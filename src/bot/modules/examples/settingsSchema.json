@@ -1,0 +1,55 @@
+{
+  "id": "examples-settings",
+  "version": "1.0.0",
+  "name": "Example Commands",
+  "description": "Configure example command behavior",
+  "icon": "🔧",
+  "scope": "both",
+
+  "sections": [
+    {
+      "id": "ping",
+      "name": "Ping Command",
+      "description": "Configure the ping command response",
+      "icon": "🏓",
+      "order": 1
+    }
+  ],
+
+  "settings": {
+    "pingEnableLatency": {
+      "type": "boolean",
+      "default": true,
+      "label": "Show Latency",
+      "description": "Display API latency in ping command responses",
+      "section": "ping",
+      "order": 1
+    },
+    "pingCustomMessage": {
+      "type": "string",
+      "default": "Pong!",
+      "label": "Custom Message",
+      "description": "Custom message to display with ping command",
+      "section": "ping",
+      "order": 2,
+      "validation": {
+        "required": true,
+        "minLength": 1,
+        "maxLength": 100
+      }
+    },
+    "pingMaxConsecutive": {
+      "type": "number",
+      "default": 5,
+      "label": "Max Consecutive Pings",
+      "description": "Maximum times a user can use ping in quick succession",
+      "section": "ping",
+      "order": 3,
+      "validation": {
+        "required": true,
+        "min": 1,
+        "max": 20
+      }
+    }
+  }
+}

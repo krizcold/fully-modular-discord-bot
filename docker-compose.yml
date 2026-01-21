@@ -1,0 +1,100 @@
+name: typescriptmodulardiscordbot
+
+services:
+  typescriptmodulardiscordbot:
+    image: ghcr.io/yundera/nginx-hash-lock:latest
+    restart: unless-stopped
+    user: "root"
+    privileged: true
+    cap_add:
+      - SYS_ADMIN
+      - NET_ADMIN
+    expose:
+      - "80"
+    environment:
+      AUTH_HASH: $AUTH_HASH
+      BACKEND_HOST: "typescriptmodulardiscordbotapp"
+      BACKEND_PORT: "8080"
+      LISTEN_PORT: "80"
+      ALLOWED_EXTENSIONS: "js,jsx,css,png,ico,svg,jpg,jpeg,gif,woff,woff2,ttf,eot"
+      ALLOWED_PATHS: "/guild,/auth"  # Exception for OAuth and Guild Web-UI (no AUTH_HASH required)
+    depends_on:
+      - typescriptmodulardiscordbotapp
+    networks:
+      - pcs
+
+  redis:
+    image: redis:7-alpine
+    container_name: typescriptmodulardiscordbot_redis
+    restart: unless-stopped
+    networks:
+      - pcs
+    command: redis-server --save "" --loglevel warning
+    volumes:
+      - type: bind
+        source: $DATA_ROOT/AppData/typescriptmodulardiscordbot/data/redis
+        target: /data
+
+  typescriptmodulardiscordbotapp:
+    image: ghcr.io/krizcold/typescript-modular-discord-bot:latest
+    container_name: typescriptmodulardiscordbotapp
+    restart: unless-stopped
+    depends_on:
+      - redis
+    environment:
+      DISCORD_TOKEN: ''
+      GUILD_ID: ''
+      CLIENT_ID: ''
+      MAIN_GUILD_ID: ''
+      DEVS: ''
+      ENABLE_GUILD_WEBUI: ''
+      DISCORD_CLIENT_ID: ''
+      DISCORD_CLIENT_SECRET: ''
+      OAUTH_CALLBACK_URL: ''
+      SESSION_SECRET: ''
+      REDIS_URL: ''
+      APP_TOKEN: $API_HASH
+      COMPILER_API: $COMPILER_API
+    volumes:
+      - type: bind
+        source: $DATA_ROOT/AppData/typescriptmodulardiscordbot/smdb-source
+        target: /app/smdb-source
+      - type: bind
+        source: $DATA_ROOT/AppData/typescriptmodulardiscordbot/data
+        target: /data
+    networks:
+      - pcs
+    expose:
+      - 8080
+    x-casaos:
+      volumes:
+        - container: /app/smdb-source
+          description:
+            en_us: Typescript Modular Discord Bot source directory.
+        - container: /data
+          description:
+            en_us: Persistent data directory for update configs and bot data.
+
+x-casaos:
+  architectures:
+    - amd64
+    - arm64
+  main: typescriptmodulardiscordbot
+  build: typescriptmodulardiscordbotapp # Github Compiler build target
+  author: kriz_cold
+  developer: kriz_cold
+  icon: https://cdn.statically.io/gh/krizcold/AppStore/main/Apps/Typescript-Modular-Discord-Bot/icon.png
+  tagline:
+    en_us: "(Test) A flexible Discord bot framework with Web-UI"
+  category: Chat
+  description:
+    en_us: "A typescript modular Discord bot with web-based management dashboard. Configure and monitor your bot from anywhere."
+  title:
+    en_us: "Typescript Modular Discord Bot"
+  port_map: "80"
+  index: /?hash=$AUTH_HASH
+  webui_port: 80
+
+networks:
+  pcs:
+    external: true

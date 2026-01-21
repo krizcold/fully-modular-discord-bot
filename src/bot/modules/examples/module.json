@@ -1,0 +1,39 @@
+{
+  "name": "examples",
+  "version": "1.0.0",
+  "displayName": "Example Commands",
+  "description": "Example commands and panels demonstrating Discord.js features (ping, buttons, modals, dropdowns, panels)",
+  "author": "kriz_cold",
+  "category": "misc",
+  "requiredIntents": ["Guilds"],
+  "requiredPermissions": [],
+  "dependencies": {
+    "required": {},
+    "optional": {}
+  },
+  "config": {},
+  "configSchema": {
+    "id": "examples-config.json",
+    "name": "Examples Module Config",
+    "description": "Configuration for example commands and features",
+    "properties": {
+      "ping.enableLatencyDisplay": {
+        "type": "boolean",
+        "default": true,
+        "description": "Show API latency in ping command responses"
+      },
+      "ping.customMessage": {
+        "type": "string",
+        "default": "Pong!",
+        "description": "Custom message to display with ping command"
+      },
+      "ping.maxConsecutivePings": {
+        "type": "number",
+        "default": 5,
+        "description": "Maximum number of times a user can use ping in quick succession"
+      }
+    }
+  },
+  "enabled": true,
+  "exports": {}
+}

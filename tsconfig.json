@@ -1,0 +1,25 @@
+{
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "CommonJS",
+    "rootDir": "src",
+    "outDir": "dist",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "moduleResolution": "Node",
+    "resolveJsonModule": true,
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["src/*"],
+      "@bot/*": ["src/bot/*"],
+      "@modules/*": ["src/bot/modules/*"],
+      "@internal/*": ["src/bot/internalSetup/*"],
+      "@bot/types": ["src/bot/types"],
+      "@webui/*": ["src/webui/*"]
+    }
+  },
+  "include": ["src"],
+  "exclude": ["node_modules","dist","src/**/disabled","src/**/*.disabled"]
+}

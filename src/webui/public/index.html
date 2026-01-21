@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Discord Bot System Settings</title>
+  <link rel="stylesheet" href="/styles.css">
+  <link rel="stylesheet" href="/styles/update-panel.css">
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <!-- Utilities -->
+  <script src="/utils/api.js"></script>
+  <script src="/utils/websocket.js"></script>
+  <!-- Components -->
+  <script type="text/babel" src="/components/BotControlPanel.jsx"></script>
+  <!-- Credentials Panel Components -->
+  <script type="text/babel" src="/components/credentials/BotCredentialsSection.jsx"></script>
+  <script type="text/babel" src="/components/credentials/OAuthCredentialsSection.jsx"></script>
+  <script type="text/babel" src="/components/CredentialsPanel.jsx"></script>
+  <script type="text/babel" src="/components/ConfigPanel.jsx"></script>
+  <script type="text/babel" src="/components/LogsPanel.jsx"></script>
+  <!-- Update Panel Components -->
+  <script type="text/babel" src="/components/update/UpdateStatus.jsx"></script>
+  <script type="text/babel" src="/components/update/UpdateBackups.jsx"></script>
+  <script type="text/babel" src="/components/UpdatePanel.jsx"></script>
+  <!-- Panel System Components -->
+  <script type="text/babel" src="/components/panels/PanelComponents.jsx"></script>
+  <script type="text/babel" src="/components/panels/PanelRenderer.jsx"></script>
+  <script type="text/babel" src="/components/panels/PanelViewer.jsx"></script>
+  <script type="text/babel" src="/components/panels/PanelList.jsx"></script>
+  <script type="text/babel" src="/components/PanelsPanel.jsx"></script>
+  <!-- App Store Components -->
+  <script type="text/babel" src="/components/AppStorePanel.jsx"></script>
+  <!-- Main App -->
+  <script type="text/babel" src="/app.jsx"></script>
+</body>
+</html>
