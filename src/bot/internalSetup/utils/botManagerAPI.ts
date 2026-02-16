@@ -1,10 +1,9 @@
 /**
  * Bot Manager Update API
  *
- * This file provides wrapper functions for the Bot Manager update system.
- * The old Yundera API has been replaced with Bot Manager integration.
+ * Provides wrapper functions for the Bot Manager update system.
  *
- * Updates are now requested from Bot Manager via:
+ * Updates are requested from Bot Manager via:
  *   POST /api/bots/{botId}/request-update
  *   Header: X-Bot-Token: {BOT_MANAGER_UPDATE_TOKEN}
  */
@@ -146,7 +145,7 @@ export async function checkForAllBotUpdates(): Promise<CombinedUpdateCheckResult
   try {
     return await updater.checkForAllUpdates();
   } catch (error) {
-    console.error('[YunderaAPI] Failed to check for all updates:', error);
+    console.error('[BotManagerAPI] Failed to check for all updates:', error);
     return null;
   }
 }
@@ -165,63 +164,3 @@ export async function triggerAllModuleUpdates(): Promise<BulkModuleUpdateResult>
   return await updater.triggerAllModuleUpdates();
 }
 
-// Deprecated: YunderaAPIClient is no longer used
-// The following is kept for backwards compatibility but does nothing
-/** @deprecated Use checkForBotUpdates/requestBotUpdate instead */
-export class YunderaAPIClient {
-  constructor(_configPath: string = '/data/update-config.json') {
-    console.warn('[YunderaAPI] YunderaAPIClient is deprecated. Updates are now managed by Bot Manager.');
-  }
-
-  getConfig(): UpdateConfig {
-    return { updateMode: 'none', updateInProgress: false };
-  }
-
-  setUpdateMode(_mode: UpdateConfig['updateMode']): void {}
-  markUpdateComplete(): void {}
-
-  async checkForUpdates(): Promise<UpdateCheckResponse | null> {
-    return await checkForBotUpdates();
-  }
-
-  async triggerUpdate(): Promise<{ success: boolean; error?: string }> {
-    return await requestBotUpdate('relative');
-  }
-
-  async getBuildStatus(): Promise<BuildStatusResponse | null> {
-    return await getBotBuildStatus();
-  }
-
-  async requestUpdate(mode: UpdateConfig['updateMode']): Promise<{ success: boolean; error?: string }> {
-    return await requestBotUpdate(mode);
-  }
-
-  async smartUpdate(): Promise<{ triggered: boolean; reason: string; updateInfo?: UpdateCheckResponse }> {
-    return await smartBotUpdate();
-  }
-
-  isUpdateInProgress(): boolean {
-    return getBotUpdateStatus().inProgress;
-  }
-
-  getUpdateMode(): UpdateConfig['updateMode'] {
-    return getBotUpdateStatus().mode;
-  }
-
-  getLastUpdateCheck(): number | undefined {
-    return getBotUpdateStatus().lastCheck;
-  }
-
-  isDockerComposeUpdatePending(): boolean {
-    return false;
-  }
-
-  getPendingUpdateMode(): UpdateConfig['updateMode'] {
-    return 'none';
-  }
-}
-
-/** @deprecated Use the standalone functions instead */
-export function getYunderaAPI(): YunderaAPIClient {
-  return new YunderaAPIClient();
-}

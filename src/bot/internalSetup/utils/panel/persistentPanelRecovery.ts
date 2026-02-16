@@ -13,7 +13,7 @@ import {
 import { updatePersistentPanel } from './persistentPanelResponse';
 import { storeNavigationContext } from './panelButtonHandler';
 import { PanelResponse } from '@bot/types/panelTypes';
-import { getBotUpdateStatus, checkForBotUpdates } from '../yunderaAPI';
+import { getBotUpdateStatus, checkForBotUpdates } from '../botManagerAPI';
 
 /**
  * Recover persistent panels after bot restart

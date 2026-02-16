@@ -21,7 +21,7 @@ import {
   triggerModuleUpdate,
   triggerAllModuleUpdates,
   CombinedUpdateCheckResult
-} from '../utils/yunderaAPI';
+} from '../utils/botManagerAPI';
 import { updatePanelDynamic } from '../utils/panel/persistentPanelResponse';
 import { updatePersistentPanelState, removePersistentPanel } from '../utils/panel/persistentPanelStorage';
 import { DISCORD_EPHEMERAL_FLAG } from '../../constants';

@@ -31,13 +31,13 @@ COPY --chown=node:node src/ /app/src/
 
 # Select updater module at build time based on BUILD_MODE
 # - undefined/empty (default): updater_local (git-based, for self-hosted)
-# - yundera: updater_yundera (API-based, for GitHub Compiler)
+# - managed: updater_managed (API-based, for Bot Manager)
 ARG BUILD_MODE
 COPY --chown=node:node updaters/ /tmp/updaters/
 RUN mkdir -p /app/src/updater && \
-    if [ "$BUILD_MODE" = "yundera" ]; then \
-      echo "Build mode: yundera - using Yundera API updater"; \
-      cp -r /tmp/updaters/updater_yundera/* /app/src/updater/; \
+    if [ "$BUILD_MODE" = "managed" ]; then \
+      echo "Build mode: managed - using Bot Manager API updater"; \
+      cp -r /tmp/updaters/updater_managed/* /app/src/updater/; \
     else \
       echo "Build mode: local - using git updater"; \
       cp -r /tmp/updaters/updater_local/* /app/src/updater/; \

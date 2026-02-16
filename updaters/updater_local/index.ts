@@ -96,7 +96,7 @@ export interface UpdateStatus {
 const DATA_PATH = process.env.DATA_DIR || '/data';
 const UPDATE_CONFIG_PATH = path.join(DATA_PATH, 'update-config.json');
 const PACKAGE_JSON_PATH = '/app/package.json';
-const GITHUB_REPO = process.env.GITHUB_REPO || 'krizcold/typescript-modular-discord-bot';
+const GITHUB_REPO = process.env.GITHUB_REPO || 'krizcold/fully-modular-discord-bot';
 
 let updateStatus: UpdateStatus = {
   inProgress: false,

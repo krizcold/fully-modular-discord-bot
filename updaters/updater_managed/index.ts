@@ -1,7 +1,7 @@
 /**
- * Yundera Updater (Bot Manager API)
+ * Managed Updater (Bot Manager API)
  *
- * This updater is used when the bot runs under Bot Manager (Yundera GitHub Compiler).
+ * This updater is used when the bot runs under Bot Manager.
  * It requests updates from the Bot Manager service instead of handling updates directly.
  * The bot receives BOT_MANAGER_UPDATE_TOKEN via environment variable.
  *
@@ -88,9 +88,9 @@ export interface UpdateStatus {
 }
 
 // Bot Manager API configuration
-const BOT_MANAGER_URL = process.env.BOT_MANAGER_URL || process.env.COMPILER_API || 'http://bot-manager:8080';
-const BOT_ID = process.env.BOT_ID || process.env.APP_ID || '';
-const UPDATE_TOKEN = process.env.BOT_MANAGER_UPDATE_TOKEN || process.env.API_HASH || '';
+const BOT_MANAGER_URL = process.env.BOT_MANAGER_URL || 'http://bot-manager:8080';
+const BOT_ID = process.env.BOT_ID || '';
+const UPDATE_TOKEN = process.env.BOT_MANAGER_UPDATE_TOKEN || '';
 
 let updateStatus: UpdateStatus = {
   inProgress: false,
@@ -274,7 +274,7 @@ export function getUpdateStatus(): UpdateStatus {
  * Get updater type identifier
  */
 export function getUpdaterType(): string {
-  return 'yundera';
+  return 'managed';
 }
 
 // ============================================================================

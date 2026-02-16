@@ -1,5 +1,5 @@
 {
-  "name": "typescript-modular-discord-bot",
+  "name": "fully-modular-discord-bot",
   "version": "0.0.1",
   "description": "Multi-purpose Discord bot TypeScript base, designed to be modular and easy to work with.",
   "main": "index.js",
@@ -13,11 +13,11 @@
     "dev": "cross-env NODE_ENV=development nodemon --watch src --ext ts,json --ignore src/bot/config.json --exec ts-node -r tsconfig-paths/register src/index.ts",
     "dev:bot": "nodemon --watch src/bot --ext ts,json --ignore src/bot/config.json --exec ts-node -r tsconfig-paths/register src/bot/index.ts",
     "dev:webui": "nodemon --watch src/webui --ext ts,json --exec ts-node -r tsconfig-paths/register src/webui/index.ts",
-    "dockerUpdate": "docker build -t typescript-modular-discord-bot . && docker-compose up -d",
+    "dockerUpdate": "docker build -t fully-modular-discord-bot . && docker-compose up -d",
     "dockerPublish": "dotenv node scripts/dockerPublish.js",
     "exportContext": "node scripts/exportContext.js",
-    "docker:run": "docker build -t typescript-modular-discord-bot . && docker run --rm -it -v %cd%:/app -p 3000:3000 typescript-modular-discord-bot",
-    "docker:run-env": "docker build -t typescript-modular-discord-bot . && docker run --rm -it --env-file .env -v ${PWD}:/app typescript-modular-discord-bot"
+    "docker:run": "docker build -t fully-modular-discord-bot . && docker run --rm -it -v %cd%:/app -p 3000:3000 fully-modular-discord-bot",
+    "docker:run-env": "docker build -t fully-modular-discord-bot . && docker run --rm -it --env-file .env -v ${PWD}:/app fully-modular-discord-bot"
   },
   "keywords": [],
   "author": "kriz_cold",

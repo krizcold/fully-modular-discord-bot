@@ -57,6 +57,6 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            BUILD_MODE=yundera
+            BUILD_MODE=managed
           cache-from: type=gha
           cache-to: type=gha,mode=max

@@ -9,7 +9,6 @@ import getLocalCommands from '../../utils/getLocalCommands';
 import areCommandsDifferent from '../../utils/areCommandsDifferent';
 import 'dotenv/config';
 import { getConfigProperty } from '../../utils/configManager';
-import { getYunderaAPI } from '../../utils/yunderaAPI';
 import { loadGlobalData, saveGlobalData } from '../../utils/dataManager';
 
 const testMode = getConfigProperty<boolean>('testMode');
@@ -139,14 +138,6 @@ const internalOrHandledKeys = [
 
 export default async function registerCommands(client: Client) {
   console.log('[i] Registering commands...');
-
-  // Check for pending docker-compose updates
-  const yunderaAPI = getYunderaAPI();
-  if (yunderaAPI.isDockerComposeUpdatePending()) {
-    const pendingMode = yunderaAPI.getPendingUpdateMode();
-    console.log(`[YunderaAPI] Docker-compose update completed - update type "${pendingMode}" was applied by pre-update.js`);
-    yunderaAPI.markUpdateComplete();
-  }
 
   if (!guildId) {
     console.error('GUILD_ID environment variable is not set.');

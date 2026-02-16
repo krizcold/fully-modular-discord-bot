@@ -1,7 +1,7 @@
-name: typescriptmodulardiscordbot
+name: fullymodulardiscordbot
 
 services:
-  typescriptmodulardiscordbot:
+  fullymodulardiscordbot:
     image: ghcr.io/yundera/nginx-hash-lock:latest
     restart: unless-stopped
     user: "root"
@@ -13,31 +13,31 @@ services:
       - "80"
     environment:
       AUTH_HASH: $AUTH_HASH
-      BACKEND_HOST: "typescriptmodulardiscordbotapp"
+      BACKEND_HOST: "fullymodulardiscordbotapp"
       BACKEND_PORT: "8080"
       LISTEN_PORT: "80"
       ALLOWED_EXTENSIONS: "js,jsx,css,png,ico,svg,jpg,jpeg,gif,woff,woff2,ttf,eot"
       ALLOWED_PATHS: "/guild,/auth"  # Exception for OAuth and Guild Web-UI (no AUTH_HASH required)
     depends_on:
-      - typescriptmodulardiscordbotapp
+      - fullymodulardiscordbotapp
     networks:
       - pcs
 
   redis:
     image: redis:7-alpine
-    container_name: typescriptmodulardiscordbot_redis
+    container_name: fullymodulardiscordbot_redis
     restart: unless-stopped
     networks:
       - pcs
     command: redis-server --save "" --loglevel warning
     volumes:
       - type: bind
-        source: $DATA_ROOT/AppData/typescriptmodulardiscordbot/data/redis
+        source: $DATA_ROOT/AppData/fullymodulardiscordbot/data/redis
         target: /data
 
-  typescriptmodulardiscordbotapp:
-    image: ghcr.io/krizcold/typescript-modular-discord-bot:latest
-    container_name: typescriptmodulardiscordbotapp
+  fullymodulardiscordbotapp:
+    image: ghcr.io/krizcold/fully-modular-discord-bot:latest
+    container_name: fullymodulardiscordbotapp
     restart: unless-stopped
     depends_on:
       - redis
@@ -54,13 +54,13 @@ services:
       SESSION_SECRET: ''
       REDIS_URL: ''
       APP_TOKEN: $API_HASH
-      COMPILER_API: $COMPILER_API
+      BOT_MANAGER_API: $BOT_MANAGER_API
     volumes:
       - type: bind
-        source: $DATA_ROOT/AppData/typescriptmodulardiscordbot/smdb-source
+        source: $DATA_ROOT/AppData/fullymodulardiscordbot/smdb-source
         target: /app/smdb-source
       - type: bind
-        source: $DATA_ROOT/AppData/typescriptmodulardiscordbot/data
+        source: $DATA_ROOT/AppData/fullymodulardiscordbot/data
         target: /data
     networks:
       - pcs
@@ -70,7 +70,7 @@ services:
       volumes:
         - container: /app/smdb-source
           description:
-            en_us: Typescript Modular Discord Bot source directory.
+            en_us: Fully Modular Discord Bot source directory.
         - container: /data
           description:
             en_us: Persistent data directory for update configs and bot data.
@@ -79,18 +79,18 @@ x-casaos:
   architectures:
     - amd64
     - arm64
-  main: typescriptmodulardiscordbot
-  build: typescriptmodulardiscordbotapp # Github Compiler build target
+  main: fullymodulardiscordbot
+  build: fullymodulardiscordbotapp
   author: kriz_cold
   developer: kriz_cold
-  icon: https://cdn.statically.io/gh/krizcold/AppStore/main/Apps/Typescript-Modular-Discord-Bot/icon.png
+  icon: https://cdn.statically.io/gh/krizcold/AppStore/main/Apps/Fully-Modular-Discord-Bot/icon.png
   tagline:
     en_us: "(Test) A flexible Discord bot framework with Web-UI"
   category: Chat
   description:
-    en_us: "A typescript modular Discord bot with web-based management dashboard. Configure and monitor your bot from anywhere."
+    en_us: "A fully modular Discord bot with web-based management dashboard. Configure and monitor your bot from anywhere."
   title:
-    en_us: "Typescript Modular Discord Bot"
+    en_us: "Fully Modular Discord Bot"
   port_map: "80"
   index: /?hash=$AUTH_HASH
   webui_port: 80

@@ -1,10 +1,12 @@
-# Typescript Modular Discord Bot
+# Fully Modular Discord Bot
+
+> **WORK IN PROGRESS** -- This project is under active development and is NOT ready for production use. APIs, configuration, file structure, and behavior may change without notice. Future updates will likely introduce breaking changes.
 
 **Kriz_cold's Fully modular Discord bot framework built with TypeScript and Discord.js v14**
 
 ## Overview
 
-This is a production-ready Discord bot framework designed with modularity at its core. Features are organized as self-contained modules that can be independently developed, distributed, and managed. The framework includes a built-in Web-UI for bot management, multi-server support with per-guild configuration, and an integrated update system for cloud deployments.
+A Discord bot framework designed with modularity at its core. Features are organized as self-contained modules that can be independently developed, distributed, and managed. The framework includes a built-in Web-UI for bot management, multi-server support with per-guild configuration, and an integrated update system for cloud deployments.
 
 ### Key Features
 
@@ -29,8 +31,8 @@ This is a production-ready Discord bot framework designed with modularity at its
 
 1. **Clone the repository:**
    ```bash
-   git clone https://github.com/yourusername/typescript-modular-discord-bot.git
-   cd typescript-modular-discord-bot
+   git clone https://github.com/krizcold/fully-modular-discord-bot.git
+   cd fully-modular-discord-bot
    ```
 
 2. **Configure credentials:**
@@ -371,7 +373,7 @@ These panels are only accessible:
 
 ## Update System
 
-**Note:** The update system only works with cloud deployments (CasaOS/Yundera with GitHub Compiler). Self-hosted instances must be updated manually.
+**Note:** The managed update system works with Bot Manager deployments. Self-hosted instances use the local git-based updater.
 
 ### Update Modes
 
@@ -638,6 +640,6 @@ Contributions are welcome! Please:
 
 ## Support
 
-- **Issues:** https://github.com/yourusername/typescript-modular-discord-bot/issues
+- **Issues:** https://github.com/krizcold/fully-modular-discord-bot/issues
 - **Discord.js Docs:** https://discord.js.org/
 - **Discord Developer Portal:** https://discord.com/developers/applications
