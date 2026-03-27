@@ -50,13 +50,11 @@ export async function configureSessionStore(): Promise<session.Store | undefined
     console.log('[SessionManager] Redis session store configured successfully');
     return sessionStore;
   } catch (error) {
-    if (isDev) {
-      console.warn('[SessionManager] Redis not available - using memory store (sessions lost on restart)');
-      return undefined; // Will use default memory store
+    console.warn('[SessionManager] Redis not available - using memory store (sessions lost on restart)');
+    if (!isDev) {
+      console.warn('[SessionManager] Production without Redis: sessions will not persist across restarts');
     }
-    console.error('[SessionManager] Failed to connect to Redis:', error);
-    console.error('[SessionManager] Redis is required for Guild Web-UI in production');
-    throw new Error('Redis connection failed - Guild Web-UI will not work');
+    return undefined; // Will use default memory store
   }
 }
 
