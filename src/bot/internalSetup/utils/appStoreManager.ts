@@ -129,7 +129,17 @@ const CREDENTIALS_DIR = path.join(APPSTORE_DIR, 'credentials');
 const CACHE_DIR = path.join(APPSTORE_DIR, 'cache');
 
 const DEFAULT_REPOS_CONFIG: ReposConfig = {
-  repositories: []
+  repositories: [
+    {
+      id: 'official-modules',
+      name: 'Official Module Store',
+      url: 'https://github.com/krizcold/discord-bot-modules',
+      branch: 'main',
+      githubToken: null,
+      enabled: true,
+      lastRefreshed: null
+    }
+  ]
 };
 
 const DEFAULT_INSTALLED_CONFIG: InstalledConfig = {
