@@ -4,18 +4,19 @@ import { register } from 'tsconfig-paths';
 const isProduction = process.env.NODE_ENV !== 'development';
 const basePath = isProduction ? path.resolve('/app/dist') : path.resolve(__dirname, '..');
 
+const pathPrefix = isProduction ? '' : 'src/';
+
 register({
   baseUrl: basePath,
   paths: {
-    // Updater now unified - uses Bot Manager API
-    '@/updater': ['src/updater'],
-    '@/updater/*': ['src/updater/*'],
-    '@/*': ['src/*'],
-    '@bot/*': ['src/bot/*'],
-    '@modules/*': ['src/bot/modules/*'],
-    '@internal/*': ['src/bot/internalSetup/*'],
-    '@bot/types': ['src/bot/types'],
-    '@webui/*': ['src/webui/*']
+    '@/updater': [`${pathPrefix}updater`],
+    '@/updater/*': [`${pathPrefix}updater/*`],
+    '@/*': [`${pathPrefix}*`],
+    '@bot/*': [`${pathPrefix}bot/*`],
+    '@modules/*': [`${pathPrefix}bot/modules/*`],
+    '@internal/*': [`${pathPrefix}bot/internalSetup/*`],
+    '@bot/types': [`${pathPrefix}bot/types`],
+    '@webui/*': [`${pathPrefix}webui/*`]
   }
 });
 
