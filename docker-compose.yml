@@ -6,7 +6,7 @@ services:
     restart: unless-stopped
     cpu_shares: 80
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:80/", "||", "exit", "1"]
+      test: ["CMD-SHELL", "curl -s -o /dev/null -w '%{http_code}' http://localhost:80/ | grep -qE '(200|301|302|403)'"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -38,6 +38,7 @@ services:
     depends_on:
       - fullymodulardiscordbotapp
     networks:
+      - internal
       - pcs
 
   redis:
@@ -48,7 +49,7 @@ services:
     environment:
       TZ: $TZ
     networks:
-      - pcs
+      - internal
     command: redis-server --save "" --loglevel warning
     volumes:
       - type: bind
@@ -85,6 +86,7 @@ services:
         source: $DATA_ROOT/AppData/fullymodulardiscordbot/data
         target: /data
     networks:
+      - internal
       - pcs
     expose:
       - 8080
@@ -120,6 +122,8 @@ x-casaos:
   webui_port: 80
 
 networks:
+  internal:
+    driver: bridge
   pcs:
     name: pcs
     external: true
