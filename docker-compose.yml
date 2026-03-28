@@ -74,6 +74,9 @@ services:
       AUTH_HASH: $AUTH_HASH
       APP_TOKEN: $API_HASH
       BOT_MANAGER_API: $BOT_MANAGER_API
+      BOT_MANAGER_INTERNAL_URL: $BOT_MANAGER_INTERNAL_URL
+      BOT_MANAGER_UPDATE_TOKEN: $API_HASH
+      BOT_ID: $APP_ID
       TZ: $TZ
     volumes:
       - type: bind

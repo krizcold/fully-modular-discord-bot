@@ -1,6 +1,8 @@
 /**
- * Bot Manager Updater
- * Requests updates from the Bot Manager service instead of handling updates directly.
+ * Managed Updater (Bot Manager API)
+ *
+ * This updater is used when the bot runs under Bot Manager.
+ * It requests updates from the Bot Manager service instead of handling updates directly.
  * The bot receives BOT_MANAGER_UPDATE_TOKEN via environment variable.
  *
  * Also provides combined update checking for both base code and modules.
@@ -86,7 +88,9 @@ export interface UpdateStatus {
 }
 
 // Bot Manager API configuration
-const BOT_MANAGER_URL = process.env.BOT_MANAGER_URL || 'http://bot-manager:8080';
+// BOT_MANAGER_INTERNAL_URL = internal Docker network URL (preferred for container-to-container calls)
+// BOT_MANAGER_API = external URL (fallback)
+const BOT_MANAGER_URL = process.env.BOT_MANAGER_INTERNAL_URL || process.env.BOT_MANAGER_API || 'http://bot-manager:8080';
 const BOT_ID = process.env.BOT_ID || '';
 const UPDATE_TOKEN = process.env.BOT_MANAGER_UPDATE_TOKEN || '';
 
@@ -272,10 +276,7 @@ export function getUpdateStatus(): UpdateStatus {
  * Get updater type identifier
  */
 export function getUpdaterType(): string {
-  if (!BOT_ID || !UPDATE_TOKEN) {
-    return 'standalone';
-  }
-  return 'bot-manager';
+  return 'managed';
 }
 
 // ============================================================================
