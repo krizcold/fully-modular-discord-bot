@@ -558,7 +558,7 @@ function RepositoriesView({ repositories, onRefresh, showSuccess, setError }) {
       setError(null);
       const res = await api.post(`/appstore/repos/${repoId}/refresh`);
       if (res.success) {
-        showSuccess(`Found ${res.modulesFound || 0} modules`);
+        showSuccess(`Found ${res.modules?.length || 0} modules`);
         onRefresh();
       }
     } catch (err) {
