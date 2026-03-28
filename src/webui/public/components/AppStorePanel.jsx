@@ -296,7 +296,7 @@ function ModuleDetailView({ module, installed, onBack, onInstall, onUninstall, o
     try {
       setInstalling(true);
       setError(null);
-      const res = await api.post(`/appstore/modules/${module.name}/install`);
+      const res = await api.post(`/appstore/modules/${module.name}/install`, { repoId: module.repoId });
       if (res.success) {
         showSuccess(`${module.displayName || module.name} installed! Restart bot to activate.`);
         onInstall();
