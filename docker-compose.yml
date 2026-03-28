@@ -12,10 +12,6 @@ services:
       retries: 3
       start_period: 30s
     user: "root"
-    privileged: true
-    cap_add:
-      - SYS_ADMIN
-      - NET_ADMIN
     expose:
       - "80"
     environment:
