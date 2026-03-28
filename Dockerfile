@@ -10,6 +10,9 @@ COPY package*.json tsconfigprod.json ./
 # Update npm to latest version
 RUN npm install -g npm@latest
 
+# Install git (needed by AppStore module manager)
+RUN apk add --no-cache git
+
 # Create necessary directories
 RUN mkdir -p /app/smdb-source /app/dist && \
     chmod -R 777 /app/smdb-source
