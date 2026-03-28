@@ -71,6 +71,7 @@ services:
       OAUTH_CALLBACK_URL: ''
       SESSION_SECRET: ''
       REDIS_URL: ''
+      AUTH_HASH: $AUTH_HASH
       APP_TOKEN: $API_HASH
       BOT_MANAGER_API: $BOT_MANAGER_API
       TZ: $TZ
