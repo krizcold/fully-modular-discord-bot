@@ -13,6 +13,7 @@ function AppStorePanel() {
   const [error, setError] = useState(null);
   const [success, setSuccess] = useState(null);
   const [categoryFilter, setCategoryFilter] = useState('all');
+  const [pendingRestart, setPendingRestart] = useState(new Set());
 
   useEffect(() => {
     loadData();
@@ -104,7 +105,7 @@ function AppStorePanel() {
           module={selectedModule}
           installed={installed[selectedModule.name]}
           onBack={() => { setView('modules'); setSelectedModule(null); }}
-          onInstall={loadData}
+          onInstall={() => { setPendingRestart(prev => new Set([...prev, selectedModule.name])); loadData(); }}
           onUninstall={loadData}
           onSaveCredentials={loadData}
           showSuccess={showSuccess}
@@ -117,6 +118,7 @@ function AppStorePanel() {
         <ModulesView
           modules={filteredModules}
           installed={installed}
+          pendingRestart={pendingRestart}
           categories={categories}
           categoryFilter={categoryFilter}
           onCategoryChange={setCategoryFilter}
@@ -150,7 +152,7 @@ function AppStorePanel() {
 }
 
 // Modules View Component
-function ModulesView({ modules, installed, categories, categoryFilter, onCategoryChange, onSelectModule, repositories }) {
+function ModulesView({ modules, installed, pendingRestart, categories, categoryFilter, onCategoryChange, onSelectModule, repositories }) {
   const installedCount = Object.keys(installed).length;
 
   return (
@@ -211,6 +213,7 @@ function ModulesView({ modules, installed, categories, categoryFilter, onCategor
               key={module.name}
               module={module}
               installed={!!installed[module.name]}
+              pending={pendingRestart?.has(module.name)}
               onClick={() => onSelectModule(module)}
             />
           ))}
@@ -221,13 +224,14 @@ function ModulesView({ modules, installed, categories, categoryFilter, onCategor
 }
 
 // Module Card Component
-function ModuleCard({ module, installed, onClick }) {
+function ModuleCard({ module, installed, pending, onClick }) {
+  const borderColor = pending ? '#5865F2' : installed ? '#3ba55d' : '#444';
   return (
     <div
       onClick={onClick}
       style={{
-        background: '#2c2f33',
-        border: installed ? '2px solid #3ba55d' : '1px solid #444',
+        background: pending ? '#1a1a2e' : '#2c2f33',
+        border: `${installed || pending ? '2px' : '1px'} solid ${borderColor}`,
         borderRadius: '10px',
         padding: '15px',
         cursor: 'pointer',
@@ -262,7 +266,15 @@ function ModuleCard({ module, installed, onClick }) {
               fontWeight: 'bold'
             }}>PREMIUM</span>
           )}
-          {installed && (
+          {pending ? (
+            <span style={{
+              background: '#5865F2',
+              color: '#fff',
+              padding: '3px 8px',
+              borderRadius: '4px',
+              fontSize: '0.7rem'
+            }}>PENDING RESTART</span>
+          ) : installed ? (
             <span style={{
               background: '#3ba55d',
               color: '#fff',
@@ -270,7 +282,7 @@ function ModuleCard({ module, installed, onClick }) {
               borderRadius: '4px',
               fontSize: '0.7rem'
             }}>INSTALLED</span>
-          )}
+          ) : null}
         </div>
       </div>
 
@@ -345,14 +357,6 @@ function ModuleDetailView({ module, installed, onBack, onInstall, onUninstall, o
 
   return (
     <div>
-      <button
-        className="button"
-        onClick={onBack}
-        style={{ marginBottom: '20px', background: '#40444b', border: 'none' }}
-      >
-        Back to Modules
-      </button>
-
       <div style={{ background: '#2c2f33', borderRadius: '10px', padding: '25px' }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '20px' }}>
           <div>

@@ -1,5 +1,7 @@
 // Bot Control Panel Component
 function BotControlPanel({ status, onStart, onRestart, onShutdown, loading, configured }) {
+  const [restarting, setRestarting] = React.useState(false);
+
   if (!status) return null;
 
   const uptimeStr = status.uptime > 0
@@ -8,6 +10,20 @@ function BotControlPanel({ status, onStart, onRestart, onShutdown, loading, conf
 
   // Check if bot can be started (must be configured)
   const canStart = configured !== false;
+
+  // Clear restarting state when bot comes back up
+  React.useEffect(() => {
+    if (restarting && status.running) {
+      setRestarting(false);
+    }
+  }, [status.running, restarting]);
+
+  async function handleRestart() {
+    setRestarting(true);
+    await onRestart(true); // skipConfirmation = true, we handle it here
+  }
+
+  const isBusy = loading || restarting;
 
   return (
     <div className="card">
@@ -36,7 +52,7 @@ function BotControlPanel({ status, onStart, onRestart, onShutdown, loading, conf
       <div className="grid">
         <div className="info-item">
           <span className="info-label">Status</span>
-          <span className="info-value">{status.running ? 'Running' : 'Stopped'}</span>
+          <span className="info-value">{restarting ? 'Restarting...' : status.running ? 'Running' : 'Stopped'}</span>
         </div>
         <div className="info-item">
           <span className="info-label">Uptime</span>
@@ -53,27 +69,29 @@ function BotControlPanel({ status, onStart, onRestart, onShutdown, loading, conf
       </div>
 
       <div style={{marginTop: '20px'}}>
-        {!status.running && (
+        {restarting ? (
+          <button className="btn btn-primary" disabled>
+            Restarting...
+          </button>
+        ) : !status.running ? (
           <button
             onClick={onStart}
             className="btn btn-success"
-            disabled={loading || !canStart}
+            disabled={isBusy || !canStart}
             title={!canStart ? 'Configure credentials first' : ''}
             style={!canStart ? { opacity: 0.5, cursor: 'not-allowed' } : {}}
           >
             Start Bot
           </button>
-        )}
-
-        {status.running && (
+        ) : (
           <>
-            <button onClick={onRestart} className="btn btn-primary" disabled={loading}>
+            <button onClick={handleRestart} className="btn btn-primary" disabled={isBusy}>
               Restart Bot
             </button>
-            <button onClick={() => onShutdown(false)} className="btn btn-warning" disabled={loading}>
+            <button onClick={() => onShutdown(false)} className="btn btn-warning" disabled={isBusy}>
               Stop Bot
             </button>
-            <button onClick={() => onShutdown(true)} className="btn btn-danger" disabled={loading}>
+            <button onClick={() => onShutdown(true)} className="btn btn-danger" disabled={isBusy}>
               Restart Container
             </button>
           </>

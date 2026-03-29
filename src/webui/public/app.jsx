@@ -51,7 +51,9 @@ function App() {
     const unsubscribeConnection = wsClient.on('_connection', (data) => {
       console.log('[WebSocket] Connection status:', data.connected);
       if (data.connected) {
-        // Reload data when WebSocket reconnects
+        // Clear stale messages and reload data when WebSocket reconnects
+        setSuccess(null);
+        setError(null);
         loadData();
       }
     });
@@ -139,10 +141,34 @@ function App() {
     try {
       setLoading(true);
       await api.post('/bot/shutdown', { emergency });
-      setSuccess(emergency ? 'Container restarting...' : 'Bot stopped successfully');
-      await loadData();
+      if (emergency) {
+        setSuccess('Container restarting... page will reload when ready.');
+        // Poll until server is back, then reload the page
+        const poll = setInterval(async () => {
+          try {
+            await api.get('/bot/status');
+            clearInterval(poll);
+            window.location.reload();
+          } catch (_) { /* still down, keep polling */ }
+        }, 3000);
+      } else {
+        setSuccess('Bot stopped successfully');
+        await loadData();
+      }
     } catch (err) {
-      setError(err.message);
+      // For emergency restart, the request may fail because the server died — that's expected
+      if (emergency) {
+        setSuccess('Container restarting... page will reload when ready.');
+        const poll = setInterval(async () => {
+          try {
+            await api.get('/bot/status');
+            clearInterval(poll);
+            window.location.reload();
+          } catch (_) { /* still down */ }
+        }, 3000);
+      } else {
+        setError(err.message);
+      }
     } finally {
       setLoading(false);
     }
