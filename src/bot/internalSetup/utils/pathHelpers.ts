@@ -14,11 +14,27 @@ export function getBotRoot(): string {
 }
 
 /**
- * Get the modules directory path
+ * Get the modules directory path (runtime — compiled dist)
  * @returns Absolute path to the modules directory
  */
 export function getModulesDir(): string {
   return path.join(getBotRoot(), 'modules');
+}
+
+/**
+ * Get the persistent source modules directory (survives container restarts).
+ * Used by AppStore to install/uninstall modules to the source tree.
+ * Falls back to the runtime modules dir if smdb-source doesn't exist (dev mode).
+ */
+export function getSourceModulesDir(): string {
+  const smdbSource = '/app/smdb-source/bot/modules';
+  if (fs.existsSync('/app/smdb-source')) {
+    if (!fs.existsSync(smdbSource)) {
+      fs.mkdirSync(smdbSource, { recursive: true });
+    }
+    return smdbSource;
+  }
+  return getModulesDir();
 }
 
 /**

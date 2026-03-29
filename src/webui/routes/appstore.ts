@@ -285,7 +285,7 @@ export function createAppStoreRoutes(): Router {
 
       res.json({
         success: true,
-        message: `Module ${name} installed successfully. Restart the bot to load it.`,
+        message: `Module ${name} installed successfully. Restart the container to load it.`,
         requiresRestart: true
       });
     } catch (error) {
