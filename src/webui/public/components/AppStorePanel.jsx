@@ -32,7 +32,12 @@ function AppStorePanel({ onModuleInstalled }) {
       ]);
 
       setModules(modulesRes.modules || []);
-      setInstalled(installedRes.modules || {});
+      // Convert installed array to object keyed by module name
+      const installedArr = installedRes.modules || [];
+      const installedMap = Array.isArray(installedArr)
+        ? installedArr.reduce((acc, m) => { acc[m.name] = m; return acc; }, {})
+        : installedArr;
+      setInstalled(installedMap);
       setRepositories(reposRes.repositories || []);
       setTiers(tiersRes.tiers || {});
       setGuildAssignments(guildsRes.guilds || {});

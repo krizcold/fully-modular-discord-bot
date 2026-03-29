@@ -1,5 +1,5 @@
 // Bot Control Panel Component
-function BotControlPanel({ status, onStart, onRestart, onShutdown, loading, configured, pendingContainerRestart }) {
+function BotControlPanel({ status, onStart, onRestart, onShutdown, loading, configured, pendingContainerRestart, containerRestarting }) {
   const [restarting, setRestarting] = React.useState(false);
 
   if (!status) return null;
@@ -71,7 +71,7 @@ function BotControlPanel({ status, onStart, onRestart, onShutdown, loading, conf
       <div className="grid">
         <div className="info-item">
           <span className="info-label">Status</span>
-          <span className="info-value">{restarting ? 'Restarting...' : status.running ? 'Running' : 'Stopped'}</span>
+          <span className="info-value">{containerRestarting ? 'Container restarting...' : restarting ? 'Restarting...' : status.running ? 'Running' : 'Stopped'}</span>
         </div>
         <div className="info-item">
           <span className="info-label">Uptime</span>
@@ -88,7 +88,11 @@ function BotControlPanel({ status, onStart, onRestart, onShutdown, loading, conf
       </div>
 
       <div style={{marginTop: '20px'}}>
-        {restarting ? (
+        {containerRestarting ? (
+          <button className="btn btn-danger" disabled>
+            Container restarting...
+          </button>
+        ) : restarting ? (
           <button className="btn btn-primary" disabled>
             Restarting...
           </button>

@@ -10,6 +10,7 @@ function App() {
   const [error, setError] = useState(null);
   const [success, setSuccess] = useState(null);
   const [pendingContainerRestart, setPendingContainerRestart] = useState(false);
+  const [containerRestarting, setContainerRestarting] = useState(false);
 
   // Load initial data and set up WebSocket subscriptions
   useEffect(() => {
@@ -140,6 +141,7 @@ function App() {
     if (!confirm(msg)) return;
     try {
       setLoading(true);
+      if (emergency) setContainerRestarting(true);
       await api.post('/bot/shutdown', { emergency });
       if (emergency) {
         setSuccess('Container restarting... page will reload when ready.');
@@ -158,6 +160,7 @@ function App() {
     } catch (err) {
       // For emergency restart, the request may fail because the server died — that's expected
       if (emergency) {
+        setContainerRestarting(true);
         setSuccess('Container restarting... page will reload when ready.');
         const poll = setInterval(async () => {
           try {
@@ -249,6 +252,7 @@ function App() {
             loading={loading}
             configured={setupStatus?.configured}
             pendingContainerRestart={pendingContainerRestart}
+            containerRestarting={containerRestarting}
           />
         )}
 
