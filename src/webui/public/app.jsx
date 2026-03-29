@@ -9,6 +9,7 @@ function App() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [success, setSuccess] = useState(null);
+  const [pendingContainerRestart, setPendingContainerRestart] = useState(false);
 
   // Load initial data and set up WebSocket subscriptions
   useEffect(() => {
@@ -110,12 +111,11 @@ function App() {
     try {
       setLoading(true);
       const res = await api.post('/bot/restart');
-      if (res.success) {
-        setSuccess('Bot restarted successfully!');
-        await loadData();
-      } else {
+      if (!res.success) {
         setError(res.error || 'Failed to restart bot');
       }
+      // Don't call loadData() here — let WebSocket bot:startup event
+      // drive the status update so BotControlPanel's restarting state works.
     } catch (err) {
       setError(err.message);
     } finally {
@@ -197,8 +197,9 @@ function App() {
         <button
           className={`tab ${activeTab === 'dashboard' ? 'active' : ''}`}
           onClick={() => setActiveTab('dashboard')}
+          title={pendingContainerRestart ? 'Container restart required to apply changes' : ''}
         >
-          Dashboard
+          Dashboard {pendingContainerRestart ? '⚠' : ''}
         </button>
         <button
           className={`tab ${activeTab === 'panels' ? 'active' : ''}`}
@@ -247,6 +248,7 @@ function App() {
             onShutdown={shutdownBot}
             loading={loading}
             configured={setupStatus?.configured}
+            pendingContainerRestart={pendingContainerRestart}
           />
         )}
 
@@ -277,7 +279,7 @@ function App() {
 
         {activeTab === 'update' && <UpdatePanel api={api} wsClient={wsClient} />}
 
-        {activeTab === 'appstore' && <AppStorePanel />}
+        {activeTab === 'appstore' && <AppStorePanel onModuleInstalled={() => setPendingContainerRestart(true)} />}
       </div>
     </div>
   );
