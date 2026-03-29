@@ -108,9 +108,9 @@ if [ ! -f "/app/dist/index.js" ]; then
     exit 1
 fi
 
-# **Copy JavaScript files from smdb-source to dist** (Preserves folders)
-echo "Copying JavaScript files..."
-cd /app/smdb-source && find . -name "*.js" -exec cp --parents {} /app/dist/ \;
+# **Copy non-TypeScript assets from smdb-source to dist** (Preserves folders)
+echo "Copying assets (JS, JSON, CSS, HTML)..."
+cd /app/smdb-source && find . \( -name "*.js" -o -name "*.json" -o -name "*.css" -o -name "*.html" -o -name "*.jsx" \) -exec cp --parents {} /app/dist/ \;
 
 # **Ensure data directories exist** (Required for persistent storage)
 echo "Creating data directories..."

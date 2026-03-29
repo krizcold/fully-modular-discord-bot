@@ -104,6 +104,7 @@ function AppStorePanel() {
         <ModuleDetailView
           module={selectedModule}
           installed={installed[selectedModule.name]}
+          pending={pendingRestart.has(selectedModule.name)}
           onBack={() => { setView('modules'); setSelectedModule(null); }}
           onInstall={() => { setPendingRestart(prev => new Set([...prev, selectedModule.name])); loadData(); }}
           onUninstall={loadData}
@@ -299,7 +300,7 @@ function ModuleCard({ module, installed, pending, onClick }) {
 }
 
 // Module Detail View Component
-function ModuleDetailView({ module, installed, onBack, onInstall, onUninstall, onSaveCredentials, showSuccess, setError }) {
+function ModuleDetailView({ module, installed, pending, onBack, onInstall, onUninstall, onSaveCredentials, showSuccess, setError }) {
   const [installing, setInstalling] = useState(false);
   const [showCredentialsForm, setShowCredentialsForm] = useState(false);
   const [credentials, setCredentials] = useState({});
@@ -310,7 +311,7 @@ function ModuleDetailView({ module, installed, onBack, onInstall, onUninstall, o
       setError(null);
       const res = await api.post(`/appstore/modules/${module.name}/install`, { repoId: module.repoId });
       if (res.success) {
-        showSuccess(`${module.displayName || module.name} installed! Restart bot to activate.`);
+        showSuccess(`${module.displayName || module.name} installed! Restart the container to activate.`);
         onInstall();
       }
     } catch (err) {
@@ -412,9 +413,24 @@ function ModuleDetailView({ module, installed, onBack, onInstall, onUninstall, o
           </div>
         )}
 
+        {/* Pending Restart Banner */}
+        {pending && (
+          <div style={{
+            background: '#1a1a2e',
+            border: '1px solid #5865F2',
+            borderRadius: '8px',
+            padding: '12px 16px',
+            marginBottom: '20px',
+            color: '#8b9eff',
+            fontSize: '0.9rem'
+          }}>
+            Installed — restart the container to activate this module.
+          </div>
+        )}
+
         {/* Action Buttons */}
         <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
-          {!installed ? (
+          {!installed && !pending ? (
             <button
               className="button primary"
               onClick={handleInstall}
