@@ -5,6 +5,9 @@
  */
 
 import { Router, Request, Response } from 'express';
+import * as fs from 'fs';
+import * as path from 'path';
+import { getModuleRegistry } from '../../bot/internalSetup/utils/moduleRegistry';
 import {
   getAppStoreManager,
   AppStoreRepository,
@@ -246,7 +249,7 @@ export function createAppStoreRoutes(): Router {
 
       res.json({
         success: true,
-        module: formatModuleInfo(moduleInfo)
+        module: formatModuleInfo(moduleInfo, true)
       });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
@@ -621,14 +624,124 @@ export function createAppStoreRoutes(): Router {
     }
   });
 
+  // ─── Component Management (Commands tab) ───
+
+  const COMPONENT_CONFIG_PATH = path.join(process.env.DATA_DIR || '/data', 'global', 'appstore', 'component-config.json');
+
+  function loadComponentConfig(): Record<string, boolean> {
+    try {
+      if (fs.existsSync(COMPONENT_CONFIG_PATH)) {
+        return JSON.parse(fs.readFileSync(COMPONENT_CONFIG_PATH, 'utf-8'));
+      }
+    } catch { /* ignore */ }
+    return {};
+  }
+
+  function saveComponentConfig(config: Record<string, boolean>): void {
+    const dir = path.dirname(COMPONENT_CONFIG_PATH);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(COMPONENT_CONFIG_PATH, JSON.stringify(config, null, 2));
+  }
+
+  /**
+   * GET /api/appstore/components
+   * Returns all components from loaded modules, grouped by module
+   */
+  router.get('/components', (req: Request, res: Response) => {
+    try {
+      const registry = getModuleRegistry();
+      const allModules = registry.getAllModules();
+      const config = loadComponentConfig();
+
+      const modules = allModules.map(mod => {
+        const commands = (mod.commands || []).map((cmd: any) => ({
+          name: cmd.name,
+          description: cmd.description || '',
+          type: cmd.type || 'ChatInput',
+          enabled: config[`${mod.manifest.name}:command:${cmd.name}`] !== false
+        }));
+
+        const events: Array<{ name: string; handlerCount: number; enabled: boolean }> = [];
+        if (mod.events) {
+          for (const [eventName, handlers] of mod.events.entries()) {
+            events.push({
+              name: eventName,
+              handlerCount: Array.isArray(handlers) ? handlers.length : 1,
+              enabled: config[`${mod.manifest.name}:event:${eventName}`] !== false
+            });
+          }
+        }
+
+        const panels = (mod.panels || []).map((panel: any) => ({
+          name: panel.name || panel.id,
+          id: panel.id,
+          description: panel.description || '',
+          scope: panel.panelScope || 'guild',
+          enabled: config[`${mod.manifest.name}:panel:${panel.id}`] !== false
+        }));
+
+        return {
+          name: mod.manifest.name,
+          displayName: mod.manifest.displayName || mod.manifest.name,
+          category: mod.manifest.category || 'misc',
+          commands,
+          events,
+          panels
+        };
+      });
+
+      // Sort: internal-ish modules first, then alphabetical
+      modules.sort((a, b) => a.name.localeCompare(b.name));
+
+      res.json({ success: true, modules });
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : 'Unknown error';
+      res.status(500).json({ success: false, error: msg });
+    }
+  });
+
+  /**
+   * PUT /api/appstore/components/:module/:type/:name
+   * Toggle a component on/off
+   */
+  router.put('/components/:module/:type/:name', (req: Request, res: Response) => {
+    try {
+      const { module: moduleName, type, name } = req.params;
+      const { enabled } = req.body;
+
+      if (!['command', 'event', 'panel'].includes(type)) {
+        return res.status(400).json({ success: false, error: 'type must be command, event, or panel' });
+      }
+
+      if (typeof enabled !== 'boolean') {
+        return res.status(400).json({ success: false, error: 'enabled (boolean) is required' });
+      }
+
+      const key = `${moduleName}:${type}:${name}`;
+      const config = loadComponentConfig();
+
+      if (enabled) {
+        delete config[key]; // Default is enabled, so just remove the override
+      } else {
+        config[key] = false;
+      }
+
+      saveComponentConfig(config);
+      res.json({ success: true, key, enabled });
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : 'Unknown error';
+      res.status(500).json({ success: false, error: msg });
+    }
+  });
+
   return router;
 }
 
 /**
  * Format module info for API response
  */
-function formatModuleInfo(info: StoreModuleInfo): any {
-  return {
+function formatModuleInfo(info: StoreModuleInfo, includeComponents = false): any {
+  const result: any = {
     name: info.manifest.name,
     displayName: info.manifest.displayName,
     description: info.manifest.description,
@@ -636,11 +749,20 @@ function formatModuleInfo(info: StoreModuleInfo): any {
     author: info.manifest.author,
     category: info.manifest.category,
     premium: info.manifest.premium || false,
+    requiredIntents: info.manifest.requiredIntents || [],
+    requiredPermissions: info.manifest.requiredPermissions || [],
     hasCredentials: !!info.manifest.apiCredentials,
-    apiCredentialsSchema: info.manifest.apiCredentials?.schema || null,
+    apiCredentials: info.manifest.apiCredentials || null,
     repoId: info.repoId,
     repoName: info.repoName,
     installed: info.installed,
     installedVersion: info.installedVersion
   };
+
+  if (includeComponents) {
+    const manager = getAppStoreManager();
+    result.components = manager.getModuleComponents(info.manifest.name, info.repoId);
+  }
+
+  return result;
 }

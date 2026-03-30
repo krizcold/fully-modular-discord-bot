@@ -85,6 +85,9 @@ export interface InstalledModule {
 
   /** Installation timestamp */
   installedAt: string;
+
+  /** Module was installed but bot has not restarted yet */
+  pendingRestart?: boolean;
 }
 
 /** Installed modules tracking file */
@@ -283,6 +286,19 @@ export class AppStoreManager {
       if (fs.existsSync(INSTALLED_CONFIG_PATH)) {
         const content = fs.readFileSync(INSTALLED_CONFIG_PATH, 'utf-8');
         this.installedConfig = JSON.parse(content);
+
+        // Clear pendingRestart flags — bot has restarted, modules are now active
+        let cleared = false;
+        for (const mod of Object.values(this.installedConfig.modules)) {
+          if (mod.pendingRestart) {
+            mod.pendingRestart = false;
+            cleared = true;
+          }
+        }
+        if (cleared) {
+          this.saveInstalled();
+          console.log('[AppStoreManager] Cleared pending restart flags (bot restarted)');
+        }
       } else {
         this.saveInstalled();
       }
@@ -687,7 +703,8 @@ export class AppStoreManager {
         name: moduleName,
         version: moduleInfo.manifest.version,
         installedFrom: repoId,
-        installedAt: new Date().toISOString()
+        installedAt: new Date().toISOString(),
+        pendingRestart: true
       };
 
       this.saveInstalled();
@@ -756,6 +773,44 @@ export class AppStoreManager {
     } catch (error) {
       throw error;
     }
+  }
+
+  /**
+   * Scan a module's directory for components (commands, events, panels).
+   * Works for both cached (repo) and installed (source) modules.
+   */
+  getModuleComponents(moduleName: string, repoId?: string): { commands: string[]; events: string[]; panels: string[] } {
+    const result = { commands: [] as string[], events: [] as string[], panels: [] as string[] };
+
+    // Try repo cache first
+    let moduleDir: string | null = null;
+    if (repoId) {
+      const cacheDir = path.join(this.cacheDir, repoId);
+      const candidate = path.join(cacheDir, moduleName);
+      if (fs.existsSync(candidate)) moduleDir = candidate;
+      // Also check nested modules/ folder
+      const nested = path.join(cacheDir, 'modules', moduleName);
+      if (!moduleDir && fs.existsSync(nested)) moduleDir = nested;
+    }
+
+    // Fallback to installed source
+    if (!moduleDir) {
+      const sourceDir = path.join(getSourceModulesDir(), moduleName);
+      if (fs.existsSync(sourceDir)) moduleDir = sourceDir;
+    }
+
+    if (!moduleDir) return result;
+
+    for (const [type, dir] of [['commands', 'commands'], ['events', 'events'], ['panels', 'panels']] as const) {
+      const fullPath = path.join(moduleDir, dir);
+      if (!fs.existsSync(fullPath)) continue;
+      try {
+        const files = fs.readdirSync(fullPath).filter(f => f.endsWith('.ts') || f.endsWith('.js'));
+        (result as any)[type] = files.map(f => f.replace(/\.(ts|js)$/, ''));
+      } catch { /* ignore */ }
+    }
+
+    return result;
   }
 
   /**
