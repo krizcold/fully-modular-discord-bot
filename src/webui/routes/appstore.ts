@@ -19,6 +19,40 @@ export function createAppStoreRoutes(): Router {
   const router = Router();
 
   // ============================================================================
+  // BUNDLED DATA (single request for all AppStore data)
+  // ============================================================================
+
+  /**
+   * GET /api/appstore/bundle
+   * Returns all AppStore data in a single response to avoid multiple API calls.
+   */
+  router.get('/bundle', async (_req: Request, res: Response) => {
+    try {
+      const manager = getAppStoreManager();
+      const premiumMgr = getPremiumManager();
+
+      const modules = await manager.getAvailableModules();
+      const installed = manager.getInstalledModules();
+      const repos = manager.getRepositories();
+
+      res.json({
+        success: true,
+        modules: modules.map(m => formatModuleInfo(m)),
+        installed,
+        repositories: repos.map(repo => ({
+          ...repo,
+          githubToken: repo.githubToken ? '***' : null
+        })),
+        tiers: premiumMgr.getAllTiers(),
+        guildAssignments: premiumMgr.getAllGuildAssignments()
+      });
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      res.status(500).json({ success: false, error: errorMessage });
+    }
+  });
+
+  // ============================================================================
   // REPOSITORY MANAGEMENT
   // ============================================================================
 
@@ -626,7 +660,9 @@ export function createAppStoreRoutes(): Router {
 
   // ─── Component Management (Commands tab) ───
 
-  const COMPONENT_CONFIG_PATH = path.join(process.env.DATA_DIR || '/data', 'global', 'appstore', 'component-config.json');
+  const APPSTORE_CONFIG_DIR = path.join(process.env.DATA_DIR || '/data', 'global', 'appstore');
+  const COMPONENT_CONFIG_PATH = path.join(APPSTORE_CONFIG_DIR, 'component-config.json');
+  const APPSTORE_CONFIG_PATH = path.join(APPSTORE_CONFIG_DIR, 'config.json');
 
   function loadComponentConfig(): Record<string, boolean> {
     try {
@@ -638,14 +674,127 @@ export function createAppStoreRoutes(): Router {
   }
 
   function saveComponentConfig(config: Record<string, boolean>): void {
-    const dir = path.dirname(COMPONENT_CONFIG_PATH);
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    if (!fs.existsSync(APPSTORE_CONFIG_DIR)) fs.mkdirSync(APPSTORE_CONFIG_DIR, { recursive: true });
     fs.writeFileSync(COMPONENT_CONFIG_PATH, JSON.stringify(config, null, 2));
+  }
+
+  function loadAppStoreConfig(): Record<string, any> {
+    try {
+      if (fs.existsSync(APPSTORE_CONFIG_PATH)) {
+        return JSON.parse(fs.readFileSync(APPSTORE_CONFIG_PATH, 'utf-8'));
+      }
+    } catch { /* ignore */ }
+    return {};
+  }
+
+  function saveAppStoreConfig(config: Record<string, any>): void {
+    if (!fs.existsSync(APPSTORE_CONFIG_DIR)) fs.mkdirSync(APPSTORE_CONFIG_DIR, { recursive: true });
+    fs.writeFileSync(APPSTORE_CONFIG_PATH, JSON.stringify(config, null, 2));
+  }
+
+  /** Map Discord ApplicationCommandOptionType numbers to readable strings */
+  const OPTION_TYPE_NAMES: Record<number, string> = {
+    1: 'SubCommand', 2: 'SubCommandGroup', 3: 'String', 4: 'Integer',
+    5: 'Boolean', 6: 'User', 7: 'Channel', 8: 'Role', 9: 'Mentionable',
+    10: 'Number', 11: 'Attachment'
+  };
+
+  /** Extract command options metadata for API response */
+  function extractCommandOptions(cmd: any): Array<{ name: string; description: string; type: string; required: boolean }> {
+    if (!cmd.options || !Array.isArray(cmd.options)) return [];
+    return cmd.options.map((opt: any) => ({
+      name: opt.name || '',
+      description: opt.description || '',
+      type: OPTION_TYPE_NAMES[opt.type] || String(opt.type),
+      required: !!opt.required
+    }));
+  }
+
+  /** Scan internalSetup directories and return an "Internal" module entry */
+  function getInternalComponents(config: Record<string, boolean>) {
+    const isProd = process.env.NODE_ENV !== 'development';
+    const ext = isProd ? '.js' : '.ts';
+    const internalBase = path.resolve(__dirname, '../../bot/internalSetup');
+
+    const commands: any[] = [];
+    const events: any[] = [];
+    const panels: any[] = [];
+
+    // --- Commands ---
+    const cmdDir = path.join(internalBase, 'commands');
+    if (fs.existsSync(cmdDir)) {
+      for (const file of fs.readdirSync(cmdDir)) {
+        if (!file.endsWith(ext) || file.includes('.disabled')) continue;
+        try {
+          const mod = require(path.join(cmdDir, file));
+          const cmd = mod.default || mod;
+          if (cmd && cmd.name) {
+            commands.push({
+              name: cmd.name,
+              description: cmd.description || '',
+              type: 'ChatInput',
+              options: extractCommandOptions(cmd),
+              testOnly: !!cmd.testOnly,
+              devOnly: !!cmd.devOnly,
+              enabled: config[`_internal:command:${cmd.name}`] !== false
+            });
+          }
+        } catch { /* skip broken files */ }
+      }
+    }
+
+    // --- Events ---
+    const evtDir = path.join(internalBase, 'events');
+    if (fs.existsSync(evtDir)) {
+      for (const eventFolder of fs.readdirSync(evtDir)) {
+        const eventPath = path.join(evtDir, eventFolder);
+        if (!fs.statSync(eventPath).isDirectory()) continue;
+        const handlers = fs.readdirSync(eventPath).filter(f => f.endsWith(ext) && !f.includes('.disabled'));
+        if (handlers.length > 0) {
+          events.push({
+            name: eventFolder,
+            handlerCount: handlers.length,
+            handlers: handlers.map(h => h.replace(ext, '')),
+            enabled: config[`_internal:event:${eventFolder}`] !== false
+          });
+        }
+      }
+    }
+
+    // --- Panels ---
+    const pnlDir = path.join(internalBase, 'panels');
+    if (fs.existsSync(pnlDir)) {
+      for (const file of fs.readdirSync(pnlDir)) {
+        if (!file.endsWith(ext) || file.includes('.disabled')) continue;
+        try {
+          const mod = require(path.join(pnlDir, file));
+          const panel = mod.default || mod;
+          if (panel && (panel.id || panel.name)) {
+            panels.push({
+              name: panel.name || panel.id,
+              id: panel.id || file.replace(ext, ''),
+              description: panel.description || '',
+              scope: panel.panelScope || 'guild',
+              enabled: config[`_internal:panel:${panel.id || file.replace(ext, '')}`] !== false
+            });
+          }
+        } catch { /* skip broken files */ }
+      }
+    }
+
+    return {
+      name: '_internal',
+      displayName: 'Internal',
+      category: 'core',
+      commands,
+      events,
+      panels
+    };
   }
 
   /**
    * GET /api/appstore/components
-   * Returns all components from loaded modules, grouped by module
+   * Returns all components from loaded modules + internalSetup, grouped by module
    */
   router.get('/components', (req: Request, res: Response) => {
     try {
@@ -653,15 +802,24 @@ export function createAppStoreRoutes(): Router {
       const allModules = registry.getAllModules();
       const config = loadComponentConfig();
 
-      const modules = allModules.map(mod => {
+      const modules: any[] = [];
+
+      // Add internalSetup as the first group
+      modules.push(getInternalComponents(config));
+
+      // Add loaded AppStore/module components
+      for (const mod of allModules) {
         const commands = (mod.commands || []).map((cmd: any) => ({
           name: cmd.name,
           description: cmd.description || '',
           type: cmd.type || 'ChatInput',
+          options: extractCommandOptions(cmd),
+          testOnly: !!cmd.testOnly,
+          devOnly: !!cmd.devOnly,
           enabled: config[`${mod.manifest.name}:command:${cmd.name}`] !== false
         }));
 
-        const events: Array<{ name: string; handlerCount: number; enabled: boolean }> = [];
+        const events: Array<{ name: string; handlerCount: number; handlers?: string[]; enabled: boolean }> = [];
         if (mod.events) {
           for (const [eventName, handlers] of mod.events.entries()) {
             events.push({
@@ -680,18 +838,15 @@ export function createAppStoreRoutes(): Router {
           enabled: config[`${mod.manifest.name}:panel:${panel.id}`] !== false
         }));
 
-        return {
+        modules.push({
           name: mod.manifest.name,
           displayName: mod.manifest.displayName || mod.manifest.name,
           category: mod.manifest.category || 'misc',
           commands,
           events,
           panels
-        };
-      });
-
-      // Sort: internal-ish modules first, then alphabetical
-      modules.sort((a, b) => a.name.localeCompare(b.name));
+        });
+      }
 
       res.json({ success: true, modules });
     } catch (error) {
@@ -728,6 +883,44 @@ export function createAppStoreRoutes(): Router {
 
       saveComponentConfig(config);
       res.json({ success: true, key, enabled });
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : 'Unknown error';
+      res.status(500).json({ success: false, error: msg });
+    }
+  });
+
+  // ─── AppStore Config (cleanup toggle, etc.) ───
+
+  /**
+   * GET /api/appstore/config
+   * Returns AppStore general config (cleanup toggle, etc.)
+   */
+  router.get('/config', (_req: Request, res: Response) => {
+    try {
+      const config = loadAppStoreConfig();
+      res.json({
+        success: true,
+        autoCleanup: config.autoCleanup === true  // default false
+      });
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : 'Unknown error';
+      res.status(500).json({ success: false, error: msg });
+    }
+  });
+
+  /**
+   * PUT /api/appstore/config
+   * Update AppStore general config
+   * Body: { autoCleanup?: boolean }
+   */
+  router.put('/config', (req: Request, res: Response) => {
+    try {
+      const config = loadAppStoreConfig();
+      if (typeof req.body.autoCleanup === 'boolean') {
+        config.autoCleanup = req.body.autoCleanup;
+      }
+      saveAppStoreConfig(config);
+      res.json({ success: true, autoCleanup: config.autoCleanup === true });
     } catch (error) {
       const msg = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({ success: false, error: msg });

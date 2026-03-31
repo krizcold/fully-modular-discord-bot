@@ -29,24 +29,18 @@ function AppStorePanel({ onModuleInstalled }) {
     try {
       setLoading(true);
       setError(null);
-      const [modulesRes, installedRes, reposRes, tiersRes, guildsRes] = await Promise.all([
-        api.get('/appstore/modules'),
-        api.get('/appstore/installed'),
-        api.get('/appstore/repos'),
-        api.get('/appstore/premium/tiers'),
-        api.get('/appstore/premium/guilds')
-      ]);
+      const res = await api.get('/appstore/bundle');
 
-      setModules(modulesRes.modules || []);
+      setModules(res.modules || []);
       // Convert installed array to object keyed by module name
-      const installedArr = installedRes.modules || [];
+      const installedArr = res.installed || [];
       const installedMap = Array.isArray(installedArr)
         ? installedArr.reduce((acc, m) => { acc[m.name] = m; return acc; }, {})
         : installedArr;
       setInstalled(installedMap);
-      setRepositories(reposRes.repositories || []);
-      setTiers(tiersRes.tiers || {});
-      setGuildAssignments(guildsRes.guilds || {});
+      setRepositories(res.repositories || []);
+      setTiers(res.tiers || {});
+      setGuildAssignments(res.guildAssignments || {});
     } catch (err) {
       setError(err.message);
     } finally {
@@ -182,6 +176,23 @@ function AppStorePanel({ onModuleInstalled }) {
 // Modules View Component
 function ModulesView({ modules, installed, pendingRestart, categories, categoryFilter, onCategoryChange, onSelectModule, onModuleChanged, repositories }) {
   const installedCount = Object.keys(installed).length;
+  const [autoCleanup, setAutoCleanup] = useState(false);
+  const [cleanupLoaded, setCleanupLoaded] = useState(false);
+
+  useEffect(() => {
+    api.get('/appstore/config')
+      .then(res => { if (res.success) setAutoCleanup(!!res.autoCleanup); })
+      .catch(() => {})
+      .finally(() => setCleanupLoaded(true));
+  }, []);
+
+  async function toggleCleanup() {
+    const newVal = !autoCleanup;
+    setAutoCleanup(newVal);
+    try {
+      await api.put('/appstore/config', { autoCleanup: newVal });
+    } catch { setAutoCleanup(!newVal); }
+  }
 
   return (
     <div>
@@ -193,25 +204,35 @@ function ModulesView({ modules, installed, pendingRestart, categories, categoryF
           </p>
         </div>
 
-        {/* Category Filter */}
-        <select
-          value={categoryFilter}
-          onChange={(e) => onCategoryChange(e.target.value)}
-          style={{
-            padding: '8px 15px',
-            background: '#2a2a2a',
-            border: '1px solid #444',
-            borderRadius: '6px',
-            color: '#e0e0e0',
-            fontSize: '0.9rem'
-          }}
-        >
-          {categories.map(cat => (
-            <option key={cat} value={cat}>
-              {cat === 'all' ? 'All Categories' : cat.charAt(0).toUpperCase() + cat.slice(1)}
-            </option>
-          ))}
-        </select>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '15px' }}>
+          {/* Auto Cleanup Toggle */}
+          {cleanupLoaded && (
+            <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }} title="When enabled, orphan commands/events are automatically removed on bot startup. Keep disabled if running multiple bot instances.">
+              <span style={{ color: '#888', fontSize: '0.78rem' }}>Auto Cleanup</span>
+              <ToggleSwitch checked={autoCleanup} onChange={toggleCleanup} />
+            </div>
+          )}
+
+          {/* Category Filter */}
+          <select
+            value={categoryFilter}
+            onChange={(e) => onCategoryChange(e.target.value)}
+            style={{
+              padding: '8px 15px',
+              background: '#2a2a2a',
+              border: '1px solid #444',
+              borderRadius: '6px',
+              color: '#e0e0e0',
+              fontSize: '0.9rem'
+            }}
+          >
+            {categories.map(cat => (
+              <option key={cat} value={cat}>
+                {cat === 'all' ? 'All Categories' : cat.charAt(0).toUpperCase() + cat.slice(1)}
+              </option>
+            ))}
+          </select>
+        </div>
       </div>
 
       {repositories.length === 0 ? (
@@ -253,11 +274,29 @@ function ModulesView({ modules, installed, pendingRestart, categories, categoryF
   );
 }
 
+// Toggle switch helper
+function ToggleSwitch({ checked, onChange }) {
+  return (
+    <label style={{ position: 'relative', display: 'inline-block', width: '36px', height: '20px', cursor: 'pointer', flexShrink: 0 }}>
+      <input type="checkbox" checked={checked} onChange={onChange} style={{ display: 'none' }} />
+      <span style={{
+        position: 'absolute', top: 0, left: 0, right: 0, bottom: 0,
+        background: checked ? '#3ba55d' : '#555', borderRadius: '10px', transition: '0.2s'
+      }}>
+        <span style={{
+          position: 'absolute', left: checked ? '18px' : '2px', top: '2px',
+          width: '16px', height: '16px', background: '#fff', borderRadius: '50%', transition: '0.2s'
+        }}></span>
+      </span>
+    </label>
+  );
+}
+
 // Module Card Component
 function CommandsView({ showSuccess, setError }) {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
-  const [expanded, setExpanded] = useState(new Set());
+  const [expanded, setExpanded] = useState(new Set(['_internal']));
 
   useEffect(() => {
     api.get('/appstore/components')
@@ -269,7 +308,6 @@ function CommandsView({ showSuccess, setError }) {
   async function toggleComponent(moduleName, type, name, currentEnabled) {
     try {
       await api.put(`/appstore/components/${moduleName}/${type}/${name}`, { enabled: !currentEnabled });
-      // Refresh
       const res = await api.get('/appstore/components');
       if (res.success) setData(res.modules);
       showSuccess(`${name} ${!currentEnabled ? 'enabled' : 'disabled'}`);
@@ -287,7 +325,7 @@ function CommandsView({ showSuccess, setError }) {
   }
 
   if (loading) return <div className="loading">Loading components...</div>;
-  if (!data || data.length === 0) return <p style={{ color: '#888' }}>No loaded modules found. Components appear here after the bot starts with modules installed.</p>;
+  if (!data || data.length === 0) return <p style={{ color: '#888' }}>No components found. Components appear here after the bot starts.</p>;
 
   const totalCommands = data.reduce((sum, m) => sum + m.commands.length, 0);
   const totalEvents = data.reduce((sum, m) => sum + m.events.length, 0);
@@ -302,9 +340,10 @@ function CommandsView({ showSuccess, setError }) {
         const isExpanded = expanded.has(mod.name);
         const componentCount = mod.commands.length + mod.events.length + mod.panels.length;
         if (componentCount === 0) return null;
+        const isInternal = mod.name === '_internal';
 
         return (
-          <div key={mod.name} style={{ background: '#2c2f33', borderRadius: '8px', marginBottom: '8px', overflow: 'hidden' }}>
+          <div key={mod.name} style={{ background: '#2c2f33', borderRadius: '8px', marginBottom: '8px', overflow: 'hidden', border: isInternal ? '1px solid #3a3a3a' : 'none' }}>
             <div
               onClick={() => toggleExpand(mod.name)}
               style={{
@@ -312,9 +351,11 @@ function CommandsView({ showSuccess, setError }) {
                 borderBottom: isExpanded ? '1px solid #444' : 'none'
               }}
             >
-              <div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
                 <span style={{ color: '#fff', fontWeight: 600 }}>{mod.displayName}</span>
-                <span style={{ color: '#666', marginLeft: '10px', fontSize: '0.8rem' }}>{mod.category}</span>
+                <span style={{ color: isInternal ? '#5865F2' : '#666', fontSize: '0.75rem', background: isInternal ? 'rgba(88,101,242,0.15)' : 'transparent', padding: isInternal ? '1px 8px' : '0', borderRadius: '8px' }}>
+                  {isInternal ? 'CORE' : mod.category}
+                </span>
               </div>
               <div style={{ display: 'flex', gap: '10px', alignItems: 'center' }}>
                 {mod.commands.length > 0 && <span style={{ color: '#2dd4a8', fontSize: '0.75rem' }}>{mod.commands.length} cmd</span>}
@@ -328,25 +369,30 @@ function CommandsView({ showSuccess, setError }) {
               <div style={{ padding: '12px 16px' }}>
                 {mod.commands.length > 0 && (
                   <div style={{ marginBottom: '12px' }}>
-                    <div style={{ color: '#2dd4a8', fontSize: '0.78rem', fontWeight: 600, marginBottom: '6px' }}>Commands</div>
+                    <div style={{ color: '#2dd4a8', fontSize: '0.78rem', fontWeight: 600, marginBottom: '8px' }}>Commands</div>
                     {mod.commands.map(cmd => (
-                      <div key={cmd.name} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '6px 0', borderBottom: '1px solid #3a3a3a' }}>
-                        <div>
-                          <span style={{ color: '#ccc', fontFamily: 'monospace', fontSize: '0.85rem' }}>/{cmd.name}</span>
-                          {cmd.description && <span style={{ color: '#666', marginLeft: '10px', fontSize: '0.78rem' }}>{cmd.description}</span>}
+                      <div key={cmd.name} style={{ padding: '8px 0', borderBottom: '1px solid #3a3a3a' }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                            <span style={{ color: '#e0e0e0', fontFamily: 'monospace', fontSize: '0.88rem', fontWeight: 600 }}>/{cmd.name}</span>
+                            {cmd.testOnly && <span style={{ color: '#fbbf24', fontSize: '0.68rem', background: 'rgba(251,191,36,0.12)', padding: '1px 6px', borderRadius: '6px' }}>TEST</span>}
+                            {cmd.devOnly && <span style={{ color: '#ed4245', fontSize: '0.68rem', background: 'rgba(237,66,69,0.12)', padding: '1px 6px', borderRadius: '6px' }}>DEV</span>}
+                          </div>
+                          <ToggleSwitch checked={cmd.enabled} onChange={() => toggleComponent(mod.name, 'command', cmd.name, cmd.enabled)} />
                         </div>
-                        <label style={{ position: 'relative', display: 'inline-block', width: '36px', height: '20px', cursor: 'pointer' }}>
-                          <input type="checkbox" checked={cmd.enabled} onChange={() => toggleComponent(mod.name, 'command', cmd.name, cmd.enabled)} style={{ display: 'none' }} />
-                          <span style={{
-                            position: 'absolute', top: 0, left: 0, right: 0, bottom: 0,
-                            background: cmd.enabled ? '#3ba55d' : '#555', borderRadius: '10px', transition: '0.2s'
-                          }}>
-                            <span style={{
-                              position: 'absolute', left: cmd.enabled ? '18px' : '2px', top: '2px',
-                              width: '16px', height: '16px', background: '#fff', borderRadius: '50%', transition: '0.2s'
-                            }}></span>
-                          </span>
-                        </label>
+                        {cmd.description && <div style={{ color: '#888', fontSize: '0.8rem', marginTop: '3px' }}>{cmd.description}</div>}
+                        {cmd.options && cmd.options.length > 0 && (
+                          <div style={{ marginTop: '6px', paddingLeft: '12px', borderLeft: '2px solid #3a3a3a' }}>
+                            {cmd.options.map(opt => (
+                              <div key={opt.name} style={{ display: 'flex', alignItems: 'baseline', gap: '6px', padding: '2px 0', fontSize: '0.78rem' }}>
+                                <span style={{ color: '#2dd4a8', fontFamily: 'monospace' }}>{opt.name}</span>
+                                <span style={{ color: '#555', fontSize: '0.7rem' }}>{opt.type}</span>
+                                {opt.required && <span style={{ color: '#ed4245', fontSize: '0.68rem' }}>required</span>}
+                                {opt.description && <span style={{ color: '#666' }}>— {opt.description}</span>}
+                              </div>
+                            ))}
+                          </div>
+                        )}
                       </div>
                     ))}
                   </div>
@@ -354,22 +400,15 @@ function CommandsView({ showSuccess, setError }) {
 
                 {mod.events.length > 0 && (
                   <div style={{ marginBottom: '12px' }}>
-                    <div style={{ color: '#5865F2', fontSize: '0.78rem', fontWeight: 600, marginBottom: '6px' }}>Events</div>
+                    <div style={{ color: '#5865F2', fontSize: '0.78rem', fontWeight: 600, marginBottom: '8px' }}>Events</div>
                     {mod.events.map(evt => (
-                      <div key={evt.name} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '6px 0', borderBottom: '1px solid #3a3a3a' }}>
-                        <span style={{ color: '#ccc', fontSize: '0.85rem' }}>{evt.name}</span>
-                        <label style={{ position: 'relative', display: 'inline-block', width: '36px', height: '20px', cursor: 'pointer' }}>
-                          <input type="checkbox" checked={evt.enabled} onChange={() => toggleComponent(mod.name, 'event', evt.name, evt.enabled)} style={{ display: 'none' }} />
-                          <span style={{
-                            position: 'absolute', top: 0, left: 0, right: 0, bottom: 0,
-                            background: evt.enabled ? '#3ba55d' : '#555', borderRadius: '10px', transition: '0.2s'
-                          }}>
-                            <span style={{
-                              position: 'absolute', left: evt.enabled ? '18px' : '2px', top: '2px',
-                              width: '16px', height: '16px', background: '#fff', borderRadius: '50%', transition: '0.2s'
-                            }}></span>
-                          </span>
-                        </label>
+                      <div key={evt.name} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '8px 0', borderBottom: '1px solid #3a3a3a' }}>
+                        <div>
+                          <span style={{ color: '#e0e0e0', fontFamily: 'monospace', fontSize: '0.85rem' }}>{evt.name}</span>
+                          {evt.handlerCount > 1 && <span style={{ color: '#666', marginLeft: '8px', fontSize: '0.72rem' }}>{evt.handlerCount} handlers</span>}
+                          {evt.handlers && <div style={{ color: '#666', fontSize: '0.72rem', marginTop: '2px' }}>{evt.handlers.join(', ')}</div>}
+                        </div>
+                        <ToggleSwitch checked={evt.enabled} onChange={() => toggleComponent(mod.name, 'event', evt.name, evt.enabled)} />
                       </div>
                     ))}
                   </div>
@@ -377,25 +416,15 @@ function CommandsView({ showSuccess, setError }) {
 
                 {mod.panels.length > 0 && (
                   <div>
-                    <div style={{ color: '#fbbf24', fontSize: '0.78rem', fontWeight: 600, marginBottom: '6px' }}>Panels</div>
+                    <div style={{ color: '#fbbf24', fontSize: '0.78rem', fontWeight: 600, marginBottom: '8px' }}>Panels</div>
                     {mod.panels.map(panel => (
-                      <div key={panel.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '6px 0', borderBottom: '1px solid #3a3a3a' }}>
+                      <div key={panel.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '8px 0', borderBottom: '1px solid #3a3a3a' }}>
                         <div>
-                          <span style={{ color: '#ccc', fontSize: '0.85rem' }}>{panel.name}</span>
-                          <span style={{ color: '#666', marginLeft: '8px', fontSize: '0.72rem' }}>{panel.scope}</span>
+                          <span style={{ color: '#e0e0e0', fontSize: '0.85rem' }}>{panel.name}</span>
+                          <span style={{ color: '#555', marginLeft: '8px', fontSize: '0.7rem', background: 'rgba(255,255,255,0.05)', padding: '1px 6px', borderRadius: '6px' }}>{panel.scope}</span>
+                          {panel.description && <div style={{ color: '#666', fontSize: '0.72rem', marginTop: '2px' }}>{panel.description}</div>}
                         </div>
-                        <label style={{ position: 'relative', display: 'inline-block', width: '36px', height: '20px', cursor: 'pointer' }}>
-                          <input type="checkbox" checked={panel.enabled} onChange={() => toggleComponent(mod.name, 'panel', panel.id, panel.enabled)} style={{ display: 'none' }} />
-                          <span style={{
-                            position: 'absolute', top: 0, left: 0, right: 0, bottom: 0,
-                            background: panel.enabled ? '#3ba55d' : '#555', borderRadius: '10px', transition: '0.2s'
-                          }}>
-                            <span style={{
-                              position: 'absolute', left: panel.enabled ? '18px' : '2px', top: '2px',
-                              width: '16px', height: '16px', background: '#fff', borderRadius: '50%', transition: '0.2s'
-                            }}></span>
-                          </span>
-                        </label>
+                        <ToggleSwitch checked={panel.enabled} onChange={() => toggleComponent(mod.name, 'panel', panel.id, panel.enabled)} />
                       </div>
                     ))}
                   </div>
@@ -656,21 +685,25 @@ function ModuleDetailView({ module, installed, pending, onBack, onInstall, onUni
           <div style={{ marginBottom: '20px', padding: '15px', background: '#1a1a1a', borderRadius: '8px' }}>
             <h4 style={{ margin: '0 0 12px 0', color: '#888' }}>Included Components</h4>
             {components.commands.length > 0 && (
-              <div style={{ marginBottom: '10px' }}>
+              <div style={{ marginBottom: '12px' }}>
                 <span style={{ color: '#2dd4a8', fontSize: '0.8rem', fontWeight: 600 }}>Commands ({components.commands.length})</span>
-                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px', marginTop: '6px' }}>
+                <div style={{ marginTop: '6px' }}>
                   {components.commands.map(c => (
-                    <span key={c} style={{ background: '#2c2f33', color: '#ccc', padding: '3px 10px', borderRadius: '12px', fontSize: '0.78rem' }}>/{c}</span>
+                    <div key={typeof c === 'string' ? c : c.name} style={{ padding: '4px 0', borderBottom: '1px solid #2c2f33' }}>
+                      <span style={{ color: '#ccc', fontFamily: 'monospace', fontSize: '0.82rem' }}>/{typeof c === 'string' ? c : c.name}</span>
+                    </div>
                   ))}
                 </div>
               </div>
             )}
             {components.events.length > 0 && (
-              <div style={{ marginBottom: '10px' }}>
+              <div style={{ marginBottom: '12px' }}>
                 <span style={{ color: '#5865F2', fontSize: '0.8rem', fontWeight: 600 }}>Events ({components.events.length})</span>
-                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px', marginTop: '6px' }}>
+                <div style={{ marginTop: '6px' }}>
                   {components.events.map(e => (
-                    <span key={e} style={{ background: '#2c2f33', color: '#ccc', padding: '3px 10px', borderRadius: '12px', fontSize: '0.78rem' }}>{e}</span>
+                    <div key={typeof e === 'string' ? e : e.name} style={{ padding: '4px 0', borderBottom: '1px solid #2c2f33' }}>
+                      <span style={{ color: '#ccc', fontSize: '0.82rem' }}>{typeof e === 'string' ? e : e.name}</span>
+                    </div>
                   ))}
                 </div>
               </div>
@@ -678,9 +711,11 @@ function ModuleDetailView({ module, installed, pending, onBack, onInstall, onUni
             {components.panels.length > 0 && (
               <div>
                 <span style={{ color: '#fbbf24', fontSize: '0.8rem', fontWeight: 600 }}>Panels ({components.panels.length})</span>
-                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px', marginTop: '6px' }}>
+                <div style={{ marginTop: '6px' }}>
                   {components.panels.map(p => (
-                    <span key={p} style={{ background: '#2c2f33', color: '#ccc', padding: '3px 10px', borderRadius: '12px', fontSize: '0.78rem' }}>{p}</span>
+                    <div key={typeof p === 'string' ? p : p.name} style={{ padding: '4px 0', borderBottom: '1px solid #2c2f33' }}>
+                      <span style={{ color: '#ccc', fontSize: '0.82rem' }}>{typeof p === 'string' ? p : p.name}</span>
+                    </div>
                   ))}
                 </div>
               </div>
@@ -1104,7 +1139,7 @@ function PremiumTiersView({ tiers, guildAssignments, onRefresh, showSuccess, set
     try {
       setProcessing(true);
       setError(null);
-      const res = await api.put(`/appstore/premium/guilds/${newGuildId}`, { tier: selectedTier });
+      const res = await api.put(`/appstore/premium/guilds/${newGuildId}`, { tierId: selectedTier });
       if (res.success) {
         showSuccess(`Guild assigned to ${selectedTier} tier`);
         setNewGuildId('');

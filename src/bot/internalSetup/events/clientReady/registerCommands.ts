@@ -10,6 +10,20 @@ import areCommandsDifferent from '../../utils/areCommandsDifferent';
 import 'dotenv/config';
 import { getConfigProperty } from '../../utils/configManager';
 import { loadGlobalData, saveGlobalData } from '../../utils/dataManager';
+import * as fs from 'fs';
+import * as path from 'path';
+
+/** Check if auto-cleanup is enabled in AppStore config (default: false) */
+function isAutoCleanupEnabled(): boolean {
+  try {
+    const configPath = path.join(process.env.DATA_DIR || '/data', 'global', 'appstore', 'config.json');
+    if (fs.existsSync(configPath)) {
+      const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+      return config.autoCleanup === true;
+    }
+  } catch { /* ignore */ }
+  return false;
+}
 
 const testMode = getConfigProperty<boolean>('testMode');
 const guildId = process.env.GUILD_ID;
@@ -183,9 +197,12 @@ export default async function registerCommands(client: Client) {
       await commandRegistration(commandData, localCommand, existingCommand, guild, client);
     }
 
-    
+
+    // Remove orphan commands only if auto-cleanup is enabled (default: OFF)
+    const cleanupEnabled = isAutoCleanupEnabled();
+
     // Remove global commands that are no longer present locally
-    if (globalCommands) {
+    if (cleanupEnabled && globalCommands) {
       for (const appCommand of globalCommands.values()) {
         // Find local command matching name AND type
         const foundLocal = localCommands.some(localCmd =>
@@ -211,31 +228,37 @@ export default async function registerCommands(client: Client) {
           }
         }
       }
+    } else if (!cleanupEnabled && globalCommands) {
+      console.log('[i] Auto-cleanup disabled — skipping orphan global command removal');
     }
 
     // Remove local (guild) commands that are no longer present locally or shouldn't be local
-    for (const guildCommand of guildCommands.values()) {
-      // Find local command matching name AND type
-      const foundLocal = localCommands.some(localCmd =>
-        localCmd.name === guildCommand.name &&
-        (localCmd.type ?? typeChat) === guildCommand.type && // Compare type
-        localCmd.testOnly // Ensure it's marked as testOnly locally
-      );
+    if (cleanupEnabled) {
+      for (const guildCommand of guildCommands.values()) {
+        // Find local command matching name AND type
+        const foundLocal = localCommands.some(localCmd =>
+          localCmd.name === guildCommand.name &&
+          (localCmd.type ?? typeChat) === guildCommand.type && // Compare type
+          localCmd.testOnly // Ensure it's marked as testOnly locally
+        );
 
-      if (!foundLocal) {
-        // Don't delete if in testMode and it *should* be a global command (we handle global deletion above)
-        // This check might be redundant if the above global check works correctly, but safe to keep
-        const correspondingLocal = localCommands.find(cmd => cmd.name === guildCommand.name && (cmd.type ?? typeChat) === guildCommand.type);
-        if (testMode && correspondingLocal && !correspondingLocal.testOnly) {
-          continue;
-        }
-        try {
-          await guild.commands.delete(guildCommand.id);
-          console.log(`Deleted local command "${guildCommand.name}" (Type: ${ApplicationCommandType[guildCommand.type]}) as it is no longer found locally or not marked testOnly.`);
-        } catch(deleteError){
-          console.error(`Error deleting local command "${guildCommand.name}":`, deleteError);
+        if (!foundLocal) {
+          // Don't delete if in testMode and it *should* be a global command (we handle global deletion above)
+          // This check might be redundant if the above global check works correctly, but safe to keep
+          const correspondingLocal = localCommands.find(cmd => cmd.name === guildCommand.name && (cmd.type ?? typeChat) === guildCommand.type);
+          if (testMode && correspondingLocal && !correspondingLocal.testOnly) {
+            continue;
+          }
+          try {
+            await guild.commands.delete(guildCommand.id);
+            console.log(`Deleted local command "${guildCommand.name}" (Type: ${ApplicationCommandType[guildCommand.type]}) as it is no longer found locally or not marked testOnly.`);
+          } catch(deleteError){
+            console.error(`Error deleting local command "${guildCommand.name}":`, deleteError);
+          }
         }
       }
+    } else {
+      console.log('[i] Auto-cleanup disabled — skipping orphan guild command removal');
     }
 
     // Save current test guild for future cleanup tracking
