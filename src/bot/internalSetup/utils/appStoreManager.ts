@@ -508,24 +508,58 @@ export class AppStoreManager {
   }
 
   /**
+   * Build an authenticated URL for git operations.
+   * Supports both formats:
+   *   - GitHub PAT (ghp_/github_pat_): https://x-access-token:TOKEN@github.com/...
+   *   - Classic token / other providers: https://TOKEN@github.com/...
+   */
+  private buildAuthUrl(repo: AppStoreRepository): string {
+    if (!repo.githubToken) return repo.url;
+    const urlObj = new URL(repo.url);
+    const token = repo.githubToken;
+    if (token.startsWith('ghp_') || token.startsWith('github_pat_')) {
+      urlObj.username = 'x-access-token';
+      urlObj.password = token;
+    } else {
+      urlObj.username = token;
+    }
+    return urlObj.toString();
+  }
+
+  /**
+   * Test if a repo URL + token combination is reachable.
+   * Uses git ls-remote (fast, no data transfer).
+   */
+  testRepoAccess(repo: AppStoreRepository): { ok: boolean; error?: string } {
+    try {
+      const testUrl = this.buildAuthUrl(repo);
+      execSync(`git ls-remote --exit-code "${testUrl}" HEAD`, {
+        stdio: 'pipe',
+        timeout: 15000
+      });
+      return { ok: true };
+    } catch (err: any) {
+      const stderr = err.stderr?.toString() || '';
+      if (stderr.includes('Authentication failed') || stderr.includes('could not read Username')) {
+        return { ok: false, error: 'Authentication failed — check your GitHub token' };
+      }
+      if (stderr.includes('not found') || stderr.includes('Repository not found')) {
+        return { ok: false, error: 'Repository not found — check the URL' };
+      }
+      return { ok: false, error: stderr.split('\n')[0] || 'Could not reach repository' };
+    }
+  }
+
+  /**
    * Clone a repository
    */
   private gitClone(repo: AppStoreRepository, targetDir: string): void {
-    // Validate repo config to prevent command injection
     const validation = validateRepoConfig(repo);
     if (!validation.valid) {
       throw new Error(`Invalid repository configuration: ${validation.error}`);
     }
 
-    let cloneUrl = repo.url;
-
-    // Add token for private repos
-    if (repo.githubToken) {
-      const urlObj = new URL(repo.url);
-      urlObj.username = repo.githubToken;
-      cloneUrl = urlObj.toString();
-    }
-
+    const cloneUrl = this.buildAuthUrl(repo);
     execSync(`git clone --depth 1 --branch "${repo.branch}" "${cloneUrl}" "${targetDir}"`, {
       stdio: 'pipe'
     });
@@ -535,21 +569,16 @@ export class AppStoreManager {
    * Pull latest from a repository
    */
   private gitPull(repoDir: string, repo: AppStoreRepository): void {
-    // Validate repo config to prevent command injection
     const validation = validateRepoConfig(repo);
     if (!validation.valid) {
       throw new Error(`Invalid repository configuration: ${validation.error}`);
     }
 
-    // Set credentials if needed
-    if (repo.githubToken) {
-      const urlObj = new URL(repo.url);
-      urlObj.username = repo.githubToken;
-      execSync(`git remote set-url origin "${urlObj.toString()}"`, {
-        cwd: repoDir,
-        stdio: 'pipe'
-      });
-    }
+    const authUrl = this.buildAuthUrl(repo);
+    execSync(`git remote set-url origin "${authUrl}"`, {
+      cwd: repoDir,
+      stdio: 'pipe'
+    });
 
     execSync(`git fetch origin "${repo.branch}" && git reset --hard "origin/${repo.branch}"`, {
       cwd: repoDir,

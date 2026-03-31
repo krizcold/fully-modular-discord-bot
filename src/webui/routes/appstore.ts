@@ -112,6 +112,17 @@ export function createAppStoreRoutes(): Router {
       }
 
       const manager = getAppStoreManager();
+
+      // Test access before saving — catches bad tokens / wrong URLs early
+      const testRepo = { url, branch: branch || 'main', githubToken: githubToken || null } as any;
+      const access = manager.testRepoAccess(testRepo);
+      if (!access.ok) {
+        return res.status(400).json({
+          success: false,
+          error: access.error || 'Could not access repository'
+        });
+      }
+
       const repo = manager.addRepository(
         name,
         url,
