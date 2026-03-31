@@ -903,6 +903,71 @@ export class AppStoreManager {
   }
 
   /**
+   * Auto-update installed modules on startup.
+   * Pulls latest from all repos, then re-copies installed modules from updated cache.
+   */
+  async autoUpdateModules(): Promise<{ updated: string[]; errors: string[] }> {
+    const updated: string[] = [];
+    const errors: string[] = [];
+    const installed = this.getInstalledModules();
+
+    if (installed.length === 0) {
+      console.log('[AppStoreManager] No installed modules to update');
+      return { updated, errors };
+    }
+
+    // Pull latest from all repos that have installed modules
+    const repoIds = new Set(installed.map(m => m.installedFrom));
+    for (const repoId of repoIds) {
+      const repo = this.getRepository(repoId);
+      if (!repo) continue;
+      try {
+        await this.refreshRepository(repoId);
+        console.log(`[AppStoreManager] Refreshed repository: ${repo.name}`);
+      } catch (err) {
+        console.error(`[AppStoreManager] Failed to refresh ${repo.name}:`, err);
+        errors.push(`Failed to refresh ${repo.name}`);
+      }
+    }
+
+    // Re-copy each installed module from the updated cache
+    for (const mod of installed) {
+      try {
+        const modules = this.moduleCache.get(mod.installedFrom);
+        const moduleInfo = modules?.find(m => m.manifest.name === mod.name);
+        if (!moduleInfo) {
+          console.warn(`[AppStoreManager] Module ${mod.name} not found in cache after refresh`);
+          continue;
+        }
+
+        const sourceDir = path.join(getSourceModulesDir(), mod.name);
+        if (fs.existsSync(sourceDir)) {
+          fs.rmSync(sourceDir, { recursive: true, force: true });
+        }
+        this.copyDirectory(moduleInfo.repoPath, sourceDir);
+
+        // Update version tracking
+        if (mod.version !== moduleInfo.manifest.version) {
+          this.installedConfig.modules[mod.name].version = moduleInfo.manifest.version;
+          console.log(`[AppStoreManager] Updated ${mod.name}: ${mod.version} -> ${moduleInfo.manifest.version}`);
+        } else {
+          console.log(`[AppStoreManager] Re-synced ${mod.name} (v${mod.version})`);
+        }
+        updated.push(mod.name);
+      } catch (err) {
+        console.error(`[AppStoreManager] Failed to update ${mod.name}:`, err);
+        errors.push(mod.name);
+      }
+    }
+
+    if (updated.length > 0) {
+      this.saveInstalled();
+    }
+
+    return { updated, errors };
+  }
+
+  /**
    * Copy directory recursively
    */
   private copyDirectory(src: string, dest: string): void {

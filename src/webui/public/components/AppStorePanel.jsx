@@ -174,21 +174,26 @@ function AppStorePanel({ onModuleInstalled }) {
 function ModulesView({ modules, installed, pendingRestart, categories, categoryFilter, onCategoryChange, onSelectModule, onModuleChanged, repositories }) {
   const installedCount = Object.keys(installed).length;
   const [autoCleanup, setAutoCleanup] = useState(false);
-  const [cleanupLoaded, setCleanupLoaded] = useState(false);
+  const [autoUpdate, setAutoUpdate] = useState(true);
+  const [configLoaded, setConfigLoaded] = useState(false);
 
   useEffect(() => {
     api.get('/appstore/config')
-      .then(res => { if (res.success) setAutoCleanup(!!res.autoCleanup); })
+      .then(res => { if (res.success) { setAutoCleanup(!!res.autoCleanup); setAutoUpdate(res.autoUpdate !== false); } })
       .catch(() => {})
-      .finally(() => setCleanupLoaded(true));
+      .finally(() => setConfigLoaded(true));
   }, []);
 
   async function toggleCleanup() {
     const newVal = !autoCleanup;
     setAutoCleanup(newVal);
-    try {
-      await api.put('/appstore/config', { autoCleanup: newVal });
-    } catch { setAutoCleanup(!newVal); }
+    try { await api.put('/appstore/config', { autoCleanup: newVal }); } catch { setAutoCleanup(!newVal); }
+  }
+
+  async function toggleAutoUpdate() {
+    const newVal = !autoUpdate;
+    setAutoUpdate(newVal);
+    try { await api.put('/appstore/config', { autoUpdate: newVal }); } catch { setAutoUpdate(!newVal); }
   }
 
   return (
@@ -202,12 +207,18 @@ function ModulesView({ modules, installed, pendingRestart, categories, categoryF
         </div>
 
         <div style={{ display: 'flex', alignItems: 'center', gap: '15px' }}>
-          {/* Auto Cleanup Toggle */}
-          {cleanupLoaded && (
-            <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }} title="When enabled, orphan commands/events are automatically removed on bot startup. Keep disabled if running multiple bot instances.">
-              <span style={{ color: '#888', fontSize: '0.78rem' }}>Auto Cleanup</span>
-              <ToggleSwitch checked={autoCleanup} onChange={toggleCleanup} />
-            </div>
+          {/* Config Toggles */}
+          {configLoaded && (
+            <>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }} title="When enabled, installed modules are updated from their repos on every container restart.">
+                <span style={{ color: '#888', fontSize: '0.78rem' }}>Auto Update</span>
+                <ToggleSwitch checked={autoUpdate} onChange={toggleAutoUpdate} />
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }} title="When enabled, orphan commands/events are automatically removed on bot startup. Keep disabled if running multiple bot instances.">
+                <span style={{ color: '#888', fontSize: '0.78rem' }}>Auto Cleanup</span>
+                <ToggleSwitch checked={autoCleanup} onChange={toggleCleanup} />
+              </div>
+            </>
           )}
 
           {/* Category Filter */}

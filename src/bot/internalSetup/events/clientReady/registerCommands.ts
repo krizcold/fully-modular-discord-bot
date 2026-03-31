@@ -25,6 +25,27 @@ function isAutoCleanupEnabled(): boolean {
   return false;
 }
 
+/** Load component toggle config — returns set of disabled command keys */
+function getDisabledCommands(): Set<string> {
+  const disabled = new Set<string>();
+  try {
+    const configPath = path.join(process.env.DATA_DIR || '/data', 'global', 'appstore', 'component-config.json');
+    if (fs.existsSync(configPath)) {
+      const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+      for (const [key, value] of Object.entries(config)) {
+        if (value === false && key.includes(':command:')) {
+          // key format: "moduleName:command:commandName" — extract commandName
+          const parts = key.split(':');
+          if (parts.length >= 3) {
+            disabled.add(parts[parts.length - 1]);
+          }
+        }
+      }
+    }
+  } catch { /* ignore */ }
+  return disabled;
+}
+
 const testMode = getConfigProperty<boolean>('testMode');
 const guildId = process.env.GUILD_ID;
 
@@ -166,6 +187,12 @@ export default async function registerCommands(client: Client) {
     // Load all local commands (each file exports a command object or an array of commands)
     const localCommands = getLocalCommands();
 
+    // Load disabled commands from component config
+    const disabledCommands = getDisabledCommands();
+    if (disabledCommands.size > 0) {
+      console.log(`[i] ${disabledCommands.size} command(s) disabled via component config: ${[...disabledCommands].join(', ')}`);
+    }
+
     // Fetch existing commands from Discord
     const globalCommands = await client.application?.commands.fetch();
     const guild = client.guilds.cache.get(guildId);
@@ -178,10 +205,24 @@ export default async function registerCommands(client: Client) {
     // Process each local command
     for (const localCommand of localCommands) {
       // https://discord.com/developers/docs/interactions/application-commands#application-command-object-application-command-structure
-      
+
       const { name, testOnly, type = typeChat } = localCommand;
 
       if (skipCommand(localCommand)) {
+        continue;
+      }
+
+      // Skip commands disabled via component config toggle
+      if (disabledCommands.has(name)) {
+        // If already registered on Discord, delete it
+        const existing = (testOnly ? guildCommands : globalCommands)?.find(cmd => cmd.name === name && cmd.type === (type ?? typeChat));
+        if (existing) {
+          try {
+            const mgr = testOnly ? guild.commands : client.application?.commands;
+            await mgr?.delete(existing.id);
+            console.log(`[i] Unregistered disabled command: ${name}`);
+          } catch (e) { console.error(`[i] Failed to unregister disabled command ${name}:`, e); }
+        }
         continue;
       }
 

@@ -915,7 +915,8 @@ export function createAppStoreRoutes(): Router {
       const config = loadAppStoreConfig();
       res.json({
         success: true,
-        autoCleanup: config.autoCleanup === true  // default false
+        autoCleanup: config.autoCleanup === true,  // default false
+        autoUpdate: config.autoUpdate !== false     // default true
       });
     } catch (error) {
       const msg = error instanceof Error ? error.message : 'Unknown error';
@@ -934,8 +935,11 @@ export function createAppStoreRoutes(): Router {
       if (typeof req.body.autoCleanup === 'boolean') {
         config.autoCleanup = req.body.autoCleanup;
       }
+      if (typeof req.body.autoUpdate === 'boolean') {
+        config.autoUpdate = req.body.autoUpdate;
+      }
       saveAppStoreConfig(config);
-      res.json({ success: true, autoCleanup: config.autoCleanup === true });
+      res.json({ success: true, autoCleanup: config.autoCleanup === true, autoUpdate: config.autoUpdate !== false });
     } catch (error) {
       const msg = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({ success: false, error: msg });

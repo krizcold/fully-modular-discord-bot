@@ -11,6 +11,7 @@ import { ModuleLoader } from './utils/moduleLoader';
 import { getModuleRegistry } from './utils/moduleRegistry';
 import { LoadedModule } from '../types/moduleTypes';
 import { ensureConfigPopulated } from './utils/configManager';
+import { getAppStoreManager } from './utils/appStoreManager';
 
 // Load credentials from /data/.env (Web-UI managed) or environment variables
 const credentials = loadCredentials();
@@ -84,6 +85,30 @@ let loadedModules: LoadedModule[] = [];
  */
 async function loadModules(client: Client): Promise<number[]> {
   console.log('[ModuleLoader] Loading modules...');
+
+  // Auto-update installed AppStore modules before loading (if enabled)
+  try {
+    const appStoreConfigPath = path.join(process.env.DATA_DIR || '/data', 'global', 'appstore', 'config.json');
+    let autoUpdate = true; // default enabled
+    if (fs.existsSync(appStoreConfigPath)) {
+      const cfg = JSON.parse(fs.readFileSync(appStoreConfigPath, 'utf-8'));
+      if (cfg.autoUpdate === false) autoUpdate = false;
+    }
+    if (autoUpdate) {
+      const manager = getAppStoreManager();
+      const result = await manager.autoUpdateModules();
+      if (result.updated.length > 0) {
+        console.log(`[AppStore] Auto-updated ${result.updated.length} module(s): ${result.updated.join(', ')}`);
+      }
+      if (result.errors.length > 0) {
+        console.warn(`[AppStore] Failed to update: ${result.errors.join(', ')}`);
+      }
+    } else {
+      console.log('[AppStore] Auto-update disabled — skipping module refresh');
+    }
+  } catch (err) {
+    console.error('[AppStore] Auto-update failed (continuing with existing modules):', err);
+  }
 
   try {
     const moduleLoader = new ModuleLoader(client);
