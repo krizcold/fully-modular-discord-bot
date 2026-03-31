@@ -533,18 +533,20 @@ export class AppStoreManager {
   testRepoAccess(repo: AppStoreRepository): { ok: boolean; error?: string } {
     try {
       const testUrl = this.buildAuthUrl(repo);
+      console.log(`[AppStoreManager] Testing repo access: ${repo.url} (token: ${repo.githubToken ? 'yes' : 'no'})`);
       execSync(`git ls-remote --exit-code "${testUrl}" HEAD`, {
         stdio: 'pipe',
         timeout: 15000
       });
       return { ok: true };
     } catch (err: any) {
-      const stderr = err.stderr?.toString() || '';
-      if (stderr.includes('Authentication failed') || stderr.includes('could not read Username')) {
+      const stderr = err.stderr?.toString() || err.message || '';
+      console.error(`[AppStoreManager] Repo access test failed: ${stderr}`);
+      if (stderr.includes('Authentication failed') || stderr.includes('could not read Username') || stderr.includes('403')) {
         return { ok: false, error: 'Authentication failed — check your GitHub token' };
       }
-      if (stderr.includes('not found') || stderr.includes('Repository not found')) {
-        return { ok: false, error: 'Repository not found — check the URL' };
+      if (stderr.includes('not found') || stderr.includes('Repository not found') || stderr.includes('404')) {
+        return { ok: false, error: 'Repository not found — check the URL and token' };
       }
       return { ok: false, error: stderr.split('\n')[0] || 'Could not reach repository' };
     }
