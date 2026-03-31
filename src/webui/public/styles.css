@@ -278,7 +278,7 @@ body {
   color: #999;
 }
 
-/* Error Message */
+/* Legacy inline messages (kept for non-dismissible context messages like bot_not_running) */
 .error-message {
   background: #F04747;
   color: white;
@@ -287,7 +287,6 @@ body {
   margin-bottom: 20px;
 }
 
-/* Success Message */
 .success-message {
   background: #43B581;
   color: white;
@@ -296,7 +295,6 @@ body {
   margin-bottom: 20px;
 }
 
-/* Info/Warning Message */
 .info-message {
   background: #5865F2;
   color: white;
@@ -304,6 +302,56 @@ body {
   border-radius: 5px;
   margin-bottom: 20px;
   border-left: 4px solid #4752C4;
+}
+
+/* ─── Toast Notification System ─── */
+#toast-container {
+  position: fixed;
+  top: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 10000;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  pointer-events: none;
+  width: auto;
+  max-width: 520px;
+}
+
+.toast {
+  pointer-events: auto;
+  padding: 12px 20px;
+  border-radius: 8px;
+  color: #fff;
+  font-size: 0.9rem;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+  opacity: 0;
+  transform: translateY(-12px);
+  animation: toast-in 0.25s ease forwards;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-width: 520px;
+  cursor: pointer;
+}
+
+.toast.toast-out {
+  animation: toast-out 0.2s ease forwards;
+}
+
+.toast-error   { background: #d83c3e; }
+.toast-success { background: #3ba55d; }
+.toast-info    { background: #5865F2; }
+
+@keyframes toast-in {
+  from { opacity: 0; transform: translateY(-12px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes toast-out {
+  from { opacity: 1; transform: translateY(0); }
+  to   { opacity: 0; transform: translateY(-12px); }
 }
 
 /* Grid */

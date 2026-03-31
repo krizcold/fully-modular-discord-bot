@@ -16,8 +16,6 @@ function CredentialsPanel({ setupStatus, onUpdate, onUpdateAndRestart }) {
   });
 
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState(null);
-  const [success, setSuccess] = useState(null);
 
   // Generate dynamic instructions based on current URL
   const [instructions] = useState(() => {
@@ -155,29 +153,27 @@ function CredentialsPanel({ setupStatus, onUpdate, onUpdateAndRestart }) {
       secret += chars.charAt(Math.floor(Math.random() * chars.length));
     }
     setCredentials({...credentials, SESSION_SECRET: secret});
-    setSuccess('Session secret generated! Remember to save it.');
+    showToast('Session secret generated! Remember to save it.', 'success');
   }
 
   // Save credentials
   async function handleSave(andStart = false) {
     setLoading(true);
-    setError(null);
-    setSuccess(null);
 
     try {
       const res = await api.post('/setup/credentials', credentials);
       if (res.success) {
-        setSuccess(andStart ? 'Credentials saved' : 'Credentials saved successfully');
+        showToast(andStart ? 'Credentials saved' : 'Credentials saved successfully', 'success');
         if (andStart) {
           await onUpdateAndRestart();
         } else {
           await onUpdate();
         }
       } else {
-        setError(res.error);
+        showToast(res.error, 'error');
       }
     } catch (err) {
-      setError(err.message);
+      showToast(err.message, 'error');
     } finally {
       setLoading(false);
     }
@@ -194,8 +190,6 @@ function CredentialsPanel({ setupStatus, onUpdate, onUpdateAndRestart }) {
             ? 'Manage your Discord bot credentials and settings'
             : 'Complete the initial setup to activate your bot'}
         </p>
-        {error && <div className="error-message">{error}</div>}
-        {success && <div className="success-message">{success}</div>}
       </div>
 
       <form onSubmit={(e) => { e.preventDefault(); handleSave(false); }}>

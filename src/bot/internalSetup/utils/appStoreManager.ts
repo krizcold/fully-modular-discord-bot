@@ -782,15 +782,28 @@ export class AppStoreManager {
   getModuleComponents(moduleName: string, repoId?: string): { commands: string[]; events: string[]; panels: string[] } {
     const result = { commands: [] as string[], events: [] as string[], panels: [] as string[] };
 
-    // Try repo cache first
+    // Try repo cache first — scan for Modules/ directory (case-insensitive, same as scanForModules)
     let moduleDir: string | null = null;
     if (repoId) {
       const cacheDir = path.join(CACHE_DIR, repoId);
-      const candidate = path.join(cacheDir, moduleName);
-      if (fs.existsSync(candidate)) moduleDir = candidate;
-      // Also check nested modules/ folder
-      const nested = path.join(cacheDir, 'modules', moduleName);
-      if (!moduleDir && fs.existsSync(nested)) moduleDir = nested;
+      if (fs.existsSync(cacheDir)) {
+        // Find the Modules/ directory (case-insensitive)
+        const entries = fs.readdirSync(cacheDir);
+        for (const entry of entries) {
+          if (entry.toLowerCase() === 'modules') {
+            const candidate = path.join(cacheDir, entry, moduleName);
+            if (fs.existsSync(candidate)) {
+              moduleDir = candidate;
+              break;
+            }
+          }
+        }
+        // Also try direct path (moduleName at root of cache)
+        if (!moduleDir) {
+          const direct = path.join(cacheDir, moduleName);
+          if (fs.existsSync(direct)) moduleDir = direct;
+        }
+      }
     }
 
     // Fallback to installed source

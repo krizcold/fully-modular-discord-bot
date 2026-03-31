@@ -10,8 +10,8 @@ function ConfigPanel() {
   const [backups, setBackups] = useState([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
-  const [error, setError] = useState(null);
-  const [success, setSuccess] = useState(null);
+  function setError(msg) { if (msg) showToast(msg, 'error'); }
+  function setSuccess(msg) { if (msg) showToast(msg, 'success'); }
   const [jsonError, setJsonError] = useState(null);
   const [initialized, setInitialized] = useState(true);
   const [initMessage, setInitMessage] = useState('');
@@ -282,8 +282,6 @@ function ConfigPanel() {
           Edit bot configuration files. Changes are automatically backed up.
         </p>
 
-        {error && <div className="error-message">{error}</div>}
-        {success && <div className="success-message">{success}</div>}
 
         {!initialized && initMessage && (
           <div style={{

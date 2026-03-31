@@ -11,10 +11,32 @@
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 </head>
 <body>
+  <div id="toast-container"></div>
   <div id="root"></div>
   <!-- Utilities -->
   <script src="/utils/api.js"></script>
   <script src="/utils/websocket.js"></script>
+  <script>
+    // Global toast notification system
+    window.showToast = function(message, type, duration) {
+      type = type || 'info';
+      duration = duration || (type === 'error' ? 5000 : 3000);
+      var container = document.getElementById('toast-container');
+      if (!container) return;
+      var el = document.createElement('div');
+      el.className = 'toast toast-' + type;
+      el.textContent = message;
+      el.onclick = function() { dismiss(); };
+      container.appendChild(el);
+      var timer = setTimeout(dismiss, duration);
+      function dismiss() {
+        clearTimeout(timer);
+        if (!el.parentNode) return;
+        el.classList.add('toast-out');
+        el.addEventListener('animationend', function() { el.remove(); });
+      }
+    };
+  </script>
   <!-- Components -->
   <script type="text/babel" src="/components/BotControlPanel.jsx"></script>
   <!-- Credentials Panel Components -->

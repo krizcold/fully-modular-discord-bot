@@ -10,8 +10,6 @@ function AppStorePanel({ onModuleInstalled }) {
   const [guildAssignments, setGuildAssignments] = useState({});
   const [selectedModule, setSelectedModule] = useState(null);
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState(null);
-  const [success, setSuccess] = useState(null);
   const [categoryFilter, setCategoryFilter] = useState('all');
   const [pendingRestart, setPendingRestart] = useState(new Set());
   // Derive pending set from server-side installed data (persisted across refreshes)
@@ -49,8 +47,10 @@ function AppStorePanel({ onModuleInstalled }) {
   }
 
   function showSuccess(message) {
-    setSuccess(message);
-    setTimeout(() => setSuccess(null), 3000);
+    showToast(message, 'success');
+  }
+  function setError(message) {
+    showToast(message, 'error');
   }
 
   // Get unique categories
@@ -67,9 +67,6 @@ function AppStorePanel({ onModuleInstalled }) {
 
   return (
     <div className="panel">
-      {error && <div className="error-message" style={{ marginBottom: '15px' }}>{error}</div>}
-      {success && <div className="success-message" style={{ marginBottom: '15px' }}>{success}</div>}
-
       {/* Navigation */}
       <div style={{ display: 'flex', gap: '10px', marginBottom: '20px' }}>
         <button

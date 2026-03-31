@@ -7,8 +7,6 @@ function App() {
   const [setupStatus, setSetupStatus] = useState(null);
   const [logs, setLogs] = useState([]);
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState(null);
-  const [success, setSuccess] = useState(null);
   const [pendingContainerRestart, setPendingContainerRestart] = useState(false);
   const [containerRestarting, setContainerRestarting] = useState(false);
 
@@ -35,8 +33,7 @@ function App() {
     const unsubscribeStartup = wsClient.on('bot:startup', (data) => {
       console.log('[WebSocket] Bot started:', data);
       setStatus(data);
-      setSuccess('Bot started successfully!');
-      setTimeout(() => setSuccess(null), 3000);
+      showToast('Bot started successfully!', 'success');
     });
 
     const unsubscribeShutdown = wsClient.on('bot:shutdown', (data) => {
@@ -46,7 +43,7 @@ function App() {
 
     const unsubscribeCrash = wsClient.on('bot:crash', (data) => {
       console.log('[WebSocket] Bot crashed:', data);
-      setError('Bot has crashed! Check logs for details.');
+      showToast('Bot has crashed! Check logs for details.', 'error');
       loadData(); // Reload to get crash status
     });
 
@@ -54,8 +51,6 @@ function App() {
       console.log('[WebSocket] Connection status:', data.connected);
       if (data.connected) {
         // Clear stale messages and reload data when WebSocket reconnects
-        setSuccess(null);
-        setError(null);
         loadData();
       }
     });
@@ -85,7 +80,7 @@ function App() {
       setLoading(false);
       setError(null);
     } catch (err) {
-      setError(err.message);
+      showToast(err.message, 'error');
       setLoading(false);
     }
   }
@@ -95,13 +90,13 @@ function App() {
       setLoading(true);
       const res = await api.post('/bot/start');
       if (res.success) {
-        setSuccess('Bot started successfully!');
+        showToast('Bot started successfully!', 'success');
         await loadData();
       } else {
-        setError(res.error || 'Failed to start bot');
+        showToast(res.error || 'Failed to start bot', 'error');
       }
     } catch (err) {
-      setError(err.message);
+      showToast(err.message, 'error');
     } finally {
       setLoading(false);
     }
@@ -113,12 +108,12 @@ function App() {
       setLoading(true);
       const res = await api.post('/bot/restart');
       if (!res.success) {
-        setError(res.error || 'Failed to restart bot');
+        showToast(res.error || 'Failed to restart bot', 'error');
       }
       // Don't call loadData() here — let WebSocket bot:startup event
       // drive the status update so BotControlPanel's restarting state works.
     } catch (err) {
-      setError(err.message);
+      showToast(err.message, 'error');
     } finally {
       setLoading(false);
     }
@@ -144,8 +139,7 @@ function App() {
       if (emergency) setContainerRestarting(true);
       await api.post('/bot/shutdown', { emergency });
       if (emergency) {
-        setSuccess('Container restarting... page will reload when ready.');
-        // Poll until server is back, then reload the page
+        showToast('Container restarting... page will reload when ready.', 'info', 15000);
         const poll = setInterval(async () => {
           try {
             await api.get('/bot/status');
@@ -154,14 +148,13 @@ function App() {
           } catch (_) { /* still down, keep polling */ }
         }, 3000);
       } else {
-        setSuccess('Bot stopped successfully');
+        showToast('Bot stopped successfully', 'success');
         await loadData();
       }
     } catch (err) {
-      // For emergency restart, the request may fail because the server died — that's expected
       if (emergency) {
         setContainerRestarting(true);
-        setSuccess('Container restarting... page will reload when ready.');
+        showToast('Container restarting... page will reload when ready.', 'info', 15000);
         const poll = setInterval(async () => {
           try {
             await api.get('/bot/status');
@@ -170,7 +163,7 @@ function App() {
           } catch (_) { /* still down */ }
         }, 3000);
       } else {
-        setError(err.message);
+        showToast(err.message, 'error');
       }
     } finally {
       setLoading(false);
@@ -192,9 +185,6 @@ function App() {
           </span>
         )}
       </div>
-
-      {error && <div className="error-message">{error}</div>}
-      {success && <div className="success-message">{success}</div>}
 
       <div className="tabs">
         <button
