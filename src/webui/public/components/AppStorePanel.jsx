@@ -50,7 +50,7 @@ function AppStorePanel({ onModuleInstalled }) {
     showToast(message, 'success');
   }
   function setError(message) {
-    showToast(message, 'error');
+    if (message) showToast(message, 'error');
   }
 
   // Get unique categories

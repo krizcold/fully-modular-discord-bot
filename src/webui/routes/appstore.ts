@@ -26,12 +26,16 @@ export function createAppStoreRoutes(): Router {
    * GET /api/appstore/bundle
    * Returns all AppStore data in a single response to avoid multiple API calls.
    */
-  router.get('/bundle', (_req: Request, res: Response) => {
+  router.get('/bundle', async (_req: Request, res: Response) => {
     try {
       const manager = getAppStoreManager();
       const premiumMgr = getPremiumManager();
 
-      const modules = manager.getCachedModules();
+      // Use fast cache; fall back to full fetch (with git clone) if cache is empty
+      let modules = manager.getCachedModules();
+      if (modules.length === 0 && manager.getRepositories().some(r => r.enabled)) {
+        modules = await manager.getAvailableModules();
+      }
       const installed = manager.getInstalledModules();
       const repos = manager.getRepositories();
 
