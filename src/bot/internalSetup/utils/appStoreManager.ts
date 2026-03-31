@@ -615,7 +615,8 @@ export class AppStoreManager {
   }
 
   /**
-   * Get all available modules from all enabled repositories
+   * Get all available modules from all enabled repositories.
+   * If not cached, triggers a git clone/pull (slow on first call).
    */
   async getAvailableModules(): Promise<StoreModuleInfo[]> {
     const allModules: StoreModuleInfo[] = [];
@@ -637,6 +638,36 @@ export class AppStoreManager {
       }
 
       allModules.push(...modules);
+    }
+
+    return allModules;
+  }
+
+  /**
+   * Get modules from cache only (no git operations).
+   * For repos not yet cached, scans the local cache directory if it exists.
+   * Returns instantly — never triggers network requests.
+   */
+  getCachedModules(): StoreModuleInfo[] {
+    const allModules: StoreModuleInfo[] = [];
+
+    for (const repo of this.reposConfig.repositories) {
+      if (!repo.enabled) continue;
+
+      let modules = this.moduleCache.get(repo.id);
+
+      if (!modules) {
+        // Try scanning local cache dir without cloning
+        const cacheDir = path.join(CACHE_DIR, repo.id);
+        if (fs.existsSync(path.join(cacheDir, '.git'))) {
+          modules = this.scanForModules(cacheDir, repo);
+          this.moduleCache.set(repo.id, modules);
+        }
+      }
+
+      if (modules) {
+        allModules.push(...modules);
+      }
     }
 
     return allModules;

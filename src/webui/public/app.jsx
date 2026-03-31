@@ -78,7 +78,6 @@ function App() {
       setSetupStatus(setupRes);
       setLogs(logsRes.logs.current);
       setLoading(false);
-      setError(null);
     } catch (err) {
       showToast(err.message, 'error');
       setLoading(false);
