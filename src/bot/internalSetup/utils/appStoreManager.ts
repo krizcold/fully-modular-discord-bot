@@ -785,7 +785,7 @@ export class AppStoreManager {
     // Try repo cache first
     let moduleDir: string | null = null;
     if (repoId) {
-      const cacheDir = path.join(this.cacheDir, repoId);
+      const cacheDir = path.join(CACHE_DIR, repoId);
       const candidate = path.join(cacheDir, moduleName);
       if (fs.existsSync(candidate)) moduleDir = candidate;
       // Also check nested modules/ folder

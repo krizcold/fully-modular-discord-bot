@@ -193,7 +193,7 @@ export function createAppStoreRoutes(): Router {
 
       res.json({
         success: true,
-        modules: modules.map(formatModuleInfo)
+        modules: modules.map(m => formatModuleInfo(m))
       });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
@@ -219,7 +219,7 @@ export function createAppStoreRoutes(): Router {
 
       res.json({
         success: true,
-        modules: modules.map(formatModuleInfo)
+        modules: modules.map(m => formatModuleInfo(m))
       });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
