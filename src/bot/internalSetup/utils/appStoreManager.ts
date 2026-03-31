@@ -362,16 +362,19 @@ export class AppStoreManager {
     branch: string = 'main',
     githubToken?: string
   ): AppStoreRepository {
-    const normalizedUrl = this.normalizeGitUrl(url);
+    const normalized = this.normalizeGitUrl(url);
+
+    // Use branch extracted from URL if user didn't specify one explicitly
+    const finalBranch = branch || normalized.branch || 'main';
 
     // Validate URL before storing
-    const urlValidation = validateRepoUrl(normalizedUrl);
+    const urlValidation = validateRepoUrl(normalized.url);
     if (!urlValidation.valid) {
       throw new Error(`Invalid repository URL: ${urlValidation.error}`);
     }
 
     // Validate branch name
-    const branchValidation = validateBranchName(branch);
+    const branchValidation = validateBranchName(finalBranch);
     if (!branchValidation.valid) {
       throw new Error(`Invalid branch name: ${branchValidation.error}`);
     }
@@ -379,8 +382,8 @@ export class AppStoreManager {
     const repo: AppStoreRepository = {
       id: crypto.randomUUID(),
       name,
-      url: normalizedUrl,
-      branch,
+      url: normalized.url,
+      branch: finalBranch,
       githubToken: githubToken || null,
       enabled: true,
       lastRefreshed: null
@@ -448,7 +451,9 @@ export class AppStoreManager {
   /**
    * Normalize GitHub URL to HTTPS format
    */
-  private normalizeGitUrl(url: string): string {
+  normalizeGitUrl(url: string): { url: string; branch?: string } {
+    let extractedBranch: string | undefined;
+
     // Convert SSH to HTTPS
     if (url.startsWith('git@github.com:')) {
       url = url.replace('git@github.com:', 'https://github.com/');
@@ -459,7 +464,20 @@ export class AppStoreManager {
       url = url.slice(0, -4);
     }
 
-    return url;
+    // Strip /tree/{branch} suffix from GitHub URLs and extract branch
+    const treeMatch = url.match(/^(https:\/\/github\.com\/[^/]+\/[^/]+)\/tree\/(.+)$/);
+    if (treeMatch) {
+      url = treeMatch[1];
+      extractedBranch = treeMatch[2].replace(/\/$/, ''); // trim trailing slash
+    }
+
+    // Strip /blob/{branch}/... suffix too (user copied a file URL)
+    const blobMatch = url.match(/^(https:\/\/github\.com\/[^/]+\/[^/]+)\/blob\/.+$/);
+    if (blobMatch) {
+      url = blobMatch[1];
+    }
+
+    return { url, branch: extractedBranch };
   }
 
   // ============================================================================

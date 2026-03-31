@@ -93,7 +93,7 @@ export function createAppStoreRoutes(): Router {
    * Add a new repository
    * Body: { name, url, branch?, githubToken? }
    */
-  router.post('/repos', (req: Request, res: Response) => {
+  router.post('/repos', async (req: Request, res: Response) => {
     try {
       const { name, url, branch, githubToken } = req.body;
 
@@ -113,8 +113,12 @@ export function createAppStoreRoutes(): Router {
 
       const manager = getAppStoreManager();
 
+      // Normalize URL first (strips /tree/branch, .git, etc.)
+      const normalized = manager.normalizeGitUrl(url);
+      const finalBranch = branch || normalized.branch || 'main';
+
       // Test access before saving — catches bad tokens / wrong URLs early
-      const testRepo = { url, branch: branch || 'main', githubToken: githubToken || null } as any;
+      const testRepo = { url: normalized.url, branch: finalBranch, githubToken: githubToken || null } as any;
       const access = manager.testRepoAccess(testRepo);
       if (!access.ok) {
         return res.status(400).json({
@@ -126,16 +130,26 @@ export function createAppStoreRoutes(): Router {
       const repo = manager.addRepository(
         name,
         url,
-        branch || 'main',
+        finalBranch,
         githubToken
       );
+
+      // Immediately clone and scan for modules
+      let modules: any[] = [];
+      try {
+        const scanned = await manager.refreshRepository(repo.id);
+        modules = scanned.map(m => formatModuleInfo(m));
+      } catch (refreshErr) {
+        console.error('[AppStore] Auto-refresh after add failed:', refreshErr);
+      }
 
       res.json({
         success: true,
         repository: {
           ...repo,
           githubToken: repo.githubToken ? '***' : null
-        }
+        },
+        modules
       });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
