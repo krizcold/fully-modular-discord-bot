@@ -179,7 +179,6 @@ async function buildRecoveryResponse(
     .setColor(color)
     .addFields(
       { name: 'Status', value: statusDisplay, inline: true },
-      { name: 'Mode', value: status.mode || 'None', inline: true },
       { name: 'Last Check', value: status.lastCheck ? formatDate(status.lastCheck) : 'Never', inline: true },
       { name: 'Release Date', value: releaseDate ? formatDate(releaseDate) : 'Unknown', inline: true },
       { name: 'Details', value: `\`\`\`\n${detailsContent}\n\`\`\``, inline: false }

@@ -185,6 +185,12 @@ export interface LoadedModule {
 
   /** Whether module is initialized */
   initialized: boolean;
+
+  /** Lifecycle hooks (loaded from hooks.ts/hooks.js if present) */
+  hooks?: ModuleHooks;
+
+  /** All file paths that were imported for this module (for cache invalidation) */
+  importedFiles: string[];
 }
 
 /**

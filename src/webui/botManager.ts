@@ -598,4 +598,40 @@ export class BotManager {
       return { success: false, isDev: false, error: error instanceof Error ? error.message : 'Unknown error' };
     }
   }
+
+  /**
+   * Reload a single module (hot-reload via IPC to bot process)
+   */
+  async reloadModule(moduleName: string): Promise<any> {
+    try {
+      return await this.sendIPCMessage('module:reload', { moduleName });
+    } catch (error) {
+      console.error('[BotManager] Error reloading module:', error);
+      return { success: false, moduleName, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  /**
+   * Reload multiple modules (hot-reload via IPC to bot process)
+   */
+  async reloadModules(moduleNames: string[]): Promise<any> {
+    try {
+      return await this.sendIPCMessage('module:reload-all', { moduleNames });
+    } catch (error) {
+      console.error('[BotManager] Error reloading modules:', error);
+      return { success: false, reloaded: [], failed: moduleNames.map(n => ({ moduleName: n, error: error instanceof Error ? error.message : 'Unknown error' })), compileDuration: 0, totalDuration: 0 };
+    }
+  }
+
+  /**
+   * Get list of loaded modules from bot process
+   */
+  async getLoadedModules(): Promise<any> {
+    try {
+      return await this.sendIPCMessage('module:list-loaded', {});
+    } catch (error) {
+      console.error('[BotManager] Error getting loaded modules:', error);
+      return { success: false, modules: [], error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
 }

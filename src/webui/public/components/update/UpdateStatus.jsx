@@ -1,15 +1,8 @@
-// Update Status Component
+// Update Status Component — Three-button layout (System / Modules / Everything)
 function UpdateStatus({ api, status, onRefresh }) {
   const [loading, setLoading] = React.useState(false);
-  const [updateMode, setUpdateMode] = React.useState('relative');
-  const [showUpdateConfirm, setShowUpdateConfirm] = React.useState(false);
-  const [updateInfo, setUpdateInfo] = React.useState(null);
-
-  const updateModes = [
-    { value: 'basic', label: 'Basic', description: 'Core infrastructure only (internalSetup, utils, types)' },
-    { value: 'relative', label: 'Relative', description: 'Core + missing files (preserves existing modules)' },
-    { value: 'full', label: 'Full', description: 'Complete replacement (resets all modules)' }
-  ];
+  const [checkResult, setCheckResult] = React.useState(null);
+  const [actionMessage, setActionMessage] = React.useState(null);
 
   const clearCrashHistory = async () => {
     if (!confirm('Are you sure you want to clear crash history? This will also disable safe mode.')) {
@@ -31,40 +24,78 @@ function UpdateStatus({ api, status, onRefresh }) {
 
   const checkForUpdates = async () => {
     setLoading(true);
+    setActionMessage(null);
     try {
-      const result = await api.post('/update/check');
-
+      const result = await api.post('/update/check-all');
       if (result.success) {
-        if (result.hasUpdates) {
-          // Show update confirmation dialog with mode selection
-          setUpdateInfo(result);
-          setShowUpdateConfirm(true);
-        } else {
-          alert(result.message || 'System is up to date');
-        }
+        setCheckResult(result);
       } else {
-        alert(result.error || 'Failed to check for updates');
+        setActionMessage({ type: 'error', text: result.error || 'Failed to check for updates' });
       }
     } catch (error) {
-      alert('Failed to check for updates: ' + error.message);
+      setActionMessage({ type: 'error', text: 'Failed to check for updates: ' + error.message });
     } finally {
       setLoading(false);
     }
   };
 
-  const triggerUpdate = async () => {
+  const triggerSystemUpdate = async () => {
+    if (!confirm('This will pull the latest code and restart the bot. Continue?')) return;
     setLoading(true);
-    setShowUpdateConfirm(false);
+    setActionMessage(null);
     try {
-      const updateResult = await api.post('/update/trigger', { mode: updateMode });
-      if (updateResult.success) {
-        alert('Update started! The system will restart shortly.');
-        setTimeout(() => onRefresh(), 3000);
+      const result = await api.post('/update/trigger', { mode: 'relative' });
+      if (result.success) {
+        setActionMessage({ type: 'success', text: 'System update started. The bot will restart shortly.' });
       } else {
-        alert('Failed to trigger update: ' + (updateResult.error || 'Unknown error'));
+        setActionMessage({ type: 'error', text: result.error || 'Failed to trigger system update' });
       }
     } catch (error) {
-      alert('Failed to trigger update: ' + error.message);
+      setActionMessage({ type: 'error', text: 'Failed to trigger system update: ' + error.message });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const triggerModuleUpdate = async () => {
+    setLoading(true);
+    setActionMessage(null);
+    try {
+      // Combined: download module files + hot-reload in one call
+      const result = await api.post('/update/modules-and-reload');
+      if (result.success) {
+        const downloaded = result.download?.totalUpdated || 0;
+        const reloaded = result.reload?.reloaded?.length || 0;
+        setActionMessage({ type: 'success', text: `Updated ${downloaded} module(s), hot-reloaded ${reloaded}. No restart needed.` });
+        // Re-check to refresh state
+        const recheck = await api.post('/update/check-all');
+        if (recheck.success) setCheckResult(recheck);
+      } else {
+        setActionMessage({ type: 'error', text: result.error || result.message || 'Failed to update modules' });
+      }
+    } catch (error) {
+      setActionMessage({ type: 'error', text: 'Failed to update modules: ' + error.message });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const triggerUpdateEverything = async () => {
+    if (!confirm('This will update modules and then restart the bot with new system code. Continue?')) return;
+    setLoading(true);
+    setActionMessage(null);
+    try {
+      // Update modules first (download only — no hot-reload since we're restarting anyway)
+      await api.post('/update/modules');
+      // Then trigger system update (restart — modules will load fresh on boot)
+      const result = await api.post('/update/trigger', { mode: 'relative' });
+      if (result.success) {
+        setActionMessage({ type: 'success', text: 'Modules updated. System update started — bot will restart shortly.' });
+      } else {
+        setActionMessage({ type: 'error', text: result.error || 'Module update succeeded but system update failed' });
+      }
+    } catch (error) {
+      setActionMessage({ type: 'error', text: 'Failed: ' + error.message });
     } finally {
       setLoading(false);
     }
@@ -77,48 +108,119 @@ function UpdateStatus({ api, status, onRefresh }) {
 
   if (!status) return <div>Loading status...</div>;
 
+  const hasSystemUpdate = checkResult?.baseCode?.hasUpdates === true;
+  const hasModuleUpdates = (checkResult?.modules?.updatesAvailable || 0) > 0;
+  const modulesWithUpdates = checkResult?.modules?.updates?.filter(u => u.hasUpdate) || [];
+
   return (
     <div className="status-section">
+      {/* Action message */}
+      {actionMessage && (
+        <div className={`action-message action-message-${actionMessage.type}`}>
+          {actionMessage.text}
+        </div>
+      )}
+
+      {/* Check + Refresh buttons */}
       <div className="update-actions">
-        <button
-          className="btn btn-primary"
-          onClick={checkForUpdates}
-          disabled={loading}
-        >
-          🔍 Check for Updates
+        <button className="btn btn-primary" onClick={checkForUpdates} disabled={loading}>
+          {loading ? 'Checking...' : 'Check for Updates'}
         </button>
-        <button
-          className="btn btn-secondary"
-          onClick={onRefresh}
-          disabled={loading}
-        >
-          🔄 Refresh Status
+        <button className="btn btn-secondary" onClick={onRefresh} disabled={loading}>
+          Refresh Status
         </button>
       </div>
 
+      {/* Status grid */}
       <div className="status-grid">
         <div className="status-item">
           <strong>Bot Status:</strong>
           <span className={status.bot?.running ? 'status-running' : 'status-stopped'}>
-            {status.bot?.running ? '🟢 Running' : '🔴 Stopped'}
+            {status.bot?.running ? 'Running' : 'Stopped'}
           </span>
         </div>
         <div className="status-item">
           <strong>Safe Mode:</strong>
           <span className={status.safety?.safeMode ? 'status-warning' : 'status-ok'}>
-            {status.safety?.safeMode ? '⚠️ Enabled' : '✅ Disabled'}
+            {status.safety?.safeMode ? 'Enabled' : 'Disabled'}
           </span>
         </div>
         <div className="status-item">
           <strong>Crash Count:</strong>
           <span>{status.safety?.crashHistory?.length || 0}</span>
         </div>
-        <div className="status-item">
-          <strong>Update Available:</strong>
-          <span>{status.safety?.updateAvailable ? '🆕 Yes' : '✅ No'}</span>
-        </div>
       </div>
 
+      {/* Combined update check results */}
+      {checkResult && (
+        <div className="update-check-results">
+          <h3>Update Status</h3>
+
+          {/* System section */}
+          <div className={`update-section ${hasSystemUpdate ? 'has-updates' : 'up-to-date'}`}>
+            <div className="update-section-header">
+              <strong>System (Base Code)</strong>
+              <span className={`update-badge ${hasSystemUpdate ? 'badge-warning' : 'badge-ok'}`}>
+                {hasSystemUpdate ? `${checkResult.baseCode.commitsBehind || '?'} commits behind` : 'Up to date'}
+              </span>
+            </div>
+            {hasSystemUpdate && <p className="update-note">Requires restart</p>}
+          </div>
+
+          {/* Modules section */}
+          <div className={`update-section ${hasModuleUpdates ? 'has-updates' : 'up-to-date'}`}>
+            <div className="update-section-header">
+              <strong>Modules</strong>
+              <span className={`update-badge ${hasModuleUpdates ? 'badge-warning' : 'badge-ok'}`}>
+                {hasModuleUpdates ? `${checkResult.modules.updatesAvailable} update(s)` : checkResult.modules.totalInstalled === 0 ? 'None installed' : 'Up to date'}
+              </span>
+            </div>
+            {modulesWithUpdates.length > 0 && (
+              <ul className="module-update-list">
+                {modulesWithUpdates.map(mod => (
+                  <li key={mod.moduleName}>
+                    <span className="module-name">{mod.moduleName}</span>
+                    <span className="module-versions">{mod.installedVersion} &rarr; {mod.availableVersion}</span>
+                  </li>
+                ))}
+              </ul>
+            )}
+            {hasModuleUpdates && <p className="update-note">Hot-reload (no restart needed)</p>}
+          </div>
+
+          <p className="custom-modules-note">Custom modules (modulesDev/) are never affected by updates.</p>
+
+          {/* Update action buttons */}
+          <div className="update-action-buttons">
+            <button
+              className="btn btn-primary"
+              onClick={triggerSystemUpdate}
+              disabled={loading || !hasSystemUpdate}
+              title={hasSystemUpdate ? 'Pull latest code and restart' : 'No system update available'}
+            >
+              Update System
+            </button>
+            <button
+              className="btn btn-success"
+              onClick={triggerModuleUpdate}
+              disabled={loading || !hasModuleUpdates}
+              title={hasModuleUpdates ? 'Update modules (no restart)' : 'No module updates available'}
+            >
+              Update Modules
+            </button>
+            <button
+              className="btn btn-secondary"
+              onClick={triggerUpdateEverything}
+              disabled={loading || !(hasSystemUpdate && hasModuleUpdates)}
+              title={hasSystemUpdate && hasModuleUpdates ? 'Update modules then restart with new system code' : 'Both system and module updates required'}
+            >
+              Update Everything
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Crash history */}
       {status.safety?.crashHistory?.length > 0 && (
         <div className="crash-history">
           <h3>Recent Crashes</h3>
@@ -141,174 +243,116 @@ function UpdateStatus({ api, status, onRefresh }) {
         </div>
       )}
 
-      {showUpdateConfirm && (
-        <div className="update-modal-overlay">
-          <div className="update-modal">
-            <h3>Update Available</h3>
-
-            {updateInfo && (
-              <div className="update-info">
-                <p><strong>{updateInfo.message}</strong></p>
-                {updateInfo.currentVersion && updateInfo.latestVersion && (
-                  <p>
-                    Current: <code>{updateInfo.currentVersion}</code> →
-                    Latest: <code>{updateInfo.latestVersion}</code>
-                  </p>
-                )}
-                {updateInfo.commitsBehind > 0 && (
-                  <p>{updateInfo.commitsBehind} commit{updateInfo.commitsBehind > 1 ? 's' : ''} behind</p>
-                )}
-              </div>
-            )}
-
-            <div className="update-mode-selector">
-              <label><strong>Update Mode:</strong></label>
-              <div className="mode-options">
-                {updateModes.map(mode => (
-                  <label key={mode.value} className={`mode-option ${updateMode === mode.value ? 'selected' : ''}`}>
-                    <input
-                      type="radio"
-                      name="updateMode"
-                      value={mode.value}
-                      checked={updateMode === mode.value}
-                      onChange={(e) => setUpdateMode(e.target.value)}
-                    />
-                    <div className="mode-content">
-                      <span className="mode-label">{mode.label}</span>
-                      <span className="mode-description">{mode.description}</span>
-                    </div>
-                  </label>
-                ))}
-              </div>
-            </div>
-
-            <div className="update-modal-actions">
-              <button
-                className="btn btn-secondary"
-                onClick={() => setShowUpdateConfirm(false)}
-                disabled={loading}
-              >
-                Cancel
-              </button>
-              <button
-                className="btn btn-primary"
-                onClick={triggerUpdate}
-                disabled={loading}
-              >
-                {loading ? 'Updating...' : 'Start Update'}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
       <style dangerouslySetInnerHTML={{__html: `
-        .update-modal-overlay {
-          position: fixed;
-          top: 0;
-          left: 0;
-          right: 0;
-          bottom: 0;
-          background: rgba(0, 0, 0, 0.7);
-          display: flex;
-          align-items: center;
-          justify-content: center;
-          z-index: 1000;
-        }
-
-        .update-modal {
-          background: #2a2a2a;
-          border-radius: 8px;
-          padding: 1.5rem;
-          max-width: 500px;
-          width: 90%;
-          border: 1px solid #444;
-        }
-
-        .update-modal h3 {
-          margin: 0 0 1rem 0;
-          color: #fff;
-        }
-
-        .update-info {
-          background: #1a1a1a;
-          padding: 1rem;
-          border-radius: 4px;
+        .action-message {
+          padding: 0.75rem 1rem;
+          border-radius: 6px;
           margin-bottom: 1rem;
+          font-size: 0.9rem;
         }
-
-        .update-info p {
-          margin: 0.5rem 0;
+        .action-message-success {
+          background: rgba(46, 204, 113, 0.15);
+          border: 1px solid rgba(46, 204, 113, 0.3);
+          color: #2ecc71;
         }
-
-        .update-info code {
-          background: #333;
-          padding: 0.2rem 0.4rem;
-          border-radius: 3px;
-          font-family: monospace;
+        .action-message-error {
+          background: rgba(231, 76, 60, 0.15);
+          border: 1px solid rgba(231, 76, 60, 0.3);
+          color: #e74c3c;
         }
-
-        .update-mode-selector {
-          margin-bottom: 1.5rem;
+        .update-check-results {
+          margin-top: 1rem;
         }
-
-        .update-mode-selector > label {
-          display: block;
+        .update-check-results h3 {
+          margin: 0 0 0.75rem 0;
+          color: #fff;
+          font-size: 1rem;
+        }
+        .update-section {
+          background: #1a1a1a;
+          border-radius: 6px;
+          padding: 0.75rem 1rem;
           margin-bottom: 0.5rem;
+          border-left: 3px solid #444;
+        }
+        .update-section.has-updates {
+          border-left-color: #e67e22;
+        }
+        .update-section.up-to-date {
+          border-left-color: #2ecc71;
+        }
+        .update-section-header {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+        }
+        .update-badge {
+          font-size: 0.8rem;
+          padding: 0.15rem 0.5rem;
+          border-radius: 10px;
+        }
+        .badge-warning {
+          background: rgba(230, 126, 34, 0.2);
+          color: #e67e22;
+        }
+        .badge-ok {
+          background: rgba(46, 204, 113, 0.2);
+          color: #2ecc71;
+        }
+        .update-note {
+          margin: 0.25rem 0 0 0;
+          font-size: 0.78rem;
+          color: #888;
+        }
+        .module-update-list {
+          list-style: none;
+          padding: 0;
+          margin: 0.5rem 0 0 0;
+        }
+        .module-update-list li {
+          display: flex;
+          justify-content: space-between;
+          padding: 0.25rem 0;
+          font-size: 0.85rem;
           color: #ccc;
         }
-
-        .mode-options {
+        .module-name {
+          font-weight: 500;
+        }
+        .module-versions {
+          color: #888;
+          font-family: monospace;
+          font-size: 0.8rem;
+        }
+        .custom-modules-note {
+          font-size: 0.78rem;
+          color: #666;
+          margin: 0.5rem 0 1rem 0;
+          font-style: italic;
+        }
+        .update-action-buttons {
           display: flex;
-          flex-direction: column;
           gap: 0.5rem;
+          flex-wrap: wrap;
         }
-
-        .mode-option {
-          display: flex;
-          align-items: flex-start;
-          gap: 0.75rem;
-          padding: 0.75rem;
-          background: #1a1a1a;
-          border: 2px solid #333;
-          border-radius: 6px;
-          cursor: pointer;
-          transition: all 0.2s;
+        .update-action-buttons .btn {
+          flex: 1;
+          min-width: 120px;
         }
-
-        .mode-option:hover {
-          border-color: #555;
-        }
-
-        .mode-option.selected {
-          border-color: #007acc;
-          background: rgba(0, 122, 204, 0.1);
-        }
-
-        .mode-option input[type="radio"] {
-          margin-top: 0.25rem;
-        }
-
-        .mode-content {
-          display: flex;
-          flex-direction: column;
-          gap: 0.25rem;
-        }
-
-        .mode-label {
-          font-weight: bold;
+        .btn-success {
+          background: #2ecc71;
           color: #fff;
+          border: none;
+          padding: 0.5rem 1rem;
+          border-radius: 4px;
+          cursor: pointer;
         }
-
-        .mode-description {
-          font-size: 0.85rem;
-          color: #999;
+        .btn-success:hover:not(:disabled) {
+          background: #27ae60;
         }
-
-        .update-modal-actions {
-          display: flex;
-          gap: 0.75rem;
-          justify-content: flex-end;
+        .btn-success:disabled {
+          opacity: 0.5;
+          cursor: not-allowed;
         }
       `}} />
     </div>

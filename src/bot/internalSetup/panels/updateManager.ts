@@ -13,10 +13,8 @@ import {
 import { PanelOptions, PanelContext, PanelResponse } from '../../types/panelTypes';
 import {
   checkForBotUpdates,
-  smartBotUpdate,
-  requestBotUpdate,
+  requestSystemUpdate,
   getBotUpdateStatus,
-  getBotBuildStatus,
   checkForAllBotUpdates,
   triggerModuleUpdate,
   triggerAllModuleUpdates,
@@ -26,6 +24,7 @@ import { updatePanelDynamic } from '../utils/panel/persistentPanelResponse';
 import { updatePersistentPanelState, removePersistentPanel } from '../utils/panel/persistentPanelStorage';
 import { DISCORD_EPHEMERAL_FLAG } from '../../constants';
 import { createV2Response, V2Colors } from '../utils/panel/v2';
+import { reloadModule, reloadModules } from '../utils/moduleReloader';
 
 // Store panel owners for security
 const panelOwners = new Map<string, string>(); // messageId -> userId
@@ -123,16 +122,14 @@ const updateManagerPanel: PanelOptions = {
     }
 
     switch (buttonId) {
-      case 'architecture':
-        return await handleUpdateMode(context, 'basic');
-      case 'keep_custom':
-        return await handleUpdateMode(context, 'relative');
-      case 'everything':
-        return await handleUpdateMode(context, 'full');
+      case 'update_system':
+        return await handleSystemUpdate(context);
+      case 'update_modules':
+        return await handleUpdateAllModules(context);
+      case 'update_everything':
+        return await handleUpdateEverything(context);
       case 'check_updates':
         return await handleCheckUpdates(context);
-      case 'update_all_modules':
-        return await handleUpdateAllModules(context);
       case 'information':
         return buildInformationView(context);
       case 'close':
@@ -150,15 +147,16 @@ const updateManagerPanel: PanelOptions = {
   },
 };
 
+// ─── Helper Functions ───
+
 /**
- * Helper: Get status display with emoji indicator for combined updates
+ * Get status display with emoji indicator
  */
 function getStatusDisplay(status: any, isChecking: boolean = false, isUpdating: boolean = false, combinedCheck?: CombinedUpdateCheckResult | null): string {
   if (isUpdating) return '🟡 Updating...';
   if (isChecking) return '🟡 Checking...';
   if (status.inProgress) return '🟡 Update in progress';
 
-  // Check combined update result
   if (combinedCheck) {
     if (!combinedCheck.success) return '🔴 Error';
     if (combinedCheck.summary.hasAnyUpdates) {
@@ -168,7 +166,6 @@ function getStatusDisplay(status: any, isChecking: boolean = false, isUpdating: 
     return '🟢 Up to Date';
   }
 
-  // Fall back to persisted status
   if (status.lastError) return '🔴 Error';
   if (status.hasUpdates) return '🟠 Updates Available';
   if (status.lastCheck) return '🟢 Up to Date';
@@ -176,15 +173,7 @@ function getStatusDisplay(status: any, isChecking: boolean = false, isUpdating: 
 }
 
 /**
- * Helper: Get mode display
- */
-function getModeDisplay(status: any): string {
-  return status.mode || 'None';
-}
-
-/**
- * Helper: Truncate module name for button labels
- * Discord button labels have 80 char limit, but we want shorter for UI
+ * Truncate module name for button labels (Discord 80 char limit)
  */
 function truncateModuleName(name: string, maxLength: number = 12): string {
   if (name.length <= maxLength) return name;
@@ -192,93 +181,67 @@ function truncateModuleName(name: string, maxLength: number = 12): string {
 }
 
 /**
- * Helper: Format date as "day month, year" (e.g., "1 December 2025")
+ * Format date as "day month, year"
  */
 function formatDate(dateInput: string | number | undefined): string {
   if (!dateInput) return 'Unknown';
   const date = new Date(dateInput);
   if (isNaN(date.getTime())) return 'Unknown';
-
   const months = ['January', 'February', 'March', 'April', 'May', 'June',
                   'July', 'August', 'September', 'October', 'November', 'December'];
-
   return `${date.getDate()} ${months[date.getMonth()]}, ${date.getFullYear()}`;
 }
 
 /**
- * Helper: Get last check display
- */
-function getLastCheckDisplay(status: any): string {
-  if (!status.lastCheck) return 'Never';
-  return formatDate(status.lastCheck);
-}
-
-/**
- * Helper: Get release date display
- */
-function getReleaseDateDisplay(updateCheck?: any): string {
-  if (updateCheck?.latestVersionDate) {
-    return formatDate(updateCheck.latestVersionDate);
-  }
-  return 'Unknown';
-}
-
-/**
- * Helper: Get accent color based on status
+ * Get accent color based on status string
  */
 function getAccentColor(statusDisplay: string): number {
-  if (statusDisplay.startsWith('🔴')) return V2Colors.danger; // Red
-  if (statusDisplay.startsWith('🟡')) return 0xF1C40F; // Yellow
-  if (statusDisplay.startsWith('🟠')) return 0xE67E22; // Orange
-  if (statusDisplay.startsWith('🟢') && statusDisplay.includes('Up to Date')) return V2Colors.success; // Green
-  return V2Colors.primary; // Blue default
+  if (statusDisplay.startsWith('🔴')) return V2Colors.danger;
+  if (statusDisplay.startsWith('🟡')) return 0xF1C40F;
+  if (statusDisplay.startsWith('🟠')) return 0xE67E22;
+  if (statusDisplay.startsWith('🟢') && statusDisplay.includes('Up to Date')) return V2Colors.success;
+  return V2Colors.primary;
 }
 
+// ─── Button Builders ───
+
 /**
- * Build standard action buttons (3 rows)
- * Row 1: Base code update modes
- * Row 2: Module updates (if any available)
- * Row 3: Check/Info/Close
+ * Build action buttons:
+ * Row 1: Update System | Update Modules | Update Everything
+ * Row 2: Individual module buttons (if updates available)
+ * Row 3: Check Updates | Information | Close
  */
 function buildButtons(disabled: boolean = false, combinedCheck?: CombinedUpdateCheckResult | null): ActionRowBuilder<ButtonBuilder>[] {
   const rows: ActionRowBuilder<ButtonBuilder>[] = [];
 
-  // Row 1: Base code update modes
+  const hasSystemUpdate = combinedCheck?.baseCode.hasUpdates === true;
+  const hasModuleUpdates = (combinedCheck?.modules.updatesAvailable || 0) > 0;
+
+  // Row 1: Update System / Update Modules / Update Everything
   const row1 = new ActionRowBuilder<ButtonBuilder>()
     .addComponents(
       new ButtonBuilder()
-        .setCustomId('panel_update_manager_btn_architecture')
-        .setLabel('🔄 Architecture')
-        .setStyle(ButtonStyle.Secondary)
-        .setDisabled(disabled),
+        .setCustomId('panel_update_manager_btn_update_system')
+        .setLabel('⬆️ Update System')
+        .setStyle(ButtonStyle.Primary)
+        .setDisabled(disabled || !hasSystemUpdate),
       new ButtonBuilder()
-        .setCustomId('panel_update_manager_btn_keep_custom')
-        .setLabel('🔄 Keep custom')
-        .setStyle(ButtonStyle.Secondary)
-        .setDisabled(disabled),
+        .setCustomId('panel_update_manager_btn_update_modules')
+        .setLabel('📦 Update Modules')
+        .setStyle(ButtonStyle.Success)
+        .setDisabled(disabled || !hasModuleUpdates),
       new ButtonBuilder()
-        .setCustomId('panel_update_manager_btn_everything')
-        .setLabel('🔄 Everything')
+        .setCustomId('panel_update_manager_btn_update_everything')
+        .setLabel('🔄 Update Everything')
         .setStyle(ButtonStyle.Secondary)
-        .setDisabled(disabled)
+        .setDisabled(disabled || !(hasSystemUpdate && hasModuleUpdates))
     );
   rows.push(row1);
 
-  // Row 2: Module updates (only if modules with updates exist)
-  if (combinedCheck?.modules.updatesAvailable && combinedCheck.modules.updatesAvailable > 0) {
+  // Row 2: Individual module update buttons (if module updates exist)
+  if (hasModuleUpdates && combinedCheck) {
     const moduleRow = new ActionRowBuilder<ButtonBuilder>();
-
-    // Add "Update All Modules" button
-    moduleRow.addComponents(
-      new ButtonBuilder()
-        .setCustomId('panel_update_manager_btn_update_all_modules')
-        .setLabel(`📦 Update All (${combinedCheck.modules.updatesAvailable})`)
-        .setStyle(ButtonStyle.Success)
-        .setDisabled(disabled)
-    );
-
-    // Add individual module update buttons (max 4 to fit in row)
-    const modulesWithUpdates = combinedCheck.modules.updates.filter(u => u.hasUpdate).slice(0, 4);
+    const modulesWithUpdates = combinedCheck.modules.updates.filter(u => u.hasUpdate).slice(0, 5);
     for (const mod of modulesWithUpdates) {
       moduleRow.addComponents(
         new ButtonBuilder()
@@ -288,11 +251,10 @@ function buildButtons(disabled: boolean = false, combinedCheck?: CombinedUpdateC
           .setDisabled(disabled)
       );
     }
-
     rows.push(moduleRow);
   }
 
-  // Row 3: Check/Info/Close
+  // Row 3: Check / Info / Close
   const row3 = new ActionRowBuilder<ButtonBuilder>()
     .addComponents(
       new ButtonBuilder()
@@ -316,108 +278,14 @@ function buildButtons(disabled: boolean = false, combinedCheck?: CombinedUpdateC
   return rows;
 }
 
-/**
- * Build information view with ONLY back button
- */
-function buildInformationView(context: PanelContext): PanelResponse {
-  const container = new ContainerBuilder()
-    .setAccentColor(V2Colors.info);
-
-  // Title
-  container.addTextDisplayComponents(
-    new TextDisplayBuilder().setContent('## Bot Update Manager\n**Update Mode Information**')
-  );
-
-  container.addSeparatorComponents(
-    new SeparatorBuilder().setSpacing(SeparatorSpacingSize.Small)
-  );
-
-  // Architecture mode
-  container.addTextDisplayComponents(
-    new TextDisplayBuilder().setContent(
-      '## Architecture\n' +
-      'Only update INTERNAL Events and Commands\n' +
-      '• Updates core bot infrastructure\n' +
-      '• Preserves all custom modules\n' +
-      '• Safest option for custom setups'
-    )
-  );
-
-  container.addSeparatorComponents(
-    new SeparatorBuilder().setSpacing(SeparatorSpacingSize.Small).setDivider(false)
-  );
-
-  // Keep custom mode
-  container.addTextDisplayComponents(
-    new TextDisplayBuilder().setContent(
-      '## Keep Custom\n' +
-      'Update all default Events and Commands, while preserving any custom ones\n' +
-      '• Updates default modules to latest version\n' +
-      '• Keeps your custom modules intact\n' +
-      '• Recommended for most users'
-    )
-  );
-
-  container.addSeparatorComponents(
-    new SeparatorBuilder().setSpacing(SeparatorSpacingSize.Small).setDivider(false)
-  );
-
-  // Everything mode
-  container.addTextDisplayComponents(
-    new TextDisplayBuilder().setContent(
-      '## Everything\n' +
-      'Replaces EVERY Command and Event with new ones (removing any possibly obsolete/custom)\n' +
-      '• Complete fresh installation\n' +
-      '• Removes all custom modifications\n' +
-      '• Data is not lost\n' +
-      '• Use when experiencing issues'
-    )
-  );
-
-  container.addSeparatorComponents(
-    new SeparatorBuilder().setSpacing(SeparatorSpacingSize.Small)
-  );
-
-  // Back button
-  container.addActionRowComponents(
-    new ActionRowBuilder<ButtonBuilder>().addComponents(
-      new ButtonBuilder()
-        .setCustomId('panel_update_manager_btn_back_to_main')
-        .setLabel('Back')
-        .setStyle(ButtonStyle.Secondary)
-    )
-  );
-
-  return createV2Response([container]);
-}
+// ─── Panel Views ───
 
 /**
- * Handle close panel - deletes the persistent panel message
- */
-async function handleClosePanel(context: PanelContext): Promise<PanelResponse> {
-  // Delete the persistent panel message and storage
-  if (context.interaction && 'message' in context.interaction && context.interaction.message) {
-    try {
-      // Remove from storage first
-      await removePersistentPanel('update_manager', context.guildId || undefined);
-      // Delete the Discord message
-      await context.interaction.message.delete();
-      console.log('[UpdateManagerPanel] Panel closed and deleted');
-    } catch (error) {
-      console.error('[UpdateManagerPanel] Failed to delete panel:', error);
-    }
-  }
-
-  // Return null - message already deleted, no response needed
-  return null as any;
-}
-
-/**
- * Build main panel view with V2 components
+ * Build main panel view
  */
 function buildPanelView(
   context: PanelContext,
-  view: 'main' | 'checking' | 'updating' | 'updating_modules',
+  view: 'main' | 'checking' | 'updating_system' | 'updating_modules',
   combinedCheck?: CombinedUpdateCheckResult | null
 ): PanelResponse {
   const status = getBotUpdateStatus();
@@ -427,15 +295,11 @@ function buildPanelView(
     panelOwners.set(context.interaction.message.id, context.userId);
   }
 
-  // Determine status display
   const isChecking = view === 'checking';
-  const isUpdating = view === 'updating' || view === 'updating_modules';
+  const isUpdating = view === 'updating_system' || view === 'updating_modules';
   const statusDisplay = getStatusDisplay(status, isChecking, isUpdating, combinedCheck);
-
-  // Determine accent color
   const accentColor = getAccentColor(statusDisplay);
 
-  // Build V2 container
   const container = new ContainerBuilder()
     .setAccentColor(accentColor);
 
@@ -448,11 +312,11 @@ function buildPanelView(
     new SeparatorBuilder().setSpacing(SeparatorSpacingSize.Small)
   );
 
-  // Status grid - using inline format
-  const lastChecked = combinedCheck?.lastChecked ? formatDate(combinedCheck.lastChecked) : getLastCheckDisplay(status);
+  // Status line
+  const lastChecked = combinedCheck?.lastChecked ? formatDate(combinedCheck.lastChecked) : (status.lastCheck ? formatDate(status.lastCheck) : 'Never');
   container.addTextDisplayComponents(
     new TextDisplayBuilder().setContent(
-      `**Status:** ${statusDisplay} | **Mode:** ${getModeDisplay(status)}\n` +
+      `**Status:** ${statusDisplay}\n` +
       `**Last Check:** ${lastChecked}`
     )
   );
@@ -461,15 +325,15 @@ function buildPanelView(
     new SeparatorBuilder().setSpacing(SeparatorSpacingSize.Small)
   );
 
-  // Build details content
+  // Details section
   let detailsContent = '';
 
   if (isChecking) {
     detailsContent = 'Connecting to update server...\nChecking base code updates...\nChecking module updates...';
-  } else if (view === 'updating') {
-    detailsContent = 'Preparing update environment...\nBacking up current configuration...\nDownloading latest version...';
+  } else if (view === 'updating_system') {
+    detailsContent = 'Requesting system update from Bot Manager...\nThe bot will restart with updated code.';
   } else if (view === 'updating_modules') {
-    detailsContent = 'Updating modules...\nBacking up current modules...\nInstalling new versions...';
+    detailsContent = 'Updating modules via hot-reload...\nNo restart required.';
   } else if (combinedCheck) {
     if (!combinedCheck.success) {
       const baseError = combinedCheck.baseCode.error;
@@ -477,9 +341,10 @@ function buildPanelView(
       detailsContent = `Errors occurred:\n${baseError ? `- Base: ${baseError}\n` : ''}${moduleErrors ? `- Modules: ${moduleErrors}` : ''}`;
     } else {
       // Base code section
-      detailsContent = '=== Base Code ===\n';
+      detailsContent = '=== System (Base Code) ===\n';
       if (combinedCheck.baseCode.hasUpdates) {
-        detailsContent += `Updates available (${combinedCheck.baseCode.commitsBehind || '?'} commits behind)\n`;
+        detailsContent += `Update available (${combinedCheck.baseCode.commitsBehind || '?'} commits behind)\n`;
+        detailsContent += 'Requires restart\n';
       } else {
         detailsContent += 'Up to date\n';
       }
@@ -494,6 +359,7 @@ function buildPanelView(
         for (const mod of modulesWithUpdates) {
           detailsContent += `  • ${mod.moduleName}: ${mod.installedVersion} → ${mod.availableVersion}\n`;
         }
+        detailsContent += 'Hot-reload (no restart needed)\n';
       } else if (combinedCheck.modules.totalInstalled === 0) {
         detailsContent += 'No modules installed\n';
       } else {
@@ -507,12 +373,14 @@ function buildPanelView(
           detailsContent += `  • ${err.moduleName}: ${err.error}\n`;
         }
       }
+
+      // Custom modules note
+      detailsContent += '\nCustom modules (modulesDev/) are never affected.';
     }
   } else if (status.lastError) {
     detailsContent = `Error: ${status.lastError}\n\nPlease check:\n- API configuration\n- Network connectivity`;
   }
 
-  // Details section with code block
   container.addTextDisplayComponents(
     new TextDisplayBuilder().setContent(
       `**Details:**\n\`\`\`\n${detailsContent || 'No details available. Click "Check Updates" to scan.'}\n\`\`\``
@@ -523,10 +391,8 @@ function buildPanelView(
     new SeparatorBuilder().setSpacing(SeparatorSpacingSize.Small)
   );
 
-  // Buttons disabled only during checking/updating
+  // Buttons disabled during checking/updating
   const buttonsDisabled = isChecking || isUpdating || status.inProgress;
-
-  // Add button rows to container
   const buttonRows = buildButtons(buttonsDisabled, combinedCheck);
   for (const row of buttonRows) {
     container.addActionRowComponents(row);
@@ -536,40 +402,104 @@ function buildPanelView(
 }
 
 /**
- * Handle check updates button - checks both base code and modules
+ * Build information view
+ */
+function buildInformationView(context: PanelContext): PanelResponse {
+  const container = new ContainerBuilder()
+    .setAccentColor(V2Colors.info);
+
+  container.addTextDisplayComponents(
+    new TextDisplayBuilder().setContent('## Bot Update Manager\n**Update Types**')
+  );
+
+  container.addSeparatorComponents(
+    new SeparatorBuilder().setSpacing(SeparatorSpacingSize.Small)
+  );
+
+  container.addTextDisplayComponents(
+    new TextDisplayBuilder().setContent(
+      '## ⬆️ Update System\n' +
+      'Updates the bot\'s base code (core framework, internal events/commands)\n' +
+      '• Pulls latest source from the repository\n' +
+      '• Rebuilds and restarts the container\n' +
+      '• All modules and custom modules are preserved\n' +
+      '• **Requires restart**'
+    )
+  );
+
+  container.addSeparatorComponents(
+    new SeparatorBuilder().setSpacing(SeparatorSpacingSize.Small).setDivider(false)
+  );
+
+  container.addTextDisplayComponents(
+    new TextDisplayBuilder().setContent(
+      '## 📦 Update Modules\n' +
+      'Updates AppStore modules to their latest versions\n' +
+      '• Downloads and applies module changes\n' +
+      '• Hot-reloads modules at runtime\n' +
+      '• **No restart needed** — bot stays online\n' +
+      '• Custom modules (modulesDev/) are never affected'
+    )
+  );
+
+  container.addSeparatorComponents(
+    new SeparatorBuilder().setSpacing(SeparatorSpacingSize.Small).setDivider(false)
+  );
+
+  container.addTextDisplayComponents(
+    new TextDisplayBuilder().setContent(
+      '## 🔄 Update Everything\n' +
+      'Updates both system and modules in one step\n' +
+      '• System update runs first (restart)\n' +
+      '• Modules are synced on boot\n' +
+      '• Only available when both have updates'
+    )
+  );
+
+  container.addSeparatorComponents(
+    new SeparatorBuilder().setSpacing(SeparatorSpacingSize.Small)
+  );
+
+  container.addActionRowComponents(
+    new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId('panel_update_manager_btn_back_to_main')
+        .setLabel('Back')
+        .setStyle(ButtonStyle.Secondary)
+    )
+  );
+
+  return createV2Response([container]);
+}
+
+// ─── Button Handlers ───
+
+/**
+ * Handle check updates button
  */
 async function handleCheckUpdates(context: PanelContext): Promise<PanelResponse> {
-  // Return immediate "checking" state
   const checkingResponse = buildPanelView(context, 'checking');
 
-  // Perform combined check in background
   setImmediate(async () => {
     try {
       const combinedCheck = await checkForAllBotUpdates();
+      const resultResponse = buildPanelView(context, 'main', combinedCheck || {
+        success: false,
+        lastChecked: new Date().toISOString(),
+        baseCode: { checked: false, hasUpdates: false, error: 'Failed to check for updates' },
+        modules: { checked: false, hasUpdates: false, totalInstalled: 0, updatesAvailable: 0, updates: [], errors: [] },
+        summary: { totalUpdatesAvailable: 0, hasAnyUpdates: false }
+      });
 
-      if (!combinedCheck) {
-        // Failed to check
-        const errorResponse = buildPanelView(context, 'main', {
-          success: false,
-          lastChecked: new Date().toISOString(),
-          baseCode: { checked: false, hasUpdates: false, error: 'Failed to check for updates' },
-          modules: { checked: false, hasUpdates: false, totalInstalled: 0, updatesAvailable: 0, updates: [], errors: [] },
-          summary: { totalUpdatesAvailable: 0, hasAnyUpdates: false }
-        });
+      await updatePanelDynamic(context, 'update_manager', resultResponse);
 
-        await updatePanelDynamic(context, 'update_manager', errorResponse);
-      } else {
-        const resultResponse = buildPanelView(context, 'main', combinedCheck);
-
-        await updatePanelDynamic(context, 'update_manager', resultResponse);
-
+      if (combinedCheck) {
         await updatePersistentPanelState('update_manager', 'checked', context.guildId || undefined, undefined, {
           lastCheckResult: combinedCheck
         });
       }
     } catch (error) {
       console.error('[UpdateManagerPanel] Error checking updates:', error);
-
       const errorResponse = buildPanelView(context, 'main', {
         success: false,
         lastChecked: new Date().toISOString(),
@@ -577,7 +507,6 @@ async function handleCheckUpdates(context: PanelContext): Promise<PanelResponse>
         modules: { checked: false, hasUpdates: false, totalInstalled: 0, updatesAvailable: 0, updates: [], errors: [] },
         summary: { totalUpdatesAvailable: 0, hasAnyUpdates: false }
       });
-
       await updatePanelDynamic(context, 'update_manager', errorResponse);
     }
   });
@@ -586,33 +515,22 @@ async function handleCheckUpdates(context: PanelContext): Promise<PanelResponse>
 }
 
 /**
- * Handle update mode button (architecture, keep_custom, everything)
+ * Handle system update button — requests pull + rebuild from Bot Manager
  */
-async function handleUpdateMode(context: PanelContext, mode: 'basic' | 'relative' | 'full'): Promise<PanelResponse> {
-  const modeNames = {
-    basic: 'Architecture',
-    relative: 'Keep custom',
-    full: 'Everything'
-  };
-
-  // Set mode in status
+async function handleSystemUpdate(context: PanelContext): Promise<PanelResponse> {
   await updatePersistentPanelState('update_manager', 'updating', context.guildId || undefined);
+  const updatingResponse = buildPanelView(context, 'updating_system');
 
-  // Return immediate "updating" state
-  const updatingResponse = buildPanelView(context, 'updating');
-
-  // Trigger update in background
   setImmediate(async () => {
     try {
-      const result = await requestBotUpdate(mode);
-
+      const result = await requestSystemUpdate();
       if (result.success) {
         await updatePersistentPanelState('update_manager', 'update_triggered', context.guildId || undefined);
       } else {
-        await updatePersistentPanelState('update_manager', 'update_complete', context.guildId || undefined);
+        await updatePersistentPanelState('update_manager', 'update_error', context.guildId || undefined);
       }
     } catch (error) {
-      console.error('[UpdateManagerPanel] Error during update:', error);
+      console.error('[UpdateManagerPanel] Error during system update:', error);
       await updatePersistentPanelState('update_manager', 'update_error', context.guildId || undefined);
     }
   });
@@ -621,40 +539,44 @@ async function handleUpdateMode(context: PanelContext, mode: 'basic' | 'relative
 }
 
 /**
- * Handle update all modules button
+ * Handle update all modules button — download files + hot-reload
  */
 async function handleUpdateAllModules(context: PanelContext): Promise<PanelResponse> {
-  // Return immediate "updating" state
   const updatingResponse = buildPanelView(context, 'updating_modules');
 
-  // Trigger module updates in background
   setImmediate(async () => {
     try {
+      // Step 1: Download module updates via AppStoreManager
       const result = await triggerAllModuleUpdates();
+
+      if (result.success && result.totalUpdated > 0) {
+        console.log(`[UpdateManagerPanel] Downloaded ${result.totalUpdated} module update(s), hot-reloading...`);
+
+        // Step 2: Hot-reload the updated modules
+        const updatedNames = result.updated.map((u: any) => u.moduleName);
+        if (updatedNames.length > 0 && context.client) {
+          const reloadResult = await reloadModules(context.client, updatedNames);
+          if (reloadResult.success) {
+            console.log(`[UpdateManagerPanel] Hot-reloaded ${reloadResult.reloaded.length} module(s)`);
+          } else {
+            console.warn(`[UpdateManagerPanel] Hot-reload partial: ${reloadResult.reloaded.length} OK, ${reloadResult.failed.length} failed`);
+          }
+        }
+      }
 
       // Re-check for updates after updating
       const newCheck = await checkForAllBotUpdates();
-
-      if (result.success && result.totalUpdated > 0) {
-        console.log(`[UpdateManagerPanel] Successfully updated ${result.totalUpdated} module(s)`);
-      }
-
       const resultResponse = buildPanelView(context, 'main', newCheck);
       await updatePanelDynamic(context, 'update_manager', resultResponse);
 
       if (newCheck) {
         await updatePersistentPanelState('update_manager', 'modules_updated', context.guildId || undefined, undefined, {
           lastCheckResult: newCheck,
-          lastModuleUpdate: {
-            updated: result.updated,
-            failed: result.failed
-          }
+          lastModuleUpdate: { updated: result.updated, failed: result.failed }
         });
       }
     } catch (error) {
       console.error('[UpdateManagerPanel] Error updating modules:', error);
-
-      // Re-check for updates to show current state
       const newCheck = await checkForAllBotUpdates();
       const errorResponse = buildPanelView(context, 'main', newCheck);
       await updatePanelDynamic(context, 'update_manager', errorResponse);
@@ -665,26 +587,65 @@ async function handleUpdateAllModules(context: PanelContext): Promise<PanelRespo
 }
 
 /**
- * Handle single module update button
+ * Handle update everything — system update first (modules sync on boot via "Update on Reboot")
  */
-async function handleUpdateSingleModule(context: PanelContext, moduleName: string): Promise<PanelResponse> {
-  // Return immediate "updating" state
-  const updatingResponse = buildPanelView(context, 'updating_modules');
+async function handleUpdateEverything(context: PanelContext): Promise<PanelResponse> {
+  await updatePersistentPanelState('update_manager', 'updating', context.guildId || undefined);
+  const updatingResponse = buildPanelView(context, 'updating_system');
 
-  // Trigger module update in background
   setImmediate(async () => {
     try {
+      // First update modules (they'll be applied before restart)
+      const moduleResult = await triggerAllModuleUpdates();
+      if (moduleResult.totalUpdated > 0) {
+        console.log(`[UpdateManagerPanel] Updated ${moduleResult.totalUpdated} module(s) before system update`);
+      }
+
+      // Then trigger system update (pull + rebuild + restart)
+      const result = await requestSystemUpdate();
+      if (result.success) {
+        await updatePersistentPanelState('update_manager', 'update_triggered', context.guildId || undefined);
+      } else {
+        await updatePersistentPanelState('update_manager', 'update_error', context.guildId || undefined);
+      }
+    } catch (error) {
+      console.error('[UpdateManagerPanel] Error during combined update:', error);
+      await updatePersistentPanelState('update_manager', 'update_error', context.guildId || undefined);
+    }
+  });
+
+  return updatingResponse;
+}
+
+/**
+ * Handle single module update button — download + hot-reload
+ */
+async function handleUpdateSingleModule(context: PanelContext, moduleName: string): Promise<PanelResponse> {
+  const updatingResponse = buildPanelView(context, 'updating_modules');
+
+  setImmediate(async () => {
+    try {
+      // Step 1: Download module update
       const result = await triggerModuleUpdate(moduleName);
 
-      // Re-check for updates after updating
-      const newCheck = await checkForAllBotUpdates();
-
       if (result.success) {
-        console.log(`[UpdateManagerPanel] Successfully updated ${moduleName} to ${result.newVersion}`);
+        console.log(`[UpdateManagerPanel] Downloaded ${moduleName} update, hot-reloading...`);
+
+        // Step 2: Hot-reload the module
+        if (context.client) {
+          const reloadResult = await reloadModule(context.client, moduleName);
+          if (reloadResult.success) {
+            console.log(`[UpdateManagerPanel] Hot-reloaded ${moduleName} (${reloadResult.duration}ms)`);
+          } else {
+            console.warn(`[UpdateManagerPanel] Hot-reload failed for ${moduleName}: ${reloadResult.error}`);
+          }
+        }
       } else {
         console.error(`[UpdateManagerPanel] Failed to update ${moduleName}: ${result.error}`);
       }
 
+      // Re-check for updates
+      const newCheck = await checkForAllBotUpdates();
       const resultResponse = buildPanelView(context, 'main', newCheck);
       await updatePanelDynamic(context, 'update_manager', resultResponse);
 
@@ -696,8 +657,6 @@ async function handleUpdateSingleModule(context: PanelContext, moduleName: strin
       }
     } catch (error) {
       console.error('[UpdateManagerPanel] Error updating module:', error);
-
-      // Re-check for updates to show current state
       const newCheck = await checkForAllBotUpdates();
       const errorResponse = buildPanelView(context, 'main', newCheck);
       await updatePanelDynamic(context, 'update_manager', errorResponse);
@@ -705,6 +664,23 @@ async function handleUpdateSingleModule(context: PanelContext, moduleName: strin
   });
 
   return updatingResponse;
+}
+
+/**
+ * Handle close panel — deletes the persistent panel message
+ */
+async function handleClosePanel(context: PanelContext): Promise<PanelResponse> {
+  if (context.interaction && 'message' in context.interaction && context.interaction.message) {
+    try {
+      await removePersistentPanel('update_manager', context.guildId || undefined);
+      await context.interaction.message.delete();
+      console.log('[UpdateManagerPanel] Panel closed and deleted');
+    } catch (error) {
+      console.error('[UpdateManagerPanel] Failed to delete panel:', error);
+    }
+  }
+
+  return null as any;
 }
 
 export default updateManagerPanel;

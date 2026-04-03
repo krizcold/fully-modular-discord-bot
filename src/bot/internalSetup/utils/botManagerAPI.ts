@@ -17,14 +17,6 @@ import type {
 
 // Re-export types for compatibility
 export type { CombinedUpdateCheckResult, ModuleUpdateResult, BulkModuleUpdateResult };
-export interface UpdateConfig {
-  updateMode: 'none' | 'basic' | 'relative' | 'full' | 'first';
-  updateInProgress: boolean;
-  lastUpdateTime?: number;
-  lastUpdateCheck?: number;
-  lastUpdateError?: string;
-  lastUpdateErrorCode?: string;
-}
 
 export interface UpdateCheckResponse {
   success: boolean;
@@ -59,14 +51,10 @@ export async function checkForBotUpdates(): Promise<UpdateCheckResponse | null> 
 }
 
 /**
- * Request update from Bot Manager
- * Note: Update modes (basic/relative/full) are no longer used - Bot Manager handles updates uniformly
+ * Request system update from Bot Manager.
+ * Triggers pull + rebuild + restart via Bot Manager API.
  */
-export async function requestBotUpdate(
-  _mode: UpdateConfig['updateMode']
-): Promise<{ success: boolean; error?: string; code?: string }> {
-  // Mode parameter kept for API compatibility but not used
-  // Bot Manager handles all updates the same way
+export async function requestSystemUpdate(): Promise<{ success: boolean; error?: string; code?: string }> {
   return await updater.triggerUpdate('relative');
 }
 
@@ -92,7 +80,7 @@ export async function smartBotUpdate(): Promise<{
     };
   }
 
-  const result = await updater.triggerUpdate('relative');
+  const result = await requestSystemUpdate();
 
   return {
     triggered: result.success,
@@ -119,7 +107,6 @@ export async function getBotBuildStatus(): Promise<BuildStatusResponse | null> {
  */
 export function getBotUpdateStatus(): {
   inProgress: boolean;
-  mode: UpdateConfig['updateMode'];
   lastCheck?: number;
   lastError?: string;
   lastErrorCode?: string;
@@ -127,7 +114,6 @@ export function getBotUpdateStatus(): {
   const status = updater.getUpdateStatus();
   return {
     inProgress: status.inProgress,
-    mode: status.mode as UpdateConfig['updateMode'],
     lastCheck: status.lastCheck,
     lastError: status.lastError,
     lastErrorCode: status.lastErrorCode

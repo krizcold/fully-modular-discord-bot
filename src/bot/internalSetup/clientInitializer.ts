@@ -6,9 +6,11 @@ import 'dotenv/config';
 import { RegisteredButtonInfo, RegisteredDropdownInfo, RegisteredModalInfo, RegisteredReactionInfo, RegisteredReactionRemoveInfo } from '../types/commandTypes';
 import { getPanelManager } from './utils/panelManager';
 import { setupPanelIPCHandlers } from './utils/ipcPanelHandler';
+import { setupReloadIPCHandlers } from './utils/ipcReloadHandler';
 import { loadCredentials } from '../../utils/envLoader';
 import { ModuleLoader } from './utils/moduleLoader';
 import { getModuleRegistry } from './utils/moduleRegistry';
+import { getModuleEventManager } from './utils/moduleEventManager';
 import { LoadedModule } from '../types/moduleTypes';
 import { ensureConfigPopulated } from './utils/configManager';
 import { getAppStoreManager } from './utils/appStoreManager';
@@ -143,38 +145,46 @@ async function loadModules(client: Client): Promise<number[]> {
 }
 
 /**
- * Register module commands and events
+ * Register module commands and events.
+ * Event handlers are tracked via ModuleEventManager for clean removal on hot-reload.
  */
 function registerModuleComponents(client: Client) {
   console.log('[ModuleLoader] Registering module components...');
 
+  const eventManager = getModuleEventManager();
+  eventManager.setClient(client);
+
   for (const module of loadedModules) {
-    // Collect command initializers from modules
-    for (const command of module.commands) {
-      if (typeof command.initialize === 'function') {
-        if (!modulesToInitialize.some(mod => mod === command)) {
-          modulesToInitialize.push(command);
-        }
-      }
-    }
-
-    // Register module event handlers
-    for (const [eventName, handlers] of module.events) {
-      for (const handler of handlers) {
-        if (typeof handler === 'function') {
-          client.on(eventName, async (...args) => {
-            try {
-              await handler(client, ...args);
-            } catch (error) {
-              console.error(`[ModuleLoader] Error in ${module.manifest.name} ${eventName} handler:`, error);
-            }
-          });
-        }
-      }
-    }
-
-    console.log(`[ModuleLoader] Registered ${module.manifest.displayName}: ${module.commands.length} commands, ${module.events.size} event types`);
+    registerSingleModuleComponents(client, module);
   }
+}
+
+/**
+ * Register a single module's commands and events.
+ * Extracted so it can be called during hot-reload for individual modules.
+ */
+function registerSingleModuleComponents(client: Client, module: LoadedModule) {
+  const eventManager = getModuleEventManager();
+
+  // Collect command initializers
+  for (const command of module.commands) {
+    if (typeof command.initialize === 'function') {
+      if (!modulesToInitialize.some(mod => mod === command)) {
+        modulesToInitialize.push(command);
+      }
+    }
+  }
+
+  // Register module event handlers via EventManager (tracked for removal)
+  for (const [eventName, handlers] of module.events) {
+    for (const handler of handlers) {
+      if (typeof handler === 'function') {
+        eventManager.registerListener(module.manifest.name, eventName, handler);
+      }
+    }
+  }
+
+  console.log(`[ModuleLoader] Registered ${module.manifest.displayName}: ${module.commands.length} commands, ${module.events.size} event types, ${eventManager.getListenerCount(module.manifest.name)} listeners`);
 }
 
 /**
@@ -410,6 +420,9 @@ async function main() {
   client.reactionHandlers = new Map<string, RegisteredReactionInfo>();
   client.reactionRemoveHandlers = new Map<string, RegisteredReactionRemoveInfo[]>();
 
+  // Set client on registry for unload context
+  getModuleRegistry().setClient(client);
+
   // PHASE 5: Register module components
   registerModuleComponents(client);
 
@@ -466,6 +479,9 @@ async function main() {
 
   // Set up IPC message handlers for Web-UI panel integration
   setupPanelIPCHandlers();
+
+  // Set up IPC message handlers for module hot-reload
+  setupReloadIPCHandlers(client);
 
   client.login(process.env.DISCORD_TOKEN);
 }

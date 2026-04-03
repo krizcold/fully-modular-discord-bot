@@ -6,7 +6,8 @@ import {
   LoadedModule,
   ModuleValidationResult,
   ModuleDependencyGraph,
-  ModuleContext
+  ModuleContext,
+  ModuleHooks
 } from '../../types/moduleTypes';
 import { getModuleRegistry } from './moduleRegistry';
 import {
@@ -116,6 +117,15 @@ export class ModuleLoader {
         // Register in module registry
         getModuleRegistry().register(module);
 
+        // Call onLoad hook
+        if (module.hooks?.onLoad) {
+          try {
+            await module.hooks.onLoad(this.createModuleContext(module));
+          } catch (hookError) {
+            console.error(`[ModuleLoader] onLoad hook failed for ${moduleName}:`, hookError);
+          }
+        }
+
         console.log(
           `[ModuleLoader] Loaded module: ${module.manifest.displayName} v${module.manifest.version}`
         );
@@ -124,9 +134,32 @@ export class ModuleLoader {
       }
     }
 
+    // Call onReady hooks on all modules (all modules are now loaded)
+    for (const module of loadedModules) {
+      if (module.hooks?.onReady) {
+        try {
+          await module.hooks.onReady(this.createModuleContext(module));
+        } catch (hookError) {
+          console.error(`[ModuleLoader] onReady hook failed for ${module.manifest.name}:`, hookError);
+        }
+      }
+    }
+
     console.log(`[ModuleLoader] Successfully loaded ${loadedModules.length} modules`);
 
     return loadedModules;
+  }
+
+  /**
+   * Create a ModuleContext for lifecycle hook calls
+   */
+  createModuleContext(module: LoadedModule): ModuleContext {
+    return {
+      client: this.client,
+      manifest: module.manifest,
+      modulePath: module.path,
+      dataPath: getModuleDataPath(module.manifest.name)
+    };
   }
 
   /**
@@ -247,12 +280,13 @@ export class ModuleLoader {
   }
 
   /**
-   * Load a single module
+   * Load a single module.
+   * Public so moduleReloader can call it directly for hot-reload.
    * @param manifest - Module manifest
    * @param modulePath - Absolute path to module directory
    * @returns Loaded module
    */
-  private async loadModule(manifest: ModuleManifest, modulePath: string): Promise<LoadedModule> {
+  async loadModule(manifest: ModuleManifest, modulePath: string): Promise<LoadedModule> {
     const module: LoadedModule = {
       manifest,
       path: modulePath,
@@ -260,25 +294,26 @@ export class ModuleLoader {
       events: new Map(),
       panels: [],
       exports: new Map(),
-      initialized: false
+      initialized: false,
+      importedFiles: []
     };
 
     // Load commands
     const commandsPath = path.join(modulePath, 'commands');
     if (fs.existsSync(commandsPath)) {
-      module.commands = await this.loadCommands(commandsPath);
+      module.commands = await this.loadCommands(commandsPath, module.importedFiles);
     }
 
     // Load events
     const eventsPath = path.join(modulePath, 'events');
     if (fs.existsSync(eventsPath)) {
-      module.events = await this.loadEvents(eventsPath);
+      module.events = await this.loadEvents(eventsPath, module.importedFiles);
     }
 
     // Load panels
     const panelsPath = path.join(modulePath, 'panels');
     if (fs.existsSync(panelsPath)) {
-      module.panels = await this.loadPanels(panelsPath);
+      module.panels = await this.loadPanels(panelsPath, module.importedFiles);
     }
 
     // Load exports
@@ -291,6 +326,7 @@ export class ModuleLoader {
           );
 
           const imported = await import(toImportPath(filePath));
+          module.importedFiles.push(filePath);
           const exportValue = namedExport ? imported[namedExport] : imported.default;
 
           module.exports.set(exportName, exportValue);
@@ -303,6 +339,24 @@ export class ModuleLoader {
       }
     }
 
+    // Load lifecycle hooks (from hooks.ts or hooks.js)
+    const hooksFileTs = path.join(modulePath, 'hooks.ts');
+    const hooksFileJs = path.join(modulePath, 'hooks.js');
+    const hooksFile = fs.existsSync(hooksFileTs) ? hooksFileTs : fs.existsSync(hooksFileJs) ? hooksFileJs : null;
+    if (hooksFile) {
+      try {
+        const imported = await import(toImportPath(hooksFile));
+        module.importedFiles.push(hooksFile);
+        module.hooks = {
+          onLoad: typeof imported.onLoad === 'function' ? imported.onLoad : undefined,
+          onReady: typeof imported.onReady === 'function' ? imported.onReady : undefined,
+          onUnload: typeof imported.onUnload === 'function' ? imported.onUnload : undefined,
+        };
+      } catch (error) {
+        console.error(`[ModuleLoader] Failed to load hooks from ${manifest.name}:`, error);
+      }
+    }
+
     return module;
   }
 
@@ -311,7 +365,7 @@ export class ModuleLoader {
    * @param commandsPath - Path to commands directory
    * @returns Array of command definitions
    */
-  private async loadCommands(commandsPath: string): Promise<any[]> {
+  private async loadCommands(commandsPath: string, importedFiles?: string[]): Promise<any[]> {
     const commands: any[] = [];
 
     const fileExtension = this.isProd ? '.js' : '.ts';
@@ -320,6 +374,7 @@ export class ModuleLoader {
     for (const file of files) {
       try {
         const imported = await import(toImportPath(file));
+        importedFiles?.push(file);
         const commandDef = imported.default || imported;
 
         // Only register if it has a 'name' property (command definition)
@@ -339,7 +394,7 @@ export class ModuleLoader {
    * @param eventsPath - Path to events directory
    * @returns Map of event names to handler arrays
    */
-  private async loadEvents(eventsPath: string): Promise<Map<string, Function[]>> {
+  private async loadEvents(eventsPath: string, importedFiles?: string[]): Promise<Map<string, Function[]>> {
     const events = new Map<string, Function[]>();
 
     const eventDirs = fs
@@ -357,6 +412,7 @@ export class ModuleLoader {
       for (const file of files) {
         try {
           const imported = await import(toImportPath(file));
+          importedFiles?.push(file);
 
           // Only register if it has a default export function (event handler)
           if (imported.default && typeof imported.default === 'function') {
@@ -380,7 +436,7 @@ export class ModuleLoader {
    * @param panelsPath - Path to panels directory
    * @returns Array of panel definitions
    */
-  private async loadPanels(panelsPath: string): Promise<any[]> {
+  private async loadPanels(panelsPath: string, importedFiles?: string[]): Promise<any[]> {
     const panels: any[] = [];
 
     const fileExtension = this.isProd ? '.js' : '.ts';
@@ -389,6 +445,7 @@ export class ModuleLoader {
     for (const file of files) {
       try {
         const imported = await import(toImportPath(file));
+        importedFiles?.push(file);
         const panelDef = imported.default || imported;
 
         // Only register if it has an 'id' property (panel definition)

@@ -136,6 +136,13 @@ export class PanelManager {
   }
 
   /**
+   * Unregister a panel by ID (used during module hot-reload).
+   */
+  public unregisterPanel(id: string): boolean {
+    return this.panels.delete(id);
+  }
+
+  /**
    * Get a panel by ID
    */
   public getPanel(id: string): PanelOptions | undefined {

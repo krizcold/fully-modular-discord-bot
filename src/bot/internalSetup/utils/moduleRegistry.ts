@@ -1,4 +1,8 @@
-import { LoadedModule, ModuleManifest, ModuleExport } from '../../types/moduleTypes';
+import { Client } from 'discord.js';
+import { LoadedModule, ModuleManifest, ModuleExport, ModuleContext } from '../../types/moduleTypes';
+import { getModuleEventManager } from './moduleEventManager';
+import { getModuleDataPath, toImportPath } from './pathHelpers';
+import { getPanelManager } from './panelManager';
 
 /**
  * ModuleRegistry - Central registry for all loaded modules
@@ -7,6 +11,14 @@ import { LoadedModule, ModuleManifest, ModuleExport } from '../../types/moduleTy
 export class ModuleRegistry {
   private modules: Map<string, LoadedModule> = new Map();
   private exports: Map<string, Map<string, any>> = new Map();
+  private client: Client | null = null;
+
+  /**
+   * Set the Discord client (needed for unload context).
+   */
+  setClient(client: Client): void {
+    this.client = client;
+  }
 
   /**
    * Register a module in the registry
@@ -22,12 +34,75 @@ export class ModuleRegistry {
   }
 
   /**
-   * Unregister a module from the registry
+   * Unregister a module from the registry (simple removal, no cleanup).
    * @param moduleName - Name of module to unregister
    */
   unregister(moduleName: string): void {
     this.modules.delete(moduleName);
     this.exports.delete(moduleName);
+  }
+
+  /**
+   * Full module unload: lifecycle hook, event listeners, panels, cache, registry.
+   * Returns true if module was found and unloaded.
+   */
+  async unloadModule(moduleName: string): Promise<boolean> {
+    const module = this.modules.get(moduleName);
+    if (!module) return false;
+
+    console.log(`[ModuleRegistry] Unloading module: ${moduleName}`);
+
+    // 1. Call onUnload lifecycle hook
+    if (module.hooks?.onUnload && this.client) {
+      try {
+        const context: ModuleContext = {
+          client: this.client,
+          manifest: module.manifest,
+          modulePath: module.path,
+          dataPath: getModuleDataPath(module.manifest.name)
+        };
+        await module.hooks.onUnload(context);
+      } catch (error) {
+        console.error(`[ModuleRegistry] onUnload hook failed for ${moduleName}:`, error);
+      }
+    }
+
+    // 2. Remove event listeners
+    const eventManager = getModuleEventManager();
+    const removedListeners = eventManager.removeModuleListeners(moduleName);
+
+    // 3. Remove panels
+    let removedPanels = 0;
+    try {
+      const panelManager = getPanelManager();
+      for (const panel of module.panels) {
+        if (panel?.id) {
+          panelManager.unregisterPanel(panel.id);
+          removedPanels++;
+        }
+      }
+    } catch {
+      // panelManager may not be initialized yet
+    }
+
+    // 4. Clear require/import cache for all files this module imported
+    for (const filePath of module.importedFiles) {
+      const importPath = toImportPath(filePath);
+      // Clear CommonJS require cache
+      try {
+        const resolved = require.resolve(importPath);
+        delete require.cache[resolved];
+      } catch {
+        // File may not be in require cache (ES module)
+      }
+    }
+
+    // 5. Remove from registry
+    this.modules.delete(moduleName);
+    this.exports.delete(moduleName);
+
+    console.log(`[ModuleRegistry] Unloaded ${moduleName}: ${removedListeners} listeners, ${removedPanels} panels removed`);
+    return true;
   }
 
   /**

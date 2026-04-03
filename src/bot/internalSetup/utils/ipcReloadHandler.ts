@@ -1,0 +1,80 @@
+/**
+ * IPC Reload Handler
+ *
+ * Handles module reload IPC messages from the Web-UI process.
+ * Runs in the bot process where the Discord client lives.
+ * Uses the same { type, requestId, data } → { requestId, data } pattern as ipcPanelHandler.
+ */
+
+import { Client } from 'discord.js';
+import { reloadModule, reloadModules } from './moduleReloader';
+import { getModuleRegistry } from './moduleRegistry';
+
+let clientRef: Client | null = null;
+
+/**
+ * Set up IPC message handlers for module hot-reload.
+ * Must be called after the Discord client is created.
+ */
+export function setupReloadIPCHandlers(client: Client): void {
+  if (!process.send) {
+    console.warn('[IPCReloadHandler] process.send not available — IPC handlers not registered');
+    return;
+  }
+
+  clientRef = client;
+  console.log('[IPCReloadHandler] Setting up IPC handlers for module hot-reload');
+
+  process.on('message', async (message: any) => {
+    if (!message || typeof message !== 'object') return;
+    if (!clientRef) return;
+
+    const { type, requestId, data } = message;
+    if (!type || !requestId) return;
+
+    // Only handle reload-related messages
+    if (!type.startsWith('module:reload') && type !== 'module:list-loaded') return;
+
+    try {
+      let response: any;
+
+      switch (type) {
+        case 'module:reload': {
+          const result = await reloadModule(clientRef, data.moduleName);
+          response = result;
+          break;
+        }
+
+        case 'module:reload-all': {
+          const result = await reloadModules(clientRef, data.moduleNames);
+          response = result;
+          break;
+        }
+
+        case 'module:list-loaded': {
+          const registry = getModuleRegistry();
+          const modules = registry.getAllModules().map(m => ({
+            name: m.manifest.name,
+            displayName: m.manifest.displayName,
+            version: m.manifest.version,
+            commands: m.commands.length,
+            events: m.events.size,
+            panels: m.panels.length
+          }));
+          response = { success: true, modules };
+          break;
+        }
+
+        default:
+          return; // Unknown type, let other handlers deal with it
+      }
+
+      process.send!({ requestId, data: response });
+    } catch (error: any) {
+      process.send!({
+        requestId,
+        data: { success: false, error: error.message || String(error) }
+      });
+    }
+  });
+}

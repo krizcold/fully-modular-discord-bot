@@ -189,6 +189,138 @@ export function createUpdateRouter(botManager: BotManager): Router {
     }
   });
 
+  // ============================================================================
+  // COMBINED UPDATE + HOT-RELOAD ENDPOINTS
+  // ============================================================================
+
+  /**
+   * POST /api/update/modules-and-reload
+   * Download module updates AND hot-reload them in one step.
+   * Returns both the download results and the reload results.
+   */
+  router.post('/modules-and-reload', async (req: Request, res: Response) => {
+    try {
+      // Step 1: Download module updates via AppStoreManager
+      const updateResult = await triggerAllModuleUpdates();
+
+      if (updateResult.totalUpdated === 0) {
+        res.json({
+          success: true,
+          download: updateResult,
+          reload: null,
+          message: 'No modules were updated — nothing to reload'
+        });
+        return;
+      }
+
+      // Step 2: Hot-reload the updated modules
+      const updatedNames = updateResult.updated.map(u => u.moduleName);
+      const reloadResult = await botManager.reloadModules(updatedNames);
+
+      res.json({
+        success: updateResult.success && (reloadResult?.success !== false),
+        download: updateResult,
+        reload: reloadResult,
+        message: reloadResult?.success
+          ? `Updated and reloaded ${updateResult.totalUpdated} module(s)`
+          : `Updated ${updateResult.totalUpdated} module(s), reload had issues`
+      });
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      res.status(500).json({ success: false, error: errorMessage });
+    }
+  });
+
+  /**
+   * POST /api/update/module-and-reload/:name
+   * Download a single module update AND hot-reload it.
+   */
+  router.post('/module-and-reload/:name', async (req: Request, res: Response) => {
+    try {
+      const { name } = req.params;
+
+      // Step 1: Download module update
+      const updateResult = await triggerModuleUpdate(name);
+
+      if (!updateResult.success) {
+        res.json({
+          success: false,
+          download: updateResult,
+          reload: null,
+          error: updateResult.error || 'Failed to download module update'
+        });
+        return;
+      }
+
+      // Step 2: Hot-reload the module
+      const reloadResult = await botManager.reloadModule(name);
+
+      res.json({
+        success: reloadResult?.success !== false,
+        download: updateResult,
+        reload: reloadResult,
+        message: reloadResult?.success
+          ? `Updated and reloaded ${name}`
+          : `Updated ${name} but reload failed: ${reloadResult?.error}`
+      });
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      res.status(500).json({ success: false, error: errorMessage });
+    }
+  });
+
+  // ============================================================================
+  // MODULE HOT-RELOAD ENDPOINTS (standalone — reload without downloading)
+  // ============================================================================
+
+  /**
+   * POST /api/update/reload/:name
+   * Hot-reload a single module (no restart needed)
+   */
+  router.post('/reload/:name', async (req: Request, res: Response) => {
+    try {
+      const result = await botManager.reloadModule(req.params.name);
+      res.json(result);
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      res.status(500).json({ success: false, error: errorMessage });
+    }
+  });
+
+  /**
+   * POST /api/update/reload
+   * Hot-reload multiple modules (no restart needed)
+   * Body: { moduleNames: string[] }
+   */
+  router.post('/reload', async (req: Request, res: Response) => {
+    try {
+      const { moduleNames } = req.body as { moduleNames?: string[] };
+      if (!moduleNames || !Array.isArray(moduleNames) || moduleNames.length === 0) {
+        res.status(400).json({ success: false, error: 'moduleNames array is required' });
+        return;
+      }
+      const result = await botManager.reloadModules(moduleNames);
+      res.json(result);
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      res.status(500).json({ success: false, error: errorMessage });
+    }
+  });
+
+  /**
+   * GET /api/update/loaded-modules
+   * Get list of currently loaded modules from bot process
+   */
+  router.get('/loaded-modules', async (req: Request, res: Response) => {
+    try {
+      const result = await botManager.getLoadedModules();
+      res.json(result);
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      res.status(500).json({ success: false, error: errorMessage });
+    }
+  });
+
   /**
    * GET /api/update/backups
    * List available backups
