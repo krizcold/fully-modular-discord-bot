@@ -211,7 +211,7 @@ function ModulesView({ modules, installed, pendingRestart, categories, categoryF
           {configLoaded && (
             <>
               <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }} title="When enabled, installed modules are updated from their repos on every container restart.">
-                <span style={{ color: '#888', fontSize: '0.78rem' }}>Auto Update</span>
+                <span style={{ color: '#888', fontSize: '0.78rem' }}>Update on Reboot</span>
                 <ToggleSwitch checked={autoUpdate} onChange={toggleAutoUpdate} />
               </div>
               <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }} title="When enabled, orphan commands/events are automatically removed on bot startup. Keep disabled if running multiple bot instances.">
