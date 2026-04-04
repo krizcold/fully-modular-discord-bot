@@ -12,7 +12,6 @@ import {
 } from 'discord.js';
 import { PanelOptions, PanelContext, PanelResponse } from '../../types/panelTypes';
 import {
-  checkForBotUpdates,
   requestSystemUpdate,
   getBotUpdateStatus,
   checkForAllBotUpdates,

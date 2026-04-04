@@ -1,5 +1,5 @@
 import { Client } from 'discord.js';
-import { LoadedModule, ModuleManifest, ModuleExport, ModuleContext } from '../../types/moduleTypes';
+import { LoadedModule, ModuleManifest, ModuleContext } from '../../types/moduleTypes';
 import { getModuleEventManager } from './moduleEventManager';
 import { getModuleDataPath, toImportPath } from './pathHelpers';
 import { getPanelManager } from './panelManager';

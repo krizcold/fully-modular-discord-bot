@@ -6,8 +6,7 @@ import {
   LoadedModule,
   ModuleValidationResult,
   ModuleDependencyGraph,
-  ModuleContext,
-  ModuleHooks
+  ModuleContext
 } from '../../types/moduleTypes';
 import { getModuleRegistry } from './moduleRegistry';
 import {
