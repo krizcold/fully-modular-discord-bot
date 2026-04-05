@@ -1,30 +1,36 @@
 #!/usr/bin/env node
 
-// Pre-compilation update script
-// This runs BEFORE TypeScript compilation to ensure we compile updated source code
+/**
+ * Pre-compilation update script
+ *
+ * Runs BEFORE TypeScript compilation (called from start.sh).
+ * Only executes when a system update is in progress (updateInProgress: true).
+ *
+ * Behavior:
+ * - Updates core system files (internalSetup, utils, types, webui, updater)
+ * - Copies missing files from the image source to smdb-source
+ * - NEVER touches modules/ or modulesDev/ (managed by AppStore + hot-reload)
+ * - Creates a backup before updating
+ */
 
 const fs = require('fs');
 const path = require('path');
-
-// Simple implementation of the update system logic
-// We can't use the TypeScript version because it hasn't been compiled yet
 
 const DATA_PATH = '/data';
 const SMDB_SOURCE_PATH = '/app/smdb-source';
 const ORIGINAL_SOURCE_PATH = '/app/src';
 
+// Directories that are managed by AppStore / users — never overwrite
+const PROTECTED_DIRS = ['bot/modules', 'bot/modulesDev'];
+
 function loadConfig() {
     const configPath = path.join(DATA_PATH, 'update-config.json');
-    const defaultConfig = {
-        updateMode: 'none',
-        updateInProgress: false
-    };
+    const defaultConfig = { updateInProgress: false };
 
     try {
         if (fs.existsSync(configPath)) {
             const configData = fs.readFileSync(configPath, 'utf8');
-            const parsedConfig = JSON.parse(configData);
-            return { ...defaultConfig, ...parsedConfig };
+            return { ...defaultConfig, ...JSON.parse(configData) };
         }
     } catch (error) {
         console.warn('[PreUpdate] Error loading config, using defaults:', error.message);
@@ -49,12 +55,9 @@ function copyDirectory(src, dest) {
     if (!fs.existsSync(src)) {
         throw new Error(`Source directory does not exist: ${src}`);
     }
-
-    // Ensure destination directory exists
     fs.mkdirSync(dest, { recursive: true });
 
     const entries = fs.readdirSync(src, { withFileTypes: true });
-
     for (const entry of entries) {
         const srcPath = path.join(src, entry.name);
         const destPath = path.join(dest, entry.name);
@@ -67,252 +70,160 @@ function copyDirectory(src, dest) {
     }
 }
 
-// Create a backup before updating
-function createBackup(updateMode) {
+/**
+ * Check if a relative path falls inside a protected directory.
+ */
+function isProtectedPath(relativePath) {
+    return PROTECTED_DIRS.some(dir => relativePath === dir || relativePath.startsWith(dir + '/'));
+}
+
+/**
+ * Create a backup of smdb-source before updating.
+ */
+function createBackup() {
     try {
         const timestamp = Date.now();
         const backupName = `backup-${timestamp}`;
         const backupPath = path.join('/data/backups', backupName);
 
         console.log(`[PreUpdate] Creating backup: ${backupName}`);
-
-        // Ensure backups directory exists
         fs.mkdirSync('/data/backups', { recursive: true });
-
-        // Create backup directory
         fs.mkdirSync(backupPath, { recursive: true });
 
-        // Copy smdb-source to backup
         const destDir = path.join(backupPath, 'smdb-source');
-        console.log('[PreUpdate] Backing up smdb-source...');
         copyDirectory(SMDB_SOURCE_PATH, destDir);
 
-        // Get version from package.json
         let version = 'unknown';
         try {
             const packageJson = JSON.parse(fs.readFileSync('/app/package.json', 'utf8'));
             version = packageJson.version || 'unknown';
-        } catch (e) {
-            // Ignore
-        }
+        } catch { /* ignore */ }
 
-        // Create metadata
-        const metadata = {
-            timestamp,
-            version,
-            description: `Pre-update backup (${updateMode} mode)`,
-            type: 'automatic',
-            updateMode,
-            size: 0
-        };
-
-        // Save metadata
         fs.writeFileSync(
             path.join(backupPath, 'metadata.json'),
-            JSON.stringify(metadata, null, 2)
+            JSON.stringify({ timestamp, version, description: 'Pre-update backup (system)', type: 'automatic', size: 0 }, null, 2)
         );
 
-        console.log(`[PreUpdate] Backup created successfully: ${backupName}`);
+        console.log(`[PreUpdate] Backup created: ${backupName}`);
         return backupPath;
     } catch (error) {
         console.error('[PreUpdate] Failed to create backup:', error.message);
-        // Continue without backup - don't block the update
         return null;
     }
 }
 
-function emptyDirectory(dirPath) {
-    if (!fs.existsSync(dirPath)) {
-        return;
-    }
+/**
+ * Replace core system directories from the image source.
+ * These are the framework files — NOT user modules.
+ */
+function updateCoreDirs() {
+    const coreDirs = [
+        'bot/internalSetup',
+        'bot/types',
+        'utils',
+        'webui',
+        'updater'
+    ];
 
-    const entries = fs.readdirSync(dirPath, { withFileTypes: true });
-    
-    for (const entry of entries) {
-        const fullPath = path.join(dirPath, entry.name);
-        console.log(`[PreUpdate] Removing: ${entry.name}`);
-        fs.rmSync(fullPath, { recursive: true, force: true });
+    for (const dir of coreDirs) {
+        const originalPath = path.join(ORIGINAL_SOURCE_PATH, dir);
+        const targetPath = path.join(SMDB_SOURCE_PATH, dir);
+
+        if (!fs.existsSync(originalPath)) continue;
+
+        if (fs.existsSync(targetPath)) {
+            console.log(`[PreUpdate] Replacing ${dir}/`);
+            fs.rmSync(targetPath, { recursive: true, force: true });
+        } else {
+            console.log(`[PreUpdate] Adding ${dir}/`);
+        }
+        copyDirectory(originalPath, targetPath);
     }
-    
-    console.log('[PreUpdate] Directory contents cleared successfully');
 }
 
-function copyMissingFiles(src, dest) {
+/**
+ * Copy files from image source that don't exist in smdb-source.
+ * Skips protected directories (modules/, modulesDev/).
+ */
+function copyMissingFiles(src, dest, relativePath = '') {
     if (!fs.existsSync(src)) return;
+    if (isProtectedPath(relativePath)) return;
 
-    // Ensure destination directory exists
     if (!fs.existsSync(dest)) {
         fs.mkdirSync(dest, { recursive: true });
     }
 
     const entries = fs.readdirSync(src, { withFileTypes: true });
-
     for (const entry of entries) {
         const srcPath = path.join(src, entry.name);
         const destPath = path.join(dest, entry.name);
+        const childRelative = relativePath ? `${relativePath}/${entry.name}` : entry.name;
 
         if (entry.isDirectory()) {
-            copyMissingFiles(srcPath, destPath);
+            if (!isProtectedPath(childRelative)) {
+                copyMissingFiles(srcPath, destPath, childRelative);
+            }
         } else if (!fs.existsSync(destPath)) {
-            console.log(`[PreUpdate] Copying missing file: ${entry.name}`);
+            console.log(`[PreUpdate] Adding missing file: ${childRelative}`);
             fs.copyFileSync(srcPath, destPath);
         }
     }
-}
-
-function updateCoreFiles(folders) {
-    for (const folder of folders) {
-        const originalPath = path.join(ORIGINAL_SOURCE_PATH, folder);
-        const targetPath = path.join(SMDB_SOURCE_PATH, folder);
-
-        if (fs.existsSync(originalPath)) {
-            if (fs.existsSync(targetPath)) {
-                console.log(`[PreUpdate] Removing existing ${folder} folder`);
-                fs.rmSync(targetPath, { recursive: true, force: true });
-            }
-            
-            console.log(`[PreUpdate] Copying new ${folder} folder`);
-            copyDirectory(originalPath, targetPath);
-        }
-    }
-}
-
-function handleFirstInstallation() {
-    console.log('[PreUpdate] Performing first installation...');
-
-    if (!fs.existsSync(SMDB_SOURCE_PATH)) {
-        console.log('[PreUpdate] Creating smdb-source from original source');
-        copyDirectory(ORIGINAL_SOURCE_PATH, SMDB_SOURCE_PATH);
-    } else {
-        console.log('[PreUpdate] smdb-source already exists, skipping first installation');
-    }
-}
-
-function handleBasicUpdate() {
-    console.log('[PreUpdate] Performing basic update...');
-
-    const internalSetupPath = path.join(SMDB_SOURCE_PATH, 'internalSetup');
-    
-    // Remove existing internalSetup folder
-    if (fs.existsSync(internalSetupPath)) {
-        console.log('[PreUpdate] Removing existing internalSetup folder');
-        fs.rmSync(internalSetupPath, { recursive: true, force: true });
-    }
-
-    // Copy new internalSetup folder
-    const originalInternalSetup = path.join(ORIGINAL_SOURCE_PATH, 'internalSetup');
-    if (fs.existsSync(originalInternalSetup)) {
-        console.log('[PreUpdate] Copying new internalSetup folder');
-        copyDirectory(originalInternalSetup, internalSetupPath);
-    }
-
-    // Also update utils and types if they exist
-    updateCoreFiles(['utils', 'types']);
-}
-
-function handleRelativeUpdate() {
-    console.log('[PreUpdate] Performing relative update...');
-
-    // First, remove and replace internalSetup folder (like basic update)
-    const internalSetupPath = path.join(SMDB_SOURCE_PATH, 'internalSetup');
-    
-    if (fs.existsSync(internalSetupPath)) {
-        console.log('[PreUpdate] Removing existing internalSetup folder');
-        fs.rmSync(internalSetupPath, { recursive: true, force: true });
-    }
-
-    const originalInternalSetup = path.join(ORIGINAL_SOURCE_PATH, 'internalSetup');
-    if (fs.existsSync(originalInternalSetup)) {
-        console.log('[PreUpdate] Copying new internalSetup folder');
-        copyDirectory(originalInternalSetup, internalSetupPath);
-    }
-
-    // Also update utils and types if they exist
-    updateCoreFiles(['utils', 'types']);
-
-    // Then copy only missing files from original to smdb-source
-    copyMissingFiles(ORIGINAL_SOURCE_PATH, SMDB_SOURCE_PATH);
-}
-
-function handleFullUpdate() {
-    console.log('[PreUpdate] Performing full update...');
-
-    // Empty the smdb-source folder contents (preserve the mount point directory)
-    if (fs.existsSync(SMDB_SOURCE_PATH)) {
-        console.log('[PreUpdate] Emptying existing smdb-source folder contents');
-        emptyDirectory(SMDB_SOURCE_PATH);
-    }
-
-    // Copy entire original source
-    console.log('[PreUpdate] Copying entire source folder');
-    copyDirectory(ORIGINAL_SOURCE_PATH, SMDB_SOURCE_PATH);
 }
 
 // Main execution
 async function main() {
     const config = loadConfig();
 
-    console.log(`[PreUpdate] Checking update mode: ${config.updateMode}`);
-
     if (!config.updateInProgress) {
-        console.log('[PreUpdate] No update in progress, skipping pre-update');
+        console.log('[PreUpdate] No update in progress, skipping');
         return;
     }
 
-    // Check write permissions before attempting update
+    console.log('[PreUpdate] System update in progress — applying changes');
+
+    // Check write permissions
     const testFile = path.join(SMDB_SOURCE_PATH, '.write-test');
     try {
         fs.writeFileSync(testFile, 'test');
         fs.unlinkSync(testFile);
     } catch (error) {
         if (error.code === 'EACCES' || error.code === 'EPERM') {
-            console.error('[PreUpdate] WARNING: Cannot write to /app/smdb-source - skipping update');
-            console.error('[PreUpdate] The bind mount may have incorrect permissions');
-            // Don't exit with error - allow bot to continue with existing code
+            console.error('[PreUpdate] Cannot write to /app/smdb-source — skipping update');
             return;
         }
         throw error;
     }
 
-    console.log(`[PreUpdate] Update in progress, handling mode: ${config.updateMode}`);
-
-    // Create backup before update (except for first installation)
-    if (config.updateMode !== 'first') {
-        const backupPath = createBackup(config.updateMode);
-        if (backupPath) {
-            console.log(`[PreUpdate] Backup saved to: ${backupPath}`);
-        }
+    // Backup before updating
+    const backupPath = createBackup();
+    if (backupPath) {
+        console.log(`[PreUpdate] Backup saved to: ${backupPath}`);
     }
 
     try {
-        switch (config.updateMode) {
-            case 'first':
-                handleFirstInstallation();
-                break;
-            case 'basic':
-                handleBasicUpdate();
-                break;
-            case 'relative':
-                handleRelativeUpdate();
-                break;
-            case 'full':
-                handleFullUpdate();
-                break;
-            default:
-                console.warn(`[PreUpdate] Unknown update mode: ${config.updateMode}`);
-                return;
+        // 1. Replace core system directories
+        updateCoreDirs();
+
+        // 2. Copy any new files that don't exist in smdb-source (skip modules)
+        copyMissingFiles(ORIGINAL_SOURCE_PATH, SMDB_SOURCE_PATH);
+
+        // 3. Always copy root-level files (index.ts, package.json, etc.)
+        const rootFiles = fs.readdirSync(ORIGINAL_SOURCE_PATH, { withFileTypes: true })
+            .filter(e => e.isFile());
+        for (const file of rootFiles) {
+            const srcPath = path.join(ORIGINAL_SOURCE_PATH, file.name);
+            const destPath = path.join(SMDB_SOURCE_PATH, file.name);
+            fs.copyFileSync(srcPath, destPath);
         }
 
         // Mark update as complete
-        config.updateMode = 'none';
         config.updateInProgress = false;
         config.lastUpdateTime = Date.now();
         saveConfig(config);
-        
-        console.log('[PreUpdate] Update process completed successfully');
 
+        console.log('[PreUpdate] System update completed successfully');
     } catch (error) {
-        console.error('[PreUpdate] Error during update process:', error.message);
+        console.error('[PreUpdate] Error during update:', error.message);
         process.exit(1);
     }
 }

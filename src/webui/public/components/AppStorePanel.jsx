@@ -11,13 +11,6 @@ function AppStorePanel({ onModuleInstalled }) {
   const [selectedModule, setSelectedModule] = useState(null);
   const [loading, setLoading] = useState(true);
   const [categoryFilter, setCategoryFilter] = useState('all');
-  const [pendingRestart, setPendingRestart] = useState(new Set());
-  // Derive pending set from server-side installed data (persisted across refreshes)
-  const serverPending = new Set(
-    Object.values(installed).filter(m => m && m.pendingRestart).map(m => m.name)
-  );
-  // Merge: server-side pending + any locally added during this session
-  const effectivePending = new Set([...serverPending, ...pendingRestart]);
 
   useEffect(() => {
     loadData();
@@ -116,9 +109,8 @@ function AppStorePanel({ onModuleInstalled }) {
         <ModuleDetailView
           module={selectedModule}
           installed={installed[selectedModule.name]}
-          pending={effectivePending.has(selectedModule.name)}
           onBack={() => { setView('modules'); setSelectedModule(null); }}
-          onInstall={() => { setPendingRestart(prev => new Set([...prev, selectedModule.name])); if (onModuleInstalled) onModuleInstalled(); loadData(); }}
+          onInstall={() => { if (onModuleInstalled) onModuleInstalled(); loadData(); }}
           onUninstall={loadData}
           onSaveCredentials={loadData}
           showSuccess={showSuccess}
@@ -131,7 +123,6 @@ function AppStorePanel({ onModuleInstalled }) {
         <ModulesView
           modules={filteredModules}
           installed={installed}
-          pendingRestart={effectivePending}
           categories={categories}
           categoryFilter={categoryFilter}
           onCategoryChange={setCategoryFilter}
@@ -171,15 +162,15 @@ function AppStorePanel({ onModuleInstalled }) {
 }
 
 // Modules View Component
-function ModulesView({ modules, installed, pendingRestart, categories, categoryFilter, onCategoryChange, onSelectModule, onModuleChanged, repositories }) {
+function ModulesView({ modules, installed, categories, categoryFilter, onCategoryChange, onSelectModule, onModuleChanged, repositories }) {
   const installedCount = Object.keys(installed).length;
   const [autoCleanup, setAutoCleanup] = useState(false);
-  const [autoUpdate, setAutoUpdate] = useState(true);
+  const [autoUpdate, setAutoUpdate] = useState(false);
   const [configLoaded, setConfigLoaded] = useState(false);
 
   useEffect(() => {
     api.get('/appstore/config')
-      .then(res => { if (res.success) { setAutoCleanup(!!res.autoCleanup); setAutoUpdate(res.autoUpdate !== false); } })
+      .then(res => { if (res.success) { setAutoCleanup(!!res.autoCleanup); setAutoUpdate(res.autoUpdate === true); } })
       .catch(() => {})
       .finally(() => setConfigLoaded(true));
   }, []);
@@ -210,8 +201,8 @@ function ModulesView({ modules, installed, pendingRestart, categories, categoryF
           {/* Config Toggles */}
           {configLoaded && (
             <>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }} title="When enabled, installed modules are updated from their repos on every container restart.">
-                <span style={{ color: '#888', fontSize: '0.78rem' }}>Update on Reboot</span>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }} title="When enabled, modules are periodically checked for updates and hot-reloaded automatically.">
+                <span style={{ color: '#888', fontSize: '0.78rem' }}>Auto-Update Modules</span>
                 <ToggleSwitch checked={autoUpdate} onChange={toggleAutoUpdate} />
               </div>
               <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }} title="When enabled, orphan commands/events are automatically removed on bot startup. Keep disabled if running multiple bot instances.">
@@ -270,7 +261,6 @@ function ModulesView({ modules, installed, pendingRestart, categories, categoryF
               key={module.name}
               module={module}
               installed={!!installed[module.name]}
-              pending={pendingRestart?.has(module.name)}
               onClick={() => onSelectModule(module)}
               onInstall={onModuleChanged}
               onUninstall={onModuleChanged}
@@ -446,9 +436,9 @@ function CommandsView({ showSuccess, setError }) {
   );
 }
 
-function ModuleCard({ module, installed, pending, onClick, onInstall, onUninstall }) {
+function ModuleCard({ module, installed, onClick, onInstall, onUninstall }) {
   const [busy, setBusy] = useState(false);
-  const borderColor = pending ? '#5865F2' : installed ? '#3ba55d' : '#444';
+  const borderColor = installed ? '#3ba55d' : '#444';
 
   async function handleInstall(e) {
     e.stopPropagation();
@@ -482,8 +472,8 @@ function ModuleCard({ module, installed, pending, onClick, onInstall, onUninstal
     <div
       onClick={onClick}
       style={{
-        background: pending ? '#1a1a2e' : '#2c2f33',
-        border: `${installed || pending ? '2px' : '1px'} solid ${borderColor}`,
+        background: '#2c2f33',
+        border: `${installed ? '2px' : '1px'} solid ${borderColor}`,
         borderRadius: '10px',
         padding: '15px',
         cursor: 'pointer',
@@ -518,15 +508,7 @@ function ModuleCard({ module, installed, pending, onClick, onInstall, onUninstal
               fontWeight: 'bold'
             }}>PREMIUM</span>
           )}
-          {pending ? (
-            <span style={{
-              background: '#5865F2',
-              color: '#fff',
-              padding: '3px 8px',
-              borderRadius: '4px',
-              fontSize: '0.7rem'
-            }}>PENDING RESTART</span>
-          ) : installed ? (
+          {installed ? (
             <>
               <span style={{
                 background: '#3ba55d',
@@ -582,7 +564,7 @@ function ModuleCard({ module, installed, pending, onClick, onInstall, onUninstal
 }
 
 // Module Detail View Component
-function ModuleDetailView({ module, installed, pending, onBack, onInstall, onUninstall, onSaveCredentials, showSuccess, setError }) {
+function ModuleDetailView({ module, installed, onBack, onInstall, onUninstall, onSaveCredentials, showSuccess, setError }) {
   const [installing, setInstalling] = useState(false);
   const [showCredentialsForm, setShowCredentialsForm] = useState(false);
   const [credentials, setCredentials] = useState({});
@@ -605,7 +587,7 @@ function ModuleDetailView({ module, installed, pending, onBack, onInstall, onUni
       setError(null);
       const res = await api.post(`/appstore/modules/${module.name}/install`, { repoId: module.repoId });
       if (res.success) {
-        showSuccess(`${module.displayName || module.name} installed! Restart the container to activate.`);
+        showSuccess(`${module.displayName || module.name} installed!`);
         onInstall();
       }
     } catch (err) {
@@ -750,24 +732,9 @@ function ModuleDetailView({ module, installed, pending, onBack, onInstall, onUni
           </div>
         )}
 
-        {/* Pending Restart Banner */}
-        {pending && (
-          <div style={{
-            background: '#1a1a2e',
-            border: '1px solid #5865F2',
-            borderRadius: '8px',
-            padding: '12px 16px',
-            marginBottom: '20px',
-            color: '#8b9eff',
-            fontSize: '0.9rem'
-          }}>
-            Installed — restart the container to activate this module.
-          </div>
-        )}
-
         {/* Action Buttons */}
         <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
-          {!installed && !pending ? (
+          {!installed ? (
             <button
               className="button primary"
               onClick={handleInstall}

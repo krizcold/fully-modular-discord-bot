@@ -86,8 +86,8 @@ export interface InstalledModule {
   /** Installation timestamp */
   installedAt: string;
 
-  /** Module was installed but bot has not restarted yet */
-  pendingRestart?: boolean;
+  /** Repo HEAD commit hash at time of install/update */
+  commitHash?: string;
 }
 
 /** Installed modules tracking file */
@@ -100,6 +100,8 @@ export interface ModuleUpdateCheck {
   moduleName: string;
   installedVersion: string;
   availableVersion: string;
+  installedCommit?: string;
+  availableCommit?: string;
   hasUpdate: boolean;
   repoId: string;
   repoName: string;
@@ -286,19 +288,6 @@ export class AppStoreManager {
       if (fs.existsSync(INSTALLED_CONFIG_PATH)) {
         const content = fs.readFileSync(INSTALLED_CONFIG_PATH, 'utf-8');
         this.installedConfig = JSON.parse(content);
-
-        // Clear pendingRestart flags — bot has restarted, modules are now active
-        let cleared = false;
-        for (const mod of Object.values(this.installedConfig.modules)) {
-          if (mod.pendingRestart) {
-            mod.pendingRestart = false;
-            cleared = true;
-          }
-        }
-        if (cleared) {
-          this.saveInstalled();
-          console.log('[AppStoreManager] Cleared pending restart flags (bot restarted)');
-        }
       } else {
         this.saveInstalled();
       }
@@ -607,6 +596,20 @@ export class AppStoreManager {
   }
 
   /**
+   * Read the HEAD commit hash from a cached repo directory.
+   */
+  private getRepoCacheCommit(repoId: string): string | null {
+    const cacheDir = path.join(CACHE_DIR, repoId);
+    try {
+      if (!fs.existsSync(path.join(cacheDir, '.git'))) return null;
+      const hash = execSync('git rev-parse HEAD', { cwd: cacheDir, stdio: 'pipe' }).toString().trim();
+      return hash || null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
    * Scan a repository for modules
    */
   private scanForModules(repoDir: string, repo: AppStoreRepository): StoreModuleInfo[] {
@@ -784,7 +787,7 @@ export class AppStoreManager {
         version: moduleInfo.manifest.version,
         installedFrom: repoId,
         installedAt: new Date().toISOString(),
-        pendingRestart: true
+        commitHash: this.getRepoCacheCommit(repoId) || undefined
       };
 
       this.saveInstalled();
@@ -964,12 +967,16 @@ export class AppStoreManager {
         }
         this.copyDirectory(moduleInfo.repoPath, sourceDir);
 
-        // Update version tracking
+        // Update version + commit tracking
+        const newCommit = this.getRepoCacheCommit(mod.installedFrom);
         if (mod.version !== moduleInfo.manifest.version) {
           this.installedConfig.modules[mod.name].version = moduleInfo.manifest.version;
           console.log(`[AppStoreManager] Updated ${mod.name}: ${mod.version} -> ${moduleInfo.manifest.version}`);
         } else {
           console.log(`[AppStoreManager] Re-synced ${mod.name} (v${mod.version})`);
+        }
+        if (newCommit) {
+          this.installedConfig.modules[mod.name].commitHash = newCommit;
         }
         updated.push(mod.name);
       } catch (err) {
@@ -1114,12 +1121,17 @@ export class AppStoreManager {
         return null;
       }
 
-      const hasUpdate = this.compareVersions(installed.version, moduleInfo.manifest.version) < 0;
+      const currentRepoCommit = this.getRepoCacheCommit(repo.id);
+      const versionChanged = this.compareVersions(installed.version, moduleInfo.manifest.version) < 0;
+      const commitChanged = !!(currentRepoCommit && installed.commitHash && currentRepoCommit !== installed.commitHash);
+      const hasUpdate = commitChanged || versionChanged;
 
       return {
         moduleName,
         installedVersion: installed.version,
         availableVersion: moduleInfo.manifest.version,
+        installedCommit: installed.commitHash ? installed.commitHash.substring(0, 7) : undefined,
+        availableCommit: currentRepoCommit ? currentRepoCommit.substring(0, 7) : undefined,
         hasUpdate,
         repoId: repo.id,
         repoName: repo.name
@@ -1186,6 +1198,8 @@ export class AppStoreManager {
 
       // Check each module in this repo
       const repoModulesCache = this.moduleCache.get(repoId);
+      const currentRepoCommit = this.getRepoCacheCommit(repoId);
+
       for (const installed of modules) {
         result.checked++;
 
@@ -1198,11 +1212,18 @@ export class AppStoreManager {
           continue;
         }
 
-        const hasUpdate = this.compareVersions(installed.version, moduleInfo.manifest.version) < 0;
+        // Detect update: commit mismatch (primary) OR version bump (secondary)
+        const versionChanged = this.compareVersions(installed.version, moduleInfo.manifest.version) < 0;
+        const commitChanged = !!(currentRepoCommit && installed.commitHash && currentRepoCommit !== installed.commitHash);
+        const noCommitTracking = !installed.commitHash; // legacy install without commit tracking
+        const hasUpdate = commitChanged || versionChanged || (noCommitTracking && versionChanged);
+
         const updateCheck: ModuleUpdateCheck = {
           moduleName: installed.name,
           installedVersion: installed.version,
           availableVersion: moduleInfo.manifest.version,
+          installedCommit: installed.commitHash ? installed.commitHash.substring(0, 7) : undefined,
+          availableCommit: currentRepoCommit ? currentRepoCommit.substring(0, 7) : undefined,
           hasUpdate,
           repoId: repo.id,
           repoName: repo.name
@@ -1306,7 +1327,8 @@ export class AppStoreManager {
           name: moduleName,
           version: moduleInfo.manifest.version,
           installedFrom: repo.id,
-          installedAt: new Date().toISOString()
+          installedAt: new Date().toISOString(),
+          commitHash: this.getRepoCacheCommit(repo.id) || undefined
         };
         this.saveInstalled();
 

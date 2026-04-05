@@ -930,7 +930,7 @@ export function createAppStoreRoutes(): Router {
       res.json({
         success: true,
         autoCleanup: config.autoCleanup === true,  // default false
-        autoUpdate: config.autoUpdate !== false     // default true
+        autoUpdate: config.autoUpdate === true      // default false
       });
     } catch (error) {
       const msg = error instanceof Error ? error.message : 'Unknown error';
@@ -953,7 +953,7 @@ export function createAppStoreRoutes(): Router {
         config.autoUpdate = req.body.autoUpdate;
       }
       saveAppStoreConfig(config);
-      res.json({ success: true, autoCleanup: config.autoCleanup === true, autoUpdate: config.autoUpdate !== false });
+      res.json({ success: true, autoCleanup: config.autoCleanup === true, autoUpdate: config.autoUpdate === true });
     } catch (error) {
       const msg = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({ success: false, error: msg });

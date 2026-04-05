@@ -7,13 +7,13 @@ import { RegisteredButtonInfo, RegisteredDropdownInfo, RegisteredModalInfo, Regi
 import { getPanelManager } from './utils/panelManager';
 import { setupPanelIPCHandlers } from './utils/ipcPanelHandler';
 import { setupReloadIPCHandlers } from './utils/ipcReloadHandler';
+import { startModuleAutoUpdater } from './utils/moduleAutoUpdater';
 import { loadCredentials } from '../../utils/envLoader';
 import { ModuleLoader } from './utils/moduleLoader';
 import { getModuleRegistry } from './utils/moduleRegistry';
 import { getModuleEventManager } from './utils/moduleEventManager';
 import { LoadedModule } from '../types/moduleTypes';
 import { ensureConfigPopulated } from './utils/configManager';
-import { getAppStoreManager } from './utils/appStoreManager';
 
 // Load credentials from /data/.env (Web-UI managed) or environment variables
 const credentials = loadCredentials();
@@ -88,29 +88,8 @@ let loadedModules: LoadedModule[] = [];
 async function loadModules(client: Client): Promise<number[]> {
   console.log('[ModuleLoader] Loading modules...');
 
-  // Auto-update installed AppStore modules before loading (if enabled)
-  try {
-    const appStoreConfigPath = path.join(process.env.DATA_DIR || '/data', 'global', 'appstore', 'config.json');
-    let autoUpdate = true; // default enabled
-    if (fs.existsSync(appStoreConfigPath)) {
-      const cfg = JSON.parse(fs.readFileSync(appStoreConfigPath, 'utf-8'));
-      if (cfg.autoUpdate === false) autoUpdate = false;
-    }
-    if (autoUpdate) {
-      const manager = getAppStoreManager();
-      const result = await manager.autoUpdateModules();
-      if (result.updated.length > 0) {
-        console.log(`[AppStore] Auto-updated ${result.updated.length} module(s): ${result.updated.join(', ')}`);
-      }
-      if (result.errors.length > 0) {
-        console.warn(`[AppStore] Failed to update: ${result.errors.join(', ')}`);
-      }
-    } else {
-      console.log('[AppStore] Auto-update disabled — skipping module refresh');
-    }
-  } catch (err) {
-    console.error('[AppStore] Auto-update failed (continuing with existing modules):', err);
-  }
+  // Module auto-update is now handled by the periodic scheduler (moduleAutoUpdater)
+  // started after the client is ready. No one-shot sync on boot.
 
   try {
     const moduleLoader = new ModuleLoader(client);
@@ -475,6 +454,9 @@ async function main() {
     } catch (error) {
       console.error('[Bot] Error recovering persistent panels:', error);
     }
+
+    // Start module auto-update scheduler (checks every 30min if enabled)
+    startModuleAutoUpdater(client);
   });
 
   // Set up IPC message handlers for Web-UI panel integration
