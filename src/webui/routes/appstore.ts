@@ -14,8 +14,11 @@ import {
   StoreModuleInfo
 } from '../../bot/internalSetup/utils/appStoreManager';
 import { getPremiumManager } from '../../bot/internalSetup/utils/premiumManager';
+import { BotManager } from '../botManager';
+import { ComponentToggleDebouncer } from '../utils/componentToggleDebouncer';
 
-export function createAppStoreRoutes(): Router {
+export function createAppStoreRoutes(botManager: BotManager): Router {
+  const toggleDebouncer = new ComponentToggleDebouncer(1500);
   const router = Router();
 
   // ============================================================================
@@ -349,10 +352,21 @@ export function createAppStoreRoutes(): Router {
 
       await manager.installModule(name, repoId);
 
+      // Hot-load the module into the running bot (no restart needed)
+      let loaded = false;
+      try {
+        const loadResult = await botManager.loadModule(name);
+        loaded = loadResult?.success === true;
+      } catch {
+        // Bot may not be running — module will load on next start
+      }
+
       res.json({
         success: true,
-        message: `Module ${name} installed successfully. Restart the container to load it.`,
-        requiresRestart: true
+        message: loaded
+          ? `Module ${name} installed and loaded.`
+          : `Module ${name} installed. It will load on next bot start.`,
+        loaded
       });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
@@ -374,10 +388,35 @@ export function createAppStoreRoutes(): Router {
 
       await manager.uninstallModule(name);
 
+      // Unload the module from the running bot (no restart needed)
+      let unloaded = false;
+      try {
+        const unloadResult = await botManager.unloadModule(name);
+        unloaded = unloadResult?.success === true;
+      } catch {
+        // Bot may not be running — module is already removed from disk
+      }
+
+      // Clean up component toggle config for this module (fresh slate on reinstall)
+      try {
+        const config = loadComponentConfig();
+        const prefix = `${name}:`;
+        let cleaned = false;
+        for (const key of Object.keys(config)) {
+          if (key.startsWith(prefix)) {
+            delete config[key];
+            cleaned = true;
+          }
+        }
+        if (cleaned) saveComponentConfig(config);
+      } catch { /* non-fatal */ }
+
       res.json({
         success: true,
-        message: `Module ${name} uninstalled successfully. Restart the bot to apply changes.`,
-        requiresRestart: true
+        message: unloaded
+          ? `Module ${name} uninstalled and unloaded.`
+          : `Module ${name} uninstalled. Changes apply on next bot start.`,
+        unloaded
       });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
@@ -911,6 +950,18 @@ export function createAppStoreRoutes(): Router {
       }
 
       saveComponentConfig(config);
+
+      // Fire debounced runtime toggle (async, doesn't block response)
+      if (botManager.isRunning()) {
+        toggleDebouncer.debounce(key, enabled, async (finalEnabled) => {
+          try {
+            await botManager.toggleComponent(moduleName, type as 'command' | 'event' | 'panel', name, finalEnabled);
+          } catch (err) {
+            console.error(`[AppStore] Runtime toggle failed for ${key}:`, err);
+          }
+        });
+      }
+
       res.json({ success: true, key, enabled });
     } catch (error) {
       const msg = error instanceof Error ? error.message : 'Unknown error';

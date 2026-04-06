@@ -7,7 +7,7 @@
  */
 
 import { Client } from 'discord.js';
-import { reloadModule, reloadModules } from './moduleReloader';
+import { reloadModule, reloadModules, unloadModuleFromMemory } from './moduleReloader';
 import { getModuleRegistry } from './moduleRegistry';
 
 let clientRef: Client | null = null;
@@ -32,8 +32,8 @@ export function setupReloadIPCHandlers(client: Client): void {
     const { type, requestId, data } = message;
     if (!type || !requestId) return;
 
-    // Only handle reload-related messages
-    if (!type.startsWith('module:reload') && type !== 'module:list-loaded') return;
+    // Only handle module-related messages
+    if (!type.startsWith('module:')) return;
 
     try {
       let response: any;
@@ -48,6 +48,20 @@ export function setupReloadIPCHandlers(client: Client): void {
         case 'module:reload-all': {
           const result = await reloadModules(clientRef, data.moduleNames);
           response = result;
+          break;
+        }
+
+        case 'module:load': {
+          // Load a newly installed module into memory (fresh install, not reload)
+          const loadResult = await reloadModule(clientRef, data.moduleName);
+          response = loadResult;
+          break;
+        }
+
+        case 'module:unload': {
+          // Unload a module from memory (uninstall)
+          const unloadResult = await unloadModuleFromMemory(clientRef, data.moduleName);
+          response = unloadResult;
           break;
         }
 

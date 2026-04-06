@@ -22,6 +22,7 @@ import {
   toImportPath,
   getModuleDataPath
 } from './pathHelpers';
+import { applyComponentToggleState } from './ipcToggleHandler';
 
 export interface ReloadResult {
   success: boolean;
@@ -158,6 +159,9 @@ async function registerReloadedModule(client: Client, module: LoadedModule): Pro
     }
   }
 
+  // Re-apply component toggle state (keep disabled components off after reload)
+  await applyComponentToggleState(client, module);
+
   console.log(`[Reloader] Reloaded: ${module.manifest.displayName} v${module.manifest.version} (${module.commands.length} commands, ${module.events.size} event types, ${module.panels.length} panels)`);
 }
 
@@ -197,21 +201,19 @@ async function reRegisterSlashCommands(client: Client): Promise<void> {
 
 /**
  * Reload a single module by name.
- * The module must already be loaded (registered in the registry).
+ * Works for both existing modules (unload → reload) and fresh installs (just load).
  */
 export async function reloadModule(client: Client, moduleName: string): Promise<ReloadResult> {
   const start = Date.now();
   const registry = getModuleRegistry();
   const existingModule = registry.getModule(moduleName);
 
-  if (!existingModule) {
-    return { success: false, moduleName, error: `Module "${moduleName}" is not loaded` };
-  }
-
   try {
-    // 1. Unload the module (lifecycle hook, events, panels, cache)
-    clearModuleCache(existingModule);
-    await registry.unloadModule(moduleName);
+    // 1. Unload if already loaded
+    if (existingModule) {
+      clearModuleCache(existingModule);
+      await registry.unloadModule(moduleName);
+    }
 
     // 2. Recompile (incremental — only changed files)
     const compile = recompileTypeScript();
@@ -219,7 +221,7 @@ export async function reloadModule(client: Client, moduleName: string): Promise<
       return { success: false, moduleName, error: `Compilation failed: ${compile.error}`, duration: Date.now() - start };
     }
 
-    // 3. Re-discover and re-load the module
+    // 3. Discover the module manifest
     const manifestPath = findModuleManifestPath(moduleName);
     if (!manifestPath) {
       return { success: false, moduleName, error: 'Module manifest not found after recompile', duration: Date.now() - start };
@@ -238,6 +240,35 @@ export async function reloadModule(client: Client, moduleName: string): Promise<
     // 6. Re-register slash commands with Discord
     await reRegisterSlashCommands(client);
 
+    const action = existingModule ? 'Reloaded' : 'Loaded';
+    console.log(`[Reloader] ${action}: ${moduleName} (${Date.now() - start}ms)`);
+    return { success: true, moduleName, duration: Date.now() - start };
+  } catch (error: any) {
+    return { success: false, moduleName, error: error.message || String(error), duration: Date.now() - start };
+  }
+}
+
+/**
+ * Unload a module from memory (for uninstall).
+ * Removes events, panels, commands, cache — module is fully gone from runtime.
+ */
+export async function unloadModuleFromMemory(client: Client, moduleName: string): Promise<ReloadResult> {
+  const start = Date.now();
+  const registry = getModuleRegistry();
+  const existingModule = registry.getModule(moduleName);
+
+  if (!existingModule) {
+    return { success: true, moduleName, duration: 0 }; // Not loaded, nothing to do
+  }
+
+  try {
+    clearModuleCache(existingModule);
+    await registry.unloadModule(moduleName);
+
+    // Re-register slash commands to remove the unloaded module's commands from Discord
+    await reRegisterSlashCommands(client);
+
+    console.log(`[Reloader] Unloaded: ${moduleName} (${Date.now() - start}ms)`);
     return { success: true, moduleName, duration: Date.now() - start };
   } catch (error: any) {
     return { success: false, moduleName, error: error.message || String(error), duration: Date.now() - start };

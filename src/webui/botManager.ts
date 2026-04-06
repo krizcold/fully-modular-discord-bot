@@ -634,4 +634,50 @@ export class BotManager {
       return { success: false, modules: [], error: error instanceof Error ? error.message : 'Unknown error' };
     }
   }
+
+  /**
+   * Load a newly installed module into memory (hot-load via IPC)
+   */
+  async loadModule(moduleName: string): Promise<any> {
+    try {
+      return await this.sendIPCMessage('module:load', { moduleName });
+    } catch (error) {
+      console.error('[BotManager] Error loading module:', error);
+      return { success: false, moduleName, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  /**
+   * Unload a module from memory (for uninstall, via IPC)
+   */
+  async unloadModule(moduleName: string): Promise<any> {
+    try {
+      return await this.sendIPCMessage('module:unload', { moduleName });
+    } catch (error) {
+      console.error('[BotManager] Error unloading module:', error);
+      return { success: false, moduleName, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  /**
+   * Toggle a component on/off at runtime via IPC to bot process.
+   */
+  async toggleComponent(
+    moduleName: string,
+    componentType: 'command' | 'event' | 'panel',
+    name: string,
+    enabled: boolean
+  ): Promise<any> {
+    try {
+      return await this.sendIPCMessage('component:toggle', {
+        module: moduleName,
+        componentType,
+        name,
+        enabled
+      });
+    } catch (error) {
+      console.error('[BotManager] Error toggling component:', error);
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
 }

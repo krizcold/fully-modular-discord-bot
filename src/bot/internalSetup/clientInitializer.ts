@@ -7,6 +7,7 @@ import { RegisteredButtonInfo, RegisteredDropdownInfo, RegisteredModalInfo, Regi
 import { getPanelManager } from './utils/panelManager';
 import { setupPanelIPCHandlers } from './utils/ipcPanelHandler';
 import { setupReloadIPCHandlers } from './utils/ipcReloadHandler';
+import { setupToggleIPCHandlers, applyAllDisabledStatesOnBoot } from './utils/ipcToggleHandler';
 import { startModuleAutoUpdater } from './utils/moduleAutoUpdater';
 import { loadCredentials } from '../../utils/envLoader';
 import { ModuleLoader } from './utils/moduleLoader';
@@ -429,6 +430,10 @@ async function main() {
     }
     console.log(`[Bot] Registered ${modulePanelCount} module panels`);
 
+    // Apply disabled component states from config (panels + events)
+    // Commands are handled by registerCommands on clientReady
+    applyAllDisabledStatesOnBoot();
+
     console.log('[Bot] Panel manager initialized successfully');
   } catch (error) {
     console.error('[Bot] Error during panel manager initialization:', error);
@@ -464,6 +469,9 @@ async function main() {
 
   // Set up IPC message handlers for module hot-reload
   setupReloadIPCHandlers(client);
+
+  // Set up IPC message handlers for component toggle
+  setupToggleIPCHandlers(client);
 
   client.login(process.env.DISCORD_TOKEN);
 }

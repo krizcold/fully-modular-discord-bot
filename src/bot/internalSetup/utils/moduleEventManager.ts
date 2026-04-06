@@ -81,6 +81,33 @@ class ModuleEventManager {
   }
 
   /**
+   * Remove listeners for a specific event within a module.
+   * Used by component toggle to disable individual events without unloading the module.
+   * Returns the number of listeners removed.
+   */
+  removeEventListeners(moduleName: string, eventName: string): number {
+    if (!this.client) return 0;
+
+    const tracked = this.listeners.get(moduleName);
+    if (!tracked || tracked.length === 0) return 0;
+
+    const toRemove = tracked.filter(t => t.eventName === eventName);
+    const toKeep = tracked.filter(t => t.eventName !== eventName);
+
+    for (const { wrappedHandler } of toRemove) {
+      this.client.removeListener(eventName, wrappedHandler);
+    }
+
+    if (toKeep.length > 0) {
+      this.listeners.set(moduleName, toKeep);
+    } else {
+      this.listeners.delete(moduleName);
+    }
+
+    return toRemove.length;
+  }
+
+  /**
    * Get the count of tracked listeners for a module.
    */
   getListenerCount(moduleName: string): number {

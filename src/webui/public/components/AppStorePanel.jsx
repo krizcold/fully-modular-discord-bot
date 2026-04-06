@@ -167,6 +167,9 @@ function ModulesView({ modules, installed, categories, categoryFilter, onCategor
   const [autoCleanup, setAutoCleanup] = useState(false);
   const [autoUpdate, setAutoUpdate] = useState(false);
   const [configLoaded, setConfigLoaded] = useState(false);
+  const [moduleUpdates, setModuleUpdates] = useState(null); // { moduleName: ModuleUpdateCheck }
+  const [checking, setChecking] = useState(false);
+  const [updating, setUpdating] = useState(false);
 
   useEffect(() => {
     api.get('/appstore/config')
@@ -187,6 +190,61 @@ function ModulesView({ modules, installed, categories, categoryFilter, onCategor
     try { await api.put('/appstore/config', { autoUpdate: newVal }); } catch { setAutoUpdate(!newVal); }
   }
 
+  async function checkModuleUpdates() {
+    setChecking(true);
+    try {
+      const res = await api.post('/update/check-all');
+      if (res.success && res.modules?.updates) {
+        const updateMap = {};
+        for (const u of res.modules.updates) {
+          if (u.hasUpdate) updateMap[u.moduleName] = u;
+        }
+        setModuleUpdates(updateMap);
+      }
+    } catch (err) {
+      console.error('Failed to check module updates:', err);
+    } finally {
+      setChecking(false);
+    }
+  }
+
+  async function updateAllModules() {
+    setUpdating(true);
+    try {
+      const res = await api.post('/update/modules-and-reload');
+      if (res.success) {
+        setModuleUpdates({});
+        onModuleChanged();
+      }
+    } catch (err) {
+      console.error('Failed to update modules:', err);
+    } finally {
+      setUpdating(false);
+    }
+  }
+
+  async function updateSingleModule(moduleName) {
+    setUpdating(true);
+    try {
+      const res = await api.post(`/update/module-and-reload/${moduleName}`);
+      if (res.success) {
+        setModuleUpdates(prev => {
+          if (!prev) return prev;
+          const next = { ...prev };
+          delete next[moduleName];
+          return next;
+        });
+        onModuleChanged();
+      }
+    } catch (err) {
+      console.error(`Failed to update ${moduleName}:`, err);
+    } finally {
+      setUpdating(false);
+    }
+  }
+
+  const updatesAvailable = moduleUpdates ? Object.keys(moduleUpdates).length : 0;
+
   return (
     <div>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px' }}>
@@ -194,6 +252,7 @@ function ModulesView({ modules, installed, categories, categoryFilter, onCategor
           <h2 style={{ margin: 0 }}>App Store</h2>
           <p style={{ color: '#999', margin: '5px 0 0 0' }}>
             {modules.length} modules available | {installedCount} installed
+            {updatesAvailable > 0 && <span style={{ color: '#e67e22', fontWeight: 600 }}> | {updatesAvailable} update{updatesAvailable !== 1 ? 's' : ''}</span>}
           </p>
         </div>
 
@@ -210,6 +269,29 @@ function ModulesView({ modules, installed, categories, categoryFilter, onCategor
                 <ToggleSwitch checked={autoCleanup} onChange={toggleCleanup} />
               </div>
             </>
+          )}
+
+          {/* Update buttons */}
+          <button
+            onClick={checkModuleUpdates}
+            disabled={checking || updating}
+            style={{
+              background: '#5865F2', color: '#fff', border: 'none', padding: '5px 12px',
+              borderRadius: '6px', fontSize: '0.78rem', cursor: checking ? 'wait' : 'pointer',
+              opacity: checking || updating ? 0.6 : 1
+            }}
+          >{checking ? 'Checking...' : 'Check Updates'}</button>
+
+          {updatesAvailable > 0 && (
+            <button
+              onClick={updateAllModules}
+              disabled={updating}
+              style={{
+                background: '#2ecc71', color: '#fff', border: 'none', padding: '5px 12px',
+                borderRadius: '6px', fontSize: '0.78rem', cursor: updating ? 'wait' : 'pointer',
+                opacity: updating ? 0.6 : 1
+              }}
+            >{updating ? 'Updating...' : `Update All (${updatesAvailable})`}</button>
           )}
 
           {/* Category Filter */}
@@ -261,9 +343,12 @@ function ModulesView({ modules, installed, categories, categoryFilter, onCategor
               key={module.name}
               module={module}
               installed={!!installed[module.name]}
+              updateInfo={moduleUpdates?.[module.name] || null}
               onClick={() => onSelectModule(module)}
               onInstall={onModuleChanged}
               onUninstall={onModuleChanged}
+              onUpdate={() => updateSingleModule(module.name)}
+              updating={updating}
             />
           ))}
         </div>
@@ -436,9 +521,10 @@ function CommandsView({ showSuccess, setError }) {
   );
 }
 
-function ModuleCard({ module, installed, onClick, onInstall, onUninstall }) {
+function ModuleCard({ module, installed, updateInfo, onClick, onInstall, onUninstall, onUpdate, updating }) {
   const [busy, setBusy] = useState(false);
-  const borderColor = installed ? '#3ba55d' : '#444';
+  const hasUpdate = !!updateInfo;
+  const borderColor = hasUpdate ? '#e67e22' : installed ? '#3ba55d' : '#444';
 
   async function handleInstall(e) {
     e.stopPropagation();
@@ -473,7 +559,7 @@ function ModuleCard({ module, installed, onClick, onInstall, onUninstall }) {
       onClick={onClick}
       style={{
         background: '#2c2f33',
-        border: `${installed ? '2px' : '1px'} solid ${borderColor}`,
+        border: `${installed || hasUpdate ? '2px' : '1px'} solid ${borderColor}`,
         borderRadius: '10px',
         padding: '15px',
         cursor: 'pointer',
@@ -510,13 +596,39 @@ function ModuleCard({ module, installed, onClick, onInstall, onUninstall }) {
           )}
           {installed ? (
             <>
-              <span style={{
-                background: '#3ba55d',
-                color: '#fff',
-                padding: '3px 8px',
-                borderRadius: '4px',
-                fontSize: '0.7rem'
-              }}>INSTALLED</span>
+              {hasUpdate ? (
+                <span style={{
+                  background: '#e67e22',
+                  color: '#fff',
+                  padding: '3px 8px',
+                  borderRadius: '4px',
+                  fontSize: '0.7rem'
+                }}>UPDATE</span>
+              ) : (
+                <span style={{
+                  background: '#3ba55d',
+                  color: '#fff',
+                  padding: '3px 8px',
+                  borderRadius: '4px',
+                  fontSize: '0.7rem'
+                }}>INSTALLED</span>
+              )}
+              {hasUpdate && (
+                <button
+                  onClick={(e) => { e.stopPropagation(); onUpdate && onUpdate(); }}
+                  disabled={busy || updating}
+                  style={{
+                    background: 'rgba(230, 126, 34, 0.15)',
+                    color: '#e67e22',
+                    border: '1px solid rgba(230, 126, 34, 0.3)',
+                    padding: '3px 8px',
+                    borderRadius: '4px',
+                    fontSize: '0.7rem',
+                    cursor: busy || updating ? 'not-allowed' : 'pointer',
+                    opacity: busy || updating ? 0.5 : 1
+                  }}
+                >{updating ? '...' : 'Update'}</button>
+              )}
               <button
                 onClick={handleUninstall}
                 disabled={busy}
@@ -554,6 +666,13 @@ function ModuleCard({ module, installed, onClick, onInstall, onUninstall }) {
       <p style={{ color: '#aaa', margin: '10px 0', fontSize: '0.9rem', lineHeight: '1.4' }}>
         {module.description || 'No description available'}
       </p>
+
+      {hasUpdate && (
+        <p style={{ color: '#e67e22', margin: '4px 0 0 0', fontSize: '0.75rem' }}>
+          {updateInfo.installedVersion} → {updateInfo.availableVersion}
+          {updateInfo.installedCommit && updateInfo.availableCommit ? ` (${updateInfo.installedCommit} → ${updateInfo.availableCommit})` : ''}
+        </p>
+      )}
 
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '10px' }}>
         <span style={{ color: '#666', fontSize: '0.8rem' }}>v{module.version || '1.0.0'}</span>

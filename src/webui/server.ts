@@ -223,7 +223,7 @@ export async function createServer(botManager: BotManager): Promise<Express> {
   app.use('/api/bot', requireAuth, createControlRoutes(botManager));
   app.use('/api/setup', requireAuth, createSetupRoutes());
   app.use('/api/config', requireAuth, createConfigRoutes());
-  app.use('/api/appstore', requireAuth, createAppStoreRoutes());
+  app.use('/api/appstore', requireAuth, createAppStoreRoutes(botManager));
   app.use('/api/panels', requireAuth, createPanelRoutes(botManager));
   app.use('/api/update', requireAuth, createUpdateRouter(botManager));
 
