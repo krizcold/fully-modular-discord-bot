@@ -680,4 +680,16 @@ export class BotManager {
       return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
     }
   }
+
+  /**
+   * Trigger slash command re-registration (includes orphan cleanup if enabled).
+   */
+  async reregisterCommands(): Promise<any> {
+    try {
+      return await this.sendIPCMessage('commands:reregister', {});
+    } catch (error) {
+      console.error('[BotManager] Error re-registering commands:', error);
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
 }

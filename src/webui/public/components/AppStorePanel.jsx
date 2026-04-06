@@ -264,7 +264,7 @@ function ModulesView({ modules, installed, categories, categoryFilter, onCategor
                 <span style={{ color: '#888', fontSize: '0.78rem' }}>Auto-Update Modules</span>
                 <ToggleSwitch checked={autoUpdate} onChange={toggleAutoUpdate} />
               </div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }} title="When enabled, orphan commands/events are automatically removed on bot startup. Keep disabled if running multiple bot instances.">
+              <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }} title="When enabled, orphan commands are automatically removed from Discord after module changes (install, uninstall, update, reload). Keep disabled if running multiple bot instances sharing the same application.">
                 <span style={{ color: '#888', fontSize: '0.78rem' }}>Auto Cleanup</span>
                 <ToggleSwitch checked={autoCleanup} onChange={toggleCleanup} />
               </div>

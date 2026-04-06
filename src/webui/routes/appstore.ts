@@ -1004,6 +1004,14 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
         config.autoUpdate = req.body.autoUpdate;
       }
       saveAppStoreConfig(config);
+
+      // If autoCleanup was just turned ON, trigger immediate orphan cleanup
+      if (req.body.autoCleanup === true && botManager.isRunning()) {
+        botManager.reregisterCommands().catch(err => {
+          console.error('[AppStore] Failed to trigger cleanup on toggle:', err);
+        });
+      }
+
       res.json({ success: true, autoCleanup: config.autoCleanup === true, autoUpdate: config.autoUpdate === true });
     } catch (error) {
       const msg = error instanceof Error ? error.message : 'Unknown error';

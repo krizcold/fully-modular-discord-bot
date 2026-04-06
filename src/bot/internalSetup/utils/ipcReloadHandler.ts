@@ -6,6 +6,7 @@
  * Uses the same { type, requestId, data } → { requestId, data } pattern as ipcPanelHandler.
  */
 
+import * as path from 'path';
 import { Client } from 'discord.js';
 import { reloadModule, reloadModules, unloadModuleFromMemory } from './moduleReloader';
 import { getModuleRegistry } from './moduleRegistry';
@@ -32,8 +33,8 @@ export function setupReloadIPCHandlers(client: Client): void {
     const { type, requestId, data } = message;
     if (!type || !requestId) return;
 
-    // Only handle module-related messages
-    if (!type.startsWith('module:')) return;
+    // Only handle module/commands-related messages
+    if (!type.startsWith('module:') && type !== 'commands:reregister') return;
 
     try {
       let response: any;
@@ -76,6 +77,26 @@ export function setupReloadIPCHandlers(client: Client): void {
             panels: m.panels.length
           }));
           response = { success: true, modules };
+          break;
+        }
+
+        case 'commands:reregister': {
+          // Re-run registerCommands (includes orphan cleanup if autoCleanup is enabled)
+          try {
+            const isProd = process.env.NODE_ENV !== 'development';
+            const registerPath = isProd
+              ? path.join(process.cwd(), 'dist', 'bot', 'internalSetup', 'events', 'clientReady', 'registerCommands.js')
+              : path.join(process.cwd(), 'src', 'bot', 'internalSetup', 'events', 'clientReady', 'registerCommands.ts');
+            const resolved = require.resolve(registerPath);
+            delete require.cache[resolved];
+            const registerFn = require(resolved).default || require(resolved);
+            if (typeof registerFn === 'function') {
+              await registerFn(clientRef);
+            }
+            response = { success: true };
+          } catch (err: any) {
+            response = { success: false, error: err.message || String(err) };
+          }
           break;
         }
 
