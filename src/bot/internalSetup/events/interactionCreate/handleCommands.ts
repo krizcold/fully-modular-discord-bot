@@ -4,11 +4,11 @@ import { getConfigProperty } from '../../utils/configManager';
 
 const testServer = process.env.GUILD_ID || ''; // Test server ID
 
-const localCommandsSets = getLocalCommands();
-
 export default async function handleCommands(client: Client, interaction: Interaction) {
   if (!interaction.isChatInputCommand() && !interaction.isContextMenuCommand()) return;
 
+  // Get commands fresh each time (supports hot-reload — new modules are visible immediately)
+  const localCommandsSets = getLocalCommands();
   let localCommands: any[] = [];
 
   // Flatten the local commands array

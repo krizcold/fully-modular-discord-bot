@@ -15,15 +15,10 @@ import { getModuleRegistry } from './moduleRegistry';
 import { getModuleEventManager } from './moduleEventManager';
 import { getPanelManager } from './panelManager';
 import getLocalCommands from './getLocalCommands';
+import { buildCommandPayload } from './commandUtils';
 import { LoadedModule } from '../../types/moduleTypes';
 
 let clientRef: Client | null = null;
-
-// Keys to strip from command definitions before sending to Discord API
-const INTERNAL_KEYS = [
-  'callback', 'requiredIntents', 'permissionsRequired',
-  'testOnly', 'botPermissions', 'devOnly', 'messageTriggerSafe', 'initialize'
-];
 
 /**
  * Read component-config.json and return disabled entries.
@@ -41,19 +36,6 @@ function loadDisabledComponents(): Record<string, false> {
     }
   } catch { /* ignore */ }
   return {};
-}
-
-/**
- * Build a Discord API payload from a local command definition.
- */
-function buildCommandPayload(commandDef: any): any {
-  const payload: any = {};
-  for (const key in commandDef) {
-    if (!INTERNAL_KEYS.includes(key) && commandDef.hasOwnProperty(key)) {
-      payload[key] = commandDef[key];
-    }
-  }
-  return payload;
 }
 
 /**

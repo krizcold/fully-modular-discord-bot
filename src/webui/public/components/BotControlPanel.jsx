@@ -1,5 +1,5 @@
 // Bot Control Panel Component
-function BotControlPanel({ status, onStart, onRestart, onShutdown, loading, configured, pendingContainerRestart, containerRestarting }) {
+function BotControlPanel({ status, onStart, onRestart, onShutdown, loading, configured, containerRestarting }) {
   const [restarting, setRestarting] = React.useState(false);
 
   if (!status) return null;
@@ -28,25 +28,6 @@ function BotControlPanel({ status, onStart, onRestart, onShutdown, loading, conf
   return (
     <div className="card">
       <h2>Bot Control</h2>
-
-      {/* Pending Container Restart Banner */}
-      {pendingContainerRestart && (
-        <div style={{
-          background: '#2d2000',
-          border: '1px solid #f0a000',
-          borderRadius: '8px',
-          padding: '14px 18px',
-          marginBottom: '16px',
-          display: 'flex',
-          alignItems: 'center',
-          gap: '10px'
-        }}>
-          <span style={{ fontSize: '1.3em' }}>⚠</span>
-          <span style={{ color: '#f0a000', fontSize: '0.9rem' }}>
-            Changes pending — restart the container to apply newly installed modules or updates.
-          </span>
-        </div>
-      )}
 
       {/* Setup Required Banner */}
       {!canStart && (
@@ -114,11 +95,8 @@ function BotControlPanel({ status, onStart, onRestart, onShutdown, loading, conf
             <button onClick={() => onShutdown(false)} className="btn btn-warning" disabled={isBusy}>
               Stop Bot
             </button>
-            <button onClick={() => onShutdown(true)} className="btn btn-danger" disabled={isBusy}
-              title={pendingContainerRestart ? 'Restart required to apply pending changes' : ''}
-              style={pendingContainerRestart ? { animation: 'pulse 2s infinite' } : {}}
-            >
-              {pendingContainerRestart ? '⚠ ' : ''}Restart Container
+            <button onClick={() => onShutdown(true)} className="btn btn-danger" disabled={isBusy}>
+              Restart Container
             </button>
           </>
         )}

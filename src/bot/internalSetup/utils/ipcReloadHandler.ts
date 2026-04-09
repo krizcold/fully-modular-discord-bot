@@ -6,10 +6,10 @@
  * Uses the same { type, requestId, data } → { requestId, data } pattern as ipcPanelHandler.
  */
 
-import * as path from 'path';
 import { Client } from 'discord.js';
 import { reloadModule, reloadModules, unloadModuleFromMemory } from './moduleReloader';
 import { getModuleRegistry } from './moduleRegistry';
+import { reRegisterSlashCommands } from './commandUtils';
 
 let clientRef: Client | null = null;
 
@@ -81,18 +81,8 @@ export function setupReloadIPCHandlers(client: Client): void {
         }
 
         case 'commands:reregister': {
-          // Re-run registerCommands (includes orphan cleanup if autoCleanup is enabled)
           try {
-            const isProd = process.env.NODE_ENV !== 'development';
-            const registerPath = isProd
-              ? path.join(process.cwd(), 'dist', 'bot', 'internalSetup', 'events', 'clientReady', 'registerCommands.js')
-              : path.join(process.cwd(), 'src', 'bot', 'internalSetup', 'events', 'clientReady', 'registerCommands.ts');
-            const resolved = require.resolve(registerPath);
-            delete require.cache[resolved];
-            const registerFn = require(resolved).default || require(resolved);
-            if (typeof registerFn === 'function') {
-              await registerFn(clientRef);
-            }
+            await reRegisterSlashCommands(clientRef);
             response = { success: true };
           } catch (err: any) {
             response = { success: false, error: err.message || String(err) };

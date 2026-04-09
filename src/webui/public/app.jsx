@@ -7,7 +7,6 @@ function App() {
   const [setupStatus, setSetupStatus] = useState(null);
   const [logs, setLogs] = useState([]);
   const [loading, setLoading] = useState(true);
-  const [pendingContainerRestart, setPendingContainerRestart] = useState(false);
   const [containerRestarting, setContainerRestarting] = useState(false);
 
   // Load initial data and set up WebSocket subscriptions
@@ -189,9 +188,8 @@ function App() {
         <button
           className={`tab ${activeTab === 'dashboard' ? 'active' : ''}`}
           onClick={() => setActiveTab('dashboard')}
-          title={pendingContainerRestart ? 'Container restart required to apply changes' : ''}
         >
-          Dashboard {pendingContainerRestart ? '⚠' : ''}
+          Dashboard
         </button>
         <button
           className={`tab ${activeTab === 'panels' ? 'active' : ''}`}
@@ -240,7 +238,6 @@ function App() {
             onShutdown={shutdownBot}
             loading={loading}
             configured={setupStatus?.configured}
-            pendingContainerRestart={pendingContainerRestart}
             containerRestarting={containerRestarting}
           />
         )}
@@ -272,7 +269,7 @@ function App() {
 
         {activeTab === 'update' && <UpdatePanel api={api} wsClient={wsClient} />}
 
-        {activeTab === 'appstore' && <AppStorePanel onModuleInstalled={() => setPendingContainerRestart(true)} />}
+        {activeTab === 'appstore' && <AppStorePanel />}
       </div>
     </div>
   );

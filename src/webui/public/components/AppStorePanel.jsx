@@ -1,7 +1,7 @@
 // App Store Panel Component - Browse, install, and manage modules
 const { useState, useEffect } = React;
 
-function AppStorePanel({ onModuleInstalled }) {
+function AppStorePanel() {
   const [view, setView] = useState('modules'); // 'modules', 'repos', 'premium', 'detail'
   const [modules, setModules] = useState([]);
   const [installed, setInstalled] = useState({});
@@ -110,7 +110,7 @@ function AppStorePanel({ onModuleInstalled }) {
           module={selectedModule}
           installed={installed[selectedModule.name]}
           onBack={() => { setView('modules'); setSelectedModule(null); }}
-          onInstall={() => { if (onModuleInstalled) onModuleInstalled(); loadData(); }}
+          onInstall={() => { loadData(); }}
           onUninstall={loadData}
           onSaveCredentials={loadData}
           showSuccess={showSuccess}
@@ -127,7 +127,7 @@ function AppStorePanel({ onModuleInstalled }) {
           categoryFilter={categoryFilter}
           onCategoryChange={setCategoryFilter}
           onSelectModule={(m) => { setSelectedModule(m); setView('detail'); }}
-          onModuleChanged={() => { if (onModuleInstalled) onModuleInstalled(); loadData(); }}
+          onModuleChanged={loadData}
           repositories={repositories}
         />
       )}

@@ -9,7 +9,8 @@
  */
 
 import { Client } from 'discord.js';
-import { execSync } from 'child_process';
+import { exec } from 'child_process';
+import { promisify } from 'util';
 import path from 'path';
 import fs from 'fs';
 import { getModuleRegistry } from './moduleRegistry';
@@ -19,10 +20,14 @@ import { LoadedModule } from '../../types/moduleTypes';
 import { getPanelManager } from './panelManager';
 import {
   findModuleManifests,
-  toImportPath,
   getModuleDataPath
 } from './pathHelpers';
 import { applyComponentToggleState } from './ipcToggleHandler';
+import { reRegisterSlashCommands } from './commandUtils';
+
+// Guard against concurrent reloads of the same module
+const reloadingModules: Set<string> = new Set();
+let recompileInProgress = false;
 
 export interface ReloadResult {
   success: boolean;
@@ -39,36 +44,39 @@ export interface BulkReloadResult {
   totalDuration: number;
 }
 
+const execAsync = promisify(exec);
+
 /**
- * Recompile TypeScript (incremental). Returns true on success.
+ * Recompile TypeScript (incremental, non-blocking).
+ * Uses async exec so the event loop stays alive (Discord heartbeats, etc.).
+ * Serialized: only one recompile runs at a time.
  */
-function recompileTypeScript(): { success: boolean; error?: string; duration: number } {
+async function recompileTypeScript(): Promise<{ success: boolean; error?: string; duration: number }> {
+  if (recompileInProgress) {
+    // Wait for the in-progress recompile to finish instead of starting a second one
+    return new Promise(resolve => {
+      const check = setInterval(() => {
+        if (!recompileInProgress) {
+          clearInterval(check);
+          resolve({ success: true, duration: 0 }); // Previous compile covered our changes
+        }
+      }, 200);
+    });
+  }
+
+  recompileInProgress = true;
   const start = Date.now();
   try {
-    execSync('npm run build-prod', {
+    await execAsync('npm run build-prod', {
       cwd: process.cwd(),
-      stdio: 'pipe',
       timeout: 60000
     });
     return { success: true, duration: Date.now() - start };
   } catch (error: any) {
     const stderr = error.stderr?.toString() || error.message || 'Unknown compilation error';
     return { success: false, error: stderr, duration: Date.now() - start };
-  }
-}
-
-/**
- * Clear Node's require cache for all files belonging to a module.
- */
-function clearModuleCache(module: LoadedModule): void {
-  for (const filePath of module.importedFiles) {
-    const importPath = toImportPath(filePath);
-    try {
-      const resolved = require.resolve(importPath);
-      delete require.cache[resolved];
-    } catch {
-      // Not in require cache
-    }
+  } finally {
+    recompileInProgress = false;
   }
 }
 
@@ -166,57 +174,28 @@ async function registerReloadedModule(client: Client, module: LoadedModule): Pro
 }
 
 /**
- * Re-register slash commands with Discord after reload.
- * Calls the existing registerCommands event handler.
- */
-async function reRegisterSlashCommands(client: Client): Promise<void> {
-  try {
-    const isProd = process.env.NODE_ENV !== 'development';
-    const registerPath = isProd
-      ? path.join(process.cwd(), 'dist', 'bot', 'internalSetup', 'events', 'clientReady', 'registerCommands.js')
-      : path.join(process.cwd(), 'src', 'bot', 'internalSetup', 'events', 'clientReady', 'registerCommands.ts');
-
-    if (!fs.existsSync(registerPath)) {
-      console.warn('[Reloader] registerCommands not found, skipping slash command sync');
-      return;
-    }
-
-    // Clear cache so we get the latest version
-    try {
-      const resolved = require.resolve(registerPath);
-      delete require.cache[resolved];
-    } catch { /* ignore */ }
-
-    const registerModule = require(registerPath);
-    const registerFn = registerModule.default || registerModule;
-
-    if (typeof registerFn === 'function') {
-      await registerFn(client);
-      console.log('[Reloader] Slash commands re-registered with Discord');
-    }
-  } catch (error) {
-    console.error('[Reloader] Failed to re-register slash commands:', error);
-  }
-}
-
-/**
  * Reload a single module by name.
  * Works for both existing modules (unload → reload) and fresh installs (just load).
  */
 export async function reloadModule(client: Client, moduleName: string): Promise<ReloadResult> {
+  if (reloadingModules.has(moduleName)) {
+    return { success: false, moduleName, error: 'Module is already being reloaded' };
+  }
+
+  reloadingModules.add(moduleName);
   const start = Date.now();
-  const registry = getModuleRegistry();
-  const existingModule = registry.getModule(moduleName);
 
   try {
+    const registry = getModuleRegistry();
+    const existingModule = registry.getModule(moduleName);
+
     // 1. Unload if already loaded
     if (existingModule) {
-      clearModuleCache(existingModule);
       await registry.unloadModule(moduleName);
     }
 
     // 2. Recompile (incremental — only changed files)
-    const compile = recompileTypeScript();
+    const compile = await recompileTypeScript();
     if (!compile.success) {
       return { success: false, moduleName, error: `Compilation failed: ${compile.error}`, duration: Date.now() - start };
     }
@@ -245,6 +224,8 @@ export async function reloadModule(client: Client, moduleName: string): Promise<
     return { success: true, moduleName, duration: Date.now() - start };
   } catch (error: any) {
     return { success: false, moduleName, error: error.message || String(error), duration: Date.now() - start };
+  } finally {
+    reloadingModules.delete(moduleName);
   }
 }
 
@@ -253,19 +234,20 @@ export async function reloadModule(client: Client, moduleName: string): Promise<
  * Removes events, panels, commands, cache — module is fully gone from runtime.
  */
 export async function unloadModuleFromMemory(client: Client, moduleName: string): Promise<ReloadResult> {
+  if (reloadingModules.has(moduleName)) {
+    return { success: false, moduleName, error: 'Module is currently being reloaded' };
+  }
+
   const start = Date.now();
   const registry = getModuleRegistry();
   const existingModule = registry.getModule(moduleName);
 
   if (!existingModule) {
-    return { success: true, moduleName, duration: 0 }; // Not loaded, nothing to do
+    return { success: true, moduleName, duration: 0 };
   }
 
   try {
-    clearModuleCache(existingModule);
     await registry.unloadModule(moduleName);
-
-    // Re-register slash commands to remove the unloaded module's commands from Discord
     await reRegisterSlashCommands(client);
 
     console.log(`[Reloader] Unloaded: ${moduleName} (${Date.now() - start}ms)`);
@@ -279,64 +261,74 @@ export async function unloadModuleFromMemory(client: Client, moduleName: string)
  * Reload multiple modules. Recompiles once, then reloads each module.
  */
 export async function reloadModules(client: Client, moduleNames: string[]): Promise<BulkReloadResult> {
+  // Filter out modules that are already being reloaded
+  const available = moduleNames.filter(n => !reloadingModules.has(n));
+  const skipped = moduleNames.filter(n => reloadingModules.has(n));
+
   const start = Date.now();
   const registry = getModuleRegistry();
   const result: BulkReloadResult = {
     success: true,
     reloaded: [],
-    failed: [],
+    failed: skipped.map(n => ({ moduleName: n, error: 'Module is already being reloaded' })),
     compileDuration: 0,
     totalDuration: 0
   };
 
-  // 1. Unload all target modules
-  for (const name of moduleNames) {
-    const existing = registry.getModule(name);
-    if (existing) {
-      clearModuleCache(existing);
-      await registry.unloadModule(name);
-    }
-  }
+  // Mark all as reloading
+  for (const name of available) reloadingModules.add(name);
 
-  // 2. Single recompile for all changes
-  const compile = recompileTypeScript();
-  result.compileDuration = compile.duration;
-  if (!compile.success) {
-    result.success = false;
-    for (const name of moduleNames) {
-      result.failed.push({ moduleName: name, error: `Compilation failed: ${compile.error}` });
+  try {
+    // 1. Unload all target modules
+    for (const name of available) {
+      const existing = registry.getModule(name);
+      if (existing) {
+        await registry.unloadModule(name);
+      }
     }
+
+    // 2. Single recompile for all changes
+    const compile = await recompileTypeScript();
+    result.compileDuration = compile.duration;
+    if (!compile.success) {
+      result.success = false;
+      for (const name of available) {
+        result.failed.push({ moduleName: name, error: `Compilation failed: ${compile.error}` });
+      }
+      result.totalDuration = Date.now() - start;
+      return result;
+    }
+
+    // 3. Reload each module via ModuleLoader
+    const loader = new ModuleLoader(client);
+    for (const name of available) {
+      try {
+        const manifestPath = findModuleManifestPath(name);
+        if (!manifestPath) {
+          result.failed.push({ moduleName: name, error: 'Module manifest not found' });
+          continue;
+        }
+
+        const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8'));
+        const modulePath = path.dirname(manifestPath);
+
+        const module = await loader.loadModule(manifest, modulePath);
+        await registerReloadedModule(client, module);
+        result.reloaded.push(name);
+      } catch (error: any) {
+        result.failed.push({ moduleName: name, error: error.message || String(error) });
+      }
+    }
+
+    // 4. Re-register slash commands once (covers all reloaded modules)
+    if (result.reloaded.length > 0) {
+      await reRegisterSlashCommands(client);
+    }
+
+    result.success = result.failed.length === 0;
     result.totalDuration = Date.now() - start;
     return result;
+  } finally {
+    for (const name of available) reloadingModules.delete(name);
   }
-
-  // 3. Reload each module via ModuleLoader
-  const loader = new ModuleLoader(client);
-  for (const name of moduleNames) {
-    try {
-      const manifestPath = findModuleManifestPath(name);
-      if (!manifestPath) {
-        result.failed.push({ moduleName: name, error: 'Module manifest not found' });
-        continue;
-      }
-
-      const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8'));
-      const modulePath = path.dirname(manifestPath);
-
-      const module = await loader.loadModule(manifest, modulePath);
-      await registerReloadedModule(client, module);
-      result.reloaded.push(name);
-    } catch (error: any) {
-      result.failed.push({ moduleName: name, error: error.message || String(error) });
-    }
-  }
-
-  // 4. Re-register slash commands once (covers all reloaded modules)
-  if (result.reloaded.length > 0) {
-    await reRegisterSlashCommands(client);
-  }
-
-  result.success = result.failed.length === 0;
-  result.totalDuration = Date.now() - start;
-  return result;
 }

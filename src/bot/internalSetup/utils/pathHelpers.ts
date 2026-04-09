@@ -2,15 +2,12 @@ import path from 'path';
 import fs from 'fs';
 
 /**
- * Get the root directory of the bot
+ * Get the root directory of the bot.
+ * __dirname is internalSetup/utils/ → go up 2 levels to reach the bot root (src/bot or dist/bot).
  * @returns Absolute path to the bot root directory
  */
 export function getBotRoot(): string {
-  // In development: /data/src/bot
-  // In production: /data/dist/bot
-  return __dirname.includes('/dist/')
-    ? path.join(__dirname, '../..')
-    : path.join(__dirname, '../..');
+  return path.join(__dirname, '..', '..');
 }
 
 /**
