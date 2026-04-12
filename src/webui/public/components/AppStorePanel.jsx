@@ -1,5 +1,5 @@
 // App Store Panel Component - Browse, install, and manage modules
-const { useState, useEffect } = React;
+const { useState, useEffect, useRef } = React;
 
 function AppStorePanel() {
   const [view, setView] = useState('modules'); // 'modules', 'repos', 'premium', 'detail'
@@ -11,15 +11,39 @@ function AppStorePanel() {
   const [selectedModule, setSelectedModule] = useState(null);
   const [loading, setLoading] = useState(true);
   const [categoryFilter, setCategoryFilter] = useState('all');
+  const [installJobs, setInstallJobs] = useState({}); // moduleName -> job
+  const hasLoadedOnce = useRef(false);
 
   useEffect(() => {
     loadData();
   }, []);
 
+  useEffect(() => {
+    const handlers = {
+      'appstore:install:queued':    job => setInstallJobs(prev => ({ ...prev, [job.moduleName]: job })),
+      'appstore:install:started':   job => setInstallJobs(prev => ({ ...prev, [job.moduleName]: job })),
+      'appstore:install:cancelled': job => setInstallJobs(prev => { const n = { ...prev }; delete n[job.moduleName]; return n; }),
+      'appstore:install:completed': job => {
+        setInstallJobs(prev => { const n = { ...prev }; delete n[job.moduleName]; return n; });
+        loadData();
+        if (job.loaded === false) {
+          showToast(`${job.moduleName} installed. It will load on next bot start.`, 'info');
+        } else {
+          showToast(`${job.moduleName} installed.`, 'success');
+        }
+      },
+      'appstore:install:failed': job => {
+        setInstallJobs(prev => ({ ...prev, [job.moduleName]: job }));
+        showToast(`Install failed for ${job.moduleName}: ${job.error || 'unknown error'}`, 'error');
+      }
+    };
+    const unsubs = Object.entries(handlers).map(([evt, cb]) => wsClient.on(evt, cb));
+    return () => unsubs.forEach(u => u && u());
+  }, []);
+
   async function loadData() {
     try {
-      setLoading(true);
-      setError(null);
+      if (!hasLoadedOnce.current) setLoading(true);
       const res = await api.get('/appstore/bundle');
 
       setModules(res.modules || []);
@@ -32,10 +56,21 @@ function AppStorePanel() {
       setRepositories(res.repositories || []);
       setTiers(res.tiers || {});
       setGuildAssignments(res.guildAssignments || {});
+
+      // Hydrate queue from bundle (only pending/running; completed/failed come via WS)
+      const queue = Array.isArray(res.installQueue) ? res.installQueue : [];
+      const jobMap = {};
+      for (const j of queue) {
+        if (j.status === 'queued' || j.status === 'running' || j.status === 'failed') {
+          jobMap[j.moduleName] = j;
+        }
+      }
+      setInstallJobs(jobMap);
     } catch (err) {
       setError(err.message);
     } finally {
       setLoading(false);
+      hasLoadedOnce.current = true;
     }
   }
 
@@ -109,6 +144,7 @@ function AppStorePanel() {
         <ModuleDetailView
           module={selectedModule}
           installed={installed[selectedModule.name]}
+          installJob={installJobs[selectedModule.name]}
           onBack={() => { setView('modules'); setSelectedModule(null); }}
           onInstall={() => { loadData(); }}
           onUninstall={loadData}
@@ -123,6 +159,7 @@ function AppStorePanel() {
         <ModulesView
           modules={filteredModules}
           installed={installed}
+          installJobs={installJobs}
           categories={categories}
           categoryFilter={categoryFilter}
           onCategoryChange={setCategoryFilter}
@@ -162,7 +199,7 @@ function AppStorePanel() {
 }
 
 // Modules View Component
-function ModulesView({ modules, installed, categories, categoryFilter, onCategoryChange, onSelectModule, onModuleChanged, repositories }) {
+function ModulesView({ modules, installed, installJobs, categories, categoryFilter, onCategoryChange, onSelectModule, onModuleChanged, repositories }) {
   const installedCount = Object.keys(installed).length;
   const [autoCleanup, setAutoCleanup] = useState(false);
   const [autoUpdate, setAutoUpdate] = useState(false);
@@ -343,6 +380,7 @@ function ModulesView({ modules, installed, categories, categoryFilter, onCategor
               key={module.name}
               module={module}
               installed={!!installed[module.name]}
+              installJob={installJobs?.[module.name] || null}
               updateInfo={moduleUpdates?.[module.name] || null}
               onClick={() => onSelectModule(module)}
               onInstall={onModuleChanged}
@@ -521,22 +559,27 @@ function CommandsView({ showSuccess, setError }) {
   );
 }
 
-function ModuleCard({ module, installed, updateInfo, onClick, onInstall, onUninstall, onUpdate, updating }) {
+function ModuleCard({ module, installed, installJob, updateInfo, onClick, onInstall, onUninstall, onUpdate, updating }) {
   const [busy, setBusy] = useState(false);
   const hasUpdate = !!updateInfo;
-  const borderColor = hasUpdate ? '#e67e22' : installed ? '#3ba55d' : '#444';
+  const jobStatus = installJob?.status || null;
+  const borderColor = hasUpdate ? '#e67e22' : installed ? '#3ba55d' : jobStatus === 'running' ? '#5865F2' : jobStatus === 'queued' ? '#888' : jobStatus === 'failed' ? '#ed4245' : '#444';
 
   async function handleInstall(e) {
     e.stopPropagation();
-    if (busy) return;
-    setBusy(true);
     try {
       await api.post(`/appstore/modules/${module.name}/install`, { repoId: module.repoId });
-      if (onInstall) onInstall();
     } catch (err) {
-      console.error('Install failed:', err);
-    } finally {
-      setBusy(false);
+      showToast(err.message || 'Install request failed', 'error');
+    }
+  }
+
+  async function handleCancel(e) {
+    e.stopPropagation();
+    try {
+      await api.delete(`/appstore/modules/${module.name}/install`);
+    } catch (err) {
+      showToast(err.message || 'Cancel failed', 'error');
     }
   }
 
@@ -644,10 +687,55 @@ function ModuleCard({ module, installed, updateInfo, onClick, onInstall, onUnins
                 }}
               >{busy ? '...' : 'Uninstall'}</button>
             </>
+          ) : jobStatus === 'queued' ? (
+            <>
+              <span style={{
+                background: 'rgba(136, 136, 136, 0.15)',
+                color: '#aaa',
+                border: '1px solid rgba(136, 136, 136, 0.3)',
+                padding: '3px 8px',
+                borderRadius: '4px',
+                fontSize: '0.7rem'
+              }}>Queued</span>
+              <button
+                onClick={handleCancel}
+                style={{
+                  background: 'rgba(248, 113, 113, 0.15)',
+                  color: '#f87171',
+                  border: '1px solid rgba(248, 113, 113, 0.3)',
+                  padding: '3px 8px',
+                  borderRadius: '4px',
+                  fontSize: '0.7rem',
+                  cursor: 'pointer'
+                }}
+              >Cancel</button>
+            </>
+          ) : jobStatus === 'running' ? (
+            <span style={{
+              background: 'rgba(88, 101, 242, 0.15)',
+              color: '#5865F2',
+              border: '1px solid rgba(88, 101, 242, 0.3)',
+              padding: '3px 8px',
+              borderRadius: '4px',
+              fontSize: '0.7rem'
+            }}>Installing…</span>
+          ) : jobStatus === 'failed' ? (
+            <button
+              onClick={handleInstall}
+              title={installJob?.error || 'Install failed'}
+              style={{
+                background: 'rgba(237, 66, 69, 0.15)',
+                color: '#ed4245',
+                border: '1px solid rgba(237, 66, 69, 0.3)',
+                padding: '3px 8px',
+                borderRadius: '4px',
+                fontSize: '0.7rem',
+                cursor: 'pointer'
+              }}
+            >Retry</button>
           ) : (
             <button
               onClick={handleInstall}
-              disabled={busy}
               style={{
                 background: 'rgba(45, 212, 168, 0.15)',
                 color: '#2dd4a8',
@@ -655,10 +743,9 @@ function ModuleCard({ module, installed, updateInfo, onClick, onInstall, onUnins
                 padding: '3px 8px',
                 borderRadius: '4px',
                 fontSize: '0.7rem',
-                cursor: busy ? 'not-allowed' : 'pointer',
-                opacity: busy ? 0.5 : 1
+                cursor: 'pointer'
               }}
-            >{busy ? '...' : 'Install'}</button>
+            >Install</button>
           )}
         </div>
       </div>
@@ -683,11 +770,12 @@ function ModuleCard({ module, installed, updateInfo, onClick, onInstall, onUnins
 }
 
 // Module Detail View Component
-function ModuleDetailView({ module, installed, onBack, onInstall, onUninstall, onSaveCredentials, showSuccess, setError }) {
+function ModuleDetailView({ module, installed, installJob, onBack, onInstall, onUninstall, onSaveCredentials, showSuccess, setError }) {
   const [installing, setInstalling] = useState(false);
   const [showCredentialsForm, setShowCredentialsForm] = useState(false);
   const [credentials, setCredentials] = useState({});
   const [components, setComponents] = useState(null);
+  const jobStatus = installJob?.status || null;
 
   // Fetch detailed module info (with components) on mount
   useEffect(() => {
@@ -702,17 +790,22 @@ function ModuleDetailView({ module, installed, onBack, onInstall, onUninstall, o
 
   async function handleInstall() {
     try {
-      setInstalling(true);
       setError(null);
       const res = await api.post(`/appstore/modules/${module.name}/install`, { repoId: module.repoId });
       if (res.success) {
-        showSuccess(`${module.displayName || module.name} installed!`);
-        onInstall();
+        showSuccess(`${module.displayName || module.name} queued for install.`);
       }
     } catch (err) {
       setError(err.message);
-    } finally {
-      setInstalling(false);
+    }
+  }
+
+  async function handleCancel() {
+    try {
+      setError(null);
+      await api.delete(`/appstore/modules/${module.name}/install`);
+    } catch (err) {
+      setError(err.message);
     }
   }
 
@@ -853,18 +946,43 @@ function ModuleDetailView({ module, installed, onBack, onInstall, onUninstall, o
 
         {/* Action Buttons */}
         <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
-          {!installed ? (
+          {!installed && jobStatus === 'queued' ? (
+            <>
+              <span className="button" style={{ background: '#555', border: 'none', padding: '12px 25px', cursor: 'default' }}>
+                Queued
+              </span>
+              <button
+                className="button"
+                onClick={handleCancel}
+                style={{ background: '#ed4245', border: 'none', padding: '12px 25px' }}
+              >
+                Cancel
+              </button>
+            </>
+          ) : !installed && jobStatus === 'running' ? (
+            <span className="button" style={{ background: '#5865F2', border: 'none', padding: '12px 25px', cursor: 'default' }}>
+              Installing…
+            </span>
+          ) : !installed && jobStatus === 'failed' ? (
             <button
               className="button primary"
               onClick={handleInstall}
-              disabled={installing}
+              title={installJob?.error || 'Install failed'}
+              style={{ background: '#ed4245', border: 'none', padding: '12px 25px' }}
+            >
+              Retry Install
+            </button>
+          ) : !installed ? (
+            <button
+              className="button primary"
+              onClick={handleInstall}
               style={{
-                background: installing ? '#555' : 'linear-gradient(135deg, #3ba55d, #2d7d46)',
+                background: 'linear-gradient(135deg, #3ba55d, #2d7d46)',
                 border: 'none',
                 padding: '12px 25px'
               }}
             >
-              {installing ? 'Installing...' : 'Install Module'}
+              Install Module
             </button>
           ) : (
             <>

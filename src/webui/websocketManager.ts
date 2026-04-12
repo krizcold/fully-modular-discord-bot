@@ -15,7 +15,12 @@ export type WSEvent =
   | 'bot:shutdown'
   | 'bot:crash'
   | 'connection:authenticated'
-  | 'panel:updated';
+  | 'panel:updated'
+  | 'appstore:install:queued'
+  | 'appstore:install:started'
+  | 'appstore:install:completed'
+  | 'appstore:install:failed'
+  | 'appstore:install:cancelled';
 
 /**
  * Bot status data structure
@@ -71,6 +76,21 @@ export interface PanelUpdatedData {
 }
 
 /**
+ * App Store install job event data
+ */
+export interface AppStoreInstallJobData {
+  id: string;
+  moduleName: string;
+  repoId: string;
+  status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
+  enqueuedAt: number;
+  startedAt?: number;
+  finishedAt?: number;
+  error?: string;
+  loaded?: boolean;
+}
+
+/**
  * Union type for all WebSocket event data
  */
 export type WSEventData =
@@ -79,7 +99,8 @@ export type WSEventData =
   | BotCrashData
   | BotShutdownData
   | ConnectionAuthData
-  | PanelUpdatedData;
+  | PanelUpdatedData
+  | AppStoreInstallJobData;
 
 /**
  * WebSocket message structure sent to clients

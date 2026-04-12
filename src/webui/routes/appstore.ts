@@ -16,9 +16,12 @@ import {
 import { getPremiumManager } from '../../bot/internalSetup/utils/premiumManager';
 import { BotManager } from '../botManager';
 import { ComponentToggleDebouncer } from '../utils/componentToggleDebouncer';
+import { getInstallQueue } from '../utils/installQueue';
 
 export function createAppStoreRoutes(botManager: BotManager): Router {
   const toggleDebouncer = new ComponentToggleDebouncer(1500);
+  const installQueue = getInstallQueue();
+  installQueue.setBotManager(botManager);
   const router = Router();
 
   // ============================================================================
@@ -51,7 +54,8 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
           githubToken: repo.githubToken ? '***' : null
         })),
         tiers: premiumMgr.getAllTiers(),
-        guildAssignments: premiumMgr.getAllGuildAssignments()
+        guildAssignments: premiumMgr.getAllGuildAssignments(),
+        installQueue: installQueue.getSnapshot()
       });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
@@ -328,10 +332,10 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
 
   /**
    * POST /api/appstore/modules/:name/install
-   * Install a module
+   * Enqueue a module for installation. Installs run strictly serially.
    * Body: { repoId, credentials? }
    */
-  router.post('/modules/:name/install', async (req: Request, res: Response) => {
+  router.post('/modules/:name/install', (req: Request, res: Response) => {
     try {
       const { name } = req.params;
       const { repoId, credentials } = req.body;
@@ -343,38 +347,46 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
         });
       }
 
-      const manager = getAppStoreManager();
-
-      // Save credentials if provided
-      if (credentials && typeof credentials === 'object') {
-        manager.saveCredentials(name, credentials);
-      }
-
-      await manager.installModule(name, repoId);
-
-      // Hot-load the module into the running bot (no restart needed)
-      let loaded = false;
-      try {
-        const loadResult = await botManager.loadModule(name);
-        loaded = loadResult?.success === true;
-      } catch {
-        // Bot may not be running — module will load on next start
-      }
-
-      res.json({
+      const job = installQueue.enqueue(name, repoId, credentials);
+      res.status(202).json({
         success: true,
-        message: loaded
-          ? `Module ${name} installed and loaded.`
-          : `Module ${name} installed. It will load on next bot start.`,
-        loaded
+        jobId: job.id,
+        status: job.status,
+        message: `Module ${name} queued for install.`
       });
-    } catch (error) {
+    } catch (error: any) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-      res.status(500).json({
+      const code = error?.code;
+      const status = code === 'DUPLICATE' || code === 'ALREADY_INSTALLED' ? 409 : 500;
+      res.status(status).json({ success: false, error: errorMessage });
+    }
+  });
+
+  /**
+   * DELETE /api/appstore/modules/:name/install
+   * Request cancel of a queued install. Running installs cannot be cancelled.
+   */
+  router.delete('/modules/:name/install', (req: Request, res: Response) => {
+    const { name } = req.params;
+    const result = installQueue.requestCancel(name);
+    if (result.ok) {
+      return res.json({ success: true, job: result.job });
+    }
+    if (result.reason === 'already-running') {
+      return res.status(409).json({
         success: false,
-        error: errorMessage
+        error: 'Installation already started, cannot cancel.'
       });
     }
+    return res.status(404).json({ success: false, error: 'No pending install for this module.' });
+  });
+
+  /**
+   * GET /api/appstore/install-queue
+   * Snapshot of current install queue state (for hydration/reconnect).
+   */
+  router.get('/install-queue', (_req: Request, res: Response) => {
+    res.json({ success: true, jobs: installQueue.getSnapshot() });
   });
 
   /**

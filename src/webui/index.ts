@@ -4,6 +4,7 @@ import { createServer as createHTTPServer } from 'http';
 import { BotManager } from './botManager';
 import { createServer } from './server';
 import { WebSocketManager } from './websocketManager';
+import { getInstallQueue } from './utils/installQueue';
 
 export async function startWebUI(botManager: BotManager): Promise<void> {
   console.log('[WebUI] Starting web interface...');
@@ -18,6 +19,15 @@ export async function startWebUI(botManager: BotManager): Promise<void> {
   // Initialize WebSocket manager
   const wsManager = new WebSocketManager(httpServer);
   botManager.setWebSocketManager(wsManager);
+
+  // Wire install queue events → WebSocket broadcasts
+  const installQueue = getInstallQueue();
+  installQueue.setBotManager(botManager);
+  installQueue.on('enqueued',  job => wsManager.broadcast('appstore:install:queued',    job));
+  installQueue.on('started',   job => wsManager.broadcast('appstore:install:started',   job));
+  installQueue.on('completed', job => wsManager.broadcast('appstore:install:completed', job));
+  installQueue.on('failed',    job => wsManager.broadcast('appstore:install:failed',    job));
+  installQueue.on('cancelled', job => wsManager.broadcast('appstore:install:cancelled', job));
 
   // Set up graceful shutdown handlers
   const shutdown = async (signal: string) => {

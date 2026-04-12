@@ -291,9 +291,58 @@ export class AppStoreManager {
       } else {
         this.saveInstalled();
       }
+
+      this.reconcileInstalledModules();
     } catch (error) {
       console.error('[AppStoreManager] Failed to load config:', error);
     }
+  }
+
+  /**
+   * Reconcile installed config with on-disk source modules directory.
+   * Handles leftovers from a crashed install (process killed between file copy and saveInstalled).
+   * - Orphan directory (on disk, not in config): delete to prevent "already installed" block on retry.
+   * - Stale config entry (in config, no directory): remove from config.
+   */
+  private reconcileInstalledModules(): void {
+    const sourceDir = getSourceModulesDir();
+    if (!fs.existsSync(sourceDir)) return;
+
+    // In dev, getSourceModulesDir() collides with getModulesDir() where built-in
+    // modules live. Skip reconciliation to avoid deleting developer source trees.
+    if (sourceDir === getModulesDir()) {
+      console.log('[AppStoreManager] Dev mode: skipping orphan reconciliation');
+      return;
+    }
+
+    let changed = false;
+
+    const entries = fs.readdirSync(sourceDir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const name = entry.name;
+      if (name.startsWith('.') || name.endsWith('.disabled')) continue;
+      if (!this.installedConfig.modules[name]) {
+        const orphanPath = path.join(sourceDir, name);
+        try {
+          fs.rmSync(orphanPath, { recursive: true, force: true });
+          console.log(`[AppStoreManager] Reconciled orphan module dir: ${name}`);
+        } catch (err) {
+          console.error(`[AppStoreManager] Failed to remove orphan dir ${name}:`, err);
+        }
+      }
+    }
+
+    for (const moduleName of Object.keys(this.installedConfig.modules)) {
+      const modDir = path.join(sourceDir, moduleName);
+      if (!fs.existsSync(modDir)) {
+        delete this.installedConfig.modules[moduleName];
+        changed = true;
+        console.log(`[AppStoreManager] Reconciled stale config entry: ${moduleName}`);
+      }
+    }
+
+    if (changed) this.saveInstalled();
   }
 
   /**
