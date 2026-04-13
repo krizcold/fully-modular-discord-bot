@@ -41,9 +41,17 @@ export function buildCommandPayload(commandDef: any): any {
 /**
  * Re-register all slash commands with Discord.
  * Calls the existing registerCommands event handler (which handles
- * registration, updates, disabled commands, and orphan cleanup).
+ * registration, updates, disabled commands, and optional orphan cleanup).
+ *
+ * Pass `{ runOrphanCleanup: false }` when calling from hot-reload paths —
+ * the in-memory ModuleRegistry is transient during install/uninstall, so the
+ * full orphan sweep can wrongly delete valid commands. Startup (clientReady)
+ * callers should omit the option so the sweep runs normally.
  */
-export async function reRegisterSlashCommands(client: Client): Promise<void> {
+export async function reRegisterSlashCommands(
+  client: Client,
+  options: { runOrphanCleanup?: boolean } = {}
+): Promise<void> {
   try {
     const isProd = process.env.NODE_ENV !== 'development';
     const registerPath = isProd
@@ -62,7 +70,7 @@ export async function reRegisterSlashCommands(client: Client): Promise<void> {
     const registerFn = registerModule.default || registerModule;
 
     if (typeof registerFn === 'function') {
-      await registerFn(client);
+      await registerFn(client, options);
       console.log('[CommandUtils] Slash commands re-registered with Discord');
     }
   } catch (error) {

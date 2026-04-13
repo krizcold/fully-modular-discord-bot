@@ -8,7 +8,7 @@
  * Handles both single module and bulk reload.
  */
 
-import { Client } from 'discord.js';
+import { Client, ApplicationCommandType } from 'discord.js';
 import { exec } from 'child_process';
 import { promisify } from 'util';
 import path from 'path';
@@ -24,6 +24,61 @@ import {
 } from './pathHelpers';
 import { applyComponentToggleState } from './ipcToggleHandler';
 import { reRegisterSlashCommands } from './commandUtils';
+import { isAutoCleanupEnabled } from '../events/clientReady/registerCommands';
+
+interface CapturedCommand {
+  name: string;
+  type: number;
+  testOnly: boolean;
+}
+
+/**
+ * Targeted deletion of a specific module's commands from Discord.
+ * Only runs if the user has the Auto-Cleanup toggle ON. Looks up each
+ * captured command by name+type in the live Discord list and deletes it,
+ * silently ignoring 10063 (already gone).
+ *
+ * This is a SCOPED replacement for the full orphan sweep that previously
+ * ran at the end of reRegisterSlashCommands on every hot-reload. Scoping
+ * to the specific module being removed prevents accidental deletion of
+ * unrelated modules' commands due to transient registry state.
+ */
+async function deleteModuleCommandsFromDiscord(
+  client: Client,
+  commands: CapturedCommand[]
+): Promise<void> {
+  if (commands.length === 0) return;
+  if (!isAutoCleanupEnabled()) return;
+
+  try {
+    const guildId = process.env.GUILD_ID;
+    const guild = guildId ? client.guilds.cache.get(guildId) : undefined;
+    const globalCommands = await client.application?.commands.fetch();
+    const guildCommands = guild ? await guild.commands.fetch() : undefined;
+
+    for (const cmd of commands) {
+      const list = cmd.testOnly ? guildCommands : globalCommands;
+      const mgr = cmd.testOnly ? guild?.commands : client.application?.commands;
+      if (!list || !mgr) continue;
+
+      const match = list.find(c => c.name === cmd.name && c.type === cmd.type);
+      if (!match) continue;
+
+      try {
+        await mgr.delete(match.id);
+        console.log(`[Reloader] Deleted ${cmd.testOnly ? 'local' : 'global'} command "${cmd.name}" from Discord`);
+      } catch (err: any) {
+        if (err?.code === 10063) {
+          console.debug(`[Reloader] Command "${cmd.name}" already gone on Discord (10063)`);
+        } else {
+          console.error(`[Reloader] Failed to delete command "${cmd.name}":`, err);
+        }
+      }
+    }
+  } catch (err) {
+    console.error('[Reloader] Failed during targeted command cleanup:', err);
+  }
+}
 
 // Guard against concurrent reloads of the same module
 const reloadingModules: Set<string> = new Set();
@@ -189,18 +244,19 @@ export async function reloadModule(client: Client, moduleName: string): Promise<
     const registry = getModuleRegistry();
     const existingModule = registry.getModule(moduleName);
 
-    // 1. Unload if already loaded
-    if (existingModule) {
-      await registry.unloadModule(moduleName);
-    }
+    // Atomic swap: prepare the new module BEFORE touching the registry.
+    // If any of recompile / manifest discovery / load fails, the old module
+    // stays registered — prevents a mid-flight failure from leaving the
+    // registry missing this module (which would cause orphan-sweeps to
+    // wrongly delete its commands later).
 
-    // 2. Recompile (incremental — only changed files)
+    // 1. Recompile (incremental — only changed files)
     const compile = await recompileTypeScript();
     if (!compile.success) {
       return { success: false, moduleName, error: `Compilation failed: ${compile.error}`, duration: Date.now() - start };
     }
 
-    // 3. Discover the module manifest
+    // 2. Discover the module manifest
     const manifestPath = findModuleManifestPath(moduleName);
     if (!manifestPath) {
       return { success: false, moduleName, error: 'Module manifest not found after recompile', duration: Date.now() - start };
@@ -209,15 +265,21 @@ export async function reloadModule(client: Client, moduleName: string): Promise<
     const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8'));
     const modulePath = path.dirname(manifestPath);
 
-    // 4. Load via ModuleLoader (single source of truth)
+    // 3. Load via ModuleLoader (single source of truth) — produces the new module.
     const loader = new ModuleLoader(client);
-    const module = await loader.loadModule(manifest, modulePath);
+    const newModule = await loader.loadModule(manifest, modulePath);
 
-    // 5. Register events, panels, commands, hooks
-    await registerReloadedModule(client, module);
+    // 4. Paired swap: remove old (if any) then register new. Short gap, no
+    //    failure points between the two.
+    if (existingModule) {
+      await registry.unloadModule(moduleName);
+    }
+    await registerReloadedModule(client, newModule);
 
-    // 6. Re-register slash commands with Discord
-    await reRegisterSlashCommands(client);
+    // 5. Re-register slash commands with Discord. Skip the full orphan sweep
+    //    because the registry is transient during hot-reload; targeted cleanup
+    //    (on uninstall) handles the only case where Discord needs deletions.
+    await reRegisterSlashCommands(client, { runOrphanCleanup: false });
 
     const action = existingModule ? 'Reloaded' : 'Loaded';
     console.log(`[Reloader] ${action}: ${moduleName} (${Date.now() - start}ms)`);
@@ -246,9 +308,20 @@ export async function unloadModuleFromMemory(client: Client, moduleName: string)
     return { success: true, moduleName, duration: 0 };
   }
 
+  // Capture the module's commands BEFORE unload so we can target them for
+  // deletion from Discord. Reading after unload would be too late.
+  const capturedCommands: CapturedCommand[] = existingModule.commands
+    .filter((c: any) => c && typeof c.name === 'string')
+    .map((c: any) => ({
+      name: c.name,
+      type: (c.type ?? ApplicationCommandType.ChatInput) as number,
+      testOnly: !!c.testOnly
+    }));
+
   try {
     await registry.unloadModule(moduleName);
-    await reRegisterSlashCommands(client);
+    await deleteModuleCommandsFromDiscord(client, capturedCommands);
+    await reRegisterSlashCommands(client, { runOrphanCleanup: false });
 
     console.log(`[Reloader] Unloaded: ${moduleName} (${Date.now() - start}ms)`);
     return { success: true, moduleName, duration: Date.now() - start };
@@ -320,9 +393,10 @@ export async function reloadModules(client: Client, moduleNames: string[]): Prom
       }
     }
 
-    // 4. Re-register slash commands once (covers all reloaded modules)
+    // 4. Re-register slash commands once (covers all reloaded modules).
+    //    Skip orphan sweep — registry is transient during hot-reload.
     if (result.reloaded.length > 0) {
-      await reRegisterSlashCommands(client);
+      await reRegisterSlashCommands(client, { runOrphanCleanup: false });
     }
 
     result.success = result.failed.length === 0;

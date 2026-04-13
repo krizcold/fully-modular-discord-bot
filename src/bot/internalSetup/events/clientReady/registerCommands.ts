@@ -14,7 +14,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 
 /** Check if auto-cleanup is enabled in AppStore config (default: false) */
-function isAutoCleanupEnabled(): boolean {
+export function isAutoCleanupEnabled(): boolean {
   try {
     const configPath = path.join(process.env.DATA_DIR || '/data', 'global', 'appstore', 'config.json');
     if (fs.existsSync(configPath)) {
@@ -171,7 +171,11 @@ const internalOrHandledKeys = [
   'initialize',
 ];
 
-export default async function registerCommands(client: Client) {
+export default async function registerCommands(
+  client: Client,
+  options: { runOrphanCleanup?: boolean } = {}
+) {
+  const runOrphanCleanup = options.runOrphanCleanup !== false;
   console.log('[i] Registering commands...');
 
   if (!guildId) {
@@ -240,7 +244,8 @@ export default async function registerCommands(client: Client) {
 
 
     // Remove orphan commands only if auto-cleanup is enabled (default: OFF)
-    const cleanupEnabled = isAutoCleanupEnabled();
+    // AND the caller allows the full sweep (startup: yes; hot-reload: no).
+    const cleanupEnabled = isAutoCleanupEnabled() && runOrphanCleanup;
 
     // Remove global commands that are no longer present locally
     if (cleanupEnabled && globalCommands) {
@@ -264,8 +269,12 @@ export default async function registerCommands(client: Client) {
           try {
             await client.application?.commands.delete(appCommand.id);
             console.log(`Deleted global command "${appCommand.name}" (Type: ${ApplicationCommandType[appCommand.type]}) as it is no longer found locally or test mode active.`);
-          } catch(deleteError){
-            console.error(`Error deleting global command "${appCommand.name}":`, deleteError);
+          } catch(deleteError: any){
+            if (deleteError?.code === 10063) {
+              console.debug(`Global command "${appCommand.name}" already gone on Discord (10063)`);
+            } else {
+              console.error(`Error deleting global command "${appCommand.name}":`, deleteError);
+            }
           }
         }
       }
@@ -293,8 +302,12 @@ export default async function registerCommands(client: Client) {
           try {
             await guild.commands.delete(guildCommand.id);
             console.log(`Deleted local command "${guildCommand.name}" (Type: ${ApplicationCommandType[guildCommand.type]}) as it is no longer found locally or not marked testOnly.`);
-          } catch(deleteError){
-            console.error(`Error deleting local command "${guildCommand.name}":`, deleteError);
+          } catch(deleteError: any){
+            if (deleteError?.code === 10063) {
+              console.debug(`Local command "${guildCommand.name}" already gone on Discord (10063)`);
+            } else {
+              console.error(`Error deleting local command "${guildCommand.name}":`, deleteError);
+            }
           }
         }
       }
