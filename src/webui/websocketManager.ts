@@ -20,7 +20,12 @@ export type WSEvent =
   | 'appstore:install:started'
   | 'appstore:install:completed'
   | 'appstore:install:failed'
-  | 'appstore:install:cancelled';
+  | 'appstore:install:cancelled'
+  | 'appstore:uninstall:queued'
+  | 'appstore:uninstall:started'
+  | 'appstore:uninstall:completed'
+  | 'appstore:uninstall:failed'
+  | 'appstore:uninstall:cancelled';
 
 /**
  * Bot status data structure
@@ -76,18 +81,21 @@ export interface PanelUpdatedData {
 }
 
 /**
- * App Store install job event data
+ * App Store install/uninstall job event data
  */
 export interface AppStoreInstallJobData {
   id: string;
+  kind: 'install' | 'uninstall';
   moduleName: string;
-  repoId: string;
+  repoId?: string;
   status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
   enqueuedAt: number;
   startedAt?: number;
   finishedAt?: number;
   error?: string;
   loaded?: boolean;
+  unloaded?: boolean;
+  skipped?: boolean;
 }
 
 /**

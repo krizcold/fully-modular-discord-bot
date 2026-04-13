@@ -347,7 +347,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
         });
       }
 
-      const job = installQueue.enqueue(name, repoId, credentials);
+      const job = installQueue.enqueueInstall(name, repoId, credentials);
       res.status(202).json({
         success: true,
         jobId: job.id,
@@ -357,7 +357,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
     } catch (error: any) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       const code = error?.code;
-      const status = code === 'DUPLICATE' || code === 'ALREADY_INSTALLED' ? 409 : 500;
+      const status = code === 'DUPLICATE' ? 409 : 500;
       res.status(status).json({ success: false, error: errorMessage });
     }
   });
@@ -368,7 +368,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
    */
   router.delete('/modules/:name/install', (req: Request, res: Response) => {
     const { name } = req.params;
-    const result = installQueue.requestCancel(name);
+    const result = installQueue.requestCancel(name, 'install');
     if (result.ok) {
       return res.json({ success: true, job: result.job });
     }
@@ -382,6 +382,25 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
   });
 
   /**
+   * DELETE /api/appstore/modules/:name/uninstall
+   * Request cancel of a queued uninstall. Running uninstalls cannot be cancelled.
+   */
+  router.delete('/modules/:name/uninstall', (req: Request, res: Response) => {
+    const { name } = req.params;
+    const result = installQueue.requestCancel(name, 'uninstall');
+    if (result.ok) {
+      return res.json({ success: true, job: result.job });
+    }
+    if (result.reason === 'already-running') {
+      return res.status(409).json({
+        success: false,
+        error: 'Uninstall already started, cannot cancel.'
+      });
+    }
+    return res.status(404).json({ success: false, error: 'No pending uninstall for this module.' });
+  });
+
+  /**
    * GET /api/appstore/install-queue
    * Snapshot of current install queue state (for hydration/reconnect).
    */
@@ -391,51 +410,24 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
 
   /**
    * DELETE /api/appstore/modules/:name
-   * Uninstall a module
+   * Enqueue a module for uninstall. Uninstalls run serially via the same queue
+   * as installs, so mixed install/uninstall sequences are race-free.
    */
-  router.delete('/modules/:name', async (req: Request, res: Response) => {
+  router.delete('/modules/:name', (req: Request, res: Response) => {
     try {
       const { name } = req.params;
-      const manager = getAppStoreManager();
-
-      await manager.uninstallModule(name);
-
-      // Unload the module from the running bot (no restart needed)
-      let unloaded = false;
-      try {
-        const unloadResult = await botManager.unloadModule(name);
-        unloaded = unloadResult?.success === true;
-      } catch {
-        // Bot may not be running — module is already removed from disk
-      }
-
-      // Clean up component toggle config for this module (fresh slate on reinstall)
-      try {
-        const config = loadComponentConfig();
-        const prefix = `${name}:`;
-        let cleaned = false;
-        for (const key of Object.keys(config)) {
-          if (key.startsWith(prefix)) {
-            delete config[key];
-            cleaned = true;
-          }
-        }
-        if (cleaned) saveComponentConfig(config);
-      } catch { /* non-fatal */ }
-
-      res.json({
+      const job = installQueue.enqueueUninstall(name);
+      res.status(202).json({
         success: true,
-        message: unloaded
-          ? `Module ${name} uninstalled and unloaded.`
-          : `Module ${name} uninstalled. Changes apply on next bot start.`,
-        unloaded
+        jobId: job.id,
+        status: job.status,
+        message: `Module ${name} queued for uninstall.`
       });
-    } catch (error) {
+    } catch (error: any) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-      res.status(500).json({
-        success: false,
-        error: errorMessage
-      });
+      const code = error?.code;
+      const status = code === 'DUPLICATE' ? 409 : 500;
+      res.status(status).json({ success: false, error: errorMessage });
     }
   });
 

@@ -19,25 +19,35 @@ function AppStorePanel() {
   }, []);
 
   useEffect(() => {
-    const handlers = {
-      'appstore:install:queued':    job => setInstallJobs(prev => ({ ...prev, [job.moduleName]: job })),
-      'appstore:install:started':   job => setInstallJobs(prev => ({ ...prev, [job.moduleName]: job })),
-      'appstore:install:cancelled': job => setInstallJobs(prev => { const n = { ...prev }; delete n[job.moduleName]; return n; }),
-      'appstore:install:completed': job => {
-        setInstallJobs(prev => { const n = { ...prev }; delete n[job.moduleName]; return n; });
-        loadData();
-        if (job.loaded === false) {
-          showToast(`${job.moduleName} installed. It will load on next bot start.`, 'info');
-        } else {
-          showToast(`${job.moduleName} installed.`, 'success');
-        }
-      },
-      'appstore:install:failed': job => {
-        setInstallJobs(prev => ({ ...prev, [job.moduleName]: job }));
-        showToast(`Install failed for ${job.moduleName}: ${job.error || 'unknown error'}`, 'error');
+    const onPending = job => setInstallJobs(prev => ({ ...prev, [job.moduleName]: job }));
+    const onRemove = job => setInstallJobs(prev => { const n = { ...prev }; delete n[job.moduleName]; return n; });
+    const onCompleted = job => {
+      setInstallJobs(prev => { const n = { ...prev }; delete n[job.moduleName]; return n; });
+      loadData();
+      if (job.kind === 'install') {
+        if (job.skipped) return;
+        if (job.loaded === false) showToast(`${job.moduleName} installed. It will load on next bot start.`, 'info');
+        else showToast(`${job.moduleName} installed.`, 'success');
+      } else {
+        if (job.skipped) return;
+        if (job.unloaded === false) showToast(`${job.moduleName} uninstalled. Changes apply on next bot start.`, 'info');
+        else showToast(`${job.moduleName} uninstalled.`, 'success');
       }
     };
-    const unsubs = Object.entries(handlers).map(([evt, cb]) => wsClient.on(evt, cb));
+    const onFailed = job => {
+      setInstallJobs(prev => ({ ...prev, [job.moduleName]: job }));
+      const label = job.kind === 'install' ? 'Install' : 'Uninstall';
+      showToast(`${label} failed for ${job.moduleName}: ${job.error || 'unknown error'}`, 'error');
+    };
+
+    const unsubs = [];
+    for (const kind of ['install', 'uninstall']) {
+      unsubs.push(wsClient.on(`appstore:${kind}:queued`, onPending));
+      unsubs.push(wsClient.on(`appstore:${kind}:started`, onPending));
+      unsubs.push(wsClient.on(`appstore:${kind}:cancelled`, onRemove));
+      unsubs.push(wsClient.on(`appstore:${kind}:completed`, onCompleted));
+      unsubs.push(wsClient.on(`appstore:${kind}:failed`, onFailed));
+    }
     return () => unsubs.forEach(u => u && u());
   }, []);
 
@@ -560,8 +570,8 @@ function CommandsView({ showSuccess, setError }) {
 }
 
 function ModuleCard({ module, installed, installJob, updateInfo, onClick, onInstall, onUninstall, onUpdate, updating }) {
-  const [busy, setBusy] = useState(false);
   const hasUpdate = !!updateInfo;
+  const jobKind = installJob?.kind || null;
   const jobStatus = installJob?.status || null;
   const borderColor = hasUpdate ? '#e67e22' : installed ? '#3ba55d' : jobStatus === 'running' ? '#5865F2' : jobStatus === 'queued' ? '#888' : jobStatus === 'failed' ? '#ed4245' : '#444';
 
@@ -574,26 +584,22 @@ function ModuleCard({ module, installed, installJob, updateInfo, onClick, onInst
     }
   }
 
-  async function handleCancel(e) {
+  async function handleUninstall(e) {
     e.stopPropagation();
     try {
-      await api.delete(`/appstore/modules/${module.name}/install`);
+      await api.delete(`/appstore/modules/${module.name}`);
     } catch (err) {
-      showToast(err.message || 'Cancel failed', 'error');
+      showToast(err.message || 'Uninstall request failed', 'error');
     }
   }
 
-  async function handleUninstall(e) {
+  async function handleCancel(e) {
     e.stopPropagation();
-    if (busy) return;
-    setBusy(true);
+    const kind = jobKind || 'install';
     try {
-      await api.delete(`/appstore/modules/${module.name}`);
-      if (onUninstall) onUninstall();
+      await api.delete(`/appstore/modules/${module.name}/${kind}`);
     } catch (err) {
-      console.error('Uninstall failed:', err);
-    } finally {
-      setBusy(false);
+      showToast(err.message || 'Cancel failed', 'error');
     }
   }
 
@@ -656,10 +662,10 @@ function ModuleCard({ module, installed, installJob, updateInfo, onClick, onInst
                   fontSize: '0.7rem'
                 }}>INSTALLED</span>
               )}
-              {hasUpdate && (
+              {hasUpdate && !installJob && (
                 <button
                   onClick={(e) => { e.stopPropagation(); onUpdate && onUpdate(); }}
-                  disabled={busy || updating}
+                  disabled={updating}
                   style={{
                     background: 'rgba(230, 126, 34, 0.15)',
                     color: '#e67e22',
@@ -667,25 +673,71 @@ function ModuleCard({ module, installed, installJob, updateInfo, onClick, onInst
                     padding: '3px 8px',
                     borderRadius: '4px',
                     fontSize: '0.7rem',
-                    cursor: busy || updating ? 'not-allowed' : 'pointer',
-                    opacity: busy || updating ? 0.5 : 1
+                    cursor: updating ? 'not-allowed' : 'pointer',
+                    opacity: updating ? 0.5 : 1
                   }}
                 >{updating ? '...' : 'Update'}</button>
               )}
-              <button
-                onClick={handleUninstall}
-                disabled={busy}
-                style={{
-                  background: 'rgba(248, 113, 113, 0.15)',
-                  color: '#f87171',
-                  border: '1px solid rgba(248, 113, 113, 0.3)',
+              {jobKind === 'uninstall' && jobStatus === 'queued' ? (
+                <>
+                  <span style={{
+                    background: 'rgba(136, 136, 136, 0.15)',
+                    color: '#aaa',
+                    border: '1px solid rgba(136, 136, 136, 0.3)',
+                    padding: '3px 8px',
+                    borderRadius: '4px',
+                    fontSize: '0.7rem'
+                  }}>Queued</span>
+                  <button
+                    onClick={handleCancel}
+                    style={{
+                      background: 'rgba(248, 113, 113, 0.15)',
+                      color: '#f87171',
+                      border: '1px solid rgba(248, 113, 113, 0.3)',
+                      padding: '3px 8px',
+                      borderRadius: '4px',
+                      fontSize: '0.7rem',
+                      cursor: 'pointer'
+                    }}
+                  >Cancel</button>
+                </>
+              ) : jobKind === 'uninstall' && jobStatus === 'running' ? (
+                <span style={{
+                  background: 'rgba(237, 66, 69, 0.15)',
+                  color: '#ed4245',
+                  border: '1px solid rgba(237, 66, 69, 0.3)',
                   padding: '3px 8px',
                   borderRadius: '4px',
-                  fontSize: '0.7rem',
-                  cursor: busy ? 'not-allowed' : 'pointer',
-                  opacity: busy ? 0.5 : 1
-                }}
-              >{busy ? '...' : 'Uninstall'}</button>
+                  fontSize: '0.7rem'
+                }}>Uninstalling…</span>
+              ) : jobKind === 'uninstall' && jobStatus === 'failed' ? (
+                <button
+                  onClick={handleUninstall}
+                  title={installJob?.error || 'Uninstall failed'}
+                  style={{
+                    background: 'rgba(237, 66, 69, 0.15)',
+                    color: '#ed4245',
+                    border: '1px solid rgba(237, 66, 69, 0.3)',
+                    padding: '3px 8px',
+                    borderRadius: '4px',
+                    fontSize: '0.7rem',
+                    cursor: 'pointer'
+                  }}
+                >Retry</button>
+              ) : (
+                <button
+                  onClick={handleUninstall}
+                  style={{
+                    background: 'rgba(248, 113, 113, 0.15)',
+                    color: '#f87171',
+                    border: '1px solid rgba(248, 113, 113, 0.3)',
+                    padding: '3px 8px',
+                    borderRadius: '4px',
+                    fontSize: '0.7rem',
+                    cursor: 'pointer'
+                  }}
+                >Uninstall</button>
+              )}
             </>
           ) : jobStatus === 'queued' ? (
             <>
@@ -775,6 +827,7 @@ function ModuleDetailView({ module, installed, installJob, onBack, onInstall, on
   const [showCredentialsForm, setShowCredentialsForm] = useState(false);
   const [credentials, setCredentials] = useState({});
   const [components, setComponents] = useState(null);
+  const jobKind = installJob?.kind || null;
   const jobStatus = installJob?.status || null;
 
   // Fetch detailed module info (with components) on mount
@@ -801,9 +854,10 @@ function ModuleDetailView({ module, installed, installJob, onBack, onInstall, on
   }
 
   async function handleCancel() {
+    const kind = jobKind || 'install';
     try {
       setError(null);
-      await api.delete(`/appstore/modules/${module.name}/install`);
+      await api.delete(`/appstore/modules/${module.name}/${kind}`);
     } catch (err) {
       setError(err.message);
     }
@@ -812,18 +866,13 @@ function ModuleDetailView({ module, installed, installJob, onBack, onInstall, on
   async function handleUninstall() {
     if (!confirm(`Uninstall ${module.displayName || module.name}? This will remove all module files.`)) return;
     try {
-      setInstalling(true);
       setError(null);
       const res = await api.delete(`/appstore/modules/${module.name}`);
       if (res.success) {
-        showSuccess(`${module.displayName || module.name} uninstalled.`);
-        onUninstall();
-        onBack();
+        showSuccess(`${module.displayName || module.name} queued for uninstall.`);
       }
     } catch (err) {
       setError(err.message);
-    } finally {
-      setInstalling(false);
     }
   }
 
@@ -986,18 +1035,41 @@ function ModuleDetailView({ module, installed, installJob, onBack, onInstall, on
             </button>
           ) : (
             <>
-              <button
-                className="button"
-                onClick={handleUninstall}
-                disabled={installing}
-                style={{
-                  background: installing ? '#555' : '#ed4245',
-                  border: 'none',
-                  padding: '12px 25px'
-                }}
-              >
-                {installing ? 'Processing...' : 'Uninstall'}
-              </button>
+              {jobKind === 'uninstall' && jobStatus === 'queued' ? (
+                <>
+                  <span className="button" style={{ background: '#555', border: 'none', padding: '12px 25px', cursor: 'default' }}>
+                    Queued
+                  </span>
+                  <button
+                    className="button"
+                    onClick={handleCancel}
+                    style={{ background: '#ed4245', border: 'none', padding: '12px 25px' }}
+                  >
+                    Cancel
+                  </button>
+                </>
+              ) : jobKind === 'uninstall' && jobStatus === 'running' ? (
+                <span className="button" style={{ background: '#ed4245', border: 'none', padding: '12px 25px', cursor: 'default' }}>
+                  Uninstalling…
+                </span>
+              ) : jobKind === 'uninstall' && jobStatus === 'failed' ? (
+                <button
+                  className="button"
+                  onClick={handleUninstall}
+                  title={installJob?.error || 'Uninstall failed'}
+                  style={{ background: '#ed4245', border: 'none', padding: '12px 25px' }}
+                >
+                  Retry Uninstall
+                </button>
+              ) : (
+                <button
+                  className="button"
+                  onClick={handleUninstall}
+                  style={{ background: '#ed4245', border: 'none', padding: '12px 25px' }}
+                >
+                  Uninstall
+                </button>
+              )}
               {module.apiCredentials && (
                 <button
                   className="button"

@@ -20,14 +20,22 @@ export async function startWebUI(botManager: BotManager): Promise<void> {
   const wsManager = new WebSocketManager(httpServer);
   botManager.setWebSocketManager(wsManager);
 
-  // Wire install queue events → WebSocket broadcasts
+  // Wire install/uninstall queue events → WebSocket broadcasts
   const installQueue = getInstallQueue();
   installQueue.setBotManager(botManager);
-  installQueue.on('enqueued',  job => wsManager.broadcast('appstore:install:queued',    job));
-  installQueue.on('started',   job => wsManager.broadcast('appstore:install:started',   job));
-  installQueue.on('completed', job => wsManager.broadcast('appstore:install:completed', job));
-  installQueue.on('failed',    job => wsManager.broadcast('appstore:install:failed',    job));
-  installQueue.on('cancelled', job => wsManager.broadcast('appstore:install:cancelled', job));
+  const queueEventMap: Record<string, 'queued' | 'started' | 'completed' | 'failed' | 'cancelled'> = {
+    enqueued: 'queued',
+    started: 'started',
+    completed: 'completed',
+    failed: 'failed',
+    cancelled: 'cancelled'
+  };
+  for (const [internalEvent, suffix] of Object.entries(queueEventMap)) {
+    installQueue.on(internalEvent, (job: any) => {
+      const channel = `appstore:${job.kind}:${suffix}` as const;
+      wsManager.broadcast(channel as any, job);
+    });
+  }
 
   // Set up graceful shutdown handlers
   const shutdown = async (signal: string) => {

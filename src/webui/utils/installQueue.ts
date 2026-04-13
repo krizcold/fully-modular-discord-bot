@@ -2,8 +2,9 @@ import { EventEmitter } from 'events';
 import * as fs from 'fs';
 import * as path from 'path';
 import { getAppStoreManager } from '../../bot/internalSetup/utils/appStoreManager';
-import { getSourceModulesDir, getModulesDir } from '../../bot/internalSetup/utils/pathHelpers';
 import type { BotManager } from '../botManager';
+
+export type JobKind = 'install' | 'uninstall';
 
 export type InstallJobStatus =
   | 'queued'
@@ -14,20 +15,44 @@ export type InstallJobStatus =
 
 export interface InstallJob {
   id: string;
+  kind: JobKind;
   moduleName: string;
-  repoId: string;
+  repoId?: string;
   credentials?: Record<string, string>;
   status: InstallJobStatus;
   enqueuedAt: number;
   startedAt?: number;
   finishedAt?: number;
   error?: string;
-  loaded?: boolean;
+  loaded?: boolean;     // install: hot-load result
+  unloaded?: boolean;   // uninstall: hot-unload result
+  skipped?: boolean;    // idempotent no-op
 }
 
 export type CancelResult =
   | { ok: true; job: InstallJob }
-  | { ok: false; reason: 'not-found' | 'already-running' | 'already-finished' };
+  | { ok: false; reason: 'not-found' | 'already-running' };
+
+const APPSTORE_CONFIG_DIR = path.join(process.env.DATA_DIR || '/data', 'global', 'appstore');
+const COMPONENT_CONFIG_PATH = path.join(APPSTORE_CONFIG_DIR, 'component-config.json');
+
+function cleanupComponentConfig(moduleName: string): void {
+  try {
+    if (!fs.existsSync(COMPONENT_CONFIG_PATH)) return;
+    const config = JSON.parse(fs.readFileSync(COMPONENT_CONFIG_PATH, 'utf-8'));
+    const prefix = `${moduleName}:`;
+    let cleaned = false;
+    for (const key of Object.keys(config)) {
+      if (key.startsWith(prefix)) {
+        delete config[key];
+        cleaned = true;
+      }
+    }
+    if (cleaned) fs.writeFileSync(COMPONENT_CONFIG_PATH, JSON.stringify(config, null, 2));
+  } catch {
+    /* non-fatal */
+  }
+}
 
 let instance: InstallQueue | null = null;
 
@@ -41,39 +66,23 @@ export class InstallQueue extends EventEmitter {
     this.botManager = botManager;
   }
 
-  enqueue(
+  enqueueInstall(
     moduleName: string,
     repoId: string,
     credentials?: Record<string, string>
   ): InstallJob {
-    const existing = this.jobs.find(
-      j =>
-        j.moduleName === moduleName &&
-        (j.status === 'queued' || j.status === 'running')
-    );
-    if (existing) {
+    const latestPending = this.getLatestPending(moduleName);
+    if (latestPending && latestPending.kind === 'install') {
       const err: any = new Error(
-        `Module ${moduleName} is already ${existing.status === 'running' ? 'being installed' : 'queued for install'}`
+        `Module ${moduleName} is already ${latestPending.status === 'running' ? 'being installed' : 'queued for install'}`
       );
       err.code = 'DUPLICATE';
       throw err;
     }
 
-    const sourceDir = path.join(getSourceModulesDir(), moduleName);
-    const runtimeDir = path.join(getModulesDir(), moduleName);
-    const manager = getAppStoreManager();
-    if (
-      manager.isModuleInstalled(moduleName) ||
-      fs.existsSync(sourceDir) ||
-      fs.existsSync(runtimeDir)
-    ) {
-      const err: any = new Error(`Module ${moduleName} is already installed`);
-      err.code = 'ALREADY_INSTALLED';
-      throw err;
-    }
-
     const job: InstallJob = {
-      id: `install-${Date.now()}-${++this.jobCounter}`,
+      id: `op-${Date.now()}-${++this.jobCounter}`,
+      kind: 'install',
       moduleName,
       repoId,
       credentials,
@@ -86,32 +95,62 @@ export class InstallQueue extends EventEmitter {
     return job;
   }
 
-  requestCancel(moduleName: string): CancelResult {
-    const job = this.jobs.find(
-      j => j.moduleName === moduleName && (j.status === 'queued' || j.status === 'running')
-    );
-    if (!job) {
-      return { ok: false, reason: 'not-found' };
+  enqueueUninstall(moduleName: string): InstallJob {
+    const latestPending = this.getLatestPending(moduleName);
+    if (latestPending && latestPending.kind === 'uninstall') {
+      const err: any = new Error(
+        `Module ${moduleName} is already ${latestPending.status === 'running' ? 'being uninstalled' : 'queued for uninstall'}`
+      );
+      err.code = 'DUPLICATE';
+      throw err;
     }
-    if (job.status === 'running') {
-      return { ok: false, reason: 'already-running' };
+
+    const job: InstallJob = {
+      id: `op-${Date.now()}-${++this.jobCounter}`,
+      kind: 'uninstall',
+      moduleName,
+      status: 'queued',
+      enqueuedAt: Date.now()
+    };
+    this.jobs.push(job);
+    this.emit('enqueued', this.redact(job));
+    this.pump();
+    return job;
+  }
+
+  /**
+   * Cancel the latest pending op of the given kind for a module.
+   * Returns already-running if the latest op of that kind is already running.
+   */
+  requestCancel(moduleName: string, kind: JobKind): CancelResult {
+    let latest: InstallJob | undefined;
+    for (let i = this.jobs.length - 1; i >= 0; i--) {
+      const j = this.jobs[i];
+      if (j.moduleName !== moduleName || j.kind !== kind) continue;
+      if (j.status !== 'queued' && j.status !== 'running') continue;
+      latest = j;
+      break;
     }
-    job.status = 'cancelled';
-    job.finishedAt = Date.now();
-    this.emit('cancelled', this.redact(job));
+    if (!latest) return { ok: false, reason: 'not-found' };
+    if (latest.status === 'running') return { ok: false, reason: 'already-running' };
+    latest.status = 'cancelled';
+    latest.finishedAt = Date.now();
+    this.emit('cancelled', this.redact(latest));
     this.prune();
-    return { ok: true, job: this.redact(job) };
+    return { ok: true, job: this.redact(latest) };
   }
 
   getSnapshot(): InstallJob[] {
     return this.jobs.map(j => this.redact(j));
   }
 
-  getJob(moduleName: string): InstallJob | undefined {
-    const job = this.jobs.find(
-      j => j.moduleName === moduleName && (j.status === 'queued' || j.status === 'running')
-    );
-    return job ? this.redact(job) : undefined;
+  private getLatestPending(moduleName: string): InstallJob | undefined {
+    for (let i = this.jobs.length - 1; i >= 0; i--) {
+      const j = this.jobs[i];
+      if (j.moduleName !== moduleName) continue;
+      if (j.status === 'queued' || j.status === 'running') return j;
+    }
+    return undefined;
   }
 
   private redact(job: InstallJob): InstallJob {
@@ -132,26 +171,11 @@ export class InstallQueue extends EventEmitter {
     const manager = getAppStoreManager();
 
     try {
-      if (next.credentials && typeof next.credentials === 'object') {
-        manager.saveCredentials(next.moduleName, next.credentials);
+      if (next.kind === 'install') {
+        await this.runInstall(next, manager);
+      } else {
+        await this.runUninstall(next, manager);
       }
-
-      await manager.installModule(next.moduleName, next.repoId);
-
-      let loaded = false;
-      if (this.botManager) {
-        try {
-          const loadResult = await this.botManager.loadModule(next.moduleName);
-          loaded = loadResult?.success === true;
-        } catch {
-          loaded = false;
-        }
-      }
-
-      next.status = 'completed';
-      next.loaded = loaded;
-      next.finishedAt = Date.now();
-      this.emit('completed', this.redact(next));
     } catch (error) {
       next.status = 'failed';
       next.error = error instanceof Error ? error.message : String(error);
@@ -162,6 +186,74 @@ export class InstallQueue extends EventEmitter {
       this.prune();
       queueMicrotask(() => this.pump());
     }
+  }
+
+  private async runInstall(job: InstallJob, manager: ReturnType<typeof getAppStoreManager>): Promise<void> {
+    // Idempotent: if already installed at run time, succeed as no-op.
+    if (manager.isModuleInstalled(job.moduleName)) {
+      job.status = 'completed';
+      job.loaded = true;
+      job.skipped = true;
+      job.finishedAt = Date.now();
+      this.emit('completed', this.redact(job));
+      return;
+    }
+
+    if (!job.repoId) {
+      throw new Error('Repository ID missing for install job');
+    }
+
+    if (job.credentials && typeof job.credentials === 'object') {
+      manager.saveCredentials(job.moduleName, job.credentials);
+    }
+
+    await manager.installModule(job.moduleName, job.repoId);
+
+    let loaded = false;
+    if (this.botManager) {
+      try {
+        const loadResult = await this.botManager.loadModule(job.moduleName);
+        loaded = loadResult?.success === true;
+      } catch {
+        loaded = false;
+      }
+    }
+
+    job.status = 'completed';
+    job.loaded = loaded;
+    job.finishedAt = Date.now();
+    this.emit('completed', this.redact(job));
+  }
+
+  private async runUninstall(job: InstallJob, manager: ReturnType<typeof getAppStoreManager>): Promise<void> {
+    // Idempotent: if not installed at run time, succeed as no-op.
+    if (!manager.isModuleInstalled(job.moduleName)) {
+      job.status = 'completed';
+      job.unloaded = true;
+      job.skipped = true;
+      job.finishedAt = Date.now();
+      this.emit('completed', this.redact(job));
+      return;
+    }
+
+    await manager.uninstallModule(job.moduleName);
+
+    let unloaded = false;
+    if (this.botManager) {
+      try {
+        const unloadResult = await this.botManager.unloadModule(job.moduleName);
+        unloaded = unloadResult?.success === true;
+      } catch {
+        unloaded = false;
+      }
+    }
+
+    cleanupComponentConfig(job.moduleName);
+
+    job.status = 'completed';
+    job.unloaded = unloaded;
+    job.finishedAt = Date.now();
+    this.emit('completed', this.redact(job));
   }
 
   private prune(): void {
