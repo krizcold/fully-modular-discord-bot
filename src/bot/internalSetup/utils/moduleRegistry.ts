@@ -85,7 +85,25 @@ export class ModuleRegistry {
       // panelManager may not be initialized yet
     }
 
-    // 4. Clear require/import cache for all files this module imported
+    // 4. Remove interaction handlers (button/modal/dropdown) this module registered.
+    //    Captured via before/after diff in registerReloadedModule. Prevents the
+    //    "Overwriting existing handler" warnings on subsequent reloads and keeps
+    //    stale handler closures from lingering on the client after unload.
+    let removedInteractions = 0;
+    if (this.client && module.registeredInteractionIds) {
+      const c = this.client as any;
+      for (const id of module.registeredInteractionIds.buttons) {
+        if (c.buttonHandlers?.delete(id)) removedInteractions++;
+      }
+      for (const id of module.registeredInteractionIds.modals) {
+        if (c.modalHandlers?.delete(id)) removedInteractions++;
+      }
+      for (const id of module.registeredInteractionIds.dropdowns) {
+        if (c.dropdownHandlers?.delete(id)) removedInteractions++;
+      }
+    }
+
+    // 5. Clear require/import cache for all files this module imported
     for (const filePath of module.importedFiles) {
       const importPath = toImportPath(filePath);
       // Clear CommonJS require cache
@@ -97,11 +115,11 @@ export class ModuleRegistry {
       }
     }
 
-    // 5. Remove from registry
+    // 6. Remove from registry
     this.modules.delete(moduleName);
     this.exports.delete(moduleName);
 
-    console.log(`[ModuleRegistry] Unloaded ${moduleName}: ${removedListeners} listeners, ${removedPanels} panels removed`);
+    console.log(`[ModuleRegistry] Unloaded ${moduleName}: ${removedListeners} listeners, ${removedPanels} panels, ${removedInteractions} interaction handlers removed`);
     return true;
   }
 

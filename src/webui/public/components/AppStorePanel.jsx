@@ -67,15 +67,21 @@ function AppStorePanel() {
       setTiers(res.tiers || {});
       setGuildAssignments(res.guildAssignments || {});
 
-      // Hydrate queue from bundle (only pending/running; completed/failed come via WS)
-      const queue = Array.isArray(res.installQueue) ? res.installQueue : [];
-      const jobMap = {};
-      for (const j of queue) {
-        if (j.status === 'queued' || j.status === 'running' || j.status === 'failed') {
-          jobMap[j.moduleName] = j;
+      // Hydrate queue from bundle ONLY on first load. Subsequent refreshes must
+      // not overwrite installJobs, because the server snapshot is a stale HTTP
+      // snapshot while WS events are authoritative and fresher. Overwriting
+      // would race-flip a running uninstall back to queued, making the card
+      // render as "Installing" due to frontend branch logic.
+      if (!hasLoadedOnce.current) {
+        const queue = Array.isArray(res.installQueue) ? res.installQueue : [];
+        const jobMap = {};
+        for (const j of queue) {
+          if (j.status === 'queued' || j.status === 'running' || j.status === 'failed') {
+            jobMap[j.moduleName] = j;
+          }
         }
+        setInstallJobs(jobMap);
       }
-      setInstallJobs(jobMap);
     } catch (err) {
       setError(err.message);
     } finally {
@@ -519,7 +525,7 @@ function CommandsView({ showSuccess, setError }) {
                                 <span style={{ color: '#2dd4a8', fontFamily: 'monospace' }}>{opt.name}</span>
                                 <span style={{ color: '#555', fontSize: '0.7rem' }}>{opt.type}</span>
                                 {opt.required && <span style={{ color: '#ed4245', fontSize: '0.68rem' }}>required</span>}
-                                {opt.description && <span style={{ color: '#666' }}>— {opt.description}</span>}
+                                {opt.description && <span style={{ color: '#666' }}>- {opt.description}</span>}
                               </div>
                             ))}
                           </div>
@@ -709,7 +715,7 @@ function ModuleCard({ module, installed, installJob, updateInfo, onClick, onInst
                   padding: '3px 8px',
                   borderRadius: '4px',
                   fontSize: '0.7rem'
-                }}>Uninstalling…</span>
+                }}>Uninstalling...</span>
               ) : jobKind === 'uninstall' && jobStatus === 'failed' ? (
                 <button
                   onClick={handleUninstall}
@@ -739,7 +745,7 @@ function ModuleCard({ module, installed, installJob, updateInfo, onClick, onInst
                 >Uninstall</button>
               )}
             </>
-          ) : jobStatus === 'queued' ? (
+          ) : jobKind === 'install' && jobStatus === 'queued' ? (
             <>
               <span style={{
                 background: 'rgba(136, 136, 136, 0.15)',
@@ -762,7 +768,7 @@ function ModuleCard({ module, installed, installJob, updateInfo, onClick, onInst
                 }}
               >Cancel</button>
             </>
-          ) : jobStatus === 'running' ? (
+          ) : jobKind === 'install' && jobStatus === 'running' ? (
             <span style={{
               background: 'rgba(88, 101, 242, 0.15)',
               color: '#5865F2',
@@ -770,8 +776,8 @@ function ModuleCard({ module, installed, installJob, updateInfo, onClick, onInst
               padding: '3px 8px',
               borderRadius: '4px',
               fontSize: '0.7rem'
-            }}>Installing…</span>
-          ) : jobStatus === 'failed' ? (
+            }}>Installing...</span>
+          ) : jobKind === 'install' && jobStatus === 'failed' ? (
             <button
               onClick={handleInstall}
               title={installJob?.error || 'Install failed'}
@@ -1010,7 +1016,7 @@ function ModuleDetailView({ module, installed, installJob, onBack, onInstall, on
             </>
           ) : !installed && jobStatus === 'running' ? (
             <span className="button" style={{ background: '#5865F2', border: 'none', padding: '12px 25px', cursor: 'default' }}>
-              Installing…
+              Installing...
             </span>
           ) : !installed && jobStatus === 'failed' ? (
             <button
@@ -1050,7 +1056,7 @@ function ModuleDetailView({ module, installed, installJob, onBack, onInstall, on
                 </>
               ) : jobKind === 'uninstall' && jobStatus === 'running' ? (
                 <span className="button" style={{ background: '#ed4245', border: 'none', padding: '12px 25px', cursor: 'default' }}>
-                  Uninstalling…
+                  Uninstalling...
                 </span>
               ) : jobKind === 'uninstall' && jobStatus === 'failed' ? (
                 <button

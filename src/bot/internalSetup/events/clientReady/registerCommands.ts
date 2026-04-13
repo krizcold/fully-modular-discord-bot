@@ -279,7 +279,11 @@ export default async function registerCommands(
         }
       }
     } else if (!cleanupEnabled && globalCommands) {
-      console.log('[i] Auto-cleanup disabled — skipping orphan global command removal');
+      if (!runOrphanCleanup) {
+        console.log('[i] Skipping orphan global command sweep (hot-reload context, targeted cleanup handled per module)');
+      } else {
+        console.log('[i] Auto-cleanup disabled, skipping orphan global command removal');
+      }
     }
 
     // Remove local (guild) commands that are no longer present locally or shouldn't be local
@@ -312,7 +316,11 @@ export default async function registerCommands(
         }
       }
     } else {
-      console.log('[i] Auto-cleanup disabled — skipping orphan guild command removal');
+      if (!runOrphanCleanup) {
+        console.log('[i] Skipping orphan guild command sweep (hot-reload context, targeted cleanup handled per module)');
+      } else {
+        console.log('[i] Auto-cleanup disabled, skipping orphan guild command removal');
+      }
     }
 
     // Save current test guild for future cleanup tracking

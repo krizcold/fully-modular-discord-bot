@@ -43,7 +43,7 @@ export function buildCommandPayload(commandDef: any): any {
  * Calls the existing registerCommands event handler (which handles
  * registration, updates, disabled commands, and optional orphan cleanup).
  *
- * Pass `{ runOrphanCleanup: false }` when calling from hot-reload paths —
+ * Pass `{ runOrphanCleanup: false }` when calling from hot-reload paths:
  * the in-memory ModuleRegistry is transient during install/uninstall, so the
  * full orphan sweep can wrongly delete valid commands. Startup (clientReady)
  * callers should omit the option so the sweep runs normally.

@@ -4,7 +4,7 @@
  * Orchestrates the hot-reload cycle for modules:
  * unload → recompile → clear cache → re-import → register → re-attach events/panels
  *
- * Delegates actual module loading to ModuleLoader.loadModule() — single source of truth.
+ * Delegates actual module loading to ModuleLoader.loadModule(), single source of truth.
  * Handles both single module and bulk reload.
  */
 
@@ -155,7 +155,7 @@ function findModuleManifestPath(moduleName: string): string | null {
 
 /**
  * After loading a module, register its events/panels/commands and call lifecycle hooks.
- * ModuleLoader.loadModule() only creates the LoadedModule — it doesn't attach to the client.
+ * ModuleLoader.loadModule() only creates the LoadedModule, it doesn't attach to the client.
  */
 async function registerReloadedModule(client: Client, module: LoadedModule): Promise<void> {
   const registry = getModuleRegistry();
@@ -170,6 +170,16 @@ async function registerReloadedModule(client: Client, module: LoadedModule): Pro
       }
     }
   }
+
+  // Snapshot interaction handler keys BEFORE panel registration, command
+  // initializers, and lifecycle hooks. Panels call panel.initialize(client)
+  // inside panelManager.registerPanel, which can register button/modal/dropdown
+  // handlers, so the snapshot has to happen before that call too. On unload,
+  // the diff-captured keys are removed from client maps, preventing the
+  // "Overwriting existing handler" warning on subsequent reloads.
+  const bBefore = new Set(Array.from(((client as any).buttonHandlers ?? new Map()).keys()));
+  const mBefore = new Set(Array.from(((client as any).modalHandlers ?? new Map()).keys()));
+  const dBefore = new Set(Array.from(((client as any).dropdownHandlers ?? new Map()).keys()));
 
   // Register panels
   try {
@@ -222,6 +232,17 @@ async function registerReloadedModule(client: Client, module: LoadedModule): Pro
     }
   }
 
+  // Diff AFTER initializers and hooks: any new interaction-handler keys were
+  // registered by this module and must be cleaned up when it unloads.
+  const bAfter = Array.from(((client as any).buttonHandlers ?? new Map()).keys()) as string[];
+  const mAfter = Array.from(((client as any).modalHandlers ?? new Map()).keys()) as string[];
+  const dAfter = Array.from(((client as any).dropdownHandlers ?? new Map()).keys()) as string[];
+  module.registeredInteractionIds = {
+    buttons: bAfter.filter(k => !bBefore.has(k)),
+    modals: mAfter.filter(k => !mBefore.has(k)),
+    dropdowns: dAfter.filter(k => !dBefore.has(k))
+  };
+
   // Re-apply component toggle state (keep disabled components off after reload)
   await applyComponentToggleState(client, module);
 
@@ -246,11 +267,11 @@ export async function reloadModule(client: Client, moduleName: string): Promise<
 
     // Atomic swap: prepare the new module BEFORE touching the registry.
     // If any of recompile / manifest discovery / load fails, the old module
-    // stays registered — prevents a mid-flight failure from leaving the
+    // stays registered; prevents a mid-flight failure from leaving the
     // registry missing this module (which would cause orphan-sweeps to
     // wrongly delete its commands later).
 
-    // 1. Recompile (incremental — only changed files)
+    // 1. Recompile (incremental, only changed files)
     const compile = await recompileTypeScript();
     if (!compile.success) {
       return { success: false, moduleName, error: `Compilation failed: ${compile.error}`, duration: Date.now() - start };
@@ -265,7 +286,7 @@ export async function reloadModule(client: Client, moduleName: string): Promise<
     const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8'));
     const modulePath = path.dirname(manifestPath);
 
-    // 3. Load via ModuleLoader (single source of truth) — produces the new module.
+    // 3. Load via ModuleLoader (single source of truth); produces the new module.
     const loader = new ModuleLoader(client);
     const newModule = await loader.loadModule(manifest, modulePath);
 
@@ -293,7 +314,7 @@ export async function reloadModule(client: Client, moduleName: string): Promise<
 
 /**
  * Unload a module from memory (for uninstall).
- * Removes events, panels, commands, cache — module is fully gone from runtime.
+ * Removes events, panels, commands, cache. Module is fully gone from runtime.
  */
 export async function unloadModuleFromMemory(client: Client, moduleName: string): Promise<ReloadResult> {
   if (reloadingModules.has(moduleName)) {
@@ -394,7 +415,7 @@ export async function reloadModules(client: Client, moduleNames: string[]): Prom
     }
 
     // 4. Re-register slash commands once (covers all reloaded modules).
-    //    Skip orphan sweep — registry is transient during hot-reload.
+    //    Skip orphan sweep: registry is transient during hot-reload.
     if (result.reloaded.length > 0) {
       await reRegisterSlashCommands(client, { runOrphanCleanup: false });
     }

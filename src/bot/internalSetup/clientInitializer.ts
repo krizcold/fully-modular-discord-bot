@@ -353,14 +353,72 @@ async function loadEventHandlers(client: Client) {
 function runInitializers(client: Client) {
   console.log(`[Initializer] Running initialization for ${modulesToInitialize.length} modules...`);
   if (modulesToInitialize.length === 0) { return; }
-  for (const module of modulesToInitialize) {
-    let moduleName = module?.name || module?.default?.name || 'Unnamed Module';
+
+  // Group initializers by owning module so we can snapshot/diff interaction
+  // handler registrations per module. This populates LoadedModule.registeredInteractionIds
+  // for startup-loaded modules, letting unloadModule later clean up the exact
+  // customIds/prefixes this module registered (no "Overwriting existing handler"
+  // warnings on subsequent reloads).
+  const registry = getModuleRegistry();
+  const loadedModules = registry.getAllModules();
+  const commandToModule = new Map<any, LoadedModule>();
+  for (const mod of loadedModules) {
+    for (const cmd of mod.commands) commandToModule.set(cmd, mod);
+  }
+
+  const byModule = new Map<string, any[]>();
+  const unattributed: any[] = [];
+  for (const cmd of modulesToInitialize) {
+    const mod = commandToModule.get(cmd);
+    if (mod) {
+      const arr = byModule.get(mod.manifest.name) ?? [];
+      arr.push(cmd);
+      byModule.set(mod.manifest.name, arr);
+    } else {
+      unattributed.push(cmd);
+    }
+  }
+
+  // Internal / unattributed commands: run without per-module tracking.
+  for (const command of unattributed) {
+    const moduleName = command?.name || command?.default?.name || 'Unnamed Module';
     try {
-      module.initialize(client);
+      command.initialize(client);
     } catch (error) {
       console.error(`[Initializer] Error running initialize function for module: ${moduleName}`, error);
     }
   }
+
+  // Per-module: snapshot interaction keys before, run initializers, diff after.
+  for (const mod of loadedModules) {
+    const cmds = byModule.get(mod.manifest.name);
+    if (!cmds || cmds.length === 0) continue;
+
+    const c = client as any;
+    const bBefore = new Set(Array.from(c.buttonHandlers?.keys() ?? []));
+    const mBefore = new Set(Array.from(c.modalHandlers?.keys() ?? []));
+    const dBefore = new Set(Array.from(c.dropdownHandlers?.keys() ?? []));
+
+    for (const command of cmds) {
+      const moduleName = command?.name || 'Unnamed Module';
+      try {
+        command.initialize(client);
+      } catch (error) {
+        console.error(`[Initializer] Error running initialize function for module: ${moduleName}`, error);
+      }
+    }
+
+    const bAfter = Array.from(c.buttonHandlers?.keys() ?? []) as string[];
+    const mAfter = Array.from(c.modalHandlers?.keys() ?? []) as string[];
+    const dAfter = Array.from(c.dropdownHandlers?.keys() ?? []) as string[];
+    const existing = mod.registeredInteractionIds ?? { buttons: [], modals: [], dropdowns: [] };
+    mod.registeredInteractionIds = {
+      buttons: [...existing.buttons, ...bAfter.filter(k => !bBefore.has(k))],
+      modals: [...existing.modals, ...mAfter.filter(k => !mBefore.has(k))],
+      dropdowns: [...existing.dropdowns, ...dAfter.filter(k => !dBefore.has(k))]
+    };
+  }
+
   console.log(`[Initializer] Initialization complete.`);
 }
 
@@ -418,15 +476,34 @@ async function main() {
     const panelManager = getPanelManager(client);
     await panelManager.loadPanels();
 
-    // Register panels from loaded modules
+    // Register panels from loaded modules. Snapshot/diff per module so we
+    // can track which button/modal/dropdown handlers a panel registered via
+    // its initialize hook. Needed so unloadModule can clean them up cleanly.
     console.log('[Bot] Registering module panels...');
     let modulePanelCount = 0;
     for (const module of loadedModules) {
+      if (module.panels.length === 0) continue;
+
+      const c = client as any;
+      const bBefore = new Set(Array.from(c.buttonHandlers?.keys() ?? []));
+      const mBefore = new Set(Array.from(c.modalHandlers?.keys() ?? []));
+      const dBefore = new Set(Array.from(c.dropdownHandlers?.keys() ?? []));
+
       for (const panel of module.panels) {
         panelManager.registerPanel(panel);
         modulePanelCount++;
         console.log(`[Bot] Registered panel '${panel.id}' from module '${module.manifest.displayName}'`);
       }
+
+      const bAfter = Array.from(c.buttonHandlers?.keys() ?? []) as string[];
+      const mAfter = Array.from(c.modalHandlers?.keys() ?? []) as string[];
+      const dAfter = Array.from(c.dropdownHandlers?.keys() ?? []) as string[];
+      const existing = module.registeredInteractionIds ?? { buttons: [], modals: [], dropdowns: [] };
+      module.registeredInteractionIds = {
+        buttons: [...existing.buttons, ...bAfter.filter(k => !bBefore.has(k))],
+        modals: [...existing.modals, ...mAfter.filter(k => !mBefore.has(k))],
+        dropdowns: [...existing.dropdowns, ...dAfter.filter(k => !dBefore.has(k))]
+      };
     }
     console.log(`[Bot] Registered ${modulePanelCount} module panels`);
 

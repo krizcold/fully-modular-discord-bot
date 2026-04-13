@@ -191,6 +191,15 @@ export interface LoadedModule {
 
   /** All file paths that were imported for this module (for cache invalidation) */
   importedFiles: string[];
+
+  /** customIds/prefixes registered into client.buttonHandlers / modalHandlers / dropdownHandlers
+   * by this module's command initializers and hooks. Captured via before/after diff
+   * during registerReloadedModule so unload can clean them up without guessing. */
+  registeredInteractionIds?: {
+    buttons: string[];
+    modals: string[];
+    dropdowns: string[];
+  };
 }
 
 /**
