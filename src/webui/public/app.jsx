@@ -174,22 +174,21 @@ function App() {
 
   return (
     <div>
-      <div className="header" style={{ textAlign: 'center', position: 'relative' }}>
-        <h1 style={{ margin: '0', padding: '20px 0', color: '#a0a0a0' }}>Discord Bot System Settings</h1>
-        {window.BOT_BUILD && (
-          <span
-            title={`branch: ${window.BOT_BUILD.branch}\nbuild: ${window.BOT_BUILD.buildDate}\ncommit: ${window.BOT_BUILD.commit}`}
-            style={{ position: 'absolute', left: '20px', top: '50%', transform: 'translateY(-50%)', color: '#666', fontSize: '0.75rem', fontFamily: 'monospace', userSelect: 'text' }}
-          >
-            v{window.BOT_BUILD.version} · {window.BOT_BUILD.commitShort}
-          </span>
-        )}
-        {status && (
-          <span className={`status-badge ${status.running ? 'running' : status.crashed ? 'crashed' : 'stopped'}`}
-                style={{ position: 'absolute', right: '20px', top: '50%', transform: 'translateY(-50%)' }}>
-            {status.running ? '● Online' : status.crashed ? '⚠ Crashed' : '○ Offline'}
-          </span>
-        )}
+      <div className="header">
+        <span
+          style={{ minWidth: '140px', paddingLeft: '20px', color: '#666', fontSize: '0.75rem', fontFamily: 'monospace', userSelect: 'text' }}
+          title={window.BOT_BUILD ? `branch: ${window.BOT_BUILD.branch}\nbuild: ${window.BOT_BUILD.buildDate}\ncommit: ${window.BOT_BUILD.commit}` : 'running in dev mode'}
+        >
+          {window.BOT_BUILD ? `v${window.BOT_BUILD.version} · ${window.BOT_BUILD.commitShort}` : 'Development'}
+        </span>
+        <h1 style={{ margin: '0', padding: '20px 0', color: '#a0a0a0', flex: 1, textAlign: 'center' }}>Discord Bot System Settings</h1>
+        <span style={{ minWidth: '140px', paddingRight: '20px', textAlign: 'right' }}>
+          {status && (
+            <span className={`status-badge ${status.running ? 'running' : status.crashed ? 'crashed' : 'stopped'}`}>
+              {status.running ? '● Online' : status.crashed ? '⚠ Crashed' : '○ Offline'}
+            </span>
+          )}
+        </span>
       </div>
 
       <div className="tabs">
