@@ -169,6 +169,12 @@ fi
 echo "Copying assets (JS, JSON, CSS, HTML)..."
 cd /app/smdb-source && find . \( -name "*.js" -o -name "*.json" -o -name "*.css" -o -name "*.html" -o -name "*.jsx" \) -exec cp --parents {} /app/dist/ \;
 
+# **Copy baked-in build info** (version + commit, written during image build)
+if [ -f /app/build-info.js ]; then
+    mkdir -p /app/dist/webui/public
+    cp /app/build-info.js /app/dist/webui/public/build-info.js
+fi
+
 # **Write update marker** (tracks when dist was last built)
 date +%s > /app/dist/.update-marker
 

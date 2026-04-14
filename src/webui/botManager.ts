@@ -692,4 +692,21 @@ export class BotManager {
       return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
     }
   }
+
+  /**
+   * Ask the bot which modules are currently loaded in memory.
+   * Returns an array of module names, or null if the bot is not running / IPC fails.
+   */
+  async listLoadedModules(): Promise<string[] | null> {
+    if (!this.isRunning()) return null;
+    try {
+      const res: any = await this.sendIPCMessage('module:list-loaded', {});
+      if (res && res.success && Array.isArray(res.modules)) {
+        return res.modules.map((m: any) => m.name).filter((n: any) => typeof n === 'string');
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  }
 }

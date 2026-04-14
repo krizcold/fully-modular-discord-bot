@@ -26,8 +26,13 @@ function AppStorePanel() {
       loadData();
       if (job.kind === 'install') {
         if (job.skipped) return;
-        if (job.loaded === false) showToast(`${job.moduleName} installed. It will load on next bot start.`, 'info');
-        else showToast(`${job.moduleName} installed.`, 'success');
+        if (job.loaded === false) {
+          // Persistent notice: the module is on disk but commands did not register.
+          // Auto-dismiss would make this too easy to miss during rapid installs.
+          showToast(`${job.moduleName} installed, but failed to hot-load. Restart the bot to activate it.`, 'warning', { sticky: true });
+        } else {
+          showToast(`${job.moduleName} installed.`, 'success');
+        }
       } else {
         if (job.skipped) return;
         if (job.unloaded === false) showToast(`${job.moduleName} uninstalled. Changes apply on next bot start.`, 'info');
@@ -48,6 +53,10 @@ function AppStorePanel() {
       unsubs.push(wsClient.on(`appstore:${kind}:completed`, onCompleted));
       unsubs.push(wsClient.on(`appstore:${kind}:failed`, onFailed));
     }
+    // Refresh after bot startup so the per-module `loaded` state in the
+    // bundle response reflects reality (e.g., "Needs restart" pill clears
+    // once a previously-failed module loads on a fresh bot boot).
+    unsubs.push(wsClient.on('bot:startup', () => loadData()));
     return () => unsubs.forEach(u => u && u());
   }, []);
 
@@ -396,6 +405,7 @@ function ModulesView({ modules, installed, installJobs, categories, categoryFilt
               key={module.name}
               module={module}
               installed={!!installed[module.name]}
+              installedEntry={installed[module.name] || null}
               installJob={installJobs?.[module.name] || null}
               updateInfo={moduleUpdates?.[module.name] || null}
               onClick={() => onSelectModule(module)}
@@ -575,11 +585,15 @@ function CommandsView({ showSuccess, setError }) {
   );
 }
 
-function ModuleCard({ module, installed, installJob, updateInfo, onClick, onInstall, onUninstall, onUpdate, updating }) {
+function ModuleCard({ module, installed, installedEntry, installJob, updateInfo, onClick, onInstall, onUninstall, onUpdate, updating }) {
   const hasUpdate = !!updateInfo;
   const jobKind = installJob?.kind || null;
   const jobStatus = installJob?.status || null;
-  const borderColor = hasUpdate ? '#e67e22' : installed ? '#3ba55d' : jobStatus === 'running' ? '#5865F2' : jobStatus === 'queued' ? '#888' : jobStatus === 'failed' ? '#ed4245' : '#444';
+  // needsRestart: module is tracked as installed but the bot reports it's not
+  // loaded in memory. Happens when a hot-load failed after file copy succeeded.
+  // `loaded === null` means the bot isn't running, so we can't tell; don't warn.
+  const needsRestart = installed && installedEntry && installedEntry.loaded === false;
+  const borderColor = hasUpdate ? '#e67e22' : needsRestart ? '#f5af19' : installed ? '#3ba55d' : jobStatus === 'running' ? '#5865F2' : jobStatus === 'queued' ? '#888' : jobStatus === 'failed' ? '#ed4245' : '#444';
 
   async function handleInstall(e) {
     e.stopPropagation();
@@ -659,6 +673,18 @@ function ModuleCard({ module, installed, installJob, updateInfo, onClick, onInst
                   borderRadius: '4px',
                   fontSize: '0.7rem'
                 }}>UPDATE</span>
+              ) : needsRestart ? (
+                <span
+                  title="Module files are installed but the bot has not loaded them. Restart the bot to activate."
+                  style={{
+                    background: '#f5af19',
+                    color: '#000',
+                    padding: '3px 8px',
+                    borderRadius: '4px',
+                    fontSize: '0.7rem',
+                    fontWeight: 'bold'
+                  }}
+                >NEEDS RESTART</span>
               ) : (
                 <span style={{
                   background: '#3ba55d',

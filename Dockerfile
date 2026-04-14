@@ -53,6 +53,22 @@ COPY --chown=node:node pre-update.js /app/pre-update.js
 # Copy safety check script for crash loop prevention
 COPY --chown=node:node safety-check.js /app/safety-check.js
 
+# Capture git commit info at build time and bake into a static JS file.
+# The web-ui loads this synchronously to display version info without any
+# runtime API calls. Written to /app/build-info.js (persistent across dist
+# rebuilds) and copied into dist/webui/public/ by start.sh at container startup.
+# Temp copy of .git is removed after extraction so the final image stays small.
+COPY --chown=node:node .git /tmp/git-info/.git
+RUN set -e; \
+    COMMIT=$(git --git-dir=/tmp/git-info/.git rev-parse HEAD 2>/dev/null || echo "unknown"); \
+    SHORT=$(echo "$COMMIT" | cut -c1-7); \
+    BRANCH=$(git --git-dir=/tmp/git-info/.git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown"); \
+    BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ); \
+    VERSION=$(node -e "console.log(require('/app/package.json').version)" 2>/dev/null || echo "0.0.0"); \
+    printf 'window.BOT_BUILD = {"version":"%s","commit":"%s","commitShort":"%s","branch":"%s","buildDate":"%s"};\n' \
+      "$VERSION" "$COMMIT" "$SHORT" "$BRANCH" "$BUILD_DATE" > /app/build-info.js; \
+    rm -rf /tmp/git-info
+
 # Copy start script and give execution permissions
 COPY --chown=node:node start.sh /app/start.sh
 RUN chmod +x /app/start.sh

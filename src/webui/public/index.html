@@ -13,24 +13,49 @@
 <body>
   <div id="toast-container"></div>
   <div id="root"></div>
+  <!-- Baked build info (written by Dockerfile at image build time). Missing in dev is fine. -->
+  <script src="/build-info.js"></script>
   <!-- Utilities -->
   <script src="/utils/api.js"></script>
   <script src="/utils/websocket.js"></script>
   <script>
-    // Global toast notification system
-    window.showToast = function(message, type, duration) {
+    // Global toast notification system.
+    // Third arg accepts either a number (legacy ms duration) or an options object:
+    //   { duration?: number, sticky?: boolean }
+    // Sticky toasts do not auto-dismiss; user must click them.
+    window.showToast = function(message, type, opts) {
       type = type || 'info';
-      duration = duration || (type === 'error' ? 5000 : 3000);
+      var sticky = false;
+      var duration;
+      if (typeof opts === 'number') {
+        duration = opts;
+      } else if (opts && typeof opts === 'object') {
+        sticky = !!opts.sticky;
+        duration = opts.duration;
+      }
+      if (duration == null) {
+        if (type === 'error') duration = 10000;
+        else if (type === 'warning') duration = 12000;
+        else duration = 6000;
+      }
       var container = document.getElementById('toast-container');
       if (!container) return;
       var el = document.createElement('div');
-      el.className = 'toast toast-' + type;
+      el.className = 'toast toast-' + type + (sticky ? ' toast-sticky' : '');
       el.textContent = message;
+      if (sticky) {
+        var close = document.createElement('span');
+        close.textContent = ' \u00D7';
+        close.style.marginLeft = '10px';
+        close.style.cursor = 'pointer';
+        close.style.fontWeight = 'bold';
+        el.appendChild(close);
+      }
       el.onclick = function() { dismiss(); };
       container.appendChild(el);
-      var timer = setTimeout(dismiss, duration);
+      var timer = sticky ? null : setTimeout(dismiss, duration);
       function dismiss() {
-        clearTimeout(timer);
+        if (timer) clearTimeout(timer);
         if (!el.parentNode) return;
         el.classList.add('toast-out');
         el.addEventListener('animationend', function() { el.remove(); });

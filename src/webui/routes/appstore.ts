@@ -42,8 +42,19 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
       if (modules.length === 0 && manager.getRepositories().some(r => r.enabled)) {
         modules = await manager.getAvailableModules();
       }
-      const installed = manager.getInstalledModules();
+      const installedRaw = manager.getInstalledModules();
       const repos = manager.getRepositories();
+
+      // Cross-reference installed modules with what the bot has actually loaded
+      // into memory. A module can be on disk + tracked in installedConfig but
+      // not loaded if its last hot-load failed (compile error, import failure,
+      // etc). The frontend uses this to show a "Needs bot restart" pill.
+      const loadedNames = await botManager.listLoadedModules();
+      const loadedSet = loadedNames ? new Set(loadedNames) : null;
+      const installed = installedRaw.map(m => ({
+        ...m,
+        loaded: loadedSet ? loadedSet.has(m.name) : null
+      }));
 
       res.json({
         success: true,

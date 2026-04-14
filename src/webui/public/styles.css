@@ -343,6 +343,14 @@ body {
 .toast-error   { background: #d83c3e; }
 .toast-success { background: #3ba55d; }
 .toast-info    { background: #5865F2; }
+.toast-warning { background: #f5af19; color: #1a1a1a; }
+
+/* Sticky toasts stay visible until user clicks to dismiss.
+   Slight border so they read as distinct from auto-dismissing toasts. */
+.toast.toast-sticky {
+  border: 2px solid rgba(255, 255, 255, 0.35);
+  font-weight: 600;
+}
 
 @keyframes toast-in {
   from { opacity: 0; transform: translateY(-12px); }
