@@ -27,8 +27,6 @@ function AppStorePanel() {
       if (job.kind === 'install') {
         if (job.skipped) return;
         if (job.loaded === false) {
-          // Persistent notice: the module is on disk but commands did not register.
-          // Auto-dismiss would make this too easy to miss during rapid installs.
           showToast(`${job.moduleName} installed, but failed to hot-load. Restart the bot to activate it.`, 'warning', { sticky: true });
         } else {
           showToast(`${job.moduleName} installed.`, 'success');
@@ -53,9 +51,6 @@ function AppStorePanel() {
       unsubs.push(wsClient.on(`appstore:${kind}:completed`, onCompleted));
       unsubs.push(wsClient.on(`appstore:${kind}:failed`, onFailed));
     }
-    // Refresh after bot startup so the per-module `loaded` state in the
-    // bundle response reflects reality (e.g., "Needs restart" pill clears
-    // once a previously-failed module loads on a fresh bot boot).
     unsubs.push(wsClient.on('bot:startup', () => loadData()));
     return () => unsubs.forEach(u => u && u());
   }, []);
@@ -76,11 +71,8 @@ function AppStorePanel() {
       setTiers(res.tiers || {});
       setGuildAssignments(res.guildAssignments || {});
 
-      // Hydrate queue from bundle ONLY on first load. Subsequent refreshes must
-      // not overwrite installJobs, because the server snapshot is a stale HTTP
-      // snapshot while WS events are authoritative and fresher. Overwriting
-      // would race-flip a running uninstall back to queued, making the card
-      // render as "Installing" due to frontend branch logic.
+      // Hydrate queue only on first load. WS events are authoritative after that;
+      // overwriting with a stale HTTP snapshot would race-flip job states.
       if (!hasLoadedOnce.current) {
         const queue = Array.isArray(res.installQueue) ? res.installQueue : [];
         const jobMap = {};
@@ -589,9 +581,6 @@ function ModuleCard({ module, installed, installedEntry, installJob, updateInfo,
   const hasUpdate = !!updateInfo;
   const jobKind = installJob?.kind || null;
   const jobStatus = installJob?.status || null;
-  // needsRestart: module is tracked as installed but the bot reports it's not
-  // loaded in memory. Happens when a hot-load failed after file copy succeeded.
-  // `loaded === null` means the bot isn't running, so we can't tell; don't warn.
   const needsRestart = installed && installedEntry && installedEntry.loaded === false;
   const borderColor = hasUpdate ? '#e67e22' : needsRestart ? '#f5af19' : installed ? '#3ba55d' : jobStatus === 'running' ? '#5865F2' : jobStatus === 'queued' ? '#888' : jobStatus === 'failed' ? '#ed4245' : '#444';
 

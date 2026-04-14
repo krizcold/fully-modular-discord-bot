@@ -693,10 +693,6 @@ export class BotManager {
     }
   }
 
-  /**
-   * Ask the bot which modules are currently loaded in memory.
-   * Returns an array of module names, or null if the bot is not running / IPC fails.
-   */
   async listLoadedModules(): Promise<string[] | null> {
     if (!this.isRunning()) return null;
     try {

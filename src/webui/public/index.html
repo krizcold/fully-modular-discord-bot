@@ -13,16 +13,11 @@
 <body>
   <div id="toast-container"></div>
   <div id="root"></div>
-  <!-- Baked build info (written by Dockerfile at image build time). Missing in dev is fine. -->
   <script src="/build-info.js"></script>
-  <!-- Utilities -->
   <script src="/utils/api.js"></script>
   <script src="/utils/websocket.js"></script>
   <script>
-    // Global toast notification system.
-    // Third arg accepts either a number (legacy ms duration) or an options object:
-    //   { duration?: number, sticky?: boolean }
-    // Sticky toasts do not auto-dismiss; user must click them.
+    // Third arg: number (duration ms) or { duration?, sticky? }. Sticky toasts do not auto-dismiss.
     window.showToast = function(message, type, opts) {
       type = type || 'info';
       var sticky = false;

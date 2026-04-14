@@ -298,18 +298,11 @@ export class AppStoreManager {
     }
   }
 
-  /**
-   * Reconcile installed config with on-disk source modules directory.
-   * Handles leftovers from a crashed install (process killed between file copy and saveInstalled).
-   * - Orphan directory (on disk, not in config): delete to prevent "already installed" block on retry.
-   * - Stale config entry (in config, no directory): remove from config.
-   */
   private reconcileInstalledModules(): void {
     const sourceDir = getSourceModulesDir();
     if (!fs.existsSync(sourceDir)) return;
 
-    // In dev, getSourceModulesDir() collides with getModulesDir() where built-in
-    // modules live. Skip reconciliation to avoid deleting developer source trees.
+    // Skip when dirs collide (dev mode), otherwise we'd wipe built-in module source trees.
     if (sourceDir === getModulesDir()) {
       console.log('[AppStoreManager] Dev mode: skipping orphan reconciliation');
       return;

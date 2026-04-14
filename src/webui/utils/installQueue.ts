@@ -118,10 +118,6 @@ export class InstallQueue extends EventEmitter {
     return job;
   }
 
-  /**
-   * Cancel the latest pending op of the given kind for a module.
-   * Returns already-running if the latest op of that kind is already running.
-   */
   requestCancel(moduleName: string, kind: JobKind): CancelResult {
     let latest: InstallJob | undefined;
     for (let i = this.jobs.length - 1; i >= 0; i--) {
@@ -189,7 +185,6 @@ export class InstallQueue extends EventEmitter {
   }
 
   private async runInstall(job: InstallJob, manager: ReturnType<typeof getAppStoreManager>): Promise<void> {
-    // Idempotent: if already installed at run time, succeed as no-op.
     if (manager.isModuleInstalled(job.moduleName)) {
       job.status = 'completed';
       job.loaded = true;
@@ -226,7 +221,6 @@ export class InstallQueue extends EventEmitter {
   }
 
   private async runUninstall(job: InstallJob, manager: ReturnType<typeof getAppStoreManager>): Promise<void> {
-    // Idempotent: if not installed at run time, succeed as no-op.
     if (!manager.isModuleInstalled(job.moduleName)) {
       job.status = 'completed';
       job.unloaded = true;

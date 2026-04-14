@@ -354,11 +354,6 @@ function runInitializers(client: Client) {
   console.log(`[Initializer] Running initialization for ${modulesToInitialize.length} modules...`);
   if (modulesToInitialize.length === 0) { return; }
 
-  // Group initializers by owning module so we can snapshot/diff interaction
-  // handler registrations per module. This populates LoadedModule.registeredInteractionIds
-  // for startup-loaded modules, letting unloadModule later clean up the exact
-  // customIds/prefixes this module registered (no "Overwriting existing handler"
-  // warnings on subsequent reloads).
   const registry = getModuleRegistry();
   const loadedModules = registry.getAllModules();
   const commandToModule = new Map<any, LoadedModule>();
@@ -379,7 +374,6 @@ function runInitializers(client: Client) {
     }
   }
 
-  // Internal / unattributed commands: run without per-module tracking.
   for (const command of unattributed) {
     const moduleName = command?.name || command?.default?.name || 'Unnamed Module';
     try {
@@ -389,7 +383,6 @@ function runInitializers(client: Client) {
     }
   }
 
-  // Per-module: snapshot interaction keys before, run initializers, diff after.
   for (const mod of loadedModules) {
     const cmds = byModule.get(mod.manifest.name);
     if (!cmds || cmds.length === 0) continue;
@@ -476,9 +469,6 @@ async function main() {
     const panelManager = getPanelManager(client);
     await panelManager.loadPanels();
 
-    // Register panels from loaded modules. Snapshot/diff per module so we
-    // can track which button/modal/dropdown handlers a panel registered via
-    // its initialize hook. Needed so unloadModule can clean them up cleanly.
     console.log('[Bot] Registering module panels...');
     let modulePanelCount = 0;
     for (const module of loadedModules) {

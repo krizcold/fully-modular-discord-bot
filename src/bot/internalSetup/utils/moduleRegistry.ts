@@ -85,10 +85,6 @@ export class ModuleRegistry {
       // panelManager may not be initialized yet
     }
 
-    // 4. Remove interaction handlers (button/modal/dropdown) this module registered.
-    //    Captured via before/after diff in registerReloadedModule. Prevents the
-    //    "Overwriting existing handler" warnings on subsequent reloads and keeps
-    //    stale handler closures from lingering on the client after unload.
     let removedInteractions = 0;
     if (this.client && module.registeredInteractionIds) {
       const c = this.client as any;

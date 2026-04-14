@@ -32,17 +32,6 @@ interface CapturedCommand {
   testOnly: boolean;
 }
 
-/**
- * Targeted deletion of a specific module's commands from Discord.
- * Only runs if the user has the Auto-Cleanup toggle ON. Looks up each
- * captured command by name+type in the live Discord list and deletes it,
- * silently ignoring 10063 (already gone).
- *
- * This is a SCOPED replacement for the full orphan sweep that previously
- * ran at the end of reRegisterSlashCommands on every hot-reload. Scoping
- * to the specific module being removed prevents accidental deletion of
- * unrelated modules' commands due to transient registry state.
- */
 async function deleteModuleCommandsFromDiscord(
   client: Client,
   commands: CapturedCommand[]
@@ -171,12 +160,8 @@ async function registerReloadedModule(client: Client, module: LoadedModule): Pro
     }
   }
 
-  // Snapshot interaction handler keys BEFORE panel registration, command
-  // initializers, and lifecycle hooks. Panels call panel.initialize(client)
-  // inside panelManager.registerPanel, which can register button/modal/dropdown
-  // handlers, so the snapshot has to happen before that call too. On unload,
-  // the diff-captured keys are removed from client maps, preventing the
-  // "Overwriting existing handler" warning on subsequent reloads.
+  // Snapshot BEFORE panel registration, since panels call panel.initialize(client)
+  // which may register interaction handlers too.
   const bBefore = new Set(Array.from(((client as any).buttonHandlers ?? new Map()).keys()));
   const mBefore = new Set(Array.from(((client as any).modalHandlers ?? new Map()).keys()));
   const dBefore = new Set(Array.from(((client as any).dropdownHandlers ?? new Map()).keys()));
@@ -232,8 +217,6 @@ async function registerReloadedModule(client: Client, module: LoadedModule): Pro
     }
   }
 
-  // Diff AFTER initializers and hooks: any new interaction-handler keys were
-  // registered by this module and must be cleaned up when it unloads.
   const bAfter = Array.from(((client as any).buttonHandlers ?? new Map()).keys()) as string[];
   const mAfter = Array.from(((client as any).modalHandlers ?? new Map()).keys()) as string[];
   const dAfter = Array.from(((client as any).dropdownHandlers ?? new Map()).keys()) as string[];
@@ -265,19 +248,13 @@ export async function reloadModule(client: Client, moduleName: string): Promise<
     const registry = getModuleRegistry();
     const existingModule = registry.getModule(moduleName);
 
-    // Atomic swap: prepare the new module BEFORE touching the registry.
-    // If any of recompile / manifest discovery / load fails, the old module
-    // stays registered; prevents a mid-flight failure from leaving the
-    // registry missing this module (which would cause orphan-sweeps to
-    // wrongly delete its commands later).
-
-    // 1. Recompile (incremental, only changed files)
+    // Atomic swap: prepare new module before touching registry so a mid-flight
+    // failure leaves the old module registered.
     const compile = await recompileTypeScript();
     if (!compile.success) {
       return { success: false, moduleName, error: `Compilation failed: ${compile.error}`, duration: Date.now() - start };
     }
 
-    // 2. Discover the module manifest
     const manifestPath = findModuleManifestPath(moduleName);
     if (!manifestPath) {
       return { success: false, moduleName, error: 'Module manifest not found after recompile', duration: Date.now() - start };
@@ -286,20 +263,14 @@ export async function reloadModule(client: Client, moduleName: string): Promise<
     const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8'));
     const modulePath = path.dirname(manifestPath);
 
-    // 3. Load via ModuleLoader (single source of truth); produces the new module.
     const loader = new ModuleLoader(client);
     const newModule = await loader.loadModule(manifest, modulePath);
 
-    // 4. Paired swap: remove old (if any) then register new. Short gap, no
-    //    failure points between the two.
     if (existingModule) {
       await registry.unloadModule(moduleName);
     }
     await registerReloadedModule(client, newModule);
 
-    // 5. Re-register slash commands with Discord. Skip the full orphan sweep
-    //    because the registry is transient during hot-reload; targeted cleanup
-    //    (on uninstall) handles the only case where Discord needs deletions.
     await reRegisterSlashCommands(client, { runOrphanCleanup: false });
 
     const action = existingModule ? 'Reloaded' : 'Loaded';
@@ -329,8 +300,6 @@ export async function unloadModuleFromMemory(client: Client, moduleName: string)
     return { success: true, moduleName, duration: 0 };
   }
 
-  // Capture the module's commands BEFORE unload so we can target them for
-  // deletion from Discord. Reading after unload would be too late.
   const capturedCommands: CapturedCommand[] = existingModule.commands
     .filter((c: any) => c && typeof c.name === 'string')
     .map((c: any) => ({
@@ -414,8 +383,6 @@ export async function reloadModules(client: Client, moduleNames: string[]): Prom
       }
     }
 
-    // 4. Re-register slash commands once (covers all reloaded modules).
-    //    Skip orphan sweep: registry is transient during hot-reload.
     if (result.reloaded.length > 0) {
       await reRegisterSlashCommands(client, { runOrphanCleanup: false });
     }
