@@ -3,7 +3,6 @@
  *
  * This updater is used when the bot runs standalone without Bot Manager.
  * It checks for updates by comparing local version with remote repository.
- * Updates are applied via the pre-update.js system on container restart.
  *
  * For self-hosted users:
  * - Docker: Pull new image and restart container
@@ -11,8 +10,6 @@
  */
 
 import * as fs from 'fs';
-import * as path from 'path';
-import { execSync } from 'child_process';
 import {
   getAppStoreManager,
   ModuleUpdateCheck,
@@ -86,62 +83,17 @@ export interface UpdateTriggerResult {
 
 export interface UpdateStatus {
   inProgress: boolean;
-  mode: 'none' | 'basic' | 'relative' | 'full' | 'first';
   lastCheck?: number;
   lastError?: string;
   lastErrorCode?: string;
 }
 
-// Configuration
-const DATA_PATH = process.env.DATA_DIR || '/data';
-const UPDATE_CONFIG_PATH = path.join(DATA_PATH, 'update-config.json');
 const PACKAGE_JSON_PATH = '/app/package.json';
 const GITHUB_REPO = process.env.GITHUB_REPO || 'krizcold/fully-modular-discord-bot';
 
 let updateStatus: UpdateStatus = {
-  inProgress: false,
-  mode: 'none'
+  inProgress: false
 };
-
-// Load update status from config
-function loadUpdateConfig(): UpdateStatus {
-  try {
-    if (fs.existsSync(UPDATE_CONFIG_PATH)) {
-      const config = JSON.parse(fs.readFileSync(UPDATE_CONFIG_PATH, 'utf-8'));
-      return {
-        inProgress: config.updateInProgress || false,
-        mode: config.updateMode || 'none',
-        lastCheck: config.lastCheck,
-        lastError: config.lastError,
-        lastErrorCode: config.lastErrorCode
-      };
-    }
-  } catch (error) {
-    console.error('[Updater] Failed to load update config:', error);
-  }
-  return { inProgress: false, mode: 'none' };
-}
-
-// Save update config
-function saveUpdateConfig(config: Partial<UpdateStatus & { updateInProgress?: boolean; updateMode?: string }>): void {
-  try {
-    const existing = fs.existsSync(UPDATE_CONFIG_PATH)
-      ? JSON.parse(fs.readFileSync(UPDATE_CONFIG_PATH, 'utf-8'))
-      : {};
-
-    const updated = {
-      ...existing,
-      ...config,
-      updateInProgress: config.inProgress ?? config.updateInProgress ?? existing.updateInProgress,
-      updateMode: config.mode ?? config.updateMode ?? existing.updateMode
-    };
-
-    fs.mkdirSync(path.dirname(UPDATE_CONFIG_PATH), { recursive: true });
-    fs.writeFileSync(UPDATE_CONFIG_PATH, JSON.stringify(updated, null, 2));
-  } catch (error) {
-    console.error('[Updater] Failed to save update config:', error);
-  }
-}
 
 // Get current version from package.json
 function getCurrentVersion(): string {
@@ -229,9 +181,6 @@ function compareVersions(a: string, b: string): number {
   return 0;
 }
 
-// Initialize status from config
-updateStatus = loadUpdateConfig();
-
 /**
  * Check for updates by comparing local version with GitHub
  */
@@ -241,7 +190,6 @@ export async function checkForUpdates(): Promise<UpdateCheckResult> {
     const githubResult = await checkGitHubForUpdates();
 
     updateStatus.lastCheck = Date.now();
-    saveUpdateConfig({ lastCheck: updateStatus.lastCheck });
 
     if (githubResult.error) {
       return {
@@ -272,39 +220,13 @@ export async function checkForUpdates(): Promise<UpdateCheckResult> {
 }
 
 /**
- * Trigger update by setting update config
- * The actual update happens on container restart via pre-update.js
+ * Self-hosted updates are applied manually: pull a new image (or git pull) and restart.
  */
-export async function triggerUpdate(mode: 'basic' | 'relative' | 'full'): Promise<UpdateTriggerResult> {
-  try {
-    console.log(`[Updater] Setting update mode to '${mode}'...`);
-
-    // Set the update config for pre-update.js to process on restart
-    saveUpdateConfig({
-      updateInProgress: true,
-      updateMode: mode,
-      triggeredAt: Date.now()
-    });
-
-    updateStatus.inProgress = true;
-    updateStatus.mode = mode;
-
-    console.log('[Updater] Update scheduled. Restart the container to apply updates.');
-
-    return {
-      success: true,
-      message: `Update mode '${mode}' scheduled. Restart the container to apply updates.\n` +
-        '- basic: Updates core framework only\n' +
-        '- relative: Updates framework + adds new files\n' +
-        '- full: Complete reset to latest version'
-    };
-  } catch (error) {
-    updateStatus.lastError = String(error);
-    return {
-      success: false,
-      error: String(error)
-    };
-  }
+export async function triggerUpdate(): Promise<UpdateTriggerResult> {
+  return {
+    success: false,
+    error: 'Self-hosted mode: pull the latest image (or git pull) and restart the bot manually.'
+  };
 }
 
 /**

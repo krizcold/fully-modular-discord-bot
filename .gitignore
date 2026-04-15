@@ -141,9 +141,6 @@ ToDo.txt
 # IDEs and editors
 package-lock.json
 
-# others
-smdb-source/
-
 # Module Development (App Store repos - separate git projects)
 src/bot/modulesDev/*
 !src/bot/modulesDev/README.md

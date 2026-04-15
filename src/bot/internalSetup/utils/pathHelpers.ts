@@ -18,28 +18,57 @@ export function getModulesDir(): string {
   return path.join(getBotRoot(), 'modules');
 }
 
+function isProd(): boolean {
+  return fs.existsSync('/app/image-version.json');
+}
+
 /**
  * Get the persistent source modules directory (survives container restarts).
  * Used by AppStore to install/uninstall modules to the source tree.
- * Falls back to the runtime modules dir if smdb-source doesn't exist (dev mode).
+ * Falls back to the runtime modules dir in dev mode.
  */
 export function getSourceModulesDir(): string {
-  const smdbSource = '/app/smdb-source/bot/modules';
-  if (fs.existsSync('/app/smdb-source')) {
-    if (!fs.existsSync(smdbSource)) {
-      fs.mkdirSync(smdbSource, { recursive: true });
+  if (isProd()) {
+    const dir = '/data/appstore-modules';
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
     }
-    return smdbSource;
+    return dir;
   }
   return getModulesDir();
 }
 
 /**
- * Get the modulesDev directory path (for App Store development)
- * @returns Absolute path to the modulesDev directory
+ * Get the modulesDev directory path (for App Store development).
+ * In prod this is /app/custom/modulesDev (user-owned overlay).
  */
 export function getModulesDevDir(): string {
+  if (isProd()) {
+    return '/app/custom/modulesDev';
+  }
   return path.join(getBotRoot(), 'modulesDev');
+}
+
+/**
+ * Get the build-staging modules directory.
+ * tsc reads from /app/build/, so AppStore-installed modules must be staged here
+ * before a recompile. In dev there is no separate staging tree.
+ */
+export function getBuildModulesDir(): string {
+  if (isProd()) {
+    return '/app/build/bot/modules';
+  }
+  return getModulesDir();
+}
+
+/**
+ * Get the build-staging root (tsc rootDir in prod).
+ */
+export function getBuildRoot(): string {
+  if (isProd()) {
+    return '/app/build';
+  }
+  return getBotRoot();
 }
 
 /**

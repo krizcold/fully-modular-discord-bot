@@ -9,6 +9,10 @@ import { getInstallQueue } from './utils/installQueue';
 export async function startWebUI(botManager: BotManager): Promise<void> {
   console.log('[WebUI] Starting web interface...');
 
+  // TODO (dev mode): generate src/webui/public/build-info.js with
+  // { version, buildId: "dev", buildDate: now } so the header badge shows
+  // something other than "Development" when running outside Docker.
+
   const app = await createServer(botManager);
   const PORT = parseInt(process.env.WEBUI_PORT || '8080', 10);
   const HOST = '0.0.0.0';

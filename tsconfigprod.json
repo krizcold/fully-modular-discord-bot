@@ -2,7 +2,7 @@
   "compilerOptions": {
     "target": "ESNext",
     "module": "CommonJS",
-    "rootDir": "./smdb-source",
+    "rootDir": "./build",
     "outDir": "dist",
     "strict": true,
     "esModuleInterop": true,
@@ -14,14 +14,14 @@
     "resolveJsonModule": true,
     "baseUrl": ".",
     "paths": {
-      "@/*": ["smdb-source/*"],
-      "@bot/*": ["smdb-source/bot/*"],
-      "@modules/*": ["smdb-source/bot/modules/*"],
-      "@internal/*": ["smdb-source/bot/internalSetup/*"],
-      "@bot/types": ["smdb-source/bot/types"],
-      "@webui/*": ["smdb-source/webui/*"]
+      "@/*": ["build/*"],
+      "@bot/*": ["build/bot/*"],
+      "@modules/*": ["build/bot/modules/*"],
+      "@internal/*": ["build/bot/internalSetup/*"],
+      "@bot/types": ["build/bot/types"],
+      "@webui/*": ["build/webui/*"]
     }
   },
-  "include": ["./smdb-source/**/*.ts"],
-  "exclude": ["node_modules","dist","smdb-source/**/disabled","smdb-source/**/*.disabled"]
+  "include": ["./build/**/*.ts"],
+  "exclude": ["node_modules","dist","build/**/disabled","build/**/*.disabled"]
 }

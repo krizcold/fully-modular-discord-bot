@@ -213,9 +213,8 @@ export async function checkForUpdates(): Promise<UpdateCheckResult> {
 
 /**
  * Request update from Bot Manager
- * Note: Update modes are handled by Bot Manager, not the bot itself
  */
-export async function triggerUpdate(_mode: 'basic' | 'relative' | 'full'): Promise<UpdateTriggerResult> {
+export async function triggerUpdate(): Promise<UpdateTriggerResult> {
   if (!BOT_ID) {
     return {
       success: false,

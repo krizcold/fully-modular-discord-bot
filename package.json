@@ -5,9 +5,8 @@
   "main": "index.js",
   "scripts": {
     "build": "tsc && npm run copy-assets",
-    "build-prod": "tsc && npm run copy-assets-prod",
+    "build-prod": "tsc",
     "copy-assets": "mkdir -p dist/webui/public && cp -r src/webui/public/* dist/webui/public/ && find src/bot/modules -name 'module.json' -exec sh -c 'mkdir -p dist/bot/modules/$(dirname {} | sed \"s|src/bot/modules/||\") && cp {} dist/bot/modules/$(dirname {} | sed \"s|src/bot/modules/||\")/' \\; && find src/bot/modules -name 'settingsSchema.json' -exec sh -c 'mkdir -p dist/bot/modules/$(dirname {} | sed \"s|src/bot/modules/||\") && cp {} dist/bot/modules/$(dirname {} | sed \"s|src/bot/modules/||\")/' \\;",
-    "copy-assets-prod": "mkdir -p dist/webui/public && cp -r smdb-source/webui/public/* dist/webui/public/ 2>/dev/null || true && find smdb-source/bot/modules -name 'module.json' -exec sh -c 'mkdir -p dist/bot/modules/$(dirname {} | sed \"s|smdb-source/bot/modules/||\") && cp {} dist/bot/modules/$(dirname {} | sed \"s|smdb-source/bot/modules/||\")/' \\; 2>/dev/null || true && find smdb-source/bot/modules -name 'settingsSchema.json' -exec sh -c 'mkdir -p dist/bot/modules/$(dirname {} | sed \"s|smdb-source/bot/modules/||\") && cp {} dist/bot/modules/$(dirname {} | sed \"s|smdb-source/bot/modules/||\")/' \\; 2>/dev/null || true",
     "start": "node dist/index.js",
     "start:watch": "tsc --watch & nodemon --watch dist dist/index.js",
     "dev": "cross-env NODE_ENV=development nodemon --watch src --ext ts,json --ignore src/bot/config.json --exec ts-node -r tsconfig-paths/register src/index.ts",

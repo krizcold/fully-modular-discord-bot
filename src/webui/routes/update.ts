@@ -63,18 +63,9 @@ export function createUpdateRouter(botManager: BotManager): Router {
     }
   });
 
-  router.post('/trigger', async (req: Request, res: Response) => {
+  router.post('/trigger', async (_req: Request, res: Response) => {
     try {
-      const mode = req.body?.mode || 'relative';
-
-      if (!['basic', 'relative', 'full'].includes(mode)) {
-        return res.status(400).json({
-          success: false,
-          error: 'Invalid update mode. Must be basic, relative, or full.'
-        });
-      }
-
-      const result = await triggerUpdate(mode);
+      const result = await triggerUpdate();
 
       if (result.success) {
         res.json({
@@ -353,23 +344,21 @@ export function createUpdateRouter(botManager: BotManager): Router {
       const backupName = `backup-${timestamp}`;
       const backupPath = path.join('/data/backups', backupName);
 
-      // Create backup directory
       fs.mkdirSync(backupPath, { recursive: true });
 
-      // Copy smdb-source to backup
-      const sourceDir = '/app/smdb-source';
-      const destDir = path.join(backupPath, 'smdb-source');
+      if (fs.existsSync('/app/custom')) {
+        await execAsync(`cp -a /app/custom ${path.join(backupPath, 'custom')}`);
+      }
+      if (fs.existsSync('/data/appstore-modules')) {
+        await execAsync(`cp -a /data/appstore-modules ${path.join(backupPath, 'appstore-modules')}`);
+      }
 
-      // Use cp command for copying
-      await execAsync(`cp -r ${sourceDir} ${destDir}`);
-
-      // Get current version from package.json
       let version = 'unknown';
       try {
         const packageJson = JSON.parse(fs.readFileSync('/app/package.json', 'utf8'));
         version = packageJson.version || 'unknown';
       } catch (e) {
-        // Ignore
+        // ignore
       }
 
       // Create metadata
@@ -421,7 +410,6 @@ export function createUpdateRouter(botManager: BotManager): Router {
       const backupName = `backup-${timestamp}`;
       const backupPath = path.join('/data/backups', backupName);
 
-      // Check if backup exists
       if (!fs.existsSync(backupPath)) {
         res.status(404).json({
           success: false,
@@ -430,30 +418,30 @@ export function createUpdateRouter(botManager: BotManager): Router {
         return;
       }
 
-      // Check if smdb-source exists in backup
-      const backupSource = path.join(backupPath, 'smdb-source');
-      if (!fs.existsSync(backupSource)) {
+      const backupCustom = path.join(backupPath, 'custom');
+      const backupAppstore = path.join(backupPath, 'appstore-modules');
+      if (!fs.existsSync(backupCustom) && !fs.existsSync(backupAppstore)) {
         res.status(400).json({
           success: false,
-          error: 'Backup is corrupted (missing smdb-source)'
+          error: 'Backup is corrupted (missing custom and appstore-modules)'
         });
         return;
       }
 
-      // Stop bot if running
       if (botManager.isRunning()) {
         await botManager.shutdown(false);
-        // Wait for shutdown
         await new Promise(resolve => setTimeout(resolve, 2000));
       }
 
-      // Clear current smdb-source
-      await execAsync('rm -rf /app/smdb-source/*');
+      if (fs.existsSync(backupCustom)) {
+        await execAsync('rm -rf /app/custom/*');
+        await execAsync(`cp -a ${backupCustom}/. /app/custom/`);
+      }
+      if (fs.existsSync(backupAppstore)) {
+        await execAsync('rm -rf /data/appstore-modules/*');
+        await execAsync(`cp -a ${backupAppstore}/. /data/appstore-modules/`);
+      }
 
-      // Restore from backup
-      await execAsync(`cp -r ${backupSource}/* /app/smdb-source/`);
-
-      // Update safety manager
       const metadata = JSON.parse(
         fs.readFileSync(path.join(backupPath, 'metadata.json'), 'utf8')
       );

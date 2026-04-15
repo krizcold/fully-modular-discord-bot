@@ -80,8 +80,8 @@ services:
       TZ: $TZ
     volumes:
       - type: bind
-        source: $DATA_ROOT/AppData/fullymodulardiscordbot/smdb-source
-        target: /app/smdb-source
+        source: $DATA_ROOT/AppData/fullymodulardiscordbot/custom
+        target: /app/custom
       - type: bind
         source: $DATA_ROOT/AppData/fullymodulardiscordbot/data
         target: /data
@@ -92,12 +92,12 @@ services:
       - 8080
     x-casaos:
       volumes:
-        - container: /app/smdb-source
+        - container: /app/custom
           description:
-            en_us: Fully Modular Discord Bot source directory.
+            en_us: User overrides directory. Files placed here overlay /app/src at boot.
         - container: /data
           description:
-            en_us: Persistent data directory for update configs and bot data.
+            en_us: Persistent data directory for AppStore modules, applied-version, and bot data.
 
 x-casaos:
   architectures:

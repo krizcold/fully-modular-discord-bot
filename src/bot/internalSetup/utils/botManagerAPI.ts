@@ -55,7 +55,7 @@ export async function checkForBotUpdates(): Promise<UpdateCheckResponse | null> 
  * Triggers pull + rebuild + restart via Bot Manager API.
  */
 export async function requestSystemUpdate(): Promise<{ success: boolean; error?: string; code?: string }> {
-  return await updater.triggerUpdate('relative');
+  return await updater.triggerUpdate();
 }
 
 /**

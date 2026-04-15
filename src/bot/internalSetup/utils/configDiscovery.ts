@@ -80,7 +80,6 @@ function generateDisplayName(filename: string): string {
   // Handle special cases
   const specialCases: Record<string, string> = {
     'config': 'Main Bot Config',
-    'update-config': 'Update Config',
   };
 
   if (specialCases[baseName]) {
@@ -126,7 +125,6 @@ function getDefaultValue(filename: string): any {
       'system.ipc.rateLimitCleanupThreshold': 100,
       'system.ipc.rateLimitCleanupAgeMs': 300000
     },
-    'update-config.json': {},
   };
 
   return defaults[filename] || {};

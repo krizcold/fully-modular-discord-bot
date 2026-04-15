@@ -13,9 +13,8 @@ RUN npm install -g npm@latest
 # Install git (needed by AppStore module manager)
 RUN apk add --no-cache git
 
-# Create necessary directories
-RUN mkdir -p /app/smdb-source /app/dist && \
-    chmod -R 777 /app/smdb-source
+# Create dist (built fresh on each container start)
+RUN mkdir -p /app/dist
 
 # Change ownership BEFORE npm install (only 3 files at this point - FAST!)
 RUN chown -R node:node /app
@@ -25,9 +24,6 @@ USER node
 
 # Install dependencies as node user (creates node_modules owned by node)
 RUN npm install
-
-# Note that /app/smdb-source is a MOUNTED VOLUME
-# While /app/dist is NOT... It's built every time the container starts
 
 # Copy source files with correct ownership (avoids slow chown later)
 COPY --chown=node:node src/ /app/src/
@@ -47,22 +43,22 @@ RUN mkdir -p /app/src/updater && \
     fi && \
     rm -rf /tmp/updaters
 
-# Copy pre-update script for handling updates before compilation
-COPY --chown=node:node pre-update.js /app/pre-update.js
-
 # Copy safety check script for crash loop prevention
 COPY --chown=node:node safety-check.js /app/safety-check.js
 
-ARG GIT_COMMIT=unknown
-ARG GIT_BRANCH=unknown
+# Bake the seed for /app/custom (copied to /app/custom by start.sh on first boot)
+COPY --chown=node:node custom-seed/ /app/custom-seed/
+
+# Build metadata: bot manager writes .build-meta.json into the build context
+# right before "docker build" runs. Contents: { commit, branch, builtAt }.
+COPY --chown=node:node .build-meta.json /app/.build-meta.json
+
 ARG BUILD_DATE=unknown
 RUN set -e; \
-    SHORT=$(echo "$GIT_COMMIT" | cut -c1-7); \
     FINAL_DATE="$BUILD_DATE"; \
     if [ "$FINAL_DATE" = "unknown" ]; then FINAL_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ); fi; \
-    VERSION=$(node -e "console.log(require('/app/package.json').version)" 2>/dev/null || echo "0.0.0"); \
-    printf 'window.BOT_BUILD = {"version":"%s","commit":"%s","commitShort":"%s","branch":"%s","buildDate":"%s"};\n' \
-      "$VERSION" "$GIT_COMMIT" "$SHORT" "$GIT_BRANCH" "$FINAL_DATE" > /app/build-info.js
+    export FINAL_DATE; \
+    node -e "const fs=require('fs');const pkg=require('/app/package.json');const meta=JSON.parse(fs.readFileSync('/app/.build-meta.json','utf8'));const commit=meta.commit||null;const commitShort=commit?commit.slice(0,7):null;const branch=meta.branch||null;const buildDate=process.env.FINAL_DATE;const buildId=commit||buildDate;fs.writeFileSync('/app/image-version.json',JSON.stringify({version:pkg.version,commit,commitShort,branch,buildId,buildDate},null,2));"
 
 # Copy start script and give execution permissions
 COPY --chown=node:node start.sh /app/start.sh

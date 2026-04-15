@@ -16,7 +16,7 @@ import path from 'path';
 import crypto from 'crypto';
 import { execSync } from 'child_process';
 import { ModuleManifest } from '../../types/moduleTypes';
-import { ensureDir, getModulesDir, getSourceModulesDir } from './pathHelpers';
+import { ensureDir, getModulesDir, getSourceModulesDir, getBuildModulesDir } from './pathHelpers';
 
 // ============================================================================
 // TYPES
@@ -310,6 +310,7 @@ export class AppStoreManager {
 
     let changed = false;
 
+    const buildDir = getBuildModulesDir();
     const entries = fs.readdirSync(sourceDir, { withFileTypes: true });
     for (const entry of entries) {
       if (!entry.isDirectory()) continue;
@@ -322,6 +323,16 @@ export class AppStoreManager {
           console.log(`[AppStoreManager] Reconciled orphan module dir: ${name}`);
         } catch (err) {
           console.error(`[AppStoreManager] Failed to remove orphan dir ${name}:`, err);
+        }
+        if (sourceDir !== buildDir) {
+          const orphanBuildPath = path.join(buildDir, name);
+          if (fs.existsSync(orphanBuildPath)) {
+            try {
+              fs.rmSync(orphanBuildPath, { recursive: true, force: true });
+            } catch (err) {
+              console.error(`[AppStoreManager] Failed to remove orphan build dir ${name}:`, err);
+            }
+          }
         }
       }
     }
@@ -812,18 +823,21 @@ export class AppStoreManager {
     }
 
     const sourceTargetDir = path.join(getSourceModulesDir(), moduleName);
+    const buildTargetDir = path.join(getBuildModulesDir(), moduleName);
     const runtimeTargetDir = path.join(getModulesDir(), moduleName);
 
-    // Check if already installed in either location
     if (fs.existsSync(sourceTargetDir) || fs.existsSync(runtimeTargetDir)) {
       throw new Error(`Module ${moduleName} is already installed`);
     }
 
     try {
-      // Copy module to persistent source directory (survives container restarts)
       this.copyDirectory(moduleInfo.repoPath, sourceTargetDir);
 
-      // Track installation
+      if (sourceTargetDir !== buildTargetDir) {
+        ensureDir(path.dirname(buildTargetDir));
+        this.copyDirectory(moduleInfo.repoPath, buildTargetDir);
+      }
+
       this.installedConfig.modules[moduleName] = {
         name: moduleName,
         version: moduleInfo.manifest.version,
@@ -834,16 +848,17 @@ export class AppStoreManager {
 
       this.saveInstalled();
 
-      // Update cache
       moduleInfo.installed = true;
       moduleInfo.installedVersion = moduleInfo.manifest.version;
 
       console.log(`[AppStoreManager] Installed module: ${moduleName} v${moduleInfo.manifest.version}`);
       return true;
     } catch (error) {
-      // Cleanup on failure
       if (fs.existsSync(sourceTargetDir)) {
         fs.rmSync(sourceTargetDir, { recursive: true, force: true });
+      }
+      if (sourceTargetDir !== buildTargetDir && fs.existsSync(buildTargetDir)) {
+        fs.rmSync(buildTargetDir, { recursive: true, force: true });
       }
       throw error;
     }
@@ -859,25 +874,26 @@ export class AppStoreManager {
     }
 
     const sourceDir = path.join(getSourceModulesDir(), moduleName);
+    const buildDir = path.join(getBuildModulesDir(), moduleName);
     const runtimeDir = path.join(getModulesDir(), moduleName);
 
-    if (!fs.existsSync(sourceDir) && !fs.existsSync(runtimeDir)) {
-      // Already removed, just update tracking
+    if (!fs.existsSync(sourceDir) && !fs.existsSync(buildDir) && !fs.existsSync(runtimeDir)) {
       delete this.installedConfig.modules[moduleName];
       this.saveInstalled();
       return true;
     }
 
     try {
-      // Remove from both source (persistent) and runtime (dist) directories
       if (fs.existsSync(sourceDir)) {
         fs.rmSync(sourceDir, { recursive: true, force: true });
+      }
+      if (sourceDir !== buildDir && fs.existsSync(buildDir)) {
+        fs.rmSync(buildDir, { recursive: true, force: true });
       }
       if (fs.existsSync(runtimeDir)) {
         fs.rmSync(runtimeDir, { recursive: true, force: true });
       }
 
-      // Remove from tracking
       delete this.installedConfig.modules[moduleName];
       this.saveInstalled();
 
@@ -1254,14 +1270,13 @@ export class AppStoreManager {
     this.updatesInProgress.add(moduleName);
 
     const sourceDir = path.join(getSourceModulesDir(), moduleName);
+    const buildDir = path.join(getBuildModulesDir(), moduleName);
     const runtimeDir = path.join(getModulesDir(), moduleName);
     const backupDir = path.join(CACHE_DIR, 'backups', `${moduleName}-${Date.now()}`);
 
     try {
-      // Refresh repo to get latest version
       await this.refreshRepository(repo.id);
 
-      // Get latest module info
       const modules = this.moduleCache.get(repo.id);
       const moduleInfo = modules?.find(m => m.manifest.name === moduleName);
 
@@ -1269,33 +1284,33 @@ export class AppStoreManager {
         return { success: false, error: `Module ${moduleName} no longer exists in repository` };
       }
 
-      // Check if update is actually needed
       if (this.compareVersions(installed.version, moduleInfo.manifest.version) >= 0) {
         return { success: true, newVersion: installed.version };
       }
 
-      // Backup current module from source dir
       console.log(`[AppStoreManager] Backing up ${moduleName} to ${backupDir}`);
       ensureDir(path.dirname(backupDir));
       if (fs.existsSync(sourceDir)) {
         this.copyDirectory(sourceDir, backupDir);
       }
 
-      // Uninstall current version (but keep tracking info for rollback)
       const previousInstalled = { ...installed };
       try {
         if (fs.existsSync(sourceDir)) fs.rmSync(sourceDir, { recursive: true, force: true });
+        if (sourceDir !== buildDir && fs.existsSync(buildDir)) fs.rmSync(buildDir, { recursive: true, force: true });
         if (fs.existsSync(runtimeDir)) fs.rmSync(runtimeDir, { recursive: true, force: true });
       } catch (error) {
         console.error(`[AppStoreManager] Failed to remove old module:`, error);
         return { success: false, error: 'Failed to remove current version' };
       }
 
-      // Install new version to persistent source directory
       try {
         this.copyDirectory(moduleInfo.repoPath, sourceDir);
+        if (sourceDir !== buildDir) {
+          ensureDir(path.dirname(buildDir));
+          this.copyDirectory(moduleInfo.repoPath, buildDir);
+        }
 
-        // Update tracking
         this.installedConfig.modules[moduleName] = {
           name: moduleName,
           version: moduleInfo.manifest.version,
@@ -1305,25 +1320,26 @@ export class AppStoreManager {
         };
         this.saveInstalled();
 
-        // Update cache
         moduleInfo.installed = true;
         moduleInfo.installedVersion = moduleInfo.manifest.version;
 
-        // Clean up backup
         fs.rmSync(backupDir, { recursive: true, force: true });
 
         console.log(`[AppStoreManager] Updated ${moduleName} from ${previousInstalled.version} to ${moduleInfo.manifest.version}`);
         return { success: true, newVersion: moduleInfo.manifest.version };
       } catch (installError) {
-        // Rollback from backup
         console.error(`[AppStoreManager] Install failed, rolling back:`, installError);
 
         try {
           if (fs.existsSync(backupDir)) {
             if (fs.existsSync(sourceDir)) fs.rmSync(sourceDir, { recursive: true, force: true });
             this.copyDirectory(backupDir, sourceDir);
+            if (sourceDir !== buildDir) {
+              if (fs.existsSync(buildDir)) fs.rmSync(buildDir, { recursive: true, force: true });
+              ensureDir(path.dirname(buildDir));
+              this.copyDirectory(backupDir, buildDir);
+            }
           }
-          // Restore tracking
           this.installedConfig.modules[moduleName] = previousInstalled;
           this.saveInstalled();
         } catch (rollbackError) {

@@ -20,7 +20,8 @@ import { LoadedModule } from '../../types/moduleTypes';
 import { getPanelManager } from './panelManager';
 import {
   findModuleManifests,
-  getModuleDataPath
+  getModuleDataPath,
+  getBuildRoot
 } from './pathHelpers';
 import { applyComponentToggleState } from './ipcToggleHandler';
 import { reRegisterSlashCommands } from './commandUtils';
@@ -95,14 +96,41 @@ const execAsync = promisify(exec);
  * Uses async exec so the event loop stays alive (Discord heartbeats, etc.).
  * Serialized: only one recompile runs at a time.
  */
+const ASSET_EXTENSIONS = new Set(['.json', '.css', '.html', '.jsx', '.js']);
+
+function copyBuildAssetsToDist(): void {
+  const buildRoot = getBuildRoot();
+  const distRoot = path.join(process.cwd(), 'dist');
+  if (!fs.existsSync(buildRoot) || buildRoot === distRoot) return;
+
+  const walk = (srcDir: string, dstDir: string) => {
+    const entries = fs.readdirSync(srcDir, { withFileTypes: true });
+    for (const entry of entries) {
+      const srcPath = path.join(srcDir, entry.name);
+      const dstPath = path.join(dstDir, entry.name);
+      if (entry.isDirectory()) {
+        walk(srcPath, dstPath);
+      } else if (ASSET_EXTENSIONS.has(path.extname(entry.name))) {
+        fs.mkdirSync(path.dirname(dstPath), { recursive: true });
+        fs.copyFileSync(srcPath, dstPath);
+      }
+    }
+  };
+
+  try {
+    walk(buildRoot, distRoot);
+  } catch (err) {
+    console.error('[Reloader] Asset copy failed:', err);
+  }
+}
+
 async function recompileTypeScript(): Promise<{ success: boolean; error?: string; duration: number }> {
   if (recompileInProgress) {
-    // Wait for the in-progress recompile to finish instead of starting a second one
     return new Promise(resolve => {
       const check = setInterval(() => {
         if (!recompileInProgress) {
           clearInterval(check);
-          resolve({ success: true, duration: 0 }); // Previous compile covered our changes
+          resolve({ success: true, duration: 0 });
         }
       }, 200);
     });
@@ -111,10 +139,12 @@ async function recompileTypeScript(): Promise<{ success: boolean; error?: string
   recompileInProgress = true;
   const start = Date.now();
   try {
-    await execAsync('npm run build-prod', {
+    const tscBin = path.join(process.cwd(), 'node_modules', '.bin', process.platform === 'win32' ? 'tsc.cmd' : 'tsc');
+    await execAsync(`"${tscBin}" -p tsconfig.json`, {
       cwd: process.cwd(),
       timeout: 60000
     });
+    copyBuildAssetsToDist();
     return { success: true, duration: Date.now() - start };
   } catch (error: any) {
     const stderr = error.stderr?.toString() || error.message || 'Unknown compilation error';
