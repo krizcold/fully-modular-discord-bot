@@ -1,7 +1,7 @@
 import { ChildProcess, fork } from 'child_process';
 import * as path from 'path';
 import { loadCredentials, validateCredentials, BotCredentials } from '../utils/envLoader';
-import { IPC_TIMEOUT_MS } from './constants';
+import { IPC_TIMEOUT_MS, IPC_TIMEOUT_MODULE_OP_MS } from './constants';
 import type { WebSocketManager, WSEvent, WSEventData } from './websocketManager';
 import { getSafetyManager } from '../utils/updateSafety';
 
@@ -462,7 +462,7 @@ export class BotManager {
   /**
    * Send IPC message to bot and wait for response
    */
-  private async sendIPCMessage(type: string, data: any): Promise<any> {
+  private async sendIPCMessage(type: string, data: any, timeoutMs: number = IPC_TIMEOUT_MS): Promise<any> {
     if (!this.isRunning() || !this.botProcess) {
       throw new Error('Bot is not running');
     }
@@ -472,7 +472,7 @@ export class BotManager {
       const timeout = setTimeout(() => {
         this.botProcess?.removeListener('message', messageHandler);
         reject(new Error('IPC request timeout'));
-      }, IPC_TIMEOUT_MS);
+      }, timeoutMs);
 
       const messageHandler = (message: any) => {
         if (message.requestId === requestId) {
@@ -604,7 +604,7 @@ export class BotManager {
    */
   async reloadModule(moduleName: string): Promise<any> {
     try {
-      return await this.sendIPCMessage('module:reload', { moduleName });
+      return await this.sendIPCMessage('module:reload', { moduleName }, IPC_TIMEOUT_MODULE_OP_MS);
     } catch (error) {
       console.error('[BotManager] Error reloading module:', error);
       return { success: false, moduleName, error: error instanceof Error ? error.message : 'Unknown error' };
@@ -616,7 +616,7 @@ export class BotManager {
    */
   async reloadModules(moduleNames: string[]): Promise<any> {
     try {
-      return await this.sendIPCMessage('module:reload-all', { moduleNames });
+      return await this.sendIPCMessage('module:reload-all', { moduleNames }, IPC_TIMEOUT_MODULE_OP_MS);
     } catch (error) {
       console.error('[BotManager] Error reloading modules:', error);
       return { success: false, reloaded: [], failed: moduleNames.map(n => ({ moduleName: n, error: error instanceof Error ? error.message : 'Unknown error' })), compileDuration: 0, totalDuration: 0 };
@@ -640,7 +640,7 @@ export class BotManager {
    */
   async loadModule(moduleName: string): Promise<any> {
     try {
-      return await this.sendIPCMessage('module:load', { moduleName });
+      return await this.sendIPCMessage('module:load', { moduleName }, IPC_TIMEOUT_MODULE_OP_MS);
     } catch (error) {
       console.error('[BotManager] Error loading module:', error);
       return { success: false, moduleName, error: error instanceof Error ? error.message : 'Unknown error' };
@@ -652,7 +652,7 @@ export class BotManager {
    */
   async unloadModule(moduleName: string): Promise<any> {
     try {
-      return await this.sendIPCMessage('module:unload', { moduleName });
+      return await this.sendIPCMessage('module:unload', { moduleName }, IPC_TIMEOUT_MODULE_OP_MS);
     } catch (error) {
       console.error('[BotManager] Error unloading module:', error);
       return { success: false, moduleName, error: error instanceof Error ? error.message : 'Unknown error' };

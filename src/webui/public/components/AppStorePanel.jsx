@@ -652,7 +652,53 @@ function ModuleCard({ module, installed, installedEntry, installJob, updateInfo,
               fontWeight: 'bold'
             }}>PREMIUM</span>
           )}
-          {installed ? (
+          {installJob && jobStatus === 'queued' ? (
+            <>
+              <span style={{
+                background: 'rgba(136, 136, 136, 0.15)',
+                color: '#aaa',
+                border: '1px solid rgba(136, 136, 136, 0.3)',
+                padding: '3px 8px',
+                borderRadius: '4px',
+                fontSize: '0.7rem'
+              }}>Queued</span>
+              <button
+                onClick={handleCancel}
+                style={{
+                  background: 'rgba(248, 113, 113, 0.15)',
+                  color: '#f87171',
+                  border: '1px solid rgba(248, 113, 113, 0.3)',
+                  padding: '3px 8px',
+                  borderRadius: '4px',
+                  fontSize: '0.7rem',
+                  cursor: 'pointer'
+                }}
+              >Cancel</button>
+            </>
+          ) : installJob && jobStatus === 'running' ? (
+            <span style={{
+              background: jobKind === 'uninstall' ? 'rgba(237, 66, 69, 0.15)' : 'rgba(88, 101, 242, 0.15)',
+              color: jobKind === 'uninstall' ? '#ed4245' : '#5865F2',
+              border: jobKind === 'uninstall' ? '1px solid rgba(237, 66, 69, 0.3)' : '1px solid rgba(88, 101, 242, 0.3)',
+              padding: '3px 8px',
+              borderRadius: '4px',
+              fontSize: '0.7rem'
+            }}>{jobKind === 'uninstall' ? 'Uninstalling...' : 'Installing...'}</span>
+          ) : installJob && jobStatus === 'failed' ? (
+            <button
+              onClick={jobKind === 'uninstall' ? handleUninstall : handleInstall}
+              title={installJob?.error || (jobKind === 'uninstall' ? 'Uninstall failed' : 'Install failed')}
+              style={{
+                background: 'rgba(237, 66, 69, 0.15)',
+                color: '#ed4245',
+                border: '1px solid rgba(237, 66, 69, 0.3)',
+                padding: '3px 8px',
+                borderRadius: '4px',
+                fontSize: '0.7rem',
+                cursor: 'pointer'
+              }}
+            >Retry</button>
+          ) : installed ? (
             <>
               {hasUpdate ? (
                 <span style={{
@@ -683,7 +729,7 @@ function ModuleCard({ module, installed, installedEntry, installJob, updateInfo,
                   fontSize: '0.7rem'
                 }}>INSTALLED</span>
               )}
-              {hasUpdate && !installJob && (
+              {hasUpdate && (
                 <button
                   onClick={(e) => { e.stopPropagation(); onUpdate && onUpdate(); }}
                   disabled={updating}
@@ -699,79 +745,8 @@ function ModuleCard({ module, installed, installedEntry, installJob, updateInfo,
                   }}
                 >{updating ? '...' : 'Update'}</button>
               )}
-              {jobKind === 'uninstall' && jobStatus === 'queued' ? (
-                <>
-                  <span style={{
-                    background: 'rgba(136, 136, 136, 0.15)',
-                    color: '#aaa',
-                    border: '1px solid rgba(136, 136, 136, 0.3)',
-                    padding: '3px 8px',
-                    borderRadius: '4px',
-                    fontSize: '0.7rem'
-                  }}>Queued</span>
-                  <button
-                    onClick={handleCancel}
-                    style={{
-                      background: 'rgba(248, 113, 113, 0.15)',
-                      color: '#f87171',
-                      border: '1px solid rgba(248, 113, 113, 0.3)',
-                      padding: '3px 8px',
-                      borderRadius: '4px',
-                      fontSize: '0.7rem',
-                      cursor: 'pointer'
-                    }}
-                  >Cancel</button>
-                </>
-              ) : jobKind === 'uninstall' && jobStatus === 'running' ? (
-                <span style={{
-                  background: 'rgba(237, 66, 69, 0.15)',
-                  color: '#ed4245',
-                  border: '1px solid rgba(237, 66, 69, 0.3)',
-                  padding: '3px 8px',
-                  borderRadius: '4px',
-                  fontSize: '0.7rem'
-                }}>Uninstalling...</span>
-              ) : jobKind === 'uninstall' && jobStatus === 'failed' ? (
-                <button
-                  onClick={handleUninstall}
-                  title={installJob?.error || 'Uninstall failed'}
-                  style={{
-                    background: 'rgba(237, 66, 69, 0.15)',
-                    color: '#ed4245',
-                    border: '1px solid rgba(237, 66, 69, 0.3)',
-                    padding: '3px 8px',
-                    borderRadius: '4px',
-                    fontSize: '0.7rem',
-                    cursor: 'pointer'
-                  }}
-                >Retry</button>
-              ) : (
-                <button
-                  onClick={handleUninstall}
-                  style={{
-                    background: 'rgba(248, 113, 113, 0.15)',
-                    color: '#f87171',
-                    border: '1px solid rgba(248, 113, 113, 0.3)',
-                    padding: '3px 8px',
-                    borderRadius: '4px',
-                    fontSize: '0.7rem',
-                    cursor: 'pointer'
-                  }}
-                >Uninstall</button>
-              )}
-            </>
-          ) : jobKind === 'install' && jobStatus === 'queued' ? (
-            <>
-              <span style={{
-                background: 'rgba(136, 136, 136, 0.15)',
-                color: '#aaa',
-                border: '1px solid rgba(136, 136, 136, 0.3)',
-                padding: '3px 8px',
-                borderRadius: '4px',
-                fontSize: '0.7rem'
-              }}>Queued</span>
               <button
-                onClick={handleCancel}
+                onClick={handleUninstall}
                 style={{
                   background: 'rgba(248, 113, 113, 0.15)',
                   color: '#f87171',
@@ -781,31 +756,8 @@ function ModuleCard({ module, installed, installedEntry, installJob, updateInfo,
                   fontSize: '0.7rem',
                   cursor: 'pointer'
                 }}
-              >Cancel</button>
+              >Uninstall</button>
             </>
-          ) : jobKind === 'install' && jobStatus === 'running' ? (
-            <span style={{
-              background: 'rgba(88, 101, 242, 0.15)',
-              color: '#5865F2',
-              border: '1px solid rgba(88, 101, 242, 0.3)',
-              padding: '3px 8px',
-              borderRadius: '4px',
-              fontSize: '0.7rem'
-            }}>Installing...</span>
-          ) : jobKind === 'install' && jobStatus === 'failed' ? (
-            <button
-              onClick={handleInstall}
-              title={installJob?.error || 'Install failed'}
-              style={{
-                background: 'rgba(237, 66, 69, 0.15)',
-                color: '#ed4245',
-                border: '1px solid rgba(237, 66, 69, 0.3)',
-                padding: '3px 8px',
-                borderRadius: '4px',
-                fontSize: '0.7rem',
-                cursor: 'pointer'
-              }}
-            >Retry</button>
           ) : (
             <button
               onClick={handleInstall}
@@ -1016,7 +968,7 @@ function ModuleDetailView({ module, installed, installJob, onBack, onInstall, on
 
         {/* Action Buttons */}
         <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
-          {!installed && jobStatus === 'queued' ? (
+          {installJob && jobStatus === 'queued' ? (
             <>
               <span className="button" style={{ background: '#555', border: 'none', padding: '12px 25px', cursor: 'default' }}>
                 Queued
@@ -1029,68 +981,28 @@ function ModuleDetailView({ module, installed, installJob, onBack, onInstall, on
                 Cancel
               </button>
             </>
-          ) : !installed && jobStatus === 'running' ? (
-            <span className="button" style={{ background: '#5865F2', border: 'none', padding: '12px 25px', cursor: 'default' }}>
-              Installing...
+          ) : installJob && jobStatus === 'running' ? (
+            <span className="button" style={{ background: jobKind === 'uninstall' ? '#ed4245' : '#5865F2', border: 'none', padding: '12px 25px', cursor: 'default' }}>
+              {jobKind === 'uninstall' ? 'Uninstalling...' : 'Installing...'}
             </span>
-          ) : !installed && jobStatus === 'failed' ? (
+          ) : installJob && jobStatus === 'failed' ? (
             <button
               className="button primary"
-              onClick={handleInstall}
-              title={installJob?.error || 'Install failed'}
+              onClick={jobKind === 'uninstall' ? handleUninstall : handleInstall}
+              title={installJob?.error || (jobKind === 'uninstall' ? 'Uninstall failed' : 'Install failed')}
               style={{ background: '#ed4245', border: 'none', padding: '12px 25px' }}
             >
-              Retry Install
+              {jobKind === 'uninstall' ? 'Retry Uninstall' : 'Retry Install'}
             </button>
-          ) : !installed ? (
-            <button
-              className="button primary"
-              onClick={handleInstall}
-              style={{
-                background: 'linear-gradient(135deg, #3ba55d, #2d7d46)',
-                border: 'none',
-                padding: '12px 25px'
-              }}
-            >
-              Install Module
-            </button>
-          ) : (
+          ) : installed ? (
             <>
-              {jobKind === 'uninstall' && jobStatus === 'queued' ? (
-                <>
-                  <span className="button" style={{ background: '#555', border: 'none', padding: '12px 25px', cursor: 'default' }}>
-                    Queued
-                  </span>
-                  <button
-                    className="button"
-                    onClick={handleCancel}
-                    style={{ background: '#ed4245', border: 'none', padding: '12px 25px' }}
-                  >
-                    Cancel
-                  </button>
-                </>
-              ) : jobKind === 'uninstall' && jobStatus === 'running' ? (
-                <span className="button" style={{ background: '#ed4245', border: 'none', padding: '12px 25px', cursor: 'default' }}>
-                  Uninstalling...
-                </span>
-              ) : jobKind === 'uninstall' && jobStatus === 'failed' ? (
-                <button
-                  className="button"
-                  onClick={handleUninstall}
-                  title={installJob?.error || 'Uninstall failed'}
-                  style={{ background: '#ed4245', border: 'none', padding: '12px 25px' }}
-                >
-                  Retry Uninstall
-                </button>
-              ) : (
-                <button
-                  className="button"
-                  onClick={handleUninstall}
-                  style={{ background: '#ed4245', border: 'none', padding: '12px 25px' }}
-                >
-                  Uninstall
-                </button>
-              )}
+              <button
+                className="button"
+                onClick={handleUninstall}
+                style={{ background: '#ed4245', border: 'none', padding: '12px 25px' }}
+              >
+                Uninstall
+              </button>
               {module.apiCredentials && (
                 <button
                   className="button"
@@ -1105,6 +1017,18 @@ function ModuleDetailView({ module, installed, installJob, onBack, onInstall, on
                 </button>
               )}
             </>
+          ) : (
+            <button
+              className="button primary"
+              onClick={handleInstall}
+              style={{
+                background: 'linear-gradient(135deg, #3ba55d, #2d7d46)',
+                border: 'none',
+                padding: '12px 25px'
+              }}
+            >
+              Install Module
+            </button>
           )}
         </div>
 
