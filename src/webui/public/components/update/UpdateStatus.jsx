@@ -39,14 +39,34 @@ function UpdateStatus({ api, status, onRefresh }) {
     }
   };
 
+  const pollForNewBuild = () => {
+    const currentBuildId = window.BOT_BUILD?.buildId;
+    const poll = setInterval(async () => {
+      try {
+        const res = await fetch('/build-info.js?_=' + Date.now(), { cache: 'no-store' });
+        if (!res.ok) return;
+        const text = await res.text();
+        const match = text.match(/"buildId"\s*:\s*"([^"]+)"/);
+        const newBuildId = match ? match[1] : null;
+        if (newBuildId && newBuildId !== currentBuildId) {
+          clearInterval(poll);
+          clearTimeout(safety);
+          window.location.reload();
+        }
+      } catch (_) { /* server down during rebuild, keep polling */ }
+    }, 3000);
+    const safety = setTimeout(() => clearInterval(poll), 10 * 60 * 1000);
+  };
+
   const triggerSystemUpdate = async () => {
     if (!confirm('This will pull the latest code and restart the bot. Continue?')) return;
     setLoading(true);
     setActionMessage(null);
     try {
-      const result = await api.post('/update/trigger', { mode: 'relative' });
+      const result = await api.post('/update/trigger');
       if (result.success) {
-        setActionMessage({ type: 'success', text: 'System update started. The bot will restart shortly.' });
+        setActionMessage({ type: 'success', text: 'System update started. This page will reload automatically when the new build is live.' });
+        pollForNewBuild();
       } else {
         setActionMessage({ type: 'error', text: result.error || 'Failed to trigger system update' });
       }
@@ -88,9 +108,10 @@ function UpdateStatus({ api, status, onRefresh }) {
       // Update modules first (download only — no hot-reload since we're restarting anyway)
       await api.post('/update/modules');
       // Then trigger system update (restart — modules will load fresh on boot)
-      const result = await api.post('/update/trigger', { mode: 'relative' });
+      const result = await api.post('/update/trigger');
       if (result.success) {
-        setActionMessage({ type: 'success', text: 'Modules updated. System update started — bot will restart shortly.' });
+        setActionMessage({ type: 'success', text: 'Modules updated. System update started — this page will reload when the new build is live.' });
+        pollForNewBuild();
       } else {
         setActionMessage({ type: 'error', text: result.error || 'Module update succeeded but system update failed' });
       }
