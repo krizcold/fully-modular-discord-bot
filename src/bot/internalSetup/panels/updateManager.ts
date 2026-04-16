@@ -282,7 +282,7 @@ function buildButtons(disabled: boolean = false, combinedCheck?: CombinedUpdateC
 /**
  * Build main panel view
  */
-function buildPanelView(
+export function buildPanelView(
   context: PanelContext,
   view: 'main' | 'checking' | 'updating_system' | 'updating_modules',
   combinedCheck?: CombinedUpdateCheckResult | null
@@ -525,12 +525,35 @@ async function handleSystemUpdate(context: PanelContext): Promise<PanelResponse>
       const result = await requestSystemUpdate();
       if (result.success) {
         await updatePersistentPanelState('update_manager', 'update_triggered', context.guildId || undefined);
+
+        const successContainer = new ContainerBuilder()
+          .setAccentColor(0x2ECC71)
+          .addTextDisplayComponents(
+            new TextDisplayBuilder().setContent('## Bot Update Manager')
+          )
+          .addSeparatorComponents(new SeparatorBuilder().setSpacing(SeparatorSpacingSize.Small))
+          .addTextDisplayComponents(
+            new TextDisplayBuilder().setContent(
+              '**Status:** Update requested\n\n' +
+              'The Bot Manager is pulling the latest code and rebuilding.\n' +
+              'The bot will restart automatically when the new build is ready.\n' +
+              'This panel will refresh after restart.'
+            )
+          );
+        const successResponse = createV2Response([successContainer]);
+        await updatePanelDynamic(context, 'update_manager', successResponse);
       } else {
         await updatePersistentPanelState('update_manager', 'update_error', context.guildId || undefined);
+        const newCheck = await checkForAllBotUpdates();
+        const errorResponse = buildPanelView(context, 'main', newCheck);
+        await updatePanelDynamic(context, 'update_manager', errorResponse);
       }
     } catch (error) {
       console.error('[UpdateManagerPanel] Error during system update:', error);
       await updatePersistentPanelState('update_manager', 'update_error', context.guildId || undefined);
+      const newCheck = await checkForAllBotUpdates();
+      const errorResponse = buildPanelView(context, 'main', newCheck);
+      await updatePanelDynamic(context, 'update_manager', errorResponse);
     }
   });
 
@@ -594,22 +617,44 @@ async function handleUpdateEverything(context: PanelContext): Promise<PanelRespo
 
   setImmediate(async () => {
     try {
-      // First update modules (they'll be applied before restart)
       const moduleResult = await triggerAllModuleUpdates();
       if (moduleResult.totalUpdated > 0) {
         console.log(`[UpdateManagerPanel] Updated ${moduleResult.totalUpdated} module(s) before system update`);
       }
 
-      // Then trigger system update (pull + rebuild + restart)
       const result = await requestSystemUpdate();
       if (result.success) {
         await updatePersistentPanelState('update_manager', 'update_triggered', context.guildId || undefined);
+
+        const successContainer = new ContainerBuilder()
+          .setAccentColor(0x2ECC71)
+          .addTextDisplayComponents(
+            new TextDisplayBuilder().setContent('## Bot Update Manager')
+          )
+          .addSeparatorComponents(new SeparatorBuilder().setSpacing(SeparatorSpacingSize.Small))
+          .addTextDisplayComponents(
+            new TextDisplayBuilder().setContent(
+              `**Status:** Update requested\n\n` +
+              `${moduleResult.totalUpdated > 0 ? `${moduleResult.totalUpdated} module(s) updated. ` : ''}` +
+              'The Bot Manager is pulling the latest code and rebuilding.\n' +
+              'The bot will restart automatically when the new build is ready.\n' +
+              'This panel will refresh after restart.'
+            )
+          );
+        const successResponse = createV2Response([successContainer]);
+        await updatePanelDynamic(context, 'update_manager', successResponse);
       } else {
         await updatePersistentPanelState('update_manager', 'update_error', context.guildId || undefined);
+        const newCheck = await checkForAllBotUpdates();
+        const errorResponse = buildPanelView(context, 'main', newCheck);
+        await updatePanelDynamic(context, 'update_manager', errorResponse);
       }
     } catch (error) {
       console.error('[UpdateManagerPanel] Error during combined update:', error);
       await updatePersistentPanelState('update_manager', 'update_error', context.guildId || undefined);
+      const newCheck = await checkForAllBotUpdates();
+      const errorResponse = buildPanelView(context, 'main', newCheck);
+      await updatePanelDynamic(context, 'update_manager', errorResponse);
     }
   });
 
