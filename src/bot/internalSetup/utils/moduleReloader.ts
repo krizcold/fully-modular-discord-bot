@@ -26,6 +26,8 @@ import {
 import { applyComponentToggleState } from './ipcToggleHandler';
 import { reRegisterSlashCommands } from './commandUtils';
 import { isAutoCleanupEnabled } from '../events/clientReady/registerCommands';
+import { clearSchemaCache, getModulesWithSettings } from './settings/settingsDiscovery';
+import { createAllSettingsPanels } from './settings/settingsPanelFactory';
 
 interface CapturedCommand {
   name: string;
@@ -196,12 +198,26 @@ async function registerReloadedModule(client: Client, module: LoadedModule): Pro
   const mBefore = new Set(Array.from(((client as any).modalHandlers ?? new Map()).keys()));
   const dBefore = new Set(Array.from(((client as any).dropdownHandlers ?? new Map()).keys()));
 
-  // Register panels
+  // Register module-defined panels
   try {
     const panelManager = getPanelManager();
     for (const panel of module.panels) {
       if (panel?.id) {
         panelManager.registerPanel(panel);
+      }
+    }
+
+    // Generate and register auto-created settings panels from settingsSchema.json
+    clearSchemaCache();
+    const modulesWithSettings = getModulesWithSettings(true);
+    const thisModule = modulesWithSettings.find(m => m.name === module.manifest.name);
+    if (thisModule) {
+      const settingsPanels = createAllSettingsPanels([thisModule]);
+      for (const panel of settingsPanels) {
+        panelManager.registerPanel(panel);
+        if (typeof panel.initialize === 'function') {
+          panel.initialize(client);
+        }
       }
     }
   } catch {

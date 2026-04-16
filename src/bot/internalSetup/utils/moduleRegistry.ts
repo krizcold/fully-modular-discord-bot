@@ -3,6 +3,7 @@ import { LoadedModule, ModuleManifest, ModuleContext } from '../../types/moduleT
 import { getModuleEventManager } from './moduleEventManager';
 import { getModuleDataPath, toImportPath } from './pathHelpers';
 import { getPanelManager } from './panelManager';
+import { clearSchemaCache } from './settings/settingsDiscovery';
 
 /**
  * ModuleRegistry - Central registry for all loaded modules
@@ -71,7 +72,7 @@ export class ModuleRegistry {
     const eventManager = getModuleEventManager();
     const removedListeners = eventManager.removeModuleListeners(moduleName);
 
-    // 3. Remove panels
+    // 3. Remove panels (module-defined + auto-generated settings panels)
     let removedPanels = 0;
     try {
       const panelManager = getPanelManager();
@@ -81,6 +82,9 @@ export class ModuleRegistry {
           removedPanels++;
         }
       }
+      panelManager.unregisterPanel(`settings_${moduleName}`);
+      panelManager.unregisterPanel(`settings_global_${moduleName}`);
+      clearSchemaCache();
     } catch {
       // panelManager may not be initialized yet
     }
