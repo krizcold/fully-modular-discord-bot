@@ -15,6 +15,7 @@ import { createAppStoreRoutes } from './routes/appstore';
 import { createPanelRoutes } from './routes/panels';
 import { createGuildPanelRoutes } from './routes/guildPanels';
 import { createUpdateRouter } from './routes/update';
+import { createDevModulesRoutes } from './routes/devmodules';
 import { requireAuth } from './middleware/auth';
 import { configureOAuth, isGuildWebUIEnabled } from './auth/oauthConfig';
 import { getSessionMiddleware } from './auth/sessionManager';
@@ -226,6 +227,7 @@ export async function createServer(botManager: BotManager): Promise<Express> {
   app.use('/api/appstore', requireAuth, createAppStoreRoutes(botManager));
   app.use('/api/panels', requireAuth, createPanelRoutes(botManager));
   app.use('/api/update', requireAuth, createUpdateRouter(botManager));
+  app.use('/api/devmodules', requireAuth, createDevModulesRoutes(botManager));
 
   // Serve static frontend files (protected by auth)
   const publicDir = path.join(__dirname, 'public');

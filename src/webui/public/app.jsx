@@ -234,6 +234,12 @@ function App() {
         >
           App Store
         </button>
+        <button
+          className={`tab ${activeTab === 'devmodules' ? 'active' : ''}`}
+          onClick={() => setActiveTab('devmodules')}
+        >
+          Dev Modules
+        </button>
       </div>
 
       <div className="tab-content">
@@ -277,6 +283,8 @@ function App() {
         {activeTab === 'update' && <UpdatePanel api={api} wsClient={wsClient} />}
 
         {activeTab === 'appstore' && <AppStorePanel />}
+
+        {activeTab === 'devmodules' && <DevModulesPanel />}
       </div>
     </div>
   );
