@@ -74,7 +74,11 @@ export function setupReloadIPCHandlers(client: Client): void {
             version: m.manifest.version,
             commands: m.commands.length,
             events: m.events.size,
-            panels: m.panels.length
+            panels: m.panels.length,
+            commandDetails: (m.commands || []).map((cmd: any) => ({
+              name: cmd.name,
+              type: cmd.type === 2 ? 'User' : cmd.type === 3 ? 'Message' : 'ChatInput',
+            })),
           }));
           response = { success: true, modules };
           break;

@@ -705,4 +705,16 @@ export class BotManager {
       return null;
     }
   }
+
+  /**
+   * Get detailed info about loaded modules (including command types)
+   */
+  async listLoadedModulesDetailed(): Promise<any | null> {
+    if (!this.isRunning()) return null;
+    try {
+      return await this.sendIPCMessage('module:list-loaded', {});
+    } catch {
+      return null;
+    }
+  }
 }

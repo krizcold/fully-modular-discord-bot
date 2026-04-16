@@ -1355,203 +1355,412 @@ function RepositoriesView({ repositories, onRefresh, showSuccess, setError }) {
 
 // Premium Tiers View Component
 function PremiumTiersView({ tiers, guildAssignments, onRefresh, showSuccess, setError }) {
-  const [editingGuild, setEditingGuild] = useState(null);
-  const [newGuildId, setNewGuildId] = useState('');
+  // Tier CRUD state
+  const [showTierForm, setShowTierForm] = useState(false);
+  const [editingTierId, setEditingTierId] = useState(null);
+  const [showOverridesFor, setShowOverridesFor] = useState(null);
+
+  // Guild assignment state
+  const [botGuilds, setBotGuilds] = useState([]);
+  const [guildsLoaded, setGuildsLoaded] = useState(false);
+  const [selectedGuildId, setSelectedGuildId] = useState('');
   const [selectedTier, setSelectedTier] = useState('');
   const [processing, setProcessing] = useState(false);
+  const [guildSearch, setGuildSearch] = useState('');
+  const [bulkSelected, setBulkSelected] = useState(new Set());
+  const [bulkTier, setBulkTier] = useState('');
+  const [bulkProcessing, setBulkProcessing] = useState(false);
 
+  useEffect(() => {
+    loadGuilds();
+  }, []);
+
+  async function loadGuilds() {
+    try {
+      const res = await api.get('/appstore/premium/bot-guilds');
+      if (res.success) setBotGuilds(res.guilds || []);
+    } catch { /* ignore */ }
+    setGuildsLoaded(true);
+  }
+
+  // ── Tier actions ──
+  async function handleDeleteTier(tierId) {
+    if (tierId === 'free') return;
+    if (!confirm(`Delete tier "${tiers[tierId]?.displayName || tierId}"? All guilds on this tier will be moved to Free.`)) return;
+    try {
+      const res = await api.delete(`/appstore/premium/tiers/${tierId}`);
+      if (res.success) { showSuccess('Tier deleted'); onRefresh(); }
+      else setError(res.message || 'Failed to delete tier');
+    } catch (err) { setError(err.message); }
+  }
+
+  function handleTierSaved() {
+    setShowTierForm(false);
+    setEditingTierId(null);
+    onRefresh();
+  }
+
+  function handleOverridesSaved() {
+    setShowOverridesFor(null);
+    onRefresh();
+  }
+
+  // ── Guild assignment actions ──
   async function handleAssignTier() {
-    if (!newGuildId || !selectedTier) {
-      setError('Guild ID and tier are required');
-      return;
-    }
+    if (!selectedGuildId || !selectedTier) { setError('Select a guild and tier'); return; }
     try {
       setProcessing(true);
-      setError(null);
-      const res = await api.put(`/appstore/premium/guilds/${newGuildId}`, { tierId: selectedTier });
+      const res = await api.put(`/appstore/premium/guilds/${selectedGuildId}`, { tierId: selectedTier });
       if (res.success) {
-        showSuccess(`Guild assigned to ${selectedTier} tier`);
-        setNewGuildId('');
+        showSuccess(`Guild assigned to ${tiers[selectedTier]?.displayName || selectedTier}`);
+        setSelectedGuildId('');
         setSelectedTier('');
         onRefresh();
+      } else { setError(res.message || 'Failed to assign'); }
+    } catch (err) { setError(err.message); }
+    finally { setProcessing(false); }
+  }
+
+  async function handleChangeGuildTier(guildId, newTierId) {
+    try {
+      if (newTierId === 'free' || !newTierId) {
+        const res = await api.delete(`/appstore/premium/guilds/${guildId}`);
+        if (res.success) { showSuccess('Guild reset to Free'); onRefresh(); }
+      } else {
+        const res = await api.put(`/appstore/premium/guilds/${guildId}`, { tierId: newTierId });
+        if (res.success) { showSuccess('Guild tier changed'); onRefresh(); }
       }
-    } catch (err) {
-      setError(err.message);
-    } finally {
-      setProcessing(false);
-    }
+    } catch (err) { setError(err.message); }
   }
 
   async function handleRemoveAssignment(guildId) {
     if (!confirm('Remove premium tier from this guild?')) return;
     try {
-      setError(null);
       const res = await api.delete(`/appstore/premium/guilds/${guildId}`);
-      if (res.success) {
-        showSuccess('Guild reset to free tier');
-        onRefresh();
-      }
-    } catch (err) {
-      setError(err.message);
-    }
+      if (res.success) { showSuccess('Guild reset to Free'); onRefresh(); }
+    } catch (err) { setError(err.message); }
   }
 
-  const tierList = Object.keys(tiers);
+  // ── Bulk assignment ──
+  function toggleBulkSelect(guildId) {
+    setBulkSelected(prev => {
+      const next = new Set(prev);
+      if (next.has(guildId)) next.delete(guildId); else next.add(guildId);
+      return next;
+    });
+  }
+
+  async function handleBulkAssign() {
+    if (bulkSelected.size === 0 || !bulkTier) { setError('Select guilds and a tier'); return; }
+    setBulkProcessing(true);
+    let ok = 0, fail = 0;
+    for (const guildId of bulkSelected) {
+      try {
+        const res = await api.put(`/appstore/premium/guilds/${guildId}`, { tierId: bulkTier });
+        if (res.success) ok++; else fail++;
+      } catch { fail++; }
+    }
+    setBulkProcessing(false);
+    setBulkSelected(new Set());
+    setBulkTier('');
+    if (ok > 0) showSuccess(`Assigned ${ok} guild${ok !== 1 ? 's' : ''} to ${tiers[bulkTier]?.displayName || bulkTier}`);
+    if (fail > 0) setError(`Failed to assign ${fail} guild${fail !== 1 ? 's' : ''}`);
+    onRefresh();
+  }
+
+  // ── Helpers ──
+  const tierList = Object.entries(tiers).sort((a, b) => (a[1].priority || 0) - (b[1].priority || 0));
+  const nonFreeTiers = tierList.filter(([id]) => id !== 'free');
+
+  function getGuildName(guildId) {
+    const g = botGuilds.find(g => g.id === guildId);
+    return g ? g.name : null;
+  }
+
+  function getGuildIcon(guildId) {
+    const g = botGuilds.find(g => g.id === guildId);
+    if (g?.icon) return `https://cdn.discordapp.com/icons/${g.id}/${g.icon}.png?size=32`;
+    return null;
+  }
+
+  function getGuildCountForTier(tierId) {
+    return Object.values(guildAssignments).filter(t => t === tierId).length;
+  }
+
+  // Filter guilds for assignment dropdown: those not already assigned to a non-free tier
+  const assignableGuilds = botGuilds.filter(g => !guildAssignments[g.id]);
+  const filteredAssignableGuilds = guildSearch
+    ? assignableGuilds.filter(g => g.name.toLowerCase().includes(guildSearch.toLowerCase()) || g.id.includes(guildSearch))
+    : assignableGuilds;
+
+  // Guild assignments enriched with names
+  const assignmentEntries = Object.entries(guildAssignments).map(([guildId, tierName]) => ({
+    guildId, tierName, guildName: getGuildName(guildId), iconUrl: getGuildIcon(guildId),
+  }));
+
+  const sectionStyle = { background: '#2c2f33', borderRadius: '10px', padding: '20px', marginBottom: '20px' };
 
   return (
     <div>
-      <div style={{ marginBottom: '20px' }}>
-        <h2 style={{ margin: 0 }}>Premium Tiers</h2>
-        <p style={{ color: '#999', margin: '5px 0 0 0' }}>
-          Manage guild premium subscriptions and tier definitions
-        </p>
+      {/* Modals */}
+      {showTierForm && (
+        <TierFormModal
+          tierId={editingTierId}
+          tier={editingTierId ? tiers[editingTierId] : null}
+          onSave={handleTierSaved}
+          onClose={() => { setShowTierForm(false); setEditingTierId(null); }}
+        />
+      )}
+      {/* Inline tier editor — replaces main content when active */}
+      {showOverridesFor && tiers[showOverridesFor] ? (
+        <TierEditorPanel
+          tierId={showOverridesFor}
+          tier={tiers[showOverridesFor]}
+          onSave={handleOverridesSaved}
+          onClose={() => setShowOverridesFor(null)}
+        />
+      ) : (<React.Fragment>
+
+      {/* Header */}
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px' }}>
+        <div>
+          <h2 style={{ margin: 0, color: '#fff' }}>Premium Tiers</h2>
+          <p style={{ color: '#999', margin: '5px 0 0 0', fontSize: '0.85rem' }}>
+            Manage tier definitions, setting overrides, and guild assignments
+          </p>
+        </div>
+        <button onClick={() => { setEditingTierId(null); setShowTierForm(true); }} style={{
+          background: 'linear-gradient(135deg, #f5af19, #f12711)', color: '#fff', border: 'none',
+          padding: '8px 16px', borderRadius: '6px', cursor: 'pointer', fontWeight: 600, fontSize: '0.85rem',
+        }}>+ Create Tier</button>
       </div>
 
-      {/* Tier Definitions */}
-      <div style={{
-        background: '#2c2f33',
-        borderRadius: '10px',
-        padding: '20px',
-        marginBottom: '20px'
-      }}>
-        <h3 style={{ margin: '0 0 15px 0', color: '#f5af19' }}>Available Tiers</h3>
-        {tierList.length === 0 ? (
-          <p style={{ color: '#888' }}>No tiers defined. Edit /data/global/premium-tiers.json to add tiers.</p>
-        ) : (
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))', gap: '15px' }}>
-            {tierList.map(tierName => (
-              <div
-                key={tierName}
-                style={{
-                  background: '#1a1a1a',
-                  borderRadius: '8px',
-                  padding: '15px',
-                  border: tierName === 'free' ? '1px solid #555' : '1px solid #f5af19'
-                }}
-              >
-                <h4 style={{ margin: '0 0 5px 0', color: tierName === 'free' ? '#888' : '#f5af19' }}>
-                  {tiers[tierName].displayName || tierName}
+      {/* Tier Cards */}
+      <div style={sectionStyle}>
+        <h3 style={{ margin: '0 0 15px 0', color: '#f5af19' }}>Tier Definitions</h3>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(240px, 1fr))', gap: '12px' }}>
+          {tierList.map(([tierId, tier]) => {
+            const isFree = tierId === 'free';
+            const overrideCount = Object.keys(tier.overrides || {}).length;
+            const guildCount = getGuildCountForTier(tierId);
+
+            return (
+              <div key={tierId} style={{
+                background: '#36393f', borderRadius: '10px', padding: '16px',
+                border: isFree ? '1px solid #555' : '1px solid #f5af19', position: 'relative',
+              }}>
+                {/* Priority badge */}
+                <div style={{
+                  position: 'absolute', top: '10px', right: '10px',
+                  background: isFree ? '#444' : 'linear-gradient(135deg, #f5af19, #f12711)',
+                  color: '#fff', padding: '2px 8px', borderRadius: '10px', fontSize: '0.72rem', fontWeight: 700,
+                }}>P{tier.priority || 0}</div>
+
+                <h4 style={{ margin: '0 0 4px 0', color: isFree ? '#aaa' : '#f5af19', fontSize: '1rem' }}>
+                  {tier.displayName || tierId}
                 </h4>
-                <p style={{ margin: 0, color: '#666', fontSize: '0.85rem' }}>
-                  Priority: {tiers[tierName].priority || 0}
-                </p>
-                {Object.keys(tiers[tierName].overrides || {}).length > 0 && (
-                  <p style={{ margin: '5px 0 0 0', color: '#888', fontSize: '0.8rem' }}>
-                    {Object.keys(tiers[tierName].overrides).length} module overrides
-                  </p>
-                )}
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
+                <div style={{ color: '#666', fontSize: '0.8rem', marginBottom: '10px' }}>
+                  ID: <code style={{ background: '#1a1a1a', padding: '1px 4px', borderRadius: '3px', color: '#888' }}>{tierId}</code>
+                </div>
 
-      {/* Assign Guild to Tier */}
-      <div style={{
-        background: '#2c2f33',
-        borderRadius: '10px',
-        padding: '20px',
-        marginBottom: '20px'
-      }}>
-        <h3 style={{ margin: '0 0 15px 0' }}>Assign Guild to Tier</h3>
-        <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
-          <input
-            type="text"
-            value={newGuildId}
-            onChange={(e) => setNewGuildId(e.target.value)}
-            placeholder="Guild ID (e.g., 123456789012345678)"
-            style={{
-              flex: 1,
-              minWidth: '200px',
-              padding: '10px',
-              background: '#1a1a1a',
-              border: '1px solid #444',
-              borderRadius: '6px',
-              color: '#e0e0e0'
-            }}
-          />
-          <select
-            value={selectedTier}
-            onChange={(e) => setSelectedTier(e.target.value)}
-            style={{
-              padding: '10px 15px',
-              background: '#1a1a1a',
-              border: '1px solid #444',
-              borderRadius: '6px',
-              color: '#e0e0e0'
-            }}
-          >
-            <option value="">Select Tier</option>
-            {tierList.filter(t => t !== 'free').map(tierName => (
-              <option key={tierName} value={tierName}>
-                {tiers[tierName].displayName || tierName}
-              </option>
-            ))}
-          </select>
-          <button
-            className="button"
-            onClick={handleAssignTier}
-            disabled={processing}
-            style={{
-              background: processing ? '#555' : '#3ba55d',
-              border: 'none',
-              padding: '10px 20px'
-            }}
-          >
-            {processing ? 'Processing...' : 'Assign'}
-          </button>
+                <div style={{ display: 'flex', gap: '8px', marginBottom: '12px', flexWrap: 'wrap' }}>
+                  {guildCount > 0 && (
+                    <span style={{ background: '#1a1a1a', color: '#888', padding: '2px 8px', borderRadius: '10px', fontSize: '0.72rem' }}>
+                      {guildCount} guild{guildCount !== 1 ? 's' : ''}
+                    </span>
+                  )}
+                  {overrideCount > 0 && (
+                    <span style={{ background: 'rgba(88, 101, 242, 0.15)', color: '#7289da', padding: '2px 8px', borderRadius: '10px', fontSize: '0.72rem' }}>
+                      {overrideCount} override{overrideCount !== 1 ? 's' : ''}
+                    </span>
+                  )}
+                </div>
+
+                {/* Action buttons */}
+                <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
+                  <button onClick={() => { setEditingTierId(tierId); setShowTierForm(true); }} style={{
+                    background: '#40444b', color: '#ddd', border: 'none', padding: '5px 10px',
+                    borderRadius: '5px', cursor: 'pointer', fontSize: '0.78rem',
+                  }}>Edit</button>
+                  <button onClick={() => setShowOverridesFor(tierId)} style={{
+                    background: '#40444b', color: '#ddd', border: 'none', padding: '5px 10px',
+                    borderRadius: '5px', cursor: 'pointer', fontSize: '0.78rem',
+                  }}>Overrides</button>
+                  {!isFree && (
+                    <button onClick={() => handleDeleteTier(tierId)} style={{
+                      background: 'transparent', color: '#ed4245', border: '1px solid #ed4245', padding: '4px 10px',
+                      borderRadius: '5px', cursor: 'pointer', fontSize: '0.78rem',
+                    }}>Delete</button>
+                  )}
+                </div>
+              </div>
+            );
+          })}
         </div>
       </div>
 
-      {/* Current Assignments */}
-      <div style={{ background: '#2c2f33', borderRadius: '10px', padding: '20px' }}>
-        <h3 style={{ margin: '0 0 15px 0' }}>Guild Assignments</h3>
-        {Object.keys(guildAssignments).length === 0 ? (
-          <p style={{ color: '#888' }}>No guilds have premium tiers assigned.</p>
-        ) : (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
-            {Object.entries(guildAssignments).map(([guildId, tierName]) => (
-              <div
-                key={guildId}
-                style={{
-                  display: 'flex',
-                  justifyContent: 'space-between',
-                  alignItems: 'center',
-                  background: '#1a1a1a',
-                  padding: '12px 15px',
-                  borderRadius: '6px'
-                }}
-              >
-                <div>
-                  <span style={{ color: '#fff', fontFamily: 'monospace' }}>{guildId}</span>
-                  <span style={{
-                    marginLeft: '15px',
-                    background: 'linear-gradient(135deg, #f5af19, #f12711)',
-                    color: '#fff',
-                    padding: '2px 10px',
-                    borderRadius: '10px',
-                    fontSize: '0.8rem'
-                  }}>
-                    {tiers[tierName]?.displayName || tierName}
-                  </span>
-                </div>
-                <button
-                  className="button"
-                  onClick={() => handleRemoveAssignment(guildId)}
-                  style={{
-                    background: '#ed4245',
-                    border: 'none',
-                    padding: '6px 12px',
-                    fontSize: '0.85rem'
-                  }}
-                >
-                  Remove
-                </button>
-              </div>
+      {/* Guild Assignment */}
+      <div style={sectionStyle}>
+        <h3 style={{ margin: '0 0 15px 0' }}>Assign Guild to Tier</h3>
+
+        {/* Single assign row */}
+        <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap', alignItems: 'center', marginBottom: botGuilds.length > 0 && assignableGuilds.length > 0 ? '14px' : 0 }}>
+          {botGuilds.length > 0 ? (
+            <select value={selectedGuildId} onChange={e => setSelectedGuildId(e.target.value)} style={{
+              flex: 1, minWidth: '220px', padding: '10px', background: '#1a1a1a',
+              border: '1px solid #444', borderRadius: '6px', color: '#e0e0e0',
+            }}>
+              <option value="">Select Guild...</option>
+              {filteredAssignableGuilds.map(g => (
+                <option key={g.id} value={g.id}>{g.name} ({g.id})</option>
+              ))}
+            </select>
+          ) : (
+            <input type="text" value={selectedGuildId} onChange={e => setSelectedGuildId(e.target.value)}
+              placeholder="Guild ID" style={{
+                flex: 1, minWidth: '200px', padding: '10px', background: '#1a1a1a',
+                border: '1px solid #444', borderRadius: '6px', color: '#e0e0e0',
+              }} />
+          )}
+          <select value={selectedTier} onChange={e => setSelectedTier(e.target.value)} style={{
+            padding: '10px 15px', background: '#1a1a1a', border: '1px solid #444',
+            borderRadius: '6px', color: '#e0e0e0',
+          }}>
+            <option value="">Select Tier</option>
+            {nonFreeTiers.map(([id, t]) => (
+              <option key={id} value={id}>{t.displayName || id}</option>
             ))}
+          </select>
+          <button onClick={handleAssignTier} disabled={processing} style={{
+            background: processing ? '#555' : '#3ba55d', color: '#fff', border: 'none',
+            padding: '10px 20px', borderRadius: '6px', cursor: processing ? 'not-allowed' : 'pointer', fontWeight: 600,
+          }}>{processing ? 'Assigning...' : 'Assign'}</button>
+        </div>
+
+        {botGuilds.length === 0 && guildsLoaded && (
+          <div style={{ color: '#666', fontSize: '0.8rem', marginTop: '8px' }}>
+            Bot is not running or has no guilds. You can still assign by guild ID manually.
+          </div>
+        )}
+
+        {/* Bulk assign — shown when there are unassigned guilds */}
+        {botGuilds.length > 0 && assignableGuilds.length > 0 && nonFreeTiers.length > 0 && (
+          <div style={{ background: '#36393f', borderRadius: '8px', padding: '12px' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
+              <div style={{ color: '#aaa', fontSize: '0.82rem', fontWeight: 600 }}>
+                Bulk Assign ({assignableGuilds.length} unassigned guild{assignableGuilds.length !== 1 ? 's' : ''})
+              </div>
+              <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+                {bulkSelected.size > 0 && (
+                  <React.Fragment>
+                    <span style={{ color: '#888', fontSize: '0.8rem' }}>{bulkSelected.size} selected</span>
+                    <select value={bulkTier} onChange={e => setBulkTier(e.target.value)} style={{
+                      padding: '5px 10px', background: '#1a1a1a', border: '1px solid #444',
+                      borderRadius: '5px', color: '#e0e0e0', fontSize: '0.82rem',
+                    }}>
+                      <option value="">Tier...</option>
+                      {nonFreeTiers.map(([id, t]) => (
+                        <option key={id} value={id}>{t.displayName || id}</option>
+                      ))}
+                    </select>
+                    <button onClick={handleBulkAssign} disabled={bulkProcessing || !bulkTier} style={{
+                      background: bulkProcessing || !bulkTier ? '#555' : '#3ba55d', color: '#fff', border: 'none',
+                      padding: '5px 12px', borderRadius: '5px', cursor: bulkProcessing || !bulkTier ? 'not-allowed' : 'pointer',
+                      fontSize: '0.82rem', fontWeight: 600,
+                    }}>{bulkProcessing ? 'Assigning...' : 'Assign Selected'}</button>
+                  </React.Fragment>
+                )}
+                <button onClick={() => {
+                  if (bulkSelected.size === assignableGuilds.length) setBulkSelected(new Set());
+                  else setBulkSelected(new Set(assignableGuilds.map(g => g.id)));
+                }} style={{
+                  background: 'none', color: '#7289da', border: '1px solid #7289da',
+                  padding: '4px 10px', borderRadius: '5px', cursor: 'pointer', fontSize: '0.75rem',
+                }}>{bulkSelected.size === assignableGuilds.length ? 'Deselect All' : 'Select All'}</button>
+              </div>
+            </div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', maxHeight: '200px', overflow: 'auto' }}>
+              {assignableGuilds.map(g => (
+                <label key={g.id} style={{
+                  display: 'flex', alignItems: 'center', gap: '8px', padding: '6px 8px',
+                  borderRadius: '5px', cursor: 'pointer',
+                  background: bulkSelected.has(g.id) ? 'rgba(88, 101, 242, 0.08)' : 'transparent',
+                }}>
+                  <input type="checkbox" checked={bulkSelected.has(g.id)}
+                    onChange={() => toggleBulkSelect(g.id)}
+                    style={{ accentColor: '#5865F2', width: '15px', height: '15px' }} />
+                  {getGuildIcon(g.id) ? (
+                    <img src={getGuildIcon(g.id)} alt="" style={{ width: '20px', height: '20px', borderRadius: '50%' }} />
+                  ) : (
+                    <div style={{ width: '20px', height: '20px', borderRadius: '50%', background: '#444', flexShrink: 0 }} />
+                  )}
+                  <span style={{ color: '#ddd', fontSize: '0.85rem' }}>{g.name}</span>
+                  <span style={{ color: '#555', fontSize: '0.72rem', fontFamily: 'monospace' }}>{g.id}</span>
+                </label>
+              ))}
+            </div>
           </div>
         )}
       </div>
+
+      {/* Current Assignments */}
+      <div style={sectionStyle}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '15px' }}>
+          <h3 style={{ margin: 0 }}>Guild Assignments</h3>
+          {assignmentEntries.length > 3 && (
+            <input type="text" value={guildSearch} onChange={e => setGuildSearch(e.target.value)}
+              placeholder="Search guilds..." style={{
+                padding: '6px 12px', background: '#1a1a1a', border: '1px solid #444',
+                borderRadius: '6px', color: '#e0e0e0', fontSize: '0.85rem', width: '200px',
+              }} />
+          )}
+        </div>
+        {assignmentEntries.length === 0 ? (
+          <p style={{ color: '#888' }}>No guilds have premium tiers assigned.</p>
+        ) : (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+            {assignmentEntries
+              .filter(a => !guildSearch || (a.guildName || a.guildId).toLowerCase().includes(guildSearch.toLowerCase()))
+              .map(({ guildId, tierName, guildName, iconUrl }) => (
+                <div key={guildId} style={{
+                  display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                  background: '#36393f', padding: '10px 14px', borderRadius: '8px',
+                }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flex: 1, minWidth: 0 }}>
+                    {iconUrl ? (
+                      <img src={iconUrl} alt="" style={{ width: '24px', height: '24px', borderRadius: '50%', flexShrink: 0 }} />
+                    ) : (
+                      <div style={{ width: '24px', height: '24px', borderRadius: '50%', background: '#444', flexShrink: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '0.6rem', color: '#888' }}>?</div>
+                    )}
+                    <div style={{ minWidth: 0 }}>
+                      <div style={{ color: '#fff', fontSize: '0.9rem', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        {guildName || <span style={{ fontFamily: 'monospace', color: '#aaa' }}>{guildId}</span>}
+                      </div>
+                      {guildName && <div style={{ color: '#666', fontSize: '0.72rem', fontFamily: 'monospace' }}>{guildId}</div>}
+                    </div>
+                  </div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexShrink: 0 }}>
+                    <select value={tierName} onChange={e => handleChangeGuildTier(guildId, e.target.value)} style={{
+                      padding: '5px 10px', background: '#1a1a1a', border: '1px solid #444',
+                      borderRadius: '5px', color: '#e0e0e0', fontSize: '0.82rem',
+                    }}>
+                      <option value="free">Free</option>
+                      {nonFreeTiers.map(([id, t]) => (
+                        <option key={id} value={id}>{t.displayName || id}</option>
+                      ))}
+                    </select>
+                    <button onClick={() => handleRemoveAssignment(guildId)} title="Reset to Free" style={{
+                      background: 'transparent', color: '#ed4245', border: '1px solid #ed4245',
+                      padding: '4px 8px', borderRadius: '5px', cursor: 'pointer', fontSize: '0.78rem',
+                    }}>Remove</button>
+                  </div>
+                </div>
+              ))}
+          </div>
+        )}
+      </div>
+
+      </React.Fragment>)}
     </div>
   );
 }

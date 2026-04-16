@@ -14,6 +14,7 @@ import {
   StoreModuleInfo
 } from '../../bot/internalSetup/utils/appStoreManager';
 import { getPremiumManager } from '../../bot/internalSetup/utils/premiumManager';
+import { getModulesDir, getModulesDevDir } from '../../bot/internalSetup/utils/pathHelpers';
 import { BotManager } from '../botManager';
 import { ComponentToggleDebouncer } from '../utils/componentToggleDebouncer';
 import { getInstallQueue } from '../utils/installQueue';
@@ -734,6 +735,121 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
         success: false,
         error: errorMessage
       });
+    }
+  });
+
+  /**
+   * GET /api/appstore/premium/module-schemas
+   * Returns all modules with their settings schemas and command names (for the tier overrides editor).
+   * Includes modules without settings so they can still be toggled on/off per tier.
+   * Command data comes from the live bot registry when available, with filesystem fallback.
+   */
+  router.get('/premium/module-schemas', async (_req: Request, res: Response) => {
+    try {
+      const moduleMap = new Map<string, { name: string; displayName: string; category: string; commands: Array<{ name: string; type: string }>; settings: Record<string, any> }>();
+
+      // Scan filesystem for module manifests and settings schemas
+      const scanDir = (baseDir: string, nested: boolean) => {
+        if (!fs.existsSync(baseDir)) return;
+        const processDirs = (dirs: Array<{ name: string; path: string }>) => {
+          for (const { name: dirName, path: dirPath } of dirs) {
+            if (moduleMap.has(dirName)) continue; // skip duplicates
+            const manifestPath = path.join(dirPath, 'module.json');
+            const schemaPath = path.join(dirPath, 'settingsSchema.json');
+            if (!fs.existsSync(manifestPath)) continue;
+            try {
+              const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8'));
+              let settings = {};
+              try {
+                if (fs.existsSync(schemaPath)) {
+                  const schema = JSON.parse(fs.readFileSync(schemaPath, 'utf-8'));
+                  settings = schema.settings || {};
+                }
+              } catch { /* no schema or parse error */ }
+
+              // Detect command file names from commands/ directory as fallback
+              // Type is unknown from filesystem — defaults to 'ChatInput'
+              const commands: Array<{ name: string; type: string }> = [];
+              const cmdDir = path.join(dirPath, 'commands');
+              if (fs.existsSync(cmdDir)) {
+                const files = fs.readdirSync(cmdDir).filter(f => f.endsWith('.ts') || f.endsWith('.js'));
+                for (const f of files) commands.push({ name: f.replace(/\.(ts|js)$/, ''), type: 'ChatInput' });
+              }
+
+              moduleMap.set(manifest.name || dirName, {
+                name: manifest.name || dirName,
+                displayName: manifest.displayName || manifest.name || dirName,
+                category: manifest.category || 'misc',
+                commands,
+                settings,
+              });
+            } catch (err) {
+              console.warn(`[Premium] Failed to read module ${dirName}:`, err);
+            }
+          }
+        };
+
+        if (nested) {
+          const repos = fs.readdirSync(baseDir, { withFileTypes: true })
+            .filter(d => d.isDirectory() && !d.name.startsWith('.'));
+          for (const repo of repos) {
+            const modulesPath = path.join(baseDir, repo.name, 'Modules');
+            if (!fs.existsSync(modulesPath)) continue;
+            const entries = fs.readdirSync(modulesPath, { withFileTypes: true })
+              .filter(d => d.isDirectory() && !d.name.endsWith('.disabled'));
+            processDirs(entries.map(e => ({ name: e.name, path: path.join(modulesPath, e.name) })));
+          }
+        } else {
+          const entries = fs.readdirSync(baseDir, { withFileTypes: true })
+            .filter(d => d.isDirectory() && !d.name.endsWith('.disabled'));
+          processDirs(entries.map(e => ({ name: e.name, path: path.join(baseDir, e.name) })));
+        }
+      };
+
+      scanDir(getModulesDir(), false);
+      scanDir(getModulesDevDir(), true);
+
+      // Enrich with live command data from bot process via IPC
+      if (botManager.isRunning()) {
+        try {
+          const result = await botManager.listLoadedModulesDetailed();
+          if (result && Array.isArray(result.modules)) {
+            for (const live of result.modules) {
+              const existing = moduleMap.get(live.name);
+              if (existing && live.commandDetails && live.commandDetails.length > 0) {
+                existing.commands = live.commandDetails; // prefer live data (has real types) over filesystem
+              }
+            }
+          }
+        } catch { /* bot not ready or IPC timeout */ }
+      }
+
+      res.json({ success: true, modules: Array.from(moduleMap.values()) });
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      res.status(500).json({ success: false, error: errorMessage });
+    }
+  });
+
+  /**
+   * GET /api/appstore/premium/bot-guilds
+   * Returns all guilds the bot is in (for guild assignment UI)
+   */
+  router.get('/premium/bot-guilds', async (_req: Request, res: Response) => {
+    try {
+      if (!botManager.isRunning()) {
+        res.json({ success: true, guilds: [], botRunning: false });
+        return;
+      }
+      const result = await botManager.getBotGuilds();
+      if (result.success) {
+        res.json({ success: true, guilds: result.guilds || [], botRunning: true });
+      } else {
+        res.json({ success: true, guilds: [], botRunning: true, error: result.error });
+      }
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      res.status(500).json({ success: false, error: errorMessage });
     }
   });
 
