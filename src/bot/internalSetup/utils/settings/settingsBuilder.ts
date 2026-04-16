@@ -231,6 +231,8 @@ export function buildEditModal(
   panelId: string, settingKey: string, moduleName: string, category: string,
   definition: SettingDefinition, currentValue: any
 ): ModalBuilder {
+  const valueStr = String(currentValue ?? '');
+  const style = valueStr.includes('\n') ? TextInputStyle.Paragraph : TextInputStyle.Short;
   return new ModalBuilder()
     .setCustomId(`panel_${panelId}_modal_edit_${settingKey}_${moduleName}_${category}`)
     .setTitle(`Edit ${definition.label}`.substring(0, 45))
@@ -239,9 +241,9 @@ export function buildEditModal(
         new TextInputBuilder()
           .setCustomId('value')
           .setLabel(definition.label)
-          .setStyle(TextInputStyle.Short)
+          .setStyle(style)
           .setPlaceholder(definition.placeholder || `Enter ${definition.type}...`)
-          .setValue(String(currentValue ?? ''))
+          .setValue(valueStr)
           .setRequired(definition.validation?.required ?? false)
       )
     );
