@@ -21,9 +21,9 @@ const MAX_ITEMS_PREVIEW = 3; // Show up to 3 items per category (+ "..." if more
 const CATEGORIES_PER_PAGE = 6; // Categories per page
 
 /**
- * Get list of panels suitable for admin panel display
- * Filters out mainGuildOnly panels if current guild is not the main guild
- * Optionally filters by panel scope (system/guild)
+ * Get list of panels suitable for admin panel display.
+ * System-scope panels are only listed in the main guild (operational security).
+ * Optionally filters by panel scope (system/guild).
  */
 export function getAdminPanelList(
   panels: Map<string, PanelOptions>,
@@ -33,34 +33,30 @@ export function getAdminPanelList(
 ): PanelListItem[] {
   const items: PanelListItem[] = [];
 
-  // Get main guild ID for filtering
   const credentials = loadCredentials();
   const mainGuildId = credentials.MAIN_GUILD_ID || credentials.GUILD_ID;
 
   for (const [id, panel] of panels) {
-    if (panel.showInAdminPanel === true) {
-      // Filter out mainGuildOnly panels if current guild is not the main guild
-      if (panel.mainGuildOnly && guildId !== mainGuildId) {
-        continue;
-      }
+    if (panel.showInAdminPanel !== true) continue;
 
-      // Filter by scope if specified
-      const panelScope = panel.panelScope || 'guild'; // Default to 'guild'
-      if (scope && panelScope !== scope) {
-        continue;
-      }
+    const panelScope = panel.panelScope || 'guild';
 
-      items.push({
-        id,
-        name: panel.name,
-        description: panel.description,
-        category: panel.category || config.defaultCategory,
-        icon: panel.adminPanelIcon || '📋',
-        order: panel.adminPanelOrder || 999,
-        scope: panelScope,
-        requiresChannel: panel.requiresChannel
-      });
-    }
+    // System-scope panels are strictly main-guild-only
+    if (panelScope === 'system' && guildId !== mainGuildId) continue;
+
+    // Filter by scope if specified
+    if (scope && panelScope !== scope) continue;
+
+    items.push({
+      id,
+      name: panel.name,
+      description: panel.description,
+      category: panel.category || config.defaultCategory,
+      icon: panel.adminPanelIcon || '📋',
+      order: panel.adminPanelOrder || 999,
+      scope: panelScope,
+      requiresChannel: panel.requiresChannel
+    });
   }
 
   // Sort by order, then by name

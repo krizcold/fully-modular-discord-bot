@@ -335,23 +335,21 @@ export async function getAllPersistentPanels(
 }
 
 /**
- * Migrate persistent panels on bot startup
+ * Clean up stale persistent panels on bot startup.
+ * Removes entries for messages that no longer exist and panels past their expiration.
  */
-export async function migratePersistentPanels(client: Client): Promise<void> {
-  console.log('Migrating persistent panels...');
+export async function cleanupPersistentPanelsOnStartup(client: Client): Promise<void> {
+  console.log('[PersistentPanels] Running startup cleanup...');
 
-  // Clean up global panels
-  const globalCleaned = await cleanupInvalidPanels(client);
-  if (globalCleaned > 0) {
-    console.log(`Cleaned up ${globalCleaned} invalid global persistent panels`);
+  const invalidCount = await cleanupInvalidPanels(client);
+  if (invalidCount > 0) {
+    console.log(`[PersistentPanels] Removed ${invalidCount} invalid panel${invalidCount !== 1 ? 's' : ''}`);
   }
 
-  // Clean up expired global panels
-  const globalExpired = await cleanupExpiredPanels(client);
-  if (globalExpired > 0) {
-    console.log(`Cleaned up ${globalExpired} expired global persistent panels`);
+  const expiredCount = await cleanupExpiredPanels(client);
+  if (expiredCount > 0) {
+    console.log(`[PersistentPanels] Removed ${expiredCount} expired panel${expiredCount !== 1 ? 's' : ''}`);
   }
 
-
-  console.log('Persistent panel migration complete');
+  console.log('[PersistentPanels] Startup cleanup complete');
 }

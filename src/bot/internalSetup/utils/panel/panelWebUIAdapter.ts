@@ -70,15 +70,7 @@ function createWebUIContext(
   modalCapture?: ModalCapture,
   channelId?: string | null
 ): PanelContext {
-  // If guildId is explicitly provided, use it
-  // Otherwise fall back to MAIN_GUILD_ID for backward compatibility
-  let contextGuildId: string | null;
-  if (guildId !== undefined) {
-    contextGuildId = guildId;
-  } else {
-    const credentials = loadCredentials();
-    contextGuildId = credentials.MAIN_GUILD_ID || credentials.GUILD_ID || null;
-  }
+  const contextGuildId: string | null = guildId ?? null;
 
   // Get the guild from client cache for role/member validation
   const guild = contextGuildId ? client.guilds.cache.get(contextGuildId) : null;
@@ -264,12 +256,12 @@ export class PanelWebUIAdapter {
   }
 
   /**
-   * Get list of panels for Web-UI (serialized format)
-   * Web-UI operates in MAIN_GUILD_ID context, so all panels (including mainGuildOnly) are shown
-   * Optionally filter by panel scope (system/guild)
+   * Get list of panels for Web-UI (serialized format).
+   * Web-UI operates in MAIN_GUILD_ID context, so system-scope panels are shown.
+   * Optionally filter by panel scope (system/guild).
    */
   public getWebUIPanelList(scope?: 'system' | 'guild'): PanelListItem[] {
-    // Get MAIN_GUILD_ID to ensure mainGuildOnly panels are shown
+    // Pass MAIN_GUILD_ID as the current guild so system-scope panels pass the main-guild check
     const credentials = loadCredentials();
     const mainGuildId = credentials.MAIN_GUILD_ID || credentials.GUILD_ID;
 

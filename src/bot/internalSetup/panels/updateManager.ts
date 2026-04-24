@@ -43,7 +43,6 @@ const updateManagerPanel: PanelOptions = {
   showInAdminPanel: true,
   adminPanelOrder: 1,
   adminPanelIcon: '🔄',
-  mainGuildOnly: true,
 
   requiredPermissions: [PermissionFlagsBits.Administrator],
   requiredIntents: [GatewayIntentBits.Guilds],
@@ -436,7 +435,7 @@ function buildInformationView(context: PanelContext): PanelResponse {
       'Updates AppStore modules to their latest versions\n' +
       '• Downloads and applies module changes\n' +
       '• Hot-reloads modules at runtime\n' +
-      '• **No restart needed** — bot stays online\n' +
+      '• **No restart needed**, bot stays online\n' +
       '• Custom modules (modulesDev/) are never affected'
     )
   );
@@ -514,7 +513,7 @@ async function handleCheckUpdates(context: PanelContext): Promise<PanelResponse>
 }
 
 /**
- * Handle system update button — requests pull + rebuild from Bot Manager
+ * Handle system update button: requests pull + rebuild from Bot Manager
  */
 async function handleSystemUpdate(context: PanelContext): Promise<PanelResponse> {
   await updatePersistentPanelState('update_manager', 'updating', context.guildId || undefined);
@@ -561,7 +560,7 @@ async function handleSystemUpdate(context: PanelContext): Promise<PanelResponse>
 }
 
 /**
- * Handle update all modules button — download files + hot-reload
+ * Handle update all modules button: download files + hot-reload
  */
 async function handleUpdateAllModules(context: PanelContext): Promise<PanelResponse> {
   const updatingResponse = buildPanelView(context, 'updating_modules');
@@ -609,7 +608,7 @@ async function handleUpdateAllModules(context: PanelContext): Promise<PanelRespo
 }
 
 /**
- * Handle update everything — system update first (modules sync on boot via "Update on Reboot")
+ * Handle update everything: system update first (modules sync on boot via "Update on Reboot")
  */
 async function handleUpdateEverything(context: PanelContext): Promise<PanelResponse> {
   await updatePersistentPanelState('update_manager', 'updating', context.guildId || undefined);
@@ -662,7 +661,7 @@ async function handleUpdateEverything(context: PanelContext): Promise<PanelRespo
 }
 
 /**
- * Handle single module update button — download + hot-reload
+ * Handle single module update button: download + hot-reload
  */
 async function handleUpdateSingleModule(context: PanelContext, moduleName: string): Promise<PanelResponse> {
   const updatingResponse = buildPanelView(context, 'updating_modules');
@@ -711,7 +710,7 @@ async function handleUpdateSingleModule(context: PanelContext, moduleName: strin
 }
 
 /**
- * Handle close panel — deletes the persistent panel message
+ * Handle close panel: deletes the persistent panel message
  */
 async function handleClosePanel(context: PanelContext): Promise<PanelResponse> {
   if (context.interaction && 'message' in context.interaction && context.interaction.message) {

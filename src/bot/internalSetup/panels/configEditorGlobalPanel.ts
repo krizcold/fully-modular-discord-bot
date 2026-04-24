@@ -42,7 +42,6 @@ const configEditorGlobalPanel: PanelOptions = {
   showInAdminPanel: true,
   adminPanelOrder: 101,
   adminPanelIcon: '🌐',
-  mainGuildOnly: true,
 
   requiredPermissions: [PermissionFlagsBits.Administrator],
   requiredIntents: [GatewayIntentBits.Guilds],

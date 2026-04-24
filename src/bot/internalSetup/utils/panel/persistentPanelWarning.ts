@@ -215,13 +215,12 @@ export async function initializePersistentPanel(
 }
 
 /**
- * Convert response to persistent (keep V2 flag, remove ephemeral)
+ * Convert response to persistent (set V2 flag, clearing the ephemeral bit).
  */
 export function makePersistentResponse(response: PanelResponse): PanelResponse {
   return {
     ...response,
     flags: MessageFlags.IsComponentsV2 as number,
-    ephemeral: undefined
   };
 }
 

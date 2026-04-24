@@ -19,8 +19,8 @@ export function checkPanelPermissions(panel: PanelOptions, context: PanelContext
 }
 
 /**
- * Check Web-UI specific permissions (no Discord interaction)
- * Web-UI always operates in MAIN_GUILD_ID context, so mainGuildOnly panels are allowed
+ * Check Web-UI specific permissions (no Discord interaction).
+ * Web-UI always operates in MAIN_GUILD_ID context, so system-scope panels are allowed.
  */
 function checkWebUIPermissions(panel: PanelOptions, userId: string): boolean {
   // Main Web-UI uses 'web-ui-owner' - it's already authenticated via nginxhashlock (AUTH_HASH)
@@ -47,7 +47,7 @@ function checkWebUIPermissions(panel: PanelOptions, userId: string): boolean {
     return false;
   }
 
-  // mainGuildOnly panels are allowed in Web-UI (operates in MAIN_GUILD_ID)
+  // System-scope panels are allowed in Web-UI (which implicitly operates in MAIN_GUILD_ID)
   return true; // Web-UI access allowed (already authenticated by NGINX/Express or OAuth)
 }
 
@@ -59,8 +59,10 @@ function checkDiscordPermissions(panel: PanelOptions, context: PanelContext): bo
 
   if (!interaction) return false;
 
-  // Check if panel requires guild context (mainGuildOnly, requiredPermissions, or allowedRoles)
-  const requiresGuildContext = panel.mainGuildOnly ||
+  const isSystemPanel = panel.panelScope === 'system';
+
+  // Check if panel requires guild context (system-scope, requiredPermissions, or allowedRoles)
+  const requiresGuildContext = isSystemPanel ||
     (panel.requiredPermissions && panel.requiredPermissions.length > 0) ||
     (panel.allowedRoles && panel.allowedRoles.length > 0);
 
@@ -69,13 +71,13 @@ function checkDiscordPermissions(panel: PanelOptions, context: PanelContext): bo
     return false;
   }
 
-  // Check mainGuildOnly restriction
-  if (panel.mainGuildOnly) {
+  // System-scope panels are strictly main-guild-only
+  if (isSystemPanel) {
     const credentials = loadCredentials();
     const mainGuildId = credentials.MAIN_GUILD_ID || credentials.GUILD_ID;
 
     if (guildId !== mainGuildId) {
-      console.log(`[PanelPermissions] Panel ${panel.id} is mainGuildOnly, but accessed from guild ${guildId}. Main guild is ${mainGuildId}.`);
+      console.log(`[PanelPermissions] System-scope panel ${panel.id} accessed from guild ${guildId}, but main guild is ${mainGuildId}.`);
       return false;
     }
   }

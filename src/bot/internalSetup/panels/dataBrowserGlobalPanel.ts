@@ -116,7 +116,6 @@ const dataBrowserGlobalPanel: PanelOptions = {
   showInAdminPanel: true,
   adminPanelOrder: 103,
   adminPanelIcon: '🌍',
-  mainGuildOnly: true,
 
   requiredPermissions: [PermissionFlagsBits.Administrator],
   requiredIntents: [GatewayIntentBits.Guilds],

@@ -140,7 +140,6 @@ const systemInfoPanel: PanelOptions = {
   showInAdminPanel: true,
   adminPanelOrder: 2,
   adminPanelIcon: '📊',
-  mainGuildOnly: true,
 
   requiredPermissions: [PermissionFlagsBits.Administrator],
   requiredIntents: [GatewayIntentBits.Guilds],

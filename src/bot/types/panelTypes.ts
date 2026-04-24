@@ -68,7 +68,6 @@ export interface PanelResponse {
   components?: any[];
 
   // Flags - use MessageFlags.Ephemeral for ephemeral, MessageFlags.IsComponentsV2 is auto-added for V2
-  ephemeral?: boolean; // Deprecated, use flags instead
   flags?: number;
 
   // Attachments
@@ -147,8 +146,7 @@ export interface PanelOptions {
   allowedRoles?: string[]; // Role IDs
   devOnly?: boolean;
   testOnly?: boolean;
-  mainGuildOnly?: boolean; // Only available in MAIN_GUILD_ID (e.g., UPDATE panel)
-  
+
   // Technical requirements
   requiredIntents?: GatewayIntentBits[];
 

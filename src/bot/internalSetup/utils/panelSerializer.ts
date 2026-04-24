@@ -869,10 +869,9 @@ export function serializePanelResponse(
     }
   }
 
-  // Check if ephemeral (works for both V1 and V2)
+  // Check if ephemeral via MessageFlags.Ephemeral bit (64)
   const flags = response.flags || 0;
-  const hasEphemeral = (flags & 64) !== 0 || response.ephemeral;
-  if (hasEphemeral) {
+  if ((flags & 64) !== 0) {
     serialized.ephemeral = true;
   }
 
