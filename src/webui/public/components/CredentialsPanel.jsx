@@ -1,9 +1,8 @@
 // Credentials Panel Component (Refactored)
-function CredentialsPanel({ setupStatus, onUpdate, onUpdateAndRestart }) {
-  const { useState, useEffect } = React;
+function CredentialsPanel({ setupStatus, isBotRunning, onUpdate, onUpdateAndRestart }) {
+  const { useState, useEffect, useMemo } = React;
 
-  // Initialize with empty strings, not objects
-  const [credentials, setCredentials] = useState({
+  const EMPTY_CREDS = {
     DISCORD_TOKEN: '',
     CLIENT_ID: '',
     GUILD_ID: '',
@@ -13,7 +12,11 @@ function CredentialsPanel({ setupStatus, onUpdate, onUpdateAndRestart }) {
     DISCORD_CLIENT_SECRET: '',
     OAUTH_CALLBACK_URL: '',
     SESSION_SECRET: ''
-  });
+  };
+
+  const [credentials, setCredentials] = useState({ ...EMPTY_CREDS });
+  // Baseline = values that are currently persisted, used to detect dirty state.
+  const [baseline, setBaseline] = useState({ ...EMPTY_CREDS });
 
   const [loading, setLoading] = useState(false);
 
@@ -65,7 +68,7 @@ function CredentialsPanel({ setupStatus, onUpdate, onUpdateAndRestart }) {
           'Right-click on your main/production server icon',
           'Click "Copy Server ID" and paste it here',
           'If left empty, it will default to Guild ID',
-          'Web-UI panels and mainGuildOnly features use this server'
+          'Web-UI panels and system-scope features use this server'
         ],
         example: '987654321098765432 (or leave empty)'
       },
@@ -120,22 +123,37 @@ function CredentialsPanel({ setupStatus, onUpdate, onUpdateAndRestart }) {
     };
   });
 
-  // Load existing credentials when setupStatus changes
+  // Load existing credentials when setupStatus changes. The baseline mirrors
+  // what's currently persisted so we can detect dirty state on save.
   useEffect(() => {
     if (setupStatus?.credentials) {
-      // Load non-sensitive values to show current state
       const creds = setupStatus.credentials;
-      setCredentials(prev => ({
-        ...prev,
-        // Load Guild Web-UI settings (non-sensitive)
-        ENABLE_GUILD_WEBUI: creds.ENABLE_GUILD_WEBUI?.value === 'true',
-        OAUTH_CALLBACK_URL: creds.OAUTH_CALLBACK_URL?.value && !creds.OAUTH_CALLBACK_URL.value.startsWith('[')
-          ? creds.OAUTH_CALLBACK_URL.value
-          : prev.OAUTH_CALLBACK_URL
-        // Sensitive values (DISCORD_CLIENT_SECRET, SESSION_SECRET, etc.) are NOT loaded for security
-      }));
+      const enableGuildWebUI = creds.ENABLE_GUILD_WEBUI?.value === 'true';
+      const callbackUrl = creds.OAUTH_CALLBACK_URL?.value && !creds.OAUTH_CALLBACK_URL.value.startsWith('[')
+        ? creds.OAUTH_CALLBACK_URL.value
+        : '';
+      const mainGuildId = (creds.MAIN_GUILD_ID?.set && setupStatus.guildIds?.MAIN_GUILD_ID) || '';
+
+      const loaded = {
+        ...EMPTY_CREDS,
+        // Only non-sensitive fields come back from the server; secrets stay empty.
+        ENABLE_GUILD_WEBUI: enableGuildWebUI,
+        OAUTH_CALLBACK_URL: callbackUrl,
+        MAIN_GUILD_ID: mainGuildId,
+      };
+      setCredentials(prev => ({ ...loaded, ...dirtyOverlay(prev, baseline) }));
+      setBaseline(loaded);
     }
   }, [setupStatus]);
+
+  /** Keep any user-typed edits when a new baseline arrives (avoid wiping in-flight edits). */
+  function dirtyOverlay(current, previousBaseline) {
+    const out = {};
+    for (const key of Object.keys(current)) {
+      if (current[key] !== previousBaseline[key]) out[key] = current[key];
+    }
+    return out;
+  }
 
   // Handle field changes
   const handleFieldChange = (field, value) => {
@@ -160,10 +178,34 @@ function CredentialsPanel({ setupStatus, onUpdate, onUpdateAndRestart }) {
   async function handleSave(andStart = false) {
     setLoading(true);
 
+    // Capture prior Guild Web-UI state before the save. Only then can we decide
+    // whether session invalidation is something users would actually care about.
+    const wasGuildWebUIEnabled = baseline.ENABLE_GUILD_WEBUI === true;
+
     try {
       const res = await api.post('/setup/credentials', credentials);
       if (res.success) {
-        showToast(andStart ? 'Credentials saved' : 'Credentials saved successfully', 'success');
+        const reload = res.reload || {};
+        const changes = Array.isArray(reload.changes) ? reload.changes : [];
+
+        if (!changes.length) {
+          showToast('No changes to save.', 'info');
+        } else {
+          showToast('Settings saved.', 'success');
+          if (reload.oauthReconfigured) {
+            showToast('Guild Web-UI reconfigured live; no restart needed.', 'success');
+          }
+          // Only warn about session invalidation when Guild Web-UI was already
+          // serving sessions before this save; otherwise there are no sessions
+          // to log out and the warning is just noise.
+          if (reload.sessionSecretChanged && wasGuildWebUIEnabled) {
+            showToast('SESSION_SECRET changed: active Guild Web-UI sessions will be logged out on the next bot restart.', 'warning', { sticky: true });
+          }
+          if (reload.botCredentialsChanged && !isManaged) {
+            showToast('Bot credentials changed: restart the bot to apply.', 'warning', { sticky: true });
+          }
+        }
+
         if (andStart) {
           await onUpdateAndRestart();
         } else {
@@ -180,6 +222,48 @@ function CredentialsPanel({ setupStatus, onUpdate, onUpdateAndRestart }) {
   }
 
   const isConfigured = setupStatus?.configured;
+  const isManaged = setupStatus?.deploymentMode === 'managed';
+
+  // ── Dirty-state tracking ──
+  // Secrets (DISCORD_CLIENT_SECRET, SESSION_SECRET, DISCORD_TOKEN) never come
+  // back from the server for security, so we treat any non-empty value as an
+  // intended change. Non-secret fields diff against the baseline.
+  const SECRET_FIELDS = ['DISCORD_TOKEN', 'DISCORD_CLIENT_SECRET', 'SESSION_SECRET'];
+  const BOT_RESTART_FIELDS = ['DISCORD_TOKEN', 'CLIENT_ID', 'GUILD_ID'];
+  const GUILD_WEBUI_FIELDS = ['ENABLE_GUILD_WEBUI', 'DISCORD_CLIENT_ID', 'DISCORD_CLIENT_SECRET', 'OAUTH_CALLBACK_URL', 'SESSION_SECRET'];
+
+  function fieldDirty(key) {
+    if (SECRET_FIELDS.includes(key)) {
+      // Secret is dirty only when user typed something
+      return !!credentials[key] && credentials[key].trim() !== '';
+    }
+    return credentials[key] !== baseline[key];
+  }
+
+  const dirtyFields = useMemo(
+    () => Object.keys(credentials).filter(fieldDirty),
+    [credentials, baseline]
+  );
+  const hasAnyChanges = dirtyFields.length > 0;
+  const botCredsDirty = dirtyFields.some(f => BOT_RESTART_FIELDS.includes(f));
+  const guildCredsDirty = dirtyFields.some(f => GUILD_WEBUI_FIELDS.includes(f));
+
+  // Primary save: disabled when nothing has changed.
+  const saveDisabled = loading || !hasAnyChanges;
+
+  // Secondary save-and-(re)start: depends on bot state + what changed.
+  // - Bot not running: always available as "Save & Start Bot" (boots the bot).
+  // - Bot running: only meaningful if bot-level creds changed ("Save & Restart Bot");
+  //   Guild Web-UI cred changes hot-reload and do NOT need a restart.
+  const startRestartLabel = !isConfigured
+    ? 'Save & Start Bot'
+    : isBotRunning
+      ? 'Save & Restart Bot'
+      : 'Save & Start Bot';
+  const startRestartDisabled = loading || (isBotRunning && !botCredsDirty);
+  // Hide the button entirely when bot is running + no bot-cred changes AND user has other
+  // (guild-webui-only) changes; the plain "Save" button covers that case without the
+  // restart confusion. We keep it visible but disabled for discoverability.
 
   return (
     <div className="credentials-panel">
@@ -199,6 +283,7 @@ function CredentialsPanel({ setupStatus, onUpdate, onUpdateAndRestart }) {
           onChange={handleFieldChange}
           instructions={instructions}
           setupStatus={setupStatus}
+          isManaged={isManaged}
         />
 
         <div className="section-divider" />
@@ -214,16 +299,28 @@ function CredentialsPanel({ setupStatus, onUpdate, onUpdateAndRestart }) {
 
         {/* Action Buttons */}
         <div className="credentials-actions">
-          <button type="submit" className="btn btn-primary" disabled={loading}>
-            {loading ? 'Saving...' : isConfigured ? 'Update Credentials' : 'Save Credentials'}
+          <button
+            type="submit"
+            className="btn btn-primary"
+            disabled={saveDisabled}
+            title={!hasAnyChanges ? 'No changes to save' : undefined}
+          >
+            {loading ? 'Saving...' : isConfigured ? 'Save Changes' : 'Save Credentials'}
           </button>
           <button
             type="button"
             onClick={() => handleSave(true)}
             className="btn btn-success"
-            disabled={loading}
+            disabled={startRestartDisabled}
+            title={
+              startRestartDisabled && isBotRunning && !botCredsDirty
+                ? 'No bot credentials changed. Guild Web-UI credentials apply without a restart; use "Save Changes" instead.'
+                : isManaged
+                  ? 'Saves credentials and restarts the bot process. The Bot Manager auto-restarts it.'
+                  : undefined
+            }
           >
-            {isConfigured ? 'Update & Restart' : 'Save & Start Bot'}
+            {startRestartLabel}
           </button>
         </div>
       </form>

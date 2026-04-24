@@ -10,41 +10,57 @@ function StatusIndicator({ isSet, optional }) {
 }
 
 // Bot Credentials Section Component
-function BotCredentialsSection({ credentials, onChange, instructions, setupStatus }) {
+function BotCredentialsSection({ credentials, onChange, instructions, setupStatus, isManaged }) {
   const credStatus = setupStatus?.credentials || {};
+  const managedNotice = (
+    <div style={{
+      background: 'rgba(250, 166, 26, 0.1)', border: '1px solid #faa61a',
+      color: '#faa61a', padding: '10px 14px', borderRadius: '6px',
+      marginBottom: '18px', fontSize: '0.88rem', lineHeight: 1.5,
+    }}>
+      <strong>Managed deployment:</strong> the external Bot Manager owns the Discord bot token,
+      client ID, and guild ID. To change them, use the Bot Manager Web-UI. Main Guild ID remains
+      editable here.
+    </div>
+  );
+  const lockedStyle = isManaged ? { opacity: 0.55, cursor: 'not-allowed' } : {};
 
   return (
     <div className="credentials-section">
       <div className="credentials-form">
         <h3 style={{marginBottom: '20px', color: '#5865F2'}}>Bot Credentials</h3>
 
-        <div className="form-group">
+        {isManaged && managedNotice}
+
+        <div className="form-group" style={lockedStyle}>
           <label>
             <StatusIndicator isSet={credStatus.DISCORD_TOKEN?.set} />
             Discord Bot Token
+            {isManaged && <span style={{ marginLeft: '6px', color: '#faa61a', fontSize: '0.75rem' }}>🔒 managed</span>}
           </label>
           <input
             type="password"
             value={credentials.DISCORD_TOKEN || ''}
             onChange={e => onChange('DISCORD_TOKEN', e.target.value)}
-            placeholder="MTIzNDU2Nzg5MDEyMzQ1Njc4OQ.XXXXXX.XXX..."
-            required
+            placeholder={isManaged ? 'Owned by the Bot Manager' : 'MTIzNDU2Nzg5MDEyMzQ1Njc4OQ.XXXXXX.XXX...'}
+            disabled={isManaged}
           />
         </div>
 
         {/* Side by side Guild IDs */}
         <div className="form-row">
-          <div className="form-group" style={{flex: 1}}>
+          <div className="form-group" style={{flex: 1, ...lockedStyle}}>
             <label>
               <StatusIndicator isSet={credStatus.GUILD_ID?.set} />
               Guild ID (Test Server)
+              {isManaged && <span style={{ marginLeft: '6px', color: '#faa61a', fontSize: '0.75rem' }}>🔒 managed</span>}
             </label>
             <input
               type="text"
               value={credentials.GUILD_ID || ''}
               onChange={e => onChange('GUILD_ID', e.target.value)}
-              placeholder="123456789012345678"
-              required
+              placeholder={isManaged ? 'Owned by the Bot Manager' : '123456789012345678'}
+              disabled={isManaged}
             />
             <small>Your test/development server</small>
           </div>
@@ -64,17 +80,18 @@ function BotCredentialsSection({ credentials, onChange, instructions, setupStatu
           </div>
         </div>
 
-        <div className="form-group">
+        <div className="form-group" style={lockedStyle}>
           <label>
             <StatusIndicator isSet={credStatus.CLIENT_ID?.set} />
             Application (Client) ID
+            {isManaged && <span style={{ marginLeft: '6px', color: '#faa61a', fontSize: '0.75rem' }}>🔒 managed</span>}
           </label>
           <input
             type="text"
             value={credentials.CLIENT_ID || ''}
             onChange={e => onChange('CLIENT_ID', e.target.value)}
-            placeholder="123456789012345678"
-            required
+            placeholder={isManaged ? 'Owned by the Bot Manager' : '123456789012345678'}
+            disabled={isManaged}
           />
         </div>
       </div>

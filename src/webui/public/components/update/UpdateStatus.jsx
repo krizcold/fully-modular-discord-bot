@@ -1,4 +1,4 @@
-// Update Status Component — Three-button layout (System / Modules / Everything)
+// Update Status Component: Three-button layout (System / Modules / Everything)
 function UpdateStatus({ api, status, onRefresh }) {
   const [loading, setLoading] = React.useState(false);
   const [checkResult, setCheckResult] = React.useState(null);
@@ -105,12 +105,12 @@ function UpdateStatus({ api, status, onRefresh }) {
     setLoading(true);
     setActionMessage(null);
     try {
-      // Update modules first (download only — no hot-reload since we're restarting anyway)
+      // Update modules first (download only; no hot-reload since we're restarting anyway)
       await api.post('/update/modules');
-      // Then trigger system update (restart — modules will load fresh on boot)
+      // Then trigger system update (restart; modules will load fresh on boot)
       const result = await api.post('/update/trigger');
       if (result.success) {
-        setActionMessage({ type: 'success', text: 'Modules updated. System update started — this page will reload when the new build is live.' });
+        setActionMessage({ type: 'success', text: 'Modules updated. System update started; this page will reload when the new build is live.' });
         pollForNewBuild();
       } else {
         setActionMessage({ type: 'error', text: result.error || 'Module update succeeded but system update failed' });

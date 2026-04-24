@@ -119,7 +119,6 @@ function OAuthCredentialsSection({ credentials, onChange, instructions, onGenera
                 value={credentials.DISCORD_CLIENT_ID || ''}
                 onChange={e => onChange('DISCORD_CLIENT_ID', e.target.value)}
                 placeholder="987654321098765432"
-                required={isEnabled}
               />
               <small>OAuth application Client ID (should be different from bot's Client ID)</small>
             </div>
@@ -134,7 +133,6 @@ function OAuthCredentialsSection({ credentials, onChange, instructions, onGenera
                 value={credentials.DISCORD_CLIENT_SECRET || ''}
                 onChange={e => onChange('DISCORD_CLIENT_SECRET', e.target.value)}
                 placeholder="AbCdEf123456_XXXXXXXXXXXXX"
-                required={isEnabled}
               />
               <small>OAuth application secret (keep this secure!)</small>
             </div>
@@ -175,8 +173,7 @@ function OAuthCredentialsSection({ credentials, onChange, instructions, onGenera
                   value={credentials.SESSION_SECRET || ''}
                   onChange={e => onChange('SESSION_SECRET', e.target.value)}
                   placeholder="Generate or enter a secure random string"
-                  required={isEnabled}
-                  style={{flex: 1}}
+                    style={{flex: 1}}
                 />
                 <button
                   type="button"

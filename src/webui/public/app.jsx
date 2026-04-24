@@ -108,7 +108,7 @@ function App() {
       if (!res.success) {
         showToast(res.error || 'Failed to restart bot', 'error');
       }
-      // Don't call loadData() here — let WebSocket bot:startup event
+      // Don't call loadData() here; let WebSocket bot:startup event
       // drive the status update so BotControlPanel's restarting state works.
     } catch (err) {
       showToast(err.message, 'error');
@@ -260,6 +260,7 @@ function App() {
         {activeTab === 'credentials' && (
           <CredentialsPanel
             setupStatus={setupStatus}
+            isBotRunning={!!status?.running}
             onUpdate={loadData}
             onUpdateAndRestart={async () => {
               await loadData();
