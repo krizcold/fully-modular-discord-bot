@@ -137,6 +137,10 @@ dist
 # Custom files/exports
 contextExport.txt
 ToDo.txt
+logs.logs
+
+# Local Claude Code workspace config (per-developer)
+.claude/
 
 # IDEs and editors
 package-lock.json
