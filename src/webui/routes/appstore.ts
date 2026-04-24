@@ -874,9 +874,9 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
       if (!code || !code.trim()) {
         return res.status(400).json({ success: false, error: 'Coupon code is required' });
       }
-      const { description, percentOff, extraDays, maxUses, expiresAt } = req.body || {};
+      const { description, percentOff, extraDays, maxUses, expiresAt, allowedTiers } = req.body || {};
       const manager = getPremiumManager();
-      const ok = manager.setCoupon(code, { description, percentOff, extraDays, maxUses, expiresAt });
+      const ok = manager.setCoupon(code, { description, percentOff, extraDays, maxUses, expiresAt, allowedTiers });
       if (!ok) {
         return res.status(400).json({
           success: false,
