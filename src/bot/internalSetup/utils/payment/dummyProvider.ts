@@ -71,6 +71,12 @@ export class DummyProvider implements PaymentProvider {
 
   private state: DummyState = JSON.parse(JSON.stringify(DEFAULT_STATE));
   private loaded = false;
+  // Track mtime so a writer in the other process (bot vs forked web-UI) is
+  // picked up by the reader's next operation. Without this, each process
+  // would keep its startup snapshot forever and the bot-side tick would
+  // run against stale data while web-UI-created subs never fire events on
+  // the bot side (and vice versa).
+  private stateMtimeMs = 0;
   private tickTimer: NodeJS.Timeout | null = null;
 
   isConfigured(): boolean {
@@ -78,29 +84,38 @@ export class DummyProvider implements PaymentProvider {
   }
 
   private ensureLoaded(): void {
-    if (this.loaded) return;
     try {
       ensureDir(path.dirname(STATE_PATH));
-      if (fs.existsSync(STATE_PATH)) {
-        const raw = fs.readFileSync(STATE_PATH, 'utf-8');
-        const loaded = JSON.parse(raw) as Partial<DummyState>;
-        this.state = {
-          subscriptions: loaded.subscriptions || {},
-          nextId: loaded.nextId || 1,
-        };
-      } else {
-        this.save();
+      if (!fs.existsSync(STATE_PATH)) {
+        // First run in this env: persist the default state so mtime tracking
+        // has something to compare against from here on.
+        if (!this.loaded) {
+          this.save();
+          this.loaded = true;
+        }
+        return;
       }
+      const stat = fs.statSync(STATE_PATH);
+      if (this.loaded && stat.mtimeMs === this.stateMtimeMs) return;
+      const raw = fs.readFileSync(STATE_PATH, 'utf-8');
+      const loaded = JSON.parse(raw) as Partial<DummyState>;
+      this.state = {
+        subscriptions: loaded.subscriptions || {},
+        nextId: loaded.nextId || 1,
+      };
+      this.stateMtimeMs = stat.mtimeMs;
+      this.loaded = true;
     } catch (err) {
       console.error('[DummyProvider] Failed to load state:', err);
+      this.loaded = true;
     }
-    this.loaded = true;
   }
 
   private save(): void {
     try {
       ensureDir(path.dirname(STATE_PATH));
       fs.writeFileSync(STATE_PATH, JSON.stringify(this.state, null, 2));
+      try { this.stateMtimeMs = fs.statSync(STATE_PATH).mtimeMs; } catch { /* ignore */ }
     } catch (err) {
       console.error('[DummyProvider] Failed to save state:', err);
     }
