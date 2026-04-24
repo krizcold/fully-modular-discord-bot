@@ -1,13 +1,14 @@
 import { Client, CommandInteraction, ContextMenuCommandInteraction, Interaction, PermissionsBitField, MessageFlags } from 'discord.js';
 import getLocalCommands from '../../utils/getLocalCommands';
 import { getConfigProperty } from '../../utils/configManager';
+import { getPremiumManager } from '../../utils/premiumManager';
 
 const testServer = process.env.GUILD_ID || ''; // Test server ID
 
 export default async function handleCommands(client: Client, interaction: Interaction) {
   if (!interaction.isChatInputCommand() && !interaction.isContextMenuCommand()) return;
 
-  // Get commands fresh each time (supports hot-reload — new modules are visible immediately)
+  // Get commands fresh each time (supports hot-reload; new modules are visible immediately)
   const localCommandsSets = getLocalCommands();
   let localCommands: any[] = [];
 
@@ -72,6 +73,44 @@ export default async function handleCommands(client: Client, interaction: Intera
           }
         }
       }
+    }
+
+    // Check premium tier access for module commands
+    if (commandObject._moduleName && interaction.guildId) {
+      try {
+        const pm = getPremiumManager();
+        const tierOverrides = pm.getTierOverrides(interaction.guildId, commandObject._moduleName);
+
+        if (tierOverrides._moduleEnabled === false) {
+          interaction.reply({
+            content: pm.getMessages().moduleBlocked,
+            flags: MessageFlags.Ephemeral,
+          });
+          return;
+        }
+
+        if (Array.isArray(tierOverrides._disabledCommands) && tierOverrides._disabledCommands.includes(commandObject.name)) {
+          interaction.reply({
+            content: pm.getMessages().commandBlocked,
+            flags: MessageFlags.Ephemeral,
+          });
+          return;
+        }
+
+        // Manifest-driven tier gate (tierRequirement on the module)
+        const tr = commandObject._tierRequirement;
+        if (tr && typeof tr.minPriority === 'number') {
+          const gatedByCommands = Array.isArray(tr.gatedCommands) && tr.gatedCommands.length > 0;
+          const commandIsGated = !gatedByCommands || tr.gatedCommands.includes(commandObject.name);
+          if (commandIsGated && !pm.hasFeatureAccess(interaction.guildId, tr.minPriority)) {
+            interaction.reply({
+              content: gatedByCommands ? pm.getMessages().commandBlocked : pm.getMessages().moduleBlocked,
+              flags: MessageFlags.Ephemeral,
+            });
+            return;
+          }
+        }
+      } catch { /* premium manager not available; allow command */ }
     }
 
     await commandObject.callback(client, interaction as CommandInteraction | ContextMenuCommandInteraction);

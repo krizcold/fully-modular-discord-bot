@@ -300,8 +300,8 @@ export interface ConditionEvaluationResult {
 export interface MergedSettings {
   /** The merged setting values */
   values: Record<string, SettingValue>;
-  /** Source of each value ('default' | 'global' | 'guild') */
-  sources: Record<string, 'default' | 'global' | 'guild'>;
+  /** Source of each value ('default' | 'global' | 'tier' | 'guild') */
+  sources: Record<string, 'default' | 'global' | 'tier' | 'guild'>;
   /** The schema used */
   schema: SettingsSchema;
 }

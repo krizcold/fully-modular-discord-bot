@@ -69,7 +69,7 @@ export interface ModuleDataSchema {
 }
 
 /**
- * API credential field - defines a single credential input for premium modules
+ * API credential field - defines a single credential input for modules requiring API credentials
  */
 export interface ApiCredentialField {
   /** Field type */
@@ -95,7 +95,7 @@ export interface ApiCredentialField {
 }
 
 /**
- * API credentials schema - defines all credentials needed by a premium module
+ * API credentials schema - defines all credentials needed by a module requiring API credentials
  */
 export interface ApiCredentialsSchema {
   /** Schema for each credential field */
@@ -154,11 +154,27 @@ export interface ModuleManifest {
   /** Exported functions/classes for cross-module communication */
   exports?: Record<string, string>;
 
-  /** Whether this is a premium module requiring API credentials */
-  premium?: boolean;
-
-  /** API credentials schema for premium modules (shown during App Store install) */
+  /** API credentials schema (shown during App Store install when present) */
   apiCredentials?: ApiCredentialsSchema;
+
+  /**
+   * Premium tier gate: declarative feature restriction based on the guild's active tier.
+   * If a guild's effective tier priority is below `minPriority`, the module (or the listed
+   * commands / features) is blocked with the configured moduleBlocked / commandBlocked message.
+   */
+  tierRequirement?: {
+    /** Minimum tier priority required (matched against PremiumTier.priority). */
+    minPriority: number;
+    /** If set, only these specific commands are gated; the rest of the module works for all tiers. */
+    gatedCommands?: string[];
+    /**
+     * Named features within the module that are gated. Modules call
+     * `pm.hasFeature(guildId, moduleName, featureName)` from their own code when
+     * the feature is about to run: returns false when the guild's tier is below
+     * `minPriority` AND the feature name is in this list.
+     */
+    gatedFeatures?: string[];
+  };
 }
 
 /**

@@ -39,21 +39,38 @@ function saveRawSettings(moduleName: string, settings: Record<string, SettingVal
   fs.writeFileSync(filePath, JSON.stringify(settings, null, 2), 'utf-8');
 }
 
-/** Load module settings with 3-tier merge: Guild > Global > Schema defaults */
-export function loadModuleSettings(moduleName: string, guildId?: string | null, category?: string): MergedSettings | null {
-  const schema = getSettingsSchema(moduleName, category);
+/** Load module settings with 4-tier merge: Guild > Tier Overrides > Global > Schema defaults */
+export function loadModuleSettings(moduleName: string, guildId?: string | null): MergedSettings | null {
+  const schema = getSettingsSchema(moduleName);
   if (!schema) return null;
 
   const globalSettings = loadRawSettings(moduleName, null);
   const guildSettings = guildId ? loadRawSettings(moduleName, guildId) : {};
 
+  // Load tier overrides for this guild+module (if guild context)
+  let tierOverrides: Record<string, any> = {};
+  if (guildId) {
+    try {
+      const { getPremiumManager } = require('../premiumManager');
+      const pm = getPremiumManager();
+      const raw = pm.getTierOverrides(guildId, moduleName);
+      // Filter out internal keys (_moduleEnabled, _disabledCommands)
+      for (const [k, v] of Object.entries(raw)) {
+        if (!k.startsWith('_')) tierOverrides[k] = v;
+      }
+    } catch { /* premium manager not available */ }
+  }
+
   const values: Record<string, SettingValue> = {};
-  const sources: Record<string, 'default' | 'global' | 'guild'> = {};
+  const sources: Record<string, 'default' | 'global' | 'tier' | 'guild'> = {};
 
   for (const [key, definition] of Object.entries(schema.settings)) {
     if (guildId && guildSettings.hasOwnProperty(key)) {
       values[key] = guildSettings[key];
       sources[key] = 'guild';
+    } else if (tierOverrides.hasOwnProperty(key)) {
+      values[key] = tierOverrides[key];
+      sources[key] = 'tier';
     } else if (globalSettings.hasOwnProperty(key)) {
       values[key] = globalSettings[key];
       sources[key] = 'global';
@@ -67,8 +84,8 @@ export function loadModuleSettings(moduleName: string, guildId?: string | null, 
 }
 
 /** Save a single setting */
-export function saveModuleSetting(moduleName: string, key: string, value: SettingValue, guildId?: string | null, category?: string): boolean {
-  const schema = getSettingsSchema(moduleName, category);
+export function saveModuleSetting(moduleName: string, key: string, value: SettingValue, guildId?: string | null): boolean {
+  const schema = getSettingsSchema(moduleName);
   if (!schema?.settings[key]) return false;
 
   const settings = loadRawSettings(moduleName, guildId);
@@ -83,8 +100,8 @@ export function saveModuleSetting(moduleName: string, key: string, value: Settin
 }
 
 /** Save multiple settings */
-export function saveModuleSettings(moduleName: string, updates: Record<string, SettingValue>, guildId?: string | null, category?: string): boolean {
-  const schema = getSettingsSchema(moduleName, category);
+export function saveModuleSettings(moduleName: string, updates: Record<string, SettingValue>, guildId?: string | null): boolean {
+  const schema = getSettingsSchema(moduleName);
   if (!schema) return false;
 
   const settings = loadRawSettings(moduleName, guildId);
@@ -128,14 +145,14 @@ export function resetAllModuleSettings(moduleName: string, guildId?: string | nu
 }
 
 /** Get schema default for a setting */
-export function getSettingDefault(moduleName: string, key: string, category?: string): SettingValue | undefined {
-  const schema = getSettingsSchema(moduleName, category);
+export function getSettingDefault(moduleName: string, key: string): SettingValue | undefined {
+  const schema = getSettingsSchema(moduleName);
   return schema?.settings[key]?.default;
 }
 
 /** Get a single setting value */
-export function getModuleSetting<T extends SettingValue>(moduleName: string, key: string, guildId?: string | null, category?: string): T | undefined {
-  const merged = loadModuleSettings(moduleName, guildId, category);
+export function getModuleSetting<T extends SettingValue>(moduleName: string, key: string, guildId?: string | null): T | undefined {
+  const merged = loadModuleSettings(moduleName, guildId);
   return merged?.values[key] as T | undefined;
 }
 
@@ -145,8 +162,8 @@ export function exportModuleSettings(moduleName: string, guildId?: string | null
 }
 
 /** Import settings from JSON */
-export function importModuleSettings(moduleName: string, jsonData: string | Record<string, SettingValue>, guildId?: string | null, category?: string): { success: boolean; errors: string[] } {
-  const schema = getSettingsSchema(moduleName, category);
+export function importModuleSettings(moduleName: string, jsonData: string | Record<string, SettingValue>, guildId?: string | null): { success: boolean; errors: string[] } {
+  const schema = getSettingsSchema(moduleName);
   if (!schema) return { success: false, errors: ['No schema found'] };
 
   let data: Record<string, SettingValue>;

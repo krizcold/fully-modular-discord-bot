@@ -196,14 +196,28 @@ function renderSettingsPanel(
   panelId: string,
   isGlobal: boolean
 ): PanelResponse {
-  const settings = loadModuleSettings(moduleName, guildId, category);
+  const settings = loadModuleSettings(moduleName, guildId);
 
   if (!settings) {
     return createV2Response(buildErrorPanel('Failed to load settings. Schema may be invalid.'));
   }
 
-  // Load hard limits for this module (always from global settings)
-  const hardLimits = loadHardLimits(moduleName);
+  // Load hard limits: global, then merge tier-supplied limits on top (tier wins on overlap).
+  // Tier limits come from the guild's active tier's overrides[moduleName]._hardLimits.
+  let hardLimits = loadHardLimits(moduleName);
+  if (guildId) {
+    try {
+      const { getPremiumManager } = require('../premiumManager');
+      const tierLimits = getPremiumManager().getTierHardLimits(guildId, moduleName);
+      if (tierLimits && Object.keys(tierLimits).length > 0) {
+        const merged: Record<string, any> = { ...hardLimits };
+        for (const [k, v] of Object.entries(tierLimits)) {
+          merged[k] = { ...(merged[k] || {}), ...(v as any) };
+        }
+        hardLimits = merged;
+      }
+    } catch { /* premium manager not available */ }
+  }
 
   // Apply pending changes to display
   const displaySettings: MergedSettings = {

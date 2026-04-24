@@ -57,6 +57,11 @@ export default function getLocalCommands(exceptions: string[] = []): any[] {
     for (const module of modules) {
       for (const command of module.commands) {
         if (command && command.name && !exceptions.includes(command.name)) {
+          // Tag command with its owning module name + tier requirement for runtime enforcement
+          command._moduleName = module.manifest.name;
+          if (module.manifest.tierRequirement) {
+            command._tierRequirement = module.manifest.tierRequirement;
+          }
           localCommands.push(command);
           moduleCommandCount++;
         }

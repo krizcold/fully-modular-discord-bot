@@ -1,5 +1,7 @@
 import { Client } from 'discord.js';
 import { getConfigProperty } from './configManager';
+import { getPremiumManager } from './premiumManager';
+import { getModuleRegistry } from './moduleRegistry';
 import {
   PanelOptions,
   PanelContext,
@@ -34,8 +36,21 @@ import {
   handlePersistentPanelModal,
   shouldBePersistent
 } from './panel/persistentPanelResponse';
-import { migratePersistentPanels } from './panel/persistentPanelStorage';
+import { cleanupPersistentPanelsOnStartup } from './panel/persistentPanelStorage';
 import { recoverPersistentPanels } from './panel/persistentPanelRecovery';
+
+/**
+ * Extract module name from a panel, if it belongs to a module.
+ * Settings panels use IDs like "settings_moduleName" or "settings_global_moduleName".
+ * Module panels may have _moduleName set during registration.
+ */
+function extractModuleNameFromPanel(panel: PanelOptions): string | null {
+  if ((panel as any)._moduleName) return (panel as any)._moduleName;
+  const id = panel.id;
+  if (id.startsWith('settings_global_')) return id.replace('settings_global_', '');
+  if (id.startsWith('settings_')) return id.replace('settings_', '');
+  return null;
+}
 
 /**
  * Main Panel Manager - Orchestrates panel loading, execution, and interactions
@@ -78,7 +93,7 @@ export class PanelManager {
     this.registerDropdownHandler();
     this.registerModalHandler();
 
-    await migratePersistentPanels(this.client);
+    await cleanupPersistentPanelsOnStartup(this.client);
     // Note: recoverPersistentPanels is called separately after client is ready
   }
 
@@ -179,6 +194,33 @@ export class PanelManager {
         'Panel Not Found',
         `The panel '${context.panelId}' could not be found.`
       );
+    }
+
+    // Check premium tier access for module panels
+    if (context.guildId && panel.panelScope !== 'system') {
+      const moduleName = extractModuleNameFromPanel(panel);
+      if (moduleName) {
+        try {
+          const pm = getPremiumManager();
+          const tierOverrides = pm.getTierOverrides(context.guildId, moduleName);
+          if (tierOverrides._moduleEnabled === false) {
+            return createPanelError(
+              'Tier Restricted',
+              pm.getMessages().panelBlocked
+            );
+          }
+
+          // Manifest-driven tier gate
+          try {
+            const registry = getModuleRegistry();
+            const mod = registry.getModule(moduleName);
+            const tr = mod?.manifest?.tierRequirement;
+            if (tr && typeof tr.minPriority === 'number' && !pm.hasFeatureAccess(context.guildId, tr.minPriority)) {
+              return createPanelError('Tier Restricted', pm.getMessages().panelBlocked);
+            }
+          } catch { /* module registry unavailable */ }
+        } catch { /* premium manager not available; allow panel */ }
+      }
     }
 
     if (!checkPanelPermissions(panel, context)) {
