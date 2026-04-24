@@ -16,7 +16,7 @@
 function renderDiscordEmoji(emoji, key) {
   if (!emoji) return null;
 
-  // Handle string (legacy format or unicode)
+  // String input: either a unicode emoji or a serialized "<:name:id>" form
   if (typeof emoji === 'string') {
     // Check if it's a custom Discord emoji format: <:name:id> or <a:name:id>
     const customMatch = emoji.match(/^<(a)?:(\w+):(\d+)>$/);
@@ -426,3 +426,96 @@ function parseDiscordFormatting(text) {
   `;
   document.head.appendChild(style);
 })();
+
+/**
+ * Shortcode emoji map (e.g. "no_entry_sign" -> "🚫"), loaded lazily from
+ * /utils/emojiShortcodes.json. Before the fetch resolves, parsing falls back
+ * to leaving `:name:` text untouched. Callers can subscribe via
+ * onDiscordEmojiMapReady(cb) to re-render once the map arrives.
+ */
+var __discordEmojiMap = null;
+var __discordEmojiMapReadyCallbacks = [];
+var __discordEmojiMapLoadStarted = false;
+
+function onDiscordEmojiMapReady(cb) {
+  if (__discordEmojiMap) {
+    try { cb(); } catch (e) { /* swallow */ }
+    return function () {};
+  }
+  __discordEmojiMapReadyCallbacks.push(cb);
+  return function () {
+    var idx = __discordEmojiMapReadyCallbacks.indexOf(cb);
+    if (idx >= 0) __discordEmojiMapReadyCallbacks.splice(idx, 1);
+  };
+}
+
+function __loadDiscordEmojiMap() {
+  if (__discordEmojiMapLoadStarted) return;
+  __discordEmojiMapLoadStarted = true;
+  fetch('/utils/emojiShortcodes.json')
+    .then(function (r) { return r.ok ? r.json() : {}; })
+    .then(function (map) {
+      __discordEmojiMap = map || {};
+      var cbs = __discordEmojiMapReadyCallbacks.slice();
+      __discordEmojiMapReadyCallbacks.length = 0;
+      cbs.forEach(function (cb) {
+        try { cb(); } catch (e) { /* swallow */ }
+      });
+    })
+    .catch(function () {
+      __discordEmojiMap = {};
+    });
+}
+__loadDiscordEmojiMap();
+
+/**
+ * Look up a single shortcode (without surrounding colons). Returns the
+ * unicode emoji, or null if not found or map not loaded yet.
+ */
+function lookupDiscordShortcode(name) {
+  if (!__discordEmojiMap) return null;
+  if (Object.prototype.hasOwnProperty.call(__discordEmojiMap, name)) {
+    return __discordEmojiMap[name];
+  }
+  var lower = name.toLowerCase();
+  if (Object.prototype.hasOwnProperty.call(__discordEmojiMap, lower)) {
+    return __discordEmojiMap[lower];
+  }
+  return null;
+}
+
+/**
+ * Parse text and replace `:shortcode:` sequences with unicode emoji characters.
+ * Leaves the original text untouched for unknown shortcodes or while the map
+ * is still loading. Skips sequences that look like custom Discord emoji IDs
+ * (i.e. :name:12345 patterns that are part of `<:name:id>`).
+ *
+ * @param {string} text
+ * @returns string with shortcodes substituted where possible
+ */
+function parseDiscordShortcodes(text) {
+  if (!text || typeof text !== 'string') return text;
+  if (!__discordEmojiMap) return text;
+
+  // Match :name: where name is letters, digits, _ or - and the closing colon
+  // is NOT followed by digits+ > (which would indicate <:name:id> custom emoji).
+  // Also avoid matching inside `<:...>` by requiring the preceding char to not
+  // be `<` or `<a`.
+  var re = /(?<!<a?):([a-zA-Z0-9_+\-]+):(?!\d+>)/g;
+  return text.replace(re, function (match, name) {
+    var hit = lookupDiscordShortcode(name);
+    return hit != null ? hit : match;
+  });
+}
+
+/**
+ * Full inline formatting: custom <:name:id> emojis -> <img>, shortcodes -> unicode.
+ * Returns a React-renderable array (or string if nothing to replace).
+ */
+function parseDiscordInline(text) {
+  if (!text || typeof text !== 'string') return text;
+  // First pass: substitute shortcodes to unicode in the raw text
+  var withUnicode = parseDiscordShortcodes(text);
+  // Second pass: replace <:name:id> / <a:name:id> with <img> elements
+  return parseDiscordEmojis(withUnicode);
+}
