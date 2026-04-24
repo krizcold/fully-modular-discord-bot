@@ -622,11 +622,35 @@ export class PremiumManager {
       const subs = this.config.subscriptions[guildId];
       if (subs.manual?.tierId === tierId) delete subs.manual;
       if (subs.paid?.tierId === tierId) delete subs.paid;
-      if (!subs.manual && !subs.paid) delete this.config.subscriptions[guildId];
+      // Evict any paused paid subs of the deleted tier; if the active slot
+      // is now free as a result of the delete above, let the next paused
+      // sub in line (if any) resume into it so the guild isn't stuck at Free
+      // while it still owns a lower-priority paused sub.
+      if (subs.pausedPaid && subs.pausedPaid.length > 0) {
+        subs.pausedPaid = subs.pausedPaid.filter(p => p.tierId !== tierId);
+        if (subs.pausedPaid.length === 0) delete subs.pausedPaid;
+      }
+      if (!subs.paid && subs.pausedPaid && subs.pausedPaid.length > 0) {
+        this.resumeHighestPausedPaid(guildId);
+      }
+      if (this.guildSubsEmpty(subs)) delete this.config.subscriptions[guildId];
     }
 
     delete this.config.tiers[tierId];
     return this.save();
+  }
+
+  /**
+   * True when a `GuildSubscriptions` entry has no remaining state (no manual,
+   * no active paid, no paused paid). Used to safely prune the per-guild
+   * record without losing a paused queue that would otherwise become
+   * unreachable.
+   */
+  private guildSubsEmpty(subs: GuildSubscriptions): boolean {
+    if (subs.manual) return false;
+    if (subs.paid) return false;
+    if (subs.pausedPaid && subs.pausedPaid.length > 0) return false;
+    return true;
   }
 
   getTiersSortedByPriority(): Array<{ id: string; tier: PremiumTier }> {
@@ -735,7 +759,7 @@ export class PremiumManager {
     const subs = this.config.subscriptions[guildId];
     if (!subs?.manual) return true;
     delete subs.manual;
-    if (!subs.manual && !subs.paid) delete this.config.subscriptions[guildId];
+    if (this.guildSubsEmpty(subs)) delete this.config.subscriptions[guildId];
     return this.save();
   }
 
@@ -761,7 +785,12 @@ export class PremiumManager {
     const subs = this.config.subscriptions[guildId];
     if (!subs?.paid) return true;
     delete subs.paid;
-    if (!subs.manual && !subs.paid) delete this.config.subscriptions[guildId];
+    // Let the next paused sub (if any) resume into the now-free active slot
+    // so cancellation/clearing doesn't trap a queued lower-priority sub.
+    if (subs.pausedPaid && subs.pausedPaid.length > 0) {
+      this.resumeHighestPausedPaid(guildId);
+    }
+    if (this.guildSubsEmpty(subs)) delete this.config.subscriptions[guildId];
     return this.save();
   }
 
