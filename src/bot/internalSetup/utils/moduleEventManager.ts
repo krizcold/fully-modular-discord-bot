@@ -2,7 +2,7 @@
  * Module Event Manager
  *
  * Tracks event listeners per-module so they can be removed on unload.
- * Replaces anonymous closure registration — every module event handler
+ * Replaces anonymous closure registration; every module event handler
  * is wrapped and stored with its reference, enabling clean removal
  * via client.removeListener().
  */
@@ -42,7 +42,7 @@ class ModuleEventManager {
     handler: Function
   ): void {
     if (!this.client) {
-      throw new Error('[ModuleEventManager] Client not set — call setClient() first');
+      throw new Error('[ModuleEventManager] Client not set; call setClient() first');
     }
 
     const wrappedHandler = async (...args: any[]) => {

@@ -107,7 +107,7 @@ export function unregisterReactionHandler(client: Client, messageId: string, emo
             console.log(`[ReactionHandler] Unregistered handler for message ${messageId}, emoji ${emojiIdentifier}`);
         }
     } else {
-        // Remove all handlers for this message (backwards compatibility)
+        // No emoji specified; remove every reaction handler for this message
         let removed = 0;
         for (const key of client.reactionHandlers?.keys() || []) {
             if (key.startsWith(`${messageId}_`)) {

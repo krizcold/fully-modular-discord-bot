@@ -11,7 +11,7 @@ export function getBotRoot(): string {
 }
 
 /**
- * Get the modules directory path (runtime — compiled dist)
+ * Get the modules directory path (runtime; compiled dist)
  * @returns Absolute path to the modules directory
  */
 export function getModulesDir(): string {

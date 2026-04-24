@@ -14,7 +14,7 @@ export interface SettingComponentOptions {
   settingKey: string;
   definition: SettingDefinition;
   value: SettingValue;
-  source: 'default' | 'global' | 'guild';
+  source: 'default' | 'global' | 'tier' | 'guild';
   defaultValue: SettingValue;
   disabled?: boolean;
   moduleName?: string;

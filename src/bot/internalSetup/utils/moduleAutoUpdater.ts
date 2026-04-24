@@ -3,7 +3,7 @@
  *
  * When enabled via the "Auto-Update Modules" toggle in AppStore config,
  * periodically checks for module updates, downloads them, and hot-reloads
- * changed modules — all without restarting the bot.
+ * changed modules, all without restarting the bot.
  *
  * Config: /data/global/appstore/config.json → autoUpdate (boolean)
  * Default: disabled

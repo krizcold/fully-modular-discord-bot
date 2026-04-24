@@ -19,7 +19,7 @@ let clientRef: Client | null = null;
  */
 export function setupReloadIPCHandlers(client: Client): void {
   if (!process.send) {
-    console.warn('[IPCReloadHandler] process.send not available — IPC handlers not registered');
+    console.warn('[IPCReloadHandler] process.send not available; IPC handlers not registered');
     return;
   }
 

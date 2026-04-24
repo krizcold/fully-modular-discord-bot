@@ -25,7 +25,7 @@ export function isAutoCleanupEnabled(): boolean {
   return false;
 }
 
-/** Load component toggle config — returns set of disabled command keys */
+/** Load component toggle config; returns set of disabled command keys */
 function getDisabledCommands(): Set<string> {
   const disabled = new Set<string>();
   try {
@@ -34,7 +34,7 @@ function getDisabledCommands(): Set<string> {
       const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
       for (const [key, value] of Object.entries(config)) {
         if (value === false && key.includes(':command:')) {
-          // key format: "moduleName:command:commandName" — extract commandName
+          // key format: "moduleName:command:commandName"; extract commandName
           const parts = key.split(':');
           if (parts.length >= 3) {
             disabled.add(parts[parts.length - 1]);

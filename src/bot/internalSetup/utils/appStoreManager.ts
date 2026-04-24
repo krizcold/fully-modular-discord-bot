@@ -603,10 +603,10 @@ export class AppStoreManager {
       const stderr = err.stderr?.toString() || err.message || '';
       console.error(`[AppStoreManager] Repo access test failed: ${stderr}`);
       if (stderr.includes('Authentication failed') || stderr.includes('could not read Username') || stderr.includes('403')) {
-        return { ok: false, error: 'Authentication failed — check your GitHub token' };
+        return { ok: false, error: 'Authentication failed: check your GitHub token' };
       }
       if (stderr.includes('not found') || stderr.includes('Repository not found') || stderr.includes('404')) {
-        return { ok: false, error: 'Repository not found — check the URL and token' };
+        return { ok: false, error: 'Repository not found: check the URL and token' };
       }
       return { ok: false, error: stderr.split('\n')[0] || 'Could not reach repository' };
     }
@@ -751,7 +751,7 @@ export class AppStoreManager {
   /**
    * Get modules from cache only (no git operations).
    * For repos not yet cached, scans the local cache directory if it exists.
-   * Returns instantly — never triggers network requests.
+   * Returns instantly; never triggers network requests.
    */
   getCachedModules(): StoreModuleInfo[] {
     const allModules: StoreModuleInfo[] = [];
@@ -923,7 +923,7 @@ export class AppStoreManager {
   getModuleComponents(moduleName: string, repoId?: string): { commands: string[]; events: string[]; panels: string[] } {
     const result = { commands: [] as string[], events: [] as string[], panels: [] as string[] };
 
-    // Try repo cache first — scan for Modules/ directory (case-insensitive, same as scanForModules)
+    // Try repo cache first: scan for Modules/ directory (case-insensitive, same as scanForModules)
     let moduleDir: string | null = null;
     if (repoId) {
       const cacheDir = path.join(CACHE_DIR, repoId);
@@ -1204,8 +1204,7 @@ export class AppStoreManager {
         // Detect update: commit mismatch (primary) OR version bump (secondary)
         const versionChanged = this.compareVersions(installed.version, moduleInfo.manifest.version) < 0;
         const commitChanged = !!(currentRepoCommit && installed.commitHash && currentRepoCommit !== installed.commitHash);
-        const noCommitTracking = !installed.commitHash; // legacy install without commit tracking
-        const hasUpdate = commitChanged || versionChanged || (noCommitTracking && versionChanged);
+        const hasUpdate = commitChanged || versionChanged;
 
         const updateCheck: ModuleUpdateCheck = {
           moduleName: installed.name,

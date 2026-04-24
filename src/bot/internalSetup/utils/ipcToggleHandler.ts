@@ -261,7 +261,7 @@ export async function applyComponentToggleState(
           console.log(`[Toggle] Re-applied disabled state for panel ${keyName}`);
         } catch { /* ignore */ }
         break;
-      // Commands handled by registerCommands — no action needed here
+      // Commands handled by registerCommands; no action needed here
     }
   }
 }

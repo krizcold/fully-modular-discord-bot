@@ -65,7 +65,7 @@ export function setupPanelIPCHandlers(): void {
 
     const { type, requestId, data } = message;
 
-    // Only handle panel/bot/guild/dev IPC messages — skip others (handled by reload/toggle handlers)
+    // Only handle panel/bot/guild/dev IPC messages; skip others (handled by reload/toggle handlers)
     const ownedPrefixes = ['panel:', 'dev:', 'bot:', 'guild:'];
     if (!ownedPrefixes.some(p => type.startsWith(p))) return;
 
