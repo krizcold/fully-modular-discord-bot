@@ -1,15 +1,47 @@
 // src/webui/routes/setup.ts
 //
-// NOTE: Main credentials (DISCORD_TOKEN, CLIENT_ID, GUILD_ID) are now
-// managed by Bot Manager. This route only handles optional/bot-specific settings.
+// Handles credential management for both bot and Guild Web-UI settings.
+// Under managed deployments (BUILD_MODE=managed), bot credentials (DISCORD_TOKEN,
+// CLIENT_ID, GUILD_ID) are owned by the external bot manager and this endpoint
+// rejects attempts to modify them. Guild Web-UI credentials are editable in
+// both modes and trigger a hot-reload of the OAuth strategy without a restart.
 
 import { Router, Request, Response } from 'express';
 import {
   loadCredentials,
   saveCredentials,
   getCredentialStatus,
-  BotCredentials
+  BotCredentials,
+  getDeploymentMode
 } from '../../utils/envLoader';
+import { reconfigureOAuth } from '../auth/oauthConfig';
+
+const OAUTH_FIELDS = ['ENABLE_GUILD_WEBUI', 'DISCORD_CLIENT_ID', 'DISCORD_CLIENT_SECRET', 'OAUTH_CALLBACK_URL'] as const;
+
+/**
+ * Classify credential changes by their reload semantics. Returns a per-field
+ * array the client can surface (e.g. "applied live", "bot needs restart").
+ */
+function computeReloadActions(
+  before: BotCredentials,
+  after: BotCredentials
+): Array<{ field: string; action: 'hot-inplace' | 'web-ui-remount' | 'bot-reconnect' | 'session-invalidate' }> {
+  const changes: Array<{ field: string; action: 'hot-inplace' | 'web-ui-remount' | 'bot-reconnect' | 'session-invalidate' }> = [];
+  const allKeys = new Set([...Object.keys(before), ...Object.keys(after)]);
+  for (const key of allKeys) {
+    if (before[key] === after[key]) continue;
+    if (OAUTH_FIELDS.includes(key as any)) {
+      changes.push({ field: key, action: 'web-ui-remount' });
+    } else if (key === 'SESSION_SECRET') {
+      changes.push({ field: key, action: 'session-invalidate' });
+    } else if (key === 'DISCORD_TOKEN' || key === 'CLIENT_ID' || key === 'GUILD_ID') {
+      changes.push({ field: key, action: 'bot-reconnect' });
+    } else {
+      changes.push({ field: key, action: 'hot-inplace' });
+    }
+  }
+  return changes;
+}
 
 export function createSetupRoutes(): Router {
   const router = Router();
@@ -44,6 +76,8 @@ export function createSetupRoutes(): Router {
         // Main credentials are managed by Bot Manager
         mainCredentialsConfigured,
         managedByBotManager: ['DISCORD_TOKEN', 'CLIENT_ID', 'GUILD_ID'],
+        // Deployment mode: UI uses this to hide / disable bot credential fields when managed
+        deploymentMode: getDeploymentMode(),
         // Optional settings status
         credentials: status,
         guildIds: guildIds
@@ -180,13 +214,37 @@ export function createSetupRoutes(): Router {
         return;
       }
 
+      // Classify what changed so the client can surface per-field feedback.
+      const reloadActions = computeReloadActions(existingCredentials, credentials);
+
+      // Hot-reload Guild Web-UI OAuth when any OAuth-related field changed.
+      const oauthChanged = reloadActions.some(c => c.action === 'web-ui-remount');
+      if (oauthChanged) {
+        try {
+          reconfigureOAuth();
+        } catch (err) {
+          console.error('[Setup] reconfigureOAuth failed:', err);
+        }
+      }
+
       // Return masked status (NEVER return actual values)
       const status = getCredentialStatus(credentials);
 
       res.json({
         success: true,
         message: 'Settings saved successfully',
-        credentials: status
+        credentials: status,
+        // Per-field reload actions so the UI can show what happened:
+        //   hot-inplace       : applied live, no further action needed
+        //   web-ui-remount    : OAuth strategy reconfigured live
+        //   bot-reconnect     : bot process needs to restart (ignored in managed mode)
+        //   session-invalidate: SESSION_SECRET changed; active sessions logged out on restart
+        reload: {
+          changes: reloadActions,
+          oauthReconfigured: oauthChanged,
+          sessionSecretChanged: reloadActions.some(c => c.action === 'session-invalidate'),
+          botCredentialsChanged: reloadActions.some(c => c.action === 'bot-reconnect'),
+        }
       });
 
     } catch (error) {
@@ -196,6 +254,14 @@ export function createSetupRoutes(): Router {
         error: errorMessage
       });
     }
+  });
+
+  /**
+   * GET /api/setup/deployment-mode
+   * Returns the current deployment mode. UI uses this to gate bot credential editing.
+   */
+  router.get('/deployment-mode', (_req: Request, res: Response) => {
+    res.json({ success: true, mode: getDeploymentMode() });
   });
 
   /**
@@ -222,7 +288,7 @@ export function createSetupRoutes(): Router {
             'Right-click on your main/production server icon',
             'Click "Copy Server ID" and paste it here',
             'If left empty, it will default to Guild ID',
-            'Web-UI panels and mainGuildOnly features use this server'
+            'Web-UI panels and system-scope features use this server'
           ],
           example: '987654321098765432 (or leave empty)'
         },

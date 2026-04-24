@@ -4,6 +4,18 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as dotenv from 'dotenv';
 
+/**
+ * Deployment mode.
+ * - `managed`: bot runs under the external docker-discord-bot-manager; bot credentials (DISCORD_TOKEN,
+ *   CLIENT_ID, GUILD_ID) are owned by the manager and MUST NOT be editable from this Web-UI.
+ * - `standalone`: bot runs on its own; all credential fields are editable.
+ */
+export type DeploymentMode = 'managed' | 'standalone';
+
+export function getDeploymentMode(): DeploymentMode {
+  return process.env.BUILD_MODE === 'managed' ? 'managed' : 'standalone';
+}
+
 export interface BotCredentials {
   DISCORD_TOKEN?: string;
   CLIENT_ID?: string;

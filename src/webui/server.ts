@@ -14,10 +14,12 @@ import { createConfigRoutes } from './routes/config';
 import { createAppStoreRoutes } from './routes/appstore';
 import { createPanelRoutes } from './routes/panels';
 import { createGuildPanelRoutes } from './routes/guildPanels';
+import { createGuildSubscriptionRoutes } from './routes/guildSubscriptions';
 import { createUpdateRouter } from './routes/update';
 import { createDevModulesRoutes } from './routes/devmodules';
 import { requireAuth } from './middleware/auth';
 import { configureOAuth, isGuildWebUIEnabled } from './auth/oauthConfig';
+import { requireGuildWebUIEnabled } from './auth/oauthMiddleware';
 import { getSessionMiddleware } from './auth/sessionManager';
 import oauthRoutes from './auth/oauthRoutes';
 
@@ -28,22 +30,23 @@ export async function createServer(botManager: BotManager): Promise<Express> {
   // This allows express-rate-limit to correctly identify client IPs from X-Forwarded-For header
   app.set('trust proxy', 1);
 
-  // Configure OAuth and sessions if Guild Web-UI is enabled
+  // Session middleware + Passport are ALWAYS installed so that Guild Web-UI
+  // credentials can be added / removed at runtime via the Credentials panel
+  // without restarting the bot. Routes that depend on OAuth use
+  // requireGuildWebUIEnabled to gate per-request.
+  const sessionConfig = await getSessionMiddleware();
+  app.use(session(sessionConfig));
+  app.use(passport.initialize());
+  app.use(passport.session());
+
+  // Configure OAuth strategy. Idempotent no-op when disabled / creds missing;
+  // can be re-invoked later via reconfigureOAuth() from the credentials save path.
+  configureOAuth();
+
   if (isGuildWebUIEnabled()) {
-    console.log('[Server] Guild Web-UI enabled - configuring OAuth');
-
-    // Configure session middleware
-    const sessionConfig = await getSessionMiddleware();
-    app.use(session(sessionConfig));
-
-    // Initialize passport
-    app.use(passport.initialize());
-    app.use(passport.session());
-
-    // Configure OAuth strategy
-    configureOAuth();
+    console.log('[Server] Guild Web-UI enabled at boot');
   } else {
-    console.log('[Server] Guild Web-UI disabled');
+    console.log('[Server] Guild Web-UI disabled at boot; routes are mounted but gated and will 503 until enabled');
   }
 
   // Security headers
@@ -206,18 +209,14 @@ export async function createServer(botManager: BotManager): Promise<Express> {
     });
   });
 
-  // OAuth Routes (NO requireAuth - accessible via nginx ALLOWED_PATHS: "/auth")
-  if (isGuildWebUIEnabled()) {
-    app.use('/auth', oauthRoutes);
-    console.log('[Server] OAuth routes mounted at /auth');
-  }
-
-  // Guild Panel Routes (NO requireAuth - OAuth middleware handles authentication)
-  // Accessible via nginx ALLOWED_PATHS: "/guild"
-  if (isGuildWebUIEnabled()) {
-    app.use('/guild/api/panels', createGuildPanelRoutes(botManager));
-    console.log('[Server] Guild panel routes mounted at /guild/api/panels');
-  }
+  // OAuth + Guild API routes are mounted UNCONDITIONALLY. Each router is
+  // gated by requireGuildWebUIEnabled, which checks state at request time.
+  // This lets the Credentials panel enable / disable Guild Web-UI without
+  // requiring a bot restart.
+  app.use('/auth', requireGuildWebUIEnabled, oauthRoutes);
+  app.use('/guild/api/panels', requireGuildWebUIEnabled, createGuildPanelRoutes(botManager));
+  app.use('/guild/api/subscriptions', requireGuildWebUIEnabled, createGuildSubscriptionRoutes());
+  console.log('[Server] Auth + Guild API routes mounted (request-time gated by ENABLE_GUILD_WEBUI)');
 
   // Owner API Routes (requireAuth - protected by AUTH_HASH via nginx)
   // NGINX handles primary auth, Express validates as defense in depth

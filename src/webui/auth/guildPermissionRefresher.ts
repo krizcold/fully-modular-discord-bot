@@ -3,6 +3,53 @@
 
 import axios from 'axios';
 import { DiscordUser, DiscordGuild } from './oauthConfig';
+import { loadCredentials } from '../../utils/envLoader';
+
+const FIVE_MINUTES_MS = 5 * 60 * 1000;
+
+/**
+ * Refresh the user's Discord access token if it's within 5 minutes of
+ * expiring. Returns a user object with fresh accessToken / refreshToken /
+ * tokenExpiresAt when refreshed; the same user unchanged otherwise.
+ *
+ * On refresh failure, returns the unchanged user; the caller will fall
+ * through to the existing 401 path and the OAuth flow restarts the session.
+ */
+async function refreshAccessTokenIfNeeded(user: DiscordUser): Promise<DiscordUser> {
+  if (!user.refreshToken || !user.tokenExpiresAt) return user;
+  if (user.tokenExpiresAt > Date.now() + FIVE_MINUTES_MS) return user;
+
+  const credentials = loadCredentials();
+  const clientID = credentials.DISCORD_CLIENT_ID;
+  const clientSecret = credentials.DISCORD_CLIENT_SECRET;
+  if (!clientID || !clientSecret) return user;
+
+  try {
+    const body = new URLSearchParams({
+      client_id: clientID,
+      client_secret: clientSecret,
+      grant_type: 'refresh_token',
+      refresh_token: user.refreshToken,
+    }).toString();
+
+    const response = await axios.post(
+      'https://discord.com/api/oauth2/token',
+      body,
+      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, timeout: 10000 }
+    );
+
+    const { access_token, refresh_token, expires_in } = response.data;
+    return {
+      ...user,
+      accessToken: access_token,
+      refreshToken: refresh_token || user.refreshToken,
+      tokenExpiresAt: Date.now() + (Number(expires_in) || 604800) * 1000,
+    };
+  } catch (error: any) {
+    console.error('[GuildPermissionRefresher] Failed to refresh access token:', error?.message || error);
+    return user;
+  }
+}
 
 /**
  * Cache entry for user guilds
@@ -37,16 +84,37 @@ const RATE_LIMIT_MS = 60 * 1000; // 1 minute between forced refreshes
  * @returns Array of guilds with permissions
  */
 async function fetchUserGuildsFromDiscord(accessToken: string): Promise<DiscordGuild[]> {
-  try {
-    const response = await axios.get('https://discord.com/api/users/@me/guilds', {
-      headers: {
-        Authorization: `Bearer ${accessToken}`
-      }
-    });
+  const url = 'https://discord.com/api/users/@me/guilds';
+  const headers = { Authorization: `Bearer ${accessToken}` };
+  const timeout = 10000;
 
+  try {
+    const response = await axios.get(url, { headers, timeout });
     return response.data;
-  } catch (error) {
-    console.error('[GuildPermissionRefresher] Error fetching guilds from Discord:', error);
+  } catch (error: any) {
+    // 401: access token expired / invalidated. Caller should force re-auth.
+    if (error?.response?.status === 401) {
+      console.warn('[GuildPermissionRefresher] Discord 401: access token expired or invalid');
+      throw new Error('DISCORD_TOKEN_INVALID');
+    }
+
+    // 429: rate limited. Respect Retry-After and retry once with a capped wait.
+    if (error?.response?.status === 429) {
+      const rawRetry = error.response.headers?.['retry-after'];
+      const retrySeconds = typeof rawRetry === 'string' ? parseFloat(rawRetry) : Number(rawRetry);
+      const retryMs = Math.min(Math.max(Number.isFinite(retrySeconds) ? retrySeconds * 1000 : 1000, 500), 10000);
+      console.warn(`[GuildPermissionRefresher] Discord 429: retrying after ${retryMs}ms`);
+      await new Promise(resolve => setTimeout(resolve, retryMs));
+      try {
+        const retryResponse = await axios.get(url, { headers, timeout });
+        return retryResponse.data;
+      } catch (retryErr: any) {
+        console.error('[GuildPermissionRefresher] Retry after 429 failed:', retryErr?.message || retryErr);
+        throw new Error('Discord API rate limit exceeded; retry failed');
+      }
+    }
+
+    console.error('[GuildPermissionRefresher] Error fetching guilds from Discord:', error?.message || error);
     throw new Error('Failed to fetch guilds from Discord API');
   }
 }
@@ -89,6 +157,10 @@ export async function refreshUserGuilds(user: DiscordUser, forceRefresh: boolean
   console.log(`[GuildPermissionRefresher] Refreshing guilds for user ${userId} from Discord API`);
 
   try {
+    // Refresh access token first if it's near expiry.
+    const tokenUser = await refreshAccessTokenIfNeeded(user);
+    user = tokenUser; // Ensure we return the refreshed tokens to the caller / session
+
     // Fetch fresh guild data from Discord
     const freshGuilds = await fetchUserGuildsFromDiscord(user.accessToken);
 

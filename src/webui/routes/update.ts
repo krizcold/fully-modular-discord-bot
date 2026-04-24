@@ -199,7 +199,7 @@ export function createUpdateRouter(botManager: BotManager): Router {
           success: true,
           download: updateResult,
           reload: null,
-          message: 'No modules were updated — nothing to reload'
+          message: 'No modules were updated; nothing to reload'
         });
         return;
       }
@@ -261,7 +261,7 @@ export function createUpdateRouter(botManager: BotManager): Router {
   });
 
   // ============================================================================
-  // MODULE HOT-RELOAD ENDPOINTS (standalone — reload without downloading)
+  // MODULE HOT-RELOAD ENDPOINTS (standalone: reload without downloading)
   // ============================================================================
 
   /**

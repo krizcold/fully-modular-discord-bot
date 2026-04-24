@@ -5,11 +5,33 @@ import { Strategy as DiscordStrategy, Profile } from '@oauth-everything/passport
 import { loadCredentials } from '../../utils/envLoader';
 
 /**
- * Check if Guild Web-UI is enabled
+ * Check if Guild Web-UI is enabled.
+ * Evaluated at call time; never cache the result. Credentials can be edited
+ * at runtime via the Credentials panel without a restart.
  */
 export function isGuildWebUIEnabled(): boolean {
   const credentials = loadCredentials();
   return credentials.ENABLE_GUILD_WEBUI === 'true';
+}
+
+/**
+ * Check if OAuth has all required credentials to actually run.
+ * Evaluated at call time.
+ */
+export function isOAuthConfigured(): boolean {
+  const c = loadCredentials();
+  return !!(c.DISCORD_CLIENT_ID && c.DISCORD_CLIENT_SECRET && c.OAUTH_CALLBACK_URL);
+}
+
+/** Serializers only need to be registered once per process. */
+let serializersRegistered = false;
+
+/** Remove any previously-registered Discord strategy from Passport. */
+function unregisterDiscordStrategy(): void {
+  const strategies = (passport as any)._strategies;
+  if (strategies && strategies.discord) {
+    delete strategies.discord;
+  }
 }
 
 /**
@@ -23,43 +45,58 @@ export interface DiscordUser {
   email?: string;
   verified?: boolean;
   guilds?: DiscordGuild[];
-  accessToken: string; // OAuth access token for Discord API calls
+  accessToken: string;              // OAuth access token for Discord API calls
+  refreshToken?: string;            // Used to refresh accessToken before Discord API calls
+  tokenExpiresAt?: number;          // Unix ms when accessToken is expected to expire
 }
 
 /**
- * Discord guild data from OAuth
+ * Discord guild data from OAuth.
+ * `permissions` is a bitfield that Discord returns as a string for newer
+ * applications (the value can exceed Number.MAX_SAFE_INTEGER). Older
+ * payloads may still return a number. Always normalize via BigInt before
+ * bitwise operations. See permissionChecker.ts.
  */
 export interface DiscordGuild {
   id: string;
   name: string;
   icon: string | null;
   owner: boolean;
-  permissions: number;  // Discord returns this as a number (bitfield)
-  features?: string[];  // Optional - Discord may not include this field
+  permissions: string | number;
+  features?: string[];
 }
 
 /**
- * Configure passport with Discord OAuth strategy
+ * Configure (or reconfigure) Passport with the Discord OAuth strategy.
+ *
+ * Idempotent: calling it multiple times is safe. It removes any previously
+ * registered Discord strategy before installing a new one. Used both at boot
+ * and when credentials change via the Credentials panel (hot-reload).
+ *
+ * If Guild Web-UI is disabled or credentials are missing, any existing
+ * strategy is unregistered and the function returns without reinstalling.
+ * Routes that depend on the strategy should gate with `requireGuildWebUIEnabled`.
  */
 export function configureOAuth(): void {
   const credentials = loadCredentials();
 
-  // Only configure if Guild Web-UI is enabled
   if (!isGuildWebUIEnabled()) {
-    console.log('[OAuth] Guild Web-UI disabled - OAuth not configured');
+    unregisterDiscordStrategy();
+    console.log('[OAuth] Guild Web-UI disabled; Discord strategy unregistered');
     return;
   }
 
   const clientID = credentials.DISCORD_CLIENT_ID;
   const clientSecret = credentials.DISCORD_CLIENT_SECRET;
-  const callbackURL = credentials.OAUTH_CALLBACK_URL || 'http://localhost:3000/auth/discord/callback';
+  const callbackURL = credentials.OAUTH_CALLBACK_URL;
 
-  if (!clientID || !clientSecret) {
-    console.warn('[OAuth] Missing DISCORD_CLIENT_ID or DISCORD_CLIENT_SECRET - OAuth disabled');
+  if (!clientID || !clientSecret || !callbackURL) {
+    unregisterDiscordStrategy();
+    console.warn('[OAuth] Missing DISCORD_CLIENT_ID / DISCORD_CLIENT_SECRET / OAUTH_CALLBACK_URL; Discord strategy unregistered');
     return;
   }
 
-  // Configure Discord strategy
+  // Register the strategy (replaces any existing one)
   passport.use(
     new DiscordStrategy(
       {
@@ -69,11 +106,7 @@ export function configureOAuth(): void {
         scope: ['identify', 'guilds', 'guilds.members.read']
       },
       (accessToken: string, refreshToken: string, profile: Profile, done: any) => {
-        // Transform Discord profile to our user format
-        // Note: guilds are fetched separately via Discord API using the accessToken
-        // Profile structure: profile.id, profile.username, profile.discriminator, profile.avatar, profile._raw
         const rawUser = profile._raw as any;
-
         const profileAny = profile as any;
         const user: DiscordUser = {
           id: profile.id || rawUser?.id,
@@ -82,8 +115,11 @@ export function configureOAuth(): void {
           avatar: profileAny.avatar || rawUser?.avatar || null,
           email: rawUser?.email,
           verified: rawUser?.verified,
-          guilds: [],  // Guilds will be fetched separately using the accessToken
-          accessToken: accessToken  // Store access token for Discord API calls
+          guilds: [],
+          accessToken,
+          refreshToken,
+          // Discord access tokens expire in 7 days. Store so we can refresh proactively.
+          tokenExpiresAt: Date.now() + 7 * 24 * 60 * 60 * 1000,
         };
 
         console.log('[OAuth] User authenticated:', user.username, `(${user.id})`);
@@ -92,15 +128,19 @@ export function configureOAuth(): void {
     )
   );
 
-  // Serialize user to session
-  passport.serializeUser((user: any, done) => {
-    done(null, user);
-  });
-
-  // Deserialize user from session
-  passport.deserializeUser((user: any, done) => {
-    done(null, user);
-  });
+  // Serializers are process-global; only install once.
+  if (!serializersRegistered) {
+    passport.serializeUser((user: any, done) => done(null, user));
+    passport.deserializeUser((user: any, done) => done(null, user));
+    serializersRegistered = true;
+  }
 
   console.log('[OAuth] Discord OAuth configured successfully');
+}
+
+/**
+ * Alias for readability at callsites that re-apply credentials changes.
+ */
+export function reconfigureOAuth(): void {
+  configureOAuth();
 }

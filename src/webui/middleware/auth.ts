@@ -69,34 +69,3 @@ export function requireAuth(req: Request, res: Response, next: NextFunction): vo
   // Hash is valid, proceed
   next();
 }
-
-/**
- * Optional middleware for routes that don't require auth
- * Adds 'authenticated' flag to request object based on hash validation
- *
- * Note: This function is currently unused as all API routes now require authentication.
- * Kept for backward compatibility or future use cases.
- */
-export function optionalAuth(req: Request, res: Response, next: NextFunction): void {
-  const AUTH_HASH = process.env.AUTH_HASH;
-
-  if (!AUTH_HASH || AUTH_HASH.trim() === '') {
-    // No auth configured, allow through
-    (req as any).authenticated = false;
-    next();
-    return;
-  }
-
-  const providedHash = req.query.hash as string || req.headers['x-auth-hash'] as string;
-
-  // Use timing-safe comparison for consistency
-  if (validateHashTimingSafe(providedHash, AUTH_HASH)) {
-    // Valid hash provided
-    (req as any).authenticated = true;
-  } else {
-    // Invalid or no hash
-    (req as any).authenticated = false;
-  }
-
-  next();
-}

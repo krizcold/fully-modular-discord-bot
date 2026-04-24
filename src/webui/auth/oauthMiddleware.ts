@@ -1,9 +1,32 @@
 // OAuth Middleware - Request authentication and authorization middleware
 
 import { Request, Response, NextFunction } from 'express';
-import { DiscordUser } from './oauthConfig';
+import { DiscordUser, isGuildWebUIEnabled, isOAuthConfigured } from './oauthConfig';
 import { hasSystemAccess, hasGuildAccess } from './permissionChecker';
 import { refreshUserGuilds } from './guildPermissionRefresher';
+
+/**
+ * Middleware: Require the Guild Web-UI to be currently enabled AND OAuth configured.
+ * Evaluated at request time so credentials can be added / removed via the
+ * Credentials panel without restarting the bot.
+ */
+export function requireGuildWebUIEnabled(req: Request, res: Response, next: NextFunction): void {
+  if (!isGuildWebUIEnabled()) {
+    res.status(503).json({
+      success: false,
+      error: 'Guild Web-UI is currently disabled. Configure credentials in the Main Web-UI to enable it.'
+    });
+    return;
+  }
+  if (!isOAuthConfigured()) {
+    res.status(503).json({
+      success: false,
+      error: 'Guild Web-UI is enabled but OAuth credentials are incomplete. Check DISCORD_CLIENT_ID, DISCORD_CLIENT_SECRET, and OAUTH_CALLBACK_URL.'
+    });
+    return;
+  }
+  next();
+}
 
 /**
  * Extend Express types
@@ -94,13 +117,30 @@ export function requireGuildAccess(req: Request, res: Response, next: NextFuncti
     return;
   }
 
-  // Refresh user guilds from Discord API (with caching)
+  // Refresh user guilds from Discord API (with caching) and persist the
+  // refreshed user back into the session. We deliberately DO NOT use
+  // req.login(): passport >= 0.6 regenerates the session ID on every
+  // req.login() call (fixation protection), which races with parallel
+  // requests (e.g. the guild-click triggers getPanelList + getSubscription
+  // simultaneously) and leaves the client with a session cookie the server
+  // doesn't recognise, looking like a spurious logout.
   refreshUserGuilds(user)
+    .then(refreshedUser => new Promise<DiscordUser>((resolve, reject) => {
+      const tokensChanged = refreshedUser.accessToken !== user.accessToken
+        || refreshedUser.tokenExpiresAt !== user.tokenExpiresAt;
+      const guildsChanged = refreshedUser.guilds !== user.guilds;
+      if (!tokensChanged && !guildsChanged) {
+        // Nothing changed: skip the session write entirely.
+        resolve(refreshedUser);
+        return;
+      }
+      // Mutate passport's session user in place, then persist.
+      const sess = req.session as any;
+      if (sess && sess.passport) sess.passport.user = refreshedUser;
+      (req as any).user = refreshedUser;
+      req.session.save((err) => err ? reject(err) : resolve(refreshedUser));
+    }))
     .then(refreshedUser => {
-      // Update user in session with fresh guild data
-      req.user = refreshedUser;
-
-      // Check guild access with refreshed permissions
       if (!hasGuildAccess(refreshedUser, guildId as string)) {
         res.status(403).json({
           success: false,
@@ -108,12 +148,11 @@ export function requireGuildAccess(req: Request, res: Response, next: NextFuncti
         });
         return;
       }
-
       next();
     })
     .catch(error => {
-      console.error('[requireGuildAccess] Error refreshing user guilds:', error);
-      // On error, check with existing session data as fallback
+      console.error('[requireGuildAccess] Error refreshing or re-saving user guilds:', error);
+      // Fall back to the pre-refresh session user
       if (!hasGuildAccess(user, guildId as string)) {
         res.status(403).json({
           success: false,
@@ -121,7 +160,6 @@ export function requireGuildAccess(req: Request, res: Response, next: NextFuncti
         });
         return;
       }
-
       next();
     });
 }

@@ -5,6 +5,36 @@ import { BotManager } from '../botManager';
 import { requireOAuth, requireGuildAccess } from '../auth/oauthMiddleware';
 import { DiscordUser } from '../auth/oauthConfig';
 import { refreshUserGuilds } from '../auth/guildPermissionRefresher';
+import { hasGuildAccess as permHasGuildAccess } from '../auth/permissionChecker';
+
+// Dev-user check cache: avoids IPC to bot on every request.
+// Keyed by user id; 5-minute TTL keeps permission changes relatively fresh.
+const DEV_CHECK_TTL = 5 * 60 * 1000;
+const devCheckCache = new Map<string, { isDev: boolean; ts: number }>();
+
+async function cachedIsUserDev(botManager: BotManager, userId: string): Promise<boolean> {
+  const cached = devCheckCache.get(userId);
+  const now = Date.now();
+  if (cached && now - cached.ts < DEV_CHECK_TTL) return cached.isDev;
+  const result = await botManager.isUserDev(userId);
+  if (result?.success) {
+    const isDev = !!result.isDev;
+    devCheckCache.set(userId, { isDev, ts: now });
+    return isDev;
+  }
+  // On IPC failure, fall back to last known value (fail-closed if none)
+  return cached?.isDev ?? false;
+}
+
+// Refresh user guilds AND persist the fresh user into the session via
+// req.login() so subsequent requests see up-to-date guild/permissions data.
+async function refreshAndSaveUser(req: Request, user: DiscordUser): Promise<DiscordUser> {
+  const refreshedUser = await refreshUserGuilds(user);
+  await new Promise<void>((resolve, reject) => {
+    req.login(refreshedUser, (err) => err ? reject(err) : resolve());
+  });
+  return refreshedUser;
+}
 
 export function createGuildPanelRoutes(botManager: BotManager): Router {
   const router = Router();
@@ -45,8 +75,7 @@ export function createGuildPanelRoutes(botManager: BotManager): Router {
 
       if (isSystemPanels) {
         // System panels require dev access
-        const devsCheckResult = await botManager.isUserDev(user.id);
-        if (!devsCheckResult.success || !devsCheckResult.isDev) {
+        if (!await cachedIsUserDev(botManager, user.id)) {
           res.status(403).json({
             success: false,
             error: 'Access denied: System panels require developer access'
@@ -129,8 +158,7 @@ export function createGuildPanelRoutes(botManager: BotManager): Router {
 
       if (isSystemPanel) {
         // System panels require dev access
-        const devsCheckResult = await botManager.isUserDev(user.id);
-        if (!devsCheckResult.success || !devsCheckResult.isDev) {
+        if (!await cachedIsUserDev(botManager, user.id)) {
           res.status(403).json({
             success: false,
             error: 'Access denied: System panels require developer access'
@@ -147,21 +175,11 @@ export function createGuildPanelRoutes(botManager: BotManager): Router {
           return;
         }
 
-        // Refresh user permissions from Discord API (with 5-min cache)
-        const refreshedUser = await refreshUserGuilds(user);
-        req.user = refreshedUser; // Update session with fresh data
+        // Refresh user permissions from Discord API (with 5-min cache) and
+        // persist the fresh user into the session.
+        const refreshedUser = await refreshAndSaveUser(req, user);
 
-        // Check guild access with refreshed permissions
-        const userGuilds = refreshedUser.guilds || [];
-        const hasGuildAccess = userGuilds.some(g => {
-          if (g.id !== guildId) return false;
-          if (g.owner) return true;
-          const permissions = BigInt(g.permissions);
-          const ADMINISTRATOR = BigInt(0x8);
-          return (permissions & ADMINISTRATOR) === ADMINISTRATOR;
-        });
-
-        if (!hasGuildAccess) {
+        if (!permHasGuildAccess(refreshedUser, guildId)) {
           res.status(403).json({
             success: false,
             error: 'Access denied: You do not have administrator access to this guild'
@@ -236,8 +254,7 @@ export function createGuildPanelRoutes(botManager: BotManager): Router {
 
       if (isSystemPanel) {
         // System panels require dev access
-        const devsCheckResult = await botManager.isUserDev(user.id);
-        if (!devsCheckResult.success || !devsCheckResult.isDev) {
+        if (!await cachedIsUserDev(botManager, user.id)) {
           res.status(403).json({
             success: false,
             error: 'Access denied: System panels require developer access'
@@ -254,21 +271,11 @@ export function createGuildPanelRoutes(botManager: BotManager): Router {
           return;
         }
 
-        // Refresh user permissions from Discord API (with 5-min cache)
-        const refreshedUser = await refreshUserGuilds(user);
-        req.user = refreshedUser; // Update session with fresh data
+        // Refresh user permissions from Discord API (with 5-min cache) and
+        // persist the fresh user into the session.
+        const refreshedUser = await refreshAndSaveUser(req, user);
 
-        // Check guild access with refreshed permissions
-        const userGuilds = refreshedUser.guilds || [];
-        const hasGuildAccess = userGuilds.some(g => {
-          if (g.id !== guildId) return false;
-          if (g.owner) return true;
-          const permissions = BigInt(g.permissions);
-          const ADMINISTRATOR = BigInt(0x8);
-          return (permissions & ADMINISTRATOR) === ADMINISTRATOR;
-        });
-
-        if (!hasGuildAccess) {
+        if (!permHasGuildAccess(refreshedUser, guildId)) {
           res.status(403).json({
             success: false,
             error: 'Access denied: You do not have administrator access to this guild'
@@ -352,8 +359,7 @@ export function createGuildPanelRoutes(botManager: BotManager): Router {
 
       if (isSystemPanel) {
         // System panels require dev access
-        const devsCheckResult = await botManager.isUserDev(user.id);
-        if (!devsCheckResult.success || !devsCheckResult.isDev) {
+        if (!await cachedIsUserDev(botManager, user.id)) {
           res.status(403).json({
             success: false,
             error: 'Access denied: System panels require developer access'
@@ -370,21 +376,11 @@ export function createGuildPanelRoutes(botManager: BotManager): Router {
           return;
         }
 
-        // Refresh user permissions from Discord API (with 5-min cache)
-        const refreshedUser = await refreshUserGuilds(user);
-        req.user = refreshedUser; // Update session with fresh data
+        // Refresh user permissions from Discord API (with 5-min cache) and
+        // persist the fresh user into the session.
+        const refreshedUser = await refreshAndSaveUser(req, user);
 
-        // Check guild access with refreshed permissions
-        const userGuilds = refreshedUser.guilds || [];
-        const hasGuildAccess = userGuilds.some(g => {
-          if (g.id !== guildId) return false;
-          if (g.owner) return true;
-          const permissions = BigInt(g.permissions);
-          const ADMINISTRATOR = BigInt(0x8);
-          return (permissions & ADMINISTRATOR) === ADMINISTRATOR;
-        });
-
-        if (!hasGuildAccess) {
+        if (!permHasGuildAccess(refreshedUser, guildId)) {
           res.status(403).json({
             success: false,
             error: 'Access denied: You do not have administrator access to this guild'
@@ -469,8 +465,7 @@ export function createGuildPanelRoutes(botManager: BotManager): Router {
 
       if (isSystemPanel) {
         // System panels require dev access
-        const devsCheckResult = await botManager.isUserDev(user.id);
-        if (!devsCheckResult.success || !devsCheckResult.isDev) {
+        if (!await cachedIsUserDev(botManager, user.id)) {
           res.status(403).json({
             success: false,
             error: 'Access denied: System panels require developer access'
@@ -487,21 +482,11 @@ export function createGuildPanelRoutes(botManager: BotManager): Router {
           return;
         }
 
-        // Refresh user permissions from Discord API (with 5-min cache)
-        const refreshedUser = await refreshUserGuilds(user);
-        req.user = refreshedUser; // Update session with fresh data
+        // Refresh user permissions from Discord API (with 5-min cache) and
+        // persist the fresh user into the session.
+        const refreshedUser = await refreshAndSaveUser(req, user);
 
-        // Check guild access with refreshed permissions
-        const userGuilds = refreshedUser.guilds || [];
-        const hasGuildAccess = userGuilds.some(g => {
-          if (g.id !== guildId) return false;
-          if (g.owner) return true;
-          const permissions = BigInt(g.permissions);
-          const ADMINISTRATOR = BigInt(0x8);
-          return (permissions & ADMINISTRATOR) === ADMINISTRATOR;
-        });
-
-        if (!hasGuildAccess) {
+        if (!permHasGuildAccess(refreshedUser, guildId)) {
           res.status(403).json({
             success: false,
             error: 'Access denied: You do not have administrator access to this guild'
@@ -565,18 +550,10 @@ export function createGuildPanelRoutes(botManager: BotManager): Router {
         return;
       }
 
-      // Verify user has access to this guild
-      const refreshedUser = await refreshUserGuilds(user);
-      const userGuilds = refreshedUser.guilds || [];
-      const hasGuildAccess = userGuilds.some(g => {
-        if (g.id !== guildId) return false;
-        if (g.owner) return true;
-        const permissions = BigInt(g.permissions);
-        const ADMINISTRATOR = BigInt(0x8);
-        return (permissions & ADMINISTRATOR) === ADMINISTRATOR;
-      });
+      // Verify user has access to this guild (refresh + persist to session)
+      const refreshedUser = await refreshAndSaveUser(req, user);
 
-      if (!hasGuildAccess) {
+      if (!permHasGuildAccess(refreshedUser, guildId)) {
         res.status(403).json({
           success: false,
           error: 'Access denied: You do not have administrator access to this guild'
@@ -631,18 +608,10 @@ export function createGuildPanelRoutes(botManager: BotManager): Router {
         return;
       }
 
-      // Verify user has access to this guild
-      const refreshedUser = await refreshUserGuilds(user);
-      const userGuilds = refreshedUser.guilds || [];
-      const hasGuildAccess = userGuilds.some(g => {
-        if (g.id !== guildId) return false;
-        if (g.owner) return true;
-        const permissions = BigInt(g.permissions);
-        const ADMINISTRATOR = BigInt(0x8);
-        return (permissions & ADMINISTRATOR) === ADMINISTRATOR;
-      });
+      // Verify user has access to this guild (refresh + persist to session)
+      const refreshedUser = await refreshAndSaveUser(req, user);
 
-      if (!hasGuildAccess) {
+      if (!permHasGuildAccess(refreshedUser, guildId)) {
         res.status(403).json({
           success: false,
           error: 'Access denied: You do not have administrator access to this guild'
@@ -697,11 +666,8 @@ export function createGuildPanelRoutes(botManager: BotManager): Router {
         return;
       }
 
-      // Refresh user guilds from Discord API (with caching)
-      const refreshedUser = await refreshUserGuilds(user);
-
-      // Update user in session with fresh guild data
-      req.user = refreshedUser;
+      // Refresh user guilds from Discord API (with caching) and persist to session.
+      const refreshedUser = await refreshAndSaveUser(req, user);
 
       // Get bot's guild list
       const botGuildsResult = await botManager.getBotGuilds();
@@ -714,26 +680,11 @@ export function createGuildPanelRoutes(botManager: BotManager): Router {
         return;
       }
 
-      // Filter guilds where user has admin access (using refreshed data)
+      // Intersect user-admin guilds with bot-present guilds.
       const userGuilds = refreshedUser.guilds || [];
-      const botGuildIds = botGuildsResult.guilds?.map((g: any) => g.id) || [];
-
-      // Find guilds where user has admin AND bot is present
-      const accessibleGuilds = userGuilds.filter(userGuild => {
-        // Check if bot is in this guild
-        if (!botGuildIds.includes(userGuild.id)) {
-          return false;
-        }
-
-        // Check if user has admin access
-        if (userGuild.owner) {
-          return true;
-        }
-
-        const permissions = BigInt(userGuild.permissions);
-        const ADMINISTRATOR = BigInt(0x8);
-        return (permissions & ADMINISTRATOR) === ADMINISTRATOR;
-      });
+      const botGuildIds = new Set((botGuildsResult.guilds || []).map((g: any) => g.id));
+      const accessibleGuilds = userGuilds
+        .filter(g => botGuildIds.has(g.id) && permHasGuildAccess(refreshedUser, g.id));
 
       const guildsResponse = accessibleGuilds.map(g => ({
         id: g.id,
@@ -741,9 +692,8 @@ export function createGuildPanelRoutes(botManager: BotManager): Router {
         icon: g.icon
       }));
 
-      // Check if user is a developer (from DEVS config)
-      const devsCheckResult = await botManager.isUserDev(user.id);
-      const isDev = devsCheckResult.success && devsCheckResult.isDev;
+      // Check if user is a developer (from DEVS config); cached
+      const isDev = await cachedIsUserDev(botManager, user.id);
 
       // Add System Panels pseudo-guild for developers
       if (isDev) {

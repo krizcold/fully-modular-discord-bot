@@ -3,9 +3,26 @@
 import session from 'express-session';
 const RedisStore = require('connect-redis').RedisStore;
 import { createClient } from 'redis';
+import crypto from 'crypto';
 import { loadCredentials } from '../../utils/envLoader';
 
 let sessionStore: session.Store | undefined;
+
+/**
+ * Stable-per-process fallback session secret, used only when the user has
+ * not configured SESSION_SECRET. Generated once at first request and kept
+ * for the bot process's lifetime so sessions stay valid within a single run.
+ * Sessions WILL be invalidated on restart in this mode; set SESSION_SECRET
+ * explicitly for cross-restart stability.
+ */
+let bootFallbackSecret: string | null = null;
+function getBootFallbackSecret(): string {
+  if (!bootFallbackSecret) {
+    bootFallbackSecret = crypto.randomBytes(32).toString('hex');
+    console.warn('[SessionManager] SESSION_SECRET not set; generated a random boot-time secret. Sessions will not survive a bot restart. Set SESSION_SECRET in the Credentials panel for persistence.');
+  }
+  return bootFallbackSecret;
+}
 
 /**
  * Configure session store (Redis with memory fallback for dev)
@@ -63,11 +80,7 @@ export async function configureSessionStore(): Promise<session.Store | undefined
  */
 export async function getSessionMiddleware(): Promise<session.SessionOptions> {
   const credentials = loadCredentials();
-  const sessionSecret = credentials.SESSION_SECRET || 'default-secret-change-in-production';
-
-  if (!credentials.SESSION_SECRET) {
-    console.warn('[SessionManager] WARNING: Using default SESSION_SECRET - set SESSION_SECRET env var for production');
-  }
+  const sessionSecret = credentials.SESSION_SECRET || getBootFallbackSecret();
 
   const store = await configureSessionStore();
 

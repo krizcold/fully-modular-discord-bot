@@ -26,20 +26,20 @@ export function getUserAdminGuilds(user: DiscordUser): string[] {
     return [];
   }
 
-  // Filter guilds where user has admin permissions
-  // Discord permissions are stored as a bitfield string
+  const ADMINISTRATOR = BigInt(0x8); // Administrator permission bit
+
   const adminGuilds = user.guilds.filter(guild => {
-    // Check if user is guild owner
-    if (guild.owner) {
-      return true;
+    if (guild.owner) return true;
+    // Discord returns the bitfield as a string for newer apps (value can exceed Number.MAX_SAFE_INTEGER).
+    // Normalize via BigInt for correctness on large values.
+    try {
+      const perms = typeof guild.permissions === 'bigint'
+        ? guild.permissions
+        : BigInt(guild.permissions as string | number);
+      return (perms & ADMINISTRATOR) === ADMINISTRATOR;
+    } catch {
+      return false;
     }
-
-    // Check if user has Administrator permission (bit 3)
-    // Permissions are stored as a number (bitfield)
-    const permissions = guild.permissions;
-    const ADMINISTRATOR = 0x8; // 0x8 = Administrator permission bit
-
-    return (permissions & ADMINISTRATOR) === ADMINISTRATOR;
   });
 
   return adminGuilds.map(guild => guild.id);

@@ -13,7 +13,8 @@ import {
   AppStoreRepository,
   StoreModuleInfo
 } from '../../bot/internalSetup/utils/appStoreManager';
-import { getPremiumManager } from '../../bot/internalSetup/utils/premiumManager';
+import { getPremiumManager, DEFAULT_MESSAGES, PremiumMessages } from '../../bot/internalSetup/utils/premiumManager';
+import { getPaymentRegistry } from '../../bot/internalSetup/utils/payment/paymentRegistry';
 import { getModulesDir, getModulesDevDir } from '../../bot/internalSetup/utils/pathHelpers';
 import { BotManager } from '../botManager';
 import { ComponentToggleDebouncer } from '../utils/componentToggleDebouncer';
@@ -62,7 +63,9 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
           githubToken: repo.githubToken ? '***' : null
         })),
         tiers: premiumMgr.getAllTiers(),
-        guildAssignments: premiumMgr.getAllGuildAssignments(),
+        subscriptions: premiumMgr.getAllSubscriptions(),
+        messages: premiumMgr.getMessages(),
+        messageDefaults: DEFAULT_MESSAGES,
         installQueue: installQueue.getSnapshot()
       });
     } catch (error) {
@@ -132,7 +135,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
       const normalized = manager.normalizeGitUrl(url);
       const finalBranch = branch || normalized.branch || 'main';
 
-      // Test access before saving — catches bad tokens / wrong URLs early
+      // Test access before saving; catches bad tokens / wrong URLs early
       const testRepo = { url: normalized.url, branch: finalBranch, githubToken: githubToken || null } as any;
       const access = manager.testRepoAccess(testRepo);
       if (!access.ok) {
@@ -593,7 +596,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
   router.put('/premium/tiers/:id', (req: Request, res: Response) => {
     try {
       const { id } = req.params;
-      const { displayName, priority, overrides } = req.body;
+      const { displayName, priority, overrides, offerings } = req.body;
 
       if (!displayName || typeof displayName !== 'string') {
         return res.status(400).json({
@@ -613,7 +616,8 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
       const success = manager.setTier(id, {
         displayName,
         priority,
-        overrides: overrides || {}
+        overrides: overrides || {},
+        offerings: Array.isArray(offerings) ? offerings : []
       });
 
       res.json({
@@ -661,80 +665,68 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
   });
 
   /**
-   * GET /api/appstore/premium/guilds
-   * List all guild tier assignments
+   * GET /api/appstore/premium/messages
+   * Returns current restriction messages and their defaults.
    */
-  router.get('/premium/guilds', (_req: Request, res: Response) => {
+  router.get('/premium/messages', (_req: Request, res: Response) => {
     try {
       const manager = getPremiumManager();
-      const assignments = manager.getAllGuildAssignments();
-
       res.json({
         success: true,
-        assignments
+        messages: manager.getMessages(),
+        defaults: DEFAULT_MESSAGES
       });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-      res.status(500).json({
-        success: false,
-        error: errorMessage
-      });
+      res.status(500).json({ success: false, error: errorMessage });
     }
   });
 
   /**
-   * PUT /api/appstore/premium/guilds/:guildId
-   * Assign a tier to a guild
-   * Body: { tierId }
+   * PUT /api/appstore/premium/messages
+   * Body: { moduleBlocked?, commandBlocked?, panelBlocked? }
    */
-  router.put('/premium/guilds/:guildId', (req: Request, res: Response) => {
+  router.put('/premium/messages', (req: Request, res: Response) => {
     try {
-      const { guildId } = req.params;
-      const { tierId } = req.body;
+      const { moduleBlocked, commandBlocked, panelBlocked } = req.body || {};
+      const partial: Partial<PremiumMessages> = {};
+      if (typeof moduleBlocked === 'string') partial.moduleBlocked = moduleBlocked;
+      if (typeof commandBlocked === 'string') partial.commandBlocked = commandBlocked;
+      if (typeof panelBlocked === 'string') partial.panelBlocked = panelBlocked;
 
-      if (!tierId || typeof tierId !== 'string') {
-        return res.status(400).json({
-          success: false,
-          error: 'Tier ID is required'
-        });
+      if (Object.keys(partial).length === 0) {
+        return res.status(400).json({ success: false, error: 'No valid message fields provided' });
       }
 
       const manager = getPremiumManager();
-      const success = manager.setGuildTier(guildId, tierId);
-
+      const success = manager.setMessages(partial);
       res.json({
         success,
-        message: success ? 'Guild tier assigned' : 'Failed to assign tier (tier may not exist)'
+        messages: manager.getMessages(),
+        defaults: DEFAULT_MESSAGES
       });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-      res.status(500).json({
-        success: false,
-        error: errorMessage
-      });
+      res.status(500).json({ success: false, error: errorMessage });
     }
   });
 
   /**
-   * DELETE /api/appstore/premium/guilds/:guildId
-   * Remove tier assignment from a guild (reset to free)
+   * POST /api/appstore/premium/messages/reset
+   * Reset all restriction messages to defaults.
    */
-  router.delete('/premium/guilds/:guildId', (req: Request, res: Response) => {
+  router.post('/premium/messages/reset', (_req: Request, res: Response) => {
     try {
-      const { guildId } = req.params;
       const manager = getPremiumManager();
-      const success = manager.removeGuildTier(guildId);
-
+      const success = manager.resetMessages();
       res.json({
         success,
-        message: success ? 'Guild tier removed' : 'Failed to remove tier'
+        messages: manager.getMessages(),
+        defaults: DEFAULT_MESSAGES
       });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-      res.status(500).json({
-        success: false,
-        error: errorMessage
-      });
+      res.status(500).json({ success: false, error: errorMessage });
     }
   });
 
@@ -768,7 +760,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
               } catch { /* no schema or parse error */ }
 
               // Detect command file names from commands/ directory as fallback
-              // Type is unknown from filesystem — defaults to 'ChatInput'
+              // Type is unknown from filesystem; defaults to 'ChatInput'
               const commands: Array<{ name: string; type: string }> = [];
               const cmdDir = path.join(dirPath, 'commands');
               if (fs.existsSync(cmdDir)) {
@@ -847,6 +839,287 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
       } else {
         res.json({ success: true, guilds: [], botRunning: true, error: result.error });
       }
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      res.status(500).json({ success: false, error: errorMessage });
+    }
+  });
+
+  // ============================================================================
+  // COUPONS
+  // ============================================================================
+
+  /**
+   * GET /api/appstore/premium/coupons
+   * Return all admin-defined coupon codes with their effects and usage counts.
+   */
+  router.get('/premium/coupons', (_req: Request, res: Response) => {
+    try {
+      const manager = getPremiumManager();
+      res.json({ success: true, coupons: manager.getAllCoupons() });
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      res.status(500).json({ success: false, error: errorMessage });
+    }
+  });
+
+  /**
+   * PUT /api/appstore/premium/coupons/:code
+   * Create or replace a coupon. Body: { description?, percentOff?, extraDays?, maxUses?, expiresAt? }
+   * Exactly one of percentOff or extraDays must be set.
+   */
+  router.put('/premium/coupons/:code', (req: Request, res: Response) => {
+    try {
+      const { code } = req.params;
+      if (!code || !code.trim()) {
+        return res.status(400).json({ success: false, error: 'Coupon code is required' });
+      }
+      const { description, percentOff, extraDays, maxUses, expiresAt } = req.body || {};
+      const manager = getPremiumManager();
+      const ok = manager.setCoupon(code, { description, percentOff, extraDays, maxUses, expiresAt });
+      if (!ok) {
+        return res.status(400).json({
+          success: false,
+          error: 'Invalid coupon. Exactly one of percentOff (1-100) or extraDays (>=1) must be set; optional maxUses must be >=1 and expiresAt must be a valid ISO date.'
+        });
+      }
+      res.json({ success: true, coupon: manager.getCoupon(code) });
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      res.status(500).json({ success: false, error: errorMessage });
+    }
+  });
+
+  /**
+   * DELETE /api/appstore/premium/coupons/:code
+   */
+  router.delete('/premium/coupons/:code', (req: Request, res: Response) => {
+    try {
+      const { code } = req.params;
+      const manager = getPremiumManager();
+      const ok = manager.deleteCoupon(code);
+      if (!ok) return res.status(404).json({ success: false, error: 'Coupon not found' });
+      res.json({ success: true });
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      res.status(500).json({ success: false, error: errorMessage });
+    }
+  });
+
+  // ============================================================================
+  // SUBSCRIPTIONS
+  // ============================================================================
+
+  /**
+   * GET /api/appstore/premium/subscriptions
+   * List all guilds with any subscription (Main Web-UI table).
+   */
+  router.get('/premium/subscriptions', (_req: Request, res: Response) => {
+    try {
+      const manager = getPremiumManager();
+      res.json({ success: true, subscriptions: manager.getAllSubscriptions() });
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      res.status(500).json({ success: false, error: errorMessage });
+    }
+  });
+
+  /**
+   * GET /api/appstore/premium/subscriptions/:guildId
+   * Single-guild detail + effective tier (Guild Web-UI tab).
+   */
+  router.get('/premium/subscriptions/:guildId', (req: Request, res: Response) => {
+    try {
+      const { guildId } = req.params;
+      const manager = getPremiumManager();
+      const subscriptions = manager.getSubscriptions(guildId);
+      const resolved = manager.resolveActiveTier(guildId);
+      res.json({
+        success: true,
+        subscriptions,
+        effective: { tierId: resolved.tierId, tier: resolved.tier, source: resolved.source }
+      });
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      res.status(500).json({ success: false, error: errorMessage });
+    }
+  });
+
+  /**
+   * POST /api/appstore/premium/subscriptions/:guildId/manual
+   * Grant (or replace) the manual subscription for a guild.
+   * Body: { tierId, durationDays: number | null, notes? }
+   */
+  router.post('/premium/subscriptions/:guildId/manual', (req: Request, res: Response) => {
+    try {
+      const { guildId } = req.params;
+      const { tierId, durationDays, notes } = req.body || {};
+      if (!tierId || typeof tierId !== 'string') {
+        return res.status(400).json({ success: false, error: 'tierId is required' });
+      }
+      if (durationDays !== null && (typeof durationDays !== 'number' || durationDays <= 0)) {
+        return res.status(400).json({ success: false, error: 'durationDays must be a positive number or null (for Lifetime)' });
+      }
+      const manager = getPremiumManager();
+      const success = manager.grantManual(guildId, tierId, durationDays, typeof notes === 'string' ? notes : undefined);
+      res.json({ success, subscriptions: manager.getSubscriptions(guildId) });
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      res.status(500).json({ success: false, error: errorMessage });
+    }
+  });
+
+  /**
+   * POST /api/appstore/premium/subscriptions/:guildId/manual/extend
+   * Extend the manual subscription.
+   * Body: { addDays }
+   */
+  router.post('/premium/subscriptions/:guildId/manual/extend', (req: Request, res: Response) => {
+    try {
+      const { guildId } = req.params;
+      const { addDays } = req.body || {};
+      if (typeof addDays !== 'number' || addDays <= 0) {
+        return res.status(400).json({ success: false, error: 'addDays must be a positive number' });
+      }
+      const manager = getPremiumManager();
+      const success = manager.extendManual(guildId, addDays);
+      res.json({ success, subscriptions: manager.getSubscriptions(guildId) });
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      res.status(500).json({ success: false, error: errorMessage });
+    }
+  });
+
+  /**
+   * DELETE /api/appstore/premium/subscriptions/:guildId/manual
+   * Revoke the manual subscription.
+   */
+  router.delete('/premium/subscriptions/:guildId/manual', (req: Request, res: Response) => {
+    try {
+      const { guildId } = req.params;
+      const manager = getPremiumManager();
+      const success = manager.revokeManual(guildId);
+      res.json({ success, subscriptions: manager.getSubscriptions(guildId) });
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      res.status(500).json({ success: false, error: errorMessage });
+    }
+  });
+
+  /**
+   * POST /api/appstore/premium/subscriptions/:guildId/paid
+   * Initiate a paid subscription through the offering's provider.
+   * Body: { tierId, offeringId, couponCode?, userId? }
+   * Response shape depends on the provider's mechanism:
+   *   immediate      → { providerSubId, state }
+   *   redirect       → { redirectUrl }
+   *   client_handoff → { clientHandoff }
+   *   oauth_link     → { oauthUrl }
+   */
+  router.post('/premium/subscriptions/:guildId/paid', async (req: Request, res: Response) => {
+    try {
+      const { guildId } = req.params;
+      const { tierId, offeringId, providerId, couponCode, userId } = req.body || {};
+      if (!tierId || typeof tierId !== 'string') {
+        return res.status(400).json({ success: false, error: 'tierId is required' });
+      }
+      if (!offeringId || typeof offeringId !== 'string') {
+        return res.status(400).json({ success: false, error: 'offeringId is required' });
+      }
+      if (!providerId || typeof providerId !== 'string') {
+        return res.status(400).json({ success: false, error: 'providerId is required' });
+      }
+      const manager = getPremiumManager();
+      const result = await manager.initiatePaidSubscription(guildId, tierId, offeringId, { providerId, couponCode, userId });
+      res.json({
+        success: true,
+        result,
+        subscriptions: manager.getSubscriptions(guildId),
+      });
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      res.status(500).json({ success: false, error: errorMessage });
+    }
+  });
+
+  /**
+   * DELETE /api/appstore/premium/subscriptions/:guildId/paid
+   * Cancel the paid subscription (autoRenew off, remaining days intact).
+   */
+  router.delete('/premium/subscriptions/:guildId/paid', async (req: Request, res: Response) => {
+    try {
+      const { guildId } = req.params;
+      const manager = getPremiumManager();
+      const success = await manager.cancelPaidSubscription(guildId);
+      res.json({ success, subscriptions: manager.getSubscriptions(guildId) });
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      res.status(500).json({ success: false, error: errorMessage });
+    }
+  });
+
+  /**
+   * POST /api/appstore/premium/subscriptions/:guildId/paid/reactivate
+   * Reactivate the paid subscription (autoRenew back on while still active).
+   */
+  router.post('/premium/subscriptions/:guildId/paid/reactivate', async (req: Request, res: Response) => {
+    try {
+      const { guildId } = req.params;
+      const manager = getPremiumManager();
+      const success = await manager.reactivatePaidSubscription(guildId);
+      res.json({ success, subscriptions: manager.getSubscriptions(guildId) });
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      res.status(500).json({ success: false, error: errorMessage });
+    }
+  });
+
+  /**
+   * GET /api/appstore/premium/providers
+   * Registered payment providers (id, displayName, capabilities).
+   */
+  router.get('/premium/providers', (_req: Request, res: Response) => {
+    try {
+      const registry = getPaymentRegistry();
+      const manager = getPremiumManager();
+      const activated = manager.getActivatedProviders();
+      const providers = registry.listAll().map(p => {
+        const activation = activated[p.id];
+        return {
+          id: p.id,
+          displayName: p.displayName,
+          isConfigured: p.isConfigured(),
+          capabilities: p.capabilities,
+          activated: !!activation,
+          defaultEnabled: activation ? !!activation.defaultEnabled : false,
+        };
+      });
+      res.json({ success: true, providers });
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      res.status(500).json({ success: false, error: errorMessage });
+    }
+  });
+
+  /**
+   * PUT /api/appstore/premium/providers/:providerId/activation
+   * Toggle a provider's system-wide activation.
+   * Body: { activated: boolean, defaultEnabled?: boolean }
+   */
+  router.put('/premium/providers/:providerId/activation', (req: Request, res: Response) => {
+    try {
+      const { providerId } = req.params;
+      const { activated, defaultEnabled } = req.body || {};
+      if (typeof activated !== 'boolean') {
+        return res.status(400).json({ success: false, error: 'activated (boolean) is required' });
+      }
+      const registry = getPaymentRegistry();
+      if (!registry.get(providerId)) {
+        return res.status(404).json({ success: false, error: `Provider '${providerId}' is not registered` });
+      }
+      const manager = getPremiumManager();
+      const success = manager.setProviderActivation(providerId, activated, !!defaultEnabled);
+      res.json({ success, activated: manager.getActivatedProviders() });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({ success: false, error: errorMessage });
@@ -1160,7 +1433,6 @@ function formatModuleInfo(info: StoreModuleInfo, includeComponents = false): any
     version: info.manifest.version,
     author: info.manifest.author,
     category: info.manifest.category,
-    premium: info.manifest.premium || false,
     requiredIntents: info.manifest.requiredIntents || [],
     requiredPermissions: info.manifest.requiredPermissions || [],
     hasCredentials: !!info.manifest.apiCredentials,
