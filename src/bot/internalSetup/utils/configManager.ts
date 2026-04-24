@@ -257,14 +257,12 @@ export function loadGuildConfig(filename: string, guildId: string): any {
   // For module config files, use metadata to get correct path
   const metadata = getConfigFileMetadata(filename);
   if (metadata && metadata.moduleName) {
-    // Construct guild-specific path using moduleName
     const filePath = path.join('/data', guildId, metadata.moduleName, filename);
     return readConfigFile(filePath, {});
   }
 
-  // Fallback: construct path without moduleName (legacy)
-  const filePath = path.join('/data', guildId, filename);
-  return readConfigFile(filePath, {});
+  console.warn(`[ConfigManager] loadGuildConfig called with undiscovered filename "${filename}"`);
+  return {};
 }
 
 /**
@@ -288,16 +286,12 @@ export function saveGuildConfig(filename: string, guildId: string, data: any): v
 
   // For module config files, use metadata to get correct path
   const metadata = getConfigFileMetadata(filename);
-  let filePath: string;
-
-  if (metadata && metadata.moduleName) {
-    // Construct guild-specific path using moduleName
-    filePath = path.join('/data', guildId, metadata.moduleName, filename);
-  } else {
-    // Fallback: construct path without moduleName (legacy)
-    filePath = path.join('/data', guildId, filename);
+  if (!metadata || !metadata.moduleName) {
+    console.warn(`[ConfigManager] saveGuildConfig called with undiscovered filename "${filename}"; skipping`);
+    return;
   }
 
+  const filePath = path.join('/data', guildId, metadata.moduleName, filename);
   const dirPath = path.dirname(filePath);
 
   if (!fs.existsSync(dirPath)) {
@@ -323,18 +317,15 @@ export function loadGlobalConfig(filename: string): any {
   // For discovered module data files
   const metadata = getConfigFileMetadata(filename);
   if (metadata && metadata.moduleName) {
-    // Construct path using moduleName for consistency
     const filePath = path.join('/data/global', metadata.moduleName, filename);
     if (fs.existsSync(filePath)) {
       return readConfigFile(filePath, {});
     }
-    // File doesn't exist - return empty (no overrides)
     return {};
   }
 
-  // Fallback: construct path from global + filename
-  const filePath = path.join('/data/global', filename);
-  return readConfigFile(filePath, {});
+  console.warn(`[ConfigManager] loadGlobalConfig called with undiscovered filename "${filename}"`);
+  return {};
 }
 
 /**
@@ -352,14 +343,12 @@ export function saveGlobalConfig(filename: string, data: any): void {
   let filePath: string;
 
   if (metadata && metadata.moduleName) {
-    // Construct path using moduleName for proper namespace
     filePath = path.join('/data/global', metadata.moduleName, filename);
   } else if (metadata && metadata.path) {
-    // Use metadata path if available
     filePath = metadata.path;
   } else {
-    // Fallback: construct path from global + filename (legacy)
-    filePath = path.join('/data/global', filename);
+    console.warn(`[ConfigManager] saveGlobalConfig called with undiscovered filename "${filename}"; skipping`);
+    return;
   }
 
   const dirPath = path.dirname(filePath);

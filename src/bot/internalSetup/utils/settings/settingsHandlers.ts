@@ -182,7 +182,7 @@ export async function handleSettingsButton(
 
     case 'toggle': {
       const settingKey = parts[1];
-      const settings = loadModuleSettings(moduleName, context.guildId, category);
+      const settings = loadModuleSettings(moduleName, context.guildId);
       if (!settings) return createV2Response(buildErrorPanel('Failed to load settings.'));
 
       const currentValue = state.pendingChanges.hasOwnProperty(settingKey)
@@ -198,7 +198,7 @@ export async function handleSettingsButton(
       const definition = schema.settings[settingKey];
       if (!definition) return createV2Response(buildErrorPanel(`Setting "${settingKey}" not found.`));
 
-      const settings = loadModuleSettings(moduleName, context.guildId, category);
+      const settings = loadModuleSettings(moduleName, context.guildId);
       const currentValue = state.pendingChanges.hasOwnProperty(settingKey)
         ? state.pendingChanges[settingKey]
         : settings?.values[settingKey];
@@ -232,7 +232,7 @@ export async function handleSettingsButton(
       const definition = schema.settings[settingKey];
       if (!definition) return createV2Response(buildErrorPanel(`Setting "${settingKey}" not found.`));
 
-      const settings = loadModuleSettings(moduleName, null, category); // System uses global settings
+      const settings = loadModuleSettings(moduleName, null); // System uses global settings
       const currentValue = state.pendingChanges.hasOwnProperty(settingKey)
         ? state.pendingChanges[settingKey]
         : settings?.values[settingKey];
@@ -291,7 +291,7 @@ export async function handleSettingsButton(
       }
 
       for (const [key, value] of Object.entries(state.pendingChanges)) {
-        saveModuleSetting(moduleName, key, value, context.guildId, category);
+        saveModuleSetting(moduleName, key, value, context.guildId);
       }
 
       state.pendingChanges = {};
@@ -576,7 +576,7 @@ export async function handleSettingsModal(
         for (const [key, value] of Object.entries(parsedSettings)) {
           const definition = schema.settings[key];
           if (definition && validateSettingValue(value, definition).valid) {
-            saveModuleSetting(moduleName, key, value, context.guildId, category);
+            saveModuleSetting(moduleName, key, value, context.guildId);
           }
         }
 

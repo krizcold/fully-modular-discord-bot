@@ -113,13 +113,9 @@ export function loadSchemaFromPath(schemaPath: string): SettingsSchema | null {
 /**
  * Load a settings schema for a specific module
  * @param moduleName - Module name (folder name, e.g., 'responseManager')
- * @param _category - Deprecated parameter, kept for backwards compatibility
  * @returns SettingsSchema or null if not found
  */
-export function loadSettingsSchema(
-  moduleName: string,
-  _category?: string
-): SettingsSchema | null {
+export function loadSettingsSchema(moduleName: string): SettingsSchema | null {
   // Check cache first
   if (schemaCache.has(moduleName)) {
     return schemaCache.get(moduleName)!;
@@ -222,10 +218,9 @@ export function getCachedSchema(moduleName: string): SettingsSchema | undefined 
 /**
  * Check if a module has a settings schema
  * @param moduleName - Module name
- * @param _category - Deprecated parameter, kept for backwards compatibility
  * @returns true if module has a settings schema
  */
-export function hasSettingsSchema(moduleName: string, _category?: string): boolean {
+export function hasSettingsSchema(moduleName: string): boolean {
   const modulePath = getModulePath(moduleName);
   const schemaPath = path.join(modulePath, 'settingsSchema.json');
   return fs.existsSync(schemaPath);
@@ -234,13 +229,9 @@ export function hasSettingsSchema(moduleName: string, _category?: string): boole
 /**
  * Get schema for a module, loading if necessary
  * @param moduleName - Module name
- * @param _category - Deprecated parameter, kept for backwards compatibility
  * @returns Schema or null
  */
-export function getSettingsSchema(
-  moduleName: string,
-  _category?: string
-): SettingsSchema | null {
+export function getSettingsSchema(moduleName: string): SettingsSchema | null {
   // Try cache first
   const cached = getCachedSchema(moduleName);
   if (cached) return cached;
