@@ -265,8 +265,11 @@ function GuildPanelsPanel({ guild, user, onBack }) {
     if (preModalPanelData) {
       setPanelData(preModalPanelData);
       setPreModalPanelData(null);
-    } else {
+    } else if (selectedPanel) {
       handleExecutePanel(selectedPanel, selectedChannel);
+    } else {
+      // Defensive: if selectedPanel was cleared (e.g. via returnToPanelList), go back to the list
+      handleBackToList();
     }
   };
 
@@ -345,19 +348,7 @@ function GuildPanelsPanel({ guild, user, onBack }) {
 
   return (
     <div className="guild-panels-panel">
-      {/* Guild Header */}
-      <div className="guild-panel-header">
-        <button onClick={onBack} className="back-button">Back to Guilds</button>
-        <div className="guild-header-info">
-          <h2>{guild.name}</h2>
-          <span className="guild-id">ID: {guild.id}</span>
-        </div>
-        <div className="user-info-small">
-          {user.username}
-        </div>
-      </div>
-
-      {/* Panel Content */}
+      {/* Panel Content: no internal header; guildApp owns the header/tabs */}
       <div className="guild-panel-content">
         {loading && !panelData ? (
           <div className="panel-loading">
