@@ -22,6 +22,7 @@ import { configureOAuth, isGuildWebUIEnabled } from './auth/oauthConfig';
 import { requireGuildWebUIEnabled } from './auth/oauthMiddleware';
 import { getSessionMiddleware } from './auth/sessionManager';
 import oauthRoutes from './auth/oauthRoutes';
+import { getPaymentRegistry } from '../bot/internalSetup/utils/payment/paymentRegistry';
 
 export async function createServer(botManager: BotManager): Promise<Express> {
   const app = express();
@@ -89,6 +90,46 @@ export async function createServer(botManager: BotManager): Promise<Express> {
     origin: false, // Disable CORS entirely
     credentials: false
   }));
+
+  // Payment provider webhooks. MUST be mounted before express.json() so the
+  // raw body bytes survive intact - HMAC signature verification (Stripe,
+  // Lemon Squeezy, PayPal) checks against the exact transmitted payload, and
+  // any JSON re-serialisation breaks the signature. Public endpoint by
+  // design: providers send webhooks unauthenticated and prove identity via
+  // their per-provider signature scheme inside `handleWebhook`. Body is
+  // capped at 1MB which is well above any provider's webhook payload size.
+  app.post(
+    '/webhook/:providerId',
+    express.raw({ type: 'application/json', limit: '1mb' }),
+    async (req: Request, res: Response) => {
+      const providerId = req.params.providerId;
+      try {
+        const provider = getPaymentRegistry().get(providerId);
+        if (!provider || !provider.handleWebhook) {
+          return res.status(404).json({ error: `Unknown provider or no webhook handler: ${providerId}` });
+        }
+        // Flatten headers to a string-only map; providers pick out the
+        // header(s) they care about (Stripe-Signature, X-Signature, etc.).
+        const headerMap: Record<string, string> = {};
+        for (const [k, v] of Object.entries(req.headers)) {
+          if (typeof v === 'string') headerMap[k] = v;
+          else if (Array.isArray(v)) headerMap[k] = v.join(',');
+        }
+        const signature =
+          headerMap['stripe-signature']
+          || headerMap['x-signature']
+          || headerMap['paypal-transmission-sig']
+          || '';
+        await provider.handleWebhook(req.body as Buffer, signature, headerMap);
+        res.json({ received: true });
+      } catch (err: any) {
+        // Return 400 so the provider retries (their delivery system handles
+        // backoff). Log full context server-side.
+        console.error(`[Webhook] ${providerId} failed:`, err);
+        res.status(400).json({ error: err?.message || 'Webhook handling failed' });
+      }
+    },
+  );
 
   // Request body size limits to prevent DoS
   app.use(express.json({ limit: '10kb' })); // Strict limit for most requests
@@ -242,9 +283,13 @@ export async function createServer(botManager: BotManager): Promise<Express> {
     res.sendFile(path.join(publicDir, 'index.html'));
   });
 
-  // Guild Web-UI route (NO requireAuth - accessible via nginx ALLOWED_PATHS: "/guild")
-  // Always register this route to prevent catch-all from handling it
-  app.get('/guild', (req: Request, res: Response) => {
+  // Guild Web-UI routes (NO requireAuth - accessible via nginx
+  // ALLOWED_PATHS: "/guild"). The wildcard `/guild/*` serves the same SPA
+  // shell so deep links like /guild/{id}/subscription work after a full
+  // page reload (used by Stripe return URLs and refresh-restores-state
+  // browser behaviour). Both must be registered before the auth-gated
+  // catch-all below.
+  const guildHtmlHandler = (req: Request, res: Response) => {
     if (!isGuildWebUIEnabled()) {
       res.status(503).send(
         '<!DOCTYPE html><html><head><title>Guild Web-UI Disabled</title>' +
@@ -259,7 +304,9 @@ export async function createServer(botManager: BotManager): Promise<Express> {
       return;
     }
     res.sendFile(path.join(publicDir, 'guild.html'));
-  });
+  };
+  app.get('/guild', guildHtmlHandler);
+  app.get('/guild/*', guildHtmlHandler);
 
   // Catch-all for SPA routing (protected by auth)
   // MUST be last to not interfere with specific routes

@@ -51,6 +51,33 @@ function AppStorePanel() {
     loadData();
   }, []);
 
+  // Honor #dummy-settings deep links from the OfferingModal's "Open in Dummy"
+  // button. Switching the view here is the only way to make the section
+  // visible (it's gated on view === 'premium'). Scroll fires after a few
+  // animation frames so PremiumTiersView has had time to mount + render.
+  useEffect(() => {
+    function handleHash() {
+      const hash = (window.location.hash || '').replace(/^#/, '');
+      if (!hash) return;
+      if (hash === 'dummy-settings') {
+        setView('premium');
+        const tryScroll = (attempt) => {
+          const el = document.getElementById('dummy-settings');
+          if (el) {
+            el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            return;
+          }
+          if (attempt > 30) return;
+          setTimeout(() => tryScroll(attempt + 1), 100);
+        };
+        tryScroll(0);
+      }
+    }
+    handleHash();
+    window.addEventListener('hashchange', handleHash);
+    return () => window.removeEventListener('hashchange', handleHash);
+  }, []);
+
   useEffect(() => {
     const onPending = job => setInstallJobs(prev => ({ ...prev, [job.moduleName]: job }));
     const onRemove = job => setInstallJobs(prev => { const n = { ...prev }; delete n[job.moduleName]; return n; });
@@ -1647,6 +1674,1050 @@ function TierCard({
   );
 }
 
+/**
+ * Provider visual identity. Each registered provider gets a brand color and
+ * a single-letter glyph (no logo files - keeps the bundle lean and avoids
+ * trademark headaches). Custom providers fall through to neutral defaults.
+ */
+const PROVIDER_VISUALS = {
+  stripe:        { color: '#635bff', glyph: 'S', tagline: 'Cards, redirect checkout, full lifecycle' },
+  discord:       { color: '#5865F2', glyph: 'D', tagline: 'Discord App Monetization (Premium Apps)' },
+  lemonsqueezy:  { color: '#ffc233', glyph: 'L', tagline: 'Hosted checkout, MoR billing' },
+  paypal:        { color: '#003087', glyph: 'P', tagline: 'Subscriptions API, sandbox + live' },
+  patreon:       { color: '#ff424d', glyph: 'P', tagline: 'OAuth-link to existing pledges' },
+  boost:         { color: '#ff73fa', glyph: 'B', tagline: 'Verify Discord server boost count' },
+  dummy:         { color: '#5d6470', glyph: 'T', tagline: 'In-process simulator for testing' },
+};
+
+function providerVisual(p) {
+  return PROVIDER_VISUALS[p.id] || {
+    color: '#3ba55d',
+    glyph: (p.displayName || p.id || '?')[0].toUpperCase(),
+    tagline: 'Custom provider',
+  };
+}
+
+// Providers that have been runtime-tested end-to-end. Anything not in this
+// set surfaces a "WIP - untested" warning ribbon on its provider card so
+// the host knows it ships as a code-complete-but-unverified scaffold.
+const RUNTIME_TESTED_PROVIDERS = new Set(['stripe', 'dummy']);
+function isWIP(providerId) { return !RUNTIME_TESTED_PROVIDERS.has(providerId); }
+
+/**
+ * ProviderMethodCard - one row of the Available Payment Methods grid.
+ *
+ * Visual hierarchy (top -> bottom):
+ *   1. brand glyph + name + status pill
+ *   2. tagline + "not configured" hint when applicable
+ *   3. action row: Configure (primary when not configured) + activation
+ *      toggle (primary when configured but not yet activated)
+ *   4. default-enable sub-toggle (only when activated)
+ */
+function ProviderMethodCard({ provider, onToggleActivation, onToggleDefaultEnabled, onConfigure }) {
+  const v = providerVisual(provider);
+  const configured = !!provider.isConfigured;
+  const activated = !!provider.activated;
+  const hasCredentials = !!provider.hasCredentials;
+  const wip = isWIP(provider.id);
+
+  // Status pill: green when ready & active, blue when ready (not active),
+  // orange when configured but missing creds.
+  let statusBg = 'rgba(255,255,255,0.05)', statusFg = '#888', statusLabel = 'Built-in';
+  if (hasCredentials && !configured) { statusBg = 'rgba(230, 126, 34, 0.18)'; statusFg = '#e67e22'; statusLabel = 'Setup needed'; }
+  else if (configured && !activated)  { statusBg = 'rgba(88, 101, 242, 0.18)'; statusFg = '#a8b1ff'; statusLabel = 'Ready'; }
+  else if (configured && activated)   { statusBg = 'rgba(59, 165, 93, 0.18)';  statusFg = '#3ba55d'; statusLabel = 'Active'; }
+  else if (!hasCredentials && activated) { statusBg = 'rgba(59, 165, 93, 0.18)'; statusFg = '#3ba55d'; statusLabel = 'Active'; }
+
+  const cardBg = activated ? 'linear-gradient(180deg, #2c2f33 0%, #2a2d31 100%)' : '#26282c';
+  const accent = activated ? v.color : 'transparent';
+
+  return (
+    <div style={{
+      background: cardBg,
+      borderRadius: '12px',
+      border: `1px solid ${activated ? v.color + '55' : '#3a3d42'}`,
+      borderLeft: activated ? `4px solid ${v.color}` : '1px solid #3a3d42',
+      transition: 'border-color 0.2s, box-shadow 0.2s',
+      overflow: 'hidden',
+      display: 'flex', flexDirection: 'column',
+    }}>
+      {/* WIP ribbon - appears above everything else on untested providers.
+          Diagonal-stripe background to read as a build-warning, not a regular
+          status pill. Hard to ignore on purpose. */}
+      {wip && (
+        <div style={{
+          background: 'repeating-linear-gradient(135deg, rgba(245,175,25,0.18) 0 8px, rgba(245,175,25,0.08) 8px 16px)',
+          borderBottom: '1px solid rgba(245,175,25,0.35)',
+          color: '#f5af19', fontSize: '0.7rem', fontWeight: 700,
+          letterSpacing: '0.6px', textTransform: 'uppercase',
+          padding: '5px 14px',
+          display: 'flex', alignItems: 'center', gap: '8px',
+        }}
+        title="This provider's code is complete but has not been tested end-to-end against the live API. Treat as a working scaffold, expect to debug.">
+          <span>⚠ WIP - untested</span>
+          <span style={{ color: '#a8862a', fontWeight: 500, textTransform: 'none', letterSpacing: 0 }}>
+            integration not yet verified against the live API
+          </span>
+        </div>
+      )}
+      {/* Top: glyph + identity + status */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: '12px', padding: '14px 16px 10px 16px' }}>
+        <div style={{
+          width: '40px', height: '40px', borderRadius: '10px',
+          background: `linear-gradient(135deg, ${v.color}, ${v.color}cc)`,
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          color: '#fff', fontWeight: 700, fontSize: '1.1rem',
+          boxShadow: `0 2px 8px ${v.color}33`, flexShrink: 0,
+        }}>{v.glyph}</div>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ color: '#fff', fontSize: '0.98rem', fontWeight: 600, lineHeight: 1.2 }}>{provider.displayName}</div>
+          <div style={{ color: '#888', fontSize: '0.74rem', marginTop: '3px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+            {v.tagline}
+          </div>
+        </div>
+        <span style={{
+          background: statusBg, color: statusFg,
+          padding: '3px 10px', borderRadius: '11px', fontSize: '0.7rem', fontWeight: 600,
+          flexShrink: 0,
+        }}>{statusLabel}</span>
+      </div>
+
+      {/* Middle: action row */}
+      <div style={{
+        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+        padding: '10px 16px', gap: '12px', borderTop: '1px solid rgba(255,255,255,0.04)',
+      }}>
+        {hasCredentials ? (
+          <button onClick={onConfigure} style={{
+            background: `linear-gradient(135deg, ${v.color}, ${v.color}cc)`,
+            border: 'none',
+            color: '#fff',
+            padding: '6px 14px', borderRadius: '6px', cursor: 'pointer',
+            fontSize: '0.82rem', fontWeight: 600,
+            boxShadow: `0 1px 4px ${v.color}33`,
+          }}>
+            Configure
+          </button>
+        ) : (
+          <span style={{ color: '#666', fontSize: '0.78rem', fontStyle: 'italic' }}>
+            No credentials needed
+          </span>
+        )}
+        <label
+          onClick={(e) => { e.preventDefault(); onToggleActivation(); }}
+          title={activated ? 'Deactivate this method' : 'Activate this method'}
+          style={{
+            display: 'flex', alignItems: 'center', gap: '8px',
+            cursor: 'pointer', userSelect: 'none', flexShrink: 0,
+          }}>
+          <span style={{ color: activated ? '#3ba55d' : '#888', fontSize: '0.78rem', fontWeight: 600 }}>
+            {activated ? 'Active' : 'Inactive'}
+          </span>
+          <span style={{
+            position: 'relative', display: 'inline-block',
+            width: '38px', height: '22px', borderRadius: '11px',
+            background: activated ? '#3ba55d' : '#4a4d52',
+            transition: 'background 0.15s',
+          }}>
+            <span style={{
+              position: 'absolute', top: '2px', left: activated ? '18px' : '2px',
+              width: '18px', height: '18px', borderRadius: '50%', background: '#fff',
+              transition: 'left 0.15s', boxShadow: '0 1px 3px rgba(0,0,0,0.4)',
+            }} />
+          </span>
+        </label>
+      </div>
+
+      {/* Footer: default-enable, only when activated */}
+      {activated && (
+        <div style={{
+          display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+          padding: '8px 16px 12px 16px', gap: '10px',
+        }}>
+          <span style={{ color: '#999', fontSize: '0.76rem' }}>
+            Default-enable on new offerings
+          </span>
+          <span
+            onClick={onToggleDefaultEnabled}
+            style={{
+              position: 'relative', display: 'inline-block',
+              width: '32px', height: '18px', borderRadius: '9px',
+              background: provider.defaultEnabled ? v.color : '#4a4d52',
+              transition: 'background 0.15s', cursor: 'pointer',
+            }}>
+            <span style={{
+              position: 'absolute', top: '2px', left: provider.defaultEnabled ? '16px' : '2px',
+              width: '14px', height: '14px', borderRadius: '50%', background: '#fff',
+              transition: 'left 0.15s', boxShadow: '0 1px 2px rgba(0,0,0,0.4)',
+            }} />
+          </span>
+        </div>
+      )}
+      {/* Suppress unused-var lint warning for accent without rendering it. */}
+      {accent && null}
+    </div>
+  );
+}
+
+/**
+ * ProviderCredentialsModal - generic form for any provider's credentials.
+ *
+ * Loads the provider's declared field defs from
+ * `GET /api/appstore/premium/providers/:id/credentials` and renders a
+ * matching form. Save uses the leave-blank-to-keep convention so admins
+ * never accidentally clear a stored secret by re-saving an empty input.
+ *
+ * Per-field clear is exposed via a small "Clear" link next to each field
+ * that is currently set; the request goes through with `clear: [key]`.
+ *
+ * Read-only fields (e.g. Discord's bot token, marked optional + helpText
+ * "managed by your hosting setup") render disabled; the API also rejects
+ * writes to the reserved keys server-side so client-side enforcement is
+ * just a UX nicety.
+ */
+function ProviderCredentialsModal({ providerId, providerName, onClose, onSaved }) {
+  const [loading, setLoading] = useState(true);
+  const [fields, setFields] = useState([]);
+  const [status, setStatus] = useState({});
+  const [values, setValues] = useState({});
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState(null);
+  const [clearing, setClearing] = useState({});
+  const [isConfigured, setIsConfigured] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      setLoading(true);
+      setError(null);
+      try {
+        const res = await api.get(`/appstore/premium/providers/${encodeURIComponent(providerId)}/credentials`);
+        if (cancelled) return;
+        if (!res.success) {
+          setError(res.error || 'Failed to load credentials');
+          setFields([]);
+        } else {
+          setFields(res.fields || []);
+          setStatus(res.status || {});
+          setIsConfigured(!!res.isConfigured);
+          // Pre-fill 'select' types with their existing value (visible) and
+          // leave secret/text empty (preview is shown via placeholder).
+          const initial = {};
+          for (const f of (res.fields || [])) {
+            if (f.type === 'select' && res.status[f.key]?.preview) {
+              initial[f.key] = res.status[f.key].preview;
+            } else {
+              initial[f.key] = '';
+            }
+          }
+          setValues(initial);
+        }
+      } catch (err) {
+        if (!cancelled) setError(err.message || 'Failed to load credentials');
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [providerId]);
+
+  async function handleSave() {
+    setSaving(true);
+    setError(null);
+    try {
+      const res = await api.put(
+        `/appstore/premium/providers/${encodeURIComponent(providerId)}/credentials`,
+        { values, clear: Object.keys(clearing).filter(k => clearing[k]) },
+      );
+      if (!res.success) {
+        setError(res.error || 'Failed to save');
+        return;
+      }
+      setStatus(res.status || {});
+      setIsConfigured(!!res.isConfigured);
+      // Reset draft + clearing flags now that they've been applied.
+      const cleared = {};
+      for (const f of fields) cleared[f.key] = '';
+      setValues(cleared);
+      setClearing({});
+      showToast(`${providerName} credentials saved`, 'success');
+      if (onSaved) onSaved();
+    } catch (err) {
+      setError(err.message || 'Failed to save');
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const overlayStyle = {
+    position: 'fixed', top: 0, left: 0, right: 0, bottom: 0,
+    background: 'rgba(0,0,0,0.65)', display: 'flex', alignItems: 'center', justifyContent: 'center',
+    zIndex: 1100,
+  };
+  const modalStyle = {
+    background: '#2c2f33', borderRadius: '12px', padding: '24px', width: '560px', maxWidth: '92vw',
+    maxHeight: '90vh', overflow: 'auto', border: '1px solid #444',
+  };
+  const inputStyle = {
+    width: '100%', padding: '9px 12px', borderRadius: '6px', border: '1px solid #555',
+    background: '#1a1a1a', color: '#e0e0e0', fontSize: '0.9rem', boxSizing: 'border-box',
+  };
+
+  const isDirty = Object.values(values).some(v => v && v.trim()) || Object.values(clearing).some(Boolean);
+
+  return (
+    <div style={overlayStyle} onClick={onClose}>
+      <div style={modalStyle} onClick={e => e.stopPropagation()}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '6px' }}>
+          <h3 style={{ margin: 0, color: '#fff' }}>Configure {providerName}</h3>
+          <span style={{
+            background: isConfigured ? 'rgba(59, 165, 93, 0.2)' : 'rgba(230, 126, 34, 0.2)',
+            color: isConfigured ? '#3ba55d' : '#e67e22',
+            padding: '3px 10px', borderRadius: '12px', fontSize: '0.72rem', fontWeight: 600,
+          }}>{isConfigured ? '✓ Ready' : '⚠ Incomplete'}</span>
+        </div>
+        <p style={{ color: '#888', fontSize: '0.82rem', margin: '0 0 14px 0' }}>
+          Stored as env vars in <code>/data/.env</code>. Leave a field blank to keep its current value.
+        </p>
+
+        {loading && <div style={{ color: '#888', fontSize: '0.85rem', padding: '12px 0' }}>Loading...</div>}
+
+        {!loading && fields.length === 0 && (
+          <div style={{ color: '#888', fontSize: '0.85rem', padding: '12px 0' }}>
+            This provider has no credentials to configure.
+          </div>
+        )}
+
+        {!loading && fields.length > 0 && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
+            {fields.map(f => {
+              const isSet = !!status[f.key]?.set;
+              const isReadOnly = !!f.optional && !!f.helpText && /managed by your hosting/i.test(f.helpText);
+              const isMarkedClear = !!clearing[f.key];
+              return (
+                <div key={f.key}>
+                  <label style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', color: '#ddd', fontSize: '0.86rem', marginBottom: '5px' }}>
+                    <span>
+                      <span style={{
+                        display: 'inline-block', width: '8px', height: '8px', borderRadius: '50%',
+                        background: isSet && !isMarkedClear ? '#3ba55d' : '#e67e22',
+                        marginRight: '6px', verticalAlign: 'middle',
+                      }} />
+                      {f.label}
+                      {f.optional && <span style={{ color: '#888', fontWeight: 400, fontSize: '0.78rem' }}> (optional)</span>}
+                    </span>
+                    {isSet && !isReadOnly && (
+                      <button type="button" onClick={() => setClearing(c => ({ ...c, [f.key]: !c[f.key] }))} style={{
+                        background: 'transparent', border: 'none', padding: 0, cursor: 'pointer',
+                        color: isMarkedClear ? '#e67e22' : '#888', fontSize: '0.74rem', textDecoration: 'underline',
+                      }}>
+                        {isMarkedClear ? 'undo clear' : 'clear on save'}
+                      </button>
+                    )}
+                  </label>
+                  {f.type === 'select' ? (
+                    <select
+                      style={inputStyle}
+                      value={values[f.key] || ''}
+                      disabled={isReadOnly || isMarkedClear}
+                      onChange={e => setValues(v => ({ ...v, [f.key]: e.target.value }))}>
+                      <option value="">(use existing or default)</option>
+                      {(f.options || []).map(opt => (
+                        <option key={opt.value} value={opt.value}>{opt.label}</option>
+                      ))}
+                    </select>
+                  ) : (
+                    <input
+                      type={f.type === 'secret' ? 'password' : 'text'}
+                      style={{ ...inputStyle, ...(isReadOnly ? { opacity: 0.5, cursor: 'not-allowed' } : {}) }}
+                      value={values[f.key] || ''}
+                      disabled={isReadOnly || isMarkedClear}
+                      placeholder={isSet ? '[set - leave blank to keep current]' : (f.placeholder || '')}
+                      onChange={e => setValues(v => ({ ...v, [f.key]: e.target.value }))}
+                    />
+                  )}
+                  {f.helpText && (
+                    <div style={{ color: '#888', fontSize: '0.72rem', marginTop: '4px' }}>{f.helpText}</div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        {error && (
+          <div style={{
+            marginTop: '14px', padding: '8px 12px',
+            background: 'rgba(237, 66, 69, 0.1)', border: '1px solid #ed4245',
+            color: '#ed4245', borderRadius: '6px', fontSize: '0.82rem',
+          }}>{error}</div>
+        )}
+
+        <div style={{ display: 'flex', gap: '10px', justifyContent: 'flex-end', marginTop: '20px' }}>
+          <button onClick={onClose} disabled={saving} style={{
+            background: '#40444b', color: '#ddd', border: 'none', padding: '9px 18px',
+            borderRadius: '6px', cursor: saving ? 'not-allowed' : 'pointer',
+            ...disabledButtonStyle(saving),
+          }}>Close</button>
+          <button onClick={handleSave} disabled={saving || !isDirty || fields.length === 0} style={{
+            background: (saving || !isDirty) ? '#555' : 'linear-gradient(135deg, #3ba55d, #2d8049)',
+            color: '#fff', border: 'none', padding: '9px 20px',
+            borderRadius: '6px', cursor: (saving || !isDirty) ? 'not-allowed' : 'pointer',
+            fontWeight: 600,
+            ...disabledButtonStyle(saving || !isDirty),
+          }}>
+            {saving ? 'Saving...' : 'Save'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Known audit-log action ids. Mirrors the AuditEntry['action'] enum on the
+// backend; kept hand-synced because the frontend uses these for the filter
+// dropdown. Adding a new action server-side without updating this list just
+// means the dropdown won't list it (entries with the new action still show
+// in "All actions").
+const AUDIT_ACTIONS = [
+  'tier.create', 'tier.update', 'tier.delete',
+  'offering.create', 'offering.update', 'offering.delete',
+  'provider.activation.set',
+  'subscription.grant.manual', 'subscription.revoke.manual', 'subscription.extend.manual',
+  'subscription.install.paid', 'subscription.cancel.paid', 'subscription.reactivate.paid',
+  'subscription.expire.paid', 'subscription.pause', 'subscription.resume',
+  'subscription.adopt.orphan', 'subscription.cancel.orphan',
+  'message.update',
+];
+
+// Color hint per action family. Purely visual; the action string itself is
+// always rendered so a missing color just falls back to the neutral.
+function auditActionColor(action) {
+  if (action.startsWith('tier.')) return '#5865F2';
+  if (action.startsWith('offering.')) return '#5865F2';
+  if (action.startsWith('provider.')) return '#7289da';
+  if (action.includes('grant.manual') || action.includes('extend.manual')) return '#3ba55d';
+  if (action.includes('revoke.manual')) return '#ed4245';
+  if (action.includes('install.paid') || action.includes('reactivate.paid')) return '#3ba55d';
+  if (action.includes('cancel.paid') || action.includes('expire.paid')) return '#ed4245';
+  if (action.includes('pause')) return '#e67e22';
+  if (action.includes('resume')) return '#3ba55d';
+  if (action.includes('adopt.orphan')) return '#3ba55d';
+  if (action.includes('cancel.orphan')) return '#e67e22';
+  if (action.includes('message.update')) return '#aaa';
+  return '#aaa';
+}
+
+/**
+ * AuditLogViewer - filterable read-only viewer for /api/appstore/premium/audit.
+ *
+ * Collapsed by default since most admin sessions don't need to inspect the
+ * log. Filter state lives locally; expanding triggers an initial fetch with
+ * the current filters, and Apply re-fetches.
+ *
+ * Filters: from + to (datetime-local, converted to ISO), action (dropdown),
+ * tier (dropdown from tiers prop), provider (dropdown from providers prop),
+ * guild (free-text id), limit (free-text). Submit button labelled Apply.
+ */
+function AuditLogViewer({ tiers, providers, sectionStyle }) {
+  const [expanded, setExpanded] = useState(false);
+  const [filters, setFilters] = useState({
+    from: '', to: '', action: '', tierId: '', providerId: '', guildId: '', limit: '500',
+  });
+  const [entries, setEntries] = useState([]);
+  const [meta, setMeta] = useState({ total: 0, truncated: false });
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+  const [hasFetched, setHasFetched] = useState(false);
+
+  async function fetchAudit() {
+    setLoading(true);
+    setError(null);
+    try {
+      const qs = new URLSearchParams();
+      if (filters.from) {
+        // datetime-local gives `YYYY-MM-DDTHH:mm`; convert to a real ISO so
+        // the backend's exact-string compare against `entry.timestamp` works
+        // (audit timestamps are full ISO with milliseconds + Z).
+        const d = new Date(filters.from);
+        if (!isNaN(d.getTime())) qs.set('from', d.toISOString());
+      }
+      if (filters.to) {
+        const d = new Date(filters.to);
+        if (!isNaN(d.getTime())) qs.set('to', d.toISOString());
+      }
+      if (filters.action) qs.set('action', filters.action);
+      if (filters.tierId) qs.set('tierId', filters.tierId);
+      if (filters.providerId) qs.set('providerId', filters.providerId);
+      if (filters.guildId.trim()) qs.set('guildId', filters.guildId.trim());
+      if (filters.limit) qs.set('limit', filters.limit);
+      const res = await api.get(`/appstore/premium/audit?${qs.toString()}`);
+      if (!res.success) {
+        setError(res.error || 'Failed to load audit log');
+        setEntries([]);
+        setMeta({ total: 0, truncated: false });
+        return;
+      }
+      setEntries(Array.isArray(res.entries) ? res.entries : []);
+      setMeta({ total: res.total || 0, truncated: !!res.truncated });
+      setHasFetched(true);
+    } catch (err) {
+      setError(err.message || 'Failed to load audit log');
+      setEntries([]);
+      setMeta({ total: 0, truncated: false });
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    if (expanded && !hasFetched) {
+      void fetchAudit();
+    }
+  }, [expanded]);
+
+  function clearFilters() {
+    setFilters({ from: '', to: '', action: '', tierId: '', providerId: '', guildId: '', limit: '500' });
+  }
+
+  function targetSummary(entry) {
+    const parts = [];
+    if (entry.tierId) parts.push(`tier=${entry.tierId}`);
+    if (entry.offeringId) parts.push(`offering=${entry.offeringId}`);
+    if (entry.providerId) parts.push(`provider=${entry.providerId}`);
+    if (entry.guildId) parts.push(`guild=${entry.guildId}`);
+    if (entry.subscriptionId) parts.push(`sub=${entry.subscriptionId.slice(0, 8)}`);
+    return parts.join(' · ');
+  }
+
+  function metaSummary(entry) {
+    const m = entry.metadata || {};
+    const parts = [];
+    for (const key of Object.keys(m)) {
+      const v = m[key];
+      if (v == null) continue;
+      const s = typeof v === 'object' ? JSON.stringify(v) : String(v);
+      const trimmed = s.length > 60 ? s.slice(0, 57) + '...' : s;
+      parts.push(`${key}=${trimmed}`);
+    }
+    return parts.join(' · ');
+  }
+
+  const inputStyle = {
+    padding: '6px 10px', borderRadius: '5px', border: '1px solid #444',
+    background: '#1a1a1a', color: '#e0e0e0', fontSize: '0.82rem', boxSizing: 'border-box',
+  };
+  const labelStyle = { display: 'block', color: '#888', fontSize: '0.7rem', marginBottom: '3px' };
+
+  return (
+    <div style={sectionStyle}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: expanded ? '12px' : 0 }}>
+        <div>
+          <h3 style={{ margin: 0 }}>Audit Log</h3>
+          <p style={{ color: '#999', margin: '4px 0 0 0', fontSize: '0.8rem' }}>
+            Append-only record of premium-related changes. Read-only.
+          </p>
+        </div>
+        <button onClick={() => setExpanded(e => !e)} style={{
+          background: '#40444b', color: '#ddd', border: 'none', padding: '6px 12px',
+          borderRadius: '6px', cursor: 'pointer', fontSize: '0.82rem',
+        }}>{expanded ? 'Collapse' : 'Expand'}</button>
+      </div>
+
+      {expanded && (
+        <React.Fragment>
+          {/* Filters row */}
+          <div style={{
+            display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))',
+            gap: '10px', marginBottom: '12px',
+          }}>
+            <div>
+              <label style={labelStyle}>From</label>
+              <input type="datetime-local" style={{ ...inputStyle, width: '100%' }}
+                value={filters.from}
+                onChange={e => setFilters(f => ({ ...f, from: e.target.value }))} />
+            </div>
+            <div>
+              <label style={labelStyle}>To</label>
+              <input type="datetime-local" style={{ ...inputStyle, width: '100%' }}
+                value={filters.to}
+                onChange={e => setFilters(f => ({ ...f, to: e.target.value }))} />
+            </div>
+            <div>
+              <label style={labelStyle}>Action</label>
+              <select style={{ ...inputStyle, width: '100%' }}
+                value={filters.action}
+                onChange={e => setFilters(f => ({ ...f, action: e.target.value }))}>
+                <option value="">All actions</option>
+                {AUDIT_ACTIONS.map(a => <option key={a} value={a}>{a}</option>)}
+              </select>
+            </div>
+            <div>
+              <label style={labelStyle}>Tier</label>
+              <select style={{ ...inputStyle, width: '100%' }}
+                value={filters.tierId}
+                onChange={e => setFilters(f => ({ ...f, tierId: e.target.value }))}>
+                <option value="">All tiers</option>
+                {Object.entries(tiers || {}).map(([id, t]) => (
+                  <option key={id} value={id}>{t?.displayName || id}</option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label style={labelStyle}>Provider</label>
+              <select style={{ ...inputStyle, width: '100%' }}
+                value={filters.providerId}
+                onChange={e => setFilters(f => ({ ...f, providerId: e.target.value }))}>
+                <option value="">All providers</option>
+                {(providers || []).map(p => (
+                  <option key={p.id} value={p.id}>{p.displayName || p.id}</option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label style={labelStyle}>Guild ID</label>
+              <input type="text" style={{ ...inputStyle, width: '100%' }}
+                placeholder="(any)"
+                value={filters.guildId}
+                onChange={e => setFilters(f => ({ ...f, guildId: e.target.value }))} />
+            </div>
+            <div>
+              <label style={labelStyle}>Limit</label>
+              <input type="number" min="1" max="5000" style={{ ...inputStyle, width: '100%' }}
+                value={filters.limit}
+                onChange={e => setFilters(f => ({ ...f, limit: e.target.value }))} />
+            </div>
+          </div>
+
+          <div style={{ display: 'flex', gap: '8px', marginBottom: '14px' }}>
+            <button onClick={fetchAudit} disabled={loading} style={{
+              background: loading ? '#555' : 'linear-gradient(135deg, #5865F2, #4752C4)',
+              color: '#fff', border: 'none',
+              padding: '7px 16px', borderRadius: '6px',
+              cursor: loading ? 'not-allowed' : 'pointer',
+              fontWeight: 600, fontSize: '0.82rem',
+              opacity: loading ? 0.55 : 1,
+            }}>{loading ? 'Loading...' : 'Apply'}</button>
+            <button onClick={clearFilters} disabled={loading} style={{
+              background: 'transparent', color: '#aaa', border: '1px solid #555',
+              padding: '6px 14px', borderRadius: '6px',
+              cursor: loading ? 'not-allowed' : 'pointer',
+              fontSize: '0.82rem',
+              opacity: loading ? 0.55 : 1,
+            }}>Reset</button>
+            {hasFetched && !loading && (
+              <span style={{ color: '#888', fontSize: '0.78rem', alignSelf: 'center' }}>
+                {entries.length} entr{entries.length === 1 ? 'y' : 'ies'} (of {meta.total} parsed)
+                {meta.truncated && ' · truncated'}
+              </span>
+            )}
+          </div>
+
+          {error && (
+            <div style={{
+              background: 'rgba(237, 66, 69, 0.1)', border: '1px solid #ed4245',
+              color: '#ed4245', padding: '8px 12px', borderRadius: '6px',
+              fontSize: '0.82rem', marginBottom: '12px',
+            }}>{error}</div>
+          )}
+
+          {entries.length === 0 && hasFetched && !loading && !error && (
+            <div style={{ color: '#666', fontSize: '0.85rem', padding: '16px', textAlign: 'center' }}>
+              No audit entries match these filters.
+            </div>
+          )}
+
+          {entries.length > 0 && (
+            <div style={{
+              maxHeight: '600px', overflow: 'auto',
+              border: '1px solid #333', borderRadius: '6px',
+            }}>
+              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.78rem' }}>
+                <thead style={{ position: 'sticky', top: 0, background: '#1a1a1a', zIndex: 1 }}>
+                  <tr style={{ color: '#888', textTransform: 'uppercase', fontSize: '0.7rem', letterSpacing: '0.5px' }}>
+                    <th style={{ padding: '8px 10px', textAlign: 'left', borderBottom: '1px solid #333' }}>Time</th>
+                    <th style={{ padding: '8px 10px', textAlign: 'left', borderBottom: '1px solid #333' }}>Action</th>
+                    <th style={{ padding: '8px 10px', textAlign: 'left', borderBottom: '1px solid #333' }}>Actor</th>
+                    <th style={{ padding: '8px 10px', textAlign: 'left', borderBottom: '1px solid #333' }}>Target</th>
+                    <th style={{ padding: '8px 10px', textAlign: 'left', borderBottom: '1px solid #333' }}>Metadata</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {entries.map((entry, idx) => (
+                    <tr key={`${entry.timestamp}:${idx}`} style={{
+                      background: idx % 2 === 0 ? '#222428' : '#1c1d21',
+                      color: '#ddd',
+                    }}>
+                      <td style={{ padding: '6px 10px', fontFamily: 'monospace', whiteSpace: 'nowrap', color: '#aaa' }}>
+                        {new Date(entry.timestamp).toLocaleString()}
+                      </td>
+                      <td style={{ padding: '6px 10px', whiteSpace: 'nowrap', color: auditActionColor(entry.action), fontWeight: 600 }}>
+                        {entry.action}
+                      </td>
+                      <td style={{ padding: '6px 10px', whiteSpace: 'nowrap', color: '#aaa' }}>
+                        {entry.actor || '?'}
+                      </td>
+                      <td style={{ padding: '6px 10px', fontFamily: 'monospace', color: '#bbb' }}>
+                        {targetSummary(entry) || <span style={{ color: '#666' }}>-</span>}
+                      </td>
+                      <td style={{ padding: '6px 10px', color: '#888' }}>
+                        {metaSummary(entry) || <span style={{ color: '#666' }}>-</span>}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          {meta.truncated && (
+            <div style={{ color: '#e67e22', fontSize: '0.78rem', marginTop: '8px' }}>
+              ⚠ Result hit the limit cap. Refine your filters or raise the limit (max 5000) to see older entries.
+            </div>
+          )}
+        </React.Fragment>
+      )}
+    </div>
+  );
+}
+
+/**
+ * MigrationsPanel - admin Stage 5 UI. Lists scheduled migrations, schedules
+ * new ones, cancels pending, and toggles the host silence policy. Shipped
+ * collapsed by default (most operators won't touch this often).
+ */
+function MigrationsPanel({ tiers, providers, sectionStyle, showSuccess, setError }) {
+  const [expanded, setExpanded] = useState(false);
+  const [migrations, setMigrations] = useState([]);
+  const [silencePolicy, setSilencePolicy] = useState('cancel');
+  const [loading, setLoading] = useState(false);
+  const [showNew, setShowNew] = useState(false);
+  const [draft, setDraft] = useState({
+    providerId: '', sourceTierId: '', sourceOfferingId: '', sourceVariantId: '',
+    targetTierId: '', targetOfferingId: '', targetVariantId: '',
+    effectiveDate: '', message: '',
+  });
+  const [submitting, setSubmitting] = useState(false);
+
+  async function fetchAll() {
+    setLoading(true);
+    try {
+      const res = await api.get('/appstore/premium/migrations');
+      if (res.success) {
+        setMigrations(res.migrations || []);
+        if (res.silencePolicy) setSilencePolicy(res.silencePolicy);
+      }
+    } catch { /* surface via setError? best to stay quiet on initial load */ }
+    finally { setLoading(false); }
+  }
+
+  useEffect(() => {
+    if (expanded) fetchAll();
+  }, [expanded]);
+
+  async function handleSilenceToggle(next) {
+    if (next === silencePolicy) return;
+    const explanation = next === 'continue'
+      ? 'Switch to CONTINUE policy?\n\n' +
+        'Subscribers who do not respond will be migrated automatically. ' +
+        'You accept the compliance burden of treating silence as consent ' +
+        '(in some jurisdictions this exposes you to chargebacks).'
+      : 'Switch to CANCEL policy?\n\n' +
+        'Subscribers who do not respond will have their subscriptions ' +
+        'cancelled at period end (pro-consumer default). They lose access ' +
+        'after their current term and the migration does not apply to them.';
+    if (!confirm(explanation)) return;
+    try {
+      const res = await api.put('/appstore/premium/migration-silence-policy', { policy: next });
+      if (res.success) { setSilencePolicy(next); showSuccess(`Silence policy: ${next}`); }
+      else setError(res.error || 'Failed to set silence policy');
+    } catch (err) { setError(err.message); }
+  }
+
+  // Helpers for the schedule form: when the admin picks a source variant,
+  // pre-fill source tier+offering by scanning the wired tiers/offerings.
+  // Likewise for target. Non-destructive - admin can override.
+  function applySourceVariant(variantId) {
+    setDraft(d => ({ ...d, sourceVariantId: variantId }));
+    if (!variantId) return;
+    for (const [tierId, t] of Object.entries(tiers)) {
+      for (const o of (t.offerings || [])) {
+        for (const link of (o.providerLinks || [])) {
+          const variants = link.cache?.variants || [];
+          if (variants.some(v => v.variantId === variantId)) {
+            setDraft(d => ({ ...d, sourceTierId: tierId, sourceOfferingId: o.id, providerId: link.providerId }));
+            return;
+          }
+        }
+      }
+    }
+  }
+
+  function applyTargetVariant(variantId) {
+    setDraft(d => ({ ...d, targetVariantId: variantId }));
+    if (!variantId) return;
+    for (const [tierId, t] of Object.entries(tiers)) {
+      for (const o of (t.offerings || [])) {
+        for (const link of (o.providerLinks || [])) {
+          const variants = link.cache?.variants || [];
+          if (variants.some(v => v.variantId === variantId)) {
+            setDraft(d => ({ ...d, targetTierId: tierId, targetOfferingId: o.id }));
+            return;
+          }
+        }
+      }
+    }
+  }
+
+  // Flatten all known variants (per provider) for the source/target pickers.
+  const allKnownVariants = (() => {
+    const out = [];
+    for (const [tierId, t] of Object.entries(tiers)) {
+      for (const o of (t.offerings || [])) {
+        for (const link of (o.providerLinks || [])) {
+          for (const v of (link.cache?.variants || [])) {
+            out.push({
+              providerId: link.providerId,
+              tierId, tierName: t.displayName,
+              offeringId: o.id, offeringLabel: o.label,
+              variantId: v.variantId, label: v.label,
+              amount: v.amount, currency: v.currency,
+              durationDays: v.durationDays,
+            });
+          }
+        }
+      }
+    }
+    return out;
+  })();
+
+  async function handleSchedule() {
+    const required = ['providerId', 'sourceTierId', 'sourceOfferingId', 'sourceVariantId',
+      'targetTierId', 'targetOfferingId', 'targetVariantId', 'effectiveDate'];
+    for (const k of required) {
+      if (!draft[k]) { setError(`${k} is required`); return; }
+    }
+    const eff = new Date(draft.effectiveDate);
+    if (isNaN(eff.getTime()) || eff.getTime() <= Date.now()) {
+      setError('effectiveDate must be a future timestamp');
+      return;
+    }
+    setSubmitting(true);
+    try {
+      const res = await api.post('/appstore/premium/migrations', {
+        ...draft,
+        effectiveDate: eff.toISOString(),
+      });
+      if (res.success) {
+        showSuccess('Migration scheduled');
+        setShowNew(false);
+        setDraft({
+          providerId: '', sourceTierId: '', sourceOfferingId: '', sourceVariantId: '',
+          targetTierId: '', targetOfferingId: '', targetVariantId: '',
+          effectiveDate: '', message: '',
+        });
+        await fetchAll();
+      } else setError(res.error || 'Failed to schedule migration');
+    } catch (err) { setError(err.message); }
+    finally { setSubmitting(false); }
+  }
+
+  async function handleCancel(migrationId) {
+    if (!confirm('Cancel this scheduled migration? Subscribers will not be migrated and the host will not be charged.')) return;
+    try {
+      const res = await api.delete(`/appstore/premium/migrations/${encodeURIComponent(migrationId)}`);
+      if (res.success) { showSuccess('Migration cancelled'); await fetchAll(); }
+      else setError(res.error || 'Failed to cancel migration');
+    } catch (err) { setError(err.message); }
+  }
+
+  const inputStyle = {
+    padding: '6px 10px', borderRadius: '5px', border: '1px solid #444',
+    background: '#1a1a1a', color: '#e0e0e0', fontSize: '0.82rem', boxSizing: 'border-box',
+  };
+  const labelStyle = { display: 'block', color: '#888', fontSize: '0.7rem', marginBottom: '3px' };
+
+  return (
+    <div style={sectionStyle}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: expanded ? '12px' : 0 }}>
+        <div>
+          <h3 style={{ margin: 0 }}>Subscription Migrations</h3>
+          <p style={{ color: '#999', margin: '4px 0 0 0', fontSize: '0.8rem' }}>
+            Move existing subscribers from one variant to another with consent (Stage 5).
+          </p>
+        </div>
+        <button onClick={() => setExpanded(e => !e)} style={{
+          background: '#40444b', color: '#ddd', border: 'none', padding: '6px 12px',
+          borderRadius: '6px', cursor: 'pointer', fontSize: '0.82rem',
+        }}>{expanded ? 'Collapse' : 'Expand'}</button>
+      </div>
+
+      {expanded && (
+        <React.Fragment>
+          {/* Silence policy */}
+          <div style={{
+            background: '#36393f', borderRadius: '8px', padding: '12px 14px', marginBottom: '14px',
+          }}>
+            <div style={{ color: '#ddd', fontSize: '0.85rem', fontWeight: 600, marginBottom: '6px' }}>
+              Silence policy <span style={{ color: '#888', fontWeight: 400 }}>(when a subscriber doesn't respond)</span>
+            </div>
+            <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+              <button onClick={() => handleSilenceToggle('cancel')}
+                style={{
+                  background: silencePolicy === 'cancel' ? 'linear-gradient(135deg, #5865F2, #4752C4)' : 'transparent',
+                  color: silencePolicy === 'cancel' ? '#fff' : '#aaa',
+                  border: '1px solid #555', padding: '6px 14px', borderRadius: '5px',
+                  cursor: 'pointer', fontSize: '0.78rem',
+                }}>
+                Cancel (default · pro-consumer)
+              </button>
+              <button onClick={() => handleSilenceToggle('continue')}
+                style={{
+                  background: silencePolicy === 'continue' ? 'linear-gradient(135deg, #e67e22, #b35400)' : 'transparent',
+                  color: silencePolicy === 'continue' ? '#fff' : '#aaa',
+                  border: '1px solid #555', padding: '6px 14px', borderRadius: '5px',
+                  cursor: 'pointer', fontSize: '0.78rem',
+                }}>
+                Continue (host accepts compliance burden)
+              </button>
+            </div>
+          </div>
+
+          {/* New-migration form */}
+          <div style={{ marginBottom: '14px' }}>
+            {!showNew ? (
+              <button onClick={() => setShowNew(true)} style={{
+                background: 'linear-gradient(135deg, #5865F2, #4752C4)', color: '#fff', border: 'none',
+                padding: '7px 14px', borderRadius: '6px', cursor: 'pointer', fontSize: '0.82rem', fontWeight: 600,
+              }}>+ Schedule migration</button>
+            ) : (
+              <div style={{ background: '#36393f', borderRadius: '8px', padding: '14px' }}>
+                <div style={{ color: '#fff', fontSize: '0.9rem', fontWeight: 600, marginBottom: '10px' }}>New migration</div>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: '10px' }}>
+                  <div>
+                    <label style={labelStyle}>Source variant</label>
+                    <select style={{ ...inputStyle, width: '100%' }}
+                      value={draft.sourceVariantId}
+                      onChange={e => applySourceVariant(e.target.value)}>
+                      <option value="">Pick source variant...</option>
+                      {allKnownVariants.map((v, i) => (
+                        <option key={`${v.providerId}:${v.variantId}:${i}`} value={v.variantId}>
+                          [{v.providerId}] {v.tierName} / {v.offeringLabel} - {v.label} ({(v.amount / 100).toFixed(2)} {v.currency})
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <div>
+                    <label style={labelStyle}>Target variant</label>
+                    <select style={{ ...inputStyle, width: '100%' }}
+                      value={draft.targetVariantId}
+                      onChange={e => applyTargetVariant(e.target.value)}>
+                      <option value="">Pick target variant...</option>
+                      {allKnownVariants
+                        .filter(v => !draft.providerId || v.providerId === draft.providerId)
+                        .map((v, i) => (
+                          <option key={`tgt:${v.providerId}:${v.variantId}:${i}`} value={v.variantId}>
+                            [{v.providerId}] {v.tierName} / {v.offeringLabel} - {v.label} ({(v.amount / 100).toFixed(2)} {v.currency})
+                          </option>
+                        ))}
+                    </select>
+                  </div>
+                  <div>
+                    <label style={labelStyle}>Effective date</label>
+                    <input type="datetime-local" style={{ ...inputStyle, width: '100%' }}
+                      value={draft.effectiveDate}
+                      onChange={e => setDraft(d => ({ ...d, effectiveDate: e.target.value }))} />
+                  </div>
+                </div>
+                <label style={{ ...labelStyle, marginTop: '10px' }}>Message to subscribers</label>
+                <textarea
+                  style={{ ...inputStyle, width: '100%', minHeight: '60px', resize: 'vertical', fontFamily: 'inherit' }}
+                  rows={2}
+                  value={draft.message}
+                  placeholder="e.g. We're updating our pricing on March 1. Please accept or decline below."
+                  onChange={e => setDraft(d => ({ ...d, message: e.target.value }))} />
+                <div style={{ color: '#888', fontSize: '0.72rem', marginTop: '6px' }}>
+                  Provider: <code>{draft.providerId || '(auto-detected from source)'}</code>
+                  {' · '}
+                  Source: <code>{draft.sourceTierId || '?'} / {draft.sourceOfferingId || '?'}</code>
+                  {' · '}
+                  Target: <code>{draft.targetTierId || '?'} / {draft.targetOfferingId || '?'}</code>
+                </div>
+                <div style={{ display: 'flex', gap: '8px', marginTop: '12px' }}>
+                  <button onClick={handleSchedule} disabled={submitting} style={{
+                    background: submitting ? '#555' : 'linear-gradient(135deg, #3ba55d, #2d8049)',
+                    color: '#fff', border: 'none', padding: '7px 14px', borderRadius: '6px',
+                    cursor: submitting ? 'not-allowed' : 'pointer', fontSize: '0.82rem', fontWeight: 600,
+                  }}>{submitting ? 'Scheduling...' : 'Schedule'}</button>
+                  <button onClick={() => setShowNew(false)} disabled={submitting} style={{
+                    background: 'transparent', color: '#aaa', border: '1px solid #555',
+                    padding: '6px 14px', borderRadius: '6px', cursor: 'pointer', fontSize: '0.82rem',
+                  }}>Cancel</button>
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Existing migrations list */}
+          {loading && <div style={{ color: '#666', fontSize: '0.8rem' }}>Loading migrations...</div>}
+          {!loading && migrations.length === 0 && (
+            <div style={{ color: '#666', fontSize: '0.85rem', padding: '12px', textAlign: 'center' }}>
+              No migrations scheduled.
+            </div>
+          )}
+          {!loading && migrations.length > 0 && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+              {migrations.map(m => {
+                const sourceTier = tiers[m.sourceTierId];
+                const targetTier = tiers[m.targetTierId];
+                const counts = (m.decisions || []).reduce((acc, d) => {
+                  acc[d.decision] = (acc[d.decision] || 0) + 1;
+                  return acc;
+                }, {});
+                const provider = providers.find(p => p.id === m.providerId);
+                return (
+                  <div key={m.id} style={{
+                    background: '#36393f', borderRadius: '8px', padding: '12px 14px',
+                    borderLeft: `3px solid ${m.status === 'pending' ? '#f5af19' : m.status === 'applied' ? '#3ba55d' : '#888'}`,
+                  }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', flexWrap: 'wrap', gap: '8px' }}>
+                      <div style={{ color: '#fff', fontSize: '0.9rem', fontWeight: 600 }}>
+                        {sourceTier?.displayName || m.sourceTierId} → {targetTier?.displayName || m.targetTierId}
+                        <span style={{ color: '#888', marginLeft: '8px', fontSize: '0.78rem', fontWeight: 400 }}>
+                          via {provider?.displayName || m.providerId} · {m.status}
+                        </span>
+                      </div>
+                      {m.status === 'pending' && (
+                        <button onClick={() => handleCancel(m.id)} style={{
+                          background: 'transparent', color: '#ed4245', border: '1px solid #ed4245',
+                          padding: '3px 10px', borderRadius: '4px', cursor: 'pointer', fontSize: '0.72rem',
+                        }}>Cancel</button>
+                      )}
+                    </div>
+                    <div style={{ color: '#aaa', fontSize: '0.78rem', marginTop: '4px' }}>
+                      Effective: {new Date(m.effectiveDate).toLocaleString()}
+                      {' · '}
+                      Affected: {m.decisions?.length || 0}
+                      {' · '}
+                      Decisions: pending {counts.pending || 0} · accepted {counts.accepted || 0} · declined {counts.declined || 0}
+                      {counts['silent-applied'] ? ` · silent-applied ${counts['silent-applied']}` : ''}
+                    </div>
+                    {m.message && (
+                      <div style={{ color: '#888', fontSize: '0.78rem', marginTop: '4px', fontStyle: 'italic' }}>
+                        "{m.message}"
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </React.Fragment>
+      )}
+    </div>
+  );
+}
+
 function PremiumTiersView({ tiers, subscriptions, messages, messageDefaults, onRefresh, onMessagesChanged, showSuccess, setError }) {
   // Tier CRUD state
   const [showTierForm, setShowTierForm] = useState(false);
@@ -1666,11 +2737,23 @@ function PremiumTiersView({ tiers, subscriptions, messages, messageDefaults, onR
   const [msgDraft, setMsgDraft] = useState(() => messages || { moduleBlocked: '', commandBlocked: '', panelBlocked: '' });
   const [msgSaving, setMsgSaving] = useState(false);
 
-  // Coupons state
+  // Dummy provider settings state (variants + products + coupons live in
+  // Dummy's own state file; this panel CRUDs them via /providers/dummy/*).
   const [coupons, setCoupons] = useState({});
   const [couponsLoaded, setCouponsLoaded] = useState(false);
-  const [newCouponDraft, setNewCouponDraft] = useState({ code: '', kind: 'percentOff', value: '', maxUses: '', description: '', expiresAt: '', scope: 'global', allowedTiers: [] });
+  const [newCouponDraft, setNewCouponDraft] = useState({ code: '', kind: 'percentOff', value: '', maxUses: '', description: '', expiresAt: '' });
   const [couponSaving, setCouponSaving] = useState(false);
+  const [dummyVariants, setDummyVariants] = useState([]);
+  const [dummyProducts, setDummyProducts] = useState([]);
+  const [dummyLoaded, setDummyLoaded] = useState(false);
+  const EMPTY_VARIANT_DRAFT = { variantId: '', label: '', amount: '', currency: 'USD', durationDays: '30', trialDays: '', recurring: true, active: true };
+  const EMPTY_PRODUCT_DRAFT = { productId: '', label: '', description: '', variantIds: [] };
+  const [variantDraft, setVariantDraft] = useState(EMPTY_VARIANT_DRAFT);
+  const [editingVariantId, setEditingVariantId] = useState(null);
+  const [variantSaving, setVariantSaving] = useState(false);
+  const [productDraft, setProductDraft] = useState(EMPTY_PRODUCT_DRAFT);
+  const [editingProductId, setEditingProductId] = useState(null);
+  const [productSaving, setProductSaving] = useState(false);
 
   useEffect(() => {
     if (messages) setMsgDraft(messages);
@@ -1680,12 +2763,23 @@ function PremiumTiersView({ tiers, subscriptions, messages, messageDefaults, onR
     loadGuilds();
     loadProviders();
     loadCoupons();
+    loadDummyVariants();
+    loadDummyProducts();
   }, []);
 
   async function loadCoupons() {
     try {
-      const res = await api.get('/appstore/premium/coupons');
-      if (res.success) setCoupons(res.coupons || {});
+      // Coupons live at the provider in the new model. The Dummy provider has
+      // a built-in registry; real providers (Stripe, LS, ...) own theirs at
+      // their dashboard. This panel manages Dummy's only.
+      const res = await api.get('/appstore/premium/providers/dummy/coupons');
+      if (res.success) {
+        // Endpoint returns an array; turn it into a Record keyed by code so
+        // the existing rendering Object.entries() still works.
+        const map = {};
+        for (const c of res.coupons || []) map[c.code] = c;
+        setCoupons(map);
+      }
     } catch { /* ignore */ }
     setCouponsLoaded(true);
   }
@@ -1695,24 +2789,21 @@ function PremiumTiersView({ tiers, subscriptions, messages, messageDefaults, onR
     if (!code) { setError('Coupon code is required'); return; }
     const value = parseInt(newCouponDraft.value, 10);
     if (isNaN(value) || value <= 0) { setError('Coupon value must be a positive number'); return; }
-    // scope: 'global' => omit allowedTiers; 'restricted' => at least one tier required.
-    if (newCouponDraft.scope === 'restricted' && newCouponDraft.allowedTiers.length === 0) {
-      setError('Select at least one tier or switch to "All tiers"');
-      return;
-    }
+    // Dummy coupons don't carry tier restrictions in the new model; tier
+    // scoping is done by wiring Dummy only on the offerings/tiers the host
+    // wants it on.
     const body = {
       description: newCouponDraft.description || undefined,
       ...(newCouponDraft.kind === 'percentOff' ? { percentOff: value } : { extraDays: value }),
       ...(newCouponDraft.maxUses ? { maxUses: parseInt(newCouponDraft.maxUses, 10) } : {}),
       ...(newCouponDraft.expiresAt ? { expiresAt: new Date(newCouponDraft.expiresAt).toISOString() } : {}),
-      ...(newCouponDraft.scope === 'restricted' ? { allowedTiers: newCouponDraft.allowedTiers } : {}),
     };
     try {
       setCouponSaving(true);
-      const res = await api.put(`/appstore/premium/coupons/${encodeURIComponent(code)}`, body);
+      const res = await api.put(`/appstore/premium/providers/dummy/coupons/${encodeURIComponent(code)}`, body);
       if (res.success) {
         showSuccess(`Coupon "${code}" saved`);
-        setNewCouponDraft({ code: '', kind: 'percentOff', value: '', maxUses: '', description: '', expiresAt: '', scope: 'global', allowedTiers: [] });
+        setNewCouponDraft({ code: '', kind: 'percentOff', value: '', maxUses: '', description: '', expiresAt: '' });
         loadCoupons();
       } else {
         setError(res.error || 'Failed to save coupon');
@@ -1727,10 +2818,156 @@ function PremiumTiersView({ tiers, subscriptions, messages, messageDefaults, onR
   async function handleDeleteCoupon(code) {
     if (!confirm(`Delete coupon "${code}"? Existing subscriptions that used it keep their effect; new redemptions will be rejected.`)) return;
     try {
-      const res = await api.delete(`/appstore/premium/coupons/${encodeURIComponent(code)}`);
+      const res = await api.delete(`/appstore/premium/providers/dummy/coupons/${encodeURIComponent(code)}`);
       if (res.success) { showSuccess('Coupon deleted'); loadCoupons(); }
       else setError(res.error || 'Failed to delete coupon');
     } catch (err) { setError(err.message); }
+  }
+
+  // ── Dummy variants ──
+  async function loadDummyVariants() {
+    try {
+      const res = await api.get('/appstore/premium/providers/dummy/variants');
+      if (res.success) setDummyVariants(res.variants || []);
+    } catch { /* ignore */ }
+    setDummyLoaded(true);
+  }
+
+  function startNewVariant() {
+    setEditingVariantId(null);
+    setVariantDraft(EMPTY_VARIANT_DRAFT);
+  }
+
+  function startEditVariant(v) {
+    setEditingVariantId(v.variantId);
+    setVariantDraft({
+      variantId: v.variantId,
+      label: v.label,
+      amount: String(v.amount),
+      currency: v.currency,
+      durationDays: v.durationDays === null ? '' : String(v.durationDays),
+      trialDays: v.trialDays != null ? String(v.trialDays) : '',
+      recurring: !!v.recurring,
+      active: v.active !== false,
+    });
+  }
+
+  async function handleSaveVariant() {
+    const id = (variantDraft.variantId || '').trim();
+    if (!id) { setError('Variant ID is required'); return; }
+    if (!variantDraft.label.trim()) { setError('Label is required'); return; }
+    const amount = parseInt(variantDraft.amount, 10);
+    if (isNaN(amount) || amount < 0) { setError('Amount must be a non-negative integer (in cents)'); return; }
+    if (!variantDraft.currency.trim()) { setError('Currency is required'); return; }
+    const durationDays = variantDraft.durationDays === ''
+      ? null
+      : parseInt(variantDraft.durationDays, 10);
+    if (durationDays !== null && (isNaN(durationDays) || durationDays < 1)) {
+      setError('Duration must be empty (Lifetime) or a positive integer'); return;
+    }
+    const trialDays = variantDraft.trialDays === ''
+      ? null
+      : parseInt(variantDraft.trialDays, 10);
+    if (trialDays !== null && (isNaN(trialDays) || trialDays < 1)) {
+      setError('Trial must be empty or a positive integer'); return;
+    }
+    const body = {
+      label: variantDraft.label.trim(),
+      amount,
+      currency: variantDraft.currency.trim().toUpperCase(),
+      durationDays,
+      ...(trialDays != null ? { trialDays } : {}),
+      recurring: !!variantDraft.recurring,
+      active: variantDraft.active !== false,
+    };
+    try {
+      setVariantSaving(true);
+      const res = await api.put(`/appstore/premium/providers/dummy/variants/${encodeURIComponent(id)}`, body);
+      if (res.success) {
+        showSuccess(`Variant "${id}" saved`);
+        startNewVariant();
+        loadDummyVariants();
+      } else setError(res.error || 'Failed to save variant');
+    } catch (err) { setError(err.message); }
+    finally { setVariantSaving(false); }
+  }
+
+  async function handleDeleteVariant(id) {
+    if (!confirm(`Delete variant "${id}"? Any product that includes it will lose this entry, and offerings already wired to it via Price mode will fail to refresh.`)) return;
+    try {
+      const res = await api.delete(`/appstore/premium/providers/dummy/variants/${encodeURIComponent(id)}`);
+      if (res.success) {
+        showSuccess('Variant deleted');
+        loadDummyVariants();
+        loadDummyProducts(); // products' variantIds may have changed
+        if (editingVariantId === id) startNewVariant();
+      } else setError(res.error || 'Failed to delete variant');
+    } catch (err) { setError(err.message); }
+  }
+
+  // ── Dummy products ──
+  async function loadDummyProducts() {
+    try {
+      const res = await api.get('/appstore/premium/providers/dummy/products');
+      if (res.success) setDummyProducts(res.products || []);
+    } catch { /* ignore */ }
+  }
+
+  function startNewProduct() {
+    setEditingProductId(null);
+    setProductDraft(EMPTY_PRODUCT_DRAFT);
+  }
+
+  function startEditProduct(p) {
+    setEditingProductId(p.productId);
+    setProductDraft({
+      productId: p.productId,
+      label: p.label,
+      description: p.description || '',
+      variantIds: Array.isArray(p.variantIds) ? [...p.variantIds] : [],
+    });
+  }
+
+  async function handleSaveProduct() {
+    const id = (productDraft.productId || '').trim();
+    if (!id) { setError('Product ID is required'); return; }
+    if (!productDraft.label.trim()) { setError('Product label is required'); return; }
+    const body = {
+      label: productDraft.label.trim(),
+      description: productDraft.description.trim() || undefined,
+      variantIds: productDraft.variantIds,
+    };
+    try {
+      setProductSaving(true);
+      const res = await api.put(`/appstore/premium/providers/dummy/products/${encodeURIComponent(id)}`, body);
+      if (res.success) {
+        showSuccess(`Product "${id}" saved`);
+        startNewProduct();
+        loadDummyProducts();
+      } else setError(res.error || 'Failed to save product');
+    } catch (err) { setError(err.message); }
+    finally { setProductSaving(false); }
+  }
+
+  async function handleDeleteProduct(id) {
+    if (!confirm(`Delete product "${id}"? Offerings wired to this Product ID in Dummy Product mode will fail to refresh.`)) return;
+    try {
+      const res = await api.delete(`/appstore/premium/providers/dummy/products/${encodeURIComponent(id)}`);
+      if (res.success) {
+        showSuccess('Product deleted');
+        loadDummyProducts();
+        if (editingProductId === id) startNewProduct();
+      } else setError(res.error || 'Failed to delete product');
+    } catch (err) { setError(err.message); }
+  }
+
+  function toggleProductVariant(variantId) {
+    setProductDraft(d => ({
+      ...d,
+      variantIds: d.variantIds.includes(variantId)
+        ? d.variantIds.filter(v => v !== variantId)
+        : [...d.variantIds, variantId],
+    }));
   }
 
   async function loadGuilds() {
@@ -1740,6 +2977,11 @@ function PremiumTiersView({ tiers, subscriptions, messages, messageDefaults, onR
     } catch { /* ignore */ }
     setGuildsLoaded(true);
   }
+
+  // Per-provider credentials modal state. Set the provider id to open;
+  // null to close. The modal triggers a provider re-fetch on save so the
+  // configured-status pill updates without a manual refresh.
+  const [credModalProviderId, setCredModalProviderId] = useState(null);
 
   async function loadProviders() {
     try {
@@ -1933,17 +3175,19 @@ function PremiumTiersView({ tiers, subscriptions, messages, messageDefaults, onR
   }
 
   function getActiveSubCountForTier(tierId) {
+    // New model: only the `active` slot counts as "currently effective".
+    // Paused queue entries don't apply yet; they'll surface when their turn
+    // comes round. Per-tier display matches what `resolveActiveTier` returns
+    // on the bot side.
     const now = Date.now();
     let count = 0;
     for (const gs of Object.values(subscriptions || {})) {
-      for (const side of ['manual', 'paid']) {
-        const s = gs[side];
-        if (!s) continue;
-        if (s.tierId !== tierId) continue;
-        if (s.status !== 'active') continue;
-        if (s.endDate !== null && Date.parse(s.endDate) <= now) continue;
-        count++;
-      }
+      const s = gs?.active;
+      if (!s) continue;
+      if (s.tierId !== tierId) continue;
+      if (s.status !== 'active') continue;
+      if (s.endDate !== null && Date.parse(s.endDate) <= now) continue;
+      count++;
     }
     return count;
   }
@@ -1961,28 +3205,31 @@ function PremiumTiersView({ tiers, subscriptions, messages, messageDefaults, onR
     return `${hours}h`;
   }
 
-  // Build sorted subscription entries for the table
+  // Build sorted subscription entries for the table. New model has a single
+  // active slot + paused queue; flatten back to "first manual" + "first paid"
+  // for the admin's guild-level overview, preferring active over paused.
   const now = Date.now();
   const subEntries = Object.entries(subscriptions || {}).map(([guildId, gs]) => {
-    const candidates = ['manual', 'paid']
-      .map(source => ({ source, sub: gs[source] }))
-      .filter(x => x.sub && x.sub.status === 'active' && (x.sub.endDate === null || Date.parse(x.sub.endDate) > now))
-      .map(x => ({ ...x, tier: tiers[x.sub.tierId] }))
-      .filter(x => x.tier);
-    let effective = null;
-    if (candidates.length > 0) {
-      candidates.sort((a, b) => {
-        if ((b.tier.priority || 0) !== (a.tier.priority || 0)) return (b.tier.priority || 0) - (a.tier.priority || 0);
-        return a.source === 'manual' ? -1 : 1;
-      });
-      effective = candidates[0];
-    }
+    const allSubs = [];
+    if (gs?.active) allSubs.push(gs.active);
+    if (Array.isArray(gs?.paused)) allSubs.push(...gs.paused);
+    const firstBySource = (source) =>
+      allSubs.find(s => s.source === source && (s.status === 'active' || s.status === 'paused'))
+      || null;
+    const manual = firstBySource('manual');
+    const paid = firstBySource('paid');
+    const active = gs?.active && gs.active.status === 'active'
+      && (gs.active.endDate === null || Date.parse(gs.active.endDate) > now)
+      ? gs.active : null;
+    const effective = active && tiers[active.tierId]
+      ? { source: active.source, sub: active, tier: tiers[active.tierId] }
+      : null;
     return {
       guildId,
       guildName: getGuildName(guildId),
       iconUrl: getGuildIcon(guildId),
-      manual: gs.manual,
-      paid: gs.paid,
+      manual,
+      paid,
       effective,
     };
   }).sort((a, b) => (a.guildName || a.guildId).localeCompare(b.guildName || b.guildId));
@@ -2011,19 +3258,32 @@ function PremiumTiersView({ tiers, subscriptions, messages, messageDefaults, onR
           onClose={() => { setShowTierForm(false); setEditingTierId(null); }}
         />
       )}
-      {showGrantManual && (
-        <GrantManualModal
-          guildId={editingManualForGuild}
-          existing={editingManualForGuild ? (subscriptions[editingManualForGuild] || {}).manual : null}
-          tiers={tiers}
-          botGuilds={botGuilds}
-          existingSubscriptions={subscriptions}
-          onSave={() => { setShowGrantManual(false); setEditingManualForGuild(null); onRefresh(); }}
-          onClose={() => { setShowGrantManual(false); setEditingManualForGuild(null); }}
-          showSuccess={showSuccess}
-          setError={setError}
-        />
-      )}
+      {showGrantManual && (() => {
+        // Find the existing manual sub for this guild across the new model:
+        // it could be the active slot OR an entry in the paused queue.
+        // Without this, clicking Edit on a manual row used to open an empty
+        // modal because the old `.manual` field no longer exists on the
+        // subscription record.
+        const gs = editingManualForGuild ? subscriptions[editingManualForGuild] : null;
+        let existingManual = null;
+        if (gs) {
+          if (gs.active?.source === 'manual') existingManual = gs.active;
+          else if (Array.isArray(gs.paused)) existingManual = gs.paused.find(p => p.source === 'manual') || null;
+        }
+        return (
+          <GrantManualModal
+            guildId={editingManualForGuild}
+            existing={existingManual}
+            tiers={tiers}
+            botGuilds={botGuilds}
+            existingSubscriptions={subscriptions}
+            onSave={() => { setShowGrantManual(false); setEditingManualForGuild(null); onRefresh(); }}
+            onClose={() => { setShowGrantManual(false); setEditingManualForGuild(null); }}
+            showSuccess={showSuccess}
+            setError={setError}
+          />
+        );
+      })()}
 
       {/* Inline editors: replace main content when active */}
       {showOfferingsFor && tiers[showOfferingsFor] ? (
@@ -2074,104 +3334,57 @@ function PremiumTiersView({ tiers, subscriptions, messages, messageDefaults, onR
 
       {/* Available Payment Methods */}
       <div style={sectionStyle}>
-        <div style={{ marginBottom: '14px' }}>
-          <h3 style={{ margin: 0, color: '#ddd' }}>Available Payment Methods</h3>
-          <p style={{ color: '#999', margin: '4px 0 0 0', fontSize: '0.8rem' }}>
-            Activate the payment methods this bot should accept. Only activated methods appear in an offering's toggles.
-          </p>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-end', marginBottom: '16px', flexWrap: 'wrap', gap: '8px' }}>
+          <div>
+            <h3 style={{ margin: 0, color: '#fff', fontSize: '1.1rem' }}>Payment Methods</h3>
+            <p style={{ color: '#888', margin: '4px 0 0 0', fontSize: '0.82rem' }}>
+              Configure credentials per provider, then activate the ones offerings can use.
+            </p>
+          </div>
+          {providers.length > 0 && (
+            <div style={{ color: '#888', fontSize: '0.78rem' }}>
+              <span style={{ color: '#3ba55d' }}>{providers.filter(p => p.activated).length}</span>
+              <span style={{ color: '#666' }}> active</span>
+              <span style={{ color: '#666', margin: '0 6px' }}>·</span>
+              <span style={{ color: '#aaa' }}>{providers.filter(p => p.isConfigured).length}</span>
+              <span style={{ color: '#666' }}> configured</span>
+              <span style={{ color: '#666', margin: '0 6px' }}>·</span>
+              <span style={{ color: '#aaa' }}>{providers.length}</span>
+              <span style={{ color: '#666' }}> total</span>
+            </div>
+          )}
         </div>
         {providers.length === 0 ? (
-          <div style={{ color: '#888', fontSize: '0.85rem', padding: '20px', textAlign: 'center' }}>
+          <div style={{ color: '#888', fontSize: '0.85rem', padding: '32px', textAlign: 'center' }}>
             No payment providers registered.
           </div>
         ) : (
           <div style={{
             display: 'grid',
-            gridTemplateColumns: 'repeat(auto-fill, minmax(300px, 1fr))',
-            gap: '12px',
+            gridTemplateColumns: 'repeat(auto-fill, minmax(320px, 1fr))',
+            gap: '14px',
           }}>
-            {providers.map(p => {
-              const caps = p.capabilities || {};
-              const capBadges = [caps.mechanism, caps.supportsCancel && 'cancel', caps.supportsCoupons && 'coupons'].filter(Boolean);
-              return (
-                <div key={p.id} style={{
-                  background: p.activated ? 'rgba(88, 101, 242, 0.07)' : '#36393f',
-                  borderRadius: '10px',
-                  padding: '14px 16px',
-                  border: p.activated ? '1px solid rgba(88, 101, 242, 0.45)' : '1px solid #3a3d42',
-                  transition: 'background 0.15s, border-color 0.15s',
-                }}>
-                  {/* Header: name + status + activation toggle */}
-                  <div style={{ display: 'flex', alignItems: 'flex-start', gap: '10px' }}>
-                    <div style={{ flex: 1, minWidth: 0 }}>
-                      <div style={{ color: '#fff', fontSize: '0.96rem', fontWeight: 600, display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
-                        <span>{p.displayName}</span>
-                        {!p.isConfigured && (
-                          <span style={{
-                            background: 'rgba(230, 126, 34, 0.18)', color: '#e67e22',
-                            padding: '2px 8px', borderRadius: '10px', fontSize: '0.68rem', fontWeight: 500,
-                          }}>not configured</span>
-                        )}
-                      </div>
-                      <div style={{ color: '#888', fontSize: '0.72rem', marginTop: '4px', display: 'flex', gap: '4px', flexWrap: 'wrap' }}>
-                        {capBadges.map((b, i) => (
-                          <span key={i} style={{
-                            background: 'rgba(255,255,255,0.04)', color: '#888',
-                            padding: '1px 7px', borderRadius: '8px',
-                          }}>{b}</span>
-                        ))}
-                      </div>
-                    </div>
-                    {/* Pill-style activation toggle */}
-                    <div
-                      onClick={() => handleProviderActivation(p.id, !p.activated, p.defaultEnabled)}
-                      title={p.activated ? 'Click to deactivate' : 'Click to activate'}
-                      style={{
-                        width: '38px', height: '22px', borderRadius: '11px',
-                        background: p.activated ? '#3ba55d' : '#555',
-                        position: 'relative', cursor: 'pointer',
-                        transition: 'background 0.15s', flexShrink: 0, marginTop: '2px',
-                      }}>
-                      <div style={{
-                        width: '18px', height: '18px', borderRadius: '50%', background: '#fff',
-                        position: 'absolute', top: '2px', left: p.activated ? '18px' : '2px',
-                        transition: 'left 0.15s', boxShadow: '0 1px 2px rgba(0,0,0,0.3)',
-                      }} />
-                    </div>
-                  </div>
-
-                  {/* Default-enabled sub-toggle, only when activated */}
-                  {p.activated && (
-                    <div style={{
-                      marginTop: '12px', paddingTop: '10px',
-                      borderTop: '1px solid rgba(255,255,255,0.06)',
-                      display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '10px',
-                    }}>
-                      <span style={{ color: '#b0b0b0', fontSize: '0.78rem' }}>
-                        Default-enable on new offerings
-                      </span>
-                      <div
-                        onClick={() => handleProviderActivation(p.id, true, !p.defaultEnabled)}
-                        style={{
-                          width: '32px', height: '18px', borderRadius: '9px',
-                          background: p.defaultEnabled ? '#5865F2' : '#555',
-                          position: 'relative', cursor: 'pointer',
-                          transition: 'background 0.15s', flexShrink: 0,
-                        }}>
-                        <div style={{
-                          width: '14px', height: '14px', borderRadius: '50%', background: '#fff',
-                          position: 'absolute', top: '2px', left: p.defaultEnabled ? '16px' : '2px',
-                          transition: 'left 0.15s', boxShadow: '0 1px 2px rgba(0,0,0,0.3)',
-                        }} />
-                      </div>
-                    </div>
-                  )}
-                </div>
-              );
-            })}
+            {providers.map(p => (
+              <ProviderMethodCard
+                key={p.id}
+                provider={p}
+                onToggleActivation={() => handleProviderActivation(p.id, !p.activated, p.defaultEnabled)}
+                onToggleDefaultEnabled={() => handleProviderActivation(p.id, true, !p.defaultEnabled)}
+                onConfigure={() => setCredModalProviderId(p.id)}
+              />
+            ))}
           </div>
         )}
       </div>
+
+      {credModalProviderId && (
+        <ProviderCredentialsModal
+          providerId={credModalProviderId}
+          providerName={providers.find(p => p.id === credModalProviderId)?.displayName || credModalProviderId}
+          onClose={() => setCredModalProviderId(null)}
+          onSaved={() => loadProviders()}
+        />
+      )}
 
       {/* Tier Cards */}
       <div style={sectionStyle}>
@@ -2320,176 +3533,392 @@ function PremiumTiersView({ tiers, subscriptions, messages, messageDefaults, onR
         )}
       </div>
 
-      {/* Coupons */}
-      <div style={sectionStyle}>
-        <div style={{ marginBottom: '12px' }}>
-          <h3 style={{ margin: 0 }}>Coupons</h3>
-          <p style={{ color: '#999', margin: '4px 0 0 0', fontSize: '0.8rem' }}>
-            Admin-defined discount codes. Each coupon is either a percent off or a number of extra subscription days.
-            Only providers whose capabilities include "coupons" (currently: Dummy) accept them at checkout.
-          </p>
-        </div>
+      {/* Dummy Provider Settings - only visible when Dummy is activated.
+          The global coupon CRUD lives here alongside Dummy's variants and
+          products catalog. Real providers (Stripe, LS, PayPal, ...) own
+          their catalogs at their dashboards; only Dummy's lives in our
+          config. */}
+      {activatedProviders?.dummy && (
+        <div id="dummy-settings" style={sectionStyle}>
+          <div style={{ marginBottom: '14px' }}>
+            <h3 style={{ margin: 0 }}>Dummy Provider Settings</h3>
+            <p style={{ color: '#999', margin: '4px 0 0 0', fontSize: '0.8rem' }}>
+              Dummy is the in-process simulator. Manage its catalog (variants, products, coupons) here so you can test the full purchase flow end-to-end without a real provider's API.
+            </p>
+          </div>
 
-        {/* Existing coupons list */}
-        {couponsLoaded && Object.keys(coupons).length > 0 && (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', marginBottom: '16px' }}>
-            {Object.entries(coupons).map(([code, c]) => {
-              const effect = typeof c.percentOff === 'number'
-                ? `${c.percentOff}% off`
-                : typeof c.extraDays === 'number'
-                  ? `+${c.extraDays} days`
-                  : 'no effect';
-              const usage = typeof c.maxUses === 'number'
-                ? `${c.usedCount || 0} / ${c.maxUses} used`
-                : `${c.usedCount || 0} uses`;
-              const expired = c.expiresAt && Date.parse(c.expiresAt) < Date.now();
-              const scopeText = c.allowedTiers && c.allowedTiers.length > 0
-                ? c.allowedTiers.map(id => tiers[id]?.displayName || id).join(', ')
-                : 'All tiers';
-              const isRestricted = !!(c.allowedTiers && c.allowedTiers.length > 0);
-              return (
-                <div key={code} style={{
-                  background: '#36393f', borderRadius: '8px', padding: '10px 14px',
-                  display: 'grid', gridTemplateColumns: 'minmax(140px, 1fr) minmax(110px, auto) minmax(130px, auto) minmax(110px, auto) minmax(120px, auto) auto',
-                  gap: '12px', alignItems: 'center',
-                  opacity: expired ? 0.5 : 1,
-                }}>
-                  <div>
-                    <div style={{ color: '#fff', fontFamily: 'monospace', fontSize: '0.95rem', fontWeight: 600 }}>{code}</div>
-                    {c.description && <div style={{ color: '#888', fontSize: '0.72rem', marginTop: '2px' }}>{c.description}</div>}
-                  </div>
-                  <div style={{ color: '#3ba55d', fontSize: '0.85rem', fontWeight: 500 }}>{effect}</div>
-                  <div style={{
-                    color: isRestricted ? '#f5af19' : '#888',
-                    fontSize: '0.78rem',
-                    background: isRestricted ? 'rgba(245, 175, 25, 0.1)' : 'transparent',
-                    padding: isRestricted ? '2px 8px' : 0,
-                    borderRadius: '10px',
-                    border: isRestricted ? '1px solid rgba(245, 175, 25, 0.3)' : 'none',
-                    display: 'inline-block',
-                  }} title={isRestricted ? `Only valid for: ${scopeText}` : 'Applies to every tier'}>
-                    {scopeText}
-                  </div>
-                  <div style={{ color: '#aaa', fontSize: '0.78rem' }}>{usage}</div>
-                  <div style={{ color: expired ? '#ed4245' : '#888', fontSize: '0.78rem' }}>
-                    {c.expiresAt
-                      ? (expired ? 'Expired' : `Expires ${new Date(c.expiresAt).toLocaleDateString()}`)
-                      : 'No expiry'}
-                  </div>
-                  <button onClick={() => handleDeleteCoupon(code)} style={{
-                    background: 'transparent', color: '#ed4245', border: '1px solid #ed4245',
-                    padding: '4px 10px', borderRadius: '4px', cursor: 'pointer', fontSize: '0.72rem',
-                  }}>Delete</button>
-                </div>
-              );
-            })}
-          </div>
-        )}
+          {/* Variants */}
+          <div style={{ marginBottom: '24px', paddingBottom: '14px', borderBottom: '1px solid #333' }}>
+            <h4 style={{ margin: '0 0 4px 0', color: '#ddd', fontSize: '0.95rem' }}>Variants</h4>
+            <p style={{ color: '#888', margin: '0 0 12px 0', fontSize: '0.75rem' }}>
+              A wire-level billing unit (amount + currency + duration). Reference one in an offering's Dummy link via Price mode, or include several in a Product.
+            </p>
 
-        {/* New coupon form */}
-        <div style={{
-          background: '#36393f', borderRadius: '8px', padding: '12px 14px',
-          display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: '10px',
-        }}>
-          <div>
-            <label style={{ display: 'block', color: '#aaa', fontSize: '0.72rem', marginBottom: '4px' }}>Code</label>
-            <input type="text" value={newCouponDraft.code}
-              onChange={e => setNewCouponDraft(d => ({ ...d, code: e.target.value }))}
-              placeholder="e.g. LAUNCH50" style={couponInputStyle} />
-          </div>
-          <div>
-            <label style={{ display: 'block', color: '#aaa', fontSize: '0.72rem', marginBottom: '4px' }}>Effect</label>
-            <select value={newCouponDraft.kind}
-              onChange={e => setNewCouponDraft(d => ({ ...d, kind: e.target.value }))}
-              style={couponInputStyle}>
-              <option value="percentOff">Percent off</option>
-              <option value="extraDays">Extra days</option>
-            </select>
-          </div>
-          <div>
-            <label style={{ display: 'block', color: '#aaa', fontSize: '0.72rem', marginBottom: '4px' }}>
-              {newCouponDraft.kind === 'percentOff' ? 'Percent (1-100)' : 'Extra days (>=1)'}
-            </label>
-            <input type="number" min="1" max={newCouponDraft.kind === 'percentOff' ? '100' : undefined}
-              value={newCouponDraft.value}
-              onChange={e => setNewCouponDraft(d => ({ ...d, value: e.target.value }))}
-              style={couponInputStyle} />
-          </div>
-          <div>
-            <label style={{ display: 'block', color: '#aaa', fontSize: '0.72rem', marginBottom: '4px' }}>Max uses <span style={{ color: '#555' }}>(optional)</span></label>
-            <input type="number" min="1" value={newCouponDraft.maxUses}
-              onChange={e => setNewCouponDraft(d => ({ ...d, maxUses: e.target.value }))}
-              placeholder="Unlimited" style={couponInputStyle} />
-          </div>
-          <div>
-            <label style={{ display: 'block', color: '#aaa', fontSize: '0.72rem', marginBottom: '4px' }}>Expires <span style={{ color: '#555' }}>(optional)</span></label>
-            <input type="date" value={newCouponDraft.expiresAt}
-              onChange={e => setNewCouponDraft(d => ({ ...d, expiresAt: e.target.value }))}
-              style={couponInputStyle} />
-          </div>
-          {/* Applies to (tier scope) */}
-          <div style={{ gridColumn: '1 / -1' }}>
-            <label style={{ display: 'block', color: '#aaa', fontSize: '0.72rem', marginBottom: '6px' }}>Applies to</label>
-            <div style={{ display: 'flex', gap: '16px', alignItems: 'center', flexWrap: 'wrap' }}>
-              <label style={{ display: 'flex', alignItems: 'center', gap: '6px', color: '#ddd', fontSize: '0.82rem', cursor: 'pointer' }}>
-                <input type="radio" name="coupon-scope" checked={newCouponDraft.scope === 'global'}
-                  onChange={() => setNewCouponDraft(d => ({ ...d, scope: 'global', allowedTiers: [] }))}
-                  style={{ accentColor: '#5865F2' }} />
-                All tiers <span style={{ color: '#666', fontSize: '0.72rem' }}>(global)</span>
-              </label>
-              <label style={{ display: 'flex', alignItems: 'center', gap: '6px', color: '#ddd', fontSize: '0.82rem', cursor: 'pointer' }}>
-                <input type="radio" name="coupon-scope" checked={newCouponDraft.scope === 'restricted'}
-                  onChange={() => setNewCouponDraft(d => ({ ...d, scope: 'restricted' }))}
-                  style={{ accentColor: '#5865F2' }} />
-                Restrict to specific tiers
-              </label>
-            </div>
-            {newCouponDraft.scope === 'restricted' && (
-              <div style={{
-                marginTop: '8px', padding: '8px 10px', background: '#1a1a1a',
-                border: '1px solid #333', borderRadius: '4px',
-                display: 'flex', flexWrap: 'wrap', gap: '8px 14px',
-              }}>
-                {Object.entries(tiers).filter(([id]) => id !== 'free').length === 0 ? (
-                  <span style={{ color: '#888', fontSize: '0.8rem' }}>No non-Free tiers exist yet; create one first.</span>
-                ) : Object.entries(tiers).filter(([id]) => id !== 'free').map(([id, t]) => {
-                  const checked = newCouponDraft.allowedTiers.includes(id);
+            {dummyLoaded && dummyVariants.length === 0 && (
+              <div style={{ color: '#666', fontSize: '0.78rem', marginBottom: '10px' }}>
+                No variants yet. Add one below to make Dummy wireable on offerings.
+              </div>
+            )}
+
+            {dummyVariants.length > 0 && (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', marginBottom: '12px' }}>
+                {dummyVariants.map(v => {
+                  const isEditing = editingVariantId === v.variantId;
                   return (
-                    <label key={id} style={{ display: 'flex', alignItems: 'center', gap: '6px', color: '#ddd', fontSize: '0.8rem', cursor: 'pointer' }}>
-                      <input type="checkbox" checked={checked}
-                        onChange={e => {
-                          setNewCouponDraft(d => ({
-                            ...d,
-                            allowedTiers: e.target.checked
-                              ? [...d.allowedTiers, id]
-                              : d.allowedTiers.filter(x => x !== id),
-                          }));
-                        }}
-                        style={{ accentColor: '#5865F2' }} />
-                      {t.displayName || id}
-                    </label>
+                    <div key={v.variantId} style={{
+                      background: isEditing ? 'rgba(88, 101, 242, 0.08)' : '#36393f',
+                      border: isEditing ? '1px solid #5865F2' : '1px solid transparent',
+                      borderRadius: '6px', padding: '6px 10px',
+                      display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) auto auto auto auto',
+                      gap: '12px', alignItems: 'center',
+                      opacity: v.active ? 1 : 0.55,
+                    }}>
+                      <div style={{ minWidth: 0 }}>
+                        <div style={{ color: '#fff', fontFamily: 'monospace', fontSize: '0.82rem', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{v.variantId}</div>
+                        <div style={{ color: '#888', fontSize: '0.7rem' }}>{v.label}</div>
+                      </div>
+                      <div style={{ color: '#ddd', fontSize: '0.8rem', whiteSpace: 'nowrap' }}>
+                        {(v.amount / 100).toFixed(2)} {v.currency}
+                      </div>
+                      <div style={{ color: '#aaa', fontSize: '0.75rem', whiteSpace: 'nowrap' }}>
+                        {v.durationDays === null ? 'Lifetime' : `${v.durationDays}d`}
+                        {v.recurring ? ' · recurring' : ' · one-time'}
+                        {v.trialDays ? ` · ${v.trialDays}d trial` : ''}
+                      </div>
+                      <div style={{ color: v.active ? '#3ba55d' : '#888', fontSize: '0.7rem' }}>
+                        {v.active ? 'active' : 'archived'}
+                      </div>
+                      <div style={{ display: 'flex', gap: '4px' }}>
+                        <button onClick={() => startEditVariant(v)} style={{
+                          background: 'transparent', color: '#aaa', border: '1px solid #555',
+                          padding: '2px 8px', borderRadius: '3px', cursor: 'pointer', fontSize: '0.7rem',
+                        }}>Edit</button>
+                        <button onClick={() => handleDeleteVariant(v.variantId)} style={{
+                          background: 'transparent', color: '#ed4245', border: '1px solid #ed4245',
+                          padding: '2px 8px', borderRadius: '3px', cursor: 'pointer', fontSize: '0.7rem',
+                        }}>Delete</button>
+                      </div>
+                    </div>
                   );
                 })}
               </div>
             )}
+
+            {/* Variant form (new or editing). Variant ID is locked once saved
+                because it's used as the URL key; admin must Delete + re-add
+                to rename. */}
+            <div style={{
+              background: '#36393f', borderRadius: '6px', padding: '12px',
+              border: editingVariantId ? '1px solid #5865F2' : '1px solid #2c2f33',
+            }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '8px' }}>
+                <span style={{ color: '#aaa', fontSize: '0.78rem', fontWeight: 600 }}>
+                  {editingVariantId ? `Editing: ${editingVariantId}` : 'New variant'}
+                </span>
+                {editingVariantId && (
+                  <button onClick={startNewVariant} style={{
+                    background: 'transparent', color: '#aaa', border: '1px solid #555',
+                    padding: '2px 8px', borderRadius: '3px', cursor: 'pointer', fontSize: '0.7rem',
+                  }}>Cancel</button>
+                )}
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: '10px' }}>
+                <div>
+                  <label style={{ display: 'block', color: '#888', fontSize: '0.7rem', marginBottom: '3px' }}>Variant ID</label>
+                  <input type="text" value={variantDraft.variantId} disabled={!!editingVariantId}
+                    onChange={e => setVariantDraft(d => ({ ...d, variantId: e.target.value }))}
+                    placeholder="e.g. dummy_monthly_999" style={couponInputStyle} />
+                </div>
+                <div>
+                  <label style={{ display: 'block', color: '#888', fontSize: '0.7rem', marginBottom: '3px' }}>Label</label>
+                  <input type="text" value={variantDraft.label}
+                    onChange={e => setVariantDraft(d => ({ ...d, label: e.target.value }))}
+                    placeholder="e.g. Monthly" style={couponInputStyle} />
+                </div>
+                <div>
+                  <label style={{ display: 'block', color: '#888', fontSize: '0.7rem', marginBottom: '3px' }}>Amount (cents)</label>
+                  <input type="number" min="0" value={variantDraft.amount}
+                    onChange={e => setVariantDraft(d => ({ ...d, amount: e.target.value }))}
+                    placeholder="999 = $9.99" style={couponInputStyle} />
+                </div>
+                <div>
+                  <label style={{ display: 'block', color: '#888', fontSize: '0.7rem', marginBottom: '3px' }}>Currency</label>
+                  <input type="text" maxLength="3" value={variantDraft.currency}
+                    onChange={e => setVariantDraft(d => ({ ...d, currency: e.target.value.toUpperCase() }))}
+                    placeholder="USD" style={couponInputStyle} />
+                </div>
+                <div>
+                  <label style={{ display: 'block', color: '#888', fontSize: '0.7rem', marginBottom: '3px' }}>Duration (days)</label>
+                  <input type="number" min="1" value={variantDraft.durationDays}
+                    onChange={e => setVariantDraft(d => ({ ...d, durationDays: e.target.value }))}
+                    placeholder="Blank = Lifetime" style={couponInputStyle} />
+                </div>
+                <div>
+                  <label style={{ display: 'block', color: '#888', fontSize: '0.7rem', marginBottom: '3px' }}>Trial (days, optional)</label>
+                  <input type="number" min="1" value={variantDraft.trialDays}
+                    onChange={e => setVariantDraft(d => ({ ...d, trialDays: e.target.value }))}
+                    placeholder="No trial" style={couponInputStyle} />
+                </div>
+              </div>
+              <div style={{ display: 'flex', gap: '14px', alignItems: 'center', marginTop: '10px', flexWrap: 'wrap' }}>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '6px', color: '#ddd', fontSize: '0.78rem', cursor: 'pointer' }}>
+                  <input type="checkbox" checked={variantDraft.recurring}
+                    onChange={e => setVariantDraft(d => ({ ...d, recurring: e.target.checked }))} />
+                  Recurring
+                </label>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '6px', color: '#ddd', fontSize: '0.78rem', cursor: 'pointer' }}>
+                  <input type="checkbox" checked={variantDraft.active}
+                    onChange={e => setVariantDraft(d => ({ ...d, active: e.target.checked }))} />
+                  Active
+                </label>
+                <button onClick={handleSaveVariant} disabled={variantSaving} style={{
+                  marginLeft: 'auto',
+                  background: variantSaving ? '#555' : 'linear-gradient(135deg, #3ba55d, #2d8049)',
+                  color: '#fff', border: 'none', padding: '7px 16px', borderRadius: '5px',
+                  cursor: variantSaving ? 'not-allowed' : 'pointer', fontWeight: 600, fontSize: '0.8rem',
+                }}>
+                  {variantSaving ? 'Saving...' : (editingVariantId ? 'Save Variant' : 'Add Variant')}
+                </button>
+              </div>
+            </div>
           </div>
 
-          <div style={{ gridColumn: '1 / -1', display: 'flex', gap: '10px', alignItems: 'end' }}>
-            <div style={{ flex: 1 }}>
-              <label style={{ display: 'block', color: '#aaa', fontSize: '0.72rem', marginBottom: '4px' }}>Description <span style={{ color: '#555' }}>(optional)</span></label>
-              <input type="text" value={newCouponDraft.description}
-                onChange={e => setNewCouponDraft(d => ({ ...d, description: e.target.value }))}
-                placeholder="Internal note, e.g. 'Launch promo'" style={couponInputStyle} />
+          {/* Products */}
+          <div style={{ marginBottom: '24px', paddingBottom: '14px', borderBottom: '1px solid #333' }}>
+            <h4 style={{ margin: '0 0 4px 0', color: '#ddd', fontSize: '0.95rem' }}>Products</h4>
+            <p style={{ color: '#888', margin: '0 0 12px 0', fontSize: '0.75rem' }}>
+              A group of variants. Wire one Product ID on an offering's Dummy link in Product mode and the variant list syncs from this catalog automatically.
+            </p>
+
+            {dummyLoaded && dummyProducts.length === 0 && (
+              <div style={{ color: '#666', fontSize: '0.78rem', marginBottom: '10px' }}>
+                No products yet.
+              </div>
+            )}
+
+            {dummyProducts.length > 0 && (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', marginBottom: '12px' }}>
+                {dummyProducts.map(p => {
+                  const isEditing = editingProductId === p.productId;
+                  return (
+                    <div key={p.productId} style={{
+                      background: isEditing ? 'rgba(88, 101, 242, 0.08)' : '#36393f',
+                      border: isEditing ? '1px solid #5865F2' : '1px solid transparent',
+                      borderRadius: '6px', padding: '8px 10px',
+                      display: 'grid', gridTemplateColumns: '1fr auto',
+                      gap: '12px', alignItems: 'start',
+                    }}>
+                      <div style={{ minWidth: 0 }}>
+                        <div style={{ color: '#fff', fontFamily: 'monospace', fontSize: '0.82rem' }}>{p.productId}</div>
+                        <div style={{ color: '#ddd', fontSize: '0.78rem', marginTop: '2px' }}>{p.label}</div>
+                        {p.description && (
+                          <div style={{ color: '#888', fontSize: '0.7rem', marginTop: '2px' }}>{p.description}</div>
+                        )}
+                        <div style={{ color: '#aaa', fontSize: '0.7rem', marginTop: '4px' }}>
+                          {p.variantIds.length} variant{p.variantIds.length !== 1 ? 's' : ''}: {p.variantIds.join(', ') || '(empty)'}
+                        </div>
+                      </div>
+                      <div style={{ display: 'flex', gap: '4px' }}>
+                        <button onClick={() => startEditProduct(p)} style={{
+                          background: 'transparent', color: '#aaa', border: '1px solid #555',
+                          padding: '2px 8px', borderRadius: '3px', cursor: 'pointer', fontSize: '0.7rem',
+                        }}>Edit</button>
+                        <button onClick={() => handleDeleteProduct(p.productId)} style={{
+                          background: 'transparent', color: '#ed4245', border: '1px solid #ed4245',
+                          padding: '2px 8px', borderRadius: '3px', cursor: 'pointer', fontSize: '0.7rem',
+                        }}>Delete</button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
+            {/* Product form */}
+            <div style={{
+              background: '#36393f', borderRadius: '6px', padding: '12px',
+              border: editingProductId ? '1px solid #5865F2' : '1px solid #2c2f33',
+            }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '8px' }}>
+                <span style={{ color: '#aaa', fontSize: '0.78rem', fontWeight: 600 }}>
+                  {editingProductId ? `Editing: ${editingProductId}` : 'New product'}
+                </span>
+                {editingProductId && (
+                  <button onClick={startNewProduct} style={{
+                    background: 'transparent', color: '#aaa', border: '1px solid #555',
+                    padding: '2px 8px', borderRadius: '3px', cursor: 'pointer', fontSize: '0.7rem',
+                  }}>Cancel</button>
+                )}
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: '10px' }}>
+                <div>
+                  <label style={{ display: 'block', color: '#888', fontSize: '0.7rem', marginBottom: '3px' }}>Product ID</label>
+                  <input type="text" value={productDraft.productId} disabled={!!editingProductId}
+                    onChange={e => setProductDraft(d => ({ ...d, productId: e.target.value }))}
+                    placeholder="e.g. dummy_product_standard" style={couponInputStyle} />
+                </div>
+                <div>
+                  <label style={{ display: 'block', color: '#888', fontSize: '0.7rem', marginBottom: '3px' }}>Label</label>
+                  <input type="text" value={productDraft.label}
+                    onChange={e => setProductDraft(d => ({ ...d, label: e.target.value }))}
+                    placeholder="e.g. Standard plan" style={couponInputStyle} />
+                </div>
+                <div style={{ gridColumn: '1 / -1' }}>
+                  <label style={{ display: 'block', color: '#888', fontSize: '0.7rem', marginBottom: '3px' }}>Description (optional)</label>
+                  <input type="text" value={productDraft.description}
+                    onChange={e => setProductDraft(d => ({ ...d, description: e.target.value }))}
+                    placeholder="Internal note; not shown to subscribers."
+                    style={couponInputStyle} />
+                </div>
+              </div>
+              <div style={{ marginTop: '10px' }}>
+                <label style={{ display: 'block', color: '#888', fontSize: '0.7rem', marginBottom: '6px' }}>
+                  Variants in this product ({productDraft.variantIds.length} selected)
+                </label>
+                {dummyVariants.length === 0 ? (
+                  <div style={{ color: '#666', fontSize: '0.75rem' }}>
+                    No variants exist yet. Create one above first.
+                  </div>
+                ) : (
+                  <div style={{
+                    background: '#1a1a1a', border: '1px solid #333', borderRadius: '4px',
+                    padding: '8px 10px', display: 'flex', flexWrap: 'wrap', gap: '6px 14px',
+                    maxHeight: '180px', overflowY: 'auto',
+                  }}>
+                    {dummyVariants.map(v => {
+                      const checked = productDraft.variantIds.includes(v.variantId);
+                      return (
+                        <label key={v.variantId} style={{
+                          display: 'flex', alignItems: 'center', gap: '6px',
+                          color: v.active ? '#ddd' : '#888', fontSize: '0.78rem', cursor: 'pointer',
+                        }}>
+                          <input type="checkbox" checked={checked}
+                            onChange={() => toggleProductVariant(v.variantId)} />
+                          <span style={{ fontFamily: 'monospace' }}>{v.variantId}</span>
+                          <span style={{ color: '#888' }}>· {(v.amount / 100).toFixed(2)} {v.currency}</span>
+                        </label>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: '10px' }}>
+                <button onClick={handleSaveProduct} disabled={productSaving} style={{
+                  background: productSaving ? '#555' : 'linear-gradient(135deg, #3ba55d, #2d8049)',
+                  color: '#fff', border: 'none', padding: '7px 16px', borderRadius: '5px',
+                  cursor: productSaving ? 'not-allowed' : 'pointer', fontWeight: 600, fontSize: '0.8rem',
+                }}>
+                  {productSaving ? 'Saving...' : (editingProductId ? 'Save Product' : 'Add Product')}
+                </button>
+              </div>
             </div>
-            <button onClick={handleSaveCoupon} disabled={couponSaving} style={{
-              background: couponSaving ? '#555' : 'linear-gradient(135deg, #3ba55d, #2d8049)',
-              color: '#fff', border: 'none', padding: '8px 20px', borderRadius: '6px',
-              cursor: couponSaving ? 'not-allowed' : 'pointer', fontWeight: 600, fontSize: '0.85rem',
-              whiteSpace: 'nowrap',
-            }}>{couponSaving ? 'Saving...' : 'Add Coupon'}</button>
+          </div>
+
+          {/* Coupons */}
+          <div>
+            <h4 style={{ margin: '0 0 4px 0', color: '#ddd', fontSize: '0.95rem' }}>Coupons</h4>
+            <p style={{ color: '#888', margin: '0 0 12px 0', fontSize: '0.75rem' }}>
+              Discount codes the simulator accepts at subscribe time. Each is either a percent off or a number of extra subscription days. Tier scoping is done at the offering level (wire Dummy only on the tiers that should accept these codes).
+            </p>
+
+            {couponsLoaded && Object.keys(coupons).length > 0 && (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', marginBottom: '12px' }}>
+                {Object.entries(coupons).map(([code, c]) => {
+                  const effect = typeof c.percentOff === 'number'
+                    ? `${c.percentOff}% off`
+                    : typeof c.extraDays === 'number'
+                      ? `+${c.extraDays} days`
+                      : 'no effect';
+                  const usage = typeof c.maxUses === 'number'
+                    ? `${c.usedCount || 0} / ${c.maxUses} used`
+                    : `${c.usedCount || 0} uses`;
+                  const expired = c.expiresAt && Date.parse(c.expiresAt) < Date.now();
+                  return (
+                    <div key={code} style={{
+                      background: '#36393f', borderRadius: '6px', padding: '8px 12px',
+                      display: 'grid', gridTemplateColumns: 'minmax(140px, 1fr) minmax(110px, auto) minmax(110px, auto) minmax(120px, auto) auto',
+                      gap: '12px', alignItems: 'center',
+                      opacity: expired ? 0.5 : 1,
+                    }}>
+                      <div>
+                        <div style={{ color: '#fff', fontFamily: 'monospace', fontSize: '0.85rem', fontWeight: 600 }}>{code}</div>
+                        {c.description && <div style={{ color: '#888', fontSize: '0.7rem', marginTop: '2px' }}>{c.description}</div>}
+                      </div>
+                      <div style={{ color: '#3ba55d', fontSize: '0.82rem', fontWeight: 500 }}>{effect}</div>
+                      <div style={{ color: '#aaa', fontSize: '0.75rem' }}>{usage}</div>
+                      <div style={{ color: expired ? '#ed4245' : '#888', fontSize: '0.75rem' }}>
+                        {c.expiresAt
+                          ? (expired ? 'Expired' : `Expires ${new Date(c.expiresAt).toLocaleDateString()}`)
+                          : 'No expiry'}
+                      </div>
+                      <button onClick={() => handleDeleteCoupon(code)} style={{
+                        background: 'transparent', color: '#ed4245', border: '1px solid #ed4245',
+                        padding: '3px 10px', borderRadius: '3px', cursor: 'pointer', fontSize: '0.7rem',
+                      }}>Delete</button>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
+            <div style={{
+              background: '#36393f', borderRadius: '6px', padding: '12px',
+              display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: '10px',
+            }}>
+              <div>
+                <label style={{ display: 'block', color: '#888', fontSize: '0.7rem', marginBottom: '3px' }}>Code</label>
+                <input type="text" value={newCouponDraft.code}
+                  onChange={e => setNewCouponDraft(d => ({ ...d, code: e.target.value }))}
+                  placeholder="e.g. LAUNCH50" style={couponInputStyle} />
+              </div>
+              <div>
+                <label style={{ display: 'block', color: '#888', fontSize: '0.7rem', marginBottom: '3px' }}>Effect</label>
+                <select value={newCouponDraft.kind}
+                  onChange={e => setNewCouponDraft(d => ({ ...d, kind: e.target.value }))}
+                  style={couponInputStyle}>
+                  <option value="percentOff">Percent off</option>
+                  <option value="extraDays">Extra days</option>
+                </select>
+              </div>
+              <div>
+                <label style={{ display: 'block', color: '#888', fontSize: '0.7rem', marginBottom: '3px' }}>
+                  {newCouponDraft.kind === 'percentOff' ? 'Percent (1-100)' : 'Extra days (>=1)'}
+                </label>
+                <input type="number" min="1" max={newCouponDraft.kind === 'percentOff' ? '100' : undefined}
+                  value={newCouponDraft.value}
+                  onChange={e => setNewCouponDraft(d => ({ ...d, value: e.target.value }))}
+                  style={couponInputStyle} />
+              </div>
+              <div>
+                <label style={{ display: 'block', color: '#888', fontSize: '0.7rem', marginBottom: '3px' }}>Max uses (optional)</label>
+                <input type="number" min="1" value={newCouponDraft.maxUses}
+                  onChange={e => setNewCouponDraft(d => ({ ...d, maxUses: e.target.value }))}
+                  placeholder="Unlimited" style={couponInputStyle} />
+              </div>
+              <div>
+                <label style={{ display: 'block', color: '#888', fontSize: '0.7rem', marginBottom: '3px' }}>Expires (optional)</label>
+                <input type="date" value={newCouponDraft.expiresAt}
+                  onChange={e => setNewCouponDraft(d => ({ ...d, expiresAt: e.target.value }))}
+                  style={couponInputStyle} />
+              </div>
+              <div style={{ gridColumn: '1 / -1', display: 'flex', gap: '10px', alignItems: 'end' }}>
+                <div style={{ flex: 1 }}>
+                  <label style={{ display: 'block', color: '#888', fontSize: '0.7rem', marginBottom: '3px' }}>Description (optional)</label>
+                  <input type="text" value={newCouponDraft.description}
+                    onChange={e => setNewCouponDraft(d => ({ ...d, description: e.target.value }))}
+                    placeholder="Internal note, e.g. 'Launch promo'" style={couponInputStyle} />
+                </div>
+                <button onClick={handleSaveCoupon} disabled={couponSaving} style={{
+                  background: couponSaving ? '#555' : 'linear-gradient(135deg, #3ba55d, #2d8049)',
+                  color: '#fff', border: 'none', padding: '7px 16px', borderRadius: '5px',
+                  cursor: couponSaving ? 'not-allowed' : 'pointer', fontWeight: 600, fontSize: '0.8rem',
+                  whiteSpace: 'nowrap',
+                }}>{couponSaving ? 'Saving...' : 'Add Coupon'}</button>
+              </div>
+            </div>
           </div>
         </div>
-      </div>
+      )}
 
       {/* Guild Subscriptions */}
       <div style={sectionStyle}>
@@ -2612,8 +4041,8 @@ function PremiumTiersView({ tiers, subscriptions, messages, messageDefaults, onR
                           <span style={{ color: '#e67e22', marginLeft: '6px' }}>(cancelled, running out)</span>
                         )}
                       </div>
-                      {entry.paid.couponEffect && (
-                        <div style={{ color: '#3ba55d', fontSize: '0.72rem', marginTop: '2px' }}>Coupon: {entry.paid.couponEffect}</div>
+                      {entry.paid.couponCode && (
+                        <div style={{ color: '#3ba55d', fontSize: '0.72rem', marginTop: '2px' }}>Coupon: {entry.paid.couponCode}</div>
                       )}
                     </div>
                   ) : (
@@ -2625,6 +4054,11 @@ function PremiumTiersView({ tiers, subscriptions, messages, messageDefaults, onR
           </div>
         )}
       </div>
+
+      <MigrationsPanel tiers={tiers} providers={providers} sectionStyle={sectionStyle}
+        showSuccess={showSuccess} setError={setError} />
+
+      <AuditLogViewer tiers={tiers} providers={providers} sectionStyle={sectionStyle} />
 
       </React.Fragment>)}
     </div>

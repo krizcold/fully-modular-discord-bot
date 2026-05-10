@@ -15,10 +15,123 @@ import {
 } from '../../bot/internalSetup/utils/appStoreManager';
 import { getPremiumManager, DEFAULT_MESSAGES, PremiumMessages } from '../../bot/internalSetup/utils/premiumManager';
 import { getPaymentRegistry } from '../../bot/internalSetup/utils/payment/paymentRegistry';
+import type { OfferingVariant } from '../../bot/internalSetup/utils/payment/paymentTypes';
+import { loadCredentials, saveCredentials, BotCredentials } from '../../utils/envLoader';
 import { getModulesDir, getModulesDevDir } from '../../bot/internalSetup/utils/pathHelpers';
 import { BotManager } from '../botManager';
 import { ComponentToggleDebouncer } from '../utils/componentToggleDebouncer';
 import { getInstallQueue } from '../utils/installQueue';
+
+/**
+ * Refresh each enabled ProviderLink's variant cache from its provider at
+ * save time. Per-link is independent in the new model (no cross-provider
+ * price lock): each link validates its own variantIds (Price mode) or
+ * productId (Product mode) against the provider's API and stores the
+ * resulting variants in `link.cache`.
+ *
+ * Records non-fatal issues into `warnings`; disables links whose provider
+ * can't satisfy their declared mode (e.g. Discord with Product mode).
+ * Lookup failures leave `link.cache` whatever it was (transient errors
+ * shouldn't tear down a working offering).
+ */
+async function refreshOfferingProviderLinks(offering: any, warnings: string[]): Promise<any> {
+  const out = { ...offering };
+  const linksIn = Array.isArray(offering?.providerLinks) ? offering.providerLinks : [];
+  const linksOut: any[] = [];
+  for (const linkRaw of linksIn) {
+    const link = { ...linkRaw, cache: linkRaw.cache ? { ...linkRaw.cache } : undefined };
+    if (!link.enabled) {
+      linksOut.push(link);
+      continue;
+    }
+    const provider = getPaymentRegistry().get(link.providerId);
+    if (!provider) {
+      link.enabled = false;
+      warnings.push(`Provider '${link.providerId}' is not registered; link disabled.`);
+      linksOut.push(link);
+      continue;
+    }
+    if (!provider.isConfigured()) {
+      // Provider is wired in code but missing creds; keep the config but
+      // let the admin know nothing will validate until they set creds.
+      warnings.push(`Provider '${link.providerId}' is not configured (missing credentials). Variants will refresh once configured.`);
+      linksOut.push(link);
+      continue;
+    }
+    try {
+      if (link.mode === 'product') {
+        if (!provider.capabilities.supportsProductMode || !provider.listVariants) {
+          warnings.push(`Provider '${link.providerId}' does not support Product mode; link disabled.`);
+          link.enabled = false;
+        } else if (!link.productConfig?.productId) {
+          warnings.push(`Provider '${link.providerId}' link has no productId; link disabled.`);
+          link.enabled = false;
+        } else {
+          const variants = await provider.listVariants(link.productConfig.productId);
+          link.cache = {
+            syncedAt: new Date().toISOString(),
+            variants,
+          };
+          // Prune label overrides that no longer point at a real variant.
+          // Keeping orphaned entries grows the config file forever and shows
+          // up as ghost rows if the variant ever returns under the same id.
+          const overrides = link.productConfig.variantLabelOverrides;
+          if (overrides && typeof overrides === 'object') {
+            const validIds = new Set(variants.map(v => v.variantId));
+            const cleaned: Record<string, string> = {};
+            for (const [id, label] of Object.entries(overrides)) {
+              if (validIds.has(id) && typeof label === 'string' && label.length > 0) {
+                cleaned[id] = label;
+              }
+            }
+            link.productConfig = { ...link.productConfig, variantLabelOverrides: cleaned };
+          }
+        }
+      } else {
+        // Price mode (default).
+        const entries = Array.isArray(link.priceConfig?.entries) ? link.priceConfig.entries : [];
+        if (entries.length === 0) {
+          warnings.push(`Provider '${link.providerId}' link has no priceConfig entries; link disabled.`);
+          link.enabled = false;
+        } else if (!provider.fetchVariant) {
+          warnings.push(`Provider '${link.providerId}' does not support Price mode; link disabled.`);
+          link.enabled = false;
+        } else {
+          const variants: OfferingVariant[] = [];
+          for (const entry of entries) {
+            try {
+              const v = await provider.fetchVariant(entry.variantId);
+              if (v) {
+                variants.push(entry.labelOverride ? { ...v, label: entry.labelOverride } : v);
+              } else {
+                warnings.push(`Variant '${entry.variantId}' on '${link.providerId}' could not be resolved (missing or archived).`);
+              }
+            } catch (err: any) {
+              warnings.push(`Failed to fetch variant '${entry.variantId}' on '${link.providerId}': ${err?.message || err}`);
+            }
+          }
+          link.cache = {
+            syncedAt: new Date().toISOString(),
+            variants,
+          };
+        }
+      }
+    } catch (err: any) {
+      warnings.push(`Refresh failed for '${link.providerId}' on '${out.label || out.id}': ${err?.message || err}`);
+    }
+    linksOut.push(link);
+  }
+  out.providerLinks = linksOut;
+
+  // primaryProviderId only stays valid if it points to an enabled link.
+  if (out.primaryProviderId) {
+    const primaryLink = linksOut.find(l => l.providerId === out.primaryProviderId);
+    if (!primaryLink || !primaryLink.enabled) {
+      delete out.primaryProviderId;
+    }
+  }
+  return out;
+}
 
 export function createAppStoreRoutes(botManager: BotManager): Router {
   const toggleDebouncer = new ComponentToggleDebouncer(1500);
@@ -152,22 +265,31 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
         githubToken
       );
 
-      // Immediately clone and scan for modules
+      // Immediately clone and scan for modules. The repo itself was added
+      // successfully; if the scan fails (auth, DNS, malformed manifest) the
+      // repo stays in the registry but we surface the failure so the client
+      // doesn't think the modules are simply empty - that was the previous
+      // false-positive: catch + log + return success:true with modules: [].
       let modules: any[] = [];
+      let refreshWarning: string | undefined;
       try {
         const scanned = await manager.refreshRepository(repo.id);
         modules = scanned.map(m => formatModuleInfo(m));
       } catch (refreshErr) {
+        refreshWarning = refreshErr instanceof Error ? refreshErr.message : String(refreshErr);
         console.error('[AppStore] Auto-refresh after add failed:', refreshErr);
       }
 
       res.json({
-        success: true,
+        success: !refreshWarning,
         repository: {
           ...repo,
           githubToken: repo.githubToken ? '***' : null
         },
-        modules
+        modules,
+        ...(refreshWarning
+          ? { warning: `Repository added but module scan failed: ${refreshWarning}. Click Refresh to retry.` }
+          : {}),
       });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
@@ -591,9 +713,15 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
   /**
    * PUT /api/appstore/premium/tiers/:id
    * Create or update a tier
-   * Body: { displayName, priority, overrides }
+   * Body: { displayName, priority, overrides, offerings }
+   *
+   * Each offering with a `primaryProviderId` is enforced: the primary's price
+   * is fetched, the offering's money fields are overridden with the primary's
+   * truth, and other real provider links are toggled off if their prices
+   * don't match. A failed primary fetch rejects the save with the provider's
+   * error verbatim so the admin can fix the upstream config.
    */
-  router.put('/premium/tiers/:id', (req: Request, res: Response) => {
+  router.put('/premium/tiers/:id', async (req: Request, res: Response) => {
     try {
       const { id } = req.params;
       const { displayName, priority, overrides, offerings } = req.body;
@@ -612,17 +740,35 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
         });
       }
 
+      const inputOfferings = Array.isArray(offerings) ? offerings : [];
+      const refreshedOfferings: any[] = [];
+      const warnings: string[] = [];
+
+      for (const offering of inputOfferings) {
+        try {
+          const refreshed = await refreshOfferingProviderLinks(offering, warnings);
+          refreshedOfferings.push(refreshed);
+        } catch (refreshErr) {
+          const message = refreshErr instanceof Error ? refreshErr.message : String(refreshErr);
+          return res.status(400).json({
+            success: false,
+            error: `Offering '${offering?.label || offering?.id || '?'}': ${message}`,
+          });
+        }
+      }
+
       const manager = getPremiumManager();
       const success = manager.setTier(id, {
         displayName,
         priority,
         overrides: overrides || {},
-        offerings: Array.isArray(offerings) ? offerings : []
+        offerings: refreshedOfferings,
       });
 
       res.json({
         success,
-        message: success ? 'Tier saved' : 'Failed to save tier'
+        message: success ? 'Tier saved' : 'Failed to save tier',
+        warnings: warnings.length > 0 ? warnings : undefined,
       });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
@@ -849,55 +995,176 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
   // COUPONS
   // ============================================================================
 
-  /**
-   * GET /api/appstore/premium/coupons
-   * Return all admin-defined coupon codes with their effects and usage counts.
-   */
-  router.get('/premium/coupons', (_req: Request, res: Response) => {
+  // ============================================================================
+  // DUMMY PROVIDER ADMIN: variants, products, coupons
+  //
+  // Dummy is the in-process simulator; admin manages its catalog (variants +
+  // products + coupons) via these endpoints. Real providers (Stripe, LS,
+  // PayPal, ...) own their catalogs at the provider's dashboard, so they
+  // don't have equivalent admin endpoints.
+  // ============================================================================
+
+  /** Resolve the live DummyProvider with its admin backdoor methods. */
+  function getDummyProvider() {
+    const provider = getPaymentRegistry().get('dummy');
+    if (!provider) return null;
+    const dummy = provider as unknown as {
+      adminListVariants: () => any[];
+      adminSetVariant: (v: any) => void;
+      adminDeleteVariant: (id: string) => boolean;
+      adminListProducts: () => any[];
+      adminSetProduct: (p: any) => void;
+      adminDeleteProduct: (id: string) => boolean;
+      adminListCoupons: () => any[];
+      adminSetCoupon: (c: any) => boolean;
+      adminDeleteCoupon: (code: string) => boolean;
+    };
+    if (typeof dummy.adminListVariants !== 'function') return null;
+    return dummy;
+  }
+
+  router.get('/premium/providers/dummy/variants', (_req: Request, res: Response) => {
     try {
-      const manager = getPremiumManager();
-      res.json({ success: true, coupons: manager.getAllCoupons() });
+      const dummy = getDummyProvider();
+      if (!dummy) return res.status(404).json({ success: false, error: 'Dummy provider not available' });
+      res.json({ success: true, variants: dummy.adminListVariants() });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({ success: false, error: errorMessage });
     }
   });
 
-  /**
-   * PUT /api/appstore/premium/coupons/:code
-   * Create or replace a coupon. Body: { description?, percentOff?, extraDays?, maxUses?, expiresAt? }
-   * Exactly one of percentOff or extraDays must be set.
-   */
-  router.put('/premium/coupons/:code', (req: Request, res: Response) => {
+  router.put('/premium/providers/dummy/variants/:variantId', (req: Request, res: Response) => {
     try {
+      const dummy = getDummyProvider();
+      if (!dummy) return res.status(404).json({ success: false, error: 'Dummy provider not available' });
+      const { variantId } = req.params;
+      const { label, amount, currency, durationDays, trialDays, recurring, active } = req.body || {};
+      if (!variantId || !label || typeof amount !== 'number' || !currency) {
+        return res.status(400).json({ success: false, error: 'variantId, label, amount, currency are required' });
+      }
+      dummy.adminSetVariant({
+        variantId,
+        label,
+        amount,
+        currency,
+        durationDays: durationDays ?? null,
+        ...(typeof trialDays === 'number' ? { trialDays } : {}),
+        recurring: !!recurring,
+        active: active !== false,
+      });
+      res.json({ success: true });
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      res.status(500).json({ success: false, error: errorMessage });
+    }
+  });
+
+  router.delete('/premium/providers/dummy/variants/:variantId', (req: Request, res: Response) => {
+    try {
+      const dummy = getDummyProvider();
+      if (!dummy) return res.status(404).json({ success: false, error: 'Dummy provider not available' });
+      const ok = dummy.adminDeleteVariant(req.params.variantId);
+      res.json({ success: ok });
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      res.status(500).json({ success: false, error: errorMessage });
+    }
+  });
+
+  router.get('/premium/providers/dummy/products', (_req: Request, res: Response) => {
+    try {
+      const dummy = getDummyProvider();
+      if (!dummy) return res.status(404).json({ success: false, error: 'Dummy provider not available' });
+      res.json({ success: true, products: dummy.adminListProducts() });
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      res.status(500).json({ success: false, error: errorMessage });
+    }
+  });
+
+  router.put('/premium/providers/dummy/products/:productId', (req: Request, res: Response) => {
+    try {
+      const dummy = getDummyProvider();
+      if (!dummy) return res.status(404).json({ success: false, error: 'Dummy provider not available' });
+      const { productId } = req.params;
+      const { label, description, variantIds } = req.body || {};
+      if (!productId || !label) {
+        return res.status(400).json({ success: false, error: 'productId and label are required' });
+      }
+      dummy.adminSetProduct({
+        productId,
+        label,
+        description,
+        variantIds: Array.isArray(variantIds) ? variantIds : [],
+      });
+      res.json({ success: true });
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      res.status(500).json({ success: false, error: errorMessage });
+    }
+  });
+
+  router.delete('/premium/providers/dummy/products/:productId', (req: Request, res: Response) => {
+    try {
+      const dummy = getDummyProvider();
+      if (!dummy) return res.status(404).json({ success: false, error: 'Dummy provider not available' });
+      const ok = dummy.adminDeleteProduct(req.params.productId);
+      res.json({ success: ok });
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      res.status(500).json({ success: false, error: errorMessage });
+    }
+  });
+
+  router.get('/premium/providers/dummy/coupons', (_req: Request, res: Response) => {
+    try {
+      const dummy = getDummyProvider();
+      if (!dummy) return res.status(404).json({ success: false, error: 'Dummy provider not available' });
+      res.json({ success: true, coupons: dummy.adminListCoupons() });
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      res.status(500).json({ success: false, error: errorMessage });
+    }
+  });
+
+  router.put('/premium/providers/dummy/coupons/:code', (req: Request, res: Response) => {
+    try {
+      const dummy = getDummyProvider();
+      if (!dummy) return res.status(404).json({ success: false, error: 'Dummy provider not available' });
       const { code } = req.params;
       if (!code || !code.trim()) {
         return res.status(400).json({ success: false, error: 'Coupon code is required' });
       }
-      const { description, percentOff, extraDays, maxUses, expiresAt, allowedTiers } = req.body || {};
-      const manager = getPremiumManager();
-      const ok = manager.setCoupon(code, { description, percentOff, extraDays, maxUses, expiresAt, allowedTiers });
+      const { description, percentOff, extraDays, maxUses, expiresAt } = req.body || {};
+      const ok = dummy.adminSetCoupon({
+        code,
+        description,
+        percentOff,
+        extraDays,
+        maxUses,
+        expiresAt,
+        usedCount: 0,
+        createdAt: new Date().toISOString(),
+      });
       if (!ok) {
         return res.status(400).json({
           success: false,
-          error: 'Invalid coupon. Exactly one of percentOff (1-100) or extraDays (>=1) must be set; optional maxUses must be >=1 and expiresAt must be a valid ISO date.'
+          error: 'Invalid coupon. Exactly one of percentOff (1-100) or extraDays (>=1) must be set; optional maxUses must be >=1 and expiresAt must be a valid ISO date.',
         });
       }
-      res.json({ success: true, coupon: manager.getCoupon(code) });
+      res.json({ success: true });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({ success: false, error: errorMessage });
     }
   });
 
-  /**
-   * DELETE /api/appstore/premium/coupons/:code
-   */
-  router.delete('/premium/coupons/:code', (req: Request, res: Response) => {
+  router.delete('/premium/providers/dummy/coupons/:code', (req: Request, res: Response) => {
     try {
-      const { code } = req.params;
-      const manager = getPremiumManager();
-      const ok = manager.deleteCoupon(code);
+      const dummy = getDummyProvider();
+      if (!dummy) return res.status(404).json({ success: false, error: 'Dummy provider not available' });
+      const ok = dummy.adminDeleteCoupon(req.params.code);
       if (!ok) return res.status(404).json({ success: false, error: 'Coupon not found' });
       res.json({ success: true });
     } catch (error) {
@@ -949,8 +1216,12 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
    * POST /api/appstore/premium/subscriptions/:guildId/manual
    * Grant (or replace) the manual subscription for a guild.
    * Body: { tierId, durationDays: number | null, notes? }
+   *
+   * Stacks per the unified rules: higher priority displaces the active sub
+   * into the paused queue; same priority replaces (manual wins ties); lower
+   * priority enters the paused queue at its position.
    */
-  router.post('/premium/subscriptions/:guildId/manual', (req: Request, res: Response) => {
+  router.post('/premium/subscriptions/:guildId/manual', async (req: Request, res: Response) => {
     try {
       const { guildId } = req.params;
       const { tierId, durationDays, notes } = req.body || {};
@@ -961,7 +1232,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
         return res.status(400).json({ success: false, error: 'durationDays must be a positive number or null (for Lifetime)' });
       }
       const manager = getPremiumManager();
-      const success = manager.grantManual(guildId, tierId, durationDays, typeof notes === 'string' ? notes : undefined);
+      const success = await manager.grantManual(guildId, tierId, durationDays, typeof notes === 'string' ? notes : undefined);
       res.json({ success, subscriptions: manager.getSubscriptions(guildId) });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
@@ -1009,17 +1280,17 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
   /**
    * POST /api/appstore/premium/subscriptions/:guildId/paid
    * Initiate a paid subscription through the offering's provider.
-   * Body: { tierId, offeringId, couponCode?, userId? }
+   * Body: { tierId, offeringId, providerId, variantId, couponCode?, userId? }
    * Response shape depends on the provider's mechanism:
-   *   immediate      → { providerSubId, state }
-   *   redirect       → { redirectUrl }
-   *   client_handoff → { clientHandoff }
-   *   oauth_link     → { oauthUrl }
+   *   immediate      -> { providerSubId, state }
+   *   redirect       -> { redirectUrl }
+   *   client_handoff -> { clientHandoff }
+   *   oauth_link     -> { oauthUrl }
    */
   router.post('/premium/subscriptions/:guildId/paid', async (req: Request, res: Response) => {
     try {
       const { guildId } = req.params;
-      const { tierId, offeringId, providerId, couponCode, userId } = req.body || {};
+      const { tierId, offeringId, providerId, variantId, couponCode, userId } = req.body || {};
       if (!tierId || typeof tierId !== 'string') {
         return res.status(400).json({ success: false, error: 'tierId is required' });
       }
@@ -1029,8 +1300,11 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
       if (!providerId || typeof providerId !== 'string') {
         return res.status(400).json({ success: false, error: 'providerId is required' });
       }
+      if (!variantId || typeof variantId !== 'string') {
+        return res.status(400).json({ success: false, error: 'variantId is required' });
+      }
       const manager = getPremiumManager();
-      const result = await manager.initiatePaidSubscription(guildId, tierId, offeringId, { providerId, couponCode, userId });
+      const result = await manager.initiatePaidSubscription(guildId, tierId, offeringId, { providerId, variantId, couponCode, userId });
       res.json({
         success: true,
         result,
@@ -1085,6 +1359,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
       const activated = manager.getActivatedProviders();
       const providers = registry.listAll().map(p => {
         const activation = activated[p.id];
+        const fields = p.getCredentialFields ? p.getCredentialFields() : [];
         return {
           id: p.id,
           displayName: p.displayName,
@@ -1092,9 +1367,91 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
           capabilities: p.capabilities,
           activated: !!activation,
           defaultEnabled: activation ? !!activation.defaultEnabled : false,
+          /** True when the provider declares any credential fields - drives
+           * the "Configure" affordance on the provider card. */
+          hasCredentials: fields.length > 0,
         };
       });
       res.json({ success: true, providers });
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      res.status(500).json({ success: false, error: errorMessage });
+    }
+  });
+
+  /**
+   * POST /api/appstore/premium/providers/:providerId/variant-lookup
+   * Body: { variantId: string }
+   * Resolve a single wire-level variantId to its normalized OfferingVariant.
+   * Used by the offering modal for paste-validate (Price mode) and the
+   * explicit refresh button. Returns the variant on success, 400 with a
+   * `reason` on validation errors so the UI can surface them verbatim.
+   */
+  router.post('/premium/providers/:providerId/variant-lookup', async (req: Request, res: Response) => {
+    try {
+      const { providerId } = req.params;
+      const { variantId } = req.body || {};
+      if (!variantId || typeof variantId !== 'string') {
+        return res.status(400).json({ success: false, error: 'variantId is required' });
+      }
+      const registry = getPaymentRegistry();
+      const provider = registry.get(providerId);
+      if (!provider) {
+        return res.status(404).json({ success: false, error: `Provider '${providerId}' is not registered` });
+      }
+      if (!provider.fetchVariant) {
+        return res.status(400).json({ success: false, error: `Provider '${providerId}' does not support variant lookup.` });
+      }
+      if (!provider.isConfigured()) {
+        return res.status(400).json({ success: false, error: `Provider '${providerId}' is not configured. Set its credentials in the Credentials tab first.` });
+      }
+      try {
+        const variant = await provider.fetchVariant(variantId);
+        if (!variant) {
+          return res.status(400).json({ success: false, error: `Variant '${variantId}' not found, archived, or not supported.` });
+        }
+        return res.json({ success: true, variant });
+      } catch (lookupErr: any) {
+        const message = lookupErr instanceof Error ? lookupErr.message : String(lookupErr);
+        return res.status(400).json({ success: false, error: message });
+      }
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      res.status(500).json({ success: false, error: errorMessage });
+    }
+  });
+
+  /**
+   * POST /api/appstore/premium/providers/:providerId/product-lookup
+   * Body: { productId: string }
+   * Resolve a Product ID to its list of variants. Used by Product-mode
+   * editor in the offering modal.
+   */
+  router.post('/premium/providers/:providerId/product-lookup', async (req: Request, res: Response) => {
+    try {
+      const { providerId } = req.params;
+      const { productId } = req.body || {};
+      if (!productId || typeof productId !== 'string') {
+        return res.status(400).json({ success: false, error: 'productId is required' });
+      }
+      const registry = getPaymentRegistry();
+      const provider = registry.get(providerId);
+      if (!provider) {
+        return res.status(404).json({ success: false, error: `Provider '${providerId}' is not registered` });
+      }
+      if (!provider.capabilities.supportsProductMode || !provider.listVariants) {
+        return res.status(400).json({ success: false, error: `Provider '${providerId}' does not support Product mode.` });
+      }
+      if (!provider.isConfigured()) {
+        return res.status(400).json({ success: false, error: `Provider '${providerId}' is not configured. Set its credentials in the Credentials tab first.` });
+      }
+      try {
+        const variants = await provider.listVariants(productId);
+        return res.json({ success: true, variants });
+      } catch (lookupErr: any) {
+        const message = lookupErr instanceof Error ? lookupErr.message : String(lookupErr);
+        return res.status(400).json({ success: false, error: message });
+      }
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({ success: false, error: errorMessage });
@@ -1106,6 +1463,201 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
    * Toggle a provider's system-wide activation.
    * Body: { activated: boolean, defaultEnabled?: boolean }
    */
+  /**
+   * GET /api/appstore/premium/audit
+   * Read the premium audit log with optional filters.
+   * Query: from, to (ISO timestamps), action, tierId, providerId, guildId,
+   *        subscriptionId, limit. Returns newest-first up to `limit`.
+   */
+  router.get('/premium/audit', (req: Request, res: Response) => {
+    try {
+      const manager = getPremiumManager();
+      const { from, to, action, tierId, providerId, guildId, subscriptionId, limit } = req.query as Record<string, string | undefined>;
+      const parsedLimit = limit ? parseInt(limit, 10) : undefined;
+      const result = manager.readAuditEntries({
+        from: from || undefined,
+        to: to || undefined,
+        action: action || undefined,
+        tierId: tierId || undefined,
+        providerId: providerId || undefined,
+        guildId: guildId || undefined,
+        subscriptionId: subscriptionId || undefined,
+        limit: Number.isFinite(parsedLimit) ? parsedLimit : undefined,
+      });
+      res.json({ success: true, ...result });
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      res.status(500).json({ success: false, error: errorMessage });
+    }
+  });
+
+  /**
+   * Migration management (Stage 5).
+   * - GET    /premium/migrations            -> list all (any status)
+   * - POST   /premium/migrations            -> schedule new
+   * - DELETE /premium/migrations/:id        -> cancel a pending one
+   * - GET    /premium/migration-silence-policy
+   * - PUT    /premium/migration-silence-policy { policy: 'cancel'|'continue' }
+   */
+  router.get('/premium/migrations', (_req: Request, res: Response) => {
+    try {
+      const mgr = getPremiumManager();
+      res.json({ success: true, migrations: mgr.listMigrations(), silencePolicy: mgr.getMigrationSilencePolicy() });
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      res.status(500).json({ success: false, error: errorMessage });
+    }
+  });
+
+  router.post('/premium/migrations', async (req: Request, res: Response) => {
+    try {
+      const body = req.body || {};
+      const required = ['providerId', 'sourceTierId', 'sourceOfferingId', 'sourceVariantId',
+        'targetTierId', 'targetOfferingId', 'targetVariantId', 'effectiveDate'];
+      for (const k of required) {
+        if (!body[k] || typeof body[k] !== 'string') {
+          return res.status(400).json({ success: false, error: `${k} is required (string)` });
+        }
+      }
+      const mgr = getPremiumManager();
+      const migration = await mgr.scheduleMigration({
+        providerId: body.providerId,
+        sourceTierId: body.sourceTierId,
+        sourceOfferingId: body.sourceOfferingId,
+        sourceVariantId: body.sourceVariantId,
+        targetTierId: body.targetTierId,
+        targetOfferingId: body.targetOfferingId,
+        targetVariantId: body.targetVariantId,
+        effectiveDate: body.effectiveDate,
+        message: typeof body.message === 'string' ? body.message : '',
+        scheduledBy: typeof body.scheduledBy === 'string' ? body.scheduledBy : 'admin',
+      });
+      res.json({ success: true, migration });
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      res.status(400).json({ success: false, error: errorMessage });
+    }
+  });
+
+  router.delete('/premium/migrations/:migrationId', (req: Request, res: Response) => {
+    try {
+      const mgr = getPremiumManager();
+      const ok = mgr.cancelMigration(req.params.migrationId);
+      if (!ok) return res.status(404).json({ success: false, error: 'Migration not found or not pending' });
+      res.json({ success: true });
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      res.status(500).json({ success: false, error: errorMessage });
+    }
+  });
+
+  router.get('/premium/migration-silence-policy', (_req: Request, res: Response) => {
+    try {
+      res.json({ success: true, policy: getPremiumManager().getMigrationSilencePolicy() });
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      res.status(500).json({ success: false, error: errorMessage });
+    }
+  });
+
+  router.put('/premium/migration-silence-policy', (req: Request, res: Response) => {
+    try {
+      const policy = req.body?.policy;
+      if (policy !== 'cancel' && policy !== 'continue') {
+        return res.status(400).json({ success: false, error: 'policy must be "cancel" or "continue"' });
+      }
+      const ok = getPremiumManager().setMigrationSilencePolicy(policy);
+      if (!ok) return res.status(500).json({ success: false, error: 'Failed to set policy' });
+      res.json({ success: true, policy });
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      res.status(500).json({ success: false, error: errorMessage });
+    }
+  });
+
+  /**
+   * GET /api/appstore/premium/providers/:providerId/credentials
+   * Returns the provider's declared credential fields + a per-key
+   * masked status ({ set: boolean }). Never returns actual values.
+   */
+  router.get('/premium/providers/:providerId/credentials', (req: Request, res: Response) => {
+    try {
+      const provider = getPaymentRegistry().get(req.params.providerId);
+      if (!provider) return res.status(404).json({ success: false, error: `Provider '${req.params.providerId}' not registered` });
+      const fields = provider.getCredentialFields ? provider.getCredentialFields() : [];
+      const c = loadCredentials();
+      const status: Record<string, { set: boolean; preview?: string }> = {};
+      for (const f of fields) {
+        const v = c[f.key];
+        const set = !!(v && v.trim() && !v.startsWith('REPLACE'));
+        status[f.key] = set
+          ? { set: true, preview: f.type === 'secret' ? '••••••••' : (v || '') }
+          : { set: false };
+      }
+      res.json({ success: true, fields, status, isConfigured: provider.isConfigured() });
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      res.status(500).json({ success: false, error: errorMessage });
+    }
+  });
+
+  /**
+   * PUT /api/appstore/premium/providers/:providerId/credentials
+   * Body: { values: { [key]: string }, clear?: string[] }
+   * - `values`: keys to set. Empty string keeps the existing value (matches
+   *   leave-blank-to-keep semantics of the legacy credentials form).
+   * - `clear`: keys to actively remove (set to undefined).
+   * Refuses to touch DISCORD_TOKEN / CLIENT_ID / GUILD_ID even if a provider
+   * declares them in its field list (those are owned by Bot Manager under
+   * managed deployments).
+   */
+  router.put('/premium/providers/:providerId/credentials', (req: Request, res: Response) => {
+    try {
+      const provider = getPaymentRegistry().get(req.params.providerId);
+      if (!provider) return res.status(404).json({ success: false, error: `Provider '${req.params.providerId}' not registered` });
+      const fields = provider.getCredentialFields ? provider.getCredentialFields() : [];
+      if (fields.length === 0) {
+        return res.status(400).json({ success: false, error: `Provider '${req.params.providerId}' has no credentials to set` });
+      }
+
+      const body = req.body || {};
+      const values = (body.values && typeof body.values === 'object') ? body.values : {};
+      const clearList: string[] = Array.isArray(body.clear) ? body.clear.filter((k: any) => typeof k === 'string') : [];
+
+      const RESERVED = new Set(['DISCORD_TOKEN', 'CLIENT_ID', 'GUILD_ID']);
+      const allowed = new Set(fields.map(f => f.key));
+      const existing = loadCredentials();
+      const next: BotCredentials = { ...existing };
+
+      for (const f of fields) {
+        if (RESERVED.has(f.key)) continue;
+        if (!allowed.has(f.key)) continue;
+        if (clearList.includes(f.key)) {
+          next[f.key] = undefined;
+          continue;
+        }
+        const incoming = values[f.key];
+        if (typeof incoming !== 'string') continue;
+        const trimmed = incoming.trim();
+        if (trimmed === '') continue; // leave-blank-to-keep
+        next[f.key] = trimmed;
+      }
+
+      const result = saveCredentials(next);
+      if (!result.success) {
+        return res.status(500).json({ success: false, error: result.error || 'Failed to save credentials' });
+      }
+      // Return the updated masked status so the modal can refresh in place.
+      const c = loadCredentials();
+      const status: Record<string, { set: boolean }> = {};
+      for (const f of fields) status[f.key] = { set: !!(c[f.key] && c[f.key]!.trim() && !c[f.key]!.startsWith('REPLACE')) };
+      res.json({ success: true, status, isConfigured: provider.isConfigured() });
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      res.status(500).json({ success: false, error: errorMessage });
+    }
+  });
+
   router.put('/premium/providers/:providerId/activation', (req: Request, res: Response) => {
     try {
       const { providerId } = req.params;
@@ -1394,7 +1946,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
    * Update AppStore general config
    * Body: { autoCleanup?: boolean }
    */
-  router.put('/config', (req: Request, res: Response) => {
+  router.put('/config', async (req: Request, res: Response) => {
     try {
       const config = loadAppStoreConfig();
       if (typeof req.body.autoCleanup === 'boolean') {
@@ -1406,13 +1958,30 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
       saveAppStoreConfig(config);
 
       // If autoCleanup was just turned ON, trigger immediate orphan cleanup
+      // and AWAIT it. The previous fire-and-forget pattern returned success
+      // before the bot-side reregister had a chance to fail, so a broken
+      // IPC silently looked like a successful toggle. The cleanup is part
+      // of what "turning autoCleanup on" means; it must succeed (or be
+      // surfaced as a failure) before we tell the UI it worked.
+      let reregisterWarning: string | undefined;
       if (req.body.autoCleanup === true && botManager.isRunning()) {
-        botManager.reregisterCommands().catch(err => {
+        try {
+          await botManager.reregisterCommands();
+        } catch (err) {
+          // The config setting itself was saved fine; the on-toggle action
+          // didn't run. Tell the client so they can retry / inspect logs
+          // rather than have the toggle look like it worked end-to-end.
+          reregisterWarning = err instanceof Error ? err.message : String(err);
           console.error('[AppStore] Failed to trigger cleanup on toggle:', err);
-        });
+        }
       }
 
-      res.json({ success: true, autoCleanup: config.autoCleanup === true, autoUpdate: config.autoUpdate === true });
+      res.json({
+        success: !reregisterWarning,
+        autoCleanup: config.autoCleanup === true,
+        autoUpdate: config.autoUpdate === true,
+        ...(reregisterWarning ? { warning: `Config saved but on-toggle cleanup failed: ${reregisterWarning}` } : {}),
+      });
     } catch (error) {
       const msg = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({ success: false, error: msg });

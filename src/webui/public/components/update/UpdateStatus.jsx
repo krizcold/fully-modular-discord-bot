@@ -144,11 +144,13 @@ function UpdateStatus({ api, status, onRefresh }) {
 
       {/* Check + Refresh buttons */}
       <div className="update-actions">
-        <button className="btn btn-primary" onClick={checkForUpdates} disabled={loading}>
-          {loading ? 'Checking...' : 'Check for Updates'}
+        <button className="btn btn-primary" onClick={checkForUpdates} disabled={loading}
+          style={disabledButtonStyle(loading)}>
+          {loading ? 'Checking…' : 'Check for Updates'}
         </button>
-        <button className="btn btn-secondary" onClick={onRefresh} disabled={loading}>
-          Refresh Status
+        <button className="btn btn-secondary" onClick={onRefresh} disabled={loading}
+          style={disabledButtonStyle(loading)}>
+          {loading ? 'Refreshing…' : 'Refresh Status'}
         </button>
       </div>
 

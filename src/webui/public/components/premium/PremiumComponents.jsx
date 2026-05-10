@@ -9,7 +9,82 @@
  *   _disabledCommands: string[]: specific commands disabled for this tier
  *   <settingKey>: value        : setting value overrides
  */
-const { useState, useEffect, useRef } = React;
+const { useState, useEffect, useRef, useMemo } = React;
+
+// ============================================================================
+// Effective-overrides helper (used by TierEditorPanel dirty tracking)
+// ============================================================================
+// Sort object keys recursively so two semantically-equal objects with different
+// insertion order JSON.stringify to identical strings.
+function _canonicalizeValue(value) {
+  if (Array.isArray(value)) return value.map(_canonicalizeValue);
+  if (value && typeof value === 'object') {
+    const out = {};
+    for (const k of Object.keys(value).sort()) out[k] = _canonicalizeValue(value[k]);
+    return out;
+  }
+  return value;
+}
+
+// Two override structures are EFFECTIVELY equal when they produce the same
+// merged value for every key on this tier. A key whose explicit value equals
+// what the tier would inherit anyway (Free's value for non-Free tiers, or the
+// schema default) is treated as absent. This mirrors the backend's per-key
+// redundancy semantics so the dirty flag tracks "would saving change anything
+// the user can observe" rather than raw byte equality. Without this, e.g.
+// toggling a boolean checkbox on then off leaves `{Y: false}` in the data,
+// structurally a delta vs `{}` baseline, but visually and semantically the
+// same as no override when the schema default is `false`.
+function effectiveOverrides(rawOverrides, moduleSchemas, freeOverrides, isFreeTier) {
+  const safeFree = freeOverrides || {};
+  const out = {};
+  for (const modName of Object.keys(rawOverrides || {}).sort()) {
+    const tierMod = rawOverrides[modName];
+    if (!tierMod || typeof tierMod !== 'object') continue;
+    const freeMod = safeFree[modName] || {};
+    // When Free disables a module, all of Free's other keys for that module
+    // become moot - mirrors the backend's effectiveFreeModuleOverride.
+    const effectiveFree = freeMod._moduleEnabled === false ? { _moduleEnabled: false } : freeMod;
+    const schema = (moduleSchemas || []).find(m => m.name === modName);
+    const settings = schema?.settings || {};
+
+    const cleanMod = {};
+    for (const key of Object.keys(tierMod).sort()) {
+      const val = tierMod[key];
+      // Compute the value the tier would see if this override didn't exist.
+      let inherited;
+      if (key === '_moduleEnabled') {
+        inherited = isFreeTier ? true : (effectiveFree._moduleEnabled !== false);
+      } else if (key === '_disabledCommands') {
+        inherited = isFreeTier
+          ? []
+          : (Array.isArray(effectiveFree._disabledCommands) ? effectiveFree._disabledCommands : []);
+      } else {
+        // Setting key: prefer Free's value, fall back to schema default.
+        if (isFreeTier) {
+          inherited = settings[key]?.default;
+        } else {
+          inherited = effectiveFree[key] !== undefined ? effectiveFree[key] : settings[key]?.default;
+        }
+      }
+
+      let matches = false;
+      if (Array.isArray(val) && Array.isArray(inherited)) {
+        const a = [...val].sort();
+        const b = [...inherited].sort();
+        matches = a.length === b.length && a.every((v, i) => v === b[i]);
+      } else if (val !== null && typeof val === 'object' && inherited !== null && typeof inherited === 'object') {
+        matches = JSON.stringify(_canonicalizeValue(val)) === JSON.stringify(_canonicalizeValue(inherited));
+      } else {
+        matches = val === inherited;
+      }
+      if (matches) continue; // redundant - drop from the effective view
+      cleanMod[key] = Array.isArray(val) ? [...val].sort() : _canonicalizeValue(val);
+    }
+    if (Object.keys(cleanMod).length > 0) out[modName] = cleanMod;
+  }
+  return out;
+}
 
 // ============================================================================
 // TierFormModal: Create or edit a premium tier
@@ -48,10 +123,15 @@ function TierFormModal({ tier, tierId, freeTier, nextPriority, onSave, onClose }
 
     setSaving(true);
     try {
+      // setTier on the backend rebuilds the tier from the request body, so we
+      // must round-trip every existing field. On edit, preserve the tier's
+      // current offerings so renaming doesn't wipe paid offerings; on create
+      // the prop is null and offerings starts empty.
       const res = await api.put(`/appstore/premium/tiers/${finalId}`, {
         displayName: displayName.trim(),
         priority: finalPriority,
         overrides: seededOverrides,
+        offerings: isEdit ? (tier?.offerings || []) : [],
       });
       if (res.success) {
         showToast(isEdit ? 'Tier updated' : 'Tier created', 'success');
@@ -130,6 +210,12 @@ function TierEditorPanel({ tierId, tier, freeTier, onSave, onClose }) {
   const [overrides, setOverrides] = useState(tier?.overrides || {});
   const [saving, setSaving] = useState(false);
   const [expandedModules, setExpandedModules] = useState(new Set());
+  // Baseline = the on-disk overrides at last successful save (or initial mount).
+  // isDirty compares the *effective* shape of current vs baseline (per-key
+  // redundancies vs Free / schema defaults pruned out), so toggling a boolean
+  // on then off and similar round trips return to a clean state even when the
+  // raw structure picked up a redundant entry along the way.
+  const [baseline, setBaseline] = useState(() => JSON.parse(JSON.stringify(tier?.overrides || {})));
 
   // ── Free-tier baseline (capabilities offered on Free are the floor) ──
   const isFreeTier = tierId === 'free';
@@ -352,16 +438,48 @@ function TierEditorPanel({ tierId, tier, freeTier, onSave, onClose }) {
     return count;
   }
 
+  // Dirty = the *effective* shape of the current overrides differs from the
+  // baseline. Computed on every render (cost is trivial: a handful of modules
+  // with a handful of keys). We keep the schemas / Free overrides as inputs so
+  // that the comparison reflects the same per-key redundancy semantics the
+  // backend would apply at save time.
+  const isDirty = useMemo(
+    () => JSON.stringify(effectiveOverrides(overrides, moduleSchemas, freeOverrides, isFreeTier))
+       !== JSON.stringify(effectiveOverrides(baseline, moduleSchemas, freeOverrides, isFreeTier)),
+    [overrides, baseline, moduleSchemas, freeOverrides, isFreeTier]
+  );
+
   async function handleSave() {
+    if (!isDirty) return;
     setSaving(true);
+    // Pre-prune: the dirty check treats per-key redundancies (a value that
+    // matches Free's value or the schema default) as no-ops. Persist the same
+    // shape so the on-disk state, the editor view, and the tier card's
+    // override count all agree. Without this, a tier "made identical to Free"
+    // would still show "N overrides" on its card because the backend's prune
+    // is whole-module-only.
+    const effective = effectiveOverrides(overrides, moduleSchemas, freeOverrides, isFreeTier);
+    const snapshot = JSON.parse(JSON.stringify(effective));
     try {
+      // Send the full tier shape: setTier on the backend rebuilds the entire
+      // tier record, so any field omitted here would get reset to its empty
+      // default. In particular `offerings` must be passed through verbatim
+      // from the parent-supplied prop or paid offerings get wiped.
       const res = await api.put(`/appstore/premium/tiers/${tierId}`, {
         displayName: tier.displayName,
         priority: tier.priority,
-        overrides,
+        overrides: effective,
+        offerings: tier.offerings || [],
       });
-      if (res.success) { showToast('Tier configuration saved', 'success'); onSave(); }
-      else showToast(res.error || 'Failed to save', 'error');
+      if (res.success) {
+        // Sync local state to the pruned form so the editor immediately
+        // reflects what's on disk. baseline + overrides land on the same
+        // value, so isDirty stays false until the user makes another change.
+        setOverrides(effective);
+        setBaseline(snapshot);
+        showToast('Tier configuration saved', 'success');
+        onSave();
+      } else showToast(res.error || 'Failed to save', 'error');
     } catch (err) {
       showToast('Error: ' + err.message, 'error');
     } finally { setSaving(false); }
@@ -518,25 +636,36 @@ function TierEditorPanel({ tierId, tier, freeTier, onSave, onClose }) {
   return (
     <div>
       {/* Header */}
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-          <button onClick={onClose} style={{
-            background: '#40444b', color: '#ddd', border: 'none', padding: '6px 12px',
-            borderRadius: '6px', cursor: 'pointer', fontSize: '0.85rem',
-          }}>&larr; Back</button>
-          <div>
-            <h3 style={{ margin: 0, color: '#f5af19' }}>{tier.displayName}: Access & Overrides</h3>
-            <span style={{ color: '#888', fontSize: '0.82rem' }}>
-              {moduleSchemas.length} module{moduleSchemas.length !== 1 ? 's' : ''}
+      <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '16px' }}>
+        <button onClick={onClose} style={{
+          background: '#40444b', color: '#ddd', border: 'none', padding: '6px 12px',
+          borderRadius: '6px', cursor: 'pointer', fontSize: '0.85rem',
+        }}>&larr; Back</button>
+        <button onClick={handleSave} disabled={saving || !isDirty} title={!isDirty && !saving ? 'No unsaved changes' : undefined} style={{
+          background: (saving || !isDirty) ? '#555' : 'linear-gradient(135deg, #3ba55d, #2d8049)',
+          color: '#fff', border: 'none', padding: '8px 14px', borderRadius: '6px',
+          cursor: (saving || !isDirty) ? 'not-allowed' : 'pointer',
+          opacity: (saving || !isDirty) ? 0.55 : 1,
+          fontWeight: 600, fontSize: '0.85rem',
+          display: 'inline-flex', alignItems: 'center', gap: '8px',
+        }}>
+          <span>{saving ? 'Saving...' : 'Save Changes'}</span>
+          {isDirty && !saving && (
+            <span title="You have unsaved changes" style={{
+              background: '#ffcc4d', color: '#1a1a1a', borderRadius: '50%',
+              width: '18px', height: '18px',
+              display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+              fontSize: '0.78rem', fontWeight: 800, lineHeight: 1,
+            }}>!</span>
+          )}
+        </button>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <h3 style={{ margin: 0, color: '#f5af19' }}>{tier.displayName}: Access & Overrides</h3>
+          <span style={{ color: '#888', fontSize: '0.82rem' }}>
+            {moduleSchemas.length} module{moduleSchemas.length !== 1 ? 's' : ''}
               {totalChanges > 0 && ` \u00B7 ${totalChanges} change${totalChanges !== 1 ? 's' : ''}`}
             </span>
           </div>
-        </div>
-        <button onClick={handleSave} disabled={saving} style={{
-          background: saving ? '#555' : 'linear-gradient(135deg, #3ba55d, #2d8049)',
-          color: '#fff', border: 'none', padding: '8px 16px', borderRadius: '6px',
-          cursor: saving ? 'not-allowed' : 'pointer', fontWeight: 600, fontSize: '0.85rem',
-        }}>{saving ? 'Saving...' : 'Save Changes'}</button>
       </div>
 
       {/* Info */}
@@ -675,7 +804,17 @@ function GrantManualModal({ guildId, existing, tiers, botGuilds, existingSubscri
     .sort((a, b) => (a[1].priority || 0) - (b[1].priority || 0));
 
   // For "Grant new": show guilds that don't already have a manual sub
-  const availableGuilds = (botGuilds || []).filter(g => !(existingSubscriptions?.[g.id]?.manual));
+  // Filter to guilds that don't already have a manual sub anywhere (active
+  // or paused queue). Stacking lets us grant another manual on top, but for
+  // the simplest UX we hide guilds that already have one.
+  function guildHasManual(g) {
+    const subs = existingSubscriptions?.[g.id];
+    if (!subs) return false;
+    if (subs.active?.source === 'manual') return true;
+    if (Array.isArray(subs.paused) && subs.paused.some(p => p.source === 'manual')) return true;
+    return false;
+  }
+  const availableGuilds = (botGuilds || []).filter(g => !guildHasManual(g));
 
   async function handleSave() {
     if (!selectedGuildId) { showToast('Guild is required', 'error'); return; }
@@ -875,101 +1014,294 @@ function CurrencyInput({ amount, currency, onChange }) {
 // ============================================================================
 function OfferingModal({ offering, providers, activatedProviders, onSave, onClose }) {
   const isEdit = !!offering;
-  const initial = offering || {
-    id: `offer-${Date.now().toString(36)}`,
-    label: 'Monthly',
-    description: '',
-    durationDays: 30,
-    autoRenewEligible: true,
-    amount: 500,
-    currency: 'USD',
-    providerLinks: Object.fromEntries(
-      Object.entries(activatedProviders || {}).map(([pid, a]) => [pid, { enabled: !!a.defaultEnabled, config: {} }])
-    ),
-    icon: undefined,
+  // New-model defaults: ProviderLinks is an Array of { providerId, enabled,
+  // mode, priceConfig?, productConfig?, cache? }. One row per activated
+  // provider on first open; admin enables the ones they want. Product mode
+  // is preferred (single Product ID, variants sync from the provider) over
+  // hand-curating individual variant IDs; falls back to Price mode for
+  // providers without a Product concept (Discord, Patreon, Boost).
+  const buildInitialLinks = () => {
+    if (offering?.providerLinks && Array.isArray(offering.providerLinks)) {
+      return offering.providerLinks.map(l => ({ ...l }));
+    }
+    return Object.entries(activatedProviders || {}).map(([providerId, a]) => {
+      const supportsProduct = !!(providers || []).find(p => p.id === providerId)?.capabilities?.supportsProductMode;
+      return supportsProduct
+        ? { providerId, enabled: !!a.defaultEnabled, mode: 'product', productConfig: { productId: '' } }
+        : { providerId, enabled: !!a.defaultEnabled, mode: 'price', priceConfig: { entries: [] } };
+    });
   };
   const [draft, setDraft] = useState(() => ({
-    ...initial,
-    providerLinks: { ...(initial.providerLinks || {}) },
+    id: offering?.id || `offer-${Date.now().toString(36)}`,
+    label: offering?.label || 'Standard',
+    description: offering?.description || '',
+    icon: offering?.icon,
+    forceAutoRenew: !!offering?.forceAutoRenew,
+    primaryProviderId: offering?.primaryProviderId,
+    providerLinks: buildInitialLinks(),
   }));
-  const isLifetime = draft.durationDays === null;
+  const [refreshing, setRefreshing] = useState({}); // providerId -> bool
+  const [refreshError, setRefreshError] = useState({}); // providerId -> string
 
-  // Only activated providers are shown in the toggle list
+  // Latest draft mirrored to a ref so async setTimeout-driven auto-fetches
+  // always see the user's most recent input. Without this, a debounced
+  // refresh fired off keystroke N captures the closure from render N, which
+  // is one render behind the state setter that scheduled it.
+  const draftRef = React.useRef(draft);
+  draftRef.current = draft;
+
+  // Per-provider debounce timers for auto-fetch on Product/Variant ID input.
+  const refreshTimers = React.useRef({});
+  React.useEffect(() => () => {
+    for (const t of Object.values(refreshTimers.current)) clearTimeout(t);
+  }, []);
+
+  function getLink(providerId) {
+    return draft.providerLinks.find(l => l.providerId === providerId);
+  }
+
+  function updateLink(providerId, mutator) {
+    setDraft(d => ({
+      ...d,
+      providerLinks: d.providerLinks.map(l =>
+        l.providerId === providerId ? mutator({ ...l }) : l,
+      ),
+    }));
+  }
+
+  function ensureLinkExists(providerId) {
+    setDraft(d => {
+      if (d.providerLinks.some(l => l.providerId === providerId)) return d;
+      const supportsProduct = !!(providers || []).find(p => p.id === providerId)?.capabilities?.supportsProductMode;
+      return {
+        ...d,
+        providerLinks: [...d.providerLinks, supportsProduct
+          ? { providerId, enabled: false, mode: 'product', productConfig: { productId: '' } }
+          : { providerId, enabled: false, mode: 'price', priceConfig: { entries: [] } }],
+      };
+    });
+  }
+
+  function toggleProvider(providerId) {
+    ensureLinkExists(providerId);
+    updateLink(providerId, l => ({ ...l, enabled: !l.enabled }));
+  }
+
+  function setMode(providerId, mode) {
+    updateLink(providerId, l => ({
+      ...l,
+      mode,
+      // Reset the other mode's config to defaults; keep the existing cache so
+      // recently-fetched variants don't disappear under the user.
+      priceConfig: mode === 'price' ? (l.priceConfig || { entries: [] }) : undefined,
+      productConfig: mode === 'product' ? (l.productConfig || { productId: '' }) : undefined,
+    }));
+    // Mode switch may reveal data that's already enterable (e.g. flipping back
+    // to product after typing a productId earlier). Schedule a refresh; the
+    // gate inside scheduleRefresh skips when there's nothing to fetch.
+    scheduleRefresh(providerId);
+  }
+
+  function addPriceEntry(providerId) {
+    updateLink(providerId, l => ({
+      ...l,
+      priceConfig: {
+        entries: [...(l.priceConfig?.entries || []), { variantId: '' }],
+      },
+    }));
+  }
+
+  function updatePriceEntry(providerId, idx, mutator) {
+    updateLink(providerId, l => {
+      const entries = [...(l.priceConfig?.entries || [])];
+      entries[idx] = mutator({ ...entries[idx] });
+      return { ...l, priceConfig: { entries } };
+    });
+    scheduleRefresh(providerId);
+  }
+
+  function removePriceEntry(providerId, idx) {
+    updateLink(providerId, l => {
+      const entries = (l.priceConfig?.entries || []).filter((_, i) => i !== idx);
+      return { ...l, priceConfig: { entries } };
+    });
+    scheduleRefresh(providerId);
+  }
+
+  function setProductId(providerId, productId) {
+    updateLink(providerId, l => ({
+      ...l,
+      productConfig: { ...(l.productConfig || {}), productId },
+    }));
+    scheduleRefresh(providerId);
+  }
+
+  function setHostedPicker(providerId, useProviderHostedPicker) {
+    updateLink(providerId, l => ({
+      ...l,
+      productConfig: { ...(l.productConfig || { productId: '' }), useProviderHostedPicker },
+    }));
+  }
+
+  /**
+   * Set an admin label override for a single variant in Product mode. Empty
+   * string clears the override (so the provider's label shines through). No
+   * cache re-bake: overrides are applied at display time both here and in
+   * the SubscribeModal, so the cached `OfferingVariant.label` stays as the
+   * provider's truth.
+   */
+  function setProductVariantOverride(providerId, variantId, value) {
+    updateLink(providerId, l => {
+      const prev = l.productConfig?.variantLabelOverrides || {};
+      const next = { ...prev };
+      const trimmed = value?.trim();
+      if (trimmed) next[variantId] = value;
+      else delete next[variantId];
+      return {
+        ...l,
+        productConfig: { ...(l.productConfig || { productId: '' }), variantLabelOverrides: next },
+      };
+    });
+  }
+
+  /**
+   * Debounced auto-fetch. Fires 500ms after the last keystroke per provider.
+   * Skips silently when there's nothing to fetch (empty productId or no
+   * variant entries) so typing then deleting doesn't pop "Enter a Product ID"
+   * errors. The manual Refresh button uses `refreshLink` directly which
+   * still throws to surface those messages on click.
+   */
+  function scheduleRefresh(providerId) {
+    clearTimeout(refreshTimers.current[providerId]);
+    refreshTimers.current[providerId] = setTimeout(() => {
+      const link = draftRef.current.providerLinks.find(l => l.providerId === providerId);
+      if (!link) return;
+      if (link.mode === 'product') {
+        if (!link.productConfig?.productId?.trim()) return;
+      } else {
+        const entries = link.priceConfig?.entries || [];
+        if (entries.every(e => !e.variantId?.trim())) return;
+      }
+      void refreshLink(providerId);
+    }, 500);
+  }
+
+  async function refreshLink(providerId) {
+    const link = draftRef.current.providerLinks.find(l => l.providerId === providerId);
+    if (!link) return;
+    setRefreshing(r => ({ ...r, [providerId]: true }));
+    setRefreshError(r => ({ ...r, [providerId]: undefined }));
+    try {
+      if (link.mode === 'product') {
+        if (!link.productConfig?.productId) {
+          throw new Error('Enter a Product ID first.');
+        }
+        const res = await api.post(`/appstore/premium/providers/${providerId}/product-lookup`, {
+          productId: link.productConfig.productId,
+        });
+        if (!res.success) throw new Error(res.error || 'Lookup failed');
+        updateLink(providerId, l => ({
+          ...l,
+          cache: {
+            syncedAt: new Date().toISOString(),
+            variants: res.variants || [],
+          },
+        }));
+      } else {
+        const entries = link.priceConfig?.entries || [];
+        if (entries.length === 0) throw new Error('Add at least one variant entry first.');
+        const variants = [];
+        for (const entry of entries) {
+          if (!entry.variantId) continue;
+          const res = await api.post(`/appstore/premium/providers/${providerId}/variant-lookup`, {
+            variantId: entry.variantId,
+          });
+          if (res.success && res.variant) {
+            variants.push(entry.labelOverride
+              ? { ...res.variant, label: entry.labelOverride }
+              : res.variant);
+          }
+        }
+        updateLink(providerId, l => ({
+          ...l,
+          cache: {
+            syncedAt: new Date().toISOString(),
+            variants,
+          },
+        }));
+      }
+    } catch (err) {
+      setRefreshError(r => ({ ...r, [providerId]: err?.message || 'Lookup failed' }));
+    } finally {
+      setRefreshing(r => ({ ...r, [providerId]: false }));
+    }
+  }
+
+  // Show only providers that are activated system-wide. Real providers (not
+  // immediate-mechanism) and Dummy alike.
   const activatedProviderIds = Object.keys(activatedProviders || {});
   const activatedList = activatedProviderIds
     .map(pid => (providers || []).find(p => p.id === pid))
     .filter(Boolean);
 
-  function setDurationDays(v) {
-    setDraft(d => ({
-      ...d,
-      durationDays: v,
-      // Lifetime has no end to renew; keep stored data consistent by clearing
-      // the flag. Switching back to a finite duration leaves it off so the
-      // admin makes an explicit choice.
-      autoRenewEligible: v === null ? false : d.autoRenewEligible,
-    }));
-  }
-  function toggleProvider(pid) {
-    setDraft(d => {
-      const links = { ...(d.providerLinks || {}) };
-      const cur = links[pid] || { enabled: false, config: {} };
-      links[pid] = { ...cur, enabled: !cur.enabled };
-      return { ...d, providerLinks: links };
-    });
-  }
-  function setProviderConfigValue(pid, key, value) {
-    setDraft(d => {
-      const links = { ...(d.providerLinks || {}) };
-      const cur = links[pid] || { enabled: false, config: {} };
-      const config = { ...(cur.config || {}) };
-      if (value === undefined || value === '') delete config[key]; else config[key] = value;
-      links[pid] = { ...cur, config };
-      return { ...d, providerLinks: links };
-    });
-  }
-
-  function renderProviderField(pid, spec) {
-    const config = draft.providerLinks?.[pid]?.config || {};
-    const value = config[spec.key];
-    const setValue = v => setProviderConfigValue(pid, spec.key, v);
-    const inputStyle = {
-      padding: '6px 10px', borderRadius: '5px', border: '1px solid #555',
-      background: '#1a1a1a', color: '#e0e0e0', fontSize: '0.85rem',
-    };
-    if (spec.type === 'boolean') {
-      return (
-        <input type="checkbox" checked={!!value} onChange={e => setValue(e.target.checked)}
-          style={{ accentColor: '#5865F2', width: '16px', height: '16px' }} />
-      );
+  /**
+   * Per-provider URL builder for the "Open in [provider]" deep link. Returns
+   * null when there's no useful target (provider not handled, or required
+   * IDs not yet typed). Stripe goes to its dashboard; Dummy jumps to the
+   * in-app Dummy Settings panel via a hash anchor on /appstore.
+   *
+   * Stripe: test vs live mode is left to the user's dashboard session; we
+   * don't know which key is configured here and Stripe handles the redirect.
+   */
+  function buildOpenInUrl(provider, link) {
+    if (!provider) return null;
+    if (provider.id === 'stripe') {
+      if (link.mode === 'product') {
+        const pid = link.productConfig?.productId?.trim();
+        return pid ? `https://dashboard.stripe.com/products/${encodeURIComponent(pid)}` : null;
+      }
+      const firstId = (link.priceConfig?.entries || [])
+        .map(e => e.variantId?.trim())
+        .find(Boolean);
+      return firstId ? `https://dashboard.stripe.com/prices/${encodeURIComponent(firstId)}` : null;
     }
-    if (spec.type === 'number') {
-      return (
-        <input type="number" style={{ ...inputStyle, width: '140px' }}
-          value={value === undefined || value === null ? '' : value}
-          onChange={e => {
-            const v = e.target.value;
-            if (v === '') setValue(undefined); else setValue(parseInt(v, 10));
-          }} />
-      );
+    if (provider.id === 'dummy') {
+      // Same-origin deep link with a hash anchor; AppStorePanel scrolls to
+      // the matching id on mount + hashchange.
+      return '/appstore#dummy-settings';
     }
-    if (spec.type === 'select' && spec.options) {
-      return (
-        <select style={{ ...inputStyle, minWidth: '140px' }}
-          value={value ?? ''} onChange={e => setValue(e.target.value || undefined)}>
-          <option value="">Default</option>
-          {spec.options.map(opt => (<option key={opt.value} value={opt.value}>{opt.label}</option>))}
-        </select>
-      );
-    }
-    return (
-      <input type="text" style={{ ...inputStyle, width: '200px' }}
-        value={value ?? ''} onChange={e => setValue(e.target.value || undefined)} />
-    );
+    return null;
   }
 
   function handleSaveClick() {
     if (!draft.label?.trim()) { showToast('Label is required', 'error'); return; }
+    // Surface hosted-picker cap overflow as a confirm() at save time so the
+    // admin doesn't accidentally ship a config that hides variants from
+    // subscribers. Inline warning above already flags it; this is a hard
+    // checkpoint that also catches the case where the admin enables the
+    // toggle but never scrolls back to read the inline notice.
+    const overflows = [];
+    for (const link of (draft.providerLinks || [])) {
+      if (!link.enabled) continue;
+      if (link.mode !== 'product') continue;
+      if (!link.productConfig?.useProviderHostedPicker) continue;
+      const provider = (providers || []).find(p => p.id === link.providerId);
+      const cap = provider?.capabilities?.hostedPickerVariantCap;
+      if (!cap) continue;
+      const activeCount = (link.cache?.variants || []).filter(v => v.active).length;
+      if (activeCount > cap) {
+        const hidden = activeCount - cap;
+        overflows.push(`${provider.displayName}: ${hidden} of ${activeCount} active prices won't be visible (cap ${cap})`);
+      }
+    }
+    if (overflows.length > 0) {
+      const ok = confirm(
+        `Heads up - some hosted-picker links have more variants than the provider can show:\n\n` +
+        overflows.map(o => `  • ${o}`).join('\n') +
+        `\n\nSave anyway?`
+      );
+      if (!ok) return;
+    }
     onSave(draft);
   }
 
@@ -979,7 +1311,7 @@ function OfferingModal({ offering, providers, activatedProviders, onSave, onClos
     zIndex: 1000,
   };
   const modalStyle = {
-    background: '#2c2f33', borderRadius: '12px', padding: '24px', width: '560px', maxWidth: '92vw',
+    background: '#2c2f33', borderRadius: '12px', padding: '24px', width: '640px', maxWidth: '92vw',
     maxHeight: '90vh', overflow: 'auto', border: '1px solid #444',
   };
   const inputStyle = {
@@ -988,18 +1320,16 @@ function OfferingModal({ offering, providers, activatedProviders, onSave, onClos
   };
   const labelStyle = { display: 'block', color: '#aaa', fontSize: '0.82rem', marginBottom: '4px', marginTop: '14px' };
 
-  const enabledCount = Object.values(draft.providerLinks || {}).filter(l => l.enabled).length;
-
   return (
     <div style={overlayStyle} onClick={onClose}>
       <div style={modalStyle} onClick={e => e.stopPropagation()}>
         <h3 style={{ margin: '0 0 4px 0', color: '#fff' }}>{isEdit ? 'Edit Offering' : 'New Offering'}</h3>
         <p style={{ color: '#888', fontSize: '0.82rem', margin: 0 }}>
-          Define a plan and pick which payment methods make it purchasable.
+          Define a plan and pick which payment methods make it purchasable. Each method has its own variant list.
         </p>
 
         <label style={labelStyle}>Label</label>
-        <input style={inputStyle} value={draft.label || ''} placeholder="e.g. Monthly"
+        <input style={inputStyle} value={draft.label || ''} placeholder="e.g. Standard"
           onChange={e => setDraft(d => ({ ...d, label: e.target.value }))} />
 
         <label style={labelStyle}>Description <span style={{ color: '#666', fontWeight: 400 }}>(optional)</span></label>
@@ -1010,124 +1340,236 @@ function OfferingModal({ offering, providers, activatedProviders, onSave, onClos
           placeholder="e.g. Best value: includes priority support and custom branding."
           onChange={e => setDraft(d => ({ ...d, description: e.target.value }))}
         />
-        <div style={{ color: '#666', fontSize: '0.72rem', marginTop: '4px' }}>
-          Shown on the subscribe card in the guild Web-UI.
+
+        <label style={{ display: 'flex', alignItems: 'center', gap: '8px', marginTop: '16px', color: '#ddd', fontSize: '0.85rem', cursor: 'pointer' }}>
+          <input type="checkbox" checked={!!draft.forceAutoRenew}
+            onChange={e => setDraft(d => ({ ...d, forceAutoRenew: e.target.checked }))}
+            style={{ accentColor: '#5865F2' }} />
+          Force auto-renew (hide the "buy as one-time" option for users)
+        </label>
+        <div style={{ color: '#666', fontSize: '0.72rem', marginTop: '2px', marginLeft: '24px' }}>
+          Only affects recurring variants. Lifetime/one-time variants never renew regardless.
         </div>
 
-        <label style={labelStyle}>Price</label>
-        <CurrencyInput
-          amount={draft.amount} currency={draft.currency}
-          onChange={({ amount, currency }) => setDraft(d => ({ ...d, amount, currency }))}
-        />
-        <div style={{ color: '#666', fontSize: '0.72rem', marginTop: '4px' }}>
-          Leave blank for non-monetary offerings (e.g. server boosting).
+        <div style={{ marginTop: '20px', color: '#aaa', fontSize: '0.82rem', fontWeight: 600, marginBottom: '8px' }}>
+          Accept Payment Via
         </div>
 
-        <label style={labelStyle}>Duration</label>
-        <div style={{ display: 'flex', gap: '12px', alignItems: 'center', flexWrap: 'wrap' }}>
-          <label style={{ display: 'flex', alignItems: 'center', gap: '6px', color: '#ddd', fontSize: '0.85rem', cursor: 'pointer' }}>
-            <input type="checkbox" checked={isLifetime}
-              onChange={e => setDurationDays(e.target.checked ? null : 30)}
-              style={{ accentColor: '#5865F2' }} />
-            Lifetime (no expiry)
-          </label>
-          {!isLifetime && (
-            <React.Fragment>
-              <select value={draft.durationDays ?? 30}
-                onChange={e => setDurationDays(parseInt(e.target.value, 10))}
-                style={{ ...inputStyle, width: 'auto', minWidth: '140px' }}>
-                {DURATION_PRESETS.map(p => (<option key={p.days} value={p.days}>{p.label} ({p.days}d)</option>))}
-                {/* Custom duration retained as the selected option if not a preset */}
-                {!DURATION_PRESETS.some(p => p.days === draft.durationDays) && draft.durationDays !== null && (
-                  <option value={draft.durationDays}>Custom: {draft.durationDays} days</option>
-                )}
-              </select>
-              <span style={{ color: '#888', fontSize: '0.82rem' }}>or</span>
-              <input type="number" min="1" style={{ ...inputStyle, width: '100px' }}
-                value={draft.durationDays ?? ''}
-                onChange={e => setDurationDays(parseInt(e.target.value, 10) || 1)} />
-              <span style={{ color: '#888', fontSize: '0.82rem' }}>days</span>
-            </React.Fragment>
-          )}
-        </div>
-
-        {/* Auto-renew is a concept tied to "end of period", so it only makes sense
-            for finite-duration offerings. Lifetime has no end, so the field is
-            omitted entirely rather than shown as disabled (which read like
-            "renewal cancelled"). */}
-        {!isLifetime && (
-          <label style={{ display: 'flex', alignItems: 'center', gap: '6px', color: '#ddd', fontSize: '0.85rem', cursor: 'pointer', marginTop: '14px' }}>
-            <input type="checkbox" checked={!!draft.autoRenewEligible}
-              onChange={e => setDraft(d => ({ ...d, autoRenewEligible: e.target.checked }))}
-              style={{ accentColor: '#5865F2' }} />
-            Allow auto-renewal at end of period
-          </label>
-        )}
-
-        {/* Payment methods */}
-        <div style={{ marginTop: '20px' }}>
-          <div style={{ color: '#aaa', fontSize: '0.82rem', fontWeight: 600, marginBottom: '8px' }}>
-            Accept Payment Via
-            <span style={{ color: enabledCount === 0 ? '#e67e22' : '#666', fontWeight: 400, marginLeft: '8px', fontSize: '0.75rem' }}>
-              ({enabledCount} of {activatedList.length} enabled)
-            </span>
+        {activatedList.length === 0 ? (
+          <div style={{
+            background: 'rgba(230, 126, 34, 0.1)', border: '1px solid #e67e22',
+            color: '#e67e22', padding: '10px 14px', borderRadius: '6px', fontSize: '0.82rem',
+          }}>
+            No payment methods are activated. Close this dialog and activate a method in the
+            "Available Payment Methods" section first.
           </div>
-
-          {activatedList.length === 0 ? (
-            <div style={{
-              background: 'rgba(230, 126, 34, 0.1)', border: '1px solid #e67e22',
-              color: '#e67e22', padding: '10px 14px', borderRadius: '6px', fontSize: '0.82rem',
-            }}>
-              No payment methods are activated. Close this dialog and activate a method in the
-              "Available Payment Methods" section first.
-            </div>
-          ) : (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-              {activatedList.map(provider => {
-                const link = draft.providerLinks?.[provider.id] || { enabled: false, config: {} };
-                const schema = provider.capabilities?.offeringSchema || [];
-                return (
-                  <div key={provider.id} style={{
-                    background: '#36393f', borderRadius: '8px', padding: '10px 12px',
-                    border: link.enabled ? '1px solid #5865F2' : '1px solid transparent',
-                  }}>
-                    <label style={{
-                      display: 'flex', alignItems: 'center', gap: '10px', cursor: 'pointer',
-                    }}>
+        ) : (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+            {activatedList.map(provider => {
+              const link = getLink(provider.id) || {
+                providerId: provider.id,
+                enabled: false,
+                mode: 'price',
+                priceConfig: { entries: [] },
+              };
+              const cap = provider.capabilities || {};
+              const variants = link.cache?.variants || [];
+              return (
+                <div key={provider.id} style={{
+                  background: '#36393f', borderRadius: '8px', padding: '12px 14px',
+                  border: link.enabled ? '1px solid #5865F2' : '1px solid #444',
+                }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }}>
                       <input type="checkbox" checked={!!link.enabled}
                         onChange={() => toggleProvider(provider.id)}
                         style={{ accentColor: '#5865F2', width: '16px', height: '16px' }} />
                       <span style={{ color: '#fff', fontSize: '0.9rem', fontWeight: 600 }}>
                         {provider.displayName}
                       </span>
-                      {!provider.isConfigured && (
-                        <span style={{
-                          background: 'rgba(230, 126, 34, 0.2)', color: '#e67e22',
-                          padding: '1px 7px', borderRadius: '10px', fontSize: '0.7rem',
-                        }}>not configured</span>
-                      )}
                     </label>
-                    {link.enabled && schema.length > 0 && (
-                      <div style={{ marginTop: '10px', paddingLeft: '26px', display: 'flex', gap: '14px', flexWrap: 'wrap' }}>
-                        {schema.map(spec => (
-                          <div key={spec.key}>
-                            <div style={{ color: '#888', fontSize: '0.72rem', marginBottom: '3px' }}>
-                              {spec.label}{spec.required && <span style={{ color: '#ed4245' }}> *</span>}
-                            </div>
-                            {renderProviderField(provider.id, spec)}
-                            {spec.description && (
-                              <div style={{ color: '#555', fontSize: '0.7rem', marginTop: '2px' }}>{spec.description}</div>
-                            )}
-                          </div>
-                        ))}
-                      </div>
+                    {!provider.isConfigured && (
+                      <span style={{
+                        background: 'rgba(230, 126, 34, 0.2)', color: '#e67e22',
+                        padding: '1px 7px', borderRadius: '10px', fontSize: '0.7rem',
+                      }}>not configured</span>
+                    )}
+                    {link.enabled && cap.supportsProductMode && (
+                      <select value={link.mode}
+                        onChange={e => setMode(provider.id, e.target.value)}
+                        style={{
+                          marginLeft: 'auto',
+                          padding: '4px 8px', borderRadius: '5px', border: '1px solid #555',
+                          background: '#1a1a1a', color: '#e0e0e0', fontSize: '0.8rem',
+                        }}>
+                        <option value="product">Product mode (synced from provider)</option>
+                        <option value="price">Price mode (curated list)</option>
+                      </select>
                     )}
                   </div>
-                );
-              })}
-            </div>
-          )}
-        </div>
+
+                  {link.enabled && (
+                    <div style={{ marginTop: '10px', paddingLeft: '24px' }}>
+                      {link.mode === 'product' ? (
+                        <div>
+                          <div style={{ color: '#888', fontSize: '0.78rem', marginBottom: '4px' }}>
+                            {cap.productIdLabel || 'Product ID'}
+                          </div>
+                          <input style={{ ...inputStyle, marginBottom: '8px' }}
+                            value={link.productConfig?.productId || ''}
+                            onChange={e => setProductId(provider.id, e.target.value)}
+                            placeholder="prod_..." />
+                          {cap.supportsHostedPicker && (
+                            <label style={{ display: 'flex', alignItems: 'center', gap: '8px', color: '#ddd', fontSize: '0.82rem', cursor: 'pointer', marginBottom: '8px' }}>
+                              <input type="checkbox" checked={!!link.productConfig?.useProviderHostedPicker}
+                                onChange={e => setHostedPicker(provider.id, e.target.checked)}
+                                style={{ accentColor: '#5865F2' }} />
+                              Show prices on {provider.displayName}'s checkout page
+                              {cap.hostedPickerVariantCap ? ` (max ${cap.hostedPickerVariantCap} prices visible)` : ''}
+                            </label>
+                          )}
+                          {(() => {
+                            // Surface the cap inline as soon as the wired Product
+                            // exceeds it AND the hosted picker is on. Save still
+                            // succeeds (config is valid; provider just truncates
+                            // visually), but the admin should know the overflow
+                            // variants won't be selectable from the hosted page.
+                            if (!cap.supportsHostedPicker) return null;
+                            if (!cap.hostedPickerVariantCap) return null;
+                            if (!link.productConfig?.useProviderHostedPicker) return null;
+                            const activeCount = (link.cache?.variants || []).filter(v => v.active).length;
+                            if (activeCount <= cap.hostedPickerVariantCap) return null;
+                            const hidden = activeCount - cap.hostedPickerVariantCap;
+                            return (
+                              <div style={{
+                                background: 'rgba(230, 126, 34, 0.1)', border: '1px solid rgba(230, 126, 34, 0.5)',
+                                color: '#e67e22', padding: '6px 10px', borderRadius: '5px',
+                                fontSize: '0.74rem', marginBottom: '8px',
+                              }}>
+                                ⚠ {provider.displayName}'s hosted page shows max {cap.hostedPickerVariantCap} prices. {hidden} of your {activeCount} active price{activeCount === 1 ? '' : 's'} won't be visible to subscribers. Either uncheck the hosted-picker option (we'll render the full list) or reduce the active prices on this Product at {provider.displayName}.
+                              </div>
+                            );
+                          })()}
+                        </div>
+                      ) : (
+                        <div>
+                          <div style={{ color: '#888', fontSize: '0.78rem', marginBottom: '4px' }}>
+                            {cap.variantIdLabel || 'Variant ID'}{cap.supportsMultipleVariants ? ' (one per billing option)' : ''}
+                          </div>
+                          {(link.priceConfig?.entries || []).map((entry, idx) => (
+                            <div key={idx} style={{ display: 'flex', gap: '6px', marginBottom: '6px' }}>
+                              <input style={{ ...inputStyle, flex: 1 }}
+                                value={entry.variantId}
+                                onChange={e => updatePriceEntry(provider.id, idx, en => ({ ...en, variantId: e.target.value }))}
+                                placeholder="price_..." />
+                              <input style={{ ...inputStyle, flex: 1 }}
+                                value={entry.labelOverride || ''}
+                                onChange={e => updatePriceEntry(provider.id, idx, en => ({ ...en, labelOverride: e.target.value || undefined }))}
+                                placeholder="Label override (optional)" />
+                              <button type="button" onClick={() => removePriceEntry(provider.id, idx)}
+                                style={{
+                                  background: 'transparent', color: '#ed4245', border: '1px solid #ed4245',
+                                  padding: '4px 10px', borderRadius: '5px', cursor: 'pointer', fontSize: '0.78rem',
+                                }}>×</button>
+                            </div>
+                          ))}
+                          {(cap.supportsMultipleVariants || (link.priceConfig?.entries || []).length === 0) && (
+                            <button type="button" onClick={() => addPriceEntry(provider.id)}
+                              style={{
+                                background: '#40444b', color: '#ddd', border: 'none',
+                                padding: '5px 12px', borderRadius: '5px', cursor: 'pointer', fontSize: '0.78rem', marginTop: '4px',
+                              }}>+ Add variant</button>
+                          )}
+                        </div>
+                      )}
+
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginTop: '10px', flexWrap: 'wrap' }}>
+                        <button type="button" onClick={() => refreshLink(provider.id)}
+                          disabled={!!refreshing[provider.id]}
+                          style={{
+                            background: 'transparent', border: '1px solid #555', color: '#aaa',
+                            padding: '4px 10px', borderRadius: '5px', cursor: 'pointer', fontSize: '0.75rem',
+                          }}>
+                          {refreshing[provider.id] ? 'Refreshing...' : '⟳ Refresh from provider'}
+                        </button>
+                        {(() => {
+                          const url = buildOpenInUrl(provider, link);
+                          if (!url) return null;
+                          return (
+                            <a href={url} target="_blank" rel="noopener noreferrer" style={{
+                              background: 'transparent', border: '1px solid #555', color: '#aaa',
+                              padding: '4px 10px', borderRadius: '5px', cursor: 'pointer', fontSize: '0.75rem',
+                              textDecoration: 'none',
+                            }}>
+                              Open in {provider.displayName} ↗
+                            </a>
+                          );
+                        })()}
+                        {link.cache?.syncedAt && (
+                          <span style={{ color: '#666', fontSize: '0.72rem' }}>
+                            synced {new Date(link.cache.syncedAt).toLocaleString()}
+                          </span>
+                        )}
+                      </div>
+
+                      {refreshError[provider.id] && (
+                        <div style={{ color: '#ed4245', fontSize: '0.78rem', marginTop: '6px' }}>
+                          ⚠ {refreshError[provider.id]}
+                        </div>
+                      )}
+
+                      {variants.length > 0 && (
+                        <div style={{ marginTop: '10px', display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                          {variants.map(v => {
+                            // Product mode: show an inline label-override input
+                            // per variant (Price mode already has its override
+                            // inside the entry editor above). Empty value falls
+                            // through to the provider's label as a placeholder.
+                            const isProductMode = link.mode === 'product';
+                            const override = isProductMode
+                              ? (link.productConfig?.variantLabelOverrides?.[v.variantId] || '')
+                              : '';
+                            return (
+                              <div key={v.variantId} style={{
+                                background: '#1a1a1a', padding: '6px 10px', borderRadius: '4px',
+                                fontSize: '0.78rem', color: '#ddd',
+                                display: 'flex', alignItems: 'center', gap: '10px',
+                              }}>
+                                {isProductMode ? (
+                                  <input
+                                    style={{
+                                      flex: 1, minWidth: 0, padding: '3px 6px', borderRadius: '3px',
+                                      border: '1px solid #444', background: '#0e0e0e', color: '#e0e0e0',
+                                      fontSize: '0.76rem', boxSizing: 'border-box',
+                                    }}
+                                    value={override}
+                                    placeholder={v.label}
+                                    onChange={e => setProductVariantOverride(provider.id, v.variantId, e.target.value)}
+                                    title="Override the label subscribers see for this variant. Leave empty to use the provider's label."
+                                  />
+                                ) : (
+                                  <span style={{ flex: 1, minWidth: 0 }}>{v.label}</span>
+                                )}
+                                <span style={{ color: '#888', whiteSpace: 'nowrap' }}>
+                                  {(v.amount / 100).toFixed(2)} {v.currency}
+                                  {v.durationDays === null
+                                    ? ' (lifetime)'
+                                    : ` / ${v.durationDays}d`}
+                                  {v.recurring ? ' · recurring' : ' · one-time'}
+                                  {!v.active && ' · ARCHIVED'}
+                                </span>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
 
         <div style={{ display: 'flex', gap: '10px', justifyContent: 'flex-end', marginTop: '22px' }}>
           <button onClick={onClose} style={{
@@ -1148,11 +1590,22 @@ function OfferingModal({ offering, providers, activatedProviders, onSave, onClos
 // ============================================================================
 function OfferingsEditorPanel({ tierId, tier, providers, activatedProviders, onSave, onClose, showSuccess, setError }) {
   const [offerings, setOfferings] = useState(() =>
-    (tier?.offerings || []).map(o => ({ ...o, providerLinks: { ...(o.providerLinks || {}) } }))
+    (tier?.offerings || []).map(o => ({
+      ...o,
+      providerLinks: Array.isArray(o.providerLinks) ? o.providerLinks.map(l => ({ ...l })) : [],
+    }))
   );
   const [saving, setSaving] = useState(false);
   const [editingOffering, setEditingOffering] = useState(null);      // null | 'new' | existing object
-  const [dirty, setDirty] = useState(false);
+  // Baseline = the on-disk offerings at last successful save (or initial mount).
+  // isDirty re-evaluates each render via canonical-JSON diff, so add-then-remove
+  // and edit-then-revert round-trip back to a clean state.
+  const [baseline, setBaseline] = useState(() => JSON.parse(JSON.stringify(tier?.offerings || [])));
+  const isDirty = useMemo(
+    () => JSON.stringify((offerings || []).map(_canonicalizeValue))
+       !== JSON.stringify((baseline || []).map(_canonicalizeValue)),
+    [offerings, baseline]
+  );
 
   function openAdd() { setEditingOffering('new'); }
   function openEdit(offering) { setEditingOffering(offering); }
@@ -1166,23 +1619,22 @@ function OfferingsEditorPanel({ tierId, tier, providers, activatedProviders, onS
       copy[idx] = nextOffering;
       return copy;
     });
-    setDirty(true);
     setEditingOffering(null);
   }
 
   function handleRemove(id) {
     if (!confirm('Remove this offering?')) return;
     setOfferings(prev => prev.filter(o => o.id !== id));
-    setDirty(true);
   }
 
   async function handleSaveAll() {
+    if (!isDirty) return;
     setSaving(true);
     try {
       const clean = offerings.map(o => ({
         ...o,
         id: o.id || `offer-${Math.random().toString(36).slice(2, 8)}`,
-        providerLinks: o.providerLinks || {},
+        providerLinks: Array.isArray(o.providerLinks) ? o.providerLinks : [],
       }));
       const res = await api.put(`/appstore/premium/tiers/${tierId}`, {
         displayName: tier.displayName,
@@ -1190,8 +1642,14 @@ function OfferingsEditorPanel({ tierId, tier, providers, activatedProviders, onS
         overrides: tier.overrides,
         offerings: clean,
       });
-      if (res.success) { showSuccess('Offerings saved'); onSave(); }
-      else setError(res.message || 'Failed to save offerings');
+      if (res.success) {
+        // Snap baseline to what we just persisted so isDirty clears immediately
+        // (don't wait on the parent to re-pass the tier prop). Use `clean` -
+        // that's what's now on disk, including any generated ids.
+        setBaseline(JSON.parse(JSON.stringify(clean)));
+        showSuccess('Offerings saved');
+        onSave();
+      } else setError(res.message || 'Failed to save offerings');
     } catch (err) {
       setError(err.message);
     } finally {
@@ -1205,8 +1663,37 @@ function OfferingsEditorPanel({ tierId, tier, providers, activatedProviders, onS
 
   // Count offerings with zero currently-enabled-AND-activated providers (warn).
   function offeringIsOrphan(o) {
-    const links = o.providerLinks || {};
-    return !Object.keys(links).some(pid => links[pid]?.enabled && activatedProviders?.[pid]);
+    const links = Array.isArray(o.providerLinks) ? o.providerLinks : [];
+    return !links.some(l => l.enabled && activatedProviders?.[l.providerId]);
+  }
+
+  /**
+   * Cheapest variant across all enabled provider links' caches; used to
+   * surface a price hint on the offering card. Returns null when no link
+   * has been refreshed yet (admin needs to click Refresh in the modal).
+   */
+  function cheapestVariant(o) {
+    const links = Array.isArray(o.providerLinks) ? o.providerLinks : [];
+    let best = null;
+    for (const link of links) {
+      if (!link.enabled) continue;
+      const variants = link.cache?.variants || [];
+      for (const v of variants) {
+        if (!v.active) continue;
+        if (!best || v.amount < best.amount) best = v;
+      }
+    }
+    return best;
+  }
+
+  function variantCount(o) {
+    const links = Array.isArray(o.providerLinks) ? o.providerLinks : [];
+    let count = 0;
+    for (const link of links) {
+      if (!link.enabled) continue;
+      count += (link.cache?.variants?.filter(v => v.active) || []).length;
+    }
+    return count;
   }
 
   return (
@@ -1221,31 +1708,39 @@ function OfferingsEditorPanel({ tierId, tier, providers, activatedProviders, onS
         />
       )}
 
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-          <button onClick={onClose} style={{
-            background: '#40444b', color: '#ddd', border: 'none', padding: '6px 12px',
-            borderRadius: '6px', cursor: 'pointer', fontSize: '0.85rem',
-          }}>&larr; Back</button>
-          <div>
-            <h3 style={{ margin: 0, color: '#f5af19' }}>{tier.displayName}: Offerings</h3>
-            <span style={{ color: '#888', fontSize: '0.82rem' }}>
-              {offerings.length} offering{offerings.length !== 1 ? 's' : ''}
-              {dirty && <span style={{ color: '#e67e22', marginLeft: '8px' }}>· unsaved changes</span>}
-            </span>
-          </div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '16px' }}>
+        <button onClick={onClose} style={{
+          background: '#40444b', color: '#ddd', border: 'none', padding: '6px 12px',
+          borderRadius: '6px', cursor: 'pointer', fontSize: '0.85rem',
+        }}>&larr; Back</button>
+        <button onClick={handleSaveAll} disabled={saving || !isDirty} title={!isDirty && !saving ? 'No unsaved changes' : undefined} style={{
+          background: (saving || !isDirty) ? '#555' : 'linear-gradient(135deg, #3ba55d, #2d8049)',
+          color: '#fff', border: 'none', padding: '8px 14px', borderRadius: '6px',
+          cursor: (saving || !isDirty) ? 'not-allowed' : 'pointer',
+          opacity: (saving || !isDirty) ? 0.55 : 1,
+          fontWeight: 600, fontSize: '0.85rem',
+          display: 'inline-flex', alignItems: 'center', gap: '8px',
+        }}>
+          <span>{saving ? 'Saving...' : 'Save Changes'}</span>
+          {isDirty && !saving && (
+            <span title="You have unsaved changes" style={{
+              background: '#ffcc4d', color: '#1a1a1a', borderRadius: '50%',
+              width: '18px', height: '18px',
+              display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+              fontSize: '0.78rem', fontWeight: 800, lineHeight: 1,
+            }}>!</span>
+          )}
+        </button>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <h3 style={{ margin: 0, color: '#f5af19' }}>{tier.displayName}: Offerings</h3>
+          <span style={{ color: '#888', fontSize: '0.82rem' }}>
+            {offerings.length} offering{offerings.length !== 1 ? 's' : ''}
+          </span>
         </div>
-        <div style={{ display: 'flex', gap: '8px' }}>
-          <button onClick={openAdd} style={{
-            background: '#40444b', color: '#ddd', border: 'none', padding: '8px 14px',
-            borderRadius: '6px', cursor: 'pointer', fontSize: '0.82rem',
-          }}>+ Add Offering</button>
-          <button onClick={handleSaveAll} disabled={saving || !dirty} style={{
-            background: (saving || !dirty) ? '#555' : 'linear-gradient(135deg, #3ba55d, #2d8049)',
-            color: '#fff', border: 'none', padding: '8px 16px', borderRadius: '6px',
-            cursor: (saving || !dirty) ? 'not-allowed' : 'pointer', fontWeight: 600, fontSize: '0.85rem',
-          }}>{saving ? 'Saving...' : 'Save Changes'}</button>
-        </div>
+        <button onClick={openAdd} style={{
+          background: '#40444b', color: '#ddd', border: 'none', padding: '8px 14px',
+          borderRadius: '6px', cursor: 'pointer', fontSize: '0.82rem',
+        }}>+ Add Offering</button>
       </div>
 
       <div style={{
@@ -1272,9 +1767,12 @@ function OfferingsEditorPanel({ tierId, tier, providers, activatedProviders, onS
       ) : (
         <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
           {offerings.map(o => {
-            const enabledProviderIds = Object.keys(o.providerLinks || {})
-              .filter(pid => o.providerLinks[pid]?.enabled);
+            const enabledProviderIds = (Array.isArray(o.providerLinks) ? o.providerLinks : [])
+              .filter(l => l.enabled)
+              .map(l => l.providerId);
             const isOrphan = offeringIsOrphan(o);
+            const cheapest = cheapestVariant(o);
+            const totalVariants = variantCount(o);
             return (
               <div key={o.id} style={{
                 background: '#2c2f33', borderRadius: '8px', padding: '12px 14px',
@@ -1285,9 +1783,9 @@ function OfferingsEditorPanel({ tierId, tier, providers, activatedProviders, onS
                   <div style={{ color: '#fff', fontSize: '0.95rem', fontWeight: 600 }}>
                     {o.label}
                     <span style={{ color: '#888', fontWeight: 400, marginLeft: '8px', fontSize: '0.82rem' }}>
-                      · {describeDuration(o.durationDays)}
-                      {formatMoney(o.amount, o.currency) && <> · {formatMoney(o.amount, o.currency)}</>}
-                      {o.autoRenewEligible && <> · auto-renewable</>}
+                      {totalVariants > 0 ? <> · {totalVariants} variant{totalVariants !== 1 ? 's' : ''}</> : <> · no variants synced yet</>}
+                      {cheapest && <> · from {(cheapest.amount / 100).toFixed(2)} {cheapest.currency}</>}
+                      {o.forceAutoRenew && <> · force auto-renew</>}
                     </span>
                   </div>
                   <div style={{ display: 'flex', gap: '6px', marginTop: '6px', flexWrap: 'wrap' }}>

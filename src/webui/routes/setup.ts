@@ -109,7 +109,12 @@ export function createSetupRoutes(): Router {
         MAIN_GUILD_ID,
         // OAuth fields (optional)
         ENABLE_GUILD_WEBUI, DISCORD_CLIENT_ID, DISCORD_CLIENT_SECRET,
-        OAUTH_CALLBACK_URL, SESSION_SECRET
+        OAUTH_CALLBACK_URL, SESSION_SECRET,
+        // Payment provider credentials are NOT accepted here - each provider
+        // owns its own credential modal accessible from the Premium panel.
+        // The PUT /api/appstore/premium/providers/:id/credentials route
+        // handles persistence via saveCredentials() with the same
+        // leave-blank-to-keep semantics this route uses.
       } = req.body;
 
       // Load existing credentials (includes Bot Manager-set values)
@@ -200,7 +205,22 @@ export function createSetupRoutes(): Router {
           : existingCredentials.OAUTH_CALLBACK_URL && { OAUTH_CALLBACK_URL: existingCredentials.OAUTH_CALLBACK_URL }),
         ...(SESSION_SECRET && SESSION_SECRET.trim() !== ''
           ? { SESSION_SECRET: SESSION_SECRET.trim() }
-          : existingCredentials.SESSION_SECRET && { SESSION_SECRET: existingCredentials.SESSION_SECRET })
+          : existingCredentials.SESSION_SECRET && { SESSION_SECRET: existingCredentials.SESSION_SECRET }),
+        // Payment provider credentials (Stripe/PayPal/LS/Patreon/Discord/...)
+        // are persisted via the per-provider modal route in appstore.ts,
+        // not here. Existing values are preserved naturally because we
+        // don't touch them.
+        ...Object.fromEntries(
+          Object.entries(existingCredentials)
+            .filter(([k, v]) => v !== undefined
+              && (k.startsWith('STRIPE_')
+                || k.startsWith('LEMONSQUEEZY_')
+                || k.startsWith('PAYPAL_')
+                || k.startsWith('PATREON_')
+                || k === 'DISCORD_APPLICATION_ID'
+                || k === 'BOOST_TARGET_GUILD_ID'
+                || k === 'WEBUI_BASE_URL'))
+        ),
       };
 
       // Save credentials

@@ -11,7 +11,7 @@ function CredentialsPanel({ setupStatus, isBotRunning, onUpdate, onUpdateAndRest
     DISCORD_CLIENT_ID: '',
     DISCORD_CLIENT_SECRET: '',
     OAUTH_CALLBACK_URL: '',
-    SESSION_SECRET: ''
+    SESSION_SECRET: '',
   };
 
   const [credentials, setCredentials] = useState({ ...EMPTY_CREDS });
@@ -119,7 +119,7 @@ function CredentialsPanel({ setupStatus, isBotRunning, onUpdate, onUpdateAndRest
           '⚠️ Keep this secure - changing it logs out all users'
         ],
         example: 'Click Generate to create'
-      }
+      },
     };
   });
 
@@ -303,15 +303,17 @@ function CredentialsPanel({ setupStatus, isBotRunning, onUpdate, onUpdateAndRest
             type="submit"
             className="btn btn-primary"
             disabled={saveDisabled}
+            style={disabledButtonStyle(saveDisabled)}
             title={!hasAnyChanges ? 'No changes to save' : undefined}
           >
-            {loading ? 'Saving...' : isConfigured ? 'Save Changes' : 'Save Credentials'}
+            {loading ? 'Saving…' : isConfigured ? 'Save Changes' : 'Save Credentials'}
           </button>
           <button
             type="button"
             onClick={() => handleSave(true)}
             className="btn btn-success"
             disabled={startRestartDisabled}
+            style={disabledButtonStyle(startRestartDisabled)}
             title={
               startRestartDisabled && isBotRunning && !botCredsDirty
                 ? 'No bot credentials changed. Guild Web-UI credentials apply without a restart; use "Save Changes" instead.'

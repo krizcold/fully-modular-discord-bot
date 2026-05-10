@@ -640,8 +640,8 @@ function PanelList({ panels, categoryFilter, onCategoryChange, onSelectPanel, ex
                   background: 'linear-gradient(135deg, #2c2f33 0%, #2a2d35 100%)',
                   border: '1px solid #5865F2',
                   borderRadius: '8px',
-                  cursor: executing ? 'wait' : 'pointer',
-                  opacity: executing ? 0.7 : 1,
+                  cursor: executing ? 'not-allowed' : 'pointer',
+                  opacity: executing ? 0.55 : 1,
                   transition: 'all 0.2s ease'
                 }}
                 onMouseEnter={(e) => {
@@ -738,8 +738,8 @@ function PanelList({ panels, categoryFilter, onCategoryChange, onSelectPanel, ex
                   backgroundColor: '#2c2f33',
                   border: '1px solid #3ba55d',
                   borderRadius: '8px',
-                  cursor: executing ? 'wait' : 'pointer',
-                  opacity: executing ? 0.7 : 1,
+                  cursor: executing ? 'not-allowed' : 'pointer',
+                  opacity: executing ? 0.55 : 1,
                   transition: 'all 0.2s ease'
                 }}
                 onMouseEnter={(e) => {

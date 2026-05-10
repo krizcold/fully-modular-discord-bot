@@ -1,13 +1,51 @@
 const { useState, useEffect } = React;
 
+// Top-level tabs that map 1:1 to a URL path. Order in the tab strip is
+// driven by the JSX below; this set is just for "is this a recognised tab"
+// validation when reading from the URL on load / popstate.
+const APP_TABS = ['dashboard', 'panels', 'credentials', 'config', 'logs', 'update', 'appstore', 'devmodules'];
+
+function tabFromPath(pathname) {
+  // Pathname like "/credentials" -> "credentials". Empty / unknown / "/"
+  // falls back to the default dashboard tab so refreshing on "/" doesn't
+  // pick a random tab.
+  const first = (pathname || '/').split('/').filter(Boolean)[0];
+  return APP_TABS.includes(first) ? first : 'dashboard';
+}
+
+function pushTabUrl(tab) {
+  // pushState updates the address bar without reloading. Preserve the
+  // existing query string (notably ?hash= used for nginx auth) and any
+  // hash fragment so the auth round-trip survives navigation.
+  const url = `/${tab}${window.location.search}${window.location.hash}`;
+  if (window.location.pathname !== `/${tab}`) {
+    window.history.pushState({}, '', url);
+  }
+}
+
 // Main App Component
 function App() {
-  const [activeTab, setActiveTab] = useState('dashboard');
+  const [activeTab, setActiveTabState] = useState(() => tabFromPath(window.location.pathname));
   const [status, setStatus] = useState(null);
   const [setupStatus, setSetupStatus] = useState(null);
   const [logs, setLogs] = useState([]);
   const [loading, setLoading] = useState(true);
   const [containerRestarting, setContainerRestarting] = useState(false);
+
+  // Wrapper so every tab change (button clicks, programmatic switches)
+  // updates the URL alongside the React state.
+  const setActiveTab = (tab) => {
+    setActiveTabState(tab);
+    pushTabUrl(tab);
+  };
+
+  // Browser back/forward: re-derive active tab from the URL the browser
+  // just restored. Doesn't pushState (would create a loop).
+  useEffect(() => {
+    const onPopState = () => setActiveTabState(tabFromPath(window.location.pathname));
+    window.addEventListener('popstate', onPopState);
+    return () => window.removeEventListener('popstate', onPopState);
+  }, []);
 
   // Load initial data and set up WebSocket subscriptions
   useEffect(() => {

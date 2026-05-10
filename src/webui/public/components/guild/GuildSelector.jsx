@@ -11,6 +11,23 @@ function GuildSelector({ user, onGuildSelected, onLogout }) {
     loadGuilds();
   }, []);
 
+  // After guilds load, if the URL carried a guild id (path /guild/{id}
+  // or legacy ?guildId= query), auto-pick that guild instead of forcing
+  // the user through the grid. Drops them back into context with one
+  // fewer click after Stripe redirects, refreshes, or shared deep links.
+  useEffect(() => {
+    if (loading || !guilds.length) return;
+    let wantedGuildId;
+    const segments = (window.location.pathname || '/').split('/').filter(Boolean);
+    if (segments[0] === 'guild' && segments[1]) wantedGuildId = decodeURIComponent(segments[1]);
+    if (!wantedGuildId) {
+      wantedGuildId = new URLSearchParams(window.location.search).get('guildId');
+    }
+    if (!wantedGuildId) return;
+    const match = guilds.find(g => g.id === wantedGuildId);
+    if (match) onGuildSelected(match);
+  }, [loading, guilds]);
+
   const loadGuilds = async () => {
     try {
       setLoading(true);

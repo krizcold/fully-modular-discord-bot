@@ -269,7 +269,7 @@ function ConfigPanel() {
   }
 
   if (loading && !config) {
-    return <div className="loading">Loading config...</div>;
+    return <FirstLoadPlaceholder label="Loading config…" />;
   }
 
   const selectedFileInfo = configFiles.find(f => f.id === selectedFile);
@@ -483,8 +483,9 @@ function ConfigPanel() {
           onClick={handleSave}
           className="btn btn-primary"
           disabled={saving || !!jsonError}
+          style={disabledButtonStyle(saving || !!jsonError)}
         >
-          {saving ? 'Saving...' : '💾 Save Config'}
+          {saving ? 'Saving…' : '💾 Save Config'}
         </button>
       </div>
 

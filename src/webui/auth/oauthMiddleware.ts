@@ -1,9 +1,20 @@
 // OAuth Middleware - Request authentication and authorization middleware
 
 import { Request, Response, NextFunction } from 'express';
-import { DiscordUser, isGuildWebUIEnabled, isOAuthConfigured } from './oauthConfig';
+import { DiscordGuild, DiscordUser, isGuildWebUIEnabled, isOAuthConfigured } from './oauthConfig';
 import { hasSystemAccess, hasGuildAccess } from './permissionChecker';
 import { refreshUserGuilds } from './guildPermissionRefresher';
+
+// Canonical signature over the access-relevant guild fields, sorted by id so
+// ordering differences from Discord's API don't look like a change. Used to
+// decide whether the refreshed user needs to be persisted back to the session.
+function guildsSignature(guilds: DiscordGuild[] | undefined): string {
+  if (!guilds || guilds.length === 0) return '';
+  return guilds
+    .map(g => `${g.id}:${g.permissions}:${g.owner ? 1 : 0}`)
+    .sort()
+    .join('|');
+}
 
 /**
  * Middleware: Require the Guild Web-UI to be currently enabled AND OAuth configured.
@@ -128,7 +139,9 @@ export function requireGuildAccess(req: Request, res: Response, next: NextFuncti
     .then(refreshedUser => new Promise<DiscordUser>((resolve, reject) => {
       const tokensChanged = refreshedUser.accessToken !== user.accessToken
         || refreshedUser.tokenExpiresAt !== user.tokenExpiresAt;
-      const guildsChanged = refreshedUser.guilds !== user.guilds;
+      // Reference-compare is useless here: the refresher always returns a new
+      // object. Compare by a canonical signature over id+permissions+owner.
+      const guildsChanged = guildsSignature(refreshedUser.guilds) !== guildsSignature(user.guilds);
       if (!tokensChanged && !guildsChanged) {
         // Nothing changed: skip the session write entirely.
         resolve(refreshedUser);
