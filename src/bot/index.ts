@@ -1,5 +1,12 @@
 // src/index.ts
 
+// This file is the bot-child entrypoint. Mark the role so the payment-provider
+// registry (and any future single-owner loop) knows to run tick / reconcile
+// jobs here rather than in the parent web-UI process. When the web-UI forks
+// us, this env var is already set by botManager; setting it here too makes
+// standalone runs (directly node-executing this file) still correct.
+process.env.BOT_PROCESS_ROLE = 'bot';
+
 // Register TypeScript path aliases for production (must be first)
 import * as tsConfigPaths from 'tsconfig-paths';
 import * as path from 'path';

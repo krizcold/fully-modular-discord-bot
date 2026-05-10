@@ -5,6 +5,7 @@ import { BotManager } from './botManager';
 import { createServer } from './server';
 import { WebSocketManager } from './websocketManager';
 import { getInstallQueue } from './utils/installQueue';
+import { setNotificationIPCDispatcher } from '../bot/internalSetup/utils/premiumNotifications';
 
 export async function startWebUI(botManager: BotManager): Promise<void> {
   console.log('[WebUI] Starting web interface...');
@@ -27,6 +28,13 @@ export async function startWebUI(botManager: BotManager): Promise<void> {
   // Wire install/uninstall queue events → WebSocket broadcasts
   const installQueue = getInstallQueue();
   installQueue.setBotManager(botManager);
+
+  // PremiumManager (running in this process too) needs a way to deliver
+  // notifications via the bot. Register a thin IPC bridge; PremiumManager
+  // will call `dispatchPremiumNotification(...)` and not care about routing.
+  setNotificationIPCDispatcher((guildId, kind, payload) =>
+    botManager.dispatchNotification(guildId, kind, payload)
+  );
   const queueEventMap: Record<string, 'queued' | 'started' | 'completed' | 'failed' | 'cancelled'> = {
     enqueued: 'queued',
     started: 'started',

@@ -8,6 +8,9 @@ import { getPanelManager } from './utils/panelManager';
 import { setupPanelIPCHandlers } from './utils/ipcPanelHandler';
 import { setupReloadIPCHandlers } from './utils/ipcReloadHandler';
 import { setupToggleIPCHandlers, applyAllDisabledStatesOnBoot } from './utils/ipcToggleHandler';
+import { setupIPCNotificationHandler } from './utils/ipcNotificationHandler';
+import { getSubscriptionNotifier } from './utils/subscriptionNotifier';
+import { getPaymentRegistry } from './utils/payment/paymentRegistry';
 import { startModuleAutoUpdater } from './utils/moduleAutoUpdater';
 import { loadCredentials } from '../../utils/envLoader';
 import { ModuleLoader } from './utils/moduleLoader';
@@ -434,8 +437,28 @@ async function main() {
   const internalEventsDirRelative = path.join(scanRoot, 'bot', 'internalSetup', 'events');
   const internalEventIntents = collectRequiredIntents(internalEventsDirRelative);
 
-  // PHASE 3: Merge all intents (modules + internal events)
-  const requiredIntents = mergeIntents(moduleIntents, internalEventIntents);
+  // PHASE 2b: Collect intents from registered payment providers. Each
+  // provider declares what it needs via `getRequiredIntents()`; e.g.
+  // ServerBoostingProvider needs GuildMembers to resolve guild.ownerId
+  // and read member.premiumSince on the target guild. Without this the
+  // bot would log in without those bits and the provider's tick would
+  // silently grant nothing.
+  const providerIntents: number[] = [];
+  try {
+    const registry = getPaymentRegistry();
+    for (const provider of registry.listAll()) {
+      if (typeof provider.getRequiredIntents !== 'function') continue;
+      for (const name of provider.getRequiredIntents()) {
+        const value = GatewayIntentBits[name as keyof typeof GatewayIntentBits];
+        if (typeof value === 'number') providerIntents.push(value);
+      }
+    }
+  } catch (err) {
+    console.warn('[clientInitializer] Failed to collect payment-provider intents:', err);
+  }
+
+  // PHASE 3: Merge all intents (modules + internal events + providers)
+  const requiredIntents = mergeIntents(moduleIntents, internalEventIntents, providerIntents);
   const defaultIntents = [ GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent, GatewayIntentBits.GuildMessageReactions ];
   const intents = requiredIntents.length > 0 ? requiredIntents : defaultIntents;
   const finalIntents = intents.map(intent => typeof intent === 'string' ? GatewayIntentBits[intent as keyof typeof GatewayIntentBits] : intent).filter(i => typeof i === 'number');
@@ -539,6 +562,35 @@ async function main() {
 
   // Set up IPC message handlers for component toggle
   setupToggleIPCHandlers(client);
+
+  // Subscription notifier (DM owner / channel fallback) lives in the bot
+  // process because it needs the Discord client. The web-UI process drives
+  // most state changes and forwards notification requests via IPC.
+  getSubscriptionNotifier().setClient(client);
+  setupIPCNotificationHandler();
+
+  // Discord App Monetization: bridge gateway entitlement events into our
+  // payment-registry event stream. Only the bot process has the client;
+  // web-UI process never sees these events.
+  try {
+    const registry = getPaymentRegistry();
+    const discord = registry.get('discord');
+    if (discord && (discord as any).attachGatewayBridge) {
+      (discord as any).attachGatewayBridge((eventName: string, handler: (payload: any) => void) => {
+        client.on(eventName as any, handler);
+      });
+    }
+    // ServerBoostingProvider polls Discord's premium-subscriptions endpoint
+    // on the configured target guild. Its setClient() also fires an
+    // immediate tick if the timer is already running, so we don't have
+    // to call start() again here.
+    const boost = registry.get('boost');
+    if (boost && (boost as any).setClient) {
+      (boost as any).setClient(client);
+    }
+  } catch (err) {
+    console.warn('[clientInitializer] Failed to attach payment provider gateway bridges:', err);
+  }
 
   client.login(process.env.DISCORD_TOKEN);
 }

@@ -28,6 +28,11 @@ export interface BotCredentials {
   DISCORD_CLIENT_SECRET?: string;
   OAUTH_CALLBACK_URL?: string;
   SESSION_SECRET?: string;
+  // Payment provider credentials are arbitrary env-var keys the providers
+  // declare via getCredentialFields(); they're addressable through the
+  // [string]: string | undefined index signature below. The per-provider
+  // credentials modal in the Premium panel reads/writes them directly via
+  // /api/appstore/premium/providers/:id/credentials.
   [key: string]: string | undefined;
 }
 
@@ -69,6 +74,23 @@ export function loadCredentials(): BotCredentials {
     OAUTH_CALLBACK_URL: process.env.OAUTH_CALLBACK_URL,
     SESSION_SECRET: process.env.SESSION_SECRET,
   };
+
+  // Payment provider env vars are dynamic per provider; copy through any
+  // process.env keys that match the registered providers' declared
+  // credential prefixes so process-env-only deployments work without
+  // /data/.env.
+  for (const key of Object.keys(process.env)) {
+    if (key in credentials) continue;
+    if (key.startsWith('STRIPE_')
+      || key.startsWith('LEMONSQUEEZY_')
+      || key.startsWith('PAYPAL_')
+      || key.startsWith('PATREON_')
+      || key === 'DISCORD_APPLICATION_ID'
+      || key === 'BOOST_TARGET_GUILD_ID'
+      || key === 'WEBUI_BASE_URL') {
+      credentials[key] = process.env[key];
+    }
+  }
 
   // Override with /data/.env if it exists (Web-UI managed)
   const dataEnvPath = '/data/.env';
@@ -214,6 +236,9 @@ export function getCredentialStatus(credentials: BotCredentials): Record<string,
     SESSION_SECRET: {
       set: !!(credentials.SESSION_SECRET && credentials.SESSION_SECRET.length > 10),
       value: credentials.SESSION_SECRET && credentials.SESSION_SECRET.length > 10 ? '[••••••••] (Set)' : '[Empty] (Not Set)'
-    }
+    },
+    // Payment provider credentials are surfaced through the per-provider
+    // /api/appstore/premium/providers/:id/credentials endpoint instead of
+    // here; the Credentials tab no longer renders any provider fields.
   };
 }

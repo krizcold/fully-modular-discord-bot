@@ -176,9 +176,11 @@ export class BotManager {
     console.log(`[BotManager] Starting bot from: ${botEntryPoint}`);
 
     try {
-      // Fork bot process with credentials
+      // Fork bot process with credentials. BOT_PROCESS_ROLE marks the child
+      // so code that must run in exactly one process (e.g. payment-provider
+      // tick loops) can tell which side it's on.
       this.botProcess = fork(botEntryPoint, [], {
-        env: { ...process.env, ...credentials },
+        env: { ...process.env, ...credentials, BOT_PROCESS_ROLE: 'bot' },
         silent: true, // Capture stdout/stderr
         execArgv: isProd ? [] : ['-r', 'ts-node/register'] // Use ts-node in development
       });
@@ -656,6 +658,21 @@ export class BotManager {
     } catch (error) {
       console.error('[BotManager] Error unloading module:', error);
       return { success: false, moduleName, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  /**
+   * Dispatch a subscription notification through the bot process. The bot
+   * owns the Discord client; web-UI-side state changes (admin grants,
+   * webhook installs) reach the user this way. Best-effort - failures log
+   * but never block the originating action.
+   */
+  async dispatchNotification(guildId: string, kind: string, payload: Record<string, any>): Promise<void> {
+    if (!this.isRunning()) return;
+    try {
+      await this.sendIPCMessage('notification:dispatch', { guildId, kind, payload });
+    } catch (error) {
+      console.warn('[BotManager] Notification dispatch failed:', error instanceof Error ? error.message : error);
     }
   }
 

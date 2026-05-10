@@ -1,134 +1,177 @@
 /**
- * Premium Manager
+ * Premium Manager - unified single-active-slot subscription model.
  *
- * Manages guild premium tiers, subscriptions (manual + paid), and setting overrides.
+ * Each guild has at most one ACTIVE subscription. Everything else lives in a
+ * single priority-sorted PAUSED queue. Subscriptions of either source (manual
+ * or paid) coexist in the same data structure.
  *
- * Two independent subscription layers per guild:
- *   - manual: granted by HOST via Main Web-UI
- *   - paid:   acquired via Guild Web-UI through a payment provider
- *              (cached mirror; the provider is the source of truth)
+ *     guildSubscriptions[guildId] = {
+ *       active?: Subscription,
+ *       paused: Subscription[],   // priority desc; manual wins ties
+ *     }
  *
- * Resolver picks the higher-priority non-expired active subscription;
- * falls back to Free when neither is active.
+ * Insertion rules (new sub arriving):
+ *   higher priority    -> active pauses, incoming becomes active
+ *   same priority + manual incoming -> active pauses, manual replaces (manual wins ties)
+ *   same priority + paid incoming   -> reject
+ *   lower priority     -> incoming inserts into paused queue at correct position
  *
- * Config file: /data/global/premium-tiers.json
+ * On active expiry / cancel: pop highest-priority paused, resume (provider
+ * resumeSubscription for paid, fresh dates for manual), install as active.
+ * Repeat if popped is itself past its endDate.
+ *
+ * Provider as source of truth: PremiumManager caches paid subscription state;
+ * provider events drive cache updates. Coupon validation is delegated to the
+ * provider (no global coupon registry; Dummy owns its own coupons).
+ *
+ * Files:
+ *   /data/global/premium-tiers.json        - PremiumConfig
+ *   /data/global/premium-tiers.audit.jsonl - append-only audit log
  */
 
 import fs from 'fs';
 import path from 'path';
+import * as crypto from 'crypto';
 import { ensureDir } from './pathHelpers';
 import type { HardLimitOverride } from '../../types/settingsTypes';
 import { getPaymentRegistry } from './payment/paymentRegistry';
-import type { ProviderEvent, InitiateResult } from './payment/paymentTypes';
+import { dispatchPremiumNotification } from './premiumNotifications';
+import type {
+  ProviderEvent,
+  InitiateResult,
+  ProviderSubscriptionRef,
+  ProviderLink,
+  OfferingVariant,
+  ProviderCouponValidation,
+} from './payment/paymentTypes';
 
 // ============================================================================
 // TYPES
 // ============================================================================
 
-/** Per-provider routing on an offering. The host activates provider IDs system-wide; each offering then toggles which of those are actually usable to buy it. */
-export interface TierProviderLink {
-  /** Whether this offering is purchasable via this provider right now */
-  enabled: boolean;
-  /** Opaque provider-specific config (e.g. Stripe Price id, Patreon tier id, server-boost count) */
-  config?: Record<string, any>;
-}
-
-/** A buyable / acquirable option on a tier. Provider-agnostic. One offering can be routed through many providers (multi-select). */
+/** A buyable / acquirable option on a tier. Provider-agnostic. */
 export interface TierOffering {
-  /** Unique id within the tier */
+  /** Unique id within the tier. */
   id: string;
-  /** Display label e.g. "Monthly", "6 Months", "Lifetime" */
+  /** Display label e.g. "Standard", "Pro Bundle". */
   label: string;
-  /** Optional marketing copy shown on the subscribe card */
+  /** Optional marketing copy shown on the subscribe card. */
   description?: string;
-  /** Duration in days; null = open-ended (Lifetime / "as long as active") */
-  durationDays: number | null;
-  /** Whether this offering supports auto-renewal at endDate */
-  autoRenewEligible: boolean;
-  /** Price amount in minor units (cents). Omitted for non-monetary mechanisms. */
-  amount?: number;
-  /** ISO 4217 currency. Omitted with amount. */
-  currency?: string;
-  /** Map of providerId → per-provider link (enabled flag + opaque config). */
-  providerLinks: Record<string, TierProviderLink>;
-  /** Optional display icon */
+  /** Optional display icon. */
   icon?: string;
+  /**
+   * Provider routings for this offering. Each link picks its own mode (Price
+   * vs Product) and config independently.
+   */
+  providerLinks: ProviderLink[];
+  /**
+   * When true, every purchase on this offering auto-renews (Subscribe UI
+   * hides the one-time opt-out and the backend ignores autoRenewOptOut).
+   * No effect on lifetime variants.
+   */
+  forceAutoRenew?: boolean;
+  /**
+   * Which provider's data is treated as canonical for cross-provider price
+   * validation. Set when the admin wires their first real provider; other
+   * real providers must match its prices or get auto-disabled.
+   */
+  primaryProviderId?: string;
 }
 
-/** Host-activated payment provider. Providers not present in `PremiumConfig.activatedProviders` are unavailable system-wide. */
+/** Host-activated payment provider; missing entry = unavailable system-wide. */
 export interface ActivatedProvider {
-  /** When true, newly created offerings toggle this provider on by default */
+  /** When true, newly created offerings toggle this provider on by default. */
   defaultEnabled: boolean;
 }
 
-/** Individual tier definition */
+/** Individual tier definition. */
 export interface PremiumTier {
-  /** Human-readable tier name */
   displayName: string;
-  /** Priority for tier ordering (higher = more premium) */
+  /** Higher = more premium; Free is always 0. */
   priority: number;
-  /** Module-specific setting overrides: overrides[moduleName][settingKey] = value */
+  /** Module-specific setting overrides: overrides[moduleName][settingKey] = value. */
   overrides: Record<string, Record<string, any>>;
   /** Offerings that acquire this tier. Free tier must be empty. */
   offerings: TierOffering[];
 }
 
 export type SubscriptionSource = 'manual' | 'paid';
-export type SubscriptionStatus = 'active' | 'expired';
+export type SubscriptionStatus = 'active' | 'paused' | 'expired';
 
-/** A subscription instance tying a guild to a tier */
+/**
+ * Snapshot of variant + tier + offering metadata at sign-up time. Frozen on
+ * the Subscription so we keep clean display continuity even if the offering
+ * is renamed, the tier is renamed, or either is deleted later.
+ */
+export interface PurchasedSnapshot {
+  offeringLabel: string;
+  variantLabel: string;
+  amount: number;
+  currency: string;
+  durationDays: number | null;
+  trialDays?: number;
+  tierDisplayName: string;
+  tierPriority: number;
+  purchasedAt: string;
+}
+
+/** A subscription instance tying a guild to a tier. */
 export interface Subscription {
+  /** Unique local id for queue management; survives across saves. */
+  id: string;
   tierId: string;
   source: SubscriptionSource;
-  /** Which TierOffering was acquired (paid only) */
+
+  // Paid only:
   offeringId?: string;
-  /** Provider id (paid only) */
+  /** Wire-level identifier picked at sign-up (Stripe Price ID, LS Variant ID, ...). */
+  variantId?: string;
   providerId?: string;
-  /** Provider's id for this subscription record (paid only) */
   providerSubId?: string;
-  /** ISO start */
+  providerMeta?: Record<string, any>;
+  purchasedSnapshot?: PurchasedSnapshot;
+
+  // Lifecycle:
   startDate: string;
-  /** ISO end, or null = open-ended (Lifetime) */
   endDate: string | null;
-  /** Whether this subscription will auto-renew at endDate. Manual subs: always false. */
   autoRenew: boolean;
   status: SubscriptionStatus;
-  /** UI slot; enforcement deferred until a provider with coupon support lands */
+
+  // Pause bookkeeping (status === 'paused'):
+  pausedAt?: string;
+  /** Frozen remaining time in days; null = lifetime (still null on resume). */
+  remainingDaysAtPause?: number | null;
+  /** Best-guess ISO when this paused entry will resume (when the higher-priority sub above ends). */
+  resumesAtHint?: string;
+
+  /** Provider-side coupon code used at sign-up. */
   couponCode?: string;
-  /** Human-readable coupon effect description (deferred) */
-  couponEffect?: string;
-  /** Admin notes (manual only) */
+
+  // Manual only:
   notes?: string;
-  /** Opaque provider metadata */
-  providerMeta?: Record<string, any>;
+  /** Admin user id who granted (audit metadata). */
+  grantedBy?: string;
+
   createdAt: string;
   updatedAt: string;
-  /**
-   * When set, this subscription is PAUSED: the guild isn't consuming its time
-   * because a higher-priority paid subscription took the active slot. The
-   * remaining days are frozen in `remainingDaysAtPause`; they're unpacked
-   * into a fresh endDate when the higher-priority sub ends and this one
-   * resumes. Lifetime subs carry `remainingDaysAtPause: null` to denote
-   * "unlimited remaining".
-   */
-  pausedAt?: string;
-  remainingDaysAtPause?: number | null;
 }
 
-/** Per-guild dual subscription record */
+/** Per-guild subscription record. */
 export interface GuildSubscriptions {
-  manual?: Subscription;
-  /** Currently-active paid subscription. At most one. */
-  paid?: Subscription;
+  /** Currently-effective subscription. At most one. */
+  active?: Subscription;
+  /** Priority desc; manual wins ties at equal priority. */
+  paused: Subscription[];
   /**
-   * Paid subscriptions paused by a higher-priority paid purchase. Ordered
-   * by tier priority descending so the highest-priority paused one resumes
-   * first when the active slot frees up.
+   * Optional fallback Discord channel id for subscription notifications when
+   * the bot can't DM the guild owner (DMs disabled, owner left guild, etc.).
+   * Default is the guild's system channel; admins override here. Empty / unset
+   * means "use system channel; if that's missing, log silently."
    */
-  pausedPaid?: Subscription[];
+  notificationsChannelId?: string;
 }
 
-/** Editable restriction messages shown when tier-gating blocks something */
+/** Editable restriction messages shown when tier-gating blocks something. */
 export interface PremiumMessages {
   moduleBlocked: string;
   commandBlocked: string;
@@ -136,85 +179,121 @@ export interface PremiumMessages {
 }
 
 /**
- * A coupon code an admin can define to grant a discount or bonus on a paid
- * subscription. Only one effect kind per coupon; providers apply it according
- * to their own mechanics (e.g. percentOff reduces the charged amount, extraDays
- * appends free time to the subscription period).
+ * A scheduled price/variant migration. Host announces "subscribers on
+ * variant X move to variant Y on DATE"; each affected guild owner gets a
+ * DM to accept or decline. On `effectiveDate` the scheduler walks
+ * decisions:
+ *   - accepted -> provider.migrateSubscriptionPrice(target)
+ *   - declined -> provider.cancelSubscription(soft) so the user rides
+ *                 out their period and leaves
+ *   - pending  -> apply host silence policy (cancel | continue)
  */
-export interface Coupon {
-  /** Opaque admin-facing label; not shown to end users unless the admin decides. */
-  description?: string;
-  /** Percent off the charged amount (0..100). Mutually exclusive with `extraDays`. */
-  percentOff?: number;
-  /** Extra subscription days appended to the initial period. Mutually exclusive with `percentOff`. */
-  extraDays?: number;
-  /** Maximum times this coupon can be redeemed across all guilds. Unlimited when absent. */
-  maxUses?: number;
-  /** How many times this coupon has been consumed so far. */
-  usedCount: number;
-  /** When the coupon was created. */
-  createdAt: string;
-  /** Optional expiry (ISO). Coupons past this date never validate. */
-  expiresAt?: string;
-  /**
-   * If set (non-empty), the coupon only applies when subscribing to one of
-   * these tier IDs. Omit / empty = global (applies to any tier). Free tier
-   * IDs are rejected at save time since you can't subscribe to Free.
-   */
-  allowedTiers?: string[];
+export type MigrationDecisionStatus = 'pending' | 'accepted' | 'declined' | 'silent-applied';
+export type MigrationOutcome = 'migrated' | 'cancelled' | 'continued' | 'failed' | 'skipped';
+
+export interface MigrationGuildDecision {
+  guildId: string;
+  /** Local Subscription.id at scheduling time. The actual sub may change
+   * before effectiveDate (cancel, swap), in which case apply skips. */
+  subscriptionId: string;
+  /** providerSubId snapshot at scheduling time, for the provider call. */
+  providerSubId: string;
+  decision: MigrationDecisionStatus;
+  decidedAt?: string;
+  notifiedAt?: string;
+  appliedAt?: string;
+  outcome?: MigrationOutcome;
+  /** Free-form note: "user already cancelled", "provider returned 422", etc. */
+  outcomeNote?: string;
 }
 
-/** Outcome of validating a coupon at subscribe time. */
-export interface CouponValidation {
-  valid: boolean;
-  /** Human-readable reason when invalid ("expired", "used up", "not found"). */
-  reason?: string;
-  /** The coupon record on success. */
-  coupon?: Coupon;
-  /** Short description the UI can surface (e.g. "20% off" or "+7 days"). */
-  effectText?: string;
-  /** Normalized effect the provider can apply mechanically. */
-  effect?: { percentOff?: number; extraDays?: number };
+export interface Migration {
+  id: string;
+  providerId: string;
+  sourceTierId: string;
+  sourceOfferingId: string;
+  sourceVariantId: string;
+  targetTierId: string;
+  targetOfferingId: string;
+  targetVariantId: string;
+  /** ISO timestamp when the scheduler will apply decisions. Spec says
+   * >=30 days from scheduling for compliance; we soft-validate (warn but
+   * allow) to keep the dev loop sane. */
+  effectiveDate: string;
+  /** Free-form announcement copy admins write, shown in subscriber DMs. */
+  message: string;
+  scheduledAt: string;
+  scheduledBy: string;
+  status: 'pending' | 'applied' | 'cancelled';
+  decisions: MigrationGuildDecision[];
+  appliedAt?: string;
 }
 
-/** Premium tiers configuration */
+/** Premium tiers configuration (no global coupons in the new model). */
 export interface PremiumConfig {
   tiers: Record<string, PremiumTier>;
-  /** Dual-layer subscriptions keyed by guildId */
   subscriptions: Record<string, GuildSubscriptions>;
-  /** Editable restriction messages */
   messages: PremiumMessages;
   /**
-   * Anti-duplicate registry for providers that link an external account (e.g. Patreon).
-   * providerAccountLinks[providerId][externalAccountId] = guildId
-   * Ensures a single external account cannot entitle multiple guilds simultaneously.
+   * Anti-duplicate registry for providers that link an external account.
+   * providerAccountLinks[providerId][externalAccountId] = guildId.
    */
   providerAccountLinks: Record<string, Record<string, string>>;
-  /**
-   * Host-activated payment providers. A provider MUST appear here with an entry
-   * to be usable for subscriptions. Default empty; host must explicitly activate.
-   */
   activatedProviders: Record<string, ActivatedProvider>;
+  /** Scheduled price/variant migrations (Stage 5). Pending entries get
+   * applied by the scheduler when their effectiveDate passes. */
+  migrations: Migration[];
   /**
-   * Admin-managed coupon registry keyed by coupon code (case-sensitive). Only
-   * providers with `capabilities.supportsCoupons` actually apply the effect;
-   * others ignore the coupon field at subscribe time.
+   * What to do for subscribers who never accept or decline a migration by
+   * its effective date. 'cancel' (default, pro-consumer) sets
+   * cancel_at_period_end so they ride out and leave. 'continue' applies
+   * the migration anyway - host accepts the "silence as consent"
+   * compliance burden. Toggleable in the admin UI with a confirmation.
    */
-  coupons: Record<string, Coupon>;
+  migrationSilencePolicy: 'cancel' | 'continue';
+}
+
+// ============================================================================
+// AUDIT LOG
+// ============================================================================
+
+/** A single append-only audit event. */
+export interface AuditEntry {
+  timestamp: string;
+  /** Always 'admin' for now (single-user admin auth); per-user when admin accounts land. */
+  actor: string;
+  action:
+    | 'tier.create' | 'tier.update' | 'tier.delete'
+    | 'offering.create' | 'offering.update' | 'offering.delete'
+    | 'provider.activation.set'
+    | 'subscription.grant.manual' | 'subscription.revoke.manual' | 'subscription.extend.manual'
+    | 'subscription.install.paid' | 'subscription.cancel.paid' | 'subscription.reactivate.paid'
+    | 'subscription.expire.paid' | 'subscription.pause' | 'subscription.resume'
+    | 'subscription.adopt.orphan' | 'subscription.cancel.orphan'
+    | 'message.update'
+    | 'migration.scheduled' | 'migration.cancelled' | 'migration.decision'
+    | 'migration.applied' | 'migration.silence-policy.set';
+  tierId?: string;
+  offeringId?: string;
+  providerId?: string;
+  subscriptionId?: string;
+  guildId?: string;
+  migrationId?: string;
+  before?: any;
+  after?: any;
+  metadata?: Record<string, any>;
 }
 
 // ============================================================================
 // DEFAULTS
 // ============================================================================
 
-/** Default restriction messages */
 export const DEFAULT_MESSAGES: PremiumMessages = {
   moduleBlocked: ':no_entry_sign: This module is not available for your server\'s current tier.',
   commandBlocked: ':no_entry_sign: This command is not available for your server\'s current tier.',
   panelBlocked: ':no_entry_sign: This module is not available for your server\'s current tier.',
 };
 
-/** Default configuration with free tier */
 const DEFAULT_CONFIG: PremiumConfig = {
   tiers: {
     free: {
@@ -222,51 +301,147 @@ const DEFAULT_CONFIG: PremiumConfig = {
       priority: 0,
       overrides: {},
       offerings: [],
-    }
+    },
   },
   subscriptions: {},
   messages: { ...DEFAULT_MESSAGES },
   providerAccountLinks: {},
   activatedProviders: {},
-  coupons: {},
+  migrations: [],
+  migrationSilencePolicy: 'cancel',
 };
 
+const CONFIG_PATH = '/data/global/premium-tiers.json';
+const AUDIT_PATH = '/data/global/premium-tiers.audit.jsonl';
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+let instance: PremiumManager | null = null;
+
+// ============================================================================
+// HELPERS
+// ============================================================================
+
+/** Generate a stable local id for a Subscription record. */
+function newSubscriptionId(): string {
+  return crypto.randomUUID();
+}
+
 /**
- * Normalize an offering that may have come from an older shape
- * (single `providerId` string + `providerConfig`) into the new multi-provider
- * `providerLinks` map. This is permissive read-time parsing, not a migration.
+ * Permissive read-time normalization of a ProviderLink. Drops obviously
+ * malformed entries and clamps mode/config to the discriminator. Disk format
+ * may carry partial data after admin saves; this keeps the in-memory shape
+ * sane.
+ */
+function normalizeProviderLink(raw: any): ProviderLink | null {
+  if (!raw || typeof raw !== 'object' || typeof raw.providerId !== 'string') return null;
+  const providerId = raw.providerId;
+  const enabled = !!raw.enabled;
+  const mode: 'price' | 'product' = raw.mode === 'product' ? 'product' : 'price';
+  const link: ProviderLink = { providerId, enabled, mode };
+
+  if (mode === 'price') {
+    const entries = Array.isArray(raw.priceConfig?.entries)
+      ? raw.priceConfig.entries
+          .filter((e: any) => e && typeof e.variantId === 'string')
+          .map((e: any) => ({
+            variantId: e.variantId,
+            ...(typeof e.labelOverride === 'string' && e.labelOverride !== '' ? { labelOverride: e.labelOverride } : {}),
+          }))
+      : [];
+    link.priceConfig = { entries };
+  } else {
+    link.productConfig = {
+      productId: typeof raw.productConfig?.productId === 'string' ? raw.productConfig.productId : '',
+      ...(raw.productConfig?.useProviderHostedPicker ? { useProviderHostedPicker: true } : {}),
+    };
+  }
+
+  if (raw.cache && typeof raw.cache === 'object') {
+    const variants = Array.isArray(raw.cache.variants)
+      ? raw.cache.variants.filter((v: any) => v && typeof v.variantId === 'string')
+      : [];
+    link.cache = {
+      syncedAt: typeof raw.cache.syncedAt === 'string' ? raw.cache.syncedAt : '',
+      variants,
+      ...(typeof raw.cache.productLabel === 'string' ? { productLabel: raw.cache.productLabel } : {}),
+      ...(typeof raw.cache.productDescription === 'string' ? { productDescription: raw.cache.productDescription } : {}),
+    };
+  }
+  return link;
+}
+
+/**
+ * Normalize a TierOffering coming off disk. Drops malformed providerLinks
+ * entries; keeps the minimal valid shape so tsc + the resolver don't crash.
  */
 function normalizeOffering(raw: any): TierOffering {
-  const providerLinks: Record<string, TierProviderLink> =
-    (raw.providerLinks && typeof raw.providerLinks === 'object')
-      ? { ...raw.providerLinks }
-      : {};
-  // Legacy: single providerId + providerConfig -> one enabled link
-  if (!Object.keys(providerLinks).length && typeof raw.providerId === 'string') {
-    providerLinks[raw.providerId] = {
-      enabled: true,
-      config: raw.providerConfig || undefined,
-    };
+  const providerLinks: ProviderLink[] = [];
+  if (Array.isArray(raw.providerLinks)) {
+    for (const r of raw.providerLinks) {
+      const link = normalizeProviderLink(r);
+      if (link) providerLinks.push(link);
+    }
+  }
+  // primaryProviderId only stays if it points to an enabled link.
+  let primaryProviderId: string | undefined;
+  if (typeof raw.primaryProviderId === 'string' && raw.primaryProviderId !== '') {
+    if (providerLinks.some(l => l.providerId === raw.primaryProviderId && l.enabled)) {
+      primaryProviderId = raw.primaryProviderId;
+    }
   }
   return {
     id: raw.id,
     label: raw.label,
     description: typeof raw.description === 'string' ? raw.description : undefined,
-    durationDays: raw.durationDays ?? null,
-    autoRenewEligible: !!raw.autoRenewEligible,
-    amount: typeof raw.amount === 'number' ? raw.amount : undefined,
-    currency: typeof raw.currency === 'string' ? raw.currency : undefined,
+    icon: typeof raw.icon === 'string' ? raw.icon : undefined,
     providerLinks,
-    icon: raw.icon,
+    forceAutoRenew: !!raw.forceAutoRenew,
+    primaryProviderId,
   };
 }
 
 /**
- * Structural value equality. Used for comparing override values (primitives,
- * arrays like `_disabledCommands`, or nested objects like `_hardLimits`).
- * Array order is ignored: a tier's disabled-commands list that matches Free's
- * is considered equal regardless of insertion order.
+ * Normalize a Subscription coming off disk. Backfills `id` for old records,
+ * coerces status to the new three-value enum, and ensures the GuildSubscriptions
+ * shape (active + paused: []).
  */
+function normalizeSubscription(raw: any): Subscription | null {
+  if (!raw || typeof raw !== 'object') return null;
+  if (typeof raw.tierId !== 'string') return null;
+  const source: SubscriptionSource = raw.source === 'paid' ? 'paid' : 'manual';
+  let status: SubscriptionStatus;
+  if (raw.status === 'paused') status = 'paused';
+  else if (raw.status === 'expired') status = 'expired';
+  else status = 'active';
+  const sub: Subscription = {
+    id: typeof raw.id === 'string' && raw.id !== '' ? raw.id : newSubscriptionId(),
+    tierId: raw.tierId,
+    source,
+    offeringId: typeof raw.offeringId === 'string' ? raw.offeringId : undefined,
+    variantId: typeof raw.variantId === 'string' ? raw.variantId : undefined,
+    providerId: typeof raw.providerId === 'string' ? raw.providerId : undefined,
+    providerSubId: typeof raw.providerSubId === 'string' ? raw.providerSubId : undefined,
+    providerMeta: raw.providerMeta && typeof raw.providerMeta === 'object' ? raw.providerMeta : undefined,
+    purchasedSnapshot: raw.purchasedSnapshot && typeof raw.purchasedSnapshot === 'object' ? raw.purchasedSnapshot : undefined,
+    startDate: typeof raw.startDate === 'string' ? raw.startDate : new Date().toISOString(),
+    endDate: typeof raw.endDate === 'string' ? raw.endDate : null,
+    autoRenew: !!raw.autoRenew,
+    status,
+    pausedAt: typeof raw.pausedAt === 'string' ? raw.pausedAt : undefined,
+    remainingDaysAtPause: typeof raw.remainingDaysAtPause === 'number' || raw.remainingDaysAtPause === null
+      ? raw.remainingDaysAtPause
+      : undefined,
+    resumesAtHint: typeof raw.resumesAtHint === 'string' ? raw.resumesAtHint : undefined,
+    couponCode: typeof raw.couponCode === 'string' ? raw.couponCode : undefined,
+    notes: typeof raw.notes === 'string' ? raw.notes : undefined,
+    grantedBy: typeof raw.grantedBy === 'string' ? raw.grantedBy : undefined,
+    createdAt: typeof raw.createdAt === 'string' ? raw.createdAt : new Date().toISOString(),
+    updatedAt: typeof raw.updatedAt === 'string' ? raw.updatedAt : new Date().toISOString(),
+  };
+  return sub;
+}
+
+/** Structural value equality used for redundant-vs-Free checks. */
 function deepEqual(a: any, b: any): boolean {
   if (a === b) return true;
   if (a == null || b == null) return false;
@@ -289,29 +464,18 @@ function deepEqual(a: any, b: any): boolean {
 
 /**
  * Free's "effective" module-override as seen by non-Free tiers. When Free
- * disables a module entirely (_moduleEnabled === false), the only meaningful
- * baseline it contributes is "module off"; its per-command / per-setting
- * values are moot on a disabled module and must not ghost-lock non-Free
- * tiers. So we collapse Free's contribution down to `{ _moduleEnabled: false }`
- * in that case.
+ * disables a module entirely, the only meaningful baseline is "module off";
+ * its per-command / per-setting state is moot on a disabled module.
  */
-function effectiveFreeModuleOverride(
-  freeMod: Record<string, any> | undefined
-): Record<string, any> {
+function effectiveFreeModuleOverride(freeMod: Record<string, any> | undefined): Record<string, any> {
   if (!freeMod) return {};
   if (freeMod._moduleEnabled === false) return { _moduleEnabled: false };
   return freeMod;
 }
 
-/**
- * True when every key a tier's module-override sets matches Free's effective
- * value for that key. Such a module entry contributes no delta: dropping it
- * leaves the effective merge identical, since keys Free has but tier doesn't
- * are already inherited.
- */
 function moduleOverrideRedundantVsFree(
   tierMod: Record<string, any>,
-  freeMod: Record<string, any>
+  freeMod: Record<string, any>,
 ): boolean {
   const effectiveFree = effectiveFreeModuleOverride(freeMod);
   const keys = Object.keys(tierMod || {});
@@ -322,77 +486,194 @@ function moduleOverrideRedundantVsFree(
   return true;
 }
 
-const CONFIG_PATH = '/data/global/premium-tiers.json';
-const DAY_MS = 24 * 60 * 60 * 1000;
-
-/** Singleton instance */
-let instance: PremiumManager | null = null;
-
 // ============================================================================
 // MANAGER
 // ============================================================================
 
 export class PremiumManager {
   private config: PremiumConfig;
-  private configLoaded: boolean = false;
-  // Track mtime so readers in one process pick up writes made by another
-  // process (bot vs. forked web-UI share this file).
-  private configMtimeMs: number = 0;
+  /**
+   * Manual-grant ids that have already received the "ending in 24h"
+   * heads-up notification, so the ticker doesn't re-DM the same warning
+   * every minute. Cleared when the sub is no longer active (expired,
+   * revoked, or removed) so a re-grant of the same id (impossible today,
+   * but cheap insurance) gets a fresh notification window.
+   */
+  private endingSoonNotified: Set<string> = new Set();
+  private configLoaded = false;
+  private configMtimeMs = 0;
   private expiryTimer: NodeJS.Timeout | null = null;
 
-  /** Listener for paid-provider events; mirrors state into the cache. */
+  /** Listener: mirror provider events into the cache. */
   private paidEventHandler = (event: ProviderEvent): void => {
     this.ensureLoaded();
+
+    if (event.type === 'subscription.created') {
+      void this.installAsyncSubscription(event).catch(err => {
+        console.error('[PremiumManager] installAsyncSubscription failed:', err);
+      });
+      return;
+    }
+
+    // For lifecycle events on existing subs, find the record (active or paused)
+    // by providerSubId and update in place.
     const subs = this.config.subscriptions[event.guildId];
-    if (!subs?.paid) return;
-    if (subs.paid.providerSubId !== event.providerSubId) return;
+    if (!subs) return;
 
-    const paid = subs.paid;
+    const matching = this.findSubscriptionByProviderSubId(subs, event.providerSubId);
+    if (!matching) return;
+    const { sub } = matching;
+
+    // Renewal failure is a notification-only event - no cache state change.
+    // Provider owns the dunning timeline; if it gives up, a separate
+    // subscription.expired event fires and triggers the standard expiry path.
+    if (event.type === 'subscription.renewal-failed') {
+      void dispatchPremiumNotification(event.guildId, 'paid.sub.renewal-failed', {
+        tierName: this.config.tiers[sub.tierId]?.displayName || sub.tierId,
+        providerName: this.providerDisplayName(event.providerId),
+        details: event.reason,
+      });
+      return;
+    }
+
+    // subscription.paused is informational from the provider side: the cache
+    // already flipped status to 'paused' when WE moved the sub into the queue.
+    // Update resumesAtHint to whatever the provider reported.
+    if (event.type === 'subscription.paused') {
+      if (event.resumesAt) sub.resumesAtHint = event.resumesAt;
+      sub.updatedAt = new Date().toISOString();
+      this.save();
+      return;
+    }
+
+    // Remaining events all carry `state`.
     const s = event.state;
-    paid.startDate = s.startDate;
-    paid.endDate = s.endDate;
-    paid.autoRenew = s.autoRenew;
-    // Provider 'cancelled' means autoRenew off but still active until
-    // endDate. Only 'expired' ends the subscription in our cache.
-    if (s.status === 'expired') paid.status = 'expired';
-    else paid.status = 'active';
-    paid.providerMeta = s.meta;
-    paid.updatedAt = new Date().toISOString();
+    sub.startDate = s.startDate;
+    sub.endDate = s.endDate;
+    sub.autoRenew = s.autoRenew;
+    sub.providerMeta = s.meta;
+    sub.updatedAt = new Date().toISOString();
 
-    // On expiry, free the active paid slot so any paused stack entry can
-    // resume into it. We keep the expired record out of the slot rather
-    // than leaving it there blocking resumption; the provider still holds
-    // the historical record for auditing.
-    if (paid.status === 'expired') {
-      delete subs.paid;
-      this.resumeHighestPausedPaid(event.guildId);
+    // Map provider status back to our three-value enum.
+    if (s.status === 'expired') sub.status = 'expired';
+    else if (s.status === 'paused') sub.status = 'paused';
+    else sub.status = 'active';
+
+    // If the active sub just expired, drop it from the slot and resume queue.
+    if (matching.location === 'active' && sub.status === 'expired') {
+      this.writeAudit({
+        timestamp: new Date().toISOString(),
+        actor: 'admin',
+        action: 'subscription.expire.paid',
+        guildId: event.guildId,
+        subscriptionId: sub.id,
+        providerId: event.providerId,
+      });
+      void dispatchPremiumNotification(event.guildId, 'paid.sub.expired', {
+        tierName: this.config.tiers[sub.tierId]?.displayName || sub.tierId,
+        providerName: this.providerDisplayName(event.providerId),
+      });
+      delete subs.active;
+      this.resumeNext(event.guildId);
     }
 
     this.save();
   };
 
+  /**
+   * Async install: webhook-driven providers fire `subscription.created` after
+   * a successful checkout. Construct the cache record, snapshot, and route
+   * through `installSubscription` so stacking rules apply uniformly.
+   */
+  private async installAsyncSubscription(
+    event: Extract<ProviderEvent, { type: 'subscription.created' }>,
+  ): Promise<void> {
+    // Idempotency: webhook deliveries are at-least-once.
+    if (this.findGuildSubscriptionByProviderSubId(event.guildId, event.providerSubId)) return;
+
+    const tier = this.config.tiers[event.tierId];
+    if (!tier) {
+      console.warn(`[PremiumManager] subscription.created for unknown tier '${event.tierId}' (provider=${event.providerId}, sub=${event.providerSubId})`);
+      return;
+    }
+    const offering = tier.offerings.find(o => o.id === event.offeringId);
+    if (!offering) {
+      console.warn(`[PremiumManager] subscription.created for unknown offering '${event.offeringId}' on tier '${event.tierId}'`);
+      return;
+    }
+
+    const variant = event.variantSnapshot
+      ?? this.findCachedVariant(offering, event.providerId, event.variantId);
+
+    const purchasedSnapshot = this.buildPurchasedSnapshot(
+      tier,
+      offering,
+      variant,
+      event.providerId,
+    );
+
+    const nowIso = new Date().toISOString();
+    const sub: Subscription = {
+      id: newSubscriptionId(),
+      tierId: event.tierId,
+      source: 'paid',
+      offeringId: event.offeringId,
+      variantId: event.variantId,
+      providerId: event.providerId,
+      providerSubId: event.providerSubId,
+      providerMeta: event.state.meta,
+      purchasedSnapshot,
+      startDate: event.state.startDate,
+      endDate: event.state.endDate,
+      autoRenew: event.state.autoRenew,
+      status: event.state.status === 'expired' ? 'expired'
+        : event.state.status === 'paused' ? 'paused'
+        : 'active',
+      couponCode: event.couponCode,
+      createdAt: nowIso,
+      updatedAt: nowIso,
+    };
+
+    await this.installSubscription(event.guildId, sub);
+    this.writeAudit({
+      timestamp: nowIso,
+      actor: 'admin',
+      action: 'subscription.install.paid',
+      guildId: event.guildId,
+      tierId: event.tierId,
+      offeringId: event.offeringId,
+      providerId: event.providerId,
+      subscriptionId: sub.id,
+      metadata: { variantId: event.variantId },
+    });
+    void dispatchPremiumNotification(event.guildId, 'paid.sub.started', {
+      tierName: tier.displayName,
+      providerName: this.providerDisplayName(event.providerId),
+      endDate: sub.endDate,
+    });
+  }
+
   constructor() {
     this.config = JSON.parse(JSON.stringify(DEFAULT_CONFIG));
-    // Listen for paid-provider events and mirror them into the cache.
     getPaymentRegistry().on('provider.event', this.paidEventHandler);
   }
 
-  /** Release the registry listener and scheduled tasks. */
   dispose(): void {
     this.stopExpiryChecker();
     getPaymentRegistry().off('provider.event', this.paidEventHandler);
   }
 
-  /** Load configuration from disk */
+  // ============================================================================
+  // CONFIG I/O
+  // ============================================================================
+
   load(): void {
     try {
       ensureDir(path.dirname(CONFIG_PATH));
-
       if (fs.existsSync(CONFIG_PATH)) {
         const content = fs.readFileSync(CONFIG_PATH, 'utf-8');
         const loaded = JSON.parse(content) as Partial<PremiumConfig>;
 
-        // Default-merge each field. Missing fields fall back to defaults.
         const mergedTiers: Record<string, PremiumTier> = {};
         for (const [id, t] of Object.entries(loaded.tiers || {})) {
           const tier = t as any;
@@ -411,19 +692,40 @@ export class PremiumManager {
           offerings: [],
         };
 
+        // Normalize each guild's subscription record into the new shape.
+        const subscriptions: Record<string, GuildSubscriptions> = {};
+        for (const [guildId, raw] of Object.entries(loaded.subscriptions || {})) {
+          const r = raw as any;
+          const active = r?.active ? normalizeSubscription(r.active) : null;
+          const pausedRaw = Array.isArray(r?.paused) ? r.paused : [];
+          const paused = pausedRaw
+            .map(normalizeSubscription)
+            .filter((s: Subscription | null): s is Subscription => !!s);
+          const notificationsChannelId = typeof r?.notificationsChannelId === 'string' && r.notificationsChannelId.length > 0
+            ? r.notificationsChannelId
+            : undefined;
+          if (active || paused.length > 0 || notificationsChannelId) {
+            subscriptions[guildId] = {
+              ...(active ? { active } : {}),
+              paused,
+              ...(notificationsChannelId ? { notificationsChannelId } : {}),
+            };
+          }
+        }
+
         this.config = {
           tiers: mergedTiers,
-          subscriptions: loaded.subscriptions || {},
+          subscriptions,
           messages: { ...DEFAULT_MESSAGES, ...(loaded.messages || {}) },
           providerAccountLinks: loaded.providerAccountLinks || {},
           activatedProviders: loaded.activatedProviders || {},
-          coupons: loaded.coupons || {},
+          migrations: Array.isArray(loaded.migrations) ? loaded.migrations : [],
+          migrationSilencePolicy: (loaded.migrationSilencePolicy === 'continue' ? 'continue' : 'cancel'),
         };
         try { this.configMtimeMs = fs.statSync(CONFIG_PATH).mtimeMs; } catch { /* ignore */ }
       } else {
         this.save();
       }
-
       this.configLoaded = true;
     } catch (error) {
       console.error('[PremiumManager] Failed to load config:', error);
@@ -431,7 +733,6 @@ export class PremiumManager {
     }
   }
 
-  /** Save configuration to disk */
   save(): boolean {
     try {
       ensureDir(path.dirname(CONFIG_PATH));
@@ -445,9 +746,8 @@ export class PremiumManager {
   }
 
   /**
-   * Ensure config is loaded and up-to-date with the on-disk copy.
-   * Bot and web-UI run as separate processes; a write from one must be
-   * visible to the other, so we re-read when the file's mtime advances.
+   * Ensure config is loaded and up-to-date with disk. Bot and forked web-UI
+   * processes share the file; mtime check picks up cross-process writes.
    */
   private ensureLoaded(): void {
     if (!this.configLoaded) {
@@ -458,6 +758,76 @@ export class PremiumManager {
       const mtime = fs.statSync(CONFIG_PATH).mtimeMs;
       if (mtime > this.configMtimeMs) this.load();
     } catch { /* file missing; next read will recreate via load() */ }
+  }
+
+  // ============================================================================
+  // AUDIT LOG
+  // ============================================================================
+
+  /**
+   * Append a single audit entry. Best-effort: failures log but don't throw,
+   * so a failing audit write doesn't block the operation that produced it.
+   */
+  private writeAudit(entry: AuditEntry): void {
+    try {
+      ensureDir(path.dirname(AUDIT_PATH));
+      fs.appendFileSync(AUDIT_PATH, JSON.stringify(entry) + '\n', 'utf-8');
+    } catch (err) {
+      console.error('[PremiumManager] writeAudit failed:', err);
+    }
+  }
+
+  /**
+   * Read the audit log with optional filters. Returns newest-first up to
+   * `limit` entries (default 500, hard cap 5000 to keep responses bounded).
+   * Reads the entire file synchronously - acceptable while the log is
+   * append-only and the volume stays in admin-action territory; revisit
+   * with a tail-reverse-stream if it ever grows past tens of MB.
+   *
+   * Bad lines are skipped silently (a partial-write or hand-edit shouldn't
+   * tear down the whole viewer). Filter values are exact-match except for
+   * `from` / `to` which are timestamp boundaries (inclusive).
+   */
+  readAuditEntries(filters: {
+    from?: string;
+    to?: string;
+    action?: string;
+    tierId?: string;
+    providerId?: string;
+    guildId?: string;
+    subscriptionId?: string;
+    limit?: number;
+  } = {}): { entries: AuditEntry[]; total: number; truncated: boolean } {
+    const limit = Math.max(1, Math.min(filters.limit ?? 500, 5000));
+    if (!fs.existsSync(AUDIT_PATH)) {
+      return { entries: [], total: 0, truncated: false };
+    }
+    const raw = fs.readFileSync(AUDIT_PATH, 'utf-8');
+    const lines = raw.split('\n');
+    const matched: AuditEntry[] = [];
+    let totalParsed = 0;
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      let entry: AuditEntry;
+      try {
+        entry = JSON.parse(trimmed);
+      } catch {
+        continue;
+      }
+      totalParsed++;
+      if (filters.from && entry.timestamp < filters.from) continue;
+      if (filters.to && entry.timestamp > filters.to) continue;
+      if (filters.action && entry.action !== filters.action) continue;
+      if (filters.tierId && entry.tierId !== filters.tierId) continue;
+      if (filters.providerId && entry.providerId !== filters.providerId) continue;
+      if (filters.guildId && entry.guildId !== filters.guildId) continue;
+      if (filters.subscriptionId && entry.subscriptionId !== filters.subscriptionId) continue;
+      matched.push(entry);
+    }
+    matched.reverse();
+    const truncated = matched.length > limit;
+    return { entries: matched.slice(0, limit), total: totalParsed, truncated };
   }
 
   // ============================================================================
@@ -476,58 +846,174 @@ export class PremiumManager {
 
   setTier(tierId: string, tier: PremiumTier): boolean {
     this.ensureLoaded();
+    const before = this.config.tiers[tierId] ? JSON.parse(JSON.stringify(this.config.tiers[tierId])) : null;
     if (tierId === 'free') {
-      // Free tier invariants: priority=0, no offerings.
       this.config.tiers.free = {
         displayName: tier.displayName || 'Free',
         priority: 0,
         overrides: tier.overrides || {},
         offerings: [],
       };
-      // Free just changed: retroactively sanitize + prune every non-Free tier.
-      // Sanitize strips any worse-than-Free violations that the new baseline
-      // exposed (e.g. tier had a command disabled that Free now enables);
-      // prune drops entries that are now redundant with Free.
+      // Free changed: re-sanitize + re-prune every other tier against the new baseline.
       for (const [otherId, other] of Object.entries(this.config.tiers)) {
         if (otherId === 'free') continue;
         other.overrides = this.pruneOverridesAgainstFree(
-          this.sanitizeTierAgainstFree(other.overrides)
+          this.sanitizeTierAgainstFree(other.overrides),
         );
       }
     } else {
       this.config.tiers[tierId] = {
         displayName: tier.displayName,
         priority: tier.priority,
-        // Sanitize first (never store worse-than-Free state) then strip module
-        // entries that duplicate Free's baseline. The two together keep tier
-        // storage honest: no ghost restrictions, no redundant matches.
         overrides: this.pruneOverridesAgainstFree(
-          this.sanitizeTierAgainstFree(tier.overrides || {})
+          this.sanitizeTierAgainstFree(tier.overrides || {}),
         ),
         offerings: (tier.offerings || []).map(normalizeOffering),
       };
     }
-    return this.save();
+    const ok = this.save();
+    if (ok) {
+      this.writeAudit({
+        timestamp: new Date().toISOString(),
+        actor: 'admin',
+        action: before ? 'tier.update' : 'tier.create',
+        tierId,
+        before,
+        after: this.config.tiers[tierId],
+      });
+      // Notify subscribers only when the change made the tier stricter -
+      // beneficial changes (more features, higher limits) don't need a DM.
+      if (before && this.tierChangeIsStricter(before, this.config.tiers[tierId])) {
+        const after = this.config.tiers[tierId];
+        for (const [guildId, subs] of Object.entries(this.config.subscriptions)) {
+          const onThisTier = subs.active?.tierId === tierId
+            || subs.paused.some(p => p.tierId === tierId);
+          if (!onThisTier) continue;
+          void dispatchPremiumNotification(guildId, 'tier.config-change-affecting-subscriber', {
+            tierName: after.displayName,
+            details: 'Some perks or limits were reduced. Open the subscription panel to see the latest tier contents.',
+          });
+        }
+      }
+    }
+    return ok;
   }
 
   /**
-   * Strip any tier-override state that would make the tier WORSE than Free
-   * (more restrictive than the baseline Free offers). This runs before
-   * `pruneOverridesAgainstFree` so the two together leave the tier with:
-   *   - no redundant overrides (match Free exactly => dropped)
-   *   - no worse-than-Free violations (stale state after Free's state moved)
+   * "Stricter" heuristic for tier-config-change notifications. Returns true
+   * when any of these hold for `after` vs `before`:
+   *   - A module override key disappears entirely
+   *   - A boolean override flips true -> false
+   *   - A numeric override decreases
+   *   - A `_hardLimits` numeric value decreases or key disappears
    *
-   * Current rules (direction-aware keys only):
-   *   - `_moduleEnabled: false` is stripped when Free enables the module.
-   *   - `_disabledCommands` is filtered to the subset Free also disables,
-   *     unless Free disables the whole module (then tier is free to disable
-   *     anything it wants inside its enabled-by-override module).
-   *
-   * Setting values are left alone: their "worse" direction isn't declared in
-   * the schema yet, so we don't have a reliable rule for them.
+   * Pure additions / increases / new modules are NOT stricter and don't
+   * warrant a DM. False positives are tolerable; false negatives just mean
+   * the user finds out via the UI on next load.
+   */
+  private tierChangeIsStricter(before: PremiumTier, after: PremiumTier): boolean {
+    const beforeOv = before.overrides || {};
+    const afterOv = after.overrides || {};
+    for (const moduleName of Object.keys(beforeOv)) {
+      const beforeMod = beforeOv[moduleName];
+      const afterMod = afterOv[moduleName];
+      if (!afterMod) return true;
+      if (!beforeMod || typeof beforeMod !== 'object') continue;
+      for (const key of Object.keys(beforeMod)) {
+        const b = (beforeMod as any)[key];
+        const a = (afterMod as any)[key];
+        if (a === undefined) return true;
+        if (typeof b === 'boolean' && typeof a === 'boolean' && b === true && a === false) return true;
+        if (typeof b === 'number' && typeof a === 'number' && a < b) return true;
+        if (key === '_hardLimits' && b && typeof b === 'object' && a && typeof a === 'object') {
+          for (const limitKey of Object.keys(b)) {
+            const bl = (b as any)[limitKey];
+            const al = (a as any)[limitKey];
+            if (al === undefined) return true;
+            if (typeof bl === 'number' && typeof al === 'number' && al < bl) return true;
+          }
+        }
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Delete a tier (cannot delete 'free'). Revokes any active or paused
+   * subscriptions on that tier; resumes the next paused entry into the
+   * active slot if active was on the deleted tier.
+   */
+  deleteTier(tierId: string): boolean {
+    this.ensureLoaded();
+
+    if (tierId === 'free') {
+      console.error('[PremiumManager] Cannot delete the free tier');
+      return false;
+    }
+    const before = this.config.tiers[tierId];
+    if (!before) return false;
+
+    for (const guildId of Object.keys(this.config.subscriptions)) {
+      const subs = this.config.subscriptions[guildId];
+      const activeWasOnDeleted = subs.active?.tierId === tierId;
+      if (activeWasOnDeleted) delete subs.active;
+      if (subs.paused.length > 0) {
+        subs.paused = subs.paused.filter(p => p.tierId !== tierId);
+      }
+      // Pop the next paused entry if active is now empty.
+      if (!subs.active && subs.paused.length > 0) {
+        this.resumeNext(guildId);
+      }
+      if (this.guildSubsEmpty(subs)) delete this.config.subscriptions[guildId];
+    }
+
+    delete this.config.tiers[tierId];
+    const ok = this.save();
+    if (ok) {
+      this.writeAudit({
+        timestamp: new Date().toISOString(),
+        actor: 'admin',
+        action: 'tier.delete',
+        tierId,
+        before,
+      });
+    }
+    return ok;
+  }
+
+  private guildSubsEmpty(subs: GuildSubscriptions): boolean {
+    if (subs.active) return false;
+    if (subs.paused.length > 0) return false;
+    if (subs.notificationsChannelId) return false;
+    return true;
+  }
+
+  /**
+   * Look up a friendly provider display name. Falls back to the providerId
+   * if the registry doesn't have it (provider unregistered after a sub was
+   * installed). Returns undefined when no providerId given so callers can
+   * skip the "(provider)" suffix in messages.
+   */
+  private providerDisplayName(providerId?: string): string | undefined {
+    if (!providerId) return undefined;
+    return getPaymentRegistry().get(providerId)?.displayName || providerId;
+  }
+
+  getTiersSortedByPriority(): Array<{ id: string; tier: PremiumTier }> {
+    this.ensureLoaded();
+    return Object.entries(this.config.tiers)
+      .map(([id, tier]) => ({ id, tier }))
+      .sort((a, b) => a.tier.priority - b.tier.priority);
+  }
+
+  /**
+   * Strip tier-override state worse-than-Free. Direction-aware keys only:
+   *   - `_moduleEnabled: false` removed when Free enables the module
+   *   - `_disabledCommands` filtered to subset of Free's, unless Free disables the module entirely
+   * Setting values are left alone (no general worse-than schema).
    */
   private sanitizeTierAgainstFree(
-    tierOverrides: Record<string, Record<string, any>>
+    tierOverrides: Record<string, Record<string, any>>,
   ): Record<string, Record<string, any>> {
     const freeOverrides = this.config.tiers.free?.overrides || {};
     const result: Record<string, Record<string, any>> = {};
@@ -536,14 +1022,9 @@ export class PremiumManager {
       const sanitized: Record<string, any> = { ...tierMod };
       const freeModuleOff = freeMod._moduleEnabled === false;
 
-      // Rule 1: tier can't disable a module Free enables.
       if (sanitized._moduleEnabled === false && !freeModuleOff) {
         delete sanitized._moduleEnabled;
       }
-
-      // Rule 2: tier's disabled-command list must be a subset of Free's own.
-      // Skip when Free's module is off (Free doesn't offer any commands there,
-      // so tier's command-level state inside its own enabled override is free).
       if (!freeModuleOff && Array.isArray(sanitized._disabledCommands)) {
         const freeDisabled = Array.isArray(freeMod._disabledCommands) ? freeMod._disabledCommands : [];
         const allowedSet = new Set(freeDisabled);
@@ -551,20 +1032,14 @@ export class PremiumManager {
         if (filtered.length === 0) delete sanitized._disabledCommands;
         else sanitized._disabledCommands = filtered;
       }
-
       if (Object.keys(sanitized).length > 0) result[moduleName] = sanitized;
     }
     return result;
   }
 
-  /**
-   * Remove module-level override entries that duplicate what the Free tier
-   * already implies. A module entry is "redundant" when every key it sets
-   * equals Free's value for that key: dropping the entry lets the tier keep
-   * inheriting Free's baseline with no observable difference.
-   */
+  /** Drop module entries fully redundant vs Free's effective baseline. */
   private pruneOverridesAgainstFree(
-    tierOverrides: Record<string, Record<string, any>>
+    tierOverrides: Record<string, Record<string, any>>,
   ): Record<string, Record<string, any>> {
     const freeOverrides = this.config.tiers.free?.overrides || {};
     const result: Record<string, Record<string, any>> = {};
@@ -577,87 +1052,39 @@ export class PremiumManager {
   }
 
   // ============================================================================
-  // ACTIVATED PROVIDERS: host-wide enable/disable of payment methods
+  // ACTIVATED PROVIDERS
   // ============================================================================
 
-  /** Return the current activation map. Empty by default. */
   getActivatedProviders(): Record<string, ActivatedProvider> {
     this.ensureLoaded();
     return { ...this.config.activatedProviders };
   }
 
-  /** True when the given provider id is activated system-wide. */
   isProviderActivated(providerId: string): boolean {
     this.ensureLoaded();
     return !!this.config.activatedProviders[providerId];
   }
 
-  /**
-   * Toggle a provider's activation.
-   * `activated=false` removes the entry (and any `defaultEnabled` setting).
-   * `activated=true` creates / updates the entry with the given `defaultEnabled`.
-   */
-  setProviderActivation(providerId: string, activated: boolean, defaultEnabled: boolean = false): boolean {
+  setProviderActivation(providerId: string, activated: boolean, defaultEnabled = false): boolean {
     this.ensureLoaded();
+    const before = this.config.activatedProviders[providerId];
     if (!activated) {
       delete this.config.activatedProviders[providerId];
     } else {
       this.config.activatedProviders[providerId] = { defaultEnabled: !!defaultEnabled };
     }
-    return this.save();
-  }
-
-  /** Delete a tier (cannot delete 'free'). Revokes any subscriptions on that tier. */
-  deleteTier(tierId: string): boolean {
-    this.ensureLoaded();
-
-    if (tierId === 'free') {
-      console.error('[PremiumManager] Cannot delete the free tier');
-      return false;
+    const ok = this.save();
+    if (ok) {
+      this.writeAudit({
+        timestamp: new Date().toISOString(),
+        actor: 'admin',
+        action: 'provider.activation.set',
+        providerId,
+        before,
+        after: this.config.activatedProviders[providerId],
+      });
     }
-
-    if (!this.config.tiers[tierId]) return false;
-
-    for (const guildId of Object.keys(this.config.subscriptions)) {
-      const subs = this.config.subscriptions[guildId];
-      if (subs.manual?.tierId === tierId) delete subs.manual;
-      if (subs.paid?.tierId === tierId) delete subs.paid;
-      // Evict any paused paid subs of the deleted tier; if the active slot
-      // is now free as a result of the delete above, let the next paused
-      // sub in line (if any) resume into it so the guild isn't stuck at Free
-      // while it still owns a lower-priority paused sub.
-      if (subs.pausedPaid && subs.pausedPaid.length > 0) {
-        subs.pausedPaid = subs.pausedPaid.filter(p => p.tierId !== tierId);
-        if (subs.pausedPaid.length === 0) delete subs.pausedPaid;
-      }
-      if (!subs.paid && subs.pausedPaid && subs.pausedPaid.length > 0) {
-        this.resumeHighestPausedPaid(guildId);
-      }
-      if (this.guildSubsEmpty(subs)) delete this.config.subscriptions[guildId];
-    }
-
-    delete this.config.tiers[tierId];
-    return this.save();
-  }
-
-  /**
-   * True when a `GuildSubscriptions` entry has no remaining state (no manual,
-   * no active paid, no paused paid). Used to safely prune the per-guild
-   * record without losing a paused queue that would otherwise become
-   * unreachable.
-   */
-  private guildSubsEmpty(subs: GuildSubscriptions): boolean {
-    if (subs.manual) return false;
-    if (subs.paid) return false;
-    if (subs.pausedPaid && subs.pausedPaid.length > 0) return false;
-    return true;
-  }
-
-  getTiersSortedByPriority(): Array<{ id: string; tier: PremiumTier }> {
-    this.ensureLoaded();
-    return Object.entries(this.config.tiers)
-      .map(([id, tier]) => ({ id, tier }))
-      .sort((a, b) => a.tier.priority - b.tier.priority);
+    return ok;
   }
 
   // ============================================================================
@@ -665,42 +1092,348 @@ export class PremiumManager {
   // ============================================================================
 
   /**
-   * Resolve the effective tier for a guild across both subscription layers.
-   * Picks the highest-priority non-expired active subscription; ties go to manual.
-   * Falls back to Free when no active subscription exists.
+   * Resolve the effective tier for a guild. Reads the active slot directly:
+   * if it's still active and not past its endDate, return its tier. Else Free.
    */
   resolveActiveTier(guildId: string): { tierId: string; tier: PremiumTier; source: SubscriptionSource | null } {
     this.ensureLoaded();
     const subs = this.config.subscriptions[guildId];
     const now = Date.now();
+    const active = subs?.active;
 
-    const candidates: Array<{ sub: Subscription; tier: PremiumTier; tierId: string }> = [];
+    if (active
+      && active.status === 'active'
+      && (active.endDate === null || Date.parse(active.endDate) > now)
+    ) {
+      const tier = this.config.tiers[active.tierId];
+      if (tier) return { tierId: active.tierId, tier, source: active.source };
+    }
 
-    if (subs) {
-      for (const source of ['manual', 'paid'] as SubscriptionSource[]) {
-        const sub = subs[source];
-        if (!sub) continue;
-        if (sub.status !== 'active') continue;
-        if (sub.endDate !== null && Date.parse(sub.endDate) <= now) continue;
-        const tier = this.config.tiers[sub.tierId];
-        if (!tier) continue;
-        candidates.push({ sub, tier, tierId: sub.tierId });
+    return { tierId: 'free', tier: this.config.tiers.free, source: null };
+  }
+
+  // ============================================================================
+  // SUBSCRIPTION INSTALL / STACKING
+  // ============================================================================
+
+  /**
+   * Build a PurchasedSnapshot for a Subscription record being installed now.
+   * Mixes the variant returned by the provider (or cached) with the tier +
+   * offering display data PM has at install time.
+   */
+  private buildPurchasedSnapshot(
+    tier: PremiumTier,
+    offering: TierOffering,
+    variant: OfferingVariant | null | undefined,
+    providerId?: string,
+  ): PurchasedSnapshot {
+    // Honor admin label overrides at snapshot time so the user's record
+    // freezes the label they actually saw at sign-up. Product mode keeps
+    // overrides in `productConfig.variantLabelOverrides`; Price mode bakes
+    // overrides directly into the cached `OfferingVariant.label`, so the
+    // raw `variant.label` is already correct in that path.
+    let variantLabel = variant?.label ?? '';
+    if (variant && providerId && offering?.providerLinks) {
+      const link = offering.providerLinks.find(l => l.providerId === providerId);
+      if (link?.mode === 'product') {
+        const override = link.productConfig?.variantLabelOverrides?.[variant.variantId];
+        if (override) variantLabel = override;
       }
     }
+    return {
+      offeringLabel: offering.label,
+      variantLabel,
+      amount: variant?.amount ?? 0,
+      currency: variant?.currency ?? '',
+      durationDays: variant?.durationDays ?? null,
+      ...(variant?.trialDays !== undefined ? { trialDays: variant.trialDays } : {}),
+      tierDisplayName: tier.displayName,
+      tierPriority: tier.priority,
+      purchasedAt: new Date().toISOString(),
+    };
+  }
 
-    if (candidates.length === 0) {
-      return { tierId: 'free', tier: this.config.tiers.free, source: null };
+  /**
+   * Find a cached variant on an offering's provider link by variantId. Used
+   * during async install when the event didn't carry a snapshot.
+   */
+  private findCachedVariant(
+    offering: TierOffering,
+    providerId: string,
+    variantId: string | undefined,
+  ): OfferingVariant | null {
+    if (!variantId) return null;
+    const link = offering.providerLinks.find(l => l.providerId === providerId);
+    if (!link?.cache?.variants) return null;
+    return link.cache.variants.find(v => v.variantId === variantId) || null;
+  }
+
+  /**
+   * Look up a Subscription on a guild by providerSubId. Returns where it lives
+   * (active vs paused index) so the caller can mutate in place.
+   */
+  private findSubscriptionByProviderSubId(
+    subs: GuildSubscriptions,
+    providerSubId: string,
+  ): { sub: Subscription; location: 'active' | 'paused'; pausedIndex?: number } | null {
+    if (subs.active?.providerSubId === providerSubId) {
+      return { sub: subs.active, location: 'active' };
+    }
+    const idx = subs.paused.findIndex(p => p.providerSubId === providerSubId);
+    if (idx >= 0) return { sub: subs.paused[idx], location: 'paused', pausedIndex: idx };
+    return null;
+  }
+
+  /** Cross-guild lookup helper for orphan dedup. */
+  private findGuildSubscriptionByProviderSubId(guildId: string, providerSubId: string): Subscription | null {
+    const subs = this.config.subscriptions[guildId];
+    if (!subs) return null;
+    return this.findSubscriptionByProviderSubId(subs, providerSubId)?.sub || null;
+  }
+
+  /**
+   * Insertion point for both manual grants and paid installs. Routes the new
+   * sub into the active slot or paused queue per the unified rules:
+   *   higher priority -> active pauses, new becomes active
+   *   same priority + manual -> active pauses, manual replaces (manual wins ties)
+   *   same priority + paid   -> caller already rejected; defensive throw here
+   *   lower priority -> insert into paused queue at correct position
+   */
+  private async installSubscription(guildId: string, incoming: Subscription): Promise<void> {
+    const subs = (this.config.subscriptions[guildId] ??= { paused: [] });
+    const incomingPriority = this.config.tiers[incoming.tierId]?.priority ?? 0;
+
+    const active = subs.active;
+    const activeAlive = active
+      && active.status === 'active'
+      && (active.endDate === null || Date.parse(active.endDate) > Date.now());
+
+    if (!activeAlive) {
+      // No active sub (or it's expired): incoming becomes active.
+      if (active) delete subs.active;
+      subs.active = incoming;
+      this.save();
+      return;
     }
 
-    candidates.sort((a, b) => {
-      if (b.tier.priority !== a.tier.priority) return b.tier.priority - a.tier.priority;
-      if (a.sub.source === 'manual' && b.sub.source !== 'manual') return -1;
-      if (b.sub.source === 'manual' && a.sub.source !== 'manual') return 1;
+    const activePriority = this.config.tiers[active!.tierId]?.priority ?? 0;
+
+    if (incomingPriority > activePriority) {
+      await this.pauseActiveIntoQueue(guildId);
+      subs.active = incoming;
+      this.save();
+      return;
+    }
+
+    if (incomingPriority === activePriority) {
+      if (incoming.source === 'manual') {
+        // Manual replaces (manual wins ties at equal priority).
+        await this.pauseActiveIntoQueue(guildId);
+        subs.active = incoming;
+        this.save();
+        return;
+      }
+      // Same-priority paid: caller is expected to reject upstream.
+      throw new Error(
+        `You already have a '${this.config.tiers[active!.tierId]?.displayName || active!.tierId}' subscription. ` +
+        `Stacking requires distinct priorities; cancel or let the existing one expire first.`,
+      );
+    }
+
+    // Lower priority: insert into paused queue at correct position.
+    const nowIso = new Date().toISOString();
+    const paused: Subscription = {
+      ...incoming,
+      status: 'paused',
+      pausedAt: nowIso,
+      remainingDaysAtPause: incoming.endDate === null
+        ? null
+        : Math.max(0, Math.ceil((Date.parse(incoming.endDate) - Date.now()) / DAY_MS)),
+      resumesAtHint: active!.endDate || undefined,
+      updatedAt: nowIso,
+    };
+    subs.paused.push(paused);
+    this.sortPausedQueue(subs);
+
+    // Best-effort provider pause for paid: the sub was just created as
+    // active at the provider; we want it frozen until our resume gives
+    // it new dates.
+    if (paused.source === 'paid' && paused.providerId && paused.providerSubId) {
+      const provider = getPaymentRegistry().get(paused.providerId);
+      if (provider?.pauseSubscription && provider.capabilities.supportsPause) {
+        try { await provider.pauseSubscription(paused.providerSubId, active!.endDate); }
+        catch (err: any) {
+          console.warn(`[PremiumManager] provider pauseSubscription failed for '${paused.providerId}': ${err?.message || err}`);
+        }
+      }
+    }
+    this.save();
+  }
+
+  /**
+   * Move the currently-active subscription to the paused queue. Snapshots
+   * remaining days, calls provider.pauseSubscription for paid subs, sorts the
+   * queue priority-desc.
+   */
+  private async pauseActiveIntoQueue(guildId: string): Promise<void> {
+    const subs = this.config.subscriptions[guildId];
+    if (!subs?.active) return;
+    const cur = subs.active;
+    const nowIso = new Date().toISOString();
+    const now = Date.now();
+
+    let remaining: number | null;
+    if (cur.endDate === null) {
+      remaining = null; // lifetime
+    } else {
+      remaining = Math.max(0, Math.ceil((Date.parse(cur.endDate) - now) / DAY_MS));
+    }
+    if (remaining === 0) {
+      // Nothing left: drop outright instead of queueing.
+      delete subs.active;
+      return;
+    }
+
+    const paused: Subscription = {
+      ...cur,
+      status: 'paused',
+      pausedAt: nowIso,
+      remainingDaysAtPause: remaining,
+      updatedAt: nowIso,
+    };
+    subs.paused.push(paused);
+    this.sortPausedQueue(subs);
+    delete subs.active;
+
+    // Best-effort provider pause for paid subs.
+    if (paused.source === 'paid' && paused.providerId && paused.providerSubId) {
+      const provider = getPaymentRegistry().get(paused.providerId);
+      if (provider?.pauseSubscription && provider.capabilities.supportsPause) {
+        try { await provider.pauseSubscription(paused.providerSubId, null); }
+        catch (err: any) {
+          console.warn(`[PremiumManager] provider pauseSubscription failed for '${paused.providerId}': ${err?.message || err}`);
+        }
+      }
+    }
+    this.writeAudit({
+      timestamp: nowIso,
+      actor: 'admin',
+      action: 'subscription.pause',
+      guildId,
+      subscriptionId: paused.id,
+      providerId: paused.providerId,
+    });
+    if (paused.source === 'paid') {
+      void dispatchPremiumNotification(guildId, 'paid.sub.paused-by-stacking', {
+        tierName: this.config.tiers[paused.tierId]?.displayName || paused.tierId,
+        providerName: this.providerDisplayName(paused.providerId),
+        remainingDays: paused.remainingDaysAtPause ?? null,
+      });
+    }
+  }
+
+  /**
+   * Sort the paused queue priority-desc, with manual winning over paid at
+   * equal priority (so manual resumes first when the active slot frees up).
+   */
+  private sortPausedQueue(subs: GuildSubscriptions): void {
+    subs.paused.sort((a, b) => {
+      const pa = this.config.tiers[a.tierId]?.priority ?? 0;
+      const pb = this.config.tiers[b.tierId]?.priority ?? 0;
+      if (pa !== pb) return pb - pa;
+      if (a.source === 'manual' && b.source !== 'manual') return -1;
+      if (b.source === 'manual' && a.source !== 'manual') return 1;
       return 0;
     });
+  }
 
-    const winner = candidates[0];
-    return { tierId: winner.tierId, tier: winner.tier, source: winner.sub.source };
+  /**
+   * If the active slot is empty and the paused queue is non-empty, pop the
+   * highest-priority entry, stamp fresh dates from its remaining-days
+   * snapshot, and install as active. For paid subs, call provider.resumeSub
+   * fire-and-forget (cache is authoritative; provider state catches up).
+   *
+   * Repeats if the popped entry is itself already past its endDate (lossy
+   * pauses can race expiry).
+   */
+  private resumeNext(guildId: string): void {
+    const subs = this.config.subscriptions[guildId];
+    if (!subs) return;
+    while (!subs.active && subs.paused.length > 0) {
+      const next = subs.paused.shift()!;
+      const nowIso = new Date().toISOString();
+      const newEndDate: string | null = next.remainingDaysAtPause == null
+        ? null
+        : new Date(Date.now() + next.remainingDaysAtPause * DAY_MS).toISOString();
+
+      const resumed: Subscription = {
+        ...next,
+        startDate: nowIso,
+        endDate: newEndDate,
+        status: 'active',
+        updatedAt: nowIso,
+        pausedAt: undefined,
+        remainingDaysAtPause: undefined,
+        resumesAtHint: undefined,
+      };
+      // Past-endDate after restoration would mean 0 remaining-days at pause:
+      // skip and try the next one. Use the right action verb per source so
+      // the audit trail doesn't mislabel a manual expiry as paid.
+      if (resumed.endDate !== null && Date.parse(resumed.endDate) <= Date.now()) {
+        this.writeAudit({
+          timestamp: nowIso,
+          actor: 'admin',
+          action: resumed.source === 'manual'
+            ? 'subscription.revoke.manual'
+            : 'subscription.expire.paid',
+          guildId,
+          subscriptionId: resumed.id,
+          providerId: resumed.providerId,
+          metadata: { reason: 'expired-while-queued' },
+        });
+        // The user already got a "paused-by-stacking" notification when this
+        // entry went into the queue; it never resumes, so close the loop with
+        // an "ended" notification matching its source.
+        if (resumed.source === 'manual') {
+          void dispatchPremiumNotification(guildId, 'manual.grant.ended', {
+            tierName: this.config.tiers[resumed.tierId]?.displayName || resumed.tierId,
+          });
+        } else {
+          void dispatchPremiumNotification(guildId, 'paid.sub.expired', {
+            tierName: this.config.tiers[resumed.tierId]?.displayName || resumed.tierId,
+            providerName: this.providerDisplayName(resumed.providerId),
+          });
+        }
+        continue;
+      }
+      subs.active = resumed;
+
+      // Best-effort provider resume for paid subs.
+      if (resumed.source === 'paid' && resumed.providerId && resumed.providerSubId) {
+        const provider = getPaymentRegistry().get(resumed.providerId);
+        if (provider?.resumeSubscription && provider.capabilities.supportsPause) {
+          provider.resumeSubscription(resumed.providerSubId, newEndDate).catch((err: any) => {
+            console.warn(`[PremiumManager] provider resumeSubscription failed for '${resumed.providerId}': ${err?.message || err}`);
+          });
+        }
+      }
+      this.writeAudit({
+        timestamp: nowIso,
+        actor: 'admin',
+        action: 'subscription.resume',
+        guildId,
+        subscriptionId: resumed.id,
+        providerId: resumed.providerId,
+      });
+      if (resumed.source === 'paid') {
+        void dispatchPremiumNotification(guildId, 'paid.sub.resumed-from-queue', {
+          tierName: this.config.tiers[resumed.tierId]?.displayName || resumed.tierId,
+          providerName: this.providerDisplayName(resumed.providerId),
+          endDate: resumed.endDate,
+        });
+      }
+      break;
+    }
   }
 
   // ============================================================================
@@ -708,19 +1441,26 @@ export class PremiumManager {
   // ============================================================================
 
   /**
-   * Grant (or replace) a manual subscription for a guild.
-   * durationDays: null = open-ended (Lifetime manual grant).
+   * Grant a manual subscription. Routes through stacking insertion: if active
+   * is higher priority, manual goes to paused queue; if active is lower,
+   * manual takes the active slot; same priority manual replaces (manual wins ties).
    */
-  grantManual(guildId: string, tierId: string, durationDays: number | null, notes?: string): boolean {
+  async grantManual(
+    guildId: string,
+    tierId: string,
+    durationDays: number | null,
+    notes?: string,
+    grantedBy?: string,
+  ): Promise<boolean> {
     this.ensureLoaded();
     if (tierId === 'free' || !this.config.tiers[tierId]) return false;
+    const tier = this.config.tiers[tierId];
 
     const nowIso = new Date().toISOString();
-    const endDate = durationDays === null
-      ? null
-      : new Date(Date.now() + durationDays * DAY_MS).toISOString();
+    const endDate = durationDays === null ? null : new Date(Date.now() + durationDays * DAY_MS).toISOString();
 
     const sub: Subscription = {
+      id: newSubscriptionId(),
       tierId,
       source: 'manual',
       startDate: nowIso,
@@ -728,84 +1468,125 @@ export class PremiumManager {
       autoRenew: false,
       status: 'active',
       notes,
+      grantedBy,
+      purchasedSnapshot: {
+        offeringLabel: '',
+        variantLabel: '',
+        amount: 0,
+        currency: '',
+        durationDays,
+        tierDisplayName: tier.displayName,
+        tierPriority: tier.priority,
+        purchasedAt: nowIso,
+      },
       createdAt: nowIso,
       updatedAt: nowIso,
     };
 
-    if (!this.config.subscriptions[guildId]) this.config.subscriptions[guildId] = {};
-    this.config.subscriptions[guildId].manual = sub;
-    return this.save();
-  }
-
-  /** Add addDays to the manual subscription's endDate. No-op for Lifetime manual. */
-  extendManual(guildId: string, addDays: number): boolean {
-    this.ensureLoaded();
-    const existing = this.config.subscriptions[guildId]?.manual;
-    if (!existing) return false;
-    if (existing.endDate === null) return true;
-
-    const base = Math.max(Date.parse(existing.endDate), Date.now());
-    existing.endDate = new Date(base + addDays * DAY_MS).toISOString();
-    existing.updatedAt = new Date().toISOString();
-    if (existing.status === 'expired' && Date.parse(existing.endDate) > Date.now()) {
-      existing.status = 'active';
-    }
-    return this.save();
-  }
-
-  /** Revoke the manual subscription entirely. */
-  revokeManual(guildId: string): boolean {
-    this.ensureLoaded();
-    const subs = this.config.subscriptions[guildId];
-    if (!subs?.manual) return true;
-    delete subs.manual;
-    if (this.guildSubsEmpty(subs)) delete this.config.subscriptions[guildId];
-    return this.save();
-  }
-
-  // ============================================================================
-  // PAID SUBSCRIPTIONS: provider-owned cache
-  //
-  // The provider is the source of truth. PremiumManager caches the current
-  // state; providers push updates via their event bus.
-  // ============================================================================
-
-  /** Write / overwrite the paid subscription cache for a guild. */
-  setPaidSubscription(guildId: string, sub: Subscription): boolean {
-    this.ensureLoaded();
-    if (sub.source !== 'paid') return false;
-    if (!this.config.subscriptions[guildId]) this.config.subscriptions[guildId] = {};
-    this.config.subscriptions[guildId].paid = sub;
-    return this.save();
-  }
-
-  /** Remove the paid subscription cache entry for a guild. */
-  clearPaidSubscription(guildId: string): boolean {
-    this.ensureLoaded();
-    const subs = this.config.subscriptions[guildId];
-    if (!subs?.paid) return true;
-    delete subs.paid;
-    // Let the next paused sub (if any) resume into the now-free active slot
-    // so cancellation/clearing doesn't trap a queued lower-priority sub.
-    if (subs.pausedPaid && subs.pausedPaid.length > 0) {
-      this.resumeHighestPausedPaid(guildId);
-    }
-    if (this.guildSubsEmpty(subs)) delete this.config.subscriptions[guildId];
-    return this.save();
+    await this.installSubscription(guildId, sub);
+    this.writeAudit({
+      timestamp: nowIso,
+      actor: 'admin',
+      action: 'subscription.grant.manual',
+      guildId,
+      tierId,
+      subscriptionId: sub.id,
+      metadata: { durationDays, notes, grantedBy },
+    });
+    void dispatchPremiumNotification(guildId, 'manual.grant.added', {
+      tierName: tier.displayName,
+      endDate,
+      notes,
+    });
+    return true;
   }
 
   /**
-   * Initiate a paid subscription through the offering's provider.
-   * Synchronous providers (Dummy) return `state` immediately and the cache
-   * record is written here. Asynchronous providers (Stripe / Discord /
-   * Patreon) return a redirect / handoff / oauthUrl; their cache record
-   * lands later via the provider.event listener once the purchase completes.
+   * Add days to the active manual sub's endDate. No-op for lifetime manual.
+   * Doesn't touch paused-queue manuals (those don't tick yet).
+   */
+  extendManual(guildId: string, addDays: number): boolean {
+    this.ensureLoaded();
+    const subs = this.config.subscriptions[guildId];
+    const active = subs?.active;
+    if (!active || active.source !== 'manual') return false;
+    if (active.endDate === null) return true;
+
+    const before = active.endDate;
+    const base = Math.max(Date.parse(active.endDate), Date.now());
+    active.endDate = new Date(base + addDays * DAY_MS).toISOString();
+    active.updatedAt = new Date().toISOString();
+    if (active.status === 'expired' && Date.parse(active.endDate) > Date.now()) {
+      active.status = 'active';
+    }
+    const ok = this.save();
+    if (ok) {
+      this.writeAudit({
+        timestamp: new Date().toISOString(),
+        actor: 'admin',
+        action: 'subscription.extend.manual',
+        guildId,
+        subscriptionId: active.id,
+        metadata: { addDays, before, after: active.endDate },
+      });
+    }
+    return ok;
+  }
+
+  /**
+   * Revoke the manual subscription entirely (active OR paused). Resumes the
+   * next paused entry into the active slot if active was the manual.
+   */
+  revokeManual(guildId: string): boolean {
+    this.ensureLoaded();
+    const subs = this.config.subscriptions[guildId];
+    if (!subs) return true;
+
+    let removed: Subscription | null = null;
+    if (subs.active?.source === 'manual') {
+      removed = subs.active;
+      delete subs.active;
+      this.resumeNext(guildId);
+    } else {
+      const idx = subs.paused.findIndex(p => p.source === 'manual');
+      if (idx >= 0) {
+        removed = subs.paused[idx];
+        subs.paused.splice(idx, 1);
+      }
+    }
+    if (this.guildSubsEmpty(subs)) delete this.config.subscriptions[guildId];
+
+    const ok = this.save();
+    if (ok && removed) {
+      this.writeAudit({
+        timestamp: new Date().toISOString(),
+        actor: 'admin',
+        action: 'subscription.revoke.manual',
+        guildId,
+        tierId: removed.tierId,
+        subscriptionId: removed.id,
+      });
+      void dispatchPremiumNotification(guildId, 'manual.grant.revoked', {
+        tierName: this.config.tiers[removed.tierId]?.displayName || removed.tierId,
+      });
+    }
+    return ok;
+  }
+
+  // ============================================================================
+  // PAID SUBSCRIPTIONS
+  // ============================================================================
+
+  /**
+   * Initiate a paid subscription. Sync providers (Dummy) install inline;
+   * async providers (Stripe / LS / PayPal) return a redirect/handoff URL and
+   * install via `subscription.created` after the webhook arrives.
    */
   async initiatePaidSubscription(
     guildId: string,
     tierId: string,
     offeringId: string,
-    opts: { providerId: string; couponCode?: string; userId?: string }
+    opts: { providerId: string; variantId: string; couponCode?: string; userId?: string; autoRenewOptOut?: boolean },
   ): Promise<InitiateResult> {
     this.ensureLoaded();
     const tier = this.config.tiers[tierId];
@@ -817,8 +1598,9 @@ export class PremiumManager {
 
     const providerId = opts.providerId;
     if (!providerId) throw new Error('providerId is required');
+    if (!opts.variantId) throw new Error('variantId is required');
 
-    const link = offering.providerLinks[providerId];
+    const link = offering.providerLinks.find(l => l.providerId === providerId);
     if (!link || !link.enabled) {
       throw new Error(`Offering '${offeringId}' is not available through provider '${providerId}'`);
     }
@@ -834,289 +1616,368 @@ export class PremiumManager {
       throw new Error(`Provider '${providerId}' cannot initiate purchase server-side`);
     }
 
-    // Validate coupon BEFORE the provider call: we reject here so the provider
-    // never sees a bad code, and we don't want to leak "provider supports
-    // coupons" semantics to the caller. Only providers whose capabilities
-    // advertise coupon support see the normalized effect passed in. The
-    // target tier is passed so tier-restricted coupons validate correctly.
-    let couponValidation: CouponValidation | undefined;
-    if (opts.couponCode) {
-      couponValidation = this.validateCoupon(opts.couponCode, tierId);
-      if (!couponValidation.valid) {
-        throw new Error(`Coupon invalid: ${couponValidation.reason || 'not accepted'}`);
-      }
-      if (!provider.capabilities.supportsCoupons) {
-        throw new Error(`Provider '${providerId}' does not accept coupons`);
+    // Pre-flight orphan check: refuse if the provider already has an
+    // unknown sub for this guild.
+    if (provider.listSubscriptionsForGuild) {
+      try {
+        const orphans = await provider.listSubscriptionsForGuild(guildId);
+        const known = this.knownProviderSubIds(guildId);
+        const truly = orphans.filter(r => !known.has(`${providerId}:${r.providerSubId}`));
+        if (truly.length > 0) {
+          const ids = truly.map(r => r.providerSubId).join(', ');
+          throw new Error(
+            `Provider '${providerId}' already has ${truly.length} subscription(s) for this guild that aren't tracked locally (${ids}). ` +
+            `Adopt or cancel them in the Subscriptions panel before starting a new one.`,
+          );
+        }
+      } catch (err: any) {
+        if (err?.message?.startsWith(`Provider '${providerId}' already has`)) throw err;
+        console.warn(`[PremiumManager] orphan pre-flight failed for '${providerId}' guild ${guildId}: ${err?.message || err}`);
       }
     }
 
-    // Stacking rules:
-    //   - HIGHER priority than the active paid sub: new one takes the active
-    //     slot, the existing paid pauses into the queue with its remaining
-    //     days snapshotted.
-    //   - LOWER priority than the active paid sub: new one installs directly
-    //     into the paused queue (never active until every higher-priority sub
-    //     above it ends). The offering's duration becomes its remaining-days-
-    //     at-pause; lifetime stays lifetime.
-    //   - SAME priority as any existing paid (active or paused): reject. You
-    //     can't own two plans at the same tier level; at most one wins the
-    //     active slot and the other is redundant.
-    const guildSubs = this.config.subscriptions[guildId];
+    // Coupon pre-validation via the provider (provider is source of truth).
+    let couponValidation: ProviderCouponValidation | undefined;
+    if (opts.couponCode) {
+      if (!provider.capabilities.supportsCoupons) {
+        throw new Error(`Provider '${providerId}' does not accept coupons`);
+      }
+      if (!provider.validateCoupon) {
+        throw new Error(`Provider '${providerId}' declared coupon support but does not implement validateCoupon`);
+      }
+      couponValidation = await provider.validateCoupon(opts.couponCode, opts.variantId);
+      if (!couponValidation.valid) {
+        throw new Error(`Coupon invalid: ${couponValidation.reason || 'not accepted'}`);
+      }
+    }
+
+    // Stacking conflict check: same-priority paid is rejected.
     const newPriority = tier.priority;
+    const guildSubs = this.config.subscriptions[guildId];
     const conflictingExisting = [
-      guildSubs?.paid,
-      ...(guildSubs?.pausedPaid || []),
+      guildSubs?.active,
+      ...(guildSubs?.paused || []),
     ].find((s): s is Subscription => {
       if (!s) return false;
+      if (s.source !== 'paid') return false;
       const exPriority = this.config.tiers[s.tierId]?.priority ?? 0;
       return exPriority === newPriority;
     });
     if (conflictingExisting) {
-      const name = this.config.tiers[conflictingExisting.tierId]?.displayName || conflictingExisting.tierId;
+      const existingName = this.config.tiers[conflictingExisting.tierId]?.displayName || conflictingExisting.tierId;
+      const newName = tier.displayName;
+      const sameTier = conflictingExisting.tierId === tierId;
       throw new Error(
-        `You already have a '${name}' subscription at this tier level. ` +
-        `Stacking requires distinct priorities: cancel or let the existing one expire first.`
+        sameTier
+          ? `You already have a '${existingName}' subscription. ` +
+            `Cancel or let the existing one expire first.`
+          : `You already have a '${existingName}' subscription at the same priority as '${newName}'. ` +
+            `Stacking requires distinct priorities: cancel or let the existing one expire first.`,
       );
     }
+
+    // Auto-renew intent: respect variant.recurring, force-flag, opt-out.
+    const variant = link.cache?.variants.find(v => v.variantId === opts.variantId)
+      || (provider.fetchVariant ? await provider.fetchVariant(opts.variantId).catch(() => null) : null);
+    const recurring = !!variant?.recurring;
+    const autoRenewIntent = recurring
+      ? (offering.forceAutoRenew ? true : !opts.autoRenewOptOut)
+      : false;
+
+    // Compute startPausedUntil if going into paused queue (lower priority than active).
+    const active = guildSubs?.active;
+    const activeAlive = active
+      && active.status === 'active'
+      && (active.endDate === null || Date.parse(active.endDate) > Date.now());
+    const willGoToQueue = activeAlive && (this.config.tiers[active!.tierId]?.priority ?? 0) > newPriority;
+    const startPausedUntil = willGoToQueue ? active!.endDate : undefined;
 
     const result = await provider.initiatePurchase({
       guildId,
       tierId,
       offeringId,
-      durationDays: offering.durationDays,
-      amount: offering.amount,
-      currency: offering.currency,
-      providerConfig: link.config,
+      variantId: opts.variantId,
+      autoRenew: autoRenewIntent,
       couponCode: opts.couponCode,
       userId: opts.userId,
+      startPausedUntil,
     });
 
+    // Sync providers (Dummy) fill state and providerSubId; install inline.
     if (result.state && result.providerSubId) {
       const nowIso = new Date().toISOString();
+      const variantSnapshot = result.variantSnapshot || variant || null;
       const sub: Subscription = {
+        id: newSubscriptionId(),
         tierId,
         source: 'paid',
         offeringId,
+        variantId: opts.variantId,
         providerId,
         providerSubId: result.providerSubId,
+        providerMeta: result.state.meta,
+        purchasedSnapshot: this.buildPurchasedSnapshot(tier, offering, variantSnapshot, providerId),
         startDate: result.state.startDate,
         endDate: result.state.endDate,
         autoRenew: result.state.autoRenew,
-        status: result.state.status === 'expired' ? 'expired' : 'active',
+        status: result.state.status === 'expired' ? 'expired'
+          : result.state.status === 'paused' ? 'paused'
+          : 'active',
         couponCode: opts.couponCode,
-        couponEffect: couponValidation?.effectText,
-        providerMeta: result.state.meta,
         createdAt: nowIso,
         updatedAt: nowIso,
       };
-      // Route to active or paused slot based on priority vs the currently
-      // active paid sub.
-      await this.installPaidSubscription(guildId, sub, offering.durationDays);
-      // Only consume on synchronous success. Async providers consume via
-      // provider.event once the purchase completes on their end.
-      if (opts.couponCode) this.consumeCoupon(opts.couponCode);
+      await this.installSubscription(guildId, sub);
+      this.writeAudit({
+        timestamp: nowIso,
+        actor: 'admin',
+        action: 'subscription.install.paid',
+        guildId,
+        tierId,
+        offeringId,
+        providerId,
+        subscriptionId: sub.id,
+        metadata: { variantId: opts.variantId, couponCode: opts.couponCode },
+      });
+      void dispatchPremiumNotification(guildId, 'paid.sub.started', {
+        tierName: tier.displayName,
+        providerName: this.providerDisplayName(providerId),
+        endDate: sub.endDate,
+      });
     }
 
     return result;
   }
 
   /**
-   * Route a newly-purchased paid subscription into the correct slot based on
-   * priority vs the current active paid sub:
-   *
-   *   - No active paid (or same priority: already rejected upstream): install as active.
-   *   - New priority > active priority: pause the active one, new takes the active slot.
-   *   - New priority < active priority: install directly into the paused queue
-   *     with remaining-days = the offering's full duration (lifetime stays null).
-   *     Best-effort provider pause so it doesn't tick while waiting.
+   * Soft-cancel the active paid sub (autoRenew off, keeps remaining days).
+   * Provider's own state is the source of truth; webhook will eventually
+   * reflect the change. We propagate provider errors so the UI shows the
+   * actual cause instead of a false-positive success.
    */
-  private async installPaidSubscription(
-    guildId: string,
-    sub: Subscription,
-    offeringDurationDays: number | null
-  ): Promise<void> {
-    const subs = (this.config.subscriptions[guildId] = this.config.subscriptions[guildId] || {});
-    const newPriority = this.config.tiers[sub.tierId]?.priority ?? 0;
-    const activePriority = subs.paid && subs.paid.status === 'active'
-      ? (this.config.tiers[subs.paid.tierId]?.priority ?? 0)
-      : -Infinity;
-
-    if (newPriority > activePriority) {
-      // Higher: pause existing into the queue, take the active slot.
-      await this.pauseCurrentPaidIfAny(guildId);
-      subs.paid = sub;
-      this.save();
-      return;
-    }
-
-    // Lower than active (same was rejected upstream): install as paused.
-    const nowIso = new Date().toISOString();
-    const paused: Subscription = {
-      ...sub,
-      pausedAt: nowIso,
-      remainingDaysAtPause: offeringDurationDays,
-      updatedAt: nowIso,
-    };
-    if (!subs.pausedPaid) subs.pausedPaid = [];
-    subs.pausedPaid.push(paused);
-    subs.pausedPaid.sort((a, b) => {
-      const pA = this.config.tiers[a.tierId]?.priority ?? 0;
-      const pB = this.config.tiers[b.tierId]?.priority ?? 0;
-      return pB - pA;
-    });
-
-    // Best-effort provider pause: the sub was just created as active at the
-    // provider; we want it frozen until our resume later gives it new dates.
-    if (paused.providerId && paused.providerSubId) {
-      const provider = getPaymentRegistry().get(paused.providerId);
-      if (provider?.pauseSubscription && provider.capabilities.supportsPause) {
-        try { await provider.pauseSubscription(paused.providerSubId); }
-        catch (err: any) {
-          console.warn(`[PremiumManager] provider pauseSubscription failed for '${paused.providerId}': ${err?.message || err}`);
-        }
-      }
-    }
-    this.save();
-  }
-
-  /**
-   * Pause the currently-active paid subscription (if any) and push it into
-   * the paused-paid stack. Remaining days at pause time are frozen so the
-   * sub can resume with the right amount of time when the higher-priority
-   * purchase ends. Lifetime subs carry `remainingDaysAtPause: null`.
-   *
-   * Calls the provider's optional `pauseSubscription` so its own ticking /
-   * billing stops. Providers without pause support still work, but their
-   * internal state may drift while paused; resume overwrites it.
-   */
-  private async pauseCurrentPaidIfAny(guildId: string): Promise<void> {
-    const subs = this.config.subscriptions[guildId];
-    if (!subs?.paid || subs.paid.status !== 'active') return;
-    const cur = subs.paid;
-    const now = Date.now();
-    const nowIso = new Date().toISOString();
-
-    let remaining: number | null;
-    if (cur.endDate === null) {
-      remaining = null; // lifetime
-    } else {
-      const msLeft = Date.parse(cur.endDate) - now;
-      const days = Math.ceil(msLeft / DAY_MS);
-      remaining = Math.max(0, days);
-    }
-
-    // No time left and not lifetime: drop outright instead of queueing.
-    if (remaining === 0) {
-      delete subs.paid;
-      return;
-    }
-
-    const paused: Subscription = {
-      ...cur,
-      pausedAt: nowIso,
-      remainingDaysAtPause: remaining,
-      updatedAt: nowIso,
-    };
-
-    if (!subs.pausedPaid) subs.pausedPaid = [];
-    subs.pausedPaid.push(paused);
-    // Keep the stack sorted highest-priority-first so `resumeHighestPausedPaid`
-    // can always take index 0.
-    subs.pausedPaid.sort((a, b) => {
-      const pA = this.config.tiers[a.tierId]?.priority ?? 0;
-      const pB = this.config.tiers[b.tierId]?.priority ?? 0;
-      return pB - pA;
-    });
-
-    delete subs.paid;
-
-    // Best-effort provider pause.
-    if (paused.providerId && paused.providerSubId) {
-      const provider = getPaymentRegistry().get(paused.providerId);
-      if (provider?.pauseSubscription && provider.capabilities.supportsPause) {
-        try { await provider.pauseSubscription(paused.providerSubId); }
-        catch (err: any) {
-          console.warn(`[PremiumManager] provider pauseSubscription failed for '${paused.providerId}': ${err?.message || err}`);
-        }
-      }
-    }
-  }
-
-  /**
-   * If the active paid slot is empty and there's a paused queue, resume the
-   * highest-priority paused entry: give it a fresh startDate and an endDate
-   * computed from its remaining-days-at-pause snapshot. Lifetime paused subs
-   * resume with endDate=null.
-   */
-  private resumeHighestPausedPaid(guildId: string): void {
-    const subs = this.config.subscriptions[guildId];
-    if (!subs) return;
-    if (subs.paid && subs.paid.status === 'active') return;
-    if (!subs.pausedPaid || subs.pausedPaid.length === 0) return;
-
-    const paused = subs.pausedPaid.shift()!;
-    if (subs.pausedPaid.length === 0) delete subs.pausedPaid;
-
-    const now = Date.now();
-    const nowIso = new Date().toISOString();
-    const newEndDate: string | null = paused.remainingDaysAtPause == null
-      ? null
-      : new Date(now + paused.remainingDaysAtPause * DAY_MS).toISOString();
-
-    const resumed: Subscription = {
-      ...paused,
-      startDate: nowIso,
-      endDate: newEndDate,
-      status: 'active',
-      updatedAt: nowIso,
-      pausedAt: undefined,
-      remainingDaysAtPause: undefined,
-    };
-
-    subs.paid = resumed;
-
-    // Best-effort provider resume (fire-and-forget: the cache is authoritative
-    // from here; provider state just needs to match).
-    if (resumed.providerId && resumed.providerSubId) {
-      const provider = getPaymentRegistry().get(resumed.providerId);
-      if (provider?.resumeSubscription && provider.capabilities.supportsPause) {
-        provider.resumeSubscription(resumed.providerSubId, newEndDate).catch((err: any) => {
-          console.warn(`[PremiumManager] provider resumeSubscription failed for '${resumed.providerId}': ${err?.message || err}`);
-        });
-      }
-    }
-  }
-
-  /** Cancel a paid subscription (flips autoRenew off, keeps remaining days). */
   async cancelPaidSubscription(guildId: string): Promise<boolean> {
     this.ensureLoaded();
-    const paid = this.config.subscriptions[guildId]?.paid;
-    if (!paid || !paid.providerId || !paid.providerSubId) return false;
-    const provider = getPaymentRegistry().get(paid.providerId);
-    if (!provider || !provider.capabilities.supportsCancel || !provider.cancelSubscription) return false;
-    await provider.cancelSubscription(paid.providerSubId);
+    const active = this.config.subscriptions[guildId]?.active;
+    if (!active || active.source !== 'paid') return false;
+    if (!active.providerId || !active.providerSubId) return false;
+    const provider = getPaymentRegistry().get(active.providerId);
+    if (!provider?.cancelSubscription || !provider.capabilities.supportsCancel) return false;
+    await provider.cancelSubscription(active.providerSubId);
+    this.writeAudit({
+      timestamp: new Date().toISOString(),
+      actor: 'admin',
+      action: 'subscription.cancel.paid',
+      guildId,
+      subscriptionId: active.id,
+      providerId: active.providerId,
+      metadata: { immediately: false },
+    });
+    void dispatchPremiumNotification(guildId, 'paid.sub.cancelled-by-user', {
+      tierName: this.config.tiers[active.tierId]?.displayName || active.tierId,
+      providerName: this.providerDisplayName(active.providerId),
+      endDate: active.endDate,
+    });
     return true;
   }
 
-  /** Reactivate a cancelled paid subscription (flips autoRenew back on while still active). */
+  /** Reactivate a cancelled paid sub while still inside its active window. */
   async reactivatePaidSubscription(guildId: string): Promise<boolean> {
     this.ensureLoaded();
-    const paid = this.config.subscriptions[guildId]?.paid;
-    if (!paid || !paid.providerId || !paid.providerSubId) return false;
-    const provider = getPaymentRegistry().get(paid.providerId);
-    if (!provider || !provider.capabilities.supportsReactivate || !provider.reactivateSubscription) return false;
-    await provider.reactivateSubscription(paid.providerSubId);
+    const active = this.config.subscriptions[guildId]?.active;
+    if (!active || active.source !== 'paid') return false;
+    if (!active.providerId || !active.providerSubId) return false;
+    if (active.status !== 'active') return false;
+    if (active.endDate !== null && Date.parse(active.endDate) <= Date.now()) return false;
+    const provider = getPaymentRegistry().get(active.providerId);
+    if (!provider?.reactivateSubscription || !provider.capabilities.supportsReactivate) return false;
+    await provider.reactivateSubscription(active.providerSubId);
+    this.writeAudit({
+      timestamp: new Date().toISOString(),
+      actor: 'admin',
+      action: 'subscription.reactivate.paid',
+      guildId,
+      subscriptionId: active.id,
+      providerId: active.providerId,
+    });
+    return true;
+  }
+
+  /**
+   * Hard-cancel the active paid sub now. Loses remaining days, frees the
+   * slot, resumes the next paused entry. Provider call must succeed before
+   * we wipe local state.
+   */
+  async cancelPaidSubscriptionImmediately(guildId: string): Promise<boolean> {
+    this.ensureLoaded();
+    const subs = this.config.subscriptions[guildId];
+    const active = subs?.active;
+    if (!active || active.source !== 'paid') return false;
+
+    if (active.providerId && active.providerSubId) {
+      const provider = getPaymentRegistry().get(active.providerId);
+      if (provider?.cancelSubscription && provider.capabilities.supportsCancel) {
+        await provider.cancelSubscription(active.providerSubId, true);
+      }
+    }
+    this.writeAudit({
+      timestamp: new Date().toISOString(),
+      actor: 'admin',
+      action: 'subscription.cancel.paid',
+      guildId,
+      subscriptionId: active.id,
+      providerId: active.providerId,
+      metadata: { immediately: true },
+    });
+    void dispatchPremiumNotification(guildId, 'paid.sub.cancelled-by-user', {
+      tierName: this.config.tiers[active.tierId]?.displayName || active.tierId,
+      providerName: this.providerDisplayName(active.providerId),
+    });
+    delete subs!.active;
+    if (subs!.paused.length > 0) this.resumeNext(guildId);
+    if (this.guildSubsEmpty(subs!)) delete this.config.subscriptions[guildId];
+    return this.save();
+  }
+
+  /**
+   * Cancel a paused subscription (paid or manual) and remove it from the
+   * queue. Provider call must succeed before we drop the queue entry.
+   */
+  async cancelAndRemovePausedSubscription(guildId: string, subscriptionId: string): Promise<boolean> {
+    this.ensureLoaded();
+    const subs = this.config.subscriptions[guildId];
+    if (!subs?.paused || subs.paused.length === 0) return false;
+    const idx = subs.paused.findIndex(p => p.id === subscriptionId);
+    if (idx < 0) return false;
+    const removed = subs.paused[idx];
+
+    if (removed.source === 'paid' && removed.providerId && removed.providerSubId) {
+      const provider = getPaymentRegistry().get(removed.providerId);
+      if (provider?.cancelSubscription && provider.capabilities.supportsCancel) {
+        await provider.cancelSubscription(removed.providerSubId, true);
+      }
+    }
+
+    subs.paused.splice(idx, 1);
+    if (this.guildSubsEmpty(subs)) delete this.config.subscriptions[guildId];
+    this.writeAudit({
+      timestamp: new Date().toISOString(),
+      actor: 'admin',
+      action: removed.source === 'manual' ? 'subscription.revoke.manual' : 'subscription.cancel.paid',
+      guildId,
+      subscriptionId: removed.id,
+      providerId: removed.providerId,
+      metadata: { fromPausedQueue: true },
+    });
+    return this.save();
+  }
+
+  // ============================================================================
+  // ORPHANS
+  // ============================================================================
+
+  private knownProviderSubIds(guildId: string): Set<string> {
+    const subs = this.config.subscriptions[guildId];
+    const ids = new Set<string>();
+    if (subs?.active?.providerSubId && subs.active.providerId) {
+      ids.add(`${subs.active.providerId}:${subs.active.providerSubId}`);
+    }
+    for (const p of subs?.paused || []) {
+      if (p.providerSubId && p.providerId) {
+        ids.add(`${p.providerId}:${p.providerSubId}`);
+      }
+    }
+    return ids;
+  }
+
+  async findOrphansForGuild(guildId: string): Promise<Array<{ providerId: string; ref: ProviderSubscriptionRef }>> {
+    this.ensureLoaded();
+    const known = this.knownProviderSubIds(guildId);
+    const out: Array<{ providerId: string; ref: ProviderSubscriptionRef }> = [];
+    for (const provider of getPaymentRegistry().listAll()) {
+      if (!provider.listSubscriptionsForGuild) continue;
+      if (!provider.isConfigured()) continue;
+      try {
+        const refs = await provider.listSubscriptionsForGuild(guildId);
+        for (const ref of refs) {
+          if (!known.has(`${provider.id}:${ref.providerSubId}`)) {
+            out.push({ providerId: provider.id, ref });
+          }
+        }
+      } catch (err: any) {
+        console.warn(`[PremiumManager] '${provider.id}' listSubscriptionsForGuild failed for guild ${guildId}: ${err?.message || err}`);
+      }
+    }
+    return out;
+  }
+
+  async adoptOrphan(guildId: string, providerId: string, providerSubId: string): Promise<boolean> {
+    this.ensureLoaded();
+    const provider = getPaymentRegistry().get(providerId);
+    if (!provider?.listSubscriptionsForGuild) {
+      throw new Error(`Provider '${providerId}' does not support orphan listing.`);
+    }
+    const refs = await provider.listSubscriptionsForGuild(guildId);
+    const ref = refs.find(r => r.providerSubId === providerSubId);
+    if (!ref) {
+      throw new Error(`Subscription '${providerSubId}' not found at '${providerId}' for guild ${guildId}.`);
+    }
+    if (this.knownProviderSubIds(guildId).has(`${providerId}:${providerSubId}`)) {
+      throw new Error(`Subscription '${providerSubId}' is already in the local cache.`);
+    }
+    if (!ref.metadata.tierId || !ref.metadata.offeringId) {
+      throw new Error(
+        `Subscription '${providerSubId}' is missing tierId/offeringId metadata so the bot can't tell what to install. ` +
+        `Cancel it at the provider instead.`,
+      );
+    }
+
+    getPaymentRegistry().emitEvent({
+      type: 'subscription.created',
+      providerId,
+      providerSubId,
+      guildId,
+      tierId: ref.metadata.tierId,
+      offeringId: ref.metadata.offeringId,
+      variantId: ref.metadata.variantId,
+      couponCode: ref.metadata.couponCode,
+      state: ref.state,
+    });
+    this.writeAudit({
+      timestamp: new Date().toISOString(),
+      actor: 'admin',
+      action: 'subscription.adopt.orphan',
+      guildId,
+      providerId,
+      metadata: { providerSubId, tierId: ref.metadata.tierId, offeringId: ref.metadata.offeringId },
+    });
+    return true;
+  }
+
+  async cancelOrphan(providerId: string, providerSubId: string): Promise<boolean> {
+    const provider = getPaymentRegistry().get(providerId);
+    if (!provider) throw new Error(`Provider '${providerId}' is not registered.`);
+    if (!provider.cancelSubscription || !provider.capabilities.supportsCancel) {
+      throw new Error(`Provider '${providerId}' does not support cancellation.`);
+    }
+    await provider.cancelSubscription(providerSubId, true);
+    this.writeAudit({
+      timestamp: new Date().toISOString(),
+      actor: 'admin',
+      action: 'subscription.cancel.orphan',
+      providerId,
+      metadata: { providerSubId },
+    });
     return true;
   }
 
   // ============================================================================
-  // SUBSCRIPTIONS: QUERY
+  // QUERY
   // ============================================================================
 
   getSubscriptions(guildId: string): GuildSubscriptions {
     this.ensureLoaded();
     const subs = this.config.subscriptions[guildId];
-    return subs ? { ...subs } : {};
+    return subs ? { ...subs } : { paused: [] };
   }
 
   getAllSubscriptions(): Record<string, GuildSubscriptions> {
@@ -1124,32 +1985,47 @@ export class PremiumManager {
     return JSON.parse(JSON.stringify(this.config.subscriptions));
   }
 
-  // ============================================================================
-  // OVERRIDES & FEATURE GATES
-  // ============================================================================
+  /** Read-only snapshot of one guild's subscription record (or null if none). */
+  getGuildSubscriptions(guildId: string): GuildSubscriptions | null {
+    this.ensureLoaded();
+    const subs = this.config.subscriptions[guildId];
+    return subs ? JSON.parse(JSON.stringify(subs)) : null;
+  }
 
   /**
-   * Get tier overrides (raw map including `_`-prefixed internal keys like
-   * `_moduleEnabled`, `_disabledCommands`, `_hardLimits`) for the guild's
-   * effective tier on a specific module.
-   *
-   * Free acts as a shared baseline: its overrides are merged in per-key, and
-   * the active tier's explicit values win when set. This keeps the Free tier
-   * as the floor that all tiers inherit from without requiring data to be
-   * physically duplicated across tiers.
+   * Set the per-guild notifications channel id (the fallback when DM to the
+   * owner fails). Pass empty string / null to clear and fall back to the
+   * guild's system channel. Persists immediately. Returns true on write,
+   * false if the guild has no subscription record yet AND the new value
+   * is empty (no point creating an empty record).
    */
+  setNotificationsChannelId(guildId: string, channelId: string | null): boolean {
+    this.ensureLoaded();
+    const next = (channelId && channelId.trim()) ? channelId.trim() : undefined;
+    const subs = this.config.subscriptions[guildId];
+    if (!subs && !next) return false;
+    if (!subs) {
+      this.config.subscriptions[guildId] = { paused: [], notificationsChannelId: next };
+    } else if (next) {
+      subs.notificationsChannelId = next;
+    } else {
+      delete subs.notificationsChannelId;
+      if (this.guildSubsEmpty(subs)) delete this.config.subscriptions[guildId];
+    }
+    return this.save();
+  }
+
+  // ============================================================================
+  // OVERRIDES & FEATURE GATES (unchanged from prior model)
+  // ============================================================================
+
   getTierOverrides(guildId: string, moduleName: string): Record<string, any> {
     const { tier, tierId } = this.resolveActiveTier(guildId);
     const tierMod = tier.overrides[moduleName] || {};
     if (tierId === 'free') return { ...tierMod };
     const freeMod = this.config.tiers.free?.overrides?.[moduleName] || {};
-    // Free's effective contribution: when Free disables the module entirely,
-    // its per-command / per-setting state is moot and must not propagate.
     const effectiveFree = effectiveFreeModuleOverride(freeMod);
-    // Per-key: tier wins, undefined keys fall through to Free.
     const merged: Record<string, any> = { ...effectiveFree, ...tierMod };
-    // _hardLimits is a nested map; merge per-key (tier wins) instead of
-    // letting the tier's object replace Free's entirely.
     if (effectiveFree._hardLimits || tierMod._hardLimits) {
       merged._hardLimits = {
         ...(effectiveFree._hardLimits || {}),
@@ -1159,11 +2035,6 @@ export class PremiumManager {
     return merged;
   }
 
-  /**
-   * Get tier-supplied hard limits for a module's settings. The caller
-   * (settingsPanelFactory / settingsValidation) merges these on top of the
-   * global _hardLimits; tier wins on overlap.
-   */
   getTierHardLimits(guildId: string, moduleName: string): Record<string, HardLimitOverride> {
     const overrides = this.getTierOverrides(guildId, moduleName);
     const hl = overrides._hardLimits;
@@ -1173,37 +2044,18 @@ export class PremiumManager {
     return {};
   }
 
-  /** True if the guild's effective tier priority >= required. */
   hasFeatureAccess(guildId: string, requiredPriority: number): boolean {
     const { tier } = this.resolveActiveTier(guildId);
     return tier.priority >= requiredPriority;
   }
 
-  /**
-   * Per-feature gate check, for modules that want to gate specific internal
-   * features (not commands, not the whole module). Looks up the module's
-   * manifest `tierRequirement` and decides whether THIS feature falls under
-   * the gate using the following rules:
-   *
-   *   - no `tierRequirement`: ungated (returns true)
-   *   - `gatedFeatures` is an array: the feature is gated iff named in it
-   *   - `gatedFeatures` absent but `gatedCommands` present: the gate is
-   *     command-scoped, so features are not gated
-   *   - both absent: whole-module gate, features are implicitly gated
-   *
-   * If the registry can't find the module (e.g. called before load), this
-   * fails open to avoid blocking features due to lookup races.
-   */
   hasFeature(guildId: string, moduleName: string, featureName: string): boolean {
-    // Lazy-require the registry to avoid a static circular import
-    // (moduleRegistry imports panelManager which imports this file).
     let registry: { getModule: (name: string) => { manifest?: any } | undefined };
     try {
       registry = (require('./moduleRegistry') as typeof import('./moduleRegistry')).getModuleRegistry();
     } catch {
       return true;
     }
-
     const mod = registry.getModule(moduleName);
     const tr = mod?.manifest?.tierRequirement;
     if (!tr || typeof tr.minPriority !== 'number') return true;
@@ -1216,17 +2068,12 @@ export class PremiumManager {
     } else {
       featureIsGated = true;
     }
-
     if (!featureIsGated) return true;
     return this.hasFeatureAccess(guildId, tr.minPriority);
   }
 
   // ============================================================================
-  // PROVIDER ACCOUNT LINKS: anti-duplicate registry
-  //
-  // One external account (e.g. a specific Patreon user) can only entitle one
-  // guild at a time. Unused by DummyProvider; present so OAuth-linked providers
-  // slot in without a data-model change later.
+  // PROVIDER ACCOUNT LINKS (anti-duplicate registry)
   // ============================================================================
 
   getAccountLink(providerId: string, externalAccountId: string): string | undefined {
@@ -1255,147 +2102,17 @@ export class PremiumManager {
   }
 
   // ============================================================================
-  // COUPONS: admin-managed discount codes
-  //
-  // Stored as a flat registry keyed by code. Effect is percentOff XOR extraDays;
-  // `validateCoupon` checks existence, expiry, and usage cap but does NOT
-  // consume. Providers that support coupons call `consumeCoupon` after a
-  // successful subscribe to increment usedCount.
-  // ============================================================================
-
-  getAllCoupons(): Record<string, Coupon> {
-    this.ensureLoaded();
-    return { ...this.config.coupons };
-  }
-
-  getCoupon(code: string): Coupon | null {
-    this.ensureLoaded();
-    return this.config.coupons[code] || null;
-  }
-
-  /**
-   * Create or replace a coupon. Exactly one of `percentOff` or `extraDays`
-   * must be provided and be > 0. `allowedTiers` (when non-empty) must name
-   * existing non-Free tiers. Returns false on validation failure.
-   */
-  setCoupon(
-    code: string,
-    input: Partial<Pick<Coupon, 'description' | 'percentOff' | 'extraDays' | 'maxUses' | 'expiresAt' | 'allowedTiers'>>
-  ): boolean {
-    this.ensureLoaded();
-    const trimmed = (code || '').trim();
-    if (!trimmed) return false;
-    const percentOff = input.percentOff;
-    const extraDays = input.extraDays;
-    const hasPercent = typeof percentOff === 'number' && percentOff > 0;
-    const hasDays = typeof extraDays === 'number' && extraDays > 0;
-    if (hasPercent === hasDays) {
-      // XOR: must have exactly one.
-      return false;
-    }
-    if (hasPercent && (percentOff! < 1 || percentOff! > 100)) return false;
-    if (hasDays && extraDays! < 1) return false;
-    if (input.maxUses !== undefined && (typeof input.maxUses !== 'number' || input.maxUses < 1)) return false;
-    if (input.expiresAt !== undefined && isNaN(Date.parse(input.expiresAt))) return false;
-
-    let allowedTiers: string[] | undefined;
-    if (input.allowedTiers !== undefined) {
-      if (!Array.isArray(input.allowedTiers)) return false;
-      // Empty array => global (store as undefined for clarity).
-      if (input.allowedTiers.length > 0) {
-        for (const t of input.allowedTiers) {
-          if (typeof t !== 'string' || !t) return false;
-          if (t === 'free') return false;
-          if (!this.config.tiers[t]) return false;
-        }
-        allowedTiers = [...new Set(input.allowedTiers)];
-      }
-    }
-
-    const existing = this.config.coupons[trimmed];
-    this.config.coupons[trimmed] = {
-      description: input.description,
-      percentOff: hasPercent ? percentOff : undefined,
-      extraDays: hasDays ? extraDays : undefined,
-      maxUses: input.maxUses,
-      expiresAt: input.expiresAt,
-      allowedTiers,
-      usedCount: existing?.usedCount ?? 0,
-      createdAt: existing?.createdAt ?? new Date().toISOString(),
-    };
-    return this.save();
-  }
-
-  deleteCoupon(code: string): boolean {
-    this.ensureLoaded();
-    if (!this.config.coupons[code]) return false;
-    delete this.config.coupons[code];
-    return this.save();
-  }
-
-  /**
-   * Validate a coupon code WITHOUT consuming it. Caller is expected to call
-   * `consumeCoupon` after the subscribe fully commits.
-   *
-   * When `tierId` is provided, the coupon's `allowedTiers` restriction is
-   * enforced (a tier-restricted coupon only validates for listed tiers).
-   * When `tierId` is omitted and the coupon is tier-restricted, we reject
-   * conservatively: there's no safe way to say "maybe valid" here.
-   */
-  validateCoupon(code: string, tierId?: string): CouponValidation {
-    this.ensureLoaded();
-    const trimmed = (code || '').trim();
-    if (!trimmed) return { valid: false, reason: 'empty code' };
-    const coupon = this.config.coupons[trimmed];
-    if (!coupon) return { valid: false, reason: 'not found' };
-    if (coupon.expiresAt && Date.parse(coupon.expiresAt) < Date.now()) {
-      return { valid: false, reason: 'expired' };
-    }
-    if (typeof coupon.maxUses === 'number' && coupon.usedCount >= coupon.maxUses) {
-      return { valid: false, reason: 'usage limit reached' };
-    }
-    if (coupon.allowedTiers && coupon.allowedTiers.length > 0) {
-      if (!tierId) return { valid: false, reason: 'tier-restricted coupon; target tier required' };
-      if (!coupon.allowedTiers.includes(tierId)) {
-        return { valid: false, reason: 'not valid for this tier' };
-      }
-    }
-    const effectText = typeof coupon.percentOff === 'number'
-      ? `${coupon.percentOff}% off`
-      : typeof coupon.extraDays === 'number'
-        ? `+${coupon.extraDays} days`
-        : '';
-    return {
-      valid: true,
-      coupon,
-      effectText,
-      effect: {
-        percentOff: coupon.percentOff,
-        extraDays: coupon.extraDays,
-      },
-    };
-  }
-
-  /** Increment usedCount for a coupon; no-op when the code doesn't exist. */
-  consumeCoupon(code: string): boolean {
-    this.ensureLoaded();
-    const coupon = this.config.coupons[code];
-    if (!coupon) return false;
-    coupon.usedCount = (coupon.usedCount || 0) + 1;
-    return this.save();
-  }
-
-  // ============================================================================
-  // EXPIRY CHECKER: manual layer only
-  //
-  // Paid subscriptions are owned by their provider; provider events (or
-  // scheduledReconcile for polling-driven providers) drive paid state
-  // transitions. Manual subscriptions are our responsibility.
+  // EXPIRY CHECKER (manual layer + active-slot endDate watch)
   // ============================================================================
 
   startExpiryChecker(intervalMs = 60_000): void {
     if (this.expiryTimer) return;
-    this.expiryTimer = setInterval(() => this.checkExpiry(), intervalMs);
+    this.expiryTimer = setInterval(() => {
+      this.checkExpiry();
+      void this.processDueMigrations().catch(err => {
+        console.error('[PremiumManager] processDueMigrations failed:', err);
+      });
+    }, intervalMs);
   }
 
   stopExpiryChecker(): void {
@@ -1405,19 +2122,81 @@ export class PremiumManager {
     }
   }
 
+  /**
+   * Walk every guild's active slot. Two passes:
+   *
+   * 1. **Expiry**: if active is past endDate AND it's a manual sub (paid
+   *    expiries flow through provider events), expire it, pop the next
+   *    paused entry into active, fire a `manual.grant.ended` notification.
+   *
+   * 2. **Ending-soon**: if active is a manual sub whose endDate is within
+   *    the next 24 hours and we haven't already warned about this sub,
+   *    fire a `manual.grant.ending-soon` notification and remember the
+   *    sub id so the ticker doesn't re-warn every minute.
+   *
+   * The dedupe set is also pruned to drop entries whose subs are no
+   * longer active anywhere; the natural cleanup point is the expiry
+   * branch above and a final sweep at the end.
+   */
   private checkExpiry(): void {
     this.ensureLoaded();
     let changed = false;
     const now = Date.now();
     const nowIso = new Date().toISOString();
+    const ENDING_SOON_WINDOW_MS = 24 * 60 * 60 * 1000;
+    const stillActiveIds = new Set<string>();
     for (const guildId of Object.keys(this.config.subscriptions)) {
-      const manual = this.config.subscriptions[guildId].manual;
-      if (!manual) continue;
-      if (manual.status === 'active' && manual.endDate !== null && Date.parse(manual.endDate) <= now) {
-        manual.status = 'expired';
-        manual.updatedAt = nowIso;
+      const subs = this.config.subscriptions[guildId];
+      const active = subs.active;
+      if (!active) continue;
+      if (active.endDate === null) continue;
+      const endMs = Date.parse(active.endDate);
+
+      if (endMs <= now) {
+        if (active.source !== 'manual') continue; // paid expiries via webhook
+
+        const tierName = this.config.tiers[active.tierId]?.displayName || active.tierId;
+        const expiredId = active.id;
+        const expiredNotes = active.notes;
+        active.status = 'expired';
+        active.updatedAt = nowIso;
         changed = true;
+        this.writeAudit({
+          timestamp: nowIso,
+          actor: 'admin',
+          action: 'subscription.revoke.manual',
+          guildId,
+          subscriptionId: active.id,
+          metadata: { reason: 'expired' },
+        });
+        void dispatchPremiumNotification(guildId, 'manual.grant.ended', {
+          tierName,
+          notes: expiredNotes,
+        });
+        this.endingSoonNotified.delete(expiredId);
+        delete subs.active;
+        if (subs.paused.length > 0) this.resumeNext(guildId);
+        if (this.guildSubsEmpty(subs)) delete this.config.subscriptions[guildId];
+        continue;
       }
+
+      // Future expiry: ending-soon window check (manual only - paid renews
+      // automatically, and cancel-before-expiry already triggers its own
+      // notification at cancel time).
+      if (active.source !== 'manual') continue;
+      stillActiveIds.add(active.id);
+      if (endMs - now > ENDING_SOON_WINDOW_MS) continue;
+      if (this.endingSoonNotified.has(active.id)) continue;
+      this.endingSoonNotified.add(active.id);
+      void dispatchPremiumNotification(guildId, 'manual.grant.ending-soon', {
+        tierName: this.config.tiers[active.tierId]?.displayName || active.tierId,
+        endDate: active.endDate,
+      });
+    }
+    // Sweep dedupe set: drop ids that no longer correspond to an active
+    // manual sub anywhere (revoked, queue-pop replaced active, etc.).
+    for (const id of this.endingSoonNotified) {
+      if (!stillActiveIds.has(id)) this.endingSoonNotified.delete(id);
     }
     if (changed) this.save();
   }
@@ -1433,18 +2212,417 @@ export class PremiumManager {
 
   setMessages(partial: Partial<PremiumMessages>): boolean {
     this.ensureLoaded();
+    const before = { ...this.config.messages };
     this.config.messages = { ...this.config.messages, ...partial };
-    return this.save();
+    const ok = this.save();
+    if (ok) {
+      this.writeAudit({
+        timestamp: new Date().toISOString(),
+        actor: 'admin',
+        action: 'message.update',
+        before,
+        after: this.config.messages,
+      });
+    }
+    return ok;
   }
 
   resetMessages(): boolean {
     this.ensureLoaded();
+    const before = { ...this.config.messages };
     this.config.messages = { ...DEFAULT_MESSAGES };
-    return this.save();
+    const ok = this.save();
+    if (ok) {
+      this.writeAudit({
+        timestamp: new Date().toISOString(),
+        actor: 'admin',
+        action: 'message.update',
+        before,
+        after: this.config.messages,
+        metadata: { reset: true },
+      });
+    }
+    return ok;
   }
 
   // ============================================================================
-  // FULL CONFIG
+  // FULL CONFIG (admin)
+  // ============================================================================
+
+  // ============================================================================
+  // MIGRATIONS (Stage 5)
+  // ============================================================================
+
+  listMigrations(): Migration[] {
+    this.ensureLoaded();
+    return JSON.parse(JSON.stringify(this.config.migrations));
+  }
+
+  getMigration(migrationId: string): Migration | null {
+    this.ensureLoaded();
+    const m = this.config.migrations.find(x => x.id === migrationId);
+    return m ? JSON.parse(JSON.stringify(m)) : null;
+  }
+
+  /** Pending migrations that affect this guild (source variant matches a
+   * sub the guild owns and migration is still pending). */
+  getPendingMigrationsForGuild(guildId: string): Migration[] {
+    this.ensureLoaded();
+    return this.config.migrations
+      .filter(m => m.status === 'pending')
+      .filter(m => m.decisions.some(d => d.guildId === guildId))
+      .map(m => JSON.parse(JSON.stringify(m)));
+  }
+
+  getMigrationSilencePolicy(): 'cancel' | 'continue' {
+    this.ensureLoaded();
+    return this.config.migrationSilencePolicy;
+  }
+
+  setMigrationSilencePolicy(policy: 'cancel' | 'continue'): boolean {
+    this.ensureLoaded();
+    if (policy !== 'cancel' && policy !== 'continue') return false;
+    const before = this.config.migrationSilencePolicy;
+    if (before === policy) return true;
+    this.config.migrationSilencePolicy = policy;
+    const ok = this.save();
+    if (ok) {
+      this.writeAudit({
+        timestamp: new Date().toISOString(),
+        actor: 'admin',
+        action: 'migration.silence-policy.set',
+        before,
+        after: policy,
+      });
+    }
+    return ok;
+  }
+
+  /**
+   * Schedule a price/variant migration. Snapshots current paid subs whose
+   * (providerId, sourceVariantId) matches into per-guild decision records;
+   * each guild owner gets a `migration.scheduled` DM with accept/decline
+   * tokens.
+   *
+   * Validation:
+   *   - target must differ from source on at least variant
+   *   - effectiveDate must parse as a future date
+   *   - source variant + target variant + provider must all exist on registered offerings
+   *
+   * Returns the new Migration on success. Throws Error on validation failure.
+   */
+  async scheduleMigration(opts: {
+    providerId: string;
+    sourceTierId: string;
+    sourceOfferingId: string;
+    sourceVariantId: string;
+    targetTierId: string;
+    targetOfferingId: string;
+    targetVariantId: string;
+    effectiveDate: string;
+    message: string;
+    scheduledBy?: string;
+  }): Promise<Migration> {
+    this.ensureLoaded();
+    if (opts.sourceVariantId === opts.targetVariantId
+      && opts.sourceOfferingId === opts.targetOfferingId
+      && opts.sourceTierId === opts.targetTierId) {
+      throw new Error('Source and target are identical; nothing to migrate.');
+    }
+    const eff = Date.parse(opts.effectiveDate);
+    if (!Number.isFinite(eff)) throw new Error('effectiveDate is not a valid timestamp.');
+    if (eff <= Date.now()) throw new Error('effectiveDate must be in the future.');
+
+    const provider = getPaymentRegistry().get(opts.providerId);
+    if (!provider) throw new Error(`Provider '${opts.providerId}' is not registered.`);
+    if (!provider.capabilities.supportsPriceMigration || !provider.migrateSubscriptionPrice) {
+      throw new Error(`Provider '${opts.providerId}' does not support price migration.`);
+    }
+
+    const sourceTier = this.config.tiers[opts.sourceTierId];
+    const targetTier = this.config.tiers[opts.targetTierId];
+    if (!sourceTier || !targetTier) throw new Error('Unknown source or target tier.');
+    const sourceOffering = sourceTier.offerings.find(o => o.id === opts.sourceOfferingId);
+    const targetOffering = targetTier.offerings.find(o => o.id === opts.targetOfferingId);
+    if (!sourceOffering || !targetOffering) throw new Error('Unknown source or target offering.');
+
+    const decisions: MigrationGuildDecision[] = [];
+    for (const [guildId, subs] of Object.entries(this.config.subscriptions)) {
+      const candidates: Subscription[] = [];
+      if (subs.active) candidates.push(subs.active);
+      candidates.push(...subs.paused);
+      for (const sub of candidates) {
+        if (sub.source !== 'paid') continue;
+        if (sub.providerId !== opts.providerId) continue;
+        if (sub.variantId !== opts.sourceVariantId) continue;
+        if (!sub.providerSubId) continue;
+        decisions.push({
+          guildId,
+          subscriptionId: sub.id,
+          providerSubId: sub.providerSubId,
+          decision: 'pending',
+        });
+      }
+    }
+
+    const migration: Migration = {
+      id: crypto.randomUUID(),
+      providerId: opts.providerId,
+      sourceTierId: opts.sourceTierId,
+      sourceOfferingId: opts.sourceOfferingId,
+      sourceVariantId: opts.sourceVariantId,
+      targetTierId: opts.targetTierId,
+      targetOfferingId: opts.targetOfferingId,
+      targetVariantId: opts.targetVariantId,
+      effectiveDate: opts.effectiveDate,
+      message: opts.message || '',
+      scheduledAt: new Date().toISOString(),
+      scheduledBy: opts.scheduledBy || 'admin',
+      status: 'pending',
+      decisions,
+    };
+    this.config.migrations.push(migration);
+    const ok = this.save();
+    if (!ok) throw new Error('Failed to persist migration.');
+
+    this.writeAudit({
+      timestamp: migration.scheduledAt,
+      actor: migration.scheduledBy,
+      action: 'migration.scheduled',
+      providerId: opts.providerId,
+      tierId: opts.sourceTierId,
+      offeringId: opts.sourceOfferingId,
+      migrationId: migration.id,
+      metadata: {
+        targetTierId: opts.targetTierId,
+        targetOfferingId: opts.targetOfferingId,
+        sourceVariantId: opts.sourceVariantId,
+        targetVariantId: opts.targetVariantId,
+        effectiveDate: opts.effectiveDate,
+        affectedCount: decisions.length,
+      },
+    });
+
+    // DM each affected guild owner. notifiedAt isn't tracked at delivery
+    // time (DM is best-effort and async); we record "we attempted at X".
+    const stamped = new Date().toISOString();
+    for (const d of migration.decisions) {
+      d.notifiedAt = stamped;
+      void dispatchPremiumNotification(d.guildId, 'migration.scheduled', {
+        tierName: targetTier.displayName,
+        endDate: opts.effectiveDate,
+        details: opts.message || `Your subscription will move from "${sourceTier.displayName}" to "${targetTier.displayName}". Open the subscription panel to accept or decline.`,
+      });
+    }
+    this.save();
+
+    return JSON.parse(JSON.stringify(migration));
+  }
+
+  /**
+   * Subscriber records their accept/decline. Idempotent: re-recording the
+   * same decision is a no-op; flipping is allowed up until the migration
+   * is applied.
+   */
+  recordMigrationDecision(migrationId: string, guildId: string, decision: 'accepted' | 'declined'): boolean {
+    this.ensureLoaded();
+    if (decision !== 'accepted' && decision !== 'declined') return false;
+    const migration = this.config.migrations.find(m => m.id === migrationId);
+    if (!migration) return false;
+    if (migration.status !== 'pending') return false;
+    const entry = migration.decisions.find(d => d.guildId === guildId);
+    if (!entry) return false;
+    if (entry.decision === decision) return true;
+    entry.decision = decision;
+    entry.decidedAt = new Date().toISOString();
+    const ok = this.save();
+    if (ok) {
+      this.writeAudit({
+        timestamp: entry.decidedAt,
+        actor: 'guild-owner',
+        action: 'migration.decision',
+        guildId,
+        migrationId,
+        metadata: { decision },
+      });
+      const targetTier = this.config.tiers[migration.targetTierId];
+      void dispatchPremiumNotification(guildId, decision === 'accepted' ? 'migration.accepted' : 'migration.declined', {
+        tierName: targetTier?.displayName || migration.targetTierId,
+        endDate: migration.effectiveDate,
+      });
+    }
+    return ok;
+  }
+
+  /** Cancel a scheduled migration before it applies. Decisions and the
+   * migration record itself are kept (status -> 'cancelled') so the audit
+   * trail and any in-flight subscriber UI can still resolve the id. */
+  cancelMigration(migrationId: string): boolean {
+    this.ensureLoaded();
+    const migration = this.config.migrations.find(m => m.id === migrationId);
+    if (!migration) return false;
+    if (migration.status !== 'pending') return false;
+    migration.status = 'cancelled';
+    const ok = this.save();
+    if (ok) {
+      this.writeAudit({
+        timestamp: new Date().toISOString(),
+        actor: 'admin',
+        action: 'migration.cancelled',
+        migrationId,
+        providerId: migration.providerId,
+      });
+    }
+    return ok;
+  }
+
+  /**
+   * Scheduler entry point. Walks pending migrations, applies any whose
+   * effectiveDate has passed. Per-guild decision drives the action:
+   *   accepted        -> provider.migrateSubscriptionPrice(target)
+   *   declined        -> provider.cancelSubscription(soft) -> rides out
+   *   pending + 'cancel'   -> same as declined
+   *   pending + 'continue' -> same as accepted (host accepts compliance burden)
+   *
+   * Outcomes are recorded per-decision so the audit trail and viewer can
+   * surface partial failures. Migration.status flips to 'applied' once
+   * all decisions resolve (success or failure).
+   */
+  async processDueMigrations(): Promise<void> {
+    this.ensureLoaded();
+    const now = Date.now();
+    const due = this.config.migrations.filter(m => m.status === 'pending' && Date.parse(m.effectiveDate) <= now);
+    if (due.length === 0) return;
+    for (const migration of due) {
+      await this.applyMigration(migration);
+    }
+  }
+
+  private async applyMigration(migration: Migration): Promise<void> {
+    const provider = getPaymentRegistry().get(migration.providerId);
+    if (!provider || !provider.migrateSubscriptionPrice) {
+      // Provider gone since scheduling; mark cancelled rather than apply.
+      migration.status = 'cancelled';
+      this.save();
+      this.writeAudit({
+        timestamp: new Date().toISOString(),
+        actor: 'system',
+        action: 'migration.cancelled',
+        migrationId: migration.id,
+        providerId: migration.providerId,
+        metadata: { reason: 'provider-unavailable' },
+      });
+      return;
+    }
+    const targetTier = this.config.tiers[migration.targetTierId];
+    const targetOffering = targetTier?.offerings.find(o => o.id === migration.targetOfferingId);
+    const policy = this.config.migrationSilencePolicy;
+    const stamp = new Date().toISOString();
+
+    for (const decision of migration.decisions) {
+      // Skip if guild lost their sub (cancelled before effective date).
+      const subs = this.config.subscriptions[decision.guildId];
+      if (!subs) {
+        decision.outcome = 'skipped';
+        decision.outcomeNote = 'guild has no subscriptions';
+        decision.appliedAt = stamp;
+        continue;
+      }
+      const allSubs: Subscription[] = [];
+      if (subs.active) allSubs.push(subs.active);
+      allSubs.push(...subs.paused);
+      const sub = allSubs.find(s => s.id === decision.subscriptionId);
+      if (!sub) {
+        decision.outcome = 'skipped';
+        decision.outcomeNote = 'subscription no longer present';
+        decision.appliedAt = stamp;
+        continue;
+      }
+      if (sub.providerSubId !== decision.providerSubId) {
+        decision.outcome = 'skipped';
+        decision.outcomeNote = 'providerSubId changed since scheduling';
+        decision.appliedAt = stamp;
+        continue;
+      }
+      if (sub.variantId !== migration.sourceVariantId) {
+        decision.outcome = 'skipped';
+        decision.outcomeNote = 'variant changed since scheduling';
+        decision.appliedAt = stamp;
+        continue;
+      }
+
+      const effective = decision.decision === 'pending'
+        ? (policy === 'continue' ? 'accepted' : 'declined')
+        : decision.decision;
+      const wasSilent = decision.decision === 'pending';
+      if (wasSilent) decision.decision = 'silent-applied';
+
+      try {
+        if (effective === 'accepted') {
+          await provider.migrateSubscriptionPrice(sub.providerSubId, migration.targetVariantId, 'none');
+          // Update local cache to match the new variant. Provider webhooks
+          // may also fire and we'll reconcile on top.
+          sub.tierId = migration.targetTierId;
+          sub.offeringId = migration.targetOfferingId;
+          sub.variantId = migration.targetVariantId;
+          sub.updatedAt = stamp;
+          decision.outcome = 'migrated';
+        } else {
+          // declined OR silent + 'cancel' policy
+          if (provider.cancelSubscription && provider.capabilities.supportsCancel) {
+            await provider.cancelSubscription(sub.providerSubId, false);
+          }
+          sub.autoRenew = false;
+          sub.updatedAt = stamp;
+          decision.outcome = 'cancelled';
+        }
+      } catch (err: any) {
+        decision.outcome = 'failed';
+        decision.outcomeNote = err?.message || String(err);
+      }
+      decision.appliedAt = stamp;
+
+      // Per-decision notification.
+      if (wasSilent) {
+        void dispatchPremiumNotification(decision.guildId, 'migration.silence-applied', {
+          tierName: targetTier?.displayName || migration.targetTierId,
+          details: policy === 'continue' ? 'Migrated to the new plan automatically.' : 'Set to cancel at period end.',
+        });
+      } else if (decision.outcome === 'migrated') {
+        void dispatchPremiumNotification(decision.guildId, 'migration.applied', {
+          tierName: targetTier?.displayName || migration.targetTierId,
+          providerName: this.providerDisplayName(migration.providerId),
+        });
+      }
+    }
+
+    migration.status = 'applied';
+    migration.appliedAt = stamp;
+    this.save();
+    this.writeAudit({
+      timestamp: stamp,
+      actor: 'system',
+      action: 'migration.applied',
+      providerId: migration.providerId,
+      migrationId: migration.id,
+      tierId: migration.targetTierId,
+      offeringId: migration.targetOfferingId,
+      metadata: {
+        outcomes: migration.decisions.reduce((acc: Record<string, number>, d) => {
+          const key = d.outcome || 'unknown';
+          acc[key] = (acc[key] || 0) + 1;
+          return acc;
+        }, {}),
+      },
+    });
+    // Reference targetOffering only to prove it parsed at scheduling - the
+    // scheduler doesn't actually need the offering object once the variant
+    // change is applied. Touched here so future code can hook in.
+    void targetOffering;
+  }
+
+  // ============================================================================
+  // FULL CONFIG (admin)
   // ============================================================================
 
   getFullConfig(): PremiumConfig {
@@ -1454,7 +2632,6 @@ export class PremiumManager {
 
   setFullConfig(config: PremiumConfig): boolean {
     if (!config.tiers || typeof config.tiers !== 'object') return false;
-
     for (const [id, t] of Object.entries(config.tiers)) {
       if (!t.overrides) t.overrides = {};
       if (!t.offerings) t.offerings = [];
@@ -1466,30 +2643,37 @@ export class PremiumManager {
     if (!config.tiers.free) {
       config.tiers.free = { displayName: 'Free', priority: 0, overrides: {}, offerings: [] };
     }
-
     this.config = {
       tiers: config.tiers,
       subscriptions: config.subscriptions || {},
       messages: { ...DEFAULT_MESSAGES, ...(config.messages || {}) },
       providerAccountLinks: config.providerAccountLinks || {},
       activatedProviders: config.activatedProviders || {},
-      coupons: config.coupons || {},
+      migrations: Array.isArray(config.migrations) ? config.migrations : [],
+      migrationSilencePolicy: config.migrationSilencePolicy === 'continue' ? 'continue' : 'cancel',
     };
     return this.save();
   }
 }
 
-/** Get the singleton PremiumManager instance */
+/** Get the singleton PremiumManager instance. */
 export function getPremiumManager(): PremiumManager {
   if (!instance) {
     instance = new PremiumManager();
     instance.load();
-    instance.startExpiryChecker();
+    // Both bot and forked web-UI process import this singleton, but only
+    // the bot should own the expiry ticker. Without this gate, both
+    // processes would write the same expiry to disk every minute and DM
+    // the user twice for the same `manual.grant.ended` event. Web-UI
+    // picks up the bot's writes via mtime reload on each operation.
+    if (process.env.BOT_PROCESS_ROLE === 'bot') {
+      instance.startExpiryChecker();
+    }
   }
   return instance;
 }
 
-/** Reset the singleton (for testing) */
+/** Reset the singleton (for tests). */
 export function resetPremiumManager(): void {
   if (instance) instance.dispose();
   instance = null;
