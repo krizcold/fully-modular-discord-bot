@@ -1,4 +1,4 @@
-import { Client, ButtonInteraction, Message } from 'discord.js';
+import { Client, ButtonInteraction, Message, MessageFlags } from 'discord.js';
 import { registerButtonHandler } from '../../events/interactionCreate/buttonHandler';
 import { PanelContext, PanelResponse } from '../../../types/panelTypes';
 import { DISCORD_EPHEMERAL_FLAG } from '../../../constants';
@@ -7,6 +7,7 @@ import {
   handlePersistentWarningCancel
 } from './persistentPanelWarning';
 import { getPersistentPanel, updatePersistentPanelState, isActiveInstance } from './persistentPanelStorage';
+import { createTitledContainer, createText, V2Colors } from './v2';
 
 /**
  * Navigation context storage
@@ -408,10 +409,13 @@ async function handlePersistentWarningButtonFromHandler(
 
   const parts = customId.split('_');
   if (parts.length < 3) {
+    const c = createTitledContainer('❌ Invalid button format', undefined, V2Colors.danger);
+    c.addTextDisplayComponents(createText('The interaction id is malformed.'));
     await interaction.update({
-      content: '❌ Invalid button format',
+      content: '',
       embeds: [],
-      components: []
+      components: [c],
+      flags: MessageFlags.IsComponentsV2,
     });
     return;
   }
@@ -436,10 +440,13 @@ async function handlePersistentWarningButtonFromHandler(
 
   const panel = panels.get(panelId);
   if (!panel) {
+    const c = createTitledContainer('❌ Panel not found', undefined, V2Colors.danger);
+    c.addTextDisplayComponents(createText(`No panel registered for id \`${panelId}\`.`));
     await interaction.update({
-      content: '❌ Panel not found',
+      content: '',
       embeds: [],
-      components: []
+      components: [c],
+      flags: MessageFlags.IsComponentsV2,
     });
     return;
   }

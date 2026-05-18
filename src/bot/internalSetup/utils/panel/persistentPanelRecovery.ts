@@ -2,7 +2,7 @@
  * Persistent Panel Recovery System
  */
 
-import { Client, TextChannel, EmbedBuilder, Colors, ActionRowBuilder, ButtonBuilder, ButtonStyle } from 'discord.js';
+import { Client, TextChannel, ActionRowBuilder, ButtonBuilder, ButtonStyle } from 'discord.js';
 import {
   loadPersistentPanels,
   getPersistentPanel,
@@ -211,20 +211,11 @@ async function recoverPanelInstance(
     return;
   }
 
-  // Update embed footer to show recovery
-  const embed = message.embeds[0];
-  if (embed) {
-    const recoveredEmbed = EmbedBuilder.from(embed)
-      .setFooter({
-        text: `Panel recovered after bot restart | ${embed.footer?.text || ''}`.trim()
-      });
-
-    await message.edit({
-      embeds: [recoveredEmbed],
-      components: message.components
-    });
-  }
-
+  // Persistent panels are posted as V2 components and have no `embeds[0]`,
+  // so the old "update embed footer to show recovery" path was dead code.
+  // If we later want a recovery indicator on a recovered panel, build it
+  // by prepending a small V2 container rather than reaching into existing
+  // component state (which is read-only from a fetched Message).
   const accessMethod = instance.accessMethod || 'direct_command';
   storeNavigationContext(message.id, [], accessMethod);
 

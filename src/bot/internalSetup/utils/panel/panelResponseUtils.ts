@@ -4,12 +4,11 @@ import {
   ButtonBuilder,
   ButtonStyle,
   ActionRowBuilder,
-  EmbedBuilder,
   ContainerBuilder,
   MessageFlags,
 } from 'discord.js';
 import { PanelContext, PanelResponse, isV2Response } from '../../../types/panelTypes';
-import { DISCORD_MAX_COMPONENT_ROWS, DISCORD_EPHEMERAL_FLAG } from '../../../constants';
+import { DISCORD_MAX_COMPONENT_ROWS } from '../../../constants';
 import {
   createContainer,
   createTitledContainer,
@@ -222,103 +221,83 @@ function injectReturnButtonV2(response: PanelResponse, context: PanelContext): P
 }
 
 /**
- * Create a standardized error message for panels
- * Returns a formatted embed with red color for visual distinction
+ * Create a standardized error message for panels.
+ *
+ * Returns a V2 components-based response so it can replace a V2 admin
+ * panel message via `interaction.update()` without hitting Discord's
+ * "MessageFlags.IS_COMPONENTS_V2 cannot be removed" error. V1→V2 upgrade
+ * is allowed by Discord; V2→V1 downgrade is not.
+ *
+ * Optional `actions` are surfaced as a V2 action row inside the container,
+ * for example a "Go subscribe" Link button on a tier-blocked response.
  */
 export function createPanelError(
   title: string,
   message: string,
-  details?: string
+  details?: string,
+  actions?: ButtonBuilder[]
 ): PanelResponse {
-  const embed = new EmbedBuilder()
-    .setTitle(`❌ ${title}`)
-    .setDescription(message)
-    .setColor(0xE74C3C) // Red
-    .setTimestamp();
-
+  const container = createTitledContainer(`❌ ${title}`, undefined, V2Colors.danger);
+  container.addTextDisplayComponents(createText(message));
   if (details) {
-    embed.addFields({ name: 'Details', value: details });
+    container.addTextDisplayComponents(createText(`\`\`\`${details}\`\`\``));
   }
-
-  return {
-    embeds: [embed],
-    flags: DISCORD_EPHEMERAL_FLAG
-  };
+  if (actions && actions.length > 0) {
+    container.addSeparatorComponents(createSeparator());
+    container.addActionRowComponents(createButtonRow(...actions));
+  }
+  return createV2Response([container]);
 }
 
 /**
- * Create a standardized success message for panels
- * Returns a formatted embed with green color for visual distinction
+ * Create a standardized success message for panels.
+ * V2-native so it can replace V2 admin-panel messages via interaction.update().
  */
 export function createPanelSuccess(
   title: string,
   message: string,
   details?: string
 ): PanelResponse {
-  const embed = new EmbedBuilder()
-    .setTitle(`✅ ${title}`)
-    .setDescription(message)
-    .setColor(0x2ECC71) // Green
-    .setTimestamp();
-
+  const container = createTitledContainer(`✅ ${title}`, undefined, V2Colors.success);
+  container.addTextDisplayComponents(createText(message));
   if (details) {
-    embed.addFields({ name: 'Details', value: details });
+    container.addTextDisplayComponents(createText(`\`\`\`${details}\`\`\``));
   }
-
-  return {
-    embeds: [embed],
-    flags: DISCORD_EPHEMERAL_FLAG
-  };
+  return createV2Response([container]);
 }
 
 /**
- * Create a standardized warning message for panels
- * Returns a formatted embed with yellow color for visual distinction
+ * Create a standardized warning message for panels.
+ * V2-native so it can replace V2 admin-panel messages via interaction.update().
  */
 export function createPanelWarning(
   title: string,
   message: string,
   details?: string
 ): PanelResponse {
-  const embed = new EmbedBuilder()
-    .setTitle(`⚠️ ${title}`)
-    .setDescription(message)
-    .setColor(0xF39C12) // Yellow/Orange
-    .setTimestamp();
-
+  const container = createTitledContainer(`⚠️ ${title}`, undefined, V2Colors.warning);
+  container.addTextDisplayComponents(createText(message));
   if (details) {
-    embed.addFields({ name: 'Details', value: details });
+    container.addTextDisplayComponents(createText(`\`\`\`${details}\`\`\``));
   }
-
-  return {
-    embeds: [embed],
-    flags: DISCORD_EPHEMERAL_FLAG
-  };
+  return createV2Response([container]);
 }
 
 /**
- * Create a standardized info message for panels
- * Returns a formatted embed with blue color for visual distinction
+ * Create a standardized info message for panels.
+ * V2-native so it can replace V2 admin-panel messages via interaction.update().
  */
 export function createPanelInfo(
   title: string,
   message: string,
   details?: string
 ): PanelResponse {
-  const embed = new EmbedBuilder()
-    .setTitle(`ℹ️ ${title}`)
-    .setDescription(message)
-    .setColor(0x3498DB) // Blue
-    .setTimestamp();
-
+  const container = createTitledContainer(`ℹ️ ${title}`, undefined, V2Colors.info);
+  container.addTextDisplayComponents(createText(message));
   if (details) {
-    embed.addFields({ name: 'Details', value: details });
+    container.addTextDisplayComponents(createText(`\`\`\`${details}\`\`\``));
   }
-
-  return {
-    embeds: [embed],
-    flags: DISCORD_EPHEMERAL_FLAG
-  };
+  return createV2Response([container]);
 }
 
 /**

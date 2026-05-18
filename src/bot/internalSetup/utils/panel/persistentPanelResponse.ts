@@ -6,11 +6,9 @@ import {
   Client,
   Message,
   TextChannel,
-  EmbedBuilder,
   ActionRowBuilder,
   ButtonBuilder,
   StringSelectMenuBuilder,
-  Colors,
   ButtonInteraction,
   CommandInteraction,
   StringSelectMenuInteraction,
@@ -28,6 +26,11 @@ import {
 import { injectReturnButtonIfNeeded } from './panelResponseUtils';
 import { serializePanelResponse } from '../panelSerializer';
 import { DISCORD_EPHEMERAL_FLAG } from '@bot/constants';
+import {
+  createTitledContainer,
+  createText,
+  V2Colors,
+} from './v2';
 
 /**
  * Create a new persistent panel message
@@ -260,16 +263,17 @@ export async function convertPanelToError(
       return;
     }
 
-    const errorEmbed = new EmbedBuilder()
-      .setTitle('⚠️ Panel Inactive')
-      .setDescription(errorMessage)
-      .setColor(Colors.Red)
-      .setTimestamp()
-      .setFooter({ text: 'This panel is no longer active' });
+    // V2-native edit: the persistent panel was originally posted with the
+    // IsComponentsV2 flag, and Discord rejects edits that try to remove
+    // that flag. Build the inactive-state notice as a V2 container.
+    const container = createTitledContainer('⚠️ Panel Inactive', undefined, V2Colors.danger);
+    container.addTextDisplayComponents(createText(errorMessage));
+    container.addTextDisplayComponents(createText('-# This panel is no longer active'));
 
     await message.edit({
-      embeds: [errorEmbed],
-      components: []
+      components: [container],
+      flags: MessageFlags.IsComponentsV2,
+      embeds: [],
     });
   } catch (error) {
     console.error('Error converting panel to error state:', error);

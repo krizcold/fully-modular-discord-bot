@@ -4,8 +4,6 @@
 
 import {
   ButtonInteraction,
-  EmbedBuilder,
-  ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
   InteractionResponse,
@@ -13,7 +11,6 @@ import {
   CommandInteraction,
   StringSelectMenuInteraction,
   ModalSubmitInteraction,
-  Colors,
   MessageFlags,
 } from 'discord.js';
 import { PanelContext, PanelOptions, PanelResponse, PanelInteraction } from '@bot/types/panelTypes';
@@ -21,7 +18,14 @@ import { getPanelManager } from '../panelManager';
 import { storePersistentPanel } from './persistentPanelStorage';
 import { storeNavigationContext } from './panelButtonHandler';
 import { injectReturnButtonIfNeeded } from './panelResponseUtils';
-import { DISCORD_EPHEMERAL_FLAG } from '@bot/constants';
+import {
+  createTitledContainer,
+  createText,
+  createButtonRow,
+  createSeparator,
+  createV2Response,
+  V2Colors,
+} from './v2';
 
 /**
  * Create the warning message for a persistent panel
@@ -33,40 +37,26 @@ export function createPersistentPanelWarning(
   const warningMessage = panel.persistentWarningMessage ||
     'This panel will be visible to everyone in this channel and will persist even after you close Discord.';
 
-  const embed = new EmbedBuilder()
-    .setTitle('⚠️ Persistent Panel Warning')
-    .setDescription(warningMessage)
-    .setColor(Colors.Yellow)
-    .addFields(
-      {
-        name: 'Panel Information',
-        value: `**Name:** ${panel.name}\n**Description:** ${panel.description}`,
-        inline: false
-      }
-    )
-    .setFooter({ text: 'Click the button below to open the persistent panel' });
-
-  const row = new ActionRowBuilder<ButtonBuilder>()
-    .addComponents(
-      new ButtonBuilder()
-        .setCustomId(`persistent_warning_${panel.id}_${context.accessMethod}`)
-        .setLabel('Open Persistent Panel')
-        .setStyle(ButtonStyle.Primary)
-        .setEmoji('📋')
-    );
-
-  row.addComponents(
+  const container = createTitledContainer('⚠️ Persistent Panel Warning', undefined, V2Colors.warning);
+  container.addTextDisplayComponents(createText(warningMessage));
+  container.addTextDisplayComponents(createText(
+    `**Panel Information**\n**Name:** ${panel.name}\n**Description:** ${panel.description}`
+  ));
+  container.addTextDisplayComponents(createText('-# Click the button below to open the persistent panel'));
+  container.addSeparatorComponents(createSeparator());
+  container.addActionRowComponents(createButtonRow(
+    new ButtonBuilder()
+      .setCustomId(`persistent_warning_${panel.id}_${context.accessMethod}`)
+      .setLabel('Open Persistent Panel')
+      .setStyle(ButtonStyle.Primary)
+      .setEmoji('📋'),
     new ButtonBuilder()
       .setCustomId('persistent_warning_cancel')
       .setLabel('Cancel')
       .setStyle(ButtonStyle.Secondary)
-  );
+  ));
 
-  return {
-    embeds: [embed],
-    components: [row],
-    flags: DISCORD_EPHEMERAL_FLAG
-  };
+  return createV2Response([container]);
 }
 
 /**
@@ -79,10 +69,13 @@ export async function handlePersistentWarningButton(
 ): Promise<void> {
   const panel = getPanelManager().getPanel(panelId);
   if (!panel) {
+    const c = createTitledContainer('❌ Panel not found', undefined, V2Colors.danger);
+    c.addTextDisplayComponents(createText(`No panel registered for id \`${panelId}\`.`));
     await interaction.update({
-      content: '❌ Panel not found',
+      content: '',
       embeds: [],
-      components: []
+      components: [c],
+      flags: MessageFlags.IsComponentsV2,
     });
     return;
   }
@@ -106,11 +99,14 @@ export async function handlePersistentWarningButton(
 
     const channel = interaction.channel;
     if (!channel || !('send' in channel)) {
+      const c = createTitledContainer('❌ Failed to create persistent panel', undefined, V2Colors.danger);
+      c.addTextDisplayComponents(createText('The channel where this interaction came from is not text-based; cannot post a persistent panel here.'));
+      // editReply on a deferUpdate-ed V2 message must keep the V2 flag set.
       await interaction.editReply({
-        content: '❌ Failed to create persistent panel - invalid channel',
+        content: '',
         embeds: [],
-        components: []
-      });
+        components: [c],
+      } as any);
       return;
     }
 
@@ -155,11 +151,13 @@ export async function handlePersistentWarningButton(
   } catch (error) {
     console.error(`Error opening persistent panel ${panelId}:`, error);
     try {
+      const c = createTitledContainer('❌ Failed to open persistent panel', undefined, V2Colors.danger);
+      c.addTextDisplayComponents(createText(error instanceof Error ? error.message : 'Unknown error.'));
       await interaction.editReply({
-        content: '❌ Failed to open persistent panel',
+        content: '',
         embeds: [],
-        components: []
-      });
+        components: [c],
+      } as any);
     } catch (e) {
       console.error('[PersistentPanelWarning] Failed to send error message:', e);
     }
