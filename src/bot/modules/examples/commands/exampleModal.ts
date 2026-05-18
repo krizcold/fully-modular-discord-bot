@@ -17,7 +17,7 @@ const MODAL_ID = 'example_feedback_modal';
 const exampleModalCommand: CommandOptions = {
   name: 'modal-example',
   description: 'Shows an example modal popup.',
-  testOnly: true,
+  testOnly: false,
   requiredIntents: [GatewayIntentBits.Guilds],
 
   initialize: (client: Client) => {

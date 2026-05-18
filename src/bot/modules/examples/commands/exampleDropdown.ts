@@ -16,7 +16,7 @@ const DROPDOWN_PREFIX = 'example_select';
 const exampleDropdownCommand: CommandOptions = {
   name: 'dropdown-example',
   description: 'Shows a simple dropdown menu example.',
-  testOnly: true,
+  testOnly: false,
   requiredIntents: [GatewayIntentBits.Guilds],
 
   initialize: (client: Client) => {

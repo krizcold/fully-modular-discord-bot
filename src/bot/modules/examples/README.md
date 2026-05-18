@@ -37,7 +37,7 @@ These commands and panels serve as templates and demonstrations for:
 
 ## Usage
 
-All commands are set to `testOnly: true` and will only register in your test guild.
+All commands are set to `testOnly: false` so they register on every guild the bot is in. Flip them back to `testOnly: true` if you want to scope them to your test guild only.
 
 ## Technical Details
 

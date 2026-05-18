@@ -10,7 +10,7 @@ import { ContextMenuCommandOptions } from '@bot/types/commandTypes';
 const pingUserCommand: ContextMenuCommandOptions<UserContextMenuCommandInteraction> = {
   name: 'Ping User',
   type: ApplicationCommandType.User,
-  testOnly: true,
+  testOnly: false,
   requiredIntents: [GatewayIntentBits.Guilds],
 
   callback: async (client: Client, interaction: UserContextMenuCommandInteraction) => {

@@ -17,7 +17,7 @@ const BUTTON_PREFIX = 'ping-response';
 const pingButtonCommand: CommandOptions = {
   name: 'ping-button',
   description: 'Sends a ping button!',
-  testOnly: true,
+  testOnly: false,
   requiredIntents: [GatewayIntentBits.Guilds],
 
   initialize: (client: Client) => {

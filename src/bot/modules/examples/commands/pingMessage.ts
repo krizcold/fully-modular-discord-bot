@@ -9,7 +9,7 @@ import { ContextMenuCommandOptions } from '@bot/types/commandTypes';
 const pingMessageCommand: ContextMenuCommandOptions<MessageContextMenuCommandInteraction> = {
   name: 'Ping Message',
   type: ApplicationCommandType.Message,
-  testOnly: true,
+  testOnly: false,
   requiredIntents: [GatewayIntentBits.Guilds],
   permissionsRequired: ['SendMessages', 'ReadMessageHistory'],
   botPermissions: ['SendMessages'],
