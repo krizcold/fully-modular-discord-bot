@@ -1,4 +1,4 @@
-import { Client } from 'discord.js';
+import { ButtonBuilder, ButtonStyle, Client } from 'discord.js';
 import { getConfigProperty } from './configManager';
 import { getPremiumManager } from './premiumManager';
 import { getModuleRegistry } from './moduleRegistry';
@@ -38,6 +38,25 @@ import {
 } from './panel/persistentPanelResponse';
 import { cleanupPersistentPanelsOnStartup } from './panel/persistentPanelStorage';
 import { recoverPersistentPanels } from './panel/persistentPanelRecovery';
+
+/**
+ * Build the optional "Upgrade your tier" Link button list for a tier-blocked
+ * panel response. Returns an empty array when `WEBUI_BASE_URL` is not set
+ * (we cannot generate a valid link in that case) or the premium manager
+ * is unavailable - callers should pass the result straight to
+ * `createPanelError`'s `actions` parameter, which no-ops on empty.
+ */
+function buildUpgradeButtons(guildId: string): ButtonBuilder[] {
+  try {
+    const pm = getPremiumManager();
+    const url = pm.getGuildSubscriptionUrl(guildId);
+    if (!url) return [];
+    const label = pm.getMessages().upgradeButtonLabel || 'Upgrade your tier';
+    return [new ButtonBuilder().setStyle(ButtonStyle.Link).setURL(url).setLabel(label)];
+  } catch {
+    return [];
+  }
+}
 
 /**
  * Extract module name from a panel, if it belongs to a module.
@@ -203,11 +222,9 @@ export class PanelManager {
         try {
           const pm = getPremiumManager();
           const tierOverrides = pm.getTierOverrides(context.guildId, moduleName);
+          const upgrade = buildUpgradeButtons(context.guildId);
           if (tierOverrides._moduleEnabled === false) {
-            return createPanelError(
-              'Tier Restricted',
-              pm.getMessages().panelBlocked
-            );
+            return createPanelError('Tier Restricted', pm.getMessages().panelBlocked, undefined, upgrade);
           }
 
           // Manifest-driven tier gate
@@ -216,7 +233,7 @@ export class PanelManager {
             const mod = registry.getModule(moduleName);
             const tr = mod?.manifest?.tierRequirement;
             if (tr && typeof tr.minPriority === 'number' && !pm.hasFeatureAccess(context.guildId, tr.minPriority)) {
-              return createPanelError('Tier Restricted', pm.getMessages().panelBlocked);
+              return createPanelError('Tier Restricted', pm.getMessages().panelBlocked, undefined, upgrade);
             }
           } catch { /* module registry unavailable */ }
         } catch { /* premium manager not available; allow panel */ }

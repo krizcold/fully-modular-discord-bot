@@ -1,7 +1,25 @@
-import { Client, CommandInteraction, ContextMenuCommandInteraction, Interaction, PermissionsBitField, MessageFlags } from 'discord.js';
+import { ActionRowBuilder, ButtonBuilder, ButtonStyle, Client, CommandInteraction, ContextMenuCommandInteraction, Interaction, PermissionsBitField, MessageFlags } from 'discord.js';
 import getLocalCommands from '../../utils/getLocalCommands';
 import { getConfigProperty } from '../../utils/configManager';
 import { getPremiumManager } from '../../utils/premiumManager';
+
+/**
+ * Build the components array attached to a tier-blocked reply. When the host
+ * has set WEBUI_BASE_URL we surface a Link button to the guild's subscription
+ * page so the user can immediately go upgrade. Without WEBUI_BASE_URL we
+ * cannot generate a valid link, so we omit the button (the message text
+ * still appears).
+ */
+function buildBlockedReplyComponents(guildId: string): any[] {
+  const pm = getPremiumManager();
+  const url = pm.getGuildSubscriptionUrl(guildId);
+  if (!url) return [];
+  const label = pm.getMessages().upgradeButtonLabel || 'Upgrade your tier';
+  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setStyle(ButtonStyle.Link).setURL(url).setLabel(label)
+  );
+  return [row];
+}
 
 const testServer = process.env.GUILD_ID || ''; // Test server ID
 
@@ -81,9 +99,12 @@ export default async function handleCommands(client: Client, interaction: Intera
         const pm = getPremiumManager();
         const tierOverrides = pm.getTierOverrides(interaction.guildId, commandObject._moduleName);
 
+        const upgradeComponents = buildBlockedReplyComponents(interaction.guildId);
+
         if (tierOverrides._moduleEnabled === false) {
           interaction.reply({
             content: pm.getMessages().moduleBlocked,
+            components: upgradeComponents,
             flags: MessageFlags.Ephemeral,
           });
           return;
@@ -92,6 +113,7 @@ export default async function handleCommands(client: Client, interaction: Intera
         if (Array.isArray(tierOverrides._disabledCommands) && tierOverrides._disabledCommands.includes(commandObject.name)) {
           interaction.reply({
             content: pm.getMessages().commandBlocked,
+            components: upgradeComponents,
             flags: MessageFlags.Ephemeral,
           });
           return;
@@ -105,6 +127,7 @@ export default async function handleCommands(client: Client, interaction: Intera
           if (commandIsGated && !pm.hasFeatureAccess(interaction.guildId, tr.minPriority)) {
             interaction.reply({
               content: gatedByCommands ? pm.getMessages().commandBlocked : pm.getMessages().moduleBlocked,
+              components: upgradeComponents,
               flags: MessageFlags.Ephemeral,
             });
             return;

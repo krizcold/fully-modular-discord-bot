@@ -245,6 +245,7 @@ function AppStorePanel() {
           onSelectModule={(m) => { setSelectedModule(m); setView('detail'); }}
           onModuleChanged={loadData}
           repositories={repositories}
+          tiers={tiers}
         />
       )}
 
@@ -281,7 +282,7 @@ function AppStorePanel() {
 }
 
 // Modules View Component
-function ModulesView({ modules, installed, installJobs, categories, categoryFilter, onCategoryChange, onSelectModule, onModuleChanged, repositories }) {
+function ModulesView({ modules, installed, installJobs, categories, categoryFilter, onCategoryChange, onSelectModule, onModuleChanged, repositories, tiers }) {
   const installedCount = Object.keys(installed).length;
   const [autoCleanup, setAutoCleanup] = useState(false);
   const [autoUpdate, setAutoUpdate] = useState(false);
@@ -470,6 +471,7 @@ function ModulesView({ modules, installed, installJobs, categories, categoryFilt
               onUninstall={onModuleChanged}
               onUpdate={() => updateSingleModule(module.name)}
               updating={updating}
+              tiers={tiers}
             />
           ))}
         </div>
@@ -642,12 +644,27 @@ function CommandsView({ showSuccess, setError }) {
   );
 }
 
-function ModuleCard({ module, installed, installedEntry, installJob, updateInfo, onClick, onInstall, onUninstall, onUpdate, updating }) {
+function ModuleCard({ module, installed, installedEntry, installJob, updateInfo, onClick, onInstall, onUninstall, onUpdate, updating, tiers }) {
   const hasUpdate = !!updateInfo;
   const jobKind = installJob?.kind || null;
   const jobStatus = installJob?.status || null;
   const needsRestart = installed && installedEntry && installedEntry.loaded === false;
   const borderColor = hasUpdate ? '#e67e22' : needsRestart ? '#f5af19' : installed ? '#3ba55d' : jobStatus === 'running' ? '#5865F2' : jobStatus === 'queued' ? '#888' : jobStatus === 'failed' ? '#ed4245' : '#444';
+
+  // Tier badge: shown when the module declares a tierRequirement. Resolves
+  // the lowest-priority tier whose priority >= minPriority for a friendly
+  // "Requires <Tier>+" label; falls back to "Tier <minPriority>+" when no
+  // matching tier exists yet (e.g. the host hasn't created a high enough
+  // tier for the gate to be satisfiable).
+  const tr = module.tierRequirement;
+  let tierBadgeLabel = null;
+  if (tr && typeof tr.minPriority === 'number') {
+    const candidates = Object.values(tiers || {})
+      .filter(t => typeof t?.priority === 'number' && t.priority >= tr.minPriority)
+      .sort((a, b) => a.priority - b.priority);
+    const tierName = candidates[0]?.displayName;
+    tierBadgeLabel = tierName ? `Requires ${tierName}+` : `Tier ${tr.minPriority}+`;
+  }
 
   async function handleInstall(e) {
     e.stopPropagation();
@@ -696,15 +713,33 @@ function ModuleCard({ module, installed, installedEntry, installJob, updateInfo,
           <h3 style={{ margin: '0 0 5px 0', color: '#fff' }}>
             {module.displayName || module.name}
           </h3>
-          <span style={{
-            fontSize: '0.75rem',
-            color: '#888',
-            background: '#1a1a1a',
-            padding: '2px 8px',
-            borderRadius: '10px'
-          }}>
-            {module.category || 'misc'}
-          </span>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '5px', alignItems: 'center' }}>
+            <span style={{
+              fontSize: '0.75rem',
+              color: '#888',
+              background: '#1a1a1a',
+              padding: '2px 8px',
+              borderRadius: '10px'
+            }}>
+              {module.category || 'misc'}
+            </span>
+            {tierBadgeLabel && (
+              <span
+                title="This module is gated behind a premium tier on guilds that subscribe."
+                style={{
+                  fontSize: '0.72rem',
+                  color: '#f5af19',
+                  background: 'rgba(245, 175, 25, 0.12)',
+                  border: '1px solid rgba(245, 175, 25, 0.35)',
+                  padding: '2px 8px',
+                  borderRadius: '10px',
+                  fontWeight: 600,
+                }}
+              >
+                ★ {tierBadgeLabel}
+              </span>
+            )}
+          </div>
         </div>
         <div style={{ display: 'flex', gap: '5px', alignItems: 'center' }}>
           {installJob && jobStatus === 'queued' ? (
@@ -2734,7 +2769,7 @@ function PremiumTiersView({ tiers, subscriptions, messages, messageDefaults, onR
   const [subscriptionSearch, setSubscriptionSearch] = useState('');
 
   // Restriction messages state (local editable copy; prop provides current saved values)
-  const [msgDraft, setMsgDraft] = useState(() => messages || { moduleBlocked: '', commandBlocked: '', panelBlocked: '' });
+  const [msgDraft, setMsgDraft] = useState(() => messages || { moduleBlocked: '', commandBlocked: '', panelBlocked: '', upgradeButtonLabel: '' });
   const [msgSaving, setMsgSaving] = useState(false);
 
   // Dummy provider settings state (variants + products + coupons live in
@@ -3032,6 +3067,11 @@ function PremiumTiersView({ tiers, subscriptions, messages, messageDefaults, onR
   async function handleSaveTierName(tierId, newName) {
     const tier = tiers[tierId];
     if (!tier) return;
+    // Free is the deployment baseline; its display name is fixed ("Free")
+    // and the tier-update route refuses Free writes. Silently no-op so
+    // the inline rename UI doesn't fire a doomed request when accidentally
+    // committed on Free.
+    if (tierId === 'free') return;
     const trimmed = (newName || '').trim();
     if (!trimmed) { setError('Tier name cannot be empty'); return; }
     if (trimmed === tier.displayName) return;
@@ -3115,7 +3155,8 @@ function PremiumTiersView({ tiers, subscriptions, messages, messageDefaults, onR
   const msgDirty = !!messages && (
     (msgDraft.moduleBlocked || '') !== (messages.moduleBlocked || '') ||
     (msgDraft.commandBlocked || '') !== (messages.commandBlocked || '') ||
-    (msgDraft.panelBlocked || '') !== (messages.panelBlocked || '')
+    (msgDraft.panelBlocked || '') !== (messages.panelBlocked || '') ||
+    (msgDraft.upgradeButtonLabel || '') !== (messages.upgradeButtonLabel || '')
   );
 
   async function handleSaveMessages() {
@@ -3477,6 +3518,7 @@ function PremiumTiersView({ tiers, subscriptions, messages, messageDefaults, onR
               { key: 'moduleBlocked', label: 'Module blocked', help: 'Command run from a module disabled for the tier.' },
               { key: 'commandBlocked', label: 'Command blocked', help: 'Specific command disabled for the guild\u2019s tier.' },
               { key: 'panelBlocked', label: 'Panel blocked', help: 'Discord panel opened from a disabled module.' },
+              { key: 'upgradeButtonLabel', label: 'Upgrade button label', help: 'Label on the link button appended to blocked replies. Only shown when WEBUI_BASE_URL is set.' },
             ].map(({ key, label, help }) => {
               const value = msgDraft[key] ?? '';
               const defaultValue = messageDefaults && messageDefaults[key];
