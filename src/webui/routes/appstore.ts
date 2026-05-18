@@ -14,6 +14,12 @@ import {
   StoreModuleInfo
 } from '../../bot/internalSetup/utils/appStoreManager';
 import { getPremiumManager, DEFAULT_MESSAGES, PremiumMessages } from '../../bot/internalSetup/utils/premiumManager';
+import {
+  loadGlobalModuleConfig,
+  type GlobalModuleConfig,
+} from '../../bot/internalSetup/utils/settings/settingsStorage';
+import { getSettingsSchema } from '../../bot/internalSetup/utils/settings/settingsDiscovery';
+import type { HardLimitOverride, SettingValue } from '../../bot/types/settingsTypes';
 import { getPaymentRegistry } from '../../bot/internalSetup/utils/payment/paymentRegistry';
 import type { OfferingVariant } from '../../bot/internalSetup/utils/payment/paymentTypes';
 import { loadCredentials, saveCredentials, BotCredentials } from '../../utils/envLoader';
@@ -175,7 +181,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
           ...repo,
           githubToken: repo.githubToken ? '***' : null
         })),
-        tiers: premiumMgr.getAllTiers(),
+        tiers: premiumMgr.getAllTiersWithEffectiveFree(),
         subscriptions: premiumMgr.getAllSubscriptions(),
         messages: premiumMgr.getMessages(),
         messageDefaults: DEFAULT_MESSAGES,
@@ -726,6 +732,17 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
       const { id } = req.params;
       const { displayName, priority, overrides, offerings } = req.body;
 
+      // Free tier is the deployment baseline; its data lives in the Global
+      // module config (`/data/global/{module}/settings.json`) and is edited
+      // via PUT /api/appstore/global-config/:moduleName or the Discord
+      // System Panel. Tier-shaped updates to Free aren't supported.
+      if (id === 'free') {
+        return res.status(400).json({
+          success: false,
+          error: "Cannot edit the 'free' tier directly. Edit per-module Global config via /api/appstore/global-config/:moduleName or the Discord System Panel.",
+        });
+      }
+
       if (!displayName || typeof displayName !== 'string') {
         return res.status(400).json({
           success: false,
@@ -830,15 +847,16 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
 
   /**
    * PUT /api/appstore/premium/messages
-   * Body: { moduleBlocked?, commandBlocked?, panelBlocked? }
+   * Body: { moduleBlocked?, commandBlocked?, panelBlocked?, upgradeButtonLabel? }
    */
   router.put('/premium/messages', (req: Request, res: Response) => {
     try {
-      const { moduleBlocked, commandBlocked, panelBlocked } = req.body || {};
+      const { moduleBlocked, commandBlocked, panelBlocked, upgradeButtonLabel } = req.body || {};
       const partial: Partial<PremiumMessages> = {};
       if (typeof moduleBlocked === 'string') partial.moduleBlocked = moduleBlocked;
       if (typeof commandBlocked === 'string') partial.commandBlocked = commandBlocked;
       if (typeof panelBlocked === 'string') partial.panelBlocked = panelBlocked;
+      if (typeof upgradeButtonLabel === 'string') partial.upgradeButtonLabel = upgradeButtonLabel;
 
       if (Object.keys(partial).length === 0) {
         return res.status(400).json({ success: false, error: 'No valid message fields provided' });
@@ -869,6 +887,96 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
         success,
         messages: manager.getMessages(),
         defaults: DEFAULT_MESSAGES
+      });
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      res.status(500).json({ success: false, error: errorMessage });
+    }
+  });
+
+  /**
+   * GET /api/appstore/global-config/:moduleName
+   *
+   * Read the deployment baseline (Global / Free tier) for one module. This
+   * is the canonical source for module values, hard limits, the
+   * module-enabled flag, and the disabled-commands list. The Discord
+   * System Panel and the Web Premium Tiers > Free tier view both read
+   * from this endpoint.
+   */
+  router.get('/global-config/:moduleName', (req: Request, res: Response) => {
+    try {
+      const { moduleName } = req.params;
+      if (!moduleName || typeof moduleName !== 'string') {
+        return res.status(400).json({ success: false, error: 'moduleName required' });
+      }
+      const schema = getSettingsSchema(moduleName);
+      const config = loadGlobalModuleConfig(moduleName);
+      res.json({
+        success: true,
+        moduleName,
+        config,
+        schema: schema || null,
+      });
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      res.status(500).json({ success: false, error: errorMessage });
+    }
+  });
+
+  /**
+   * PUT /api/appstore/global-config/:moduleName
+   *
+   * Body: { values?, hardLimits?, moduleEnabled?, disabledCommands? }
+   *
+   * Writes a partial update to the module's deployment baseline. Paid-tier
+   * deltas are re-sanitized/pruned against the new baseline so they don't
+   * carry "worse than Free" remnants.
+   */
+  router.put('/global-config/:moduleName', (req: Request, res: Response) => {
+    try {
+      const { moduleName } = req.params;
+      if (!moduleName || typeof moduleName !== 'string') {
+        return res.status(400).json({ success: false, error: 'moduleName required' });
+      }
+
+      const body = req.body || {};
+      const partial: Partial<GlobalModuleConfig> = {};
+
+      if (body.values !== undefined) {
+        if (!body.values || typeof body.values !== 'object' || Array.isArray(body.values)) {
+          return res.status(400).json({ success: false, error: 'values must be an object' });
+        }
+        partial.values = body.values as Record<string, SettingValue>;
+      }
+      if (body.hardLimits !== undefined) {
+        if (!body.hardLimits || typeof body.hardLimits !== 'object' || Array.isArray(body.hardLimits)) {
+          return res.status(400).json({ success: false, error: 'hardLimits must be an object' });
+        }
+        partial.hardLimits = body.hardLimits as Record<string, HardLimitOverride>;
+      }
+      if (body.moduleEnabled !== undefined) {
+        if (typeof body.moduleEnabled !== 'boolean') {
+          return res.status(400).json({ success: false, error: 'moduleEnabled must be a boolean' });
+        }
+        partial.moduleEnabled = body.moduleEnabled;
+      }
+      if (body.disabledCommands !== undefined) {
+        if (!Array.isArray(body.disabledCommands) || !body.disabledCommands.every((c: any) => typeof c === 'string')) {
+          return res.status(400).json({ success: false, error: 'disabledCommands must be an array of strings' });
+        }
+        partial.disabledCommands = body.disabledCommands;
+      }
+
+      if (Object.keys(partial).length === 0) {
+        return res.status(400).json({ success: false, error: 'No valid fields provided' });
+      }
+
+      const manager = getPremiumManager();
+      const ok = manager.setGlobalModuleConfig(moduleName, partial);
+      res.json({
+        success: ok,
+        moduleName,
+        config: loadGlobalModuleConfig(moduleName),
       });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
@@ -2006,6 +2114,9 @@ function formatModuleInfo(info: StoreModuleInfo, includeComponents = false): any
     requiredPermissions: info.manifest.requiredPermissions || [],
     hasCredentials: !!info.manifest.apiCredentials,
     apiCredentials: info.manifest.apiCredentials || null,
+    // Forward the tier gate so the AppStore browse view can show a
+    // "Requires <Tier>+" badge on premium-only module cards.
+    tierRequirement: info.manifest.tierRequirement || null,
     repoId: info.repoId,
     repoName: info.repoName,
     installed: info.installed,

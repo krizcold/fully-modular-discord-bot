@@ -6,7 +6,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import type { SettingValue, MergedSettings, HardLimitOverride } from '@bot/types/settingsTypes';
 import { getSettingsSchema } from './settingsDiscovery';
-import { validateSettingValue } from './settingsValidation';
+import { validateSettingValue, validateValueWithEffectiveLimits } from './settingsValidation';
 
 const SETTINGS_FILENAME = 'settings.json';
 
@@ -39,48 +39,134 @@ function saveRawSettings(moduleName: string, settings: Record<string, SettingVal
   fs.writeFileSync(filePath, JSON.stringify(settings, null, 2), 'utf-8');
 }
 
-/** Load module settings with 4-tier merge: Guild > Tier Overrides > Global > Schema defaults */
+/** Load module settings with 4-tier merge: Guild > Paid tier delta > Global / Free baseline > Schema defaults */
 export function loadModuleSettings(moduleName: string, guildId?: string | null): MergedSettings | null {
   const schema = getSettingsSchema(moduleName);
   if (!schema) return null;
 
+  // Global / Free baseline values + per-guild overrides. The global file is
+  // also the canonical Free-tier baseline in the unified model; reading it
+  // here gives us the "no paid sub" view.
   const globalSettings = loadRawSettings(moduleName, null);
   const guildSettings = guildId ? loadRawSettings(moduleName, guildId) : {};
 
-  // Load tier overrides for this guild+module (if guild context)
+  // Active-paid-tier delta on top of global. Free guilds and no-guild
+  // contexts return `{}` here so the merge naturally falls through to
+  // the global baseline.
   let tierOverrides: Record<string, any> = {};
   if (guildId) {
     try {
       const { getPremiumManager } = require('../premiumManager');
       const pm = getPremiumManager();
-      const raw = pm.getTierOverrides(guildId, moduleName);
-      // Filter out internal keys (_moduleEnabled, _disabledCommands)
+      const raw = pm.getPaidTierDelta(guildId, moduleName);
+      // Filter out internal keys (_moduleEnabled, _disabledCommands, _hardLimits)
       for (const [k, v] of Object.entries(raw)) {
         if (!k.startsWith('_')) tierOverrides[k] = v;
       }
     } catch { /* premium manager not available */ }
   }
 
+  // Merged hard limits (system + tier) for read-time clamping. Clamping is
+  // purely a read-time view: storage retains whatever was saved, so a later
+  // tier upgrade auto-restores the original value without any re-write.
+  const mergedHardLimits = getMergedHardLimits(moduleName, guildId);
+
   const values: Record<string, SettingValue> = {};
   const sources: Record<string, 'default' | 'global' | 'tier' | 'guild'> = {};
+  const clamped: Record<string, { stored: SettingValue; effective: SettingValue }> = {};
 
   for (const [key, definition] of Object.entries(schema.settings)) {
+    let value: SettingValue;
     if (guildId && guildSettings.hasOwnProperty(key)) {
-      values[key] = guildSettings[key];
+      value = guildSettings[key];
       sources[key] = 'guild';
     } else if (tierOverrides.hasOwnProperty(key)) {
-      values[key] = tierOverrides[key];
+      value = tierOverrides[key];
       sources[key] = 'tier';
     } else if (globalSettings.hasOwnProperty(key)) {
-      values[key] = globalSettings[key];
+      value = globalSettings[key];
       sources[key] = 'global';
     } else {
-      values[key] = definition.default;
+      value = definition.default;
       sources[key] = 'default';
+    }
+    const effective = clampValueByHardLimit(value, definition.type, mergedHardLimits[key]);
+    values[key] = effective;
+    if (effective !== value) {
+      clamped[key] = { stored: value, effective };
     }
   }
 
-  return { values, sources, schema };
+  const result: MergedSettings = { values, sources, schema };
+  if (Object.keys(clamped).length > 0) result.clamped = clamped;
+  return result;
+}
+
+/**
+ * Clamp a stored setting value by its merged hard limit, type-aware.
+ * Numbers honor min/max, strings minLength/maxLength (truncating from the
+ * end if too long, not extending), arrays minItems/maxItems (truncating
+ * from the end). Anything outside these types passes through.
+ *
+ * Storage is unchanged on read - this is purely a view-time clamp so a
+ * later tier upgrade returns the original saved value automatically.
+ */
+function clampValueByHardLimit(
+  value: SettingValue,
+  type: string,
+  limit: HardLimitOverride | undefined
+): SettingValue {
+  if (!limit) return value;
+
+  if (type === 'number' && typeof value === 'number') {
+    let v = value;
+    if (typeof limit.min === 'number' && v < limit.min) v = limit.min;
+    if (typeof limit.max === 'number' && v > limit.max) v = limit.max;
+    return v;
+  }
+
+  if (type === 'string' && typeof value === 'string') {
+    let v = value;
+    if (typeof limit.maxLength === 'number' && v.length > limit.maxLength) {
+      v = v.slice(0, limit.maxLength);
+    }
+    return v;
+  }
+
+  if (Array.isArray(value)) {
+    let arr = value;
+    if (typeof limit.maxItems === 'number' && arr.length > limit.maxItems) {
+      arr = arr.slice(0, limit.maxItems);
+    }
+    return arr as SettingValue;
+  }
+
+  return value;
+}
+
+/**
+ * Merge system-panel hard limits (global, in /data/global/{module}/settings.json)
+ * with per-guild tier-supplied hard limits (from premiumManager). Tier wins on
+ * overlap, mirroring settingsPanelFactory.ts:206-220.
+ *
+ * Returns a per-setting-key map of HardLimitOverride. Used by read-time
+ * clamping (loadModuleSettings) and save-time validation (settingsHandlers).
+ */
+export function getMergedHardLimits(moduleName: string, guildId?: string | null): Record<string, HardLimitOverride> {
+  const merged: Record<string, HardLimitOverride> = { ...loadHardLimits(moduleName) };
+  if (!guildId) return merged;
+
+  try {
+    const { getPremiumManager } = require('../premiumManager');
+    const tierLimits = getPremiumManager().getTierHardLimits(guildId, moduleName) as Record<string, HardLimitOverride>;
+    if (tierLimits && typeof tierLimits === 'object') {
+      for (const [k, v] of Object.entries(tierLimits)) {
+        merged[k] = { ...(merged[k] || {}), ...v };
+      }
+    }
+  } catch { /* premium manager not available */ }
+
+  return merged;
 }
 
 /** Save a single setting */
@@ -175,6 +261,9 @@ export function importModuleSettings(moduleName: string, jsonData: string | Reco
 
   const errors: string[] = [];
   const validSettings: Record<string, SettingValue> = {};
+  // Use effective limits (schema + system + tier hard limits) so an import
+  // cannot bypass caps that the panel UI enforces.
+  const mergedLimits = getMergedHardLimits(moduleName, guildId);
 
   for (const [key, value] of Object.entries(data)) {
     const definition = schema.settings[key];
@@ -182,7 +271,7 @@ export function importModuleSettings(moduleName: string, jsonData: string | Reco
       errors.push(`Unknown: ${key}`);
       continue;
     }
-    const result = validateSettingValue(value, definition);
+    const result = validateValueWithEffectiveLimits(value, definition, mergedLimits[key]);
     if (!result.valid) {
       errors.push(`${key}: ${result.error}`);
     } else {
@@ -273,4 +362,134 @@ export function getHardLimit(moduleName: string, key: string): HardLimitOverride
 /** Reset hard limit for a specific setting (remove override) */
 export function resetHardLimit(moduleName: string, key: string): boolean {
   return saveHardLimit(moduleName, key, {});
+}
+
+// ============================================================================
+// Global Module Config (the deployment baseline)
+//
+// `/data/global/{moduleName}/settings.json` is the canonical source for the
+// deployment baseline of a module. Conceptually identical to "what Free tier
+// guilds see." Holds setting values, `_hardLimits` caps, `_moduleEnabled`
+// flag, and `_disabledCommands` list.
+//
+// Paid tiers layer their deltas on top of this baseline at read time via
+// `premiumManager.getTierOverrides`.
+// ============================================================================
+
+const MODULE_ENABLED_KEY = '_moduleEnabled';
+const DISABLED_COMMANDS_KEY = '_disabledCommands';
+
+/** Full shape of a module's global config, parsed from the settings file. */
+export interface GlobalModuleConfig {
+  values: Record<string, SettingValue>;
+  hardLimits: Record<string, HardLimitOverride>;
+  /** Default `true`; set to `false` to disable the module bot-wide. */
+  moduleEnabled: boolean;
+  /** Command names disabled bot-wide. */
+  disabledCommands: string[];
+}
+
+/** Load the full global config for a module. */
+export function loadGlobalModuleConfig(moduleName: string): GlobalModuleConfig {
+  const filePath = getSettingsFilePath(moduleName, null);
+  const empty: GlobalModuleConfig = {
+    values: {},
+    hardLimits: {},
+    moduleEnabled: true,
+    disabledCommands: [],
+  };
+  if (!fs.existsSync(filePath)) return empty;
+  try {
+    const data = JSON.parse(fs.readFileSync(filePath, 'utf-8') || '{}');
+    const {
+      [HARD_LIMITS_KEY]: hl,
+      [MODULE_ENABLED_KEY]: me,
+      [DISABLED_COMMANDS_KEY]: dc,
+      ...rest
+    } = data;
+    return {
+      values: rest,
+      hardLimits: hl && typeof hl === 'object' ? hl : {},
+      moduleEnabled: me !== false,
+      disabledCommands: Array.isArray(dc) ? dc.filter((c): c is string => typeof c === 'string') : [],
+    };
+  } catch (error) {
+    console.error(`[SettingsStorage] Error reading global config for ${moduleName}:`, error);
+    return empty;
+  }
+}
+
+/**
+ * Partial update of the global module config. Field semantics:
+ *
+ * - `values` (REPLACE): if present, all existing non-internal keys in the
+ *   file are removed first, then the new values are written. Callers who
+ *   want to update a single setting must send the FULL desired values
+ *   object. Pass `{}` to clear all setting values back to schema defaults.
+ *   Omit the field entirely to leave existing values alone.
+ * - `hardLimits` (REPLACE): if present, replaces the `_hardLimits` block.
+ *   Pass `{}` to clear all caps. Omit to leave existing caps alone.
+ * - `moduleEnabled`: `true` deletes the stored `_moduleEnabled` flag
+ *   (true is the default); `false` writes it. Omit to leave as-is.
+ * - `disabledCommands`: replaces the `_disabledCommands` list. Pass `[]`
+ *   to clear. Omit to leave as-is.
+ *
+ * The Discord System Panel and the Web Premium Tiers > Free tier view are
+ * both expected to send the FULL desired state per module so the file
+ * mirrors the in-memory editor view exactly.
+ */
+export function saveGlobalModuleConfig(
+  moduleName: string,
+  partial: Partial<GlobalModuleConfig>,
+): boolean {
+  const filePath = getSettingsFilePath(moduleName, null);
+  const dirPath = path.dirname(filePath);
+  try {
+    let data: Record<string, any> = {};
+    if (fs.existsSync(filePath)) {
+      data = JSON.parse(fs.readFileSync(filePath, 'utf-8') || '{}');
+    }
+
+    if (partial.values !== undefined) {
+      for (const k of Object.keys(data)) {
+        if (k.startsWith('_')) continue;
+        delete data[k];
+      }
+      for (const [k, v] of Object.entries(partial.values)) {
+        data[k] = v;
+      }
+    }
+    if (partial.hardLimits !== undefined) {
+      const hl = partial.hardLimits;
+      if (!hl || Object.keys(hl).length === 0) {
+        delete data[HARD_LIMITS_KEY];
+      } else {
+        data[HARD_LIMITS_KEY] = hl;
+      }
+    }
+    if (partial.moduleEnabled !== undefined) {
+      if (partial.moduleEnabled === true) {
+        delete data[MODULE_ENABLED_KEY];
+      } else {
+        data[MODULE_ENABLED_KEY] = false;
+      }
+    }
+    if (partial.disabledCommands !== undefined) {
+      const list = partial.disabledCommands;
+      if (!Array.isArray(list) || list.length === 0) {
+        delete data[DISABLED_COMMANDS_KEY];
+      } else {
+        data[DISABLED_COMMANDS_KEY] = list;
+      }
+    }
+
+    if (!fs.existsSync(dirPath)) {
+      fs.mkdirSync(dirPath, { recursive: true });
+    }
+    fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf-8');
+    return true;
+  } catch (error) {
+    console.error(`[SettingsStorage] Error saving global config for ${moduleName}:`, error);
+    return false;
+  }
 }

@@ -461,28 +461,371 @@ function TierEditorPanel({ tierId, tier, freeTier, onSave, onClose }) {
     const effective = effectiveOverrides(overrides, moduleSchemas, freeOverrides, isFreeTier);
     const snapshot = JSON.parse(JSON.stringify(effective));
     try {
-      // Send the full tier shape: setTier on the backend rebuilds the entire
-      // tier record, so any field omitted here would get reset to its empty
-      // default. In particular `offerings` must be passed through verbatim
-      // from the parent-supplied prop or paid offerings get wiped.
-      const res = await api.put(`/appstore/premium/tiers/${tierId}`, {
-        displayName: tier.displayName,
-        priority: tier.priority,
-        overrides: effective,
-        offerings: tier.offerings || [],
-      });
-      if (res.success) {
-        // Sync local state to the pruned form so the editor immediately
-        // reflects what's on disk. baseline + overrides land on the same
-        // value, so isDirty stays false until the user makes another change.
-        setOverrides(effective);
-        setBaseline(snapshot);
-        showToast('Tier configuration saved', 'success');
-        onSave();
-      } else showToast(res.error || 'Failed to save', 'error');
+      if (isFreeTier) {
+        // Free baseline lives in `/data/global/{module}/settings.json`, not
+        // in `tiers.free.overrides`. Decompose `effective` into per-module
+        // global-config writes; also write empty configs for modules that
+        // previously had baseline data but no longer do, so the on-disk
+        // state matches the editor view.
+        const moduleNames = new Set([
+          ...Object.keys(effective || {}),
+          ...Object.keys(baseline || {}),
+        ]);
+        const failures = [];
+        for (const moduleName of moduleNames) {
+          const mod = effective[moduleName] || {};
+          const { _moduleEnabled, _disabledCommands, _hardLimits, ...values } = mod;
+          const payload = {
+            values,
+            moduleEnabled: _moduleEnabled !== false,
+            disabledCommands: Array.isArray(_disabledCommands) ? _disabledCommands : [],
+            hardLimits: _hardLimits && typeof _hardLimits === 'object' ? _hardLimits : {},
+          };
+          try {
+            const r = await api.put(`/appstore/global-config/${encodeURIComponent(moduleName)}`, payload);
+            if (!r.success) failures.push(`${moduleName}: ${r.error || 'unknown error'}`);
+          } catch (e) {
+            failures.push(`${moduleName}: ${e.message || e}`);
+          }
+        }
+        if (failures.length === 0) {
+          setOverrides(effective);
+          setBaseline(snapshot);
+          showToast('Free baseline saved', 'success');
+          onSave();
+        } else {
+          showToast(`Saved with ${failures.length} error(s): ${failures.join('; ')}`, 'error');
+        }
+      } else {
+        // Send the full tier shape: setTier on the backend rebuilds the entire
+        // tier record, so any field omitted here would get reset to its empty
+        // default. In particular `offerings` must be passed through verbatim
+        // from the parent-supplied prop or paid offerings get wiped.
+        const res = await api.put(`/appstore/premium/tiers/${tierId}`, {
+          displayName: tier.displayName,
+          priority: tier.priority,
+          overrides: effective,
+          offerings: tier.offerings || [],
+        });
+        if (res.success) {
+          setOverrides(effective);
+          setBaseline(snapshot);
+          showToast('Tier configuration saved', 'success');
+          onSave();
+        } else showToast(res.error || 'Failed to save', 'error');
+      }
     } catch (err) {
       showToast('Error: ' + err.message, 'error');
     } finally { setSaving(false); }
+  }
+
+  // ── Hard-limit cap editor helpers ──
+  // Caps live at `overrides[moduleName]._hardLimits[key]` as a HardLimitOverride
+  // shape. Read returns own cap or inherited Free baseline; write touches own
+  // tier only.
+  function getCap(moduleName, key) {
+    const mod = getModOverrides(moduleName);
+    return (mod._hardLimits && mod._hardLimits[key]) || {};
+  }
+  function getFreeCap(moduleName, key) {
+    if (isFreeTier) return {};
+    const freeMod = getFreeModOverrides(moduleName);
+    return (freeMod._hardLimits && freeMod._hardLimits[key]) || {};
+  }
+  // Merged effective cap for the current tier context: Free baseline merged
+  // with this tier's own cap (this tier wins per-field, matching the
+  // server-side merge in `getTierHardLimits`). Used for live-clamping the
+  // VALUE input so as the host edits the cap inputs the value stays inside
+  // the new range.
+  function effectiveCap(moduleName, key) {
+    const own = getCap(moduleName, key);
+    if (isFreeTier) return own;
+    return { ...getFreeCap(moduleName, key), ...own };
+  }
+  // Compute the effective numeric clamp range for a NUMBER setting given
+  // its schema definition and the merged hard-limit cap currently in
+  // effect. Mirrors `validateValue` + `validateValueWithEffectiveLimits`
+  // server-side: absolute bounds are always enforced; the soft min/max
+  // is shadowed by the cap when the cap is set.
+  function numberEffectiveBound(settingDef, cap) {
+    const v = (settingDef && settingDef.validation) || {};
+    const softMin = typeof cap?.min === 'number' ? cap.min : v.min;
+    const softMax = typeof cap?.max === 'number' ? cap.max : v.max;
+    const aMin = v.absoluteMin;
+    const aMax = v.absoluteMax;
+    const effMin = (typeof aMin === 'number' && typeof softMin === 'number') ? Math.max(aMin, softMin)
+      : typeof aMin === 'number' ? aMin
+      : typeof softMin === 'number' ? softMin
+      : undefined;
+    const effMax = (typeof aMax === 'number' && typeof softMax === 'number') ? Math.min(aMax, softMax)
+      : typeof aMax === 'number' ? aMax
+      : typeof softMax === 'number' ? softMax
+      : undefined;
+    return { effMin, effMax };
+  }
+  // Same shape, but for STRING settings: clamps length, not numeric value.
+  // Used to drive `maxLength` on text inputs and to truncate the value
+  // when a cap tightens below the current value's length.
+  function stringEffectiveBound(settingDef, cap) {
+    const v = (settingDef && settingDef.validation) || {};
+    const softMinLength = typeof cap?.minLength === 'number' ? cap.minLength : v.minLength;
+    const softMaxLength = typeof cap?.maxLength === 'number' ? cap.maxLength : v.maxLength;
+    const aMinLength = v.absoluteMinLength ?? v.absoluteMin;
+    const aMaxLength = v.absoluteMaxLength ?? v.absoluteMax;
+    const effMinLength = (typeof aMinLength === 'number' && typeof softMinLength === 'number') ? Math.max(aMinLength, softMinLength)
+      : typeof aMinLength === 'number' ? aMinLength
+      : typeof softMinLength === 'number' ? softMinLength
+      : undefined;
+    const effMaxLength = (typeof aMaxLength === 'number' && typeof softMaxLength === 'number') ? Math.min(aMaxLength, softMaxLength)
+      : typeof aMaxLength === 'number' ? aMaxLength
+      : typeof softMaxLength === 'number' ? softMaxLength
+      : undefined;
+    return { effMinLength, effMaxLength };
+  }
+  // Pair lookup for the min <= max constraint on cap inputs.
+  function siblingCapKey(k) {
+    if (k === 'min') return 'max';
+    if (k === 'max') return 'min';
+    if (k === 'minLength') return 'maxLength';
+    if (k === 'maxLength') return 'minLength';
+    if (k === 'minItems') return 'maxItems';
+    if (k === 'maxItems') return 'minItems';
+    return null;
+  }
+  function patchCap(moduleName, key, patch) {
+    setOverrides(prev => {
+      const next = { ...prev };
+      const mod = { ...(next[moduleName] || {}) };
+      const hardLimits = { ...(mod._hardLimits || {}) };
+      const merged = { ...(hardLimits[key] || {}), ...patch };
+      // Drop undefined / null entries so the cap object only carries set fields.
+      for (const k of Object.keys(merged)) {
+        if (merged[k] === undefined || merged[k] === null || Number.isNaN(merged[k])) delete merged[k];
+      }
+      if (Object.keys(merged).length === 0) {
+        delete hardLimits[key];
+      } else {
+        hardLimits[key] = merged;
+      }
+      if (Object.keys(hardLimits).length === 0) {
+        delete mod._hardLimits;
+      } else {
+        mod._hardLimits = hardLimits;
+      }
+
+      // After the cap changes, drag the override value with it. If the
+      // stored value for this setting falls outside the new effective
+      // range, clamp it in place so the visible value never sits beyond
+      // the cap the host just typed.
+      const schemaForMod = (moduleSchemas || []).find(m => m.name === moduleName);
+      const settingDef = schemaForMod?.settings?.[key];
+      // Build the effective cap that will apply when this update lands:
+      // Free baseline (for non-Free tiers) + the just-updated cap.
+      const freeOwn = isFreeTier ? {} : (((freeOverrides[moduleName] || {})._hardLimits) || {})[key] || {};
+      const effCap = { ...freeOwn, ...merged };
+      if (settingDef && settingDef.type === 'number' && typeof mod[key] === 'number') {
+        const { effMin, effMax } = numberEffectiveBound(settingDef, effCap);
+        let v = mod[key];
+        if (typeof effMin === 'number' && v < effMin) v = effMin;
+        if (typeof effMax === 'number' && v > effMax) v = effMax;
+        if (v !== mod[key]) mod[key] = v;
+      } else if (settingDef && settingDef.type === 'string' && typeof mod[key] === 'string') {
+        // Truncate string values when their length cap shrinks below the
+        // current value's length. We do NOT pad shorter strings up to
+        // `minLength` automatically - that would invent characters the
+        // user didn't type; just let save-time validation flag it.
+        const { effMaxLength } = stringEffectiveBound(settingDef, effCap);
+        if (typeof effMaxLength === 'number' && mod[key].length > effMaxLength) {
+          mod[key] = mod[key].slice(0, effMaxLength);
+        }
+      }
+
+      if (Object.keys(mod).length === 0) {
+        delete next[moduleName];
+      } else {
+        next[moduleName] = mod;
+      }
+      return next;
+    });
+  }
+  function settingHasCaps(setting) {
+    const t = setting.type || 'string';
+    return t === 'number' || t === 'string'
+      || t === 'multiSelect' || t === 'multiChannel' || t === 'multiRole';
+  }
+  function renderCapsRow(moduleName, key, setting) {
+    if (!settingHasCaps(setting)) return null;
+    const cap = getCap(moduleName, key);
+    const freeCap = getFreeCap(moduleName, key);
+    const v = setting.validation || {};
+    const t = setting.type || 'string';
+    const fieldStyle = {
+      padding: '3px 6px', borderRadius: '4px', border: '1px solid #444',
+      background: '#171717', color: '#cfcfcf', fontSize: '0.75rem', width: '70px',
+    };
+    const labelStyle = { color: '#888', fontSize: '0.7rem' };
+
+    // Placeholder for an empty cap input: just the most relevant reference
+    // value (Free baseline if a paid tier has one, else the schema's
+    // recommended limit, else the absolute bound). No label - the field
+    // label next to the input already says what it is.
+    function placeholderFor(capKey, schemaKey, absoluteKey) {
+      if (!isFreeTier && freeCap[capKey] !== undefined) return String(freeCap[capKey]);
+      if (v[schemaKey] !== undefined) return String(v[schemaKey]);
+      if (v[absoluteKey] !== undefined) return String(v[absoluteKey]);
+      return '';
+    }
+
+    function field(capKey, placeholder, minAttr, maxAttr) {
+      // Caps must stay within their effective range (`validateHardLimits`
+      // in settingsValidation enforces this against `absoluteMin/Max` and
+      // `absoluteMinLength/MaxLength` etc. at save time; we mirror it
+      // here so the UI can't even emit an out-of-bound cap value).
+      //
+      // Also enforces `min <= max` (equal is allowed): typing min=10 when
+      // max=5 already exists clamps the new min to 5; typing max=5 when
+      // min=10 already exists clamps the new max to 10. The sibling cap
+      // pulls the typed value toward the valid range.
+      const siblingKey = siblingCapKey(capKey);
+      const siblingValue = siblingKey ? cap[siblingKey] : undefined;
+      const clamp = (n) => {
+        if (typeof n !== 'number' || Number.isNaN(n)) return n;
+        if (typeof minAttr === 'number' && n < minAttr) return minAttr;
+        if (typeof maxAttr === 'number' && n > maxAttr) return maxAttr;
+        if (typeof siblingValue === 'number') {
+          if (capKey.startsWith('min') && n > siblingValue) return siblingValue;
+          if (capKey.startsWith('max') && n < siblingValue) return siblingValue;
+        }
+        return n;
+      };
+      // Reference value for "empty + interaction" bootstrap: the
+      // placeholder. The placeholder already encodes the right reference
+      // (Free's cap for paid tiers, else schema's recommended limit, else
+      // the absolute bound). If the placeholder isn't numeric, fall back
+      // to the floor of the cap's effective range.
+      const placeholderNum = placeholder !== '' ? parseFloat(placeholder) : NaN;
+      const refNum = !Number.isNaN(placeholderNum) ? placeholderNum
+        : (typeof minAttr === 'number' ? minAttr : 0);
+      const isEmpty = cap[capKey] === undefined;
+      // String-coerce for stable controlled-input behavior across browsers.
+      const capValue = isEmpty || !Number.isFinite(cap[capKey]) ? '' : String(cap[capKey]);
+      // Custom paired +/- stepper. Native spinner clicks don't reveal
+      // direction, so we replace them with explicit buttons.
+      const stepBy = (direction) => {
+        const base = !isEmpty && Number.isFinite(cap[capKey]) ? cap[capKey] : refNum;
+        patchCap(moduleName, key, { [capKey]: clamp(base + direction) });
+      };
+      const stepperBtnStyle = {
+        background: '#171717', color: '#888', border: '1px solid #444',
+        cursor: 'pointer', padding: '0 3px', lineHeight: 1, fontSize: '0.55rem',
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+        flex: 1, minHeight: 0,
+      };
+      return (
+        <div style={{ display: 'inline-flex', alignItems: 'stretch' }}>
+          <input type="number" className="no-native-spinner"
+            style={{
+              ...fieldStyle, width: '60px',
+              borderTopRightRadius: 0, borderBottomRightRadius: 0,
+            }}
+            value={capValue}
+            placeholder={placeholder}
+            min={minAttr} max={maxAttr}
+            onKeyDown={(e) => {
+              if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+                e.preventDefault();
+                stepBy(e.key === 'ArrowUp' ? 1 : -1);
+              }
+            }}
+            onChange={(e) => {
+              const raw = e.target.value;
+              if (raw === '') { patchCap(moduleName, key, { [capKey]: undefined }); return; }
+              const num = parseFloat(raw);
+              if (Number.isNaN(num)) return;
+              patchCap(moduleName, key, { [capKey]: clamp(num) });
+            }} />
+          <div style={{ display: 'flex', flexDirection: 'column' }}>
+            <button type="button" onClick={() => stepBy(1)}
+              style={{ ...stepperBtnStyle, borderTopRightRadius: '4px', borderBottom: 'none', borderLeft: 'none' }}
+              aria-label="Increment"
+              tabIndex={-1}>▲</button>
+            <button type="button" onClick={() => stepBy(-1)}
+              style={{ ...stepperBtnStyle, borderBottomRightRadius: '4px', borderLeft: 'none' }}
+              aria-label="Decrement"
+              tabIndex={-1}>▼</button>
+          </div>
+        </div>
+      );
+    }
+
+    // For string/array caps, fall back to `absoluteMin`/`absoluteMax` when
+    // the type-specific length/items field isn't set, so a schema author
+    // writing `absoluteMin: 1` gets it honored as a length / item floor.
+    const absLo = (typeKey) => v[typeKey] ?? v.absoluteMin;
+    const absHi = (typeKey) => v[typeKey] ?? v.absoluteMax;
+
+    let fields;
+    let rangeText = null;
+    if (t === 'number') {
+      const lo = v.absoluteMin;
+      const hi = v.absoluteMax;
+      fields = (
+        <>
+          <span style={labelStyle}>min</span>
+          {field('min', placeholderFor('min', 'min', 'absoluteMin'), lo, hi)}
+          <span style={labelStyle}>max</span>
+          {field('max', placeholderFor('max', 'max', 'absoluteMax'), lo, hi)}
+        </>
+      );
+      const rLo = v.min ?? lo;
+      const rHi = v.max ?? hi;
+      if (rLo !== undefined || rHi !== undefined) rangeText = `${rLo ?? '−∞'}–${rHi ?? '∞'}`;
+    } else if (t === 'string') {
+      const lo = absLo('absoluteMinLength') ?? 0;
+      const hi = absHi('absoluteMaxLength');
+      fields = (
+        <>
+          <span style={labelStyle}>min length</span>
+          {field('minLength', placeholderFor('minLength', 'minLength', 'absoluteMinLength'), lo, hi)}
+          <span style={labelStyle}>max length</span>
+          {field('maxLength', placeholderFor('maxLength', 'maxLength', 'absoluteMaxLength'), lo, hi)}
+        </>
+      );
+      const rLo = v.minLength ?? lo;
+      const rHi = v.maxLength ?? hi;
+      if (rLo !== undefined || rHi !== undefined) rangeText = `${rLo ?? 0}–${rHi ?? '∞'} chars`;
+    } else {
+      const lo = absLo('absoluteMinItems') ?? 0;
+      const hi = absHi('absoluteMaxItems');
+      fields = (
+        <>
+          <span style={labelStyle}>min items</span>
+          {field('minItems', placeholderFor('minItems', 'minItems', 'absoluteMinItems'), lo, hi)}
+          <span style={labelStyle}>max items</span>
+          {field('maxItems', placeholderFor('maxItems', 'maxItems', 'absoluteMaxItems'), lo, hi)}
+        </>
+      );
+      const rLo = v.minItems ?? lo;
+      const rHi = v.maxItems ?? hi;
+      if (rLo !== undefined || rHi !== undefined) rangeText = `${rLo ?? 0}–${rHi ?? '∞'} items`;
+    }
+    return (
+      <div style={{
+        display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap',
+        marginTop: '4px', paddingLeft: '12px',
+        borderLeft: '2px solid rgba(245, 175, 25, 0.35)',
+      }}>
+        <span style={{ color: '#f5af19', fontSize: '0.7rem', fontWeight: 600, marginRight: '4px' }}>
+          {isFreeTier ? 'Cap' : 'Cap (overrides Free)'}
+        </span>
+        {fields}
+        {rangeText && (
+          <span style={{ color: '#666', fontSize: '0.72rem' }}>
+            <span style={{ color: '#888' }}>Range:</span> {rangeText}
+          </span>
+        )}
+      </div>
+    );
   }
 
   // ── Setting input renderer ──
@@ -519,11 +862,87 @@ function TierEditorPanel({ tierId, tier, freeTier, onSave, onClose }) {
         </label>
       );
     } else if (type === 'number') {
+      // Effective range is the intersection of:
+      //   - absolute bounds (immutable technical floor/ceiling)
+      //   - the cap currently being edited (Free baseline + this tier's
+      //     own cap merged), which shadows the schema's soft min/max
+      //   - the schema's soft min/max when no cap is set (the schema
+      //     author's recommended range)
+      // Mirrors the server-side `validateValueWithEffectiveLimits` flow.
+      const cap = effectiveCap(moduleName, key);
+      const { effMin, effMax } = numberEffectiveBound(setting, cap);
+      const hasMin = typeof effMin === 'number';
+      const hasMax = typeof effMax === 'number';
+      const clamp = (n) => {
+        if (typeof n !== 'number' || Number.isNaN(n)) return n;
+        if (hasMin && n < effMin) return effMin;
+        if (hasMax && n > effMax) return effMax;
+        return n;
+      };
+      // Coerce to a string for the `value` prop. React's controlled number
+      // input behaves inconsistently when the prop transitions between a
+      // number and an empty string: some browsers retain the last-shown
+      // text even when React thinks the value cleared. String normalizes
+      // the prop type across all states.
+      const valueProp = isSet && Number.isFinite(current) ? String(current) : '';
+      // Custom paired +/- stepper. Replaces the native spinner because we
+      // can't tell which native spinner button was clicked - both produce
+      // an onChange event with no direction information, and on an empty
+      // input the browser fills in the same min/step value for both, so
+      // UP and DOWN are indistinguishable. The custom buttons know which
+      // direction they are stepping in, and the keyboard arrow handler
+      // below mirrors the same logic for keyboard input.
+      const stepBy = (direction) => {
+        const base = isSet && Number.isFinite(current)
+          ? current
+          : (typeof setting.default === 'number' ? setting.default : 0);
+        setSettingValue(moduleName, key, clamp(base + direction));
+      };
+      const stepperBtnStyle = {
+        background: '#1a1a2e', color: '#888', border: '1px solid #555',
+        cursor: 'pointer', padding: '0 4px', lineHeight: 1, fontSize: '0.6rem',
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+        // No fixed height: `flex: 1` inside the column stretches each
+        // button to fill half of the input's natural height, so the
+        // total stepper matches the input regardless of font size /
+        // padding tweaks elsewhere.
+        flex: 1, minHeight: 0,
+      };
       input = (
-        <input type="number" style={{ ...inputStyle, width: '120px' }}
-          value={isSet ? current : ''} placeholder={String(setting.default ?? '')}
-          onChange={e => { const v = e.target.value; if (v === '') removeSettingOverride(moduleName, key); else setSettingValue(moduleName, key, parseFloat(v)); }}
-          min={setting.validation?.min} max={setting.validation?.max} />
+        <div style={{ display: 'inline-flex', alignItems: 'stretch' }}>
+          <input type="number" className="no-native-spinner"
+            style={{
+              ...inputStyle, width: '90px',
+              borderTopRightRadius: 0, borderBottomRightRadius: 0,
+            }}
+            value={valueProp}
+            placeholder={String(setting.default ?? '')}
+            min={hasMin ? effMin : undefined}
+            max={hasMax ? effMax : undefined}
+            onKeyDown={e => {
+              if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+                e.preventDefault();
+                stepBy(e.key === 'ArrowUp' ? 1 : -1);
+              }
+            }}
+            onChange={e => {
+              const raw = e.target.value;
+              if (raw === '') { removeSettingOverride(moduleName, key); return; }
+              const parsed = parseFloat(raw);
+              if (Number.isNaN(parsed)) return;
+              setSettingValue(moduleName, key, clamp(parsed));
+            }} />
+          <div style={{ display: 'flex', flexDirection: 'column' }}>
+            <button type="button" onClick={() => stepBy(1)}
+              style={{ ...stepperBtnStyle, borderTopRightRadius: '5px', borderBottom: 'none', borderLeft: 'none' }}
+              aria-label="Increment"
+              tabIndex={-1}>▲</button>
+            <button type="button" onClick={() => stepBy(-1)}
+              style={{ ...stepperBtnStyle, borderBottomRightRadius: '5px', borderLeft: 'none' }}
+              aria-label="Decrement"
+              tabIndex={-1}>▼</button>
+          </div>
+        </div>
       );
     } else if (type === 'select' && setting.options) {
       input = (
@@ -536,63 +955,135 @@ function TierEditorPanel({ tierId, tier, freeTier, onSave, onClose }) {
         </select>
       );
     } else if (type === 'color') {
-      const hexVal = isSet && current ? (current.startsWith('0x') ? '#' + current.slice(2) : current) : '';
+      // Hex preview color for the native `<input type="color">` swatch.
+      // Accepts both `0xRRGGBB` (canonical) and `#RRGGBB` (textbox) at
+      // read time, even if the typed value is mid-edit and not yet a
+      // complete hex string.
+      const hexVal = isSet && typeof current === 'string' && current
+        ? (current.startsWith('0x') ? '#' + current.slice(2) : current)
+        : '';
+      const isCompleteHex = (s) => typeof s === 'string'
+        && /^[0-9A-Fa-f]{6}$/.test(s.replace(/^(0x|#)/i, ''));
       input = (
         <div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
-          <input type="color" value={hexVal || '#5865F2'}
+          <input type="color" value={isCompleteHex(current) ? hexVal : '#5865F2'}
             onChange={e => setSettingValue(moduleName, key, '0x' + e.target.value.slice(1).toUpperCase())}
             style={{ width: '32px', height: '28px', border: 'none', background: 'none', cursor: 'pointer' }} />
           <input type="text" style={{ ...inputStyle, width: '100px' }}
             value={isSet ? current : ''} placeholder={String(setting.default ?? '')}
-            onChange={e => { if (e.target.value === '') removeSettingOverride(moduleName, key); else setSettingValue(moduleName, key, e.target.value); }} />
+            onChange={e => {
+              // Never interrupt while typing: store the raw text as-is,
+              // even mid-edit (e.g. `0xa-`). Validation + correction
+              // happens on blur, below.
+              const raw = e.target.value;
+              if (raw === '') { removeSettingOverride(moduleName, key); return; }
+              setSettingValue(moduleName, key, raw);
+            }}
+            onBlur={e => {
+              // On blur, normalize a valid hex (accept `RRGGBB`,
+              // `#RRGGBB`, or `0xRRGGBB`, any case) to the canonical
+              // `0xRRGGBB` form. If the value is invalid (incomplete,
+              // wrong length, non-hex characters), revert: drop the
+              // override so the field re-shows the schema default
+              // placeholder. This way the field never settles in an
+              // invalid state but the user can type freely without
+              // being corrected mid-keystroke.
+              const raw = (e.target.value || '').trim();
+              if (raw === '') { removeSettingOverride(moduleName, key); return; }
+              const stripped = raw.replace(/^(0x|#)/i, '');
+              if (/^[0-9A-Fa-f]{6}$/.test(stripped)) {
+                const normalized = '0x' + stripped.toUpperCase();
+                if (normalized !== current) setSettingValue(moduleName, key, normalized);
+              } else {
+                removeSettingOverride(moduleName, key);
+              }
+            }} />
         </div>
       );
     } else {
+      // Fallback for string-shaped settings (type: 'string', or anything
+      // not specially handled above). Mirrors the number input's clamp
+      // logic, but the bound is on length (HTML `maxLength` attribute
+      // prevents typing beyond, and the cap-change drag in patchCap
+      // truncates the stored value when a cap tightens).
+      const { effMaxLength } = stringEffectiveBound(setting, effectiveCap(moduleName, key));
       input = (
         <input type="text" style={{ ...inputStyle, width: '100%', maxWidth: '300px' }}
           value={isSet ? current : ''} placeholder={String(setting.default ?? '')}
-          onChange={e => { if (e.target.value === '') removeSettingOverride(moduleName, key); else setSettingValue(moduleName, key, e.target.value); }} />
+          maxLength={typeof effMaxLength === 'number' ? effMaxLength : undefined}
+          onChange={e => {
+            const raw = e.target.value;
+            if (raw === '') { removeSettingOverride(moduleName, key); return; }
+            // Defensive truncation for paste / IME / spec-compliance:
+            // HTML `maxLength` covers typing in most browsers but paste
+            // events can land an overflow.
+            const truncated = typeof effMaxLength === 'number' && raw.length > effMaxLength
+              ? raw.slice(0, effMaxLength)
+              : raw;
+            setSettingValue(moduleName, key, truncated);
+          }} />
       );
     }
 
     const freeVal = !isFreeTier ? getFreeSettingValue(moduleName, key) : undefined;
+    const metaStyle = { color: '#666', fontSize: '0.72rem' };
+    const metaBoldStyle = { color: '#888' };
 
     return (
       <div key={key} style={{
-        display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-        padding: '8px 12px', background: isOwned ? 'rgba(88, 101, 242, 0.05)' : 'transparent',
-        borderRadius: '6px', marginBottom: '4px', gap: '12px', flexWrap: 'wrap',
+        padding: '10px 12px',
+        background: isOwned ? 'rgba(88, 101, 242, 0.05)' : 'rgba(255,255,255,0.015)',
+        border: isOwned ? '1px solid rgba(88, 101, 242, 0.18)' : '1px solid #2a2a2a',
+        borderRadius: '6px', marginBottom: '6px',
       }}>
-        <div style={{ flex: '1 1 200px', minWidth: 0 }}>
-          <div style={{ color: '#ddd', fontSize: '0.85rem', fontWeight: 500 }}>
-            {setting.label || key}
-            {isInherited && (
-              <span title="Value inherited from the Free tier; changes to Free flow through here automatically." style={{
-                marginLeft: '8px', color: '#5aa5ff',
-                background: 'rgba(90, 165, 255, 0.08)', border: '1px solid rgba(90, 165, 255, 0.3)',
-                padding: '1px 6px', borderRadius: '10px', fontSize: '0.68rem', fontWeight: 500,
-              }}>inherited</span>
-            )}
-          </div>
-          {setting.description && <div style={{ color: '#666', fontSize: '0.75rem', marginTop: '2px' }}>{setting.description}</div>}
-          {setting.default !== undefined && <div style={{ color: '#555', fontSize: '0.72rem', marginTop: '1px' }}>Default: {String(setting.default)}</div>}
-          {!isFreeTier && freeVal !== undefined && (
-            <div style={{ color: '#5aa5ff', fontSize: '0.72rem', marginTop: '2px' }}>
-              Free tier: {String(freeVal)} <span style={{ color: '#666' }}>(use as reference; don't go worse than Free)</span>
-            </div>
+        {/* Title line: label + inherited badge */}
+        <div style={{ color: '#ddd', fontSize: '0.88rem', fontWeight: 600, marginBottom: '2px' }}>
+          {setting.label || key}
+          {isInherited && (
+            <span title="Value inherited from the Free tier; changes to Free flow through here automatically." style={{
+              marginLeft: '8px', color: '#5aa5ff',
+              background: 'rgba(90, 165, 255, 0.08)', border: '1px solid rgba(90, 165, 255, 0.3)',
+              padding: '1px 6px', borderRadius: '10px', fontSize: '0.68rem', fontWeight: 500,
+            }}>inherited</span>
           )}
         </div>
-        <div style={{ display: 'flex', gap: '6px', alignItems: 'center', flexShrink: 0 }}>
+
+        {/* Description (optional) */}
+        {setting.description && (
+          <div style={{ color: '#7a7a7a', fontSize: '0.75rem', marginBottom: '6px' }}>
+            {setting.description}
+          </div>
+        )}
+
+        {/* Value line: input, then inline metadata (default, Free baseline),
+            then Reset. Range info belongs with the caps row, not here. */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
           {input}
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+            {setting.default !== undefined && (
+              <span style={metaStyle}>
+                <span style={metaBoldStyle}>Default:</span> {String(setting.default)}
+              </span>
+            )}
+            {!isFreeTier && freeVal !== undefined && (
+              <span style={{ ...metaStyle, color: '#5aa5ff' }}
+                title="Reference: don't go worse than Free for this setting.">
+                <span style={metaBoldStyle}>Free:</span> {String(freeVal)}
+              </span>
+            )}
+          </div>
           {isOwned && (
             <button onClick={() => removeSettingOverride(moduleName, key)}
               title={freeVal !== undefined ? 'Clear override and inherit from Free' : 'Reset to default'}
               style={{
+                marginLeft: 'auto',
                 background: 'none', border: '1px solid #555', color: '#888', borderRadius: '4px',
                 padding: '4px 8px', cursor: 'pointer', fontSize: '0.75rem',
               }}>Reset</button>
           )}
         </div>
+
+        {renderCapsRow(moduleName, key, setting)}
       </div>
     );
   }

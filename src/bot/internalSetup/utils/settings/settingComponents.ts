@@ -23,6 +23,12 @@ export interface SettingComponentOptions {
   isSystemPanel?: boolean;
   /** Hard limit overrides from global settings */
   hardLimitOverride?: HardLimitOverride;
+  /**
+   * Set when the stored value was clamped down to the effective value at
+   * read time. Drives the strikethrough warning in the info line so the
+   * guild admin sees both the saved value and what's actually being used.
+   */
+  clampedInfo?: { stored: SettingValue; effective: SettingValue };
 }
 
 function buildCustomId(panelId: string, action: string, key: string, moduleName?: string, category?: string): string {
@@ -174,14 +180,21 @@ function formatDefault(defaultValue: SettingValue, type: string): string {
 }
 
 function buildInfoLine(options: SettingComponentOptions): string {
-  const { definition, value, defaultValue, hardLimitOverride, isSystemPanel } = options;
+  const { definition, value, defaultValue, hardLimitOverride, isSystemPanel, clampedInfo } = options;
 
-  // Always show value and constraints
+  // Always show effective value and constraints
   const displayValue = formatDisplayValue(value, definition.type);
   const constraints = formatConstraints({ definition, hardLimitOverride, isSystemPanel });
   const defaultStr = formatDefault(defaultValue, definition.type);
 
-  const parts = [displayValue];
+  // When the stored value got capped down, prepend `⚠ ~~stored~~ ` so the
+  // guild admin can see both what they saved and what's actually being
+  // applied. Reuses formatDisplayValue so all types format consistently.
+  const prefix = clampedInfo !== undefined
+    ? `⚠ ~~${formatDisplayValue(clampedInfo.stored, definition.type)}~~ `
+    : '';
+
+  const parts = [prefix + displayValue];
   const meta = [constraints, defaultStr].filter(Boolean);
   if (meta.length > 0) parts.push(`*${meta.join(' ')}*`);
 

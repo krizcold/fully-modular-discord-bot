@@ -35,8 +35,11 @@ import {
   exportModuleSettings,
   loadHardLimits,
   saveHardLimit,
+  getMergedHardLimits,
+  loadGlobalModuleConfig,
 } from './settingsStorage';
-import { parseSettingValue, validateSettingValue, validateHardLimits, getEffectiveLimits } from './settingsValidation';
+import { getPremiumManager } from '../premiumManager';
+import { parseSettingValue, validateSettingValue, validateValueWithEffectiveLimits, validateHardLimits, getEffectiveLimits } from './settingsValidation';
 
 // Types duplicated here to avoid circular dependency with settingsPanelFactory
 export interface SettingsPanelState {
@@ -272,12 +275,15 @@ export async function handleSettingsButton(
         return render(state);
       }
 
-      // Validate all pending changes
+      // Validate all pending changes against effective limits (schema +
+      // system-panel hard limits + tier-supplied hard limits). Without this
+      // a guild user could save a value above the cap they see in the UI.
+      const mergedLimits = getMergedHardLimits(moduleName, context.guildId);
       const errorMessages: string[] = [];
       for (const [key, value] of Object.entries(state.pendingChanges)) {
         const definition = schema.settings[key];
         if (definition) {
-          const result = validateSettingValue(value, definition);
+          const result = validateValueWithEffectiveLimits(value, definition, mergedLimits[key]);
           if (!result.valid && result.error) {
             errorMessages.push(`**${definition.label}**: ${result.error}`);
           }
@@ -330,6 +336,22 @@ export async function handleSettingsButton(
         flags: MessageFlags.Ephemeral,
       });
       return null;
+    }
+
+    case 'modtoggle': {
+      // System Panel-only toggle for the module's `_moduleEnabled` flag in
+      // Global config (the deployment baseline). Flips the persisted state
+      // and re-renders so the button label updates. Per-guild and tier
+      // edits use other surfaces; this one is the host's quick on/off.
+      try {
+        const pm = getPremiumManager();
+        const current = loadGlobalModuleConfig(moduleName).moduleEnabled;
+        pm.setGlobalModuleConfig(moduleName, { moduleEnabled: !current });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Failed to toggle module';
+        await sendEphemeralError(context, msg);
+      }
+      return render(state);
     }
 
     default:
@@ -390,7 +412,10 @@ export async function handleSettingsModal(
 
       const rawValue = getModalFieldValue(context, 'value');
       const parsed = parseSettingValue(rawValue, definition.type);
-      const result = validateSettingValue(parsed, definition);
+      // Validate against effective limits (schema + system + tier) so the cap
+      // shown in the modal label is also enforced on submit.
+      const mergedLimits = getMergedHardLimits(moduleName, context.guildId);
+      const result = validateValueWithEffectiveLimits(parsed, definition, mergedLimits[settingKey]);
 
       if (!result.valid && result.error) {
         // Send ephemeral error message instead of storing in state
@@ -573,9 +598,12 @@ export async function handleSettingsModal(
         }
         const parsedSettings = result.data;
 
+        // Validate each imported value against effective limits so a JSON
+        // upload cannot bypass the caps the user sees in the panel UI.
+        const mergedLimits = getMergedHardLimits(moduleName, context.guildId);
         for (const [key, value] of Object.entries(parsedSettings)) {
           const definition = schema.settings[key];
-          if (definition && validateSettingValue(value, definition).valid) {
+          if (definition && validateValueWithEffectiveLimits(value, definition, mergedLimits[key]).valid) {
             saveModuleSetting(moduleName, key, value, context.guildId);
           }
         }

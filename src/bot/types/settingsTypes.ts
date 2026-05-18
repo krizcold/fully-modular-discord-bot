@@ -298,12 +298,19 @@ export interface ConditionEvaluationResult {
  * Merged settings with metadata
  */
 export interface MergedSettings {
-  /** The merged setting values */
+  /** The merged setting values (post read-time hard-limit clamping) */
   values: Record<string, SettingValue>;
   /** Source of each value ('default' | 'global' | 'tier' | 'guild') */
   sources: Record<string, 'default' | 'global' | 'tier' | 'guild'>;
   /** The schema used */
   schema: SettingsSchema;
+  /**
+   * Map of keys whose stored value was clamped down by the effective
+   * hard limits at read time. Only present (per-key) when stored ≠ effective.
+   * Storage retains the original; this just lets the UI surface a warning
+   * so guild admins know their saved value is being capped.
+   */
+  clamped?: Record<string, { stored: SettingValue; effective: SettingValue }>;
 }
 
 /**

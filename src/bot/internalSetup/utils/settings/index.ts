@@ -46,6 +46,8 @@ export {
   parseSettingValue,
   formatValidationErrors,
   validateSettingValue,
+  validateValueWithEffectiveLimits,
+  getEffectiveLimits,
 } from './settingsValidation';
 
 // Storage
@@ -59,6 +61,7 @@ export {
   getModuleSetting,
   exportModuleSettings,
   importModuleSettings,
+  getMergedHardLimits,
 } from './settingsStorage';
 
 // Panel Factory

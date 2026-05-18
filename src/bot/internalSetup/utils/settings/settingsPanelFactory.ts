@@ -14,7 +14,7 @@ import type { PanelOptions, PanelContext, PanelResponse } from '@bot/types/panel
 import type { ModuleWithSettings, SettingsSchema, MergedSettings } from '@bot/types/settingsTypes';
 import { createV2Response } from '../panel/v2';
 import { buildSettingsPanel, buildErrorPanel } from './settingsBuilder';
-import { loadModuleSettings, loadHardLimits } from './settingsStorage';
+import { loadModuleSettings, getMergedHardLimits, loadGlobalModuleConfig } from './settingsStorage';
 import {
   handleSettingsButton,
   handleSettingsDropdown,
@@ -202,29 +202,31 @@ function renderSettingsPanel(
     return createV2Response(buildErrorPanel('Failed to load settings. Schema may be invalid.'));
   }
 
-  // Load hard limits: global, then merge tier-supplied limits on top (tier wins on overlap).
-  // Tier limits come from the guild's active tier's overrides[moduleName]._hardLimits.
-  let hardLimits = loadHardLimits(moduleName);
-  if (guildId) {
-    try {
-      const { getPremiumManager } = require('../premiumManager');
-      const tierLimits = getPremiumManager().getTierHardLimits(guildId, moduleName);
-      if (tierLimits && Object.keys(tierLimits).length > 0) {
-        const merged: Record<string, any> = { ...hardLimits };
-        for (const [k, v] of Object.entries(tierLimits)) {
-          merged[k] = { ...(merged[k] || {}), ...(v as any) };
-        }
-        hardLimits = merged;
-      }
-    } catch { /* premium manager not available */ }
-  }
+  // Effective hard limits = system-panel global + tier-supplied (tier wins).
+  // Same merge feeds save-time validation in settingsHandlers and read-time
+  // clamping in loadModuleSettings, so the panel UI, the modal validator,
+  // and the runtime view stay consistent.
+  const hardLimits = getMergedHardLimits(moduleName, guildId);
 
   // Apply pending changes to display
   const displaySettings: MergedSettings = {
     values: { ...settings.values, ...state.pendingChanges },
     sources: { ...settings.sources },
     schema: settings.schema,
+    // Forward the read-time clamp map so the renderer can show the
+    // "⚠ ~~stored~~ effective" warning. A pending change for a key
+    // means the user is actively editing it, so clear the clamp entry
+    // for that key (their new value will be re-evaluated on save).
+    clamped: settings.clamped ? { ...settings.clamped } : undefined,
   };
+  if (displaySettings.clamped) {
+    for (const k of Object.keys(state.pendingChanges)) {
+      delete displaySettings.clamped[k];
+    }
+    if (Object.keys(displaySettings.clamped).length === 0) {
+      delete displaySettings.clamped;
+    }
+  }
 
   // Mark pending changes with appropriate source
   const pendingSource = isGlobal ? 'global' : 'guild';
@@ -233,6 +235,13 @@ function renderSettingsPanel(
   }
 
   const isDirty = Object.keys(state.pendingChanges).length > 0;
+
+  // System Panel renders a `_moduleEnabled` toggle button alongside the
+  // existing Save / Reset / Upload / Download row. Read the current state
+  // from Global config so the button label reflects the persisted value.
+  const moduleEnabled = isGlobal
+    ? loadGlobalModuleConfig(moduleName).moduleEnabled
+    : true;
 
   const containers = buildSettingsPanel({
     schema,
@@ -245,6 +254,7 @@ function renderSettingsPanel(
     isDirty,
     isSystemPanel: isGlobal,
     hardLimits,
+    moduleEnabled,
   });
 
   return createV2Response(containers);

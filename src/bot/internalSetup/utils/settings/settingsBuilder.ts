@@ -56,6 +56,12 @@ export interface SettingsPanelOptions {
   isSystemPanel?: boolean;
   /** Hard limit overrides from global settings */
   hardLimits?: Record<string, import('@bot/types/settingsTypes').HardLimitOverride>;
+  /**
+   * Current `_moduleEnabled` state from the Global module config. Drives
+   * the toggle button label on the System Panel. Ignored on the guild
+   * panel.
+   */
+  moduleEnabled?: boolean;
 }
 
 function getSortedSections(schema: SettingsSchema): SectionDefinition[] {
@@ -80,6 +86,7 @@ export function buildSettingsPanel(options: SettingsPanelOptions): ContainerBuil
     schema, settings, currentSection, currentPage,
     moduleName, category, panelId,
     isDirty = false, isSystemPanel = false, hardLimits = {},
+    moduleEnabled = true,
   } = options;
 
   // Determine color based on state:
@@ -165,6 +172,10 @@ export function buildSettingsPanel(options: SettingsPanelOptions): ContainerBuil
       moduleName, category,
       isSystemPanel,
       hardLimitOverride: hardLimits[key],
+      // Pass the per-key clamp diff so the renderer can surface a
+      // strikethrough warning when the stored value got capped down
+      // at read time. Absent when stored === effective.
+      clampedInfo: settings.clamped?.[key],
     };
 
     const components = buildSettingComponent(componentOptions);
@@ -201,28 +212,37 @@ export function buildSettingsPanel(options: SettingsPanelOptions): ContainerBuil
     container.addTextDisplayComponents(new TextDisplayBuilder().setContent('-# *Unsaved changes*'));
   }
 
-  // Action buttons - single row
-  container.addActionRowComponents(
-    new ActionRowBuilder<ButtonBuilder>().addComponents(
-      new ButtonBuilder()
-        .setCustomId(`panel_${panelId}_btn_save_${moduleName}_${category}`)
-        .setLabel('Save')
-        .setStyle(ButtonStyle.Success)
-        .setDisabled(!isDirty),
-      new ButtonBuilder()
-        .setCustomId(`panel_${panelId}_btn_reset_${moduleName}_${category}`)
-        .setLabel('Reset All')
-        .setStyle(ButtonStyle.Danger),
-      new ButtonBuilder()
-        .setCustomId(`panel_${panelId}_btn_upload_${moduleName}_${category}`)
-        .setLabel('Upload')
-        .setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder()
-        .setCustomId(`panel_${panelId}_btn_download_${moduleName}_${category}`)
-        .setLabel('Download')
-        .setStyle(ButtonStyle.Secondary)
-    )
+  // Action buttons - single row. On the System Panel we add a 5th "Module:
+  // Enabled/Disabled" toggle that flips the global `_moduleEnabled` flag
+  // for this module (the deployment-wide on/off switch).
+  const actionRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`panel_${panelId}_btn_save_${moduleName}_${category}`)
+      .setLabel('Save')
+      .setStyle(ButtonStyle.Success)
+      .setDisabled(!isDirty),
+    new ButtonBuilder()
+      .setCustomId(`panel_${panelId}_btn_reset_${moduleName}_${category}`)
+      .setLabel('Reset All')
+      .setStyle(ButtonStyle.Danger),
+    new ButtonBuilder()
+      .setCustomId(`panel_${panelId}_btn_upload_${moduleName}_${category}`)
+      .setLabel('Upload')
+      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId(`panel_${panelId}_btn_download_${moduleName}_${category}`)
+      .setLabel('Download')
+      .setStyle(ButtonStyle.Secondary),
   );
+  if (isSystemPanel) {
+    actionRow.addComponents(
+      new ButtonBuilder()
+        .setCustomId(`panel_${panelId}_btn_modtoggle_${moduleName}_${category}`)
+        .setLabel(moduleEnabled ? 'Module: Enabled' : 'Module: Disabled')
+        .setStyle(moduleEnabled ? ButtonStyle.Primary : ButtonStyle.Secondary),
+    );
+  }
+  container.addActionRowComponents(actionRow);
 
   return [container];
 }

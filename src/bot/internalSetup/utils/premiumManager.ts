@@ -34,6 +34,11 @@ import path from 'path';
 import * as crypto from 'crypto';
 import { ensureDir } from './pathHelpers';
 import type { HardLimitOverride } from '../../types/settingsTypes';
+import {
+  loadGlobalModuleConfig,
+  saveGlobalModuleConfig,
+  type GlobalModuleConfig,
+} from './settings/settingsStorage';
 import { getPaymentRegistry } from './payment/paymentRegistry';
 import { dispatchPremiumNotification } from './premiumNotifications';
 import type {
@@ -176,6 +181,13 @@ export interface PremiumMessages {
   moduleBlocked: string;
   commandBlocked: string;
   panelBlocked: string;
+  /**
+   * Label on the "go upgrade" button appended to a blocked response when
+   * `WEBUI_BASE_URL` is set. The button links to the guild's subscription
+   * page. When `WEBUI_BASE_URL` is missing the button is omitted entirely
+   * (the rest of the message still shows).
+   */
+  upgradeButtonLabel: string;
 }
 
 /**
@@ -292,6 +304,7 @@ export const DEFAULT_MESSAGES: PremiumMessages = {
   moduleBlocked: ':no_entry_sign: This module is not available for your server\'s current tier.',
   commandBlocked: ':no_entry_sign: This command is not available for your server\'s current tier.',
   panelBlocked: ':no_entry_sign: This module is not available for your server\'s current tier.',
+  upgradeButtonLabel: 'Upgrade your tier',
 };
 
 const DEFAULT_CONFIG: PremiumConfig = {
@@ -471,6 +484,27 @@ function effectiveFreeModuleOverride(freeMod: Record<string, any> | undefined): 
   if (!freeMod) return {};
   if (freeMod._moduleEnabled === false) return { _moduleEnabled: false };
   return freeMod;
+}
+
+/**
+ * Convert a module's `GlobalModuleConfig` (the deployment baseline) into the
+ * legacy "Free-tier overrides for this module" shape that the rest of the
+ * tier-merge code expects (`{ _moduleEnabled?, _disabledCommands?, _hardLimits?, <key>: value }`).
+ *
+ * Storage layout changed in the unification rework: the deployment baseline
+ * lives in `/data/global/{module}/settings.json` instead of
+ * `tiers.free.overrides[module]`. This adapter keeps the existing override
+ * merge / prune / sanitize logic working without each caller having to know
+ * the storage move.
+ */
+function freeBaselineFromGlobal(g: GlobalModuleConfig): Record<string, any> {
+  const result: Record<string, any> = { ...g.values };
+  if (g.moduleEnabled === false) result._moduleEnabled = false;
+  if (g.disabledCommands.length > 0) result._disabledCommands = [...g.disabledCommands];
+  if (Object.keys(g.hardLimits).length > 0) {
+    result._hardLimits = JSON.parse(JSON.stringify(g.hardLimits));
+  }
+  return result;
 }
 
 function moduleOverrideRedundantVsFree(
@@ -839,6 +873,52 @@ export class PremiumManager {
     return { ...this.config.tiers };
   }
 
+  /**
+   * Like `getAllTiers`, but `tiers.free.overrides` is reconstructed from
+   * the Global module configs (`/data/global/{module}/settings.json`)
+   * instead of returned as the empty placeholder that lives on disk in
+   * the new model. Used by the Premium Tiers Web UI so the Free tier
+   * editor sees the host's baseline values + caps + flags.
+   */
+  getAllTiersWithEffectiveFree(): Record<string, PremiumTier> {
+    this.ensureLoaded();
+    const tiers: Record<string, PremiumTier> = {};
+    for (const [id, t] of Object.entries(this.config.tiers)) {
+      tiers[id] = { ...t, overrides: { ...t.overrides } };
+    }
+    if (tiers.free) {
+      tiers.free = { ...tiers.free, overrides: this.getEffectiveFreeOverrides() };
+    }
+    return tiers;
+  }
+
+  /**
+   * Build the legacy "Free-tier overrides" record by walking every module
+   * with a settings schema and adapting each Global config into the
+   * override shape (`{ _moduleEnabled?, _disabledCommands?, _hardLimits?, <key>: value }`).
+   * Modules without any baseline state contribute no entry. The shape
+   * matches what `tiers.free.overrides` looked like in the pre-unification
+   * model, so the Web Tier UI can keep treating it uniformly.
+   */
+  getEffectiveFreeOverrides(): Record<string, Record<string, any>> {
+    let modules: Array<{ name: string }> = [];
+    try {
+      const { getModulesWithSettings } = require('./settings/settingsDiscovery') as typeof import('./settings/settingsDiscovery');
+      modules = getModulesWithSettings();
+    } catch {
+      return {};
+    }
+    const result: Record<string, Record<string, any>> = {};
+    for (const { name } of modules) {
+      const cfg = loadGlobalModuleConfig(name);
+      const overrides = freeBaselineFromGlobal(cfg);
+      if (Object.keys(overrides).length > 0) {
+        result[name] = overrides;
+      }
+    }
+    return result;
+  }
+
   getTier(tierId: string): PremiumTier | null {
     this.ensureLoaded();
     return this.config.tiers[tierId] || null;
@@ -846,31 +926,22 @@ export class PremiumManager {
 
   setTier(tierId: string, tier: PremiumTier): boolean {
     this.ensureLoaded();
-    const before = this.config.tiers[tierId] ? JSON.parse(JSON.stringify(this.config.tiers[tierId])) : null;
+    // Free is the deployment baseline; its data lives in
+    // `/data/global/{module}/settings.json` and is edited via
+    // `setGlobalModuleConfig` (Web global-config route) or the Discord
+    // System Panel. Tier-shaped updates to Free are not supported.
     if (tierId === 'free') {
-      this.config.tiers.free = {
-        displayName: tier.displayName || 'Free',
-        priority: 0,
-        overrides: tier.overrides || {},
-        offerings: [],
-      };
-      // Free changed: re-sanitize + re-prune every other tier against the new baseline.
-      for (const [otherId, other] of Object.entries(this.config.tiers)) {
-        if (otherId === 'free') continue;
-        other.overrides = this.pruneOverridesAgainstFree(
-          this.sanitizeTierAgainstFree(other.overrides),
-        );
-      }
-    } else {
-      this.config.tiers[tierId] = {
-        displayName: tier.displayName,
-        priority: tier.priority,
-        overrides: this.pruneOverridesAgainstFree(
-          this.sanitizeTierAgainstFree(tier.overrides || {}),
-        ),
-        offerings: (tier.offerings || []).map(normalizeOffering),
-      };
+      throw new Error("Cannot edit the 'free' tier via setTier - edit Global module config via the System Panel or the global-config route instead");
     }
+    const before = this.config.tiers[tierId] ? JSON.parse(JSON.stringify(this.config.tiers[tierId])) : null;
+    this.config.tiers[tierId] = {
+      displayName: tier.displayName,
+      priority: tier.priority,
+      overrides: this.pruneOverridesAgainstFree(
+        this.sanitizeTierAgainstFree(tier.overrides || {}),
+      ),
+      offerings: (tier.offerings || []).map(normalizeOffering),
+    };
     const ok = this.save();
     if (ok) {
       this.writeAudit({
@@ -897,6 +968,42 @@ export class PremiumManager {
       }
     }
     return ok;
+  }
+
+  /**
+   * Update a module's Global / Free baseline config (values + caps + module
+   * flags + disabled commands). Source of truth is
+   * `/data/global/{module}/settings.json`. Edits flow through here from
+   * both the Discord System Panel and the Web Premium Tiers > Free tier
+   * view.
+   *
+   * After writing, every paid tier's `overrides[module]` is re-sanitized
+   * and re-pruned against the new baseline (mirrors what the old
+   * Free-tier path of setTier did, but scoped to the touched module).
+   */
+  setGlobalModuleConfig(moduleName: string, partial: Partial<GlobalModuleConfig>): boolean {
+    this.ensureLoaded();
+    const ok = saveGlobalModuleConfig(moduleName, partial);
+    if (!ok) return false;
+
+    // Re-sanitize + re-prune every paid tier's entry for this module against
+    // the new baseline. Free has no `overrides` payload of its own so it
+    // doesn't need touching.
+    for (const [tierId, tier] of Object.entries(this.config.tiers)) {
+      if (tierId === 'free') continue;
+      if (!tier.overrides[moduleName]) continue;
+      const singleModuleSet = { [moduleName]: tier.overrides[moduleName] };
+      const sanitized = this.pruneOverridesAgainstFree(
+        this.sanitizeTierAgainstFree(singleModuleSet),
+      );
+      if (sanitized[moduleName]) {
+        tier.overrides[moduleName] = sanitized[moduleName];
+      } else {
+        delete tier.overrides[moduleName];
+      }
+    }
+    this.save();
+    return true;
   }
 
   /**
@@ -1015,10 +1122,9 @@ export class PremiumManager {
   private sanitizeTierAgainstFree(
     tierOverrides: Record<string, Record<string, any>>,
   ): Record<string, Record<string, any>> {
-    const freeOverrides = this.config.tiers.free?.overrides || {};
     const result: Record<string, Record<string, any>> = {};
     for (const [moduleName, tierMod] of Object.entries(tierOverrides || {})) {
-      const freeMod = freeOverrides[moduleName] || {};
+      const freeMod = freeBaselineFromGlobal(loadGlobalModuleConfig(moduleName));
       const sanitized: Record<string, any> = { ...tierMod };
       const freeModuleOff = freeMod._moduleEnabled === false;
 
@@ -1041,10 +1147,9 @@ export class PremiumManager {
   private pruneOverridesAgainstFree(
     tierOverrides: Record<string, Record<string, any>>,
   ): Record<string, Record<string, any>> {
-    const freeOverrides = this.config.tiers.free?.overrides || {};
     const result: Record<string, Record<string, any>> = {};
     for (const [moduleName, tierMod] of Object.entries(tierOverrides || {})) {
-      const freeMod = freeOverrides[moduleName] || {};
+      const freeMod = freeBaselineFromGlobal(loadGlobalModuleConfig(moduleName));
       if (moduleOverrideRedundantVsFree(tierMod, freeMod)) continue;
       result[moduleName] = tierMod;
     }
@@ -2019,12 +2124,24 @@ export class PremiumManager {
   // OVERRIDES & FEATURE GATES (unchanged from prior model)
   // ============================================================================
 
+  /**
+   * Effective overrides for a guild + module: Global / Free baseline merged
+   * with the guild's active paid tier delta (if any). Storage source for
+   * the baseline is `/data/global/{module}/settings.json` (the System
+   * Panel's data); paid tier deltas live in `premium-tiers.json` under
+   * `tiers.{paidId}.overrides[module]`. Free guilds get baseline only.
+   *
+   * `_hardLimits` is merged key-by-key (paid wins on overlap). Other keys
+   * (`_moduleEnabled`, `_disabledCommands`, setting values) follow the same
+   * "paid wins" rule via object spread.
+   */
   getTierOverrides(guildId: string, moduleName: string): Record<string, any> {
-    const { tier, tierId } = this.resolveActiveTier(guildId);
-    const tierMod = tier.overrides[moduleName] || {};
-    if (tierId === 'free') return { ...tierMod };
-    const freeMod = this.config.tiers.free?.overrides?.[moduleName] || {};
-    const effectiveFree = effectiveFreeModuleOverride(freeMod);
+    const { tierId } = this.resolveActiveTier(guildId);
+    const baseline = freeBaselineFromGlobal(loadGlobalModuleConfig(moduleName));
+    if (tierId === 'free') return baseline;
+    const effectiveFree = effectiveFreeModuleOverride(baseline);
+    const tier = this.config.tiers[tierId];
+    const tierMod = tier?.overrides?.[moduleName] || {};
     const merged: Record<string, any> = { ...effectiveFree, ...tierMod };
     if (effectiveFree._hardLimits || tierMod._hardLimits) {
       merged._hardLimits = {
@@ -2042,6 +2159,25 @@ export class PremiumManager {
       return hl as Record<string, HardLimitOverride>;
     }
     return {};
+  }
+
+  /**
+   * Raw paid-tier delta for a guild + module. Returns ONLY the paid tier's
+   * own `overrides[moduleName]` payload (without merging the Global / Free
+   * baseline). Free guilds (or guilds with no active sub) return `{}`.
+   *
+   * Use this when you need to distinguish "value came from the host's
+   * deployment baseline" from "value came from the paid tier's delta" -
+   * for example, the settings panel source-labeling in
+   * `loadModuleSettings`. Most consumers want the merged result; use
+   * `getTierOverrides` for that.
+   */
+  getPaidTierDelta(guildId: string, moduleName: string): Record<string, any> {
+    const { tierId } = this.resolveActiveTier(guildId);
+    if (tierId === 'free') return {};
+    const tier = this.config.tiers[tierId];
+    const delta = tier?.overrides?.[moduleName];
+    return delta ? { ...delta } : {};
   }
 
   hasFeatureAccess(guildId: string, requiredPriority: number): boolean {
@@ -2243,6 +2379,18 @@ export class PremiumManager {
       });
     }
     return ok;
+  }
+
+  /**
+   * Resolve the URL to a guild's subscription page on the bot's web-UI.
+   * Returns null when WEBUI_BASE_URL is not configured - callers should
+   * gracefully omit the upgrade button in that case rather than show a
+   * broken link.
+   */
+  getGuildSubscriptionUrl(guildId: string): string | null {
+    const baseUrl = (process.env.WEBUI_BASE_URL || '').trim();
+    if (!baseUrl) return null;
+    return `${baseUrl.replace(/\/$/, '')}/guild/${encodeURIComponent(guildId)}/subscription`;
   }
 
   // ============================================================================

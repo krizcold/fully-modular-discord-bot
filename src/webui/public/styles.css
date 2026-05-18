@@ -4,6 +4,21 @@
   box-sizing: border-box;
 }
 
+/* Hide native number-input spinner buttons on inputs that opt into the
+ * custom paired +/- stepper UI (used by the Premium Tiers override editor).
+ * Native spinner clicks don't reliably reveal their direction, so we
+ * replace them with explicit buttons that know which way they're stepping. */
+.no-native-spinner::-webkit-inner-spin-button,
+.no-native-spinner::-webkit-outer-spin-button {
+  -webkit-appearance: none;
+  appearance: none;
+  margin: 0;
+}
+.no-native-spinner {
+  -moz-appearance: textfield;
+  appearance: textfield;
+}
+
 body {
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen', 'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue', sans-serif;
   background: #1a1a1a;
