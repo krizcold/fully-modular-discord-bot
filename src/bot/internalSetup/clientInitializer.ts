@@ -260,11 +260,13 @@ async function loadEventHandlers(client: Client) {
   // Special handling for 'interactionCreate' to order internal handlers
   const interactionCreateDir = path.join(internalEventsDir, 'interactionCreate');
   const handleCommandsPath = path.join(interactionCreateDir, isProd ? 'handleCommands.js' : 'handleCommands.ts');
+  const autocompleteHandlerPath = path.join(interactionCreateDir, isProd ? 'autocompleteHandler.js' : 'autocompleteHandler.ts');
   const buttonHandlerPath = path.join(interactionCreateDir, isProd ? 'buttonHandler.js' : 'buttonHandler.ts');
   const dropdownHandlerPath = path.join(interactionCreateDir, isProd ? 'dropdownHandler.js' : 'dropdownHandler.ts');
   const modalSubmitHandlerPath = path.join(interactionCreateDir, isProd ? 'modalSubmitHandler.js' : 'modalSubmitHandler.ts');
   const orderedInternalInteractionHandlers = [
     handleCommandsPath,
+    autocompleteHandlerPath,
     buttonHandlerPath,
     dropdownHandlerPath,
     modalSubmitHandlerPath

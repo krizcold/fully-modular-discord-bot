@@ -5,9 +5,39 @@
  * Replaces anonymous closure registration; every module event handler
  * is wrapped and stored with its reference, enabling clean removal
  * via client.removeListener().
+ *
+ * The wrapper also enforces module-level tier gating: when a module
+ * declares a whole-module `tierRequirement` (no `gatedCommands` and
+ * no `gatedFeatures` set, so the entire module is premium), event
+ * handlers are skipped for guilds whose active tier is below the
+ * required priority. Modules that gate at the command/feature level
+ * pass events through untouched - they self-gate via
+ * `pm.hasFeature(guildId, moduleName, featureName)` from inside the
+ * handler when premium-only behavior runs.
  */
 
 import { Client } from 'discord.js';
+
+/**
+ * Best-effort guildId extraction from a Discord.js event payload.
+ * Returns null when the event has no guild context (DMs, clientReady,
+ * etc.) - in that case we allow the event through unchanged.
+ *
+ * Covers the common Discord.js event shapes:
+ *   - {guildId} on Message, Channel, Interaction
+ *   - {guild: {id}} on GuildMember, Role, GuildBan, etc.
+ *   - voiceStateUpdate(old, new) - first arg has guild.id
+ */
+function extractGuildId(args: any[]): string | null {
+  for (const arg of args) {
+    if (!arg || typeof arg !== 'object') continue;
+    const direct = (arg as any).guildId;
+    if (typeof direct === 'string' && direct) return direct;
+    const nested = (arg as any).guild?.id;
+    if (typeof nested === 'string' && nested) return nested;
+  }
+  return null;
+}
 
 interface TrackedListener {
   eventName: string;
@@ -47,6 +77,14 @@ class ModuleEventManager {
 
     const wrappedHandler = async (...args: any[]) => {
       try {
+        // Whole-module tier gate: looked up at fire time so manifest hot-edits
+        // and tier upgrades take effect without re-registering listeners.
+        // We only auto-gate when the manifest signals a module-wide premium
+        // requirement (no gatedCommands and no gatedFeatures arrays). Modules
+        // that gate at the command or feature level pass events through and
+        // self-gate inside the handler.
+        if (this.shouldSkipEvent(moduleName, args)) return;
+
         await handler(this.client!, ...args);
       } catch (error) {
         console.error(`[ModuleLoader] Error in ${moduleName} ${eventName} handler:`, error);
@@ -142,6 +180,45 @@ class ModuleEventManager {
       total += this.removeModuleListeners(moduleName);
     }
     return total;
+  }
+
+  /**
+   * Whole-module tier gate for events. Returns true when this event should
+   * be skipped because the module is wholly premium-locked AND the guild
+   * resolved from the args is below the required tier priority.
+   *
+   * Returns false (allow) when:
+   *   - The module has no `tierRequirement` manifest entry.
+   *   - The module declares command-level or feature-level gates
+   *     (gatedCommands / gatedFeatures present): events pass through and
+   *     the module self-gates via `pm.hasFeature` from inside the handler.
+   *   - No guild can be extracted from the event args (DM, clientReady,
+   *     errors, etc.).
+   *   - The premium manager or registry is unavailable - we never fail
+   *     closed on infrastructure problems.
+   */
+  private shouldSkipEvent(moduleName: string, args: any[]): boolean {
+    let registry: any;
+    let pm: any;
+    try {
+      registry = require('./moduleRegistry').getModuleRegistry();
+      pm = require('./premiumManager').getPremiumManager();
+    } catch {
+      return false;
+    }
+
+    const manifest = registry.getModule(moduleName)?.manifest;
+    const tr = manifest?.tierRequirement;
+    if (!tr || typeof tr.minPriority !== 'number') return false;
+
+    const hasCommandGate = Array.isArray(tr.gatedCommands) && tr.gatedCommands.length > 0;
+    const hasFeatureGate = Array.isArray(tr.gatedFeatures) && tr.gatedFeatures.length > 0;
+    if (hasCommandGate || hasFeatureGate) return false;
+
+    const guildId = extractGuildId(args);
+    if (!guildId) return false;
+
+    return !pm.hasFeatureAccess(guildId, tr.minPriority);
   }
 }
 
