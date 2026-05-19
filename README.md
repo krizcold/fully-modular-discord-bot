@@ -448,7 +448,7 @@ npm run dev:webui        # Run Web-UI only
 **Building:**
 ```bash
 npm run build            # Compile for development (from src/)
-npm run build-prod       # Compile for production (from smdb-source/)
+npm run build-prod       # Compile for production (tsc only, used by container build)
 ```
 
 **Production:**
@@ -608,8 +608,8 @@ The project uses two services:
 
 ```yaml
 volumes:
-  - ./smdb-source:/app/smdb-source  # Editable source code
-  - ./data:/data                     # Persistent data
+  - ./custom:/app/custom  # User overrides (overlays /app/src at boot)
+  - ./data:/data          # Persistent data (appstore-modules, applied-version, bot data)
 ```
 
 ### Environment Variables
