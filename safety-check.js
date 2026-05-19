@@ -2,8 +2,9 @@
 
 /**
  * Safety Check Script
- * Runs before TypeScript compilation to prevent crash loops
- * Manages safe mode, crash detection, and auto-rollback
+ * Crash-loop guard. Counts crashes in a rolling window; on threshold trip,
+ * enters safe mode (Web-UI only, bot disabled). Auto-restore is deliberately
+ * NOT done here - the user decides whether to restore from a backup.
  */
 
 const fs = require('fs');
@@ -11,7 +12,6 @@ const path = require('path');
 
 // Configuration paths
 const SAFETY_CONFIG_PATH = '/data/update-safety.json';
-const UPDATE_CONFIG_PATH = '/data/update-config.json';
 const CRASH_LOGS_DIR = '/data/crash-logs';
 const BACKUPS_DIR = '/data/backups';
 
@@ -23,9 +23,7 @@ const DEFAULT_SAFETY_CONFIG = {
   crashCount: 0,
   crashHistory: [],
   lastSuccessfulStart: null,
-  currentVersion: null,
-  rollbackAvailable: false,
-  rollbackSnapshot: null
+  currentVersion: null
 };
 
 // Console colors
@@ -92,18 +90,6 @@ function cleanCrashHistory(config) {
 }
 
 /**
- * Check if rollback is available
- */
-function checkRollbackAvailable(config) {
-  if (!config.rollbackSnapshot) {
-    return false;
-  }
-
-  const backupPath = config.rollbackSnapshot.path;
-  return fs.existsSync(backupPath);
-}
-
-/**
  * Main safety check logic
  */
 function performSafetyCheck() {
@@ -138,31 +124,7 @@ function performSafetyCheck() {
   if (recentCrashCount >= config.maxConsecutiveCrashes) {
     console.log(`\n${colors.red}${colors.bright}🚨 CRASH THRESHOLD EXCEEDED${colors.reset}`);
     console.log(`Bot has crashed ${recentCrashCount} times in the last ${config.crashWindowMs / 60000} minutes.`);
-
-    // Check for rollback availability
-    const rollbackAvailable = checkRollbackAvailable(config);
-
-    if (rollbackAvailable) {
-      console.log(`${colors.green}Rollback available:${colors.reset} ${config.rollbackSnapshot.version || 'previous version'}`);
-      console.log('Auto-rollback will be triggered...');
-
-      // Trigger rollback (will be implemented in rollback.js)
-      try {
-        const rollbackScript = path.join(__dirname, 'rollback.js');
-        if (fs.existsSync(rollbackScript)) {
-          require(rollbackScript).performRollback(config.rollbackSnapshot);
-          console.log(`${colors.green}✓ Rollback completed successfully${colors.reset}`);
-
-          // Clear crash history after successful rollback
-          config.crashHistory = [];
-          config.crashCount = 0;
-        }
-      } catch (error) {
-        console.error(`${colors.red}Rollback failed:${colors.reset}`, error.message);
-      }
-    } else {
-      console.log(`${colors.red}No rollback available${colors.reset}`);
-    }
+    console.log('Entering safe mode. Use the Web-UI to inspect crash logs and, if needed, manually restore a backup.');
 
     // Enable safe mode
     config.safeMode = true;
@@ -171,18 +133,7 @@ function performSafetyCheck() {
 
     saveSafetyConfig(config);
 
-    console.log(`\n${colors.yellow}Entering SAFE MODE to prevent further crashes.${colors.reset}`);
     process.exit(2);
-  }
-
-  // Check if we're recovering from a previous update
-  const updateConfig = loadUpdateConfig();
-  if (updateConfig.updateInProgress) {
-    console.log(`${colors.yellow}Update in progress:${colors.reset} ${updateConfig.updateMode || 'unknown'}`);
-
-    // Record that we're attempting to start after an update
-    config.lastUpdateAttempt = Date.now();
-    config.lastUpdateMode = updateConfig.updateMode;
   }
 
   // Save updated config
@@ -193,21 +144,6 @@ function performSafetyCheck() {
 
   // Exit with 0 to continue normal startup
   process.exit(0);
-}
-
-/**
- * Load update configuration
- */
-function loadUpdateConfig() {
-  try {
-    if (fs.existsSync(UPDATE_CONFIG_PATH)) {
-      const content = fs.readFileSync(UPDATE_CONFIG_PATH, 'utf8');
-      return JSON.parse(content);
-    }
-  } catch (error) {
-    console.error(`${colors.red}Error loading update config:${colors.reset}`, error.message);
-  }
-  return { updateInProgress: false };
 }
 
 /**

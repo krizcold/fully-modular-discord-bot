@@ -442,14 +442,17 @@ export function createUpdateRouter(botManager: BotManager): Router {
         await execAsync(`cp -a ${backupAppstore}/. /data/appstore-modules/`);
       }
 
-      const metadata = JSON.parse(
-        fs.readFileSync(path.join(backupPath, 'metadata.json'), 'utf8')
-      );
-      safetyManager.createRollbackSnapshot(
-        metadata.version,
-        'rollback',
-        backupPath
-      );
+      // Wipe ephemeral build outputs + the applied-version marker so the next
+      // boot's buildId compare rebuilds /app/build and /app/dist from the
+      // restored sources. Mirrors performRollback in rollback.js.
+      await execAsync('rm -rf /app/build /app/dist');
+      try {
+        if (fs.existsSync('/data/applied-version.json')) {
+          fs.unlinkSync('/data/applied-version.json');
+        }
+      } catch {
+        // best-effort
+      }
 
       res.json({
         success: true,

@@ -2,14 +2,29 @@
 
 /**
  * Rollback Script
- * Restores smdb-source from a backup snapshot when crash threshold is exceeded.
- * Called by safety-check.js during auto-recovery.
+ * Restores /app/custom and /data/appstore-modules from a backup snapshot
+ * when the crash threshold is exceeded. Called by safety-check.js during
+ * auto-recovery; also runnable from the CLI for manual snapshots / rollbacks.
+ *
+ * Backup layout (matches the Web-UI /api/update/backup route):
+ *   /data/backups/backup-<timestamp>/
+ *     custom/             (mirror of /app/custom)
+ *     appstore-modules/   (mirror of /data/appstore-modules)
+ *     metadata.json
+ *
+ * /app/src is image-baked (immutable) - image revert is its mechanism.
+ * /app/build and /app/dist are ephemeral - rebuilt from src+custom by start.sh
+ * on every buildId mismatch.
  */
 
 const fs = require('fs');
 const path = require('path');
 
-const SMDB_SOURCE_PATH = '/app/smdb-source';
+const CUSTOM_PATH = '/app/custom';
+const APPSTORE_MODULES_PATH = '/data/appstore-modules';
+const BUILD_PATH = '/app/build';
+const DIST_PATH = '/app/dist';
+const APPLIED_VERSION_PATH = '/data/applied-version.json';
 const BACKUPS_PATH = '/data/backups';
 
 /**
@@ -52,9 +67,26 @@ function emptyDirectory(dirPath) {
 }
 
 /**
+ * Restore a single subdir from backup into its target location.
+ * Returns true if the subdir existed in the backup and was restored.
+ */
+function restoreSubdir(backupSubdir, targetDir, label) {
+  if (!fs.existsSync(backupSubdir)) {
+    console.log(`[Rollback] Backup has no ${label}/, skipping ${targetDir} restore`);
+    return false;
+  }
+
+  console.log(`[Rollback] Restoring ${targetDir} from backup...`);
+  fs.mkdirSync(targetDir, { recursive: true });
+  emptyDirectory(targetDir);
+  copyDirectory(backupSubdir, targetDir);
+  return true;
+}
+
+/**
  * Perform rollback from a backup snapshot
  * @param {Object} snapshot - Snapshot info with path and version
- * @param {string} snapshot.path - Path to backup directory
+ * @param {string} snapshot.path - Path to backup directory (/data/backups/backup-<ts>)
  * @param {string} [snapshot.version] - Version string for logging
  */
 function performRollback(snapshot) {
@@ -63,38 +95,34 @@ function performRollback(snapshot) {
   }
 
   const backupPath = snapshot.path;
-  const sourcePath = path.join(backupPath, 'smdb-source');
+  const backupCustom = path.join(backupPath, 'custom');
+  const backupAppstore = path.join(backupPath, 'appstore-modules');
 
   console.log(`[Rollback] Starting rollback to: ${snapshot.version || 'previous version'}`);
   console.log(`[Rollback] Backup path: ${backupPath}`);
 
-  // Verify backup exists
   if (!fs.existsSync(backupPath)) {
     throw new Error(`Backup not found: ${backupPath}`);
   }
 
-  if (!fs.existsSync(sourcePath)) {
-    throw new Error(`Backup source not found: ${sourcePath}`);
+  if (!fs.existsSync(backupCustom) && !fs.existsSync(backupAppstore)) {
+    throw new Error(`Backup is corrupted (missing custom and appstore-modules): ${backupPath}`);
   }
 
-  // Verify smdb-source is writable
-  const testFile = path.join(SMDB_SOURCE_PATH, '.rollback-test');
-  try {
-    fs.writeFileSync(testFile, 'test');
-    fs.unlinkSync(testFile);
-  } catch (error) {
-    throw new Error(`Cannot write to smdb-source: ${error.message}`);
+  restoreSubdir(backupCustom, CUSTOM_PATH, 'custom');
+  restoreSubdir(backupAppstore, APPSTORE_MODULES_PATH, 'appstore-modules');
+
+  // Clear ephemeral build outputs and the applied-version marker so the next
+  // boot's buildId compare in start.sh rebuilds /app/build and /app/dist from
+  // the restored /app/custom + /app/src + /data/appstore-modules.
+  console.log('[Rollback] Clearing /app/build, /app/dist, /data/applied-version.json (next boot rebuilds)');
+  fs.rmSync(BUILD_PATH, { recursive: true, force: true });
+  fs.rmSync(DIST_PATH, { recursive: true, force: true });
+  if (fs.existsSync(APPLIED_VERSION_PATH)) {
+    fs.unlinkSync(APPLIED_VERSION_PATH);
   }
 
-  // Empty current smdb-source
-  console.log('[Rollback] Clearing current smdb-source...');
-  emptyDirectory(SMDB_SOURCE_PATH);
-
-  // Copy backup to smdb-source
-  console.log('[Rollback] Restoring from backup...');
-  copyDirectory(sourcePath, SMDB_SOURCE_PATH);
-
-  // Update rollback metadata
+  // Update backup metadata
   const metadataPath = path.join(backupPath, 'metadata.json');
   if (fs.existsSync(metadataPath)) {
     try {
@@ -130,10 +158,11 @@ function listBackups() {
 
     const backupPath = path.join(BACKUPS_PATH, entry.name);
     const metadataPath = path.join(backupPath, 'metadata.json');
-    const sourcePath = path.join(backupPath, 'smdb-source');
+    const customPath = path.join(backupPath, 'custom');
+    const appstorePath = path.join(backupPath, 'appstore-modules');
 
-    // Skip if source doesn't exist
-    if (!fs.existsSync(sourcePath)) continue;
+    // Accept a backup as long as at least one of the two subdirs is present.
+    if (!fs.existsSync(customPath) && !fs.existsSync(appstorePath)) continue;
 
     let metadata = {
       timestamp: parseInt(entry.name.replace('backup-', '')) || 0,
@@ -172,7 +201,8 @@ function getLatestBackup() {
 }
 
 /**
- * Create a rollback snapshot from current smdb-source
+ * Create a rollback snapshot of the two mutable user-state dirs
+ * (/app/custom + /data/appstore-modules).
  * @param {string} [description] - Optional description
  * @returns {Object} Snapshot info
  */
@@ -183,17 +213,17 @@ function createSnapshot(description = 'Manual snapshot') {
 
   console.log(`[Rollback] Creating snapshot: ${backupName}`);
 
-  // Ensure backups directory exists
   fs.mkdirSync(BACKUPS_PATH, { recursive: true });
-
-  // Create backup directory
   fs.mkdirSync(backupPath, { recursive: true });
 
-  // Copy smdb-source to backup
-  const destDir = path.join(backupPath, 'smdb-source');
-  copyDirectory(SMDB_SOURCE_PATH, destDir);
+  if (fs.existsSync(CUSTOM_PATH)) {
+    copyDirectory(CUSTOM_PATH, path.join(backupPath, 'custom'));
+  }
+  if (fs.existsSync(APPSTORE_MODULES_PATH)) {
+    copyDirectory(APPSTORE_MODULES_PATH, path.join(backupPath, 'appstore-modules'));
+  }
 
-  // Get version from package.json
+  // Read version from package.json
   let version = 'unknown';
   try {
     const packageJson = JSON.parse(fs.readFileSync('/app/package.json', 'utf-8'));
@@ -202,7 +232,6 @@ function createSnapshot(description = 'Manual snapshot') {
     // Ignore
   }
 
-  // Create metadata
   const metadata = {
     timestamp,
     version,

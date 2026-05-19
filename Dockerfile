@@ -43,8 +43,11 @@ RUN mkdir -p /app/src/updater && \
     fi && \
     rm -rf /tmp/updaters
 
-# Copy safety check script for crash loop prevention
+# Copy safety check + rollback scripts for crash loop prevention.
+# safety-check.js require()s rollback.js from the same dir during auto-recovery,
+# so both must ship in the image.
 COPY --chown=node:node safety-check.js /app/safety-check.js
+COPY --chown=node:node rollback.js /app/rollback.js
 
 # Bake the seed for /app/custom (copied to /app/custom by start.sh on first boot)
 COPY --chown=node:node custom-seed/ /app/custom-seed/

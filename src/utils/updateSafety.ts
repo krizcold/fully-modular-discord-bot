@@ -21,39 +21,27 @@ export interface SafetyConfig {
   crashHistory: CrashRecord[];
   lastSuccessfulStart: number | null;
   currentVersion: string | null;
-  rollbackAvailable: boolean;
-  rollbackSnapshot: RollbackSnapshot | null;
   safeModeReason?: string;
   safeModeTimestamp?: number;
-  lastUpdateAttempt?: number;
-  lastUpdateMode?: string;
 }
 
 export interface CrashRecord {
   timestamp: number;
   exitCode: number | null;
   signal: string | null;
-  updateMode?: string;
   errorMessage?: string;
   logSnippet?: string[];
 }
 
-export interface RollbackSnapshot {
-  timestamp: number;
-  version: string;
-  updateMode: string;
-  path: string;
-  size?: number;
-}
-
 export interface BackupMetadata {
-  id: string;
   timestamp: number;
   version: string;
-  updateMode?: string;
-  size: number;
-  path: string;
-  success: boolean;
+  description?: string;
+  type?: 'manual' | 'auto';
+  path?: string;
+  size?: number;
+  usedForRollback?: boolean;
+  rollbackTime?: number;
 }
 
 // Default configuration
@@ -64,9 +52,7 @@ const DEFAULT_SAFETY_CONFIG: SafetyConfig = {
   crashCount: 0,
   crashHistory: [],
   lastSuccessfulStart: null,
-  currentVersion: null,
-  rollbackAvailable: false,
-  rollbackSnapshot: null
+  currentVersion: null
 };
 
 /**
@@ -323,41 +309,6 @@ export class UpdateSafetyManager {
       console.error('Error reading crash logs:', error);
       return [];
     }
-  }
-
-  /**
-   * Create a rollback snapshot
-   */
-  public createRollbackSnapshot(version: string, updateMode: string, backupPath: string): void {
-    const snapshot: RollbackSnapshot = {
-      timestamp: Date.now(),
-      version,
-      updateMode,
-      path: backupPath
-    };
-
-    // Check if backup file exists and get size
-    if (fs.existsSync(backupPath)) {
-      const stats = fs.statSync(backupPath);
-      snapshot.size = stats.size;
-    }
-
-    this.config.rollbackSnapshot = snapshot;
-    this.config.rollbackAvailable = true;
-
-    this.saveConfig(true);
-    console.log(`[UpdateSafety] Created rollback snapshot: ${version}`);
-  }
-
-  /**
-   * Clear rollback snapshot
-   */
-  public clearRollbackSnapshot(): void {
-    this.config.rollbackSnapshot = null;
-    this.config.rollbackAvailable = false;
-
-    this.saveConfig(true);
-    console.log('[UpdateSafety] Rollback snapshot cleared');
   }
 
   /**

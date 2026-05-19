@@ -17,6 +17,7 @@ import crypto from 'crypto';
 import { execSync } from 'child_process';
 import { ModuleManifest } from '../../types/moduleTypes';
 import { ensureDir, getModulesDir, getSourceModulesDir, getBuildModulesDir } from './pathHelpers';
+import { takeAutoSnapshot } from '@/utils/autoSnapshot';
 
 // ============================================================================
 // TYPES
@@ -830,6 +831,8 @@ export class AppStoreManager {
       throw new Error(`Module ${moduleName} is already installed`);
     }
 
+    takeAutoSnapshot(`install ${moduleName}`);
+
     try {
       this.copyDirectory(moduleInfo.repoPath, sourceTargetDir);
 
@@ -882,6 +885,8 @@ export class AppStoreManager {
       this.saveInstalled();
       return true;
     }
+
+    takeAutoSnapshot(`uninstall ${moduleName}`);
 
     try {
       if (fs.existsSync(sourceDir)) {
@@ -1286,6 +1291,8 @@ export class AppStoreManager {
       if (this.compareVersions(installed.version, moduleInfo.manifest.version) >= 0) {
         return { success: true, newVersion: installed.version };
       }
+
+      takeAutoSnapshot(`update ${moduleName}`);
 
       console.log(`[AppStoreManager] Backing up ${moduleName} to ${backupDir}`);
       ensureDir(path.dirname(backupDir));
