@@ -11,7 +11,6 @@
     "required": {},
     "optional": {}
   },
-  "config": {},
   "configSchema": {
     "id": "examples-config.json",
     "name": "Examples Module Config",

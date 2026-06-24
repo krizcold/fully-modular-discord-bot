@@ -2,7 +2,7 @@ name: fullymodulardiscordbot
 
 services:
   fullymodulardiscordbot:
-    image: ghcr.io/yundera/nginx-hash-lock:latest
+    image: ghcr.io/yundera/appshield:latest
     restart: unless-stopped
     cpu_shares: 80
     healthcheck:
@@ -16,6 +16,8 @@ services:
       - "80"
     environment:
       AUTH_HASH: $AUTH_HASH
+      USER: $WEBUI_USER          # AppShield login user (empty = disabled, hash-only)
+      PASSWORD: $WEBUI_PASSWORD  # AppShield login password (empty = disabled)
       BACKEND_HOST: "fullymodulardiscordbotapp"
       BACKEND_PORT: "8080"
       LISTEN_PORT: "80"

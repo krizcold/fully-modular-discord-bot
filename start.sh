@@ -25,8 +25,8 @@ fi
 echo "Image buildId:   $IMAGE_BUILD_ID"
 echo "Applied buildId: ${APPLIED_BUILD_ID:-<none>}"
 
-if [ "$IMAGE_BUILD_ID" != "$APPLIED_BUILD_ID" ]; then
-    echo "[Build] buildId mismatch - rebuilding /app/build and /app/dist"
+if [ "$IMAGE_BUILD_ID" != "$APPLIED_BUILD_ID" ] || [ ! -f /app/dist/index.js ]; then
+    echo "[Build] buildId mismatch or /app/dist missing - rebuilding /app/build and /app/dist"
 
     rm -rf /app/build /app/dist
     mkdir -p /app/build /app/dist
