@@ -16,8 +16,8 @@ services:
       - "80"
     environment:
       AUTH_HASH: $AUTH_HASH
-      USER: $WEBUI_USER          # AppShield login user (empty = disabled, hash-only)
-      PASSWORD: $WEBUI_PASSWORD  # AppShield login password (empty = disabled)
+      USER: "$WEBUI_USER"          # AppShield login user (empty = disabled, hash-only)
+      PASSWORD: "$WEBUI_PASSWORD"  # AppShield login password (empty = disabled)
       BACKEND_HOST: "fullymodulardiscordbotapp"
       BACKEND_PORT: "8080"
       LISTEN_PORT: "80"
