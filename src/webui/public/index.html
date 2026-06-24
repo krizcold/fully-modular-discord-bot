@@ -8,7 +8,10 @@
   <link rel="stylesheet" href="/styles/update-panel.css">
   <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
-  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <!-- Pinned to Babel 7: Babel 8 defaults preset-react to the automatic runtime,
+       which injects `import {jsx} from "react/jsx-runtime"` and breaks these classic
+       (global-scope) text/babel scripts. -->
+  <script src="https://unpkg.com/@babel/standalone@7/babel.min.js"></script>
 </head>
 <body>
   <div id="toast-container"></div>
