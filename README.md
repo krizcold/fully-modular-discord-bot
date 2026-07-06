@@ -443,7 +443,13 @@ Access via `/admin-panel` command → Bot Update Manager
 npm run dev              # Run with ts-node and auto-restart
 npm run dev:bot          # Run bot only (for Web-UI development)
 npm run dev:webui        # Run Web-UI only
+npm run redis:dev        # Start (or reuse) a local Redis container for session storage
 ```
+
+Redis is optional in development: without it, sessions use an in-memory store. To enable it,
+run `npm run redis:dev` (requires Docker Desktop) and set `REDIS_URL=redis://localhost:6379`
+in the Credentials panel or `/data/.env`. Container deployments ship a redis sidecar and set
+`REDIS_URL` automatically via docker-compose.
 
 **Building:**
 ```bash

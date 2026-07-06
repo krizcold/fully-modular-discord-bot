@@ -12,6 +12,7 @@
     "dev": "cross-env NODE_ENV=development nodemon --watch src --ext ts,json --ignore src/bot/config.json --exec ts-node -r tsconfig-paths/register src/index.ts",
     "dev:bot": "nodemon --watch src/bot --ext ts,json --ignore src/bot/config.json --exec ts-node -r tsconfig-paths/register src/bot/index.ts",
     "dev:webui": "nodemon --watch src/webui --ext ts,json --exec ts-node -r tsconfig-paths/register src/webui/index.ts",
+    "redis:dev": "docker start smdb-redis || docker run -d --name smdb-redis -p 6379:6379 redis:alpine",
     "dockerUpdate": "docker build -t fully-modular-discord-bot . && docker-compose up -d",
     "dockerPublish": "dotenv node scripts/dockerPublish.js",
     "exportContext": "node scripts/exportContext.js",

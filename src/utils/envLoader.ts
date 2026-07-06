@@ -73,6 +73,7 @@ export function loadCredentials(): BotCredentials {
     DISCORD_CLIENT_SECRET: process.env.DISCORD_CLIENT_SECRET,
     OAUTH_CALLBACK_URL: process.env.OAUTH_CALLBACK_URL,
     SESSION_SECRET: process.env.SESSION_SECRET,
+    REDIS_URL: process.env.REDIS_URL,
   };
 
   // Payment provider env vars are dynamic per provider; copy through any
