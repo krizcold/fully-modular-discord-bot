@@ -23,6 +23,7 @@ const MAIN_CONFIG_SCHEMA: Record<string, any> = {
   'system.ipc.rateLimitMs': 1000,
   'system.ipc.rateLimitCleanupThreshold': 100,
   'system.ipc.rateLimitCleanupAgeMs': 300000,
+  'metrics.enabled': true,
   // Giveaway module config (TODO: Move to module-specific config file)
   'giveaway.itemsPerPage': 10,
   'giveaway.nameDisplayCap': 50

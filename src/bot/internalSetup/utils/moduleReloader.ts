@@ -28,6 +28,7 @@ import { reRegisterSlashCommands } from './commandUtils';
 import { isAutoCleanupEnabled } from '../events/clientReady/registerCommands';
 import { clearSchemaCache, getModulesWithSettings } from './settings/settingsDiscovery';
 import { createAllSettingsPanels } from './settings/settingsPanelFactory';
+import { getMetricsCollector } from './metrics/metricsCollector';
 
 interface CapturedCommand {
   name: string;
@@ -266,10 +267,16 @@ async function registerReloadedModule(client: Client, module: LoadedModule): Pro
   const bAfter = Array.from(((client as any).buttonHandlers ?? new Map()).keys()) as string[];
   const mAfter = Array.from(((client as any).modalHandlers ?? new Map()).keys()) as string[];
   const dAfter = Array.from(((client as any).dropdownHandlers ?? new Map()).keys()) as string[];
+  const bNew = bAfter.filter(k => !bBefore.has(k));
+  const mNew = mAfter.filter(k => !mBefore.has(k));
+  const dNew = dAfter.filter(k => !dBefore.has(k));
+  for (const id of bNew) { const info = (client as any).buttonHandlers.get(id); if (info) info._moduleName = module.manifest.name; }
+  for (const id of mNew) { const info = (client as any).modalHandlers.get(id); if (info) info._moduleName = module.manifest.name; }
+  for (const id of dNew) { const info = (client as any).dropdownHandlers.get(id); if (info) info._moduleName = module.manifest.name; }
   module.registeredInteractionIds = {
-    buttons: bAfter.filter(k => !bBefore.has(k)),
-    modals: mAfter.filter(k => !mBefore.has(k)),
-    dropdowns: dAfter.filter(k => !dBefore.has(k))
+    buttons: bNew,
+    modals: mNew,
+    dropdowns: dNew
   };
 
   // Re-apply component toggle state (keep disabled components off after reload)
@@ -314,6 +321,7 @@ export async function reloadModule(client: Client, moduleName: string): Promise<
 
     if (existingModule) {
       await registry.unloadModule(moduleName);
+      getMetricsCollector().dropModule(moduleName);
     }
     await registerReloadedModule(client, newModule);
 
@@ -356,6 +364,7 @@ export async function unloadModuleFromMemory(client: Client, moduleName: string)
 
   try {
     await registry.unloadModule(moduleName);
+    getMetricsCollector().dropModule(moduleName);
     await deleteModuleCommandsFromDiscord(client, capturedCommands);
     await reRegisterSlashCommands(client, { runOrphanCleanup: false });
 
@@ -393,6 +402,7 @@ export async function reloadModules(client: Client, moduleNames: string[]): Prom
       const existing = registry.getModule(name);
       if (existing) {
         await registry.unloadModule(name);
+        getMetricsCollector().dropModule(name);
       }
     }
 

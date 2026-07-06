@@ -3,6 +3,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import { getMetricsCollector } from './metrics/metricsCollector';
 
 /**
  * Base data directory for all bot data
@@ -91,6 +92,7 @@ export function loadData<T = any>(
 ): T {
   try {
     const filePath = getDataFilePath(filename, options);
+    getMetricsCollector().recordIO('read', options.scope === 'global' ? null : options.guildId ?? null, options.category ?? null);
 
     if (!fs.existsSync(filePath)) {
       console.log(`[DataManager] File not found: ${filePath} - returning default value`);
@@ -120,6 +122,7 @@ export function saveData<T = any>(
 
     ensureDirectory(dir);
     fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf-8');
+    getMetricsCollector().recordIO('write', options.scope === 'global' ? null : options.guildId ?? null, options.category ?? null);
 
     console.log(`[DataManager] Saved ${filename} to ${filePath}`);
     return true;
@@ -447,4 +450,43 @@ export function deleteModuleData(
  */
 export function deleteGlobalModuleData(filename: string, moduleName: string): boolean {
   return deleteData(filename, { scope: 'global', category: moduleName });
+}
+
+// ============================================================================
+// SIZE HELPERS (async recursive stat)
+// ============================================================================
+
+async function sizeDirectoryRecursive(dir: string): Promise<number> {
+  let total = 0;
+  let entries;
+  try {
+    entries = await fs.promises.readdir(dir, { withFileTypes: true });
+  } catch {
+    return 0;
+  }
+  for (const entry of entries) {
+    const fullPath = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      total += await sizeDirectoryRecursive(fullPath);
+    } else if (entry.isFile()) {
+      try {
+        total += (await fs.promises.stat(fullPath)).size;
+      } catch { /* file vanished mid-walk */ }
+    }
+  }
+  return total;
+}
+
+/**
+ * Total size in bytes of a guild's data directory.
+ */
+export function sizeOfGuildData(guildId: string): Promise<number> {
+  return sizeDirectoryRecursive(path.join(BASE_DATA_DIR, guildId));
+}
+
+/**
+ * Total size in bytes of the global data directory.
+ */
+export function sizeOfGlobalData(): Promise<number> {
+  return sizeDirectoryRecursive(path.join(BASE_DATA_DIR, 'global'));
 }

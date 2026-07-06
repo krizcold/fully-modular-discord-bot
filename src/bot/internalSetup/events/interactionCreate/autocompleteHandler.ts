@@ -1,6 +1,7 @@
 import { Client, Interaction } from 'discord.js';
 import getLocalCommands from '../../utils/getLocalCommands';
 import { getPremiumManager } from '../../utils/premiumManager';
+import { instrument } from '../../utils/metrics/instrument';
 
 /**
  * Autocomplete dispatcher.
@@ -61,7 +62,9 @@ export default async function handleAutocomplete(client: Client, interaction: In
   }
 
   try {
-    const choices = await commandObject.autocomplete(client, interaction);
+    const choices = await instrument('autocomplete', interaction.guildId, commandObject._moduleName, interaction.commandName, () =>
+      commandObject.autocomplete(client, interaction)
+    );
     if (!interaction.responded) {
       await interaction.respond(Array.isArray(choices) ? choices.slice(0, 25) : []);
     }

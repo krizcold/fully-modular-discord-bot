@@ -167,15 +167,18 @@ export interface RegisteredButtonInfo {
     timeoutMs: number | null;
     permissionsRequired?: PermissionResolvable[];
     specialUsers?: SpecialUserRule[];
+    _moduleName?: string;
 }
 
 export interface RegisteredDropdownInfo<TInteraction extends AnySelectMenuInteraction = AnySelectMenuInteraction> {
     handler: (client: Client, interaction: TInteraction) => Promise<void>;
     timeoutMs: number | null;
+    _moduleName?: string;
 }
 
 export interface RegisteredModalInfo {
     handler: (client: Client, interaction: ModalSubmitInteraction) => Promise<void>;
+    _moduleName?: string;
 }
 
 export interface RegisteredReactionInfo {
@@ -186,12 +189,15 @@ export interface RegisteredReactionInfo {
     maxEntries?: number; // Overall max entries for this reaction message (0 or undefined for infinite)
     allowBots?: boolean; // If the handler should process bot reactions (defaults to false)
     collectedUsers: Set<string>; // Users who have successfully triggered this reaction handler
+    trackCollectedUsers?: boolean; // One-shot-per-user dedup (default true); permanent handlers (e.g. role toggles) set false
+    _moduleName?: string;
 }
 
 export interface RegisteredReactionRemoveInfo {
     handler: (client: Client, reaction: MessageReaction, user: User) => Promise<void>;
     emojiIdentifier: string;
     guildId?: string;
+    _moduleName?: string;
 }
 
 // --- Augmentation for Discord.js Client ---

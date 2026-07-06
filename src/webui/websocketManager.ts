@@ -14,6 +14,7 @@ export type WSEvent =
   | 'bot:startup'
   | 'bot:shutdown'
   | 'bot:crash'
+  | 'bot:metrics:snapshot'
   | 'connection:authenticated'
   | 'panel:updated'
   | 'appstore:install:queued'
@@ -35,6 +36,19 @@ export interface BotStatusData {
   uptime: number;
   processId?: number;
   crashed: boolean;
+}
+
+/**
+ * Live metrics sample pushed from the bot child every SAMPLE_MS
+ */
+export interface MetricsSnapshotData {
+  t: number;
+  cpuPct: number;
+  memRssMb: number;
+  heapMb: number;
+  loopLagMs: number;
+  diskTotalMb: number;
+  metricsEnabled: boolean;
 }
 
 /**
@@ -428,8 +442,8 @@ export class WebSocketManager {
       }
     });
 
-    // Only log non-log events to reduce noise
-    if (type !== 'bot:log') {
+    // Only log non-log events to reduce noise (metrics snapshots tick every 5s)
+    if (type !== 'bot:log' && type !== 'bot:metrics:snapshot') {
       console.log(`[WebSocket] Broadcasted ${type} to ${sentCount} clients (seq: ${message.sequence})`);
     }
   }

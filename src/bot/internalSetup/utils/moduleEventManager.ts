@@ -17,6 +17,8 @@
  */
 
 import { Client } from 'discord.js';
+import { getMetricsCollector } from './metrics/metricsCollector';
+import { instrument } from './metrics/instrument';
 
 /**
  * Best-effort guildId extraction from a Discord.js event payload.
@@ -85,7 +87,7 @@ class ModuleEventManager {
         // self-gate inside the handler.
         if (this.shouldSkipEvent(moduleName, args)) return;
 
-        await handler(this.client!, ...args);
+        await instrument('event', extractGuildId(args), moduleName, eventName, () => handler(this.client!, ...args));
       } catch (error) {
         console.error(`[ModuleLoader] Error in ${moduleName} ${eventName} handler:`, error);
       }
@@ -115,6 +117,7 @@ class ModuleEventManager {
 
     const count = tracked.length;
     this.listeners.delete(moduleName);
+    getMetricsCollector().dropModule(moduleName);
     return count;
   }
 

@@ -1,5 +1,6 @@
 import { Client, Interaction, ModalSubmitInteraction, MessageFlags } from 'discord.js';
 import { RegisteredModalInfo } from '../../../types/commandTypes'; // Import type
+import { instrument } from '../../utils/metrics/instrument';
 
 /**
  * Handles incoming modal submit interactions using the map attached to the client.
@@ -66,7 +67,9 @@ async function handleModalSubmit(client: Client, interaction: Interaction) {
   // Execute the Handler
   const { handler } = modalInfo;
   try {
-    await handler(client, interaction);
+    await instrument('modal', interaction.guildId, modalInfo._moduleName ?? matchedKey, matchedKey, () =>
+      handler(client, interaction as ModalSubmitInteraction)
+    );
   } catch (error) {
     console.error(`Error executing modal handler for customId "${incomingCustomId}" (registered as ${matchedKey}):`, error);
     try {

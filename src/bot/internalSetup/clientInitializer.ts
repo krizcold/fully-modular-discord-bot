@@ -1,4 +1,4 @@
-import { Client, GatewayIntentBits, Collection, Interaction, ButtonInteraction, StringSelectMenuInteraction, MessageFlags } from 'discord.js';
+import { Client, GatewayIntentBits, Partials, Collection, Interaction, ButtonInteraction, StringSelectMenuInteraction, MessageFlags } from 'discord.js';
 import * as fs from 'fs';
 import * as path from 'path';
 import getAllFiles from './utils/getAllFiles';
@@ -6,6 +6,9 @@ import 'dotenv/config';
 import { RegisteredButtonInfo, RegisteredDropdownInfo, RegisteredModalInfo, RegisteredReactionInfo, RegisteredReactionRemoveInfo } from '../types/commandTypes';
 import { getPanelManager } from './utils/panelManager';
 import { setupPanelIPCHandlers } from './utils/ipcPanelHandler';
+import { setupMetricsIPCHandlers } from './utils/ipcMetricsHandler';
+import { getMetricsCollector } from './utils/metrics/metricsCollector';
+import { startSamplers, stopSamplers } from './utils/metrics/samplers';
 import { setupReloadIPCHandlers } from './utils/ipcReloadHandler';
 import { setupToggleIPCHandlers, applyAllDisabledStatesOnBoot } from './utils/ipcToggleHandler';
 import { setupIPCNotificationHandler } from './utils/ipcNotificationHandler';
@@ -409,11 +412,17 @@ function runInitializers(client: Client) {
     const bAfter = Array.from(c.buttonHandlers?.keys() ?? []) as string[];
     const mAfter = Array.from(c.modalHandlers?.keys() ?? []) as string[];
     const dAfter = Array.from(c.dropdownHandlers?.keys() ?? []) as string[];
+    const bNew = bAfter.filter(k => !bBefore.has(k));
+    const mNew = mAfter.filter(k => !mBefore.has(k));
+    const dNew = dAfter.filter(k => !dBefore.has(k));
+    for (const id of bNew) { const info = c.buttonHandlers.get(id); if (info) info._moduleName = mod.manifest.name; }
+    for (const id of mNew) { const info = c.modalHandlers.get(id); if (info) info._moduleName = mod.manifest.name; }
+    for (const id of dNew) { const info = c.dropdownHandlers.get(id); if (info) info._moduleName = mod.manifest.name; }
     const existing = mod.registeredInteractionIds ?? { buttons: [], modals: [], dropdowns: [] };
     mod.registeredInteractionIds = {
-      buttons: [...existing.buttons, ...bAfter.filter(k => !bBefore.has(k))],
-      modals: [...existing.modals, ...mAfter.filter(k => !mBefore.has(k))],
-      dropdowns: [...existing.dropdowns, ...dAfter.filter(k => !dBefore.has(k))]
+      buttons: [...existing.buttons, ...bNew],
+      modals: [...existing.modals, ...mNew],
+      dropdowns: [...existing.dropdowns, ...dNew]
     };
   }
 
@@ -467,8 +476,15 @@ async function main() {
   const intentsList = finalIntents.map((i) => { const n = Object.entries(GatewayIntentBits).find(([_,v])=>v===i)?.[0]; return n||i; });
   console.log('Logging in with intents:', intentsList);
 
-  // PHASE 4: Create the real client with all required intents
-  const client = new Client({ intents: finalIntents });
+  // PHASE 4: Create the real client with all required intents.
+  // Partials are REQUIRED for reaction events on uncached messages (e.g. a
+  // giveaway or halloffame message from before a restart) - without them
+  // discord.js silently drops those events. Every internal and module
+  // reaction handler already fetches partials before use.
+  const client = new Client({
+    intents: finalIntents,
+    partials: [Partials.Message, Partials.Reaction, Partials.User],
+  });
 
   client.buttonHandlers = new Map<string, RegisteredButtonInfo>();
   client.dropdownHandlers = new Map<string, RegisteredDropdownInfo>();
@@ -513,11 +529,17 @@ async function main() {
       const bAfter = Array.from(c.buttonHandlers?.keys() ?? []) as string[];
       const mAfter = Array.from(c.modalHandlers?.keys() ?? []) as string[];
       const dAfter = Array.from(c.dropdownHandlers?.keys() ?? []) as string[];
+      const bNew = bAfter.filter(k => !bBefore.has(k));
+      const mNew = mAfter.filter(k => !mBefore.has(k));
+      const dNew = dAfter.filter(k => !dBefore.has(k));
+      for (const id of bNew) { const info = c.buttonHandlers.get(id); if (info) info._moduleName = module.manifest.name; }
+      for (const id of mNew) { const info = c.modalHandlers.get(id); if (info) info._moduleName = module.manifest.name; }
+      for (const id of dNew) { const info = c.dropdownHandlers.get(id); if (info) info._moduleName = module.manifest.name; }
       const existing = module.registeredInteractionIds ?? { buttons: [], modals: [], dropdowns: [] };
       module.registeredInteractionIds = {
-        buttons: [...existing.buttons, ...bAfter.filter(k => !bBefore.has(k))],
-        modals: [...existing.modals, ...mAfter.filter(k => !mBefore.has(k))],
-        dropdowns: [...existing.dropdowns, ...dAfter.filter(k => !dBefore.has(k))]
+        buttons: [...existing.buttons, ...bNew],
+        modals: [...existing.modals, ...mNew],
+        dropdowns: [...existing.dropdowns, ...dNew]
       };
     }
     console.log(`[Bot] Registered ${modulePanelCount} module panels`);
@@ -559,6 +581,9 @@ async function main() {
   // Set up IPC message handlers for Web-UI panel integration
   setupPanelIPCHandlers();
 
+  // Set up IPC message handlers for metrics
+  setupMetricsIPCHandlers();
+
   // Set up IPC message handlers for module hot-reload
   setupReloadIPCHandlers(client);
 
@@ -593,6 +618,23 @@ async function main() {
   } catch (err) {
     console.warn('[clientInitializer] Failed to attach payment provider gateway bridges:', err);
   }
+
+  // Metrics: seed persisted totals, start samplers (needs the client for the
+  // per-guild RAM estimate), flush on shutdown. The bot child has no other
+  // signal handlers, so this hook is the only shutdown path.
+  const metrics = getMetricsCollector();
+  metrics.seedTotals();
+  startSamplers(client);
+  let shuttingDown = false;
+  const shutdownHandler = () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    stopSamplers();
+    metrics.flushTotals();
+    process.exit(0);
+  };
+  process.on('SIGTERM', shutdownHandler);
+  process.on('SIGINT', shutdownHandler);
 
   client.login(process.env.DISCORD_TOKEN);
 }
