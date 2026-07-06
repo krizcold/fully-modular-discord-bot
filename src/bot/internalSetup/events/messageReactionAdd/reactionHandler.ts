@@ -1,5 +1,6 @@
 import { Client, MessageReaction, User, PartialUser, PartialMessageReaction, GatewayIntentBits } from 'discord.js';
 import { RegisteredReactionInfo } from '../../../types/commandTypes';
+import { instrument } from '../../utils/metrics/instrument';
 
 export const requiredIntents = [
     GatewayIntentBits.GuildMessageReactions,
@@ -8,7 +9,17 @@ export const requiredIntents = [
 ];
 
 async function handleReaction(client: Client, reaction: MessageReaction | PartialMessageReaction, user: User | PartialUser) {
-    // Fetch partials first to get emoji info
+    // Registered-handler lookup BEFORE any REST fetch: messageId and emoji are
+    // already on the raw payload, and almost no reaction has a handler -
+    // fetching partials first paid a REST call for every stray reaction.
+    const messageId = reaction.message.id;
+    const reactedEmojiIdentifier = reaction.emoji.id || reaction.emoji.name;
+    const handlerKey = `${messageId}_${reactedEmojiIdentifier}`;
+
+    const reactionInfo = client.reactionHandlers?.get(handlerKey);
+    if (!reactionInfo) return;
+
+    // Fetch partials now that a handler cares
     if (reaction.partial) {
         try {
             reaction = await reaction.fetch();
@@ -26,13 +37,6 @@ async function handleReaction(client: Client, reaction: MessageReaction | Partia
         }
     }
 
-    const messageId = reaction.message.id;
-    const reactedEmojiIdentifier = reaction.emoji.id || reaction.emoji.name;
-    const handlerKey = `${messageId}_${reactedEmojiIdentifier}`;
-
-    const reactionInfo = client.reactionHandlers?.get(handlerKey);
-    if (!reactionInfo) return;
-
     // Check bot status with allowBots option
     if (user.bot && !reactionInfo.allowBots) {
         return;
@@ -40,11 +44,9 @@ async function handleReaction(client: Client, reaction: MessageReaction | Partia
 
     const { handler, emojiIdentifier, endTime, guildId, maxEntries, collectedUsers } = reactionInfo;
 
-    // End time check
+    // End time check: expired entries are dead by definition, drop them
     if (endTime && Date.now() > endTime) {
-        // Giveaway/event might have ended. The unregister should ideally happen when the event concludes.
-        // For robustness, we can remove it here if it's past time.
-        // unregisterReactionHandler(client, messageId); // Consider if this is the right place.
+        client.reactionHandlers?.delete(handlerKey);
         return;
     }
 
@@ -53,19 +55,27 @@ async function handleReaction(client: Client, reaction: MessageReaction | Partia
         return;
     }
 
-    // Max entries / already collected check
-    if (collectedUsers.has(user.id)) {
-        return;
-    }
-    if (maxEntries && maxEntries > 0 && collectedUsers.size >= maxEntries) {
-        return;
+    // Max entries / already collected check (one-shot-per-user registrants
+    // like giveaway entries; permanent registrants opt out via
+    // trackCollectedUsers: false so toggles/re-reacts keep working)
+    if (reactionInfo.trackCollectedUsers !== false) {
+        if (collectedUsers.has(user.id)) {
+            return;
+        }
+        if (maxEntries && maxEntries > 0 && collectedUsers.size >= maxEntries) {
+            return;
+        }
     }
 
     // Execute the handler
     try {
         // Ensure full types are passed to the handler
-        await handler(client, reaction as MessageReaction, user as User, reactionInfo);
-        collectedUsers.add(user.id); // Mark as collected after successful handler execution
+        await instrument('reaction', reaction.message.guildId, reactionInfo._moduleName, emojiIdentifier, () =>
+            handler(client, reaction as MessageReaction, user as User, reactionInfo)
+        );
+        if (reactionInfo.trackCollectedUsers !== false) {
+            collectedUsers.add(user.id); // Mark as collected after successful handler execution
+        }
     } catch (error) {
         console.error(`[ReactionHandler] Error executing reaction handler for message ${messageId}, emoji ${emojiIdentifier}:`, error);
     }
@@ -81,6 +91,7 @@ export function registerReactionHandler(
         guildId?: string;
         maxEntries?: number;
         allowBots?: boolean;
+        trackCollectedUsers?: boolean;
     } = {}
 ) {
     if (!client.reactionHandlers) {
@@ -94,6 +105,7 @@ export function registerReactionHandler(
         guildId: options.guildId,
         maxEntries: options.maxEntries,
         allowBots: options.allowBots || false,
+        trackCollectedUsers: options.trackCollectedUsers !== false,
     };
     const handlerKey = `${messageId}_${emojiIdentifier}`;
     client.reactionHandlers.set(handlerKey, info);

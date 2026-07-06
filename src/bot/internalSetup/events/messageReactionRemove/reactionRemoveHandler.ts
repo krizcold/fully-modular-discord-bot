@@ -1,5 +1,6 @@
 import { Client, MessageReaction, User, PartialUser, PartialMessageReaction, GatewayIntentBits } from 'discord.js';
 import { RegisteredReactionRemoveInfo } from '@bot/types/commandTypes';
+import { instrument } from '../../utils/metrics/instrument';
 
 export const requiredIntents = [
     GatewayIntentBits.GuildMessageReactions,
@@ -12,7 +13,13 @@ async function handleReactionRemove(client: Client, reaction: MessageReaction | 
         return;
     }
 
-    // Fetch partials
+    // Registered-handler lookup BEFORE any REST fetch (messageId is on the raw payload)
+    const messageId = reaction.message.id;
+    const handlers = client.reactionRemoveHandlers?.get(messageId);
+
+    if (!handlers || handlers.length === 0) return;
+
+    // Fetch partials now that a handler cares
     if (reaction.partial) {
         try {
             reaction = await reaction.fetch();
@@ -32,11 +39,6 @@ async function handleReactionRemove(client: Client, reaction: MessageReaction | 
 
     if (user.bot) return;
 
-    const messageId = reaction.message.id;
-    const handlers = client.reactionRemoveHandlers?.get(messageId);
-
-    if (!handlers || handlers.length === 0) return;
-
     const reactedEmojiIdentifier = reaction.emoji.id || reaction.emoji.name;
 
     for (const info of handlers) {
@@ -44,7 +46,9 @@ async function handleReactionRemove(client: Client, reaction: MessageReaction | 
         if (info.guildId && reaction.message.guildId !== info.guildId) continue;
 
         try {
-            await info.handler(client, reaction as MessageReaction, user as User);
+            await instrument('reaction', reaction.message.guildId, info._moduleName, info.emojiIdentifier, () =>
+                info.handler(client, reaction as MessageReaction, user as User)
+            );
         } catch (error) {
             console.error(`[ReactionRemoveHandler] Error executing handler for message ${messageId}:`, error);
         }
