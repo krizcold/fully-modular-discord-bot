@@ -16,8 +16,41 @@ import path from 'path';
 import crypto from 'crypto';
 import { execSync } from 'child_process';
 import { ModuleManifest } from '../../types/moduleTypes';
-import { ensureDir, getModulesDir, getSourceModulesDir, getBuildModulesDir } from './pathHelpers';
+import { ensureDir, getModulesDir, getSourceModulesDir, getBuildModulesDir, getModulesDevDir } from './pathHelpers';
 import { takeAutoSnapshot } from '@/utils/autoSnapshot';
+
+/**
+ * Find a Dev module whose manifest name matches. Installing a store module
+ * over a same-name Dev module would silently shadow the Dev copy (the loader
+ * resolves names against modules/ first), so installs must reject the clash.
+ */
+function findDevModuleWithName(moduleName: string): boolean {
+  const modulesDevDir = getModulesDevDir();
+  if (!fs.existsSync(modulesDevDir)) return false;
+  try {
+    const repos = fs.readdirSync(modulesDevDir, { withFileTypes: true })
+      .filter(dirent => dirent.isDirectory() && !dirent.name.startsWith('.'))
+      .map(dirent => dirent.name);
+    for (const repoName of repos) {
+      const repoModulesDir = path.join(modulesDevDir, repoName, 'Modules');
+      if (!fs.existsSync(repoModulesDir)) continue;
+      const devModules = fs.readdirSync(repoModulesDir, { withFileTypes: true })
+        .filter(dirent => dirent.isDirectory() && !dirent.name.endsWith('.disabled'))
+        .map(dirent => dirent.name);
+      for (const devModule of devModules) {
+        const manifestPath = path.join(repoModulesDir, devModule, 'module.json');
+        if (!fs.existsSync(manifestPath)) continue;
+        try {
+          const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8'));
+          if (manifest?.name === moduleName) return true;
+        } catch { /* unreadable manifest; skip */ }
+      }
+    }
+  } catch (error) {
+    console.error('[AppStoreManager] Error scanning modulesDev for name conflicts:', error);
+  }
+  return false;
+}
 
 // ============================================================================
 // TYPES
@@ -829,6 +862,10 @@ export class AppStoreManager {
 
     if (fs.existsSync(sourceTargetDir) || fs.existsSync(runtimeTargetDir)) {
       throw new Error(`Module ${moduleName} is already installed`);
+    }
+
+    if (findDevModuleWithName(moduleName)) {
+      throw new Error(`Module ${moduleName} conflicts with a Dev module of the same name. Remove or rename the Dev module first.`);
     }
 
     takeAutoSnapshot(`install ${moduleName}`);

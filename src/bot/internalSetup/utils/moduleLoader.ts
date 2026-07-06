@@ -85,6 +85,20 @@ export class ModuleLoader {
       }
     }
 
+    // Duplicate names (e.g. a store-installed copy in modules/ shadowing a
+    // Dev module) load only the FIRST discovered copy - make that visible
+    const seenNames = new Map<string, string>();
+    for (const m of manifests) {
+      const firstPath = seenNames.get(m.manifest.name);
+      if (firstPath) {
+        console.warn(
+          `[ModuleLoader] Duplicate module name "${m.manifest.name}": loading ${firstPath}, ignoring ${m.path}`
+        );
+      } else {
+        seenNames.set(m.manifest.name, m.path);
+      }
+    }
+
     // Step 3: Resolve dependencies and determine load order
     const dependencyGraph = this.buildDependencyGraph(manifests.map(m => m.manifest));
 
