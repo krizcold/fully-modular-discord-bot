@@ -21,12 +21,20 @@ export interface ConfigFileMetadata {
 }
 
 /**
+ * Internal system namespaces under /data/global that must never surface as
+ * user-editable data files: appstore holds repo clones, github tokens and
+ * per-module API credentials; payment-providers holds provider state.
+ */
+const GLOBAL_SCAN_EXCLUDES = new Set(['appstore', 'payment-providers']);
+
+/**
  * Recursively scan a directory for JSON files
  */
 function scanDirectoryRecursive(
   dirPath: string,
   category: 'config' | 'data',
-  prefix: string = ''
+  prefix: string = '',
+  excludeTop?: Set<string>
 ): ConfigFileMetadata[] {
   const results: ConfigFileMetadata[] = [];
 
@@ -42,6 +50,9 @@ function scanDirectoryRecursive(
       const stat = fs.statSync(fullPath);
 
       if (stat.isDirectory()) {
+        if (prefix === '' && excludeTop?.has(item)) {
+          continue;
+        }
         // Recursively scan subdirectory
         const subResults = scanDirectoryRecursive(
           fullPath,
@@ -157,7 +168,7 @@ export function discoverConfigFiles(): ConfigFileMetadata[] {
 
   // 3. Scan for any existing files that might not have schemas
   if (fs.existsSync('/data/global')) {
-    const globalResults = scanDirectoryRecursive('/data/global', 'data');
+    const globalResults = scanDirectoryRecursive('/data/global', 'data', '', GLOBAL_SCAN_EXCLUDES);
     for (const file of globalResults) {
       // Check if a schema already exists for this file (by checking if any entry has the same filename)
       let foundSchema = false;
@@ -702,7 +713,7 @@ export function discoverGlobalDataFiles(): DataFileMetadata[] {
   // 2. Scan for any existing files that might not have schemas
   const globalDir = '/data/global';
   if (fs.existsSync(globalDir)) {
-    const existingFiles = scanDirectoryRecursive(globalDir, 'data');
+    const existingFiles = scanDirectoryRecursive(globalDir, 'data', '', GLOBAL_SCAN_EXCLUDES);
 
     for (const file of existingFiles) {
       // Extract module name from path
