@@ -216,6 +216,11 @@ export interface LoadedModule {
     modals: string[];
     dropdowns: string[];
   };
+
+  registeredReactionIds?: {
+    reactions: string[];
+    reactionRemoves: string[];
+  };
 }
 
 /**

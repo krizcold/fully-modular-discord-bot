@@ -399,6 +399,8 @@ function runInitializers(client: Client) {
     const bBefore = new Set(Array.from(c.buttonHandlers?.keys() ?? []));
     const mBefore = new Set(Array.from(c.modalHandlers?.keys() ?? []));
     const dBefore = new Set(Array.from(c.dropdownHandlers?.keys() ?? []));
+    const rBefore = new Set(Array.from(c.reactionHandlers?.keys() ?? []));
+    const rrBefore = new Set(Array.from(c.reactionRemoveHandlers?.keys() ?? []));
 
     for (const command of cmds) {
       const moduleName = command?.name || 'Unnamed Module';
@@ -412,17 +414,28 @@ function runInitializers(client: Client) {
     const bAfter = Array.from(c.buttonHandlers?.keys() ?? []) as string[];
     const mAfter = Array.from(c.modalHandlers?.keys() ?? []) as string[];
     const dAfter = Array.from(c.dropdownHandlers?.keys() ?? []) as string[];
+    const rAfter = Array.from(c.reactionHandlers?.keys() ?? []) as string[];
+    const rrAfter = Array.from(c.reactionRemoveHandlers?.keys() ?? []) as string[];
     const bNew = bAfter.filter(k => !bBefore.has(k));
     const mNew = mAfter.filter(k => !mBefore.has(k));
     const dNew = dAfter.filter(k => !dBefore.has(k));
+    const rNew = rAfter.filter(k => !rBefore.has(k));
+    const rrNew = rrAfter.filter(k => !rrBefore.has(k));
     for (const id of bNew) { const info = c.buttonHandlers.get(id); if (info) info._moduleName = mod.manifest.name; }
     for (const id of mNew) { const info = c.modalHandlers.get(id); if (info) info._moduleName = mod.manifest.name; }
     for (const id of dNew) { const info = c.dropdownHandlers.get(id); if (info) info._moduleName = mod.manifest.name; }
+    for (const id of rNew) { const info = c.reactionHandlers.get(id); if (info) info._moduleName = mod.manifest.name; }
+    for (const id of rrNew) { const infos = c.reactionRemoveHandlers.get(id); if (infos) for (const info of infos) info._moduleName = mod.manifest.name; }
     const existing = mod.registeredInteractionIds ?? { buttons: [], modals: [], dropdowns: [] };
     mod.registeredInteractionIds = {
       buttons: [...existing.buttons, ...bNew],
       modals: [...existing.modals, ...mNew],
       dropdowns: [...existing.dropdowns, ...dNew]
+    };
+    const existingReactions = (mod as any).registeredReactionIds ?? { reactions: [], reactionRemoves: [] };
+    (mod as any).registeredReactionIds = {
+      reactions: [...existingReactions.reactions, ...rNew],
+      reactionRemoves: [...existingReactions.reactionRemoves, ...rrNew]
     };
   }
 
@@ -519,6 +532,8 @@ async function main() {
       const bBefore = new Set(Array.from(c.buttonHandlers?.keys() ?? []));
       const mBefore = new Set(Array.from(c.modalHandlers?.keys() ?? []));
       const dBefore = new Set(Array.from(c.dropdownHandlers?.keys() ?? []));
+      const rBefore = new Set(Array.from(c.reactionHandlers?.keys() ?? []));
+      const rrBefore = new Set(Array.from(c.reactionRemoveHandlers?.keys() ?? []));
 
       for (const panel of module.panels) {
         panelManager.registerPanel(panel);
@@ -529,17 +544,28 @@ async function main() {
       const bAfter = Array.from(c.buttonHandlers?.keys() ?? []) as string[];
       const mAfter = Array.from(c.modalHandlers?.keys() ?? []) as string[];
       const dAfter = Array.from(c.dropdownHandlers?.keys() ?? []) as string[];
+      const rAfter = Array.from(c.reactionHandlers?.keys() ?? []) as string[];
+      const rrAfter = Array.from(c.reactionRemoveHandlers?.keys() ?? []) as string[];
       const bNew = bAfter.filter(k => !bBefore.has(k));
       const mNew = mAfter.filter(k => !mBefore.has(k));
       const dNew = dAfter.filter(k => !dBefore.has(k));
+      const rNew = rAfter.filter(k => !rBefore.has(k));
+      const rrNew = rrAfter.filter(k => !rrBefore.has(k));
       for (const id of bNew) { const info = c.buttonHandlers.get(id); if (info) info._moduleName = module.manifest.name; }
       for (const id of mNew) { const info = c.modalHandlers.get(id); if (info) info._moduleName = module.manifest.name; }
       for (const id of dNew) { const info = c.dropdownHandlers.get(id); if (info) info._moduleName = module.manifest.name; }
+      for (const id of rNew) { const info = c.reactionHandlers.get(id); if (info) info._moduleName = module.manifest.name; }
+      for (const id of rrNew) { const infos = c.reactionRemoveHandlers.get(id); if (infos) for (const info of infos) info._moduleName = module.manifest.name; }
       const existing = module.registeredInteractionIds ?? { buttons: [], modals: [], dropdowns: [] };
       module.registeredInteractionIds = {
         buttons: [...existing.buttons, ...bNew],
         modals: [...existing.modals, ...mNew],
         dropdowns: [...existing.dropdowns, ...dNew]
+      };
+      const existingReactions = (module as any).registeredReactionIds ?? { reactions: [], reactionRemoves: [] };
+      (module as any).registeredReactionIds = {
+        reactions: [...existingReactions.reactions, ...rNew],
+        reactionRemoves: [...existingReactions.reactionRemoves, ...rrNew]
       };
     }
     console.log(`[Bot] Registered ${modulePanelCount} module panels`);
