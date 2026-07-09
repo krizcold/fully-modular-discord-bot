@@ -23,7 +23,7 @@ RUN chown -R node:node /app
 USER node
 
 # Install dependencies as node user (creates node_modules owned by node)
-RUN npm install
+RUN npm ci
 
 # Copy source files with correct ownership (avoids slow chown later)
 COPY --chown=node:node src/ /app/src/
@@ -32,6 +32,8 @@ COPY --chown=node:node src/ /app/src/
 # - undefined/empty (default): updater_local (git-based, for self-hosted)
 # - managed: updater_managed (API-based, for Bot Manager)
 ARG BUILD_MODE
+# Persist to runtime so getDeploymentMode() sees the mode this image was built with
+ENV BUILD_MODE=${BUILD_MODE}
 COPY --chown=node:node updaters/ /tmp/updaters/
 RUN mkdir -p /app/src/updater && \
     if [ "$BUILD_MODE" = "managed" ]; then \

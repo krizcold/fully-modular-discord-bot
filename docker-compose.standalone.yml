@@ -1,0 +1,30 @@
+# Standalone self-hosted deployment (no Bot Manager, no CasaOS/Yundera).
+#   docker compose -f docker-compose.standalone.yml up -d --build
+# The committed docker-compose.yml is the manager-processed Yundera compose
+# and is NOT usable for plain self-hosting.
+
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    ports:
+      # Localhost only by default. To expose on the LAN use "8080:8080".
+      - "127.0.0.1:8080:8080"
+    environment:
+      # Required to use the Web-UI. Any long random secret works; open
+      # http://localhost:8080/?hash=<AUTH_HASH> after boot. When unset the
+      # page shell still loads but every API request is rejected with 503, so
+      # the UI is unusable (auth is never disabled outside NODE_ENV=development).
+      AUTH_HASH: ${AUTH_HASH:-}
+      # Optional prefill. The supported flow is to leave these unset and enter
+      # the credentials in the Web-UI Credentials tab after first boot.
+      DISCORD_TOKEN: ${DISCORD_TOKEN:-}
+      CLIENT_ID: ${CLIENT_ID:-}
+      GUILD_ID: ${GUILD_ID:-}
+      # Optional Redis for persistent Guild Web-UI sessions; off when unset.
+      # REDIS_URL: redis://your-redis-host:6379
+    volumes:
+      # Persistent data: saved credentials (/data/.env), AppStore modules,
+      # guild data. On Linux create it first so the container user (uid 1000)
+      # can write: mkdir -p data && sudo chown 1000:1000 data
+      - ./data:/data

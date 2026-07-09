@@ -3,8 +3,9 @@
 // Handles credential management for both bot and Guild Web-UI settings.
 // Under managed deployments (BUILD_MODE=managed), bot credentials (DISCORD_TOKEN,
 // CLIENT_ID, GUILD_ID) are owned by the external bot manager and this endpoint
-// rejects attempts to modify them. Guild Web-UI credentials are editable in
-// both modes and trigger a hot-reload of the OAuth strategy without a restart.
+// rejects attempts to modify them. Under standalone deployments they are
+// editable here. Guild Web-UI credentials are editable in both modes and
+// trigger a hot-reload of the OAuth strategy without a restart.
 
 import { Router, Request, Response } from 'express';
 import {
@@ -93,18 +94,18 @@ export function createSetupRoutes(): Router {
 
   /**
    * POST /api/setup/credentials
-   * Save OPTIONAL credentials to /data/.env
+   * Save credentials to /data/.env
    *
-   * NOTE: Main credentials (DISCORD_TOKEN, CLIENT_ID, GUILD_ID) are managed
-   * by Bot Manager and should NOT be modified here. This endpoint only handles
-   * optional settings like MAIN_GUILD_ID and OAuth configuration.
+   * Main credentials (DISCORD_TOKEN, CLIENT_ID, GUILD_ID) are accepted only
+   * in standalone mode. In managed mode they are owned by Bot Manager and any
+   * values sent here are ignored; existing values are preserved.
    */
   router.post('/credentials', async (req: Request, res: Response) => {
     try {
+      const isStandalone = getDeploymentMode() === 'standalone';
       const {
-        // Main credentials are NOT accepted - managed by Bot Manager
-        // DISCORD_TOKEN, CLIENT_ID, GUILD_ID - DO NOT ACCEPT
-
+        // Main credentials: only honored when isStandalone (ignored when managed)
+        DISCORD_TOKEN, CLIENT_ID, GUILD_ID,
         // Optional bot-specific settings
         MAIN_GUILD_ID,
         // OAuth fields (optional)
@@ -126,6 +127,24 @@ export function createSetupRoutes(): Router {
           res.status(400).json({
             success: false,
             error: 'MAIN_GUILD_ID must be a valid Discord server ID (numeric) if provided'
+          });
+          return;
+        }
+      }
+
+      // Validate standalone-editable bot credentials if provided (blank = keep existing)
+      if (isStandalone) {
+        if (CLIENT_ID && CLIENT_ID.trim() !== '' && (CLIENT_ID.trim().length < 17 || !/^\d+$/.test(CLIENT_ID.trim()))) {
+          res.status(400).json({
+            success: false,
+            error: 'CLIENT_ID must be a valid Discord application ID (numeric) if provided'
+          });
+          return;
+        }
+        if (GUILD_ID && GUILD_ID.trim() !== '' && (GUILD_ID.trim().length < 17 || !/^\d+$/.test(GUILD_ID.trim()))) {
+          res.status(400).json({
+            success: false,
+            error: 'GUILD_ID must be a valid Discord server ID (numeric) if provided'
           });
           return;
         }
@@ -180,12 +199,19 @@ export function createSetupRoutes(): Router {
         }
       }
 
-      // Build credentials object - PRESERVE main credentials from Bot Manager
+      // Build credentials object. Managed mode: main credentials are preserved
+      // (owned by Bot Manager). Standalone: provided non-empty values replace
+      // existing ones; blank fields keep the stored value.
       const credentials: BotCredentials = {
-        // PRESERVE main credentials (set by Bot Manager)
-        DISCORD_TOKEN: existingCredentials.DISCORD_TOKEN,
-        CLIENT_ID: existingCredentials.CLIENT_ID,
-        GUILD_ID: existingCredentials.GUILD_ID,
+        DISCORD_TOKEN: isStandalone && DISCORD_TOKEN && DISCORD_TOKEN.trim() !== ''
+          ? DISCORD_TOKEN.trim()
+          : existingCredentials.DISCORD_TOKEN,
+        CLIENT_ID: isStandalone && CLIENT_ID && CLIENT_ID.trim() !== ''
+          ? CLIENT_ID.trim()
+          : existingCredentials.CLIENT_ID,
+        GUILD_ID: isStandalone && GUILD_ID && GUILD_ID.trim() !== ''
+          ? GUILD_ID.trim()
+          : existingCredentials.GUILD_ID,
         // MAIN_GUILD_ID: Use provided value, or keep existing
         ...(MAIN_GUILD_ID && MAIN_GUILD_ID.trim() !== ''
           ? { MAIN_GUILD_ID: MAIN_GUILD_ID.trim() }
