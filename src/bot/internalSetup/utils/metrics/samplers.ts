@@ -16,9 +16,11 @@ let diskTimer: NodeJS.Timeout | null = null;
 let flushTimer: NodeJS.Timeout | null = null;
 let loopHistogram: IntervalHistogram | null = null;
 let lastCpuUsage: NodeJS.CpuUsage | null = null;
+let lastSampleHrtime: bigint | null = null;
 let clientRef: Client | null = null;
 let walking = false;
 let lastEnabled: boolean | null = null;
+const tickErrorsLogged = new Set<string>();
 
 export function startSamplers(client: Client): void {
   const collector = getMetricsCollector();
@@ -27,54 +29,70 @@ export function startSamplers(client: Client): void {
   loopHistogram = monitorEventLoopDelay({ resolution: 20 });
   loopHistogram.enable();
   lastCpuUsage = process.cpuUsage();
+  lastSampleHrtime = process.hrtime.bigint();
 
   sampleTimer = setInterval(() => {
-    // Live metrics.enabled toggle: one config read per tick; disabled ticks
-    // only refresh the CPU/loop baselines so re-enabling starts clean
-    const enabled = collector.refreshEnabled();
-    const cpu = process.cpuUsage(lastCpuUsage!);
-    lastCpuUsage = process.cpuUsage();
-    const h = loopHistogram!;
-    if (!enabled) {
+    // Metrics must never take the bot down: swallow tick errors, log each
+    // distinct message once
+    try {
+      // Live metrics.enabled toggle: one config read per tick; disabled ticks
+      // only refresh the CPU/loop baselines so re-enabling starts clean
+      const enabled = collector.refreshEnabled();
+      const cpu = process.cpuUsage(lastCpuUsage!);
+      lastCpuUsage = process.cpuUsage();
+      // Divide by the actual elapsed time, not the nominal interval: timer
+      // drift or event-loop stalls would otherwise inflate cpuPct past 100%
+      const nowHrtime = process.hrtime.bigint();
+      const elapsedMicros = lastSampleHrtime !== null ? Number((nowHrtime - lastSampleHrtime) / 1000n) : 0;
+      lastSampleHrtime = nowHrtime;
+      const h = loopHistogram!;
+      if (!enabled) {
+        h.reset();
+        // One final push on the enabled->disabled transition so the Usage tab
+        // learns about the toggle without a manual refresh
+        if (lastEnabled !== false && process.send) {
+          process.send({
+            type: 'metrics:snapshot',
+            data: { t: Date.now(), cpuPct: 0, memRssMb: 0, heapMb: 0, loopLagMs: 0, diskTotalMb: 0, metricsEnabled: false },
+          });
+        }
+        lastEnabled = false;
+        return;
+      }
+      lastEnabled = true;
+      const mem = process.memoryUsage();
+      const sample: MetricsSample = {
+        t: Date.now(),
+        cpuPct: elapsedMicros > 0 ? Math.round(((cpu.user + cpu.system) / elapsedMicros) * 10000) / 100 : 0,
+        rssBytes: mem.rss,
+        heapBytes: mem.heapUsed,
+        loopP50Ms: nsToMs(h.percentile(50)),
+        loopP95Ms: nsToMs(h.percentile(95)),
+        loopMaxMs: nsToMs(h.max),
+      };
       h.reset();
-      // One final push on the enabled->disabled transition so the Usage tab
-      // learns about the toggle without a manual refresh
-      if (lastEnabled !== false && process.send) {
+      collector.pushSample(sample);
+
+      if (process.send) {
         process.send({
           type: 'metrics:snapshot',
-          data: { t: Date.now(), cpuPct: 0, memRssMb: 0, heapMb: 0, loopLagMs: 0, diskTotalMb: 0, metricsEnabled: false },
+          data: {
+            t: sample.t,
+            cpuPct: sample.cpuPct,
+            memRssMb: Math.round((sample.rssBytes / 1024 / 1024) * 10) / 10,
+            heapMb: Math.round((sample.heapBytes / 1024 / 1024) * 10) / 10,
+            loopLagMs: sample.loopP95Ms,
+            diskTotalMb: Math.round((collector.getDiskTotalBytes() / 1024 / 1024) * 10) / 10,
+            metricsEnabled: true,
+          },
         });
       }
-      lastEnabled = false;
-      return;
-    }
-    lastEnabled = true;
-    const mem = process.memoryUsage();
-    const sample: MetricsSample = {
-      t: Date.now(),
-      cpuPct: Math.round(((cpu.user + cpu.system) / (SAMPLE_MS * 1000)) * 10000) / 100,
-      rssBytes: mem.rss,
-      heapBytes: mem.heapUsed,
-      loopP50Ms: nsToMs(h.percentile(50)),
-      loopP95Ms: nsToMs(h.percentile(95)),
-      loopMaxMs: nsToMs(h.max),
-    };
-    h.reset();
-    collector.pushSample(sample);
-
-    if (process.send) {
-      process.send({
-        type: 'metrics:snapshot',
-        data: {
-          t: sample.t,
-          cpuPct: sample.cpuPct,
-          memRssMb: Math.round((sample.rssBytes / 1024 / 1024) * 10) / 10,
-          heapMb: Math.round((sample.heapBytes / 1024 / 1024) * 10) / 10,
-          loopLagMs: sample.loopP95Ms,
-          diskTotalMb: Math.round((collector.getDiskTotalBytes() / 1024 / 1024) * 10) / 10,
-          metricsEnabled: true,
-        },
-      });
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      if (!tickErrorsLogged.has(msg)) {
+        tickErrorsLogged.add(msg);
+        console.error('[Metrics] Sample tick failed (repeats of this error suppressed):', error);
+      }
     }
   }, SAMPLE_MS);
   sampleTimer.unref();

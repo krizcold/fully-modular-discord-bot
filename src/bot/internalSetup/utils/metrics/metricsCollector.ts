@@ -7,6 +7,7 @@ import {
   listGuilds,
   loadModuleData,
   saveModuleData,
+  deleteModuleData,
   loadGlobalModuleData,
   saveGlobalModuleData,
   moduleDataExists,
@@ -206,6 +207,19 @@ export class MetricsCollector {
     this.activeSinceFlush.delete(guildId);
     this.guildDisk.delete(guildId);
     this.ramEstimates.delete(guildId);
+  }
+
+  // Not gated on enabled: totals persisted during an earlier enabled period
+  // would otherwise resurrect the departed guild at the next boot's seed
+  dropGuildPersisted(guildId: string): void {
+    try {
+      if (!moduleDataExists(TOTALS_FILENAME, guildId, METRICS_NAMESPACE)) return;
+      if (!deleteModuleData(TOTALS_FILENAME, guildId, METRICS_NAMESPACE)) {
+        console.warn(`[Metrics] Could not delete persisted totals for departed guild ${guildId}`);
+      }
+    } catch (error) {
+      console.warn(`[Metrics] Could not delete persisted totals for departed guild ${guildId}:`, error);
+    }
   }
 
   // --- sampler feeds ---
