@@ -63,8 +63,8 @@ services:
       - redis
     environment:
       DISCORD_TOKEN: ''
-      GUILD_ID: ''
-      CLIENT_ID: ''
+      GUILD_ID: ''   # required
+      CLIENT_ID: ''  # required
       AUTH_HASH: $AUTH_HASH
       APP_TOKEN: $API_HASH
       BOT_MANAGER_API: $BOT_MANAGER_API
