@@ -9,8 +9,8 @@
  */
 
 import * as fs from 'fs';
-import * as path from 'path';
 import { Client } from 'discord.js';
+import { dataPath } from '../../../utils/dataRoot';
 import { getModuleRegistry } from './moduleRegistry';
 import { getModuleEventManager } from './moduleEventManager';
 import { getPanelManager } from './panelManager';
@@ -25,7 +25,7 @@ let clientRef: Client | null = null;
  */
 function loadDisabledComponents(): Record<string, false> {
   try {
-    const configPath = path.join(process.env.DATA_DIR || '/data', 'global', 'appstore', 'component-config.json');
+    const configPath = dataPath('global', 'appstore', 'component-config.json');
     if (fs.existsSync(configPath)) {
       const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
       const disabled: Record<string, false> = {};

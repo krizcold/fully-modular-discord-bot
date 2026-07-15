@@ -1,12 +1,13 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { getConfigFileMetadata } from './configDiscovery';
+import { dataPath } from '../../../utils/dataRoot';
 import type { ModuleConfigSchema, ConfigFieldSchema } from '../../types/moduleTypes';
 
 // Use dist/bot/config.json in production, src/bot/config.json in development
 const isProd = process.env.NODE_ENV !== 'development';
-const rootConfigPath = isProd ? '/data/dist/bot/config.json' : path.join(__dirname, '../../config.json');
-const guildConfigsDir = '/data/guildConfigs';
+const rootConfigPath = isProd ? dataPath('dist', 'bot', 'config.json') : path.join(__dirname, '../../config.json');
+const guildConfigsDir = dataPath('guildConfigs');
 
 /**
  * Schema for main bot config (config.json)
@@ -258,7 +259,7 @@ export function loadGuildConfig(filename: string, guildId: string): any {
   // For module config files, use metadata to get correct path
   const metadata = getConfigFileMetadata(filename);
   if (metadata && metadata.moduleName) {
-    const filePath = path.join('/data', guildId, metadata.moduleName, filename);
+    const filePath = dataPath(guildId, metadata.moduleName, filename);
     return readConfigFile(filePath, {});
   }
 
@@ -292,7 +293,7 @@ export function saveGuildConfig(filename: string, guildId: string, data: any): v
     return;
   }
 
-  const filePath = path.join('/data', guildId, metadata.moduleName, filename);
+  const filePath = dataPath(guildId, metadata.moduleName, filename);
   const dirPath = path.dirname(filePath);
 
   if (!fs.existsSync(dirPath)) {
@@ -318,7 +319,7 @@ export function loadGlobalConfig(filename: string): any {
   // For discovered module data files
   const metadata = getConfigFileMetadata(filename);
   if (metadata && metadata.moduleName) {
-    const filePath = path.join('/data/global', metadata.moduleName, filename);
+    const filePath = dataPath('global', metadata.moduleName, filename);
     if (fs.existsSync(filePath)) {
       return readConfigFile(filePath, {});
     }
@@ -344,7 +345,7 @@ export function saveGlobalConfig(filename: string, data: any): void {
   let filePath: string;
 
   if (metadata && metadata.moduleName) {
-    filePath = path.join('/data/global', metadata.moduleName, filename);
+    filePath = dataPath('global', metadata.moduleName, filename);
   } else if (metadata && metadata.path) {
     filePath = metadata.path;
   } else {

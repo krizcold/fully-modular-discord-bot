@@ -16,6 +16,7 @@
 import fs from 'fs';
 import path from 'path';
 import { ensureDir } from '../pathHelpers';
+import { dataPath } from '../../../../utils/dataRoot';
 import { getPaymentRegistry } from './paymentRegistry';
 import type {
   PaymentProvider,
@@ -95,7 +96,7 @@ interface DummyState {
   nextId: number;
 }
 
-const STATE_PATH = '/data/global/payment-providers/dummy/state.json';
+const STATE_PATH = dataPath('global', 'payment-providers', 'dummy', 'state.json');
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 /**

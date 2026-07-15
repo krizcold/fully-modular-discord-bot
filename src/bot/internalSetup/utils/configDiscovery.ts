@@ -1,5 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import { dataPath } from '../../../utils/dataRoot';
 import type { ModuleConfigSchema, DataFileMetadata, DataFileSchema } from '../../types/moduleTypes';
 
 // Detect production environment
@@ -149,7 +150,7 @@ export function discoverConfigFiles(): ConfigFileMetadata[] {
   const discoveredMap = new Map<string, ConfigFileMetadata>();
 
   // 1. Add main bot config
-  const mainConfigPath = '/data/dist/bot/config.json';
+  const mainConfigPath = dataPath('dist', 'bot', 'config.json');
   discoveredMap.set('config.json', {
     id: 'config.json',
     path: mainConfigPath,
@@ -167,8 +168,8 @@ export function discoverConfigFiles(): ConfigFileMetadata[] {
   }
 
   // 3. Scan for any existing files that might not have schemas
-  if (fs.existsSync('/data/global')) {
-    const globalResults = scanDirectoryRecursive('/data/global', 'data', '', GLOBAL_SCAN_EXCLUDES);
+  if (fs.existsSync(dataPath('global'))) {
+    const globalResults = scanDirectoryRecursive(dataPath('global'), 'data', '', GLOBAL_SCAN_EXCLUDES);
     for (const file of globalResults) {
       // Check if a schema already exists for this file (by checking if any entry has the same filename)
       let foundSchema = false;
@@ -211,7 +212,7 @@ export function discoverGuildConfigFiles(guildId: string): ConfigFileMetadata[] 
   // 2. For each schema, create guild-specific metadata
   for (const schema of schemas) {
     // Path follows module namespace: /data/{guildId}/{moduleName}/{configId}
-    const guildPath = `/data/${guildId}/${schema.moduleName}/${schema.id}`;
+    const guildPath = dataPath(guildId, schema.moduleName!, schema.id);
 
     discovered.set(schema.id, {
       id: schema.id,
@@ -236,7 +237,7 @@ export function discoverGuildConfigFiles(guildId: string): ConfigFileMetadata[] 
     ...guildDataSchemas.map(d => `${d.moduleName}/${d.id.split('/').pop()}`)
   ]);
 
-  const guildDir = `/data/${guildId}`;
+  const guildDir = dataPath(guildId);
   if (fs.existsSync(guildDir)) {
     const existingFiles = scanDirectoryRecursive(guildDir, 'data');
 
@@ -309,7 +310,7 @@ export function discoverModuleConfigSchemas(modules: any[]): ConfigFileMetadata[
       }
 
       // Path follows module namespace: /data/global/{moduleName}/{configId}
-      const configPath = `/data/global/${moduleName}/${schema.id}`;
+      const configPath = dataPath('global', moduleName, schema.id);
 
       discovered.push({
         id: schema.id,
@@ -401,7 +402,7 @@ export function discoverModuleConfigSchemasFromDisk(): ConfigFileMetadata[] {
           }
 
           // Path follows module namespace using module.json name
-          const configPath = `/data/global/${moduleName}/${schema.id}`;
+          const configPath = dataPath('global', moduleName, schema.id);
 
           discovered.push({
             id: schema.id,
@@ -509,7 +510,7 @@ export function discoverModuleDataSchemasFromDisk(): DataFileMetadata[] {
           for (const dataFile of dataFiles) {
             // For global scope or both scopes
             if (dataFile.scope === 'global' || dataFile.scope === 'both') {
-              const globalPath = `/data/global/${moduleName}/${dataFile.id}`;
+              const globalPath = dataPath('global', moduleName, dataFile.id);
 
               discovered.push({
                 id: dataFile.id,  // Keep original filename as ID
@@ -586,7 +587,7 @@ export function discoverGuildDataFiles(guildId: string): DataFileMetadata[] {
             // For guild scope or both scopes
             if (dataFile.scope === 'guild' || dataFile.scope === 'both') {
               // Path follows module namespace using module.json name
-              const guildPath = `/data/${guildId}/${moduleName}/${dataFile.id}`;
+              const guildPath = dataPath(guildId, moduleName, dataFile.id);
 
               const key = `${moduleName}/${dataFile.id}`;
               discovered.set(key, {
@@ -611,7 +612,7 @@ export function discoverGuildDataFiles(guildId: string): DataFileMetadata[] {
     }
 
     // Also scan for any existing files that might not have schemas
-    const guildDir = `/data/${guildId}`;
+    const guildDir = dataPath(guildId);
     if (fs.existsSync(guildDir)) {
       const existingFiles = scanDirectoryRecursive(guildDir, 'data');
 
@@ -711,7 +712,7 @@ export function discoverGlobalDataFiles(): DataFileMetadata[] {
   }
 
   // 2. Scan for any existing files that might not have schemas
-  const globalDir = '/data/global';
+  const globalDir = dataPath('global');
   if (fs.existsSync(globalDir)) {
     const existingFiles = scanDirectoryRecursive(globalDir, 'data', '', GLOBAL_SCAN_EXCLUDES);
 

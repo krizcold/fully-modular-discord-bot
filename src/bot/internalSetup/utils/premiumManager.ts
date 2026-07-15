@@ -33,6 +33,7 @@ import fs from 'fs';
 import path from 'path';
 import * as crypto from 'crypto';
 import { ensureDir } from './pathHelpers';
+import { dataPath } from '../../../utils/dataRoot';
 import type { HardLimitOverride } from '../../types/settingsTypes';
 import {
   loadGlobalModuleConfig,
@@ -324,8 +325,8 @@ const DEFAULT_CONFIG: PremiumConfig = {
   migrationSilencePolicy: 'cancel',
 };
 
-const CONFIG_PATH = '/data/global/premium-tiers.json';
-const AUDIT_PATH = '/data/global/premium-tiers.audit.jsonl';
+const CONFIG_PATH = dataPath('global', 'premium-tiers.json');
+const AUDIT_PATH = dataPath('global', 'premium-tiers.audit.jsonl');
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 let instance: PremiumManager | null = null;

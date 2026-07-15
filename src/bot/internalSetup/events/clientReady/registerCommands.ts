@@ -10,13 +10,13 @@ import areCommandsDifferent from '../../utils/areCommandsDifferent';
 import 'dotenv/config';
 import { getConfigProperty } from '../../utils/configManager';
 import { loadGlobalData, saveGlobalData } from '../../utils/dataManager';
+import { dataPath } from '../../../../utils/dataRoot';
 import * as fs from 'fs';
-import * as path from 'path';
 
 /** Check if auto-cleanup is enabled in AppStore config (default: false) */
 export function isAutoCleanupEnabled(): boolean {
   try {
-    const configPath = path.join(process.env.DATA_DIR || '/data', 'global', 'appstore', 'config.json');
+    const configPath = dataPath('global', 'appstore', 'config.json');
     if (fs.existsSync(configPath)) {
       const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
       return config.autoCleanup === true;
@@ -29,7 +29,7 @@ export function isAutoCleanupEnabled(): boolean {
 function getDisabledCommands(): Set<string> {
   const disabled = new Set<string>();
   try {
-    const configPath = path.join(process.env.DATA_DIR || '/data', 'global', 'appstore', 'component-config.json');
+    const configPath = dataPath('global', 'appstore', 'component-config.json');
     if (fs.existsSync(configPath)) {
       const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
       for (const [key, value] of Object.entries(config)) {

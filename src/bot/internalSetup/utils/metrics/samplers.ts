@@ -8,8 +8,9 @@ import type { Client } from 'discord.js';
 import { getMetricsCollector, MetricsSample } from './metricsCollector';
 import { listGuilds, sizeOfGlobalData } from '../dataManager';
 import { SAMPLE_MS, DISK_WALK_MS, FLUSH_MS, BYTES_PER_CACHE_OBJECT } from './constants';
+import { DATA_ROOT } from '../../../../utils/dataRoot';
 
-const BASE_DATA_DIR = '/data';
+const BASE_DATA_DIR = DATA_ROOT;
 
 let sampleTimer: NodeJS.Timeout | null = null;
 let diskTimer: NodeJS.Timeout | null = null;

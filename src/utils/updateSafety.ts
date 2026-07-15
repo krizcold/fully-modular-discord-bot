@@ -5,12 +5,13 @@
 
 import fs from 'fs';
 import path from 'path';
+import { dataPath } from './dataRoot';
 
 // Configuration paths
-const SAFETY_CONFIG_PATH = '/data/update-safety.json';
-const CRASH_LOGS_DIR = '/data/crash-logs';
-const BACKUPS_DIR = '/data/backups';
-const RECOVERY_DIR = '/data/recovery';
+const SAFETY_CONFIG_PATH = dataPath('update-safety.json');
+const CRASH_LOGS_DIR = dataPath('crash-logs');
+const BACKUPS_DIR = dataPath('backups');
+const RECOVERY_DIR = dataPath('recovery');
 
 // Safety configuration interface
 export interface SafetyConfig {

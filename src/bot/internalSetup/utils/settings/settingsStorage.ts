@@ -5,6 +5,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import type { SettingValue, MergedSettings, HardLimitOverride } from '@bot/types/settingsTypes';
+import { dataPath } from '../../../../utils/dataRoot';
 import { getSettingsSchema } from './settingsDiscovery';
 import { validateSettingValue, validateValueWithEffectiveLimits } from './settingsValidation';
 
@@ -12,9 +13,9 @@ const SETTINGS_FILENAME = 'settings.json';
 
 function getSettingsFilePath(moduleName: string, guildId?: string | null): string {
   if (guildId) {
-    return path.join('/data', guildId, moduleName, SETTINGS_FILENAME);
+    return dataPath(guildId, moduleName, SETTINGS_FILENAME);
   }
-  return path.join('/data/global', moduleName, SETTINGS_FILENAME);
+  return dataPath('global', moduleName, SETTINGS_FILENAME);
 }
 
 function loadRawSettings(moduleName: string, guildId?: string | null): Record<string, SettingValue> {

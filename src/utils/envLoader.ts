@@ -3,6 +3,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as dotenv from 'dotenv';
+import { dataPath } from './dataRoot';
 
 /**
  * Deployment mode.
@@ -94,12 +95,19 @@ export function loadCredentials(): BotCredentials {
   }
 
   // Override with /data/.env if it exists (Web-UI managed)
-  const dataEnvPath = '/data/.env';
+  const dataEnvPath = dataPath('.env');
   if (fs.existsSync(dataEnvPath)) {
     try {
       const dataEnv = dotenv.parse(fs.readFileSync(dataEnvPath));
       // Only override if docker-compose value is a placeholder
       for (const [key, value] of Object.entries(dataEnv)) {
+        // Compose defaults like ${VAR:-} leave the var set to an empty string,
+        // which dotenv would treat as "already set"; empty means unset intent,
+        // so apply the saved value to process.env for direct readers (e.g. the
+        // web-UI AUTH_HASH middleware).
+        if (process.env[key] === undefined || process.env[key] === '') {
+          process.env[key] = value;
+        }
         if (isPlaceholder(credentials[key])) {
           credentials[key] = value;
         }
@@ -162,7 +170,7 @@ export function validateCredentials(credentials: BotCredentials): CredentialVali
  * @returns Success status
  */
 export function saveCredentials(credentials: BotCredentials): { success: boolean; error?: string } {
-  const dataEnvPath = '/data/.env';
+  const dataEnvPath = dataPath('.env');
 
   try {
     // Ensure /data directory exists

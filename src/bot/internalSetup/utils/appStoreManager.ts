@@ -17,6 +17,7 @@ import crypto from 'crypto';
 import { execSync } from 'child_process';
 import { ModuleManifest } from '../../types/moduleTypes';
 import { ensureDir, getModulesDir, getSourceModulesDir, getBuildModulesDir, getModulesDevDir } from './pathHelpers';
+import { dataPath } from '../../../utils/dataRoot';
 import { takeAutoSnapshot } from '@/utils/autoSnapshot';
 
 /**
@@ -161,7 +162,7 @@ export interface ModuleUpdatesResult {
 // CONSTANTS
 // ============================================================================
 
-const APPSTORE_DIR = '/data/global/appstore';
+const APPSTORE_DIR = dataPath('global', 'appstore');
 const REPOS_CONFIG_PATH = path.join(APPSTORE_DIR, 'repos.json');
 const INSTALLED_CONFIG_PATH = path.join(APPSTORE_DIR, 'installed.json');
 const CREDENTIALS_DIR = path.join(APPSTORE_DIR, 'credentials');

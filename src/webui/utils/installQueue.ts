@@ -1,6 +1,7 @@
 import { EventEmitter } from 'events';
 import * as fs from 'fs';
 import * as path from 'path';
+import { dataPath } from '../../utils/dataRoot';
 import { getAppStoreManager } from '../../bot/internalSetup/utils/appStoreManager';
 import type { BotManager } from '../botManager';
 
@@ -33,7 +34,7 @@ export type CancelResult =
   | { ok: true; job: InstallJob }
   | { ok: false; reason: 'not-found' | 'already-running' };
 
-const APPSTORE_CONFIG_DIR = path.join(process.env.DATA_DIR || '/data', 'global', 'appstore');
+const APPSTORE_CONFIG_DIR = dataPath('global', 'appstore');
 const COMPONENT_CONFIG_PATH = path.join(APPSTORE_CONFIG_DIR, 'component-config.json');
 
 function cleanupComponentConfig(moduleName: string): void {

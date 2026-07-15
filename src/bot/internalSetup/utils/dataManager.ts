@@ -4,11 +4,12 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { getMetricsCollector } from './metrics/metricsCollector';
+import { DATA_ROOT } from '../../../utils/dataRoot';
 
 /**
  * Base data directory for all bot data
  */
-const BASE_DATA_DIR = '/data';
+const BASE_DATA_DIR = DATA_ROOT;
 
 /**
  * Data scope - either guild-specific or global
