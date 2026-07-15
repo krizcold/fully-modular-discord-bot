@@ -34,6 +34,9 @@ COPY --chown=node:node src/ /app/src/
 ARG BUILD_MODE
 # Persist to runtime so getDeploymentMode() sees the mode this image was built with
 ENV BUILD_MODE=${BUILD_MODE}
+
+# Fleet placement invariant: the master holds the shard containing the test guild
+ENV PIN_TEST_GUILD_SHARD=true
 COPY --chown=node:node updaters/ /tmp/updaters/
 RUN mkdir -p /app/src/updater && \
     if [ "$BUILD_MODE" = "managed" ]; then \

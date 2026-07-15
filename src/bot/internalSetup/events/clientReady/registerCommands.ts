@@ -9,6 +9,7 @@ import getLocalCommands from '../../utils/getLocalCommands';
 import areCommandsDifferent from '../../utils/areCommandsDifferent';
 import 'dotenv/config';
 import { getConfigProperty } from '../../utils/configManager';
+import { resolveNodeRole } from '../../fleet/nodeIdentity';
 import { loadGlobalData, saveGlobalData } from '../../utils/dataManager';
 import { dataPath } from '../../../../utils/dataRoot';
 import * as fs from 'fs';
@@ -175,6 +176,12 @@ export default async function registerCommands(
   client: Client,
   options: { runOrphanCleanup?: boolean } = {}
 ) {
+  // Slash-command registration is a bot-identity-wide operation; only the
+  // master node performs it (co-workers would race the same Discord state).
+  if (resolveNodeRole() === 'co-worker') {
+    console.log('[i] Skipping command registration (co-worker node; the master owns it)');
+    return;
+  }
   const runOrphanCleanup = options.runOrphanCleanup !== false;
   console.log('[i] Registering commands...');
 

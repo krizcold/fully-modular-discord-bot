@@ -23,6 +23,16 @@ export interface BotCredentials {
   GUILD_ID?: string;
   MAIN_GUILD_ID?: string;
   AUTH_HASH?: string;
+  // Fleet / sharding control plane (Phase 1). Resolved in the bot child:
+  // explicit BOT_NODE_ROLE wins; else MASTER_URL present = co-worker; else
+  // standalone master.
+  BOT_NODE_ROLE?: string;
+  MASTER_URL?: string;
+  CONTROL_SECRET?: string;
+  CONTROL_PORT?: string;
+  NODE_NAME?: string;
+  PIN_TEST_GUILD_SHARD?: string;
+  FLEET_SHARD_COUNT?: string;
   // OAuth Configuration (Optional - for Guild Web-UI)
   ENABLE_GUILD_WEBUI?: string;
   DISCORD_CLIENT_ID?: string;
@@ -68,6 +78,14 @@ export function loadCredentials(): BotCredentials {
     GUILD_ID: process.env.GUILD_ID,
     MAIN_GUILD_ID: process.env.MAIN_GUILD_ID,
     AUTH_HASH: process.env.AUTH_HASH,
+    // Fleet fields (flow to the bot child via the botManager env spread)
+    BOT_NODE_ROLE: process.env.BOT_NODE_ROLE,
+    MASTER_URL: process.env.MASTER_URL,
+    CONTROL_SECRET: process.env.CONTROL_SECRET,
+    CONTROL_PORT: process.env.CONTROL_PORT,
+    NODE_NAME: process.env.NODE_NAME,
+    PIN_TEST_GUILD_SHARD: process.env.PIN_TEST_GUILD_SHARD,
+    FLEET_SHARD_COUNT: process.env.FLEET_SHARD_COUNT,
     // OAuth fields
     ENABLE_GUILD_WEBUI: process.env.ENABLE_GUILD_WEBUI,
     DISCORD_CLIENT_ID: process.env.DISCORD_CLIENT_ID,

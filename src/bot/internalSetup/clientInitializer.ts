@@ -16,6 +16,8 @@ import { getSubscriptionNotifier } from './utils/subscriptionNotifier';
 import { getPaymentRegistry } from './utils/payment/paymentRegistry';
 import { startModuleAutoUpdater } from './utils/moduleAutoUpdater';
 import { loadCredentials } from '../../utils/envLoader';
+import { initFleet } from './fleet/bootstrap';
+import { getIngestService } from './ingest/ingestService';
 import { ModuleLoader } from './utils/moduleLoader';
 import { getModuleRegistry } from './utils/moduleRegistry';
 import { getModuleEventManager } from './utils/moduleEventManager';
@@ -447,6 +449,11 @@ function runInitializers(client: Client) {
  * Main function that initializes the client.
  */
 async function main() {
+  // Fleet boot: role resolution, term acquisition, shard leases. Standalone
+  // resolves to a master with self-granted leases; a co-worker holds here
+  // until its master grants a lease.
+  const fleet = await initFleet();
+
   // PHASE 0: Ensure config.json is fully populated with schema
   console.log('[Bot] Synchronizing config.json with schema...');
   ensureConfigPopulated();
@@ -494,10 +501,13 @@ async function main() {
   // giveaway or halloffame message from before a restart) - without them
   // discord.js silently drops those events. Every internal and module
   // reaction handler already fetches partials before use.
-  const client = new Client({
+  // Construction goes through IngestService: {shards, shardCount} come from
+  // this node's lease (standalone lease = the whole shard set).
+  const client = getIngestService().buildClient({
     intents: finalIntents,
     partials: [Partials.Message, Partials.Reaction, Partials.User],
   });
+  fleet.attachClient(client);
 
   client.buttonHandlers = new Map<string, RegisteredButtonInfo>();
   client.dropdownHandlers = new Map<string, RegisteredDropdownInfo>();
@@ -662,7 +672,9 @@ async function main() {
   process.on('SIGTERM', shutdownHandler);
   process.on('SIGINT', shutdownHandler);
 
-  client.login(process.env.DISCORD_TOKEN);
+  // Login is gated by the lease runtime: no identify without a current-term
+  // lease, honoring the grant's identify delay. Standalone starts immediately.
+  fleet.startIngest(process.env.DISCORD_TOKEN);
 }
 
 main().catch(console.error);
