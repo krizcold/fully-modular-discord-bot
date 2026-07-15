@@ -10,14 +10,11 @@
     "start": "node dist/index.js",
     "start:watch": "tsc --watch & nodemon --watch dist dist/index.js",
     "dev": "cross-env NODE_ENV=development nodemon --watch src --ext ts,json --ignore src/bot/config.json --exec ts-node -r tsconfig-paths/register src/index.ts",
-    "dev:bot": "nodemon --watch src/bot --ext ts,json --ignore src/bot/config.json --exec ts-node -r tsconfig-paths/register src/bot/index.ts",
-    "dev:webui": "nodemon --watch src/webui --ext ts,json --exec ts-node -r tsconfig-paths/register src/webui/index.ts",
+    "dev:bot": "cross-env NODE_ENV=development nodemon --watch src/bot --ext ts,json --ignore src/bot/config.json --exec ts-node -r tsconfig-paths/register src/bot/index.ts",
+    "dev:webui": "cross-env NODE_ENV=development nodemon --watch src/webui --ext ts,json --exec ts-node -r tsconfig-paths/register src/webui/index.ts",
     "redis:dev": "docker start smdb-redis || docker run -d --name smdb-redis -p 6379:6379 redis:alpine",
-    "dockerUpdate": "docker build -t fully-modular-discord-bot . && docker-compose up -d",
     "dockerPublish": "dotenv node scripts/dockerPublish.js",
-    "exportContext": "node scripts/exportContext.js",
-    "docker:run": "docker build -t fully-modular-discord-bot . && docker run --rm -it -v %cd%:/app -p 3000:3000 fully-modular-discord-bot",
-    "docker:run-env": "docker build -t fully-modular-discord-bot . && docker run --rm -it --env-file .env -v ${PWD}:/app fully-modular-discord-bot"
+    "exportContext": "node scripts/exportContext.js"
   },
   "keywords": [],
   "author": "kriz_cold",
