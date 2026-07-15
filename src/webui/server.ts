@@ -18,6 +18,7 @@ import { createGuildSubscriptionRoutes } from './routes/guildSubscriptions';
 import { createUpdateRouter } from './routes/update';
 import { createDevModulesRoutes } from './routes/devmodules';
 import { createUsageRoutes } from './routes/usage';
+import { createFleetRoutes } from './routes/fleet';
 import { requireAuth } from './middleware/auth';
 import { configureOAuth, isGuildWebUIEnabled } from './auth/oauthConfig';
 import { requireGuildWebUIEnabled } from './auth/oauthMiddleware';
@@ -270,6 +271,7 @@ export async function createServer(botManager: BotManager): Promise<Express> {
   app.use('/api/update', requireAuth, createUpdateRouter(botManager));
   app.use('/api/devmodules', requireAuth, createDevModulesRoutes(botManager));
   app.use('/api/usage', requireAuth, createUsageRoutes(botManager));
+  app.use('/api/fleet', requireAuth, createFleetRoutes(botManager));
 
   // Serve static frontend files (protected by auth)
   const publicDir = path.join(__dirname, 'public');

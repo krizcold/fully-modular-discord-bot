@@ -7,6 +7,7 @@ import { RegisteredButtonInfo, RegisteredDropdownInfo, RegisteredModalInfo, Regi
 import { getPanelManager } from './utils/panelManager';
 import { setupPanelIPCHandlers } from './utils/ipcPanelHandler';
 import { setupMetricsIPCHandlers } from './utils/ipcMetricsHandler';
+import { setupFleetIPCHandlers } from './utils/ipcFleetHandler';
 import { getMetricsCollector } from './utils/metrics/metricsCollector';
 import { startSamplers, stopSamplers } from './utils/metrics/samplers';
 import { setupReloadIPCHandlers } from './utils/ipcReloadHandler';
@@ -619,6 +620,9 @@ async function main() {
 
   // Set up IPC message handlers for metrics
   setupMetricsIPCHandlers();
+
+  // Set up IPC message handlers for fleet state
+  setupFleetIPCHandlers();
 
   // Set up IPC message handlers for module hot-reload
   setupReloadIPCHandlers(client);

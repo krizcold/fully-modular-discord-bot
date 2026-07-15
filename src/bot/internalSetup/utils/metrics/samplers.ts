@@ -6,6 +6,7 @@ import * as path from 'path';
 import { monitorEventLoopDelay, IntervalHistogram } from 'perf_hooks';
 import type { Client } from 'discord.js';
 import { getMetricsCollector, MetricsSample } from './metricsCollector';
+import { pushFleetStatus } from '../ipcFleetHandler';
 import { listGuilds, sizeOfGlobalData } from '../dataManager';
 import { SAMPLE_MS, DISK_WALK_MS, FLUSH_MS, BYTES_PER_CACHE_OBJECT } from './constants';
 import { DATA_ROOT } from '../../../../utils/dataRoot';
@@ -36,6 +37,9 @@ export function startSamplers(client: Client): void {
     // Metrics must never take the bot down: swallow tick errors, log each
     // distinct message once
     try {
+      // Fleet status rides this 5s tick (no extra timer); pushed before the
+      // metrics.enabled gate so it flows even with metrics disabled
+      pushFleetStatus();
       // Live metrics.enabled toggle: one config read per tick; disabled ticks
       // only refresh the CPU/loop baselines so re-enabling starts clean
       const enabled = collector.refreshEnabled();

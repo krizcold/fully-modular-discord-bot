@@ -413,6 +413,12 @@ function UsagePanel({ api, wsClient }) {
             </table>
           )}
         </div>
+
+        <FleetView
+          api={api}
+          wsClient={wsClient}
+          guildNames={guildRows.reduce((acc, g) => { acc[g.guildId] = g.name; return acc; }, {})}
+        />
       </RefetchOverlay>
     </div>
   );

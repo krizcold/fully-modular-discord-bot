@@ -245,6 +245,10 @@ export class BotManager {
           if (this.wsManager) {
             this.wsManager.broadcast('bot:metrics:snapshot', message.data);
           }
+        } else if (message.type === 'fleet:status') {
+          if (this.wsManager) {
+            this.wsManager.broadcast('bot:fleet:status', message.data);
+          }
         }
       });
 
@@ -556,6 +560,18 @@ export class BotManager {
       return await this.sendIPCMessage('metrics:leaderboard', {});
     } catch (error) {
       console.error('[BotManager] Error getting metrics leaderboard:', error);
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  /**
+   * Get the fleet state snapshot from the bot
+   */
+  async getFleetState(): Promise<any> {
+    try {
+      return await this.sendIPCMessage('fleet:state', {});
+    } catch (error) {
+      console.error('[BotManager] Error getting fleet state:', error);
       return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
     }
   }
