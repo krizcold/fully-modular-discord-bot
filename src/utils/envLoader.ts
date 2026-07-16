@@ -30,6 +30,7 @@ export interface BotCredentials {
   MASTER_URL?: string;
   CONTROL_SECRET?: string;
   CONTROL_PORT?: string;
+  FLEET_PUBLIC_URL?: string;
   NODE_NAME?: string;
   PIN_TEST_GUILD_SHARD?: string;
   FLEET_SHARD_COUNT?: string;
@@ -83,6 +84,7 @@ export function loadCredentials(): BotCredentials {
     MASTER_URL: process.env.MASTER_URL,
     CONTROL_SECRET: process.env.CONTROL_SECRET,
     CONTROL_PORT: process.env.CONTROL_PORT,
+    FLEET_PUBLIC_URL: process.env.FLEET_PUBLIC_URL,
     NODE_NAME: process.env.NODE_NAME,
     PIN_TEST_GUILD_SHARD: process.env.PIN_TEST_GUILD_SHARD,
     FLEET_SHARD_COUNT: process.env.FLEET_SHARD_COUNT,

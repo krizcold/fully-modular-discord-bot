@@ -35,6 +35,67 @@ function FleetBadge({ text, background, color }) {
   );
 }
 
+// Master-only worker-onboarding card. Renders a copy-paste env block an
+// operator drops into a new bot instance's Fleet config to add it as a worker.
+function FleetConnectCard({ connect }) {
+  const [copied, setCopied] = React.useState(false);
+
+  if (!connect.secretSet) {
+    return (
+      <div className="usage-stat-card" style={{ marginTop: '10px' }}>
+        <div className="usage-stat-title">Connect a worker</div>
+        <div className="usage-stat-sub">
+          Set a CONTROL_SECRET in this bot's Fleet config to let other instances join.
+        </div>
+      </div>
+    );
+  }
+
+  const secretLine = connect.secret != null
+    ? `CONTROL_SECRET=${connect.secret}`
+    : 'CONTROL_SECRET=<generate one on this master>';
+  const block = [
+    'BOT_NODE_ROLE=co-worker',
+    `MASTER_URL=${connect.masterUrl}`,
+    secretLine,
+  ].join('\n');
+
+  const copyBlock = () => {
+    navigator.clipboard.writeText(block);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
+
+  return (
+    <div className="usage-stat-card" style={{ marginTop: '10px' }}>
+      <div className="usage-stat-title">
+        Connect a worker
+        <button onClick={copyBlock} style={{ marginLeft: '10px', fontSize: '0.72rem', padding: '2px 8px' }}>
+          {copied ? 'Copied' : 'Copy'}
+        </button>
+      </div>
+      <pre
+        style={{
+          margin: '6px 0',
+          padding: '8px 10px',
+          background: '#1e1e1e',
+          borderRadius: '6px',
+          fontSize: '0.78rem',
+          userSelect: 'all',
+          whiteSpace: 'pre-wrap',
+          wordBreak: 'break-all',
+        }}
+      >{block}</pre>
+      <div className="usage-stat-sub">
+        Paste these into a new bot instance's Fleet config to add it as a worker.
+        {connect.urlIsTemplate
+          ? ' Replace <host> with this master\'s reachable address (LAN IP, or host.docker.internal for a same-box container).'
+          : ''}
+      </div>
+    </div>
+  );
+}
+
 function FleetNodeCard({ node }) {
   const healthColor = FLEET_HEALTH_COLORS[node.health] || '#888';
   return (
@@ -131,6 +192,8 @@ function FleetView({ api, wsClient, guildNames }) {
       {fleet.role === 'co-worker' && !fleet.masterKnown && (
         <div className="usage-notice">Master unreachable, retrying...</div>
       )}
+
+      {fleet.role === 'master' && fleet.connect ? <FleetConnectCard connect={fleet.connect} /> : null}
 
       <div className="usage-stat-grid">
         {fleet.nodes.map((node) => <FleetNodeCard key={node.nodeId} node={node} />)}

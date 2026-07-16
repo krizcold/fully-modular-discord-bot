@@ -73,6 +73,8 @@ services:
       BOT_ID: $APP_ID
       REDIS_URL: redis://redis:6379
       TZ: $TZ
+    labels:
+      fleet.control-port: "3928"  # manager detects this to expose the control endpoint and inject CONTROL_PORT/role/etc
     volumes:
       - type: bind
         source: $DATA_ROOT/AppData/fullymodulardiscordbot/custom

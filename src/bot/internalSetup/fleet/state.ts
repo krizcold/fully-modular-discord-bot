@@ -2,7 +2,7 @@
 // fork IPC (a follow-up ipcFleetHandler answers 'fleet:state' with it).
 
 import { performance } from 'perf_hooks';
-import { DEFAULT_SHARD_CAPACITY, PROTOCOL_VERSION } from './constants';
+import { CONTROL_PORT_DEFAULT, DEFAULT_SHARD_CAPACITY, PROTOCOL_VERSION } from './constants';
 import { isPinEnabled } from './placement';
 import type { NodeRole } from './protocol';
 import type { Registry } from './registry';
@@ -40,6 +40,20 @@ export interface FleetState {
   pinnedShardId: number | null;
   masterKnown: boolean;
   masterUrl: string | null;
+  /**
+   * Worker-onboarding block, master-only. masterUrl is the reachable control
+   * endpoint: FLEET_PUBLIC_URL when the platform advertised one, else a
+   * ws://<host>:<port> template the operator fills in. secret is the master's
+   * own CONTROL_SECRET, returned only over the auth-gated web UI so operators
+   * can copy-paste a worker's config. Never populated on a co-worker.
+   */
+  connect: {
+    masterUrl: string;
+    urlIsTemplate: boolean;
+    controlPort: number;
+    secretSet: boolean;
+    secret?: string;
+  } | null;
   leases: { leaseId: string; shardId: number; identifyDelayMs: number }[];
   nodes: FleetStateNode[];
   shardTable: { shardId: number; nodeId: string; leaseId: string; term: number; epoch: number; status: string }[];
@@ -67,6 +81,26 @@ export function _setFleetStateSources(s: FleetStateSources): void {
   sources = s;
 }
 
+/**
+ * Master-only worker-onboarding block. FLEET_PUBLIC_URL (injected by the
+ * manager on a public platform) is the advertised wss endpoint; without it a
+ * ws://<host>:<port> template is returned for the operator to fill in. The
+ * secret is included only when set so the copy-paste block carries it.
+ */
+function buildConnect(): FleetState['connect'] {
+  const controlPort = Number(process.env.CONTROL_PORT) || CONTROL_PORT_DEFAULT;
+  const publicUrl = (process.env.FLEET_PUBLIC_URL || '').trim();
+  const secret = (process.env.CONTROL_SECRET || '').trim();
+  const urlIsTemplate = publicUrl === '';
+  return {
+    masterUrl: urlIsTemplate ? `ws://<host>:${controlPort}` : publicUrl,
+    urlIsTemplate,
+    controlPort,
+    secretSet: secret !== '',
+    secret: secret !== '' ? secret : undefined,
+  };
+}
+
 export function getFleetState(): FleetState {
   if (!sources) {
     return {
@@ -84,6 +118,7 @@ export function getFleetState(): FleetState {
       pinnedShardId: null,
       masterKnown: false,
       masterUrl: null,
+      connect: null,
       leases: [],
       nodes: [],
       shardTable: [],
@@ -130,6 +165,7 @@ export function getFleetState(): FleetState {
       pinnedShardId,
       masterKnown: true,
       masterUrl: null,
+      connect: buildConnect(),
       leases,
       nodes,
       shardTable: [...registry.shardTable.values()]
@@ -166,6 +202,7 @@ export function getFleetState(): FleetState {
     pinnedShardId: null,
     masterKnown: controlClient?.masterKnown() ?? false,
     masterUrl: (process.env.MASTER_URL || '').trim() || null,
+    connect: null,
     leases,
     nodes: [
       {

@@ -7,9 +7,14 @@ services:
   bot:
     build: .
     restart: unless-stopped
+    labels:
+      fleet.control-port: "3928"  # only meaningful under the Bot Manager; harmless here
     ports:
       # Localhost only by default. To expose on the LAN use "8080:8080".
       - "127.0.0.1:8080:8080"
+      # Fleet control plane. Uncomment on a master to let same-host workers
+      # dial in; bind to a reachable interface (not 127.0.0.1) for other hosts.
+      # - "127.0.0.1:3928:3928"  # expose fleet control plane for same-host workers
     environment:
       # Required to use the Web-UI. Any long random secret works; open
       # http://localhost:8080/?hash=<AUTH_HASH> after boot. When unset the
@@ -23,6 +28,15 @@ services:
       GUILD_ID: ${GUILD_ID:-}
       # Optional Redis for persistent Guild Web-UI sessions; off when unset.
       # REDIS_URL: redis://your-redis-host:6379
+      # Fleet / multi-instance sharding (optional). A single standalone bot is
+      # a master and needs none of these. Set them only to run more than one
+      # instance sharing the same token.
+      # BOT_NODE_ROLE: co-worker         # master (default) or co-worker
+      # MASTER_URL: ws://master-host:3928  # co-worker only: the master's control URL
+      # CONTROL_SECRET: ${CONTROL_SECRET:-}  # shared secret; required on both master and worker
+      # FLEET_SHARD_COUNT: ${FLEET_SHARD_COUNT:-}  # override the auto-derived shard count
+      # PIN_TEST_GUILD_SHARD: ${PIN_TEST_GUILD_SHARD:-}  # keep the test guild's shard on the master
+      # NODE_NAME: ${NODE_NAME:-}        # friendly name shown in the Fleet view
     volumes:
       # Persistent data: saved credentials (/data/.env), AppStore modules,
       # guild data. On Linux create it first so the container user (uid 1000)
