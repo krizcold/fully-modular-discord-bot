@@ -40,6 +40,20 @@ export interface ShardLease {
   epoch: number;
 }
 
+/**
+ * A grant whose ack was lost. The worker may have applied it despite the lost
+ * ack, so the shard is NOT free (granting it elsewhere would dual-identify).
+ * Resolved by heartbeat truth: reconcilePending() confirms or frees it.
+ */
+export interface PendingLease {
+  shardId: number;
+  nodeId: string;
+  leaseId: string;
+  term: number;
+  epoch: number;
+  grantedAt: number;
+}
+
 export class Registry {
   term = 0;
   epoch = 0;
@@ -47,6 +61,7 @@ export class Registry {
 
   readonly nodes = new Map<string, RegistryNode>();
   readonly shardTable = new Map<number, ShardLease>();
+  readonly pendingConfirmation = new Map<number, PendingLease>();
   readonly guildMap = new Map<string, number>();
 
   upsertNode(input: {
@@ -118,12 +133,63 @@ export class Registry {
     }
   }
 
+  clearPendingForNode(nodeId: string): void {
+    for (const [shardId, pending] of this.pendingConfirmation) {
+      if (pending.nodeId === nodeId) this.pendingConfirmation.delete(shardId);
+    }
+  }
+
   shardIdsOf(nodeId: string): number[] {
     const shardIds: number[] = [];
     for (const lease of this.shardTable.values()) {
       if (lease.nodeId === nodeId) shardIds.push(lease.shardId);
     }
     return shardIds.sort((a, b) => a - b);
+  }
+
+  /**
+   * A shard is FREE when it is unassigned, not pending-confirmation and not
+   * frozen. Shards leased to a currently-disconnected node stay in shardTable,
+   * so they read as held here (Wait mode; never auto-moved).
+   */
+  freeShards(): number[] {
+    const free: number[] = [];
+    for (let shardId = 0; shardId < this.shardCount; shardId++) {
+      if (this.shardTable.has(shardId)) continue; // held (live or frozen)
+      if (this.pendingConfirmation.has(shardId)) continue;
+      free.push(shardId);
+    }
+    return free;
+  }
+
+  /**
+   * Resolve pending-confirmation shards from heartbeat truth. Heartbeats that
+   * reach the registry are already valid-term (the control server fences stale
+   * terms), so a target node's reported shard set is authoritative once a
+   * heartbeat lands AFTER the grant: present -> confirm the lease; absent ->
+   * the grant never took, free the shard.
+   */
+  reconcilePending(): void {
+    for (const [shardId, pending] of this.pendingConfirmation) {
+      const node = this.nodes.get(pending.nodeId);
+      if (!node) {
+        this.pendingConfirmation.delete(shardId);
+        continue;
+      }
+      if (!node.connected) {
+        // Target vanished mid-pending: adopt it as that node's (now frozen)
+        // lease so Wait mode holds it until Declare Lost, rather than granting
+        // a maybe-identified shard to someone else.
+        this.shardTable.set(shardId, { shardId, nodeId: pending.nodeId, leaseId: pending.leaseId, term: pending.term, epoch: pending.epoch });
+        this.pendingConfirmation.delete(shardId);
+        continue;
+      }
+      if (node.lastHeartbeatAt === null || node.lastHeartbeatAt <= pending.grantedAt) continue;
+      if (node.shards.some(s => s.shardId === shardId)) {
+        this.shardTable.set(shardId, { shardId, nodeId: pending.nodeId, leaseId: pending.leaseId, term: pending.term, epoch: pending.epoch });
+      }
+      this.pendingConfirmation.delete(shardId);
+    }
   }
 
   healthOf(node: RegistryNode): NodeHealth {

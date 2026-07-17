@@ -29,8 +29,5 @@ export const CONTROL_ACK_TIMEOUT_MS = 10000;
 /** Timeout for the /gateway/bot fetch at plan time; a fallback keeps boot alive offline. */
 export const GATEWAY_INFO_TIMEOUT_MS = 5000;
 
-/** Default declared shard capacity when a node does not say otherwise. */
-export const DEFAULT_SHARD_CAPACITY = 4;
-
 /** Directory under /data/global/ holding the embedded control store. */
 export const FLEET_DIR = 'fleet';

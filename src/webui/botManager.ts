@@ -577,6 +577,18 @@ export class BotManager {
   }
 
   /**
+   * Manually assign a FREE shard to a node (master-only; validated in the bot child).
+   */
+  async assignFleetShard(shardId: number, nodeId: string): Promise<any> {
+    try {
+      return await this.sendIPCMessage('fleet:assign', { shardId, nodeId });
+    } catch (error) {
+      console.error('[BotManager] Error assigning fleet shard:', error);
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  /**
    * Execute a panel
    */
   async executePanel(panelId: string, userId: string, guildId: string | null = null, channelId: string | null = null): Promise<any> {

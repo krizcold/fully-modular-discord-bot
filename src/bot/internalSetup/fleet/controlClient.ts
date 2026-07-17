@@ -41,12 +41,8 @@ export class ControlClient {
   private heartbeatTimer: NodeJS.Timeout | null = null;
   private ttlTimer: NodeJS.Timeout | null = null;
   private readonly pending = new Map<string, { resolve: (data: any) => void; reject: (error: Error) => void; timer: NodeJS.Timeout }>();
-  private firstLeaseResolve: (() => void) | null = null;
-  private readonly firstLease: Promise<void>;
 
-  constructor(private readonly opts: ControlClientOptions) {
-    this.firstLease = new Promise<void>(resolve => { this.firstLeaseResolve = resolve; });
-  }
+  constructor(private readonly opts: ControlClientOptions) {}
 
   start(): void {
     this.connect();
@@ -70,11 +66,6 @@ export class ControlClient {
 
   getTerm(): number {
     return this.term;
-  }
-
-  /** Resolves when the first lease grant has been accepted; never rejects (idle-until-master). */
-  waitForFirstLease(): Promise<void> {
-    return this.firstLease;
   }
 
   sendGuildNotice(notice: GuildNoticePayload): void {
@@ -167,10 +158,6 @@ export class ControlClient {
         const ack = await this.opts.runtime.applyGrant(grant);
         if (ack.ok) {
           this.term = Math.max(this.term, grant.term);
-          if (this.firstLeaseResolve) {
-            this.firstLeaseResolve();
-            this.firstLeaseResolve = null;
-          }
           console.log(`[Fleet] Lease granted: shards [${grant.leases.map(l => l.shardId).join(', ')}] of ${grant.shardCount} (term ${grant.term}, epoch ${grant.epoch})`);
         }
         this.replyAck(requestId, ack);

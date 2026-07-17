@@ -1,20 +1,21 @@
-// Fleet boot orchestration: role resolution, control-plane wiring, lease
-// acquisition. Standalone IS the master path with self-granted leases over
-// the whole shard set; with zero fleet env this adds exactly one role log
-// line to today's boot.
+// Fleet boot orchestration: role resolution, control-plane wiring, shard
+// placement. The master claims up to ITS capacity and grants workers only
+// FREE shards; owned shards move exclusively through the (future) migration
+// system, never automatically. Standalone IS the master path claiming every
+// shard, byte-identical to today's single-box boot.
 
+import { performance } from 'perf_hooks';
 import type { Client } from 'discord.js';
 import { getIngestService } from '../ingest/ingestService';
 import {
   CONTROL_PORT_DEFAULT,
-  DEFAULT_SHARD_CAPACITY,
   HEARTBEAT_MS,
   PROTOCOL_VERSION,
 } from './constants';
 import { LeaseGrantPayload, MSG, NodeCapabilities, NodeRole, RegisterPayload, RegisterResult } from './protocol';
 import { getAppVersion, getNodeId, getNodeName, isStandalone, resolveNodeRole } from './nodeIdentity';
 import { FileControlStore } from './fileControlStore';
-import { Registry } from './registry';
+import { Registry, RegistryNode } from './registry';
 import { ControlServer } from './controlServer';
 import { ControlClient } from './controlClient';
 import { LeaseRuntime } from './leaseRuntime';
@@ -22,13 +23,13 @@ import {
   assignIdentifyDelays,
   fetchGatewayInfo,
   guildIdToShardId,
-  planAssignments,
   resolvePinnedShardId,
+  resolveShardCapacity,
   resolveShardCount,
 } from './placement';
 import { _setFleetStateSources } from './state';
 
-/** Fleet-mode masters wait this long at boot for surviving workers to redial before the first plan (Part 5 flow 1). */
+/** Fleet-mode masters wait this long at boot for surviving workers to redial before the first placement (Part 5 flow 1). */
 const REGISTER_GRACE_MS = 10000;
 
 export interface FleetContext {
@@ -46,6 +47,18 @@ export function getFleetContext(): FleetContext | null {
   return context;
 }
 
+export type AssignResult = { success: boolean; error?: string };
+
+// Master-only manual FREE-shard assignment, wired by initMaster. Co-workers
+// leave it null so the IPC handler reports a clear not-master error.
+let masterAssign: ((shardId: number, nodeId: string) => Promise<AssignResult>) | null = null;
+
+/** Manual assign of a FREE shard to a node (Usage-tab action). Master-only. */
+export async function fleetAssignShard(shardId: number, nodeId: string): Promise<AssignResult> {
+  if (!masterAssign) return { success: false, error: 'This node is not the fleet master' };
+  return masterAssign(shardId, nodeId);
+}
+
 export async function initFleet(): Promise<FleetContext> {
   if (context) return context;
   const role = resolveNodeRole();
@@ -55,7 +68,7 @@ export async function initFleet(): Promise<FleetContext> {
   const appVersion = getAppVersion();
   const ingest = getIngestService();
   const runtime = new LeaseRuntime(ingest);
-  const capabilities: NodeCapabilities = { shardCapacity: DEFAULT_SHARD_CAPACITY, dataBackend: 'file' };
+  const capabilities: NodeCapabilities = { shardCapacity: resolveShardCapacity(), dataBackend: 'file' };
 
   context = role === 'master'
     ? await initMaster({ standalone, nodeId, nodeName, appVersion, capabilities, runtime })
@@ -82,11 +95,8 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     console.warn('[Fleet] /gateway/bot unreachable; assuming 1 recommended shard');
   }
   const maxConcurrency = gateway?.maxConcurrency ?? 1;
-  const shardCount = resolveShardCount({
-    standalone,
-    recommended: gateway?.recommendedShards ?? 1,
-    selfCapacity: capabilities.shardCapacity,
-  });
+  const recommendedShards = gateway?.recommendedShards ?? null;
+  const shardCount = resolveShardCount(gateway?.recommendedShards ?? 1);
   const pinnedShardId = resolvePinnedShardId(shardCount);
 
   const registry = new Registry();
@@ -97,117 +107,126 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   let server: ControlServer | null = null;
   let graceOver = standalone;
 
-  let replanRunning = false;
-  let replanQueued = false;
+  let distributeRunning = false;
+  let distributeQueued = false;
 
-  async function replanOnce(): Promise<void> {
-    const connected = [...registry.nodes.values()].filter(n => n.connected);
-    // Wait-mode: shards leased to disconnected nodes are never redistributed
-    // here (auto-reassignment is Phase 2); they may still be served under a
-    // live lease and re-granting them would risk a dual identify.
-    const frozenShards = new Set<number>();
-    for (const lease of registry.shardTable.values()) {
-      const holder = registry.nodes.get(lease.nodeId);
-      if (!holder || !holder.connected) frozenShards.add(lease.shardId);
-    }
-    const shardPool: number[] = [];
-    for (let shardId = 0; shardId < registry.shardCount; shardId++) {
-      if (!frozenShards.has(shardId)) shardPool.push(shardId);
-    }
+  // STANDALONE master claims EVERY shard regardless of FLEET_SHARD_CAPACITY
+  // (today's single-box behavior, byte-identical boot); the capacity cap
+  // applies only in FLEET mode.
+  const targetFor = (node: RegistryNode): number => {
+    if (node.isSelf && standalone) return registry.shardCount;
+    return Math.max(1, node.capabilities?.shardCapacity ?? 1);
+  };
 
-    const assignments = planAssignments({
-      shardCount: registry.shardCount,
-      shardPool,
-      nodes: connected.map(n => ({
-        nodeId: n.nodeId,
-        capacity: Math.max(1, n.capabilities?.shardCapacity || DEFAULT_SHARD_CAPACITY),
-        isMaster: n.isSelf,
-      })),
-      pinnedShardId,
-    });
-
-    const changed = new Set<string>();
-    const grantTargets: string[] = [];
-    for (const node of connected) {
-      const target = assignments.get(node.nodeId) ?? [];
-      const current = registry.shardIdsOf(node.nodeId);
-      const setChanged = target.length !== current.length || target.some((v, i) => v !== current[i]);
-      if (setChanged) changed.add(node.nodeId);
-      if (setChanged || node.needsGrant) grantTargets.push(node.nodeId);
-    }
-    if (grantTargets.length === 0) return;
-    if (changed.size > 0) registry.epoch += 1;
-    const epoch = registry.epoch;
-
-    // Revoke-before-grant: every node whose set changes releases everything
-    // it holds before any shard is granted elsewhere.
-    for (const revokeNodeId of changed) {
-      const node = registry.nodes.get(revokeNodeId)!;
-      const leaseIds = [...registry.shardTable.values()]
-        .filter(l => l.nodeId === revokeNodeId)
-        .map(l => l.leaseId);
-      if (leaseIds.length === 0) continue;
-      if (node.isSelf) {
-        await runtime.revoke(registry.term, leaseIds, 'replan');
-        registry.clearNodeAssignment(revokeNodeId);
-        continue;
-      }
-      try {
-        const ack = await server!.request(revokeNodeId, MSG.LEASE_REVOKE, { term: registry.term, leaseIds, reason: 'replan' });
-        if (!ack?.ok) throw new Error(ack?.reason ?? 'revoke refused');
-        registry.clearNodeAssignment(revokeNodeId);
-      } catch (error) {
-        // Cannot prove the holder released its sessions: abort instead of
-        // risking a dual identify. The next register/disconnect re-plans.
-        console.error(`[Fleet] Revoke failed for ${revokeNodeId}; aborting replan:`, error instanceof Error ? error.message : error);
-        return;
-      }
-    }
-
-    // Identify slots master-first, but remote grants are DELIVERED and acked
-    // before the master's own: a rejoining worker destroys its stale-term
-    // sessions when it adopts, so the master never identifies into a shard a
-    // worker still holds.
-    const grantAssignments = new Map<string, number[]>();
-    for (const [assignNodeId, shardIds] of assignments) {
-      if (grantTargets.includes(assignNodeId)) grantAssignments.set(assignNodeId, shardIds);
-    }
+  async function grantShardsTo(node: RegistryNode, fullShardIds: number[], epoch: number): Promise<{ ok: boolean; pending: boolean }> {
     const reuseLeaseIds = new Map<number, string>();
     for (const lease of registry.shardTable.values()) reuseLeaseIds.set(lease.shardId, lease.leaseId);
-    const delayed = assignIdentifyDelays(grantAssignments, maxConcurrency, reuseLeaseIds);
+    const leases = assignIdentifyDelays(new Map([[node.nodeId, fullShardIds]]), maxConcurrency, reuseLeaseIds).get(node.nodeId) ?? [];
+    const grant: LeaseGrantPayload = { term: registry.term, epoch, shardCount: registry.shardCount, leases };
 
-    const grantOrder = [...delayed.keys()].sort((a, b) => {
+    if (node.isSelf) {
+      const ack = await runtime.applyGrant(grant);
+      if (ack.ok) {
+        registry.applyAssignment(node.nodeId, leases, registry.term, epoch);
+        node.needsGrant = false;
+      }
+      return { ok: ack.ok, pending: false };
+    }
+
+    try {
+      const ack = await server!.request(node.nodeId, MSG.LEASE_GRANT, grant);
+      if (ack?.ok) {
+        registry.applyAssignment(node.nodeId, leases, registry.term, epoch);
+        registry.clearPendingForNode(node.nodeId);
+        node.needsGrant = false;
+        return { ok: true, pending: false };
+      }
+      // Refused (stale-term etc.): the worker did NOT adopt, so the shards stay free.
+      console.error(`[Fleet] Grant refused by ${node.nodeName}: ${ack?.reason ?? 'unknown'}`);
+      return { ok: false, pending: false };
+    } catch (error) {
+      // UNACKED grant fence: the worker may have applied it despite the lost
+      // ack. Mark the NEW shards pending-confirmation (NOT free) so they are
+      // never granted elsewhere and dual-identified; heartbeats resolve them.
+      const alreadyHeld = new Set(registry.shardIdsOf(node.nodeId));
+      const pendingIds: number[] = [];
+      for (const lease of leases) {
+        if (alreadyHeld.has(lease.shardId)) continue;
+        registry.pendingConfirmation.set(lease.shardId, {
+          shardId: lease.shardId,
+          nodeId: node.nodeId,
+          leaseId: lease.leaseId,
+          term: registry.term,
+          epoch,
+          grantedAt: performance.now(),
+        });
+        pendingIds.push(lease.shardId);
+      }
+      console.warn(
+        `[Fleet] Grant to ${node.nodeName} unacked; shards [${pendingIds.join(', ')}] pending confirmation:`,
+        error instanceof Error ? error.message : error,
+      );
+      return { ok: false, pending: true };
+    }
+  }
+
+  // Free-shard distribution: every connected node is topped up to its capacity
+  // from the FREE pool, master first (it also keeps the pinned shard). Owned
+  // and frozen shards are never touched here, so a joining worker can only ever
+  // take shards nobody serves.
+  async function distributeOnce(): Promise<void> {
+    const free = registry.freeShards();
+    if (free.length === 0) return;
+
+    const connected = [...registry.nodes.values()].filter(n => n.connected);
+    const pickOrder = [...connected].sort((a, b) =>
+      a.isSelf === b.isSelf ? a.nodeId.localeCompare(b.nodeId) : a.isSelf ? -1 : 1,
+    );
+
+    const pool = [...free];
+    const master = registry.nodes.get(nodeId);
+    const grantsByNode = new Map<string, number[]>();
+    const addGrant = (id: string, shardId: number) => {
+      const arr = grantsByNode.get(id) ?? [];
+      arr.push(shardId);
+      grantsByNode.set(id, arr);
+    };
+
+    // Iron rule: the pinned shard is the master's; never hand it to a worker.
+    if (pinnedShardId !== null && master && master.connected) {
+      const idx = pool.indexOf(pinnedShardId);
+      if (idx !== -1) {
+        pool.splice(idx, 1);
+        addGrant(nodeId, pinnedShardId);
+      }
+    }
+
+    for (const node of pickOrder) {
+      let have = registry.shardIdsOf(node.nodeId).length + (grantsByNode.get(node.nodeId)?.length ?? 0);
+      const target = targetFor(node);
+      while (have < target && pool.length > 0) {
+        addGrant(node.nodeId, pool.shift()!);
+        have++;
+      }
+    }
+
+    if (grantsByNode.size === 0) return;
+    registry.epoch += 1;
+    const epoch = registry.epoch;
+
+    // Deliver remote grants (and collect their acks) BEFORE the master's own
+    // identify: a rejoining worker destroys stale sessions on adopt, so the
+    // master never identifies into a shard a worker still holds.
+    const execOrder = [...grantsByNode.keys()].sort((a, b) => {
       const aSelf = registry.nodes.get(a)?.isSelf ? 1 : 0;
       const bSelf = registry.nodes.get(b)?.isSelf ? 1 : 0;
       return aSelf - bSelf;
     });
-    for (const grantNodeId of grantOrder) {
+    for (const grantNodeId of execOrder) {
       const node = registry.nodes.get(grantNodeId);
-      const leases = delayed.get(grantNodeId)!;
       if (!node) continue;
-      const grant: LeaseGrantPayload = { term: registry.term, epoch, shardCount: registry.shardCount, leases };
-      if (node.isSelf) {
-        const ack = await runtime.applyGrant(grant);
-        if (ack.ok) {
-          registry.applyAssignment(grantNodeId, leases, registry.term, epoch);
-          node.needsGrant = false;
-        }
-        continue;
-      }
-      try {
-        const ack = await server!.request(grantNodeId, MSG.LEASE_GRANT, grant);
-        if (ack?.ok) {
-          registry.applyAssignment(grantNodeId, leases, registry.term, epoch);
-          node.needsGrant = false;
-        } else {
-          console.error(`[Fleet] Grant refused by ${grantNodeId}: ${ack?.reason ?? 'unknown'}`);
-        }
-      } catch (error) {
-        console.error(
-          `[Fleet] Grant to ${grantNodeId} failed; shards [${leases.map(l => l.shardId).join(', ')}] left unassigned:`,
-          error instanceof Error ? error.message : error,
-        );
-      }
+      const fullSet = [...registry.shardIdsOf(grantNodeId), ...(grantsByNode.get(grantNodeId) ?? [])].sort((a, b) => a - b);
+      await grantShardsTo(node, fullSet, epoch);
     }
 
     await persist();
@@ -215,28 +234,56 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       const summary = [...registry.nodes.values()]
         .map(n => `${n.nodeName}${n.isSelf ? ' (self)' : ''}=[${registry.shardIdsOf(n.nodeId).join(', ')}]`)
         .join(' ');
-      console.log(`[Fleet] Plan (term ${registry.term}, epoch ${epoch}, ${registry.shardCount} shards): ${summary}`);
+      console.log(`[Fleet] Placement (term ${registry.term}, epoch ${epoch}, ${registry.shardCount} shards): ${summary}`);
     }
   }
 
-  async function replan(): Promise<void> {
+  async function distribute(): Promise<void> {
     if (!graceOver) return;
-    if (replanRunning) {
-      replanQueued = true;
+    if (distributeRunning) {
+      distributeQueued = true;
       return;
     }
-    replanRunning = true;
+    distributeRunning = true;
     try {
       do {
-        replanQueued = false;
-        await replanOnce();
-      } while (replanQueued);
+        distributeQueued = false;
+        await distributeOnce();
+      } while (distributeQueued);
     } catch (error) {
-      console.error('[Fleet] Replan failed:', error);
+      console.error('[Fleet] Distribute failed:', error);
     } finally {
-      replanRunning = false;
+      distributeRunning = false;
     }
   }
+
+  masterAssign = async (shardId: number, targetNodeId: string): Promise<AssignResult> => {
+    if (!Number.isInteger(shardId) || shardId < 0 || shardId >= registry.shardCount) {
+      return { success: false, error: `shard ${shardId} does not exist (valid 0..${registry.shardCount - 1})` };
+    }
+    const target = registry.nodes.get(targetNodeId);
+    if (!target || !target.connected) {
+      return { success: false, error: `node ${targetNodeId || '(none)'} is not connected` };
+    }
+    const held = registry.shardTable.get(shardId);
+    if (held) {
+      const holder = registry.nodes.get(held.nodeId);
+      const holderName = holder?.nodeName ?? held.nodeId;
+      if (holder && holder.connected) {
+        return { success: false, error: `shard ${shardId} is held by ${holderName}; moving a served shard requires migration` };
+      }
+      return { success: false, error: `shard ${shardId} is frozen (held by disconnected ${holderName}); requires Declare Lost` };
+    }
+    if (registry.pendingConfirmation.has(shardId)) {
+      return { success: false, error: `shard ${shardId} is pending confirmation; try again shortly` };
+    }
+    registry.epoch += 1;
+    const fullSet = [...registry.shardIdsOf(targetNodeId), shardId].sort((a, b) => a - b);
+    const result = await grantShardsTo(target, fullSet, registry.epoch);
+    await persist();
+    if (result.ok || result.pending) return { success: true };
+    return { success: false, error: `grant to ${target.nodeName} was refused` };
+  };
 
   async function persist(): Promise<void> {
     const byNode = new Map<string, { leaseId: string; shardId: number; identifyDelayMs: number }[]>();
@@ -286,35 +333,44 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
           nodeId: payload.nodeId,
           nodeName: payload.nodeName || payload.nodeId,
           appVersion: payload.appVersion,
-          capabilities: payload.capabilities ?? { shardCapacity: DEFAULT_SHARD_CAPACITY, dataBackend: 'file' },
+          capabilities: payload.capabilities ?? { shardCapacity: 1, dataBackend: 'file' },
           isSelf: false,
           send,
         });
         console.log(`[Fleet] Node registered: ${payload.nodeName} (${payload.nodeId})`);
         return { accepted: true, term: registry.term };
       },
-      afterRegister: () => void replan(),
+      afterRegister: () => void distribute(),
       onHeartbeat: (heartbeatNodeId, hb) => registry.recordHeartbeat(heartbeatNodeId, hb),
       onGuildNotice: (_noticeNodeId, notice) => registry.applyGuildNotice(notice),
       onDisconnect: disconnectedNodeId => {
         registry.markDisconnected(disconnectedNodeId);
         const name = registry.nodes.get(disconnectedNodeId)?.nodeName ?? disconnectedNodeId;
-        console.warn(`[Fleet] Node disconnected: ${name} (leases held in Wait mode)`);
+        console.warn(`[Fleet] Node disconnected: ${name} (owned shards frozen in Wait mode)`);
+        // Free-shard distribution only; the disconnected node's shards stay frozen.
+        void distribute();
       },
     });
     await server.start(port, secret);
-    console.log(`[Fleet] Role: master node=${nodeName} (${nodeId.slice(0, 8)}) term=${term} shardCount=${shardCount} controlPort=${port}${pinnedShardId !== null ? ` pinnedShard=${pinnedShardId}` : ''}`);
+    console.log(`[Fleet] Role: master node=${nodeName} (${nodeId.slice(0, 8)}) term=${term} shardCount=${shardCount} capacity=${capabilities.shardCapacity} controlPort=${port}${pinnedShardId !== null ? ` pinnedShard=${pinnedShardId}` : ''}`);
     setTimeout(() => {
       graceOver = true;
-      void replan();
+      void distribute();
     }, REGISTER_GRACE_MS).unref();
   } else {
     console.log(`[Fleet] Role: master (standalone) node=${nodeName} (${nodeId.slice(0, 8)}) term=${term} shards=${shardCount} self-granted`);
-    await replan();
+    await distribute();
   }
 
   const selfHeartbeat = setInterval(() => {
     registry.recordHeartbeat(nodeId, runtime.buildHeartbeat(registry.term));
+    // Periodic reconcile tick: adopt heartbeat truth for pending leases, then
+    // re-run free-shard distribution so on-hold workers claim newly-free
+    // shards and drift cannot persist.
+    if (!standalone && graceOver) {
+      registry.reconcilePending();
+      void distribute();
+    }
   }, HEARTBEAT_MS);
   selfHeartbeat.unref();
 
@@ -325,6 +381,8 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     nodeName,
     appVersion,
     pinnedShardId,
+    capacity: capabilities.shardCapacity,
+    recommendedShards,
     runtime,
     ingest,
     registry,
@@ -357,7 +415,7 @@ async function initCoWorker(init: CommonInit): Promise<FleetContext> {
   const masterUrl = (process.env.MASTER_URL || '').trim();
   const secret = (process.env.CONTROL_SECRET || '').trim();
 
-  console.log(`[Fleet] Role: co-worker node=${nodeName} (${nodeId.slice(0, 8)}) master=${masterUrl || 'none'}`);
+  console.log(`[Fleet] Role: co-worker node=${nodeName} (${nodeId.slice(0, 8)}) master=${masterUrl || 'none'} capacity=${capabilities.shardCapacity}`);
 
   let controlClient: ControlClient | null = null;
   if (masterUrl && secret) {
@@ -384,6 +442,8 @@ async function initCoWorker(init: CommonInit): Promise<FleetContext> {
     nodeName,
     appVersion,
     pinnedShardId: null,
+    capacity: capabilities.shardCapacity,
+    recommendedShards: null,
     runtime,
     ingest,
     registry: null,
@@ -416,18 +476,18 @@ async function initCoWorker(init: CommonInit): Promise<FleetContext> {
   };
 
   if (!controlClient) {
-    // Idle forever: no master means no lease and no identify, but the
-    // process stays alive so an operator can fix the env and restart.
+    // No master configured: keep the process informative and alive, but do NOT
+    // block boot - the web UI, IPC and fleet state must still come up.
     setInterval(() => {
       console.warn('[Fleet] Co-worker idle: MASTER_URL/CONTROL_SECRET not configured');
     }, 3600000);
-    await new Promise<void>(() => { /* never resolves by design */ });
     return ctx;
   }
 
+  // Boot must NOT block on the first lease: the co-worker starts dialing and
+  // returns immediately. It stays on-hold (registered, no lease, no identify)
+  // until the master grants a shard, at which point applyGrant -> maybeStart
+  // begins ingest. The no-lease login gate keeps Discord untouched meanwhile.
   controlClient.start();
-  // Boot holds here until the master grants a lease; an unreachable master
-  // means the co-worker idles and keeps redialing with backoff.
-  await controlClient.waitForFirstLease();
   return ctx;
 }

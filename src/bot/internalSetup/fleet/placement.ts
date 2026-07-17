@@ -1,6 +1,7 @@
-// PlacementEngine v1: decides the shard count and which node holds which
-// shard lease. Standalone is the same code path with a single node that
-// receives every lease.
+// Placement helpers: shard-count resolution, this-node capacity, the guild ->
+// shard formula and identify pacing. The master claims up to ITS capacity and
+// only ever grants FREE shards to workers; owned shards move exclusively via
+// migration (bootstrap owns the distribution loop).
 
 import * as https from 'https';
 import { randomUUID } from 'crypto';
@@ -50,12 +51,29 @@ export function guildIdToShardId(guildId: string, shardCount: number): number {
   }
 }
 
-export function resolveShardCount(opts: { standalone: boolean; recommended: number; selfCapacity: number }): number {
+/** FLEET_SHARD_COUNT override when it is a valid positive integer; null otherwise. */
+export function getShardCountOverride(): number | null {
   const override = Number(process.env.FLEET_SHARD_COUNT);
-  if (Number.isInteger(override) && override > 0) return override;
-  if (opts.standalone) return Math.max(1, opts.recommended);
-  // Over-shard early: more, smaller bundles keep later rebalancing fine-grained.
-  return Math.max(1, opts.recommended, opts.selfCapacity * 2);
+  return Number.isInteger(override) && override > 0 ? override : null;
+}
+
+/** Total shards: FLEET_SHARD_COUNT override, else Discord's /gateway/bot recommendation. */
+export function resolveShardCount(recommended: number): number {
+  return getShardCountOverride() ?? Math.max(1, recommended);
+}
+
+/** Where shardCount came from, for display. */
+export function getShardSource(): 'discord' | 'override' {
+  return getShardCountOverride() !== null ? 'override' : 'discord';
+}
+
+/**
+ * Max shards THIS instance holds (FLEET_SHARD_CAPACITY, default 1). Applies in
+ * FLEET mode; a STANDALONE master claims every shard regardless (bootstrap).
+ */
+export function resolveShardCapacity(): number {
+  const raw = Number(process.env.FLEET_SHARD_CAPACITY);
+  return Number.isInteger(raw) && raw > 0 ? raw : 1;
 }
 
 /** True when PIN_TEST_GUILD_SHARD=true; env missing = false. */
@@ -69,67 +87,6 @@ export function resolvePinnedShardId(shardCount: number): number | null {
   const guildId = (process.env.GUILD_ID || '').trim();
   if (!/^\d+$/.test(guildId)) return null;
   return guildIdToShardId(guildId, shardCount);
-}
-
-export interface PlacementNode {
-  nodeId: string;
-  capacity: number;
-  isMaster: boolean;
-}
-
-/**
- * Spread shards across nodes proportional to declared capacity, master first,
- * contiguous-ish ranges, deterministic for a given node set. The pinned shard
- * always lands on the master. shardPool restricts which shards are plannable
- * (shards leased to disconnected nodes stay frozen in Wait mode).
- */
-export function planAssignments(opts: {
-  shardCount: number;
-  shardPool?: number[];
-  nodes: PlacementNode[];
-  pinnedShardId: number | null;
-}): Map<string, number[]> {
-  const { shardCount, pinnedShardId } = opts;
-  const pool = (opts.shardPool ?? Array.from({ length: shardCount }, (_, i) => i))
-    .filter(id => id >= 0 && id < shardCount)
-    .sort((a, b) => a - b);
-  const ordered = [...opts.nodes].sort((a, b) =>
-    a.isMaster === b.isMaster ? a.nodeId.localeCompare(b.nodeId) : a.isMaster ? -1 : 1,
-  );
-  const result = new Map<string, number[]>(ordered.map(n => [n.nodeId, []]));
-  if (ordered.length === 0 || pool.length === 0) return result;
-
-  const totalCapacity = ordered.reduce((sum, n) => sum + Math.max(1, n.capacity), 0);
-  const targets = new Map<string, number>();
-  let assigned = 0;
-  for (const node of ordered) {
-    const share = Math.floor((pool.length * Math.max(1, node.capacity)) / totalCapacity);
-    targets.set(node.nodeId, share);
-    assigned += share;
-  }
-  for (let i = 0; assigned < pool.length; i = (i + 1) % ordered.length) {
-    targets.set(ordered[i].nodeId, (targets.get(ordered[i].nodeId) ?? 0) + 1);
-    assigned++;
-  }
-
-  const master = ordered.find(n => n.isMaster) ?? ordered[0];
-  const pinned = pinnedShardId !== null && pool.includes(pinnedShardId) ? pinnedShardId : null;
-  if (pinned !== null) {
-    result.get(master.nodeId)!.push(pinned);
-    if ((targets.get(master.nodeId) ?? 0) < 1) targets.set(master.nodeId, 1);
-  }
-
-  const remaining: number[] = pool.filter(shardId => shardId !== pinned);
-  for (const node of ordered) {
-    const bucket = result.get(node.nodeId)!;
-    while (bucket.length < (targets.get(node.nodeId) ?? 0) && remaining.length > 0) {
-      bucket.push(remaining.shift()!);
-    }
-  }
-  // Rounding leftovers (pin can consume a slot): master absorbs them.
-  while (remaining.length > 0) result.get(master.nodeId)!.push(remaining.shift()!);
-  for (const bucket of result.values()) bucket.sort((a, b) => a - b);
-  return result;
 }
 
 /**

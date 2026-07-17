@@ -31,5 +31,27 @@ export function createFleetRoutes(botManager: BotManager): Router {
     }
   });
 
+  /**
+   * POST /api/fleet/assign { shardId, nodeId }
+   * Master-only manual assignment of a FREE shard to a node. Owned shards are
+   * rejected with a migration error; the bot child does the authoritative
+   * validation. Returns { success } or { success:false, error }.
+   */
+  router.post('/assign', async (req: Request, res: Response) => {
+    try {
+      if (!botManager.isRunning()) {
+        res.json({ success: false, error: 'Bot is not running' });
+        return;
+      }
+      const shardId = Number(req.body?.shardId);
+      const nodeId = String(req.body?.nodeId ?? '');
+      const result = await botManager.assignFleetShard(shardId, nodeId);
+      res.json(result?.success ? { success: true } : { success: false, error: result?.error ?? 'assign failed' });
+    } catch (error) {
+      console.error('[Fleet] Failed to assign shard:', error instanceof Error ? error.message : error);
+      res.json({ success: false, error: error instanceof Error ? error.message : 'assign failed' });
+    }
+  });
+
   return router;
 }

@@ -34,6 +34,7 @@ export interface BotCredentials {
   NODE_NAME?: string;
   PIN_TEST_GUILD_SHARD?: string;
   FLEET_SHARD_COUNT?: string;
+  FLEET_SHARD_CAPACITY?: string;
   // OAuth Configuration (Optional - for Guild Web-UI)
   ENABLE_GUILD_WEBUI?: string;
   DISCORD_CLIENT_ID?: string;
@@ -88,6 +89,7 @@ export function loadCredentials(): BotCredentials {
     NODE_NAME: process.env.NODE_NAME,
     PIN_TEST_GUILD_SHARD: process.env.PIN_TEST_GUILD_SHARD,
     FLEET_SHARD_COUNT: process.env.FLEET_SHARD_COUNT,
+    FLEET_SHARD_CAPACITY: process.env.FLEET_SHARD_CAPACITY,
     // OAuth fields
     ENABLE_GUILD_WEBUI: process.env.ENABLE_GUILD_WEBUI,
     DISCORD_CLIENT_ID: process.env.DISCORD_CLIENT_ID,

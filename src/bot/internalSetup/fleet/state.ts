@@ -2,8 +2,8 @@
 // fork IPC (a follow-up ipcFleetHandler answers 'fleet:state' with it).
 
 import { performance } from 'perf_hooks';
-import { CONTROL_PORT_DEFAULT, DEFAULT_SHARD_CAPACITY, PROTOCOL_VERSION } from './constants';
-import { isPinEnabled } from './placement';
+import { CONTROL_PORT_DEFAULT, PROTOCOL_VERSION } from './constants';
+import { getShardSource, isPinEnabled, resolveShardCapacity } from './placement';
 import type { NodeRole } from './protocol';
 import type { Registry } from './registry';
 import type { LeaseRuntime } from './leaseRuntime';
@@ -19,6 +19,8 @@ export interface FleetStateNode {
   health: 'up' | 'late' | 'down';
   appVersion: string;
   capabilities: { shardCapacity: number; dataBackend: string };
+  capacity: number;
+  onHold: boolean;
   shardIds: number[];
   guildCount: number;
   load: { cpuPct: number; rssMb: number; loopLagMs: number } | null;
@@ -36,6 +38,10 @@ export interface FleetState {
   term: number;
   epoch: number;
   shardCount: number;
+  shardSource: 'discord' | 'override';
+  recommendedShards: number | null;
+  capacity: number;
+  onHold: boolean;
   pinTestGuildShard: boolean;
   pinnedShardId: number | null;
   masterKnown: boolean;
@@ -56,7 +62,7 @@ export interface FleetState {
   } | null;
   leases: { leaseId: string; shardId: number; identifyDelayMs: number }[];
   nodes: FleetStateNode[];
-  shardTable: { shardId: number; nodeId: string; leaseId: string; term: number; epoch: number; status: string }[];
+  shardTable: { shardId: number; nodeId: string | null; leaseId: string | null; term: number; epoch: number; status: string }[];
   guildMap: Record<string, number>;
   updatedAt: number;
 }
@@ -68,6 +74,8 @@ export interface FleetStateSources {
   nodeName: string;
   appVersion: string;
   pinnedShardId: number | null;
+  capacity: number;
+  recommendedShards: number | null;
   runtime: LeaseRuntime;
   ingest: IngestService;
   registry: Registry | null;
@@ -114,6 +122,10 @@ export function getFleetState(): FleetState {
       term: 0,
       epoch: 0,
       shardCount: 0,
+      shardSource: getShardSource(),
+      recommendedShards: null,
+      capacity: resolveShardCapacity(),
+      onHold: false,
       pinTestGuildShard: isPinEnabled(),
       pinnedShardId: null,
       masterKnown: false,
@@ -127,7 +139,7 @@ export function getFleetState(): FleetState {
     };
   }
 
-  const { role, standalone, nodeId, nodeName, appVersion, pinnedShardId, runtime, ingest, registry, controlClient } = sources;
+  const { role, standalone, nodeId, nodeName, appVersion, pinnedShardId, capacity, recommendedShards, runtime, ingest, registry, controlClient } = sources;
   const lease = runtime.getCurrent();
   const leases = lease ? lease.leases.map(l => ({ ...l })) : [];
 
@@ -145,11 +157,29 @@ export function getFleetState(): FleetState {
       health: registry.healthOf(node),
       appVersion: node.appVersion,
       capabilities: node.capabilities,
+      capacity: node.capabilities?.shardCapacity ?? 1,
+      onHold: !node.isSelf && node.connected && registry.shardIdsOf(node.nodeId).length === 0,
       shardIds: registry.shardIdsOf(node.nodeId),
       guildCount: node.guildCount,
       load: node.load,
       lastHeartbeatAgoMs: node.lastHeartbeatAt === null ? null : Math.round(performance.now() - node.lastHeartbeatAt),
     }));
+    // Complete shard table: one entry per shardId. Held shards as leased, free
+    // shards as unassigned, unacked grants as pending-confirmation (target node).
+    const shardTable: FleetState['shardTable'] = [];
+    for (let shardId = 0; shardId < registry.shardCount; shardId++) {
+      const held = registry.shardTable.get(shardId);
+      if (held) {
+        shardTable.push({ shardId, nodeId: held.nodeId, leaseId: held.leaseId, term: held.term, epoch: held.epoch, status: statusByShard.get(shardId) ?? 'Unknown' });
+        continue;
+      }
+      const pending = registry.pendingConfirmation.get(shardId);
+      if (pending) {
+        shardTable.push({ shardId, nodeId: pending.nodeId, leaseId: pending.leaseId, term: pending.term, epoch: pending.epoch, status: 'pending' });
+        continue;
+      }
+      shardTable.push({ shardId, nodeId: null, leaseId: null, term: 0, epoch: 0, status: 'unassigned' });
+    }
     return {
       initialized: true,
       role,
@@ -161,6 +191,10 @@ export function getFleetState(): FleetState {
       term: registry.term,
       epoch: registry.epoch,
       shardCount: registry.shardCount,
+      shardSource: getShardSource(),
+      recommendedShards,
+      capacity,
+      onHold: false,
       pinTestGuildShard: isPinEnabled(),
       pinnedShardId,
       masterKnown: true,
@@ -168,9 +202,7 @@ export function getFleetState(): FleetState {
       connect: buildConnect(),
       leases,
       nodes,
-      shardTable: [...registry.shardTable.values()]
-        .sort((a, b) => a.shardId - b.shardId)
-        .map(entry => ({ ...entry, status: statusByShard.get(entry.shardId) ?? 'Unknown' })),
+      shardTable,
       guildMap: Object.fromEntries(registry.guildMap),
       updatedAt: Date.now(),
     };
@@ -187,6 +219,21 @@ export function getFleetState(): FleetState {
   }
   const statusByShard = new Map<number, string>((hb?.shards ?? []).map(s => [s.shardId, s.status]));
   const term = controlClient?.getTerm() ?? lease?.term ?? 0;
+  const registered = controlClient?.masterKnown() ?? false;
+  const onHold = registered && leases.length === 0;
+  const shardCount = lease?.shardCount ?? 0;
+  // Complete shard table from this node's own leases; the master owns the
+  // fleet-wide picture, so shards this node does not hold read as unassigned.
+  const leaseByShard = new Map<number, { leaseId: string; shardId: number; identifyDelayMs: number }>(leases.map(l => [l.shardId, l]));
+  const shardTable: FleetState['shardTable'] = [];
+  for (let shardId = 0; shardId < shardCount; shardId++) {
+    const l = leaseByShard.get(shardId);
+    if (l) {
+      shardTable.push({ shardId, nodeId, leaseId: l.leaseId, term: lease?.term ?? term, epoch: lease?.epoch ?? 0, status: statusByShard.get(shardId) ?? 'Unknown' });
+    } else {
+      shardTable.push({ shardId, nodeId: null, leaseId: null, term: 0, epoch: 0, status: 'unassigned' });
+    }
+  }
   return {
     initialized: true,
     role,
@@ -197,10 +244,14 @@ export function getFleetState(): FleetState {
     protocolVersion: PROTOCOL_VERSION,
     term,
     epoch: lease?.epoch ?? 0,
-    shardCount: lease?.shardCount ?? 0,
+    shardCount,
+    shardSource: getShardSource(),
+    recommendedShards,
+    capacity,
+    onHold,
     pinTestGuildShard: isPinEnabled(),
     pinnedShardId: null,
-    masterKnown: controlClient?.masterKnown() ?? false,
+    masterKnown: registered,
     masterUrl: (process.env.MASTER_URL || '').trim() || null,
     connect: null,
     leases,
@@ -213,23 +264,16 @@ export function getFleetState(): FleetState {
         connected: true,
         health: 'up',
         appVersion,
-        capabilities: { shardCapacity: DEFAULT_SHARD_CAPACITY, dataBackend: 'file' },
+        capabilities: { shardCapacity: capacity, dataBackend: 'file' },
+        capacity,
+        onHold,
         shardIds: leases.map(l => l.shardId).sort((a, b) => a - b),
         guildCount: Object.keys(guildMap).length,
         load: hb?.load ?? null,
         lastHeartbeatAgoMs: null,
       },
     ],
-    shardTable: leases
-      .sort((a, b) => a.shardId - b.shardId)
-      .map(l => ({
-        shardId: l.shardId,
-        nodeId,
-        leaseId: l.leaseId,
-        term: lease?.term ?? term,
-        epoch: lease?.epoch ?? 0,
-        status: statusByShard.get(l.shardId) ?? 'Unknown',
-      })),
+    shardTable,
     guildMap,
     updatedAt: Date.now(),
   };
