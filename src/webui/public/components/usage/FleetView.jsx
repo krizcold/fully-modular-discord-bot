@@ -5,6 +5,12 @@
 
 const FLEET_HEALTH_COLORS = { up: '#57f287', late: '#fee75c', down: '#ed4245' };
 
+// Guilds-per-shard scale limits (FinalArchitecture Part 1/8). Recommended
+// max is the reshard trigger; hard max is Discord's absolute ceiling.
+const FLEET_RECOMMENDED_MAX = 1500;
+const FLEET_HARD_MAX = 2500;
+const FLEET_APPROACHING = FLEET_RECOMMENDED_MAX * 0.9;
+
 function fleetFormatAge(ms) {
   if (ms == null) return '-';
   if (ms < 1500) return 'just now';
@@ -31,6 +37,107 @@ function FleetBadge({ text, background, color }) {
       }}
     >
       {text}
+    </span>
+  );
+}
+
+// Fleet-wide scale signal: total guilds, shard count + source, unassigned
+// shards, and busiest-shard utilization against the guild-per-shard limits.
+function FleetCapacityCard({ cap }) {
+  const barColor = cap.busiest > FLEET_RECOMMENDED_MAX
+    ? '#ed4245'
+    : cap.busiest >= 1000
+      ? '#fee75c'
+      : '#57f287';
+  const barPct = Math.max(0, Math.min(100, (cap.busiest / FLEET_HARD_MAX) * 100));
+
+  let shardsLabel;
+  if (cap.shardSource === 'override') shardsLabel = `${cap.shardCount} (manual override)`;
+  else if (cap.shardSource === 'discord') shardsLabel = `${cap.shardCount} (Discord-recommended)`;
+  else shardsLabel = String(cap.shardCount);
+
+  return (
+    <div className="usage-stat-card" style={{ marginTop: '10px' }}>
+      <div className="usage-stat-title">Fleet capacity</div>
+      <div className="usage-stat-sub" style={{ marginBottom: '10px' }}>
+        {`${cap.totalGuilds} guild${cap.totalGuilds === 1 ? '' : 's'} across the fleet`}
+        {` · Shards: ${shardsLabel}`}
+        {cap.shardSource === 'override' && cap.recommendedShards != null && cap.recommendedShards !== cap.shardCount
+          ? ` (Discord recommends ${cap.recommendedShards})`
+          : ''}
+      </div>
+
+      {cap.unassigned > 0 ? (
+        <div className="usage-notice" style={{ marginBottom: '10px' }}>
+          {`${cap.unassigned} shard${cap.unassigned === 1 ? '' : 's'} unassigned - those guilds are unserved until an instance holds them.`}
+          {cap.onHoldNodes > 0
+            ? ' Assign a free shard to an on-hold instance to bring those guilds online.'
+            : ''}
+        </div>
+      ) : null}
+
+      <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.78rem', color: '#bbb', marginBottom: '4px' }}>
+        <span>
+          {`${cap.approximate ? '~' : ''}${cap.busiest} guilds/shard`}
+          {cap.approximate ? ' (estimate)' : ' (busiest shard)'}
+        </span>
+        <span style={{ color: '#777' }}>{`recommended max ${FLEET_RECOMMENDED_MAX} · hard max ${FLEET_HARD_MAX}`}</span>
+      </div>
+      <div style={{ height: '8px', background: '#1e1e1e', borderRadius: '4px', overflow: 'hidden' }}>
+        <div style={{ width: `${barPct}%`, height: '100%', background: barColor, transition: 'width 0.3s ease' }} />
+      </div>
+      {cap.busiest > FLEET_APPROACHING ? (
+        <div className="usage-stat-sub" style={{ marginTop: '8px', color: '#fee75c' }}>
+          Approaching per-shard capacity - plan to add shards/instances.
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+// Master-only picker + Assign button for an UNASSIGNED (free, no-data) shard.
+// Moving a held shard is a migration (Phase 4) and is not offered here.
+function FleetAssignControl({ shardId, nodes, defaultNodeId, onAssigned }) {
+  const [nodeId, setNodeId] = React.useState(defaultNodeId || (nodes[0] && nodes[0].nodeId) || '');
+  const [busy, setBusy] = React.useState(false);
+
+  if (nodes.length === 0) {
+    return <span style={{ color: '#777', fontSize: '0.78rem' }}>no connected instance</span>;
+  }
+
+  const assign = () => {
+    if (!nodeId || busy) return;
+    setBusy(true);
+    api.post('/fleet/assign', { shardId, nodeId })
+      .then((res) => {
+        if (res && res.success === false) {
+          showToast(res.error || res.message || 'Assign failed', 'error');
+          return;
+        }
+        showToast(`Assigned shard ${shardId}`, 'success');
+        if (onAssigned) onAssigned();
+      })
+      .catch((err) => showToast(err.message || 'Assign failed', 'error'))
+      .finally(() => setBusy(false));
+  };
+
+  return (
+    <span style={{ display: 'inline-flex', alignItems: 'center', gap: '6px' }}>
+      <select
+        value={nodeId}
+        onChange={(e) => setNodeId(e.target.value)}
+        disabled={busy}
+        style={{ fontSize: '0.75rem', padding: '1px 4px' }}
+      >
+        {nodes.map((n) => (
+          <option key={n.nodeId} value={n.nodeId}>
+            {n.nodeName}{n.onHold ? ' (on hold)' : ''}
+          </option>
+        ))}
+      </select>
+      <button onClick={assign} disabled={busy} style={{ fontSize: '0.72rem', padding: '2px 8px' }}>
+        {busy ? 'Assigning...' : 'Assign'}
+      </button>
     </span>
   );
 }
@@ -133,6 +240,8 @@ function FleetConnectCard({ connect }) {
 
 function FleetNodeCard({ node }) {
   const healthColor = FLEET_HEALTH_COLORS[node.health] || '#888';
+  const held = (node.shardIds && node.shardIds.length) || 0;
+  const capacity = node.capacity != null ? node.capacity : null;
   return (
     <div className="usage-stat-card">
       <div className="usage-stat-title">
@@ -144,11 +253,18 @@ function FleetNodeCard({ node }) {
           color={node.isMaster ? '#a0c0f0' : '#bbb'}
         />
         {node.isSelf ? <FleetBadge text="self" background="#2b4a2b" color="#a0e0a0" /> : null}
+        {node.onHold ? <FleetBadge text="ON HOLD" background="#4a3a1a" color="#fee75c" /> : null}
       </div>
       <div className="usage-stat-value">{node.guildCount} guilds</div>
       <div className="usage-stat-sub">
-        {node.shardIds.length > 0 ? `shards [${node.shardIds.join(', ')}]` : 'no shards leased'}
+        {capacity != null ? `holds ${held} / ${capacity} shards` : `holds ${held} shards`}
+        {node.shardIds && node.shardIds.length > 0 ? ` [${node.shardIds.join(', ')}]` : ''}
       </div>
+      {node.onHold ? (
+        <div className="usage-stat-sub" style={{ color: '#fee75c' }}>
+          waiting for a free shard - not serving guilds yet
+        </div>
+      ) : null}
       <div className="usage-stat-sub">
         {node.load
           ? `cpu ${node.load.cpuPct}% · rss ${node.load.rssMb} MB · loop ${node.load.loopLagMs} ms`
@@ -202,25 +318,72 @@ function FleetView({ api, wsClient, guildNames }) {
     );
   }
 
+  const nodes = fleet.nodes || [];
+  const shardTable = fleet.shardTable || [];
+  const guildMap = fleet.guildMap || {};
+
   const nodesById = {};
-  for (const node of fleet.nodes) nodesById[node.nodeId] = node;
+  for (const node of nodes) nodesById[node.nodeId] = node;
   const nodeNameOf = (nodeId) => (nodesById[nodeId] && nodesById[nodeId].nodeName) || nodeId;
   const shardToNode = {};
-  for (const entry of fleet.shardTable) shardToNode[entry.shardId] = entry.nodeId;
+  for (const entry of shardTable) shardToNode[entry.shardId] = entry.nodeId;
 
-  const guildEntries = Object.entries(fleet.guildMap || {}).map(([guildId, shardId]) => ({
+  const guildEntries = Object.entries(guildMap).map(([guildId, shardId]) => ({
     guildId,
     shardId,
     name: (guildNames && guildNames[guildId]) || guildId,
   }));
   guildEntries.sort((a, b) => a.shardId - b.shardId || (a.name > b.name ? 1 : a.name < b.name ? -1 : 0));
 
+  // Shard count with a safe fallback to what the table actually shows.
+  const shardCount = fleet.shardCount != null ? fleet.shardCount : shardTable.length;
+
+  // Total guilds: prefer summed node counts, fall back to the guild map size.
+  let totalGuilds = 0;
+  for (const node of nodes) totalGuilds += node.guildCount || 0;
+  if (totalGuilds === 0) totalGuilds = Object.keys(guildMap).length;
+
+  // Busiest shard: use REAL per-shard counts from guildMap when it has entries;
+  // otherwise estimate an even ceil(totalGuilds / shardCount) spread.
+  let busiest = 0;
+  let approximate = true;
+  const guildMapKeys = Object.keys(guildMap);
+  if (guildMapKeys.length > 0) {
+    const perShard = {};
+    for (const shardId of Object.values(guildMap)) perShard[shardId] = (perShard[shardId] || 0) + 1;
+    for (const count of Object.values(perShard)) if (count > busiest) busiest = count;
+    approximate = false;
+  } else if (shardCount > 0) {
+    busiest = Math.ceil(totalGuilds / shardCount);
+  }
+
+  const unassignedCount = shardTable.filter((s) => s.status === 'unassigned').length;
+  const onHoldNodeCount = nodes.filter((n) => n.onHold).length;
+  const capacitySummary = {
+    totalGuilds,
+    shardCount,
+    shardSource: fleet.shardSource,
+    recommendedShards: fleet.recommendedShards != null ? fleet.recommendedShards : null,
+    unassigned: unassignedCount,
+    onHoldNodes: onHoldNodeCount,
+    busiest,
+    approximate,
+  };
+
+  // Assign picker targets: connected nodes, on-hold ones first (they are idle).
+  const isMaster = fleet.role === 'master';
+  const assignableNodes = nodes
+    .filter((n) => n.connected !== false)
+    .slice()
+    .sort((a, b) => (b.onHold ? 1 : 0) - (a.onHold ? 1 : 0));
+  const defaultAssignNodeId = (assignableNodes.find((n) => n.onHold) || assignableNodes[0] || {}).nodeId;
+
   return (
     <div className="usage-board">
       <h3>Fleet</h3>
       <div className="usage-stat-sub">
         {fleet.standalone ? 'standalone (single node)' : `role ${fleet.role}`}
-        {` · term ${fleet.term} · epoch ${fleet.epoch} · ${fleet.shardCount} shard${fleet.shardCount === 1 ? '' : 's'}`}
+        {` · term ${fleet.term} · epoch ${fleet.epoch} · ${shardCount} shard${shardCount === 1 ? '' : 's'}`}
         {fleet.pinTestGuildShard && fleet.pinnedShardId != null ? ` · shard ${fleet.pinnedShardId} pinned to master` : ''}
       </div>
 
@@ -228,33 +391,65 @@ function FleetView({ api, wsClient, guildNames }) {
         <div className="usage-notice">Master unreachable, retrying...</div>
       )}
 
+      {fleet.role === 'co-worker' && fleet.masterKnown && fleet.onHold && (
+        <div className="usage-notice">
+          On hold: connected to the master, waiting for a shard to be assigned. Not serving any guilds yet.
+        </div>
+      )}
+
+      <FleetCapacityCard cap={capacitySummary} />
+
       {fleet.role === 'master' && fleet.connect ? <FleetConnectCard connect={fleet.connect} /> : null}
 
-      <div className="usage-stat-grid">
-        {fleet.nodes.map((node) => <FleetNodeCard key={node.nodeId} node={node} />)}
+      <div className="usage-stat-grid" style={{ marginTop: '14px' }}>
+        {nodes.map((node) => <FleetNodeCard key={node.nodeId} node={node} />)}
       </div>
 
       <div className="usage-stat-title">Shard table</div>
-      {fleet.shardTable.length === 0 ? (
-        <div className="usage-empty">No shard leases yet</div>
+      {shardTable.length === 0 ? (
+        <div className="usage-empty">No shards yet</div>
       ) : (
         <table className="usage-table usage-table-compact">
           <thead>
-            <tr><th>Shard</th><th>Node</th><th>Status</th><th>Term</th><th>Epoch</th></tr>
+            <tr>
+              <th>Shard</th><th>Node</th><th>Status</th><th>Term</th><th>Epoch</th>
+              {isMaster ? <th>Action</th> : null}
+            </tr>
           </thead>
           <tbody>
-            {fleet.shardTable.map((s) => (
-              <tr key={s.shardId}>
-                <td>
-                  {s.shardId}
-                  {fleet.pinnedShardId === s.shardId ? <FleetBadge text="pinned" background="#4a3a1a" color="#fee75c" /> : null}
-                </td>
-                <td>{nodeNameOf(s.nodeId)}</td>
-                <td>{s.status}</td>
-                <td>{s.term}</td>
-                <td>{s.epoch}</td>
-              </tr>
-            ))}
+            {shardTable.map((s) => {
+              const isFree = s.status === 'unassigned' || s.nodeId == null;
+              const isPending = s.status === 'pending';
+              const statusColor = isFree ? '#777' : isPending ? '#fee75c' : undefined;
+              return (
+                <tr key={s.shardId}>
+                  <td>
+                    {s.shardId}
+                    {fleet.pinnedShardId === s.shardId ? <FleetBadge text="pinned" background="#4a3a1a" color="#fee75c" /> : null}
+                  </td>
+                  <td style={isFree ? { color: '#777' } : undefined}>{s.nodeId != null ? nodeNameOf(s.nodeId) : '-'}</td>
+                  <td style={statusColor ? { color: statusColor } : undefined}>{s.status}</td>
+                  <td>{s.term != null ? s.term : '-'}</td>
+                  <td>{s.epoch != null ? s.epoch : '-'}</td>
+                  {isMaster ? (
+                    <td>
+                      {isFree ? (
+                        <FleetAssignControl
+                          shardId={s.shardId}
+                          nodes={assignableNodes}
+                          defaultNodeId={defaultAssignNodeId}
+                          onAssigned={loadFleet}
+                        />
+                      ) : isPending ? (
+                        <span style={{ color: '#777', fontSize: '0.78rem' }}>assigning...</span>
+                      ) : (
+                        <span style={{ color: '#777', fontSize: '0.78rem' }}>held (migration to move)</span>
+                      )}
+                    </td>
+                  ) : null}
+                </tr>
+              );
+            })}
           </tbody>
         </table>
       )}
