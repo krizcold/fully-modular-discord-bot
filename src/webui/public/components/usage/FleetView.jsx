@@ -38,7 +38,8 @@ function FleetBadge({ text, background, color }) {
 // Master-only worker-onboarding card. Renders a copy-paste env block an
 // operator drops into a new bot instance's Fleet config to add it as a worker.
 function FleetConnectCard({ connect }) {
-  const [copied, setCopied] = React.useState(false);
+  const [copiedKey, setCopiedKey] = React.useState(null);
+  const [secretVisible, setSecretVisible] = React.useState(false);
 
   if (!connect.secretSet) {
     return (
@@ -51,41 +52,75 @@ function FleetConnectCard({ connect }) {
     );
   }
 
-  const secretLine = connect.secret != null
-    ? `CONTROL_SECRET=${connect.secret}`
-    : 'CONTROL_SECRET=<generate one on this master>';
+  const secretValue = connect.secret != null
+    ? connect.secret
+    : '<generate one on this master>';
   const block = [
     'BOT_NODE_ROLE=co-worker',
     `MASTER_URL=${connect.masterUrl}`,
-    secretLine,
+    `CONTROL_SECRET=${secretValue}`,
   ].join('\n');
 
-  const copyBlock = () => {
-    navigator.clipboard.writeText(block);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
+  const copy = (key, value) => {
+    navigator.clipboard.writeText(value);
+    setCopiedKey(key);
+    setTimeout(() => setCopiedKey(null), 2000);
   };
+
+  const buttonStyle = { fontSize: '0.72rem', padding: '2px 8px', flexShrink: 0 };
+  const rowStyle = { display: 'flex', alignItems: 'center', gap: '8px', padding: '3px 0' };
+  const labelStyle = { fontSize: '0.72rem', color: '#999', width: '130px', flexShrink: 0 };
+  const valueStyle = {
+    fontFamily: 'monospace',
+    fontSize: '0.78rem',
+    userSelect: 'text',
+    wordBreak: 'break-all',
+    flex: '1 1 auto',
+    minWidth: 0,
+  };
+
+  const copyButton = (key, value) => (
+    <button onClick={() => copy(key, value)} style={buttonStyle}>
+      {copiedKey === key ? 'Copied' : 'Copy'}
+    </button>
+  );
+
+  const secretMasked = connect.secret != null && !secretVisible;
 
   return (
     <div className="usage-stat-card" style={{ marginTop: '10px' }}>
       <div className="usage-stat-title">
         Connect a worker
-        <button onClick={copyBlock} style={{ marginLeft: '10px', fontSize: '0.72rem', padding: '2px 8px' }}>
-          {copied ? 'Copied' : 'Copy'}
+        <button
+          onClick={() => copy('all', block)}
+          title="Copy all three lines (paste into a .env)"
+          style={{ marginLeft: '10px', fontSize: '0.72rem', padding: '2px 8px' }}
+        >
+          {copiedKey === 'all' ? 'Copied' : 'Copy all'}
         </button>
       </div>
-      <pre
-        style={{
-          margin: '6px 0',
-          padding: '8px 10px',
-          background: '#1e1e1e',
-          borderRadius: '6px',
-          fontSize: '0.78rem',
-          userSelect: 'all',
-          whiteSpace: 'pre-wrap',
-          wordBreak: 'break-all',
-        }}
-      >{block}</pre>
+      <div style={{ margin: '6px 0', padding: '8px 10px', background: '#1e1e1e', borderRadius: '6px' }}>
+        <div style={rowStyle}>
+          <span style={labelStyle}>BOT_NODE_ROLE</span>
+          <span style={valueStyle}>co-worker</span>
+          {copyButton('role', 'co-worker')}
+        </div>
+        <div style={rowStyle}>
+          <span style={labelStyle}>MASTER_URL</span>
+          <span style={valueStyle}>{connect.masterUrl}</span>
+          {copyButton('url', connect.masterUrl)}
+        </div>
+        <div style={rowStyle}>
+          <span style={labelStyle}>CONTROL_SECRET</span>
+          <span style={valueStyle}>{secretMasked ? '••••••••••••' : secretValue}</span>
+          {connect.secret != null ? (
+            <button onClick={() => setSecretVisible(!secretVisible)} style={buttonStyle}>
+              {secretVisible ? 'Hide' : 'Show'}
+            </button>
+          ) : null}
+          {copyButton('secret', secretValue)}
+        </div>
+      </div>
       <div className="usage-stat-sub">
         Paste these into a new bot instance's Fleet config to add it as a worker.
         {connect.urlIsTemplate
