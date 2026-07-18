@@ -25,10 +25,18 @@ export interface CurrentLease {
   receivedAt: number;
 }
 
+// discord.js cannot hot-change a Client's shard set, so a plan change means a
+// destroy + re-login. Coalesce rapid changes (e.g. assigning several free
+// shards one click at a time) into ONE rebuild, and never rebuild in the
+// caller's await path (client.destroy() stalls while a shard is mid-connect,
+// which would time out the assign request and leave the gateway thrashing).
+const GATEWAY_SYNC_DEBOUNCE_MS = 1500;
+
 export class LeaseRuntime {
   private current: CurrentLease | null = null;
   private token: string | undefined;
   private startTimer: NodeJS.Timeout | null = null;
+  private syncTimer: NodeJS.Timeout | null = null;
   private seq = 0;
   private lastHeartbeat: HeartbeatPayload | null = null;
   private histogram: IntervalHistogram | null = null;
@@ -76,13 +84,37 @@ export class LeaseRuntime {
       return { ok: true, term: grant.term };
     }
 
-    // Shard set changed: destroy old sessions BEFORE adopting so a lease move
-    // can never leave two holders identified for the same shard.
-    await this.stopSessions('lease changed');
+    // Shard set changed. Adopt the plan synchronously (fencing stays exact),
+    // but do the physical gateway rebuild off the caller's path so the grant
+    // returns immediately. The added shards are FREE (manual assign and
+    // free-shard distribution never take an owned shard), so there is no
+    // dual-identify window to close synchronously; moving an owned shard is a
+    // migration (Phase 4), not this path.
     this.current = { term: grant.term, epoch: grant.epoch, shardCount: grant.shardCount, leases: grant.leases, receivedAt: Date.now() };
     this.ingest.setShardPlan(shardIds, grant.shardCount);
-    this.maybeStart();
+    if (this.ingest.isStarted()) {
+      // A gateway is already running the old set: coalesce into one rebuild.
+      this.scheduleGatewaySync();
+    } else {
+      // Nothing running yet (first lease / currently down): log in now.
+      this.maybeStart();
+    }
     return { ok: true, term: grant.term };
+  }
+
+  /** Debounced destroy + re-login so rapid plan changes rebuild the gateway once. */
+  private scheduleGatewaySync(): void {
+    if (this.syncTimer) clearTimeout(this.syncTimer);
+    this.syncTimer = setTimeout(() => {
+      this.syncTimer = null;
+      void this.syncGateway();
+    }, GATEWAY_SYNC_DEBOUNCE_MS);
+  }
+
+  private async syncGateway(): Promise<void> {
+    if (!this.current) return;
+    await this.stopSessions('lease changed');
+    this.maybeStart();
   }
 
   /** Sessions are destroyed FIRST: an acked revoke means the token is free to re-grant. */
@@ -170,6 +202,10 @@ export class LeaseRuntime {
     if (this.startTimer) {
       clearTimeout(this.startTimer);
       this.startTimer = null;
+    }
+    if (this.syncTimer) {
+      clearTimeout(this.syncTimer);
+      this.syncTimer = null;
     }
     await this.ingest.stop(reason);
   }
