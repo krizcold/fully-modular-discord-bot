@@ -91,6 +91,11 @@ function FleetCapacityCard({ cap }) {
           Approaching per-shard capacity - plan to add shards/instances.
         </div>
       ) : null}
+      {cap.ownNodeOnly ? (
+        <div className="usage-stat-sub" style={{ marginTop: '8px', color: '#777' }}>
+          Per-shard guild counts on a co-worker cover this node's shards only.
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -343,15 +348,20 @@ function FleetView({ api, wsClient, guildNames }) {
   for (const node of nodes) totalGuilds += node.guildCount || 0;
   if (totalGuilds === 0) totalGuilds = Object.keys(guildMap).length;
 
+  // Real per-shard guild counts from guildMap: the single source of truth for
+  // both the busiest-shard capacity signal and the shard table's Guilds column.
+  // Fleet-wide on a master, own-node-only on a co-worker (guildMap is own-node
+  // there). Keys are shardId (as strings); numeric shardId lookups coerce fine.
+  const perShardCounts = {};
+  for (const shardId of Object.values(guildMap)) perShardCounts[shardId] = (perShardCounts[shardId] || 0) + 1;
+
   // Busiest shard: use REAL per-shard counts from guildMap when it has entries;
   // otherwise estimate an even ceil(totalGuilds / shardCount) spread.
   let busiest = 0;
   let approximate = true;
   const guildMapKeys = Object.keys(guildMap);
   if (guildMapKeys.length > 0) {
-    const perShard = {};
-    for (const shardId of Object.values(guildMap)) perShard[shardId] = (perShard[shardId] || 0) + 1;
-    for (const count of Object.values(perShard)) if (count > busiest) busiest = count;
+    for (const count of Object.values(perShardCounts)) if (count > busiest) busiest = count;
     approximate = false;
   } else if (shardCount > 0) {
     busiest = Math.ceil(totalGuilds / shardCount);
@@ -368,6 +378,9 @@ function FleetView({ api, wsClient, guildNames }) {
     onHoldNodes: onHoldNodeCount,
     busiest,
     approximate,
+    // On a co-worker guildMap is own-node only, so per-shard counts (busiest,
+    // and the shard table column) cover this node's shards, not the whole fleet.
+    ownNodeOnly: fleet.role === 'co-worker',
   };
 
   // Assign picker targets: connected nodes, on-hold ones first (they are idle).
@@ -412,7 +425,11 @@ function FleetView({ api, wsClient, guildNames }) {
         <table className="usage-table usage-table-compact">
           <thead>
             <tr>
-              <th>Shard</th><th>Node</th><th>Status</th><th>Term</th><th>Epoch</th>
+              <th>Shard</th><th>Node</th><th>Status</th>
+              <th title={fleet.role === 'co-worker'
+                ? "Guilds on this shard (co-worker: this node's shards only)"
+                : 'Guilds on this shard, from the fleet guild map'}>Guilds</th>
+              <th>Term</th><th>Epoch</th>
               {isMaster ? <th>Action</th> : null}
             </tr>
           </thead>
@@ -429,6 +446,7 @@ function FleetView({ api, wsClient, guildNames }) {
                   </td>
                   <td style={isFree ? { color: '#777' } : undefined}>{s.nodeId != null ? nodeNameOf(s.nodeId) : '-'}</td>
                   <td style={statusColor ? { color: statusColor } : undefined}>{s.status}</td>
+                  <td style={isFree ? { color: '#777' } : undefined}>{perShardCounts[s.shardId] || 0}</td>
                   <td>{s.term != null ? s.term : '-'}</td>
                   <td>{s.epoch != null ? s.epoch : '-'}</td>
                   {isMaster ? (
