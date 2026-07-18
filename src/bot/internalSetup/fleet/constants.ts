@@ -5,6 +5,9 @@ export const PROTOCOL_VERSION = 1;
 /** Heartbeat cadence (worker -> master, and the master's self-sample into its own registry). */
 export const HEARTBEAT_MS = 5000;
 
+/** How often the master refreshes the full guild list via REST (per-shard totals, including unassigned shards). */
+export const GUILD_TOTALS_REFRESH_MS = 120000;
+
 /** Master -> worker keepalive ping cadence; any inbound master frame renews the worker's lease clock. */
 export const LEASE_RENEW_MS = 15000;
 

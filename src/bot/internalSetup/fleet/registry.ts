@@ -63,6 +63,9 @@ export class Registry {
   readonly shardTable = new Map<number, ShardLease>();
   readonly pendingConfirmation = new Map<number, PendingLease>();
   readonly guildMap = new Map<string, number>();
+  // Fleet-wide guild count per shard from the master's REST guild list, so
+  // unassigned shards (no gateway session) still report their real guild count.
+  readonly shardGuildTotals = new Map<number, number>();
 
   upsertNode(input: {
     nodeId: string;
@@ -117,6 +120,15 @@ export class Registry {
       this.guildMap.delete(notice.guildId);
     } else {
       this.guildMap.set(notice.guildId, guildIdToShardId(notice.guildId, this.shardCount));
+    }
+  }
+
+  /** Recompute per-shard guild totals from the master's full REST guild list. */
+  setAllGuilds(guildIds: string[]): void {
+    this.shardGuildTotals.clear();
+    for (const id of guildIds) {
+      const shardId = guildIdToShardId(id, this.shardCount);
+      this.shardGuildTotals.set(shardId, (this.shardGuildTotals.get(shardId) ?? 0) + 1);
     }
   }
 

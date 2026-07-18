@@ -9,6 +9,7 @@ import type { Client } from 'discord.js';
 import { getIngestService } from '../ingest/ingestService';
 import {
   CONTROL_PORT_DEFAULT,
+  GUILD_TOTALS_REFRESH_MS,
   HEARTBEAT_MS,
   PROTOCOL_VERSION,
 } from './constants';
@@ -21,6 +22,7 @@ import { ControlClient } from './controlClient';
 import { LeaseRuntime } from './leaseRuntime';
 import {
   assignIdentifyDelays,
+  fetchAllGuildIds,
   fetchGatewayInfo,
   guildIdToShardId,
   resolvePinnedShardId,
@@ -373,6 +375,16 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     }
   }, HEARTBEAT_MS);
   selfHeartbeat.unref();
+
+  // Full guild list via REST (not shard-bound) so per-shard counts cover shards
+  // no instance is connected to. Slow refresh; failures keep the last counts.
+  const refreshGuildTotals = async (): Promise<void> => {
+    const ids = await fetchAllGuildIds(process.env.DISCORD_TOKEN);
+    if (ids) registry.setAllGuilds(ids);
+  };
+  void refreshGuildTotals();
+  const guildTotalsTimer = setInterval(() => void refreshGuildTotals(), GUILD_TOTALS_REFRESH_MS);
+  guildTotalsTimer.unref();
 
   _setFleetStateSources({
     role: 'master',

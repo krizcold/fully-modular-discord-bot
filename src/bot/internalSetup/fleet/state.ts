@@ -62,7 +62,7 @@ export interface FleetState {
   } | null;
   leases: { leaseId: string; shardId: number; identifyDelayMs: number }[];
   nodes: FleetStateNode[];
-  shardTable: { shardId: number; nodeId: string | null; leaseId: string | null; term: number; epoch: number; status: string }[];
+  shardTable: { shardId: number; nodeId: string | null; leaseId: string | null; term: number; epoch: number; status: string; guildCount: number }[];
   guildMap: Record<string, number>;
   updatedAt: number;
 }
@@ -164,21 +164,29 @@ export function getFleetState(): FleetState {
       load: node.load,
       lastHeartbeatAgoMs: node.lastHeartbeatAt === null ? null : Math.round(performance.now() - node.lastHeartbeatAt),
     }));
+    // Per-shard guild counts: prefer the REST-derived totals (cover unassigned
+    // shards), fall back to the connection-derived guildMap before the first
+    // REST fetch lands.
+    const gmCounts = new Map<number, number>();
+    for (const s of registry.guildMap.values()) gmCounts.set(s, (gmCounts.get(s) ?? 0) + 1);
+    const guildsOnShard = (shardId: number): number =>
+      registry.shardGuildTotals.get(shardId) ?? gmCounts.get(shardId) ?? 0;
     // Complete shard table: one entry per shardId. Held shards as leased, free
     // shards as unassigned, unacked grants as pending-confirmation (target node).
     const shardTable: FleetState['shardTable'] = [];
     for (let shardId = 0; shardId < registry.shardCount; shardId++) {
+      const guildCount = guildsOnShard(shardId);
       const held = registry.shardTable.get(shardId);
       if (held) {
-        shardTable.push({ shardId, nodeId: held.nodeId, leaseId: held.leaseId, term: held.term, epoch: held.epoch, status: statusByShard.get(shardId) ?? 'Unknown' });
+        shardTable.push({ shardId, nodeId: held.nodeId, leaseId: held.leaseId, term: held.term, epoch: held.epoch, status: statusByShard.get(shardId) ?? 'Unknown', guildCount });
         continue;
       }
       const pending = registry.pendingConfirmation.get(shardId);
       if (pending) {
-        shardTable.push({ shardId, nodeId: pending.nodeId, leaseId: pending.leaseId, term: pending.term, epoch: pending.epoch, status: 'pending' });
+        shardTable.push({ shardId, nodeId: pending.nodeId, leaseId: pending.leaseId, term: pending.term, epoch: pending.epoch, status: 'pending', guildCount });
         continue;
       }
-      shardTable.push({ shardId, nodeId: null, leaseId: null, term: 0, epoch: 0, status: 'unassigned' });
+      shardTable.push({ shardId, nodeId: null, leaseId: null, term: 0, epoch: 0, status: 'unassigned', guildCount });
     }
     return {
       initialized: true,
@@ -225,13 +233,18 @@ export function getFleetState(): FleetState {
   // Complete shard table from this node's own leases; the master owns the
   // fleet-wide picture, so shards this node does not hold read as unassigned.
   const leaseByShard = new Map<number, { leaseId: string; shardId: number; identifyDelayMs: number }>(leases.map(l => [l.shardId, l]));
+  // This node only knows guilds on shards it holds (own client); shards it does
+  // not hold read 0 here (the master has the fleet-wide REST-derived totals).
+  const ownShardCounts = new Map<number, number>();
+  for (const s of Object.values(guildMap)) ownShardCounts.set(s, (ownShardCounts.get(s) ?? 0) + 1);
   const shardTable: FleetState['shardTable'] = [];
   for (let shardId = 0; shardId < shardCount; shardId++) {
+    const guildCount = ownShardCounts.get(shardId) ?? 0;
     const l = leaseByShard.get(shardId);
     if (l) {
-      shardTable.push({ shardId, nodeId, leaseId: l.leaseId, term: lease?.term ?? term, epoch: lease?.epoch ?? 0, status: statusByShard.get(shardId) ?? 'Unknown' });
+      shardTable.push({ shardId, nodeId, leaseId: l.leaseId, term: lease?.term ?? term, epoch: lease?.epoch ?? 0, status: statusByShard.get(shardId) ?? 'Unknown', guildCount });
     } else {
-      shardTable.push({ shardId, nodeId: null, leaseId: null, term: 0, epoch: 0, status: 'unassigned' });
+      shardTable.push({ shardId, nodeId: null, leaseId: null, term: 0, epoch: 0, status: 'unassigned', guildCount });
     }
   }
   return {

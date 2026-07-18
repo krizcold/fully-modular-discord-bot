@@ -343,29 +343,23 @@ function FleetView({ api, wsClient, guildNames }) {
   // Shard count with a safe fallback to what the table actually shows.
   const shardCount = fleet.shardCount != null ? fleet.shardCount : shardTable.length;
 
-  // Total guilds: prefer summed node counts, fall back to the guild map size.
+  // Per-shard guild counts come straight from the shard table. The master fills
+  // each row's guildCount from its REST guild list, so unassigned shards report
+  // their real count too; a co-worker only knows its own shards. Total = sum,
+  // busiest = max. One source of truth for the column and the capacity signal.
   let totalGuilds = 0;
-  for (const node of nodes) totalGuilds += node.guildCount || 0;
-  if (totalGuilds === 0) totalGuilds = Object.keys(guildMap).length;
-
-  // Real per-shard guild counts from guildMap: the single source of truth for
-  // both the busiest-shard capacity signal and the shard table's Guilds column.
-  // Fleet-wide on a master, own-node-only on a co-worker (guildMap is own-node
-  // there). Keys are shardId (as strings); numeric shardId lookups coerce fine.
-  const perShardCounts = {};
-  for (const shardId of Object.values(guildMap)) perShardCounts[shardId] = (perShardCounts[shardId] || 0) + 1;
-
-  // Busiest shard: use REAL per-shard counts from guildMap when it has entries;
-  // otherwise estimate an even ceil(totalGuilds / shardCount) spread.
   let busiest = 0;
-  let approximate = true;
-  const guildMapKeys = Object.keys(guildMap);
-  if (guildMapKeys.length > 0) {
-    for (const count of Object.values(perShardCounts)) if (count > busiest) busiest = count;
-    approximate = false;
-  } else if (shardCount > 0) {
-    busiest = Math.ceil(totalGuilds / shardCount);
+  for (const s of shardTable) {
+    const c = s.guildCount || 0;
+    totalGuilds += c;
+    if (c > busiest) busiest = c;
   }
+  // Fallback before the first REST fetch lands / when the table has no counts.
+  if (totalGuilds === 0) {
+    for (const node of nodes) totalGuilds += node.guildCount || 0;
+    if (totalGuilds === 0) totalGuilds = Object.keys(guildMap).length;
+  }
+  const approximate = false;
 
   const unassignedCount = shardTable.filter((s) => s.status === 'unassigned').length;
   const onHoldNodeCount = nodes.filter((n) => n.onHold).length;
@@ -446,7 +440,7 @@ function FleetView({ api, wsClient, guildNames }) {
                   </td>
                   <td style={isFree ? { color: '#777' } : undefined}>{s.nodeId != null ? nodeNameOf(s.nodeId) : '-'}</td>
                   <td style={statusColor ? { color: statusColor } : undefined}>{s.status}</td>
-                  <td style={isFree ? { color: '#777' } : undefined}>{perShardCounts[s.shardId] || 0}</td>
+                  <td style={isFree ? { color: '#777' } : undefined}>{s.guildCount || 0}</td>
                   <td>{s.term != null ? s.term : '-'}</td>
                   <td>{s.epoch != null ? s.epoch : '-'}</td>
                   {isMaster ? (
