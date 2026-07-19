@@ -22,7 +22,7 @@ import { ControlClient } from './controlClient';
 import { LeaseRuntime } from './leaseRuntime';
 import {
   assignIdentifyDelays,
-  fetchAllGuildIds,
+  fetchAllGuilds,
   fetchGatewayInfo,
   guildIdToShardId,
   resolvePinnedShardId,
@@ -379,8 +379,8 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   // Full guild list via REST (not shard-bound) so per-shard counts cover shards
   // no instance is connected to. Slow refresh; failures keep the last counts.
   const refreshGuildTotals = async (): Promise<void> => {
-    const ids = await fetchAllGuildIds(process.env.DISCORD_TOKEN);
-    if (ids) registry.setAllGuilds(ids);
+    const guilds = await fetchAllGuilds(process.env.DISCORD_TOKEN);
+    if (guilds) registry.setAllGuilds(guilds);
   };
   void refreshGuildTotals();
   const guildTotalsTimer = setInterval(() => void refreshGuildTotals(), GUILD_TOTALS_REFRESH_MS);

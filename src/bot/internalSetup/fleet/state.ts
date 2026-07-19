@@ -64,6 +64,8 @@ export interface FleetState {
   nodes: FleetStateNode[];
   shardTable: { shardId: number; nodeId: string | null; leaseId: string | null; term: number; epoch: number; status: string; guildCount: number }[];
   guildMap: Record<string, number>;
+  /** Names for guilds in guildMap the connected clients cannot name (master's REST list); merged UI-side. */
+  guildNames?: Record<string, string>;
   updatedAt: number;
 }
 
@@ -211,7 +213,12 @@ export function getFleetState(): FleetState {
       leases,
       nodes,
       shardTable,
-      guildMap: Object.fromEntries(registry.guildMap),
+      // Full guild map: the master's REST list (every guild, incl. unassigned
+      // shards) overlaid with the connection-derived map. Both use the same
+      // guild -> shard formula, so the overlay only fills in any not-yet-fetched
+      // guilds; the result lets Guilds-by-shard list unserved guilds too.
+      guildMap: { ...Object.fromEntries(registry.restGuildShards), ...Object.fromEntries(registry.guildMap) },
+      guildNames: Object.fromEntries(registry.restGuildNames),
       updatedAt: Date.now(),
     };
   }

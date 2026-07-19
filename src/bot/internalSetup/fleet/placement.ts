@@ -60,25 +60,32 @@ function httpsGetJson(path: string, token: string): Promise<any | null> {
   });
 }
 
+export interface RestGuild {
+  id: string;
+  name: string;
+}
+
 /**
- * Every guild id the bot is in, via REST (GET /users/@me/guilds, paginated).
- * REST is NOT shard-bound, so this reports guilds on shards no instance is
- * currently connected to - the only way to count guilds on an unassigned shard.
- * Null on any failure; caller keeps its last known counts.
+ * Every guild the bot is in, via REST (GET /users/@me/guilds, paginated),
+ * with its name. REST is NOT shard-bound, so this reports guilds on shards no
+ * instance is currently connected to - the only way to see the guilds on an
+ * unassigned shard. Null on any failure; caller keeps its last known list.
  */
-export async function fetchAllGuildIds(token: string | undefined): Promise<string[] | null> {
+export async function fetchAllGuilds(token: string | undefined): Promise<RestGuild[] | null> {
   if (!token || token.trim() === '') return null;
-  const ids: string[] = [];
+  const guilds: RestGuild[] = [];
   let after = '';
   // Hard page cap so a huge account cannot spin forever; 200/page => 40k guilds.
   for (let page = 0; page < 200; page++) {
     const batch = await httpsGetJson(`/users/@me/guilds?limit=200${after ? `&after=${after}` : ''}`, token);
-    if (!Array.isArray(batch)) return page === 0 ? null : ids;
-    for (const g of batch) if (g && typeof g.id === 'string') ids.push(g.id);
-    if (batch.length < 200) return ids;
+    if (!Array.isArray(batch)) return page === 0 ? null : guilds;
+    for (const g of batch) {
+      if (g && typeof g.id === 'string') guilds.push({ id: g.id, name: typeof g.name === 'string' ? g.name : g.id });
+    }
+    if (batch.length < 200) return guilds;
     after = batch[batch.length - 1].id;
   }
-  return ids;
+  return guilds;
 }
 
 /** Discord's fixed guild -> shard formula. */

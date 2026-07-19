@@ -66,6 +66,11 @@ export class Registry {
   // Fleet-wide guild count per shard from the master's REST guild list, so
   // unassigned shards (no gateway session) still report their real guild count.
   readonly shardGuildTotals = new Map<number, number>();
+  // Full guild -> shard map and names from the master's REST guild list, so the
+  // Guilds-by-shard view lists guilds on unassigned shards too (which the
+  // connection-derived guildMap never sees).
+  readonly restGuildShards = new Map<string, number>();
+  readonly restGuildNames = new Map<string, string>();
 
   upsertNode(input: {
     nodeId: string;
@@ -123,12 +128,16 @@ export class Registry {
     }
   }
 
-  /** Recompute per-shard guild totals from the master's full REST guild list. */
-  setAllGuilds(guildIds: string[]): void {
+  /** Recompute per-shard totals, the full guild -> shard map and names from the master's REST guild list. */
+  setAllGuilds(guilds: { id: string; name: string }[]): void {
     this.shardGuildTotals.clear();
-    for (const id of guildIds) {
-      const shardId = guildIdToShardId(id, this.shardCount);
+    this.restGuildShards.clear();
+    this.restGuildNames.clear();
+    for (const g of guilds) {
+      const shardId = guildIdToShardId(g.id, this.shardCount);
       this.shardGuildTotals.set(shardId, (this.shardGuildTotals.get(shardId) ?? 0) + 1);
+      this.restGuildShards.set(g.id, shardId);
+      this.restGuildNames.set(g.id, g.name);
     }
   }
 

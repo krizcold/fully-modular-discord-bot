@@ -326,6 +326,10 @@ function FleetView({ api, wsClient, guildNames }) {
   const nodes = fleet.nodes || [];
   const shardTable = fleet.shardTable || [];
   const guildMap = fleet.guildMap || {};
+  // Names for guilds the connected clients cannot name (guilds on unassigned
+  // shards), supplied by the master's REST list; the connected-client names
+  // (guildNames prop) still win when present.
+  const fleetGuildNames = fleet.guildNames || {};
 
   const nodesById = {};
   for (const node of nodes) nodesById[node.nodeId] = node;
@@ -336,7 +340,7 @@ function FleetView({ api, wsClient, guildNames }) {
   const guildEntries = Object.entries(guildMap).map(([guildId, shardId]) => ({
     guildId,
     shardId,
-    name: (guildNames && guildNames[guildId]) || guildId,
+    name: (guildNames && guildNames[guildId]) || fleetGuildNames[guildId] || guildId,
   }));
   guildEntries.sort((a, b) => a.shardId - b.shardId || (a.name > b.name ? 1 : a.name < b.name ? -1 : 0));
 
