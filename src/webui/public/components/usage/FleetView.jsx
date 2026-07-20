@@ -324,6 +324,57 @@ function FleetView({ api, wsClient, guildNames }) {
   }
 
   const nodes = fleet.nodes || [];
+
+  // Co-worker: a compact, honest self-status. A co-worker never holds the
+  // fleet-wide picture (all nodes, the full shard table, every guild) - the
+  // master owns that - so rendering the full dashboard here would show a
+  // mostly-empty, misleading table (its own shard held, every other shard
+  // reading "unassigned"). Full fleet status and shard assignment live on the
+  // master's Usage tab.
+  if (fleet.role !== 'master') {
+    const selfNode = nodes[0];
+    const heldShards = (fleet.leases || []).map((l) => l.shardId).sort((a, b) => a - b);
+    const servingGuilds = selfNode ? selfNode.guildCount : 0;
+    return (
+      <div className="usage-board">
+        <h3>Fleet</h3>
+        <div className="usage-stat-sub">
+          {`role co-worker · term ${fleet.term} · epoch ${fleet.epoch} · ${fleet.shardCount} shard${fleet.shardCount === 1 ? '' : 's'} in the fleet`}
+        </div>
+
+        {!fleet.masterKnown && (
+          <div className="usage-notice">Master unreachable, retrying...</div>
+        )}
+        {fleet.masterKnown && fleet.onHold && (
+          <div className="usage-notice">
+            On hold: connected to the master, waiting for a shard to be assigned. Not serving any guilds yet.
+          </div>
+        )}
+        {fleet.masterKnown && !fleet.onHold && (
+          <div className="usage-stat-card" style={{ marginTop: '10px' }}>
+            <div className="usage-stat-title">Connected to master</div>
+            <div className="usage-stat-value">
+              {heldShards.length > 0
+                ? `Holding shard${heldShards.length === 1 ? '' : 's'} [${heldShards.join(', ')}] of ${fleet.shardCount}`
+                : 'No shards held'}
+            </div>
+            <div className="usage-stat-sub">{`Serving ${servingGuilds} guild${servingGuilds === 1 ? '' : 's'}`}</div>
+          </div>
+        )}
+
+        {selfNode ? (
+          <div className="usage-stat-grid" style={{ marginTop: '14px' }}>
+            <FleetNodeCard node={selfNode} />
+          </div>
+        ) : null}
+
+        <div className="usage-stat-sub" style={{ marginTop: '14px', color: '#777' }}>
+          Full fleet status and shard assignment are on the master's Usage tab.
+        </div>
+      </div>
+    );
+  }
+
   const shardTable = fleet.shardTable || [];
   const guildMap = fleet.guildMap || {};
   // Names for guilds the connected clients cannot name (guilds on unassigned
