@@ -532,7 +532,12 @@ function FleetView({ api, wsClient, guildNames }) {
           <tbody>
             {guildEntries.map((g) => (
               <tr key={g.guildId}>
-                <td>{g.name}</td>
+                <td>
+                  <div>{g.name}</div>
+                  {g.name !== g.guildId ? (
+                    <div style={{ fontSize: '0.72rem', color: '#777', fontFamily: 'monospace' }}>{g.guildId}</div>
+                  ) : null}
+                </td>
                 <td>{g.shardId}</td>
                 <td>{shardToNode[g.shardId] != null ? nodeNameOf(shardToNode[g.shardId]) : '-'}</td>
               </tr>
