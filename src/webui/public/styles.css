@@ -962,6 +962,17 @@ body {
   font-size: 0.8rem;
 }
 
+/* Fleet tables pin their column widths so a live status push (changed guild
+   counts, statuses, or an appearing/disappearing assign control) cannot resize
+   columns and make the table jump. Scoped to fleet tables only - the shared
+   .usage-table(-compact) metrics tables keep their content-based sizing. */
+.fleet-table {
+  table-layout: fixed;
+}
+.fleet-table td {
+  word-break: break-word;
+}
+
 .usage-sortable {
   cursor: pointer;
   user-select: none;

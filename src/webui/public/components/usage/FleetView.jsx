@@ -471,7 +471,16 @@ function FleetView({ api, wsClient, guildNames }) {
       {shardTable.length === 0 ? (
         <div className="usage-empty">No shards yet</div>
       ) : (
-        <table className="usage-table usage-table-compact">
+        <table className="usage-table usage-table-compact fleet-table">
+          <colgroup>
+            <col style={{ width: '8%' }} />
+            <col style={{ width: '20%' }} />
+            <col style={{ width: '15%' }} />
+            <col style={{ width: '10%' }} />
+            <col style={{ width: '9%' }} />
+            <col style={{ width: '9%' }} />
+            {isMaster ? <col style={{ width: '29%' }} /> : null}
+          </colgroup>
           <thead>
             <tr>
               <th>Shard</th><th>Node</th><th>Status</th>
@@ -525,7 +534,12 @@ function FleetView({ api, wsClient, guildNames }) {
       {guildEntries.length === 0 ? (
         <div className="usage-empty">No guilds mapped yet</div>
       ) : (
-        <table className="usage-table usage-table-compact">
+        <table className="usage-table usage-table-compact fleet-table">
+          <colgroup>
+            <col style={{ width: '58%' }} />
+            <col style={{ width: '14%' }} />
+            <col style={{ width: '28%' }} />
+          </colgroup>
           <thead>
             <tr><th>Guild</th><th>Shard</th><th>Node</th></tr>
           </thead>
