@@ -380,7 +380,12 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   // no instance is connected to. Slow refresh; failures keep the last counts.
   const refreshGuildTotals = async (): Promise<void> => {
     const guilds = await fetchAllGuilds(process.env.DISCORD_TOKEN);
-    if (guilds) registry.setAllGuilds(guilds);
+    if (guilds) {
+      registry.setAllGuilds(guilds);
+      console.log(`[Fleet] Guild directory refreshed via REST: ${guilds.length} guild(s) (names for Guilds-by-shard, including unheld shards)`);
+    } else {
+      console.warn('[Fleet] Guild directory refresh FAILED (REST GET /users/@me/guilds); Guilds-by-shard will show IDs for guilds this node is not connected to');
+    }
   };
   void refreshGuildTotals();
   const guildTotalsTimer = setInterval(() => void refreshGuildTotals(), GUILD_TOTALS_REFRESH_MS);

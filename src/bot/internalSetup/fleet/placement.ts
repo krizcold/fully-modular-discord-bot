@@ -51,12 +51,17 @@ function httpsGetJson(path: string, token: string): Promise<any | null> {
         let body = '';
         res.on('data', chunk => { body += chunk; });
         res.on('end', () => {
-          try { resolve(res.statusCode === 200 ? JSON.parse(body) : null); } catch { resolve(null); }
+          if (res.statusCode !== 200) {
+            console.warn(`[Fleet] REST ${path} -> HTTP ${res.statusCode}: ${body.slice(0, 200)}`);
+            resolve(null);
+            return;
+          }
+          try { resolve(JSON.parse(body)); } catch { console.warn(`[Fleet] REST ${path} returned malformed JSON`); resolve(null); }
         });
       },
     );
-    req.on('timeout', () => { req.destroy(); resolve(null); });
-    req.on('error', () => resolve(null));
+    req.on('timeout', () => { console.warn(`[Fleet] REST ${path} timed out after ${GATEWAY_INFO_TIMEOUT_MS}ms`); req.destroy(); resolve(null); });
+    req.on('error', e => { console.warn(`[Fleet] REST ${path} error: ${e instanceof Error ? e.message : String(e)}`); resolve(null); });
   });
 }
 
