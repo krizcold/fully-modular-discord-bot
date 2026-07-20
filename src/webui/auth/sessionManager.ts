@@ -29,8 +29,13 @@ function getBootFallbackSecret(): string {
  */
 export async function configureSessionStore(): Promise<session.Store | undefined> {
   const credentials = loadCredentials();
-  const redisUrl = credentials.REDIS_URL || 'redis://redis:6379';
+  const redisUrl = credentials.REDIS_URL;
   const isDev = process.env.NODE_ENV === 'development';
+
+  if (!redisUrl) {
+    console.log('[SessionManager] REDIS_URL not configured - using in-memory session store');
+    return undefined;
+  }
 
   try {
     console.log(`[SessionManager] Connecting to Redis at ${redisUrl}...`);

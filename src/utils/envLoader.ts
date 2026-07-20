@@ -3,6 +3,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as dotenv from 'dotenv';
+import { dataPath } from './dataRoot';
 
 /**
  * Deployment mode.
@@ -22,6 +23,18 @@ export interface BotCredentials {
   GUILD_ID?: string;
   MAIN_GUILD_ID?: string;
   AUTH_HASH?: string;
+  // Fleet / sharding control plane (Phase 1). Resolved in the bot child:
+  // explicit BOT_NODE_ROLE wins; else MASTER_URL present = co-worker; else
+  // standalone master.
+  BOT_NODE_ROLE?: string;
+  MASTER_URL?: string;
+  CONTROL_SECRET?: string;
+  CONTROL_PORT?: string;
+  FLEET_PUBLIC_URL?: string;
+  NODE_NAME?: string;
+  PIN_TEST_GUILD_SHARD?: string;
+  FLEET_SHARD_COUNT?: string;
+  FLEET_SHARD_CAPACITY?: string;
   // OAuth Configuration (Optional - for Guild Web-UI)
   ENABLE_GUILD_WEBUI?: string;
   DISCORD_CLIENT_ID?: string;
@@ -67,12 +80,23 @@ export function loadCredentials(): BotCredentials {
     GUILD_ID: process.env.GUILD_ID,
     MAIN_GUILD_ID: process.env.MAIN_GUILD_ID,
     AUTH_HASH: process.env.AUTH_HASH,
+    // Fleet fields (flow to the bot child via the botManager env spread)
+    BOT_NODE_ROLE: process.env.BOT_NODE_ROLE,
+    MASTER_URL: process.env.MASTER_URL,
+    CONTROL_SECRET: process.env.CONTROL_SECRET,
+    CONTROL_PORT: process.env.CONTROL_PORT,
+    FLEET_PUBLIC_URL: process.env.FLEET_PUBLIC_URL,
+    NODE_NAME: process.env.NODE_NAME,
+    PIN_TEST_GUILD_SHARD: process.env.PIN_TEST_GUILD_SHARD,
+    FLEET_SHARD_COUNT: process.env.FLEET_SHARD_COUNT,
+    FLEET_SHARD_CAPACITY: process.env.FLEET_SHARD_CAPACITY,
     // OAuth fields
     ENABLE_GUILD_WEBUI: process.env.ENABLE_GUILD_WEBUI,
     DISCORD_CLIENT_ID: process.env.DISCORD_CLIENT_ID,
     DISCORD_CLIENT_SECRET: process.env.DISCORD_CLIENT_SECRET,
     OAUTH_CALLBACK_URL: process.env.OAUTH_CALLBACK_URL,
     SESSION_SECRET: process.env.SESSION_SECRET,
+    REDIS_URL: process.env.REDIS_URL,
   };
 
   // Payment provider env vars are dynamic per provider; copy through any
@@ -93,12 +117,19 @@ export function loadCredentials(): BotCredentials {
   }
 
   // Override with /data/.env if it exists (Web-UI managed)
-  const dataEnvPath = '/data/.env';
+  const dataEnvPath = dataPath('.env');
   if (fs.existsSync(dataEnvPath)) {
     try {
       const dataEnv = dotenv.parse(fs.readFileSync(dataEnvPath));
       // Only override if docker-compose value is a placeholder
       for (const [key, value] of Object.entries(dataEnv)) {
+        // Compose defaults like ${VAR:-} leave the var set to an empty string,
+        // which dotenv would treat as "already set"; empty means unset intent,
+        // so apply the saved value to process.env for direct readers (e.g. the
+        // web-UI AUTH_HASH middleware).
+        if (process.env[key] === undefined || process.env[key] === '') {
+          process.env[key] = value;
+        }
         if (isPlaceholder(credentials[key])) {
           credentials[key] = value;
         }
@@ -161,7 +192,7 @@ export function validateCredentials(credentials: BotCredentials): CredentialVali
  * @returns Success status
  */
 export function saveCredentials(credentials: BotCredentials): { success: boolean; error?: string } {
-  const dataEnvPath = '/data/.env';
+  const dataEnvPath = dataPath('.env');
 
   try {
     // Ensure /data directory exists

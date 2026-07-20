@@ -23,6 +23,7 @@ import type { HardLimitOverride, SettingValue } from '../../bot/types/settingsTy
 import { getPaymentRegistry } from '../../bot/internalSetup/utils/payment/paymentRegistry';
 import type { OfferingVariant } from '../../bot/internalSetup/utils/payment/paymentTypes';
 import { loadCredentials, saveCredentials, BotCredentials } from '../../utils/envLoader';
+import { dataPath } from '../../utils/dataRoot';
 import { getModulesDir, getModulesDevDir } from '../../bot/internalSetup/utils/pathHelpers';
 import { BotManager } from '../botManager';
 import { ComponentToggleDebouncer } from '../utils/componentToggleDebouncer';
@@ -1788,7 +1789,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
 
   // ─── Component Management (Commands tab) ───
 
-  const APPSTORE_CONFIG_DIR = path.join(process.env.DATA_DIR || '/data', 'global', 'appstore');
+  const APPSTORE_CONFIG_DIR = dataPath('global', 'appstore');
   const COMPONENT_CONFIG_PATH = path.join(APPSTORE_CONFIG_DIR, 'component-config.json');
   const APPSTORE_CONFIG_PATH = path.join(APPSTORE_CONFIG_DIR, 'config.json');
 

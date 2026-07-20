@@ -11,8 +11,8 @@
  */
 
 import * as fs from 'fs';
-import * as path from 'path';
 import { Client } from 'discord.js';
+import { dataPath } from '../../../utils/dataRoot';
 import { getAppStoreManager } from './appStoreManager';
 import { reloadModules } from './moduleReloader';
 
@@ -26,7 +26,7 @@ let clientRef: Client | null = null;
  */
 function isAutoUpdateEnabled(): boolean {
   try {
-    const configPath = path.join(process.env.DATA_DIR || '/data', 'global', 'appstore', 'config.json');
+    const configPath = dataPath('global', 'appstore', 'config.json');
     if (!fs.existsSync(configPath)) return false;
     const cfg = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
     return cfg.autoUpdate === true;

@@ -13,10 +13,11 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import { dataPath } from './dataRoot';
 
 const CUSTOM_PATH = '/app/custom';
-const APPSTORE_MODULES_PATH = '/data/appstore-modules';
-const BACKUPS_PATH = '/data/backups';
+const APPSTORE_MODULES_PATH = dataPath('appstore-modules');
+const BACKUPS_PATH = dataPath('backups');
 const AUTO_DEBOUNCE_MS = 60_000;
 const AUTO_RETENTION = 5;
 

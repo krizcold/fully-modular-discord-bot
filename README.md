@@ -23,7 +23,7 @@ A Discord bot framework designed with modularity at its core. Features are organ
 
 ### Prerequisites
 
-- Discord Bot Token ([Get one here](#-registering-the-bot-account))
+- Discord Bot Token ([Get one here](#registering-the-bot-account))
 - Docker and Docker Compose (for containerized deployment)
 - Node.js 24+ (for local development)
 
@@ -35,22 +35,38 @@ A Discord bot framework designed with modularity at its core. Features are organ
    cd fully-modular-discord-bot
    ```
 
-2. **Configure credentials:**
-   Create a `.env` file or use the Web-UI after first startup:
+2. **Set the Web-UI access secret:**
+   Create a `.env` file next to `docker-compose.standalone.yml`:
    ```env
-   DISCORD_TOKEN=your_bot_token_here
-   CLIENT_ID=your_bot_client_id
-   GUILD_ID=your_test_server_id
-   MAIN_GUILD_ID=your_main_server_id  # Optional
+   AUTH_HASH=any_long_random_secret
    ```
-
-3. **Start the bot:**
+   `AUTH_HASH` is required: without it the Web-UI page loads but every API
+   request is rejected with HTTP 503, so the dashboard is unusable. Discord
+   credentials do NOT need to be set here; you will enter them in the Web-UI
+   after first boot. On Linux, also create the data
+   directory so the container user (uid 1000) can write to it:
    ```bash
-   docker-compose up -d
+   mkdir -p data && sudo chown 1000:1000 data
    ```
 
-4. **Access Web-UI (local):**
-   Open `http://localhost:3000/` in your browser
+3. **Build and start the bot:**
+   ```bash
+   docker compose -f docker-compose.standalone.yml up -d --build
+   ```
+   The bot boots into standby (credentials missing) with the Web-UI running.
+
+4. **Open the Web-UI:**
+   Open `http://localhost:8080/?hash=YOUR_AUTH_HASH` in your browser.
+
+5. **Enter your Discord credentials:**
+   Go to the **Credentials** tab, fill in Bot Token, Application (Client) ID,
+   and Guild ID, then click **Save & Start Bot**. The bot comes online without
+   restarting the container.
+
+Note: the committed `docker-compose.yml` is the manager-processed compose used
+by Bot Manager / Yundera (CasaOS) deployments. It depends on manager-injected
+variables and networks and cannot be started with plain `docker compose up`;
+use `docker-compose.standalone.yml` for self-hosting.
 
 ### Local Development
 
@@ -198,15 +214,18 @@ The bot includes a browser-based management interface for monitoring and control
 
 ### Accessing Web-UI
 
-**Local Development:**
+**Local Development (`npm run dev`, auth bypassed):**
 ```
 http://localhost:8080
 ```
 
-**Docker Deployment (with nginx proxy):**
+**Docker Deployment (standalone):**
 ```
-http://localhost:3000/?hash=YOUR_AUTH_HASH
+http://localhost:8080/?hash=YOUR_AUTH_HASH
 ```
+
+**Bot Manager / Yundera deployments** are reached through the AppShield
+gateway URL that the manager provides.
 
 The Web-UI operates in the main guild context (`MAIN_GUILD_ID`) and has full access to all admin panels.
 
@@ -239,15 +258,15 @@ Guild Web-UI provides a separate interface at `/guild` where Discord server admi
 
 **2. Configure OAuth2 Settings:**
 - Go to OAuth2 section
-- Add redirect URI: `http://your-domain:3000/auth/discord/callback`
-  - For local testing: `http://localhost:3000/auth/discord/callback`
+- Add redirect URI: `http://your-domain:8080/auth/discord/callback`
+  - For local testing: `http://localhost:8080/auth/discord/callback`
   - For production: `https://your-domain/auth/discord/callback`
 - Select scopes: `identify`, `guilds`, `guilds.members.read`
 - Save changes
 
 **3. Configure via Web-UI Credentials Tab:**
 
-Access the owner Web-UI (`http://localhost:3000/?hash=AUTH_HASH`) and go to **Credentials** tab:
+Access the owner Web-UI (`http://localhost:8080/?hash=AUTH_HASH`) and go to **Credentials** tab:
 
 1. Expand **"🔐 Advanced: Guild Web-UI OAuth (Optional)"** section
 2. Enable **"Enable Guild Web-UI"** checkbox
@@ -263,7 +282,7 @@ Access the owner Web-UI (`http://localhost:3000/?hash=AUTH_HASH`) and go to **Cr
 **4. Test OAuth Login:**
 ```bash
 # Access guild interface (no AUTH_HASH required):
-http://localhost:3000/guild
+http://localhost:8080/guild
 
 # You'll be redirected to Discord for OAuth login
 # After login, select a guild to manage
@@ -276,7 +295,7 @@ http://localhost:3000/guild
 | **Enable Guild Web-UI** | Yes | Toggle to enable OAuth feature | `true` or `false` |
 | **Discord OAuth Client ID** | Yes* | OAuth application ID (not bot CLIENT_ID) | `987654321098765432` |
 | **Discord OAuth Client Secret** | Yes* | OAuth application secret (keep secure!) | `AbCdEf123456_XXX` |
-| **OAuth Callback URL** | Yes* | Discord redirect URI (must match exactly) | `http://localhost:3000/auth/discord/callback` |
+| **OAuth Callback URL** | Yes* | Discord redirect URI (must match exactly) | `http://localhost:8080/auth/discord/callback` |
 | **Session Secret** | Yes* | Random string for session encryption | Click "Generate" button |
 | **Redis URL** | No | Optional Redis for persistent sessions | `redis://localhost:6379` |
 
@@ -443,7 +462,13 @@ Access via `/admin-panel` command → Bot Update Manager
 npm run dev              # Run with ts-node and auto-restart
 npm run dev:bot          # Run bot only (for Web-UI development)
 npm run dev:webui        # Run Web-UI only
+npm run redis:dev        # Start (or reuse) a local Redis container for session storage
 ```
+
+Redis is optional in development: without it, sessions use an in-memory store. To enable it,
+run `npm run redis:dev` (requires Docker Desktop) and set `REDIS_URL=redis://localhost:6379`
+in the Credentials panel or `/data/.env`. Container deployments ship a redis sidecar and set
+`REDIS_URL` automatically via docker-compose.
 
 **Building:**
 ```bash
@@ -598,31 +623,40 @@ export default async (client: Client, message: Message) => {
 
 ## Docker Configuration
 
-### docker-compose.yml Structure
+Two compose files ship with the repository:
 
-The project uses two services:
-- **nginxhashlock** - Reverse proxy with hash-based authentication (port 3000)
-- **bot app** - Discord bot + Web-UI (port 8080 internal)
+### docker-compose.standalone.yml (self-hosting)
 
-### Volume Mounts
+A single service built from the local Dockerfile. The Web-UI listens on port
+8080 inside the container and is published on `127.0.0.1:8080` (localhost
+only; change the mapping to `8080:8080` to expose it on your LAN).
 
+**Volume:**
 ```yaml
 volumes:
-  - ./custom:/app/custom  # User overrides (overlays /app/src at boot)
-  - ./data:/data          # Persistent data (appstore-modules, applied-version, bot data)
+  - ./data:/data  # Persistent data (saved credentials, appstore-modules, bot data)
 ```
 
-### Environment Variables
+**Environment variables (read from `.env`):**
 
-Set in docker-compose.yml or via CasaOS UI:
-```yaml
-environment:
-  DISCORD_TOKEN: 'your_token_here'
-  GUILD_ID: 'your_guild_id'
-  CLIENT_ID: 'your_client_id'
-  MAIN_GUILD_ID: 'your_main_guild_id'  # Optional
-  AUTH_HASH: '$AUTH_HASH'              # For Web-UI access
-```
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `AUTH_HASH` | Yes | Web-UI access secret. Without it every Web-UI API request returns HTTP 503. Open the UI with `/?hash=AUTH_HASH`. |
+| `DISCORD_TOKEN` | No | Optional prefill; the Web-UI Credentials tab is the supported way to set it. |
+| `CLIENT_ID` | No | Optional prefill. |
+| `GUILD_ID` | No | Optional prefill. |
+| `REDIS_URL` | No | Enables Redis-backed Guild Web-UI sessions; sessions use an in-memory store when unset. |
+
+Credentials entered in the Web-UI are stored in `/data/.env` (the `./data`
+bind mount) and survive container rebuilds.
+
+### docker-compose.yml (Bot Manager / Yundera)
+
+The committed `docker-compose.yml` is the manager-processed compose used by
+Bot Manager on Yundera (CasaOS). It includes the AppShield auth gateway, a
+Redis sidecar, the external `pcs` network, and `$VARIABLE` placeholders that
+the manager substitutes at deploy time. It is not meant to be started by
+hand.
 
 ---
 

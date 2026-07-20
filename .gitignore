@@ -142,9 +142,6 @@ logs.logs
 # Local Claude Code workspace config (per-developer)
 .claude/
 
-# IDEs and editors
-package-lock.json
-
 # Module Development (App Store repos - separate git projects)
 src/bot/modulesDev/*
 !src/bot/modulesDev/README.md

@@ -9,14 +9,15 @@ import getLocalCommands from '../../utils/getLocalCommands';
 import areCommandsDifferent from '../../utils/areCommandsDifferent';
 import 'dotenv/config';
 import { getConfigProperty } from '../../utils/configManager';
+import { resolveNodeRole } from '../../fleet/nodeIdentity';
 import { loadGlobalData, saveGlobalData } from '../../utils/dataManager';
+import { dataPath } from '../../../../utils/dataRoot';
 import * as fs from 'fs';
-import * as path from 'path';
 
 /** Check if auto-cleanup is enabled in AppStore config (default: false) */
 export function isAutoCleanupEnabled(): boolean {
   try {
-    const configPath = path.join(process.env.DATA_DIR || '/data', 'global', 'appstore', 'config.json');
+    const configPath = dataPath('global', 'appstore', 'config.json');
     if (fs.existsSync(configPath)) {
       const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
       return config.autoCleanup === true;
@@ -29,7 +30,7 @@ export function isAutoCleanupEnabled(): boolean {
 function getDisabledCommands(): Set<string> {
   const disabled = new Set<string>();
   try {
-    const configPath = path.join(process.env.DATA_DIR || '/data', 'global', 'appstore', 'component-config.json');
+    const configPath = dataPath('global', 'appstore', 'component-config.json');
     if (fs.existsSync(configPath)) {
       const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
       for (const [key, value] of Object.entries(config)) {
@@ -175,6 +176,12 @@ export default async function registerCommands(
   client: Client,
   options: { runOrphanCleanup?: boolean } = {}
 ) {
+  // Slash-command registration is a bot-identity-wide operation; only the
+  // master node performs it (co-workers would race the same Discord state).
+  if (resolveNodeRole() === 'co-worker') {
+    console.log('[i] Skipping command registration (co-worker node; the master owns it)');
+    return;
+  }
   const runOrphanCleanup = options.runOrphanCleanup !== false;
   console.log('[i] Registering commands...');
 
@@ -199,12 +206,25 @@ export default async function registerCommands(
 
     // Fetch existing commands from Discord
     const globalCommands = await client.application?.commands.fetch();
-    const guild = client.guilds.cache.get(guildId);
-    if (!guild) {
-      console.error(`Guild (ID: ${guildId}) not found.`);
+    if (!client.application) {
+      console.error('[registerCommands] client.application not available; cannot register commands.');
       return;
     }
-    const guildCommands = await guild.commands.fetch(); // Test commands!
+    // Test (guild) commands go through the application-commands REST API scoped
+    // to guildId, NOT a cached Guild object. In a fleet the test guild usually
+    // lives on ANOTHER node's shard, so it is legitimately absent from this
+    // client's cache; the old cache lookup aborted all registration on the
+    // master. This REST manager works regardless of which shard holds the guild,
+    // and never adds it to this client's cache (which would corrupt the fleet
+    // guild map / this node's guild count).
+    const appCommands = client.application.commands;
+    const guildCmds = {
+      fetch: () => appCommands.fetch({ guildId }),
+      create: (data: any) => appCommands.create(data, guildId),
+      edit: (id: string, data: any) => appCommands.edit(id, data, guildId),
+      delete: (id: string) => appCommands.delete(id, guildId),
+    };
+    const guildCommands = await guildCmds.fetch(); // Test commands!
 
     // Process each local command
     for (const localCommand of localCommands) {
@@ -222,7 +242,7 @@ export default async function registerCommands(
         const existing = (testOnly ? guildCommands : globalCommands)?.find(cmd => cmd.name === name && cmd.type === (type ?? typeChat));
         if (existing) {
           try {
-            const mgr = testOnly ? guild.commands : client.application?.commands;
+            const mgr = testOnly ? guildCmds : client.application?.commands;
             await mgr?.delete(existing.id);
             console.log(`[i] Unregistered disabled command: ${name}`);
           } catch (e) { console.error(`[i] Failed to unregister disabled command ${name}:`, e); }
@@ -239,7 +259,7 @@ export default async function registerCommands(
       const commandData: any = createBasePayload(localCommand)
       //commandData.description = testOnly ? `[TEST] ${description}` : description;
 
-      await commandRegistration(commandData, localCommand, existingCommand, guild, client);
+      await commandRegistration(commandData, localCommand, existingCommand, guildCmds, client);
     }
 
 
@@ -304,7 +324,7 @@ export default async function registerCommands(
             continue;
           }
           try {
-            await guild.commands.delete(guildCommand.id);
+            await guildCmds.delete(guildCommand.id);
             console.log(`Deleted local command "${guildCommand.name}" (Type: ${ApplicationCommandType[guildCommand.type]}) as it is no longer found locally or not marked testOnly.`);
           } catch(deleteError: any){
             if (deleteError?.code === 10063) {
@@ -385,14 +405,14 @@ function skipCommand(localCommand: any) {
  * @param commandData The command data to be registered or updated.
  * @param localCommand The local command object.
  * @param existingCommand The existing command object from Discord, if any.
- * @param guild The guild object for test commands.
+ * @param guildCmds The guild-scoped command manager (REST) for test commands.
  * @param client The Discord client instance.
  */
 async function commandRegistration(
   commandData: any,
   localCommand: any,
   existingCommand: ApplicationCommand | undefined,
-  guild: any,
+  guildCmds: any,
   client: Client,
 ) {
 
@@ -443,7 +463,7 @@ async function commandRegistration(
 
   
   // ---> Perform Registration/Edit <---
-  const targetManager = localCommand.testOnly ? guild.commands : client.application?.commands;
+  const targetManager = localCommand.testOnly ? guildCmds : client.application?.commands;
   if (!targetManager) return; // what lmao how
 
   try {

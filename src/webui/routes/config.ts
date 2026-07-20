@@ -17,11 +17,12 @@ import {
   saveGlobalConfig,
   saveGuildConfig
 } from '../../bot/internalSetup/utils/configManager';
+import { dataPath } from '../../utils/dataRoot';
 
 export function createConfigRoutes(): Router {
   const router = Router();
 
-  const BACKUP_DIR = '/data/configBackups';
+  const BACKUP_DIR = dataPath('configBackups');
 
   // Ensure backup directory exists
   if (!fs.existsSync(BACKUP_DIR)) {
@@ -166,9 +167,9 @@ export function createConfigRoutes(): Router {
       // Determine the actual config path (guild or global)
       let actualConfigPath: string;
       if (guildId && configInfo.moduleName) {
-        actualConfigPath = path.join('/data', guildId, configInfo.moduleName, fileId);
+        actualConfigPath = dataPath(guildId, configInfo.moduleName, fileId);
       } else if (guildId) {
-        actualConfigPath = path.join('/data/guildConfigs', `${guildId}.json`);
+        actualConfigPath = dataPath('guildConfigs', `${guildId}.json`);
       } else {
         actualConfigPath = configInfo.path;
       }

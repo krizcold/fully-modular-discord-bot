@@ -22,6 +22,7 @@ import * as path from 'path';
 import { PanelOptions, PanelContext, PanelResponse } from '../../types/panelTypes';
 import { discoverGuildConfigFiles, ConfigFileMetadata } from '../utils/configDiscovery';
 import { loadGuildConfig, saveGuildConfig, getMergedConfig } from '../utils/configManager';
+import { dataPath } from '../../../utils/dataRoot';
 import { createV2Response, V2Colors } from '../utils/panel/v2';
 import { validateAndSanitizeJson } from '../utils/json';
 
@@ -249,9 +250,9 @@ const configEditorGuildPanel: PanelOptions = {
         if (Object.keys(overridesOnly).length === 0) {
           let configPath: string;
           if (schemaMetadata && schemaMetadata.moduleName) {
-            configPath = path.join('/data', context.guildId!, schemaMetadata.moduleName, fileId);
+            configPath = dataPath(context.guildId!, schemaMetadata.moduleName, fileId);
           } else {
-            configPath = path.join('/data', context.guildId!, fileId);
+            configPath = dataPath(context.guildId!, fileId);
           }
           if (fs.existsSync(configPath)) {
             fs.unlinkSync(configPath);
@@ -306,9 +307,9 @@ const configEditorGuildPanel: PanelOptions = {
         // Construct proper path with moduleName
         let configPath: string;
         if (schemaMetadata && schemaMetadata.moduleName) {
-          configPath = path.join('/data', context.guildId, schemaMetadata.moduleName, fileId);
+          configPath = dataPath(context.guildId, schemaMetadata.moduleName, fileId);
         } else {
-          configPath = path.join('/data', context.guildId, fileId);
+          configPath = dataPath(context.guildId, fileId);
         }
 
         if (fs.existsSync(configPath)) {

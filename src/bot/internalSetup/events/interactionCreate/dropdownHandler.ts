@@ -8,6 +8,7 @@ import {
 } from 'discord.js';
 import { RegisteredDropdownInfo } from '../../../types/commandTypes'; // Import the type
 import { getConfigPropertyForGuild } from '../../utils/configManager';
+import { instrument } from '../../utils/metrics/instrument';
 
 // Default timeout (e.g., 15 minutes), can be adjusted or removed if not needed for dropdowns
 const DEFAULT_DROPDOWN_TIMEOUT_MS = 15 * 60 * 1000;
@@ -94,7 +95,9 @@ async function handleDropdownInteraction(client: Client, interaction: Interactio
 
   // Execute the Handler
   try {
-    await handler(client, interaction); // interaction is any select menu type
+    await instrument('dropdown', interaction.guildId, dropdownInfo._moduleName ?? matchedKey, matchedKey, () =>
+      handler(client, interaction as AnySelectMenuInteraction)
+    );
   } catch (error) {
     // Log error with the specific customId
     console.error(`Error executing dropdown handler for customId "${incomingCustomId}" (registered as ${matchedKey}):`, error);

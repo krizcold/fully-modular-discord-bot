@@ -1,11 +1,50 @@
 // src/webui/index.ts
 
-import { createServer as createHTTPServer } from 'http';
+import { createServer as createHTTPServer, request as httpRequest } from 'http';
+import { request as httpsRequest } from 'https';
 import { BotManager } from './botManager';
 import { createServer } from './server';
 import { WebSocketManager } from './websocketManager';
 import { getInstallQueue } from './utils/installQueue';
 import { setNotificationIPCDispatcher } from '../bot/internalSetup/utils/premiumNotifications';
+
+/**
+ * Tell the bot manager this bot's web UI is now serving, so the manager keeps
+ * the Open button disabled until the UI is actually reachable after a (re)start.
+ * Fire-and-forget with a couple of retries; a standalone bot (no manager env)
+ * skips it, and a lost ping just leaves Open gated until the next start (safe).
+ */
+function reportWebUiReady(attempt = 1): void {
+  const base = (process.env.BOT_MANAGER_INTERNAL_URL || '').trim();
+  const botId = (process.env.BOT_ID || '').trim();
+  const token = (process.env.BOT_MANAGER_UPDATE_TOKEN || '').trim();
+  if (!base || !botId || !token) return; // standalone (no manager) - nothing to report
+  let url: URL;
+  try {
+    url = new URL(`${base.replace(/\/$/, '')}/api/bots/${botId}/webui-ready`);
+  } catch {
+    return;
+  }
+  const doRequest = url.protocol === 'https:' ? httpsRequest : httpRequest;
+  let settled = false;
+  const retry = () => {
+    if (settled) return;
+    settled = true;
+    if (attempt < 3) setTimeout(() => reportWebUiReady(attempt + 1), 3000);
+  };
+  const req = doRequest(
+    url,
+    { method: 'POST', headers: { 'X-Bot-Token': token, 'Content-Length': 0 }, timeout: 5000 },
+    res => {
+      res.resume();
+      if ((res.statusCode || 0) >= 500) retry();
+      else settled = true;
+    },
+  );
+  req.on('error', () => retry());
+  req.on('timeout', () => req.destroy());
+  req.end();
+}
 
 export async function startWebUI(botManager: BotManager): Promise<void> {
   console.log('[WebUI] Starting web interface...');
@@ -90,6 +129,7 @@ export async function startWebUI(botManager: BotManager): Promise<void> {
       } else {
         console.log(`[WebUI] Access URL: http://localhost:${PORT}/?hash=\${AUTH_HASH}`);
       }
+      reportWebUiReady();
       resolve();
     });
   });

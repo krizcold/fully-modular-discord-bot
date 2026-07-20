@@ -5,10 +5,11 @@
 import { Client, TextChannel } from 'discord.js';
 import * as fs from 'fs/promises';
 import * as path from 'path';
+import { dataPath } from '../../../../utils/dataRoot';
 import { PersistentPanelInstance, PersistentPanelStorage } from '@bot/types/panelTypes';
 
 // Storage paths
-const GLOBAL_STORAGE_PATH = '/data/global/persistent-panels.json';
+const GLOBAL_STORAGE_PATH = dataPath('global', 'persistent-panels.json');
 
 /**
  * Get the storage path for a specific guild or global
@@ -17,7 +18,7 @@ function getStoragePath(guildId?: string): string {
   if (!guildId) {
     return GLOBAL_STORAGE_PATH;
   }
-  return path.join('/data', guildId, 'persistent-panels.json');
+  return dataPath(guildId, 'persistent-panels.json');
 }
 
 /**

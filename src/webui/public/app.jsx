@@ -3,7 +3,7 @@ const { useState, useEffect } = React;
 // Top-level tabs that map 1:1 to a URL path. Order in the tab strip is
 // driven by the JSX below; this set is just for "is this a recognised tab"
 // validation when reading from the URL on load / popstate.
-const APP_TABS = ['dashboard', 'panels', 'credentials', 'config', 'logs', 'update', 'appstore', 'devmodules'];
+const APP_TABS = ['dashboard', 'panels', 'credentials', 'config', 'logs', 'usage', 'update', 'appstore', 'devmodules'];
 
 function tabFromPath(pathname) {
   // Pathname like "/credentials" -> "credentials". Empty / unknown / "/"
@@ -261,6 +261,12 @@ function App() {
           Logs
         </button>
         <button
+          className={`tab ${activeTab === 'usage' ? 'active' : ''}`}
+          onClick={() => setActiveTab('usage')}
+        >
+          Usage
+        </button>
+        <button
           className={`tab ${activeTab === 'update' ? 'active' : ''}`}
           onClick={() => setActiveTab('update')}
         >
@@ -318,6 +324,8 @@ function App() {
         {activeTab === 'config' && <ConfigPanel />}
 
         {activeTab === 'logs' && <LogsPanel api={api} wsClient={wsClient} />}
+
+        {activeTab === 'usage' && <UsagePanel api={api} wsClient={wsClient} />}
 
         {activeTab === 'update' && <UpdatePanel api={api} wsClient={wsClient} />}
 

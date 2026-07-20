@@ -1,6 +1,7 @@
 import { Client, ButtonInteraction, MessageFlags, Interaction, PermissionsBitField, GuildMember, PermissionResolvable } from 'discord.js';
 import { RegisteredButtonInfo, SpecialUserRule } from '../../../types/commandTypes';
 import { getConfigPropertyForGuild } from '../../utils/configManager';
+import { instrument } from '../../utils/metrics/instrument';
 
 // Default timeout duration (15 minutes in milliseconds)
 const DEFAULT_BUTTON_TIMEOUT_MS = 15 * 60 * 1000;
@@ -123,7 +124,9 @@ async function handleButtonInteraction(client: Client, interaction: ButtonIntera
 
   // Execute the Handler
   try {
-    await handler(client, interaction, userLevel);
+    await instrument('button', interaction.guildId, buttonInfo._moduleName ?? matchedKey, matchedKey, () =>
+      handler(client, interaction, userLevel)
+    );
   } catch (error) {
     console.error(`Error executing button handler for customId "${incomingCustomId}" (registered as ${matchedKey}, UserLevel: ${userLevel}):`, error);
     try {

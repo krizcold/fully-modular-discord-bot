@@ -3,6 +3,7 @@ import * as path from 'path';
 import * as fs from 'fs';
 import { BotManager } from '../botManager';
 import { getSafetyManager } from '../../utils/updateSafety';
+import { dataPath } from '../../utils/dataRoot';
 import { exec } from 'child_process';
 import { promisify } from 'util';
 
@@ -342,15 +343,15 @@ export function createUpdateRouter(botManager: BotManager): Router {
       const { description } = req.body;
       const timestamp = Date.now();
       const backupName = `backup-${timestamp}`;
-      const backupPath = path.join('/data/backups', backupName);
+      const backupPath = path.join(dataPath('backups'), backupName);
 
       fs.mkdirSync(backupPath, { recursive: true });
 
       if (fs.existsSync('/app/custom')) {
         await execAsync(`cp -a /app/custom ${path.join(backupPath, 'custom')}`);
       }
-      if (fs.existsSync('/data/appstore-modules')) {
-        await execAsync(`cp -a /data/appstore-modules ${path.join(backupPath, 'appstore-modules')}`);
+      if (fs.existsSync(dataPath('appstore-modules'))) {
+        await execAsync(`cp -a ${dataPath('appstore-modules')} ${path.join(backupPath, 'appstore-modules')}`);
       }
 
       let version = 'unknown';
@@ -408,7 +409,7 @@ export function createUpdateRouter(botManager: BotManager): Router {
     try {
       const { timestamp } = req.params;
       const backupName = `backup-${timestamp}`;
-      const backupPath = path.join('/data/backups', backupName);
+      const backupPath = path.join(dataPath('backups'), backupName);
 
       if (!fs.existsSync(backupPath)) {
         res.status(404).json({
@@ -438,8 +439,8 @@ export function createUpdateRouter(botManager: BotManager): Router {
         await execAsync(`cp -a ${backupCustom}/. /app/custom/`);
       }
       if (fs.existsSync(backupAppstore)) {
-        await execAsync('rm -rf /data/appstore-modules/*');
-        await execAsync(`cp -a ${backupAppstore}/. /data/appstore-modules/`);
+        await execAsync(`rm -rf ${dataPath('appstore-modules')}/*`);
+        await execAsync(`cp -a ${backupAppstore}/. ${dataPath('appstore-modules')}/`);
       }
 
       // Wipe ephemeral build outputs + the applied-version marker so the next
@@ -447,8 +448,8 @@ export function createUpdateRouter(botManager: BotManager): Router {
       // restored sources. Mirrors performRollback in rollback.js.
       await execAsync('rm -rf /app/build /app/dist');
       try {
-        if (fs.existsSync('/data/applied-version.json')) {
-          fs.unlinkSync('/data/applied-version.json');
+        if (fs.existsSync(dataPath('applied-version.json'))) {
+          fs.unlinkSync(dataPath('applied-version.json'));
         }
       } catch {
         // best-effort
@@ -475,7 +476,7 @@ export function createUpdateRouter(botManager: BotManager): Router {
     try {
       const { timestamp } = req.params;
       const backupName = `backup-${timestamp}`;
-      const backupPath = path.join('/data/backups', backupName);
+      const backupPath = path.join(dataPath('backups'), backupName);
 
       // Check if backup exists
       if (!fs.existsSync(backupPath)) {
@@ -514,7 +515,7 @@ export function createUpdateRouter(botManager: BotManager): Router {
 
       // Save config
       fs.writeFileSync(
-        '/data/update-safety.json',
+        dataPath('update-safety.json'),
         JSON.stringify(config, null, 2)
       );
 

@@ -103,6 +103,20 @@ export class ModuleRegistry {
       }
     }
 
+    // 4b. Remove reaction handlers captured during load/hot-reload, or
+    // closures from the unloaded module code keep executing on reactions
+    let removedReactions = 0;
+    const reactionIds = (module as any).registeredReactionIds as { reactions: string[]; reactionRemoves: string[] } | undefined;
+    if (this.client && reactionIds) {
+      const c = this.client as any;
+      for (const id of reactionIds.reactions) {
+        if (c.reactionHandlers?.delete(id)) removedReactions++;
+      }
+      for (const id of reactionIds.reactionRemoves) {
+        if (c.reactionRemoveHandlers?.delete(id)) removedReactions++;
+      }
+    }
+
     // 5. Clear require/import cache for all files this module imported
     for (const filePath of module.importedFiles) {
       const importPath = toImportPath(filePath);
@@ -119,7 +133,7 @@ export class ModuleRegistry {
     this.modules.delete(moduleName);
     this.exports.delete(moduleName);
 
-    console.log(`[ModuleRegistry] Unloaded ${moduleName}: ${removedListeners} listeners, ${removedPanels} panels, ${removedInteractions} interaction handlers removed`);
+    console.log(`[ModuleRegistry] Unloaded ${moduleName}: ${removedListeners} listeners, ${removedPanels} panels, ${removedInteractions} interaction handlers, ${removedReactions} reaction handlers removed`);
     return true;
   }
 

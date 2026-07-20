@@ -1,5 +1,6 @@
 import path from 'path';
 import fs from 'fs';
+import { DATA_ROOT, dataPath } from '../../../utils/dataRoot';
 
 /**
  * Get the root directory of the bot.
@@ -29,7 +30,7 @@ function isProd(): boolean {
  */
 export function getSourceModulesDir(): string {
   if (isProd()) {
-    const dir = '/data/appstore-modules';
+    const dir = dataPath('appstore-modules');
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
     }
@@ -87,7 +88,7 @@ export function getModulePath(moduleName: string): string {
  * @returns Absolute path to the module's data directory
  */
 export function getModuleDataPath(moduleName: string, guildId?: string | null): string {
-  const dataRoot = path.join(process.cwd(), 'data');
+  const dataRoot = DATA_ROOT;
 
   if (guildId) {
     return path.join(dataRoot, guildId, moduleName);

@@ -241,6 +241,14 @@ export class BotManager {
       this.botProcess.on('message', (message: any) => {
         if (message.type === 'panel:live_update') {
           this.emitPanelUpdate(message.data);
+        } else if (message.type === 'metrics:snapshot') {
+          if (this.wsManager) {
+            this.wsManager.broadcast('bot:metrics:snapshot', message.data);
+          }
+        } else if (message.type === 'fleet:status') {
+          if (this.wsManager) {
+            this.wsManager.broadcast('bot:fleet:status', message.data);
+          }
         }
       });
 
@@ -473,7 +481,7 @@ export class BotManager {
       const requestId = `${type}_${Date.now()}_${Math.random()}`;
       const timeout = setTimeout(() => {
         this.botProcess?.removeListener('message', messageHandler);
-        reject(new Error('IPC request timeout'));
+        reject(new Error('IPC request timed out; the operation may still complete in the background - check bot logs before retrying'));
       }, timeoutMs);
 
       const messageHandler = (message: any) => {
@@ -516,6 +524,66 @@ export class BotManager {
       return await this.sendIPCMessage('bot:guilds', {});
     } catch (error) {
       console.error('[BotManager] Error getting bot guilds:', error);
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  /**
+   * Get the global metrics snapshot from the bot
+   */
+  async getGlobalMetrics(): Promise<any> {
+    try {
+      return await this.sendIPCMessage('metrics:global', {});
+    } catch (error) {
+      console.error('[BotManager] Error getting global metrics:', error);
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  /**
+   * Get one guild's metrics snapshot from the bot
+   */
+  async getGuildMetrics(guildId: string): Promise<any> {
+    try {
+      return await this.sendIPCMessage('metrics:guild', { guildId });
+    } catch (error) {
+      console.error('[BotManager] Error getting guild metrics:', error);
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  /**
+   * Get the metrics leaderboard (modules / commands / guilds) from the bot
+   */
+  async getMetricsLeaderboard(): Promise<any> {
+    try {
+      return await this.sendIPCMessage('metrics:leaderboard', {});
+    } catch (error) {
+      console.error('[BotManager] Error getting metrics leaderboard:', error);
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  /**
+   * Get the fleet state snapshot from the bot
+   */
+  async getFleetState(): Promise<any> {
+    try {
+      return await this.sendIPCMessage('fleet:state', {});
+    } catch (error) {
+      console.error('[BotManager] Error getting fleet state:', error);
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  /**
+   * Manually assign a FREE shard to a node (master-only; validated in the bot child).
+   */
+  async assignFleetShard(shardId: number, nodeId: string): Promise<any> {
+    try {
+      return await this.sendIPCMessage('fleet:assign', { shardId, nodeId });
+    } catch (error) {
+      console.error('[BotManager] Error assigning fleet shard:', error);
       return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
     }
   }

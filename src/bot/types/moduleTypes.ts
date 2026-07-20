@@ -151,6 +151,9 @@ export interface ModuleManifest {
   /** Whether module is enabled (default: true) */
   enabled?: boolean;
 
+  /** Marks the module as expensive under load; shed first by the future load-limiter, badged in the Usage tab */
+  heavyLoad?: boolean;
+
   /** Exported functions/classes for cross-module communication */
   exports?: Record<string, string>;
 
@@ -212,6 +215,11 @@ export interface LoadedModule {
     buttons: string[];
     modals: string[];
     dropdowns: string[];
+  };
+
+  registeredReactionIds?: {
+    reactions: string[];
+    reactionRemoves: string[];
   };
 }
 

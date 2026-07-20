@@ -2,6 +2,7 @@ import { ActionRowBuilder, ButtonBuilder, ButtonStyle, Client, CommandInteractio
 import getLocalCommands from '../../utils/getLocalCommands';
 import { getConfigProperty } from '../../utils/configManager';
 import { getPremiumManager } from '../../utils/premiumManager';
+import { instrument } from '../../utils/metrics/instrument';
 
 /**
  * Build the components array attached to a tier-blocked reply. When the host
@@ -136,7 +137,9 @@ export default async function handleCommands(client: Client, interaction: Intera
       } catch { /* premium manager not available; allow command */ }
     }
 
-    await commandObject.callback(client, interaction as CommandInteraction | ContextMenuCommandInteraction);
+    await instrument('command', interaction.guildId, commandObject._moduleName, interaction.commandName, () =>
+      commandObject.callback(client, interaction as CommandInteraction | ContextMenuCommandInteraction)
+    );
   } catch (error) {
     console.error(`There was an error running this command:`, error);
   }
