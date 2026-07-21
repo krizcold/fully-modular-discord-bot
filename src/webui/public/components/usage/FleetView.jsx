@@ -236,7 +236,7 @@ function FleetConnectCard({ connect }) {
       <div className="usage-stat-sub">
         Paste these into a new bot instance's Fleet config to add it as a worker.
         {connect.urlIsTemplate
-          ? ' Replace <host> with this master\'s reachable address (LAN IP, or host.docker.internal for a same-box container).'
+          ? ' Replace <host> with this master\'s reachable address (LAN IP, or the master\'s container name on a shared docker network for a same-box worker).'
           : ''}
       </div>
     </div>
