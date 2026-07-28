@@ -29,8 +29,8 @@ import { getPaymentRegistry } from '../bot/internalSetup/utils/payment/paymentRe
 export async function createServer(botManager: BotManager): Promise<Express> {
   const app = express();
 
-  // Trust proxy - required for nginxhashlock reverse proxy
-  // This allows express-rate-limit to correctly identify client IPs from X-Forwarded-For header
+  // Trust proxy - required when a reverse proxy / auth gateway (AppShield, Authelia)
+  // fronts the app, so express-rate-limit reads client IPs from X-Forwarded-For.
   app.set('trust proxy', 1);
 
   // Session middleware + Passport are ALWAYS installed so that Guild Web-UI
@@ -86,8 +86,9 @@ export async function createServer(botManager: BotManager): Promise<Express> {
     next();
   });
 
-  // CORS configuration - Disable CORS since auth is via query parameter
-  // This prevents CSRF attacks from malicious origins
+  // CORS configuration - Disable CORS entirely. The web UI is not authenticated by the
+  // bot itself (auth lives at the deployment boundary), so no cross-origin requests are
+  // expected; this also blocks CSRF from malicious origins.
   app.use(cors({
     origin: false, // Disable CORS entirely
     credentials: false
@@ -261,8 +262,8 @@ export async function createServer(botManager: BotManager): Promise<Express> {
   app.use('/guild/api/subscriptions', requireGuildWebUIEnabled, createGuildSubscriptionRoutes());
   console.log('[Server] Auth + Guild API routes mounted (request-time gated by ENABLE_GUILD_WEBUI)');
 
-  // Owner API Routes (requireAuth - protected by AUTH_HASH via nginx)
-  // NGINX handles primary auth, Express validates as defense in depth
+  // Owner API Routes. Auth is enforced at the deployment boundary (AppShield OIDC /
+  // Authelia when managed, or the localhost bind when standalone); requireAuth passes.
   app.use('/api/bot', requireAuth, createControlRoutes(botManager));
   app.use('/api/setup', requireAuth, createSetupRoutes());
   app.use('/api/config', requireAuth, createConfigRoutes());
@@ -273,7 +274,7 @@ export async function createServer(botManager: BotManager): Promise<Express> {
   app.use('/api/usage', requireAuth, createUsageRoutes(botManager));
   app.use('/api/fleet', requireAuth, createFleetRoutes(botManager));
 
-  // Serve static frontend files (protected by auth)
+  // Serve static frontend files (auth is enforced at the deployment boundary; requireAuth passes)
   const publicDir = path.join(__dirname, 'public');
   app.use(express.static(publicDir, {
     setHeaders: (res) => {
@@ -282,13 +283,13 @@ export async function createServer(botManager: BotManager): Promise<Express> {
     }
   }));
 
-  // Root route (protected by auth for defense-in-depth)
+  // Root route (requireAuth passes; auth enforced at the deployment boundary)
   app.get('/', requireAuth, (req: Request, res: Response) => {
     res.sendFile(path.join(publicDir, 'index.html'));
   });
 
-  // Guild Web-UI routes (NO requireAuth - accessible via nginx
-  // ALLOWED_PATHS: "/guild"). The wildcard `/guild/*` serves the same SPA
+  // Guild Web-UI routes (NO requireAuth - public via the gateway's AppShield
+  // ALLOWED_PATHS: "/guild,/auth"). The wildcard `/guild/*` serves the same SPA
   // shell so deep links like /guild/{id}/subscription work after a full
   // page reload (used by Stripe return URLs and refresh-restores-state
   // browser behaviour). Both must be registered before the auth-gated
@@ -312,7 +313,7 @@ export async function createServer(botManager: BotManager): Promise<Express> {
   app.get('/guild', guildHtmlHandler);
   app.get('/guild/*', guildHtmlHandler);
 
-  // Catch-all for SPA routing (protected by auth)
+  // Catch-all for SPA routing (requireAuth passes; auth at the boundary)
   // MUST be last to not interfere with specific routes
   app.get('*', requireAuth, (req: Request, res: Response) => {
     res.sendFile(path.join(publicDir, 'index.html'));

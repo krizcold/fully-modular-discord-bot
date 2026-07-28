@@ -127,7 +127,7 @@ export async function startWebUI(botManager: BotManager): Promise<void> {
         console.log(`[WebUI] Access URL: http://localhost:${PORT}/`);
         console.log(`[WebUI] Development mode - no auth required`);
       } else {
-        console.log(`[WebUI] Access URL: http://localhost:${PORT}/?hash=\${AUTH_HASH}`);
+        console.log(`[WebUI] Access URL: http://localhost:${PORT}/`);
       }
       reportWebUiReady();
       resolve();

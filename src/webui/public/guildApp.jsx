@@ -30,7 +30,7 @@ function pushGuildUrl(guildId, tab) {
     : '/guild';
   if (window.location.pathname !== path) {
     // Strip query params we want to consume-and-clear (subscribe=...).
-    // Anything else (auth ?hash= for example) stays.
+    // Anything else stays.
     const params = new URLSearchParams(window.location.search);
     params.delete('subscribe');
     params.delete('session');

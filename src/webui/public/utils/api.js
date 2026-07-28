@@ -1,12 +1,9 @@
-// API helper for authenticated requests
-const urlParams = new URLSearchParams(window.location.search);
-const authHash = urlParams.get('hash') || '';
+// API helper for same-origin requests. Auth is handled at the deployment boundary
+// (a gateway when managed, or the localhost bind when standalone), not by a URL param.
 
 const api = {
   async get(endpoint) {
-    const separator = endpoint.includes('?') ? '&' : '?';
-    const url = `/api${endpoint}${separator}hash=${authHash}`;
-    const res = await fetch(url);
+    const res = await fetch(`/api${endpoint}`);
 
     // Clone response so we can read it as text if JSON parsing fails
     const resClone = res.clone();
@@ -26,9 +23,7 @@ const api = {
     return json;
   },
   async post(endpoint, data = {}) {
-    const separator = endpoint.includes('?') ? '&' : '?';
-    const url = `/api${endpoint}${separator}hash=${authHash}`;
-    const res = await fetch(url, {
+    const res = await fetch(`/api${endpoint}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(data)
@@ -52,9 +47,7 @@ const api = {
     return json;
   },
   async put(endpoint, data = {}) {
-    const separator = endpoint.includes('?') ? '&' : '?';
-    const url = `/api${endpoint}${separator}hash=${authHash}`;
-    const res = await fetch(url, {
+    const res = await fetch(`/api${endpoint}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(data)
@@ -76,9 +69,7 @@ const api = {
     return json;
   },
   async delete(endpoint) {
-    const separator = endpoint.includes('?') ? '&' : '?';
-    const url = `/api${endpoint}${separator}hash=${authHash}`;
-    const res = await fetch(url, {
+    const res = await fetch(`/api${endpoint}`, {
       method: 'DELETE'
     });
 

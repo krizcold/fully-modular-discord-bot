@@ -1,71 +1,18 @@
 // src/webui/middleware/auth.ts
 
 import { Request, Response, NextFunction } from 'express';
-import { createHash, timingSafeEqual } from 'crypto';
 
 /**
- * Perform timing-safe comparison of two hash values
- * Prevents timing attacks by using constant-time comparison
- * @param provided - Hash provided by client
- * @param expected - Expected hash value
- * @returns true if hashes match, false otherwise
+ * Web-UI access is authenticated at the deployment BOUNDARY, not by this app:
+ *  - Managed by the Bot Manager: a gateway fronts the bot (AppShield OIDC on Yundera,
+ *    Authelia on the remote/Linux stack) and authenticates before the request arrives.
+ *  - Standalone self-hosted: the web UI binds to 127.0.0.1 (localhost only), so only
+ *    the local machine can reach it. Exposing the port to a network is the operator's
+ *    choice and must be done behind a reverse proxy / auth gateway.
+ *
+ * There is no in-app URL secret. This middleware is kept so route wiring is unchanged;
+ * it intentionally passes every request through.
  */
-function validateHashTimingSafe(provided: string | undefined, expected: string): boolean {
-  if (!provided || provided.trim() === '') {
-    return false;
-  }
-
-  try {
-    // Use timing-safe comparison to prevent timing attacks
-    // Hash both values to ensure equal length for comparison
-    const providedBuffer = Buffer.from(createHash('sha256').update(provided).digest('hex'));
-    const expectedBuffer = Buffer.from(createHash('sha256').update(expected).digest('hex'));
-
-    return timingSafeEqual(providedBuffer, expectedBuffer);
-  } catch (error) {
-    console.error('[Auth] Error during hash validation:', error);
-    return false;
-  }
-}
-
-/**
- * Authentication middleware that validates AUTH_HASH
- * Development mode (NODE_ENV=development): Auth is bypassed
- * Production mode: Requires valid AUTH_HASH via query param or header
- */
-export function requireAuth(req: Request, res: Response, next: NextFunction): void {
-  const AUTH_HASH = process.env.AUTH_HASH;
-  const isDevelopment = process.env.NODE_ENV === 'development';
-
-  // Development mode: Skip auth entirely
-  if (isDevelopment) {
-    next();
-    return;
-  }
-
-  // Production mode: Reject if hash is not set
-  if (!AUTH_HASH || AUTH_HASH.trim() === '') {
-    console.warn('[Auth] Request rejected - AUTH_HASH not configured');
-    res.status(503).json({
-      error: 'Service unavailable',
-      message: 'Authentication system not configured. Please set AUTH_HASH environment variable.'
-    });
-    return;
-  }
-
-  // Get hash from query parameter or header
-  const providedHash = req.query.hash as string || req.headers['x-auth-hash'] as string;
-
-  // Validate hash using timing-safe comparison
-  if (!validateHashTimingSafe(providedHash, AUTH_HASH)) {
-    console.warn('[Auth] Unauthorized access attempt from', req.ip);
-    res.status(401).json({
-      error: 'Unauthorized',
-      message: 'Invalid or missing authentication hash'
-    });
-    return;
-  }
-
-  // Hash is valid, proceed
+export function requireAuth(_req: Request, _res: Response, next: NextFunction): void {
   next();
 }

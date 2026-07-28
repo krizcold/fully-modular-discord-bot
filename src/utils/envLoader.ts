@@ -22,7 +22,6 @@ export interface BotCredentials {
   CLIENT_ID?: string;
   GUILD_ID?: string;
   MAIN_GUILD_ID?: string;
-  AUTH_HASH?: string;
   // Fleet / sharding control plane (Phase 1). Resolved in the bot child:
   // explicit BOT_NODE_ROLE wins; else MASTER_URL present = co-worker; else
   // standalone master.
@@ -79,7 +78,6 @@ export function loadCredentials(): BotCredentials {
     CLIENT_ID: process.env.CLIENT_ID,
     GUILD_ID: process.env.GUILD_ID,
     MAIN_GUILD_ID: process.env.MAIN_GUILD_ID,
-    AUTH_HASH: process.env.AUTH_HASH,
     // Fleet fields (flow to the bot child via the botManager env spread)
     BOT_NODE_ROLE: process.env.BOT_NODE_ROLE,
     MASTER_URL: process.env.MASTER_URL,
@@ -125,8 +123,7 @@ export function loadCredentials(): BotCredentials {
       for (const [key, value] of Object.entries(dataEnv)) {
         // Compose defaults like ${VAR:-} leave the var set to an empty string,
         // which dotenv would treat as "already set"; empty means unset intent,
-        // so apply the saved value to process.env for direct readers (e.g. the
-        // web-UI AUTH_HASH middleware).
+        // so apply the saved value to process.env for direct readers.
         if (process.env[key] === undefined || process.env[key] === '') {
           process.env[key] = value;
         }

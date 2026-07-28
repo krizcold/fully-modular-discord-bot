@@ -17,23 +17,10 @@ class WebSocketClient {
    * Connect to WebSocket server
    */
   connect() {
-    // Extract auth hash from URL
-    const urlParams = new URLSearchParams(window.location.search);
-    const authHash = urlParams.get('hash');
-
-    // Determine WebSocket URL
+    // Auth is handled at the deployment boundary (a gateway when managed, or the
+    // localhost bind when standalone), not by a URL param.
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    let wsUrl;
-
-    // If hash is present, use it (production mode via nginx proxy)
-    // If no hash, connect without it (development mode - server skips auth)
-    if (authHash && authHash.trim() !== '') {
-      wsUrl = `${protocol}//${window.location.host}/ws?hash=${encodeURIComponent(authHash)}`;
-    } else {
-      // Development mode: connect without hash (server will skip auth check)
-      console.log('[WebSocket] No auth hash - connecting in development mode');
-      wsUrl = `${protocol}//${window.location.host}/ws`;
-    }
+    const wsUrl = `${protocol}//${window.location.host}/ws`;
 
     console.log('[WebSocket] Connecting...');
 

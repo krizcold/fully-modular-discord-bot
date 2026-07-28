@@ -2,8 +2,6 @@
 
 import { WebSocketServer, WebSocket } from 'ws';
 import { Server as HTTPServer } from 'http';
-import { createHash, timingSafeEqual } from 'crypto';
-import * as url from 'url';
 
 /**
  * WebSocket event types for bot status and control
@@ -16,7 +14,7 @@ export type WSEvent =
   | 'bot:crash'
   | 'bot:metrics:snapshot'
   | 'bot:fleet:status'
-  | 'connection:authenticated'
+  | 'connection:established'
   | 'panel:updated'
   | 'appstore:install:queued'
   | 'appstore:install:started'
@@ -139,7 +137,6 @@ export interface WSMessage {
  * WebSocket Manager - Manages WebSocket connections and broadcasts
  *
  * Features:
- * - Authenticated connections with timing-safe comparison
  * - Rate limiting (5 connections per IP per minute, 100 max total)
  * - Heartbeat mechanism to detect stale connections
  * - Automatic cleanup of dead clients
@@ -198,23 +195,12 @@ export class WebSocketManager {
         return;
       }
 
-      // Authenticate WebSocket connection
-      const query = url.parse(req.url || '', true).query;
-      const hash = query.hash as string;
-
-      // Validate auth hash
-      if (!this.validateAuth(hash)) {
-        console.warn(`[WebSocket] Unauthorized connection attempt from ${ip}`);
-        ws.close(1008, 'Unauthorized');
-        return;
-      }
-
-      // Add to clients
+      // Web-UI access is authenticated at the deployment boundary (a gateway when
+      // managed, or the localhost bind when standalone), not by this app. See auth.ts.
       this.clients.add(ws);
-      console.log(`[WebSocket] Client authenticated. Total clients: ${this.clients.size}`);
+      console.log(`[WebSocket] Client connected. Total clients: ${this.clients.size}`);
 
-      // Send authentication confirmation
-      this.sendToClient(ws, 'connection:authenticated', {
+      this.sendToClient(ws, 'connection:established', {
         message: 'Connected to bot manager WebSocket'
       });
 
@@ -242,38 +228,6 @@ export class WebSocketManager {
     console.log('[WebSocket] Server initialized on /ws');
   }
 
-  /**
-   * Validate authentication hash using timing-safe comparison
-   * @param hash - The hash provided by the client
-   * @returns true if authentication is valid, false otherwise
-   */
-  private validateAuth(hash: string | undefined): boolean {
-    // Development mode: Skip auth entirely
-    if (process.env.NODE_ENV === 'development') {
-      return true;
-    }
-
-    const AUTH_HASH = process.env.AUTH_HASH;
-
-    if (!AUTH_HASH || AUTH_HASH.trim() === '') {
-      console.error('[WebSocket] AUTH_HASH not configured - rejecting connection');
-      return false;
-    }
-
-    if (!hash || hash.trim() === '') {
-      console.warn('[WebSocket] No hash provided in connection attempt');
-      return false;
-    }
-
-    try {
-      const hashBuffer = Buffer.from(createHash('sha256').update(hash).digest('hex'));
-      const authBuffer = Buffer.from(createHash('sha256').update(AUTH_HASH).digest('hex'));
-      return timingSafeEqual(hashBuffer, authBuffer);
-    } catch (error) {
-      console.error('[WebSocket] Error during authentication:', error);
-      return false;
-    }
-  }
 
   /**
    * Check if IP address has exceeded rate limit

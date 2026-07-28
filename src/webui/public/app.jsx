@@ -15,8 +15,7 @@ function tabFromPath(pathname) {
 
 function pushTabUrl(tab) {
   // pushState updates the address bar without reloading. Preserve the
-  // existing query string (notably ?hash= used for nginx auth) and any
-  // hash fragment so the auth round-trip survives navigation.
+  // existing query string and hash fragment so navigation state survives.
   const url = `/${tab}${window.location.search}${window.location.hash}`;
   if (window.location.pathname !== `/${tab}`) {
     window.history.pushState({}, '', url);
