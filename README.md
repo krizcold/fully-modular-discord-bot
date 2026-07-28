@@ -35,16 +35,10 @@ A Discord bot framework designed with modularity at its core. Features are organ
    cd fully-modular-discord-bot
    ```
 
-2. **Set the Web-UI access secret:**
-   Create a `.env` file next to `docker-compose.standalone.yml`:
-   ```env
-   AUTH_HASH=any_long_random_secret
-   ```
-   `AUTH_HASH` is required: without it the Web-UI page loads but every API
-   request is rejected with HTTP 503, so the dashboard is unusable. Discord
-   credentials do NOT need to be set here; you will enter them in the Web-UI
-   after first boot. On Linux, also create the data
-   directory so the container user (uid 1000) can write to it:
+2. **Prepare the data directory (Linux only):**
+   Discord credentials do NOT need to be set up front; you will enter them in
+   the Web-UI after first boot. On Linux, create the data directory so the
+   container user (uid 1000) can write to it:
    ```bash
    mkdir -p data && sudo chown 1000:1000 data
    ```
@@ -54,9 +48,13 @@ A Discord bot framework designed with modularity at its core. Features are organ
    docker compose -f docker-compose.standalone.yml up -d --build
    ```
    The bot boots into standby (credentials missing) with the Web-UI running.
+   The Web-UI binds to `127.0.0.1:8080`, so it is reachable only from the local
+   machine and needs no authentication of its own. To reach it from another
+   machine, put your own reverse proxy with authentication in front of it, or
+   SSH-tunnel to the port.
 
 4. **Open the Web-UI:**
-   Open `http://localhost:8080/?hash=YOUR_AUTH_HASH` in your browser.
+   Open `http://localhost:8080/` in your browser.
 
 5. **Enter your Discord credentials:**
    Go to the **Credentials** tab, fill in Bot Token, Application (Client) ID,
@@ -214,18 +212,24 @@ The bot includes a browser-based management interface for monitoring and control
 
 ### Accessing Web-UI
 
-**Local Development (`npm run dev`, auth bypassed):**
+**Local Development (`npm run dev`):**
 ```
 http://localhost:8080
 ```
 
 **Docker Deployment (standalone):**
 ```
-http://localhost:8080/?hash=YOUR_AUTH_HASH
+http://localhost:8080/
 ```
+The standalone Web-UI binds to `127.0.0.1:8080` and has no built-in
+authentication; access is gated by the localhost bind. Expose it remotely only
+behind your own reverse proxy with authentication.
 
 **Bot Manager / Yundera deployments** are reached through the AppShield
-gateway URL that the manager provides.
+gateway URL that the manager provides. On Yundera the gateway runs in OIDC
+mode: sign into CasaOS once and you are single-signed-on into the bot. On a
+Linux server managed by the Bot Manager, the manager's bundled Caddy and
+Authelia provide SSO (with optional MFA) in front of the bot.
 
 The Web-UI operates in the main guild context (`MAIN_GUILD_ID`) and has full access to all admin panels.
 
@@ -236,7 +240,7 @@ The Web-UI operates in the main guild context (`MAIN_GUILD_ID`) and has full acc
 #### What is Guild Web-UI?
 
 Guild Web-UI provides a separate interface at `/guild` where Discord server administrators can:
-- Login with Discord OAuth (no AUTH_HASH needed)
+- Login with Discord OAuth (member-facing login, separate from the admin gateway)
 - Select which guild to manage
 - Access guild-specific panels (config editor, data browser, module panels)
 - Manage only guilds where they have Administrator permission AND bot is present
@@ -266,7 +270,7 @@ Guild Web-UI provides a separate interface at `/guild` where Discord server admi
 
 **3. Configure via Web-UI Credentials Tab:**
 
-Access the owner Web-UI (`http://localhost:8080/?hash=AUTH_HASH`) and go to **Credentials** tab:
+Access the owner Web-UI (`http://localhost:8080/`) and go to **Credentials** tab:
 
 1. Expand **"🔐 Advanced: Guild Web-UI OAuth (Optional)"** section
 2. Enable **"Enable Guild Web-UI"** checkbox
@@ -281,7 +285,7 @@ Access the owner Web-UI (`http://localhost:8080/?hash=AUTH_HASH`) and go to **Cr
 
 **4. Test OAuth Login:**
 ```bash
-# Access guild interface (no AUTH_HASH required):
+# Access guild interface:
 http://localhost:8080/guild
 
 # You'll be redirected to Discord for OAuth login
@@ -641,7 +645,6 @@ volumes:
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `AUTH_HASH` | Yes | Web-UI access secret. Without it every Web-UI API request returns HTTP 503. Open the UI with `/?hash=AUTH_HASH`. |
 | `DISCORD_TOKEN` | No | Optional prefill; the Web-UI Credentials tab is the supported way to set it. |
 | `CLIENT_ID` | No | Optional prefill. |
 | `GUILD_ID` | No | Optional prefill. |
