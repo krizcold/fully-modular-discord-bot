@@ -16,11 +16,9 @@ services:
       # dial in; bind to a reachable interface (not 127.0.0.1) for other hosts.
       # - "127.0.0.1:3928:3928"  # expose fleet control plane for same-host workers
     environment:
-      # Required to use the Web-UI. Any long random secret works; open
-      # http://localhost:8080/?hash=<AUTH_HASH> after boot. When unset the
-      # page shell still loads but every API request is rejected with 503, so
-      # the UI is unusable (auth is never disabled outside NODE_ENV=development).
-      AUTH_HASH: ${AUTH_HASH:-}
+      # The Web-UI binds to 127.0.0.1 (see ports above), so only this machine can
+      # reach it and there is no in-app auth. To reach it from elsewhere, put a
+      # reverse proxy / auth gateway in front - do not publish 8080 directly.
       # Optional prefill. The supported flow is to leave these unset and enter
       # the credentials in the Web-UI Credentials tab after first boot.
       DISCORD_TOKEN: ${DISCORD_TOKEN:-}
