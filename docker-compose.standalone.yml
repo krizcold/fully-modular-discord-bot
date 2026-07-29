@@ -17,8 +17,9 @@ services:
       # - "127.0.0.1:3928:3928"  # expose fleet control plane for same-host workers
     environment:
       # The Web-UI binds to 127.0.0.1 (see ports above), so only this machine can
-      # reach it and there is no in-app auth. To reach it from elsewhere, put a
-      # reverse proxy / auth gateway in front - do not publish 8080 directly.
+      # reach it and there is no in-app auth. For a public Linux server use
+      # `sudo ./setup.sh` (docker-compose.remote.yml: Caddy TLS + Authelia login)
+      # instead - do not publish 8080 directly.
       # Optional prefill. The supported flow is to leave these unset and enter
       # the credentials in the Web-UI Credentials tab after first boot.
       DISCORD_TOKEN: ${DISCORD_TOKEN:-}

@@ -1,0 +1,122 @@
+# Public self-hosted deployment (Linux VPS, no Bot Manager): the bot's Web-UI on
+# the public internet, behind TLS (caddy-docker-proxy) + an MFA auth gateway
+# (Authelia) - the same stack the Bot Manager uses for its remote install.
+#
+# The admin Web-UI is reachable ONLY through Caddy + a completed Authelia login.
+# The member routes /guild and /auth stay public (they carry their own Discord
+# OAuth login). The bot publishes no host port; only Caddy listens on 80/443.
+#
+# Setup: run `sudo ./setup.sh` (automates all of the below; see README).
+# To do it by hand instead:
+#   1. create ./authelia/secrets/{JWT_SECRET,SESSION_SECRET,STORAGE_ENCRYPTION_KEY}
+#   2. put an argon2id hash in ./authelia/users_database.yml
+#   3. create a .env with PUBLIC_HOST, AUTHELIA_HOST, COOKIE_DOMAIN, ACME_EMAIL, TZ
+#   4. open inbound TCP 80 + 443 (and your provider's external firewall if enabled)
+#   5. docker compose -f docker-compose.remote.yml up -d
+
+name: fullymodulardiscordbot-remote
+
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    labels:
+      fleet.control-port: "3928"  # only meaningful under the Bot Manager; harmless here
+      # Reachable only through Caddy (no host port published). Caddy serves it at
+      # PUBLIC_HOST over TLS and forwards every request through Authelia first;
+      # /guild and /auth are bypass rules in authelia/configuration.yml.
+      caddy: ${PUBLIC_HOST}
+      caddy.reverse_proxy: "{{upstreams 8080}}"
+      caddy.forward_auth: "authelia:9091"
+      caddy.forward_auth.uri: /api/authz/forward-auth
+      caddy.forward_auth.copy_headers: Remote-User Remote-Groups Remote-Email Remote-Name
+    environment:
+      # Optional prefill. The supported flow is to leave these unset and enter
+      # the credentials in the Web-UI Credentials tab after first boot.
+      DISCORD_TOKEN: ${DISCORD_TOKEN:-}
+      CLIENT_ID: ${CLIENT_ID:-}
+      GUILD_ID: ${GUILD_ID:-}
+      REDIS_URL: redis://redis:6379
+      TZ: ${TZ}
+    volumes:
+      # Persistent data: saved credentials (/data/.env), AppStore modules, guild
+      # data. setup.sh creates it owned by uid 1000 (the container user).
+      - ./data:/data
+    depends_on:
+      - redis
+    networks:
+      - smdb_remote
+
+  # Guild Web-UI OAuth sessions (in-memory store; --save "" writes no snapshots).
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --save "" --loglevel warning
+    environment:
+      TZ: ${TZ}
+    networks:
+      - smdb_remote
+
+  # Ingress reverse proxy with automatic Let's Encrypt TLS (sslip.io or your domain).
+  caddy:
+    image: lucaslorentz/caddy-docker-proxy:2.12-alpine
+    container_name: caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"        # ACME HTTP-01 + HTTP->HTTPS redirect
+      - "443:443"      # public HTTPS
+      - "443:443/udp"  # HTTP/3 (optional)
+    environment:
+      CADDY_INGRESS_NETWORKS: smdb_remote
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - caddy_data:/data        # persists issued certs + ACME account - DO NOT lose
+      - caddy_config:/config
+    networks:
+      - smdb_remote
+
+  # Auth gateway: login + TOTP/WebAuthn MFA, enforced via Caddy forward_auth.
+  authelia:
+    image: authelia/authelia:4.39.20
+    container_name: authelia
+    restart: unless-stopped
+    environment:
+      X_AUTHELIA_CONFIG: /config/configuration.yml
+      X_AUTHELIA_CONFIG_FILTERS: template          # render {{ env "..." }} in configuration.yml
+      PUBLIC_HOST: ${PUBLIC_HOST}
+      # Named AUTH_HOST inside the container: Authelia parses any AUTHELIA_*-prefixed
+      # env as its own config (AUTHELIA_HOST -> deprecated 'host' key -> fatal clash
+      # with server.address). The .env key stays AUTHELIA_HOST.
+      AUTH_HOST: ${AUTHELIA_HOST}
+      COOKIE_DOMAIN: ${COOKIE_DOMAIN}
+      # two_factor (default) or one_factor (password-only; setup.sh's MFA question)
+      ACCESS_POLICY: ${ACCESS_POLICY:-two_factor}
+      AUTHELIA_IDENTITY_VALIDATION_RESET_PASSWORD_JWT_SECRET_FILE: /secrets/JWT_SECRET
+      AUTHELIA_SESSION_SECRET_FILE: /secrets/SESSION_SECRET
+      AUTHELIA_STORAGE_ENCRYPTION_KEY_FILE: /secrets/STORAGE_ENCRYPTION_KEY
+      TZ: ${TZ}
+    volumes:
+      - ./authelia:/config                # configuration.yml + users_database.yml
+      - ./authelia/secrets:/secrets:ro    # the three secret files
+      - authelia_data:/data               # sqlite db + notification.txt
+    networks:
+      - smdb_remote
+    # This (real ingress) container carries its own site block AND the Caddy global
+    # options - putting global options on the caddy controller itself can yield an
+    # empty Caddyfile (caddy-docker-proxy#632), so they live here.
+    labels:
+      caddy_0: ${AUTHELIA_HOST}
+      caddy_0.reverse_proxy: "{{upstreams 9091}}"
+      caddy_1.email: ${ACME_EMAIL}
+      # Optional: let Authelia see the real client IP for its rate-limiter. If Caddy
+      # fails to render the global block, this one label can be removed safely.
+      caddy_1.servers.trusted_proxies: "static private_ranges"
+
+networks:
+  smdb_remote:
+    name: smdb_remote
+
+volumes:
+  caddy_data:
+  caddy_config:
+  authelia_data:

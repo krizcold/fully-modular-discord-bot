@@ -145,3 +145,9 @@ logs.logs
 # Module Development (App Store repos - separate git projects)
 src/bot/modulesDev/*
 !src/bot/modulesDev/README.md
+
+# Runtime data (docker bind mount: saved credentials, guild data; never commit)
+/data/
+
+# Authelia secrets + runtime (public self-hosted gateway); never commit
+authelia/secrets/

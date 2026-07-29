@@ -49,9 +49,10 @@ A Discord bot framework designed with modularity at its core. Features are organ
    ```
    The bot boots into standby (credentials missing) with the Web-UI running.
    The Web-UI binds to `127.0.0.1:8080`, so it is reachable only from the local
-   machine and needs no authentication of its own. To reach it from another
-   machine, put your own reverse proxy with authentication in front of it, or
-   SSH-tunnel to the port.
+   machine and needs no authentication of its own. To host it on a public
+   Linux server instead, run `sudo ./setup.sh` - it deploys
+   `docker-compose.remote.yml` with HTTPS and an Authelia login in front (see
+   **Accessing Web-UI**).
 
 4. **Open the Web-UI:**
    Open `http://localhost:8080/` in your browser.
@@ -217,13 +218,24 @@ The bot includes a browser-based management interface for monitoring and control
 http://localhost:8080
 ```
 
-**Docker Deployment (standalone):**
+**Docker Deployment (standalone, local):**
 ```
 http://localhost:8080/
 ```
 The standalone Web-UI binds to `127.0.0.1:8080` and has no built-in
-authentication; access is gated by the localhost bind. Expose it remotely only
-behind your own reverse proxy with authentication.
+authentication; access is gated by the localhost bind.
+
+**Docker Deployment (standalone, public Linux server):**
+```bash
+sudo ./setup.sh
+```
+Stands up the Web-UI on the public internet behind Caddy (automatic HTTPS) +
+Authelia (login + optional MFA, default on) from `docker-compose.remote.yml` -
+the same stack the Bot Manager's remote install uses. The script asks for a
+domain (or derives sslip.io hosts from your server IP), sets the admin
+password, and prints a TOTP QR code for your authenticator app. The member
+routes `/guild` and `/auth` stay public with their own Discord OAuth login.
+Re-run it any time to reconfigure (`--reset-password`, `--reset-mfa`).
 
 **Bot Manager / Yundera deployments** are reached through the AppShield
 gateway URL that the manager provides. On Yundera the gateway serves its own
@@ -628,9 +640,9 @@ export default async (client: Client, message: Message) => {
 
 ## Docker Configuration
 
-Two compose files ship with the repository:
+Three compose files ship with the repository:
 
-### docker-compose.standalone.yml (self-hosting)
+### docker-compose.standalone.yml (self-hosting, local)
 
 A single service built from the local Dockerfile. The Web-UI listens on port
 8080 inside the container and is published on `127.0.0.1:8080` (localhost
@@ -653,6 +665,15 @@ volumes:
 
 Credentials entered in the Web-UI are stored in `/data/.env` (the `./data`
 bind mount) and survive container rebuilds.
+
+### docker-compose.remote.yml (self-hosting, public Linux server)
+
+The bot, a Redis sidecar for Guild Web-UI sessions, Caddy (automatic
+Let's Encrypt TLS), and Authelia (login + TOTP/WebAuthn MFA enforced via
+`forward_auth`). The admin Web-UI is reachable only through Caddy after an
+Authelia login; `/guild` and `/auth` bypass the gate (they carry the bot's own
+Discord OAuth). Deployed and reconfigured by `sudo ./setup.sh`; the compose
+header documents the equivalent manual steps.
 
 ### docker-compose.yml (Bot Manager / Yundera)
 
