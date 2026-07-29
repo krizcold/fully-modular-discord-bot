@@ -226,10 +226,11 @@ authentication; access is gated by the localhost bind. Expose it remotely only
 behind your own reverse proxy with authentication.
 
 **Bot Manager / Yundera deployments** are reached through the AppShield
-gateway URL that the manager provides. On Yundera the gateway runs in OIDC
-mode: sign into CasaOS once and you are single-signed-on into the bot. On a
-Linux server managed by the Bot Manager, the manager's bundled Caddy and
-Authelia provide SSO (with optional MFA) in front of the bot.
+gateway URL that the manager provides. On Yundera the gateway serves its own
+login form (user `admin`, your platform default app password) and keeps you
+signed in with a session cookie. On a Linux server managed by the Bot Manager,
+the manager's bundled Caddy and Authelia provide SSO (with optional MFA) in
+front of the bot.
 
 The Web-UI operates in the main guild context (`MAIN_GUILD_ID`) and has full access to all admin panels.
 

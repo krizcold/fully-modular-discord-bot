@@ -262,7 +262,7 @@ export async function createServer(botManager: BotManager): Promise<Express> {
   app.use('/guild/api/subscriptions', requireGuildWebUIEnabled, createGuildSubscriptionRoutes());
   console.log('[Server] Auth + Guild API routes mounted (request-time gated by ENABLE_GUILD_WEBUI)');
 
-  // Owner API Routes. Auth is enforced at the deployment boundary (AppShield OIDC /
+  // Owner API Routes. Auth is enforced at the deployment boundary (AppShield /
   // Authelia when managed, or the localhost bind when standalone); requireAuth passes.
   app.use('/api/bot', requireAuth, createControlRoutes(botManager));
   app.use('/api/setup', requireAuth, createSetupRoutes());

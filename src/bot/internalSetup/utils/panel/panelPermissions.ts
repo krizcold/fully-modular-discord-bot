@@ -23,7 +23,7 @@ export function checkPanelPermissions(panel: PanelOptions, context: PanelContext
  * Web-UI always operates in MAIN_GUILD_ID context, so system-scope panels are allowed.
  */
 function checkWebUIPermissions(panel: PanelOptions, userId: string): boolean {
-  // Main Web-UI uses 'web-ui-owner' - it's already authenticated at the deployment boundary (AppShield OIDC / localhost)
+  // Main Web-UI uses 'web-ui-owner' - it's already authenticated at the deployment boundary (AppShield / localhost)
   // No permission checks needed - owner has full access
   if (userId === 'web-ui-owner') {
     return true;
