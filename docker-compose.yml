@@ -2,8 +2,9 @@ name: fullymodulardiscordbot
 
 services:
   fullymodulardiscordbot:
-    image: ghcr.io/yundera/appshield:latest
+    image: ghcr.io/yundera/appshield:2.0.7
     container_name: fullymodulardiscordbot
+    hostname: fullymodulardiscordbot
     restart: unless-stopped
     cpu_shares: 80
     healthcheck:
@@ -16,15 +17,23 @@ services:
     expose:
       - "80"
     environment:
-      # OIDC/SSO via the CasaOS auth registrar (no URL hash). Sign in once at CasaOS
-      # and this bot's admin UI is authed; AppShield self-registers its OIDC client.
-      OIDC_REGISTRAR_URL: ${OIDC_REGISTRAR_URL:-http://auth-registrar:9092}
+      # Login-form auth (AppShield credentials mode, the store-proven no-hash gate):
+      # the gateway serves its own login page and issues a session cookie. USER must
+      # stay a literal - $USER would substitute the deploy shell's user.
+      USER: "admin"
+      PASSWORD: $APP_DEFAULT_PASSWORD
       BACKEND_HOST: "fullymodulardiscordbotapp"
       BACKEND_PORT: "8080"
       LISTEN_PORT: "80"
       ALLOWED_EXTENSIONS: "js,jsx,css,png,ico,svg,jpg,jpeg,gif,woff,woff2,ttf,eot"
       ALLOWED_PATHS: "/guild,/auth"  # Discord OAuth + Guild member Web-UI stay public (their own auth)
       TZ: $TZ
+    volumes:
+      # Persists AppShield sessions across restarts/updates (SESSIONS_FILE default
+      # /data/sessions.json); without it every recreate logs the admin out.
+      - type: bind
+        source: $DATA_ROOT/AppData/fullymodulardiscordbot/appshield
+        target: /data
     labels:
       caddy_0: fullymodulardiscordbot-${APP_DOMAIN}
       caddy_0.import: gateway_tls
