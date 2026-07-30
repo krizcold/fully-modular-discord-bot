@@ -12,8 +12,10 @@ import {
   GUILD_TOTALS_REFRESH_MS,
   HEARTBEAT_MS,
   PROTOCOL_VERSION,
+  RECOVERY_HOLDDOWN_MS,
+  REGISTER_GRACE_MS,
 } from './constants';
-import { LeaseGrantPayload, MSG, NodeCapabilities, NodeRole, RegisterPayload, RegisterResult } from './protocol';
+import { LeaseGrantPayload, LeaseRevokePayload, MSG, NodeCapabilities, NodeRole, RegisterPayload, RegisterResult } from './protocol';
 import { getAppVersion, getNodeId, getNodeName, isStandalone, resolveNodeRole } from './nodeIdentity';
 import { FileControlStore } from './fileControlStore';
 import { Registry, RegistryNode } from './registry';
@@ -24,15 +26,14 @@ import {
   assignIdentifyDelays,
   fetchAllGuilds,
   fetchGatewayInfo,
+  getShardCountOverride,
   guildIdToShardId,
   resolvePinnedShardId,
   resolveShardCapacity,
   resolveShardCount,
 } from './placement';
-import { _setFleetStateSources } from './state';
-
-/** Fleet-mode masters wait this long at boot for surviving workers to redial before the first placement (Part 5 flow 1). */
-const REGISTER_GRACE_MS = 10000;
+import { evaluateRecovery } from './recovery';
+import { _setFleetStateSources, FleetRecoverySource } from './state';
 
 export interface FleetContext {
   role: NodeRole;
@@ -86,6 +87,19 @@ interface CommonInit {
   runtime: LeaseRuntime;
 }
 
+function isValidHeldLeases(held: NonNullable<RegisterPayload['heldLeases']>): boolean {
+  if (typeof held !== 'object') return false;
+  if (!Number.isInteger(held.term) || held.term < 0) return false;
+  if (!Number.isInteger(held.epoch) || held.epoch < 0) return false;
+  if (!Number.isInteger(held.shardCount) || held.shardCount < 0) return false;
+  if (!Array.isArray(held.leases)) return false;
+  for (const lease of held.leases) {
+    if (typeof lease?.leaseId !== 'string' || lease.leaseId.length === 0) return false;
+    if (!Number.isInteger(lease?.shardId) || lease.shardId < 0) return false;
+  }
+  return true;
+}
+
 async function initMaster(init: CommonInit & { standalone: boolean }): Promise<FleetContext> {
   const { standalone, nodeId, nodeName, appVersion, capabilities, runtime } = init;
   const ingest = getIngestService();
@@ -99,12 +113,59 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   const maxConcurrency = gateway?.maxConcurrency ?? 1;
   const recommendedShards = gateway?.recommendedShards ?? null;
   const shardCount = resolveShardCount(gateway?.recommendedShards ?? 1);
-  const pinnedShardId = resolvePinnedShardId(shardCount);
 
   const registry = new Registry();
   registry.term = term;
   registry.shardCount = shardCount;
   registry.upsertNode({ nodeId, nodeName, appVersion, capabilities, isSelf: true, send: null });
+
+  // Restart recovery (fleet mode only; evaluateRecovery never reads the store
+  // standalone): adopt the persisted plan so owned shards never move across a
+  // master restart. Self leases are re-granted immediately (the old process's
+  // sessions died with it); remote leases seed the shardTable at their old
+  // (term, epoch) and read as frozen until their node re-registers.
+  const rec = await evaluateRecovery(store, {
+    newTerm: term,
+    resolvedShardCount: shardCount,
+    liveRecommendation: recommendedShards,
+    override: getShardCountOverride(),
+    standalone,
+  });
+  if (rec.plan) {
+    const plan = rec.plan;
+    registry.shardCount = plan.shardCount;
+    registry.epoch = plan.epoch;
+    for (const assignment of plan.assignments) {
+      for (const lease of assignment.leases) {
+        registry.shardTable.set(lease.shardId, {
+          shardId: lease.shardId,
+          nodeId: assignment.nodeId,
+          leaseId: lease.leaseId,
+          term: plan.term,
+          epoch: plan.epoch,
+        });
+      }
+    }
+    for (const persistedNode of rec.nodes ?? []) {
+      if (persistedNode.nodeId === nodeId) continue;
+      registry.restoreNode(persistedNode);
+    }
+    const selfShardIds = registry.shardIdsOf(nodeId);
+    if (selfShardIds.length > 0) {
+      registry.epoch += 1;
+      await grantShardsTo(registry.nodes.get(nodeId)!, selfShardIds, registry.epoch);
+    }
+    console.log(`[Fleet] Recovery: adopted plan (term ${term}, epoch ${registry.epoch}, ${registry.shardCount} shards, hold-down ${Math.round(RECOVERY_HOLDDOWN_MS / 1000)}s)`);
+  }
+
+  const pinnedShardId = resolvePinnedShardId(registry.shardCount);
+
+  const recoverySource: FleetRecoverySource | null = standalone ? null : {
+    adopted: rec.plan !== undefined,
+    holdDownUntil: 0,
+    reshardAdvised: rec.reshardAdvised ?? null,
+    reshardApplied: rec.reshardApplied ? { from: rec.reshardApplied.from, to: rec.reshardApplied.to } : null,
+  };
 
   let server: ControlServer | null = null;
   let graceOver = standalone;
@@ -172,11 +233,34 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     }
   }
 
-  // Free-shard distribution: every connected node is topped up to its capacity
-  // from the FREE pool, master first (it also keeps the pinned shard). Owned
-  // and frozen shards are never touched here, so a joining worker can only ever
-  // take shards nobody serves.
+  // Phase R: re-grant each connected node's full CURRENT set under the current
+  // term. No shard changes hands, so it is conflict-free and exempt from the
+  // hold-down; workers see the same shard set + shardCount and adopt without a
+  // session bounce.
+  async function reGrantOnly(): Promise<void> {
+    const needing = [...registry.nodes.values()].filter(node => {
+      if (!node.connected) return false;
+      if (node.needsGrant && registry.shardIdsOf(node.nodeId).length > 0) return true;
+      for (const lease of registry.shardTable.values()) {
+        if (lease.nodeId === node.nodeId && lease.term < registry.term) return true;
+      }
+      return false;
+    });
+    if (needing.length === 0) return;
+    registry.epoch += 1;
+    const epoch = registry.epoch;
+    for (const node of needing) {
+      await grantShardsTo(node, registry.shardIdsOf(node.nodeId), epoch);
+    }
+    await persist();
+  }
+
+  // Free-shard distribution: Phase R re-grants first, then (Phase F) every
+  // connected node is topped up to its capacity from the FREE pool, master
+  // first (it also keeps the pinned shard). Owned and frozen shards are never
+  // touched here, so a joining worker can only ever take shards nobody serves.
   async function distributeOnce(): Promise<void> {
+    await reGrantOnly();
     const free = registry.freeShards();
     if (free.length === 0) return;
 
@@ -241,7 +325,14 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   }
 
   async function distribute(): Promise<void> {
-    if (!graceOver) return;
+    if (!graceOver) {
+      try {
+        await reGrantOnly();
+      } catch (error) {
+        console.error('[Fleet] Distribute failed:', error);
+      }
+      return;
+    }
     if (distributeRunning) {
       distributeQueued = true;
       return;
@@ -259,7 +350,47 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     }
   }
 
+  // Revoke-on-register (term fencing alone cannot stop a node re-registered
+  // at the current term from serving its cached lease): a shardCount mismatch
+  // kills the ENTIRE held set (stale-count shards are invisible to both the
+  // foreign check and adoption, incl. out-of-range ids after a reshard down);
+  // otherwise only leases the table records under ANOTHER owner die. A table
+  // entry with the same owner but a drifted leaseId (adoption invented a
+  // fresh id) is NOT foreign: Phase R re-issues the table's leaseIds via the
+  // same-shape adopt. Unrecorded held shards are left for heartbeat-claims
+  // adoption, which re-homes them to their live holder without a bounce.
+  async function reconcileHeldLeases(heldNodeId: string): Promise<void> {
+    const node = registry.nodes.get(heldNodeId);
+    const held = node?.heldLeases;
+    if (!node || !held || held.leases.length === 0) return;
+    let leaseIds: string[] = [];
+    let reason = 'not-owner-after-reconcile';
+    if (held.shardCount !== registry.shardCount) {
+      leaseIds = held.leases.map(l => l.leaseId);
+      reason = 'shard-count-mismatch';
+    } else {
+      for (const l of held.leases) {
+        const lease = registry.shardTable.get(l.shardId);
+        if (lease === undefined) continue;
+        if (lease.nodeId !== heldNodeId) leaseIds.push(l.leaseId);
+        else if (lease.leaseId !== l.leaseId) node.needsGrant = true;
+      }
+    }
+    if (leaseIds.length === 0) return;
+    const revoke: LeaseRevokePayload = { term: registry.term, leaseIds, reason };
+    try {
+      await server!.request(heldNodeId, MSG.LEASE_REVOKE, revoke);
+      console.log(`[Fleet] Revoked ${leaseIds.length} stale lease(s) from ${node.nodeName} (${reason})`);
+    } catch (error) {
+      console.warn(`[Fleet] Reconcile revoke to ${node.nodeName} failed:`, error instanceof Error ? error.message : error);
+    }
+  }
+
   masterAssign = async (shardId: number, targetNodeId: string): Promise<AssignResult> => {
+    const holdRemainingMs = recoverySource ? recoverySource.holdDownUntil - Date.now() : 0;
+    if (holdRemainingMs > 0) {
+      return { success: false, error: `recovery hold-down active, ${Math.ceil(holdRemainingMs / 1000)}s remaining` };
+    }
     if (!Number.isInteger(shardId) || shardId < 0 || shardId >= registry.shardCount) {
       return { success: false, error: `shard ${shardId} does not exist (valid 0..${registry.shardCount - 1})` };
     }
@@ -331,7 +462,10 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
           // A worker cloned from the master's data volume would collide in the registry.
           return { accepted: false, term: registry.term, reason: 'node-id-collision-with-master' };
         }
-        registry.upsertNode({
+        if (payload.heldLeases != null && !isValidHeldLeases(payload.heldLeases)) {
+          return { accepted: false, term: registry.term, reason: 'bad-held-leases' };
+        }
+        const node = registry.upsertNode({
           nodeId: payload.nodeId,
           nodeName: payload.nodeName || payload.nodeId,
           appVersion: payload.appVersion,
@@ -339,10 +473,20 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
           isSelf: false,
           send,
         });
+        node.heldLeases = payload.heldLeases ?? null;
         console.log(`[Fleet] Node registered: ${payload.nodeName} (${payload.nodeId})`);
         return { accepted: true, term: registry.term };
       },
-      afterRegister: () => void distribute(),
+      afterRegister: registeredNodeId => {
+        void (async () => {
+          try {
+            await reconcileHeldLeases(registeredNodeId);
+            await distribute();
+          } catch (error) {
+            console.error('[Fleet] Post-register reconcile failed:', error);
+          }
+        })();
+      },
       onHeartbeat: (heartbeatNodeId, hb) => registry.recordHeartbeat(heartbeatNodeId, hb),
       onGuildNotice: (_noticeNodeId, notice) => registry.applyGuildNotice(notice),
       onDisconnect: disconnectedNodeId => {
@@ -354,11 +498,13 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       },
     });
     await server.start(port, secret);
-    console.log(`[Fleet] Role: master node=${nodeName} (${nodeId.slice(0, 8)}) term=${term} shardCount=${shardCount} capacity=${capabilities.shardCapacity} controlPort=${port}${pinnedShardId !== null ? ` pinnedShard=${pinnedShardId}` : ''}`);
+    const graceMs = rec.recovered ? RECOVERY_HOLDDOWN_MS : REGISTER_GRACE_MS;
+    if (rec.recovered && recoverySource) recoverySource.holdDownUntil = Date.now() + graceMs;
+    console.log(`[Fleet] Role: master node=${nodeName} (${nodeId.slice(0, 8)}) term=${term} shardCount=${registry.shardCount} capacity=${capabilities.shardCapacity} controlPort=${port}${pinnedShardId !== null ? ` pinnedShard=${pinnedShardId}` : ''}`);
     setTimeout(() => {
       graceOver = true;
       void distribute();
-    }, REGISTER_GRACE_MS).unref();
+    }, graceMs).unref();
   } else {
     console.log(`[Fleet] Role: master (standalone) node=${nodeName} (${nodeId.slice(0, 8)}) term=${term} shards=${shardCount} self-granted`);
     await distribute();
@@ -404,6 +550,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     ingest,
     registry,
     controlClient: null,
+    recovery: recoverySource,
   });
 
   return {
@@ -446,6 +593,7 @@ async function initCoWorker(init: CommonInit): Promise<FleetContext> {
         protocolVersion: PROTOCOL_VERSION,
         appVersion,
         capabilities,
+        heldLeases: runtime.getHeldSummary(),
       }),
     });
   } else {
@@ -465,6 +613,7 @@ async function initCoWorker(init: CommonInit): Promise<FleetContext> {
     ingest,
     registry: null,
     controlClient,
+    recovery: null,
   });
 
   const attachGuildNotices = (client: Client) => {

@@ -60,6 +60,19 @@ export interface FleetState {
     secretSet: boolean;
     secret?: string;
   } | null;
+  /**
+   * Restart-recovery block, fleet-mode master only (null standalone and on
+   * co-workers). holdDownRemainingMs counts down the recovery hold-down on
+   * FREE-pool distribution; reshardAdvised persists while the adopted
+   * shardCount differs from Discord's recommendation (DECISION-1);
+   * reshardApplied surfaces a FLEET_SHARD_COUNT-driven replan for one boot.
+   */
+  recovery: {
+    adopted: boolean;
+    holdDownRemainingMs: number;
+    reshardAdvised: { running: number; recommended: number } | null;
+    reshardApplied: { from: number; to: number } | null;
+  } | null;
   leases: { leaseId: string; shardId: number; identifyDelayMs: number }[];
   nodes: FleetStateNode[];
   shardTable: { shardId: number; nodeId: string | null; leaseId: string | null; term: number; epoch: number; status: string; guildCount: number }[];
@@ -67,6 +80,14 @@ export interface FleetState {
   /** Names for guilds in guildMap the connected clients cannot name (master's REST list); merged UI-side. */
   guildNames?: Record<string, string>;
   updatedAt: number;
+}
+
+export interface FleetRecoverySource {
+  adopted: boolean;
+  /** Epoch ms when the recovery hold-down ends; 0 when no hold-down is active. */
+  holdDownUntil: number;
+  reshardAdvised: { running: number; recommended: number } | null;
+  reshardApplied: { from: number; to: number } | null;
 }
 
 export interface FleetStateSources {
@@ -82,6 +103,7 @@ export interface FleetStateSources {
   ingest: IngestService;
   registry: Registry | null;
   controlClient: ControlClient | null;
+  recovery: FleetRecoverySource | null;
 }
 
 let sources: FleetStateSources | null = null;
@@ -133,6 +155,7 @@ export function getFleetState(): FleetState {
       masterKnown: false,
       masterUrl: null,
       connect: null,
+      recovery: null,
       leases: [],
       nodes: [],
       shardTable: [],
@@ -210,6 +233,14 @@ export function getFleetState(): FleetState {
       masterKnown: true,
       masterUrl: null,
       connect: buildConnect(),
+      recovery: sources.recovery
+        ? {
+            adopted: sources.recovery.adopted,
+            holdDownRemainingMs: Math.max(0, sources.recovery.holdDownUntil - Date.now()),
+            reshardAdvised: sources.recovery.reshardAdvised,
+            reshardApplied: sources.recovery.reshardApplied,
+          }
+        : null,
       leases,
       nodes,
       shardTable,
@@ -274,6 +305,7 @@ export function getFleetState(): FleetState {
     masterKnown: registered,
     masterUrl: (process.env.MASTER_URL || '').trim() || null,
     connect: null,
+    recovery: null,
     leases,
     nodes: [
       {
