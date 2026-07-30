@@ -118,6 +118,11 @@ export class ControlClient {
       const result = (await this.request(MSG.REGISTER, this.opts.buildRegister())) as RegisterResult;
       if (!result?.accepted) {
         console.error(`[Fleet] Master refused registration: ${result?.reason ?? 'unknown'}; retrying with backoff`);
+        // A refusal is definitive (unlike a transient disconnect): expire the
+        // cached lease now, or the refusal-redial loop would renew the lease
+        // clock forever (backoff caps below the TTL) and keep unrecorded
+        // sessions alive past the master's recovery hold-down.
+        await this.opts.runtime.expire(`registration refused: ${result?.reason ?? 'unknown'}`);
         this.ws?.close();
         return;
       }
