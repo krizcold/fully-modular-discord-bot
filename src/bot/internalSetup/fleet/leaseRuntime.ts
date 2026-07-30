@@ -14,6 +14,7 @@ import type {
   LeaseGrantPayload,
   LeaseInfo,
   LoadSample,
+  RegisterPayload,
   ShardStatusEntry,
 } from './protocol';
 
@@ -57,6 +58,17 @@ export class LeaseRuntime {
     return this.lastHeartbeat;
   }
 
+  /** Cached lease summary carried in the register payload so the master can reconcile; null when no lease is held. */
+  getHeldSummary(): RegisterPayload['heldLeases'] {
+    if (!this.current) return null;
+    return {
+      term: this.current.term,
+      epoch: this.current.epoch,
+      shardCount: this.current.shardCount,
+      leases: this.current.leases.map(l => ({ leaseId: l.leaseId, shardId: l.shardId })),
+    };
+  }
+
   /** Called once with the login token; starts (or arms) the gated login. */
   setToken(token: string | undefined): void {
     this.token = token;
@@ -67,6 +79,11 @@ export class LeaseRuntime {
     // Term fencing: a lower-term grant is a deposed master talking.
     if (this.current && grant.term < this.current.term) {
       return { ok: false, term: this.current.term, reason: 'stale-term' };
+    }
+    // Reconcile by highest (term, epoch): a same-term lower-epoch grant is an
+    // older placement round arriving late.
+    if (this.current && grant.term === this.current.term && grant.epoch < this.current.epoch) {
+      return { ok: false, term: this.current.term, reason: 'stale-epoch' };
     }
     const shardIds = grant.leases.map(l => l.shardId).sort((a, b) => a - b);
     const sameShape =
