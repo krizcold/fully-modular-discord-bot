@@ -459,6 +459,24 @@ function FleetView({ api, wsClient, guildNames }) {
         </div>
       )}
 
+      {fleet.recovery && fleet.recovery.holdDownRemainingMs > 0 && (
+        <div className="usage-notice">
+          {`Recovery hold-down: free-shard distribution and manual assignment resume in ${Math.ceil(fleet.recovery.holdDownRemainingMs / 1000)}s. Re-grants to returning instances are unaffected.`}
+        </div>
+      )}
+
+      {fleet.recovery && fleet.recovery.reshardAdvised && (
+        <div className="usage-notice">
+          {`Discord now recommends ${fleet.recovery.reshardAdvised.recommended} shard${fleet.recovery.reshardAdvised.recommended === 1 ? '' : 's'}; fleet runs ${fleet.recovery.reshardAdvised.running}; resharding requires setting FLEET_SHARD_COUNT.`}
+        </div>
+      )}
+
+      {fleet.recovery && fleet.recovery.reshardApplied && (
+        <div className="usage-notice">
+          {`Reshard applied: ${fleet.recovery.reshardApplied.from} -> ${fleet.recovery.reshardApplied.to} shards (FLEET_SHARD_COUNT override); the previous shard plan was discarded and instances rebuild their sessions.`}
+        </div>
+      )}
+
       <FleetCapacityCard cap={capacitySummary} />
 
       {fleet.role === 'master' && fleet.connect ? <FleetConnectCard connect={fleet.connect} /> : null}
