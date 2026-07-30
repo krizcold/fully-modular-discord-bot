@@ -1,6 +1,7 @@
 // Master-side fleet model: node table, shard-lease table and guild -> shard
 // map, fed by registrations, heartbeats and guild notices.
 
+import { randomUUID } from 'crypto';
 import { performance } from 'perf_hooks';
 import { HEARTBEAT_MS, LEASE_TTL_MS } from './constants';
 import type {
@@ -9,6 +10,7 @@ import type {
   LeaseInfo,
   LoadSample,
   NodeCapabilities,
+  RegisterPayload,
   ShardStatusEntry,
 } from './protocol';
 import { guildIdToShardId } from './placement';
@@ -24,6 +26,8 @@ export interface RegistryNode {
   connected: boolean;
   /** Set at (re)registration, cleared once a grant is acked; a rejoining node always gets a fresh grant. */
   needsGrant: boolean;
+  /** Worker's cached lease summary from its last register, reconciled right after acceptance. */
+  heldLeases: RegisterPayload['heldLeases'];
   lastHeartbeatAt: number | null;
   lastSeq: number;
   shards: ShardStatusEntry[];
@@ -89,12 +93,40 @@ export class Registry {
       isSelf: input.isSelf,
       connected: true,
       needsGrant: true,
+      heldLeases: null,
       lastHeartbeatAt: existing?.lastHeartbeatAt ?? null,
       lastSeq: existing?.lastSeq ?? 0,
       shards: existing?.shards ?? [],
       guildCount: existing?.guildCount ?? 0,
       load: existing?.load ?? null,
       send: input.send,
+    };
+    this.nodes.set(input.nodeId, node);
+    return node;
+  }
+
+  /** Seed a node from the persisted registry at recovery boot: known but not connected, awaiting its re-register. */
+  restoreNode(input: {
+    nodeId: string;
+    nodeName: string;
+    appVersion: string;
+    capabilities: NodeCapabilities;
+  }): RegistryNode {
+    const node: RegistryNode = {
+      nodeId: input.nodeId,
+      nodeName: input.nodeName,
+      appVersion: input.appVersion,
+      capabilities: input.capabilities,
+      isSelf: false,
+      connected: false,
+      needsGrant: true,
+      heldLeases: null,
+      lastHeartbeatAt: null,
+      lastSeq: 0,
+      shards: [],
+      guildCount: 0,
+      load: null,
+      send: null,
     };
     this.nodes.set(input.nodeId, node);
     return node;
@@ -118,6 +150,34 @@ export class Registry {
     node.guildCount = Array.isArray(hb.guilds) ? hb.guilds.length : 0;
     node.load = hb.load ?? null;
     this.replaceNodeGuilds(nodeId, Array.isArray(hb.guilds) ? hb.guilds : []);
+    this.adoptHeartbeatClaims(nodeId, hb);
+  }
+
+  /**
+   * Adopt heartbeat truth for shards a node reports live that are recorded
+   * nowhere (the grant-then-crash window): the claim becomes that node's
+   * lease and Phase R re-issues its full set under the current term.
+   */
+  adoptHeartbeatClaims(nodeId: string, hb: HeartbeatPayload): void {
+    const node = this.nodes.get(nodeId);
+    if (!node) return;
+    let adopted = false;
+    for (const entry of Array.isArray(hb.shards) ? hb.shards : []) {
+      if (!Number.isInteger(entry?.shardId) || entry.shardId < 0 || entry.shardId >= this.shardCount) continue;
+      if (entry.status === 'NotStarted') continue;
+      if (this.shardTable.has(entry.shardId)) continue;
+      if (this.pendingConfirmation.has(entry.shardId)) continue;
+      this.shardTable.set(entry.shardId, {
+        shardId: entry.shardId,
+        nodeId,
+        leaseId: randomUUID(),
+        term: hb.term,
+        epoch: this.epoch,
+      });
+      adopted = true;
+      console.log(`[Fleet] Adopted heartbeat-claimed shard ${entry.shardId} from node ${node.nodeName}`);
+    }
+    if (adopted) node.needsGrant = true;
   }
 
   applyGuildNotice(notice: GuildNoticePayload): void {
