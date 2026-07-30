@@ -18,6 +18,20 @@ export const LEASE_RENEW_MS = 15000;
  */
 export const LEASE_TTL_MS = 45000;
 
+/** Fleet-mode masters wait this long at boot for surviving workers to redial before the first placement (Part 5 flow 1). */
+export const REGISTER_GRACE_MS = 10000;
+
+/**
+ * Recovery-boot hold-down on FREE-pool distribution. Covers the worst case
+ * for a pre-restart holder that never re-registers: the lease TTL, plus the
+ * worker's checkTtl poll granularity (HEARTBEAT_MS), plus slack for the
+ * async session destroy. Holders that DO reach the master either re-register
+ * and heartbeat within the window (claims adopted) or are refused and expire
+ * their cached lease immediately, so waiting this long from server start
+ * rules out double-grants.
+ */
+export const RECOVERY_HOLDDOWN_MS = LEASE_TTL_MS + HEARTBEAT_MS + 5000;
+
 /** Per-bucket identify spacing the master serializes grants with. */
 export const IDENTIFY_SPACING_MS = 5500;
 

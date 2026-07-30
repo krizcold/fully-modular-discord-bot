@@ -32,6 +32,9 @@ export interface RegisterPayload {
   protocolVersion: number;
   appVersion: string;
   capabilities: NodeCapabilities;
+  /** Worker's cached lease summary, reconciled by the master on every (re)register; null when no lease is held. */
+  heldLeases?: { term: number; epoch: number; shardCount: number;
+                 leases: { leaseId: string; shardId: number }[] } | null;
 }
 
 export interface RegisterResult {
