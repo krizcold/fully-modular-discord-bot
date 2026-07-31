@@ -108,6 +108,12 @@ export function getShardCountOverride(): number | null {
   return Number.isInteger(override) && override > 0 ? override : null;
 }
 
+/** True when FLEET_CONFIRM_RESHARD is 1/true; an override-driven shardCount change only applies when confirmed. */
+export function isReshardConfirmed(): boolean {
+  const value = (process.env.FLEET_CONFIRM_RESHARD || '').trim().toLowerCase();
+  return value === '1' || value === 'true';
+}
+
 /** Total shards: FLEET_SHARD_COUNT override, else Discord's /gateway/bot recommendation. */
 export function resolveShardCount(recommended: number): number {
   return getShardCountOverride() ?? Math.max(1, recommended);
