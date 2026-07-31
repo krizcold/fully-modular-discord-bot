@@ -65,13 +65,19 @@ export interface FleetState {
    * co-workers). holdDownRemainingMs counts down the recovery hold-down on
    * FREE-pool distribution; reshardAdvised persists while the adopted
    * shardCount differs from Discord's recommendation (DECISION-1);
-   * reshardApplied surfaces a FLEET_SHARD_COUNT-driven replan for one boot.
+   * reshardApplied surfaces a confirmed reshard for one boot;
+   * reshardNeedsConfirm persists while an override mismatch awaits
+   * FLEET_CONFIRM_RESHARD; reshardPaused persists while the reshard pause
+   * marker exists (no shard is assigned until resumed; its fields are null
+   * when the marker is corrupt, since the pause fails closed).
    */
   recovery: {
     adopted: boolean;
     holdDownRemainingMs: number;
     reshardAdvised: { running: number; recommended: number } | null;
     reshardApplied: { from: number; to: number } | null;
+    reshardNeedsConfirm: { from: number; to: number } | null;
+    reshardPaused: { from: number | null; to: number | null; archivedAt: number | null } | null;
   } | null;
   leases: { leaseId: string; shardId: number; identifyDelayMs: number }[];
   nodes: FleetStateNode[];
@@ -88,6 +94,9 @@ export interface FleetRecoverySource {
   holdDownUntil: number;
   reshardAdvised: { running: number; recommended: number } | null;
   reshardApplied: { from: number; to: number } | null;
+  reshardNeedsConfirm: { from: number; to: number } | null;
+  /** Mutable: fleetResumeAssignments nulls it so the pause banner drops without a restart. */
+  reshardPaused: { from: number | null; to: number | null; archivedAt: number | null } | null;
 }
 
 export interface FleetStateSources {
@@ -239,6 +248,8 @@ export function getFleetState(): FleetState {
             holdDownRemainingMs: Math.max(0, sources.recovery.holdDownUntil - Date.now()),
             reshardAdvised: sources.recovery.reshardAdvised,
             reshardApplied: sources.recovery.reshardApplied,
+            reshardNeedsConfirm: sources.recovery.reshardNeedsConfirm,
+            reshardPaused: sources.recovery.reshardPaused,
           }
         : null,
       leases,

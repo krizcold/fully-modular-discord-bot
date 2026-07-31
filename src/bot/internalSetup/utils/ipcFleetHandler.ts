@@ -4,7 +4,7 @@
 // block or crash the bot child.
 
 import { getFleetState } from '../fleet/state';
-import { fleetAssignShard } from '../fleet/bootstrap';
+import { fleetAssignShard, fleetResumeAssignments } from '../fleet/bootstrap';
 
 /** Unsolicited push, carried by the metrics 5s sample tick (no own timer). */
 export function pushFleetStatus(): void {
@@ -38,6 +38,11 @@ export function setupFleetIPCHandlers(): void {
           const shardId = Number(message.data?.shardId);
           const nodeId = String(message.data?.nodeId ?? '');
           const result = await fleetAssignShard(shardId, nodeId);
+          response = result.success ? { success: true } : { success: false, error: result.error };
+          break;
+        }
+        case 'fleet:resumeAssignments': {
+          const result = await fleetResumeAssignments();
           response = result.success ? { success: true } : { success: false, error: result.error };
           break;
         }

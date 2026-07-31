@@ -11,11 +11,12 @@ import {
   CONTROL_PORT_DEFAULT,
   GUILD_TOTALS_REFRESH_MS,
   HEARTBEAT_MS,
+  LEASE_RENEW_MS,
   PROTOCOL_VERSION,
   RECOVERY_HOLDDOWN_MS,
   REGISTER_GRACE_MS,
 } from './constants';
-import { LeaseGrantPayload, LeaseRevokePayload, MSG, NodeCapabilities, NodeRole, RegisterPayload, RegisterResult } from './protocol';
+import { HeartbeatPayload, LeaseGrantPayload, LeaseRevokePayload, MSG, NodeCapabilities, NodeRole, RegisterPayload, RegisterResult } from './protocol';
 import { getAppVersion, getNodeId, getNodeName, isStandalone, resolveNodeRole } from './nodeIdentity';
 import { FileControlStore } from './fileControlStore';
 import { Registry, RegistryNode } from './registry';
@@ -60,6 +61,14 @@ let masterAssign: ((shardId: number, nodeId: string) => Promise<AssignResult>) |
 export async function fleetAssignShard(shardId: number, nodeId: string): Promise<AssignResult> {
   if (!masterAssign) return { success: false, error: 'This node is not the fleet master' };
   return masterAssign(shardId, nodeId);
+}
+
+let masterResume: (() => Promise<AssignResult>) | null = null;
+
+/** End the reshard pause: delete the marker and let distribution proceed (Usage-tab action). Master-only. */
+export async function fleetResumeAssignments(): Promise<AssignResult> {
+  if (!masterResume) return { success: false, error: 'This node is not the fleet master' };
+  return masterResume();
 }
 
 export async function initFleet(): Promise<FleetContext> {
@@ -131,6 +140,13 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     override: getShardCountOverride(),
     standalone,
   });
+  // Reshard pause: while the marker exists NOTHING is auto-assigned - no
+  // self-claim, no Phase R/F (distribute returns immediately). Manual assign
+  // and Resume are allowed only after the hold-down window (a partitioned
+  // old-count holder inside its lease TTL never re-registers, so only time
+  // guarantees its sessions died). Cleared only by fleetResumeAssignments
+  // deleting the marker.
+  let paused = rec.reshardPaused !== undefined;
   if (rec.plan) {
     const plan = rec.plan;
     registry.shardCount = plan.shardCount;
@@ -155,7 +171,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       registry.epoch += 1;
       await grantShardsTo(registry.nodes.get(nodeId)!, selfShardIds, registry.epoch);
     }
-    console.log(`[Fleet] Recovery: adopted plan (term ${term}, epoch ${registry.epoch}, ${registry.shardCount} shards, hold-down ${Math.round(RECOVERY_HOLDDOWN_MS / 1000)}s)`);
+    console.log(`[Fleet] Recovery: adopted plan (term ${term}, epoch ${registry.epoch}, ${registry.shardCount} shards${paused ? ', reshard pause active' : `, hold-down ${Math.round(RECOVERY_HOLDDOWN_MS / 1000)}s`})`);
   }
 
   const pinnedShardId = resolvePinnedShardId(registry.shardCount);
@@ -165,10 +181,15 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     holdDownUntil: 0,
     reshardAdvised: rec.reshardAdvised ?? null,
     reshardApplied: rec.reshardApplied ? { from: rec.reshardApplied.from, to: rec.reshardApplied.to } : null,
+    reshardNeedsConfirm: rec.reshardNeedsConfirm ?? null,
+    reshardPaused: rec.reshardPaused ?? null,
   };
 
   let server: ControlServer | null = null;
-  let graceOver = standalone;
+  // graceOver gates nothing that auto-runs while paused (distribute returns
+  // immediately), so paused boots start with it set; holdDownUntil is still
+  // armed to time-fence Resume and manual assign against stale holders.
+  let graceOver = standalone || paused;
 
   let distributeRunning = false;
   let distributeQueued = false;
@@ -325,6 +346,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   }
 
   async function distribute(): Promise<void> {
+    if (paused) return;
     if (!graceOver) {
       try {
         await reGrantOnly();
@@ -377,6 +399,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       }
     }
     if (leaseIds.length === 0) return;
+    if (reason === 'shard-count-mismatch') mismatchRevokeAt.set(heldNodeId, Date.now());
     const revoke: LeaseRevokePayload = { term: registry.term, leaseIds, reason };
     try {
       await server!.request(heldNodeId, MSG.LEASE_REVOKE, revoke);
@@ -386,10 +409,34 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     }
   }
 
+  // A single register-time mismatch revoke can be lost (ack timeout) while
+  // the worker keeps serving old-count shards inside its lease TTL and its
+  // heartbeats still report them. Retry off those heartbeats, throttled,
+  // until one arrives with the current count or no lease (no shardCount).
+  const mismatchRevokeAt = new Map<string, number>();
+  function maybeRetryMismatchRevoke(hbNodeId: string, hb: HeartbeatPayload): void {
+    if (!Number.isInteger(hb.shardCount) || hb.shardCount === registry.shardCount) return;
+    const node = registry.nodes.get(hbNodeId);
+    const held = node?.heldLeases;
+    if (!node || node.isSelf || !held || held.shardCount === registry.shardCount || held.leases.length === 0) return;
+    const now = Date.now();
+    if (now - (mismatchRevokeAt.get(hbNodeId) ?? 0) < LEASE_RENEW_MS) return;
+    mismatchRevokeAt.set(hbNodeId, now);
+    const revoke: LeaseRevokePayload = { term: registry.term, leaseIds: held.leases.map(l => l.leaseId), reason: 'shard-count-mismatch' };
+    void server!.request(hbNodeId, MSG.LEASE_REVOKE, revoke)
+      .then(() => console.log(`[Fleet] Re-sent shard-count-mismatch revoke to ${node.nodeName} (${held.leases.length} lease(s))`))
+      .catch(error => console.warn(`[Fleet] Mismatch revoke retry to ${node.nodeName} failed:`, error instanceof Error ? error.message : error));
+  }
+
   masterAssign = async (shardId: number, targetNodeId: string): Promise<AssignResult> => {
     const holdRemainingMs = recoverySource ? recoverySource.holdDownUntil - Date.now() : 0;
     if (holdRemainingMs > 0) {
-      return { success: false, error: `recovery hold-down active, ${Math.ceil(holdRemainingMs / 1000)}s remaining` };
+      return {
+        success: false,
+        error: paused
+          ? `waiting for stale-holder leases to expire, ${Math.ceil(holdRemainingMs / 1000)}s remaining`
+          : `recovery hold-down active, ${Math.ceil(holdRemainingMs / 1000)}s remaining`,
+      };
     }
     if (!Number.isInteger(shardId) || shardId < 0 || shardId >= registry.shardCount) {
       return { success: false, error: `shard ${shardId} does not exist (valid 0..${registry.shardCount - 1})` };
@@ -416,6 +463,21 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     await persist();
     if (result.ok || result.pending) return { success: true };
     return { success: false, error: `grant to ${target.nodeName} was refused` };
+  };
+
+  masterResume = async (): Promise<AssignResult> => {
+    if (!paused) return { success: false, error: 'No reshard pause is active' };
+    const holdRemainingMs = recoverySource ? recoverySource.holdDownUntil - Date.now() : 0;
+    if (holdRemainingMs > 0) {
+      return { success: false, error: `waiting for stale-holder leases to expire, ${Math.ceil(holdRemainingMs / 1000)}s remaining` };
+    }
+    // Marker first: if the delete fails the pause must survive the next boot.
+    await store.clearReshardMarker();
+    paused = false;
+    if (recoverySource) recoverySource.reshardPaused = null;
+    console.log('[Fleet] Reshard pause resumed: assignments re-enabled');
+    void distribute();
+    return { success: true };
   };
 
   async function persist(): Promise<void> {
@@ -487,7 +549,10 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
           }
         })();
       },
-      onHeartbeat: (heartbeatNodeId, hb) => registry.recordHeartbeat(heartbeatNodeId, hb),
+      onHeartbeat: (heartbeatNodeId, hb) => {
+        registry.recordHeartbeat(heartbeatNodeId, hb);
+        maybeRetryMismatchRevoke(heartbeatNodeId, hb);
+      },
       onGuildNotice: (_noticeNodeId, notice) => registry.applyGuildNotice(notice),
       onDisconnect: disconnectedNodeId => {
         registry.markDisconnected(disconnectedNodeId);
@@ -498,9 +563,12 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       },
     });
     await server.start(port, secret);
-    const graceMs = rec.recovered ? RECOVERY_HOLDDOWN_MS : REGISTER_GRACE_MS;
-    if (rec.recovered && recoverySource) recoverySource.holdDownUntil = Date.now() + graceMs;
+    const graceMs = rec.recovered || paused ? RECOVERY_HOLDDOWN_MS : REGISTER_GRACE_MS;
+    if ((rec.recovered || paused) && recoverySource) recoverySource.holdDownUntil = Date.now() + graceMs;
     console.log(`[Fleet] Role: master node=${nodeName} (${nodeId.slice(0, 8)}) term=${term} shardCount=${registry.shardCount} capacity=${capabilities.shardCapacity} controlPort=${port}${pinnedShardId !== null ? ` pinnedShard=${pinnedShardId}` : ''}`);
+    if (paused && rec.reshardPaused) {
+      console.warn(`[Fleet] RESHARD PAUSE active (${rec.reshardPaused.from ?? '?'} -> ${rec.reshardPaused.to ?? '?'} shards): no shards will be assigned until resumed from the Usage tab`);
+    }
     setTimeout(() => {
       graceOver = true;
       void distribute();

@@ -589,6 +589,18 @@ export class BotManager {
   }
 
   /**
+   * End the reshard pause and let shard distribution proceed (master-only; validated in the bot child).
+   */
+  async resumeFleetAssignments(): Promise<any> {
+    try {
+      return await this.sendIPCMessage('fleet:resumeAssignments', {});
+    } catch (error) {
+      console.error('[BotManager] Error resuming fleet assignments:', error);
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  /**
    * Execute a panel
    */
   async executePanel(panelId: string, userId: string, guildId: string | null = null, channelId: string | null = null): Promise<any> {

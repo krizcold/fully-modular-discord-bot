@@ -53,5 +53,25 @@ export function createFleetRoutes(botManager: BotManager): Router {
     }
   });
 
+  /**
+   * POST /api/fleet/resume-assignments
+   * Master-only: end the reshard pause (delete the marker, resume shard
+   * distribution). Clear errors when this node is not the master or no pause
+   * is active; never a 500.
+   */
+  router.post('/resume-assignments', async (req: Request, res: Response) => {
+    try {
+      if (!botManager.isRunning()) {
+        res.json({ success: false, error: 'Bot is not running' });
+        return;
+      }
+      const result = await botManager.resumeFleetAssignments();
+      res.json(result?.success ? { success: true } : { success: false, error: result?.error ?? 'resume failed' });
+    } catch (error) {
+      console.error('[Fleet] Failed to resume assignments:', error instanceof Error ? error.message : error);
+      res.json({ success: false, error: error instanceof Error ? error.message : 'resume failed' });
+    }
+  });
+
   return router;
 }
