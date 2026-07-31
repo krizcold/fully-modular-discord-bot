@@ -147,6 +147,70 @@ function FleetAssignControl({ shardId, nodes, defaultNodeId, onAssigned }) {
   );
 }
 
+// Master-only reshard pause banner: a confirmed reshard archived the previous
+// ownership and froze all automatic assignment; the Resume button (behind a
+// confirm dialog, locked until the stale-holder hold-down elapses) deletes
+// the pause marker and lets distribution proceed. A corrupt marker still
+// pauses (fail closed) and renders unknown fields.
+function FleetReshardPauseBanner({ paused, holdMs, nodes, onResumed }) {
+  const [busy, setBusy] = React.useState(false);
+
+  const connectedNames = nodes
+    .filter((n) => n.connected !== false)
+    .map((n) => n.nodeName);
+
+  const fromLabel = paused.from != null ? paused.from : 'unknown';
+  const toLabel = paused.to != null ? paused.to : 'unknown';
+  const archiveRef = paused.from != null && paused.archivedAt != null
+    ? ` (fleet/archive/plan-${paused.from}-${paused.archivedAt}.json)`
+    : '';
+  const holdLocked = holdMs > 0;
+
+  const resume = () => {
+    if (busy || holdLocked) return;
+    if (!confirm(
+      'Resume assignments? Shards will be granted and instances begin serving under the new shard count. '
+      + 'Guilds whose data was not redistributed start fresh; their old data remains on its former holders (recoverable later).'
+    )) return;
+    setBusy(true);
+    api.post('/fleet/resume-assignments', {})
+      .then((res) => {
+        if (res && res.success === false) {
+          showToast(res.error || res.message || 'Resume failed', 'error');
+          return;
+        }
+        showToast('Assignments resumed', 'success');
+        if (onResumed) onResumed();
+      })
+      .catch((err) => showToast(err.message || 'Resume failed', 'error'))
+      .finally(() => setBusy(false));
+  };
+
+  return (
+    <div className="usage-notice">
+      <div>
+        {`Reshard pause: ${fromLabel} -> ${toLabel} shards. The previous shard plan and ownership records were archived${archiveRef}. NO shards will be assigned until assignments are resumed.`}
+      </div>
+      <div style={{ marginTop: '4px' }}>
+        Manual assignment stays available during the pause; a manually assigned shard starts serving with whatever data its node holds locally.
+      </div>
+      {holdLocked ? (
+        <div style={{ marginTop: '4px' }}>
+          {`Resume and manual assignment unlock in ${Math.ceil(holdMs / 1000)}s (waiting for stale-holder leases to expire).`}
+        </div>
+      ) : null}
+      <div style={{ marginTop: '4px', color: '#bbb' }}>
+        {connectedNames.length > 0
+          ? `Connected instances: ${connectedNames.join(', ')}`
+          : 'No instances connected yet.'}
+      </div>
+      <button onClick={resume} disabled={busy || holdLocked} style={{ marginTop: '6px', fontSize: '0.72rem', padding: '2px 8px' }}>
+        {busy ? 'Resuming...' : 'Resume assignments'}
+      </button>
+    </div>
+  );
+}
+
 // Master-only worker-onboarding card. Renders a copy-paste env block an
 // operator drops into a new bot instance's Fleet config to add it as a worker.
 function FleetConnectCard({ connect }) {
@@ -459,7 +523,7 @@ function FleetView({ api, wsClient, guildNames }) {
         </div>
       )}
 
-      {fleet.recovery && fleet.recovery.holdDownRemainingMs > 0 && (
+      {fleet.recovery && fleet.recovery.holdDownRemainingMs > 0 && !fleet.recovery.reshardPaused && (
         <div className="usage-notice">
           {`Recovery hold-down: free-shard distribution and manual assignment resume in ${Math.ceil(fleet.recovery.holdDownRemainingMs / 1000)}s. Re-grants to returning instances are unaffected.`}
         </div>
@@ -473,8 +537,23 @@ function FleetView({ api, wsClient, guildNames }) {
 
       {fleet.recovery && fleet.recovery.reshardApplied && (
         <div className="usage-notice">
-          {`Reshard applied: ${fleet.recovery.reshardApplied.from} -> ${fleet.recovery.reshardApplied.to} shards (FLEET_SHARD_COUNT override); the previous shard plan was discarded and instances rebuild their sessions.`}
+          {`Reshard applied: ${fleet.recovery.reshardApplied.from} -> ${fleet.recovery.reshardApplied.to} shards (FLEET_SHARD_COUNT override); the previous shard plan and ownership records were archived.`}
         </div>
+      )}
+
+      {fleet.recovery && fleet.recovery.reshardNeedsConfirm && (
+        <div className="usage-notice">
+          {`Shard count change requested (${fleet.recovery.reshardNeedsConfirm.from} -> ${fleet.recovery.reshardNeedsConfirm.to}) but not confirmed; the fleet keeps running ${fleet.recovery.reshardNeedsConfirm.from} shard${fleet.recovery.reshardNeedsConfirm.from === 1 ? '' : 's'}. Set FLEET_CONFIRM_RESHARD=1 and restart the master to apply it.`}
+        </div>
+      )}
+
+      {fleet.recovery && fleet.recovery.reshardPaused && (
+        <FleetReshardPauseBanner
+          paused={fleet.recovery.reshardPaused}
+          holdMs={fleet.recovery.holdDownRemainingMs}
+          nodes={nodes}
+          onResumed={loadFleet}
+        />
       )}
 
       <FleetCapacityCard cap={capacitySummary} />
