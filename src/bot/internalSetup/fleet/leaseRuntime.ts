@@ -206,6 +206,7 @@ export class LeaseRuntime {
     const hb: HeartbeatPayload = {
       term,
       seq: ++this.seq,
+      shardCount: this.current?.shardCount,
       shards,
       guilds: client ? [...client.guilds.cache.keys()] : [],
       metrics,

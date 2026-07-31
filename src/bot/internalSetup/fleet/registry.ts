@@ -159,6 +159,11 @@ export class Registry {
    * lease and Phase R re-issues its full set under the current term.
    */
   adoptHeartbeatClaims(nodeId: string, hb: HeartbeatPayload): void {
+    // Adoption fence (network input): only claims made under the CURRENT
+    // shardCount are meaningful shard ids. A mid-reshard straggler still
+    // serving old-count shards for a few heartbeats (revoke completes async)
+    // must never populate the new-count table.
+    if (!Number.isInteger(hb.shardCount) || hb.shardCount !== this.shardCount) return;
     const node = this.nodes.get(nodeId);
     if (!node) return;
     let adopted = false;

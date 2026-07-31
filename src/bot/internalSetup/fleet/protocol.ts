@@ -83,6 +83,8 @@ export interface LoadSample {
 export interface HeartbeatPayload {
   term: number;
   seq: number;
+  /** shardCount of the sender's current lease; absent when no lease is held. Adoption requires it to match the registry's. */
+  shardCount?: number;
   shards: ShardStatusEntry[];
   guilds: string[];
   metrics: { totals: any; topKGuilds: any[] };
