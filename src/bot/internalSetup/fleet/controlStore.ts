@@ -32,6 +32,23 @@ export interface PersistedNode {
   lastSeenAt: number;
 }
 
+/** Outgoing plan + registry snapshot written on a confirmed reshard; ownership records are archived, never discarded. */
+export interface ReshardArchive {
+  plan: PersistedPlan;
+  registry: PersistedNode[];
+  archivedAt: number;
+  from: number;
+  to: number;
+}
+
+/** Reshard pause marker (reshard-pending.json): while it exists, ANY boot enters the pause regardless of env. */
+export interface ReshardMarker {
+  from: number;
+  to: number;
+  at: number;
+  archiveFile: string;
+}
+
 export interface ControlStore {
   /** CAS-acquire a new master term: strictly greater than any previously stored term. */
   acquireTerm(nodeId: string): Promise<number>;
@@ -40,4 +57,10 @@ export interface ControlStore {
   loadPlan(): Promise<PersistedPlan | null>;
   saveRegistry(nodes: PersistedNode[]): Promise<void>;
   loadRegistry(): Promise<PersistedNode[]>;
+  /** Archive the outgoing plan + registry on a confirmed reshard; returns the archive file reference. */
+  archivePlan(archive: ReshardArchive): Promise<string>;
+  /** Fail-closed: null ONLY when the marker file does not exist; any other read/parse failure returns 'corrupt' (still a pause). */
+  loadReshardMarker(): Promise<ReshardMarker | 'corrupt' | null>;
+  saveReshardMarker(marker: ReshardMarker): Promise<void>;
+  clearReshardMarker(): Promise<void>;
 }

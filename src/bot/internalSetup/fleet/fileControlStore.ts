@@ -5,7 +5,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { dataPath } from '../../../utils/dataRoot';
 import { FLEET_DIR } from './constants';
-import type { ControlStore, PersistedNode, PersistedPlan, PersistedTerm } from './controlStore';
+import type { ControlStore, PersistedNode, PersistedPlan, PersistedTerm, ReshardArchive, ReshardMarker } from './controlStore';
 
 export function atomicWriteFileSync(file: string, contents: string): void {
   fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -72,5 +72,38 @@ export class FileControlStore implements ControlStore {
   async loadRegistry(): Promise<PersistedNode[]> {
     const parsed = readJson<{ nodes?: PersistedNode[] }>(this.file('registry.json'));
     return Array.isArray(parsed?.nodes) ? parsed!.nodes! : [];
+  }
+
+  async archivePlan(archive: ReshardArchive): Promise<string> {
+    const file = dataPath('global', FLEET_DIR, 'archive', `plan-${archive.from}-${archive.archivedAt}.json`);
+    atomicWriteFileSync(file, JSON.stringify(archive, null, 2));
+    return file;
+  }
+
+  async loadReshardMarker(): Promise<ReshardMarker | 'corrupt' | null> {
+    let raw: string;
+    try {
+      raw = fs.readFileSync(this.file('reshard-pending.json'), 'utf-8');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      return 'corrupt';
+    }
+    try {
+      return JSON.parse(raw) as ReshardMarker;
+    } catch {
+      return 'corrupt';
+    }
+  }
+
+  async saveReshardMarker(marker: ReshardMarker): Promise<void> {
+    atomicWriteFileSync(this.file('reshard-pending.json'), JSON.stringify(marker, null, 2));
+  }
+
+  async clearReshardMarker(): Promise<void> {
+    try {
+      fs.unlinkSync(this.file('reshard-pending.json'));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
   }
 }
