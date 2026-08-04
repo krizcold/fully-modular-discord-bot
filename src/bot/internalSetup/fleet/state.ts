@@ -2,12 +2,14 @@
 // fork IPC (a follow-up ipcFleetHandler answers 'fleet:state' with it).
 
 import { performance } from 'perf_hooks';
-import { CONTROL_PORT_DEFAULT, PROTOCOL_VERSION } from './constants';
+import { CONTROL_PORT_DEFAULT, LEASE_TTL_MS, PROTOCOL_VERSION } from './constants';
 import { getShardSource, isPinEnabled, resolveShardCapacity } from './placement';
-import type { NodeRole } from './protocol';
+import type { BudgetInfo, NodeRole } from './protocol';
 import type { Registry } from './registry';
 import type { LeaseRuntime } from './leaseRuntime';
 import type { ControlClient } from './controlClient';
+import type { HealthMonitor, LossEvent } from './healthMonitor';
+import type { IdentifyLedger } from './identifyLedger';
 import type { IngestService } from '../ingest/ingestService';
 
 export interface FleetStateNode {
@@ -25,6 +27,61 @@ export interface FleetStateNode {
   guildCount: number;
   load: { cpuPct: number; rssMb: number; loopLagMs: number } | null;
   lastHeartbeatAgoMs: number | null;
+  /** Ms since the health monitor confirmed the node down; null while up. */
+  downSinceMs: number | null;
+  draining: boolean;
+  /** Active crash-loop identify backoff, from the master's ledger. */
+  backoff: { crashCount: number; nextPermitInMs: number } | null;
+  /** Last fully-applied sync revision from the node's heartbeats (master view); null when unreported. */
+  syncAppliedRevision: number | null;
+}
+
+export interface FleetRefusedRegistration {
+  nodeName: string;
+  reason: string;
+  at: number;
+}
+
+export interface MigrationLegView {
+  legId: string;
+  shardId: number;
+  from: string;
+  to: string;
+  guildsDone: number;
+  guildsTotal: number;
+  bytesSent: number;
+  round: number;
+  deltaFiles: number;
+  legState?: string;
+}
+
+export interface MigrationActiveView {
+  id: string;
+  kind: string;
+  state: string;
+  currentLegIndex?: number;
+  legs: MigrationLegView[];
+  frozenWriteRejections: number;
+  paused?: boolean;
+  error?: string;
+}
+
+export interface MigrationView {
+  active: MigrationActiveView | null;
+  history: { id: string; kind: string; state: string; error?: string; updatedAt: number }[];
+}
+
+export interface PinViolationLeg {
+  shardId: number;
+  fromNodeId: string;
+  toNodeId: string;
+}
+
+export interface PinViolationView {
+  shardId: number;
+  holderNodeId: string;
+  proposedLegs: PinViolationLeg[] | null;
+  reason?: string;
 }
 
 export interface FleetState {
@@ -79,10 +136,37 @@ export interface FleetState {
     reshardNeedsConfirm: { from: number; to: number } | null;
     reshardPaused: { from: number | null; to: number | null; archivedAt: number | null } | null;
   } | null;
+  /**
+   * Sync status: co-worker from the SyncEngine, master revision from the
+   * SyncAuthority; status 'n/a' standalone and on fleet masters (a master is
+   * always its own source of truth).
+   */
+  sync: {
+    revision?: number;
+    appliedRevision?: number;
+    status: 'waiting-master' | 'syncing' | 'in-sync' | 'degraded' | 'n/a';
+    lastError?: string;
+  };
+  /** Identify budget: master from the ledger, worker from its last register/renewed copy, standalone null (card hidden). */
+  budget: BudgetInfo | null;
+  /** Node-loss event ring (down transitions + Declare Lost); master-only content. */
+  lossLog: LossEvent[];
+  /** Register refusals ring (VersionGate etc.); master-only content. */
+  refusedRegistrations: FleetRefusedRegistration[];
+  /** Co-worker only: lease still held while the master is unreachable. */
+  servingOnCachedLease?: boolean;
+  /** Co-worker only: ms until the cached lease expires without master contact; null when not on a cached lease. */
+  cachedLeaseTtlRemainingMs?: number | null;
+  /** Co-worker only: operator drain received; cleared on the next re-register. */
+  draining?: boolean;
   leases: { leaseId: string; shardId: number; identifyDelayMs: number }[];
   nodes: FleetStateNode[];
   shardTable: { shardId: number; nodeId: string | null; leaseId: string | null; term: number; epoch: number; status: string; guildCount: number }[];
   guildMap: Record<string, number>;
+  /** Active/recent migration status (master-only content); null when the subsystem is inert (standalone) or idle. */
+  migration: MigrationView | null;
+  /** Pin-restore proposal when the pinned shard sits off the master; null otherwise (master-only, never auto-executed). */
+  pinViolation: PinViolationView | null;
   /** Names for guilds in guildMap the connected clients cannot name (master's REST list); merged UI-side. */
   guildNames?: Record<string, string>;
   updatedAt: number;
@@ -113,6 +197,15 @@ export interface FleetStateSources {
   registry: Registry | null;
   controlClient: ControlClient | null;
   recovery: FleetRecoverySource | null;
+  ledger: IdentifyLedger | null;
+  healthMonitor: HealthMonitor | null;
+  refusedRegistrations: FleetRefusedRegistration[] | null;
+  /** Sync block supplier: SyncAuthority-backed on a fleet master, SyncEngine-backed on a co-worker, null standalone. */
+  sync: (() => FleetState['sync']) | null;
+  /** Migration view supplier (fleet master only); null standalone and on co-workers. */
+  migration: (() => MigrationView | null) | null;
+  /** Pin-violation supplier (fleet master only); null otherwise. */
+  pinViolation: (() => PinViolationView | null) | null;
 }
 
 let sources: FleetStateSources | null = null;
@@ -165,15 +258,21 @@ export function getFleetState(): FleetState {
       masterUrl: null,
       connect: null,
       recovery: null,
+      sync: { status: 'n/a' },
+      budget: null,
+      lossLog: [],
+      refusedRegistrations: [],
       leases: [],
       nodes: [],
       shardTable: [],
       guildMap: {},
+      migration: null,
+      pinViolation: null,
       updatedAt: Date.now(),
     };
   }
 
-  const { role, standalone, nodeId, nodeName, appVersion, pinnedShardId, capacity, recommendedShards, runtime, ingest, registry, controlClient } = sources;
+  const { role, standalone, nodeId, nodeName, appVersion, pinnedShardId, capacity, recommendedShards, runtime, ingest, registry, controlClient, ledger, healthMonitor, refusedRegistrations } = sources;
   const lease = runtime.getCurrent();
   const leases = lease ? lease.leases.map(l => ({ ...l })) : [];
 
@@ -197,6 +296,10 @@ export function getFleetState(): FleetState {
       guildCount: node.guildCount,
       load: node.load,
       lastHeartbeatAgoMs: node.lastHeartbeatAt === null ? null : Math.round(performance.now() - node.lastHeartbeatAt),
+      downSinceMs: node.downSince === null ? null : Math.round(performance.now() - node.downSince),
+      draining: node.draining,
+      backoff: ledger?.getNodeBackoff(node.nodeId) ?? null,
+      syncAppliedRevision: node.syncAppliedRevision,
     }));
     // Per-shard guild counts: prefer the REST-derived totals (cover unassigned
     // shards), fall back to the connection-derived guildMap before the first
@@ -212,7 +315,11 @@ export function getFleetState(): FleetState {
       const guildCount = guildsOnShard(shardId);
       const held = registry.shardTable.get(shardId);
       if (held) {
-        shardTable.push({ shardId, nodeId: held.nodeId, leaseId: held.leaseId, term: held.term, epoch: held.epoch, status: statusByShard.get(shardId) ?? 'Unknown', guildCount });
+        // A disconnected holder's last heartbeat status would read live; the
+        // row is frozen (Wait mode) until the node returns or is declared lost.
+        const holder = registry.nodes.get(held.nodeId);
+        const frozen = !holder || (!holder.connected && !holder.isSelf);
+        shardTable.push({ shardId, nodeId: held.nodeId, leaseId: held.leaseId, term: held.term, epoch: held.epoch, status: frozen ? 'frozen' : statusByShard.get(shardId) ?? 'Unknown', guildCount });
         continue;
       }
       const pending = registry.pendingConfirmation.get(shardId);
@@ -252,6 +359,10 @@ export function getFleetState(): FleetState {
             reshardPaused: sources.recovery.reshardPaused,
           }
         : null,
+      sync: sources.sync?.() ?? { status: 'n/a' },
+      budget: ledger?.getBudgetInfo() ?? null,
+      lossLog: healthMonitor?.getLossEvents() ?? [],
+      refusedRegistrations: refusedRegistrations ?? [],
       leases,
       nodes,
       shardTable,
@@ -261,6 +372,8 @@ export function getFleetState(): FleetState {
       // guilds; the result lets Guilds-by-shard list unserved guilds too.
       guildMap: { ...Object.fromEntries(registry.restGuildShards), ...Object.fromEntries(registry.guildMap) },
       guildNames: Object.fromEntries(registry.restGuildNames),
+      migration: sources.migration?.() ?? null,
+      pinViolation: sources.pinViolation?.() ?? null,
       updatedAt: Date.now(),
     };
   }
@@ -279,6 +392,12 @@ export function getFleetState(): FleetState {
   const registered = controlClient?.masterKnown() ?? false;
   const onHold = registered && leases.length === 0;
   const shardCount = lease?.shardCount ?? 0;
+  const draining = controlClient?.isDraining() ?? false;
+  const servingOnCachedLease = !registered && runtime.hasCurrentLease();
+  const lastContactAgoMs = controlClient?.getLastContactAgoMs() ?? null;
+  const cachedLeaseTtlRemainingMs = servingOnCachedLease
+    ? Math.max(0, LEASE_TTL_MS - (lastContactAgoMs ?? LEASE_TTL_MS))
+    : null;
   // Complete shard table from this node's own leases; the master owns the
   // fleet-wide picture, so shards this node does not hold read as unassigned.
   const leaseByShard = new Map<number, { leaseId: string; shardId: number; identifyDelayMs: number }>(leases.map(l => [l.shardId, l]));
@@ -317,6 +436,13 @@ export function getFleetState(): FleetState {
     masterUrl: (process.env.MASTER_URL || '').trim() || null,
     connect: null,
     recovery: null,
+    sync: sources.sync?.() ?? { status: 'n/a' },
+    budget: controlClient?.getLastBudget() ?? null,
+    lossLog: [],
+    refusedRegistrations: [],
+    servingOnCachedLease,
+    cachedLeaseTtlRemainingMs,
+    draining,
     leases,
     nodes: [
       {
@@ -334,10 +460,16 @@ export function getFleetState(): FleetState {
         guildCount: Object.keys(guildMap).length,
         load: hb?.load ?? null,
         lastHeartbeatAgoMs: null,
+        downSinceMs: null,
+        draining,
+        backoff: null,
+        syncAppliedRevision: sources.sync?.().appliedRevision ?? null,
       },
     ],
     shardTable,
     guildMap,
+    migration: null,
+    pinViolation: null,
     updatedAt: Date.now(),
   };
 }
