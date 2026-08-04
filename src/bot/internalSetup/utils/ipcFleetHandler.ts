@@ -4,7 +4,19 @@
 // block or crash the bot child.
 
 import { getFleetState } from '../fleet/state';
-import { fleetAssignShard, fleetResumeAssignments } from '../fleet/bootstrap';
+import {
+  fleetAssignShard,
+  fleetDeclareLost,
+  fleetDrainNode,
+  fleetMigrateAbort,
+  fleetMigratePrecheck,
+  fleetMigrateResume,
+  fleetMigrateStart,
+  fleetMigrationsList,
+  fleetResumeAssignments,
+  fleetSyncBump,
+} from '../fleet/bootstrap';
+import type { StartPayload } from '../fleet/migration/migrationCoordinator';
 
 /** Unsolicited push, carried by the metrics 5s sample tick (no own timer). */
 export function pushFleetStatus(): void {
@@ -25,7 +37,13 @@ export function setupFleetIPCHandlers(): void {
   process.on('message', async (message: any) => {
     if (!message || typeof message !== 'object') return;
     const { type, requestId } = message;
-    if (typeof type !== 'string' || !type.startsWith('fleet:') || !requestId) return;
+    if (typeof type !== 'string' || !type.startsWith('fleet:')) return;
+    // Fire-and-forget nudge from webui write sites; no reply expected.
+    if (type === 'fleet:sync:bump') {
+      fleetSyncBump(String(message.data?.scope ?? ''));
+      return;
+    }
+    if (!requestId) return;
 
     try {
       let response: any;
@@ -44,6 +62,42 @@ export function setupFleetIPCHandlers(): void {
         case 'fleet:resumeAssignments': {
           const result = await fleetResumeAssignments();
           response = result.success ? { success: true } : { success: false, error: result.error };
+          break;
+        }
+        case 'fleet:declareLost': {
+          const nodeId = String(message.data?.nodeId ?? '');
+          const result = await fleetDeclareLost(nodeId);
+          response = result.success ? { success: true } : { success: false, error: result.error };
+          break;
+        }
+        case 'fleet:drain': {
+          const nodeId = String(message.data?.nodeId ?? '');
+          const result = await fleetDrainNode(nodeId);
+          response = result.success ? { success: true } : { success: false, error: result.error };
+          break;
+        }
+        case 'fleet:migrate:start': {
+          const result = await fleetMigrateStart(message.data as StartPayload);
+          response = result.ok ? { success: true, migrationId: result.migrationId } : { success: false, error: result.error };
+          break;
+        }
+        case 'fleet:migrate:abort': {
+          const result = await fleetMigrateAbort(String(message.data?.migrationId ?? ''));
+          response = result.ok ? { success: true } : { success: false, error: result.error };
+          break;
+        }
+        case 'fleet:migrate:resume': {
+          const result = await fleetMigrateResume(String(message.data?.migrationId ?? ''));
+          response = result.ok ? { success: true } : { success: false, error: result.error };
+          break;
+        }
+        case 'fleet:migrate:precheck': {
+          const result = await fleetMigratePrecheck(message.data as StartPayload);
+          response = result.ok ? { success: true, precheck: result } : { success: false, error: result.error };
+          break;
+        }
+        case 'fleet:migrations': {
+          response = { success: true, migrations: fleetMigrationsList() };
           break;
         }
         default:

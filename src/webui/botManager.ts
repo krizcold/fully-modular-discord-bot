@@ -4,6 +4,7 @@ import { loadCredentials, validateCredentials, BotCredentials } from '../utils/e
 import { IPC_TIMEOUT_MS, IPC_TIMEOUT_MODULE_OP_MS } from './constants';
 import type { WebSocketManager, WSEvent, WSEventData } from './websocketManager';
 import { getSafetyManager } from '../utils/updateSafety';
+import { resetAppStoreManager } from '../bot/internalSetup/utils/appStoreManager';
 
 export interface BotStartResult {
   success: boolean;
@@ -248,6 +249,17 @@ export class BotManager {
         } else if (message.type === 'fleet:status') {
           if (this.wsManager) {
             this.wsManager.broadcast('bot:fleet:status', message.data);
+          }
+        } else if (message.type === 'sync:applied') {
+          // Co-worker applied a master sync: this process's AppStore caches
+          // are stale (installed.json/repos.json were overwritten on disk).
+          try {
+            resetAppStoreManager();
+          } catch (error) {
+            console.warn('[BotManager] AppStore reset after sync failed:', error instanceof Error ? error.message : error);
+          }
+          if (this.wsManager) {
+            this.wsManager.broadcast('bot:sync:status', message.data);
           }
         }
       });
@@ -596,6 +608,91 @@ export class BotManager {
       return await this.sendIPCMessage('fleet:resumeAssignments', {});
     } catch (error) {
       console.error('[BotManager] Error resuming fleet assignments:', error);
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  /**
+   * Declare a down node lost: free its shards for redistribution (master-only; validated in the bot child).
+   */
+  async declareFleetNodeLost(nodeId: string): Promise<any> {
+    try {
+      return await this.sendIPCMessage('fleet:declareLost', { nodeId });
+    } catch (error) {
+      console.error('[BotManager] Error declaring fleet node lost:', error);
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  /**
+   * Fire-and-forget sync bump after a webui write (master bot child bumps
+   * the sync revision; no-op on co-workers/standalone or with the bot down).
+   */
+  notifySyncMutation(scope: string): void {
+    if (!this.isRunning() || !this.botProcess) return;
+    try {
+      this.botProcess.send({ type: 'fleet:sync:bump', data: { scope } });
+    } catch { /* backstop rehash covers a lost nudge */ }
+  }
+
+  /**
+   * Drain a live worker's leases (master-only; validated in the bot child).
+   */
+  async drainFleetNode(nodeId: string): Promise<any> {
+    try {
+      return await this.sendIPCMessage('fleet:drain', { nodeId });
+    } catch (error) {
+      console.error('[BotManager] Error draining fleet node:', error);
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  /** Start a migration (move/swap/retire/redistribute; master-only, validated in the bot child). */
+  async startFleetMigration(payload: any): Promise<any> {
+    try {
+      return await this.sendIPCMessage('fleet:migrate:start', payload);
+    } catch (error) {
+      console.error('[BotManager] Error starting migration:', error);
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  /** Dry-run precheck for a migration (master-only). */
+  async precheckFleetMigration(payload: any): Promise<any> {
+    try {
+      return await this.sendIPCMessage('fleet:migrate:precheck', payload);
+    } catch (error) {
+      console.error('[BotManager] Error prechecking migration:', error);
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  /** Abort the active migration (master-only). */
+  async abortFleetMigration(migrationId: string): Promise<any> {
+    try {
+      return await this.sendIPCMessage('fleet:migrate:abort', { migrationId });
+    } catch (error) {
+      console.error('[BotManager] Error aborting migration:', error);
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  /** Resume a paused retire (master-only). */
+  async resumeFleetMigration(migrationId: string): Promise<any> {
+    try {
+      return await this.sendIPCMessage('fleet:migrate:resume', { migrationId });
+    } catch (error) {
+      console.error('[BotManager] Error resuming migration:', error);
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  /** List the active + recent migrations (master-only). */
+  async listFleetMigrations(): Promise<any> {
+    try {
+      return await this.sendIPCMessage('fleet:migrations', {});
+    } catch (error) {
+      console.error('[BotManager] Error listing migrations:', error);
       return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
     }
   }

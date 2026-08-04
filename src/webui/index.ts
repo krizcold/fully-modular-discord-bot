@@ -7,6 +7,19 @@ import { createServer } from './server';
 import { WebSocketManager } from './websocketManager';
 import { getInstallQueue } from './utils/installQueue';
 import { setNotificationIPCDispatcher } from '../bot/internalSetup/utils/premiumNotifications';
+import { initSyncNudge, nudgeSync } from './utils/syncNudge';
+import { ensureDurableSessionSecret } from '../utils/envLoader';
+import { flushAll } from '../bot/internalSetup/utils/dataManager';
+
+/**
+ * Drain the parent process's write queue before exit (bounded). The web-UI
+ * parent imports the same dataManager facade (config.ts writes route through it),
+ * so accepted config writes live in this process's pendingOps until flushed; an
+ * exit without this loses them. Mirrors the bot child's clientInitializer drain.
+ */
+export async function flushBeforeExit(): Promise<void> {
+  await Promise.race([flushAll(), new Promise(resolve => setTimeout(resolve, 5000))]);
+}
 
 /**
  * Tell the bot manager this bot's web UI is now serving, so the manager keeps
@@ -53,6 +66,11 @@ export async function startWebUI(botManager: BotManager): Promise<void> {
   // { version, buildId: "dev", buildDate: now } so the header badge shows
   // something other than "Development" when running outside Docker.
 
+  // Durable SESSION_SECRET before the session middleware is built, so
+  // sessions survive restarts with or without Redis.
+  ensureDurableSessionSecret();
+  initSyncNudge(botManager);
+
   const app = await createServer(botManager);
   const PORT = parseInt(process.env.WEBUI_PORT || '8080', 10);
   const HOST = '0.0.0.0';
@@ -85,6 +103,10 @@ export async function startWebUI(botManager: BotManager): Promise<void> {
     installQueue.on(internalEvent, (job: any) => {
       const channel = `appstore:${job.kind}:${suffix}` as const;
       wsManager.broadcast(channel as any, job);
+      if (suffix === 'completed' || suffix === 'failed') {
+        nudgeSync('modules');
+        nudgeSync('appstore');
+      }
     });
   }
 
@@ -99,6 +121,9 @@ export async function startWebUI(botManager: BotManager): Promise<void> {
     if (botManager.isRunning()) {
       await botManager.shutdown(false);
     }
+
+    // Drain accepted config writes before exit (bounded), so none are lost.
+    await flushBeforeExit();
 
     // Close HTTP server
     httpServer.close(() => {
