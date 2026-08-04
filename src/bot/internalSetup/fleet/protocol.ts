@@ -3,6 +3,12 @@
 // {requestId, data} (acks additionally carry their message name as type).
 // Every post-register message carries the sender's term so lower terms can be
 // rejected everywhere (split-brain fencing).
+//
+// Secrecy: repos.json GitHub tokens and module API credentials cross the wire
+// only inside SYNC_READ replies on this already-CONTROL_SECRET-authenticated
+// channel. Deployments crossing untrusted networks must use wss://
+// (FLEET_PUBLIC_URL behind TLS) - the same trust posture as lease/secret
+// traffic.
 
 export type NodeRole = 'master' | 'co-worker';
 
@@ -17,13 +23,36 @@ export const MSG = {
   LEASE_GRANT: 'control:lease:grant',
   LEASE_ACK: 'control:lease:ack',
   LEASE_REVOKE: 'control:lease:revoke',
+  LEASE_RENEW: 'control:lease:renew',
+  /** Reply payload name only; the wire reply is {requestId, data}. */
+  LEASE_RENEWED: 'control:lease:renewed',
+  NODE_DRAIN: 'control:node:drain',
   HEARTBEAT: 'control:heartbeat',
   GUILD_NOTICE: 'control:guild:notice',
+  SYNC_STATE: 'control:sync:state',
+  SYNC_FILES: 'control:sync:files',
+  SYNC_MODULE_BEGIN: 'control:sync:module:begin',
+  SYNC_READ: 'control:sync:read',
+  SYNC_REPORT: 'control:sync:report',
+  // Migration (P5). PREPARE/DRAIN/COMMIT/ABORT flow master -> participant
+  // (request/ack). PROGRESS/VERIFY flow participant -> master (PROGRESS is
+  // fire-and-forget; VERIFY is fire-and-forget too, coordinator-driven).
+  // INVENTORY (redistribute) is master -> node request/reply.
+  XFER_PREPARE: 'control:xfer:prepare',
+  XFER_PREPARED: 'control:xfer:prepared',
+  XFER_PROGRESS: 'control:xfer:progress',
+  XFER_DRAIN: 'control:xfer:drain',
+  XFER_VERIFY: 'control:xfer:verify',
+  XFER_COMMIT: 'control:xfer:commit',
+  XFER_ABORT: 'control:xfer:abort',
+  XFER_INVENTORY: 'control:xfer:inventory',
 } as const;
 
 export interface NodeCapabilities {
   shardCapacity: number;
   dataBackend: string;
+  /** Advertised transfer endpoint (ws://host:port) when TRANSFER_URL is set; direction-by-reachability uses it. */
+  transferUrl?: string;
 }
 
 export interface RegisterPayload {
@@ -41,6 +70,38 @@ export interface RegisterResult {
   accepted: boolean;
   term: number;
   reason?: string;
+  budget?: BudgetInfo | null;
+}
+
+export interface BudgetInfo {
+  total: number;
+  /** Live remaining minus local debits since the last fetch. */
+  remaining: number;
+  resetAfterMs: number;
+  fetchedAgoMs: number;
+  /** True when the last /gateway/bot fetch failed. */
+  stale: boolean;
+  /** True when /gateway/bot has never succeeded; the numeric fields are placeholders. */
+  unavailable?: true;
+  backoffs: { nodeId: string; nodeName: string; crashCount: number; nextPermitInMs: number }[];
+}
+
+export interface LeaseRenewPayload {
+  term: number;
+  leaseIds: string[];
+}
+
+export interface LeaseRenewedPayload {
+  ok: boolean;
+  term: number;
+  epoch: number;
+  reason?: string; // 'lease-mismatch' | 'stale-term'
+  budget?: BudgetInfo | null;
+}
+
+export interface NodeDrainPayload {
+  term: number;
+  reason: string;
 }
 
 export interface LeaseInfo {
@@ -89,10 +150,190 @@ export interface HeartbeatPayload {
   guilds: string[];
   metrics: { totals: any; topKGuilds: any[] };
   load: LoadSample;
+  /** Last fully-applied sync revision (co-worker only). */
+  syncAppliedRevision?: number;
+  /** False while the last reconcile ended degraded (co-worker only). */
+  syncOk?: boolean;
 }
 
 export interface GuildNoticePayload {
   guildId: string;
   shardId: number;
   kind: 'create' | 'delete';
+}
+
+export type SyncFileScope = 'appstore' | 'config' | 'settings' | 'globaldata';
+
+export interface SyncModuleEntry {
+  name: string;
+  version: string;
+  commit?: string;
+  contentHash: string;
+  enabled: boolean;
+}
+
+/** Small, hashes-only manifest; secrets never appear here. */
+export interface SyncManifest {
+  revision: number;
+  appVersion: string;
+  modules: SyncModuleEntry[];
+  appstoreHash: string;
+  configHash: string;
+  settingsHash: string;
+  globalDataHash: string;
+}
+
+export interface SyncStatePayload {
+  term: number;
+  manifest: SyncManifest;
+}
+
+export interface SyncFileEntry {
+  path: string;
+  size: number;
+  sha256: string;
+}
+
+export interface SyncFilesRequest {
+  term: number;
+  scope: SyncFileScope;
+}
+
+export interface SyncFilesReply {
+  revision: number;
+  files: SyncFileEntry[];
+}
+
+export interface SyncModuleBeginRequest {
+  term: number;
+  name: string;
+}
+
+export interface SyncModuleBeginReply {
+  revision: number;
+  name: string;
+  version: string;
+  commit?: string;
+  contentHash: string;
+  files: SyncFileEntry[];
+}
+
+export interface SyncReadRequest {
+  term: number;
+  scope: 'module' | SyncFileScope;
+  module?: string;
+  path: string;
+  offset: number;
+}
+
+export interface SyncReadReply {
+  dataB64: string;
+  eof: boolean;
+}
+
+export interface SyncReportPayload {
+  term: number;
+  appliedRevision: number;
+  ok: boolean;
+  degraded?: string[];
+}
+
+// ============================================================================
+// MIGRATION (P5)
+// ============================================================================
+
+export type MigrationKind = 'move' | 'swap' | 'retire' | 'redistribute';
+export type TransferDirection = 'push' | 'pull';
+export type TransferRole = 'source' | 'target';
+
+/** One transfer leg's per-participant instruction inside a prepare. */
+export interface XferPrepareLeg {
+  legId: string;
+  shardId: number;
+  role: TransferRole;
+  /** Peer's transfer endpoint when this side must dial; absent when this side listens. */
+  peerUrl?: string;
+  token: string;
+  direction: TransferDirection;
+  guilds: string[];
+}
+
+export interface XferPreparePayload {
+  migrationId: string;
+  kind: MigrationKind;
+  legs: XferPrepareLeg[];
+  term: number;
+  epoch: number;
+}
+
+export interface XferPreparedPayload {
+  ok: boolean;
+  /** Source ack: sum of sizeOfGuildData over the leg's guilds. */
+  estBytes?: number;
+  /** Target ack: statfs free bytes, or undefined when unknown (tolerated with a UI warning). */
+  freeBytes?: number;
+  reason?: string;
+}
+
+export interface XferProgressPayload {
+  migrationId: string;
+  legId: string;
+  round: number;
+  filesSent: number;
+  bytesSent: number;
+  guildsTotal: number;
+  guildsDone: number;
+  deltaFiles: number;
+  error?: string;
+}
+
+export interface XferDrainPayload {
+  migrationId: string;
+  term: number;
+  legIds: string[];
+}
+
+export interface XferVerifyPayload {
+  migrationId: string;
+  legId: string;
+  side: TransferRole;
+  hash: string;
+  guildHashes: Record<string, string>;
+}
+
+export interface XferCommitPayload {
+  migrationId: string;
+  term: number;
+  epoch: number;
+  legIds: string[];
+  /**
+   * Source-side cleanup marker + the leg's guilds, threaded so a RESTARTED
+   * source (empty in-memory legs Map, no _incoming staging) can still graveyard
+   * its originals + unfreeze from the payload. The commit acks ok only when that
+   * source cleanup genuinely completed. Absent for target commits.
+   */
+  sourceCleanup?: boolean;
+  guilds?: string[];
+}
+
+export interface XferAbortPayload {
+  migrationId: string;
+  term: number;
+  reason: string;
+}
+
+/** Redistribute inventory request/reply (post-reshard placement). */
+export interface XferInventoryRequest {
+  term: number;
+}
+
+export interface XferInventoryGuild {
+  guildId: string;
+  bytes: number;
+  ownerShardIdAtLastServe?: number;
+}
+
+export interface XferInventoryReply {
+  ok: boolean;
+  guilds: XferInventoryGuild[];
 }

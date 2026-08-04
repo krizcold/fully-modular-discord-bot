@@ -1,6 +1,6 @@
 // Single source of truth for every fleet constant; imported by every fleet consumer.
 
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 2;
 
 /** Heartbeat cadence (worker -> master, and the master's self-sample into its own registry). */
 export const HEARTBEAT_MS = 5000;
@@ -17,6 +17,12 @@ export const LEASE_RENEW_MS = 15000;
  * the wire, so clock skew between machines cannot corrupt lease validity.
  */
 export const LEASE_TTL_MS = 45000;
+
+/** A node whose last heartbeat is older than this reads as late. */
+export const HEALTH_LATE_MS = HEARTBEAT_MS * 2.5;
+
+/** A node silent past this is confirmed down (its lease TTL has expired with it). */
+export const HEALTH_DOWN_MS = LEASE_TTL_MS;
 
 /** Fleet-mode masters wait this long at boot for surviving workers to redial before the first placement (Part 5 flow 1). */
 export const REGISTER_GRACE_MS = 10000;
@@ -46,5 +52,87 @@ export const CONTROL_ACK_TIMEOUT_MS = 10000;
 /** Timeout for the /gateway/bot fetch at plan time; a fallback keeps boot alive offline. */
 export const GATEWAY_INFO_TIMEOUT_MS = 5000;
 
+/** How often the master refreshes session_start_limit from /gateway/bot (also refreshed after charged grant rounds). */
+export const BUDGET_REFRESH_MS = 300000;
+
+/** Identify-budget reserve the master never grants into (fraction of the daily total). */
+export const BUDGET_RESERVE_PCT = 0.05;
+
+/** Re-registers within this window count toward crash-loop detection. */
+export const CRASH_LOOP_WINDOW_MS = 600000;
+
+/** Re-register count in the window at which identify permits start backing off. */
+export const CRASH_LOOP_THRESHOLD = 3;
+
+/** First crash-loop identify backoff; doubles per further re-register. */
+export const IDENTIFY_BACKOFF_BASE_MS = 30000;
+
+/** Crash-loop identify backoff ceiling. */
+export const IDENTIFY_BACKOFF_MAX_MS = 900000;
+
+/** Cap on the persisted node-loss event ring (and the refused-registrations ring). */
+export const LOSS_LOG_CAP = 20;
+
 /** Directory under /data/global/ holding the embedded control store. */
 export const FLEET_DIR = 'fleet';
+
+/** Master sync backstop: rehash-and-bump plus re-push to behind workers on this cadence. */
+export const SYNC_RECONCILE_MS = 15000;
+
+/** Debounce on syncAuthority.bump() so rapid mutations coalesce into one manifest recompute. */
+export const SYNC_BUMP_DEBOUNCE_MS = 500;
+
+/** Raw bytes per SYNC_READ chunk (b64-encoded on the wire; one frame in flight per worker). */
+export const SYNC_CHUNK_BYTES = 262144;
+
+/** Sanity cap on any single synced file. */
+export const SYNC_MAX_FILE_BYTES = 67108864;
+
+/** Worker-side download staging directory under /data/global/fleet/. */
+export const SYNC_STAGING_DIRNAME = 'sync-staging';
+
+// ============================================================================
+// MIGRATION (P5): node-to-node data transfer + cutover under commit barriers.
+// ============================================================================
+
+/** Default transfer-channel listen port (CONTROL_PORT_DEFAULT + 1). */
+export const TRANSFER_PORT_DEFAULT = CONTROL_PORT_DEFAULT + 1;
+
+/** Single-use transfer token lifetime after prepare; a stale token cannot dial. */
+export const TRANSFER_TOKEN_TTL_MS = 120000;
+
+/** How long the master waits for a prepare ack from a participant. */
+export const XFER_PREPARE_TIMEOUT_MS = 15000;
+
+/** No progress from a leg for this long during copy = stall -> abort. */
+export const XFER_STALL_TIMEOUT_MS = 60000;
+
+/** How long the master waits for both verify frames after issuing drain. */
+export const XFER_DRAIN_TIMEOUT_MS = 30000;
+
+/** Commit is idempotent and retried on this cadence until every participant acks. */
+export const XFER_COMMIT_RETRY_MS = 10000;
+
+/** A copy round shipping this few changed files is the last (converged) round. */
+export const XFER_DELTA_THRESHOLD_FILES = 25;
+
+/** Hard cap on copy rounds before forcing the drain (convergence backstop). */
+export const XFER_MAX_ROUNDS = 10;
+
+/** Sender pauses while the socket's bufferedAmount exceeds this (backpressure). */
+export const XFER_HIGH_WATER_BYTES = 8388608;
+
+/** File records above this size are chunked (offset/totalSize framing). */
+export const XFER_CHUNK_BYTES = 33554432;
+
+/** Required target free space = estBytes * this + a fixed cushion. */
+export const SPACE_MARGIN = 1.5;
+
+/** Fixed free-space cushion above the margin-scaled estimate. */
+export const SPACE_CUSHION_BYTES = 104857600;
+
+/** _incoming staging retained this long when the master is unreachable at boot, then swept. */
+export const INCOMING_RETENTION_MS = 86400000;
+
+/** Cap on the persisted finished-migration history ring. */
+export const MIGRATION_HISTORY_CAP = 10;
