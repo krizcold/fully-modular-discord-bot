@@ -1,16 +1,26 @@
 const { useState, useEffect } = React;
 
-// Top-level tabs that map 1:1 to a URL path. Order in the tab strip is
-// driven by the JSX below; this set is just for "is this a recognised tab"
-// validation when reading from the URL on load / popstate.
+// Top-level tabs that map 1:1 to a URL path. Order drives the tab strip;
+// co-worker nodes drop the master-owned tabs (App Store, Dev Modules).
 const APP_TABS = ['dashboard', 'panels', 'credentials', 'config', 'logs', 'usage', 'update', 'appstore', 'devmodules'];
+const APP_TAB_LABELS = {
+  dashboard: 'Dashboard',
+  panels: 'Panels',
+  credentials: 'Credentials',
+  config: 'Config',
+  logs: 'Logs',
+  usage: 'Usage',
+  update: 'Update',
+  appstore: 'App Store',
+  devmodules: 'Dev Modules',
+};
 
-function tabFromPath(pathname) {
-  // Pathname like "/credentials" -> "credentials". Empty / unknown / "/"
-  // falls back to the default dashboard tab so refreshing on "/" doesn't
-  // pick a random tab.
+function tabFromPath(pathname, tabs) {
+  // Pathname like "/credentials" -> "credentials". Empty / unknown / hidden
+  // paths fall back to the default dashboard tab.
+  const validTabs = tabs || APP_TABS;
   const first = (pathname || '/').split('/').filter(Boolean)[0];
-  return APP_TABS.includes(first) ? first : 'dashboard';
+  return validTabs.includes(first) ? first : 'dashboard';
 }
 
 function pushTabUrl(tab) {
@@ -209,6 +219,14 @@ function App() {
     return <div className="loading">Loading...</div>;
   }
 
+  // Co-worker nodes mirror the master: App Store and Dev Modules are managed
+  // there, so their tabs are hidden here.
+  const isCoWorker = setupStatus?.nodeRole === 'co-worker';
+  const visibleTabs = isCoWorker
+    ? APP_TABS.filter(tab => tab !== 'appstore' && tab !== 'devmodules')
+    : APP_TABS;
+  const currentTab = visibleTabs.includes(activeTab) ? activeTab : 'dashboard';
+
   return (
     <div>
       <div className="header">
@@ -229,64 +247,19 @@ function App() {
       </div>
 
       <div className="tabs">
-        <button
-          className={`tab ${activeTab === 'dashboard' ? 'active' : ''}`}
-          onClick={() => setActiveTab('dashboard')}
-        >
-          Dashboard
-        </button>
-        <button
-          className={`tab ${activeTab === 'panels' ? 'active' : ''}`}
-          onClick={() => setActiveTab('panels')}
-        >
-          Panels
-        </button>
-        <button
-          className={`tab ${activeTab === 'credentials' ? 'active' : ''}`}
-          onClick={() => setActiveTab('credentials')}
-        >
-          Credentials
-        </button>
-        <button
-          className={`tab ${activeTab === 'config' ? 'active' : ''}`}
-          onClick={() => setActiveTab('config')}
-        >
-          Config
-        </button>
-        <button
-          className={`tab ${activeTab === 'logs' ? 'active' : ''}`}
-          onClick={() => setActiveTab('logs')}
-        >
-          Logs
-        </button>
-        <button
-          className={`tab ${activeTab === 'usage' ? 'active' : ''}`}
-          onClick={() => setActiveTab('usage')}
-        >
-          Usage
-        </button>
-        <button
-          className={`tab ${activeTab === 'update' ? 'active' : ''}`}
-          onClick={() => setActiveTab('update')}
-        >
-          Update
-        </button>
-        <button
-          className={`tab ${activeTab === 'appstore' ? 'active' : ''}`}
-          onClick={() => setActiveTab('appstore')}
-        >
-          App Store
-        </button>
-        <button
-          className={`tab ${activeTab === 'devmodules' ? 'active' : ''}`}
-          onClick={() => setActiveTab('devmodules')}
-        >
-          Dev Modules
-        </button>
+        {visibleTabs.map(tab => (
+          <button
+            key={tab}
+            className={`tab ${currentTab === tab ? 'active' : ''}`}
+            onClick={() => setActiveTab(tab)}
+          >
+            {APP_TAB_LABELS[tab]}
+          </button>
+        ))}
       </div>
 
       <div className="tab-content">
-        {activeTab === 'dashboard' && (
+        {currentTab === 'dashboard' && (
           <BotControlPanel
             status={status}
             onStart={startBot}
@@ -298,9 +271,24 @@ function App() {
           />
         )}
 
-        {activeTab === 'panels' && <PanelsPanel />}
+        {currentTab === 'panels' && <PanelsPanel />}
 
-        {activeTab === 'credentials' && (
+        {currentTab === 'credentials' && (isCoWorker ? (
+          <ConnectionSection
+            setupStatus={setupStatus}
+            isBotRunning={!!status?.running}
+            onUpdate={loadData}
+            onUpdateAndRestart={async () => {
+              await loadData();
+              try {
+                await api.post('/bot/restart-server');
+              } catch (err) {
+                console.warn('Server restart failed, falling back to bot restart:', err);
+                await startOrRestartBot();
+              }
+            }}
+          />
+        ) : (
           <CredentialsPanel
             setupStatus={setupStatus}
             isBotRunning={!!status?.running}
@@ -318,19 +306,19 @@ function App() {
               }
             }}
           />
-        )}
+        ))}
 
-        {activeTab === 'config' && <ConfigPanel />}
+        {currentTab === 'config' && <ConfigPanel isCoWorker={isCoWorker} />}
 
-        {activeTab === 'logs' && <LogsPanel api={api} wsClient={wsClient} />}
+        {currentTab === 'logs' && <LogsPanel api={api} wsClient={wsClient} />}
 
-        {activeTab === 'usage' && <UsagePanel api={api} wsClient={wsClient} />}
+        {currentTab === 'usage' && <UsagePanel api={api} wsClient={wsClient} />}
 
-        {activeTab === 'update' && <UpdatePanel api={api} wsClient={wsClient} />}
+        {currentTab === 'update' && <UpdatePanel api={api} wsClient={wsClient} />}
 
-        {activeTab === 'appstore' && <AppStorePanel />}
+        {currentTab === 'appstore' && !isCoWorker && <AppStorePanel />}
 
-        {activeTab === 'devmodules' && <DevModulesPanel />}
+        {currentTab === 'devmodules' && !isCoWorker && <DevModulesPanel />}
       </div>
     </div>
   );
