@@ -17,6 +17,7 @@ import fs from 'fs';
 import path from 'path';
 import { ensureDir } from '../pathHelpers';
 import { dataPath } from '../../../../utils/dataRoot';
+import { saveData } from '../dataManager';
 import { getPaymentRegistry } from './paymentRegistry';
 import type {
   PaymentProvider,
@@ -202,8 +203,7 @@ export class DummyProvider implements PaymentProvider {
 
   private save(): void {
     try {
-      ensureDir(path.dirname(STATE_PATH));
-      fs.writeFileSync(STATE_PATH, JSON.stringify(this.state, null, 2));
+      saveData('state.json', { scope: 'global', category: 'payment-providers/dummy' }, this.state);
       try { this.stateMtimeMs = fs.statSync(STATE_PATH).mtimeMs; } catch { /* ignore */ }
     } catch (err) {
       console.error('[DummyProvider] Failed to save state:', err);

@@ -30,10 +30,9 @@
  */
 
 import fs from 'fs';
-import path from 'path';
 import * as crypto from 'crypto';
-import { ensureDir } from './pathHelpers';
 import { dataPath } from '../../../utils/dataRoot';
+import { appendData, flushAll, readRaw, saveGlobalData } from './dataManager';
 import type { HardLimitOverride } from '../../types/settingsTypes';
 import {
   loadGlobalModuleConfig,
@@ -704,9 +703,8 @@ export class PremiumManager {
 
   load(): void {
     try {
-      ensureDir(path.dirname(CONFIG_PATH));
-      if (fs.existsSync(CONFIG_PATH)) {
-        const content = fs.readFileSync(CONFIG_PATH, 'utf-8');
+      const content = readRaw(CONFIG_PATH);
+      if (content !== null) {
         const loaded = JSON.parse(content) as Partial<PremiumConfig>;
 
         const mergedTiers: Record<string, PremiumTier> = {};
@@ -770,9 +768,14 @@ export class PremiumManager {
 
   save(): boolean {
     try {
-      ensureDir(path.dirname(CONFIG_PATH));
-      fs.writeFileSync(CONFIG_PATH, JSON.stringify(this.config, null, 2));
-      try { this.configMtimeMs = fs.statSync(CONFIG_PATH).mtimeMs; } catch { /* ignore */ }
+      const ok = saveGlobalData('premium-tiers.json', this.config);
+      if (!ok) return false;
+      // Fire-and-forget flush so the on-disk mtime advances; record it after so
+      // ensureLoaded()'s cross-process mtime check does not needlessly reload
+      // this process's own write. A one-cycle stale window is tolerated.
+      void flushAll()
+        .then(() => { try { this.configMtimeMs = fs.statSync(CONFIG_PATH).mtimeMs; } catch { /* ignore */ } })
+        .catch(() => { /* flush retried by the queue */ });
       return true;
     } catch (error) {
       console.error('[PremiumManager] Failed to save config:', error);
@@ -805,8 +808,7 @@ export class PremiumManager {
    */
   private writeAudit(entry: AuditEntry): void {
     try {
-      ensureDir(path.dirname(AUDIT_PATH));
-      fs.appendFileSync(AUDIT_PATH, JSON.stringify(entry) + '\n', 'utf-8');
+      appendData('premium-tiers.audit.jsonl', { scope: 'global' }, JSON.stringify(entry) + '\n');
     } catch (err) {
       console.error('[PremiumManager] writeAudit failed:', err);
     }

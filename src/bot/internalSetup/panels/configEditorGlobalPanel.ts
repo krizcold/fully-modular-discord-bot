@@ -17,10 +17,10 @@ import {
   LabelBuilder,
   MessageFlags,
 } from 'discord.js';
-import * as fs from 'fs';
 import { PanelOptions, PanelContext, PanelResponse } from '../../types/panelTypes';
 import { discoverConfigFiles, ConfigFileMetadata } from '../utils/configDiscovery';
 import { loadGlobalConfig, saveGlobalConfig, getMergedConfig } from '../utils/configManager';
+import { deleteRawAtomic } from '../utils/dataManager';
 import { createV2Response, V2Colors } from '../utils/panel/v2';
 import { validateAndSanitizeJson } from '../utils/json';
 
@@ -140,8 +140,8 @@ const configEditorGlobalPanel: PanelOptions = {
       const configFiles = discoverConfigFiles().filter(f => f.category === 'config');
       const metadata = configFiles.find(f => f.id === fileId);
 
-      if (metadata?.path && fs.existsSync(metadata.path)) {
-        fs.unlinkSync(metadata.path);
+      if (metadata?.path) {
+        deleteRawAtomic(metadata.path);
       }
 
       // Return to config view with fresh data
@@ -199,9 +199,7 @@ const configEditorGlobalPanel: PanelOptions = {
         }
 
         if (Object.keys(overridesOnly).length === 0 && metadata?.path) {
-          if (fs.existsSync(metadata.path)) {
-            fs.unlinkSync(metadata.path);
-          }
+          deleteRawAtomic(metadata.path);
         } else {
           saveGlobalConfig(fileId, overridesOnly);
         }
@@ -240,9 +238,7 @@ const configEditorGlobalPanel: PanelOptions = {
 
     try {
       if (Object.keys(overridesOnly).length === 0 && metadata?.path) {
-        if (fs.existsSync(metadata.path)) {
-          fs.unlinkSync(metadata.path);
-        }
+        deleteRawAtomic(metadata.path);
       } else {
         saveGlobalConfig(fileId, overridesOnly);
       }

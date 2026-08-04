@@ -35,7 +35,8 @@ function scanDirectoryRecursive(
   dirPath: string,
   category: 'config' | 'data',
   prefix: string = '',
-  excludeTop?: Set<string>
+  excludeTop?: Set<string>,
+  excludeUnderscoreTop = false
 ): ConfigFileMetadata[] {
   const results: ConfigFileMetadata[] = [];
 
@@ -52,6 +53,11 @@ function scanDirectoryRecursive(
 
       if (stat.isDirectory()) {
         if (prefix === '' && excludeTop?.has(item)) {
+          continue;
+        }
+        // Underscore-prefixed top-level dirs are internal namespaces
+        // (_guildConfig, _hardLimits, ...) - never user-editable rows.
+        if (prefix === '' && excludeUnderscoreTop && item.startsWith('_')) {
           continue;
         }
         // Recursively scan subdirectory
@@ -239,7 +245,7 @@ export function discoverGuildConfigFiles(guildId: string): ConfigFileMetadata[] 
 
   const guildDir = dataPath(guildId);
   if (fs.existsSync(guildDir)) {
-    const existingFiles = scanDirectoryRecursive(guildDir, 'data');
+    const existingFiles = scanDirectoryRecursive(guildDir, 'data', '', undefined, true);
 
     for (const file of existingFiles) {
       // Extract module name and filename for comparison
@@ -614,7 +620,7 @@ export function discoverGuildDataFiles(guildId: string): DataFileMetadata[] {
     // Also scan for any existing files that might not have schemas
     const guildDir = dataPath(guildId);
     if (fs.existsSync(guildDir)) {
-      const existingFiles = scanDirectoryRecursive(guildDir, 'data');
+      const existingFiles = scanDirectoryRecursive(guildDir, 'data', '', undefined, true);
 
       for (const file of existingFiles) {
         // Extract module name from path (e.g., "moduleName/file.json")

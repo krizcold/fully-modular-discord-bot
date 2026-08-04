@@ -9,6 +9,7 @@ import fs from 'fs';
 import path from 'path';
 import { SettingsSchema, ModuleWithSettings } from '@bot/types/settingsTypes';
 import { getModulesDir, getModulesDevDir, getModuleInfo, getModulePath } from '../pathHelpers';
+import { resolveNodeRole } from '../../fleet/nodeIdentity';
 
 /** Cache for loaded schemas */
 const schemaCache = new Map<string, SettingsSchema>();
@@ -40,9 +41,11 @@ export function findSettingsSchemas(): string[] {
     }
   }
 
-  // Scan modulesDev directory
+  // Scan modulesDev directory. Dev modules are strictly master-only: a
+  // co-worker never scans them even when present on disk, so it never
+  // registers phantom settings panels for modules it can never load.
   const modulesDevDir = getModulesDevDir();
-  if (fs.existsSync(modulesDevDir)) {
+  if (resolveNodeRole() !== 'co-worker' && fs.existsSync(modulesDevDir)) {
     const repos = fs.readdirSync(modulesDevDir, { withFileTypes: true })
       .filter(dirent => dirent.isDirectory() && !dirent.name.startsWith('.'))
       .map(dirent => dirent.name);

@@ -17,12 +17,10 @@ import {
   LabelBuilder,
   MessageFlags,
 } from 'discord.js';
-import * as fs from 'fs';
-import * as path from 'path';
 import { PanelOptions, PanelContext, PanelResponse } from '../../types/panelTypes';
 import { discoverGuildConfigFiles, ConfigFileMetadata } from '../utils/configDiscovery';
 import { loadGuildConfig, saveGuildConfig, getMergedConfig } from '../utils/configManager';
-import { dataPath } from '../../../utils/dataRoot';
+import { deleteData } from '../utils/dataManager';
 import { createV2Response, V2Colors } from '../utils/panel/v2';
 import { validateAndSanitizeJson } from '../utils/json';
 
@@ -248,14 +246,10 @@ const configEditorGuildPanel: PanelOptions = {
         }
 
         if (Object.keys(overridesOnly).length === 0) {
-          let configPath: string;
           if (schemaMetadata && schemaMetadata.moduleName) {
-            configPath = dataPath(context.guildId!, schemaMetadata.moduleName, fileId);
+            deleteData(fileId, { guildId: context.guildId!, category: schemaMetadata.moduleName });
           } else {
-            configPath = dataPath(context.guildId!, fileId);
-          }
-          if (fs.existsSync(configPath)) {
-            fs.unlinkSync(configPath);
+            deleteData(fileId, { guildId: context.guildId! });
           }
         } else {
           saveGuildConfig(fileId, context.guildId!, overridesOnly);
@@ -303,19 +297,13 @@ const configEditorGuildPanel: PanelOptions = {
     // Save config (or delete if no overrides)
     try {
       if (Object.keys(overridesOnly).length === 0) {
-        // No overrides - delete file if it exists
-        // Construct proper path with moduleName
-        let configPath: string;
+        // No overrides - delete the config file through the facade.
         if (schemaMetadata && schemaMetadata.moduleName) {
-          configPath = dataPath(context.guildId, schemaMetadata.moduleName, fileId);
+          deleteData(fileId, { guildId: context.guildId, category: schemaMetadata.moduleName });
         } else {
-          configPath = dataPath(context.guildId, fileId);
+          deleteData(fileId, { guildId: context.guildId });
         }
-
-        if (fs.existsSync(configPath)) {
-          fs.unlinkSync(configPath);
-          console.log(`[ConfigEditor] Deleted ${fileId} (no overrides)`);
-        }
+        console.log(`[ConfigEditor] Deleted ${fileId} (no overrides)`);
       } else {
         // Save only overrides
         saveGuildConfig(fileId, context.guildId, overridesOnly);

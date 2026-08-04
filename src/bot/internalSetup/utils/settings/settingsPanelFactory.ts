@@ -14,6 +14,7 @@ import type { PanelOptions, PanelContext, PanelResponse } from '@bot/types/panel
 import type { ModuleWithSettings, SettingsSchema, MergedSettings } from '@bot/types/settingsTypes';
 import { createV2Response } from '../panel/v2';
 import { buildSettingsPanel, buildErrorPanel } from './settingsBuilder';
+import { resolveNodeRole } from '../../fleet/nodeIdentity';
 import { loadModuleSettings, getMergedHardLimits, loadGlobalModuleConfig } from './settingsStorage';
 import {
   handleSettingsButton,
@@ -95,6 +96,20 @@ interface CreatePanelOptions {
   panelScope: PanelScopeType;
 }
 
+// Actions that persist to /data/global/{module}/settings.json (the
+// master-authoritative synced 'settings' scope). Button 'reset'/'upload' only
+// OPEN a modal (read-only) - the write happens on the modal submit, so the sets
+// differ by surface. System-scope panels are read-only on a co-worker;
+// guild-scope panels are node-owned and untouched.
+const MUTATING_SETTINGS_BUTTONS = new Set(['save', 'modtoggle']);
+const MUTATING_SETTINGS_MODALS = new Set(['reset', 'upload', 'sysedit']);
+
+/** True when a co-worker must reject this system-scope mutation (read-only mirror). */
+function isBlockedSystemMutation(isSystemScope: boolean, actions: Set<string>, interactionId: string): boolean {
+  if (!isSystemScope || resolveNodeRole() !== 'co-worker') return false;
+  return actions.has(interactionId.split('_')[0]);
+}
+
 /**
  * Create a settings panel for a module with specified scope
  */
@@ -169,6 +184,9 @@ export function createSettingsPanel(options: CreatePanelOptions): PanelOptions {
     },
 
     handleButton: async (context: PanelContext, buttonId: string): Promise<PanelResponse | null> => {
+      if (isBlockedSystemMutation(isSystemScope, MUTATING_SETTINGS_BUTTONS, buttonId)) {
+        return createV2Response(buildErrorPanel('Synced from master - read-only on this node.'));
+      }
       return handleSettingsButton(createHandlerCtx(context), buttonId);
     },
 
@@ -177,6 +195,9 @@ export function createSettingsPanel(options: CreatePanelOptions): PanelOptions {
     },
 
     handleModal: async (context: PanelContext, modalId: string): Promise<PanelResponse> => {
+      if (isBlockedSystemMutation(isSystemScope, MUTATING_SETTINGS_MODALS, modalId)) {
+        return createV2Response(buildErrorPanel('Synced from master - read-only on this node.'));
+      }
       return handleSettingsModal(createHandlerCtx(context), modalId);
     },
   };

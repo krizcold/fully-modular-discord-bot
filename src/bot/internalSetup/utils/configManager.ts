@@ -1,13 +1,12 @@
-import * as fs from 'fs';
 import * as path from 'path';
 import { getConfigFileMetadata } from './configDiscovery';
 import { dataPath } from '../../../utils/dataRoot';
+import { loadData, readRaw, saveData, writeRawAtomic } from './dataManager';
 import type { ModuleConfigSchema, ConfigFieldSchema } from '../../types/moduleTypes';
 
 // Use dist/bot/config.json in production, src/bot/config.json in development
 const isProd = process.env.NODE_ENV !== 'development';
 const rootConfigPath = isProd ? dataPath('dist', 'bot', 'config.json') : path.join(__dirname, '../../config.json');
-const guildConfigsDir = dataPath('guildConfigs');
 
 /**
  * Schema for main bot config (config.json)
@@ -41,18 +40,11 @@ const MAIN_CONFIG_SCHEMA: Record<string, any> = {
  * - Works for both development and production environments
  */
 export function ensureConfigPopulated(): void {
-  const configDir = path.dirname(rootConfigPath);
-
-  // Ensure directory exists
-  if (!fs.existsSync(configDir)) {
-    fs.mkdirSync(configDir, { recursive: true });
-  }
-
   // Read existing config (if exists)
   let existingConfig: Record<string, any> = {};
-  if (fs.existsSync(rootConfigPath)) {
+  const rawContent = readRaw(rootConfigPath);
+  if (rawContent !== null) {
     try {
-      const rawContent = fs.readFileSync(rootConfigPath, 'utf-8');
       existingConfig = JSON.parse(rawContent || '{}');
     } catch (e) {
       console.warn(`[ConfigManager] Error reading existing config, will regenerate:`, e);
@@ -88,36 +80,29 @@ export function ensureConfigPopulated(): void {
   }
 
   // Write fully populated config
-  try {
-    fs.writeFileSync(rootConfigPath, JSON.stringify(populatedConfig, null, 2), 'utf-8');
-    console.log(`[ConfigManager] Config synchronized with schema (${addedCount} added, ${preservedCount} preserved, ${orphanedKeys.length} removed)`);
-  } catch (e) {
-    console.error(`[ConfigManager] Error writing populated config:`, e);
-  }
+  writeRawAtomic(rootConfigPath, JSON.stringify(populatedConfig, null, 2));
+  console.log(`[ConfigManager] Config synchronized with schema (${addedCount} added, ${preservedCount} preserved, ${orphanedKeys.length} removed)`);
 }
 
 /**
  * Ensures a specific config file exists in a given directory. If not, creates an empty one.
  */
-function ensureConfigFile(dirPath: string, filePath: string, defaultContent: string = '{}'): void {
-  if (!fs.existsSync(dirPath)) {
-    fs.mkdirSync(dirPath, { recursive: true });
-  }
-  if (!fs.existsSync(filePath)) {
-    fs.writeFileSync(filePath, defaultContent, 'utf-8');
+function ensureConfigFile(filePath: string, defaultContent: string = '{}'): void {
+  if (readRaw(filePath) === null) {
+    writeRawAtomic(filePath, defaultContent);
     console.log(`[ConfigManager] Created default config file: ${path.relative(path.resolve(__dirname, '../..'), filePath)}`);
   }
 }
 
 /**
- * Reads a JSON config file.
+ * Reads a JSON config file through the facade (read-your-writes against the queue).
  */
 function readConfigFile<T>(filePath: string, defaultValue: T): T {
-  if (!fs.existsSync(filePath)) {
+  const configRaw = readRaw(filePath);
+  if (configRaw === null) {
     return defaultValue;
   }
   try {
-    const configRaw = fs.readFileSync(filePath, 'utf-8');
     return JSON.parse(configRaw || JSON.stringify(defaultValue));
   } catch (e) {
     console.error(`[ConfigManager] Error reading/parsing ${path.basename(filePath)}:`, e);
@@ -135,7 +120,7 @@ function readConfigFile<T>(filePath: string, defaultValue: T): T {
  * Auto-documents: If property is missing from config.json, writes the default to file.
  */
 export function getConfigProperty<T>(property: string): T {
-  ensureConfigFile(path.dirname(rootConfigPath), rootConfigPath);
+  ensureConfigFile(rootConfigPath);
 
   // Get default from schema
   const defaultValue = MAIN_CONFIG_SCHEMA[property] as T;
@@ -145,9 +130,9 @@ export function getConfigProperty<T>(property: string): T {
   let propertyExistsInFile = false;
   let fileValue: any;
 
-  if (fs.existsSync(rootConfigPath)) {
+  const rawContent = readRaw(rootConfigPath);
+  if (rawContent !== null) {
     try {
-      const rawContent = fs.readFileSync(rootConfigPath, 'utf-8');
       const parsedConfig = JSON.parse(rawContent || '{}');
       if (parsedConfig.hasOwnProperty(property)) {
         propertyExistsInFile = true;
@@ -196,7 +181,7 @@ export function getConfigProperty<T>(property: string): T {
  * Config hierarchy:
  * 1. Schema defaults from MAIN_CONFIG_SCHEMA
  * 2. Base config from /data/config.json (global overrides)
- * 3. Guild-specific override from /data/guildConfigs/{guildId}.json (guild overrides)
+ * 3. Guild-specific override from /data/{guildId}/_guildConfig/config.json (guild overrides)
  *
  * Guild configs only contain OVERRIDES - properties not defined in guild config
  * will fall back to base config. This allows updating base config without touching
@@ -215,52 +200,37 @@ export function getConfigPropertyForGuild<T>(property: string, guildId: string |
     return baseValue;
   }
 
-  // Check for guild-specific override
-  const guildConfigPath = path.join(guildConfigsDir, `${guildId}.json`);
+  // Check for guild-specific override in the guild namespace
+  const guildConfig = loadData<Record<string, any>>('config.json', { guildId, category: '_guildConfig' }, {});
 
-  if (!fs.existsSync(guildConfigPath)) {
-    // No guild-specific config, return base value
-    return baseValue;
+  // If guild config has this property, use it; otherwise use base
+  if (guildConfig.hasOwnProperty(property)) {
+    return guildConfig[property];
   }
 
-  try {
-    const guildConfigRaw = fs.readFileSync(guildConfigPath, 'utf-8');
-    const guildConfig = JSON.parse(guildConfigRaw || '{}');
-
-    // If guild config has this property, use it; otherwise use base
-    if (guildConfig.hasOwnProperty(property)) {
-      return guildConfig[property];
-    }
-
-    return baseValue;
-  } catch (e) {
-    console.error(`[ConfigManager] Error reading guild config for ${guildId}:`, e);
-    return baseValue;
-  }
+  return baseValue;
 }
 
 
 
 /**
  * Load entire guild-specific config file
- * Guild configs are stored in /data/guildConfigs/{guildId}.json
+ * Guild configs are stored in /data/{guildId}/_guildConfig/config.json
  * Module configs are stored in /data/{guildId}/{moduleName}/{filename}
  * These contain ONLY overrides - not a full config
  *
  * Note: Defaults come from schemas, not parameters
  */
 export function loadGuildConfig(filename: string, guildId: string): any {
-  // For guild-specific config files in /data/guildConfigs/
+  // Guild-specific config now lives inside the guild namespace.
   if (filename === 'config.json') {
-    const guildConfigPath = path.join(guildConfigsDir, `${guildId}.json`);
-    return readConfigFile(guildConfigPath, {});
+    return loadData('config.json', { guildId, category: '_guildConfig' }, {});
   }
 
   // For module config files, use metadata to get correct path
   const metadata = getConfigFileMetadata(filename);
   if (metadata && metadata.moduleName) {
-    const filePath = dataPath(guildId, metadata.moduleName, filename);
-    return readConfigFile(filePath, {});
+    return loadData(filename, { guildId, category: metadata.moduleName }, {});
   }
 
   console.warn(`[ConfigManager] loadGuildConfig called with undiscovered filename "${filename}"`);
@@ -269,20 +239,13 @@ export function loadGuildConfig(filename: string, guildId: string): any {
 
 /**
  * Save entire guild-specific config file
- * Guild configs are stored in /data/guildConfigs/{guildId}.json
+ * Guild configs are stored in /data/{guildId}/_guildConfig/config.json
  * Module configs are stored in /data/{guildId}/{moduleName}/{filename}
  */
 export function saveGuildConfig(filename: string, guildId: string, data: any): void {
-  // For guild-specific config files in /data/guildConfigs/
+  // Guild-specific config now lives inside the guild namespace.
   if (filename === 'config.json') {
-    const guildConfigPath = path.join(guildConfigsDir, `${guildId}.json`);
-
-    if (!fs.existsSync(guildConfigsDir)) {
-      fs.mkdirSync(guildConfigsDir, { recursive: true });
-    }
-
-    fs.writeFileSync(guildConfigPath, JSON.stringify(data, null, 2), 'utf-8');
-    console.log(`[ConfigManager] Saved guild config: ${guildConfigPath}`);
+    saveData('config.json', { guildId, category: '_guildConfig' }, data);
     return;
   }
 
@@ -293,15 +256,7 @@ export function saveGuildConfig(filename: string, guildId: string, data: any): v
     return;
   }
 
-  const filePath = dataPath(guildId, metadata.moduleName, filename);
-  const dirPath = path.dirname(filePath);
-
-  if (!fs.existsSync(dirPath)) {
-    fs.mkdirSync(dirPath, { recursive: true });
-  }
-
-  fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf-8');
-  console.log(`[ConfigManager] Saved config: ${filePath}`);
+  saveData(filename, { guildId, category: metadata.moduleName }, data);
 }
 
 /**
@@ -319,11 +274,7 @@ export function loadGlobalConfig(filename: string): any {
   // For discovered module data files
   const metadata = getConfigFileMetadata(filename);
   if (metadata && metadata.moduleName) {
-    const filePath = dataPath('global', metadata.moduleName, filename);
-    if (fs.existsSync(filePath)) {
-      return readConfigFile(filePath, {});
-    }
-    return {};
+    return loadData(filename, { scope: 'global', category: metadata.moduleName }, {});
   }
 
   console.warn(`[ConfigManager] loadGlobalConfig called with undiscovered filename "${filename}"`);
@@ -335,31 +286,26 @@ export function loadGlobalConfig(filename: string): any {
  */
 export function saveGlobalConfig(filename: string, data: any): void {
   if (filename === 'config.json') {
-    fs.writeFileSync(rootConfigPath, JSON.stringify(data, null, 2), 'utf-8');
+    // Root config lives outside the guild/global namespaces.
+    writeRawAtomic(rootConfigPath, JSON.stringify(data, null, 2));
     console.log(`[ConfigManager] Saved global config: ${rootConfigPath}`);
     return;
   }
 
   // For discovered module data files
   const metadata = getConfigFileMetadata(filename);
-  let filePath: string;
-
   if (metadata && metadata.moduleName) {
-    filePath = dataPath('global', metadata.moduleName, filename);
-  } else if (metadata && metadata.path) {
-    filePath = metadata.path;
-  } else {
-    console.warn(`[ConfigManager] saveGlobalConfig called with undiscovered filename "${filename}"; skipping`);
+    saveData(filename, { scope: 'global', category: metadata.moduleName }, data);
+    console.log(`[ConfigManager] Saved config: ${dataPath('global', metadata.moduleName, filename)}`);
+    return;
+  }
+  if (metadata && metadata.path) {
+    writeRawAtomic(metadata.path, JSON.stringify(data, null, 2));
+    console.log(`[ConfigManager] Saved config: ${metadata.path}`);
     return;
   }
 
-  const dirPath = path.dirname(filePath);
-  if (!fs.existsSync(dirPath)) {
-    fs.mkdirSync(dirPath, { recursive: true });
-  }
-
-  fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf-8');
-  console.log(`[ConfigManager] Saved config: ${filePath}`);
+  console.warn(`[ConfigManager] saveGlobalConfig called with undiscovered filename "${filename}"; skipping`);
 }
 
 /**

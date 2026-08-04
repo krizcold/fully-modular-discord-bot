@@ -134,6 +134,8 @@ async function runDiskWalk(): Promise<void> {
   walking = true;
   try {
     const collector = getMetricsCollector();
+    // listGuilds() is numeric-only, so _graveyard, _incoming, global and dist
+    // are never walked here; sizeOfGlobalData() excludes the fleet subdir.
     for (const guildId of listGuilds()) {
       const { totalBytes, byModule } = await sizeGuildDir(path.join(BASE_DATA_DIR, guildId));
       collector.setGuildDisk(guildId, totalBytes, byModule);

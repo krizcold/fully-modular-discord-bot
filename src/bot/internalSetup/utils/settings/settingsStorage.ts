@@ -2,42 +2,28 @@
  * Settings Storage - File I/O for module settings
  */
 
-import * as fs from 'fs';
-import * as path from 'path';
 import type { SettingValue, MergedSettings, HardLimitOverride } from '@bot/types/settingsTypes';
-import { dataPath } from '../../../../utils/dataRoot';
+import { deleteData, loadData, saveData } from '../dataManager';
 import { getSettingsSchema } from './settingsDiscovery';
 import { validateSettingValue, validateValueWithEffectiveLimits } from './settingsValidation';
 
 const SETTINGS_FILENAME = 'settings.json';
 
-function getSettingsFilePath(moduleName: string, guildId?: string | null): string {
-  if (guildId) {
-    return dataPath(guildId, moduleName, SETTINGS_FILENAME);
-  }
-  return dataPath('global', moduleName, SETTINGS_FILENAME);
+// Settings live in the module's namespace: guild-scoped under
+// /data/{guildId}/{moduleName}/, global under /data/global/{moduleName}/.
+function settingsOptions(moduleName: string, guildId?: string | null) {
+  return guildId
+    ? { guildId, scope: 'guild' as const, category: moduleName }
+    : { scope: 'global' as const, category: moduleName };
 }
 
 function loadRawSettings(moduleName: string, guildId?: string | null): Record<string, SettingValue> {
-  const filePath = getSettingsFilePath(moduleName, guildId);
-  if (!fs.existsSync(filePath)) return {};
-
-  try {
-    return JSON.parse(fs.readFileSync(filePath, 'utf-8') || '{}');
-  } catch (error) {
-    console.error(`[SettingsStorage] Error reading ${moduleName}:`, error);
-    return {};
-  }
+  return loadData<Record<string, SettingValue>>(SETTINGS_FILENAME, settingsOptions(moduleName, guildId), {});
 }
 
 function saveRawSettings(moduleName: string, settings: Record<string, SettingValue>, guildId?: string | null): void {
-  const filePath = getSettingsFilePath(moduleName, guildId);
-  const dirPath = path.dirname(filePath);
-
-  if (!fs.existsSync(dirPath)) {
-    fs.mkdirSync(dirPath, { recursive: true });
-  }
-  fs.writeFileSync(filePath, JSON.stringify(settings, null, 2), 'utf-8');
+  const ok = saveData(SETTINGS_FILENAME, settingsOptions(moduleName, guildId), settings);
+  if (!ok) throw new Error(`[SettingsStorage] Failed to save settings for ${moduleName}`);
 }
 
 /** Load module settings with 4-tier merge: Guild > Paid tier delta > Global / Free baseline > Schema defaults */
@@ -220,15 +206,8 @@ export function resetModuleSetting(moduleName: string, key: string, guildId?: st
 
 /** Reset all settings (delete file) */
 export function resetAllModuleSettings(moduleName: string, guildId?: string | null): boolean {
-  const filePath = getSettingsFilePath(moduleName, guildId);
-  if (!fs.existsSync(filePath)) return true;
-
-  try {
-    fs.unlinkSync(filePath);
-    return true;
-  } catch {
-    return false;
-  }
+  deleteData(SETTINGS_FILENAME, settingsOptions(moduleName, guildId));
+  return true;
 }
 
 /** Get schema default for a setting */
@@ -300,29 +279,14 @@ const HARD_LIMITS_KEY = '_hardLimits';
 
 /** Load all hard limit overrides for a module (from global settings only) */
 export function loadHardLimits(moduleName: string): Record<string, HardLimitOverride> {
-  const filePath = getSettingsFilePath(moduleName, null);
-  if (!fs.existsSync(filePath)) return {};
-
-  try {
-    const data = JSON.parse(fs.readFileSync(filePath, 'utf-8') || '{}');
-    return data[HARD_LIMITS_KEY] || {};
-  } catch (error) {
-    console.error(`[SettingsStorage] Error reading hard limits for ${moduleName}:`, error);
-    return {};
-  }
+  const data = loadRawSettings(moduleName, null) as Record<string, any>;
+  return data[HARD_LIMITS_KEY] || {};
 }
 
 /** Save a hard limit override for a specific setting */
 export function saveHardLimit(moduleName: string, key: string, limits: HardLimitOverride): boolean {
-  const filePath = getSettingsFilePath(moduleName, null);
-  const dirPath = path.dirname(filePath);
-
   try {
-    // Load existing data
-    let data: Record<string, any> = {};
-    if (fs.existsSync(filePath)) {
-      data = JSON.parse(fs.readFileSync(filePath, 'utf-8') || '{}');
-    }
+    const data = loadRawSettings(moduleName, null) as Record<string, any>;
 
     // Initialize _hardLimits if needed
     if (!data[HARD_LIMITS_KEY]) {
@@ -342,11 +306,7 @@ export function saveHardLimit(moduleName: string, key: string, limits: HardLimit
       delete data[HARD_LIMITS_KEY];
     }
 
-    // Save
-    if (!fs.existsSync(dirPath)) {
-      fs.mkdirSync(dirPath, { recursive: true });
-    }
-    fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf-8');
+    saveRawSettings(moduleName, data, null);
     return true;
   } catch (error) {
     console.error(`[SettingsStorage] Error saving hard limit for ${moduleName}.${key}:`, error);
@@ -392,32 +352,19 @@ export interface GlobalModuleConfig {
 
 /** Load the full global config for a module. */
 export function loadGlobalModuleConfig(moduleName: string): GlobalModuleConfig {
-  const filePath = getSettingsFilePath(moduleName, null);
-  const empty: GlobalModuleConfig = {
-    values: {},
-    hardLimits: {},
-    moduleEnabled: true,
-    disabledCommands: [],
+  const data = loadRawSettings(moduleName, null) as Record<string, any>;
+  const {
+    [HARD_LIMITS_KEY]: hl,
+    [MODULE_ENABLED_KEY]: me,
+    [DISABLED_COMMANDS_KEY]: dc,
+    ...rest
+  } = data;
+  return {
+    values: rest,
+    hardLimits: hl && typeof hl === 'object' ? hl : {},
+    moduleEnabled: me !== false,
+    disabledCommands: Array.isArray(dc) ? dc.filter((c): c is string => typeof c === 'string') : [],
   };
-  if (!fs.existsSync(filePath)) return empty;
-  try {
-    const data = JSON.parse(fs.readFileSync(filePath, 'utf-8') || '{}');
-    const {
-      [HARD_LIMITS_KEY]: hl,
-      [MODULE_ENABLED_KEY]: me,
-      [DISABLED_COMMANDS_KEY]: dc,
-      ...rest
-    } = data;
-    return {
-      values: rest,
-      hardLimits: hl && typeof hl === 'object' ? hl : {},
-      moduleEnabled: me !== false,
-      disabledCommands: Array.isArray(dc) ? dc.filter((c): c is string => typeof c === 'string') : [],
-    };
-  } catch (error) {
-    console.error(`[SettingsStorage] Error reading global config for ${moduleName}:`, error);
-    return empty;
-  }
 }
 
 /**
@@ -443,13 +390,8 @@ export function saveGlobalModuleConfig(
   moduleName: string,
   partial: Partial<GlobalModuleConfig>,
 ): boolean {
-  const filePath = getSettingsFilePath(moduleName, null);
-  const dirPath = path.dirname(filePath);
   try {
-    let data: Record<string, any> = {};
-    if (fs.existsSync(filePath)) {
-      data = JSON.parse(fs.readFileSync(filePath, 'utf-8') || '{}');
-    }
+    const data = loadRawSettings(moduleName, null) as Record<string, any>;
 
     if (partial.values !== undefined) {
       for (const k of Object.keys(data)) {
@@ -484,10 +426,7 @@ export function saveGlobalModuleConfig(
       }
     }
 
-    if (!fs.existsSync(dirPath)) {
-      fs.mkdirSync(dirPath, { recursive: true });
-    }
-    fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf-8');
+    saveRawSettings(moduleName, data, null);
     return true;
   } catch (error) {
     console.error(`[SettingsStorage] Error saving global config for ${moduleName}:`, error);
