@@ -3,7 +3,8 @@
 // store with real CAS replaces it for multi-master durability later, behind
 // this same interface.
 
-import type { LeaseInfo, NodeCapabilities } from './protocol';
+import type { LeaseInfo, MigrationKind, NodeCapabilities, TransferDirection } from './protocol';
+import type { LossEvent } from './healthMonitor';
 
 export interface PersistedTerm {
   term: number;
@@ -32,6 +33,13 @@ export interface PersistedNode {
   lastSeenAt: number;
 }
 
+export interface PersistedRegistry {
+  nodes: PersistedNode[];
+  /** Node-loss event ring; survives master restarts. */
+  lostNodes?: LossEvent[];
+  updatedAt: number;
+}
+
 /** Outgoing plan + registry snapshot written on a confirmed reshard; ownership records are archived, never discarded. */
 export interface ReshardArchive {
   plan: PersistedPlan;
@@ -49,18 +57,92 @@ export interface ReshardMarker {
   archiveFile: string;
 }
 
+/** Master-side migration state machine states (P5). */
+export type MigrationState =
+  | 'PRECHECK'
+  | 'PREPARING'
+  | 'COPYING'
+  | 'DRAINING'
+  | 'VERIFYING'
+  | 'COMMITTING'
+  | 'GRANTING'
+  | 'DONE'
+  | 'ABORTING'
+  | 'ABORTED';
+
+/** One transfer leg of a migration record. */
+export interface MigrationLeg {
+  legId: string;
+  shardId: number;
+  sourceNodeId: string;
+  targetNodeId: string;
+  direction: TransferDirection;
+  guilds: string[];
+  /** Per-leg state for the sequential retire pipeline; undefined for single-barrier kinds. */
+  legState?: MigrationState;
+  error?: string;
+}
+
+/**
+ * Persisted migration record (crash recovery). COMMITTING is written BEFORE the
+ * first commit message leaves - the joint-commit decision barrier: once it is on
+ * disk both-or-neither holds across a master crash.
+ */
+export interface MigrationRecord {
+  id: string;
+  kind: MigrationKind;
+  legs: MigrationLeg[];
+  state: MigrationState;
+  term: number;
+  epoch?: number;
+  error?: string;
+  /** Retire: index of the leg currently executing; legs before it are committed. */
+  currentLegIndex?: number;
+  /**
+   * Sources that were unreachable at COMMITTING: their originals are not yet
+   * graveyarded. Retained on the finished record so the coordinator re-sends the
+   * idempotent XFER_COMMIT when the source reconnects (term/epoch fencing keeps
+   * it from serving meanwhile). Cleared per-node as each source cleanup acks.
+   */
+  pendingSourceCleanup?: { nodeId: string; legIds: string[] }[];
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface PersistedMigrations {
+  active: MigrationRecord | null;
+  history: MigrationRecord[];
+  updatedAt: number;
+}
+
+/**
+ * Redistribute assignment proposal (shard -> node) persisted alongside the
+ * reshard pause. masterResume grants EXACTLY this map so every guild serves
+ * from the node its data was committed to, not a load-based re-distribute.
+ */
+export interface RedistributeProposal {
+  proposal: Record<number, string>;
+  updatedAt: number;
+}
+
 export interface ControlStore {
   /** CAS-acquire a new master term: strictly greater than any previously stored term. */
   acquireTerm(nodeId: string): Promise<number>;
   getTerm(): Promise<PersistedTerm | null>;
   savePlan(plan: PersistedPlan): Promise<void>;
   loadPlan(): Promise<PersistedPlan | null>;
-  saveRegistry(nodes: PersistedNode[]): Promise<void>;
-  loadRegistry(): Promise<PersistedNode[]>;
+  saveRegistry(registry: PersistedRegistry): Promise<void>;
+  loadRegistry(): Promise<PersistedRegistry>;
   /** Archive the outgoing plan + registry on a confirmed reshard; returns the archive file reference. */
   archivePlan(archive: ReshardArchive): Promise<string>;
   /** Fail-closed: null ONLY when the marker file does not exist; any other read/parse failure returns 'corrupt' (still a pause). */
   loadReshardMarker(): Promise<ReshardMarker | 'corrupt' | null>;
   saveReshardMarker(marker: ReshardMarker): Promise<void>;
   clearReshardMarker(): Promise<void>;
+  /** Persist the migration record + history atomically (called on every state transition). */
+  saveMigrations(state: PersistedMigrations): Promise<void>;
+  loadMigrations(): Promise<PersistedMigrations>;
+  /** Persist the redistribute assignment proposal for masterResume; null clears it. */
+  saveRedistributeProposal(proposal: RedistributeProposal | null): Promise<void>;
+  loadRedistributeProposal(): Promise<RedistributeProposal | null>;
 }

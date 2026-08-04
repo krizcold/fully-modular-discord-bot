@@ -9,17 +9,24 @@ import { WebSocket } from 'ws';
 import {
   CONTROL_ACK_TIMEOUT_MS,
   HEARTBEAT_MS,
+  LEASE_RENEW_MS,
   LEASE_TTL_MS,
   RECONNECT_BACKOFF_MS,
 } from './constants';
 import {
+  BudgetInfo,
   ControlEnvelope,
   GuildNoticePayload,
+  HeartbeatPayload,
   LeaseGrantPayload,
+  LeaseRenewedPayload,
   LeaseRevokePayload,
   MSG,
+  NodeDrainPayload,
   RegisterPayload,
   RegisterResult,
+  SyncReportPayload,
+  SyncStatePayload,
 } from './protocol';
 import type { LeaseRuntime } from './leaseRuntime';
 
@@ -28,6 +35,12 @@ export interface ControlClientOptions {
   secret: string;
   buildRegister: () => RegisterPayload;
   runtime: LeaseRuntime;
+  /** Pushed manifest handler (sync engine); the ack is a receipt, sent before this runs. */
+  onSyncState?: (payload: SyncStatePayload) => void;
+  /** Stamps sync fields onto every outgoing heartbeat. */
+  decorateHeartbeat?: (hb: HeartbeatPayload) => HeartbeatPayload;
+  /** Migration control (prepare/drain/commit/abort/inventory) -> executor; returns the ack payload. */
+  onXferControl?: (type: string, data: any) => Promise<any>;
 }
 
 export class ControlClient {
@@ -37,9 +50,12 @@ export class ControlClient {
   private attempt = 0;
   private stopped = false;
   private lastContactAt: number | null = null;
+  private draining = false;
+  private lastBudget: BudgetInfo | null = null;
   private reconnectTimer: NodeJS.Timeout | null = null;
   private heartbeatTimer: NodeJS.Timeout | null = null;
   private ttlTimer: NodeJS.Timeout | null = null;
+  private renewTimer: NodeJS.Timeout | null = null;
   private readonly pending = new Map<string, { resolve: (data: any) => void; reject: (error: Error) => void; timer: NodeJS.Timeout }>();
 
   constructor(private readonly opts: ControlClientOptions) {}
@@ -50,6 +66,7 @@ export class ControlClient {
     // to keep dialing instead of falling off the event loop.
     this.heartbeatTimer = setInterval(() => this.sendHeartbeat(), HEARTBEAT_MS);
     this.ttlTimer = setInterval(() => this.checkTtl(), HEARTBEAT_MS);
+    this.renewTimer = setInterval(() => void this.renewLease(), LEASE_RENEW_MS);
   }
 
   stop(): void {
@@ -57,6 +74,7 @@ export class ControlClient {
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     if (this.ttlTimer) clearInterval(this.ttlTimer);
+    if (this.renewTimer) clearInterval(this.renewTimer);
     this.ws?.terminate();
   }
 
@@ -68,8 +86,35 @@ export class ControlClient {
     return this.term;
   }
 
+  isDraining(): boolean {
+    return this.draining;
+  }
+
+  /** Last budget snapshot carried on a register or renewed reply; kept across master loss for the UI. */
+  getLastBudget(): BudgetInfo | null {
+    return this.lastBudget;
+  }
+
+  getLastContactAgoMs(): number | null {
+    return this.lastContactAt === null ? null : performance.now() - this.lastContactAt;
+  }
+
   sendGuildNotice(notice: GuildNoticePayload): void {
     this.send(MSG.GUILD_NOTICE, { term: this.term, ...notice });
+  }
+
+  /** Sync pull request (files listing / module begin / chunk read). */
+  syncRequest(type: string, data: any): Promise<any> {
+    return this.request(type, data);
+  }
+
+  sendSyncReport(report: SyncReportPayload): void {
+    this.send(MSG.SYNC_REPORT, report);
+  }
+
+  /** Fire-and-forget frame to the master (migration progress/verify). */
+  sendToMaster(type: string, data: any): void {
+    this.send(type, data);
   }
 
   private connect(): void {
@@ -129,6 +174,8 @@ export class ControlClient {
       this.term = result.term;
       this.registered = true;
       this.attempt = 0;
+      this.draining = false;
+      if (result.budget) this.lastBudget = result.budget;
       this.touch();
       console.log(`[Fleet] Registered with master (term ${this.term})`);
     } catch (error) {
@@ -175,6 +222,33 @@ export class ControlClient {
         this.replyAck(requestId, ack);
         break;
       }
+      case MSG.NODE_DRAIN: {
+        const drain = data as NodeDrainPayload;
+        this.draining = true;
+        console.warn(`[Fleet] Drain requested by master (${drain?.reason || 'unspecified'}); revokes follow`);
+        this.replyAck(requestId, { ok: true, term: this.term });
+        break;
+      }
+      case MSG.SYNC_STATE: {
+        // Ack first (receipt, not completion) so the master's push never
+        // waits on the reconcile; register/lease traffic is untouched.
+        this.replyAck(requestId, { ok: true, term: this.term });
+        this.opts.onSyncState?.(data as SyncStatePayload);
+        break;
+      }
+      case MSG.XFER_PREPARE:
+      case MSG.XFER_DRAIN:
+      case MSG.XFER_COMMIT:
+      case MSG.XFER_ABORT:
+      case MSG.XFER_INVENTORY: {
+        // Migration control from the master -> local executor; reply via the ack path.
+        const handler = this.opts.onXferControl;
+        if (!handler) { this.replyAck(requestId, { ok: false, reason: 'migration-unavailable' }); break; }
+        handler(type, data)
+          .then(result => this.replyAck(requestId, result))
+          .catch(error => this.replyAck(requestId, { ok: false, reason: error instanceof Error ? error.message : String(error) }));
+        break;
+      }
       default:
         break;
     }
@@ -216,7 +290,27 @@ export class ControlClient {
 
   private sendHeartbeat(): void {
     if (!this.registered) return;
-    this.send(MSG.HEARTBEAT, this.opts.runtime.buildHeartbeat(this.term));
+    const hb = this.opts.runtime.buildHeartbeat(this.term);
+    this.send(MSG.HEARTBEAT, this.opts.decorateHeartbeat ? this.opts.decorateHeartbeat(hb) : hb);
+  }
+
+  // Renew is observability, not liveness (any master frame renews the lease
+  // clock): it carries the budget snapshot back and makes lease drift visible;
+  // a lease-mismatch reply is fixed master-side (needsGrant), never locally.
+  private async renewLease(): Promise<void> {
+    if (!this.registered || !this.opts.runtime.hasCurrentLease()) return;
+    const current = this.opts.runtime.getCurrent();
+    if (!current) return;
+    try {
+      const reply = (await this.request(MSG.LEASE_RENEW, {
+        term: this.term,
+        leaseIds: current.leases.map(l => l.leaseId),
+      })) as LeaseRenewedPayload;
+      if (reply?.budget) this.lastBudget = reply.budget;
+      if (reply && reply.ok === false) {
+        console.warn(`[Fleet] Lease renew refused (${reply.reason ?? 'unknown'}); master reconciles next tick`);
+      }
+    } catch { /* disconnected or timed out; reconnect and TTL paths handle it */ }
   }
 
   private checkTtl(): void {

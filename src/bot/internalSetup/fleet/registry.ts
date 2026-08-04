@@ -3,7 +3,7 @@
 
 import { randomUUID } from 'crypto';
 import { performance } from 'perf_hooks';
-import { HEARTBEAT_MS, LEASE_TTL_MS } from './constants';
+import { HEALTH_DOWN_MS, HEALTH_LATE_MS } from './constants';
 import type {
   GuildNoticePayload,
   HeartbeatPayload,
@@ -28,11 +28,25 @@ export interface RegistryNode {
   needsGrant: boolean;
   /** Worker's cached lease summary from its last register, reconciled right after acceptance. */
   heldLeases: RegisterPayload['heldLeases'];
+  /** performance.now() when the health monitor confirmed this node down; null while up. */
+  downSince: number | null;
+  /** Operator drain: excluded from placement until the node re-registers. */
+  draining: boolean;
+  /** performance.now() of the last (re)registration; heartbeat-derived held sets are trusted only when newer. */
+  registeredAt: number;
+  /** shardCount from the node's last accepted heartbeat; null when it carried none. */
+  lastShardCount: number | null;
+  /** leaseIds from the node's most recent LEASE_RENEW; drain revokes union them in. */
+  lastRenewLeaseIds: string[] | null;
   lastHeartbeatAt: number | null;
   lastSeq: number;
   shards: ShardStatusEntry[];
   guildCount: number;
   load: LoadSample | null;
+  /** Last fully-applied sync revision from the node's heartbeats; null before the first one. */
+  syncAppliedRevision: number | null;
+  /** False while the node's last reconcile ended degraded; null when unreported. */
+  syncOk: boolean | null;
   send: ((message: object) => void) | null;
 }
 
@@ -94,11 +108,18 @@ export class Registry {
       connected: true,
       needsGrant: true,
       heldLeases: null,
+      downSince: null,
+      draining: false,
+      registeredAt: performance.now(),
+      lastShardCount: existing?.lastShardCount ?? null,
+      lastRenewLeaseIds: null,
       lastHeartbeatAt: existing?.lastHeartbeatAt ?? null,
       lastSeq: existing?.lastSeq ?? 0,
       shards: existing?.shards ?? [],
       guildCount: existing?.guildCount ?? 0,
       load: existing?.load ?? null,
+      syncAppliedRevision: existing?.syncAppliedRevision ?? null,
+      syncOk: existing?.syncOk ?? null,
       send: input.send,
     };
     this.nodes.set(input.nodeId, node);
@@ -121,11 +142,18 @@ export class Registry {
       connected: false,
       needsGrant: true,
       heldLeases: null,
+      downSince: null,
+      draining: false,
+      registeredAt: performance.now(),
+      lastShardCount: null,
+      lastRenewLeaseIds: null,
       lastHeartbeatAt: null,
       lastSeq: 0,
       shards: [],
       guildCount: 0,
       load: null,
+      syncAppliedRevision: null,
+      syncOk: null,
       send: null,
     };
     this.nodes.set(input.nodeId, node);
@@ -146,9 +174,12 @@ export class Registry {
     if (hb.seq <= node.lastSeq && hb.seq !== 1) return;
     node.lastSeq = hb.seq;
     node.lastHeartbeatAt = performance.now();
+    node.lastShardCount = typeof hb.shardCount === 'number' && Number.isInteger(hb.shardCount) ? hb.shardCount : null;
     node.shards = Array.isArray(hb.shards) ? hb.shards : [];
     node.guildCount = Array.isArray(hb.guilds) ? hb.guilds.length : 0;
     node.load = hb.load ?? null;
+    if (Number.isInteger(hb.syncAppliedRevision)) node.syncAppliedRevision = hb.syncAppliedRevision!;
+    if (typeof hb.syncOk === 'boolean') node.syncOk = hb.syncOk;
     this.replaceNodeGuilds(nodeId, Array.isArray(hb.guilds) ? hb.guilds : []);
     this.adoptHeartbeatClaims(nodeId, hb);
   }
@@ -166,6 +197,9 @@ export class Registry {
     if (!Number.isInteger(hb.shardCount) || hb.shardCount !== this.shardCount) return;
     const node = this.nodes.get(nodeId);
     if (!node) return;
+    // A draining node's claims are teardown residue: the drain retry revokes
+    // them off this same heartbeat; adopting would resurrect a revoked lease.
+    if (node.draining) return;
     let adopted = false;
     for (const entry of Array.isArray(hb.shards) ? hb.shards : []) {
       if (!Number.isInteger(entry?.shardId) || entry.shardId < 0 || entry.shardId >= this.shardCount) continue;
@@ -256,12 +290,16 @@ export class Registry {
    * the grant never took, free the shard.
    */
   reconcilePending(): void {
+    const confirmedNodes = new Set<string>();
     for (const [shardId, pending] of this.pendingConfirmation) {
       const node = this.nodes.get(pending.nodeId);
       if (!node) {
         this.pendingConfirmation.delete(shardId);
         continue;
       }
+      // A draining node's pending grants resolve through the drain teardown
+      // (revoke retry / Declare Lost), never by confirmation into the table.
+      if (node.draining) continue;
       if (!node.connected) {
         // Target vanished mid-pending: adopt it as that node's (now frozen)
         // lease so Wait mode holds it until Declare Lost, rather than granting
@@ -273,8 +311,23 @@ export class Registry {
       if (node.lastHeartbeatAt === null || node.lastHeartbeatAt <= pending.grantedAt) continue;
       if (node.shards.some(s => s.shardId === shardId)) {
         this.shardTable.set(shardId, { shardId, nodeId: pending.nodeId, leaseId: pending.leaseId, term: pending.term, epoch: pending.epoch });
+        confirmedNodes.add(pending.nodeId);
       }
       this.pendingConfirmation.delete(shardId);
+    }
+    // Heartbeat proved those sessions live: refresh the node's held snapshot
+    // so the identify mirror charges 0 for the follow-up same-set re-grant.
+    for (const nodeId of confirmedNodes) {
+      const node = this.nodes.get(nodeId);
+      if (!node) continue;
+      node.heldLeases = {
+        term: this.term,
+        epoch: this.epoch,
+        shardCount: this.shardCount,
+        leases: [...this.shardTable.values()]
+          .filter(l => l.nodeId === nodeId)
+          .map(l => ({ leaseId: l.leaseId, shardId: l.shardId })),
+      };
     }
   }
 
@@ -282,8 +335,8 @@ export class Registry {
     if (!node.connected && !node.isSelf) return 'down';
     if (node.lastHeartbeatAt === null) return 'late';
     const age = performance.now() - node.lastHeartbeatAt;
-    if (age < HEARTBEAT_MS * 2.5) return 'up';
-    if (age < LEASE_TTL_MS) return 'late';
+    if (age < HEALTH_LATE_MS) return 'up';
+    if (age < HEALTH_DOWN_MS) return 'late';
     return 'down';
   }
 

@@ -33,6 +33,11 @@ export function getNodeName(): string {
 }
 
 let cachedNodeId: string | null = null;
+// True once getNodeId minted a fresh id this boot (node.json was missing or
+// unparseable), false once a valid id was loaded from disk. Consumed by the
+// residue sweep to tell "this node forgot who it was" apart from a genuine
+// foreign/cloned volume, so a regenerated id never mass-graveyards owned data.
+let nodeIdWasGenerated = false;
 
 export function getNodeId(): string {
   if (cachedNodeId) return cachedNodeId;
@@ -41,13 +46,20 @@ export function getNodeId(): string {
     const parsed = JSON.parse(fs.readFileSync(file, 'utf-8'));
     if (parsed && typeof parsed.nodeId === 'string' && parsed.nodeId.length > 0) {
       cachedNodeId = parsed.nodeId;
+      nodeIdWasGenerated = false;
       return cachedNodeId!;
     }
   } catch { /* first boot */ }
   const nodeId = randomUUID();
+  nodeIdWasGenerated = true;
   atomicWriteFileSync(file, JSON.stringify({ nodeId, createdAt: Date.now() }, null, 2));
   cachedNodeId = nodeId;
   return nodeId;
+}
+
+/** True when getNodeId minted a fresh id this boot (node.json was missing/unparseable). */
+export function wasNodeIdFreshlyGenerated(): boolean {
+  return nodeIdWasGenerated;
 }
 
 let cachedAppVersion: string | null = null;

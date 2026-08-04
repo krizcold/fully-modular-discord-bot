@@ -103,7 +103,7 @@ export async function evaluateRecovery(store: ControlStore, opts: RecoveryOption
 }
 
 async function adoptPlan(store: ControlStore, plan: PersistedPlan): Promise<RecoveryResult> {
-  const persisted = await store.loadRegistry();
+  const persisted = (await store.loadRegistry()).nodes;
   const byId = new Map(persisted.map(n => [n.nodeId, n]));
   const nodes: PersistedNode[] = plan.assignments.map(a =>
     byId.get(a.nodeId) ?? {
@@ -145,7 +145,7 @@ async function confirmedReshard(
   } else {
     from = plan.shardCount;
     at = now;
-    const registry = await store.loadRegistry();
+    const registry = (await store.loadRegistry()).nodes;
     archiveFile = await store.archivePlan({ plan, registry, archivedAt: at, from, to });
   }
   await store.saveReshardMarker({ from, to, at, archiveFile });

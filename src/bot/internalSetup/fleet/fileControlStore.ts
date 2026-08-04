@@ -5,7 +5,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { dataPath } from '../../../utils/dataRoot';
 import { FLEET_DIR } from './constants';
-import type { ControlStore, PersistedNode, PersistedPlan, PersistedTerm, ReshardArchive, ReshardMarker } from './controlStore';
+import type { ControlStore, PersistedMigrations, PersistedPlan, PersistedRegistry, PersistedTerm, RedistributeProposal, ReshardArchive, ReshardMarker } from './controlStore';
 
 export function atomicWriteFileSync(file: string, contents: string): void {
   fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -65,13 +65,17 @@ export class FileControlStore implements ControlStore {
     return readJson<PersistedPlan>(this.file('leases.json'));
   }
 
-  async saveRegistry(nodes: PersistedNode[]): Promise<void> {
-    atomicWriteFileSync(this.file('registry.json'), JSON.stringify({ nodes, updatedAt: Date.now() }, null, 2));
+  async saveRegistry(registry: PersistedRegistry): Promise<void> {
+    atomicWriteFileSync(this.file('registry.json'), JSON.stringify(registry, null, 2));
   }
 
-  async loadRegistry(): Promise<PersistedNode[]> {
-    const parsed = readJson<{ nodes?: PersistedNode[] }>(this.file('registry.json'));
-    return Array.isArray(parsed?.nodes) ? parsed!.nodes! : [];
+  async loadRegistry(): Promise<PersistedRegistry> {
+    const parsed = readJson<PersistedRegistry>(this.file('registry.json'));
+    return {
+      nodes: Array.isArray(parsed?.nodes) ? parsed!.nodes! : [],
+      lostNodes: Array.isArray(parsed?.lostNodes) ? parsed!.lostNodes! : undefined,
+      updatedAt: Number(parsed?.updatedAt) || 0,
+    };
   }
 
   async archivePlan(archive: ReshardArchive): Promise<string> {
@@ -105,5 +109,33 @@ export class FileControlStore implements ControlStore {
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
     }
+  }
+
+  async saveMigrations(state: PersistedMigrations): Promise<void> {
+    atomicWriteFileSync(this.file('migrations.json'), JSON.stringify(state, null, 2));
+  }
+
+  async loadMigrations(): Promise<PersistedMigrations> {
+    const parsed = readJson<PersistedMigrations>(this.file('migrations.json'));
+    return {
+      active: parsed?.active ?? null,
+      history: Array.isArray(parsed?.history) ? parsed!.history! : [],
+      updatedAt: Number(parsed?.updatedAt) || 0,
+    };
+  }
+
+  async saveRedistributeProposal(proposal: RedistributeProposal | null): Promise<void> {
+    const file = this.file('redistribute-proposal.json');
+    if (proposal === null) {
+      try { fs.unlinkSync(file); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+      return;
+    }
+    atomicWriteFileSync(file, JSON.stringify(proposal, null, 2));
+  }
+
+  async loadRedistributeProposal(): Promise<RedistributeProposal | null> {
+    const parsed = readJson<RedistributeProposal>(this.file('redistribute-proposal.json'));
+    if (!parsed || typeof parsed.proposal !== 'object' || parsed.proposal === null) return null;
+    return { proposal: parsed.proposal, updatedAt: Number(parsed.updatedAt) || 0 };
   }
 }

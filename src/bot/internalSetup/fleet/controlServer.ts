@@ -11,6 +11,8 @@ import {
   ControlEnvelope,
   GuildNoticePayload,
   HeartbeatPayload,
+  LeaseRenewedPayload,
+  LeaseRenewPayload,
   MSG,
   RegisterPayload,
   RegisterResult,
@@ -24,7 +26,15 @@ export interface ControlServerHooks {
   afterRegister: (nodeId: string) => void;
   onHeartbeat: (nodeId: string, hb: HeartbeatPayload) => void;
   onGuildNotice: (nodeId: string, notice: GuildNoticePayload) => void;
+  onLeaseRenew: (nodeId: string, payload: LeaseRenewPayload) => LeaseRenewedPayload;
   onDisconnect: (nodeId: string) => void;
+  /** Worker pull requests (control:sync:files / module:begin / read); term-fenced like every post-register message. */
+  onSyncRequest?: (nodeId: string, type: string, data: any) => Promise<any>;
+  onSyncReport?: (nodeId: string, data: any) => void;
+  /** Migration progress from a participant (fire-and-forget into the coordinator). */
+  onXferProgress?: (nodeId: string, data: any) => void;
+  /** Migration verify from a participant (fire-and-forget into the coordinator). */
+  onXferVerify?: (nodeId: string, data: any) => void;
 }
 
 interface ConnState {
@@ -86,6 +96,11 @@ export class ControlServer {
 
   isConnected(nodeId: string): boolean {
     return this.conns.get(nodeId)?.readyState === WebSocket.OPEN;
+  }
+
+  /** Terminate a node's socket (health monitor: silent-but-open connections) so the close path freezes its leases. */
+  dropNode(nodeId: string): void {
+    this.conns.get(nodeId)?.terminate();
   }
 
   /** Request/response to one node (grant, revoke). Rejects on timeout or dead socket. */
@@ -193,6 +208,37 @@ export class ControlServer {
         break;
       case MSG.GUILD_NOTICE:
         this.hooks.onGuildNotice(state.nodeId, (data?.notice ?? data) as GuildNoticePayload);
+        break;
+      case MSG.LEASE_RENEW:
+        if (requestId) this.reply(socket, requestId, this.hooks.onLeaseRenew(state.nodeId, data as LeaseRenewPayload));
+        break;
+      case MSG.SYNC_FILES:
+      case MSG.SYNC_MODULE_BEGIN:
+      case MSG.SYNC_READ: {
+        if (!requestId) break;
+        const nodeId = state.nodeId;
+        const handler = this.hooks.onSyncRequest;
+        if (!handler) {
+          this.reply(socket, requestId, { ok: false, term: this.hooks.getTerm(), reason: 'sync-unavailable' });
+          break;
+        }
+        handler(nodeId, type, data)
+          .then(result => this.reply(socket, requestId, result))
+          .catch(error => this.reply(socket, requestId, {
+            ok: false,
+            term: this.hooks.getTerm(),
+            reason: error instanceof Error ? error.message : String(error),
+          }));
+        break;
+      }
+      case MSG.SYNC_REPORT:
+        this.hooks.onSyncReport?.(state.nodeId, data);
+        break;
+      case MSG.XFER_PROGRESS:
+        this.hooks.onXferProgress?.(state.nodeId, data);
+        break;
+      case MSG.XFER_VERIFY:
+        this.hooks.onXferVerify?.(state.nodeId, data);
         break;
       default:
         if (requestId) this.reply(socket, requestId, { ok: false, term: this.hooks.getTerm(), reason: `unknown-type:${type}` });
