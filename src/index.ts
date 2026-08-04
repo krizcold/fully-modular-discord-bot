@@ -25,7 +25,7 @@ initLogCapture();
 
 import 'dotenv/config';
 import { BotManager } from './webui/botManager';
-import { startWebUI } from './webui';
+import { startWebUI, flushBeforeExit } from './webui';
 import { ensureConfigPopulated } from './bot/internalSetup/utils/configManager';
 import { getSafetyManager } from './utils/updateSafety';
 
@@ -100,12 +100,14 @@ async function main() {
   process.on('SIGTERM', async () => {
     console.log('[Main] SIGTERM received, shutting down...');
     await botManager.shutdown(false);
+    await flushBeforeExit();
     process.exit(0);
   });
 
   process.on('SIGINT', async () => {
     console.log('[Main] SIGINT received, shutting down...');
     await botManager.shutdown(false);
+    await flushBeforeExit();
     process.exit(0);
   });
 }

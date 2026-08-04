@@ -10,6 +10,7 @@ import { setupMetricsIPCHandlers } from './utils/ipcMetricsHandler';
 import { setupFleetIPCHandlers } from './utils/ipcFleetHandler';
 import { getMetricsCollector } from './utils/metrics/metricsCollector';
 import { startSamplers, stopSamplers } from './utils/metrics/samplers';
+import { flushAll, sweepGraveyard } from './utils/dataManager';
 import { setupReloadIPCHandlers } from './utils/ipcReloadHandler';
 import { setupToggleIPCHandlers, applyAllDisabledStatesOnBoot } from './utils/ipcToggleHandler';
 import { setupIPCNotificationHandler } from './utils/ipcNotificationHandler';
@@ -455,6 +456,15 @@ async function main() {
   // until its master grants a lease.
   const fleet = await initFleet();
 
+  // Fleet IPC needs no client and must answer while the sync gate below
+  // blocks, so the webui can poll /api/fleet/state during the wait.
+  setupFleetIPCHandlers();
+
+  // Sync boot gate: a co-worker blocks until its files/modules mirror the
+  // master (instant on master + standalone). Runs BEFORE ensureConfigPopulated
+  // so the master's config.json lands first.
+  await fleet.awaitSyncReady();
+
   // PHASE 0: Ensure config.json is fully populated with schema
   console.log('[Bot] Synchronizing config.json with schema...');
   ensureConfigPopulated();
@@ -611,8 +621,11 @@ async function main() {
       console.error('[Bot] Error recovering persistent panels:', error);
     }
 
-    // Start module auto-update scheduler (checks every 30min if enabled)
-    startModuleAutoUpdater(client);
+    // Start module auto-update scheduler (checks every 30min if enabled).
+    // Co-workers receive module updates only via master sync.
+    if (fleet.role !== 'co-worker') {
+      startModuleAutoUpdater(client);
+    }
   });
 
   // Set up IPC message handlers for Web-UI panel integration
@@ -620,9 +633,6 @@ async function main() {
 
   // Set up IPC message handlers for metrics
   setupMetricsIPCHandlers();
-
-  // Set up IPC message handlers for fleet state
-  setupFleetIPCHandlers();
 
   // Set up IPC message handlers for module hot-reload
   setupReloadIPCHandlers(client);
@@ -665,16 +675,27 @@ async function main() {
   const metrics = getMetricsCollector();
   metrics.seedTotals();
   startSamplers(client);
+
+  // Graveyard TTL sweep: at boot and every 24h. unref() so it never keeps the
+  // process alive.
+  void sweepGraveyard().catch(err => console.warn('[clientInitializer] Graveyard sweep failed:', err));
+  const graveyardTimer = setInterval(() => {
+    void sweepGraveyard().catch(err => console.warn('[clientInitializer] Graveyard sweep failed:', err));
+  }, 24 * 60 * 60 * 1000);
+  graveyardTimer.unref();
+
   let shuttingDown = false;
-  const shutdownHandler = () => {
+  const shutdownHandler = async () => {
     if (shuttingDown) return;
     shuttingDown = true;
     stopSamplers();
-    metrics.flushTotals();
+    metrics.flushTotals(); // writes via saveData, so it must precede flushAll
+    // Drain the write queue before exit (bounded), so no accepted write is lost.
+    await Promise.race([flushAll(), new Promise(resolve => setTimeout(resolve, 5000))]);
     process.exit(0);
   };
-  process.on('SIGTERM', shutdownHandler);
-  process.on('SIGINT', shutdownHandler);
+  process.on('SIGTERM', () => void shutdownHandler());
+  process.on('SIGINT', () => void shutdownHandler());
 
   // Login is gated by the lease runtime: no identify without a current-term
   // lease, honoring the grant's identify delay. Standalone starts immediately.

@@ -9,17 +9,15 @@ import { loadCredentials } from '../../utils/envLoader';
 let sessionStore: session.Store | undefined;
 
 /**
- * Stable-per-process fallback session secret, used only when the user has
- * not configured SESSION_SECRET. Generated once at first request and kept
- * for the bot process's lifetime so sessions stay valid within a single run.
- * Sessions WILL be invalidated on restart in this mode; set SESSION_SECRET
- * explicitly for cross-restart stability.
+ * Last-resort fallback session secret. ensureDurableSessionSecret() persists
+ * one to /data/.env at startup, so this only triggers when /data is not
+ * writable; sessions then last for this process's lifetime only.
  */
 let bootFallbackSecret: string | null = null;
 function getBootFallbackSecret(): string {
   if (!bootFallbackSecret) {
     bootFallbackSecret = crypto.randomBytes(32).toString('hex');
-    console.warn('[SessionManager] SESSION_SECRET not set; generated a random boot-time secret. Sessions will not survive a bot restart. Set SESSION_SECRET in the Credentials panel for persistence.');
+    console.log('[SessionManager] Using an in-memory boot-time session secret (/data not writable?); sessions will not survive a restart.');
   }
   return bootFallbackSecret;
 }

@@ -2,6 +2,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import * as crypto from 'crypto';
 import * as dotenv from 'dotenv';
 import { dataPath } from './dataRoot';
 
@@ -34,6 +35,8 @@ export interface BotCredentials {
   PIN_TEST_GUILD_SHARD?: string;
   FLEET_SHARD_COUNT?: string;
   FLEET_SHARD_CAPACITY?: string;
+  TRANSFER_URL?: string;
+  TRANSFER_PORT?: string;
   // OAuth Configuration (Optional - for Guild Web-UI)
   ENABLE_GUILD_WEBUI?: string;
   DISCORD_CLIENT_ID?: string;
@@ -88,6 +91,8 @@ export function loadCredentials(): BotCredentials {
     PIN_TEST_GUILD_SHARD: process.env.PIN_TEST_GUILD_SHARD,
     FLEET_SHARD_COUNT: process.env.FLEET_SHARD_COUNT,
     FLEET_SHARD_CAPACITY: process.env.FLEET_SHARD_CAPACITY,
+    TRANSFER_URL: process.env.TRANSFER_URL,
+    TRANSFER_PORT: process.env.TRANSFER_PORT,
     // OAuth fields
     ENABLE_GUILD_WEBUI: process.env.ENABLE_GUILD_WEBUI,
     DISCORD_CLIENT_ID: process.env.DISCORD_CLIENT_ID,
@@ -157,6 +162,34 @@ export function loadCredentials(): BotCredentials {
   }
 
   return credentials;
+}
+
+/**
+ * Durable SESSION_SECRET: generate once and APPEND to /data/.env (append-only
+ * on purpose - round-tripping the whole credentials object would freeze
+ * compose-env values into the file). Sessions then survive restarts with
+ * either the memory or the Redis store.
+ */
+export function ensureDurableSessionSecret(): void {
+  const credentials = loadCredentials();
+  if (credentials.SESSION_SECRET && credentials.SESSION_SECRET.trim() !== '') {
+    if (!process.env.SESSION_SECRET) process.env.SESSION_SECRET = credentials.SESSION_SECRET;
+    return;
+  }
+  const secret = crypto.randomBytes(32).toString('hex');
+  const dataEnvPath = dataPath('.env');
+  try {
+    fs.mkdirSync(path.dirname(dataEnvPath), { recursive: true });
+    const needsNewline = fs.existsSync(dataEnvPath)
+      && fs.statSync(dataEnvPath).size > 0
+      && !fs.readFileSync(dataEnvPath, 'utf-8').endsWith('\n');
+    fs.appendFileSync(dataEnvPath, `${needsNewline ? '\n' : ''}SESSION_SECRET=${secret}\n`, 'utf-8');
+    process.env.SESSION_SECRET = secret;
+    console.log('[EnvLoader] Generated durable SESSION_SECRET in /data/.env');
+  } catch (error) {
+    // Read-only /data: the sessionManager boot fallback covers this run.
+    console.warn('[EnvLoader] Could not persist SESSION_SECRET:', error instanceof Error ? error.message : error);
+  }
 }
 
 /**

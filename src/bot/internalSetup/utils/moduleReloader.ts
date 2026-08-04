@@ -127,7 +127,7 @@ function copyBuildAssetsToDist(): void {
   }
 }
 
-async function recompileTypeScript(): Promise<{ success: boolean; error?: string; duration: number }> {
+export async function recompileTypeScript(): Promise<{ success: boolean; error?: string; duration: number }> {
   if (recompileInProgress) {
     return new Promise(resolve => {
       const check = setInterval(() => {
