@@ -7,13 +7,21 @@ import * as https from 'https';
 import { randomUUID } from 'crypto';
 import { GATEWAY_INFO_TIMEOUT_MS, IDENTIFY_SPACING_MS } from './constants';
 import type { LeaseInfo } from './protocol';
+import type { Registry, RegistryNode } from './registry';
+
+export interface SessionStartLimit {
+  total: number;
+  remaining: number;
+  resetAfterMs: number;
+}
 
 export interface GatewayInfo {
   recommendedShards: number;
   maxConcurrency: number;
+  sessionStartLimit: SessionStartLimit | null;
 }
 
-/** GET /gateway/bot for the recommended shard count and identify concurrency. Null on any failure. */
+/** GET /gateway/bot for the recommended shard count, identify concurrency and identify budget. Null on any failure. */
 export function fetchGatewayInfo(token: string | undefined): Promise<GatewayInfo | null> {
   if (!token || token.trim() === '') return Promise.resolve(null);
   return new Promise(resolve => {
@@ -27,9 +35,17 @@ export function fetchGatewayInfo(token: string | undefined): Promise<GatewayInfo
           try {
             if (res.statusCode !== 200) return resolve(null);
             const parsed = JSON.parse(body);
+            const ssl = parsed?.session_start_limit;
             resolve({
               recommendedShards: Number(parsed.shards) || 1,
-              maxConcurrency: Number(parsed?.session_start_limit?.max_concurrency) || 1,
+              maxConcurrency: Number(ssl?.max_concurrency) || 1,
+              sessionStartLimit: ssl && Number.isFinite(Number(ssl.total))
+                ? {
+                    total: Number(ssl.total),
+                    remaining: Number(ssl.remaining) || 0,
+                    resetAfterMs: Number(ssl.reset_after) || 0,
+                  }
+                : null,
             });
           } catch {
             resolve(null);
@@ -144,6 +160,122 @@ export function resolvePinnedShardId(shardCount: number): number | null {
   const guildId = (process.env.GUILD_ID || '').trim();
   if (!/^\d+$/.test(guildId)) return null;
   return guildIdToShardId(guildId, shardCount);
+}
+
+/**
+ * Placement v1.5: place FREE shards on the least-loaded eligible nodes,
+ * biggest-impact shards (most fleet guilds) first. Eligible = connected, not
+ * draining, under target; the caller pre-filters ledger-backoff nodes. The
+ * pinned-shard-to-master rule runs in the caller before this.
+ */
+export function pickFreePlacements(
+  freePool: number[],
+  nodes: RegistryNode[],
+  registry: Registry,
+  targetFor: (node: RegistryNode) => number,
+): Map<string, number[]> {
+  const placements = new Map<string, number[]>();
+  const eligible = nodes
+    .filter(n => n.connected && !n.draining)
+    .sort((a, b) => (a.isSelf === b.isSelf ? a.nodeId.localeCompare(b.nodeId) : a.isSelf ? -1 : 1));
+  if (eligible.length === 0) return placements;
+
+  const held = new Map<string, number>();
+  for (const node of eligible) held.set(node.nodeId, registry.shardIdsOf(node.nodeId).length);
+
+  const pool = [...freePool].sort(
+    (a, b) => (registry.shardGuildTotals.get(b) ?? 0) - (registry.shardGuildTotals.get(a) ?? 0),
+  );
+  for (const shardId of pool) {
+    let best: RegistryNode | null = null;
+    let bestScore = Infinity;
+    for (const node of eligible) {
+      const target = targetFor(node);
+      const has = held.get(node.nodeId) ?? 0;
+      if (has >= target) continue;
+      const loadScore = node.load ? node.load.cpuPct + node.load.loopLagMs / 10 : 50;
+      const score = (has / Math.max(1, target)) * 100 + loadScore + node.guildCount / 100;
+      if (score < bestScore) {
+        bestScore = score;
+        best = node;
+      }
+    }
+    if (!best) break;
+    const arr = placements.get(best.nodeId) ?? [];
+    arr.push(shardId);
+    placements.set(best.nodeId, arr);
+    held.set(best.nodeId, (held.get(best.nodeId) ?? 0) + 1);
+  }
+  return placements;
+}
+
+export interface PinRestoreLeg {
+  shardId: number;
+  fromNodeId: string;
+  toNodeId: string;
+}
+
+export interface PinRestorePlan {
+  proposedLegs: PinRestoreLeg[] | null;
+  reason?: string;
+}
+
+/**
+ * Swap proposal (P5): when PIN_TEST_GUILD_SHARD is on and the pinned shard is
+ * held by a live non-master node, propose the lease moves that bring it back to
+ * the master. Leg 1 = pinned shard -> master. If the master is at capacity, the
+ * displaced leg moves the master's lowest-guild-count shard to the pinned
+ * shard's current holder (if it has capacity), else any connected node with
+ * free capacity, else null + reason 'no-capacity'. The general mechanism is N
+ * lease moves under one barrier; a strict 1:1 swap is the equal-capacity case.
+ * NEVER auto-executed - the Swap button submits the returned legs.
+ */
+export function planPinRestoreLegs(
+  registry: Registry,
+  pinnedShardId: number,
+  masterNodeId: string,
+): PinRestorePlan | null {
+  const held = registry.shardTable.get(pinnedShardId);
+  if (!held || held.nodeId === masterNodeId) return null;
+  const holder = registry.nodes.get(held.nodeId);
+  if (!holder || !holder.connected) return null; // frozen holder: Wait/Declare Lost, not Swap
+  const master = registry.nodes.get(masterNodeId);
+  if (!master) return null;
+
+  const legs: PinRestoreLeg[] = [{ shardId: pinnedShardId, fromNodeId: held.nodeId, toNodeId: masterNodeId }];
+
+  const masterCapacity = Math.max(1, master.capabilities?.shardCapacity ?? 1);
+  const masterHeld = registry.shardIdsOf(masterNodeId).length;
+  // After receiving the pinned shard the master would hold masterHeld + 1.
+  if (masterHeld + 1 <= masterCapacity) {
+    return { proposedLegs: legs };
+  }
+
+  // Master is at capacity: displace its lowest-guild-count shard.
+  const guildsOnShard = (shardId: number): number =>
+    registry.shardGuildTotals.get(shardId) ?? 0;
+  const masterShards = registry.shardIdsOf(masterNodeId)
+    .filter(s => s !== pinnedShardId)
+    .sort((a, b) => guildsOnShard(a) - guildsOnShard(b));
+  const displaced = masterShards[0];
+  if (displaced === undefined) return { proposedLegs: null, reason: 'no-capacity' };
+
+  // Prefer the pinned shard's current holder if it will have capacity after
+  // giving up the pinned shard; else any connected node with free capacity.
+  const holderCapacity = Math.max(1, holder.capabilities?.shardCapacity ?? 1);
+  const holderHeldAfter = registry.shardIdsOf(held.nodeId).length - 1; // it releases the pinned shard
+  let target: string | null = holderHeldAfter < holderCapacity ? held.nodeId : null;
+  if (!target) {
+    for (const node of registry.nodes.values()) {
+      if (node.nodeId === masterNodeId || node.nodeId === held.nodeId) continue;
+      if (!node.connected || node.draining) continue;
+      const cap = Math.max(1, node.capabilities?.shardCapacity ?? 1);
+      if (registry.shardIdsOf(node.nodeId).length < cap) { target = node.nodeId; break; }
+    }
+  }
+  if (!target) return { proposedLegs: null, reason: 'no-capacity' };
+  legs.push({ shardId: displaced, fromNodeId: masterNodeId, toNodeId: target });
+  return { proposedLegs: legs };
 }
 
 /**
