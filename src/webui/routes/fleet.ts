@@ -73,5 +73,138 @@ export function createFleetRoutes(botManager: BotManager): Router {
     }
   });
 
+  /**
+   * POST /api/fleet/declare-lost { nodeId }
+   * Master-only operator verdict on a down node: free its shards and forget
+   * it. The bot child does the authoritative validation (connected nodes are
+   * refused with a Drain hint); never a 500.
+   */
+  router.post('/declare-lost', async (req: Request, res: Response) => {
+    try {
+      if (!botManager.isRunning()) {
+        res.json({ success: false, error: 'Bot is not running' });
+        return;
+      }
+      const nodeId = String(req.body?.nodeId ?? '');
+      const result = await botManager.declareFleetNodeLost(nodeId);
+      res.json(result?.success ? { success: true } : { success: false, error: result?.error ?? 'declare lost failed' });
+    } catch (error) {
+      console.error('[Fleet] Failed to declare node lost:', error instanceof Error ? error.message : error);
+      res.json({ success: false, error: error instanceof Error ? error.message : 'declare lost failed' });
+    }
+  });
+
+  /**
+   * POST /api/fleet/drain { nodeId }
+   * Master-only manual lease drain of a live worker. The bot child does the
+   * authoritative validation; never a 500.
+   */
+  router.post('/drain', async (req: Request, res: Response) => {
+    try {
+      if (!botManager.isRunning()) {
+        res.json({ success: false, error: 'Bot is not running' });
+        return;
+      }
+      const nodeId = String(req.body?.nodeId ?? '');
+      const result = await botManager.drainFleetNode(nodeId);
+      res.json(result?.success ? { success: true } : { success: false, error: result?.error ?? 'drain failed' });
+    } catch (error) {
+      console.error('[Fleet] Failed to drain node:', error instanceof Error ? error.message : error);
+      res.json({ success: false, error: error instanceof Error ? error.message : 'drain failed' });
+    }
+  });
+
+  /**
+   * POST /api/fleet/migrate { kind, ... }
+   * Master-only: start a migration (move/swap/retire/redistribute). The bot
+   * child validates (concurrency, health, ownership, route); never a 500.
+   */
+  router.post('/migrate', async (req: Request, res: Response) => {
+    try {
+      if (!botManager.isRunning()) {
+        res.json({ success: false, error: 'Bot is not running' });
+        return;
+      }
+      const result = await botManager.startFleetMigration(req.body ?? {});
+      res.json(result?.success ? { success: true, migrationId: result.migrationId } : { success: false, error: result?.error ?? 'migration failed' });
+    } catch (error) {
+      console.error('[Fleet] Failed to start migration:', error instanceof Error ? error.message : error);
+      res.json({ success: false, error: error instanceof Error ? error.message : 'migration failed' });
+    }
+  });
+
+  /**
+   * POST /api/fleet/migrate/precheck { kind, ... }
+   * Master-only dry-run: returns est size, target free space, direction, guilds,
+   * warnings (and the redistribute move set) for the confirm dialog.
+   */
+  router.post('/migrate/precheck', async (req: Request, res: Response) => {
+    try {
+      if (!botManager.isRunning()) {
+        res.json({ success: false, error: 'Bot is not running' });
+        return;
+      }
+      const result = await botManager.precheckFleetMigration(req.body ?? {});
+      res.json(result?.success ? { success: true, precheck: result.precheck } : { success: false, error: result?.error ?? 'precheck failed' });
+    } catch (error) {
+      console.error('[Fleet] Failed to precheck migration:', error instanceof Error ? error.message : error);
+      res.json({ success: false, error: error instanceof Error ? error.message : 'precheck failed' });
+    }
+  });
+
+  /**
+   * POST /api/fleet/migrate/abort { migrationId }
+   * Master-only: abort the active migration (refused post-commit).
+   */
+  router.post('/migrate/abort', async (req: Request, res: Response) => {
+    try {
+      if (!botManager.isRunning()) {
+        res.json({ success: false, error: 'Bot is not running' });
+        return;
+      }
+      const result = await botManager.abortFleetMigration(String(req.body?.migrationId ?? ''));
+      res.json(result?.success ? { success: true } : { success: false, error: result?.error ?? 'abort failed' });
+    } catch (error) {
+      console.error('[Fleet] Failed to abort migration:', error instanceof Error ? error.message : error);
+      res.json({ success: false, error: error instanceof Error ? error.message : 'abort failed' });
+    }
+  });
+
+  /**
+   * POST /api/fleet/migrate/resume { migrationId }
+   * Master-only: resume a paused retire at its failed leg.
+   */
+  router.post('/migrate/resume', async (req: Request, res: Response) => {
+    try {
+      if (!botManager.isRunning()) {
+        res.json({ success: false, error: 'Bot is not running' });
+        return;
+      }
+      const result = await botManager.resumeFleetMigration(String(req.body?.migrationId ?? ''));
+      res.json(result?.success ? { success: true } : { success: false, error: result?.error ?? 'resume failed' });
+    } catch (error) {
+      console.error('[Fleet] Failed to resume migration:', error instanceof Error ? error.message : error);
+      res.json({ success: false, error: error instanceof Error ? error.message : 'resume failed' });
+    }
+  });
+
+  /**
+   * GET /api/fleet/migrations
+   * Master-only: the active + recent migrations. Degrade-never-500 like /state.
+   */
+  router.get('/migrations', async (_req: Request, res: Response) => {
+    try {
+      if (!botManager.isRunning()) {
+        res.json({ success: true, running: false, migrations: { active: null, history: [] } });
+        return;
+      }
+      const result = await botManager.listFleetMigrations();
+      res.json({ success: true, running: true, migrations: result?.migrations ?? { active: null, history: [] } });
+    } catch (error) {
+      console.error('[Fleet] Failed to list migrations:', error instanceof Error ? error.message : error);
+      res.json({ success: true, running: botManager.isRunning(), migrations: { active: null, history: [] } });
+    }
+  });
+
   return router;
 }

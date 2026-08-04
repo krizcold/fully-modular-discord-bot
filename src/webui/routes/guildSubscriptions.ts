@@ -4,6 +4,7 @@ import { Router, Request, Response } from 'express';
 import { requireOAuth, requireGuildAccess } from '../auth/oauthMiddleware';
 import { getPremiumManager } from '../../bot/internalSetup/utils/premiumManager';
 import { getPaymentRegistry } from '../../bot/internalSetup/utils/payment/paymentRegistry';
+import { isCoWorkerNode } from '../middleware/fleetGate';
 
 export function createGuildSubscriptionRoutes(): Router {
   const router = Router();
@@ -35,6 +36,14 @@ export function createGuildSubscriptionRoutes(): Router {
    * offeringId / variantId we encoded at initiate time).
    */
   router.get('/patreon/callback', async (req: Request, res: Response) => {
+    // This GET mutates premium state (master-authoritative synced scope);
+    // blockWritesOnCoWorker lets GETs through, so guard it explicitly here.
+    if (isCoWorkerNode()) {
+      return res.status(503).type('html').send(
+        '<h2>Premium is managed on the master node.</h2>' +
+        '<p>Open this server\'s subscription page on the master bot\'s Web UI to link Patreon.</p>'
+      );
+    }
     const provider = getPaymentRegistry().get('patreon');
     if (!provider || !provider.handleOAuthCallback) {
       return res.status(503).type('html').send(

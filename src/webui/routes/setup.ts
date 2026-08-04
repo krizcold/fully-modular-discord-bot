@@ -16,6 +16,11 @@ import {
   getDeploymentMode
 } from '../../utils/envLoader';
 import { reconfigureOAuth } from '../auth/oauthConfig';
+import { isStandalone as isStandaloneFleet, resolveNodeRole } from '../../bot/internalSetup/fleet/nodeIdentity';
+import { isCoWorkerNode } from '../middleware/fleetGate';
+
+/** The only fields a co-worker edits locally; everything else mirrors the master via sync. */
+const CONNECTION_FIELDS = ['DISCORD_TOKEN', 'MASTER_URL', 'CONTROL_SECRET', 'NODE_NAME', 'FLEET_SHARD_CAPACITY'] as const;
 
 const OAUTH_FIELDS = ['ENABLE_GUILD_WEBUI', 'DISCORD_CLIENT_ID', 'DISCORD_CLIENT_SECRET', 'OAUTH_CALLBACK_URL'] as const;
 
@@ -72,6 +77,7 @@ export function createSetupRoutes(): Router {
         MAIN_GUILD_ID: credentials.MAIN_GUILD_ID || null
       };
 
+      const nodeRole = resolveNodeRole();
       res.json({
         success: true,
         // Main credentials are managed by Bot Manager
@@ -79,9 +85,23 @@ export function createSetupRoutes(): Router {
         managedByBotManager: ['DISCORD_TOKEN', 'CLIENT_ID', 'GUILD_ID'],
         // Deployment mode: UI uses this to hide / disable bot credential fields when managed
         deploymentMode: getDeploymentMode(),
+        // Fleet role: co-worker UIs hide master-owned tabs and show the Connection page
+        nodeRole,
+        standalone: isStandaloneFleet(),
         // Optional settings status
         credentials: status,
-        guildIds: guildIds
+        guildIds: guildIds,
+        // Co-worker Connection page values (MASTER_URL/NODE_NAME/capacity are
+        // not secrets; token and secret report set/unset only)
+        ...(nodeRole === 'co-worker' ? {
+          connection: {
+            MASTER_URL: credentials.MASTER_URL || '',
+            NODE_NAME: credentials.NODE_NAME || '',
+            FLEET_SHARD_CAPACITY: credentials.FLEET_SHARD_CAPACITY || '',
+            CONTROL_SECRET_SET: !!(credentials.CONTROL_SECRET && credentials.CONTROL_SECRET.trim() !== ''),
+            DISCORD_TOKEN_SET: !!(credentials.DISCORD_TOKEN && credentials.DISCORD_TOKEN.trim() !== ''),
+          },
+        } : {}),
       });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
@@ -102,6 +122,42 @@ export function createSetupRoutes(): Router {
    */
   router.post('/credentials', async (req: Request, res: Response) => {
     try {
+      // Co-worker: accept only connection fields; every other field is
+      // preserved (mirrors the managed-mode ignore precedent below).
+      if (isCoWorkerNode()) {
+        const existingCredentials = loadCredentials();
+        const credentials: BotCredentials = { ...existingCredentials };
+        for (const field of CONNECTION_FIELDS) {
+          const value = req.body?.[field];
+          if (typeof value === 'string' && value.trim() !== '') {
+            credentials[field] = value.trim();
+          }
+        }
+        if (credentials.FLEET_SHARD_CAPACITY !== undefined && credentials.FLEET_SHARD_CAPACITY !== ''
+            && !/^\d+$/.test(credentials.FLEET_SHARD_CAPACITY)) {
+          res.status(400).json({ success: false, error: 'FLEET_SHARD_CAPACITY must be a positive integer' });
+          return;
+        }
+        const saveResult = saveCredentials(credentials);
+        if (!saveResult.success) {
+          res.status(500).json({ success: false, error: saveResult.error || 'Failed to save credentials' });
+          return;
+        }
+        const reloadActions = computeReloadActions(existingCredentials, credentials);
+        res.json({
+          success: true,
+          message: 'Connection settings saved successfully',
+          credentials: getCredentialStatus(credentials),
+          reload: {
+            changes: reloadActions,
+            oauthReconfigured: false,
+            sessionSecretChanged: false,
+            botCredentialsChanged: reloadActions.length > 0,
+          },
+        });
+        return;
+      }
+
       const isStandalone = getDeploymentMode() === 'standalone';
       const {
         // Main credentials: only honored when isStandalone (ignored when managed)

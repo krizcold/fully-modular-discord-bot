@@ -17,10 +17,19 @@ import {
   saveGlobalConfig,
   saveGuildConfig
 } from '../../bot/internalSetup/utils/configManager';
+import { writeRawAtomic } from '../../bot/internalSetup/utils/dataManager';
 import { dataPath } from '../../utils/dataRoot';
+import { coWorkerReadonlyResponse, isCoWorkerNode } from '../middleware/fleetGate';
+import { nudgeSync } from '../utils/syncNudge';
 
 export function createConfigRoutes(): Router {
   const router = Router();
+
+  // A guild id must be a plain Discord snowflake. Anything else ('global',
+  // 'guildConfigs', a '..'-bearing value) either targets master-owned global
+  // state through the guild-scoped path or escapes the guild dir via path.join,
+  // so it is rejected for ALL nodes before it reaches dataPath()/saveGuildConfig.
+  const isValidGuildId = (id: unknown): id is string => typeof id === 'string' && /^\d{5,20}$/.test(id);
 
   const BACKUP_DIR = dataPath('configBackups');
 
@@ -135,6 +144,20 @@ export function createConfigRoutes(): Router {
       const fileId = req.body.file || 'config.json';
       const newConfig = req.body.config;
       const guildId = req.body.guildId as string | undefined;
+      // Any guild-scoped write must carry a genuine snowflake (all nodes): a
+      // reserved sentinel like 'global' would otherwise hit the same file as a
+      // global write and escape the guild-scoped allowance. A null/absent
+      // guildId is a legitimate global write and routes below.
+      if (guildId != null && !isValidGuildId(guildId)) {
+        res.status(400).json({ success: false, error: 'Invalid guildId format' });
+        return;
+      }
+      // Co-worker: global config is synced from the master; only genuine
+      // node-owned guild writes stay allowed (guild data is node-owned).
+      if (!guildId && isCoWorkerNode()) {
+        coWorkerReadonlyResponse(res);
+        return;
+      }
       const configInfo = getConfigFileMetadata(fileId);
 
       if (!configInfo) {
@@ -169,7 +192,7 @@ export function createConfigRoutes(): Router {
       if (guildId && configInfo.moduleName) {
         actualConfigPath = dataPath(guildId, configInfo.moduleName, fileId);
       } else if (guildId) {
-        actualConfigPath = dataPath('guildConfigs', `${guildId}.json`);
+        actualConfigPath = dataPath(guildId, '_guildConfig', 'config.json');
       } else {
         actualConfigPath = configInfo.path;
       }
@@ -203,6 +226,7 @@ export function createConfigRoutes(): Router {
       } else {
         saveGlobalConfig(fileId, newConfig);
         console.log(`[Config] ${fileId} updated successfully (global)`);
+        nudgeSync('config');
       }
 
       res.json({
@@ -276,6 +300,11 @@ export function createConfigRoutes(): Router {
    */
   router.post('/restore', (req: Request, res: Response) => {
     try {
+      // Restore writes the master-authoritative global path; co-workers never restore.
+      if (isCoWorkerNode()) {
+        coWorkerReadonlyResponse(res);
+        return;
+      }
       const { filename, file } = req.body;
       const fileId = file || 'config.json';
       const configInfo = getConfigFileMetadata(fileId);
@@ -324,15 +353,12 @@ export function createConfigRoutes(): Router {
         fs.copyFileSync(configInfo.path, currentBackup);
       }
 
-      // Ensure parent directory exists
-      const configDir = path.dirname(configInfo.path);
-      if (!fs.existsSync(configDir)) {
-        fs.mkdirSync(configDir, { recursive: true });
-      }
-
-      // Restore backup
-      fs.copyFileSync(backupPath, configInfo.path);
+      // Restore backup through the facade so it is ordered by the single
+      // per-path write queue (an in-flight update flush cannot clobber it).
+      const backupContents = fs.readFileSync(backupPath, 'utf-8');
+      writeRawAtomic(configInfo.path, backupContents);
       console.log(`[Config] Restored ${fileId} from backup: ${filename}`);
+      nudgeSync('config');
 
       res.json({
         success: true,
@@ -421,6 +447,20 @@ export function createConfigRoutes(): Router {
       const newData = req.body.data;
       const guildId = req.body.guildId as string | undefined;
 
+      // A guild-scoped data write must be a genuine snowflake (all nodes), or a
+      // sentinel/traversal value would reach master-owned global data. A
+      // null/absent guildId is a legitimate global write and routes below.
+      if (guildId != null && !isValidGuildId(guildId)) {
+        res.status(400).json({ success: false, error: 'Invalid guildId format' });
+        return;
+      }
+      // Co-worker: global data files are synced from the master; only genuine
+      // node-owned guild writes stay allowed.
+      if (!guildId && isCoWorkerNode()) {
+        coWorkerReadonlyResponse(res);
+        return;
+      }
+
       if (!fileId) {
         res.status(400).json({
           success: false,
@@ -482,15 +522,12 @@ export function createConfigRoutes(): Router {
         }
       }
 
-      // Ensure parent directory exists
-      const dirPath = path.dirname(savePath);
-      if (!fs.existsSync(dirPath)) {
-        fs.mkdirSync(dirPath, { recursive: true });
-      }
-
-      // Save data file
-      fs.writeFileSync(savePath, JSON.stringify(newData, null, 2), 'utf-8');
+      // Save through the facade so this write is ordered by the single per-path
+      // queue (no race with a queued global/guild write to the same file) and
+      // lands atomically via temp+fsync+rename.
+      writeRawAtomic(savePath, JSON.stringify(newData, null, 2));
       console.log(`[Data] ${fileId} saved successfully${guildId ? ` for guild ${guildId}` : ' (global)'}`);
+      if (!guildId) nudgeSync('globaldata');
 
       res.json({
         success: true,

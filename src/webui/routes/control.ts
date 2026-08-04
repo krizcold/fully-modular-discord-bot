@@ -1,6 +1,13 @@
 import { Router, Request, Response } from 'express';
 import { BotManager } from '../botManager';
 import { getWebuiLogs, clearWebuiLogs } from '../utils/logCapture';
+import { flushAll } from '../../bot/internalSetup/utils/dataManager';
+
+// Drain the parent's write queue before a deterministic exit (bounded), so a
+// config write accepted just before Restart/Shutdown is not lost.
+async function flushBeforeExit(): Promise<void> {
+  await Promise.race([flushAll(), new Promise(resolve => setTimeout(resolve, 5000))]);
+}
 
 export function createControlRoutes(botManager: BotManager): Router {
   const router = Router();
@@ -88,6 +95,7 @@ export function createControlRoutes(botManager: BotManager): Router {
               console.error('[Control] Error during bot shutdown:', err);
             }
           }
+          await flushBeforeExit();
           console.log('[Control] Exiting process - Docker will restart container');
           process.exit(0);
         }, 500);
@@ -134,6 +142,7 @@ export function createControlRoutes(botManager: BotManager): Router {
             console.error('[Control] Error during bot shutdown:', err);
           }
         }
+        await flushBeforeExit();
         console.log('[Control] Exiting process for full restart');
         process.exit(0);
       }, 500);
