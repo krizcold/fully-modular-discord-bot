@@ -40,6 +40,10 @@ export class BotManager {
   private operationInProgress: boolean = false; // Prevents race conditions
   private safeMode: boolean = false;
   private safetyManager = getSafetyManager();
+  private cleanupRun: { running: boolean; startedAt: number; finishedAt?: number; success?: boolean; error?: string } | null = null;
+  // Reject callbacks of in-flight IPC requests, so a child exit settles them
+  // immediately instead of leaving callers hanging until their timeout.
+  private pendingIpcRejects = new Set<(err: Error) => void>();
   // Web-UI listener control, wired by startWebUI; lets the access-log channel's
   // Discord buttons / the /webui command stop and restart the HTTP listener.
   private webuiControl: { stop: () => void; start: () => void } | null = null;
@@ -237,6 +241,9 @@ export class BotManager {
 
         this.botProcess = null;
         this.botStartTime = 0;
+        const pending = [...this.pendingIpcRejects];
+        this.pendingIpcRejects.clear();
+        for (const fail of pending) fail(new Error('bot process exited before replying'));
         this.emitEvent('bot:status', this.getStatus());
       });
 
@@ -509,8 +516,15 @@ export class BotManager {
 
     return new Promise((resolve, reject) => {
       const requestId = `${type}_${Date.now()}_${Math.random()}`;
+      const fail = (err: Error) => {
+        clearTimeout(timeout);
+        this.botProcess?.removeListener('message', messageHandler);
+        this.pendingIpcRejects.delete(fail);
+        reject(err);
+      };
       const timeout = setTimeout(() => {
         this.botProcess?.removeListener('message', messageHandler);
+        this.pendingIpcRejects.delete(fail);
         reject(new Error('IPC request timed out; the operation may still complete in the background - check bot logs before retrying'));
       }, timeoutMs);
 
@@ -518,6 +532,7 @@ export class BotManager {
         if (message.requestId === requestId) {
           clearTimeout(timeout);
           this.botProcess?.removeListener('message', messageHandler);
+          this.pendingIpcRejects.delete(fail);
           resolve(message.data);
         }
       };
@@ -525,6 +540,7 @@ export class BotManager {
       try {
         this.botProcess!.on('message', messageHandler);
         this.botProcess!.send({ type, requestId, data });
+        this.pendingIpcRejects.add(fail);
       } catch (error) {
         // Clean up on error
         clearTimeout(timeout);
@@ -920,15 +936,34 @@ export class BotManager {
   }
 
   /**
-   * Trigger slash command re-registration (includes orphan cleanup if enabled).
+   * Kick off slash command re-registration (includes orphan cleanup if enabled)
+   * as tracked background work. Rate-limited global-command sweeps can run for
+   * minutes, so callers return immediately and the UI polls the status instead
+   * of blocking a request on the sweep.
    */
-  async reregisterCommands(): Promise<any> {
-    try {
-      return await this.sendIPCMessage('commands:reregister', {});
-    } catch (error) {
-      console.error('[BotManager] Error re-registering commands:', error);
-      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
-    }
+  startCommandCleanup(): { alreadyRunning: boolean } {
+    if (this.cleanupRun?.running) return { alreadyRunning: true };
+    const run: NonNullable<typeof this.cleanupRun> = { running: true, startedAt: Date.now() };
+    this.cleanupRun = run;
+    void (async () => {
+      try {
+        const result = await this.sendIPCMessage('commands:reregister', {}, IPC_TIMEOUT_MODULE_OP_MS);
+        run.success = result?.success === true;
+        if (!run.success) run.error = result?.error || 're-registration failed';
+      } catch (error) {
+        run.success = false;
+        run.error = error instanceof Error ? error.message : String(error);
+      } finally {
+        run.running = false;
+        run.finishedAt = Date.now();
+        if (run.error) console.error('[BotManager] Command cleanup failed:', run.error);
+      }
+    })();
+    return { alreadyRunning: false };
+  }
+
+  getCommandCleanupStatus(): { running: boolean; startedAt?: number; finishedAt?: number; success?: boolean; error?: string } {
+    return this.cleanupRun ? { ...this.cleanupRun } : { running: false };
   }
 
   async listLoadedModules(): Promise<string[] | null> {

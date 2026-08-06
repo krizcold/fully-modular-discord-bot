@@ -286,6 +286,7 @@ function ModulesView({ modules, installed, installJobs, categories, categoryFilt
   const installedCount = Object.keys(installed).length;
   const [autoCleanup, setAutoCleanup] = useState(false);
   const [autoUpdate, setAutoUpdate] = useState(false);
+  const [cleanupStatus, setCleanupStatus] = useState(null); // { running, success, error } from /appstore/config
   const [configLoaded, setConfigLoaded] = useState(false);
   const [moduleUpdates, setModuleUpdates] = useState(null); // { moduleName: ModuleUpdateCheck }
   const [checking, setChecking] = useState(false);
@@ -293,15 +294,44 @@ function ModulesView({ modules, installed, installJobs, categories, categoryFilt
 
   useEffect(() => {
     api.get('/appstore/config')
-      .then(res => { if (res.success) { setAutoCleanup(!!res.autoCleanup); setAutoUpdate(res.autoUpdate === true); } })
+      .then(res => {
+        if (res.success) {
+          setAutoCleanup(!!res.autoCleanup);
+          setAutoUpdate(res.autoUpdate === true);
+          // Adopt only an in-flight run on load (survives refresh); stale
+          // finished runs from earlier sessions are not worth a badge.
+          if (res.cleanup?.running) setCleanupStatus(res.cleanup);
+        }
+      })
       .catch(() => {})
       .finally(() => setConfigLoaded(true));
   }, []);
 
+  useEffect(() => {
+    if (!cleanupStatus?.running) return;
+    const t = setInterval(async () => {
+      try {
+        const res = await api.get('/appstore/config');
+        if (res.success && res.cleanup) setCleanupStatus(res.cleanup);
+      } catch { /* keep polling */ }
+    }, 2000);
+    return () => clearInterval(t);
+  }, [cleanupStatus?.running]);
+
+  useEffect(() => {
+    if (cleanupStatus && !cleanupStatus.running && cleanupStatus.success) {
+      const t = setTimeout(() => setCleanupStatus(null), 4000);
+      return () => clearTimeout(t);
+    }
+  }, [cleanupStatus]);
+
   async function toggleCleanup() {
     const newVal = !autoCleanup;
     setAutoCleanup(newVal);
-    try { await api.put('/appstore/config', { autoCleanup: newVal }); } catch { setAutoCleanup(!newVal); }
+    try {
+      const res = await api.put('/appstore/config', { autoCleanup: newVal });
+      if (res.cleanupStarted) setCleanupStatus({ running: true, startedAt: Date.now() });
+    } catch { setAutoCleanup(!newVal); }
   }
 
   async function toggleAutoUpdate() {
@@ -387,6 +417,17 @@ function ModulesView({ modules, installed, installJobs, categories, categoryFilt
               <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }} title="When enabled, orphan commands are automatically removed from Discord after module changes (install, uninstall, update, reload). Keep disabled if running multiple bot instances sharing the same application.">
                 <span style={{ color: '#888', fontSize: '0.78rem' }}>Auto Cleanup</span>
                 <ToggleSwitch checked={autoCleanup} onChange={toggleCleanup} />
+                {cleanupStatus?.running && (
+                  <span style={{ color: '#faa61a', fontSize: '0.75rem' }} title="Removing orphan commands from Discord; rate limits can make this take a while. Safe to leave or refresh this page.">
+                    cleanup running...
+                  </span>
+                )}
+                {cleanupStatus && !cleanupStatus.running && cleanupStatus.success && (
+                  <span style={{ color: '#43b581', fontSize: '0.75rem' }}>cleanup done</span>
+                )}
+                {cleanupStatus && !cleanupStatus.running && cleanupStatus.error && (
+                  <span style={{ color: '#f04747', fontSize: '0.75rem' }} title={cleanupStatus.error}>cleanup failed</span>
+                )}
               </div>
             </>
           )}

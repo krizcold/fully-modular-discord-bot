@@ -2064,7 +2064,8 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
       res.json({
         success: true,
         autoCleanup: config.autoCleanup === true,  // default false
-        autoUpdate: config.autoUpdate === true      // default false
+        autoUpdate: config.autoUpdate === true,     // default false
+        cleanup: botManager.getCommandCleanupStatus()
       });
     } catch (error) {
       const msg = error instanceof Error ? error.message : 'Unknown error';
@@ -2089,30 +2090,22 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
       saveAppStoreConfig(config);
       nudgeSync('appstore');
 
-      // If autoCleanup was just turned ON, trigger immediate orphan cleanup
-      // and AWAIT it. The previous fire-and-forget pattern returned success
-      // before the bot-side reregister had a chance to fail, so a broken
-      // IPC silently looked like a successful toggle. The cleanup is part
-      // of what "turning autoCleanup on" means; it must succeed (or be
-      // surfaced as a failure) before we tell the UI it worked.
-      let reregisterWarning: string | undefined;
+      // Turning autoCleanup ON kicks off the orphan sweep as tracked background
+      // work: rate-limited global-command sweeps can run for minutes, so the
+      // response returns immediately and the UI polls the `cleanup` status from
+      // GET /config until the run finishes (the outcome, including IPC failure,
+      // is captured there rather than blocking this request on the sweep).
+      let cleanupStarted = false;
       if (req.body.autoCleanup === true && botManager.isRunning()) {
-        try {
-          await botManager.reregisterCommands();
-        } catch (err) {
-          // The config setting itself was saved fine; the on-toggle action
-          // didn't run. Tell the client so they can retry / inspect logs
-          // rather than have the toggle look like it worked end-to-end.
-          reregisterWarning = err instanceof Error ? err.message : String(err);
-          console.error('[AppStore] Failed to trigger cleanup on toggle:', err);
-        }
+        botManager.startCommandCleanup();
+        cleanupStarted = true;
       }
 
       res.json({
-        success: !reregisterWarning,
+        success: true,
         autoCleanup: config.autoCleanup === true,
         autoUpdate: config.autoUpdate === true,
-        ...(reregisterWarning ? { warning: `Config saved but on-toggle cleanup failed: ${reregisterWarning}` } : {}),
+        ...(cleanupStarted ? { cleanupStarted: true } : {}),
       });
     } catch (error) {
       const msg = error instanceof Error ? error.message : 'Unknown error';
