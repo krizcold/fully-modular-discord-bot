@@ -19,7 +19,7 @@ import {
   unfreezeGuildWrites,
 } from '../../utils/dataManager';
 import { hashLeg } from '../../utils/dataInterchange';
-import { TRANSFER_PORT_DEFAULT, TRANSFER_TOKEN_TTL_MS, XFER_MAX_ROUNDS, XFER_DELTA_THRESHOLD_FILES } from '../constants';
+import { TRANSFER_PORT_DEFAULT, TRANSFER_TOKEN_TTL_MS, XFER_MAX_ROUNDS, XFER_DELTA_THRESHOLD_FILES, XFER_DIAL_RETRY_MS, XFER_DIAL_RETRY_WINDOW_MS } from '../constants';
 import {
   MSG,
   XferAbortPayload,
@@ -67,6 +67,7 @@ interface LegRuntime {
   aborted: boolean;
   committed: boolean;
   frozen: boolean;
+  drainPending: boolean;
 }
 
 export interface ExecutorHooks {
@@ -127,6 +128,7 @@ export class MigrationExecutor {
 
   private async onPrepare(payload: XferPreparePayload): Promise<XferPreparedPayload> {
     // A prepare carries this node's legs only (the coordinator filters per node).
+    console.log(`[Migration] Prepare received: ${payload.migrationId} (${payload.legs.map(l => `${l.legId}=${l.role}/${l.direction}`).join(', ')})`);
     this.currentTerm = payload.term;
     let estBytes = 0;
     let freeBytes: number | undefined;
@@ -159,6 +161,7 @@ export class MigrationExecutor {
           aborted: false,
           committed: false,
           frozen: false,
+          drainPending: false,
         });
       }
       if (legInfo.role === 'source') {
@@ -192,15 +195,29 @@ export class MigrationExecutor {
     return { ok: true, estBytes: estBytes || undefined, freeBytes };
   }
 
-  private dialAndStart(leg: LegRuntime): void {
+  private dialAndStart(leg: LegRuntime, dialDeadline = Date.now() + XFER_DIAL_RETRY_WINDOW_MS): void {
     if (!leg.peerUrl) {
       this.reportProgress(leg, 'no peer url to dial');
       return;
     }
     const ws = dialTransfer(leg.peerUrl, leg.token);
     leg.ws = ws;
-    ws.on('error', err => this.reportProgress(leg, `dial error: ${err instanceof Error ? err.message : String(err)}`));
+    let opened = false;
+    ws.on('error', err => {
+      if (leg.aborted || !this.legs.has(leg.legId)) return;
+      if (!opened && Date.now() < dialDeadline) {
+        // The prepare fan-out has no ordering barrier, so the peer's lazy
+        // listener may still be binding; re-dial instead of aborting the leg.
+        leg.ws = null;
+        setTimeout(() => {
+          if (!leg.aborted && this.legs.has(leg.legId) && !leg.ws) this.dialAndStart(leg, dialDeadline);
+        }, XFER_DIAL_RETRY_MS);
+        return;
+      }
+      this.reportProgress(leg, `dial error: ${err instanceof Error ? err.message : String(err)}`);
+    });
     ws.on('open', () => {
+      opened = true;
       if (leg.role === 'target') {
         // pull: announce ourselves, then receive.
         try { ws.send(JSON.stringify({ t: 'hello', mode: 'pull' })); } catch { /* closing */ }
@@ -233,7 +250,15 @@ export class MigrationExecutor {
       legId: leg.legId,
       guilds: () => leg.guilds,
     });
-    void this.runCopyRounds(leg);
+    if (leg.drainPending) {
+      // A drain already arrived (redistribute drains right after the prepare
+      // acks, possibly before the retried dial connected): go straight to the
+      // frozen final round - on a fresh sender it ships everything.
+      leg.drainPending = false;
+      void this.finishDrain(leg);
+    } else {
+      void this.runCopyRounds(leg);
+    }
   }
 
   // Source copy loop: bulk round 0 then delta rounds until convergence or the
@@ -275,6 +300,18 @@ export class MigrationExecutor {
       await flushGuild(guildId);
     }
     leg.frozen = true;
+    if (!leg.sender) {
+      // The dial retry loop may still be connecting. Skipping the final round
+      // here would send a one-sided verify and hang the migration until the
+      // drain timeout; defer it to the moment the sender attaches instead.
+      leg.drainPending = true;
+      return;
+    }
+    await this.finishDrain(leg);
+  }
+
+  private async finishDrain(leg: LegRuntime): Promise<void> {
+    if (leg.finalHashDone || leg.aborted) return;
     try {
       if (leg.sender) {
         const finalRound = leg.round + 1;
@@ -343,7 +380,13 @@ export class MigrationExecutor {
       if (leg.role === 'target') await this.commitTarget(leg, payload.term, payload.epoch);
       else await this.commitSource(leg);
       leg.committed = true;
+      // Release the runtime so the lazy listener can unbind; a retried commit
+      // lands in the no-runtime branch above, which is already idempotent.
+      try { leg.ws?.close(); } catch { /* closing */ }
+      this.legs.delete(legId);
+      this.tokens.delete(leg.token);
     }
+    this.maybeReleaseServer();
     return { ok: allDone, term: payload.term };
   }
 

@@ -114,6 +114,7 @@ export class TransferServer {
       this.httpServer.once('error', reject);
       this.httpServer.listen(port, () => {
         this.httpServer!.removeListener('error', reject);
+        console.log(`[Migration] Transfer listener bound on port ${port}`);
         resolve();
       });
     });

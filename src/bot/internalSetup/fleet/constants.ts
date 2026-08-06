@@ -104,6 +104,12 @@ export const TRANSFER_TOKEN_TTL_MS = 120000;
 /** How long the master waits for a prepare ack from a participant. */
 export const XFER_PREPARE_TIMEOUT_MS = 15000;
 
+/** Pre-open dial failures re-dial on this cadence (the peer's lazy listener may still be binding). */
+export const XFER_DIAL_RETRY_MS = 500;
+
+/** Give up re-dialing a leg's peer after this window and report the dial error. */
+export const XFER_DIAL_RETRY_WINDOW_MS = 10000;
+
 /** No progress from a leg for this long during copy = stall -> abort. */
 export const XFER_STALL_TIMEOUT_MS = 60000;
 
