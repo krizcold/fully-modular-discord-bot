@@ -9,6 +9,8 @@ import handleCommands from '../events/interactionCreate/handleCommands';
 import getLocalCommands from './getLocalCommands';
 import { getPanelManager } from './panelManager';
 import { buildConsoleInteraction } from './consoleInteraction';
+import { getFleetState } from '../fleet/state';
+import { guildIdToShardId } from '../fleet/placement';
 
 interface InvokePayload {
   command?: string;
@@ -39,12 +41,20 @@ async function handleInvoke(data: InvokePayload): Promise<Record<string, unknown
   if (!commandExists(command)) return { success: false, error: `no such command: ${command}` };
 
   const guildId = data.guildId ? String(data.guildId) : null;
-  // A sharded node only caches guilds on shards it serves, so cache membership is
-  // the faithful ownership gate (this is exactly how Discord routes interactions).
-  // Standalone caches all its guilds, so the gate is a natural no-op there.
   const guild = guildId ? client.guilds.cache.get(guildId) || null : null;
-  if (guildId && !guild && !data.force) {
-    return { success: false, error: `this node does not serve guild ${guildId} (not in cache); pass force to attempt anyway` };
+  if (guildId && !data.force) {
+    // Ownership gate: the lease table is authoritative (the discord.js cache
+    // lags it right after a shard migration). Standalone has no lease table, so
+    // it keeps the cache check, which covers every guild there.
+    const fleet = getFleetState();
+    if (fleet.initialized && !fleet.standalone && fleet.shardCount > 0) {
+      const shardId = guildIdToShardId(guildId, fleet.shardCount);
+      if (!fleet.leases.some(l => l.shardId === shardId)) {
+        return { success: false, error: `this node does not serve guild ${guildId} (shard ${shardId} not leased); pass force to attempt anyway` };
+      }
+    } else if (!guild) {
+      return { success: false, error: `this node does not serve guild ${guildId} (not in cache); pass force to attempt anyway` };
+    }
   }
 
   const userId = data.userId ? String(data.userId) : null;
