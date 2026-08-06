@@ -54,6 +54,22 @@ export class LeaseRuntime {
     return this.current;
   }
 
+  /**
+   * Dev fault hook (drill P2.8): corrupt a held lease id so the next renew carries
+   * a stale id, the master reports lease-mismatch, and Phase R re-grants within a
+   * tick. Double-gated by FLEET_DEV_HOOKS; self-heals on the next grant.
+   */
+  corruptLeaseForTest(shardId: number): { ok: boolean; error?: string } {
+    if (process.env.FLEET_DEV_HOOKS !== '1') return { ok: false, error: 'dev hooks disabled (set FLEET_DEV_HOOKS=1)' };
+    if (!this.current) return { ok: false, error: 'no current lease on this node' };
+    const lease = this.current.leases.find(l => l.shardId === shardId);
+    if (!lease) return { ok: false, error: `no held lease for shard ${shardId}` };
+    const original = lease.leaseId;
+    lease.leaseId = `corrupt-${original}`;
+    console.warn(`[Fleet][DEV] Corrupted lease id for shard ${shardId} (${original} -> ${lease.leaseId}); next renew reports lease-mismatch`);
+    return { ok: true };
+  }
+
   getLastHeartbeat(): HeartbeatPayload | null {
     return this.lastHeartbeat;
   }

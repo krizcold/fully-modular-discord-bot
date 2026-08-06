@@ -206,5 +206,24 @@ export function createFleetRoutes(botManager: BotManager): Router {
     }
   });
 
+  /**
+   * POST /api/fleet/dev/corrupt-lease { shardId }
+   * Dev fault hook (drill P2.8): corrupt a held lease so the next renew reports
+   * lease-mismatch. Inert unless FLEET_DEV_HOOKS=1 on the bot; never a 500.
+   */
+  router.post('/dev/corrupt-lease', async (req: Request, res: Response) => {
+    try {
+      if (!botManager.isRunning()) {
+        res.json({ success: false, error: 'Bot is not running' });
+        return;
+      }
+      const result = await botManager.corruptFleetLease(Number(req.body?.shardId));
+      res.json(result?.success ? { success: true } : { success: false, error: result?.error ?? 'corrupt-lease failed' });
+    } catch (error) {
+      console.error('[Fleet] Failed to corrupt lease:', error instanceof Error ? error.message : error);
+      res.json({ success: false, error: error instanceof Error ? error.message : 'corrupt-lease failed' });
+    }
+  });
+
   return router;
 }

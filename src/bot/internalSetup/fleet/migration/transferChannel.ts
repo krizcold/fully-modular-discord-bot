@@ -300,6 +300,7 @@ export class TransferReceiver {
   private readonly openChunks = new Map<string, fs.promises.FileHandle>();
   private readonly chunkHash = new Map<string, ReturnType<typeof createHash>>();
   private closed = false;
+  private corruptApplied = false;
 
   constructor(
     private readonly ws: WebSocket,
@@ -356,6 +357,7 @@ export class TransferReceiver {
         return;
       }
       await fs.promises.writeFile(target, payload);
+      await this.maybeCorruptForTest(target);
       return;
     }
 
@@ -377,7 +379,28 @@ export class TransferReceiver {
       await fh.close().catch(() => undefined);
       this.openChunks.delete(key);
       this.chunkHash.delete(key);
+      await this.maybeCorruptForTest(target);
     }
+  }
+
+  /**
+   * Dev fault hook (drill P5.5): flip one byte of the first staged file AFTER it
+   * has passed its per-record sha256 check, so COPYING completes cleanly and the
+   * corruption is caught only by the VERIFYING dual-hash - exercising the
+   * verify-abort path. Double-gated (FLEET_DEV_HOOKS=1 + XFER_TEST_CORRUPT=1) and
+   * inert otherwise; never breaks the transfer path itself.
+   */
+  private async maybeCorruptForTest(target: string): Promise<void> {
+    if (this.corruptApplied) return;
+    if (process.env.FLEET_DEV_HOOKS !== '1' || process.env.XFER_TEST_CORRUPT !== '1') return;
+    try {
+      const buf = await fs.promises.readFile(target);
+      if (buf.length === 0) return;
+      buf[0] = buf[0] ^ 0xff;
+      await fs.promises.writeFile(target, buf);
+      this.corruptApplied = true;
+      console.warn(`[Transfer][DEV] XFER_TEST_CORRUPT flipped a byte in staged ${path.basename(target)}; VERIFYING should abort this migration`);
+    } catch { /* the corruption hook must never break the transfer path */ }
   }
 
   // Resolve a peer-controlled (guildId, relPath) to an absolute path, or null

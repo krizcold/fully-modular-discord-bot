@@ -120,6 +120,17 @@ export function fleetSyncBump(scope: string): void {
   masterSyncBump?.(scope);
 }
 
+// This node's LeaseRuntime, wired in initFleet. Used only by the dev lease-corrupt
+// fault hook (drill P2.8); null before init and on nodes with no runtime.
+let devRuntime: LeaseRuntime | null = null;
+
+/** Dev fault hook: corrupt a held lease id on this node. Double-gated by FLEET_DEV_HOOKS. */
+export function fleetDevCorruptLease(shardId: number): { ok: boolean; error?: string } {
+  if (process.env.FLEET_DEV_HOOKS !== '1') return { ok: false, error: 'dev hooks disabled (set FLEET_DEV_HOOKS=1)' };
+  if (!devRuntime) return { ok: false, error: 'fleet not initialized on this node' };
+  return devRuntime.corruptLeaseForTest(shardId);
+}
+
 // Migration control surface (master-only; null on co-workers and standalone,
 // where the migration subsystem is never constructed). Mirrors masterAssign.
 let masterMigrateStart: ((payload: StartPayload) => Promise<{ ok: boolean; error?: string; migrationId?: string }>) | null = null;
@@ -162,6 +173,7 @@ export async function initFleet(): Promise<FleetContext> {
   const appVersion = getAppVersion();
   const ingest = getIngestService();
   const runtime = new LeaseRuntime(ingest);
+  devRuntime = runtime;
   const advertisedTransferUrl = (process.env.TRANSFER_URL || '').trim() || undefined;
   const capabilities: NodeCapabilities = {
     shardCapacity: resolveShardCapacity(),

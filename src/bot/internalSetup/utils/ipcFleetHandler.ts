@@ -15,6 +15,7 @@ import {
   fleetMigrationsList,
   fleetResumeAssignments,
   fleetSyncBump,
+  fleetDevCorruptLease,
 } from '../fleet/bootstrap';
 import type { StartPayload } from '../fleet/migration/migrationCoordinator';
 
@@ -98,6 +99,12 @@ export function setupFleetIPCHandlers(): void {
         }
         case 'fleet:migrations': {
           response = { success: true, migrations: fleetMigrationsList() };
+          break;
+        }
+        case 'fleet:dev:corruptLease': {
+          const shardId = Number(message.data?.shardId);
+          const result = fleetDevCorruptLease(shardId);
+          response = result.ok ? { success: true } : { success: false, error: result.error };
           break;
         }
         default:
