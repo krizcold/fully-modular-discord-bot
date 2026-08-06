@@ -5,6 +5,7 @@ import passport from 'passport';
 import { DiscordUser } from './oauthConfig';
 import { getUserAdminGuilds, hasSystemAccess } from './permissionChecker';
 import { clearUserCache } from './guildPermissionRefresher';
+import { fireAccessLog } from '../utils/accessLog';
 
 const router = Router();
 
@@ -24,6 +25,16 @@ router.get(
     failureRedirect: '/guild?error=auth_failed'
   }),
   (req: Request, res: Response) => {
+    // Successful guild OAuth login -> access-log event (carries the Discord user).
+    const u = req.user as DiscordUser | undefined;
+    fireAccessLog({
+      uiKind: 'guild',
+      ip: req.ip || '',
+      userAgent: String(req.headers['user-agent'] || ''),
+      when: Date.now(),
+      user: u ? { id: u.id, username: u.username } : undefined,
+    });
+
     // Successful authentication. Validate returnTo to prevent open-redirect:
     // must be a same-origin absolute path ("/..."), not protocol-relative ("//...")
     // or absolute URL ("https://evil.com/...").

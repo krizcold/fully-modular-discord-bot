@@ -24,6 +24,11 @@ const MAIN_CONFIG_SCHEMA: Record<string, any> = {
   'system.ipc.rateLimitCleanupThreshold': 100,
   'system.ipc.rateLimitCleanupAgeMs': 300000,
   'metrics.enabled': true,
+  // Access-log channel: when enabled with a channel id, the bot posts a message
+  // (IP, browser, when) to that channel the first time a new web-UI session or a
+  // guild OAuth login is seen, with dev-only Shut-down-bot / Shut-down-web-UI buttons.
+  'security.accessLog.enabled': false,
+  'security.accessLog.channelId': '',
   // Giveaway module config (TODO: Move to module-specific config file)
   'giveaway.itemsPerPage': 10,
   'giveaway.nameDisplayCap': 50

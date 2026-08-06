@@ -82,6 +82,26 @@ export async function startWebUI(botManager: BotManager): Promise<void> {
   const wsManager = new WebSocketManager(httpServer);
   botManager.setWebSocketManager(wsManager);
 
+  // Web-UI listener stop/start, driven from Discord via the access-log buttons
+  // or the /webui command. Stop closes the HTTP listener only; the bot child
+  // stays connected, so Discord is the recovery path (start re-listens).
+  botManager.setWebUiControl({
+    stop: () => {
+      try {
+        httpServer.close(() => console.warn('[WebUI] Listener stopped by control action (bot stays connected)'));
+      } catch (err) {
+        console.error('[WebUI] Failed to stop listener:', err);
+      }
+    },
+    start: () => {
+      try {
+        if (!httpServer.listening) httpServer.listen(PORT, HOST, () => console.warn('[WebUI] Listener restarted by control action'));
+      } catch (err) {
+        console.error('[WebUI] Failed to restart listener:', err);
+      }
+    },
+  });
+
   // Wire install/uninstall queue events → WebSocket broadcasts
   const installQueue = getInstallQueue();
   installQueue.setBotManager(botManager);
