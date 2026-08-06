@@ -151,3 +151,4 @@ src/bot/modulesDev/*
 
 # Authelia secrets + runtime (public self-hosted gateway); never commit
 authelia/secrets/
+/data_coworker
