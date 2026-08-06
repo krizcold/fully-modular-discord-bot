@@ -55,8 +55,13 @@ async function toggleCommand(
 ): Promise<{ success: boolean; error?: string }> {
   try {
     const guildId = process.env.GUILD_ID;
-    const guild = guildId ? client.guilds.cache.get(guildId) : null;
     const commandDef = findCommandDef(commandName);
+    // Test commands go through the application-commands REST API scoped to
+    // guildId, NOT a cached Guild object: in a fleet the test guild may live on
+    // another node's shard, so a cache lookup here would silently fall back to
+    // the GLOBAL registry (see registerCommands.ts).
+    const appCommands = client.application?.commands;
+    if (!appCommands) return { success: false, error: 'Command manager not available' };
 
     if (enabled) {
       // RE-REGISTER with Discord
@@ -65,10 +70,11 @@ async function toggleCommand(
       }
 
       const payload = buildCommandPayload(commandDef);
-      const targetManager = commandDef.testOnly && guild ? guild.commands : client.application?.commands;
-      if (!targetManager) return { success: false, error: 'Command manager not available' };
-
-      await targetManager.create(payload);
+      if (commandDef.testOnly && guildId) {
+        await appCommands.create(payload, guildId);
+      } else {
+        await appCommands.create(payload);
+      }
       console.log(`[Toggle] Registered command: ${commandName}`);
       return { success: true };
     } else {
@@ -77,17 +83,20 @@ async function toggleCommand(
       const isTestOnly = commandDef?.testOnly === true;
 
       // Fetch current commands to find the ID
-      const commands = isTestOnly && guild
-        ? await guild.commands.fetch()
-        : await client.application?.commands.fetch();
+      const commands = isTestOnly && guildId
+        ? await appCommands.fetch({ guildId })
+        : await appCommands.fetch();
 
       const existing = commands?.find(
         (cmd: any) => cmd.name === commandName && cmd.type === commandType
       );
 
       if (existing) {
-        const mgr = isTestOnly && guild ? guild.commands : client.application?.commands;
-        await mgr?.delete(existing.id);
+        if (isTestOnly && guildId) {
+          await appCommands.delete(existing.id, guildId);
+        } else {
+          await appCommands.delete(existing.id);
+        }
         console.log(`[Toggle] Unregistered command: ${commandName}`);
       }
       return { success: true };
