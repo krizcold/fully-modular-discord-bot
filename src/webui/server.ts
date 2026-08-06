@@ -13,6 +13,7 @@ import { createSetupRoutes } from './routes/setup';
 import { createConfigRoutes } from './routes/config';
 import { createAppStoreRoutes } from './routes/appstore';
 import { createPanelRoutes } from './routes/panels';
+import { createCommandRoutes } from './routes/commands';
 import { createGuildPanelRoutes } from './routes/guildPanels';
 import { createGuildSubscriptionRoutes } from './routes/guildSubscriptions';
 import { createUpdateRouter } from './routes/update';
@@ -26,9 +27,14 @@ import { requireGuildWebUIEnabled } from './auth/oauthMiddleware';
 import { getSessionMiddleware } from './auth/sessionManager';
 import oauthRoutes from './auth/oauthRoutes';
 import { getPaymentRegistry } from '../bot/internalSetup/utils/payment/paymentRegistry';
+import { setAccessLogDispatcher, fireAccessLog } from './utils/accessLog';
 
 export async function createServer(botManager: BotManager): Promise<Express> {
   const app = express();
+
+  // Wire the access-log dispatcher so the request/OAuth hooks can report new
+  // sessions to the bot child (no-op unless security.accessLog is enabled).
+  setAccessLogDispatcher((info) => botManager.postAccessLog(info));
 
   // Trust proxy - required when a reverse proxy / auth gateway (AppShield, Authelia)
   // fronts the app, so express-rate-limit reads client IPs from X-Forwarded-For.
@@ -279,6 +285,7 @@ export async function createServer(botManager: BotManager): Promise<Express> {
   app.use('/api/config', requireAuth, createConfigRoutes());
   app.use('/api/appstore', requireAuth, blockWritesOnCoWorker, createAppStoreRoutes(botManager));
   app.use('/api/panels', requireAuth, createPanelRoutes(botManager));
+  app.use('/api/commands', requireAuth, createCommandRoutes(botManager));
   app.use('/api/update', requireAuth, createUpdateRouter(botManager));
   app.use('/api/devmodules', requireAuth, requireMasterNode, createDevModulesRoutes(botManager));
   app.use('/api/usage', requireAuth, createUsageRoutes(botManager));
@@ -295,6 +302,12 @@ export async function createServer(botManager: BotManager): Promise<Express> {
 
   // Root route (requireAuth passes; auth enforced at the deployment boundary)
   app.get('/', requireAuth, (req: Request, res: Response) => {
+    // First page load of a new admin session -> access-log event (once per session).
+    const sess = req.session as (typeof req.session & { accessLogged?: boolean }) | undefined;
+    if (sess && !sess.accessLogged) {
+      sess.accessLogged = true;
+      fireAccessLog({ uiKind: 'admin', ip: req.ip || '', userAgent: String(req.headers['user-agent'] || ''), when: Date.now() });
+    }
     res.sendFile(path.join(publicDir, 'index.html'));
   });
 

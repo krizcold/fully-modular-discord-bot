@@ -40,6 +40,14 @@ export class BotManager {
   private operationInProgress: boolean = false; // Prevents race conditions
   private safeMode: boolean = false;
   private safetyManager = getSafetyManager();
+  // Web-UI listener control, wired by startWebUI; lets the access-log channel's
+  // Discord buttons / the /webui command stop and restart the HTTP listener.
+  private webuiControl: { stop: () => void; start: () => void } | null = null;
+
+  /** Wire the web-UI listener stop/start hooks (owned by startWebUI). */
+  setWebUiControl(control: { stop: () => void; start: () => void }): void {
+    this.webuiControl = control;
+  }
 
   constructor(safeMode: boolean = false) {
     this.safeMode = safeMode;
@@ -261,6 +269,16 @@ export class BotManager {
           if (this.wsManager) {
             this.wsManager.broadcast('bot:sync:status', message.data);
           }
+        } else if (message.type === 'control:shutdown-bot') {
+          // Access-log channel "Shut down bot" button: stop the Discord bot child.
+          console.warn('[BotManager] control:shutdown-bot received from access-log action');
+          void this.shutdown(false);
+        } else if (message.type === 'control:stop-webui') {
+          console.warn('[BotManager] control:stop-webui received; stopping the web-UI listener (bot stays connected)');
+          this.webuiControl?.stop();
+        } else if (message.type === 'control:start-webui') {
+          console.warn('[BotManager] control:start-webui received; restarting the web-UI listener');
+          this.webuiControl?.start();
         }
       });
 
@@ -517,6 +535,14 @@ export class BotManager {
   }
 
   /**
+   * Invoke a bot command synthetically (console `cmd invoke`). Runs through the
+   * real dispatcher in the bot child; replies are captured, not sent to Discord.
+   */
+  async invokeCommand(payload: any): Promise<any> {
+    return await this.sendIPCMessage('command:invoke', payload);
+  }
+
+  /**
    * Get list of panels from bot
    */
   async getPanelList(): Promise<any> {
@@ -687,6 +713,11 @@ export class BotManager {
     }
   }
 
+  /** Dev fault hook: corrupt a held lease id on this node (drill P2.8). */
+  async corruptFleetLease(shardId: number): Promise<any> {
+    return await this.sendIPCMessage('fleet:dev:corruptLease', { shardId });
+  }
+
   /** List the active + recent migrations (master-only). */
   async listFleetMigrations(): Promise<any> {
     try {
@@ -850,6 +881,19 @@ export class BotManager {
       await this.sendIPCMessage('notification:dispatch', { guildId, kind, payload });
     } catch (error) {
       console.warn('[BotManager] Notification dispatch failed:', error instanceof Error ? error.message : error);
+    }
+  }
+
+  /**
+   * Fire-and-forget access-log event to the bot child (new web-UI session / OAuth
+   * login). The child posts to the configured channel when the feature is enabled.
+   */
+  postAccessLog(info: Record<string, any>): void {
+    if (!this.isRunning() || !this.botProcess) return;
+    try {
+      this.botProcess.send({ type: 'security:access-log', data: info });
+    } catch {
+      /* access logging must never affect serving */
     }
   }
 

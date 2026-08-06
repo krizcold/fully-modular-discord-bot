@@ -6,6 +6,8 @@ import 'dotenv/config';
 import { RegisteredButtonInfo, RegisteredDropdownInfo, RegisteredModalInfo, RegisteredReactionInfo, RegisteredReactionRemoveInfo } from '../types/commandTypes';
 import { getPanelManager } from './utils/panelManager';
 import { setupPanelIPCHandlers } from './utils/ipcPanelHandler';
+import { setupCommandIPCHandlers } from './utils/ipcCommandHandler';
+import { setupAccessLogChannel } from './utils/accessLogChannel';
 import { setupMetricsIPCHandlers } from './utils/ipcMetricsHandler';
 import { setupFleetIPCHandlers } from './utils/ipcFleetHandler';
 import { getMetricsCollector } from './utils/metrics/metricsCollector';
@@ -630,6 +632,12 @@ async function main() {
 
   // Set up IPC message handlers for Web-UI panel integration
   setupPanelIPCHandlers();
+
+  // Set up IPC handler for console `cmd invoke` (synthetic slash-command dispatch)
+  setupCommandIPCHandlers();
+
+  // Set up the optional access-log channel (embed + dev-only shutdown buttons)
+  setupAccessLogChannel(client);
 
   // Set up IPC message handlers for metrics
   setupMetricsIPCHandlers();
