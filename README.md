@@ -210,6 +210,7 @@ The bot includes a browser-based management interface for monitoring and control
 - **Logs** - Real-time log viewing (last 50 lines)
 - **Panels** - Execute Discord panels from the browser
 - **Bot Control** - Start, stop, restart the bot process
+- **`smdb` console** - Loopback CLI with full panel-API parity, plus synthetic slash-command execution (see [Documentation/DiscordBot/Console.md](../Documentation/DiscordBot/Console.md))
 
 ### Accessing Web-UI
 
