@@ -590,6 +590,12 @@ export class SyncEngine {
     for (const name of this.degradedModules) {
       if (enabledNames.has(name)) toReload.add(name);
     }
+    // Enabled on disk but absent from the registry (e.g. unloaded by an earlier
+    // disable, then re-enabled without a content change): load it now, not at
+    // the next reboot. reloadModules fresh-loads modules that are not loaded.
+    for (const name of enabledNames) {
+      if (!registry.getModule(name)) toReload.add(name);
+    }
     if (toReload.size > 0) {
       const result = await reloadModules(client, [...toReload]);
       for (const name of result.reloaded) this.degradedModules.delete(name);
