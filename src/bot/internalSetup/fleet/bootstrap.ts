@@ -11,6 +11,7 @@ import {
   CONTROL_PORT_DEFAULT,
   GUILD_TOTALS_REFRESH_MS,
   HEARTBEAT_MS,
+  INCOMING_RESOLVE_INTERVAL_MS,
   LEASE_RENEW_MS,
   LOSS_LOG_CAP,
   PROTOCOL_VERSION,
@@ -209,17 +210,29 @@ export async function initFleet(): Promise<FleetContext> {
   // abort/commit broadcast (or the retention TTL) resolves it - staging is never
   // deleted while the master might still consider the migration live.
   if (!standalone) {
-    try {
-      await resolveIncomingWithMaster(async (migrationId): Promise<MigrationDisposition> => {
-        const decision = migrationDispositionOf(migrationId);
-        if (decision) return decision;
-        // Not the master (or migration not in the local coordinator): defer to
-        // the broadcast/TTL path by signalling unreachable (reject).
-        throw new Error('migration status not locally resolvable');
-      });
-    } catch (error) {
-      console.warn('[Fleet] _incoming resolution failed:', error instanceof Error ? error.message : error);
-    }
+    const resolveIncoming = async (): Promise<void> => {
+      try {
+        await resolveIncomingWithMaster(async (migrationId): Promise<MigrationDisposition> => {
+          const decision = migrationDispositionOf(migrationId);
+          if (decision) return decision;
+          // Not the master (or migration not in the local coordinator): defer to
+          // the broadcast/TTL path by signalling unreachable (reject).
+          throw new Error('migration status not locally resolvable');
+        });
+      } catch (error) {
+        console.warn('[Fleet] _incoming resolution failed:', error instanceof Error ? error.message : error);
+      }
+    };
+    await resolveIncoming();
+    // Periodic retry: staging retained at boot (master unreachable, or this is
+    // a co-worker) is re-resolved in place, so the retention TTL reclaims
+    // aborted staging within a day of the abort instead of a day plus a reboot.
+    // Skipped while migration work is live on this node: the resolver's
+    // commitFromStaging must never race the executor's own commit path.
+    setInterval(() => {
+      if (migrationWorkActive()) return;
+      void resolveIncoming();
+    }, INCOMING_RESOLVE_INTERVAL_MS).unref();
   }
 
   return context;
@@ -228,6 +241,9 @@ export async function initFleet(): Promise<FleetContext> {
 // Master-side disposition of a migration id for the boot _incoming resolution;
 // null on co-workers and when the coordinator does not know the migration.
 let migrationDispositionOf: (migrationId: string) => MigrationDisposition | null = () => null;
+// Whether migration work (coordinator active record or a live executor leg) is
+// running on this node; the periodic staging resolver must never race it.
+let migrationWorkActive: () => boolean = () => false;
 
 interface CommonInit {
   nodeId: string;
@@ -665,8 +681,12 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     }
 
     const candidates = [...registry.nodes.values()].filter(n => !ledger || !ledger.inBackoff(n.nodeId));
+    // Headroom counts pending-confirmation leases: they are not in the shard
+    // table yet, but every composed grant re-delivers them (reGrantSetOf), so
+    // they book capacity - otherwise a returning worker whose set is split
+    // table/pending is undercounted and wins a free shard over its cap.
     const placements = pickFreePlacements(pool, candidates, registry, node =>
-      targetFor(node) - (grantsByNode.get(node.nodeId)?.length ?? 0));
+      targetFor(node) - pendingShardIdsOf(node.nodeId).length - (grantsByNode.get(node.nodeId)?.length ?? 0));
     for (const [placedNodeId, shardIds] of placements) {
       for (const shardId of shardIds) addGrant(placedNodeId, shardId);
     }
@@ -707,7 +727,24 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     for (const grantNodeId of execOrder) {
       const node = registry.nodes.get(grantNodeId);
       if (!node) continue;
-      const fullSet = [...new Set([...reGrantSetOf(grantNodeId), ...(grantsByNode.get(grantNodeId) ?? [])])].sort((a, b) => a - b);
+      const reGrant = reGrantSetOf(grantNodeId);
+      const rawPlaced = grantsByNode.get(grantNodeId) ?? [];
+      // Invariant backstop: an automatic grant never exceeds declared capacity.
+      // Only load-picked FREE shards are trimmed - the re-grant set is the
+      // node's own recorded holding, and the pinned shard is the master's by
+      // the iron rule regardless of capacity (trimming it would strand it
+      // free forever: workers are fenced off it above).
+      const pinnedPlaced = pinnedShardId !== null ? rawPlaced.filter(id => id === pinnedShardId) : [];
+      let trimmable = pinnedPlaced.length > 0 ? rawPlaced.filter(id => id !== pinnedShardId) : rawPlaced;
+      const headroom = Math.max(0, targetFor(node) - reGrant.length - pinnedPlaced.length);
+      if (trimmable.length > headroom) {
+        const trimmed = trimmable.slice(headroom);
+        trimmable = trimmable.slice(0, headroom);
+        console.warn(`[Fleet] Trimmed free placement [${trimmed.join(', ')}] to ${node.nodeName}: capacity ${targetFor(node)} already booked by held+pending leases`);
+      }
+      const placed = [...pinnedPlaced, ...trimmable];
+      if (placed.length === 0) continue;
+      const fullSet = [...new Set([...reGrant, ...placed])].sort((a, b) => a - b);
       await grantShardsTo(node, fullSet, epoch);
     }
 
@@ -1374,6 +1411,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     masterMigratePrecheck = payload => coordinator!.precheck(payload);
     masterMigrateList = () => coordinator!.getView();
     migrationDispositionOf = migrationId => coordinator!.dispositionOf(migrationId);
+    migrationWorkActive = () => coordinator!.hasActive() || selfExecutor!.hasActiveLegs();
 
     server = new ControlServer({
       getTerm: () => registry.term,
@@ -1641,6 +1679,7 @@ async function initCoWorker(init: CommonInit): Promise<FleetContext> {
       selfTransferUrl: () => advertisedTransferUrl,
       transferPort: () => transferPort,
     });
+    migrationWorkActive = () => executor?.hasActiveLegs() ?? false;
     controlClient = new ControlClient({
       masterUrl,
       secret,
