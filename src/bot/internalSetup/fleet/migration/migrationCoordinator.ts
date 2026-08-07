@@ -203,6 +203,8 @@ export class MigrationCoordinator {
       if (state === 'DRAINING' || state === 'VERIFYING') this.drainRan = true;
       this.finishHooks = (finalState: 'DONE' | 'ABORTED') => {
         leg.legState = finalState;
+        // Same trailing-frame protection as runSingleLegMove's finishHooks.
+        this.live.delete(leg.legId);
         if (finalState === 'ABORTED') { leg.error = single.error; parent.error = single.error; }
         for (const entry of single.pendingSourceCleanup ?? []) {
           for (const legId of entry.legIds) this.recordPendingSourceLeg(parent, entry.nodeId, legId);
@@ -459,6 +461,11 @@ export class MigrationCoordinator {
     l.guildsDone = payload.guildsDone;
     l.lastProgressAt = performance.now();
     if (payload.error) {
+      // Same commit-decided fence as abort()/onNodeDown: once COMMITTING or
+      // GRANTING, a late transfer error must not abort (retries continue at
+      // reconnect). A paused retire has no leg in flight either.
+      if (this.record.state === 'COMMITTING' || this.record.state === 'GRANTING') return;
+      if (this.record.kind === 'retire' && this.paused) return;
       l.error = payload.error;
       void this.enterAborting(`progress error on leg ${payload.legId}: ${payload.error}`);
       return;
@@ -487,6 +494,9 @@ export class MigrationCoordinator {
 
   onNodeDown(nodeId: string): void {
     if (!this.record || isTerminal(this.record.state)) return;
+    // A paused retire has no leg in flight; nothing to abort. The pause holds
+    // and Resume's precheck rejects a still-down participant.
+    if (this.record.kind === 'retire' && this.paused) return;
     if (!this.record.legs.some(leg => leg.sourceNodeId === nodeId || leg.targetNodeId === nodeId)) return;
     // A down TARGET blocks the commit (its data is the product); a down SOURCE
     // before commit aborts safely (originals intact). Pre-commit: abort.
@@ -886,7 +896,28 @@ export class MigrationCoordinator {
 
   // ABORTING: XFER_ABORT to both sides (idempotent, retried while connected);
   // if the drain revoked the lease, re-grant the shard back to the source.
+  // Guarded by an in-progress flag, not a state check: a second trigger firing
+  // during the first abort's awaits (trailing error frame, duplicate node-down)
+  // would otherwise finish() again after finishHooks restored the retire
+  // parent, terminally aborting a pausable retire. recoverRetire legitimately
+  // re-enters with a leg already persisted as ABORTING, which a bare state
+  // check would break.
+  private abortInProgress = false;
   private async enterAborting(reason: string): Promise<void> {
+    if (!this.record || this.abortInProgress) return;
+    // A paused retire has no leg in flight: a pipeline straggler from the
+    // aborted leg (timed-out prepare/drain rejection landing after the pause)
+    // must not terminally abort it. Operator Abort-remaining goes via abort().
+    if (this.record.kind === 'retire' && this.paused) return;
+    this.abortInProgress = true;
+    try {
+      await this.enterAbortingImpl(reason);
+    } finally {
+      this.abortInProgress = false;
+    }
+  }
+
+  private async enterAbortingImpl(reason: string): Promise<void> {
     if (!this.record) return;
     this.clearStallWatchdog();
     this.clearDrainTimeout();
@@ -899,8 +930,12 @@ export class MigrationCoordinator {
     await this.transition('ABORTING');
     console.warn(`[Migration] Aborting ${this.record.id}: ${reason}`);
     const rec = this.record;
+    // Committed legs stand: their data lives on the target and the source's
+    // copy is graveyarded, so rolling them back would serve stale/empty state.
+    // Only legs that did not reach DONE participate in the abort rollback.
+    const abortLegs = rec.legs.filter(l => l.legState !== 'DONE');
     const nodes = new Set<string>();
-    for (const leg of rec.legs) { nodes.add(leg.sourceNodeId); nodes.add(leg.targetNodeId); }
+    for (const leg of abortLegs) { nodes.add(leg.sourceNodeId); nodes.add(leg.targetNodeId); }
     for (const nodeId of nodes) {
       try {
         await this.hooks.sendControl(nodeId, MSG.XFER_ABORT, { migrationId: rec.id, term: rec.term, reason });
@@ -913,7 +948,7 @@ export class MigrationCoordinator {
     // entry, then set the source entry unconditionally and re-grant its set.
     if (this.drainRan) {
       const bySource = new Map<string, number[]>();
-      for (const leg of rec.legs) {
+      for (const leg of abortLegs) {
         const arr = bySource.get(leg.sourceNodeId) ?? [];
         arr.push(leg.shardId);
         bySource.set(leg.sourceNodeId, arr);
@@ -943,7 +978,7 @@ export class MigrationCoordinator {
     }
     // Release the fence: the shards are back on the source (drain path) or were
     // never drained (pre-drain abort keeps the source's original table entry).
-    this.unfenceShards(rec.legs.map(l => l.shardId));
+    this.unfenceShards(abortLegs.map(l => l.shardId));
     await this.finish('ABORTED', reason);
   }
 
@@ -1027,6 +1062,10 @@ export class MigrationCoordinator {
       this.hydrateLive(single);
       this.finishHooks = (state: 'DONE' | 'ABORTED') => {
         leg.legState = state;
+        // Drop the finished leg from the live map: a trailing progress/error
+        // frame from its dying transfer must not resolve against the restored
+        // parent record and abort a paused retire.
+        this.live.delete(leg.legId);
         // Carry the failing leg's error up to the parent so the paused retire
         // surfaces why (the slice's error was set on `single`, not parent).
         if (state === 'ABORTED') { leg.error = single.error; parent.error = single.error; }
