@@ -88,6 +88,11 @@ export class MigrationExecutor {
 
   constructor(private readonly hooks: ExecutorHooks) {}
 
+  /** Whether any leg runtime is live on this node (gates the periodic staging resolver). */
+  hasActiveLegs(): boolean {
+    return this.legs.size > 0;
+  }
+
   /** Route a control frame from the master. Returns the ack payload (idempotent). */
   async handle(type: string, data: any): Promise<any> {
     switch (type) {
@@ -402,6 +407,8 @@ export class MigrationExecutor {
       writeOwnerStamp(guildId, { shardId: leg.shardId, term, epoch });
     }
     try { await fs.promises.rm(legDir, { recursive: true, force: true }); } catch { /* best effort */ }
+    // Non-recursive: only reaps the migration dir once its last leg is gone.
+    try { await fs.promises.rmdir(path.dirname(legDir)); } catch { /* other legs still staged */ }
   }
 
   private async commitSource(leg: LegRuntime): Promise<void> {
@@ -608,6 +615,8 @@ export async function commitFromStaging(migrationId: string, legId: string, term
     writeOwnerStamp(guildId, { shardId, term, epoch });
   }
   try { await fs.promises.rm(legDir, { recursive: true, force: true }); } catch { /* best effort */ }
+  // Non-recursive: only reaps the migration dir once its last leg is gone.
+  try { await fs.promises.rmdir(path.dirname(legDir)); } catch { /* other legs still staged */ }
 }
 
 // Source-side graveyard + unfreeze for a leg's guilds when there is NO in-memory

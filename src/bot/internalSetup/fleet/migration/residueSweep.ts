@@ -212,11 +212,16 @@ export async function resolveIncomingWithMaster(
       continue;
     }
     // committing: finish each leg's renames from its intact staging.
+    let finished = 0;
     for (const leg of legs) {
       if (!leg.isDirectory()) continue;
       await commitFromStaging(mig.name, leg.name, disposition.term, disposition.epoch);
+      finished += 1;
     }
-    console.log(`[Fleet] Resumed commit for migration staging ${mig.name} (master verdict: committing)`);
+    // Reap the migration dir when nothing is left (a DONE migration keeps the
+    // committing verdict while in history; an empty dir must not log forever).
+    try { await fs.promises.rmdir(migDir); } catch { /* not empty or already gone */ }
+    if (finished > 0) console.log(`[Fleet] Resumed commit for migration staging ${mig.name} (master verdict: committing)`);
   }
 }
 
