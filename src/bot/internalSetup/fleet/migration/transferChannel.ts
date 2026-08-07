@@ -302,6 +302,12 @@ export class TransferReceiver {
   private readonly chunkHash = new Map<string, ReturnType<typeof createHash>>();
   private closed = false;
   private corruptApplied = false;
+  // Serializes message processing in arrival order. Without it, round-end (a
+  // tiny text frame) can be handled while an earlier record's write is still in
+  // flight - the redistribute path ships the WHOLE dataset as one final round,
+  // so the verify would hash incomplete staging (spurious mismatch abort). It
+  // also keeps chunk hash updates in offset order.
+  private processing: Promise<void> = Promise.resolve();
 
   constructor(
     private readonly ws: WebSocket,
@@ -313,7 +319,9 @@ export class TransferReceiver {
     this.baseDir = path.join(DATA_ROOT, INCOMING_DIR, migrationId, legId);
     this.baseResolved = path.resolve(this.baseDir);
     this.allowGuilds = new Set(guilds);
-    ws.on('message', (raw, isBinary) => void this.onMessage(raw, isBinary));
+    ws.on('message', (raw, isBinary) => {
+      this.processing = this.processing.then(() => this.onMessage(raw, isBinary)).catch(() => undefined);
+    });
     ws.on('close', () => { this.closed = true; this.events.onClose?.(); });
   }
 
