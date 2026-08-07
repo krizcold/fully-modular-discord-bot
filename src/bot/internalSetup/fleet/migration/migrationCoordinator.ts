@@ -853,7 +853,20 @@ export class MigrationCoordinator {
       const bSelf = this.hooks.isSelf(b) ? 1 : 0;
       return aSelf - bSelf;
     });
-    const epoch = rec.epoch ?? this.hooks.registry.epoch;
+    // Re-stamp when a concurrent grant round advanced the epoch past the
+    // commit-time stamp: re-sending the stale stamp is refused forever, and
+    // merely matching the newer epoch would TIE with that round's in-flight
+    // grants (equal epochs are last-writer-wins on the node). A fresh bump
+    // makes this round strictly dominant; stamping it back on the record keeps
+    // retries and crash recovery ordered.
+    let epoch = rec.epoch ?? this.hooks.registry.epoch;
+    if (this.hooks.registry.epoch > epoch) {
+      this.hooks.registry.epoch += 1;
+      epoch = this.hooks.registry.epoch;
+      rec.epoch = epoch;
+      if (this.parentRecord) this.parentRecord.epoch = epoch;
+      await this.persist();
+    }
     // The data is committed to each target; the grant is safe + idempotent to
     // retry. A hard grant refusal (ledger floor, target draining) must NEVER
     // finish DONE with the shard stranded off the free pool it would fall into,
