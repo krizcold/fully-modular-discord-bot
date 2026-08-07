@@ -17,7 +17,7 @@ import {
   saveGlobalConfig,
   saveGuildConfig
 } from '../../bot/internalSetup/utils/configManager';
-import { writeRawAtomic } from '../../bot/internalSetup/utils/dataManager';
+import { isGuildWriteFrozen, writeRawAtomic } from '../../bot/internalSetup/utils/dataManager';
 import { dataPath } from '../../utils/dataRoot';
 import { coWorkerReadonlyResponse, isCoWorkerNode } from '../middleware/fleetGate';
 import { nudgeSync } from '../utils/syncNudge';
@@ -156,6 +156,13 @@ export function createConfigRoutes(): Router {
       // node-owned guild writes stay allowed (guild data is node-owned).
       if (!guildId && isCoWorkerNode()) {
         coWorkerReadonlyResponse(res);
+        return;
+      }
+      // The facade would silently drop a frozen-guild write (correct for
+      // background writers); an operator save must be told instead.
+      if (guildId && isGuildWriteFrozen(guildId)) {
+        console.warn(`[Config] Rejected config write to frozen guild ${guildId} (shard migration in progress)`);
+        res.status(503).json({ success: false, error: 'Guild data is frozen for a shard migration; retry after it completes' });
         return;
       }
       const configInfo = getConfigFileMetadata(fileId);
@@ -458,6 +465,15 @@ export function createConfigRoutes(): Router {
       // node-owned guild writes stay allowed.
       if (!guildId && isCoWorkerNode()) {
         coWorkerReadonlyResponse(res);
+        return;
+      }
+      // This route writes via writeRawAtomic, which has no guild context and
+      // therefore no facade freeze gate: without this check a drain-window
+      // write would land after the final-round hash and then be graveyarded
+      // (or resurrect a zombie guild dir if it races the rename).
+      if (guildId && isGuildWriteFrozen(guildId)) {
+        console.warn(`[Config] Rejected data write to frozen guild ${guildId} (shard migration in progress)`);
+        res.status(503).json({ success: false, error: 'Guild data is frozen for a shard migration; retry after it completes' });
         return;
       }
 

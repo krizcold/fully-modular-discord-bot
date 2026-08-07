@@ -286,13 +286,23 @@ function hasFleetEnv(): boolean {
 
 const frozenGuilds = new Set<string>();
 let frozenWriteRejections = 0;
+const rejectionsAtFreeze = new Map<string, number>();
 
 export function freezeGuildWrites(guildId: string): void {
   frozenGuilds.add(guildId);
+  rejectionsAtFreeze.set(guildId, frozenWriteRejections);
 }
 
 export function unfreezeGuildWrites(guildId: string): void {
-  frozenGuilds.delete(guildId);
+  const atFreeze = rejectionsAtFreeze.get(guildId);
+  rejectionsAtFreeze.delete(guildId);
+  if (frozenGuilds.delete(guildId) && atFreeze !== undefined) {
+    // Counter is facade-global, so with several guilds frozen at once the
+    // delta attributes all rejections in the window to each; observability
+    // only, exact counts live with the rejecting writer's own handling.
+    const dropped = frozenWriteRejections - atFreeze;
+    if (dropped > 0) console.log(`[Data] Guild ${guildId} unfrozen; ${dropped} frozen-write rejection(s) during the freeze window`);
+  }
 }
 
 export function getFrozenStats(): { frozenGuilds: string[]; frozenWriteRejections: number } {
@@ -308,6 +318,15 @@ function isGuildFrozen(options: DataOptions): boolean {
   if (frozenGuilds.has(guildId)) return true;
   if (hasFleetEnv() && fs.existsSync(path.join(BASE_DATA_DIR, guildId, '.freeze'))) return true;
   return false;
+}
+
+/**
+ * Route-visible freeze check: the same gate the facade rejects writes with,
+ * including the cross-process .freeze sentinel, so the webui process can refuse
+ * an operator save instead of silently dropping it.
+ */
+export function isGuildWriteFrozen(guildId: string): boolean {
+  return isGuildFrozen({ guildId });
 }
 
 // ============================================================================
