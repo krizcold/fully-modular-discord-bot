@@ -1205,11 +1205,10 @@ export class MigrationCoordinator {
   }
 
   // Auto-proposal for Redistribute (shard -> node), rebuilt each computation.
-  // Capacity-balanced round-robin over the connected NON-master nodes,
-  // deterministic by nodeId; a shard already held in the table keeps its holder
-  // (including one already on the master - that is not an auto-move). The auto
-  // assignment never TARGETS the master (no-auto-move-to-master invariant); an
-  // operator override UI can replace this map without touching the mechanism.
+  // Capacity-balanced round-robin over ALL connected nodes, the master
+  // included, deterministic by nodeId; a shard already held in the table keeps
+  // its holder. An operator override UI can replace this map without touching
+  // the mechanism.
   private proposal = new Map<number, string>();
   private buildProposal(shardCount: number): void {
     this.proposal.clear();
@@ -1217,9 +1216,11 @@ export class MigrationCoordinator {
       .filter(n => n.connected)
       .sort((a, b) => a.nodeId.localeCompare(b.nodeId));
     if (connected.length === 0) return;
-    // Auto-placement candidates exclude the master; the master only keeps shards
-    // it already holds (the `existing` branch), never receives a moved one.
-    const candidates = connected.filter(n => n.nodeId !== this.hooks.selfNodeId);
+    // Every connected node is a placement candidate, the master included: the
+    // master holds data like any node (bounded by its capacity), and after a
+    // reshard the empty plan means it has nothing in the `existing` branch, so
+    // excluding it here would stack the whole fleet onto the workers.
+    const candidates = connected;
     const capOf = (nodeId: string) => {
       const n = this.hooks.registry.nodes.get(nodeId);
       return Math.max(1, n?.capabilities?.shardCapacity ?? 1);
@@ -1233,7 +1234,7 @@ export class MigrationCoordinator {
         held.set(existing.nodeId, (held.get(existing.nodeId) ?? 0) + 1);
         continue;
       }
-      // Least-loaded non-master node under its capacity (capacity-balanced).
+      // Least-loaded candidate by held/capacity ratio (capacity-balanced).
       let best: string | null = null;
       let bestScore = Infinity;
       for (const n of candidates) {
