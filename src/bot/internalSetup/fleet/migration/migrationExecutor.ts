@@ -285,11 +285,22 @@ export class MigrationExecutor {
   }
 
   private async onDrain(payload: XferDrainPayload): Promise<any> {
-    for (const legId of payload.legIds) {
-      const leg = this.legs.get(legId);
-      if (!leg) continue;
-      if (leg.role === 'source') await this.drainSource(leg);
-    }
+    // Ack on receipt, not completion: the final delta round + verify hash can
+    // outlast the generic control-ack window on large namespaces, and the
+    // DRAINING phase completes on XFER_VERIFY under its own drain timeout.
+    // Errors surface through reportProgress like any other leg fault.
+    void (async () => {
+      for (const legId of payload.legIds) {
+        const leg = this.legs.get(legId);
+        if (!leg) continue;
+        if (leg.role !== 'source') continue;
+        try {
+          await this.drainSource(leg);
+        } catch (error) {
+          this.reportProgress(leg, error instanceof Error ? error.message : String(error));
+        }
+      }
+    })();
     return { ok: true, term: payload.term };
   }
 
