@@ -244,6 +244,7 @@ export class MigrationExecutor {
         leg.round = round;
         await this.verifyTargetStaging(leg);
       },
+      onError: error => this.reportProgress(leg, error instanceof Error ? error.message : String(error)),
     }, leg.guilds);
   }
 

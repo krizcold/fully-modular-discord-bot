@@ -292,6 +292,8 @@ export interface ReceiverEvents {
   /** The 'round-end' final frame arrived; the caller should verify staging. */
   onFinal?: (round: number) => void;
   onClose?: () => void;
+  /** A record write failed fatally (e.g. ENOSPC on a full target disk). */
+  onError?: (error: unknown) => void;
 }
 
 export class TransferReceiver {
@@ -338,7 +340,16 @@ export class TransferReceiver {
     try {
       await this.writeRecord(buf);
     } catch (error) {
-      console.warn(`[Transfer] Receive error on ${this.migrationId}/${this.legId}:`, error instanceof Error ? error.message : error);
+      // A record write failure (e.g. ENOSPC on a full target disk) is fatal to
+      // the leg: stop ingesting and surface the real cause. Swallowing it lets
+      // staging end up incomplete, so the leg would abort with a misleading
+      // "hash mismatch" (the corruption/tamper signal) instead of the true
+      // out-of-space error, after wasting the whole transfer + verify hash.
+      if (!this.closed) {
+        this.closed = true;
+        console.warn(`[Transfer] Receive error on ${this.migrationId}/${this.legId}:`, error instanceof Error ? error.message : error);
+        this.events.onError?.(error);
+      }
     }
   }
 
