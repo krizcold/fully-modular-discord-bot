@@ -366,6 +366,31 @@ export class MigrationCoordinator {
     const guilds: string[] = [];
     for (const leg of legs.legs) { for (const g of leg.guilds) guilds.push(g); }
     const warnings: string[] = [];
+    // Explicit targets may exceed a node's declared capacity (deliberate
+    // operator override - the grant is honored); surface it in the confirm
+    // dialog instead of refusing. Net delta per node so a swap (one in, one
+    // out) never warns.
+    const delta = new Map<string, number>();
+    for (const leg of legs.legs) {
+      delta.set(leg.targetNodeId, (delta.get(leg.targetNodeId) ?? 0) + 1);
+      delta.set(leg.sourceNodeId, (delta.get(leg.sourceNodeId) ?? 0) - 1);
+    }
+    for (const [nodeId, d] of delta) {
+      if (d <= 0) continue;
+      const node = this.hooks.registry.nodes.get(nodeId);
+      if (!node) continue;
+      const cap = Math.max(1, node.capabilities?.shardCapacity ?? 1);
+      // Pending-confirmation grants book capacity like held leases do in the
+      // placement headroom math.
+      let pending = 0;
+      for (const p of this.hooks.registry.pendingConfirmation.values()) {
+        if (p.nodeId === nodeId) pending += 1;
+      }
+      const projected = this.hooks.registry.shardIdsOf(nodeId).length + pending + d;
+      if (projected > cap) {
+        warnings.push(`target ${node.nodeName} will exceed its declared capacity (${projected}/${cap})`);
+      }
+    }
     return { ok: true, estBytes, direction, guilds, warnings };
   }
 

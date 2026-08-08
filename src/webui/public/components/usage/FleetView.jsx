@@ -227,9 +227,11 @@ function FleetMoveControl({ shardId, fromNodeId, nodes, onStarted }) {
         const estMb = p.estBytes != null ? Math.round(p.estBytes / 1048576) : '?';
         const freeMb = p.targetFreeBytes != null ? Math.round(p.targetFreeBytes / 1048576) : 'unknown';
         const guildN = (p.guilds || []).length;
+        const warnText = (p.warnings || []).length ? `WARNING: ${p.warnings.join('; ')}\n\n` : '';
         if (!confirm(
           `Move shard ${shardId} to the selected node?\n`
           + `~${estMb} MB across ${guildN} guild(s), target free ~${freeMb} MB, direction ${p.direction || '?'}.\n\n`
+          + warnText
           + MIGRATION_FILE_WARNING
         )) return null;
         return api.post('/fleet/migrate', { kind: 'move', shardId, toNodeId });
@@ -279,14 +281,22 @@ function FleetRetireControl({ node, nodes, shardTable, onStarted }) {
       if (!t) { showToast(`Choose a target for shard ${shardId}`, 'error'); return; }
       targetsMap[String(shardId)] = t;
     }
-    if (!confirm(
-      `Retire ${node.nodeName}? Its ${owned.length} shard(s) will be moved one at a time to the chosen targets.\n\n`
-      + MIGRATION_FILE_WARNING
-    )) return;
     setBusy(true);
-    api.post('/fleet/migrate', { kind: 'retire', nodeId: node.nodeId, targets: targetsMap })
+    api.post('/fleet/migrate/precheck', { kind: 'retire', nodeId: node.nodeId, targets: targetsMap })
+      .then((pre) => {
+        const p = (pre && pre.precheck) || {};
+        if (pre && pre.success === false) { showToast(pre.error || 'Precheck failed', 'error'); return null; }
+        const warnText = (p.warnings || []).length ? `WARNING: ${p.warnings.join('; ')}\n\n` : '';
+        if (!confirm(
+          `Retire ${node.nodeName}? Its ${owned.length} shard(s) will be moved one at a time to the chosen targets.\n\n`
+          + warnText
+          + MIGRATION_FILE_WARNING
+        )) return null;
+        return api.post('/fleet/migrate', { kind: 'retire', nodeId: node.nodeId, targets: targetsMap });
+      })
       .then((res) => {
-        if (!res || res.success === false) { showToast((res && res.error) || 'Retire failed', 'error'); return; }
+        if (!res) return;
+        if (res.success === false) { showToast(res.error || 'Retire failed', 'error'); return; }
         showToast(`Retire of ${node.nodeName} started`, 'success');
         setOpen(false);
         if (onStarted) onStarted();
