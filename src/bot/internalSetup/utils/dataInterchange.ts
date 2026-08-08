@@ -29,6 +29,27 @@ function sha256Hex(bytes: Buffer): string {
   return crypto.createHash('sha256').update(bytes).digest('hex');
 }
 
+/**
+ * Streamed file hash for verify walks: bounded memory and the event loop
+ * yields between chunks, so hashing a large file cannot starve the control
+ * channel (heartbeats, drain acks) the way a whole-file read + single-shot
+ * update does.
+ */
+export function hashFileStreamed(filePath: string): Promise<{ size: number; sha256: string }> {
+  return new Promise((resolve, reject) => {
+    const hash = crypto.createHash('sha256');
+    let size = 0;
+    const stream = fs.createReadStream(filePath);
+    stream.on('data', (chunk: Buffer | string) => {
+      const buf = typeof chunk === 'string' ? Buffer.from(chunk) : chunk;
+      size += buf.length;
+      hash.update(buf);
+    });
+    stream.on('error', reject);
+    stream.on('end', () => resolve({ size, sha256: hash.digest('hex') }));
+  });
+}
+
 // Resolve a record's relPath under destRoot, or null when it fails the guard
 // (absolute / drive-letter / backslash / empty or '..' segment / escapes root).
 // Mirrors the Stage 3/4 resolveScopeFile traversal idiom.
@@ -126,9 +147,17 @@ export interface NamespaceHashResult {
  * relPath + '\n' + decimalSize + '\n' + fileSha256Hex + '\n').
  */
 export async function hashNamespace(guildId: string): Promise<NamespaceHashResult> {
+  // Verify-only walk: streamed per-file hashes, never whole-file buffers
+  // (exportNamespace buffers each file because its records SHIP the bytes;
+  // a verify pass only needs the digests).
+  await flushGuild(guildId);
+  const base = path.join(DATA_ROOT, guildId);
   const files: { relPath: string; size: number; sha256: string }[] = [];
-  for await (const record of exportNamespace(guildId)) {
-    files.push({ relPath: record.relPath, size: record.size, sha256: record.sha256 });
+  for await (const relPath of walkFiles(base)) {
+    try {
+      const { size, sha256 } = await hashFileStreamed(path.join(base, relPath));
+      files.push({ relPath, size, sha256 });
+    } catch { /* file vanished mid-walk */ }
   }
   files.sort((a, b) => Buffer.compare(Buffer.from(a.relPath, 'utf-8'), Buffer.from(b.relPath, 'utf-8')));
   const hash = crypto.createHash('sha256');

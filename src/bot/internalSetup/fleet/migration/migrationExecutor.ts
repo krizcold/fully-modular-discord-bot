@@ -572,6 +572,7 @@ async function hashStaging(migrationId: string, legId: string, guilds: string[])
 // sorted relPath, sha256(concat of relPath\nsize\nfileSha\n).
 async function hashStagedGuild(base: string): Promise<string> {
   const { createHash } = await import('crypto');
+  const { hashFileStreamed } = await import('../../utils/dataInterchange');
   const files: { relPath: string; size: number; sha256: string }[] = [];
   async function walk(rel: string): Promise<void> {
     const dir = rel ? path.join(base, rel) : base;
@@ -582,8 +583,10 @@ async function hashStagedGuild(base: string): Promise<string> {
       const childRel = rel ? `${rel}/${entry.name}` : entry.name;
       if (entry.isDirectory()) await walk(childRel);
       else if (entry.isFile()) {
-        const bytes = await fs.promises.readFile(path.join(base, ...childRel.split('/')));
-        files.push({ relPath: childRel, size: bytes.length, sha256: createHash('sha256').update(bytes).digest('hex') });
+        try {
+          const { size, sha256 } = await hashFileStreamed(path.join(base, ...childRel.split('/')));
+          files.push({ relPath: childRel, size, sha256 });
+        } catch { /* file vanished mid-walk */ }
       }
     }
   }
