@@ -66,6 +66,8 @@ export interface CoordinatorHooks {
   store: ControlStore;
   /** True while the reshard pause marker exists (redistribute is the only pause-time migration). */
   isPaused: () => boolean;
+  /** Milliseconds left of the recovery hold-down (0 when elapsed); the fleet is still assembling while > 0. */
+  holdDownRemainingMs: () => number;
   /** Grant a node its full shard set (the existing metered grant path). Returns ok/pending. */
   grantShardsTo: (nodeId: string, fullShardIds: number[], epoch: number) => Promise<{ ok: boolean; pending: boolean }>;
   /** Revoke specific leases from a node (source destroys sessions). */
@@ -1133,6 +1135,8 @@ export class MigrationCoordinator {
   // --------------------------------------------------------------------------
   private async precheckRedistribute(): Promise<PrecheckResult> {
     if (!this.hooks.isPaused()) return { ok: false, error: 'redistribute runs only during the reshard pause' };
+    const assembling = this.assemblingError();
+    if (assembling) return { ok: false, error: assembling };
     if (this.hasActive()) return { ok: false, error: 'migration-in-progress' };
     const { moveSet, unreachable, totalBytes } = await this.computeRedistribute();
     return { ok: true, moveSet, unreachable, estBytes: totalBytes };
@@ -1140,6 +1144,8 @@ export class MigrationCoordinator {
 
   private async startRedistribute(): Promise<{ ok: boolean; error?: string; migrationId?: string }> {
     if (!this.hooks.isPaused()) return { ok: false, error: 'redistribute runs only during the reshard pause' };
+    const assembling = this.assemblingError();
+    if (assembling) return { ok: false, error: assembling };
     const { moveSet } = await this.computeRedistribute();
     // Persist the FULL proposal (all shards, built by computeRedistribute) up
     // front so Resume grants EXACTLY the proposal even if the master crashes
@@ -1273,6 +1279,20 @@ export class MigrationCoordinator {
         held.set(best, (held.get(best) ?? 0) + 1);
       }
     }
+  }
+
+  // Redistribute placement is computed from the CONNECTED set, and Resume grants
+  // exactly that proposal. A reshard-pause boot restores no worker entries, so
+  // during the hold-down the registry holds only the master: a redistribute
+  // started then bakes a master-only proposal (behind the benign "nothing to
+  // redistribute") and Resume hands it the whole fleet, past its capacity.
+  // Refuse until the fleet has assembled, the same gate Resume and manual assign
+  // already apply. A worker that registered and then dropped is still visible as
+  // `unreachable`, so the deliberate offline-holder redistribute is unaffected.
+  private assemblingError(): string | null {
+    const remainingMs = this.hooks.holdDownRemainingMs();
+    if (remainingMs <= 0) return null;
+    return `waiting for stale-holder leases to expire, ${Math.ceil(remainingMs / 1000)}s remaining`;
   }
 
   // The node the proposal assigns a shard to.

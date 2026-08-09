@@ -1335,6 +1335,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       selfNodeId: nodeId,
       store,
       isPaused: () => paused,
+      holdDownRemainingMs: () => (recoverySource ? Math.max(0, recoverySource.holdDownUntil - Date.now()) : 0),
       grantShardsTo: async (targetNodeId, fullShardIds, epoch) => {
         const node = registry.nodes.get(targetNodeId);
         if (!node) return { ok: false, pending: false };
