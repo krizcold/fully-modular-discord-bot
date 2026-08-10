@@ -19,7 +19,7 @@ import { createHash, timingSafeEqual } from 'crypto';
 import { WebSocketServer, WebSocket } from 'ws';
 import { DATA_ROOT } from '../../../../utils/dataRoot';
 import { exportNamespace, FileRecord } from '../../utils/dataInterchange';
-import { XFER_CHUNK_BYTES, XFER_HIGH_WATER_BYTES } from '../constants';
+import { XFER_CHUNK_BYTES, XFER_DIAL_HANDSHAKE_MS, XFER_HIGH_WATER_BYTES } from '../constants';
 
 const INCOMING_DIR = '_incoming';
 const FILE_STRIKE_LIMIT = 3;
@@ -102,6 +102,9 @@ export class TransferServer {
       this.httpServer.on('upgrade', (req, socket, head) => {
         const ctx = this.hooks.authorize(String(req.headers['x-transfer-token'] ?? ''));
         if (!ctx) {
+          // Tokens are single use, so a legitimate re-dial after the peer already
+          // consumed one lands here too; say so rather than dropping in silence.
+          console.warn('[Transfer] Rejected upgrade: unknown, expired or already-spent token');
           socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
           socket.destroy();
           return;
@@ -456,7 +459,13 @@ export class TransferReceiver {
 
 /** Dial a peer's transfer endpoint with the single-use token header. */
 export function dialTransfer(peerUrl: string, token: string): WebSocket {
-  return new WebSocket(peerUrl, { headers: { 'x-transfer-token': token } });
+  // Mirrors the control dial: with no handshake timeout, ws registers no abort
+  // timer, so an upgrade that stalls (a proxied cross-host route on first
+  // contact) never emits open OR error and the caller waits forever.
+  return new WebSocket(peerUrl, {
+    headers: { 'x-transfer-token': token },
+    handshakeTimeout: XFER_DIAL_HANDSHAKE_MS,
+  });
 }
 
 /** Staging dir for a leg's received bytes. */

@@ -68,6 +68,7 @@ interface LegRuntime {
   committed: boolean;
   frozen: boolean;
   drainPending: boolean;
+  dialTimer: NodeJS.Timeout | null;
 }
 
 export interface ExecutorHooks {
@@ -117,9 +118,10 @@ export class MigrationExecutor {
       onPullConnected: (legId, ws) => {
         const leg = this.legs.get(legId);
         if (!leg || leg.role !== 'source') { ws.close(); return; }
-        // The target dialed us (pull): read its hello, then stream.
+        // The target dialed us (pull): its hello starts the stream. A hello that
+        // never arrives leaves this socket idle until the master's stall
+        // watchdog aborts the leg; there is no send-anyway fallback here.
         ws.once('message', () => this.attachSender(leg, ws));
-        // Also start immediately if no hello arrives; a hello is advisory.
         leg.ws = ws;
       },
       onPushConnected: (legId, ws) => {
@@ -167,6 +169,7 @@ export class MigrationExecutor {
           committed: false,
           frozen: false,
           drainPending: false,
+          dialTimer: null,
         });
       }
       if (legInfo.role === 'source') {
@@ -205,6 +208,19 @@ export class MigrationExecutor {
       this.reportProgress(leg, 'no peer url to dial');
       return;
     }
+    // The retry window is only consulted from the socket's error handler, so a
+    // dial that raises no event at all would never report. Arm the deadline as
+    // a timer too: the leg must always end in a connection or a stated failure.
+    if (!leg.dialTimer) {
+      leg.dialTimer = setTimeout(() => {
+        leg.dialTimer = null;
+        if (leg.aborted || leg.sender || leg.receiver || !this.legs.has(leg.legId)) return;
+        try { leg.ws?.terminate(); } catch { /* already gone */ }
+        leg.ws = null;
+        this.reportProgress(leg, `dial to ${leg.peerUrl} produced no websocket upgrade within ${XFER_DIAL_RETRY_WINDOW_MS}ms`);
+      }, XFER_DIAL_RETRY_WINDOW_MS + XFER_DIAL_RETRY_MS);
+      leg.dialTimer.unref?.();
+    }
     const ws = dialTransfer(leg.peerUrl, leg.token);
     leg.ws = ws;
     let opened = false;
@@ -236,6 +252,7 @@ export class MigrationExecutor {
 
   private attachReceiver(leg: LegRuntime, ws: WebSocket): void {
     if (leg.receiver) return;
+    this.clearDialTimer(leg);
     leg.ws = ws;
     void this.writeManifest(leg, 'receiving');
     leg.receiver = new TransferReceiver(ws, leg.migrationId, leg.legId, {
@@ -250,6 +267,7 @@ export class MigrationExecutor {
 
   private attachSender(leg: LegRuntime, ws: WebSocket): void {
     if (leg.sender) return;
+    this.clearDialTimer(leg);
     leg.ws = ws;
     leg.sender = new TransferSender(ws, {
       migrationId: leg.migrationId,
@@ -446,6 +464,7 @@ export class MigrationExecutor {
     for (const [legId, leg] of this.legs) {
       if (leg.migrationId !== payload.migrationId) continue;
       leg.aborted = true;
+      this.clearDialTimer(leg);
       try { leg.ws?.close(); } catch { /* closing */ }
       await leg.receiver?.close();
       if (leg.role === 'target') {
@@ -488,7 +507,16 @@ export class MigrationExecutor {
     }
   }
 
+  private clearDialTimer(leg: LegRuntime): void {
+    if (!leg.dialTimer) return;
+    clearTimeout(leg.dialTimer);
+    leg.dialTimer = null;
+  }
+
   private reportProgress(leg: LegRuntime, error?: string, progress?: { filesSent: number; bytesSent: number; deltaFiles: number }): void {
+    // A participant used to fail its leg without saying anything locally, which
+    // left only the master's generic abort to diagnose from.
+    if (error) console.warn(`[Migration] Leg ${leg.legId} fault: ${error}`);
     const payload: XferProgressPayload = {
       migrationId: leg.migrationId,
       legId: leg.legId,

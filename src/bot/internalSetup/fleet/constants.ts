@@ -107,8 +107,15 @@ export const XFER_PREPARE_TIMEOUT_MS = 15000;
 /** Pre-open dial failures re-dial on this cadence (the peer's lazy listener may still be binding). */
 export const XFER_DIAL_RETRY_MS = 500;
 
+/**
+ * Abort a transfer dial whose websocket upgrade never answers. Without it a
+ * handshake that stalls behind a reverse proxy raises no event at all, so the
+ * leg dies silently until the stall watchdog fires a minute later.
+ */
+export const XFER_DIAL_HANDSHAKE_MS = 8000;
+
 /** Give up re-dialing a leg's peer after this window and report the dial error. */
-export const XFER_DIAL_RETRY_WINDOW_MS = 10000;
+export const XFER_DIAL_RETRY_WINDOW_MS = 25000;
 
 /** No progress from a leg for this long during copy = stall -> abort. */
 export const XFER_STALL_TIMEOUT_MS = 60000;
