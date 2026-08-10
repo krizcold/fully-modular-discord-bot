@@ -1139,20 +1139,26 @@ export class MigrationCoordinator {
     if (assembling) return { ok: false, error: assembling };
     if (this.hasActive()) return { ok: false, error: 'migration-in-progress' };
     const { moveSet, unreachable, totalBytes } = await this.computeRedistribute();
-    return { ok: true, moveSet, unreachable, estBytes: totalBytes };
+    return { ok: true, moveSet, unreachable, estBytes: totalBytes, warnings: this.proposalWarnings(unreachable) };
   }
 
   private async startRedistribute(): Promise<{ ok: boolean; error?: string; migrationId?: string }> {
     if (!this.hooks.isPaused()) return { ok: false, error: 'redistribute runs only during the reshard pause' };
     const assembling = this.assemblingError();
     if (assembling) return { ok: false, error: assembling };
-    const { moveSet } = await this.computeRedistribute();
+    const { moveSet, unreachable } = await this.computeRedistribute();
     // Persist the FULL proposal (all shards, built by computeRedistribute) up
     // front so Resume grants EXACTLY the proposal even if the master crashes
     // mid-redistribute or there is nothing to move (data already on the proposal
     // owners). The proposal covers every shard, not just the moved ones.
     await this.persistProposal();
-    if (moveSet.length === 0) return { ok: false, error: 'nothing to redistribute (all data already placed)' };
+    // Resume grants this proposal verbatim, so an operator who skipped the
+    // precheck still needs to see what it commits them to.
+    for (const warning of this.proposalWarnings(unreachable)) console.warn(`[Migration] Redistribute: ${warning}`);
+    if (moveSet.length === 0) {
+      const missing = unreachable.length > 0 ? `; ${unreachable.map(n => n.nodeName).join(', ')} unreachable` : '';
+      return { ok: false, error: `nothing to redistribute (all data already placed)${missing}` };
+    }
     const legs: MigrationLeg[] = moveSet.map(m => {
       const direction = this.resolveDirection(m.from, m.to) ?? 'push';
       return { legId: randomUUID(), shardId: m.shardId, sourceNodeId: m.from, targetNodeId: m.to, direction, guilds: m.guilds };
@@ -1293,6 +1299,28 @@ export class MigrationCoordinator {
     const remainingMs = this.hooks.holdDownRemainingMs();
     if (remainingMs <= 0) return null;
     return `waiting for stale-holder leases to expire, ${Math.ceil(remainingMs / 1000)}s remaining`;
+  }
+
+  // Capacity is a soft placement hint, not a safety invariant: Resume grants the
+  // proposal verbatim so that every guild is served by the node holding its data,
+  // which deliberately outranks the declared cap (the same override retire's
+  // explicit targets get). Capping here instead would leave surplus shards with
+  // no owner at all, since distribute() only places onto nodes under capacity.
+  // So warn rather than refuse, and name the nodes the proposal could not consult.
+  private proposalWarnings(unreachable: { nodeId: string; nodeName: string }[]): string[] {
+    const warnings: string[] = [];
+    const load = new Map<string, number>();
+    for (const nodeId of this.proposal.values()) load.set(nodeId, (load.get(nodeId) ?? 0) + 1);
+    for (const [nodeId, count] of load) {
+      const node = this.hooks.registry.nodes.get(nodeId);
+      if (!node) continue;
+      const cap = Math.max(1, node.capabilities?.shardCapacity ?? 1);
+      if (count > cap) warnings.push(`${node.nodeName} will exceed its declared capacity (${count}/${cap})`);
+    }
+    if (unreachable.length > 0) {
+      warnings.push(`${unreachable.map(n => n.nodeName).join(', ')} unreachable; their shards are placed on the nodes that are up and those guilds start fresh`);
+    }
+    return warnings;
   }
 
   // The node the proposal assigns a shard to.
