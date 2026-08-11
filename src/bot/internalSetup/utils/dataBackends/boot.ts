@@ -9,7 +9,7 @@ import { PostgresBackend } from './postgresBackend';
 import { initWorkingSet } from './workingSet';
 import { initDataReadiness, getDataReadiness, DataReadinessDriver } from './dataReadiness';
 import { forceRouteDefault, routeFor } from './routeResolver';
-import { evaluateRecognitionGuard, verifyStoreIdentity, GuardVerdict } from './recognitionGuard';
+import { evaluateRecognitionGuard, verifyStoreIdentity, readFileMarker, GuardVerdict } from './recognitionGuard';
 import { setGuildDataBackend } from '../dataManager';
 
 // Startup barrier bound = the acceptance window: past it something is wrong
@@ -102,20 +102,25 @@ async function verifyIdentityLoop(url: string, driver: DataReadinessDriver): Pro
         refuse(verdict.reason);
         return;
       }
-      driver.release();
-      bootStatus = { ...bootStatus, state: 'serving' };
-      console.log('[Data] Postgres store identity verified; serving');
-      return;
-    } catch {
-      if (!logged) {
-        console.warn('[Data] Waiting on the data backend to verify store identity; gates stay closed');
-        logged = true;
+      // Release only once the marker holds the store id (minted by the
+      // backend's own provisioning): hydration cannot proceed any earlier
+      // anyway, and adopting it now makes a later URL swap detectable from
+      // the very next boot.
+      if (readFileMarker()?.storeId) {
+        driver.release();
+        bootStatus = { ...bootStatus, state: 'serving' };
+        console.log('[Data] Postgres store identity verified; serving');
+        return;
       }
-      await new Promise<void>(resolve => {
-        const t = setTimeout(resolve, IDENTITY_RETRY_MS);
-        t.unref();
-      });
+    } catch { /* unreachable; fall through to the retry sleep */ }
+    if (!logged) {
+      console.warn('[Data] Waiting on the data backend to verify store identity; gates stay closed');
+      logged = true;
     }
+    await new Promise<void>(resolve => {
+      const t = setTimeout(resolve, IDENTITY_RETRY_MS);
+      t.unref();
+    });
   }
 }
 
