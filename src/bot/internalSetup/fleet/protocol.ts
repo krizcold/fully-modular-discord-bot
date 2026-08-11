@@ -187,6 +187,8 @@ export interface HeartbeatPayload {
   syncAppliedRevision?: number;
   /** False while the last reconcile ended degraded (co-worker only). */
   syncOk?: boolean;
+  /** Data backend reachability (postgres nodes only; absent = file mode or pre-backend build). */
+  dataBackendHealthy?: boolean;
 }
 
 export interface GuildNoticePayload {

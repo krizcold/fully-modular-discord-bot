@@ -8,6 +8,7 @@ import { Status } from 'discord.js';
 import type { Client } from 'discord.js';
 import { getMetricsCollector } from '../utils/metrics/metricsCollector';
 import { getDataReadiness } from '../utils/dataBackends/dataReadiness';
+import { getGuildDataBackend } from '../utils/dataManager';
 import { getNodeId } from './nodeIdentity';
 import type { IngestService } from '../ingest/ingestService';
 import type {
@@ -242,6 +243,7 @@ export class LeaseRuntime {
     try {
       metrics = getMetricsCollector().getHeartbeatSnapshot();
     } catch { /* metrics must never take the control channel down */ }
+    const backend = getGuildDataBackend();
     const hb: HeartbeatPayload = {
       term,
       seq: ++this.seq,
@@ -250,6 +252,7 @@ export class LeaseRuntime {
       guilds: client ? [...client.guilds.cache.keys()] : [],
       metrics,
       load: this.sampleLoad(),
+      ...(backend ? { dataBackendHealthy: backend.healthy() } : {}),
     };
     this.lastHeartbeat = hb;
     return hb;

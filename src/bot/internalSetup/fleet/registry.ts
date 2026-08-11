@@ -45,6 +45,8 @@ export interface RegistryNode {
   load: LoadSample | null;
   /** Last fully-applied sync revision from the node's heartbeats; null before the first one. */
   syncAppliedRevision: number | null;
+  /** Last heartbeat's data-backend reachability; null when unreported (file mode). */
+  dataBackendHealthy: boolean | null;
   /** False while the node's last reconcile ended degraded; null when unreported. */
   syncOk: boolean | null;
   send: ((message: object) => void) | null;
@@ -120,6 +122,7 @@ export class Registry {
       load: existing?.load ?? null,
       syncAppliedRevision: existing?.syncAppliedRevision ?? null,
       syncOk: existing?.syncOk ?? null,
+      dataBackendHealthy: existing?.dataBackendHealthy ?? null,
       send: input.send,
     };
     this.nodes.set(input.nodeId, node);
@@ -154,6 +157,7 @@ export class Registry {
       load: null,
       syncAppliedRevision: null,
       syncOk: null,
+      dataBackendHealthy: null,
       send: null,
     };
     this.nodes.set(input.nodeId, node);
@@ -180,6 +184,7 @@ export class Registry {
     node.load = hb.load ?? null;
     if (Number.isInteger(hb.syncAppliedRevision)) node.syncAppliedRevision = hb.syncAppliedRevision!;
     if (typeof hb.syncOk === 'boolean') node.syncOk = hb.syncOk;
+    if (typeof hb.dataBackendHealthy === 'boolean') node.dataBackendHealthy = hb.dataBackendHealthy;
     this.replaceNodeGuilds(nodeId, Array.isArray(hb.guilds) ? hb.guilds : []);
     this.adoptHeartbeatClaims(nodeId, hb);
   }
