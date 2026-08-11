@@ -14,6 +14,20 @@ const HYDRATE_RETRY_CAP_MS = 30_000;
 // Interactions wait inline inside Discord's 3 s ack window, then fail politely.
 const INTERACTION_WAIT_MS = 2500;
 const EVENT_BUFFER_CAP = 256;
+// Decline-lease deadline: unhydrated guilds + unhealthy backend past this
+// hands the lease back rather than sitting on shards it cannot serve.
+const HYDRATION_DECLINE_MS = 30_000;
+
+export type LeaseDeclineReason = 'hydration-timeout' | 'deposed-at-hydration';
+
+// Module-level (not per-driver): the fleet wiring registers once and the
+// handler survives a runtime recycle (URL rotation reconstructs the driver).
+// Never wired on masters or standalone - their self-grants never decline.
+let declineHandler: ((reason: LeaseDeclineReason, shardIds: number[]) => void) | null = null;
+
+export function setLeaseDeclineHandler(cb: (reason: LeaseDeclineReason, shardIds: number[]) => void): void {
+  declineHandler = cb;
+}
 
 // Local copy of the guild->shard formula (placement.ts) to avoid a fleet import.
 function guildIdToShardId(guildId: string, shardCount: number): number {
@@ -180,22 +194,35 @@ export class DataReadinessDriver {
   }
 
   private async hydrateShards(shards: number[]): Promise<void> {
-    let guilds: string[] = [];
-    for (let attempt = 0; !this.stopped; attempt++) {
-      try {
-        guilds = await this.backend.listOwnedGuilds(shards, this.shardCount);
-        break;
-      } catch {
-        await sleep(backoff(attempt));
-        // Shards may have been revoked while we waited.
-        const still = shards.filter(s => this.shardIds.includes(s));
-        if (still.length === 0) return;
+    // Decline deadline: still-unhydrated shards on an unhealthy backend get
+    // handed back instead of held unservable. Healthy-but-slow keeps working.
+    const declineTimer = setTimeout(() => {
+      if (this.stopped || !declineHandler || this.backend.healthy()) return;
+      const affected = shards.filter(s => this.shardIds.includes(s));
+      if (affected.length === 0) return;
+      declineHandler('hydration-timeout', affected);
+    }, HYDRATION_DECLINE_MS);
+    declineTimer.unref();
+    try {
+      let guilds: string[] = [];
+      for (let attempt = 0; !this.stopped; attempt++) {
+        try {
+          guilds = await this.backend.listOwnedGuilds(shards, this.shardCount);
+          break;
+        } catch {
+          await sleep(backoff(attempt));
+          // Shards may have been revoked while we waited.
+          const still = shards.filter(s => this.shardIds.includes(s));
+          if (still.length === 0) return;
+        }
       }
+      for (let i = 0; i < guilds.length; i += HYDRATION_FANOUT) {
+        await Promise.all(guilds.slice(i, i + HYDRATION_FANOUT).map(g => this.hydrateWithRetry(g)));
+      }
+      this.settleInitialIfReady();
+    } finally {
+      clearTimeout(declineTimer);
     }
-    for (let i = 0; i < guilds.length; i += HYDRATION_FANOUT) {
-      await Promise.all(guilds.slice(i, i + HYDRATION_FANOUT).map(g => this.hydrateWithRetry(g)));
-    }
-    this.settleInitialIfReady();
   }
 
   private async hydrateWithRetry(guildId: string): Promise<void> {
@@ -204,10 +231,11 @@ export class DataReadinessDriver {
       const outcome = await this.ws.hydrate(guildId, this.fenceFor(guildId));
       if (outcome === 'ready') return;
       if (outcome === 'deposed') {
-        // Single-node posture: a deposed claim here means a stale local view;
-        // the fleet layer's decline path (multi-node) owns handing the lease
-        // back. Log loudly and stop retrying this guild.
+        // A 0-row claim: a newer owner holds this guild. A healthy node must
+        // not sit on a lease it can never serve - decline immediately (fleet
+        // wiring; masters and standalone log only).
         console.error(`[Data] Hydration claim for guild ${guildId} lost to a newer owner; not serving it`);
+        declineHandler?.('deposed-at-hydration', [guildIdToShardId(guildId, this.shardCount || 1)]);
         return;
       }
       await sleep(backoff(attempt));
