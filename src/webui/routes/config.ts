@@ -11,7 +11,10 @@ import {
   discoverGuildDataFiles,
   getDataFileMetadata
 } from '../../bot/internalSetup/utils/configDiscovery';
+import type { ConfigFileMetadata } from '../../bot/internalSetup/utils/configDiscovery';
 import type { DataFileMetadata } from '../../bot/types/moduleTypes';
+import { routeFor } from '../../bot/internalSetup/utils/dataBackends/routeResolver';
+import { getWebuiDataReader, isDataBackendUnreachable } from '../utils/webuiDataReader';
 import {
   getMergedConfig,
   saveGlobalConfig,
@@ -43,13 +46,26 @@ export function createConfigRoutes(): Router {
    * List all available config files (includes module schemas)
    * If guildId provided, returns guild-specific config files
    */
-  router.get('/list', (req: Request, res: Response) => {
+  router.get('/list', async (req: Request, res: Response) => {
     try {
       const guildId = req.query.guildId as string | undefined;
 
       // If guild ID provided, return guild-specific configs + data files
       let files;
-      if (guildId) {
+      if (guildId && routeFor(guildId) === 'postgres') {
+        try {
+          files = await discoverGuildFilesPostgres(guildId);
+        } catch (error) {
+          if (!isDataBackendUnreachable(error)) {
+            throw error;
+          }
+          res.status(503).json({
+            success: false,
+            error: 'Data backend unreachable; retry shortly'
+          });
+          return;
+        }
+      } else if (guildId) {
         const configFiles = discoverGuildConfigFiles(guildId);
         const dataFiles = discoverGuildDataFiles(guildId);
 
@@ -385,7 +401,7 @@ export function createConfigRoutes(): Router {
    * Get specific data file (raw JSON)
    * If guildId provided, returns guild-specific data file
    */
-  router.get('/data/get', (req: Request, res: Response) => {
+  router.get('/data/get', async (req: Request, res: Response) => {
     try {
       const fileId = req.query.file ? decodeURIComponent(req.query.file as string) : undefined;
       const guildId = req.query.guildId as string | undefined;
@@ -395,6 +411,11 @@ export function createConfigRoutes(): Router {
           success: false,
           error: 'File ID is required'
         });
+        return;
+      }
+
+      if (guildId && routeFor(guildId) === 'postgres') {
+        await serveGuildDataFromReader(fileId, guildId, res);
         return;
       }
 
@@ -459,6 +480,12 @@ export function createConfigRoutes(): Router {
       // null/absent guildId is a legitimate global write and routes below.
       if (guildId != null && !isValidGuildId(guildId)) {
         res.status(400).json({ success: false, error: 'Invalid guildId format' });
+        return;
+      }
+      // The webui parent never writes postgres; database-routed guild writes
+      // must go through the owning bot process.
+      if (guildId && routeFor(guildId) === 'postgres') {
+        res.status(503).json({ success: false, error: 'Editing this guild\'s data from the web UI is temporarily unavailable in database mode' });
         return;
       }
       // Co-worker: global data files are synced from the master; only genuine
@@ -559,4 +586,160 @@ export function createConfigRoutes(): Router {
   });
 
   return router;
+}
+
+/**
+ * Mirror of configDiscovery's generateDisplayName for reader-served entries.
+ */
+function displayNameFor(filename: string): string {
+  const baseName = filename.replace('.json', '');
+  if (baseName === 'config') {
+    return 'Main Bot Config';
+  }
+  return baseName
+    .replace(/([A-Z])/g, ' $1')
+    .replace(/[-_]/g, ' ')
+    .split(' ')
+    .map(word => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
+    .join(' ')
+    .trim();
+}
+
+/**
+ * Guild file listing for a postgres-routed guild: schema-declared entries keep
+ * their metadata but the exists probes are answered by the database, and the
+ * orphan disk scan is replaced by database listings (per schema-known module
+ * plus the guild-dir root). Disk leftovers are ignored - the database is the
+ * source of truth for this guild.
+ */
+async function discoverGuildFilesPostgres(guildId: string): Promise<Array<ConfigFileMetadata | DataFileMetadata>> {
+  const reader = getWebuiDataReader();
+
+  const configFiles = discoverGuildConfigFiles(guildId).filter(file => file.schema);
+  const dataFiles = discoverGuildDataFiles(guildId).filter(file => file.schema);
+  const schemaFiles: Array<ConfigFileMetadata | DataFileMetadata> = [...configFiles, ...dataFiles];
+
+  await Promise.all(schemaFiles.map(async file => {
+    file.exists = await reader.exists(guildId, file.moduleName || '', file.id);
+  }));
+
+  const covered = new Set(schemaFiles.map(file => `${file.moduleName || ''}/${file.id}`));
+  const moduleNames = [...new Set(schemaFiles.map(file => file.moduleName).filter((name): name is string => !!name))];
+  const orphans: Array<ConfigFileMetadata | DataFileMetadata> = [];
+
+  await Promise.all(moduleNames.map(async moduleName => {
+    const filenames = await reader.listFiles(guildId, moduleName);
+    for (const filename of filenames) {
+      if (covered.has(`${moduleName}/${filename}`)) {
+        continue;
+      }
+      orphans.push({
+        id: filename,
+        path: dataPath(guildId, moduleName, filename),
+        name: displayNameFor(filename),
+        description: 'Orphaned data file (no schema defined)',
+        category: 'data',
+        exists: true,
+        required: false,
+        template: undefined,
+        scope: 'guild',
+        moduleName
+      });
+    }
+  }));
+
+  const rootFilenames = await reader.listFiles(guildId);
+  for (const filename of rootFilenames) {
+    orphans.push({
+      id: filename,
+      path: dataPath(guildId, filename),
+      name: displayNameFor(filename),
+      description: `${displayNameFor(filename)} runtime data`,
+      category: 'data',
+      exists: true,
+      default: {}
+    });
+  }
+
+  // Same dedup-by-path as the file-routed branch: schema entries win.
+  const pathMap = new Map<string, ConfigFileMetadata | DataFileMetadata>();
+  [...schemaFiles, ...orphans].forEach(file => {
+    const existing = pathMap.get(file.path);
+    if (!existing || (file.schema && !existing.schema)) {
+      pathMap.set(file.path, file);
+    }
+  });
+  return Array.from(pathMap.values());
+}
+
+/**
+ * GET /data/get for a postgres-routed guild: same (module, filename) mapping
+ * as the file path resolution (category subdir = module, basename = filename),
+ * answered by the database reader with today's response shapes.
+ */
+async function serveGuildDataFromReader(fileId: string, guildId: string, res: Response): Promise<void> {
+  const metadata = getDataFileMetadata(fileId, guildId);
+
+  const parts = fileId.split('/');
+  const moduleName = metadata ? (metadata.moduleName || '') : (parts.length >= 2 ? parts[0] : '');
+  const filename = metadata ? metadata.id : parts[parts.length - 1];
+
+  let existsInDb: boolean;
+  let doc: string | null;
+  try {
+    const reader = getWebuiDataReader();
+    existsInDb = await reader.exists(guildId, moduleName, filename);
+    doc = existsInDb ? await reader.readDoc(guildId, moduleName, filename) : null;
+  } catch (error) {
+    res.status(503).json({
+      success: false,
+      error: 'Data backend unreachable; retry shortly'
+    });
+    return;
+  }
+
+  if (!metadata && !existsInDb) {
+    res.status(404).json({
+      success: false,
+      error: 'Data file not found'
+    });
+    return;
+  }
+
+  let data: any;
+  if (doc !== null) {
+    try {
+      data = JSON.parse(doc);
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        error: 'Failed to parse data file JSON'
+      });
+      return;
+    }
+  } else {
+    data = metadata?.template || {};
+  }
+
+  const responseMetadata: DataFileMetadata = metadata
+    ? { ...metadata, exists: existsInDb }
+    : {
+        id: filename,
+        path: dataPath(guildId, moduleName, filename),
+        name: displayNameFor(filename),
+        description: 'Orphaned data file (no schema defined)',
+        category: 'data',
+        exists: true,
+        required: false,
+        template: undefined,
+        scope: 'guild',
+        moduleName
+      };
+
+  res.json({
+    success: true,
+    data,
+    metadata: responseMetadata,
+    exists: existsInDb
+  });
 }
