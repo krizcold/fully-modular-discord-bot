@@ -9,7 +9,7 @@ import { PostgresBackend } from './postgresBackend';
 import { initWorkingSet } from './workingSet';
 import { initDataReadiness, getDataReadiness, DataReadinessDriver } from './dataReadiness';
 import { forceRouteDefault, routeFor } from './routeResolver';
-import { evaluateRecognitionGuard, verifyStoreIdentity } from './recognitionGuard';
+import { evaluateRecognitionGuard, verifyStoreIdentity, GuardVerdict } from './recognitionGuard';
 import { setGuildDataBackend } from '../dataManager';
 
 // Startup barrier bound = the acceptance window: past it something is wrong
@@ -55,7 +55,15 @@ function refuse(reason: string): void {
 
 /** Called once at boot, before fleet init. Never throws; file mode is a no-op. */
 export function initDataBackendLayer(): void {
-  const verdict = evaluateRecognitionGuard();
+  let verdict: GuardVerdict;
+  try {
+    verdict = evaluateRecognitionGuard();
+  } catch (error) {
+    // An invalid DATA_BACKEND value must refuse (gates closed, web UI up for
+    // the fix), never crash-loop the process.
+    refuse(error instanceof Error ? error.message : String(error));
+    return;
+  }
   if (verdict.state === 'refused') {
     refuse(verdict.reason);
     return;
@@ -141,10 +149,18 @@ export async function gateEventDispatch(eventName: string, args: any[], replay: 
     await awaitDataStartupBarrier();
     return true;
   }
-  const readiness = getDataReadiness();
-  if (!readiness) return true;
   const guildId = extractGuildId(args);
-  if (!guildId || routeFor(guildId) === 'file') return true;
+  if (!guildId) return true;
+  if (bootStatus.state === 'refused') {
+    // Unresolvable backend configuration: guild-scoped dispatch stays closed.
+    const first = args[0];
+    if (first && typeof first.isRepliable === 'function') {
+      await politeReject(first, "This bot's data storage is currently unavailable; please contact the server operator.");
+    }
+    return false;
+  }
+  const readiness = getDataReadiness();
+  if (!readiness || routeFor(guildId) === 'file') return true;
   const first = args[0];
   if (first && typeof first.isRepliable === 'function') {
     if (await readiness.admitInteraction(guildId)) return true;
@@ -159,6 +175,7 @@ export async function gateEventDispatch(eventName: string, args: any[], replay: 
  * interaction, but the caller renders its own error instead of a Discord reply.
  */
 export async function awaitGuildDataReady(guildId: string): Promise<boolean> {
+  if (bootStatus.state === 'refused') return false;
   const readiness = getDataReadiness();
   if (!readiness || routeFor(guildId) === 'file') return true;
   return readiness.admitInteraction(guildId);
@@ -171,17 +188,14 @@ export function dataUnavailableMessage(causeKey: 'database-unreachable' | 'guild
     : "The bot's database is currently unreachable, so your change was not saved. Please try again later or contact support.";
 }
 
-async function politeReject(interaction: any): Promise<void> {
+async function politeReject(interaction: any, content = "This server's data is still loading, try again in a moment."): Promise<void> {
   try {
     if (typeof interaction.isAutocomplete === 'function' && interaction.isAutocomplete()) {
       if (typeof interaction.respond === 'function') await interaction.respond([]).catch(() => { /* expired */ });
       return;
     }
     if (interaction.isRepliable() && !interaction.replied && !interaction.deferred) {
-      await interaction.reply({
-        content: "This server's data is still loading, try again in a moment.",
-        flags: MessageFlags.Ephemeral,
-      }).catch(() => { /* expired or already handled */ });
+      await interaction.reply({ content, flags: MessageFlags.Ephemeral }).catch(() => { /* expired or already handled */ });
     }
   } catch { /* the gate must never throw into dispatch */ }
 }
