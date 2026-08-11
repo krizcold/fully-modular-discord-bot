@@ -1,6 +1,8 @@
 import { Client, Interaction, ModalSubmitInteraction, MessageFlags } from 'discord.js';
 import { RegisteredModalInfo } from '../../../types/commandTypes'; // Import type
 import { instrument } from '../../utils/metrics/instrument';
+import { DataBackendUnavailableError } from '../../utils/dataManager';
+import { dataUnavailableMessage } from '../../utils/dataBackends/boot';
 
 /**
  * Handles incoming modal submit interactions using the map attached to the client.
@@ -72,13 +74,16 @@ async function handleModalSubmit(client: Client, interaction: Interaction) {
     );
   } catch (error) {
     console.error(`Error executing modal handler for customId "${incomingCustomId}" (registered as ${matchedKey}):`, error);
+    const content = error instanceof DataBackendUnavailableError
+      ? dataUnavailableMessage(error.causeKey)
+      : 'There was an error processing your submission.';
     try {
       // Try to reply or follow up with an error message
       if (!interaction.replied && !interaction.deferred) {
-        await interaction.reply({ content: 'There was an error processing your submission.', flags: MessageFlags.Ephemeral });
+        await interaction.reply({ content, flags: MessageFlags.Ephemeral });
       } else {
         // If already replied/deferred, try followup. This might happen if handler deferred then threw.
-        await interaction.followUp({ content: 'There was an error processing your submission.', flags: MessageFlags.Ephemeral });
+        await interaction.followUp({ content, flags: MessageFlags.Ephemeral });
       }
     } catch (replyError) {
       console.error("Failed to send error reply/followUp for modal handler error:", replyError);

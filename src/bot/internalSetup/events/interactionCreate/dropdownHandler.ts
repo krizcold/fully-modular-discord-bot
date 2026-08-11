@@ -9,6 +9,8 @@ import {
 import { RegisteredDropdownInfo } from '../../../types/commandTypes'; // Import the type
 import { getConfigPropertyForGuild } from '../../utils/configManager';
 import { instrument } from '../../utils/metrics/instrument';
+import { DataBackendUnavailableError } from '../../utils/dataManager';
+import { dataUnavailableMessage } from '../../utils/dataBackends/boot';
 
 // Default timeout (e.g., 15 minutes), can be adjusted or removed if not needed for dropdowns
 const DEFAULT_DROPDOWN_TIMEOUT_MS = 15 * 60 * 1000;
@@ -101,13 +103,16 @@ async function handleDropdownInteraction(client: Client, interaction: Interactio
   } catch (error) {
     // Log error with the specific customId
     console.error(`Error executing dropdown handler for customId "${incomingCustomId}" (registered as ${matchedKey}):`, error);
+    const content = error instanceof DataBackendUnavailableError
+      ? dataUnavailableMessage(error.causeKey)
+      : 'There was an error processing your selection.';
     try {
       if (!interaction.replied && !interaction.deferred) {
-        await interaction.reply({ content: 'There was an error processing your selection.', flags: MessageFlags.Ephemeral });
+        await interaction.reply({ content, flags: MessageFlags.Ephemeral });
       } else if (!interaction.replied) { // implies deferred
-        await interaction.editReply({ content: 'There was an error processing your selection.' });
+        await interaction.editReply({ content });
       } else { // implies replied
-        await interaction.followUp({ content: 'There was an error processing your selection.', flags: MessageFlags.Ephemeral });
+        await interaction.followUp({ content, flags: MessageFlags.Ephemeral });
       }
     } catch (replyError) {
       console.error("Failed to send error reply/followUp for dropdown handler error:", replyError);

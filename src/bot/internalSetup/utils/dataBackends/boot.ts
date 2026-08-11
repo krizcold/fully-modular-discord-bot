@@ -164,6 +164,13 @@ export async function awaitGuildDataReady(guildId: string): Promise<boolean> {
   return readiness.admitInteraction(guildId);
 }
 
+/** User-visible text for a refused write (Stage 3 makes this operator-customizable). */
+export function dataUnavailableMessage(causeKey: 'database-unreachable' | 'guild-fenced'): string {
+  return causeKey === 'guild-fenced'
+    ? "This server's data just moved to another bot node; please try again in a moment."
+    : "The bot's database is currently unreachable, so your change was not saved. Please try again later or contact support.";
+}
+
 async function politeReject(interaction: any): Promise<void> {
   try {
     if (typeof interaction.isAutocomplete === 'function' && interaction.isAutocomplete()) {

@@ -2,6 +2,8 @@ import { Client, ButtonInteraction, MessageFlags, Interaction, PermissionsBitFie
 import { RegisteredButtonInfo, SpecialUserRule } from '../../../types/commandTypes';
 import { getConfigPropertyForGuild } from '../../utils/configManager';
 import { instrument } from '../../utils/metrics/instrument';
+import { DataBackendUnavailableError } from '../../utils/dataManager';
+import { dataUnavailableMessage } from '../../utils/dataBackends/boot';
 
 // Default timeout duration (15 minutes in milliseconds)
 const DEFAULT_BUTTON_TIMEOUT_MS = 15 * 60 * 1000;
@@ -129,13 +131,16 @@ async function handleButtonInteraction(client: Client, interaction: ButtonIntera
     );
   } catch (error) {
     console.error(`Error executing button handler for customId "${incomingCustomId}" (registered as ${matchedKey}, UserLevel: ${userLevel}):`, error);
+    const content = error instanceof DataBackendUnavailableError
+      ? dataUnavailableMessage(error.causeKey)
+      : 'There was an error processing this button click.';
     try {
       if (!interaction.replied && !interaction.deferred) {
-        await interaction.reply({ content: 'There was an error processing this button click.', flags: MessageFlags.Ephemeral });
+        await interaction.reply({ content, flags: MessageFlags.Ephemeral });
       } else if (!interaction.replied) {
-        await interaction.editReply({ content: 'There was an error processing this button click.' });
+        await interaction.editReply({ content });
       } else {
-        await interaction.followUp({ content: 'There was an error processing this button click.', flags: MessageFlags.Ephemeral });
+        await interaction.followUp({ content, flags: MessageFlags.Ephemeral });
       }
     } catch (replyError) { /* Ignore */ }
   }

@@ -3,6 +3,8 @@ import getLocalCommands from '../../utils/getLocalCommands';
 import { getConfigProperty } from '../../utils/configManager';
 import { getPremiumManager } from '../../utils/premiumManager';
 import { instrument } from '../../utils/metrics/instrument';
+import { DataBackendUnavailableError } from '../../utils/dataManager';
+import { dataUnavailableMessage } from '../../utils/dataBackends/boot';
 
 /**
  * Build the components array attached to a tier-blocked reply. When the host
@@ -142,5 +144,16 @@ export default async function handleCommands(client: Client, interaction: Intera
     );
   } catch (error) {
     console.error(`There was an error running this command:`, error);
+    // A refused data write must reach the user with its cause, not a silent log.
+    if (error instanceof DataBackendUnavailableError) {
+      const content = dataUnavailableMessage(error.causeKey);
+      try {
+        if (interaction.replied || interaction.deferred) {
+          await interaction.followUp({ content, flags: MessageFlags.Ephemeral }).catch(() => { });
+        } else {
+          await interaction.reply({ content, flags: MessageFlags.Ephemeral }).catch(() => { });
+        }
+      } catch { /* interaction expired */ }
+    }
   }
 };

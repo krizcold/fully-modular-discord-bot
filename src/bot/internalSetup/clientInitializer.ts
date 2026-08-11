@@ -13,7 +13,7 @@ import { setupFleetIPCHandlers } from './utils/ipcFleetHandler';
 import { getMetricsCollector } from './utils/metrics/metricsCollector';
 import { startSamplers, stopSamplers } from './utils/metrics/samplers';
 import { flushAll, sweepGraveyard, DataBackendUnavailableError } from './utils/dataManager';
-import { initDataBackendLayer, awaitDataStartupBarrier, gateEventDispatch } from './utils/dataBackends/boot';
+import { initDataBackendLayer, awaitDataStartupBarrier, gateEventDispatch, dataUnavailableMessage } from './utils/dataBackends/boot';
 import { getWorkingSet } from './utils/dataBackends/workingSet';
 import { setupReloadIPCHandlers } from './utils/ipcReloadHandler';
 import { setupToggleIPCHandlers, applyAllDisabledStatesOnBoot } from './utils/ipcToggleHandler';
@@ -347,9 +347,7 @@ async function loadEventHandlers(client: Client) {
           console.error(`Error executing or processing event handler ${eventFile} for event ${eventName}:`, error);
           if (interactionOrEvent && typeof (interactionOrEvent as Interaction).isRepliable === 'function' && (interactionOrEvent as Interaction).isRepliable()) {
             const content = error instanceof DataBackendUnavailableError
-              ? (error.causeKey === 'guild-fenced'
-                ? "This server's data just moved to another bot node; please try again in a moment."
-                : "The bot's database is currently unreachable, so your change was not saved. Please try again later or contact support.")
+              ? dataUnavailableMessage(error.causeKey)
               : 'An error occurred while processing your request.';
             try {
               if ((interactionOrEvent as Interaction & { replied: boolean; deferred: boolean }).replied || (interactionOrEvent as Interaction & { replied: boolean; deferred: boolean }).deferred) {
