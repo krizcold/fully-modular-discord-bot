@@ -11,6 +11,7 @@ import {
   CONTROL_PORT_DEFAULT,
   GUILD_TOTALS_REFRESH_MS,
   HEARTBEAT_MS,
+  DECLINE_COOLDOWN_MS,
   INCOMING_RESOLVE_INTERVAL_MS,
   LEASE_RENEW_MS,
   LOSS_LOG_CAP,
@@ -46,6 +47,7 @@ import { serveSyncRequest, SyncAuthority } from './syncAuthority';
 import { SyncEngine } from './syncEngine';
 import { getFrozenStats, setOwnerInfoProvider } from '../utils/dataManager';
 import { applyDeliveredBackend } from '../utils/dataBackends/boot';
+import { setLeaseDeclineHandler } from '../utils/dataBackends/dataReadiness';
 import { currentRouteDefault } from '../utils/dataBackends/routeResolver';
 import { loadCredentials, resolveDataBackend } from '../../../utils/envLoader';
 import { MigrationDisposition, resolveIncomingWithMaster, resumeSourceGraveyarding, runResidueSweep } from './migration/residueSweep';
@@ -1487,6 +1489,20 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
         node.capabilities = payload.capabilities;
         void persist().catch(err => console.warn('[Fleet] Failed to persist capability refresh:', err));
       },
+      onLeaseDecline: (fromNodeId, payload) => {
+        if (!payload || payload.term !== registry.term) return;
+        const leaseIds = Array.isArray(payload.leaseIds) ? payload.leaseIds.filter(id => typeof id === 'string') : [];
+        if (leaseIds.length === 0) return;
+        const name = registry.nodes.get(fromNodeId)?.nodeName ?? fromNodeId;
+        console.warn(`[Fleet] ${name} declined ${leaseIds.length} lease(s): ${payload.reason}`);
+        clearCoveredLeases(fromNodeId, leaseIds);
+        // Cooldown keeps a shard the node cannot hydrate from bouncing back to
+        // it every tick; deposed-at-hydration skips it (the shard belongs
+        // elsewhere and placement should proceed immediately).
+        if (payload.reason !== 'deposed-at-hydration') ledger?.penalize(fromNodeId, DECLINE_COOLDOWN_MS);
+        void persist().catch(err => console.warn('[Fleet] Failed to persist lease decline:', err));
+        void distribute();
+      },
       afterRegister: registeredNodeId => {
         // Sync rides the control channel and never delays lease traffic:
         // push the current manifest fire-and-forget beside the reconcile.
@@ -1755,6 +1771,25 @@ async function initCoWorker(init: CommonInit): Promise<FleetContext> {
           ...(ok === null ? {} : { syncOk: ok }),
         };
       },
+    });
+    // Decline-lease path (ruled C1): destroy the sessions FIRST (an acked
+    // revoke means the token is free), then hand the leases back. Registered
+    // module-level so it survives a data-runtime recycle; masters and
+    // standalone never register one.
+    setLeaseDeclineHandler((reason, shardIds) => {
+      void (async () => {
+        try {
+          const current = runtime.getCurrent();
+          if (!current) return;
+          const leaseIds = current.leases.filter(l => shardIds.includes(l.shardId)).map(l => l.leaseId);
+          if (leaseIds.length === 0) return;
+          console.warn(`[Fleet] Declining ${leaseIds.length} lease(s) for shard(s) ${shardIds.join(', ')} (${reason})`);
+          await runtime.revoke(current.term, leaseIds, `declined: ${reason}`);
+          controlClient?.sendToMaster(MSG.LEASE_DECLINE, { term: current.term, leaseIds, reason });
+        } catch (error) {
+          console.error('[Fleet] Lease decline failed:', error);
+        }
+      })();
     });
   } else {
     console.error('[Fleet] Co-worker requires MASTER_URL and CONTROL_SECRET; idling without a master');

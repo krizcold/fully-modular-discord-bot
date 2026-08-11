@@ -11,6 +11,7 @@ import {
   CapabilityRefreshPayload,
   ControlEnvelope,
   GuildNoticePayload,
+  LeaseDeclinePayload,
   HeartbeatPayload,
   LeaseRenewedPayload,
   LeaseRenewPayload,
@@ -29,6 +30,8 @@ export interface ControlServerHooks {
   onGuildNotice: (nodeId: string, notice: GuildNoticePayload) => void;
   /** A worker's live capabilities changed (e.g. it applied a delivered data backend). */
   onCapabilityRefresh?: (nodeId: string, payload: CapabilityRefreshPayload) => void;
+  /** A worker handed leases back (cannot hydrate them / claim lost to a newer owner). */
+  onLeaseDecline?: (nodeId: string, payload: LeaseDeclinePayload) => void;
   onLeaseRenew: (nodeId: string, payload: LeaseRenewPayload) => LeaseRenewedPayload;
   onDisconnect: (nodeId: string) => void;
   /** Worker pull requests (control:sync:files / module:begin / read); term-fenced like every post-register message. */
@@ -211,6 +214,9 @@ export class ControlServer {
         break;
       case MSG.CAPABILITY_REFRESH:
         this.hooks.onCapabilityRefresh?.(state.nodeId, data as CapabilityRefreshPayload);
+        break;
+      case MSG.LEASE_DECLINE:
+        this.hooks.onLeaseDecline?.(state.nodeId, data as LeaseDeclinePayload);
         break;
       case MSG.GUILD_NOTICE:
         this.hooks.onGuildNotice(state.nodeId, (data?.notice ?? data) as GuildNoticePayload);
