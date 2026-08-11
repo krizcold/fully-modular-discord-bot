@@ -7,6 +7,8 @@ import { monitorEventLoopDelay, IntervalHistogram } from 'perf_hooks';
 import { Status } from 'discord.js';
 import type { Client } from 'discord.js';
 import { getMetricsCollector } from '../utils/metrics/metricsCollector';
+import { getDataReadiness } from '../utils/dataBackends/dataReadiness';
+import { getNodeId } from './nodeIdentity';
 import type { IngestService } from '../ingest/ingestService';
 import type {
   HeartbeatPayload,
@@ -113,6 +115,7 @@ export class LeaseRuntime {
       // re-identify. Adopt without bouncing live sessions.
       this.current = { term: grant.term, epoch: grant.epoch, shardCount: grant.shardCount, leases: grant.leases, receivedAt: Date.now() };
       this.ingest.setShardPlan(shardIds, grant.shardCount);
+      this.notifyDataLayer();
       this.maybeStart();
       return { ok: true, term: grant.term };
     }
@@ -125,6 +128,7 @@ export class LeaseRuntime {
     // migration (Phase 4), not this path.
     this.current = { term: grant.term, epoch: grant.epoch, shardCount: grant.shardCount, leases: grant.leases, receivedAt: Date.now() };
     this.ingest.setShardPlan(shardIds, grant.shardCount);
+    this.notifyDataLayer();
     if (this.ingest.isStarted()) {
       // A gateway is already running the old set: coalesce into one rebuild.
       this.scheduleGatewaySync();
@@ -169,6 +173,7 @@ export class LeaseRuntime {
       this.ingest.setShardPlan(remaining.map(l => l.shardId), this.current.shardCount);
       this.maybeStart();
     }
+    this.notifyDataLayer();
     return { ok: true, term };
   }
 
@@ -177,7 +182,25 @@ export class LeaseRuntime {
     if (!this.current) return;
     console.warn(`[Fleet] Lease expired (${reason}); destroying gateway sessions`);
     this.current = null;
+    this.notifyDataLayer();
     await this.stopSessions('lease expired');
+  }
+
+  /** Mirror the held lease into the data layer (constructed only in postgres mode). */
+  private notifyDataLayer(): void {
+    const readiness = getDataReadiness();
+    if (!readiness) return;
+    if (!this.current) {
+      readiness.onLeaseLost();
+      return;
+    }
+    readiness.onLeaseChanged({
+      nodeId: getNodeId(),
+      term: this.current.term,
+      epoch: this.current.epoch,
+      shardCount: this.current.shardCount,
+      shardIds: this.current.leases.map(l => l.shardId),
+    });
   }
 
   /**
