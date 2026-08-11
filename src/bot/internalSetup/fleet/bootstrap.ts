@@ -21,7 +21,7 @@ import {
 } from './constants';
 import { HeartbeatPayload, LeaseGrantPayload, LeaseInfo, LeaseRenewedPayload, LeaseRevokePayload, MSG, NodeCapabilities, NodeDrainPayload, NodeRole, RegisterPayload, RegisterResult } from './protocol';
 import { getAppVersion, getNodeId, getNodeName, isStandalone, resolveNodeRole, wasNodeIdFreshlyGenerated } from './nodeIdentity';
-import { FileControlStore } from './fileControlStore';
+import { createControlStore, PostgresControlStore } from './postgresControlStore';
 import { Registry, RegistryNode } from './registry';
 import { ControlServer } from './controlServer';
 import { ControlClient } from './controlClient';
@@ -276,7 +276,16 @@ function isValidHeldLeases(held: NonNullable<RegisterPayload['heldLeases']>): bo
 async function initMaster(init: CommonInit & { standalone: boolean }): Promise<FleetContext> {
   const { standalone, nodeId, nodeName, appVersion, capabilities, runtime } = init;
   const ingest = getIngestService();
-  const store = new FileControlStore();
+  const store = createControlStore(standalone);
+  // A control-store fence trip means a second master owns the schema: this
+  // master stops granting entirely (the higher-term master is the healthy one).
+  let controlFenced = false;
+  if (store instanceof PostgresControlStore) {
+    store.onFenced(observedTerm => {
+      controlFenced = true;
+      console.error(`[Fleet] MASTER DEPOSED BY CONTROL STORE: term ${observedTerm} observed; granting stopped until restart`);
+    });
+  }
   const term = await store.acquireTerm(nodeId);
 
   const gateway = await fetchGatewayInfo(process.env.DISCORD_TOKEN);
@@ -760,6 +769,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   }
 
   async function distribute(): Promise<void> {
+    if (controlFenced) return;
     if (paused) return;
     if (!graceOver) {
       try {
