@@ -64,6 +64,13 @@ export class IdentifyLedger {
     return (this.history.get(nodeId)?.backoffUntil ?? 0) > Date.now();
   }
 
+  /** Direct cooldown (lease declines): the candidate filter skips the node until it expires. */
+  penalize(nodeId: string, cooldownMs: number): void {
+    const history = this.history.get(nodeId) ?? { registeredAt: [], grantsCharged: 0, backoffUntil: 0 };
+    history.backoffUntil = Math.max(history.backoffUntil, Date.now() + cooldownMs);
+    this.history.set(nodeId, history);
+  }
+
   getNodeBackoff(nodeId: string): { crashCount: number; nextPermitInMs: number } | null {
     const history = this.history.get(nodeId);
     const now = Date.now();

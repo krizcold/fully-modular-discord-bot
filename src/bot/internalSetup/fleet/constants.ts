@@ -38,6 +38,14 @@ export const REGISTER_GRACE_MS = 10000;
  */
 export const RECOVERY_HOLDDOWN_MS = LEASE_TTL_MS + HEARTBEAT_MS + 5000;
 
+/**
+ * Identify-ledger cooldown after a declined lease (hydration-timeout), so a
+ * shard the node cannot hydrate is not re-granted to it every renew tick,
+ * burning an IDENTIFY per cycle. Deposed-at-hydration declines skip it: that
+ * shard belongs elsewhere and placement should proceed immediately.
+ */
+export const DECLINE_COOLDOWN_MS = 60_000;
+
 /** Per-bucket identify spacing the master serializes grants with. */
 export const IDENTIFY_SPACING_MS = 5500;
 
