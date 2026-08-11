@@ -45,7 +45,7 @@ import { _setFleetStateSources, FleetRecoverySource, FleetRefusedRegistration, g
 import type { MigrationView, PinViolationView } from './state';
 import { serveSyncRequest, SyncAuthority } from './syncAuthority';
 import { SyncEngine } from './syncEngine';
-import { getFrozenStats, setOwnerInfoProvider } from '../utils/dataManager';
+import { getFrozenStats, getGuildDataBackend, setOwnerInfoProvider } from '../utils/dataManager';
 import { applyDeliveredBackend } from '../utils/dataBackends/boot';
 import { setLeaseDeclineHandler } from '../utils/dataBackends/dataReadiness';
 import { currentRouteDefault } from '../utils/dataBackends/routeResolver';
@@ -290,6 +290,10 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       console.error(`[Fleet] MASTER DEPOSED BY CONTROL STORE: term ${observedTerm} observed; granting stopped until restart`);
     });
   }
+  // Shards declined for hydration-timeout: held UNPLACED while the data
+  // backend is globally unhealthy (re-granting would just burn identifies);
+  // the first healthy report re-enters them into placement.
+  const timeoutDeclinedShards = new Set<number>();
   const term = await store.acquireTerm(nodeId);
 
   const gateway = await fetchGatewayInfo(process.env.DISCORD_TOKEN);
@@ -678,6 +682,19 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     if (free.length === 0) return;
 
     const pool = [...free];
+    if (timeoutDeclinedShards.size > 0) {
+      const selfBackend = getGuildDataBackend();
+      const anyHealthy = (selfBackend ? selfBackend.healthy() : false)
+        || [...registry.nodes.values()].some(n => n.connected && n.dataBackendHealthy === true);
+      if (anyHealthy) {
+        timeoutDeclinedShards.clear();
+      } else {
+        for (let i = pool.length - 1; i >= 0; i--) {
+          if (timeoutDeclinedShards.has(pool[i])) pool.splice(i, 1);
+        }
+        if (pool.length === 0) return;
+      }
+    }
     const master = registry.nodes.get(nodeId);
     const grantsByNode = new Map<string, number[]>();
     const addGrant = (id: string, shardId: number) => {
@@ -1495,6 +1512,12 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
         if (leaseIds.length === 0) return;
         const name = registry.nodes.get(fromNodeId)?.nodeName ?? fromNodeId;
         console.warn(`[Fleet] ${name} declined ${leaseIds.length} lease(s): ${payload.reason}`);
+        if (payload.reason === 'hydration-timeout') {
+          const covered = new Set(leaseIds);
+          for (const [shardId, lease] of registry.shardTable) {
+            if (lease.nodeId === fromNodeId && covered.has(lease.leaseId)) timeoutDeclinedShards.add(shardId);
+          }
+        }
         clearCoveredLeases(fromNodeId, leaseIds);
         // Cooldown keeps a shard the node cannot hydrate from bouncing back to
         // it every tick; deposed-at-hydration skips it (the shard belongs
