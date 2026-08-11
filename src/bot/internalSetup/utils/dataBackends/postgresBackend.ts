@@ -99,6 +99,11 @@ type AlertListener = (event: AlertEvent, detail: string) => void;
 export class PostgresBackend implements DataBackend {
   readonly kind = 'postgres' as const;
 
+  /** Shared with the PostgresControlStore when no CONTROL_STORE_URL redirects it. */
+  getPool(): Pool {
+    return this.pool;
+  }
+
   private readonly pool: Pool;
   private state: 'connecting' | 'ready' | 'outage' = 'connecting';
   private outageSince: number | undefined;
