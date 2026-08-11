@@ -2,6 +2,7 @@
 
 import { getPanelManager } from './panelManager';
 import { getConfigProperty } from './configManager';
+import { awaitGuildDataReady } from './dataBackends/boot';
 
 /**
  * Set up IPC message handlers for Web-UI panel integration
@@ -139,6 +140,12 @@ function validateMessage(message: any): boolean {
  * Handle IPC message and return response
  */
 async function handleIPCMessage(type: string, data: any, panelManager: any): Promise<any> {
+  // Synthetic-entry data gate: webui-driven panel actions read/write guild
+  // data without passing the Discord dispatch gate, so wait here the same way.
+  const panelActions = new Set(['panel:execute', 'panel:button', 'panel:dropdown', 'panel:modal']);
+  if (panelActions.has(type) && data?.guildId && !(await awaitGuildDataReady(String(data.guildId)))) {
+    return { success: false, error: "This server's data is still loading; try again in a moment" };
+  }
   switch (type) {
     case 'panel:list':
       return {

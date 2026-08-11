@@ -11,6 +11,7 @@ import { getPanelManager } from './panelManager';
 import { buildConsoleInteraction } from './consoleInteraction';
 import { getFleetState } from '../fleet/state';
 import { guildIdToShardId } from '../fleet/placement';
+import { awaitGuildDataReady } from './dataBackends/boot';
 
 interface InvokePayload {
   command?: string;
@@ -55,6 +56,10 @@ async function handleInvoke(data: InvokePayload): Promise<Record<string, unknown
     } else if (!guild) {
       return { success: false, error: `this node does not serve guild ${guildId} (not in cache); pass force to attempt anyway` };
     }
+  }
+
+  if (guildId && !(await awaitGuildDataReady(guildId))) {
+    return { success: false, error: `guild ${guildId}'s data is still loading; try again in a moment` };
   }
 
   const userId = data.userId ? String(data.userId) : null;
