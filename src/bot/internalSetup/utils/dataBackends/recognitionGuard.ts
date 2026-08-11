@@ -12,6 +12,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { DATA_ROOT } from '../../../../utils/dataRoot';
 import { DataBackendKind, resolveDataBackend } from '../../../../utils/envLoader';
+import { forceRouteDefault } from './routeResolver';
 import { listGuilds } from './fileBackend';
 import { readStoreId, PostgresUnreachableError } from './postgresBackend';
 import type { BackendStateMarker } from './postgresBackend';
@@ -81,6 +82,19 @@ export function evaluateRecognitionGuard(): GuardVerdict {
   // Marker says the data lives in postgres while DATA_BACKEND says file: keep
   // serving from postgres (needs the URL still configured; boot checks that).
   return { state: 'transformation-required', live: 'postgres', configured };
+}
+
+/**
+ * Webui-parent counterpart of the bot child's transformation-required route
+ * override: the parent evaluates the same marker so both processes route a
+ * guild to the same live backend. Read-only - never writes the marker, never
+ * refuses (the child owns serving posture).
+ */
+export function applyRouteDefaultFromMarker(): void {
+  try {
+    const marker = readFileMarker();
+    if (marker && marker.live !== resolveDataBackend()) forceRouteDefault(marker.live);
+  } catch { /* invalid DATA_BACKEND surfaces per-route in the child's refusal */ }
 }
 
 /**

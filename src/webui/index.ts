@@ -10,6 +10,7 @@ import { setNotificationIPCDispatcher } from '../bot/internalSetup/utils/premium
 import { initSyncNudge, nudgeSync } from './utils/syncNudge';
 import { ensureDurableSessionSecret } from '../utils/envLoader';
 import { flushAll } from '../bot/internalSetup/utils/dataManager';
+import { applyRouteDefaultFromMarker } from '../bot/internalSetup/utils/dataBackends/recognitionGuard';
 import { stopSessionStore } from './auth/sessionManager';
 
 /**
@@ -70,6 +71,9 @@ export async function startWebUI(botManager: BotManager): Promise<void> {
   // Durable SESSION_SECRET before the session middleware is built, so
   // sessions survive restarts.
   ensureDurableSessionSecret();
+  // Route guilds to the marker-named live backend (transformation-required
+  // parity with the bot child; no-op when marker and env agree).
+  applyRouteDefaultFromMarker();
   initSyncNudge(botManager);
 
   const app = await createServer(botManager);
