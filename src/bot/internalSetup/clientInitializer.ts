@@ -12,7 +12,9 @@ import { setupMetricsIPCHandlers } from './utils/ipcMetricsHandler';
 import { setupFleetIPCHandlers } from './utils/ipcFleetHandler';
 import { getMetricsCollector } from './utils/metrics/metricsCollector';
 import { startSamplers, stopSamplers } from './utils/metrics/samplers';
-import { flushAll, sweepGraveyard } from './utils/dataManager';
+import { flushAll, sweepGraveyard, DataBackendUnavailableError } from './utils/dataManager';
+import { initDataBackendLayer, awaitDataStartupBarrier, gateEventDispatch } from './utils/dataBackends/boot';
+import { getWorkingSet } from './utils/dataBackends/workingSet';
 import { setupReloadIPCHandlers } from './utils/ipcReloadHandler';
 import { setupToggleIPCHandlers, applyAllDisabledStatesOnBoot } from './utils/ipcToggleHandler';
 import { setupIPCNotificationHandler } from './utils/ipcNotificationHandler';
@@ -296,7 +298,7 @@ async function loadEventHandlers(client: Client) {
 
     console.log(`Registering ${eventName} event with handlers:`, orderedFiles.map(f => path.relative(projectRoot, f)));
 
-    client.on(eventName, async (...args) => {
+    const dispatchOrdered = async (...args: any[]) => {
       const interactionOrEvent = args[0];
       for (const eventFile of orderedFiles) {
         try {
@@ -344,11 +346,16 @@ async function loadEventHandlers(client: Client) {
         } catch (error) {
           console.error(`Error executing or processing event handler ${eventFile} for event ${eventName}:`, error);
           if (interactionOrEvent && typeof (interactionOrEvent as Interaction).isRepliable === 'function' && (interactionOrEvent as Interaction).isRepliable()) {
+            const content = error instanceof DataBackendUnavailableError
+              ? (error.causeKey === 'guild-fenced'
+                ? "This server's data just moved to another bot node; please try again in a moment."
+                : "The bot's database is currently unreachable, so your change was not saved. Please try again later or contact support.")
+              : 'An error occurred while processing your request.';
             try {
               if ((interactionOrEvent as Interaction & { replied: boolean; deferred: boolean }).replied || (interactionOrEvent as Interaction & { replied: boolean; deferred: boolean }).deferred) {
-                await (interactionOrEvent as Interaction & { followUp: Function }).followUp({ content: 'An error occurred while processing your request.', flags: MessageFlags.Ephemeral }).catch(() => { });
+                await (interactionOrEvent as Interaction & { followUp: Function }).followUp({ content, flags: MessageFlags.Ephemeral }).catch(() => { });
               } else {
-                await (interactionOrEvent as Interaction & { reply: Function }).reply({ content: 'An error occurred while processing your request.', flags: MessageFlags.Ephemeral }).catch(() => { });
+                await (interactionOrEvent as Interaction & { reply: Function }).reply({ content, flags: MessageFlags.Ephemeral }).catch(() => { });
               }
             } catch (replyError) {
               // Ignore
@@ -356,6 +363,14 @@ async function loadEventHandlers(client: Client) {
           }
         }
       }
+    };
+
+    client.on(eventName, async (...args) => {
+      // Data-ready gate: file-routed guilds pass through; clientReady holds
+      // behind the startup barrier; unready postgres-routed guilds get a
+      // polite ephemeral reject (interactions) or ordered replay (events).
+      if (!(await gateEventDispatch(eventName, args, () => void dispatchOrdered(...args)))) return;
+      await dispatchOrdered(...args);
     });
   }
 }
@@ -453,6 +468,12 @@ function runInitializers(client: Client) {
  * Main function that initializes the client.
  */
 async function main() {
+  // Data backend boot runs FIRST so the readiness driver exists when the
+  // first lease lands (the master self-grants during initFleet). File mode is
+  // a no-op; postgres mode constructs the backend held until its store
+  // identity verifies.
+  initDataBackendLayer();
+
   // Fleet boot: role resolution, term acquisition, shard leases. Standalone
   // resolves to a master with self-granted leases; a co-worker holds here
   // until its master grants a lease.
@@ -605,6 +626,10 @@ async function main() {
   client.once('clientReady', async () => {
     console.log(`Logged in as ${client.user?.tag}!`);
 
+    // Module initializers bulk-read guild data; hold them behind the same
+    // startup barrier as the clientReady event fan-out (no-op in file mode).
+    await awaitDataStartupBarrier();
+
     // Run all module initializers (after client is ready)
     runInitializers(client);
 
@@ -698,8 +723,12 @@ async function main() {
     shuttingDown = true;
     stopSamplers();
     metrics.flushTotals(); // writes via saveData, so it must precede flushAll
-    // Drain the write queue before exit (bounded), so no accepted write is lost.
-    await Promise.race([flushAll(), new Promise(resolve => setTimeout(resolve, 5000))]);
+    // Drain the write queue before exit (bounded), so no accepted write is
+    // lost. Postgres mode gets a wider bound: a coalesced Working Set can hold
+    // more dirty state than the file queue, and losing a fenced flush window
+    // costs real writes.
+    const drainMs = getWorkingSet() ? 30000 : 5000;
+    await Promise.race([flushAll(), new Promise(resolve => setTimeout(resolve, drainMs))]);
     process.exit(0);
   };
   process.on('SIGTERM', () => void shutdownHandler());
