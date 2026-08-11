@@ -281,6 +281,41 @@ export function saveCredentials(credentials: BotCredentials): { success: boolean
 }
 
 /**
+ * Upsert exactly the given keys into /data/.env, preserving every other line
+ * verbatim (saveCredentials would freeze compose-provided values into the
+ * file). Atomic temp + rename. Used by the master-delivered backend apply.
+ */
+export function upsertCredentials(patch: Record<string, string>): { success: boolean; error?: string } {
+  const dataEnvPath = dataPath('.env');
+  try {
+    fs.mkdirSync(path.dirname(dataEnvPath), { recursive: true });
+    let lines: string[] = [];
+    try {
+      lines = fs.readFileSync(dataEnvPath, 'utf-8').split(/\r?\n/);
+    } catch { /* no file yet */ }
+    const remaining = new Set(Object.keys(patch));
+    const updated = lines.map(line => {
+      const match = line.match(/^([A-Za-z_][A-Za-z0-9_]*)=/);
+      if (match && remaining.has(match[1])) {
+        remaining.delete(match[1]);
+        return `${match[1]}=${patch[match[1]]}`;
+      }
+      return line;
+    });
+    while (updated.length > 0 && updated[updated.length - 1] === '') updated.pop();
+    for (const key of remaining) updated.push(`${key}=${patch[key]}`);
+    const tmp = `${dataEnvPath}.tmp`;
+    fs.writeFileSync(tmp, updated.join('\n') + '\n', { encoding: 'utf-8' });
+    fs.renameSync(tmp, dataEnvPath);
+    return { success: true };
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    console.error('[EnvLoader] Error upserting credentials:', errorMessage);
+    return { success: false, error: errorMessage };
+  }
+}
+
+/**
  * Gets masked credential status (for Web-UI display)
  * Never returns actual credential values for security
  */
