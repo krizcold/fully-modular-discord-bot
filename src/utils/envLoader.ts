@@ -43,6 +43,11 @@ export interface BotCredentials {
   DISCORD_CLIENT_SECRET?: string;
   OAUTH_CALLBACK_URL?: string;
   SESSION_SECRET?: string;
+  // Data backend: file (default) | postgres, the Postgres connection string,
+  // and the optional control-store location override.
+  DATA_BACKEND?: string;
+  DATA_BACKEND_URL?: string;
+  CONTROL_STORE_URL?: string;
   // Payment provider credentials are arbitrary env-var keys the providers
   // declare via getCredentialFields(); they're addressable through the
   // [string]: string | undefined index signature below. The per-provider
@@ -99,7 +104,9 @@ export function loadCredentials(): BotCredentials {
     DISCORD_CLIENT_SECRET: process.env.DISCORD_CLIENT_SECRET,
     OAUTH_CALLBACK_URL: process.env.OAUTH_CALLBACK_URL,
     SESSION_SECRET: process.env.SESSION_SECRET,
-    REDIS_URL: process.env.REDIS_URL,
+    DATA_BACKEND: process.env.DATA_BACKEND,
+    DATA_BACKEND_URL: process.env.DATA_BACKEND_URL,
+    CONTROL_STORE_URL: process.env.CONTROL_STORE_URL,
   };
 
   // Payment provider env vars are dynamic per provider; copy through any
@@ -167,8 +174,7 @@ export function loadCredentials(): BotCredentials {
 /**
  * Durable SESSION_SECRET: generate once and APPEND to /data/.env (append-only
  * on purpose - round-tripping the whole credentials object would freeze
- * compose-env values into the file). Sessions then survive restarts with
- * either the memory or the Redis store.
+ * compose-env values into the file). Sessions then survive restarts.
  */
 export function ensureDurableSessionSecret(): void {
   const credentials = loadCredentials();
@@ -190,6 +196,32 @@ export function ensureDurableSessionSecret(): void {
     // Read-only /data: the sessionManager boot fallback covers this run.
     console.warn('[EnvLoader] Could not persist SESSION_SECRET:', error instanceof Error ? error.message : error);
   }
+}
+
+export type DataBackendKind = 'file' | 'postgres';
+
+// Fleet-delivered backend decision (register reply; workers follow the master).
+// Takes precedence over process env and /data/.env when set.
+let fleetDataBackend: { backend: DataBackendKind; url?: string } | null = null;
+let cachedEnvBackend: DataBackendKind | null = null;
+
+export function setFleetDataBackend(info: { backend: DataBackendKind; url?: string } | null): void {
+  fleetDataBackend = info;
+}
+
+/**
+ * The deployment's data backend. Absent/empty DATA_BACKEND means file; any
+ * value other than file/postgres refuses boot.
+ */
+export function resolveDataBackend(): DataBackendKind {
+  if (fleetDataBackend) return fleetDataBackend.backend;
+  if (cachedEnvBackend === null) {
+    const raw = (loadCredentials().DATA_BACKEND || '').trim().toLowerCase();
+    if (raw === '' || raw === 'file') cachedEnvBackend = 'file';
+    else if (raw === 'postgres') cachedEnvBackend = 'postgres';
+    else throw new Error(`[EnvLoader] Invalid DATA_BACKEND value "${raw}" (expected "file" or "postgres")`);
+  }
+  return cachedEnvBackend;
 }
 
 /**
