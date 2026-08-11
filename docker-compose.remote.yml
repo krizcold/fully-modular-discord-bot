@@ -36,24 +36,11 @@ services:
       DISCORD_TOKEN: ${DISCORD_TOKEN:-}
       CLIENT_ID: ${CLIENT_ID:-}
       GUILD_ID: ${GUILD_ID:-}
-      REDIS_URL: redis://redis:6379
       TZ: ${TZ}
     volumes:
       # Persistent data: saved credentials (/data/.env), AppStore modules, guild
       # data. setup.sh creates it owned by uid 1000 (the container user).
       - ./data:/data
-    depends_on:
-      - redis
-    networks:
-      - smdb_remote
-
-  # Guild Web-UI OAuth sessions (in-memory store; --save "" writes no snapshots).
-  redis:
-    image: redis:7-alpine
-    restart: unless-stopped
-    command: redis-server --save "" --loglevel warning
-    environment:
-      TZ: ${TZ}
     networks:
       - smdb_remote
 

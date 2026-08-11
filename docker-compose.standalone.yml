@@ -25,8 +25,6 @@ services:
       DISCORD_TOKEN: ${DISCORD_TOKEN:-}
       CLIENT_ID: ${CLIENT_ID:-}
       GUILD_ID: ${GUILD_ID:-}
-      # Optional Redis for persistent Guild Web-UI sessions; off when unset.
-      # REDIS_URL: redis://your-redis-host:6379
       # Fleet / multi-instance sharding (optional). A single standalone bot is
       # a master and needs none of these. Set them only to run more than one
       # instance sharing the same token.

@@ -454,20 +454,6 @@ export function createSetupRoutes(): Router {
             '⚠️ Keep this secret secure - changing it logs out all users'
           ],
           example: 'Use the Generate button or: openssl rand -base64 32'
-        },
-        REDIS_URL: {
-          title: 'Redis URL (Optional)',
-          steps: [
-            '⚠️ This field is OPTIONAL',
-            'Redis provides persistent session storage',
-            'Without Redis, sessions are stored in memory (lost on restart)',
-            'Format: redis://host:port or redis://user:pass@host:port/db',
-            'Examples:',
-            '  - redis://localhost:6379',
-            '  - redis://redis:6379 (Docker)',
-            'Leave empty to use memory store (fine for testing)'
-          ],
-          example: 'redis://localhost:6379 (or leave empty)'
         }
       }
     });

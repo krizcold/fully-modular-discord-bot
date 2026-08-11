@@ -293,7 +293,6 @@ Access the owner Web-UI (`http://localhost:8080/`) and go to **Credentials** tab
    - **Discord OAuth Client Secret**: Click "Reset Secret" button, copy immediately
    - **OAuth Callback URL**: Must match Discord redirect URI exactly
    - **Session Secret**: Click "Generate" button or provide your own (min 16 chars)
-   - **Redis URL** (Optional): Leave empty to use memory store, or provide Redis URL for persistent sessions
 
 4. Click **"Update & Restart"** to apply changes
 
@@ -315,7 +314,6 @@ http://localhost:8080/guild
 | **Discord OAuth Client Secret** | Yes* | OAuth application secret (keep secure!) | `AbCdEf123456_XXX` |
 | **OAuth Callback URL** | Yes* | Discord redirect URI (must match exactly) | `http://localhost:8080/auth/discord/callback` |
 | **Session Secret** | Yes* | Random string for session encryption | Click "Generate" button |
-| **Redis URL** | No | Optional Redis for persistent sessions | `redis://localhost:6379` |
 
 *Required only when **Enable Guild Web-UI** is enabled
 
@@ -330,11 +328,6 @@ http://localhost:8080/guild
 - Use the "Generate" button for secure random value
 - Changing it logs out all guild admin users
 - Keep it secure - used for encrypting sessions
-
-⚠️ **Redis Sessions (Recommended for Production):**
-- Memory store loses sessions on bot restart
-- Redis provides persistent session storage
-- Use Redis in production for better user experience
 
 #### Permission Validation
 
@@ -354,10 +347,6 @@ Guild Web-UI validates user permissions:
 - User must be Administrator in at least one guild where bot is present
 - Check bot is invited to user's guilds
 - Verify user has Administrator permission in Discord
-
-**Sessions lost on restart:**
-- Configure Redis URL for persistent sessions
-- Without Redis, sessions use memory store (lost on restart)
 
 ---
 
@@ -480,13 +469,7 @@ Access via `/admin-panel` command → Bot Update Manager
 npm run dev              # Run with ts-node and auto-restart
 npm run dev:bot          # Run bot only (for Web-UI development)
 npm run dev:webui        # Run Web-UI only
-npm run redis:dev        # Start (or reuse) a local Redis container for session storage
 ```
-
-Redis is optional in development: without it, sessions use an in-memory store. To enable it,
-run `npm run redis:dev` (requires Docker Desktop) and set `REDIS_URL=redis://localhost:6379`
-in the Credentials panel or `/data/.env`. Container deployments ship a redis sidecar and set
-`REDIS_URL` automatically via docker-compose.
 
 **Building:**
 ```bash
@@ -662,16 +645,14 @@ volumes:
 | `DISCORD_TOKEN` | No | Optional prefill; the Web-UI Credentials tab is the supported way to set it. |
 | `CLIENT_ID` | No | Optional prefill. |
 | `GUILD_ID` | No | Optional prefill. |
-| `REDIS_URL` | No | Enables Redis-backed Guild Web-UI sessions; sessions use an in-memory store when unset. |
 
 Credentials entered in the Web-UI are stored in `/data/.env` (the `./data`
 bind mount) and survive container rebuilds.
 
 ### docker-compose.remote.yml (self-hosting, public Linux server)
 
-The bot, a Redis sidecar for Guild Web-UI sessions, Caddy (automatic
-Let's Encrypt TLS), and Authelia (login + TOTP/WebAuthn MFA enforced via
-`forward_auth`). The admin Web-UI is reachable only through Caddy after an
+The bot, Caddy (automatic Let's Encrypt TLS), and Authelia (login +
+TOTP/WebAuthn MFA enforced via `forward_auth`). The admin Web-UI is reachable only through Caddy after an
 Authelia login; `/guild` and `/auth` bypass the gate (they carry the bot's own
 Discord OAuth). Deployed and reconfigured by `sudo ./setup.sh`; the compose
 header documents the equivalent manual steps.
@@ -679,8 +660,8 @@ header documents the equivalent manual steps.
 ### docker-compose.yml (Bot Manager / Yundera)
 
 The committed `docker-compose.yml` is the manager-processed compose used by
-Bot Manager on Yundera (CasaOS). It includes the AppShield auth gateway, a
-Redis sidecar, the external `pcs` network, and `$VARIABLE` placeholders that
+Bot Manager on Yundera (CasaOS). It includes the AppShield auth gateway,
+the external `pcs` network, and `$VARIABLE` placeholders that
 the manager substitutes at deploy time. It is not meant to be started by
 hand.
 

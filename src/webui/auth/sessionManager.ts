@@ -1,12 +1,12 @@
-// Session Manager - Handles session storage with Redis fallback to memory
+// Session Manager - file-backed session storage with in-memory fallback
 
 import session from 'express-session';
-const RedisStore = require('connect-redis').RedisStore;
-import { createClient } from 'redis';
 import crypto from 'crypto';
 import { loadCredentials } from '../../utils/envLoader';
+import { FileSessionStore } from './fileSessionStore';
 
-let sessionStore: session.Store | undefined;
+let sessionStore: FileSessionStore | undefined;
+let sessionStoreConfigured = false;
 
 /**
  * Last-resort fallback session secret. ensureDurableSessionSecret() persists
@@ -23,59 +23,24 @@ function getBootFallbackSecret(): string {
 }
 
 /**
- * Configure session store (Redis with memory fallback for dev)
+ * Configure session store (file-backed, memory fallback when /data is not writable)
  */
 export async function configureSessionStore(): Promise<session.Store | undefined> {
-  const credentials = loadCredentials();
-  const redisUrl = credentials.REDIS_URL;
-  const isDev = process.env.NODE_ENV === 'development';
-
-  if (!redisUrl) {
-    console.log('[SessionManager] REDIS_URL not configured - using in-memory session store');
+  if (sessionStoreConfigured) return sessionStore;
+  sessionStoreConfigured = true;
+  const store = new FileSessionStore();
+  if (!store.probeOk) {
+    store.stop();
+    console.warn('[SessionManager] Session directory not writable - using in-memory session store; sessions will not survive a restart.');
     return undefined;
   }
+  sessionStore = store;
+  return sessionStore;
+}
 
-  try {
-    console.log(`[SessionManager] Connecting to Redis at ${redisUrl}...`);
-
-    const redisClient = createClient({
-      url: redisUrl,
-      socket: {
-        connectTimeout: isDev ? 3000 : 10000, // Shorter timeout in dev
-        reconnectStrategy: (retries) => {
-          if (retries > (isDev ? 2 : 10)) {
-            console.error(`[SessionManager] Redis connection failed after ${retries} retries`);
-            return false; // Stop retrying
-          }
-          return Math.min(retries * 100, 3000);
-        }
-      }
-    });
-
-    redisClient.on('error', (err) => {
-      // Only log once, not on every retry
-      if (!sessionStore) {
-        console.error('[SessionManager] Redis error:', err.message);
-      }
-    });
-
-    await redisClient.connect();
-
-    // connect-redis v9 - RedisStore is the constructor
-    sessionStore = new RedisStore({
-      client: redisClient,
-      prefix: 'smdb:sess:'
-    });
-
-    console.log('[SessionManager] Redis session store configured successfully');
-    return sessionStore;
-  } catch (error) {
-    console.warn('[SessionManager] Redis not available - using memory store (sessions lost on restart)');
-    if (!isDev) {
-      console.warn('[SessionManager] Production without Redis: sessions will not persist across restarts');
-    }
-    return undefined; // Will use default memory store
-  }
+/** Stop the session store's sweep timer (clean shutdown). */
+export function stopSessionStore(): void {
+  sessionStore?.stop();
 }
 
 /**

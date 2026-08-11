@@ -10,6 +10,7 @@ import { setNotificationIPCDispatcher } from '../bot/internalSetup/utils/premium
 import { initSyncNudge, nudgeSync } from './utils/syncNudge';
 import { ensureDurableSessionSecret } from '../utils/envLoader';
 import { flushAll } from '../bot/internalSetup/utils/dataManager';
+import { stopSessionStore } from './auth/sessionManager';
 
 /**
  * Drain the parent process's write queue before exit (bounded). The web-UI
@@ -67,7 +68,7 @@ export async function startWebUI(botManager: BotManager): Promise<void> {
   // something other than "Development" when running outside Docker.
 
   // Durable SESSION_SECRET before the session middleware is built, so
-  // sessions survive restarts with or without Redis.
+  // sessions survive restarts.
   ensureDurableSessionSecret();
   initSyncNudge(botManager);
 
@@ -141,6 +142,8 @@ export async function startWebUI(botManager: BotManager): Promise<void> {
     if (botManager.isRunning()) {
       await botManager.shutdown(false);
     }
+
+    stopSessionStore();
 
     // Drain accepted config writes before exit (bounded), so none are lost.
     await flushBeforeExit();
