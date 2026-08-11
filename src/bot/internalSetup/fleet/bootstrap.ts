@@ -19,7 +19,7 @@ import {
   REGISTER_GRACE_MS,
   XFER_COMMIT_RETRY_MS,
 } from './constants';
-import { HeartbeatPayload, LeaseGrantPayload, LeaseInfo, LeaseRenewedPayload, LeaseRevokePayload, MSG, NodeCapabilities, NodeDrainPayload, NodeRole, RegisterPayload, RegisterResult } from './protocol';
+import { DataBackendInfo, HeartbeatPayload, LeaseGrantPayload, LeaseInfo, LeaseRenewedPayload, LeaseRevokePayload, MSG, NodeCapabilities, NodeDrainPayload, NodeRole, RegisterPayload, RegisterResult } from './protocol';
 import { getAppVersion, getNodeId, getNodeName, isStandalone, resolveNodeRole, wasNodeIdFreshlyGenerated } from './nodeIdentity';
 import { createControlStore, PostgresControlStore } from './postgresControlStore';
 import { Registry, RegistryNode } from './registry';
@@ -45,7 +45,9 @@ import type { MigrationView, PinViolationView } from './state';
 import { serveSyncRequest, SyncAuthority } from './syncAuthority';
 import { SyncEngine } from './syncEngine';
 import { getFrozenStats, setOwnerInfoProvider } from '../utils/dataManager';
-import { resolveDataBackend } from '../../../utils/envLoader';
+import { applyDeliveredBackend } from '../utils/dataBackends/boot';
+import { currentRouteDefault } from '../utils/dataBackends/routeResolver';
+import { loadCredentials, resolveDataBackend } from '../../../utils/envLoader';
 import { MigrationDisposition, resolveIncomingWithMaster, resumeSourceGraveyarding, runResidueSweep } from './migration/residueSweep';
 import { MigrationCoordinator, PrecheckResult, StartPayload } from './migration/migrationCoordinator';
 import { MigrationExecutor } from './migration/migrationExecutor';
@@ -1278,6 +1280,18 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     return { success: true };
   };
 
+  // The register reply hands workers the deployment's LIVE backend (the
+  // route default, which transformation-required overrides), never the raw
+  // env value: a fresh worker must serve from where the data actually lives.
+  function buildDataBackendInfo(): DataBackendInfo {
+    let live: 'file' | 'postgres' = 'file';
+    try {
+      live = currentRouteDefault();
+    } catch { /* invalid DATA_BACKEND refused at data boot; deliver file */ }
+    if (live !== 'postgres') return { backend: 'file' };
+    return { backend: 'postgres', url: (loadCredentials().DATA_BACKEND_URL || '').trim() };
+  }
+
   async function persist(): Promise<void> {
     const byNode = new Map<string, { leaseId: string; shardId: number; identifyDelayMs: number }[]>();
     for (const lease of registry.shardTable.values()) {
@@ -1465,7 +1479,13 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
         ledgerDeferWarnAt.delete(payload.nodeId);
         ledger?.onRegister(payload.nodeId);
         console.log(`[Fleet] Node registered: ${payload.nodeName} (${payload.nodeId})`);
-        return { accepted: true, term: registry.term, budget: ledger?.getBudgetInfo() ?? null };
+        return { accepted: true, term: registry.term, budget: ledger?.getBudgetInfo() ?? null, dataBackend: buildDataBackendInfo() };
+      },
+      onCapabilityRefresh: (fromNodeId, payload) => {
+        const node = registry.nodes.get(fromNodeId);
+        if (!node || !payload?.capabilities) return;
+        node.capabilities = payload.capabilities;
+        void persist().catch(err => console.warn('[Fleet] Failed to persist capability refresh:', err));
       },
       afterRegister: registeredNodeId => {
         // Sync rides the control channel and never delays lease traffic:
@@ -1710,6 +1730,22 @@ async function initCoWorker(init: CommonInit): Promise<FleetContext> {
       }),
       onSyncState: payload => engine.onSyncState(payload),
       onXferControl: (type, data) => executor!.handle(type, data),
+      onDataBackend: info => {
+        void (async () => {
+          try {
+            const changed = await applyDeliveredBackend(info);
+            if (changed) {
+              // Mutating the shared object keeps buildRegister's closure
+              // current; the refresh converges the master's registry NOW so
+              // migration prechecks never read a stale backend.
+              capabilities.dataBackend = resolveDataBackend();
+              controlClient?.sendToMaster(MSG.CAPABILITY_REFRESH, { term: controlClient.getTerm(), capabilities });
+            }
+          } catch (error) {
+            console.error('[Fleet] Failed to apply the delivered data backend:', error);
+          }
+        })();
+      },
       decorateHeartbeat: hb => {
         const syncState = engine.getSyncState();
         const ok = engine.getLastReportOk();

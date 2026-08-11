@@ -41,6 +41,8 @@ export interface ControlClientOptions {
   decorateHeartbeat?: (hb: HeartbeatPayload) => HeartbeatPayload;
   /** Migration control (prepare/drain/commit/abort/inventory) -> executor; returns the ack payload. */
   onXferControl?: (type: string, data: any) => Promise<any>;
+  /** Master-delivered data backend from the register reply (re-delivered on every reconnect). */
+  onDataBackend?: (info: RegisterResult['dataBackend']) => void;
 }
 
 export class ControlClient {
@@ -176,6 +178,7 @@ export class ControlClient {
       this.attempt = 0;
       this.draining = false;
       if (result.budget) this.lastBudget = result.budget;
+      this.opts.onDataBackend?.(result.dataBackend);
       this.touch();
       console.log(`[Fleet] Registered with master (term ${this.term})`);
     } catch (error) {

@@ -8,6 +8,7 @@ import { createHash, timingSafeEqual } from 'crypto';
 import { WebSocketServer, WebSocket } from 'ws';
 import { CONTROL_ACK_TIMEOUT_MS, LEASE_RENEW_MS } from './constants';
 import {
+  CapabilityRefreshPayload,
   ControlEnvelope,
   GuildNoticePayload,
   HeartbeatPayload,
@@ -26,6 +27,8 @@ export interface ControlServerHooks {
   afterRegister: (nodeId: string) => void;
   onHeartbeat: (nodeId: string, hb: HeartbeatPayload) => void;
   onGuildNotice: (nodeId: string, notice: GuildNoticePayload) => void;
+  /** A worker's live capabilities changed (e.g. it applied a delivered data backend). */
+  onCapabilityRefresh?: (nodeId: string, payload: CapabilityRefreshPayload) => void;
   onLeaseRenew: (nodeId: string, payload: LeaseRenewPayload) => LeaseRenewedPayload;
   onDisconnect: (nodeId: string) => void;
   /** Worker pull requests (control:sync:files / module:begin / read); term-fenced like every post-register message. */
@@ -205,6 +208,9 @@ export class ControlServer {
     switch (type) {
       case MSG.HEARTBEAT:
         this.hooks.onHeartbeat(state.nodeId, data as HeartbeatPayload);
+        break;
+      case MSG.CAPABILITY_REFRESH:
+        this.hooks.onCapabilityRefresh?.(state.nodeId, data as CapabilityRefreshPayload);
         break;
       case MSG.GUILD_NOTICE:
         this.hooks.onGuildNotice(state.nodeId, (data?.notice ?? data) as GuildNoticePayload);
