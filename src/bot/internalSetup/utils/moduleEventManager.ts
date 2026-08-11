@@ -19,27 +19,7 @@
 import { Client } from 'discord.js';
 import { getMetricsCollector } from './metrics/metricsCollector';
 import { instrument } from './metrics/instrument';
-
-/**
- * Best-effort guildId extraction from a Discord.js event payload.
- * Returns null when the event has no guild context (DMs, clientReady,
- * etc.) - in that case we allow the event through unchanged.
- *
- * Covers the common Discord.js event shapes:
- *   - {guildId} on Message, Channel, Interaction
- *   - {guild: {id}} on GuildMember, Role, GuildBan, etc.
- *   - voiceStateUpdate(old, new) - first arg has guild.id
- */
-function extractGuildId(args: any[]): string | null {
-  for (const arg of args) {
-    if (!arg || typeof arg !== 'object') continue;
-    const direct = (arg as any).guildId;
-    if (typeof direct === 'string' && direct) return direct;
-    const nested = (arg as any).guild?.id;
-    if (typeof nested === 'string' && nested) return nested;
-  }
-  return null;
-}
+import { gateEventDispatch, extractGuildId } from './dataBackends/boot';
 
 interface TrackedListener {
   eventName: string;
@@ -86,6 +66,10 @@ class ModuleEventManager {
         // that gate at the command or feature level pass events through and
         // self-gate inside the handler.
         if (this.shouldSkipEvent(moduleName, args)) return;
+
+        // Data-ready gate (postgres-routed guilds only): clientReady holds
+        // behind the startup barrier, unready-guild events buffer for replay.
+        if (!(await gateEventDispatch(eventName, args, () => void wrappedHandler(...args)))) return;
 
         await instrument('event', extractGuildId(args), moduleName, eventName, () => handler(this.client!, ...args));
       } catch (error) {
