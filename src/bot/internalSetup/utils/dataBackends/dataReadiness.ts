@@ -37,6 +37,10 @@ export class DataReadinessDriver {
   private shardCount = 0;
   private lease: LeaseSnapshot | null = null;
   private stopped = false;
+  // Held = lease deltas are recorded but nothing hydrates (no ownership claims
+  // land) until boot releases the driver after the store-identity verdict.
+  private held = false;
+  private lastCatalog: string[] = [];
   private catalogTimer: NodeJS.Timeout;
   private readonly buffers = new Map<string, Array<() => void>>();
   private bufferDrops = 0;
@@ -44,7 +48,8 @@ export class DataReadinessDriver {
   private resolveInitial: (() => void) | null = null;
   private readonly initialHydration = new Promise<void>(resolve => { this.resolveInitial = resolve; });
 
-  constructor(private readonly backend: DataBackend, private readonly ws: WorkingSetManager) {
+  constructor(private readonly backend: DataBackend, private readonly ws: WorkingSetManager, opts?: { held?: boolean }) {
+    this.held = opts?.held ?? false;
     this.catalogTimer = setInterval(() => void this.refreshCatalog(), CATALOG_REFRESH_MS);
     this.catalogTimer.unref();
   }
@@ -52,6 +57,16 @@ export class DataReadinessDriver {
   stop(): void {
     this.stopped = true;
     clearInterval(this.catalogTimer);
+  }
+
+  /** Boot hook: store identity verified; hydrate whatever leases arrived while held. */
+  release(): void {
+    if (!this.held) return;
+    this.held = false;
+    if (this.shardIds.length > 0) {
+      void this.hydrateShards([...this.shardIds]);
+      void this.refreshCatalog();
+    }
   }
 
   /** Fleet hook: the node's lease set changed (grant adoption). */
@@ -63,6 +78,7 @@ export class DataReadinessDriver {
     this.shardIds = [...snapshot.shardIds];
     this.shardCount = snapshot.shardCount;
     this.lease = snapshot;
+    if (this.held) return;
     // Same-shape re-grant: refresh fences only, never re-hydrate.
     for (const guildId of this.ws.readyGuilds()) {
       this.ws.refreshFence(guildId, this.fenceFor(guildId));
@@ -159,7 +175,7 @@ export class DataReadinessDriver {
 
   /** A GUILD_CREATE (or first touch) for a leased guild with no working set. */
   private hydrateOnDemand(guildId: string): void {
-    if (!this.isLeasedHere(guildId) || this.ws.has(guildId)) return;
+    if (this.held || !this.isLeasedHere(guildId) || this.ws.has(guildId)) return;
     void this.hydrateWithRetry(guildId);
   }
 
@@ -230,13 +246,20 @@ export class DataReadinessDriver {
     this.resolveInitial?.();
   }
 
+  /** Owned guilds whose working set is not ready (startup-barrier skip logging). */
+  unreadyGuilds(): string[] {
+    return this.lastCatalog.filter(g => !this.isReadyNow(g));
+  }
+
   private async refreshCatalog(): Promise<void> {
-    if (this.stopped || this.shardIds.length === 0) {
+    if (this.stopped || this.held || this.shardIds.length === 0) {
+      this.lastCatalog = [];
       setOwnedGuildCatalog([]);
       return;
     }
     try {
-      setOwnedGuildCatalog(await this.backend.listOwnedGuilds(this.shardIds, this.shardCount));
+      this.lastCatalog = await this.backend.listOwnedGuilds(this.shardIds, this.shardCount);
+      setOwnedGuildCatalog(this.lastCatalog);
     } catch { /* catalog snapshot refresh is best-effort; the next tick retries */ }
   }
 }
@@ -255,8 +278,8 @@ function backoff(attempt: number): number {
 
 let driver: DataReadinessDriver | null = null;
 
-export function initDataReadiness(backend: DataBackend, ws: WorkingSetManager): DataReadinessDriver {
-  driver = new DataReadinessDriver(backend, ws);
+export function initDataReadiness(backend: DataBackend, ws: WorkingSetManager, opts?: { held?: boolean }): DataReadinessDriver {
+  driver = new DataReadinessDriver(backend, ws, opts);
   return driver;
 }
 
