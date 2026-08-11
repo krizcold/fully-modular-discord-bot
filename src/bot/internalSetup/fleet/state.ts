@@ -11,6 +11,7 @@ import type { ControlClient } from './controlClient';
 import type { HealthMonitor, LossEvent } from './healthMonitor';
 import type { IdentifyLedger } from './identifyLedger';
 import type { IngestService } from '../ingest/ingestService';
+import { resolveDataBackend } from '../../../utils/envLoader';
 
 export interface FleetStateNode {
   nodeId: string;
@@ -96,6 +97,10 @@ export interface FleetState {
   epoch: number;
   shardCount: number;
   shardSource: 'discord' | 'override';
+  /** Deployment-default data backend (resolveDataBackend()). */
+  dataBackend: 'file' | 'postgres';
+  /** Per-guild routing overrides while a backend transformation is active; delivered with that machinery. */
+  dataRouting?: { guildId: string; backend: 'file' | 'postgres' }[];
   recommendedShards: number | null;
   capacity: number;
   onHold: boolean;
@@ -249,6 +254,7 @@ export function getFleetState(): FleetState {
       epoch: 0,
       shardCount: 0,
       shardSource: getShardSource(),
+      dataBackend: resolveDataBackend(),
       recommendedShards: null,
       capacity: resolveShardCapacity(),
       onHold: false,
@@ -341,6 +347,7 @@ export function getFleetState(): FleetState {
       epoch: registry.epoch,
       shardCount: registry.shardCount,
       shardSource: getShardSource(),
+      dataBackend: resolveDataBackend(),
       recommendedShards,
       capacity,
       onHold: false,
@@ -427,6 +434,7 @@ export function getFleetState(): FleetState {
     epoch: lease?.epoch ?? 0,
     shardCount,
     shardSource: getShardSource(),
+    dataBackend: resolveDataBackend(),
     recommendedShards,
     capacity,
     onHold,
@@ -453,7 +461,7 @@ export function getFleetState(): FleetState {
         connected: true,
         health: 'up',
         appVersion,
-        capabilities: { shardCapacity: capacity, dataBackend: 'file' },
+        capabilities: { shardCapacity: capacity, dataBackend: resolveDataBackend() },
         capacity,
         onHold,
         shardIds: leases.map(l => l.shardId).sort((a, b) => a - b),

@@ -26,6 +26,8 @@ export const MSG = {
   LEASE_RENEW: 'control:lease:renew',
   /** Reply payload name only; the wire reply is {requestId, data}. */
   LEASE_RENEWED: 'control:lease:renewed',
+  /** Worker -> master: hand back leases it cannot serve (hydration failure or lost ownership claim). */
+  LEASE_DECLINE: 'control:lease:decline',
   NODE_DRAIN: 'control:node:drain',
   HEARTBEAT: 'control:heartbeat',
   GUILD_NOTICE: 'control:guild:notice',
@@ -46,11 +48,23 @@ export const MSG = {
   XFER_COMMIT: 'control:xfer:commit',
   XFER_ABORT: 'control:xfer:abort',
   XFER_INVENTORY: 'control:xfer:inventory',
+  /** Lease-only legs: source -> master drain confirmation replacing the dual-hash verify. */
+  XFER_FLUSHED: 'control:xfer:flushed',
+  // Data backend. TRANSFORM_GUILD/BACKEND_FLIP flow master -> owner
+  // (request/ack). DATA_WRITE/DATA_READ are master -> owning node
+  // request/reply (the webui write-through-owner hop and its symmetric read).
+  // CAPABILITY_REFRESH flows worker -> master after a runtime backend apply.
+  TRANSFORM_GUILD: 'control:transform:guild',
+  BACKEND_FLIP: 'control:backend:flip',
+  DATA_WRITE: 'control:data:write',
+  DATA_READ: 'control:data:read',
+  CAPABILITY_REFRESH: 'control:capability:refresh',
 } as const;
 
 export interface NodeCapabilities {
   shardCapacity: number;
-  dataBackend: string;
+  /** Declarations only ever send a real backend; 'unknown' is recorded registry-side for a register payload with no capabilities (never a guessed backend). */
+  dataBackend: 'file' | 'postgres' | 'unknown';
   /** Advertised transfer endpoint (ws://host:port) when TRANSFER_URL is set; direction-by-reachability uses it. */
   transferUrl?: string;
 }
@@ -71,6 +85,19 @@ export interface RegisterResult {
   term: number;
   reason?: string;
   budget?: BudgetInfo | null;
+  /** Master's data-backend decision, re-delivered on every reconnect; absent = file mode. Refusals carry nothing. */
+  dataBackend?: DataBackendInfo;
+}
+
+/** Backend decision + routing map handed to workers in the register reply. */
+export interface DataBackendInfo {
+  backend: 'file' | 'postgres';
+  /** Connection string; only when backend is postgres. */
+  url?: string;
+  /** Active transformation, if any. */
+  transformationId?: string;
+  /** Per-guild routing overrides while a transformation is active. */
+  routes?: { guildId: string; backend: 'file' | 'postgres' }[];
 }
 
 export interface BudgetInfo {
@@ -127,6 +154,12 @@ export interface LeaseAckPayload {
   ok: boolean;
   term: number;
   reason?: string;
+}
+
+export interface LeaseDeclinePayload {
+  term: number;
+  leaseIds: string[];
+  reason: 'hydration-timeout' | 'deposed-at-hydration';
 }
 
 export interface ShardStatusEntry {
@@ -243,7 +276,8 @@ export interface SyncReportPayload {
 // ============================================================================
 
 export type MigrationKind = 'move' | 'swap' | 'retire' | 'redistribute';
-export type TransferDirection = 'push' | 'pull';
+/** 'none' = lease-only leg (both endpoints postgres-routed); the transfer channel is never opened. */
+export type TransferDirection = 'push' | 'pull' | 'none';
 export type TransferRole = 'source' | 'target';
 
 /** One transfer leg's per-participant instruction inside a prepare. */
@@ -301,6 +335,17 @@ export interface XferVerifyPayload {
   guildHashes: Record<string, string>;
 }
 
+/** Lease-only legs: drain confirmation replaces the dual-hash verify. */
+export interface XferFlushedPayload {
+  migrationId: string;
+  legId: string;
+  term: number;
+  ok: boolean;
+  pendingOps: number;
+  flushFailures: number;
+  reason?: string;
+}
+
 export interface XferCommitPayload {
   migrationId: string;
   term: number;
@@ -336,4 +381,76 @@ export interface XferInventoryGuild {
 export interface XferInventoryReply {
   ok: boolean;
   guilds: XferInventoryGuild[];
+}
+
+// ============================================================================
+// DATA BACKEND
+// ============================================================================
+
+export interface TransformGuildPayload {
+  transformationId: string;
+  term: number;
+  guildId: string;
+  direction: 'file-to-postgres' | 'postgres-to-file';
+}
+
+export interface TransformGuildAckPayload {
+  ok: boolean;
+  namespaceHash?: string;
+  reason?: string;
+}
+
+export interface BackendFlipPayload {
+  backend: 'file' | 'postgres';
+  transformationId: string;
+  term: number;
+}
+
+export interface BackendFlipAckPayload {
+  ok: boolean;
+}
+
+/** Webui write-through-owner hop (master -> owning node). */
+export interface DataWriteRequest {
+  term: number;
+  guildId: string;
+  module: string;
+  /** Ignored for delete-namespace. */
+  filename: string;
+  op: 'write' | 'delete' | 'delete-namespace';
+  /** Raw JSON text; write op only. */
+  contentJson?: string;
+  origin: 'webui-operator';
+}
+
+export interface DataWriteReply {
+  ok: boolean;
+  code?: 'frozen' | 'not-owner' | 'owner-unreachable' | 'stale-term' | 'backend-unavailable' | 'bot-down' | 'invalid' | 'io-error';
+  error?: string;
+  /** Accepted, flush still retrying. */
+  pending?: boolean;
+}
+
+/** Symmetric read hop; no filename = list the module's files. */
+export interface DataReadRequest {
+  term: number;
+  guildId: string;
+  module: string;
+  filename?: string;
+}
+
+export interface DataReadReply {
+  ok: boolean;
+  /** Raw JSON text of the requested file; absent for a listing. */
+  contentJson?: string;
+  /** Listing when no filename was requested. */
+  files?: string[];
+  code?: 'frozen' | 'not-owner' | 'owner-unreachable' | 'stale-term' | 'backend-unavailable' | 'bot-down' | 'invalid' | 'io-error';
+  error?: string;
+}
+
+/** Worker -> master after a runtime backend apply; the master updates the registry entry and persists. */
+export interface CapabilityRefreshPayload {
+  term: number;
+  capabilities: NodeCapabilities;
 }

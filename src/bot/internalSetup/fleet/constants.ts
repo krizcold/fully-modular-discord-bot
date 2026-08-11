@@ -1,6 +1,6 @@
 // Single source of truth for every fleet constant; imported by every fleet consumer.
 
-export const PROTOCOL_VERSION = 2;
+export const PROTOCOL_VERSION = 3;
 
 /** Heartbeat cadence (worker -> master, and the master's self-sample into its own registry). */
 export const HEARTBEAT_MS = 5000;

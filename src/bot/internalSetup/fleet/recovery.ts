@@ -13,6 +13,8 @@ export interface RecoveryOptions {
   liveRecommendation: number | null;
   override: number | null;
   standalone: boolean;
+  /** Deployment's resolved backend for synthesized node stubs; passed in so this module stays env-import-free. */
+  dataBackend: 'file' | 'postgres';
 }
 
 export interface RecoveryResult {
@@ -76,7 +78,7 @@ export async function evaluateRecovery(store: ControlStore, opts: RecoveryOption
     if (!isReshardConfirmed()) {
       // Unconfirmed count change: adopt the old count (zero downtime); an
       // unconfirmed change can never wipe or remap anything.
-      const result = await adoptPlan(store, plan);
+      const result = await adoptPlan(store, plan, opts.dataBackend);
       result.reshardNeedsConfirm = { from: plan.shardCount, to: opts.override };
       if (paused) result.reshardPaused = paused;
       console.warn(`[Fleet] FLEET_SHARD_COUNT ${opts.override} != persisted ${plan.shardCount} without FLEET_CONFIRM_RESHARD; keeping ${plan.shardCount} shard(s); set FLEET_CONFIRM_RESHARD=1 and restart to apply`);
@@ -90,7 +92,7 @@ export async function evaluateRecovery(store: ControlStore, opts: RecoveryOption
     return confirmedReshard(store, plan, opts.override, opts.newTerm, usableMarker);
   }
 
-  const result = await adoptPlan(store, plan);
+  const result = await adoptPlan(store, plan, opts.dataBackend);
   if (paused) result.reshardPaused = paused;
   if (opts.liveRecommendation !== null && opts.liveRecommendation !== plan.shardCount) {
     // DECISION-1: adopt the persisted shardCount even when Discord's live
@@ -102,7 +104,7 @@ export async function evaluateRecovery(store: ControlStore, opts: RecoveryOption
   return result;
 }
 
-async function adoptPlan(store: ControlStore, plan: PersistedPlan): Promise<RecoveryResult> {
+async function adoptPlan(store: ControlStore, plan: PersistedPlan, dataBackend: 'file' | 'postgres'): Promise<RecoveryResult> {
   const persisted = (await store.loadRegistry()).nodes;
   const byId = new Map(persisted.map(n => [n.nodeId, n]));
   const nodes: PersistedNode[] = plan.assignments.map(a =>
@@ -110,7 +112,7 @@ async function adoptPlan(store: ControlStore, plan: PersistedPlan): Promise<Reco
       nodeId: a.nodeId,
       nodeName: a.nodeId,
       appVersion: '',
-      capabilities: { shardCapacity: 1, dataBackend: 'file' },
+      capabilities: { shardCapacity: 1, dataBackend },
       lastSeenAt: 0,
     },
   );

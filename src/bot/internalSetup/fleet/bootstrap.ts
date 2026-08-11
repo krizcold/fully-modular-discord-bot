@@ -45,6 +45,7 @@ import type { MigrationView, PinViolationView } from './state';
 import { serveSyncRequest, SyncAuthority } from './syncAuthority';
 import { SyncEngine } from './syncEngine';
 import { getFrozenStats, setOwnerInfoProvider } from '../utils/dataManager';
+import { resolveDataBackend } from '../../../utils/envLoader';
 import { MigrationDisposition, resolveIncomingWithMaster, resumeSourceGraveyarding, runResidueSweep } from './migration/residueSweep';
 import { MigrationCoordinator, PrecheckResult, StartPayload } from './migration/migrationCoordinator';
 import { MigrationExecutor } from './migration/migrationExecutor';
@@ -178,7 +179,7 @@ export async function initFleet(): Promise<FleetContext> {
   const advertisedTransferUrl = (process.env.TRANSFER_URL || '').trim() || undefined;
   const capabilities: NodeCapabilities = {
     shardCapacity: resolveShardCapacity(),
-    dataBackend: 'file',
+    dataBackend: resolveDataBackend(),
     ...(advertisedTransferUrl ? { transferUrl: advertisedTransferUrl } : {}),
   };
 
@@ -350,6 +351,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     liveRecommendation: recommendedShards,
     override: getShardCountOverride(),
     standalone,
+    dataBackend: resolveDataBackend(),
   });
   // Reshard pause: while the marker exists NOTHING is auto-assigned - no
   // self-claim, no Phase R/F (distribute returns immediately). Manual assign
@@ -1437,7 +1439,10 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
           nodeId: payload.nodeId,
           nodeName: payload.nodeName || payload.nodeId,
           appVersion: payload.appVersion,
-          capabilities: payload.capabilities ?? { shardCapacity: 1, dataBackend: 'file' },
+          // No declared capabilities: record 'unknown', never a guessed backend,
+          // so the migration backend-skew check can tell "declared file" apart
+          // from "never declared".
+          capabilities: payload.capabilities ?? { shardCapacity: 1, dataBackend: 'unknown' },
           isSelf: false,
           send,
         });

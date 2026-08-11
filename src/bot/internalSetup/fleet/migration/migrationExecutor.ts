@@ -22,6 +22,7 @@ import { hashLeg } from '../../utils/dataInterchange';
 import { TRANSFER_PORT_DEFAULT, TRANSFER_TOKEN_TTL_MS, XFER_MAX_ROUNDS, XFER_DELTA_THRESHOLD_FILES, XFER_DIAL_RETRY_MS, XFER_DIAL_RETRY_WINDOW_MS } from '../constants';
 import {
   MSG,
+  TransferDirection,
   XferAbortPayload,
   XferCommitPayload,
   XferDrainPayload,
@@ -55,7 +56,7 @@ interface LegRuntime {
   shardId: number;
   role: 'source' | 'target';
   guilds: string[];
-  direction: 'push' | 'pull';
+  direction: TransferDirection;
   peerUrl?: string;
   token: string;
   ws: WebSocket | null;
