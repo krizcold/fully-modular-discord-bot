@@ -16,3 +16,8 @@ export function forceRouteDefault(kind: DataBackendKind | null): void {
 export function routeFor(_guildId: string): DataBackendKind {
   return forcedDefault ?? resolveDataBackend();
 }
+
+/** The default every guild currently routes to (the node's LIVE backend). */
+export function currentRouteDefault(): DataBackendKind {
+  return forcedDefault ?? resolveDataBackend();
+}

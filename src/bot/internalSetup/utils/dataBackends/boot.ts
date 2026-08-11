@@ -4,13 +4,18 @@
 // claim can touch a database that turns out to be the wrong one.
 
 import { MessageFlags } from 'discord.js';
-import { DataBackendKind, loadCredentials } from '../../../../utils/envLoader';
+import { DataBackendKind, loadCredentials, setFleetDataBackend, upsertCredentials } from '../../../../utils/envLoader';
 import { PostgresBackend } from './postgresBackend';
-import { initWorkingSet } from './workingSet';
+import { initWorkingSet, getWorkingSet } from './workingSet';
 import { initDataReadiness, getDataReadiness, DataReadinessDriver } from './dataReadiness';
 import { forceRouteDefault, routeFor } from './routeResolver';
-import { evaluateRecognitionGuard, verifyStoreIdentity, readFileMarker, GuardVerdict } from './recognitionGuard';
-import { setGuildDataBackend } from '../dataManager';
+import { evaluateRecognitionGuard, verifyStoreIdentity, readFileMarker, writeFileMarker, GuardVerdict } from './recognitionGuard';
+import { listGuilds } from './fileBackend';
+import { setGuildDataBackend, getGuildDataBackend } from '../dataManager';
+
+function hasLocalGuildData(): boolean {
+  return listGuilds().length > 0;
+}
 
 // Startup barrier bound = the acceptance window: past it something is wrong
 // enough that holding clientReady longer helps nobody.
@@ -84,6 +89,13 @@ export function initDataBackendLayer(): void {
     refuse('the live data backend is postgres but DATA_BACKEND_URL is not set');
     return;
   }
+  startPostgresRuntime(url);
+}
+
+let activeUrl: string | null = null;
+
+function startPostgresRuntime(url: string): void {
+  activeUrl = url;
   bootStatus = { ...bootStatus, mode: 'postgres', state: 'starting' };
   const backend = new PostgresBackend({ url });
   backend.start();
@@ -91,6 +103,68 @@ export function initDataBackendLayer(): void {
   setGuildDataBackend(backend);
   const driver = initDataReadiness(backend, ws, { held: true });
   void verifyIdentityLoop(url, driver);
+}
+
+/**
+ * Co-worker apply of the master-delivered backend (register reply, re-sent on
+ * every reconnect). Returns true when the effective backend or URL changed
+ * (the caller refreshes and re-sends its capabilities). Ordering per the
+ * spec: adopt -> persist env -> marker -> (re)start runtime, gates stay
+ * closed until the new runtime's identity verifies.
+ */
+export async function applyDeliveredBackend(info: { backend: DataBackendKind; url?: string } | undefined): Promise<boolean> {
+  const backend = info?.backend ?? 'file';
+  const url = (info?.url || '').trim();
+  const creds = loadCredentials();
+  const envBackend = (creds.DATA_BACKEND || 'file').trim() || 'file';
+  const envUrl = (creds.DATA_BACKEND_URL || '').trim();
+  const changed = backend !== envBackend || (backend === 'postgres' && url !== envUrl);
+
+  setFleetDataBackend(backend === 'postgres' ? { backend, url } : { backend });
+
+  if (changed) {
+    const patch: Record<string, string> = { DATA_BACKEND: backend };
+    if (backend === 'postgres') patch.DATA_BACKEND_URL = url;
+    const result = upsertCredentials(patch);
+    if (!result.success) {
+      console.warn('[Data] Could not persist the delivered backend to /data/.env; applied in-memory only:', result.error);
+    }
+  }
+
+  // Stale local marker with no local guild data: the master's delivered
+  // backend wins and the node rewrites its own marker (guard step 5).
+  const marker = readFileMarker();
+  if (marker && marker.live !== backend && !hasLocalGuildData()) {
+    writeFileMarker({ live: backend, storeId: null, flippedAt: Date.now(), transformationId: null });
+    forceRouteDefault(null);
+  }
+
+  if (backend === 'postgres') {
+    if (!url) {
+      refuse('the master delivered a postgres backend without a URL');
+      return changed;
+    }
+    if (activeUrl === url) return changed;
+    if (activeUrl !== null) {
+      console.warn('[Data] Delivered backend URL changed; recycling the postgres runtime (unflushed writes drain best-effort)');
+      await stopPostgresRuntime();
+    }
+    startPostgresRuntime(url);
+  }
+  return changed;
+}
+
+async function stopPostgresRuntime(): Promise<void> {
+  try {
+    getDataReadiness()?.stop();
+    const ws = getWorkingSet();
+    if (ws) await ws.flushAllDirty();
+    await getGuildDataBackend()?.stop();
+  } catch (error) {
+    console.warn('[Data] Error while recycling the postgres runtime:', error);
+  }
+  setGuildDataBackend(null);
+  activeUrl = null;
 }
 
 async function verifyIdentityLoop(url: string, driver: DataReadinessDriver): Promise<void> {
