@@ -290,6 +290,15 @@ export class WorkingSetManager {
     return [...names];
   }
 
+  /** Raw JSON text of a live doc; null when absent or the set is not ready. */
+  readDocRaw(guildId: string, module: string, filename: string): string | null {
+    const ws = this.sets.get(guildId);
+    if (!ws || ws.state === 'hydrating' || ws.state === 'failed') return null;
+    const doc = ws.docs.get(docKeyOf(module, filename));
+    if (!doc || doc.tombstone) return null;
+    return doc.content;
+  }
+
   /** Every live doc key across all modules (guild-dir scan parity). */
   listAllKeys(guildId: string): DocKey[] | null {
     const ws = this.sets.get(guildId);

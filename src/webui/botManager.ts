@@ -559,6 +559,34 @@ export class BotManager {
   }
 
   /**
+   * Guild data write hop (6.3): the bot child applies the write on the owning
+   * node; the parent never writes a postgres-routed guild itself. 15s outer
+   * timeout so the inner 10s control hop surfaces its own error first.
+   */
+  async writeGuildData(payload: { guildId: string; module: string; filename: string; op: 'write' | 'delete' | 'delete-namespace'; contentJson?: string }): Promise<any> {
+    if (!this.isRunning() || !this.botProcess) {
+      return { ok: false, code: 'bot-down', error: 'bot process is not running' };
+    }
+    try {
+      return await this.sendIPCMessage('data:guild-write', payload, 15000);
+    } catch (error) {
+      return { ok: false, code: 'io-error', error: error instanceof Error ? error.message : 'IPC failure' };
+    }
+  }
+
+  /** Symmetric read hop; no filename = list the module's files. */
+  async readGuildData(payload: { guildId: string; module: string; filename?: string }): Promise<any> {
+    if (!this.isRunning() || !this.botProcess) {
+      return { ok: false, code: 'bot-down', error: 'bot process is not running' };
+    }
+    try {
+      return await this.sendIPCMessage('data:guild-read', payload, 15000);
+    } catch (error) {
+      return { ok: false, code: 'io-error', error: error instanceof Error ? error.message : 'IPC failure' };
+    }
+  }
+
+  /**
    * Get list of panels from bot
    */
   async getPanelList(): Promise<any> {

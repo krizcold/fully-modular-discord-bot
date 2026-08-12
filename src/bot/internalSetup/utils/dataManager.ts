@@ -21,6 +21,7 @@ import {
   enqueueDelete,
   existsOnDisk,
   readFileUtf8,
+  readRaw,
   freezeSentinelExists,
   guildDirExists,
   dropPendingForGuild,
@@ -152,6 +153,32 @@ export function listGuildDataFiles(guildId: string, category?: string): string[]
     return ws.listFiles(guildId, category ?? '') ?? [];
   }
   return listGuildDataFilesFs(guildId, category);
+}
+
+/**
+ * Deadline-bounded durability confirmation for one guild (operator writes:
+ * 'ok' = committed, 'pending' = accepted but still retrying).
+ */
+export async function flushGuildOutcome(guildId: string, deadlineMs: number): Promise<'ok' | 'pending' | 'deposed' | 'unavailable'> {
+  await flushGuildFiles(guildId);
+  const ws = getWorkingSet();
+  if (ws && routeFor(guildId) === 'postgres') {
+    return ws.flushGuildNow(guildId, deadlineMs);
+  }
+  return 'ok';
+}
+
+/**
+ * Raw JSON text of one guild doc from whichever backend routes the guild;
+ * null = absent (or the working set is not ready).
+ */
+export function readGuildDocRaw(guildId: string, module: string, filename: string): string | null {
+  const ws = getWorkingSet();
+  if (ws && routeFor(guildId) === 'postgres') {
+    return ws.readDocRaw(guildId, module, filename);
+  }
+  const filePath = getDataFilePath(filename, module ? { guildId, category: module } : { guildId });
+  return readRaw(filePath);
 }
 
 /**

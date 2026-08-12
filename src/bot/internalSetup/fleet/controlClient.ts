@@ -43,6 +43,8 @@ export interface ControlClientOptions {
   onXferControl?: (type: string, data: any) => Promise<any>;
   /** Master-delivered data backend from the register reply (re-delivered on every reconnect). */
   onDataBackend?: (info: RegisterResult['dataBackend']) => void;
+  /** Webui data hop from the master (DATA_WRITE/DATA_READ); returns the reply payload. */
+  onDataOp?: (type: string, data: any) => Promise<any>;
 }
 
 export class ControlClient {
@@ -237,6 +239,15 @@ export class ControlClient {
         // waits on the reconcile; register/lease traffic is untouched.
         this.replyAck(requestId, { ok: true, term: this.term });
         this.opts.onSyncState?.(data as SyncStatePayload);
+        break;
+      }
+      case MSG.DATA_WRITE:
+      case MSG.DATA_READ: {
+        const handler = this.opts.onDataOp;
+        if (!handler) { this.replyAck(requestId, { ok: false, code: 'owner-unreachable', error: 'data ops unavailable on this node' }); break; }
+        handler(type, data)
+          .then(result => this.replyAck(requestId, result))
+          .catch(error => this.replyAck(requestId, { ok: false, code: 'io-error', error: error instanceof Error ? error.message : String(error) }));
         break;
       }
       case MSG.XFER_PREPARE:

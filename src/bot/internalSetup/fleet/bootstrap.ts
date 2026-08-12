@@ -46,6 +46,13 @@ import type { MigrationView, PinViolationView } from './state';
 import { serveSyncRequest, SyncAuthority } from './syncAuthority';
 import { SyncEngine } from './syncEngine';
 import { getFrozenStats, getGuildDataBackend, setOwnerInfoProvider } from '../utils/dataManager';
+import {
+  applyOperatorDataRead,
+  applyOperatorDataWrite,
+  GuildDataReadRequest,
+  GuildDataWriteRequest,
+  setDataOpForwarder,
+} from '../utils/ipcDataHandler';
 import { applyDeliveredBackend } from '../utils/dataBackends/boot';
 import { setLeaseDeclineHandler } from '../utils/dataBackends/dataReadiness';
 import { currentRouteDefault } from '../utils/dataBackends/routeResolver';
@@ -1463,6 +1470,31 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     migrationDispositionOf = migrationId => coordinator!.dispositionOf(migrationId);
     migrationWorkActive = () => coordinator!.hasActive() || selfExecutor!.hasActiveLegs();
 
+    // Webui write-through-owner hop (6.3): the master routes an operator data
+    // op to the guild's owning node over the control channel; a self-owned
+    // guild applies through the local facade directly.
+    setDataOpForwarder(async (kind, req) => {
+      const shardId = guildIdToShardId(req.guildId, registry.shardCount);
+      const owner = registry.shardTable.get(shardId);
+      if (!owner) return { ok: false, code: 'not-owner', error: `shard ${shardId} is unassigned` };
+      const node = registry.nodes.get(owner.nodeId);
+      if (!node || (!node.connected && !node.isSelf)) {
+        return { ok: false, code: 'owner-unreachable', error: 'owning instance is not connected' };
+      }
+      if (node.isSelf) {
+        return kind === 'write'
+          ? applyOperatorDataWrite(req as GuildDataWriteRequest)
+          : applyOperatorDataRead(req as GuildDataReadRequest);
+      }
+      const type = kind === 'write' ? MSG.DATA_WRITE : MSG.DATA_READ;
+      try {
+        const reply = await server!.request(owner.nodeId, type, { term: registry.term, ...req, ...(kind === 'write' ? { origin: 'webui-operator' } : {}) });
+        return reply ?? { ok: false, code: 'owner-unreachable', error: 'empty reply from the owning instance' };
+      } catch (error) {
+        return { ok: false, code: 'owner-unreachable', error: error instanceof Error ? error.message : String(error) };
+      }
+    });
+
     server = new ControlServer({
       getTerm: () => registry.term,
       onRegister: (payload: RegisterPayload, send): RegisterResult => {
@@ -1774,6 +1806,26 @@ async function initCoWorker(init: CommonInit): Promise<FleetContext> {
       }),
       onSyncState: payload => engine.onSyncState(payload),
       onXferControl: (type, data) => executor!.handle(type, data),
+      onDataOp: async (type, data) => {
+        // Webui write/read hop: reject a stale term and verify the lease is
+        // actually held here (mid-handover race protection), then apply
+        // through the local facade.
+        const req = (data ?? {}) as { term?: number; guildId?: string };
+        if (typeof req.term !== 'number' || req.term !== controlClient?.getTerm()) {
+          return { ok: false, code: 'stale-term' };
+        }
+        const current = runtime.getCurrent();
+        if (!current || current.shardCount <= 0 || typeof req.guildId !== 'string') {
+          return { ok: false, code: 'not-owner' };
+        }
+        const shardId = guildIdToShardId(req.guildId, current.shardCount);
+        if (!current.leases.some(l => l.shardId === shardId)) {
+          return { ok: false, code: 'not-owner' };
+        }
+        return type === MSG.DATA_WRITE
+          ? applyOperatorDataWrite(data as GuildDataWriteRequest)
+          : applyOperatorDataRead(data as GuildDataReadRequest);
+      },
       onDataBackend: info => {
         void (async () => {
           try {

@@ -7,6 +7,7 @@ import { RegisteredButtonInfo, RegisteredDropdownInfo, RegisteredModalInfo, Regi
 import { getPanelManager } from './utils/panelManager';
 import { setupPanelIPCHandlers } from './utils/ipcPanelHandler';
 import { setupCommandIPCHandlers } from './utils/ipcCommandHandler';
+import { setupDataIPCHandlers } from './utils/ipcDataHandler';
 import { setupAccessLogChannel } from './utils/accessLogChannel';
 import { setupMetricsIPCHandlers } from './utils/ipcMetricsHandler';
 import { setupFleetIPCHandlers } from './utils/ipcFleetHandler';
@@ -658,6 +659,9 @@ async function main() {
 
   // Set up IPC handler for console `cmd invoke` (synthetic slash-command dispatch)
   setupCommandIPCHandlers();
+
+  // Set up IPC handlers for the webui's guild data write/read hops (6.3)
+  setupDataIPCHandlers();
 
   // Set up the optional access-log channel (embed + dev-only shutdown buttons)
   setupAccessLogChannel(client);
