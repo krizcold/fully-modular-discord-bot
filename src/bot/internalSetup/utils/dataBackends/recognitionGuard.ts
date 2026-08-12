@@ -107,7 +107,14 @@ export async function verifyStoreIdentity(url: string): Promise<{ ok: true } | {
   const dbStoreId = await readStoreId(url);
   const marker = readFileMarker();
   if (marker?.storeId && dbStoreId && marker.storeId !== dbStoreId) {
-    return { ok: false, reason: `the configured database is not the one this deployment's data lives in (store ${dbStoreId} vs recorded ${marker.storeId})` };
+    // The binding only protects data that actually lives (or is mid-window
+    // converting) in postgres. On a quiet live:file marker it is residue from
+    // an aborted or abandoned window: rebind instead of refusing.
+    if (marker.live === 'postgres' || marker.transformationId !== null) {
+      return { ok: false, reason: `the configured database is not the one this deployment's data lives in (store ${dbStoreId} vs recorded ${marker.storeId})` };
+    }
+    writeFileMarker({ ...marker, storeId: dbStoreId });
+    return { ok: true };
   }
   if (marker?.live === 'postgres' && marker.storeId && dbStoreId === null) {
     return { ok: false, reason: 'the marker records data living in postgres but the configured database carries no store identity' };

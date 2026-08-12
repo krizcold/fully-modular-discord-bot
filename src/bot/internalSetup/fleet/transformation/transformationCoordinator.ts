@@ -29,6 +29,7 @@ import {
 import { guildIdToShardId } from '../placement';
 import { DataBackendKind, loadCredentials, resolveDataBackend } from '../../../../utils/envLoader';
 import { currentRouteDefault, applyRouteOverrides } from '../../utils/dataBackends/routeResolver';
+import { readFileMarker, writeFileMarker } from '../../utils/dataBackends/recognitionGuard';
 import { ensureTransformationRuntime } from '../../utils/dataBackends/boot';
 import { getGuildDataBackend } from '../../utils/dataManager';
 import { PostgresBackend, writeBackendState, readStoreId } from '../../utils/dataBackends/postgresBackend';
@@ -188,6 +189,7 @@ export class TransformationCoordinator {
     } else if (rec.state === 'PLANNING') {
       rec.state = 'ABORTED';
       rec.error = 'master restarted during PLANNING';
+      this.clearWindowMarker();
     }
     await this.persist();
     this.applyMasterRoutes();
@@ -219,6 +221,15 @@ export class TransformationCoordinator {
       if (!node.connected) return { ok: false, error: `node ${node.nodeName} is not connected` };
     }
 
+    // A file-source window means postgres holds no live data: any recorded
+    // store binding is residue from an earlier era. Clearing it BEFORE the
+    // runtime starts routes identity through the self-retrying adoption loop
+    // (a one-shot rebind can lose a write race with the window stamp below).
+    if (source === 'file') {
+      const marker = readFileMarker();
+      if (marker?.storeId) writeFileMarker({ ...marker, storeId: null });
+    }
+
     // Both directions involve the database (destination or source).
     const ensure = ensureTransformationRuntime();
     if (!ensure.ok) return { ok: false, error: ensure.error };
@@ -245,9 +256,26 @@ export class TransformationCoordinator {
     };
     this.record = record;
     await this.persist();
+    // Window stamp: lets the store-identity guard tell a mid-window restart
+    // (mismatch must refuse) from stale residue on a quiet live:file marker.
+    this.stampWindowMarker(record.id);
     await this.transition('CONVERTING');
     void this.driveConverting();
     return { ok: true, transformationId: record.id };
+  }
+
+  private stampWindowMarker(id: string): void {
+    const marker = readFileMarker();
+    if (marker) writeFileMarker({ ...marker, transformationId: id });
+  }
+
+  /** Terminal without a flip: the window stamp (and, when the live backend stayed file, the adopted store binding) no longer protects anything. */
+  private clearWindowMarker(): void {
+    const marker = readFileMarker();
+    if (!marker) return;
+    const clearStore = marker.live === 'file';
+    if (marker.transformationId === null && (!clearStore || marker.storeId === null)) return;
+    writeFileMarker({ ...marker, transformationId: null, storeId: clearStore ? null : marker.storeId });
   }
 
   pause(): { ok: boolean; error?: string } {
@@ -433,6 +461,7 @@ export class TransformationCoordinator {
         this.record.state = 'ABORTED';
         this.record.updatedAt = Date.now();
         await this.persist();
+        this.clearWindowMarker();
         this.applyMasterRoutes();
         this.hooks.pushStatus();
         console.log(`[Transform] Aborted: converted guilds reverted to ${sourceOf(this.record.direction)}`);
