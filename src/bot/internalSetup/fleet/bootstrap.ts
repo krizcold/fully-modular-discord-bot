@@ -1873,10 +1873,13 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   });
 
   // Owner-info source for .owner manifests (dataManager cannot import fleet).
+  // Epoch comes from the master's own LEASE, not the global counter: ownership
+  // rows fenced with a newer-than-lease epoch would depose this node's own
+  // later hydration claims (which are lease-minted).
   setOwnerInfoProvider(() => ({
     nodeId,
     term: registry.term,
-    epoch: registry.epoch,
+    epoch: runtime.getCurrent()?.epoch ?? registry.epoch,
     shardCount: registry.shardCount,
   }));
 
