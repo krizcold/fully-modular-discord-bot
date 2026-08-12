@@ -7,6 +7,7 @@ import type { ModuleConfigSchema, ConfigFieldSchema } from '../../types/moduleTy
 // Use dist/bot/config.json in production, src/bot/config.json in development
 const isProd = process.env.NODE_ENV !== 'development';
 const rootConfigPath = isProd ? dataPath('dist', 'bot', 'config.json') : path.join(__dirname, '../../config.json');
+export const ROOT_CONFIG_PATH = rootConfigPath;
 
 /**
  * Schema for main bot config (config.json)

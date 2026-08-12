@@ -8,6 +8,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { createHash } from 'crypto';
 import { DATA_ROOT, dataPath } from '../../../utils/dataRoot';
+import { ROOT_CONFIG_PATH } from '../utils/configManager';
 import { getSourceModulesDir } from '../utils/pathHelpers';
 import { FLEET_DIR, SYNC_MAX_FILE_BYTES } from './constants';
 import { getAppVersion } from './nodeIdentity';
@@ -80,7 +81,10 @@ function scopeRelFiles(scope: SyncFileScope): string[] {
   const root = scopeRoot(scope);
   switch (scope) {
     case 'config': {
-      return fs.existsSync(dataPath('config.json')) ? ['config.json'] : [];
+      // Development's root config lives outside DATA_ROOT (shared checkout): rel escapes and the scope stays empty.
+      const rel = toRelPosix(DATA_ROOT, ROOT_CONFIG_PATH);
+      if (rel.startsWith('..') || path.isAbsolute(rel)) return [];
+      return fs.existsSync(ROOT_CONFIG_PATH) ? [rel] : [];
     }
     case 'appstore': {
       const files: string[] = [];
@@ -131,7 +135,7 @@ export function isPathInScope(scope: SyncFileScope, rel: string): boolean {
   const low = rel.toLowerCase();
   switch (scope) {
     case 'config':
-      return low === 'config.json';
+      return low === 'config.json' || low === 'dist/bot/config.json';
     case 'appstore':
       return low !== 'cache' && !low.startsWith('cache/');
     case 'settings':
