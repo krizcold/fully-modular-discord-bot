@@ -22,7 +22,7 @@ import {
 } from './constants';
 import { DataBackendInfo, HeartbeatPayload, LeaseGrantPayload, LeaseInfo, LeaseRenewedPayload, LeaseRevokePayload, MSG, NodeCapabilities, NodeDrainPayload, NodeRole, RegisterPayload, RegisterResult } from './protocol';
 import { getAppVersion, getNodeId, getNodeName, isStandalone, resolveNodeRole, wasNodeIdFreshlyGenerated } from './nodeIdentity';
-import { createControlStore, PostgresControlStore } from './postgresControlStore';
+import { prepareControlStore, PostgresControlStore } from './postgresControlStore';
 import { Registry, RegistryNode } from './registry';
 import { ControlServer } from './controlServer';
 import { ControlClient } from './controlClient';
@@ -280,7 +280,7 @@ function isValidHeldLeases(held: NonNullable<RegisterPayload['heldLeases']>): bo
 async function initMaster(init: CommonInit & { standalone: boolean }): Promise<FleetContext> {
   const { standalone, nodeId, nodeName, appVersion, capabilities, runtime } = init;
   const ingest = getIngestService();
-  const store = createControlStore(standalone);
+  const store = await prepareControlStore(standalone);
   // A control-store fence trip means a second master owns the schema: this
   // master stops granting entirely (the higher-term master is the healthy one).
   let controlFenced = false;

@@ -4,11 +4,14 @@
 // one schema; the store latches fenced, fires onFenced, and refuses further
 // writes (the higher-term master is the healthy one).
 
-import { Pool, PoolClient } from 'pg';
+import * as fs from 'fs';
+import { Client, Pool, PoolClient } from 'pg';
 import { loadCredentials, resolveDataBackend } from '../../../utils/envLoader';
+import { dataPath } from '../../../utils/dataRoot';
 import { getGuildDataBackend } from '../utils/dataManager';
 import { PostgresBackend } from '../utils/dataBackends/postgresBackend';
-import { FileControlStore } from './fileControlStore';
+import { FileControlStore, atomicWriteFileSync } from './fileControlStore';
+import { FLEET_DIR } from './constants';
 import type {
   ControlStore,
   PersistedMigrations,
@@ -22,6 +25,13 @@ import type {
 
 const ACQUIRE_RETRY_BASE_MS = 1000;
 const ACQUIRE_RETRY_CAP_MS = 30_000;
+const SEED_RETRY_MS = 5000;
+
+// While it exists, the control plane lives in smdb_control; a file-mode boot
+// that finds it must export the documents back before serving.
+const MOVED_SENTINEL = () => dataPath('global', FLEET_DIR, 'control-store-moved.json');
+
+const DOC_NAMES = ['plan', 'registry', 'migrations', 'reshard-pending', 'redistribute-proposal'] as const;
 
 const CONTROL_DDL = [
   `CREATE SCHEMA IF NOT EXISTS smdb_control`,
@@ -122,6 +132,77 @@ export class PostgresControlStore implements ControlStore {
       return { term: Number(res.rows[0].term), nodeId: res.rows[0].node_id, updatedAt: Number(res.rows[0].updated_at) };
     } finally {
       client.release();
+    }
+  }
+
+  /**
+   * File -> postgres control-plane move, run BEFORE acquireTerm on a
+   * non-standalone postgres-mode master boot. Gated on FRESHNESS, not row
+   * absence: whenever the file-store term exceeds the control-store term the
+   * whole document set is mirrored in verbatim (stale rows with no file
+   * counterpart are deleted, so an obsolete era can never resurrect). The
+   * moved sentinel is ensured either way. Holds with backoff while the
+   * database cannot be asked or a file document is unreadable.
+   */
+  async seedFromFileStore(): Promise<void> {
+    const fileStore = new FileControlStore();
+    for (let logged = false; ; ) {
+      const client = await this.pool.connect().catch(() => null);
+      if (client) {
+        try {
+          await this.ensureProvisioned(client);
+          const fileTerm = (await fileStore.getTerm())?.term ?? 0;
+          const res = await client.query(`SELECT term FROM smdb_control.term WHERE id = 1`);
+          const pgTerm = res.rows.length > 0 ? Number(res.rows[0].term) : 0;
+          if (fileTerm > pgTerm) {
+            const marker = await fileStore.loadReshardMarker();
+            if (marker === 'corrupt') {
+              throw new Error('reshard-pending.json is unreadable; refusing to seed past an unreadable pause marker');
+            }
+            const docs: Record<string, string | null> = {
+              'plan': jsonOrNull(await fileStore.loadPlan()),
+              'registry': jsonOrNull(await fileStore.loadRegistry()),
+              'migrations': jsonOrNull(await fileStore.loadMigrations()),
+              'reshard-pending': jsonOrNull(marker),
+              'redistribute-proposal': jsonOrNull(await fileStore.loadRedistributeProposal()),
+            };
+            await client.query('BEGIN');
+            const now = Date.now();
+            const fileTermRow = await fileStore.getTerm();
+            await client.query(
+              `INSERT INTO smdb_control.term (id, term, node_id, updated_at) VALUES (1, $1, $2, $3)
+               ON CONFLICT (id) DO UPDATE SET term = EXCLUDED.term, node_id = EXCLUDED.node_id, updated_at = EXCLUDED.updated_at`,
+              [fileTerm, fileTermRow?.nodeId ?? 'seed', now]);
+            for (const name of DOC_NAMES) {
+              const body = docs[name];
+              if (body === null) {
+                await client.query(`DELETE FROM smdb_control.docs WHERE name = $1`, [name]);
+              } else {
+                await client.query(
+                  `INSERT INTO smdb_control.docs (name, body, updated_at) VALUES ($1, $2, $3)
+                   ON CONFLICT (name) DO UPDATE SET body = EXCLUDED.body, updated_at = EXCLUDED.updated_at`,
+                  [name, body, now]);
+              }
+            }
+            await client.query(`DELETE FROM smdb_control.docs WHERE name = 'superseded'`);
+            await client.query('COMMIT');
+            console.log(`[Fleet] Control store seeded from files (term ${fileTerm} over ${pgTerm})`);
+          }
+          if (!fs.existsSync(MOVED_SENTINEL())) {
+            atomicWriteFileSync(MOVED_SENTINEL(), JSON.stringify({ movedAt: Date.now() }, null, 2));
+          }
+          return;
+        } catch (error) {
+          await client.query('ROLLBACK').catch(() => { /* not in a txn */ });
+          console.warn('[Fleet] Control-store seeding failed; retrying:', error instanceof Error ? error.message : error);
+        } finally {
+          client.release();
+        }
+      } else if (!logged) {
+        console.warn('[Fleet] Waiting on control store to seed from files (unreachable)');
+        logged = true;
+      }
+      await sleep(SEED_RETRY_MS);
     }
   }
 
@@ -311,6 +392,96 @@ export function createControlStore(standalone: boolean): ControlStore {
   // the master process alive so the web UI can serve the diagnosis.
   console.error('[Fleet] Postgres control store unavailable (data backend not constructed); falling back to the embedded file store');
   return new FileControlStore();
+}
+
+/**
+ * Boot-time control-store preparation, run before acquireTerm:
+ * - postgres store: freshness-gated seeding from the file store (5.3 step 3).
+ * - file store on a non-standalone master with the moved sentinel present:
+ *   export the control documents back from smdb_control first (5.3 reverse),
+ *   fail-closed - the boot HOLDS on unreachable, empty, or stale postgres.
+ */
+export async function prepareControlStore(standalone: boolean): Promise<ControlStore> {
+  const store = createControlStore(standalone);
+  if (store instanceof PostgresControlStore) {
+    await store.seedFromFileStore();
+  } else if (!standalone && fs.existsSync(MOVED_SENTINEL())) {
+    await exportBackToFileStore();
+  }
+  return store;
+}
+
+async function exportBackToFileStore(): Promise<void> {
+  const creds = loadCredentials();
+  const url = (creds.CONTROL_STORE_URL || '').trim() || (creds.DATA_BACKEND_URL || '').trim();
+  const fileStore = new FileControlStore();
+  for (let logged = false; ; ) {
+    if (!url) {
+      if (!logged) {
+        console.error('[Fleet] Control store was moved to postgres but no DATA_BACKEND_URL/CONTROL_STORE_URL is set; boot holds until one is restored');
+        logged = true;
+      }
+      await sleep(SEED_RETRY_MS);
+      continue;
+    }
+    const client = new Client({ connectionString: url, connectionTimeoutMillis: 5000 });
+    try {
+      await client.connect();
+      const termRes = await client.query(`SELECT term, node_id, updated_at FROM smdb_control.term WHERE id = 1`);
+      const fileTerm = (await fileStore.getTerm())?.term ?? 0;
+      // Zero rows or a term below the local files = the same hold as
+      // unreachable: a silent no-op copy would delete the sentinel and let
+      // the pre-seed file plan resurrect an obsolete topology.
+      if (termRes.rows.length === 0 || Number(termRes.rows[0].term) < fileTerm) {
+        throw new Error(termRes.rows.length === 0
+          ? 'smdb_control carries no term row'
+          : `smdb_control term ${termRes.rows[0].term} is below the local file term ${fileTerm}`);
+      }
+      const docsRes = await client.query(`SELECT name, body FROM smdb_control.docs WHERE name = ANY($1)`, [[...DOC_NAMES]]);
+      const bodies = new Map<string, string>(docsRes.rows.map((row: any) => [row.name, row.body]));
+
+      atomicWriteFileSync(dataPath('global', FLEET_DIR, 'term.json'), JSON.stringify({
+        term: Number(termRes.rows[0].term),
+        nodeId: termRes.rows[0].node_id,
+        updatedAt: Number(termRes.rows[0].updated_at),
+      }, null, 2));
+      const fileFor: Record<string, string> = {
+        'plan': 'leases.json',
+        'registry': 'registry.json',
+        'migrations': 'migrations.json',
+        'reshard-pending': 'reshard-pending.json',
+        'redistribute-proposal': 'redistribute-proposal.json',
+      };
+      for (const name of DOC_NAMES) {
+        const target = dataPath('global', FLEET_DIR, fileFor[name]);
+        const body = bodies.get(name);
+        if (body === undefined) {
+          try { fs.unlinkSync(target); } catch { /* absent on both sides */ }
+        } else {
+          atomicWriteFileSync(target, JSON.stringify(JSON.parse(body), null, 2));
+        }
+      }
+      await client.query(
+        `INSERT INTO smdb_control.docs (name, body, updated_at) VALUES ('superseded', $1, $2)
+         ON CONFLICT (name) DO UPDATE SET body = EXCLUDED.body, updated_at = EXCLUDED.updated_at`,
+        [JSON.stringify({ at: Date.now() }), Date.now()]);
+      fs.unlinkSync(MOVED_SENTINEL());
+      console.log('[Fleet] Control store exported back to files; sentinel cleared');
+      return;
+    } catch (error) {
+      if (!logged) {
+        console.warn('[Fleet] Control-store export-back holding boot:', error instanceof Error ? error.message : error);
+        logged = true;
+      }
+    } finally {
+      await client.end().catch(() => { /* best effort */ });
+    }
+    await sleep(SEED_RETRY_MS);
+  }
+}
+
+function jsonOrNull(value: unknown): string | null {
+  return value === null || value === undefined ? null : JSON.stringify(value);
 }
 
 function sleep(ms: number): Promise<void> {
