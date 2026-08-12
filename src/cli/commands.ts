@@ -187,6 +187,20 @@ const HANDLERS: Record<string, Handler> = {
   // Dev-only fault hook (route is inert unless FLEET_DEV_HOOKS=1 on the bot).
   'fleet corrupt-lease': (c) => simple(c, 'POST', '/api/fleet/dev/corrupt-lease', { shardId: flagInt(c.flags, 'shard', -1) }),
 
+  // --- backend transformation (spec 3.2) ---
+  'transform start': (c) => {
+    const direction = flagStr(c.flags, 'direction');
+    return simple(c, 'POST', '/api/fleet/transform', direction ? { direction } : {});
+  },
+  'transform pause': (c) => simple(c, 'POST', '/api/fleet/transform/pause'),
+  'transform resume': (c) => simple(c, 'POST', '/api/fleet/transform/resume'),
+  'transform abort': (c) => simple(c, 'POST', '/api/fleet/transform/abort'),
+  'transform status': (c) =>
+    simple(c, 'GET', '/api/fleet/state', undefined, (b) => {
+      const t = (b as { transformation?: unknown }).transformation;
+      console.log(JSON.stringify(t ?? null, null, 2));
+    }),
+
   // --- data bundle round-trip (local disk, same primitives as tools/dataBundle) ---
   'bundle export': (c) => bundleExport(c),
   'bundle import': (c) => bundleImport(c),

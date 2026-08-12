@@ -764,6 +764,46 @@ export class BotManager {
     }
   }
 
+  /** Start the backend transformation (any master incl. standalone; validated in the bot child). */
+  async startFleetTransformation(payload: any): Promise<any> {
+    try {
+      return await this.sendIPCMessage('fleet:transform:start', payload ?? {});
+    } catch (error) {
+      console.error('[BotManager] Error starting transformation:', error);
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  /** Pause the active transformation after the in-flight guild finishes. */
+  async pauseFleetTransformation(): Promise<any> {
+    try {
+      return await this.sendIPCMessage('fleet:transform:pause', {});
+    } catch (error) {
+      console.error('[BotManager] Error pausing transformation:', error);
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  /** Resume a paused transformation at its cursors. */
+  async resumeFleetTransformation(): Promise<any> {
+    try {
+      return await this.sendIPCMessage('fleet:transform:resume', {});
+    } catch (error) {
+      console.error('[BotManager] Error resuming transformation:', error);
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  /** Abort: reverses the converted prefix (allowed until the flip persists). */
+  async abortFleetTransformation(): Promise<any> {
+    try {
+      return await this.sendIPCMessage('fleet:transform:abort', {});
+    } catch (error) {
+      console.error('[BotManager] Error aborting transformation:', error);
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
   /** Dev fault hook: corrupt a held lease id on this node (drill P2.8). */
   async corruptFleetLease(shardId: number): Promise<any> {
     return await this.sendIPCMessage('fleet:dev:corruptLease', { shardId });

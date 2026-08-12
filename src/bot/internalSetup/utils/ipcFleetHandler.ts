@@ -16,6 +16,10 @@ import {
   fleetResumeAssignments,
   fleetSyncBump,
   fleetDevCorruptLease,
+  fleetTransformStart,
+  fleetTransformPause,
+  fleetTransformResume,
+  fleetTransformAbort,
 } from '../fleet/bootstrap';
 import type { StartPayload } from '../fleet/migration/migrationCoordinator';
 
@@ -99,6 +103,28 @@ export function setupFleetIPCHandlers(): void {
         }
         case 'fleet:migrations': {
           response = { success: true, migrations: fleetMigrationsList() };
+          break;
+        }
+        case 'fleet:transform:start': {
+          const direction = message.data?.direction;
+          const payload = direction === 'file-to-postgres' || direction === 'postgres-to-file' ? { direction } : {};
+          const result = await fleetTransformStart(payload);
+          response = result.ok ? { success: true, transformationId: result.transformationId } : { success: false, error: result.error };
+          break;
+        }
+        case 'fleet:transform:pause': {
+          const result = fleetTransformPause();
+          response = result.ok ? { success: true } : { success: false, error: result.error };
+          break;
+        }
+        case 'fleet:transform:resume': {
+          const result = await fleetTransformResume();
+          response = result.ok ? { success: true } : { success: false, error: result.error };
+          break;
+        }
+        case 'fleet:transform:abort': {
+          const result = await fleetTransformAbort();
+          response = result.ok ? { success: true } : { success: false, error: result.error };
           break;
         }
         case 'fleet:dev:corruptLease': {

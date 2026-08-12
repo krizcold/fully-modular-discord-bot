@@ -207,6 +207,72 @@ export function createFleetRoutes(botManager: BotManager): Router {
   });
 
   /**
+   * POST /api/fleet/transform { direction? }
+   * Start the backend transformation (any master incl. standalone). The
+   * direction is derived from where the data lives; a supplied one is
+   * validated against it.
+   */
+  router.post('/transform', async (req: Request, res: Response) => {
+    try {
+      if (!botManager.isRunning()) {
+        res.json({ success: false, error: 'Bot is not running' });
+        return;
+      }
+      const direction = typeof req.body?.direction === 'string' ? { direction: req.body.direction } : {};
+      const result = await botManager.startFleetTransformation(direction);
+      res.json(result?.success ? { success: true, transformationId: result.transformationId } : { success: false, error: result?.error ?? 'transform start failed' });
+    } catch (error) {
+      console.error('[Fleet] Failed to start transformation:', error instanceof Error ? error.message : error);
+      res.json({ success: false, error: error instanceof Error ? error.message : 'transform start failed' });
+    }
+  });
+
+  /** POST /api/fleet/transform/pause - lets the in-flight guild finish, then holds. */
+  router.post('/transform/pause', async (_req: Request, res: Response) => {
+    try {
+      if (!botManager.isRunning()) {
+        res.json({ success: false, error: 'Bot is not running' });
+        return;
+      }
+      const result = await botManager.pauseFleetTransformation();
+      res.json(result?.success ? { success: true } : { success: false, error: result?.error ?? 'pause failed' });
+    } catch (error) {
+      console.error('[Fleet] Failed to pause transformation:', error instanceof Error ? error.message : error);
+      res.json({ success: false, error: error instanceof Error ? error.message : 'pause failed' });
+    }
+  });
+
+  /** POST /api/fleet/transform/resume - re-enters at the cursors. */
+  router.post('/transform/resume', async (_req: Request, res: Response) => {
+    try {
+      if (!botManager.isRunning()) {
+        res.json({ success: false, error: 'Bot is not running' });
+        return;
+      }
+      const result = await botManager.resumeFleetTransformation();
+      res.json(result?.success ? { success: true } : { success: false, error: result?.error ?? 'resume failed' });
+    } catch (error) {
+      console.error('[Fleet] Failed to resume transformation:', error instanceof Error ? error.message : error);
+      res.json({ success: false, error: error instanceof Error ? error.message : 'resume failed' });
+    }
+  });
+
+  /** POST /api/fleet/transform/abort - reverses the converted prefix (refused after the flip). */
+  router.post('/transform/abort', async (_req: Request, res: Response) => {
+    try {
+      if (!botManager.isRunning()) {
+        res.json({ success: false, error: 'Bot is not running' });
+        return;
+      }
+      const result = await botManager.abortFleetTransformation();
+      res.json(result?.success ? { success: true } : { success: false, error: result?.error ?? 'abort failed' });
+    } catch (error) {
+      console.error('[Fleet] Failed to abort transformation:', error instanceof Error ? error.message : error);
+      res.json({ success: false, error: error instanceof Error ? error.message : 'abort failed' });
+    }
+  });
+
+  /**
    * POST /api/fleet/dev/corrupt-lease { shardId }
    * Dev fault hook (drill P2.8): corrupt a held lease so the next renew reports
    * lease-mismatch. Inert unless FLEET_DEV_HOOKS=1 on the bot; never a 500.
