@@ -1,6 +1,6 @@
-// Which backend serves a guild's data. Default-only for now: per-guild
-// overrides exist only while a backend transformation is active and are
-// delivered with that machinery.
+// Which backend serves a guild's data. Per-guild overrides exist only while a
+// backend transformation is active: converted guilds route to the destination,
+// everything else follows the default.
 
 import { resolveDataBackend, DataBackendKind } from '../../../../utils/envLoader';
 
@@ -9,15 +9,35 @@ import { resolveDataBackend, DataBackendKind } from '../../../../utils/envLoader
 // the other one, until a transformation actually moves the data.
 let forcedDefault: DataBackendKind | null = null;
 
+const overrides = new Map<string, DataBackendKind>();
+
 export function forceRouteDefault(kind: DataBackendKind | null): void {
   forcedDefault = kind;
 }
 
-export function routeFor(_guildId: string): DataBackendKind {
-  return forcedDefault ?? resolveDataBackend();
+export function setRouteOverride(guildId: string, kind: DataBackendKind): void {
+  overrides.set(guildId, kind);
 }
 
-/** The default every guild currently routes to (the node's LIVE backend). */
+export function clearRouteOverride(guildId: string): void {
+  overrides.delete(guildId);
+}
+
+/** Replace the whole override map (delivered routing map; null/empty clears). */
+export function applyRouteOverrides(routes: { guildId: string; backend: DataBackendKind }[] | null): void {
+  overrides.clear();
+  for (const route of routes ?? []) overrides.set(route.guildId, route.backend);
+}
+
+export function getRouteOverrides(): { guildId: string; backend: DataBackendKind }[] {
+  return [...overrides.entries()].map(([guildId, backend]) => ({ guildId, backend }));
+}
+
+export function routeFor(guildId: string): DataBackendKind {
+  return overrides.get(guildId) ?? forcedDefault ?? resolveDataBackend();
+}
+
+/** The default every non-overridden guild currently routes to (the node's LIVE backend). */
 export function currentRouteDefault(): DataBackendKind {
   return forcedDefault ?? resolveDataBackend();
 }
