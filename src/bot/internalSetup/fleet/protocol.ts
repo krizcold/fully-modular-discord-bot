@@ -145,6 +145,7 @@ export interface LeaseGrantPayload {
   /** Present only while a transformation is active: the full routing map, applied before hydration. */
   transformationId?: string;
   dataRoutes?: { guildId: string; backend: 'file' | 'postgres' }[];
+  dataBackendUrl?: string;
 }
 
 export interface LeaseRevokePayload {
@@ -401,6 +402,8 @@ export interface TransformGuildPayload {
   direction: 'file-to-postgres' | 'postgres-to-file';
   /** Absent = convert. 'retire-source' runs the RETIRING pass for this guild on its owner. */
   phase?: 'convert' | 'retire-source';
+  /** Connection string for a node whose env never carried it (C5: authed control channel is the secret lane). */
+  url?: string;
 }
 
 export interface TransformGuildAckPayload {
@@ -413,6 +416,8 @@ export interface BackendFlipPayload {
   backend: 'file' | 'postgres';
   transformationId: string;
   term: number;
+  /** Connection string so a zero-guild node can still construct the runtime it flips to. */
+  url?: string;
 }
 
 export interface BackendFlipAckPayload {

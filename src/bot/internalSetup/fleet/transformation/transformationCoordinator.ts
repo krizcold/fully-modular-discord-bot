@@ -92,6 +92,13 @@ export class TransformationCoordinator {
     return this.hasActive() ? this.record!.id : null;
   }
 
+  /** Post-flip cleanup phase: the one window Declare Lost stays allowed (skips the lost node's retires). */
+  isRetiring(): boolean {
+    const rec = this.record;
+    if (!rec) return false;
+    return rec.state === 'RETIRING' || (rec.state === 'PAUSED' && rec.pausedFrom === 'RETIRING');
+  }
+
   /**
    * Per-guild routing overrides the window needs: the converted prefix routes
    * to the destination (during ABORTING, the not-yet-reverted slice). Empty
@@ -505,7 +512,7 @@ export class TransformationCoordinator {
         console.warn('[Transform] Could not write the database-side backend marker (informational):', error instanceof Error ? error.message : error);
       }
     }
-    const flip: BackendFlipPayload = { backend: dest, transformationId: rec.id, term: rec.term };
+    const flip: BackendFlipPayload = { backend: dest, transformationId: rec.id, term: rec.term, ...(url ? { url } : {}) };
     for (const node of this.hooks.registry.nodes.values()) {
       if (!node.connected) continue;
       try {
@@ -529,6 +536,8 @@ export class TransformationCoordinator {
 
   private async sendTransform(nodeId: string, payload: TransformGuildPayload): Promise<TransformGuildAckPayload> {
     try {
+      const url = (loadCredentials().DATA_BACKEND_URL || '').trim();
+      if (url) payload = { ...payload, url };
       const ack = await this.hooks.sendControl(nodeId, MSG.TRANSFORM_GUILD, payload, TRANSFORM_GUILD_TIMEOUT_MS);
       if (ack && typeof ack.ok === 'boolean') return ack as TransformGuildAckPayload;
       return { ok: false, reason: 'malformed ack' };

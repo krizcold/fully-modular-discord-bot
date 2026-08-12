@@ -22,7 +22,7 @@ import {
   guildDirExists,
 } from '../../utils/dataBackends/fileBackend';
 import { setRouteOverride } from '../../utils/dataBackends/routeResolver';
-import { getActiveBackendUrl, applyBackendFlip } from '../../utils/dataBackends/boot';
+import { getActiveBackendUrl, applyBackendFlip, ensureRuntimeWith } from '../../utils/dataBackends/boot';
 import { PostgresBackend } from '../../utils/dataBackends/postgresBackend';
 import { importNamespace } from '../../utils/dataInterchange';
 import { DATA_ROOT } from '../../../../utils/dataRoot';
@@ -41,6 +41,7 @@ import {
 } from './convertEngine';
 
 const SOURCE_FLUSH_DEADLINE_MS = 30000;
+const RUNTIME_READY_WAIT_MS = 15000;
 
 export interface TransformationExecutorOptions {
   getTerm: () => number;
@@ -65,13 +66,15 @@ export class TransformationExecutor {
     if (payload.phase === 'retire-source') return this.retireSource(payload);
 
     const sourceIsFile = direction === 'file-to-postgres';
-    const url = getActiveBackendUrl();
-    const backend = getGuildDataBackend() as PostgresBackend | null;
     // Either direction needs the postgres runtime: as the destination it must
     // be able to serve the guild the moment its route flips; as the source it
-    // must be readable to export.
-    if (!url || !backend || !getWorkingSet()) return { ok: false, reason: 'postgres-runtime-not-ready' };
-    if (!backend.healthy()) return { ok: false, reason: 'database-unreachable' };
+    // must be readable to export. A node whose env never carried the URL
+    // constructs it from the payload-delivered one.
+    if (getActiveBackendUrl() === null && payload.url) ensureRuntimeWith(payload.url);
+    const url = getActiveBackendUrl();
+    if (!url) return { ok: false, reason: 'postgres-runtime-not-ready' };
+    if (!(await this.waitPostgresReady(RUNTIME_READY_WAIT_MS))) return { ok: false, reason: 'database-unreachable' };
+    const backend = getGuildDataBackend() as PostgresBackend;
     const fence = fenceFromOwnerInfo(guildId);
     if (!fence) return { ok: false, reason: 'no-fence' };
 
@@ -158,9 +161,22 @@ export class TransformationExecutor {
 
   private async handleBackendFlip(payload: BackendFlipPayload): Promise<BackendFlipAckPayload> {
     if (payload.term !== this.opts.getTerm()) return { ok: false };
+    if (payload.backend === 'postgres' && getActiveBackendUrl() === null && payload.url) {
+      ensureRuntimeWith(payload.url);
+    }
     applyBackendFlip(payload.backend);
     this.opts.onFlipped?.(payload.backend);
     await sweepTransformStaging(null);
     return { ok: true };
+  }
+
+  private async waitPostgresReady(boundMs: number): Promise<boolean> {
+    const deadline = Date.now() + boundMs;
+    for (; ;) {
+      const backend = getGuildDataBackend();
+      if (backend && getWorkingSet() && backend.healthy()) return true;
+      if (Date.now() >= deadline) return false;
+      await new Promise(resolve => setTimeout(resolve, 500).unref());
+    }
   }
 }

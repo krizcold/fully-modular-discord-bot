@@ -53,13 +53,16 @@ import {
   GuildDataWriteRequest,
   setDataOpForwarder,
 } from '../utils/ipcDataHandler';
-import { applyDeliveredBackend } from '../utils/dataBackends/boot';
+import { applyDeliveredBackend, ensureRuntimeWith } from '../utils/dataBackends/boot';
 import { setLeaseDeclineHandler } from '../utils/dataBackends/dataReadiness';
-import { currentRouteDefault } from '../utils/dataBackends/routeResolver';
-import { loadCredentials, resolveDataBackend } from '../../../utils/envLoader';
+import { applyRouteOverrides, currentRouteDefault } from '../utils/dataBackends/routeResolver';
+import { loadCredentials, resolveDataBackend, upsertCredentials } from '../../../utils/envLoader';
 import { MigrationDisposition, resolveIncomingWithMaster, resumeSourceGraveyarding, runResidueSweep } from './migration/residueSweep';
 import { MigrationCoordinator, PrecheckResult, StartPayload } from './migration/migrationCoordinator';
 import { MigrationExecutor } from './migration/migrationExecutor';
+import { TransformationCoordinator } from './transformation/transformationCoordinator';
+import { TransformationExecutor } from './transformation/transformationExecutor';
+import type { TransformDirection } from './controlStore';
 import { planPinRestoreLegs } from './placement';
 import { TRANSFER_PORT_DEFAULT } from './constants';
 
@@ -175,6 +178,33 @@ export async function fleetMigratePrecheck(payload: StartPayload): Promise<Prech
 export function fleetMigrationsList(): MigrationView {
   if (!masterMigrateList) return { active: null, history: [] };
   return masterMigrateList();
+}
+
+// Backend transformation control surface (any master, standalone included - a
+// mismatched standalone deployment transforms itself; null on co-workers).
+let masterTransformStart: ((payload: { direction?: TransformDirection }) => Promise<{ ok: boolean; error?: string; transformationId?: string }>) | null = null;
+let masterTransformPause: (() => { ok: boolean; error?: string }) | null = null;
+let masterTransformResume: (() => Promise<{ ok: boolean; error?: string }>) | null = null;
+let masterTransformAbort: (() => Promise<{ ok: boolean; error?: string }>) | null = null;
+
+export async function fleetTransformStart(payload: { direction?: TransformDirection }): Promise<{ ok: boolean; error?: string; transformationId?: string }> {
+  if (!masterTransformStart) return { ok: false, error: 'This node is not the fleet master' };
+  return masterTransformStart(payload);
+}
+
+export function fleetTransformPause(): { ok: boolean; error?: string } {
+  if (!masterTransformPause) return { ok: false, error: 'This node is not the fleet master' };
+  return masterTransformPause();
+}
+
+export async function fleetTransformResume(): Promise<{ ok: boolean; error?: string }> {
+  if (!masterTransformResume) return { ok: false, error: 'This node is not the fleet master' };
+  return masterTransformResume();
+}
+
+export async function fleetTransformAbort(): Promise<{ ok: boolean; error?: string }> {
+  if (!masterTransformAbort) return { ok: false, error: 'This node is not the fleet master' };
+  return masterTransformAbort();
 }
 
 export async function initFleet(): Promise<FleetContext> {
@@ -317,6 +347,10 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   registry.term = term;
   registry.shardCount = shardCount;
   registry.upsertNode({ nodeId, nodeName, appVersion, capabilities, isSelf: true, send: null });
+
+  // Declared before the recovery self-grant below (grantShardsTo reads it);
+  // constructed after the recovery sources exist.
+  let transformer: TransformationCoordinator | null = null;
 
   const ledger = standalone ? null : new IdentifyLedger(process.env.DISCORD_TOKEN, registry, gateway?.sessionStartLimit ?? null);
 
@@ -553,6 +587,16 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     for (const pending of registry.pendingConfirmation.values()) reuseLeaseIds.set(pending.shardId, pending.leaseId);
     const leases = assignIdentifyDelays(new Map([[node.nodeId, fullShardIds]]), maxConcurrency, reuseLeaseIds).get(node.nodeId) ?? [];
     const grant: LeaseGrantPayload = { term: registry.term, epoch, shardCount: registry.shardCount, leases };
+    const activeTransformationId = transformer?.activeId() ?? null;
+    if (activeTransformationId) {
+      // A shard placed mid-window arrives with the routes (and the URL) it
+      // needs BEFORE hydration - without them a converted guild would be read
+      // from the wrong backend and served empty.
+      grant.transformationId = activeTransformationId;
+      grant.dataRoutes = transformer!.routesView();
+      const url = (loadCredentials().DATA_BACKEND_URL || '').trim();
+      if (url) grant.dataBackendUrl = url;
+    }
 
     if (node.isSelf) {
       const ack = await runtime.applyGrant(grant);
@@ -1316,6 +1360,19 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     try {
       live = currentRouteDefault();
     } catch { /* invalid DATA_BACKEND refused at data boot; deliver file */ }
+    const transformationId = transformer?.activeId() ?? null;
+    if (transformationId) {
+      // Mid-window delivery: the live default plus the routing map and the
+      // URL (a file-default worker still needs the runtime for converted
+      // guilds); post-flip (RETIRING) the changed default IS the flip
+      // instruction for a node that missed the broadcast.
+      return {
+        backend: live,
+        url: (loadCredentials().DATA_BACKEND_URL || '').trim(),
+        transformationId,
+        routes: transformer!.routesView(),
+      };
+    }
     if (live !== 'postgres') return { backend: 'file' };
     return { backend: 'postgres', url: (loadCredentials().DATA_BACKEND_URL || '').trim() };
   }
@@ -1348,6 +1405,34 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   }
 
   const refusedRegistrations: FleetRefusedRegistration[] = [];
+
+  // Backend transformation subsystem (spec 3.2): constructed on EVERY master,
+  // standalone included (C6 - a mismatched standalone deployment transforms
+  // itself). The master is a participant of its own transformation via a
+  // local executor; sendControl mirrors the migration self-participant path.
+  const transformExecutor = new TransformationExecutor({ getTerm: () => registry.term });
+  transformer = new TransformationCoordinator({
+    registry,
+    store,
+    isPaused: () => paused,
+    holdDownRemainingMs: () => (recoverySource ? Math.max(0, recoverySource.holdDownUntil - Date.now()) : 0),
+    migrationActive: () => (coordinator?.hasActive() ?? false) || (selfExecutor?.hasActiveLegs() ?? false),
+    refusedRegistrationsPending: () => refusedRegistrations.length > 0,
+    sendControl: (targetNodeId, type, data, timeoutMs) => {
+      if (registry.nodes.get(targetNodeId)?.isSelf) return transformExecutor.handle(type, data);
+      if (!server) return Promise.reject(new Error(`Node ${targetNodeId} is not reachable (no control server)`));
+      return server.request(targetNodeId, type, data, timeoutMs);
+    },
+    pushStatus: () => pushFleetStatusNow(),
+    persistEnvBackend: backend => {
+      const result = upsertCredentials({ DATA_BACKEND: backend });
+      if (!result.success) console.warn('[Fleet] Could not persist DATA_BACKEND after the flip:', result.error);
+    },
+  });
+  masterTransformStart = payload => transformer!.start(payload);
+  masterTransformPause = () => transformer!.pause();
+  masterTransformResume = () => transformer!.resume();
+  masterTransformAbort = () => transformer!.abort();
 
   if (!standalone) {
     const secret = (process.env.CONTROL_SECRET || '').trim();
@@ -1642,6 +1727,10 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
         }
       },
     });
+    // Transformation crash recovery BEFORE the server accepts registrations,
+    // so the very first register reply already carries the routing map.
+    await transformer.recover().catch(error =>
+      console.error('[Transform] Recovery failed:', error instanceof Error ? error.message : error));
     await server.start(port, secret);
     // Migration crash recovery runs AFTER the P1 plan/registry reload above (the
     // reload seeded registry.shardTable/epoch), so pre-COMMITTING migrations
@@ -1662,6 +1751,8 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     }, graceMs).unref();
   } else {
     console.log(`[Fleet] Role: master (standalone) node=${nodeName} (${nodeId.slice(0, 8)}) term=${term} shards=${shardCount} self-granted`);
+    await transformer.recover().catch(error =>
+      console.error('[Transform] Recovery failed:', error instanceof Error ? error.message : error));
     await distribute();
   }
 
@@ -1792,6 +1883,16 @@ async function initCoWorker(init: CommonInit): Promise<FleetContext> {
       transferPort: () => transferPort,
     });
     migrationWorkActive = () => executor?.hasActiveLegs() ?? false;
+    // Transformation participant: converts its own guilds and applies the
+    // flip; a completed flip refreshes the advertised capability like a
+    // delivered-backend change does.
+    const transformExecutor = new TransformationExecutor({
+      getTerm: () => controlClient?.getTerm() ?? 0,
+      onFlipped: () => {
+        capabilities.dataBackend = resolveDataBackend();
+        controlClient?.sendToMaster(MSG.CAPABILITY_REFRESH, { term: controlClient.getTerm(), capabilities });
+      },
+    });
     controlClient = new ControlClient({
       masterUrl,
       secret,
@@ -1806,6 +1907,13 @@ async function initCoWorker(init: CommonInit): Promise<FleetContext> {
       }),
       onSyncState: payload => engine.onSyncState(payload),
       onXferControl: (type, data) => executor!.handle(type, data),
+      onTransformControl: (type, data) => transformExecutor.handle(type, data),
+      onDataRoutes: (_transformationId, routes, url) => {
+        // Applied before the grant's hydration: a converted shard placed here
+        // mid-window must read its guilds from the destination.
+        applyRouteOverrides(routes);
+        if (url) ensureRuntimeWith(url);
+      },
       onDataOp: async (type, data) => {
         // Webui write/read hop: reject a stale term and verify the lease is
         // actually held here (mid-handover race protection), then apply

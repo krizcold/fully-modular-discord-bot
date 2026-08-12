@@ -172,6 +172,11 @@ export function getActiveBackendUrl(): string | null {
   return activeUrl;
 }
 
+/** Worker-side lazy runtime construction from a control-channel-delivered URL (C5). */
+export function ensureRuntimeWith(url: string): void {
+  if (activeUrl === null && url) startPostgresRuntime(url);
+}
+
 /**
  * Master-side pre-transformation ensure: the destination (or source) postgres
  * runtime must be up before any guild converts or any route flips postgres.
