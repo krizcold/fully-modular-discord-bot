@@ -417,6 +417,128 @@ function FleetMigrationCard({ migration, onChanged }) {
   );
 }
 
+// Backend-transformation card: direction, state badge, per-node conversion
+// (and retirement) progress, failed guilds, Pause/Resume/Abort.
+function FleetTransformationCard({ transformation, api, onChanged }) {
+  const [busy, setBusy] = React.useState(false);
+  const t = transformation;
+  const finished = t.state === 'DONE' || t.state === 'ABORTED';
+  const directionLabel = t.direction === 'postgres-to-file' ? 'database to file' : 'file to database';
+  const badgeStyle = finished
+    ? { background: '#3a3a3a', color: '#bbb' }
+    : t.state === 'PAUSED'
+      ? { background: '#4a3a1a', color: '#fee75c' }
+      : { background: '#2b3a5c', color: '#a0c0f0' };
+  const showRetired = t.state === 'RETIRING' || t.state === 'DONE'
+    || (t.state === 'PAUSED' && t.pausedFrom === 'RETIRING');
+  const canPause = t.state === 'CONVERTING' || t.state === 'ABORTING' || t.state === 'RETIRING';
+  const canResume = t.state === 'PAUSED';
+  const canAbort = t.state === 'CONVERTING'
+    || (t.state === 'PAUSED' && (t.pausedFrom == null || t.pausedFrom === 'CONVERTING'));
+  const buttonStyle = { fontSize: '0.72rem', padding: '2px 8px' };
+
+  const act = (path, successMsg) => {
+    if (busy) return;
+    setBusy(true);
+    api.post(path, {})
+      .then((res) => {
+        if (!res || res.success === false) { showToast((res && res.error) || 'Action failed', 'error'); return; }
+        showToast(successMsg, 'success');
+        if (onChanged) onChanged();
+      })
+      .catch((err) => showToast(err.message || 'Action failed', 'error'))
+      .finally(() => setBusy(false));
+  };
+
+  const abort = () => {
+    if (busy) return;
+    if (!confirm('Abort the backend transformation? Converted guilds will be converted back to the source backend. Nothing is deleted.')) return;
+    act('/fleet/transform/abort', 'Transformation aborting');
+  };
+
+  return (
+    <div className="usage-stat-card" style={{ marginTop: '10px' }}>
+      <div className="usage-stat-title">
+        {`Backend transformation: ${directionLabel}`}
+        <FleetBadge text={t.state} background={badgeStyle.background} color={badgeStyle.color} />
+      </div>
+      {t.error ? <div className="usage-stat-sub" style={{ color: '#ed4245' }}>{t.error}</div> : null}
+      {(t.nodes || []).map((n) => {
+        const convertPct = n.total > 0 ? Math.max(0, Math.min(100, (n.converted / n.total) * 100)) : 0;
+        const retirePct = n.total > 0 ? Math.max(0, Math.min(100, (n.retired / n.total) * 100)) : 0;
+        return (
+          <div key={n.nodeId} style={{ marginTop: '6px' }}>
+            <div className="usage-stat-sub">{`${n.nodeName}: ${n.converted}/${n.total} guilds converted`}</div>
+            <div style={{ height: '6px', background: '#1e1e1e', borderRadius: '3px', overflow: 'hidden' }}>
+              <div style={{ width: `${convertPct}%`, height: '100%', background: '#57f287', transition: 'width 0.3s ease' }} />
+            </div>
+            {showRetired ? (
+              <div style={{ marginTop: '4px' }}>
+                <div className="usage-stat-sub">{`${n.nodeName}: ${n.retired}/${n.total} source copies retired`}</div>
+                <div style={{ height: '6px', background: '#1e1e1e', borderRadius: '3px', overflow: 'hidden' }}>
+                  <div style={{ width: `${retirePct}%`, height: '100%', background: '#a0c0f0', transition: 'width 0.3s ease' }} />
+                </div>
+              </div>
+            ) : null}
+          </div>
+        );
+      })}
+      {(t.failedGuilds || []).length > 0 ? (
+        <div style={{ marginTop: '6px' }}>
+          <div className="usage-stat-sub" style={{ color: '#fee75c' }}>
+            {`${t.failedGuilds.length} guild${t.failedGuilds.length === 1 ? '' : 's'} failed to convert:`}
+          </div>
+          {t.failedGuilds.map((f) => (
+            <div key={f.guildId} className="usage-stat-sub" style={{ color: '#fee75c', fontFamily: 'monospace' }}>
+              {`${f.guildId}: ${f.reason}`}
+            </div>
+          ))}
+        </div>
+      ) : null}
+      {canPause || canResume || canAbort ? (
+        <div style={{ marginTop: '6px', display: 'flex', gap: '6px' }}>
+          {canPause ? <button onClick={() => act('/fleet/transform/pause', 'Transformation pausing')} disabled={busy} style={buttonStyle}>{busy ? 'Working...' : 'Pause'}</button> : null}
+          {canResume ? <button onClick={() => act('/fleet/transform/resume', 'Transformation resumed')} disabled={busy} style={buttonStyle}>{busy ? 'Working...' : 'Resume'}</button> : null}
+          {canAbort ? <button onClick={abort} disabled={busy} className="btn btn-danger" style={buttonStyle}>{busy ? 'Working...' : 'Abort'}</button> : null}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+// Master-only transformation-required banner: the configured DATA_BACKEND
+// names one backend while the guild data still lives in the other.
+function FleetTransformBanner({ dataBoot, transformation, api, onChanged }) {
+  const [busy, setBusy] = React.useState(false);
+  const active = transformation != null && transformation.state !== 'DONE' && transformation.state !== 'ABORTED';
+
+  const start = () => {
+    if (busy) return;
+    if (!confirm('Start the backend transformation? Guilds are converted one at a time (writes to a guild pause for seconds while it converts), verified, then the whole deployment flips to the new backend. You can pause or abort until the flip.')) return;
+    setBusy(true);
+    api.post('/fleet/transform', {})
+      .then((res) => {
+        if (!res || res.success === false) { showToast((res && res.error) || 'Start failed', 'error'); return; }
+        showToast('Transformation started', 'success');
+        if (onChanged) onChanged();
+      })
+      .catch((err) => showToast(err.message || 'Start failed', 'error'))
+      .finally(() => setBusy(false));
+  };
+
+  return (
+    <div className="usage-notice">
+      <div>Backend transformation required</div>
+      <div style={{ marginTop: '4px' }}>{dataBoot.banner}</div>
+      {active ? null : (
+        <button onClick={start} disabled={busy} style={{ marginTop: '6px', fontSize: '0.72rem', padding: '2px 8px' }}>
+          {busy ? 'Starting...' : 'Start transformation'}
+        </button>
+      )}
+    </div>
+  );
+}
+
 // Master-only pin-violation banner: the pinned shard sits off the master. The
 // Swap button submits the proposed legs (never auto-executed); a null proposal
 // shows the no-capacity reason.
@@ -861,6 +983,11 @@ function FleetView({ api, wsClient, guildNames }) {
             Draining: this node's leases were revoked by the operator; it rejoins placement after a restart (re-register).
           </div>
         )}
+        {fleet.dataBoot && fleet.dataBoot.banner && (
+          <div className="usage-notice">
+            {`${fleet.dataBoot.banner} The transformation is started from the master's Usage tab.`}
+          </div>
+        )}
         {fleet.sync && fleet.sync.status === 'waiting-master' && (
           <div className="usage-notice">
             Waiting for master sync: modules and configuration load after the first verified sync from the master.
@@ -1035,6 +1162,17 @@ function FleetView({ api, wsClient, guildNames }) {
         </div>
       )}
 
+      {fleet.dataBoot && fleet.dataBoot.state === 'refused' && (
+        <div className="usage-notice" style={{ borderColor: '#e5534b', color: '#e5534b' }}>
+          <div>The data backend refused to serve requests.</div>
+          <div style={{ marginTop: '4px' }}>{fleet.dataBoot.refusalReason || 'No reason was reported.'}</div>
+        </div>
+      )}
+
+      {fleet.dataBoot && fleet.dataBoot.banner && (
+        <FleetTransformBanner dataBoot={fleet.dataBoot} transformation={fleet.transformation} api={api} onChanged={loadFleet} />
+      )}
+
       <FleetCapacityCard cap={capacitySummary} />
 
       {fleet.budget ? <FleetBudgetCard budget={fleet.budget} /> : null}
@@ -1044,6 +1182,8 @@ function FleetView({ api, wsClient, guildNames }) {
       {fleet.pinViolation ? <FleetPinViolationBanner pin={fleet.pinViolation} dataBackend={fleet.dataBackend} onStarted={loadFleet} /> : null}
 
       {fleet.migration ? <FleetMigrationCard migration={fleet.migration} onChanged={loadFleet} /> : null}
+
+      {fleet.transformation ? <FleetTransformationCard transformation={fleet.transformation} api={api} onChanged={loadFleet} /> : null}
 
       <div className="usage-stat-grid" style={{ marginTop: '14px' }}>
         {nodes.map((node) => (
