@@ -24,8 +24,9 @@ import { isGuildWriteFrozen, writeRawAtomic } from '../../bot/internalSetup/util
 import { dataPath } from '../../utils/dataRoot';
 import { coWorkerReadonlyResponse, isCoWorkerNode } from '../middleware/fleetGate';
 import { nudgeSync } from '../utils/syncNudge';
+import type { BotManager } from '../botManager';
 
-export function createConfigRoutes(): Router {
+export function createConfigRoutes(botManager: BotManager): Router {
   const router = Router();
 
   // A guild id must be a plain Discord snowflake. Anything else ('global',
@@ -155,7 +156,7 @@ export function createConfigRoutes(): Router {
    * Update config file (dynamically discovered)
    * Supports guild-specific config updates via guildId in request body
    */
-  router.post('/update', (req: Request, res: Response) => {
+  router.post('/update', async (req: Request, res: Response) => {
     try {
       const fileId = req.body.file || 'config.json';
       const newConfig = req.body.config;
@@ -207,6 +208,22 @@ export function createConfigRoutes(): Router {
           success: false,
           error: 'Config is not valid JSON'
         });
+        return;
+      }
+
+      // Database-routed guild: the owning bot process applies the write
+      // (mapping mirrors saveGuildConfig); the parent never writes postgres.
+      if (guildId && routeFor(guildId) === 'postgres') {
+        const module = fileId === 'config.json' ? '_guildConfig' : (configInfo.moduleName || '');
+        const filename = fileId === 'config.json' ? 'config.json' : configInfo.id;
+        const reply = await botManager.writeGuildData({
+          guildId,
+          module,
+          filename,
+          op: 'write',
+          contentJson: JSON.stringify(newConfig, null, 2)
+        });
+        sendHopReply(res, reply ?? { ok: false, code: 'bot-down' });
         return;
       }
 
@@ -429,6 +446,31 @@ export function createConfigRoutes(): Router {
         return;
       }
 
+      // File-routed guild with no local guild dir (owned by another node): ask
+      // the bot child to read from the owner. Any miss falls through to the
+      // local template/empty behavior, so reads never get worse than today.
+      if (guildId && isValidGuildId(guildId) && !fs.existsSync(dataPath(guildId))) {
+        const reply = await botManager.readGuildData({
+          guildId,
+          module: metadata.moduleName || '',
+          filename: metadata.id
+        });
+        if (reply?.ok && reply.contentJson) {
+          try {
+            const remoteData = JSON.parse(reply.contentJson);
+            res.json({
+              success: true,
+              data: remoteData,
+              metadata,
+              exists: true
+            });
+            return;
+          } catch {
+            // fall through to local behavior
+          }
+        }
+      }
+
       // Load raw data from file path
       let data: any;
       const filePath = metadata.path;
@@ -469,7 +511,7 @@ export function createConfigRoutes(): Router {
    * Update data file (raw JSON)
    * Supports guild-specific data updates via guildId in request body
    */
-  router.post('/data/update', (req: Request, res: Response) => {
+  router.post('/data/update', async (req: Request, res: Response) => {
     try {
       const fileId = req.body.file;
       const newData = req.body.data;
@@ -483,9 +525,25 @@ export function createConfigRoutes(): Router {
         return;
       }
       // The webui parent never writes postgres; database-routed guild writes
-      // must go through the owning bot process.
+      // go through the owning bot process.
       if (guildId && routeFor(guildId) === 'postgres') {
-        res.status(503).json({ success: false, error: 'Editing this guild\'s data from the web UI is temporarily unavailable in database mode' });
+        if (!fileId) {
+          res.status(400).json({ success: false, error: 'File ID is required' });
+          return;
+        }
+        if (newData === undefined) {
+          res.status(400).json({ success: false, error: 'Data is required' });
+          return;
+        }
+        const { module, filename } = dataHopTarget(fileId, guildId);
+        const reply = await botManager.writeGuildData({
+          guildId,
+          module,
+          filename,
+          op: 'write',
+          contentJson: JSON.stringify(newData, null, 2)
+        });
+        sendHopReply(res, reply ?? { ok: false, code: 'bot-down' });
         return;
       }
       // Co-worker: global data files are synced from the master; only genuine
@@ -585,7 +643,121 @@ export function createConfigRoutes(): Router {
     }
   });
 
+  /**
+   * POST /api/config/data/delete
+   * Delete a guild data file; the bot child applies it on the owning node.
+   */
+  router.post('/data/delete', async (req: Request, res: Response) => {
+    try {
+      const fileId = req.body.file;
+      const guildId = req.body.guildId;
+
+      if (!isValidGuildId(guildId)) {
+        res.status(400).json({ success: false, error: 'A valid guildId is required' });
+        return;
+      }
+      if (!fileId) {
+        res.status(400).json({ success: false, error: 'File ID is required' });
+        return;
+      }
+
+      const { module, filename } = dataHopTarget(fileId, guildId);
+      const reply = await botManager.writeGuildData({
+        guildId,
+        module,
+        filename,
+        op: 'delete'
+      });
+      sendHopReply(res, reply ?? { ok: false, code: 'bot-down' });
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      res.status(500).json({
+        success: false,
+        error: `Failed to delete data file: ${errorMessage}`
+      });
+    }
+  });
+
+  /**
+   * POST /api/config/data/delete-guild
+   * Delete every data file for a guild (namespace removal on the owning node).
+   */
+  router.post('/data/delete-guild', async (req: Request, res: Response) => {
+    try {
+      const guildId = req.body.guildId;
+
+      if (!isValidGuildId(guildId)) {
+        res.status(400).json({ success: false, error: 'A valid guildId is required' });
+        return;
+      }
+
+      const reply = await botManager.writeGuildData({
+        guildId,
+        module: '',
+        filename: '',
+        op: 'delete-namespace'
+      });
+      sendHopReply(res, reply ?? { ok: false, code: 'bot-down' });
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      res.status(500).json({
+        success: false,
+        error: `Failed to delete guild data: ${errorMessage}`
+      });
+    }
+  });
+
   return router;
+}
+
+/**
+ * Same (module, filename) mapping as serveGuildDataFromReader: schema metadata
+ * wins, otherwise 'module/file.json' style ids split on the slash.
+ */
+function dataHopTarget(fileId: string, guildId: string): { module: string; filename: string } {
+  const metadata = getDataFileMetadata(fileId, guildId);
+  const parts = fileId.split('/');
+  return {
+    module: metadata ? (metadata.moduleName || '') : (parts.length >= 2 ? parts[0] : ''),
+    filename: metadata ? metadata.id : parts[parts.length - 1]
+  };
+}
+
+/**
+ * Map a guild-write/read hop reply (bot child IPC) onto the HTTP response.
+ */
+function sendHopReply(res: Response, reply: any): void {
+  if (reply && reply.ok) {
+    if (reply.pending) {
+      res.status(202).json({ success: true, pending: true, message: 'saved, not yet confirmed durable' });
+    } else {
+      res.status(200).json({ success: true });
+    }
+    return;
+  }
+  const detail = reply && typeof reply.error === 'string' ? reply.error : undefined;
+  switch (reply?.code) {
+    case 'frozen':
+      res.status(503).json({ success: false, error: 'Guild data is frozen for a shard migration; retry after it completes' });
+      return;
+    case 'not-owner':
+    case 'owner-unreachable':
+    case 'stale-term':
+      res.status(503).json({ success: false, error: 'guild temporarily unavailable' });
+      return;
+    case 'backend-unavailable':
+      res.status(503).json({ success: false, error: detail || 'the database backend is unavailable' });
+      return;
+    case 'bot-down':
+      res.status(503).json({ success: false, error: 'the bot process is not running' });
+      return;
+    case 'invalid':
+      res.status(400).json({ success: false, error: detail || 'Invalid request' });
+      return;
+    default:
+      res.status(500).json({ success: false, error: detail || 'Guild data operation failed' });
+      return;
+  }
 }
 
 /**

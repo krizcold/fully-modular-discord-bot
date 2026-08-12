@@ -107,12 +107,14 @@ function ConfigPanel({ isCoWorker }) {
       if (res.success) {
         setConfigFiles(res.files);
         setError(null);
+        return res.files;
       } else {
         setError(res.error || 'Failed to load config files');
       }
     } catch (err) {
       setError(err.message);
     }
+    return [];
   }
 
   async function loadConfig(fileId) {
@@ -287,12 +289,78 @@ function ConfigPanel({ isCoWorker }) {
     }
   }
 
+  async function refreshAfterDelete() {
+    const files = await loadConfigFiles();
+    const stillListed = (files || []).some(f => f.id === selectedFile);
+    if (stillListed) {
+      await loadConfig(selectedFile);
+      await loadBackups(selectedFile);
+    } else {
+      const nextData = (files || []).find(f => f.category === 'data');
+      if (nextData) {
+        setSelectedFile(nextData.id);
+      } else {
+        setSelectedFile(null);
+        setConfig(null);
+        setConfigText('');
+      }
+    }
+  }
+
+  async function handleDeleteFile() {
+    const currentContext = guildContextOptions.find(o => o.value === guildContext);
+    const guildId = currentContext?.guildId || null;
+    if (!guildId || !selectedFile) return;
+
+    const selectedInfo = configFiles.find(f => f.id === selectedFile);
+    if (!confirm(`Delete data file "${selectedInfo?.name || selectedFile}" for guild ${guildId}?`)) return;
+
+    try {
+      setSaving(true);
+      const res = await api.post('/config/data/delete', { file: selectedFile, guildId });
+      if (res.success) {
+        setSuccess(res.pending ? `Delete accepted: ${res.message}` : 'Data file deleted');
+        await refreshAfterDelete();
+      } else {
+        setError(res.error || 'Failed to delete data file');
+      }
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function handleDeleteGuildData() {
+    const currentContext = guildContextOptions.find(o => o.value === guildContext);
+    const guildId = currentContext?.guildId || null;
+    if (!guildId) return;
+
+    if (!confirm(`Delete ALL data for guild ${guildId}? This removes every data file stored for this guild. Deleted data is kept restorable for 14 days (the graveyard) before it is permanently removed.`)) return;
+
+    try {
+      setSaving(true);
+      const res = await api.post('/config/data/delete-guild', { guildId });
+      if (res.success) {
+        setSuccess(res.pending ? `Delete accepted: ${res.message}` : 'All data for this guild was deleted');
+        await refreshAfterDelete();
+      } else {
+        setError(res.error || 'Failed to delete guild data');
+      }
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
   if (loading && !config) {
     return <FirstLoadPlaceholder label="Loading config…" />;
   }
 
   const selectedFileInfo = configFiles.find(f => f.id === selectedFile);
   const readOnlyContext = !!isCoWorker && guildContext === 'system';
+  const currentGuildId = guildContextOptions.find(o => o.value === guildContext)?.guildId || null;
 
   return (
     <div>
@@ -519,14 +587,42 @@ function ConfigPanel({ isCoWorker }) {
         </div>
 
         {!readOnlyContext && (
-          <button
-            onClick={handleSave}
-            className="btn btn-primary"
-            disabled={saving || !!jsonError}
-            style={disabledButtonStyle(saving || !!jsonError)}
-          >
-            {saving ? 'Saving…' : '💾 Save Config'}
-          </button>
+          <div style={{display: 'flex', gap: '10px', flexWrap: 'wrap'}}>
+            <button
+              onClick={handleSave}
+              className="btn btn-primary"
+              disabled={saving || !!jsonError}
+              style={disabledButtonStyle(saving || !!jsonError)}
+            >
+              {saving ? 'Saving…' : '💾 Save Config'}
+            </button>
+            {currentGuildId && selectedFileInfo?.category === 'data' && selectedFileInfo?.exists && (
+              <button
+                onClick={handleDeleteFile}
+                className="btn btn-danger"
+                disabled={saving}
+                style={disabledButtonStyle(saving)}
+              >
+                🗑️ Delete File
+              </button>
+            )}
+          </div>
+        )}
+
+        {!readOnlyContext && currentGuildId && selectedFileType === 'data' && (
+          <div style={{marginTop: '20px', paddingTop: '15px', borderTop: '1px solid #333'}}>
+            <button
+              onClick={handleDeleteGuildData}
+              className="btn btn-danger"
+              disabled={saving}
+              style={disabledButtonStyle(saving)}
+            >
+              🗑️ Delete all data for this guild
+            </button>
+            <div style={{color: '#999', fontSize: '0.85rem', marginTop: '6px'}}>
+              Removes every data file for this guild. Deleted data stays restorable for 14 days.
+            </div>
+          </div>
         )}
       </div>
 

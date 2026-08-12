@@ -282,7 +282,7 @@ export async function createServer(botManager: BotManager): Promise<Express> {
   // Authelia when managed, or the localhost bind when standalone); requireAuth passes.
   app.use('/api/bot', requireAuth, createControlRoutes(botManager));
   app.use('/api/setup', requireAuth, createSetupRoutes());
-  app.use('/api/config', requireAuth, createConfigRoutes());
+  app.use('/api/config', requireAuth, createConfigRoutes(botManager));
   app.use('/api/appstore', requireAuth, blockWritesOnCoWorker, createAppStoreRoutes(botManager));
   app.use('/api/panels', requireAuth, createPanelRoutes(botManager));
   app.use('/api/commands', requireAuth, createCommandRoutes(botManager));
