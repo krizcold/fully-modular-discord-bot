@@ -480,6 +480,7 @@ export class TransformationCoordinator {
         this.record.state = 'DONE';
         this.record.updatedAt = Date.now();
         await this.persist();
+        this.applyMasterRoutes();
         this.hooks.pushStatus();
         console.log('[Transform] DONE: source data retired (graveyard TTL applies)');
       }
@@ -496,6 +497,8 @@ export class TransformationCoordinator {
     await this.transition('FLIPPING');
     await this.completeFlip();
     await this.transition('RETIRING');
+    // The flipped default now covers every guild; drop the override map.
+    this.applyMasterRoutes();
     void this.driveRetiring();
   }
 

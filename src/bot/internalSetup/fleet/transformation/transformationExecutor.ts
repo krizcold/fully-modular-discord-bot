@@ -147,8 +147,11 @@ export class TransformationExecutor {
         const moved = await graveyardGuildDir(guildId, reason);
         return moved ? { ok: true } : { ok: false, reason: 'graveyard rename failed' };
       }
-      const backend = getGuildDataBackend() as PostgresBackend | null;
-      if (!backend) return { ok: false, reason: 'postgres-runtime-not-ready' };
+      // A node that flipped to file may never have constructed the runtime
+      // (offline at the broadcast); the retire message carries the URL.
+      if (getActiveBackendUrl() === null && payload.url) ensureRuntimeWith(payload.url);
+      if (!(await this.waitPostgresReady(RUNTIME_READY_WAIT_MS))) return { ok: false, reason: 'postgres-runtime-not-ready' };
+      const backend = getGuildDataBackend() as PostgresBackend;
       const fence = fenceFromOwnerInfo(guildId);
       if (!fence) return { ok: false, reason: 'no-fence' };
       const res = await backend.retireGuild(guildId, reason, fence);
