@@ -3,9 +3,11 @@
 // CURRENT-TERM LEASE. The master's self-granted leases run through the same
 // runtime as a co-worker's remote grants.
 
+import * as fs from 'fs';
 import { monitorEventLoopDelay, IntervalHistogram } from 'perf_hooks';
 import { Status } from 'discord.js';
 import type { Client } from 'discord.js';
+import { DATA_ROOT } from '../../../utils/dataRoot';
 import { getMetricsCollector } from '../utils/metrics/metricsCollector';
 import { getDataReadiness } from '../utils/dataBackends/dataReadiness';
 import { getGuildDataBackend } from '../utils/dataManager';
@@ -35,6 +37,28 @@ export interface CurrentLease {
 // caller's await path (client.destroy() stalls while a shard is mid-connect,
 // which would time out the assign request and leave the gateway thrashing).
 const GATEWAY_SYNC_DEBOUNCE_MS = 1500;
+
+// Sampled off the heartbeat path (statfs is async); feeds the postgres-to-file
+// transformation space precheck. undefined until the first sample lands or
+// when the platform lacks statfs.
+const FREE_DISK_SAMPLE_MS = 60_000;
+let cachedFreeDiskBytes: number | undefined;
+let freeDiskSamplerStarted = false;
+
+function startFreeDiskSampler(): void {
+  if (freeDiskSamplerStarted) return;
+  freeDiskSamplerStarted = true;
+  const sample = async (): Promise<void> => {
+    try {
+      const st = await (fs.promises as any).statfs(DATA_ROOT);
+      if (st && Number.isFinite(st.bavail) && Number.isFinite(st.bsize)) {
+        cachedFreeDiskBytes = st.bavail * st.bsize;
+      }
+    } catch { /* unsupported platform; stays undefined */ }
+  };
+  void sample();
+  setInterval(() => void sample(), FREE_DISK_SAMPLE_MS).unref();
+}
 
 export class LeaseRuntime {
   private current: CurrentLease | null = null;
@@ -244,6 +268,7 @@ export class LeaseRuntime {
       metrics = getMetricsCollector().getHeartbeatSnapshot();
     } catch { /* metrics must never take the control channel down */ }
     const backend = getGuildDataBackend();
+    startFreeDiskSampler();
     const hb: HeartbeatPayload = {
       term,
       seq: ++this.seq,
@@ -253,6 +278,7 @@ export class LeaseRuntime {
       metrics,
       load: this.sampleLoad(),
       ...(backend ? { dataBackendHealthy: backend.healthy() } : {}),
+      ...(cachedFreeDiskBytes !== undefined ? { freeDiskBytes: cachedFreeDiskBytes } : {}),
     };
     this.lastHeartbeat = hb;
     return hb;

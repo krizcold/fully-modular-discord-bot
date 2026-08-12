@@ -47,6 +47,8 @@ export interface RegistryNode {
   syncAppliedRevision: number | null;
   /** Last heartbeat's data-backend reachability; null when unreported (file mode). */
   dataBackendHealthy: boolean | null;
+  /** Free bytes on the node's data volume from its last heartbeat; null when unreported. */
+  freeDiskBytes: number | null;
   /** False while the node's last reconcile ended degraded; null when unreported. */
   syncOk: boolean | null;
   send: ((message: object) => void) | null;
@@ -123,6 +125,7 @@ export class Registry {
       syncAppliedRevision: existing?.syncAppliedRevision ?? null,
       syncOk: existing?.syncOk ?? null,
       dataBackendHealthy: existing?.dataBackendHealthy ?? null,
+      freeDiskBytes: existing?.freeDiskBytes ?? null,
       send: input.send,
     };
     this.nodes.set(input.nodeId, node);
@@ -158,6 +161,7 @@ export class Registry {
       syncAppliedRevision: null,
       syncOk: null,
       dataBackendHealthy: null,
+      freeDiskBytes: null,
       send: null,
     };
     this.nodes.set(input.nodeId, node);
@@ -185,6 +189,7 @@ export class Registry {
     if (Number.isInteger(hb.syncAppliedRevision)) node.syncAppliedRevision = hb.syncAppliedRevision!;
     if (typeof hb.syncOk === 'boolean') node.syncOk = hb.syncOk;
     if (typeof hb.dataBackendHealthy === 'boolean') node.dataBackendHealthy = hb.dataBackendHealthy;
+    if (Number.isFinite(hb.freeDiskBytes)) node.freeDiskBytes = hb.freeDiskBytes!;
     this.replaceNodeGuilds(nodeId, Array.isArray(hb.guilds) ? hb.guilds : []);
     this.adoptHeartbeatClaims(nodeId, hb);
   }
