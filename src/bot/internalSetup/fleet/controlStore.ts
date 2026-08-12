@@ -125,6 +125,52 @@ export interface RedistributeProposal {
   updatedAt: number;
 }
 
+/** Master-side backend transformation state machine states (spec 3.2). */
+export type TransformationState =
+  | 'PLANNING'
+  | 'CONVERTING'
+  | 'FLIPPING'
+  | 'RETIRING'
+  | 'PAUSED'
+  | 'ABORTING'
+  | 'DONE'
+  | 'ABORTED';
+
+export type TransformDirection = 'file-to-postgres' | 'postgres-to-file';
+
+export interface TransformationNodePlan {
+  nodeId: string;
+  /** Owned-guild snapshot at PLANNING, ascending numeric. */
+  guilds: string[];
+  /** Guilds that appeared during the window (source-routed until FLIPPING). */
+  joined: string[];
+  /** Position in guilds concat joined; entries before it are converted. */
+  cursor: number;
+  /** Position in guilds concat joined for the RETIRING pass. */
+  retireCursor?: number;
+  /** Cursor value when ABORTING began: the reverse pass covers entries [0, abortLimit). */
+  abortLimit?: number;
+}
+
+/**
+ * Persisted transformation record (crash recovery). FLIPPING is written BEFORE
+ * the flip broadcast leaves - the same both-or-neither barrier migrations use
+ * for COMMITTING.
+ */
+export interface TransformationRecord {
+  id: string;
+  direction: TransformDirection;
+  state: TransformationState;
+  term: number;
+  nodes: TransformationNodePlan[];
+  /** State the operation was in when it paused; PAUSED resumes back into it. */
+  pausedFrom?: TransformationState;
+  error?: string;
+  failedGuilds?: { guildId: string; reason: string }[];
+  createdAt: number;
+  updatedAt: number;
+}
+
 export interface ControlStore {
   /** CAS-acquire a new master term: strictly greater than any previously stored term. */
   acquireTerm(nodeId: string): Promise<number>;
@@ -145,4 +191,7 @@ export interface ControlStore {
   /** Persist the redistribute assignment proposal for masterResume; null clears it. */
   saveRedistributeProposal(proposal: RedistributeProposal | null): Promise<void>;
   loadRedistributeProposal(): Promise<RedistributeProposal | null>;
+  /** Persist the backend transformation record (every state transition); null clears it. */
+  saveTransformation(record: TransformationRecord | null): Promise<void>;
+  loadTransformation(): Promise<TransformationRecord | null>;
 }

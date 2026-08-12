@@ -5,7 +5,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { dataPath } from '../../../utils/dataRoot';
 import { FLEET_DIR } from './constants';
-import type { ControlStore, PersistedMigrations, PersistedPlan, PersistedRegistry, PersistedTerm, RedistributeProposal, ReshardArchive, ReshardMarker } from './controlStore';
+import type { ControlStore, PersistedMigrations, PersistedPlan, PersistedRegistry, PersistedTerm, RedistributeProposal, ReshardArchive, ReshardMarker, TransformationRecord } from './controlStore';
 
 export function atomicWriteFileSync(file: string, contents: string): void {
   fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -137,5 +137,20 @@ export class FileControlStore implements ControlStore {
     const parsed = readJson<RedistributeProposal>(this.file('redistribute-proposal.json'));
     if (!parsed || typeof parsed.proposal !== 'object' || parsed.proposal === null) return null;
     return { proposal: parsed.proposal, updatedAt: Number(parsed.updatedAt) || 0 };
+  }
+
+  async saveTransformation(record: TransformationRecord | null): Promise<void> {
+    const file = this.file('transformation.json');
+    if (record === null) {
+      try { fs.unlinkSync(file); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+      return;
+    }
+    atomicWriteFileSync(file, JSON.stringify(record, null, 2));
+  }
+
+  async loadTransformation(): Promise<TransformationRecord | null> {
+    const parsed = readJson<TransformationRecord>(this.file('transformation.json'));
+    if (!parsed || typeof parsed.id !== 'string' || !Array.isArray(parsed.nodes)) return null;
+    return parsed;
   }
 }

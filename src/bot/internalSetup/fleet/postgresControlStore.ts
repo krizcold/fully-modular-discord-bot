@@ -21,6 +21,7 @@ import type {
   RedistributeProposal,
   ReshardArchive,
   ReshardMarker,
+  TransformationRecord,
 } from './controlStore';
 
 const ACQUIRE_RETRY_BASE_MS = 1000;
@@ -31,7 +32,7 @@ const SEED_RETRY_MS = 5000;
 // that finds it must export the documents back before serving.
 const MOVED_SENTINEL = () => dataPath('global', FLEET_DIR, 'control-store-moved.json');
 
-const DOC_NAMES = ['plan', 'registry', 'migrations', 'reshard-pending', 'redistribute-proposal'] as const;
+const DOC_NAMES = ['plan', 'registry', 'migrations', 'reshard-pending', 'redistribute-proposal', 'transformation'] as const;
 
 const CONTROL_DDL = [
   `CREATE SCHEMA IF NOT EXISTS smdb_control`,
@@ -165,6 +166,7 @@ export class PostgresControlStore implements ControlStore {
               'migrations': jsonOrNull(await fileStore.loadMigrations()),
               'reshard-pending': jsonOrNull(marker),
               'redistribute-proposal': jsonOrNull(await fileStore.loadRedistributeProposal()),
+              'transformation': jsonOrNull(await fileStore.loadTransformation()),
             };
             await client.query('BEGIN');
             const now = Date.now();
@@ -357,6 +359,23 @@ export class PostgresControlStore implements ControlStore {
     if (!parsed || typeof parsed.proposal !== 'object' || parsed.proposal === null) return null;
     return { proposal: parsed.proposal, updatedAt: Number(parsed.updatedAt) || 0 };
   }
+
+  async saveTransformation(record: TransformationRecord | null): Promise<void> {
+    if (record === null) {
+      await this.deleteDoc('transformation');
+      return;
+    }
+    await this.fencedWrite(client => this.upsertDoc(client, 'transformation', JSON.stringify(record)));
+  }
+
+  async loadTransformation(): Promise<TransformationRecord | null> {
+    const body = await this.readDoc('transformation');
+    if (body === null) return null;
+    let parsed: TransformationRecord;
+    try { parsed = JSON.parse(body) as TransformationRecord; } catch { return null; }
+    if (!parsed || typeof parsed.id !== 'string' || !Array.isArray(parsed.nodes)) return null;
+    return parsed;
+  }
 }
 
 /**
@@ -451,6 +470,7 @@ async function exportBackToFileStore(): Promise<void> {
         'migrations': 'migrations.json',
         'reshard-pending': 'reshard-pending.json',
         'redistribute-proposal': 'redistribute-proposal.json',
+        'transformation': 'transformation.json',
       };
       for (const name of DOC_NAMES) {
         const target = dataPath('global', FLEET_DIR, fileFor[name]);
