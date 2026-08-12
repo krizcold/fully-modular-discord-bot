@@ -5,6 +5,7 @@ import { IPC_TIMEOUT_MS, IPC_TIMEOUT_MODULE_OP_MS } from './constants';
 import type { WebSocketManager, WSEvent, WSEventData } from './websocketManager';
 import { getSafetyManager } from '../utils/updateSafety';
 import { resetAppStoreManager } from '../bot/internalSetup/utils/appStoreManager';
+import { applyRouteOverrides } from '../bot/internalSetup/utils/dataBackends/routeResolver';
 
 export interface BotStartResult {
   success: boolean;
@@ -262,6 +263,12 @@ export class BotManager {
             this.wsManager.broadcast('bot:metrics:snapshot', message.data);
           }
         } else if (message.type === 'fleet:status') {
+          // The parent's route resolver follows the bot's routing map so
+          // /list and /data/get branch per guild during a transformation
+          // window (absent or empty clears any overrides).
+          try {
+            applyRouteOverrides(Array.isArray(message.data?.dataRouting) ? message.data.dataRouting : null);
+          } catch { /* status push must never fail */ }
           if (this.wsManager) {
             this.wsManager.broadcast('bot:fleet:status', message.data);
           }

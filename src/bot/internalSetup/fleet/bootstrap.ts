@@ -1868,6 +1868,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     refusedRegistrations: standalone ? null : refusedRegistrations,
     sync: syncAuthority ? () => ({ revision: syncAuthority!.getRevision(), status: 'n/a' as const }) : null,
     migration: coordinator ? () => coordinator!.getView() : null,
+    transformation: () => transformer?.getView() ?? null,
     pinViolation: standalone ? null : () => pinViolation,
   });
 
@@ -2049,6 +2050,7 @@ async function initCoWorker(init: CommonInit): Promise<FleetContext> {
     refusedRegistrations: null,
     sync: syncEngine ? () => syncEngine!.getSyncState() : null,
     migration: null,
+    transformation: null,
     pinViolation: null,
   });
 

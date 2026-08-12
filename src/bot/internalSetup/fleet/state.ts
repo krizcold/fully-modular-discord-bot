@@ -12,6 +12,9 @@ import type { HealthMonitor, LossEvent } from './healthMonitor';
 import type { IdentifyLedger } from './identifyLedger';
 import type { IngestService } from '../ingest/ingestService';
 import { resolveDataBackend } from '../../../utils/envLoader';
+import { getRouteOverrides } from '../utils/dataBackends/routeResolver';
+import { getDataBootStatus, DataBootStatus } from '../utils/dataBackends/boot';
+import type { TransformationView } from './transformation/transformationCoordinator';
 
 export interface FleetStateNode {
   nodeId: string;
@@ -101,8 +104,10 @@ export interface FleetState {
   shardSource: 'discord' | 'override';
   /** Deployment-default data backend (resolveDataBackend()). */
   dataBackend: 'file' | 'postgres';
-  /** Per-guild routing overrides while a backend transformation is active; delivered with that machinery. */
+  /** Per-guild routing overrides while a backend transformation is active (this process's live resolver). */
   dataRouting?: { guildId: string; backend: 'file' | 'postgres' }[];
+  /** Data-layer boot status: transformation-required banner, refusals; drives the Fleet-tab transformation surface. */
+  dataBoot: DataBootStatus;
   recommendedShards: number | null;
   capacity: number;
   onHold: boolean;
@@ -172,6 +177,8 @@ export interface FleetState {
   guildMap: Record<string, number>;
   /** Active/recent migration status (master-only content); null when the subsystem is inert (standalone) or idle. */
   migration: MigrationView | null;
+  /** Backend transformation status (any master incl. standalone); null on co-workers and when none has run. */
+  transformation: TransformationView | null;
   /** Pin-restore proposal when the pinned shard sits off the master; null otherwise (master-only, never auto-executed). */
   pinViolation: PinViolationView | null;
   /** Names for guilds in guildMap the connected clients cannot name (master's REST list); merged UI-side. */
@@ -219,6 +226,8 @@ export interface FleetStateSources {
   sync: (() => FleetState['sync']) | null;
   /** Migration view supplier (fleet master only); null standalone and on co-workers. */
   migration: (() => MigrationView | null) | null;
+  /** Transformation view supplier (any master incl. standalone); null on co-workers. */
+  transformation: (() => TransformationView | null) | null;
   /** Pin-violation supplier (fleet master only); null otherwise. */
   pinViolation: (() => PinViolationView | null) | null;
 }
@@ -266,6 +275,8 @@ export function getFleetState(): FleetState {
       shardCount: 0,
       shardSource: getShardSource(),
       dataBackend: resolveDataBackend(),
+      dataRouting: getRouteOverrides(),
+      dataBoot: getDataBootStatus(),
       recommendedShards: null,
       capacity: resolveShardCapacity(),
       onHold: false,
@@ -284,6 +295,7 @@ export function getFleetState(): FleetState {
       shardTable: [],
       guildMap: {},
       migration: null,
+      transformation: null,
       pinViolation: null,
       updatedAt: Date.now(),
     };
@@ -360,6 +372,8 @@ export function getFleetState(): FleetState {
       shardCount: registry.shardCount,
       shardSource: getShardSource(),
       dataBackend: resolveDataBackend(),
+      dataRouting: getRouteOverrides(),
+      dataBoot: getDataBootStatus(),
       recommendedShards,
       capacity,
       onHold: false,
@@ -392,6 +406,7 @@ export function getFleetState(): FleetState {
       guildMap: { ...Object.fromEntries(registry.restGuildShards), ...Object.fromEntries(registry.guildMap) },
       guildNames: Object.fromEntries(registry.restGuildNames),
       migration: sources.migration?.() ?? null,
+      transformation: sources.transformation?.() ?? null,
       pinViolation: sources.pinViolation?.() ?? null,
       updatedAt: Date.now(),
     };
@@ -448,6 +463,8 @@ export function getFleetState(): FleetState {
     shardCount,
     shardSource: getShardSource(),
     dataBackend: resolveDataBackend(),
+    dataRouting: getRouteOverrides(),
+    dataBoot: getDataBootStatus(),
     recommendedShards,
     capacity,
     onHold,
@@ -490,6 +507,7 @@ export function getFleetState(): FleetState {
     shardTable,
     guildMap,
     migration: null,
+    transformation: null,
     pinViolation: null,
     updatedAt: Date.now(),
   };
