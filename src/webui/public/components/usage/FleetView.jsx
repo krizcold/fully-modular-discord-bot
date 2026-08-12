@@ -959,6 +959,12 @@ function FleetView({ api, wsClient, guildNames }) {
         {fleet.pinTestGuildShard && fleet.pinnedShardId != null ? ` · shard ${fleet.pinnedShardId} pinned to master` : ''}
       </div>
 
+      {fleet.controlStoreFenced && (
+        <div className="usage-notice" style={{ borderColor: '#e5534b', color: '#e5534b' }}>
+          {`CRITICAL: another master (term ${fleet.controlStoreFenced.observedTerm}) owns this fleet's control store. This master has stopped granting shards. Keep exactly one master per control store, then restart this instance.`}
+        </div>
+      )}
+
       {fleet.role === 'co-worker' && !fleet.masterKnown && (
         <div className="usage-notice">Master unreachable, retrying...</div>
       )}

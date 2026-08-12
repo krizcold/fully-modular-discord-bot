@@ -92,6 +92,8 @@ export interface FleetState {
   nodeId: string;
   nodeName: string;
   appVersion: string;
+  /** CRITICAL: a control-store write observed a foreign term (two masters on one schema); granting is stopped until restart. */
+  controlStoreFenced: { observedTerm: number; at: number } | null;
   protocolVersion: number;
   term: number;
   epoch: number;
@@ -188,6 +190,14 @@ export interface FleetRecoverySource {
   reshardPaused: { from: number | null; to: number | null; archivedAt: number | null } | null;
 }
 
+// Control-store fence trip (two masters on one schema). Latched until restart,
+// like the granting stop it accompanies; set by the master's onFenced hook.
+let controlStoreFenced: { observedTerm: number; at: number } | null = null;
+
+export function _setControlStoreFenced(observedTerm: number): void {
+  controlStoreFenced = { observedTerm, at: Date.now() };
+}
+
 export interface FleetStateSources {
   role: NodeRole;
   standalone: boolean;
@@ -249,6 +259,7 @@ export function getFleetState(): FleetState {
       nodeId: '',
       nodeName: '',
       appVersion: '',
+      controlStoreFenced: null,
       protocolVersion: PROTOCOL_VERSION,
       term: 0,
       epoch: 0,
@@ -342,6 +353,7 @@ export function getFleetState(): FleetState {
       nodeId,
       nodeName,
       appVersion,
+      controlStoreFenced,
       protocolVersion: PROTOCOL_VERSION,
       term: registry.term,
       epoch: registry.epoch,
@@ -429,6 +441,7 @@ export function getFleetState(): FleetState {
     nodeId,
     nodeName,
     appVersion,
+    controlStoreFenced: null,
     protocolVersion: PROTOCOL_VERSION,
     term,
     epoch: lease?.epoch ?? 0,

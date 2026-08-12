@@ -41,7 +41,7 @@ import {
   resolveShardCount,
 } from './placement';
 import { evaluateRecovery } from './recovery';
-import { _setFleetStateSources, FleetRecoverySource, FleetRefusedRegistration, getFleetState } from './state';
+import { _setControlStoreFenced, _setFleetStateSources, FleetRecoverySource, FleetRefusedRegistration, getFleetState } from './state';
 import type { MigrationView, PinViolationView } from './state';
 import { serveSyncRequest, SyncAuthority } from './syncAuthority';
 import { SyncEngine } from './syncEngine';
@@ -287,7 +287,9 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   if (store instanceof PostgresControlStore) {
     store.onFenced(observedTerm => {
       controlFenced = true;
+      _setControlStoreFenced(observedTerm);
       console.error(`[Fleet] MASTER DEPOSED BY CONTROL STORE: term ${observedTerm} observed; granting stopped until restart`);
+      pushFleetStatusNow();
     });
   }
   // Shards declined for hydration-timeout: held UNPLACED while the data
