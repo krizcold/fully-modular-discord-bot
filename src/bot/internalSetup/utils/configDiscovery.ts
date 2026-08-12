@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { dataPath } from '../../../utils/dataRoot';
+import { dataExists, listGuildDataKeys } from './dataManager';
 import type { ModuleConfigSchema, DataFileMetadata, DataFileSchema } from '../../types/moduleTypes';
 
 // Detect production environment
@@ -226,7 +227,7 @@ export function discoverGuildConfigFiles(guildId: string): ConfigFileMetadata[] 
       name: schema.name,
       description: schema.description,
       category: 'config',
-      exists: fs.existsSync(guildPath),
+      exists: dataExists(schema.id, { guildId, category: schema.moduleName! }),
       default: schema.default,
       schema: schema.schema,
       moduleName: schema.moduleName
@@ -602,7 +603,7 @@ export function discoverGuildDataFiles(guildId: string): DataFileMetadata[] {
                 name: dataFile.name,
                 description: dataFile.description,
                 category: 'data',
-                exists: fs.existsSync(guildPath),
+                exists: dataExists(dataFile.id, { guildId, category: moduleName }),
                 required: dataFile.required,
                 template: dataFile.template,
                 scope: dataFile.scope,
@@ -618,37 +619,70 @@ export function discoverGuildDataFiles(guildId: string): DataFileMetadata[] {
     }
 
     // Also scan for any existing files that might not have schemas
-    const guildDir = dataPath(guildId);
-    if (fs.existsSync(guildDir)) {
-      const existingFiles = scanDirectoryRecursive(guildDir, 'data', '', undefined, true);
+    const backendKeys = listGuildDataKeys(guildId);
+    if (backendKeys !== null) {
+      // Postgres-routed guild: the working set is the file listing. Mirror the
+      // fs scan rules: skip guild-root docs and underscore-prefixed internal
+      // namespaces, .json only.
+      for (const backendKey of backendKeys) {
+        const keyModule = backendKey.module;
+        if (keyModule === '' || keyModule.startsWith('_')) continue;
+        const filename = backendKey.filename.split('/').pop()!;
+        if (!filename.endsWith('.json')) continue;
+        const key = `${keyModule}/${filename}`;
 
-      for (const file of existingFiles) {
-        // Extract module name from path (e.g., "moduleName/file.json")
-        const pathParts = file.id.split('/');
-        if (pathParts.length >= 2) {
-          const key = `${pathParts[0]}/${pathParts[pathParts.length - 1]}`;
+        if (configFileIds.has(key)) {
+          continue;
+        }
 
-          // Skip if this is a config file (defined in configSchema)
-          if (configFileIds.has(key)) {
-            continue;
-          }
+        if (!discovered.has(key)) {
+          discovered.set(key, {
+            id: filename,  // Just filename, not full path (moduleName is separate)
+            path: dataPath(guildId, keyModule, backendKey.filename),
+            name: generateDisplayName(filename),
+            description: `Orphaned data file (no schema defined)`,
+            category: 'data',
+            exists: true,
+            required: false,
+            template: undefined,
+            scope: 'guild',
+            moduleName: keyModule
+          });
+        }
+      }
+    } else {
+      const guildDir = dataPath(guildId);
+      if (fs.existsSync(guildDir)) {
+        const existingFiles = scanDirectoryRecursive(guildDir, 'data', '', undefined, true);
 
-          if (!discovered.has(key)) {
-            // File exists but has no schema - add it as orphaned data
-            // Use just the filename as id (consistent with schema-based files)
-            const filename = pathParts[pathParts.length - 1];
-            discovered.set(key, {
-              id: filename,  // Just filename, not full path (moduleName is separate)
-              path: file.path,
-              name: generateDisplayName(filename),
-              description: `Orphaned data file (no schema defined)`,
-              category: 'data',
-              exists: true,
-              required: false,
-              template: undefined,
-              scope: 'guild',
-              moduleName: pathParts[0]
-            });
+        for (const file of existingFiles) {
+          // Extract module name from path (e.g., "moduleName/file.json")
+          const pathParts = file.id.split('/');
+          if (pathParts.length >= 2) {
+            const key = `${pathParts[0]}/${pathParts[pathParts.length - 1]}`;
+
+            // Skip if this is a config file (defined in configSchema)
+            if (configFileIds.has(key)) {
+              continue;
+            }
+
+            if (!discovered.has(key)) {
+              // File exists but has no schema - add it as orphaned data
+              // Use just the filename as id (consistent with schema-based files)
+              const filename = pathParts[pathParts.length - 1];
+              discovered.set(key, {
+                id: filename,  // Just filename, not full path (moduleName is separate)
+                path: file.path,
+                name: generateDisplayName(filename),
+                description: `Orphaned data file (no schema defined)`,
+                category: 'data',
+                exists: true,
+                required: false,
+                template: undefined,
+                scope: 'guild',
+                moduleName: pathParts[0]
+              });
+            }
           }
         }
       }

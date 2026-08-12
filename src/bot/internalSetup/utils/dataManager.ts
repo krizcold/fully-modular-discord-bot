@@ -155,6 +155,18 @@ export function listGuildDataFiles(guildId: string, category?: string): string[]
 }
 
 /**
+ * Every doc key a postgres-routed guild holds in its working set, or null when
+ * the guild is file-routed or the set is not ready (caller uses its fs scan).
+ */
+export function listGuildDataKeys(guildId: string): { module: string; filename: string }[] | null {
+  const ws = getWorkingSet();
+  if (ws && routeFor(guildId) === 'postgres') {
+    return ws.listAllKeys(guildId);
+  }
+  return null;
+}
+
+/**
  * Total size in bytes of a guild's data in its routing backend.
  */
 export function sizeOfGuildData(guildId: string): Promise<number> {

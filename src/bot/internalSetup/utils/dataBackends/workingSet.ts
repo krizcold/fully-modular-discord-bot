@@ -290,6 +290,18 @@ export class WorkingSetManager {
     return [...names];
   }
 
+  /** Every live doc key across all modules (guild-dir scan parity). */
+  listAllKeys(guildId: string): DocKey[] | null {
+    const ws = this.sets.get(guildId);
+    if (!ws || ws.state === 'hydrating' || ws.state === 'failed') return null;
+    const keys = new Set<string>();
+    for (const [key, doc] of ws.docs) {
+      if (!doc.tombstone) keys.add(key);
+    }
+    for (const key of ws.appendKeys) keys.add(key);
+    return [...keys].map(splitDocKey);
+  }
+
   // --------------------------------------------------------------------------
   // Coalescing + flush
   // --------------------------------------------------------------------------
