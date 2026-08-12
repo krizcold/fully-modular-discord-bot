@@ -30,6 +30,9 @@ const MAIN_CONFIG_SCHEMA: Record<string, any> = {
   // guild OAuth login is seen, with dev-only Shut-down-bot / Shut-down-web-UI buttons.
   'security.accessLog.enabled': false,
   'security.accessLog.channelId': '',
+  // User-facing outage notices shown when guild data is unavailable (operators append their contact info)
+  'outageNotice.dataLoading': "This server's data is still loading, try again in a moment.",
+  'outageNotice.databaseUnreachable': "The bot's database is currently unreachable, so your change was not saved. Please try again later or contact support.",
   // Giveaway module config (TODO: Move to module-specific config file)
   'giveaway.itemsPerPage': 10,
   'giveaway.nameDisplayCap': 50

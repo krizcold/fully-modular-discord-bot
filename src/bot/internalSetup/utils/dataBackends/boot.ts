@@ -12,6 +12,7 @@ import { forceRouteDefault, routeFor } from './routeResolver';
 import { evaluateRecognitionGuard, verifyStoreIdentity, readFileMarker, writeFileMarker, GuardVerdict } from './recognitionGuard';
 import { listGuilds } from './fileBackend';
 import { setGuildDataBackend, getGuildDataBackend } from '../dataManager';
+import { getConfigProperty } from '../configManager';
 
 function hasLocalGuildData(): boolean {
   return listGuilds().length > 0;
@@ -260,21 +261,28 @@ export async function awaitGuildDataReady(guildId: string): Promise<boolean> {
   return readiness.admitInteraction(guildId);
 }
 
-/** User-visible text for a refused write (Stage 3 makes this operator-customizable). */
+/** Config-backed notice text, resolved at reply time so edits apply without restart. */
+function noticeText(property: string, fallback: string): string {
+  const value = getConfigProperty<string>(property);
+  return typeof value === 'string' && value.trim() !== '' ? value : fallback;
+}
+
+/** User-visible text for a refused write; the database-unreachable notice is operator-editable in config.json. */
 export function dataUnavailableMessage(causeKey: 'database-unreachable' | 'guild-fenced'): string {
   return causeKey === 'guild-fenced'
     ? "This server's data just moved to another bot node; please try again in a moment."
-    : "The bot's database is currently unreachable, so your change was not saved. Please try again later or contact support.";
+    : noticeText('outageNotice.databaseUnreachable', "The bot's database is currently unreachable, so your change was not saved. Please try again later or contact support.");
 }
 
-async function politeReject(interaction: any, content = "This server's data is still loading, try again in a moment."): Promise<void> {
+async function politeReject(interaction: any, content?: string): Promise<void> {
   try {
     if (typeof interaction.isAutocomplete === 'function' && interaction.isAutocomplete()) {
       if (typeof interaction.respond === 'function') await interaction.respond([]).catch(() => { /* expired */ });
       return;
     }
     if (interaction.isRepliable() && !interaction.replied && !interaction.deferred) {
-      await interaction.reply({ content, flags: MessageFlags.Ephemeral }).catch(() => { /* expired or already handled */ });
+      const text = content ?? noticeText('outageNotice.dataLoading', "This server's data is still loading, try again in a moment.");
+      await interaction.reply({ content: text, flags: MessageFlags.Ephemeral }).catch(() => { /* expired or already handled */ });
     }
   } catch { /* the gate must never throw into dispatch */ }
 }
