@@ -622,6 +622,15 @@ export class PostgresBackend implements DataBackend {
     return Number(res.rows[0]?.total ?? 0);
   }
 
+  /** Newest graveyard batch (retired_at ms) for a guild; null when none exist. */
+  async latestGraveyardBatch(guildId: string): Promise<number | null> {
+    const res = await this.read(
+      `SELECT MAX(retired_at) AS retired_at FROM smdb_data.guild_data_graveyard WHERE guild_id = $1`,
+      [guildId]);
+    const value = res.rows[0]?.retired_at;
+    return value == null ? null : Number(value);
+  }
+
   private async read(text: string, values: unknown[]): Promise<QueryResult> {
     try {
       const res = await this.pool.query(text, values);

@@ -419,8 +419,8 @@ export interface DataWriteRequest {
   module: string;
   /** Ignored for delete-namespace. */
   filename: string;
-  op: 'write' | 'delete' | 'delete-namespace';
-  /** Raw JSON text; write op only. */
+  op: 'write' | 'delete' | 'delete-namespace' | 'restore-graveyard';
+  /** Raw JSON text; write op only. For restore-graveyard it carries {retiredAt}. */
   contentJson?: string;
   origin: 'webui-operator';
 }

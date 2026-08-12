@@ -82,6 +82,22 @@ export class WebuiDataReader {
     return rows[0]?.present === true;
   }
 
+  async listGraveyard(): Promise<Array<{ guildId: string; retiredAt: number; reason: string; rows: number }>> {
+    const rows = await this.query(
+      `SELECT guild_id, retired_at, reason, COUNT(*)::int AS row_count
+       FROM smdb_data.guild_data_graveyard
+       GROUP BY guild_id, retired_at, reason
+       ORDER BY retired_at DESC`,
+      []
+    );
+    return rows.map(row => ({
+      guildId: row.guild_id,
+      retiredAt: Number(row.retired_at),
+      reason: row.reason,
+      rows: Number(row.row_count)
+    }));
+  }
+
   async readDoc(guildId: string, module: string, filename: string): Promise<string | null> {
     const docRows = await this.query(
       `SELECT doc FROM smdb_data.guild_data

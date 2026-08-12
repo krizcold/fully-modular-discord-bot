@@ -191,6 +191,23 @@ const HANDLERS: Record<string, Handler> = {
   'bundle export': (c) => bundleExport(c),
   'bundle import': (c) => bundleImport(c),
 
+  // --- graveyard (retired guild namespaces, spec 4.4) ---
+  'graveyard list': (c) =>
+    simple(c, 'GET', '/api/data/graveyard', undefined, (b) =>
+      table(((b as { entries?: Record<string, unknown>[] }).entries) || [], ['guildId', 'retiredAt', 'reason', 'rows', 'backend']),
+    ),
+  'graveyard restore': (c) => {
+    const guildId = need(c, 0, 'guildId');
+    const raw = flagStr(c.flags, 'retired-at') ?? c.args[1];
+    const body: Record<string, unknown> = { guildId };
+    if (raw !== undefined) {
+      const retiredAt = Number(raw);
+      if (!Number.isFinite(retiredAt)) fail('retiredAt must be a number (ms)', EXIT_USAGE);
+      body.retiredAt = retiredAt;
+    }
+    return simple(c, 'POST', '/api/data/graveyard/restore', body);
+  },
+
   // --- misc + cross-cutting ---
   health: (c) => simple(c, 'GET', '/api/health'),
   api: async (c) => {

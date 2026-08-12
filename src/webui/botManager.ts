@@ -563,7 +563,7 @@ export class BotManager {
    * node; the parent never writes a postgres-routed guild itself. 15s outer
    * timeout so the inner 10s control hop surfaces its own error first.
    */
-  async writeGuildData(payload: { guildId: string; module: string; filename: string; op: 'write' | 'delete' | 'delete-namespace'; contentJson?: string }): Promise<any> {
+  async writeGuildData(payload: { guildId: string; module: string; filename: string; op: 'write' | 'delete' | 'delete-namespace' | 'restore-graveyard'; contentJson?: string }): Promise<any> {
     if (!this.isRunning() || !this.botProcess) {
       return { ok: false, code: 'bot-down', error: 'bot process is not running' };
     }

@@ -338,6 +338,67 @@ export async function graveyardGuildDir(guildId: string, reason: string): Promis
   return true;
 }
 
+export interface FileGraveyardEntry {
+  guildId: string;
+  retiredAt: number;
+  reason: string;
+}
+
+/** Enumerate _graveyard entries ({guildId}-{ms} dirs), newest first. */
+export async function listGraveyardEntries(): Promise<FileGraveyardEntry[]> {
+  const graveyardRoot = path.join(BASE_DATA_DIR, GRAVEYARD_DIR);
+  let entries: fs.Dirent[];
+  try {
+    entries = await fs.promises.readdir(graveyardRoot, { withFileTypes: true });
+  } catch {
+    return []; // no graveyard yet
+  }
+  const out: FileGraveyardEntry[] = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const dashIdx = entry.name.lastIndexOf('-');
+    if (dashIdx <= 0) continue;
+    const guildId = entry.name.slice(0, dashIdx);
+    const retiredAt = Number(entry.name.slice(dashIdx + 1));
+    if (!/^\d+$/.test(guildId) || !Number.isFinite(retiredAt)) continue;
+    let reason = '';
+    try {
+      const raw = await fs.promises.readFile(path.join(graveyardRoot, entry.name, '.graveyard.json'), 'utf-8');
+      const marker = JSON.parse(raw) as { reason?: unknown };
+      if (typeof marker?.reason === 'string') reason = marker.reason;
+    } catch { /* marker is best-effort */ }
+    out.push({ guildId, retiredAt, reason });
+  }
+  out.sort((a, b) => b.retiredAt - a.retiredAt);
+  return out;
+}
+
+/**
+ * Rename a _graveyard entry back to /data/{guildId}. Refuses when a live guild
+ * dir exists or no matching entry is found (returned as {ok:false}); an actual
+ * rename failure throws so callers can tell refusal from IO error.
+ */
+export async function restoreGuildDirFromGraveyard(guildId: string, retiredAt?: number): Promise<{ ok: boolean; error?: string }> {
+  if (guildDirExists(guildId)) {
+    return { ok: false, error: 'live guild data exists; delete it before restoring' };
+  }
+  const graveyardRoot = path.join(BASE_DATA_DIR, GRAVEYARD_DIR);
+  let entryName: string | null = null;
+  if (retiredAt !== undefined) {
+    const candidate = `${guildId}-${retiredAt}`;
+    if (fs.existsSync(path.join(graveyardRoot, candidate))) entryName = candidate;
+  } else {
+    const newest = (await listGraveyardEntries()).find(e => e.guildId === guildId);
+    if (newest) entryName = `${guildId}-${newest.retiredAt}`;
+  }
+  if (!entryName) return { ok: false, error: 'no graveyard entry for this guild' };
+  const dest = path.join(BASE_DATA_DIR, guildId);
+  await fs.promises.rename(path.join(graveyardRoot, entryName), dest);
+  await fs.promises.rm(path.join(dest, '.graveyard.json'), { force: true }).catch(() => { /* marker cleanup is best-effort */ });
+  console.warn(`[DataManager] Guild ${guildId} restored from graveyard entry ${entryName}`);
+  return { ok: true };
+}
+
 /**
  * Delete graveyard entries older than the TTL (default 14 days).
  */

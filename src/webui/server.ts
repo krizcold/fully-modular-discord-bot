@@ -20,6 +20,7 @@ import { createUpdateRouter } from './routes/update';
 import { createDevModulesRoutes } from './routes/devmodules';
 import { createUsageRoutes } from './routes/usage';
 import { createFleetRoutes } from './routes/fleet';
+import { createGraveyardRoutes } from './routes/graveyard';
 import { requireAuth } from './middleware/auth';
 import { blockWritesOnCoWorker, isCoWorkerNode, requireMasterNode } from './middleware/fleetGate';
 import { configureOAuth, isGuildWebUIEnabled } from './auth/oauthConfig';
@@ -290,6 +291,7 @@ export async function createServer(botManager: BotManager): Promise<Express> {
   app.use('/api/devmodules', requireAuth, requireMasterNode, createDevModulesRoutes(botManager));
   app.use('/api/usage', requireAuth, createUsageRoutes(botManager));
   app.use('/api/fleet', requireAuth, createFleetRoutes(botManager));
+  app.use('/api/data/graveyard', requireAuth, createGraveyardRoutes(botManager));
 
   // Serve static frontend files (auth is enforced at the deployment boundary; requireAuth passes)
   const publicDir = path.join(__dirname, 'public');

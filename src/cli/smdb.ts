@@ -32,6 +32,7 @@ Fleet:     fleet state|migrations|resume-assignments | assign --shard N --node I
            fleet migrate --kind move|swap|retire|redistribute --body '{...}' | precheck --kind K --body '{...}'
            fleet abort|resume --migration ID | corrupt-lease --shard N (dev hook)
 Data:      bundle export <guildId> <file> | bundle import <file>
+           graveyard list | graveyard restore <guildId> [retiredAt | --retired-at MS]
 Raw:       api <METHOD> <path> [--body JSON] | events [--filter PREFIX] [--timeout S]
            wait --get <path> --until <expr> [--interval MS] [--timeout S] | health
 

@@ -14,6 +14,7 @@ import {
   isGuildWriteFrozen,
   listGuildDataFiles,
   readGuildDocRaw,
+  restoreGuildFromGraveyard,
   saveData,
 } from './dataManager';
 import { DataBackendUnavailableError } from './dataBackends/workingSet';
@@ -27,8 +28,8 @@ export interface GuildDataWriteRequest {
   module: string;
   /** Ignored for delete-namespace. */
   filename: string;
-  op: 'write' | 'delete' | 'delete-namespace';
-  /** Raw JSON text, 2-space pretty like the facade writes. */
+  op: 'write' | 'delete' | 'delete-namespace' | 'restore-graveyard';
+  /** Raw JSON text, 2-space pretty like the facade writes. For restore-graveyard it carries {retiredAt}. */
   contentJson?: string;
 }
 
@@ -59,8 +60,8 @@ function validSegment(value: string, allowSubpath: boolean): boolean {
 
 function validateWrite(req: GuildDataWriteRequest): string | null {
   if (!/^\d+$/.test(req.guildId ?? '')) return 'invalid guildId';
-  if (req.op !== 'write' && req.op !== 'delete' && req.op !== 'delete-namespace') return 'invalid op';
-  if (req.op === 'delete-namespace') return null;
+  if (req.op !== 'write' && req.op !== 'delete' && req.op !== 'delete-namespace' && req.op !== 'restore-graveyard') return 'invalid op';
+  if (req.op === 'delete-namespace' || req.op === 'restore-graveyard') return null;
   if (!validSegment(req.module, false)) return 'invalid module';
   if (!validSegment(req.filename, true)) return 'invalid filename';
   if (req.op === 'write' && typeof req.contentJson !== 'string') return 'contentJson is required';
@@ -88,6 +89,27 @@ export async function applyOperatorDataWrite(req: GuildDataWriteRequest): Promis
     return { ok: false, code: 'backend-unavailable', error: 'guild data is not ready' };
   }
   try {
+    if (op === 'restore-graveyard') {
+      let retiredAt: number | undefined;
+      if (req.contentJson !== undefined) {
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(req.contentJson);
+        } catch {
+          return { ok: false, code: 'invalid', error: 'contentJson is not valid JSON' };
+        }
+        const value = (parsed as { retiredAt?: unknown } | null)?.retiredAt;
+        if (value !== undefined) {
+          if (typeof value !== 'number' || !Number.isFinite(value)) {
+            return { ok: false, code: 'invalid', error: 'retiredAt must be a number (ms)' };
+          }
+          retiredAt = value;
+        }
+      }
+      const restored = await restoreGuildFromGraveyard(guildId, retiredAt);
+      if (!restored.ok) return { ok: false, code: 'invalid', error: restored.error || 'restore refused' };
+      return { ok: true };
+    }
     if (op === 'delete-namespace') {
       const moved = await deleteGuildNamespace(guildId, 'webui-operator-delete');
       if (!moved) return { ok: false, code: 'io-error', error: 'guild data delete failed; nothing was removed' };

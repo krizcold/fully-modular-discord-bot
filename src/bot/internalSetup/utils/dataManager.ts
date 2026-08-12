@@ -26,6 +26,7 @@ import {
   guildDirExists,
   dropPendingForGuild,
   graveyardGuildDir,
+  restoreGuildDirFromGraveyard,
   writeRawAtomic,
   listGuildDataFiles as listGuildDataFilesFs,
   listGlobalDataFiles,
@@ -40,7 +41,7 @@ import {
 } from './dataBackends/fileBackend';
 import { routeFor } from './dataBackends/routeResolver';
 import { getWorkingSet, DataBackendUnavailableError } from './dataBackends/workingSet';
-import { sweepGraveyardRows } from './dataBackends/postgresBackend';
+import { sweepGraveyardRows, PostgresBackend } from './dataBackends/postgresBackend';
 import type { DataBackend, FenceToken } from './dataBackends/backend';
 import { loadCredentials } from '../../../utils/envLoader';
 
@@ -52,6 +53,7 @@ export {
   readRaw,
   deleteRawAtomic,
   sizeOfGlobalData,
+  listGraveyardEntries,
 } from './dataBackends/fileBackend';
 
 // ============================================================================
@@ -671,6 +673,43 @@ export async function deleteGuildNamespace(guildId: string, reason: string): Pro
   ownerStamped.delete(guildId);
 
   return graveyardGuildDir(guildId, reason);
+}
+
+/**
+ * Restore a retired guild namespace from the graveyard. Refusals (live data
+ * exists, no matching entry) come back as {ok:false, error}; backend outages
+ * throw DataBackendUnavailableError and IO failures throw plain errors.
+ * retiredAt absent = the guild's newest graveyard batch/entry.
+ */
+export async function restoreGuildFromGraveyard(guildId: string, retiredAt?: number): Promise<{ ok: boolean; error?: string; moved?: number }> {
+  if (routeFor(guildId) === 'postgres') {
+    if (!pgBackend) throw new DataBackendUnavailableError('database-unreachable');
+    let batch = retiredAt;
+    if (batch === undefined) {
+      if (!(pgBackend instanceof PostgresBackend)) throw new DataBackendUnavailableError('database-unreachable');
+      let newest: number | null;
+      try {
+        newest = await pgBackend.latestGraveyardBatch(guildId);
+      } catch {
+        throw new DataBackendUnavailableError('database-unreachable');
+      }
+      if (newest === null) return { ok: false, error: 'no graveyard entry for this guild' };
+      batch = newest;
+    }
+    const token = fenceFromOwnerInfo(guildId)
+      ?? { nodeId: '', term: 0, epoch: 0, shardId: 0, shardCount: 1 };
+    const res = await pgBackend.restoreGuild(guildId, batch, token);
+    if (res.ok) {
+      // The pre-restore ready gate hydrated the guild EMPTY (claim-then-read
+      // saw no rows); evict that set so the next access rehydrates with the
+      // restored docs instead of serving the stale emptiness.
+      getWorkingSet()?.evict(guildId);
+      return { ok: true, moved: res.moved };
+    }
+    if (res.reason === 'live-rows') return { ok: false, error: 'live guild data exists; delete it before restoring' };
+    throw new DataBackendUnavailableError('database-unreachable');
+  }
+  return restoreGuildDirFromGraveyard(guildId, retiredAt);
 }
 
 /**
