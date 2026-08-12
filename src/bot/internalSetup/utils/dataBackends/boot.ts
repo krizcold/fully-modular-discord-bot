@@ -8,7 +8,7 @@ import { DataBackendKind, loadCredentials, setFleetDataBackend, upsertCredential
 import { PostgresBackend } from './postgresBackend';
 import { initWorkingSet, getWorkingSet } from './workingSet';
 import { initDataReadiness, getDataReadiness, DataReadinessDriver } from './dataReadiness';
-import { forceRouteDefault, routeFor } from './routeResolver';
+import { forceRouteDefault, routeFor, applyRouteOverrides } from './routeResolver';
 import { evaluateRecognitionGuard, verifyStoreIdentity, readFileMarker, writeFileMarker, GuardVerdict } from './recognitionGuard';
 import { listGuilds } from './fileBackend';
 import { setGuildDataBackend, getGuildDataBackend } from '../dataManager';
@@ -113,7 +113,9 @@ function startPostgresRuntime(url: string): void {
  * spec: adopt -> persist env -> marker -> (re)start runtime, gates stay
  * closed until the new runtime's identity verifies.
  */
-export async function applyDeliveredBackend(info: { backend: DataBackendKind; url?: string } | undefined): Promise<boolean> {
+export async function applyDeliveredBackend(
+  info: { backend: DataBackendKind; url?: string; transformationId?: string; routes?: { guildId: string; backend: DataBackendKind }[] } | undefined,
+): Promise<boolean> {
   const backend = info?.backend ?? 'file';
   const url = (info?.url || '').trim();
   const creds = loadCredentials();
@@ -132,10 +134,21 @@ export async function applyDeliveredBackend(info: { backend: DataBackendKind; ur
     }
   }
 
-  // Stale local marker with no local guild data: the master's delivered
-  // backend wins and the node rewrites its own marker (guard step 5).
   const marker = readFileMarker();
-  if (marker && marker.live !== backend && !hasLocalGuildData()) {
+  if (info?.transformationId) {
+    // Mid-window delivery: adopt the routing map, and make sure the postgres
+    // runtime exists even while the serving default is file (converted or
+    // converting guilds need it). A delivered backend that differs from the
+    // local marker is the flip instruction this node missed while offline.
+    applyRouteOverrides(info.routes ?? []);
+    if (marker && marker.live !== backend) {
+      applyBackendFlip(backend);
+    } else if (url && activeUrl === null) {
+      startPostgresRuntime(url);
+    }
+  } else if (marker && marker.live !== backend && !hasLocalGuildData()) {
+    // Stale local marker with no local guild data: the master's delivered
+    // backend wins and the node rewrites its own marker (guard step 5).
     writeFileMarker({ live: backend, storeId: null, flippedAt: Date.now(), transformationId: null });
     forceRouteDefault(null);
   }
@@ -153,6 +166,45 @@ export async function applyDeliveredBackend(info: { backend: DataBackendKind; ur
     startPostgresRuntime(url);
   }
   return changed;
+}
+
+export function getActiveBackendUrl(): string | null {
+  return activeUrl;
+}
+
+/**
+ * Master-side pre-transformation ensure: the destination (or source) postgres
+ * runtime must be up before any guild converts or any route flips postgres.
+ */
+export function ensureTransformationRuntime(): { ok: boolean; error?: string } {
+  if (bootStatus.state === 'refused') return { ok: false, error: bootStatus.refusalReason || 'data layer refused' };
+  if (activeUrl !== null) return { ok: true };
+  const url = (loadCredentials().DATA_BACKEND_URL || '').trim();
+  if (!url) return { ok: false, error: 'DATA_BACKEND_URL is not set' };
+  startPostgresRuntime(url);
+  return { ok: true };
+}
+
+/**
+ * The node's BACKEND_FLIP duty: swap the resolver default, clear the routing
+ * map, write our own marker naming the destination. The postgres runtime is
+ * left running either way (a file flip still retires postgres rows next).
+ */
+export function applyBackendFlip(dest: DataBackendKind): void {
+  const marker = readFileMarker();
+  setFleetDataBackend(dest === 'postgres'
+    ? { backend: dest, url: activeUrl ?? (loadCredentials().DATA_BACKEND_URL || '').trim() }
+    : { backend: dest });
+  forceRouteDefault(null);
+  applyRouteOverrides(null);
+  writeFileMarker({
+    live: dest,
+    storeId: dest === 'postgres' ? (marker?.storeId ?? null) : null,
+    flippedAt: Date.now(),
+    transformationId: null,
+  });
+  bootStatus = { mode: dest, state: dest === 'postgres' ? 'serving' : 'file', banner: null, refusalReason: null };
+  console.log(`[Data] Backend flipped: every guild now routes to ${dest}`);
 }
 
 async function stopPostgresRuntime(): Promise<void> {
