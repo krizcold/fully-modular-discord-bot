@@ -45,6 +45,10 @@ export interface ControlClientOptions {
   onDataBackend?: (info: RegisterResult['dataBackend']) => void;
   /** Webui data hop from the master (DATA_WRITE/DATA_READ); returns the reply payload. */
   onDataOp?: (type: string, data: any) => Promise<any>;
+  /** Backend transformation control (TRANSFORM_GUILD/BACKEND_FLIP) -> executor; returns the ack payload. */
+  onTransformControl?: (type: string, data: any) => Promise<any>;
+  /** Grant-carried routing map (active transformation); applied BEFORE the grant so hydration sees correct routes. */
+  onDataRoutes?: (transformationId: string, routes: { guildId: string; backend: 'file' | 'postgres' }[]) => void;
 }
 
 export class ControlClient {
@@ -212,6 +216,9 @@ export class ControlClient {
     switch (type) {
       case MSG.LEASE_GRANT: {
         const grant = data as LeaseGrantPayload;
+        if (grant.transformationId && Array.isArray(grant.dataRoutes)) {
+          try { this.opts.onDataRoutes?.(grant.transformationId, grant.dataRoutes); } catch { /* grant must still apply */ }
+        }
         const ack = await this.opts.runtime.applyGrant(grant);
         if (ack.ok) {
           this.term = Math.max(this.term, grant.term);
@@ -248,6 +255,15 @@ export class ControlClient {
         handler(type, data)
           .then(result => this.replyAck(requestId, result))
           .catch(error => this.replyAck(requestId, { ok: false, code: 'io-error', error: error instanceof Error ? error.message : String(error) }));
+        break;
+      }
+      case MSG.TRANSFORM_GUILD:
+      case MSG.BACKEND_FLIP: {
+        const handler = this.opts.onTransformControl;
+        if (!handler) { this.replyAck(requestId, { ok: false, reason: 'transformation-unavailable' }); break; }
+        handler(type, data)
+          .then(result => this.replyAck(requestId, result))
+          .catch(error => this.replyAck(requestId, { ok: false, reason: error instanceof Error ? error.message : String(error) }));
         break;
       }
       case MSG.XFER_PREPARE:

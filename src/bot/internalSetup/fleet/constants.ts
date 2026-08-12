@@ -160,3 +160,19 @@ export const INCOMING_RESOLVE_INTERVAL_MS = 3600000;
 
 /** Cap on the persisted finished-migration history ring. */
 export const MIGRATION_HISTORY_CAP = 10;
+
+// ============================================================================
+// BACKEND TRANSFORMATION (spec 3.2): per-guild convert-verify-flip.
+// ============================================================================
+
+/** Per-guild convert (or retire-source) window: freeze, export, staged import, hash, commit. */
+export const TRANSFORM_GUILD_TIMEOUT_MS = 600000;
+
+/** Statement timeout on the dedicated staging connection (its transaction spans export + hash + commit). */
+export const TRANSFORM_STAGING_STATEMENT_TIMEOUT_MS = 600000;
+
+/** How long the master waits for each BACKEND_FLIP ack. */
+export const TRANSFORM_FLIP_TIMEOUT_MS = 30000;
+
+/** Bounded wait for the destination store's first liveness probe at PLANNING. */
+export const TRANSFORM_DEST_PROBE_WAIT_MS = 5000;

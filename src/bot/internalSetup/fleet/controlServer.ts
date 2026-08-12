@@ -112,7 +112,7 @@ export class ControlServer {
   }
 
   /** Request/response to one node (grant, revoke). Rejects on timeout or dead socket. */
-  request(nodeId: string, type: string, data: any): Promise<any> {
+  request(nodeId: string, type: string, data: any, timeoutMs: number = CONTROL_ACK_TIMEOUT_MS): Promise<any> {
     const socket = this.conns.get(nodeId);
     if (!socket || socket.readyState !== WebSocket.OPEN) {
       return Promise.reject(new Error(`Node ${nodeId} is not connected`));
@@ -122,7 +122,7 @@ export class ControlServer {
       const timer = setTimeout(() => {
         this.pending.delete(requestId);
         reject(new Error(`Control request ${type} to ${nodeId} timed out`));
-      }, CONTROL_ACK_TIMEOUT_MS);
+      }, timeoutMs);
       this.pending.set(requestId, { resolve, reject, timer });
       try {
         socket.send(JSON.stringify({ type, requestId, data }));

@@ -142,6 +142,9 @@ export interface LeaseGrantPayload {
   epoch: number;
   shardCount: number;
   leases: LeaseInfo[];
+  /** Present only while a transformation is active: the full routing map, applied before hydration. */
+  transformationId?: string;
+  dataRoutes?: { guildId: string; backend: 'file' | 'postgres' }[];
 }
 
 export interface LeaseRevokePayload {
@@ -189,6 +192,8 @@ export interface HeartbeatPayload {
   syncOk?: boolean;
   /** Data backend reachability (postgres nodes only; absent = file mode or pre-backend build). */
   dataBackendHealthy?: boolean;
+  /** Free bytes on the data volume; feeds the postgres-to-file transformation space precheck. */
+  freeDiskBytes?: number;
 }
 
 export interface GuildNoticePayload {
@@ -394,6 +399,8 @@ export interface TransformGuildPayload {
   term: number;
   guildId: string;
   direction: 'file-to-postgres' | 'postgres-to-file';
+  /** Absent = convert. 'retire-source' runs the RETIRING pass for this guild on its owner. */
+  phase?: 'convert' | 'retire-source';
 }
 
 export interface TransformGuildAckPayload {
