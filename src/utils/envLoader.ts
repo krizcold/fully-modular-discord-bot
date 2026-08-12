@@ -365,6 +365,19 @@ export function getCredentialStatus(credentials: BotCredentials): Record<string,
       set: !!(credentials.SESSION_SECRET && credentials.SESSION_SECRET.length > 10),
       value: credentials.SESSION_SECRET && credentials.SESSION_SECRET.length > 10 ? '[••••••••] (Set)' : '[Empty] (Not Set)'
     },
+    // Data backend settings (standalone-editable)
+    DATA_BACKEND: {
+      set: !!(credentials.DATA_BACKEND && credentials.DATA_BACKEND.trim() !== ''),
+      value: credentials.DATA_BACKEND && credentials.DATA_BACKEND.trim() !== '' ? credentials.DATA_BACKEND : 'file'
+    },
+    DATA_BACKEND_URL: {
+      set: !!(credentials.DATA_BACKEND_URL && credentials.DATA_BACKEND_URL.length > 10),
+      value: credentials.DATA_BACKEND_URL && credentials.DATA_BACKEND_URL.length > 10 ? '[••••••••] (Set)' : '[Empty] (Not Set)'
+    },
+    CONTROL_STORE_URL: {
+      set: !!(credentials.CONTROL_STORE_URL && credentials.CONTROL_STORE_URL.length > 10),
+      value: credentials.CONTROL_STORE_URL && credentials.CONTROL_STORE_URL.length > 10 ? '[••••••••] (Set)' : '[Empty] (Not Set)'
+    },
     // Payment provider credentials are surfaced through the per-provider
     // /api/appstore/premium/providers/:id/credentials endpoint instead of
     // here; the Credentials tab no longer renders any provider fields.

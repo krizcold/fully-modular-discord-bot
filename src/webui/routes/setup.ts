@@ -24,6 +24,9 @@ const CONNECTION_FIELDS = ['DISCORD_TOKEN', 'MASTER_URL', 'CONTROL_SECRET', 'NOD
 
 const OAUTH_FIELDS = ['ENABLE_GUILD_WEBUI', 'DISCORD_CLIENT_ID', 'DISCORD_CLIENT_SECRET', 'OAUTH_CALLBACK_URL'] as const;
 
+/** Data backend settings; changes only take effect after a bot restart. */
+const DATA_BACKEND_FIELDS = ['DATA_BACKEND', 'DATA_BACKEND_URL', 'CONTROL_STORE_URL'] as const;
+
 /**
  * Classify credential changes by their reload semantics. Returns a per-field
  * array the client can surface (e.g. "applied live", "bot needs restart").
@@ -36,11 +39,16 @@ function computeReloadActions(
   const allKeys = new Set([...Object.keys(before), ...Object.keys(after)]);
   for (const key of allKeys) {
     if (before[key] === after[key]) continue;
+    // Unset DATA_BACKEND means file; persisting the default is not a change.
+    if (key === 'DATA_BACKEND' && (before[key] || 'file') === (after[key] || 'file')) continue;
     if (OAUTH_FIELDS.includes(key as any)) {
       changes.push({ field: key, action: 'web-ui-remount' });
     } else if (key === 'SESSION_SECRET') {
       changes.push({ field: key, action: 'session-invalidate' });
     } else if (key === 'DISCORD_TOKEN' || key === 'CLIENT_ID' || key === 'GUILD_ID') {
+      changes.push({ field: key, action: 'bot-reconnect' });
+    } else if (DATA_BACKEND_FIELDS.includes(key as any)) {
+      // Data backend changes require a bot restart to take effect.
       changes.push({ field: key, action: 'bot-reconnect' });
     } else {
       changes.push({ field: key, action: 'hot-inplace' });
@@ -167,6 +175,8 @@ export function createSetupRoutes(): Router {
         // OAuth fields (optional)
         ENABLE_GUILD_WEBUI, DISCORD_CLIENT_ID, DISCORD_CLIENT_SECRET,
         OAUTH_CALLBACK_URL, SESSION_SECRET,
+        // Data backend settings: only honored when isStandalone (ignored when managed)
+        DATA_BACKEND, DATA_BACKEND_URL, CONTROL_STORE_URL,
         // Payment provider credentials are NOT accepted here - each provider
         // owns its own credential modal accessible from the Premium panel.
         // The PUT /api/appstore/premium/providers/:id/credentials route
@@ -201,6 +211,30 @@ export function createSetupRoutes(): Router {
           res.status(400).json({
             success: false,
             error: 'GUILD_ID must be a valid Discord server ID (numeric) if provided'
+          });
+          return;
+        }
+        if (DATA_BACKEND && DATA_BACKEND.trim() !== ''
+            && DATA_BACKEND.trim() !== 'file' && DATA_BACKEND.trim() !== 'postgres') {
+          res.status(400).json({
+            success: false,
+            error: 'DATA_BACKEND must be "file" or "postgres"'
+          });
+          return;
+        }
+        if (DATA_BACKEND_URL && DATA_BACKEND_URL.trim() !== ''
+            && !/^postgres(ql)?:\/\//.test(DATA_BACKEND_URL.trim())) {
+          res.status(400).json({
+            success: false,
+            error: 'DATA_BACKEND_URL must start with postgresql:// or postgres://'
+          });
+          return;
+        }
+        if (CONTROL_STORE_URL && CONTROL_STORE_URL.trim() !== ''
+            && !/^postgres(ql)?:\/\//.test(CONTROL_STORE_URL.trim())) {
+          res.status(400).json({
+            success: false,
+            error: 'CONTROL_STORE_URL must start with postgresql:// or postgres://'
           });
           return;
         }
@@ -288,6 +322,17 @@ export function createSetupRoutes(): Router {
         ...(SESSION_SECRET && SESSION_SECRET.trim() !== ''
           ? { SESSION_SECRET: SESSION_SECRET.trim() }
           : existingCredentials.SESSION_SECRET && { SESSION_SECRET: existingCredentials.SESSION_SECRET }),
+        // Data backend settings: standalone-editable; managed mode preserves
+        // existing values (owned by the external manager). Blank keeps existing.
+        ...(isStandalone && DATA_BACKEND && DATA_BACKEND.trim() !== ''
+          ? { DATA_BACKEND: DATA_BACKEND.trim() }
+          : existingCredentials.DATA_BACKEND && { DATA_BACKEND: existingCredentials.DATA_BACKEND }),
+        ...(isStandalone && DATA_BACKEND_URL && DATA_BACKEND_URL.trim() !== ''
+          ? { DATA_BACKEND_URL: DATA_BACKEND_URL.trim() }
+          : existingCredentials.DATA_BACKEND_URL && { DATA_BACKEND_URL: existingCredentials.DATA_BACKEND_URL }),
+        ...(isStandalone && CONTROL_STORE_URL && CONTROL_STORE_URL.trim() !== ''
+          ? { CONTROL_STORE_URL: CONTROL_STORE_URL.trim() }
+          : existingCredentials.CONTROL_STORE_URL && { CONTROL_STORE_URL: existingCredentials.CONTROL_STORE_URL }),
         // Payment provider credentials (Stripe/PayPal/LS/Patreon/Discord/...)
         // are persisted via the per-provider modal route in appstore.ts,
         // not here. Existing values are preserved naturally because we
@@ -454,6 +499,34 @@ export function createSetupRoutes(): Router {
             '⚠️ Keep this secret secure - changing it logs out all users'
           ],
           example: 'Use the Generate button or: openssl rand -base64 32'
+        },
+        DATA_BACKEND: {
+          title: 'Data Backend (Optional, standalone only)',
+          steps: [
+            'Choose where the bot stores its data: file (default) or postgres',
+            'Switching the backend does NOT move existing data; use the backend transformation to migrate',
+            'A bot restart is required for the change to take effect'
+          ],
+          example: 'file or postgres'
+        },
+        DATA_BACKEND_URL: {
+          title: 'Database URL (Required if backend is postgres)',
+          steps: [
+            'PostgreSQL connection string for the data backend',
+            'Format: postgresql://user:password@host:5432/db',
+            'Leave blank to keep the saved value (it is never shown here)',
+            'A bot restart is required for changes to take effect'
+          ],
+          example: 'postgresql://user:password@host:5432/db'
+        },
+        CONTROL_STORE_URL: {
+          title: 'Control Store URL (Optional)',
+          steps: [
+            'Optional separate Postgres for the fleet control plane; blank = same database',
+            'Leave blank to keep the saved value (it is never shown here)',
+            'A bot restart is required for changes to take effect'
+          ],
+          example: 'postgresql://user:password@host:5432/control (or leave empty)'
         }
       }
     });
