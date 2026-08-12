@@ -557,6 +557,12 @@ export class TransformationCoordinator {
   private snapshotNodes(): { nodes: TransformationNodePlan[] } | { error: string } {
     const registry = this.hooks.registry;
     const merged = new Map<string, number>([...registry.restGuildShards, ...registry.guildMap]);
+    // An empty window would flip the live backend having converted nothing,
+    // leaving every guild serving empty from the destination. Pre-discovery
+    // starts land here; a genuinely guild-less deployment needs no transform.
+    if (merged.size === 0) {
+      return { error: 'no guilds discovered yet; wait for startup to finish and retry' };
+    }
     const byNode = new Map<string, string[]>();
     for (const [guildId] of merged) {
       const owner = this.ownerOf(guildId);
