@@ -12,6 +12,9 @@ function CredentialsPanel({ setupStatus, isBotRunning, onUpdate, onUpdateAndRest
     DISCORD_CLIENT_SECRET: '',
     OAUTH_CALLBACK_URL: '',
     SESSION_SECRET: '',
+    DATA_BACKEND: 'file',
+    DATA_BACKEND_URL: '',
+    CONTROL_STORE_URL: '',
   };
 
   const [credentials, setCredentials] = useState({ ...EMPTY_CREDS });
@@ -120,6 +123,37 @@ function CredentialsPanel({ setupStatus, isBotRunning, onUpdate, onUpdateAndRest
         ],
         example: 'Click Generate to create'
       },
+      DATA_BACKEND: {
+        title: 'Data Backend',
+        steps: [
+          'File (default) stores data as files under /data',
+          'PostgreSQL stores data in a Postgres database',
+          '⚠️ Switching the backend does NOT move existing data - use the backend transformation to migrate',
+          'A bot restart is required for the change to take effect'
+        ],
+        example: 'File (default)'
+      },
+      DATA_BACKEND_URL: {
+        title: 'Database URL',
+        steps: [
+          'PostgreSQL connection string for the data backend',
+          'Format: postgresql://user:password@host:5432/db',
+          'Leave blank to keep the saved value (it is never shown here)',
+          'A bot restart is required for changes to take effect'
+        ],
+        example: 'postgresql://user:password@host:5432/db'
+      },
+      CONTROL_STORE_URL: {
+        title: 'Control Store URL (Optional)',
+        steps: [
+          '⚠️ This field is OPTIONAL and advanced',
+          'Optional separate Postgres for the fleet control plane',
+          'Leave blank to use the same database as the data backend',
+          'Leave blank to keep the saved value (it is never shown here)',
+          'A bot restart is required for changes to take effect'
+        ],
+        example: 'postgresql://user:password@host:5432/control (or leave empty)'
+      },
     };
   });
 
@@ -140,6 +174,7 @@ function CredentialsPanel({ setupStatus, isBotRunning, onUpdate, onUpdateAndRest
         ENABLE_GUILD_WEBUI: enableGuildWebUI,
         OAUTH_CALLBACK_URL: callbackUrl,
         MAIN_GUILD_ID: mainGuildId,
+        DATA_BACKEND: creds.DATA_BACKEND?.value || 'file',
       };
       setCredentials(prev => ({ ...loaded, ...dirtyOverlay(prev, baseline) }));
       setBaseline(loaded);
@@ -201,8 +236,13 @@ function CredentialsPanel({ setupStatus, isBotRunning, onUpdate, onUpdateAndRest
           if (reload.sessionSecretChanged && wasGuildWebUIEnabled) {
             showToast('SESSION_SECRET changed: active Guild Web-UI sessions will be logged out on the next bot restart.', 'warning', { sticky: true });
           }
-          if (reload.botCredentialsChanged && !isManaged) {
+          const dataStorageChanged = changes.some(c => DATA_STORAGE_FIELDS.includes(c.field));
+          const botCredsChanged = changes.some(c => c.action === 'bot-reconnect' && !DATA_STORAGE_FIELDS.includes(c.field));
+          if (botCredsChanged && !isManaged) {
             showToast('Bot credentials changed: restart the bot to apply.', 'warning', { sticky: true });
+          }
+          if (dataStorageChanged) {
+            showToast('Data storage settings changed: restart the bot for the new backend to take effect.', 'warning', { sticky: true });
           }
         }
 
@@ -228,8 +268,9 @@ function CredentialsPanel({ setupStatus, isBotRunning, onUpdate, onUpdateAndRest
   // Secrets (DISCORD_CLIENT_SECRET, SESSION_SECRET, DISCORD_TOKEN) never come
   // back from the server for security, so we treat any non-empty value as an
   // intended change. Non-secret fields diff against the baseline.
-  const SECRET_FIELDS = ['DISCORD_TOKEN', 'DISCORD_CLIENT_SECRET', 'SESSION_SECRET'];
-  const BOT_RESTART_FIELDS = ['DISCORD_TOKEN', 'CLIENT_ID', 'GUILD_ID'];
+  const SECRET_FIELDS = ['DISCORD_TOKEN', 'DISCORD_CLIENT_SECRET', 'SESSION_SECRET', 'DATA_BACKEND_URL', 'CONTROL_STORE_URL'];
+  const DATA_STORAGE_FIELDS = ['DATA_BACKEND', 'DATA_BACKEND_URL', 'CONTROL_STORE_URL'];
+  const BOT_RESTART_FIELDS = ['DISCORD_TOKEN', 'CLIENT_ID', 'GUILD_ID', ...DATA_STORAGE_FIELDS];
   const GUILD_WEBUI_FIELDS = ['ENABLE_GUILD_WEBUI', 'DISCORD_CLIENT_ID', 'DISCORD_CLIENT_SECRET', 'OAUTH_CALLBACK_URL', 'SESSION_SECRET'];
 
   function fieldDirty(key) {
@@ -296,6 +337,118 @@ function CredentialsPanel({ setupStatus, isBotRunning, onUpdate, onUpdateAndRest
           onGenerateSecret={generateSessionSecret}
           setupStatus={setupStatus}
         />
+
+        {/* Data Storage Section (standalone only; managed deployments edit this in the Bot Manager) */}
+        {!isManaged && (
+          <>
+            <div className="section-divider" />
+            <div className="credentials-section">
+              <div className="credentials-form">
+                <h3 style={{marginBottom: '20px', color: '#43B581'}}>Data Storage</h3>
+
+                <div className="form-group">
+                  <label>
+                    <StatusIndicator isSet={true} />
+                    Data Backend
+                  </label>
+                  <select
+                    value={credentials.DATA_BACKEND || 'file'}
+                    onChange={e => handleFieldChange('DATA_BACKEND', e.target.value)}
+                    style={{
+                      width: '100%',
+                      padding: '10px',
+                      background: '#1a1a1a',
+                      border: '1px solid #444',
+                      borderRadius: '5px',
+                      color: '#e0e0e0',
+                      fontSize: '1rem',
+                      cursor: 'pointer'
+                    }}
+                  >
+                    <option value="file">File (default)</option>
+                    <option value="postgres">PostgreSQL</option>
+                  </select>
+                  <small>
+                    Changing these settings requires a bot restart. Switching the backend does NOT
+                    move existing data - the backend transformation does.
+                  </small>
+                </div>
+
+                {credentials.DATA_BACKEND === 'postgres' && (
+                  <div className="form-group">
+                    <label>
+                      <StatusIndicator isSet={setupStatus?.credentials?.DATA_BACKEND_URL?.set} />
+                      Database URL
+                    </label>
+                    <input
+                      type="password"
+                      value={credentials.DATA_BACKEND_URL || ''}
+                      onChange={e => handleFieldChange('DATA_BACKEND_URL', e.target.value)}
+                      placeholder="postgresql://user:password@host:5432/db"
+                    />
+                    <small>Leave blank to keep the saved value (it is never shown here)</small>
+                  </div>
+                )}
+
+                <div className="form-group">
+                  <label>
+                    <StatusIndicator isSet={setupStatus?.credentials?.CONTROL_STORE_URL?.set} optional />
+                    Control Store URL (Advanced, Optional)
+                  </label>
+                  <input
+                    type="password"
+                    value={credentials.CONTROL_STORE_URL || ''}
+                    onChange={e => handleFieldChange('CONTROL_STORE_URL', e.target.value)}
+                    placeholder="postgresql://user:password@host:5432/control"
+                  />
+                  <small>
+                    Optional separate Postgres for the fleet control plane; blank = same database.
+                    Leave blank to keep the saved value (it is never shown here).
+                  </small>
+                </div>
+              </div>
+
+              <div className="credentials-instructions">
+                <h3 style={{
+                  color: '#43B581',
+                  marginBottom: '15px',
+                  paddingBottom: '10px',
+                  borderBottom: '1px solid #333'
+                }}>
+                  Setup Guide: Data Storage
+                </h3>
+                {instructions && (
+                  <>
+                    {instructions.DATA_BACKEND && (
+                      <InstructionCard
+                        key="DATA_BACKEND"
+                        title={instructions.DATA_BACKEND.title}
+                        steps={instructions.DATA_BACKEND.steps}
+                        example={instructions.DATA_BACKEND.example}
+                      />
+                    )}
+                    {instructions.DATA_BACKEND_URL && (
+                      <InstructionCard
+                        key="DATA_BACKEND_URL"
+                        title={instructions.DATA_BACKEND_URL.title}
+                        steps={instructions.DATA_BACKEND_URL.steps}
+                        example={instructions.DATA_BACKEND_URL.example}
+                      />
+                    )}
+                    {instructions.CONTROL_STORE_URL && (
+                      <InstructionCard
+                        key="CONTROL_STORE_URL"
+                        title={instructions.CONTROL_STORE_URL.title}
+                        steps={instructions.CONTROL_STORE_URL.steps}
+                        example={instructions.CONTROL_STORE_URL.example}
+                      />
+                    )}
+                  </>
+                )}
+              </div>
+            </div>
+          </>
+        )}
 
         {/* Action Buttons */}
         <div className="credentials-actions">
