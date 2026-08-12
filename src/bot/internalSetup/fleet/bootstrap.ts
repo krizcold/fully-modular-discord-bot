@@ -1372,6 +1372,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
         // any leg it owns (the coordinator authenticates side <-> sender).
         if (type === MSG.XFER_PROGRESS) coordinator?.onProgress(nodeId, data);
         else if (type === MSG.XFER_VERIFY) coordinator?.onVerify(nodeId, data);
+        else if (type === MSG.XFER_FLUSHED) coordinator?.onFlushed(nodeId, data);
       },
       selfTransferUrl: () => selfTransferUrl,
       transferPort: () => transferPort,
@@ -1451,6 +1452,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       },
       pushStatus: () => pushFleetStatusNow(),
       frozenWriteRejections: () => getFrozenStats().frozenWriteRejections,
+      dataBackendHealthy: () => getGuildDataBackend()?.healthy() ?? false,
       onNodeDownDuringMigration: () => { /* coordinator aborts; the node-down bump is informational */ },
     });
     masterMigrateStart = payload => coordinator!.start(payload);
@@ -1596,6 +1598,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       onSyncRequest: (_syncNodeId, type, data) => serveSyncRequest(syncAuthority!, type, data),
       onXferProgress: (xferNodeId, data) => coordinator?.onProgress(xferNodeId, data),
       onXferVerify: (xferNodeId, data) => coordinator?.onVerify(xferNodeId, data),
+      onXferFlushed: (xferNodeId, data) => coordinator?.onFlushed(xferNodeId, data),
       onSyncReport: (reportNodeId, data) => {
         const node = registry.nodes.get(reportNodeId);
         if (!node) return;

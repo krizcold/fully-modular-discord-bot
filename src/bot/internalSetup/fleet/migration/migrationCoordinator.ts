@@ -30,6 +30,7 @@ import {
   MSG,
   MigrationKind,
   TransferDirection,
+  XferFlushedPayload,
   XferInventoryReply,
   XferPrepareLeg,
   XferPreparePayload,
@@ -37,6 +38,7 @@ import {
   XferProgressPayload,
   XferVerifyPayload,
 } from '../protocol';
+import { routeFor } from '../../utils/dataBackends/routeResolver';
 import type { Registry } from '../registry';
 import type { MigrationActiveView, MigrationLegView, MigrationView } from '../state';
 
@@ -106,6 +108,8 @@ export interface CoordinatorHooks {
   pushStatus: () => void;
   /** Live frozen-write rejection count from the data facade (drain-window backstop). */
   frozenWriteRejections: () => number;
+  /** Master-side DB liveness (lease-only prechecks; replaces the statfs gate). */
+  dataBackendHealthy: () => boolean;
   /** Node-down hook fired when a participant is declared lost / disconnects mid-migration. */
   onNodeDownDuringMigration?: (nodeId: string) => void;
 }
@@ -120,6 +124,7 @@ interface LegLive {
   lastProgressAt: number;
   sourceVerify?: XferVerifyPayload;
   targetVerify?: XferVerifyPayload;
+  flushed?: XferFlushedPayload;
   error?: string;
 }
 
@@ -360,9 +365,11 @@ export class MigrationCoordinator {
     if ('error' in legs) return { ok: false, error: legs.error };
     if (legs.legs.length === 0) return { ok: false, error: 'no shards to move' };
     const first = legs.legs[0];
-    const direction = this.resolveDirection(first.sourceNodeId, first.targetNodeId);
-    if (!direction) {
-      return { ok: false, error: 'No transfer route: set TRANSFER_URL (and expose TRANSFER_PORT) on the source or the target node.' };
+    // buildLegs already refused a route-less transfer leg; lease-only legs
+    // carry 'none' and need the database up on the master instead of a route.
+    const direction = first.direction;
+    if (direction === 'none' && !this.hooks.dataBackendHealthy()) {
+      return { ok: false, error: 'database unreachable from the master; cannot start a lease-only migration' };
     }
     let estBytes = 0;
     const guilds: string[] = [];
@@ -417,9 +424,9 @@ export class MigrationCoordinator {
     if ('error' in built) return { ok: false, error: built.error };
     if (built.legs.length === 0) return { ok: false, error: 'no shards to move' };
 
-    // PRECHECK gate: connectivity, health, ownership, route.
+    // PRECHECK gate: connectivity, health, ownership, route (or DB probe).
     for (const leg of built.legs) {
-      const gate = this.precheckLeg(leg.shardId, leg.sourceNodeId, leg.targetNodeId);
+      const gate = this.precheckLeg(leg);
       if (!gate.ok) return { ok: false, error: gate.error };
     }
 
@@ -519,6 +526,25 @@ export class MigrationCoordinator {
     this.maybeAllVerified();
   }
 
+  /** Lease-only drain confirmation (replaces the dual-hash verify). */
+  onFlushed(fromNodeId: string, payload: XferFlushedPayload): void {
+    if (!this.record || this.record.id !== payload.migrationId) return;
+    if (this.record.state !== 'DRAINING' && this.record.state !== 'VERIFYING') return;
+    if (payload.term !== this.record.term) return;
+    const l = this.live.get(payload.legId);
+    if (!l) return;
+    // Only the leg's own source drains; anyone else cannot confirm its flush.
+    if (fromNodeId !== l.leg.sourceNodeId) return;
+    l.flushed = payload;
+    this.maybeAllFlushed();
+  }
+
+  private maybeAllFlushed(): void {
+    if (!this.record || this.record.state !== 'DRAINING' || !this.recordIsLeaseOnly()) return;
+    const all = this.record.legs.every(leg => this.live.get(leg.legId)?.flushed);
+    if (all) void this.enterVerifying();
+  }
+
   onNodeDown(nodeId: string): void {
     if (!this.record || isTerminal(this.record.state)) return;
     // A paused retire has no leg in flight; nothing to abort. The pause holds
@@ -559,24 +585,39 @@ export class MigrationCoordinator {
   private async enterPreparing(): Promise<void> {
     if (!this.record) return;
     await this.transition('PREPARING');
+    const leaseOnly = this.recordIsLeaseOnly();
     try {
       const acks = await this.sendPrepareToAll();
-      // Space check: every target's free space must exceed the total source
-      // estimate * margin + cushion (statfs "unknown" is tolerated - no gate).
       for (const [nodeId, ack] of acks) {
         if (!ack.ok) throw new Error(`prepare nack from ${nodeId}: ${ack.reason ?? 'unknown'}`);
       }
-      const totalEst = [...acks.values()].reduce((s, a) => s + (a.estBytes ?? 0), 0);
-      const needed = totalEst * SPACE_MARGIN + SPACE_CUSHION_BYTES;
-      for (const [nodeId, ack] of acks) {
-        if (ack.freeBytes !== undefined && ack.freeBytes < needed) {
-          throw new Error(`target ${nodeId} lacks space (free ${ack.freeBytes}, need ~${Math.round(needed)})`);
+      if (!leaseOnly) {
+        // Space check: every target's free space must exceed the total source
+        // estimate * margin + cushion (statfs "unknown" is tolerated - no gate).
+        const totalEst = [...acks.values()].reduce((s, a) => s + (a.estBytes ?? 0), 0);
+        const needed = totalEst * SPACE_MARGIN + SPACE_CUSHION_BYTES;
+        for (const [nodeId, ack] of acks) {
+          if (ack.freeBytes !== undefined && ack.freeBytes < needed) {
+            throw new Error(`target ${nodeId} lacks space (free ${ack.freeBytes}, need ~${Math.round(needed)})`);
+          }
         }
       }
-      await this.enterCopying();
+      // Lease-only: no copy rounds exist; the drain is the whole data phase.
+      await (leaseOnly ? this.enterDraining() : this.enterCopying());
     } catch (error) {
       await this.enterAborting(error instanceof Error ? error.message : String(error));
     }
+  }
+
+  /** True when every leg is a lease-only hand-off (data lives in the central DB). */
+  private recordIsLeaseOnly(): boolean {
+    return this.record != null && this.record.legs.length > 0 && this.record.legs.every(l => l.direction === 'none');
+  }
+
+  private legIsLeaseOnly(guilds: string[]): boolean {
+    // No per-guild routing overrides exist yet (Stage 4); the first guild's
+    // route answers for the shard, '0' probes the deployment default.
+    return routeFor(guilds[0] ?? '0') === 'postgres';
   }
 
   private async enterCopying(): Promise<void> {
@@ -758,13 +799,25 @@ export class MigrationCoordinator {
     if (!this.record) return;
     this.clearDrainTimeout();
     await this.transition('VERIFYING');
-    for (const leg of this.record.legs) {
-      const l = this.live.get(leg.legId)!;
-      if (!l.sourceVerify || !l.targetVerify || l.sourceVerify.hash !== l.targetVerify.hash) {
-        // Per-guild diff logged on mismatch.
-        this.logHashDiff(leg, l);
-        await this.enterAborting(`hash mismatch on leg ${leg.legId}`);
-        return;
+    if (this.recordIsLeaseOnly()) {
+      // Verify = drain confirmation: every source flushed everything durable
+      // into the database (data-commit strictly before the gateway swap).
+      for (const leg of this.record.legs) {
+        const f = this.live.get(leg.legId)?.flushed;
+        if (!f || !f.ok || f.pendingOps > 0 || f.flushFailures > 0) {
+          await this.enterAborting(`drain flush not confirmed on leg ${leg.legId}${f?.reason ? `: ${f.reason}` : ''}`);
+          return;
+        }
+      }
+    } else {
+      for (const leg of this.record.legs) {
+        const l = this.live.get(leg.legId)!;
+        if (!l.sourceVerify || !l.targetVerify || l.sourceVerify.hash !== l.targetVerify.hash) {
+          // Per-guild diff logged on mismatch.
+          this.logHashDiff(leg, l);
+          await this.enterAborting(`hash mismatch on leg ${leg.legId}`);
+          return;
+        }
       }
     }
     // All match: bump the epoch, persist COMMITTING BEFORE the first commit.
@@ -1065,7 +1118,7 @@ export class MigrationCoordinator {
       // Completed legs stand (crash-recovery / resume path).
       if (leg.legState === 'DONE') continue;
       // Re-run PRECHECK for this leg.
-      const gate = this.precheckLeg(leg.shardId, leg.sourceNodeId, leg.targetNodeId);
+      const gate = this.precheckLeg(leg);
       if (!gate.ok) {
         rec.error = `retire leg ${idx} (shard ${leg.shardId}): ${gate.error}`;
         this.paused = true;
@@ -1156,6 +1209,13 @@ export class MigrationCoordinator {
     // precheck still needs to see what it commits them to.
     for (const warning of this.proposalWarnings(unreachable)) console.warn(`[Migration] Redistribute: ${warning}`);
     if (moveSet.length === 0) {
+      if (this.legIsLeaseOnly([])) {
+        // Postgres deployment: guild data lives in the central database, so
+        // there are no per-node files to place. The proposal is persisted and
+        // Resume grants it verbatim; that IS the whole redistribute.
+        console.log('[Migration] Redistribute: no node-local data to move (database backend); proposal persisted for Resume');
+        return { ok: true };
+      }
       const missing = unreachable.length > 0 ? `; ${unreachable.map(n => n.nodeName).join(', ')} unreachable` : '';
       return { ok: false, error: `nothing to redistribute (all data already placed)${missing}` };
     }
@@ -1351,9 +1411,12 @@ export class MigrationCoordinator {
   private buildLegs(payload: StartPayload): { legs: MigrationLeg[] } | { error: string } {
     const reg = this.hooks.registry;
     const legOf = (shardId: number, fromNodeId: string, toNodeId: string): { leg: MigrationLeg } | { error: string } => {
+      const guilds = this.guildsOnShard(shardId);
+      if (this.legIsLeaseOnly(guilds)) {
+        return { leg: { legId: randomUUID(), shardId, sourceNodeId: fromNodeId, targetNodeId: toNodeId, direction: 'none', guilds } };
+      }
       const direction = this.resolveDirection(fromNodeId, toNodeId);
       if (!direction) return { error: 'No transfer route: set TRANSFER_URL (and expose TRANSFER_PORT) on the source or the target node.' };
-      const guilds = this.guildsOnShard(shardId);
       return { leg: { legId: randomUUID(), shardId, sourceNodeId: fromNodeId, targetNodeId: toNodeId, direction, guilds } };
     };
     if (payload.kind === 'move') {
@@ -1387,7 +1450,8 @@ export class MigrationCoordinator {
     return { error: 'unsupported kind' };
   }
 
-  private precheckLeg(shardId: number, sourceNodeId: string, targetNodeId: string): { ok: boolean; error?: string } {
+  private precheckLeg(leg: MigrationLeg): { ok: boolean; error?: string } {
+    const { shardId, sourceNodeId, targetNodeId } = leg;
     const reg = this.hooks.registry;
     if (targetNodeId === sourceNodeId) return { ok: false, error: 'target equals source' };
     const source = reg.nodes.get(sourceNodeId);
@@ -1400,7 +1464,18 @@ export class MigrationCoordinator {
     if (reg.healthOf(target) !== 'up') return { ok: false, error: `target ${target.nodeName} is not healthy` };
     const held = reg.shardTable.get(shardId);
     if (!held || held.nodeId !== sourceNodeId) return { ok: false, error: `shard ${shardId} is not owned by ${source.nodeName}` };
-    if (!this.resolveDirection(sourceNodeId, targetNodeId)) {
+    if (leg.direction === 'none') {
+      // Defense-in-depth for the lease-only hand-off: both participants must
+      // advertise the postgres backend (a runtime backend apply refreshes the
+      // capability, 5.2), and the database must be reachable from the master.
+      for (const node of [source, target]) {
+        const backend = node.capabilities?.dataBackend ?? 'unknown';
+        if (backend !== 'postgres') return { ok: false, error: `backend-skew: ${node.nodeName} reports ${backend}` };
+      }
+      if (!this.hooks.dataBackendHealthy()) {
+        return { ok: false, error: 'database unreachable from the master; cannot start a lease-only migration' };
+      }
+    } else if (!this.resolveDirection(sourceNodeId, targetNodeId)) {
       return { ok: false, error: 'No transfer route: set TRANSFER_URL (and expose TRANSFER_PORT) on the source or the target node.' };
     }
     return { ok: true };

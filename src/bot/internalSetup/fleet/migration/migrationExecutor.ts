@@ -19,6 +19,8 @@ import {
   unfreezeGuildWrites,
 } from '../../utils/dataManager';
 import { hashLeg } from '../../utils/dataInterchange';
+import { routeFor } from '../../utils/dataBackends/routeResolver';
+import { getWorkingSet } from '../../utils/dataBackends/workingSet';
 import { TRANSFER_PORT_DEFAULT, TRANSFER_TOKEN_TTL_MS, XFER_MAX_ROUNDS, XFER_DELTA_THRESHOLD_FILES, XFER_DIAL_RETRY_MS, XFER_DIAL_RETRY_WINDOW_MS } from '../constants';
 import {
   MSG,
@@ -26,6 +28,7 @@ import {
   XferAbortPayload,
   XferCommitPayload,
   XferDrainPayload,
+  XferFlushedPayload,
   XferInventoryReply,
   XferPreparePayload,
   XferPreparedPayload,
@@ -41,6 +44,9 @@ import {
 } from './transferChannel';
 
 const INCOMING_DIR = '_incoming';
+// Per-guild flush confirmation budget inside a lease-only drain; the master's
+// XFER_DRAIN_TIMEOUT_MS (30s) bounds the whole phase above this.
+const LEASE_ONLY_FLUSH_MS = 10000;
 
 interface TokenEntry {
   migrationId: string;
@@ -142,14 +148,19 @@ export class MigrationExecutor {
     let freeBytes: number | undefined;
     let needListener = false;
     for (const legInfo of payload.legs) {
+      // Lease-only legs never open the transfer channel: register the runtime
+      // only (no token, no listener, no staging, no size estimate).
+      const leaseOnly = legInfo.direction === 'none';
       // Idempotent: a duplicate prepare re-registers the token but keeps the runtime.
-      this.tokens.set(legInfo.token, {
-        migrationId: payload.migrationId,
-        legId: legInfo.legId,
-        role: legInfo.role,
-        expiresAt: Date.now() + TRANSFER_TOKEN_TTL_MS,
-        spent: false,
-      });
+      if (!leaseOnly) {
+        this.tokens.set(legInfo.token, {
+          migrationId: payload.migrationId,
+          legId: legInfo.legId,
+          role: legInfo.role,
+          expiresAt: Date.now() + TRANSFER_TOKEN_TTL_MS,
+          spent: false,
+        });
+      }
       if (!this.legs.has(legInfo.legId)) {
         this.legs.set(legInfo.legId, {
           migrationId: payload.migrationId,
@@ -173,6 +184,7 @@ export class MigrationExecutor {
           dialTimer: null,
         });
       }
+      if (leaseOnly) continue;
       if (legInfo.role === 'source') {
         for (const guildId of legInfo.guilds) estBytes += await sizeOfGuildData(guildId);
       }
@@ -190,13 +202,14 @@ export class MigrationExecutor {
       }
     }
     // A target reports free bytes (statfs); "unknown" is tolerated by the coordinator.
-    if (payload.legs.some(l => l.role === 'target')) {
+    if (payload.legs.some(l => l.role === 'target' && l.direction !== 'none')) {
       freeBytes = await statfsFree(DATA_ROOT);
     }
 
     // Kick off the copy: dialers connect now; listeners wait for the inbound dial.
     for (const legInfo of payload.legs) {
       const leg = this.legs.get(legInfo.legId)!;
+      if (leg.direction === 'none') continue;
       const iDial = (leg.direction === 'push' && leg.role === 'source')
         || (leg.direction === 'pull' && leg.role === 'target');
       if (iDial && !leg.ws) this.dialAndStart(leg);
@@ -330,6 +343,10 @@ export class MigrationExecutor {
   // the backstop for non-gateway writers during the frozen window.
   private async drainSource(leg: LegRuntime): Promise<void> {
     if (leg.finalHashDone || leg.aborted) return;
+    if (leg.direction === 'none') {
+      await this.drainSourceLeaseOnly(leg);
+      return;
+    }
     for (const guildId of leg.guilds) {
       freezeGuildWrites(guildId);
       await writeFreezeSentinel(guildId);
@@ -344,6 +361,37 @@ export class MigrationExecutor {
       return;
     }
     await this.finishDrain(leg);
+  }
+
+  // Lease-only drain: the coordinator's revoke already put the working sets in
+  // frozen-retained (one final flush queued under the old fence). Confirm that
+  // every guild's writes are durable in the database, then report the outcome;
+  // the master's VERIFYING accepts only ok with zero pending/failed.
+  private async drainSourceLeaseOnly(leg: LegRuntime): Promise<void> {
+    const ws = getWorkingSet();
+    let pendingOps = 0;
+    let flushFailures = 0;
+    let reason: string | undefined;
+    if (ws) {
+      const outcomes = await Promise.all(leg.guilds.map(g => ws.flushGuildNow(g, LEASE_ONLY_FLUSH_MS)));
+      outcomes.forEach((outcome, i) => {
+        if (outcome === 'ok') return;
+        if (outcome === 'pending') pendingOps += 1;
+        else flushFailures += 1;
+        if (!reason) reason = `guild ${leg.guilds[i]}: ${outcome}`;
+      });
+    }
+    leg.finalHashDone = true;
+    const payload: XferFlushedPayload = {
+      migrationId: leg.migrationId,
+      legId: leg.legId,
+      term: this.currentTerm,
+      ok: pendingOps === 0 && flushFailures === 0,
+      pendingOps,
+      flushFailures,
+      ...(reason ? { reason } : {}),
+    };
+    this.hooks.sendToMaster(MSG.XFER_FLUSHED, payload);
   }
 
   private async finishDrain(leg: LegRuntime): Promise<void> {
@@ -413,7 +461,15 @@ export class MigrationExecutor {
         continue;
       }
       if (leg.committed) continue;
-      if (leg.role === 'target') await this.commitTarget(leg, payload.term, payload.epoch);
+      if (leg.direction === 'none') {
+        // Lease-only: nothing is staged and nothing is graveyarded. The target
+        // takes ownership at hydration after the grant; the source just drops
+        // its frozen-retained working sets.
+        if (leg.role === 'source') {
+          const ws = getWorkingSet();
+          for (const guildId of leg.guilds) ws?.evict(guildId);
+        }
+      } else if (leg.role === 'target') await this.commitTarget(leg, payload.term, payload.epoch);
       else await this.commitSource(leg);
       leg.committed = true;
       // Release the runtime so the lazy listener can unbind; a retried commit
@@ -468,7 +524,10 @@ export class MigrationExecutor {
       this.clearDialTimer(leg);
       try { leg.ws?.close(); } catch { /* closing */ }
       await leg.receiver?.close();
-      if (leg.role === 'target') {
+      if (leg.direction === 'none') {
+        // Lease-only source: no freeze was taken; the abort rollback re-grant
+        // rehydrates the frozen-retained working sets back to ready.
+      } else if (leg.role === 'target') {
         try { await fs.promises.rm(incomingLegDir(leg.migrationId, legId), { recursive: true, force: true }); } catch { /* best effort */ }
       } else {
         for (const guildId of leg.guilds) {
@@ -672,13 +731,23 @@ export async function commitFromStaging(migrationId: string, legId: string, term
 // so the coordinator keeps the leg in pendingSourceCleanup and retries.
 async function commitSourceGuilds(migrationId: string, guilds: string[]): Promise<boolean> {
   if (guilds.length === 0) return true; // nothing to clean up
+  // Postgres-routed guilds have no on-disk originals: their cleanup is just
+  // dropping any leftover working set, so a restarted source acks ok as a
+  // natural no-op. Only file-routed guilds need the graveyard sequence.
+  const ws = getWorkingSet();
+  const fileGuilds: string[] = [];
+  for (const guildId of guilds) {
+    if (routeFor(guildId) === 'postgres') ws?.evict(guildId);
+    else fileGuilds.push(guildId);
+  }
+  if (fileGuilds.length === 0) return true;
   const marker = sourceGraveyardMarker(migrationId);
   try {
     await fs.promises.mkdir(path.dirname(marker), { recursive: true });
-    await fs.promises.writeFile(marker, JSON.stringify({ id: migrationId, phase: 'graveyarding', guilds }), 'utf-8');
+    await fs.promises.writeFile(marker, JSON.stringify({ id: migrationId, phase: 'graveyarding', guilds: fileGuilds }), 'utf-8');
   } catch { /* best effort; boot resume only covers a crash after this point */ }
   let allDone = true;
-  for (const guildId of guilds) {
+  for (const guildId of fileGuilds) {
     await removeFreezeSentinel(guildId);
     unfreezeGuildWrites(guildId);
     const live = path.join(DATA_ROOT, guildId);

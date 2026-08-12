@@ -41,6 +41,8 @@ export interface ControlServerHooks {
   onXferProgress?: (nodeId: string, data: any) => void;
   /** Migration verify from a participant (fire-and-forget into the coordinator). */
   onXferVerify?: (nodeId: string, data: any) => void;
+  /** Lease-only drain confirmation from a source (fire-and-forget into the coordinator). */
+  onXferFlushed?: (nodeId: string, data: any) => void;
 }
 
 interface ConnState {
@@ -251,6 +253,9 @@ export class ControlServer {
         break;
       case MSG.XFER_VERIFY:
         this.hooks.onXferVerify?.(state.nodeId, data);
+        break;
+      case MSG.XFER_FLUSHED:
+        this.hooks.onXferFlushed?.(state.nodeId, data);
         break;
       default:
         if (requestId) this.reply(socket, requestId, { ok: false, term: this.hooks.getTerm(), reason: `unknown-type:${type}` });
