@@ -475,6 +475,9 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       // A confirmed-down node that is a migration participant is a node-down
       // event for the coordinator (pre-commit -> abort; post-commit -> retries).
       coordinator?.onNodeDown(transNodeId);
+      // A confirmed LOSS auto-pauses an active transformation (spec 3.3);
+      // plain disconnects do not - in-flight converts fail loudly on their own.
+      transformer?.onNodeDown(transNodeId);
       persist().catch(error => console.warn('[Fleet] Persist after down transition failed:', error instanceof Error ? error.message : error));
     },
   });
@@ -728,9 +731,16 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     // own un-cleaned source before the deferred graveyard runs.
     const migratingShards = coordinator?.migratingShardIds();
     const pendingCleanupShards = coordinator?.pendingSourceCleanupShardIds();
-    const fenced = (migratingShards?.size ?? 0) > 0 || (pendingCleanupShards?.size ?? 0) > 0 || resumePendingShards.size > 0;
+    // Transformation pinning (spec 3.3): a shard still holding a file-routed
+    // window guild stays with its holder - placing it on a node without the
+    // bytes would serve (and later convert) it empty. Fully-converted shards
+    // place normally; grant-carried routes make that safe.
+    const transformPinned = transformer?.pinnedShardIds();
+    const fenced = (migratingShards?.size ?? 0) > 0 || (pendingCleanupShards?.size ?? 0) > 0
+      || (transformPinned?.size ?? 0) > 0 || resumePendingShards.size > 0;
     const free = fenced
-      ? registry.freeShards().filter(id => !migratingShards?.has(id) && !pendingCleanupShards?.has(id) && !resumePendingShards.has(id))
+      ? registry.freeShards().filter(id => !migratingShards?.has(id) && !pendingCleanupShards?.has(id)
+        && !transformPinned?.has(id) && !resumePendingShards.has(id))
       : registry.freeShards();
     if (free.length === 0) return;
 
@@ -1114,6 +1124,9 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       // assigning it there would serve stale data and never unfreeze.
       return { success: false, error: `shard ${shardId} has a pending source cleanup; try again shortly` };
     }
+    if (transformer?.hasActive()) {
+      return { success: false, error: 'a backend transformation is active; shard assignment is locked until it finishes' };
+    }
     registry.epoch += 1;
     const fullSet = [...registry.shardIdsOf(targetNodeId), shardId].sort((a, b) => a - b);
     const result = await grantShardsTo(target, fullSet, registry.epoch);
@@ -1204,6 +1217,9 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
 
   masterResume = async (): Promise<AssignResult> => {
     if (!paused) return { success: false, error: 'No reshard pause is active' };
+    if (transformer?.hasActive()) {
+      return { success: false, error: 'a backend transformation is active; finish or abort it first' };
+    }
     const holdRemainingMs = recoverySource ? recoverySource.holdDownUntil - Date.now() : 0;
     if (holdRemainingMs > 0) {
       return { success: false, error: `waiting for stale-holder leases to expire, ${Math.ceil(holdRemainingMs / 1000)}s remaining` };
@@ -1255,9 +1271,16 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     if (!node) return { success: false, error: `node ${targetNodeId || '(none)'} is unknown` };
     if (node.isSelf) return { success: false, error: 'cannot declare the master node lost' };
     if (node.connected) return { success: false, error: 'node is connected; use Drain' };
+    // Refused mid-transformation (spec 3.3) EXCEPT during RETIRING: post-flip
+    // the data is safe in the destination and only the lost node's source
+    // residue is affected - it is recorded and skipped.
+    if (transformer?.hasActive() && !transformer.isRetiring()) {
+      return { success: false, error: 'a backend transformation is active; abort it (or let it finish) before declaring nodes lost' };
+    }
     // Declaring a migration participant lost is a node-down event for the
     // coordinator (pre-commit -> abort; post-commit -> retries at reconnect).
     coordinator?.onNodeDown(targetNodeId);
+    transformer?.onNodeRemoved(targetNodeId);
     registry.epoch += 1;
     const shardIds: number[] = [];
     for (const [shardId, lease] of registry.shardTable) {
@@ -1295,6 +1318,9 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     if (!node) return { success: false, error: `node ${targetNodeId || '(none)'} is unknown` };
     if (node.isSelf) return { success: false, error: 'cannot drain the master node' };
     if (!node.connected) return { success: false, error: 'node is not connected; use Declare Lost' };
+    if (transformer?.hasActive()) {
+      return { success: false, error: 'a backend transformation is active; draining would move its shards mid-window' };
+    }
     const holdRemainingMs = recoverySource ? recoverySource.holdDownUntil - Date.now() : 0;
     if (holdRemainingMs > 0) {
       return { success: false, error: `recovery hold-down active, ${Math.ceil(holdRemainingMs / 1000)}s remaining` };
@@ -1546,6 +1572,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       frozenWriteRejections: () => getFrozenStats().frozenWriteRejections,
       dataBackendHealthy: () => getGuildDataBackend()?.healthy() ?? false,
       onNodeDownDuringMigration: () => { /* coordinator aborts; the node-down bump is informational */ },
+      transformationActive: () => transformer?.hasActive() ?? false,
     });
     masterMigrateStart = payload => coordinator!.start(payload);
     masterMigrateAbort = migrationId => coordinator!.abort(migrationId);
@@ -1629,9 +1656,29 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       },
       onLeaseDecline: (fromNodeId, payload) => {
         if (!payload || payload.term !== registry.term) return;
-        const leaseIds = Array.isArray(payload.leaseIds) ? payload.leaseIds.filter(id => typeof id === 'string') : [];
+        let leaseIds = Array.isArray(payload.leaseIds) ? payload.leaseIds.filter(id => typeof id === 'string') : [];
         if (leaseIds.length === 0) return;
         const name = registry.nodes.get(fromNodeId)?.nodeName ?? fromNodeId;
+        // A decline for a transformation-pinned shard is refused (spec 3.3):
+        // the master logs it and holds the lease; renew drift re-grants it to
+        // the same holder, which retries hydration where the bytes live.
+        const pinned = transformer?.pinnedShardIds();
+        if (pinned && pinned.size > 0) {
+          const rest = new Set(leaseIds);
+          const allowed: string[] = [];
+          let refusedCount = 0;
+          for (const lease of registry.shardTable.values()) {
+            if (lease.nodeId !== fromNodeId || !rest.has(lease.leaseId)) continue;
+            rest.delete(lease.leaseId);
+            if (pinned.has(lease.shardId)) refusedCount++;
+            else allowed.push(lease.leaseId);
+          }
+          if (refusedCount > 0) {
+            console.warn(`[Fleet] Held ${refusedCount} declined lease(s) from ${name}: shard(s) pinned by the active transformation`);
+            leaseIds = [...allowed, ...rest];
+            if (leaseIds.length === 0) return;
+          }
+        }
         console.warn(`[Fleet] ${name} declined ${leaseIds.length} lease(s): ${payload.reason}`);
         if (payload.reason === 'hydration-timeout') {
           const covered = new Set(leaseIds);

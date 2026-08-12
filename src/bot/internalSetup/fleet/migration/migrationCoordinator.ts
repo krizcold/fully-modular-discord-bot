@@ -112,6 +112,8 @@ export interface CoordinatorHooks {
   dataBackendHealthy: () => boolean;
   /** Node-down hook fired when a participant is declared lost / disconnects mid-migration. */
   onNodeDownDuringMigration?: (nodeId: string) => void;
+  /** Migrations are refused while a backend transformation is active (spec 3.3). */
+  transformationActive?: () => boolean;
 }
 
 interface LegLive {
@@ -406,6 +408,9 @@ export class MigrationCoordinator {
   private validateCommon(payload: StartPayload): PrecheckResult {
     if (this.hooks.isPaused() && payload.kind !== 'redistribute') {
       return { ok: false, error: 'reshard pause active; only Redistribute runs during the pause' };
+    }
+    if (this.hooks.transformationActive?.()) {
+      return { ok: false, error: 'a backend transformation is active; migrations are locked until it finishes' };
     }
     if (this.hasActive()) return { ok: false, error: 'migration-in-progress' };
     return { ok: true };
