@@ -582,7 +582,7 @@ export class BotManager {
   }
 
   /** Symmetric read hop; no filename = list the module's files. */
-  async readGuildData(payload: { guildId: string; module: string; filename?: string }): Promise<any> {
+  async readGuildData(payload: { guildId: string; module: string; filename?: string; scope?: 'all' }): Promise<any> {
     if (!this.isRunning() || !this.botProcess) {
       return { ok: false, code: 'bot-down', error: 'bot process is not running' };
     }

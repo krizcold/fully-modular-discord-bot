@@ -66,32 +66,40 @@ export function createConfigRoutes(botManager: BotManager): Router {
           });
           return;
         }
-      } else if (guildId) {
-        const configFiles = discoverGuildConfigFiles(guildId);
-        const dataFiles = discoverGuildDataFiles(guildId);
+      } else if (guildId && isValidGuildId(guildId) && !fs.existsSync(dataPath(guildId))) {
+        // File-routed guild with no local dir: during a mixed-backend window
+        // its files live on the owning node's disk, so ask the owner. A failed
+        // hop leaves files unset and the local branch below answers as today.
+        files = await discoverGuildFilesViaHop(botManager, guildId);
+      }
+      if (files === undefined) {
+        if (guildId) {
+          const configFiles = discoverGuildConfigFiles(guildId);
+          const dataFiles = discoverGuildDataFiles(guildId);
 
-        // Deduplicate by path, preferring schema-defined entries over auto-generated ones
-        const pathMap = new Map();
+          // Deduplicate by path, preferring schema-defined entries over auto-generated ones
+          const pathMap = new Map();
 
-        [...configFiles, ...dataFiles].forEach(file => {
-          const existing = pathMap.get(file.path);
+          [...configFiles, ...dataFiles].forEach(file => {
+            const existing = pathMap.get(file.path);
 
-          if (!existing) {
-            // No entry for this path yet, add it
-            pathMap.set(file.path, file);
-          } else if (file.schema && !existing.schema) {
-            // Current has schema, existing doesn't - replace with schema version
-            pathMap.set(file.path, file);
-          } else if (!file.schema && existing.schema) {
-            // Current has no schema, existing does - keep existing (skip current)
-            return;
-          }
-          // If both have schema or both don't, keep first occurrence
-        });
+            if (!existing) {
+              // No entry for this path yet, add it
+              pathMap.set(file.path, file);
+            } else if (file.schema && !existing.schema) {
+              // Current has schema, existing doesn't - replace with schema version
+              pathMap.set(file.path, file);
+            } else if (!file.schema && existing.schema) {
+              // Current has no schema, existing does - keep existing (skip current)
+              return;
+            }
+            // If both have schema or both don't, keep first occurrence
+          });
 
-        files = Array.from(pathMap.values());
-      } else {
-        files = discoverAllConfigFilesForWebUI();
+          files = Array.from(pathMap.values());
+        } else {
+          files = discoverAllConfigFilesForWebUI();
+        }
       }
 
       res.json({
@@ -834,6 +842,74 @@ async function discoverGuildFilesPostgres(guildId: string): Promise<Array<Config
   }
 
   // Same dedup-by-path as the file-routed branch: schema entries win.
+  const pathMap = new Map<string, ConfigFileMetadata | DataFileMetadata>();
+  [...schemaFiles, ...orphans].forEach(file => {
+    const existing = pathMap.get(file.path);
+    if (!existing || (file.schema && !existing.schema)) {
+      pathMap.set(file.path, file);
+    }
+  });
+  return Array.from(pathMap.values());
+}
+
+/**
+ * Guild file listing for a file-routed guild whose files live on another
+ * node's disk (mixed-backend window): the owner's read hop answers with every
+ * 'module/filename' key (guild-root files are bare filenames) and the same
+ * response shape as discoverGuildFilesPostgres is built against that key set.
+ * undefined = hop failed; the caller falls back to the local scan.
+ */
+async function discoverGuildFilesViaHop(botManager: BotManager, guildId: string): Promise<Array<ConfigFileMetadata | DataFileMetadata> | undefined> {
+  const reply = await botManager.readGuildData({ guildId, module: '', scope: 'all' });
+  if (!reply || !reply.ok || !Array.isArray(reply.files)) {
+    return undefined;
+  }
+  const keys = new Set<string>(reply.files.filter((key: unknown): key is string => typeof key === 'string'));
+
+  const configFiles = discoverGuildConfigFiles(guildId).filter(file => file.schema);
+  const dataFiles = discoverGuildDataFiles(guildId).filter(file => file.schema);
+  const schemaFiles: Array<ConfigFileMetadata | DataFileMetadata> = [...configFiles, ...dataFiles];
+
+  for (const file of schemaFiles) {
+    file.exists = keys.has(file.moduleName ? `${file.moduleName}/${file.id}` : file.id);
+  }
+
+  const covered = new Set(schemaFiles.map(file => `${file.moduleName || ''}/${file.id}`));
+  const orphans: Array<ConfigFileMetadata | DataFileMetadata> = [];
+  for (const key of keys) {
+    const slash = key.indexOf('/');
+    if (slash > 0) {
+      if (covered.has(key)) {
+        continue;
+      }
+      const moduleName = key.slice(0, slash);
+      const filename = key.slice(slash + 1);
+      orphans.push({
+        id: filename,
+        path: dataPath(guildId, moduleName, filename),
+        name: displayNameFor(filename),
+        description: 'Orphaned data file (no schema defined)',
+        category: 'data',
+        exists: true,
+        required: false,
+        template: undefined,
+        scope: 'guild',
+        moduleName
+      });
+    } else {
+      orphans.push({
+        id: key,
+        path: dataPath(guildId, key),
+        name: displayNameFor(key),
+        description: `${displayNameFor(key)} runtime data`,
+        category: 'data',
+        exists: true,
+        default: {}
+      });
+    }
+  }
+
+  // Same dedup-by-path as the other branches: schema entries win.
   const pathMap = new Map<string, ConfigFileMetadata | DataFileMetadata>();
   [...schemaFiles, ...orphans].forEach(file => {
     const existing = pathMap.get(file.path);

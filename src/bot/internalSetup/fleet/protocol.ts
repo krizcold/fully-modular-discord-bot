@@ -451,6 +451,8 @@ export interface DataReadRequest {
   guildId: string;
   module: string;
   filename?: string;
+  /** With no filename: reply files are namespace-wide 'module/filename' keys (guild-root files are bare filenames) instead of one module's filenames. */
+  scope?: 'all';
 }
 
 export interface DataReadReply {

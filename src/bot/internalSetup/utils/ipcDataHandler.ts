@@ -7,12 +7,15 @@
  * the ok), so 'ok' means committed and 'pending' means accepted-but-retrying.
  */
 
+import * as fs from 'fs';
+import { dataPath } from '../../../utils/dataRoot';
 import {
   deleteData,
   deleteGuildNamespace,
   flushGuildOutcome,
   isGuildWriteFrozen,
   listGuildDataFiles,
+  listGuildDataKeys,
   readGuildDocRaw,
   restoreGuildFromGraveyard,
   saveData,
@@ -38,6 +41,8 @@ export interface GuildDataReadRequest {
   module: string;
   /** No filename = list the module's files. */
   filename?: string;
+  /** With no filename: list every guild data key as 'module/filename' (guild-root files are bare filenames); ignores module. */
+  scope?: 'all';
 }
 
 /**
@@ -144,6 +149,34 @@ export async function applyOperatorDataWrite(req: GuildDataWriteRequest): Promis
   return { ok: false, code: 'backend-unavailable', error: 'flush did not complete' };
 }
 
+/**
+ * Every data key of the guild namespace as 'module/filename' strings (guild-
+ * root files are bare filenames). A file-routed guild is answered by a disk
+ * scan mirroring configDiscovery's orphan rules: top-level *.json plus each
+ * non-underscore subdirectory's *.json, non-recursive.
+ */
+function listAllGuildDataKeys(guildId: string): string[] {
+  const backendKeys = listGuildDataKeys(guildId);
+  if (backendKeys !== null) {
+    return backendKeys.map(key => (key.module ? `${key.module}/${key.filename}` : key.filename));
+  }
+  const keys: string[] = [];
+  const guildDir = dataPath(guildId);
+  if (!fs.existsSync(guildDir)) return keys;
+  for (const entry of fs.readdirSync(guildDir, { withFileTypes: true })) {
+    if (entry.isFile() && entry.name.endsWith('.json')) {
+      keys.push(entry.name);
+    } else if (entry.isDirectory() && !entry.name.startsWith('_')) {
+      for (const inner of fs.readdirSync(dataPath(guildId, entry.name), { withFileTypes: true })) {
+        if (inner.isFile() && inner.name.endsWith('.json')) {
+          keys.push(`${entry.name}/${inner.name}`);
+        }
+      }
+    }
+  }
+  return keys;
+}
+
 export async function applyOperatorDataRead(req: GuildDataReadRequest): Promise<DataReadReply> {
   if (!/^\d+$/.test(req.guildId ?? '')) return { ok: false, code: 'invalid', error: 'invalid guildId' };
   if (req.module !== '' && !validSegment(req.module, false)) return { ok: false, code: 'invalid', error: 'invalid module' };
@@ -153,6 +186,9 @@ export async function applyOperatorDataRead(req: GuildDataReadRequest): Promise<
   }
   try {
     if (req.filename === undefined) {
+      if (req.scope === 'all') {
+        return { ok: true, files: listAllGuildDataKeys(req.guildId) };
+      }
       return { ok: true, files: listGuildDataFiles(req.guildId, req.module || undefined) };
     }
     const raw = readGuildDocRaw(req.guildId, req.module, req.filename);
