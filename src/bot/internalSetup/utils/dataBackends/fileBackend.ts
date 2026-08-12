@@ -241,6 +241,23 @@ export function freezeSentinelExists(guildId: string): boolean {
   return fs.existsSync(path.join(BASE_DATA_DIR, guildId, '.freeze'));
 }
 
+/** Best-effort: the in-memory freeze set is the primary gate; the sentinel adds cross-process visibility. */
+export async function writeFreezeSentinel(guildId: string): Promise<void> {
+  try {
+    const dir = path.join(BASE_DATA_DIR, guildId);
+    await fs.promises.mkdir(dir, { recursive: true });
+    await fs.promises.writeFile(path.join(dir, '.freeze'), String(Date.now()), 'utf-8');
+  } catch (error) {
+    console.warn(`[DataManager] Could not write freeze sentinel for ${guildId}:`, error);
+  }
+}
+
+export async function removeFreezeSentinel(guildId: string): Promise<void> {
+  try {
+    await fs.promises.unlink(path.join(BASE_DATA_DIR, guildId, '.freeze'));
+  } catch { /* absent */ }
+}
+
 // ============================================================================
 // RAW PATH ENTRY (root config + secondary bypassers outside the namespaces)
 // ============================================================================

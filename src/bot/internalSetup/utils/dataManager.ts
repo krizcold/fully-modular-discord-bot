@@ -89,7 +89,7 @@ function wsRouted(options: DataOptions): string | null {
   return routeFor(guildId) === 'postgres' ? guildId : null;
 }
 
-function fenceFromOwnerInfo(guildId: string): FenceToken | null {
+export function fenceFromOwnerInfo(guildId: string): FenceToken | null {
   const info = ownerInfoProvider?.();
   if (!info) return null;
   return {

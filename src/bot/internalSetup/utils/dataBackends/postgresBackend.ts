@@ -622,6 +622,47 @@ export class PostgresBackend implements DataBackend {
     return Number(res.rows[0]?.total ?? 0);
   }
 
+  /**
+   * Full guild content for the transformation export: docs plus compacted
+   * append streams (string_agg is byte-identical to the file). A path present
+   * in both tables yields the doc (dual rows are a pre-existing pathology).
+   */
+  async readGuildRecords(guildId: string): Promise<{ module: string; filename: string; content: string; kind: 'doc' | 'append' }[]> {
+    const docs = await this.read(
+      `SELECT module, filename, doc FROM smdb_data.guild_data WHERE guild_id = $1`, [guildId]);
+    const appends = await this.read(
+      `SELECT module, filename, string_agg(chunk, '' ORDER BY seq) AS content
+         FROM smdb_data.guild_append WHERE guild_id = $1 GROUP BY module, filename`,
+      [guildId]);
+    const out: { module: string; filename: string; content: string; kind: 'doc' | 'append' }[] = [];
+    const seen = new Set<string>();
+    for (const row of docs.rows) {
+      seen.add(`${row.module}/${row.filename}`);
+      out.push({ module: row.module, filename: row.filename, content: row.doc, kind: 'doc' });
+    }
+    for (const row of appends.rows) {
+      if (seen.has(`${row.module}/${row.filename}`)) {
+        console.warn(`[DataBackend] Guild ${guildId} path ${row.module}/${row.filename} exists as doc AND append; exporting the doc`);
+        continue;
+      }
+      out.push({ module: row.module, filename: row.filename, content: row.content, kind: 'append' });
+    }
+    return out;
+  }
+
+  /** Stored bytes per guild (transformation space precheck), one grouped query pass. */
+  async sizeOfAllGuilds(): Promise<Map<string, number>> {
+    const out = new Map<string, number>();
+    const docs = await this.read(
+      `SELECT guild_id, SUM(octet_length(doc)) AS total FROM smdb_data.guild_data GROUP BY guild_id`, []);
+    const appends = await this.read(
+      `SELECT guild_id, SUM(octet_length(chunk)) AS total FROM smdb_data.guild_append GROUP BY guild_id`, []);
+    for (const row of [...docs.rows, ...appends.rows]) {
+      out.set(row.guild_id, (out.get(row.guild_id) ?? 0) + Number(row.total ?? 0));
+    }
+    return out;
+  }
+
   /** Newest graveyard batch (retired_at ms) for a guild; null when none exist. */
   async latestGraveyardBatch(guildId: string): Promise<number | null> {
     const res = await this.read(
