@@ -447,6 +447,20 @@ export class TransformationCoordinator {
             await this.enterPaused(`abort: guild ${guildId}: ${ack.reason ?? 'revert failed'}`);
             return;
           }
+          // The copy the guild briefly lived in is now stale residue; retiring
+          // it is best-effort (failure leaves a harmless unretired copy).
+          try {
+            const retire = await this.sendTransform(plan.nodeId, {
+              transformationId: rec.id,
+              term: rec.term,
+              guildId,
+              direction: reverse,
+              phase: 'retire-source',
+            });
+            if (!retire.ok) console.warn(`[Transform] abort: residue retire for guild ${guildId} failed: ${retire.reason ?? 'unknown'}`);
+          } catch (error) {
+            console.warn(`[Transform] abort: residue retire for guild ${guildId} failed:`, error instanceof Error ? error.message : error);
+          }
           plan.cursor += 1;
           this.applyMasterRoutes();
           await this.persist();
