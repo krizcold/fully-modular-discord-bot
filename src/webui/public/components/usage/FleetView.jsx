@@ -202,10 +202,15 @@ function FleetAssignControl({ shardId, nodes, defaultNodeId, onAssigned }) {
 }
 
 const MIGRATION_FILE_WARNING = 'File backend: after a verified hand-off the source copy is retired to the graveyard (14-day TTL). Aborting at any point leaves the source untouched.';
+const MIGRATION_PG_WARNING = 'Database backend: guild data stays in the central database and follows the shard; the hand-off is a lease re-grant (seconds). Aborting copies and deletes nothing.';
+
+function migrationWarning(dataBackend) {
+  return dataBackend === 'postgres' ? MIGRATION_PG_WARNING : MIGRATION_FILE_WARNING;
+}
 
 // Master-only Move action for an OWNED shard: pick a target node, run a
 // precheck (est size, target free space, direction), confirm, then submit.
-function FleetMoveControl({ shardId, fromNodeId, nodes, onStarted }) {
+function FleetMoveControl({ shardId, fromNodeId, nodes, dataBackend, onStarted }) {
   const targets = nodes.filter((n) => n.nodeId !== fromNodeId && n.connected !== false && !n.draining);
   const [toNodeId, setToNodeId] = React.useState((targets[0] && targets[0].nodeId) || '');
   const [busy, setBusy] = React.useState(false);
@@ -224,15 +229,20 @@ function FleetMoveControl({ shardId, fromNodeId, nodes, onStarted }) {
           return null;
         }
         const p = res.precheck || {};
-        const estMb = p.estBytes != null ? Math.round(p.estBytes / 1048576) : '?';
-        const freeMb = p.targetFreeBytes != null ? Math.round(p.targetFreeBytes / 1048576) : 'unknown';
         const guildN = (p.guilds || []).length;
         const warnText = (p.warnings || []).length ? `WARNING: ${p.warnings.join('; ')}\n\n` : '';
+        const sizeLine = dataBackend === 'postgres'
+          ? `${guildN} guild(s) hand off through the database (no file copy).\n\n`
+          : (() => {
+            const estMb = p.estBytes != null ? Math.round(p.estBytes / 1048576) : '?';
+            const freeMb = p.targetFreeBytes != null ? Math.round(p.targetFreeBytes / 1048576) : 'unknown';
+            return `~${estMb} MB across ${guildN} guild(s), target free ~${freeMb} MB, direction ${p.direction || '?'}.\n\n`;
+          })();
         if (!confirm(
           `Move shard ${shardId} to the selected node?\n`
-          + `~${estMb} MB across ${guildN} guild(s), target free ~${freeMb} MB, direction ${p.direction || '?'}.\n\n`
+          + sizeLine
           + warnText
-          + MIGRATION_FILE_WARNING
+          + migrationWarning(dataBackend)
         )) return null;
         return api.post('/fleet/migrate', { kind: 'move', shardId, toNodeId });
       })
@@ -262,7 +272,7 @@ function FleetMoveControl({ shardId, fromNodeId, nodes, onStarted }) {
 
 // Master-only Retire dialog: lists the node's owned shards with a per-shard
 // target dropdown, then submits one retire migration (sequential legs).
-function FleetRetireControl({ node, nodes, shardTable, onStarted }) {
+function FleetRetireControl({ node, nodes, shardTable, dataBackend, onStarted }) {
   const [open, setOpen] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
   const owned = (node.shardIds || []).slice();
@@ -290,7 +300,7 @@ function FleetRetireControl({ node, nodes, shardTable, onStarted }) {
         if (!confirm(
           `Retire ${node.nodeName}? Its ${owned.length} shard(s) will be moved one at a time to the chosen targets.\n\n`
           + warnText
-          + MIGRATION_FILE_WARNING
+          + migrationWarning(dataBackend)
         )) return null;
         return api.post('/fleet/migrate', { kind: 'retire', nodeId: node.nodeId, targets: targetsMap });
       })
@@ -410,7 +420,7 @@ function FleetMigrationCard({ migration, onChanged }) {
 // Master-only pin-violation banner: the pinned shard sits off the master. The
 // Swap button submits the proposed legs (never auto-executed); a null proposal
 // shows the no-capacity reason.
-function FleetPinViolationBanner({ pin, onStarted }) {
+function FleetPinViolationBanner({ pin, dataBackend, onStarted }) {
   const [busy, setBusy] = React.useState(false);
   if (!pin) return null;
 
@@ -419,7 +429,7 @@ function FleetPinViolationBanner({ pin, onStarted }) {
     const legs = pin.proposedLegs.map((l) => ({ shardId: l.shardId, fromNodeId: l.fromNodeId, toNodeId: l.toNodeId }));
     if (!confirm(
       `Swap to restore the pinned shard ${pin.shardId} to the master? ${legs.length} lease move(s) run under one barrier.\n\n`
-      + MIGRATION_FILE_WARNING
+      + migrationWarning(dataBackend)
     )) return;
     setBusy(true);
     api.post('/fleet/migrate', { kind: 'swap', legs })
@@ -454,7 +464,7 @@ function FleetPinViolationBanner({ pin, onStarted }) {
 // confirm dialog, locked until the stale-holder hold-down elapses) deletes
 // the pause marker and lets distribution proceed. A corrupt marker still
 // pauses (fail closed) and renders unknown fields.
-function FleetReshardPauseBanner({ paused, holdMs, nodes, onResumed }) {
+function FleetReshardPauseBanner({ paused, holdMs, nodes, dataBackend, onResumed }) {
   const [busy, setBusy] = React.useState(false);
 
   const connectedNames = nodes
@@ -472,7 +482,9 @@ function FleetReshardPauseBanner({ paused, holdMs, nodes, onResumed }) {
     if (busy || holdLocked) return;
     if (!confirm(
       'Resume assignments? Shards will be granted and instances begin serving under the new shard count. '
-      + 'Guilds whose data was not redistributed start fresh; their old data remains on its former holders (recoverable later).'
+      + (dataBackend === 'postgres'
+        ? 'Guild data lives in the central database and follows each shard to its new owner.'
+        : 'Guilds whose data was not redistributed start fresh; their old data remains on its former holders (recoverable later).')
     )) return;
     setBusy(true);
     api.post('/fleet/resume-assignments', {})
@@ -634,7 +646,7 @@ function FleetSyncCard({ sync }) {
   );
 }
 
-function FleetNodeCard({ node, isMasterView, onAction, masterSyncRevision, retireControl }) {
+function FleetNodeCard({ node, isMasterView, onAction, masterSyncRevision, retireControl, dataBackend }) {
   const [busy, setBusy] = React.useState(false);
   const [waiting, setWaiting] = React.useState(false);
   const healthColor = FLEET_HEALTH_COLORS[node.health] || '#888';
@@ -664,7 +676,10 @@ function FleetNodeCard({ node, isMasterView, onAction, masterSyncRevision, retir
       .finally(() => setBusy(false));
   };
 
-  const dataCaveat = "this node's disk holds those guilds' data; reassigned guilds start fresh";
+  const dataCaveat = dataBackend === 'postgres'
+    ? 'guild data lives in the central database; reassigned guilds keep their data'
+    : "this node's disk holds those guilds' data; reassigned guilds start fresh";
+  const caveatLabel = dataBackend === 'postgres' ? 'Database backend' : 'File-mode warning';
   const buttonStyle = { fontSize: '0.72rem', padding: '2px 8px' };
 
   return (
@@ -715,7 +730,7 @@ function FleetNodeCard({ node, isMasterView, onAction, masterSyncRevision, retir
             <button
               onClick={() => act(
                 '/fleet/declare-lost',
-                `Declare ${node.nodeName} lost? Its ${held} frozen shard${held === 1 ? '' : 's'} will be freed and redistributed to surviving instances. File-mode warning: ${dataCaveat}.`,
+                `Declare ${node.nodeName} lost? Its ${held} frozen shard${held === 1 ? '' : 's'} will be freed and redistributed to surviving instances. ${caveatLabel}: ${dataCaveat}.`,
                 'Node declared lost',
               )}
               disabled={busy}
@@ -731,7 +746,7 @@ function FleetNodeCard({ node, isMasterView, onAction, masterSyncRevision, retir
           <button
             onClick={() => act(
               '/fleet/drain',
-              `Drain ${node.nodeName}? All its leases will be revoked and its shards redistributed to other instances. File-mode warning: ${dataCaveat}.`,
+              `Drain ${node.nodeName}? All its leases will be revoked and its shards redistributed to other instances. ${caveatLabel}: ${dataCaveat}.`,
               'Node drained',
             )}
             disabled={busy}
@@ -874,7 +889,7 @@ function FleetView({ api, wsClient, guildNames }) {
 
         {selfNode ? (
           <div className="usage-stat-grid" style={{ marginTop: '14px' }}>
-            <FleetNodeCard node={selfNode} />
+            <FleetNodeCard node={selfNode} dataBackend={fleet.dataBackend} />
           </div>
         ) : null}
 
@@ -1004,6 +1019,7 @@ function FleetView({ api, wsClient, guildNames }) {
           paused={fleet.recovery.reshardPaused}
           holdMs={fleet.recovery.holdDownRemainingMs}
           nodes={nodes}
+          dataBackend={fleet.dataBackend}
           onResumed={loadFleet}
         />
       )}
@@ -1025,7 +1041,7 @@ function FleetView({ api, wsClient, guildNames }) {
 
       {fleet.role === 'master' && fleet.connect ? <FleetConnectCard connect={fleet.connect} /> : null}
 
-      {fleet.pinViolation ? <FleetPinViolationBanner pin={fleet.pinViolation} onStarted={loadFleet} /> : null}
+      {fleet.pinViolation ? <FleetPinViolationBanner pin={fleet.pinViolation} dataBackend={fleet.dataBackend} onStarted={loadFleet} /> : null}
 
       {fleet.migration ? <FleetMigrationCard migration={fleet.migration} onChanged={loadFleet} /> : null}
 
@@ -1037,8 +1053,9 @@ function FleetView({ api, wsClient, guildNames }) {
             isMasterView={isMaster}
             onAction={loadFleet}
             masterSyncRevision={fleet.sync != null ? fleet.sync.revision : null}
+            dataBackend={fleet.dataBackend}
             retireControl={isMaster && !node.isSelf && (node.shardIds || []).length > 0 ? (
-              <FleetRetireControl node={node} nodes={nodes} shardTable={shardTable} onStarted={loadFleet} />
+              <FleetRetireControl node={node} nodes={nodes} shardTable={shardTable} dataBackend={fleet.dataBackend} onStarted={loadFleet} />
             ) : null}
           />
         ))}
@@ -1103,6 +1120,7 @@ function FleetView({ api, wsClient, guildNames }) {
                           shardId={s.shardId}
                           fromNodeId={s.nodeId}
                           nodes={assignableNodes}
+                          dataBackend={fleet.dataBackend}
                           onStarted={loadFleet}
                         />
                       )}
