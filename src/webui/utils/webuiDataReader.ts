@@ -69,6 +69,18 @@ export class WebuiDataReader {
     return rows.map(row => row.filename);
   }
 
+  async listModules(guildId: string): Promise<string[]> {
+    const rows = await this.query(
+      `SELECT module FROM smdb_data.guild_data
+       WHERE guild_id = $1 AND module <> ''
+       UNION
+       SELECT module FROM smdb_data.guild_append
+       WHERE guild_id = $1 AND module <> ''`,
+      [guildId]
+    );
+    return rows.map(row => row.module);
+  }
+
   async exists(guildId: string, module: string, filename: string): Promise<boolean> {
     const rows = await this.query(
       `SELECT (

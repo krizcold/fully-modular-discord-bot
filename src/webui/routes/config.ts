@@ -788,9 +788,10 @@ function displayNameFor(filename: string): string {
 /**
  * Guild file listing for a postgres-routed guild: schema-declared entries keep
  * their metadata but the exists probes are answered by the database, and the
- * orphan disk scan is replaced by database listings (per schema-known module
- * plus the guild-dir root). Disk leftovers are ignored - the database is the
- * source of truth for this guild.
+ * orphan disk scan is replaced by database listings (per module present in the
+ * database or known to a schema, plus the guild-dir root - a schema-less
+ * module's rows must still surface). Disk leftovers are ignored - the database
+ * is the source of truth for this guild.
  */
 async function discoverGuildFilesPostgres(guildId: string): Promise<Array<ConfigFileMetadata | DataFileMetadata>> {
   const reader = getWebuiDataReader();
@@ -804,7 +805,8 @@ async function discoverGuildFilesPostgres(guildId: string): Promise<Array<Config
   }));
 
   const covered = new Set(schemaFiles.map(file => `${file.moduleName || ''}/${file.id}`));
-  const moduleNames = [...new Set(schemaFiles.map(file => file.moduleName).filter((name): name is string => !!name))];
+  const schemaModules = schemaFiles.map(file => file.moduleName).filter((name): name is string => !!name);
+  const moduleNames = [...new Set([...schemaModules, ...await reader.listModules(guildId)])];
   const orphans: Array<ConfigFileMetadata | DataFileMetadata> = [];
 
   await Promise.all(moduleNames.map(async moduleName => {
