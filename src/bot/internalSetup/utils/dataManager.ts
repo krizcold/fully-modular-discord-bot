@@ -661,7 +661,7 @@ export async function deleteGuildNamespace(guildId: string, reason: string): Pro
       console.error(`[DataManager] Failed to retire guild ${guildId} (${res.reason})`);
       return false;
     }
-    if (res.moved > 0) console.warn(`[DataManager] Guild ${guildId} moved to graveyard (${reason})`);
+    if (res.moved > 0) console.log(`[DataManager] Guild ${guildId} moved to graveyard (${reason})`);
     return res.moved > 0;
   }
   if (!guildDirExists(guildId)) return false;

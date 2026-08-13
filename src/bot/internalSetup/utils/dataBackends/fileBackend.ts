@@ -351,7 +351,7 @@ export async function graveyardGuildDir(guildId: string, reason: string): Promis
   } catch (error) {
     console.warn(`[DataManager] Failed to write graveyard marker for ${guildId}:`, error);
   }
-  console.warn(`[DataManager] Guild ${guildId} moved to graveyard (${reason})`);
+  console.log(`[DataManager] Guild ${guildId} moved to graveyard (${reason})`);
   return true;
 }
 

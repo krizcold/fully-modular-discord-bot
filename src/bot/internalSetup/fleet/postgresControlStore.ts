@@ -407,9 +407,11 @@ export function createControlStore(standalone: boolean): ControlStore {
   if (dataBackend instanceof PostgresBackend) {
     return new PostgresControlStore(dataBackend.getPool());
   }
-  // Postgres default with no live backend (refused boot): the file store keeps
-  // the master process alive so the web UI can serve the diagnosis.
-  console.error('[Fleet] Postgres control store unavailable (data backend not constructed); falling back to the embedded file store');
+  // Postgres default with no live backend: an expected state on a
+  // transformation-required boot (configured postgres, live file), and on a
+  // refused boot the file store keeps the master process alive so the web UI
+  // can serve the diagnosis - a warning, not an error.
+  console.warn('[Fleet] Postgres control store unavailable (data backend not constructed); falling back to the embedded file store');
   return new FileControlStore();
 }
 
