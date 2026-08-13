@@ -125,12 +125,10 @@ export class PostgresBackend implements DataBackend {
       connectionTimeoutMillis: CONNECT_TIMEOUT_MS,
       idleTimeoutMillis: IDLE_TIMEOUT_MS,
       keepAlive: true,
-    });
-    this.pool.on('connect', client => {
-      // Queued ahead of any caller query on this session (per-client FIFO).
-      void client
-        .query(`SET statement_timeout = ${STATEMENT_TIMEOUT_MS}; SET idle_in_transaction_session_timeout = ${IDLE_IN_TX_TIMEOUT_MS}`)
-        .catch(() => { /* a dead session surfaces on first use */ });
+      // Applied in the startup packet: a connect-event SET would race the
+      // caller's first query on the same session (deprecated queueing, pg@9 throws).
+      statement_timeout: STATEMENT_TIMEOUT_MS,
+      idle_in_transaction_session_timeout: IDLE_IN_TX_TIMEOUT_MS,
     });
     this.pool.on('error', error => {
       // Unhandled idle-client errors would crash the process.
