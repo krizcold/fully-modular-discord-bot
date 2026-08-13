@@ -459,9 +459,14 @@ export class PostgresBackend implements DataBackend {
       await client.query('BEGIN');
       const claim = await client.query(FENCED_OWNERSHIP_UPDATE, this.fenceParams(guildId, token));
       if ((claim.rowCount ?? 0) !== 1) {
-        await client.query('ROLLBACK');
-        this.noteSuccess();
-        return { ok: false, reason: 'deposed' };
+        // No row is not a competitor: a guild that joined mid-window and never
+        // wrote has no ownership row; claim it so the retire can tombstone it.
+        const inserted = await client.query(OWNERSHIP_INSERT, this.fenceParams(guildId, token));
+        if ((inserted.rowCount ?? 0) !== 1) {
+          await client.query('ROLLBACK');
+          this.noteSuccess();
+          return { ok: false, reason: 'deposed' };
+        }
       }
       const retiredAt = Date.now();
       const docsMoved = await client.query(
