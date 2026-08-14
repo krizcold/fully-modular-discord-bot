@@ -6,6 +6,7 @@ import type { WebSocketManager, WSEvent, WSEventData } from './websocketManager'
 import { getSafetyManager } from '../utils/updateSafety';
 import { resetAppStoreManager } from '../bot/internalSetup/utils/appStoreManager';
 import { applyRouteOverrides } from '../bot/internalSetup/utils/dataBackends/routeResolver';
+import { invalidateRoleOverrideCache } from '../bot/internalSetup/fleet/nodeIdentity';
 
 export interface BotStartResult {
   success: boolean;
@@ -167,6 +168,10 @@ export class BotManager {
     // Lock operations
     this.operationInProgress = true;
 
+    // The bot child may have written role-override.json (auto-promotion); the
+    // parent's role must stay in lockstep with whatever role this child boots.
+    invalidateRoleOverrideCache();
+
     // Load and validate credentials
     const credentials = loadCredentials();
     const validation = validateCredentials(credentials);
@@ -293,6 +298,14 @@ export class BotManager {
         } else if (message.type === 'control:start-webui') {
           console.warn('[BotManager] control:start-webui received; restarting the web-UI listener');
           this.webuiControl?.start();
+        } else if (message.type === 'fleet:promote-restart') {
+          // Auto-promotion staged by the bot child (role override already on
+          // disk); the restart boots it as master. The parent's own role
+          // cache must be dropped too, or its route gates keep treating the
+          // new master as a co-worker until a container restart.
+          console.warn('[BotManager] fleet:promote-restart received (auto-promotion staged); restarting the bot child as master');
+          invalidateRoleOverrideCache();
+          void this.restart();
         }
       });
 

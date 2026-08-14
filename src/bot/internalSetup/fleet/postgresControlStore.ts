@@ -136,6 +136,67 @@ export class PostgresControlStore implements ControlStore {
     }
   }
 
+  // Local-clock start of the current unbroken run of failed stamps; null while
+  // stamping succeeds. Feeds the master self-fence and the fleet-state banner.
+  private stampFailingSince: number | null = null;
+
+  getStampFailingForMs(): number | null {
+    return this.stampFailingSince === null ? null : Date.now() - this.stampFailingSince;
+  }
+
+  /**
+   * Term liveness stamp (PLAN_STANDBY 3.1): touch updated_at under the minted
+   * term. Zero rows updated means a newer master owns the schema - latch the
+   * fence NOW instead of waiting for the next document write, so a deposed
+   * master learns of its deposition within one stamp interval.
+   */
+  async stampTerm(): Promise<void> {
+    if (this.fenced || this.mintedTerm === null) return;
+    let client: PoolClient | null = null;
+    try {
+      client = await this.pool.connect();
+    } catch {
+      this.noteStampFailure();
+      return;
+    }
+    try {
+      const res = await client.query(
+        `UPDATE smdb_control.term SET updated_at = $1 WHERE id = 1 AND term = $2`,
+        [Date.now(), this.mintedTerm]);
+      if ((res.rowCount ?? 0) === 0) {
+        let observed = -1;
+        try {
+          const cur = await client.query(`SELECT term FROM smdb_control.term WHERE id = 1`);
+          observed = cur.rows.length > 0 ? Number(cur.rows[0].term) : -1;
+        } catch { /* fence with the term unknown */ }
+        this.stampFailingSince = null;
+        this.fenced = true;
+        console.error(`[Fleet] CONTROL STORE FENCED (liveness stamp): term row holds ${observed}, this master minted ${this.mintedTerm}; a second master owns this schema`);
+        this.fencedCb?.(observed);
+        return;
+      }
+      this.stampFailingSince = null;
+    } catch {
+      this.noteStampFailure();
+    } finally {
+      client?.release();
+    }
+  }
+
+  private noteStampFailure(): void {
+    if (this.stampFailingSince === null) this.stampFailingSince = Date.now();
+  }
+
+  /**
+   * Self-fence latch (PLAN_STANDBY 3.8): refuse every further write without a
+   * foreign term having been observed (the store may be unreachable). Latched
+   * until restart, exactly like the deposed fence, so a partition that heals
+   * after the latch can never resurrect this master mid-promotion.
+   */
+  latchSelfFence(): void {
+    this.fenced = true;
+  }
+
   /**
    * File -> postgres control-plane move, run BEFORE acquireTerm on a
    * non-standalone postgres-mode master boot. Gated on FRESHNESS, not row

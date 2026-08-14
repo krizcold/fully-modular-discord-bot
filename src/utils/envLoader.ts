@@ -28,6 +28,12 @@ export interface BotCredentials {
   // standalone master.
   BOT_NODE_ROLE?: string;
   MASTER_URL?: string;
+  /** Ordered comma-separated master candidate list (PLAN_STANDBY 3.4); MASTER_URL is the single-entry fallback. */
+  MASTER_URLS?: string;
+  /** '1' designates this co-worker as the backup master (promote surface + auto-promote eligibility). */
+  FLEET_BACKUP_MASTER?: string;
+  /** '1' on the designated backup: self-promote on master silence (default off). */
+  FLEET_AUTO_PROMOTE?: string;
   CONTROL_SECRET?: string;
   CONTROL_PORT?: string;
   FLEET_PUBLIC_URL?: string;
@@ -62,6 +68,12 @@ export interface CredentialValidation {
   reason?: string;
 }
 
+// Keys whose process.env value was seeded from /data/.env by THIS process
+// rather than provided by the container environment. For these the file stays
+// authoritative across reloads (edits re-apply, deletions unset); genuine
+// compose env is never in this set and keeps its precedence.
+const fileSeededEnvKeys = new Set<string>();
+
 /**
  * Loads environment variables with priority:
  * 1. Docker-compose environment variables (process.env)
@@ -89,6 +101,9 @@ export function loadCredentials(): BotCredentials {
     // Fleet fields (flow to the bot child via the botManager env spread)
     BOT_NODE_ROLE: process.env.BOT_NODE_ROLE,
     MASTER_URL: process.env.MASTER_URL,
+    MASTER_URLS: process.env.MASTER_URLS,
+    FLEET_BACKUP_MASTER: process.env.FLEET_BACKUP_MASTER,
+    FLEET_AUTO_PROMOTE: process.env.FLEET_AUTO_PROMOTE,
     CONTROL_SECRET: process.env.CONTROL_SECRET,
     CONTROL_PORT: process.env.CONTROL_PORT,
     FLEET_PUBLIC_URL: process.env.FLEET_PUBLIC_URL,
@@ -135,12 +150,26 @@ export function loadCredentials(): BotCredentials {
       for (const [key, value] of Object.entries(dataEnv)) {
         // Compose defaults like ${VAR:-} leave the var set to an empty string,
         // which dotenv would treat as "already set"; empty means unset intent,
-        // so apply the saved value to process.env for direct readers.
-        if (process.env[key] === undefined || process.env[key] === '') {
+        // so apply the saved value to process.env for direct readers. A key
+        // this loader itself seeded stays FILE-authoritative on later loads:
+        // without that, the first load pins the value into process.env and a
+        // web-UI edit (or clear) never takes effect until the whole container
+        // is recreated. Genuine compose-provided env still wins forever.
+        if (process.env[key] === undefined || process.env[key] === '' || fileSeededEnvKeys.has(key)) {
           process.env[key] = value;
+          fileSeededEnvKeys.add(key);
         }
-        if (isPlaceholder(credentials[key])) {
+        if (isPlaceholder(credentials[key]) || fileSeededEnvKeys.has(key)) {
           credentials[key] = value;
+        }
+      }
+      // A seeded key deleted from the file was explicitly cleared: unset it
+      // everywhere so e.g. a disarmed FLEET_AUTO_PROMOTE stays disarmed.
+      for (const key of [...fileSeededEnvKeys]) {
+        if (!(key in dataEnv)) {
+          delete process.env[key];
+          credentials[key] = undefined;
+          fileSeededEnvKeys.delete(key);
         }
       }
       console.log('[EnvLoader] Loaded credentials from /data/.env');

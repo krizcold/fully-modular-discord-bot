@@ -111,6 +111,11 @@ export class ControlServer {
     this.conns.get(nodeId)?.terminate();
   }
 
+  /** Deposed/self-fenced teardown: drop every worker so their redial cycle finds the live master. */
+  dropAll(): void {
+    for (const socket of this.conns.values()) socket.terminate();
+  }
+
   /** Request/response to one node (grant, revoke). Rejects on timeout or dead socket. */
   request(nodeId: string, type: string, data: any, timeoutMs: number = CONTROL_ACK_TIMEOUT_MS): Promise<any> {
     const socket = this.conns.get(nodeId);

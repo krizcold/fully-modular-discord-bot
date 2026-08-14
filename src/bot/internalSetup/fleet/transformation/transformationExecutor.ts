@@ -51,13 +51,24 @@ export interface TransformationExecutorOptions {
 
 export class TransformationExecutor {
   private sweptFor: string | null = null;
+  private inFlight = 0;
 
   constructor(private readonly opts: TransformationExecutorOptions) { }
 
+  /** Live TRANSFORM_GUILD/BACKEND_FLIP work on this node; feeds the promote precheck. */
+  isBusy(): boolean {
+    return this.inFlight > 0;
+  }
+
   async handle(type: string, data: any): Promise<any> {
-    if (type === MSG.TRANSFORM_GUILD) return this.handleTransformGuild(data as TransformGuildPayload);
-    if (type === MSG.BACKEND_FLIP) return this.handleBackendFlip(data as BackendFlipPayload);
-    return { ok: false, reason: `unknown-type:${type}` };
+    this.inFlight++;
+    try {
+      if (type === MSG.TRANSFORM_GUILD) return await this.handleTransformGuild(data as TransformGuildPayload);
+      if (type === MSG.BACKEND_FLIP) return await this.handleBackendFlip(data as BackendFlipPayload);
+      return { ok: false, reason: `unknown-type:${type}` };
+    } finally {
+      this.inFlight--;
+    }
   }
 
   private async handleTransformGuild(payload: TransformGuildPayload): Promise<TransformGuildAckPayload> {

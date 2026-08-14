@@ -5,6 +5,7 @@ import { performance } from 'perf_hooks';
 import { CONTROL_PORT_DEFAULT, LEASE_TTL_MS, PROTOCOL_VERSION } from './constants';
 import { getShardSource, isPinEnabled, resolveShardCapacity } from './placement';
 import type { BudgetInfo, NodeRole } from './protocol';
+import { isBackupMaster, readRoleOverride, resolveMasterUrls } from './nodeIdentity';
 import type { Registry } from './registry';
 import type { LeaseRuntime } from './leaseRuntime';
 import type { ControlClient } from './controlClient';
@@ -12,6 +13,7 @@ import type { HealthMonitor, LossEvent } from './healthMonitor';
 import type { IdentifyLedger } from './identifyLedger';
 import type { IngestService } from '../ingest/ingestService';
 import { resolveDataBackend } from '../../../utils/envLoader';
+import { getGuildDataBackend } from '../utils/dataManager';
 import { getRouteOverrides } from '../utils/dataBackends/routeResolver';
 import { getDataBootStatus, DataBootStatus } from '../utils/dataBackends/boot';
 import type { TransformationView } from './transformation/transformationCoordinator';
@@ -24,7 +26,7 @@ export interface FleetStateNode {
   connected: boolean;
   health: 'up' | 'late' | 'down';
   appVersion: string;
-  capabilities: { shardCapacity: number; dataBackend: string };
+  capabilities: { shardCapacity: number; dataBackend: string; backupMaster?: boolean; autoPromote?: boolean };
   capacity: number;
   onHold: boolean;
   shardIds: number[];
@@ -97,6 +99,20 @@ export interface FleetState {
   appVersion: string;
   /** CRITICAL: a control-store write observed a foreign term (two masters on one schema); granting is stopped until restart. */
   controlStoreFenced: { observedTerm: number; at: number } | null;
+  /** Boot takeover guard: holding on a foreign term row that still advances (PLAN_STANDBY 3.2). */
+  takeoverHold: TakeoverHoldView | null;
+  /** Master self-fence latch: store silent + auto backup unreachable; sessions destroyed until restart (PLAN_STANDBY 3.8). */
+  selfFenced: { at: number; reason: string } | null;
+  /** Operator role override in force (promotion/demotion); null when the role comes from env. */
+  roleOverride: { role: NodeRole; setBy: string; setAt: number } | null;
+  /** This node is the designated backup master (FLEET_BACKUP_MASTER=1). */
+  backupMaster: boolean;
+  /** Auto-promotion watcher status; null unless this node is an auto-enabled backup. */
+  autoPromote: AutoPromoteStatusView | null;
+  /** Fleet master: ms the term-row stamp has been failing; null while stamping succeeds (or off-postgres). */
+  termStampFailingForMs: number | null;
+  /** Co-worker: the ordered master candidate list in use. */
+  masterUrls: string[];
   protocolVersion: number;
   term: number;
   epoch: number;
@@ -171,6 +187,10 @@ export interface FleetState {
   cachedLeaseTtlRemainingMs?: number | null;
   /** Co-worker only: operator drain received; cleared on the next re-register. */
   draining?: boolean;
+  /** Co-worker only: a migration/transformation executor leg is live on this node (promote precheck input). */
+  migrationWorkActive?: boolean;
+  /** Co-worker only: live data-backend reachability (postgres mode; the control store shares it in the default topology). null in file mode / pre-construction. Promote precheck input. */
+  dataBackendHealthy?: boolean | null;
   leases: { leaseId: string; shardId: number; identifyDelayMs: number }[];
   nodes: FleetStateNode[];
   shardTable: { shardId: number; nodeId: string | null; leaseId: string | null; term: number; epoch: number; status: string; guildCount: number }[];
@@ -205,6 +225,43 @@ export function _setControlStoreFenced(observedTerm: number): void {
   controlStoreFenced = { observedTerm, at: Date.now() };
 }
 
+/** Boot takeover guard hold (PLAN_STANDBY 3.2): a foreign term row still advancing. */
+export interface TakeoverHoldView {
+  observedTerm: number;
+  observedNodeId: string;
+  observingForMs: number;
+  requiredMs: number;
+}
+
+let takeoverHold: TakeoverHoldView | null = null;
+
+export function _setTakeoverHold(hold: TakeoverHoldView | null): void {
+  takeoverHold = hold;
+}
+
+// Master self-fence latch (PLAN_STANDBY 3.8): store silent + auto backup gone.
+// Latched until restart, exactly like the deposed fence.
+let selfFenced: { at: number; reason: string } | null = null;
+
+export function _setSelfFenced(reason: string): void {
+  selfFenced = { at: Date.now(), reason };
+}
+
+/** Auto-promotion watcher status (designated backup only). */
+export interface AutoPromoteStatusView {
+  enabled: boolean;
+  /** null before the first read attempt. */
+  storeReadOk: boolean | null;
+  /** Ms since the term row last advanced across this node's own reads; null before the first successful read. */
+  termStaleForMs: number | null;
+  fired: boolean;
+}
+
+function buildRoleOverrideView(): { role: NodeRole; setBy: string; setAt: number } | null {
+  const override = readRoleOverride();
+  return override ? { role: override.role, setBy: override.setBy, setAt: override.setAt } : null;
+}
+
 export interface FleetStateSources {
   role: NodeRole;
   standalone: boolean;
@@ -230,6 +287,12 @@ export interface FleetStateSources {
   transformation: (() => TransformationView | null) | null;
   /** Pin-violation supplier (fleet master only); null otherwise. */
   pinViolation: (() => PinViolationView | null) | null;
+  /** Term-stamp health supplier (fleet master on the postgres store only); null otherwise. */
+  termStamp: (() => number | null) | null;
+  /** Auto-promotion watcher status supplier (auto-enabled backup only); null otherwise. */
+  autoPromote: (() => AutoPromoteStatusView | null) | null;
+  /** Live migration/transformation work on THIS node (co-worker executors); null on masters (coordinator view covers it). */
+  migrationActive: (() => boolean) | null;
 }
 
 let sources: FleetStateSources | null = null;
@@ -269,6 +332,15 @@ export function getFleetState(): FleetState {
       nodeName: '',
       appVersion: '',
       controlStoreFenced: null,
+      // Live during initFleet: the boot takeover guard holds BEFORE the state
+      // sources exist, and this pre-init branch is what the UI polls then.
+      takeoverHold,
+      selfFenced,
+      roleOverride: buildRoleOverrideView(),
+      backupMaster: isBackupMaster(),
+      autoPromote: null,
+      termStampFailingForMs: null,
+      masterUrls: resolveMasterUrls(),
       protocolVersion: PROTOCOL_VERSION,
       term: 0,
       epoch: 0,
@@ -366,6 +438,13 @@ export function getFleetState(): FleetState {
       nodeName,
       appVersion,
       controlStoreFenced,
+      takeoverHold,
+      selfFenced,
+      roleOverride: buildRoleOverrideView(),
+      backupMaster: isBackupMaster(),
+      autoPromote: sources.autoPromote?.() ?? null,
+      termStampFailingForMs: sources.termStamp?.() ?? null,
+      masterUrls: resolveMasterUrls(),
       protocolVersion: PROTOCOL_VERSION,
       term: registry.term,
       epoch: registry.epoch,
@@ -457,6 +536,13 @@ export function getFleetState(): FleetState {
     nodeName,
     appVersion,
     controlStoreFenced: null,
+    takeoverHold,
+    selfFenced,
+    roleOverride: buildRoleOverrideView(),
+    backupMaster: isBackupMaster(),
+    autoPromote: sources.autoPromote?.() ?? null,
+    termStampFailingForMs: null,
+    masterUrls: resolveMasterUrls(),
     protocolVersion: PROTOCOL_VERSION,
     term,
     epoch: lease?.epoch ?? 0,
@@ -471,7 +557,7 @@ export function getFleetState(): FleetState {
     pinTestGuildShard: isPinEnabled(),
     pinnedShardId: null,
     masterKnown: registered,
-    masterUrl: (process.env.MASTER_URL || '').trim() || null,
+    masterUrl: controlClient?.getCurrentMasterUrl() ?? resolveMasterUrls()[0] ?? null,
     connect: null,
     recovery: null,
     sync: sources.sync?.() ?? { status: 'n/a' },
@@ -481,6 +567,8 @@ export function getFleetState(): FleetState {
     servingOnCachedLease,
     cachedLeaseTtlRemainingMs,
     draining,
+    migrationWorkActive: sources.migrationActive?.() ?? false,
+    dataBackendHealthy: getGuildDataBackend()?.healthy() ?? null,
     leases,
     nodes: [
       {

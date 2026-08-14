@@ -8,6 +8,8 @@ import { performance } from 'perf_hooks';
 import type { Client } from 'discord.js';
 import { getIngestService } from '../ingest/ingestService';
 import {
+  AUTO_PROMOTE_OVERRIDE_MAX_AGE_MS,
+  BACKUP_DOWN_CONFIRM_MS,
   CONTROL_PORT_DEFAULT,
   GUILD_TOTALS_REFRESH_MS,
   HEARTBEAT_MS,
@@ -15,13 +17,32 @@ import {
   INCOMING_RESOLVE_INTERVAL_MS,
   LEASE_RENEW_MS,
   LOSS_LOG_CAP,
+  MASTER_SELF_FENCE_MS,
   PROTOCOL_VERSION,
   RECOVERY_HOLDDOWN_MS,
   REGISTER_GRACE_MS,
+  TERM_GUARD_POLL_MS,
+  TERM_STAMP_MS,
+  TERM_TAKEOVER_STALE_MS,
   XFER_COMMIT_RETRY_MS,
 } from './constants';
 import { DataBackendInfo, HeartbeatPayload, LeaseGrantPayload, LeaseInfo, LeaseRenewedPayload, LeaseRevokePayload, MSG, NodeCapabilities, NodeDrainPayload, NodeRole, RegisterPayload, RegisterResult } from './protocol';
-import { getAppVersion, getNodeId, getNodeName, isStandalone, resolveNodeRole, wasNodeIdFreshlyGenerated } from './nodeIdentity';
+import {
+  clearRoleOverride,
+  consumeTakeoverFlags,
+  getAppVersion,
+  getNodeId,
+  getNodeName,
+  isAutoPromoteEnabled,
+  isBackupMaster,
+  isStandalone,
+  readRoleOverride,
+  resolveMasterUrls,
+  resolveNodeRole,
+  wasNodeIdFreshlyGenerated,
+  writeRoleOverride,
+} from './nodeIdentity';
+import { AutoPromoteWatcher } from './autoPromote';
 import { prepareControlStore, PostgresControlStore } from './postgresControlStore';
 import { Registry, RegistryNode } from './registry';
 import { ControlServer } from './controlServer';
@@ -41,7 +62,7 @@ import {
   resolveShardCount,
 } from './placement';
 import { evaluateRecovery } from './recovery';
-import { _setControlStoreFenced, _setFleetStateSources, FleetRecoverySource, FleetRefusedRegistration, getFleetState } from './state';
+import { _setControlStoreFenced, _setFleetStateSources, _setSelfFenced, _setTakeoverHold, FleetRecoverySource, FleetRefusedRegistration, getFleetState } from './state';
 import type { MigrationView, PinViolationView } from './state';
 import { serveSyncRequest, SyncAuthority } from './syncAuthority';
 import { SyncEngine } from './syncEngine';
@@ -209,6 +230,18 @@ export async function fleetTransformAbort(): Promise<{ ok: boolean; error?: stri
 
 export async function initFleet(): Promise<FleetContext> {
   if (context) return context;
+  // A staged auto-promotion whose restart never happened is STALE evidence: a
+  // routine boot days later must not act on it (it would depose a healthy
+  // master and chain-declare it lost). Void it and boot by env role.
+  const staged = readRoleOverride();
+  if (staged && staged.setBy === 'auto-promote' && (staged.takeover || staged.chainTakeover)
+      && Date.now() - staged.setAt > AUTO_PROMOTE_OVERRIDE_MAX_AGE_MS) {
+    console.warn(`[Fleet] VOIDING stale auto-promotion override (staged ${Math.round((Date.now() - staged.setAt) / 60000)} min ago, never completed); booting by env role. Promote again if the takeover is still wanted.`);
+    clearRoleOverride();
+  }
+  if ((process.env.MASTER_URLS || '').trim() !== '' && (process.env.BOT_NODE_ROLE || '').trim() === '' && !readRoleOverride()) {
+    console.warn('[Fleet] MASTER_URLS is set but BOT_NODE_ROLE is not. The candidate list NEVER changes a node\'s role; set BOT_NODE_ROLE=master or co-worker explicitly on every node that carries MASTER_URLS.');
+  }
   const role = resolveNodeRole();
   const standalone = isStandalone();
   const nodeId = getNodeId();
@@ -218,10 +251,15 @@ export async function initFleet(): Promise<FleetContext> {
   const runtime = new LeaseRuntime(ingest);
   devRuntime = runtime;
   const advertisedTransferUrl = (process.env.TRANSFER_URL || '').trim() || undefined;
+  if (!isBackupMaster() && (process.env.FLEET_AUTO_PROMOTE || '').trim() === '1') {
+    console.warn('[Fleet] FLEET_AUTO_PROMOTE=1 ignored: this node is not the designated backup (set FLEET_BACKUP_MASTER=1)');
+  }
   const capabilities: NodeCapabilities = {
     shardCapacity: resolveShardCapacity(),
     dataBackend: resolveDataBackend(),
     ...(advertisedTransferUrl ? { transferUrl: advertisedTransferUrl } : {}),
+    ...(isBackupMaster() ? { backupMaster: true } : {}),
+    ...(isAutoPromoteEnabled() ? { autoPromote: true } : {}),
   };
 
   context = role === 'master'
@@ -314,18 +352,93 @@ function isValidHeldLeases(held: NonNullable<RegisterPayload['heldLeases']>): bo
   return true;
 }
 
+// Boot takeover guard (PLAN_STANDBY 3.2). Returns the FOREIGN previous term
+// holder (chain input) or null when the row is absent or this node's own.
+// Freshness is OBSERVED: the row must stop advancing for the full staleness
+// window of local time before an unconfirmed boot may take over; no
+// cross-machine clock comparison ever happens. An unreachable store yields no
+// evidence either way, so it resets the observation window (fail safe).
+async function runTakeoverGuard(
+  store: PostgresControlStore,
+  selfNodeId: string,
+  takeoverConfirmed: boolean,
+): Promise<{ term: number; nodeId: string } | null> {
+  const read = async (): Promise<{ term: number; nodeId: string; updatedAt: number } | null | 'unreachable'> => {
+    try {
+      return await store.getTerm();
+    } catch {
+      return 'unreachable';
+    }
+  };
+  let row = await read();
+  while (row === 'unreachable') {
+    // Cannot observe, cannot CAS either; hold here rather than inside
+    // acquireTerm so the guard is never skipped by a store blip.
+    await guardSleep(TERM_GUARD_POLL_MS);
+    row = await read();
+  }
+  if (!row || row.nodeId === selfNodeId) return null;
+  if (takeoverConfirmed) {
+    console.warn(`[Fleet] Takeover CONFIRMED over term ${row.term} (node ${row.nodeId.slice(0, 8)}); skipping the guard`);
+    return { term: row.term, nodeId: row.nodeId };
+  }
+  console.warn(`[Fleet] TAKEOVER GUARD: term ${row.term} is held by another node (${row.nodeId.slice(0, 8)}); holding until its stamp stops advancing for ${Math.round(TERM_TAKEOVER_STALE_MS / 1000)}s (Promote sets takeover; FLEET_CONFIRM_TAKEOVER=1 is the env override)`);
+  let baseline = row;
+  let lastAdvanceAt = Date.now();
+  for (;;) {
+    const observingForMs = Date.now() - lastAdvanceAt;
+    if (observingForMs >= TERM_TAKEOVER_STALE_MS) break;
+    _setTakeoverHold({
+      observedTerm: baseline.term,
+      observedNodeId: baseline.nodeId,
+      observingForMs,
+      requiredMs: TERM_TAKEOVER_STALE_MS,
+    });
+    await guardSleep(TERM_GUARD_POLL_MS);
+    const next = await read();
+    if (next === 'unreachable') {
+      lastAdvanceAt = Date.now();
+      continue;
+    }
+    if (!next) {
+      _setTakeoverHold(null);
+      return null;
+    }
+    if (next.nodeId === selfNodeId) {
+      _setTakeoverHold(null);
+      return null;
+    }
+    if (next.term !== baseline.term || next.updatedAt !== baseline.updatedAt) {
+      baseline = next;
+      lastAdvanceAt = Date.now();
+    }
+  }
+  _setTakeoverHold(null);
+  console.warn(`[Fleet] Takeover guard released: term ${baseline.term} (node ${baseline.nodeId.slice(0, 8)}) stopped advancing; proceeding to take over`);
+  return { term: baseline.term, nodeId: baseline.nodeId };
+}
+
+function guardSleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 async function initMaster(init: CommonInit & { standalone: boolean }): Promise<FleetContext> {
   const { standalone, nodeId, nodeName, appVersion, capabilities, runtime } = init;
   const ingest = getIngestService();
   const store = await prepareControlStore(standalone);
   // A control-store fence trip means a second master owns the schema: this
-  // master stops granting entirely (the higher-term master is the healthy one).
+  // master stops granting entirely (the higher-term master is the healthy
+  // one). Teardown (assigned once the server exists) drops every worker so
+  // their candidate cycle finds the live master, and new registers are
+  // refused 'deposed' via the controlFenced check in onRegister.
   let controlFenced = false;
+  let onDeposedTeardown: (() => void) | null = null;
   if (store instanceof PostgresControlStore) {
     store.onFenced(observedTerm => {
       controlFenced = true;
       _setControlStoreFenced(observedTerm);
       console.error(`[Fleet] MASTER DEPOSED BY CONTROL STORE: term ${observedTerm} observed; granting stopped until restart`);
+      onDeposedTeardown?.();
       pushFleetStatusNow();
     });
   }
@@ -333,7 +446,27 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   // backend is globally unhealthy (re-granting would just burn identifies);
   // the first healthy report re-enters them into placement.
   const timeoutDeclinedShards = new Set<number>();
+
+  // Boot takeover guard (PLAN_STANDBY 3.2) + previous-holder capture for the
+  // ruling-5 takeover chain. The override's one-shot flags are read BEFORE the
+  // CAS and consumed right after it succeeds.
+  const bootOverride = readRoleOverride();
+  const takeoverConfirmed = bootOverride?.takeover === true
+    || (process.env.FLEET_CONFIRM_TAKEOVER || '').trim() === '1';
+  const chainTakeover = !standalone && bootOverride?.chainTakeover === true;
+  let previousHolder: { term: number; nodeId: string } | null = null;
+  if (store instanceof PostgresControlStore && !standalone) {
+    previousHolder = await runTakeoverGuard(store, nodeId, takeoverConfirmed);
+  }
+
   const term = await store.acquireTerm(nodeId);
+  if (bootOverride?.takeover || bootOverride?.chainTakeover) consumeTakeoverFlags();
+  // The stamp is this master's own lease (PLAN_STANDBY 3.1): deposed masters
+  // learn of it within one interval, and unwritable stamps feed the self-fence.
+  if (store instanceof PostgresControlStore && !standalone) {
+    const stampTimer = setInterval(() => void store.stampTerm(), TERM_STAMP_MS);
+    stampTimer.unref();
+  }
 
   const gateway = await fetchGatewayInfo(process.env.DISCORD_TOKEN);
   if (!gateway && process.env.DISCORD_TOKEN) {
@@ -502,10 +635,14 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
 
   // STANDALONE master claims EVERY shard regardless of FLEET_SHARD_CAPACITY
   // (today's single-box behavior, byte-identical boot); the capacity cap
-  // applies only in FLEET mode.
+  // applies only in FLEET mode. Capacity 0 is a real declaration (a pure
+  // standby that serves nothing, PLAN_STANDBY ruling 1); only absent/invalid
+  // declarations fall back to 1.
   const targetFor = (node: RegistryNode): number => {
     if (node.isSelf && standalone) return registry.shardCount;
-    return Math.max(1, node.capabilities?.shardCapacity ?? 1);
+    const declared = node.capabilities?.shardCapacity;
+    if (declared === 0) return 0;
+    return Math.max(1, declared ?? 1);
   };
 
   // Master-side mirror of the worker's same-shape adopt: a grant identifies
@@ -1610,6 +1747,11 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     server = new ControlServer({
       getTerm: () => registry.term,
       onRegister: (payload: RegisterPayload, send): RegisterResult => {
+        // Deposed/self-fenced: refuse with the reason the client treats as
+        // advance-to-next-candidate, so redialing workers find the live master.
+        if (controlFenced) {
+          return refuse('deposed', payload);
+        }
         if (!payload || typeof payload.nodeId !== 'string' || payload.nodeId.length === 0) {
           return refuse('invalid-register-payload', payload);
         }
@@ -1779,6 +1921,83 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     await transformer.recover().catch(error =>
       console.error('[Transform] Recovery failed:', error instanceof Error ? error.message : error));
     await server.start(port, secret);
+    onDeposedTeardown = () => server?.dropAll();
+
+    // Master self-fence watchdog (PLAN_STANDBY 3.8): latches only when the
+    // backup's promotion is genuinely imminent. Three guards protect the C1
+    // coast: the backup must have been seen ALIVE this boot (a registry record
+    // restored from persistence proves nothing), its disconnect must be
+    // CONFIRMED (continuous >= BACKUP_DOWN_CONFIRM_MS - a WS blip through a
+    // proxy reload can never latch), and the disconnect must be CONCURRENT
+    // with the store silence (a backup that died long before the outage is
+    // not promoting off it). A global DB outage with the backup's WS up (or
+    // only blipping) coasts on C1 exactly as without any backup.
+    if (store instanceof PostgresControlStore) {
+      const armedDownSince = new Map<string, number>();
+      const selfFenceTimer = setInterval(() => {
+        if (controlFenced) return;
+        const now = Date.now();
+        for (const n of registry.nodes.values()) {
+          if (n.isSelf || n.capabilities?.autoPromote !== true) continue;
+          if (n.connected || n.lastHeartbeatAt === null) {
+            armedDownSince.delete(n.nodeId);
+          } else if (!armedDownSince.has(n.nodeId)) {
+            armedDownSince.set(n.nodeId, now);
+          }
+        }
+        const failingForMs = store.getStampFailingForMs();
+        if (failingForMs === null || failingForMs < MASTER_SELF_FENCE_MS) return;
+        const failingSince = now - failingForMs;
+        const promotionImminent = [...armedDownSince.values()].some(downSince =>
+          now - downSince >= BACKUP_DOWN_CONFIRM_MS && downSince >= failingSince - BACKUP_DOWN_CONFIRM_MS);
+        if (!promotionImminent) return;
+        controlFenced = true;
+        store.latchSelfFence();
+        _setSelfFenced(`control store silent for ${Math.round(failingForMs / 1000)}s with the auto-promote backup disconnected alongside it`);
+        console.error('[Fleet] MASTER SELF-FENCE: control store silent and the auto-promote backup went down with it; it WILL promote - destroying gateway sessions and stopping grants until restart');
+        server?.dropAll();
+        void runtime.expire('master self-fence: standby takeover imminent');
+        pushFleetStatusNow();
+      }, HEARTBEAT_MS);
+      selfFenceTimer.unref();
+    }
+
+    // Ruling-5 takeover chain: a promotion staged over a DEAD master
+    // (chainTakeover one-shot) declares the previous holder lost once the
+    // hold-down proved its sessions gone, freeing its shards for placement.
+    // A previous master that somehow re-registered is left strictly alone.
+    // Failures NEVER escape (an unhandled rejection here would kill the
+    // freshly promoted master mid-failover) and retry on a timer: the
+    // one-shot flag and the pre-CAS holder capture cannot survive a restart,
+    // so the promoted process itself must see the chain through.
+    if (chainTakeover && previousHolder && previousHolder.nodeId !== nodeId) {
+      const chainTarget = previousHolder;
+      const chainDelayMs = (rec.recovered || paused ? RECOVERY_HOLDDOWN_MS : REGISTER_GRACE_MS) + 2000;
+      console.warn(`[Fleet] Takeover chain armed: previous master ${chainTarget.nodeId.slice(0, 8)} (term ${chainTarget.term}) will be declared lost in ${Math.round(chainDelayMs / 1000)}s unless it re-registers`);
+      const runChain = async (): Promise<void> => {
+        if (controlFenced) return;
+        const old = registry.nodes.get(chainTarget.nodeId);
+        if (!old) {
+          console.log('[Fleet] Takeover chain: the previous master holds nothing (adopted plan empty for it, or already declared lost); chain done');
+          return;
+        }
+        if (old.connected) {
+          console.warn(`[Fleet] Takeover chain: previous master ${old.nodeName} re-registered; leaving its shards alone`);
+          return;
+        }
+        console.warn(`[Fleet] Takeover chain: declaring previous master ${old.nodeName} lost (stale term ${chainTarget.term})`);
+        try {
+          const res = await fleetDeclareLost(chainTarget.nodeId);
+          if (res.success) return;
+          console.error(`[Fleet] Takeover chain Declare Lost refused: ${res.error}; retrying in ${Math.round(XFER_COMMIT_RETRY_MS / 1000)}s`);
+        } catch (error) {
+          console.error(`[Fleet] Takeover chain Declare Lost failed (retrying in ${Math.round(XFER_COMMIT_RETRY_MS / 1000)}s):`, error instanceof Error ? error.message : error);
+        }
+        setTimeout(() => void runChain(), XFER_COMMIT_RETRY_MS).unref();
+      };
+      setTimeout(() => void runChain(), chainDelayMs).unref();
+    }
+
     // Migration crash recovery runs AFTER the P1 plan/registry reload above (the
     // reload seeded registry.shardTable/epoch), so pre-COMMITTING migrations
     // abort, COMMITTING resumes commit retries, GRANTING re-issues grants.
@@ -1870,6 +2089,9 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     migration: coordinator ? () => coordinator!.getView() : null,
     transformation: () => transformer?.getView() ?? null,
     pinViolation: standalone ? null : () => pinViolation,
+    termStamp: store instanceof PostgresControlStore && !standalone ? () => store.getStampFailingForMs() : null,
+    autoPromote: null,
+    migrationActive: null,
   });
 
   // Owner-info source for .owner manifests (dataManager cannot import fleet).
@@ -1908,15 +2130,15 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
 async function initCoWorker(init: CommonInit): Promise<FleetContext> {
   const { nodeId, nodeName, appVersion, capabilities, runtime } = init;
   const ingest = getIngestService();
-  const masterUrl = (process.env.MASTER_URL || '').trim();
+  const masterUrls = resolveMasterUrls();
   const secret = (process.env.CONTROL_SECRET || '').trim();
 
-  console.log(`[Fleet] Role: co-worker node=${nodeName} (${nodeId.slice(0, 8)}) master=${masterUrl || 'none'} capacity=${capabilities.shardCapacity}`);
+  console.log(`[Fleet] Role: co-worker node=${nodeName} (${nodeId.slice(0, 8)}) masters=${masterUrls.join(' | ') || 'none'} capacity=${capabilities.shardCapacity}${isBackupMaster() ? ` BACKUP MASTER${isAutoPromoteEnabled() ? ' (auto-promote)' : ''}` : ''}`);
 
   let controlClient: ControlClient | null = null;
   let syncEngine: SyncEngine | null = null;
   let executor: MigrationExecutor | null = null;
-  if (masterUrl && secret) {
+  if (masterUrls.length > 0 && secret) {
     const engine = new SyncEngine({
       request: (type, data) => controlClient!.syncRequest(type, data),
       getTerm: () => controlClient!.getTerm(),
@@ -1933,7 +2155,6 @@ async function initCoWorker(init: CommonInit): Promise<FleetContext> {
       selfTransferUrl: () => advertisedTransferUrl,
       transferPort: () => transferPort,
     });
-    migrationWorkActive = () => executor?.hasActiveLegs() ?? false;
     // Transformation participant: converts its own guilds and applies the
     // flip; a completed flip refreshes the advertised capability like a
     // delivered-backend change does.
@@ -1944,8 +2165,11 @@ async function initCoWorker(init: CommonInit): Promise<FleetContext> {
         controlClient?.sendToMaster(MSG.CAPABILITY_REFRESH, { term: controlClient.getTerm(), capabilities });
       },
     });
+    // Promote-precheck signal: BOTH executors' live work counts (a promotion
+    // restart mid-convert would break a transformation guild window).
+    migrationWorkActive = () => (executor?.hasActiveLegs() ?? false) || transformExecutor.isBusy();
     controlClient = new ControlClient({
-      masterUrl,
+      masterUrls,
       secret,
       runtime,
       buildRegister: (): RegisterPayload => ({
@@ -2031,7 +2255,30 @@ async function initCoWorker(init: CommonInit): Promise<FleetContext> {
       })();
     });
   } else {
-    console.error('[Fleet] Co-worker requires MASTER_URL and CONTROL_SECRET; idling without a master');
+    console.error('[Fleet] Co-worker requires MASTER_URLS (or MASTER_URL) and CONTROL_SECRET; idling without a master');
+  }
+
+  // Auto-promotion (PLAN_STANDBY 3.8): the designated backup stages its own
+  // promotion (override + parent-driven restart) when the term row goes silent
+  // AND the master WS is down. The override is written HERE, child-side, so a
+  // parent that misses the notification still promotes on the next restart.
+  let autoWatcher: AutoPromoteWatcher | null = null;
+  if (controlClient && isAutoPromoteEnabled()) {
+    const client = controlClient;
+    autoWatcher = new AutoPromoteWatcher({
+      masterConnected: () => client.masterKnown(),
+      requestPromotion: info => {
+        writeRoleOverride({ role: 'master', takeover: true, chainTakeover: true, setAt: Date.now(), setBy: 'auto-promote' });
+        if (process.send) {
+          try {
+            process.send({ type: 'fleet:promote-restart', data: info });
+            return;
+          } catch { /* fall through to the manual-restart log */ }
+        }
+        console.error('[Fleet] Auto-promotion staged (role override written) but the webui parent could not be notified; restart the bot to complete it');
+      },
+    });
+    autoWatcher.start();
   }
 
   _setFleetStateSources({
@@ -2055,6 +2302,9 @@ async function initCoWorker(init: CommonInit): Promise<FleetContext> {
     migration: null,
     transformation: null,
     pinViolation: null,
+    termStamp: null,
+    autoPromote: autoWatcher ? () => autoWatcher!.getStatus() : null,
+    migrationActive: () => migrationWorkActive(),
   });
 
   // Owner-info source for .owner manifests: null until the first lease grant.
@@ -2093,7 +2343,7 @@ async function initCoWorker(init: CommonInit): Promise<FleetContext> {
         // Unconfigured co-worker: gate module loading forever (it could never
         // lease anyway) while the web UI stays up for the Connection page.
         // Behavior change from the old pointless module load on this path.
-        console.warn('[Fleet] Co-worker unconfigured: module loading gated until MASTER_URL/CONTROL_SECRET are saved and the bot restarts');
+        console.warn('[Fleet] Co-worker unconfigured: module loading gated until MASTER_URLS/CONTROL_SECRET are saved and the bot restarts');
         return new Promise<void>(() => {});
       }
       const waitLog = setInterval(() => console.log('[Fleet] Waiting for master sync...'), 15000);
@@ -2106,7 +2356,7 @@ async function initCoWorker(init: CommonInit): Promise<FleetContext> {
     // No master configured: keep the process informative and alive, but do NOT
     // block boot - the web UI, IPC and fleet state must still come up.
     setInterval(() => {
-      console.warn('[Fleet] Co-worker idle: MASTER_URL/CONTROL_SECRET not configured');
+      console.warn('[Fleet] Co-worker idle: MASTER_URLS/CONTROL_SECRET not configured');
     }, 3600000);
     return ctx;
   }

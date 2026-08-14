@@ -473,14 +473,15 @@ async function main() {
   // identity verifies.
   initDataBackendLayer();
 
+  // Fleet IPC needs no client and must answer BEFORE initFleet returns: the
+  // boot takeover guard can hold a master boot for its whole observation
+  // window, and the webui must render that hold (pre-init fleet state) live.
+  setupFleetIPCHandlers();
+
   // Fleet boot: role resolution, term acquisition, shard leases. Standalone
   // resolves to a master with self-granted leases; a co-worker holds here
   // until its master grants a lease.
   const fleet = await initFleet();
-
-  // Fleet IPC needs no client and must answer while the sync gate below
-  // blocks, so the webui can poll /api/fleet/state during the wait.
-  setupFleetIPCHandlers();
 
   // Sync boot gate: a co-worker blocks until its files/modules mirror the
   // master (instant on master + standalone). Runs BEFORE ensureConfigPopulated

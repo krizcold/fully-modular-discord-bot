@@ -146,7 +146,9 @@ export function getShardSource(): 'discord' | 'override' {
  */
 export function resolveShardCapacity(): number {
   const raw = Number(process.env.FLEET_SHARD_CAPACITY);
-  return Number.isInteger(raw) && raw > 0 ? raw : 1;
+  // 0 is a real declaration: a pure standby that serves nothing
+  // (PLAN_STANDBY ruling 1). Absent/invalid still defaults to 1.
+  return Number.isInteger(raw) && raw >= 0 ? raw : 1;
 }
 
 /** True when PIN_TEST_GUILD_SHARD=true; env missing = false. */

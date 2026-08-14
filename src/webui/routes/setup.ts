@@ -20,7 +20,27 @@ import { isStandalone as isStandaloneFleet, resolveNodeRole } from '../../bot/in
 import { isCoWorkerNode } from '../middleware/fleetGate';
 
 /** The only fields a co-worker edits locally; everything else mirrors the master via sync. */
-const CONNECTION_FIELDS = ['DISCORD_TOKEN', 'MASTER_URL', 'CONTROL_SECRET', 'NODE_NAME', 'FLEET_SHARD_CAPACITY'] as const;
+const CONNECTION_FIELDS = ['DISCORD_TOKEN', 'MASTER_URL', 'MASTER_URLS', 'CONTROL_SECRET', 'NODE_NAME', 'FLEET_SHARD_CAPACITY', 'FLEET_BACKUP_MASTER', 'FLEET_AUTO_PROMOTE'] as const;
+
+/**
+ * Non-secret standby fields where a blanked form field is an EXPLICIT clear
+ * (an armed FLEET_AUTO_PROMOTE must be disarmable from the UI). Every other
+ * connection field keeps the historical blank-keeps-existing semantics.
+ */
+const CLEARABLE_CONNECTION_FIELDS = new Set<string>(['MASTER_URLS', 'FLEET_BACKUP_MASTER', 'FLEET_AUTO_PROMOTE']);
+
+/**
+ * Fleet wiring the master-branch credentials save must PRESERVE verbatim: it
+ * has no fleet form fields, but a promoted ex-co-worker's /data/.env carries
+ * them, and the branch's rebuild-from-scratch save would otherwise silently
+ * wipe CONTROL_SECRET/MASTER_URLS - leaving the node to boot as a STANDALONE
+ * master claiming every shard on the shared token after its next restart.
+ */
+const PRESERVED_FLEET_FIELDS = [
+  'BOT_NODE_ROLE', 'MASTER_URL', 'MASTER_URLS', 'CONTROL_SECRET', 'CONTROL_PORT', 'FLEET_PUBLIC_URL',
+  'NODE_NAME', 'PIN_TEST_GUILD_SHARD', 'FLEET_SHARD_COUNT', 'FLEET_SHARD_CAPACITY',
+  'FLEET_BACKUP_MASTER', 'FLEET_AUTO_PROMOTE', 'TRANSFER_URL', 'TRANSFER_PORT',
+] as const;
 
 const OAUTH_FIELDS = ['ENABLE_GUILD_WEBUI', 'DISCORD_CLIENT_ID', 'DISCORD_CLIENT_SECRET', 'OAUTH_CALLBACK_URL'] as const;
 
@@ -104,8 +124,11 @@ export function createSetupRoutes(): Router {
         ...(nodeRole === 'co-worker' ? {
           connection: {
             MASTER_URL: credentials.MASTER_URL || '',
+            MASTER_URLS: credentials.MASTER_URLS || '',
             NODE_NAME: credentials.NODE_NAME || '',
             FLEET_SHARD_CAPACITY: credentials.FLEET_SHARD_CAPACITY || '',
+            FLEET_BACKUP_MASTER: credentials.FLEET_BACKUP_MASTER || '',
+            FLEET_AUTO_PROMOTE: credentials.FLEET_AUTO_PROMOTE || '',
             CONTROL_SECRET_SET: !!(credentials.CONTROL_SECRET && credentials.CONTROL_SECRET.trim() !== ''),
             DISCORD_TOKEN_SET: !!(credentials.DISCORD_TOKEN && credentials.DISCORD_TOKEN.trim() !== ''),
           },
@@ -137,14 +160,25 @@ export function createSetupRoutes(): Router {
         const credentials: BotCredentials = { ...existingCredentials };
         for (const field of CONNECTION_FIELDS) {
           const value = req.body?.[field];
-          if (typeof value === 'string' && value.trim() !== '') {
+          if (typeof value !== 'string') continue;
+          if (value.trim() !== '') {
             credentials[field] = value.trim();
+          } else if (CLEARABLE_CONNECTION_FIELDS.has(field)) {
+            delete credentials[field];
           }
         }
         if (credentials.FLEET_SHARD_CAPACITY !== undefined && credentials.FLEET_SHARD_CAPACITY !== ''
             && !/^\d+$/.test(credentials.FLEET_SHARD_CAPACITY)) {
           res.status(400).json({ success: false, error: 'FLEET_SHARD_CAPACITY must be a positive integer' });
           return;
+        }
+        // MASTER_URLS never implies a role (it is carried by masters too), so
+        // pin the explicit role this page exclusively serves: without it, a
+        // node configured via MASTER_URLS that later drops its legacy
+        // MASTER_URL would silently boot as a master.
+        if ((credentials.MASTER_URLS || '').trim() !== ''
+            && (credentials.BOT_NODE_ROLE || '').trim() === '') {
+          credentials.BOT_NODE_ROLE = 'co-worker';
         }
         const saveResult = saveCredentials(credentials);
         if (!saveResult.success) {
@@ -333,6 +367,12 @@ export function createSetupRoutes(): Router {
         ...(isStandalone && CONTROL_STORE_URL && CONTROL_STORE_URL.trim() !== ''
           ? { CONTROL_STORE_URL: CONTROL_STORE_URL.trim() }
           : existingCredentials.CONTROL_STORE_URL && { CONTROL_STORE_URL: existingCredentials.CONTROL_STORE_URL }),
+        // Fleet wiring: never edited here, always preserved (see
+        // PRESERVED_FLEET_FIELDS - a promoted ex-co-worker's file holds it).
+        ...Object.fromEntries(
+          PRESERVED_FLEET_FIELDS
+            .filter(k => existingCredentials[k] !== undefined && existingCredentials[k] !== '')
+            .map(k => [k, existingCredentials[k]])),
         // Payment provider credentials (Stripe/PayPal/LS/Patreon/Discord/...)
         // are persisted via the per-provider modal route in appstore.ts,
         // not here. Existing values are preserved naturally because we

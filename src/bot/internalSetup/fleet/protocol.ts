@@ -67,6 +67,10 @@ export interface NodeCapabilities {
   dataBackend: 'file' | 'postgres' | 'unknown';
   /** Advertised transfer endpoint (ws://host:port) when TRANSFER_URL is set; direction-by-reachability uses it. */
   transferUrl?: string;
+  /** Designated backup master (FLEET_BACKUP_MASTER=1); badges the fleet view and gates the promote surface. */
+  backupMaster?: boolean;
+  /** The backup will self-promote on master silence (FLEET_AUTO_PROMOTE=1); arms the master's self-fence. */
+  autoPromote?: boolean;
 }
 
 export interface RegisterPayload {

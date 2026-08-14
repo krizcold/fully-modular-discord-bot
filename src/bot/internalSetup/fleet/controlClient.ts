@@ -31,7 +31,8 @@ import {
 import type { LeaseRuntime } from './leaseRuntime';
 
 export interface ControlClientOptions {
-  masterUrl: string;
+  /** Ordered master candidate list (PLAN_STANDBY 3.4); cycled on reconnect, never empty. */
+  masterUrls: string[];
   secret: string;
   buildRegister: () => RegisterPayload;
   runtime: LeaseRuntime;
@@ -56,6 +57,10 @@ export class ControlClient {
   private registered = false;
   private term = 0;
   private attempt = 0;
+  // Candidate cursor. A close without a successful registration advances it
+  // (dead endpoint, refused register, deposed master); a registered connection
+  // that drops retries the SAME candidate first (blip vs failover).
+  private urlIndex = 0;
   private stopped = false;
   private lastContactAt: number | null = null;
   private draining = false;
@@ -125,23 +130,29 @@ export class ControlClient {
     this.send(type, data);
   }
 
+  /** The candidate currently being dialed (or held); for the fleet-state view. */
+  getCurrentMasterUrl(): string {
+    return this.opts.masterUrls[this.urlIndex % this.opts.masterUrls.length];
+  }
+
   private connect(): void {
     if (this.stopped) return;
-    const ws = new WebSocket(this.opts.masterUrl, {
+    const ws = new WebSocket(this.getCurrentMasterUrl(), {
       headers: { 'x-control-secret': this.opts.secret },
       handshakeTimeout: CONTROL_ACK_TIMEOUT_MS,
     });
     this.ws = ws;
+    let registeredHere = false;
 
     ws.on('open', () => {
       this.touch();
-      void this.register();
+      void this.register().then(ok => { registeredHere = ok; });
     });
     ws.on('message', raw => void this.onMessage(raw));
     ws.on('ping', () => this.touch());
     ws.on('error', error => {
       if (this.attempt <= 1) {
-        console.warn(`[Fleet] Control connection error: ${error instanceof Error ? error.message : error}`);
+        console.warn(`[Fleet] Control connection error (${this.getCurrentMasterUrl()}): ${error instanceof Error ? error.message : error}`);
       }
     });
     ws.on('close', () => {
@@ -149,6 +160,14 @@ export class ControlClient {
       this.registered = false;
       this.failPending(new Error('control connection closed'));
       if (wasRegistered) console.warn('[Fleet] Lost control connection to master; reconnecting');
+      // Never registered on this connection: the endpoint is dead, refusing,
+      // or deposed - advance to the next candidate. A registered connection
+      // that dropped retries the same master first (an outage advances on the
+      // following failed attempt).
+      if (!registeredHere && this.opts.masterUrls.length > 1) {
+        this.urlIndex = (this.urlIndex + 1) % this.opts.masterUrls.length;
+        console.log(`[Fleet] Advancing to master candidate ${this.getCurrentMasterUrl()}`);
+      }
       this.scheduleReconnect();
     });
   }
@@ -158,7 +177,7 @@ export class ControlClient {
     const delay = RECONNECT_BACKOFF_MS[Math.min(this.attempt, RECONNECT_BACKOFF_MS.length - 1)];
     this.attempt++;
     if (this.attempt <= 3 || this.attempt % 10 === 0) {
-      console.log(`[Fleet] Master unreachable; retrying in ${delay}ms (attempt ${this.attempt})`);
+      console.log(`[Fleet] Master unreachable; retrying in ${delay}ms (attempt ${this.attempt}, next ${this.getCurrentMasterUrl()})`);
     }
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
@@ -166,18 +185,24 @@ export class ControlClient {
     }, delay);
   }
 
-  private async register(): Promise<void> {
+  private async register(): Promise<boolean> {
     try {
       const result = (await this.request(MSG.REGISTER, this.opts.buildRegister())) as RegisterResult;
       if (!result?.accepted) {
         console.error(`[Fleet] Master refused registration: ${result?.reason ?? 'unknown'}; retrying with backoff`);
-        // A refusal is definitive (unlike a transient disconnect): expire the
-        // cached lease now, or the refusal-redial loop would renew the lease
-        // clock forever (backoff caps below the TTL) and keep unrecorded
-        // sessions alive past the master's recovery hold-down.
-        await this.opts.runtime.expire(`registration refused: ${result?.reason ?? 'unknown'}`);
+        // A deposed master is refusing because it is NOT the master anymore;
+        // the lease may be perfectly valid at its successor, so keep the
+        // cached sessions and let the candidate cycle find the live master
+        // (the same-shape adopt then costs zero identifies). Every other
+        // refusal is definitive: expire the cached lease now, or the
+        // refusal-redial loop would renew the lease clock forever (backoff
+        // caps below the TTL) and keep unrecorded sessions alive past the
+        // master's recovery hold-down.
+        if (result?.reason !== 'deposed') {
+          await this.opts.runtime.expire(`registration refused: ${result?.reason ?? 'unknown'}`);
+        }
         this.ws?.close();
-        return;
+        return false;
       }
       this.term = result.term;
       this.registered = true;
@@ -186,10 +211,12 @@ export class ControlClient {
       if (result.budget) this.lastBudget = result.budget;
       this.opts.onDataBackend?.(result.dataBackend);
       this.touch();
-      console.log(`[Fleet] Registered with master (term ${this.term})`);
+      console.log(`[Fleet] Registered with master at ${this.getCurrentMasterUrl()} (term ${this.term})`);
+      return true;
     } catch (error) {
       console.warn(`[Fleet] Registration failed: ${error instanceof Error ? error.message : error}`);
       this.ws?.close();
+      return false;
     }
   }
 
@@ -344,12 +371,24 @@ export class ControlClient {
   }
 
   private checkTtl(): void {
-    if (!this.opts.runtime.hasCurrentLease()) return;
     if (this.lastContactAt === null) return;
     if (performance.now() - this.lastContactAt <= LEASE_TTL_MS) return;
-    this.registered = false;
-    void this.opts.runtime.expire('no master contact past LEASE_TTL');
-    this.ws?.terminate();
+    // Connection liveness is checked for EVERY registered client, lease or
+    // not: the master pings every LEASE_RENEW_MS, so this much silence on an
+    // OPEN socket means the peer died without FIN (host loss). A leaseless
+    // backup must detect that too, or masterKnown() stays true for the OS TCP
+    // timeout (~15-30 min) and both the auto-promote trigger and the manual
+    // Promote modal's master-down view are blind to the death. Lease expiry
+    // itself stays gated on actually holding one.
+    if (this.opts.runtime.hasCurrentLease()) {
+      this.registered = false;
+      void this.opts.runtime.expire('no master contact past LEASE_TTL');
+      this.ws?.terminate();
+    } else if (this.registered) {
+      this.registered = false;
+      console.warn('[Fleet] No master contact past LEASE_TTL on a leaseless connection; terminating for redial');
+      this.ws?.terminate();
+    }
   }
 
   private touch(): void {

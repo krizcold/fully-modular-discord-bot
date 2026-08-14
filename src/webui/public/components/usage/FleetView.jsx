@@ -815,6 +815,13 @@ function FleetNodeCard({ node, isMasterView, onAction, masterSyncRevision, retir
           color={node.isMaster ? '#a0c0f0' : '#bbb'}
         />
         {node.isSelf ? <FleetBadge text="self" background="#2b4a2b" color="#a0e0a0" /> : null}
+        {node.capabilities && node.capabilities.backupMaster ? (
+          <FleetBadge
+            text={node.capabilities.autoPromote ? 'BACKUP (auto)' : 'BACKUP'}
+            background="#2b3a5c"
+            color="#8ab4f8"
+          />
+        ) : null}
         {node.onHold ? <FleetBadge text="ON HOLD" background="#4a3a1a" color="#fee75c" /> : null}
         {node.draining ? <FleetBadge text="DRAINING" background="#4a3a1a" color="#fee75c" /> : null}
         {node.backoff ? <FleetBadge text="BACKOFF" background="#4a2a1a" color="#f0a0a0" /> : null}
@@ -898,31 +905,104 @@ function FleetNodeCard({ node, isMasterView, onAction, masterSyncRevision, retir
   );
 }
 
+// Warm standby (PLAN_STANDBY 3.5): the designated backup's promote surface.
+// Rendered ONLY on the backup co-worker's own UI in postgres mode. The
+// chainTakeover decision follows what this node can see: master WS down =
+// dead-master failover (declare lost + take its shards), master WS up =
+// planned handover (the deposed master keeps its shards until demoted).
+function FleetBackupCard({ api, fleet }) {
+  const [busy, setBusy] = React.useState(false);
+  const auto = fleet.autoPromote;
+  const masterDown = !fleet.masterKnown;
+  const promote = () => {
+    if (busy) return;
+    const text = masterDown
+      ? 'Promote this backup to MASTER?\n\nThe master looks unreachable from this node. After the safety hold-down the old master is declared lost and its shards are taken over. This node restarts; its own shards re-identify (budget-metered) and workers reattach at zero identify cost.'
+      : 'The master still looks ALIVE from this node. Promote anyway as a PLANNED HANDOVER?\n\nThe current master is deposed within seconds (its next liveness stamp fences it) and KEEPS its shards until you demote it from its own UI. If it is alive but cut off (partitioned), stop its container first instead of promoting over it.';
+    if (!confirm(text)) return;
+    setBusy(true);
+    api.post('/fleet/promote', { takeover: true, chainTakeover: masterDown })
+      .then((res) => {
+        if (!res || res.success === false) { showToast((res && res.error) || 'Promotion failed', 'error'); return; }
+        showToast('Promotion started: this node restarts as master', 'success');
+      })
+      .catch((err) => showToast((err && err.message) || 'Promotion failed', 'error'))
+      .finally(() => setBusy(false));
+  };
+  return (
+    <div className="usage-stat-card" style={{ marginTop: '10px' }}>
+      <div className="usage-stat-title">Backup master</div>
+      <div className="usage-stat-sub">
+        {auto
+          ? `Auto-promotion armed: fires after ~2 minutes of master silence. Term stamp last advanced ${auto.termStaleForMs != null ? Math.round(auto.termStaleForMs / 1000) + 's ago' : 'unknown'}${auto.storeReadOk === false ? ' (store unreachable)' : ''}${auto.fired ? ' - TRIGGERED' : ''}`
+          : 'Manual mode: this node takes over only when you press Promote.'}
+      </div>
+      <button onClick={promote} disabled={busy} style={{ marginTop: '6px' }}>
+        {busy ? 'Promoting...' : 'Promote to master'}
+      </button>
+    </div>
+  );
+}
+
+// Demote surface for a deposed / self-fenced / operator-overridden master.
+function FleetDemoteButton({ api }) {
+  const [busy, setBusy] = React.useState(false);
+  const demote = () => {
+    if (busy) return;
+    if (!confirm('Demote this master to co-worker?\n\nIt restarts, dials the master candidates (MASTER_URLS) and re-adopts its shards from the live master at zero identify cost.')) return;
+    setBusy(true);
+    api.post('/fleet/demote', {})
+      .then((res) => {
+        if (!res || res.success === false) { showToast((res && res.error) || 'Demotion failed', 'error'); return; }
+        showToast('Demotion started: this node restarts as co-worker', 'success');
+      })
+      .catch((err) => showToast((err && err.message) || 'Demotion failed', 'error'))
+      .finally(() => setBusy(false));
+  };
+  return (
+    <button onClick={demote} disabled={busy} style={{ marginTop: '6px', fontSize: '0.72rem', padding: '2px 8px' }}>
+      {busy ? 'Demoting...' : 'Demote to co-worker'}
+    </button>
+  );
+}
+
 function FleetView({ api, wsClient, guildNames }) {
   const [fleet, setFleet] = React.useState(null);
   // Distinguishes "lease expired after the master vanished" from "never had a
   // lease" on a co-worker; reset once the master is back.
   const sawCachedLeaseRef = React.useRef(false);
+  // No WS pushes arrive while the fleet layer is mid-init (e.g. the boot
+  // takeover guard holding), so poll until initialized.
+  const fleetInitializedRef = React.useRef(false);
+
+  const applyFleet = React.useCallback((obj) => {
+    fleetInitializedRef.current = obj != null && obj.initialized === true;
+    setFleet(obj);
+  }, []);
 
   const loadFleet = React.useCallback(() => {
     api.get('/fleet/state')
-      .then((res) => { if (res.success) setFleet(res); })
+      .then((res) => { if (res.success) applyFleet(res); })
       .catch((err) => console.error('[Fleet] Failed to load fleet state:', err));
-  }, [api]);
+  }, [api, applyFleet]);
 
   React.useEffect(() => {
     loadFleet();
     const unsubscribe = wsClient.on('bot:fleet:status', (state) => {
-      setFleet(Object.assign({ success: true, running: true }, state));
+      applyFleet(Object.assign({ success: true, running: true }, state));
     });
     const unsubscribeStatus = wsClient.on('bot:status', () => loadFleet());
     const unsubscribeSync = wsClient.on('bot:sync:status', () => loadFleet());
+    const initPoll = setInterval(() => {
+      if (!fleetInitializedRef.current) loadFleet();
+    }, 5000);
     return () => {
       unsubscribe();
       unsubscribeStatus();
       unsubscribeSync();
+      clearInterval(initPoll);
     };
-  }, [loadFleet]);
+  }, [loadFleet, applyFleet]);
 
   if (!fleet) {
     return (
@@ -937,6 +1017,12 @@ function FleetView({ api, wsClient, guildNames }) {
     return (
       <div className="usage-board">
         <h3>Fleet</h3>
+        {fleet.takeoverHold && (
+          <div className="usage-notice" style={{ borderColor: '#e0a030', color: '#e0a030' }}>
+            {`TAKEOVER GUARD: another master (term ${fleet.takeoverHold.observedTerm}) still looks alive, so this master boot is holding: ${Math.round((fleet.takeoverHold.observingForMs || 0) / 1000)}s of ${Math.round((fleet.takeoverHold.requiredMs || 0) / 1000)}s without its stamp advancing. It proceeds automatically once the incumbent goes silent; a deliberate takeover is started from the backup's Promote button instead. If this node is a returned OLD master, demote it here to rejoin the fleet as a co-worker.`}
+            <div><FleetDemoteButton api={api} /></div>
+          </div>
+        )}
         <div className="usage-empty">
           {!fleet.running
             ? 'Fleet state becomes available once the bot process is running.'
@@ -996,6 +1082,19 @@ function FleetView({ api, wsClient, guildNames }) {
         {fleet.masterKnown && fleet.onHold && (
           <div className="usage-notice">
             On hold: connected to the master, waiting for a shard to be assigned. Not serving any guilds yet.
+          </div>
+        )}
+        {fleet.roleOverride && (
+          <div className="usage-stat-sub" style={{ marginTop: '6px' }}>
+            {`Role set by operator override (${fleet.roleOverride.setBy}, ${new Date(fleet.roleOverride.setAt).toISOString().slice(0, 16).replace('T', ' ')} UTC)`}
+          </div>
+        )}
+        {fleet.backupMaster && fleet.dataBackend === 'postgres' && (
+          <FleetBackupCard api={api} fleet={fleet} />
+        )}
+        {fleet.backupMaster && fleet.dataBackend !== 'postgres' && (
+          <div className="usage-stat-sub" style={{ marginTop: '6px', color: '#777' }}>
+            Designated backup master, but promotion is a postgres-mode feature (file mode has no standby).
           </div>
         )}
         {fleet.masterKnown && !fleet.onHold && (
@@ -1103,7 +1202,28 @@ function FleetView({ api, wsClient, guildNames }) {
 
       {fleet.controlStoreFenced && (
         <div className="usage-notice" style={{ borderColor: '#e5534b', color: '#e5534b' }}>
-          {`CRITICAL: another master (term ${fleet.controlStoreFenced.observedTerm}) owns this fleet's control store. This master has stopped granting shards. Keep exactly one master per control store, then restart this instance.`}
+          {`CRITICAL: another master (term ${fleet.controlStoreFenced.observedTerm}) owns this fleet's control store. This master has stopped granting shards. Demote this node to rejoin the fleet as a co-worker, or keep exactly one master per control store and restart.`}
+          {!fleet.standalone && <div><FleetDemoteButton api={api} /></div>}
+        </div>
+      )}
+
+      {fleet.selfFenced && (
+        <div className="usage-notice" style={{ borderColor: '#e5534b', color: '#e5534b' }}>
+          {`CRITICAL: this master SELF-FENCED (${fleet.selfFenced.reason}). Its gateway sessions were destroyed because the auto-promote backup is expected to take over. Demote this node to rejoin the fleet as a co-worker.`}
+          <div><FleetDemoteButton api={api} /></div>
+        </div>
+      )}
+
+      {fleet.termStampFailingForMs != null && !fleet.controlStoreFenced && !fleet.selfFenced && (
+        <div className="usage-notice">
+          {`Control store unreachable: the term liveness stamp has been failing for ${Math.round(fleet.termStampFailingForMs / 1000)}s. Control-plane writes are held; guilds keep serving on cached state.`}
+        </div>
+      )}
+
+      {fleet.roleOverride && !fleet.standalone && (
+        <div className="usage-stat-sub">
+          {`Role set by operator override (${fleet.roleOverride.setBy}, ${new Date(fleet.roleOverride.setAt).toISOString().slice(0, 16).replace('T', ' ')} UTC)`}
+          {!fleet.controlStoreFenced && !fleet.selfFenced && <div><FleetDemoteButton api={api} /></div>}
         </div>
       )}
 

@@ -4,6 +4,15 @@
 
 import { Router, Request, Response } from 'express';
 import { BotManager } from '../botManager';
+import {
+  clearRoleOverride,
+  invalidateRoleOverrideCache,
+  isStandalone,
+  resolveEnvRole,
+  resolveMasterUrls,
+  resolveNodeRole,
+  writeRoleOverride,
+} from '../../bot/internalSetup/fleet/nodeIdentity';
 
 export function createFleetRoutes(botManager: BotManager): Router {
   const router = Router();
@@ -269,6 +278,120 @@ export function createFleetRoutes(botManager: BotManager): Router {
     } catch (error) {
       console.error('[Fleet] Failed to abort transformation:', error instanceof Error ? error.message : error);
       res.json({ success: false, error: error instanceof Error ? error.message : 'abort failed' });
+    }
+  });
+
+  /**
+   * POST /api/fleet/promote { takeover?, chainTakeover? }
+   * Warm standby (PLAN_STANDBY 3.5): promote THIS node (the designated backup)
+   * to master. Parent-side on purpose - it writes the role override and
+   * restarts the bot child, so it works while the child is mid-restart.
+   * Prechecks run against the child's live fleet state; every refusal is a
+   * clear message, never a 500. takeover skips the boot guard (explicit
+   * intent); chainTakeover additionally declares the dead master lost after
+   * the hold-down (dead-master failover, NOT planned handover).
+   */
+  router.post('/promote', async (req: Request, res: Response) => {
+    try {
+      if (!botManager.isRunning()) {
+        res.json({ success: false, error: 'Bot is not running; start it before promoting' });
+        return;
+      }
+      const result = await botManager.getFleetState();
+      const state: any = result?.success ? result.state : null;
+      if (!state || !state.initialized) {
+        res.json({ success: false, error: 'Fleet state unavailable (bot still initializing); try again shortly' });
+        return;
+      }
+      const refusal = state.role !== 'co-worker' ? 'this node is already a master'
+        : state.backupMaster !== true ? 'this node is not the designated backup master (set FLEET_BACKUP_MASTER=1)'
+        : state.dataBackend !== 'postgres' ? 'promotion is a postgres-mode feature (file mode has no standby)'
+        : state.dataBackendHealthy === false ? 'the database (control store) is unreachable from this node; a promotion would park at boot instead of taking over - wait for it or fix connectivity first'
+        : state.draining === true ? 'this node is draining; promotion refused'
+        : state.migrationWorkActive === true ? 'a migration/transformation is working on this node; wait for it to finish'
+        : null;
+      if (refusal) {
+        res.json({ success: false, error: refusal });
+        return;
+      }
+      writeRoleOverride({
+        role: 'master',
+        ...(req.body?.takeover === true ? { takeover: true } : {}),
+        ...(req.body?.chainTakeover === true ? { chainTakeover: true } : {}),
+        setAt: Date.now(),
+        setBy: 'webui-promote',
+      });
+      console.warn(`[Fleet] PROMOTION staged via web UI (takeover=${req.body?.takeover === true}, chainTakeover=${req.body?.chainTakeover === true}); restarting the bot child as master`);
+      const restart = await botManager.restart();
+      res.json(restart?.success ? { success: true } : { success: false, error: restart?.error ?? 'restart failed; the role override is staged and the next start boots as master' });
+    } catch (error) {
+      console.error('[Fleet] Promotion failed:', error instanceof Error ? error.message : error);
+      res.json({ success: false, error: error instanceof Error ? error.message : 'promotion failed' });
+    }
+  });
+
+  /**
+   * POST /api/fleet/demote
+   * Demote THIS master back to co-worker (deposed/overridden master cleanup,
+   * or the second half of a planned handover). An env co-worker only needs
+   * its override cleared; an env master gets a co-worker override and must
+   * have master candidates configured to dial.
+   *
+   * MUST work in all three master states, not just a healthy one: (a) fully
+   * initialized; (b) parked in the boot takeover guard (initFleet never
+   * returns, so fleet state stays pre-init forever - the flagship
+   * old-master-returns flow lives exactly there); (c) bot child down/crash-
+   * looping. For (b) and (c) the child's state is unusable (the pre-init
+   * branch hardcodes role/standalone), so the prechecks run from PARENT-side
+   * truth: the same env + override file the child would boot from.
+   */
+  router.post('/demote', async (req: Request, res: Response) => {
+    try {
+      // The override may have been written by the bot child (auto-promote);
+      // never trust this process's cached copy for a role decision.
+      invalidateRoleOverrideCache();
+      const running = botManager.isRunning();
+      let state: any = null;
+      if (running) {
+        const result = await botManager.getFleetState();
+        state = result?.success ? result.state : null;
+      }
+      if (state && state.initialized) {
+        const refusal = state.role !== 'master' ? 'this node is not a master'
+          : state.standalone === true ? 'a standalone master has no fleet to rejoin; demotion is meaningless here'
+          : (!Array.isArray(state.masterUrls) || state.masterUrls.length === 0)
+            ? 'no master candidates configured (set MASTER_URLS first, or the demoted node would idle)'
+          : null;
+        if (refusal) {
+          res.json({ success: false, error: refusal });
+          return;
+        }
+      } else if (running && !(state && (state.takeoverHold || state.selfFenced))) {
+        // Genuine early boot with no hold: seconds away from real state.
+        res.json({ success: false, error: 'Fleet state unavailable (bot still initializing); try again shortly' });
+        return;
+      } else {
+        // Guard-held boot or a downed child: parent-side prechecks.
+        const refusal = resolveNodeRole() !== 'master' ? 'this node is not a master'
+          : isStandalone() ? 'a standalone master has no fleet to rejoin; demotion is meaningless here'
+          : resolveMasterUrls().length === 0 ? 'no master candidates configured (set MASTER_URLS first, or the demoted node would idle)'
+          : null;
+        if (refusal) {
+          res.json({ success: false, error: refusal });
+          return;
+        }
+      }
+      if (resolveEnvRole() === 'co-worker') {
+        clearRoleOverride();
+      } else {
+        writeRoleOverride({ role: 'co-worker', setAt: Date.now(), setBy: 'webui-demote' });
+      }
+      console.warn('[Fleet] DEMOTION staged via web UI; restarting the bot child as co-worker');
+      const restart = await botManager.restart();
+      res.json(restart?.success ? { success: true } : { success: false, error: restart?.error ?? 'restart failed; the role change is staged and the next start boots as co-worker' });
+    } catch (error) {
+      console.error('[Fleet] Demotion failed:', error instanceof Error ? error.message : error);
+      res.json({ success: false, error: error instanceof Error ? error.message : 'demotion failed' });
     }
   });
 
