@@ -68,8 +68,57 @@ The database provisions its own schema on first contact; there is nothing to cre
    cross-host database; the in-fleet credential handover requires the control secret (use `wss://`
    across untrusted networks); and if you want at-rest protection, use full-disk encryption on the
    host, where it belongs.
+7. **Database HA is postgres-native, below the app.** Neither the bot nor the manager replicates
+   the database, ever: high availability of the data layer comes from the database world itself
+   (a managed Postgres, or streaming replication behind one stable URL). The fleet is already
+   built to ride a database failover: nodes coast on the bounded write-acceptance window while
+   the URL fails over, a promoted replica keeps the store identity and is reattached to
+   normally, and a wrong or empty database is refused outright instead of served. The sidecar
+   tier's honest recovery point stays the nightly `pg_dump`.
 
-## Switching an existing deployment
+## High availability: the warm standby master
+
+Master-role failure (the machine running the fleet master dies) is handled by a designated
+backup master. This is a postgres-mode feature: file mode intentionally has no standby, because
+a standby cannot serve a dead node's local disk (transform to postgres first).
+
+Two Discord facts shape the design. One token allows exactly ONE gateway session per shard, so a
+backup can never sit connected to the master's shards "just in case"; and all fleet nodes read
+the same central database, so there is nothing to copy when taking over. The only step physics
+forces on a takeover is re-identifying the dead master's shards, which takes seconds and is
+metered by the identify budget.
+
+**Setup.** Pick one co-worker and set `FLEET_BACKUP_MASTER=1` on it (any capacity works;
+`FLEET_SHARD_CAPACITY=0` makes a pure standby that serves nothing). Give EVERY fleet node
+`MASTER_URLS`: an ordered, comma-separated list of every master-capable control URL, the normal
+master first, the backup second. Workers cycle through the list on reconnect, so a failover
+needs no reconfiguration anywhere. Set `BOT_NODE_ROLE` explicitly on every node that carries
+`MASTER_URLS` (`master` on the master, `co-worker` on workers): the candidate list itself never
+changes a node's role, and the bot logs a warning when it finds the list without an explicit
+role.
+
+**Unplanned failover (master died).** Open the backup's web UI, Usage tab, Fleet section, and
+press "Promote to master". One click does the whole thing: the node restarts as master, takes
+the term, waits out the safety hold-down, declares the dead master lost, and takes over its
+shards. Workers redial down their candidate list and reattach at zero identify cost.
+
+**Automatic failover.** Set `FLEET_AUTO_PROMOTE=1` on the designated backup and it pulls the
+same lever itself when the master's liveness stamp goes silent for about two minutes AND its
+control connection to the master is down. Both signals must agree, so a master that merely lost
+the database (and is riding the acceptance window) is never shot. Default off: without the flag
+the backup is exactly a warm manual backup and nothing else.
+
+**Planned handover (rolling upgrades: standby first, master last).** Promote the backup while
+the old master is still alive; the confirm dialog recognizes this case. The old master is
+deposed within seconds (its next stamp fences it) and KEEPS its shards; then press "Demote to
+co-worker" on the old master's own UI and it rejoins the fleet and re-identifies its own shards
+(the demote restart ended their sessions, so this identify cost is physics, not overhead). A
+full handover costs identifies for the two restarted nodes' own shards; every other worker
+reattaches for free.
+
+**The old master comes back later.** Safe by construction: a booting master that sees another
+master's liveness stamp still advancing idles with a banner instead of stealing the fleet back
+(the takeover guard). Demote it from its UI whenever convenient.
 
 Upgrade first, swap second: never combine an app upgrade and a backend swap in one restart wave.
 
