@@ -669,7 +669,7 @@ function FleetConnectCard({ connect }) {
     : '<generate one on this master>';
   const block = [
     'BOT_NODE_ROLE=co-worker',
-    `MASTER_URL=${connect.masterUrl}`,
+    `MASTER_URLS=${connect.masterUrl}`,
     `CONTROL_SECRET=${secretValue}`,
   ].join('\n');
 
@@ -718,7 +718,7 @@ function FleetConnectCard({ connect }) {
           {copyButton('role', 'co-worker')}
         </div>
         <div style={rowStyle}>
-          <span style={labelStyle}>MASTER_URL</span>
+          <span style={labelStyle}>MASTER_URLS</span>
           <span style={valueStyle}>{connect.masterUrl}</span>
           {copyButton('url', connect.masterUrl)}
         </div>
