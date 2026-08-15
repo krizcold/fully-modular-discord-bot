@@ -88,14 +88,14 @@ the same central database, so there is nothing to copy when taking over. The onl
 forces on a takeover is re-identifying the dead master's shards, which takes seconds and is
 metered by the identify budget.
 
-**Setup.** Pick one co-worker and set `FLEET_BACKUP_MASTER=1` on it (any capacity works;
-`FLEET_SHARD_CAPACITY=0` makes a pure standby that serves nothing). Give EVERY fleet node
-`MASTER_URLS`: an ordered, comma-separated list of every master-capable control URL, the normal
-master first, the backup second. Workers cycle through the list on reconnect, so a failover
-needs no reconfiguration anywhere. Set `BOT_NODE_ROLE` explicitly on every node that carries
-`MASTER_URLS` (`master` on the master, `co-worker` on workers): the candidate list itself never
-changes a node's role, and the bot logs a warning when it finds the list without an explicit
-role.
+**Setup.** Pick one worker node and give it `BOT_NODE_ROLE=backup-master` (a designated
+co-worker: it serves shards like any worker; any capacity works, and `FLEET_SHARD_CAPACITY=0`
+makes a pure standby that serves nothing). Give EVERY fleet node `MASTER_URLS`: an ordered,
+comma-separated list of every master-capable control URL, the normal master first, the backup
+second. Workers cycle through the list on reconnect, so a failover needs no reconfiguration
+anywhere. Set `BOT_NODE_ROLE` explicitly on every node that carries `MASTER_URLS` (`master`,
+`co-worker`, or `backup-master`): the candidate list itself never changes a node's role, and
+the bot logs a warning when it finds the list without an explicit role.
 
 **Unplanned failover (master died).** Open the backup's web UI, Usage tab, Fleet section, and
 press "Promote to master". One click does the whole thing: the node restarts as master, takes
