@@ -88,7 +88,9 @@ export function resolveNodeRole(): NodeRole {
 export function resolveEnvRole(): NodeRole {
   const explicit = (process.env.BOT_NODE_ROLE || '').trim().toLowerCase();
   if (explicit === 'master') return 'master';
-  if (explicit === 'co-worker') return 'co-worker';
+  // backup-master is a designated co-worker: protocol role co-worker, backup
+  // designation carried separately (isBackupMaster).
+  if (explicit === 'co-worker' || explicit === 'backup-master') return 'co-worker';
   // Only the legacy single MASTER_URL infers co-worker. MASTER_URLS is the
   // fleet-wide candidate list carried by EVERY node, the master included, so
   // it can never imply a role; nodes using it must set BOT_NODE_ROLE.
@@ -133,9 +135,10 @@ function normalizeUrl(url: string): string {
   return url.replace(/\/+$/, '').toLowerCase();
 }
 
-/** True when this co-worker is the designated backup master (FLEET_BACKUP_MASTER=1). */
+/** True when this co-worker is the designated backup master (BOT_NODE_ROLE=backup-master, or the low-level FLEET_BACKUP_MASTER=1 flag). */
 export function isBackupMaster(): boolean {
-  return (process.env.FLEET_BACKUP_MASTER || '').trim() === '1';
+  return (process.env.BOT_NODE_ROLE || '').trim().toLowerCase() === 'backup-master'
+    || (process.env.FLEET_BACKUP_MASTER || '').trim() === '1';
 }
 
 /** True when the designated backup is set to promote itself (FLEET_AUTO_PROMOTE=1). */
