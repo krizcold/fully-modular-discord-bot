@@ -16,7 +16,7 @@ import {
   getDeploymentMode
 } from '../../utils/envLoader';
 import { reconfigureOAuth } from '../auth/oauthConfig';
-import { isStandalone as isStandaloneFleet, resolveNodeRole } from '../../bot/internalSetup/fleet/nodeIdentity';
+import { isBackupMaster, isStandalone as isStandaloneFleet, resolveNodeRole } from '../../bot/internalSetup/fleet/nodeIdentity';
 import { isCoWorkerNode } from '../middleware/fleetGate';
 
 /** The only fields a co-worker edits locally; everything else mirrors the master via sync. */
@@ -127,7 +127,9 @@ export function createSetupRoutes(): Router {
             MASTER_URLS: credentials.MASTER_URLS || '',
             NODE_NAME: credentials.NODE_NAME || '',
             FLEET_SHARD_CAPACITY: credentials.FLEET_SHARD_CAPACITY || '',
-            FLEET_BACKUP_MASTER: credentials.FLEET_BACKUP_MASTER || '',
+            // Effective designation: BOT_NODE_ROLE=backup-master or the
+            // legacy flag. The page edits the ROLE; the flag is never shown.
+            BACKUP_MASTER: isBackupMaster() ? '1' : '',
             FLEET_AUTO_PROMOTE: credentials.FLEET_AUTO_PROMOTE || '',
             CONTROL_SECRET_SET: !!(credentials.CONTROL_SECRET && credentials.CONTROL_SECRET.trim() !== ''),
             DISCORD_TOKEN_SET: !!(credentials.DISCORD_TOKEN && credentials.DISCORD_TOKEN.trim() !== ''),
@@ -171,6 +173,15 @@ export function createSetupRoutes(): Router {
             && !/^\d+$/.test(credentials.FLEET_SHARD_CAPACITY)) {
           res.status(400).json({ success: false, error: 'FLEET_SHARD_CAPACITY must be a positive integer' });
           return;
+        }
+        // The backup designation IS the role here: this page offers the two
+        // worker roles only (promotion to master goes through the Fleet tab's
+        // Promote button), and a saved role retires the legacy flag.
+        const requestedRole = String(req.body?.BOT_NODE_ROLE ?? '').trim().toLowerCase();
+        if (requestedRole === 'co-worker' || requestedRole === 'backup-master') {
+          credentials.BOT_NODE_ROLE = requestedRole;
+          delete credentials.FLEET_BACKUP_MASTER;
+          if (requestedRole !== 'backup-master') delete credentials.FLEET_AUTO_PROMOTE;
         }
         // MASTER_URLS never implies a role (it is carried by masters too), so
         // pin the explicit role this page exclusively serves: without it, a

@@ -6,12 +6,11 @@ function ConnectionSection({ setupStatus, isBotRunning, onUpdate, onUpdateAndRes
 
   const EMPTY_FIELDS = {
     DISCORD_TOKEN: '',
-    MASTER_URL: '',
     MASTER_URLS: '',
     CONTROL_SECRET: '',
     NODE_NAME: '',
     FLEET_SHARD_CAPACITY: '',
-    FLEET_BACKUP_MASTER: '',
+    BOT_NODE_ROLE: 'co-worker',
     FLEET_AUTO_PROMOTE: '',
   };
   const SECRET_FIELDS = ['DISCORD_TOKEN', 'CONTROL_SECRET'];
@@ -26,11 +25,12 @@ function ConnectionSection({ setupStatus, isBotRunning, onUpdate, onUpdateAndRes
     const loaded = {
       ...EMPTY_FIELDS,
       // Secrets never come back from the server; non-secrets show current values.
-      MASTER_URL: connection.MASTER_URL || '',
-      MASTER_URLS: connection.MASTER_URLS || '',
+      // MASTER_URLS falls back to a legacy MASTER_URL so the single candidates
+      // field always shows what this node actually dials.
+      MASTER_URLS: connection.MASTER_URLS || connection.MASTER_URL || '',
       NODE_NAME: connection.NODE_NAME || '',
       FLEET_SHARD_CAPACITY: connection.FLEET_SHARD_CAPACITY || '',
-      FLEET_BACKUP_MASTER: connection.FLEET_BACKUP_MASTER || '',
+      BOT_NODE_ROLE: connection.BACKUP_MASTER === '1' ? 'backup-master' : 'co-worker',
       FLEET_AUTO_PROMOTE: connection.FLEET_AUTO_PROMOTE || '',
     };
     setFields(prev => {
@@ -112,22 +112,23 @@ function ConnectionSection({ setupStatus, isBotRunning, onUpdate, onUpdateAndRes
 
             <div className="form-group">
               <label>
-                <StatusIndicator isSet={!!(connection.MASTER_URL && connection.MASTER_URL !== '')} />
-                Master URL
+                <StatusIndicator isSet={fields.BOT_NODE_ROLE === 'backup-master'} optional />
+                Fleet Role
               </label>
-              <input
-                type="text"
-                value={fields.MASTER_URL || ''}
-                onChange={e => handleChange('MASTER_URL', e.target.value)}
-                placeholder="ws://master-host:3928 (wss:// across untrusted networks)"
-              />
-              <small>Copy from the master's Usage tab (Connect a worker)</small>
+              <select
+                value={fields.BOT_NODE_ROLE || 'co-worker'}
+                onChange={e => handleChange('BOT_NODE_ROLE', e.target.value)}
+              >
+                <option value="co-worker">Co-worker</option>
+                <option value="backup-master">Backup Master</option>
+              </select>
+              <small>Backup Master adds the Promote button on this node (postgres mode), so it can take over when the master dies</small>
             </div>
 
             <div className="form-group">
               <label>
-                <StatusIndicator isSet={!!(connection.MASTER_URLS && connection.MASTER_URLS !== '')} optional />
-                Master Candidates (Optional)
+                <StatusIndicator isSet={!!((connection.MASTER_URLS && connection.MASTER_URLS !== '') || (connection.MASTER_URL && connection.MASTER_URL !== ''))} />
+                Master Candidates
               </label>
               <input
                 type="text"
@@ -135,37 +136,25 @@ function ConnectionSection({ setupStatus, isBotRunning, onUpdate, onUpdateAndRes
                 onChange={e => handleChange('MASTER_URLS', e.target.value)}
                 placeholder="wss://master...,wss://backup... (ordered, comma-separated)"
               />
-              <small>Ordered list tried on reconnect; overrides Master URL. List every promotable node so failover needs no reconfiguration</small>
+              <small>Ordered list tried on reconnect, the master first. Copy from the master's Usage tab (Connect a worker); list every promotable node so failover needs no reconfiguration</small>
             </div>
 
-            <div className="form-row">
-              <div className="form-group" style={{ flex: 1 }}>
-                <label>
-                  <StatusIndicator isSet={connection.FLEET_BACKUP_MASTER === '1'} optional />
-                  Backup Master (Optional)
-                </label>
-                <input
-                  type="text"
-                  value={fields.FLEET_BACKUP_MASTER || ''}
-                  onChange={e => handleChange('FLEET_BACKUP_MASTER', e.target.value)}
-                  placeholder="1 = designated backup master"
-                />
-                <small>Shows the Promote button on this node (postgres mode)</small>
-              </div>
-              <div className="form-group" style={{ flex: 1 }}>
+            {fields.BOT_NODE_ROLE === 'backup-master' && (
+              <div className="form-group">
                 <label>
                   <StatusIndicator isSet={connection.FLEET_AUTO_PROMOTE === '1'} optional />
                   Auto-Promote (Optional)
                 </label>
-                <input
-                  type="text"
+                <select
                   value={fields.FLEET_AUTO_PROMOTE || ''}
                   onChange={e => handleChange('FLEET_AUTO_PROMOTE', e.target.value)}
-                  placeholder="1 = promote itself on master silence"
-                />
-                <small>Backup master only; default off (manual promotion)</small>
+                >
+                  <option value="">Off (manual promotion)</option>
+                  <option value="1">Promote itself on master silence</option>
+                </select>
+                <small>Lets this node promote itself when the master goes silent; default off</small>
               </div>
-            </div>
+            )}
 
             <div className="form-group">
               <label>
