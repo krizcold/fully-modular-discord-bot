@@ -326,7 +326,7 @@ export function createFleetRoutes(botManager: BotManager): Router {
         return;
       }
       const refusal = state.role !== 'co-worker' ? 'this node is already a master'
-        : state.backupMaster !== true ? 'this node is not the designated backup master (set FLEET_BACKUP_MASTER=1)'
+        : state.backupMaster !== true ? 'this node is not the designated backup master (set BOT_NODE_ROLE=backup-master)'
         : state.dataBackend !== 'postgres' ? 'promotion is a postgres-mode feature (file mode has no standby)'
         : state.dataBackendHealthy === false ? 'the database (control store) is unreachable from this node; a promotion would park at boot instead of taking over - wait for it or fix connectivity first'
         : state.draining === true ? 'this node is draining; promotion refused'

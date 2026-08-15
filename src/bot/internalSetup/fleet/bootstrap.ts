@@ -240,7 +240,7 @@ export async function initFleet(): Promise<FleetContext> {
     clearRoleOverride();
   }
   if ((process.env.MASTER_URLS || '').trim() !== '' && (process.env.BOT_NODE_ROLE || '').trim() === '' && !readRoleOverride()) {
-    console.warn('[Fleet] MASTER_URLS is set but BOT_NODE_ROLE is not. The candidate list NEVER changes a node\'s role; set BOT_NODE_ROLE=master or co-worker explicitly on every node that carries MASTER_URLS.');
+    console.warn('[Fleet] MASTER_URLS is set but BOT_NODE_ROLE is not. The candidate list NEVER changes a node\'s role; set BOT_NODE_ROLE=master, co-worker or backup-master explicitly on every node that carries MASTER_URLS.');
   }
   const role = resolveNodeRole();
   const standalone = isStandalone();
@@ -252,7 +252,7 @@ export async function initFleet(): Promise<FleetContext> {
   devRuntime = runtime;
   const advertisedTransferUrl = (process.env.TRANSFER_URL || '').trim() || undefined;
   if (!isBackupMaster() && (process.env.FLEET_AUTO_PROMOTE || '').trim() === '1') {
-    console.warn('[Fleet] FLEET_AUTO_PROMOTE=1 ignored: this node is not the designated backup (set FLEET_BACKUP_MASTER=1)');
+    console.warn('[Fleet] FLEET_AUTO_PROMOTE=1 ignored: this node is not the designated backup (set BOT_NODE_ROLE=backup-master)');
   }
   const capabilities: NodeCapabilities = {
     shardCapacity: resolveShardCapacity(),
