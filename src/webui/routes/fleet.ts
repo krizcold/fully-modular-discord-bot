@@ -3,7 +3,9 @@
 // degrades, never errors (no 500s here).
 
 import { Router, Request, Response } from 'express';
+import { Client } from 'pg';
 import { BotManager } from '../botManager';
+import { loadCredentials } from '../../utils/envLoader';
 import {
   clearRoleOverride,
   invalidateRoleOverrideCache,
@@ -13,6 +15,26 @@ import {
   resolveNodeRole,
   writeRoleOverride,
 } from '../../bot/internalSetup/fleet/nodeIdentity';
+
+// Promotion gate: dataBackendHealthy stays true through the C1 write-acceptance
+// coast, so it cannot see a control-store outage. Reachability only (SELECT 1,
+// not the term row): a reachable virgin store is a deliberate first promotion,
+// and the boot provisions its own schema.
+async function controlStoreReachable(): Promise<{ ok: boolean; error?: string }> {
+  const creds = loadCredentials();
+  const url = (creds.CONTROL_STORE_URL || '').trim() || (creds.DATA_BACKEND_URL || '').trim();
+  if (!url) return { ok: false, error: 'no CONTROL_STORE_URL/DATA_BACKEND_URL known yet (delivered on the first register)' };
+  const client = new Client({ connectionString: url, connectionTimeoutMillis: 5000, query_timeout: 5000 });
+  try {
+    await client.connect();
+    await client.query('SELECT 1');
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  } finally {
+    await client.end().catch(() => { /* best effort */ });
+  }
+}
 
 export function createFleetRoutes(botManager: BotManager): Router {
   const router = Router();
@@ -312,6 +334,12 @@ export function createFleetRoutes(botManager: BotManager): Router {
         : null;
       if (refusal) {
         res.json({ success: false, error: refusal });
+        return;
+      }
+      const store = await controlStoreReachable();
+      if (!store.ok) {
+        console.warn(`[Fleet] Promotion refused: control store probe failed (${store.error})`);
+        res.json({ success: false, error: 'the database (control store) is unreachable from this node; a promotion would park at boot instead of taking over - wait for it or fix connectivity first' });
         return;
       }
       writeRoleOverride({
