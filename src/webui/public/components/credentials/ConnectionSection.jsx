@@ -18,6 +18,7 @@ function ConnectionSection({ setupStatus, isBotRunning, onUpdate, onUpdateAndRes
   const [fields, setFields] = useState({ ...EMPTY_FIELDS });
   const [baseline, setBaseline] = useState({ ...EMPTY_FIELDS });
   const [loading, setLoading] = useState(false);
+  const [selfUrlCopied, setSelfUrlCopied] = useState(false);
 
   const connection = setupStatus?.connection || {};
 
@@ -124,6 +125,33 @@ function ConnectionSection({ setupStatus, isBotRunning, onUpdate, onUpdateAndRes
               </select>
               <small>Backup Master adds the Promote button on this node (postgres mode), so it can take over when the master dies</small>
             </div>
+
+            {fields.BOT_NODE_ROLE === 'backup-master' && connection.SELF_URL && (
+              <div className="form-group">
+                <label>This Node's URL</label>
+                <div style={{ display: 'flex', gap: '10px', alignItems: 'center' }}>
+                  <input
+                    type="text"
+                    value={connection.SELF_URL}
+                    readOnly
+                    style={{ flex: 1, background: '#2a2a2a', opacity: 0.9 }}
+                  />
+                  <button
+                    type="button"
+                    className="btn btn-secondary"
+                    style={{ marginRight: 0 }}
+                    onClick={() => {
+                      navigator.clipboard.writeText(connection.SELF_URL);
+                      setSelfUrlCopied(true);
+                      setTimeout(() => setSelfUrlCopied(false), 2000);
+                    }}
+                  >
+                    {selfUrlCopied ? 'Copied' : 'Copy'}
+                  </button>
+                </div>
+                <small>Add it to every worker's Master Candidates, after the master's, so a failover to this node needs no rewiring. Each node skips its own URL, so one list works everywhere</small>
+              </div>
+            )}
 
             <div className="form-group">
               <label>

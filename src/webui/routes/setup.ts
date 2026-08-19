@@ -130,6 +130,10 @@ export function createSetupRoutes(): Router {
             // Effective designation: BOT_NODE_ROLE=backup-master or the
             // legacy flag. The page edits the ROLE; the flag is never shown.
             BACKUP_MASTER: isBackupMaster() ? '1' : '',
+            // This node's own advertised endpoint (empty when the platform
+            // never injected one): a backup master shows it so its URL can be
+            // added to every worker's candidates.
+            SELF_URL: credentials.FLEET_PUBLIC_URL || '',
             FLEET_AUTO_PROMOTE: credentials.FLEET_AUTO_PROMOTE || '',
             CONTROL_SECRET_SET: !!(credentials.CONTROL_SECRET && credentials.CONTROL_SECRET.trim() !== ''),
             DISCORD_TOKEN_SET: !!(credentials.DISCORD_TOKEN && credentials.DISCORD_TOKEN.trim() !== ''),
