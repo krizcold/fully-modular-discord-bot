@@ -45,7 +45,8 @@ The database provisions its own schema on first contact; there is nothing to cre
 
 1. **The central database is the availability floor.** When it is down, every guild's data plane
    degrades at once: the bot keeps running, accepts writes for a bounded window (about 5 minutes
-   or 64 MiB per guild), then refuses writes with a clear user-facing message until the database
+   or 64 MiB of buffered writes per node, whichever trips first; the window is node-wide, not
+   per guild), then refuses writes with a clear user-facing message until the database
    returns. File mode has a per-node blast radius instead; postgres trades that for stateless
    workers and seconds-fast failover.
 2. **The managed sidecar shares its host's fate.** The manager-provisioned Postgres runs on the
@@ -68,19 +69,33 @@ The database provisions its own schema on first contact; there is nothing to cre
    cross-host database; the in-fleet credential handover requires the control secret (use `wss://`
    across untrusted networks); and if you want at-rest protection, use full-disk encryption on the
    host, where it belongs.
-7. **Database HA is postgres-native, below the app.** Neither the bot nor the manager replicates
-   the database, ever: high availability of the data layer comes from the database world itself
-   (a managed Postgres, or streaming replication behind one stable URL). The fleet is already
-   built to ride a database failover: nodes coast on the bounded write-acceptance window while
-   the URL fails over, a promoted replica keeps the store identity and is reattached to
-   normally, and a wrong or empty database is refused outright instead of served. The sidecar
-   tier's honest recovery point stays the nightly `pg_dump`.
+7. **Database HA is postgres-native, and the manager will provision it.** Today neither the bot
+   nor the manager replicates the database: high availability of the data layer comes from the
+   database world itself (a managed Postgres, or streaming replication behind one stable URL).
+   The fleet is already built to ride a database failover: nodes coast on the bounded
+   write-acceptance window while the URL fails over, a promoted replica keeps the store
+   identity and is reattached to normally, and a wrong or empty database is refused outright
+   instead of served. The planned replication arc makes the manager provision that standard
+   setup itself: a streaming replica on the backup master's machine, promoted together with the
+   backup master, so host-death coverage stops requiring hand-configured infrastructure. The
+   sidecar tier's honest recovery point stays the nightly `pg_dump` until then.
 
 ## High availability: the warm standby master
 
-Master-role failure (the machine running the fleet master dies) is handled by a designated
-backup master. This is a postgres-mode feature: file mode intentionally has no standby, because
-a standby cannot serve a dead node's local disk (transform to postgres first).
+Master-role failure is handled by a designated backup master. This is a postgres-mode feature:
+file mode intentionally has no standby, because a standby cannot serve a dead node's local disk
+(transform to postgres first).
+
+**The one rule that decides what the standby can save you from: a takeover needs the database
+to have survived whatever killed the master.** The backup master holds no copy of the data; it
+holds a connection to the same central database as everyone else. So it covers the master
+process or container crashing, planned rolling handovers, and the master's whole MACHINE dying
+IF the database lives somewhere else (an external URL). It cannot cover the machine dying when
+the database is the managed sidecar on that same machine: the backup would be a healthy bot
+pointing at a dead address, so both promotion paths refuse by design (a promoted master without
+a database would park at boot and serve nothing). If host death is in your threat model, put
+the database on a host that outlives the master, or wait for the manager-provisioned replica
+(planned; see item 7 above).
 
 Two Discord facts shape the design. One token allows exactly ONE gateway session per shard, so a
 backup can never sit connected to the master's shards "just in case"; and all fleet nodes read
