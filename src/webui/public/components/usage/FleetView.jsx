@@ -914,17 +914,34 @@ function FleetBackupCard({ api, fleet }) {
   const [busy, setBusy] = React.useState(false);
   const auto = fleet.autoPromote;
   const masterDown = !fleet.masterKnown;
+  const pair = fleet.dbReplica === true;
+  // The pair promotion runs BEFORE the role takeover, so a lag refusal comes
+  // back with nothing changed: re-posting with confirmLag is the R3 override.
+  const send = (confirmLag) => api.post('/fleet/promote', { takeover: true, chainTakeover: masterDown, ...(confirmLag ? { confirmLag: true } : {}) });
   const promote = () => {
     if (busy) return;
     const text = masterDown
       ? 'Promote this backup to MASTER?\n\nThe master looks unreachable from this node. After the safety hold-down the old master is declared lost and its shards are taken over. This node restarts; its own shards re-identify (budget-metered) and workers reattach at zero identify cost.'
       : 'The master still looks ALIVE from this node. Promote anyway as a PLANNED HANDOVER?\n\nThe current master is deposed within seconds (its next liveness stamp fences it) and KEEPS its shards until you demote it from its own UI. If it is alive but cut off (partitioned), stop its container first instead of promoting over it.';
-    if (!confirm(text)) return;
+    const pairText = !pair ? ''
+      : masterDown
+        ? '\n\nThis machine holds a database standby. If nothing answers on the old master or its database, the standby is promoted first and becomes the fleet database (you will be asked to accept how current it is). If the fleet database is still reachable, only the role moves and the standby keeps following it.'
+        : '\n\nThis machine holds a database standby, but it will not move while the master answers this node: either only the role moves, or the promotion is refused if this node cannot reach the fleet database.';
+    if (!confirm(text + pairText)) return;
     setBusy(true);
-    api.post('/fleet/promote', { takeover: true, chainTakeover: masterDown })
+    send(false)
       .then((res) => {
+        if (res && res.success === false && res.needsLagConfirm) {
+          const behind = res.lagMs != null ? Math.round(res.lagMs / 1000) + 's' : 'an unknown amount of time';
+          if (!confirm(`Nothing answers on the old master or its database, and this machine's standby last replayed a transaction ${behind} ago.\n\nPromoting makes that standby the fleet database, so anything the old one accepted after that point is LOST. Continue?`)) return null;
+          return send(true);
+        }
+        return res;
+      })
+      .then((res) => {
+        if (res === null) return;
         if (!res || res.success === false) { showToast((res && res.error) || 'Promotion failed', 'error'); return; }
-        showToast('Promotion started: this node restarts as master', 'success');
+        showToast(res.promotedDatabase ? 'Promotion started: the standby is now the fleet database, this node restarts as master' : 'Promotion started: this node restarts as master', 'success');
       })
       .catch((err) => showToast((err && err.message) || 'Promotion failed', 'error'))
       .finally(() => setBusy(false));
@@ -937,6 +954,11 @@ function FleetBackupCard({ api, fleet }) {
           ? `Auto-promotion armed: fires after ~2 minutes of master silence. Term stamp last advanced ${auto.termStaleForMs != null ? Math.round(auto.termStaleForMs / 1000) + 's ago' : 'unknown'}${auto.storeReadOk === false ? ' (store unreachable)' : ''}${auto.fired ? ' - TRIGGERED' : ''}`
           : 'Manual mode: this node takes over only when you press Promote.'}
       </div>
+      {pair ? (
+        <div className="usage-stat-sub">
+          Database standby on this machine: if the fleet database dies with the master, promotion takes the pair.
+        </div>
+      ) : null}
       <button onClick={promote} disabled={busy} style={{ marginTop: '6px' }}>
         {busy ? 'Promoting...' : 'Promote to master'}
       </button>

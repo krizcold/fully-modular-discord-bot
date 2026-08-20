@@ -6,6 +6,7 @@ import { CONTROL_PORT_DEFAULT, LEASE_TTL_MS, PROTOCOL_VERSION } from './constant
 import { getShardSource, isPinEnabled, resolveShardCapacity } from './placement';
 import type { BudgetInfo, NodeRole } from './protocol';
 import { isBackupMaster, readRoleOverride, resolveMasterUrls } from './nodeIdentity';
+import { hasDbReplica } from './replicaPromotion';
 import type { Registry } from './registry';
 import type { LeaseRuntime } from './leaseRuntime';
 import type { ControlClient } from './controlClient';
@@ -107,6 +108,8 @@ export interface FleetState {
   roleOverride: { role: NodeRole; setBy: string; setAt: number } | null;
   /** This node is the designated backup master (FLEET_BACKUP_MASTER=1). */
   backupMaster: boolean;
+  /** A manager-provisioned standby of the fleet database lives on this machine; promotion takes the pair. */
+  dbReplica: boolean;
   /** Auto-promotion watcher status; null unless this node is an auto-enabled backup. */
   autoPromote: AutoPromoteStatusView | null;
   /** Fleet master: ms the term-row stamp has been failing; null while stamping succeeds (or off-postgres). */
@@ -338,6 +341,7 @@ export function getFleetState(): FleetState {
       selfFenced,
       roleOverride: buildRoleOverrideView(),
       backupMaster: isBackupMaster(),
+      dbReplica: hasDbReplica(),
       autoPromote: null,
       termStampFailingForMs: null,
       masterUrls: resolveMasterUrls(),
@@ -442,6 +446,7 @@ export function getFleetState(): FleetState {
       selfFenced,
       roleOverride: buildRoleOverrideView(),
       backupMaster: isBackupMaster(),
+      dbReplica: hasDbReplica(),
       autoPromote: sources.autoPromote?.() ?? null,
       termStampFailingForMs: sources.termStamp?.() ?? null,
       masterUrls: resolveMasterUrls(),
@@ -540,6 +545,7 @@ export function getFleetState(): FleetState {
     selfFenced,
     roleOverride: buildRoleOverrideView(),
     backupMaster: isBackupMaster(),
+    dbReplica: hasDbReplica(),
     autoPromote: sources.autoPromote?.() ?? null,
     termStampFailingForMs: null,
     masterUrls: resolveMasterUrls(),

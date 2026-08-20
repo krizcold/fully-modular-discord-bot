@@ -3,9 +3,7 @@
 // degrades, never errors (no 500s here).
 
 import { Router, Request, Response } from 'express';
-import { Client } from 'pg';
 import { BotManager } from '../botManager';
-import { loadCredentials } from '../../utils/envLoader';
 import {
   clearRoleOverride,
   invalidateRoleOverrideCache,
@@ -15,26 +13,11 @@ import {
   resolveNodeRole,
   writeRoleOverride,
 } from '../../bot/internalSetup/fleet/nodeIdentity';
+import { canonicalStoreReachable, promoteReplicaPair, resolveReplicaEndpoints } from '../../bot/internalSetup/fleet/replicaPromotion';
 
 // Promotion gate: dataBackendHealthy stays true through the C1 write-acceptance
-// coast, so it cannot see a control-store outage. Reachability only (SELECT 1,
-// not the term row): a reachable virgin store is a deliberate first promotion,
-// and the boot provisions its own schema.
-async function controlStoreReachable(): Promise<{ ok: boolean; error?: string }> {
-  const creds = loadCredentials();
-  const url = (creds.CONTROL_STORE_URL || '').trim() || (creds.DATA_BACKEND_URL || '').trim();
-  if (!url) return { ok: false, error: 'no CONTROL_STORE_URL/DATA_BACKEND_URL known yet (delivered on the first register)' };
-  const client = new Client({ connectionString: url, connectionTimeoutMillis: 5000, query_timeout: 5000 });
-  try {
-    await client.connect();
-    await client.query('SELECT 1');
-    return { ok: true };
-  } catch (error) {
-    return { ok: false, error: error instanceof Error ? error.message : String(error) };
-  } finally {
-    await client.end().catch(() => { /* best effort */ });
-  }
-}
+// coast, so it cannot see a control-store outage. The probe itself lives in
+// replicaPromotion.ts because the pair rung decides on the same signal.
 
 export function createFleetRoutes(botManager: BotManager): Router {
   const router = Router();
@@ -312,6 +295,15 @@ export function createFleetRoutes(botManager: BotManager): Router {
    * clear message, never a 500. takeover skips the boot guard (explicit
    * intent); chainTakeover additionally declares the dead master lost after
    * the hold-down (dead-master failover, NOT planned handover).
+   *
+   * PLAN_REPLICATION Stage 3: on a machine holding a database standby the
+   * rung runs first and decides whether the DATABASE moves too. It only does
+   * when the primary is gone on both channels (see replicaPromotion.ts); a
+   * reachable fleet database is deposed through the term row instead, because
+   * forking the store is what would break that fence. confirmLag is the
+   * operator's acknowledgement of the measured RPO (R3); the response carries
+   * needsLagConfirm + lagMs when it is required, and promotedDatabase on
+   * success says whether the standby became the fleet store.
    */
   router.post('/promote', async (req: Request, res: Response) => {
     try {
@@ -325,10 +317,15 @@ export function createFleetRoutes(botManager: BotManager): Router {
         res.json({ success: false, error: 'Fleet state unavailable (bot still initializing); try again shortly' });
         return;
       }
+      // A local standby changes what "the database is unreachable" means: the
+      // primary being gone is exactly the failure this pair exists for, and
+      // the promotion brings the database back with it.
+      const replica = resolveReplicaEndpoints();
+      let promotedDatabase = false;
       const refusal = state.role !== 'co-worker' ? 'this node is already a master'
         : state.backupMaster !== true ? 'this node is not the designated backup master (set BOT_NODE_ROLE=backup-master)'
         : state.dataBackend !== 'postgres' ? 'promotion is a postgres-mode feature (file mode has no standby)'
-        : state.dataBackendHealthy === false ? 'the database (control store) is unreachable from this node; a promotion would park at boot instead of taking over - wait for it or fix connectivity first'
+        : (state.dataBackendHealthy === false && !replica) ? 'the database (control store) is unreachable from this node; a promotion would park at boot instead of taking over - wait for it or fix connectivity first'
         : state.draining === true ? 'this node is draining; promotion refused'
         : state.migrationWorkActive === true ? 'a migration/transformation is working on this node; wait for it to finish'
         : null;
@@ -336,11 +333,31 @@ export function createFleetRoutes(botManager: BotManager): Router {
         res.json({ success: false, error: refusal });
         return;
       }
-      const store = await controlStoreReachable();
-      if (!store.ok) {
-        console.warn(`[Fleet] Promotion refused: control store probe failed (${store.error})`);
-        res.json({ success: false, error: 'the database (control store) is unreachable from this node; a promotion would park at boot instead of taking over - wait for it or fix connectivity first' });
-        return;
+      if (replica) {
+        // The rung decides whether this promotion needs the database at all
+        // (a live fleet database is deposed through the term row and must NOT
+        // be forked) and runs the same reachability check when it does not.
+        const pair = await promoteReplicaPair(replica, {
+          confirmLag: req.body?.confirmLag === true,
+          masterAlive: state.masterKnown === true,
+        });
+        if (!pair.success) {
+          console.warn(`[Fleet] Promotion refused at the replica rung: ${pair.error}`);
+          res.json({
+            success: false,
+            error: pair.error ?? 'promoting the local database replica failed',
+            ...(pair.needsLagConfirm ? { needsLagConfirm: true, lagMs: pair.lagMs ?? null } : {}),
+          });
+          return;
+        }
+        promotedDatabase = pair.promotedDatabase === true;
+      } else {
+        const store = await canonicalStoreReachable();
+        if (!store.ok) {
+          console.warn(`[Fleet] Promotion refused: control store probe failed (${store.error})`);
+          res.json({ success: false, error: 'the database (control store) is unreachable from this node; a promotion would park at boot instead of taking over - wait for it or fix connectivity first' });
+          return;
+        }
       }
       writeRoleOverride({
         role: 'master',
@@ -351,7 +368,9 @@ export function createFleetRoutes(botManager: BotManager): Router {
       });
       console.warn(`[Fleet] PROMOTION staged via web UI (takeover=${req.body?.takeover === true}, chainTakeover=${req.body?.chainTakeover === true}); restarting the bot child as master`);
       const restart = await botManager.restart();
-      res.json(restart?.success ? { success: true } : { success: false, error: restart?.error ?? 'restart failed; the role override is staged and the next start boots as master' });
+      res.json(restart?.success
+        ? { success: true, promotedDatabase }
+        : { success: false, error: restart?.error ?? 'restart failed; the role override is staged and the next start boots as master' });
     } catch (error) {
       console.error('[Fleet] Promotion failed:', error instanceof Error ? error.message : error);
       res.json({ success: false, error: error instanceof Error ? error.message : 'promotion failed' });

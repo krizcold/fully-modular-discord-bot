@@ -139,6 +139,26 @@ export const BACKUP_DOWN_CONFIRM_MS = 30_000;
  */
 export const AUTO_PROMOTE_OVERRIDE_MAX_AGE_MS = 600_000;
 
+/**
+ * Promote-the-pair (PLAN_REPLICATION Stage 3, ruling R3): the RPO an operator
+ * accepts when a standby becomes the fleet database. Read ONLY in the pair
+ * lane, where every channel reports the primary gone and the age of the last
+ * replayed transaction is the data that dies with it. The role-only lanes
+ * never move the database, so the age is not consulted there at all - gating
+ * on "still streaming AND stale" was the first design and is backwards, since
+ * that combination is the master-process-death case the backup exists for.
+ * Above this the manual promote comes back asking for an explicit confirm; the
+ * auto lane never confirms, so it aborts and rolls back. An unknown age
+ * (nothing replayed since the standby started) does not gate.
+ */
+export const REPLICA_LAG_PROMOTE_MAX_MS = 60_000;
+
+/** Bounded wait for a standby to apply already-received WAL before promoting. */
+export const REPLICA_CATCHUP_WAIT_MS = 15_000;
+
+/** Poll cadence inside that wait. */
+export const REPLICA_CATCHUP_POLL_MS = 1000;
+
 /** Master sync backstop: rehash-and-bump plus re-push to behind workers on this cadence. */
 export const SYNC_RECONCILE_MS = 15000;
 
