@@ -59,6 +59,16 @@ export const MSG = {
   DATA_WRITE: 'control:data:write',
   DATA_READ: 'control:data:read',
   CAPABILITY_REFRESH: 'control:capability:refresh',
+  /**
+   * Pre-register term probe (Stage 4 boot fence): reply {ok, term, nodeId}.
+   * Its handler is answered ahead of BOTH the not-registered gate (the prober
+   * deliberately never registers) and term fencing (the prober's term is the
+   * very thing in question), so neither can be removed as redundant. The
+   * generic not-registered reply is not a substitute: it carries no nodeId,
+   * and a prober that cannot attribute an answer discards it - a booting node
+   * dials its own advertised URL, and its predecessor may still hold the port.
+   */
+  TERM_PROBE: 'control:term:probe',
 } as const;
 
 export interface NodeCapabilities {

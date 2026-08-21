@@ -18,6 +18,8 @@ import {
   LEASE_RENEW_MS,
   LOSS_LOG_CAP,
   MASTER_SELF_FENCE_MS,
+  PEER_TERM_PROBE_BUDGET_MS,
+  PEER_TERM_PROBE_MS,
   PROTOCOL_VERSION,
   RECOVERY_HOLDDOWN_MS,
   REGISTER_GRACE_MS,
@@ -62,7 +64,7 @@ import {
   resolveShardCount,
 } from './placement';
 import { evaluateRecovery } from './recovery';
-import { _setControlStoreFenced, _setFleetStateSources, _setSelfFenced, _setTakeoverHold, FleetRecoverySource, FleetRefusedRegistration, getFleetState } from './state';
+import { _setControlStoreFenced, _setFleetStateSources, _setSelfFenced, _setStaleMasterPark, _setTakeoverHold, FleetRecoverySource, FleetRefusedRegistration, getFleetState } from './state';
 import type { MigrationView, PinViolationView } from './state';
 import { serveSyncRequest, SyncAuthority } from './syncAuthority';
 import { SyncEngine } from './syncEngine';
@@ -83,7 +85,8 @@ import { MigrationCoordinator, PrecheckResult, StartPayload } from './migration/
 import { MigrationExecutor } from './migration/migrationExecutor';
 import { TransformationCoordinator } from './transformation/transformationCoordinator';
 import { TransformationExecutor } from './transformation/transformationExecutor';
-import type { TransformDirection } from './controlStore';
+import type { ControlStore, PersistedTerm, TransformDirection } from './controlStore';
+import { probePeerTerm } from './peerTermProbe';
 import { planPinRestoreLegs } from './placement';
 import { TRANSFER_PORT_DEFAULT } from './constants';
 
@@ -418,6 +421,78 @@ async function runTakeoverGuard(
   return { term: baseline.term, nodeId: baseline.nodeId };
 }
 
+/**
+ * Stale-master boot fence (PLAN_REPLICATION Stage 4). The takeover guard above
+ * judges the term ROW; it cannot judge which DATABASE that row lives in, and
+ * promoting a database replica FORKS the store. A returned old master then
+ * reads its own copy, finds nothing contradicting it, and mints a term that
+ * nothing can ever fence. So before acquiring, a master with candidates
+ * configured asks them who they are and what term they hold.
+ *
+ * The two run in sequence and prove different halves of the same question.
+ * Reaching this line means nobody is writing this node's term row: either it
+ * belongs to this node, or the guard above watched a foreign holder go silent
+ * for its full staleness window. A candidate that answers ANYWAY is therefore
+ * a master serving from a database this one is not part of, and acquiring here
+ * would put two masters on one bot token. That is the whole verdict; the term
+ * comparison only keeps this node from deferring to a peer staler than itself.
+ *
+ * Silence is never evidence. A dead, renamed or secret-rotated candidate reads
+ * identically to a healthy one, so failing closed would strand masters that
+ * have nothing wrong with them. A fork that survives a partition is the
+ * accepted residual risk of having no third witness (Section 11 ruling).
+ *
+ * Parking is terminal by design: this node's database is the forked copy, so
+ * the verdict cannot improve by waiting. Demote is the way out.
+ */
+async function runStaleMasterFence(
+  store: ControlStore,
+  selfNodeId: string,
+  standalone: boolean,
+  takeoverConfirmed: boolean,
+): Promise<void> {
+  if (standalone) return;
+  const secret = (process.env.CONTROL_SECRET || '').trim();
+  if (secret === '') return;
+  const candidates = resolveMasterUrls();
+  if (candidates.length === 0) return;
+  if (takeoverConfirmed) {
+    console.warn('[Fleet] Takeover CONFIRMED; skipping the stale-master fence');
+    return;
+  }
+
+  // Hold rather than skip on an unreadable store, exactly like the guard: the
+  // very next statement blocks on the same store until it answers, so waiting
+  // here costs nothing and silently dropping the only fork check costs a fleet.
+  let local: PersistedTerm | null = null;
+  for (;;) {
+    try {
+      local = await store.getTerm();
+      break;
+    } catch {
+      console.warn('[Fleet] Stale-master fence: control store unreadable; holding before it can judge the boot');
+      await guardSleep(TERM_GUARD_POLL_MS);
+    }
+  }
+  const localTerm = local ? local.term : 0;
+
+  const deadline = Date.now() + PEER_TERM_PROBE_BUDGET_MS;
+  for (const url of candidates) {
+    if (Date.now() >= deadline) {
+      console.warn('[Fleet] Stale-master fence: probe budget spent; proceeding on the evidence gathered');
+      break;
+    }
+    const peer = await probePeerTerm(url, secret, PEER_TERM_PROBE_MS);
+    // This node's own answer proves nothing: candidates include its own
+    // advertised URL, and a predecessor process may still hold the port.
+    if (peer === null || peer.nodeId === selfNodeId || peer.term < localTerm) continue;
+    console.error(`[Fleet] STALE MASTER FENCE: ${url} answers as a live master on term ${peer.term} while this node's store holds ${localTerm} and nothing is writing to it; parking the boot instead of acquiring a term on a database the fleet has moved off. Demote this node to rejoin as a co-worker.`);
+    _setStaleMasterPark({ observedTerm: peer.term, localTerm, peerUrl: url, at: Date.now() });
+    pushFleetStatusNow();
+    for (;;) await guardSleep(TERM_GUARD_POLL_MS);
+  }
+}
+
 function guardSleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
@@ -458,6 +533,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   if (store instanceof PostgresControlStore && !standalone) {
     previousHolder = await runTakeoverGuard(store, nodeId, takeoverConfirmed);
   }
+  await runStaleMasterFence(store, nodeId, standalone, takeoverConfirmed);
 
   const term = await store.acquireTerm(nodeId);
   if (bootOverride?.takeover || bootOverride?.chainTakeover) consumeTakeoverFlags();
@@ -1746,6 +1822,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
 
     server = new ControlServer({
       getTerm: () => registry.term,
+      getNodeId: () => nodeId,
       onRegister: (payload: RegisterPayload, send): RegisterResult => {
         // Deposed/self-fenced: refuse with the reason the client treats as
         // advance-to-next-candidate, so redialing workers find the live master.

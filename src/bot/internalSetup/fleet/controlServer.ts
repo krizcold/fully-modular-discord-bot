@@ -22,6 +22,8 @@ import {
 
 export interface ControlServerHooks {
   getTerm: () => number;
+  /** This master's own node id, so a TERM_PROBE reply can be attributed (a prober must be able to recognise its own answer). */
+  getNodeId: () => string;
   /** Registry insert + VersionGate; returns the register reply. */
   onRegister: (payload: RegisterPayload, send: (message: object) => void) => RegisterResult;
   /** Fired after the register reply went out, so grants always follow acceptance. */
@@ -195,6 +197,16 @@ export class ControlServer {
       }
       if (requestId) this.reply(socket, requestId, result);
       if (result.accepted) this.hooks.afterRegister(payload.nodeId);
+      return;
+    }
+
+    // Stale-master boot fence probe: answered BEFORE the not-registered gate
+    // (the prober never registers) and before term fencing (its term is
+    // exactly what is in question). Identity is what makes the answer usable:
+    // a booting node dials its own advertised URL too, and during a restart
+    // its predecessor may still hold this port.
+    if (type === MSG.TERM_PROBE) {
+      if (requestId) this.reply(socket, requestId, { ok: true, term: this.hooks.getTerm(), nodeId: this.hooks.getNodeId() });
       return;
     }
 

@@ -108,6 +108,17 @@ export const TERM_TAKEOVER_STALE_MS = 90_000;
 export const TERM_GUARD_POLL_MS = 5000;
 
 /**
+ * Stale-master boot fence (PLAN_REPLICATION Stage 4): per-candidate deadline
+ * for the pre-register term probe, covering handshake and reply together.
+ * Deliberately shorter than CONTROL_ACK_TIMEOUT_MS - this runs on every master
+ * boot, and a dead candidate must not cost the fleet a visible outage.
+ */
+export const PEER_TERM_PROBE_MS = 5000;
+
+/** Aggregate ceiling across all candidates, so a long list cannot stall a boot. */
+export const PEER_TERM_PROBE_BUDGET_MS = 20_000;
+
+/**
  * Master self-fence: stamping failing for this long while a registered
  * auto-promote backup's control connection is down expires the master exactly
  * like a worker's lease TTL - under those conditions the backup WILL promote,

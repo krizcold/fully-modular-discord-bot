@@ -1045,6 +1045,12 @@ function FleetView({ api, wsClient, guildNames }) {
             <div><FleetDemoteButton api={api} /></div>
           </div>
         )}
+        {fleet.staleMasterPark && (
+          <div className="usage-notice" style={{ borderColor: '#e5534b', color: '#e5534b' }}>
+            {`STALE MASTER FENCE: ${fleet.staleMasterPark.peerUrl} answers as a live master on term ${fleet.staleMasterPark.observedTerm}, while this node's own database holds term ${fleet.staleMasterPark.localTerm} and nothing is writing to it. The fleet was failed over to that node's database, so this machine's copy is a fork: acquiring a term here would put two masters on one bot token, each writing a database the other never sees. The boot is parked and will not release on its own. Demote this node to rejoin the fleet as a co-worker on the live database - that is the intended recovery, and it is safe even if this machine's copy is the newer one, because the fleet's data lives on the node above. Only if that node must NOT keep the fleet, set FLEET_CONFIRM_TAKEOVER=1 on this node and restart it to seize the fleet onto this database instead; every change made on the other node since the failover is lost.`}
+            <div><FleetDemoteButton api={api} /></div>
+          </div>
+        )}
         <div className="usage-empty">
           {!fleet.running
             ? 'Fleet state becomes available once the bot process is running.'

@@ -385,12 +385,12 @@ export function createFleetRoutes(botManager: BotManager): Router {
    * have master candidates configured to dial.
    *
    * MUST work in all three master states, not just a healthy one: (a) fully
-   * initialized; (b) parked in the boot takeover guard (initFleet never
-   * returns, so fleet state stays pre-init forever - the flagship
-   * old-master-returns flow lives exactly there); (c) bot child down/crash-
-   * looping. For (b) and (c) the child's state is unusable (the pre-init
-   * branch hardcodes role/standalone), so the prechecks run from PARENT-side
-   * truth: the same env + override file the child would boot from.
+   * initialized; (b) parked in the boot takeover guard or the stale-master
+   * fence (initFleet never returns, so fleet state stays pre-init forever -
+   * the flagship old-master-returns flow lives exactly there); (c) bot child
+   * down/crash-looping. For (b) and (c) the child's state is unusable (the
+   * pre-init branch hardcodes role/standalone), so the prechecks run from
+   * PARENT-side truth: the same env + override file the child would boot from.
    */
   router.post('/demote', async (req: Request, res: Response) => {
     try {
@@ -413,7 +413,7 @@ export function createFleetRoutes(botManager: BotManager): Router {
           res.json({ success: false, error: refusal });
           return;
         }
-      } else if (running && !(state && (state.takeoverHold || state.selfFenced))) {
+      } else if (running && !(state && (state.takeoverHold || state.staleMasterPark || state.selfFenced))) {
         // Genuine early boot with no hold: seconds away from real state.
         res.json({ success: false, error: 'Fleet state unavailable (bot still initializing); try again shortly' });
         return;

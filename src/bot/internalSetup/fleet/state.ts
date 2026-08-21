@@ -102,6 +102,8 @@ export interface FleetState {
   controlStoreFenced: { observedTerm: number; at: number } | null;
   /** Boot takeover guard: holding on a foreign term row that still advances (PLAN_STANDBY 3.2). */
   takeoverHold: TakeoverHoldView | null;
+  /** Stale-master boot fence: parked because a live peer holds a term this node's own store cannot beat (PLAN_REPLICATION Stage 4). */
+  staleMasterPark: StaleMasterParkView | null;
   /** Master self-fence latch: store silent + auto backup unreachable; sessions destroyed until restart (PLAN_STANDBY 3.8). */
   selfFenced: { at: number; reason: string } | null;
   /** Operator role override in force (promotion/demotion); null when the role comes from env. */
@@ -242,6 +244,25 @@ export function _setTakeoverHold(hold: TakeoverHoldView | null): void {
   takeoverHold = hold;
 }
 
+/**
+ * Stale-master boot fence (PLAN_REPLICATION Stage 4): a live peer holds a term
+ * at least as fresh as this node's OWN term row, so the boot parked instead of
+ * minting a term on what can only be a forked copy of the fleet database.
+ * Terminal until an operator demotes; there is no timeout to wait out.
+ */
+export interface StaleMasterParkView {
+  observedTerm: number;
+  localTerm: number;
+  peerUrl: string;
+  at: number;
+}
+
+let staleMasterPark: StaleMasterParkView | null = null;
+
+export function _setStaleMasterPark(park: StaleMasterParkView | null): void {
+  staleMasterPark = park;
+}
+
 // Master self-fence latch (PLAN_STANDBY 3.8): store silent + auto backup gone.
 // Latched until restart, exactly like the deposed fence.
 let selfFenced: { at: number; reason: string } | null = null;
@@ -335,9 +356,11 @@ export function getFleetState(): FleetState {
       nodeName: '',
       appVersion: '',
       controlStoreFenced: null,
-      // Live during initFleet: the boot takeover guard holds BEFORE the state
-      // sources exist, and this pre-init branch is what the UI polls then.
+      // Live during initFleet: the boot takeover guard and the stale-master
+      // fence both hold BEFORE the state sources exist, and this pre-init
+      // branch is what the UI polls then.
       takeoverHold,
+      staleMasterPark,
       selfFenced,
       roleOverride: buildRoleOverrideView(),
       backupMaster: isBackupMaster(),
@@ -443,6 +466,7 @@ export function getFleetState(): FleetState {
       appVersion,
       controlStoreFenced,
       takeoverHold,
+      staleMasterPark,
       selfFenced,
       roleOverride: buildRoleOverrideView(),
       backupMaster: isBackupMaster(),
@@ -542,6 +566,7 @@ export function getFleetState(): FleetState {
     appVersion,
     controlStoreFenced: null,
     takeoverHold,
+    staleMasterPark,
     selfFenced,
     roleOverride: buildRoleOverrideView(),
     backupMaster: isBackupMaster(),
