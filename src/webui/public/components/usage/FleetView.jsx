@@ -901,6 +901,29 @@ function FleetNodeCard({ node, isMasterView, onAction, masterSyncRevision, retir
               : `Sync: Behind (${masterSyncRevision - node.syncAppliedRevision})`}
         </div>
       ) : null}
+      {node.dbReplica ? <FleetReplicaLine replica={node.dbReplica} /> : null}
+    </div>
+  );
+}
+
+// One node's database standby, from its own heartbeat. A standby that stopped
+// following is the failure this whole arc exists to survive, so it is stated
+// rather than left to a missing green line.
+function FleetReplicaLine({ replica }) {
+  const lagText = replica.replayAgeMs == null ? '' : ` · last replay ${fleetFormatAge(replica.replayAgeMs)}`;
+  if (replica.error) {
+    return <div className="usage-stat-sub" style={{ color: '#e5534b' }}>DB standby: unreachable ({replica.error})</div>;
+  }
+  if (!replica.inRecovery) {
+    return <div className="usage-stat-sub" style={{ color: '#e5534b' }}>DB standby: promoted, no longer following the primary</div>;
+  }
+  if (!replica.streaming) {
+    return <div className="usage-stat-sub" style={{ color: '#e5534b' }}>DB standby: NOT streaming{lagText}</div>;
+  }
+  const stale = replica.replayAgeMs != null && replica.replayAgeMs > 60000;
+  return (
+    <div className="usage-stat-sub" style={{ color: stale ? '#d29922' : undefined }}>
+      DB standby: streaming{lagText}
     </div>
   );
 }
@@ -1239,6 +1262,12 @@ function FleetView({ api, wsClient, guildNames }) {
         <div className="usage-notice" style={{ borderColor: '#e5534b', color: '#e5534b' }}>
           {`CRITICAL: this master SELF-FENCED (${fleet.selfFenced.reason}). Its gateway sessions were destroyed because the auto-promote backup is expected to take over. Demote this node to rejoin the fleet as a co-worker.`}
           <div><FleetDemoteButton api={api} /></div>
+        </div>
+      )}
+
+      {fleet.dbStandbys && fleet.dbStandbys.some((sb) => sb.state !== 'streaming') && (
+        <div className="usage-notice" style={{ borderColor: '#e5534b', color: '#e5534b' }}>
+          {`Database replication is BROKEN: ${fleet.dbStandbys.filter((sb) => sb.state !== 'streaming').map((sb) => `${sb.clientAddr || 'standby'} is ${sb.state || 'not streaming'}`).join(', ')}. The copy is going stale, so this machine dying would lose everything written since the link broke. Re-seed the standby from its manager.`}
         </div>
       )}
 
