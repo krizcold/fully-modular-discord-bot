@@ -12,6 +12,7 @@ import type {
   NodeCapabilities,
   RegisterPayload,
   ShardStatusEntry,
+  ReplicaHealthReport,
 } from './protocol';
 import { guildIdToShardId } from './placement';
 
@@ -49,6 +50,8 @@ export interface RegistryNode {
   dataBackendHealthy: boolean | null;
   /** Free bytes on the node's data volume from its last heartbeat; null when unreported. */
   freeDiskBytes: number | null;
+  /** The node's local database standby from its last heartbeat; null when it has none. */
+  dbReplica: ReplicaHealthReport | null;
   /** False while the node's last reconcile ended degraded; null when unreported. */
   syncOk: boolean | null;
   send: ((message: object) => void) | null;
@@ -125,6 +128,7 @@ export class Registry {
       syncAppliedRevision: existing?.syncAppliedRevision ?? null,
       syncOk: existing?.syncOk ?? null,
       dataBackendHealthy: existing?.dataBackendHealthy ?? null,
+      dbReplica: existing?.dbReplica ?? null,
       freeDiskBytes: existing?.freeDiskBytes ?? null,
       send: input.send,
     };
@@ -161,6 +165,7 @@ export class Registry {
       syncAppliedRevision: null,
       syncOk: null,
       dataBackendHealthy: null,
+      dbReplica: null,
       freeDiskBytes: null,
       send: null,
     };
@@ -189,6 +194,7 @@ export class Registry {
     if (Number.isInteger(hb.syncAppliedRevision)) node.syncAppliedRevision = hb.syncAppliedRevision!;
     if (typeof hb.syncOk === 'boolean') node.syncOk = hb.syncOk;
     if (typeof hb.dataBackendHealthy === 'boolean') node.dataBackendHealthy = hb.dataBackendHealthy;
+    if (hb.dbReplica !== undefined) node.dbReplica = hb.dbReplica;
     if (Number.isFinite(hb.freeDiskBytes)) node.freeDiskBytes = hb.freeDiskBytes!;
     this.replaceNodeGuilds(nodeId, Array.isArray(hb.guilds) ? hb.guilds : []);
     this.adoptHeartbeatClaims(nodeId, hb);

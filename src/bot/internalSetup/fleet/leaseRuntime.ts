@@ -12,6 +12,7 @@ import { getMetricsCollector } from '../utils/metrics/metricsCollector';
 import { getDataReadiness } from '../utils/dataBackends/dataReadiness';
 import { getGuildDataBackend } from '../utils/dataManager';
 import { getNodeId } from './nodeIdentity';
+import { getReplicaHealth, startReplicaHealthSampler } from './replicaHealth';
 import type { IngestService } from '../ingest/ingestService';
 import type {
   HeartbeatPayload,
@@ -269,6 +270,8 @@ export class LeaseRuntime {
     } catch { /* metrics must never take the control channel down */ }
     const backend = getGuildDataBackend();
     startFreeDiskSampler();
+    startReplicaHealthSampler();
+    const dbReplica = getReplicaHealth();
     const hb: HeartbeatPayload = {
       term,
       seq: ++this.seq,
@@ -279,6 +282,7 @@ export class LeaseRuntime {
       load: this.sampleLoad(),
       ...(backend ? { dataBackendHealthy: backend.healthy() } : {}),
       ...(cachedFreeDiskBytes !== undefined ? { freeDiskBytes: cachedFreeDiskBytes } : {}),
+      ...(dbReplica ? { dbReplica } : {}),
     };
     this.lastHeartbeat = hb;
     return hb;

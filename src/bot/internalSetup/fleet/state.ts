@@ -15,6 +15,8 @@ import type { IdentifyLedger } from './identifyLedger';
 import type { IngestService } from '../ingest/ingestService';
 import { resolveDataBackend } from '../../../utils/envLoader';
 import { getGuildDataBackend } from '../utils/dataManager';
+import { getReplicaHealth, getStandbyLinks, startReplicaHealthSampler, StandbyLinkView } from './replicaHealth';
+import type { ReplicaHealthReport } from './protocol';
 import { getRouteOverrides } from '../utils/dataBackends/routeResolver';
 import { getDataBootStatus, DataBootStatus } from '../utils/dataBackends/boot';
 import type { TransformationView } from './transformation/transformationCoordinator';
@@ -41,6 +43,8 @@ export interface FleetStateNode {
   backoff: { crashCount: number; nextPermitInMs: number } | null;
   /** Last fully-applied sync revision from the node's heartbeats (master view); null when unreported. */
   syncAppliedRevision: number | null;
+  /** The node's local database standby from its heartbeat; null when it has none. */
+  dbReplica: ReplicaHealthReport | null;
 }
 
 export interface FleetRefusedRegistration {
@@ -208,6 +212,8 @@ export interface FleetState {
   pinViolation: PinViolationView | null;
   /** Names for guilds in guildMap the connected clients cannot name (master's REST list); merged UI-side. */
   guildNames?: Record<string, string>;
+  /** Standbys attached to the fleet database, read by whoever serves it; null off-postgres or before the first read. */
+  dbStandbys: StandbyLinkView[] | null;
   updatedAt: number;
 }
 
@@ -347,6 +353,8 @@ function buildConnect(): FleetState['connect'] {
 }
 
 export function getFleetState(): FleetState {
+  // A master builds no heartbeats, so this is where its own sampler starts.
+  startReplicaHealthSampler();
   if (!sources) {
     return {
       initialized: false,
@@ -393,6 +401,7 @@ export function getFleetState(): FleetState {
       nodes: [],
       shardTable: [],
       guildMap: {},
+      dbStandbys: null,
       migration: null,
       transformation: null,
       pinViolation: null,
@@ -428,6 +437,8 @@ export function getFleetState(): FleetState {
       draining: node.draining,
       backoff: ledger?.getNodeBackoff(node.nodeId) ?? null,
       syncAppliedRevision: node.syncAppliedRevision,
+      // The master keeps no heartbeat of its own, so its standby is read locally.
+      dbReplica: node.isSelf ? getReplicaHealth() ?? null : node.dbReplica,
     }));
     // Per-shard guild counts: prefer the REST-derived totals (cover unassigned
     // shards), fall back to the connection-derived guildMap before the first
@@ -513,6 +524,7 @@ export function getFleetState(): FleetState {
       // guilds; the result lets Guilds-by-shard list unserved guilds too.
       guildMap: { ...Object.fromEntries(registry.restGuildShards), ...Object.fromEntries(registry.guildMap) },
       guildNames: Object.fromEntries(registry.restGuildNames),
+      dbStandbys: getStandbyLinks() ?? null,
       migration: sources.migration?.() ?? null,
       transformation: sources.transformation?.() ?? null,
       pinViolation: sources.pinViolation?.() ?? null,
@@ -621,10 +633,12 @@ export function getFleetState(): FleetState {
         draining,
         backoff: null,
         syncAppliedRevision: sources.sync?.().appliedRevision ?? null,
+        dbReplica: getReplicaHealth() ?? null,
       },
     ],
     shardTable,
     guildMap,
+    dbStandbys: getStandbyLinks() ?? null,
     migration: null,
     transformation: null,
     pinViolation: null,

@@ -192,6 +192,17 @@ export interface LoadSample {
   loopLagMs: number;
 }
 
+/** A node's local database standby, as its heartbeat reports it (PLAN_REPLICATION Stage 5). */
+export interface ReplicaHealthReport {
+  streaming: boolean;
+  /** False once promoted: the copy has stopped following the primary. */
+  inRecovery: boolean;
+  /** Age of the last replayed transaction; the RPO if the primary died now. */
+  replayAgeMs: number | null;
+  /** Set when the standby could not be probed at all (stopped, mid-reseed). */
+  error?: string;
+}
+
 export interface HeartbeatPayload {
   term: number;
   seq: number;
@@ -209,6 +220,8 @@ export interface HeartbeatPayload {
   dataBackendHealthy?: boolean;
   /** Free bytes on the data volume; feeds the postgres-to-file transformation space precheck. */
   freeDiskBytes?: number;
+  /** This node's local database standby; absent when it has none (PLAN_REPLICATION Stage 5). */
+  dbReplica?: ReplicaHealthReport;
 }
 
 export interface GuildNoticePayload {
