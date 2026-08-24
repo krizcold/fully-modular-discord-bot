@@ -110,9 +110,10 @@ export function canonicalStoreReachable(): Promise<{ ok: boolean; error?: string
 }
 
 /** True when the fleet's canonical URL already names this machine's own database endpoint. */
-function canonicalIsOwnReplica(publicEndpoint: string): boolean {
+function canonicalIsOwnReplica(endpoints: ReplicaEndpoints): boolean {
   try {
-    return new URL(currentCanonicalUrl()).host === new URL(publicEndpoint).host;
+    const canonical = new URL(currentCanonicalUrl()).host;
+    return canonical === new URL(endpoints.public).host || canonical === new URL(endpoints.local).host;
   } catch {
     return false;
   }
@@ -213,17 +214,24 @@ export async function promoteReplica(splicedLocalUrl: string): Promise<{ success
  * design) and the takeover would boot against the dead primary and park
  * forever. CONTROL_STORE_URL is repointed only when it was in use.
  */
-export function persistPromotedUrls(splicedPublicUrl: string): { success: boolean; error?: string } {
+export function persistPromotedUrls(splicedLocalUrl: string, splicedPublicUrl: string): { success: boolean; error?: string } {
   const hadControlUrl = (loadCredentials().CONTROL_STORE_URL || '').trim() !== '';
-  const patch: Record<string, string> = { DATA_BACKEND_URL: splicedPublicUrl };
-  if (hadControlUrl) patch.CONTROL_STORE_URL = splicedPublicUrl;
+  // This node dials its own database by the LOCAL form (F1: the public form
+  // cannot hairpin from beside the sidecar); the public form is recorded for
+  // delivery to remote workers on their next register.
+  const patch: Record<string, string> = {
+    DATA_BACKEND_URL: splicedLocalUrl,
+    DATA_BACKEND_LOCAL_URL: splicedLocalUrl,
+    DATA_BACKEND_PUBLIC_URL: splicedPublicUrl,
+  };
+  if (hadControlUrl) patch.CONTROL_STORE_URL = splicedLocalUrl;
   const result = upsertCredentials(patch);
   if (!result.success) return { success: false, error: `could not persist the promoted database URL: ${result.error}` };
   const creds = loadCredentials();
   const effective = (creds.DATA_BACKEND_URL || '').trim();
   const controlEffective = (creds.CONTROL_STORE_URL || '').trim();
-  if (effective !== splicedPublicUrl || (hadControlUrl && controlEffective !== splicedPublicUrl)) {
-    return { success: false, error: 'the fleet database URL is pinned by this container environment, so the promoted database cannot take effect; point DATA_BACKEND_URL (and CONTROL_STORE_URL, if set) at the standby in the instance env editor, then promote again' };
+  if (effective !== splicedLocalUrl || (hadControlUrl && controlEffective !== splicedLocalUrl)) {
+    return { success: false, error: 'the fleet database URL is pinned by this container environment, so the promoted database cannot take effect; REMOVE DATA_BACKEND_URL (and CONTROL_STORE_URL, if set) from the instance env editor so the node-local data/.env takes effect, then promote again' };
   }
   return { success: true };
 }
@@ -280,13 +288,13 @@ export async function promoteReplicaPair(
   // SOMEONE ELSE'S live database must not be told to follow this one.
   if (probe.inRecovery === false) {
     const canonicalNow = await canonicalStoreReachable();
-    if ((canonicalNow.ok || opts.masterAlive) && !canonicalIsOwnReplica(endpoints.public)) {
+    if ((canonicalNow.ok || opts.masterAlive) && !canonicalIsOwnReplica(endpoints)) {
       return {
         success: false,
         error: 'this machine\'s database has already left standby mode, but the fleet is still running on another one; pointing the fleet at this database would split it. Re-seed this machine as a standby, or stop the old master and its database first.',
       };
     }
-    const persisted = persistPromotedUrls(publicSpliced.url);
+    const persisted = persistPromotedUrls(local.url!, publicSpliced.url!);
     return persisted.success
       ? { success: true, promotedDatabase: true, lagMs: probe.replayAgeMs ?? null }
       : { success: false, error: persisted.error };
@@ -330,16 +338,14 @@ export async function promoteReplicaPair(
       error: `the standby last replayed a transaction ${Math.round(lagMs / 1000)}s ago; promoting it accepts losing anything the old primary took after that`,
     };
   }
-  // Prove the endpoint the FLEET will dial works before the one step that
-  // cannot be undone: a standby behind a closed host port or a NAT without
-  // hairpin would otherwise leave a promoted database nobody can reach.
+  // The published endpoint cannot be PROVEN from here: this node sits beside
+  // the standby sidecar, exactly the vantage where the public form cannot
+  // hairpin (F1), and after promotion this node dials the LOCAL form anyway.
+  // A dead public endpoint only delays REMOTE workers (they retry until it
+  // opens), so it warns instead of vetoing the host-death failover.
   const reachable = await storeReachable(publicSpliced.url);
   if (!reachable.ok) {
-    return {
-      success: false,
-      lagMs,
-      error: `the standby's published endpoint is not reachable from this node (${reachable.error}); the fleet could not use it after promotion. Open that host port (and check NAT hairpin), then promote.`,
-    };
+    console.warn(`[Fleet] The standby's published endpoint did not answer from this node (${reachable.error}); remote workers cannot follow this database until that host port is reachable for them. Proceeding - this vantage cannot prove the public endpoint either way (NAT hairpin).`);
   }
 
   // Last look before the point of no return: the operator may have spent the
@@ -353,7 +359,7 @@ export async function promoteReplicaPair(
   console.warn(`[Fleet] PAIR PROMOTION: the primary is gone on both channels; promoting the local standby (last replay ${lagMs === null ? 'unknown' : Math.round(lagMs / 1000) + 's ago'})`);
   const promoted = await promoteReplica(local.url);
   if (!promoted.success) return { success: false, error: `promoting the local database replica failed: ${promoted.error}`, lagMs };
-  const persisted = persistPromotedUrls(publicSpliced.url);
+  const persisted = persistPromotedUrls(local.url!, publicSpliced.url!);
   if (!persisted.success) return { success: false, error: persisted.error, lagMs };
   console.warn('[Fleet] Pair promotion complete: the local database is out of recovery and is now this fleet\'s canonical store');
   return { success: true, promotedDatabase: true, lagMs };
