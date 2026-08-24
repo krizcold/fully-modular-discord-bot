@@ -549,7 +549,11 @@ export class TransformationCoordinator {
   private async completeFlip(): Promise<void> {
     const rec = this.record!;
     const dest = destOf(rec.direction);
-    const url = (loadCredentials().DATA_BACKEND_URL || '').trim();
+    const creds = loadCredentials();
+    // Own marker write dials this node's picked form; the PAYLOAD carries the
+    // LOCAL form (a remote master's own picked url is the public one, and a
+    // url that equals publicUrl would defeat every receiver's pick).
+    const url = (creds.DATA_BACKEND_URL || '').trim();
     if (url) {
       try {
         const storeId = await readStoreId(url);
@@ -558,7 +562,9 @@ export class TransformationCoordinator {
         console.warn('[Transform] Could not write the database-side backend marker (informational):', error instanceof Error ? error.message : error);
       }
     }
-    const flip: BackendFlipPayload = { backend: dest, transformationId: rec.id, term: rec.term, ...(url ? { url } : {}) };
+    const deliverUrl = (creds.DATA_BACKEND_LOCAL_URL || '').trim() || url;
+    const publicUrl = (creds.DATA_BACKEND_PUBLIC_URL || '').trim();
+    const flip: BackendFlipPayload = { backend: dest, transformationId: rec.id, term: rec.term, ...(deliverUrl ? { url: deliverUrl } : {}), ...(publicUrl ? { publicUrl } : {}) };
     for (const node of this.hooks.registry.nodes.values()) {
       if (!node.connected) continue;
       try {
@@ -582,8 +588,10 @@ export class TransformationCoordinator {
 
   private async sendTransform(nodeId: string, payload: TransformGuildPayload): Promise<TransformGuildAckPayload> {
     try {
-      const url = (loadCredentials().DATA_BACKEND_URL || '').trim();
-      if (url) payload = { ...payload, url };
+      const creds = loadCredentials();
+      const url = (creds.DATA_BACKEND_LOCAL_URL || '').trim() || (creds.DATA_BACKEND_URL || '').trim();
+      const publicUrl = (creds.DATA_BACKEND_PUBLIC_URL || '').trim();
+      if (url) payload = { ...payload, url, ...(publicUrl ? { publicUrl } : {}) };
       const ack = await this.hooks.sendControl(nodeId, MSG.TRANSFORM_GUILD, payload, TRANSFORM_GUILD_TIMEOUT_MS);
       if (ack && typeof ack.ok === 'boolean') return ack as TransformGuildAckPayload;
       return { ok: false, reason: 'malformed ack' };

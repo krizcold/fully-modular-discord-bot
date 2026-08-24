@@ -22,7 +22,7 @@ import {
   guildDirExists,
 } from '../../utils/dataBackends/fileBackend';
 import { setRouteOverride } from '../../utils/dataBackends/routeResolver';
-import { getActiveBackendUrl, applyBackendFlip, ensureRuntimeWith } from '../../utils/dataBackends/boot';
+import { getActiveBackendUrl, applyBackendFlip, ensureRuntimeWith, pickDeliveredUrl } from '../../utils/dataBackends/boot';
 import { PostgresBackend } from '../../utils/dataBackends/postgresBackend';
 import { importNamespace } from '../../utils/dataInterchange';
 import { DATA_ROOT } from '../../../../utils/dataRoot';
@@ -81,7 +81,9 @@ export class TransformationExecutor {
     // be able to serve the guild the moment its route flips; as the source it
     // must be readable to export. A node whose env never carried the URL
     // constructs it from the payload-delivered one.
-    if (getActiveBackendUrl() === null && payload.url) ensureRuntimeWith(payload.url);
+    if (getActiveBackendUrl() === null && payload.url) {
+      ensureRuntimeWith(await pickDeliveredUrl(payload.url, (payload.publicUrl || '').trim()));
+    }
     const url = getActiveBackendUrl();
     if (!url) return { ok: false, reason: 'postgres-runtime-not-ready' };
     if (!(await this.waitPostgresReady(RUNTIME_READY_WAIT_MS))) return { ok: false, reason: 'database-unreachable' };
@@ -160,7 +162,9 @@ export class TransformationExecutor {
       }
       // A node that flipped to file may never have constructed the runtime
       // (offline at the broadcast); the retire message carries the URL.
-      if (getActiveBackendUrl() === null && payload.url) ensureRuntimeWith(payload.url);
+      if (getActiveBackendUrl() === null && payload.url) {
+        ensureRuntimeWith(await pickDeliveredUrl(payload.url, (payload.publicUrl || '').trim()));
+      }
       if (!(await this.waitPostgresReady(RUNTIME_READY_WAIT_MS))) return { ok: false, reason: 'postgres-runtime-not-ready' };
       const backend = getGuildDataBackend() as PostgresBackend;
       const fence = fenceFromOwnerInfo(guildId);
@@ -176,7 +180,7 @@ export class TransformationExecutor {
   private async handleBackendFlip(payload: BackendFlipPayload): Promise<BackendFlipAckPayload> {
     if (payload.term !== this.opts.getTerm()) return { ok: false };
     if (payload.backend === 'postgres' && getActiveBackendUrl() === null && payload.url) {
-      ensureRuntimeWith(payload.url);
+      ensureRuntimeWith(await pickDeliveredUrl(payload.url, (payload.publicUrl || '').trim()));
     }
     applyBackendFlip(payload.backend);
     this.opts.onFlipped?.(payload.backend);
