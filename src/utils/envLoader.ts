@@ -53,6 +53,10 @@ export interface BotCredentials {
   // and the optional control-store location override.
   DATA_BACKEND?: string;
   DATA_BACKEND_URL?: string;
+  /** Host-reachable form of DATA_BACKEND_URL, delivered to remote workers (same-host consumers cannot hairpin it). */
+  DATA_BACKEND_PUBLIC_URL?: string;
+  /** Container-name form as delivered, kept verbatim so this node can re-deliver the pair if it becomes master. */
+  DATA_BACKEND_LOCAL_URL?: string;
   CONTROL_STORE_URL?: string;
   // Payment provider credentials are arbitrary env-var keys the providers
   // declare via getCredentialFields(); they're addressable through the
@@ -121,6 +125,8 @@ export function loadCredentials(): BotCredentials {
     SESSION_SECRET: process.env.SESSION_SECRET,
     DATA_BACKEND: process.env.DATA_BACKEND,
     DATA_BACKEND_URL: process.env.DATA_BACKEND_URL,
+    DATA_BACKEND_PUBLIC_URL: process.env.DATA_BACKEND_PUBLIC_URL,
+    DATA_BACKEND_LOCAL_URL: process.env.DATA_BACKEND_LOCAL_URL,
     CONTROL_STORE_URL: process.env.CONTROL_STORE_URL,
   };
 

@@ -76,7 +76,7 @@ import {
   GuildDataWriteRequest,
   setDataOpForwarder,
 } from '../utils/ipcDataHandler';
-import { applyDeliveredBackend, ensureRuntimeWith } from '../utils/dataBackends/boot';
+import { applyDeliveredBackend, ensureRuntimeWith, getActiveBackendUrl, pickDeliveredUrl } from '../utils/dataBackends/boot';
 import { setLeaseDeclineHandler } from '../utils/dataBackends/dataReadiness';
 import { applyRouteOverrides, currentRouteDefault } from '../utils/dataBackends/routeResolver';
 import { loadCredentials, resolveDataBackend, upsertCredentials } from '../../../utils/envLoader';
@@ -810,8 +810,11 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       // from the wrong backend and served empty.
       grant.transformationId = activeTransformationId;
       grant.dataRoutes = transformer!.routesView();
-      const url = (loadCredentials().DATA_BACKEND_URL || '').trim();
+      const grantCreds = loadCredentials();
+      const url = (grantCreds.DATA_BACKEND_LOCAL_URL || '').trim() || (grantCreds.DATA_BACKEND_URL || '').trim();
       if (url) grant.dataBackendUrl = url;
+      const publicUrl = (grantCreds.DATA_BACKEND_PUBLIC_URL || '').trim();
+      if (publicUrl) grant.dataBackendPublicUrl = publicUrl;
     }
 
     if (node.isSelf) {
@@ -1600,6 +1603,12 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       live = currentRouteDefault();
     } catch { /* invalid DATA_BACKEND refused at data boot; deliver file */ }
     const transformationId = transformer?.activeId() ?? null;
+    // The LOCAL form is delivered as the primary url (a master beside the
+    // sidecar has it as its own DATA_BACKEND_URL; a remote master carries it
+    // in DATA_BACKEND_LOCAL_URL because its own picked url is the public one).
+    const creds = loadCredentials();
+    const url = (creds.DATA_BACKEND_LOCAL_URL || '').trim() || (creds.DATA_BACKEND_URL || '').trim();
+    const publicUrl = (creds.DATA_BACKEND_PUBLIC_URL || '').trim();
     if (transformationId) {
       // Mid-window delivery: the live default plus the routing map and the
       // URL (a file-default worker still needs the runtime for converted
@@ -1607,13 +1616,14 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       // instruction for a node that missed the broadcast.
       return {
         backend: live,
-        url: (loadCredentials().DATA_BACKEND_URL || '').trim(),
+        url,
+        ...(publicUrl ? { publicUrl } : {}),
         transformationId,
         routes: transformer!.routesView(),
       };
     }
     if (live !== 'postgres') return { backend: 'file' };
-    return { backend: 'postgres', url: (loadCredentials().DATA_BACKEND_URL || '').trim() };
+    return { backend: 'postgres', url, ...(publicUrl ? { publicUrl } : {}) };
   }
 
   async function persist(): Promise<void> {
@@ -2260,11 +2270,16 @@ async function initCoWorker(init: CommonInit): Promise<FleetContext> {
       onSyncState: payload => engine.onSyncState(payload),
       onXferControl: (type, data) => executor!.handle(type, data),
       onTransformControl: (type, data) => transformExecutor.handle(type, data),
-      onDataRoutes: (_transformationId, routes, url) => {
-        // Applied before the grant's hydration: a converted shard placed here
-        // mid-window must read its guilds from the destination.
+      onDataRoutes: async (_transformationId, routes, url, publicUrl) => {
+        // Applied (and awaited) before the grant's hydration: a converted
+        // shard placed here mid-window must read its guilds from the
+        // destination, so the runtime must exist before applyGrant runs. The
+        // probe only runs while no runtime exists; ensureRuntimeWith no-ops
+        // otherwise and the grant ack should not wait on a wasted dial.
         applyRouteOverrides(routes);
-        if (url) ensureRuntimeWith(url);
+        if (url && getActiveBackendUrl() === null) {
+          ensureRuntimeWith(await pickDeliveredUrl(url, (publicUrl || '').trim()));
+        }
       },
       onDataOp: async (type, data) => {
         // Webui write/read hop: reject a stale term and verify the lease is

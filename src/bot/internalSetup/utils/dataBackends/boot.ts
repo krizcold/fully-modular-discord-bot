@@ -4,6 +4,7 @@
 // claim can touch a database that turns out to be the wrong one.
 
 import { MessageFlags } from 'discord.js';
+import { connect } from 'net';
 import { DataBackendKind, loadCredentials, setFleetDataBackend, upsertCredentials } from '../../../../utils/envLoader';
 import { PostgresBackend } from './postgresBackend';
 import { initWorkingSet, getWorkingSet } from './workingSet';
@@ -106,6 +107,42 @@ function startPostgresRuntime(url: string): void {
   void verifyIdentityLoop(url, driver);
 }
 
+const PICK_CONNECT_TIMEOUT_MS = 4_000;
+
+function tcpReachable(host: string, port: number): Promise<boolean> {
+  return new Promise(resolve => {
+    const socket = connect({ host, port });
+    const done = (ok: boolean): void => { socket.destroy(); resolve(ok); };
+    socket.setTimeout(PICK_CONNECT_TIMEOUT_MS, () => done(false));
+    socket.once('connect', () => done(true));
+    socket.once('error', () => done(false));
+  });
+}
+
+/**
+ * Pick which delivered form this node can actually DIAL (F1): the container
+ * form connects only from the sidecar's own host, and the public form cannot
+ * hairpin from there. A TCP connect, not a DNS lookup, is the test - wildcard
+ * resolvers (ISP NXDOMAIN redirection behind docker's embedded DNS) make bare
+ * names "resolve" everywhere, which would strand a remote worker on an
+ * undialable pick. When BOTH forms are dark the database itself is down and
+ * the probe proves nothing about vantage, so the pick sticks with whatever
+ * this node used before rather than migrating on noise. A wrong pick is still
+ * caught by store-identity verification, never served.
+ */
+export async function pickDeliveredUrl(url: string, publicUrl: string, previous?: string): Promise<string> {
+  if (!publicUrl || publicUrl === url) return url;
+  try {
+    const local = new URL(url);
+    if (await tcpReachable(local.hostname, Number(local.port) || 5432)) return url;
+    const pub = new URL(publicUrl);
+    if (await tcpReachable(pub.hostname, Number(pub.port) || 5432)) return publicUrl;
+    return previous === publicUrl ? publicUrl : url;
+  } catch {
+    return publicUrl;
+  }
+}
+
 /**
  * Co-worker apply of the master-delivered backend (register reply, re-sent on
  * every reconnect). Returns true when the effective backend or URL changed
@@ -114,20 +151,37 @@ function startPostgresRuntime(url: string): void {
  * closed until the new runtime's identity verifies.
  */
 export async function applyDeliveredBackend(
-  info: { backend: DataBackendKind; url?: string; transformationId?: string; routes?: { guildId: string; backend: DataBackendKind }[] } | undefined,
+  info: { backend: DataBackendKind; url?: string; publicUrl?: string; transformationId?: string; routes?: { guildId: string; backend: DataBackendKind }[] } | undefined,
 ): Promise<boolean> {
   const backend = info?.backend ?? 'file';
-  const url = (info?.url || '').trim();
+  const publicUrl = (info?.publicUrl || '').trim();
+  const localUrl = (info?.url || '').trim();
+  const previousUrl = (loadCredentials().DATA_BACKEND_URL || '').trim();
+  // Mid-transformation deliveries carry the url with backend 'file' too, so
+  // the pick keys on the url's presence, not on the backend.
+  const url = localUrl ? await pickDeliveredUrl(localUrl, publicUrl, previousUrl) : localUrl;
   const creds = loadCredentials();
   const envBackend = (creds.DATA_BACKEND || 'file').trim() || 'file';
   const envUrl = (creds.DATA_BACKEND_URL || '').trim();
-  const changed = backend !== envBackend || (backend === 'postgres' && url !== envUrl);
+  const envPublicUrl = (creds.DATA_BACKEND_PUBLIC_URL || '').trim();
+  const envLocalUrl = (creds.DATA_BACKEND_LOCAL_URL || '').trim();
+  const changed = backend !== envBackend
+    || (backend === 'postgres' && (url !== envUrl || publicUrl !== envPublicUrl || localUrl !== envLocalUrl));
 
   setFleetDataBackend(backend === 'postgres' ? { backend, url } : { backend });
 
   if (changed) {
     const patch: Record<string, string> = { DATA_BACKEND: backend };
-    if (backend === 'postgres') patch.DATA_BACKEND_URL = url;
+    if (backend === 'postgres') {
+      patch.DATA_BACKEND_URL = url;
+      // Both delivered forms verbatim, so this node can re-deliver the pair if
+      // it ever becomes master (the picked url alone loses the container form
+      // on remote nodes). Always written: an empty value clears a stale form
+      // left from a primary whose replication was since disabled (upsert
+      // cannot delete).
+      patch.DATA_BACKEND_LOCAL_URL = localUrl;
+      patch.DATA_BACKEND_PUBLIC_URL = publicUrl;
+    }
     const result = upsertCredentials(patch);
     if (!result.success) {
       console.warn('[Data] Could not persist the delivered backend to /data/.env; applied in-memory only:', result.error);

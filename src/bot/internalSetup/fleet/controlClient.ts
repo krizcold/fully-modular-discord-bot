@@ -49,7 +49,7 @@ export interface ControlClientOptions {
   /** Backend transformation control (TRANSFORM_GUILD/BACKEND_FLIP) -> executor; returns the ack payload. */
   onTransformControl?: (type: string, data: any) => Promise<any>;
   /** Grant-carried routing map (active transformation); applied BEFORE the grant so hydration sees correct routes. */
-  onDataRoutes?: (transformationId: string, routes: { guildId: string; backend: 'file' | 'postgres' }[], url?: string) => void;
+  onDataRoutes?: (transformationId: string, routes: { guildId: string; backend: 'file' | 'postgres' }[], url?: string, publicUrl?: string) => void | Promise<void>;
 }
 
 export class ControlClient {
@@ -244,7 +244,7 @@ export class ControlClient {
       case MSG.LEASE_GRANT: {
         const grant = data as LeaseGrantPayload;
         if (grant.transformationId && Array.isArray(grant.dataRoutes)) {
-          try { this.opts.onDataRoutes?.(grant.transformationId, grant.dataRoutes, grant.dataBackendUrl); } catch { /* grant must still apply */ }
+          try { await this.opts.onDataRoutes?.(grant.transformationId, grant.dataRoutes, grant.dataBackendUrl, grant.dataBackendPublicUrl); } catch { /* grant must still apply */ }
         }
         const ack = await this.opts.runtime.applyGrant(grant);
         if (ack.ok) {

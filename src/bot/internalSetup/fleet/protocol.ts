@@ -108,6 +108,14 @@ export interface DataBackendInfo {
   backend: 'file' | 'postgres';
   /** Connection string; only when backend is postgres. */
   url?: string;
+  /**
+   * Host-reachable form of the same database, when replication published one.
+   * A receiver whose local DNS cannot resolve `url`'s host is on another
+   * machine and uses this instead (F1: the public form cannot hairpin from
+   * containers sharing a docker network with the sidecar, so same-host nodes
+   * must keep the container-name form).
+   */
+  publicUrl?: string;
   /** Active transformation, if any. */
   transformationId?: string;
   /** Per-guild routing overrides while a transformation is active. */
@@ -160,6 +168,8 @@ export interface LeaseGrantPayload {
   transformationId?: string;
   dataRoutes?: { guildId: string; backend: 'file' | 'postgres' }[];
   dataBackendUrl?: string;
+  /** Host-reachable counterpart of dataBackendUrl (see DataBackendInfo.publicUrl). */
+  dataBackendPublicUrl?: string;
 }
 
 export interface LeaseRevokePayload {
@@ -431,6 +441,8 @@ export interface TransformGuildPayload {
   phase?: 'convert' | 'retire-source';
   /** Connection string for a node whose env never carried it (C5: authed control channel is the secret lane). */
   url?: string;
+  /** Host-reachable counterpart of url (see DataBackendInfo.publicUrl). */
+  publicUrl?: string;
 }
 
 export interface TransformGuildAckPayload {
@@ -445,6 +457,8 @@ export interface BackendFlipPayload {
   term: number;
   /** Connection string so a zero-guild node can still construct the runtime it flips to. */
   url?: string;
+  /** Host-reachable counterpart of url (see DataBackendInfo.publicUrl). */
+  publicUrl?: string;
 }
 
 export interface BackendFlipAckPayload {
