@@ -14,6 +14,7 @@ import { FileControlStore, atomicWriteFileSync } from './fileControlStore';
 import { FLEET_DIR } from './constants';
 import type {
   ControlStore,
+  PersistedFleetConfig,
   PersistedMigrations,
   PersistedPlan,
   PersistedRegistry,
@@ -32,7 +33,7 @@ const SEED_RETRY_MS = 5000;
 // that finds it must export the documents back before serving.
 const MOVED_SENTINEL = () => dataPath('global', FLEET_DIR, 'control-store-moved.json');
 
-const DOC_NAMES = ['plan', 'registry', 'migrations', 'reshard-pending', 'redistribute-proposal', 'transformation'] as const;
+const DOC_NAMES = ['plan', 'registry', 'migrations', 'reshard-pending', 'redistribute-proposal', 'transformation', 'fleet-config'] as const;
 
 const CONTROL_DDL = [
   `CREATE SCHEMA IF NOT EXISTS smdb_control`,
@@ -218,6 +219,7 @@ export class PostgresControlStore implements ControlStore {
               'reshard-pending': jsonOrNull(marker),
               'redistribute-proposal': jsonOrNull(await fileStore.loadRedistributeProposal()),
               'transformation': jsonOrNull(await fileStore.loadTransformation()),
+              'fleet-config': jsonOrNull(await fileStore.loadFleetConfig()),
             };
             await client.query('BEGIN');
             const now = Date.now();
@@ -316,6 +318,16 @@ export class PostgresControlStore implements ControlStore {
 
   async savePlan(plan: PersistedPlan): Promise<void> {
     await this.fencedWrite(client => this.upsertDoc(client, 'plan', JSON.stringify(plan)));
+  }
+
+  async saveFleetConfig(config: PersistedFleetConfig): Promise<void> {
+    await this.fencedWrite(client => this.upsertDoc(client, 'fleet-config', JSON.stringify(config)));
+  }
+
+  async loadFleetConfig(): Promise<PersistedFleetConfig | null> {
+    const body = await this.readDoc('fleet-config');
+    if (body === null) return null;
+    try { return JSON.parse(body) as PersistedFleetConfig; } catch { return null; }
   }
 
   async loadPlan(): Promise<PersistedPlan | null> {
@@ -524,6 +536,7 @@ async function exportBackToFileStore(): Promise<void> {
         'reshard-pending': 'reshard-pending.json',
         'redistribute-proposal': 'redistribute-proposal.json',
         'transformation': 'transformation.json',
+        'fleet-config': 'fleet-config.json',
       };
       for (const name of DOC_NAMES) {
         const target = dataPath('global', FLEET_DIR, fileFor[name]);

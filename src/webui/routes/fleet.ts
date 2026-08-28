@@ -9,11 +9,11 @@ import {
   invalidateRoleOverrideCache,
   isStandalone,
   resolveEnvRole,
-  resolveMasterUrls,
   resolveNodeRole,
   writeRoleOverride,
 } from '../../bot/internalSetup/fleet/nodeIdentity';
 import { canonicalStoreReachable, promoteReplicaPair, resolveReplicaEndpoints } from '../../bot/internalSetup/fleet/replicaPromotion';
+import { effectiveMasterUrls } from '../../bot/internalSetup/fleet/fleetConfig';
 
 // Promotion gate: dataBackendHealthy stays true through the C1 write-acceptance
 // coast, so it cannot see a control-store outage. The probe itself lives in
@@ -42,6 +42,27 @@ export function createFleetRoutes(botManager: BotManager): Router {
     } catch (error) {
       console.error('[Fleet] Failed to get fleet state:', error instanceof Error ? error.message : error);
       res.json({ success: true, running: botManager.isRunning(), initialized: false });
+    }
+  });
+
+  /**
+   * POST /api/fleet/config { masterCandidates: string[] }
+   * Master-only runtime edit of the fleet config (B2): validated and applied
+   * in the bot child, persisted to the control store, and pushed to every
+   * connected node with zero restarts. The current copy rides GET /state
+   * (state.fleetConfig, with the source of each value).
+   */
+  router.post('/config', async (req: Request, res: Response) => {
+    try {
+      if (!botManager.isRunning()) {
+        res.json({ success: false, error: 'Bot is not running' });
+        return;
+      }
+      const result = await botManager.setFleetConfig(req.body?.masterCandidates);
+      res.json(result?.success ? { success: true, revision: result.revision } : { success: false, error: result?.error ?? 'config update failed' });
+    } catch (error) {
+      console.error('[Fleet] Failed to set fleet config:', error instanceof Error ? error.message : error);
+      res.json({ success: false, error: error instanceof Error ? error.message : 'config update failed' });
     }
   });
 
@@ -422,7 +443,7 @@ export function createFleetRoutes(botManager: BotManager): Router {
         // Guard-held boot or a downed child: parent-side prechecks.
         const refusal = resolveNodeRole() !== 'master' ? 'this node is not a master'
           : isStandalone() ? 'a standalone master has no fleet to rejoin; demotion is meaningless here'
-          : resolveMasterUrls().length === 0 ? 'no master candidates configured (set MASTER_URLS first, or the demoted node would idle)'
+          : effectiveMasterUrls().urls.length === 0 ? 'no master candidates configured (set MASTER_URLS or the fleet config first, or the demoted node would idle)'
           : null;
         if (refusal) {
           res.json({ success: false, error: refusal });

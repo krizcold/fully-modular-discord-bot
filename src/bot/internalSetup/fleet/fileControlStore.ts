@@ -5,7 +5,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { dataPath } from '../../../utils/dataRoot';
 import { FLEET_DIR } from './constants';
-import type { ControlStore, PersistedMigrations, PersistedPlan, PersistedRegistry, PersistedTerm, RedistributeProposal, ReshardArchive, ReshardMarker, TransformationRecord } from './controlStore';
+import type { ControlStore, PersistedFleetConfig, PersistedMigrations, PersistedPlan, PersistedRegistry, PersistedTerm, RedistributeProposal, ReshardArchive, ReshardMarker, TransformationRecord } from './controlStore';
 
 export function atomicWriteFileSync(file: string, contents: string): void {
   fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -55,6 +55,14 @@ export class FileControlStore implements ControlStore {
 
   async getTerm(): Promise<PersistedTerm | null> {
     return readJson<PersistedTerm>(this.file('term.json'));
+  }
+
+  async saveFleetConfig(config: PersistedFleetConfig): Promise<void> {
+    atomicWriteFileSync(this.file('fleet-config.json'), JSON.stringify(config, null, 2));
+  }
+
+  async loadFleetConfig(): Promise<PersistedFleetConfig | null> {
+    return readJson<PersistedFleetConfig>(this.file('fleet-config.json'));
   }
 
   async savePlan(plan: PersistedPlan): Promise<void> {

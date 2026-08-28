@@ -25,7 +25,7 @@ import {
   TERM_TAKEOVER_STALE_MS,
   XFER_COMMIT_RETRY_MS,
 } from './constants';
-import { DataBackendInfo, HeartbeatPayload, LeaseGrantPayload, LeaseInfo, LeaseRenewedPayload, LeaseRevokePayload, MSG, NodeCapabilities, NodeDrainPayload, NodeRole, RegisterPayload, RegisterResult } from './protocol';
+import { DataBackendInfo, FleetConfigPayload, HeartbeatPayload, LeaseGrantPayload, LeaseInfo, LeaseRenewedPayload, LeaseRevokePayload, MSG, NodeCapabilities, NodeDrainPayload, NodeRole, RegisterPayload, RegisterResult } from './protocol';
 import {
   consumeTakeoverFlags,
   getAppVersion,
@@ -33,8 +33,8 @@ import {
   getNodeName,
   isBackupMaster,
   isStandalone,
+  rawMasterUrls,
   readRoleOverride,
-  resolveMasterUrls,
   resolveNodeRole,
   wasNodeIdFreshlyGenerated,
 } from './nodeIdentity';
@@ -78,7 +78,8 @@ import { MigrationCoordinator, PrecheckResult, StartPayload } from './migration/
 import { MigrationExecutor } from './migration/migrationExecutor';
 import { TransformationCoordinator } from './transformation/transformationCoordinator';
 import { TransformationExecutor } from './transformation/transformationExecutor';
-import type { ControlStore, PersistedTerm, TransformDirection } from './controlStore';
+import type { ControlStore, PersistedFleetConfig, PersistedTerm, TransformDirection } from './controlStore';
+import { effectiveFleetConfigView, effectiveMasterUrls, validateMasterCandidates, writeFleetConfigCache } from './fleetConfig';
 import { probePeerTerm } from './peerTermProbe';
 import { planPinRestoreLegs } from './placement';
 import { TRANSFER_PORT_DEFAULT } from './constants';
@@ -222,6 +223,14 @@ export async function fleetTransformResume(): Promise<{ ok: boolean; error?: str
 export async function fleetTransformAbort(): Promise<{ ok: boolean; error?: string }> {
   if (!masterTransformAbort) return { ok: false, error: 'This node is not the fleet master' };
   return masterTransformAbort();
+}
+
+let masterConfigSet: ((candidates: string[]) => Promise<{ ok: boolean; error?: string; revision?: number }>) | null = null;
+
+/** Runtime fleet-config edit (B2); master-only, pushed fleet-wide with zero restarts. */
+export async function fleetSetConfig(candidates: unknown): Promise<{ ok: boolean; error?: string; revision?: number }> {
+  if (!masterConfigSet) return { ok: false, error: 'This node is not the fleet master' };
+  return masterConfigSet(Array.isArray(candidates) ? (candidates as string[]) : []);
 }
 
 export async function initFleet(): Promise<FleetContext> {
@@ -434,7 +443,7 @@ async function runStaleMasterFence(
   if (standalone) return;
   const secret = (process.env.CONTROL_SECRET || '').trim();
   if (secret === '') return;
-  const candidates = resolveMasterUrls();
+  const { urls: candidates } = effectiveMasterUrls();
   if (candidates.length === 0) return;
   if (takeoverConfirmed) {
     console.warn('[Fleet] Takeover CONFIRMED; skipping the stale-master fence');
@@ -523,6 +532,28 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     const stampTimer = setInterval(() => void store.stampTerm(), TERM_STAMP_MS);
     stampTimer.unref();
   }
+
+  // Fleet runtime config (PLAN_REPLICATION 20.7, B2): the stored copy owns the
+  // topology once it exists; the env list seeds it exactly once, on the first
+  // master boot against a store that has none.
+  let fleetConfig: PersistedFleetConfig | null = null;
+  if (!standalone) {
+    fleetConfig = await store.loadFleetConfig();
+    if (!fleetConfig) {
+      // Seed from the UNFILTERED env list: the stored copy is fleet-wide and
+      // must include this master's own URL (workers dial it); the per-node
+      // self-filter applies at dial time (effectiveMasterUrls).
+      fleetConfig = { revision: 1, masterCandidates: rawMasterUrls(), backupDesignations: [], updatedAt: Date.now() };
+      await store.saveFleetConfig(fleetConfig)
+        .catch(err => console.warn('[Fleet] Failed to persist the seeded fleet config:', err instanceof Error ? err.message : err));
+    }
+  }
+  const fleetConfigPayload = (): FleetConfigPayload => ({
+    revision: fleetConfig!.revision,
+    masterCandidates: fleetConfig!.masterCandidates,
+    backupDesignations: fleetConfig!.backupDesignations,
+  });
+  if (fleetConfig) writeFleetConfigCache(fleetConfigPayload());
 
   const gateway = await fetchGatewayInfo(process.env.DISCORD_TOKEN);
   if (!gateway && process.env.DISCORD_TOKEN) {
@@ -649,6 +680,30 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
 
   let server: ControlServer | null = null;
   let syncAuthority: SyncAuthority | null = null;
+
+  // Persist + push a fleet-config change (B2). The cache write is synchronous
+  // truth for this node; the store write and the per-node pushes are fire-and-
+  // forget (a missed push is re-delivered on that node's next register).
+  const persistFleetConfig = (why: string): void => {
+    if (!fleetConfig) return;
+    const payload = fleetConfigPayload();
+    writeFleetConfigCache(payload);
+    void store.saveFleetConfig(fleetConfig)
+      .catch(err => console.warn(`[Fleet] Failed to persist fleet config (${why}):`, err instanceof Error ? err.message : err));
+    for (const node of registry.nodes.values()) {
+      if (node.isSelf || !node.connected) continue;
+      void server?.request(node.nodeId, MSG.CONFIG_UPDATE, payload).catch(() => { /* re-delivered on register */ });
+    }
+    console.log(`[Fleet] Fleet config revision ${fleetConfig.revision} (${why}) pushed to the fleet`);
+  };
+  masterConfigSet = async (candidates: string[]) => {
+    if (!fleetConfig) return { ok: false, error: 'a standalone master holds no fleet config' };
+    const valid = validateMasterCandidates(candidates);
+    if (!valid.ok) return { ok: false, error: valid.error };
+    fleetConfig = { ...fleetConfig, revision: fleetConfig.revision + 1, masterCandidates: valid.urls, updatedAt: Date.now() };
+    persistFleetConfig('candidates edited');
+    return { ok: true, revision: fleetConfig.revision };
+  };
   let coordinator: MigrationCoordinator | null = null;
   let selfExecutor: MigrationExecutor | null = null;
   let pinViolation: PinViolationView | null = null;
@@ -1855,7 +1910,20 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
         ledgerDeferWarnAt.delete(payload.nodeId);
         ledger?.onRegister(payload.nodeId);
         console.log(`[Fleet] Node registered: ${payload.nodeName} (${payload.nodeId})`);
-        return { accepted: true, term: registry.term, budget: ledger?.getBudgetInfo() ?? null, dataBackend: buildDataBackendInfo() };
+        // A backup-master's designation is env-seeded into the runtime config
+        // on its first registration; from then on the stored list owns it.
+        if (fleetConfig && payload.capabilities?.backupMaster === true
+            && !fleetConfig.backupDesignations.some(d => d.nodeId === payload.nodeId)) {
+          const priority = fleetConfig.backupDesignations.reduce((max, d) => Math.max(max, d.priority), 0) + 1;
+          fleetConfig = {
+            ...fleetConfig,
+            revision: fleetConfig.revision + 1,
+            backupDesignations: [...fleetConfig.backupDesignations, { nodeId: payload.nodeId, priority }],
+            updatedAt: Date.now(),
+          };
+          persistFleetConfig(`designated backup ${payload.nodeName || payload.nodeId}`);
+        }
+        return { accepted: true, term: registry.term, budget: ledger?.getBudgetInfo() ?? null, dataBackend: buildDataBackendInfo(), ...(fleetConfig ? { fleetConfig: fleetConfigPayload() } : {}) };
       },
       onCapabilityRefresh: (fromNodeId, payload) => {
         const node = registry.nodes.get(fromNodeId);
@@ -2118,6 +2186,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     transformation: () => transformer?.getView() ?? null,
     pinViolation: standalone ? null : () => pinViolation,
     termStamp: store instanceof PostgresControlStore && !standalone ? () => store.getStampFailingForMs() : null,
+    fleetConfig: () => (fleetConfig ? { revision: fleetConfig.revision, masterCandidates: fleetConfig.masterCandidates, backupDesignations: fleetConfig.backupDesignations, source: 'runtime' as const } : null),
     migrationActive: null,
   });
 
@@ -2157,10 +2226,10 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
 async function initCoWorker(init: CommonInit): Promise<FleetContext> {
   const { nodeId, nodeName, appVersion, capabilities, runtime } = init;
   const ingest = getIngestService();
-  const masterUrls = resolveMasterUrls();
+  const { urls: masterUrls, source: masterUrlsSource } = effectiveMasterUrls();
   const secret = (process.env.CONTROL_SECRET || '').trim();
 
-  console.log(`[Fleet] Role: co-worker node=${nodeName} (${nodeId.slice(0, 8)}) masters=${masterUrls.join(' | ') || 'none'} capacity=${capabilities.shardCapacity}${isBackupMaster() ? ` BACKUP MASTER` : ''}`);
+  console.log(`[Fleet] Role: co-worker node=${nodeName} (${nodeId.slice(0, 8)}) masters=${masterUrls.join(' | ') || 'none'} (${masterUrlsSource}) capacity=${capabilities.shardCapacity}${isBackupMaster() ? ` BACKUP MASTER` : ''}`);
 
   let controlClient: ControlClient | null = null;
   let syncEngine: SyncEngine | null = null;
@@ -2208,6 +2277,12 @@ async function initCoWorker(init: CommonInit): Promise<FleetContext> {
         heldLeases: runtime.getHeldSummary(),
       }),
       onSyncState: payload => engine.onSyncState(payload),
+      onFleetConfig: config => {
+        // The registered master is the authority; cache first (reboot truth),
+        // then swap the live dial list without dropping the connection.
+        writeFleetConfigCache(config);
+        controlClient?.updateMasterUrls(config.masterCandidates);
+      },
       onXferControl: (type, data) => executor!.handle(type, data),
       onTransformControl: (type, data) => transformExecutor.handle(type, data),
       onDataRoutes: async (_transformationId, routes, url, publicUrl) => {
@@ -2312,6 +2387,7 @@ async function initCoWorker(init: CommonInit): Promise<FleetContext> {
     transformation: null,
     pinViolation: null,
     termStamp: null,
+    fleetConfig: () => effectiveFleetConfigView(),
     migrationActive: () => migrationWorkActive(),
   });
 

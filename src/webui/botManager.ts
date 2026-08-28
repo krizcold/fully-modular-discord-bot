@@ -671,6 +671,18 @@ export class BotManager {
   }
 
   /**
+   * Runtime fleet-config edit (B2); master-only, validated in the bot child.
+   */
+  async setFleetConfig(masterCandidates: string[]): Promise<any> {
+    try {
+      return await this.sendIPCMessage('fleet:config:set', { masterCandidates });
+    } catch (error) {
+      console.error('[BotManager] Error setting fleet config:', error);
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  /**
    * Manually assign a FREE shard to a node (master-only; validated in the bot child).
    */
   async assignFleetShard(shardId: number, nodeId: string): Promise<any> {

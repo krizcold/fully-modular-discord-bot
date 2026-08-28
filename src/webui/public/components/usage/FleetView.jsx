@@ -928,6 +928,75 @@ function FleetReplicaLine({ replica }) {
   );
 }
 
+// Fleet runtime config (B2): the master edits the candidate list live (zero
+// restarts, pushed fleet-wide); every other node shows the copy in force.
+function FleetConfigCard({ api, fleet }) {
+  const cfg = fleet.fleetConfig;
+  const [draft, setDraft] = React.useState(null);
+  const [busy, setBusy] = React.useState(false);
+  if (!cfg) return null;
+  const editable = fleet.role === 'master' && !fleet.standalone;
+  const nodeName = (id) => {
+    const node = (fleet.nodes || []).find((n) => n.nodeId === id);
+    return node ? node.nodeName : id.slice(0, 8);
+  };
+  const save = () => {
+    if (busy) return;
+    const urls = draft.split('\n').map((u) => u.trim()).filter(Boolean);
+    setBusy(true);
+    api.post('/fleet/config', { masterCandidates: urls })
+      .then((res) => {
+        if (!res || res.success === false) { showToast((res && res.error) || 'Config update failed', 'error'); return; }
+        showToast(`Fleet config saved (revision ${res.revision}) and pushed to every node`, 'success');
+        setDraft(null);
+      })
+      .catch((err) => showToast((err && err.message) || 'Config update failed', 'error'))
+      .finally(() => setBusy(false));
+  };
+  return (
+    <div className="usage-stat-card" style={{ marginTop: '10px' }}>
+      <div className="usage-stat-title">Fleet config</div>
+      <div className="usage-stat-sub">
+        {`Revision ${cfg.revision} (${cfg.source === 'runtime' ? 'runtime copy' : 'env seed; no runtime copy yet'})`}
+      </div>
+      {draft !== null ? (
+        <div style={{ marginTop: '6px' }}>
+          <textarea
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            rows={Math.max(3, draft.split('\n').length + 1)}
+            style={{ width: '100%', fontFamily: 'monospace', fontSize: '0.75rem' }}
+          />
+          <div style={{ marginTop: '4px' }}>
+            <button onClick={save} disabled={busy} style={{ fontSize: '0.72rem', padding: '2px 8px' }}>
+              {busy ? 'Saving...' : 'Save and push'}
+            </button>
+            <button onClick={() => setDraft(null)} disabled={busy} style={{ fontSize: '0.72rem', padding: '2px 8px', marginLeft: '6px' }}>
+              Cancel
+            </button>
+          </div>
+        </div>
+      ) : (
+        <div style={{ marginTop: '6px' }}>
+          <div className="usage-stat-sub" style={{ fontFamily: 'monospace', whiteSpace: 'pre-wrap' }}>
+            {cfg.masterCandidates.join('\n') || 'no master candidates'}
+          </div>
+          {editable && (
+            <button onClick={() => setDraft(cfg.masterCandidates.join('\n'))} style={{ marginTop: '4px', fontSize: '0.72rem', padding: '2px 8px' }}>
+              Edit master candidates
+            </button>
+          )}
+        </div>
+      )}
+      {(cfg.backupDesignations || []).length > 0 && (
+        <div className="usage-stat-sub" style={{ marginTop: '6px' }}>
+          {`Backups: ${cfg.backupDesignations.map((d) => `${nodeName(d.nodeId)} (priority ${d.priority})`).join(', ')}`}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // Warm standby (PLAN_STANDBY 3.5): the designated backup's promote surface.
 // Rendered ONLY on the backup co-worker's own UI in postgres mode. The
 // chainTakeover decision follows what this node can see: master WS down =
@@ -1157,6 +1226,7 @@ function FleetView({ api, wsClient, guildNames }) {
           </div>
         )}
 
+        {!fleet.standalone && <FleetConfigCard api={api} fleet={fleet} />}
         <FleetSyncCard sync={fleet.sync} />
 
         {fleet.budget ? <FleetBudgetCard budget={fleet.budget} /> : null}
@@ -1273,6 +1343,8 @@ function FleetView({ api, wsClient, guildNames }) {
           {!fleet.controlStoreFenced && <div><FleetDemoteButton api={api} /></div>}
         </div>
       )}
+
+      {!fleet.standalone && <FleetConfigCard api={api} fleet={fleet} />}
 
       {fleet.role === 'co-worker' && !fleet.masterKnown && (
         <div className="usage-notice">Master unreachable, retrying...</div>

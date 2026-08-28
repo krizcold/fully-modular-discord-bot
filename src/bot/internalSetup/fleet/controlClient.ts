@@ -16,6 +16,7 @@ import {
 import {
   BudgetInfo,
   ControlEnvelope,
+  FleetConfigPayload,
   GuildNoticePayload,
   HeartbeatPayload,
   LeaseGrantPayload,
@@ -44,6 +45,8 @@ export interface ControlClientOptions {
   onXferControl?: (type: string, data: any) => Promise<any>;
   /** Master-delivered data backend from the register reply (re-delivered on every reconnect). */
   onDataBackend?: (info: RegisterResult['dataBackend']) => void;
+  /** Fleet runtime config from the register reply and CONFIG_UPDATE pushes (B2). */
+  onFleetConfig?: (config: FleetConfigPayload) => void;
   /** Webui data hop from the master (DATA_WRITE/DATA_READ); returns the reply payload. */
   onDataOp?: (type: string, data: any) => Promise<any>;
   /** Backend transformation control (TRANSFORM_GUILD/BACKEND_FLIP) -> executor; returns the ack payload. */
@@ -135,6 +138,16 @@ export class ControlClient {
     return this.opts.masterUrls[this.urlIndex % this.opts.masterUrls.length];
   }
 
+  /** Live dial-list swap (runtime config push, B2); the open connection is kept. */
+  updateMasterUrls(urls: string[]): void {
+    if (!Array.isArray(urls) || urls.length === 0) return;
+    const current = this.getCurrentMasterUrl();
+    this.opts.masterUrls.length = 0;
+    this.opts.masterUrls.push(...urls);
+    const idx = urls.indexOf(current);
+    this.urlIndex = idx >= 0 ? idx : 0;
+  }
+
   private connect(): void {
     if (this.stopped) return;
     const ws = new WebSocket(this.getCurrentMasterUrl(), {
@@ -212,6 +225,12 @@ export class ControlClient {
       this.opts.onDataBackend?.(result.dataBackend);
       this.touch();
       console.log(`[Fleet] Registered with master at ${this.getCurrentMasterUrl()} (term ${this.term})`);
+      // After the log so the dialed-URL line reports the pre-swap candidate; a
+      // failed cache write must not junk an accepted registration.
+      if (result.fleetConfig) {
+        try { this.opts.onFleetConfig?.(result.fleetConfig); }
+        catch (error) { console.warn('[Fleet] Failed to apply the delivered fleet config:', error instanceof Error ? error.message : error); }
+      }
       return true;
     } catch (error) {
       console.warn(`[Fleet] Registration failed: ${error instanceof Error ? error.message : error}`);
@@ -266,6 +285,15 @@ export class ControlClient {
         this.draining = true;
         console.warn(`[Fleet] Drain requested by master (${drain?.reason || 'unspecified'}); revokes follow`);
         this.replyAck(requestId, { ok: true, term: this.term });
+        break;
+      }
+      case MSG.CONFIG_UPDATE: {
+        // Ack first (receipt); the registered master is the config authority.
+        // A failed cache write must never take the bot down (the config is
+        // re-delivered on the next register anyway).
+        this.replyAck(requestId, { ok: true, term: this.term });
+        try { this.opts.onFleetConfig?.(data as FleetConfigPayload); }
+        catch (error) { console.warn('[Fleet] Failed to apply a pushed fleet config:', error instanceof Error ? error.message : error); }
         break;
       }
       case MSG.SYNC_STATE: {

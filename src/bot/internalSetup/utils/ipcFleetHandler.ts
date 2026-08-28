@@ -14,6 +14,7 @@ import {
   fleetMigrateStart,
   fleetMigrationsList,
   fleetResumeAssignments,
+  fleetSetConfig,
   fleetSyncBump,
   fleetDevCorruptLease,
   fleetTransformStart,
@@ -55,6 +56,11 @@ export function setupFleetIPCHandlers(): void {
       switch (type) {
         case 'fleet:state': {
           response = { success: true, state: getFleetState() };
+          break;
+        }
+        case 'fleet:config:set': {
+          const result = await fleetSetConfig(message.data?.masterCandidates);
+          response = result.ok ? { success: true, revision: result.revision } : { success: false, error: result.error };
           break;
         }
         case 'fleet:assign': {

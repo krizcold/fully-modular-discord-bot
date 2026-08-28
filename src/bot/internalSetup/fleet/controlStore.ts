@@ -171,10 +171,27 @@ export interface TransformationRecord {
   updatedAt: number;
 }
 
+/**
+ * Fleet runtime config (PLAN_REPLICATION 20.7): topology edited at runtime with
+ * zero restarts. Env values seed it exactly once (first master boot); after
+ * that the stored copy owns every key, rides replication to the standby, and
+ * is pushed to every node over the control channel.
+ */
+export interface PersistedFleetConfig {
+  revision: number;
+  /** Ordered master-candidate dial list (ws/wss URLs). */
+  masterCandidates: string[];
+  /** Designated backups; priority orders stand-in election (B5 consumes it). */
+  backupDesignations: { nodeId: string; priority: number }[];
+  updatedAt: number;
+}
+
 export interface ControlStore {
   /** CAS-acquire a new master term: strictly greater than any previously stored term. */
   acquireTerm(nodeId: string): Promise<number>;
   getTerm(): Promise<PersistedTerm | null>;
+  saveFleetConfig(config: PersistedFleetConfig): Promise<void>;
+  loadFleetConfig(): Promise<PersistedFleetConfig | null>;
   savePlan(plan: PersistedPlan): Promise<void>;
   loadPlan(): Promise<PersistedPlan | null>;
   saveRegistry(registry: PersistedRegistry): Promise<void>;

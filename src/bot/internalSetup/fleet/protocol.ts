@@ -69,6 +69,8 @@ export const MSG = {
    * dials its own advertised URL, and its predecessor may still hold the port.
    */
   TERM_PROBE: 'control:term:probe',
+  /** Master -> node push of the fleet runtime config (B2); ack is a receipt. Also delivered in every register reply. */
+  CONFIG_UPDATE: 'control:config:update',
 } as const;
 
 export interface NodeCapabilities {
@@ -99,6 +101,15 @@ export interface RegisterResult {
   budget?: BudgetInfo | null;
   /** Master's data-backend decision, re-delivered on every reconnect; absent = file mode. Refusals carry nothing. */
   dataBackend?: DataBackendInfo;
+  /** Fleet runtime config in force, re-delivered on every reconnect (B2). */
+  fleetConfig?: FleetConfigPayload;
+}
+
+/** Wire form of PersistedFleetConfig (control-store side); pushed on CONFIG_UPDATE and in register replies. */
+export interface FleetConfigPayload {
+  revision: number;
+  masterCandidates: string[];
+  backupDesignations: { nodeId: string; priority: number }[];
 }
 
 /** Backend decision + routing map handed to workers in the register reply. */

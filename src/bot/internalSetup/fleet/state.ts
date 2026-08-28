@@ -5,7 +5,8 @@ import { performance } from 'perf_hooks';
 import { CONTROL_PORT_DEFAULT, LEASE_TTL_MS, PROTOCOL_VERSION } from './constants';
 import { getShardSource, isPinEnabled, resolveShardCapacity } from './placement';
 import type { BudgetInfo, NodeRole } from './protocol';
-import { isBackupMaster, readRoleOverride, resolveMasterUrls } from './nodeIdentity';
+import { isBackupMaster, readRoleOverride } from './nodeIdentity';
+import { effectiveFleetConfigView, effectiveMasterUrls } from './fleetConfig';
 import { hasDbReplica } from './replicaPromotion';
 import type { Registry } from './registry';
 import type { LeaseRuntime } from './leaseRuntime';
@@ -118,6 +119,8 @@ export interface FleetState {
   termStampFailingForMs: number | null;
   /** Co-worker: the ordered master candidate list in use. */
   masterUrls: string[];
+  /** Fleet runtime config in force on this node (B2); null only on a standalone master. */
+  fleetConfig: { revision: number; masterCandidates: string[]; backupDesignations: { nodeId: string; priority: number }[]; source: 'runtime' | 'env' } | null;
   protocolVersion: number;
   term: number;
   epoch: number;
@@ -297,6 +300,8 @@ export interface FleetStateSources {
   pinViolation: (() => PinViolationView | null) | null;
   /** Term-stamp health supplier (fleet master on the postgres store only); null otherwise. */
   termStamp: (() => number | null) | null;
+  /** Fleet runtime config supplier (B2); null on standalone. */
+  fleetConfig: (() => { revision: number; masterCandidates: string[]; backupDesignations: { nodeId: string; priority: number }[]; source: 'runtime' | 'env' } | null) | null;
   /** Live migration/transformation work on THIS node (co-worker executors); null on masters (coordinator view covers it). */
   migrationActive: (() => boolean) | null;
 }
@@ -349,7 +354,8 @@ export function getFleetState(): FleetState {
       backupMaster: isBackupMaster(),
       dbReplica: hasDbReplica(),
       termStampFailingForMs: null,
-      masterUrls: resolveMasterUrls(),
+      masterUrls: effectiveMasterUrls().urls,
+      fleetConfig: effectiveFleetConfigView(),
       protocolVersion: PROTOCOL_VERSION,
       term: 0,
       epoch: 0,
@@ -456,7 +462,8 @@ export function getFleetState(): FleetState {
       backupMaster: isBackupMaster(),
       dbReplica: hasDbReplica(),
       termStampFailingForMs: sources.termStamp?.() ?? null,
-      masterUrls: resolveMasterUrls(),
+      masterUrls: effectiveMasterUrls().urls,
+      fleetConfig: sources.fleetConfig?.() ?? null,
       protocolVersion: PROTOCOL_VERSION,
       term: registry.term,
       epoch: registry.epoch,
@@ -555,7 +562,8 @@ export function getFleetState(): FleetState {
     backupMaster: isBackupMaster(),
     dbReplica: hasDbReplica(),
     termStampFailingForMs: null,
-    masterUrls: resolveMasterUrls(),
+    masterUrls: effectiveMasterUrls().urls,
+    fleetConfig: sources.fleetConfig?.() ?? null,
     protocolVersion: PROTOCOL_VERSION,
     term,
     epoch: lease?.epoch ?? 0,
@@ -570,7 +578,7 @@ export function getFleetState(): FleetState {
     pinTestGuildShard: isPinEnabled(),
     pinnedShardId: null,
     masterKnown: registered,
-    masterUrl: controlClient?.getCurrentMasterUrl() ?? resolveMasterUrls()[0] ?? null,
+    masterUrl: controlClient?.getCurrentMasterUrl() ?? effectiveMasterUrls().urls[0] ?? null,
     connect: null,
     recovery: null,
     sync: sources.sync?.() ?? { status: 'n/a' },

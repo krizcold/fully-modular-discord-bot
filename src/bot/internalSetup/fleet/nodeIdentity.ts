@@ -115,20 +115,36 @@ export function isStandalone(): boolean {
  * or demoted node never dials itself.
  */
 export function resolveMasterUrls(): string[] {
+  return stripSelfUrl(rawMasterUrls());
+}
+
+/**
+ * The env candidate list UNFILTERED: the fleet-wide list carried by every
+ * node, the master included. This is what seeds the runtime fleet config
+ * (B2) - persisting the per-node dial form would strip the master's own URL
+ * from every worker's list. Self-filtering belongs at dial time.
+ */
+export function rawMasterUrls(): string[] {
   const raw = (process.env.MASTER_URLS || '').trim();
   const list = raw !== ''
     ? raw.split(',').map(s => s.trim()).filter(s => s !== '')
     : [(process.env.MASTER_URL || '').trim()].filter(s => s !== '');
-  const self = normalizeUrl((process.env.FLEET_PUBLIC_URL || '').trim());
   const seen = new Set<string>();
   const urls: string[] = [];
   for (const url of list) {
     const key = normalizeUrl(url);
-    if (key === '' || key === self || seen.has(key)) continue;
+    if (key === '' || seen.has(key)) continue;
     seen.add(key);
     urls.push(url);
   }
   return urls;
+}
+
+/** Dial-time self-filter: drop this node's own advertised control route. */
+export function stripSelfUrl(urls: string[]): string[] {
+  const self = normalizeUrl((process.env.FLEET_PUBLIC_URL || '').trim());
+  if (self === '') return urls;
+  return urls.filter(url => normalizeUrl(url) !== self);
 }
 
 function normalizeUrl(url: string): string {
