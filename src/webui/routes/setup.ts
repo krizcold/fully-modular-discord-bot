@@ -20,14 +20,14 @@ import { isBackupMaster, isStandalone as isStandaloneFleet, resolveNodeRole } fr
 import { isCoWorkerNode } from '../middleware/fleetGate';
 
 /** The only fields a co-worker edits locally; everything else mirrors the master via sync. */
-const CONNECTION_FIELDS = ['DISCORD_TOKEN', 'MASTER_URL', 'MASTER_URLS', 'CONTROL_SECRET', 'NODE_NAME', 'FLEET_SHARD_CAPACITY', 'FLEET_BACKUP_MASTER', 'FLEET_AUTO_PROMOTE'] as const;
+const CONNECTION_FIELDS = ['DISCORD_TOKEN', 'MASTER_URL', 'MASTER_URLS', 'CONTROL_SECRET', 'NODE_NAME', 'FLEET_SHARD_CAPACITY', 'FLEET_BACKUP_MASTER'] as const;
 
 /**
  * Non-secret standby fields where a blanked form field is an EXPLICIT clear
- * (an armed FLEET_AUTO_PROMOTE must be disarmable from the UI). Every other
- * connection field keeps the historical blank-keeps-existing semantics.
+ * (a designation must be revocable from the UI). Every other connection
+ * field keeps the historical blank-keeps-existing semantics.
  */
-const CLEARABLE_CONNECTION_FIELDS = new Set<string>(['MASTER_URLS', 'FLEET_BACKUP_MASTER', 'FLEET_AUTO_PROMOTE']);
+const CLEARABLE_CONNECTION_FIELDS = new Set<string>(['MASTER_URLS', 'FLEET_BACKUP_MASTER']);
 
 /**
  * Fleet wiring the master-branch credentials save must PRESERVE verbatim: it
@@ -39,7 +39,7 @@ const CLEARABLE_CONNECTION_FIELDS = new Set<string>(['MASTER_URLS', 'FLEET_BACKU
 const PRESERVED_FLEET_FIELDS = [
   'BOT_NODE_ROLE', 'MASTER_URL', 'MASTER_URLS', 'CONTROL_SECRET', 'CONTROL_PORT', 'FLEET_PUBLIC_URL',
   'NODE_NAME', 'PIN_TEST_GUILD_SHARD', 'FLEET_SHARD_COUNT', 'FLEET_SHARD_CAPACITY',
-  'FLEET_BACKUP_MASTER', 'FLEET_AUTO_PROMOTE', 'TRANSFER_URL', 'TRANSFER_PORT',
+  'FLEET_BACKUP_MASTER', 'TRANSFER_URL', 'TRANSFER_PORT',
 ] as const;
 
 const OAUTH_FIELDS = ['ENABLE_GUILD_WEBUI', 'DISCORD_CLIENT_ID', 'DISCORD_CLIENT_SECRET', 'OAUTH_CALLBACK_URL'] as const;
@@ -134,7 +134,6 @@ export function createSetupRoutes(): Router {
             // never injected one): a backup master shows it so its URL can be
             // added to every worker's candidates.
             SELF_URL: credentials.FLEET_PUBLIC_URL || '',
-            FLEET_AUTO_PROMOTE: credentials.FLEET_AUTO_PROMOTE || '',
             CONTROL_SECRET_SET: !!(credentials.CONTROL_SECRET && credentials.CONTROL_SECRET.trim() !== ''),
             DISCORD_TOKEN_SET: !!(credentials.DISCORD_TOKEN && credentials.DISCORD_TOKEN.trim() !== ''),
           },
@@ -185,7 +184,6 @@ export function createSetupRoutes(): Router {
         if (requestedRole === 'co-worker' || requestedRole === 'backup-master') {
           credentials.BOT_NODE_ROLE = requestedRole;
           delete credentials.FLEET_BACKUP_MASTER;
-          if (requestedRole !== 'backup-master') delete credentials.FLEET_AUTO_PROMOTE;
         }
         // MASTER_URLS never implies a role (it is carried by masters too), so
         // pin the explicit role this page exclusively serves: without it, a

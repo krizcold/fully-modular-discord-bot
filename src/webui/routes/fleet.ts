@@ -394,8 +394,9 @@ export function createFleetRoutes(botManager: BotManager): Router {
    */
   router.post('/demote', async (req: Request, res: Response) => {
     try {
-      // The override may have been written by the bot child (auto-promote);
-      // never trust this process's cached copy for a role decision.
+      // The child rewrites role-override.json when it consumes one-shot
+      // takeover flags; never trust this process's cached copy for a role
+      // decision.
       invalidateRoleOverrideCache();
       const running = botManager.isRunning();
       let state: any = null;
@@ -413,7 +414,7 @@ export function createFleetRoutes(botManager: BotManager): Router {
           res.json({ success: false, error: refusal });
           return;
         }
-      } else if (running && !(state && (state.takeoverHold || state.staleMasterPark || state.selfFenced))) {
+      } else if (running && !(state && (state.takeoverHold || state.staleMasterPark))) {
         // Genuine early boot with no hold: seconds away from real state.
         res.json({ success: false, error: 'Fleet state unavailable (bot still initializing); try again shortly' });
         return;

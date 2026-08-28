@@ -113,7 +113,7 @@ export class ControlServer {
     this.conns.get(nodeId)?.terminate();
   }
 
-  /** Deposed/self-fenced teardown: drop every worker so their redial cycle finds the live master. */
+  /** Deposed teardown: drop every worker so their redial cycle finds the live master. */
   dropAll(): void {
     for (const socket of this.conns.values()) socket.terminate();
   }

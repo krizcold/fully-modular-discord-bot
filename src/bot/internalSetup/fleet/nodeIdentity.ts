@@ -24,7 +24,7 @@ export interface RoleOverride {
   /** Promotion over a dead master: auto-Declare-Lost it after the hold-down. */
   chainTakeover?: boolean;
   setAt: number;
-  setBy: 'webui-promote' | 'webui-demote' | 'auto-promote';
+  setBy: 'webui-promote' | 'webui-demote';
 }
 
 const ROLE_OVERRIDE_BASENAME = 'role-override.json';
@@ -46,7 +46,7 @@ export function readRoleOverride(): RoleOverride | null {
         ...(parsed.takeover === true ? { takeover: true } : {}),
         ...(parsed.chainTakeover === true ? { chainTakeover: true } : {}),
         setAt: Number(parsed.setAt) || 0,
-        setBy: parsed.setBy === 'webui-demote' || parsed.setBy === 'auto-promote' ? parsed.setBy : 'webui-promote',
+        setBy: parsed.setBy === 'webui-demote' ? parsed.setBy : 'webui-promote',
       };
       return cachedOverride;
     }
@@ -55,7 +55,7 @@ export function readRoleOverride(): RoleOverride | null {
   return null;
 }
 
-/** Written by the webui parent (promote/demote) and the auto-promote path. */
+/** Written by the webui parent (promote/demote). */
 export function writeRoleOverride(override: RoleOverride): void {
   atomicWriteFileSync(roleOverrideFile(), JSON.stringify(override, null, 2));
   cachedOverride = undefined;
@@ -98,7 +98,7 @@ export function resolveEnvRole(): NodeRole {
   return 'master';
 }
 
-/** Cross-process staleness fix: the webui PARENT must re-read after the bot CHILD wrote the override (auto-promotion). */
+/** Cross-process staleness fix: the webui PARENT must re-read after the bot CHILD rewrote the override (takeover-flag consumption). */
 export function invalidateRoleOverrideCache(): void {
   cachedOverride = undefined;
 }
@@ -139,11 +139,6 @@ function normalizeUrl(url: string): string {
 export function isBackupMaster(): boolean {
   return (process.env.BOT_NODE_ROLE || '').trim().toLowerCase() === 'backup-master'
     || (process.env.FLEET_BACKUP_MASTER || '').trim() === '1';
-}
-
-/** True when the designated backup is set to promote itself (FLEET_AUTO_PROMOTE=1). */
-export function isAutoPromoteEnabled(): boolean {
-  return isBackupMaster() && (process.env.FLEET_AUTO_PROMOTE || '').trim() === '1';
 }
 
 export function getNodeName(): string {

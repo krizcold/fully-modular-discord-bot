@@ -6,8 +6,7 @@ import type { WebSocketManager, WSEvent, WSEventData } from './websocketManager'
 import { getSafetyManager } from '../utils/updateSafety';
 import { resetAppStoreManager } from '../bot/internalSetup/utils/appStoreManager';
 import { applyRouteOverrides } from '../bot/internalSetup/utils/dataBackends/routeResolver';
-import { clearRoleOverride, invalidateRoleOverrideCache } from '../bot/internalSetup/fleet/nodeIdentity';
-import { promoteReplicaPair, resolveReplicaEndpoints } from '../bot/internalSetup/fleet/replicaPromotion';
+import { invalidateRoleOverrideCache } from '../bot/internalSetup/fleet/nodeIdentity';
 
 export interface BotStartResult {
   success: boolean;
@@ -169,7 +168,7 @@ export class BotManager {
     // Lock operations
     this.operationInProgress = true;
 
-    // The bot child may have written role-override.json (auto-promotion); the
+    // The child consumes one-shot takeover flags from role-override.json; the
     // parent's role must stay in lockstep with whatever role this child boots.
     invalidateRoleOverrideCache();
 
@@ -299,14 +298,6 @@ export class BotManager {
         } else if (message.type === 'control:start-webui') {
           console.warn('[BotManager] control:start-webui received; restarting the web-UI listener');
           this.webuiControl?.start();
-        } else if (message.type === 'fleet:promote-restart') {
-          // Auto-promotion staged by the bot child (role override already on
-          // disk); the restart boots it as master. The parent's own role
-          // cache must be dropped too, or its route gates keep treating the
-          // new master as a co-worker until a container restart.
-          console.warn('[BotManager] fleet:promote-restart received (auto-promotion staged); restarting the bot child as master');
-          invalidateRoleOverrideCache();
-          void this.completeAutoPromotion();
         }
       });
 
@@ -337,39 +328,6 @@ export class BotManager {
       // Release operation lock
       this.operationInProgress = false;
     }
-  }
-
-  /**
-   * Auto-promotion's parent half (PLAN_REPLICATION Stage 3). On a machine with
-   * a database standby the rung runs before the restart and decides whether
-   * the database moves too; in the state this watcher can actually fire in
-   * (the term row went silent while its store stayed READABLE) the primary is
-   * alive, so the rung takes the role only and this is the pre-Stage-3 path.
-   * It runs HERE and not in the child because only this process can tell a
-   * container-pinned DATA_BACKEND_URL from a /data/.env one.
-   *
-   * A failed rung rolls the staged override back rather than booting a master
-   * against a database it cannot use (which would park in the seed/acquire
-   * retry loop forever), then restarts as a co-worker anyway so the child's
-   * watcher re-arms: its fired latch never resets, so without the restart one
-   * transient failure would end unattended failover permanently.
-   */
-  private async completeAutoPromotion(): Promise<void> {
-    const replica = resolveReplicaEndpoints();
-    if (replica) {
-      // The watcher only fires with the master's control connection already
-      // down (autoPromote requires masterConnected() === false), and this
-      // process holds no fleet state of its own to re-derive it from.
-      const pair = await promoteReplicaPair(replica, { masterAlive: false });
-      if (!pair.success) {
-        clearRoleOverride();
-        console.error(`[BotManager] AUTO-PROMOTION ABORTED: ${pair.error}. Rolled back to co-worker; restarting so the watcher re-arms. Use Promote to master in the Fleet tab to take over with an explicit acknowledgement.`);
-        await this.restart();
-        return;
-      }
-      console.warn(`[BotManager] Auto-promotion rung cleared (${pair.promotedDatabase ? 'the local standby is now the fleet database' : 'the fleet database is live, taking the role only'}); restarting as master`);
-    }
-    await this.restart();
   }
 
   /**

@@ -85,14 +85,14 @@ export const LOSS_LOG_CAP = 20;
 export const FLEET_DIR = 'fleet';
 
 // ============================================================================
-// WARM STANDBY (PLAN_STANDBY): term liveness, takeover guard, auto-promotion.
+// WARM STANDBY (PLAN_STANDBY): term liveness, takeover guard.
 // ============================================================================
 
 /**
  * Fleet-mode master on the postgres control store stamps the term row on this
  * cadence. The stamp is the master's own lease: a fenced stamp (0 rows) means
- * a newer master owns the schema, and a stamp that cannot be written counts
- * toward the self-fence.
+ * a newer master owns the schema, and a stamp that cannot be written feeds the
+ * stamp-health banner.
  */
 export const TERM_STAMP_MS = LEASE_RENEW_MS;
 
@@ -119,38 +119,6 @@ export const PEER_TERM_PROBE_MS = 5000;
 export const PEER_TERM_PROBE_BUDGET_MS = 20_000;
 
 /**
- * Master self-fence: stamping failing for this long while a registered
- * auto-promote backup's control connection is down expires the master exactly
- * like a worker's lease TTL - under those conditions the backup WILL promote,
- * and a fenced-but-serving master would fight its sessions.
- */
-export const MASTER_SELF_FENCE_MS = 90_000;
-
-/**
- * Auto-promotion: the designated backup self-promotes when the term row has
- * not advanced for this long (observed over its own reads) AND its control
- * connection to the master is down. Strictly greater than both the guard
- * staleness and the self-fence threshold so the old master is provably
- * dead or self-fenced before the backup pulls the trigger.
- */
-export const AUTO_PROMOTE_STALE_MS = 120_000;
-
-/**
- * Self-fence arming: the auto backup must be CONTINUOUSLY disconnected this
- * long, and its disconnect must be concurrent with the store silence, before
- * the fence can latch. A routine WS blip (proxy reload, backup redeploy) can
- * never latch it, and a backup that died long before the outage cannot arm it.
- */
-export const BACKUP_DOWN_CONFIRM_MS = 30_000;
-
-/**
- * A staged auto-promotion override older than this at boot is VOID: its
- * evidence is stale (the restart it expected never happened) and acting on it
- * could depose a healthy master days later.
- */
-export const AUTO_PROMOTE_OVERRIDE_MAX_AGE_MS = 600_000;
-
-/**
  * Promote-the-pair (PLAN_REPLICATION Stage 3, ruling R3): the RPO an operator
  * accepts when a standby becomes the fleet database. Read ONLY in the pair
  * lane, where every channel reports the primary gone and the age of the last
@@ -158,9 +126,8 @@ export const AUTO_PROMOTE_OVERRIDE_MAX_AGE_MS = 600_000;
  * never move the database, so the age is not consulted there at all - gating
  * on "still streaming AND stale" was the first design and is backwards, since
  * that combination is the master-process-death case the backup exists for.
- * Above this the manual promote comes back asking for an explicit confirm; the
- * auto lane never confirms, so it aborts and rolls back. An unknown age
- * (nothing replayed since the standby started) does not gate.
+ * Above this the manual promote comes back asking for an explicit confirm. An
+ * unknown age (nothing replayed since the standby started) does not gate.
  */
 export const REPLICA_LAG_PROMOTE_MAX_MS = 60_000;
 

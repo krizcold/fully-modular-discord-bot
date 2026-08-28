@@ -817,7 +817,7 @@ function FleetNodeCard({ node, isMasterView, onAction, masterSyncRevision, retir
         {node.isSelf ? <FleetBadge text="self" background="#2b4a2b" color="#a0e0a0" /> : null}
         {node.capabilities && node.capabilities.backupMaster ? (
           <FleetBadge
-            text={node.capabilities.autoPromote ? 'BACKUP (auto)' : 'BACKUP'}
+            text="BACKUP"
             background="#2b3a5c"
             color="#8ab4f8"
           />
@@ -935,7 +935,6 @@ function FleetReplicaLine({ replica }) {
 // planned handover (the deposed master keeps its shards until demoted).
 function FleetBackupCard({ api, fleet }) {
   const [busy, setBusy] = React.useState(false);
-  const auto = fleet.autoPromote;
   const masterDown = !fleet.masterKnown;
   const pair = fleet.dbReplica === true;
   // The pair promotion runs BEFORE the role takeover, so a lag refusal comes
@@ -973,9 +972,7 @@ function FleetBackupCard({ api, fleet }) {
     <div className="usage-stat-card" style={{ marginTop: '10px' }}>
       <div className="usage-stat-title">Backup master</div>
       <div className="usage-stat-sub">
-        {auto
-          ? `Auto-promotion armed: fires after ~2 minutes of master silence. Term stamp last advanced ${auto.termStaleForMs != null ? Math.round(auto.termStaleForMs / 1000) + 's ago' : 'unknown'}${auto.storeReadOk === false ? ' (store unreachable)' : ''}${auto.fired ? ' - TRIGGERED' : ''}`
-          : 'Manual mode: this node takes over only when you press Promote.'}
+        This node takes over only when you press Promote.
       </div>
       {pair ? (
         <div className="usage-stat-sub">
@@ -989,7 +986,7 @@ function FleetBackupCard({ api, fleet }) {
   );
 }
 
-// Demote surface for a deposed / self-fenced / operator-overridden master.
+// Demote surface for a deposed / operator-overridden master.
 function FleetDemoteButton({ api }) {
   const [busy, setBusy] = React.useState(false);
   const demote = () => {
@@ -1258,20 +1255,13 @@ function FleetView({ api, wsClient, guildNames }) {
         </div>
       )}
 
-      {fleet.selfFenced && (
-        <div className="usage-notice" style={{ borderColor: '#e5534b', color: '#e5534b' }}>
-          {`CRITICAL: this master SELF-FENCED (${fleet.selfFenced.reason}). Its gateway sessions were destroyed because the auto-promote backup is expected to take over. Demote this node to rejoin the fleet as a co-worker.`}
-          <div><FleetDemoteButton api={api} /></div>
-        </div>
-      )}
-
       {fleet.dbStandbys && fleet.dbStandbys.some((sb) => sb.state !== 'streaming') && (
         <div className="usage-notice" style={{ borderColor: '#e5534b', color: '#e5534b' }}>
           {`Database replication is BROKEN: ${fleet.dbStandbys.filter((sb) => sb.state !== 'streaming').map((sb) => `${sb.clientAddr || 'standby'} is ${sb.state || 'not streaming'}`).join(', ')}. The copy is going stale, so this machine dying would lose everything written since the link broke. Re-seed the standby from its manager.`}
         </div>
       )}
 
-      {fleet.termStampFailingForMs != null && !fleet.controlStoreFenced && !fleet.selfFenced && (
+      {fleet.termStampFailingForMs != null && !fleet.controlStoreFenced && (
         <div className="usage-notice">
           {`Control store unreachable: the term liveness stamp has been failing for ${Math.round(fleet.termStampFailingForMs / 1000)}s. Control-plane writes are held; guilds keep serving on cached state.`}
         </div>
@@ -1280,7 +1270,7 @@ function FleetView({ api, wsClient, guildNames }) {
       {fleet.roleOverride && !fleet.standalone && (
         <div className="usage-stat-sub">
           {`Role set by operator override (${fleet.roleOverride.setBy}, ${new Date(fleet.roleOverride.setAt).toISOString().slice(0, 16).replace('T', ' ')} UTC)`}
-          {!fleet.controlStoreFenced && !fleet.selfFenced && <div><FleetDemoteButton api={api} /></div>}
+          {!fleet.controlStoreFenced && <div><FleetDemoteButton api={api} /></div>}
         </div>
       )}
 

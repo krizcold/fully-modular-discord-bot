@@ -29,7 +29,7 @@ export interface FleetStateNode {
   connected: boolean;
   health: 'up' | 'late' | 'down';
   appVersion: string;
-  capabilities: { shardCapacity: number; dataBackend: string; backupMaster?: boolean; autoPromote?: boolean };
+  capabilities: { shardCapacity: number; dataBackend: string; backupMaster?: boolean };
   capacity: number;
   onHold: boolean;
   shardIds: number[];
@@ -108,16 +108,12 @@ export interface FleetState {
   takeoverHold: TakeoverHoldView | null;
   /** Stale-master boot fence: parked because a live peer holds a term this node's own store cannot beat (PLAN_REPLICATION Stage 4). */
   staleMasterPark: StaleMasterParkView | null;
-  /** Master self-fence latch: store silent + auto backup unreachable; sessions destroyed until restart (PLAN_STANDBY 3.8). */
-  selfFenced: { at: number; reason: string } | null;
   /** Operator role override in force (promotion/demotion); null when the role comes from env. */
   roleOverride: { role: NodeRole; setBy: string; setAt: number } | null;
   /** This node is the designated backup master (FLEET_BACKUP_MASTER=1). */
   backupMaster: boolean;
   /** A manager-provisioned standby of the fleet database lives on this machine; promotion takes the pair. */
   dbReplica: boolean;
-  /** Auto-promotion watcher status; null unless this node is an auto-enabled backup. */
-  autoPromote: AutoPromoteStatusView | null;
   /** Fleet master: ms the term-row stamp has been failing; null while stamping succeeds (or off-postgres). */
   termStampFailingForMs: number | null;
   /** Co-worker: the ordered master candidate list in use. */
@@ -269,24 +265,6 @@ export function _setStaleMasterPark(park: StaleMasterParkView | null): void {
   staleMasterPark = park;
 }
 
-// Master self-fence latch (PLAN_STANDBY 3.8): store silent + auto backup gone.
-// Latched until restart, exactly like the deposed fence.
-let selfFenced: { at: number; reason: string } | null = null;
-
-export function _setSelfFenced(reason: string): void {
-  selfFenced = { at: Date.now(), reason };
-}
-
-/** Auto-promotion watcher status (designated backup only). */
-export interface AutoPromoteStatusView {
-  enabled: boolean;
-  /** null before the first read attempt. */
-  storeReadOk: boolean | null;
-  /** Ms since the term row last advanced across this node's own reads; null before the first successful read. */
-  termStaleForMs: number | null;
-  fired: boolean;
-}
-
 function buildRoleOverrideView(): { role: NodeRole; setBy: string; setAt: number } | null {
   const override = readRoleOverride();
   return override ? { role: override.role, setBy: override.setBy, setAt: override.setAt } : null;
@@ -319,8 +297,6 @@ export interface FleetStateSources {
   pinViolation: (() => PinViolationView | null) | null;
   /** Term-stamp health supplier (fleet master on the postgres store only); null otherwise. */
   termStamp: (() => number | null) | null;
-  /** Auto-promotion watcher status supplier (auto-enabled backup only); null otherwise. */
-  autoPromote: (() => AutoPromoteStatusView | null) | null;
   /** Live migration/transformation work on THIS node (co-worker executors); null on masters (coordinator view covers it). */
   migrationActive: (() => boolean) | null;
 }
@@ -369,11 +345,9 @@ export function getFleetState(): FleetState {
       // branch is what the UI polls then.
       takeoverHold,
       staleMasterPark,
-      selfFenced,
       roleOverride: buildRoleOverrideView(),
       backupMaster: isBackupMaster(),
       dbReplica: hasDbReplica(),
-      autoPromote: null,
       termStampFailingForMs: null,
       masterUrls: resolveMasterUrls(),
       protocolVersion: PROTOCOL_VERSION,
@@ -478,11 +452,9 @@ export function getFleetState(): FleetState {
       controlStoreFenced,
       takeoverHold,
       staleMasterPark,
-      selfFenced,
       roleOverride: buildRoleOverrideView(),
       backupMaster: isBackupMaster(),
       dbReplica: hasDbReplica(),
-      autoPromote: sources.autoPromote?.() ?? null,
       termStampFailingForMs: sources.termStamp?.() ?? null,
       masterUrls: resolveMasterUrls(),
       protocolVersion: PROTOCOL_VERSION,
@@ -579,11 +551,9 @@ export function getFleetState(): FleetState {
     controlStoreFenced: null,
     takeoverHold,
     staleMasterPark,
-    selfFenced,
     roleOverride: buildRoleOverrideView(),
     backupMaster: isBackupMaster(),
     dbReplica: hasDbReplica(),
-    autoPromote: sources.autoPromote?.() ?? null,
     termStampFailingForMs: null,
     masterUrls: resolveMasterUrls(),
     protocolVersion: PROTOCOL_VERSION,

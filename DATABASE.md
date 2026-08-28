@@ -117,12 +117,6 @@ press "Promote to master". One click does the whole thing: the node restarts as 
 the term, waits out the safety hold-down, declares the dead master lost, and takes over its
 shards. Workers redial down their candidate list and reattach at zero identify cost.
 
-**Automatic failover.** Set `FLEET_AUTO_PROMOTE=1` on the designated backup and it pulls the
-same lever itself when the master's liveness stamp goes silent for about two minutes AND its
-control connection to the master is down. Both signals must agree, so a master that merely lost
-the database (and is riding the acceptance window) is never shot. Default off: without the flag
-the backup is exactly a warm manual backup and nothing else.
-
 **Planned handover (rolling upgrades: standby first, master last).** Promote the backup while
 the old master is still alive; the confirm dialog recognizes this case. The old master is
 deposed within seconds (its next stamp fences it) and KEEPS its shards; then press "Demote to

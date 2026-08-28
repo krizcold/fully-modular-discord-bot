@@ -30,10 +30,8 @@ export interface BotCredentials {
   MASTER_URL?: string;
   /** Ordered comma-separated master candidate list (PLAN_STANDBY 3.4); MASTER_URL is the single-entry fallback. */
   MASTER_URLS?: string;
-  /** '1' designates this co-worker as the backup master (promote surface + auto-promote eligibility). */
+  /** '1' designates this co-worker as the backup master (promote surface). */
   FLEET_BACKUP_MASTER?: string;
-  /** '1' on the designated backup: self-promote on master silence (default off). */
-  FLEET_AUTO_PROMOTE?: string;
   CONTROL_SECRET?: string;
   CONTROL_PORT?: string;
   FLEET_PUBLIC_URL?: string;
@@ -107,7 +105,6 @@ export function loadCredentials(): BotCredentials {
     MASTER_URL: process.env.MASTER_URL,
     MASTER_URLS: process.env.MASTER_URLS,
     FLEET_BACKUP_MASTER: process.env.FLEET_BACKUP_MASTER,
-    FLEET_AUTO_PROMOTE: process.env.FLEET_AUTO_PROMOTE,
     CONTROL_SECRET: process.env.CONTROL_SECRET,
     CONTROL_PORT: process.env.CONTROL_PORT,
     FLEET_PUBLIC_URL: process.env.FLEET_PUBLIC_URL,
@@ -170,7 +167,7 @@ export function loadCredentials(): BotCredentials {
         }
       }
       // A seeded key deleted from the file was explicitly cleared: unset it
-      // everywhere so e.g. a disarmed FLEET_AUTO_PROMOTE stays disarmed.
+      // everywhere so e.g. a cleared MASTER_URLS stays cleared.
       for (const key of [...fileSeededEnvKeys]) {
         if (!(key in dataEnv)) {
           delete process.env[key];

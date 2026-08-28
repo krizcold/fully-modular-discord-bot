@@ -11,7 +11,6 @@ function ConnectionSection({ setupStatus, isBotRunning, onUpdate, onUpdateAndRes
     NODE_NAME: '',
     FLEET_SHARD_CAPACITY: '',
     BOT_NODE_ROLE: 'co-worker',
-    FLEET_AUTO_PROMOTE: '',
   };
   const SECRET_FIELDS = ['DISCORD_TOKEN', 'CONTROL_SECRET'];
 
@@ -32,7 +31,6 @@ function ConnectionSection({ setupStatus, isBotRunning, onUpdate, onUpdateAndRes
       NODE_NAME: connection.NODE_NAME || '',
       FLEET_SHARD_CAPACITY: connection.FLEET_SHARD_CAPACITY || '',
       BOT_NODE_ROLE: connection.BACKUP_MASTER === '1' ? 'backup-master' : 'co-worker',
-      FLEET_AUTO_PROMOTE: connection.FLEET_AUTO_PROMOTE || '',
     };
     setFields(prev => {
       const overlay = {};
@@ -166,23 +164,6 @@ function ConnectionSection({ setupStatus, isBotRunning, onUpdate, onUpdateAndRes
               />
               <small>Ordered list tried on reconnect, the master first. Copy from the master's Usage tab (Connect a worker); list every promotable node so failover needs no reconfiguration</small>
             </div>
-
-            {fields.BOT_NODE_ROLE === 'backup-master' && (
-              <div className="form-group">
-                <label>
-                  <StatusIndicator isSet={connection.FLEET_AUTO_PROMOTE === '1'} optional />
-                  Auto-Promote (Optional)
-                </label>
-                <select
-                  value={fields.FLEET_AUTO_PROMOTE || ''}
-                  onChange={e => handleChange('FLEET_AUTO_PROMOTE', e.target.value)}
-                >
-                  <option value="">Off (manual promotion)</option>
-                  <option value="1">Promote itself on master silence</option>
-                </select>
-                <small>Lets this node promote itself when the master goes silent; default off</small>
-              </div>
-            )}
 
             <div className="form-group">
               <label>

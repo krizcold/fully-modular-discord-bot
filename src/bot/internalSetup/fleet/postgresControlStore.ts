@@ -137,7 +137,7 @@ export class PostgresControlStore implements ControlStore {
   }
 
   // Local-clock start of the current unbroken run of failed stamps; null while
-  // stamping succeeds. Feeds the master self-fence and the fleet-state banner.
+  // stamping succeeds. Feeds the fleet-state stamp-health banner.
   private stampFailingSince: number | null = null;
 
   getStampFailingForMs(): number | null {
@@ -185,16 +185,6 @@ export class PostgresControlStore implements ControlStore {
 
   private noteStampFailure(): void {
     if (this.stampFailingSince === null) this.stampFailingSince = Date.now();
-  }
-
-  /**
-   * Self-fence latch (PLAN_STANDBY 3.8): refuse every further write without a
-   * foreign term having been observed (the store may be unreachable). Latched
-   * until restart, exactly like the deposed fence, so a partition that heals
-   * after the latch can never resurrect this master mid-promotion.
-   */
-  latchSelfFence(): void {
-    this.fenced = true;
   }
 
   /**

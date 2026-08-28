@@ -8,8 +8,6 @@ import { performance } from 'perf_hooks';
 import type { Client } from 'discord.js';
 import { getIngestService } from '../ingest/ingestService';
 import {
-  AUTO_PROMOTE_OVERRIDE_MAX_AGE_MS,
-  BACKUP_DOWN_CONFIRM_MS,
   CONTROL_PORT_DEFAULT,
   GUILD_TOTALS_REFRESH_MS,
   HEARTBEAT_MS,
@@ -17,7 +15,6 @@ import {
   INCOMING_RESOLVE_INTERVAL_MS,
   LEASE_RENEW_MS,
   LOSS_LOG_CAP,
-  MASTER_SELF_FENCE_MS,
   PEER_TERM_PROBE_BUDGET_MS,
   PEER_TERM_PROBE_MS,
   PROTOCOL_VERSION,
@@ -30,21 +27,17 @@ import {
 } from './constants';
 import { DataBackendInfo, HeartbeatPayload, LeaseGrantPayload, LeaseInfo, LeaseRenewedPayload, LeaseRevokePayload, MSG, NodeCapabilities, NodeDrainPayload, NodeRole, RegisterPayload, RegisterResult } from './protocol';
 import {
-  clearRoleOverride,
   consumeTakeoverFlags,
   getAppVersion,
   getNodeId,
   getNodeName,
-  isAutoPromoteEnabled,
   isBackupMaster,
   isStandalone,
   readRoleOverride,
   resolveMasterUrls,
   resolveNodeRole,
   wasNodeIdFreshlyGenerated,
-  writeRoleOverride,
 } from './nodeIdentity';
-import { AutoPromoteWatcher } from './autoPromote';
 import { prepareControlStore, PostgresControlStore } from './postgresControlStore';
 import { Registry, RegistryNode } from './registry';
 import { ControlServer } from './controlServer';
@@ -64,7 +57,7 @@ import {
   resolveShardCount,
 } from './placement';
 import { evaluateRecovery } from './recovery';
-import { _setControlStoreFenced, _setFleetStateSources, _setSelfFenced, _setStaleMasterPark, _setTakeoverHold, FleetRecoverySource, FleetRefusedRegistration, getFleetState } from './state';
+import { _setControlStoreFenced, _setFleetStateSources, _setStaleMasterPark, _setTakeoverHold, FleetRecoverySource, FleetRefusedRegistration, getFleetState } from './state';
 import type { MigrationView, PinViolationView } from './state';
 import { serveSyncRequest, SyncAuthority } from './syncAuthority';
 import { SyncEngine } from './syncEngine';
@@ -233,15 +226,6 @@ export async function fleetTransformAbort(): Promise<{ ok: boolean; error?: stri
 
 export async function initFleet(): Promise<FleetContext> {
   if (context) return context;
-  // A staged auto-promotion whose restart never happened is STALE evidence: a
-  // routine boot days later must not act on it (it would depose a healthy
-  // master and chain-declare it lost). Void it and boot by env role.
-  const staged = readRoleOverride();
-  if (staged && staged.setBy === 'auto-promote' && (staged.takeover || staged.chainTakeover)
-      && Date.now() - staged.setAt > AUTO_PROMOTE_OVERRIDE_MAX_AGE_MS) {
-    console.warn(`[Fleet] VOIDING stale auto-promotion override (staged ${Math.round((Date.now() - staged.setAt) / 60000)} min ago, never completed); booting by env role. Promote again if the takeover is still wanted.`);
-    clearRoleOverride();
-  }
   if ((process.env.MASTER_URLS || '').trim() !== '' && (process.env.BOT_NODE_ROLE || '').trim() === '' && !readRoleOverride()) {
     console.warn('[Fleet] MASTER_URLS is set but BOT_NODE_ROLE is not. The candidate list NEVER changes a node\'s role; set BOT_NODE_ROLE=master, co-worker or backup-master explicitly on every node that carries MASTER_URLS.');
   }
@@ -254,15 +238,11 @@ export async function initFleet(): Promise<FleetContext> {
   const runtime = new LeaseRuntime(ingest);
   devRuntime = runtime;
   const advertisedTransferUrl = (process.env.TRANSFER_URL || '').trim() || undefined;
-  if (!isBackupMaster() && (process.env.FLEET_AUTO_PROMOTE || '').trim() === '1') {
-    console.warn('[Fleet] FLEET_AUTO_PROMOTE=1 ignored: this node is not the designated backup (set BOT_NODE_ROLE=backup-master)');
-  }
   const capabilities: NodeCapabilities = {
     shardCapacity: resolveShardCapacity(),
     dataBackend: resolveDataBackend(),
     ...(advertisedTransferUrl ? { transferUrl: advertisedTransferUrl } : {}),
     ...(isBackupMaster() ? { backupMaster: true } : {}),
-    ...(isAutoPromoteEnabled() ? { autoPromote: true } : {}),
   };
 
   context = role === 'master'
@@ -538,7 +518,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   const term = await store.acquireTerm(nodeId);
   if (bootOverride?.takeover || bootOverride?.chainTakeover) consumeTakeoverFlags();
   // The stamp is this master's own lease (PLAN_STANDBY 3.1): deposed masters
-  // learn of it within one interval, and unwritable stamps feed the self-fence.
+  // learn of it within one interval, and stamp health feeds the fleet-state banner.
   if (store instanceof PostgresControlStore && !standalone) {
     const stampTimer = setInterval(() => void store.stampTerm(), TERM_STAMP_MS);
     stampTimer.unref();
@@ -1834,7 +1814,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       getTerm: () => registry.term,
       getNodeId: () => nodeId,
       onRegister: (payload: RegisterPayload, send): RegisterResult => {
-        // Deposed/self-fenced: refuse with the reason the client treats as
+        // Deposed: refuse with the reason the client treats as
         // advance-to-next-candidate, so redialing workers find the live master.
         if (controlFenced) {
           return refuse('deposed', payload);
@@ -2010,45 +1990,6 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     await server.start(port, secret);
     onDeposedTeardown = () => server?.dropAll();
 
-    // Master self-fence watchdog (PLAN_STANDBY 3.8): latches only when the
-    // backup's promotion is genuinely imminent. Three guards protect the C1
-    // coast: the backup must have been seen ALIVE this boot (a registry record
-    // restored from persistence proves nothing), its disconnect must be
-    // CONFIRMED (continuous >= BACKUP_DOWN_CONFIRM_MS - a WS blip through a
-    // proxy reload can never latch), and the disconnect must be CONCURRENT
-    // with the store silence (a backup that died long before the outage is
-    // not promoting off it). A global DB outage with the backup's WS up (or
-    // only blipping) coasts on C1 exactly as without any backup.
-    if (store instanceof PostgresControlStore) {
-      const armedDownSince = new Map<string, number>();
-      const selfFenceTimer = setInterval(() => {
-        if (controlFenced) return;
-        const now = Date.now();
-        for (const n of registry.nodes.values()) {
-          if (n.isSelf || n.capabilities?.autoPromote !== true) continue;
-          if (n.connected || n.lastHeartbeatAt === null) {
-            armedDownSince.delete(n.nodeId);
-          } else if (!armedDownSince.has(n.nodeId)) {
-            armedDownSince.set(n.nodeId, now);
-          }
-        }
-        const failingForMs = store.getStampFailingForMs();
-        if (failingForMs === null || failingForMs < MASTER_SELF_FENCE_MS) return;
-        const failingSince = now - failingForMs;
-        const promotionImminent = [...armedDownSince.values()].some(downSince =>
-          now - downSince >= BACKUP_DOWN_CONFIRM_MS && downSince >= failingSince - BACKUP_DOWN_CONFIRM_MS);
-        if (!promotionImminent) return;
-        controlFenced = true;
-        store.latchSelfFence();
-        _setSelfFenced(`control store silent for ${Math.round(failingForMs / 1000)}s with the auto-promote backup disconnected alongside it`);
-        console.error('[Fleet] MASTER SELF-FENCE: control store silent and the auto-promote backup went down with it; it WILL promote - destroying gateway sessions and stopping grants until restart');
-        server?.dropAll();
-        void runtime.expire('master self-fence: standby takeover imminent');
-        pushFleetStatusNow();
-      }, HEARTBEAT_MS);
-      selfFenceTimer.unref();
-    }
-
     // Ruling-5 takeover chain: a promotion staged over a DEAD master
     // (chainTakeover one-shot) declares the previous holder lost once the
     // hold-down proved its sessions gone, freeing its shards for placement.
@@ -2177,7 +2118,6 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     transformation: () => transformer?.getView() ?? null,
     pinViolation: standalone ? null : () => pinViolation,
     termStamp: store instanceof PostgresControlStore && !standalone ? () => store.getStampFailingForMs() : null,
-    autoPromote: null,
     migrationActive: null,
   });
 
@@ -2220,7 +2160,7 @@ async function initCoWorker(init: CommonInit): Promise<FleetContext> {
   const masterUrls = resolveMasterUrls();
   const secret = (process.env.CONTROL_SECRET || '').trim();
 
-  console.log(`[Fleet] Role: co-worker node=${nodeName} (${nodeId.slice(0, 8)}) masters=${masterUrls.join(' | ') || 'none'} capacity=${capabilities.shardCapacity}${isBackupMaster() ? ` BACKUP MASTER${isAutoPromoteEnabled() ? ' (auto-promote)' : ''}` : ''}`);
+  console.log(`[Fleet] Role: co-worker node=${nodeName} (${nodeId.slice(0, 8)}) masters=${masterUrls.join(' | ') || 'none'} capacity=${capabilities.shardCapacity}${isBackupMaster() ? ` BACKUP MASTER` : ''}`);
 
   let controlClient: ControlClient | null = null;
   let syncEngine: SyncEngine | null = null;
@@ -2350,29 +2290,6 @@ async function initCoWorker(init: CommonInit): Promise<FleetContext> {
     console.error('[Fleet] Co-worker requires MASTER_URLS (or MASTER_URL) and CONTROL_SECRET; idling without a master');
   }
 
-  // Auto-promotion (PLAN_STANDBY 3.8): the designated backup stages its own
-  // promotion (override + parent-driven restart) when the term row goes silent
-  // AND the master WS is down. The override is written HERE, child-side, so a
-  // parent that misses the notification still promotes on the next restart.
-  let autoWatcher: AutoPromoteWatcher | null = null;
-  if (controlClient && isAutoPromoteEnabled()) {
-    const client = controlClient;
-    autoWatcher = new AutoPromoteWatcher({
-      masterConnected: () => client.masterKnown(),
-      requestPromotion: info => {
-        writeRoleOverride({ role: 'master', takeover: true, chainTakeover: true, setAt: Date.now(), setBy: 'auto-promote' });
-        if (process.send) {
-          try {
-            process.send({ type: 'fleet:promote-restart', data: info });
-            return;
-          } catch { /* fall through to the manual-restart log */ }
-        }
-        console.error('[Fleet] Auto-promotion staged (role override written) but the webui parent could not be notified; restart the bot to complete it');
-      },
-    });
-    autoWatcher.start();
-  }
-
   _setFleetStateSources({
     role: 'co-worker',
     standalone: false,
@@ -2395,7 +2312,6 @@ async function initCoWorker(init: CommonInit): Promise<FleetContext> {
     transformation: null,
     pinViolation: null,
     termStamp: null,
-    autoPromote: autoWatcher ? () => autoWatcher!.getStatus() : null,
     migrationActive: () => migrationWorkActive(),
   });
 

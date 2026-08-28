@@ -377,9 +377,9 @@ export class ControlClient {
     // not: the master pings every LEASE_RENEW_MS, so this much silence on an
     // OPEN socket means the peer died without FIN (host loss). A leaseless
     // backup must detect that too, or masterKnown() stays true for the OS TCP
-    // timeout (~15-30 min) and both the auto-promote trigger and the manual
-    // Promote modal's master-down view are blind to the death. Lease expiry
-    // itself stays gated on actually holding one.
+    // timeout (~15-30 min) and the manual Promote modal's master-down view is
+    // blind to the death. Lease expiry itself stays gated on actually holding
+    // one.
     if (this.opts.runtime.hasCurrentLease()) {
       this.registered = false;
       void this.opts.runtime.expire('no master contact past LEASE_TTL');

@@ -24,11 +24,10 @@
 // darkens both at once while the master keeps serving on the C1 window. The
 // master's control channel (masterKnown) runs on a different port and protocol
 // and is the only path-independent liveness signal in the system, so the
-// irreversible lane is gated on it too - the same pairing AutoPromoteWatcher
-// already requires before it fires.
+// irreversible lane is gated on it too.
 //
-// PARENT PROCESS ONLY. The webui parent owns both lanes (the promote route and
-// the auto-promote restart handler) because it owns /data/.env precedence: a
+// PARENT PROCESS ONLY. The webui parent owns the promote lane because it owns
+// /data/.env precedence: a
 // URL the container environment pins cannot be overridden from the file, and
 // the parent is the process whose loadCredentials() can tell the two apart.
 
@@ -80,7 +79,7 @@ export function spliceFleetCredentials(replicaUrl: string): { url?: string; erro
 
 /**
  * Reachability only (SELECT 1, not the term row): shared by the promote route
- * and both rung lanes. A reachable virgin store is a deliberate first
+ * and the rung. A reachable virgin store is a deliberate first
  * promotion, and the boot provisions its own schema.
  */
 export async function storeReachable(url: string): Promise<{ ok: boolean; error?: string }> {
@@ -248,16 +247,13 @@ export interface PairPromotionResult {
 }
 
 /**
- * The replica rung, shared by both lanes. It decides whether this promotion
+ * The replica rung, called by the promote route. It decides whether this promotion
  * needs the database at all (see the table at the top of this file) and, when
  * it does, makes the standby the fleet's store before the role moves.
  *
  * `masterAlive` is the control channel's verdict and is required, not inferred:
- * the route knows it from live fleet state, and the auto lane knows it because
- * its watcher only fires with the master's connection already down.
- * `confirmLag` is the operator's acknowledgement of the measured RPO (R3). The
- * auto lane never sets it, so an unattended promotion cannot silently accept a
- * standby that stopped replaying long before the primary died.
+ * the route knows it from live fleet state.
+ * `confirmLag` is the operator's acknowledgement of the measured RPO (R3).
  */
 export async function promoteReplicaPair(
   endpoints: ReplicaEndpoints,
