@@ -21,6 +21,7 @@ import type { ReplicaHealthReport } from './protocol';
 import { getRouteOverrides } from '../utils/dataBackends/routeResolver';
 import { getDataBootStatus, DataBootStatus } from '../utils/dataBackends/boot';
 import type { TransformationView } from './transformation/transformationCoordinator';
+import type { WitnessStatus } from './witness';
 
 export interface FleetStateNode {
   nodeId: string;
@@ -120,7 +121,9 @@ export interface FleetState {
   /** Co-worker: the ordered master candidate list in use. */
   masterUrls: string[];
   /** Fleet runtime config in force on this node (B2); null only on a standalone master. */
-  fleetConfig: { revision: number; masterCandidates: string[]; backupDesignations: { nodeId: string; priority: number }[]; source: 'runtime' | 'env' } | null;
+  fleetConfig: { revision: number; masterCandidates: string[]; backupDesignations: { nodeId: string; priority: number }[]; witnessChannelId?: string; source: 'runtime' | 'env' } | null;
+  /** Discord witness beacon status (B3); null when this node is not an election participant. */
+  witness: WitnessStatus | null;
   protocolVersion: number;
   term: number;
   epoch: number;
@@ -301,7 +304,9 @@ export interface FleetStateSources {
   /** Term-stamp health supplier (fleet master on the postgres store only); null otherwise. */
   termStamp: (() => number | null) | null;
   /** Fleet runtime config supplier (B2); null on standalone. */
-  fleetConfig: (() => { revision: number; masterCandidates: string[]; backupDesignations: { nodeId: string; priority: number }[]; source: 'runtime' | 'env' } | null) | null;
+  fleetConfig: (() => { revision: number; masterCandidates: string[]; backupDesignations: { nodeId: string; priority: number }[]; witnessChannelId?: string; source: 'runtime' | 'env' } | null) | null;
+  /** Witness status supplier (B3); null when no witness runs on this node. */
+  witness: (() => WitnessStatus) | null;
   /** Live migration/transformation work on THIS node (co-worker executors); null on masters (coordinator view covers it). */
   migrationActive: (() => boolean) | null;
 }
@@ -356,6 +361,7 @@ export function getFleetState(): FleetState {
       termStampFailingForMs: null,
       masterUrls: effectiveMasterUrls().urls,
       fleetConfig: effectiveFleetConfigView(),
+      witness: null,
       protocolVersion: PROTOCOL_VERSION,
       term: 0,
       epoch: 0,
@@ -464,6 +470,7 @@ export function getFleetState(): FleetState {
       termStampFailingForMs: sources.termStamp?.() ?? null,
       masterUrls: effectiveMasterUrls().urls,
       fleetConfig: sources.fleetConfig?.() ?? null,
+      witness: sources.witness?.() ?? null,
       protocolVersion: PROTOCOL_VERSION,
       term: registry.term,
       epoch: registry.epoch,
@@ -564,6 +571,7 @@ export function getFleetState(): FleetState {
     termStampFailingForMs: null,
     masterUrls: effectiveMasterUrls().urls,
     fleetConfig: sources.fleetConfig?.() ?? null,
+    witness: sources.witness?.() ?? null,
     protocolVersion: PROTOCOL_VERSION,
     term,
     epoch: lease?.epoch ?? 0,

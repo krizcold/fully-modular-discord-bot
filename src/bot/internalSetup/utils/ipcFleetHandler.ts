@@ -59,7 +59,7 @@ export function setupFleetIPCHandlers(): void {
           break;
         }
         case 'fleet:config:set': {
-          const result = await fleetSetConfig(message.data?.masterCandidates);
+          const result = await fleetSetConfig(message.data?.masterCandidates, message.data?.witnessChannelId);
           response = result.ok ? { success: true, revision: result.revision } : { success: false, error: result.error };
           break;
         }

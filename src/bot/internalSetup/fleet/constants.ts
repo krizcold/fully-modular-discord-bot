@@ -229,3 +229,18 @@ export const TRANSFORM_FLIP_TIMEOUT_MS = 30000;
 
 /** Bounded wait for the destination store's first liveness probe at PLANNING. */
 export const TRANSFORM_DEST_PROBE_WAIT_MS = 5000;
+
+// ============================================================================
+// DISCORD WITNESS (PLAN_REPLICATION 20.6): beacon-based leader evidence.
+// ============================================================================
+
+/**
+ * Beacon renew cadence for election participants (master + designated
+ * backups). The spec window is 30-60s: slow enough to stay invisible in rate
+ * limits, fast enough that multiple missed periods still read as a prompt
+ * dead-master verdict.
+ */
+export const WITNESS_RENEW_MS = 45_000;
+
+/** Per-request ceiling on witness REST calls; a slow Discord reads as dark, never as a hang. */
+export const WITNESS_REST_TIMEOUT_MS = 10_000;

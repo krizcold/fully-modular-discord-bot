@@ -23,6 +23,9 @@ export function readFleetConfigCache(): FleetConfigPayload | null {
       backupDesignations: Array.isArray(parsed.backupDesignations)
         ? parsed.backupDesignations.filter((d: any) => typeof d?.nodeId === 'string' && Number.isFinite(d?.priority))
         : [],
+      ...(typeof parsed.witnessChannelId === 'string' && parsed.witnessChannelId !== ''
+        ? { witnessChannelId: parsed.witnessChannelId }
+        : {}),
     };
   } catch {
     return null;
@@ -46,9 +49,17 @@ export function effectiveMasterUrls(): { urls: string[]; source: 'runtime' | 'en
 }
 
 /** Fleet-state view of the config in force on this node (workers and pre-init reads). */
-export function effectiveFleetConfigView(): { revision: number; masterCandidates: string[]; backupDesignations: { nodeId: string; priority: number }[]; source: 'runtime' | 'env' } {
+export function effectiveFleetConfigView(): { revision: number; masterCandidates: string[]; backupDesignations: { nodeId: string; priority: number }[]; witnessChannelId?: string; source: 'runtime' | 'env' } {
   const cached = readFleetConfigCache();
-  if (cached) return { revision: cached.revision, masterCandidates: cached.masterCandidates, backupDesignations: cached.backupDesignations, source: 'runtime' };
+  if (cached) {
+    return {
+      revision: cached.revision,
+      masterCandidates: cached.masterCandidates,
+      backupDesignations: cached.backupDesignations,
+      ...(cached.witnessChannelId !== undefined ? { witnessChannelId: cached.witnessChannelId } : {}),
+      source: 'runtime',
+    };
+  }
   return { revision: 0, masterCandidates: resolveMasterUrls(), backupDesignations: [], source: 'env' };
 }
 
@@ -70,4 +81,14 @@ export function validateMasterCandidates(input: unknown): { ok: true; urls: stri
     if (!urls.includes(url)) urls.push(url);
   }
   return { ok: true, urls };
+}
+
+/** Witness beacon channel id: a Discord snowflake, or empty for the owner DM default. */
+export function validateWitnessChannelId(input: unknown): { ok: true; value: string | undefined } | { ok: false; error: string } {
+  if (input === undefined || input === null) return { ok: true, value: undefined };
+  if (typeof input !== 'string') return { ok: false, error: 'witnessChannelId must be a string' };
+  const value = input.trim();
+  if (value === '') return { ok: true, value: undefined };
+  if (!/^\d{15,21}$/.test(value)) return { ok: false, error: 'witnessChannelId must be a Discord channel id (or empty for the owner DM default)' };
+  return { ok: true, value };
 }

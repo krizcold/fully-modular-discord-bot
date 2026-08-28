@@ -110,6 +110,8 @@ export interface FleetConfigPayload {
   revision: number;
   masterCandidates: string[];
   backupDesignations: { nodeId: string; priority: number }[];
+  /** Witness beacon channel id; absent = owner DM default (PLAN_REPLICATION 20.6). */
+  witnessChannelId?: string;
 }
 
 /** Backend decision + routing map handed to workers in the register reply. */

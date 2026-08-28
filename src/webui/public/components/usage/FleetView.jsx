@@ -933,6 +933,7 @@ function FleetReplicaLine({ replica }) {
 function FleetConfigCard({ api, fleet }) {
   const cfg = fleet.fleetConfig;
   const [draft, setDraft] = React.useState(null);
+  const [witnessDraft, setWitnessDraft] = React.useState('');
   const [busy, setBusy] = React.useState(false);
   if (!cfg) return null;
   const editable = fleet.role === 'master' && !fleet.standalone;
@@ -944,7 +945,7 @@ function FleetConfigCard({ api, fleet }) {
     if (busy) return;
     const urls = draft.split('\n').map((u) => u.trim()).filter(Boolean);
     setBusy(true);
-    api.post('/fleet/config', { masterCandidates: urls })
+    api.post('/fleet/config', { masterCandidates: urls, witnessChannelId: witnessDraft.trim() })
       .then((res) => {
         if (!res || res.success === false) { showToast((res && res.error) || 'Config update failed', 'error'); return; }
         showToast(`Fleet config saved (revision ${res.revision}) and pushed to every node`, 'success');
@@ -967,6 +968,13 @@ function FleetConfigCard({ api, fleet }) {
             rows={Math.max(3, draft.split('\n').length + 1)}
             style={{ width: '100%', fontFamily: 'monospace', fontSize: '0.75rem' }}
           />
+          <input
+            type="text"
+            value={witnessDraft}
+            onChange={(e) => setWitnessDraft(e.target.value)}
+            placeholder="witness beacon channel id (empty = owner DM)"
+            style={{ width: '100%', marginTop: '4px', fontFamily: 'monospace', fontSize: '0.75rem' }}
+          />
           <div style={{ marginTop: '4px' }}>
             <button onClick={save} disabled={busy} style={{ fontSize: '0.72rem', padding: '2px 8px' }}>
               {busy ? 'Saving...' : 'Save and push'}
@@ -982,17 +990,47 @@ function FleetConfigCard({ api, fleet }) {
             {cfg.masterCandidates.join('\n') || 'no master candidates'}
           </div>
           {editable && (
-            <button onClick={() => setDraft(cfg.masterCandidates.join('\n'))} style={{ marginTop: '4px', fontSize: '0.72rem', padding: '2px 8px' }}>
-              Edit master candidates
+            <button onClick={() => { setDraft(cfg.masterCandidates.join('\n')); setWitnessDraft(cfg.witnessChannelId || ''); }} style={{ marginTop: '4px', fontSize: '0.72rem', padding: '2px 8px' }}>
+              Edit fleet config
             </button>
           )}
         </div>
       )}
+      <div className="usage-stat-sub" style={{ marginTop: '6px' }}>
+        {`Witness beacon: ${cfg.witnessChannelId ? `channel ${cfg.witnessChannelId}` : 'owner DM (default)'}`}
+      </div>
       {(cfg.backupDesignations || []).length > 0 && (
         <div className="usage-stat-sub" style={{ marginTop: '6px' }}>
           {`Backups: ${cfg.backupDesignations.map((d) => `${nodeName(d.nodeId)} (priority ${d.priority})`).join(', ')}`}
         </div>
       )}
+    </div>
+  );
+}
+
+// Discord witness status (B3): where this node's beacon lives and what the
+// last renew and read saw. Read-only; darkness is stated, never inferred.
+function FleetWitnessCard({ fleet }) {
+  const w = fleet.witness;
+  if (!w) return null;
+  const home = w.home === 'channel' ? `channel ${w.channelId}` : w.home === 'dm' ? 'owner DM (default)' : 'unresolved';
+  const roleLabel = (r) => (r === 'master' ? 'master' : 'backup');
+  return (
+    <div className="usage-stat-card" style={{ marginTop: '10px' }}>
+      <div className="usage-stat-title">Discord witness</div>
+      <div className="usage-stat-sub">{`Beacon home: ${home}`}</div>
+      {w.lastRenewOk ? (
+        <div className="usage-stat-sub">{`Beacon renewed ${fleetFormatAge(Date.now() - w.lastRenewAt)}`}</div>
+      ) : (
+        <div className="usage-stat-sub" style={{ color: '#e5534b' }}>
+          {`Witness dark${w.lastError ? `: ${w.lastError}` : ''}`}
+        </div>
+      )}
+      {(w.claims || []).map((c) => (
+        <div key={c.nodeId} className="usage-stat-sub" style={{ fontFamily: 'monospace' }}>
+          {`${c.nodeName} · ${roleLabel(c.role)} · term ${c.term} · seen ${fleetFormatAge(Date.now() - c.observedAt)}`}
+        </div>
+      ))}
     </div>
   );
 }
@@ -1227,6 +1265,7 @@ function FleetView({ api, wsClient, guildNames }) {
         )}
 
         {!fleet.standalone && <FleetConfigCard api={api} fleet={fleet} />}
+        <FleetWitnessCard fleet={fleet} />
         <FleetSyncCard sync={fleet.sync} />
 
         {fleet.budget ? <FleetBudgetCard budget={fleet.budget} /> : null}
@@ -1345,6 +1384,7 @@ function FleetView({ api, wsClient, guildNames }) {
       )}
 
       {!fleet.standalone && <FleetConfigCard api={api} fleet={fleet} />}
+      <FleetWitnessCard fleet={fleet} />
 
       {fleet.role === 'co-worker' && !fleet.masterKnown && (
         <div className="usage-notice">Master unreachable, retrying...</div>

@@ -183,6 +183,8 @@ export interface PersistedFleetConfig {
   masterCandidates: string[];
   /** Designated backups; priority orders stand-in election (B5 consumes it). */
   backupDesignations: { nodeId: string; priority: number }[];
+  /** Witness beacon channel id; absent = owner DM default (PLAN_REPLICATION 20.6). */
+  witnessChannelId?: string;
   updatedAt: number;
 }
 

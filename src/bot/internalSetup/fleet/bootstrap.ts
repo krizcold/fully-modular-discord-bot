@@ -79,7 +79,8 @@ import { MigrationExecutor } from './migration/migrationExecutor';
 import { TransformationCoordinator } from './transformation/transformationCoordinator';
 import { TransformationExecutor } from './transformation/transformationExecutor';
 import type { ControlStore, PersistedFleetConfig, PersistedTerm, TransformDirection } from './controlStore';
-import { effectiveFleetConfigView, effectiveMasterUrls, validateMasterCandidates, writeFleetConfigCache } from './fleetConfig';
+import { effectiveFleetConfigView, effectiveMasterUrls, readFleetConfigCache, validateMasterCandidates, validateWitnessChannelId, writeFleetConfigCache } from './fleetConfig';
+import { FleetWitness, startWitnessLoop } from './witness';
 import { probePeerTerm } from './peerTermProbe';
 import { planPinRestoreLegs } from './placement';
 import { TRANSFER_PORT_DEFAULT } from './constants';
@@ -225,12 +226,12 @@ export async function fleetTransformAbort(): Promise<{ ok: boolean; error?: stri
   return masterTransformAbort();
 }
 
-let masterConfigSet: ((candidates: string[]) => Promise<{ ok: boolean; error?: string; revision?: number }>) | null = null;
+let masterConfigSet: ((candidates: string[], witnessChannelId: unknown) => Promise<{ ok: boolean; error?: string; revision?: number }>) | null = null;
 
 /** Runtime fleet-config edit (B2); master-only, pushed fleet-wide with zero restarts. */
-export async function fleetSetConfig(candidates: unknown): Promise<{ ok: boolean; error?: string; revision?: number }> {
+export async function fleetSetConfig(candidates: unknown, witnessChannelId?: unknown): Promise<{ ok: boolean; error?: string; revision?: number }> {
   if (!masterConfigSet) return { ok: false, error: 'This node is not the fleet master' };
-  return masterConfigSet(Array.isArray(candidates) ? (candidates as string[]) : []);
+  return masterConfigSet(Array.isArray(candidates) ? (candidates as string[]) : [], witnessChannelId);
 }
 
 export async function initFleet(): Promise<FleetContext> {
@@ -552,6 +553,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     revision: fleetConfig!.revision,
     masterCandidates: fleetConfig!.masterCandidates,
     backupDesignations: fleetConfig!.backupDesignations,
+    ...(fleetConfig!.witnessChannelId !== undefined ? { witnessChannelId: fleetConfig!.witnessChannelId } : {}),
   });
   if (fleetConfig) writeFleetConfigCache(fleetConfigPayload());
 
@@ -696,12 +698,24 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     }
     console.log(`[Fleet] Fleet config revision ${fleetConfig.revision} (${why}) pushed to the fleet`);
   };
-  masterConfigSet = async (candidates: string[]) => {
+  masterConfigSet = async (candidates: string[], witnessChannelId: unknown) => {
     if (!fleetConfig) return { ok: false, error: 'a standalone master holds no fleet config' };
     const valid = validateMasterCandidates(candidates);
     if (!valid.ok) return { ok: false, error: valid.error };
-    fleetConfig = { ...fleetConfig, revision: fleetConfig.revision + 1, masterCandidates: valid.urls, updatedAt: Date.now() };
-    persistFleetConfig('candidates edited');
+    // Undefined = the caller did not touch the witness field; empty = clear to the owner DM default.
+    const witness = witnessChannelId === undefined
+      ? { ok: true as const, value: fleetConfig.witnessChannelId }
+      : validateWitnessChannelId(witnessChannelId);
+    if (!witness.ok) return { ok: false, error: witness.error };
+    fleetConfig = {
+      ...fleetConfig,
+      revision: fleetConfig.revision + 1,
+      masterCandidates: valid.urls,
+      updatedAt: Date.now(),
+    };
+    if (witness.value !== undefined) fleetConfig.witnessChannelId = witness.value;
+    else delete fleetConfig.witnessChannelId;
+    persistFleetConfig('config edited');
     return { ok: true, revision: fleetConfig.revision };
   };
   let coordinator: MigrationCoordinator | null = null;
@@ -2164,6 +2178,23 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   const guildTotalsTimer = setInterval(() => void refreshGuildTotals(), GUILD_TOTALS_REFRESH_MS);
   guildTotalsTimer.unref();
 
+  let witness: FleetWitness | null = null;
+  if (!standalone) {
+    const witnessToken = (process.env.DISCORD_TOKEN || '').trim();
+    if (witnessToken === '') {
+      console.warn('[Fleet] Witness disabled: DISCORD_TOKEN is empty');
+    } else {
+      witness = startWitnessLoop({
+        token: witnessToken,
+        nodeId,
+        nodeName,
+        role: 'master',
+        getTerm: () => registry.term,
+        getChannelId: () => fleetConfig?.witnessChannelId ?? null,
+      });
+    }
+  }
+
   _setFleetStateSources({
     role: 'master',
     standalone,
@@ -2186,7 +2217,8 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     transformation: () => transformer?.getView() ?? null,
     pinViolation: standalone ? null : () => pinViolation,
     termStamp: store instanceof PostgresControlStore && !standalone ? () => store.getStampFailingForMs() : null,
-    fleetConfig: () => (fleetConfig ? { revision: fleetConfig.revision, masterCandidates: fleetConfig.masterCandidates, backupDesignations: fleetConfig.backupDesignations, source: 'runtime' as const } : null),
+    fleetConfig: () => (fleetConfig ? { revision: fleetConfig.revision, masterCandidates: fleetConfig.masterCandidates, backupDesignations: fleetConfig.backupDesignations, ...(fleetConfig.witnessChannelId !== undefined ? { witnessChannelId: fleetConfig.witnessChannelId } : {}), source: 'runtime' as const } : null),
+    witness: witness ? () => witness!.getStatus() : null,
     migrationActive: null,
   });
 
@@ -2365,6 +2397,23 @@ async function initCoWorker(init: CommonInit): Promise<FleetContext> {
     console.error('[Fleet] Co-worker requires MASTER_URLS (or MASTER_URL) and CONTROL_SECRET; idling without a master');
   }
 
+  let witness: FleetWitness | null = null;
+  if (isBackupMaster()) {
+    const witnessToken = (process.env.DISCORD_TOKEN || '').trim();
+    if (witnessToken === '') {
+      console.warn('[Fleet] Witness disabled: DISCORD_TOKEN is empty');
+    } else {
+      witness = startWitnessLoop({
+        token: witnessToken,
+        nodeId,
+        nodeName,
+        role: 'backup',
+        getTerm: () => controlClient?.getTerm() ?? 0,
+        getChannelId: () => readFleetConfigCache()?.witnessChannelId ?? null,
+      });
+    }
+  }
+
   _setFleetStateSources({
     role: 'co-worker',
     standalone: false,
@@ -2388,6 +2437,7 @@ async function initCoWorker(init: CommonInit): Promise<FleetContext> {
     pinViolation: null,
     termStamp: null,
     fleetConfig: () => effectiveFleetConfigView(),
+    witness: witness ? () => witness!.getStatus() : null,
     migrationActive: () => migrationWorkActive(),
   });
 
