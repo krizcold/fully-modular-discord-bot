@@ -20,6 +20,8 @@ export interface PromoteRecord {
   updatedAt: number;
   parked: boolean;
   lastError: string | null;
+  /** Who asked for this promote; stamped on the role override at the restart phase. */
+  startedBy: 'webui-promote' | 'manager-promote';
   /** Transfer-and-retire: relayed to the old master in its register reply. */
   retireOldMaster: boolean;
   supersededNodeId: string | null;
@@ -49,6 +51,7 @@ export function readPromoteRecord(): PromoteRecord | null {
       updatedAt: Number(parsed.updatedAt) || 0,
       parked: parsed.parked === true,
       lastError: typeof parsed.lastError === 'string' ? parsed.lastError : null,
+      startedBy: parsed.startedBy === 'manager-promote' ? 'manager-promote' : 'webui-promote',
       retireOldMaster: parsed.retireOldMaster === true,
       supersededNodeId: typeof parsed.supersededNodeId === 'string' ? parsed.supersededNodeId : null,
       supersededTerm: Number.isFinite(parsed.supersededTerm) ? Number(parsed.supersededTerm) : null,

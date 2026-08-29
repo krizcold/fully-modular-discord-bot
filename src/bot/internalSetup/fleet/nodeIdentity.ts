@@ -24,7 +24,21 @@ export interface RoleOverride {
   /** Promotion over a dead master: auto-Declare-Lost it after the hold-down. */
   chainTakeover?: boolean;
   setAt: number;
-  setBy: 'webui-promote' | 'webui-demote' | 'stepdown';
+  setBy: RoleOverrideSetBy;
+}
+
+// The union is DERIVED from this list, so a value the reader accepts and a value
+// the type allows cannot drift apart.
+const SET_BY_VALUES = [
+  'webui-promote', 'manager-promote', 'webui-demote', 'manager-demote', 'stepdown',
+] as const;
+
+export type RoleOverrideSetBy = typeof SET_BY_VALUES[number];
+
+function toSetBy(value: unknown): RoleOverrideSetBy {
+  return (SET_BY_VALUES as readonly string[]).includes(value as string)
+    ? value as RoleOverrideSetBy
+    : 'webui-promote';
 }
 
 const ROLE_OVERRIDE_BASENAME = 'role-override.json';
@@ -46,7 +60,7 @@ export function readRoleOverride(): RoleOverride | null {
         ...(parsed.takeover === true ? { takeover: true } : {}),
         ...(parsed.chainTakeover === true ? { chainTakeover: true } : {}),
         setAt: Number(parsed.setAt) || 0,
-        setBy: parsed.setBy === 'webui-demote' || parsed.setBy === 'stepdown' ? parsed.setBy : 'webui-promote',
+        setBy: toSetBy(parsed.setBy),
       };
       return cachedOverride;
     }

@@ -20,6 +20,7 @@ import { createUpdateRouter } from './routes/update';
 import { createDevModulesRoutes } from './routes/devmodules';
 import { createUsageRoutes } from './routes/usage';
 import { createFleetRoutes } from './routes/fleet';
+import { createManagedRoutes } from './routes/managed';
 import { createGraveyardRoutes } from './routes/graveyard';
 import { requireAuth } from './middleware/auth';
 import { blockWritesOnCoWorker, isCoWorkerNode, requireMasterNode } from './middleware/fleetGate';
@@ -292,6 +293,12 @@ export async function createServer(botManager: BotManager): Promise<Express> {
   app.use('/api/usage', requireAuth, createUsageRoutes(botManager));
   app.use('/api/fleet', requireAuth, createFleetRoutes(botManager));
   app.use('/api/data/graveyard', requireAuth, createGraveyardRoutes(botManager));
+
+  // Manager-facing lifecycle surface (PLAN_REPLICATION 20.16). NOT requireAuth:
+  // this one carries its own per-instance token check, because it is reached
+  // container-to-container over the shared docker network and so never passes
+  // the boundary gateway that authenticates every route above.
+  app.use('/api/managed', createManagedRoutes(botManager));
 
   // Serve static frontend files (auth is enforced at the deployment boundary; requireAuth passes)
   const publicDir = path.join(__dirname, 'public');

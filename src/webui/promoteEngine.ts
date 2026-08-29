@@ -46,6 +46,8 @@ import { clearSuperseded, freshMasterClaim, masterStoreDeadNow } from '../bot/in
 export interface PromoteStartOptions {
   confirmLag?: boolean;
   retireOldMaster?: boolean;
+  /** Provenance for the role override this promote ends up writing. */
+  startedBy?: 'webui-promote' | 'manager-promote';
 }
 
 export interface PromoteStartResult {
@@ -250,6 +252,7 @@ export async function startPromote(botManager: BotManager, opts: PromoteStartOpt
     updatedAt: Date.now(),
     parked: false,
     lastError: null,
+    startedBy: opts.startedBy === 'manager-promote' ? 'manager-promote' : 'webui-promote',
     retireOldMaster: opts.retireOldMaster === true,
     supersededNodeId: expectedHolder,
     supersededTerm: expectedTerm,
@@ -476,7 +479,7 @@ async function phaseRestart(botManager: BotManager, record: PromoteRecord): Prom
     takeover: true,
     ...(record.mode === 'failover' ? { chainTakeover: true } : {}),
     setAt: Date.now(),
-    setBy: 'webui-promote',
+    setBy: record.startedBy,
   });
   for (let attempt = 0; ; attempt++) {
     const restart = await botManager.restart();
