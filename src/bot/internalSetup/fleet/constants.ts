@@ -244,3 +244,47 @@ export const WITNESS_RENEW_MS = 45_000;
 
 /** Per-request ceiling on witness REST calls; a slow Discord reads as dark, never as a hang. */
 export const WITNESS_REST_TIMEOUT_MS = 10_000;
+
+/**
+ * A beacon edited within this window counts as FRESH (its node is alive). Three
+ * renew periods absorb one missed tick and Discord's own edit latency without
+ * reading a live master as gone.
+ */
+export const WITNESS_FRESH_WINDOW_MS = WITNESS_RENEW_MS * 3;
+
+/**
+ * The window in which a beacon's FAST-CHANGING facts can still be believed
+ * (whether the master can reach its own store). Term and role change rarely and
+ * tolerate the three-period window above; a store that came back seconds ago
+ * does not. TWO periods plus the REST ceiling, because the age of a cached
+ * claim is the sum of two independent cadences (how long ago the writer edited
+ * it, and how long ago this node read it), and budgeting for one would refuse
+ * roughly a third of genuine readings.
+ */
+export const WITNESS_CURRENT_WINDOW_MS = WITNESS_RENEW_MS * 2 + WITNESS_REST_TIMEOUT_MS;
+
+// ============================================================================
+// UNIFIED PROMOTE (PLAN_REPLICATION 20.4): transfer, failover, step-down.
+// ============================================================================
+
+/** Poll cadence while the local standby replays up to the fenced write position. */
+export const PROMOTE_CATCHUP_POLL_MS = 2000;
+
+/** Bounded catch-up wait before the promote record parks (Continue re-enters it). */
+export const PROMOTE_CATCHUP_TIMEOUT_MS = 300_000;
+
+/** Per-statement ceiling for the promote engine's one-shot SQL on the old primary. */
+export const PROMOTE_SQL_TIMEOUT_MS = 15_000;
+
+/**
+ * A superseded master keeps serving its shards until the new master is proven
+ * up (STEP_DOWN message or a fresh higher-term beacon); past this it restarts
+ * as a co-worker anyway, because a fenced master cannot accept writes forever.
+ */
+export const STEPDOWN_FALLBACK_MS = 300_000;
+
+/** Grace between the step-down decision and the restart request, so a delivered backend can drain. */
+export const STEPDOWN_HANDOVER_DELAY_MS = 3000;
+
+/** Per-candidate deadline for the new master's STEP_DOWN notification (best effort, fire and forget). */
+export const STEP_DOWN_NOTIFY_MS = PEER_TERM_PROBE_MS;

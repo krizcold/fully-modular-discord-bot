@@ -24,7 +24,7 @@ export interface RoleOverride {
   /** Promotion over a dead master: auto-Declare-Lost it after the hold-down. */
   chainTakeover?: boolean;
   setAt: number;
-  setBy: 'webui-promote' | 'webui-demote';
+  setBy: 'webui-promote' | 'webui-demote' | 'stepdown';
 }
 
 const ROLE_OVERRIDE_BASENAME = 'role-override.json';
@@ -46,7 +46,7 @@ export function readRoleOverride(): RoleOverride | null {
         ...(parsed.takeover === true ? { takeover: true } : {}),
         ...(parsed.chainTakeover === true ? { chainTakeover: true } : {}),
         setAt: Number(parsed.setAt) || 0,
-        setBy: parsed.setBy === 'webui-demote' ? parsed.setBy : 'webui-promote',
+        setBy: parsed.setBy === 'webui-demote' || parsed.setBy === 'stepdown' ? parsed.setBy : 'webui-promote',
       };
       return cachedOverride;
     }

@@ -110,6 +110,10 @@ export interface FleetState {
   takeoverHold: TakeoverHoldView | null;
   /** Stale-master boot fence: parked because a live peer holds a term this node's own store cannot beat (PLAN_REPLICATION Stage 4). */
   staleMasterPark: StaleMasterParkView | null;
+  /** Boot hold: this master's store is EMPTY while other nodes are configured; seed from a backup first (20.14). */
+  emptyStoreHold: EmptyStoreHoldView | null;
+  /** This master was superseded by a higher term and is stepping down (B4). */
+  superseded: SupersededView | null;
   /** Operator role override in force (promotion/demotion); null when the role comes from env. */
   roleOverride: { role: NodeRole; setBy: string; setAt: number } | null;
   /** This node is the designated backup master (FLEET_BACKUP_MASTER=1). */
@@ -271,6 +275,35 @@ export function _setStaleMasterPark(park: StaleMasterParkView | null): void {
   staleMasterPark = park;
 }
 
+/** Boot hold on an EMPTY master store while other nodes are configured (PLAN_REPLICATION 20.14): seed first, never mint. */
+export interface EmptyStoreHoldView {
+  candidates: string[];
+  since: number;
+  storeState: 'empty' | 'unreachable';
+}
+
+let emptyStoreHold: EmptyStoreHoldView | null = null;
+
+export function _setEmptyStoreHold(hold: EmptyStoreHoldView | null): void {
+  emptyStoreHold = hold;
+}
+
+/** This master was superseded by a higher term (B4): who, how it learned, and whether the step-down is staged. */
+export interface SupersededView {
+  byNodeId: string;
+  byNodeName: string;
+  term: number;
+  source: string;
+  since: number;
+  steppedDown: boolean;
+}
+
+let superseded: SupersededView | null = null;
+
+export function _setSuperseded(view: SupersededView | null): void {
+  superseded = view;
+}
+
 function buildRoleOverrideView(): { role: NodeRole; setBy: string; setAt: number } | null {
   const override = readRoleOverride();
   return override ? { role: override.role, setBy: override.setBy, setAt: override.setAt } : null;
@@ -355,6 +388,8 @@ export function getFleetState(): FleetState {
       // branch is what the UI polls then.
       takeoverHold,
       staleMasterPark,
+      emptyStoreHold,
+      superseded,
       roleOverride: buildRoleOverrideView(),
       backupMaster: isBackupMaster(),
       dbReplica: hasDbReplica(),
@@ -464,6 +499,8 @@ export function getFleetState(): FleetState {
       controlStoreFenced,
       takeoverHold,
       staleMasterPark,
+      emptyStoreHold: null,
+      superseded,
       roleOverride: buildRoleOverrideView(),
       backupMaster: isBackupMaster(),
       dbReplica: hasDbReplica(),
@@ -565,6 +602,8 @@ export function getFleetState(): FleetState {
     controlStoreFenced: null,
     takeoverHold,
     staleMasterPark,
+    emptyStoreHold: null,
+    superseded,
     roleOverride: buildRoleOverrideView(),
     backupMaster: isBackupMaster(),
     dbReplica: hasDbReplica(),

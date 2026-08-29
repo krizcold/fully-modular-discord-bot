@@ -30,6 +30,7 @@ import {
   SyncStatePayload,
 } from './protocol';
 import type { LeaseRuntime } from './leaseRuntime';
+import type { CopyBlock, SupersededInfo } from './protocol';
 
 export interface ControlClientOptions {
   /** Ordered master candidate list (PLAN_STANDBY 3.4); cycled on reconnect, never empty. */
@@ -47,6 +48,10 @@ export interface ControlClientOptions {
   onDataBackend?: (info: RegisterResult['dataBackend']) => void;
   /** Fleet runtime config from the register reply and CONFIG_UPDATE pushes (B2). */
   onFleetConfig?: (config: FleetConfigPayload) => void;
+  /** This node was superseded by the master it just registered with (B4); recorded for the manager. */
+  onSuperseded?: (info: SupersededInfo) => void;
+  /** Copy block relayed to designated backups in the register reply (B4). */
+  onCopyBlock?: (block: CopyBlock) => void;
   /** Webui data hop from the master (DATA_WRITE/DATA_READ); returns the reply payload. */
   onDataOp?: (type: string, data: any) => Promise<any>;
   /** Backend transformation control (TRANSFORM_GUILD/BACKEND_FLIP) -> executor; returns the ack payload. */
@@ -230,6 +235,14 @@ export class ControlClient {
       if (result.fleetConfig) {
         try { this.opts.onFleetConfig?.(result.fleetConfig); }
         catch (error) { console.warn('[Fleet] Failed to apply the delivered fleet config:', error instanceof Error ? error.message : error); }
+      }
+      if (result.superseded) {
+        try { this.opts.onSuperseded?.(result.superseded); }
+        catch (error) { console.warn('[Fleet] Failed to record the superseded fact:', error instanceof Error ? error.message : error); }
+      }
+      if (result.copyBlock) {
+        try { this.opts.onCopyBlock?.(result.copyBlock); }
+        catch (error) { console.warn('[Fleet] Failed to record the delivered copy block:', error instanceof Error ? error.message : error); }
       }
       return true;
     } catch (error) {

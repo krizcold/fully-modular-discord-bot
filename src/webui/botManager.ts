@@ -288,6 +288,17 @@ export class BotManager {
           if (this.wsManager) {
             this.wsManager.broadcast('bot:sync:status', message.data);
           }
+        } else if (message.type === 'fleet:stepdown') {
+          // A superseded master staged its co-worker override (B4); it comes
+          // back as a co-worker of the new master. A concurrent operation only
+          // delays the restart, never loses it.
+          console.warn('[BotManager] fleet:stepdown received; restarting the bot child as co-worker');
+          const retry = (): void => {
+            void this.restart().then(result => {
+              if (!result.success && result.reason === 'operation_in_progress') setTimeout(retry, 5000).unref();
+            });
+          };
+          retry();
         } else if (message.type === 'control:shutdown-bot') {
           // Access-log channel "Shut down bot" button: stop the Discord bot child.
           console.warn('[BotManager] control:shutdown-bot received from access-log action');
@@ -666,6 +677,22 @@ export class BotManager {
       return await this.sendIPCMessage('fleet:state', {});
     } catch (error) {
       console.error('[BotManager] Error getting fleet state:', error);
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  /**
+   * Force a witness read in the child and return its status (B4). Its own
+   * ceiling, well above the ordinary IPC deadline: a cold paginated read is
+   * seven sequential Discord calls, and the promote verdict that asks for it
+   * prefers waiting to deciding on stale evidence. An overrun is not fatal -
+   * it lands in the catch below and the caller falls back to the cached
+   * reading, which the freshness windows reject on their own if it is old.
+   */
+  async readFleetWitness(): Promise<any> {
+    try {
+      return await this.sendIPCMessage('fleet:witness:read', {}, 75000);
+    } catch (error) {
       return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
     }
   }

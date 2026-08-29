@@ -16,6 +16,13 @@ export interface WitnessClaim {
   nodeName: string;
   term: number;
   role: WitnessRole;
+  /**
+   * A master's own verdict on its control store. False is the one signal that
+   * separates "the master's database died" from "this node cannot reach the
+   * master's database" (PLAN_REPLICATION 20.12 c3), which no probe from
+   * another machine can tell apart. Absent on older beacons and on backups.
+   */
+  storeHealthy?: boolean;
   /** Discord's edited_timestamp (falls back to the post timestamp), ms epoch. */
   observedAt: number;
 }
@@ -33,7 +40,7 @@ export interface WitnessStatus {
 
 export interface FleetWitness {
   /** Create-or-edit this node's beacon with the given claim. False = witness dark. */
-  renewClaim(term: number, role: WitnessRole): Promise<boolean>;
+  renewClaim(term: number, role: WitnessRole, storeHealthy?: boolean): Promise<boolean>;
   /** Latest claim per node from the beacon home. Null = witness dark. */
   readClaims(): Promise<WitnessClaim[] | null>;
   getStatus(): WitnessStatus;
@@ -104,7 +111,7 @@ function rest(method: string, path: string, token: string, body?: unknown): Prom
   });
 }
 
-function parseBeacon(content: unknown): { nodeId: string; nodeName: string; term: number; role: WitnessRole } | null {
+function parseBeacon(content: unknown): { nodeId: string; nodeName: string; term: number; role: WitnessRole; storeHealthy?: boolean } | null {
   if (typeof content !== 'string') return null;
   const lines = content.split('\n');
   if (lines[0] !== BEACON_MARKER) return null;
@@ -116,6 +123,7 @@ function parseBeacon(content: unknown): { nodeId: string; nodeName: string; term
       nodeName: typeof parsed.nodeName === 'string' && parsed.nodeName !== '' ? parsed.nodeName : parsed.nodeId,
       term: Number(parsed.term),
       role: parsed.role === 'master' ? 'master' : 'backup',
+      ...(typeof parsed.storeHealthy === 'boolean' ? { storeHealthy: parsed.storeHealthy } : {}),
     };
   } catch {
     return null;
@@ -162,10 +170,17 @@ export class DiscordWitness implements FleetWitness {
     };
   }
 
-  async renewClaim(term: number, role: WitnessRole): Promise<boolean> {
+  async renewClaim(term: number, role: WitnessRole, storeHealthy?: boolean): Promise<boolean> {
     const channelId = await this.resolveHome();
     if (channelId === null) return this.renewFailed('beacon home unresolved (Discord unreachable or owner DM unavailable)');
-    const content = `${BEACON_MARKER}\n${JSON.stringify({ nodeId: this.opts.nodeId, nodeName: this.opts.nodeName, term, role, seq: ++this.seq })}`;
+    const content = `${BEACON_MARKER}\n${JSON.stringify({
+      nodeId: this.opts.nodeId,
+      nodeName: this.opts.nodeName,
+      term,
+      role,
+      ...(typeof storeHealthy === 'boolean' ? { storeHealthy } : {}),
+      seq: ++this.seq,
+    })}`;
     if (this.beaconMessageId === null) {
       const adopted = await this.findOwnBeacon(channelId);
       if (adopted === undefined) return this.renewFailed('beacon lookup failed');
@@ -211,13 +226,13 @@ export class DiscordWitness implements FleetWitness {
    * top of the channel. Driven by the loop when a successful renew's own claim
    * is invisible to readers (a PATCH never moves a message up in history).
    */
-  async repostBeacon(term: number, role: WitnessRole): Promise<boolean> {
+  async repostBeacon(term: number, role: WitnessRole, storeHealthy?: boolean): Promise<boolean> {
     if (this.beaconMessageId !== null && this.activeChannelId !== null) {
       // Awaited: an in-flight DELETE would race the rebuild's own-beacon scan.
       await rest('DELETE', `/channels/${this.activeChannelId}/messages/${this.beaconMessageId}`, this.opts.token);
       this.beaconMessageId = null;
     }
-    return this.renewClaim(term, role);
+    return this.renewClaim(term, role, storeHealthy);
   }
 
   /**
@@ -305,6 +320,8 @@ export class DiscordWitness implements FleetWitness {
 export interface WitnessLoopOptions extends DiscordWitnessOptions {
   role: WitnessRole;
   getTerm: () => number;
+  /** Master only: whether this node can still write its own control store (20.12 c3). */
+  getStoreHealthy?: () => boolean;
 }
 
 /** Build a witness and drive its renew loop; a successful renew is followed by a read so drills can verify both halves. */
@@ -317,11 +334,15 @@ export function startWitnessLoop(opts: WitnessLoopOptions): FleetWitness {
     if (inFlight) return;
     inFlight = true;
     try {
-      const ok = await witness.renewClaim(opts.getTerm(), opts.role);
-      if (!ok) return;
+      const storeHealthy = opts.getStoreHealthy?.();
+      const ok = await witness.renewClaim(opts.getTerm(), opts.role, storeHealthy);
+      // The read runs even when the renew failed: consumers judge other nodes
+      // on how recently this node last READ the home, so skipping it would let
+      // one failed write age out evidence that is still perfectly readable.
       const claims = await witness.readClaims();
+      if (!ok) return;
       if (claims !== null && !claims.some(c => c.nodeId === opts.nodeId)) {
-        await witness.repostBeacon(opts.getTerm(), opts.role);
+        await witness.repostBeacon(opts.getTerm(), opts.role, storeHealthy);
       }
     } catch (error) {
       // The suppliers are externally owned; a throw here must never become an

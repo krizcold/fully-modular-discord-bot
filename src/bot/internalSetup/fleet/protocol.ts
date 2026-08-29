@@ -71,7 +71,38 @@ export const MSG = {
   TERM_PROBE: 'control:term:probe',
   /** Master -> node push of the fleet runtime config (B2); ack is a receipt. Also delivered in every register reply. */
   CONFIG_UPDATE: 'control:config:update',
+  /**
+   * New master -> superseded master (B4): "I hold a higher term, step down".
+   * Answered ahead of the not-registered gate like TERM_PROBE (the sender
+   * never registers with the node it deposed). Carries the new data backend
+   * so the old master can drain its buffered writes into it before restarting.
+   */
+  STEP_DOWN: 'control:step:down',
 } as const;
+
+/** STEP_DOWN payload: the new master's identity, term and (optionally) its data backend. */
+export interface StepDownPayload {
+  term: number;
+  nodeId: string;
+  nodeName: string;
+  dataBackend?: DataBackendInfo;
+}
+
+/** Register-reply fact for a node the master superseded (B4): who, which term, and whether the owner asked to retire it. */
+export interface SupersededInfo {
+  byNodeId: string;
+  byNodeName: string;
+  term: number;
+  retireRequested: boolean;
+  at: number;
+}
+
+/** Replication copy block (replicator DSN + server certificate), relayed to designated backups only (B4). */
+export interface CopyBlock {
+  dsn: string;
+  cert: string;
+  publishedAt: number;
+}
 
 export interface NodeCapabilities {
   shardCapacity: number;
@@ -103,6 +134,10 @@ export interface RegisterResult {
   dataBackend?: DataBackendInfo;
   /** Fleet runtime config in force, re-delivered on every reconnect (B2). */
   fleetConfig?: FleetConfigPayload;
+  /** Present only in the reply to the node this master superseded (B4). */
+  superseded?: SupersededInfo;
+  /** Present only in replies to designated backups (B4): the copy block a new machine seeds from. */
+  copyBlock?: CopyBlock;
 }
 
 /** Wire form of PersistedFleetConfig (control-store side); pushed on CONFIG_UPDATE and in register replies. */

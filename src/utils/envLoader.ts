@@ -76,6 +76,28 @@ export interface CredentialValidation {
 // compose env is never in this set and keeps its precedence.
 const fileSeededEnvKeys = new Set<string>();
 
+function isPlaceholderValue(value?: string): boolean {
+  if (!value) return true;
+  const v = value.trim().toUpperCase();
+  return v.startsWith('REPLACE WITH') ||
+         v.startsWith('OPTIONAL') ||
+         v === '' ||
+         v.includes('WILL BE AUTO-GENERATED');
+}
+
+/**
+ * True when the container environment PINS this key: a real value is present in
+ * process.env that /data/.env cannot override (genuine compose env wins by
+ * design). Call after loadCredentials(), so the seeded-key set reflects the
+ * current file. Lets a caller refuse before doing work that a later write to
+ * /data/.env would silently fail to take effect for.
+ */
+export function isContainerPinned(key: string): boolean {
+  const value = process.env[key];
+  if (typeof value !== 'string' || isPlaceholderValue(value)) return false;
+  return !fileSeededEnvKeys.has(key);
+}
+
 /**
  * Loads environment variables with priority:
  * 1. Docker-compose environment variables (process.env)
@@ -84,15 +106,7 @@ const fileSeededEnvKeys = new Set<string>();
  * This ensures CasaOS compatibility while allowing Web-UI to manage credentials.
  */
 export function loadCredentials(): BotCredentials {
-  // Helper to check if a value is a placeholder
-  const isPlaceholder = (value?: string) => {
-    if (!value) return true;
-    const v = value.trim().toUpperCase();
-    return v.startsWith('REPLACE WITH') ||
-           v.startsWith('OPTIONAL') ||
-           v === '' ||
-           v.includes('WILL BE AUTO-GENERATED');
-  };
+  const isPlaceholder = isPlaceholderValue;
 
   // Start with docker-compose env vars (CasaOS compatibility)
   const credentials: BotCredentials = {

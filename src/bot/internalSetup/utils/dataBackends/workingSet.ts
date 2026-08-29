@@ -91,6 +91,7 @@ export class WorkingSetManager {
   private lastError: string | null = null;
   private dirtyBytes = 0;
   private retryTimer: NodeJS.Timeout | null = null;
+  private quiesced = false;
   private retryAttempt = 0;
   // Counters driven to zero by the drill matrix (non-gated callers touching
   // guilds whose working set is not ready).
@@ -98,7 +99,52 @@ export class WorkingSetManager {
   private wsBypassWrites = 0;
   private fencedFlushRejections = 0;
 
-  constructor(private readonly backend: DataBackend) {}
+  constructor(private backend: DataBackend) {}
+
+  /**
+   * Runtime recycle on a delivered URL change: dirty guilds are re-flushed into
+   * the NEW database (a transfer fences the old primary read-only, so writes
+   * accepted during the switch exist only in this working set).
+   */
+  retargetBackend(backend: DataBackend): void {
+    this.backend = backend;
+  }
+
+  /**
+   * Recycle handover: this manager has been replaced and must never write
+   * again. Its successor holds the SAME fence token (same node, same lease), so
+   * the database physically cannot arbitrate between the two - a surviving
+   * debounce or retry timer here would commit stale content over the live
+   * working set's rows and no fence would report it. Every timer is cleared and
+   * every later flush is a no-op.
+   */
+  quiesce(): void {
+    this.quiesced = true;
+    if (this.retryTimer) { clearTimeout(this.retryTimer); this.retryTimer = null; }
+    for (const ws of this.sets.values()) ws.clearTimers();
+  }
+
+  /**
+   * Guilds holding unflushed writes right now (recycle drain accounting). A
+   * flush already on the wire counts: it emptied its dirty set before awaiting,
+   * so it would otherwise read as clean and be dropped on the floor.
+   */
+  dirtyGuildIds(): string[] {
+    return [...this.sets.values()].filter(ws => ws.dirtyKeys.size > 0 || ws.flushInFlight).map(ws => ws.guildId);
+  }
+
+  /** Bounded wait for in-flight flushes to come back, so their keys are visible again. */
+  async settleInFlight(deadlineMs: number): Promise<void> {
+    const deadline = Date.now() + deadlineMs;
+    while (Date.now() < deadline && [...this.sets.values()].some(ws => ws.flushInFlight)) {
+      await new Promise<void>(resolve => { setTimeout(resolve, 100).unref?.(); });
+    }
+  }
+
+  /** Fenced-flush rejections so far; a drain that raises this DISCARDED writes. */
+  fencedRejectionCount(): number {
+    return this.fencedFlushRejections;
+  }
 
   // --------------------------------------------------------------------------
   // Lifecycle (driven by the DataReadiness hook on lease grants/revokes)
@@ -366,6 +412,7 @@ export class WorkingSetManager {
   }
 
   private async flush(ws: GuildWorkingSet): Promise<void> {
+    if (this.quiesced) return;
     if (ws.flushInFlight) { ws.requeue = true; return; }
     if (ws.debounceTimer) { clearTimeout(ws.debounceTimer); ws.debounceTimer = null; }
     if (ws.dirtyKeys.size === 0) { ws.windowOpenedAt = null; return; }
@@ -508,7 +555,7 @@ export class WorkingSetManager {
   }
 
   private scheduleRetry(): void {
-    if (this.retryTimer) return;
+    if (this.quiesced || this.retryTimer) return;
     const wait = Math.min(RETRY_CAP_MS, RETRY_BASE_MS * 2 ** this.retryAttempt) * (0.5 + Math.random() * 0.5);
     this.retryAttempt += 1;
     this.retryTimer = setTimeout(() => {

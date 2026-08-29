@@ -13,6 +13,7 @@ import {
   fleetMigrateResume,
   fleetMigrateStart,
   fleetMigrationsList,
+  fleetReadWitness,
   fleetResumeAssignments,
   fleetSetConfig,
   fleetSyncBump,
@@ -56,6 +57,10 @@ export function setupFleetIPCHandlers(): void {
       switch (type) {
         case 'fleet:state': {
           response = { success: true, state: getFleetState() };
+          break;
+        }
+        case 'fleet:witness:read': {
+          response = { success: true, witness: await fleetReadWitness() };
           break;
         }
         case 'fleet:config:set': {

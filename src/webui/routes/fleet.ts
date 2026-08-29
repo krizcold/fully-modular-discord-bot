@@ -12,12 +12,10 @@ import {
   resolveNodeRole,
   writeRoleOverride,
 } from '../../bot/internalSetup/fleet/nodeIdentity';
-import { canonicalStoreReachable, promoteReplicaPair, resolveReplicaEndpoints } from '../../bot/internalSetup/fleet/replicaPromotion';
 import { effectiveMasterUrls } from '../../bot/internalSetup/fleet/fleetConfig';
-
-// Promotion gate: dataBackendHealthy stays true through the C1 write-acceptance
-// coast, so it cannot see a control-store outage. The probe itself lives in
-// replicaPromotion.ts because the pair rung decides on the same signal.
+import { readPromoteRecord } from '../../bot/internalSetup/fleet/promoteRecord';
+import { freshMasterClaim, readSuperseded, writeFreshFleetConfirm } from '../../bot/internalSetup/fleet/stepDown';
+import { cancelPromote, continuePromote, startPromote } from '../promoteEngine';
 
 export function createFleetRoutes(botManager: BotManager): Router {
   const router = Router();
@@ -28,20 +26,23 @@ export function createFleetRoutes(botManager: BotManager): Router {
    * the response beside running/success.
    */
   router.get('/state', async (req: Request, res: Response) => {
+    // The promote record is parent-owned and outlives the child (the restart
+    // phase runs while the child is down), so it rides beside the child state.
+    const promote = readPromoteRecord();
     try {
       if (!botManager.isRunning()) {
-        res.json({ success: true, running: false, initialized: false });
+        res.json({ success: true, running: false, initialized: false, promote });
         return;
       }
       const result = await botManager.getFleetState();
       if (!result?.success || !result.state) {
-        res.json({ success: true, running: true, initialized: false });
+        res.json({ success: true, running: true, initialized: false, promote });
         return;
       }
-      res.json({ success: true, running: true, ...result.state });
+      res.json({ success: true, running: true, ...result.state, promote });
     } catch (error) {
       console.error('[Fleet] Failed to get fleet state:', error instanceof Error ? error.message : error);
-      res.json({ success: true, running: botManager.isRunning(), initialized: false });
+      res.json({ success: true, running: botManager.isRunning(), initialized: false, promote });
     }
   });
 
@@ -309,102 +310,72 @@ export function createFleetRoutes(botManager: BotManager): Router {
   });
 
   /**
-   * POST /api/fleet/promote { takeover?, chainTakeover? }
-   * Warm standby (PLAN_STANDBY 3.5): promote THIS node (the designated backup)
-   * to master. Parent-side on purpose - it writes the role override and
-   * restarts the bot child, so it works while the child is mid-restart.
-   * Prechecks run against the child's live fleet state; every refusal is a
-   * clear message, never a 500. takeover skips the boot guard (explicit
-   * intent); chainTakeover additionally declares the dead master lost after
-   * the hold-down (dead-master failover, NOT planned handover).
-   *
-   * PLAN_REPLICATION Stage 3: on a machine holding a database standby the
-   * rung runs first and decides whether the DATABASE moves too. It only does
-   * when the primary is gone on both channels (see replicaPromotion.ts); a
-   * reachable fleet database is deposed through the term row instead, because
-   * forking the store is what would break that fence. confirmLag is the
-   * operator's acknowledgement of the measured RPO (R3); the response carries
-   * needsLagConfirm + lagMs when it is required, and promotedDatabase on
-   * success says whether the standby became the fleet store.
+   * POST /api/fleet/promote { confirmLag?, retireOldMaster? }
+   * Unified promote (PLAN_REPLICATION 20.4, B4): THIS instance (the designated
+   * backup) becomes the master side, bot and database together. The engine
+   * takes the verdict here (every refusal is a clear message, never a 500;
+   * needsLagConfirm + lagMs when the RPO must be acknowledged) and runs the
+   * phases in the background; the record rides GET /state as `promote`.
+   * retireOldMaster is the Transfer-and-retire button: relayed to the old
+   * master in its register reply for its manager to act on.
    */
   router.post('/promote', async (req: Request, res: Response) => {
     try {
-      if (!botManager.isRunning()) {
-        res.json({ success: false, error: 'Bot is not running; start it before promoting' });
-        return;
-      }
-      const result = await botManager.getFleetState();
-      const state: any = result?.success ? result.state : null;
-      if (!state || !state.initialized) {
-        res.json({ success: false, error: 'Fleet state unavailable (bot still initializing); try again shortly' });
-        return;
-      }
-      // A local standby changes what "the database is unreachable" means: the
-      // primary being gone is exactly the failure this pair exists for, and
-      // the promotion brings the database back with it.
-      const replica = resolveReplicaEndpoints();
-      let promotedDatabase = false;
-      const refusal = state.role !== 'co-worker' ? 'this node is already a master'
-        : state.backupMaster !== true ? 'this node is not the designated backup master (set BOT_NODE_ROLE=backup-master)'
-        : state.dataBackend !== 'postgres' ? 'promotion is a postgres-mode feature (file mode has no standby)'
-        : (state.dataBackendHealthy === false && !replica) ? 'the database (control store) is unreachable from this node; a promotion would park at boot instead of taking over - wait for it or fix connectivity first'
-        : state.draining === true ? 'this node is draining; promotion refused'
-        : state.migrationWorkActive === true ? 'a migration/transformation is working on this node; wait for it to finish'
-        : null;
-      if (refusal) {
-        res.json({ success: false, error: refusal });
-        return;
-      }
-      if (replica) {
-        // The rung decides whether this promotion needs the database at all
-        // (a live fleet database is deposed through the term row and must NOT
-        // be forked) and runs the same reachability check when it does not.
-        const pair = await promoteReplicaPair(replica, {
-          confirmLag: req.body?.confirmLag === true,
-          masterAlive: state.masterKnown === true,
-        });
-        if (!pair.success) {
-          console.warn(`[Fleet] Promotion refused at the replica rung: ${pair.error}`);
-          res.json({
-            success: false,
-            error: pair.error ?? 'promoting the local database replica failed',
-            ...(pair.needsLagConfirm ? { needsLagConfirm: true, lagMs: pair.lagMs ?? null } : {}),
-          });
-          return;
-        }
-        promotedDatabase = pair.promotedDatabase === true;
-      } else {
-        const store = await canonicalStoreReachable();
-        if (!store.ok) {
-          console.warn(`[Fleet] Promotion refused: control store probe failed (${store.error})`);
-          res.json({ success: false, error: 'the database (control store) is unreachable from this node; a promotion would park at boot instead of taking over - wait for it or fix connectivity first' });
-          return;
-        }
-      }
-      writeRoleOverride({
-        role: 'master',
-        ...(req.body?.takeover === true ? { takeover: true } : {}),
-        ...(req.body?.chainTakeover === true ? { chainTakeover: true } : {}),
-        setAt: Date.now(),
-        setBy: 'webui-promote',
+      const result = await startPromote(botManager, {
+        confirmLag: req.body?.confirmLag === true,
+        retireOldMaster: req.body?.retireOldMaster === true,
       });
-      console.warn(`[Fleet] PROMOTION staged via web UI (takeover=${req.body?.takeover === true}, chainTakeover=${req.body?.chainTakeover === true}); restarting the bot child as master`);
-      const restart = await botManager.restart();
-      res.json(restart?.success
-        ? { success: true, promotedDatabase }
-        : { success: false, error: restart?.error ?? 'restart failed; the role override is staged and the next start boots as master' });
+      if (!result.success) console.warn(`[Fleet] Promotion refused: ${result.error}`);
+      res.json(result);
     } catch (error) {
       console.error('[Fleet] Promotion failed:', error instanceof Error ? error.message : error);
       res.json({ success: false, error: error instanceof Error ? error.message : 'promotion failed' });
     }
   });
 
+  /** GET /api/fleet/promote: the promote record (also embedded in /state). */
+  router.get('/promote', (_req: Request, res: Response) => {
+    res.json({ success: true, record: readPromoteRecord() });
+  });
+
+  /** POST /api/fleet/promote/continue: re-enter a parked promote at its recorded phase. */
+  router.post('/promote/continue', async (_req: Request, res: Response) => {
+    try {
+      res.json(await continuePromote(botManager));
+    } catch (error) {
+      res.json({ success: false, error: error instanceof Error ? error.message : 'continue failed' });
+    }
+  });
+
+  /** POST /api/fleet/promote/cancel: clear a promote that has not passed the point of no return. */
+  router.post('/promote/cancel', (_req: Request, res: Response) => {
+    res.json(cancelPromote());
+  });
+
   /**
-   * POST /api/fleet/demote
+   * POST /api/fleet/confirm-fresh
+   * Exit for the empty-store boot hold (PLAN_REPLICATION 20.14): the operator
+   * confirms this is a brand-new fleet with no backup holding data.
+   */
+  router.post('/confirm-fresh', (_req: Request, res: Response) => {
+    try {
+      writeFreshFleetConfirm();
+      console.warn('[Fleet] Brand-new fleet CONFIRMED via web UI; the empty-store hold releases');
+      res.json({ success: true });
+    } catch (error) {
+      res.json({ success: false, error: error instanceof Error ? error.message : 'confirm failed' });
+    }
+  });
+
+  /**
+   * POST /api/fleet/demote { confirm? }
    * Demote THIS master back to co-worker (deposed/overridden master cleanup,
-   * or the second half of a planned handover). An env co-worker only needs
+   * or a deliberate "under maintenance" freeze). An env co-worker only needs
    * its override cleared; an env master gets a co-worker override and must
-   * have master candidates configured to dial.
+   * have master candidates configured to dial. With no other master visible
+   * (no fresh master beacon, not superseded, not parked) the demote freezes
+   * the fleet, so it answers needsConfirm with the ordering warning first
+   * (PLAN_REPLICATION 20.12a).
    *
    * MUST work in all three master states, not just a healthy one: (a) fully
    * initialized; (b) parked in the boot takeover guard or the stale-master
@@ -436,9 +407,28 @@ export function createFleetRoutes(botManager: BotManager): Router {
           res.json({ success: false, error: refusal });
           return;
         }
-      } else if (running && !(state && (state.takeoverHold || state.staleMasterPark))) {
-        // Genuine early boot with no hold: seconds away from real state.
-        res.json({ success: false, error: 'Fleet state unavailable (bot still initializing); try again shortly' });
+        const successor = state.witness ? freshMasterClaim(state.witness, state.nodeId, Date.now()) : null;
+        if (!successor && !state.superseded && !readSuperseded() && req.body?.confirm !== true) {
+          res.json({
+            success: false,
+            needsConfirm: true,
+            error: 'No other master is visible from this node. Demoting now freezes the fleet: workers lose their coordinator within 45s and drop their sessions, and the bot shows offline until a backup is promoted; the true database stays on this machine, untouched. Safe order to retire this machine: demote, promote the backup while this database is still reachable (zero loss), then remove the machine. Promoting after the machine is gone takes the RPO path instead.',
+          });
+          return;
+        }
+      } else if (running
+        && !(state && (state.takeoverHold || state.staleMasterPark || state.emptyStoreHold))
+        && req.body?.confirm !== true) {
+        // Genuine early boot with no known hold: seconds away from real state.
+        // Any OTHER stall that never reaches initialization (a control store
+        // whose provisioning cannot complete, say) is still escapable with an
+        // explicit confirm - demote is the documented way out of a boot that
+        // cannot finish, and refusing it outright leaves no way out at all.
+        res.json({
+          success: false,
+          needsConfirm: true,
+          error: 'The bot has not finished initializing, so its role cannot be read from the running process. If it has been stuck longer than a boot should take, demote it anyway: the next start comes up as a co-worker.',
+        });
         return;
       } else {
         // Guard-held boot or a downed child: parent-side prechecks.

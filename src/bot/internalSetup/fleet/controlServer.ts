@@ -18,12 +18,15 @@ import {
   MSG,
   RegisterPayload,
   RegisterResult,
+  StepDownPayload,
 } from './protocol';
 
 export interface ControlServerHooks {
   getTerm: () => number;
   /** This master's own node id, so a TERM_PROBE reply can be attributed (a prober must be able to recognise its own answer). */
   getNodeId: () => string;
+  /** A newer master says step down (B4); answered pre-registration like TERM_PROBE. */
+  onStepDown?: (payload: StepDownPayload) => { ok: boolean; reason?: string };
   /** Registry insert + VersionGate; returns the register reply. */
   onRegister: (payload: RegisterPayload, send: (message: object) => void) => RegisterResult;
   /** Fired after the register reply went out, so grants always follow acceptance. */
@@ -207,6 +210,17 @@ export class ControlServer {
     // its predecessor may still hold this port.
     if (type === MSG.TERM_PROBE) {
       if (requestId) this.reply(socket, requestId, { ok: true, term: this.hooks.getTerm(), nodeId: this.hooks.getNodeId() });
+      return;
+    }
+
+    // Step-down notice from a newer master: also pre-registration (the sender
+    // never registers here) and ahead of term fencing (its term is higher by
+    // definition, and the verdict on that belongs to the hook).
+    if (type === MSG.STEP_DOWN) {
+      const verdict = this.hooks.onStepDown
+        ? this.hooks.onStepDown((data ?? {}) as StepDownPayload)
+        : { ok: false, reason: 'unsupported' };
+      if (requestId) this.reply(socket, requestId, { ...verdict, term: this.hooks.getTerm() });
       return;
     }
 

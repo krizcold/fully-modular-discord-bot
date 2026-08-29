@@ -1040,68 +1040,183 @@ function FleetWitnessCard({ fleet }) {
 // chainTakeover decision follows what this node can see: master WS down =
 // dead-master failover (declare lost + take its shards), master WS up =
 // planned handover (the deposed master keeps its shards until demoted).
-function FleetBackupCard({ api, fleet }) {
+function FleetPromoteCard({ api, fleet, reload }) {
   const [busy, setBusy] = React.useState(false);
   const masterDown = !fleet.masterKnown;
   const pair = fleet.dbReplica === true;
-  // The pair promotion runs BEFORE the role takeover, so a lag refusal comes
-  // back with nothing changed: re-posting with confirmLag is the R3 override.
-  const send = (confirmLag) => api.post('/fleet/promote', { takeover: true, chainTakeover: masterDown, ...(confirmLag ? { confirmLag: true } : {}) });
-  const promote = () => {
+  const record = fleet.promote;
+  const active = !!(record && record.phase !== 'done');
+  // Unified promote (PLAN_REPLICATION 20.4): ONE action moves the whole side.
+  // The verdict is the engine's; the card only names the likely path and
+  // drives the confirmations (the RPO acknowledgement re-posts with confirmLag).
+  const post = (body) => api.post('/fleet/promote', body);
+  const run = (retireOldMaster) => {
     if (busy) return;
     const text = masterDown
-      ? 'Promote this backup to MASTER?\n\nThe master looks unreachable from this node. After the safety hold-down the old master is declared lost and its shards are taken over. This node restarts; its own shards re-identify (budget-metered) and workers reattach at zero identify cost.'
-      : 'The master still looks ALIVE from this node. Promote anyway as a PLANNED HANDOVER?\n\nThe current master is deposed within seconds (its next liveness stamp fences it) and KEEPS its shards until you demote it from its own UI. If it is alive but cut off (partitioned), stop its container first instead of promoting over it.';
-    const pairText = !pair ? ''
-      : masterDown
-        ? '\n\nThis machine holds a database standby. If nothing answers on the old master or its database, the standby is promoted first and becomes the fleet database (you will be asked to accept how current it is). If the fleet database is still reachable, only the role moves and the standby keeps following it.'
-        : '\n\nThis machine holds a database standby, but it will not move while the master answers this node: either only the role moves, or the promotion is refused if this node cannot reach the fleet database.';
-    if (!confirm(text + pairText)) return;
+      ? 'Promote this instance to MASTER?\n\nThe master looks unreachable from this node. If its database still answers, this is a zero-loss transfer: the old database is fenced at a known point, the copy here catches up, then takes over. If nothing answers, the copy is promoted as far as replication reached and you will be asked to accept how current it is. This node restarts once as master; workers keep their sessions.'
+      : retireOldMaster
+        ? 'TRANSFER master here and RETIRE the old master?\n\nThe old master is deposed within seconds, keeps serving its shards until this node moves them, then rejoins as a co-worker. Its manager is told to reseed its database as a standby of this node once the transfer completes. No data is lost: the old database is fenced before the copy point.'
+        : 'TRANSFER master to this instance?\n\nZero data loss: the old database is fenced at a known point, the copy here catches up to it, then becomes the fleet database. The old master keeps serving its shards until this node moves them, then rejoins as a co-worker. Writes are refused for a few seconds around the switch; Discord sessions stay up.';
+    if (!confirm(text)) return;
     setBusy(true);
-    send(false)
+    post({ retireOldMaster })
       .then((res) => {
         if (res && res.success === false && res.needsLagConfirm) {
           const behind = res.lagMs != null ? Math.round(res.lagMs / 1000) + 's' : 'an unknown amount of time';
-          if (!confirm(`Nothing answers on the old master or its database, and this machine's standby last replayed a transaction ${behind} ago.\n\nPromoting makes that standby the fleet database, so anything the old one accepted after that point is LOST. Continue?`)) return null;
-          return send(true);
+          if (!confirm(`Nothing answers on the old master or its database, and this machine's copy last replayed a transaction ${behind} ago.\n\nPromoting makes that copy the fleet database, so anything the old one accepted after that point is LOST. Continue?`)) return null;
+          return post({ retireOldMaster, confirmLag: true });
         }
         return res;
       })
       .then((res) => {
         if (res === null) return;
         if (!res || res.success === false) { showToast((res && res.error) || 'Promotion failed', 'error'); return; }
-        showToast(res.promotedDatabase ? 'Promotion started: the standby is now the fleet database, this node restarts as master' : 'Promotion started: this node restarts as master', 'success');
+        showToast(`Promote started (${res.record ? res.record.mode : 'promote'}); follow the phases in the card below`, 'success');
+        // The record lives in the parent, so only a state fetch surfaces it;
+        // without this the phase card stays invisible for the whole run and a
+        // parked promote would never show its Continue button.
+        reload();
       })
       .catch((err) => showToast((err && err.message) || 'Promotion failed', 'error'))
-      .finally(() => setBusy(false));
+      .finally(() => { setBusy(false); reload(); });
   };
   return (
     <div className="usage-stat-card" style={{ marginTop: '10px' }}>
       <div className="usage-stat-title">Backup master</div>
       <div className="usage-stat-sub">
-        This node takes over only when you press Promote.
+        This instance takes over only when you press a button here: bot and database together, one action.
       </div>
-      {pair ? (
-        <div className="usage-stat-sub">
-          Database standby on this machine: if the fleet database dies with the master, promotion takes the pair.
+      {!pair ? (
+        <div className="usage-stat-sub" style={{ color: '#d29922' }}>
+          No database standby on this machine yet; the promote refuses until one is seeded (the manager provisions it from the copy block).
         </div>
       ) : null}
-      <button onClick={promote} disabled={busy} style={{ marginTop: '6px' }}>
-        {busy ? 'Promoting...' : 'Promote to master'}
-      </button>
+      {!active && (masterDown ? (
+        <button onClick={() => run(false)} disabled={busy} style={{ marginTop: '6px' }}>
+          {busy ? 'Working...' : 'Promote to master'}
+        </button>
+      ) : (
+        <div style={{ marginTop: '6px' }}>
+          <button onClick={() => run(false)} disabled={busy}>
+            {busy ? 'Working...' : 'Transfer master here'}
+          </button>
+          <button onClick={() => run(true)} disabled={busy} style={{ marginLeft: '6px' }}>
+            {busy ? 'Working...' : 'Transfer and retire old master'}
+          </button>
+        </div>
+      ))}
     </div>
   );
 }
 
-// Demote surface for a deposed / operator-overridden master.
+const PROMOTE_PHASE_TEXT = {
+  verdict: 'Deciding',
+  claim: 'Claiming the term on the old database',
+  fence: 'Fencing the old database',
+  catchup: 'Catching the copy up to the fenced position',
+  promote: 'Promoting the local copy',
+  restart: 'Restarting as master',
+  done: 'Done',
+};
+
+// The promote record rides beside the fleet state from the parent, so it stays
+// visible while the bot child restarts; a parked phase offers Continue.
+function FleetPromoteRecord({ api, fleet, reload }) {
+  const [busy, setBusy] = React.useState(false);
+  const r = fleet.promote;
+  if (!r) return null;
+  if (r.phase === 'done' && !r.parked && !r.lastError) return null;
+  const act = (path, okText) => {
+    if (busy) return;
+    setBusy(true);
+    api.post(path, {})
+      .then((res) => {
+        if (!res || res.success === false) { showToast((res && res.error) || 'Failed', 'error'); return; }
+        showToast(okText, 'success');
+      })
+      .catch((err) => showToast((err && err.message) || 'Failed', 'error'))
+      .finally(() => { setBusy(false); reload(); });
+  };
+  return (
+    <div className="usage-stat-card" style={{ marginTop: '10px', borderColor: r.parked ? '#e5534b' : undefined }}>
+      <div className="usage-stat-title">{`Promote (${r.mode}): ${PROMOTE_PHASE_TEXT[r.phase] || r.phase}${r.parked ? ' · PARKED' : ''}`}</div>
+      {r.lastError ? <div className="usage-stat-sub" style={{ color: '#ed4245' }}>{r.lastError}</div> : null}
+      {r.fencedLsn ? <div className="usage-stat-sub">{`Old database fenced at ${r.fencedLsn}`}</div> : null}
+      {r.parked ? (
+        <div style={{ marginTop: '6px' }}>
+          <button onClick={() => act('/fleet/promote/continue', 'Promote continues')} disabled={busy} style={{ fontSize: '0.72rem', padding: '2px 8px' }}>Continue</button>
+          {r.phase === 'claim' ? (
+            <button onClick={() => act('/fleet/promote/cancel', 'Promote cancelled')} disabled={busy} style={{ fontSize: '0.72rem', padding: '2px 8px', marginLeft: '6px' }}>Cancel</button>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+// A master (or the co-worker it became) that a higher term superseded (B4).
+function FleetSupersededBanner({ fleet }) {
+  const s = fleet.superseded;
+  if (!s) return null;
+  return (
+    <div className="usage-notice" style={{ borderColor: '#e5534b', color: '#e5534b' }}>
+      {`SUPERSEDED by ${s.byNodeName} at term ${s.term} (${s.source}). ${s.steppedDown
+        ? 'This node has stepped down and serves as a co-worker of the new master.'
+        : 'This node keeps serving its shards until the new master is proven up, then steps down on its own.'} Its database is inert now: retire this side from the manager (reseed it as a standby of the new master, or decommission it).`}
+    </div>
+  );
+}
+
+// Empty-store boot hold (PLAN_REPLICATION 20.14): a master with no data while
+// other nodes are configured must seed from a backup before it serves.
+function FleetEmptyStoreHoldBanner({ api, hold }) {
+  const [busy, setBusy] = React.useState(false);
+  const confirmFresh = () => {
+    if (busy) return;
+    if (!confirm('Confirm this is a BRAND-NEW fleet?\n\nOnly do this when no backup anywhere holds real data for this bot. The empty database on this machine becomes the fleet database and a term is minted on it. If a backup with real data exists, cancel and seed this machine from it instead (Promote on that data, or provision this machine as a standby first).')) return;
+    setBusy(true);
+    api.post('/fleet/confirm-fresh', {})
+      .then((res) => {
+        if (!res || res.success === false) { showToast((res && res.error) || 'Confirm failed', 'error'); return; }
+        showToast('Brand-new fleet confirmed; the hold releases on its next check', 'success');
+      })
+      .catch((err) => showToast((err && err.message) || 'Confirm failed', 'error'))
+      .finally(() => setBusy(false));
+  };
+  return (
+    <div className="usage-notice" style={{ borderColor: '#e0a030', color: '#e0a030' }}>
+      {`EMPTY STORE HOLD: this master's database is ${hold.storeState} while other fleet nodes are configured (${(hold.candidates || []).join(', ')}). It will not mint a term or serve while a backup may hold the real data. Provision this machine as a standby of the node that holds the data and let it catch up (the hold releases by itself once this database holds real data), or demote this node to rejoin the fleet as a co-worker. Only confirm a brand-new fleet when no backup anywhere holds data for this bot.`}
+      <div>
+        <FleetDemoteButton api={api} />
+      </div>
+      <div>
+        <button onClick={confirmFresh} disabled={busy} style={{ marginTop: '6px', fontSize: '0.72rem', padding: '2px 8px' }}>
+          {busy ? 'Confirming...' : 'This is a brand-new fleet'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// Demote surface for a deposed / operator-overridden master. With no other
+// master visible the route answers needsConfirm with the ordering warning.
 function FleetDemoteButton({ api }) {
   const [busy, setBusy] = React.useState(false);
   const demote = () => {
     if (busy) return;
-    if (!confirm('Demote this master to co-worker?\n\nIt restarts, dials the master candidates (MASTER_URLS) and re-adopts its shards from the live master at zero identify cost.')) return;
+    if (!confirm('Demote this master to co-worker?\n\nIt restarts, dials the master candidates and re-adopts its shards from the live master at zero identify cost.')) return;
     setBusy(true);
-    api.post('/fleet/demote', {})
+    const send = (confirmFreeze) => api.post('/fleet/demote', confirmFreeze ? { confirm: true } : {});
+    send(false)
       .then((res) => {
+        if (res && res.success === false && res.needsConfirm) {
+          if (!confirm(`${res.error}\n\nDemote anyway (the fleet stays under maintenance until a backup is promoted)?`)) return null;
+          return send(true);
+        }
+        return res;
+      })
+      .then((res) => {
+        if (res === null) return;
         if (!res || res.success === false) { showToast((res && res.error) || 'Demotion failed', 'error'); return; }
         showToast('Demotion started: this node restarts as co-worker', 'success');
       })
@@ -1123,9 +1238,13 @@ function FleetView({ api, wsClient, guildNames }) {
   // No WS pushes arrive while the fleet layer is mid-init (e.g. the boot
   // takeover guard holding), so poll until initialized.
   const fleetInitializedRef = React.useRef(false);
+  // The promote record is the PARENT's, so the child's fleet-status pushes
+  // never carry it; a running promote keeps polling the route that does.
+  const promoteActiveRef = React.useRef(false);
 
   const applyFleet = React.useCallback((obj) => {
     fleetInitializedRef.current = obj != null && obj.initialized === true;
+    promoteActiveRef.current = !!(obj && obj.promote && obj.promote.phase !== 'done');
     setFleet(obj);
   }, []);
 
@@ -1138,12 +1257,15 @@ function FleetView({ api, wsClient, guildNames }) {
   React.useEffect(() => {
     loadFleet();
     const unsubscribe = wsClient.on('bot:fleet:status', (state) => {
-      applyFleet(Object.assign({ success: true, running: true }, state));
+      // Carry the last known promote record across a child push: replacing the
+      // object wholesale would blank the phase card for the whole run.
+      setFleet((prev) => Object.assign({ success: true, running: true }, state, prev && prev.promote ? { promote: prev.promote } : {}));
+      fleetInitializedRef.current = state != null && state.initialized === true;
     });
     const unsubscribeStatus = wsClient.on('bot:status', () => loadFleet());
     const unsubscribeSync = wsClient.on('bot:sync:status', () => loadFleet());
     const initPoll = setInterval(() => {
-      if (!fleetInitializedRef.current) loadFleet();
+      if (!fleetInitializedRef.current || promoteActiveRef.current) loadFleet();
     }, 5000);
     return () => {
       unsubscribe();
@@ -1178,6 +1300,10 @@ function FleetView({ api, wsClient, guildNames }) {
             <div><FleetDemoteButton api={api} /></div>
           </div>
         )}
+        {fleet.emptyStoreHold && (
+          <FleetEmptyStoreHoldBanner api={api} hold={fleet.emptyStoreHold} />
+        )}
+        <FleetPromoteRecord api={api} fleet={fleet} reload={loadFleet} />
         <div className="usage-empty">
           {!fleet.running
             ? 'Fleet state becomes available once the bot process is running.'
@@ -1239,14 +1365,16 @@ function FleetView({ api, wsClient, guildNames }) {
             On hold: connected to the master, waiting for a shard to be assigned. Not serving any guilds yet.
           </div>
         )}
+        <FleetSupersededBanner fleet={fleet} />
         {fleet.roleOverride && (
           <div className="usage-stat-sub" style={{ marginTop: '6px' }}>
             {`Role set by operator override (${fleet.roleOverride.setBy}, ${new Date(fleet.roleOverride.setAt).toISOString().slice(0, 16).replace('T', ' ')} UTC)`}
           </div>
         )}
         {fleet.backupMaster && fleet.dataBackend === 'postgres' && (
-          <FleetBackupCard api={api} fleet={fleet} />
+          <FleetPromoteCard api={api} fleet={fleet} reload={loadFleet} />
         )}
+        <FleetPromoteRecord api={api} fleet={fleet} reload={loadFleet} />
         {fleet.backupMaster && fleet.dataBackend !== 'postgres' && (
           <div className="usage-stat-sub" style={{ marginTop: '6px', color: '#777' }}>
             Designated backup master, but promotion is a postgres-mode feature (file mode has no standby).
@@ -1359,10 +1487,12 @@ function FleetView({ api, wsClient, guildNames }) {
 
       {fleet.controlStoreFenced && (
         <div className="usage-notice" style={{ borderColor: '#e5534b', color: '#e5534b' }}>
-          {`CRITICAL: another master (term ${fleet.controlStoreFenced.observedTerm}) owns this fleet's control store. This master has stopped granting shards. Demote this node to rejoin the fleet as a co-worker, or keep exactly one master per control store and restart.`}
-          {!fleet.standalone && <div><FleetDemoteButton api={api} /></div>}
+          {`CRITICAL: another master (term ${fleet.controlStoreFenced.observedTerm}) owns this fleet's control store. This master has stopped granting shards.${fleet.superseded ? '' : ' Demote this node to rejoin the fleet as a co-worker, or keep exactly one master per control store and restart.'}`}
+          {!fleet.standalone && !fleet.superseded && <div><FleetDemoteButton api={api} /></div>}
         </div>
       )}
+      <FleetSupersededBanner fleet={fleet} />
+      <FleetPromoteRecord api={api} fleet={fleet} reload={loadFleet} />
 
       {fleet.dbStandbys && fleet.dbStandbys.some((sb) => sb.state !== 'streaming') && (
         <div className="usage-notice" style={{ borderColor: '#e5534b', color: '#e5534b' }}>
@@ -1379,7 +1509,11 @@ function FleetView({ api, wsClient, guildNames }) {
       {fleet.roleOverride && !fleet.standalone && (
         <div className="usage-stat-sub">
           {`Role set by operator override (${fleet.roleOverride.setBy}, ${new Date(fleet.roleOverride.setAt).toISOString().slice(0, 16).replace('T', ' ')} UTC)`}
-          {!fleet.controlStoreFenced && <div><FleetDemoteButton api={api} /></div>}
+        </div>
+      )}
+      {!fleet.standalone && !fleet.controlStoreFenced && !fleet.superseded && (
+        <div className="usage-stat-sub">
+          <FleetDemoteButton api={api} />
         </div>
       )}
 

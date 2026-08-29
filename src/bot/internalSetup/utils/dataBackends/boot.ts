@@ -96,15 +96,19 @@ export function initDataBackendLayer(): void {
 
 let activeUrl: string | null = null;
 
-function startPostgresRuntime(url: string): void {
+/** Make a prepared backend the live runtime; the caller owns identity verification. */
+function installRuntime(url: string, backend: PostgresBackend): DataReadinessDriver {
   activeUrl = url;
   bootStatus = { ...bootStatus, mode: 'postgres', state: 'starting' };
-  const backend = new PostgresBackend({ url });
-  backend.start();
   const ws = initWorkingSet(backend);
   setGuildDataBackend(backend);
-  const driver = initDataReadiness(backend, ws, { held: true });
-  void verifyIdentityLoop(url, driver);
+  return initDataReadiness(backend, ws, { held: true });
+}
+
+function startPostgresRuntime(url: string): void {
+  const backend = new PostgresBackend({ url });
+  backend.start();
+  void verifyIdentityLoop(url, installRuntime(url, backend));
 }
 
 const PICK_CONNECT_TIMEOUT_MS = 4_000;
@@ -145,14 +149,20 @@ export async function pickDeliveredUrl(url: string, publicUrl: string, previous?
 
 /**
  * Co-worker apply of the master-delivered backend (register reply, re-sent on
- * every reconnect). Returns true when the effective backend or URL changed
- * (the caller refreshes and re-sends its capabilities). Ordering per the
- * spec: adopt -> persist env -> marker -> (re)start runtime, gates stay
- * closed until the new runtime's identity verifies.
+ * every reconnect). Reports `changed` when the effective backend or URL changed
+ * (the caller refreshes and re-sends its capabilities) and `recycled` when the
+ * postgres runtime was actually rebuilt (the caller must re-mirror its lease
+ * into the fresh readiness driver; the two are NOT the same condition, because
+ * an unchanged delivery can still resolve to a different reachable form).
+ * Ordering per the spec: adopt -> persist env -> marker -> (re)start runtime,
+ * gates stay closed until the new runtime's identity verifies.
+ * keepPrevious leaves the outgoing pool open for a caller that shares it with
+ * its control store and is about to restart anyway.
  */
 export async function applyDeliveredBackend(
   info: { backend: DataBackendKind; url?: string; publicUrl?: string; transformationId?: string; routes?: { guildId: string; backend: DataBackendKind }[] } | undefined,
-): Promise<boolean> {
+  opts?: { keepPrevious?: boolean },
+): Promise<{ changed: boolean; recycled: boolean }> {
   const backend = info?.backend ?? 'file';
   const publicUrl = (info?.publicUrl || '').trim();
   const localUrl = (info?.url || '').trim();
@@ -210,16 +220,16 @@ export async function applyDeliveredBackend(
   if (backend === 'postgres') {
     if (!url) {
       refuse('the master delivered a postgres backend without a URL');
-      return changed;
+      return { changed, recycled: false };
     }
-    if (activeUrl === url) return changed;
+    if (activeUrl === url) return { changed, recycled: false };
     if (activeUrl !== null) {
-      console.warn('[Data] Delivered backend URL changed; recycling the postgres runtime (unflushed writes drain best-effort)');
-      await stopPostgresRuntime();
+      console.warn('[Data] Delivered backend URL changed; recycling the postgres runtime and carrying unflushed writes to the new database');
+      return { changed, recycled: await recyclePostgresRuntime(url, opts?.keepPrevious === true) };
     }
     startPostgresRuntime(url);
   }
-  return changed;
+  return { changed, recycled: false };
 }
 
 export function getActiveBackendUrl(): string | null {
@@ -266,17 +276,116 @@ export function applyBackendFlip(dest: DataBackendKind): void {
   console.log(`[Data] Backend flipped: every guild now routes to ${dest}`);
 }
 
-async function stopPostgresRuntime(): Promise<void> {
+/** Bounded identity retries for a drain: a just-promoted database can be seconds late to answer. */
+const DRAIN_VERIFY_ATTEMPTS = 10;
+const DRAIN_VERIFY_RETRY_MS = 3000;
+/** Bounded wait for flushes already on the wire, so their keys are visible to the drain again. */
+const DRAIN_SETTLE_MS = 15_000;
+
+const sleep = (ms: number) => new Promise<void>(resolve => { setTimeout(resolve, ms).unref?.(); });
+
+/**
+ * URL change while serving. The outgoing runtime KEEPS SERVING until the new
+ * database has proven its identity and taken every buffered write: installing
+ * the cold runtime first would leave the node dropping guild events and
+ * rejecting interactions for the whole verification window while its data sat
+ * intact in memory. Only when the drain is done does the swap happen, and the
+ * outgoing working set is silenced in the same breath - it carries a fence
+ * token identical to its successor's, so a surviving retry from it would
+ * overwrite live rows with no fence able to tell the two apart.
+ * A transfer fences the old primary read-only before all this, so writes
+ * accepted meanwhile exist only in that working set; flushing them at the old
+ * database would lose every one. Writes that cannot be carried are named.
+ * Returns whether the runtime actually changed.
+ */
+let recycleTarget: string | null = null;
+let recycleQueue: Promise<boolean> = Promise.resolve(false);
+
+/**
+ * Single-flight per target. The master re-delivers the same backend on EVERY
+ * register and the window below is long, so a flapping control socket would
+ * otherwise start a second swap over the first one's fresh working set and
+ * discard its writes with nothing left to name them. A genuinely different
+ * target queues behind the one in flight rather than racing it.
+ */
+function recyclePostgresRuntime(url: string, keepPrevious: boolean): Promise<boolean> {
+  if (recycleTarget === url) return recycleQueue;
+  recycleTarget = url;
+  recycleQueue = recycleQueue
+    .catch(() => false)
+    .then(() => runRecycle(url, keepPrevious))
+    .finally(() => { if (recycleTarget === url) recycleTarget = null; });
+  return recycleQueue;
+}
+
+async function runRecycle(url: string, keepPrevious: boolean): Promise<boolean> {
+  const oldReadiness = getDataReadiness();
+  const oldWs = getWorkingSet();
+  const oldBackend = getGuildDataBackend();
+  const incoming = new PostgresBackend({ url });
+  incoming.start();
+  let carried: string[] = [];
   try {
-    getDataReadiness()?.stop();
-    const ws = getWorkingSet();
-    if (ws) await ws.flushAllDirty();
-    await getGuildDataBackend()?.stop();
+    let verified = false;
+    for (let attempt = 0; attempt < DRAIN_VERIFY_ATTEMPTS && !verified; attempt++) {
+      try {
+        const identity = await verifyStoreIdentity(url);
+        if (!identity.ok) {
+          console.error(`[Data] The delivered database refused identity verification (${identity.reason}); staying on the current database`);
+          await incoming.stop().catch(() => { /* best effort */ });
+          return false;
+        }
+        verified = true;
+      } catch {
+        if (attempt + 1 < DRAIN_VERIFY_ATTEMPTS) await sleep(DRAIN_VERIFY_RETRY_MS);
+      }
+    }
+    if (!verified) {
+      console.error('[Data] The delivered database never answered the identity check; staying on the current database');
+      await incoming.stop().catch(() => { /* best effort */ });
+      return false;
+    }
+    if (oldWs) {
+      // A flush already on the wire has emptied its dirty set, so it is
+      // invisible to the drain until it comes back and re-dirties; waiting for
+      // it is what keeps those writes from vanishing between the two runtimes.
+      await oldWs.settleInFlight(DRAIN_SETTLE_MS);
+      const pending = oldWs.dirtyGuildIds();
+      if (pending.length > 0) {
+        const fencedBefore = oldWs.fencedRejectionCount();
+        oldWs.retargetBackend(incoming);
+        const leftover = await oldWs.flushAllDirty();
+        carried = leftover;
+        const discarded = oldWs.fencedRejectionCount() - fencedBefore;
+        if (discarded > 0) {
+          console.error(`[Data] ${discarded} of ${pending.length} draining guild(s) had their unflushed writes DISCARDED as fenced during the recycle (candidates: ${pending.join(', ')})`);
+        }
+        if (leftover.length > 0) {
+          console.error(`[Data] ${leftover.length} guild(s) could not drain into the new database and their writes are DROPPED: ${leftover.join(', ')}`);
+        }
+      }
+    }
   } catch (error) {
     console.warn('[Data] Error while recycling the postgres runtime:', error);
+    await incoming.stop().catch(() => { /* best effort */ });
+    return false;
   }
-  setGuildDataBackend(null);
-  activeUrl = null;
+  // Named once: anything flushAllDirty already reported is not repeated here.
+  const stranded = (oldWs?.dirtyGuildIds() ?? []).filter(g => !carried.includes(g));
+  if (stranded.length > 0) {
+    console.error(`[Data] ${stranded.length} guild(s) still hold writes the old runtime could not place and they are DROPPED at the swap: ${stranded.join(', ')}`);
+  }
+  oldReadiness?.stop();
+  oldWs?.quiesce();
+  void verifyIdentityLoop(url, installRuntime(url, incoming));
+  // NEVER awaited: pool.end() waits for checked-out clients, and a connection
+  // hung against a partitioned host would hold this result back for as long as
+  // the OS takes to give up - with the swap already complete, that would strand
+  // the caller before it re-mirrors the lease and leave the node serving
+  // nothing. A superseded master keeps its pool either way: its control store
+  // shares it and it restarts in seconds.
+  if (!keepPrevious && oldBackend) void oldBackend.stop().catch(() => { /* best effort */ });
+  return true;
 }
 
 async function verifyIdentityLoop(url: string, driver: DataReadinessDriver): Promise<void> {

@@ -212,6 +212,15 @@ export class LeaseRuntime {
     await this.stopSessions('lease expired');
   }
 
+  /**
+   * A recycled data runtime starts with a fresh readiness driver that knows no
+   * shards; re-mirroring the held lease is what lets it hydrate again without
+   * waiting for the next grant.
+   */
+  renotifyDataLayer(): void {
+    this.notifyDataLayer();
+  }
+
   /** Mirror the held lease into the data layer (constructed only in postgres mode). */
   private notifyDataLayer(): void {
     const readiness = getDataReadiness();

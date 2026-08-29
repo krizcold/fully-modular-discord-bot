@@ -25,6 +25,7 @@ initLogCapture();
 
 import 'dotenv/config';
 import { BotManager } from './webui/botManager';
+import { resumePromote } from './webui/promoteEngine';
 import { startWebUI, flushBeforeExit } from './webui';
 import { ensureConfigPopulated } from './bot/internalSetup/utils/configManager';
 import { getSafetyManager } from './utils/updateSafety';
@@ -90,6 +91,11 @@ async function main() {
         console.error(`[Main] [Error] Bot failed to start: ${result.error}`);
       }
     }
+    // A promote interrupted by a parent restart resumes at its recorded phase
+    // (B4). AFTER the ordinary start, and never in safe mode: its restart phase
+    // forks the bot child, which would both defeat the crash guard and steal
+    // this boot's health validation.
+    void resumePromote(botManager);
   }
 
   console.log('='.repeat(60));
