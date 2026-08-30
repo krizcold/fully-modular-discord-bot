@@ -12,7 +12,7 @@ import crypto from 'crypto';
 import { Router, Request, Response, NextFunction } from 'express';
 import { BotManager } from '../botManager';
 import { readPromoteRecord } from '../../bot/internalSetup/fleet/promoteRecord';
-import { readCopyBlock, readSuperseded, writeFreshFleetConfirm } from '../../bot/internalSetup/fleet/stepDown';
+import { clearCopyBlock, readCopyBlock, readSuperseded, writeCopyBlock, writeFreshFleetConfirm } from '../../bot/internalSetup/fleet/stepDown';
 import { runDemote } from '../lifecycleActions';
 import { cancelPromote, continuePromote, startPromote } from '../promoteEngine';
 
@@ -70,6 +70,7 @@ export function createManagedRoutes(botManager: BotManager): Router {
         nodeName: state?.nodeName ?? null,
         term: state?.term ?? null,
         standalone: state?.standalone === true,
+        backupMaster: state?.backupMaster === true,
         superseded: readSuperseded(),
         promote: readPromoteRecord(),
         emptyStoreHold: state?.emptyStoreHold ?? null,
@@ -120,6 +121,37 @@ export function createManagedRoutes(botManager: BotManager): Router {
   /** POST /api/managed/demote { confirm? } */
   router.post('/demote', async (req: Request, res: Response) => {
     res.json(await runDemote(botManager, req.body?.confirm === true, 'manager-demote'));
+  });
+
+  /**
+   * POST /api/managed/copy-block { dsn, cert }
+   * The manager hands this node the replication copy block for the database it
+   * hosts, so the bot can relay it to designated backups on register (20.14).
+   * Only the manager can produce it: the replicator password and the server
+   * certificate live in the sidecar the manager owns, never in the bot.
+   */
+  router.post('/copy-block', (req: Request, res: Response) => {
+    try {
+      // clear:true retracts it, for when the database it describes is gone.
+      // Relaying a block to a deleted database would point a backup at nothing.
+      if (req.body?.clear === true) {
+        clearCopyBlock();
+        console.log('[Managed] Copy block retracted by the manager');
+        res.json({ success: true });
+        return;
+      }
+      const dsn = String(req.body?.dsn ?? '').trim();
+      const cert = String(req.body?.cert ?? '').trim();
+      if (!dsn || !cert) {
+        res.json({ success: false, error: 'dsn and cert are both required' });
+        return;
+      }
+      writeCopyBlock({ dsn, cert, publishedAt: Date.now() });
+      console.log('[Managed] Copy block published by the manager; designated backups get it on register');
+      res.json({ success: true });
+    } catch (error) {
+      res.json({ success: false, error: error instanceof Error ? error.message : 'copy block write failed' });
+    }
   });
 
   /** POST /api/managed/confirm-fresh: release the empty-store boot hold (20.14). */

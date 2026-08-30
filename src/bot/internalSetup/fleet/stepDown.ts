@@ -63,6 +63,11 @@ export function writeCopyBlock(block: CopyBlock): void {
   atomicWriteFileSync(copyBlockFile(), JSON.stringify(block, null, 2));
 }
 
+/** Drop the block when the database it describes is gone, so nothing relays it. */
+export function clearCopyBlock(): void {
+  try { fs.unlinkSync(copyBlockFile()); } catch { /* already absent */ }
+}
+
 /** Operator confirmation that an empty master store is a brand-new fleet (exits the 20.14 boot hold). */
 /**
  * File-only by design: the confirmation answers ONE empty store and is consumed
