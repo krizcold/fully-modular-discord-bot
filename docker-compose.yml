@@ -64,6 +64,7 @@ services:
       TZ: $TZ
     labels:
       fleet.control-port: "3928"  # manager detects this to expose the control endpoint and inject CONTROL_PORT/role/etc
+      fleet.transfer-port: "3929"  # manager detects this to expose the transfer endpoint and inject TRANSFER_PORT
     volumes:
       - type: bind
         source: $DATA_ROOT/AppData/fullymodulardiscordbot/custom

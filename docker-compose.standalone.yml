@@ -9,6 +9,7 @@ services:
     restart: unless-stopped
     labels:
       fleet.control-port: "3928"  # only meaningful under the Bot Manager; harmless here
+      fleet.transfer-port: "3929"  # only meaningful under the Bot Manager; harmless here
     ports:
       # Localhost only by default. To expose on the LAN use "8080:8080".
       - "127.0.0.1:8080:8080"

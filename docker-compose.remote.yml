@@ -22,6 +22,7 @@ services:
     restart: unless-stopped
     labels:
       fleet.control-port: "3928"  # only meaningful under the Bot Manager; harmless here
+      fleet.transfer-port: "3929"  # only meaningful under the Bot Manager; harmless here
       # Reachable only through Caddy (no host port published). Caddy serves it at
       # PUBLIC_HOST over TLS and forwards every request through Authelia first;
       # /guild and /auth are bypass rules in authelia/configuration.yml.
