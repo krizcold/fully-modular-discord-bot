@@ -29,7 +29,7 @@ services:
       # a master and needs none of these. Set them only to run more than one
       # instance sharing the same token.
       # BOT_NODE_ROLE: co-worker         # master (default) or co-worker
-      # MASTER_URL: ws://master-host:3928  # co-worker only: the master's control URL
+      # MASTER_URLS: ws://master-host:3928  # co-worker only: master candidates (ordered, comma-separated)
       # CONTROL_SECRET: ${CONTROL_SECRET:-}  # shared secret; required on both master and worker
       # FLEET_SHARD_COUNT: ${FLEET_SHARD_COUNT:-}  # override the auto-derived shard count
       # PIN_TEST_GUILD_SHARD: ${PIN_TEST_GUILD_SHARD:-}  # keep the test guild's shard on the master

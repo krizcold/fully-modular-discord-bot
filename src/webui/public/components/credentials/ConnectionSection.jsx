@@ -25,9 +25,7 @@ function ConnectionSection({ setupStatus, isBotRunning, onUpdate, onUpdateAndRes
     const loaded = {
       ...EMPTY_FIELDS,
       // Secrets never come back from the server; non-secrets show current values.
-      // MASTER_URLS falls back to a legacy MASTER_URL so the single candidates
-      // field always shows what this node actually dials.
-      MASTER_URLS: connection.MASTER_URLS || connection.MASTER_URL || '',
+      MASTER_URLS: connection.MASTER_URLS || '',
       NODE_NAME: connection.NODE_NAME || '',
       FLEET_SHARD_CAPACITY: connection.FLEET_SHARD_CAPACITY || '',
       BOT_NODE_ROLE: connection.BACKUP_MASTER === '1' ? 'backup-master' : 'co-worker',
@@ -153,7 +151,7 @@ function ConnectionSection({ setupStatus, isBotRunning, onUpdate, onUpdateAndRes
 
             <div className="form-group">
               <label>
-                <StatusIndicator isSet={!!((connection.MASTER_URLS && connection.MASTER_URLS !== '') || (connection.MASTER_URL && connection.MASTER_URL !== ''))} />
+                <StatusIndicator isSet={!!(connection.MASTER_URLS && connection.MASTER_URLS !== '')} />
                 Master Candidates
               </label>
               <input

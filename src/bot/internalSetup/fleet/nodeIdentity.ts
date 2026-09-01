@@ -105,10 +105,8 @@ export function resolveEnvRole(): NodeRole {
   // backup-master is a designated co-worker: protocol role co-worker, backup
   // designation carried separately (isBackupMaster).
   if (explicit === 'co-worker' || explicit === 'backup-master') return 'co-worker';
-  // Only the legacy single MASTER_URL infers co-worker. MASTER_URLS is the
-  // fleet-wide candidate list carried by EVERY node, the master included, so
-  // it can never imply a role; nodes using it must set BOT_NODE_ROLE.
-  if ((process.env.MASTER_URL || '').trim() !== '') return 'co-worker';
+  // Absent means master. Nothing else ever implies a role: MASTER_URLS is the
+  // fleet-wide candidate list carried by EVERY node, the master included.
   return 'master';
 }
 
@@ -123,10 +121,9 @@ export function isStandalone(): boolean {
 }
 
 /**
- * Master candidate list (PLAN_STANDBY 3.4): MASTER_URLS (ordered,
- * comma-separated) with MASTER_URL as the single-entry fallback. A candidate
- * equal to this node's own advertised control route is skipped so a promoted
- * or demoted node never dials itself.
+ * Master candidate list (PLAN_STANDBY 3.4): MASTER_URLS, ordered and
+ * comma-separated. A candidate equal to this node's own advertised control
+ * route is skipped so a promoted or demoted node never dials itself.
  */
 export function resolveMasterUrls(): string[] {
   return stripSelfUrl(rawMasterUrls());
@@ -142,7 +139,7 @@ export function rawMasterUrls(): string[] {
   const raw = (process.env.MASTER_URLS || '').trim();
   const list = raw !== ''
     ? raw.split(',').map(s => s.trim()).filter(s => s !== '')
-    : [(process.env.MASTER_URL || '').trim()].filter(s => s !== '');
+    : [];
   const seen = new Set<string>();
   const urls: string[] = [];
   for (const url of list) {
@@ -165,10 +162,9 @@ function normalizeUrl(url: string): string {
   return url.replace(/\/+$/, '').toLowerCase();
 }
 
-/** True when this co-worker is the designated backup master (BOT_NODE_ROLE=backup-master, or the low-level FLEET_BACKUP_MASTER=1 flag). */
+/** True when this co-worker is the designated backup master (BOT_NODE_ROLE=backup-master). */
 export function isBackupMaster(): boolean {
-  return (process.env.BOT_NODE_ROLE || '').trim().toLowerCase() === 'backup-master'
-    || (process.env.FLEET_BACKUP_MASTER || '').trim() === '1';
+  return (process.env.BOT_NODE_ROLE || '').trim().toLowerCase() === 'backup-master';
 }
 
 export function getNodeName(): string {

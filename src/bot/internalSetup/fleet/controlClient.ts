@@ -1,4 +1,4 @@
-// Co-worker dial-out control channel: connects to MASTER_URL, registers,
+// Co-worker dial-out control channel: dials the master candidates, registers,
 // receives leases, heartbeats, reconnects with backoff, idles without a
 // master. Also holds the worker's lease clock: any inbound master frame
 // renews it; silence past LEASE_TTL_MS expires the lease (local-monotonic,

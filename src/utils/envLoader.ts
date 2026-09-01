@@ -24,14 +24,10 @@ export interface BotCredentials {
   GUILD_ID?: string;
   MAIN_GUILD_ID?: string;
   // Fleet / sharding control plane (Phase 1). Resolved in the bot child:
-  // explicit BOT_NODE_ROLE wins; else MASTER_URL present = co-worker; else
-  // standalone master.
+  // explicit BOT_NODE_ROLE wins; absent means master.
   BOT_NODE_ROLE?: string;
-  MASTER_URL?: string;
-  /** Ordered comma-separated master candidate list (PLAN_STANDBY 3.4); MASTER_URL is the single-entry fallback. */
+  /** Ordered comma-separated master candidate list (PLAN_STANDBY 3.4). */
   MASTER_URLS?: string;
-  /** '1' designates this co-worker as the backup master (promote surface). */
-  FLEET_BACKUP_MASTER?: string;
   CONTROL_SECRET?: string;
   CONTROL_PORT?: string;
   FLEET_PUBLIC_URL?: string;
@@ -116,9 +112,7 @@ export function loadCredentials(): BotCredentials {
     MAIN_GUILD_ID: process.env.MAIN_GUILD_ID,
     // Fleet fields (flow to the bot child via the botManager env spread)
     BOT_NODE_ROLE: process.env.BOT_NODE_ROLE,
-    MASTER_URL: process.env.MASTER_URL,
     MASTER_URLS: process.env.MASTER_URLS,
-    FLEET_BACKUP_MASTER: process.env.FLEET_BACKUP_MASTER,
     CONTROL_SECRET: process.env.CONTROL_SECRET,
     CONTROL_PORT: process.env.CONTROL_PORT,
     FLEET_PUBLIC_URL: process.env.FLEET_PUBLIC_URL,

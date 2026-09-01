@@ -2791,7 +2791,7 @@ async function initCoWorker(init: CommonInit): Promise<FleetContext> {
       })();
     });
   } else {
-    console.error('[Fleet] Co-worker requires MASTER_URLS (or MASTER_URL) and CONTROL_SECRET; idling without a master');
+    console.error('[Fleet] Co-worker requires MASTER_URLS and CONTROL_SECRET; idling without a master');
   }
 
   let witness: FleetWitness | null = null;

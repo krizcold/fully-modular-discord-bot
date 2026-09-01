@@ -20,14 +20,14 @@ import { isBackupMaster, isStandalone as isStandaloneFleet, resolveNodeRole } fr
 import { isCoWorkerNode } from '../middleware/fleetGate';
 
 /** The only fields a co-worker edits locally; everything else mirrors the master via sync. */
-const CONNECTION_FIELDS = ['DISCORD_TOKEN', 'MASTER_URL', 'MASTER_URLS', 'CONTROL_SECRET', 'NODE_NAME', 'FLEET_SHARD_CAPACITY', 'FLEET_BACKUP_MASTER'] as const;
+const CONNECTION_FIELDS = ['DISCORD_TOKEN', 'MASTER_URLS', 'CONTROL_SECRET', 'NODE_NAME', 'FLEET_SHARD_CAPACITY'] as const;
 
 /**
  * Non-secret standby fields where a blanked form field is an EXPLICIT clear
  * (a designation must be revocable from the UI). Every other connection
  * field keeps the historical blank-keeps-existing semantics.
  */
-const CLEARABLE_CONNECTION_FIELDS = new Set<string>(['MASTER_URLS', 'FLEET_BACKUP_MASTER']);
+const CLEARABLE_CONNECTION_FIELDS = new Set<string>(['MASTER_URLS']);
 
 /**
  * Fleet wiring the master-branch credentials save must PRESERVE verbatim: it
@@ -37,9 +37,9 @@ const CLEARABLE_CONNECTION_FIELDS = new Set<string>(['MASTER_URLS', 'FLEET_BACKU
  * master claiming every shard on the shared token after its next restart.
  */
 const PRESERVED_FLEET_FIELDS = [
-  'BOT_NODE_ROLE', 'MASTER_URL', 'MASTER_URLS', 'CONTROL_SECRET', 'CONTROL_PORT', 'FLEET_PUBLIC_URL',
+  'BOT_NODE_ROLE', 'MASTER_URLS', 'CONTROL_SECRET', 'CONTROL_PORT', 'FLEET_PUBLIC_URL',
   'NODE_NAME', 'PIN_TEST_GUILD_SHARD', 'FLEET_SHARD_COUNT', 'FLEET_SHARD_CAPACITY',
-  'FLEET_BACKUP_MASTER', 'TRANSFER_URL', 'TRANSFER_PORT',
+  'TRANSFER_URL', 'TRANSFER_PORT',
 ] as const;
 
 const OAUTH_FIELDS = ['ENABLE_GUILD_WEBUI', 'DISCORD_CLIENT_ID', 'DISCORD_CLIENT_SECRET', 'OAUTH_CALLBACK_URL'] as const;
@@ -119,16 +119,15 @@ export function createSetupRoutes(): Router {
         // Optional settings status
         credentials: status,
         guildIds: guildIds,
-        // Co-worker Connection page values (MASTER_URL/NODE_NAME/capacity are
+        // Co-worker Connection page values (MASTER_URLS/NODE_NAME/capacity are
         // not secrets; token and secret report set/unset only)
         ...(nodeRole === 'co-worker' ? {
           connection: {
-            MASTER_URL: credentials.MASTER_URL || '',
             MASTER_URLS: credentials.MASTER_URLS || '',
             NODE_NAME: credentials.NODE_NAME || '',
             FLEET_SHARD_CAPACITY: credentials.FLEET_SHARD_CAPACITY || '',
-            // Effective designation: BOT_NODE_ROLE=backup-master or the
-            // legacy flag. The page edits the ROLE; the flag is never shown.
+            // Effective designation: BOT_NODE_ROLE=backup-master. The page
+            // edits the ROLE.
             BACKUP_MASTER: isBackupMaster() ? '1' : '',
             // This node's own advertised endpoint (empty when the platform
             // never injected one): a backup master shows it so its URL can be
@@ -179,16 +178,15 @@ export function createSetupRoutes(): Router {
         }
         // The backup designation IS the role here: this page offers the two
         // worker roles only (promotion to master goes through the Fleet tab's
-        // Promote button), and a saved role retires the legacy flag.
+        // Promote button).
         const requestedRole = String(req.body?.BOT_NODE_ROLE ?? '').trim().toLowerCase();
         if (requestedRole === 'co-worker' || requestedRole === 'backup-master') {
           credentials.BOT_NODE_ROLE = requestedRole;
-          delete credentials.FLEET_BACKUP_MASTER;
         }
         // MASTER_URLS never implies a role (it is carried by masters too), so
         // pin the explicit role this page exclusively serves: without it, a
-        // node configured via MASTER_URLS that later drops its legacy
-        // MASTER_URL would silently boot as a master.
+        // MASTER_URLS-only node would silently boot as a master (absent
+        // means master).
         if ((credentials.MASTER_URLS || '').trim() !== ''
             && (credentials.BOT_NODE_ROLE || '').trim() === '') {
           credentials.BOT_NODE_ROLE = 'co-worker';

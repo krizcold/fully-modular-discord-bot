@@ -116,7 +116,7 @@ export interface FleetState {
   superseded: SupersededView | null;
   /** Operator role override in force (promotion/demotion); null when the role comes from env. */
   roleOverride: { role: NodeRole; setBy: string; setAt: number } | null;
-  /** This node is the designated backup master (FLEET_BACKUP_MASTER=1). */
+  /** This node is the designated backup master (BOT_NODE_ROLE=backup-master). */
   backupMaster: boolean;
   /** A manager-provisioned standby of the fleet database lives on this machine; promotion takes the pair. */
   dbReplica: boolean;

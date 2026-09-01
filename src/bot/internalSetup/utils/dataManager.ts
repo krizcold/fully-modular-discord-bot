@@ -214,8 +214,7 @@ export async function sweepGraveyard(): Promise<void> {
   await sweepFileGraveyard();
   if (!pgBackend || routeFor('0') !== 'postgres') return;
   const explicitRole = (process.env.BOT_NODE_ROLE || '').trim().toLowerCase();
-  const isCoWorker = explicitRole === 'co-worker' || explicitRole === 'backup-master'
-    || (explicitRole !== 'master' && (process.env.MASTER_URL || '').trim() !== '');
+  const isCoWorker = explicitRole === 'co-worker' || explicitRole === 'backup-master';
   if (isCoWorker) return;
   const url = loadCredentials().DATA_BACKEND_URL;
   if (!url) return;
@@ -308,8 +307,7 @@ let cachedFleetEnv: boolean | null = null;
 function hasFleetEnv(): boolean {
   if (cachedFleetEnv === null) {
     const explicitRole = (process.env.BOT_NODE_ROLE || '').trim().toLowerCase();
-    const isCoWorker = explicitRole === 'co-worker' || explicitRole === 'backup-master'
-      || (explicitRole !== 'master' && (process.env.MASTER_URL || '').trim() !== '');
+    const isCoWorker = explicitRole === 'co-worker' || explicitRole === 'backup-master';
     const isStandalone = !isCoWorker && (process.env.CONTROL_SECRET || '').trim() === '';
     cachedFleetEnv = !isStandalone;
   }

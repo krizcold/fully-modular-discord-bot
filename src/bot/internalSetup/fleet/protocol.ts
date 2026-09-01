@@ -110,7 +110,7 @@ export interface NodeCapabilities {
   dataBackend: 'file' | 'postgres' | 'unknown';
   /** Advertised transfer endpoint (ws://host:port) when TRANSFER_URL is set; direction-by-reachability uses it. */
   transferUrl?: string;
-  /** Designated backup master (FLEET_BACKUP_MASTER=1); badges the fleet view and gates the promote surface. */
+  /** Designated backup master (BOT_NODE_ROLE=backup-master); badges the fleet view and gates the promote surface. */
   backupMaster?: boolean;
 }
 
