@@ -503,8 +503,8 @@ async function runStaleMasterFence(
     }
   }
   const localTerm = local ? local.term : 0;
-  const park = (observedTerm: number, peerUrl: string, detail: string): Promise<never> => {
-    console.error(`[Fleet] STALE MASTER FENCE: ${detail}; parking the boot instead of acquiring a term on a database the fleet has moved off. Demote this node to rejoin as a co-worker.`);
+  const park = (observedTerm: number, peerUrl: string, detail: string, extra = ''): Promise<never> => {
+    console.error(`[Fleet] STALE MASTER FENCE: ${detail}; parking the boot instead of acquiring a term on a database the fleet has moved off. Demote this node to rejoin as a co-worker.${extra}`);
     _setStaleMasterPark({ observedTerm, localTerm, peerUrl, at: Date.now() });
     pushFleetStatusNow();
     return (async () => { for (;;) await guardSleep(TERM_GUARD_POLL_MS); })();
@@ -539,7 +539,11 @@ async function runStaleMasterFence(
     const claims = await witness.readClaims();
     const higher = claims ? higherTermClaim(claims, selfNodeId, localTerm) : null;
     if (higher) {
-      await park(higher.term, `witness beacon of ${higher.nodeName}`, `the witness holds a beacon from ${higher.nodeName} (${higher.nodeId.slice(0, 8)}) at term ${higher.term} while this node's store holds ${localTerm}`);
+      // The restore tail belongs to THIS half only: the peer half means a
+      // foreign master is answering LIVE right now, where the same advice
+      // would talk an operator into a dual-master seize.
+      await park(higher.term, `witness beacon of ${higher.nodeName}`, `the witness holds a beacon from ${higher.nodeName} (${higher.nodeId.slice(0, 8)}) at term ${higher.term} while this node's store holds ${localTerm}`,
+        ' If this database was DELIBERATELY restored from a dump, the fleet has not moved anywhere: the manager\'s restore lane advances the restored control term automatically, and FLEET_CONFIRM_TAKEOVER=1 on the next start overrides the fence by hand.');
     }
   }
 }
