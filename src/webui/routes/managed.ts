@@ -76,6 +76,10 @@ export function createManagedRoutes(botManager: BotManager): Router {
         emptyStoreHold: state?.emptyStoreHold ?? null,
         takeoverHold: state?.takeoverHold ?? null,
         staleMasterPark: state?.staleMasterPark ?? null,
+        // Only an initialized master relays the block to designated backups
+        // (20.14); the manager keys its publishes on this verdict instead of
+        // interpreting this app's role vocabulary.
+        copyBlockTarget: state?.initialized === true && state?.role === 'master',
         copyBlock,
       });
     } catch (error) {
