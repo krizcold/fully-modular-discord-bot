@@ -25,7 +25,7 @@ import {
   TERM_TAKEOVER_STALE_MS,
   XFER_COMMIT_RETRY_MS,
 } from './constants';
-import { DataBackendInfo, FleetConfigPayload, HeartbeatPayload, LeaseGrantPayload, LeaseInfo, LeaseRenewedPayload, LeaseRevokePayload, MSG, NodeCapabilities, NodeDrainPayload, NodeRole, RegisterPayload, RegisterResult } from './protocol';
+import { DataBackendInfo, FleetConfigPayload, HeartbeatPayload, LeaseGrantPayload, LeaseInfo, LeaseRenewedPayload, LeaseRevokePayload, MSG, NodeCapabilities, NodeDrainPayload, NodeRole, RegisterPayload, RegisterResult, SlotStatusPayload } from './protocol';
 import {
   clearRoleOverride,
   consumeTakeoverFlags,
@@ -62,7 +62,7 @@ import {
   resolveShardCount,
 } from './placement';
 import { evaluateRecovery } from './recovery';
-import { _setControlStoreFenced, _setEmptyStoreHold, _setFleetStateSources, _setStaleMasterPark, _setSuperseded, _setTakeoverHold, FleetRecoverySource, FleetRefusedRegistration, getFleetState } from './state';
+import { _setControlStoreFenced, _setEmptyStoreHold, _setFleetStateSources, _setSlotStatus, _setStaleMasterPark, _setSuperseded, _setTakeoverHold, FleetRecoverySource, FleetRefusedRegistration, getFleetState } from './state';
 import type { MigrationView, PinViolationView } from './state';
 import { serveSyncRequest, SyncAuthority } from './syncAuthority';
 import { SyncEngine } from './syncEngine';
@@ -85,6 +85,9 @@ import { TransformationCoordinator } from './transformation/transformationCoordi
 import { TransformationExecutor } from './transformation/transformationExecutor';
 import type { ControlStore, PersistedFleetConfig, PersistedTerm, TransformDirection } from './controlStore';
 import { effectiveFleetConfigView, effectiveMasterUrls, readFleetConfigCache, validateMasterCandidates, validateWitnessChannelId, writeFleetConfigCache } from './fleetConfig';
+import { getLocalReplicaIdentity, getReplicaHealth, getSlotSample, setReplicaProbeListener } from './replicaHealth';
+import { hasDbReplica } from './replicaPromotion';
+import { clearSlotStatus, readSlotStatus, recordFromPush, sourceMatchesAny, writeSlotStatus } from './slotStatus';
 import { DiscordWitness, FleetWitness, startWitnessLoop, WitnessStatus } from './witness';
 import { probePeerTerm } from './peerTermProbe';
 import { probeStoreEmpty } from './emptyStore';
@@ -646,6 +649,10 @@ function guardSleep(ms: number): Promise<void> {
 }
 
 async function initMaster(init: CommonInit & { standalone: boolean }): Promise<FleetContext> {
+  // A master follows no slot: a record left by this node's co-worker past must
+  // not keep answering the manager's facts hook.
+  clearSlotStatus();
+  _setSlotStatus(null);
   const { standalone, nodeId, nodeName, appVersion, capabilities, runtime } = init;
   const ingest = getIngestService();
   const usedFreshConfirm = await runEmptyStoreHold(standalone, nodeId);
@@ -2515,9 +2522,27 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     }
   }
 
+  // Slot signal (20.17): each fresh read of the primary's slot table goes to
+  // every connected node that reports a local standby. wal_status lives only
+  // on the primary, and a standby cannot tell a lost slot from an offline
+  // primary on its own. Fire-and-forget like the config push: the next sample
+  // re-delivers, and the receiver judges freshness itself.
+  let pushedSlotSampleAt = 0;
+  const pushSlotStatus = (): void => {
+    const sample = getSlotSample();
+    if (!sample || sample.observedAt === pushedSlotSampleAt) return;
+    pushedSlotSampleAt = sample.observedAt;
+    const payload: SlotStatusPayload = { observedAt: sample.observedAt, nodeId, term: registry.term, slots: sample.slots };
+    for (const node of registry.nodes.values()) {
+      if (node.isSelf || !node.connected || !node.dbReplica) continue;
+      void server?.request(node.nodeId, MSG.SLOT_STATUS, payload).catch(() => { /* re-delivered on the next sample */ });
+    }
+  };
+
   const selfHeartbeat = setInterval(() => {
     registry.recordHeartbeat(nodeId, runtime.buildHeartbeat(registry.term));
     healthMonitor?.tick();
+    pushSlotStatus();
     // Witness consumer (20.6): a FRESH beacon with a higher term from another
     // node means a newer master is up, whether or not this node's own store
     // could tell it (a dead store never fences). Begin or finish the step-down.
@@ -2644,6 +2669,37 @@ async function initCoWorker(init: CommonInit): Promise<FleetContext> {
   if (priorSupersession) {
     _setSuperseded({ byNodeId: priorSupersession.byNodeId, byNodeName: priorSupersession.byNodeName, term: priorSupersession.term, source: priorSupersession.source, since: priorSupersession.at, steppedDown: true });
   }
+  // The recorded slot status carries over a restart like the superseded fact
+  // (the manager reads the file either way); a node whose standby is gone drops
+  // it so no stale verdict outlives the copy it described.
+  if (hasDbReplica()) {
+    _setSlotStatus(readSlotStatus());
+  } else {
+    clearSlotStatus();
+  }
+  // The standby's own probe outranks a stale relay: a receiver that is
+  // streaming proves the slot is not lost or gone (a re-seeded copy behind a
+  // record from before the re-seed), and a copy out of recovery follows no
+  // slot at all (promoted). Either way the record describes a copy that no
+  // longer exists, so it is dropped rather than left to age out.
+  // One streaming reading is not enough: against a lost slot the walreceiver
+  // shows "streaming" for the length of a handshake on every 5 s retry, and a
+  // probe can land in it. Two probes a minute apart cannot both.
+  let streamingProbes = 0;
+  setReplicaProbeListener(report => {
+    if (report.error) { streamingProbes = 0; return; }
+    const record = readSlotStatus();
+    // Counted only against a recorded lost or absent slot, so the streak from
+    // the hours of healthy streaming before the loss is never inherited.
+    const questioned = record !== null && (record.walStatus === 'lost' || record.walStatus === 'absent');
+    streamingProbes = report.streaming && questioned ? streamingProbes + 1 : 0;
+    if (!record) return;
+    const contradicted = !report.inRecovery || (questioned && streamingProbes >= 2);
+    if (!contradicted) return;
+    clearSlotStatus();
+    _setSlotStatus(null);
+    pushFleetStatusNow();
+  });
 
   let controlClient: ControlClient | null = null;
   let syncEngine: SyncEngine | null = null;
@@ -2711,6 +2767,26 @@ async function initCoWorker(init: CommonInit): Promise<FleetContext> {
         if (info.retireRequested) console.warn(`[Fleet] The owner asked to retire this side after the transfer to ${info.byNodeName}; the manager performs it`);
       },
       onCopyBlock: block => writeCopyBlock(block),
+      onSlotStatus: payload => {
+        // Only this node's own slot is recorded, judged by primary_slot_name
+        // from the standby itself, and "my source is this master" by the
+        // database endpoint this master delivered: the manager then acts on
+        // a verdict, never on a slot name or URL of its own reading.
+        const identity = getLocalReplicaIdentity();
+        if (!identity?.slotName) return;
+        // A copy out of recovery (promoted) follows no slot; a probe that
+        // errored leaves the question open and the previous record ages out.
+        const health = getReplicaHealth();
+        if (health && !health.error && !health.inRecovery) return;
+        const creds = loadCredentials();
+        const delivered = [creds.DATA_BACKEND_URL, creds.DATA_BACKEND_PUBLIC_URL, creds.DATA_BACKEND_LOCAL_URL]
+          .map(url => (url || '').trim())
+          .filter(url => url !== '');
+        const record = recordFromPush(payload, identity.slotName, identity.sourceHost ? sourceMatchesAny(identity, delivered) : null);
+        writeSlotStatus(record);
+        _setSlotStatus(record);
+        pushFleetStatusNow();
+      },
       onXferControl: (type, data) => executor!.handle(type, data),
       onTransformControl: (type, data) => transformExecutor.handle(type, data),
       onDataRoutes: async (_transformationId, routes, url, publicUrl) => {

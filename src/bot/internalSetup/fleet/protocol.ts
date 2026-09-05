@@ -71,6 +71,8 @@ export const MSG = {
   TERM_PROBE: 'control:term:probe',
   /** Master -> node push of the fleet runtime config (B2); ack is a receipt. Also delivered in every register reply. */
   CONFIG_UPDATE: 'control:config:update',
+  /** Master -> standby-hosting node push of the primary's replication slot table (20.17 slot signal); ack is a receipt. */
+  SLOT_STATUS: 'control:slot:status',
   /**
    * New master -> superseded master (B4): "I hold a higher term, step down".
    * Answered ahead of the not-registered gate like TERM_PROBE (the sender
@@ -257,6 +259,24 @@ export interface ReplicaHealthReport {
   replayAgeMs: number | null;
   /** Set when the standby could not be probed at all (stopped, mid-reseed). */
   error?: string;
+}
+
+/** One physical replication slot on the primary, as the master's bot reads it (20.17 slot signal). */
+export interface SlotStatusRow {
+  slotName: string;
+  active: boolean;
+  /** pg_replication_slots.wal_status: reserved | extended | unreserved | lost. */
+  walStatus: string;
+  /** WAL the slot retains on the primary; null when it has no restart position. */
+  retainedBytes: number | null;
+}
+
+/** SLOT_STATUS payload: the primary's slot table at one read, from the master that read it. */
+export interface SlotStatusPayload {
+  observedAt: number;
+  nodeId: string;
+  term: number;
+  slots: SlotStatusRow[];
 }
 
 export interface HeartbeatPayload {

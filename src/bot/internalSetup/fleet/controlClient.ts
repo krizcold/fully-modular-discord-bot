@@ -30,7 +30,7 @@ import {
   SyncStatePayload,
 } from './protocol';
 import type { LeaseRuntime } from './leaseRuntime';
-import type { CopyBlock, SupersededInfo } from './protocol';
+import type { CopyBlock, SlotStatusPayload, SupersededInfo } from './protocol';
 
 export interface ControlClientOptions {
   /** Ordered master candidate list (PLAN_STANDBY 3.4); cycled on reconnect, never empty. */
@@ -52,6 +52,8 @@ export interface ControlClientOptions {
   onSuperseded?: (info: SupersededInfo) => void;
   /** Copy block relayed to designated backups in the register reply (B4). */
   onCopyBlock?: (block: CopyBlock) => void;
+  /** The primary's slot table, pushed by the master to nodes hosting a standby (20.17 slot signal). */
+  onSlotStatus?: (payload: SlotStatusPayload) => void;
   /** Webui data hop from the master (DATA_WRITE/DATA_READ); returns the reply payload. */
   onDataOp?: (type: string, data: any) => Promise<any>;
   /** Backend transformation control (TRANSFORM_GUILD/BACKEND_FLIP) -> executor; returns the ack payload. */
@@ -307,6 +309,14 @@ export class ControlClient {
         this.replyAck(requestId, { ok: true, term: this.term });
         try { this.opts.onFleetConfig?.(data as FleetConfigPayload); }
         catch (error) { console.warn('[Fleet] Failed to apply a pushed fleet config:', error instanceof Error ? error.message : error); }
+        break;
+      }
+      case MSG.SLOT_STATUS: {
+        // Ack first (receipt); a failed record write must never take the bot
+        // down, and the next sample re-delivers the table anyway.
+        this.replyAck(requestId, { ok: true, term: this.term });
+        try { this.opts.onSlotStatus?.(data as SlotStatusPayload); }
+        catch (error) { console.warn('[Fleet] Failed to record a pushed slot status:', error instanceof Error ? error.message : error); }
         break;
       }
       case MSG.SYNC_STATE: {

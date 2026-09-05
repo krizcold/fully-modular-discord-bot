@@ -768,7 +768,7 @@ function FleetSyncCard({ sync }) {
   );
 }
 
-function FleetNodeCard({ node, isMasterView, onAction, masterSyncRevision, retireControl, dataBackend }) {
+function FleetNodeCard({ node, isMasterView, onAction, masterSyncRevision, retireControl, dataBackend, standbySlot }) {
   const [busy, setBusy] = React.useState(false);
   const [waiting, setWaiting] = React.useState(false);
   const healthColor = FLEET_HEALTH_COLORS[node.health] || '#888';
@@ -902,6 +902,22 @@ function FleetNodeCard({ node, isMasterView, onAction, masterSyncRevision, retir
         </div>
       ) : null}
       {node.dbReplica ? <FleetReplicaLine replica={node.dbReplica} /> : null}
+      {standbySlot ? <FleetSlotLine slot={standbySlot} /> : null}
+    </div>
+  );
+}
+
+// The primary's word on this node's standby slot, relayed by the master
+// (20.17). A lost slot is the one state the copy cannot recover from on its
+// own, so it is stated in red rather than left to a missing green line.
+function FleetSlotLine({ slot }) {
+  const age = slot.receivedAt ? ` · ${fleetFormatAge(Date.now() - slot.receivedAt)}` : '';
+  const source = slot.sourceIsCurrentMaster === true ? '' : slot.sourceIsCurrentMaster === false ? ' (not from the current master)' : ' (source unknown)';
+  const bad = slot.walStatus === 'lost' || slot.walStatus === 'absent';
+  const warn = slot.walStatus === 'unreserved';
+  return (
+    <div className="usage-stat-sub" style={{ color: bad ? '#e5534b' : warn ? '#d29922' : undefined }}>
+      Primary slot {slot.slotName}: {slot.walStatus}{source}{age}
     </div>
   );
 }
@@ -1400,7 +1416,7 @@ function FleetView({ api, wsClient, guildNames }) {
 
         {selfNode ? (
           <div className="usage-stat-grid" style={{ marginTop: '14px' }}>
-            <FleetNodeCard node={selfNode} dataBackend={fleet.dataBackend} />
+            <FleetNodeCard node={selfNode} dataBackend={fleet.dataBackend} standbySlot={fleet.standbySlot} />
           </div>
         ) : null}
 

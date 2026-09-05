@@ -13,6 +13,7 @@ import { Router, Request, Response, NextFunction } from 'express';
 import { BotManager } from '../botManager';
 import { readPromoteRecord } from '../../bot/internalSetup/fleet/promoteRecord';
 import { clearCopyBlock, readCopyBlock, readSuperseded, writeCopyBlock, writeFreshFleetConfirm } from '../../bot/internalSetup/fleet/stepDown';
+import { readSlotStatus, slotLostVerdict } from '../../bot/internalSetup/fleet/slotStatus';
 import { runDemote } from '../lifecycleActions';
 import { cancelPromote, continuePromote, startPromote } from '../promoteEngine';
 
@@ -61,6 +62,7 @@ export function createManagedRoutes(botManager: BotManager): Router {
         state = result?.success ? result.state : null;
       }
       const copyBlock = readCopyBlock();
+      const standbySlot = readSlotStatus();
       res.json({
         success: true,
         running: botManager.isRunning(),
@@ -81,6 +83,11 @@ export function createManagedRoutes(botManager: BotManager): Router {
         // interpreting this app's role vocabulary.
         copyBlockTarget: state?.initialized === true && state?.role === 'master',
         copyBlock,
+        // The primary's own word on this node's standby slot (20.17), and the
+        // verdict the manager's reseed keys on: fresh, lost, and from the
+        // master this copy follows. Unknown folds to false, never to "lost".
+        standbySlot,
+        standbySlotLost: slotLostVerdict(standbySlot),
       });
     } catch (error) {
       res.json({ success: false, error: error instanceof Error ? error.message : 'facts unavailable' });

@@ -109,6 +109,11 @@ export interface ReplicaProbe {
    * what makes it the RPO to show an operator promoting after a host death.
    */
   replayAgeMs?: number | null;
+  /** primary_slot_name: the slot this copy consumes on its primary (20.17 slot signal). */
+  slotName?: string | null;
+  /** The endpoint out of primary_conninfo; the password in it is never read out. */
+  sourceHost?: string | null;
+  sourcePort?: number | null;
   error?: string;
 }
 
@@ -116,19 +121,73 @@ const PROBE_SQL = `
   SELECT pg_is_in_recovery() AS in_recovery,
          pg_last_wal_receive_lsn() IS NOT DISTINCT FROM pg_last_wal_replay_lsn() AS apply_complete,
          EXTRACT(EPOCH FROM (now() - pg_last_xact_replay_timestamp())) * 1000 AS replay_age_ms,
-         (SELECT status FROM pg_stat_wal_receiver LIMIT 1) AS receiver_status`;
+         (SELECT status FROM pg_stat_wal_receiver LIMIT 1) AS receiver_status,
+         current_setting('primary_slot_name', true) AS slot_name`;
+
+// primary_conninfo is a superuser-only setting (it carries the replicator
+// password), so it is read apart from the probe and its absence costs only the
+// source endpoint, never the probe itself.
+const SOURCE_SQL = `SELECT current_setting('primary_conninfo', true) AS conninfo`;
+
+/**
+ * One value out of a libpq conninfo string. libpq quotes a value it did not
+ * consider a plain word (pg_basebackup -R writes a hyphenated host as
+ * host='a-b'), escaping quotes and backslashes inside the quotes.
+ */
+export function conninfoValue(text: string, key: string): string | null {
+  let i = 0;
+  while (i < text.length) {
+    while (i < text.length && /\s/.test(text[i])) i++;
+    const eq = text.indexOf('=', i);
+    if (eq < 0) return null;
+    const name = text.slice(i, eq).trim();
+    i = eq + 1;
+    while (i < text.length && /\s/.test(text[i])) i++;
+    let value = '';
+    if (text[i] === "'") {
+      i++;
+      while (i < text.length && text[i] !== "'") {
+        if (text[i] === '\\' && i + 1 < text.length) i++;
+        value += text[i++];
+      }
+      i++;
+    } else {
+      while (i < text.length && !/\s/.test(text[i])) value += text[i++];
+    }
+    if (name === key) return value;
+  }
+  return null;
+}
+
+/** Only the endpoint leaves the conninfo: it also carries the replicator password. */
+export function conninfoEndpoint(conninfo: unknown): { sourceHost: string | null; sourcePort: number | null } {
+  const text = typeof conninfo === 'string' ? conninfo : '';
+  // A host list names first the entry the receiver tries first; hostaddr stands in when host is absent.
+  const host = (conninfoValue(text, 'host') ?? conninfoValue(text, 'hostaddr') ?? '').split(',')[0].trim() || null;
+  const port = (conninfoValue(text, 'port') ?? '').split(',')[0].trim();
+  return { sourceHost: host, sourcePort: /^\d+$/.test(port) ? Number(port) : host ? 5432 : null };
+}
 
 export async function probeReplica(splicedLocalUrl: string): Promise<ReplicaProbe> {
   const client = new Client({ connectionString: splicedLocalUrl, connectionTimeoutMillis: 5000, query_timeout: 5000 });
+  // A connection dropped mid-probe surfaces through the statement that fails;
+  // an unlistened 'error' event would end the process instead.
+  client.on('error', () => { /* reported by the failing query */ });
   try {
     await client.connect();
     const row = (await client.query(PROBE_SQL)).rows[0] ?? {};
+    let source: { sourceHost: string | null; sourcePort: number | null } = { sourceHost: null, sourcePort: null };
+    try {
+      source = conninfoEndpoint((await client.query(SOURCE_SQL)).rows[0]?.conninfo);
+    } catch { /* not a superuser: the probe stands, the source stays unknown */ }
     return {
       ok: true,
       inRecovery: row.in_recovery === true,
       applyComplete: row.apply_complete !== false,
       receiverStreaming: String(row.receiver_status || '') === 'streaming',
       replayAgeMs: row.replay_age_ms === null || row.replay_age_ms === undefined ? null : Number(row.replay_age_ms),
+      slotName: typeof row.slot_name === 'string' && row.slot_name !== '' ? row.slot_name : null,
+      ...source,
     };
   } catch (error) {
     return { ok: false, error: error instanceof Error ? error.message : String(error) };

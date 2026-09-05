@@ -18,6 +18,7 @@ import { resolveDataBackend } from '../../../utils/envLoader';
 import { getGuildDataBackend } from '../utils/dataManager';
 import { getReplicaHealth, getStandbyLinks, startReplicaHealthSampler, StandbyLinkView } from './replicaHealth';
 import type { ReplicaHealthReport } from './protocol';
+import type { SlotStatusRecord } from './slotStatus';
 import { getRouteOverrides } from '../utils/dataBackends/routeResolver';
 import { getDataBootStatus, DataBootStatus } from '../utils/dataBackends/boot';
 import type { TransformationView } from './transformation/transformationCoordinator';
@@ -220,6 +221,8 @@ export interface FleetState {
   guildNames?: Record<string, string>;
   /** Standbys attached to the fleet database, read by whoever serves it; null off-postgres or before the first read. */
   dbStandbys: StandbyLinkView[] | null;
+  /** This node's standby slot as its primary last reported it (20.17 slot signal); null when nothing was recorded. */
+  standbySlot: SlotStatusRecord | null;
   updatedAt: number;
 }
 
@@ -302,6 +305,12 @@ let superseded: SupersededView | null = null;
 
 export function _setSuperseded(view: SupersededView | null): void {
   superseded = view;
+}
+
+let standbySlot: SlotStatusRecord | null = null;
+
+export function _setSlotStatus(record: SlotStatusRecord | null): void {
+  standbySlot = record;
 }
 
 function buildRoleOverrideView(): { role: NodeRole; setBy: string; setAt: number } | null {
@@ -423,6 +432,7 @@ export function getFleetState(): FleetState {
       shardTable: [],
       guildMap: {},
       dbStandbys: null,
+      standbySlot,
       migration: null,
       transformation: null,
       pinViolation: null,
@@ -548,6 +558,7 @@ export function getFleetState(): FleetState {
       guildMap: { ...Object.fromEntries(registry.restGuildShards), ...Object.fromEntries(registry.guildMap) },
       guildNames: Object.fromEntries(registry.restGuildNames),
       dbStandbys: getStandbyLinks() ?? null,
+      standbySlot,
       migration: sources.migration?.() ?? null,
       transformation: sources.transformation?.() ?? null,
       pinViolation: sources.pinViolation?.() ?? null,
@@ -664,6 +675,7 @@ export function getFleetState(): FleetState {
     shardTable,
     guildMap,
     dbStandbys: getStandbyLinks() ?? null,
+    standbySlot,
     migration: null,
     transformation: null,
     pinViolation: null,
