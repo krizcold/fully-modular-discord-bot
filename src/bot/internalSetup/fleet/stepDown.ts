@@ -68,6 +68,16 @@ export function clearCopyBlock(): void {
   try { fs.unlinkSync(copyBlockFile()); } catch { /* already absent */ }
 }
 
+/** The database endpoint a copy block names (the password is never read out); null when its DSN does not parse. */
+export function copyBlockEndpoint(block: CopyBlock): { sourceHost: string; sourcePort: number } | null {
+  try {
+    const url = new URL(block.dsn);
+    return url.hostname ? { sourceHost: url.hostname, sourcePort: Number(url.port) || 5432 } : null;
+  } catch {
+    return null;
+  }
+}
+
 /** Operator confirmation that an empty master store is a brand-new fleet (exits the 20.14 boot hold). */
 /**
  * File-only by design: the confirmation answers ONE empty store and is consumed

@@ -42,6 +42,7 @@ import {
   spliceFleetCredentials,
 } from '../bot/internalSetup/fleet/replicaPromotion';
 import { clearSuperseded, freshMasterClaim, masterStoreDeadNow } from '../bot/internalSetup/fleet/stepDown';
+import { sourceMatchesAny } from '../bot/internalSetup/fleet/slotStatus';
 
 export interface PromoteStartOptions {
   confirmLag?: boolean;
@@ -174,6 +175,18 @@ export async function startPromote(botManager: BotManager, opts: PromoteStartOpt
   } else if (canonical.ok) {
     if (probe.receiverStreaming !== true) {
       return { success: false, error: 'the fleet database is reachable but this standby is not following it, so a transfer could not catch up; re-seed the standby from the manager, then promote' };
+    }
+    // The copy must follow the database about to be fenced. A standby of a
+    // FORMER primary shares its cluster identity (byte copies do), so the
+    // identity check below cannot tell them apart; only its source can.
+    if (probe.sourceHost) {
+      const creds = loadCredentials();
+      const stores = [currentCanonicalUrl(), creds.DATA_BACKEND_URL, creds.DATA_BACKEND_PUBLIC_URL, creds.DATA_BACKEND_LOCAL_URL]
+        .map(url => (url || '').trim())
+        .filter(url => url !== '');
+      if (!sourceMatchesAny({ sourceHost: probe.sourceHost, sourcePort: probe.sourcePort ?? null }, stores)) {
+        return { success: false, error: `this machine's copy follows ${probe.sourceHost}:${probe.sourcePort ?? 5432}, which is not the fleet database this node points at; re-seed this standby from the current master, then promote` };
+      }
     }
     // Lineage: the database about to be fenced and the copy about to be
     // promoted must be one cluster. Without this the promote can fence an

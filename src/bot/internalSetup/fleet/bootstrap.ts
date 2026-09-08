@@ -95,6 +95,7 @@ import { readPromoteRecord, writePromoteRecord } from './promoteRecord';
 import {
   clearFreshFleetConfirm,
   clearSuperseded,
+  copyBlockEndpoint,
   freshHigherTermClaim,
   hasFreshFleetConfirm,
   higherTermClaim,
@@ -2265,7 +2266,14 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
         const superseded = promote && promote.supersededNodeId === payload.nodeId && !promote.supersededDelivered
           ? { byNodeId: nodeId, byNodeName: nodeName, term: registry.term, retireRequested: promote.retireOldMaster, at: Date.now() }
           : null;
-        const copyBlock = payload.capabilities?.backupMaster === true ? readCopyBlock() : null;
+        // Only a block naming THIS master's own database is relayed: a block
+        // inherited from the master this node superseded names a fenced
+        // database, and a standby seeded from it would follow the wrong side.
+        const held = payload.capabilities?.backupMaster === true ? readCopyBlock() : null;
+        const heldEndpoint = held ? copyBlockEndpoint(held) : null;
+        const own = buildDataBackendInfo();
+        const ownUrls = [own.url, own.publicUrl].filter((url): url is string => typeof url === 'string' && url !== '');
+        const copyBlock = held && heldEndpoint && sourceMatchesAny(heldEndpoint, ownUrls) ? held : null;
         return {
           accepted: true,
           term: registry.term,

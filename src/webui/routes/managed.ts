@@ -12,8 +12,9 @@ import crypto from 'crypto';
 import { Router, Request, Response, NextFunction } from 'express';
 import { BotManager } from '../botManager';
 import { readPromoteRecord } from '../../bot/internalSetup/fleet/promoteRecord';
-import { clearCopyBlock, readCopyBlock, readSuperseded, writeCopyBlock, writeFreshFleetConfirm } from '../../bot/internalSetup/fleet/stepDown';
-import { readSlotStatus, slotLostVerdict } from '../../bot/internalSetup/fleet/slotStatus';
+import { clearCopyBlock, copyBlockEndpoint, readCopyBlock, readSuperseded, writeCopyBlock, writeFreshFleetConfirm } from '../../bot/internalSetup/fleet/stepDown';
+import { readSlotStatus, slotLostVerdict, sourceMatchesAny } from '../../bot/internalSetup/fleet/slotStatus';
+import { loadCredentials } from '../../utils/envLoader';
 import { runDemote } from '../lifecycleActions';
 import { cancelPromote, continuePromote, startPromote } from '../promoteEngine';
 
@@ -63,6 +64,16 @@ export function createManagedRoutes(botManager: BotManager): Router {
       }
       const copyBlock = readCopyBlock();
       const standbySlot = readSlotStatus();
+      // A block names the database this node itself follows only while it is
+      // current: a former master's block, inherited by a promoted node or
+      // relayed before the new primary published its own, names a fenced
+      // database, and a standby seeded from it would follow the wrong side.
+      const creds = loadCredentials();
+      const delivered = [creds.DATA_BACKEND_URL, creds.DATA_BACKEND_PUBLIC_URL, creds.DATA_BACKEND_LOCAL_URL]
+        .map(url => (url || '').trim())
+        .filter(url => url !== '');
+      const blockEndpoint = copyBlock ? copyBlockEndpoint(copyBlock) : null;
+      const copyBlockCurrent = blockEndpoint && delivered.length > 0 ? sourceMatchesAny(blockEndpoint, delivered) : null;
       res.json({
         success: true,
         running: botManager.isRunning(),
@@ -73,6 +84,8 @@ export function createManagedRoutes(botManager: BotManager): Router {
         term: state?.term ?? null,
         standalone: state?.standalone === true,
         backupMaster: state?.backupMaster === true,
+        /** This node's container carries a standby endpoint; null while the bot is down. */
+        dbReplica: state ? state.dbReplica === true : null,
         superseded: readSuperseded(),
         promote: readPromoteRecord(),
         emptyStoreHold: state?.emptyStoreHold ?? null,
@@ -83,6 +96,7 @@ export function createManagedRoutes(botManager: BotManager): Router {
         // interpreting this app's role vocabulary.
         copyBlockTarget: state?.initialized === true && state?.role === 'master',
         copyBlock,
+        copyBlockCurrent,
         // The primary's own word on this node's standby slot (20.17), and the
         // verdict the manager's reseed keys on: fresh, lost, and from the
         // master this copy follows. Unknown folds to false, never to "lost".
