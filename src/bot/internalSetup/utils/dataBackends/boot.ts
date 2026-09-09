@@ -95,6 +95,20 @@ export function initDataBackendLayer(): void {
 }
 
 let activeUrl: string | null = null;
+// The endpoints of the last delivery this process applied. loadCredentials is
+// a fork-time snapshot in the bot child (upsertCredentials writes the file,
+// and a key the fork already carried is never re-read from it), so a delivery
+// that lands while the child runs reaches only here.
+let deliveredUrls: string[] | null = null;
+
+/** Every form of the database endpoint the fleet's master last delivered. */
+export function getDeliveredBackendUrls(): string[] {
+  if (deliveredUrls) return deliveredUrls;
+  const creds = loadCredentials();
+  return [creds.DATA_BACKEND_URL, creds.DATA_BACKEND_PUBLIC_URL, creds.DATA_BACKEND_LOCAL_URL]
+    .map(url => (url || '').trim())
+    .filter(url => url !== '');
+}
 
 /** Make a prepared backend the live runtime; the caller owns identity verification. */
 function installRuntime(url: string, backend: PostgresBackend): DataReadinessDriver {
@@ -170,6 +184,11 @@ export async function applyDeliveredBackend(
   // Mid-transformation deliveries carry the url with backend 'file' too, so
   // the pick keys on the url's presence, not on the backend.
   const url = localUrl ? await pickDeliveredUrl(localUrl, publicUrl, previousUrl) : localUrl;
+  // A delivery naming no endpoint at all leaves what is known standing: it
+  // cannot show that a copy's source was left behind, and a verdict from it
+  // would be one drawn from silence.
+  const named = [url, publicUrl, localUrl].map(u => u.trim()).filter(u => u !== '');
+  if (named.length > 0) deliveredUrls = named;
   const creds = loadCredentials();
   const envBackend = (creds.DATA_BACKEND || 'file').trim() || 'file';
   const envUrl = (creds.DATA_BACKEND_URL || '').trim();

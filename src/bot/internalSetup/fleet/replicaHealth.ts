@@ -44,6 +44,8 @@ export interface LocalReplicaIdentity {
   slotName: string | null;
   sourceHost: string | null;
   sourcePort: number | null;
+  /** This node's clock when sourceHost was last READ, not when it was last carried forward. */
+  sourceAt: number;
 }
 
 let replicaHealth: ReplicaHealthReport | undefined;
@@ -111,6 +113,7 @@ async function sampleLocalReplica(): Promise<void> {
       slotName: probe.slotName ?? localIdentity?.slotName ?? null,
       sourceHost: probe.sourceHost ?? localIdentity?.sourceHost ?? null,
       sourcePort: probe.sourcePort ?? localIdentity?.sourcePort ?? null,
+      sourceAt: probe.sourceHost ? Date.now() : localIdentity?.sourceAt ?? 0,
     };
   }
   try { probeListener?.(replicaHealth); } catch { /* a listener fault never blocks the sampler */ }

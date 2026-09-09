@@ -74,7 +74,7 @@ import {
   GuildDataWriteRequest,
   setDataOpForwarder,
 } from '../utils/ipcDataHandler';
-import { applyDeliveredBackend, ensureRuntimeWith, getActiveBackendUrl, pickDeliveredUrl } from '../utils/dataBackends/boot';
+import { applyDeliveredBackend, ensureRuntimeWith, getActiveBackendUrl, getDeliveredBackendUrls, pickDeliveredUrl } from '../utils/dataBackends/boot';
 import { setLeaseDeclineHandler } from '../utils/dataBackends/dataReadiness';
 import { applyRouteOverrides, currentRouteDefault } from '../utils/dataBackends/routeResolver';
 import { loadCredentials, resolveDataBackend, upsertCredentials } from '../../../utils/envLoader';
@@ -2752,7 +2752,11 @@ async function initCoWorker(init: CommonInit): Promise<FleetContext> {
     const record = readSlotStatus();
     // Counted only against a recorded lost or absent slot, so the streak from
     // the hours of healthy streaming before the loss is never inherited.
-    const questioned = record !== null && (record.walStatus === 'lost' || record.walStatus === 'absent');
+    // A record from a master this copy no longer follows is not describing a
+    // replaced copy: 'absent' is what a survivor of a failover always reads
+    // there, so its own receiver cannot contradict it (20.19 F5).
+    const questioned = record !== null && record.sourceIsCurrentMaster !== false
+      && (record.walStatus === 'lost' || record.walStatus === 'absent');
     streamingProbes = report.streaming && questioned ? streamingProbes + 1 : 0;
     if (!record) return;
     const contradicted = !report.inRecovery || (questioned && streamingProbes >= 2);
@@ -2839,11 +2843,8 @@ async function initCoWorker(init: CommonInit): Promise<FleetContext> {
         // errored leaves the question open and the previous record ages out.
         const health = getReplicaHealth();
         if (health && !health.error && !health.inRecovery) return;
-        const creds = loadCredentials();
-        const delivered = [creds.DATA_BACKEND_URL, creds.DATA_BACKEND_PUBLIC_URL, creds.DATA_BACKEND_LOCAL_URL]
-          .map(url => (url || '').trim())
-          .filter(url => url !== '');
-        const record = recordFromPush(payload, identity.slotName, identity.sourceHost ? sourceMatchesAny(identity, delivered) : null);
+        const delivered = getDeliveredBackendUrls();
+        const record = recordFromPush(payload, identity.slotName, identity.sourceHost ? sourceMatchesAny(identity, delivered) : null, identity.sourceAt);
         writeSlotStatus(record);
         _setSlotStatus(record);
         pushFleetStatusNow();

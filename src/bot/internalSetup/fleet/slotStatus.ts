@@ -28,6 +28,8 @@ export interface SlotStatusRecord {
   fromTerm: number;
   /** This copy's primary_conninfo names the database endpoint the sending master delivered; null when the source could not be read. */
   sourceIsCurrentMaster: boolean | null;
+  /** This node's clock when the source behind that verdict was last read; a rebuilt copy is not re-read at once. */
+  sourceAt: number;
   /** Where this node's own slot had confirmed at the master's read; null when the primary had no restart position for it. */
   restartLsn: string | null;
   /** The other standbys' rows from the SAME read, so a promote can see who received further (20.19 F14). */
@@ -51,6 +53,7 @@ export function readSlotStatus(): SlotStatusRecord | null {
       fromNodeId: typeof parsed.fromNodeId === 'string' ? parsed.fromNodeId : '',
       fromTerm: Number(parsed.fromTerm) || 0,
       sourceIsCurrentMaster: parsed.sourceIsCurrentMaster === true ? true : parsed.sourceIsCurrentMaster === false ? false : null,
+      sourceAt: Number(parsed.sourceAt) || 0,
       restartLsn: typeof parsed.restartLsn === 'string' && parsed.restartLsn !== '' ? parsed.restartLsn : null,
       peers: Array.isArray(parsed.peers)
         ? parsed.peers
@@ -141,7 +144,7 @@ export function backupsAhead(
 }
 
 /** This standby's row out of a pushed table; 'absent' when the primary has no slot of that name. */
-export function recordFromPush(payload: SlotStatusPayload, slotName: string, sourceIsCurrentMaster: boolean | null): SlotStatusRecord {
+export function recordFromPush(payload: SlotStatusPayload, slotName: string, sourceIsCurrentMaster: boolean | null, sourceAt: number): SlotStatusRecord {
   const row = payload.slots.find(s => s.slotName === slotName);
   return {
     restartLsn: row?.restartLsn ?? null,
@@ -157,6 +160,7 @@ export function recordFromPush(payload: SlotStatusPayload, slotName: string, sou
     fromNodeId: String(payload.nodeId || ''),
     fromTerm: Number(payload.term) || 0,
     sourceIsCurrentMaster,
+    sourceAt,
   };
 }
 
