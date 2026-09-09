@@ -45,6 +45,7 @@ import {
   writeRoleOverride,
 } from './nodeIdentity';
 import { prepareControlStore, PostgresControlStore } from './postgresControlStore';
+import { clearOwnSyncPosture } from './syncPosture';
 import { Registry, RegistryNode } from './registry';
 import { ControlServer } from './controlServer';
 import { ControlClient } from './controlClient';
@@ -659,6 +660,11 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   const { standalone, nodeId, nodeName, appVersion, capabilities, runtime } = init;
   const ingest = getIngestService();
   const usedFreshConfirm = await runEmptyStoreHold(standalone, nodeId);
+  // Before the control store and before any write of this boot (B6 map F18):
+  // a master that died while armed comes back armed, and its first write would
+  // hang behind standbys that may no longer exist. Relaxing writes no WAL, so
+  // this is the one statement that can always get through.
+  await clearOwnSyncPosture();
   const store = await prepareControlStore(standalone);
   // A control-store fence trip means a second master owns the schema: this
   // master stops granting entirely (the higher-term master is the healthy

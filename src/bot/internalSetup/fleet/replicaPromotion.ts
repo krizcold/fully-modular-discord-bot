@@ -216,6 +216,22 @@ export async function probeReplicaSettled(splicedLocalUrl: string): Promise<Repl
 }
 
 /**
+ * A promoted copy carries whatever its old primary had armed, because ALTER
+ * SYSTEM lives in the auto.conf the seed copied (B6 map F18). Left in place it
+ * names standbys this cluster does not have and the very next write hangs, so
+ * the relax runs on the promoting connection before anything is persisted.
+ * Best effort: a promote that already succeeded is not undone by this.
+ */
+async function relaxInheritedPosture(client: Client): Promise<void> {
+  try {
+    await client.query('ALTER SYSTEM RESET synchronous_standby_names');
+    await client.query('SELECT pg_reload_conf()');
+  } catch (error) {
+    console.warn(`[Fleet] Could not relax an inherited synchronous posture on the promoted database: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+/**
  * pg_promote(wait := true) and verify recovery actually ended. The fleet role
  * is the sidecar's bootstrap superuser (POSTGRES_USER), so no extra grant is
  * needed. A standby already out of recovery counts as promoted: a previous
@@ -228,12 +244,14 @@ export async function promoteReplica(splicedLocalUrl: string): Promise<{ success
     const state = await client.query(`SELECT pg_is_in_recovery() AS in_recovery`);
     if (state.rows[0]?.in_recovery !== true) {
       console.warn('[Fleet] Local database replica is already out of recovery (earlier promotion attempt); continuing with the takeover');
+      await relaxInheritedPosture(client);
       return { success: true };
     }
     const res = await client.query(`SELECT pg_promote(wait := true, wait_seconds := 60) AS promoted`);
     if (res.rows[0]?.promoted !== true) return { success: false, error: 'pg_promote timed out before recovery ended' };
     const verify = await client.query(`SELECT pg_is_in_recovery() AS in_recovery`);
     if (verify.rows[0]?.in_recovery === true) return { success: false, error: 'the replica still reports in-recovery after pg_promote' };
+    await relaxInheritedPosture(client);
     return { success: true };
   } catch (error) {
     return { success: false, error: error instanceof Error ? error.message : String(error) };
