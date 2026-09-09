@@ -92,3 +92,28 @@ export function validateWitnessChannelId(input: unknown): { ok: true; value: str
   if (!/^\d{15,21}$/.test(value)) return { ok: false, error: 'witnessChannelId must be a Discord channel id (or empty for the owner DM default)' };
   return { ok: true, value };
 }
+
+/**
+ * The backup order (PLAN_REPLICATION 20.9, 20.19 F9): the list order IS the
+ * priority, renumbered 1..n on save. Only nodes this master knows (registered
+ * now, or already designated) may be listed, each once. An empty list is
+ * allowed: the next register of a backup-master designates it again.
+ */
+export function validateBackupDesignations(input: unknown, known: Set<string>): { ok: true; designations: { nodeId: string; priority: number }[] } | { ok: false; error: string } {
+  if (!Array.isArray(input)) return { ok: false, error: 'backupDesignations must be a list' };
+  if (input.length > 16) return { ok: false, error: 'backupDesignations is capped at 16 entries' };
+  const ids: string[] = [];
+  for (const raw of input) {
+    const nodeId = typeof raw === 'string' ? raw.trim() : typeof raw?.nodeId === 'string' ? raw.nodeId.trim() : '';
+    if (nodeId === '') return { ok: false, error: 'backupDesignations entries must name a node id' };
+    if (!known.has(nodeId)) return { ok: false, error: `node ${nodeId.slice(0, 8)} is not known to this master` };
+    if (ids.includes(nodeId)) return { ok: false, error: `node ${nodeId.slice(0, 8)} is listed twice` };
+    ids.push(nodeId);
+  }
+  return { ok: true, designations: ids.map((nodeId, index) => ({ nodeId, priority: index + 1 })) };
+}
+
+/** Priorities are 1..n in order; a removal closes the gap. */
+export function renumberDesignations(list: { nodeId: string; priority: number }[]): { nodeId: string; priority: number }[] {
+  return [...list].sort((a, b) => a.priority - b.priority).map((d, index) => ({ nodeId: d.nodeId, priority: index + 1 }));
+}

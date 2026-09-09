@@ -84,7 +84,7 @@ import { MigrationExecutor } from './migration/migrationExecutor';
 import { TransformationCoordinator } from './transformation/transformationCoordinator';
 import { TransformationExecutor } from './transformation/transformationExecutor';
 import type { ControlStore, PersistedFleetConfig, PersistedTerm, TransformDirection } from './controlStore';
-import { effectiveFleetConfigView, effectiveMasterUrls, readFleetConfigCache, validateMasterCandidates, validateWitnessChannelId, writeFleetConfigCache } from './fleetConfig';
+import { effectiveFleetConfigView, effectiveMasterUrls, readFleetConfigCache, validateMasterCandidates, renumberDesignations, validateBackupDesignations, validateWitnessChannelId, writeFleetConfigCache } from './fleetConfig';
 import { getLocalReplicaIdentity, getReplicaHealth, getSlotSample, setReplicaProbeListener } from './replicaHealth';
 import { hasDbReplica } from './replicaPromotion';
 import { clearSlotStatus, readSlotStatus, recordFromPush, sourceMatchesAny, writeSlotStatus } from './slotStatus';
@@ -267,12 +267,12 @@ export async function fleetReadWitness(): Promise<WitnessStatus | null> {
   return readWitnessNow();
 }
 
-let masterConfigSet: ((candidates: string[], witnessChannelId: unknown) => Promise<{ ok: boolean; error?: string; revision?: number }>) | null = null;
+let masterConfigSet: ((candidates: string[], witnessChannelId: unknown, backupDesignations: unknown) => Promise<{ ok: boolean; error?: string; revision?: number }>) | null = null;
 
-/** Runtime fleet-config edit (B2); master-only, pushed fleet-wide with zero restarts. */
-export async function fleetSetConfig(candidates: unknown, witnessChannelId?: unknown): Promise<{ ok: boolean; error?: string; revision?: number }> {
+/** Runtime fleet-config edit (B2, backup order B5); master-only, pushed fleet-wide with zero restarts. */
+export async function fleetSetConfig(candidates: unknown, witnessChannelId?: unknown, backupDesignations?: unknown): Promise<{ ok: boolean; error?: string; revision?: number }> {
   if (!masterConfigSet) return { ok: false, error: 'This node is not the fleet master' };
-  return masterConfigSet(Array.isArray(candidates) ? (candidates as string[]) : [], witnessChannelId);
+  return masterConfigSet(Array.isArray(candidates) ? (candidates as string[]) : [], witnessChannelId, backupDesignations);
 }
 
 export async function initFleet(): Promise<FleetContext> {
@@ -727,6 +727,18 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       await store.saveFleetConfig(fleetConfig)
         .catch(err => console.warn('[Fleet] Failed to persist the seeded fleet config:', err instanceof Error ? err.message : err));
     }
+    // A master is not its own backup: a promoted backup's entry, pushed to every
+    // node until now, leaves the list it now owns.
+    if (fleetConfig && fleetConfig.backupDesignations.some(d => d.nodeId === nodeId)) {
+      fleetConfig = {
+        ...fleetConfig,
+        revision: fleetConfig.revision + 1,
+        backupDesignations: renumberDesignations(fleetConfig.backupDesignations.filter(d => d.nodeId !== nodeId)),
+        updatedAt: Date.now(),
+      };
+      await store.saveFleetConfig(fleetConfig)
+        .catch(err => console.warn('[Fleet] Failed to persist the fleet config after dropping this master from its backups:', err instanceof Error ? err.message : err));
+    }
   }
   const fleetConfigPayload = (): FleetConfigPayload => ({
     revision: fleetConfig!.revision,
@@ -877,10 +889,19 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     }
     console.log(`[Fleet] Fleet config revision ${fleetConfig.revision} (${why}) pushed to the fleet`);
   };
-  masterConfigSet = async (candidates: string[], witnessChannelId: unknown) => {
+  masterConfigSet = async (candidates: string[], witnessChannelId: unknown, backupDesignations: unknown) => {
     if (!fleetConfig) return { ok: false, error: 'a standalone master holds no fleet config' };
     const valid = validateMasterCandidates(candidates);
     if (!valid.ok) return { ok: false, error: valid.error };
+    // Undefined = the caller did not touch the order; a list replaces it whole.
+    let designations: { nodeId: string; priority: number }[] | undefined;
+    if (backupDesignations !== undefined) {
+      const known = new Set<string>([...registry.nodes.keys(), ...fleetConfig.backupDesignations.map(d => d.nodeId)]);
+      const order = validateBackupDesignations(backupDesignations, known);
+      if (!order.ok) return { ok: false, error: order.error };
+      if (order.designations.some(d => d.nodeId === nodeId)) return { ok: false, error: 'the master is not its own backup' };
+      designations = order.designations;
+    }
     // Undefined = the caller did not touch the witness field; empty = clear to the owner DM default.
     const witness = witnessChannelId === undefined
       ? { ok: true as const, value: fleetConfig.witnessChannelId }
@@ -890,6 +911,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       ...fleetConfig,
       revision: fleetConfig.revision + 1,
       masterCandidates: valid.urls,
+      ...(designations ? { backupDesignations: designations } : {}),
       updatedAt: Date.now(),
     };
     if (witness.value !== undefined) fleetConfig.witnessChannelId = witness.value;
@@ -1738,6 +1760,16 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       registry.pendingConfirmation.delete(shardId);
     }
     registry.nodes.delete(targetNodeId);
+    // A node that is gone cannot stand in; its designation goes with it.
+    if (fleetConfig && fleetConfig.backupDesignations.some(d => d.nodeId === targetNodeId)) {
+      fleetConfig = {
+        ...fleetConfig,
+        revision: fleetConfig.revision + 1,
+        backupDesignations: renumberDesignations(fleetConfig.backupDesignations.filter(d => d.nodeId !== targetNodeId)),
+        updatedAt: Date.now(),
+      };
+      persistFleetConfig(`declared lost ${node.nodeName || targetNodeId}`);
+    }
     drainRevokeAt.delete(targetNodeId);
     drainExtraLeaseIds.delete(targetNodeId);
     mismatchRevokeAt.delete(targetNodeId);
@@ -2244,9 +2276,11 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
         ledger?.onRegister(payload.nodeId);
         console.log(`[Fleet] Node registered: ${payload.nodeName} (${payload.nodeId})`);
         // A backup-master's designation is env-seeded into the runtime config
-        // on its first registration; from then on the stored list owns it.
-        if (fleetConfig && payload.capabilities?.backupMaster === true
-            && !fleetConfig.backupDesignations.some(d => d.nodeId === payload.nodeId)) {
+        // on its first registration; from then on the stored list owns the
+        // ORDER, and env stays the trigger: a node whose env no longer says
+        // backup-master leaves the list on its next register (20.19 F8/F11).
+        const listed = !!fleetConfig && fleetConfig.backupDesignations.some(d => d.nodeId === payload.nodeId);
+        if (fleetConfig && payload.capabilities?.backupMaster === true && !listed) {
           const priority = fleetConfig.backupDesignations.reduce((max, d) => Math.max(max, d.priority), 0) + 1;
           fleetConfig = {
             ...fleetConfig,
@@ -2255,6 +2289,14 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
             updatedAt: Date.now(),
           };
           persistFleetConfig(`designated backup ${payload.nodeName || payload.nodeId}`);
+        } else if (fleetConfig && payload.capabilities?.backupMaster !== true && listed) {
+          fleetConfig = {
+            ...fleetConfig,
+            revision: fleetConfig.revision + 1,
+            backupDesignations: renumberDesignations(fleetConfig.backupDesignations.filter(d => d.nodeId !== payload.nodeId)),
+            updatedAt: Date.now(),
+          };
+          persistFleetConfig(`backup designation withdrawn ${payload.nodeName || payload.nodeId}`);
         }
         // B4 facts: the node this master superseded learns it here (and
         // whether the owner asked to retire it); designated backups get the

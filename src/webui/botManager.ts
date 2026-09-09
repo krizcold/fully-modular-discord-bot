@@ -700,9 +700,9 @@ export class BotManager {
   /**
    * Runtime fleet-config edit (B2); master-only, validated in the bot child.
    */
-  async setFleetConfig(masterCandidates: string[], witnessChannelId?: string): Promise<any> {
+  async setFleetConfig(masterCandidates: string[], witnessChannelId?: string, backupDesignations?: unknown): Promise<any> {
     try {
-      return await this.sendIPCMessage('fleet:config:set', { masterCandidates, witnessChannelId });
+      return await this.sendIPCMessage('fleet:config:set', { masterCandidates, witnessChannelId, backupDesignations });
     } catch (error) {
       console.error('[BotManager] Error setting fleet config:', error);
       return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };

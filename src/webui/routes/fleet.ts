@@ -39,7 +39,7 @@ export function createFleetRoutes(botManager: BotManager): Router {
   });
 
   /**
-   * POST /api/fleet/config { masterCandidates: string[], witnessChannelId?: string }
+   * POST /api/fleet/config { masterCandidates: string[], witnessChannelId?: string, backupDesignations?: {nodeId}[] }
    * Master-only runtime edit of the fleet config (B2): validated and applied
    * in the bot child, persisted to the control store, and pushed to every
    * connected node with zero restarts. The current copy rides GET /state
@@ -52,7 +52,8 @@ export function createFleetRoutes(botManager: BotManager): Router {
         res.json({ success: false, error: 'Bot is not running' });
         return;
       }
-      const result = await botManager.setFleetConfig(req.body?.masterCandidates, req.body?.witnessChannelId);
+      // backupDesignations omitted = the order is unchanged; a list is the new order (B5).
+      const result = await botManager.setFleetConfig(req.body?.masterCandidates, req.body?.witnessChannelId, req.body?.backupDesignations);
       res.json(result?.success ? { success: true, revision: result.revision } : { success: false, error: result?.error ?? 'config update failed' });
     } catch (error) {
       console.error('[Fleet] Failed to set fleet config:', error instanceof Error ? error.message : error);

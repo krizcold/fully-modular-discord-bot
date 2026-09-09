@@ -950,9 +950,21 @@ function FleetConfigCard({ api, fleet }) {
   const cfg = fleet.fleetConfig;
   const [draft, setDraft] = React.useState(null);
   const [witnessDraft, setWitnessDraft] = React.useState('');
+  const [backupsDraft, setBackupsDraft] = React.useState([]);
+  // The order is posted only when the operator actually moved it: the draft is
+  // an Edit-time snapshot, and the list keeps changing under it as nodes register.
+  const [backupsEdited, setBackupsEdited] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
   if (!cfg) return null;
   const editable = fleet.role === 'master' && !fleet.standalone;
+  const move = (i, delta) => {
+    const next = [...backupsDraft];
+    const j = i + delta;
+    if (j < 0 || j >= next.length) return;
+    [next[i], next[j]] = [next[j], next[i]];
+    setBackupsDraft(next);
+    setBackupsEdited(true);
+  };
   const nodeName = (id) => {
     const node = (fleet.nodes || []).find((n) => n.nodeId === id);
     return node ? node.nodeName : id.slice(0, 8);
@@ -961,7 +973,7 @@ function FleetConfigCard({ api, fleet }) {
     if (busy) return;
     const urls = draft.split('\n').map((u) => u.trim()).filter(Boolean);
     setBusy(true);
-    api.post('/fleet/config', { masterCandidates: urls, witnessChannelId: witnessDraft.trim() })
+    api.post('/fleet/config', { masterCandidates: urls, witnessChannelId: witnessDraft.trim(), ...(backupsEdited ? { backupDesignations: backupsDraft.map((d, i) => ({ nodeId: d.nodeId, priority: i + 1 })) } : {}) })
       .then((res) => {
         if (!res || res.success === false) { showToast((res && res.error) || 'Config update failed', 'error'); return; }
         showToast(`Fleet config saved (revision ${res.revision}) and pushed to every node`, 'success');
@@ -991,6 +1003,19 @@ function FleetConfigCard({ api, fleet }) {
             placeholder="witness beacon channel id (empty = owner DM)"
             style={{ width: '100%', marginTop: '4px', fontFamily: 'monospace', fontSize: '0.75rem' }}
           />
+          {backupsDraft.length > 0 && (
+            <div style={{ marginTop: '6px' }}>
+              <div className="usage-stat-sub">Backup order: the first stands in first, and breaks a tie between equally fresh copies</div>
+              {backupsDraft.map((d, i) => (
+                <div key={d.nodeId} style={{ display: 'flex', alignItems: 'center', gap: '6px', marginTop: '2px' }}>
+                  <span style={{ fontFamily: 'monospace', fontSize: '0.75rem' }}>{`${i + 1}. ${nodeName(d.nodeId)}`}</span>
+                  <button onClick={() => move(i, -1)} disabled={busy || i === 0} style={{ fontSize: '0.7rem', padding: '1px 6px' }}>Up</button>
+                  <button onClick={() => move(i, 1)} disabled={busy || i === backupsDraft.length - 1} style={{ fontSize: '0.7rem', padding: '1px 6px' }}>Down</button>
+                  <button onClick={() => { setBackupsDraft(backupsDraft.filter((_, j) => j !== i)); setBackupsEdited(true); }} disabled={busy} style={{ fontSize: '0.7rem', padding: '1px 6px' }} title="Removed from the order; the node is designated again on its next register while its env still says backup-master">Remove</button>
+                </div>
+              ))}
+            </div>
+          )}
           <div style={{ marginTop: '4px' }}>
             <button onClick={save} disabled={busy} style={{ fontSize: '0.72rem', padding: '2px 8px' }}>
               {busy ? 'Saving...' : 'Save and push'}
@@ -1006,7 +1031,7 @@ function FleetConfigCard({ api, fleet }) {
             {cfg.masterCandidates.join('\n') || 'no master candidates'}
           </div>
           {editable && (
-            <button onClick={() => { setDraft(cfg.masterCandidates.join('\n')); setWitnessDraft(cfg.witnessChannelId || ''); }} style={{ marginTop: '4px', fontSize: '0.72rem', padding: '2px 8px' }}>
+            <button onClick={() => { setDraft(cfg.masterCandidates.join('\n')); setWitnessDraft(cfg.witnessChannelId || ''); setBackupsDraft([...(cfg.backupDesignations || [])].sort((a, b) => a.priority - b.priority)); setBackupsEdited(false); }} style={{ marginTop: '4px', fontSize: '0.72rem', padding: '2px 8px' }}>
               Edit fleet config
             </button>
           )}
@@ -1017,7 +1042,7 @@ function FleetConfigCard({ api, fleet }) {
       </div>
       {(cfg.backupDesignations || []).length > 0 && (
         <div className="usage-stat-sub" style={{ marginTop: '6px' }}>
-          {`Backups: ${cfg.backupDesignations.map((d) => `${nodeName(d.nodeId)} (priority ${d.priority})`).join(', ')}`}
+          {`Backup order: ${[...cfg.backupDesignations].sort((a, b) => a.priority - b.priority).map((d) => `${d.priority}. ${nodeName(d.nodeId)}`).join(', ')}`}
         </div>
       )}
     </div>
@@ -1062,6 +1087,17 @@ function FleetPromoteCard({ api, fleet, reload }) {
   const pair = fleet.dbReplica === true;
   const record = fleet.promote;
   const active = !!(record && record.phase !== 'done');
+  // The backup order (20.9) as ADVICE: a higher-ranked backup whose beacon is
+  // fresh is the preferred stand-in; the click stays the operator's.
+  const order = [...((fleet.fleetConfig && fleet.fleetConfig.backupDesignations) || [])].sort((a, b) => a.priority - b.priority);
+  const mine = order.find((d) => d.nodeId === fleet.nodeId);
+  const freshMs = 135000; // three witness renew periods, the fleet's own fresh window
+  // Darkness is not evidence: an unread witness says nothing about who is
+  // alive, and the claims snapshot is whatever the last SUCCESSFUL read saw.
+  const witnessRead = !!(fleet.witness && fleet.witness.lastReadAt != null && Date.now() - fleet.witness.lastReadAt < freshMs);
+  const claims = (fleet.witness && fleet.witness.claims) || [];
+  const preferred = mine && witnessRead ? order.filter((d) => d.priority < mine.priority && claims.some((c) => c.nodeId === d.nodeId && Date.now() - c.observedAt < freshMs)) : [];
+  const nameOf = (id) => { const n = (fleet.nodes || []).find((x) => x.nodeId === id); return n ? n.nodeName : id.slice(0, 8); };
   // Unified promote (PLAN_REPLICATION 20.4): ONE action moves the whole side.
   // The verdict is the engine's; the card only names the likely path and
   // drives the confirmations (the RPO acknowledgement re-posts with confirmLag).
@@ -1102,6 +1138,16 @@ function FleetPromoteCard({ api, fleet, reload }) {
       <div className="usage-stat-sub">
         This instance takes over only when you press a button here: bot and database together, one action.
       </div>
+      {order.length > 1 && (
+        <div className="usage-stat-sub" style={{ marginTop: '4px', color: preferred.length ? '#d29922' : undefined }}>
+          {`Backup order: ${order.map((d) => `${d.priority}. ${nameOf(d.nodeId)}`).join(', ')}.`}
+          {mine ? (preferred.length
+            ? ` ${nameOf(preferred[0].nodeId)} ranks above this node and its beacon is fresh, so it is the preferred stand-in; promoting here is still your call.`
+            : witnessRead
+              ? ' No higher-ranked backup is beaconing; this node is the preferred stand-in.'
+              : ' The witness has not been read recently, so nothing here says whether a higher-ranked backup is alive.') : ''}
+        </div>
+      )}
       {!pair ? (
         <div className="usage-stat-sub" style={{ color: '#d29922' }}>
           No database standby on this machine yet; the promote refuses until one is seeded (the manager provisions it from the copy block).
