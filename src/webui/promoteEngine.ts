@@ -42,10 +42,12 @@ import {
   spliceFleetCredentials,
 } from '../bot/internalSetup/fleet/replicaPromotion';
 import { clearSuperseded, freshMasterClaim, masterStoreDeadNow } from '../bot/internalSetup/fleet/stepDown';
-import { sourceMatchesAny } from '../bot/internalSetup/fleet/slotStatus';
+import { backupsAhead, readSlotStatus, sourceMatchesAny } from '../bot/internalSetup/fleet/slotStatus';
 
 export interface PromoteStartOptions {
   confirmLag?: boolean;
+  /** The operator has seen that another designated backup received further than this copy (20.19 F14). */
+  confirmLineage?: boolean;
   retireOldMaster?: boolean;
   /** Provenance for the role override this promote ends up writing. */
   startedBy?: 'webui-promote' | 'manager-promote';
@@ -55,6 +57,9 @@ export interface PromoteStartResult {
   success: boolean;
   error?: string;
   needsLagConfirm?: boolean;
+  needsLineageConfirm?: boolean;
+  /** Bytes of WAL the furthest other backup holds beyond this copy; 0 when level and outranked, null when this copy has no position at all. */
+  aheadBy?: number | null;
   lagMs?: number | null;
   record?: PromoteRecord;
 }
@@ -240,6 +245,31 @@ export async function startPromote(botManager: BotManager, opts: PromoteStartOpt
         lagMs,
         error: `${lagMs === null ? 'this machine\'s copy has replayed nothing since it started' : `the standby last replayed a transaction ${Math.round(lagMs / 1000)}s ago`}; promoting it accepts losing anything the old primary took after that.${aliveWarning}`,
       };
+    }
+    // Lineage (20.9 "freshest lineage wins; priority breaks ties", 20.19 F14):
+    // the last slot table the master pushed before it died is the final word on
+    // how far each standby received. A copy that is behind another backup's can
+    // still be promoted, but never unknowingly: what that one holds beyond this
+    // point is what promoting here abandons.
+    if (opts.confirmLineage !== true) {
+      const designations: { nodeId: string; priority: number }[] = state.fleetConfig?.backupDesignations ?? [];
+      const priorityOf = (id: string): number => designations.find(d => d.nodeId === id)?.priority ?? Number.MAX_SAFE_INTEGER;
+      const ahead = backupsAhead(readSlotStatus(), priorityOf(state.nodeId), priorityOf);
+      if (ahead.length > 0) {
+        const first = ahead[0];
+        const who = `backup ${first.nodeId.slice(0, 8)}`;
+        const how = first.bytesAhead === null
+          ? 'still holds a replication position on the primary while this copy holds none (its slot was invalidated, or it never attached), so there is no reading in which this copy is the fresher one'
+          : first.bytesAhead > 0
+            ? `is ahead of this copy by ${first.bytesAhead} bytes of WAL`
+            : 'received exactly as far as this copy and ranks above it in the backup order';
+        return {
+          success: false,
+          needsLineageConfirm: true,
+          aheadBy: first.bytesAhead,
+          error: `${who} ${how}, as of the last slot table the master pushed before it went quiet; promoting here makes THIS copy the fleet database and abandons whatever that one received beyond it.`,
+        };
+      }
     }
     mode = 'failover';
     firstPhase = 'promote';

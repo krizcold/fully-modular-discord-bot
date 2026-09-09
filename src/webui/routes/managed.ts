@@ -108,11 +108,12 @@ export function createManagedRoutes(botManager: BotManager): Router {
     }
   });
 
-  /** POST /api/managed/promote { confirmLag?, retireOldMaster? } */
+  /** POST /api/managed/promote { confirmLag?, confirmLineage?, retireOldMaster? } */
   router.post('/promote', async (req: Request, res: Response) => {
     try {
       const result = await startPromote(botManager, {
         confirmLag: req.body?.confirmLag === true,
+        confirmLineage: req.body?.confirmLineage === true,
         retireOldMaster: req.body?.retireOldMaster === true,
         startedBy: 'manager-promote',
       });

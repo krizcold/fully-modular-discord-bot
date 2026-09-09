@@ -2582,7 +2582,18 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     const sample = getSlotSample();
     if (!sample || sample.observedAt === pushedSlotSampleAt) return;
     pushedSlotSampleAt = sample.observedAt;
-    const payload: SlotStatusPayload = { observedAt: sample.observedAt, nodeId, term: registry.term, slots: sample.slots };
+    // Each row is stamped with the node that reports the slot as its own, so
+    // a receiver can tell WHOSE copy every row describes (20.19 F14). A slot no
+    // connected node claims stays unattributed rather than guessed at.
+    const owners = new Map<string, string>();
+    for (const node of registry.nodes.values()) {
+      if (node.dbReplicaSlot) owners.set(node.dbReplicaSlot, node.nodeId);
+    }
+    const slots = sample.slots.map(row => {
+      const owner = owners.get(row.slotName);
+      return owner ? { ...row, nodeId: owner } : row;
+    });
+    const payload: SlotStatusPayload = { observedAt: sample.observedAt, nodeId, term: registry.term, slots };
     for (const node of registry.nodes.values()) {
       if (node.isSelf || !node.connected || !node.dbReplica) continue;
       void server?.request(node.nodeId, MSG.SLOT_STATUS, payload).catch(() => { /* re-delivered on the next sample */ });

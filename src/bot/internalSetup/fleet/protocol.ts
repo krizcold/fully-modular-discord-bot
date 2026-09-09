@@ -269,6 +269,10 @@ export interface SlotStatusRow {
   walStatus: string;
   /** WAL the slot retains on the primary; null when it has no restart position. */
   retainedBytes: number | null;
+  /** restart_lsn as text: how far this standby's slot has confirmed. Null before it first attaches. */
+  restartLsn: string | null;
+  /** The node whose heartbeat reports this slot as its own; absent when no connected node claims it (20.19 F14). */
+  nodeId?: string;
 }
 
 /** SLOT_STATUS payload: the primary's slot table at one read, from the master that read it. */
@@ -292,6 +296,8 @@ export interface HeartbeatPayload {
   syncAppliedRevision?: number;
   /** False while the last reconcile ended degraded (co-worker only). */
   syncOk?: boolean;
+  /** The replication slot this node's own standby streams on, empty when it holds none; the master annotates its slot table with it (20.19 F14). */
+  dbReplicaSlot?: string;
   /** Data backend reachability (postgres nodes only; absent = file mode or pre-backend build). */
   dataBackendHealthy?: boolean;
   /** Free bytes on the data volume; feeds the postgres-to-file transformation space precheck. */

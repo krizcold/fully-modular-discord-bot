@@ -12,7 +12,7 @@ import { getMetricsCollector } from '../utils/metrics/metricsCollector';
 import { getDataReadiness } from '../utils/dataBackends/dataReadiness';
 import { getGuildDataBackend } from '../utils/dataManager';
 import { getNodeId } from './nodeIdentity';
-import { getReplicaHealth, startReplicaHealthSampler } from './replicaHealth';
+import { getLocalReplicaIdentity, getReplicaHealth, startReplicaHealthSampler } from './replicaHealth';
 import type { IngestService } from '../ingest/ingestService';
 import type {
   HeartbeatPayload,
@@ -281,6 +281,7 @@ export class LeaseRuntime {
     startFreeDiskSampler();
     startReplicaHealthSampler();
     const dbReplica = getReplicaHealth();
+    const dbReplicaSlot = getLocalReplicaIdentity()?.slotName;
     const hb: HeartbeatPayload = {
       term,
       seq: ++this.seq,
@@ -292,6 +293,13 @@ export class LeaseRuntime {
       ...(backend ? { dataBackendHealthy: backend.healthy() } : {}),
       ...(cachedFreeDiskBytes !== undefined ? { freeDiskBytes: cachedFreeDiskBytes } : {}),
       ...(dbReplica ? { dbReplica } : {}),
+      // Always sent, empty when this node cannot name a standby slot right now.
+      // Empty is read as "no claim", which costs one heartbeat of silence after
+      // a restart while the sampler warms; the alternative, omitting it to mean
+      // "unknown", would keep a REMOVED standby's claim alive, because the
+      // identity above deliberately survives a standby outage. Silence loses an
+      // advisory; a stale claim states a falsehood about a copy that is gone.
+      dbReplicaSlot: dbReplicaSlot ?? '',
     };
     this.lastHeartbeat = hb;
     return hb;

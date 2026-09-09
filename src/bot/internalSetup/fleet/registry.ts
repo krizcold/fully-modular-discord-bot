@@ -52,6 +52,8 @@ export interface RegistryNode {
   freeDiskBytes: number | null;
   /** The node's local database standby from its last heartbeat; null when it has none. */
   dbReplica: ReplicaHealthReport | null;
+  /** The slot that standby streams on, from the same heartbeat; null when unreported (20.19 F14). */
+  dbReplicaSlot: string | null;
   /** False while the node's last reconcile ended degraded; null when unreported. */
   syncOk: boolean | null;
   send: ((message: object) => void) | null;
@@ -129,6 +131,7 @@ export class Registry {
       syncOk: existing?.syncOk ?? null,
       dataBackendHealthy: existing?.dataBackendHealthy ?? null,
       dbReplica: existing?.dbReplica ?? null,
+      dbReplicaSlot: existing?.dbReplicaSlot ?? null,
       freeDiskBytes: existing?.freeDiskBytes ?? null,
       send: input.send,
     };
@@ -166,6 +169,7 @@ export class Registry {
       syncOk: null,
       dataBackendHealthy: null,
       dbReplica: null,
+      dbReplicaSlot: null,
       freeDiskBytes: null,
       send: null,
     };
@@ -195,6 +199,8 @@ export class Registry {
     if (typeof hb.syncOk === 'boolean') node.syncOk = hb.syncOk;
     if (typeof hb.dataBackendHealthy === 'boolean') node.dataBackendHealthy = hb.dataBackendHealthy;
     if (hb.dbReplica !== undefined) node.dbReplica = hb.dbReplica;
+    // Empty = this node holds no standby now, so its old claim is dropped.
+    if (typeof hb.dbReplicaSlot === 'string') node.dbReplicaSlot = hb.dbReplicaSlot || null;
     if (Number.isFinite(hb.freeDiskBytes)) node.freeDiskBytes = hb.freeDiskBytes!;
     this.replaceNodeGuilds(nodeId, Array.isArray(hb.guilds) ? hb.guilds : []);
     this.adoptHeartbeatClaims(nodeId, hb);

@@ -1111,15 +1111,22 @@ function FleetPromoteCard({ api, fleet, reload }) {
         : 'TRANSFER master to this instance?\n\nZero data loss: the old database is fenced at a known point, the copy here catches up to it, then becomes the fleet database. The old master keeps serving its shards until this node moves them, then rejoins as a co-worker. Writes are refused for a few seconds around the switch; Discord sessions stay up.';
     if (!confirm(text)) return;
     setBusy(true);
-    post({ retireOldMaster })
-      .then((res) => {
-        if (res && res.success === false && res.needsLagConfirm) {
-          const behind = res.lagMs != null ? Math.round(res.lagMs / 1000) + 's' : 'an unknown amount of time';
-          if (!confirm(`Nothing answers on the old master or its database, and this machine's copy last replayed a transaction ${behind} ago.\n\nPromoting makes that copy the fleet database, so anything the old one accepted after that point is LOST. Continue?`)) return null;
-          return post({ retireOldMaster, confirmLag: true });
-        }
-        return res;
-      })
+    // The engine checks the RPO first and the lineage after it, so either can
+    // arrive on the answer to the other; each is asked once and carried on.
+    const attempt = (body) => post(body).then((res) => {
+      if (!res || res.success !== false) return res;
+      if (res.needsLagConfirm && !body.confirmLag) {
+        const behind = res.lagMs != null ? Math.round(res.lagMs / 1000) + 's' : 'an unknown amount of time';
+        if (!confirm(`Nothing answers on the old master or its database, and this machine's copy last replayed a transaction ${behind} ago.\n\nPromoting makes that copy the fleet database, so anything the old one accepted after that point is LOST. Continue?`)) return null;
+        return attempt({ ...body, confirmLag: true });
+      }
+      if (res.needsLineageConfirm && !body.confirmLineage) {
+        if (!confirm((res.error || 'Another designated backup received further than this copy.') + '\n\nPromote this copy anyway?')) return null;
+        return attempt({ ...body, confirmLineage: true });
+      }
+      return res;
+    });
+    attempt({ retireOldMaster })
       .then((res) => {
         if (res === null) return;
         if (!res || res.success === false) { showToast((res && res.error) || 'Promotion failed', 'error'); return; }

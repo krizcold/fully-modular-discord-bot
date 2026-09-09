@@ -316,6 +316,7 @@ export function createFleetRoutes(botManager: BotManager): Router {
     try {
       const result = await startPromote(botManager, {
         confirmLag: req.body?.confirmLag === true,
+        confirmLineage: req.body?.confirmLineage === true,
         retireOldMaster: req.body?.retireOldMaster === true,
       });
       if (!result.success) console.warn(`[Fleet] Promotion refused: ${result.error}`);

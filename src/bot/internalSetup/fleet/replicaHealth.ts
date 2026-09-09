@@ -146,6 +146,7 @@ const SLOT_SQL = `
   SELECT slot_name,
          active,
          wal_status,
+         restart_lsn::text AS restart_lsn,
          CASE WHEN restart_lsn IS NULL OR pg_is_in_recovery() THEN NULL
               ELSE pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) END AS retained_bytes
     FROM pg_replication_slots
@@ -166,6 +167,7 @@ async function sampleSlotTable(): Promise<void> {
         retainedBytes: row.retained_bytes === null || row.retained_bytes === undefined
           ? null
           : Number(row.retained_bytes),
+        restartLsn: row.restart_lsn === null || row.restart_lsn === undefined ? null : String(row.restart_lsn),
       })),
     };
   } catch {
