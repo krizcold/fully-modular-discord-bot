@@ -14,6 +14,7 @@ import { BotManager } from '../botManager';
 import { readPromoteRecord } from '../../bot/internalSetup/fleet/promoteRecord';
 import { clearCopyBlock, copyBlockEndpoint, readCopyBlock, readSuperseded, writeCopyBlock, writeFreshFleetConfirm } from '../../bot/internalSetup/fleet/stepDown';
 import { readSlotStatus, slotLostVerdict, sourceMatchesAny } from '../../bot/internalSetup/fleet/slotStatus';
+import { effectiveFleetConfigView } from '../../bot/internalSetup/fleet/fleetConfig';
 import { loadCredentials } from '../../utils/envLoader';
 import { runDemote } from '../lifecycleActions';
 import { cancelPromote, continuePromote, startPromote } from '../promoteEngine';
@@ -84,6 +85,11 @@ export function createManagedRoutes(botManager: BotManager): Router {
         term: state?.term ?? null,
         standalone: state?.standalone === true,
         backupMaster: state?.backupMaster === true,
+        // Both halves of the active-mode key (20.5): what this node consents to,
+        // and what the master's stored designation actually enabled.
+        backupMode: effectiveFleetConfigView().backupDesignations
+          .find(d => d.nodeId === state?.nodeId)?.mode === 'active' ? 'active' : 'passive',
+        activeCapable: state?.activeCapable === true,
         /** This node's container carries a standby endpoint; null while the bot is down. */
         dbReplica: state ? state.dbReplica === true : null,
         superseded: readSuperseded(),

@@ -5,7 +5,7 @@ import { performance } from 'perf_hooks';
 import { CONTROL_PORT_DEFAULT, LEASE_TTL_MS, PROTOCOL_VERSION } from './constants';
 import { getShardSource, isPinEnabled, resolveShardCapacity } from './placement';
 import type { BudgetInfo, NodeRole } from './protocol';
-import { isBackupMaster, readRoleOverride } from './nodeIdentity';
+import { consentsToActiveMode, isBackupMaster, readRoleOverride } from './nodeIdentity';
 import { effectiveFleetConfigView, effectiveMasterUrls } from './fleetConfig';
 import { hasDbReplica } from './replicaPromotion';
 import type { Registry } from './registry';
@@ -32,7 +32,7 @@ export interface FleetStateNode {
   connected: boolean;
   health: 'up' | 'late' | 'down';
   appVersion: string;
-  capabilities: { shardCapacity: number; dataBackend: string; backupMaster?: boolean };
+  capabilities: { shardCapacity: number; dataBackend: string; backupMaster?: boolean; activeCapable?: boolean };
   capacity: number;
   onHold: boolean;
   shardIds: number[];
@@ -119,6 +119,8 @@ export interface FleetState {
   roleOverride: { role: NodeRole; setBy: string; setAt: number } | null;
   /** This node is the designated backup master (BOT_NODE_ROLE=backup-master). */
   backupMaster: boolean;
+  /** This node CONSENTS to active stand-in mode (FLEET_BACKUP_MODE=active); the master's stored entry still has to enable it (20.5). */
+  activeCapable: boolean;
   /** A manager-provisioned standby of the fleet database lives on this machine; promotion takes the pair. */
   dbReplica: boolean;
   /** Fleet master: ms the term-row stamp has been failing; null while stamping succeeds (or off-postgres). */
@@ -401,6 +403,7 @@ export function getFleetState(): FleetState {
       superseded,
       roleOverride: buildRoleOverrideView(),
       backupMaster: isBackupMaster(),
+      activeCapable: consentsToActiveMode(),
       dbReplica: hasDbReplica(),
       termStampFailingForMs: null,
       masterUrls: effectiveMasterUrls().urls,
@@ -513,6 +516,7 @@ export function getFleetState(): FleetState {
       superseded,
       roleOverride: buildRoleOverrideView(),
       backupMaster: isBackupMaster(),
+      activeCapable: consentsToActiveMode(),
       dbReplica: hasDbReplica(),
       termStampFailingForMs: sources.termStamp?.() ?? null,
       masterUrls: effectiveMasterUrls().urls,
@@ -617,6 +621,7 @@ export function getFleetState(): FleetState {
     superseded,
     roleOverride: buildRoleOverrideView(),
     backupMaster: isBackupMaster(),
+    activeCapable: consentsToActiveMode(),
     dbReplica: hasDbReplica(),
     termStampFailingForMs: null,
     masterUrls: effectiveMasterUrls().urls,

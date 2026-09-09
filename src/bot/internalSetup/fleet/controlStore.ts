@@ -3,7 +3,7 @@
 // store with real CAS replaces it for multi-master durability later, behind
 // this same interface.
 
-import type { LeaseInfo, MigrationKind, NodeCapabilities, TransferDirection } from './protocol';
+import type { BackupDesignation, LeaseInfo, MigrationKind, NodeCapabilities, TransferDirection } from './protocol';
 import type { LossEvent } from './healthMonitor';
 
 export interface PersistedTerm {
@@ -182,7 +182,7 @@ export interface PersistedFleetConfig {
   /** Ordered master-candidate dial list (ws/wss URLs). */
   masterCandidates: string[];
   /** Designated backups; priority orders stand-in election (B5 consumes it). */
-  backupDesignations: { nodeId: string; priority: number }[];
+  backupDesignations: BackupDesignation[];
   /** Witness beacon channel id; absent = owner DM default (PLAN_REPLICATION 20.6). */
   witnessChannelId?: string;
   updatedAt: number;

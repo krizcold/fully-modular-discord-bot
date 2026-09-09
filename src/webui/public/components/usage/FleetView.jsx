@@ -969,11 +969,26 @@ function FleetConfigCard({ api, fleet }) {
     const node = (fleet.nodes || []).find((n) => n.nodeId === id);
     return node ? node.nodeName : id.slice(0, 8);
   };
+  // Active mode needs BOTH keys: this is the node's half, and the master cannot
+  // supply it (20.5). A node that has not registered here cannot be shown to
+  // consent, so it reads as passive.
+  const consents = (id) => {
+    const node = (fleet.nodes || []).find((n) => n.nodeId === id);
+    return !!(node && node.capabilities && node.capabilities.activeCapable);
+  };
+  const toggleMode = (i) => {
+    const next = [...backupsDraft];
+    next[i] = next[i].mode === 'active'
+      ? { nodeId: next[i].nodeId, priority: next[i].priority }
+      : { nodeId: next[i].nodeId, priority: next[i].priority, mode: 'active' };
+    setBackupsDraft(next);
+    setBackupsEdited(true);
+  };
   const save = () => {
     if (busy) return;
     const urls = draft.split('\n').map((u) => u.trim()).filter(Boolean);
     setBusy(true);
-    api.post('/fleet/config', { masterCandidates: urls, witnessChannelId: witnessDraft.trim(), ...(backupsEdited ? { backupDesignations: backupsDraft.map((d, i) => ({ nodeId: d.nodeId, priority: i + 1 })) } : {}) })
+    api.post('/fleet/config', { masterCandidates: urls, witnessChannelId: witnessDraft.trim(), ...(backupsEdited ? { backupDesignations: backupsDraft.map((d, i) => (d.mode === 'active' ? { nodeId: d.nodeId, priority: i + 1, mode: 'active' } : { nodeId: d.nodeId, priority: i + 1 })) } : {}) })
       .then((res) => {
         if (!res || res.success === false) { showToast((res && res.error) || 'Config update failed', 'error'); return; }
         showToast(`Fleet config saved (revision ${res.revision}) and pushed to every node`, 'success');
@@ -1005,13 +1020,23 @@ function FleetConfigCard({ api, fleet }) {
           />
           {backupsDraft.length > 0 && (
             <div style={{ marginTop: '6px' }}>
-              <div className="usage-stat-sub">Backup order: the first stands in first, and breaks a tie between equally fresh copies</div>
+              <div className="usage-stat-sub">Backup order: the first stands in first, and breaks a tie between equally fresh copies. Active mode lets a backup stand in temporarily while the master is gone, and needs that node's own consent too.</div>
               {backupsDraft.map((d, i) => (
                 <div key={d.nodeId} style={{ display: 'flex', alignItems: 'center', gap: '6px', marginTop: '2px' }}>
                   <span style={{ fontFamily: 'monospace', fontSize: '0.75rem' }}>{`${i + 1}. ${nodeName(d.nodeId)}`}</span>
                   <button onClick={() => move(i, -1)} disabled={busy || i === 0} style={{ fontSize: '0.7rem', padding: '1px 6px' }}>Up</button>
                   <button onClick={() => move(i, 1)} disabled={busy || i === backupsDraft.length - 1} style={{ fontSize: '0.7rem', padding: '1px 6px' }}>Down</button>
-                  <button onClick={() => { setBackupsDraft(backupsDraft.filter((_, j) => j !== i)); setBackupsEdited(true); }} disabled={busy} style={{ fontSize: '0.7rem', padding: '1px 6px' }} title="Removed from the order; the node is designated again on its next register while its env still says backup-master">Remove</button>
+                  <button
+                    onClick={() => toggleMode(i)}
+                    disabled={busy || (!consents(d.nodeId) && d.mode !== 'active')}
+                    style={{ fontSize: '0.7rem', padding: '1px 6px' }}
+                    title={consents(d.nodeId)
+                      ? 'Active lets this backup stand in temporarily while the master is gone; passive means it only stores data'
+                      : 'This node has not declared FLEET_BACKUP_MODE=active, so it cannot be enabled for active mode from here'}
+                  >
+                    {d.mode === 'active' ? 'Active' : 'Passive'}
+                  </button>
+                  <button onClick={() => { setBackupsDraft(backupsDraft.filter((_, j) => j !== i)); setBackupsEdited(true); }} disabled={busy} style={{ fontSize: '0.7rem', padding: '1px 6px' }} title="Removed from the order; the node is designated again on its next register while its env still says backup-master, but its active mode does NOT come back on its own">Remove</button>
                 </div>
               ))}
             </div>

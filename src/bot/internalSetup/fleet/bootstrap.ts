@@ -28,6 +28,7 @@ import {
 import { DataBackendInfo, FleetConfigPayload, HeartbeatPayload, LeaseGrantPayload, LeaseInfo, LeaseRenewedPayload, LeaseRevokePayload, MSG, NodeCapabilities, NodeDrainPayload, NodeRole, RegisterPayload, RegisterResult, SlotStatusPayload } from './protocol';
 import {
   clearRoleOverride,
+  consentsToActiveMode,
   consumeTakeoverFlags,
   getAppVersion,
   getNodeId,
@@ -84,7 +85,7 @@ import { MigrationExecutor } from './migration/migrationExecutor';
 import { TransformationCoordinator } from './transformation/transformationCoordinator';
 import { TransformationExecutor } from './transformation/transformationExecutor';
 import type { ControlStore, PersistedFleetConfig, PersistedTerm, TransformDirection } from './controlStore';
-import { effectiveFleetConfigView, effectiveMasterUrls, readFleetConfigCache, validateMasterCandidates, renumberDesignations, validateBackupDesignations, validateWitnessChannelId, writeFleetConfigCache } from './fleetConfig';
+import { effectiveFleetConfigView, effectiveMasterUrls, forcePassive, readFleetConfigCache, validateMasterCandidates, renumberDesignations, validateBackupDesignations, validateWitnessChannelId, writeFleetConfigCache } from './fleetConfig';
 import { getLocalReplicaIdentity, getReplicaHealth, getSlotSample, setReplicaProbeListener } from './replicaHealth';
 import { hasDbReplica } from './replicaPromotion';
 import { clearSlotStatus, readSlotStatus, recordFromPush, sourceMatchesAny, writeSlotStatus } from './slotStatus';
@@ -294,6 +295,7 @@ export async function initFleet(): Promise<FleetContext> {
     dataBackend: resolveDataBackend(),
     ...(advertisedTransferUrl ? { transferUrl: advertisedTransferUrl } : {}),
     ...(isBackupMaster() ? { backupMaster: true } : {}),
+    ...(consentsToActiveMode() ? { activeCapable: true } : {}),
   };
 
   context = role === 'master'
@@ -897,7 +899,9 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     let designations: { nodeId: string; priority: number }[] | undefined;
     if (backupDesignations !== undefined) {
       const known = new Set<string>([...registry.nodes.keys(), ...fleetConfig.backupDesignations.map(d => d.nodeId)]);
-      const order = validateBackupDesignations(backupDesignations, known);
+      // A node absent from the registry cannot be shown to consent, and silence
+      // never buys active mode (20.5, B6 map F7).
+      const order = validateBackupDesignations(backupDesignations, known, id => registry.nodes.get(id)?.capabilities?.activeCapable === true);
       if (!order.ok) return { ok: false, error: order.error };
       if (order.designations.some(d => d.nodeId === nodeId)) return { ok: false, error: 'the master is not its own backup' };
       designations = order.designations;
@@ -2297,6 +2301,18 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
             updatedAt: Date.now(),
           };
           persistFleetConfig(`backup designation withdrawn ${payload.nodeName || payload.nodeId}`);
+        } else if (fleetConfig && listed && payload.capabilities?.activeCapable !== true
+          && fleetConfig.backupDesignations.some(d => d.nodeId === payload.nodeId && d.mode === 'active')) {
+          // Consent withdrawn (or never declared by this build): the enable goes.
+          // Only ever downward, so a master's own downgrade is never undone here
+          // and re-enabling stays the master operator's act (20.5, B6 map F7).
+          fleetConfig = {
+            ...fleetConfig,
+            revision: fleetConfig.revision + 1,
+            backupDesignations: forcePassive(fleetConfig.backupDesignations, payload.nodeId),
+            updatedAt: Date.now(),
+          };
+          persistFleetConfig(`active mode withdrawn ${payload.nodeName || payload.nodeId}`);
         }
         // B4 facts: the node this master superseded learns it here (and
         // whether the owner asked to retire it); designated backups get the

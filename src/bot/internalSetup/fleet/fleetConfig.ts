@@ -9,7 +9,7 @@ import { dataPath } from '../../../utils/dataRoot';
 import { FLEET_DIR } from './constants';
 import { atomicWriteFileSync } from './fileControlStore';
 import { resolveMasterUrls, stripSelfUrl } from './nodeIdentity';
-import type { FleetConfigPayload } from './protocol';
+import type { BackupDesignation, FleetConfigPayload } from './protocol';
 
 const cacheFile = () => dataPath('global', FLEET_DIR, 'config-cache.json');
 
@@ -21,7 +21,9 @@ export function readFleetConfigCache(): FleetConfigPayload | null {
       revision: Number(parsed.revision),
       masterCandidates: parsed.masterCandidates.filter((u: unknown) => typeof u === 'string'),
       backupDesignations: Array.isArray(parsed.backupDesignations)
-        ? parsed.backupDesignations.filter((d: any) => typeof d?.nodeId === 'string' && Number.isFinite(d?.priority))
+        ? parsed.backupDesignations
+          .filter((d: any) => typeof d?.nodeId === 'string' && Number.isFinite(d?.priority))
+          .map((d: any) => (d.mode === 'active' ? { nodeId: d.nodeId, priority: d.priority, mode: 'active' as const } : { nodeId: d.nodeId, priority: d.priority }))
         : [],
       ...(typeof parsed.witnessChannelId === 'string' && parsed.witnessChannelId !== ''
         ? { witnessChannelId: parsed.witnessChannelId }
@@ -49,7 +51,7 @@ export function effectiveMasterUrls(): { urls: string[]; source: 'runtime' | 'en
 }
 
 /** Fleet-state view of the config in force on this node (workers and pre-init reads). */
-export function effectiveFleetConfigView(): { revision: number; masterCandidates: string[]; backupDesignations: { nodeId: string; priority: number }[]; witnessChannelId?: string; source: 'runtime' | 'env' } {
+export function effectiveFleetConfigView(): { revision: number; masterCandidates: string[]; backupDesignations: BackupDesignation[]; witnessChannelId?: string; source: 'runtime' | 'env' } {
   const cached = readFleetConfigCache();
   if (cached) {
     return {
@@ -99,21 +101,35 @@ export function validateWitnessChannelId(input: unknown): { ok: true; value: str
  * now, or already designated) may be listed, each once. An empty list is
  * allowed: the next register of a backup-master designates it again.
  */
-export function validateBackupDesignations(input: unknown, known: Set<string>): { ok: true; designations: { nodeId: string; priority: number }[] } | { ok: false; error: string } {
+export function validateBackupDesignations(input: unknown, known: Set<string>, activeCapable?: (nodeId: string) => boolean): { ok: true; designations: BackupDesignation[] } | { ok: false; error: string } {
   if (!Array.isArray(input)) return { ok: false, error: 'backupDesignations must be a list' };
   if (input.length > 16) return { ok: false, error: 'backupDesignations is capped at 16 entries' };
   const ids: string[] = [];
+  const active = new Set<string>();
   for (const raw of input) {
     const nodeId = typeof raw === 'string' ? raw.trim() : typeof raw?.nodeId === 'string' ? raw.nodeId.trim() : '';
     if (nodeId === '') return { ok: false, error: 'backupDesignations entries must name a node id' };
     if (!known.has(nodeId)) return { ok: false, error: `node ${nodeId.slice(0, 8)} is not known to this master` };
     if (ids.includes(nodeId)) return { ok: false, error: `node ${nodeId.slice(0, 8)} is listed twice` };
+    // The master owns the ENABLE, never the consent: it may not put a node into a
+    // mode that node's own capability declines (20.5, B6 map F7).
+    if (typeof raw !== 'string' && raw?.mode === 'active') {
+      if (activeCapable && !activeCapable(nodeId)) {
+        return { ok: false, error: `node ${nodeId.slice(0, 8)} does not declare active mode, so it cannot be enabled for it here` };
+      }
+      active.add(nodeId);
+    }
     ids.push(nodeId);
   }
-  return { ok: true, designations: ids.map((nodeId, index) => ({ nodeId, priority: index + 1 })) };
+  return { ok: true, designations: ids.map((nodeId, index) => (active.has(nodeId) ? { nodeId, priority: index + 1, mode: 'active' as const } : { nodeId, priority: index + 1 })) };
 }
 
-/** Priorities are 1..n in order; a removal closes the gap. */
-export function renumberDesignations(list: { nodeId: string; priority: number }[]): { nodeId: string; priority: number }[] {
-  return [...list].sort((a, b) => a.priority - b.priority).map((d, index) => ({ nodeId: d.nodeId, priority: index + 1 }));
+/** Priorities are 1..n in order; a removal closes the gap. The mode rides along: it is the master's own enable, not a function of the order. */
+export function renumberDesignations(list: BackupDesignation[]): BackupDesignation[] {
+  return [...list].sort((a, b) => a.priority - b.priority).map((d, index) => (d.mode === 'active' ? { nodeId: d.nodeId, priority: index + 1, mode: 'active' as const } : { nodeId: d.nodeId, priority: index + 1 }));
+}
+
+/** Drop an entry's active enable, keeping everything else (a node that withdrew its consent). */
+export function forcePassive(list: BackupDesignation[], nodeId: string): BackupDesignation[] {
+  return list.map(d => (d.nodeId === nodeId ? { nodeId: d.nodeId, priority: d.priority } : d));
 }
