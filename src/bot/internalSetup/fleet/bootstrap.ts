@@ -25,7 +25,7 @@ import {
   TERM_TAKEOVER_STALE_MS,
   XFER_COMMIT_RETRY_MS,
 } from './constants';
-import { DataBackendInfo, FleetConfigPayload, HeartbeatPayload, LeaseGrantPayload, LeaseInfo, LeaseRenewedPayload, LeaseRevokePayload, MSG, NodeCapabilities, NodeDrainPayload, NodeRole, RegisterPayload, RegisterResult, SlotStatusPayload } from './protocol';
+import { DataBackendInfo, FleetConfigPayload, HeartbeatPayload, LeaseGrantPayload, LeaseInfo, LeaseRenewedPayload, LeaseRevokePayload, MSG, NodeCapabilities, NodeDrainPayload, NodeRole, RegisterPayload, RegisterResult, SlotStatusPayload, SyncPosturePayload } from './protocol';
 import {
   clearRoleOverride,
   consentsToActiveMode,
@@ -91,6 +91,7 @@ import { getLocalReplicaIdentity, getReplicaHealth, getSlotSample, setReplicaPro
 import { hasDbReplica } from './replicaPromotion';
 import { clearSlotStatus, readSlotStatus, recordFromPush, sourceMatchesAny, writeSlotStatus } from './slotStatus';
 import { startSyncPostureEngine, SyncPostureEngine, SyncPostureTarget } from './syncPostureEngine';
+import { clearSyncPostureRecord, recordFromPosturePush, writeSyncPostureRecord } from './syncPostureFact';
 import { DiscordWitness, FleetWitness, startWitnessLoop, WitnessStatus } from './witness';
 import { probePeerTerm } from './peerTermProbe';
 import { probeStoreEmpty } from './emptyStore';
@@ -669,8 +670,10 @@ function guardSleep(ms: number): Promise<void> {
 
 async function initMaster(init: CommonInit & { standalone: boolean }): Promise<FleetContext> {
   // A master follows no slot: a record left by this node's co-worker past must
-  // not keep answering the manager's facts hook.
+  // not keep answering the manager's facts hook. The posture fact goes with it,
+  // for the same reason: a master is not a standby of itself.
   clearSlotStatus();
+  clearSyncPostureRecord();
   _setSlotStatus(null);
   const { standalone, nodeId, nodeName, appVersion, capabilities, runtime } = init;
   const ingest = getIngestService();
@@ -2616,6 +2619,68 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     }
   }
 
+  // The in-sync fact (B6 map F23). The watchdog publishes fire and forget, so
+  // identity is stamped here and writes are serialised with latest-wins: an
+  // older publish that overtakes a newer one must never become the stored
+  // truth, and the stored truth is what every standby replays.
+  let publishedPosture: SyncPosturePayload | null = null;
+  let posturePending: SyncPosturePayload | null = null;
+  let postureWriting = false;
+  const drainPostureWrites = async (): Promise<void> => {
+    if (postureWriting) return;
+    postureWriting = true;
+    try {
+      while (posturePending) {
+        const next = posturePending;
+        posturePending = null;
+        try {
+          await store.saveSyncPosture(next);
+        } catch (error) {
+          console.warn(`[Fleet] Could not record the synchronous posture: ${error instanceof Error ? error.message : error}`);
+          // Requeued, never dropped: this row is the carrier that survives the
+          // master's death, so a lost write could strand every standby holding
+          // an "armed" attestation nothing will ever correct. Retried on the
+          // heartbeat tick rather than here, because a store that is down would
+          // spin this loop.
+          if (!posturePending) posturePending = next;
+          break;
+        }
+      }
+    } finally {
+      postureWriting = false;
+    }
+  };
+  const publishSyncPosture = (fact: { state: 'armed' | 'relaxed'; slotName: string | null; nodeId: string | null; heldToLsn: string | null }): void => {
+    const stamped: SyncPosturePayload = { ...fact, updatedAt: Date.now(), masterNodeId: nodeId, term: registry.term };
+    publishedPosture = stamped;
+    posturePending = stamped;
+    void drainPostureWrites();
+  };
+
+  // The second carrier: the same fact on the push lane, for display and for the
+  // fast path. It STOPS being pushed once it outlives its own refresh, so a
+  // watchdog that died cannot keep an "armed" claim alive by repetition; the
+  // receiver's window then expires and the claim disarms itself.
+  const POSTURE_PUSH_MAX_AGE_MS = 90_000;
+  const posturePushed = new Map<string, number>();
+  const pushSyncPosture = (): void => {
+    if (posturePending) void drainPostureWrites();
+    const fact = publishedPosture;
+    if (!fact || Date.now() - fact.updatedAt >= POSTURE_PUSH_MAX_AGE_MS) return;
+    for (const node of registry.nodes.values()) {
+      // Forgetting a node that is gone is what re-delivers the current fact to
+      // it when it comes back, instead of leaving it to wait out a refresh.
+      if (node.isSelf || !node.connected || !node.dbReplica) { posturePushed.delete(node.nodeId); continue; }
+      // Once per ATTESTATION, not once per tick: the receiver stamps its own
+      // freshness clock on arrival, so re-sending an unchanged fact would keep
+      // renewing a claim the master had stopped making.
+      if (posturePushed.get(node.nodeId) === fact.updatedAt) continue;
+      posturePushed.set(node.nodeId, fact.updatedAt);
+      void server?.request(node.nodeId, MSG.SYNC_POSTURE, fact)
+        .catch(() => { posturePushed.delete(node.nodeId); });
+    }
+  };
+
   // Synchronous posture (20.5 active mode, B6 map F12-F17). While a designated
   // ACTIVE backup is provably keeping up, this master holds its own primary
   // waiting for that copy, so a stand-in's data really would be every
@@ -2624,6 +2689,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   if (!standalone && !controlFenced && resolveDataBackend() === 'postgres') {
     const engine = startSyncPostureEngine({
       url: () => getActiveBackendUrl(),
+      publish: fact => publishSyncPosture(fact),
       // Every eligible backup in priority order, not just the first: whether a
       // copy is actually streaming is the engine's evidence to weigh, and one
       // broken high-priority backup must not hide a working lower one (F14).
@@ -2680,6 +2746,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     registry.recordHeartbeat(nodeId, runtime.buildHeartbeat(registry.term));
     healthMonitor?.tick();
     pushSlotStatus();
+    pushSyncPosture();
     // Witness consumer (20.6): a FRESH beacon with a higher term from another
     // node means a newer master is up, whether or not this node's own store
     // could tell it (a dead store never fences). Begin or finish the step-down.
@@ -2813,6 +2880,7 @@ async function initCoWorker(init: CommonInit): Promise<FleetContext> {
     _setSlotStatus(readSlotStatus());
   } else {
     clearSlotStatus();
+    clearSyncPostureRecord();
   }
   // The standby's own probe outranks a stale relay: a receiver that is
   // streaming proves the slot is not lost or gone (a re-seeded copy behind a
@@ -2825,6 +2893,9 @@ async function initCoWorker(init: CommonInit): Promise<FleetContext> {
   let streamingProbes = 0;
   setReplicaProbeListener(report => {
     if (report.error) { streamingProbes = 0; return; }
+    // A copy out of recovery is nobody's standby any more, so the posture
+    // recorded about it goes too, whether or not a slot record exists.
+    if (!report.inRecovery) clearSyncPostureRecord();
     const record = readSlotStatus();
     // Counted only against a recorded lost or absent slot, so the streak from
     // the hours of healthy streaming before the loss is never inherited.
@@ -2924,6 +2995,18 @@ async function initCoWorker(init: CommonInit): Promise<FleetContext> {
         writeSlotStatus(record);
         _setSlotStatus(record);
         pushFleetStatusNow();
+      },
+      onSyncPosture: payload => {
+        // Filed whatever it names: a fact that names ANOTHER copy is exactly
+        // how this node learns it is not the one being waited for.
+        const identity = getLocalReplicaIdentity();
+        if (!identity?.slotName) return;
+        // A copy out of recovery (promoted) follows no master's posture, the
+        // same refusal the slot handler makes on the same evidence.
+        const health = getReplicaHealth();
+        if (health && !health.error && !health.inRecovery) return;
+        const record = recordFromPosturePush(payload, identity.sourceHost ? sourceMatchesAny(identity, getDeliveredBackendUrls()) : null);
+        if (record) writeSyncPostureRecord(record);
       },
       onXferControl: (type, data) => executor!.handle(type, data),
       onTransformControl: (type, data) => transformExecutor.handle(type, data),

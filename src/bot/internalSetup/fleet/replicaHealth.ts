@@ -22,6 +22,7 @@
 import { getGuildDataBackend } from '../utils/dataManager';
 import { PostgresBackend } from '../utils/dataBackends/postgresBackend';
 import { probeReplica, resolveReplicaEndpoints, spliceFleetCredentials } from './replicaPromotion';
+import { readReplayedSyncPosture, type ReplayedSyncPosture } from './syncPostureFact';
 import type { ReplicaHealthReport, SlotStatusRow } from './protocol';
 
 const SAMPLE_MS = 60_000;
@@ -49,6 +50,7 @@ export interface LocalReplicaIdentity {
 }
 
 let replicaHealth: ReplicaHealthReport | undefined;
+let replayedPosture: ReplayedSyncPosture | undefined;
 let localIdentity: LocalReplicaIdentity | undefined;
 let standbyLinks: StandbyLinkView[] | undefined;
 let slotSample: SlotSample | undefined;
@@ -58,6 +60,16 @@ let probeListener: ((report: ReplicaHealthReport) => void) | undefined;
 /** Called after every local standby probe; the co-worker uses it to drop a slot record the standby itself contradicts. */
 export function setReplicaProbeListener(listener: (report: ReplicaHealthReport) => void): void {
   probeListener = listener;
+}
+
+/**
+ * The sync posture this node's own copy has REPLAYED (B6 map F23). It arrives
+ * through the replication stream rather than any protocol, so it is read from
+ * the copy itself; undefined until a read succeeds, which is not evidence of
+ * anything either way.
+ */
+export function getReplayedSyncPosture(): ReplayedSyncPosture | undefined {
+  return replayedPosture;
 }
 
 /** Cached standby view for the heartbeat; undefined when this node has no replica. */
@@ -85,6 +97,7 @@ async function sampleLocalReplica(): Promise<void> {
   if (!endpoints) {
     replicaHealth = undefined;
     localIdentity = undefined;
+    replayedPosture = undefined;
     return;
   }
   const spliced = spliceFleetCredentials(endpoints.local);
@@ -116,6 +129,11 @@ async function sampleLocalReplica(): Promise<void> {
       sourceAt: probe.sourceHost ? Date.now() : localIdentity?.sourceAt ?? 0,
     };
   }
+  // Kept on a failed read rather than cleared: the row is durable in the copy,
+  // so a momentary read fault is not the same as the row being absent, and the
+  // verdict ages the cached read out on its own.
+  const replayed = await readReplayedSyncPosture(spliced.url);
+  if (replayed) replayedPosture = replayed;
   try { probeListener?.(replicaHealth); } catch { /* a listener fault never blocks the sampler */ }
 }
 

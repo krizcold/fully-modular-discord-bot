@@ -73,6 +73,7 @@ export const MSG = {
   CONFIG_UPDATE: 'control:config:update',
   /** Master -> standby-hosting node push of the primary's replication slot table (20.17 slot signal); ack is a receipt. */
   SLOT_STATUS: 'control:slot:status',
+  SYNC_POSTURE: 'control:sync:posture',
   /**
    * New master -> superseded master (B4): "I hold a higher term, step down".
    * Answered ahead of the not-registered gate like TERM_PROBE (the sender
@@ -285,6 +286,26 @@ export interface SlotStatusRow {
   restartLsn: string | null;
   /** The node whose heartbeat reports this slot as its own; absent when no connected node claims it (20.19 F14). */
   nodeId?: string;
+}
+
+/**
+ * SYNC_POSTURE payload, and the shape of the fact in BOTH carriers (B6 map
+ * F23): the master's own account of whether it was synchronously waiting for a
+ * copy, and how far that reached. Stamped with the master's identity exactly as
+ * the slot table is, so a fact from a former master is recognisable as one.
+ */
+export interface SyncPosturePayload {
+  state: 'armed' | 'relaxed';
+  /** The copy being waited for; null while relaxed. */
+  slotName: string | null;
+  /** The node hosting that copy; null while relaxed. */
+  nodeId: string | null;
+  /** The primary's write position when this was attested; null while relaxed. */
+  heldToLsn: string | null;
+  /** The master's clock; also the ordering key, because publishes are fire and forget. */
+  updatedAt: number;
+  masterNodeId: string;
+  term: number;
 }
 
 /** SLOT_STATUS payload: the primary's slot table at one read, from the master that read it. */

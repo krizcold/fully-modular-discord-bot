@@ -5,6 +5,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { dataPath } from '../../../utils/dataRoot';
 import { FLEET_DIR } from './constants';
+import type { SyncPosturePayload } from './protocol';
 import type { ControlStore, PersistedFleetConfig, PersistedMigrations, PersistedPlan, PersistedRegistry, PersistedTerm, RedistributeProposal, ReshardArchive, ReshardMarker, TransformationRecord } from './controlStore';
 
 export function atomicWriteFileSync(file: string, contents: string): void {
@@ -161,4 +162,17 @@ export class FileControlStore implements ControlStore {
     if (!parsed || typeof parsed.id !== 'string' || !Array.isArray(parsed.nodes)) return null;
     return parsed;
   }
+
+  // A file-mode fleet replicates nothing, so this row reaches nobody. It is
+  // still stored and read back so the posture survives a restart on a node
+  // that later moves to postgres, and so the interface has one meaning.
+  async saveSyncPosture(fact: SyncPosturePayload | null): Promise<void> {
+    const file = this.file('control-sync-posture.json');
+    if (fact === null) {
+      try { fs.unlinkSync(file); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+      return;
+    }
+    atomicWriteFileSync(file, JSON.stringify(fact, null, 2));
+  }
+
 }

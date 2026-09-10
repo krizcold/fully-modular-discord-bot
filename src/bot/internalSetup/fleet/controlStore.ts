@@ -3,7 +3,7 @@
 // store with real CAS replaces it for multi-master durability later, behind
 // this same interface.
 
-import type { BackupDesignation, LeaseInfo, MigrationKind, NodeCapabilities, TransferDirection } from './protocol';
+import type { BackupDesignation, LeaseInfo, MigrationKind, NodeCapabilities, SyncPosturePayload, TransferDirection } from './protocol';
 import type { LossEvent } from './healthMonitor';
 
 export interface PersistedTerm {
@@ -213,4 +213,11 @@ export interface ControlStore {
   /** Persist the backend transformation record (every state transition); null clears it. */
   saveTransformation(record: TransformationRecord | null): Promise<void>;
   loadTransformation(): Promise<TransformationRecord | null>;
+  /**
+   * The master's synchronous posture (B6 map F23). On postgres this row is the
+   * point: it lives in the replicated cluster, so every standby replays it with
+   * no protocol at all, and while the posture is ARMED the row's own write is
+   * synchronous, which is what makes a replayed row evidence rather than gossip.
+   */
+  saveSyncPosture(fact: SyncPosturePayload | null): Promise<void>;
 }

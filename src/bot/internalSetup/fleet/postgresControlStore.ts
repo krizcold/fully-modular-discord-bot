@@ -13,6 +13,7 @@ import { PostgresBackend } from '../utils/dataBackends/postgresBackend';
 import { FileControlStore, atomicWriteFileSync } from './fileControlStore';
 import { FLEET_DIR } from './constants';
 import { watchPoolForSyncWaitCancel } from '../utils/syncWaitCancel';
+import type { SyncPosturePayload } from './protocol';
 import type {
   ControlStore,
   PersistedFleetConfig,
@@ -34,6 +35,10 @@ const SEED_RETRY_MS = 5000;
 // that finds it must export the documents back before serving.
 const MOVED_SENTINEL = () => dataPath('global', FLEET_DIR, 'control-store-moved.json');
 
+// The documents that MIGRATE between the file and postgres stores. The sync
+// posture row is deliberately absent: it describes one live cluster's
+// relationship to one live copy, so carrying it across a backend change would
+// assert a guarantee about a database that no longer exists (B6 map F23).
 const DOC_NAMES = ['plan', 'registry', 'migrations', 'reshard-pending', 'redistribute-proposal', 'transformation', 'fleet-config'] as const;
 
 const CONTROL_DDL = [
@@ -440,6 +445,15 @@ export class PostgresControlStore implements ControlStore {
     if (!parsed || typeof parsed.id !== 'string' || !Array.isArray(parsed.nodes)) return null;
     return parsed;
   }
+
+  async saveSyncPosture(fact: SyncPosturePayload | null): Promise<void> {
+    if (fact === null) {
+      await this.deleteDoc('sync-posture');
+      return;
+    }
+    await this.fencedWrite(client => this.upsertDoc(client, 'sync-posture', JSON.stringify(fact)));
+  }
+
 }
 
 /**

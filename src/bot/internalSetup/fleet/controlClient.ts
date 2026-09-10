@@ -30,7 +30,7 @@ import {
   SyncStatePayload,
 } from './protocol';
 import type { LeaseRuntime } from './leaseRuntime';
-import type { CopyBlock, SlotStatusPayload, SupersededInfo } from './protocol';
+import type { CopyBlock, SlotStatusPayload, SupersededInfo, SyncPosturePayload } from './protocol';
 
 export interface ControlClientOptions {
   /** Ordered master candidate list (PLAN_STANDBY 3.4); cycled on reconnect, never empty. */
@@ -54,6 +54,7 @@ export interface ControlClientOptions {
   onCopyBlock?: (block: CopyBlock) => void;
   /** The primary's slot table, pushed by the master to nodes hosting a standby (20.17 slot signal). */
   onSlotStatus?: (payload: SlotStatusPayload) => void;
+  onSyncPosture?: (payload: SyncPosturePayload) => void;
   /** Webui data hop from the master (DATA_WRITE/DATA_READ); returns the reply payload. */
   onDataOp?: (type: string, data: any) => Promise<any>;
   /** Backend transformation control (TRANSFORM_GUILD/BACKEND_FLIP) -> executor; returns the ack payload. */
@@ -317,6 +318,14 @@ export class ControlClient {
         this.replyAck(requestId, { ok: true, term: this.term });
         try { this.opts.onSlotStatus?.(data as SlotStatusPayload); }
         catch (error) { console.warn('[Fleet] Failed to record a pushed slot status:', error instanceof Error ? error.message : error); }
+        break;
+      }
+      case MSG.SYNC_POSTURE: {
+        // Ack first, on the slot signal's precedent: a failed record write must
+        // never take the bot down, and the next tick re-delivers the fact.
+        this.replyAck(requestId, { ok: true, term: this.term });
+        try { this.opts.onSyncPosture?.(data as SyncPosturePayload); }
+        catch (error) { console.warn('[Fleet] Failed to record a pushed sync posture:', error instanceof Error ? error.message : error); }
         break;
       }
       case MSG.SYNC_STATE: {

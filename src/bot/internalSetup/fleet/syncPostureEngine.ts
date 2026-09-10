@@ -91,6 +91,14 @@ const QUERY_TIMEOUT_MS = 4000;
 /** How long stop() waits for a tick that is already mid-arm before relaxing anyway. */
 const STOP_FENCE_MS = 6000;
 
+/**
+ * How often an unchanged ARMED posture is re-attested (B6 map F23). Each
+ * refresh moves the position the guarantee reaches, and while armed the write
+ * that carries it is itself synchronous, which is what makes the standby's
+ * replayed copy of it evidence.
+ */
+const PUBLISH_REFRESH_MS = 30_000;
+
 const sleep = (ms: number): Promise<void> => new Promise(resolve => { setTimeout(resolve, ms); });
 
 export type SyncPostureState = 'relaxed' | 'arming' | 'armed';
@@ -157,6 +165,13 @@ export function startSyncPostureEngine(inputs: {
   targets: () => SyncPostureTarget[];
   /** This node's own primary; re-read every tick because a repoint replaces it. */
   url: () => string | null;
+  /**
+   * Record what this master is attesting. Called fire and forget, never
+   * awaited: the watchdog owes the fleet a relax within a second and must not
+   * queue behind a control-store write to deliver it. The caller stamps
+   * identity and serialises, because publishes can overtake each other.
+   */
+  publish?: (fact: { state: 'armed' | 'relaxed'; slotName: string | null; nodeId: string | null; heldToLsn: string | null }) => void;
 }): SyncPostureEngine {
   let client: Client | null = null;
   let clientUrl = '';
@@ -179,6 +194,7 @@ export function startSyncPostureEngine(inputs: {
   /** Consecutive streaming polls per candidate slot; reset the moment one is not streaming. */
   const steadyTicks = new Map<string, number>();
   let complainedAboutCommitLevel = '';
+  let publishedAt = 0;
   let stopped = false;
   let ticking = false;
 
@@ -234,6 +250,11 @@ export function startSyncPostureEngine(inputs: {
       return false;
     }
     wroteAt = Date.now();
+    // AFTER the relax landed, never before: writing this while still armed
+    // would be a synchronous write waiting on the copy that just went away,
+    // so the disarm would hang on itself.
+    publishedAt = Date.now();
+    inputs.publish?.({ state: 'relaxed', slotName: null, nodeId: null, heldToLsn: null });
     lastDrop = { reason, at: Date.now() };
     cooldownUntil = Date.now() + REARM_COOLDOWN_MS;
     frozenTicks = 0;
@@ -370,9 +391,15 @@ export function startSyncPostureEngine(inputs: {
           await drop(live, `the standby stopped acknowledging writes (${link.gapBytes} bytes behind and not moving)`);
           return;
         }
+        if (state === 'armed' && Date.now() - publishedAt >= PUBLISH_REFRESH_MS && now.currentLsn) {
+          publishedAt = Date.now();
+          inputs.publish?.({ state: 'armed', slotName: named.slotName, nodeId: named.nodeId, heldToLsn: now.currentLsn });
+        }
         if (state === 'arming') {
           if (link.syncState === 'sync') {
             enter('armed', named);
+            publishedAt = Date.now();
+            inputs.publish?.({ state: 'armed', slotName: named.slotName, nodeId: named.nodeId, heldToLsn: now.currentLsn });
             console.log(`[Fleet] SYNC POSTURE ARMED on ${named.slotName}: fleet writes now wait for that copy, and a drop costs about a second of stall`);
           } else if (Date.now() - armedAt > ARM_TIMEOUT_MS) {
             await drop(live, `the standby never reached synchronous state within ${Math.round(ARM_TIMEOUT_MS / 1000)}s`);
@@ -453,10 +480,17 @@ export function startSyncPostureEngine(inputs: {
       // the plan.
       const url = (inputs.url() || '').trim();
       const live = url ? await connect(url) : null;
+      let relaxed = false;
       if (live) {
-        await relaxSyncPosture(live).catch(error =>
-          console.error(`[Fleet] SYNC POSTURE: could not relax while standing down; the next master boot clears it: ${error instanceof Error ? error.message : String(error)}`));
+        relaxed = await relaxSyncPosture(live).then(() => true).catch(error => {
+          console.error(`[Fleet] SYNC POSTURE: could not relax while standing down; the next master boot clears it: ${error instanceof Error ? error.message : String(error)}`);
+          return false;
+        });
       }
+      // Only once the relax has landed, for drop()'s reason: on a cluster that
+      // is still armed this publish is a synchronous write waiting on a copy
+      // that may be gone, so it would hang the shutdown instead of ending it.
+      if (relaxed) inputs.publish?.({ state: 'relaxed', slotName: null, nodeId: null, heldToLsn: null });
       enter('relaxed', null);
       await closeClient();
     },
