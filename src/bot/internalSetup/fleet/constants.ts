@@ -52,6 +52,9 @@ export const IDENTIFY_SPACING_MS = 5500;
 /** Co-worker dial-out reconnect ladder; the last entry repeats forever. */
 export const RECONNECT_BACKOFF_MS = [1000, 2000, 5000, 10000, 30000];
 
+/** How often a node re-checks whether its own beacon facts changed; a flip renews out of band rather than waiting for the next renew (B6 map F36). */
+export const WITNESS_FACT_WATCH_MS = 5000;
+
 export const CONTROL_PORT_DEFAULT = 3928;
 
 /** Timeout for request/response exchanges (register, grant, revoke) on the control channel. */

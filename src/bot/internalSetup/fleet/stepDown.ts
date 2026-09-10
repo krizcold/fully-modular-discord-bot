@@ -137,11 +137,20 @@ export function notifyStepDown(url: string, secret: string, payload: StepDownPay
   });
 }
 
-/** Any other node's claim holding a term above ours, fresh or not: this copy is a stale fork (boot fence). */
+/**
+ * Any other node's claim holding a term above ours, fresh or not: this copy is
+ * a stale fork (boot fence).
+ *
+ * A STAND-IN covering THIS node is the one exception (B6 map F21). Its whole
+ * purpose is to hold the fleet until this master returns, so parking on it
+ * would be the inverse of the automatic failback 20.5 rules: the node it names
+ * enters the failback lane instead. Every other node treats it as a master.
+ */
 export function higherTermClaim(claims: WitnessClaim[], selfNodeId: string, selfTerm: number): WitnessClaim | null {
   let best: WitnessClaim | null = null;
   for (const claim of claims) {
     if (claim.nodeId === selfNodeId || claim.term <= selfTerm) continue;
+    if (claim.role !== 'master' && claim.standingInFor === selfNodeId) continue;
     if (!best || claim.term > best.term) best = claim;
   }
   return best;
@@ -169,7 +178,12 @@ export function freshMasterClaim(status: WitnessStatus, selfNodeId: string, now:
   if (status.lastReadAt === null || now - status.lastReadAt > WITNESS_FRESH_WINDOW_MS) return null;
   let best: WitnessClaim | null = null;
   for (const claim of status.claims) {
-    if (claim.nodeId === selfNodeId || claim.role !== 'master') continue;
+    // A stand-in IS the fleet's coordinator for the duration, so every node but
+    // the one it covers must see it here: otherwise a third backup reads
+    // masterAlive=false and is offered the RPO path INTO a live stand-in, and
+    // the demote guard warns the fleet is about to freeze when it is not (F21).
+    const serving = claim.role === 'master' || claim.standingInFor !== undefined;
+    if (claim.nodeId === selfNodeId || !serving) continue;
     if (now - claim.observedAt > WITNESS_FRESH_WINDOW_MS) continue;
     if (!best || claim.term > best.term) best = claim;
   }
@@ -184,7 +198,10 @@ export function freshMasterClaim(status: WitnessStatus, selfNodeId: string, now:
  * the recovered master accepted meanwhile.
  */
 export function masterStoreDeadNow(claim: WitnessClaim | null, status: WitnessStatus, now: number): boolean {
-  if (!claim || claim.storeHealthy !== false) return false;
+  // ONLY 'dead'. A 'stalled' master is waiting on a departed sync standby: its
+  // database is alive and holds the newest writes, and treating that as a dead
+  // store would unlock the lossy path in the very case that loses most (F20).
+  if (!claim || claim.storeState !== 'dead') return false;
   if (status.lastReadAt === null || now - status.lastReadAt > WITNESS_CURRENT_WINDOW_MS) return false;
   return now - claim.observedAt <= WITNESS_CURRENT_WINDOW_MS;
 }

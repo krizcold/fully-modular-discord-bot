@@ -112,6 +112,15 @@ export interface SyncPostureStatus {
   since: number;
   /** Why the posture last dropped, for the operator and for the fact B6-d publishes. */
   lastDrop: { reason: string; at: number } | null;
+  /**
+   * When this engine last got an ANSWER out of its own primary. The state
+   * alone cannot say whether a stall is this master's doing, because a
+   * database that dies while armed leaves the state stuck at 'armed': every
+   * path that could change it needs the connection that just went away. So a
+   * claim about our own stall has to rest on positive evidence that the
+   * database is still there.
+   */
+  lastSampleAt: number;
 }
 
 export interface SyncPostureTarget {
@@ -203,6 +212,7 @@ export function startSyncPostureEngine(inputs: {
   const steadyTicks = new Map<string, number>();
   let complainedAboutCommitLevel = '';
   let publishedAt = 0;
+  let lastSampleAt = 0;
   let stopped = false;
   let ticking = false;
 
@@ -318,6 +328,7 @@ export function startSyncPostureEngine(inputs: {
       const watched = state === 'relaxed' || !named ? candidates : [named, ...candidates.filter(c => c.slotName !== named!.slotName)];
       const now = await sample(live, watched.map(t => t.slotName));
       if (!now) return;
+      lastSampleAt = Date.now();
 
       // The cluster is the authority on what is armed. Outside the window
       // where this engine's own write is still propagating, a disagreement is
@@ -488,6 +499,7 @@ export function startSyncPostureEngine(inputs: {
       nodeId: named?.nodeId ?? null,
       since,
       lastDrop,
+      lastSampleAt,
     }),
     stop: async () => {
       if (stopped) return;

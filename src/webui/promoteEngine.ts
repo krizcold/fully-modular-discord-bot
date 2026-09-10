@@ -235,7 +235,12 @@ export async function startPromote(botManager: BotManager, opts: PromoteStartOpt
     const masterBeacon = witnessStatus ? freshMasterClaim(witnessStatus, state.nodeId, now) : null;
     const masterStoreDead = witnessStatus ? masterStoreDeadNow(masterBeacon, witnessStatus, now) : false;
     if (masterAlive && !masterStoreDead) {
-      return { success: false, error: 'the fleet database cannot be reached from this node, but the master is still alive (its control connection is up or its witness beacon is fresh) and reports its own database healthy, so it is coasting on a database this node cannot fence. Promoting would split the fleet into two masters. Restore the database connection, or stop the old master and its database, then promote.' };
+      // A STALLED master needs the opposite remedy from a healthy one, and
+      // saying "healthy" would point the operator at stopping a database that
+      // holds the newest committed writes (B6 map F20).
+      return masterBeacon?.storeState === 'stalled'
+        ? { success: false, error: 'the fleet database cannot be reached from this node, and the master reports its writes STALLED waiting on a synchronous standby that left. Its database is alive and holds the newest committed writes, so promoting this copy would lose them and split the fleet into two masters. Restore or release that standby and the master frees itself within seconds; stopping the master database is the one thing not to do here.' }
+        : { success: false, error: 'the fleet database cannot be reached from this node, but the master is still alive (its control connection is up or its witness beacon is fresh) and reports its own database healthy, so it is coasting on a database this node cannot fence. Promoting would split the fleet into two masters. Restore the database connection, or stop the old master and its database, then promote.' };
     }
     // The c3 branch carries a second risk the replay age never shows: the old
     // master's bot is still up, so if its database came back in the seconds

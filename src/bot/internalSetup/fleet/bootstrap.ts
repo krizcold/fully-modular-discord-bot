@@ -92,7 +92,7 @@ import { hasDbReplica } from './replicaPromotion';
 import { clearSlotStatus, readSlotStatus, recordFromPush, sourceMatchesAny, writeSlotStatus } from './slotStatus';
 import { startSyncPostureEngine, SyncPostureEngine, SyncPostureTarget } from './syncPostureEngine';
 import { clearSyncPostureRecord, recordFromPosturePush, writeSyncPostureRecord } from './syncPostureFact';
-import { DiscordWitness, FleetWitness, startWitnessLoop, WitnessStatus } from './witness';
+import { BeaconFacts, DiscordWitness, FleetWitness, startWitnessLoop, WitnessStatus } from './witness';
 import { probePeerTerm } from './peerTermProbe';
 import { probeStoreEmpty } from './emptyStore';
 import { readPromoteRecord, writePromoteRecord } from './promoteRecord';
@@ -2602,10 +2602,39 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
         // "I cannot reach the master's database" (20.12 c3): only this node
         // knows which one it is. A stamp failing longer than a worker's lease
         // TTL is a dead store, not a blip.
-        getStoreHealthy: () => {
-          if (!(store instanceof PostgresControlStore) || standalone) return true;
-          const failingForMs = store.getStampFailingForMs();
-          return failingForMs === null || failingForMs < LEASE_TTL_MS;
+        getBeaconFacts: (): BeaconFacts => {
+          const facts: BeaconFacts = { storeState: 'healthy' };
+          if (store instanceof PostgresControlStore && !standalone) {
+            const failing = (store.getStampFailingForMs() ?? 0) >= LEASE_TTL_MS;
+            // The third value, and the reason it exists (B6 map F20): while
+            // this master's OWN writes are the ones waiting on a departed sync
+            // standby, the stamp fails for a reason that is not a dead store.
+            // Its database is alive and holds the newest committed writes, and
+            // the stall was caused by the absence of the very copy a failover
+            // would promote, so publishing 'dead' here would unlock the lossy
+            // path in exactly the case that loses the most.
+            // A drop that JUST happened counts too: the watchdog relaxes in
+            // about a second, so by the time the stamp has failed for a whole
+            // lease TTL the posture reads relaxed again while the writes it
+            // stalled are still draining. Judging on the live state alone would
+            // publish 'dead' for a stall this master had already ended.
+            const posture = syncPosture?.getStatus();
+            // The recent SAMPLE is the load-bearing half: it is positive
+            // evidence that the primary is still answering. Without it a
+            // database that DIED while armed would publish 'stalled' forever,
+            // because nothing can move the state without the connection that
+            // just went away, and 'stalled' is what withholds the operator's
+            // failover. That would be worse than the bug F20 exists to fix.
+            const ourStall = posture !== undefined
+              && Date.now() - posture.lastSampleAt < LEASE_TTL_MS
+              && (posture.state !== 'relaxed' || (posture.lastDrop !== null && Date.now() - posture.lastDrop.at < LEASE_TTL_MS));
+            facts.storeState = !failing ? 'healthy' : ourStall ? 'stalled' : 'dead';
+          }
+          // A promote already running here is otherwise invisible to every
+          // other machine: the record is node-local (F36).
+          const promote = readPromoteRecord();
+          if (promote && promote.phase !== 'done' && !(promote.parked && promote.phase === 'claim')) facts.promoting = true;
+          return facts;
         },
         getChannelId: () => fleetConfig?.witnessChannelId ?? null,
       });
@@ -3116,6 +3145,18 @@ async function initCoWorker(init: CommonInit): Promise<FleetContext> {
         role: 'backup',
         getTerm: () => controlClient?.getTerm() ?? 0,
         getChannelId: () => readFleetConfigCache()?.witnessChannelId ?? null,
+        getBeaconFacts: (): BeaconFacts => {
+          const facts: BeaconFacts = {};
+          // Node-local otherwise, and the one fact that stops an automatic lane
+          // arming into the middle of a human-driven promote (F36).
+          const promote = readPromoteRecord();
+          if (promote && promote.phase !== 'done' && !(promote.parked && promote.phase === 'claim')) facts.promoting = true;
+          // Carried so a contested arm can be ranked by the operator's own
+          // order instead of an arbitrary tie-break (F22).
+          const mine = readFleetConfigCache()?.backupDesignations.find(d => d.nodeId === nodeId);
+          if (mine) facts.backupPriority = mine.priority;
+          return facts;
+        },
       });
       readWitnessNow = async () => {
         // Null when the read itself failed: readClaims leaves the previous
