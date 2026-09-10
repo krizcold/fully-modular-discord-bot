@@ -172,6 +172,13 @@ export function startSyncPostureEngine(inputs: {
    * identity and serialises, because publishes can overtake each other.
    */
   publish?: (fact: { state: 'armed' | 'relaxed'; slotName: string | null; nodeId: string | null; heldToLsn: string | null }) => void;
+  /**
+   * The newest moment any OTHER node reports having had a write's synchronous
+   * wait cancelled, in that node's own clock, or 0. Co-workers write guild data
+   * through this same primary, so their cancelled waits are holes in exactly
+   * the same guarantee, and only this process can disarm on them (F24).
+   */
+  foreignCancelAt?: () => number;
 }): SyncPostureEngine {
   let client: Client | null = null;
   let clientUrl = '';
@@ -191,6 +198,7 @@ export function startSyncPostureEngine(inputs: {
    */
   let caughtUpBarrier: string | null = null;
   let handledCancelAt = 0;
+  let handledForeignCancelAt = 0;
   /** Consecutive streaming polls per candidate slot; reset the moment one is not streaming. */
   const steadyTicks = new Map<string, number>();
   let complainedAboutCommitLevel = '';
@@ -337,6 +345,20 @@ export function startSyncPostureEngine(inputs: {
       // alone, so the posture stops meaning what it claims immediately (F24).
       // The barrier is read from THIS tick: the cancelled commit is at or
       // before the primary's position now, never after it.
+      // A foreign latch is compared only against the last foreign value seen:
+      // it is stamped on another machine's clock, so it orders against itself
+      // and against nothing here.
+      const foreignAt = inputs.foreignCancelAt?.() ?? 0;
+      if (foreignAt > handledForeignCancelAt) {
+        if (state !== 'relaxed') {
+          if (now.currentLsn !== null) caughtUpBarrier = now.currentLsn;
+          // Marked handled only AFTER the disarm lands, exactly as the local
+          // latch is: consuming it first would drop the one signal no later
+          // sample can re-derive.
+          if (!(await drop(live, 'a co-worker reported a write whose synchronous wait was cancelled'))) return;
+        }
+        handledForeignCancelAt = foreignAt;
+      }
       const cancel = getSyncWaitCancel();
       if (cancel && cancel.at > handledCancelAt) {
         if (now.currentLsn !== null) caughtUpBarrier = now.currentLsn;

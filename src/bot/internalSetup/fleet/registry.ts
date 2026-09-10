@@ -56,6 +56,8 @@ export interface RegistryNode {
   dbReplicaSlot: string | null;
   /** False while the node's last reconcile ended degraded; null when unreported. */
   syncOk: boolean | null;
+  /** When this node last had a write's synchronous wait cancelled, in ITS clock; null when never (B6 map F24). */
+  syncWaitCancelledAt: number | null;
   send: ((message: object) => void) | null;
 }
 
@@ -132,6 +134,7 @@ export class Registry {
       dataBackendHealthy: existing?.dataBackendHealthy ?? null,
       dbReplica: existing?.dbReplica ?? null,
       dbReplicaSlot: existing?.dbReplicaSlot ?? null,
+      syncWaitCancelledAt: existing?.syncWaitCancelledAt ?? null,
       freeDiskBytes: existing?.freeDiskBytes ?? null,
       send: input.send,
     };
@@ -170,6 +173,7 @@ export class Registry {
       dataBackendHealthy: null,
       dbReplica: null,
       dbReplicaSlot: null,
+      syncWaitCancelledAt: null,
       freeDiskBytes: null,
       send: null,
     };
@@ -201,6 +205,11 @@ export class Registry {
     if (hb.dbReplica !== undefined) node.dbReplica = hb.dbReplica;
     // Empty = this node holds no standby now, so its old claim is dropped.
     if (typeof hb.dbReplicaSlot === 'string') node.dbReplicaSlot = hb.dbReplicaSlot || null;
+    // Never moves backwards: a node that restarts loses its latch, and adopting
+    // the lower value would re-fire a disarm the master has already acted on.
+    if (Number.isFinite(hb.syncWaitCancelledAt) && Number(hb.syncWaitCancelledAt) > (node.syncWaitCancelledAt ?? 0)) {
+      node.syncWaitCancelledAt = Number(hb.syncWaitCancelledAt);
+    }
     if (Number.isFinite(hb.freeDiskBytes)) node.freeDiskBytes = hb.freeDiskBytes!;
     this.replaceNodeGuilds(nodeId, Array.isArray(hb.guilds) ? hb.guilds : []);
     this.adoptHeartbeatClaims(nodeId, hb);

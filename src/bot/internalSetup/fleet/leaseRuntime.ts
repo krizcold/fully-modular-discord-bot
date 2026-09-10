@@ -13,6 +13,7 @@ import { getDataReadiness } from '../utils/dataBackends/dataReadiness';
 import { getGuildDataBackend } from '../utils/dataManager';
 import { getNodeId } from './nodeIdentity';
 import { getLocalReplicaIdentity, getReplicaHealth, startReplicaHealthSampler } from './replicaHealth';
+import { getSyncWaitCancel } from '../utils/syncWaitCancel';
 import type { IngestService } from '../ingest/ingestService';
 import type {
   HeartbeatPayload,
@@ -282,6 +283,7 @@ export class LeaseRuntime {
     startReplicaHealthSampler();
     const dbReplica = getReplicaHealth();
     const dbReplicaSlot = getLocalReplicaIdentity()?.slotName;
+    const syncWaitCancelledAt = getSyncWaitCancel()?.at;
     const hb: HeartbeatPayload = {
       term,
       seq: ++this.seq,
@@ -300,6 +302,7 @@ export class LeaseRuntime {
       // identity above deliberately survives a standby outage. Silence loses an
       // advisory; a stale claim states a falsehood about a copy that is gone.
       dbReplicaSlot: dbReplicaSlot ?? '',
+      ...(syncWaitCancelledAt !== undefined ? { syncWaitCancelledAt } : {}),
     };
     this.lastHeartbeat = hb;
     return hb;

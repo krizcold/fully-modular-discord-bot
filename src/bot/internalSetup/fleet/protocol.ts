@@ -337,6 +337,15 @@ export interface HeartbeatPayload {
   freeDiskBytes?: number;
   /** This node's local database standby; absent when it has none (PLAN_REPLICATION Stage 5). */
   dbReplica?: ReplicaHealthReport;
+  /**
+   * When this node last saw one of its own writes have its synchronous wait
+   * CANCELLED, in this node's clock; absent when it never has. Only the master
+   * can act on it, and every node writes through the master's primary, so
+   * without this the hole is invisible to the one process able to close it
+   * (B6 map F24). Compared only against itself, never against the reader's
+   * clock: a new value means a new event, and the value never moves backwards.
+   */
+  syncWaitCancelledAt?: number;
 }
 
 export interface GuildNoticePayload {

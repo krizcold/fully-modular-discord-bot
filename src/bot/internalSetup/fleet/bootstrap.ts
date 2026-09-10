@@ -2690,6 +2690,14 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     const engine = startSyncPostureEngine({
       url: () => getActiveBackendUrl(),
       publish: fact => publishSyncPosture(fact),
+      foreignCancelAt: () => {
+        let newest = 0;
+        for (const node of registry.nodes.values()) {
+          if (node.isSelf) continue;
+          if ((node.syncWaitCancelledAt ?? 0) > newest) newest = node.syncWaitCancelledAt!;
+        }
+        return newest;
+      },
       // Every eligible backup in priority order, not just the first: whether a
       // copy is actually streaming is the engine's evidence to weigh, and one
       // broken high-priority backup must not hide a working lower one (F14).
