@@ -23,7 +23,7 @@ import { getSubscriptionNotifier } from './utils/subscriptionNotifier';
 import { getPaymentRegistry } from './utils/payment/paymentRegistry';
 import { startModuleAutoUpdater } from './utils/moduleAutoUpdater';
 import { loadCredentials } from '../../utils/envLoader';
-import { initFleet } from './fleet/bootstrap';
+import { initFleet, relaxFleetSyncPosture } from './fleet/bootstrap';
 import { getIngestService } from './ingest/ingestService';
 import { ModuleLoader } from './utils/moduleLoader';
 import { getModuleRegistry } from './utils/moduleRegistry';
@@ -725,6 +725,14 @@ async function main() {
     if (shuttingDown) return;
     shuttingDown = true;
     stopSamplers();
+    // Before anything writes: an armed synchronous posture stalls every write
+    // below for its whole bound, and nothing would be watching it after exit.
+    // Bounded, because the drain is the part that must not be lost and the
+    // next master boot clears a posture this did not reach in time.
+    await Promise.race([
+      relaxFleetSyncPosture().catch(err => console.warn('[clientInitializer] Could not relax the synchronous posture on shutdown:', err)),
+      new Promise(resolve => setTimeout(resolve, 1500)),
+    ]);
     metrics.flushTotals(); // writes via saveData, so it must precede flushAll
     // Drain the write queue before exit (bounded), so no accepted write is
     // lost. Postgres mode gets a wider bound: a coalesced Working Set can hold

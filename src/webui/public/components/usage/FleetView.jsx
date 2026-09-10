@@ -1020,7 +1020,7 @@ function FleetConfigCard({ api, fleet }) {
           />
           {backupsDraft.length > 0 && (
             <div style={{ marginTop: '6px' }}>
-              <div className="usage-stat-sub">Backup order: the first stands in first, and breaks a tie between equally fresh copies. Active mode lets a backup stand in temporarily while the master is gone, and needs that node's own consent too.</div>
+              <div className="usage-stat-sub">Backup order: the first stands in first, and breaks a tie between equally fresh copies. Active mode lets a backup stand in temporarily while the master is gone, and needs that node's own consent too. It is not free: while it is on, every write in the fleet waits for that copy, so losing it costs about a second or two of stalled writes before replication drops back to asynchronous.</div>
               {backupsDraft.map((d, i) => (
                 <div key={d.nodeId} style={{ display: 'flex', alignItems: 'center', gap: '6px', marginTop: '2px' }}>
                   <span style={{ fontFamily: 'monospace', fontSize: '0.75rem' }}>{`${i + 1}. ${nodeName(d.nodeId)}`}</span>

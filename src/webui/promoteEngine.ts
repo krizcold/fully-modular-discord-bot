@@ -43,6 +43,7 @@ import {
 } from '../bot/internalSetup/fleet/replicaPromotion';
 import { clearSuperseded, freshMasterClaim, masterStoreDeadNow } from '../bot/internalSetup/fleet/stepDown';
 import { backupsAhead, readSlotStatus, sourceMatchesAny } from '../bot/internalSetup/fleet/slotStatus';
+import { watchForSyncWaitCancel } from '../bot/internalSetup/utils/syncWaitCancel';
 
 export interface PromoteStartOptions {
   confirmLag?: boolean;
@@ -68,6 +69,10 @@ let phasesRunning = false;
 
 async function withClient<T>(url: string, fn: (client: Client) => Promise<T>, queryTimeoutMs = PROMOTE_SQL_TIMEOUT_MS): Promise<T> {
   const client = new Client({ connectionString: url, connectionTimeoutMillis: 5000, query_timeout: queryTimeoutMs });
+  // This connection writes the term row, and the fence it runs terminates
+  // every other client backend on the old primary, which is what turns a
+  // waiting commit into an acknowledged one (B6 map F24).
+  watchForSyncWaitCancel(client, 'the promote connection');
   try {
     await client.connect();
     return await fn(client);

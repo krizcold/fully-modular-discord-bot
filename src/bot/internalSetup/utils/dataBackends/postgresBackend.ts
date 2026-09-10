@@ -7,6 +7,7 @@
 import { randomUUID } from 'crypto';
 import { Client, Pool } from 'pg';
 import type { PoolClient, QueryResult } from 'pg';
+import { watchForSyncWaitCancel, watchPoolForSyncWaitCancel } from '../syncWaitCancel';
 import type {
   DataBackend,
   DocKey,
@@ -134,6 +135,11 @@ export class PostgresBackend implements DataBackend {
       // Unhandled idle-client errors would crash the process.
       console.error('[PostgresBackend] Idle client error:', error);
     });
+    // Guild-data writes are fleet writes: they go through the master's primary
+    // from every node, so a promote's fence sweep can terminate one mid-wait,
+    // which postgres reports as a WARNING on an otherwise successful commit
+    // (B6 map F24).
+    watchPoolForSyncWaitCancel(this.pool, 'the guild-data pool');
   }
 
   // ==========================================================================
@@ -760,6 +766,7 @@ async function metaClient(url: string): Promise<Client> {
     statement_timeout: STATEMENT_TIMEOUT_MS,
     keepAlive: true,
   });
+  watchForSyncWaitCancel(client, 'a data-backend meta connection');
   try {
     await client.connect();
   } catch (error) {

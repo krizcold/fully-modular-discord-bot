@@ -12,6 +12,7 @@ import { exportNamespace, FileRecord } from '../../utils/dataInterchange';
 import type { FenceToken } from '../../utils/dataBackends/backend';
 import { graveyardGuildDir, dropPendingForGuild, guildDirExists } from '../../utils/dataBackends/fileBackend';
 import { TRANSFORM_STAGING_STATEMENT_TIMEOUT_MS } from '../constants';
+import { watchForSyncWaitCancel } from '../../utils/syncWaitCancel';
 
 const STAGING_ROOT = '_transform';
 const EXCLUDED_NAMES = new Set(['.owner', '.freeze']);
@@ -131,6 +132,7 @@ function classifyRecord(record: FileRecord): 'doc' | 'append' {
 
 async function stagingClient(url: string): Promise<Client> {
   const client = new Client({ connectionString: url, connectionTimeoutMillis: 5000, keepAlive: true });
+  watchForSyncWaitCancel(client, 'the transformation staging connection');
   await client.connect();
   // The staging transaction is held across export, hashing and the commit
   // decision, so this session opts out of the tight pool defaults.

@@ -90,6 +90,7 @@ import { effectiveFleetConfigView, effectiveMasterUrls, forcePassive, readFleetC
 import { getLocalReplicaIdentity, getReplicaHealth, getSlotSample, setReplicaProbeListener } from './replicaHealth';
 import { hasDbReplica } from './replicaPromotion';
 import { clearSlotStatus, readSlotStatus, recordFromPush, sourceMatchesAny, writeSlotStatus } from './slotStatus';
+import { startSyncPostureEngine, SyncPostureEngine, SyncPostureTarget } from './syncPostureEngine';
 import { DiscordWitness, FleetWitness, startWitnessLoop, WitnessStatus } from './witness';
 import { probePeerTerm } from './peerTermProbe';
 import { probeStoreEmpty } from './emptyStore';
@@ -151,6 +152,20 @@ let masterAssign: ((shardId: number, nodeId: string) => Promise<AssignResult>) |
 export async function fleetAssignShard(shardId: number, nodeId: string): Promise<AssignResult> {
   if (!masterAssign) return { success: false, error: 'This node is not the fleet master' };
   return masterAssign(shardId, nodeId);
+}
+
+let stopSyncPosture: (() => Promise<void>) | null = null;
+
+/**
+ * Relax the master's synchronous posture before a planned exit, ahead of the
+ * write drain: an armed posture stalls every write in that drain for its whole
+ * bound, so leaving it to the next boot's clear would cost the shutdown its
+ * own data. A node with no posture engine returns immediately.
+ */
+export async function relaxFleetSyncPosture(): Promise<void> {
+  const stop = stopSyncPosture;
+  stopSyncPosture = null;
+  if (stop) await stop();
 }
 
 let masterResume: (() => Promise<AssignResult>) | null = null;
@@ -674,6 +689,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   // supersession hook (assigned once the registry exists) turns the fence
   // into a step-down (B4).
   let controlFenced = false;
+  let syncPosture: SyncPostureEngine | null = null;
   let onDeposedTeardown: (() => void) | null = null;
   let onSupersededByStore: ((observedTerm: number) => void) | null = null;
   let beginSupersession: ((by: { nodeId: string; nodeName: string; term: number }, source: SupersededSource) => void) | null = null;
@@ -2487,7 +2503,13 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     await transformer.recover().catch(error =>
       console.error('[Transform] Recovery failed:', error instanceof Error ? error.message : error));
     await server.start(port, secret);
-    onDeposedTeardown = () => server?.dropAll();
+    onDeposedTeardown = () => {
+      server?.dropAll();
+      // A deposed master must not keep another node's writes waiting on a copy
+      // it no longer speaks for; the stop relaxes before it lets go.
+      void syncPosture?.stop().catch(() => { /* logged inside, and the next boot clears regardless */ });
+      syncPosture = null;
+    };
 
     // A promoted master tells every other candidate to step down (B4). The
     // notice carries this node's data backend so the old master drains its
@@ -2592,6 +2614,38 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
         return claims === null ? null : witness!.getStatus();
       };
     }
+  }
+
+  // Synchronous posture (20.5 active mode, B6 map F12-F17). While a designated
+  // ACTIVE backup is provably keeping up, this master holds its own primary
+  // waiting for that copy, so a stand-in's data really would be every
+  // acknowledged write. Inert until an operator enables active mode on a node
+  // that also consents to it, which is nobody by default.
+  if (!standalone && !controlFenced && resolveDataBackend() === 'postgres') {
+    const engine = startSyncPostureEngine({
+      url: () => getActiveBackendUrl(),
+      // Every eligible backup in priority order, not just the first: whether a
+      // copy is actually streaming is the engine's evidence to weigh, and one
+      // broken high-priority backup must not hide a working lower one (F14).
+      targets: (): SyncPostureTarget[] => {
+        if (!fleetConfig) return [];
+        const eligible: SyncPostureTarget[] = [];
+        for (const designation of [...fleetConfig.backupDesignations].sort((a, b) => a.priority - b.priority)) {
+          if (designation.mode !== 'active') continue;
+          const node = registry.nodes.get(designation.nodeId);
+          // Both halves of the key must still hold, and a backup whose BOT is
+          // gone cannot stand in for anything, so the fleet stops paying the
+          // stall price for it even while its database keeps streaming.
+          if (!node || !node.connected || node.capabilities?.activeCapable !== true) continue;
+          const slotName = (node.dbReplicaSlot || '').trim();
+          if (slotName === '') continue;
+          eligible.push({ nodeId: designation.nodeId, slotName });
+        }
+        return eligible;
+      },
+    });
+    syncPosture = engine;
+    stopSyncPosture = () => engine.stop();
   }
 
   // Slot signal (20.17): each fresh read of the primary's slot table goes to

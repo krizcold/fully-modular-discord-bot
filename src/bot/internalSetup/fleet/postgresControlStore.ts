@@ -12,6 +12,7 @@ import { getGuildDataBackend } from '../utils/dataManager';
 import { PostgresBackend } from '../utils/dataBackends/postgresBackend';
 import { FileControlStore, atomicWriteFileSync } from './fileControlStore';
 import { FLEET_DIR } from './constants';
+import { watchPoolForSyncWaitCancel } from '../utils/syncWaitCancel';
 import type {
   ControlStore,
   PersistedFleetConfig,
@@ -464,6 +465,9 @@ export function createControlStore(standalone: boolean): ControlStore {
     });
     // An idle client error must never take the master down.
     pool.on('error', () => { /* surfaced by the next query */ });
+    // A split control store is still the fleet's database, and the term stamp
+    // and registry writes commit through it (B6 map F24).
+    watchPoolForSyncWaitCancel(pool, 'the control-store pool');
     return new PostgresControlStore(pool);
   }
   const dataBackend = getGuildDataBackend();
