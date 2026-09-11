@@ -23,6 +23,14 @@ export interface RoleOverride {
   takeover?: boolean;
   /** Promotion over a dead master: auto-Declare-Lost it after the hold-down. */
   chainTakeover?: boolean;
+  /**
+   * Boot as a TEMPORARY stand-in (20.5): serve from a database still in
+   * recovery, at the term already in the replayed row, and keep the backup
+   * identity throughout. Unlike the takeover flags this is NOT one-shot: it
+   * describes the role the node is currently holding, so it is cleared by the
+   * failback or a disarm rather than consumed at term acquisition.
+   */
+  standIn?: boolean;
   setAt: number;
   setBy: RoleOverrideSetBy;
 }
@@ -30,7 +38,7 @@ export interface RoleOverride {
 // The union is DERIVED from this list, so a value the reader accepts and a value
 // the type allows cannot drift apart.
 const SET_BY_VALUES = [
-  'webui-promote', 'manager-promote', 'webui-demote', 'manager-demote', 'stepdown',
+  'webui-promote', 'manager-promote', 'webui-demote', 'manager-demote', 'stepdown', 'stand-in',
 ] as const;
 
 export type RoleOverrideSetBy = typeof SET_BY_VALUES[number];
@@ -59,6 +67,7 @@ export function readRoleOverride(): RoleOverride | null {
         role: parsed.role,
         ...(parsed.takeover === true ? { takeover: true } : {}),
         ...(parsed.chainTakeover === true ? { chainTakeover: true } : {}),
+        ...(parsed.standIn === true ? { standIn: true } : {}),
         setAt: Number(parsed.setAt) || 0,
         setBy: toSetBy(parsed.setBy),
       };
@@ -84,7 +93,21 @@ export function clearRoleOverride(): void {
 export function consumeTakeoverFlags(): void {
   const override = readRoleOverride();
   if (!override || (!override.takeover && !override.chainTakeover)) return;
-  writeRoleOverride({ role: override.role, setAt: override.setAt, setBy: override.setBy });
+  // standIn is carried across deliberately: it is not a one-shot instruction but
+  // the description of the role this node is holding right now, and dropping it
+  // here would leave a serving stand-in indistinguishable from a true master on
+  // its very next boot.
+  writeRoleOverride({
+    role: override.role,
+    ...(override.standIn === true ? { standIn: true } : {}),
+    setAt: override.setAt,
+    setBy: override.setBy,
+  });
+}
+
+/** Whether this boot is a temporary stand-in rather than a master in its own right (20.5). */
+export function isStandInBoot(): boolean {
+  return readRoleOverride()?.standIn === true;
 }
 
 /**

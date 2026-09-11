@@ -15,6 +15,14 @@ export interface RecoveryOptions {
   standalone: boolean;
   /** Deployment's resolved backend for synthesized node stubs; passed in so this module stays env-import-free. */
   dataBackend: 'file' | 'postgres';
+  /**
+   * The caller INHERITED newTerm from the stored row instead of minting it (a
+   * serve-only stand-in, 20.5). The stored plan is stamped under that same term,
+   * so equality stops being evidence of a cloned store and becomes the expected
+   * case; without this the plan is discarded and every shard the dead master
+   * held reads as free.
+   */
+  termInherited?: boolean;
 }
 
 export interface RecoveryResult {
@@ -66,7 +74,7 @@ export async function evaluateRecovery(store: ControlStore, opts: RecoveryOption
     return result;
   }
 
-  const invalid = validatePlan(plan, opts.newTerm);
+  const invalid = validatePlan(plan, opts.newTerm, opts.termInherited === true);
   if (invalid) {
     console.error(`[Fleet] Persisted plan DISCARDED (${invalid}); starting virgin`);
     const result: RecoveryResult = { recovered: false };
@@ -74,6 +82,16 @@ export async function evaluateRecovery(store: ControlStore, opts: RecoveryOption
     return result;
   }
 
+  // A stand-in cannot persist the archive that makes a reshard reversible: on a
+  // read-only store every write inside confirmedReshard is a silent no-op, and
+  // it would still RETURN an empty plan, so the node would take over and serve
+  // zero shards - strictly worse than never arming.
+  if (opts.termInherited && opts.override !== null && opts.override !== plan.shardCount) {
+    console.warn(`[Fleet] Standing in: ignoring the FLEET_SHARD_COUNT override ${opts.override} and adopting the persisted ${plan.shardCount}-shard plan`);
+    const result = await adoptPlan(store, plan, opts.dataBackend);
+    if (paused) result.reshardPaused = paused;
+    return result;
+  }
   if (opts.override !== null && opts.override !== plan.shardCount) {
     if (!isReshardConfirmed()) {
       // Unconfirmed count change: adopt the old count (zero downtime); an
@@ -163,12 +181,19 @@ async function confirmedReshard(
   };
 }
 
-function validatePlan(plan: PersistedPlan, newTerm: number): string | null {
+function validatePlan(plan: PersistedPlan, newTerm: number, termInherited: boolean): string | null {
   if (!Number.isInteger(plan.term) || plan.term < 0) return 'term is not an integer >= 0';
   if (!Number.isInteger(plan.epoch) || plan.epoch < 0) return 'epoch is not an integer >= 0';
   if (!Number.isInteger(plan.shardCount) || plan.shardCount < 1) return 'shardCount is not an integer >= 1';
   if (!Array.isArray(plan.assignments)) return 'assignments is not an array';
-  if (plan.term >= newTerm) return `plan term ${plan.term} >= new term ${newTerm}, corrupted or cloned store`;
+  // A stand-in does not MINT a term, it inherits the one the plan was stamped
+  // under, so equality here is the normal case rather than a cloned store. The
+  // relaxation is gated on that: for a master that minted, `>=` is still the
+  // only thing that catches a boot against a copied volume, and losing it there
+  // would let a clone adopt a plan it must discard.
+  if (termInherited ? plan.term > newTerm : plan.term >= newTerm) {
+    return `plan term ${plan.term} ${termInherited ? '>' : '>='} new term ${newTerm}, corrupted or cloned store`;
+  }
   const seen = new Set<number>();
   for (const assignment of plan.assignments) {
     if (typeof assignment?.nodeId !== 'string' || assignment.nodeId.length === 0) return 'assignment nodeId is empty';

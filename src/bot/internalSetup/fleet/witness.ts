@@ -45,6 +45,13 @@ export interface BeaconFacts {
   promoting?: boolean;
   /** This node's designated backup priority, so a contested arm can be ranked by the operator's own order (B6 map F22). */
   backupPriority?: number;
+  /**
+   * Backup only: this node still holds a control connection to the master
+   * (B6 map F19 term f). One backup's view of the master is the only evidence
+   * that separates "the master is gone" from "this backup is the isolated one",
+   * and no other channel carries it once the master is unreachable.
+   */
+  masterSeen?: boolean;
 }
 
 export interface WitnessClaim {
@@ -56,6 +63,7 @@ export interface WitnessClaim {
   standingInFor?: string;
   promoting?: boolean;
   backupPriority?: number;
+  masterSeen?: boolean;
   /** Discord's edited_timestamp (falls back to the post timestamp), ms epoch. */
   observedAt: number;
 }
@@ -163,6 +171,7 @@ function parseBeacon(content: unknown): { nodeId: string; nodeName: string; term
       ...(typeof parsed.standingInFor === 'string' && parsed.standingInFor !== '' ? { standingInFor: parsed.standingInFor } : {}),
       ...(parsed.promoting === true ? { promoting: true } : {}),
       ...(Number.isFinite(parsed.backupPriority) ? { backupPriority: Number(parsed.backupPriority) } : {}),
+      ...(parsed.masterSeen === true ? { masterSeen: true } : {}),
     };
   } catch {
     return null;
@@ -221,6 +230,7 @@ export class DiscordWitness implements FleetWitness {
       ...(facts.standingInFor ? { standingInFor: facts.standingInFor } : {}),
       ...(facts.promoting ? { promoting: true } : {}),
       ...(Number.isFinite(facts.backupPriority) ? { backupPriority: facts.backupPriority } : {}),
+      ...(facts.masterSeen ? { masterSeen: true } : {}),
       seq: ++this.seq,
     })}`;
     if (this.beaconMessageId === null) {
@@ -364,12 +374,20 @@ export interface WitnessLoopOptions extends DiscordWitnessOptions {
   getTerm: () => number;
   /** Master only: whether this node can still write its own control store (20.12 c3). */
   getBeaconFacts?: () => BeaconFacts;
+  /**
+   * Called after every completed tick with THIS tick's own renew outcome, which
+   * is the only place that boolean is exact. WitnessStatus.lastRenewOk is up to
+   * a full renew period old, and the stand-in lane's whole safety argument rests
+   * on proving the witness darkness belongs to the master and not to this node
+   * IN THE SAME TICK that observed it (B6 map F19 term b).
+   */
+  onTick?: (renewOk: boolean, status: WitnessStatus) => void;
 }
 
 /** Build a witness and drive its renew loop; a successful renew is followed by a read so drills can verify both halves. */
 /** Only the facts a reader ACTS on; a changed value here is worth an out-of-band renew, the seq counter is not. */
 function factsKey(facts: BeaconFacts): string {
-  return [facts.storeState ?? '', facts.standingInFor ?? '', facts.promoting ? '1' : '', facts.backupPriority ?? ''].join('|');
+  return [facts.storeState ?? '', facts.standingInFor ?? '', facts.promoting ? '1' : '', facts.backupPriority ?? '', facts.masterSeen ? '1' : ''].join('|');
 }
 
 export function startWitnessLoop(opts: WitnessLoopOptions): FleetWitness {
@@ -389,6 +407,15 @@ export function startWitnessLoop(opts: WitnessLoopOptions): FleetWitness {
       // on how recently this node last READ the home, so skipping it would let
       // one failed write age out evidence that is still perfectly readable.
       const claims = await witness.readClaims();
+      // Runs on a failed renew too: a lane that must refuse when this node
+      // could not renew has to be TOLD that, not left to infer it from silence.
+      if (opts.onTick) {
+        try {
+          opts.onTick(ok, witness.getStatus());
+        } catch (error) {
+          console.warn('[Fleet] Witness tick consumer failed:', error instanceof Error ? error.message : error);
+        }
+      }
       if (!ok) return;
       if (claims !== null && !claims.some(c => c.nodeId === opts.nodeId)) {
         await witness.repostBeacon(opts.getTerm(), opts.role, opts.getBeaconFacts?.() ?? {});

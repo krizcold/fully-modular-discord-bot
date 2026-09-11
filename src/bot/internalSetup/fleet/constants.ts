@@ -291,3 +291,22 @@ export const STEPDOWN_HANDOVER_DELAY_MS = 3000;
 
 /** Per-candidate deadline for the new master's STEP_DOWN notification (best effort, fire and forget). */
 export const STEP_DOWN_NOTIFY_MS = PEER_TERM_PROBE_MS;
+
+/**
+ * How many times this node may arm the stand-in lane before it stops trying and
+ * leaves the fleet to a manual promote. Each attempt costs a bot restart into
+ * the master path, so a master flapping dark and alive would otherwise drive an
+ * arm-failback-arm loop against a shared daily identify budget (B6 map F40).
+ */
+export const ARM_MAX_ATTEMPTS = 3;
+
+/** Minimum spacing between two stand-in attempts, for the same reason. */
+export const ARM_SPACING_MS = 30 * 60_000;
+
+/**
+ * How long a SERVE-ONLY stand-in boot waits on an unreadable copy before giving
+ * up and returning to backup duty. Unbounded is correct for a real master (the
+ * next statement blocks on the same store anyway); for a stand-in it is the
+ * worst possible state, because it has already stopped being a backup.
+ */
+export const STANDIN_FENCE_HOLD_MS = 60_000;

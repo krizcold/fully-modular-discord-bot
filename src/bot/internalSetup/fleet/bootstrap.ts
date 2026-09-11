@@ -36,6 +36,7 @@ import {
   invalidateRoleOverrideCache,
   isBackupMaster,
   isStandalone,
+  isStandInBoot,
   rawMasterUrls,
   readRoleOverride,
   resolveEnvRole,
@@ -44,7 +45,8 @@ import {
   wasNodeIdFreshlyGenerated,
   writeRoleOverride,
 } from './nodeIdentity';
-import { prepareControlStore, PostgresControlStore } from './postgresControlStore';
+import { createStandInControlStore, prepareControlStore, PostgresControlStore } from './postgresControlStore';
+import { ArmRecord, readArmRecord, writeArmRecord } from './armRecord';
 import { clearOwnSyncPosture } from './syncPosture';
 import { Registry, RegistryNode } from './registry';
 import { ControlServer } from './controlServer';
@@ -76,7 +78,7 @@ import {
   GuildDataWriteRequest,
   setDataOpForwarder,
 } from '../utils/ipcDataHandler';
-import { applyDeliveredBackend, ensureRuntimeWith, getActiveBackendUrl, getDeliveredBackendUrls, pickDeliveredUrl } from '../utils/dataBackends/boot';
+import { applyDeliveredBackend, ensureRuntimeWith, getActiveBackendUrl, getDeliveredBackendUrls, pickDeliveredUrl, repointRuntimeForThisProcess } from '../utils/dataBackends/boot';
 import { setLeaseDeclineHandler } from '../utils/dataBackends/dataReadiness';
 import { applyRouteOverrides, currentRouteDefault } from '../utils/dataBackends/routeResolver';
 import { loadCredentials, resolveDataBackend, upsertCredentials } from '../../../utils/envLoader';
@@ -88,7 +90,9 @@ import { TransformationExecutor } from './transformation/transformationExecutor'
 import type { ControlStore, PersistedFleetConfig, PersistedTerm, TransformDirection } from './controlStore';
 import { effectiveFleetConfigView, effectiveMasterUrls, forcePassive, readFleetConfigCache, validateMasterCandidates, renumberDesignations, validateBackupDesignations, validateWitnessChannelId, writeFleetConfigCache } from './fleetConfig';
 import { getLocalReplicaIdentity, getReplicaHealth, getSlotSample, setReplicaProbeListener } from './replicaHealth';
-import { hasDbReplica } from './replicaPromotion';
+import { canonicalStoreReachable, hasDbReplica, probeReplica, resolveReplicaEndpoints, spliceFleetCredentials } from './replicaPromotion';
+import { ArmEvidenceInputs, armDeferral, evaluateArmEvidence, ledgerAllowsArm, preArmRefusal, reachabilityWarning } from './armLane';
+import { readReshardPending, readStandbyTermRow } from './armProbe';
 import { clearSlotStatus, readSlotStatus, recordFromPush, sourceMatchesAny, writeSlotStatus } from './slotStatus';
 import { startSyncPostureEngine, SyncPostureEngine, SyncPostureTarget } from './syncPostureEngine';
 import { clearSyncPostureRecord, recordFromPosturePush, writeSyncPostureRecord } from './syncPostureFact';
@@ -101,6 +105,7 @@ import {
   clearSuperseded,
   copyBlockEndpoint,
   freshHigherTermClaim,
+  freshMasterClaim,
   hasFreshFleetConfirm,
   higherTermClaim,
   notifyStepDown,
@@ -111,7 +116,7 @@ import {
   writeCopyBlock,
   writeSuperseded,
 } from './stepDown';
-import { LEASE_TTL_MS, STEP_DOWN_NOTIFY_MS, STEPDOWN_FALLBACK_MS, STEPDOWN_HANDOVER_DELAY_MS } from './constants';
+import { ARM_MAX_ATTEMPTS, LEASE_TTL_MS, STANDIN_FENCE_HOLD_MS, STEP_DOWN_NOTIFY_MS, STEPDOWN_FALLBACK_MS, STEPDOWN_HANDOVER_DELAY_MS, WITNESS_FRESH_WINDOW_MS } from './constants';
 import type { StepDownPayload } from './protocol';
 import { planPinRestoreLegs } from './placement';
 import { TRANSFER_PORT_DEFAULT } from './constants';
@@ -297,6 +302,15 @@ export async function initFleet(): Promise<FleetContext> {
   if (context) return context;
   if ((process.env.MASTER_URLS || '').trim() !== '' && (process.env.BOT_NODE_ROLE || '').trim() === '' && !readRoleOverride()) {
     console.warn('[Fleet] MASTER_URLS is set but BOT_NODE_ROLE is not. The candidate list NEVER changes a node\'s role; set BOT_NODE_ROLE=master, co-worker or backup-master explicitly on every node that carries MASTER_URLS.');
+  }
+  // A stale stand-in override on a node that has since lost its fleet wiring
+  // would otherwise take the ORDINARY master path onto a database still in
+  // recovery, with none of the stand-in guards and no way back: the lane's own
+  // standIn flag requires a fleet, so it would read false here.
+  if (isStandalone() && isStandInBoot()) {
+    console.warn('[Fleet] Clearing a stand-in role override on a standalone boot: there is no fleet to stand in for');
+    clearRoleOverride();
+    invalidateRoleOverrideCache();
   }
   const role = resolveNodeRole();
   const standalone = isStandalone();
@@ -501,6 +515,7 @@ async function runStaleMasterFence(
   selfNodeName: string,
   standalone: boolean,
   takeoverConfirmed: boolean,
+  standIn = false,
 ): Promise<void> {
   if (standalone) return;
   if (takeoverConfirmed) {
@@ -516,17 +531,29 @@ async function runStaleMasterFence(
   // very next statement blocks on the same store until it answers, so waiting
   // here costs nothing and silently dropping the only fork check costs a fleet.
   let local: PersistedTerm | null = null;
-  for (;;) {
+  for (let waited = 0; ; waited += TERM_GUARD_POLL_MS) {
     try {
       local = await store.getTerm();
       break;
     } catch {
+      // Unbounded is right for a real master: the next statement blocks on the
+      // same store anyway. A stand-in is the opposite case - it has already
+      // given up backup duty and its witness, so holding here forever is worse
+      // than never having armed, and nothing is left running to change its mind.
+      if (standIn && waited >= STANDIN_FENCE_HOLD_MS) {
+        return disarmStandIn('the copy this node would serve from is unreadable');
+      }
       console.warn('[Fleet] Stale-master fence: control store unreadable; holding before it can judge the boot');
       await guardSleep(TERM_GUARD_POLL_MS);
     }
   }
   const localTerm = local ? local.term : 0;
   const park = (observedTerm: number, peerUrl: string, detail: string, extra = ''): Promise<never> => {
+    // A stand-in that trips the fence has learned the master is alive after all,
+    // which is the best possible outcome: it simply stops standing in. Parking
+    // it instead would strand a node that is no longer a backup and no longer a
+    // master, with nothing left running to change its mind.
+    if (standIn) return disarmStandIn(`${detail}; the master this node was covering is alive`);
     console.error(`[Fleet] STALE MASTER FENCE: ${detail}; parking the boot instead of acquiring a term on a database the fleet has moved off. Demote this node to rejoin as a co-worker.${extra}`);
     _setStaleMasterPark({ observedTerm, localTerm, peerUrl, at: Date.now() });
     pushFleetStatusNow();
@@ -544,6 +571,17 @@ async function runStaleMasterFence(
       // This node's own answer proves nothing: candidates include its own
       // advertised URL, and a predecessor process may still hold the port.
       if (peer === null || peer.nodeId === selfNodeId || peer.term < localTerm) continue;
+      // A stand-in covering THIS node is the one peer that must not fence it:
+      // it holds the fleet at this node's own inherited term precisely so this
+      // node can come back, so parking here would strand the fleet on a
+      // temporary copy forever. The witness half already carries the same
+      // exception (F21); the peer half needs it too, and needs it MORE, because
+      // an inherited term is equal rather than higher and so always trips the
+      // comparison above (B6 map F28).
+      if (peer.standingInFor === selfNodeId) {
+        console.warn(`[Fleet] Stale-master fence: ${url} is standing in for this node at term ${peer.term}; continuing the boot so it can hand back`);
+        continue;
+      }
       await park(peer.term, url, `${url} answers as a live master on term ${peer.term} while this node's store holds ${localTerm} and nothing is writing to it`);
     }
   }
@@ -668,22 +706,127 @@ function guardSleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+/**
+ * The stand-in lane's only exit from a boot that must not continue. It replaces
+ * park() on this path deliberately: park is a terminal hold, which for a
+ * stand-in is strictly WORSE than never arming, because the node has already
+ * abandoned its backup duty and its witness. Anything that would park a
+ * stand-in instead returns it to being a backup (B6 map F40, and the park
+ * hazard 20.5's reversibility rule exists to avoid).
+ */
+async function disarmStandIn(reason: string): Promise<never> {
+  const record = readArmRecord();
+  if (record) {
+    writeArmRecord({ ...record, phase: 'disarmed', disarmedAt: Date.now(), disarmReason: reason });
+  }
+  // Forced to co-worker rather than cleared: an explicit override records that
+  // this node stood down, and stamps who did it, where a deleted file would say
+  // only that no override was ever written.
+  writeRoleOverride({ role: 'co-worker', setAt: Date.now(), setBy: 'stand-in' });
+  invalidateRoleOverrideCache();
+  console.error(`[Fleet] STAND-IN DISARMED: ${reason}; returning to backup duty`);
+  requestStepDownRestart();
+  const retry = setInterval(() => requestStepDownRestart(), STEPDOWN_FALLBACK_MS);
+  retry.unref();
+  for (;;) await guardSleep(TERM_GUARD_POLL_MS);
+}
+
 async function initMaster(init: CommonInit & { standalone: boolean }): Promise<FleetContext> {
   // A master follows no slot: a record left by this node's co-worker past must
   // not keep answering the manager's facts hook. The posture fact goes with it,
   // for the same reason: a master is not a standby of itself.
-  clearSlotStatus();
-  clearSyncPostureRecord();
-  _setSlotStatus(null);
+  // Kept for a stand-in: it never promoted, so it IS still a standby, and
+  // blanking its slot facts would hide a live copy from the manager's replica
+  // automation for the whole outage.
+  if (!isStandInBoot()) {
+    clearSlotStatus();
+    clearSyncPostureRecord();
+    _setSlotStatus(null);
+  }
   const { standalone, nodeId, nodeName, appVersion, capabilities, runtime } = init;
   const ingest = getIngestService();
-  const usedFreshConfirm = await runEmptyStoreHold(standalone, nodeId);
+  // SERVE-ONLY STAND-IN BOOT (20.5, B6-f). This node coordinates the fleet from
+  // a database that is STILL A STANDBY, so postgres refuses every write here
+  // with SQLSTATE 25006 - including CREATE ... IF NOT EXISTS, which is rejected
+  // on the command class before it checks whether the object exists (measured
+  // 2026-09-10 on a real pair). Write sites on this path are therefore SKIPPED
+  // rather than attempted and caught: several retry forever, and a boot that
+  // never reaches server.start serves nobody while having already given up
+  // being a backup.
+  const armRecord: ArmRecord | null = readArmRecord();
+  const standIn = !standalone && isStandInBoot();
+  if (standIn && (!armRecord || armRecord.phase === 'disarmed')) {
+    return disarmStandIn('the stand-in role override carries no live arm record, so this node cannot say which master it covers');
+  }
+  const coveringNodeId = standIn ? armRecord!.coveringNodeId : null;
+  // Every OTHER stand-in failure routes here; these reads reach the pool with no
+  // catch of their own, and initFleet has none either, so without this a copy
+  // that blinks between the fence and the read crashes the bot child, which
+  // re-enters the same stand-in boot instead of going back to being a backup.
+  const standInGuard = async <T>(what: string, fn: () => Promise<T>): Promise<T> => {
+    try {
+      return await fn();
+    } catch (error) {
+      if (!standIn) throw error;
+      return disarmStandIn(`${what} failed on the copy this node is serving: ${error instanceof Error ? error.message : error}`);
+    }
+  };
+  let standInUrl = '';
+  if (standIn) {
+    const endpoints = resolveReplicaEndpoints();
+    const spliced = endpoints ? spliceFleetCredentials(endpoints.local) : {};
+    if (!endpoints || !('url' in spliced) || !spliced.url) {
+      return disarmStandIn('this node holds no usable database standby to serve from');
+    }
+    standInUrl = spliced.url;
+    // Guild data has to follow the control plane onto the copy. Both endpoints
+    // otherwise resolve to the MASTER's primary, which is the host the arm lane
+    // proved unreachable in order to arm at all, so a stand-in that repointed
+    // only its control store would coordinate a fleet it could not serve.
+    //
+    // IN PROCESS ONLY, and nothing is written to /data/.env. The delivered-backend
+    // lane persists on purpose, because a worker must still know its endpoint
+    // after a restart; a stand-in is the opposite case, deriving this endpoint
+    // again from FLEET_DB_REPLICA_URL on every boot. A persisted value would
+    // outlive the stand-in that wrote it and need unwinding later, across exits
+    // that are not one code path, and the canonical endpoint it replaced is what
+    // the arm conjunction probes: left behind, this node's own copy answers that
+    // probe forever and the lane quietly retires. Dying with the process is what
+    // keeps serve-only reversible at no cost.
+    const repointed = await repointRuntimeForThisProcess(standInUrl)
+      .catch(err => {
+        console.warn('[Fleet] Stand-in data backend repoint failed:', err instanceof Error ? err.message : err);
+        return false;
+      });
+    if (!repointed) {
+      return disarmStandIn('this node could not point its data layer at the copy it would serve from');
+    }
+  }
+  // Counted on every serve-only BOOT, not just on every arm, and reset the
+  // moment this node actually serves. A boot that dies before that point comes
+  // straight back here with the override still set, so counting arms alone
+  // would never increment in exactly the reboot loop the cap exists to stop.
+  if (standIn) {
+    if (armRecord!.attempts >= ARM_MAX_ATTEMPTS) {
+      return disarmStandIn(`this node has tried to stand in ${armRecord!.attempts} times without serving; failing over now needs a manual promote`);
+    }
+    writeArmRecord({ ...armRecord!, attempts: armRecord!.attempts + 1, lastAttemptAt: Date.now() });
+  }
+  // The store is populated by replication by construction (the arm read its term
+  // row), and the hold's own probe loop is unbounded on an error, so running it
+  // here can only wedge a boot whose answer is already known.
+  const usedFreshConfirm = standIn ? false : await runEmptyStoreHold(standalone, nodeId);
   // Before the control store and before any write of this boot (B6 map F18):
   // a master that died while armed comes back armed, and its first write would
   // hang behind standbys that may no longer exist. Relaxing writes no WAL, so
   // this is the one statement that can always get through.
-  await clearOwnSyncPosture();
-  const store = await prepareControlStore(standalone);
+  // Skipped because it dials the CANONICAL endpoint, which on this path is the
+  // dead master's primary: a stand-in has no business relaxing a posture on a
+  // cluster it does not serve from. The copy's OWN inherited
+  // synchronous_standby_names still has to go, but only when it leaves recovery,
+  // which is the write step's job.
+  if (!standIn) await clearOwnSyncPosture();
+  const store = standIn ? createStandInControlStore(standInUrl) : await prepareControlStore(standalone);
   // A control-store fence trip means a second master owns the schema: this
   // master stops granting entirely (the higher-term master is the healthy
   // one). Teardown (assigned once the server exists) drops every worker so
@@ -723,19 +866,64 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     || (process.env.FLEET_CONFIRM_TAKEOVER || '').trim() === '1';
   const chainTakeover = !standalone && bootOverride?.chainTakeover === true;
   let previousHolder: { term: number; nodeId: string } | null = null;
-  if (store instanceof PostgresControlStore && !standalone) {
+  // The guard watches for a FROZEN term row and reports its holder as takeover
+  // chain input. A stand-in's row is frozen by construction (its master is gone
+  // and it will not stamp), so the guard would hand back a chain input that must
+  // never be acted on: chaining ends in a Declare Lost, which F8 forbids an
+  // automatic lane. The evidence the guard would have supplied was already
+  // gathered by the arm conjunction before the override was written.
+  if (store instanceof PostgresControlStore && !standalone && !standIn) {
     previousHolder = await runTakeoverGuard(store, nodeId, takeoverConfirmed);
   }
-  await runStaleMasterFence(store, nodeId, nodeName, standalone, takeoverConfirmed);
+  // The fence stays ON for a stand-in: its PEER half parks on any answering peer
+  // at an equal or higher term, which is how a master that came back between the
+  // arm decision and this boot is caught. Two things differ for a stand-in: the
+  // terminal park becomes a disarm, and the otherwise unbounded hold on an
+  // unreadable store is bounded.
+  // The witness half does NOT catch that case, because an inherited term equals
+  // the returning master's and higherTermClaim is strictly-greater; the pre-arm
+  // contestedTerm check is what covers an undialable one.
+  await runStaleMasterFence(store, nodeId, nodeName, standalone, takeoverConfirmed, standIn);
 
   // The boot cleared every gate, so the brand-new-fleet answer has been spent
   // on the store it was given for.
   if (usedFreshConfirm) clearFreshFleetConfirm();
-  const term = await store.acquireTerm(nodeId);
+  // A stand-in INHERITS the term instead of minting one. Minting is an INSERT,
+  // which a replica refuses, and acquireTerm retries forever, so on this path it
+  // is not merely wrong but a guaranteed wedge. Inheriting is also the correct
+  // semantics: the stand-in is holding the dead master's term open until it
+  // returns, not starting an era of its own, and a higher term would make the
+  // returning master's own boot fence park it out of its fleet.
+  let term: number;
+  if (standIn) {
+    const inherited = await standInGuard('reading the inherited term', () => store.getTerm());
+    if (!inherited || !Number.isFinite(inherited.term) || inherited.term <= 0) {
+      return disarmStandIn('the replayed control store carries no term row to stand in at');
+    }
+    // The record was written before a restart; if the row now names a different
+    // master, this node would publish standingInFor X while holding Y's term,
+    // and the returning master's fence exception keys on the published name.
+    if (inherited.nodeId !== coveringNodeId) {
+      return disarmStandIn(`the term row now names ${inherited.nodeId}, not the ${coveringNodeId} this node armed to cover`);
+    }
+    term = inherited.term;
+    // Re-read rather than spread: the boot already wrote attempts+1 to DISK,
+    // but this closure still holds the object as it was BEFORE that write, so
+    // spreading it would rewind the counter and leave the cap unable to bound
+    // the reboot loop it exists for.
+    const onDisk = readArmRecord() ?? armRecord!;
+    writeArmRecord({ ...onDisk, phase: 'serving', inheritedTerm: term, inheritedFrom: inherited.nodeId });
+    console.warn(`[Fleet] STANDING IN for ${coveringNodeId} at inherited term ${term}; serving READ-ONLY until the write step`);
+  } else {
+    term = await store.acquireTerm(nodeId);
+  }
   if (bootOverride?.takeover || bootOverride?.chainTakeover) consumeTakeoverFlags();
   // The stamp is this master's own lease (PLAN_STANDBY 3.1): deposed masters
   // learn of it within one interval, and stamp health feeds the fleet-state banner.
-  if (store instanceof PostgresControlStore && !standalone) {
+  // Suppressed while standing in: the stamp is an UPDATE, and a zero-row result
+  // latches the control-store fence. The stand-in does not own this term and
+  // must not start claiming its lease.
+  if (store instanceof PostgresControlStore && !standalone && !standIn) {
     const stampTimer = setInterval(() => void store.stampTerm(), TERM_STAMP_MS);
     stampTimer.unref();
   }
@@ -745,7 +933,13 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   // master boot against a store that has none.
   let fleetConfig: PersistedFleetConfig | null = null;
   if (!standalone) {
-    fleetConfig = await store.loadFleetConfig();
+    fleetConfig = await standInGuard('reading the fleet config', () => store.loadFleetConfig());
+    // A stand-in reads the topology and never rewrites it: the seed and the
+    // self-removal below are both writes, and the list it would be editing
+    // belongs to the master it is covering.
+    if (!fleetConfig && standIn) {
+      return disarmStandIn('the replayed control store carries no fleet config to serve from');
+    }
     if (!fleetConfig) {
       // Seed from the UNFILTERED env list: the stored copy is fleet-wide and
       // must include this master's own URL (workers dial it); the per-node
@@ -756,7 +950,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     }
     // A master is not its own backup: a promoted backup's entry, pushed to every
     // node until now, leaves the list it now owns.
-    if (fleetConfig && fleetConfig.backupDesignations.some(d => d.nodeId === nodeId)) {
+    if (!standIn && fleetConfig && fleetConfig.backupDesignations.some(d => d.nodeId === nodeId)) {
       fleetConfig = {
         ...fleetConfig,
         revision: fleetConfig.revision + 1,
@@ -845,14 +1039,15 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   // master restart. Self leases are re-granted immediately (the old process's
   // sessions died with it); remote leases seed the shardTable at their old
   // (term, epoch) and read as frozen until their node re-registers.
-  const rec = await evaluateRecovery(store, {
+  const rec = await standInGuard('reading the persisted plan', () => evaluateRecovery(store, {
     newTerm: term,
     resolvedShardCount: shardCount,
     liveRecommendation: recommendedShards,
     override: getShardCountOverride(),
     standalone,
     dataBackend: resolveDataBackend(),
-  });
+    termInherited: standIn,
+  }));
   // Reshard pause: while the marker exists NOTHING is auto-assigned - no
   // self-claim, no Phase R/F (distribute returns immediately). Manual assign
   // and Resume are allowed only after the hold-down window (a partitioned
@@ -969,7 +1164,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       persist().catch(error => console.warn('[Fleet] Persist after down transition failed:', error instanceof Error ? error.message : error));
     },
   });
-  if (healthMonitor) healthMonitor.seed((await store.loadRegistry()).lostNodes ?? []);
+  if (healthMonitor) healthMonitor.seed((await standInGuard('reading the node registry', () => store.loadRegistry())).lostNodes ?? []);
 
   // graceOver gates nothing that auto-runs while paused (distribute returns
   // immediately), so paused boots start with it set; holdDownUntil is still
@@ -2227,6 +2422,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     server = new ControlServer({
       getTerm: () => registry.term,
       getNodeId: () => nodeId,
+      getStandingInFor: () => coveringNodeId,
       onStepDown: payload => {
         const noticeTerm = Number(payload?.term);
         if (!Number.isFinite(noticeTerm) || typeof payload?.nodeId !== 'string' || payload.nodeId === '') return { ok: false, reason: 'invalid' };
@@ -2506,6 +2702,14 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     await transformer.recover().catch(error =>
       console.error('[Transform] Recovery failed:', error instanceof Error ? error.message : error));
     await server.start(port, secret);
+    // Reaching this line is what "it worked" means for the stand-in lane, so the
+    // attempt budget resets HERE. Resetting at term acquisition would clear it
+    // before every read that can still fail, and the reboot loop F40 exists to
+    // bound would never increment.
+    if (standIn) {
+      const serving = readArmRecord();
+      if (serving) writeArmRecord({ ...serving, attempts: 0 });
+    }
     onDeposedTeardown = () => {
       server?.dropAll();
       // A deposed master must not keep another node's writes waiting on a copy
@@ -2596,7 +2800,11 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
         token: witnessToken,
         nodeId,
         nodeName,
-        role: 'master',
+        // A stand-in KEEPS its backup identity (20.5), and the F21 park
+        // exception it depends on is written as "not role master", so beaconing
+        // 'master' here would make the returning true master park on its own
+        // stand-in and never come back.
+        role: standIn ? 'backup' : 'master',
         getTerm: () => registry.term,
         // Published so a backup can tell "the master's database died" from
         // "I cannot reach the master's database" (20.12 c3): only this node
@@ -2604,6 +2812,11 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
         // TTL is a dead store, not a blip.
         getBeaconFacts: (): BeaconFacts => {
           const facts: BeaconFacts = { storeState: 'healthy' };
+          // The flag that makes every other node treat this one as the fleet's
+          // coordinator while keeping the node it names out of the park path
+          // (F21). Published from the master loop because a serving stand-in IS
+          // running the master path, and its own role stays 'backup'.
+          if (coveringNodeId) facts.standingInFor = coveringNodeId;
           if (store instanceof PostgresControlStore && !standalone) {
             const failing = (store.getStampFailingForMs() ?? 0) >= LEASE_TTL_MS;
             // The third value, and the reason it exists (B6 map F20): while
@@ -2715,7 +2928,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   // waiting for that copy, so a stand-in's data really would be every
   // acknowledged write. Inert until an operator enables active mode on a node
   // that also consents to it, which is nobody by default.
-  if (!standalone && !controlFenced && resolveDataBackend() === 'postgres') {
+  if (!standalone && !controlFenced && !standIn && resolveDataBackend() === 'postgres') {
     const engine = startSyncPostureEngine({
       url: () => getActiveBackendUrl(),
       publish: fact => publishSyncPosture(fact),
@@ -3132,6 +3345,176 @@ async function initCoWorker(init: CommonInit): Promise<FleetContext> {
     console.error('[Fleet] Co-worker requires MASTER_URLS and CONTROL_SECRET; idling without a master');
   }
 
+  // THE STAND-IN ARM DECISION (20.5, B6-f). Runs on the witness tick because
+  // term (b) - "this node's own renew succeeded" - is only exact in the tick
+  // that performed it, and that term is what separates "the master is gone"
+  // from "this node is the one that is isolated".
+  let armInFlight = false;
+  // When this node's own evidence first held, so a lower-ranked backup can defer
+  // to a higher-ranked one by WAITING rather than by asking it anything.
+  let evidenceHeldSince = 0;
+  const evaluateStandInArm = async (renewOk: boolean, status: WitnessStatus): Promise<void> => {
+    if (armInFlight) return;
+    armInFlight = true;
+    try {
+      const now = Date.now();
+      // A witness that could not be READ is not evidence of a dark master; it is
+      // evidence of nothing. freshMasterClaim returns null for both, so the read
+      // freshness is checked separately rather than folded into it.
+      const readFresh = status.lastReadAt !== null && now - status.lastReadAt <= WITNESS_FRESH_WINDOW_MS;
+      const cheap = {
+        ownRenewOk: renewOk,
+        masterUnreachable: controlClient?.masterKnown() !== true,
+        masterBeaconDark: readFresh && freshMasterClaim(status, nodeId, now) === null,
+        noPeerSeesMaster: !status.claims.some(c =>
+          c.nodeId !== nodeId && now - c.observedAt <= WITNESS_FRESH_WINDOW_MS && c.masterSeen === true),
+      };
+      // The last two terms each cost a database connection, so they are gathered
+      // only once the free evidence agrees. Passing them as satisfied here is
+      // safe because this call can only REFUSE: every real decision below runs
+      // against the measured values.
+      const cheapVerdict = evaluateArmEvidence({ ...cheap, storeUnreachable: true, receiverStopped: true });
+      if (!cheapVerdict.arm) {
+        evidenceHeldSince = 0;
+        return;
+      }
+
+      // Checked before anything dials: on a node that never consented, every
+      // one of the connections below would open and time out on every tick for
+      // the whole outage, and the answer is already known.
+      const designation = readFleetConfigCache()?.backupDesignations.find(d => d.nodeId === nodeId);
+      const activeMode = consentsToActiveMode() && designation?.mode === 'active';
+      if (!activeMode || resolveDataBackend() !== 'postgres') {
+        evidenceHeldSince = 0;
+        return;
+      }
+
+      const endpoints = resolveReplicaEndpoints();
+      const spliced = endpoints ? spliceFleetCredentials(endpoints.local) : { error: 'no standby endpoint' };
+      const localUrl = 'url' in spliced && spliced.url ? spliced.url : '';
+      const probe = localUrl === '' ? null : await probeReplica(localUrl);
+      const evidence: ArmEvidenceInputs = {
+        ...cheap,
+        storeUnreachable: !(await canonicalStoreReachable()).ok,
+        // probeReplica answers {ok:false} on a refusal or timeout, so without the
+        // ok check a probe that never ran would satisfy the term it was meant to
+        // measure. An absent fact produces no arm.
+        receiverStopped: probe?.ok === true && probe.receiverStreaming !== true,
+      };
+      const verdict = evaluateArmEvidence(evidence);
+      if (!verdict.arm) {
+        evidenceHeldSince = 0;
+        return;
+      }
+
+      // Reading the replayed term row proves three things at once: this copy
+      // still holds the fleet's state (F37, which the manager's own copyCleared
+      // flag never reaches the bot to tell us), which master would be covered,
+      // and at which term the stand-in would serve.
+      const termRow = localUrl === '' ? null : await readStandbyTermRow(localUrl);
+      const reshard = localUrl === '' ? null : await readReshardPending(localUrl);
+      // Decided WITHOUT a connection, deliberately. At arm time both endpoints
+      // live on the machine that just died, so a cluster-identity comparison can
+      // never come back with anything but "unreachable" and would refuse every
+      // deployment rather than only split ones. Two spellings of one cluster now
+      // read as split, which is the safe direction, and the refusal says so.
+      const controlUrl = (loadCredentials().CONTROL_STORE_URL || '').trim();
+      const split = controlUrl !== '' && controlUrl !== (loadCredentials().DATA_BACKEND_URL || '').trim();
+      const refusal = preArmRefusal({
+        activeMode,
+        dataBackendIsPostgres: resolveDataBackend() === 'postgres',
+        draining: controlClient?.isDraining() === true,
+        migrationWorkActive: migrationWorkActive(),
+        hasStandbyEndpoint: localUrl !== '',
+        promoteInFlight: (() => {
+          const record = readPromoteRecord();
+          return record !== null && record.phase !== 'done' && !record.parked;
+        })(),
+        standbyHoldsFleetState: termRow !== null,
+        // Fail closed: an unreadable marker is treated as a pause, because
+        // arming into one serves less than the dark master did.
+        reshardPending: reshard !== false,
+        splitControlStore: split,
+        contestedTerm: termRow !== null && status.claims.some(c =>
+          c.nodeId !== nodeId
+          && now - c.observedAt <= WITNESS_FRESH_WINDOW_MS
+          && (c.role === 'master' || c.standingInFor !== undefined)
+          && c.term >= termRow.term),
+      });
+      if (refusal) {
+        evidenceHeldSince = 0;
+        console.warn(`[Fleet] Stand-in NOT armed: ${refusal}`);
+        return;
+      }
+
+      // F22's ranking, as ruled: a lower-ranked backup WAITS rather than asks
+      // permission. Two designated active backups see identical evidence at the
+      // same instant, and nothing can separate them AFTERWARDS - both inherit
+      // the same term, and every comparison that would fence one is
+      // strictly-greater, so an equal term is invisible to all of them.
+      //
+      // The wait is measured from when this node's own evidence first held, and
+      // it is one full FRESH window per rank step rather than one renew period:
+      // the higher-ranked node has to arm, restart, boot and publish its
+      // standingInFor beacon before the next node decides, and only the fresh
+      // window is long enough to cover that. If it never appears - because that
+      // node is dead, unfit, or capped - this one simply proceeds, which is why
+      // the rank is a delay and not a veto.
+      if (evidenceHeldSince === 0) evidenceHeldSince = now;
+      const rank = designation?.priority ?? 1;
+      const deferral = armDeferral(rank, evidenceHeldSince, now);
+      if (deferral.defer) {
+        console.warn(`[Fleet] Stand-in deferring: rank ${rank} waits ${Math.round(deferral.waitMs / 1000)}s for any higher-ranked backup to stand in first`);
+        return;
+      }
+
+      const existing = readArmRecord();
+      const allowed = ledgerAllowsArm(existing, now);
+      if (!allowed.arm) {
+        console.error(`[Fleet] Stand-in NOT armed: ${allowed.reason}`);
+        return;
+      }
+
+      // Legal but worth saying out loud (F39): 20.9 blesses a solo machine no
+      // co-worker can dial, and on one, standing in serves only this machine.
+      const warning = reachabilityWarning(process.env.FLEET_PUBLIC_URL || '', rawMasterUrls());
+      if (warning) console.warn(`[Fleet] Stand-in reachability: ${warning}`);
+
+      // The point of no return: the override makes the next boot a master boot.
+      // The attempt is counted by that boot rather than here, so a node that
+      // cannot get through it is bounded by re-entering it (F40).
+      // The override goes FIRST. If only the second write fails, the next boot
+      // finds a stand-in override with no record and disarms cleanly at one
+      // restart's cost; the other order would leave no override and a record
+      // whose lastAttemptAt locks this node out for the whole spacing window
+      // over an arm that never happened.
+      writeRoleOverride({ role: 'master', standIn: true, setAt: now, setBy: 'stand-in' });
+      writeArmRecord({
+        phase: 'claimed',
+        coveringNodeId: termRow!.nodeId,
+        armedAt: now,
+        updatedAt: now,
+        inheritedTerm: termRow!.term,
+        inheritedFrom: termRow!.nodeId,
+        evidence: { ...evidence, observedAt: now },
+        // Counted at the serve-only BOOT rather than here: the override is what
+        // persists, so a node that dies before serving is counted by the boot it
+        // keeps re-entering, and counting both would spend two of three on one try.
+        attempts: existing?.attempts ?? 0,
+        lastAttemptAt: now,
+        disarmedAt: null,
+        disarmReason: null,
+      });
+      invalidateRoleOverrideCache();
+      console.error(`[Fleet] STANDING IN for ${termRow!.nodeId} at term ${termRow!.term}: the master is gone on all six checks; restarting to serve READ-ONLY`);
+      requestStepDownRestart();
+    } catch (error) {
+      console.warn('[Fleet] Stand-in evaluation failed:', error instanceof Error ? error.message : error);
+    } finally {
+      armInFlight = false;
+    }
+  };
+
   let witness: FleetWitness | null = null;
   if (isBackupMaster()) {
     const witnessToken = (process.env.DISCORD_TOKEN || '').trim();
@@ -3155,8 +3538,12 @@ async function initCoWorker(init: CommonInit): Promise<FleetContext> {
           // order instead of an arbitrary tie-break (F22).
           const mine = readFleetConfigCache()?.backupDesignations.find(d => d.nodeId === nodeId);
           if (mine) facts.backupPriority = mine.priority;
+          // One backup's view of the master is the only evidence that tells a
+          // peer "the master is up and it is YOU who cannot see it" (F19 term f).
+          if (controlClient?.masterKnown() === true) facts.masterSeen = true;
           return facts;
         },
+        onTick: (renewOk, status) => void evaluateStandInArm(renewOk, status),
       });
       readWitnessNow = async () => {
         // Null when the read itself failed: readClaims leaves the previous

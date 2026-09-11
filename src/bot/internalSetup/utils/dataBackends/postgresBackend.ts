@@ -183,6 +183,18 @@ export class PostgresBackend implements DataBackend {
     while (!this.stopped) {
       try {
         await this.pool.query('SELECT 1');
+        // A cluster IN RECOVERY refuses DDL outright (25006), including
+        // CREATE ... IF NOT EXISTS, so provisioning would fail here forever and
+        // the backend would never become ready. A replica's schema arrives by
+        // replication instead, so there is nothing to provision: this is asked
+        // of the cluster rather than passed in, because any backend pointed at a
+        // standby needs it, not only the stand-in lane that first hit it.
+        const recovery = await this.pool.query('SELECT pg_is_in_recovery() AS in_recovery');
+        if (recovery.rows[0]?.in_recovery === true) {
+          this.becomeReady();
+          console.log('[PostgresBackend] Connected to a database in recovery; backend ready READ-ONLY (no provisioning)');
+          return;
+        }
         await this.provision();
         if (this.schemaMismatch) return;
         this.becomeReady();

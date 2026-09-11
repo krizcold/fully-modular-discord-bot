@@ -69,7 +69,22 @@ export class PostgresControlStore implements ControlStore {
   private fenced = false;
   private fencedCb: ((observedTerm: number) => void) | null = null;
 
-  constructor(private readonly pool: Pool) {}
+  /**
+   * readOnly marks a store opened against a cluster still IN RECOVERY, which is
+   * what a serve-only stand-in coordinates from (20.5, B6-f). Two things follow
+   * and neither is optional:
+   *
+   * - Provisioning is asserted rather than run. ensureProvisioned issues DDL on
+   *   EVERY accessor until one succeeds, and a standby refuses DDL outright
+   *   (25006) even in its IF NOT EXISTS form, so an unmarked store cannot even
+   *   READ its own term row.
+   * - Writes become no-ops instead of throws. persist() is awaited inside the
+   *   distribution pass, so a throw there aborts free-shard placement for the
+   *   whole pass rather than just failing to record it.
+   */
+  constructor(private readonly pool: Pool, private readonly readOnly = false) {
+    if (readOnly) this.provisioned = true;
+  }
 
   /** Fires once when a mutating call observes a foreign term (two masters on one schema). */
   onFenced(cb: (observedTerm: number) => void): void {
@@ -99,6 +114,10 @@ export class PostgresControlStore implements ControlStore {
    * Unreachable store: infinite backoff (master boot waits, never crashes).
    */
   async acquireTerm(nodeId: string): Promise<number> {
+    // Minting is an INSERT. On a read-only store the retry below would never
+    // succeed and never stop, so this fails loudly instead of wedging a boot: a
+    // stand-in inherits its term and must never reach here.
+    if (this.readOnly) throw new Error('[Fleet] Control store is read-only (stand-in); a term cannot be minted here');
     for (let attempt = 0; ; attempt++) {
       const client = await this.pool.connect().catch(() => null);
       if (client) {
@@ -158,6 +177,7 @@ export class PostgresControlStore implements ControlStore {
    * master learns of its deposition within one stamp interval.
    */
   async stampTerm(): Promise<void> {
+    if (this.readOnly) return;
     if (this.fenced || this.mintedTerm === null) return;
     let client: PoolClient | null = null;
     try {
@@ -269,6 +289,10 @@ export class PostgresControlStore implements ControlStore {
 
   /** Term-fenced transaction wrapper: commit only under this master's minted term. */
   private async fencedWrite(fn: (client: PoolClient) => Promise<void>): Promise<void> {
+    // Every document write on this store is bookkeeping that only the NEXT
+    // master boot reads back, so dropping it costs a stand-in nothing it can
+    // use, while attempting it costs the caller its whole pass.
+    if (this.readOnly) return;
     if (this.fenced) throw new Error('[Fleet] Control store is fenced (another master holds the term); write refused');
     if (this.mintedTerm === null) throw new Error('[Fleet] Control store write before term acquisition');
     const client = await this.pool.connect();
@@ -494,6 +518,26 @@ export function createControlStore(standalone: boolean): ControlStore {
   // can serve the diagnosis - a warning, not an error.
   console.warn('[Fleet] Postgres control store unavailable (data backend not constructed); falling back to the embedded file store');
   return new FileControlStore();
+}
+
+/**
+ * The control store a SERVE-ONLY STAND-IN coordinates from: this node's own
+ * standby, not the fleet's canonical endpoint.
+ *
+ * The distinction is the whole point. createControlStore resolves
+ * CONTROL_STORE_URL || DATA_BACKEND_URL, and on a designated backup both name
+ * the MASTER's primary - the host the arm lane just proved unreachable in order
+ * to arm at all. Opening that here would dial a dead machine forever.
+ */
+export function createStandInControlStore(url: string): PostgresControlStore {
+  const pool = new Pool({
+    connectionString: url,
+    max: 2,
+    connectionTimeoutMillis: 5000,
+    idleTimeoutMillis: 30_000,
+  });
+  pool.on('error', err => console.warn('[Fleet] Stand-in control store idle client error:', err instanceof Error ? err.message : err));
+  return new PostgresControlStore(pool, true);
 }
 
 /**

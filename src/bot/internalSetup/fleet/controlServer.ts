@@ -25,6 +25,8 @@ export interface ControlServerHooks {
   getTerm: () => number;
   /** This master's own node id, so a TERM_PROBE reply can be attributed (a prober must be able to recognise its own answer). */
   getNodeId: () => string;
+  /** The master this node is temporarily standing in for, if any; the returning master must not fence itself out on it. */
+  getStandingInFor?: () => string | null;
   /** A newer master says step down (B4); answered pre-registration like TERM_PROBE. */
   onStepDown?: (payload: StepDownPayload) => { ok: boolean; reason?: string };
   /** Registry insert + VersionGate; returns the register reply. */
@@ -209,7 +211,15 @@ export class ControlServer {
     // a booting node dials its own advertised URL too, and during a restart
     // its predecessor may still hold this port.
     if (type === MSG.TERM_PROBE) {
-      if (requestId) this.reply(socket, requestId, { ok: true, term: this.hooks.getTerm(), nodeId: this.hooks.getNodeId() });
+      if (requestId) {
+        const standingInFor = this.hooks.getStandingInFor?.() ?? null;
+        this.reply(socket, requestId, {
+          ok: true,
+          term: this.hooks.getTerm(),
+          nodeId: this.hooks.getNodeId(),
+          ...(standingInFor ? { standingInFor } : {}),
+        });
+      }
       return;
     }
 

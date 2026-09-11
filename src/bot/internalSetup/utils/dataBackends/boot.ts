@@ -251,6 +251,27 @@ export async function applyDeliveredBackend(
   return { changed, recycled: false };
 }
 
+/**
+ * Point the guild data layer at a different database for THIS PROCESS ONLY,
+ * writing nothing to /data/.env.
+ *
+ * The delivered-backend lane persists on purpose: a worker must still know its
+ * endpoint after a restart. A serve-only stand-in is the opposite case. It
+ * re-derives its copy's endpoint from FLEET_DB_REPLICA_URL on every boot, and a
+ * persisted value would outlive the stand-in that wrote it and need unwinding
+ * later, on a node whose exits are several different code paths. Letting the
+ * repoint die with the process is what keeps the step reversible at no cost,
+ * which is the property 20.5 asks of serve-only.
+ */
+export async function repointRuntimeForThisProcess(url: string): Promise<boolean> {
+  if (!url) return false;
+  setFleetDataBackend({ backend: 'postgres', url });
+  if (activeUrl === url) return true;
+  if (activeUrl !== null) return runRecycle(url, false);
+  startPostgresRuntime(url);
+  return true;
+}
+
 export function getActiveBackendUrl(): string | null {
   return activeUrl;
 }
@@ -410,8 +431,17 @@ async function runRecycle(url: string, keepPrevious: boolean): Promise<boolean> 
 async function verifyIdentityLoop(url: string, driver: DataReadinessDriver): Promise<void> {
   let logged = false;
   for (;;) {
+    // This loop outlives a runtime swap: it dials through its own one-shot
+    // client rather than the pool that was stopped, and an unreachable endpoint
+    // keeps it retrying indefinitely. installRuntime sets activeUrl before the
+    // incoming loop starts, so a mismatch means this loop belongs to a database
+    // the node has already moved off. Leaving it running lets it refuse() the
+    // whole data layer over a verdict about the WRONG database, and refuse() is
+    // a module-level latch nothing on the new runtime's path resets.
+    if (activeUrl !== url) return;
     try {
       const verdict = await verifyStoreIdentity(url);
+      if (activeUrl !== url) return;
       if (!verdict.ok) {
         refuse(verdict.reason);
         return;
