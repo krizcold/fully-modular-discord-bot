@@ -162,6 +162,8 @@ export interface FleetConfigPayload {
   backupDesignations: BackupDesignation[];
   /** Witness beacon channel id; absent = owner DM default (PLAN_REPLICATION 20.6). */
   witnessChannelId?: string;
+  /** This fleet has had a designated backup at some point; pushed so a promoted backup inherits the memory (20.14). */
+  hadBackup?: boolean;
 }
 
 /** Backend decision + routing map handed to workers in the register reply. */

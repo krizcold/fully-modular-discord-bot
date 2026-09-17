@@ -1279,7 +1279,7 @@ function FleetEmptyStoreHoldBanner({ api, hold }) {
   };
   return (
     <div className="usage-notice" style={{ borderColor: '#e0a030', color: '#e0a030' }}>
-      {`EMPTY STORE HOLD: this master's database is ${hold.storeState} while other fleet nodes are configured (${(hold.candidates || []).join(', ')}). It will not mint a term or serve while a backup may hold the real data. Provision this machine as a standby of the node that holds the data and let it catch up (the hold releases by itself once this database holds real data), or demote this node to rejoin the fleet as a co-worker. Only confirm a brand-new fleet when no backup anywhere holds data for this bot.`}
+      {`EMPTY STORE HOLD: this master's database is ${hold.storeState} while this fleet has other nodes on record (${(hold.candidates || []).join(', ')}). It will not mint a term or serve while a backup may hold the real data. Provision this machine as a standby of the node that holds the data and let it catch up (the hold releases by itself once this database holds real data), or demote this node to rejoin the fleet as a co-worker. Only confirm a brand-new fleet when no backup anywhere holds data for this bot.`}
       <div>
         <FleetDemoteButton api={api} />
       </div>

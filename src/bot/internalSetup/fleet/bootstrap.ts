@@ -41,7 +41,6 @@ import {
   readRoleOverride,
   resolveEnvRole,
   resolveNodeRole,
-  stripSelfUrl,
   wasNodeIdFreshlyGenerated,
   writeRoleOverride,
 } from './nodeIdentity';
@@ -88,7 +87,7 @@ import { MigrationExecutor } from './migration/migrationExecutor';
 import { TransformationCoordinator } from './transformation/transformationCoordinator';
 import { TransformationExecutor } from './transformation/transformationExecutor';
 import type { ControlStore, PersistedFleetConfig, PersistedTerm, TransformDirection } from './controlStore';
-import { effectiveFleetConfigView, effectiveMasterUrls, forcePassive, readFleetConfigCache, validateMasterCandidates, renumberDesignations, validateBackupDesignations, validateWitnessChannelId, writeFleetConfigCache } from './fleetConfig';
+import { effectiveFleetConfigView, effectiveMasterUrls, emptyStoreHoldEvidence, forcePassive, readFleetConfigCache, rememberBackups, validateMasterCandidates, renumberDesignations, validateBackupDesignations, validateWitnessChannelId, writeFleetConfigCache } from './fleetConfig';
 import { getLocalReplicaIdentity, getReplicaHealth, getSlotSample, setReplicaProbeListener } from './replicaHealth';
 import { canonicalStoreReachable, hasDbReplica, probeReplica, resolveReplicaEndpoints, spliceFleetCredentials } from './replicaPromotion';
 import { ArmEvidenceInputs, armDeferral, evaluateArmEvidence, ledgerAllowsArm, preArmRefusal, reachabilityWarning } from './armLane';
@@ -609,31 +608,8 @@ async function runStaleMasterFence(
   }
 }
 
-/**
- * Master candidates that are provably NOT this node. FLEET_PUBLIC_URL makes the
- * self-filter exact; without it (a hand deployment where the manager injects
- * nothing) a lone entry may well be this node's own advertised URL, while two
- * or more entries always include at least one foreign node. A stored backup
- * designation is evidence on its own, and survives a lost database volume
- * because it lives in the node's data directory.
- */
 function otherNodesConfigured(selfNodeId: string): string[] {
-  const cached = readFleetConfigCache();
-  // A designation is the strongest evidence and the one that survives a lost
-  // database volume, so it is checked on its own, never behind a URL list: a
-  // manager-deployed master often carries no MASTER_URLS at all (the workers
-  // dial it), which would otherwise read as a fleet of one.
-  const designated = (cached?.backupDesignations ?? []).filter(d => d.nodeId !== selfNodeId);
-  // The runtime list owns the topology once it exists (20.7); env seeds it.
-  const fleetWide = cached?.masterCandidates?.length ? cached.masterCandidates : rawMasterUrls();
-  // FLEET_PUBLIC_URL makes the self-filter exact; without it (hand deployment)
-  // a lone entry may be this node's own advertised URL, while two or more
-  // always include at least one foreign node.
-  const foreign = (process.env.FLEET_PUBLIC_URL || '').trim() !== ''
-    ? stripSelfUrl(fleetWide)
-    : (fleetWide.length > 1 ? fleetWide : []);
-  if (foreign.length > 0) return foreign;
-  return designated.map(d => `node ${d.nodeId.slice(0, 8)}`);
+  return emptyStoreHoldEvidence(readFleetConfigCache(), rawMasterUrls(), selfNodeId, (process.env.FLEET_PUBLIC_URL || '').trim() !== '');
 }
 
 /**
@@ -688,7 +664,7 @@ async function runEmptyStoreHold(standalone: boolean, selfNodeId: string): Promi
     }
     if (!announced) {
       announced = true;
-      console.error(`[Fleet] EMPTY STORE HOLD: this master's database is ${verdict} while other fleet nodes are configured (${candidates.join(', ')}). It will not mint a term on an empty store while a backup may hold the real data. Provision this machine as a standby of the node that holds the data and let it catch up, or demote this node to rejoin as a co-worker, or confirm a brand-new fleet from the Fleet tab.`);
+      console.error(`[Fleet] EMPTY STORE HOLD: this master's database is ${verdict} while this fleet has other nodes on record (${candidates.join(', ')}). It will not mint a term on an empty store while a backup may hold the real data. Provision this machine as a standby of the node that holds the data and let it catch up, or demote this node to rejoin as a co-worker, or confirm a brand-new fleet from the Fleet tab.`);
     }
     _setEmptyStoreHold({ candidates, since, storeState: verdict });
     pushFleetStatusNow();
@@ -948,6 +924,9 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       await store.saveFleetConfig(fleetConfig)
         .catch(err => console.warn('[Fleet] Failed to persist the seeded fleet config:', err instanceof Error ? err.message : err));
     }
+    // Before the self-removal below, so a promoted backup that was the only
+    // designation still carries the fact that this fleet has had one.
+    if (fleetConfig) fleetConfig = rememberBackups(fleetConfig);
     // A master is not its own backup: a promoted backup's entry, pushed to every
     // node until now, leaves the list it now owns.
     if (!standIn && fleetConfig && fleetConfig.backupDesignations.some(d => d.nodeId === nodeId)) {
@@ -966,6 +945,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     masterCandidates: fleetConfig!.masterCandidates,
     backupDesignations: fleetConfig!.backupDesignations,
     ...(fleetConfig!.witnessChannelId !== undefined ? { witnessChannelId: fleetConfig!.witnessChannelId } : {}),
+    ...(fleetConfig!.hadBackup === true ? { hadBackup: true } : {}),
   });
   if (fleetConfig) writeFleetConfigCache(fleetConfigPayload());
 
@@ -1101,6 +1081,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   // forget (a missed push is re-delivered on that node's next register).
   const persistFleetConfig = (why: string): void => {
     if (!fleetConfig) return;
+    fleetConfig = rememberBackups(fleetConfig);
     const payload = fleetConfigPayload();
     writeFleetConfigCache(payload);
     void store.saveFleetConfig(fleetConfig)

@@ -28,6 +28,7 @@ export function readFleetConfigCache(): FleetConfigPayload | null {
       ...(typeof parsed.witnessChannelId === 'string' && parsed.witnessChannelId !== ''
         ? { witnessChannelId: parsed.witnessChannelId }
         : {}),
+      ...(parsed.hadBackup === true ? { hadBackup: true } : {}),
     };
   } catch {
     return null;
@@ -36,6 +37,41 @@ export function readFleetConfigCache(): FleetConfigPayload | null {
 
 export function writeFleetConfigCache(config: FleetConfigPayload): void {
   atomicWriteFileSync(cacheFile(), JSON.stringify(config, null, 2));
+}
+
+/**
+ * Once a backup has been designated the fleet REMEMBERS it, and neither a
+ * Declare Lost nor a withdrawn designation forgets it (RULED 2026-09-16): on a
+ * master carrying no MASTER_URLS the designation list is the empty-store
+ * hold's only evidence, so dropping the last entry would let a wiped master
+ * start fresh while the backup it just forgot still held the only copy. The
+ * memory survives a lost volume through the node-local cache, and only a
+ * confirmed brand-new fleet starts without it, because that boot seeds a
+ * fresh config.
+ */
+export function rememberBackups<T extends { backupDesignations: BackupDesignation[]; hadBackup?: boolean }>(config: T): T {
+  return config.hadBackup !== true && config.backupDesignations.length > 0 ? { ...config, hadBackup: true } : config;
+}
+
+/**
+ * The empty-store hold's evidence that other nodes exist (20.14): master
+ * candidates provably not this node, else the designated backups, else the
+ * memory that a backup has existed. selfUrlKnown (FLEET_PUBLIC_URL set) makes
+ * the self-filter exact; without it (a hand deployment where the manager
+ * injects nothing) a lone entry may well be this node's own advertised URL,
+ * while two or more entries always include at least one foreign node. A
+ * designation is checked on its own, never behind the URL list, because a
+ * manager-deployed master often carries no MASTER_URLS at all (the workers
+ * dial it), which would otherwise read as a fleet of one.
+ */
+export function emptyStoreHoldEvidence(cached: FleetConfigPayload | null, envUrls: string[], selfNodeId: string, selfUrlKnown: boolean): string[] {
+  // The runtime list owns the topology once it exists (20.7); env seeds it.
+  const fleetWide = cached?.masterCandidates?.length ? cached.masterCandidates : envUrls;
+  const foreign = selfUrlKnown ? stripSelfUrl(fleetWide) : (fleetWide.length > 1 ? fleetWide : []);
+  if (foreign.length > 0) return foreign;
+  const designated = (cached?.backupDesignations ?? []).filter(d => d.nodeId !== selfNodeId);
+  if (designated.length > 0) return designated.map(d => `node ${d.nodeId.slice(0, 8)}`);
+  return cached?.hadBackup === true ? ['a backup this fleet designated before'] : [];
 }
 
 /** The dial list a node acts on: the runtime copy once one exists, else the env seed. */

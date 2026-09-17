@@ -185,6 +185,8 @@ export interface PersistedFleetConfig {
   backupDesignations: BackupDesignation[];
   /** Witness beacon channel id; absent = owner DM default (PLAN_REPLICATION 20.6). */
   witnessChannelId?: string;
+  /** Set once a backup has ever been designated and never unset: the empty-store hold's evidence once the list is empty (20.14). */
+  hadBackup?: boolean;
   updatedAt: number;
 }
 
