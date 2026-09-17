@@ -1298,6 +1298,7 @@ function FleetStandInBanner({ fleet }) {
           : 'Checking whether writes can be taken.';
     text = `STANDING IN for ${nameOf(s.coveringNodeId)} at term ${s.inheritedTerm == null ? '?' : s.inheritedTerm}, READ-ONLY. ${gate} Manual promote stays available and makes this node the true master for good.`;
   }
+  if (fleet.initialized) text += ` This is a PARTIAL takeover: the shards ${nameOf(s.coveringNodeId)} held stay dark until it returns, and this node serves only the free pool and the nodes that re-register with it.`;
   return (
     <div className="usage-notice" style={{ borderColor: '#5b9bd5', color: '#5b9bd5' }}>{text}</div>
   );

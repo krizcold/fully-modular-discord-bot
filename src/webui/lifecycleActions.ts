@@ -101,7 +101,14 @@ export async function runDemote(
       writeRoleOverride({ role: 'co-worker', setAt: Date.now(), setBy });
     }
     console.warn(`[Fleet] DEMOTION staged (${setBy}); restarting the bot child as co-worker`);
-    const restart = await botManager.restart();
+    // Retried the way the promote engine restarts: the record and the override
+    // are already written, and a child left running past a failed restart
+    // would keep serving as a stand-in whose own record says the lane ended.
+    let restart = await botManager.restart();
+    for (let attempt = 0; !restart?.success && restart?.reason === 'operation_in_progress' && attempt < 5; attempt++) {
+      await new Promise(resolve => setTimeout(resolve, 5000));
+      restart = await botManager.restart();
+    }
     return restart?.success
       ? { success: true }
       : { success: false, error: restart?.error ?? 'restart failed; the role change is staged and the next start boots as co-worker' };

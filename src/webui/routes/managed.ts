@@ -96,6 +96,7 @@ export function createManagedRoutes(botManager: BotManager): Router {
         promote: readPromoteRecord(),
         emptyStoreHold: state?.emptyStoreHold ?? null,
         standIn: state?.standIn ?? null,
+        masterStandingInFor: state?.masterStandingInFor ?? null,
         takeoverHold: state?.takeoverHold ?? null,
         staleMasterPark: state?.staleMasterPark ?? null,
         // Only an initialized master relays the block to designated backups

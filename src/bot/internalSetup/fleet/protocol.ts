@@ -143,6 +143,8 @@ export interface RegisterResult {
   superseded?: SupersededInfo;
   /** Present only in replies to designated backups (B4): the copy block a new machine seeds from. */
   copyBlock?: CopyBlock;
+  /** The answering node is a stand-in for that master (20.5): the fleet runs on a temporary copy until the failback. */
+  standingInFor?: string;
 }
 
 /**

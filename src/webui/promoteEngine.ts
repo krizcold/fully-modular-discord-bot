@@ -712,11 +712,13 @@ async function phaseRestart(botManager: BotManager, record: PromoteRecord): Prom
     writeArmRecord({ ...arm, phase: 'promoted', promotedAt: arm.promotedAt ?? Date.now(), writeRequestedAt: null, writeGate: null });
   } else {
     // A manual promote from a serving stand-in makes it the TRUE master for
-    // good (20.5): the stand-in identity ends here, and its record says so.
-    const arm = readArmRecord();
-    if (arm && arm.phase !== 'disarmed' && arm.phase !== 'claimed') {
-      writeArmRecord({ ...arm, phase: 'disarmed', disarmedAt: Date.now(), disarmReason: 'promoted by hand into the true master' });
-    }
+    // good (20.5): the stand-in identity ends here, and its record says so,
+    // written once the restart below has succeeded, so a promote parked at
+    // its restart leaves the record still saying what the copy holds (the
+    // manager reads the ended lane from it). Over an ALREADY disarmed record
+    // too: a lane that ended earlier (a demote, a step-down) leaves a record
+    // that says the copy may hold writes nothing else has, and this promote
+    // is what makes them the fleet's for good.
     writeRoleOverride({
       role: 'master',
       takeover: true,
@@ -727,7 +729,18 @@ async function phaseRestart(botManager: BotManager, record: PromoteRecord): Prom
   }
   for (let attempt = 0; ; attempt++) {
     const restart = await botManager.restart();
-    if (restart.success) return;
+    if (restart.success) {
+      if (record.mode !== 'stand-in') {
+        // Only a lane that is live, or that ended holding the writes, is
+        // ended BY this promote; an old record that never took writes keeps
+        // its own reason, or the tab would blame this promote for it.
+        const arm = readArmRecord();
+        if (arm && arm.phase !== 'claimed' && (arm.phase !== 'disarmed' || arm.promotedAt !== null)) {
+          writeArmRecord({ ...arm, phase: 'disarmed', disarmedAt: Date.now(), disarmReason: 'promoted by hand into the true master' });
+        }
+      }
+      return;
+    }
     if (restart.reason !== 'operation_in_progress' || attempt >= 5) {
       throw new Error(restart.error ?? 'restart failed; the role override is staged and the next start boots as master');
     }

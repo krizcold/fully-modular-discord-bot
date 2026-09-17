@@ -76,6 +76,7 @@ export class ControlClient {
   private lastContactAt: number | null = null;
   private draining = false;
   private lastBudget: BudgetInfo | null = null;
+  private masterStandingInFor: string | null = null;
   private reconnectTimer: NodeJS.Timeout | null = null;
   private heartbeatTimer: NodeJS.Timeout | null = null;
   private ttlTimer: NodeJS.Timeout | null = null;
@@ -95,6 +96,7 @@ export class ControlClient {
 
   stop(): void {
     this.stopped = true;
+    this.masterStandingInFor = null;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     if (this.ttlTimer) clearInterval(this.ttlTimer);
@@ -117,6 +119,17 @@ export class ControlClient {
   /** Last budget snapshot carried on a register or renewed reply; kept across master loss for the UI. */
   getLastBudget(): BudgetInfo | null {
     return this.lastBudget;
+  }
+
+  /**
+   * The master this node LAST registered with stands in for that node (20.5);
+   * null once a true master's reply overwrote it. Deliberately not masked by
+   * the connection state: a co-worker is unregistered for minutes while its
+   * master dies and its stand-in boots, and again on every blip, and its own
+   * manager must not read a freeze as over in exactly those windows.
+   */
+  getMasterStandingInFor(): string | null {
+    return this.masterStandingInFor;
   }
 
   getLastContactAgoMs(): number | null {
@@ -227,6 +240,7 @@ export class ControlClient {
       }
       this.term = result.term;
       this.registered = true;
+      this.masterStandingInFor = typeof result.standingInFor === 'string' && result.standingInFor !== '' ? result.standingInFor : null;
       this.attempt = 0;
       this.draining = false;
       if (result.budget) this.lastBudget = result.budget;

@@ -548,14 +548,14 @@ async function runStaleMasterFence(
     }
   }
   const localTerm = local ? local.term : 0;
-  const park = (observedTerm: number, peerUrl: string, detail: string, extra = ''): Promise<never> => {
+  const park = (observedTerm: number, peerUrl: string, detail: string, extra = '', standInNodeId: string | null = null): Promise<never> => {
     // A stand-in that trips the fence has learned the master is alive after all,
     // which is the best possible outcome: it simply stops standing in. Parking
     // it instead would strand a node that is no longer a backup and no longer a
     // master, with nothing left running to change its mind.
     if (standIn) return disarmStandIn(`${detail}; the master this node was covering is alive`);
     console.error(`[Fleet] STALE MASTER FENCE: ${detail}; parking the boot instead of acquiring a term on a database the fleet has moved off. Demote this node to rejoin as a co-worker.${extra}`);
-    _setStaleMasterPark({ observedTerm, localTerm, peerUrl, at: Date.now() });
+    _setStaleMasterPark({ observedTerm, localTerm, peerUrl, at: Date.now(), standInNodeId });
     pushFleetStatusNow();
     return (async () => { for (;;) await guardSleep(TERM_GUARD_POLL_MS); })();
   };
@@ -587,7 +587,7 @@ async function runStaleMasterFence(
         // database now and this one is behind it, so serving would fork the
         // data the outage produced.
         await park(peer.term, url, `${url} is standing in for this node and has taken writes at term ${peer.term} while this node's store holds ${localTerm}: its copy is the fleet database now and this one is behind it`,
-          ' Automatic failback is not built yet: re-seed this machine as a standby of that node, or promote that node by hand, before this node serves again.');
+          ' Automatic failback is not built yet: re-seed this machine as a standby of that node, or promote that node by hand, before this node serves again.', peer.nodeId);
       }
       await park(peer.term, url, `${url} answers as a live master on term ${peer.term} while this node's store holds ${localTerm} and nothing is writing to it`);
     }
@@ -608,7 +608,7 @@ async function runStaleMasterFence(
     const higher = claims ? higherTermClaim(claims, selfNodeId, localTerm) : null;
     if (higher && higher.standingInFor === selfNodeId) {
       await park(higher.term, `witness beacon of ${higher.nodeName}`, `${higher.nodeName} (${higher.nodeId.slice(0, 8)}) is standing in for this node and has taken writes at term ${higher.term} while this node's store holds ${localTerm}: its copy is the fleet database now and this one is behind it`,
-        ' Automatic failback is not built yet: re-seed this machine as a standby of that node, or promote that node by hand, before this node serves again.');
+        ' Automatic failback is not built yet: re-seed this machine as a standby of that node, or promote that node by hand, before this node serves again.', higher.nodeId);
     }
     if (higher) {
       // The restore tail belongs to THIS half only: the peer half means a
@@ -2614,6 +2614,10 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
           ...(fleetConfig ? { fleetConfig: fleetConfigPayload() } : {}),
           ...(superseded ? { superseded } : {}),
           ...(copyBlock ? { copyBlock } : {}),
+          // Said in the reply because the node's own manager acts only on what
+          // its bot recorded (20.11): a standby beside it must keep its place
+          // for the failback instead of re-seeding off the stand-in (B6 map F35).
+          ...(coveringNodeId ? { standingInFor: coveringNodeId } : {}),
         };
       },
       onCapabilityRefresh: (fromNodeId, payload) => {

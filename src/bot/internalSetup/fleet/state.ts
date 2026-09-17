@@ -152,6 +152,8 @@ export interface FleetState {
   pinnedShardId: number | null;
   masterKnown: boolean;
   masterUrl: string | null;
+  /** Co-worker: the node it registered with stands in for that master (20.5), so the fleet runs on a temporary copy. */
+  masterStandingInFor: string | null;
   /**
    * Worker-onboarding block, master-only. masterUrl is the reachable control
    * endpoint: FLEET_PUBLIC_URL when the platform advertised one, else a
@@ -275,6 +277,8 @@ export interface StaleMasterParkView {
   localTerm: number;
   peerUrl: string;
   at: number;
+  /** The stand-in that took the fleet's writes while this master was down (20.5); null for a plain stale fork. Its manager reads it to say which copy is behind. */
+  standInNodeId: string | null;
 }
 
 let staleMasterPark: StaleMasterParkView | null = null;
@@ -465,6 +469,7 @@ export function getFleetState(): FleetState {
       pinnedShardId: null,
       masterKnown: false,
       masterUrl: null,
+      masterStandingInFor: null,
       connect: null,
       recovery: null,
       sync: { status: 'n/a' },
@@ -579,6 +584,7 @@ export function getFleetState(): FleetState {
       pinnedShardId,
       masterKnown: true,
       masterUrl: null,
+      masterStandingInFor: null,
       connect: buildConnect(),
       recovery: sources.recovery
         ? {
@@ -685,6 +691,7 @@ export function getFleetState(): FleetState {
     pinnedShardId: null,
     masterKnown: registered,
     masterUrl: controlClient?.getCurrentMasterUrl() ?? effectiveMasterUrls().urls[0] ?? null,
+    masterStandingInFor: controlClient?.getMasterStandingInFor() ?? null,
     connect: null,
     recovery: null,
     sync: sources.sync?.() ?? { status: 'n/a' },
