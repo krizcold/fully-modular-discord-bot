@@ -1239,7 +1239,7 @@ function FleetPromoteRecord({ api, fleet, reload }) {
       {r.parked ? (
         <div style={{ marginTop: '6px' }}>
           <button onClick={() => act('/fleet/promote/continue', 'Promote continues')} disabled={busy} style={{ fontSize: '0.72rem', padding: '2px 8px' }}>Continue</button>
-          {r.phase === 'claim' ? (
+          {r.phase === 'claim' || r.mode === 'stand-in' ? (
             <button onClick={() => act('/fleet/promote/cancel', 'Promote cancelled')} disabled={busy} style={{ fontSize: '0.72rem', padding: '2px 8px', marginLeft: '6px' }}>Cancel</button>
           ) : null}
         </div>
@@ -1263,6 +1263,46 @@ function FleetSupersededBanner({ fleet }) {
 
 // Empty-store boot hold (PLAN_REPLICATION 20.14): a master with no data while
 // other nodes are configured must seed from a backup before it serves.
+// The stand-in lane's own surface (20.5, B6-f): what this node is holding for
+// whom, whether writes have been taken, and why they have not been.
+function FleetStandInBanner({ fleet }) {
+  const s = fleet.standIn;
+  if (!s) return null;
+  const nameOf = (id) => {
+    const n = (fleet.nodes || []).find(x => x.nodeId === id);
+    return n ? n.nodeName : id.slice(0, 8);
+  };
+  const at = (ms) => new Date(ms).toISOString().slice(11, 16) + ' UTC';
+  if (!s.live) {
+    if (s.phase !== 'disarmed' || !s.disarmedAt) return null;
+    return (
+      <div className="usage-stat-sub" style={{ marginTop: '6px' }}>
+        {`Last stand-in attempt for ${nameOf(s.coveringNodeId)} ended at ${at(s.disarmedAt)}: ${s.disarmReason || 'no reason recorded'}.${s.rearmAfter && Date.now() < s.rearmAfter ? ` The lane may arm again after ${at(s.rearmAfter)}.` : ''}`}
+      </div>
+    );
+  }
+  let text;
+  if (!fleet.initialized && s.writeGate) {
+    text = `STANDING IN for ${nameOf(s.coveringNodeId)}: this boot is HELD. ${s.writeGate}`;
+  } else if (s.phase === 'promoted') {
+    text = `STANDING IN for ${nameOf(s.coveringNodeId)} WITH WRITES: this machine's copy has been promoted and is the fleet database until the master returns for failback or an operator promotes this node for good.${s.writeGate ? ` ${s.writeGate}` : ''}`;
+  } else if (s.phase === 'promoting') {
+    text = `STANDING IN for ${nameOf(s.coveringNodeId)}: taking writes now (promoting this machine's copy).${s.writeGate ? ` ${s.writeGate}` : ''}`;
+  } else {
+    const gate = s.writeGate
+      ? s.writeGate
+      : s.writeRefusal
+        ? `Taking writes was refused: ${s.writeRefusal}`
+        : Date.now() < s.holdUntil
+          ? `Writes are taken automatically after ${at(s.holdUntil)} if the master is still gone on every check and this copy was provably in sync.`
+          : 'Checking whether writes can be taken.';
+    text = `STANDING IN for ${nameOf(s.coveringNodeId)} at term ${s.inheritedTerm == null ? '?' : s.inheritedTerm}, READ-ONLY. ${gate} Manual promote stays available and makes this node the true master for good.`;
+  }
+  return (
+    <div className="usage-notice" style={{ borderColor: '#5b9bd5', color: '#5b9bd5' }}>{text}</div>
+  );
+}
+
 function FleetEmptyStoreHoldBanner({ api, hold }) {
   const [busy, setBusy] = React.useState(false);
   const confirmFresh = () => {
@@ -1397,6 +1437,10 @@ function FleetView({ api, wsClient, guildNames }) {
         {fleet.emptyStoreHold && (
           <FleetEmptyStoreHoldBanner api={api} hold={fleet.emptyStoreHold} />
         )}
+        <FleetStandInBanner fleet={fleet} />
+        {fleet.standIn && fleet.standIn.live && fleet.standIn.writeGate && (
+          <div><FleetDemoteButton api={api} /></div>
+        )}
         <FleetPromoteRecord api={api} fleet={fleet} reload={loadFleet} />
         <div className="usage-empty">
           {!fleet.running
@@ -1460,6 +1504,7 @@ function FleetView({ api, wsClient, guildNames }) {
           </div>
         )}
         <FleetSupersededBanner fleet={fleet} />
+        <FleetStandInBanner fleet={fleet} />
         {fleet.roleOverride && (
           <div className="usage-stat-sub" style={{ marginTop: '6px' }}>
             {`Role set by operator override (${fleet.roleOverride.setBy}, ${new Date(fleet.roleOverride.setAt).toISOString().slice(0, 16).replace('T', ' ')} UTC)`}
@@ -1600,6 +1645,7 @@ function FleetView({ api, wsClient, guildNames }) {
         </div>
       )}
 
+      <FleetStandInBanner fleet={fleet} />
       {fleet.roleOverride && !fleet.standalone && (
         <div className="usage-stat-sub">
           {`Role set by operator override (${fleet.roleOverride.setBy}, ${new Date(fleet.roleOverride.setAt).toISOString().slice(0, 16).replace('T', ' ')} UTC)`}

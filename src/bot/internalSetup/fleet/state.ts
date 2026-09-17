@@ -2,10 +2,11 @@
 // fork IPC (a follow-up ipcFleetHandler answers 'fleet:state' with it).
 
 import { performance } from 'perf_hooks';
-import { CONTROL_PORT_DEFAULT, LEASE_TTL_MS, PROTOCOL_VERSION } from './constants';
+import { ARM_MAX_ATTEMPTS, ARM_SPACING_MS, CONTROL_PORT_DEFAULT, LEASE_TTL_MS, PROTOCOL_VERSION, WITNESS_FRESH_WINDOW_MS } from './constants';
+import { ArmPhase, readArmRecord } from './armRecord';
 import { getShardSource, isPinEnabled, resolveShardCapacity } from './placement';
 import type { BudgetInfo, NodeRole } from './protocol';
-import { consentsToActiveMode, isBackupMaster, readRoleOverride } from './nodeIdentity';
+import { consentsToActiveMode, isBackupMaster, isStandInBoot, readRoleOverride } from './nodeIdentity';
 import { effectiveFleetConfigView, effectiveMasterUrls } from './fleetConfig';
 import { hasDbReplica } from './replicaPromotion';
 import type { Registry } from './registry';
@@ -115,6 +116,8 @@ export interface FleetState {
   emptyStoreHold: EmptyStoreHoldView | null;
   /** This master was superseded by a higher term and is stepping down (B4). */
   superseded: SupersededView | null;
+  /** The stand-in lane (20.5, B6-f): live while this node holds the fleet for a dead master; its last record otherwise. */
+  standIn: StandInView | null;
   /** Operator role override in force (promotion/demotion); null when the role comes from env. */
   roleOverride: { role: NodeRole; setBy: string; setAt: number } | null;
   /** This node is the designated backup master (BOT_NODE_ROLE=backup-master). */
@@ -315,6 +318,43 @@ export function _setSlotStatus(record: SlotStatusRecord | null): void {
   standbySlot = record;
 }
 
+export interface StandInView {
+  /** This boot IS the stand-in the record describes. False on a backup showing why its last attempt ended. */
+  live: boolean;
+  phase: ArmPhase;
+  coveringNodeId: string;
+  armedAt: number;
+  inheritedTerm: number | null;
+  /** When 20.6's post-claim hold expires and writes may first be taken. */
+  holdUntil: number;
+  writeGate: string | null;
+  writeRefusal: string | null;
+  promotedAt: number | null;
+  disarmedAt: number | null;
+  disarmReason: string | null;
+  /** After a disarm: when the F40 spacing lets the lane arm again; null while it is live or once the attempt cap is spent. */
+  rearmAfter: number | null;
+}
+
+function buildStandInView(): StandInView | null {
+  const record = readArmRecord();
+  if (!record) return null;
+  return {
+    live: isStandInBoot() && record.phase !== 'disarmed',
+    phase: record.phase,
+    coveringNodeId: record.coveringNodeId,
+    armedAt: record.armedAt,
+    inheritedTerm: record.inheritedTerm,
+    holdUntil: record.armedAt + WITNESS_FRESH_WINDOW_MS,
+    writeGate: record.writeGate,
+    writeRefusal: record.writeRefusal,
+    promotedAt: record.promotedAt,
+    disarmedAt: record.disarmedAt,
+    disarmReason: record.disarmReason,
+    rearmAfter: record.phase === 'disarmed' && record.attempts < ARM_MAX_ATTEMPTS ? Math.max(record.lastAttemptAt, record.disarmedAt ?? 0) + ARM_SPACING_MS : null,
+  };
+}
+
 function buildRoleOverrideView(): { role: NodeRole; setBy: string; setAt: number } | null {
   const override = readRoleOverride();
   return override ? { role: override.role, setBy: override.setBy, setAt: override.setAt } : null;
@@ -402,6 +442,7 @@ export function getFleetState(): FleetState {
       emptyStoreHold,
       superseded,
       roleOverride: buildRoleOverrideView(),
+      standIn: buildStandInView(),
       backupMaster: isBackupMaster(),
       activeCapable: consentsToActiveMode(),
       dbReplica: hasDbReplica(),
@@ -515,6 +556,7 @@ export function getFleetState(): FleetState {
       emptyStoreHold: null,
       superseded,
       roleOverride: buildRoleOverrideView(),
+      standIn: buildStandInView(),
       backupMaster: isBackupMaster(),
       activeCapable: consentsToActiveMode(),
       dbReplica: hasDbReplica(),
@@ -620,6 +662,7 @@ export function getFleetState(): FleetState {
     emptyStoreHold: null,
     superseded,
     roleOverride: buildRoleOverrideView(),
+    standIn: buildStandInView(),
     backupMaster: isBackupMaster(),
     activeCapable: consentsToActiveMode(),
     dbReplica: hasDbReplica(),

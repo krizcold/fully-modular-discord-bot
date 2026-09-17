@@ -10,8 +10,9 @@
 // arm, because the failure this lane guards against (two nodes serving the same
 // Discord identity) is exactly what a hopeful default produces.
 
-import { ARM_MAX_ATTEMPTS, ARM_SPACING_MS, WITNESS_FRESH_WINDOW_MS } from './constants';
+import { ARM_MAX_ATTEMPTS, ARM_SPACING_MS, STANDIN_WRITE_REQUEST_STALE_MS, WITNESS_FRESH_WINDOW_MS } from './constants';
 import { ArmRecord } from './armRecord';
+import type { SyncPostureVerdict } from './syncPostureFact';
 
 /**
  * The six-term conjunction. Each is stated so that TRUE means "consistent with
@@ -115,9 +116,16 @@ export function ledgerAllowsArm(record: ArmRecord | null, now: number): ArmVerdi
   if (record.attempts >= ARM_MAX_ATTEMPTS) {
     return { arm: false, reason: `this node has already tried to stand in ${record.attempts} times; failing over now needs a manual promote` };
   }
-  const since = now - record.lastAttemptAt;
-  if (record.lastAttemptAt > 0 && since < ARM_SPACING_MS) {
-    return { arm: false, reason: `the last stand-in attempt was ${Math.round(since / 1000)}s ago; the lane waits ${Math.round(ARM_SPACING_MS / 1000)}s between attempts` };
+  // Measured from whichever came last: the attempt's start, or the disarm that
+  // ended it (a fence trip, a step-down, an operator's demote). A stand-in that
+  // served for longer than the spacing would otherwise be eligible again on the
+  // very next tick after the operator demoted it, which turns F9's ruled exit
+  // into a 45 s pause; counting from the exit gives the operator the same room
+  // F40 gives every attempt to reach the mode toggle.
+  const last = Math.max(record.lastAttemptAt, record.disarmedAt ?? 0);
+  const since = now - last;
+  if (last > 0 && since < ARM_SPACING_MS) {
+    return { arm: false, reason: `the last stand-in ${record.disarmedAt !== null && record.disarmedAt >= record.lastAttemptAt ? 'ended' : 'attempt was'} ${Math.round(since / 1000)}s ago; the lane waits ${Math.round(ARM_SPACING_MS / 1000)}s between attempts` };
   }
   return { arm: true };
 }
@@ -161,4 +169,52 @@ export function armDeferral(rank: number, evidenceHeldSince: number, now: number
   const waitMs = Math.max(0, rank - 1) * WITNESS_FRESH_WINDOW_MS;
   if (waitMs === 0 || evidenceHeldSince <= 0) return { defer: false, waitMs };
   return { defer: now - evidenceHeldSince < waitMs, waitMs };
+}
+
+export type WriteStepTiming =
+  | { step: 'hold'; remainingMs: number }
+  | { step: 'requested' }
+  | { step: 'stale-request' }
+  | { step: 'after-refusal'; remainingMs: number }
+  | { step: 'check' };
+
+/**
+ * When a serving stand-in may ask to take writes (F2's second gate, 20.6's
+ * post-claim hold). Reads are served from the instant the arm fires; writes wait
+ * one full staleness window after the claim, which is what makes the hold cheap
+ * enough to keep as ruled (F4). A request already out waits for the parent's
+ * answer, but not forever: the parent answers by rewriting the record, and a
+ * parent mid-restart or a lost IPC message would otherwise leave the lane
+ * waiting on a request nobody holds. A refusal waits out the arm spacing before
+ * the lane asks again, so a permanent one surfaces every spacing and never
+ * spins, while a transient one recovers.
+ */
+export function writeStepTiming(record: ArmRecord, now: number): WriteStepTiming {
+  if (record.phase === 'promoting') {
+    const since = now - (record.writeRequestedAt ?? record.updatedAt);
+    return since < STANDIN_WRITE_REQUEST_STALE_MS ? { step: 'requested' } : { step: 'stale-request' };
+  }
+  const holdRemaining = record.armedAt + WITNESS_FRESH_WINDOW_MS - now;
+  if (holdRemaining > 0) return { step: 'hold', remainingMs: holdRemaining };
+  if (record.writeRefusedAt !== null) {
+    const again = record.writeRefusedAt + ARM_SPACING_MS - now;
+    if (again > 0) return { step: 'after-refusal', remainingMs: again };
+  }
+  return { step: 'check' };
+}
+
+/**
+ * Taking writes needs everything the arm needed, re-proven now, plus the one
+ * fact serve-only never needed: the replicated in-sync row naming this copy as
+ * the one the master was synchronously waiting for. That row replaces the
+ * operator's RPO confirm; without it the lane keeps serving read-only and the
+ * manual promote with its confirm stays the exit (20.5, F9).
+ */
+export function writeStepVerdict(evidence: ArmEvidenceInputs, sync: SyncPostureVerdict): ArmVerdict {
+  const gone = evaluateArmEvidence(evidence);
+  if (!gone.arm) return gone;
+  if (!sync.inSync) {
+    return { arm: false, reason: `this copy was not provably in sync when the master died (${sync.reason}), so taking writes needs a manual promote with its RPO confirm` };
+  }
+  return { arm: true };
 }

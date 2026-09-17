@@ -310,3 +310,11 @@ export const ARM_SPACING_MS = 30 * 60_000;
  * worst possible state, because it has already stopped being a backup.
  */
 export const STANDIN_FENCE_HOLD_MS = 60_000;
+
+/**
+ * How long a stand-in's request to take writes may go unanswered before the
+ * lane asks again. The parent answers by rewriting the arm record, so a parent
+ * mid-restart, or an IPC message lost with it, would otherwise leave the lane
+ * waiting forever on a request nobody holds.
+ */
+export const STANDIN_WRITE_REQUEST_STALE_MS = 5 * 60_000;

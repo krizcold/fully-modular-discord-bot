@@ -13,6 +13,7 @@ import {
 } from '../bot/internalSetup/fleet/nodeIdentity';
 import { effectiveMasterUrls } from '../bot/internalSetup/fleet/fleetConfig';
 import { freshMasterClaim, readSuperseded } from '../bot/internalSetup/fleet/stepDown';
+import { readArmRecord, writeArmRecord } from '../bot/internalSetup/fleet/armRecord';
 
 export interface DemoteResult {
   success: boolean;
@@ -67,7 +68,7 @@ export async function runDemote(
         };
       }
     } else if (running
-      && !(state && (state.takeoverHold || state.staleMasterPark || state.emptyStoreHold))
+      && !(state && (state.takeoverHold || state.staleMasterPark || state.emptyStoreHold || (state.standIn?.live && state.standIn.writeGate)))
       && !confirm) {
       // Genuine early boot with no known hold: seconds away from real state.
       // Any OTHER stall that never reaches initialization (a control store whose
@@ -86,6 +87,13 @@ export async function runDemote(
         : effectiveMasterUrls().urls.length === 0 ? 'no master candidates configured (set MASTER_URLS or the fleet config first, or the demoted node would idle)'
         : null;
       if (refusal) return { success: false, error: refusal };
+    }
+    // Demote is one of F9's two ruled exits from standing in, so the lane's
+    // record ends here too. Left live, a parked write step's Continue would
+    // later restore the stand-in override over this demotion.
+    const arm = readArmRecord();
+    if (arm && arm.phase !== 'disarmed') {
+      writeArmRecord({ ...arm, phase: 'disarmed', disarmedAt: Date.now(), disarmReason: `demoted by the operator (${setBy})` });
     }
     if (resolveEnvRole() === 'co-worker') {
       clearRoleOverride();

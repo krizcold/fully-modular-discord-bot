@@ -95,6 +95,7 @@ export function createManagedRoutes(botManager: BotManager): Router {
         superseded: readSuperseded(),
         promote: readPromoteRecord(),
         emptyStoreHold: state?.emptyStoreHold ?? null,
+        standIn: state?.standIn ?? null,
         takeoverHold: state?.takeoverHold ?? null,
         staleMasterPark: state?.staleMasterPark ?? null,
         // Only an initialized master relays the block to designated backups
@@ -146,8 +147,8 @@ export function createManagedRoutes(botManager: BotManager): Router {
   });
 
   /** POST /api/managed/promote/cancel */
-  router.post('/promote/cancel', (_req: Request, res: Response) => {
-    res.json(cancelPromote());
+  router.post('/promote/cancel', async (_req: Request, res: Response) => {
+    res.json(await cancelPromote());
   });
 
   /** POST /api/managed/demote { confirm? } */

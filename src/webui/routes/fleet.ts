@@ -342,8 +342,8 @@ export function createFleetRoutes(botManager: BotManager): Router {
   });
 
   /** POST /api/fleet/promote/cancel: clear a promote that has not passed the point of no return. */
-  router.post('/promote/cancel', (_req: Request, res: Response) => {
-    res.json(cancelPromote());
+  router.post('/promote/cancel', async (_req: Request, res: Response) => {
+    res.json(await cancelPromote());
   });
 
   /**

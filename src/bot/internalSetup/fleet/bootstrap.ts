@@ -89,8 +89,9 @@ import { TransformationExecutor } from './transformation/transformationExecutor'
 import type { ControlStore, PersistedFleetConfig, PersistedTerm, TransformDirection } from './controlStore';
 import { effectiveFleetConfigView, effectiveMasterUrls, emptyStoreHoldEvidence, forcePassive, readFleetConfigCache, rememberBackups, validateMasterCandidates, renumberDesignations, validateBackupDesignations, validateWitnessChannelId, writeFleetConfigCache } from './fleetConfig';
 import { getLocalReplicaIdentity, getReplicaHealth, getSlotSample, setReplicaProbeListener } from './replicaHealth';
-import { canonicalStoreReachable, hasDbReplica, probeReplica, resolveReplicaEndpoints, spliceFleetCredentials } from './replicaPromotion';
+import { canonicalIsOwnReplica, canonicalStoreReachable, hasDbReplica, probeReplica, resolveReplicaEndpoints, spliceFleetCredentials } from './replicaPromotion';
 import { ArmEvidenceInputs, armDeferral, evaluateArmEvidence, ledgerAllowsArm, preArmRefusal, reachabilityWarning } from './armLane';
+import { StandInWriteContext, evaluateStandInWrites } from './armWrites';
 import { readReshardPending, readStandbyTermRow } from './armProbe';
 import { clearSlotStatus, readSlotStatus, recordFromPush, sourceMatchesAny, writeSlotStatus } from './slotStatus';
 import { startSyncPostureEngine, SyncPostureEngine, SyncPostureTarget } from './syncPostureEngine';
@@ -578,8 +579,15 @@ async function runStaleMasterFence(
       // an inherited term is equal rather than higher and so always trips the
       // comparison above (B6 map F28).
       if (peer.standingInFor === selfNodeId) {
-        console.warn(`[Fleet] Stale-master fence: ${url} is standing in for this node at term ${peer.term}; continuing the boot so it can hand back`);
-        continue;
+        if (peer.term === localTerm) {
+          console.warn(`[Fleet] Stale-master fence: ${url} is standing in for this node at term ${peer.term}; continuing the boot so it can hand back`);
+          continue;
+        }
+        // A higher term means it TOOK WRITES (B6-f2): its copy is the fleet
+        // database now and this one is behind it, so serving would fork the
+        // data the outage produced.
+        await park(peer.term, url, `${url} is standing in for this node and has taken writes at term ${peer.term} while this node's store holds ${localTerm}: its copy is the fleet database now and this one is behind it`,
+          ' Automatic failback is not built yet: re-seed this machine as a standby of that node, or promote that node by hand, before this node serves again.');
       }
       await park(peer.term, url, `${url} answers as a live master on term ${peer.term} while this node's store holds ${localTerm} and nothing is writing to it`);
     }
@@ -598,6 +606,10 @@ async function runStaleMasterFence(
     });
     const claims = await witness.readClaims();
     const higher = claims ? higherTermClaim(claims, selfNodeId, localTerm) : null;
+    if (higher && higher.standingInFor === selfNodeId) {
+      await park(higher.term, `witness beacon of ${higher.nodeName}`, `${higher.nodeName} (${higher.nodeId.slice(0, 8)}) is standing in for this node and has taken writes at term ${higher.term} while this node's store holds ${localTerm}: its copy is the fleet database now and this one is behind it`,
+        ' Automatic failback is not built yet: re-seed this machine as a standby of that node, or promote that node by hand, before this node serves again.');
+    }
     if (higher) {
       // The restore tail belongs to THIS half only: the peer half means a
       // foreign master is answering LIVE right now, where the same advice
@@ -743,18 +755,55 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     try {
       return await fn();
     } catch (error) {
-      if (!standIn) throw error;
+      if (!serveOnly) throw error;
       return disarmStandIn(`${what} failed on the copy this node is serving: ${error instanceof Error ? error.message : error}`);
     }
   };
   let standInUrl = '';
+  // Which half of F2's gate this boot is on is asked of the COPY, not assumed
+  // from the record: the parent may have promoted it and died before writing
+  // 'promoted', and a copy that has left recovery cannot be served read-only
+  // through a store that asserts it is a replica.
+  let serveOnly = false;
   if (standIn) {
+    // The gate text belongs to the phase that wrote it. Cleared here so that,
+    // before this boot initializes, only the genuine hold below can be read
+    // as one by the Fleet tab and by demote's known-hold list.
+    if (armRecord!.writeGate !== null) writeArmRecord({ ...armRecord!, writeGate: null });
     const endpoints = resolveReplicaEndpoints();
     const spliced = endpoints ? spliceFleetCredentials(endpoints.local) : {};
-    if (!endpoints || !('url' in spliced) || !spliced.url) {
-      return disarmStandIn('this node holds no usable database standby to serve from');
+    if ('url' in spliced && spliced.url) standInUrl = spliced.url;
+    if (armRecord!.phase === 'promoted') {
+      // Past F2's irreversible half: the copy is the fleet database and
+      // /data/.env already names it, so nothing on this path may disarm.
+      serveOnly = false;
+    } else {
+      if (standInUrl === '') return disarmStandIn('this node holds no usable database standby to serve from');
+      const copy = await probeReplica(standInUrl);
+      serveOnly = copy.inRecovery !== false;
     }
-    standInUrl = spliced.url;
+    if (!serveOnly && armRecord!.phase !== 'promoted' && !canonicalIsOwnReplica(endpoints!)) {
+      // The copy left recovery but the fleet's database URL was never
+      // persisted: the parent's write step died between pg_promote and the
+      // persist. Booting the master path here would open the DEAD primary and
+      // wait on it forever, and disarming is forbidden past the irreversible
+      // half (the copy holds the fleet's writes). So this holds, visibly, until
+      // the parent's resume or the operator's Continue persists the URL and
+      // restarts this node. Only on THIS branch: a record already promoted was
+      // written after the persist, and the replica env it would be checked
+      // against is free to name a new standby of this node by then.
+      const reason = 'this node\'s copy has left recovery but the fleet database URL still names the old primary, so the write step never finished persisting it. Continue the parked write step from the Fleet tab (it persists the URL and restarts this node), or demote this node and re-seed it as a standby';
+      const onDisk = readArmRecord();
+      if (onDisk) writeArmRecord({ ...onDisk, writeGate: reason });
+      console.error(`[Fleet] STAND-IN WRITE STEP HELD: ${reason}`);
+      pushFleetStatusNow();
+      for (;;) await guardSleep(TERM_GUARD_POLL_MS);
+    }
+    if (!serveOnly) {
+      console.warn(`[Fleet] STAND-IN WRITE STEP: this node's copy has left recovery; booting as a writing master for ${coveringNodeId}`);
+    }
+  }
+  if (serveOnly) {
     // Guild data has to follow the control plane onto the copy. Both endpoints
     // otherwise resolve to the MASTER's primary, which is the host the arm lane
     // proved unreachable in order to arm at all, so a stand-in that repointed
@@ -782,11 +831,11 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   // moment this node actually serves. A boot that dies before that point comes
   // straight back here with the override still set, so counting arms alone
   // would never increment in exactly the reboot loop the cap exists to stop.
-  if (standIn) {
+  if (serveOnly) {
     if (armRecord!.attempts >= ARM_MAX_ATTEMPTS) {
       return disarmStandIn(`this node has tried to stand in ${armRecord!.attempts} times without serving; failing over now needs a manual promote`);
     }
-    writeArmRecord({ ...armRecord!, attempts: armRecord!.attempts + 1, lastAttemptAt: Date.now() });
+    writeArmRecord({ ...armRecord!, attempts: armRecord!.attempts + 1, lastAttemptAt: Date.now(), writeGate: null });
   }
   // The store is populated by replication by construction (the arm read its term
   // row), and the hold's own probe loop is unbounded on an error, so running it
@@ -801,8 +850,8 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   // cluster it does not serve from. The copy's OWN inherited
   // synchronous_standby_names still has to go, but only when it leaves recovery,
   // which is the write step's job.
-  if (!standIn) await clearOwnSyncPosture();
-  const store = standIn ? createStandInControlStore(standInUrl) : await prepareControlStore(standalone);
+  if (!serveOnly) await clearOwnSyncPosture();
+  const store = serveOnly ? createStandInControlStore(standInUrl) : await prepareControlStore(standalone);
   // A control-store fence trip means a second master owns the schema: this
   // master stops granting entirely (the higher-term master is the healthy
   // one). Teardown (assigned once the server exists) drops every worker so
@@ -843,11 +892,14 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   const chainTakeover = !standalone && bootOverride?.chainTakeover === true;
   let previousHolder: { term: number; nodeId: string } | null = null;
   // The guard watches for a FROZEN term row and reports its holder as takeover
-  // chain input. A stand-in's row is frozen by construction (its master is gone
-  // and it will not stamp), so the guard would hand back a chain input that must
-  // never be acted on: chaining ends in a Declare Lost, which F8 forbids an
-  // automatic lane. The evidence the guard would have supplied was already
-  // gathered by the arm conjunction before the override was written.
+  // chain input. A stand-in's row is frozen by construction on BOTH of its
+  // boots: serve-only because the master is gone and this node never stamps,
+  // writes because the copy has left recovery and nothing can advance the row
+  // but this node's own mint. Watching it for 90 s would measure nothing and
+  // hand back a chain input that must never be acted on (chaining ends in a
+  // Declare Lost, which F8 forbids an automatic lane). The evidence the guard
+  // would have supplied was gathered by the arm conjunction and re-proved by
+  // the write step before either override was written.
   if (store instanceof PostgresControlStore && !standalone && !standIn) {
     previousHolder = await runTakeoverGuard(store, nodeId, takeoverConfirmed);
   }
@@ -859,7 +911,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   // The witness half does NOT catch that case, because an inherited term equals
   // the returning master's and higherTermClaim is strictly-greater; the pre-arm
   // contestedTerm check is what covers an undialable one.
-  await runStaleMasterFence(store, nodeId, nodeName, standalone, takeoverConfirmed, standIn);
+  await runStaleMasterFence(store, nodeId, nodeName, standalone, takeoverConfirmed, serveOnly);
 
   // The boot cleared every gate, so the brand-new-fleet answer has been spent
   // on the store it was given for.
@@ -871,7 +923,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   // returns, not starting an era of its own, and a higher term would make the
   // returning master's own boot fence park it out of its fleet.
   let term: number;
-  if (standIn) {
+  if (serveOnly) {
     const inherited = await standInGuard('reading the inherited term', () => store.getTerm());
     if (!inherited || !Number.isFinite(inherited.term) || inherited.term <= 0) {
       return disarmStandIn('the replayed control store carries no term row to stand in at');
@@ -888,10 +940,24 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     // spreading it would rewind the counter and leave the cap unable to bound
     // the reboot loop it exists for.
     const onDisk = readArmRecord() ?? armRecord!;
-    writeArmRecord({ ...onDisk, phase: 'serving', inheritedTerm: term, inheritedFrom: inherited.nodeId });
+    // A record in phase promoting stays promoting: the parent may hold a parked
+    // write step for it, and Continue needs that phase while Cancel needs a copy
+    // still in recovery, so writing serving over it here would close both exits.
+    writeArmRecord({ ...onDisk, phase: onDisk.phase === 'promoting' ? 'promoting' : 'serving', inheritedTerm: term, inheritedFrom: inherited.nodeId });
     console.warn(`[Fleet] STANDING IN for ${coveringNodeId} at inherited term ${term}; serving READ-ONLY until the write step`);
   } else {
     term = await store.acquireTerm(nodeId);
+    if (standIn) {
+      // The inherited term becomes an OWNED one here, one above it, on the copy
+      // that now holds the fleet's writes. The number is the whole signal: a
+      // stand-in at the master's own term is serve-only and reversible, so the
+      // returning master continues past it; a stand-in at a higher term has
+      // taken writes, so the returning master parks on it (20.14 lineage) until
+      // the failback lane exists to sync it from this copy first.
+      const onDisk = readArmRecord();
+      if (onDisk) writeArmRecord({ ...onDisk, phase: 'promoted', promotedAt: onDisk.promotedAt ?? Date.now(), writeRequestedAt: null, writeGate: null });
+      console.error(`[Fleet] STANDING IN for ${coveringNodeId} WITH WRITES at term ${term} (inherited ${armRecord!.inheritedTerm ?? 'unknown'}): this copy is the fleet database until the master returns for failback or an operator promotes this node for good`);
+    }
   }
   if (bootOverride?.takeover || bootOverride?.chainTakeover) consumeTakeoverFlags();
   // The stamp is this master's own lease (PLAN_STANDBY 3.1): deposed masters
@@ -899,7 +965,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   // Suppressed while standing in: the stamp is an UPDATE, and a zero-row result
   // latches the control-store fence. The stand-in does not own this term and
   // must not start claiming its lease.
-  if (store instanceof PostgresControlStore && !standalone && !standIn) {
+  if (store instanceof PostgresControlStore && !standalone && !serveOnly) {
     const stampTimer = setInterval(() => void store.stampTerm(), TERM_STAMP_MS);
     stampTimer.unref();
   }
@@ -913,7 +979,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     // A stand-in reads the topology and never rewrites it: the seed and the
     // self-removal below are both writes, and the list it would be editing
     // belongs to the master it is covering.
-    if (!fleetConfig && standIn) {
+    if (!fleetConfig && serveOnly) {
       return disarmStandIn('the replayed control store carries no fleet config to serve from');
     }
     if (!fleetConfig) {
@@ -1026,7 +1092,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     override: getShardCountOverride(),
     standalone,
     dataBackend: resolveDataBackend(),
-    termInherited: standIn,
+    termInherited: serveOnly,
   }));
   // Reshard pause: while the marker exists NOTHING is auto-assigned - no
   // self-claim, no Phase R/F (distribute returns immediately). Manual assign
@@ -2327,6 +2393,12 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     finishStepDown = (reason: string): void => {
       if (stepDownStaged || !supersededBy) return;
       stepDownStaged = true;
+      if (standIn) {
+        const arm = readArmRecord();
+        if (arm && arm.phase !== 'disarmed') {
+          writeArmRecord({ ...arm, phase: 'disarmed', disarmedAt: Date.now(), disarmReason: `${supersededBy.nodeName} holds a higher term (${supersededBy.term}); this node stops standing in` });
+        }
+      }
       persistSupersession(true);
       console.warn(`[Fleet] STEP-DOWN (${reason}): restarting in ${Math.round(STEPDOWN_HANDOVER_DELAY_MS / 1000)}s to rejoin under ${supersededBy.nodeName} (term ${supersededBy.term})`);
       setTimeout(() => requestStepDownRestart(), STEPDOWN_HANDOVER_DELAY_MS).unref();
@@ -2777,6 +2849,18 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     if (witnessToken === '') {
       console.warn('[Fleet] Witness disabled: DISCORD_TOKEN is empty');
     } else {
+      // The write step's tick needs what a serving master otherwise never
+      // holds: the copy's own endpoint, a way to ask the covered master
+      // directly, and which backups are registered HERE (their masterSeen
+      // names this stand-in, not the master it covers).
+      const writeCtx: StandInWriteContext | null = standIn && serveOnly ? {
+        nodeId,
+        coveringNodeId: coveringNodeId!,
+        standInUrl,
+        secret: (process.env.CONTROL_SECRET || '').trim(),
+        candidates: () => effectiveMasterUrls().urls,
+        peerRegisteredHere: id => registry.nodes.get(id)?.connected === true,
+      } : null;
       witness = startWitnessLoop({
         token: witnessToken,
         nodeId,
@@ -2831,6 +2915,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
           return facts;
         },
         getChannelId: () => fleetConfig?.witnessChannelId ?? null,
+        ...(writeCtx ? { onTick: (renewOk: boolean, status: WitnessStatus) => void evaluateStandInWrites(writeCtx, renewOk, status) } : {}),
       });
       readWitnessNow = async () => {
         // Null when the read itself failed: readClaims leaves the previous
@@ -2909,7 +2994,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   // waiting for that copy, so a stand-in's data really would be every
   // acknowledged write. Inert until an operator enables active mode on a node
   // that also consents to it, which is nobody by default.
-  if (!standalone && !controlFenced && !standIn && resolveDataBackend() === 'postgres') {
+  if (!standalone && !controlFenced && !serveOnly && resolveDataBackend() === 'postgres') {
     const engine = startSyncPostureEngine({
       url: () => getActiveBackendUrl(),
       publish: fact => publishSyncPosture(fact),
@@ -3483,6 +3568,11 @@ async function initCoWorker(init: CommonInit): Promise<FleetContext> {
         // keeps re-entering, and counting both would spend two of three on one try.
         attempts: existing?.attempts ?? 0,
         lastAttemptAt: now,
+        writeRequestedAt: null,
+        writeRefusal: null,
+        writeRefusedAt: null,
+        writeGate: null,
+        promotedAt: null,
         disarmedAt: null,
         disarmReason: null,
       });

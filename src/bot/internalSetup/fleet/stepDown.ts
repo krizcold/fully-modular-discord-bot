@@ -141,16 +141,17 @@ export function notifyStepDown(url: string, secret: string, payload: StepDownPay
  * Any other node's claim holding a term above ours, fresh or not: this copy is
  * a stale fork (boot fence).
  *
- * A STAND-IN covering THIS node is the one exception (B6 map F21). Its whole
- * purpose is to hold the fleet until this master returns, so parking on it
- * would be the inverse of the automatic failback 20.5 rules: the node it names
- * enters the failback lane instead. Every other node treats it as a master.
+ * A stand-in covering THIS node needs no exception here, and must not have one.
+ * While it serves READ-ONLY it holds this node's own term, so it never clears
+ * the strictly-greater test and this node's boot continues past it to hand
+ * back (B6 map F21/F28). A stand-in at a HIGHER term has TAKEN WRITES: its copy
+ * is the fleet database now and this node's is behind it, so this node must
+ * park (or, if still serving, step down) rather than mint past those writes.
  */
 export function higherTermClaim(claims: WitnessClaim[], selfNodeId: string, selfTerm: number): WitnessClaim | null {
   let best: WitnessClaim | null = null;
   for (const claim of claims) {
     if (claim.nodeId === selfNodeId || claim.term <= selfTerm) continue;
-    if (claim.role !== 'master' && claim.standingInFor === selfNodeId) continue;
     if (!best || claim.term > best.term) best = claim;
   }
   return best;
@@ -210,4 +211,20 @@ export function masterStoreDeadNow(claim: WitnessClaim | null, status: WitnessSt
 export function requestStepDownRestart(): void {
   if (!process.send) return;
   try { process.send({ type: 'fleet:stepdown' }); } catch { /* the fallback timer retries */ }
+}
+
+export interface StandInWriteRequest {
+  coveringNodeId: string;
+  inheritedTerm: number | null;
+  heldToLsn: string | null;
+}
+
+/**
+ * A serving stand-in asks the parent to take writes (20.5, B6 map F2). The
+ * step runs in the parent because only there is the container-pinned URL
+ * verdict correct; the parent answers by rewriting the arm record.
+ */
+export function requestStandInWrites(data: StandInWriteRequest): void {
+  if (!process.send) return;
+  try { process.send({ type: 'fleet:standin:writes', data }); } catch { /* the lane asks again once the request goes stale */ }
 }

@@ -9,7 +9,8 @@ import { FLEET_DIR } from './constants';
 import { atomicWriteFileSync } from './fileControlStore';
 
 export type PromotePhase = 'verdict' | 'claim' | 'fence' | 'catchup' | 'promote' | 'restart' | 'done';
-export type PromoteMode = 'transfer' | 'failover';
+/** stand-in: a serving stand-in's copy takes the fleet's writes (20.5, B6 map F2); it keeps its backup identity. */
+export type PromoteMode = 'transfer' | 'failover' | 'stand-in';
 
 const PHASES: PromotePhase[] = ['verdict', 'claim', 'fence', 'catchup', 'promote', 'restart', 'done'];
 
@@ -21,7 +22,7 @@ export interface PromoteRecord {
   parked: boolean;
   lastError: string | null;
   /** Who asked for this promote; stamped on the role override at the restart phase. */
-  startedBy: 'webui-promote' | 'manager-promote';
+  startedBy: 'webui-promote' | 'manager-promote' | 'stand-in';
   /** Transfer-and-retire: relayed to the old master in its register reply. */
   retireOldMaster: boolean;
   supersededNodeId: string | null;
@@ -43,7 +44,7 @@ const recordFile = () => dataPath('global', FLEET_DIR, 'promote.json');
 export function readPromoteRecord(): PromoteRecord | null {
   try {
     const parsed = JSON.parse(fs.readFileSync(recordFile(), 'utf-8'));
-    if (!PHASES.includes(parsed?.phase) || (parsed?.mode !== 'transfer' && parsed?.mode !== 'failover')) return null;
+    if (!PHASES.includes(parsed?.phase) || (parsed?.mode !== 'transfer' && parsed?.mode !== 'failover' && parsed?.mode !== 'stand-in')) return null;
     return {
       phase: parsed.phase,
       mode: parsed.mode,
@@ -51,7 +52,7 @@ export function readPromoteRecord(): PromoteRecord | null {
       updatedAt: Number(parsed.updatedAt) || 0,
       parked: parsed.parked === true,
       lastError: typeof parsed.lastError === 'string' ? parsed.lastError : null,
-      startedBy: parsed.startedBy === 'manager-promote' ? 'manager-promote' : 'webui-promote',
+      startedBy: parsed.startedBy === 'manager-promote' ? 'manager-promote' : parsed.startedBy === 'stand-in' ? 'stand-in' : 'webui-promote',
       retireOldMaster: parsed.retireOldMaster === true,
       supersededNodeId: typeof parsed.supersededNodeId === 'string' ? parsed.supersededNodeId : null,
       supersededTerm: Number.isFinite(parsed.supersededTerm) ? Number(parsed.supersededTerm) : null,

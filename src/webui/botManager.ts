@@ -7,6 +7,7 @@ import { getSafetyManager } from '../utils/updateSafety';
 import { resetAppStoreManager } from '../bot/internalSetup/utils/appStoreManager';
 import { applyRouteOverrides } from '../bot/internalSetup/utils/dataBackends/routeResolver';
 import { invalidateRoleOverrideCache } from '../bot/internalSetup/fleet/nodeIdentity';
+import { startStandInWrites } from './promoteEngine';
 
 export interface BotStartResult {
   success: boolean;
@@ -299,6 +300,16 @@ export class BotManager {
             });
           };
           retry();
+        } else if (message.type === 'fleet:standin:writes') {
+          // A serving stand-in asks for the write step (B6-f2). It runs here
+          // because the pinned-URL verdict is only correct in this process;
+          // the answer goes back through the arm record, never the socket.
+          const data = message.data ?? {};
+          void startStandInWrites(this, {
+            coveringNodeId: String(data.coveringNodeId ?? ''),
+            inheritedTerm: Number.isFinite(data.inheritedTerm) ? Number(data.inheritedTerm) : null,
+            heldToLsn: typeof data.heldToLsn === 'string' ? data.heldToLsn : null,
+          });
         } else if (message.type === 'control:shutdown-bot') {
           // Access-log channel "Shut down bot" button: stop the Discord bot child.
           console.warn('[BotManager] control:shutdown-bot received from access-log action');

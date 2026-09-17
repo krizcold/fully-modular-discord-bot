@@ -27,7 +27,7 @@ import {
   REPLICA_LAG_PROMOTE_MAX_MS,
 } from '../bot/internalSetup/fleet/constants';
 import { isContainerPinned, loadCredentials } from '../utils/envLoader';
-import { getNodeId, writeRoleOverride } from '../bot/internalSetup/fleet/nodeIdentity';
+import { getNodeId, invalidateRoleOverrideCache, readRoleOverride, writeRoleOverride } from '../bot/internalSetup/fleet/nodeIdentity';
 import { PromoteRecord, clearPromoteRecord, readPromoteRecord, writePromoteRecord } from '../bot/internalSetup/fleet/promoteRecord';
 import {
   ReplicaEndpoints,
@@ -41,7 +41,8 @@ import {
   resolveReplicaEndpoints,
   spliceFleetCredentials,
 } from '../bot/internalSetup/fleet/replicaPromotion';
-import { clearSuperseded, freshMasterClaim, masterStoreDeadNow } from '../bot/internalSetup/fleet/stepDown';
+import { StandInWriteRequest, clearSuperseded, freshMasterClaim, masterStoreDeadNow } from '../bot/internalSetup/fleet/stepDown';
+import { readArmRecord, writeArmRecord } from '../bot/internalSetup/fleet/armRecord';
 import { backupsAhead, readSlotStatus, sourceMatchesAny } from '../bot/internalSetup/fleet/slotStatus';
 import { watchForSyncWaitCancel } from '../bot/internalSetup/utils/syncWaitCancel';
 
@@ -125,7 +126,10 @@ export async function startPromote(botManager: BotManager, opts: PromoteStartOpt
   const state: any = stateResult?.success ? stateResult.state : null;
   if (!state || !state.initialized) return { success: false, error: 'Fleet state unavailable (bot still initializing); try again shortly' };
 
-  const refusal = state.role !== 'co-worker' ? 'this node is already a master'
+  // A SERVING stand-in may be promoted by hand: it is one of F9's two ruled
+  // exits, and the only way a stand-in ever becomes the true master (20.5).
+  const servingStandIn = state.role === 'master' && state.standIn?.live === true;
+  const refusal = state.role !== 'co-worker' && !servingStandIn ? 'this node is already a master'
     : state.backupMaster !== true ? 'this node is not the designated backup master (set BOT_NODE_ROLE=backup-master)'
     : state.dataBackend !== 'postgres' ? 'promotion is a postgres-mode feature (file mode has no standby)'
     : state.draining === true ? 'this node is draining; promotion refused'
@@ -165,7 +169,10 @@ export async function startPromote(botManager: BotManager, opts: PromoteStartOpt
     if (fresh?.success && fresh.witness) witnessStatus = fresh.witness;
     else console.warn('[Fleet] Promote has no fresh witness reading (this node runs no witness, or the read failed); judging on the last cached one, which the freshness windows will reject if it is old');
   }
-  const masterAlive = state.masterKnown === true
+  // A serving stand-in reports masterKnown for ITSELF (it runs the master path),
+  // which must not read as "the master is alive": the witness half still
+  // catches a returning master's fresh beacon.
+  const masterAlive = (state.masterKnown === true && !servingStandIn)
     || (witnessStatus ? freshMasterClaim(witnessStatus, state.nodeId, Date.now()) !== null : false);
   const lagMs = probe.replayAgeMs ?? null;
 
@@ -322,6 +329,87 @@ export async function startPromote(botManager: BotManager, opts: PromoteStartOpt
   return { success: true, record };
 }
 
+/**
+ * The stand-in lane's write step (20.5, B6 map F2), run HERE because the bot
+ * child asked for it and cannot run it itself: inside a forked child every set
+ * key reads container-pinned, so the one refusal that matters most (a pinned
+ * URL means the promoted copy could never take effect) is only decidable in
+ * the parent. Every refusal is written back into the arm record, which is how
+ * the child learns the answer and how the Fleet tab says why.
+ */
+export async function startStandInWrites(botManager: BotManager, req: StandInWriteRequest): Promise<void> {
+  const refuse = (reason: string): void => {
+    const arm = readArmRecord();
+    if (arm && arm.phase === 'promoting') {
+      writeArmRecord({ ...arm, phase: 'serving', writeRequestedAt: null, writeRefusal: reason, writeRefusedAt: Date.now() });
+    }
+    console.error(`[Fleet] Stand-in NOT taking writes: ${reason}`);
+  };
+  const existing = readPromoteRecord();
+  if (existing && existing.phase !== 'done') {
+    // Parked included, whatever its mode: a parked record is an operator's
+    // unfinished act (its claimed term, fence position and retire request
+    // live nowhere else), and the only two ways out of it are theirs.
+    return refuse(existing.parked
+      ? `a promote is parked at phase ${existing.phase} (${existing.lastError ?? 'no error recorded'}); Continue or Cancel it from the Fleet tab`
+      : `a promote is already running (phase ${existing.phase})`);
+  }
+  if (phasesRunning) return refuse('a promote is already running');
+  if (!botManager.isRunning()) return refuse('the bot is not running');
+  const arm = readArmRecord();
+  if (!arm || arm.phase !== 'promoting' || arm.coveringNodeId !== req.coveringNodeId) {
+    return refuse('the arm record shows no pending request to take writes');
+  }
+  const endpoints = resolveReplicaEndpoints();
+  if (!endpoints) return refuse('this instance holds no database standby to promote');
+  const spliced = splicedEndpoints(endpoints);
+  if ('error' in spliced) return refuse(spliced.error);
+  const pinned = ['DATA_BACKEND_URL', 'DATA_BACKEND_LOCAL_URL', 'DATA_BACKEND_PUBLIC_URL']
+    .concat((loadCredentials().CONTROL_STORE_URL || '').trim() !== '' ? ['CONTROL_STORE_URL'] : [])
+    .filter(isContainerPinned);
+  if (pinned.length > 0) {
+    return refuse(`the fleet database URL is pinned by this container environment (${pinned.join(', ')}), so a promoted copy could never take effect here; remove ${pinned.join(' and ')} from this instance's env editor, then promote by hand`);
+  }
+  const probe = await probeReplicaSettled(spliced.local);
+  if (!probe.ok) return refuse(`the local database standby is unreachable (${probe.error})`);
+
+  const record: PromoteRecord = {
+    phase: 'promote',
+    mode: 'stand-in',
+    startedAt: Date.now(),
+    updatedAt: Date.now(),
+    parked: false,
+    lastError: null,
+    startedBy: 'stand-in',
+    retireOldMaster: false,
+    supersededNodeId: req.coveringNodeId,
+    supersededTerm: req.inheritedTerm,
+    supersededDelivered: false,
+    expectedTerm: null,
+    expectedHolder: null,
+    claimedTerm: null,
+    fencedLsn: null,
+    lagMs: probe.replayAgeMs ?? null,
+  };
+  writePromoteRecord(record);
+  console.warn(`[Fleet] STAND-IN WRITE STEP started for ${req.coveringNodeId.slice(0, 8)} (held to ${req.heldToLsn ?? 'unknown'}): promoting this machine's copy`);
+  void runPhases(botManager, record, spliced);
+}
+
+/** The stand-in lane still wants the writes: its record has asked for them or already holds them. */
+function standInLaneLive(): boolean {
+  const arm = readArmRecord();
+  return !!arm && (arm.phase === 'promoting' || arm.phase === 'promoted');
+}
+
+/** Why the lane is not live, for a refusal an operator reads. */
+function describeStandInLane(): string {
+  const arm = readArmRecord();
+  if (!arm) return 'its record is gone';
+  if (arm.phase === 'disarmed') return arm.disarmReason ?? 'it was disarmed';
+  return `its record now reads ${arm.phase}`;
+}
+
 /** Re-enter a parked record at its recorded phase. */
 export async function continuePromote(botManager: BotManager): Promise<{ success: boolean; error?: string; record?: PromoteRecord }> {
   const record = readPromoteRecord();
@@ -329,6 +417,13 @@ export async function continuePromote(botManager: BotManager): Promise<{ success
   if (record.phase === 'done') return { success: false, error: 'the last promote already finished' };
   if (!record.parked) return { success: false, error: `the promote is running (phase ${record.phase})` };
   if (phasesRunning) return { success: false, error: 'a promote is already running' };
+  // Checked BEFORE the phases run, because the promote phase's first act is
+  // pg_promote: a guard in the restart phase alone would let a Continue on a
+  // demoted or stepped-down stand-in take its copy out of recovery and only
+  // then park again.
+  if (record.mode === 'stand-in' && !standInLaneLive()) {
+    return { success: false, error: `the stand-in lane no longer asks for the writes (${describeStandInLane()}), so this write step cannot continue; Cancel it, and re-seed this machine as a standby if its copy has left recovery` };
+  }
   const endpoints = resolveReplicaEndpoints();
   if (!endpoints) return { success: false, error: 'this instance no longer reports a database standby' };
   const spliced = splicedEndpoints(endpoints);
@@ -346,7 +441,7 @@ export async function continuePromote(botManager: BotManager): Promise<{ success
  * record being cleared. Past the claim the old master is already deposed and
  * the only safe direction is forward.
  */
-export function cancelPromote(): { success: boolean; error?: string } {
+export async function cancelPromote(): Promise<{ success: boolean; error?: string }> {
   const record = readPromoteRecord();
   if (!record) return { success: false, error: 'no promote to cancel' };
   // A parked claim never landed (the phase advances only on success), so it is
@@ -357,6 +452,48 @@ export function cancelPromote(): { success: boolean; error?: string } {
     clearPromoteRecord();
     return { success: true };
   }
+  // A parked stand-in write step carries nothing the record alone must keep:
+  // the override is written by its restart phase and the covered master rides
+  // the arm record. Dismissing it hands the lane back its refusal spacing, and
+  // manual promote stays open.
+  if (record.mode === 'stand-in' && record.parked) {
+    // Allowed while the copy is still a standby, or once the lane has ENDED
+    // (the stand-in stepped down or was disarmed: the copy's fate is then the
+    // manager's re-seed or adopt, and the record has nothing left to stage).
+    // Refused in between: promoteReplica runs FIRST in its phase, so a park
+    // after it has already taken the irreversible step, and dismissing it
+    // would hide that from the lane and the operator alike. An unreadable copy
+    // is not a yes.
+    // Read as disarmed, never merely unreadable: an absent record is not a yes.
+    const laneEnded = readArmRecord()?.phase === 'disarmed';
+    const endpoints = resolveReplicaEndpoints();
+    const spliced = endpoints ? splicedEndpoints(endpoints) : { error: 'no standby endpoint' };
+    const copy = 'error' in spliced ? null : await probeReplica(spliced.local);
+    // Re-read after the probe, on both branches: a Continue clicked meanwhile
+    // has restarted the phases, and clearing under them would only be undone
+    // by their next save.
+    const again = readPromoteRecord();
+    if (phasesRunning || !again || !again.parked || again.startedAt !== record.startedAt) {
+      return { success: false, error: 'the promote changed while the cancel was being checked; look at its current phase and retry' };
+    }
+    if (laneEnded) {
+      // The asymmetry with the branch below is deliberate: with the lane still
+      // serving, Continue is the exit and cancel must not hide a promoted copy;
+      // with the lane ended, Continue can never succeed (its restart phase
+      // refuses a disarmed lane), so cancel IS the exit, and the copy's fate
+      // is the manager's adopt-or-re-seed verdict. Said out loud, because this
+      // record was the only thing saying the copy may have been promoted.
+      console.error(`[Fleet] STAND-IN WRITE STEP dismissed after the lane ended (parked at phase ${record.phase}: ${record.lastError ?? 'no error recorded'}); this machine's copy ${copy && copy.ok ? (copy.inRecovery === false ? 'HAS LEFT RECOVERY and may hold the fleet database URL' : 'is still a standby') : 'could not be read'}; the manager's replica verdict decides its fate`);
+    } else if (!copy || !copy.ok || copy.inRecovery !== true) {
+      return { success: false, error: `this machine's copy ${copy && copy.ok ? 'has already left recovery' : 'cannot be read right now'}; Continue the write step so the fleet's database URL is persisted, or re-seed this machine as a standby` };
+    }
+    const arm = readArmRecord();
+    if (arm && arm.phase === 'promoting') {
+      writeArmRecord({ ...arm, phase: 'serving', writeRequestedAt: null, writeRefusal: 'the write step was cancelled by the operator', writeRefusedAt: Date.now() });
+    }
+    clearPromoteRecord();
+    return { success: true };
+  }
   return { success: false, error: `the promote is past the point of cancellation (phase ${record.phase}); Continue it instead` };
 }
 
@@ -364,6 +501,33 @@ export function cancelPromote(): { success: boolean; error?: string } {
 export async function resumePromote(botManager: BotManager): Promise<void> {
   const record = readPromoteRecord();
   if (!record || record.phase === 'done' || record.parked) return;
+  if (record.mode === 'stand-in') {
+    // The evidence this step was decided on is as old as the parent's outage,
+    // and the lane's own state is the only fresh fact. If the child has since
+    // disarmed (its boot fence found the master alive) or the override no
+    // longer says stand-in, promoting now would take a copy nobody serves
+    // from out of recovery. Parked, not run: the operator decides.
+    invalidateRoleOverrideCache();
+    const arm = readArmRecord();
+    const override = readRoleOverride();
+    if (!arm || (arm.phase !== 'promoting' && arm.phase !== 'promoted') || override?.standIn !== true) {
+      record.parked = true;
+      record.lastError = `the parent restarted mid-step and the stand-in lane has since changed state (record ${arm?.phase ?? 'absent'}, override ${override?.standIn === true ? 'stand-in' : override?.role ?? 'none'}); Continue only if this node should still take the writes`;
+      writePromoteRecord(record);
+      console.error(`[Fleet] STAND-IN WRITE STEP parked at resume: ${record.lastError}`);
+      return;
+    }
+    // The restart phase had already done its work when the parent died in it:
+    // the override is staged, the record says promoted, and this parent's own
+    // start forked the child onto the writes path. Restarting again would only
+    // cost the fleet a second outage and a second term.
+    if (record.phase === 'restart' && arm.phase === 'promoted') {
+      record.phase = 'done';
+      writePromoteRecord(record);
+      console.warn('[Fleet] STAND-IN WRITE STEP complete: the restart it was interrupted in has already taken');
+      return;
+    }
+  }
   const endpoints = resolveReplicaEndpoints();
   if (!endpoints) return;
   const spliced = splicedEndpoints(endpoints);
@@ -394,6 +558,11 @@ async function runPhases(botManager: BotManager, record: PromoteRecord, spliced:
             record.phase = 'promote';
             break;
           case 'promote':
+            // The same guard as continuePromote, for the resume path and for a
+            // lane that ends while an earlier phase of this run is executing.
+            if (record.mode === 'stand-in' && !standInLaneLive()) {
+              throw new Error(`the stand-in lane stopped asking for the writes before the copy was promoted (${describeStandInLane()}); Cancel this step`);
+            }
             await phasePromote(spliced);
             record.phase = 'restart';
             break;
@@ -527,13 +696,35 @@ async function phasePromote(spliced: { local: string; public: string }): Promise
 }
 
 async function phaseRestart(botManager: BotManager, record: PromoteRecord): Promise<void> {
-  writeRoleOverride({
-    role: 'master',
-    takeover: true,
-    ...(record.mode === 'failover' ? { chainTakeover: true } : {}),
-    setAt: Date.now(),
-    setBy: record.startedBy,
-  });
+  if (record.mode === 'stand-in') {
+    // The lane can have changed state while the copy was promoted (the child
+    // steps down on a fresh higher term at any time). The copy is already out
+    // of recovery, so this is not undone here: it parks with the facts and
+    // the operator decides.
+    const arm = readArmRecord();
+    if (!arm || (arm.phase !== 'promoting' && arm.phase !== 'promoted')) {
+      throw new Error(`the stand-in lane changed state while the copy was being promoted (its record is now ${arm ? arm.phase : 'absent'}); the copy has left recovery, so decide by hand: Cancel this step and re-seed this machine as a standby, or promote this node by hand to serve from the copy`);
+    }
+    // Still a stand-in (20.5: the backup KEEPS its identity), so no takeover
+    // and no chain: the boot runs the full fence and mints one term above the
+    // inherited one, and it never Declares Lost the master it covers (F8).
+    writeRoleOverride({ role: 'master', standIn: true, setAt: Date.now(), setBy: 'stand-in' });
+    writeArmRecord({ ...arm, phase: 'promoted', promotedAt: arm.promotedAt ?? Date.now(), writeRequestedAt: null, writeGate: null });
+  } else {
+    // A manual promote from a serving stand-in makes it the TRUE master for
+    // good (20.5): the stand-in identity ends here, and its record says so.
+    const arm = readArmRecord();
+    if (arm && arm.phase !== 'disarmed' && arm.phase !== 'claimed') {
+      writeArmRecord({ ...arm, phase: 'disarmed', disarmedAt: Date.now(), disarmReason: 'promoted by hand into the true master' });
+    }
+    writeRoleOverride({
+      role: 'master',
+      takeover: true,
+      ...(record.mode === 'failover' ? { chainTakeover: true } : {}),
+      setAt: Date.now(),
+      setBy: record.startedBy,
+    });
+  }
   for (let attempt = 0; ; attempt++) {
     const restart = await botManager.restart();
     if (restart.success) return;

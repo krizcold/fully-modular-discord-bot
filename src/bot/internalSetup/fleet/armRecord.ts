@@ -12,9 +12,17 @@ import { dataPath } from '../../../utils/dataRoot';
 import { FLEET_DIR } from './constants';
 import { atomicWriteFileSync } from './fileControlStore';
 
-export type ArmPhase = 'claimed' | 'serving' | 'disarmed';
+/**
+ * claimed: the override is written and the serve-only boot is next.
+ * serving: coordinating READ-ONLY from a copy still in recovery.
+ * promoting: this node asked the parent to take writes; answered by the parent
+ *   rewriting this record (F2's second gate runs where the pinned-URL verdict
+ *   is correct, which is never inside a forked child).
+ * promoted: the copy left recovery; the next boot mints a term of its own.
+ */
+export type ArmPhase = 'claimed' | 'serving' | 'promoting' | 'promoted' | 'disarmed';
 
-const PHASES: ArmPhase[] = ['claimed', 'serving', 'disarmed'];
+const PHASES: ArmPhase[] = ['claimed', 'serving', 'promoting', 'promoted', 'disarmed'];
 
 /** The six-term conjunction as observed at the instant the lane armed (F19). */
 export interface ArmEvidence {
@@ -40,6 +48,14 @@ export interface ArmRecord {
   /** Counted at each serve-only BOOT and cleared once the node actually serves. */
   attempts: number;
   lastAttemptAt: number;
+  /** The tick that asked the parent to take writes; null once answered or never asked. */
+  writeRequestedAt: number | null;
+  /** The parent's last refusal to take writes, kept so the lane waits out the spacing and the Fleet tab can say why. */
+  writeRefusal: string | null;
+  writeRefusedAt: number | null;
+  /** The last reason a tick did NOT ask for writes; display only. */
+  writeGate: string | null;
+  promotedAt: number | null;
   disarmedAt: number | null;
   disarmReason: string | null;
 }
@@ -77,6 +93,11 @@ export function readArmRecord(): ArmRecord | null {
       evidence: readEvidence(parsed.evidence),
       attempts: Number(parsed.attempts) || 0,
       lastAttemptAt: Number(parsed.lastAttemptAt) || 0,
+      writeRequestedAt: Number.isFinite(parsed.writeRequestedAt) ? Number(parsed.writeRequestedAt) : null,
+      writeRefusal: typeof parsed.writeRefusal === 'string' ? parsed.writeRefusal : null,
+      writeRefusedAt: Number.isFinite(parsed.writeRefusedAt) ? Number(parsed.writeRefusedAt) : null,
+      writeGate: typeof parsed.writeGate === 'string' ? parsed.writeGate : null,
+      promotedAt: Number.isFinite(parsed.promotedAt) ? Number(parsed.promotedAt) : null,
       disarmedAt: Number.isFinite(parsed.disarmedAt) ? Number(parsed.disarmedAt) : null,
       disarmReason: typeof parsed.disarmReason === 'string' ? parsed.disarmReason : null,
     };
