@@ -50,6 +50,8 @@ export interface ControlClientOptions {
   onFleetConfig?: (config: FleetConfigPayload) => void;
   /** This node was superseded by the master it just registered with (B4); recorded for the manager. */
   onSuperseded?: (info: SupersededInfo) => void;
+  /** The master this node registered with, and its term (B6 map F28): the holder sighting the promote engine reads. */
+  onMasterIdentity?: (nodeId: string, term: number) => void;
   /** Copy block relayed to designated backups in the register reply (B4). */
   onCopyBlock?: (block: CopyBlock) => void;
   /** The primary's slot table, pushed by the master to nodes hosting a standby (20.17 slot signal). */
@@ -260,6 +262,10 @@ export class ControlClient {
       if (result.copyBlock) {
         try { this.opts.onCopyBlock?.(result.copyBlock); }
         catch (error) { console.warn('[Fleet] Failed to record the delivered copy block:', error instanceof Error ? error.message : error); }
+      }
+      if (typeof result.nodeId === 'string' && result.nodeId !== '') {
+        try { this.opts.onMasterIdentity?.(result.nodeId, result.term); }
+        catch (error) { console.warn('[Fleet] Failed to record the master sighting:', error instanceof Error ? error.message : error); }
       }
       return true;
     } catch (error) {

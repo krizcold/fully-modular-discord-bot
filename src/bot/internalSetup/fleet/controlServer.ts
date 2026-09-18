@@ -200,7 +200,7 @@ export class ControlServer {
         this.conns.set(payload.nodeId, socket);
         state.nodeId = payload.nodeId;
       }
-      if (requestId) this.reply(socket, requestId, result);
+      if (requestId) this.reply(socket, requestId, result.accepted ? { ...result, nodeId: this.hooks.getNodeId() } : result);
       if (result.accepted) this.hooks.afterRegister(payload.nodeId);
       return;
     }

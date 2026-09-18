@@ -27,19 +27,22 @@ import {
   REPLICA_LAG_PROMOTE_MAX_MS,
 } from '../bot/internalSetup/fleet/constants';
 import { isContainerPinned, loadCredentials } from '../utils/envLoader';
-import { getNodeId, invalidateRoleOverrideCache, readRoleOverride, writeRoleOverride } from '../bot/internalSetup/fleet/nodeIdentity';
+import { clearRoleOverride, getNodeId, invalidateRoleOverrideCache, readRoleOverride, writeRoleOverride } from '../bot/internalSetup/fleet/nodeIdentity';
 import { PromoteRecord, clearPromoteRecord, readPromoteRecord, writePromoteRecord } from '../bot/internalSetup/fleet/promoteRecord';
+import { HolderSighting, readHolderSighting } from '../bot/internalSetup/fleet/holderSighting';
 import {
   ReplicaEndpoints,
   canonicalIsOwnReplica,
-  canonicalStoreReachable,
   currentCanonicalUrl,
   persistPromotedUrls,
   probeReplica,
   probeReplicaSettled,
   promoteReplica,
+  readTermRow,
   resolveReplicaEndpoints,
   spliceFleetCredentials,
+  storeReachable,
+  stripUrlCredentials,
 } from '../bot/internalSetup/fleet/replicaPromotion';
 import { StandInWriteRequest, clearSuperseded, freshMasterClaim, masterStoreDeadNow } from '../bot/internalSetup/fleet/stepDown';
 import { readArmRecord, writeArmRecord } from '../bot/internalSetup/fleet/armRecord';
@@ -102,12 +105,128 @@ async function systemIdentifier(url: string): Promise<string | null> {
   }
 }
 
-function splicedEndpoints(endpoints: ReplicaEndpoints): { local: string; public: string } | { error: string } {
-  const local = spliceFleetCredentials(endpoints.local);
+function splicedEndpoints(endpoints: ReplicaEndpoints, base?: string): { local: string; public: string } | { error: string } {
+  const local = spliceFleetCredentials(endpoints.local, base);
   if (!local.url) return { error: local.error ?? 'unusable standby endpoint' };
-  const publicSpliced = spliceFleetCredentials(endpoints.public);
+  const publicSpliced = spliceFleetCredentials(endpoints.public, base);
   if (!publicSpliced.url) return { error: publicSpliced.error ?? 'unusable standby endpoint' };
   return { local: local.url, public: publicSpliced.url };
+}
+
+/**
+ * The database a returning master's promote fences and claims (B6 map F28):
+ * the one it follows, read WITH credentials from the child that installed it,
+ * because the hold persists nothing and the manager's re-seed may have
+ * retired every URL the node owned. Null while the child is not serving from
+ * a verified delivered database.
+ */
+async function readFollowed(botManager: BotManager): Promise<{ url: string; forms: string[] } | null> {
+  const res = await botManager.readFollowedBackend();
+  const followed = res?.success ? res.followed : null;
+  if (!followed || typeof followed.url !== 'string' || followed.url === '') return null;
+  return { url: followed.url, forms: Array.isArray(followed.forms) ? followed.forms.filter((f: unknown): f is string => typeof f === 'string') : [] };
+}
+
+type HoldForms = { following: string | null; followingForms: string[] };
+
+/**
+ * The child's fleet state as far as the promote gates need it (B6 map F28):
+ * null when the child is not running or did not answer, which is UNKNOWN and
+ * never read as "no hold".
+ */
+async function readChildState(botManager: BotManager): Promise<{ initialized: boolean; hold: HoldForms | null; park: { at: number; peerUrl: string; observedTerm: number } | null } | null> {
+  if (!botManager.isRunning()) return null;
+  const res = await botManager.getFleetState().catch(() => null);
+  if (!res?.success || !res.state) return null;
+  const hold = res.state.followerHold;
+  const park = res.state.staleMasterPark;
+  return {
+    initialized: res.state.initialized === true,
+    hold: hold ? { following: typeof hold.following === 'string' ? hold.following : null, followingForms: Array.isArray(hold.followingForms) ? hold.followingForms.filter((f: unknown): f is string => typeof f === 'string') : [] } : null,
+    // A boot parked on a live holder: a foreign node answered at or above this
+    // node's term at `at`, which is evidence against any record decided before.
+    park: park && Number.isFinite(park.at) ? { at: Number(park.at), peerUrl: String(park.peerUrl ?? ''), observedTerm: Number(park.observedTerm) || 0 } : null,
+  };
+}
+
+/**
+ * False only on evidence: a record decided on this node's OWN database (it
+ * names no followed endpoint) predates any hold; one naming a database other
+ * than the ones the hold delivered is foreign. A hold that has delivered
+ * nothing yet is no evidence either way and is not judged.
+ */
+function recordOfHold(record: PromoteRecord, hold: HoldForms): boolean {
+  if (record.canonicalEndpoint === null) return false;
+  const forms = [hold.following, ...hold.followingForms].filter((f): f is string => f !== null);
+  return forms.length === 0 || forms.includes(record.canonicalEndpoint);
+}
+
+/**
+ * Another node has held the fleet since this promote was decided (B6 map F28):
+ * the record's restart phase would boot this node as master past the fence
+ * onto a fleet somebody else holds. Read from the sighting the child persists,
+ * so it outlives the hold, a demote, a re-designation and a step-down, and
+ * needs no running child.
+ */
+export function promoteSupersededBy(record: PromoteRecord): HolderSighting | null {
+  if (record.mode === 'stand-in' || record.phase === 'done') return null;
+  const seen = readHolderSighting();
+  return seen && seen.nodeId !== getNodeId() && seen.seenAt >= record.startedAt ? seen : null;
+}
+
+/**
+ * 20.12 c3, carried to the restart: the master a failover supersedes while
+ * its bot is alive and its database dead keeps answering the boot fence at
+ * the term its dead store froze on, and this node's higher beacon is what
+ * steps it down. A stand-in that took writes is such a master too (its
+ * standby's failover is decided the same way); the fence re-proves the fact
+ * on that node's own fresh beacon before letting it answer.
+ */
+export function c3SupersededPeer(masterAlive: boolean, masterStoreDead: boolean, masterBeacon: { nodeId: string } | null): string | null {
+  return masterAlive && masterStoreDead && masterBeacon ? masterBeacon.nodeId : null;
+}
+
+/** A phase is running a promote in this parent; an unparked record no phase owns is an orphan of a parent restart. */
+export function promoteInFlight(): boolean {
+  return phasesRunning;
+}
+
+const supersededText = (seen: HolderSighting): string =>
+  `node ${seen.nodeId.slice(0, 8)} has held the fleet at term ${seen.term} since this promote was decided (seen ${new Date(seen.seenAt).toISOString()}, via ${seen.via})`;
+
+/**
+ * Dismisses a record the fleet has moved past. What its restart phase staged
+ * goes with it: a takeover override written at or after its start (phaseRestart
+ * is that shape's only writer) would boot this node as master past the fence
+ * on the next start, with the record that said so gone.
+ */
+function dismissSupersededRecord(record: PromoteRecord): void {
+  invalidateRoleOverrideCache();
+  const staged = readRoleOverride();
+  if (staged?.takeover === true && staged.setAt >= record.startedAt) {
+    clearRoleOverride();
+    console.warn('[Fleet] PROMOTE dismissed: the takeover override its restart phase staged is cleared, so the next start boots this node in its configured role (a master through the fence, a designated backup as a co-worker)');
+  }
+  if (record.phase === 'promote' || record.phase === 'restart') {
+    console.error(`[Fleet] PROMOTE dismissed past its promote phase (${record.mode}, ${record.parked ? 'parked' : 'stopped'} at ${record.phase}: ${record.lastError ?? 'no error recorded'}); this machine's copy may have left recovery and /data/.env may already name it; the manager's replica verdict decides its fate`);
+  }
+  if (record.claimedTerm !== null || record.fencedLsn) {
+    console.error(`[Fleet] PROMOTE dismissed past its claim (${record.mode}, ${record.parked ? 'parked' : 'stopped'} at ${record.phase}: ${record.lastError ?? 'no error recorded'}); its claimed term${record.claimedTerm !== null ? ` ${record.claimedTerm}` : ''} and fence position${record.fencedLsn ? ` ${record.fencedLsn}` : ''} go with it, for a database the lane left read-only; the fleet is on the node that superseded it`);
+  }
+  clearPromoteRecord();
+}
+
+/** The URL a phase fences and claims: the followed database when the record names one, else this node's own canonical URL. */
+async function canonicalForRecord(botManager: BotManager, record: PromoteRecord): Promise<string> {
+  if (!record.canonicalEndpoint) return currentCanonicalUrl();
+  const followed = await readFollowed(botManager);
+  if (followed && stripUrlCredentials(followed.url) === record.canonicalEndpoint) return followed.url;
+  // Past the claim the node no longer follows that database (the claim
+  // deposed it), and its own credentials, persisted at the claim, open it:
+  // one lineage.
+  const own = spliceFleetCredentials(record.canonicalEndpoint).url;
+  if (own) return own;
+  throw new Error(`this node is not following the database this promote was decided on (${record.canonicalEndpoint}) and holds no credentials of its own yet; Continue once the Fleet tab shows it following, or Cancel`);
 }
 
 /**
@@ -117,10 +236,21 @@ function splicedEndpoints(endpoints: ReplicaEndpoints): { local: string; public:
  */
 export async function startPromote(botManager: BotManager, opts: PromoteStartOptions): Promise<PromoteStartResult> {
   const existing = readPromoteRecord();
-  if (existing && existing.phase !== 'done' && !existing.parked) {
+  // Liveness is the engine's (see continuePromote): an unparked record no
+  // phase owns may be replaced like a parked one.
+  const existingIdle = !!existing && (existing.parked || !phasesRunning);
+  if (existing && existing.phase !== 'done' && !existingIdle) {
     return { success: false, error: `a promote is already running (phase ${existing.phase}); wait for it to finish` };
   }
   if (phasesRunning) return { success: false, error: 'a promote is already running; wait for it to finish' };
+  // A record the fleet has moved past is dismissed before anything is decided
+  // over it: Cancel clears it and the takeover its restart phase may have
+  // staged, where a fresh verdict over the same copy would take the
+  // already-promoted shortcut below onto a fleet another node holds.
+  if (existing && existing.phase !== 'done') {
+    const seen = promoteSupersededBy(existing);
+    if (seen) return { success: false, error: `${supersededText(seen)}; Cancel that promote first from this instance's Fleet tab (${existing.phase === 'restart' ? 'it dismisses the record and clears the takeover its restart phase staged' : existing.claimedTerm !== null || existing.fencedLsn ? 'it dismisses the record, discarding this lane\'s claimed term and fence position for a database it left read-only' : 'it dismisses the record'}), then decide again on what is reachable now` };
+  }
   if (!botManager.isRunning()) return { success: false, error: 'Bot is not running; start it before promoting' };
   const stateResult = await botManager.getFleetState();
   const state: any = stateResult?.success ? stateResult.state : null;
@@ -129,19 +259,37 @@ export async function startPromote(botManager: BotManager, opts: PromoteStartOpt
   // A SERVING stand-in may be promoted by hand: it is one of F9's two ruled
   // exits, and the only way a stand-in ever becomes the true master (20.5).
   const servingStandIn = state.role === 'master' && state.standIn?.live === true;
+  // A returning master holding behind its stand-in is eligible by what it IS
+  // (B6 map D8, F28): the node it follows says it stands in for THIS node, so
+  // this node's database is the one behind the fleet's. No env designation
+  // is asked for; once that node stops naming it (promoted by hand, or the
+  // lane ended) there is no failback to run and the plain gate applies.
+  const hold = state.followerHold ?? null;
+  const returningMaster = hold?.namesThisNode === true;
   const refusal = state.role !== 'co-worker' && !servingStandIn ? 'this node is already a master'
-    : state.backupMaster !== true ? 'this node is not the designated backup master (set BOT_NODE_ROLE=backup-master)'
+    : state.backupMaster !== true && !returningMaster ? (
+      hold && hold.namesThisNode === null ? 'this node is the fleet\'s master by configuration and holds behind the node that took the fleet while it was down, but it is not registered with that node yet, so the failback cannot start; wait for the registration, or demote this node to stay a co-worker'
+      : hold ? 'this node is the fleet\'s master by configuration, but the node it follows no longer stands in for it (it was promoted by hand, or the lane ended), so there is no failback to run; demote this node to stay a co-worker, or set BOT_NODE_ROLE=backup-master to make it a designated backup'
+      : 'this node is not the designated backup master (set BOT_NODE_ROLE=backup-master)')
     : state.dataBackend !== 'postgres' ? 'promotion is a postgres-mode feature (file mode has no standby)'
     : state.draining === true ? 'this node is draining; promotion refused'
     : state.migrationWorkActive === true ? 'a migration/transformation is working on this node; wait for it to finish'
     : null;
   if (refusal) return { success: false, error: refusal };
 
+  // The fleet database this promote fences and claims, and the credentials
+  // the local copy takes. A returning master's own URL names ITS database,
+  // the copy that is behind, or nothing at all once the manager retired the
+  // primary's pins; the fleet's is the one it follows.
+  const followed = returningMaster ? await readFollowed(botManager) : null;
+  if (returningMaster && !followed) {
+    return { success: false, error: 'the database the node this one follows delivered is not installed here yet (not dialable from this machine, or its identity did not verify), so the failback cannot fence it; the Fleet tab\'s hold notice says which' };
+  }
   const endpoints = resolveReplicaEndpoints();
   if (!endpoints) {
     return { success: false, error: 'this instance holds no database standby to promote; seed one first (the manager provisions it from the copy block, or provision it by hand), then promote' };
   }
-  const spliced = splicedEndpoints(endpoints);
+  const spliced = splicedEndpoints(endpoints, followed?.url);
   if ('error' in spliced) return { success: false, error: spliced.error };
 
   // Checked HERE, before anything irreversible: the promoted database is
@@ -157,7 +305,9 @@ export async function startPromote(botManager: BotManager, opts: PromoteStartOpt
 
   const probe = await probeReplicaSettled(spliced.local);
   if (!probe.ok) return { success: false, error: `the local database standby is unreachable (${probe.error}); start it, then promote` };
-  const canonical = await canonicalStoreReachable();
+  const canonicalEndpoint = followed ? stripUrlCredentials(followed.url) : null;
+  const canonicalUrl = followed ? followed.url : currentCanonicalUrl();
+  const canonical = canonicalUrl ? await storeReachable(canonicalUrl) : { ok: false, error: 'no CONTROL_STORE_URL/DATA_BACKEND_URL known yet (delivered on the first register)' };
   // With the fleet database dark, the witness is the only thing that can tell a
   // dead master from an unreachable one, and the c3 unlock turns on a fact that
   // flips within seconds. Ask for a reading NOW rather than judging on the
@@ -180,11 +330,15 @@ export async function startPromote(botManager: BotManager, opts: PromoteStartOpt
   let firstPhase: PromoteRecord['phase'];
   let expectedTerm: number | null = null;
   let expectedHolder: string | null = null;
+  let supersededStoreDead: string | null = null;
   if (probe.inRecovery === false) {
     // Retry of an interrupted promote: the database is already ours, so the
     // rest is the repoint and the restart. Never point a fleet that is still
-    // running on ANOTHER live database at this one.
-    if ((canonical.ok || masterAlive) && !canonicalIsOwnReplica(endpoints)) {
+    // running on ANOTHER live database at this one: a master that is alive is
+    // that by itself (the interrupted promote's own master is dead or deposed,
+    // and this node's canonical URL already names this copy once the promote
+    // phase persisted it, so the URL alone cannot tell the two apart).
+    if (masterAlive || (canonical.ok && !canonicalIsOwnReplica(endpoints, canonicalUrl))) {
       return { success: false, error: 'this machine\'s database has already left standby mode, but the fleet is still running on another one; pointing the fleet at this database would split it. Re-seed this machine as a standby, or stop the old master and its database first.' };
     }
     mode = 'failover';
@@ -198,7 +352,10 @@ export async function startPromote(botManager: BotManager, opts: PromoteStartOpt
     // identity check below cannot tell them apart; only its source can.
     if (probe.sourceHost) {
       const creds = loadCredentials();
-      const stores = [currentCanonicalUrl(), creds.DATA_BACKEND_URL, creds.DATA_BACKEND_PUBLIC_URL, creds.DATA_BACKEND_LOCAL_URL]
+      // A returning master's own forms name the database that is BEHIND, so
+      // they are not the fleet's; the forms the stand-in delivered are, and
+      // the copy may follow either of them.
+      const stores = followed ? [canonicalUrl, ...followed.forms] : [canonicalUrl, creds.DATA_BACKEND_URL, creds.DATA_BACKEND_PUBLIC_URL, creds.DATA_BACKEND_LOCAL_URL]
         .map(url => (url || '').trim())
         .filter(url => url !== '');
       if (!sourceMatchesAny({ sourceHost: probe.sourceHost, sourcePort: probe.sourcePort ?? null }, stores)) {
@@ -209,7 +366,6 @@ export async function startPromote(botManager: BotManager, opts: PromoteStartOpt
     // promoted must be one cluster. Without this the promote can fence an
     // unrelated instance (a leftover CONTROL_STORE_URL is enough), leaving the
     // real primary writable while the fleet is repointed at a copy of it.
-    const canonicalUrl = currentCanonicalUrl();
     const [primaryId, standbyId] = await Promise.all([systemIdentifier(canonicalUrl), systemIdentifier(spliced.local)]);
     if (!primaryId || !standbyId) {
       return { success: false, error: 'could not read the cluster identity of the fleet database and this machine\'s copy, so a transfer cannot prove they are the same database; check both endpoints and retry' };
@@ -233,6 +389,13 @@ export async function startPromote(botManager: BotManager, opts: PromoteStartOpt
     mode = 'transfer';
     firstPhase = 'claim';
   } else {
+    // A returning master's own standby copies the database that is BEHIND
+    // (20.19 F7 puts one beside its primary): promoting it would seize the
+    // fleet onto pre-outage data with no refusal. The copy must follow the
+    // database the node it follows delivered, as the transfer branch demands.
+    if (followed && probe.sourceHost && !sourceMatchesAny({ sourceHost: probe.sourceHost, sourcePort: probe.sourcePort ?? null }, [canonicalUrl, ...followed.forms])) {
+      return { success: false, error: `this machine's copy follows ${probe.sourceHost}:${probe.sourcePort ?? 5432}, which is not the fleet database this node follows, so the failback cannot promote it. If the node holding the fleet is gone for good, FLEET_CONFIRM_TAKEOVER=1 on this node plus a restart seizes the fleet back onto this node's own database, losing what that node accepted during the outage` };
+    }
     // A live master whose OWN beacon reports its store unreachable is 20.12's
     // c3: the fleet database really is gone, not merely unreachable from here,
     // and only the master could tell the difference. It cannot be fenced and
@@ -241,6 +404,7 @@ export async function startPromote(botManager: BotManager, opts: PromoteStartOpt
     const now = Date.now();
     const masterBeacon = witnessStatus ? freshMasterClaim(witnessStatus, state.nodeId, now) : null;
     const masterStoreDead = witnessStatus ? masterStoreDeadNow(masterBeacon, witnessStatus, now) : false;
+    supersededStoreDead = c3SupersededPeer(masterAlive, masterStoreDead, masterBeacon);
     if (masterAlive && !masterStoreDead) {
       // A STALLED master needs the opposite remedy from a healthy one, and
       // saying "healthy" would point the operator at stopping a database that
@@ -255,7 +419,10 @@ export async function startPromote(botManager: BotManager, opts: PromoteStartOpt
     const aliveWarning = masterStoreDead
       ? ' The old master\'s bot is still running and reported its own database dead; if that database has recovered since its last beacon, anything it accepted meanwhile stays behind on it.'
       : '';
-    if (opts.confirmLag !== true && (masterStoreDead || (lagMs !== null && lagMs > REPLICA_LAG_PROMOTE_MAX_MS))) {
+    // An unmeasured age is not a small one: a copy that replayed nothing
+    // since it started has an RPO nobody measured, which 20.4 says the
+    // operator confirms (the refusal below already words that case).
+    if (opts.confirmLag !== true && (masterStoreDead || lagMs === null || lagMs > REPLICA_LAG_PROMOTE_MAX_MS)) {
       return {
         success: false,
         needsLagConfirm: true,
@@ -304,9 +471,32 @@ export async function startPromote(botManager: BotManager, opts: PromoteStartOpt
     }).catch(() => null);
   }
 
+  // A node with no database of its own (the manager's re-seed retired every
+  // pin) takes the copy's credentials the moment the failback is decided:
+  // nothing is overwritten, and every later phase, resume and cancel can then
+  // reach the copy without the follow the lane may end.
+  if (followed && currentCanonicalUrl() === '') {
+    const persisted = persistPromotedUrls(spliced.local, spliced.public);
+    if (!persisted.success) return { success: false, error: persisted.error ?? 'could not persist the copy\'s URL' };
+  }
+  // Only a transfer record can hold a landed claim (a failover starts at
+  // 'promote'; the write step's record is written there too).
+  const priorClaim = existing && existingIdle && existing.mode === 'transfer' && existing.phase !== 'done' ? existing : null;
+  // A transfer re-decided over its OWN landed claim resumes that lane rather
+  // than resetting it: the old database is already claimed (and, past the
+  // fence, read-only), so a fresh claim on it can only fail, and the fence
+  // position the catch-up needs lives nowhere but in the parked record.
+  const resume = mode === 'transfer' && expectedHolder === getNodeId() && priorClaim && priorClaim.claimedTerm !== null && priorClaim.canonicalEndpoint === canonicalEndpoint ? priorClaim : null;
+  // The gate above was read before every await of this verdict; a Continue
+  // clicked meanwhile has started the parked lane, and writing over its record
+  // would be undone by its next save while this run silently did nothing.
+  const still = readPromoteRecord();
+  if (phasesRunning || (still && still.phase !== 'done' && (still.parked !== existing?.parked || still.updatedAt !== existing?.updatedAt))) {
+    return { success: false, error: 'a promote is already running or was restarted while this one was being decided; look at its current phase and retry' };
+  }
   clearSuperseded();
   const record: PromoteRecord = {
-    phase: firstPhase,
+    phase: resume ? resume.phase : firstPhase,
     mode,
     startedAt: Date.now(),
     updatedAt: Date.now(),
@@ -314,17 +504,22 @@ export async function startPromote(botManager: BotManager, opts: PromoteStartOpt
     lastError: null,
     startedBy: opts.startedBy === 'manager-promote' ? 'manager-promote' : 'webui-promote',
     retireOldMaster: opts.retireOldMaster === true,
-    supersededNodeId: expectedHolder,
-    supersededTerm: expectedTerm,
-    supersededDelivered: false,
+    // A term row that already names this node is this node's OWN landed claim
+    // (the record parked past it, or its acknowledgement was lost), not a
+    // holder to supersede: the parked record carries the real one.
+    supersededNodeId: expectedHolder && expectedHolder !== getNodeId() ? expectedHolder : priorClaim?.supersededNodeId ?? null,
+    supersededTerm: expectedHolder && expectedHolder !== getNodeId() ? expectedTerm : priorClaim?.supersededTerm ?? null,
+    supersededDelivered: resume ? resume.supersededDelivered : false,
     expectedTerm,
     expectedHolder,
-    claimedTerm: null,
-    fencedLsn: null,
+    supersededStoreDead,
+    claimedTerm: resume?.claimedTerm ?? null,
+    fencedLsn: resume?.fencedLsn ?? null,
     lagMs,
+    canonicalEndpoint,
   };
   writePromoteRecord(record);
-  console.warn(`[Fleet] PROMOTE started (${mode}): phase ${firstPhase}${record.retireOldMaster ? ', old master to be retired' : ''}`);
+  console.warn(`[Fleet] PROMOTE started (${mode}): ${resume ? 'resumed at' : 'phase'} ${record.phase}${record.retireOldMaster ? ', old master to be retired' : ''}`);
   void runPhases(botManager, record, spliced);
   return { success: true, record };
 }
@@ -382,14 +577,18 @@ export async function startStandInWrites(botManager: BotManager, req: StandInWri
     lastError: null,
     startedBy: 'stand-in',
     retireOldMaster: false,
-    supersededNodeId: req.coveringNodeId,
-    supersededTerm: req.inheritedTerm,
+    // A stand-in supersedes nobody (20.5, F8: a partial takeover): the covered
+    // master registering here for the failback must not be told to retire.
+    supersededNodeId: null,
+    supersededTerm: null,
     supersededDelivered: false,
     expectedTerm: null,
     expectedHolder: null,
+    supersededStoreDead: null,
     claimedTerm: null,
     fencedLsn: null,
     lagMs: probe.replayAgeMs ?? null,
+    canonicalEndpoint: null,
   };
   writePromoteRecord(record);
   console.warn(`[Fleet] STAND-IN WRITE STEP started for ${req.coveringNodeId.slice(0, 8)} (held to ${req.heldToLsn ?? 'unknown'}): promoting this machine's copy`);
@@ -415,8 +614,10 @@ export async function continuePromote(botManager: BotManager): Promise<{ success
   const record = readPromoteRecord();
   if (!record) return { success: false, error: 'no promote to continue' };
   if (record.phase === 'done') return { success: false, error: 'the last promote already finished' };
-  if (!record.parked) return { success: false, error: `the promote is running (phase ${record.phase})` };
-  if (phasesRunning) return { success: false, error: 'a promote is already running' };
+  // Liveness is the engine's, not the record's: an unparked record no phase
+  // owns (a parent restart in safe mode, a resume that could not start) is
+  // continued like a parked one.
+  if (phasesRunning) return { success: false, error: record.parked ? 'a promote is already running' : `the promote is running (phase ${record.phase})` };
   // Checked BEFORE the phases run, because the promote phase's first act is
   // pg_promote: a guard in the restart phase alone would let a Continue on a
   // demoted or stepped-down stand-in take its copy out of recovery and only
@@ -424,15 +625,47 @@ export async function continuePromote(botManager: BotManager): Promise<{ success
   if (record.mode === 'stand-in' && !standInLaneLive()) {
     return { success: false, error: `the stand-in lane no longer asks for the writes (${describeStandInLane()}), so this write step cannot continue; Cancel it, and re-seed this machine as a standby if its copy has left recovery` };
   }
+  // A record from before the hold this node is in names no database the node
+  // follows; its restart phase would write a takeover override and boot this
+  // node as master on its own stale database, past the fence.
+  // An unreadable or still-initializing child is unknown, never "no hold":
+  // the restart phase stages a takeover override that boots this node as
+  // master past the fence, so the phases run only on a child that answered.
+  if (record.mode !== 'stand-in') {
+    const seen = promoteSupersededBy(record);
+    if (seen) {
+      return { success: false, error: `${supersededText(seen)}, so continuing it would restart this node as master past the fence onto a fleet that node holds; Cancel it, and Promote again on what is reachable now` };
+    }
+    const child = await readChildState(botManager);
+    if (child?.park && child.park.at >= record.startedAt) {
+      return { success: false, error: `the boot is parked on a live holder (${child.park.peerUrl} answers at term ${child.park.observedTerm}) since this promote was decided, and the park is terminal: its takeover restart is what the fence parks. Cancel this promote (it dismisses the record and clears any takeover it staged) and demote this node from the Fleet tab; to seize the fleet deliberately instead, leave this promote on record and set FLEET_CONFIRM_TAKEOVER=1 plus a restart (the override it staged is what puts this node on the master path where that confirm is read)` };
+    }
+    if (!child || !child.initialized) {
+      return { success: false, error: `the bot is not running or still initializing, so this node's fleet state cannot be read; start it and let it initialize, then Continue (${record.phase === 'restart' ? 'a takeover override this promote staged boots the node as master by itself' : 'the gates that protect the takeover restart need its fleet state'})` };
+    }
+    if (child.hold && !recordOfHold(record, child.hold)) {
+      return { success: false, error: 'this promote predates the follower hold this node is in (it names no database the node follows), so continuing it would restart this node as master on its own stale database; Cancel it, and use Promote on the Returning master card for the failback' };
+    }
+  }
   const endpoints = resolveReplicaEndpoints();
   if (!endpoints) return { success: false, error: 'this instance no longer reports a database standby' };
-  const spliced = splicedEndpoints(endpoints);
-  if ('error' in spliced) return { success: false, error: spliced.error };
-  record.parked = false;
-  record.lastError = null;
-  writePromoteRecord(record);
-  void runPhases(botManager, record, spliced);
-  return { success: true, record };
+  const base = record.canonicalEndpoint ? (await readFollowed(botManager))?.url : undefined;
+  const spliced = splicedEndpoints(endpoints, base);
+  if ('error' in spliced) {
+    return { success: false, error: record.canonicalEndpoint ? 'this node is not following the database this promote was decided on and holds no credentials of its own yet; Continue once the Fleet tab shows it following' : spliced.error };
+  }
+  // Re-read after the awaits above, as every cancel branch does: a Cancel that
+  // cleared the record meanwhile, or a Promote that replaced it, must not be
+  // undone by writing this snapshot back and running its phases.
+  const moved = readPromoteRecord();
+  if (phasesRunning || !moved || moved.parked !== record.parked || moved.startedAt !== record.startedAt || moved.updatedAt !== record.updatedAt) {
+    return { success: false, error: 'the promote changed while the continue was being checked; look at its current phase and retry' };
+  }
+  moved.parked = false;
+  moved.lastError = null;
+  writePromoteRecord(moved);
+  void runPhases(botManager, moved, spliced);
+  return { success: true, record: moved };
 }
 
 /**
@@ -441,14 +674,92 @@ export async function continuePromote(botManager: BotManager): Promise<{ success
  * record being cleared. Past the claim the old master is already deposed and
  * the only safe direction is forward.
  */
-export async function cancelPromote(): Promise<{ success: boolean; error?: string }> {
+export async function cancelPromote(botManager?: BotManager): Promise<{ success: boolean; error?: string }> {
   const record = readPromoteRecord();
   if (!record) return { success: false, error: 'no promote to cancel' };
-  // A parked claim never landed (the phase advances only on success), so it is
-  // the one point where nothing has happened yet. Past it the record is the
-  // only carrier of the superseded and retire facts and the role override is
-  // staged, so dismissing it would strand both: Continue is the way forward.
-  if (record.phase === 'done' || (record.parked && record.phase === 'claim')) {
+  // Liveness is the engine's, not the record's (see continuePromote).
+  const idle = record.parked || !phasesRunning;
+  // Held by another node since it was decided: nothing it could still do is
+  // safe (its restart phase is a takeover past the fence) and the fleet is that
+  // node's. Dismissed whatever its phase, from the persisted sighting, so it
+  // needs no running child.
+  if (record.mode !== 'stand-in' && idle && promoteSupersededBy(record)) {
+    dismissSupersededRecord(record);
+    return { success: true };
+  }
+  // A record from before the follower hold this node is in has nothing left
+  // pending: the node is no longer the master it was, and the only thing
+  // continuing it could do is the takeover restart above. Dismissed whatever
+  // its phase.
+  if (botManager && record.mode !== 'stand-in' && idle) {
+    const child = await readChildState(botManager);
+    // A boot parked on a live holder since this record was decided is evidence
+    // the sighting cannot carry (a holder already sighted at that term is the
+    // same holding): a foreign node answers at or above this node's term, so
+    // the record's one remaining act, the takeover restart, is what the fence
+    // parks. Judged ahead of the initialized gate, because a park never
+    // initializes.
+    if (child?.park && child.park.at >= record.startedAt) {
+      const moved = readPromoteRecord();
+      if (phasesRunning || !moved || moved.parked !== record.parked || moved.startedAt !== record.startedAt || moved.updatedAt !== record.updatedAt) {
+        return { success: false, error: 'the promote changed while the cancel was being checked; look at its current phase and retry' };
+      }
+      dismissSupersededRecord(record);
+      return { success: true };
+    }
+    if (child?.initialized && child.hold && !recordOfHold(record, child.hold)) {
+      // Re-read after the await, as every cancel branch does.
+      const moved = readPromoteRecord();
+      if (phasesRunning || !moved || moved.parked !== record.parked || moved.startedAt !== record.startedAt || moved.updatedAt !== record.updatedAt) {
+        return { success: false, error: 'the promote changed while the cancel was being checked; look at its current phase and retry' };
+      }
+      dismissSupersededRecord(record);
+      return { success: true };
+    }
+  }
+  // A parked claim whose term never landed is the one point where nothing has
+  // happened yet (claimedTerm is written only after the COMMIT, so the phase
+  // alone cannot say). Past it the record is the only carrier of the
+  // superseded and retire facts and the role override is staged, so
+  // dismissing it would strand both: Continue is the way forward.
+  if (record.phase === 'done') {
+    clearPromoteRecord();
+    return { success: true };
+  }
+  if (idle && record.phase === 'claim' && record.claimedTerm === null) {
+    // A null claimedTerm is not proof the COMMIT never landed (a lost
+    // acknowledgement leaves it null too), so the row itself is asked: one
+    // that names this node, or cannot be read, refuses.
+    const url = record.canonicalEndpoint ? spliceFleetCredentials(record.canonicalEndpoint).url ?? '' : currentCanonicalUrl();
+    const row = url ? await readTermRow(url) : null;
+    // Re-read after the await, as the branches below do: a Continue clicked
+    // meanwhile has restarted the phases, and clearing under them would only
+    // be undone by their next save.
+    // ANY intervening write refuses, not only a new record: a Continue that ran
+    // and re-parked keeps startedAt, and the row read above may predate its
+    // COMMIT (stale in the permissive direction).
+    const moved = readPromoteRecord();
+    if (phasesRunning || !moved || moved.parked !== record.parked || moved.startedAt !== record.startedAt || moved.updatedAt !== record.updatedAt || moved.claimedTerm !== null) {
+      return { success: false, error: 'the promote changed while the cancel was being checked; look at its current phase and retry' };
+    }
+    if (!row) return { success: false, error: 'the fleet database\'s term row cannot be read right now, so this cancel cannot prove the claim never landed; Continue the promote, retry once it answers, or press Promote to decide again on what is reachable now (with that database gone for good this takes the failover path, behind the data-loss confirm)' };
+    if (row.nodeId === getNodeId()) return { success: false, error: 'the claim landed (the fleet database\'s term row names this node), so the promote is past the point of cancellation; Continue it instead' };
+    clearPromoteRecord();
+    return { success: true };
+  }
+  // A failover parked before its copy left recovery took no irreversible step
+  // either; an unreadable copy is not a yes.
+  if (record.mode === 'failover' && idle && record.phase === 'promote') {
+    const endpoints = resolveReplicaEndpoints();
+    const spliced = endpoints ? splicedEndpoints(endpoints) : { error: 'no standby endpoint' };
+    const copy = 'error' in spliced ? null : await probeReplica(spliced.local);
+    const again = readPromoteRecord();
+    if (phasesRunning || !again || again.parked !== record.parked || again.startedAt !== record.startedAt) {
+      return { success: false, error: 'the promote changed while the cancel was being checked; look at its current phase and retry' };
+    }
+    if (!copy || !copy.ok || copy.inRecovery !== true) {
+      return { success: false, error: `this machine's copy ${copy && copy.ok ? 'has already left recovery' : 'cannot be read right now'}; Continue the promote instead` };
+    }
     clearPromoteRecord();
     return { success: true };
   }
@@ -456,7 +767,7 @@ export async function cancelPromote(): Promise<{ success: boolean; error?: strin
   // the override is written by its restart phase and the covered master rides
   // the arm record. Dismissing it hands the lane back its refusal spacing, and
   // manual promote stays open.
-  if (record.mode === 'stand-in' && record.parked) {
+  if (record.mode === 'stand-in' && idle) {
     // Allowed while the copy is still a standby, or once the lane has ENDED
     // (the stand-in stepped down or was disarmed: the copy's fate is then the
     // manager's re-seed or adopt, and the record has nothing left to stage).
@@ -473,7 +784,7 @@ export async function cancelPromote(): Promise<{ success: boolean; error?: strin
     // has restarted the phases, and clearing under them would only be undone
     // by their next save.
     const again = readPromoteRecord();
-    if (phasesRunning || !again || !again.parked || again.startedAt !== record.startedAt) {
+    if (phasesRunning || !again || again.parked !== record.parked || again.startedAt !== record.startedAt) {
       return { success: false, error: 'the promote changed while the cancel was being checked; look at its current phase and retry' };
     }
     if (laneEnded) {
@@ -528,10 +839,57 @@ export async function resumePromote(botManager: BotManager): Promise<void> {
       return;
     }
   }
+  // Another node has held the fleet since this record was decided (the child
+  // saw it while the lane ran, or while the parent was down): its remaining
+  // phases end in the takeover restart, so it is parked instead, judged
+  // BEFORE the restart shortcut below. A boot that really took the fleet
+  // cleared the sighting first, so a finished restart still reads as done;
+  // one the boot refused (the same sighting) keeps its record for Cancel.
+  const seen = promoteSupersededBy(record);
+  if (seen) {
+    record.parked = true;
+    record.lastError = `${supersededText(seen)}; its takeover restart would seize the fleet from that node, so it is parked: Cancel it, and Promote again on what is reachable now`;
+    writePromoteRecord(record);
+    console.error(`[Fleet] PROMOTE parked at resume: ${record.lastError}`);
+    return;
+  }
+  // A restart phase the parent died inside: phaseRestart is the only writer
+  // of a master override at or after this record's start, so one present
+  // means the boot the parent's own start just forked takes it (staged) or
+  // already took it (consumed), and the record is finished. Without it the
+  // takeover was never staged, and running it blind would boot this node as
+  // master past the fence: parked for the operator, and a follower hold
+  // refuses the Continue.
+  if (record.mode !== 'stand-in' && record.phase === 'restart') {
+    invalidateRoleOverrideCache();
+    const override = readRoleOverride();
+    if (override?.role === 'master' && override.setAt >= record.startedAt) {
+      record.phase = 'done';
+      writePromoteRecord(record);
+      console.warn('[Fleet] PROMOTE complete: the restart it was interrupted in has already taken');
+      return;
+    }
+    record.parked = true;
+    record.lastError = 'the parent restarted inside the restart phase; Continue re-runs the takeover restart, which skips the boot fence, so continue only if this node still holds the fleet\'s newest data';
+    writePromoteRecord(record);
+    console.error(`[Fleet] PROMOTE parked at resume: ${record.lastError}`);
+    return;
+  }
   const endpoints = resolveReplicaEndpoints();
   if (!endpoints) return;
-  const spliced = splicedEndpoints(endpoints);
-  if ('error' in spliced) return;
+  // The child's follow is the preferred credential source; past the claim
+  // the node's own credentials, persisted there, carry every later phase, so
+  // a node that no longer follows (the claim deposed that database) finishes.
+  const followed = record.canonicalEndpoint && botManager.isRunning() ? await readFollowed(botManager) : null;
+  const spliced = splicedEndpoints(endpoints, followed?.url);
+  if ('error' in spliced) {
+    if (!record.canonicalEndpoint) return;
+    record.parked = true;
+    record.lastError = 'the parent restarted before this promote had persisted the copy\'s credentials, and the bot is not following the database it was decided on; Continue once the Fleet tab shows it following, or Cancel';
+    writePromoteRecord(record);
+    console.error(`[Fleet] PROMOTE parked at resume: ${record.lastError}`);
+    return;
+  }
   console.warn(`[Fleet] Resuming the interrupted promote at phase ${record.phase}`);
   void runPhases(botManager, record, spliced);
 }
@@ -546,11 +904,11 @@ async function runPhases(botManager: BotManager, record: PromoteRecord, spliced:
         switch (record.phase) {
           case 'verdict':
           case 'claim':
-            await phaseClaim(record);
+            await phaseClaim(botManager, record, spliced);
             record.phase = 'fence';
             break;
           case 'fence':
-            await phaseFence(record);
+            await phaseFence(botManager, record);
             record.phase = 'catchup';
             break;
           case 'catchup':
@@ -562,6 +920,13 @@ async function runPhases(botManager: BotManager, record: PromoteRecord, spliced:
             // lane that ends while an earlier phase of this run is executing.
             if (record.mode === 'stand-in' && !standInLaneLive()) {
               throw new Error(`the stand-in lane stopped asking for the writes before the copy was promoted (${describeStandInLane()}); Cancel this step`);
+            }
+            // Judged here too, ahead of the irreversible step: the sighting can
+            // land while the catch-up runs, and pg_promote is what a park at
+            // the restart phase can no longer undo.
+            if (record.mode !== 'stand-in') {
+              const seen = promoteSupersededBy(record);
+              if (seen) throw new Error(`${supersededText(seen)}; the copy is left a standby${record.claimedTerm !== null || record.fencedLsn ? `, but this lane already claimed term ${record.claimedTerm ?? '?'} on ${record.canonicalEndpoint ?? 'the fleet database'} and left it read-only${record.fencedLsn ? ` at ${record.fencedLsn}` : ''}, and a Cancel discards those facts` : ', so nothing here is spent'}: Cancel this promote, and Promote again on what is reachable now`);
             }
             await phasePromote(spliced);
             record.phase = 'restart';
@@ -596,8 +961,8 @@ async function runPhases(botManager: BotManager, record: PromoteRecord, spliced:
  * checked against what the verdict saw, so a second promote racing this one
  * parks instead of stacking a second claim nothing can distinguish.
  */
-async function phaseClaim(record: PromoteRecord): Promise<void> {
-  const url = currentCanonicalUrl();
+async function phaseClaim(botManager: BotManager, record: PromoteRecord, spliced: { local: string; public: string }): Promise<void> {
+  const url = await canonicalForRecord(botManager, record);
   if (!url) throw new Error('no fleet database URL is known on this node');
   const nodeId = getNodeId();
   await withClient(url, async client => {
@@ -637,6 +1002,14 @@ async function phaseClaim(record: PromoteRecord): Promise<void> {
       throw error;
     }
   });
+  // A returning master's point of no return: the claim deposed the database
+  // it followed, so from here its own credentials (one lineage's) open that
+  // database and its copy; written now so a restart of either process can
+  // finish without the follow the claim ended.
+  if (record.canonicalEndpoint) {
+    const persisted = persistPromotedUrls(spliced.local, spliced.public);
+    if (!persisted.success) throw new Error(persisted.error ?? 'could not persist the copy\'s URL after the claim');
+  }
   console.warn(`[Fleet] PROMOTE claim: term ${record.claimedTerm} taken on the old master's database (held by ${record.supersededNodeId?.slice(0, 8) ?? 'nobody'} at term ${record.supersededTerm ?? 0})`);
 }
 
@@ -646,8 +1019,8 @@ async function phaseClaim(record: PromoteRecord): Promise<void> {
  * exactly this position; every later client write is refused loudly instead
  * of silently lost.
  */
-async function phaseFence(record: PromoteRecord): Promise<void> {
-  const url = currentCanonicalUrl();
+async function phaseFence(botManager: BotManager, record: PromoteRecord): Promise<void> {
+  const url = await canonicalForRecord(botManager, record);
   if (!url) throw new Error('no fleet database URL is known on this node');
   await withClient(url, async client => {
     await client.query(`ALTER SYSTEM SET default_transaction_read_only = on`);
@@ -719,10 +1092,16 @@ async function phaseRestart(botManager: BotManager, record: PromoteRecord): Prom
     // too: a lane that ended earlier (a demote, a step-down) leaves a record
     // that says the copy may hold writes nothing else has, and this promote
     // is what makes them the fleet's for good.
+    // Judged here too, not only at Continue: the sighting can arrive while the
+    // earlier phases run (the child registers with a master that took the fleet
+    // meanwhile), and this is the last point before the fence is skipped.
+    const seen = promoteSupersededBy(record);
+    if (seen) throw new Error(`${supersededText(seen)}; the takeover restart is not staged. This machine's copy has already left recovery and /data/.env names it${record.claimedTerm !== null ? `, and this lane claimed term ${record.claimedTerm} on ${record.canonicalEndpoint ?? 'the fleet database'}` : ''}${record.fencedLsn ? ` and left it read-only at ${record.fencedLsn}` : ''}, so there is no Promote left to run here: Cancel this promote, then re-seed this machine as a standby of the node that took the fleet and promote it once it has caught up, or demote this node to stay a co-worker; if that node is gone for good, Cancel this promote and, where this node's Fleet tab still offers Promote (a designated backup, or a hold that still names this node), press it again (this copy is already out of recovery, so the lane left is the repoint and the restart); otherwise seize the fleet onto this copy with FLEET_CONFIRM_TAKEOVER=1 plus a restart on a node whose configured role is master`);
     writeRoleOverride({
       role: 'master',
       takeover: true,
       ...(record.mode === 'failover' ? { chainTakeover: true } : {}),
+      ...(record.supersededStoreDead ? { supersededStoreDead: record.supersededStoreDead } : {}),
       setAt: Date.now(),
       setBy: record.startedBy,
     });

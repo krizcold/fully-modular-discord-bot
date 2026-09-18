@@ -53,22 +53,42 @@ export async function runDemote(
       state = result?.success ? result.state : null;
     }
     if (state && state.initialized) {
-      const refusal = state.role !== 'master' ? 'this node is not a master'
+      // A follower hold runs the co-worker runtime under a master identity
+      // (B6 map F28): the boot enters it from the master path alone, so the
+      // hold IS that identity whatever the override file says now (a demote
+      // whose restart failed has already written co-worker; a designated
+      // backup's staged takeover may have been cleared by a Cancel). Demote
+      // is the hold's exit.
+      const identityRole = state.followerHold ? 'master' : state.role;
+      const refusal = identityRole !== 'master' ? 'this node is not a master'
         : state.standalone === true ? 'a standalone master has no fleet to rejoin; demotion is meaningless here'
         : (!Array.isArray(state.masterUrls) || state.masterUrls.length === 0)
           ? 'no master candidates configured (set MASTER_URLS first, or the demoted node would idle)'
         : null;
       if (refusal) return { success: false, error: refusal };
       const successor = state.witness ? freshMasterClaim(state.witness, state.nodeId, Date.now()) : null;
-      if (!successor && !state.superseded && !readSuperseded() && !confirm) {
+      // A follower hold is a visible holder too: the node it follows is the
+      // coordinator, and this node coordinates nobody, so its demote freezes
+      // nothing.
+      if (!successor && !state.followerHold && !state.superseded && !readSuperseded() && !confirm) {
         return {
           success: false,
           needsConfirm: true,
-          error: 'No other master is visible from this node. Demoting now freezes the fleet: workers lose their coordinator within 45s and drop their sessions, and the bot shows offline until a backup is promoted; the true database stays on this machine, untouched. Safe order to retire this machine: demote, promote the backup while this database is still reachable (zero loss), then remove the machine. Promoting after the machine is gone takes the RPO path instead.',
+          error: 'No other master is visible from this node. Demoting now freezes the fleet: workers lose their coordinator within 45s and drop their sessions, and the bot shows offline until a backup is promoted; the true database stays on this machine, untouched. Safe order to retire this machine: demote, promote the backup while this database is still reachable (zero loss), then remove the machine. Promoting after the machine is gone takes the RPO path instead. Demote anyway (the fleet stays under maintenance until a backup is promoted)?',
+        };
+      }
+      // A hold that has never known its holder: demoting spends this node's
+      // master identity, and with it the FLEET_CONFIRM_TAKEOVER route the hold
+      // banner names for a holder gone for good (only a master boot reads it).
+      if (state.followerHold && state.followerHold.namesThisNode !== true && state.masterKnown !== true && !confirm) {
+        return {
+          success: false,
+          needsConfirm: true,
+          error: `This node holds as a follower but has not registered with the node it follows, so nothing is known of that node yet. Demoting spends this node's master identity: it rejoins as a co-worker once a master answers${state.followerHold.reason === 'behind' ? ', and the FLEET_CONFIRM_TAKEOVER route back onto this database closes with it (a master boot is what reads that confirm)' : ', and with it the failback that would promote this copy back; nothing on this database can be seized while it is a copy'}. Demote anyway?`,
         };
       }
     } else if (running
-      && !(state && (state.takeoverHold || state.staleMasterPark || state.emptyStoreHold || (state.standIn?.live && state.standIn.writeGate)))
+      && !(state && (state.takeoverHold || state.staleMasterPark || state.followerHold || state.emptyStoreHold || (state.standIn?.live && state.standIn.writeGate)))
       && !confirm) {
       // Genuine early boot with no known hold: seconds away from real state.
       // Any OTHER stall that never reaches initialization (a control store whose
@@ -78,11 +98,16 @@ export async function runDemote(
       return {
         success: false,
         needsConfirm: true,
-        error: 'The bot has not finished initializing, so its role cannot be read from the running process. If it has been stuck longer than a boot should take, demote it anyway: the next start comes up as a co-worker.',
+        error: 'The bot has not finished initializing, so its role cannot be read from the running process. If it has been stuck longer than a boot should take, demote it anyway: the next start comes up as a co-worker. Demote anyway?',
       };
     } else {
-      // Guard-held boot or a downed child: parent-side prechecks.
-      const refusal = resolveNodeRole() !== 'master' ? 'this node is not a master'
+      // Guard-held boot or a downed child: parent-side prechecks. A child
+      // reporting a master-path hold IS on the master path by construction,
+      // whatever the override file resolves to now: a designated backup whose
+      // only master identity was a staged takeover that a Cancel has since
+      // cleared still needs the demote as the park's exit.
+      const heldMasterBoot = !!(state && (state.takeoverHold || state.staleMasterPark || state.followerHold || state.emptyStoreHold));
+      const refusal = !heldMasterBoot && resolveNodeRole() !== 'master' ? 'this node is not a master'
         : isStandalone() ? 'a standalone master has no fleet to rejoin; demotion is meaningless here'
         : effectiveMasterUrls().urls.length === 0 ? 'no master candidates configured (set MASTER_URLS or the fleet config first, or the demoted node would idle)'
         : null;

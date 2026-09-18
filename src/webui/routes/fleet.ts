@@ -7,7 +7,7 @@ import { BotManager } from '../botManager';
 import { readPromoteRecord } from '../../bot/internalSetup/fleet/promoteRecord';
 import { writeFreshFleetConfirm } from '../../bot/internalSetup/fleet/stepDown';
 import { runDemote } from '../lifecycleActions';
-import { cancelPromote, continuePromote, startPromote } from '../promoteEngine';
+import { cancelPromote, continuePromote, promoteInFlight, promoteSupersededBy, startPromote } from '../promoteEngine';
 
 export function createFleetRoutes(botManager: BotManager): Router {
   const router = Router();
@@ -21,20 +21,25 @@ export function createFleetRoutes(botManager: BotManager): Router {
     // The promote record is parent-owned and outlives the child (the restart
     // phase runs while the child is down), so it rides beside the child state.
     const promote = readPromoteRecord();
+    // Parent-side too: whether another node has held the fleet since the
+    // record was decided (the tab offers Cancel on it, child or no child), and
+    // whether a phase is running it in this parent.
+    const promoteHeldBy = promote ? promoteSupersededBy(promote) : null;
+    const promoteRunning = promoteInFlight();
     try {
       if (!botManager.isRunning()) {
-        res.json({ success: true, running: false, initialized: false, promote });
+        res.json({ success: true, running: false, initialized: false, promote, promoteHeldBy, promoteRunning });
         return;
       }
       const result = await botManager.getFleetState();
       if (!result?.success || !result.state) {
-        res.json({ success: true, running: true, initialized: false, promote });
+        res.json({ success: true, running: true, initialized: false, promote, promoteHeldBy, promoteRunning });
         return;
       }
-      res.json({ success: true, running: true, ...result.state, promote });
+      res.json({ success: true, running: true, ...result.state, promote, promoteHeldBy, promoteRunning });
     } catch (error) {
       console.error('[Fleet] Failed to get fleet state:', error instanceof Error ? error.message : error);
-      res.json({ success: true, running: botManager.isRunning(), initialized: false, promote });
+      res.json({ success: true, running: botManager.isRunning(), initialized: false, promote, promoteHeldBy, promoteRunning });
     }
   });
 
@@ -343,7 +348,7 @@ export function createFleetRoutes(botManager: BotManager): Router {
 
   /** POST /api/fleet/promote/cancel: clear a promote that has not passed the point of no return. */
   router.post('/promote/cancel', async (_req: Request, res: Response) => {
-    res.json(await cancelPromote());
+    res.json(await cancelPromote(botManager));
   });
 
   /**

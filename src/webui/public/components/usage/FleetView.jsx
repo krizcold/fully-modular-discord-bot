@@ -1111,7 +1111,15 @@ function FleetPromoteCard({ api, fleet, reload }) {
   const masterDown = !fleet.masterKnown;
   const pair = fleet.dbReplica === true;
   const record = fleet.promote;
-  const active = !!(record && record.phase !== 'done');
+  // A claim parked before its term landed hides nothing: startPromote re-runs
+  // the whole verdict over a parked record and the claim is idempotent, so
+  // pressing Promote again is the forward exit when Cancel cannot prove the
+  // claim never landed (a dead canonical reads the same as a lost one).
+  // The engine's liveness: an unparked record no phase runs is idle too. A
+  // record the fleet has moved past keeps hiding the buttons: its card names
+  // Cancel, and the engine refuses a new verdict over it until then.
+  const recordIdle = !!(record && (record.parked || fleet.promoteRunning === false));
+  const active = !!(record && record.phase !== 'done' && !(recordIdle && record.phase === 'claim' && !record.claimedTerm && !fleet.promoteHeldBy));
   // The backup order (20.9) as ADVICE: a higher-ranked backup whose beacon is
   // fresh is the preferred stand-in; the click stays the operator's.
   const order = [...((fleet.fleetConfig && fleet.fleetConfig.backupDesignations) || [])].sort((a, b) => a.priority - b.priority);
@@ -1141,8 +1149,10 @@ function FleetPromoteCard({ api, fleet, reload }) {
     const attempt = (body) => post(body).then((res) => {
       if (!res || res.success !== false) return res;
       if (res.needsLagConfirm && !body.confirmLag) {
-        const behind = res.lagMs != null ? Math.round(res.lagMs / 1000) + 's' : 'an unknown amount of time';
-        if (!confirm(`Nothing answers on the old master or its database, and this machine's copy last replayed a transaction ${behind} ago.\n\nPromoting makes that copy the fleet database, so anything the old one accepted after that point is LOST. Continue?`)) return null;
+        const replayed = res.lagMs != null
+          ? `this machine's copy last replayed a transaction ${Math.round(res.lagMs / 1000)}s ago`
+          : 'this machine\'s copy has replayed nothing since it started, so how far behind it is cannot be measured';
+        if (!confirm(`${res.error || `Nothing answers on the old master or its database, and ${replayed}.`}\n\nPromoting makes that copy the fleet database, so anything the old one accepted after that point is LOST. Continue?`)) return null;
         return attempt({ ...body, confirmLag: true });
       }
       if (res.needsLineageConfirm && !body.confirmLineage) {
@@ -1166,7 +1176,7 @@ function FleetPromoteCard({ api, fleet, reload }) {
   };
   return (
     <div className="usage-stat-card" style={{ marginTop: '10px' }}>
-      <div className="usage-stat-title">Backup master</div>
+      <div className="usage-stat-title">{fleet.followerHold ? 'Returning master' : 'Backup master'}</div>
       <div className="usage-stat-sub">
         This instance takes over only when you press a button here: bot and database together, one action.
       </div>
@@ -1215,7 +1225,7 @@ const PROMOTE_PHASE_TEXT = {
 
 // The promote record rides beside the fleet state from the parent, so it stays
 // visible while the bot child restarts; a parked phase offers Continue.
-function FleetPromoteRecord({ api, fleet, reload }) {
+function FleetPromoteRecord({ api, fleet, reload, readOnly = false }) {
   const [busy, setBusy] = React.useState(false);
   const r = fleet.promote;
   if (!r) return null;
@@ -1231,16 +1241,38 @@ function FleetPromoteRecord({ api, fleet, reload }) {
       .catch((err) => showToast((err && err.message) || 'Failed', 'error'))
       .finally(() => { setBusy(false); reload(); });
   };
+  // The engine's liveness: an unparked record no phase runs (the parent
+  // restarted without resuming it) keeps its exits like a parked one.
+  const idle = r.parked || fleet.promoteRunning === false;
+  // Another node has held the fleet since this record was decided: the engine
+  // refuses Continue and dismisses on Cancel, from a fact that needs no child.
+  const heldBy = fleet.promoteHeldBy || null;
+  // A boot parked on a live holder since this record was decided: the engine
+  // dismisses on Cancel from the park view, and Continue can only refuse.
+  const parkedSince = r.mode !== 'stand-in' && fleet.staleMasterPark && fleet.staleMasterPark.at >= r.startedAt ? fleet.staleMasterPark : null;
+  const cancellable = !!heldBy || !!parkedSince || (r.phase === 'claim' && !r.claimedTerm) || (r.mode === 'failover' && r.phase === 'promote') || r.mode === 'stand-in';
   return (
-    <div className="usage-stat-card" style={{ marginTop: '10px', borderColor: r.parked ? '#e5534b' : undefined }}>
-      <div className="usage-stat-title">{`Promote (${r.mode}): ${PROMOTE_PHASE_TEXT[r.phase] || r.phase}${r.parked ? ' · PARKED' : ''}`}</div>
+    <div className="usage-stat-card" style={{ marginTop: '10px', borderColor: idle && r.phase !== 'done' ? '#e5534b' : undefined }}>
+      <div className="usage-stat-title">{`Promote (${r.mode}): ${PROMOTE_PHASE_TEXT[r.phase] || r.phase}${r.parked ? ' · PARKED' : idle && r.phase !== 'done' ? ' · STOPPED' : ''}`}</div>
       {r.lastError ? <div className="usage-stat-sub" style={{ color: '#ed4245' }}>{r.lastError}</div> : null}
       {r.fencedLsn ? <div className="usage-stat-sub">{`Old database fenced at ${r.fencedLsn}`}</div> : null}
-      {r.parked ? (
+      {heldBy ? (
+        <div className="usage-stat-sub" style={{ color: '#ed4245' }}>{`Node ${heldBy.nodeId.slice(0, 8)} has held the fleet at term ${heldBy.term} since this promote was decided, so continuing it would restart this node as master past the fence${idle ? ': Continue is refused and Cancel dismisses it.' : '; the running phases will refuse to stage the takeover restart and park with that reason, and Cancel then dismisses it.'}`}</div>
+      ) : null}
+      {parkedSince ? (
+        <div className="usage-stat-sub" style={{ color: '#ed4245' }}>{`The boot is parked on a live holder (${parkedSince.peerUrl} answers at term ${parkedSince.observedTerm}) since this promote was decided, so its takeover restart is what the fence parks: Cancel dismisses it and clears any takeover it staged.`}</div>
+      ) : null}
+      {!r.parked && idle && r.phase !== 'done' ? (
+        <div className="usage-stat-sub" style={{ marginTop: '6px' }}>No phase is running this promote (the parent restarted without resuming it); Continue re-enters it at its recorded phase.</div>
+      ) : null}
+      {idle && r.phase !== 'done' && readOnly && !heldBy ? (
+        <div className="usage-stat-sub" style={{ marginTop: '6px' }}>Start the bot to continue or cancel this promote: the gates that protect a takeover restart need its fleet state.</div>
+      ) : null}
+      {idle && r.phase !== 'done' && (!readOnly || heldBy) ? (
         <div style={{ marginTop: '6px' }}>
-          <button onClick={() => act('/fleet/promote/continue', 'Promote continues')} disabled={busy} style={{ fontSize: '0.72rem', padding: '2px 8px' }}>Continue</button>
-          {r.phase === 'claim' || r.mode === 'stand-in' ? (
-            <button onClick={() => act('/fleet/promote/cancel', 'Promote cancelled')} disabled={busy} style={{ fontSize: '0.72rem', padding: '2px 8px', marginLeft: '6px' }}>Cancel</button>
+          {!readOnly && !parkedSince ? <button onClick={() => act('/fleet/promote/continue', 'Promote continues')} disabled={busy} style={{ fontSize: '0.72rem', padding: '2px 8px' }}>Continue</button> : null}
+          {cancellable ? (
+            <button onClick={() => act('/fleet/promote/cancel', 'Promote cancelled')} disabled={busy} style={{ fontSize: '0.72rem', padding: '2px 8px', marginLeft: readOnly || parkedSince ? 0 : '6px' }}>Cancel</button>
           ) : null}
         </div>
       ) : null}
@@ -1304,6 +1336,68 @@ function FleetStandInBanner({ fleet }) {
   );
 }
 
+// The follower hold (20.5, B6 map F28): a returning master that found its
+// stand-in holding the fleet's writes, or its own database a copy, and runs
+// as a co-worker of the node holding the fleet until the failback promotes it
+// back. The failback-pending surface proper is B6-j's; this says what holds
+// and what ends it.
+function FleetFollowerHoldBanner({ api, fleet }) {
+  const h = fleet.followerHold;
+  const who = h.standInName || (h.standInNodeId ? h.standInNodeId.slice(0, 8) : 'the node holding the fleet');
+  const behind = h.reason === 'copy'
+    ? `this node's own database is a copy in recovery${h.observedTerm != null ? ` of ${who}'s at term ${h.observedTerm}` : ''}, so it cannot serve as master from it`
+    : `${who} stood in for this node while it was down and took the fleet's writes at term ${h.observedTerm}, while this node's own database holds term ${h.localTerm}: that copy is the fleet database now and this one is behind it`;
+  const posture = h.namesThisNode === true
+    ? (h.following
+      ? `Following ${who} as a co-worker on its database.`
+      : `Registered with ${who}, but the database it delivered is not installed here yet (not dialable from this machine, or its identity did not verify), so this node serves nothing until it is.`)
+    : h.namesThisNode === false
+      ? `Following ${who} as a co-worker, but it no longer stands in for this node (promoted by hand, or its lane ended), so there is no failback to run: demote this node to stay a co-worker, or set BOT_NODE_ROLE=backup-master on this node and restart it to make it a designated backup.`
+      : `Dialing ${who} to follow it as a co-worker.`;
+  const lastResort = ' If that node is gone for good, FLEET_CONFIRM_TAKEOVER=1 on this node plus a restart seizes the fleet back onto this database, losing everything that node accepted during the outage.';
+  // A lane of THIS hold in flight outranks the routes (a record from before the
+  // hold names no database the node follows, and is not the failback). A claim
+  // parked before its term landed keeps the routes: the promote card stays
+  // live for it.
+  const rec = fleet.promote && fleet.promote.phase !== 'done' && !fleet.promoteHeldBy ? fleet.promote : null;
+  // The engine's rule (recordOfHold): a hold that has delivered nothing yet is
+  // not judged, so the lane it names is still the lane.
+  const forms = [h.following, ...(h.followingForms || [])].filter(Boolean);
+  const lane = rec && rec.canonicalEndpoint && (forms.length === 0 || forms.includes(rec.canonicalEndpoint)) ? rec : null;
+  // The record card's liveness: an unparked lane no phase runs is stopped.
+  const laneIdle = !!(lane && (lane.parked || fleet.promoteRunning === false));
+  const unlandedClaim = !!(laneIdle && lane.phase === 'claim' && !lane.claimedTerm);
+  const cancellable = !!(laneIdle && ((lane.phase === 'claim' && !lane.claimedTerm) || (lane.mode === 'failover' && lane.phase === 'promote')));
+  const phaseText = lane ? (PROMOTE_PHASE_TEXT[lane.phase] || lane.phase) : '';
+  // A record the fleet has moved past is not the lane, but it blocks a new
+  // verdict until it is cancelled: named ahead of the promote routes.
+  const stale = fleet.promote && fleet.promote.phase !== 'done' && fleet.promoteHeldBy ? fleet.promote : null;
+  const staleIdle = !!(stale && (stale.parked || fleet.promoteRunning === false));
+  const next = lane && !unlandedClaim
+    ? (laneIdle
+      ? ` The failback is ${lane.parked ? 'parked' : 'stopped (no phase is running it)'} (${phaseText}); Continue it in the promote record card below${cancellable ? ', or Cancel it there' : ''}.`
+      : ` The failback is running (${phaseText}); the promote record card below follows it.`)
+    : stale
+    ? ` A promote decided before node ${fleet.promoteHeldBy.nodeId.slice(0, 8)} took the fleet is still on record (${PROMOTE_PHASE_TEXT[stale.phase] || stale.phase})${staleIdle
+      ? `; Cancel it in the promote record card below${h.namesThisNode === true ? ', and the promote button returns here' : ', before any new verdict'}.`
+      : '; its running phases will refuse to stage the takeover restart and park with that reason, and Cancel in the promote record card below dismisses it then.'}`
+    : h.namesThisNode === true
+    ? (h.reason === 'copy'
+      ? ' To take the fleet back, promote this node from the card below once its copy has caught up; that ends the stand-in.'
+      : ' To take the fleet back: re-seed this database as a standby of that copy (its block is on that node\'s Database modal), then promote this node from the card below once the copy has caught up. Demote this node to stay a co-worker instead.' + lastResort)
+    : h.namesThisNode === null
+      ? (h.reason === 'copy'
+        ? ' The failback cannot start until this node is registered with the node holding the fleet; this copy is kept as it is meanwhile (neither re-seeded nor adopted).'
+        : lastResort)
+      : '';
+  return (
+    <div className="usage-notice" style={{ borderColor: '#e0a030', color: '#e0a030' }}>
+      {`RETURNING MASTER, HOLDING: ${behind}. ${posture}${next}`}
+      <div><FleetDemoteButton api={api} /></div>
+    </div>
+  );
+}
+
 function FleetEmptyStoreHoldBanner({ api, hold }) {
   const [busy, setBusy] = React.useState(false);
   const confirmFresh = () => {
@@ -1345,7 +1439,7 @@ function FleetDemoteButton({ api }) {
     send(false)
       .then((res) => {
         if (res && res.success === false && res.needsConfirm) {
-          if (!confirm(`${res.error}\n\nDemote anyway (the fleet stays under maintenance until a backup is promoted)?`)) return null;
+          if (!confirm(res.error)) return null;
           return send(true);
         }
         return res;
@@ -1392,9 +1486,10 @@ function FleetView({ api, wsClient, guildNames }) {
   React.useEffect(() => {
     loadFleet();
     const unsubscribe = wsClient.on('bot:fleet:status', (state) => {
-      // Carry the last known promote record across a child push: replacing the
-      // object wholesale would blank the phase card for the whole run.
-      setFleet((prev) => Object.assign({ success: true, running: true }, state, prev && prev.promote ? { promote: prev.promote } : {}));
+      // Carry the last known promote record, and the parent-side facts that
+      // describe it, across a child push: replacing the object wholesale would
+      // blank the phase card for the whole run.
+      setFleet((prev) => Object.assign({ success: true, running: true }, state, prev && prev.promote ? { promote: prev.promote, promoteHeldBy: prev.promoteHeldBy, promoteRunning: prev.promoteRunning } : {}));
       fleetInitializedRef.current = state != null && state.initialized === true;
     });
     const unsubscribeStatus = wsClient.on('bot:status', () => loadFleet());
@@ -1431,10 +1526,11 @@ function FleetView({ api, wsClient, guildNames }) {
         )}
         {fleet.staleMasterPark && (
           <div className="usage-notice" style={{ borderColor: '#e5534b', color: '#e5534b' }}>
-            {`STALE MASTER FENCE: ${fleet.staleMasterPark.peerUrl} answers as a live master on term ${fleet.staleMasterPark.observedTerm}, while this node's own database holds term ${fleet.staleMasterPark.localTerm} and nothing is writing to it. The fleet was failed over to that node's database, so this machine's copy is a fork: acquiring a term here would put two masters on one bot token, each writing a database the other never sees. The boot is parked and will not release on its own. Demote this node to rejoin the fleet as a co-worker on the live database - that is the intended recovery, and it is safe even if this machine's copy is the newer one, because the fleet's data lives on the node above. Only if that node must NOT keep the fleet, set FLEET_CONFIRM_TAKEOVER=1 on this node and restart it to seize the fleet onto this database instead; every change made on the other node since the failover is lost.${String(fleet.staleMasterPark.peerUrl || '').startsWith('witness beacon') ? ' One more case releases safely: if this database was DELIBERATELY restored from a dump on this same machine, the fleet has not moved anywhere and the fence is reacting to the rewound control term - the manager\'s restore lane advances it automatically, and the takeover confirm above is the by-hand override.' : ''}`}
+            {`STALE MASTER FENCE: ${fleet.staleMasterPark.peerUrl} holds the fleet at term ${fleet.staleMasterPark.observedTerm}, while this node's own database holds term ${fleet.staleMasterPark.localTerm} and nothing is writing to it. The fleet's term ${fleet.staleMasterPark.observedTerm} was minted on that node's database, so this machine's copy is a fork: acquiring a term here would put two masters on one bot token, each writing a database the other never sees. The boot is parked and will not release on its own. Demote this node to rejoin the fleet as a co-worker on the live database - that is the intended recovery, and it is safe even if this machine's copy is the newer one, because the fleet's data lives on the node above. Only if that node must NOT keep the fleet, set FLEET_CONFIRM_TAKEOVER=1 on this node and restart it to seize the fleet onto this database instead; every change the fleet has made on that node is lost.${String(fleet.staleMasterPark.peerUrl || '').startsWith('witness beacon') ? ' One more case releases safely: if this database was DELIBERATELY restored from a dump on this same machine, the fleet has not moved anywhere and the fence is reacting to the rewound control term - the manager\'s restore lane advances it automatically, and the takeover confirm above is the by-hand override.' : ''}`}
             <div><FleetDemoteButton api={api} /></div>
           </div>
         )}
+        {fleet.followerHold && <FleetFollowerHoldBanner api={api} fleet={fleet} />}
         {fleet.emptyStoreHold && (
           <FleetEmptyStoreHoldBanner api={api} hold={fleet.emptyStoreHold} />
         )}
@@ -1442,7 +1538,7 @@ function FleetView({ api, wsClient, guildNames }) {
         {fleet.standIn && fleet.standIn.live && fleet.standIn.writeGate && (
           <div><FleetDemoteButton api={api} /></div>
         )}
-        <FleetPromoteRecord api={api} fleet={fleet} reload={loadFleet} />
+        <FleetPromoteRecord api={api} fleet={fleet} reload={loadFleet} readOnly={!fleet.running} />
         <div className="usage-empty">
           {!fleet.running
             ? 'Fleet state becomes available once the bot process is running.'
@@ -1505,13 +1601,14 @@ function FleetView({ api, wsClient, guildNames }) {
           </div>
         )}
         <FleetSupersededBanner fleet={fleet} />
+        {fleet.followerHold && <FleetFollowerHoldBanner api={api} fleet={fleet} />}
         <FleetStandInBanner fleet={fleet} />
         {fleet.roleOverride && (
           <div className="usage-stat-sub" style={{ marginTop: '6px' }}>
             {`Role set by operator override (${fleet.roleOverride.setBy}, ${new Date(fleet.roleOverride.setAt).toISOString().slice(0, 16).replace('T', ' ')} UTC)`}
           </div>
         )}
-        {fleet.backupMaster && fleet.dataBackend === 'postgres' && (
+        {(fleet.backupMaster || (fleet.followerHold && fleet.followerHold.namesThisNode === true)) && fleet.dataBackend === 'postgres' && (
           <FleetPromoteCard api={api} fleet={fleet} reload={loadFleet} />
         )}
         <FleetPromoteRecord api={api} fleet={fleet} reload={loadFleet} />

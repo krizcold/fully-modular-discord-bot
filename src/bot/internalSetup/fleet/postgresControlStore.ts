@@ -82,8 +82,14 @@ export class PostgresControlStore implements ControlStore {
    *   distribution pass, so a throw there aborts free-shard placement for the
    *   whole pass rather than just failing to record it.
    */
-  constructor(private readonly pool: Pool, private readonly readOnly = false) {
+  constructor(private readonly pool: Pool, private readonly readOnly = false, private readonly ownsPool = false) {
     if (readOnly) this.provisioned = true;
+  }
+
+  /** Ends the pool when this store owns it; a pool shared with the guild data backend is left to that runtime. */
+  async close(): Promise<void> {
+    if (!this.ownsPool) return;
+    await this.pool.end().catch(() => { /* already ended */ });
   }
 
   /** Fires once when a mutating call observes a foreign term (two masters on one schema). */
@@ -506,7 +512,7 @@ export function createControlStore(standalone: boolean): ControlStore {
     // A split control store is still the fleet's database, and the term stamp
     // and registry writes commit through it (B6 map F24).
     watchPoolForSyncWaitCancel(pool, 'the control-store pool');
-    return new PostgresControlStore(pool);
+    return new PostgresControlStore(pool, false, true);
   }
   const dataBackend = getGuildDataBackend();
   if (dataBackend instanceof PostgresBackend) {
@@ -537,7 +543,7 @@ export function createStandInControlStore(url: string): PostgresControlStore {
     idleTimeoutMillis: 30_000,
   });
   pool.on('error', err => console.warn('[Fleet] Stand-in control store idle client error:', err instanceof Error ? err.message : err));
-  return new PostgresControlStore(pool, true);
+  return new PostgresControlStore(pool, true, true);
 }
 
 /**

@@ -145,6 +145,8 @@ export interface RegisterResult {
   copyBlock?: CopyBlock;
   /** The answering node is a stand-in for that master (20.5): the fleet runs on a temporary copy until the failback. */
   standingInFor?: string;
+  /** The answering master's node id, on accepted replies (B6 map F28: the holder sighting). */
+  nodeId?: string;
 }
 
 /**

@@ -24,6 +24,13 @@ export interface RoleOverride {
   /** Promotion over a dead master: auto-Declare-Lost it after the hold-down. */
   chainTakeover?: boolean;
   /**
+   * The master this promote superseded with its DATABASE reported dead while
+   * its bot stayed up (20.12 c3): the one peer the boot fence lets answer at
+   * this node's own term under the staged takeover, because this node's
+   * higher beacon is what steps it down. One-shot like the flags above.
+   */
+  supersededStoreDead?: string;
+  /**
    * Boot as a TEMPORARY stand-in (20.5): serve from a database still in
    * recovery, at the term already in the replayed row, and keep the backup
    * identity throughout. Unlike the takeover flags this is NOT one-shot: it
@@ -67,6 +74,7 @@ export function readRoleOverride(): RoleOverride | null {
         role: parsed.role,
         ...(parsed.takeover === true ? { takeover: true } : {}),
         ...(parsed.chainTakeover === true ? { chainTakeover: true } : {}),
+        ...(typeof parsed.supersededStoreDead === 'string' && parsed.supersededStoreDead !== '' ? { supersededStoreDead: parsed.supersededStoreDead } : {}),
         ...(parsed.standIn === true ? { standIn: true } : {}),
         setAt: Number(parsed.setAt) || 0,
         setBy: toSetBy(parsed.setBy),

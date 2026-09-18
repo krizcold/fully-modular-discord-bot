@@ -99,6 +99,7 @@ export function createManagedRoutes(botManager: BotManager): Router {
         masterStandingInFor: state?.masterStandingInFor ?? null,
         takeoverHold: state?.takeoverHold ?? null,
         staleMasterPark: state?.staleMasterPark ?? null,
+        followerHold: state?.followerHold ?? null,
         // Only an initialized master relays the block to designated backups
         // (20.14); the manager keys its publishes on this verdict instead of
         // interpreting this app's role vocabulary.
@@ -149,7 +150,7 @@ export function createManagedRoutes(botManager: BotManager): Router {
 
   /** POST /api/managed/promote/cancel */
   router.post('/promote/cancel', async (_req: Request, res: Response) => {
-    res.json(await cancelPromote());
+    res.json(await cancelPromote(botManager));
   });
 
   /** POST /api/managed/demote { confirm? } */

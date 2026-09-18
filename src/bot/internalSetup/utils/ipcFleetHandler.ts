@@ -18,6 +18,7 @@ import {
   fleetSetConfig,
   fleetSyncBump,
   fleetDevCorruptLease,
+  fleetFollowedBackend,
   fleetTransformStart,
   fleetTransformPause,
   fleetTransformResume,
@@ -61,6 +62,10 @@ export function setupFleetIPCHandlers(): void {
         }
         case 'fleet:witness:read': {
           response = { success: true, witness: await fleetReadWitness() };
+          break;
+        }
+        case 'fleet:followed:read': {
+          response = { success: true, followed: fleetFollowedBackend() };
           break;
         }
         case 'fleet:config:set': {

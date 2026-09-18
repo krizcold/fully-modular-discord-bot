@@ -110,6 +110,11 @@ export function getDeliveredBackendUrls(): string[] {
     .filter(url => url !== '');
 }
 
+/** True once a master delivered a database this process applied. */
+export function hasDelivery(): boolean {
+  return deliveredUrls !== null;
+}
+
 /** Make a prepared backend the live runtime; the caller owns identity verification. */
 function installRuntime(url: string, backend: PostgresBackend): DataReadinessDriver {
   activeUrl = url;
@@ -172,10 +177,15 @@ export async function pickDeliveredUrl(url: string, publicUrl: string, previous?
  * gates stay closed until the new runtime's identity verifies.
  * keepPrevious leaves the outgoing pool open for a caller that shares it with
  * its control store and is about to restart anyway.
+ * persist:false applies the delivery in this process only. A follower hold
+ * (B6 map F28) runs the co-worker runtime under a master identity whose next
+ * boot opens the store /data/.env names: a persisted foreign URL would wedge
+ * that boot in the takeover guard, and where /data/.env is where the node's
+ * own URL lives it would overwrite the only record of it.
  */
 export async function applyDeliveredBackend(
   info: { backend: DataBackendKind; url?: string; publicUrl?: string; transformationId?: string; routes?: { guildId: string; backend: DataBackendKind }[] } | undefined,
-  opts?: { keepPrevious?: boolean },
+  opts?: { keepPrevious?: boolean; persist?: boolean },
 ): Promise<{ changed: boolean; recycled: boolean }> {
   const backend = info?.backend ?? 'file';
   const publicUrl = (info?.publicUrl || '').trim();
@@ -188,7 +198,7 @@ export async function applyDeliveredBackend(
   // cannot show that a copy's source was left behind, and a verdict from it
   // would be one drawn from silence.
   const named = [url, publicUrl, localUrl].map(u => u.trim()).filter(u => u !== '');
-  if (named.length > 0) deliveredUrls = named;
+  if (named.length > 0) deliveredUrls = Array.from(new Set(named));
   const creds = loadCredentials();
   const envBackend = (creds.DATA_BACKEND || 'file').trim() || 'file';
   const envUrl = (creds.DATA_BACKEND_URL || '').trim();
@@ -199,7 +209,7 @@ export async function applyDeliveredBackend(
 
   setFleetDataBackend(backend === 'postgres' ? { backend, url } : { backend });
 
-  if (changed) {
+  if (changed && opts?.persist !== false) {
     const patch: Record<string, string> = { DATA_BACKEND: backend };
     if (backend === 'postgres') {
       patch.DATA_BACKEND_URL = url;
@@ -274,6 +284,27 @@ export async function repointRuntimeForThisProcess(url: string): Promise<boolean
 
 export function getActiveBackendUrl(): string | null {
   return activeUrl;
+}
+
+/**
+ * A follower hold's own database is behind the fleet's, or is the copy the
+ * failback promotes (B6 map F28): the runtime booted on it must not serve, or
+ * the shards the node it follows grants would write into a database the
+ * failback wipes or promotes over. The runtime is stopped and the gates latch
+ * closed until a delivery installs a database; one that cannot be dialed or
+ * fails its identity check leaves them closed.
+ */
+export function holdOwnRuntimeForDelivery(reason: string): void {
+  const own = activeUrl !== null ? getGuildDataBackend() : null;
+  // Unwound the way a recycle unwinds it: a driver left behind would take the
+  // lease a delivery's fresh driver then never learns of.
+  getDataReadiness()?.stop();
+  getWorkingSet()?.quiesce();
+  activeUrl = null;
+  setGuildDataBackend(null);
+  bootStatus = { ...bootStatus, state: 'refused', refusalReason: reason };
+  console.error(`[Data] HOLDING the data layer: ${reason}`);
+  if (own) void own.stop().catch(() => { /* best effort */ });
 }
 
 /** Worker-side lazy runtime construction from a control-channel-delivered URL (C5). */

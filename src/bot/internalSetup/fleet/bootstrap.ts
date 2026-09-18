@@ -65,7 +65,7 @@ import {
   resolveShardCount,
 } from './placement';
 import { evaluateRecovery } from './recovery';
-import { _setControlStoreFenced, _setEmptyStoreHold, _setFleetStateSources, _setSlotStatus, _setStaleMasterPark, _setSuperseded, _setTakeoverHold, FleetRecoverySource, FleetRefusedRegistration, getFleetState } from './state';
+import { _setControlStoreFenced, _setEmptyStoreHold, _setFleetStateSources, _setFollowerFollowingSupplier, _setFollowerHold, _setSlotStatus, _setStaleMasterPark, _setSuperseded, _setTakeoverHold, FleetRecoverySource, FleetRefusedRegistration, FollowerHoldBase, getFleetState } from './state';
 import type { MigrationView, PinViolationView } from './state';
 import { serveSyncRequest, SyncAuthority } from './syncAuthority';
 import { SyncEngine } from './syncEngine';
@@ -77,7 +77,7 @@ import {
   GuildDataWriteRequest,
   setDataOpForwarder,
 } from '../utils/ipcDataHandler';
-import { applyDeliveredBackend, ensureRuntimeWith, getActiveBackendUrl, getDeliveredBackendUrls, pickDeliveredUrl, repointRuntimeForThisProcess } from '../utils/dataBackends/boot';
+import { applyDeliveredBackend, ensureRuntimeWith, getActiveBackendUrl, getDataBootStatus, getDeliveredBackendUrls, hasDelivery, holdOwnRuntimeForDelivery, pickDeliveredUrl, repointRuntimeForThisProcess } from '../utils/dataBackends/boot';
 import { setLeaseDeclineHandler } from '../utils/dataBackends/dataReadiness';
 import { applyRouteOverrides, currentRouteDefault } from '../utils/dataBackends/routeResolver';
 import { loadCredentials, resolveDataBackend, upsertCredentials } from '../../../utils/envLoader';
@@ -89,7 +89,7 @@ import { TransformationExecutor } from './transformation/transformationExecutor'
 import type { ControlStore, PersistedFleetConfig, PersistedTerm, TransformDirection } from './controlStore';
 import { effectiveFleetConfigView, effectiveMasterUrls, emptyStoreHoldEvidence, forcePassive, readFleetConfigCache, rememberBackups, validateMasterCandidates, renumberDesignations, validateBackupDesignations, validateWitnessChannelId, writeFleetConfigCache } from './fleetConfig';
 import { getLocalReplicaIdentity, getReplicaHealth, getSlotSample, setReplicaProbeListener } from './replicaHealth';
-import { canonicalIsOwnReplica, canonicalStoreReachable, hasDbReplica, probeReplica, resolveReplicaEndpoints, spliceFleetCredentials } from './replicaPromotion';
+import { canonicalIsOwnReplica, canonicalStoreReachable, currentCanonicalUrl, hasDbReplica, probeReplica, readTermRow, resolveReplicaEndpoints, spliceFleetCredentials } from './replicaPromotion';
 import { ArmEvidenceInputs, armDeferral, evaluateArmEvidence, ledgerAllowsArm, preArmRefusal, reachabilityWarning } from './armLane';
 import { StandInWriteContext, evaluateStandInWrites } from './armWrites';
 import { readReshardPending, readStandbyTermRow } from './armProbe';
@@ -100,6 +100,7 @@ import { BeaconFacts, DiscordWitness, FleetWitness, startWitnessLoop, WitnessSta
 import { probePeerTerm } from './peerTermProbe';
 import { probeStoreEmpty } from './emptyStore';
 import { readPromoteRecord, writePromoteRecord } from './promoteRecord';
+import { clearHolderSighting, noteHolderSighting, readHolderSighting } from './holderSighting';
 import {
   clearFreshFleetConfirm,
   clearSuperseded,
@@ -107,12 +108,12 @@ import {
   freshHigherTermClaim,
   freshMasterClaim,
   hasFreshFleetConfirm,
-  higherTermClaim,
   notifyStepDown,
   readCopyBlock,
   readSuperseded,
   requestStepDownRestart,
   SupersededSource,
+  witnessWinner,
   writeCopyBlock,
   writeSuperseded,
 } from './stepDown';
@@ -290,6 +291,18 @@ export async function fleetReadWitness(): Promise<WitnessStatus | null> {
   return readWitnessNow();
 }
 
+let followedBackend: (() => { url: string; forms: string[] } | null) | null = null;
+
+/**
+ * The database a follower hold serves from, WITH credentials, for the parent's
+ * promote engine (B6 map F28): the hold persists nothing, so this is the only
+ * place the parent can take the fleet database and its credentials from. Null
+ * until a delivery installed and verified.
+ */
+export function fleetFollowedBackend(): { url: string; forms: string[] } | null {
+  return followedBackend ? followedBackend() : null;
+}
+
 let masterConfigSet: ((candidates: string[], witnessChannelId: unknown, backupDesignations: unknown) => Promise<{ ok: boolean; error?: string; revision?: number }>) | null = null;
 
 /** Runtime fleet-config edit (B2, backup order B5); master-only, pushed fleet-wide with zero restarts. */
@@ -329,9 +342,13 @@ export async function initFleet(): Promise<FleetContext> {
     ...(consentsToActiveMode() ? { activeCapable: true } : {}),
   };
 
-  context = role === 'master'
-    ? await initMaster({ standalone, nodeId, nodeName, appVersion, capabilities, runtime })
-    : await initCoWorker({ nodeId, nodeName, appVersion, capabilities, runtime });
+  const init = { nodeId, nodeName, appVersion, capabilities, runtime };
+  const boot = role === 'master' ? await initMaster({ standalone, ...init }) : await initCoWorker(init);
+  // A master that came back behind its stand-in, or on a copy, follows the
+  // node holding the fleet as a co-worker (20.5, B6 map F28). Its identity
+  // stays master (env and override untouched): the promote engine reads it
+  // as the returning master, and a restart re-derives the same hold.
+  context = 'followerHold' in boot ? await initCoWorker(init, boot.followerHold) : boot;
 
   // Boot ownership sweep: stamp-if-missing (adopt), foreign-residue -> graveyard,
   // orphaned *.tmp cleanup, _incoming disposition. Runs before any ingest login
@@ -507,25 +524,41 @@ async function runTakeoverGuard(
  * accepted residual risk of having no third witness (Section 11 ruling).
  *
  * Parking is terminal by design: this node's database is the forked copy, so
- * the verdict cannot improve by waiting. Demote is the way out.
+ * the verdict cannot improve by waiting. Demote is the way out. The one
+ * non-terminal answer is a stand-in that names this node and has taken writes:
+ * that copy descends from this one and the failback brings it back, so the
+ * fence returns a follower hold instead of parking (20.5, B6 map F28).
  */
 async function runStaleMasterFence(
   store: ControlStore,
   selfNodeId: string,
   selfNodeName: string,
   standalone: boolean,
-  takeoverConfirmed: boolean,
+  envConfirm: boolean,
+  stagedTakeover: boolean,
+  storeDeadPeer: string | null,
   standIn = false,
-): Promise<void> {
-  if (standalone) return;
-  if (takeoverConfirmed) {
-    console.warn('[Fleet] Takeover CONFIRMED; skipping the stale-master fence');
-    return;
+): Promise<FollowerHoldBase | null> {
+  if (standalone) return null;
+  // Only the operator's env confirm skips this fence. A takeover a promote
+  // staged was decided on what that node could see at the time: a candidate
+  // answering NOW at or above this node's term is a live holder it did not
+  // see (a healed partition, the node's own outage), which the sighting file
+  // cannot record (a holder that never stopped holding is the same holding),
+  // so the peer half runs; the one peer it lets answer at this node's own
+  // term is the c3 master the verdict saw alive with its database dead. The
+  // witness half judges FRESH beacons only: the superseded or dead master's
+  // last ones age out, while a stand-in that armed after the decision, or a
+  // second backup promoted by hand, renews its beacon and is a live holder.
+  if (envConfirm) {
+    console.warn('[Fleet] Takeover CONFIRMED by FLEET_CONFIRM_TAKEOVER; skipping the stale-master fence');
+    return null;
   }
+  if (stagedTakeover) console.warn(`[Fleet] Takeover staged by a promote: keeping the peer half of the stale-master fence (a live holder invalidates the decision${storeDeadPeer ? `; node ${storeDeadPeer.slice(0, 8)}, superseded with its database dead, may answer at this node's own term` : ''}) and only fresh beacons in the witness half`);
   const secret = (process.env.CONTROL_SECRET || '').trim();
   const { urls: candidates } = effectiveMasterUrls();
   const token = (process.env.DISCORD_TOKEN || '').trim();
-  if ((secret === '' || candidates.length === 0) && token === '') return;
+  if ((secret === '' || candidates.length === 0) && token === '') return null;
 
   // Hold rather than skip on an unreadable store, exactly like the guard: the
   // very next statement blocks on the same store until it answers, so waiting
@@ -548,17 +581,59 @@ async function runStaleMasterFence(
     }
   }
   const localTerm = local ? local.term : 0;
-  const park = (observedTerm: number, peerUrl: string, detail: string, extra = '', standInNodeId: string | null = null): Promise<never> => {
+  const park = (observedTerm: number, peerUrl: string, holderNodeId: string, detail: string, extra = ''): Promise<never> => {
     // A stand-in that trips the fence has learned the master is alive after all,
     // which is the best possible outcome: it simply stops standing in. Parking
     // it instead would strand a node that is no longer a backup and no longer a
     // master, with nothing left running to change its mind.
     if (standIn) return disarmStandIn(`${detail}; the master this node was covering is alive`);
     console.error(`[Fleet] STALE MASTER FENCE: ${detail}; parking the boot instead of acquiring a term on a database the fleet has moved off. Demote this node to rejoin as a co-worker.${extra}`);
-    _setStaleMasterPark({ observedTerm, localTerm, peerUrl, at: Date.now(), standInNodeId });
+    noteHolderSighting(holderNodeId, observedTerm, 'fence-park', selfNodeId);
+    _setStaleMasterPark({ observedTerm, localTerm, peerUrl, at: Date.now() });
     pushFleetStatusNow();
     return (async () => { for (;;) await guardSleep(TERM_GUARD_POLL_MS); })();
   };
+  // The failback's first half (20.5, B6 map F28): the stand-in's copy is the
+  // fleet database now and this one is behind it, so this node follows that
+  // node as a co-worker instead of parking, until the failback syncs this
+  // database from its copy and promotes it back. A stand-in that lands here
+  // has learned the master is alive and stops standing in, as on a park.
+  const hold = (observedTerm: number, seenVia: string, standInNodeId: string, standInName: string | null, detail: string): Promise<FollowerHoldBase> => {
+    if (standIn) return disarmStandIn(`${detail}; the master this node was covering is alive`);
+    console.error(`[Fleet] FOLLOWER HOLD: ${detail}; following that node as a co-worker instead of minting a term past the writes its copy holds. To take the fleet back, re-seed this database as a standby of that copy and promote this node once it has caught up; demote this node to stay a co-worker instead. If that node is gone for good, FLEET_CONFIRM_TAKEOVER=1 on this node plus a restart seizes the fleet back onto this database, losing everything that node accepted during the outage.`);
+    noteHolderSighting(standInNodeId, observedTerm, 'fence-hold', selfNodeId);
+    return Promise.resolve({ reason: 'behind', standInNodeId, standInName, observedTerm, localTerm, seenVia, since: Date.now() });
+  };
+
+  // One witness read serves both halves: the c3 exception in the peer half
+  // re-proves its premise on that node's own FRESH beacon, and the witness half
+  // judges the rest. Under a staged takeover only a beacon still being renewed
+  // is a holder: the superseded or dead master's last ones are history, and a
+  // lossy failover of a lagging copy must not park on them.
+  const claims = token !== ''
+    ? await new DiscordWitness({ token, nodeId: selfNodeId, nodeName: selfNodeName, getChannelId: () => readFleetConfigCache()?.witnessChannelId ?? null }).readClaims()
+    : null;
+  const usable = stagedTakeover && claims ? claims.filter(c => Date.now() - c.observedAt <= WITNESS_FRESH_WINDOW_MS) : claims;
+  // The c3 re-proof (20.12) needs no probe: the staged fact names the node
+  // and its own fresh beacon is already in hand, where a probe it does not
+  // answer (undialable, or past the probe budget) could not show a store that
+  // came back at the same term. A beacon that no longer says dead at or above
+  // this node's term is a live holder again: one that names this node holds
+  // (its copy is the fleet database and this one a promoted fork of it), any
+  // other parks. A still-dead store, or no fresh beacon, keeps the pass:
+  // silence is not evidence.
+  if (stagedTakeover && storeDeadPeer !== null) {
+    const own = usable?.find(c => c.nodeId === storeDeadPeer) ?? null;
+    if (own && own.storeState !== 'dead' && own.term >= localTerm) {
+      const via = `witness beacon of ${own.nodeName}`;
+      const detail = `${own.nodeName} (${own.nodeId.slice(0, 8)}) is the node this promote superseded with its database reported dead, but its beacon now reports that database ${own.storeState ?? 'healthy'} at term ${own.term} while this node's store holds ${localTerm}`;
+      if (own.standingInFor === selfNodeId) return hold(own.term, via, own.nodeId, own.nodeName, detail);
+      // Named by node, not by the witness-half marker: that marker switches on
+      // the tab's restore-from-a-dump tail, which belongs to a beacon nobody
+      // renews, where this holder is live right now.
+      await park(own.term, `${own.nodeName} (${own.nodeId.slice(0, 8)})`, own.nodeId, detail);
+    }
+  }
 
   if (secret !== '' && candidates.length > 0) {
     const deadline = Date.now() + PEER_TERM_PROBE_BUDGET_MS;
@@ -571,6 +646,22 @@ async function runStaleMasterFence(
       // This node's own answer proves nothing: candidates include its own
       // advertised URL, and a predecessor process may still hold the port.
       if (peer === null || peer.nodeId === selfNodeId || peer.term < localTerm) continue;
+      // 20.12 c3: the promote saw this master alive with its DATABASE dead and
+      // the operator took the RPO confirm over it; its bot still answers at the
+      // term its dead store froze on, and this node's higher beacon is what
+      // steps it down. That fact flips within seconds and a store that comes
+      // back keeps its term, so it was re-proved ahead of this loop on the
+      // node's own fresh beacon, whether or not it answers the probe; here the
+      // answer is only logged. A higher term from it means it minted: parked
+      // above like any other. Judged BEFORE the
+      // hand-back below: a stand-in that took writes for this node and whose
+      // store then died is this peer too, and the hand-back's equal-term
+      // continue must not pass it unproved.
+      if (stagedTakeover && storeDeadPeer !== null && peer.nodeId === storeDeadPeer && peer.term === localTerm) {
+        const own = usable?.find(c => c.nodeId === storeDeadPeer) ?? null;
+        console.warn(`[Fleet] Stale-master fence: ${url} is the master this promote superseded with its database reported dead (term ${peer.term}${own ? ', its beacon still says so' : ', no fresh beacon from it'}); proceeding, its bot steps down on this node's higher beacon`);
+        continue;
+      }
       // A stand-in covering THIS node is the one peer that must not fence it:
       // it holds the fleet at this node's own inherited term precisely so this
       // node can come back, so parking here would strand the fleet on a
@@ -586,10 +677,9 @@ async function runStaleMasterFence(
         // A higher term means it TOOK WRITES (B6-f2): its copy is the fleet
         // database now and this one is behind it, so serving would fork the
         // data the outage produced.
-        await park(peer.term, url, `${url} is standing in for this node and has taken writes at term ${peer.term} while this node's store holds ${localTerm}: its copy is the fleet database now and this one is behind it`,
-          ' Automatic failback is not built yet: re-seed this machine as a standby of that node, or promote that node by hand, before this node serves again.', peer.nodeId);
+        return hold(peer.term, url, peer.nodeId, null, `${url} is standing in for this node and has taken writes at term ${peer.term} while this node's store holds ${localTerm}: its copy is the fleet database now and this one is behind it`);
       }
-      await park(peer.term, url, `${url} answers as a live master on term ${peer.term} while this node's store holds ${localTerm} and nothing is writing to it`);
+      await park(peer.term, url, peer.nodeId, `${url} answers as a live master on term ${peer.term} while this node's store holds ${localTerm} and nothing is writing to it`);
     }
   }
 
@@ -597,27 +687,20 @@ async function runStaleMasterFence(
   // EVER posted means this copy is a stale fork, fresh beacon or not, and it
   // is the only evidence that reaches a master that cannot be dialed
   // (Windows, NAT). Darkness is not evidence, like silence above.
-  if (token !== '') {
-    const witness = new DiscordWitness({
-      token,
-      nodeId: selfNodeId,
-      nodeName: selfNodeName,
-      getChannelId: () => readFleetConfigCache()?.witnessChannelId ?? null,
-    });
-    const claims = await witness.readClaims();
-    const higher = claims ? higherTermClaim(claims, selfNodeId, localTerm) : null;
+  if (usable) {
+    const higher = witnessWinner(usable, selfNodeId, localTerm);
     if (higher && higher.standingInFor === selfNodeId) {
-      await park(higher.term, `witness beacon of ${higher.nodeName}`, `${higher.nodeName} (${higher.nodeId.slice(0, 8)}) is standing in for this node and has taken writes at term ${higher.term} while this node's store holds ${localTerm}: its copy is the fleet database now and this one is behind it`,
-        ' Automatic failback is not built yet: re-seed this machine as a standby of that node, or promote that node by hand, before this node serves again.', higher.nodeId);
+      return hold(higher.term, `witness beacon of ${higher.nodeName}`, higher.nodeId, higher.nodeName, `${higher.nodeName} (${higher.nodeId.slice(0, 8)}) is standing in for this node and has taken writes at term ${higher.term} while this node's store holds ${localTerm}: its copy is the fleet database now and this one is behind it`);
     }
     if (higher) {
       // The restore tail belongs to THIS half only: the peer half means a
       // foreign master is answering LIVE right now, where the same advice
       // would talk an operator into a dual-master seize.
-      await park(higher.term, `witness beacon of ${higher.nodeName}`, `the witness holds a beacon from ${higher.nodeName} (${higher.nodeId.slice(0, 8)}) at term ${higher.term} while this node's store holds ${localTerm}`,
+      await park(higher.term, `witness beacon of ${higher.nodeName}`, higher.nodeId, `the witness holds a beacon from ${higher.nodeName} (${higher.nodeId.slice(0, 8)}) at term ${higher.term} while this node's store holds ${localTerm}`,
         ' If this database was DELIBERATELY restored from a dump, the fleet has not moved anywhere: the manager\'s restore lane advances the restored control term automatically, and FLEET_CONFIRM_TAKEOVER=1 on the next start overrides the fence by hand.');
     }
   }
+  return null;
 }
 
 function otherNodesConfigured(selfNodeId: string): string[] {
@@ -633,8 +716,8 @@ function otherNodesConfigured(selfNodeId: string): string[] {
  * empty postgres store from local files and provisions DDL, either of which
  * would make the store look populated. Unreachable holds too: an empty store
  * that is merely late to start must not slip through. Exits when the store is
- * populated (seeded), when a takeover override appears (a promote restarts
- * this child anyway) or on the operator's brand-new-fleet confirmation, which
+ * populated (seeded), on FLEET_CONFIRM_TAKEOVER, or on the operator's
+ * brand-new-fleet confirmation, which
  * is CONSUMED here: it answers the empty store in front of it, never every
  * empty store this node will ever boot with.
  */
@@ -660,9 +743,13 @@ async function runEmptyStoreHold(standalone: boolean, selfNodeId: string): Promi
       clearFreshFleetConfirm();
       break;
     }
-    invalidateRoleOverrideCache();
-    const override = readRoleOverride();
-    if (override?.takeover === true || (process.env.FLEET_CONFIRM_TAKEOVER || '').trim() === '1') {
+    // A takeover a promote staged releases nothing here: every lane that
+    // stages one verified moments earlier that the copy had left recovery
+    // holding the fleet's data, so a store reading empty, or unreachable
+    // while it initialises, is not the database that promote was decided on;
+    // a populated one breaks above, and the restart that promote runs ends
+    // this child anyway. The operator's env confirm is the deliberate release.
+    if ((process.env.FLEET_CONFIRM_TAKEOVER || '').trim() === '1') {
       clearFreshFleetConfirm();
       break;
     }
@@ -719,7 +806,63 @@ async function disarmStandIn(reason: string): Promise<never> {
   for (;;) await guardSleep(TERM_GUARD_POLL_MS);
 }
 
-async function initMaster(init: CommonInit & { standalone: boolean }): Promise<FleetContext> {
+/**
+ * The follower hold's structural entry (20.5, B6 map F28, D8): a master with
+ * no database of its own beside a manager-provisioned standby is a copy by
+ * configuration. Asked before the empty-store hold, which probes the node's
+ * own database and would hold forever when there is none to probe; the
+ * in-recovery entry is asked after it.
+ */
+async function ownStoreIsCopy(): Promise<FollowerHoldBase | null> {
+  const url = currentCanonicalUrl();
+  // No database of its own but a manager-provisioned standby beside it: the
+  // manager's re-seed retires the primary's env pins and leaves the standby's,
+  // which is the returning master's shape on a managed machine. A node that
+  // owns a primary beside its standby (20.19 F7) keeps its own URL.
+  if (url === '' && hasDbReplica()) {
+    console.error('[Fleet] FOLLOWER HOLD: this node is the fleet\'s master by configuration but carries no database of its own, only a standby; following the node holding the fleet as a co-worker until the failback promotes that copy, or demote this node to stay a co-worker');
+    return { reason: 'copy', standInNodeId: null, standInName: null, observedTerm: null, localTerm: null, seenVia: 'own database re-seeded as a standby', since: Date.now() };
+  }
+  return null;
+}
+
+/**
+ * The copy hold's probe entry: this node's own database is in recovery. Waits
+ * for that database to answer, rather than shooting once, whenever the control
+ * store about to be prepared blocks on this same database (a live postgres
+ * runtime, or a CONTROL_STORE_URL of its own): a sidecar still starting would
+ * otherwise turn a copy into "not a copy" and send the boot into the control
+ * store's seeding loop, which issues DDL a standby refuses forever, and the
+ * wait costs nothing there. A transformation-required boot (configured
+ * postgres, live file, no control store of its own) comes up on the FILE
+ * control store to serve its diagnosis, so it keeps the single shot.
+ */
+async function ownStoreInRecovery(selfNodeId: string): Promise<FollowerHoldBase | null> {
+  const url = currentCanonicalUrl();
+  if (url === '' || resolveDataBackend() !== 'postgres') return null;
+  // The wait's premise, that the control store about to be prepared blocks on
+  // this same database, holds only when this boot runs a postgres runtime or
+  // names a control store of its own: a transformation-required boot
+  // (configured postgres, live file) comes up on the file control store to
+  // serve its diagnosis, and must not wait on a database it never had.
+  const blocksOnIt = getDataBootStatus().mode === 'postgres' || (loadCredentials().CONTROL_STORE_URL || '').trim() !== '';
+  let probe = await probeReplica(url);
+  for (let announced = false; blocksOnIt && !probe.ok; probe = await probeReplica(url)) {
+    if (!announced) {
+      announced = true;
+      console.warn('[Fleet] Copy hold: this node\'s own database is not answering yet; holding before it can judge the boot');
+    }
+    await guardSleep(TERM_GUARD_POLL_MS);
+  }
+  if (!probe.ok || probe.inRecovery !== true) return null;
+  const row = await readTermRow(url);
+  const holder = row && row.nodeId !== selfNodeId ? row.nodeId : null;
+  console.error(`[Fleet] FOLLOWER HOLD: this node's own database is in recovery, a copy${holder ? ` of ${holder.slice(0, 8)}'s at term ${row!.term}` : ''}, so it cannot serve as master from it; following the node holding the fleet as a co-worker until the failback promotes this copy, or demote this node to stay a co-worker`);
+  noteHolderSighting(holder, row?.term ?? null, 'fence-hold', selfNodeId);
+  return { reason: 'copy', standInNodeId: holder, standInName: null, observedTerm: row?.term ?? null, localTerm: null, seenVia: 'own database in recovery', since: Date.now() };
+}
+
+async function initMaster(init: CommonInit & { standalone: boolean }): Promise<FleetContext | { followerHold: FollowerHoldBase }> {
   // A master follows no slot: a record left by this node's co-worker past must
   // not keep answering the manager's facts hook. The posture fact goes with it,
   // for the same reason: a master is not a standby of itself.
@@ -840,7 +983,19 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   // The store is populated by replication by construction (the arm read its term
   // row), and the hold's own probe loop is unbounded on an error, so running it
   // here can only wedge a boot whose answer is already known.
+  // Before the empty-store hold, which probes the node's own database and
+  // holds forever when there is none to probe.
+  if (!standalone && !standIn) {
+    const copyOf = await ownStoreIsCopy();
+    if (copyOf) return { followerHold: copyOf };
+  }
   const usedFreshConfirm = standIn ? false : await runEmptyStoreHold(standalone, nodeId);
+  // The copy hold's probe entry; it waits for the store where the control
+  // store would block on it anyway.
+  if (!standalone && !standIn) {
+    const inRecovery = await ownStoreInRecovery(nodeId);
+    if (inRecovery) return { followerHold: inRecovery };
+  }
   // Before the control store and before any write of this boot (B6 map F18):
   // a master that died while armed comes back armed, and its first write would
   // hang behind standbys that may no longer exist. Relaxing writes no WAL, so
@@ -887,9 +1042,23 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   // ruling-5 takeover chain. The override's one-shot flags are read BEFORE the
   // CAS and consumed right after it succeeds.
   const bootOverride = readRoleOverride();
-  const takeoverConfirmed = bootOverride?.takeover === true
-    || (process.env.FLEET_CONFIRM_TAKEOVER || '').trim() === '1';
-  const chainTakeover = !standalone && bootOverride?.chainTakeover === true;
+  // A staged takeover is consent only while nothing has held the fleet since
+  // it was staged: a holder sighting at or after the override's own stamp (the
+  // engine refuses to stage over an older one) means the fleet moved past it
+  // while the restart never took. Booting on it would skip the guard and the
+  // fence onto a fleet somebody else holds, so the boot runs both instead,
+  // which park or hold on the live holder; keyed on the override rather than
+  // the promote record, which its own lane may have finished or dismissed
+  // meanwhile. The operator's Cancel on the record clears both, and the env
+  // confirm stays the deliberate seizure, chain included.
+  const envConfirm = (process.env.FLEET_CONFIRM_TAKEOVER || '').trim() === '1';
+  const stagedSeen = bootOverride?.takeover === true || bootOverride?.chainTakeover === true ? readHolderSighting() : null;
+  const stagedSuperseded = !!stagedSeen && stagedSeen.nodeId !== nodeId && stagedSeen.seenAt >= bootOverride!.setAt;
+  if (stagedSuperseded && !envConfirm) {
+    console.error(`[Fleet] TAKEOVER NOT HONOURED: node ${stagedSeen!.nodeId.slice(0, 8)} has held the fleet at term ${stagedSeen!.term} since this takeover was staged; booting through the takeover guard and the stale-master fence instead. Cancel the promote that staged it on the Fleet tab if it is still on record, or demote this node there; FLEET_CONFIRM_TAKEOVER=1 on this node seizes the fleet deliberately`);
+  }
+  const takeoverConfirmed = (bootOverride?.takeover === true && !stagedSuperseded) || envConfirm;
+  const chainTakeover = !standalone && bootOverride?.chainTakeover === true && (!stagedSuperseded || envConfirm);
   let previousHolder: { term: number; nodeId: string } | null = null;
   // The guard watches for a FROZEN term row and reports its holder as takeover
   // chain input. A stand-in's row is frozen by construction on BOTH of its
@@ -911,11 +1080,19 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   // The witness half does NOT catch that case, because an inherited term equals
   // the returning master's and higherTermClaim is strictly-greater; the pre-arm
   // contestedTerm check is what covers an undialable one.
-  await runStaleMasterFence(store, nodeId, nodeName, standalone, takeoverConfirmed, serveOnly);
+  const stagedTakeover = bootOverride?.takeover === true && !stagedSuperseded;
+  const followerHold = await runStaleMasterFence(store, nodeId, nodeName, standalone, envConfirm, stagedTakeover, stagedTakeover ? bootOverride?.supersededStoreDead ?? null : null, serveOnly);
+  if (followerHold) {
+    if (store instanceof PostgresControlStore) await store.close();
+    return { followerHold };
+  }
 
   // The boot cleared every gate, so the brand-new-fleet answer has been spent
   // on the store it was given for.
   if (usedFreshConfirm) clearFreshFleetConfirm();
+  // Past every gate this node holds the fleet itself; the holder it last saw
+  // is one it has replaced.
+  clearHolderSighting();
   // A stand-in INHERITS the term instead of minting one. Minting is an INSERT,
   // which a replica refuses, and acquireTerm retries forever, so on this path it
   // is not merely wrong but a guaranteed wedge. Inheriting is also the correct
@@ -2375,6 +2552,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     let supersededSource: SupersededSource = 'store-fence';
     const persistSupersession = (steppedDown: boolean): void => {
       if (!supersededBy) return;
+      noteHolderSighting(supersededBy.nodeId, supersededBy.term, 'step-down', nodeId);
       const existing = readSuperseded();
       writeSuperseded({
         byNodeId: supersededBy.nodeId,
@@ -3180,13 +3358,27 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   };
 }
 
-async function initCoWorker(init: CommonInit): Promise<FleetContext> {
+async function initCoWorker(init: CommonInit, followerHold: FollowerHoldBase | null = null): Promise<FleetContext> {
   const { nodeId, nodeName, appVersion, capabilities, runtime } = init;
+  if (followerHold) {
+    _setFollowerHold(followerHold);
+    // The database this node booted on is behind the fleet's, or is the copy
+    // the failback promotes: nothing may be served from it (B6 map F28).
+    holdOwnRuntimeForDelivery('this node\'s own database is not the fleet\'s while it holds as a follower; serving waits for the database the node it follows delivers');
+    const followed = (): { url: string; forms: string[] } | null => {
+      const active = getActiveBackendUrl();
+      const forms = hasDelivery() ? getDeliveredBackendUrls() : [];
+      return active !== null && forms.includes(active) && getDataBootStatus().state === 'serving' ? { url: active, forms } : null;
+    };
+    followedBackend = followed;
+    _setFollowerFollowingSupplier(() => ({ url: followed()?.url ?? null, forms: hasDelivery() ? getDeliveredBackendUrls() : [] }));
+    pushFleetStatusNow();
+  }
   const ingest = getIngestService();
   const { urls: masterUrls, source: masterUrlsSource } = effectiveMasterUrls();
   const secret = (process.env.CONTROL_SECRET || '').trim();
 
-  console.log(`[Fleet] Role: co-worker node=${nodeName} (${nodeId.slice(0, 8)}) masters=${masterUrls.join(' | ') || 'none'} (${masterUrlsSource}) capacity=${capabilities.shardCapacity}${isBackupMaster() ? ` BACKUP MASTER` : ''}`);
+  console.log(`[Fleet] Role: co-worker node=${nodeName} (${nodeId.slice(0, 8)}) masters=${masterUrls.join(' | ') || 'none'} (${masterUrlsSource}) capacity=${capabilities.shardCapacity}${isBackupMaster() ? ` BACKUP MASTER` : ''}${followerHold ? ' FOLLOWER HOLD (the fleet\'s master by configuration, following the node holding the fleet)' : ''}`);
   // A stepped-down old master carries its superseded fact into the co-worker
   // role until the manager retires or decommissions this side (B4).
   const priorSupersession = readSuperseded();
@@ -3285,6 +3477,7 @@ async function initCoWorker(init: CommonInit): Promise<FleetContext> {
         writeFleetConfigCache(config);
         controlClient?.updateMasterUrls(config.masterCandidates);
       },
+      onMasterIdentity: (masterNodeId, term) => noteHolderSighting(masterNodeId, term, 'register', nodeId),
       onSuperseded: info => {
         // This node is the old master the new one superseded (B4): record the
         // fact, and the owner's retire request, for the manager. An existing
@@ -3295,6 +3488,7 @@ async function initCoWorker(init: CommonInit): Promise<FleetContext> {
         const since = current?.at ?? info.at;
         const retireRequested = info.retireRequested || current?.retireRequested === true;
         writeSuperseded({ ...info, retireRequested, at: since, source, steppedDown: true });
+        noteHolderSighting(info.byNodeId, info.term, 'step-down', nodeId);
         _setSuperseded({ byNodeId: info.byNodeId, byNodeName: info.byNodeName, term: info.term, source, since, steppedDown: true });
         if (info.retireRequested) console.warn(`[Fleet] The owner asked to retire this side after the transfer to ${info.byNodeName}; the manager performs it`);
       },
@@ -3364,12 +3558,29 @@ async function initCoWorker(init: CommonInit): Promise<FleetContext> {
       onDataBackend: info => {
         void (async () => {
           try {
-            const { changed, recycled } = await applyDeliveredBackend(info);
+            const { changed, recycled } = await applyDeliveredBackend(info, followerHold ? { persist: false } : undefined);
+            if (followerHold) {
+              // A hold entered without a database of its own could not read
+              // whose copy it holds; the delivered credentials can.
+              if (followerHold.reason === 'copy' && followerHold.standInNodeId === null && info?.url) {
+                const endpoints = resolveReplicaEndpoints();
+                const local = endpoints ? spliceFleetCredentials(endpoints.local, info.url).url : undefined;
+                const row = local ? await readTermRow(local) : null;
+                if (row && row.nodeId !== nodeId) {
+                  followerHold.standInNodeId = row.nodeId;
+                  followerHold.observedTerm = row.term;
+                  _setFollowerHold(followerHold);
+                }
+              }
+              pushFleetStatusNow();
+            }
             // A recycled runtime starts with a driver that knows no shards; the
             // held lease is re-mirrored so it hydrates without waiting for the
             // next grant (which may already have landed). Keyed on the recycle,
-            // not on the env change: the two do not always coincide.
-            if (recycled) runtime.renotifyDataLayer();
+            // not on the env change: the two do not always coincide. A hold's
+            // delivery installs a fresh runtime instead (its own was dropped at
+            // the hold), and a lease granted meanwhile must reach it too.
+            if (recycled || (followerHold && getActiveBackendUrl() !== null)) runtime.renotifyDataLayer();
             if (changed) {
               // Mutating the shared object keeps buildRegister's closure
               // current; the refresh converges the master's registry NOW so
@@ -3591,7 +3802,11 @@ async function initCoWorker(init: CommonInit): Promise<FleetContext> {
   };
 
   let witness: FleetWitness | null = null;
-  if (isBackupMaster()) {
+  // A follower hold beacons too (B6 map F28): its promote judges the node it
+  // follows on a fresh witness reading, and the owner sees the master is back.
+  // It never evaluates the arm: it is not a designated backup, and its own
+  // database is the copy that is behind.
+  if (isBackupMaster() || followerHold) {
     const witnessToken = (process.env.DISCORD_TOKEN || '').trim();
     if (witnessToken === '') {
       console.warn('[Fleet] Witness disabled: DISCORD_TOKEN is empty');
@@ -3618,7 +3833,7 @@ async function initCoWorker(init: CommonInit): Promise<FleetContext> {
           if (controlClient?.masterKnown() === true) facts.masterSeen = true;
           return facts;
         },
-        onTick: (renewOk, status) => void evaluateStandInArm(renewOk, status),
+        ...(isBackupMaster() ? { onTick: (renewOk: boolean, status: WitnessStatus) => void evaluateStandInArm(renewOk, status) } : {}),
       });
       readWitnessNow = async () => {
         // Null when the read itself failed: readClaims leaves the previous

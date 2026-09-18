@@ -708,6 +708,15 @@ export class BotManager {
     }
   }
 
+  /** The database a follower hold serves from, with credentials, for the failback promote (B6 map F28). */
+  async readFollowedBackend(): Promise<any> {
+    try {
+      return await this.sendIPCMessage('fleet:followed:read', {}, 10000);
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
   /**
    * Runtime fleet-config edit (B2); master-only, validated in the bot child.
    */

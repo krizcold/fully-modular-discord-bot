@@ -32,11 +32,19 @@ export interface PromoteRecord {
   /** Term row observed at the verdict; the claim refuses if the row moved since. */
   expectedTerm: number | null;
   expectedHolder: string | null;
+  /** 20.12 c3: the superseded master's node id when the verdict saw it alive with its database dead; the boot fence lets that one peer answer. */
+  supersededStoreDead: string | null;
   claimedTerm: number | null;
   /** End-of-WAL position captured when the old primary was fenced (transfer only). */
   fencedLsn: string | null;
   /** Age of the standby's last replayed transaction at the verdict (the RPO shown to the operator). */
   lagMs: number | null;
+  /**
+   * The fleet database this promote fences and claims, credential-less, when it
+   * is not the one this node's own credentials name: a returning master follows
+   * its stand-in's database (B6 map F28). Null = the node's own canonical URL.
+   */
+  canonicalEndpoint: string | null;
 }
 
 const recordFile = () => dataPath('global', FLEET_DIR, 'promote.json');
@@ -59,9 +67,11 @@ export function readPromoteRecord(): PromoteRecord | null {
       supersededDelivered: parsed.supersededDelivered === true,
       expectedTerm: Number.isFinite(parsed.expectedTerm) ? Number(parsed.expectedTerm) : null,
       expectedHolder: typeof parsed.expectedHolder === 'string' ? parsed.expectedHolder : null,
+      supersededStoreDead: typeof parsed.supersededStoreDead === 'string' && parsed.supersededStoreDead !== '' ? parsed.supersededStoreDead : null,
       claimedTerm: Number.isFinite(parsed.claimedTerm) ? Number(parsed.claimedTerm) : null,
       fencedLsn: typeof parsed.fencedLsn === 'string' ? parsed.fencedLsn : null,
       lagMs: Number.isFinite(parsed.lagMs) ? Number(parsed.lagMs) : null,
+      canonicalEndpoint: typeof parsed.canonicalEndpoint === 'string' && parsed.canonicalEndpoint !== '' ? parsed.canonicalEndpoint : null,
     };
   } catch {
     return null;

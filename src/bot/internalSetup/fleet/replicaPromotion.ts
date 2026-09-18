@@ -37,14 +37,19 @@ export function hasDbReplica(): boolean {
   return resolveReplicaEndpoints() !== null;
 }
 
-/** Splice this node's fleet credentials into a credential-less replica endpoint. */
-export function spliceFleetCredentials(replicaUrl: string): { url?: string; error?: string } {
+/**
+ * Splice this node's fleet credentials into a credential-less replica
+ * endpoint. base overrides the node's own URL as the credential source: a
+ * follower hold takes them from the database it follows (B6 map F28), which
+ * the byte copies of one lineage all share.
+ */
+export function spliceFleetCredentials(replicaUrl: string, base?: string): { url?: string; error?: string } {
   const creds = loadCredentials();
-  const base = (creds.DATA_BACKEND_URL || '').trim() || (creds.CONTROL_STORE_URL || '').trim();
-  if (!base) return { error: 'no DATA_BACKEND_URL/CONTROL_STORE_URL known to take the fleet credentials from (delivered on the first register)' };
+  const from = (base || '').trim() || (creds.DATA_BACKEND_URL || '').trim() || (creds.CONTROL_STORE_URL || '').trim();
+  if (!from) return { error: 'no DATA_BACKEND_URL/CONTROL_STORE_URL known to take the fleet credentials from (delivered on the first register)' };
   try {
     const replica = new URL(replicaUrl);
-    const source = new URL(base);
+    const source = new URL(from);
     if (!source.username) return { error: 'the fleet database URL carries no credentials to splice into the replica endpoint' };
     // Getters return the percent-encoded serialization; re-embed verbatim.
     const cred = `${source.username}${source.password ? `:${source.password}` : ''}@`;
@@ -72,6 +77,33 @@ export async function storeReachable(url: string): Promise<{ ok: boolean; error?
   }
 }
 
+/** The URL without its user and password; null when unparseable. */
+export function stripUrlCredentials(url: string | null): string | null {
+  if (!url) return null;
+  try {
+    const parsed = new URL(url);
+    parsed.username = '';
+    parsed.password = '';
+    return parsed.toString();
+  } catch {
+    return null;
+  }
+}
+
+/** The control term row as the database at url holds it; null when absent or unreadable. */
+export async function readTermRow(url: string): Promise<{ term: number; nodeId: string } | null> {
+  const client = new Client({ connectionString: url, connectionTimeoutMillis: 5000, query_timeout: 5000 });
+  try {
+    await client.connect();
+    const res = await client.query(`SELECT term, node_id FROM smdb_control.term WHERE id = 1`);
+    return res.rows.length > 0 ? { term: Number(res.rows[0].term), nodeId: String(res.rows[0].node_id) } : null;
+  } catch {
+    return null;
+  } finally {
+    await client.end().catch(() => { /* best effort */ });
+  }
+}
+
 /** The URL this node currently believes is the fleet's store. */
 export function currentCanonicalUrl(): string {
   const creds = loadCredentials();
@@ -86,9 +118,9 @@ export function canonicalStoreReachable(): Promise<{ ok: boolean; error?: string
 }
 
 /** True when the fleet's canonical URL already names this machine's own database endpoint. */
-export function canonicalIsOwnReplica(endpoints: ReplicaEndpoints): boolean {
+export function canonicalIsOwnReplica(endpoints: ReplicaEndpoints, canonicalUrl = currentCanonicalUrl()): boolean {
   try {
-    const canonical = new URL(currentCanonicalUrl()).host;
+    const canonical = new URL(canonicalUrl).host;
     return canonical === new URL(endpoints.public).host || canonical === new URL(endpoints.local).host;
   } catch {
     return false;
@@ -272,7 +304,10 @@ export function persistPromotedUrls(splicedLocalUrl: string, splicedPublicUrl: s
   // This node dials its own database by the LOCAL form (F1: the public form
   // cannot hairpin from beside the sidecar); the public form is recorded for
   // delivery to remote workers on their next register.
+  // The kind rides with the URL: a follower hold never persisted the
+  // delivery that would have written it, and a promoted copy is postgres.
   const patch: Record<string, string> = {
+    DATA_BACKEND: 'postgres',
     DATA_BACKEND_URL: splicedLocalUrl,
     DATA_BACKEND_LOCAL_URL: splicedLocalUrl,
     DATA_BACKEND_PUBLIC_URL: splicedPublicUrl,

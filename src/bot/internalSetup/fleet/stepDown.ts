@@ -138,6 +138,19 @@ export function notifyStepDown(url: string, secret: string, payload: StepDownPay
 }
 
 /**
+ * The boot fence's witness verdict: the highest claim above this node's term,
+ * except that a stand-in naming this node tied AT that highest term wins the
+ * tie. Every designated backup beacons its master's term, so the stand-in
+ * never has the tie to itself, and message order is not a verdict; anyone
+ * strictly higher still wins (20.5, B6 map F28).
+ */
+export function witnessWinner(claims: WitnessClaim[], selfNodeId: string, selfTerm: number): WitnessClaim | null {
+  const best = higherTermClaim(claims, selfNodeId, selfTerm);
+  if (!best) return null;
+  return claims.find(c => c.nodeId !== selfNodeId && c.standingInFor === selfNodeId && c.term >= best.term) ?? best;
+}
+
+/**
  * Any other node's claim holding a term above ours, fresh or not: this copy is
  * a stale fork (boot fence).
  *
@@ -146,7 +159,8 @@ export function notifyStepDown(url: string, secret: string, payload: StepDownPay
  * the strictly-greater test and this node's boot continues past it to hand
  * back (B6 map F21/F28). A stand-in at a HIGHER term has TAKEN WRITES: its copy
  * is the fleet database now and this node's is behind it, so this node must
- * park (or, if still serving, step down) rather than mint past those writes.
+ * hold as a follower of it (or, if still serving, step down) rather than mint
+ * past those writes (the fence in bootstrap, B6 map F28).
  */
 export function higherTermClaim(claims: WitnessClaim[], selfNodeId: string, selfTerm: number): WitnessClaim | null {
   let best: WitnessClaim | null = null;

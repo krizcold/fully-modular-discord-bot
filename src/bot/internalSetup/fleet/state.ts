@@ -8,7 +8,7 @@ import { getShardSource, isPinEnabled, resolveShardCapacity } from './placement'
 import type { BudgetInfo, NodeRole } from './protocol';
 import { consentsToActiveMode, isBackupMaster, isStandInBoot, readRoleOverride } from './nodeIdentity';
 import { effectiveFleetConfigView, effectiveMasterUrls } from './fleetConfig';
-import { hasDbReplica } from './replicaPromotion';
+import { hasDbReplica, stripUrlCredentials } from './replicaPromotion';
 import type { Registry } from './registry';
 import type { LeaseRuntime } from './leaseRuntime';
 import type { ControlClient } from './controlClient';
@@ -112,6 +112,8 @@ export interface FleetState {
   takeoverHold: TakeoverHoldView | null;
   /** Stale-master boot fence: parked because a live peer holds a term this node's own store cannot beat (PLAN_REPLICATION Stage 4). */
   staleMasterPark: StaleMasterParkView | null;
+  /** Follower hold (20.5, B6 map F28): this master came back behind a stand-in that took the fleet's writes, or on a copy, and follows the node holding the fleet as a co-worker until the failback promotes it back. */
+  followerHold: FollowerHoldView | null;
   /** Boot hold: this master's store is EMPTY while other nodes are configured; seed from a backup first (20.14). */
   emptyStoreHold: EmptyStoreHoldView | null;
   /** This master was superseded by a higher term and is stepping down (B4). */
@@ -277,14 +279,66 @@ export interface StaleMasterParkView {
   localTerm: number;
   peerUrl: string;
   at: number;
-  /** The stand-in that took the fleet's writes while this master was down (20.5); null for a plain stale fork. Its manager reads it to say which copy is behind. */
-  standInNodeId: string | null;
 }
 
 let staleMasterPark: StaleMasterParkView | null = null;
 
 export function _setStaleMasterPark(park: StaleMasterParkView | null): void {
   staleMasterPark = park;
+}
+
+/**
+ * Follower hold (PLAN_REPLICATION 20.5, B6 map F28): this master came back to
+ * find a stand-in holding the fleet's writes for it, or its own database a
+ * copy of another node's, so instead of parking it follows the node holding
+ * the fleet as a co-worker. Its identity stays master (env and override are
+ * untouched, so a restart re-derives the same hold), which is what makes it
+ * the returning master the failback promotes back. Non-terminal: that
+ * promote, or a demote, ends it.
+ */
+export interface FollowerHoldView {
+  /** behind: a stand-in naming this node took writes at a higher term; copy: this node's own database is in recovery. */
+  reason: 'behind' | 'copy';
+  /** The node whose copy holds the fleet's writes; null when a copy's replayed term row named nobody but this node. */
+  standInNodeId: string | null;
+  standInName: string | null;
+  observedTerm: number | null;
+  localTerm: number | null;
+  /** A candidate URL, 'witness beacon of X', or 'own database in recovery'. */
+  seenVia: string;
+  since: number;
+  /** The fleet database this node follows meanwhile, credential-less; null until the node it registered with delivered one. */
+  following: string | null;
+  /** Every form that delivery named (container and public), credential-less: the copy's primary_conninfo may name either. */
+  followingForms: string[];
+  /** The node this bot is registered with still says it stands in for THIS node; null until registered. */
+  namesThisNode: boolean | null;
+}
+
+/** What the boot decides; the live fields are read from the co-worker runtime. */
+export type FollowerHoldBase = Omit<FollowerHoldView, 'following' | 'followingForms' | 'namesThisNode'>;
+
+let followerHold: FollowerHoldBase | null = null;
+let followerFollowing: (() => { url: string | null; forms: string[] }) | null = null;
+
+export function _setFollowerHold(hold: FollowerHoldBase | null): void {
+  followerHold = hold;
+}
+
+/** Read live from the data layer by the co-worker runtime; the view strips credentials, since it is polled by the UI and relayed to the manager. */
+export function _setFollowerFollowingSupplier(fn: (() => { url: string | null; forms: string[] }) | null): void {
+  followerFollowing = fn;
+}
+
+function buildFollowerHoldView(): FollowerHoldView | null {
+  if (!followerHold) return null;
+  const client = sources?.controlClient ?? null;
+  // The last delivered value is kept across reconnects (controlClient), so a
+  // null with a master known means the node it follows names nobody.
+  const named = client?.getMasterStandingInFor() ?? null;
+  const namesThisNode = named !== null ? named === sources!.nodeId : client?.masterKnown() ? false : null;
+  const followed = followerFollowing?.() ?? { url: null, forms: [] };
+  return { ...followerHold, following: stripUrlCredentials(followed.url), followingForms: followed.forms.map(stripUrlCredentials).filter((f): f is string => f !== null), namesThisNode };
 }
 
 /** Boot hold on an EMPTY master store while other nodes are configured (PLAN_REPLICATION 20.14): seed first, never mint. */
@@ -443,6 +497,7 @@ export function getFleetState(): FleetState {
       // branch is what the UI polls then.
       takeoverHold,
       staleMasterPark,
+      followerHold: buildFollowerHoldView(),
       emptyStoreHold,
       superseded,
       roleOverride: buildRoleOverrideView(),
@@ -558,6 +613,7 @@ export function getFleetState(): FleetState {
       controlStoreFenced,
       takeoverHold,
       staleMasterPark,
+      followerHold: buildFollowerHoldView(),
       emptyStoreHold: null,
       superseded,
       roleOverride: buildRoleOverrideView(),
@@ -665,6 +721,7 @@ export function getFleetState(): FleetState {
     controlStoreFenced: null,
     takeoverHold,
     staleMasterPark,
+    followerHold: buildFollowerHoldView(),
     emptyStoreHold: null,
     superseded,
     roleOverride: buildRoleOverrideView(),
