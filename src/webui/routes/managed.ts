@@ -75,6 +75,12 @@ export function createManagedRoutes(botManager: BotManager): Router {
         .filter(url => url !== '');
       const blockEndpoint = copyBlock ? copyBlockEndpoint(copyBlock) : null;
       const copyBlockCurrent = blockEndpoint && delivered.length > 0 ? sourceMatchesAny(blockEndpoint, delivered) : null;
+      // While this node holds as a follower, the block that matters is the one
+      // naming the database it FOLLOWS (B6 map F32): the source the failback
+      // re-seeds this machine from, relayed by the stand-in on register.
+      const holdForms: string[] = Array.isArray(state?.followerHold?.followingForms) ? state.followerHold.followingForms : [];
+      const followingForms: string[] = holdForms.length > 0 ? holdForms : Array.isArray(state?.deliveredForms) ? state.deliveredForms : [];
+      const copyBlockFollowed = blockEndpoint && followingForms.length > 0 ? sourceMatchesAny(blockEndpoint, followingForms) : null;
       res.json({
         success: true,
         running: botManager.isRunning(),
@@ -106,6 +112,8 @@ export function createManagedRoutes(botManager: BotManager): Router {
         copyBlockTarget: state?.initialized === true && state?.role === 'master',
         copyBlock,
         copyBlockCurrent,
+        copyBlockFollowed,
+        ownCopyLineage: state?.ownCopyLineage ?? null,
         // The primary's own word on this node's standby slot (20.17), and the
         // verdict the manager's reseed keys on: fresh, lost, and from the
         // master this copy follows. Unknown folds to false, never to "lost".

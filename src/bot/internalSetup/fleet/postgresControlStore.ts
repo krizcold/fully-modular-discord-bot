@@ -41,8 +41,11 @@ const MOVED_SENTINEL = () => dataPath('global', FLEET_DIR, 'control-store-moved.
 // assert a guarantee about a database that no longer exists (B6 map F23).
 const DOC_NAMES = ['plan', 'registry', 'migrations', 'reshard-pending', 'redistribute-proposal', 'transformation', 'fleet-config'] as const;
 
+/** The fleet's coordination schema: rows here are this node's own bookkeeping, never application data (B6 map F31). */
+export const CONTROL_SCHEMA = 'smdb_control';
+
 const CONTROL_DDL = [
-  `CREATE SCHEMA IF NOT EXISTS smdb_control`,
+  `CREATE SCHEMA IF NOT EXISTS ${CONTROL_SCHEMA}`,
   `CREATE TABLE IF NOT EXISTS smdb_control.term (
     id smallint PRIMARY KEY DEFAULT 1 CHECK (id = 1),
     term bigint NOT NULL,
@@ -107,6 +110,15 @@ export class PostgresControlStore implements ControlStore {
     try {
       for (const statement of CONTROL_DDL) {
         await client.query(statement);
+      }
+      // The failback's divergence proof (B6 map F31) reads this database's WAL
+      // through pg_walinspect, and a copy of it fenced read-only cannot install
+      // anything: installed here, on the writable primary, every copy carries
+      // it. Best effort; a build without the extension reads unknown there.
+      try {
+        await client.query('CREATE EXTENSION IF NOT EXISTS pg_walinspect');
+      } catch (error) {
+        console.warn(`[Fleet] The WAL inspector (pg_walinspect) could not be installed on the fleet database (${error instanceof Error ? error.message : String(error)}); the failback's divergence proof reads unknown on a read-only copy of it`);
       }
       this.provisioned = true;
     } finally {

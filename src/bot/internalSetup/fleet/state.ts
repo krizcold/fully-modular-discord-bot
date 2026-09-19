@@ -21,7 +21,8 @@ import { getReplicaHealth, getStandbyLinks, startReplicaHealthSampler, StandbyLi
 import type { ReplicaHealthReport } from './protocol';
 import type { SlotStatusRecord } from './slotStatus';
 import { getRouteOverrides } from '../utils/dataBackends/routeResolver';
-import { getDataBootStatus, DataBootStatus } from '../utils/dataBackends/boot';
+import { getDataBootStatus, getDeliveredBackendUrls, hasDelivery, DataBootStatus } from '../utils/dataBackends/boot';
+import type { LineageFact } from './lineage';
 import type { TransformationView } from './transformation/transformationCoordinator';
 import type { WitnessStatus } from './witness';
 
@@ -156,6 +157,10 @@ export interface FleetState {
   masterUrl: string | null;
   /** Co-worker: the node it registered with stands in for that master (20.5), so the fleet runs on a temporary copy. */
   masterStandingInFor: string | null;
+  /** Co-worker: this node keeps a promoted copy of its own beside the database it follows (a stand-in whose lane ended), judged against it (B6 map F31, F32); null while that copy is a plain standby. */
+  ownCopyLineage: LineageFact | null;
+  /** Co-worker: every form of the database the master delivered to this process, credential-less; empty until a delivery landed. */
+  deliveredForms: string[];
   /**
    * Worker-onboarding block, master-only. masterUrl is the reachable control
    * endpoint: FLEET_PUBLIC_URL when the platform advertised one, else a
@@ -313,16 +318,28 @@ export interface FollowerHoldView {
   followingForms: string[];
   /** The node this bot is registered with still says it stands in for THIS node; null until registered. */
   namesThisNode: boolean | null;
+  /** The divergence proof (B6 map F31): is this node's own database a prefix of the one it follows; null until judged, and on a copy hold. */
+  lineage: LineageFact | null;
 }
 
 /** What the boot decides; the live fields are read from the co-worker runtime. */
-export type FollowerHoldBase = Omit<FollowerHoldView, 'following' | 'followingForms' | 'namesThisNode'>;
+export type FollowerHoldBase = Omit<FollowerHoldView, 'following' | 'followingForms' | 'namesThisNode' | 'lineage'>;
 
 let followerHold: FollowerHoldBase | null = null;
 let followerFollowing: (() => { url: string | null; forms: string[] }) | null = null;
+let followerLineage: LineageFact | null = null;
+let ownCopyLineage: LineageFact | null = null;
 
 export function _setFollowerHold(hold: FollowerHoldBase | null): void {
   followerHold = hold;
+}
+
+export function _setFollowerLineage(fact: LineageFact | null): void {
+  followerLineage = fact;
+}
+
+export function _setOwnCopyLineage(fact: LineageFact | null): void {
+  ownCopyLineage = fact;
 }
 
 /** Read live from the data layer by the co-worker runtime; the view strips credentials, since it is polled by the UI and relayed to the manager. */
@@ -338,7 +355,7 @@ function buildFollowerHoldView(): FollowerHoldView | null {
   const named = client?.getMasterStandingInFor() ?? null;
   const namesThisNode = named !== null ? named === sources!.nodeId : client?.masterKnown() ? false : null;
   const followed = followerFollowing?.() ?? { url: null, forms: [] };
-  return { ...followerHold, following: stripUrlCredentials(followed.url), followingForms: followed.forms.map(stripUrlCredentials).filter((f): f is string => f !== null), namesThisNode };
+  return { ...followerHold, following: stripUrlCredentials(followed.url), followingForms: followed.forms.map(stripUrlCredentials).filter((f): f is string => f !== null), namesThisNode, lineage: followerLineage };
 }
 
 /** Boot hold on an EMPTY master store while other nodes are configured (PLAN_REPLICATION 20.14): seed first, never mint. */
@@ -525,6 +542,8 @@ export function getFleetState(): FleetState {
       masterKnown: false,
       masterUrl: null,
       masterStandingInFor: null,
+      ownCopyLineage: null,
+      deliveredForms: [],
       connect: null,
       recovery: null,
       sync: { status: 'n/a' },
@@ -641,6 +660,8 @@ export function getFleetState(): FleetState {
       masterKnown: true,
       masterUrl: null,
       masterStandingInFor: null,
+      ownCopyLineage: null,
+      deliveredForms: [],
       connect: buildConnect(),
       recovery: sources.recovery
         ? {
@@ -749,6 +770,8 @@ export function getFleetState(): FleetState {
     masterKnown: registered,
     masterUrl: controlClient?.getCurrentMasterUrl() ?? effectiveMasterUrls().urls[0] ?? null,
     masterStandingInFor: controlClient?.getMasterStandingInFor() ?? null,
+    ownCopyLineage,
+    deliveredForms: hasDelivery() ? getDeliveredBackendUrls().map(stripUrlCredentials).filter((f): f is string => f !== null) : [],
     connect: null,
     recovery: null,
     sync: sources.sync?.() ?? { status: 'n/a' },

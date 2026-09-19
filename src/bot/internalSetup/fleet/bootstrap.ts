@@ -65,7 +65,7 @@ import {
   resolveShardCount,
 } from './placement';
 import { evaluateRecovery } from './recovery';
-import { _setControlStoreFenced, _setEmptyStoreHold, _setFleetStateSources, _setFollowerFollowingSupplier, _setFollowerHold, _setSlotStatus, _setStaleMasterPark, _setSuperseded, _setTakeoverHold, FleetRecoverySource, FleetRefusedRegistration, FollowerHoldBase, getFleetState } from './state';
+import { _setControlStoreFenced, _setEmptyStoreHold, _setFleetStateSources, _setFollowerFollowingSupplier, _setFollowerHold, _setFollowerLineage, _setOwnCopyLineage, _setSlotStatus, _setStaleMasterPark, _setSuperseded, _setTakeoverHold, FleetRecoverySource, FleetRefusedRegistration, FollowerHoldBase, getFleetState } from './state';
 import type { MigrationView, PinViolationView } from './state';
 import { serveSyncRequest, SyncAuthority } from './syncAuthority';
 import { SyncEngine } from './syncEngine';
@@ -101,6 +101,7 @@ import { probePeerTerm } from './peerTermProbe';
 import { probeStoreEmpty } from './emptyStore';
 import { readPromoteRecord, writePromoteRecord } from './promoteRecord';
 import { clearHolderSighting, noteHolderSighting, readHolderSighting } from './holderSighting';
+import { judgeLineage, LINEAGE_REFRESH_MS, LineageFact } from './lineage';
 import {
   clearFreshFleetConfirm,
   clearSuperseded,
@@ -2767,8 +2768,9 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
           persistFleetConfig(`active mode withdrawn ${payload.nodeName || payload.nodeId}`);
         }
         // B4 facts: the node this master superseded learns it here (and
-        // whether the owner asked to retire it); designated backups get the
-        // copy block a brand-new machine seeds from.
+        // whether the owner asked to retire it); designated backups, and the
+        // node a stand-in covers, get the copy block a machine seeds from (the
+        // failback re-seeds the returning master from it, B6 map F32).
         // Delivered ONCE (marked in afterRegister, once the reply is actually
         // on the wire): a standing retire instruction re-armed on every
         // reconnect would keep a long-retired side flagged forever.
@@ -2779,7 +2781,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
         // Only a block naming THIS master's own database is relayed: a block
         // inherited from the master this node superseded names a fenced
         // database, and a standby seeded from it would follow the wrong side.
-        const held = payload.capabilities?.backupMaster === true ? readCopyBlock() : null;
+        const held = payload.capabilities?.backupMaster === true || (coveringNodeId !== null && payload.nodeId === coveringNodeId) ? readCopyBlock() : null;
         const heldEndpoint = held ? copyBlockEndpoint(held) : null;
         const own = buildDataBackendInfo();
         const ownUrls = [own.url, own.publicUrl].filter((url): url is string => typeof url === 'string' && url !== '');
@@ -3374,6 +3376,22 @@ async function initCoWorker(init: CommonInit, followerHold: FollowerHoldBase | n
     _setFollowerFollowingSupplier(() => ({ url: followed()?.url ?? null, forms: hasDelivery() ? getDeliveredBackendUrls() : [] }));
     pushFleetStatusNow();
   }
+  // The divergence proof (B6 map F31), judged once a delivery installs and
+  // re-judged on a slow cadence: neither position moves while this node
+  // follows, so the refresh only catches a side that was unreadable.
+  let lineageTimer: NodeJS.Timeout | null = null;
+  const judge = (own: () => string | null, followedUrl: () => string | null, set: (fact: LineageFact | null) => void): void => {
+    const run = async (): Promise<void> => {
+      const ownUrl = own();
+      const url = followedUrl();
+      set(ownUrl && url ? await judgeLineage(ownUrl, url) : null);
+      pushFleetStatusNow();
+    };
+    if (lineageTimer) clearInterval(lineageTimer);
+    lineageTimer = setInterval(() => { void run(); }, LINEAGE_REFRESH_MS);
+    lineageTimer.unref();
+    void run();
+  };
   const ingest = getIngestService();
   const { urls: masterUrls, source: masterUrlsSource } = effectiveMasterUrls();
   const secret = (process.env.CONTROL_SECRET || '').trim();
@@ -3572,7 +3590,22 @@ async function initCoWorker(init: CommonInit, followerHold: FollowerHoldBase | n
                   _setFollowerHold(followerHold);
                 }
               }
+              // Behind a stand-in, this node's own database (the one its own
+              // URL names; the hold persisted nothing) is judged against the
+              // one it now follows. A copy hold has nothing of its own to judge.
+              if (followerHold.reason === 'behind') judge(() => currentCanonicalUrl() || null, () => fleetFollowedBackend()?.url ?? null, _setFollowerLineage);
               pushFleetStatusNow();
+            } else if (info?.url && hasDbReplica() && readSuperseded()) {
+              // A stand-in whose lane ended keeps its promoted copy beside the
+              // database it now follows: judged so its manager's drop-back can
+              // say what the re-seed would destroy (B6 map F32). Back in
+              // recovery, the copy is a plain standby again and there is nothing
+              // to judge.
+              judge(() => {
+                const endpoints = resolveReplicaEndpoints();
+                const active = getActiveBackendUrl();
+                return endpoints && active ? spliceFleetCredentials(endpoints.local, active).url ?? null : null;
+              }, () => getActiveBackendUrl(), fact => _setOwnCopyLineage(fact && fact.ownInRecovery === false ? fact : null));
             }
             // A recycled runtime starts with a driver that knows no shards; the
             // held lease is re-mirrored so it hydrates without waiting for the
