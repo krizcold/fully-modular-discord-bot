@@ -45,6 +45,12 @@ export interface PromoteRecord {
    * its stand-in's database (B6 map F28). Null = the node's own canonical URL.
    */
   canonicalEndpoint: string | null;
+  /** A returning master's F31 verdict on its own database against the one it follows, as read when this promote started (B6-j: the episode record). */
+  lineageVerdict: string | null;
+  /** When this node first saw the node it follows holding the fleet, captured when the failback was decided (the child clears the sighting when it boots). */
+  holdSince: number | null;
+  /** The decision found this copy already out of recovery: a lane's own promoted database, still holding what that lane took (B6-j). */
+  promotedCopy: boolean;
 }
 
 const recordFile = () => dataPath('global', FLEET_DIR, 'promote.json');
@@ -72,6 +78,9 @@ export function readPromoteRecord(): PromoteRecord | null {
       fencedLsn: typeof parsed.fencedLsn === 'string' ? parsed.fencedLsn : null,
       lagMs: Number.isFinite(parsed.lagMs) ? Number(parsed.lagMs) : null,
       canonicalEndpoint: typeof parsed.canonicalEndpoint === 'string' && parsed.canonicalEndpoint !== '' ? parsed.canonicalEndpoint : null,
+      lineageVerdict: typeof parsed.lineageVerdict === 'string' ? parsed.lineageVerdict : null,
+      holdSince: Number.isFinite(parsed.holdSince) ? Number(parsed.holdSince) : null,
+      promotedCopy: parsed.promotedCopy === true,
     };
   } catch {
     return null;

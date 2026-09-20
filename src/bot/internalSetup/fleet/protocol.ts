@@ -147,6 +147,8 @@ export interface RegisterResult {
   standingInFor?: string;
   /** The answering master's node id, on accepted replies (B6 map F28: the holder sighting). */
   nodeId?: string;
+  /** The answering master's display name, beside its id (B6-j: the serving-machine line). */
+  nodeName?: string;
 }
 
 /**

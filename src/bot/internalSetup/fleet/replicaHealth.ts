@@ -24,6 +24,8 @@ import { PostgresBackend } from '../utils/dataBackends/postgresBackend';
 import { probeReplica, resolveReplicaEndpoints, spliceFleetCredentials } from './replicaPromotion';
 import { readReplayedSyncPosture, type ReplayedSyncPosture } from './syncPostureFact';
 import type { ReplicaHealthReport, SlotStatusRow } from './protocol';
+import { expireHeldEpisodeIfReseeded, stampUnrecordedLaneReseeded } from './episodeRecord';
+import { getNodeId } from './nodeIdentity';
 
 const SAMPLE_MS = 60_000;
 
@@ -116,6 +118,13 @@ async function sampleLocalReplica(): Promise<void> {
       replayAgeMs: probe.replayAgeMs ?? null,
     }
     : { streaming: false, inRecovery: false, replayAgeMs: null, error: probe.error };
+  // A copy back in recovery was re-seeded: a held verdict on this node's own
+  // stand-in lane expires here, once, where the transition is seen (B6-j), and
+  // a lane that left no record is stamped on its arm record the same way.
+  if (probe.ok && probe.inRecovery === true) {
+    try { expireHeldEpisodeIfReseeded(getNodeId()); } catch { /* an episode-stamp fault never blocks the sampler */ }
+    try { stampUnrecordedLaneReseeded(getNodeId()); } catch { /* likewise for the arm's stamp */ }
+  }
   // Settings, not state: the last good read stays valid while the standby is
   // down, which is exactly when a pushed "lost" must still find its slot.
   // The source read can fail on its own (a superuser-only setting, a timeout

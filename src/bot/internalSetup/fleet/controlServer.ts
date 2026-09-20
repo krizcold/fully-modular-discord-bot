@@ -25,6 +25,8 @@ export interface ControlServerHooks {
   getTerm: () => number;
   /** This master's own node id, so a TERM_PROBE reply can be attributed (a prober must be able to recognise its own answer). */
   getNodeId: () => string;
+  /** This node's display name, said beside the id in the register reply so a worker can name what it follows. */
+  getNodeName?: () => string;
   /** The master this node is temporarily standing in for, if any; the returning master must not fence itself out on it. */
   getStandingInFor?: () => string | null;
   /** A newer master says step down (B4); answered pre-registration like TERM_PROBE. */
@@ -200,7 +202,7 @@ export class ControlServer {
         this.conns.set(payload.nodeId, socket);
         state.nodeId = payload.nodeId;
       }
-      if (requestId) this.reply(socket, requestId, result.accepted ? { ...result, nodeId: this.hooks.getNodeId() } : result);
+      if (requestId) this.reply(socket, requestId, result.accepted ? { ...result, nodeId: this.hooks.getNodeId(), ...(this.hooks.getNodeName ? { nodeName: this.hooks.getNodeName() } : {}) } : result);
       if (result.accepted) this.hooks.afterRegister(payload.nodeId);
       return;
     }

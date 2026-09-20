@@ -27,7 +27,7 @@ import {
   REPLICA_LAG_PROMOTE_MAX_MS,
 } from '../bot/internalSetup/fleet/constants';
 import { isContainerPinned, loadCredentials } from '../utils/envLoader';
-import { clearRoleOverride, getNodeId, invalidateRoleOverrideCache, readRoleOverride, writeRoleOverride } from '../bot/internalSetup/fleet/nodeIdentity';
+import { clearRoleOverride, getNodeId, getNodeName, invalidateRoleOverrideCache, readRoleOverride, writeRoleOverride } from '../bot/internalSetup/fleet/nodeIdentity';
 import { PromoteRecord, clearPromoteRecord, readPromoteRecord, writePromoteRecord } from '../bot/internalSetup/fleet/promoteRecord';
 import { HolderSighting, readHolderSighting } from '../bot/internalSetup/fleet/holderSighting';
 import {
@@ -46,6 +46,7 @@ import {
 } from '../bot/internalSetup/fleet/replicaPromotion';
 import { StandInWriteRequest, clearSuperseded, freshMasterClaim, masterStoreDeadNow } from '../bot/internalSetup/fleet/stepDown';
 import { readArmRecord, writeArmRecord } from '../bot/internalSetup/fleet/armRecord';
+import { closeStandInEpisodeOrWarn, failbackEpisode, promoteClosesEpisode, readEpisodeRecord, recallLineageVerdict, writeEpisodeRecordOrWarn } from '../bot/internalSetup/fleet/episodeRecord';
 import { backupsAhead, readSlotStatus, sourceMatchesAny } from '../bot/internalSetup/fleet/slotStatus';
 import { watchForSyncWaitCancel } from '../bot/internalSetup/utils/syncWaitCancel';
 
@@ -517,7 +518,12 @@ export async function startPromote(botManager: BotManager, opts: PromoteStartOpt
     fencedLsn: resume?.fencedLsn ?? null,
     lagMs,
     canonicalEndpoint,
+    lineageVerdict: hold?.lineage?.verdict ?? null,
+    holdSince: hold ? (readHolderSighting()?.firstSeenAt ?? hold.since) : null,
+    promotedCopy: probe.inRecovery === false,
   };
+  // The behind hold's verdict was judged in the process before the re-seed (B6-j).
+  if (record.lineageVerdict === null) record.lineageVerdict = recallLineageVerdict(record.supersededNodeId, record.holdSince);
   writePromoteRecord(record);
   console.warn(`[Fleet] PROMOTE started (${mode}): ${resume ? 'resumed at' : 'phase'} ${record.phase}${record.retireOldMaster ? ', old master to be retired' : ''}`);
   void runPhases(botManager, record, spliced);
@@ -589,10 +595,40 @@ export async function startStandInWrites(botManager: BotManager, req: StandInWri
     fencedLsn: null,
     lagMs: probe.replayAgeMs ?? null,
     canonicalEndpoint: null,
+    lineageVerdict: null,
+    holdSince: null,
+    promotedCopy: false,
   };
   writePromoteRecord(record);
   console.warn(`[Fleet] STAND-IN WRITE STEP started for ${req.coveringNodeId.slice(0, 8)} (held to ${req.heldToLsn ?? 'unknown'}): promoting this machine's copy`);
   void runPhases(botManager, record, spliced);
+}
+
+const PROMOTED_BY_HAND = 'promoted by hand into the true master';
+
+/**
+ * The stand-in lane a takeover promote ends (B6-j), from the restart and from
+ * the resume that finds the restart already taken. Only a lane that is live,
+ * or that ended holding the writes, is ended BY this promote; an old record
+ * that never took writes keeps its own reason, or the tab would blame this
+ * promote for it. The arm record's reason is written first and either way:
+ * the manager recognises this exit by it. Whether the lane's episode closes
+ * is the episode module's rule, and its write never fails the promote.
+ */
+function closeTakeoverLane(record: PromoteRecord): void {
+  if (record.mode === 'stand-in') return;
+  const arm = readArmRecord();
+  if (!arm || arm.phase === 'claimed' || (arm.phase === 'disarmed' && arm.promotedAt === null)) return;
+  writeArmRecord({ ...arm, phase: 'disarmed', disarmedAt: Date.now(), disarmReason: PROMOTED_BY_HAND });
+  if (promoteClosesEpisode(arm.phase, record, readEpisodeRecord(), getNodeId())) {
+    closeStandInEpisodeOrWarn(arm, getNodeId(), getNodeName(), null, 'promoted-for-good', PROMOTED_BY_HAND);
+  }
+}
+
+/** A returning master's failback that finished (B6-j): the outcome is the episode module's verdict on the record. */
+function noteFailbackDone(record: PromoteRecord): void {
+  const episode = failbackEpisode(record, readHolderSighting(), getNodeId(), getNodeName());
+  if (episode) writeEpisodeRecordOrWarn(episode);
 }
 
 /** The stand-in lane still wants the writes: its record has asked for them or already holds them. */
@@ -865,6 +901,8 @@ export async function resumePromote(botManager: BotManager): Promise<void> {
     const override = readRoleOverride();
     if (override?.role === 'master' && override.setAt >= record.startedAt) {
       record.phase = 'done';
+      closeTakeoverLane(record);
+      noteFailbackDone(record);
       writePromoteRecord(record);
       console.warn('[Fleet] PROMOTE complete: the restart it was interrupted in has already taken');
       return;
@@ -938,6 +976,7 @@ async function runPhases(botManager: BotManager, record: PromoteRecord, spliced:
             // not need to be finished for the new master to deliver it.
             await phaseRestart(botManager, record);
             record.phase = 'done';
+            noteFailbackDone(record);
             break;
         }
         save();
@@ -1109,15 +1148,7 @@ async function phaseRestart(botManager: BotManager, record: PromoteRecord): Prom
   for (let attempt = 0; ; attempt++) {
     const restart = await botManager.restart();
     if (restart.success) {
-      if (record.mode !== 'stand-in') {
-        // Only a lane that is live, or that ended holding the writes, is
-        // ended BY this promote; an old record that never took writes keeps
-        // its own reason, or the tab would blame this promote for it.
-        const arm = readArmRecord();
-        if (arm && arm.phase !== 'claimed' && (arm.phase !== 'disarmed' || arm.promotedAt !== null)) {
-          writeArmRecord({ ...arm, phase: 'disarmed', disarmedAt: Date.now(), disarmReason: 'promoted by hand into the true master' });
-        }
-      }
+      closeTakeoverLane(record);
       return;
     }
     if (restart.reason !== 'operation_in_progress' || attempt >= 5) {

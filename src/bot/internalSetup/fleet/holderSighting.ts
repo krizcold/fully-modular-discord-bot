@@ -18,6 +18,8 @@ export interface HolderSighting {
   /** When this node FIRST saw that node holding at that term; a re-derived hold or a reconnect keeps it. */
   seenAt: number;
   via: HolderSightingVia;
+  /** When this node first saw that node holding at ANY term; carried across the holder's own term advances (B6-j: the episode's window). */
+  firstSeenAt: number;
 }
 
 const sightingFile = () => dataPath('global', FLEET_DIR, 'holder-sighting.json');
@@ -31,6 +33,7 @@ export function readHolderSighting(): HolderSighting | null {
       term: Number(parsed.term),
       seenAt: Number(parsed.seenAt),
       via: parsed.via === 'fence-park' || parsed.via === 'fence-hold' || parsed.via === 'step-down' ? parsed.via : 'register',
+      firstSeenAt: Number.isFinite(parsed.firstSeenAt) ? Number(parsed.firstSeenAt) : Number(parsed.seenAt),
     };
   } catch {
     return null;
@@ -51,7 +54,12 @@ export function noteHolderSighting(nodeId: string | null, term: number | null, v
   if (!nodeId || nodeId === selfNodeId || term === null || !Number.isFinite(term)) return;
   const current = readHolderSighting();
   if (current && (term < current.term || (term === current.term && nodeId === current.nodeId))) return;
-  atomicWriteFileSync(sightingFile(), JSON.stringify({ nodeId, term, seenAt: Date.now(), via }, null, 2));
+  // A reconnect reports the holder's TERM, not how this node learned it holds:
+  // the same node moving up keeps the recorded via (a hold, a park, a
+  // step-down), which the seizure's episode is keyed on (B6-j).
+  const recorded = current && current.nodeId === nodeId && via === 'register' ? current.via : via;
+  const firstSeenAt = current && current.nodeId === nodeId ? current.firstSeenAt : Date.now();
+  atomicWriteFileSync(sightingFile(), JSON.stringify({ nodeId, term, seenAt: Date.now(), via: recorded, firstSeenAt }, null, 2));
 }
 
 export function clearHolderSighting(): void {

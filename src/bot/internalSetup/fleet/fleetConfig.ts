@@ -8,7 +8,7 @@ import * as fs from 'fs';
 import { dataPath } from '../../../utils/dataRoot';
 import { FLEET_DIR } from './constants';
 import { atomicWriteFileSync } from './fileControlStore';
-import { resolveMasterUrls, stripSelfUrl } from './nodeIdentity';
+import { rawMasterUrls, resolveMasterUrls, stripSelfUrl } from './nodeIdentity';
 import type { BackupDesignation, FleetConfigPayload } from './protocol';
 
 const cacheFile = () => dataPath('global', FLEET_DIR, 'config-cache.json');
@@ -86,19 +86,52 @@ export function effectiveMasterUrls(): { urls: string[]; source: 'runtime' | 'en
   return { urls: resolveMasterUrls(), source: 'env' };
 }
 
+/** Where each value in force came from (20.7): the runtime document, the env seed, or the default of an unset key. */
+export interface FleetConfigSources {
+  masterCandidates: 'runtime' | 'env';
+  witnessChannelId: 'runtime' | 'default';
+  backupDesignations: 'runtime' | 'none';
+}
+
+export interface FleetConfigView {
+  revision: number;
+  masterCandidates: string[];
+  backupDesignations: BackupDesignation[];
+  witnessChannelId?: string;
+  sources: FleetConfigSources;
+}
+
+/** The sources of a runtime document's values: an empty stored list leaves the env seed in force (effectiveMasterUrls). */
+export function fleetConfigSources(config: { masterCandidates: string[]; backupDesignations: unknown[]; witnessChannelId?: string }): FleetConfigSources {
+  return {
+    masterCandidates: config.masterCandidates.length > 0 ? 'runtime' : 'env',
+    witnessChannelId: config.witnessChannelId !== undefined ? 'runtime' : 'default',
+    backupDesignations: config.backupDesignations.length > 0 ? 'runtime' : 'none',
+  };
+}
+
+/**
+ * The view of a stored document, on the master and on every copy alike: an
+ * empty stored list shows the env seed it leaves in force, UNFILTERED, because
+ * the view stands for the fleet-wide document (which carries the master's own
+ * URL) and seeds the editor; the per-node self-filter applies at dial time.
+ */
+export function fleetConfigViewOf(config: { revision: number; masterCandidates: string[]; backupDesignations: BackupDesignation[]; witnessChannelId?: string }): FleetConfigView {
+  const sources = fleetConfigSources(config);
+  return {
+    revision: config.revision,
+    masterCandidates: sources.masterCandidates === 'runtime' ? config.masterCandidates : rawMasterUrls(),
+    backupDesignations: config.backupDesignations,
+    ...(config.witnessChannelId !== undefined ? { witnessChannelId: config.witnessChannelId } : {}),
+    sources,
+  };
+}
+
 /** Fleet-state view of the config in force on this node (workers and pre-init reads). */
-export function effectiveFleetConfigView(): { revision: number; masterCandidates: string[]; backupDesignations: BackupDesignation[]; witnessChannelId?: string; source: 'runtime' | 'env' } {
+export function effectiveFleetConfigView(): FleetConfigView {
   const cached = readFleetConfigCache();
-  if (cached) {
-    return {
-      revision: cached.revision,
-      masterCandidates: cached.masterCandidates,
-      backupDesignations: cached.backupDesignations,
-      ...(cached.witnessChannelId !== undefined ? { witnessChannelId: cached.witnessChannelId } : {}),
-      source: 'runtime',
-    };
-  }
-  return { revision: 0, masterCandidates: resolveMasterUrls(), backupDesignations: [], source: 'env' };
+  if (cached) return fleetConfigViewOf(cached);
+  return { revision: 0, masterCandidates: rawMasterUrls(), backupDesignations: [], sources: { masterCandidates: 'env', witnessChannelId: 'default', backupDesignations: 'none' } };
 }
 
 /**

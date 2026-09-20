@@ -3,17 +3,11 @@
 // both callers. Promote lives in promoteEngine; this is its counterpart.
 
 import { BotManager } from './botManager';
-import {
-  clearRoleOverride,
-  invalidateRoleOverrideCache,
-  isStandalone,
-  resolveEnvRole,
-  resolveNodeRole,
-  writeRoleOverride,
-} from '../bot/internalSetup/fleet/nodeIdentity';
+import { clearRoleOverride, getNodeId, getNodeName, invalidateRoleOverrideCache, isStandalone, resolveEnvRole, resolveNodeRole, writeRoleOverride } from '../bot/internalSetup/fleet/nodeIdentity';
 import { effectiveMasterUrls } from '../bot/internalSetup/fleet/fleetConfig';
 import { freshMasterClaim, readSuperseded } from '../bot/internalSetup/fleet/stepDown';
-import { readArmRecord, writeArmRecord } from '../bot/internalSetup/fleet/armRecord';
+import { readArmRecord } from '../bot/internalSetup/fleet/armRecord';
+import { closeStandInLane } from '../bot/internalSetup/fleet/episodeRecord';
 
 export interface DemoteResult {
   success: boolean;
@@ -118,7 +112,7 @@ export async function runDemote(
     // later restore the stand-in override over this demotion.
     const arm = readArmRecord();
     if (arm && arm.phase !== 'disarmed') {
-      writeArmRecord({ ...arm, phase: 'disarmed', disarmedAt: Date.now(), disarmReason: `demoted by the operator (${setBy})` });
+      closeStandInLane(arm, getNodeId(), getNodeName(), null, 'demoted', `demoted by the operator (${setBy})`, `demoted by the operator (${setBy})`);
     }
     if (resolveEnvRole() === 'co-worker') {
       clearRoleOverride();

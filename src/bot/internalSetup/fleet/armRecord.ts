@@ -58,6 +58,8 @@ export interface ArmRecord {
   promotedAt: number | null;
   disarmedAt: number | null;
   disarmReason: string | null;
+  /** The copy was seen re-seeded after this lane took writes and ended with no episode record of its own (B6-j): stamped once by the replica sampler. */
+  copyReseededAt: number | null;
 }
 
 const recordFile = (): string => dataPath('global', FLEET_DIR, 'arm.json');
@@ -100,6 +102,7 @@ export function readArmRecord(): ArmRecord | null {
       promotedAt: Number.isFinite(parsed.promotedAt) ? Number(parsed.promotedAt) : null,
       disarmedAt: Number.isFinite(parsed.disarmedAt) ? Number(parsed.disarmedAt) : null,
       disarmReason: typeof parsed.disarmReason === 'string' ? parsed.disarmReason : null,
+      copyReseededAt: Number.isFinite(parsed.copyReseededAt) ? Number(parsed.copyReseededAt) : null,
     };
   } catch {
     return null;

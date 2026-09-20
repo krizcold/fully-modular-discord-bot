@@ -4,10 +4,11 @@
 import { performance } from 'perf_hooks';
 import { ARM_MAX_ATTEMPTS, ARM_SPACING_MS, CONTROL_PORT_DEFAULT, LEASE_TTL_MS, PROTOCOL_VERSION, WITNESS_FRESH_WINDOW_MS } from './constants';
 import { ArmPhase, readArmRecord } from './armRecord';
+import { EpisodeRecord, readEpisodeRecord } from './episodeRecord';
 import { getShardSource, isPinEnabled, resolveShardCapacity } from './placement';
 import type { BudgetInfo, NodeRole } from './protocol';
 import { consentsToActiveMode, isBackupMaster, isStandInBoot, readRoleOverride } from './nodeIdentity';
-import { effectiveFleetConfigView, effectiveMasterUrls } from './fleetConfig';
+import { FleetConfigView, effectiveFleetConfigView, effectiveMasterUrls } from './fleetConfig';
 import { hasDbReplica, stripUrlCredentials } from './replicaPromotion';
 import type { Registry } from './registry';
 import type { LeaseRuntime } from './leaseRuntime';
@@ -121,6 +122,8 @@ export interface FleetState {
   superseded: SupersededView | null;
   /** The stand-in lane (20.5, B6-f): live while this node holds the fleet for a dead master; its last record otherwise. */
   standIn: StandInView | null;
+  /** The last stand-in episode this node took part in, on either side (B6-j): who stood in for whom, how it ended, what became of the outage writes. */
+  episode: EpisodeRecord | null;
   /** Operator role override in force (promotion/demotion); null when the role comes from env. */
   roleOverride: { role: NodeRole; setBy: string; setAt: number } | null;
   /** This node is the designated backup master (BOT_NODE_ROLE=backup-master). */
@@ -134,7 +137,7 @@ export interface FleetState {
   /** Co-worker: the ordered master candidate list in use. */
   masterUrls: string[];
   /** Fleet runtime config in force on this node (B2); null only on a standalone master. */
-  fleetConfig: { revision: number; masterCandidates: string[]; backupDesignations: { nodeId: string; priority: number }[]; witnessChannelId?: string; source: 'runtime' | 'env' } | null;
+  fleetConfig: FleetConfigView | null;
   /** Discord witness beacon status (B3); null when this node is not an election participant. */
   witness: WitnessStatus | null;
   protocolVersion: number;
@@ -157,6 +160,9 @@ export interface FleetState {
   masterUrl: string | null;
   /** Co-worker: the node it registered with stands in for that master (20.5), so the fleet runs on a temporary copy. */
   masterStandingInFor: string | null;
+  /** Co-worker: the node it is registered with, as its register reply named itself (B6-j: the serving-machine line). */
+  masterNodeId: string | null;
+  masterName: string | null;
   /** Co-worker: this node keeps a promoted copy of its own beside the database it follows (a stand-in whose lane ended), judged against it (B6 map F31, F32); null while that copy is a plain standby. */
   ownCopyLineage: LineageFact | null;
   /** Co-worker: every form of the database the master delivered to this process, credential-less; empty until a delivery landed. */
@@ -407,6 +413,8 @@ export interface StandInView {
   promotedAt: number | null;
   disarmedAt: number | null;
   disarmReason: string | null;
+  /** The copy was seen re-seeded after a lane that took writes ended with no record of its own (B6-j). */
+  copyReseededAt: number | null;
   /** After a disarm: when the F40 spacing lets the lane arm again; null while it is live or once the attempt cap is spent. */
   rearmAfter: number | null;
 }
@@ -426,6 +434,7 @@ function buildStandInView(): StandInView | null {
     promotedAt: record.promotedAt,
     disarmedAt: record.disarmedAt,
     disarmReason: record.disarmReason,
+    copyReseededAt: record.copyReseededAt,
     rearmAfter: record.phase === 'disarmed' && record.attempts < ARM_MAX_ATTEMPTS ? Math.max(record.lastAttemptAt, record.disarmedAt ?? 0) + ARM_SPACING_MS : null,
   };
 }
@@ -463,7 +472,7 @@ export interface FleetStateSources {
   /** Term-stamp health supplier (fleet master on the postgres store only); null otherwise. */
   termStamp: (() => number | null) | null;
   /** Fleet runtime config supplier (B2); null on standalone. */
-  fleetConfig: (() => { revision: number; masterCandidates: string[]; backupDesignations: { nodeId: string; priority: number }[]; witnessChannelId?: string; source: 'runtime' | 'env' } | null) | null;
+  fleetConfig: (() => FleetConfigView | null) | null;
   /** Witness status supplier (B3); null when no witness runs on this node. */
   witness: (() => WitnessStatus) | null;
   /** Live migration/transformation work on THIS node (co-worker executors); null on masters (coordinator view covers it). */
@@ -519,6 +528,7 @@ export function getFleetState(): FleetState {
       superseded,
       roleOverride: buildRoleOverrideView(),
       standIn: buildStandInView(),
+      episode: null,
       backupMaster: isBackupMaster(),
       activeCapable: consentsToActiveMode(),
       dbReplica: hasDbReplica(),
@@ -542,6 +552,8 @@ export function getFleetState(): FleetState {
       masterKnown: false,
       masterUrl: null,
       masterStandingInFor: null,
+      masterNodeId: null,
+      masterName: null,
       ownCopyLineage: null,
       deliveredForms: [],
       connect: null,
@@ -637,6 +649,7 @@ export function getFleetState(): FleetState {
       superseded,
       roleOverride: buildRoleOverrideView(),
       standIn: buildStandInView(),
+      episode: readEpisodeRecord(),
       backupMaster: isBackupMaster(),
       activeCapable: consentsToActiveMode(),
       dbReplica: hasDbReplica(),
@@ -660,6 +673,8 @@ export function getFleetState(): FleetState {
       masterKnown: true,
       masterUrl: null,
       masterStandingInFor: null,
+      masterNodeId: null,
+      masterName: null,
       ownCopyLineage: null,
       deliveredForms: [],
       connect: buildConnect(),
@@ -747,6 +762,7 @@ export function getFleetState(): FleetState {
     superseded,
     roleOverride: buildRoleOverrideView(),
     standIn: buildStandInView(),
+    episode: readEpisodeRecord(),
     backupMaster: isBackupMaster(),
     activeCapable: consentsToActiveMode(),
     dbReplica: hasDbReplica(),
@@ -770,6 +786,8 @@ export function getFleetState(): FleetState {
     masterKnown: registered,
     masterUrl: controlClient?.getCurrentMasterUrl() ?? effectiveMasterUrls().urls[0] ?? null,
     masterStandingInFor: controlClient?.getMasterStandingInFor() ?? null,
+    masterNodeId: controlClient?.getMasterNodeId() ?? null,
+    masterName: controlClient?.getMasterName() ?? null,
     ownCopyLineage,
     deliveredForms: hasDelivery() ? getDeliveredBackendUrls().map(stripUrlCredentials).filter((f): f is string => f !== null) : [],
     connect: null,

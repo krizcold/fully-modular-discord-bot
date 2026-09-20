@@ -976,6 +976,8 @@ function FleetConfigCard({ api, fleet }) {
     const node = (fleet.nodes || []).find((n) => n.nodeId === id);
     return !!(node && node.capabilities && node.capabilities.activeCapable);
   };
+  // A node this master has no registration of cannot be read either way.
+  const consentKnown = (id) => (fleet.nodes || []).some((n) => n.nodeId === id);
   const toggleMode = (i) => {
     const next = [...backupsDraft];
     next[i] = next[i].mode === 'active'
@@ -1001,7 +1003,7 @@ function FleetConfigCard({ api, fleet }) {
     <div className="usage-stat-card" style={{ marginTop: '10px' }}>
       <div className="usage-stat-title">Fleet config</div>
       <div className="usage-stat-sub">
-        {`Revision ${cfg.revision} (${cfg.source === 'runtime' ? 'runtime copy' : 'env seed; no runtime copy yet'})`}
+        {`Revision ${cfg.revision} · candidates: ${cfg.sources.masterCandidates === 'runtime' ? 'runtime copy' : 'env seed (no runtime list)'} · witness channel: ${cfg.sources.witnessChannelId === 'runtime' ? 'runtime copy' : 'default (owner DM)'} · backups: ${cfg.sources.backupDesignations === 'runtime' ? 'runtime copy' : 'none designated'}`}
       </div>
       {draft !== null ? (
         <div style={{ marginTop: '6px' }}>
@@ -1030,9 +1032,13 @@ function FleetConfigCard({ api, fleet }) {
                     onClick={() => toggleMode(i)}
                     disabled={busy || (!consents(d.nodeId) && d.mode !== 'active')}
                     style={{ fontSize: '0.7rem', padding: '1px 6px' }}
-                    title={consents(d.nodeId)
-                      ? 'Active lets this backup stand in temporarily while the master is gone; passive means it only stores data'
-                      : 'This node has not declared FLEET_BACKUP_MODE=active, so it cannot be enabled for active mode from here'}
+                    title={!consentKnown(d.nodeId)
+                      ? (d.mode === 'active'
+                        ? 'Active mode is enabled here for this node now; its own consent cannot be read while it is unregistered, and once saved, turning it off here cannot be undone until it registers again (Cancel still restores it)'
+                        : 'That node is not registered here, so its consent cannot be read; active mode cannot be enabled for it until it registers')
+                      : consents(d.nodeId)
+                        ? 'Active lets this backup stand in temporarily while the master is gone; passive means it only stores data'
+                        : 'This node has not declared FLEET_BACKUP_MODE=active, so it cannot be enabled for active mode from here'}
                   >
                     {d.mode === 'active' ? 'Active' : 'Passive'}
                   </button>
@@ -1055,6 +1061,31 @@ function FleetConfigCard({ api, fleet }) {
           <div className="usage-stat-sub" style={{ fontFamily: 'monospace', whiteSpace: 'pre-wrap' }}>
             {cfg.masterCandidates.join('\n') || 'no master candidates'}
           </div>
+          {(cfg.backupDesignations || []).length > 0 && (
+            <div className="usage-stat-sub" style={{ marginTop: '4px' }}>
+              {[...cfg.backupDesignations].sort((a, b) => a.priority - b.priority).map((d, i) => {
+                // Consent is a fact the master reads off each node's registration; a
+                // co-worker sees only itself, so it says the stored mode alone.
+                const enabled = d.mode === 'active';
+                const consent = consents(d.nodeId);
+                const known = consentKnown(d.nodeId);
+                // A co-worker reads only its own consent; other entries show the stored mode alone.
+                const self = d.nodeId === fleet.nodeId;
+                const mode = fleet.role !== 'master'
+                  ? (!self ? (enabled ? 'active' : 'passive')
+                    : enabled && fleet.activeCapable ? 'active (enabled by the master; this node consents)'
+                    : enabled ? 'enabled by the master, but this node does not consent (FLEET_BACKUP_MODE is not active here), so it stays passive and will not stand in'
+                    : fleet.activeCapable ? 'passive (this node consents to active; the master has not enabled it)'
+                    : 'passive')
+                  : !known ? (enabled ? 'active (enabled here; that node is not registered here, so its consent cannot be read)' : 'passive (that node is not registered here)')
+                  : enabled && consent ? 'active (enabled here; the node consents)'
+                  : enabled ? 'active enabled here, but the node does not consent (FLEET_BACKUP_MODE is not active there), so it drops to passive on its next register'
+                  : consent ? 'passive here, while the node consents to active (enable it under Edit fleet config)'
+                  : 'passive';
+                return <div key={d.nodeId}>{`${i + 1}. ${nodeName(d.nodeId)}: ${mode}`}</div>;
+              })}
+            </div>
+          )}
           {editable && (
             <button onClick={() => { setDraft(cfg.masterCandidates.join('\n')); setWitnessDraft(cfg.witnessChannelId || ''); setBackupsDraft([...(cfg.backupDesignations || [])].sort((a, b) => a.priority - b.priority)); setBackupsEdited(false); }} style={{ marginTop: '4px', fontSize: '0.72rem', padding: '2px 8px' }}>
               Edit fleet config
@@ -1280,15 +1311,123 @@ function FleetPromoteRecord({ api, fleet, reload, readOnly = false }) {
   );
 }
 
+// The last stand-in episode this node took part in (20.5, B6-j), on either
+// side: who stood in for whom, how it ended, and the plan's question, did the
+// writes taken during the outage survive.
+function FleetEpisodeCard({ fleet }) {
+  const e = fleet.episode;
+  if (!e) return null;
+  const nameOf = (id, given) => {
+    if (given) return given;
+    const n = (fleet.nodes || []).find(x => x.nodeId === id);
+    return n ? n.nodeName : id.slice(0, 8);
+  };
+  const at = (ms) => new Date(ms).toISOString().slice(0, 16).replace('T', ' ') + ' UTC';
+  const standIn = nameOf(e.standInNodeId, e.standInName);
+  const covering = nameOf(e.coveringNodeId, e.coveringName);
+  const ENDING = {
+    'handed-back': `the fleet moved onto a database built from that copy (the failback, or a promote through it)${e.writesSurvived === 'partial' ? ', as far as this database had replayed from it' : ', so the writes travelled with it'}`,
+    'promoted-for-good': `${standIn} was promoted by hand into the true master`,
+    'demoted': `${standIn} was demoted by the operator`,
+    'superseded': 'another node took the fleet at a higher term',
+    'seized': `${covering} seized the fleet back onto its own database`,
+    'never-served': 'the lane ended before it served, or while it served read-only',
+  };
+  // A node that held the fleet on this copy (a stand-in promoted for good, or
+  // a returning master after its failback) and was superseded later, its
+  // record closed before that supersession: the writes are on the fleet
+  // database only if the new master's database was built from this copy.
+  const s = fleet.superseded;
+  const heldForGood = !!(s && (e.writesSurvived === 'yes' || e.writesSurvived === 'partial') && e.endedAt < s.since
+    && ((e.side === 'stand-in' && e.standInNodeId === fleet.nodeId && e.ending === 'promoted-for-good') || (e.side === 'master' && e.coveringNodeId === fleet.nodeId)));
+  const WRITES = {
+    yes: heldForGood
+      ? `The writes taken during the outage were the fleet's while this node held it; ${s.byNodeName} has since taken term ${s.term}, so they are on the fleet database only if that database was built from this machine's database${e.copyReseeded ? `; this machine's database has since been re-seeded as a standby, so ${e.side === 'stand-in' ? 'they are nowhere else' : 'this side no longer holds them'}` : ': do not re-seed or decommission this side until that is settled'}.`
+      : 'The writes taken during the outage SURVIVED: they are on the fleet database.',
+    no: e.side === 'stand-in' && e.standInNodeId === fleet.nodeId && e.ending === 'seized' && !e.copyReseeded
+      ? 'The writes taken during the outage were DISCARDED: they are off the fleet database; this copy still holds them until it is re-seeded, so take a dump of this database first if they are wanted.'
+      : 'The writes taken during the outage were DISCARDED.',
+    held: `The writes taken during the outage are held ONLY by ${standIn}'s copy: a re-seed discards them, a promote of that node makes them the fleet's.`,
+    none: 'No writes were taken during the episode.',
+    partial: heldForGood
+      ? `The writes taken during the outage survived only as far as this database had replayed from that copy (it was never fenced, so anything the stand-in took after that was lost), and what it did recover was the fleet's while this node held it; ${s.byNodeName} has since taken term ${s.term}, so it is on the fleet database only if that database was built from this machine's database${e.copyReseeded ? '; this machine\'s database has since been re-seeded as a standby, so this side no longer holds it' : ': do not re-seed or decommission this side until that is settled'}.`
+      : 'The writes taken during the outage survived only as far as this database had replayed from that copy: it was never fenced, so anything the stand-in took after that was lost.',
+  };
+  const lineage = e.lineageVerdict === 'prefix' ? ` ${covering}'s own pre-outage database was a prefix of that copy, so nothing of its own was lost at the wipe.`
+    : e.lineageVerdict === 'diverged' ? ` ${covering}'s own pre-outage database held changes that copy never received; they were discarded at the consented wipe (the safety dump taken before it has them if it succeeded; this machine's manager reported the outcome at the consent).`
+    : e.lineageVerdict === 'unknown' ? ` Whether ${covering}'s own pre-outage database held changes that copy never received could not be told.`
+    : '';
+  // The record is this lane's own when its since-when is the arm's. A record
+  // that closed before a disarmed lane ARMED cannot be the lane's own, so the
+  // lane's record was not written (a later promote restamps only the disarm
+  // time); any record older than an open episode (a live lane, a follower
+  // hold) is an earlier one, whichever side it is.
+  const arm = fleet.standIn;
+  const ownLane = !!(arm && e.side === 'stand-in' && e.standInNodeId === fleet.nodeId && e.standInSince === arm.armedAt);
+  const laneMiss = !!(arm && arm.phase === 'disarmed' && !ownLane && e.endedAt < arm.armedAt);
+  const openSince = arm && arm.phase !== 'disarmed' ? arm.armedAt : fleet.followerHold ? fleet.followerHold.since : null;
+  const earlier = laneMiss || (openSince !== null && e.endedAt <= openSince);
+  const title = !earlier ? 'Last stand-in episode' : laneMiss ? "An earlier stand-in episode (this lane's own record was not written; if the write faulted, the bot log says so)" : 'An earlier stand-in episode';
+  return (
+    <div className="usage-stat-card" style={{ marginTop: '10px' }}>
+      <div className="usage-stat-title">{title}</div>
+      <div className="usage-stat-sub">
+        {`${standIn} stood in for ${covering} from ${at(e.standInSince)}${e.writesFrom ? `, taking writes from ${at(e.writesFrom)}` : ''}, until ${at(e.endedAt)}: ${ENDING[e.ending] || e.ending}${e.detail ? ` (${e.detail})` : ''}.`}
+      </div>
+      <div className="usage-stat-sub" style={{ marginTop: '4px', color: e.writesSurvived === 'no' ? '#e5534b' : e.writesSurvived === 'held' || e.writesSurvived === 'partial' || (e.writesSurvived === 'yes' && heldForGood) ? '#e0a030' : undefined }}>
+        {(WRITES[e.writesSurvived] || '') + lineage}
+      </div>
+    </div>
+  );
+}
+
 // A master (or the co-worker it became) that a higher term superseded (B4).
+// An ex-stand-in whose episode was handed back names the failback instead of
+// calling its copy inert (B6-j): the drop-back re-seeds it.
 function FleetSupersededBanner({ fleet }) {
   const s = fleet.superseded;
   if (!s) return null;
+  // Only an episode closed by THIS supersession speaks for the hand-back (the
+  // record outlives its episode). A held verdict is durable (the record itself
+  // expires when the copy is re-seeded) and needs no such correlation: while
+  // it stands, this copy alone holds the outage writes and is not inert. A
+  // node that held the fleet for good on this copy and was superseded later is
+  // inert only if the new master's database was built from it.
+  const e = fleet.episode;
+  const own = !!(e && e.side === 'stand-in' && e.standInNodeId === fleet.nodeId);
+  const thisEpisode = own && e.endedAt >= s.since && e.ending === 'handed-back' && e.writesSurvived === 'yes';
+  const holdsWrites = own && e.writesSurvived === 'held';
+  // A lane that took writes and left no record of its own (the write faulted,
+  // or the process died between the two writes): nothing here can say where
+  // the writes went, so nothing here may call the copy inert, nor read an
+  // older record as this lane's, until the copy is seen re-seeded (the
+  // sampler stamps the arm record once).
+  const a = fleet.standIn;
+  const laneRecordMissing = !!(a && a.phase === 'disarmed' && a.promotedAt !== null && (!e || (!(own && e.standInSince === a.armedAt) && e.endedAt < a.armedAt)));
+  const laneUnrecorded = laneRecordMissing && !a.copyReseededAt;
+  const heldForGood = !!e && !laneRecordMissing && (e.writesSurvived === 'yes' || e.writesSurvived === 'partial') && e.endedAt < s.since
+    && ((own && e.ending === 'promoted-for-good') || (e.side === 'master' && e.coveringNodeId === fleet.nodeId));
+  // A lane the fleet moved on from (a seizure, or a lossy failback): the copy
+  // still holds what it took until it is re-seeded, so a dump comes first.
+  const seizedHere = own && e.ending === 'seized' && !e.copyReseeded;
+  const tail = thisEpisode
+    ? ` The fleet moved onto a database built from this machine's copy (the failback, or a promote through it), so the writes taken during the outage survived on ${s.byNodeName}'s database. This copy is re-seeded as a standby of it by the drop-back run on this machine's manager when the failback asked this side to retire (its Database modal parks and asks first); otherwise re-seed it by hand from that node's Database modal.`
+    : holdsWrites
+      ? ` This database is NOT inert: the writes taken during the outage are held ONLY by this copy. Do not re-seed or decommission this side until they are recovered: promote this node for good to make them the fleet's, or take a dump of this database first.`
+      : heldForGood
+        ? (e.copyReseeded
+          ? ` This node held the fleet on this machine's database before ${s.byNodeName} took term ${s.term}; it has since been re-seeded as a standby of that node, so it is inert now, and the writes it held are on the fleet database only if that node's database was built from it${e.side === 'stand-in' ? ', and nowhere else if it was not' : ''}.`
+          : ` This node held the fleet on this copy before ${s.byNodeName} took term ${s.term}: the copy is inert only if that node's database was built from it; settle that before re-seeding or decommissioning this side.`)
+        : seizedHere
+          ? ' The fleet moved on without the writes this copy took while standing in; this copy still holds them until it is re-seeded, so take a dump of this database first if they are wanted. It is inert for the fleet otherwise: retire this side from the manager (reseed it as a standby of the new master, or decommission it).'
+          : laneUnrecorded
+            ? " This copy took the fleet's writes as a stand-in and its lane left no episode record (if the write faulted, the bot log says so), so whether they reached the new master's database cannot be told from here: do not re-seed or decommission this side until that is settled."
+            : ' Its database is inert now: retire this side from the manager (reseed it as a standby of the new master, or decommission it).';
   return (
     <div className="usage-notice" style={{ borderColor: '#e5534b', color: '#e5534b' }}>
       {`SUPERSEDED by ${s.byNodeName} at term ${s.term} (${s.source}). ${s.steppedDown
         ? 'This node has stepped down and serves as a co-worker of the new master.'
-        : 'This node keeps serving its shards until the new master is proven up, then steps down on its own.'} Its database is inert now: retire this side from the manager (reseed it as a standby of the new master, or decommission it).`}
+        : 'This node keeps serving its shards until the new master is proven up, then steps down on its own.'}${tail}`}
     </div>
   );
 }
@@ -1307,9 +1446,14 @@ function FleetStandInBanner({ fleet }) {
   const at = (ms) => new Date(ms).toISOString().slice(11, 16) + ' UTC';
   if (!s.live) {
     if (s.phase !== 'disarmed' || !s.disarmedAt) return null;
+    // The lane's own episode record says how it ended (it is this lane's when
+    // its since-when is the arm's); the arm record's reason is restamped by a
+    // later promote by hand, which the manager reads.
+    const e = fleet.episode;
+    const lane = e && e.side === 'stand-in' && e.standInNodeId === fleet.nodeId && e.standInSince === s.armedAt ? e : null;
     return (
       <div className="usage-stat-sub" style={{ marginTop: '6px' }}>
-        {`Last stand-in attempt for ${nameOf(s.coveringNodeId)} ended at ${at(s.disarmedAt)}: ${s.disarmReason || 'no reason recorded'}.${s.rearmAfter && Date.now() < s.rearmAfter ? ` The lane may arm again after ${at(s.rearmAfter)}.` : ''}`}
+        {`Last stand-in attempt for ${nameOf(s.coveringNodeId)} ended at ${at(lane ? lane.endedAt : s.disarmedAt)}: ${lane ? lane.detail : (s.disarmReason || 'no reason recorded')}.${s.rearmAfter && Date.now() < s.rearmAfter ? ` The lane may arm again after ${at(s.rearmAfter)}.` : ''}`}
       </div>
     );
   }
@@ -1317,7 +1461,7 @@ function FleetStandInBanner({ fleet }) {
   if (!fleet.initialized && s.writeGate) {
     text = `STANDING IN for ${nameOf(s.coveringNodeId)}: this boot is HELD. ${s.writeGate}`;
   } else if (s.phase === 'promoted') {
-    text = `STANDING IN for ${nameOf(s.coveringNodeId)} WITH WRITES: this machine's copy has been promoted and is the fleet database until the master returns for failback or an operator promotes this node for good.${s.writeGate ? ` ${s.writeGate}` : ''}`;
+    text = `STANDING IN for ${nameOf(s.coveringNodeId)} WITH WRITES${s.promotedAt ? ` since ${new Date(s.promotedAt).toISOString().slice(0, 16).replace('T', ' ')} UTC` : ''}: this machine's copy has been promoted and is the fleet database until the master returns for failback or an operator promotes this node for good.${s.writeGate ? ` ${s.writeGate}` : ''}`;
   } else if (s.phase === 'promoting') {
     text = `STANDING IN for ${nameOf(s.coveringNodeId)}: taking writes now (promoting this machine's copy).${s.writeGate ? ` ${s.writeGate}` : ''}`;
   } else {
@@ -1383,8 +1527,8 @@ function FleetFollowerHoldBanner({ api, fleet }) {
       : '; its running phases will refuse to stage the takeover restart and park with that reason, and Cancel in the promote record card below dismisses it then.'}`
     : h.namesThisNode === true
     ? (h.reason === 'copy'
-      ? ' To take the fleet back, promote this node from the card below once its copy has caught up; that ends the stand-in.'
-      : ' To take the fleet back: re-seed this database as a standby of that copy (its block is on that node\'s Database modal), then promote this node from the card below once the copy has caught up. Demote this node to stay a co-worker instead.' + lastResort)
+      ? ' FAILBACK PENDING: to take the fleet back, promote this node from the card below once its copy has caught up; that ends the stand-in. A manager that manages this database runs that step itself (its Database modal shows the failback run).'
+      : ` FAILBACK PENDING. A manager that manages this database runs it from its Database modal: it dumps this database, parks and asks before wiping it, re-seeds it as a standby of that copy, then promotes this node back once it has caught up. By hand: re-seed this database as a standby of that copy (its block is on that node's Database modal), then promote this node from the card below once the copy has caught up. Demote this node to stay a co-worker instead.` + lastResort)
     : h.namesThisNode === null
       ? (h.reason === 'copy'
         ? ' The failback cannot start until this node is registered with the node holding the fleet; this copy is kept as it is meanwhile (neither re-seeded nor adopted).'
@@ -1568,6 +1712,16 @@ function FleetView({ api, wsClient, guildNames }) {
         <div className="usage-stat-sub">
           {`role co-worker · term ${fleet.term} · epoch ${fleet.epoch} · ${fleet.shardCount} shard${fleet.shardCount === 1 ? '' : 's'} in the fleet`}
         </div>
+        {fleet.masterKnown && (
+          <div className="usage-stat-sub" style={{ color: fleet.masterStandingInFor ? '#5b9bd5' : undefined }}>
+            {`Following ${fleet.masterName || (fleet.masterNodeId ? fleet.masterNodeId.slice(0, 8) : 'the master')}${fleet.masterUrl ? ` at ${fleet.masterUrl}` : ''}${fleet.masterStandingInFor
+              ? (fleet.masterStandingInFor === fleet.nodeId
+                ? ', which is STANDING IN for THIS node: the fleet runs on its copy until the failback promotes this node back'
+                : `, which is STANDING IN for ${fleet.masterStandingInFor.slice(0, 8)}: the fleet runs on ${fleet.masterName || 'that stand-in'}'s copy until that master returns for the failback`)
+              : ` as the fleet's master`}${fleet.deliveredForms && fleet.deliveredForms.length > 0 ? ` · data from ${fleet.deliveredForms[0]}` : ''}`}
+          </div>
+        )}
+        <FleetEpisodeCard fleet={fleet} />
 
         {!fleet.masterKnown && fleet.servingOnCachedLease && (
           <div className="usage-notice">
@@ -1729,6 +1883,7 @@ function FleetView({ api, wsClient, guildNames }) {
         </div>
       )}
       <FleetSupersededBanner fleet={fleet} />
+      <FleetEpisodeCard fleet={fleet} />
       <FleetPromoteRecord api={api} fleet={fleet} reload={loadFleet} />
 
       {fleet.dbStandbys && fleet.dbStandbys.some((sb) => sb.state !== 'streaming') && (

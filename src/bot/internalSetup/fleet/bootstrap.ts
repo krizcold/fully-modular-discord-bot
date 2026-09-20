@@ -46,6 +46,7 @@ import {
 } from './nodeIdentity';
 import { createStandInControlStore, prepareControlStore, PostgresControlStore } from './postgresControlStore';
 import { ArmRecord, readArmRecord, writeArmRecord } from './armRecord';
+import { closeStandInLane, rememberLineageVerdict, seizedEpisode, standInEnding, writeEpisodeRecordOrWarn } from './episodeRecord';
 import { clearOwnSyncPosture } from './syncPosture';
 import { Registry, RegistryNode } from './registry';
 import { ControlServer } from './controlServer';
@@ -87,7 +88,7 @@ import { MigrationExecutor } from './migration/migrationExecutor';
 import { TransformationCoordinator } from './transformation/transformationCoordinator';
 import { TransformationExecutor } from './transformation/transformationExecutor';
 import type { ControlStore, PersistedFleetConfig, PersistedTerm, TransformDirection } from './controlStore';
-import { effectiveFleetConfigView, effectiveMasterUrls, emptyStoreHoldEvidence, forcePassive, readFleetConfigCache, rememberBackups, validateMasterCandidates, renumberDesignations, validateBackupDesignations, validateWitnessChannelId, writeFleetConfigCache } from './fleetConfig';
+import { effectiveFleetConfigView, effectiveMasterUrls, emptyStoreHoldEvidence, fleetConfigViewOf, forcePassive, readFleetConfigCache, rememberBackups, validateMasterCandidates, renumberDesignations, validateBackupDesignations, validateWitnessChannelId, writeFleetConfigCache } from './fleetConfig';
 import { getLocalReplicaIdentity, getReplicaHealth, getSlotSample, setReplicaProbeListener } from './replicaHealth';
 import { canonicalIsOwnReplica, canonicalStoreReachable, currentCanonicalUrl, hasDbReplica, probeReplica, readTermRow, resolveReplicaEndpoints, spliceFleetCredentials } from './replicaPromotion';
 import { ArmEvidenceInputs, armDeferral, evaluateArmEvidence, ledgerAllowsArm, preArmRefusal, reachabilityWarning } from './armLane';
@@ -553,6 +554,12 @@ async function runStaleMasterFence(
   // second backup promoted by hand, renews its beacon and is a live holder.
   if (envConfirm) {
     console.warn('[Fleet] Takeover CONFIRMED by FLEET_CONFIRM_TAKEOVER; skipping the stale-master fence');
+    // A stand-in seen holding the fleet for this node is the episode this
+    // confirm ends (B6-j): whatever it accepted while standing in is discarded.
+    const seen = readHolderSighting();
+    if (!standIn && seen && seen.via === 'fence-hold') {
+      writeEpisodeRecordOrWarn(seizedEpisode(seen, selfNodeId, selfNodeName));
+    }
     return null;
   }
   if (stagedTakeover) console.warn(`[Fleet] Takeover staged by a promote: keeping the peer half of the stale-master fence (a live holder invalidates the decision${storeDeadPeer ? `; node ${storeDeadPeer.slice(0, 8)}, superseded with its database dead, may answer at this node's own term` : ''}) and only fresh beacons in the witness half`);
@@ -793,7 +800,12 @@ function guardSleep(ms: number): Promise<void> {
 async function disarmStandIn(reason: string): Promise<never> {
   const record = readArmRecord();
   if (record) {
-    writeArmRecord({ ...record, phase: 'disarmed', disarmedAt: Date.now(), disarmReason: reason });
+    // The episode closes with the lane (B6-j), the lane's state first. Every
+    // exit here is a serve-only boot's (a promoted lane parks or holds
+    // instead), so no writes were ever at stake: never-served, whatever ended
+    // it.
+    if (record.phase !== 'disarmed') closeStandInLane(record, getNodeId(), getNodeName(), null, 'never-served', reason, reason);
+    else writeArmRecord({ ...record, phase: 'disarmed', disarmedAt: Date.now(), disarmReason: reason });
   }
   // Forced to co-worker rather than cleared: an explicit override records that
   // this node stood down, and stamps who did it, where a deleted file would say
@@ -2551,6 +2563,10 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     let stepDownStaged = false;
     let supersededSince = 0;
     let supersededSource: SupersededSource = 'store-fence';
+    // Latched once any supersession arrived through this copy's own term row
+    // (the stamp found it taken, or a notice the row corroborated): the claim
+    // landed here, which a later witness claim at a higher term cannot undo.
+    let supersededOnCopy = false;
     const persistSupersession = (steppedDown: boolean): void => {
       if (!supersededBy) return;
       noteHolderSighting(supersededBy.nodeId, supersededBy.term, 'step-down', nodeId);
@@ -2575,7 +2591,11 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       if (standIn) {
         const arm = readArmRecord();
         if (arm && arm.phase !== 'disarmed') {
-          writeArmRecord({ ...arm, phase: 'disarmed', disarmedAt: Date.now(), disarmReason: `${supersededBy.nodeName} holds a higher term (${supersededBy.term}); this node stops standing in` });
+          // The lane's state first; then how the episode ended (B6-j), which
+          // is the episode module's rule, from whether writes were taken and
+          // whether the claim landed on this copy (the latch above).
+          const ending = standInEnding(arm, { nodeId: supersededBy.nodeId, onCopy: supersededOnCopy });
+          closeStandInLane(arm, nodeId, nodeName, supersededBy.nodeId === arm.coveringNodeId ? supersededBy.nodeName : null, ending, `${supersededBy.nodeName} took term ${supersededBy.term} ${supersededOnCopy ? 'on this copy' : 'on another database'}`, `${supersededBy.nodeName} holds a higher term (${supersededBy.term}); this node stops standing in`);
         }
       }
       persistSupersession(true);
@@ -2587,6 +2607,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       setInterval(() => requestStepDownRestart(), STEPDOWN_FALLBACK_MS).unref();
     };
     beginSupersession = (by, source): void => {
+      if (source !== 'witness') supersededOnCopy = true;
       if (supersededBy) {
         // A newer claim supersedes the recorded one; the manager reads this
         // file to decide which node's database this side must follow.
@@ -2654,6 +2675,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     server = new ControlServer({
       getTerm: () => registry.term,
       getNodeId: () => nodeId,
+      getNodeName: () => nodeName,
       getStandingInFor: () => coveringNodeId,
       onStepDown: payload => {
         const noticeTerm = Number(payload?.term);
@@ -3322,7 +3344,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     transformation: () => transformer?.getView() ?? null,
     pinViolation: standalone ? null : () => pinViolation,
     termStamp: store instanceof PostgresControlStore && !standalone ? () => store.getStampFailingForMs() : null,
-    fleetConfig: () => (fleetConfig ? { revision: fleetConfig.revision, masterCandidates: fleetConfig.masterCandidates, backupDesignations: fleetConfig.backupDesignations, ...(fleetConfig.witnessChannelId !== undefined ? { witnessChannelId: fleetConfig.witnessChannelId } : {}), source: 'runtime' as const } : null),
+    fleetConfig: () => (fleetConfig ? fleetConfigViewOf(fleetConfig) : null),
     witness: witness ? () => witness!.getStatus() : null,
     migrationActive: null,
   });
@@ -3593,7 +3615,13 @@ async function initCoWorker(init: CommonInit, followerHold: FollowerHoldBase | n
               // Behind a stand-in, this node's own database (the one its own
               // URL names; the hold persisted nothing) is judged against the
               // one it now follows. A copy hold has nothing of its own to judge.
-              if (followerHold.reason === 'behind') judge(() => currentCanonicalUrl() || null, () => fleetFollowedBackend()?.url ?? null, _setFollowerLineage);
+              if (followerHold.reason === 'behind') {
+                judge(() => currentCanonicalUrl() || null, () => fleetFollowedBackend()?.url ?? null, (fact) => {
+                  _setFollowerLineage(fact);
+                  // Kept for the failback's promote, which runs in a later process on the re-seeded copy (B6-j).
+                  if (fact) rememberLineageVerdict(fact.verdict, followerHold.standInNodeId);
+                });
+              }
               pushFleetStatusNow();
             } else if (info?.url && hasDbReplica() && readSuperseded()) {
               // A stand-in whose lane ended keeps its promoted copy beside the
@@ -3823,6 +3851,7 @@ async function initCoWorker(init: CommonInit, followerHold: FollowerHoldBase | n
         promotedAt: null,
         disarmedAt: null,
         disarmReason: null,
+        copyReseededAt: null,
       });
       invalidateRoleOverrideCache();
       console.error(`[Fleet] STANDING IN for ${termRow!.nodeId} at term ${termRow!.term}: the master is gone on all six checks; restarting to serve READ-ONLY`);

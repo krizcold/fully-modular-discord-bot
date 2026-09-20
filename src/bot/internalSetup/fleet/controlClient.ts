@@ -79,6 +79,8 @@ export class ControlClient {
   private draining = false;
   private lastBudget: BudgetInfo | null = null;
   private masterStandingInFor: string | null = null;
+  private masterNodeId: string | null = null;
+  private masterName: string | null = null;
   private reconnectTimer: NodeJS.Timeout | null = null;
   private heartbeatTimer: NodeJS.Timeout | null = null;
   private ttlTimer: NodeJS.Timeout | null = null;
@@ -99,6 +101,8 @@ export class ControlClient {
   stop(): void {
     this.stopped = true;
     this.masterStandingInFor = null;
+    this.masterNodeId = null;
+    this.masterName = null;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     if (this.ttlTimer) clearInterval(this.ttlTimer);
@@ -132,6 +136,15 @@ export class ControlClient {
    */
   getMasterStandingInFor(): string | null {
     return this.masterStandingInFor;
+  }
+
+  /** The node this client LAST registered with, as its reply named itself; kept across blips like standingInFor. */
+  getMasterNodeId(): string | null {
+    return this.masterNodeId;
+  }
+
+  getMasterName(): string | null {
+    return this.masterName;
   }
 
   getLastContactAgoMs(): number | null {
@@ -243,6 +256,8 @@ export class ControlClient {
       this.term = result.term;
       this.registered = true;
       this.masterStandingInFor = typeof result.standingInFor === 'string' && result.standingInFor !== '' ? result.standingInFor : null;
+      this.masterNodeId = typeof result.nodeId === 'string' && result.nodeId !== '' ? result.nodeId : null;
+      this.masterName = typeof result.nodeName === 'string' && result.nodeName !== '' ? result.nodeName : null;
       this.attempt = 0;
       this.draining = false;
       if (result.budget) this.lastBudget = result.budget;
