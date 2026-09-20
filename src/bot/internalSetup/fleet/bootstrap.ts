@@ -47,6 +47,7 @@ import {
 import { createStandInControlStore, prepareControlStore, PostgresControlStore } from './postgresControlStore';
 import { ArmRecord, readArmRecord, writeArmRecord } from './armRecord';
 import { closeStandInLane, rememberLineageVerdict, seizedEpisode, standInEnding, writeEpisodeRecordOrWarn } from './episodeRecord';
+import { backupModeEnabled, leverRank, readModeOverride } from './modeOverride';
 import { clearOwnSyncPosture } from './syncPosture';
 import { Registry, RegistryNode } from './registry';
 import { ControlServer } from './controlServer';
@@ -3725,7 +3726,9 @@ async function initCoWorker(init: CommonInit, followerHold: FollowerHoldBase | n
       // one of the connections below would open and time out on every tick for
       // the whole outage, and the answer is already known.
       const designation = readFleetConfigCache()?.backupDesignations.find(d => d.nodeId === nodeId);
-      const activeMode = consentsToActiveMode() && designation?.mode === 'active';
+      // The emergency lever (B6-k) turns the master's key while the master is
+      // unreachable; the node's own consent is the other key, as ever.
+      const activeMode = consentsToActiveMode() && backupModeEnabled(designation?.mode, readModeOverride(), cheap.masterUnreachable);
       if (!activeMode || resolveDataBackend() !== 'postgres') {
         evidenceHeldSince = 0;
         return;
@@ -3803,10 +3806,12 @@ async function initCoWorker(init: CommonInit, followerHold: FollowerHoldBase | n
       // node is dead, unfit, or capped - this one simply proceeds, which is why
       // the rank is a delay and not a veto.
       if (evidenceHeldSince === 0) evidenceHeldSince = now;
-      const rank = designation?.priority ?? 1;
+      // A node the master never ranked sorts LAST, so it waits out every
+      // designated backup its cache lists instead of racing one (F22).
+      const rank = designation?.priority ?? leverRank(readFleetConfigCache()?.backupDesignations ?? [], nodeId);
       const deferral = armDeferral(rank, evidenceHeldSince, now);
       if (deferral.defer) {
-        console.warn(`[Fleet] Stand-in deferring: rank ${rank} waits ${Math.round(deferral.waitMs / 1000)}s for any higher-ranked backup to stand in first`);
+        console.warn(`[Fleet] Stand-in deferring: ${designation ? `rank ${rank}` : 'unranked (sorting last)'} waits ${Math.round(deferral.waitMs / 1000)}s for any higher-ranked backup to stand in first`);
         return;
       }
 
@@ -3854,7 +3859,7 @@ async function initCoWorker(init: CommonInit, followerHold: FollowerHoldBase | n
         copyReseededAt: null,
       });
       invalidateRoleOverrideCache();
-      console.error(`[Fleet] STANDING IN for ${termRow!.nodeId} at term ${termRow!.term}: the master is gone on all six checks; restarting to serve READ-ONLY`);
+      console.error(`[Fleet] STANDING IN for ${termRow!.nodeId} at term ${termRow!.term}: the master is gone on all six checks; restarting to serve READ-ONLY${designation?.mode === 'active' ? '' : ' (the master\'s key was turned by the local emergency lever)'}`);
       requestStepDownRestart();
     } catch (error) {
       console.warn('[Fleet] Stand-in evaluation failed:', error instanceof Error ? error.message : error);

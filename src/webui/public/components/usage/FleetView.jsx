@@ -1082,7 +1082,15 @@ function FleetConfigCard({ api, fleet }) {
                   : enabled ? 'active enabled here, but the node does not consent (FLEET_BACKUP_MODE is not active there), so it drops to passive on its next register'
                   : consent ? 'passive here, while the node consents to active (enable it under Edit fleet config)'
                   : 'passive';
-                return <div key={d.nodeId}>{`${i + 1}. ${nodeName(d.nodeId)}: ${mode}`}</div>;
+                const lever = self && fleet.role !== 'master' && fleet.modeOverride
+                  ? (enabled ? '; the local emergency lever is set but adds nothing (the stored designation enables this node)'
+                    : fleet.backupMaster !== true ? '; the local emergency lever is set, but this node\'s env role is not backup-master (BOT_NODE_ROLE), so it cannot stand in'
+                    : fleet.dataBackend && fleet.dataBackend !== 'postgres' ? '; the local emergency lever is set, but this node is in file mode, which has no standby, so it cannot stand in'
+                    : fleet.masterKnown ? '; the local emergency lever is set but ignored while the master is reachable'
+                    : !fleet.activeCapable ? '; the local emergency lever is set, but this node does not consent (FLEET_BACKUP_MODE is not active), so it stays passive'
+                    : '; the local emergency lever is enabling it (read-only) while the master is dark')
+                  : '';
+                return <div key={d.nodeId}>{`${i + 1}. ${nodeName(d.nodeId)}: ${mode}${lever}`}</div>;
               })}
             </div>
           )}
@@ -1571,6 +1579,68 @@ function FleetEmptyStoreHoldBanner({ api, hold }) {
   );
 }
 
+// The emergency lever (B6-k, F11): a node-local enable of active mode for the
+// outage, on this backup's own web UI. It supplies the master's key only,
+// counts only while the master is unreachable, and survives restarts until
+// cleared.
+function FleetModeLeverCard({ api, fleet, reload }) {
+  const [busy, setBusy] = React.useState(false);
+  const o = fleet.modeOverride;
+  // The set path belongs to a backup master's co-worker view; a set lever is
+  // shown, and can be cleared, on every role, or a standing-in node could
+  // neither see what armed it nor end that.
+  const canSet = fleet.backupMaster && fleet.dataBackend === 'postgres' && fleet.role === 'co-worker';
+  if (!o && !canSet) return null;
+  const at = (ms) => new Date(ms).toISOString().slice(0, 16).replace('T', ' ') + ' UTC';
+  const standing = !!(fleet.standIn && fleet.standIn.live);
+  // The arm log's own test: a node the master enabled runs on the stored
+  // designation, and the lever adds nothing there.
+  // The pre-init build publishes no node id and the degraded responses no
+  // config, so the stored mode is unknown there rather than passive.
+  const storedKnown = !!fleet.nodeId && !!(fleet.fleetConfig && fleet.fleetConfig.backupDesignations);
+  const storedActive = storedKnown && fleet.fleetConfig.backupDesignations.some((d) => d.nodeId === fleet.nodeId && d.mode === 'active');
+  // masterKnown is the arm's evidence on the co-worker build only: a serving
+  // stand-in reports it for itself, and the pre-init build has no arm tick.
+  const now = !o || storedActive ? ''
+    : standing ? (storedKnown ? ' This stand-in was armed by the local lever; clearing it does not end the current lane (demote does).' : ' Clearing it does not end the current stand-in lane (demote does).')
+    : fleet.initialized !== true ? ' Whether it counts right now cannot be read until this node\'s fleet layer is up.'
+    : fleet.role === 'master' ? ' It has no effect while this node is the master.'
+    : fleet.backupMaster !== true ? ' It cannot count on this node: its env role is not backup-master (BOT_NODE_ROLE), so no stand-in lane is evaluated here.'
+    : fleet.dataBackend && fleet.dataBackend !== 'postgres' ? ' It cannot count on this node: its data backend is file mode, which has no standby to stand in from.'
+    : fleet.masterKnown ? ' Ignored right now: the master is reachable, so its stored designation decides.'
+    : ' Counting right now: this node holds no control connection to the master.';
+  const send = (clear) => {
+    if (busy) return;
+    if (!clear && !confirm('Enable active mode locally?\n\nWhile the master is unreachable this node may then stand in READ-ONLY, as a designated backup would. Taking writes needs the master\'s own in-sync attestation, which a node the master never enabled does not have, so writes stay a manual promote with its RPO confirm. Whenever the master is reachable the stored designation decides and this is ignored. It stays set across restarts until cleared here.')) return;
+    setBusy(true);
+    api.post('/fleet/mode-override', clear ? { clear: true } : {})
+      .then((res) => {
+        if (!res || res.success === false) { showToast((res && res.error) || 'The lever could not be set', 'error'); return; }
+        showToast(clear ? 'Local enable cleared' : 'Active mode enabled locally for the outage', 'success');
+        if (reload) reload();
+      })
+      .catch((err) => showToast((err && err.message) || 'The lever could not be set', 'error'))
+      .finally(() => setBusy(false));
+  };
+  return (
+    <div className="usage-stat-card" style={{ marginTop: '10px' }}>
+      <div className="usage-stat-title">Emergency lever</div>
+      <div className="usage-stat-sub">
+        {(o
+          ? storedActive
+            ? `Active mode is ENABLED LOCALLY (set ${at(o.setAt)} by ${o.setBy}), but the master's stored designation already enables this node, so the lever adds nothing here${standing ? ' (this stand-in runs on the stored enable)' : ''}. It survives restarts until cleared here.`
+            : `Active mode is ENABLED LOCALLY (set ${at(o.setAt)} by ${o.setBy}): while the master is unreachable this node may stand in READ-ONLY as a designated backup would; taking writes still needs the master's own in-sync attestation replicated into this copy, and without it writes stay a manual promote with its RPO confirm.${now} It survives restarts until cleared here.`
+          : (storedActive ? 'The master\'s stored designation already enables active mode for this node, so the lever would add nothing here now; it exists for a node the master never enabled. ' : '')
+            + 'If the master is dark and its stored designation does not enable active mode for this node, this enables it locally for the outage: the node may then stand in READ-ONLY; taking writes stays a manual promote with its RPO confirm. It ranks below the stored designation whenever the master is reachable, and it survives restarts until cleared here.')
+          + (fleet.activeCapable ? '' : ' This node does not CONSENT to active mode (FLEET_BACKUP_MODE is not active), so the lever has no effect until its env consents.')}
+      </div>
+      <button onClick={() => send(!!o)} disabled={busy} style={{ marginTop: '6px', fontSize: '0.72rem', padding: '2px 8px' }}>
+        {o ? 'Clear the local enable' : 'Enable active mode locally'}
+      </button>
+    </div>
+  );
+}
+
 // Demote surface for a deposed / operator-overridden master. With no other
 // master visible the route answers needsConfirm with the ordering warning.
 function FleetDemoteButton({ api }) {
@@ -1679,6 +1749,7 @@ function FleetView({ api, wsClient, guildNames }) {
           <FleetEmptyStoreHoldBanner api={api} hold={fleet.emptyStoreHold} />
         )}
         <FleetStandInBanner fleet={fleet} />
+        <FleetModeLeverCard api={api} fleet={fleet} reload={loadFleet} />
         {fleet.standIn && fleet.standIn.live && fleet.standIn.writeGate && (
           <div><FleetDemoteButton api={api} /></div>
         )}
@@ -1765,6 +1836,7 @@ function FleetView({ api, wsClient, guildNames }) {
         {(fleet.backupMaster || (fleet.followerHold && fleet.followerHold.namesThisNode === true)) && fleet.dataBackend === 'postgres' && (
           <FleetPromoteCard api={api} fleet={fleet} reload={loadFleet} />
         )}
+        <FleetModeLeverCard api={api} fleet={fleet} reload={loadFleet} />
         <FleetPromoteRecord api={api} fleet={fleet} reload={loadFleet} />
         {fleet.backupMaster && fleet.dataBackend !== 'postgres' && (
           <div className="usage-stat-sub" style={{ marginTop: '6px', color: '#777' }}>
@@ -1899,6 +1971,7 @@ function FleetView({ api, wsClient, guildNames }) {
       )}
 
       <FleetStandInBanner fleet={fleet} />
+      <FleetModeLeverCard api={api} fleet={fleet} reload={loadFleet} />
       {fleet.roleOverride && !fleet.standalone && (
         <div className="usage-stat-sub">
           {`Role set by operator override (${fleet.roleOverride.setBy}, ${new Date(fleet.roleOverride.setAt).toISOString().slice(0, 16).replace('T', ' ')} UTC)`}

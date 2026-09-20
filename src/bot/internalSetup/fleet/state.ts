@@ -8,6 +8,7 @@ import { EpisodeRecord, readEpisodeRecord } from './episodeRecord';
 import { getShardSource, isPinEnabled, resolveShardCapacity } from './placement';
 import type { BudgetInfo, NodeRole } from './protocol';
 import { consentsToActiveMode, isBackupMaster, isStandInBoot, readRoleOverride } from './nodeIdentity';
+import { readModeOverride } from './modeOverride';
 import { FleetConfigView, effectiveFleetConfigView, effectiveMasterUrls } from './fleetConfig';
 import { hasDbReplica, stripUrlCredentials } from './replicaPromotion';
 import type { Registry } from './registry';
@@ -130,6 +131,8 @@ export interface FleetState {
   backupMaster: boolean;
   /** This node CONSENTS to active stand-in mode (FLEET_BACKUP_MODE=active); the master's stored entry still has to enable it (20.5). */
   activeCapable: boolean;
+  /** The emergency lever (B6-k): a node-local enable that counts only while the master is unreachable; null when not set. */
+  modeOverride: { mode: 'active'; setAt: number; setBy: string } | null;
   /** A manager-provisioned standby of the fleet database lives on this machine; promotion takes the pair. */
   dbReplica: boolean;
   /** Fleet master: ms the term-row stamp has been failing; null while stamping succeeds (or off-postgres). */
@@ -531,6 +534,7 @@ export function getFleetState(): FleetState {
       episode: null,
       backupMaster: isBackupMaster(),
       activeCapable: consentsToActiveMode(),
+      modeOverride: readModeOverride(),
       dbReplica: hasDbReplica(),
       termStampFailingForMs: null,
       masterUrls: effectiveMasterUrls().urls,
@@ -652,6 +656,7 @@ export function getFleetState(): FleetState {
       episode: readEpisodeRecord(),
       backupMaster: isBackupMaster(),
       activeCapable: consentsToActiveMode(),
+      modeOverride: readModeOverride(),
       dbReplica: hasDbReplica(),
       termStampFailingForMs: sources.termStamp?.() ?? null,
       masterUrls: effectiveMasterUrls().urls,
@@ -765,6 +770,7 @@ export function getFleetState(): FleetState {
     episode: readEpisodeRecord(),
     backupMaster: isBackupMaster(),
     activeCapable: consentsToActiveMode(),
+    modeOverride: readModeOverride(),
     dbReplica: hasDbReplica(),
     termStampFailingForMs: null,
     masterUrls: effectiveMasterUrls().urls,

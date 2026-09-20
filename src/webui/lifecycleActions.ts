@@ -3,11 +3,51 @@
 // both callers. Promote lives in promoteEngine; this is its counterpart.
 
 import { BotManager } from './botManager';
-import { clearRoleOverride, getNodeId, getNodeName, invalidateRoleOverrideCache, isStandalone, resolveEnvRole, resolveNodeRole, writeRoleOverride } from '../bot/internalSetup/fleet/nodeIdentity';
+import { clearRoleOverride, consentsToActiveMode, getNodeId, getNodeName, invalidateRoleOverrideCache, isBackupMaster, isStandalone, resolveEnvRole, resolveNodeRole, writeRoleOverride } from '../bot/internalSetup/fleet/nodeIdentity';
 import { effectiveMasterUrls } from '../bot/internalSetup/fleet/fleetConfig';
 import { freshMasterClaim, readSuperseded } from '../bot/internalSetup/fleet/stepDown';
 import { readArmRecord } from '../bot/internalSetup/fleet/armRecord';
 import { closeStandInLane } from '../bot/internalSetup/fleet/episodeRecord';
+import { clearModeOverride, ModeOverride, readModeOverride, writeModeOverride } from '../bot/internalSetup/fleet/modeOverride';
+
+export interface ModeOverrideResult {
+  success: boolean;
+  error?: string;
+  override: ModeOverride | null;
+}
+
+/**
+ * The emergency lever (B6-k): enable active mode locally for the outage. Refused
+ * on a node that is not the designated backup master, and on one that does not
+ * consent: the lever supplies the master's key only, never the node's own.
+ */
+export function setModeOverride(setBy: string): ModeOverrideResult {
+  if (!isBackupMaster()) {
+    return { success: false, error: 'This node is not the designated backup master (BOT_NODE_ROLE); only a backup master can stand in.', override: readModeOverride() };
+  }
+  if (!consentsToActiveMode()) {
+    return { success: false, error: 'This node does not consent to active mode: set FLEET_BACKUP_MODE=active in its env (the manager\'s Backup Mode row) and restart it first; the lever supplies only the master\'s key.', override: readModeOverride() };
+  }
+  try {
+    return { success: true, override: writeModeOverride(setBy) };
+  } catch (err) {
+    return { success: false, error: `The local enable could not be written: ${err instanceof Error ? err.message : String(err)}`, override: readModeOverride() };
+  }
+}
+
+export function unsetModeOverride(): ModeOverrideResult {
+  let failure: string | null = null;
+  try {
+    clearModeOverride();
+  } catch (err) {
+    failure = err instanceof Error ? err.message : String(err);
+  }
+  // What the arm tick will read decides the answer, not the unlink's verdict.
+  const left = readModeOverride();
+  if (left) return { success: false, error: `The local enable could not be cleared and is still in effect${failure ? `: ${failure}` : '.'}`, override: left };
+  if (failure) return { success: false, error: `The clear failed, but no local enable is readable any more: ${failure}`, override: null };
+  return { success: true, override: null };
+}
 
 export interface DemoteResult {
   success: boolean;

@@ -6,7 +6,9 @@ import { Router, Request, Response } from 'express';
 import { BotManager } from '../botManager';
 import { readPromoteRecord } from '../../bot/internalSetup/fleet/promoteRecord';
 import { writeFreshFleetConfirm } from '../../bot/internalSetup/fleet/stepDown';
-import { runDemote } from '../lifecycleActions';
+import { runDemote, setModeOverride, unsetModeOverride } from '../lifecycleActions';
+import { modeOverrideAction, readModeOverride } from '../../bot/internalSetup/fleet/modeOverride';
+import { consentsToActiveMode } from '../../bot/internalSetup/fleet/nodeIdentity';
 import { cancelPromote, continuePromote, promoteInFlight, promoteSupersededBy, startPromote } from '../promoteEngine';
 
 export function createFleetRoutes(botManager: BotManager): Router {
@@ -26,20 +28,23 @@ export function createFleetRoutes(botManager: BotManager): Router {
     // whether a phase is running it in this parent.
     const promoteHeldBy = promote ? promoteSupersededBy(promote) : null;
     const promoteRunning = promoteInFlight();
+    // The lever is parent-owned too and arms the child's next boot, so it stays
+    // visible and clearable while the child is down or not answering.
+    const lever = { modeOverride: readModeOverride(), activeCapable: consentsToActiveMode() };
     try {
       if (!botManager.isRunning()) {
-        res.json({ success: true, running: false, initialized: false, promote, promoteHeldBy, promoteRunning });
+        res.json({ success: true, running: false, initialized: false, ...lever, promote, promoteHeldBy, promoteRunning });
         return;
       }
       const result = await botManager.getFleetState();
       if (!result?.success || !result.state) {
-        res.json({ success: true, running: true, initialized: false, promote, promoteHeldBy, promoteRunning });
+        res.json({ success: true, running: true, initialized: false, ...lever, promote, promoteHeldBy, promoteRunning });
         return;
       }
       res.json({ success: true, running: true, ...result.state, promote, promoteHeldBy, promoteRunning });
     } catch (error) {
       console.error('[Fleet] Failed to get fleet state:', error instanceof Error ? error.message : error);
-      res.json({ success: true, running: botManager.isRunning(), initialized: false, promote, promoteHeldBy, promoteRunning });
+      res.json({ success: true, running: botManager.isRunning(), initialized: false, ...lever, promote, promoteHeldBy, promoteRunning });
     }
   });
 
@@ -364,6 +369,20 @@ export function createFleetRoutes(botManager: BotManager): Router {
     } catch (error) {
       res.json({ success: false, error: error instanceof Error ? error.message : 'confirm failed' });
     }
+  });
+
+  /**
+   * POST /api/fleet/mode-override { clear? }
+   * The emergency lever (B6-k): enable active mode locally while the master is
+   * unreachable, or clear that enable.
+   */
+  router.post('/mode-override', (req: Request, res: Response) => {
+    const action = modeOverrideAction(req.body);
+    if (action === null) {
+      res.json({ success: false, error: 'Unknown body: send {} to enable locally or {"clear": true} to clear.', override: readModeOverride() });
+      return;
+    }
+    res.json(action === 'clear' ? unsetModeOverride() : setModeOverride('webui'));
   });
 
   /**
