@@ -103,7 +103,7 @@ export function applyRouteDefaultFromMarker(): void {
  * PostgresUnreachableError while it cannot be asked so the caller retries.
  * On first contact with a provisioned store the marker adopts its store_id.
  */
-export async function verifyStoreIdentity(url: string): Promise<{ ok: true } | { ok: false; reason: string }> {
+export async function verifyStoreIdentity(url: string): Promise<{ ok: true } | { ok: false; reason: string; pending?: true }> {
   const dbStoreId = await readStoreId(url);
   const marker = readFileMarker();
   if (marker?.storeId && dbStoreId && marker.storeId !== dbStoreId) {
@@ -117,7 +117,8 @@ export async function verifyStoreIdentity(url: string): Promise<{ ok: true } | {
     return { ok: true };
   }
   if (marker?.live === 'postgres' && marker.storeId && dbStoreId === null) {
-    return { ok: false, reason: 'the marker records data living in postgres but the configured database carries no store identity' };
+    // A store still provisioning carries none yet: a caller with a budget may ask again.
+    return { ok: false, reason: 'the marker records data living in postgres but the configured database carries no store identity', pending: true };
   }
   if (dbStoreId && (!marker || marker.storeId === null)) {
     writeFileMarker({

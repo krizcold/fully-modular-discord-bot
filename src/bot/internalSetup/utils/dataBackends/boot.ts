@@ -384,6 +384,38 @@ interface DeliveryRecycle { forms: string[]; persist: boolean }
 /** unreachable: a delivery never answered and this process holds nothing it may serve from (B7-F5). */
 interface RecycleOutcome { recycled: boolean; unreachable: boolean }
 const NO_RECYCLE: RecycleOutcome = { recycled: false, unreachable: false };
+
+/** The form that verified is the one to boot on next time, whatever the pick persisted before the recycle ran. */
+function persistPickedForm(delivery: DeliveryRecycle, url: string): void {
+  if (!delivery.persist || url === (loadCredentials().DATA_BACKEND_URL || '').trim()) return;
+  const result = upsertCredentials({ DATA_BACKEND_URL: url });
+  if (!result.success) console.warn('[Data] Could not persist the re-picked backend form to /data/.env; applied in-memory only:', result.error);
+}
+
+/**
+ * A delivery this node cannot install while the master has moved the fleet
+ * off the database it served from: one more write there would fork the data
+ * (B7-F5). The leases go back the way a hydration timeout hands them back, so
+ * the master can place the shards elsewhere, the gates latch closed, and the
+ * caller restarts the process: a fresh one picks the form again on its
+ * register. Writes still buffered are dropped rather than flushed to the
+ * abandoned store, and named. A superseded master keeps its pool (its control
+ * store shares it) and restarts on its own step-down.
+ */
+function giveUpDelivery(
+  oldReadiness: ReturnType<typeof getDataReadiness>,
+  oldWs: ReturnType<typeof getWorkingSet>,
+  stopBackend: boolean,
+  reason: string,
+): RecycleOutcome {
+  const dropped = oldWs?.dirtyGuildIds() ?? [];
+  if (dropped.length > 0) {
+    console.error(`[Data] ${dropped.length} guild(s) hold unflushed writes that are DROPPED at the hold (the fleet moved off this database): ${dropped.join(', ')}`);
+  }
+  oldReadiness?.declineAll('hydration-timeout');
+  holdOwnRuntimeForDelivery(reason, stopBackend);
+  return { recycled: false, unreachable: true };
+}
 /** Bounded wait for flushes already on the wire, so their keys are visible to the drain again. */
 const DRAIN_SETTLE_MS = 15_000;
 
@@ -440,19 +472,38 @@ async function runRecycle(url: string, keepPrevious: boolean, delivery?: Deliver
       try {
         const identity = await verifyStoreIdentity(url);
         if (!identity.ok) {
-          console.error(`[Data] The delivered database refused identity verification (${identity.reason}); staying on the current database`);
+          // A store still provisioning carries no identity yet and is asked
+          // again within the budget. Any other refusal is final, and under a
+          // delivery it ends the way a form that never answered does (B7-F5):
+          // whatever this database is, the previous one is no longer the fleet's.
+          if (identity.pending && attempt + 1 < DRAIN_VERIFY_ATTEMPTS) {
+            await sleep(DRAIN_VERIFY_RETRY_MS);
+            continue;
+          }
           void incoming.stop().catch(() => { /* best effort */ });
-          return NO_RECYCLE;
+          if (!delivery) {
+            console.error(`[Data] The delivered database refused identity verification (${identity.reason}); staying on the current database`);
+            return NO_RECYCLE;
+          }
+          return giveUpDelivery(oldReadiness, oldWs, !keepPrevious, `the delivered database refused identity verification (${identity.reason}), and the previous one is no longer the fleet database`);
         }
         verified = true;
       } catch {
         // A form this node cannot dial is re-picked, not waited on: the master
         // delivers every form of its database, and the one that answers a TCP
-        // connect from here is the one to verify (B7-F5). Once, never onto the
-        // form the node already dials, with a fresh budget; only the candidate
-        // backend moves, and nothing is installed or written until it verifies.
+        // connect from here is the one to verify (B7-F5). Once, with a fresh
+        // budget; only the candidate backend moves, and nothing is installed
+        // or written until it verifies. The form this node already dials
+        // answering means the delivery names the database it is on: it stays.
         if (delivery && !repicked && (attempt + 1) % REPICK_EVERY_FAILURES === 0) {
-          const alt = await reachableAlternative(url, delivery.forms.filter(f => f !== activeUrl));
+          const alt = await reachableAlternative(url, delivery.forms);
+          if (alt !== null && alt === activeUrl) {
+            console.warn('[Data] The delivered database answers on the form this node already dials; staying on it');
+            void incoming.stop().catch(() => { /* best effort */ });
+            setFleetDataBackend({ backend: 'postgres', url: alt });
+            persistPickedForm(delivery, alt);
+            return NO_RECYCLE;
+          }
           if (alt) {
             console.warn('[Data] The delivered database answers on another of its forms; dialing that one instead');
             void incoming.stop().catch(() => { /* best effort */ });
@@ -472,25 +523,11 @@ async function runRecycle(url: string, keepPrevious: boolean, delivery?: Deliver
         console.error('[Data] The delivered database never answered the identity check; staying on the current database');
         return NO_RECYCLE;
       }
-      // The master moved the fleet off the database this node has served
-      // from: one more write there would fork the data (B7-F5). The leases go
-      // back the way a hydration timeout hands them back, so the master can
-      // place the shards elsewhere, the gates latch closed, and the caller
-      // restarts the process: a fresh one picks the form again on its
-      // register. A superseded master keeps its pool (its control store shares
-      // it) and restarts on its own step-down.
-      oldReadiness?.declineAll('hydration-timeout');
-      holdOwnRuntimeForDelivery('the delivered database never answered the identity check, and the previous one is no longer the fleet database', !keepPrevious);
-      return { recycled: false, unreachable: true };
+      return giveUpDelivery(oldReadiness, oldWs, !keepPrevious, 'the delivered database never answered the identity check, and the previous one is no longer the fleet database');
     }
     if (delivery) {
       setFleetDataBackend({ backend: 'postgres', url });
-      // The form that verified is the one to boot on next time, whatever the
-      // pick persisted before this recycle ran.
-      if (delivery.persist && url !== (loadCredentials().DATA_BACKEND_URL || '').trim()) {
-        const result = upsertCredentials({ DATA_BACKEND_URL: url });
-        if (!result.success) console.warn('[Data] Could not persist the re-picked backend form to /data/.env; applied in-memory only:', result.error);
-      }
+      persistPickedForm(delivery, url);
     }
     if (oldWs) {
       // A flush already on the wire has emptied its dirty set, so it is
