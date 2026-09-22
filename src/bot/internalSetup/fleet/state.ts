@@ -304,8 +304,8 @@ export function _setStaleMasterPark(park: StaleMasterParkView | null): void {
 }
 
 /**
- * Read-only control-store park (B7-F6): the store is a standby or a primary a
- * promote fenced, so the boot parked instead of minting a term on it (a mint
+ * Read-only control-store park (B7-F6): the store is a standby or a primary
+ * fenced read-only, so the boot parked instead of minting a term on it (a mint
  * that outlived the posture would land on a fork at the live master's own
  * term). Terminal until an operator demotes, re-seeds or repoints.
  */

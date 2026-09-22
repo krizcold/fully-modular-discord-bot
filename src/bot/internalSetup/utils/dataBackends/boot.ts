@@ -205,7 +205,7 @@ export async function pickDeliveredUrl(url: string, publicUrl: string): Promise<
 export async function applyDeliveredBackend(
   info: { backend: DataBackendKind; url?: string; publicUrl?: string; transformationId?: string; routes?: { guildId: string; backend: DataBackendKind }[] } | undefined,
   opts?: { keepPrevious?: boolean; persist?: boolean },
-): Promise<{ changed: boolean; recycled: boolean; unreachable?: boolean }> {
+): Promise<{ changed: boolean; recycled: boolean; unreachable?: boolean; reason?: string }> {
   const backend = info?.backend ?? 'file';
   const publicUrl = (info?.publicUrl || '').trim();
   const localUrl = (info?.url || '').trim();
@@ -279,7 +279,7 @@ export async function applyDeliveredBackend(
     if (activeUrl !== null) {
       console.warn('[Data] Delivered backend URL changed; recycling the postgres runtime and carrying unflushed writes to the new database');
       const outcome = await recyclePostgresRuntime(url, opts?.keepPrevious === true, { forms: named, persist: opts?.persist !== false });
-      return { changed, recycled: outcome.recycled, unreachable: outcome.unreachable };
+      return { changed, recycled: outcome.recycled, unreachable: outcome.unreachable, reason: outcome.reason };
     }
     startPostgresRuntime(url);
   }
@@ -381,8 +381,12 @@ const REPICK_EVERY_FAILURES = 3;
 /** A master-delivered database: every form it was delivered in, and whether the pick is written to /data/.env. */
 interface DeliveryRecycle { forms: string[]; persist: boolean }
 
-/** unreachable: a delivery never answered and this process holds nothing it may serve from (B7-F5). */
-interface RecycleOutcome { recycled: boolean; unreachable: boolean }
+/**
+ * unreachable: a delivery this node could not install (it never answered, or
+ * refused the identity check; reason names which) while this process holds
+ * nothing it may serve from (B7-F5).
+ */
+interface RecycleOutcome { recycled: boolean; unreachable: boolean; reason?: string }
 const NO_RECYCLE: RecycleOutcome = { recycled: false, unreachable: false };
 
 /** The form that verified is the one to boot on next time, whatever the pick persisted before the recycle ran. */
@@ -414,7 +418,7 @@ function giveUpDelivery(
   }
   oldReadiness?.declineAll('hydration-timeout');
   holdOwnRuntimeForDelivery(reason, stopBackend);
-  return { recycled: false, unreachable: true };
+  return { recycled: false, unreachable: true, reason };
 }
 /** Bounded wait for flushes already on the wire, so their keys are visible to the drain again. */
 const DRAIN_SETTLE_MS = 15_000;
@@ -462,8 +466,9 @@ async function runRecycle(url: string, keepPrevious: boolean, delivery?: Deliver
   const oldReadiness = getDataReadiness();
   const oldWs = getWorkingSet();
   const oldBackend = getGuildDataBackend();
+  // Started only once the store verifies: a start provisions a store that
+  // lacks the schema and would mint an identity in one this node then refuses.
   let incoming = new PostgresBackend({ url });
-  incoming.start();
   let carried: string[] = [];
   let repicked = false;
   try {
@@ -482,7 +487,7 @@ async function runRecycle(url: string, keepPrevious: boolean, delivery?: Deliver
           }
           void incoming.stop().catch(() => { /* best effort */ });
           if (!delivery) {
-            console.error(`[Data] The delivered database refused identity verification (${identity.reason}); staying on the current database`);
+            console.error(`[Data] The database this process was repointed at refused identity verification (${identity.reason}); staying on the current database`);
             return NO_RECYCLE;
           }
           return giveUpDelivery(oldReadiness, oldWs, !keepPrevious, `the delivered database refused identity verification (${identity.reason}), and the previous one is no longer the fleet database`);
@@ -509,7 +514,6 @@ async function runRecycle(url: string, keepPrevious: boolean, delivery?: Deliver
             void incoming.stop().catch(() => { /* best effort */ });
             url = alt;
             incoming = new PostgresBackend({ url });
-            incoming.start();
             repicked = true;
             attempt = -1;
           }
@@ -520,11 +524,12 @@ async function runRecycle(url: string, keepPrevious: boolean, delivery?: Deliver
     if (!verified) {
       void incoming.stop().catch(() => { /* best effort */ });
       if (!delivery) {
-        console.error('[Data] The delivered database never answered the identity check; staying on the current database');
+        console.error('[Data] The database this process was repointed at never answered the identity check; staying on the current database');
         return NO_RECYCLE;
       }
       return giveUpDelivery(oldReadiness, oldWs, !keepPrevious, 'the delivered database never answered the identity check, and the previous one is no longer the fleet database');
     }
+    incoming.start();
     if (delivery) {
       setFleetDataBackend({ backend: 'postgres', url });
       persistPickedForm(delivery, url);
@@ -587,14 +592,18 @@ async function verifyIdentityLoop(url: string, driver: DataReadinessDriver): Pro
       const verdict = await verifyStoreIdentity(url);
       if (activeUrl !== url) return;
       if (!verdict.ok) {
-        refuse(verdict.reason);
-        return;
-      }
-      // Release only once the marker holds the store id (minted by the
-      // backend's own provisioning): hydration cannot proceed any earlier
-      // anyway, and adopting it now makes a later URL swap detectable from
-      // the very next boot.
-      if (readFileMarker()?.storeId) {
+        // A store still provisioning carries no identity yet (a standby that
+        // has not replayed the row, a store mid-restore): waited on like an
+        // unreachable one, never refused.
+        if (!verdict.pending) {
+          refuse(verdict.reason);
+          return;
+        }
+      } else if (readFileMarker()?.storeId) {
+        // Release only once the marker holds the store id (minted by the
+        // backend's own provisioning): hydration cannot proceed any earlier
+        // anyway, and adopting it now makes a later URL swap detectable from
+        // the very next boot.
         driver.release();
         bootStatus = { ...bootStatus, state: 'serving' };
         console.log('[Data] Postgres store identity verified; serving');

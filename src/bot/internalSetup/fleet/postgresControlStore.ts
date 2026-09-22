@@ -66,16 +66,16 @@ const CONTROL_DDL = [
   )`,
 ];
 
-/** 25006 read_only_sql_transaction: the store refuses writes, as a standby or a primary fenced by a promote does. */
+/** 25006 read_only_sql_transaction: the store refuses writes, as a standby or a primary fenced read-only does. */
 function isReadOnlyRefusal(error: unknown): boolean {
   return typeof error === 'object' && error !== null && (error as { code?: unknown }).code === '25006';
 }
 
-/** Why a store refuses writes, asked of the cluster: in recovery it is a standby, out of it a primary a promote fenced. */
+/** Why a store refuses writes, asked of the cluster: in recovery it is a standby; out of it, a primary fenced read-only (a promote, a restore and a recovery channel set the same posture). */
 export type ReadOnlyCause = 'standby' | 'fenced';
 
 function readOnlyWording(cause: ReadOnlyCause): string {
-  return cause === 'standby' ? 'in recovery (a standby)' : 'fenced read-only by a promote';
+  return cause === 'standby' ? 'in recovery (a standby)' : 'fenced read-only (default_transaction_read_only = on)';
 }
 
 /**
@@ -309,10 +309,10 @@ export class PostgresControlStore implements ControlStore {
           const pgTerm = res.rows.length > 0 ? Number(res.rows[0].term) : 0;
           const posture = await client.query(`SHOW default_transaction_read_only`);
           if (posture.rows[0]?.default_transaction_read_only === 'on') {
-            // Fenced by a promote: nothing this node holds in files belongs on
+            // Fenced read-only: nothing this node holds in files belongs on
             // it, and the write below would loop on 25006 for good (B7-F6).
             // The boot fence judges the node from the row it can read.
-            console.warn(`[Fleet] Control store is fenced read-only by a promote (the term row holds ${pgTerm}); nothing seeded from files, the boot fence judges this node`);
+            console.warn(`[Fleet] Control store is fenced read-only (default_transaction_read_only = on; the term row holds ${pgTerm}); nothing seeded from files, the boot fence judges this node`);
             return;
           }
           if (fileTerm > pgTerm) {

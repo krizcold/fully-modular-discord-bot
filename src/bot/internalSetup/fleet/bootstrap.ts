@@ -877,8 +877,9 @@ async function ownStoreInRecovery(selfNodeId: string): Promise<FollowerHoldBase 
 }
 
 /**
- * Read-only control store (B7-F6): a standby, or a primary a promote fenced
- * when it moved the fleet off it. No term can be minted here, and a retry that
+ * Read-only control store (B7-F6): a standby, or a primary fenced read-only (a
+ * promote that moved the fleet off it, a restore, a recovery channel). No term
+ * can be minted here, and a retry that
  * outlived the posture would mint on a forked copy at the live master's own
  * term, so the boot parks with the exits named. Terminal, like the stale-master
  * park, whose Demote exit it shares.
@@ -887,7 +888,7 @@ function parkOnReadOnlyStore(error: ControlStoreReadOnlyError): Promise<never> {
   const exits = error.cause === 'standby'
     ? 'point CONTROL_STORE_URL or DATA_BACKEND_URL at the primary, or promote this copy, then restart'
     : error.provisioned
-      ? 'Demote this node to rejoin as a co-worker, or re-seed its database from the machine that serves the fleet; if a restore holds this posture, restart once it finishes'
+      ? 'a promote that moved the fleet off this database sets this, and so do a restore whose write fence was not lifted and an armed recovery channel; if a restore or a channel holds it, restart the database container or disarm the channel and start this node again; otherwise Demote this node to rejoin as a co-worker, or re-seed its database from the machine that serves the fleet'
       : 'check DATA_BACKEND_URL and CONTROL_STORE_URL and the database they name';
   const reason = `READ-ONLY CONTROL STORE: ${error.message}; parking the boot instead of minting a term on it. ${exits}`;
   console.error(`[Fleet] ${reason}`);
@@ -3625,7 +3626,7 @@ async function initCoWorker(init: CommonInit, followerHold: FollowerHoldBase | n
       onDataBackend: info => {
         void (async () => {
           try {
-            const { changed, recycled, unreachable } = await applyDeliveredBackend(info, followerHold ? { persist: false } : undefined);
+            const { changed, recycled, unreachable, reason: holdReason } = await applyDeliveredBackend(info, followerHold ? { persist: false } : undefined);
             if (followerHold) {
               // A hold entered without a database of its own could not read
               // whose copy it holds; the delivered credentials can.
@@ -3670,11 +3671,12 @@ async function initCoWorker(init: CommonInit, followerHold: FollowerHoldBase | n
             // the hold), and a lease granted meanwhile must reach it too.
             if (recycled || (followerHold && getActiveBackendUrl() !== null)) runtime.renotifyDataLayer();
             if (unreachable) {
-              // The delivered database never answered from here and the store
+              // The delivered database could not be installed from here (it
+              // never answered, or refused the identity check) and the store
               // this process served from is no longer the fleet's (B7-F5): it
               // holds nothing it may serve. A fresh process picks the form again
               // on its register, with the master's forms probed live.
-              console.error('[Fleet] The delivered database is unreachable from this node; restarting in 3s to pick its form again on the register');
+              console.error(`[Fleet] The delivered database cannot be installed from this node (${holdReason ?? 'no reason given'}); restarting in 3s to pick its form again on the register`);
               setTimeout(() => requestStepDownRestart(), STEPDOWN_HANDOVER_DELAY_MS).unref();
             }
             if (changed) {
