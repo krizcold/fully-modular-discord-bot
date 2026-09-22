@@ -888,7 +888,7 @@ function parkOnReadOnlyStore(error: ControlStoreReadOnlyError): Promise<never> {
   const exits = error.cause === 'standby'
     ? 'point CONTROL_STORE_URL or DATA_BACKEND_URL at the primary, or promote this copy, then restart'
     : error.provisioned
-      ? 'a promote that moved the fleet off this database sets this, and so do a restore whose write fence was not lifted and an armed recovery channel; if a restore or a channel holds it, restart the database container or disarm the channel and start this node again; otherwise Demote this node to rejoin as a co-worker, or re-seed its database from the machine that serves the fleet'
+      ? 'a promote that moved the fleet off this database sets this, and so do a restore whose write fence was not lifted and an armed recovery channel; if a restore holds it, wait for it to finish, and run the restore again if it reports the fence could not be lifted (a container restart clears only a fence the manager reports as stripped); if a recovery channel holds it, disarm the channel; then start this node again; otherwise Demote this node to rejoin as a co-worker, or re-seed its database from the machine that serves the fleet'
       : 'check DATA_BACKEND_URL and CONTROL_STORE_URL and the database they name';
   const reason = `READ-ONLY CONTROL STORE: ${error.message}; parking the boot instead of minting a term on it. ${exits}`;
   console.error(`[Fleet] ${reason}`);

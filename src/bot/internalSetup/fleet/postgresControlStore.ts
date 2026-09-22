@@ -143,8 +143,10 @@ export class PostgresControlStore implements ControlStore {
           await client.query(statement);
         }
       } catch (error) {
-        // A primary a promote fenced read-only refuses the DDL with 25006 like
-        // a standby does, IF NOT EXISTS or not. Its schema is already there,
+        // A primary fenced read-only (a promote that moved the fleet off it, a
+        // restore whose write fence was not lifted, an armed recovery channel)
+        // refuses the DDL with 25006 like a standby does, IF NOT EXISTS or not.
+        // Its schema is already there,
         // so provisioning is asserted from it and the reads go through: the
         // takeover guard and the stale-master fence judge a returning master
         // by its term row, and a boot that cannot read it loops on this DDL
