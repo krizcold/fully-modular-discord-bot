@@ -66,8 +66,15 @@ const CONTROL_DDL = [
   )`,
 ];
 
+/** 25006 read_only_sql_transaction: the store refuses writes, as a standby or a primary fenced by a promote does. */
+function isReadOnlyRefusal(error: unknown): boolean {
+  return typeof error === 'object' && error !== null && (error as { code?: unknown }).code === '25006';
+}
+
 export class PostgresControlStore implements ControlStore {
   private provisioned = false;
+  private readOnlyNoted = false;
+  private readOnlyMintNoted = false;
   private mintedTerm: number | null = null;
   private fenced = false;
   private fencedCb: ((observedTerm: number) => void) | null = null;
@@ -108,8 +115,27 @@ export class PostgresControlStore implements ControlStore {
     if (this.provisioned) return;
     await client.query(`SELECT pg_advisory_lock(hashtext('smdb_control_bootstrap'))`);
     try {
-      for (const statement of CONTROL_DDL) {
-        await client.query(statement);
+      try {
+        for (const statement of CONTROL_DDL) {
+          await client.query(statement);
+        }
+      } catch (error) {
+        // A primary a promote fenced read-only refuses the DDL with 25006 like
+        // a standby does, IF NOT EXISTS or not. Its schema is already there,
+        // so provisioning is asserted from it and the reads go through: the
+        // takeover guard and the stale-master fence judge a returning master
+        // by its term row, and a boot that cannot read it loops on this DDL
+        // instead of parking (B7-F6). An unprovisioned read-only store stays
+        // a refusal.
+        if (!isReadOnlyRefusal(error)) throw error;
+        const present = await client.query(`SELECT to_regclass('smdb_control.term') IS NOT NULL AS present`);
+        if (present.rows[0]?.present !== true) throw error;
+        if (!this.readOnlyNoted) {
+          this.readOnlyNoted = true;
+          console.warn('[Fleet] Control store is read-only (fenced); provisioning asserted from the existing schema, reads only');
+        }
+        this.provisioned = true;
+        return;
       }
       // The failback's divergence proof (B6 map F31) reads this database's WAL
       // through pg_walinspect, and a copy of it fenced read-only cannot install
@@ -156,7 +182,20 @@ export class PostgresControlStore implements ControlStore {
           this.mintedTerm = term;
           return term;
         } catch (error) {
-          console.warn('[Fleet] Waiting on control store for term acquisition:', error instanceof Error ? error.message : error);
+          if (isReadOnlyRefusal(error)) {
+            // The fence found no live holder to park on, yet a promote fenced
+            // this database: no term can ever be minted here (B7-F6). Held
+            // rather than crashed, with the exits named; Demote's pre-init
+            // path is one of them.
+            if (!this.readOnlyMintNoted) {
+              this.readOnlyMintNoted = true;
+              console.error(this.provisioned
+                ? '[Fleet] Control store is read-only (fenced by a promote): no term can be minted on it. This node is a former master whose database the fleet moved off; Demote it to rejoin as a co-worker, or re-seed its database from the machine that serves the fleet'
+                : '[Fleet] Control store is read-only and holds no control schema: this is not a fleet database this node can mint on; check DATA_BACKEND_URL and the database itself');
+            }
+          } else {
+            console.warn('[Fleet] Waiting on control store for term acquisition:', error instanceof Error ? error.message : error);
+          }
         } finally {
           client.release();
         }
@@ -251,6 +290,14 @@ export class PostgresControlStore implements ControlStore {
           const fileTerm = (await fileStore.getTerm())?.term ?? 0;
           const res = await client.query(`SELECT term FROM smdb_control.term WHERE id = 1`);
           const pgTerm = res.rows.length > 0 ? Number(res.rows[0].term) : 0;
+          const posture = await client.query(`SHOW default_transaction_read_only`);
+          if (posture.rows[0]?.default_transaction_read_only === 'on') {
+            // Fenced by a promote: nothing this node holds in files belongs on
+            // it, and the write below would loop on 25006 for good (B7-F6).
+            // The boot fence judges the node from the row it can read.
+            console.warn(`[Fleet] Control store is read-only (fenced; the term row holds ${pgTerm}); nothing seeded from files, the boot fence judges this node`);
+            return;
+          }
           if (fileTerm > pgTerm) {
             const marker = await fileStore.loadReshardMarker();
             if (marker === 'corrupt') {
@@ -293,6 +340,10 @@ export class PostgresControlStore implements ControlStore {
           return;
         } catch (error) {
           await client.query('ROLLBACK').catch(() => { /* not in a txn */ });
+          if (isReadOnlyRefusal(error)) {
+            console.warn('[Fleet] Control store is read-only (fenced); nothing seeded from files, the boot fence judges this node');
+            return;
+          }
           console.warn('[Fleet] Control-store seeding failed; retrying:', error instanceof Error ? error.message : error);
         } finally {
           client.release();
