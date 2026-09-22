@@ -115,6 +115,8 @@ export interface FleetState {
   takeoverHold: TakeoverHoldView | null;
   /** Stale-master boot fence: parked because a live peer holds a term this node's own store cannot beat (PLAN_REPLICATION Stage 4). */
   staleMasterPark: StaleMasterParkView | null;
+  /** Read-only control store (B7-F6): parked because no term can be minted on a fenced or in-recovery store; Demote is the exit. */
+  readOnlyStorePark: ReadOnlyStoreParkView | null;
   /** Follower hold (20.5, B6 map F28): this master came back behind a stand-in that took the fleet's writes, or on a copy, and follows the node holding the fleet as a co-worker until the failback promotes it back. */
   followerHold: FollowerHoldView | null;
   /** Boot hold: this master's store is EMPTY while other nodes are configured; seed from a backup first (20.14). */
@@ -299,6 +301,25 @@ let staleMasterPark: StaleMasterParkView | null = null;
 
 export function _setStaleMasterPark(park: StaleMasterParkView | null): void {
   staleMasterPark = park;
+}
+
+/**
+ * Read-only control-store park (B7-F6): the store is a standby or a primary a
+ * promote fenced, so the boot parked instead of minting a term on it (a mint
+ * that outlived the posture would land on a fork at the live master's own
+ * term). Terminal until an operator demotes, re-seeds or repoints.
+ */
+export interface ReadOnlyStoreParkView {
+  cause: 'standby' | 'fenced';
+  provisioned: boolean;
+  reason: string;
+  at: number;
+}
+
+let readOnlyStorePark: ReadOnlyStoreParkView | null = null;
+
+export function _setReadOnlyStorePark(park: ReadOnlyStoreParkView | null): void {
+  readOnlyStorePark = park;
 }
 
 /**
@@ -526,6 +547,7 @@ export function getFleetState(): FleetState {
       // branch is what the UI polls then.
       takeoverHold,
       staleMasterPark,
+      readOnlyStorePark,
       followerHold: buildFollowerHoldView(),
       emptyStoreHold,
       superseded,
@@ -648,6 +670,7 @@ export function getFleetState(): FleetState {
       controlStoreFenced,
       takeoverHold,
       staleMasterPark,
+      readOnlyStorePark,
       followerHold: buildFollowerHoldView(),
       emptyStoreHold: null,
       superseded,
@@ -762,6 +785,7 @@ export function getFleetState(): FleetState {
     controlStoreFenced: null,
     takeoverHold,
     staleMasterPark,
+    readOnlyStorePark,
     followerHold: buildFollowerHoldView(),
     emptyStoreHold: null,
     superseded,

@@ -1744,6 +1744,12 @@ function FleetView({ api, wsClient, guildNames }) {
             <div><FleetDemoteButton api={api} /></div>
           </div>
         )}
+        {fleet.readOnlyStorePark && (
+          <div className="usage-notice" style={{ borderColor: '#e5534b', color: '#e5534b' }}>
+            {fleet.readOnlyStorePark.reason}
+            <div><FleetDemoteButton api={api} /></div>
+          </div>
+        )}
         {fleet.followerHold && <FleetFollowerHoldBanner api={api} fleet={fleet} />}
         {fleet.emptyStoreHold && (
           <FleetEmptyStoreHoldBanner api={api} hold={fleet.emptyStoreHold} />

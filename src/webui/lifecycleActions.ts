@@ -122,7 +122,7 @@ export async function runDemote(
         };
       }
     } else if (running
-      && !(state && (state.takeoverHold || state.staleMasterPark || state.followerHold || state.emptyStoreHold || (state.standIn?.live && state.standIn.writeGate)))
+      && !(state && (state.takeoverHold || state.staleMasterPark || state.readOnlyStorePark || state.followerHold || state.emptyStoreHold || (state.standIn?.live && state.standIn.writeGate)))
       && !confirm) {
       // Genuine early boot with no known hold: seconds away from real state.
       // Any OTHER stall that never reaches initialization (a control store whose
@@ -140,7 +140,7 @@ export async function runDemote(
       // whatever the override file resolves to now: a designated backup whose
       // only master identity was a staged takeover that a Cancel has since
       // cleared still needs the demote as the park's exit.
-      const heldMasterBoot = !!(state && (state.takeoverHold || state.staleMasterPark || state.followerHold || state.emptyStoreHold));
+      const heldMasterBoot = !!(state && (state.takeoverHold || state.staleMasterPark || state.readOnlyStorePark || state.followerHold || state.emptyStoreHold));
       const refusal = !heldMasterBoot && resolveNodeRole() !== 'master' ? 'this node is not a master'
         : isStandalone() ? 'a standalone master has no fleet to rejoin; demotion is meaningless here'
         : effectiveMasterUrls().urls.length === 0 ? 'no master candidates configured (set MASTER_URLS or the fleet config first, or the demoted node would idle)'

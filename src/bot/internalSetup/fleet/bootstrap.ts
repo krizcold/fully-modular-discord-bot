@@ -44,7 +44,7 @@ import {
   wasNodeIdFreshlyGenerated,
   writeRoleOverride,
 } from './nodeIdentity';
-import { createStandInControlStore, prepareControlStore, PostgresControlStore } from './postgresControlStore';
+import { ControlStoreReadOnlyError, createStandInControlStore, prepareControlStore, PostgresControlStore } from './postgresControlStore';
 import { ArmRecord, readArmRecord, writeArmRecord } from './armRecord';
 import { closeStandInLane, rememberLineageVerdict, seizedEpisode, standInEnding, writeEpisodeRecordOrWarn } from './episodeRecord';
 import { backupModeEnabled, leverRank, readModeOverride } from './modeOverride';
@@ -67,7 +67,7 @@ import {
   resolveShardCount,
 } from './placement';
 import { evaluateRecovery } from './recovery';
-import { _setControlStoreFenced, _setEmptyStoreHold, _setFleetStateSources, _setFollowerFollowingSupplier, _setFollowerHold, _setFollowerLineage, _setOwnCopyLineage, _setSlotStatus, _setStaleMasterPark, _setSuperseded, _setTakeoverHold, FleetRecoverySource, FleetRefusedRegistration, FollowerHoldBase, getFleetState } from './state';
+import { _setControlStoreFenced, _setEmptyStoreHold, _setFleetStateSources, _setFollowerFollowingSupplier, _setFollowerHold, _setFollowerLineage, _setOwnCopyLineage, _setReadOnlyStorePark, _setSlotStatus, _setStaleMasterPark, _setSuperseded, _setTakeoverHold, FleetRecoverySource, FleetRefusedRegistration, FollowerHoldBase, getFleetState } from './state';
 import type { MigrationView, PinViolationView } from './state';
 import { serveSyncRequest, SyncAuthority } from './syncAuthority';
 import { SyncEngine } from './syncEngine';
@@ -876,6 +876,26 @@ async function ownStoreInRecovery(selfNodeId: string): Promise<FollowerHoldBase 
   return { reason: 'copy', standInNodeId: holder, standInName: null, observedTerm: row?.term ?? null, localTerm: null, seenVia: 'own database in recovery', since: Date.now() };
 }
 
+/**
+ * Read-only control store (B7-F6): a standby, or a primary a promote fenced
+ * when it moved the fleet off it. No term can be minted here, and a retry that
+ * outlived the posture would mint on a forked copy at the live master's own
+ * term, so the boot parks with the exits named. Terminal, like the stale-master
+ * park, whose Demote exit it shares.
+ */
+function parkOnReadOnlyStore(error: ControlStoreReadOnlyError): Promise<never> {
+  const exits = error.cause === 'standby'
+    ? 'point CONTROL_STORE_URL or DATA_BACKEND_URL at the primary, or promote this copy, then restart'
+    : error.provisioned
+      ? 'Demote this node to rejoin as a co-worker, or re-seed its database from the machine that serves the fleet; if a restore holds this posture, restart once it finishes'
+      : 'check DATA_BACKEND_URL and CONTROL_STORE_URL and the database they name';
+  const reason = `READ-ONLY CONTROL STORE: ${error.message}; parking the boot instead of minting a term on it. ${exits}`;
+  console.error(`[Fleet] ${reason}`);
+  _setReadOnlyStorePark({ cause: error.cause, provisioned: error.provisioned, reason, at: Date.now() });
+  pushFleetStatusNow();
+  return (async () => { for (;;) await guardSleep(TERM_GUARD_POLL_MS); })();
+}
+
 async function initMaster(init: CommonInit & { standalone: boolean }): Promise<FleetContext | { followerHold: FollowerHoldBase }> {
   // A master follows no slot: a record left by this node's co-worker past must
   // not keep answering the manager's facts hook. The posture fact goes with it,
@@ -1020,7 +1040,10 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   // synchronous_standby_names still has to go, but only when it leaves recovery,
   // which is the write step's job.
   if (!serveOnly) await clearOwnSyncPosture();
-  const store = serveOnly ? createStandInControlStore(standInUrl) : await prepareControlStore(standalone);
+  const store = serveOnly ? createStandInControlStore(standInUrl) : await prepareControlStore(standalone).catch((error: unknown) => {
+    if (error instanceof ControlStoreReadOnlyError) return parkOnReadOnlyStore(error);
+    throw error;
+  });
   // A control-store fence trip means a second master owns the schema: this
   // master stops granting entirely (the higher-term master is the healthy
   // one). Teardown (assigned once the server exists) drops every worker so
@@ -1137,7 +1160,10 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     writeArmRecord({ ...onDisk, phase: onDisk.phase === 'promoting' ? 'promoting' : 'serving', inheritedTerm: term, inheritedFrom: inherited.nodeId });
     console.warn(`[Fleet] STANDING IN for ${coveringNodeId} at inherited term ${term}; serving READ-ONLY until the write step`);
   } else {
-    term = await store.acquireTerm(nodeId);
+    term = await store.acquireTerm(nodeId).catch((error: unknown) => {
+      if (error instanceof ControlStoreReadOnlyError) return parkOnReadOnlyStore(error);
+      throw error;
+    });
     if (standIn) {
       // The inherited term becomes an OWNED one here, one above it, on the copy
       // that now holds the fleet's writes. The number is the whole signal: a
