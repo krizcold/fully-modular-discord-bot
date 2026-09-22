@@ -73,6 +73,12 @@ export class DataReadinessDriver {
     clearInterval(this.catalogTimer);
   }
 
+  /** Hand every lease back now, as a hydration timeout would: the database this driver fronts can no longer serve them. */
+  declineAll(reason: LeaseDeclineReason): void {
+    if (!declineHandler || this.shardIds.length === 0) return;
+    declineHandler(reason, [...this.shardIds]);
+  }
+
   /** Boot hook: store identity verified; hydrate whatever leases arrived while held. */
   release(): void {
     if (!this.held) return;

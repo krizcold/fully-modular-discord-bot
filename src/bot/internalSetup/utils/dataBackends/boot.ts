@@ -101,6 +101,18 @@ let activeUrl: string | null = null;
 // that lands while the child runs reaches only here.
 let deliveredUrls: string[] | null = null;
 
+/** Another of the given forms of one database that answers a TCP connect now, if any. */
+async function reachableAlternative(url: string, forms: string[]): Promise<string | null> {
+  for (const candidate of forms) {
+    if (candidate === url) continue;
+    try {
+      const parsed = new URL(candidate);
+      if (await tcpReachable(parsed.hostname, Number(parsed.port) || 5432)) return candidate;
+    } catch { /* not a URL this node can dial */ }
+  }
+  return null;
+}
+
 /** Every form of the database endpoint the fleet's master last delivered. */
 export function getDeliveredBackendUrls(): string[] {
   if (deliveredUrls) return deliveredUrls;
@@ -149,18 +161,25 @@ function tcpReachable(host: string, port: number): Promise<boolean> {
  * resolvers (ISP NXDOMAIN redirection behind docker's embedded DNS) make bare
  * names "resolve" everywhere, which would strand a remote worker on an
  * undialable pick. When BOTH forms are dark the database itself is down and
- * the probe proves nothing about vantage, so the pick sticks with whatever
- * this node used before rather than migrating on noise. A wrong pick is still
- * caught by store-identity verification, never served.
+ * the probe proves nothing about vantage: the form a SERVING runtime dials is
+ * proven for this vantage and stays, anything else is the public one. A wrong
+ * pick is never served: identity verification gates it, the recycle re-picks
+ * among the delivered forms while it verifies, and the next delivery picks
+ * again.
  */
-export async function pickDeliveredUrl(url: string, publicUrl: string, previous?: string): Promise<string> {
+export async function pickDeliveredUrl(url: string, publicUrl: string): Promise<string> {
   if (!publicUrl || publicUrl === url) return url;
   try {
     const local = new URL(url);
     if (await tcpReachable(local.hostname, Number(local.port) || 5432)) return url;
     const pub = new URL(publicUrl);
     if (await tcpReachable(pub.hostname, Number(pub.port) || 5432)) return publicUrl;
-    return previous === publicUrl ? publicUrl : url;
+    // Both dark. History is not evidence: an unverified runtime may sit on
+    // exactly the form this node cannot dial (B7-F5). A node with no proven
+    // form is the remote one in every fleet shape but the sidecar's own host,
+    // where a live database would have answered the first probe.
+    if (bootStatus.state === 'serving' && activeUrl !== null && (activeUrl === url || activeUrl === publicUrl)) return activeUrl;
+    return publicUrl;
   } catch {
     return publicUrl;
   }
@@ -186,19 +205,24 @@ export async function pickDeliveredUrl(url: string, publicUrl: string, previous?
 export async function applyDeliveredBackend(
   info: { backend: DataBackendKind; url?: string; publicUrl?: string; transformationId?: string; routes?: { guildId: string; backend: DataBackendKind }[] } | undefined,
   opts?: { keepPrevious?: boolean; persist?: boolean },
-): Promise<{ changed: boolean; recycled: boolean }> {
+): Promise<{ changed: boolean; recycled: boolean; unreachable?: boolean }> {
   const backend = info?.backend ?? 'file';
   const publicUrl = (info?.publicUrl || '').trim();
   const localUrl = (info?.url || '').trim();
-  const previousUrl = (loadCredentials().DATA_BACKEND_URL || '').trim();
   // Mid-transformation deliveries carry the url with backend 'file' too, so
   // the pick keys on the url's presence, not on the backend.
-  const url = localUrl ? await pickDeliveredUrl(localUrl, publicUrl, previousUrl) : localUrl;
+  let url = localUrl ? await pickDeliveredUrl(localUrl, publicUrl) : localUrl;
   // A delivery naming no endpoint at all leaves what is known standing: it
   // cannot show that a copy's source was left behind, and a verdict from it
   // would be one drawn from silence.
   const named = [url, publicUrl, localUrl].map(u => u.trim()).filter(u => u !== '');
   if (named.length > 0) deliveredUrls = Array.from(new Set(named));
+  // A SERVING runtime already on one of these forms stays on it: a pick taken
+  // during a blip must not recycle the node off the right database onto
+  // another form of the same one (B7-F5). A runtime the gates never opened for
+  // is not kept, since it may sit on a form this node cannot dial, and the pick
+  // just taken is what heals it.
+  if (activeUrl !== null && bootStatus.state === 'serving' && named.includes(activeUrl)) url = activeUrl;
   const creds = loadCredentials();
   const envBackend = (creds.DATA_BACKEND || 'file').trim() || 'file';
   const envUrl = (creds.DATA_BACKEND_URL || '').trim();
@@ -254,7 +278,8 @@ export async function applyDeliveredBackend(
     if (activeUrl === url) return { changed, recycled: false };
     if (activeUrl !== null) {
       console.warn('[Data] Delivered backend URL changed; recycling the postgres runtime and carrying unflushed writes to the new database');
-      return { changed, recycled: await recyclePostgresRuntime(url, opts?.keepPrevious === true) };
+      const outcome = await recyclePostgresRuntime(url, opts?.keepPrevious === true, { forms: named, persist: opts?.persist !== false });
+      return { changed, recycled: outcome.recycled, unreachable: outcome.unreachable };
     }
     startPostgresRuntime(url);
   }
@@ -277,7 +302,7 @@ export async function repointRuntimeForThisProcess(url: string): Promise<boolean
   if (!url) return false;
   setFleetDataBackend({ backend: 'postgres', url });
   if (activeUrl === url) return true;
-  if (activeUrl !== null) return runRecycle(url, false);
+  if (activeUrl !== null) return (await runRecycle(url, false)).recycled;
   startPostgresRuntime(url);
   return true;
 }
@@ -294,8 +319,8 @@ export function getActiveBackendUrl(): string | null {
  * closed until a delivery installs a database; one that cannot be dialed or
  * fails its identity check leaves them closed.
  */
-export function holdOwnRuntimeForDelivery(reason: string): void {
-  const own = activeUrl !== null ? getGuildDataBackend() : null;
+export function holdOwnRuntimeForDelivery(reason: string, stopBackend = true): void {
+  const own = activeUrl !== null && stopBackend ? getGuildDataBackend() : null;
   // Unwound the way a recycle unwinds it: a driver left behind would take the
   // lease a delivery's fresh driver then never learns of.
   getDataReadiness()?.stop();
@@ -350,6 +375,15 @@ export function applyBackendFlip(dest: DataBackendKind): void {
 /** Bounded identity retries for a drain: a just-promoted database can be seconds late to answer. */
 const DRAIN_VERIFY_ATTEMPTS = 10;
 const DRAIN_VERIFY_RETRY_MS = 3000;
+// Failed identity checks between two looks for another delivered form.
+const REPICK_EVERY_FAILURES = 3;
+
+/** A master-delivered database: every form it was delivered in, and whether the pick is written to /data/.env. */
+interface DeliveryRecycle { forms: string[]; persist: boolean }
+
+/** unreachable: a delivery never answered and this process holds nothing it may serve from (B7-F5). */
+interface RecycleOutcome { recycled: boolean; unreachable: boolean }
+const NO_RECYCLE: RecycleOutcome = { recycled: false, unreachable: false };
 /** Bounded wait for flushes already on the wire, so their keys are visible to the drain again. */
 const DRAIN_SETTLE_MS = 15_000;
 
@@ -370,7 +404,7 @@ const sleep = (ms: number) => new Promise<void>(resolve => { setTimeout(resolve,
  * Returns whether the runtime actually changed.
  */
 let recycleTarget: string | null = null;
-let recycleQueue: Promise<boolean> = Promise.resolve(false);
+let recycleQueue: Promise<RecycleOutcome> = Promise.resolve(NO_RECYCLE);
 
 /**
  * Single-flight per target. The master re-delivers the same backend on EVERY
@@ -379,23 +413,27 @@ let recycleQueue: Promise<boolean> = Promise.resolve(false);
  * discard its writes with nothing left to name them. A genuinely different
  * target queues behind the one in flight rather than racing it.
  */
-function recyclePostgresRuntime(url: string, keepPrevious: boolean): Promise<boolean> {
+function recyclePostgresRuntime(url: string, keepPrevious: boolean, delivery?: DeliveryRecycle): Promise<RecycleOutcome> {
   if (recycleTarget === url) return recycleQueue;
   recycleTarget = url;
   recycleQueue = recycleQueue
-    .catch(() => false)
-    .then(() => runRecycle(url, keepPrevious))
+    .catch(() => NO_RECYCLE)
+    .then(() => runRecycle(url, keepPrevious, delivery))
     .finally(() => { if (recycleTarget === url) recycleTarget = null; });
   return recycleQueue;
 }
 
-async function runRecycle(url: string, keepPrevious: boolean): Promise<boolean> {
+async function runRecycle(url: string, keepPrevious: boolean, delivery?: DeliveryRecycle): Promise<RecycleOutcome> {
+  // A queued recycle can find the node already on its form (an earlier one
+  // re-picked it): nothing to do.
+  if (activeUrl === url) return NO_RECYCLE;
   const oldReadiness = getDataReadiness();
   const oldWs = getWorkingSet();
   const oldBackend = getGuildDataBackend();
-  const incoming = new PostgresBackend({ url });
+  let incoming = new PostgresBackend({ url });
   incoming.start();
   let carried: string[] = [];
+  let repicked = false;
   try {
     let verified = false;
     for (let attempt = 0; attempt < DRAIN_VERIFY_ATTEMPTS && !verified; attempt++) {
@@ -403,18 +441,56 @@ async function runRecycle(url: string, keepPrevious: boolean): Promise<boolean> 
         const identity = await verifyStoreIdentity(url);
         if (!identity.ok) {
           console.error(`[Data] The delivered database refused identity verification (${identity.reason}); staying on the current database`);
-          await incoming.stop().catch(() => { /* best effort */ });
-          return false;
+          void incoming.stop().catch(() => { /* best effort */ });
+          return NO_RECYCLE;
         }
         verified = true;
       } catch {
+        // A form this node cannot dial is re-picked, not waited on: the master
+        // delivers every form of its database, and the one that answers a TCP
+        // connect from here is the one to verify (B7-F5). Once, never onto the
+        // form the node already dials, with a fresh budget; only the candidate
+        // backend moves, and nothing is installed or written until it verifies.
+        if (delivery && !repicked && (attempt + 1) % REPICK_EVERY_FAILURES === 0) {
+          const alt = await reachableAlternative(url, delivery.forms.filter(f => f !== activeUrl));
+          if (alt) {
+            console.warn('[Data] The delivered database answers on another of its forms; dialing that one instead');
+            void incoming.stop().catch(() => { /* best effort */ });
+            url = alt;
+            incoming = new PostgresBackend({ url });
+            incoming.start();
+            repicked = true;
+            attempt = -1;
+          }
+        }
         if (attempt + 1 < DRAIN_VERIFY_ATTEMPTS) await sleep(DRAIN_VERIFY_RETRY_MS);
       }
     }
     if (!verified) {
-      console.error('[Data] The delivered database never answered the identity check; staying on the current database');
-      await incoming.stop().catch(() => { /* best effort */ });
-      return false;
+      void incoming.stop().catch(() => { /* best effort */ });
+      if (!delivery) {
+        console.error('[Data] The delivered database never answered the identity check; staying on the current database');
+        return NO_RECYCLE;
+      }
+      // The master moved the fleet off the database this node has served
+      // from: one more write there would fork the data (B7-F5). The leases go
+      // back the way a hydration timeout hands them back, so the master can
+      // place the shards elsewhere, the gates latch closed, and the caller
+      // restarts the process: a fresh one picks the form again on its
+      // register. A superseded master keeps its pool (its control store shares
+      // it) and restarts on its own step-down.
+      oldReadiness?.declineAll('hydration-timeout');
+      holdOwnRuntimeForDelivery('the delivered database never answered the identity check, and the previous one is no longer the fleet database', !keepPrevious);
+      return { recycled: false, unreachable: true };
+    }
+    if (delivery) {
+      setFleetDataBackend({ backend: 'postgres', url });
+      // The form that verified is the one to boot on next time, whatever the
+      // pick persisted before this recycle ran.
+      if (delivery.persist && url !== (loadCredentials().DATA_BACKEND_URL || '').trim()) {
+        const result = upsertCredentials({ DATA_BACKEND_URL: url });
+        if (!result.success) console.warn('[Data] Could not persist the re-picked backend form to /data/.env; applied in-memory only:', result.error);
+      }
     }
     if (oldWs) {
       // A flush already on the wire has emptied its dirty set, so it is
@@ -439,7 +515,7 @@ async function runRecycle(url: string, keepPrevious: boolean): Promise<boolean> 
   } catch (error) {
     console.warn('[Data] Error while recycling the postgres runtime:', error);
     await incoming.stop().catch(() => { /* best effort */ });
-    return false;
+    return NO_RECYCLE;
   }
   // Named once: anything flushAllDirty already reported is not repeated here.
   const stranded = (oldWs?.dirtyGuildIds() ?? []).filter(g => !carried.includes(g));
@@ -456,7 +532,7 @@ async function runRecycle(url: string, keepPrevious: boolean): Promise<boolean> 
   // nothing. A superseded master keeps its pool either way: its control store
   // shares it and it restarts in seconds.
   if (!keepPrevious && oldBackend) void oldBackend.stop().catch(() => { /* best effort */ });
-  return true;
+  return { recycled: true, unreachable: false };
 }
 
 async function verifyIdentityLoop(url: string, driver: DataReadinessDriver): Promise<void> {

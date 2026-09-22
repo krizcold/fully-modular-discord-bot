@@ -3599,7 +3599,7 @@ async function initCoWorker(init: CommonInit, followerHold: FollowerHoldBase | n
       onDataBackend: info => {
         void (async () => {
           try {
-            const { changed, recycled } = await applyDeliveredBackend(info, followerHold ? { persist: false } : undefined);
+            const { changed, recycled, unreachable } = await applyDeliveredBackend(info, followerHold ? { persist: false } : undefined);
             if (followerHold) {
               // A hold entered without a database of its own could not read
               // whose copy it holds; the delivered credentials can.
@@ -3643,6 +3643,14 @@ async function initCoWorker(init: CommonInit, followerHold: FollowerHoldBase | n
             // delivery installs a fresh runtime instead (its own was dropped at
             // the hold), and a lease granted meanwhile must reach it too.
             if (recycled || (followerHold && getActiveBackendUrl() !== null)) runtime.renotifyDataLayer();
+            if (unreachable) {
+              // The delivered database never answered from here and the store
+              // this process served from is no longer the fleet's (B7-F5): it
+              // holds nothing it may serve. A fresh process picks the form again
+              // on its register, with the master's forms probed live.
+              console.error('[Fleet] The delivered database is unreachable from this node; restarting in 3s to pick its form again on the register');
+              setTimeout(() => requestStepDownRestart(), STEPDOWN_HANDOVER_DELAY_MS).unref();
+            }
             if (changed) {
               // Mutating the shared object keeps buildRegister's closure
               // current; the refresh converges the master's registry NOW so
