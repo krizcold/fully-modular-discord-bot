@@ -9,6 +9,14 @@ import { applyRouteOverrides } from '../bot/internalSetup/utils/dataBackends/rou
 import { invalidateRoleOverrideCache } from '../bot/internalSetup/fleet/nodeIdentity';
 import { startStandInWrites } from './promoteEngine';
 
+// A crashed child is started again after this pause. The safety manager's
+// crash threshold (safe mode) bounds fast loops; a child that dies slower than
+// that window is bounded here: after this many automatic starts in a row with
+// no run reaching the stable uptime, it stays down for the operator.
+const CRASH_RESTART_DELAY_MS = 5000;
+const CRASH_RESTARTS_MAX = 5;
+const CRASH_STABLE_UPTIME_MS = 10 * 60_000;
+
 export interface BotStartResult {
   success: boolean;
   reason?: string;
@@ -39,6 +47,9 @@ export class BotManager {
   private readonly MAX_LOGS = 10000;
   private botStartTime: number = 0;
   private crashed: boolean = false;
+  private crashRestarts = 0;
+  private startingAfterCrash = false;
+  private stopRequested = false;
   private wsManager: WebSocketManager | null = null;
   private operationInProgress: boolean = false; // Prevents race conditions
   private safeMode: boolean = false;
@@ -168,6 +179,9 @@ export class BotManager {
 
     // Lock operations
     this.operationInProgress = true;
+    // An operator's start begins a fresh count of automatic ones.
+    if (!this.startingAfterCrash) this.crashRestarts = 0;
+    this.stopRequested = false;
 
     // The child consumes one-shot takeover flags from role-override.json; the
     // parent's role must stay in lockstep with whatever role this child boots.
@@ -240,6 +254,27 @@ export class BotManager {
           this.safetyManager.recordCrash(code, signal, this.crashLogs);
 
           this.emitEvent('bot:crash', { code, signal, logs: this.crashLogs });
+          // A child that stays down is a dead fleet node behind a container
+          // that still reads running.
+          if (this.botStartTime > 0 && Date.now() - this.botStartTime >= CRASH_STABLE_UPTIME_MS) this.crashRestarts = 0;
+          if (this.stopRequested) {
+            console.log('[BotManager] The exit followed a requested stop; not starting the bot again');
+          } else if (this.isInSafeMode()) {
+            console.error('[BotManager] Safe mode: the bot stays down after this crash');
+          } else if (this.crashRestarts >= CRASH_RESTARTS_MAX) {
+            console.error(`[BotManager] The bot stays down: ${this.crashRestarts} automatic starts in a row ended in a crash before ${CRASH_STABLE_UPTIME_MS / 60_000} minutes of uptime; start it by hand`);
+          } else {
+            this.crashRestarts += 1;
+            console.warn(`[BotManager] Starting the bot again in ${CRASH_RESTART_DELAY_MS / 1000}s (automatic start ${this.crashRestarts} of ${CRASH_RESTARTS_MAX})`);
+            setTimeout(() => {
+              this.startingAfterCrash = true;
+              void this.start().then(result => {
+                if (!result.success && result.reason !== 'already_running') {
+                  console.error(`[BotManager] The bot did not start again after its crash: ${result.error ?? result.reason ?? 'unknown'}`);
+                }
+              }).finally(() => { this.startingAfterCrash = false; });
+            }, CRASH_RESTART_DELAY_MS).unref();
+          }
         } else {
           // Clean exit
           this.crashed = false;
@@ -401,6 +436,9 @@ export class BotManager {
       const signal = emergency ? 'SIGKILL' : 'SIGTERM';
       console.log(`[BotManager] Shutting down bot with ${signal}...`);
 
+      // A requested stop is never a crash, whatever exit code the platform
+      // reports for the kill.
+      this.stopRequested = true;
       this.botProcess.kill(signal);
       this.addLog(`[BotManager] Bot shutdown initiated (${signal})`);
       this.emitEvent('bot:shutdown', { signal, emergency });
