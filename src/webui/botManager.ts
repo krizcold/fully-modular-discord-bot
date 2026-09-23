@@ -446,11 +446,14 @@ export class BotManager {
       this.operationInProgress = true;
     }
 
+    // A start that lands during the sleep below owns a new child; this stop
+    // only ever acts on the one it signalled.
+    const child = this.botProcess;
     try {
       const signal = emergency ? 'SIGKILL' : 'SIGTERM';
       console.log(`[BotManager] Shutting down bot with ${signal}...`);
 
-      this.botProcess.kill(signal);
+      child.kill(signal);
       this.addLog(`[BotManager] Bot shutdown initiated (${signal})`);
       this.emitEvent('bot:shutdown', { signal, emergency });
 
@@ -458,13 +461,15 @@ export class BotManager {
       await this.sleep(1000);
 
       // Force kill if still running
-      if (this.isRunning() && !emergency) {
+      if (this.botProcess === child && this.isRunning() && !emergency) {
         console.log('[BotManager] Bot did not exit gracefully, forcing shutdown');
-        this.botProcess?.kill('SIGKILL');
+        child.kill('SIGKILL');
       }
 
-      this.botProcess = null;
-      this.botStartTime = 0;
+      if (this.botProcess === child) {
+        this.botProcess = null;
+        this.botStartTime = 0;
+      }
     } finally {
       // Release lock if emergency
       if (emergency) {
