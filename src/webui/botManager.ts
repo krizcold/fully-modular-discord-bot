@@ -220,6 +220,7 @@ export class BotManager {
         execArgv: isProd ? [] : ['-r', 'ts-node/register'] // Use ts-node in development
       });
 
+      const child = this.botProcess;
       this.botStartTime = Date.now();
       this.crashed = false;
 
@@ -243,6 +244,12 @@ export class BotManager {
 
       // Handle process exit
       this.botProcess.on('exit', (code, signal) => {
+        // A child still draining when its shutdown moved the handle on exits
+        // later; that exit is not its successor's.
+        if (this.botProcess !== child) {
+          console.log(`[BotManager] A previous bot child exited with code: ${code}, signal: ${signal}`);
+          return;
+        }
         console.log(`[BotManager] Bot exited with code: ${code}, signal: ${signal}`);
 
         if (code !== 0 && code !== null) {
