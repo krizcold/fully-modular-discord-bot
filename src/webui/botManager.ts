@@ -296,9 +296,7 @@ export class BotManager {
 
         this.botProcess = null;
         this.botStartTime = 0;
-        const pending = [...this.pendingIpcRejects];
-        this.pendingIpcRejects.clear();
-        for (const fail of pending) fail(new Error('bot process exited before replying'));
+        this.failPendingIpc('bot process exited before replying');
         this.emitEvent('bot:status', this.getStatus());
       });
 
@@ -469,6 +467,9 @@ export class BotManager {
       if (this.botProcess === child) {
         this.botProcess = null;
         this.botStartTime = 0;
+        // The child may drain past this point; its exit is stale by then and
+        // settles nothing, so requests still waiting on it fail here.
+        this.failPendingIpc('bot process was stopped before replying');
       }
     } finally {
       // Release lock if emergency
@@ -512,6 +513,12 @@ export class BotManager {
     clearTimeout(this.crashRestartTimer);
     this.crashRestartTimer = null;
     console.log('[BotManager] The automatic start after the crash was called off by a requested stop');
+  }
+
+  private failPendingIpc(message: string): void {
+    const pending = [...this.pendingIpcRejects];
+    this.pendingIpcRejects.clear();
+    for (const fail of pending) fail(new Error(message));
   }
 
   /**
