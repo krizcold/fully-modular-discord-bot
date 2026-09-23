@@ -10,6 +10,9 @@ import { Client, ClientOptions } from 'discord.js';
 export class IngestService {
   private client: Client | null = null;
   private started = false;
+  private generation = 0;
+  private stopping: Promise<void> | null = null;
+  private starting: Promise<string> | null = null;
   private shardPlan: { shards: number[]; shardCount: number } | null = null;
 
   buildClient(options: ClientOptions): Client {
@@ -48,22 +51,68 @@ export class IngestService {
   }
 
   /** Only LeaseRuntime may call this; the lease gate and identify pacing live there. */
-  start(token: string | undefined): Promise<string> {
-    if (!this.client) return Promise.reject(new Error('[Ingest] start() before buildClient()'));
+  async start(token: string | undefined): Promise<string> {
+    if (!this.client) throw new Error('[Ingest] start() before buildClient()');
+    // One login at a time: a second grant while the first is parked below
+    // joins it instead of identifying the same shards twice.
+    if (this.starting) return this.starting;
     this.started = true;
-    return this.client.login(token);
+    const generation = ++this.generation;
+    const run = (async (): Promise<string> => {
+      // A stop still tearing the previous sessions down resets the ws
+      // manager when it finishes; a login begun under it would resume into
+      // that reset. A stop that lands while parked here cancels this login.
+      while (this.stopping) await this.stopping;
+      if (!this.started || generation !== this.generation) {
+        console.warn('[Ingest] Login abandoned by a stop before it connected');
+        return '';
+      }
+      try {
+        return await this.client!.login(token);
+      } catch (error) {
+        // A stop() while this connect was in flight nulled the ws manager
+        // the connect resumed into (WebSocketManager.connect reads this._ws
+        // after its await): that rejection is this node's own destroy, not
+        // a login failure. A failure on a login nobody stopped still
+        // surfaces unhandled, exactly like today's boot.
+        if (!this.started || generation !== this.generation) {
+          console.warn(`[Ingest] Login abandoned by a stop mid-connect: ${error instanceof Error ? error.message : String(error)}`);
+          return '';
+        }
+        throw error;
+      }
+    })();
+    this.starting = run;
+    try {
+      return await run;
+    } finally {
+      if (this.starting === run) this.starting = null;
+    }
   }
 
   /** Destroys all gateway sessions and leaves the Client re-loginable for a future grant. */
   async stop(reason: string): Promise<void> {
+    // An earlier stop still tearing down is this stop's work too: a revoke
+    // acknowledged before it finishes would free shards still connected.
+    while (this.stopping) await this.stopping;
     if (!this.client || !this.started) {
       this.started = false;
       return;
     }
     this.started = false;
+    const run = this.destroySessions(reason);
+    this.stopping = run;
+    try {
+      await run;
+    } finally {
+      if (this.stopping === run) this.stopping = null;
+    }
+  }
+
+  private async destroySessions(reason: string): Promise<void> {
     console.log(`[Ingest] Destroying gateway sessions (${reason})`);
     try {
-      await this.client.destroy();
+      await this.client!.destroy();
     } catch (error) {
       console.error('[Ingest] Error destroying client:', error);
     }
@@ -73,7 +122,7 @@ export class IngestService {
     // destroyed flag would no-op the NEXT destroy (breaking revoke fencing).
     // Reset both so a future grant re-logins this same Client instance with
     // fresh shard options.
-    const ws = this.client.ws as any;
+    const ws = this.client!.ws as any;
     ws.destroyed = false;
     ws._ws = null;
     ws.status = 0;
