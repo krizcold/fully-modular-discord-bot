@@ -16,7 +16,7 @@ import { clearCopyBlock, copyBlockEndpoint, readCopyBlock, readSuperseded, write
 import { readSlotStatus, slotLostVerdict, sourceMatchesAny } from '../../bot/internalSetup/fleet/slotStatus';
 import { effectiveFleetConfigView } from '../../bot/internalSetup/fleet/fleetConfig';
 import { loadCredentials } from '../../utils/envLoader';
-import { runDemote } from '../lifecycleActions';
+import { runDemote, runRoleReset } from '../lifecycleActions';
 import { cancelPromote, continuePromote, startPromote } from '../promoteEngine';
 
 function tokensMatch(given: string, expected: string): boolean {
@@ -164,6 +164,11 @@ export function createManagedRoutes(botManager: BotManager): Router {
   /** POST /api/managed/demote { confirm? } */
   router.post('/demote', async (req: Request, res: Response) => {
     res.json(await runDemote(botManager, req.body?.confirm === true, 'manager-demote'));
+  });
+
+  /** POST /api/managed/role-reset { restart? } (restart defaults to true) */
+  router.post('/role-reset', async (req: Request, res: Response) => {
+    res.json(await runRoleReset(botManager, req.body?.restart !== false));
   });
 
   /**

@@ -355,6 +355,31 @@ export function upsertCredentials(patch: Record<string, string>): { success: boo
   }
 }
 
+/** Drop exactly the given keys from /data/.env, every other line kept verbatim; a key already absent is not an error. */
+export function removeCredentials(keys: string[]): { success: boolean; error?: string } {
+  const dataEnvPath = dataPath('.env');
+  try {
+    let lines: string[] = [];
+    try {
+      lines = fs.readFileSync(dataEnvPath, 'utf-8').split(/\r?\n/);
+    } catch { return { success: true }; }
+    const drop = new Set(keys);
+    const kept = lines.filter(line => {
+      const match = line.match(/^([A-Za-z_][A-Za-z0-9_]*)=/);
+      return !(match && drop.has(match[1]));
+    });
+    while (kept.length > 0 && kept[kept.length - 1] === '') kept.pop();
+    const tmp = `${dataEnvPath}.tmp`;
+    fs.writeFileSync(tmp, kept.join('\n') + '\n', { encoding: 'utf-8' });
+    fs.renameSync(tmp, dataEnvPath);
+    return { success: true };
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    console.error('[EnvLoader] Error removing credentials:', errorMessage);
+    return { success: false, error: errorMessage };
+  }
+}
+
 /**
  * Gets masked credential status (for Web-UI display)
  * Never returns actual credential values for security
