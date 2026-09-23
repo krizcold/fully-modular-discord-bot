@@ -192,30 +192,33 @@ export async function runDemote(
  * only store configuration. restart false leaves the child alone for a caller
  * about to stop it.
  */
-export async function runRoleReset(botManager: BotManager, restart: boolean): Promise<{ success: boolean; error?: string }> {
+export async function runRoleReset(botManager: BotManager, restart: boolean): Promise<{ success: boolean; formsCleared?: boolean; error?: string }> {
   try {
     // Seeds process.env from the file for keys compose left unset, which is
     // exactly what isContainerPinned tells apart from a genuine pin.
     loadCredentials();
-    if (!isContainerPinned('DATA_BACKEND_URL')) {
-      return { success: false, error: 'this node\'s container environment pins no database URL (DATA_BACKEND_URL), so its persisted store forms are its only store configuration and cannot be reset' };
-    }
-    const keys = ['DATA_BACKEND_URL', 'DATA_BACKEND_LOCAL_URL']
-      .concat(isContainerPinned('DATA_BACKEND_PUBLIC_URL') ? ['DATA_BACKEND_PUBLIC_URL'] : [])
-      .concat(isContainerPinned('CONTROL_STORE_URL') ? ['CONTROL_STORE_URL'] : []);
     clearRoleOverride();
     invalidateRoleOverrideCache();
-    const cleared = removeCredentials(keys);
-    if (!cleared.success) return { success: false, error: `the role override is cleared but the persisted store forms are not: ${cleared.error}` };
-    console.warn(`[Fleet] ROLE RESET (manager): the role override and the persisted store forms are cleared; the next boot follows BOT_NODE_ROLE and the container environment${restart ? '; restarting the bot child' : ''}`);
-    if (!restart) return { success: true };
+    // A container that pins no database URL has the persisted forms as its
+    // only store configuration: they stay, and the next delivery replaces
+    // them once the node follows a master again.
+    const pinned = isContainerPinned('DATA_BACKEND_URL');
+    if (pinned) {
+      const keys = ['DATA_BACKEND_URL', 'DATA_BACKEND_LOCAL_URL']
+        .concat(isContainerPinned('DATA_BACKEND_PUBLIC_URL') ? ['DATA_BACKEND_PUBLIC_URL'] : [])
+        .concat(isContainerPinned('CONTROL_STORE_URL') ? ['CONTROL_STORE_URL'] : []);
+      const cleared = removeCredentials(keys);
+      if (!cleared.success) return { success: false, error: `the role override is cleared but the persisted store forms are not: ${cleared.error}` };
+    }
+    console.warn(`[Fleet] ROLE RESET (manager): the role override is cleared and the persisted store forms are ${pinned ? 'cleared; the next boot follows BOT_NODE_ROLE and the container environment' : 'kept (the container environment pins no database URL); the next boot follows BOT_NODE_ROLE'}${restart ? '; restarting the bot child' : ''}`);
+    if (!restart) return { success: true, formsCleared: pinned };
     let result = await botManager.restart();
     for (let attempt = 0; !result?.success && result?.reason === 'operation_in_progress' && attempt < 5; attempt++) {
       await new Promise(resolve => setTimeout(resolve, 5000));
       result = await botManager.restart();
     }
     return result?.success
-      ? { success: true }
+      ? { success: true, formsCleared: pinned }
       : { success: false, error: result?.error ?? 'restart failed; the reset is written and the next start applies it' };
   } catch (error) {
     console.error('[Fleet] Role reset failed:', error instanceof Error ? error.message : error);
