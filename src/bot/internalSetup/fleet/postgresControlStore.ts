@@ -71,7 +71,7 @@ function isReadOnlyRefusal(error: unknown): boolean {
   return typeof error === 'object' && error !== null && (error as { code?: unknown }).code === '25006';
 }
 
-/** Why a store refuses writes, asked of the cluster: in recovery it is a standby; out of it, a primary fenced read-only (a promote, a restore and a recovery channel set the same posture). */
+/** Why a store refuses writes, asked of the cluster: in recovery it is a standby; out of it, a primary fenced read-only (a promote, a restore and a recovery-channel swap set the same posture). */
 export type ReadOnlyCause = 'standby' | 'fenced';
 
 function readOnlyWording(cause: ReadOnlyCause): string {
@@ -144,7 +144,7 @@ export class PostgresControlStore implements ControlStore {
         }
       } catch (error) {
         // A primary fenced read-only (a promote that moved the fleet off it, a
-        // restore whose write fence was not lifted, an armed recovery channel)
+        // restore, a swap quiesced through a recovery channel)
         // refuses the DDL with 25006 like a standby does, IF NOT EXISTS or not.
         // Its schema is already there,
         // so provisioning is asserted from it and the reads go through: the

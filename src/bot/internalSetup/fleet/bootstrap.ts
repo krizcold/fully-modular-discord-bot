@@ -878,7 +878,7 @@ async function ownStoreInRecovery(selfNodeId: string): Promise<FollowerHoldBase 
 
 /**
  * Read-only control store (B7-F6): a standby, or a primary fenced read-only (a
- * promote that moved the fleet off it, a restore, a recovery channel). No term
+ * promote that moved the fleet off it, a restore, a recovery-channel swap). No term
  * can be minted here, and a retry that
  * outlived the posture would mint on a forked copy at the live master's own
  * term, so the boot parks with the exits named. Terminal, like the stale-master
@@ -888,8 +888,8 @@ function parkOnReadOnlyStore(error: ControlStoreReadOnlyError): Promise<never> {
   const exits = error.cause === 'standby'
     ? 'point CONTROL_STORE_URL or DATA_BACKEND_URL at the primary, or promote this copy, then restart'
     : error.provisioned
-      ? 'a promote that moved the fleet off this database sets this, and so do a restore whose write fence was not lifted and an armed recovery channel; if a restore holds it, wait for it to finish, and run the restore again if it reports the fence could not be lifted (a container restart clears only a fence the manager reports as stripped); if a recovery channel holds it, disarm the channel; then start this node again; otherwise Demote this node to rejoin as a co-worker, or re-seed its database from the machine that serves the fleet'
-      : 'check DATA_BACKEND_URL and CONTROL_STORE_URL and the database they name';
+      ? 'a promote that moved the fleet off this database leaves it fenced, and so does a manager lane still working on it (a restore, or a swap quiesced through a recovery channel); a lane lifts its own fence when it finishes, so let it finish or run it again from the manager rather than lifting the fence by hand, then start this node again (if it still parks, restart the database container so it re-reads its saved posture); once the fleet has moved off this database for good, Demote this node to rejoin as a co-worker, or re-seed its database from the machine that serves the fleet'
+      : 'check DATA_BACKEND_URL and CONTROL_STORE_URL and the database they name; an empty database fenced read-only is what a restore that failed leaves behind, and running the restore again is its exit';
   const reason = `READ-ONLY CONTROL STORE: ${error.message}; parking the boot instead of minting a term on it. ${exits}`;
   console.error(`[Fleet] ${reason}`);
   _setReadOnlyStorePark({ cause: error.cause, provisioned: error.provisioned, reason, at: Date.now() });
