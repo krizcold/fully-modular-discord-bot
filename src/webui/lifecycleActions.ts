@@ -187,9 +187,10 @@ export async function runDemote(
  * delivers the database that environment names rather than the one it last
  * followed. The local form is derived from the pinned URL at backend boot, so
  * it goes with the URL; a public or control-store form the environment does
- * not pin stays, being this node's only copy of it. Refused where the
- * environment pins no database URL: the persisted forms are then this node's
- * only store configuration. restart false leaves the child alone for a caller
+ * not pin stays, being this node's only copy of it. Where the environment
+ * pins no database URL every form stays, being this node's only store
+ * configuration; the override is cleared all the same and the next delivery
+ * replaces the forms. restart false leaves the child alone for a caller
  * about to stop it.
  */
 export async function runRoleReset(botManager: BotManager, restart: boolean): Promise<{ success: boolean; formsCleared?: boolean; error?: string }> {
