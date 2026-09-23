@@ -142,10 +142,9 @@ export async function startWebUI(botManager: BotManager): Promise<void> {
     // Close WebSocket connections
     wsManager.close();
 
-    // Shutdown bot if running
-    if (botManager.isRunning()) {
-      await botManager.shutdown(false);
-    }
+    // Shutdown bot; when the child is already gone this calls off a pending
+    // automatic start.
+    await botManager.shutdown(false);
 
     stopSessionStore();
 

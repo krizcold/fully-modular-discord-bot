@@ -50,6 +50,7 @@ export class BotManager {
   private crashRestarts = 0;
   private startingAfterCrash = false;
   private stopRequested = false;
+  private crashRestartTimer: NodeJS.Timeout | null = null;
   private wsManager: WebSocketManager | null = null;
   private operationInProgress: boolean = false; // Prevents race conditions
   private safeMode: boolean = false;
@@ -266,7 +267,12 @@ export class BotManager {
           } else {
             this.crashRestarts += 1;
             console.warn(`[BotManager] Starting the bot again in ${CRASH_RESTART_DELAY_MS / 1000}s (automatic start ${this.crashRestarts} of ${CRASH_RESTARTS_MAX})`);
-            setTimeout(() => {
+            this.crashRestartTimer = setTimeout(() => {
+              this.crashRestartTimer = null;
+              if (this.stopRequested || this.isInSafeMode()) {
+                console.log(`[BotManager] The automatic start was called off: ${this.stopRequested ? 'a stop was requested' : 'safe mode is on'}`);
+                return;
+              }
               this.startingAfterCrash = true;
               void this.start().then(result => {
                 if (!result.success && result.reason !== 'already_running') {
@@ -422,6 +428,7 @@ export class BotManager {
       return;
     }
 
+    this.cancelCrashRestart();
     if (!this.botProcess) {
       console.log('[BotManager] Bot is not running');
       return;
@@ -436,9 +443,6 @@ export class BotManager {
       const signal = emergency ? 'SIGKILL' : 'SIGTERM';
       console.log(`[BotManager] Shutting down bot with ${signal}...`);
 
-      // A requested stop is never a crash, whatever exit code the platform
-      // reports for the kill.
-      this.stopRequested = true;
       this.botProcess.kill(signal);
       this.addLog(`[BotManager] Bot shutdown initiated (${signal})`);
       this.emitEvent('bot:shutdown', { signal, emergency });
@@ -483,6 +487,19 @@ export class BotManager {
       processId: this.botProcess?.pid,
       crashed: this.crashed
     };
+  }
+
+  /**
+   * A requested stop is never a crash, whatever exit code the platform
+   * reports for the kill, and it calls off an automatic start still waiting
+   * on its timer.
+   */
+  cancelCrashRestart(): void {
+    this.stopRequested = true;
+    if (!this.crashRestartTimer) return;
+    clearTimeout(this.crashRestartTimer);
+    this.crashRestartTimer = null;
+    console.log('[BotManager] The automatic start after the crash was called off by a requested stop');
   }
 
   /**

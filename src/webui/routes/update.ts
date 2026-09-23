@@ -436,10 +436,11 @@ export function createUpdateRouter(botManager: BotManager): Router {
         return;
       }
 
-      if (botManager.isRunning()) {
-        await botManager.shutdown(false);
-        await new Promise(resolve => setTimeout(resolve, 2000));
-      }
+      // Unconditional: a crashed child may still be waiting on its automatic
+      // start, which the shutdown calls off.
+      const wasRunning = botManager.isRunning();
+      await botManager.shutdown(false);
+      if (wasRunning) await new Promise(resolve => setTimeout(resolve, 2000));
 
       if (fs.existsSync(backupCustom)) {
         await execAsync('rm -rf /app/custom/*');
