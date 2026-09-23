@@ -308,6 +308,9 @@ export class BotManager {
 
       // Handle IPC messages from bot (for real-time panel updates)
       this.botProcess.on('message', (message: any) => {
+        // A draining previous child still reports; only the current one may
+        // move the manager's state.
+        if (this.botProcess !== child) return;
         if (message.type === 'panel:live_update') {
           this.emitPanelUpdate(message.data);
         } else if (message.type === 'metrics:snapshot') {
