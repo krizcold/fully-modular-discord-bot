@@ -13,6 +13,7 @@ export class IngestService {
   private generation = 0;
   private stopping: Promise<void> | null = null;
   private starting: Promise<string> | null = null;
+  private unwinding: Promise<unknown> | null = null;
   private shardPlan: { shards: number[]; shardCount: number } | null = null;
 
   buildClient(options: ClientOptions): Client {
@@ -53,9 +54,11 @@ export class IngestService {
   /** Only LeaseRuntime may call this; the lease gate and identify pacing live there. */
   async start(token: string | undefined): Promise<string> {
     if (!this.client) throw new Error('[Ingest] start() before buildClient()');
-    // One login at a time: a second grant while the first is parked below
-    // joins it instead of identifying the same shards twice.
-    if (this.starting) return this.starting;
+    // One login at a time: a second grant while a live start is parked below
+    // joins it instead of identifying the same shards twice. A start whose
+    // login a stop cancelled is superseded, never joined: its promise may
+    // never settle (see destroySessions).
+    if (this.starting && this.started) return this.starting;
     this.started = true;
     const generation = ++this.generation;
     const run = (async (): Promise<string> => {
@@ -63,6 +66,11 @@ export class IngestService {
       // manager when it finishes; a login begun under it would resume into
       // that reset. A stop that lands while parked here cancels this login.
       while (this.stopping) await this.stopping;
+      const unwinding = this.unwinding;
+      if (unwinding) {
+        await unwinding.catch(() => undefined);
+        if (this.unwinding === unwinding) this.unwinding = null;
+      }
       if (!this.started || generation !== this.generation) {
         console.warn('[Ingest] Login abandoned by a stop before it connected');
         return '';
@@ -72,10 +80,16 @@ export class IngestService {
       } catch (error) {
         // A stop() while this connect was in flight nulled the ws manager
         // the connect resumed into (WebSocketManager.connect reads this._ws
-        // after its await): that rejection is this node's own destroy, not
-        // a login failure. A failure on a login nobody stopped still
-        // surfaces unhandled, exactly like today's boot.
+        // after its awaits): that rejection is this node's own destroy, not
+        // a login failure. Client.login destroys the client again on the way
+        // out, so the reset is repeated here. A failure on a login nobody
+        // stopped still surfaces unhandled, exactly like today's boot.
         if (!this.started || generation !== this.generation) {
+          if ((this.client!.ws as any)._ws) {
+            console.error('[Ingest] A stopped login failed after a newer login had begun; discord.js destroyed the shared client under it');
+            throw error;
+          }
+          this.resetGateway();
           console.warn(`[Ingest] Login abandoned by a stop mid-connect: ${error instanceof Error ? error.message : String(error)}`);
           return '';
         }
@@ -111,17 +125,29 @@ export class IngestService {
 
   private async destroySessions(reason: string): Promise<void> {
     console.log(`[Ingest] Destroying gateway sessions (${reason})`);
+    // A login still fetching the gateway information (no shard wrappers yet)
+    // reads the ws manager when the fetch returns and would connect through
+    // the manager the next login creates: that login waits for it to fail on
+    // the reset below. A login caught mid-identify never settles (the shard's
+    // connect awaits a ready that its destroy never emits), so it is not
+    // waited on; it stays parked on the old manager.
+    const ws = this.client!.ws as any;
+    if (this.starting && ws._ws && ws.shards.size === 0) this.unwinding = this.starting;
     try {
       await this.client!.destroy();
     } catch (error) {
       console.error('[Ingest] Error destroying client:', error);
     }
-    // client.destroy() latches ws.destroyed and keeps the internal
-    // @discordjs/ws manager that was built with the old shard set; a shard
-    // set frozen at first login would defeat lease moves, and a latched
-    // destroyed flag would no-op the NEXT destroy (breaking revoke fencing).
-    // Reset both so a future grant re-logins this same Client instance with
-    // fresh shard options.
+    this.resetGateway();
+  }
+
+  // client.destroy() latches ws.destroyed and keeps the internal
+  // @discordjs/ws manager that was built with the old shard set; a shard
+  // set frozen at first login would defeat lease moves, and a latched
+  // destroyed flag would no-op the NEXT destroy (breaking revoke fencing).
+  // Reset both so a future grant re-logins this same Client instance with
+  // fresh shard options.
+  private resetGateway(): void {
     const ws = this.client!.ws as any;
     ws.destroyed = false;
     ws._ws = null;
