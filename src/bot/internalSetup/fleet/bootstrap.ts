@@ -1904,11 +1904,20 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     setUnassigned([...groups].map(([reason, shardIds]) => ({ shardIds, reason })));
   }
 
-  async function distribute(): Promise<void> {
+  // Both reports, dropped while a fence, the reshard pause or the grace and
+  // hold-down defer distribution (each carries its own banner).
+  function reportPlacement(): void {
     if (controlFenced || paused || !graceOver) {
       unassigned = null;
       unassignedKey = '';
+      return;
     }
+    reportUnassigned();
+    reportOverCapacity();
+  }
+
+  async function distribute(): Promise<void> {
+    if (controlFenced || paused || !graceOver) reportPlacement();
     if (controlFenced) return;
     if (paused) return;
     if (!graceOver) {
@@ -1929,8 +1938,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
         distributeQueued = false;
         await distributeOnce();
       } while (distributeQueued);
-      reportUnassigned();
-      reportOverCapacity();
+      reportPlacement();
     } catch (error) {
       console.error('[Fleet] Distribute failed:', error);
     } finally {
@@ -2191,8 +2199,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     await persist();
     // A manual grant changes the table outside distribute(), whose reports
     // are the only refresh standalone has (no periodic tick there).
-    reportUnassigned();
-    reportOverCapacity();
+    reportPlacement();
     if (result.ok || result.pending) return { success: true };
     return { success: false, error: `grant to ${target.nodeName} was refused` };
   };
