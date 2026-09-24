@@ -1805,9 +1805,6 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       const placed = [...pinnedPlaced, ...trimmable];
       if (placed.length === 0) continue;
       const fullSet = [...new Set([...reGrant, ...placed])].sort((a, b) => a - b);
-      if (node.isSelf && alone && !standalone && fullSet.length > declaredCapacityOf(node)) {
-        console.error(`[Fleet] Lone master: no other node can hold shards; taking [${placed.join(', ')}] past declared capacity ${declaredCapacityOf(node)} (holding ${fullSet.length} of ${registry.shardCount}). Start another instance and move shards to it${reshardHint()}`);
-      }
       await grantShardsTo(node, fullSet, epoch);
     }
 
@@ -1820,11 +1817,30 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     }
   }
 
+  // Over capacity is never silent (B7-F15): after every distribution run the
+  // master reads its own holding against its declared capacity (one rule,
+  // overCapacityOf, shared with the fleet state) and prints an error line once
+  // per change of the holding or of alone, so a restarted master that still
+  // carries the whole fleet says so again.
+  let overCapacityKey = '';
+  function reportOverCapacity(): void {
+    const view = standalone ? null : overCapacityOf(registry, nodeId, pinnedShardId);
+    const key = view ? `${view.shardIds.join(',')}:${view.alone}` : '';
+    if (key === overCapacityKey) return;
+    if (view) {
+      const exit = view.alone ? 'Start another instance and move shards to it' : 'Move shards to another node';
+      console.error(`[Fleet] OVER CAPACITY: this master holds [${view.shardIds.join(', ')}] (${view.shardIds.length} of ${registry.shardCount}) against declared capacity ${view.capacity}${view.alone ? ' as the only node able to hold shards' : ''}. ${exit}${reshardHint()}`);
+    } else {
+      console.log('[Fleet] The master is back within its declared capacity');
+    }
+    overCapacityKey = key;
+  }
+
   // Unassigned shards are never silent (B7-F15): after every distribution
   // run the master names the free shards it could not place and why, once
   // per change, and the Fleet tab shows the same report. A fence, a reshard
-  // pause or the recovery hold-down carries its own banner, so the report is
-  // dropped there and starts afresh when distribution resumes.
+  // pause, the register grace or the recovery hold-down defers distribution,
+  // so the report is dropped there and starts afresh when it resumes.
   let unassigned: UnassignedView[] | null = null;
   let unassignedKey = '';
   function setUnassigned(next: UnassignedView[] | null): void {
@@ -1890,6 +1906,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
         await distributeOnce();
       } while (distributeQueued);
       reportUnassigned();
+      reportOverCapacity();
     } catch (error) {
       console.error('[Fleet] Distribute failed:', error);
     } finally {
