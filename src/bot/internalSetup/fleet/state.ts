@@ -132,6 +132,8 @@ export interface FleetState {
   superseded: SupersededView | null;
   /** The stand-in lane (20.5, B6-f): live while this node holds the fleet for a dead master; its last record otherwise. */
   standIn: StandInView | null;
+  /** Why this backup's last arm tick did not stand in (B7-F19); null before the first tick, while standing in, and on nodes that never evaluate. */
+  standInVerdict: StandInVerdictView | null;
   /** The last stand-in episode this node took part in, on either side (B6-j): who stood in for whom, how it ended, what became of the outage writes. */
   episode: EpisodeRecord | null;
   /** Operator role override in force (promotion/demotion); null when the role comes from env. */
@@ -434,6 +436,14 @@ export function _setSlotStatus(record: SlotStatusRecord | null): void {
   standbySlot = record;
 }
 
+export interface StandInVerdictView {
+  at: number;
+  /** Every term or gate that held against the arm on that tick. */
+  reasons: string[];
+  /** What that tick did not read (the two database terms, while the free evidence disagreed); null otherwise. */
+  note: string | null;
+}
+
 export interface StandInView {
   /** This boot IS the stand-in the record describes. False on a backup showing why its last attempt ended. */
   live: boolean;
@@ -514,6 +524,8 @@ export interface FleetStateSources {
   witness: (() => WitnessStatus) | null;
   /** Live migration/transformation work on THIS node (co-worker executors); null on masters (coordinator view covers it). */
   migrationActive: (() => boolean) | null;
+  /** The arm lane's last refusal (B7-F19); wired on designated backups only. */
+  standInVerdict?: (() => StandInVerdictView | null) | null;
 }
 
 let sources: FleetStateSources | null = null;
@@ -566,6 +578,7 @@ export function getFleetState(): FleetState {
       superseded,
       roleOverride: buildRoleOverrideView(),
       standIn: buildStandInView(),
+      standInVerdict: null,
       episode: null,
       backupMaster: isBackupMaster(),
       activeCapable: consentsToActiveMode(),
@@ -691,6 +704,7 @@ export function getFleetState(): FleetState {
       superseded,
       roleOverride: buildRoleOverrideView(),
       standIn: buildStandInView(),
+      standInVerdict: sources.standInVerdict?.() ?? null,
       episode: readEpisodeRecord(),
       backupMaster: isBackupMaster(),
       activeCapable: consentsToActiveMode(),
@@ -808,6 +822,7 @@ export function getFleetState(): FleetState {
     superseded,
     roleOverride: buildRoleOverrideView(),
     standIn: buildStandInView(),
+    standInVerdict: sources.standInVerdict?.() ?? null,
     episode: readEpisodeRecord(),
     backupMaster: isBackupMaster(),
     activeCapable: consentsToActiveMode(),

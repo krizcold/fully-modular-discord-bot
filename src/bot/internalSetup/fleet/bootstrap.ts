@@ -72,7 +72,7 @@ import {
 } from './placement';
 import { evaluateRecovery } from './recovery';
 import { _setControlStoreFenced, _setEmptyStoreHold, _setFleetStateSources, _setFollowerFollowingSupplier, _setFollowerHold, _setFollowerLineage, _setOwnCopyLineage, _setReadOnlyStorePark, _setSlotStatus, _setStaleMasterPark, _setSuperseded, _setTakeoverHold, FleetRecoverySource, FleetRefusedRegistration, FollowerHoldBase, getFleetState } from './state';
-import type { MigrationView, PinViolationView, UnassignedView } from './state';
+import type { MigrationView, PinViolationView, StandInVerdictView, UnassignedView } from './state';
 import { serveSyncRequest, SyncAuthority } from './syncAuthority';
 import { SyncEngine } from './syncEngine';
 import { getFrozenStats, getGuildDataBackend, setOwnerInfoProvider } from '../utils/dataManager';
@@ -96,7 +96,7 @@ import type { ControlStore, PersistedFleetConfig, PersistedTerm, TransformDirect
 import { effectiveFleetConfigView, effectiveMasterUrls, emptyStoreHoldEvidence, fleetConfigViewOf, fleetMasterCandidates, forcePassive, readFleetConfigCache, rememberBackups, validateMasterCandidates, renumberDesignations, validateBackupDesignations, validateWitnessChannelId, writeFleetConfigCache } from './fleetConfig';
 import { getLocalReplicaIdentity, getReplicaHealth, getSlotSample, setReplicaProbeListener } from './replicaHealth';
 import { canonicalIsOwnReplica, canonicalStoreReachable, currentCanonicalUrl, hasDbReplica, probeReplica, readTermRow, resolveReplicaEndpoints, spliceFleetCredentials } from './replicaPromotion';
-import { ArmEvidenceInputs, armDeferral, evaluateArmEvidence, ledgerAllowsArm, preArmRefusal, reachabilityWarning } from './armLane';
+import { ArmEvidenceInputs, armDeferral, evaluateArmEvidence, ledgerAllowsArm, missingArmTerms, preArmRefusal, reachabilityWarning } from './armLane';
 import { judgeReachability } from './reachability';
 import { StandInWriteContext, evaluateStandInWrites } from './armWrites';
 import { readReshardPending, readStandbyTermRow } from './armProbe';
@@ -3848,6 +3848,20 @@ async function initCoWorker(init: CommonInit, followerHold: FollowerHoldBase | n
   // When this node's own evidence first held, so a lower-ranked backup can defer
   // to a higher-ranked one by WAITING rather than by asking it anything.
   let evidenceHeldSince = 0;
+  // The last refusal, keyed on its text so it is logged once per change (B7-F19):
+  // a healthy fleet holds on the first free term every tick, and an outage
+  // moves through several sets before it arms or settles.
+  let armReport = '';
+  let armVerdict: StandInVerdictView | null = null;
+  const UNREAD_DB_TERMS = 'the database terms are read only once the free evidence agrees';
+  const reportNoArm = (reasons: string[], note: string | null, outage: boolean): void => {
+    evidenceHeldSince = 0;
+    armVerdict = { at: Date.now(), reasons, note };
+    const text = `Stand-in not arming: ${reasons.join('; ')}${note ? ` (${note})` : ''}`;
+    if (text === armReport) return;
+    armReport = text;
+    if (outage) console.warn(`[Fleet] ${text}`); else console.log(`[Fleet] ${text}`);
+  };
   const evaluateStandInArm = async (renewOk: boolean, status: WitnessStatus): Promise<void> => {
     if (armInFlight) return;
     armInFlight = true;
@@ -3869,8 +3883,10 @@ async function initCoWorker(init: CommonInit, followerHold: FollowerHoldBase | n
       // safe because this call can only REFUSE: every real decision below runs
       // against the measured values.
       const cheapVerdict = evaluateArmEvidence({ ...cheap, storeUnreachable: true, receiverStopped: true });
+      // A term whose fact is ABSENT is reported as unknown, never as the opposite fact.
+      const beaconAbsent = readFresh ? {} : { masterBeaconDark: 'the witness could not be read inside the fresh window, so whether a master beacon is fresh is unknown' };
       if (!cheapVerdict.arm) {
-        evidenceHeldSince = 0;
+        reportNoArm(missingArmTerms({ ...cheap, storeUnreachable: true, receiverStopped: true }, beaconAbsent), UNREAD_DB_TERMS, cheap.masterUnreachable);
         return;
       }
 
@@ -3882,7 +3898,9 @@ async function initCoWorker(init: CommonInit, followerHold: FollowerHoldBase | n
       // unreachable; the node's own consent is the other key, as ever.
       const activeMode = consentsToActiveMode() && backupModeEnabled(designation?.mode, readModeOverride(), cheap.masterUnreachable);
       if (!activeMode || resolveDataBackend() !== 'postgres') {
-        evidenceHeldSince = 0;
+        reportNoArm([resolveDataBackend() !== 'postgres' ? 'this node is not on the postgres backend, so it has no copy to serve from'
+          : !consentsToActiveMode() ? 'this node does not consent to active mode (FLEET_BACKUP_MODE is not active)'
+          : 'the master has not enabled active mode for this node and no local lever is set'], null, true);
         return;
       }
 
@@ -3900,7 +3918,10 @@ async function initCoWorker(init: CommonInit, followerHold: FollowerHoldBase | n
       };
       const verdict = evaluateArmEvidence(evidence);
       if (!verdict.arm) {
-        evidenceHeldSince = 0;
+        reportNoArm(missingArmTerms(evidence, {
+          ...beaconAbsent,
+          ...(probe?.ok === true ? {} : { receiverStopped: localUrl === '' ? 'this node has no usable standby endpoint, so its receiver could not be read' : 'this node\'s standby could not be probed, so whether it still streams from the master is unknown' }),
+        }), null, true);
         return;
       }
 
@@ -3940,6 +3961,8 @@ async function initCoWorker(init: CommonInit, followerHold: FollowerHoldBase | n
       });
       if (refusal) {
         evidenceHeldSince = 0;
+        armVerdict = { at: now, reasons: [refusal], note: null };
+        armReport = '';
         console.warn(`[Fleet] Stand-in NOT armed: ${refusal}`);
         return;
       }
@@ -3963,13 +3986,18 @@ async function initCoWorker(init: CommonInit, followerHold: FollowerHoldBase | n
       const rank = designation?.priority ?? leverRank(readFleetConfigCache()?.backupDesignations ?? [], nodeId);
       const deferral = armDeferral(rank, evidenceHeldSince, now);
       if (deferral.defer) {
-        console.warn(`[Fleet] Stand-in deferring: ${designation ? `rank ${rank}` : 'unranked (sorting last)'} waits ${Math.round(deferral.waitMs / 1000)}s for any higher-ranked backup to stand in first`);
+        const wait = `${designation ? `rank ${rank}` : 'unranked (sorting last)'} waits ${Math.round(deferral.waitMs / 1000)}s for any higher-ranked backup to stand in first`;
+        armVerdict = { at: now, reasons: [`deferring: ${wait}`], note: null };
+        armReport = '';
+        console.warn(`[Fleet] Stand-in deferring: ${wait}`);
         return;
       }
 
       const existing = readArmRecord();
       const allowed = ledgerAllowsArm(existing, now);
       if (!allowed.arm) {
+        armVerdict = { at: now, reasons: [allowed.reason], note: null };
+        armReport = '';
         console.error(`[Fleet] Stand-in NOT armed: ${allowed.reason}`);
         return;
       }
@@ -3994,6 +4022,8 @@ async function initCoWorker(init: CommonInit, followerHold: FollowerHoldBase | n
       // restart's cost; the other order would leave no override and a record
       // whose lastAttemptAt locks this node out for the whole spacing window
       // over an arm that never happened.
+      armVerdict = null;
+      armReport = '';
       writeRoleOverride({ role: 'master', standIn: true, setAt: now, setBy: 'stand-in' });
       writeArmRecord({
         phase: 'claimed',
@@ -4022,7 +4052,10 @@ async function initCoWorker(init: CommonInit, followerHold: FollowerHoldBase | n
       await reachabilityLogged;
       requestStepDownRestart();
     } catch (error) {
-      console.warn('[Fleet] Stand-in evaluation failed:', error instanceof Error ? error.message : error);
+      const message = error instanceof Error ? error.message : String(error);
+      armVerdict = { at: Date.now(), reasons: [`the evaluation failed: ${message}`], note: null };
+      armReport = '';
+      console.warn('[Fleet] Stand-in evaluation failed:', message);
     } finally {
       armInFlight = false;
     }
@@ -4098,6 +4131,7 @@ async function initCoWorker(init: CommonInit, followerHold: FollowerHoldBase | n
     fleetConfig: () => effectiveFleetConfigView(),
     witness: witness ? () => witness!.getStatus() : null,
     migrationActive: () => migrationWorkActive(),
+    standInVerdict: isBackupMaster() ? () => armVerdict : null,
   });
 
   // Owner-info source for .owner manifests: null until the first lease grant.

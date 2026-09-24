@@ -56,6 +56,16 @@ export function evaluateArmEvidence(inputs: ArmEvidenceInputs): ArmVerdict {
   return { arm: true };
 }
 
+/**
+ * Every term that held against the arm, in the same order: the whole reason this
+ * backup is not standing in, for the log and its Fleet tab (B7-F19). A term whose
+ * fact could not be gathered is named by the caller's `absent` text instead of
+ * the term's own, which would assert the opposite fact.
+ */
+export function missingArmTerms(inputs: ArmEvidenceInputs, absent: Partial<Record<keyof ArmEvidenceInputs, string>> = {}): string[] {
+  return TERMS.filter(term => inputs[term.key] !== true).map(term => absent[term.key] ?? term.missing);
+}
+
 export interface PreArmInputs {
   /** The stored designation says this node may stand in, and its own env consented (B6-a). */
   activeMode: boolean;
