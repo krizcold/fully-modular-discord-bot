@@ -3474,7 +3474,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     migration: coordinator ? () => coordinator!.getView() : null,
     transformation: () => transformer?.getView() ?? null,
     pinViolation: standalone ? null : () => pinViolation,
-    unassigned: standalone ? null : () => unassigned,
+    unassigned: () => unassigned,
     termStamp: store instanceof PostgresControlStore && !standalone ? () => store.getStampFailingForMs() : null,
     fleetConfig: () => (fleetConfig ? fleetConfigViewOf(fleetConfig) : null),
     witness: witness ? () => witness!.getStatus() : null,

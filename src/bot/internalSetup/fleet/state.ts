@@ -251,7 +251,7 @@ export interface FleetState {
   pinViolation: PinViolationView | null;
   /** Fleet master holding more shards than its declared capacity, the pinned shard not counted (B7-F15); alone says no other node could take shards. */
   overCapacity: OverCapacityView | null;
-  /** Fleet master: shards no instance serves, with why, after the last distribution run; null when every shard is placed or a hold, pause or fence explains the wait. */
+  /** Master (fleet or standalone): shards no instance serves, with why, after the last distribution run; null when every shard is placed or a hold, pause or fence explains the wait. */
   unassigned: UnassignedView[] | null;
   /** Names for guilds in guildMap the connected clients cannot name (master's REST list); merged UI-side. */
   guildNames?: Record<string, string>;
@@ -504,7 +504,7 @@ export interface FleetStateSources {
   transformation: (() => TransformationView | null) | null;
   /** Pin-violation supplier (fleet master only); null otherwise. */
   pinViolation: (() => PinViolationView | null) | null;
-  /** Unassigned-shard report supplier (fleet master only); null otherwise. */
+  /** Unassigned-shard report supplier (any master, standalone included); null on co-workers. */
   unassigned: (() => UnassignedView[] | null) | null;
   /** Term-stamp health supplier (fleet master on the postgres store only); null otherwise. */
   termStamp: (() => number | null) | null;
