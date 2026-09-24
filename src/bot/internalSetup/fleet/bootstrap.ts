@@ -1861,11 +1861,16 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       return;
     }
     const alone = !otherNodeCanHoldShards(registry);
-    const withRoom = [...registry.nodes.values()].filter(n => n.connected && !n.draining
-      && targetFor(n, alone) - registry.shardIdsOf(n.nodeId).length - pendingShardIdsOf(n.nodeId).length > 0);
+    const roomOf = (n: RegistryNode): number =>
+      targetFor(n, alone) - registry.shardIdsOf(n.nodeId).length - pendingShardIdsOf(n.nodeId).length;
+    const withRoom = [...registry.nodes.values()].filter(n => n.connected && !n.draining && roomOf(n) > 0);
+    // Priced like the grant distributeOnce composes: the node's re-grant set
+    // plus what it would take, of which a changed shape identifies everything.
+    const priceOf = (n: RegistryNode): number =>
+      shardsForcingIdentify(n, [...new Set([...reGrantSetOf(n.nodeId), ...free.slice(0, roomOf(n))])].sort((a, b) => a - b)).length;
     const openReason = withRoom.length === 0
       ? 'no connected node has free capacity; start another instance or reshard'
-      : ledger !== null && withRoom.every(n => !ledger.permit(n.nodeId, 1).ok)
+      : ledger !== null && withRoom.every(n => !ledger.permit(n.nodeId, priceOf(n)).ok)
         ? 'deferred by the identify ledger; its warning names the retry'
         : 'placement pending';
     const groups = new Map<string, number[]>();
