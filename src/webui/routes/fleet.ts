@@ -313,7 +313,7 @@ export function createFleetRoutes(botManager: BotManager): Router {
   });
 
   /**
-   * POST /api/fleet/promote { confirmLag?, retireOldMaster? }
+   * POST /api/fleet/promote { confirmLag?, confirmLineage?, confirmReachability?, retireOldMaster? }
    * Unified promote (PLAN_REPLICATION 20.4, B4): THIS instance (the designated
    * backup) becomes the master side, bot and database together. The engine
    * takes the verdict here (every refusal is a clear message, never a 500;
@@ -327,6 +327,7 @@ export function createFleetRoutes(botManager: BotManager): Router {
       const result = await startPromote(botManager, {
         confirmLag: req.body?.confirmLag === true,
         confirmLineage: req.body?.confirmLineage === true,
+        confirmReachability: req.body?.confirmReachability === true,
         retireOldMaster: req.body?.retireOldMaster === true,
       });
       if (!result.success) console.warn(`[Fleet] Promotion refused: ${result.error}`);

@@ -148,6 +148,20 @@ export function reachabilityWarning(publicUrl: string, masterCandidates: string[
   return null;
 }
 
+/**
+ * The promote's form of the same judgement (B7-F18, ruled: warn and confirm,
+ * never refuse). 20.9 allows a master no other machine can dial, and a refusal
+ * would block the only way back online when that copy is the last good one.
+ */
+export function promoteReachabilityWarning(publicUrl: string, masterCandidates: string[]): string | null {
+  const listed = selfListed(publicUrl, masterCandidates);
+  if (listed === true) return null;
+  const why = listed === null
+    ? 'This node advertises no FLEET_PUBLIC_URL, so whether the other instances can reach it cannot be determined here'
+    : 'This node is not in the fleet\'s master candidate list, so no other instance can connect to it';
+  return `${why}. As master it serves alone: the old master and every co-worker lose their master, cannot register with this node, and their shards go dark until they are stopped and declared lost here; a master that returns later finds this node through the witness and parks. Promote anyway only if this machine is meant to serve on its own.`;
+}
+
 /** Whether the list the other nodes dial names this node; null when it advertises no URL. Compared as dialing compares. */
 function selfListed(publicUrl: string, masterCandidates: string[]): boolean | null {
   const mine = normalizeUrl(publicUrl.trim());

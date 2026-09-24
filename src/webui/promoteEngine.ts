@@ -28,6 +28,8 @@ import {
 } from '../bot/internalSetup/fleet/constants';
 import { isContainerPinned, loadCredentials } from '../utils/envLoader';
 import { clearRoleOverride, getNodeId, getNodeName, invalidateRoleOverrideCache, readRoleOverride, writeRoleOverride } from '../bot/internalSetup/fleet/nodeIdentity';
+import { promoteReachabilityWarning } from '../bot/internalSetup/fleet/armLane';
+import { fleetMasterCandidates } from '../bot/internalSetup/fleet/fleetConfig';
 import { PromoteRecord, clearPromoteRecord, readPromoteRecord, writePromoteRecord } from '../bot/internalSetup/fleet/promoteRecord';
 import { HolderSighting, readHolderSighting } from '../bot/internalSetup/fleet/holderSighting';
 import {
@@ -54,6 +56,8 @@ export interface PromoteStartOptions {
   confirmLag?: boolean;
   /** The operator has seen that another designated backup received further than this copy (20.19 F14). */
   confirmLineage?: boolean;
+  /** The operator has seen that no other instance can connect to this node as master (B7-F18). */
+  confirmReachability?: boolean;
   retireOldMaster?: boolean;
   /** Provenance for the role override this promote ends up writing. */
   startedBy?: 'webui-promote' | 'manager-promote';
@@ -64,6 +68,7 @@ export interface PromoteStartResult {
   error?: string;
   needsLagConfirm?: boolean;
   needsLineageConfirm?: boolean;
+  needsReachabilityConfirm?: boolean;
   /** Bytes of WAL the furthest other backup holds beyond this copy; 0 when level and outranked, null when this copy has no position at all. */
   aheadBy?: number | null;
   lagMs?: number | null;
@@ -458,6 +463,14 @@ export async function startPromote(botManager: BotManager, opts: PromoteStartOpt
     }
     mode = 'failover';
     firstPhase = 'promote';
+  }
+
+  // Asked last, once nothing refuses. The configured master reclaiming its
+  // own role is exempt: it is what the operator set up to be dialed, and its
+  // failback runs unattended.
+  if (!returningMaster && opts.confirmReachability !== true) {
+    const warning = promoteReachabilityWarning(process.env.FLEET_PUBLIC_URL || '', fleetMasterCandidates());
+    if (warning) return { success: false, needsReachabilityConfirm: true, error: warning };
   }
 
   // The death path never reaches the old master's database, so the node it
