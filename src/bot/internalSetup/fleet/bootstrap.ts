@@ -1864,22 +1864,25 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     const roomOf = (n: RegistryNode): number =>
       targetFor(n, alone) - registry.shardIdsOf(n.nodeId).length - pendingShardIdsOf(n.nodeId).length;
     const withRoom = [...registry.nodes.values()].filter(n => n.connected && !n.draining && roomOf(n) > 0);
-    // Priced like the grant distributeOnce composes: the node's re-grant set
-    // plus what it would take, of which a changed shape identifies everything
-    // while a same-shape grant identifies nothing and skips the ledger gate,
-    // leaving only the crash backoff (the candidate filter) to block it.
-    const priceOf = (n: RegistryNode): number =>
-      shardsForcingIdentify(n, [...new Set([...reGrantSetOf(n.nodeId), ...free.slice(0, roomOf(n))])].sort((a, b) => a - b)).length;
-    const ledgerBlocks = (n: RegistryNode): boolean => {
+    // Priced like the grant distributeOnce composes: a changed shape
+    // identifies the whole set, a same-shape grant identifies nothing and
+    // skips the ledger gate. A free placement also needs the node out of the
+    // crash backoff (the candidate filter); the pinned shard is the master's
+    // outside every capacity rule, so only the gate on its composed grant
+    // can hold that one back.
+    const LEDGER = 'deferred by the identify ledger; its warning names the retry';
+    const ledgerRefuses = (n: RegistryNode, wouldHold: number[]): boolean => {
       if (!ledger) return false;
-      const price = priceOf(n);
-      return price === 0 ? ledger.inBackoff(n.nodeId) : !ledger.permit(n.nodeId, price).ok;
+      const price = shardsForcingIdentify(n, [...new Set(wouldHold)].sort((a, b) => a - b)).length;
+      return price > 0 && !ledger.permit(n.nodeId, price).ok;
     };
+    const ledgerBlocks = (n: RegistryNode): boolean =>
+      ledger !== null && (ledger.inBackoff(n.nodeId) || ledgerRefuses(n, [...reGrantSetOf(n.nodeId), ...free.slice(0, roomOf(n))]));
     const openReason = withRoom.length === 0
       ? 'no connected node has free capacity; start another instance or reshard'
-      : withRoom.every(ledgerBlocks)
-        ? 'deferred by the identify ledger; its warning names the retry'
-        : 'placement pending';
+      : withRoom.every(ledgerBlocks) ? LEDGER : 'placement pending';
+    const self = registry.nodes.get(nodeId);
+    const pinReason = pinnedShardId !== null && self && ledgerRefuses(self, [...reGrantSetOf(nodeId), pinnedShardId]) ? LEDGER : 'placement pending';
     const groups = new Map<string, number[]>();
     for (const shardId of free) {
       const reason = coordinator?.migratingShardIds().has(shardId) || coordinator?.pendingSourceCleanupShardIds().has(shardId)
@@ -1889,7 +1892,9 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
           ? 'awaiting its redistribute grant'
           : timeoutDeclinedShards.has(shardId)
             ? 'declined after a hydration timeout, retried once a data backend is healthy'
-            : openReason;
+            : shardId === pinnedShardId
+              ? pinReason
+              : openReason;
       groups.set(reason, [...(groups.get(reason) ?? []), shardId]);
     }
     setUnassigned([...groups].map(([reason, shardIds]) => ({ shardIds, reason })));
