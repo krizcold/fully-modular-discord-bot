@@ -43,7 +43,9 @@ export async function judgeReachability(
   for (const url of candidates) {
     try {
       const parsed = new URL(url.trim());
-      if (parsed.hostname !== '' && Number(parsed.port) === controlPort) hosts.push(parsed.hostname);
+      // An IPv6 literal keeps its brackets in a URL; the resolver takes it bare.
+      const host = parsed.hostname.replace(/^\[(.*)\]$/, '$1');
+      if (host !== '' && Number(parsed.port) === controlPort) hosts.push(host);
     } catch {
       // not a URL: nothing any node could dial
     }
