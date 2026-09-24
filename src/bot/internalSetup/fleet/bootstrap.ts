@@ -1458,10 +1458,12 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   // standby that serves nothing, PLAN_STANDBY ruling 1); only absent/invalid
   // declarations fall back to 1. A fleet master that is the only node able to
   // hold shards (alone) takes every free shard past its capacity rather than
-  // leave any unserved (B7-F15); the exception ends the moment another node
-  // that can hold shards is up, but shards already taken stay until moved.
+  // leave any unserved (B7-F15); a master declaring 0 cannot hold shards
+  // either, so it stays out of the exception and the unassigned report names
+  // the shards. The exception ends the moment another node that can hold
+  // shards is up, but shards already taken stay until moved.
   const targetFor = (node: RegistryNode, alone = false): number => {
-    if (node.isSelf && (standalone || alone)) return registry.shardCount;
+    if (node.isSelf && (standalone || (alone && declaredCapacityOf(node) > 0))) return registry.shardCount;
     return declaredCapacityOf(node);
   };
   const reshardHint = (): string =>
