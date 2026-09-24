@@ -2189,6 +2189,10 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     const fullSet = [...registry.shardIdsOf(targetNodeId), shardId].sort((a, b) => a - b);
     const result = await grantShardsTo(target, fullSet, registry.epoch);
     await persist();
+    // A manual grant changes the table outside distribute(), whose reports
+    // are the only refresh standalone has (no periodic tick there).
+    reportUnassigned();
+    reportOverCapacity();
     if (result.ok || result.pending) return { success: true };
     return { success: false, error: `grant to ${target.nodeName} was refused` };
   };
