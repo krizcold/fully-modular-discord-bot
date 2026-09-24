@@ -1831,7 +1831,8 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     if (key === overCapacityKey) return;
     if (view) {
       const exit = view.alone ? 'Start another instance and move shards to it' : 'Move shards to another node';
-      console.error(`[Fleet] OVER CAPACITY: this master holds [${view.shardIds.join(', ')}] (${view.shardIds.length} of ${registry.shardCount}) against declared capacity ${view.capacity}${view.alone ? ' as the only node able to hold shards' : ''}. ${exit}${reshardHint()}`);
+      const pin = view.pinned !== null ? `, plus pinned shard ${view.pinned} which stays here` : '';
+      console.error(`[Fleet] OVER CAPACITY: this master holds [${view.shardIds.join(', ')}] (${view.shardIds.length} of ${registry.shardCount}${pin}) against declared capacity ${view.capacity}${view.alone ? ' as the only node able to hold shards' : ''}. ${exit}${reshardHint()}`);
     } else {
       console.log('[Fleet] The master is back within its declared capacity');
     }

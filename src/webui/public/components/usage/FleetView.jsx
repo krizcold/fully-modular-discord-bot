@@ -2023,7 +2023,7 @@ function FleetView({ api, wsClient, guildNames }) {
 
       {fleet.overCapacity && (
         <div className="usage-notice">
-          {`Over capacity: this master holds ${fleet.overCapacity.shardIds.length} shard${fleet.overCapacity.shardIds.length === 1 ? '' : 's'} [${fleet.overCapacity.shardIds.join(', ')}] against its declared capacity of ${fleet.overCapacity.capacity}${fleet.overCapacity.alone ? ' as the only node able to hold shards' : ''}. ${fleet.overCapacity.alone ? 'Start another instance, then move shards to it with Move on their rows' : 'Move shards to another instance with Move on their rows'}${reshardHint(fleet)}.`}
+          {`Over capacity: this master holds ${fleet.overCapacity.shardIds.length} shard${fleet.overCapacity.shardIds.length === 1 ? '' : 's'} [${fleet.overCapacity.shardIds.join(', ')}]${fleet.overCapacity.pinned != null ? ` (plus pinned shard ${fleet.overCapacity.pinned}, which stays here)` : ''} against its declared capacity of ${fleet.overCapacity.capacity}${fleet.overCapacity.alone ? ' as the only node able to hold shards' : ''}. ${fleet.overCapacity.alone ? 'Start another instance, then move shards to it with Move on their rows' : 'Move shards to another instance with Move on their rows'}${reshardHint(fleet)}.`}
         </div>
       )}
 

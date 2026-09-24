@@ -225,23 +225,28 @@ export function otherNodeCanHoldShards(registry: Registry): boolean {
 }
 
 export interface OverCapacityView {
+  /** The shards counted against the capacity, the ones a Move can take elsewhere. */
   shardIds: number[];
   capacity: number;
   alone: boolean;
+  /** The pinned shard the master also holds, counted against nothing and never moved; null otherwise. */
+  pinned: number | null;
 }
 
 /**
  * The master's holding past its declared capacity (B7-F15), null within it.
  * The pinned shard is the master's by the iron rule regardless of capacity,
- * so it is not counted; alone says whether any other node could take shards.
+ * so it is listed apart and not counted; alone says whether any other node
+ * could take shards.
  */
 export function overCapacityOf(registry: Registry, nodeId: string, pinnedShardId: number | null): OverCapacityView | null {
   const self = registry.nodes.get(nodeId);
   if (!self) return null;
-  const shardIds = registry.shardIdsOf(nodeId);
+  const held = registry.shardIdsOf(nodeId);
+  const shardIds = held.filter(id => id !== pinnedShardId);
   const capacity = declaredCapacityOf(self);
-  if (shardIds.filter(id => id !== pinnedShardId).length <= capacity) return null;
-  return { shardIds, capacity, alone: !otherNodeCanHoldShards(registry) };
+  if (shardIds.length <= capacity) return null;
+  return { shardIds, capacity, alone: !otherNodeCanHoldShards(registry), pinned: held.length > shardIds.length ? pinnedShardId : null };
 }
 
 export interface PinRestoreLeg {
