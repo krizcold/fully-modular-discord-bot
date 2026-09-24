@@ -1864,8 +1864,8 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       && targetFor(n, alone) - registry.shardIdsOf(n.nodeId).length - pendingShardIdsOf(n.nodeId).length > 0);
     const openReason = withRoom.length === 0
       ? 'no connected node has free capacity; start another instance or reshard'
-      : withRoom.every(n => ledger?.inBackoff(n.nodeId))
-        ? 'deferred by the identify ledger, retried when its hold ends'
+      : ledger !== null && withRoom.every(n => !ledger.permit(n.nodeId, 1).ok)
+        ? 'deferred by the identify ledger; its warning names the retry'
         : 'placement pending';
     const groups = new Map<string, number[]>();
     for (const shardId of free) {
