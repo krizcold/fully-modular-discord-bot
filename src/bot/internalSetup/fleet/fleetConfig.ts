@@ -86,6 +86,12 @@ export function effectiveMasterUrls(): { urls: string[]; source: 'runtime' | 'en
   return { urls: resolveMasterUrls(), source: 'env' };
 }
 
+/** The list the other nodes dial (the runtime document's, else the env seed), this node included. */
+export function fleetMasterCandidates(): string[] {
+  const cached = readFleetConfigCache();
+  return cached && cached.masterCandidates.length > 0 ? cached.masterCandidates : rawMasterUrls();
+}
+
 /** Where each value in force came from (20.7): the runtime document, the env seed, or the default of an unset key. */
 export interface FleetConfigSources {
   masterCandidates: 'runtime' | 'env';

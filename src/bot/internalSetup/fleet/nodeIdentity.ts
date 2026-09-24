@@ -189,7 +189,7 @@ export function stripSelfUrl(urls: string[]): string[] {
   return urls.filter(url => normalizeUrl(url) !== self);
 }
 
-function normalizeUrl(url: string): string {
+export function normalizeUrl(url: string): string {
   return url.replace(/\/+$/, '').toLowerCase();
 }
 

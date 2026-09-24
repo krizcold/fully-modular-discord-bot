@@ -93,7 +93,7 @@ import { MigrationExecutor } from './migration/migrationExecutor';
 import { TransformationCoordinator } from './transformation/transformationCoordinator';
 import { TransformationExecutor } from './transformation/transformationExecutor';
 import type { ControlStore, PersistedFleetConfig, PersistedTerm, TransformDirection } from './controlStore';
-import { effectiveFleetConfigView, effectiveMasterUrls, emptyStoreHoldEvidence, fleetConfigViewOf, forcePassive, readFleetConfigCache, rememberBackups, validateMasterCandidates, renumberDesignations, validateBackupDesignations, validateWitnessChannelId, writeFleetConfigCache } from './fleetConfig';
+import { effectiveFleetConfigView, effectiveMasterUrls, emptyStoreHoldEvidence, fleetConfigViewOf, fleetMasterCandidates, forcePassive, readFleetConfigCache, rememberBackups, validateMasterCandidates, renumberDesignations, validateBackupDesignations, validateWitnessChannelId, writeFleetConfigCache } from './fleetConfig';
 import { getLocalReplicaIdentity, getReplicaHealth, getSlotSample, setReplicaProbeListener } from './replicaHealth';
 import { canonicalIsOwnReplica, canonicalStoreReachable, currentCanonicalUrl, hasDbReplica, probeReplica, readTermRow, resolveReplicaEndpoints, spliceFleetCredentials } from './replicaPromotion';
 import { ArmEvidenceInputs, armDeferral, evaluateArmEvidence, ledgerAllowsArm, preArmRefusal, reachabilityWarning } from './armLane';
@@ -3975,7 +3975,7 @@ async function initCoWorker(init: CommonInit, followerHold: FollowerHoldBase | n
 
       // Legal but worth saying out loud (F39): 20.9 blesses a solo machine no
       // co-worker can dial, and on one, standing in serves only this machine.
-      const warning = reachabilityWarning(process.env.FLEET_PUBLIC_URL || '', rawMasterUrls());
+      const warning = reachabilityWarning(process.env.FLEET_PUBLIC_URL || '', fleetMasterCandidates());
       if (warning) console.warn(`[Fleet] Stand-in reachability: ${warning}`);
 
       // The point of no return: the override makes the next boot a master boot.

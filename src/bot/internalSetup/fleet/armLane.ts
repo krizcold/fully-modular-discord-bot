@@ -12,6 +12,7 @@
 
 import { ARM_MAX_ATTEMPTS, ARM_SPACING_MS, STANDIN_WRITE_REQUEST_STALE_MS, WITNESS_FRESH_WINDOW_MS } from './constants';
 import { ArmRecord } from './armRecord';
+import { normalizeUrl } from './nodeIdentity';
 import type { SyncPostureVerdict } from './syncPostureFact';
 
 /**
@@ -136,16 +137,22 @@ export function ledgerAllowsArm(record: ArmRecord | null, now: number): ArmVerdi
  * advertised URL the condition cannot be computed, and saying nothing would let
  * an unreachable node look identical to a reachable one.
  */
-export function reachabilityWarning(publicUrl: string, rawMasterCandidates: string[]): string | null {
-  const mine = publicUrl.trim();
-  if (mine === '') {
+export function reachabilityWarning(publicUrl: string, masterCandidates: string[]): string | null {
+  const listed = selfListed(publicUrl, masterCandidates);
+  if (listed === null) {
     return 'this node advertises no FLEET_PUBLIC_URL, so whether co-workers can reach it cannot be determined here';
   }
-  const listed = rawMasterCandidates.some(url => url.trim() === mine);
   if (!listed) {
     return 'this node is not in the fleet master candidate list, so no co-worker can dial it: while it stands in, only this machine serves';
   }
   return null;
+}
+
+/** Whether the list the other nodes dial names this node; null when it advertises no URL. Compared as dialing compares. */
+function selfListed(publicUrl: string, masterCandidates: string[]): boolean | null {
+  const mine = normalizeUrl(publicUrl.trim());
+  if (mine === '') return null;
+  return masterCandidates.some(url => normalizeUrl(url.trim()) === mine);
 }
 
 /**
