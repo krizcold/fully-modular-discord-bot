@@ -1846,6 +1846,11 @@ function FleetView({ api, wsClient, guildNames }) {
         <FleetSupersededBanner fleet={fleet} />
         {fleet.followerHold && <FleetFollowerHoldBanner api={api} fleet={fleet} />}
         <FleetStandInBanner fleet={fleet} />
+        {fleet.backupMaster && fleet.standInVerdict && !(fleet.standIn && fleet.standIn.live) && (
+          <div className="usage-stat-sub" style={{ marginTop: '6px' }}>
+            {`Stand-in check at ${new Date(fleet.standInVerdict.at).toISOString().slice(11, 19)} UTC: not arming: ${fleet.standInVerdict.reasons.join('; ')}${fleet.standInVerdict.note ? ' (' + fleet.standInVerdict.note + ')' : ''}`}
+          </div>
+        )}
         {fleet.roleOverride && (
           <div className="usage-stat-sub" style={{ marginTop: '6px' }}>
             {`Role set by operator override (${fleet.roleOverride.setBy}, ${new Date(fleet.roleOverride.setAt).toISOString().slice(0, 16).replace('T', ' ')} UTC)`}
