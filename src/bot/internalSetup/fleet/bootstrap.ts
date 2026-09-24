@@ -58,10 +58,13 @@ import { HealthMonitor } from './healthMonitor';
 import { IdentifyLedger } from './identifyLedger';
 import {
   assignIdentifyDelays,
+  declaredCapacityOf,
   fetchAllGuilds,
   fetchGatewayInfo,
   getShardCountOverride,
   guildIdToShardId,
+  otherNodeCanHoldShards,
+  overCapacityOf,
   pickFreePlacements,
   resolvePinnedShardId,
   resolveShardCapacity,
@@ -1457,17 +1460,10 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   // hold shards (alone) takes every free shard past its capacity rather than
   // leave any unserved (B7-F15); the exception ends the moment another node
   // that can hold shards is up, but shards already taken stay until moved.
-  const declaredCapacityOf = (node: RegistryNode): number => {
-    const declared = node.capabilities?.shardCapacity;
-    if (declared === 0) return 0;
-    return Math.max(1, declared ?? 1);
-  };
   const targetFor = (node: RegistryNode, alone = false): number => {
     if (node.isSelf && (standalone || alone)) return registry.shardCount;
     return declaredCapacityOf(node);
   };
-  const otherNodeCanHoldShards = (): boolean =>
-    [...registry.nodes.values()].some(n => !n.isSelf && n.connected && !n.draining && declaredCapacityOf(n) > 0);
   const reshardHint = (): string =>
     recommendedShards !== null && recommendedShards < registry.shardCount
       ? `, or reshard: Discord recommends ${recommendedShards} shard(s), set FLEET_SHARD_COUNT`
@@ -1743,7 +1739,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       }
     }
 
-    const alone = !otherNodeCanHoldShards();
+    const alone = !otherNodeCanHoldShards(registry);
     const candidates = [...registry.nodes.values()].filter(n => !ledger || !ledger.inBackoff(n.nodeId));
     // Headroom counts pending-confirmation leases: they are not in the shard
     // table yet, but every composed grant re-delivers them (reGrantSetOf), so
@@ -1845,7 +1841,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       setUnassigned(null);
       return;
     }
-    const alone = !otherNodeCanHoldShards();
+    const alone = !otherNodeCanHoldShards(registry);
     const withRoom = [...registry.nodes.values()].filter(n => n.connected && !n.draining
       && targetFor(n, alone) - registry.shardIdsOf(n.nodeId).length - pendingShardIdsOf(n.nodeId).length > 0);
     const openReason = withRoom.length === 0

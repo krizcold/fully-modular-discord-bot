@@ -5,7 +5,8 @@ import { performance } from 'perf_hooks';
 import { ARM_MAX_ATTEMPTS, ARM_SPACING_MS, CONTROL_PORT_DEFAULT, LEASE_TTL_MS, PROTOCOL_VERSION, WITNESS_FRESH_WINDOW_MS } from './constants';
 import { ArmPhase, readArmRecord } from './armRecord';
 import { EpisodeRecord, readEpisodeRecord } from './episodeRecord';
-import { getShardSource, isPinEnabled, resolveShardCapacity } from './placement';
+import { getShardSource, isPinEnabled, overCapacityOf, resolveShardCapacity } from './placement';
+import type { OverCapacityView } from './placement';
 import type { BudgetInfo, NodeRole } from './protocol';
 import { consentsToActiveMode, isBackupMaster, isStandInBoot, readRoleOverride } from './nodeIdentity';
 import { readModeOverride } from './modeOverride';
@@ -248,8 +249,8 @@ export interface FleetState {
   transformation: TransformationView | null;
   /** Pin-restore proposal when the pinned shard sits off the master; null otherwise (master-only, never auto-executed). */
   pinViolation: PinViolationView | null;
-  /** Fleet master holding more shards than its declared capacity (a master alone takes every shard, B7-F15); null otherwise. */
-  overCapacity: { shardIds: number[]; capacity: number } | null;
+  /** Fleet master holding more shards than its declared capacity, the pinned shard not counted (B7-F15); alone says no other node could take shards. */
+  overCapacity: OverCapacityView | null;
   /** Fleet master: shards no instance serves, with why, after the last distribution run; null when every shard is placed or a hold, pause or fence explains the wait. */
   unassigned: UnassignedView[] | null;
   /** Names for guilds in guildMap the connected clients cannot name (master's REST list); merged UI-side. */
@@ -748,9 +749,7 @@ export function getFleetState(): FleetState {
       migration: sources.migration?.() ?? null,
       transformation: sources.transformation?.() ?? null,
       pinViolation: sources.pinViolation?.() ?? null,
-      overCapacity: !standalone && registry.shardIdsOf(nodeId).length > capacity
-        ? { shardIds: registry.shardIdsOf(nodeId), capacity }
-        : null,
+      overCapacity: standalone ? null : overCapacityOf(registry, nodeId, pinnedShardId),
       unassigned: sources.unassigned?.() ?? null,
       updatedAt: Date.now(),
     };

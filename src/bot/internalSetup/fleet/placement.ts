@@ -212,6 +212,38 @@ export function pickFreePlacements(
   return placements;
 }
 
+/** Declared shard capacity: 0 is a real declaration (a pure standby), absent or invalid reads 1. */
+export function declaredCapacityOf(node: RegistryNode): number {
+  const declared = node.capabilities?.shardCapacity;
+  if (declared === 0) return 0;
+  return Math.max(1, declared ?? 1);
+}
+
+/** True while a node other than the master is connected, not draining and can hold shards. */
+export function otherNodeCanHoldShards(registry: Registry): boolean {
+  return [...registry.nodes.values()].some(n => !n.isSelf && n.connected && !n.draining && declaredCapacityOf(n) > 0);
+}
+
+export interface OverCapacityView {
+  shardIds: number[];
+  capacity: number;
+  alone: boolean;
+}
+
+/**
+ * The master's holding past its declared capacity (B7-F15), null within it.
+ * The pinned shard is the master's by the iron rule regardless of capacity,
+ * so it is not counted; alone says whether any other node could take shards.
+ */
+export function overCapacityOf(registry: Registry, nodeId: string, pinnedShardId: number | null): OverCapacityView | null {
+  const self = registry.nodes.get(nodeId);
+  if (!self) return null;
+  const shardIds = registry.shardIdsOf(nodeId);
+  const capacity = declaredCapacityOf(self);
+  if (shardIds.filter(id => id !== pinnedShardId).length <= capacity) return null;
+  return { shardIds, capacity, alone: !otherNodeCanHoldShards(registry) };
+}
+
 export interface PinRestoreLeg {
   shardId: number;
   fromNodeId: string;
