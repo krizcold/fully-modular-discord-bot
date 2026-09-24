@@ -1827,7 +1827,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   let overCapacityKey = '';
   function reportOverCapacity(): void {
     const view = standalone ? null : overCapacityOf(registry, nodeId, pinnedShardId);
-    const key = view ? `${view.shardIds.join(',')}:${view.alone}` : '';
+    const key = view ? `${view.shardIds.join(',')}:${view.pinned}:${view.alone}` : '';
     if (key === overCapacityKey) return;
     if (view) {
       const exit = view.alone ? 'Start another instance and move shards to it' : 'Move shards to another node';
