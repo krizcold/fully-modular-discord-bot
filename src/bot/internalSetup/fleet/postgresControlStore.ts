@@ -389,6 +389,7 @@ export class PostgresControlStore implements ControlStore {
     if (this.mintedTerm === null) throw new Error('[Fleet] Control store write before term acquisition');
     const client = await this.pool.connect();
     let inTxn = false;
+    let broken = false;
     try {
       await this.ensureProvisioned(client);
       await client.query('BEGIN');
@@ -408,11 +409,11 @@ export class PostgresControlStore implements ControlStore {
       inTxn = false;
     } catch (error) {
       if (inTxn) {
-        await client.query('ROLLBACK').catch(() => client.release(true));
+        await client.query('ROLLBACK').catch(() => { broken = true; });
       }
       throw error;
     } finally {
-      client.release();
+      client.release(broken ? true : undefined);
     }
   }
 
