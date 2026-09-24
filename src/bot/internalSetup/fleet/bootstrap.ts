@@ -1881,8 +1881,12 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     const openReason = withRoom.length === 0
       ? 'no connected node has free capacity; start another instance or reshard'
       : withRoom.every(ledgerBlocks) ? LEDGER : 'placement pending';
+    // The master's one composed grant carries the pin plus its free picks,
+    // the pin having taken one slot of its room.
     const self = registry.nodes.get(nodeId);
-    const pinReason = pinnedShardId !== null && self && ledgerRefuses(self, [...reGrantSetOf(nodeId), pinnedShardId]) ? LEDGER : 'placement pending';
+    const pinReason = pinnedShardId !== null && self
+      && ledgerRefuses(self, [...reGrantSetOf(nodeId), pinnedShardId, ...free.filter(id => id !== pinnedShardId).slice(0, Math.max(0, roomOf(self) - 1))])
+      ? LEDGER : 'placement pending';
     const groups = new Map<string, number[]>();
     for (const shardId of free) {
       const reason = coordinator?.migratingShardIds().has(shardId) || coordinator?.pendingSourceCleanupShardIds().has(shardId)
