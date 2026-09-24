@@ -9,6 +9,7 @@
  * neither: the run asks.
  */
 import { Client } from 'pg';
+import { shortLivedClient } from '../utils/pgClient';
 import { CONTROL_SCHEMA } from './postgresControlStore';
 import { lsnBytes } from './slotStatus';
 
@@ -44,8 +45,7 @@ export const LINEAGE_REFRESH_MS = 60_000;
 const QUERY_TIMEOUT_MS = 5000;
 
 async function withClient<T>(url: string, fn: (client: Client) => Promise<T>): Promise<T> {
-  const client = new Client({ connectionString: url, connectionTimeoutMillis: QUERY_TIMEOUT_MS, query_timeout: QUERY_TIMEOUT_MS });
-  client.on('error', () => { /* surfaced by the query that fails */ });
+  const client = shortLivedClient({ connectionString: url, connectionTimeoutMillis: QUERY_TIMEOUT_MS, query_timeout: QUERY_TIMEOUT_MS });
   try {
     await client.connect();
     return await fn(client);

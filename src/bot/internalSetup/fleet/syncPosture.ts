@@ -17,6 +17,7 @@
  * reset by the arm's own relax, because only there is it known to be ours.
  */
 import { Client } from 'pg';
+import { shortLivedClient } from '../utils/pgClient';
 import { loadCredentials, resolveDataBackend } from '../../../utils/envLoader';
 
 const CLEAR_CONNECT_TIMEOUT_MS = 5000;
@@ -61,7 +62,7 @@ export async function relaxSyncPosture(client: Client): Promise<void> {
 
 /** Relax the posture on the database this url names. Best effort by contract: the caller boots either way. */
 export async function clearSyncPosture(url: string): Promise<{ ok: boolean; error?: string }> {
-  const client = new Client({
+  const client = shortLivedClient({
     connectionString: url,
     connectionTimeoutMillis: CLEAR_CONNECT_TIMEOUT_MS,
     query_timeout: CLEAR_QUERY_TIMEOUT_MS,

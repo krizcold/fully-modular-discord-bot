@@ -11,14 +11,12 @@
 // exactly the state in which standing in would serve nothing.
 
 import { Client } from 'pg';
+import { shortLivedClient } from '../utils/pgClient';
 import { PROMOTE_SQL_TIMEOUT_MS } from './constants';
 
 async function withReadOnlyClient<T>(url: string, fn: (client: Client) => Promise<T>): Promise<T | null> {
   if (!url) return null;
-  const client = new Client({ connectionString: url, connectionTimeoutMillis: 5000, query_timeout: PROMOTE_SQL_TIMEOUT_MS });
-  // A socket fault emits OUTSIDE the query promise; without a listener it would
-  // reach the process as an unhandled 'error' event and take the bot down.
-  client.on('error', () => { /* the awaited call below reports the failure */ });
+  const client = shortLivedClient({ connectionString: url, connectionTimeoutMillis: 5000, query_timeout: PROMOTE_SQL_TIMEOUT_MS });
   try {
     await client.connect();
     return await fn(client);

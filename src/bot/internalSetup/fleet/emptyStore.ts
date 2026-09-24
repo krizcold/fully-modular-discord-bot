@@ -3,13 +3,13 @@
 // seed from local files on first touch, which is exactly what must NOT happen
 // to a store that may still need seeding from a backup.
 
-import { Client } from 'pg';
+import { shortLivedClient } from '../utils/pgClient';
 import { PROMOTE_SQL_TIMEOUT_MS } from './constants';
 
 export type StoreEmptiness = 'empty' | 'populated' | 'unreachable';
 
 async function countRows(url: string, relation: string, where: string): Promise<number | 'unreachable'> {
-  const client = new Client({ connectionString: url, connectionTimeoutMillis: 5000, query_timeout: PROMOTE_SQL_TIMEOUT_MS });
+  const client = shortLivedClient({ connectionString: url, connectionTimeoutMillis: 5000, query_timeout: PROMOTE_SQL_TIMEOUT_MS });
   try {
     await client.connect();
     const exists = await client.query(`SELECT to_regclass($1) IS NOT NULL AS present`, [relation]);

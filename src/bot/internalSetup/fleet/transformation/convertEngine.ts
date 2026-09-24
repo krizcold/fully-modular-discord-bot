@@ -7,6 +7,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
 import { Client } from 'pg';
+import { shortLivedClient } from '../../utils/pgClient';
 import { DATA_ROOT } from '../../../../utils/dataRoot';
 import { exportNamespace, FileRecord } from '../../utils/dataInterchange';
 import type { FenceToken } from '../../utils/dataBackends/backend';
@@ -131,7 +132,7 @@ function classifyRecord(record: FileRecord): 'doc' | 'append' {
 }
 
 async function stagingClient(url: string): Promise<Client> {
-  const client = new Client({ connectionString: url, connectionTimeoutMillis: 5000, keepAlive: true });
+  const client = shortLivedClient({ connectionString: url, connectionTimeoutMillis: 5000, keepAlive: true });
   watchForSyncWaitCancel(client, 'the transformation staging connection');
   await client.connect();
   // The staging transaction is held across export, hashing and the commit

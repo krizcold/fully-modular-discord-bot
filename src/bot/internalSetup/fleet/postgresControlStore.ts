@@ -6,6 +6,7 @@
 
 import * as fs from 'fs';
 import { Client, Pool, PoolClient } from 'pg';
+import { guardPoolClients, shortLivedClient } from '../utils/pgClient';
 import { loadCredentials, resolveDataBackend } from '../../../utils/envLoader';
 import { dataPath } from '../../../utils/dataRoot';
 import { getGuildDataBackend } from '../utils/dataManager';
@@ -597,6 +598,7 @@ export function createControlStore(standalone: boolean): ControlStore {
     // A split control store is still the fleet's database, and the term stamp
     // and registry writes commit through it (B6 map F24).
     watchPoolForSyncWaitCancel(pool, 'the control-store pool');
+    guardPoolClients(pool, 'the control-store pool');
     return new PostgresControlStore(pool, false, true);
   }
   const dataBackend = getGuildDataBackend();
@@ -628,6 +630,7 @@ export function createStandInControlStore(url: string): PostgresControlStore {
     idleTimeoutMillis: 30_000,
   });
   pool.on('error', err => console.warn('[Fleet] Stand-in control store idle client error:', err instanceof Error ? err.message : err));
+  guardPoolClients(pool, 'the stand-in control store');
   return new PostgresControlStore(pool, true, true);
 }
 
@@ -661,7 +664,7 @@ async function exportBackToFileStore(): Promise<void> {
       await sleep(SEED_RETRY_MS);
       continue;
     }
-    const client = new Client({ connectionString: url, connectionTimeoutMillis: 5000 });
+    const client = shortLivedClient({ connectionString: url, connectionTimeoutMillis: 5000 });
     try {
       await client.connect();
       const termRes = await client.query(`SELECT term, node_id, updated_at FROM smdb_control.term WHERE id = 1`);

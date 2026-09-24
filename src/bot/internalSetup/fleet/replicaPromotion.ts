@@ -9,6 +9,7 @@
 // loadCredentials() can tell the two apart.
 
 import { Client } from 'pg';
+import { shortLivedClient } from '../utils/pgClient';
 import { loadCredentials, upsertCredentials } from '../../../utils/envLoader';
 import { REPLICA_CATCHUP_POLL_MS, REPLICA_CATCHUP_WAIT_MS } from './constants';
 
@@ -65,7 +66,7 @@ export function spliceFleetCredentials(replicaUrl: string, base?: string): { url
  * promotion, and the boot provisions its own schema.
  */
 export async function storeReachable(url: string): Promise<{ ok: boolean; error?: string }> {
-  const client = new Client({ connectionString: url, connectionTimeoutMillis: 5000, query_timeout: 5000 });
+  const client = shortLivedClient({ connectionString: url, connectionTimeoutMillis: 5000, query_timeout: 5000 });
   try {
     await client.connect();
     await client.query('SELECT 1');
@@ -92,7 +93,7 @@ export function stripUrlCredentials(url: string | null): string | null {
 
 /** The control term row as the database at url holds it; null when absent or unreadable. */
 export async function readTermRow(url: string): Promise<{ term: number; nodeId: string } | null> {
-  const client = new Client({ connectionString: url, connectionTimeoutMillis: 5000, query_timeout: 5000 });
+  const client = shortLivedClient({ connectionString: url, connectionTimeoutMillis: 5000, query_timeout: 5000 });
   try {
     await client.connect();
     const res = await client.query(`SELECT term, node_id FROM smdb_control.term WHERE id = 1`);
@@ -201,10 +202,7 @@ export function conninfoEndpoint(conninfo: unknown): { sourceHost: string | null
 }
 
 export async function probeReplica(splicedLocalUrl: string): Promise<ReplicaProbe> {
-  const client = new Client({ connectionString: splicedLocalUrl, connectionTimeoutMillis: 5000, query_timeout: 5000 });
-  // A connection dropped mid-probe surfaces through the statement that fails;
-  // an unlistened 'error' event would end the process instead.
-  client.on('error', () => { /* reported by the failing query */ });
+  const client = shortLivedClient({ connectionString: splicedLocalUrl, connectionTimeoutMillis: 5000, query_timeout: 5000 });
   try {
     await client.connect();
     const row = (await client.query(PROBE_SQL)).rows[0] ?? {};
@@ -270,7 +268,7 @@ async function relaxInheritedPosture(client: Client): Promise<void> {
  * attempt got this far and only the URL repoint remains.
  */
 export async function promoteReplica(splicedLocalUrl: string): Promise<{ success: boolean; error?: string }> {
-  const client = new Client({ connectionString: splicedLocalUrl, connectionTimeoutMillis: 5000, query_timeout: 90000 });
+  const client = shortLivedClient({ connectionString: splicedLocalUrl, connectionTimeoutMillis: 5000, query_timeout: 90000 });
   try {
     await client.connect();
     const state = await client.query(`SELECT pg_is_in_recovery() AS in_recovery`);

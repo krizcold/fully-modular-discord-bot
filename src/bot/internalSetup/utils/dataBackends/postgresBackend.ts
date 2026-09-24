@@ -6,6 +6,7 @@
 
 import { randomUUID } from 'crypto';
 import { Client, Pool } from 'pg';
+import { guardPoolClients, shortLivedClient } from '../pgClient';
 import type { PoolClient, QueryResult } from 'pg';
 import { watchForSyncWaitCancel, watchPoolForSyncWaitCancel } from '../syncWaitCancel';
 import type {
@@ -140,6 +141,7 @@ export class PostgresBackend implements DataBackend {
     // which postgres reports as a WARNING on an otherwise successful commit
     // (B6 map F24).
     watchPoolForSyncWaitCancel(this.pool, 'the guild-data pool');
+    guardPoolClients(this.pool, 'the guild-data pool');
   }
 
   // ==========================================================================
@@ -772,7 +774,7 @@ function isMissingRelation(error: unknown): boolean {
 }
 
 async function metaClient(url: string): Promise<Client> {
-  const client = new Client({
+  const client = shortLivedClient({
     connectionString: url,
     connectionTimeoutMillis: CONNECT_TIMEOUT_MS,
     statement_timeout: STATEMENT_TIMEOUT_MS,

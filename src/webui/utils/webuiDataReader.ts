@@ -3,6 +3,7 @@
 // fencing; postgres-routed guild reads in the routes go through this reader.
 
 import { Pool } from 'pg';
+import { guardPoolClients } from '../../bot/internalSetup/utils/pgClient';
 import { loadCredentials } from '../../utils/envLoader';
 
 const READER_ERROR = 'data backend unreachable';
@@ -24,6 +25,7 @@ export class WebuiDataReader {
       });
       // An idle client error would otherwise crash the parent process.
       this.pool.on('error', () => {});
+      guardPoolClients(this.pool, 'the web UI reader');
     }
     return this.pool;
   }

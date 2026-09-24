@@ -48,6 +48,7 @@
 
 import * as fs from 'fs';
 import { Client } from 'pg';
+import { shortLivedClient } from '../utils/pgClient';
 import { dataPath } from '../../../utils/dataRoot';
 import { FLEET_DIR } from './constants';
 import { atomicWriteFileSync } from './fileControlStore';
@@ -160,14 +161,11 @@ const READ_QUERY_TIMEOUT_MS = 5000;
  * evidence of anything, which is the whole discipline here.
  */
 export async function readReplayedSyncPosture(url: string): Promise<ReplayedSyncPosture | null> {
-  const client = new Client({
+  const client = shortLivedClient({
     connectionString: url,
     connectionTimeoutMillis: READ_CONNECT_TIMEOUT_MS,
     query_timeout: READ_QUERY_TIMEOUT_MS,
   });
-  // A socket fault emits on the client itself, outside any query's promise, so
-  // without this an unreachable local database takes the whole bot down.
-  client.on('error', () => { /* reported by the failing query */ });
   try {
     await client.connect();
     const res = await client.query(REPLAYED_SQL);
