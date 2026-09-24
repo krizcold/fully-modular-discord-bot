@@ -242,6 +242,8 @@ export interface FleetState {
   transformation: TransformationView | null;
   /** Pin-restore proposal when the pinned shard sits off the master; null otherwise (master-only, never auto-executed). */
   pinViolation: PinViolationView | null;
+  /** Fleet master holding more shards than its declared capacity (a master alone takes every shard, B7-F15); null otherwise. */
+  overCapacity: { shardIds: number[]; capacity: number } | null;
   /** Names for guilds in guildMap the connected clients cannot name (master's REST list); merged UI-side. */
   guildNames?: Record<string, string>;
   /** Standbys attached to the fleet database, read by whoever serves it; null off-postgres or before the first read. */
@@ -597,6 +599,7 @@ export function getFleetState(): FleetState {
       migration: null,
       transformation: null,
       pinViolation: null,
+      overCapacity: null,
       updatedAt: Date.now(),
     };
   }
@@ -734,6 +737,9 @@ export function getFleetState(): FleetState {
       migration: sources.migration?.() ?? null,
       transformation: sources.transformation?.() ?? null,
       pinViolation: sources.pinViolation?.() ?? null,
+      overCapacity: !standalone && registry.shardIdsOf(nodeId).length > capacity
+        ? { shardIds: registry.shardIdsOf(nodeId), capacity }
+        : null,
       updatedAt: Date.now(),
     };
   }
@@ -862,6 +868,7 @@ export function getFleetState(): FleetState {
     migration: null,
     transformation: null,
     pinViolation: null,
+    overCapacity: null,
     updatedAt: Date.now(),
   };
 }

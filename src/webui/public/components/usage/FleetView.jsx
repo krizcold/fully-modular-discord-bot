@@ -539,6 +539,13 @@ function FleetTransformBanner({ dataBoot, transformation, api, onChanged }) {
   );
 }
 
+// Reshard exit named by the capacity banners when Discord recommends fewer
+// shards than the fleet runs; empty otherwise.
+function reshardHint(fleet) {
+  if (fleet.recommendedShards == null || fleet.recommendedShards >= fleet.shardCount) return '';
+  return `, or reshard (Discord recommends ${fleet.recommendedShards} shard${fleet.recommendedShards === 1 ? '' : 's'}: set FLEET_SHARD_COUNT)`;
+}
+
 // Master-only pin-violation banner: the pinned shard sits off the master. The
 // Swap button submits the proposed legs (never auto-executed); a null proposal
 // shows the no-capacity reason.
@@ -2011,6 +2018,12 @@ function FleetView({ api, wsClient, guildNames }) {
       {fleet.recovery && fleet.recovery.reshardAdvised && (
         <div className="usage-notice">
           {`Discord now recommends ${fleet.recovery.reshardAdvised.recommended} shard${fleet.recovery.reshardAdvised.recommended === 1 ? '' : 's'}; fleet runs ${fleet.recovery.reshardAdvised.running}; resharding requires setting FLEET_SHARD_COUNT.`}
+        </div>
+      )}
+
+      {fleet.overCapacity && (
+        <div className="usage-notice">
+          {`Over capacity: this master holds ${fleet.overCapacity.shardIds.length} shard${fleet.overCapacity.shardIds.length === 1 ? '' : 's'} [${fleet.overCapacity.shardIds.join(', ')}], above its declared capacity of ${fleet.overCapacity.capacity} (a master alone takes every shard rather than leave any unserved). Start another instance and move shards to it from its node card${reshardHint(fleet)}.`}
         </div>
       )}
 
