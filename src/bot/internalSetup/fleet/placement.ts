@@ -1,7 +1,8 @@
 // Placement helpers: shard-count resolution, this-node capacity, the guild ->
-// shard formula and identify pacing. The master claims up to ITS capacity and
-// only ever grants FREE shards to workers; owned shards move exclusively via
-// migration (bootstrap owns the distribution loop).
+// shard formula and identify pacing. The master claims up to ITS capacity
+// (every shard while no other node can hold any) and only ever grants FREE
+// shards to workers; owned shards move exclusively via migration (bootstrap
+// owns the distribution loop).
 
 import * as https from 'https';
 import { randomUUID } from 'crypto';

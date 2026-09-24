@@ -1,8 +1,9 @@
 // Fleet boot orchestration: role resolution, control-plane wiring, shard
-// placement. The master claims up to ITS capacity and grants workers only
-// FREE shards; owned shards move exclusively through the (future) migration
-// system, never automatically. Standalone IS the master path claiming every
-// shard, byte-identical to today's single-box boot.
+// placement. The master claims up to ITS capacity, or every shard while no
+// other node can hold any, and grants workers only FREE shards; owned shards
+// move exclusively through the (future) migration system, never
+// automatically. Standalone IS the master path claiming every shard,
+// byte-identical to today's single-box boot.
 
 import { performance } from 'perf_hooks';
 import type { Client } from 'discord.js';
@@ -1452,13 +1453,25 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   // (today's single-box behavior, byte-identical boot); the capacity cap
   // applies only in FLEET mode. Capacity 0 is a real declaration (a pure
   // standby that serves nothing, PLAN_STANDBY ruling 1); only absent/invalid
-  // declarations fall back to 1.
-  const targetFor = (node: RegistryNode): number => {
-    if (node.isSelf && standalone) return registry.shardCount;
+  // declarations fall back to 1. A fleet master that is the only node able to
+  // hold shards (alone) takes every free shard past its capacity rather than
+  // leave any unserved (B7-F15); the exception ends the moment another node
+  // that can hold shards is up, but shards already taken stay until moved.
+  const declaredCapacityOf = (node: RegistryNode): number => {
     const declared = node.capabilities?.shardCapacity;
     if (declared === 0) return 0;
     return Math.max(1, declared ?? 1);
   };
+  const targetFor = (node: RegistryNode, alone = false): number => {
+    if (node.isSelf && (standalone || alone)) return registry.shardCount;
+    return declaredCapacityOf(node);
+  };
+  const otherNodeCanHoldShards = (): boolean =>
+    [...registry.nodes.values()].some(n => !n.isSelf && n.connected && !n.draining && declaredCapacityOf(n) > 0);
+  const reshardHint = (): string =>
+    recommendedShards !== null && recommendedShards < registry.shardCount
+      ? `, or reshard: Discord recommends ${recommendedShards} shard(s), set FLEET_SHARD_COUNT`
+      : '';
 
   // Master-side mirror of the worker's same-shape adopt: a grant identifies
   // NOTHING when it matches what the node currently holds (its heldLeases when
@@ -1730,13 +1743,14 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       }
     }
 
+    const alone = !otherNodeCanHoldShards();
     const candidates = [...registry.nodes.values()].filter(n => !ledger || !ledger.inBackoff(n.nodeId));
     // Headroom counts pending-confirmation leases: they are not in the shard
     // table yet, but every composed grant re-delivers them (reGrantSetOf), so
     // they book capacity - otherwise a returning worker whose set is split
     // table/pending is undercounted and wins a free shard over its cap.
     const placements = pickFreePlacements(pool, candidates, registry, node =>
-      targetFor(node) - pendingShardIdsOf(node.nodeId).length - (grantsByNode.get(node.nodeId)?.length ?? 0));
+      targetFor(node, alone) - pendingShardIdsOf(node.nodeId).length - (grantsByNode.get(node.nodeId)?.length ?? 0));
     for (const [placedNodeId, shardIds] of placements) {
       for (const shardId of shardIds) addGrant(placedNodeId, shardId);
     }
@@ -1786,15 +1800,18 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       // free forever: workers are fenced off it above).
       const pinnedPlaced = pinnedShardId !== null ? rawPlaced.filter(id => id === pinnedShardId) : [];
       let trimmable = pinnedPlaced.length > 0 ? rawPlaced.filter(id => id !== pinnedShardId) : rawPlaced;
-      const headroom = Math.max(0, targetFor(node) - reGrant.length - pinnedPlaced.length);
+      const headroom = Math.max(0, targetFor(node, alone) - reGrant.length - pinnedPlaced.length);
       if (trimmable.length > headroom) {
         const trimmed = trimmable.slice(headroom);
         trimmable = trimmable.slice(0, headroom);
-        console.warn(`[Fleet] Trimmed free placement [${trimmed.join(', ')}] to ${node.nodeName}: capacity ${targetFor(node)} already booked by held+pending leases`);
+        console.warn(`[Fleet] Trimmed free placement [${trimmed.join(', ')}] to ${node.nodeName}: capacity ${targetFor(node, alone)} already booked by held+pending leases`);
       }
       const placed = [...pinnedPlaced, ...trimmable];
       if (placed.length === 0) continue;
       const fullSet = [...new Set([...reGrant, ...placed])].sort((a, b) => a - b);
+      if (node.isSelf && alone && !standalone && fullSet.length > declaredCapacityOf(node)) {
+        console.error(`[Fleet] Lone master: no other node can hold shards; taking [${placed.join(', ')}] past declared capacity ${declaredCapacityOf(node)} (holding ${fullSet.length} of ${registry.shardCount}). Start another instance and move shards to it${reshardHint()}`);
+      }
       await grantShardsTo(node, fullSet, epoch);
     }
 
