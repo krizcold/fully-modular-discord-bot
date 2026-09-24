@@ -1190,8 +1190,9 @@ function FleetPromoteCard({ api, fleet, reload }) {
         : 'TRANSFER master to this instance?\n\nZero data loss: the old database is fenced at a known point, the copy here catches up to it, then becomes the fleet database. The old master keeps serving its shards until this node moves them, then rejoins as a co-worker. Writes are refused for a few seconds around the switch; Discord sessions stay up.';
     if (!confirm(text)) return;
     setBusy(true);
-    // The engine checks the RPO first and the lineage after it, so either can
-    // arrive on the answer to the other; each is asked once and carried on.
+    // The engine asks for the RPO, then the lineage, then whether other nodes
+    // can reach this one, so each can arrive on the answer to another; each is
+    // asked once and carried on.
     const attempt = (body) => post(body).then((res) => {
       if (!res || res.success !== false) return res;
       if (res.needsLagConfirm && !body.confirmLag) {
@@ -1204,6 +1205,10 @@ function FleetPromoteCard({ api, fleet, reload }) {
       if (res.needsLineageConfirm && !body.confirmLineage) {
         if (!confirm((res.error || 'Another designated backup received further than this copy.') + '\n\nPromote this copy anyway?')) return null;
         return attempt({ ...body, confirmLineage: true });
+      }
+      if (res.needsReachabilityConfirm && !body.confirmReachability) {
+        if (!confirm((res.error || 'No other instance can connect to this node.') + '\n\nPromote this instance anyway?')) return null;
+        return attempt({ ...body, confirmReachability: true });
       }
       return res;
     });
