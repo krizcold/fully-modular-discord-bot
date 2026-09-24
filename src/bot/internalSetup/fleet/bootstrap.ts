@@ -1865,12 +1865,19 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       targetFor(n, alone) - registry.shardIdsOf(n.nodeId).length - pendingShardIdsOf(n.nodeId).length;
     const withRoom = [...registry.nodes.values()].filter(n => n.connected && !n.draining && roomOf(n) > 0);
     // Priced like the grant distributeOnce composes: the node's re-grant set
-    // plus what it would take, of which a changed shape identifies everything.
+    // plus what it would take, of which a changed shape identifies everything
+    // while a same-shape grant identifies nothing and skips the ledger gate,
+    // leaving only the crash backoff (the candidate filter) to block it.
     const priceOf = (n: RegistryNode): number =>
       shardsForcingIdentify(n, [...new Set([...reGrantSetOf(n.nodeId), ...free.slice(0, roomOf(n))])].sort((a, b) => a - b)).length;
+    const ledgerBlocks = (n: RegistryNode): boolean => {
+      if (!ledger) return false;
+      const price = priceOf(n);
+      return price === 0 ? ledger.inBackoff(n.nodeId) : !ledger.permit(n.nodeId, price).ok;
+    };
     const openReason = withRoom.length === 0
       ? 'no connected node has free capacity; start another instance or reshard'
-      : ledger !== null && withRoom.every(n => !ledger.permit(n.nodeId, priceOf(n)).ok)
+      : withRoom.every(ledgerBlocks)
         ? 'deferred by the identify ledger; its warning names the retry'
         : 'placement pending';
     const groups = new Map<string, number[]>();
