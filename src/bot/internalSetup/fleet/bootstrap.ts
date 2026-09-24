@@ -1835,7 +1835,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     const key = next ? next.map(u => `${u.shardIds.join(',')}:${u.reason}`).join('|') : '';
     unassigned = next;
     if (key === unassignedKey) return;
-    if (next) console.error(`[Fleet] UNASSIGNED shards ${next.map(u => `[${u.shardIds.join(', ')}] ${u.reason}`).join('; ')}`);
+    if (next) console.error(`[Fleet] UNASSIGNED shards ${next.map(u => `[${u.shardIds.join(', ')}]: ${u.reason}`).join('; ')}`);
     else if (unassignedKey !== '') console.log('[Fleet] Every shard is assigned again');
     unassignedKey = key;
   }
