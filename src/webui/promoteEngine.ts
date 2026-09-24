@@ -23,6 +23,7 @@ import type { BotManager } from './botManager';
 import {
   PROMOTE_CATCHUP_POLL_MS,
   PROMOTE_CATCHUP_TIMEOUT_MS,
+  CONTROL_PORT_DEFAULT,
   PROMOTE_SQL_TIMEOUT_MS,
   REPLICA_LAG_PROMOTE_MAX_MS,
 } from '../bot/internalSetup/fleet/constants';
@@ -30,6 +31,7 @@ import { isContainerPinned, loadCredentials } from '../utils/envLoader';
 import { clearRoleOverride, getNodeId, getNodeName, invalidateRoleOverrideCache, readRoleOverride, writeRoleOverride } from '../bot/internalSetup/fleet/nodeIdentity';
 import { promoteReachabilityWarning } from '../bot/internalSetup/fleet/armLane';
 import { fleetMasterCandidates } from '../bot/internalSetup/fleet/fleetConfig';
+import { judgeReachability } from '../bot/internalSetup/fleet/reachability';
 import { PromoteRecord, clearPromoteRecord, readPromoteRecord, writePromoteRecord } from '../bot/internalSetup/fleet/promoteRecord';
 import { HolderSighting, readHolderSighting } from '../bot/internalSetup/fleet/holderSighting';
 import {
@@ -469,7 +471,10 @@ export async function startPromote(botManager: BotManager, opts: PromoteStartOpt
   // own role is exempt: it is what the operator set up to be dialed, and its
   // failback runs unattended.
   if (!returningMaster && opts.confirmReachability !== true) {
-    const warning = promoteReachabilityWarning(process.env.FLEET_PUBLIC_URL || '', fleetMasterCandidates());
+    const publicUrl = process.env.FLEET_PUBLIC_URL || '';
+    const candidates = fleetMasterCandidates();
+    const reach = await judgeReachability(publicUrl, candidates, Number(process.env.CONTROL_PORT) || CONTROL_PORT_DEFAULT);
+    const warning = promoteReachabilityWarning(reach, publicUrl, candidates);
     if (warning) return { success: false, needsReachabilityConfirm: true, error: warning };
   }
 

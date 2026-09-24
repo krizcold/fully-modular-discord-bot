@@ -12,7 +12,7 @@
 
 import { ARM_MAX_ATTEMPTS, ARM_SPACING_MS, STANDIN_WRITE_REQUEST_STALE_MS, WITNESS_FRESH_WINDOW_MS } from './constants';
 import { ArmRecord } from './armRecord';
-import { normalizeUrl } from './nodeIdentity';
+import type { Reachability } from './reachability';
 import type { SyncPostureVerdict } from './syncPostureFact';
 
 /**
@@ -137,36 +137,26 @@ export function ledgerAllowsArm(record: ArmRecord | null, now: number): ArmVerdi
  * advertised URL the condition cannot be computed, and saying nothing would let
  * an unreachable node look identical to a reachable one.
  */
-export function reachabilityWarning(publicUrl: string, masterCandidates: string[]): string | null {
-  const listed = selfListed(publicUrl, masterCandidates);
-  if (listed === null) {
-    return 'this node advertises no FLEET_PUBLIC_URL, so whether co-workers can reach it cannot be determined here';
-  }
-  if (!listed) {
-    return 'this node is not in the fleet master candidate list, so no co-worker can dial it: while it stands in, only this machine serves';
-  }
-  return null;
+export function reachabilityWarning(reach: Reachability): string | null {
+  if (reach.verdict === 'listed') return null;
+  if (reach.verdict === 'unknown') return `whether co-workers can reach this node cannot be determined here: ${reach.why}`;
+  return 'this node is not in the fleet master candidate list, so no co-worker can dial it: while it stands in, only this machine serves';
 }
+
+const PROMOTED_ALONE = 'the old master and every co-worker lose their master, cannot register with this node, and their shards go dark until they are stopped and declared lost here; a master that returns later finds this node through the witness and parks';
 
 /**
  * The promote's form of the same judgement (B7-F18, ruled: warn and confirm,
  * never refuse). 20.9 allows a master no other machine can dial, and a refusal
  * would block the only way back online when that copy is the last good one.
  */
-export function promoteReachabilityWarning(publicUrl: string, masterCandidates: string[]): string | null {
-  const listed = selfListed(publicUrl, masterCandidates);
-  if (listed === true) return null;
-  const why = listed === null
-    ? 'This node advertises no FLEET_PUBLIC_URL, so whether the other instances can reach it cannot be determined here'
-    : 'This node is not in the fleet\'s master candidate list, so no other instance can connect to it';
-  return `${why}. As master it serves alone: the old master and every co-worker lose their master, cannot register with this node, and their shards go dark until they are stopped and declared lost here; a master that returns later finds this node through the witness and parks. Promote anyway only if this machine is meant to serve on its own.`;
-}
-
-/** Whether the list the other nodes dial names this node; null when it advertises no URL. Compared as dialing compares. */
-function selfListed(publicUrl: string, masterCandidates: string[]): boolean | null {
-  const mine = normalizeUrl(publicUrl.trim());
-  if (mine === '') return null;
-  return masterCandidates.some(url => normalizeUrl(url.trim()) === mine);
+export function promoteReachabilityWarning(reach: Reachability, publicUrl: string, candidates: string[]): string | null {
+  if (reach.verdict === 'listed') return null;
+  const list = candidates.length > 0 ? candidates.join(', ') : 'nothing';
+  if (reach.verdict === 'unlisted') {
+    return `This node (${publicUrl.trim()}) is not in the master list the other instances dial (${list}), so none of them can connect to it. As master it serves alone: ${PROMOTED_ALONE}. Promote anyway only if this machine is meant to serve on its own.`;
+  }
+  return `Whether the other instances can reach this node cannot be determined here: ${reach.why}. They dial ${list}. If none of those is this node, as master it serves alone: ${PROMOTED_ALONE}. Promote anyway only if one of those is this node or this machine is meant to serve on its own.`;
 }
 
 /**

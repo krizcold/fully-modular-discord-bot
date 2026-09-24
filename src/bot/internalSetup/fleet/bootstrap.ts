@@ -97,6 +97,7 @@ import { effectiveFleetConfigView, effectiveMasterUrls, emptyStoreHoldEvidence, 
 import { getLocalReplicaIdentity, getReplicaHealth, getSlotSample, setReplicaProbeListener } from './replicaHealth';
 import { canonicalIsOwnReplica, canonicalStoreReachable, currentCanonicalUrl, hasDbReplica, probeReplica, readTermRow, resolveReplicaEndpoints, spliceFleetCredentials } from './replicaPromotion';
 import { ArmEvidenceInputs, armDeferral, evaluateArmEvidence, ledgerAllowsArm, preArmRefusal, reachabilityWarning } from './armLane';
+import { judgeReachability } from './reachability';
 import { StandInWriteContext, evaluateStandInWrites } from './armWrites';
 import { readReshardPending, readStandbyTermRow } from './armProbe';
 import { clearSlotStatus, readSlotStatus, recordFromPush, sourceMatchesAny, writeSlotStatus } from './slotStatus';
@@ -3975,8 +3976,13 @@ async function initCoWorker(init: CommonInit, followerHold: FollowerHoldBase | n
 
       // Legal but worth saying out loud (F39): 20.9 blesses a solo machine no
       // co-worker can dial, and on one, standing in serves only this machine.
-      const warning = reachabilityWarning(process.env.FLEET_PUBLIC_URL || '', fleetMasterCandidates());
-      if (warning) console.warn(`[Fleet] Stand-in reachability: ${warning}`);
+      // Never awaited: a name lookup must not open a gap before the writes below.
+      void judgeReachability(process.env.FLEET_PUBLIC_URL || '', fleetMasterCandidates(), Number(process.env.CONTROL_PORT) || CONTROL_PORT_DEFAULT)
+        .then(reach => {
+          const warning = reachabilityWarning(reach);
+          if (warning) console.warn(`[Fleet] Stand-in reachability: ${warning}`);
+        })
+        .catch(() => { /* a warning only */ });
 
       // The point of no return: the override makes the next boot a master boot.
       // The attempt is counted by that boot rather than here, so a node that
