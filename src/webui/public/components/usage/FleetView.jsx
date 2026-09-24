@@ -2027,6 +2027,17 @@ function FleetView({ api, wsClient, guildNames }) {
         </div>
       )}
 
+      {fleet.unassigned && fleet.unassigned.length > 0 && (
+        <div className="usage-notice">
+          <div>Unassigned shards: no instance serves their guilds.</div>
+          {fleet.unassigned.map((u) => (
+            <div key={u.shardIds.join(',')} style={{ marginTop: '4px', color: '#fee75c' }}>
+              {`Shard${u.shardIds.length === 1 ? '' : 's'} [${u.shardIds.join(', ')}]: ${u.reason}.`}
+            </div>
+          ))}
+        </div>
+      )}
+
       {fleet.recovery && fleet.recovery.reshardApplied && (
         <div className="usage-notice">
           {`Reshard applied: ${fleet.recovery.reshardApplied.from} -> ${fleet.recovery.reshardApplied.to} shards (FLEET_SHARD_COUNT override); the previous shard plan and ownership records were archived.`}

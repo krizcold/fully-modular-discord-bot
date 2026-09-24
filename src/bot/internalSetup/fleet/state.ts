@@ -102,6 +102,12 @@ export interface PinViolationView {
   reason?: string;
 }
 
+/** Free shards the master could not place, grouped by the reason (B7-F15). */
+export interface UnassignedView {
+  shardIds: number[];
+  reason: string;
+}
+
 export interface FleetState {
   initialized: boolean;
   role: NodeRole;
@@ -244,6 +250,8 @@ export interface FleetState {
   pinViolation: PinViolationView | null;
   /** Fleet master holding more shards than its declared capacity (a master alone takes every shard, B7-F15); null otherwise. */
   overCapacity: { shardIds: number[]; capacity: number } | null;
+  /** Fleet master: shards no instance serves, with why, after the last distribution run; null when every shard is placed or a hold, pause or fence explains the wait. */
+  unassigned: UnassignedView[] | null;
   /** Names for guilds in guildMap the connected clients cannot name (master's REST list); merged UI-side. */
   guildNames?: Record<string, string>;
   /** Standbys attached to the fleet database, read by whoever serves it; null off-postgres or before the first read. */
@@ -495,6 +503,8 @@ export interface FleetStateSources {
   transformation: (() => TransformationView | null) | null;
   /** Pin-violation supplier (fleet master only); null otherwise. */
   pinViolation: (() => PinViolationView | null) | null;
+  /** Unassigned-shard report supplier (fleet master only); null otherwise. */
+  unassigned: (() => UnassignedView[] | null) | null;
   /** Term-stamp health supplier (fleet master on the postgres store only); null otherwise. */
   termStamp: (() => number | null) | null;
   /** Fleet runtime config supplier (B2); null on standalone. */
@@ -600,6 +610,7 @@ export function getFleetState(): FleetState {
       transformation: null,
       pinViolation: null,
       overCapacity: null,
+      unassigned: null,
       updatedAt: Date.now(),
     };
   }
@@ -740,6 +751,7 @@ export function getFleetState(): FleetState {
       overCapacity: !standalone && registry.shardIdsOf(nodeId).length > capacity
         ? { shardIds: registry.shardIdsOf(nodeId), capacity }
         : null,
+      unassigned: sources.unassigned?.() ?? null,
       updatedAt: Date.now(),
     };
   }
@@ -869,6 +881,7 @@ export function getFleetState(): FleetState {
     transformation: null,
     pinViolation: null,
     overCapacity: null,
+    unassigned: null,
     updatedAt: Date.now(),
   };
 }

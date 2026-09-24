@@ -69,7 +69,7 @@ import {
 } from './placement';
 import { evaluateRecovery } from './recovery';
 import { _setControlStoreFenced, _setEmptyStoreHold, _setFleetStateSources, _setFollowerFollowingSupplier, _setFollowerHold, _setFollowerLineage, _setOwnCopyLineage, _setReadOnlyStorePark, _setSlotStatus, _setStaleMasterPark, _setSuperseded, _setTakeoverHold, FleetRecoverySource, FleetRefusedRegistration, FollowerHoldBase, getFleetState } from './state';
-import type { MigrationView, PinViolationView } from './state';
+import type { MigrationView, PinViolationView, UnassignedView } from './state';
 import { serveSyncRequest, SyncAuthority } from './syncAuthority';
 import { SyncEngine } from './syncEngine';
 import { getFrozenStats, getGuildDataBackend, setOwnerInfoProvider } from '../utils/dataManager';
@@ -1824,7 +1824,55 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     }
   }
 
+  // Unassigned shards are never silent (B7-F15): after every distribution
+  // run the master names the free shards it could not place and why, once
+  // per change, and the Fleet tab shows the same report. A fence, a reshard
+  // pause or the recovery hold-down carries its own banner, so the report is
+  // dropped there and starts afresh when distribution resumes.
+  let unassigned: UnassignedView[] | null = null;
+  let unassignedKey = '';
+  function setUnassigned(next: UnassignedView[] | null): void {
+    const key = next ? next.map(u => `${u.shardIds.join(',')}:${u.reason}`).join('|') : '';
+    unassigned = next;
+    if (key === unassignedKey) return;
+    if (next) console.error(`[Fleet] UNASSIGNED shards ${next.map(u => `[${u.shardIds.join(', ')}] ${u.reason}`).join('; ')}`);
+    else if (unassignedKey !== '') console.log('[Fleet] Every shard is assigned again');
+    unassignedKey = key;
+  }
+  function reportUnassigned(): void {
+    const free = registry.freeShards();
+    if (free.length === 0) {
+      setUnassigned(null);
+      return;
+    }
+    const alone = !otherNodeCanHoldShards();
+    const withRoom = [...registry.nodes.values()].filter(n => n.connected && !n.draining
+      && targetFor(n, alone) - registry.shardIdsOf(n.nodeId).length - pendingShardIdsOf(n.nodeId).length > 0);
+    const openReason = withRoom.length === 0
+      ? 'no connected node has free capacity; start another instance or reshard'
+      : withRoom.every(n => ledger?.inBackoff(n.nodeId))
+        ? 'deferred by the identify ledger, retried when its hold ends'
+        : 'placement pending';
+    const groups = new Map<string, number[]>();
+    for (const shardId of free) {
+      const reason = coordinator?.migratingShardIds().has(shardId) || coordinator?.pendingSourceCleanupShardIds().has(shardId)
+          || transformer?.pinnedShardIds().has(shardId)
+        ? 'held back by a migration or transformation in progress'
+        : resumePendingShards.has(shardId)
+          ? 'awaiting its redistribute grant'
+          : timeoutDeclinedShards.has(shardId)
+            ? 'declined after a hydration timeout, retried once a data backend is healthy'
+            : openReason;
+      groups.set(reason, [...(groups.get(reason) ?? []), shardId]);
+    }
+    setUnassigned([...groups].map(([reason, shardIds]) => ({ shardIds, reason })));
+  }
+
   async function distribute(): Promise<void> {
+    if (controlFenced || paused || !graceOver) {
+      unassigned = null;
+      unassignedKey = '';
+    }
     if (controlFenced) return;
     if (paused) return;
     if (!graceOver) {
@@ -1845,6 +1893,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
         distributeQueued = false;
         await distributeOnce();
       } while (distributeQueued);
+      reportUnassigned();
     } catch (error) {
       console.error('[Fleet] Distribute failed:', error);
     } finally {
@@ -3388,6 +3437,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     migration: coordinator ? () => coordinator!.getView() : null,
     transformation: () => transformer?.getView() ?? null,
     pinViolation: standalone ? null : () => pinViolation,
+    unassigned: standalone ? null : () => unassigned,
     termStamp: store instanceof PostgresControlStore && !standalone ? () => store.getStampFailingForMs() : null,
     fleetConfig: () => (fleetConfig ? fleetConfigViewOf(fleetConfig) : null),
     witness: witness ? () => witness!.getStatus() : null,
@@ -3986,6 +4036,7 @@ async function initCoWorker(init: CommonInit, followerHold: FollowerHoldBase | n
     migration: null,
     transformation: null,
     pinViolation: null,
+    unassigned: null,
     termStamp: null,
     fleetConfig: () => effectiveFleetConfigView(),
     witness: witness ? () => witness!.getStatus() : null,
