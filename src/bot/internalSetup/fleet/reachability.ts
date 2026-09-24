@@ -39,23 +39,23 @@ export async function judgeReachability(
 ): Promise<Reachability> {
   const mine = normalizeUrl(publicUrl.trim());
   if (mine !== '' && candidates.some(url => normalizeUrl(url.trim()) === mine)) return { verdict: 'listed' };
-  const unresolved: string[] = [];
-  let own: Set<string> | null = null;
+  const hosts: string[] = [];
   for (const url of candidates) {
-    let host: string;
-    let port: number;
     try {
       const parsed = new URL(url.trim());
-      host = parsed.hostname;
-      port = Number(parsed.port);
+      if (parsed.hostname !== '' && Number(parsed.port) === controlPort) hosts.push(parsed.hostname);
     } catch {
-      continue;
+      // not a URL: nothing any node could dial
     }
-    if (host === '' || port !== controlPort) continue;
-    let addresses: string[];
-    try {
-      addresses = await deps.lookup(host);
-    } catch {
+  }
+  // In parallel, so the wait is one lookup timeout at most.
+  const answers = await Promise.all(hosts.map(host => Promise.resolve()
+    .then(() => deps.lookup(host))
+    .then(addresses => ({ host, addresses }), () => ({ host, addresses: null as string[] | null }))));
+  const unresolved: string[] = [];
+  let own: Set<string> | null = null;
+  for (const { host, addresses } of answers) {
+    if (addresses === null) {
       unresolved.push(host);
       continue;
     }

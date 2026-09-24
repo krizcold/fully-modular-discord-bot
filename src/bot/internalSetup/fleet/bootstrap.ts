@@ -3976,8 +3976,10 @@ async function initCoWorker(init: CommonInit, followerHold: FollowerHoldBase | n
 
       // Legal but worth saying out loud (F39): 20.9 blesses a solo machine no
       // co-worker can dial, and on one, standing in serves only this machine.
-      // Never awaited: a name lookup must not open a gap before the writes below.
-      void judgeReachability(process.env.FLEET_PUBLIC_URL || '', fleetMasterCandidates(), Number(process.env.CONTROL_PORT) || CONTROL_PORT_DEFAULT)
+      // Started before the writes and settled before the restart: a name lookup
+      // must neither open a gap before the point of no return nor die with the
+      // child the restart replaces.
+      const reachabilityLogged = judgeReachability(process.env.FLEET_PUBLIC_URL || '', fleetMasterCandidates(), Number(process.env.CONTROL_PORT) || CONTROL_PORT_DEFAULT)
         .then(reach => {
           const warning = reachabilityWarning(reach);
           if (warning) console.warn(`[Fleet] Stand-in reachability: ${warning}`);
@@ -4017,6 +4019,7 @@ async function initCoWorker(init: CommonInit, followerHold: FollowerHoldBase | n
       });
       invalidateRoleOverrideCache();
       console.error(`[Fleet] STANDING IN for ${termRow!.nodeId} at term ${termRow!.term}: the master is gone on all six checks; restarting to serve READ-ONLY${designation?.mode === 'active' ? '' : ' (the master\'s key was turned by the local emergency lever)'}`);
+      await reachabilityLogged;
       requestStepDownRestart();
     } catch (error) {
       console.warn('[Fleet] Stand-in evaluation failed:', error instanceof Error ? error.message : error);
