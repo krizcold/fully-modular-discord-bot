@@ -2626,6 +2626,12 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
         .catch(() => { posturePushed.delete(node.nodeId); });
     }
   };
+  // The boot clear relaxed the cluster without a word, so the row a
+  // predecessor left can still say ARMED while writes no longer wait for any
+  // copy (B7-F23). Attested before the control server opens, so every node
+  // that registers is handed it at once, and a master that dies during its
+  // own boot has still said so.
+  if (bootRelaxed && !standalone && !controlFenced) publishSyncPosture({ state: 'relaxed', slotName: null, nodeId: null, heldToLsn: null });
 
   if (!standalone) {
     const secret = (process.env.CONTROL_SECRET || '').trim();
@@ -3367,11 +3373,6 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   // acknowledged write. Inert until an operator enables active mode on a node
   // that also consents to it, which is nobody by default.
   if (!standalone && !controlFenced && !serveOnly && resolveDataBackend() === 'postgres') {
-    // The boot clear relaxed the cluster without a word, so the row a
-    // predecessor left can still say ARMED while writes no longer wait for any
-    // copy (B7-F23). Attested here, before the engine's first sample, so a
-    // master that dies during its own boot has still said so.
-    if (bootRelaxed) publishSyncPosture({ state: 'relaxed', slotName: null, nodeId: null, heldToLsn: null });
     const engine = startSyncPostureEngine({
       url: () => getActiveBackendUrl(),
       publish: fact => publishSyncPosture(fact),
