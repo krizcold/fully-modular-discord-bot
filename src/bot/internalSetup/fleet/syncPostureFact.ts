@@ -227,8 +227,17 @@ export function syncPostureVerdict(evidence: SyncPostureEvidence, now = Date.now
   // exactly as a slot verdict from a former master is not (D16).
   if (sourceIsCurrentMaster !== true) return no('this copy does not follow the master that recorded the posture');
 
-  // The fast disarm: a fresh pushed fact that contradicts wins outright.
-  const pushedIsFresh = pushed !== null && now - pushed.receivedAt < SYNC_POSTURE_FRESH_MS;
+  // Two facts from one master are ordered by (term, seq), two counters that
+  // master owns: the term steps on every boot and the seq on every attestation
+  // within one, so neither a clock step nor a restart reorders them. Null when
+  // they are not comparable (no row yet, or another master).
+  const order = pushed !== null && replayed !== null && pushed.masterNodeId === replayed.fact.masterNodeId
+    ? (pushed.term !== replayed.fact.term ? Math.sign(pushed.term - replayed.fact.term) : Math.sign(pushed.seq - replayed.fact.seq))
+    : null;
+  // The fast disarm: a fresh pushed fact that contradicts wins outright, unless
+  // the row this copy replayed is a LATER attestation that has superseded it
+  // (a relax still being re-sent across the re-arm that followed it).
+  const pushedIsFresh = pushed !== null && now - pushed.receivedAt < SYNC_POSTURE_FRESH_MS && order !== -1;
   if (pushedIsFresh && pushed!.state !== 'armed') return no('the master has since said it was waiting for no copy');
   if (pushedIsFresh && pushed!.slotName !== mySlotName) return no('the master has since said it was waiting for a different copy');
 
@@ -241,16 +250,12 @@ export function syncPostureVerdict(evidence: SyncPostureEvidence, now = Date.now
     return no('the replayed posture came from a different master than the one now speaking');
   }
   // A later attestation from the same master outranks the replayed row at ANY
-  // age. Later is (term, seq), two counters the master owns: the term steps on
-  // every boot and the seq on every attestation within one, so neither a clock
-  // step nor a restart reorders them. The relax it carries is the one a copy
-  // whose stream broke first never replays (B7-F23). The window above expires
-  // stale positives; a later negative does not become true by ageing.
-  const later = pushed !== null && pushed.masterNodeId === replayed.fact.masterNodeId
-    && (pushed.term > replayed.fact.term || (pushed.term === replayed.fact.term && pushed.seq > replayed.fact.seq));
-  if (later) {
-    if (pushed.state !== 'armed') return no('the master later said it was waiting for no copy, and this copy never replayed that relax');
-    if (pushed.slotName !== mySlotName) return no('the master later said it was waiting for a different copy');
+  // age: the relax it carries is the one a copy whose stream broke first never
+  // replays (B7-F23). The window above expires stale positives; a later
+  // negative does not become true by ageing.
+  if (order === 1) {
+    if (pushed!.state !== 'armed') return no('the master later said it was waiting for no copy, and this copy never replayed that relax');
+    if (pushed!.slotName !== mySlotName) return no('the master later said it was waiting for a different copy');
   }
   // F23's rule, and the one that closes the unilateral degrade: if this copy
   // has replayed transactions from after the last attestation, WAL kept
