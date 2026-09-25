@@ -3324,7 +3324,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   const POSTURE_PUSH_MAX_AGE_MS = 90_000;
   /** A relax is re-sent to each node this often, the cadence an ARMED posture is re-attested at. */
   const POSTURE_RELAX_RESEND_MS = 30_000;
-  const posturePushed = new Map<string, number>();
+  const posturePushed = new Map<string, string>();
   const posturePushedAt = new Map<string, number>();
   const pushSyncPosture = (): void => {
     if (posturePending) void drainPostureWrites();
@@ -3337,6 +3337,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     // master relaxed (B7-F23), so it is re-sent while the node is here.
     const relaxed = fact.state !== 'armed';
     if (!relaxed && Date.now() - fact.updatedAt >= POSTURE_PUSH_MAX_AGE_MS) return;
+    const attestation = `${fact.term}:${fact.seq}`;
     for (const node of registry.nodes.values()) {
       // Forgetting a node that is gone is what re-delivers the current fact to
       // it when it comes back, instead of leaving it to wait out a refresh.
@@ -3347,8 +3348,8 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       // Once per ATTESTATION, not once per tick: the receiver stamps its own
       // freshness clock on arrival, so re-sending an unchanged fact would keep
       // renewing a claim the master had stopped making.
-      if (posturePushed.get(node.nodeId) === fact.updatedAt && (!relaxed || Date.now() - (posturePushedAt.get(node.nodeId) ?? 0) < POSTURE_RELAX_RESEND_MS)) continue;
-      posturePushed.set(node.nodeId, fact.updatedAt);
+      if (posturePushed.get(node.nodeId) === attestation && (!relaxed || Date.now() - (posturePushedAt.get(node.nodeId) ?? 0) < POSTURE_RELAX_RESEND_MS)) continue;
+      posturePushed.set(node.nodeId, attestation);
       posturePushedAt.set(node.nodeId, Date.now());
       void server?.request(node.nodeId, MSG.SYNC_POSTURE, fact)
         .catch(() => { posturePushed.delete(node.nodeId); });
