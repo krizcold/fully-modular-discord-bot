@@ -2983,11 +2983,6 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
         ledgerDeferWarnAt.delete(payload.nodeId);
         ledger?.onRegister(payload.nodeId);
         console.log(`[Fleet] Node registered: ${payload.nodeName} (${payload.nodeId})`);
-        // The current posture goes out the moment a node registers: one whose
-        // control connection was down for a relax must not wait out a
-        // heartbeat for it (B7-F23).
-        posturePushed.delete(payload.nodeId);
-        pushSyncPosture();
         // A backup-master's designation is env-seeded into the runtime config
         // on its first registration; from then on the stored list owns the
         // ORDER, and env stays the trigger: a node whose env no longer says
@@ -3114,6 +3109,11 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
         // Sync rides the control channel and never delays lease traffic:
         // push the current manifest fire-and-forget beside the reconcile.
         void syncAuthority!.pushTo(registeredNodeId);
+        // The current posture too, now that the socket is on record: a node
+        // whose control connection was down for a relax must not wait out a
+        // heartbeat for it (B7-F23).
+        posturePushed.delete(registeredNodeId);
+        pushSyncPosture();
         void (async () => {
           try {
             await reconcileHeldLeases(registeredNodeId);
