@@ -350,6 +350,13 @@ export function startSyncPostureEngine(inputs: {
           await drop(live, 'an armed posture was found with no watchdog behind it');
           return;
         }
+        // The boot clear relaxes the cluster without a word, so the row a
+        // predecessor left can still say ARMED while writes no longer wait for
+        // any copy (B7-F23). The first sample that confirms the relax attests it.
+        if (state === 'relaxed' && publishedAt === 0 && now.armedNames.trim() === '') {
+          publishedAt = Date.now();
+          inputs.publish?.({ state: 'relaxed', slotName: null, nodeId: null, heldToLsn: null });
+        }
       }
 
       // A cancelled wait means an acknowledged write may live on this machine
