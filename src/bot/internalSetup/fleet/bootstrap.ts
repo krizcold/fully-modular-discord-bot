@@ -3319,7 +3319,10 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   // watchdog that died cannot keep an "armed" claim alive by repetition; the
   // receiver's window then expires and the claim disarms itself.
   const POSTURE_PUSH_MAX_AGE_MS = 90_000;
+  /** A relax is re-sent to each node this often, the cadence an ARMED posture is re-attested at. */
+  const POSTURE_RELAX_RESEND_MS = 30_000;
   const posturePushed = new Map<string, number>();
+  const posturePushedAt = new Map<string, number>();
   const pushSyncPosture = (): void => {
     if (posturePending) void drainPostureWrites();
     const fact = publishedPosture;
@@ -3328,7 +3331,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     // watchdog cannot keep an ARMED claim alive by repetition. A relax is the
     // opposite fact: it has no refresh to ride, the receiver acks it before
     // filing it, and a copy that never filed it reads as in sync after the
-    // master relaxed (B7-F23), so it goes on every tick while the node is here.
+    // master relaxed (B7-F23), so it is re-sent while the node is here.
     const relaxed = fact.state !== 'armed';
     if (!relaxed && Date.now() - fact.updatedAt >= POSTURE_PUSH_MAX_AGE_MS) return;
     for (const node of registry.nodes.values()) {
@@ -3338,8 +3341,9 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       // Once per ATTESTATION, not once per tick: the receiver stamps its own
       // freshness clock on arrival, so re-sending an unchanged fact would keep
       // renewing a claim the master had stopped making.
-      if (!relaxed && posturePushed.get(node.nodeId) === fact.updatedAt) continue;
+      if (posturePushed.get(node.nodeId) === fact.updatedAt && (!relaxed || Date.now() - (posturePushedAt.get(node.nodeId) ?? 0) < POSTURE_RELAX_RESEND_MS)) continue;
       posturePushed.set(node.nodeId, fact.updatedAt);
+      posturePushedAt.set(node.nodeId, Date.now());
       void server?.request(node.nodeId, MSG.SYNC_POSTURE, fact)
         .catch(() => { posturePushed.delete(node.nodeId); });
     }
