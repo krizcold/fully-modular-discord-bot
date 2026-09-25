@@ -3312,6 +3312,9 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     publishedPosture = stamped;
     posturePending = stamped;
     void drainPostureWrites();
+    // Pushed now rather than on the next heartbeat: a master that dies inside
+    // those 5 s has already acknowledged writes the copy never saw (B7-F23).
+    pushSyncPosture();
   };
 
   // The second carrier: the same fact on the push lane, for display and for the
