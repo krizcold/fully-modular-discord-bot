@@ -10,13 +10,13 @@
 // forked child), so the decision ends in an IPC request and the parent answers
 // by rewriting the arm record.
 
-import { PEER_TERM_PROBE_MS, WITNESS_FRESH_WINDOW_MS } from './constants';
-import { ArmEvidenceInputs, writeStepTiming, writeStepVerdict } from './armLane';
+import { PEER_TERM_PROBE_MS } from './constants';
+import { ArmEvidenceInputs, freeArmTerms, writeStepTiming, writeStepVerdict } from './armLane';
 import { readArmRecord, writeArmRecord } from './armRecord';
 import { probePeerTerm } from './peerTermProbe';
 import { readPromoteRecord } from './promoteRecord';
 import { canonicalStoreReachable, probeReplica } from './replicaPromotion';
-import { freshMasterClaim, requestStandInWrites } from './stepDown';
+import { requestStandInWrites } from './stepDown';
 import { readReplayedSyncPosture, readSyncPostureRecord, syncPostureVerdict } from './syncPostureFact';
 import type { WitnessStatus } from './witness';
 
@@ -85,16 +85,15 @@ export async function evaluateStandInWrites(ctx: StandInWriteContext, renewOk: b
     // The same six terms the arm required, gathered again from where a serving
     // master stands: no control client exists here, so the covered master is
     // asked directly through the fence's own peer probe.
-    const readFresh = status.lastReadAt !== null && now - status.lastReadAt <= WITNESS_FRESH_WINDOW_MS;
+    const free = freeArmTerms(status, ctx.nodeId, now, id => ctx.peerRegisteredHere(id));
     const cheap = {
       ownRenewOk: renewOk,
-      masterBeaconDark: readFresh && freshMasterClaim(status, ctx.nodeId, now) === null,
-      noPeerSeesMaster: !status.claims.some(c =>
-        c.nodeId !== ctx.nodeId && now - c.observedAt <= WITNESS_FRESH_WINDOW_MS && c.masterSeen === true && !ctx.peerRegisteredHere(c.nodeId)),
+      masterBeaconDark: free.masterBeaconDark,
+      noPeerSeesMaster: free.noPeerSeesMaster,
     };
     // Free evidence first; the connections below are only opened once it agrees.
     // Passing the costly terms as satisfied is safe because this call can only refuse.
-    const cheapVerdict = writeStepVerdict({ ...cheap, masterUnreachable: true, storeUnreachable: true, receiverStopped: true }, { inSync: true, heldToLsn: null, reason: '' });
+    const cheapVerdict = writeStepVerdict({ ...cheap, masterUnreachable: true, storeUnreachable: true, receiverStopped: true }, { inSync: true, heldToLsn: null, reason: '' }, free.absent);
     if (!cheapVerdict.arm) {
       noteGate(`writes not taken: ${cheapVerdict.reason}`);
       return;
@@ -125,7 +124,7 @@ export async function evaluateStandInWrites(ctx: StandInWriteContext, renewOk: b
       mySlotName: copy.slotName ?? null,
       sourceIsCurrentMaster: replayed !== null && replayed.fact.masterNodeId === ctx.coveringNodeId && pushed?.sourceIsCurrentMaster !== false,
     }, now);
-    const verdict = writeStepVerdict(evidence, sync);
+    const verdict = writeStepVerdict(evidence, sync, free.absent);
     if (!verdict.arm) {
       noteGate(`writes not taken: ${verdict.reason}`);
       return;

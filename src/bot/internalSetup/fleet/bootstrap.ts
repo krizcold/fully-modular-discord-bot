@@ -96,7 +96,7 @@ import type { ControlStore, PersistedFleetConfig, PersistedTerm, TransformDirect
 import { effectiveFleetConfigView, effectiveMasterUrls, emptyStoreHoldEvidence, fleetConfigViewOf, fleetMasterCandidates, forcePassive, readFleetConfigCache, rememberBackups, validateMasterCandidates, renumberDesignations, validateBackupDesignations, validateWitnessChannelId, writeFleetConfigCache } from './fleetConfig';
 import { getLocalReplicaIdentity, getReplicaHealth, getSlotSample, setReplicaProbeListener } from './replicaHealth';
 import { canonicalIsOwnReplica, canonicalStoreReachable, currentCanonicalUrl, hasDbReplica, probeReplica, readTermRow, resolveReplicaEndpoints, spliceFleetCredentials } from './replicaPromotion';
-import { ArmEvidenceInputs, armDeferral, evaluateArmEvidence, ledgerAllowsArm, missingArmTerms, preArmRefusal, reachabilityWarning } from './armLane';
+import { ArmEvidenceInputs, armDeferral, evaluateArmEvidence, freeArmTerms, ledgerAllowsArm, missingArmTerms, preArmRefusal, reachabilityWarning } from './armLane';
 import { judgeReachability } from './reachability';
 import { StandInWriteContext, evaluateStandInWrites } from './armWrites';
 import { readReshardPending, readStandbyTermRow } from './armProbe';
@@ -114,7 +114,6 @@ import {
   clearSuperseded,
   copyBlockEndpoint,
   freshHigherTermClaim,
-  freshMasterClaim,
   hasFreshFleetConfirm,
   notifyStepDown,
   readCopyBlock,
@@ -3867,16 +3866,15 @@ async function initCoWorker(init: CommonInit, followerHold: FollowerHoldBase | n
     armInFlight = true;
     try {
       const now = Date.now();
-      // A witness that could not be READ is not evidence of a dark master; it is
-      // evidence of nothing. freshMasterClaim returns null for both, so the read
-      // freshness is checked separately rather than folded into it.
-      const readFresh = status.lastReadAt !== null && now - status.lastReadAt <= WITNESS_FRESH_WINDOW_MS;
+      // The witness terms are judged as of the last READ: an unread witness is
+      // evidence of nothing, and a claim's age advances on the clock while this
+      // node's knowledge of it does not (B7-F22).
+      const free = freeArmTerms(status, nodeId, now);
       const cheap = {
         ownRenewOk: renewOk,
         masterUnreachable: controlClient?.masterKnown() !== true,
-        masterBeaconDark: readFresh && freshMasterClaim(status, nodeId, now) === null,
-        noPeerSeesMaster: !status.claims.some(c =>
-          c.nodeId !== nodeId && now - c.observedAt <= WITNESS_FRESH_WINDOW_MS && c.masterSeen === true),
+        masterBeaconDark: free.masterBeaconDark,
+        noPeerSeesMaster: free.noPeerSeesMaster,
       };
       // The last two terms each cost a database connection, so they are gathered
       // only once the free evidence agrees. Passing them as satisfied here is
@@ -3884,7 +3882,7 @@ async function initCoWorker(init: CommonInit, followerHold: FollowerHoldBase | n
       // against the measured values.
       const cheapVerdict = evaluateArmEvidence({ ...cheap, storeUnreachable: true, receiverStopped: true });
       // A term whose fact is ABSENT is reported as unknown, never as the opposite fact.
-      const beaconAbsent = readFresh ? {} : { masterBeaconDark: 'the witness could not be read inside the fresh window, so whether a master beacon is fresh is unknown' };
+      const beaconAbsent = free.absent;
       if (!cheapVerdict.arm) {
         reportNoArm(missingArmTerms({ ...cheap, storeUnreachable: true, receiverStopped: true }, beaconAbsent), UNREAD_DB_TERMS, cheap.masterUnreachable);
         return;
@@ -3955,7 +3953,7 @@ async function initCoWorker(init: CommonInit, followerHold: FollowerHoldBase | n
         splitControlStore: split,
         contestedTerm: termRow !== null && status.claims.some(c =>
           c.nodeId !== nodeId
-          && now - c.observedAt <= WITNESS_FRESH_WINDOW_MS
+          && free.readAt - c.observedAt <= WITNESS_FRESH_WINDOW_MS
           && (c.role === 'master' || c.standingInFor !== undefined)
           && c.term >= termRow.term),
       });

@@ -14,6 +14,7 @@ import { ARM_MAX_ATTEMPTS, ARM_SPACING_MS, STANDIN_WRITE_REQUEST_STALE_MS, WITNE
 import { ArmRecord } from './armRecord';
 import type { Reachability } from './reachability';
 import type { SyncPostureVerdict } from './syncPostureFact';
+import type { WitnessClaim, WitnessStatus } from './witness';
 
 /**
  * The six-term conjunction. Each is stated so that TRUE means "consistent with
@@ -49,12 +50,15 @@ const TERMS: Array<{ key: keyof ArmEvidenceInputs; missing: string }> = [
  * Ordered cheapest-first so a caller can gather lazily: the two terms that cost
  * a database connection sit last and are only reached when the free ones agree.
  */
-export function evaluateArmEvidence(inputs: ArmEvidenceInputs): ArmVerdict {
+export function evaluateArmEvidence(inputs: ArmEvidenceInputs, absent: AbsentTerms = {}): ArmVerdict {
   for (const term of TERMS) {
-    if (inputs[term.key] !== true) return { arm: false, reason: term.missing };
+    if (inputs[term.key] !== true) return { arm: false, reason: absent[term.key] ?? term.missing };
   }
   return { arm: true };
 }
+
+/** Texts that replace a term's default in a report: a fact that could not be gathered, named as unknown. */
+export type AbsentTerms = Partial<Record<keyof ArmEvidenceInputs, string>>;
 
 /**
  * Every term that held against the arm, in the same order: the whole reason this
@@ -62,8 +66,49 @@ export function evaluateArmEvidence(inputs: ArmEvidenceInputs): ArmVerdict {
  * fact could not be gathered is named by the caller's `absent` text instead of
  * the term's own, which would assert the opposite fact.
  */
-export function missingArmTerms(inputs: ArmEvidenceInputs, absent: Partial<Record<keyof ArmEvidenceInputs, string>> = {}): string[] {
+export function missingArmTerms(inputs: ArmEvidenceInputs, absent: AbsentTerms = {}): string[] {
   return TERMS.filter(term => inputs[term.key] !== true).map(term => absent[term.key] ?? term.missing);
+}
+
+export const WITNESS_UNREAD = 'the witness could not be read inside the fresh window, so whether a master beacon is fresh is unknown';
+export const PEER_UNREAD = 'whether another backup still sees the master is unknown for the same reason';
+
+export interface FreeArmTerms {
+  /** The last read is inside the fresh window, so the claims are knowledge and not history. */
+  readFresh: boolean;
+  /** When the claims were read; every claim's age is judged as of it, never as of the clock. */
+  readAt: number;
+  /** The freshest serving beacon (a master or a stand-in) as of the read; null when none, or when the read is stale. */
+  beacon: WitnessClaim | null;
+  masterBeaconDark: boolean;
+  noPeerSeesMaster: boolean;
+  /** What a report says in place of the two witness terms. */
+  absent: AbsentTerms;
+}
+
+/**
+ * Terms (a) and (f) from the witness as it stood at the LAST READ. A claim's age
+ * advances on the clock while this node's knowledge of it does not, so with
+ * reads failing a claim would cross the window up to one renew period before the
+ * read itself does, and a stale reading would assert a dark beacon nobody
+ * observed (B7-F22). The read is judged against the clock, the claims against
+ * the read; an unread witness leaves both terms unknown.
+ */
+export function freeArmTerms(status: WitnessStatus, selfNodeId: string, now: number, ignorePeer: (nodeId: string) => boolean = () => false): FreeArmTerms {
+  const readAt = status.lastReadAt ?? 0;
+  const readFresh = status.lastReadAt !== null && now - readAt <= WITNESS_FRESH_WINDOW_MS;
+  if (!readFresh) {
+    return { readFresh, readAt, beacon: null, masterBeaconDark: false, noPeerSeesMaster: false, absent: { masterBeaconDark: WITNESS_UNREAD, noPeerSeesMaster: PEER_UNREAD } };
+  }
+  let beacon: WitnessClaim | null = null;
+  for (const claim of status.claims) {
+    if (claim.nodeId === selfNodeId || readAt - claim.observedAt > WITNESS_FRESH_WINDOW_MS) continue;
+    if (claim.role !== 'master' && claim.standingInFor === undefined) continue;
+    if (!beacon || claim.term > beacon.term) beacon = claim;
+  }
+  const peerSees = status.claims.some(c =>
+    c.nodeId !== selfNodeId && readAt - c.observedAt <= WITNESS_FRESH_WINDOW_MS && c.masterSeen === true && !ignorePeer(c.nodeId));
+  return { readFresh, readAt, beacon, masterBeaconDark: beacon === null, noPeerSeesMaster: !peerSees, absent: {} };
 }
 
 export interface PreArmInputs {
@@ -231,8 +276,8 @@ export function writeStepTiming(record: ArmRecord, now: number): WriteStepTiming
  * operator's RPO confirm; without it the lane keeps serving read-only and the
  * manual promote with its confirm stays the exit (20.5, F9).
  */
-export function writeStepVerdict(evidence: ArmEvidenceInputs, sync: SyncPostureVerdict): ArmVerdict {
-  const gone = evaluateArmEvidence(evidence);
+export function writeStepVerdict(evidence: ArmEvidenceInputs, sync: SyncPostureVerdict, absent: AbsentTerms = {}): ArmVerdict {
+  const gone = evaluateArmEvidence(evidence, absent);
   if (!gone.arm) return gone;
   if (!sync.inSync) {
     return { arm: false, reason: `this copy was not provably in sync when the master died (${sync.reason}), so taking writes needs a manual promote with its RPO confirm` };
