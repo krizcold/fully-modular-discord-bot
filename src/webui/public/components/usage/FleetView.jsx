@@ -1175,7 +1175,8 @@ function FleetPromoteCard({ api, fleet, reload }) {
   // alive, and the claims snapshot is whatever the last SUCCESSFUL read saw.
   const witnessRead = !!(fleet.witness && fleet.witness.lastReadAt != null && Date.now() - fleet.witness.lastReadAt < freshMs);
   const claims = (fleet.witness && fleet.witness.claims) || [];
-  const preferred = mine && witnessRead ? order.filter((d) => d.priority < mine.priority && claims.some((c) => c.nodeId === d.nodeId && Date.now() - c.observedAt < freshMs)) : [];
+  // Claims are aged as of the read that delivered them, like the arm lane does.
+  const preferred = mine && witnessRead ? order.filter((d) => d.priority < mine.priority && claims.some((c) => c.nodeId === d.nodeId && fleet.witness.lastReadAt - c.observedAt < freshMs)) : [];
   const nameOf = (id) => { const n = (fleet.nodes || []).find((x) => x.nodeId === id); return n ? n.nodeName : id.slice(0, 8); };
   // Unified promote (PLAN_REPLICATION 20.4): ONE action moves the whole side.
   // The verdict is the engine's; the card only names the likely path and
