@@ -3703,14 +3703,17 @@ async function initCoWorker(init: CommonInit, followerHold: FollowerHoldBase | n
       },
       onSyncPosture: payload => {
         // Filed whatever it names: a fact that names ANOTHER copy is exactly
-        // how this node learns it is not the one being waited for.
+        // how this node learns it is not the one being waited for. Filed
+        // before the copy has ever been probed too, with the source unknown: a
+        // relax that arrives while the local database is still coming up must
+        // not be dropped (B7-F23).
+        if (!hasDbReplica()) return;
         const identity = getLocalReplicaIdentity();
-        if (!identity?.slotName) return;
         // A copy out of recovery (promoted) follows no master's posture, the
         // same refusal the slot handler makes on the same evidence.
         const health = getReplicaHealth();
         if (health && !health.error && !health.inRecovery) return;
-        const record = recordFromPosturePush(payload, identity.sourceHost ? sourceMatchesAny(identity, getDeliveredBackendUrls()) : null);
+        const record = recordFromPosturePush(payload, identity?.sourceHost ? sourceMatchesAny(identity, getDeliveredBackendUrls()) : null);
         if (record) writeSyncPostureRecord(record);
       },
       onXferControl: (type, data) => executor!.handle(type, data),
