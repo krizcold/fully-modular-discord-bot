@@ -220,7 +220,11 @@ export function masterStoreDeadNow(claim: WitnessClaim | null, status: WitnessSt
   // store would unlock the lossy path in the very case that loses most (F20).
   if (!claim || claim.storeState !== 'dead') return false;
   if (status.lastReadAt === null || now - status.lastReadAt > WITNESS_CURRENT_WINDOW_MS) return false;
-  return status.lastReadAt - claim.observedAt <= WITNESS_CURRENT_WINDOW_MS;
+  // On the CLOCK, unlike the fresh-claim helpers above: this fact unlocks the
+  // lossy path while it looks fresh, so the conservative reading is the older
+  // one, and the current window already budgets the read's age and the edit's
+  // age together (constants.ts).
+  return now - claim.observedAt <= WITNESS_CURRENT_WINDOW_MS;
 }
 
 /** Child -> parent: the co-worker override is staged, restart me (B4 step-down). */

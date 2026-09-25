@@ -6,6 +6,7 @@ import { BotManager } from './botManager';
 import { clearRoleOverride, consentsToActiveMode, getNodeId, getNodeName, invalidateRoleOverrideCache, isBackupMaster, isStandalone, resolveEnvRole, resolveNodeRole, writeRoleOverride } from '../bot/internalSetup/fleet/nodeIdentity';
 import { effectiveMasterUrls } from '../bot/internalSetup/fleet/fleetConfig';
 import { isContainerPinned, loadCredentials, removeCredentials } from '../utils/envLoader';
+import { WITNESS_FRESH_WINDOW_MS } from '../bot/internalSetup/fleet/constants';
 import { freshMasterClaim, readSuperseded } from '../bot/internalSetup/fleet/stepDown';
 import { readArmRecord } from '../bot/internalSetup/fleet/armRecord';
 import { closeStandInLane } from '../bot/internalSetup/fleet/episodeRecord';
@@ -101,7 +102,11 @@ export async function runDemote(
           ? 'no master candidates configured (set MASTER_URLS first, or the demoted node would idle)'
         : null;
       if (refusal) return { success: false, error: refusal };
-      const successor = state.witness ? freshMasterClaim(state.witness, state.nodeId, Date.now()) : null;
+      // A successor SKIPS the warning below, so it must look fresh on the clock
+      // as well as at the read: a beacon that may have gone dark since the last
+      // read is no reason to demote without the confirm.
+      const seen = state.witness ? freshMasterClaim(state.witness, state.nodeId, Date.now()) : null;
+      const successor = seen && Date.now() - seen.observedAt <= WITNESS_FRESH_WINDOW_MS ? seen : null;
       // A follower hold is a visible holder too: the node it follows is the
       // coordinator, and this node coordinates nobody, so its demote freezes
       // nothing.
