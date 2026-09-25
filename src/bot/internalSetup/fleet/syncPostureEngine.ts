@@ -188,6 +188,8 @@ export function startSyncPostureEngine(inputs: {
    * the same guarantee, and only this process can disarm on them (F24).
    */
   foreignCancelAt?: () => number;
+  /** Whether this process has already published a posture fact (the boot attestation), so the engine's own is redundant. */
+  attested?: () => boolean;
 }): SyncPostureEngine {
   let client: Client | null = null;
   let clientUrl = '';
@@ -350,10 +352,10 @@ export function startSyncPostureEngine(inputs: {
           await drop(live, 'an armed posture was found with no watchdog behind it');
           return;
         }
-        // The boot clear relaxes the cluster without a word, so the row a
-        // predecessor left can still say ARMED while writes no longer wait for
-        // any copy (B7-F23). The first sample that confirms the relax attests it.
-        if (state === 'relaxed' && publishedAt === 0 && now.armedNames.trim() === '') {
+        // A boot whose clear failed attests nothing, and the cluster may still
+        // have come up relaxed under a predecessor's ARMED row: the first sample
+        // that confirms the relax attests it, unless this process already has.
+        if (state === 'relaxed' && publishedAt === 0 && now.armedNames.trim() === '' && inputs.attested?.() !== true) {
           publishedAt = Date.now();
           inputs.publish?.({ state: 'relaxed', slotName: null, nodeId: null, heldToLsn: null });
         }

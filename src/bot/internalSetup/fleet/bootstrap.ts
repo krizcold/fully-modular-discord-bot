@@ -1044,7 +1044,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   // cluster it does not serve from. The copy's OWN inherited
   // synchronous_standby_names still has to go, but only when it leaves recovery,
   // which is the write step's job.
-  if (!serveOnly) await clearOwnSyncPosture();
+  const bootRelaxed = serveOnly ? false : await clearOwnSyncPosture();
   const store = serveOnly ? createStandInControlStore(standInUrl) : await prepareControlStore(standalone).catch((error: unknown) => {
     if (error instanceof ControlStoreReadOnlyError) return parkOnReadOnlyStore(error);
     throw error;
@@ -3361,9 +3361,15 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   // acknowledged write. Inert until an operator enables active mode on a node
   // that also consents to it, which is nobody by default.
   if (!standalone && !controlFenced && !serveOnly && resolveDataBackend() === 'postgres') {
+    // The boot clear relaxed the cluster without a word, so the row a
+    // predecessor left can still say ARMED while writes no longer wait for any
+    // copy (B7-F23). Attested here, before the engine's first sample, so a
+    // master that dies during its own boot has still said so.
+    if (bootRelaxed) publishSyncPosture({ state: 'relaxed', slotName: null, nodeId: null, heldToLsn: null });
     const engine = startSyncPostureEngine({
       url: () => getActiveBackendUrl(),
       publish: fact => publishSyncPosture(fact),
+      attested: () => publishedPosture !== null,
       foreignCancelAt: () => {
         let newest = 0;
         for (const node of registry.nodes.values()) {

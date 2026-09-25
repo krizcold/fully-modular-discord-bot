@@ -83,16 +83,19 @@ export async function clearSyncPosture(url: string): Promise<{ ok: boolean; erro
  * The master's own boot clear. A file-mode fleet has no cluster to relax, and a
  * node with no backend url yet cannot be reached, so both are silent no-ops:
  * this runs before the control store exists and must never hold up a boot.
+ * Resolves true only when the cluster was actually relaxed, which is what the
+ * boot attestation rests on.
  */
-export async function clearOwnSyncPosture(): Promise<void> {
+export async function clearOwnSyncPosture(): Promise<boolean> {
   // Keyed on the backend KIND, not on the url alone: a url left over from a
   // postgres phase outlives the flip back to file, and dialing it would relax
   // a cluster this node no longer serves from.
-  if (resolveDataBackend() !== 'postgres') return;
+  if (resolveDataBackend() !== 'postgres') return false;
   const url = (loadCredentials().DATA_BACKEND_URL || '').trim();
-  if (!url) return;
+  if (!url) return false;
   const cleared = await clearSyncPosture(url);
   if (!cleared.ok) {
     console.warn(`[Fleet] Could not relax the synchronous posture at boot (a database that came back armed would hang its first write): ${cleared.error}`);
   }
+  return cleared.ok;
 }
