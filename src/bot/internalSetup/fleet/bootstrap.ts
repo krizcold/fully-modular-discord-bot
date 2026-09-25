@@ -2546,6 +2546,87 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   masterTransformResume = () => transformer!.resume();
   masterTransformAbort = () => transformer!.abort();
 
+  // The in-sync fact (B6 map F23). The watchdog publishes fire and forget, so
+  // identity is stamped here and writes are serialised with latest-wins: an
+  // older publish that overtakes a newer one must never become the stored
+  // truth, and the stored truth is what every standby replays.
+  let publishedPosture: SyncPosturePayload | null = null;
+  let posturePending: SyncPosturePayload | null = null;
+  let postureSeq = 0;
+  let postureWriting = false;
+  const drainPostureWrites = async (): Promise<void> => {
+    if (postureWriting) return;
+    postureWriting = true;
+    try {
+      while (posturePending) {
+        const next = posturePending;
+        posturePending = null;
+        try {
+          await store.saveSyncPosture(next);
+        } catch (error) {
+          console.warn(`[Fleet] Could not record the synchronous posture: ${error instanceof Error ? error.message : error}`);
+          // Requeued, never dropped: this row is the carrier that survives the
+          // master's death, so a lost write could strand every standby holding
+          // an "armed" attestation nothing will ever correct. Retried on the
+          // heartbeat tick rather than here, because a store that is down would
+          // spin this loop.
+          if (!posturePending) posturePending = next;
+          break;
+        }
+      }
+    } finally {
+      postureWriting = false;
+    }
+  };
+  const publishSyncPosture = (fact: { state: 'armed' | 'relaxed'; slotName: string | null; nodeId: string | null; heldToLsn: string | null }): void => {
+    const stamped: SyncPosturePayload = { ...fact, updatedAt: Date.now(), masterNodeId: nodeId, term: registry.term, seq: ++postureSeq };
+    publishedPosture = stamped;
+    posturePending = stamped;
+    void drainPostureWrites();
+    // Pushed now rather than on the next heartbeat: a master that dies inside
+    // those 5 s has already acknowledged writes the copy never saw (B7-F23).
+    pushSyncPosture();
+  };
+
+  // The second carrier: the same fact on the push lane, for display and for the
+  // fast path. It STOPS being pushed once it outlives its own refresh, so a
+  // watchdog that died cannot keep an "armed" claim alive by repetition; the
+  // receiver's window then expires and the claim disarms itself.
+  const POSTURE_PUSH_MAX_AGE_MS = 90_000;
+  /** A relax is re-sent to each node this often, the cadence an ARMED posture is re-attested at. */
+  const POSTURE_RELAX_RESEND_MS = 30_000;
+  const posturePushed = new Map<string, string>();
+  const posturePushedAt = new Map<string, number>();
+  const pushSyncPosture = (): void => {
+    if (posturePending) void drainPostureWrites();
+    const fact = publishedPosture;
+    if (!fact) return;
+    // The age cap and the once-per-attestation rule below exist so a dead
+    // watchdog cannot keep an ARMED claim alive by repetition. A relax is the
+    // opposite fact: it has no refresh to ride, the receiver acks it before
+    // filing it, and a copy that never filed it reads as in sync after the
+    // master relaxed (B7-F23), so it is re-sent while the node is here.
+    const relaxed = fact.state !== 'armed';
+    if (!relaxed && Date.now() - fact.updatedAt >= POSTURE_PUSH_MAX_AGE_MS) return;
+    const attestation = `${fact.term}:${fact.seq}`;
+    for (const node of registry.nodes.values()) {
+      // Forgetting a node that is gone is what re-delivers the current fact to
+      // it when it comes back, instead of leaving it to wait out a refresh.
+      // Every connected node, not only those whose heartbeat has already said
+      // they host a replica: after a master restart that field is empty until
+      // the node's next heartbeat, and the receiver filters on its own setting.
+      if (node.isSelf || !node.connected) { posturePushed.delete(node.nodeId); continue; }
+      // Once per ATTESTATION, not once per tick: the receiver stamps its own
+      // freshness clock on arrival, so re-sending an unchanged fact would keep
+      // renewing a claim the master had stopped making.
+      if (posturePushed.get(node.nodeId) === attestation && (!relaxed || Date.now() - (posturePushedAt.get(node.nodeId) ?? 0) < POSTURE_RELAX_RESEND_MS)) continue;
+      posturePushed.set(node.nodeId, attestation);
+      posturePushedAt.set(node.nodeId, Date.now());
+      void server?.request(node.nodeId, MSG.SYNC_POSTURE, fact)
+        .catch(() => { posturePushed.delete(node.nodeId); });
+    }
+  };
+
   if (!standalone) {
     const secret = (process.env.CONTROL_SECRET || '').trim();
     const port = Number(process.env.CONTROL_PORT) || CONTROL_PORT_DEFAULT;
@@ -2896,6 +2977,11 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
         ledgerDeferWarnAt.delete(payload.nodeId);
         ledger?.onRegister(payload.nodeId);
         console.log(`[Fleet] Node registered: ${payload.nodeName} (${payload.nodeId})`);
+        // The current posture goes out the moment a node registers: one whose
+        // control connection was down for a relax must not wait out a
+        // heartbeat for it (B7-F23).
+        posturePushed.delete(payload.nodeId);
+        pushSyncPosture();
         // A backup-master's designation is env-seeded into the runtime config
         // on its first registration; from then on the stored list owns the
         // ORDER, and env stays the trigger: a node whose env no longer says
@@ -3274,87 +3360,6 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       };
     }
   }
-
-  // The in-sync fact (B6 map F23). The watchdog publishes fire and forget, so
-  // identity is stamped here and writes are serialised with latest-wins: an
-  // older publish that overtakes a newer one must never become the stored
-  // truth, and the stored truth is what every standby replays.
-  let publishedPosture: SyncPosturePayload | null = null;
-  let posturePending: SyncPosturePayload | null = null;
-  let postureSeq = 0;
-  let postureWriting = false;
-  const drainPostureWrites = async (): Promise<void> => {
-    if (postureWriting) return;
-    postureWriting = true;
-    try {
-      while (posturePending) {
-        const next = posturePending;
-        posturePending = null;
-        try {
-          await store.saveSyncPosture(next);
-        } catch (error) {
-          console.warn(`[Fleet] Could not record the synchronous posture: ${error instanceof Error ? error.message : error}`);
-          // Requeued, never dropped: this row is the carrier that survives the
-          // master's death, so a lost write could strand every standby holding
-          // an "armed" attestation nothing will ever correct. Retried on the
-          // heartbeat tick rather than here, because a store that is down would
-          // spin this loop.
-          if (!posturePending) posturePending = next;
-          break;
-        }
-      }
-    } finally {
-      postureWriting = false;
-    }
-  };
-  const publishSyncPosture = (fact: { state: 'armed' | 'relaxed'; slotName: string | null; nodeId: string | null; heldToLsn: string | null }): void => {
-    const stamped: SyncPosturePayload = { ...fact, updatedAt: Date.now(), masterNodeId: nodeId, term: registry.term, seq: ++postureSeq };
-    publishedPosture = stamped;
-    posturePending = stamped;
-    void drainPostureWrites();
-    // Pushed now rather than on the next heartbeat: a master that dies inside
-    // those 5 s has already acknowledged writes the copy never saw (B7-F23).
-    pushSyncPosture();
-  };
-
-  // The second carrier: the same fact on the push lane, for display and for the
-  // fast path. It STOPS being pushed once it outlives its own refresh, so a
-  // watchdog that died cannot keep an "armed" claim alive by repetition; the
-  // receiver's window then expires and the claim disarms itself.
-  const POSTURE_PUSH_MAX_AGE_MS = 90_000;
-  /** A relax is re-sent to each node this often, the cadence an ARMED posture is re-attested at. */
-  const POSTURE_RELAX_RESEND_MS = 30_000;
-  const posturePushed = new Map<string, string>();
-  const posturePushedAt = new Map<string, number>();
-  const pushSyncPosture = (): void => {
-    if (posturePending) void drainPostureWrites();
-    const fact = publishedPosture;
-    if (!fact) return;
-    // The age cap and the once-per-attestation rule below exist so a dead
-    // watchdog cannot keep an ARMED claim alive by repetition. A relax is the
-    // opposite fact: it has no refresh to ride, the receiver acks it before
-    // filing it, and a copy that never filed it reads as in sync after the
-    // master relaxed (B7-F23), so it is re-sent while the node is here.
-    const relaxed = fact.state !== 'armed';
-    if (!relaxed && Date.now() - fact.updatedAt >= POSTURE_PUSH_MAX_AGE_MS) return;
-    const attestation = `${fact.term}:${fact.seq}`;
-    for (const node of registry.nodes.values()) {
-      // Forgetting a node that is gone is what re-delivers the current fact to
-      // it when it comes back, instead of leaving it to wait out a refresh.
-      // Every connected node, not only those whose heartbeat has already said
-      // they host a replica: after a master restart that field is empty until
-      // the node's next heartbeat, and the receiver filters on its own setting.
-      if (node.isSelf || !node.connected) { posturePushed.delete(node.nodeId); continue; }
-      // Once per ATTESTATION, not once per tick: the receiver stamps its own
-      // freshness clock on arrival, so re-sending an unchanged fact would keep
-      // renewing a claim the master had stopped making.
-      if (posturePushed.get(node.nodeId) === attestation && (!relaxed || Date.now() - (posturePushedAt.get(node.nodeId) ?? 0) < POSTURE_RELAX_RESEND_MS)) continue;
-      posturePushed.set(node.nodeId, attestation);
-      posturePushedAt.set(node.nodeId, Date.now());
-      void server?.request(node.nodeId, MSG.SYNC_POSTURE, fact)
-        .catch(() => { posturePushed.delete(node.nodeId); });
-    }
-  };
 
   // Synchronous posture (20.5 active mode, B6 map F12-F17). While a designated
   // ACTIVE backup is provably keeping up, this master holds its own primary
