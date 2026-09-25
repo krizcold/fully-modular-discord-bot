@@ -310,10 +310,16 @@ export interface SyncPosturePayload {
   nodeId: string | null;
   /** The primary's write position when this was attested; null while relaxed. */
   heldToLsn: string | null;
-  /** The master's clock; also the ordering key, because publishes are fire and forget. */
+  /** The master's clock, for every freshness rule. */
   updatedAt: number;
   masterNodeId: string;
   term: number;
+  /**
+   * This master's attestation counter within one boot. With the term, which
+   * steps on every boot, it orders attestations without a clock, which can
+   * step backwards; publishes are fire and forget, so the order has to travel.
+   */
+  seq: number;
 }
 
 /** SLOT_STATUS payload: the primary's slot table at one read, from the master that read it. */

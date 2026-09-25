@@ -3281,6 +3281,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   // truth, and the stored truth is what every standby replays.
   let publishedPosture: SyncPosturePayload | null = null;
   let posturePending: SyncPosturePayload | null = null;
+  let postureSeq = 0;
   let postureWriting = false;
   const drainPostureWrites = async (): Promise<void> => {
     if (postureWriting) return;
@@ -3307,9 +3308,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     }
   };
   const publishSyncPosture = (fact: { state: 'armed' | 'relaxed'; slotName: string | null; nodeId: string | null; heldToLsn: string | null }): void => {
-    // Strictly increasing: a later attestation outranks an earlier one by this
-    // stamp alone (syncPostureVerdict), so a clock step must not reorder them.
-    const stamped: SyncPosturePayload = { ...fact, updatedAt: Math.max(Date.now(), (publishedPosture?.updatedAt ?? 0) + 1), masterNodeId: nodeId, term: registry.term };
+    const stamped: SyncPosturePayload = { ...fact, updatedAt: Date.now(), masterNodeId: nodeId, term: registry.term, seq: ++postureSeq };
     publishedPosture = stamped;
     posturePending = stamped;
     void drainPostureWrites();

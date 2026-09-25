@@ -115,6 +115,7 @@ function parseFact(parsed: any): SyncPostureFact | null {
     updatedAt: Number(parsed.updatedAt),
     masterNodeId: parsed.masterNodeId,
     term: Number(parsed.term) || 0,
+    seq: Number(parsed.seq) || 0,
   };
 }
 
@@ -240,11 +241,14 @@ export function syncPostureVerdict(evidence: SyncPostureEvidence, now = Date.now
     return no('the replayed posture came from a different master than the one now speaking');
   }
   // A later attestation from the same master outranks the replayed row at ANY
-  // age: both stamps are the master's clock, and the relax it carries is the
-  // one a copy whose stream broke first never replays (B7-F23). The window
-  // above expires stale positives; a later negative does not become true by
-  // ageing.
-  if (pushed !== null && pushed.masterNodeId === replayed.fact.masterNodeId && pushed.updatedAt > replayed.fact.updatedAt) {
+  // age. Later is (term, seq), two counters the master owns: the term steps on
+  // every boot and the seq on every attestation within one, so neither a clock
+  // step nor a restart reorders them. The relax it carries is the one a copy
+  // whose stream broke first never replays (B7-F23). The window above expires
+  // stale positives; a later negative does not become true by ageing.
+  const later = pushed !== null && pushed.masterNodeId === replayed.fact.masterNodeId
+    && (pushed.term > replayed.fact.term || (pushed.term === replayed.fact.term && pushed.seq > replayed.fact.seq));
+  if (later) {
     if (pushed.state !== 'armed') return no('the master later said it was waiting for no copy, and this copy never replayed that relax');
     if (pushed.slotName !== mySlotName) return no('the master later said it was waiting for a different copy');
   }
