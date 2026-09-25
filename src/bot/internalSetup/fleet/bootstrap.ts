@@ -3340,7 +3340,10 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     for (const node of registry.nodes.values()) {
       // Forgetting a node that is gone is what re-delivers the current fact to
       // it when it comes back, instead of leaving it to wait out a refresh.
-      if (node.isSelf || !node.connected || !node.dbReplica) { posturePushed.delete(node.nodeId); continue; }
+      // Every connected node, not only those whose heartbeat has already said
+      // they host a replica: after a master restart that field is empty until
+      // the node's next heartbeat, and the receiver filters on its own setting.
+      if (node.isSelf || !node.connected) { posturePushed.delete(node.nodeId); continue; }
       // Once per ATTESTATION, not once per tick: the receiver stamps its own
       // freshness clock on arrival, so re-sending an unchanged fact would keep
       // renewing a claim the master had stopped making.
