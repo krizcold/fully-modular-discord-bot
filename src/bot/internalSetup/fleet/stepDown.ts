@@ -174,13 +174,14 @@ export function higherTermClaim(claims: WitnessClaim[], selfNodeId: string, self
 /**
  * A FRESH higher-term claim from another node: that node is up and holds a
  * newer term than this one, so this master steps down now. Freshness is judged
- * on Discord's edit stamps and the read itself must be recent, so a stale
- * snapshot from a dark witness can never trigger a step-down.
+ * on Discord's edit stamps as of the read that delivered them, and the read
+ * itself must be recent, so a stale snapshot from a dark witness can never
+ * trigger a step-down and never ages a claim this node has not re-read (B7-F22).
  */
 export function freshHigherTermClaim(status: WitnessStatus, selfNodeId: string, selfTerm: number, now: number): WitnessClaim | null {
   if (status.lastReadAt === null || now - status.lastReadAt > WITNESS_FRESH_WINDOW_MS) return null;
-  const candidate = higherTermClaim(status.claims.filter(c => now - c.observedAt <= WITNESS_FRESH_WINDOW_MS), selfNodeId, selfTerm);
-  return candidate;
+  const readAt = status.lastReadAt;
+  return higherTermClaim(status.claims.filter(c => readAt - c.observedAt <= WITNESS_FRESH_WINDOW_MS), selfNodeId, selfTerm);
 }
 
 /**
@@ -191,6 +192,7 @@ export function freshHigherTermClaim(status: WitnessStatus, selfNodeId: string, 
  */
 export function freshMasterClaim(status: WitnessStatus, selfNodeId: string, now: number): WitnessClaim | null {
   if (status.lastReadAt === null || now - status.lastReadAt > WITNESS_FRESH_WINDOW_MS) return null;
+  const readAt = status.lastReadAt;
   let best: WitnessClaim | null = null;
   for (const claim of status.claims) {
     // A stand-in IS the fleet's coordinator for the duration, so every node but
@@ -199,7 +201,7 @@ export function freshMasterClaim(status: WitnessStatus, selfNodeId: string, now:
     // the demote guard warns the fleet is about to freeze when it is not (F21).
     const serving = claim.role === 'master' || claim.standingInFor !== undefined;
     if (claim.nodeId === selfNodeId || !serving) continue;
-    if (now - claim.observedAt > WITNESS_FRESH_WINDOW_MS) continue;
+    if (readAt - claim.observedAt > WITNESS_FRESH_WINDOW_MS) continue;
     if (!best || claim.term > best.term) best = claim;
   }
   return best;
@@ -218,7 +220,7 @@ export function masterStoreDeadNow(claim: WitnessClaim | null, status: WitnessSt
   // store would unlock the lossy path in the very case that loses most (F20).
   if (!claim || claim.storeState !== 'dead') return false;
   if (status.lastReadAt === null || now - status.lastReadAt > WITNESS_CURRENT_WINDOW_MS) return false;
-  return now - claim.observedAt <= WITNESS_CURRENT_WINDOW_MS;
+  return status.lastReadAt - claim.observedAt <= WITNESS_CURRENT_WINDOW_MS;
 }
 
 /** Child -> parent: the co-worker override is staged, restart me (B4 step-down). */
