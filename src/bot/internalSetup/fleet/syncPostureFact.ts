@@ -201,8 +201,9 @@ export interface SyncPostureEvidence {
   /** Whether this copy still streams from the master that wrote the row; null when unknown, which is not a yes. */
   sourceIsCurrentMaster: boolean | null;
   /**
-   * The fleet term this copy has replayed; null when unreadable. Every master
-   * boot takes a new term, so a posture attested at a lower one came from an
+   * The fleet term this copy has replayed; null when unreadable, which is no
+   * verdict (a copy fit to stand in always holds the row). Every master boot
+   * takes a new term, so a posture attested at a lower one came from an
    * incarnation that ended without re-attesting, and its boot clear had
    * already released writes this copy was never waited for.
    */
@@ -253,7 +254,8 @@ export function syncPostureVerdict(evidence: SyncPostureEvidence, now = Date.now
   if (replayed.fact.state !== 'armed') return no('the posture this copy replayed says the master was not waiting for any copy');
   if (replayed.fact.slotName !== mySlotName) return no('the posture this copy replayed names a different copy');
   if (!replayed.fact.heldToLsn) return no('the replayed posture records no position it was held to');
-  if (copyTerm !== null && replayed.fact.term < copyTerm) {
+  if (copyTerm === null) return no('the term this copy has replayed could not be read, so nothing places the attestation in time');
+  if (replayed.fact.term < copyTerm) {
     return no('this copy has replayed a term the master took after its last attestation, so nothing vouches for the writes since');
   }
   if (pushedIsFresh && pushed!.masterNodeId !== replayed.fact.masterNodeId) {
