@@ -3324,7 +3324,14 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   const pushSyncPosture = (): void => {
     if (posturePending) void drainPostureWrites();
     const fact = publishedPosture;
-    if (!fact || Date.now() - fact.updatedAt >= POSTURE_PUSH_MAX_AGE_MS) return;
+    if (!fact) return;
+    // The age cap and the once-per-attestation rule below exist so a dead
+    // watchdog cannot keep an ARMED claim alive by repetition. A relax is the
+    // opposite fact: it has no refresh to ride, the receiver acks it before
+    // filing it, and a copy that never filed it reads as in sync after the
+    // master relaxed (B7-F23), so it goes on every tick while the node is here.
+    const relaxed = fact.state !== 'armed';
+    if (!relaxed && Date.now() - fact.updatedAt >= POSTURE_PUSH_MAX_AGE_MS) return;
     for (const node of registry.nodes.values()) {
       // Forgetting a node that is gone is what re-delivers the current fact to
       // it when it comes back, instead of leaving it to wait out a refresh.
@@ -3332,7 +3339,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       // Once per ATTESTATION, not once per tick: the receiver stamps its own
       // freshness clock on arrival, so re-sending an unchanged fact would keep
       // renewing a claim the master had stopped making.
-      if (posturePushed.get(node.nodeId) === fact.updatedAt) continue;
+      if (!relaxed && posturePushed.get(node.nodeId) === fact.updatedAt) continue;
       posturePushed.set(node.nodeId, fact.updatedAt);
       void server?.request(node.nodeId, MSG.SYNC_POSTURE, fact)
         .catch(() => { posturePushed.delete(node.nodeId); });
