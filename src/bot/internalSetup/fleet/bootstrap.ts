@@ -3307,7 +3307,9 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     }
   };
   const publishSyncPosture = (fact: { state: 'armed' | 'relaxed'; slotName: string | null; nodeId: string | null; heldToLsn: string | null }): void => {
-    const stamped: SyncPosturePayload = { ...fact, updatedAt: Date.now(), masterNodeId: nodeId, term: registry.term };
+    // Strictly increasing: a later attestation outranks an earlier one by this
+    // stamp alone (syncPostureVerdict), so a clock step must not reorder them.
+    const stamped: SyncPosturePayload = { ...fact, updatedAt: Math.max(Date.now(), (publishedPosture?.updatedAt ?? 0) + 1), masterNodeId: nodeId, term: registry.term };
     publishedPosture = stamped;
     posturePending = stamped;
     void drainPostureWrites();

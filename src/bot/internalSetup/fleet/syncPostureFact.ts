@@ -23,7 +23,9 @@
  *    required to reach a positive verdict, and it could not be: its freshness
  *    window is deliberately shorter than the witness dead-master window, so by
  *    the time anything could conclude the master is dead it has expired by
- *    design. What it can do is CONTRADICT, and a fresh contradiction wins.
+ *    design. What it can do is CONTRADICT: a fresh contradiction wins, and so
+ *    does one the master attested LATER than the row this copy replayed, at
+ *    any age (B7-F23).
  *
  * THE RULE THAT CLOSES THE DEGRADE is F23's own: "my last replayed posture row
  * is older than my last streaming observation" is no verdict. Implemented as
@@ -34,12 +36,13 @@
  * attestation, the tail of this copy is unattested and nothing is claimed.
  *
  * WHAT REMAINS UNCLOSED, stated rather than papered over: if the master
- * relaxes, then acknowledges writes this copy never receives, then dies, this
- * copy sees neither those writes nor the relax row, and reads as consistent.
- * No fact reaching this machine can distinguish that, which is one reason the
- * arming conjunction is not this file's to make. It is bounded in practice
- * because a relax is almost always triggered BY this copy falling behind, in
- * which case it is not a stand-in candidate at all.
+ * relaxes while this node's control connection is down as well, then
+ * acknowledges writes this copy never receives, then dies, this copy sees
+ * neither those writes nor the relax on either carrier, and reads as
+ * consistent. No fact reaching this machine can distinguish that (only the
+ * master's beacon could carry it), which is one reason the arming conjunction
+ * is not this file's to make. Where the control connection outlived the
+ * stream, the pushed relax IS that fact, and the verdict honours it above.
  *
  * Fail-closed throughout, on the slot signal's precedent (B6 map D16): a
  * missing, stale, or not-from-this-master fact is no verdict at all, never a
@@ -235,6 +238,15 @@ export function syncPostureVerdict(evidence: SyncPostureEvidence, now = Date.now
   if (!replayed.fact.heldToLsn) return no('the replayed posture records no position it was held to');
   if (pushedIsFresh && pushed!.masterNodeId !== replayed.fact.masterNodeId) {
     return no('the replayed posture came from a different master than the one now speaking');
+  }
+  // A later attestation from the same master outranks the replayed row at ANY
+  // age: both stamps are the master's clock, and the relax it carries is the
+  // one a copy whose stream broke first never replays (B7-F23). The window
+  // above expires stale positives; a later negative does not become true by
+  // ageing.
+  if (pushed !== null && pushed.masterNodeId === replayed.fact.masterNodeId && pushed.updatedAt > replayed.fact.updatedAt) {
+    if (pushed.state !== 'armed') return no('the master later said it was waiting for no copy, and this copy never replayed that relax');
+    if (pushed.slotName !== mySlotName) return no('the master later said it was waiting for a different copy');
   }
   // F23's rule, and the one that closes the unilateral degrade: if this copy
   // has replayed transactions from after the last attestation, WAL kept
