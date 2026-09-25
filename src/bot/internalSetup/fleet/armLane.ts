@@ -108,7 +108,12 @@ export function freeArmTerms(status: WitnessStatus, selfNodeId: string, now: num
   }
   const peerSees = status.claims.some(c =>
     c.nodeId !== selfNodeId && readAt - c.observedAt <= WITNESS_FRESH_WINDOW_MS && c.masterSeen === true && !ignorePeer(c.nodeId));
-  return { readFresh, readAt, beacon, masterBeaconDark: beacon === null, noPeerSeesMaster: !peerSees, absent: {} };
+  // F22's rule is about equal-or-higher-term beacons, so the refusal names the
+  // beacon it saw and its term rather than a nameless fresh one (B7-F21).
+  const absent: AbsentTerms = beacon
+    ? { masterBeaconDark: `a fresh ${beacon.standingInFor !== undefined ? 'stand-in' : 'master'} beacon from ${beacon.nodeName} at term ${beacon.term} is still being published` }
+    : {};
+  return { readFresh, readAt, beacon, masterBeaconDark: beacon === null, noPeerSeesMaster: !peerSees, absent };
 }
 
 export interface PreArmInputs {
