@@ -200,6 +200,13 @@ export interface SyncPostureEvidence {
   mySlotName: string | null;
   /** Whether this copy still streams from the master that wrote the row; null when unknown, which is not a yes. */
   sourceIsCurrentMaster: boolean | null;
+  /**
+   * The fleet term this copy has replayed; null when unreadable. Every master
+   * boot takes a new term, so a posture attested at a lower one came from an
+   * incarnation that ended without re-attesting, and its boot clear had
+   * already released writes this copy was never waited for.
+   */
+  copyTerm: number | null;
 }
 
 export interface SyncPostureVerdict {
@@ -220,7 +227,7 @@ export interface SyncPostureVerdict {
  * relax this copy has already replayed is invisible in a cached one.
  */
 export function syncPostureVerdict(evidence: SyncPostureEvidence, now = Date.now()): SyncPostureVerdict {
-  const { replayed, pushed, mySlotName, sourceIsCurrentMaster } = evidence;
+  const { replayed, pushed, mySlotName, sourceIsCurrentMaster, copyTerm } = evidence;
   const no = (reason: string): SyncPostureVerdict => ({ inSync: false, heldToLsn: null, reason });
   if (!mySlotName) return no('this node hosts no standby of the fleet database');
   // A copy that follows some other database is not evidence about this fleet,
@@ -246,6 +253,9 @@ export function syncPostureVerdict(evidence: SyncPostureEvidence, now = Date.now
   if (replayed.fact.state !== 'armed') return no('the posture this copy replayed says the master was not waiting for any copy');
   if (replayed.fact.slotName !== mySlotName) return no('the posture this copy replayed names a different copy');
   if (!replayed.fact.heldToLsn) return no('the replayed posture records no position it was held to');
+  if (copyTerm !== null && replayed.fact.term < copyTerm) {
+    return no('this copy has replayed a term the master took after its last attestation, so nothing vouches for the writes since');
+  }
   if (pushedIsFresh && pushed!.masterNodeId !== replayed.fact.masterNodeId) {
     return no('the replayed posture came from a different master than the one now speaking');
   }

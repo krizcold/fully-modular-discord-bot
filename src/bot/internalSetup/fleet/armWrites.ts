@@ -12,6 +12,7 @@
 
 import { PEER_TERM_PROBE_MS } from './constants';
 import { ArmEvidenceInputs, freeArmTerms, writeStepTiming, writeStepVerdict } from './armLane';
+import { readStandbyTermRow } from './armProbe';
 import { readArmRecord, writeArmRecord } from './armRecord';
 import { probePeerTerm } from './peerTermProbe';
 import { readPromoteRecord } from './promoteRecord';
@@ -118,11 +119,13 @@ export async function evaluateStandInWrites(ctx: StandInWriteContext, renewOk: b
     // copy has already replayed is invisible in a cached read.
     const replayed = await readReplayedSyncPosture(ctx.standInUrl);
     const pushed = readSyncPostureRecord();
+    const termRow = await readStandbyTermRow(ctx.standInUrl);
     const sync = syncPostureVerdict({
       replayed,
       pushed,
       mySlotName: copy.slotName ?? null,
       sourceIsCurrentMaster: replayed !== null && replayed.fact.masterNodeId === ctx.coveringNodeId && pushed?.sourceIsCurrentMaster !== false,
+      copyTerm: termRow?.term ?? null,
     }, now);
     const verdict = writeStepVerdict(evidence, sync, free.absent);
     if (!verdict.arm) {
