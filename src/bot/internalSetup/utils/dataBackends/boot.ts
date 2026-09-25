@@ -610,6 +610,9 @@ async function verifyIdentityLoop(url: string, driver: DataReadinessDriver): Pro
         return;
       }
     } catch { /* unreachable; fall through to the retry sleep */ }
+    // Re-checked after the attempt too: a swap mid-attempt retired this loop,
+    // and its warning would describe a database the node has moved off (B7-F24).
+    if (activeUrl !== url) return;
     if (!logged) {
       console.warn('[Data] Waiting on the data backend to verify store identity; gates stay closed');
       logged = true;
