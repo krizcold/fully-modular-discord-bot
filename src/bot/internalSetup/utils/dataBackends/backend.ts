@@ -29,7 +29,8 @@ export interface FenceToken {
 export type FlushOutcome =
   | { ok: true }
   | { ok: false; reason: 'deposed'; currentOwner?: { nodeId: string; term: number; epoch: number } }
-  | { ok: false; reason: 'unavailable' };
+  | { ok: false; reason: 'unavailable' }
+  | { ok: false; reason: 'read-only' };
 
 export type HydrationOutcome =
   | { ok: true; docs: { key: DocKey; doc: string }[]; appendKeys: DocKey[] }
@@ -60,5 +61,7 @@ export interface DataBackend {
   guildFileExists(guildId: string, key: DocKey): Promise<boolean>;
   sizeOfGuildData(guildId: string): Promise<number>;
   healthy(): boolean;
+  /** The store refuses writes (a copy in recovery, SQLSTATE 25006) while reads keep serving. */
+  isReadOnly(): boolean;
   onAlert(cb: (event: 'outage' | 'recovered' | 'deposed', detail: string) => void): void;
 }

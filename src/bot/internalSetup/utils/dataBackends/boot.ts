@@ -693,7 +693,8 @@ function noticeText(property: string, fallback: string): string {
 }
 
 /** User-visible text for a refused write; the database-unreachable notice is operator-editable in config.json. */
-export function dataUnavailableMessage(causeKey: 'database-unreachable' | 'guild-fenced'): string {
+export function dataUnavailableMessage(causeKey: 'database-unreachable' | 'guild-fenced' | 'database-read-only'): string {
+  if (causeKey === 'database-read-only') return "The bot's database is read-only while a backup covers an outage, so your change was not saved. Please try again in a few minutes.";
   return causeKey === 'guild-fenced'
     ? "This server's data just moved to another bot node; please try again in a moment."
     : noticeText('outageNotice.databaseUnreachable', "The bot's database is currently unreachable, so your change was not saved. Please try again later or contact support.");

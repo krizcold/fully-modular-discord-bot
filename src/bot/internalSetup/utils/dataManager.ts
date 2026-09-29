@@ -496,7 +496,7 @@ export function saveData<T = any>(
       }
       if (result === 'frozen-window') { frozenWriteRejections += 1; return false; }
       if (result === 'not-ready') return false;
-      throw new DataBackendUnavailableError(result === 'fenced' ? 'guild-fenced' : 'database-unreachable');
+      throw new DataBackendUnavailableError(result === 'fenced' ? 'guild-fenced' : result === 'read-only' ? 'database-read-only' : 'database-unreachable');
     }
     const dir = getDataDirectory(options);
     const filePath = getDataFilePath(filename, options);
@@ -544,7 +544,7 @@ export function appendData(filename: string, options: DataOptions, line: string)
       }
       if (result === 'frozen-window') { frozenWriteRejections += 1; return false; }
       if (result === 'not-ready') return false;
-      throw new DataBackendUnavailableError(result === 'fenced' ? 'guild-fenced' : 'database-unreachable');
+      throw new DataBackendUnavailableError(result === 'fenced' ? 'guild-fenced' : result === 'read-only' ? 'database-read-only' : 'database-unreachable');
     }
     const dir = getDataDirectory(options);
     const filePath = getDataFilePath(filename, options);
@@ -606,7 +606,7 @@ export function deleteData(filename: string, options: DataOptions): boolean {
       }
       if (result === 'frozen-window') { frozenWriteRejections += 1; return false; }
       if (result === 'not-ready') return false;
-      throw new DataBackendUnavailableError(result === 'fenced' ? 'guild-fenced' : 'database-unreachable');
+      throw new DataBackendUnavailableError(result === 'fenced' ? 'guild-fenced' : result === 'read-only' ? 'database-read-only' : 'database-unreachable');
     }
     const filePath = getDataFilePath(filename, options);
 
