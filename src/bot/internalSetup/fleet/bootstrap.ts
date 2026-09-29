@@ -95,7 +95,7 @@ import { TransformationExecutor } from './transformation/transformationExecutor'
 import type { ControlStore, PersistedFleetConfig, PersistedTerm, TransformDirection } from './controlStore';
 import { effectiveFleetConfigView, effectiveMasterUrls, emptyStoreHoldEvidence, fleetConfigViewOf, fleetMasterCandidates, forcePassive, readFleetConfigCache, rememberBackups, validateMasterCandidates, renumberDesignations, validateBackupDesignations, validateWitnessChannelId, writeFleetConfigCache } from './fleetConfig';
 import { getLocalReplicaIdentity, getReplicaHealth, getSlotSample, setReplicaProbeListener } from './replicaHealth';
-import { canonicalIsOwnReplica, canonicalStoreReachable, currentCanonicalUrl, hasDbReplica, probeReplica, readTermRow, resolveReplicaEndpoints, spliceFleetCredentials } from './replicaPromotion';
+import { canonicalIsOwnReplica, canonicalStoreReachable, currentCanonicalUrl, hasDbReplica, probeReplica, readTermRow, resolveReplicaEndpoints, spliceFleetCredentials, standInDelivery } from './replicaPromotion';
 import { ArmEvidenceInputs, armDeferral, evaluateArmEvidence, freeArmTerms, ledgerAllowsArm, missingArmTerms, preArmRefusal, reachabilityWarning } from './armLane';
 import { judgeReachability } from './reachability';
 import { StandInWriteContext, evaluateStandInWrites } from './armWrites';
@@ -2461,6 +2461,13 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   // route default, which transformation-required overrides), never the raw
   // env value: a fresh worker must serve from where the data actually lives.
   function buildDataBackendInfo(): DataBackendInfo {
+    // A serve-only stand-in coordinates from its copy, repointed in process and
+    // never persisted, so the env still names the primary the arm proved dead:
+    // its workers are handed the copy's forms instead (B7-F26).
+    if (serveOnly) {
+      const copy = standInDelivery();
+      if (copy) return { backend: 'postgres', url: copy.url, publicUrl: copy.publicUrl, serveOnly: true };
+    }
     let live: 'file' | 'postgres' = 'file';
     try {
       live = currentRouteDefault();
@@ -3775,7 +3782,12 @@ async function initCoWorker(init: CommonInit, followerHold: FollowerHoldBase | n
       onDataBackend: info => {
         void (async () => {
           try {
-            const { changed, recycled, unreachable, reason: holdReason } = await applyDeliveredBackend(info, followerHold ? { persist: false } : undefined);
+            // A serve-only stand-in's copy is followed in process only, like the
+            // follower hold: the canonical URL stays persisted for the next boot,
+            // and the master's own delivery re-persists at the hand-back. Past
+            // the write step the copy IS the fleet database and persists (B7-F26).
+            const inProcessOnly = followerHold !== null || info?.serveOnly === true;
+            const { changed, recycled, unreachable, reason: holdReason } = await applyDeliveredBackend(info, inProcessOnly ? { persist: false } : undefined);
             if (followerHold) {
               // A hold entered without a database of its own could not read
               // whose copy it holds; the delivered credentials can.

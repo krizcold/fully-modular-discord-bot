@@ -8,6 +8,7 @@ import { connect } from 'net';
 import { DataBackendKind, loadCredentials, setFleetDataBackend, upsertCredentials } from '../../../../utils/envLoader';
 import { PostgresBackend } from './postgresBackend';
 import { initWorkingSet, getWorkingSet } from './workingSet';
+import type { DirtyCarry } from './workingSet';
 import { initDataReadiness, getDataReadiness, DataReadinessDriver } from './dataReadiness';
 import { forceRouteDefault, routeFor, applyRouteOverrides } from './routeResolver';
 import { evaluateRecognitionGuard, verifyStoreIdentity, readFileMarker, writeFileMarker, GuardVerdict } from './recognitionGuard';
@@ -470,6 +471,7 @@ async function runRecycle(url: string, keepPrevious: boolean, delivery?: Deliver
   // lacks the schema and would mint an identity in one this node then refuses.
   let incoming = new PostgresBackend({ url });
   let carried: string[] = [];
+  let carryOver: DirtyCarry[] = [];
   let repicked = false;
   try {
     let verified = false;
@@ -549,7 +551,13 @@ async function runRecycle(url: string, keepPrevious: boolean, delivery?: Deliver
         if (discarded > 0) {
           console.error(`[Data] ${discarded} of ${pending.length} draining guild(s) had their unflushed writes DISCARDED as fenced during the recycle (candidates: ${pending.join(', ')})`);
         }
-        if (leftover.length > 0) {
+        if (leftover.length > 0 && incoming.isReadOnly()) {
+          // A stand-in's copy takes no writes yet: the outage's accepted writes
+          // ride into the new working set and flush when it does (the write
+          // step) or at the next recycle (the hand-back) (B7-F26).
+          carryOver = oldWs.exportDirty(leftover);
+          console.warn(`[Data] ${leftover.length} guild(s) hold writes the read-only copy cannot take yet; carried in memory until it does: ${leftover.join(', ')}`);
+        } else if (leftover.length > 0) {
           console.error(`[Data] ${leftover.length} guild(s) could not drain into the new database and their writes are DROPPED: ${leftover.join(', ')}`);
         }
       }
@@ -567,6 +575,7 @@ async function runRecycle(url: string, keepPrevious: boolean, delivery?: Deliver
   oldReadiness?.stop();
   oldWs?.quiesce();
   void verifyIdentityLoop(url, installRuntime(url, incoming));
+  if (carryOver.length > 0) getWorkingSet()?.adoptDirty(carryOver);
   // NEVER awaited: pool.end() waits for checked-out clients, and a connection
   // hung against a partitioned host would hold this result back for as long as
   // the OS takes to give up - with the swap already complete, that would strand

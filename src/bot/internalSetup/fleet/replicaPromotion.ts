@@ -61,6 +61,18 @@ export function spliceFleetCredentials(replicaUrl: string, base?: string): { url
 }
 
 /**
+ * The copy a serve-only stand-in hands its co-workers in place of the primary
+ * it covers (B7-F26): both forms, this node's fleet credentials spliced in.
+ */
+export function standInDelivery(): { url: string; publicUrl: string } | null {
+  const endpoints = resolveReplicaEndpoints();
+  if (!endpoints) return null;
+  const local = spliceFleetCredentials(endpoints.local).url;
+  const publicUrl = spliceFleetCredentials(endpoints.public).url;
+  return local && publicUrl ? { url: local, publicUrl } : null;
+}
+
+/**
  * Reachability only (SELECT 1, not the term row): shared by the promote route
  * and the rung. A reachable virgin store is a deliberate first
  * promotion, and the boot provisions its own schema.

@@ -82,6 +82,13 @@ function splitDocKey(key: string): DocKey {
   return { module: key.slice(0, idx), filename: key.slice(idx + 1) };
 }
 
+/** Unflushed writes leaving one manager for another at a recycle (exportDirty / adoptDirty). */
+export interface DirtyCarry {
+  guildId: string;
+  docs: { key: string; content: string; tombstone: boolean; dirtySince: number }[];
+  appends: { key: string; chunk: string; dirtySince: number }[];
+}
+
 export interface BackendHealth {
   state: 'healthy' | 'degraded' | 'refusing';
   oldestDirtyMs: number;
@@ -97,6 +104,10 @@ export class WorkingSetManager {
   private retryTimer: NodeJS.Timeout | null = null;
   private quiesced = false;
   private retryAttempt = 0;
+  // A carry is bound to the read-only store it was adopted for: once that store
+  // has taken writes, another node may have written newer data, so a carry not
+  // yet applied is dropped rather than flushed over it.
+  private readonly adoptions = new Map<string, { carry: DirtyCarry; store: DataBackend }>();
   // Counters driven to zero by the drill matrix (non-gated callers touching
   // guilds whose working set is not ready).
   private wsBypassReads = 0;
@@ -134,7 +145,76 @@ export class WorkingSetManager {
    * so it would otherwise read as clean and be dropped on the floor.
    */
   dirtyGuildIds(): string[] {
-    return [...this.sets.values()].filter(ws => ws.dirtyKeys.size > 0 || ws.flushInFlight).map(ws => ws.guildId);
+    this.pruneAdoptions();
+    const ids = new Set([...this.sets.values()].filter(ws => ws.dirtyKeys.size > 0 || ws.flushInFlight).map(ws => ws.guildId));
+    for (const id of this.adoptions.keys()) ids.add(id);
+    return [...ids];
+  }
+
+  private pruneAdoptions(): void {
+    const stale = [...this.adoptions].filter(([, a]) => !a.store.isReadOnly()).map(([id]) => id);
+    if (stale.length === 0) return;
+    for (const id of stale) this.adoptions.delete(id);
+    console.error(`[Data] Carried writes for ${stale.length} guild(s) DROPPED: the copy took writes before this node hydrated them, so they could overwrite newer data: ${stale.join(', ')}`);
+  }
+
+  /**
+   * Recycle onto a store that takes no writes yet (a stand-in's copy in
+   * recovery): the writes this manager could not drain leave with the caller
+   * instead of being dropped, and its accounting forgets them (B7-F26).
+   */
+  exportDirty(guildIds: string[]): DirtyCarry[] {
+    this.pruneAdoptions();
+    const out: DirtyCarry[] = [];
+    for (const guildId of guildIds) {
+      const pending = this.adoptions.get(guildId)?.carry;
+      const docs = pending ? [...pending.docs] : [];
+      const appends = pending ? [...pending.appends] : [];
+      const ws = this.sets.get(guildId);
+      if (ws) {
+        for (const key of ws.dirtyKeys) {
+          const doc = ws.docs.get(key);
+          if (doc?.dirty) docs.push({ key, content: doc.content, tombstone: doc.tombstone, dirtySince: doc.dirtySince });
+        }
+        for (const [key, buf] of ws.appendBuf) {
+          if (buf.chunk.length > 0) appends.push({ key, chunk: buf.chunk, dirtySince: buf.dirtySince });
+        }
+        this.forgetDirty(ws);
+      }
+      this.adoptions.delete(guildId);
+      if (docs.length > 0 || appends.length > 0) out.push({ guildId, docs, appends });
+    }
+    return out;
+  }
+
+  /** The other side of exportDirty: applied over the store's older content once the guild hydrates here. */
+  adoptDirty(carries: DirtyCarry[]): void {
+    for (const carry of carries) {
+      const ws = this.sets.get(carry.guildId);
+      if (ws && ws.state === 'ready') this.applyCarry(ws, carry);
+      else this.adoptions.set(carry.guildId, { carry, store: this.backend });
+    }
+  }
+
+  // The acceptance window restarts at the adoption: it measures how long writes
+  // have waited on THIS runtime, and the carried age would close the window the
+  // moment the copy takes writes.
+  private applyCarry(ws: GuildWorkingSet, carry: DirtyCarry): void {
+    const now = Date.now();
+    for (const doc of carry.docs) {
+      if (ws.docs.get(doc.key)?.dirty) continue; // a write accepted here since is newer
+      ws.docs.set(doc.key, { content: doc.content, tombstone: doc.tombstone, dirty: true, dirtySince: now });
+      this.dirtyBytes += doc.content.length;
+      this.markDirty(ws, doc.key, now);
+    }
+    for (const append of carry.appends) {
+      const buf = ws.appendBuf.get(append.key);
+      if (buf) buf.chunk = append.chunk + buf.chunk;
+      else ws.appendBuf.set(append.key, { chunk: append.chunk, dirtySince: now });
+      ws.appendKeys.add(append.key);
+      this.dirtyBytes += append.chunk.length;
+      this.markDirty(ws, append.key, now);
+    }
   }
 
   /** Bounded wait for in-flight flushes to come back, so their keys are visible again. */
@@ -201,6 +281,12 @@ export class WorkingSetManager {
       ws.appendKeys.add(docKeyOf(key.module, key.filename));
     }
     ws.state = 'ready';
+    this.pruneAdoptions();
+    const adoption = this.adoptions.get(guildId);
+    if (adoption) {
+      this.adoptions.delete(guildId);
+      this.applyCarry(ws, adoption.carry);
+    }
     for (const wake of ws.readyWaiters.splice(0)) wake();
     return 'ready';
   }
@@ -520,7 +606,10 @@ export class WorkingSetManager {
   async flushAllDirty(): Promise<string[]> {
     const dirty = [...this.sets.values()].filter(ws => ws.dirtyKeys.size > 0);
     await Promise.all(dirty.map(ws => this.flush(ws)));
-    return [...this.sets.values()].filter(ws => ws.dirtyKeys.size > 0).map(ws => ws.guildId);
+    const left = [...this.sets.values()].filter(ws => ws.dirtyKeys.size > 0).map(ws => ws.guildId);
+    this.pruneAdoptions();
+    for (const id of this.adoptions.keys()) if (!left.includes(id)) left.push(id);
+    return left;
   }
 
   // --------------------------------------------------------------------------

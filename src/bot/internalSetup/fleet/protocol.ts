@@ -185,6 +185,8 @@ export interface DataBackendInfo {
    * must keep the container-name form).
    */
   publicUrl?: string;
+  /** Delivered by a serve-only stand-in: a copy still in recovery, followed in process and never persisted as the node's database. */
+  serveOnly?: boolean;
   /** Active transformation, if any. */
   transformationId?: string;
   /** Per-guild routing overrides while a transformation is active. */
