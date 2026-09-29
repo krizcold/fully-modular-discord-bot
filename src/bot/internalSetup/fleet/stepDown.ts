@@ -177,11 +177,17 @@ export function higherTermClaim(claims: WitnessClaim[], selfNodeId: string, self
  * on Discord's edit stamps as of the read that delivered them, and the read
  * itself must be recent, so a stale snapshot from a dark witness can never
  * trigger a step-down and never ages a claim this node has not re-read (B7-F22).
+ * The claim returned names the node that SERVES that term when one is fresh:
+ * every designated backup beacons its master's term, so a backup's echo read
+ * first would otherwise be recorded as the holder (B7-F28).
  */
 export function freshHigherTermClaim(status: WitnessStatus, selfNodeId: string, selfTerm: number, now: number): WitnessClaim | null {
   if (status.lastReadAt === null || now - status.lastReadAt > WITNESS_FRESH_WINDOW_MS) return null;
   const readAt = status.lastReadAt;
-  return higherTermClaim(status.claims.filter(c => readAt - c.observedAt <= WITNESS_FRESH_WINDOW_MS), selfNodeId, selfTerm);
+  const fresh = status.claims.filter(c => readAt - c.observedAt <= WITNESS_FRESH_WINDOW_MS);
+  const best = higherTermClaim(fresh, selfNodeId, selfTerm);
+  if (!best) return null;
+  return fresh.find(c => c.nodeId !== selfNodeId && c.term === best.term && (c.role === 'master' || c.standingInFor !== undefined)) ?? best;
 }
 
 /**
