@@ -6,6 +6,7 @@ import type { WebSocketManager, WSEvent, WSEventData } from './websocketManager'
 import { getSafetyManager } from '../utils/updateSafety';
 import { resetAppStoreManager } from '../bot/internalSetup/utils/appStoreManager';
 import { applyRouteOverrides } from '../bot/internalSetup/utils/dataBackends/routeResolver';
+import { setWebuiDataStoreUrl } from './utils/webuiDataReader';
 import { invalidateRoleOverrideCache } from '../bot/internalSetup/fleet/nodeIdentity';
 import { startStandInWrites } from './promoteEngine';
 
@@ -221,6 +222,8 @@ export class BotManager {
       });
 
       const child = this.botProcess;
+      // A new child serves no store until it reports one.
+      setWebuiDataStoreUrl(null);
       this.botStartTime = Date.now();
       this.crashed = false;
 
@@ -295,6 +298,7 @@ export class BotManager {
         }
 
         this.botProcess = null;
+        setWebuiDataStoreUrl(null);
         this.botStartTime = 0;
         this.failPendingIpc('bot process exited before replying');
         this.emitEvent('bot:status', this.getStatus());
@@ -327,6 +331,10 @@ export class BotManager {
           if (this.wsManager) {
             this.wsManager.broadcast('bot:fleet:status', message.data);
           }
+        } else if (message.type === 'data:store') {
+          // The parent's reader follows the store the child serves (a delivered
+          // database, a stand-in's copy), never only the node's own /data/.env.
+          setWebuiDataStoreUrl(typeof message.data?.url === 'string' ? message.data.url : null);
         } else if (message.type === 'sync:applied') {
           // Co-worker applied a master sync: this process's AppStore caches
           // are stale (installed.json/repos.json were overwritten on disk).
@@ -469,6 +477,7 @@ export class BotManager {
 
       if (this.botProcess === child) {
         this.botProcess = null;
+        setWebuiDataStoreUrl(null);
         this.botStartTime = 0;
         // The child may drain past this point; its exit is stale by then and
         // settles nothing, so requests still waiting on it fail here.

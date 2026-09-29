@@ -131,10 +131,19 @@ export function hasDelivery(): boolean {
 /** Make a prepared backend the live runtime; the caller owns identity verification. */
 function installRuntime(url: string, backend: PostgresBackend): DataReadinessDriver {
   activeUrl = url;
+  reportStore(url);
   bootStatus = { ...bootStatus, mode: 'postgres', state: 'starting' };
   const ws = initWorkingSet(backend);
   setGuildDataBackend(backend);
   return initDataReadiness(backend, ws, { held: true });
+}
+
+/** The parent's web UI reader follows the store this child serves, in-process deliveries included; null while it serves none. */
+function reportStore(url: string | null): void {
+  if (!process.send) return;
+  try {
+    process.send({ type: 'data:store', data: { url } }, () => { /* a closed channel is the parent gone */ });
+  } catch { /* the parent reads the node's own database until the next install */ }
 }
 
 function startPostgresRuntime(url: string): void {
@@ -327,6 +336,7 @@ export function holdOwnRuntimeForDelivery(reason: string, stopBackend = true): v
   getDataReadiness()?.stop();
   getWorkingSet()?.quiesce();
   activeUrl = null;
+  reportStore(null);
   setGuildDataBackend(null);
   bootStatus = { ...bootStatus, state: 'refused', refusalReason: reason };
   console.error(`[Data] HOLDING the data layer: ${reason}`);

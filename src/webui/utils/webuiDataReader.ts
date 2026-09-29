@@ -8,15 +8,36 @@ import { loadCredentials } from '../../utils/envLoader';
 
 const READER_ERROR = 'data backend unreachable';
 
+let reportedUrl: string | null = null;
+let generation = 0;
+
+/**
+ * The store the running bot child serves, reported over IPC at every install
+ * of its postgres runtime (a delivered database, a stand-in's copy). Null
+ * while no child serves one: the reader then opens the node's own database.
+ */
+export function setWebuiDataStoreUrl(url: string | null): void {
+  const next = url && url.trim() ? url.trim() : null;
+  if (next === reportedUrl) return;
+  reportedUrl = next;
+  generation += 1;
+}
+
 export class WebuiDataReader {
   private pool: Pool | null = null;
+  private poolGeneration = -1;
 
   private getPool(): Pool {
+    if (this.pool && this.poolGeneration !== generation) {
+      void this.pool.end().catch(() => {});
+      this.pool = null;
+    }
     if (!this.pool) {
-      const url = (loadCredentials().DATA_BACKEND_URL || '').trim();
+      const url = (reportedUrl ?? (loadCredentials().DATA_BACKEND_URL || '')).trim();
       if (!url) {
         throw new Error(READER_ERROR);
       }
+      this.poolGeneration = generation;
       this.pool = new Pool({
         connectionString: url,
         max: 2,
