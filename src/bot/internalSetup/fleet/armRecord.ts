@@ -22,6 +22,9 @@ import { atomicWriteFileSync } from './fileControlStore';
  */
 export type ArmPhase = 'claimed' | 'serving' | 'promoting' | 'promoted' | 'disarmed';
 
+/** The disarm reason a manual promote from a serving stand-in writes (20.5: the stand-in identity ends there). */
+export const PROMOTED_BY_HAND = 'promoted by hand into the true master';
+
 const PHASES: ArmPhase[] = ['claimed', 'serving', 'promoting', 'promoted', 'disarmed'];
 
 /** The six-term conjunction as observed at the instant the lane armed (F19). */

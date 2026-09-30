@@ -50,7 +50,7 @@ import {
   stripUrlCredentials,
 } from '../bot/internalSetup/fleet/replicaPromotion';
 import { StandInWriteRequest, clearSuperseded, freshMasterClaim, masterStoreDeadNow } from '../bot/internalSetup/fleet/stepDown';
-import { readArmRecord, writeArmRecord } from '../bot/internalSetup/fleet/armRecord';
+import { PROMOTED_BY_HAND, readArmRecord, writeArmRecord } from '../bot/internalSetup/fleet/armRecord';
 import { closeStandInEpisodeOrWarn, failbackEpisode, promoteClosesEpisode, readEpisodeRecord, recallLineageVerdict, writeEpisodeRecordOrWarn } from '../bot/internalSetup/fleet/episodeRecord';
 import { backupsAhead, readSlotStatus, sourceMatchesAny } from '../bot/internalSetup/fleet/slotStatus';
 import { watchForSyncWaitCancel } from '../bot/internalSetup/utils/syncWaitCancel';
@@ -622,8 +622,6 @@ export async function startStandInWrites(botManager: BotManager, req: StandInWri
   console.warn(`[Fleet] STAND-IN WRITE STEP started for ${req.coveringNodeId.slice(0, 8)} (held to ${req.heldToLsn ?? 'unknown'}): promoting this machine's copy`);
   void runPhases(botManager, record, spliced);
 }
-
-const PROMOTED_BY_HAND = 'promoted by hand into the true master';
 
 /**
  * The stand-in lane a takeover promote ends (B6-j), from the restart and from

@@ -13,6 +13,7 @@ import { getGuildDataBackend } from '../utils/dataManager';
 import { PostgresBackend } from '../utils/dataBackends/postgresBackend';
 import { FileControlStore, atomicWriteFileSync } from './fileControlStore';
 import { FLEET_DIR } from './constants';
+import type { StagedDocName, StagingHooks } from './standInStaging';
 import { watchPoolForSyncWaitCancel } from '../utils/syncWaitCancel';
 import type { SyncPosturePayload } from './protocol';
 import type {
@@ -94,6 +95,7 @@ export class ControlStoreReadOnlyError extends Error {
 export class PostgresControlStore implements ControlStore {
   private provisioned = false;
   private readOnlyNoted = false;
+  private stageFailureNoted = false;
   private mintedTerm: number | null = null;
   private fenced = false;
   private fencedCb: ((observedTerm: number) => void) | null = null;
@@ -110,8 +112,17 @@ export class PostgresControlStore implements ControlStore {
    * - Writes become no-ops instead of throws. persist() is awaited inside the
    *   distribution pass, so a throw there aborts free-shard placement for the
    *   whole pass rather than just failing to record it.
+   * - The placement documents (plan, registry, fleet config) go through
+   *   `stage`: written to it instead of dropped, and read from it before the
+   *   copy's own, so a serve-only re-boot keeps the placement it built and the
+   *   boot that first writes lands it (B7-F29).
    */
-  constructor(private readonly pool: Pool, private readonly readOnly = false, private readonly ownsPool = false) {
+  constructor(
+    private readonly pool: Pool,
+    private readonly readOnly = false,
+    private readonly ownsPool = false,
+    private readonly stage: StagingHooks | null = null,
+  ) {
     if (readOnly) this.provisioned = true;
   }
 
@@ -381,9 +392,10 @@ export class PostgresControlStore implements ControlStore {
 
   /** Term-fenced transaction wrapper: commit only under this master's minted term. */
   private async fencedWrite(fn: (client: PoolClient) => Promise<void>): Promise<void> {
-    // Every document write on this store is bookkeeping that only the NEXT
-    // master boot reads back, so dropping it costs a stand-in nothing it can
-    // use, while attempting it costs the caller its whole pass.
+    // Every write reaching here on a read-only store is bookkeeping a stand-in
+    // cannot use (the placement documents went through writeDoc and its stage
+    // hook first), so dropping it costs nothing, while attempting it costs the
+    // caller its whole pass.
     if (this.readOnly) return;
     if (this.fenced) throw new Error('[Fleet] Control store is fenced (another master holds the term); write refused');
     if (this.mintedTerm === null) throw new Error('[Fleet] Control store write before term acquisition');
@@ -439,33 +451,60 @@ export class PostgresControlStore implements ControlStore {
     await this.fencedWrite(client => client.query(`DELETE FROM smdb_control.docs WHERE name = $1`, [name]).then(() => undefined));
   }
 
+  /** The placement documents: through the fence, or staged while this store is read-only (B7-F29); a write here never throws on a read-only store. */
+  private async writeDoc(name: StagedDocName, body: string): Promise<void> {
+    if (this.readOnly) {
+      if (this.stage === null) return;
+      try {
+        this.stage.write(name, body);
+      } catch (error) {
+        if (!this.stageFailureNoted) {
+          this.stageFailureNoted = true;
+          console.warn(`[Fleet] The placement this stand-in builds could not be staged (${error instanceof Error ? error.message : error}); the last staged copy is what a writing boot lands`);
+        }
+      }
+      return;
+    }
+    await this.fencedWrite(client => this.upsertDoc(client, name, body));
+  }
+
+  /** The staged body of a placement document while this store is read-only, or null to read the copy's own. */
+  private stagedBody(name: StagedDocName): string | null {
+    if (!this.readOnly || this.stage === null) return null;
+    try {
+      return this.stage.read(name);
+    } catch {
+      return null;
+    }
+  }
+
   async savePlan(plan: PersistedPlan): Promise<void> {
-    await this.fencedWrite(client => this.upsertDoc(client, 'plan', JSON.stringify(plan)));
+    await this.writeDoc('plan', JSON.stringify(plan));
   }
 
   async saveFleetConfig(config: PersistedFleetConfig): Promise<void> {
-    await this.fencedWrite(client => this.upsertDoc(client, 'fleet-config', JSON.stringify(config)));
+    await this.writeDoc('fleet-config', JSON.stringify(config));
   }
 
   async loadFleetConfig(): Promise<PersistedFleetConfig | null> {
-    const body = await this.readDoc('fleet-config');
+    const body = this.stagedBody('fleet-config') ?? await this.readDoc('fleet-config');
     if (body === null) return null;
     try { return JSON.parse(body) as PersistedFleetConfig; } catch { return null; }
   }
 
   async loadPlan(): Promise<PersistedPlan | null> {
-    const body = await this.readDoc('plan');
+    const body = this.stagedBody('plan') ?? await this.readDoc('plan');
     if (body === null) return null;
     try { return JSON.parse(body) as PersistedPlan; } catch { return null; }
   }
 
   async saveRegistry(registry: PersistedRegistry): Promise<void> {
-    await this.fencedWrite(client => this.upsertDoc(client, 'registry', JSON.stringify(registry)));
+    await this.writeDoc('registry', JSON.stringify(registry));
   }
 
   async loadRegistry(): Promise<PersistedRegistry> {
     let parsed: PersistedRegistry | null = null;
-    const body = await this.readDoc('registry');
+    const body = this.stagedBody('registry') ?? await this.readDoc('registry');
     if (body !== null) {
       try { parsed = JSON.parse(body) as PersistedRegistry; } catch { parsed = null; }
     }
@@ -623,7 +662,7 @@ export function createControlStore(standalone: boolean): ControlStore {
  * the MASTER's primary - the host the arm lane just proved unreachable in order
  * to arm at all. Opening that here would dial a dead machine forever.
  */
-export function createStandInControlStore(url: string): PostgresControlStore {
+export function createStandInControlStore(url: string, stage: StagingHooks | null = null): PostgresControlStore {
   const pool = new Pool({
     connectionString: url,
     max: 2,
@@ -632,7 +671,7 @@ export function createStandInControlStore(url: string): PostgresControlStore {
   });
   pool.on('error', err => console.warn('[Fleet] Stand-in control store idle client error:', err instanceof Error ? err.message : err));
   guardPoolClients(pool, 'the stand-in control store');
-  return new PostgresControlStore(pool, true, true);
+  return new PostgresControlStore(pool, true, true, stage);
 }
 
 /**

@@ -47,6 +47,7 @@ import {
 } from './nodeIdentity';
 import { ControlStoreReadOnlyError, createStandInControlStore, prepareControlStore, PostgresControlStore } from './postgresControlStore';
 import { ArmRecord, readArmRecord, writeArmRecord } from './armRecord';
+import { clearStandInStaging, landStandInStagingOrWarn, reconcileStandInStaging, stagingHooksFor } from './standInStaging';
 import { closeStandInLane, rememberLineageVerdict, seizedEpisode, standInEnding, writeEpisodeRecordOrWarn } from './episodeRecord';
 import { backupModeEnabled, leverRank, readModeOverride } from './modeOverride';
 import { clearOwnSyncPosture } from './syncPosture';
@@ -1045,7 +1046,9 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   // synchronous_standby_names still has to go, but only when it leaves recovery,
   // which is the write step's job.
   const bootRelaxed = serveOnly ? false : await clearOwnSyncPosture();
-  const store = serveOnly ? createStandInControlStore(standInUrl) : await prepareControlStore(standalone).catch((error: unknown) => {
+  const store = serveOnly
+    ? createStandInControlStore(standInUrl, stagingHooksFor(armRecord!.armedAt))
+    : await prepareControlStore(standalone).catch((error: unknown) => {
     if (error instanceof ControlStoreReadOnlyError) return parkOnReadOnlyStore(error);
     throw error;
   });
@@ -1084,6 +1087,10 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   // ruling-5 takeover chain. The override's one-shot flags are read BEFORE the
   // CAS and consumed right after it succeeds.
   const bootOverride = readRoleOverride();
+  // A staging from another lane, or from one that ended without writes, goes
+  // before anything reads it (B7-F29); the hand promote's is kept for the
+  // takeover boot alone.
+  reconcileStandInStaging(armRecord, bootOverride?.takeover === true || bootOverride?.chainTakeover === true);
   // A staged takeover is consent only while nothing has held the fleet since
   // it was staged: a holder sighting at or after the override's own stamp (the
   // engine refuses to stage over an older one) means the fleet moved past it
@@ -1179,6 +1186,16 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       const onDisk = readArmRecord();
       if (onDisk) writeArmRecord({ ...onDisk, phase: 'promoted', promotedAt: onDisk.promotedAt ?? Date.now(), writeRequestedAt: null, writeGate: null });
       console.error(`[Fleet] STANDING IN for ${coveringNodeId} WITH WRITES at term ${term} (inherited ${armRecord!.inheritedTerm ?? 'unknown'}): this copy is the fleet database until the master returns for failback or an operator promotes this node for good`);
+      // The placement built while serving read-only lands once, before the
+      // plan is read back below (B7-F29).
+      await landStandInStagingOrWarn(store, armRecord!.armedAt, '[Fleet] STAND-IN WRITE STEP');
+    } else if (bootOverride?.takeover === true || bootOverride?.chainTakeover === true) {
+      // The hand promote of a serving stand-in (F9) boots this takeover master.
+      // Its arm record can still read serving here (the promote disarms it only
+      // after this restart resolved), so the takeover flag is the key, and the
+      // staging is spent either way.
+      if (armRecord !== null) await landStandInStagingOrWarn(store, armRecord.armedAt, '[Fleet] PROMOTED BY HAND');
+      else clearStandInStaging();
     }
   }
   if (bootOverride?.takeover || bootOverride?.chainTakeover) consumeTakeoverFlags();
@@ -3565,6 +3582,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
 
 async function initCoWorker(init: CommonInit, followerHold: FollowerHoldBase | null = null): Promise<FleetContext> {
   const { nodeId, nodeName, appVersion, capabilities, runtime } = init;
+  reconcileStandInStaging(readArmRecord(), false);
   if (followerHold) {
     _setFollowerHold(followerHold);
     // The database this node booted on is behind the fleet's, or is the copy
