@@ -78,7 +78,8 @@ import { serveSyncRequest, SyncAuthority } from './syncAuthority';
 import { SyncEngine } from './syncEngine';
 import { MirrorAuthority, isMirrorRequest, serveMirrorRequest } from './mirrorAuthority';
 import { MirrorEngine } from './mirrorEngine';
-import { getFrozenStats, getGuildDataBackend, setOwnerInfoProvider } from '../utils/dataManager';
+import { isStaleCopy, listStaleCopies, STALE_COPY_REASON } from './fileFailover';
+import { deleteGuildNamespace, getFrozenStats, getGuildDataBackend, setOwnerInfoProvider } from '../utils/dataManager';
 import {
   applyOperatorDataRead,
   applyOperatorDataWrite,
@@ -199,6 +200,22 @@ let masterDeclareLost: ((nodeId: string) => Promise<AssignResult>) | null = null
 export async function fleetDeclareLost(nodeId: string): Promise<AssignResult> {
   if (!masterDeclareLost) return { success: false, error: 'This node is not the fleet master' };
   return masterDeclareLost(nodeId);
+}
+
+export interface RetireCopiesResult {
+  success: boolean;
+  needsConfirm?: boolean;
+  count?: number;
+  retired?: number;
+  error?: string;
+}
+
+let coWorkerRetireStaleCopies: ((confirm: boolean) => Promise<RetireCopiesResult>) | null = null;
+
+/** The retire reading of a superseded side in file mode (B4f-2): its stale guild copies go to the graveyard. Co-worker only. */
+export async function fleetRetireStaleCopies(confirm: boolean): Promise<RetireCopiesResult> {
+  if (!coWorkerRetireStaleCopies) return { success: false, error: 'This node is not a co-worker' };
+  return coWorkerRetireStaleCopies(confirm);
 }
 
 let masterDrainNode: ((nodeId: string) => Promise<AssignResult>) | null = null;
@@ -605,7 +622,7 @@ async function runStaleMasterFence(
     if (standIn) return disarmStandIn(`${detail}; the master this node was covering is alive`);
     console.error(`[Fleet] STALE MASTER FENCE: ${detail}; parking the boot instead of acquiring a term on a database the fleet has moved off. Demote this node to rejoin as a co-worker.${extra}`);
     noteHolderSighting(holderNodeId, observedTerm, 'fence-park', selfNodeId);
-    _setStaleMasterPark({ observedTerm, localTerm, peerUrl, at: Date.now() });
+    _setStaleMasterPark({ observedTerm, localTerm, peerUrl, at: Date.now(), ...(store instanceof PostgresControlStore ? {} : { reason: `${detail}. Demote this node to rejoin as a co-worker.` }) });
     pushFleetStatusNow();
     return (async () => { for (;;) await guardSleep(TERM_GUARD_POLL_MS); })();
   };
@@ -620,6 +637,25 @@ async function runStaleMasterFence(
     noteHolderSighting(standInNodeId, observedTerm, 'fence-hold', selfNodeId);
     return Promise.resolve({ reason: 'behind', standInNodeId, standInName, observedTerm, localTerm, seenVia, since: Date.now() });
   };
+
+  // File mode (B4f-2): term.json naming ANOTHER node was seeded by a promote
+  // (the store's own mint always names this node). The seed sits above every
+  // term the fleet has beaconed by a margin, so neither half below could
+  // judge it: such a boot is valid only under the takeover that promote
+  // staged, decided on a dead master, and the two rules marked fileSeeded
+  // below hold it to that premise. One whose takeover is no longer staged, or
+  // was not honoured (another node held the fleet since it was staged), parks
+  // here: a later restart must not take the fleet on an old copy with no verdict.
+  // A regenerated identity (node.json lost, term.json kept) names the old id
+  // too and is not a seed: that boot keeps the former rules.
+  const fileSeeded = !(store instanceof PostgresControlStore) && local !== null && local.nodeId !== selfNodeId && !wasNodeIdFreshlyGenerated();
+  if (fileSeeded && !stagedTakeover) {
+    const reason = `this node's term (${localTerm}) was seeded by a promote under node ${local!.nodeId.slice(0, 8)}, and that promote's takeover is not staged any more or was not honoured (another node held the fleet after it was decided), so the seed says nothing about the fleet now; the boot is parked. Demote this node to rejoin as a co-worker, then Promote again from its Fleet tab for a fresh verdict once the master is dead; FLEET_CONFIRM_TAKEOVER=1 on this node plus a restart seizes the fleet onto the adopted copy regardless.`;
+    console.error(`[Fleet] STALE MASTER FENCE: ${reason}`);
+    _setStaleMasterPark({ observedTerm: localTerm, localTerm, peerUrl: `node ${local!.nodeId.slice(0, 8)} (the seed's source)`, at: Date.now(), reason });
+    pushFleetStatusNow();
+    for (;;) await guardSleep(TERM_GUARD_POLL_MS);
+  }
 
   // One witness read serves both halves: the c3 exception in the peer half
   // re-proves its premise on that node's own FRESH beacon, and the witness half
@@ -661,7 +697,14 @@ async function runStaleMasterFence(
       const peer = await probePeerTerm(url, secret, PEER_TERM_PROBE_MS);
       // This node's own answer proves nothing: candidates include its own
       // advertised URL, and a predecessor process may still hold the port.
-      if (peer === null || peer.nodeId === selfNodeId || peer.term < localTerm) continue;
+      if (peer === null || peer.nodeId === selfNodeId) continue;
+      // A seeded file-mode boot (above): terms are per node there, so a lower
+      // term says nothing about who holds the fleet; any other node answering
+      // as a live master falsifies the dead-master premise and is the fence.
+      if (peer.term < localTerm) {
+        if (!fileSeeded) continue;
+        await park(peer.term, url, peer.nodeId, `${url} answers as a live master on term ${peer.term} while this node's store holds ${localTerm}; in file mode terms are per node, so a live master is the fence whatever the numbers`);
+      }
       // 20.12 c3: the promote saw this master alive with its DATABASE dead and
       // the operator took the RPO confirm over it; its bot still answers at the
       // term its dead store froze on, and this node's higher beacon is what
@@ -699,6 +742,17 @@ async function runStaleMasterFence(
     }
   }
 
+  // A seeded file-mode boot (above): a FRESH master beacon from another node
+  // is a live master whatever the numbers, and the only evidence of one this
+  // node cannot dial. The dead master's own beacons are stale by the time a
+  // promote decided over it boots (the verdict refused while one was fresh),
+  // so the takeover passes here; a master that came back meanwhile parks it.
+  if (fileSeeded && claims) {
+    const live = claims.find(c => c.nodeId !== selfNodeId && c.role === 'master' && Date.now() - c.observedAt <= WITNESS_FRESH_WINDOW_MS);
+    if (live) {
+      await park(live.term, `witness beacon of ${live.nodeName}`, live.nodeId, `${live.nodeName} (${live.nodeId.slice(0, 8)}) beacons as a live master at term ${live.term} while this node's store holds ${localTerm}; in file mode terms are per node, so a live master's fresh beacon is the fence whatever the numbers`);
+    }
+  }
   // Witness half (PLAN_REPLICATION 20.6/20.14): a higher term another node
   // EVER posted means this copy is a stale fork, fresh beacon or not, and it
   // is the only evidence that reaches a master that cannot be dialed
@@ -1077,9 +1131,6 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       pushFleetStatusNow();
     });
   }
-  // A node booting as master is not a superseded one; the fact belongs to the
-  // co-worker it becomes after a step-down, and to the manager reading it.
-  clearSuperseded();
   // Shards declined for hydration-timeout: held UNPLACED while the data
   // backend is globally unhealthy (re-granting would just burn identifies);
   // the first healthy report re-enters them into placement.
@@ -1134,6 +1185,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   const stagedTakeover = bootOverride?.takeover === true && !stagedSuperseded;
   const followerHold = await runStaleMasterFence(store, nodeId, nodeName, standalone, envConfirm, stagedTakeover, stagedTakeover ? bootOverride?.supersededStoreDead ?? null : null, serveOnly);
   if (followerHold) {
+    clearSuperseded();
     if (store instanceof PostgresControlStore) await store.close();
     return { followerHold };
   }
@@ -1201,6 +1253,11 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     }
   }
   if (bootOverride?.takeover || bootOverride?.chainTakeover) consumeTakeoverFlags();
+  // A node holding a term is not a superseded one; that fact belongs to the
+  // co-worker it becomes after a step-down. Every park above keeps it (B4f-2:
+  // a park's exits lead back to that co-worker, whose Retire reading and
+  // migration inventory rest on it).
+  clearSuperseded();
   // The stamp is this master's own lease (PLAN_STANDBY 3.1): deposed masters
   // learn of it within one interval, and stamp health feeds the fleet-state banner.
   // Suppressed while standing in: the stamp is an UPDATE, and a zero-row result
@@ -4258,6 +4315,60 @@ async function initCoWorker(init: CommonInit, followerHold: FollowerHoldBase | n
     }
   }
 
+  // The retire reading of a superseded side (B4f-2): the guild copies this node
+  // stamped before the fleet moved on and does not hold, judged against the
+  // superseding term; memoized, since the state is built every few seconds.
+  const STALE_COPIES_CACHE_MS = 5000;
+  let staleCopiesCache: { at: number; list: string[] | null } | null = null;
+  const heldNow = (): { held: Set<number>; shardCount: number | null } => {
+    const held = runtime.getHeldSummary();
+    return { held: new Set(held?.leases.map(l => l.shardId) ?? []), shardCount: held?.shardCount ?? null };
+  };
+  const staleCopiesNow = (): string[] | null => {
+    if (staleCopiesCache && Date.now() - staleCopiesCache.at < STALE_COPIES_CACHE_MS) return staleCopiesCache.list;
+    const superseded = resolveDataBackend() === 'file' && !migrationWorkActive() ? readSuperseded() : null;
+    const { held, shardCount } = heldNow();
+    const list = superseded ? listStaleCopies(nodeId, held, shardCount, superseded.term) : null;
+    staleCopiesCache = { at: Date.now(), list };
+    return list;
+  };
+  let retireRunning = false;
+  coWorkerRetireStaleCopies = async (confirm: boolean): Promise<RetireCopiesResult> => {
+    if (resolveDataBackend() !== 'file') return { success: false, error: 'retiring stale copies is file mode\'s reading of Retire; on postgres the manager re-seeds this side' };
+    const superseded = readSuperseded();
+    if (!superseded) return { success: false, error: 'this node was not superseded; only a side the fleet moved past has stale copies to retire' };
+    if (controlClient?.masterKnown() !== true) return { success: false, error: 'this node is not registered with the new master yet, so what it holds cannot be told from what it keeps; retry once the Fleet tab shows it connected' };
+    if (migrationWorkActive()) return { success: false, error: 'a migration is moving guild data onto or off this node; retry once it has finished' };
+    if (retireRunning) return { success: false, error: 'a retire is already running on this node' };
+    staleCopiesCache = null;
+    const stale = staleCopiesNow() ?? [];
+    if (stale.length === 0) return { success: true, count: 0, retired: 0 };
+    if (!confirm) {
+      return {
+        success: false,
+        needsConfirm: true,
+        count: stale.length,
+        error: `${stale.length} guild cop${stale.length === 1 ? 'y' : 'ies'} on this disk ${stale.length === 1 ? 'is' : 'are'} stale: ${superseded.byNodeName} took the fleet at term ${superseded.term} on the backup's copy of this data. Anything this node wrote after the backup's last copy exists only here. Retiring moves ${stale.length === 1 ? 'that directory' : 'these directories'} to the graveyard (kept for the retention period, restorable from the Graveyard tab) and touches nothing the new master serves.`,
+      };
+    }
+    retireRunning = true;
+    let retired = 0;
+    try {
+      for (const guildId of stale) {
+        // Re-judged alone: a lease or a migration can land while this runs.
+        const { held, shardCount } = heldNow();
+        if (migrationWorkActive() || !isStaleCopy(guildId, nodeId, held, shardCount, superseded.term)) continue;
+        if (await deleteGuildNamespace(guildId, STALE_COPY_REASON)) retired += 1;
+      }
+    } finally {
+      retireRunning = false;
+      staleCopiesCache = null;
+    }
+    console.warn(`[Fleet] Retired ${retired} stale guild cop${retired === 1 ? 'y' : 'ies'} after the supersession by ${superseded.byNodeName} (term ${superseded.term})`);
+    pushFleetStatusNow();
+    return { success: true, count: stale.length, retired };
+  };
+
   _setFleetStateSources({
     role: 'co-worker',
     standalone: false,
@@ -4286,6 +4397,7 @@ async function initCoWorker(init: CommonInit, followerHold: FollowerHoldBase | n
     migrationActive: () => migrationWorkActive(),
     standInVerdict: isBackupMaster() ? () => armVerdict : null,
     mirror: mirrorEngine ? () => mirrorEngine!.getReport() : null,
+    staleCopies: () => staleCopiesNow()?.length ?? null,
   });
 
   // Owner-info source for .owner manifests: null until the first lease grant.

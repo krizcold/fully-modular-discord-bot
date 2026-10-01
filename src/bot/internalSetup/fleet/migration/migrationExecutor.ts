@@ -10,12 +10,14 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { WebSocket } from 'ws';
 import { DATA_ROOT } from '../../../../utils/dataRoot';
+import { atomicWriteFileSync } from '../fileControlStore';
+import { getNodeId } from '../nodeIdentity';
+import { readSuperseded } from '../stepDown';
 import {
   deleteGuildNamespace,
   flushGuild,
   freezeGuildWrites,
   sizeOfGuildData,
-  stampOwner,
   unfreezeGuildWrites,
 } from '../../utils/dataManager';
 import { hashLeg } from '../../utils/dataInterchange';
@@ -545,7 +547,12 @@ export class MigrationExecutor {
   }
 
   private async onInventory(): Promise<XferInventoryReply> {
-    // Post-P4 inventory reads each locally-owned guild's .owner + size.
+    // Post-P4 inventory reads each locally-owned guild's .owner + size. A
+    // superseded side's stale copies (B4f-2: its own stamps below the
+    // superseding term) are not its data to move and stay out, or a
+    // Redistribute run before their Retire would land them over a newer copy.
+    const superseded = readSuperseded();
+    const selfNodeId = getNodeId();
     const guilds: XferInventoryReply['guilds'] = [];
     let names: string[] = [];
     try { names = fs.readdirSync(DATA_ROOT).filter(n => /^\d+$/.test(n)); } catch { /* none */ }
@@ -553,6 +560,7 @@ export class MigrationExecutor {
       let ownerShardIdAtLastServe: number | undefined;
       try {
         const owner = JSON.parse(fs.readFileSync(path.join(DATA_ROOT, guildId, '.owner'), 'utf-8'));
+        if (superseded && owner?.nodeId === selfNodeId && Number.isFinite(owner?.term) && Number(owner.term) < superseded.term) continue;
         if (Number.isInteger(owner?.shardId)) ownerShardIdAtLastServe = owner.shardId;
       } catch { /* no manifest */ }
       guilds.push({ guildId, bytes: await sizeOfGuildData(guildId), ownerShardIdAtLastServe });
@@ -631,28 +639,18 @@ async function removeFreezeSentinel(guildId: string): Promise<void> {
   try { await fs.promises.unlink(path.join(DATA_ROOT, guildId, '.freeze')); } catch { /* absent */ }
 }
 
-// Direct .owner stamp with an explicit (shardId, term, epoch) - the committed
-// target owns the data now, distinct from stampOwner's current-node provider.
+// Direct .owner stamp with an explicit (shardId, term, epoch): the committed
+// target owns the data now, whether or not it holds a lease yet (stampOwner
+// needs one and would leave the dir unstamped), and the commit's term is the
+// stamp's.
 function writeOwnerStamp(guildId: string, info: { shardId: number; term: number; epoch: number }): void {
-  // stampOwner uses the ownerInfoProvider (this node's current identity), which
-  // is exactly what the new owner needs; but its shard/epoch may lag the commit,
-  // so write the authoritative manifest directly, then let stampOwner no-op.
   const dir = path.join(DATA_ROOT, guildId);
   try {
     fs.mkdirSync(dir, { recursive: true });
-    // Preserve nodeId from the current provider by delegating to stampOwner
-    // first (fills nodeId/shardCount), then overwrite shard/term/epoch fields.
-  } catch { /* ignore */ }
-  stampOwner(guildId);
-  try {
-    const file = path.join(dir, '.owner');
-    const existing = JSON.parse(fs.readFileSync(file, 'utf-8'));
-    existing.shardId = info.shardId;
-    existing.term = info.term;
-    existing.epoch = info.epoch;
-    existing.updatedAt = Date.now();
-    fs.writeFileSync(file, JSON.stringify(existing, null, 2), 'utf-8');
-  } catch { /* stampOwner's manifest stands if the overwrite fails */ }
+    atomicWriteFileSync(path.join(dir, '.owner'), JSON.stringify({ guildId, shardId: info.shardId, nodeId: getNodeId(), term: info.term, epoch: info.epoch, updatedAt: Date.now() }, null, 2));
+  } catch (error) {
+    console.warn(`[Migration] Owner stamp for guild ${guildId} failed:`, error instanceof Error ? error.message : error);
+  }
 }
 
 // Hash a leg's target STAGING (not the live dir) for the verify compare.

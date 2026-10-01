@@ -170,6 +170,16 @@ export const MIRROR_DOC_NAMES = ['leases.json', 'registry.json', 'fleet-config.j
 /** Master-side mirror revision record under /data/global/fleet/. */
 export const MIRROR_REVISION_FILENAME = 'mirror.json';
 
+/**
+ * The file-mode promote seeds term.json this far above every term it knows
+ * (the copy's source, the registration, every witness beacon): a file-mode
+ * master mints a term on every boot, so the dead one may hold terms nobody
+ * saw (a crash loop past its mint, reboots while Discord was dark). The
+ * returning master then parks on this boot's higher beacon, or steps down to
+ * it once it reads the witness, instead of meeting it at an equal term.
+ */
+export const FILE_PROMOTE_TERM_MARGIN = 1000;
+
 // ============================================================================
 // MIGRATION (P5): node-to-node data transfer + cutover under commit barriers.
 // ============================================================================

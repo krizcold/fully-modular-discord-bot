@@ -15,6 +15,7 @@ import {
   fleetMigrationsList,
   fleetReadWitness,
   fleetResumeAssignments,
+  fleetRetireStaleCopies,
   fleetSetConfig,
   fleetSyncBump,
   fleetDevCorruptLease,
@@ -147,6 +148,10 @@ export function setupFleetIPCHandlers(): void {
           const shardId = Number(message.data?.shardId);
           const result = fleetDevCorruptLease(shardId);
           response = result.ok ? { success: true } : { success: false, error: result.error };
+          break;
+        }
+        case 'fleet:retireCopies': {
+          response = await fleetRetireStaleCopies(message.data?.confirm === true);
           break;
         }
         default:

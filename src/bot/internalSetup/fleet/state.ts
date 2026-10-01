@@ -242,6 +242,8 @@ export interface FleetState {
   refusedRegistrations: FleetRefusedRegistration[];
   /** Fleet master in file mode: the latest node whose backup designation was refused, one backup being the rule (B4f-1); null when none. */
   backupDesignationRefused: BackupDesignationRefusedView | null;
+  /** Co-worker in file mode that a higher term superseded (B4f-2): live guild dirs it keeps for shards it does not hold; null elsewhere. */
+  staleCopies: number | null;
   /** Co-worker only: lease still held while the master is unreachable. */
   servingOnCachedLease?: boolean;
   /** Co-worker only: ms until the cached lease expires without master contact; null when not on a cached lease. */
@@ -319,6 +321,8 @@ export interface StaleMasterParkView {
   localTerm: number;
   peerUrl: string;
   at: number;
+  /** File mode (B4f-2): why the boot parked, in the fence's words; the Fleet tab shows it in place of the database text. */
+  reason?: string;
 }
 
 let staleMasterPark: StaleMasterParkView | null = null;
@@ -541,6 +545,8 @@ export interface FleetStateSources {
   mirror?: (() => MirrorReport | null) | null;
   /** The latest refused backup designation (B4f-1); fleet master only. */
   backupDesignationRefused?: (() => BackupDesignationRefusedView | null) | null;
+  /** Stale guild copies of a superseded co-worker in file mode (B4f-2). */
+  staleCopies?: (() => number | null) | null;
 }
 
 let sources: FleetStateSources | null = null;
@@ -630,6 +636,7 @@ export function getFleetState(): FleetState {
       lossLog: [],
       refusedRegistrations: [],
       backupDesignationRefused: null,
+      staleCopies: null,
       leases: [],
       nodes: [],
       shardTable: [],
@@ -767,6 +774,7 @@ export function getFleetState(): FleetState {
       lossLog: healthMonitor?.getLossEvents() ?? [],
       refusedRegistrations: refusedRegistrations ?? [],
       backupDesignationRefused: sources.backupDesignationRefused?.() ?? null,
+      staleCopies: null,
       leases,
       nodes,
       shardTable,
@@ -877,6 +885,7 @@ export function getFleetState(): FleetState {
     lossLog: [],
     refusedRegistrations: [],
     backupDesignationRefused: null,
+    staleCopies: sources.staleCopies?.() ?? null,
     servingOnCachedLease,
     cachedLeaseTtlRemainingMs,
     draining,

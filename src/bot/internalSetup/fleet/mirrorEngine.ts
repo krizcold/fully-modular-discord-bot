@@ -19,6 +19,7 @@ import { MSG, MirrorListReply, MirrorReadKind, MirrorReport, MirrorStatus, SyncF
 const STAGING_DIRNAME = '.staging';
 const DOCS_DIRNAME = 'fleet';
 const MANIFEST_FILENAME = 'manifest.json';
+const ADOPT_MARKER_FILENAME = 'adopt.json';
 
 export interface MirrorFileRecord {
   size: number;
@@ -67,6 +68,11 @@ export function mirrorDocsDir(): string {
 
 export function mirrorManifestFile(): string {
   return path.join(mirrorRoot(), MANIFEST_FILENAME);
+}
+
+/** The adopt's commit-intent marker (B4f-2): while it exists the copy is being moved into the live tree and no tick touches it. */
+export function adoptMarkerFile(): string {
+  return path.join(mirrorRoot(), ADOPT_MARKER_FILENAME);
 }
 
 function emptyManifest(): MirrorManifest {
@@ -267,7 +273,7 @@ export class MirrorEngine {
   }
 
   private async tick(): Promise<void> {
-    if (this.running || !this.hooks.masterKnown() || resolveDataBackend() !== 'file') return;
+    if (this.running || !this.hooks.masterKnown() || resolveDataBackend() !== 'file' || fs.existsSync(adoptMarkerFile())) return;
     this.running = true;
     this.attemptedAt = Date.now();
     try {

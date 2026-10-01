@@ -8,15 +8,18 @@ import { dataPath } from '../../../utils/dataRoot';
 import { FLEET_DIR } from './constants';
 import { atomicWriteFileSync } from './fileControlStore';
 
-export type PromotePhase = 'verdict' | 'claim' | 'fence' | 'catchup' | 'promote' | 'restart' | 'done';
+export type PromotePhase = 'verdict' | 'claim' | 'fence' | 'catchup' | 'promote' | 'adopt' | 'pin' | 'seed' | 'restart' | 'done';
+/** The store the phases work on: postgres (claim, fence, catch-up, promote) or file (adopt, pin, seed; B4f-2). */
+export type PromoteBackend = 'postgres' | 'file';
 /** stand-in: a serving stand-in's copy takes the fleet's writes (20.5, B6 map F2); it keeps its backup identity. */
 export type PromoteMode = 'transfer' | 'failover' | 'stand-in';
 
-const PHASES: PromotePhase[] = ['verdict', 'claim', 'fence', 'catchup', 'promote', 'restart', 'done'];
+const PHASES: PromotePhase[] = ['verdict', 'claim', 'fence', 'catchup', 'promote', 'adopt', 'pin', 'seed', 'restart', 'done'];
 
 export interface PromoteRecord {
   phase: PromotePhase;
   mode: PromoteMode;
+  backend: PromoteBackend;
   startedAt: number;
   updatedAt: number;
   parked: boolean;
@@ -62,6 +65,7 @@ export function readPromoteRecord(): PromoteRecord | null {
     return {
       phase: parsed.phase,
       mode: parsed.mode,
+      backend: parsed.backend === 'file' ? 'file' : 'postgres',
       startedAt: Number(parsed.startedAt) || 0,
       updatedAt: Number(parsed.updatedAt) || 0,
       parked: parsed.parked === true,

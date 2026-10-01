@@ -1187,6 +1187,10 @@ function FleetPromoteCard({ api, fleet, reload }) {
   const masterDown = !fleet.masterKnown;
   const pair = fleet.dbReplica === true;
   const record = fleet.promote;
+  // File mode (B4f-2): the copy this node holds is what the promote adopts.
+  const fileMode = fleet.dataBackend === 'file';
+  const selfNode = (fleet.nodes || []).find((n) => n.isSelf);
+  const copy = fileMode && selfNode ? selfNode.mirror : null;
   // A claim parked before its term landed hides nothing: startPromote re-runs
   // the whole verdict over a parked record and the claim is idempotent, so
   // pressing Promote again is the forward exit when Cancel cannot prove the
@@ -1215,7 +1219,9 @@ function FleetPromoteCard({ api, fleet, reload }) {
   const run = (retireOldMaster) => {
     if (busy) return;
     const text = masterDown
-      ? 'Promote this instance to MASTER?\n\nThe master looks unreachable from this node. If its database still answers, this is a zero-loss transfer: the old database is fenced at a known point, the copy here catches up, then takes over. If nothing answers, the copy is promoted as far as replication reached and you will be asked to accept how current it is. This node restarts once as master; workers keep their sessions.'
+      ? (fileMode
+        ? 'Promote this instance to MASTER?\n\nThe master looks unreachable from this node. Its guild data is taken from the copy this node holds; you will be asked to accept how old that copy is. This node restarts once as master.'
+        : 'Promote this instance to MASTER?\n\nThe master looks unreachable from this node. If its database still answers, this is a zero-loss transfer: the old database is fenced at a known point, the copy here catches up, then takes over. If nothing answers, the copy is promoted as far as replication reached and you will be asked to accept how current it is. This node restarts once as master; workers keep their sessions.')
       : retireOldMaster
         ? 'TRANSFER master here and RETIRE the old master?\n\nThe old master is deposed within seconds, keeps serving its shards until this node moves them, then rejoins as a co-worker. Its manager is told to reseed its database as a standby of this node once the transfer completes. No data is lost: the old database is fenced before the copy point.'
         : 'TRANSFER master to this instance?\n\nZero data loss: the old database is fenced at a known point, the copy here catches up to it, then becomes the fleet database. The old master keeps serving its shards until this node moves them, then rejoins as a co-worker. Writes are refused for a few seconds around the switch; Discord sessions stay up.';
@@ -1230,7 +1236,7 @@ function FleetPromoteCard({ api, fleet, reload }) {
         const replayed = res.lagMs != null
           ? `this machine's copy last replayed a transaction ${Math.round(res.lagMs / 1000)}s ago`
           : 'this machine\'s copy has replayed nothing since it started, so how far behind it is cannot be measured';
-        if (!confirm(`${res.error || `Nothing answers on the old master or its database, and ${replayed}.`}\n\nPromoting makes that copy the fleet database, so anything the old one accepted after that point is LOST. Continue?`)) return null;
+        if (!confirm(`${res.error || `Nothing answers on the old master or its database, and ${replayed}.`}\n\n${fileMode ? 'Promoting adopts that copy as this bot\'s live guild data, so anything the old master wrote after that point is LOST (it stays on the old machine until that side retires it).' : 'Promoting makes that copy the fleet database, so anything the old one accepted after that point is LOST.'} Continue?`)) return null;
         return attempt({ ...body, confirmLag: true });
       }
       if (res.needsLineageConfirm && !body.confirmLineage) {
@@ -1260,7 +1266,7 @@ function FleetPromoteCard({ api, fleet, reload }) {
     <div className="usage-stat-card" style={{ marginTop: '10px' }}>
       <div className="usage-stat-title">{fleet.followerHold ? 'Returning master' : 'Backup master'}</div>
       <div className="usage-stat-sub">
-        This instance takes over only when you press a button here: bot and database together, one action.
+        {fileMode ? 'This instance takes over only when you press the button here: the bot restarts as master on the copy of the master\'s guild data it holds.' : 'This instance takes over only when you press a button here: bot and database together, one action.'}
       </div>
       {order.length > 1 && (
         <div className="usage-stat-sub" style={{ marginTop: '4px', color: preferred.length ? '#d29922' : undefined }}>
@@ -1272,15 +1278,26 @@ function FleetPromoteCard({ api, fleet, reload }) {
               : ' The witness has not been read recently, so nothing here says whether a higher-ranked backup is alive.') : ''}
         </div>
       )}
-      {!pair ? (
+      {!fileMode && !pair ? (
         <div className="usage-stat-sub" style={{ color: '#d29922' }}>
           No database standby on this machine yet; the promote refuses until one is seeded (the manager provisions it from the copy block).
+        </div>
+      ) : null}
+      {fileMode ? (
+        <div className="usage-stat-sub" style={{ color: copy && copy.completedAgoMs != null ? undefined : '#d29922' }}>
+          {copy && copy.completedAgoMs != null
+            ? `Copy of the master's guild data: last complete ${fleetFormatAge(copy.completedAgoMs)} (${copy.guildCount} guild${copy.guildCount === 1 ? '' : 's'}, ${(copy.totalBytes / 1048576).toFixed(1)} MB); promoting adopts it, and that age is what you accept losing.`
+            : 'No complete copy of the master\'s guild data on this node yet; the promote refuses until the Backup copy line below shows one.'}
         </div>
       ) : null}
       {!active && (masterDown ? (
         <button onClick={() => run(false)} disabled={busy} style={{ marginTop: '6px' }}>
           {busy ? 'Working...' : 'Promote to master'}
         </button>
+      ) : fileMode ? (
+        <div className="usage-stat-sub" style={{ marginTop: '6px' }}>
+          The master is reachable from this node. Moving the master here while it is alive is a planned transfer, which file mode does not have yet.
+        </div>
       ) : (
         <div style={{ marginTop: '6px' }}>
           <button onClick={() => run(false)} disabled={busy}>
@@ -1301,6 +1318,9 @@ const PROMOTE_PHASE_TEXT = {
   fence: 'Fencing the old database',
   catchup: 'Catching the copy up to the fenced position',
   promote: 'Promoting the local copy',
+  adopt: 'Adopting the copy of the guild data',
+  pin: 'Pinning the shard plan to this node',
+  seed: 'Seeding the term',
   restart: 'Restarting as master',
   done: 'Done',
 };
@@ -1332,10 +1352,10 @@ function FleetPromoteRecord({ api, fleet, reload, readOnly = false }) {
   // A boot parked on a live holder since this record was decided: the engine
   // dismisses on Cancel from the park view, and Continue can only refuse.
   const parkedSince = r.mode !== 'stand-in' && fleet.staleMasterPark && fleet.staleMasterPark.at >= r.startedAt ? fleet.staleMasterPark : null;
-  const cancellable = !!heldBy || !!parkedSince || (r.phase === 'claim' && !r.claimedTerm) || (r.mode === 'failover' && r.phase === 'promote') || r.mode === 'stand-in';
+  const cancellable = !!heldBy || !!parkedSince || (r.phase === 'claim' && !r.claimedTerm) || (r.mode === 'failover' && r.phase === 'promote') || r.mode === 'stand-in' || (r.backend === 'file' && r.phase !== 'restart');
   return (
     <div className="usage-stat-card" style={{ marginTop: '10px', borderColor: idle && r.phase !== 'done' ? '#e5534b' : undefined }}>
-      <div className="usage-stat-title">{`Promote (${r.mode}): ${PROMOTE_PHASE_TEXT[r.phase] || r.phase}${r.parked ? ' · PARKED' : idle && r.phase !== 'done' ? ' · STOPPED' : ''}`}</div>
+      <div className="usage-stat-title">{`Promote (${r.mode}${r.backend === 'file' ? ', file mode' : ''}): ${PROMOTE_PHASE_TEXT[r.phase] || r.phase}${r.parked ? ' · PARKED' : idle && r.phase !== 'done' ? ' · STOPPED' : ''}`}</div>
       {r.lastError ? <div className="usage-stat-sub" style={{ color: '#ed4245' }}>{r.lastError}</div> : null}
       {r.fencedLsn ? <div className="usage-stat-sub">{`Old database fenced at ${r.fencedLsn}`}</div> : null}
       {heldBy ? (
@@ -1435,7 +1455,8 @@ function FleetEpisodeCard({ fleet }) {
 // A master (or the co-worker it became) that a higher term superseded (B4).
 // An ex-stand-in whose episode was handed back names the failback instead of
 // calling its copy inert (B6-j): the drop-back re-seeds it.
-function FleetSupersededBanner({ fleet }) {
+function FleetSupersededBanner({ api, fleet, reload }) {
+  const [busy, setBusy] = React.useState(false);
   const s = fleet.superseded;
   if (!s) return null;
   // Only an episode closed by THIS supersession speaks for the hand-back (the
@@ -1461,7 +1482,41 @@ function FleetSupersededBanner({ fleet }) {
   // A lane the fleet moved on from (a seizure, or a lossy failback): the copy
   // still holds what it took until it is re-seeded, so a dump comes first.
   const seizedHere = own && e.ending === 'seized' && !e.copyReseeded;
-  const tail = thisEpisode
+  // File mode (B4f-2): the new master adopted the backup's copy, so what this
+  // side kept for shards it no longer holds is stale; retiring is its act.
+  const fileMode = fleet.dataBackend === 'file';
+  const stale = fleet.staleCopies;
+  const retire = () => {
+    if (busy) return;
+    setBusy(true);
+    const post = (confirmed) => api.post('/fleet/retire-copies', { confirm: confirmed });
+    post(false)
+      .then((res) => {
+        if (res && res.success === false && res.needsConfirm) {
+          if (!confirm(`${res.error}\n\nRetire ${res.count} stale cop${res.count === 1 ? 'y' : 'ies'} to the graveyard?`)) return null;
+          return post(true);
+        }
+        return res;
+      })
+      .then((res) => {
+        if (res === null) return;
+        if (!res || res.success === false) { showToast((res && res.error) || 'Retire failed', 'error'); return; }
+        showToast(res.retired > 0 ? `${res.retired} stale cop${res.retired === 1 ? 'y' : 'ies'} retired to the graveyard` : 'No stale copies to retire', 'success');
+      })
+      .catch((err) => showToast((err && err.message) || 'Retire failed', 'error'))
+      .finally(() => { setBusy(false); if (reload) reload(); });
+  };
+  // A file promote running from this node adopts a copy that covers these
+  // guilds where it has them; the rest are judged again once it has ended.
+  const promoting = !!(fileMode && fleet.promote && fleet.promote.backend === 'file' && fleet.promote.phase !== 'done');
+  const fileTail = !s.steppedDown
+    ? ''
+    : promoting
+      ? ' A promote from this node is under way; the stale copies it kept are judged again once it has ended (its adopt replaces the ones the copy covers).'
+    : stale > 0
+      ? ` ${stale} guild cop${stale === 1 ? 'y' : 'ies'} this node kept ${stale === 1 ? 'is' : 'are'} stale: ${s.byNodeName} adopted the backup's copy of that data, and anything written here after the backup's last copy exists only on this disk. Retire ${stale === 1 ? 'it' : 'them'} to the graveyard below, then make this node the new master's backup (BOT_NODE_ROLE=backup-master) so it starts mirroring.`
+      : ' No stale guild copies remain on this disk; set BOT_NODE_ROLE=backup-master to make this node the new master\'s backup.';
+  const tail = fileMode ? fileTail : thisEpisode
     ? ` The fleet moved onto a database built from this machine's copy (the failback, or a promote through it), so the writes taken during the outage survived on ${s.byNodeName}'s database. This copy is re-seeded as a standby of it by the drop-back run on this machine's manager when the failback asked this side to retire (its Database modal parks and asks first); otherwise re-seed it by hand from that node's Database modal.`
     : holdsWrites
       ? ` This database is NOT inert: the writes taken during the outage are held ONLY by this copy. Do not re-seed or decommission this side until they are recovered: promote this node for good to make them the fleet's, or take a dump of this database first.`
@@ -1479,6 +1534,9 @@ function FleetSupersededBanner({ fleet }) {
       {`SUPERSEDED by ${s.byNodeName} at term ${s.term} (${s.source}). ${s.steppedDown
         ? 'This node has stepped down and serves as a co-worker of the new master.'
         : 'This node keeps serving its shards until the new master is proven up, then steps down on its own.'}${tail}`}
+      {fileMode && s.steppedDown && !promoting && stale > 0 ? (
+        <div><button onClick={retire} disabled={busy} style={{ fontSize: '0.72rem', padding: '2px 8px', marginTop: '6px' }}>{busy ? 'Working...' : 'Retire stale copies'}</button></div>
+      ) : null}
     </div>
   );
 }
@@ -1783,7 +1841,7 @@ function FleetView({ api, wsClient, guildNames }) {
         )}
         {fleet.staleMasterPark && (
           <div className="usage-notice" style={{ borderColor: '#e5534b', color: '#e5534b' }}>
-            {`STALE MASTER FENCE: ${fleet.staleMasterPark.peerUrl} holds the fleet at term ${fleet.staleMasterPark.observedTerm}, while this node's own database holds term ${fleet.staleMasterPark.localTerm} and nothing is writing to it. The fleet's term ${fleet.staleMasterPark.observedTerm} was minted on that node's database, so this machine's copy is a fork: acquiring a term here would put two masters on one bot token, each writing a database the other never sees. The boot is parked and will not release on its own. Demote this node to rejoin the fleet as a co-worker on the live database - that is the intended recovery, and it is safe even if this machine's copy is the newer one, because the fleet's data lives on the node above. Only if that node must NOT keep the fleet, set FLEET_CONFIRM_TAKEOVER=1 on this node and restart it to seize the fleet onto this database instead; every change the fleet has made on that node is lost.${String(fleet.staleMasterPark.peerUrl || '').startsWith('witness beacon') ? ' One more case releases safely: if this database was DELIBERATELY restored from a dump on this same machine, the fleet has not moved anywhere and the fence is reacting to the rewound control term - the manager\'s restore lane advances it automatically, and the takeover confirm above is the by-hand override.' : ''}`}
+            {fleet.staleMasterPark.reason ? `STALE MASTER FENCE: ${fleet.staleMasterPark.reason}` : `STALE MASTER FENCE: ${fleet.staleMasterPark.peerUrl} holds the fleet at term ${fleet.staleMasterPark.observedTerm}, while this node's own database holds term ${fleet.staleMasterPark.localTerm} and nothing is writing to it. The fleet's term ${fleet.staleMasterPark.observedTerm} was minted on that node's database, so this machine's copy is a fork: acquiring a term here would put two masters on one bot token, each writing a database the other never sees. The boot is parked and will not release on its own. Demote this node to rejoin the fleet as a co-worker on the live database - that is the intended recovery, and it is safe even if this machine's copy is the newer one, because the fleet's data lives on the node above. Only if that node must NOT keep the fleet, set FLEET_CONFIRM_TAKEOVER=1 on this node and restart it to seize the fleet onto this database instead; every change the fleet has made on that node is lost.${String(fleet.staleMasterPark.peerUrl || '').startsWith('witness beacon') ? ' One more case releases safely: if this database was DELIBERATELY restored from a dump on this same machine, the fleet has not moved anywhere and the fence is reacting to the rewound control term - the manager\'s restore lane advances it automatically, and the takeover confirm above is the by-hand override.' : ''}`}
             <div><FleetDemoteButton api={api} /></div>
           </div>
         )}
@@ -1874,7 +1932,7 @@ function FleetView({ api, wsClient, guildNames }) {
             On hold: connected to the master, waiting for a shard to be assigned. Not serving any guilds yet.
           </div>
         )}
-        <FleetSupersededBanner fleet={fleet} />
+        <FleetSupersededBanner api={api} fleet={fleet} reload={loadFleet} />
         {fleet.followerHold && <FleetFollowerHoldBanner api={api} fleet={fleet} />}
         <FleetStandInBanner fleet={fleet} />
         {fleet.backupMaster && fleet.standInVerdict && !(fleet.standIn && fleet.standIn.live) && (
@@ -1887,16 +1945,11 @@ function FleetView({ api, wsClient, guildNames }) {
             {`Role set by operator override (${fleet.roleOverride.setBy}, ${new Date(fleet.roleOverride.setAt).toISOString().slice(0, 16).replace('T', ' ')} UTC)`}
           </div>
         )}
-        {(fleet.backupMaster || (fleet.followerHold && fleet.followerHold.namesThisNode === true)) && fleet.dataBackend === 'postgres' && (
+        {(((fleet.backupMaster || (fleet.followerHold && fleet.followerHold.namesThisNode === true)) && fleet.dataBackend === 'postgres') || (fleet.backupMaster && fleet.dataBackend === 'file')) && (
           <FleetPromoteCard api={api} fleet={fleet} reload={loadFleet} />
         )}
         <FleetModeLeverCard api={api} fleet={fleet} reload={loadFleet} />
         <FleetPromoteRecord api={api} fleet={fleet} reload={loadFleet} />
-        {fleet.backupMaster && fleet.dataBackend !== 'postgres' && (
-          <div className="usage-stat-sub" style={{ marginTop: '6px', color: '#777' }}>
-            Designated backup master in file mode: this node keeps a copy of the master's guild data (the Backup copy line below). Promotion from that copy is not built yet; promotion today is a postgres-mode feature.
-          </div>
-        )}
         {fleet.masterKnown && !fleet.onHold && (
           <div className="usage-stat-card" style={{ marginTop: '10px' }}>
             <div className="usage-stat-title">Connected to master</div>
@@ -2008,7 +2061,7 @@ function FleetView({ api, wsClient, guildNames }) {
           {!fleet.standalone && !fleet.superseded && <div><FleetDemoteButton api={api} /></div>}
         </div>
       )}
-      <FleetSupersededBanner fleet={fleet} />
+      <FleetSupersededBanner api={api} fleet={fleet} reload={loadFleet} />
       <FleetEpisodeCard fleet={fleet} />
       <FleetPromoteRecord api={api} fleet={fleet} reload={loadFleet} />
 

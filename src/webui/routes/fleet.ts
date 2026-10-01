@@ -396,6 +396,24 @@ export function createFleetRoutes(botManager: BotManager): Router {
   });
 
   /**
+   * POST /api/fleet/retire-copies { confirm? }
+   * The retire reading of a superseded side in file mode (B4f-2): the guild
+   * copies this co-worker keeps for shards it no longer holds go to the
+   * graveyard. Without confirm the child answers needsConfirm with the count.
+   */
+  router.post('/retire-copies', async (req: Request, res: Response) => {
+    try {
+      if (!botManager.isRunning()) {
+        res.json({ success: false, error: 'Bot is not running' });
+        return;
+      }
+      res.json(await botManager.retireFleetStaleCopies(req.body?.confirm === true));
+    } catch (error) {
+      res.json({ success: false, error: error instanceof Error ? error.message : 'retire failed' });
+    }
+  });
+
+  /**
    * POST /api/fleet/dev/corrupt-lease { shardId }
    * Dev fault hook (drill P2.8): corrupt a held lease so the next renew reports
    * lease-mismatch. Inert unless FLEET_DEV_HOOKS=1 on the bot; never a 500.

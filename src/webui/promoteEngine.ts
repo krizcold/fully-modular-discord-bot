@@ -27,6 +27,7 @@ import {
   CONTROL_PORT_DEFAULT,
   PROMOTE_SQL_TIMEOUT_MS,
   REPLICA_LAG_PROMOTE_MAX_MS,
+  FILE_PROMOTE_TERM_MARGIN,
 } from '../bot/internalSetup/fleet/constants';
 import { isContainerPinned, loadCredentials } from '../utils/envLoader';
 import { clearRoleOverride, getNodeId, getNodeName, invalidateRoleOverrideCache, readRoleOverride, writeRoleOverride } from '../bot/internalSetup/fleet/nodeIdentity';
@@ -34,6 +35,8 @@ import { promoteReachabilityWarning } from '../bot/internalSetup/fleet/armLane';
 import { fleetMasterCandidates } from '../bot/internalSetup/fleet/fleetConfig';
 import { judgeReachability } from '../bot/internalSetup/fleet/reachability';
 import { PromoteRecord, clearPromoteRecord, readPromoteRecord, writePromoteRecord } from '../bot/internalSetup/fleet/promoteRecord';
+import { adoptMirror, adoptStarted, clearAdoptMarker, finishAdopt, pinPlacement, seedTerm } from '../bot/internalSetup/fleet/fileFailover';
+import { readMirrorManifest } from '../bot/internalSetup/fleet/mirrorEngine';
 import { HolderSighting, readHolderSighting } from '../bot/internalSetup/fleet/holderSighting';
 import {
   ReplicaEndpoints,
@@ -216,7 +219,10 @@ function dismissSupersededRecord(record: PromoteRecord): void {
     clearRoleOverride();
     console.warn('[Fleet] PROMOTE dismissed: the takeover override its restart phase staged is cleared, so the next start boots this node in its configured role (a master through the fence, a designated backup as a co-worker)');
   }
-  if (record.phase === 'promote' || record.phase === 'restart') {
+  if (record.backend === 'file' && (record.phase !== 'adopt' || adoptStarted())) {
+    console.error(`[Fleet] PROMOTE dismissed past its adopt (file mode, ${record.parked ? 'parked' : 'stopped'} at ${record.phase}: ${record.lastError ?? 'no error recorded'}); the guild data adopted from the old master stays in this node's live tree under its own ownership and the pinned placement in its fleet directory, served by nobody while this node is a co-worker: the next adopt or migration onto this node graveyards those dirs first; the mirror resumes on its next tick`);
+    clearAdoptMarker();
+  } else if (record.phase === 'promote' || record.phase === 'restart') {
     console.error(`[Fleet] PROMOTE dismissed past its promote phase (${record.mode}, ${record.parked ? 'parked' : 'stopped'} at ${record.phase}: ${record.lastError ?? 'no error recorded'}); this machine's copy may have left recovery and /data/.env may already name it; the manager's replica verdict decides its fate`);
   }
   if (record.claimedTerm !== null || record.fencedLsn) {
@@ -280,11 +286,11 @@ export async function startPromote(botManager: BotManager, opts: PromoteStartOpt
       hold && hold.namesThisNode === null ? 'this node is the fleet\'s master by configuration and holds behind the node that took the fleet while it was down, but it is not registered with that node yet, so the failback cannot start; wait for the registration, or demote this node to stay a co-worker'
       : hold ? 'this node is the fleet\'s master by configuration, but the node it follows no longer stands in for it (it was promoted by hand, or the lane ended), so there is no failback to run; demote this node to stay a co-worker, or set BOT_NODE_ROLE=backup-master to make it a designated backup'
       : 'this node is not the designated backup master (set BOT_NODE_ROLE=backup-master)')
-    : state.dataBackend !== 'postgres' ? 'promotion is a postgres-mode feature (file mode has no standby)'
     : state.draining === true ? 'this node is draining; promotion refused'
     : state.migrationWorkActive === true ? 'a migration/transformation is working on this node; wait for it to finish'
     : null;
   if (refusal) return { success: false, error: refusal };
+  if (state.dataBackend === 'file') return startFilePromote(botManager, state, opts, existing);
 
   // The fleet database this promote fences and claims, and the credentials
   // the local copy takes. A returning master's own URL names ITS database,
@@ -472,11 +478,8 @@ export async function startPromote(botManager: BotManager, opts: PromoteStartOpt
   // own role is exempt: it is what the operator set up to be dialed, and its
   // failback runs unattended.
   if (!returningMaster && opts.confirmReachability !== true) {
-    const publicUrl = process.env.FLEET_PUBLIC_URL || '';
-    const candidates = fleetMasterCandidates();
-    const reach = await judgeReachability(publicUrl, candidates, Number(process.env.CONTROL_PORT) || CONTROL_PORT_DEFAULT);
-    const warning = promoteReachabilityWarning(reach, publicUrl, candidates);
-    if (warning) return { success: false, needsReachabilityConfirm: true, error: warning };
+    const refused = await reachabilityRefusal();
+    if (refused) return refused;
   }
 
   // The death path never reaches the old master's database, so the node it
@@ -518,6 +521,7 @@ export async function startPromote(botManager: BotManager, opts: PromoteStartOpt
   const record: PromoteRecord = {
     phase: resume ? resume.phase : firstPhase,
     mode,
+    backend: 'postgres',
     startedAt: Date.now(),
     updatedAt: Date.now(),
     parked: false,
@@ -546,6 +550,114 @@ export async function startPromote(botManager: BotManager, opts: PromoteStartOpt
   writePromoteRecord(record);
   console.warn(`[Fleet] PROMOTE started (${mode}): ${resume ? 'resumed at' : 'phase'} ${record.phase}${record.retireOldMaster ? ', old master to be retired' : ''}`);
   void runPhases(botManager, record, spliced);
+  return { success: true, record };
+}
+
+/** The B7-F18 warn-and-confirm: no other instance can reach this node as master. */
+async function reachabilityRefusal(): Promise<PromoteStartResult | null> {
+  const publicUrl = process.env.FLEET_PUBLIC_URL || '';
+  const candidates = fleetMasterCandidates();
+  const reach = await judgeReachability(publicUrl, candidates, Number(process.env.CONTROL_PORT) || CONTROL_PORT_DEFAULT);
+  const warning = promoteReachabilityWarning(reach, publicUrl, candidates);
+  return warning ? { success: false, needsReachabilityConfirm: true, error: warning } : null;
+}
+
+/**
+ * The file-mode verdict (B4f-2, PLAN_REPLICATION 20.20): the designated backup
+ * adopts the copy of the master's guild data it holds. Only a DEAD master is
+ * taken over here (a live one is moved by the planned transfer, not built
+ * yet); the RPO is the age of the last complete copy, confirmed by the
+ * operator as the postgres lane confirms a standby's lag.
+ */
+async function startFilePromote(botManager: BotManager, state: any, opts: PromoteStartOptions, existing: PromoteRecord | null): Promise<PromoteStartResult> {
+  let witnessStatus = state.witness ?? null;
+  const fresh = await botManager.readFleetWitness();
+  if (fresh?.success && fresh.witness) witnessStatus = fresh.witness;
+  else console.warn('[Fleet] Promote has no fresh witness reading (this node runs no witness, or the read failed); judging on the last cached one, which the freshness windows will reject if it is old');
+  const masterAlive = state.masterKnown === true || (witnessStatus ? freshMasterClaim(witnessStatus, state.nodeId, Date.now()) !== null : false);
+  if (masterAlive) {
+    return { success: false, error: 'the master is still alive (its control connection is up or its witness beacon is fresh). Moving the master to this node while it is alive is a planned transfer, which file mode does not have yet, so this node cannot take over while the master answers. If it must, stop the old master first and promote again: the copy this node holds is then adopted.' };
+  }
+  if ((loadCredentials().CONTROL_STORE_URL || '').trim() !== '') {
+    return { success: false, error: 'this node keeps its guild data in files but its control store is a database (CONTROL_STORE_URL), a layout the file-mode promote does not cover: the plan it would pin and the term it would seed live in files that boot never reads. Keep the control store in files beside the data, or move the data to postgres, before relying on a promote here.' };
+  }
+  const manifest = readMirrorManifest();
+  if (!manifest || manifest.completedAt === null || manifest.sourceNodeId === null) {
+    return { success: false, error: 'this node holds no complete copy of the master\'s guild data (the Backup copy line on the Fleet tab says why); the file-mode promote adopts that copy, so there is nothing to promote from yet' };
+  }
+  // The copy must be of the master this node last registered with: a copy of
+  // a previous master is held, not adopted (the engine's foreign-copy hold).
+  const sighting = readHolderSighting();
+  if (sighting && sighting.nodeId !== manifest.sourceNodeId) {
+    return { success: false, error: `this node's copy was taken from ${manifest.sourceNodeName ?? manifest.sourceNodeId.slice(0, 8)}, but the master it last registered with is node ${sighting.nodeId.slice(0, 8)} (term ${sighting.term}); a copy of a previous master cannot stand for the one that died` };
+  }
+  // The fleet's highest term known here floors the seed: the copy's source
+  // term, the registration, and every beacon the witness holds (a master that
+  // minted and died after the last listing left one above the copy's term, and
+  // a boot minting at or below it would not park that master when it returns).
+  const claims: { nodeId: string; term: number }[] = Array.isArray(witnessStatus?.claims) ? witnessStatus.claims : [];
+  const sourceBeacon = claims.reduce((max, c) => (c.nodeId === manifest.sourceNodeId && Number.isFinite(c.term) ? Math.max(max, c.term) : max), 0);
+  const anyBeacon = claims.reduce((max, c) => (Number.isFinite(c.term) ? Math.max(max, c.term) : max), 0);
+  const supersededTerm = Math.max(manifest.sourceTerm ?? 0, sighting?.term ?? 0, sourceBeacon) || null;
+  const seedFloor = Math.max(supersededTerm ?? 0, anyBeacon, Number.isFinite(state.term) ? Number(state.term) : 0) || null;
+  const lagMs = Math.max(0, Date.now() - manifest.completedAt);
+  let complete = 0;
+  let partial = 0;
+  let bytes = 0;
+  for (const guild of Object.values(manifest.guilds)) {
+    if (guild.hash === null) partial += 1;
+    else complete += 1;
+    for (const file of Object.values(guild.files)) bytes += file.size;
+  }
+  if (opts.confirmLag !== true && (lagMs > REPLICA_LAG_PROMOTE_MAX_MS || partial > 0)) {
+    return {
+      success: false,
+      needsLagConfirm: true,
+      lagMs,
+      error: `this node's copy of the master's guild data was last complete ${Math.round(lagMs / 1000)}s ago (${complete} guild(s), ${(bytes / 1048576).toFixed(1)} MB)${partial > 0 ? `; ${partial} guild(s) are partial since then, their copy mixing files from before and after that point` : ''}; promoting adopts that copy and accepts losing anything the master wrote after it.`,
+    };
+  }
+  if (opts.confirmReachability !== true) {
+    const refused = await reachabilityRefusal();
+    if (refused) return refused;
+  }
+  const still = readPromoteRecord();
+  if (phasesRunning || (still && still.phase !== 'done' && (still.parked !== existing?.parked || still.updatedAt !== existing?.updatedAt))) {
+    return { success: false, error: 'a promote is already running or was restarted while this one was being decided; look at its current phase and retry' };
+  }
+  // The superseded fact, if this node carries one, stays: the master boot
+  // clears it, and a promote cancelled or dismissed before that boot leaves
+  // the Retire reading and the inventory's stale-copy rule their evidence.
+  const record: PromoteRecord = {
+    phase: 'adopt',
+    mode: 'failover',
+    backend: 'file',
+    startedAt: Date.now(),
+    updatedAt: Date.now(),
+    parked: false,
+    lastError: null,
+    startedBy: opts.startedBy === 'manager-promote' ? 'manager-promote' : 'webui-promote',
+    // The old side's retire is its own operator's act in file mode (the Fleet
+    // tab's Retire stale copies), so no instruction travels on the register reply.
+    retireOldMaster: false,
+    supersededNodeId: manifest.sourceNodeId,
+    supersededTerm,
+    supersededDelivered: false,
+    // The seed's floor (file mode): the highest term the fleet is known to have reached.
+    expectedTerm: seedFloor,
+    expectedHolder: null,
+    supersededStoreDead: null,
+    claimedTerm: null,
+    fencedLsn: null,
+    lagMs,
+    canonicalEndpoint: null,
+    lineageVerdict: null,
+    holdSince: null,
+    promotedCopy: false,
+  };
+  writePromoteRecord(record);
+  console.warn(`[Fleet] PROMOTE started (failover, file mode): adopting the copy of ${manifest.sourceNodeName ?? manifest.sourceNodeId.slice(0, 8)} (complete ${Math.round(lagMs / 1000)}s ago, ${complete} guild(s))`);
+  void runPhases(botManager, record, null);
   return { success: true, record };
 }
 
@@ -596,6 +708,7 @@ export async function startStandInWrites(botManager: BotManager, req: StandInWri
   const record: PromoteRecord = {
     phase: 'promote',
     mode: 'stand-in',
+    backend: 'postgres',
     startedAt: Date.now(),
     updatedAt: Date.now(),
     parked: false,
@@ -700,6 +813,17 @@ export async function continuePromote(botManager: BotManager): Promise<{ success
       return { success: false, error: 'this promote predates the follower hold this node is in (it names no database the node follows), so continuing it would restart this node as master on its own stale database; Cancel it, and use Promote on the Returning master card for the failback' };
     }
   }
+  if (record.backend === 'file') {
+    const moved = readPromoteRecord();
+    if (phasesRunning || !moved || moved.parked !== record.parked || moved.startedAt !== record.startedAt || moved.updatedAt !== record.updatedAt) {
+      return { success: false, error: 'the promote changed while the continue was being checked; look at its current phase and retry' };
+    }
+    moved.parked = false;
+    moved.lastError = null;
+    writePromoteRecord(moved);
+    void runPhases(botManager, moved, null);
+    return { success: true, record: moved };
+  }
   const endpoints = resolveReplicaEndpoints();
   if (!endpoints) return { success: false, error: 'this instance no longer reports a database standby' };
   const base = record.canonicalEndpoint ? (await readFollowed(botManager))?.url : undefined;
@@ -776,6 +900,24 @@ export async function cancelPromote(botManager?: BotManager): Promise<{ success:
   // superseded and retire facts and the role override is staged, so
   // dismissing it would strand both: Continue is the way forward.
   if (record.phase === 'done') {
+    clearPromoteRecord();
+    return { success: true };
+  }
+  // A file-mode promote cancels at any phase before its restart: what the
+  // adopt moved is residue in this node's live tree (the next adopt or
+  // migration onto it graveyards those dirs first), and a pinned plan or a
+  // seeded term in a co-worker's fleet directory drives nothing. The restart
+  // phase is the point of no return, as on postgres: its override is staged.
+  if (record.backend === 'file' && idle) {
+    if (record.phase === 'restart') return { success: false, error: 'the promote is past the point of cancellation (phase restart; the master override is staged); Continue it instead' };
+    const moved = readPromoteRecord();
+    if (phasesRunning || !moved || moved.parked !== record.parked || moved.startedAt !== record.startedAt || moved.updatedAt !== record.updatedAt) {
+      return { success: false, error: 'the promote changed while the cancel was being checked; look at its current phase and retry' };
+    }
+    if (adoptStarted()) {
+      console.error(`[Fleet] PROMOTE cancelled past its adopt (file mode, at ${record.phase}): the guild data adopted from the old master stays in this node's live tree under its own ownership${record.phase !== 'adopt' ? ' and the pinned placement in its fleet directory' : ''}, served by nobody while this node is a co-worker (the next adopt or migration onto this node graveyards those dirs first); the mirror resumes on its next tick`);
+      clearAdoptMarker();
+    }
     clearPromoteRecord();
     return { success: true };
   }
@@ -930,6 +1072,11 @@ export async function resumePromote(botManager: BotManager): Promise<void> {
     console.error(`[Fleet] PROMOTE parked at resume: ${record.lastError}`);
     return;
   }
+  if (record.backend === 'file') {
+    console.warn(`[Fleet] Resuming the interrupted file-mode promote at phase ${record.phase}`);
+    void runPhases(botManager, record, null);
+    return;
+  }
   const endpoints = resolveReplicaEndpoints();
   if (!endpoints) return;
   // The child's follow is the preferred credential source; past the claim
@@ -949,17 +1096,21 @@ export async function resumePromote(botManager: BotManager): Promise<void> {
   void runPhases(botManager, record, spliced);
 }
 
-async function runPhases(botManager: BotManager, record: PromoteRecord, spliced: { local: string; public: string }): Promise<void> {
+async function runPhases(botManager: BotManager, record: PromoteRecord, spliced: { local: string; public: string } | null): Promise<void> {
   if (phasesRunning) return;
   phasesRunning = true;
   const save = (): void => writePromoteRecord(record);
+  const db = (): { local: string; public: string } => {
+    if (!spliced) throw new Error(`phase ${record.phase} belongs to a postgres promote, not to this file-mode one`);
+    return spliced;
+  };
   try {
     while (record.phase !== 'done') {
       try {
         switch (record.phase) {
           case 'verdict':
           case 'claim':
-            await phaseClaim(botManager, record, spliced);
+            await phaseClaim(botManager, record, db());
             record.phase = 'fence';
             break;
           case 'fence':
@@ -967,7 +1118,7 @@ async function runPhases(botManager: BotManager, record: PromoteRecord, spliced:
             record.phase = 'catchup';
             break;
           case 'catchup':
-            await phaseCatchup(record, spliced.local);
+            await phaseCatchup(record, db().local);
             record.phase = 'promote';
             break;
           case 'promote':
@@ -983,9 +1134,36 @@ async function runPhases(botManager: BotManager, record: PromoteRecord, spliced:
               const seen = promoteSupersededBy(record);
               if (seen) throw new Error(`${supersededText(seen)}; the copy is left a standby${record.claimedTerm !== null || record.fencedLsn ? `, but this lane already claimed term ${record.claimedTerm ?? '?'} on ${record.canonicalEndpoint ?? 'the fleet database'} and left it read-only${record.fencedLsn ? ` at ${record.fencedLsn}` : ''}, and a Cancel discards those facts` : ', so nothing here is spent'}: Cancel this promote, and Promote again on what is reachable now`);
             }
-            await phasePromote(spliced);
+            await phasePromote(db());
             record.phase = 'restart';
             break;
+          case 'adopt': {
+            // Judged before the first rename, as the postgres lane judges before
+            // pg_promote: the sighting can land while the verdict runs.
+            const seen = promoteSupersededBy(record);
+            if (seen) throw new Error(`${supersededText(seen)}; ${adoptStarted() ? 'what the adopt moved so far stays as this node\'s live dirs, served by nobody' : 'nothing has been adopted'}: Cancel this promote, and Promote again on what is reachable now`);
+            const adopted = await adoptMirror(getNodeId());
+            console.warn(`[Fleet] PROMOTE adopt: ${adopted.adopted} guild(s) taken from the copy, ${adopted.kept} already this node's, ${adopted.graveyarded} live dir(s) graveyarded first, ${adopted.skipped} without a copy`);
+            record.phase = 'pin';
+            break;
+          }
+          case 'pin': {
+            const pinned = await pinPlacement(getNodeId(), record.supersededNodeId);
+            console.warn(`[Fleet] PROMOTE pin: shard(s) [${pinned.movedShards.join(', ')}] of the old master pinned to this node${pinned.removed.length > 0 ? `; stale records removed: ${pinned.removed.join(', ')}` : ''}`);
+            record.phase = 'seed';
+            break;
+          }
+          case 'seed': {
+            // Above every term known here BY A MARGIN: a file-mode master mints on
+            // every boot, and the dead one may have minted unseen (a crash loop past
+            // its mint, a reboot while Discord was dark); a returning master below
+            // this boot's term parks on its beacon or steps down to it, one at or
+            // above it would split the fleet or take it back onto stale data.
+            const term = seedTerm(record.supersededNodeId ?? getNodeId(), Math.max(record.expectedTerm ?? 0, record.supersededTerm ?? 0) + FILE_PROMOTE_TERM_MARGIN);
+            console.warn(`[Fleet] PROMOTE seed: term.json holds ${term} under the old master's id; the boot mints ${term + 1}`);
+            record.phase = 'restart';
+            break;
+          }
           case 'restart':
             // 'done' only after the restart actually took: parking at 'done'
             // would leave a record Continue refuses to re-enter. The superseded
@@ -1152,11 +1330,17 @@ async function phaseRestart(botManager: BotManager, record: PromoteRecord): Prom
     // earlier phases run (the child registers with a master that took the fleet
     // meanwhile), and this is the last point before the fence is skipped.
     const seen = promoteSupersededBy(record);
+    if (seen && record.backend === 'file') throw new Error(`${supersededText(seen)}; the takeover restart is not staged, so this node stays a co-worker. The old master's guild data is adopted into this node's live tree under its own ownership and the plan is pinned in its fleet directory, served by nobody (the next adopt or migration onto this node graveyards those dirs first), and the mirror resumes once this promote is cancelled. Cancel this promote; if that node is gone for good, Promote again on what is reachable now`);
     if (seen) throw new Error(`${supersededText(seen)}; the takeover restart is not staged. This machine's copy has already left recovery and /data/.env names it${record.claimedTerm !== null ? `, and this lane claimed term ${record.claimedTerm} on ${record.canonicalEndpoint ?? 'the fleet database'}` : ''}${record.fencedLsn ? ` and left it read-only at ${record.fencedLsn}` : ''}, so there is no Promote left to run here: Cancel this promote, then re-seed this machine as a standby of the node that took the fleet and promote it once it has caught up, or demote this node to stay a co-worker; if that node is gone for good, Cancel this promote and, where this node's Fleet tab still offers Promote (a designated backup, or a hold that still names this node), press it again (this copy is already out of recovery, so the lane left is the repoint and the restart); otherwise seize the fleet onto this copy with FLEET_CONFIRM_TAKEOVER=1 plus a restart on a node whose configured role is master`);
+    // The copy is spent once the adopt and the pin stand: the tree goes before
+    // the override, so a boot that parks and demotes starts a fresh mirror.
+    if (record.backend === 'file') finishAdopt();
+    // No chain for a file record: the pin reassigned every shard the dead
+    // master held, which is all the chain's Declare Lost would free.
     writeRoleOverride({
       role: 'master',
       takeover: true,
-      ...(record.mode === 'failover' ? { chainTakeover: true } : {}),
+      ...(record.mode === 'failover' && record.backend !== 'file' ? { chainTakeover: true } : {}),
       ...(record.supersededStoreDead ? { supersededStoreDead: record.supersededStoreDead } : {}),
       setAt: Date.now(),
       setBy: record.startedBy,

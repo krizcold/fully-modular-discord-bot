@@ -851,6 +851,16 @@ export class BotManager {
     }
   }
 
+  /** Retire the stale guild copies of a superseded co-worker in file mode (B4f-2; validated in the bot child). */
+  async retireFleetStaleCopies(confirm: boolean): Promise<any> {
+    try {
+      return await this.sendIPCMessage('fleet:retireCopies', { confirm });
+    } catch (error) {
+      console.error('[BotManager] Error retiring stale copies:', error);
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
   /**
    * Fire-and-forget sync bump after a webui write (master bot child bumps
    * the sync revision; no-op on co-workers/standalone or with the bot down).
