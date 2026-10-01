@@ -43,7 +43,7 @@ export interface ControlServerHooks {
   onLeaseDecline?: (nodeId: string, payload: LeaseDeclinePayload) => void;
   onLeaseRenew: (nodeId: string, payload: LeaseRenewPayload) => LeaseRenewedPayload;
   onDisconnect: (nodeId: string) => void;
-  /** Worker pull requests (control:sync:files / module:begin / read); term-fenced like every post-register message. */
+  /** Worker pull requests (control:sync:files / module:begin / read, and the mirror list / read of B4f-1); term-fenced like every post-register message. */
   onSyncRequest?: (nodeId: string, type: string, data: any) => Promise<any>;
   onSyncReport?: (nodeId: string, data: any) => void;
   /** Migration progress from a participant (fire-and-forget into the coordinator). */
@@ -271,6 +271,8 @@ export class ControlServer {
         break;
       case MSG.SYNC_FILES:
       case MSG.SYNC_MODULE_BEGIN:
+      case MSG.MIRROR_LIST:
+      case MSG.MIRROR_READ:
       case MSG.SYNC_READ: {
         if (!requestId) break;
         const nodeId = state.nodeId;

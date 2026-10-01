@@ -155,9 +155,9 @@ export class ControlClient {
     this.send(MSG.GUILD_NOTICE, { term: this.term, ...notice });
   }
 
-  /** Sync pull request (files listing / module begin / chunk read). */
-  syncRequest(type: string, data: any): Promise<any> {
-    return this.request(type, data);
+  /** Sync pull request (files listing / module begin / chunk read, and the mirror's); the ack timeout is the control default unless given. */
+  syncRequest(type: string, data: any, timeoutMs?: number): Promise<any> {
+    return this.request(type, data, timeoutMs);
   }
 
   sendSyncReport(report: SyncReportPayload): void {
@@ -411,7 +411,7 @@ export class ControlClient {
     this.ws.send(JSON.stringify({ type: MSG.LEASE_ACK, requestId, data }));
   }
 
-  private request(type: string, data: any): Promise<any> {
+  private request(type: string, data: any, timeoutMs: number = CONTROL_ACK_TIMEOUT_MS): Promise<any> {
     const ws = this.ws;
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       return Promise.reject(new Error('control connection not open'));
@@ -421,7 +421,7 @@ export class ControlClient {
       const timer = setTimeout(() => {
         this.pending.delete(requestId);
         reject(new Error(`control request ${type} timed out`));
-      }, CONTROL_ACK_TIMEOUT_MS);
+      }, timeoutMs);
       this.pending.set(requestId, { resolve, reject, timer });
       try {
         ws.send(JSON.stringify({ type, requestId, data }));

@@ -21,7 +21,7 @@ export interface FileRecord {
 
 // Files that are node-local sidecars, never part of the transferable namespace.
 const EXCLUDED_NAMES = new Set(['.owner', '.freeze']);
-function isExcluded(name: string): boolean {
+export function isExcludedNamespaceName(name: string): boolean {
   return EXCLUDED_NAMES.has(name) || name.endsWith('.tmp');
 }
 
@@ -53,7 +53,7 @@ export function hashFileStreamed(filePath: string): Promise<{ size: number; sha2
 // Resolve a record's relPath under destRoot, or null when it fails the guard
 // (absolute / drive-letter / backslash / empty or '..' segment / escapes root).
 // Mirrors the Stage 3/4 resolveScopeFile traversal idiom.
-function safeImportTarget(destResolved: string, relPath: unknown): string | null {
+export function safeImportTarget(destResolved: string, relPath: unknown): string | null {
   if (typeof relPath !== 'string' || relPath.length === 0) return null;
   if (path.isAbsolute(relPath) || relPath.includes('\\') || /^[a-zA-Z]:/.test(relPath)) return null;
   const segments = relPath.split('/');
@@ -76,7 +76,7 @@ async function* walkFiles(base: string, rel: string = ''): AsyncGenerator<string
     return;
   }
   for (const entry of entries) {
-    if (isExcluded(entry.name)) continue;
+    if (isExcludedNamespaceName(entry.name)) continue;
     const childRel = rel ? `${rel}/${entry.name}` : entry.name;
     if (entry.isDirectory()) {
       yield* walkFiles(base, childRel);
@@ -159,14 +159,19 @@ export async function hashNamespace(guildId: string): Promise<NamespaceHashResul
       files.push({ relPath, size, sha256 });
     } catch { /* file vanished mid-walk */ }
   }
-  files.sort((a, b) => Buffer.compare(Buffer.from(a.relPath, 'utf-8'), Buffer.from(b.relPath, 'utf-8')));
+  return namespaceHashOf(files);
+}
+
+/** The namespace hash of a listed file set (the formula above), shared with the guild-data mirror. */
+export function namespaceHashOf(files: { relPath: string; size: number; sha256: string }[]): NamespaceHashResult {
+  const sorted = [...files].sort((a, b) => Buffer.compare(Buffer.from(a.relPath, 'utf-8'), Buffer.from(b.relPath, 'utf-8')));
   const hash = crypto.createHash('sha256');
   let totalBytes = 0;
-  for (const f of files) {
+  for (const f of sorted) {
     hash.update(`${f.relPath}\n${f.size}\n${f.sha256}\n`);
     totalBytes += f.size;
   }
-  return { namespaceHash: hash.digest('hex'), fileCount: files.length, totalBytes };
+  return { namespaceHash: hash.digest('hex'), fileCount: sorted.length, totalBytes };
 }
 
 /**

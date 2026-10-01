@@ -15,7 +15,7 @@ import { getModuleRegistry } from '../utils/moduleRegistry';
 import { resetAppStoreManager } from '../utils/appStoreManager';
 import { clearSchemaCache } from '../utils/settings/settingsDiscovery';
 import { FLEET_DIR, SYNC_MAX_FILE_BYTES, SYNC_STAGING_DIRNAME } from './constants';
-import { atomicWriteFileSync } from './fileControlStore';
+import { atomicWriteFileSync, renameWithRetry } from './fileControlStore';
 import {
   MSG,
   SyncFileEntry,
@@ -61,19 +61,6 @@ export interface SyncEngineHooks {
   request: (type: string, data: any) => Promise<any>;
   getTerm: () => number;
   sendReport: (data: any) => void;
-}
-
-function renameWithRetry(from: string, to: string): void {
-  for (let attempt = 0; ; attempt++) {
-    try {
-      fs.renameSync(from, to);
-      return;
-    } catch (error) {
-      if (attempt >= 3) throw error;
-      const waitUntil = Date.now() + 25 * (attempt + 1);
-      while (Date.now() < waitUntil) { /* Windows EPERM on rename-over-open */ }
-    }
-  }
 }
 
 function copyDirRecursive(src: string, dst: string): void {

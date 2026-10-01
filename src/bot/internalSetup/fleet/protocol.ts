@@ -36,6 +36,9 @@ export const MSG = {
   SYNC_MODULE_BEGIN: 'control:sync:module:begin',
   SYNC_READ: 'control:sync:read',
   SYNC_REPORT: 'control:sync:report',
+  /** Designated backup -> master (B4f-1): the guild-data mirror listing and chunk reads; served to the designated backup in file mode only. */
+  MIRROR_LIST: 'control:mirror:list',
+  MIRROR_READ: 'control:mirror:read',
   // Migration (P5). PREPARE/DRAIN/COMMIT/ABORT flow master -> participant
   // (request/ack). PROGRESS/VERIFY flow participant -> master (PROGRESS is
   // fire-and-forget; VERIFY is fire-and-forget too, coordinator-driven).
@@ -362,6 +365,8 @@ export interface HeartbeatPayload {
    * clock: a new value means a new event, and the value never moves backwards.
    */
   syncWaitCancelledAt?: number;
+  /** The designated backup's guild-data mirror report (B4f-1); absent on every other node. */
+  mirror?: MirrorReport;
 }
 
 export interface GuildNoticePayload {
@@ -444,6 +449,70 @@ export interface SyncReportPayload {
   appliedRevision: number;
   ok: boolean;
   degraded?: string[];
+}
+
+// ============================================================================
+// GUILD-DATA MIRROR (B4f-1): the designated backup's copy of a file-mode
+// master's guild dirs, pulled over the control channel on a cadence.
+// ============================================================================
+
+export interface MirrorGuildEntry {
+  guildId: string;
+  /** hashNamespace's formula over the files below. */
+  hash: string;
+  files: SyncFileEntry[];
+}
+
+export interface MirrorListRequest {
+  term: number;
+}
+
+export interface MirrorListReply {
+  /** Bumps when the overall hash changes; persisted on the master. */
+  revision: number;
+  sourceNodeId: string;
+  sourceNodeName: string;
+  sourceTerm: number;
+  listedAt: number;
+  guilds: MirrorGuildEntry[];
+  /** Guilds skipped this listing because a migration holds them frozen; the backup keeps its last copy. */
+  frozen: string[];
+  /** The placement documents (leases, registry, fleet config), read-only copies. */
+  documents: SyncFileEntry[];
+}
+
+export type MirrorReadKind = 'guild' | 'document';
+
+export interface MirrorReadRequest {
+  term: number;
+  kind: MirrorReadKind;
+  guildId?: string;
+  path: string;
+  offset: number;
+}
+
+/** A chunk reply; at eof it carries the sha256 of the file as served, so a file rewritten between the listing and the read still lands. */
+export interface MirrorReadReply extends SyncReadReply {
+  sha256?: string;
+}
+
+/** 'held': the copy was taken from another master than the one serving now, and stays untouched until a later lane adopts or retires it. */
+export type MirrorStatus = 'idle' | 'copying' | 'complete' | 'degraded' | 'refused' | 'held';
+
+/** The backup's word on its copy, in its heartbeat and its own fleet state. Ages are elapsed at build time, never clock values. */
+export interface MirrorReport {
+  status: MirrorStatus;
+  /** Ms since the last COMPLETE copy; null when there has never been one. */
+  completedAgoMs: number | null;
+  attemptedAgoMs: number | null;
+  revision: number | null;
+  sourceNodeId: string | null;
+  sourceNodeName: string | null;
+  sourceTerm: number | null;
+  guildCount: number;
+  totalBytes: number;
+  frozenCount: number;
+  error?: string;
 }
 
 // ============================================================================

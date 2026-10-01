@@ -21,7 +21,7 @@ import type { IngestService } from '../ingest/ingestService';
 import { resolveDataBackend } from '../../../utils/envLoader';
 import { getGuildDataBackend } from '../utils/dataManager';
 import { getReplicaHealth, getStandbyLinks, startReplicaHealthSampler, StandbyLinkView } from './replicaHealth';
-import type { ReplicaHealthReport } from './protocol';
+import type { MirrorReport, ReplicaHealthReport } from './protocol';
 import type { SlotStatusRecord } from './slotStatus';
 import { getRouteOverrides } from '../utils/dataBackends/routeResolver';
 import { getDataBootStatus, getDeliveredBackendUrls, hasDelivery, DataBootStatus } from '../utils/dataBackends/boot';
@@ -53,6 +53,15 @@ export interface FleetStateNode {
   syncAppliedRevision: number | null;
   /** The node's local database standby from its heartbeat; null when it has none. */
   dbReplica: ReplicaHealthReport | null;
+  /** The node's guild-data mirror (B4f-1): from its heartbeat on the master's view, from its own engine on itself; null when it keeps none. */
+  mirror: MirrorReport | null;
+}
+
+/** A backup designation the master refused because file mode mirrors to one backup (B4f-1). */
+export interface BackupDesignationRefusedView {
+  nodeId: string;
+  nodeName: string;
+  at: number;
 }
 
 export interface FleetRefusedRegistration {
@@ -231,6 +240,8 @@ export interface FleetState {
   lossLog: LossEvent[];
   /** Register refusals ring (VersionGate etc.); master-only content. */
   refusedRegistrations: FleetRefusedRegistration[];
+  /** Fleet master in file mode: the latest node whose backup designation was refused, one backup being the rule (B4f-1); null when none. */
+  backupDesignationRefused: BackupDesignationRefusedView | null;
   /** Co-worker only: lease still held while the master is unreachable. */
   servingOnCachedLease?: boolean;
   /** Co-worker only: ms until the cached lease expires without master contact; null when not on a cached lease. */
@@ -526,6 +537,10 @@ export interface FleetStateSources {
   migrationActive: (() => boolean) | null;
   /** The arm lane's last refusal (B7-F19); wired on designated backups only. */
   standInVerdict?: (() => StandInVerdictView | null) | null;
+  /** The guild-data mirror report (B4f-1); wired on a designated backup. */
+  mirror?: (() => MirrorReport | null) | null;
+  /** The latest refused backup designation (B4f-1); fleet master only. */
+  backupDesignationRefused?: (() => BackupDesignationRefusedView | null) | null;
 }
 
 let sources: FleetStateSources | null = null;
@@ -614,6 +629,7 @@ export function getFleetState(): FleetState {
       budget: null,
       lossLog: [],
       refusedRegistrations: [],
+      backupDesignationRefused: null,
       leases: [],
       nodes: [],
       shardTable: [],
@@ -659,6 +675,7 @@ export function getFleetState(): FleetState {
       syncAppliedRevision: node.syncAppliedRevision,
       // The master keeps no heartbeat of its own, so its standby is read locally.
       dbReplica: node.isSelf ? getReplicaHealth() ?? null : node.dbReplica,
+      mirror: node.isSelf ? null : node.mirror,
     }));
     // Per-shard guild counts: prefer the REST-derived totals (cover unassigned
     // shards), fall back to the connection-derived guildMap before the first
@@ -749,6 +766,7 @@ export function getFleetState(): FleetState {
       budget: ledger?.getBudgetInfo() ?? null,
       lossLog: healthMonitor?.getLossEvents() ?? [],
       refusedRegistrations: refusedRegistrations ?? [],
+      backupDesignationRefused: sources.backupDesignationRefused?.() ?? null,
       leases,
       nodes,
       shardTable,
@@ -858,6 +876,7 @@ export function getFleetState(): FleetState {
     budget: controlClient?.getLastBudget() ?? null,
     lossLog: [],
     refusedRegistrations: [],
+    backupDesignationRefused: null,
     servingOnCachedLease,
     cachedLeaseTtlRemainingMs,
     draining,
@@ -885,6 +904,7 @@ export function getFleetState(): FleetState {
         backoff: null,
         syncAppliedRevision: sources.sync?.().appliedRevision ?? null,
         dbReplica: getReplicaHealth() ?? null,
+        mirror: sources.mirror?.() ?? null,
       },
     ],
     shardTable,

@@ -909,6 +909,7 @@ function FleetNodeCard({ node, isMasterView, onAction, masterSyncRevision, retir
         </div>
       ) : null}
       {node.dbReplica ? <FleetReplicaLine replica={node.dbReplica} /> : null}
+      {node.mirror ? <FleetMirrorLine mirror={node.mirror} heartbeatAgoMs={node.lastHeartbeatAgoMs} /> : null}
       {standbySlot ? <FleetSlotLine slot={standbySlot} /> : null}
     </div>
   );
@@ -949,6 +950,35 @@ function FleetReplicaLine({ replica }) {
       DB standby: streaming{lagText}
     </div>
   );
+}
+
+// The designated backup's copy of the master's guild data (B4f-1): from its
+// own engine on its Fleet tab, from its heartbeat on the master's. The age
+// is the RPO a dead-master promote would carry, so a copy that stopped
+// refreshing is stated in colour rather than left to a growing number.
+function FleetMirrorLine({ mirror, heartbeatAgoMs }) {
+  const skew = heartbeatAgoMs == null ? 0 : heartbeatAgoMs;
+  const copy = mirror.completedAgoMs == null
+    ? 'none yet'
+    : `last complete copy ${fleetFormatAge(mirror.completedAgoMs + skew)} (${mirror.guildCount} guild${mirror.guildCount === 1 ? '' : 's'}, ${(mirror.totalBytes / 1048576).toFixed(1)} MB)`;
+  const frozen = mirror.frozenCount > 0 ? `; ${mirror.frozenCount} guild${mirror.frozenCount === 1 ? '' : 's'} frozen by a migration, kept as last copied` : '';
+  const stale = mirror.completedAgoMs != null && mirror.completedAgoMs + skew > 180000;
+  if (mirror.status === 'refused') {
+    return <div className="usage-stat-sub" style={{ color: '#e5534b' }}>{`Backup copy: ${copy}; the master refuses the mirror (${mirror.error || 'no reason given'})`}</div>;
+  }
+  if (mirror.status === 'held') {
+    return <div className="usage-stat-sub" style={{ color: '#d29922' }}>{`Backup copy: ${copy} from ${mirror.sourceNodeName || mirror.sourceNodeId || 'a previous master'}; HELD: ${mirror.error || 'another master serves now'}`}</div>;
+  }
+  if (mirror.status === 'degraded') {
+    return <div className="usage-stat-sub" style={{ color: mirror.completedAgoMs == null ? '#e5534b' : '#d29922' }}>{`Backup copy: ${copy}; last attempt failed: ${mirror.error || 'unknown error'}`}</div>;
+  }
+  if (mirror.status === 'copying') {
+    return <div className="usage-stat-sub">{`Backup copy: copying now; ${copy}${frozen}`}</div>;
+  }
+  if (mirror.status === 'idle') {
+    return <div className="usage-stat-sub" style={{ color: '#777' }}>{`Backup copy: ${copy}; waiting for the master`}</div>;
+  }
+  return <div className="usage-stat-sub" style={{ color: stale ? '#d29922' : undefined }}>{`Backup copy: ${copy}${frozen}`}</div>;
 }
 
 // Fleet runtime config (B2): the master edits the candidate list live (zero
@@ -1864,7 +1894,7 @@ function FleetView({ api, wsClient, guildNames }) {
         <FleetPromoteRecord api={api} fleet={fleet} reload={loadFleet} />
         {fleet.backupMaster && fleet.dataBackend !== 'postgres' && (
           <div className="usage-stat-sub" style={{ marginTop: '6px', color: '#777' }}>
-            Designated backup master, but promotion is a postgres-mode feature (file mode has no standby).
+            Designated backup master in file mode: this node keeps a copy of the master's guild data (the Backup copy line below). Promotion from that copy is not built yet; promotion today is a postgres-mode feature.
           </div>
         )}
         {fleet.masterKnown && !fleet.onHold && (
@@ -1991,6 +2021,12 @@ function FleetView({ api, wsClient, guildNames }) {
       {fleet.termStampFailingForMs != null && !fleet.controlStoreFenced && (
         <div className="usage-notice">
           {`Control store unreachable: the term liveness stamp has been failing for ${Math.round(fleet.termStampFailingForMs / 1000)}s. Control-plane writes are held; guilds keep serving on cached state.`}
+        </div>
+      )}
+
+      {fleet.backupDesignationRefused && (
+        <div className="usage-notice" style={{ borderColor: '#e0a030', color: '#e0a030' }}>
+          {`${fleet.backupDesignationRefused.nodeName} asked to be a designated backup ${fleetFormatAge(Date.now() - fleet.backupDesignationRefused.at)}, but file mode mirrors the guild data to one backup, so it joined as a plain co-worker. To move the copy to it, remove the current designated backup on the config card below: the list then takes this node. A node that should stop being a backup also needs backup-master taken out of its env, or it is designated again when it reconnects.`}
         </div>
       )}
 

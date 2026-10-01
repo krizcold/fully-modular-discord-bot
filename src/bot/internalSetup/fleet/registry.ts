@@ -12,6 +12,7 @@ import type {
   NodeCapabilities,
   RegisterPayload,
   ShardStatusEntry,
+  MirrorReport,
   ReplicaHealthReport,
 } from './protocol';
 import { guildIdToShardId } from './placement';
@@ -54,6 +55,8 @@ export interface RegistryNode {
   dbReplica: ReplicaHealthReport | null;
   /** The slot that standby streams on, from the same heartbeat; null when unreported (20.19 F14). */
   dbReplicaSlot: string | null;
+  /** The node's guild-data mirror report from its last heartbeat (B4f-1); null when it reports none. */
+  mirror: MirrorReport | null;
   /** False while the node's last reconcile ended degraded; null when unreported. */
   syncOk: boolean | null;
   /** When this node last had a write's synchronous wait cancelled, in ITS clock; null when never (B6 map F24). */
@@ -134,6 +137,7 @@ export class Registry {
       dataBackendHealthy: existing?.dataBackendHealthy ?? null,
       dbReplica: existing?.dbReplica ?? null,
       dbReplicaSlot: existing?.dbReplicaSlot ?? null,
+      mirror: existing?.mirror ?? null,
       syncWaitCancelledAt: existing?.syncWaitCancelledAt ?? null,
       freeDiskBytes: existing?.freeDiskBytes ?? null,
       send: input.send,
@@ -173,6 +177,7 @@ export class Registry {
       dataBackendHealthy: null,
       dbReplica: null,
       dbReplicaSlot: null,
+      mirror: null,
       syncWaitCancelledAt: null,
       freeDiskBytes: null,
       send: null,
@@ -205,6 +210,8 @@ export class Registry {
     if (hb.dbReplica !== undefined) node.dbReplica = hb.dbReplica;
     // Empty = this node holds no standby now, so its old claim is dropped.
     if (typeof hb.dbReplicaSlot === 'string') node.dbReplicaSlot = hb.dbReplicaSlot || null;
+    // Absent = this node keeps no mirror now (a backup demoted to a plain co-worker), so the old report goes.
+    node.mirror = hb.mirror ?? null;
     // Never moves backwards: a node that restarts loses its latch, and adopting
     // the lower value would re-fire a disarm the master has already acted on.
     if (Number.isFinite(hb.syncWaitCancelledAt) && Number(hb.syncWaitCancelledAt) > (node.syncWaitCancelledAt ?? 0)) {

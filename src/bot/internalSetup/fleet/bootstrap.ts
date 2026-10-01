@@ -73,9 +73,11 @@ import {
 } from './placement';
 import { evaluateRecovery } from './recovery';
 import { _setControlStoreFenced, _setEmptyStoreHold, _setFleetStateSources, _setFollowerFollowingSupplier, _setFollowerHold, _setFollowerLineage, _setOwnCopyLineage, _setReadOnlyStorePark, _setSlotStatus, _setStaleMasterPark, _setSuperseded, _setTakeoverHold, FleetRecoverySource, FleetRefusedRegistration, FollowerHoldBase, getFleetState } from './state';
-import type { MigrationView, PinViolationView, StandInVerdictView, UnassignedView } from './state';
+import type { BackupDesignationRefusedView, MigrationView, PinViolationView, StandInVerdictView, UnassignedView } from './state';
 import { serveSyncRequest, SyncAuthority } from './syncAuthority';
 import { SyncEngine } from './syncEngine';
+import { MirrorAuthority, isMirrorRequest, serveMirrorRequest } from './mirrorAuthority';
+import { MirrorEngine } from './mirrorEngine';
 import { getFrozenStats, getGuildDataBackend, setOwnerInfoProvider } from '../utils/dataManager';
 import {
   applyOperatorDataRead,
@@ -1380,6 +1382,8 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
 
   let server: ControlServer | null = null;
   let syncAuthority: SyncAuthority | null = null;
+  let mirrorAuthority: MirrorAuthority | null = null;
+  let backupDesignationRefused: BackupDesignationRefusedView | null = null;
 
   // Persist + push a fleet-config change (B2). The cache write is synchronous
   // truth for this node; the store write and the per-node pushes are fire-and-
@@ -1397,6 +1401,34 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     }
     console.log(`[Fleet] Fleet config revision ${fleetConfig.revision} (${why}) pushed to the fleet`);
   };
+  // One backup in file mode (B4f-1): when the list empties, the connected node
+  // that declares backup-master takes the slot (the refused one first). Env is
+  // the trigger, as at registration, so a freed slot never idles the mirror.
+  const fillFreedBackupSlot = (): void => {
+    if (!fleetConfig || fleetConfig.backupDesignations.length > 0 || resolveDataBackend() !== 'file') return;
+    const refusedId = backupDesignationRefused?.nodeId ?? null;
+    const declared = [...registry.nodes.values()].filter(n => !n.isSelf && n.connected && n.capabilities?.backupMaster === true);
+    const pick = declared.find(n => n.nodeId === refusedId) ?? declared[0];
+    if (!pick) return;
+    fleetConfig = { ...fleetConfig, revision: fleetConfig.revision + 1, backupDesignations: [{ nodeId: pick.nodeId, priority: 1 }], updatedAt: Date.now() };
+    backupDesignationRefused = null;
+    persistFleetConfig(`designated backup ${pick.nodeName || pick.nodeId} (freed slot)`);
+  };
+  // The cap is file mode's. Once the fleet runs on postgres (a transformation
+  // flips the backend in place; nobody registers again), a refusal left over
+  // is resolved the way registration would have: the node is designated if it
+  // is here and still declares backup-master, and the note goes either way.
+  const reconcileRefusedBackup = (): void => {
+    if (!backupDesignationRefused || resolveDataBackend() === 'file') return;
+    const refused = backupDesignationRefused;
+    backupDesignationRefused = null;
+    const node = registry.nodes.get(refused.nodeId);
+    if (!fleetConfig || !node || !node.connected || node.capabilities?.backupMaster !== true) return;
+    if (fleetConfig.backupDesignations.some(d => d.nodeId === node.nodeId)) return;
+    const priority = fleetConfig.backupDesignations.reduce((max, d) => Math.max(max, d.priority), 0) + 1;
+    fleetConfig = { ...fleetConfig, revision: fleetConfig.revision + 1, backupDesignations: [...fleetConfig.backupDesignations, { nodeId: node.nodeId, priority }], updatedAt: Date.now() };
+    persistFleetConfig(`designated backup ${node.nodeName || node.nodeId} (postgres mode)`);
+  };
   masterConfigSet = async (candidates: string[], witnessChannelId: unknown, backupDesignations: unknown) => {
     if (!fleetConfig) return { ok: false, error: 'a standalone master holds no fleet config' };
     const valid = validateMasterCandidates(candidates);
@@ -1410,6 +1442,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       const order = validateBackupDesignations(backupDesignations, known, id => registry.nodes.get(id)?.capabilities?.activeCapable === true);
       if (!order.ok) return { ok: false, error: order.error };
       if (order.designations.some(d => d.nodeId === nodeId)) return { ok: false, error: 'the master is not its own backup' };
+      if (resolveDataBackend() === 'file' && order.designations.length > 1) return { ok: false, error: 'file mode mirrors the guild data to one backup; keep a single designated backup' };
       designations = order.designations;
     }
     // Undefined = the caller did not touch the witness field; empty = clear to the owner DM default.
@@ -1427,6 +1460,11 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     if (witness.value !== undefined) fleetConfig.witnessChannelId = witness.value;
     else delete fleetConfig.witnessChannelId;
     persistFleetConfig('config edited');
+    // The cap's refusal (B4f-1) is resolved on this card, once the save stands.
+    if (designations) {
+      fillFreedBackupSlot();
+      backupDesignationRefused = null;
+    }
     return { ok: true, revision: fleetConfig.revision };
   };
   let coordinator: MigrationCoordinator | null = null;
@@ -2380,6 +2418,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       registry.pendingConfirmation.delete(shardId);
     }
     registry.nodes.delete(targetNodeId);
+    if (backupDesignationRefused?.nodeId === targetNodeId) backupDesignationRefused = null;
     // A node that is gone cannot stand in; its designation goes with it.
     if (fleetConfig && fleetConfig.backupDesignations.some(d => d.nodeId === targetNodeId)) {
       fleetConfig = {
@@ -2389,6 +2428,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
         updatedAt: Date.now(),
       };
       persistFleetConfig(`declared lost ${node.nodeName || targetNodeId}`);
+      fillFreedBackupSlot();
     }
     drainRevokeAt.delete(targetNodeId);
     drainExtraLeaseIds.delete(targetNodeId);
@@ -2673,6 +2713,22 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       pushToNode: (pushNodeId, statePayload) => server!.request(pushNodeId, MSG.SYNC_STATE, statePayload),
     });
     masterSyncBump = scope => syncAuthority!.bump(scope);
+    mirrorAuthority = new MirrorAuthority({
+      nodeId,
+      nodeName,
+      getTerm: () => registry.term,
+      documents: async () => {
+        const [plan, persistedRegistry, config] = await Promise.all([store.loadPlan(), store.loadRegistry(), store.loadFleetConfig()]);
+        // Both exist on a serving master, so null is a failed read (the file
+        // store reads every error as null): the listing aborts, the copy stays.
+        if (!plan || !config) throw new Error('control store documents unavailable');
+        return [
+          { name: 'leases.json', body: JSON.stringify(plan, null, 2) },
+          { name: 'registry.json', body: JSON.stringify(persistedRegistry, null, 2) },
+          { name: 'fleet-config.json', body: JSON.stringify(config, null, 2) },
+        ];
+      },
+    });
 
     // Migration subsystem (fleet master only; never constructed standalone).
     // The master is also a participant of its own migrations, so it runs a
@@ -3012,7 +3068,13 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
         // ORDER, and env stays the trigger: a node whose env no longer says
         // backup-master leaves the list on its next register (20.19 F8/F11).
         const listed = !!fleetConfig && fleetConfig.backupDesignations.some(d => d.nodeId === payload.nodeId);
-        if (fleetConfig && payload.capabilities?.backupMaster === true && !listed) {
+        if (backupDesignationRefused && backupDesignationRefused.nodeId === payload.nodeId) backupDesignationRefused = null;
+        if (fleetConfig && payload.capabilities?.backupMaster === true && !listed && resolveDataBackend() === 'file' && fleetConfig.backupDesignations.length > 0) {
+          // One backup in file mode (20.15): the mirror has one reader. The node
+          // joins as a plain co-worker and the master's Fleet tab names the refusal.
+          backupDesignationRefused = { nodeId: payload.nodeId, nodeName: payload.nodeName || payload.nodeId, at: Date.now() };
+          console.warn(`[Fleet] Backup designation refused for ${payload.nodeName || payload.nodeId}: file mode mirrors the guild data to one backup, and one is designated already`);
+        } else if (fleetConfig && payload.capabilities?.backupMaster === true && !listed) {
           const priority = fleetConfig.backupDesignations.reduce((max, d) => Math.max(max, d.priority), 0) + 1;
           fleetConfig = {
             ...fleetConfig,
@@ -3029,6 +3091,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
             updatedAt: Date.now(),
           };
           persistFleetConfig(`backup designation withdrawn ${payload.nodeName || payload.nodeId}`);
+          fillFreedBackupSlot();
         } else if (fleetConfig && listed && payload.capabilities?.activeCapable !== true
           && fleetConfig.backupDesignations.some(d => d.nodeId === payload.nodeId && d.mode === 'active')) {
           // Consent withdrawn (or never declared by this build): the enable goes.
@@ -3199,7 +3262,19 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
         // Free-shard distribution only; the disconnected node's shards stay frozen.
         void distribute();
       },
-      onSyncRequest: (_syncNodeId, type, data) => serveSyncRequest(syncAuthority!, type, data),
+      onSyncRequest: (syncNodeId, type, data) => {
+        if (!isMirrorRequest(type)) return serveSyncRequest(syncAuthority!, type, data);
+        // The mirror is served to the designated backup only, by this master's
+        // own record of the designation, and only while guild data lives on
+        // this node's disk (B4f-1).
+        if (resolveDataBackend() !== 'file') return Promise.reject(new Error('mirror-not-file-mode'));
+        if (!fleetConfig || !fleetConfig.backupDesignations.some(d => d.nodeId === syncNodeId)) return Promise.reject(new Error('mirror-not-designated'));
+        // One reader (20.15): a list left with two entries by a postgres-to-file
+        // transformation serves the first in the operator's order only.
+        const first = [...fleetConfig.backupDesignations].sort((a, b) => a.priority - b.priority)[0];
+        if (first.nodeId !== syncNodeId) return Promise.reject(new Error('mirror-second-backup: file mode mirrors to one backup, and this node is not first in the order'));
+        return serveMirrorRequest(mirrorAuthority!, type, data);
+      },
       onXferProgress: (xferNodeId, data) => coordinator?.onProgress(xferNodeId, data),
       onXferVerify: (xferNodeId, data) => coordinator?.onVerify(xferNodeId, data),
       onXferFlushed: (xferNodeId, data) => coordinator?.onFlushed(xferNodeId, data),
@@ -3466,6 +3541,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     healthMonitor?.tick();
     pushSlotStatus();
     pushSyncPosture();
+    reconcileRefusedBackup();
     // Witness consumer (20.6): a FRESH beacon with a higher term from another
     // node means a newer master is up, whether or not this node's own store
     // could tell it (a dead store never fences). Begin or finish the step-down.
@@ -3545,6 +3621,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     fleetConfig: () => (fleetConfig ? fleetConfigViewOf(fleetConfig) : null),
     witness: witness ? () => witness!.getStatus() : null,
     migrationActive: null,
+    backupDesignationRefused: standalone ? null : () => backupDesignationRefused,
   });
 
   // Owner-info source for .owner manifests (dataManager cannot import fleet).
@@ -3666,6 +3743,7 @@ async function initCoWorker(init: CommonInit, followerHold: FollowerHoldBase | n
 
   let controlClient: ControlClient | null = null;
   let syncEngine: SyncEngine | null = null;
+  let mirrorEngine: MirrorEngine | null = null;
   let executor: MigrationExecutor | null = null;
   if (masterUrls.length > 0 && secret) {
     const engine = new SyncEngine({
@@ -3674,6 +3752,14 @@ async function initCoWorker(init: CommonInit, followerHold: FollowerHoldBase | n
       sendReport: report => controlClient!.sendSyncReport(report),
     });
     syncEngine = engine;
+    if (isBackupMaster()) {
+      mirrorEngine = new MirrorEngine({
+        request: (type, data, timeoutMs) => controlClient!.syncRequest(type, data, timeoutMs),
+        getTerm: () => controlClient?.getTerm() ?? 0,
+        masterKnown: () => controlClient?.masterKnown() === true,
+        onChanged: () => pushFleetStatusNow(),
+      });
+    }
     // Migration participant: the co-worker performs its own prepare/drain/commit/
     // abort locally using the Stage 4 facade; progress/verify ride back to the
     // master fire-and-forget over the same control channel.
@@ -3716,7 +3802,10 @@ async function initCoWorker(init: CommonInit, followerHold: FollowerHoldBase | n
         writeFleetConfigCache(config);
         controlClient?.updateMasterUrls(config.masterCandidates);
       },
-      onMasterIdentity: (masterNodeId, term) => noteHolderSighting(masterNodeId, term, 'register', nodeId),
+      onMasterIdentity: (masterNodeId, term) => {
+        noteHolderSighting(masterNodeId, term, 'register', nodeId);
+        mirrorEngine?.tickNow();
+      },
       onSuperseded: info => {
         // This node is the old master the new one superseded (B4): record the
         // fact, and the owner's retire request, for the manager. An existing
@@ -3873,10 +3962,12 @@ async function initCoWorker(init: CommonInit, followerHold: FollowerHoldBase | n
       decorateHeartbeat: hb => {
         const syncState = engine.getSyncState();
         const ok = engine.getLastReportOk();
+        const mirror = mirrorEngine?.getReport() ?? null;
         return {
           ...hb,
           ...(syncState.appliedRevision !== undefined ? { syncAppliedRevision: syncState.appliedRevision } : {}),
           ...(ok === null ? {} : { syncOk: ok }),
+          ...(mirror ? { mirror } : {}),
         };
       },
     });
@@ -4194,6 +4285,7 @@ async function initCoWorker(init: CommonInit, followerHold: FollowerHoldBase | n
     witness: witness ? () => witness!.getStatus() : null,
     migrationActive: () => migrationWorkActive(),
     standInVerdict: isBackupMaster() ? () => armVerdict : null,
+    mirror: mirrorEngine ? () => mirrorEngine!.getReport() : null,
   });
 
   // Owner-info source for .owner manifests: null until the first lease grant.
@@ -4255,5 +4347,6 @@ async function initCoWorker(init: CommonInit, followerHold: FollowerHoldBase | n
   // until the master grants a shard, at which point applyGrant -> maybeStart
   // begins ingest. The no-lease login gate keeps Discord untouched meanwhile.
   controlClient.start();
+  mirrorEngine?.start();
   return ctx;
 }

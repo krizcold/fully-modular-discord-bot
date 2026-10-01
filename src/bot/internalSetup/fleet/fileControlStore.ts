@@ -30,6 +30,20 @@ export function atomicWriteFileSync(file: string, contents: string): void {
   }
 }
 
+/** Rename with the same bounded retry: Windows EPERM on rename-over-open. */
+export function renameWithRetry(from: string, to: string): void {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      fs.renameSync(from, to);
+      return;
+    } catch (error) {
+      if (attempt >= 3) throw error;
+      const waitUntil = Date.now() + 25 * (attempt + 1);
+      while (Date.now() < waitUntil) { /* bounded, rare */ }
+    }
+  }
+}
+
 function readJson<T>(file: string): T | null {
   try {
     return JSON.parse(fs.readFileSync(file, 'utf-8')) as T;

@@ -155,6 +155,21 @@ export const SYNC_MAX_FILE_BYTES = 67108864;
 /** Worker-side download staging directory under /data/global/fleet/. */
 export const SYNC_STAGING_DIRNAME = 'sync-staging';
 
+/** Guild-data mirror (B4f-1): the designated backup's shadow tree under DATA_ROOT; never a live guild dir. */
+export const MIRROR_DIRNAME = '_mirror';
+
+/** Backup-side mirror cadence; one extra tick follows every registration. */
+export const MIRROR_TICK_MS = 60000;
+
+/** Ack timeout for the mirror listing alone: a first listing hashes every guild file, which the 10 s control ack timeout does not fit. */
+export const MIRROR_LIST_TIMEOUT_MS = 120000;
+
+/** The master's placement documents that ride along with the mirror, by their fleet-dir file names. */
+export const MIRROR_DOC_NAMES = ['leases.json', 'registry.json', 'fleet-config.json'] as const;
+
+/** Master-side mirror revision record under /data/global/fleet/. */
+export const MIRROR_REVISION_FILENAME = 'mirror.json';
+
 // ============================================================================
 // MIGRATION (P5): node-to-node data transfer + cutover under commit barriers.
 // ============================================================================
