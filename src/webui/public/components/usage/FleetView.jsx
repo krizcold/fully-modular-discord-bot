@@ -775,7 +775,7 @@ function FleetSyncCard({ sync }) {
   );
 }
 
-function FleetNodeCard({ node, isMasterView, onAction, masterSyncRevision, retireControl, dataBackend, standbySlot }) {
+function FleetNodeCard({ node, isMasterView, onAction, masterSyncRevision, retireControl, dataBackend, standbySlot, api, canDrop }) {
   const [busy, setBusy] = React.useState(false);
   const [waiting, setWaiting] = React.useState(false);
   const healthColor = FLEET_HEALTH_COLORS[node.health] || '#888';
@@ -909,7 +909,7 @@ function FleetNodeCard({ node, isMasterView, onAction, masterSyncRevision, retir
         </div>
       ) : null}
       {node.dbReplica ? <FleetReplicaLine replica={node.dbReplica} /> : null}
-      {node.mirror ? <FleetMirrorLine mirror={node.mirror} heartbeatAgoMs={node.lastHeartbeatAgoMs} /> : null}
+      {node.mirror ? <FleetMirrorLine mirror={node.mirror} heartbeatAgoMs={node.lastHeartbeatAgoMs} api={api} canDrop={!!(node.isSelf && !isMasterView && api && canDrop !== false)} /> : null}
       {standbySlot ? <FleetSlotLine slot={standbySlot} /> : null}
     </div>
   );
@@ -956,7 +956,22 @@ function FleetReplicaLine({ replica }) {
 // own engine on its Fleet tab, from its heartbeat on the master's. The age
 // is the RPO a dead-master promote would carry, so a copy that stopped
 // refreshing is stated in colour rather than left to a growing number.
-function FleetMirrorLine({ mirror, heartbeatAgoMs }) {
+function FleetMirrorLine({ mirror, heartbeatAgoMs, api, canDrop }) {
+  const [busy, setBusy] = React.useState(false);
+  // The Retire reading of a held copy (B4f-3): a copy of a master that no
+  // longer serves, kept for a seed or a promote that never came.
+  const drop = () => {
+    if (busy) return;
+    if (!confirm(`Drop this node's copy of ${mirror.sourceNodeName || 'the old master'}'s guild data (${mirror.guildCount} guild${mirror.guildCount === 1 ? '' : 's'}, ${(mirror.totalBytes / 1048576).toFixed(1)} MB)?\n\nThe master this node is registered with is not the one this copy was taken from, and it adopts nothing from it. The copy is kept only as what a new master could be seeded from or a promote could adopt; once dropped (removed, not graveyarded) the mirror copies the current master instead.`)) return;
+    setBusy(true);
+    api.post('/fleet/mirror/drop', {})
+      .then((res) => {
+        if (!res || res.success === false) { showToast((res && res.error) || 'Drop refused', 'error'); return; }
+        showToast('Copy dropped; the mirror copies the current master from its next tick', 'success');
+      })
+      .catch((err) => showToast((err && err.message) || 'Drop failed', 'error'))
+      .finally(() => setBusy(false));
+  };
   const skew = heartbeatAgoMs == null ? 0 : heartbeatAgoMs;
   const copy = mirror.completedAgoMs == null
     ? 'none yet'
@@ -967,7 +982,16 @@ function FleetMirrorLine({ mirror, heartbeatAgoMs }) {
     return <div className="usage-stat-sub" style={{ color: '#e5534b' }}>{`Backup copy: ${copy}; the master refuses the mirror (${mirror.error || 'no reason given'})`}</div>;
   }
   if (mirror.status === 'held') {
-    return <div className="usage-stat-sub" style={{ color: '#d29922' }}>{`Backup copy: ${copy} from ${mirror.sourceNodeName || mirror.sourceNodeId || 'a previous master'}; HELD: ${mirror.error || 'another master serves now'}`}</div>;
+    return (
+      <div className="usage-stat-sub" style={{ color: '#d29922' }}>
+        {`Backup copy: ${copy} from ${mirror.sourceNodeName || mirror.sourceNodeId || 'a previous master'}; HELD: ${mirror.error || 'another master serves now'}`}
+        {canDrop && api ? (
+          <button onClick={drop} disabled={busy} style={{ marginLeft: '6px', fontSize: '0.72rem', padding: '2px 8px' }}>
+            {busy ? 'Dropping...' : 'Drop this copy'}
+          </button>
+        ) : null}
+      </div>
+    );
   }
   if (mirror.status === 'degraded') {
     return <div className="usage-stat-sub" style={{ color: mirror.completedAgoMs == null ? '#e5534b' : '#d29922' }}>{`Backup copy: ${copy}; last attempt failed: ${mirror.error || 'unknown error'}`}</div>;
@@ -993,7 +1017,11 @@ function FleetConfigCard({ api, fleet }) {
   const [backupsEdited, setBackupsEdited] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
   if (!cfg) return null;
-  const editable = fleet.role === 'master' && !fleet.standalone;
+  // A co-worker registered with nobody edits the list it dials (B4f-3: the
+  // backup is pointed at the machine seeded as the new master); the master's
+  // pushed config replaces it once this node registers.
+  const dialOnly = fleet.role !== 'master' && !fleet.masterKnown;
+  const editable = (fleet.role === 'master' && !fleet.standalone) || dialOnly;
   const move = (i, delta) => {
     const next = [...backupsDraft];
     const j = i + delta;
@@ -1027,10 +1055,10 @@ function FleetConfigCard({ api, fleet }) {
     if (busy) return;
     const urls = draft.split('\n').map((u) => u.trim()).filter(Boolean);
     setBusy(true);
-    api.post('/fleet/config', { masterCandidates: urls, witnessChannelId: witnessDraft.trim(), ...(backupsEdited ? { backupDesignations: backupsDraft.map((d, i) => (d.mode === 'active' ? { nodeId: d.nodeId, priority: i + 1, mode: 'active' } : { nodeId: d.nodeId, priority: i + 1 })) } : {}) })
+    api.post('/fleet/config', dialOnly ? { masterCandidates: urls } : { masterCandidates: urls, witnessChannelId: witnessDraft.trim(), ...(backupsEdited ? { backupDesignations: backupsDraft.map((d, i) => (d.mode === 'active' ? { nodeId: d.nodeId, priority: i + 1, mode: 'active' } : { nodeId: d.nodeId, priority: i + 1 })) } : {}) })
       .then((res) => {
         if (!res || res.success === false) { showToast((res && res.error) || 'Config update failed', 'error'); return; }
-        showToast(`Fleet config saved (revision ${res.revision}) and pushed to every node`, 'success');
+        showToast(dialOnly ? 'Master list saved on this node; it dials that list now' : `Fleet config saved (revision ${res.revision}) and pushed to every node`, 'success');
         setDraft(null);
       })
       .catch((err) => showToast((err && err.message) || 'Config update failed', 'error'))
@@ -1050,14 +1078,14 @@ function FleetConfigCard({ api, fleet }) {
             rows={Math.max(3, draft.split('\n').length + 1)}
             style={{ width: '100%', fontFamily: 'monospace', fontSize: '0.75rem' }}
           />
-          <input
+          {!dialOnly && (<input
             type="text"
             value={witnessDraft}
             onChange={(e) => setWitnessDraft(e.target.value)}
             placeholder="witness beacon channel id (empty = owner DM)"
             style={{ width: '100%', marginTop: '4px', fontFamily: 'monospace', fontSize: '0.75rem' }}
-          />
-          {backupsDraft.length > 0 && (
+          />)}
+          {!dialOnly && backupsDraft.length > 0 && (
             <div style={{ marginTop: '6px' }}>
               <div className="usage-stat-sub">Backup order: the first stands in first, and breaks a tie between equally fresh copies. Active mode lets a backup stand in temporarily while the master is gone, and needs that node's own consent too. It is not free: while it is on, every write in the fleet waits for that copy, so losing it costs about a second or two of stalled writes before replication drops back to asynchronous.</div>
               {backupsDraft.map((d, i) => (
@@ -1131,9 +1159,14 @@ function FleetConfigCard({ api, fleet }) {
               })}
             </div>
           )}
+          {dialOnly && (
+            <div className="usage-stat-sub" style={{ marginTop: '4px' }}>
+              This node is registered with no master, so the list it dials is edited here (a new master's address, for a backup seeding it); a master's pushed config replaces it once this node registers.
+            </div>
+          )}
           {editable && (
             <button onClick={() => { setDraft(cfg.masterCandidates.join('\n')); setWitnessDraft(cfg.witnessChannelId || ''); setBackupsDraft([...(cfg.backupDesignations || [])].sort((a, b) => a.priority - b.priority)); setBackupsEdited(false); }} style={{ marginTop: '4px', fontSize: '0.72rem', padding: '2px 8px' }}>
-              Edit fleet config
+              {dialOnly ? 'Edit master list' : 'Edit fleet config'}
             </button>
           )}
         </div>
@@ -1680,6 +1713,108 @@ function FleetEmptyStoreHoldBanner({ api, hold }) {
   );
 }
 
+const SEED_PHASE_TEXT = {
+  dialing: 'waiting for the backup to dial this node',
+  copying: 'receiving the copy',
+  verifying: 'verifying the copy against the backup\'s hashes',
+  adopting: 'adopting the copy, pinning the plan and seeding the term',
+  restarting: 'done; restarting as master',
+};
+
+// The seed hold (B4f-3): a file-mode master with no guild data holds until a
+// backup's copy is adopted; the offers and the confirm live here.
+function FleetSeedHoldBanner({ api, hold, reload }) {
+  const [busy, setBusy] = React.useState(false);
+  const mb = (bytes) => (bytes / 1048576).toFixed(1);
+  const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+  const seed = (b) => {
+    if (busy) return;
+    setBusy(true);
+    api.post('/fleet/seed', { nodeId: b.nodeId })
+      .then((res) => {
+        if (res && res.success === false && res.needsConfirm) {
+          if (!confirm(res.error)) return null;
+          return api.post('/fleet/seed', { nodeId: b.nodeId, confirm: true });
+        }
+        return res;
+      })
+      .then((res) => {
+        if (res === null) return;
+        if (!res || res.success === false) { showToast((res && res.error) || 'Seed refused', 'error'); return; }
+        showToast(`Seeding from ${b.nodeName}; this banner follows the push`, 'success');
+      })
+      .catch((err) => showToast((err && err.message) || 'Seed failed', 'error'))
+      .finally(() => { setBusy(false); reload(); });
+  };
+  const confirmFresh = () => {
+    if (busy) return;
+    if (!confirm('Confirm this is a BRAND-NEW fleet?\n\nOnly do this when no backup anywhere holds real data for this bot. This machine mints a term above every beacon on an empty data directory and serves. If a backup with real data exists, cancel and seed this machine from its copy instead.')) return;
+    setBusy(true);
+    api.post('/fleet/confirm-fresh', {})
+      .then((res) => {
+        if (!res || res.success === false) { showToast((res && res.error) || 'Confirm failed', 'error'); return; }
+        showToast('Brand-new fleet confirmed; the hold releases on its next check', 'success');
+      })
+      .catch((err) => showToast((err && err.message) || 'Confirm failed', 'error'))
+      .finally(() => setBusy(false));
+  };
+  const where = hold.controlUrl ? hold.controlUrl : `ws://<this machine>:${hold.controlPort} (its FLEET_PUBLIC_URL when it has one)`;
+  const push = hold.push;
+  const pushText = push
+    ? ` Seeding from ${push.backupNodeName}: ${push.stalled ? push.stalled : (SEED_PHASE_TEXT[push.phase] || push.phase)}${push.phase === 'copying' ? ` (round ${push.round}, ${plural(push.filesSent, 'file')}, ${mb(push.bytesSent)} MB)` : ''}.`
+    : '';
+  return (
+    <div className="usage-notice" style={{ borderColor: '#e0a030', color: '#e0a030' }}>
+      {`SEED HOLD: this master holds no guild data while the witness shows the fleet at term ${hold.holdTerm}${hold.beaconedBy ? ` (beaconed by ${hold.beaconedBy})` : ''} and no live master. It will not mint a term and serve empty while a backup may hold the real data. Point the designated backup at this machine (${where}): reuse the old master's address for it, or edit the master list on the backup's own Fleet tab; it registers here and offers the copy it holds, and the seed is confirmed below. Or demote this node to rejoin the fleet as a co-worker. Only confirm a brand-new fleet when no backup anywhere holds data for this bot.${hold.transferUrl ? '' : ' TRANSFER_URL is not set on this node: the backup pushes the copy to that address, so set it and restart this bot before confirming a seed.'}${hold.interrupted ? ` ${hold.interrupted}` : ''}${hold.lastError ? ` Last seed attempt failed: ${hold.lastError}.` : ''}${pushText}`}
+      {hold.backups.length === 0 ? (
+        <div className="usage-stat-sub" style={{ marginTop: '6px' }}>No backup has registered here yet.</div>
+      ) : hold.backups.map((b) => {
+        const o = b.offer;
+        const text = o
+          ? (o.kind === 'mirror'
+            ? `${b.nodeName}: offers its copy of ${o.sourceNodeName}'s guild data (term ${o.sourceTerm}), last complete ${fleetFormatAge(o.ageMs)} (${plural(o.guildCount, 'guild')}, ${mb(o.totalBytes)} MB${o.partialCount > 0 ? `; ${o.partialCount} partial since then` : ''})`
+            : `${b.nodeName}: offers its own guild data from its mastership at term ${o.sourceTerm} (live, ${plural(o.guildCount, 'guild')}, ${mb(o.totalBytes)} MB)`)
+          : `${b.nodeName}: registered, no copy to offer${b.offerReason ? `: ${b.offerReason}` : (b.offerAt == null ? ' (asking)' : '')}`;
+        return (
+          <div key={b.nodeId} className="usage-stat-sub" style={{ marginTop: '6px', color: b.connected ? undefined : '#777' }}>
+            {`${text}${b.connected ? '' : ' (disconnected now)'}`}
+            {o && b.connected && !push && hold.transferUrl ? (
+              <button onClick={() => seed(b)} disabled={busy} style={{ marginLeft: '6px', fontSize: '0.72rem', padding: '2px 8px' }}>
+                {busy ? 'Working...' : 'Seed from this copy'}
+              </button>
+            ) : null}
+          </div>
+        );
+      })}
+      <div><FleetDemoteButton api={api} /></div>
+      <div>
+        <button onClick={confirmFresh} disabled={busy} style={{ marginTop: '6px', fontSize: '0.72rem', padding: '2px 8px' }}>
+          {busy ? 'Confirming...' : 'This is a brand-new fleet'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// The backup's side of the seed (B4f-3): its master holds to be seeded, and
+// this node's copy is what it offers; the confirm is on that master's tab.
+function fleetSeedSourceText(fleet) {
+  const master = fleet.masterName || (fleet.masterNodeId ? fleet.masterNodeId.slice(0, 8) : 'the master');
+  const push = fleet.seedPush;
+  const self = (fleet.nodes || []).find((n) => n.isSelf);
+  const copy = self ? self.mirror : null;
+  const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+  const holds = copy && copy.completedAgoMs != null
+    ? `This node holds a copy of ${copy.sourceNodeName || 'the old master'}'s guild data, last complete ${fleetFormatAge(copy.completedAgoMs)} (${plural(copy.guildCount, 'guild')}, ${(copy.totalBytes / 1048576).toFixed(1)} MB), and offers it.`
+    : 'This node offers what it holds; that master\'s Fleet tab says what, or why nothing.';
+  const progress = push
+    ? (push.phase === 'failed' ? ` The last push failed: ${push.error || 'unknown error'}.`
+      : push.phase === 'sent' ? ` The copy was pushed (${plural(push.filesSent, 'file')}, ${(push.bytesSent / 1048576).toFixed(1)} MB in ${plural(push.round + 1, 'round')}); the master verifies it and adopts it, or its Fleet tab says why not.`
+      : ` Pushing the copy now (${push.phase}, round ${push.round}, ${plural(push.filesSent, 'file')}, ${(push.bytesSent / 1048576).toFixed(1)} MB).`)
+    : '';
+  return `SEEDING A NEW MASTER: ${master} holds no guild data and waits to be seeded from a backup's copy before it serves; it grants no shards meanwhile. ${holds} Confirm the seed on ${master}'s Fleet tab.${progress}`;
+}
+
 // The emergency lever (B6-k, F11): a node-local enable of active mode for the
 // outage, on this backup's own web UI. It supplies the master's key only,
 // counts only while the master is unreachable, and survives restarts until
@@ -1855,6 +1990,9 @@ function FleetView({ api, wsClient, guildNames }) {
         {fleet.emptyStoreHold && (
           <FleetEmptyStoreHoldBanner api={api} hold={fleet.emptyStoreHold} />
         )}
+        {fleet.seedHold && (
+          <FleetSeedHoldBanner api={api} hold={fleet.seedHold} reload={loadFleet} />
+        )}
         <FleetStandInBanner fleet={fleet} />
         <FleetModeLeverCard api={api} fleet={fleet} reload={loadFleet} />
         {fleet.standIn && fleet.standIn.live && fleet.standIn.writeGate && (
@@ -1927,7 +2065,12 @@ function FleetView({ api, wsClient, guildNames }) {
             Waiting for master sync: modules and configuration load after the first verified sync from the master.
           </div>
         )}
-        {fleet.masterKnown && fleet.onHold && (
+        {fleet.masterKnown && fleet.masterSeedHold && (
+          <div className="usage-notice" style={{ borderColor: '#e0a030', color: '#e0a030' }}>
+            {fleetSeedSourceText(fleet)}
+          </div>
+        )}
+        {fleet.masterKnown && fleet.onHold && !fleet.masterSeedHold && (
           <div className="usage-notice">
             On hold: connected to the master, waiting for a shard to be assigned. Not serving any guilds yet.
           </div>
@@ -1970,7 +2113,7 @@ function FleetView({ api, wsClient, guildNames }) {
 
         {selfNode ? (
           <div className="usage-stat-grid" style={{ marginTop: '14px' }}>
-            <FleetNodeCard node={selfNode} dataBackend={fleet.dataBackend} standbySlot={fleet.standbySlot} />
+            <FleetNodeCard node={selfNode} dataBackend={fleet.dataBackend} standbySlot={fleet.standbySlot} api={api} canDrop={!fleet.masterSeedHold && !(fleet.seedPush && (fleet.seedPush.phase === 'dialing' || fleet.seedPush.phase === 'copying'))} />
           </div>
         ) : null}
 

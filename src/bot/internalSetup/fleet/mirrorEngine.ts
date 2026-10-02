@@ -211,6 +211,7 @@ export class MirrorEngine {
   private lastError: string | undefined;
   private attemptedAt: number | null = null;
   private running = false;
+  private dropPending: string | null = null;
   private diskVerified = false;
   private caseInsensitive: boolean | null = null;
   private timer: NodeJS.Timeout | null = null;
@@ -282,6 +283,12 @@ export class MirrorEngine {
         // The gate's own answers (mirror-*) are refusals; anything else (a disk
         // fault in the listing, a stale term, a store error) is a failed attempt.
         const reason = String(reply?.reason ?? 'no reply');
+        // A master holding to be seeded (B4f-3) copies nothing yet; the copy
+        // this node holds is what it may adopt, so it stays and the line says so.
+        if (reason.startsWith('mirror-seed-hold')) {
+          this.finish('held', 'the master holds to be seeded and copies nothing yet; it adopts the copy this node offers once the seed is confirmed on its Fleet tab');
+          return;
+        }
         this.finish(reason.startsWith('mirror-') ? 'refused' : 'degraded', reason);
         return;
       }
@@ -316,7 +323,31 @@ export class MirrorEngine {
       console.warn(`[Fleet] Mirror tick failed: ${this.lastError}`);
     } finally {
       this.running = false;
+      if (this.dropPending !== null) {
+        const sourceNodeId = this.dropPending;
+        this.dropPending = null;
+        this.dropCopyOf(sourceNodeId);
+      }
     }
+  }
+
+  /**
+   * The copy taken from that master seeded the fleet's new master (B4f-3), so
+   * it is spent: the tree goes, and the next tick copies the master this node
+   * is registered with. A tick in flight finishes first (it holds, since the
+   * new master lists under another id, so it writes nothing meanwhile).
+   */
+  dropCopyOf(sourceNodeId: string): void {
+    if (this.running) {
+      this.dropPending = sourceNodeId;
+      return;
+    }
+    if (this.manifest.sourceNodeId !== sourceNodeId || fs.existsSync(adoptMarkerFile())) return;
+    fs.rmSync(mirrorRoot(), { recursive: true, force: true });
+    this.manifest = emptyManifest();
+    this.diskVerified = false;
+    this.finish('idle');
+    console.warn(`[Fleet] Mirror copy of node ${sourceNodeId.slice(0, 8)} dropped: it seeded the new master, which this node mirrors from its next tick`);
   }
 
   private finish(status: MirrorStatus, error?: string): void {

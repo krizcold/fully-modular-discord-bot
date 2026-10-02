@@ -52,6 +52,8 @@ export interface ControlServerHooks {
   onXferVerify?: (nodeId: string, data: any) => void;
   /** Lease-only drain confirmation from a source (fire-and-forget into the coordinator). */
   onXferFlushed?: (nodeId: string, data: any) => void;
+  /** A backup's seed push progress and final hashes (B4f-3, fire-and-forget into the seed hold). */
+  onSeedReport?: (nodeId: string, data: any) => void;
 }
 
 interface ConnState {
@@ -106,6 +108,10 @@ export class ControlServer {
       clearInterval(this.pingTimer);
       this.pingTimer = null;
     }
+    // Every socket, registered or not: the listener closes only once its
+    // connections are gone, and the port may be wanted again at once (a
+    // seed hold released into the master boot, B4f-3).
+    for (const socket of this.states.keys()) socket.terminate();
     for (const socket of this.conns.values()) socket.terminate();
     this.wss?.close();
     this.httpServer?.close();
@@ -301,6 +307,9 @@ export class ControlServer {
         break;
       case MSG.XFER_FLUSHED:
         this.hooks.onXferFlushed?.(state.nodeId, data);
+        break;
+      case MSG.SEED_REPORT:
+        this.hooks.onSeedReport?.(state.nodeId, data);
         break;
       default:
         if (requestId) this.reply(socket, requestId, { ok: false, term: this.hooks.getTerm(), reason: `unknown-type:${type}` });

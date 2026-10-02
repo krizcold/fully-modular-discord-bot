@@ -18,7 +18,7 @@ import * as path from 'path';
 import { createHash, timingSafeEqual } from 'crypto';
 import { WebSocketServer, WebSocket } from 'ws';
 import { DATA_ROOT } from '../../../../utils/dataRoot';
-import { exportNamespace, FileRecord } from '../../utils/dataInterchange';
+import { exportNamespace, exportNamespaceFrom, FileRecord } from '../../utils/dataInterchange';
 import { XFER_CHUNK_BYTES, XFER_DIAL_HANDSHAKE_MS, XFER_HIGH_WATER_BYTES } from '../constants';
 
 const INCOMING_DIR = '_incoming';
@@ -156,6 +156,8 @@ export interface SenderOptions {
   guilds: () => string[];
   /** Extra dirtiness signal: a path with a pending facade op is treated as changed. */
   isDirty?: (guildId: string, relPath: string) => boolean;
+  /** The root the guild dirs are read from; the live data root when absent (B4f-3: a backup ships its mirror copy). */
+  rootDir?: string;
 }
 
 /**
@@ -201,7 +203,7 @@ export class TransferSender {
     this.failed.clear();
 
     for (const guildId of guilds) {
-      for await (const record of exportNamespace(guildId)) {
+      for await (const record of this.opts.rootDir ? exportNamespaceFrom(path.join(this.opts.rootDir, guildId), guildId) : exportNamespace(guildId)) {
         const key = `${record.guildId}/${record.relPath}`;
         seen.add(key);
         const prev = this.snapshot.get(key);
@@ -210,7 +212,7 @@ export class TransferSender {
         // Refresh the snapshot every round so the next delta compares against
         // the freshest bytes even when we did not resend this round.
         let mtimeMs = 0;
-        try { mtimeMs = (await fs.promises.stat(path.join(DATA_ROOT, record.guildId, ...record.relPath.split('/')))).mtimeMs; } catch { /* vanished */ }
+        try { mtimeMs = (await fs.promises.stat(path.join(this.opts.rootDir ?? DATA_ROOT, record.guildId, ...record.relPath.split('/')))).mtimeMs; } catch { /* vanished */ }
         this.snapshot.set(key, { size: record.size, mtimeMs, sha256: record.sha256 });
         if (!changed) continue;
         await this.sendFile(record);

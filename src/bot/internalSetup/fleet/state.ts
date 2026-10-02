@@ -28,6 +28,7 @@ import { getDataBootStatus, getDeliveredBackendUrls, hasDelivery, DataBootStatus
 import type { LineageFact } from './lineage';
 import type { TransformationView } from './transformation/transformationCoordinator';
 import type { WitnessStatus } from './witness';
+import type { SeedPushView } from './seedSource';
 
 export interface FleetStateNode {
   nodeId: string;
@@ -137,6 +138,12 @@ export interface FleetState {
   followerHold: FollowerHoldView | null;
   /** Boot hold: this master's store is EMPTY while other nodes are configured; seed from a backup first (20.14). */
   emptyStoreHold: EmptyStoreHoldView | null;
+  /** Seed hold (B4f-3): this file-mode master holds no guild data while the witness shows the fleet at a higher term; a backup's copy seeds it. */
+  seedHold: SeedHoldView | null;
+  /** Co-worker: the master it is registered with holds to be seeded (B4f-3). */
+  masterSeedHold: boolean;
+  /** Co-worker: the seed push this node runs for a holding master (B4f-3); null when none. */
+  seedPush: SeedPushView | null;
   /** This master was superseded by a higher term and is stepping down (B4). */
   superseded: SupersededView | null;
   /** The stand-in lane (20.5, B6-f): live while this node holds the fleet for a dead master; its last record otherwise. */
@@ -429,6 +436,62 @@ export function _setEmptyStoreHold(hold: EmptyStoreHoldView | null): void {
   emptyStoreHold = hold;
 }
 
+/** A backup's offer as the holding master shows it (B4f-3): the copy, its source, its age, its size. */
+export interface SeedHoldOfferView {
+  kind: 'mirror' | 'live';
+  sourceNodeId: string;
+  sourceNodeName: string;
+  sourceTerm: number;
+  completedAt: number | null;
+  ageMs: number | null;
+  guildCount: number;
+  partialCount: number;
+  totalBytes: number;
+}
+
+export interface SeedHoldBackupView {
+  nodeId: string;
+  nodeName: string;
+  connected: boolean;
+  offer: SeedHoldOfferView | null;
+  offerReason: string | null;
+  offerAt: number | null;
+}
+
+export interface SeedPushProgressView {
+  seedId: string;
+  backupNodeId: string;
+  backupNodeName: string;
+  phase: 'dialing' | 'copying' | 'verifying' | 'adopting' | 'restarting';
+  round: number;
+  filesSent: number;
+  bytesSent: number;
+  startedAt: number;
+  /** The copy landed but a finishing phase threw; the record resumes it at the next boot. */
+  stalled: string | null;
+}
+
+/** The seed hold (B4f-3): what the holding master knows and offers the operator. */
+export interface SeedHoldView {
+  since: number;
+  /** The highest term any beacon has shown; the seed's floor. */
+  holdTerm: number;
+  beaconedBy: string | null;
+  transferUrl: string | null;
+  controlUrl: string | null;
+  controlPort: number;
+  backups: SeedHoldBackupView[];
+  push: SeedPushProgressView | null;
+  lastError: string | null;
+  interrupted: string | null;
+}
+
+let seedHold: SeedHoldView | null = null;
+
+export function _setSeedHold(hold: SeedHoldView | null): void {
+  seedHold = hold;
+}
+
 /** This master was superseded by a higher term (B4): who, how it learned, and whether the step-down is staged. */
 export interface SupersededView {
   byNodeId: string;
@@ -547,6 +610,8 @@ export interface FleetStateSources {
   backupDesignationRefused?: (() => BackupDesignationRefusedView | null) | null;
   /** Stale guild copies of a superseded co-worker in file mode (B4f-2). */
   staleCopies?: (() => number | null) | null;
+  /** The seed push this co-worker runs for a holding master (B4f-3). */
+  seedPush?: (() => SeedPushView | null) | null;
 }
 
 let sources: FleetStateSources | null = null;
@@ -596,6 +661,9 @@ export function getFleetState(): FleetState {
       readOnlyStorePark,
       followerHold: buildFollowerHoldView(),
       emptyStoreHold,
+      seedHold,
+      masterSeedHold: false,
+      seedPush: null,
       superseded,
       roleOverride: buildRoleOverrideView(),
       standIn: buildStandInView(),
@@ -725,6 +793,9 @@ export function getFleetState(): FleetState {
       readOnlyStorePark,
       followerHold: buildFollowerHoldView(),
       emptyStoreHold: null,
+      seedHold: null,
+      masterSeedHold: false,
+      seedPush: null,
       superseded,
       roleOverride: buildRoleOverrideView(),
       standIn: buildStandInView(),
@@ -845,6 +916,9 @@ export function getFleetState(): FleetState {
     readOnlyStorePark,
     followerHold: buildFollowerHoldView(),
     emptyStoreHold: null,
+    seedHold: null,
+    masterSeedHold: controlClient?.getMasterSeedHold() ?? false,
+    seedPush: sources.seedPush?.() ?? null,
     superseded,
     roleOverride: buildRoleOverrideView(),
     standIn: buildStandInView(),

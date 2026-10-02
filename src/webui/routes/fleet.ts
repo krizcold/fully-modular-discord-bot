@@ -414,6 +414,41 @@ export function createFleetRoutes(botManager: BotManager): Router {
   });
 
   /**
+   * POST /api/fleet/mirror/drop
+   * The Retire reading of a held mirror copy (B4f-3): the copy of a master
+   * that no longer serves is dropped, and the mirror copies the current one.
+   */
+  router.post('/mirror/drop', async (_req: Request, res: Response) => {
+    try {
+      if (!botManager.isRunning()) {
+        res.json({ success: false, error: 'Bot is not running' });
+        return;
+      }
+      res.json(await botManager.dropHeldMirrorCopy());
+    } catch (error) {
+      res.json({ success: false, error: error instanceof Error ? error.message : 'drop failed' });
+    }
+  });
+
+  /**
+   * POST /api/fleet/seed { nodeId, confirm? }
+   * The seed hold's confirm (B4f-3): this master adopts the copy the named
+   * backup offers. Without confirm the child answers needsConfirm with the
+   * copy's age and size; the operator's confirm starts the push.
+   */
+  router.post('/seed', async (req: Request, res: Response) => {
+    try {
+      if (!botManager.isRunning()) {
+        res.json({ success: false, error: 'Bot is not running' });
+        return;
+      }
+      res.json(await botManager.seedFleet(String(req.body?.nodeId ?? ''), req.body?.confirm === true));
+    } catch (error) {
+      res.json({ success: false, error: error instanceof Error ? error.message : 'seed failed' });
+    }
+  });
+
+  /**
    * POST /api/fleet/dev/corrupt-lease { shardId }
    * Dev fault hook (drill P2.8): corrupt a held lease so the next renew reports
    * lease-mismatch. Inert unless FLEET_DEV_HOOKS=1 on the bot; never a 500.

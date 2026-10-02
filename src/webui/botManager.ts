@@ -357,6 +357,16 @@ export class BotManager {
             });
           };
           retry();
+        } else if (message.type === 'fleet:seeded') {
+          // A master seeded from a backup's copy staged its takeover override
+          // (B4f-3); it comes back as the master serving that copy.
+          console.warn('[BotManager] fleet:seeded received; restarting the bot child as the seeded master');
+          const retrySeeded = (): void => {
+            void this.restart().then(result => {
+              if (!result.success && result.reason === 'operation_in_progress') setTimeout(retrySeeded, 5000).unref();
+            });
+          };
+          retrySeeded();
         } else if (message.type === 'fleet:standin:writes') {
           // A serving stand-in asks for the write step (B6-f2). It runs here
           // because the pinned-URL verdict is only correct in this process;
@@ -852,6 +862,26 @@ export class BotManager {
   }
 
   /** Retire the stale guild copies of a superseded co-worker in file mode (B4f-2; validated in the bot child). */
+  /** The Retire reading of a held mirror copy (B4f-3): drop it so the mirror copies the master this node is registered with. */
+  async dropHeldMirrorCopy(): Promise<any> {
+    try {
+      return await this.sendIPCMessage('fleet:mirror:drop', {});
+    } catch (error) {
+      console.error('[BotManager] Error dropping the held copy:', error);
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  /** The seed hold's confirm (B4f-3): seed this master from the named backup's copy; without confirm the child answers needsConfirm with the text. */
+  async seedFleet(nodeId: string, confirm: boolean): Promise<any> {
+    try {
+      return await this.sendIPCMessage('fleet:seed', { nodeId, confirm });
+    } catch (error) {
+      console.error('[BotManager] Error confirming the seed:', error);
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
   async retireFleetStaleCopies(confirm: boolean): Promise<any> {
     try {
       return await this.sendIPCMessage('fleet:retireCopies', { confirm });

@@ -16,6 +16,8 @@ import {
   fleetReadWitness,
   fleetResumeAssignments,
   fleetRetireStaleCopies,
+  fleetSeedConfirm,
+  fleetDropHeldCopy,
   fleetSetConfig,
   fleetSyncBump,
   fleetDevCorruptLease,
@@ -152,6 +154,14 @@ export function setupFleetIPCHandlers(): void {
         }
         case 'fleet:retireCopies': {
           response = await fleetRetireStaleCopies(message.data?.confirm === true);
+          break;
+        }
+        case 'fleet:mirror:drop': {
+          response = fleetDropHeldCopy();
+          break;
+        }
+        case 'fleet:seed': {
+          response = fleetSeedConfirm(String(message.data?.nodeId ?? ''), message.data?.confirm === true);
           break;
         }
         default:

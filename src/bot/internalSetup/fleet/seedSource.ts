@@ -1,0 +1,354 @@
+// The backup's side of the seed of a new master (B4f-3, PLAN_REPLICATION
+// 20.20): what copy this node can offer a master holding to be seeded (its
+// mirror of a master, or its own live guild data after a mastership), and the
+// push of that copy over the transfer channel once the operator confirmed.
+
+import * as fs from 'fs';
+import * as path from 'path';
+import { WebSocket } from 'ws';
+import { DATA_ROOT, dataPath } from '../../../utils/dataRoot';
+import { FLEET_DIR, MIRROR_DOC_NAMES, XFER_DELTA_THRESHOLD_FILES, XFER_DIAL_RETRY_MS, XFER_DIAL_RETRY_WINDOW_MS, XFER_MAX_ROUNDS } from './constants';
+import type { PersistedFleetConfig, PersistedPlan, PersistedTerm } from './controlStore';
+import { readOwnerNodeId } from './fileFailover';
+import { readHolderSighting } from './holderSighting';
+import { mirrorDocsDir, mirrorGuildDir, mirrorRoot, readMirrorManifest } from './mirrorEngine';
+import { dialTransfer, TransferSender } from './migration/transferChannel';
+import { MSG, SeedOffer, SeedOfferGuild, SeedPushPayload, SeedReportPayload } from './protocol';
+import { hashNamespaceAt } from '../utils/dataInterchange';
+import { flushGuild } from '../utils/dataManager';
+
+const isGuildId = (value: unknown): value is string => typeof value === 'string' && /^\d+$/.test(value);
+
+function readJson<T>(file: string): T | null {
+  try {
+    return JSON.parse(fs.readFileSync(file, 'utf-8')) as T;
+  } catch {
+    return null;
+  }
+}
+
+function fleetFile(name: string): string {
+  return dataPath('global', FLEET_DIR, name);
+}
+
+function listNumericDirs(root: string): string[] {
+  try {
+    return fs.readdirSync(root, { withFileTypes: true }).filter(e => e.isDirectory() && isGuildId(e.name)).map(e => e.name).sort();
+  } catch {
+    return [];
+  }
+}
+
+/** Bytes of the files a copy ships (the sidecars .owner, .freeze and *.tmp are not part of the namespace). */
+function sizeOfDir(dir: string): number {
+  let total = 0;
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return 0;
+  }
+  for (const entry of entries) {
+    if (entry.name === '.owner' || entry.name === '.freeze' || entry.name.endsWith('.tmp')) continue;
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) total += sizeOfDir(full);
+    else if (entry.isFile()) {
+      try { total += fs.statSync(full).size; } catch { /* vanished */ }
+    }
+  }
+  return total;
+}
+
+/**
+ * The placement documents a copy carries, as text. Null when the plan or the
+ * fleet config is missing or does not parse: the pin needs both.
+ */
+function readDocuments(dir: string): Record<string, string> | null {
+  const documents: Record<string, string> = {};
+  for (const name of MIRROR_DOC_NAMES) {
+    try {
+      documents[name] = fs.readFileSync(path.join(dir, name), 'utf-8');
+    } catch { /* absent: judged below */ }
+  }
+  const plan = documents['leases.json'] === undefined ? null : readJsonText<PersistedPlan>(documents['leases.json']);
+  const config = documents['fleet-config.json'] === undefined ? null : readJsonText<PersistedFleetConfig>(documents['fleet-config.json']);
+  if (!plan || !Array.isArray(plan.assignments) || !config || !Array.isArray(config.masterCandidates)) return null;
+  return documents;
+}
+
+function readJsonText<T>(text: string): T | null {
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The term of this node's own mastership, from a term.json that names it; 0
+ * when it never minted one, or when that row is older than `notBefore` (the
+ * last registration with another master: terms are per node in file mode,
+ * so a mastership counts by WHEN it was, never by its number against others').
+ */
+export function ownMastershipTerm(selfNodeId: string, notBefore = 0): number {
+  const term = readJson<PersistedTerm>(fleetFile('term.json'));
+  if (!term || term.nodeId !== selfNodeId || !Number.isFinite(term.term)) return 0;
+  if (notBefore > 0 && !(Number.isFinite(term.updatedAt) && term.updatedAt > notBefore)) return 0;
+  return term.term;
+}
+
+export interface SeedOfferOutcome {
+  offer: SeedOffer | null;
+  /** Why nothing is offered, in the words the holding master shows beside this node. */
+  reason: string | null;
+}
+
+/**
+ * The copy this node can seed a new master from. Its mirror of another master
+ * comes first: a complete copy, with the placement documents the pin needs.
+ * Otherwise its own live guild data, offered only when this node's last
+ * mastership is the latest holding it knows of (its term.json names it, and no
+ * master it registered with since held a higher term), so an old mastership's
+ * leftovers never pose as the fleet's data.
+ */
+export function buildSeedOffer(selfNodeId: string, selfNodeName: string): SeedOfferOutcome {
+  const now = Date.now();
+  const manifest = readMirrorManifest();
+  if (manifest && manifest.sourceNodeId !== null && manifest.sourceNodeId !== selfNodeId) {
+    const sourceName = manifest.sourceNodeName ?? manifest.sourceNodeId.slice(0, 8);
+    if (manifest.completedAt === null) {
+      return { offer: null, reason: `this node's copy of ${sourceName}'s guild data was never complete (its Backup copy line says why)` };
+    }
+    const documents = readDocuments(mirrorDocsDir());
+    if (!documents) return { offer: null, reason: `this node's copy of ${sourceName}'s guild data carries no usable placement documents (leases.json, fleet-config.json), so a master seeded from it could not pin the shard plan` };
+    const guilds: SeedOfferGuild[] = [];
+    let partialCount = 0;
+    let totalBytes = 0;
+    for (const guildId of Object.keys(manifest.guilds).filter(isGuildId).sort()) {
+      const record = manifest.guilds[guildId];
+      // A guild dir the copy no longer holds ships nothing: offered as partial,
+      // so the operator's confirm names it.
+      const present = fs.existsSync(mirrorGuildDir(guildId));
+      const hash = present ? record.hash : null;
+      if (hash === null) partialCount += 1;
+      const bytes = present ? sizeOfDir(mirrorGuildDir(guildId)) : 0;
+      totalBytes += bytes;
+      guilds.push({ guildId, hash, bytes });
+    }
+    return {
+      offer: {
+        kind: 'mirror',
+        sourceNodeId: manifest.sourceNodeId,
+        sourceNodeName: sourceName,
+        sourceTerm: manifest.sourceTerm ?? 0,
+        completedAt: manifest.completedAt,
+        ageMs: Math.max(0, now - manifest.completedAt),
+        guilds,
+        partialCount,
+        totalBytes,
+        documents,
+      },
+      reason: null,
+    };
+  }
+  const ownAny = ownMastershipTerm(selfNodeId);
+  if (ownAny <= 0) {
+    return { offer: null, reason: 'this node holds no complete copy of a master\'s guild data and has never been a master itself' };
+  }
+  const sighting = readHolderSighting();
+  const ownTerm = ownMastershipTerm(selfNodeId, sighting && sighting.nodeId !== selfNodeId ? sighting.seenAt : 0);
+  if (ownTerm <= 0) {
+    return { offer: null, reason: `this node's own mastership (term ${ownAny}) is older than its last registration with another master (node ${sighting!.nodeId.slice(0, 8)} at term ${sighting!.term}), so its live guild data is not the fleet's latest` };
+  }
+  const documents = readDocuments(fleetFile(''));
+  if (!documents) return { offer: null, reason: `this node was a master (term ${ownTerm}) but its fleet directory carries no usable placement documents from that mastership` };
+  const guilds: SeedOfferGuild[] = [];
+  let totalBytes = 0;
+  for (const guildId of listNumericDirs(DATA_ROOT)) {
+    const owner = readOwnerNodeId(path.join(DATA_ROOT, guildId));
+    if (owner !== null && owner !== selfNodeId) continue;
+    const bytes = sizeOfDir(path.join(DATA_ROOT, guildId));
+    totalBytes += bytes;
+    guilds.push({ guildId, hash: null, bytes });
+  }
+  if (guilds.length === 0) return { offer: null, reason: `this node was a master (term ${ownTerm}) but holds no guild data of its own` };
+  return {
+    offer: {
+      kind: 'live',
+      sourceNodeId: selfNodeId,
+      sourceNodeName: selfNodeName,
+      sourceTerm: ownTerm,
+      completedAt: null,
+      ageMs: null,
+      guilds,
+      partialCount: 0,
+      totalBytes,
+      documents,
+    },
+    reason: null,
+  };
+}
+
+export type SeedPushPhase = 'dialing' | 'copying' | 'sent' | 'failed';
+
+/** The co-worker's view of the push it runs for a holding master. */
+export interface SeedPushView {
+  seedId: string;
+  phase: SeedPushPhase;
+  round: number;
+  filesSent: number;
+  bytesSent: number;
+  startedAt: number;
+  error: string | null;
+}
+
+export interface SeedSourceHooks {
+  selfNodeId: string;
+  selfNodeName: string;
+  getTerm: () => number;
+  sendToMaster: (type: string, data: any) => void;
+  onChanged: () => void;
+}
+
+/**
+ * Answers the holding master's requests: SEED_OFFER with what this node holds,
+ * SEED_PUSH by dialing the master's transfer endpoint with the single-use token
+ * and streaming the copy (bulk round, delta rounds to convergence, a final
+ * round), then reporting the hashes of what it shipped. One push at a time.
+ */
+export class SeedSource {
+  private push: SeedPushView | null = null;
+  private ws: WebSocket | null = null;
+
+  constructor(private readonly hooks: SeedSourceHooks) {}
+
+  getView(): SeedPushView | null {
+    return this.push;
+  }
+
+  async handle(type: string, data: any): Promise<any> {
+    if (type === MSG.SEED_OFFER) {
+      const outcome = buildSeedOffer(this.hooks.selfNodeId, this.hooks.selfNodeName);
+      return { ok: true, offer: outcome.offer, ...(outcome.reason ? { reason: outcome.reason } : {}) };
+    }
+    if (type === MSG.SEED_PUSH) return this.startPush(data as SeedPushPayload);
+    return { ok: false, reason: `unknown-seed:${type}` };
+  }
+
+  private startPush(payload: SeedPushPayload): { ok: boolean; reason?: string } {
+    if (!payload || typeof payload.seedId !== 'string' || payload.seedId === '' || typeof payload.token !== 'string' || payload.token === '' || typeof payload.peerUrl !== 'string' || payload.peerUrl === '') {
+      return { ok: false, reason: 'malformed seed push' };
+    }
+    if (payload.kind !== 'mirror' && payload.kind !== 'live') return { ok: false, reason: 'unknown copy kind' };
+    if (!Array.isArray(payload.guilds) || !payload.guilds.every(isGuildId)) return { ok: false, reason: 'malformed guild list' };
+    if (this.push && (this.push.phase === 'dialing' || this.push.phase === 'copying')) {
+      return { ok: false, reason: `a push is already running (${this.push.seedId})` };
+    }
+    // The copy must still be what was offered: the master decided on it.
+    const outcome = buildSeedOffer(this.hooks.selfNodeId, this.hooks.selfNodeName);
+    if (!outcome.offer || outcome.offer.kind !== payload.kind) {
+      return { ok: false, reason: outcome.offer ? `this node now offers its ${outcome.offer.kind} copy, not the ${payload.kind} one the seed named; ask for the offer again` : (outcome.reason ?? 'nothing to offer') };
+    }
+    const offered = new Set(outcome.offer.guilds.map(g => g.guildId));
+    const missing = payload.guilds.filter(g => !offered.has(g));
+    if (missing.length > 0) return { ok: false, reason: `the copy no longer holds guild(s) ${missing.slice(0, 5).join(', ')}; ask for the offer again` };
+    this.push = { seedId: payload.seedId, phase: 'dialing', round: 0, filesSent: 0, bytesSent: 0, startedAt: Date.now(), error: null };
+    this.hooks.onChanged();
+    void this.runPush(payload);
+    return { ok: true };
+  }
+
+  private report(seedId: string, extra: Partial<SeedReportPayload> = {}): void {
+    const view = this.push;
+    if (!view || view.seedId !== seedId) return;
+    const payload: SeedReportPayload = {
+      term: this.hooks.getTerm(),
+      seedId,
+      round: view.round,
+      filesSent: view.filesSent,
+      bytesSent: view.bytesSent,
+      ...extra,
+    };
+    this.hooks.sendToMaster(MSG.SEED_REPORT, payload);
+    this.hooks.onChanged();
+  }
+
+  private fail(seedId: string, reason: string): void {
+    const view = this.push;
+    if (!view || view.seedId !== seedId || view.phase === 'failed' || view.phase === 'sent') return;
+    view.phase = 'failed';
+    view.error = reason;
+    console.warn(`[Fleet] Seed push ${seedId} failed: ${reason}`);
+    this.report(seedId, { error: reason });
+    try { this.ws?.terminate(); } catch { /* closing */ }
+    this.ws = null;
+  }
+
+  private dial(payload: SeedPushPayload): Promise<WebSocket> {
+    // The master binds its transfer listener before it hands the token over,
+    // so a refused dial is a transient fault and is retried inside the window.
+    const deadline = Date.now() + XFER_DIAL_RETRY_WINDOW_MS;
+    return new Promise((resolve, reject) => {
+      const attempt = (): void => {
+        const ws = dialTransfer(payload.peerUrl, payload.token);
+        let opened = false;
+        ws.once('open', () => {
+          opened = true;
+          resolve(ws);
+        });
+        ws.once('error', (error: Error) => {
+          if (opened) return;
+          if (Date.now() < deadline) {
+            setTimeout(attempt, XFER_DIAL_RETRY_MS).unref();
+            return;
+          }
+          reject(new Error(`dial to ${payload.peerUrl} failed: ${error.message}`));
+        });
+      };
+      attempt();
+    });
+  }
+
+  private async runPush(payload: SeedPushPayload): Promise<void> {
+    const { seedId } = payload;
+    const view = this.push!;
+    try {
+      const ws = await this.dial(payload);
+      this.ws = ws;
+      view.phase = 'copying';
+      this.hooks.onChanged();
+      const rootDir = payload.kind === 'mirror' ? mirrorRoot() : DATA_ROOT;
+      const sender = new TransferSender(ws, { migrationId: seedId, legId: 'copy', guilds: () => payload.guilds, rootDir });
+      // Bulk round, then delta rounds until the copy converges (a copy nobody
+      // writes converges on its first delta), then the final round the master
+      // verifies against the hashes reported below.
+      let round = 0;
+      for (;;) {
+        const progress = await sender.sendRound(round);
+        view.round = round;
+        view.filesSent += progress.filesSent;
+        view.bytesSent += progress.bytesSent;
+        this.report(seedId);
+        if (round > 0 && progress.filesSent <= XFER_DELTA_THRESHOLD_FILES) break;
+        if (round >= XFER_MAX_ROUNDS - 1) break;
+        round += 1;
+      }
+      const finalRound = round + 1;
+      const progress = await sender.sendRound(finalRound);
+      view.round = finalRound;
+      view.filesSent += progress.filesSent;
+      view.bytesSent += progress.bytesSent;
+      sender.finish(finalRound);
+      const guildHashes: Record<string, string> = {};
+      for (const guildId of payload.guilds) {
+        if (payload.kind === 'live') await flushGuild(guildId);
+        guildHashes[guildId] = (await hashNamespaceAt(path.join(rootDir, guildId))).namespaceHash;
+      }
+      view.phase = 'sent';
+      this.report(seedId, { final: { guildHashes } });
+      console.log(`[Fleet] Seed push ${seedId}: ${payload.guilds.length} guild(s) shipped in ${finalRound + 1} round(s), ${view.filesSent} file(s), hashes reported`);
+    } catch (error) {
+      this.fail(seedId, error instanceof Error ? error.message : String(error));
+    }
+  }
+}

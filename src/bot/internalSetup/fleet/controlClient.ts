@@ -30,7 +30,7 @@ import {
   SyncStatePayload,
 } from './protocol';
 import type { LeaseRuntime } from './leaseRuntime';
-import type { CopyBlock, SlotStatusPayload, SupersededInfo, SyncPosturePayload } from './protocol';
+import type { CopyBlock, SeededFromInfo, SlotStatusPayload, SupersededInfo, SyncPosturePayload } from './protocol';
 
 export interface ControlClientOptions {
   /** Ordered master candidate list (PLAN_STANDBY 3.4); cycled on reconnect, never empty. */
@@ -63,6 +63,10 @@ export interface ControlClientOptions {
   onTransformControl?: (type: string, data: any) => Promise<any>;
   /** Grant-carried routing map (active transformation); applied BEFORE the grant so hydration sees correct routes. */
   onDataRoutes?: (transformationId: string, routes: { guildId: string; backend: 'file' | 'postgres' }[], url?: string, publicUrl?: string) => void | Promise<void>;
+  /** Seed control from a master holding to be seeded (SEED_OFFER, SEED_PUSH; B4f-3); returns the reply payload. */
+  onSeedControl?: (type: string, data: any) => Promise<any>;
+  /** The master this node registered with was seeded from this node's mirror copy (B4f-3): that copy is spent. */
+  onSeededFrom?: (info: SeededFromInfo) => void;
 }
 
 export class ControlClient {
@@ -81,6 +85,7 @@ export class ControlClient {
   private masterStandingInFor: string | null = null;
   private masterNodeId: string | null = null;
   private masterName: string | null = null;
+  private masterSeedHold = false;
   private reconnectTimer: NodeJS.Timeout | null = null;
   private heartbeatTimer: NodeJS.Timeout | null = null;
   private ttlTimer: NodeJS.Timeout | null = null;
@@ -145,6 +150,11 @@ export class ControlClient {
 
   getMasterName(): string | null {
     return this.masterName;
+  }
+
+  /** The master this node LAST registered with holds to be seeded (B4f-3); kept across blips like the identity above. */
+  getMasterSeedHold(): boolean {
+    return this.masterSeedHold;
   }
 
   getLastContactAgoMs(): number | null {
@@ -258,6 +268,7 @@ export class ControlClient {
       this.masterStandingInFor = typeof result.standingInFor === 'string' && result.standingInFor !== '' ? result.standingInFor : null;
       this.masterNodeId = typeof result.nodeId === 'string' && result.nodeId !== '' ? result.nodeId : null;
       this.masterName = typeof result.nodeName === 'string' && result.nodeName !== '' ? result.nodeName : null;
+      this.masterSeedHold = result.seedHold === true;
       this.attempt = 0;
       this.draining = false;
       if (result.budget) this.lastBudget = result.budget;
@@ -278,7 +289,14 @@ export class ControlClient {
         try { this.opts.onCopyBlock?.(result.copyBlock); }
         catch (error) { console.warn('[Fleet] Failed to record the delivered copy block:', error instanceof Error ? error.message : error); }
       }
-      if (typeof result.nodeId === 'string' && result.nodeId !== '') {
+      if (result.seededFrom && typeof result.seededFrom.seedId === 'string' && typeof result.seededFrom.sourceNodeId === 'string') {
+        try { this.opts.onSeededFrom?.(result.seededFrom); }
+        catch (error) { console.warn('[Fleet] Failed to release the copy that seeded the master:', error instanceof Error ? error.message : error); }
+      }
+      // A seed hold holds nothing (B4f-3): recording it as the holder would
+      // refuse this node's own promote over the dead master as a copy of a
+      // previous master.
+      if (typeof result.nodeId === 'string' && result.nodeId !== '' && result.seedHold !== true) {
         try { this.opts.onMasterIdentity?.(result.nodeId, result.term); }
         catch (error) { console.warn('[Fleet] Failed to record the master sighting:', error instanceof Error ? error.message : error); }
       }
@@ -383,6 +401,17 @@ export class ControlClient {
       case MSG.BACKEND_FLIP: {
         const handler = this.opts.onTransformControl;
         if (!handler) { this.replyAck(requestId, { ok: false, reason: 'transformation-unavailable' }); break; }
+        handler(type, data)
+          .then(result => this.replyAck(requestId, result))
+          .catch(error => this.replyAck(requestId, { ok: false, reason: error instanceof Error ? error.message : String(error) }));
+        break;
+      }
+      case MSG.SEED_OFFER:
+      case MSG.SEED_PUSH: {
+        // A master holding to be seeded asks what copy this node holds, or
+        // hands it the push (B4f-3); the reply rides the ack path.
+        const handler = this.opts.onSeedControl;
+        if (!handler) { this.replyAck(requestId, { ok: false, reason: 'seed-unavailable' }); break; }
         handler(type, data)
           .then(result => this.replyAck(requestId, result))
           .catch(error => this.replyAck(requestId, { ok: false, reason: error instanceof Error ? error.message : String(error) }));

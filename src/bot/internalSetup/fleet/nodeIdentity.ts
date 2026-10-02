@@ -45,7 +45,7 @@ export interface RoleOverride {
 // The union is DERIVED from this list, so a value the reader accepts and a value
 // the type allows cannot drift apart.
 const SET_BY_VALUES = [
-  'webui-promote', 'manager-promote', 'webui-demote', 'manager-demote', 'stepdown', 'stand-in',
+  'webui-promote', 'manager-promote', 'webui-demote', 'manager-demote', 'stepdown', 'stand-in', 'webui-seed',
 ] as const;
 
 export type RoleOverrideSetBy = typeof SET_BY_VALUES[number];

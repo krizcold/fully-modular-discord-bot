@@ -7,10 +7,14 @@ import { clearRoleOverride, consentsToActiveMode, getNodeId, getNodeName, invali
 import { effectiveMasterUrls } from '../bot/internalSetup/fleet/fleetConfig';
 import { isContainerPinned, loadCredentials, removeCredentials } from '../utils/envLoader';
 import { WITNESS_FRESH_WINDOW_MS } from '../bot/internalSetup/fleet/constants';
-import { freshMasterClaim, readSuperseded } from '../bot/internalSetup/fleet/stepDown';
+import { clearFreshFleetConfirm, freshMasterClaim, readSuperseded } from '../bot/internalSetup/fleet/stepDown';
 import { readArmRecord } from '../bot/internalSetup/fleet/armRecord';
 import { closeStandInLane } from '../bot/internalSetup/fleet/episodeRecord';
 import { clearModeOverride, ModeOverride, readModeOverride, writeModeOverride } from '../bot/internalSetup/fleet/modeOverride';
+import { clearSeedRecord, readSeedRecord } from '../bot/internalSetup/fleet/seedHold';
+import { clearAdoptMarker } from '../bot/internalSetup/fleet/fileFailover';
+import { mirrorRoot } from '../bot/internalSetup/fleet/mirrorEngine';
+import * as fs from 'fs';
 
 export interface ModeOverrideResult {
   success: boolean;
@@ -128,7 +132,7 @@ export async function runDemote(
         };
       }
     } else if (running
-      && !(state && (state.takeoverHold || state.staleMasterPark || state.readOnlyStorePark || state.followerHold || state.emptyStoreHold || (state.standIn?.live && state.standIn.writeGate)))
+      && !(state && (state.takeoverHold || state.staleMasterPark || state.readOnlyStorePark || state.followerHold || state.emptyStoreHold || state.seedHold || (state.standIn?.live && state.standIn.writeGate)))
       && !confirm) {
       // Genuine early boot with no known hold: seconds away from real state.
       // Any OTHER stall that never reaches initialization (a control store whose
@@ -146,7 +150,7 @@ export async function runDemote(
       // whatever the override file resolves to now: a designated backup whose
       // only master identity was a staged takeover that a Cancel has since
       // cleared still needs the demote as the park's exit.
-      const heldMasterBoot = !!(state && (state.takeoverHold || state.staleMasterPark || state.readOnlyStorePark || state.followerHold || state.emptyStoreHold));
+      const heldMasterBoot = !!(state && (state.takeoverHold || state.staleMasterPark || state.readOnlyStorePark || state.followerHold || state.emptyStoreHold || state.seedHold));
       const refusal = !heldMasterBoot && resolveNodeRole() !== 'master' ? 'this node is not a master'
         : isStandalone() ? 'a standalone master has no fleet to rejoin; demotion is meaningless here'
         : effectiveMasterUrls().urls.length === 0 ? 'no master candidates configured (set MASTER_URLS or the fleet config first, or the demoted node would idle)'
@@ -160,6 +164,23 @@ export async function runDemote(
     if (arm && arm.phase !== 'disarmed') {
       closeStandInLane(arm, getNodeId(), getNodeName(), null, 'demoted', `demoted by the operator (${setBy})`, `demoted by the operator (${setBy})`);
     }
+    // A seed this node was taking (B4f-3) ends with its master identity: the
+    // record would re-run its adopt at a later master boot, and the adopt
+    // marker would stop a backup's mirror ticks. What the adopt moved into
+    // the live tree stays as this node's residue (the B4f-2 reading). Done
+    // here and again once the child is gone: a lane still running in it
+    // can rewrite the record until the restart ends it.
+    const abandonSeed = (): void => {
+      const seed = readSeedRecord();
+      if (!seed || seed.phase === 'done') return;
+      clearSeedRecord();
+      clearAdoptMarker();
+      fs.rmSync(mirrorRoot(), { recursive: true, force: true });
+      console.warn(`[Fleet] DEMOTION: the seed ${seed.seedId} from ${seed.backupNodeName} (phase ${seed.phase}) is abandoned with it`);
+    };
+    abandonSeed();
+    // A brand-new-fleet confirm answers a hold this node no longer stands in.
+    clearFreshFleetConfirm();
     if (resolveEnvRole() === 'co-worker') {
       clearRoleOverride();
     } else {
@@ -174,6 +195,7 @@ export async function runDemote(
       await new Promise(resolve => setTimeout(resolve, 5000));
       restart = await botManager.restart();
     }
+    abandonSeed();
     return restart?.success
       ? { success: true }
       : { success: false, error: restart?.error ?? 'restart failed; the role change is staged and the next start boots as co-worker' };

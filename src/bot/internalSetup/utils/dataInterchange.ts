@@ -92,7 +92,11 @@ async function* walkFiles(base: string, rel: string = ''): AsyncGenerator<string
  */
 export async function* exportNamespace(guildId: string): AsyncGenerator<FileRecord> {
   await flushGuild(guildId);
-  const base = path.join(DATA_ROOT, guildId);
+  yield* exportNamespaceFrom(path.join(DATA_ROOT, guildId), guildId);
+}
+
+/** The records of a guild dir at any root (B4f-3: a backup ships its mirror copy); no flush, the caller owns the dir's quiet. */
+export async function* exportNamespaceFrom(base: string, guildId: string): AsyncGenerator<FileRecord> {
   for await (const relPath of walkFiles(base)) {
     let bytes: Buffer;
     try {
@@ -151,7 +155,11 @@ export async function hashNamespace(guildId: string): Promise<NamespaceHashResul
   // (exportNamespace buffers each file because its records SHIP the bytes;
   // a verify pass only needs the digests).
   await flushGuild(guildId);
-  const base = path.join(DATA_ROOT, guildId);
+  return hashNamespaceAt(path.join(DATA_ROOT, guildId));
+}
+
+/** The same formula over a guild dir at any root (a mirror copy, a transfer's staging); a missing dir hashes as empty. */
+export async function hashNamespaceAt(base: string): Promise<NamespaceHashResult> {
   const files: { relPath: string; size: number; sha256: string }[] = [];
   for await (const relPath of walkFiles(base)) {
     try {

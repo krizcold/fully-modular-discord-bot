@@ -84,6 +84,11 @@ export const MSG = {
    * so the old master can drain its buffered writes into it before restarting.
    */
   STEP_DOWN: 'control:step:down',
+  // The seed of a new master (B4f-3): the holding master asks a backup for
+  // the copy it holds, hands it the push, and takes its progress and hashes.
+  SEED_OFFER: 'control:seed:offer',
+  SEED_PUSH: 'control:seed:push',
+  SEED_REPORT: 'control:seed:report',
 } as const;
 
 /** STEP_DOWN payload: the new master's identity, term and (optionally) its data backend. */
@@ -120,6 +125,8 @@ export interface NodeCapabilities {
   backupMaster?: boolean;
   /** This node consents to active (stand-in) mode (FLEET_BACKUP_MODE=active); the master's stored entry still has to enable it (20.5). */
   activeCapable?: boolean;
+  /** This build answers a seed hold's offer and push (B4f-3); a hold refuses a backup without it, naming the update. */
+  seedSource?: boolean;
 }
 
 export interface RegisterPayload {
@@ -152,6 +159,10 @@ export interface RegisterResult {
   nodeId?: string;
   /** The answering master's display name, beside its id (B6-j: the serving-machine line). */
   nodeName?: string;
+  /** The answering master holds to be seeded (B4f-3): it grants nothing and copies nothing until a backup's copy is adopted. */
+  seedHold?: boolean;
+  /** Present once, in the reply to the backup whose mirror copy seeded this master (B4f-3): that copy is spent. */
+  seededFrom?: SeededFromInfo;
 }
 
 /**
@@ -513,6 +524,75 @@ export interface MirrorReport {
   totalBytes: number;
   frozenCount: number;
   error?: string;
+}
+
+// ============================================================================
+// SEED OF A NEW MASTER (B4f-3): a file-mode master with no guild data holds
+// until a designated backup pushes it the copy it holds.
+// ============================================================================
+
+export type SeedCopyKind = 'mirror' | 'live';
+
+export interface SeedOfferGuild {
+  guildId: string;
+  /** hashNamespace's formula over the copy's files; null for a partial mirror guild, and for live data (hashed at the push). */
+  hash: string | null;
+  bytes: number;
+}
+
+/** What a backup holds that a seed can adopt: its mirror of a master, or its own live guild data after a mastership. */
+export interface SeedOffer {
+  kind: SeedCopyKind;
+  sourceNodeId: string;
+  sourceNodeName: string;
+  sourceTerm: number;
+  /** When the mirror was last complete, the backup's clock; null for live data. */
+  completedAt: number | null;
+  /** Ms since completedAt as of the offer; null for live data. */
+  ageMs: number | null;
+  guilds: SeedOfferGuild[];
+  partialCount: number;
+  totalBytes: number;
+  /** The placement documents (leases, registry, fleet config) as the copy holds them, by file name. */
+  documents: Record<string, string>;
+}
+
+export interface SeedOfferRequest {
+  term: number;
+}
+
+export interface SeedOfferReply {
+  ok: boolean;
+  offer: SeedOffer | null;
+  /** Why nothing is offered, in the words the holding master shows. */
+  reason?: string;
+}
+
+/** The holding master's instruction: dial its transfer endpoint with the single-use token and push these guilds of the named copy. */
+export interface SeedPushPayload {
+  term: number;
+  seedId: string;
+  token: string;
+  peerUrl: string;
+  kind: SeedCopyKind;
+  guilds: string[];
+}
+
+/** The backup's progress, fire-and-forget; the final one carries the hashes of what it shipped. */
+export interface SeedReportPayload {
+  term: number;
+  seedId: string;
+  round: number;
+  filesSent: number;
+  bytesSent: number;
+  final?: { guildHashes: Record<string, string> };
+  error?: string;
+}
+
+/** Register-reply fact for the backup whose mirror copy seeded this master (B4f-3): that copy is spent. */
+export interface SeededFromInfo {
+  seedId: string;
+  sourceNodeId: string;
 }
 
 // ============================================================================

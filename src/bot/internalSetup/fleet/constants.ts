@@ -180,6 +180,15 @@ export const MIRROR_REVISION_FILENAME = 'mirror.json';
  */
 export const FILE_PROMOTE_TERM_MARGIN = 1000;
 
+/** The seed hold (B4f-3): how long the holding master waits for a backup's offer (a manifest read and dir sizes, no hashing). */
+export const SEED_OFFER_TIMEOUT_MS = 30000;
+
+/** The offer is asked again this often, so its age and its guild count follow the backup's disk. */
+export const SEED_OFFER_REFRESH_MS = 60000;
+
+/** After the final round landed, how long the holding master waits for the backup's hashes before the seed fails. */
+export const SEED_REPORT_WAIT_MS = 120000;
+
 // ============================================================================
 // MIGRATION (P5): node-to-node data transfer + cutover under commit barriers.
 // ============================================================================

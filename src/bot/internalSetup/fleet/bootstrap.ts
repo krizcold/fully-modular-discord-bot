@@ -42,6 +42,7 @@ import {
   readRoleOverride,
   resolveEnvRole,
   resolveNodeRole,
+  stripSelfUrl,
   wasNodeIdFreshlyGenerated,
   writeRoleOverride,
 } from './nodeIdentity';
@@ -77,8 +78,10 @@ import type { BackupDesignationRefusedView, MigrationView, PinViolationView, Sta
 import { serveSyncRequest, SyncAuthority } from './syncAuthority';
 import { SyncEngine } from './syncEngine';
 import { MirrorAuthority, isMirrorRequest, serveMirrorRequest } from './mirrorAuthority';
-import { MirrorEngine } from './mirrorEngine';
-import { isStaleCopy, listStaleCopies, STALE_COPY_REASON } from './fileFailover';
+import { MirrorEngine, readMirrorManifest } from './mirrorEngine';
+import { adoptStarted, isStaleCopy, listStaleCopies, STALE_COPY_REASON } from './fileFailover';
+import { confirmSeed, floorTermAbove, readSeedRecord, resumeSeed, runSeedHold, seedHoldApplies, writeSeedRecord } from './seedHold';
+import { ownMastershipTerm, SeedSource } from './seedSource';
 import { deleteGuildNamespace, getFrozenStats, getGuildDataBackend, setOwnerInfoProvider } from '../utils/dataManager';
 import {
   applyOperatorDataRead,
@@ -118,6 +121,7 @@ import {
   clearSuperseded,
   copyBlockEndpoint,
   freshHigherTermClaim,
+  freshMasterClaim,
   hasFreshFleetConfirm,
   notifyStepDown,
   readCopyBlock,
@@ -332,10 +336,38 @@ export function fleetFollowedBackend(): { url: string; forms: string[] } | null 
 
 let masterConfigSet: ((candidates: string[], witnessChannelId: unknown, backupDesignations: unknown) => Promise<{ ok: boolean; error?: string; revision?: number }>) | null = null;
 
-/** Runtime fleet-config edit (B2, backup order B5); master-only, pushed fleet-wide with zero restarts. */
+let coWorkerDialSet: ((candidates: unknown) => { ok: boolean; error?: string; revision?: number }) | null = null;
+
+/**
+ * Runtime fleet-config edit (B2, backup order B5); master-only, pushed
+ * fleet-wide with zero restarts. A co-worker registered with nobody edits
+ * the master list it dials (B4f-3: the backup is pointed at the machine
+ * seeded as the new master); the other fields are the master's alone.
+ */
 export async function fleetSetConfig(candidates: unknown, witnessChannelId?: unknown, backupDesignations?: unknown): Promise<{ ok: boolean; error?: string; revision?: number }> {
-  if (!masterConfigSet) return { ok: false, error: 'This node is not the fleet master' };
+  if (!masterConfigSet) {
+    if (coWorkerDialSet && (witnessChannelId === undefined || witnessChannelId === '') && backupDesignations === undefined) return coWorkerDialSet(candidates);
+    return { ok: false, error: 'This node is not the fleet master' };
+  }
   return masterConfigSet(Array.isArray(candidates) ? (candidates as string[]) : [], witnessChannelId, backupDesignations);
+}
+
+/** The seed hold's confirm (B4f-3, IPC fleet:seed): seed this holding master from the named backup's copy. */
+export function fleetSeedConfirm(nodeId: string, confirm: boolean): { success: boolean; needsConfirm?: boolean; error?: string } {
+  return confirmSeed(nodeId, confirm);
+}
+
+let heldCopyDrop: (() => { success: boolean; error?: string }) | null = null;
+
+/**
+ * The Retire reading of a HELD mirror copy (B4f-3, IPC fleet:mirror:drop): a
+ * copy taken from a master that no longer serves, kept for a seed or a
+ * promote that never came (a brand-new fleet, a seize), is dropped so the
+ * mirror copies the master this node is registered with. Co-worker only.
+ */
+export function fleetDropHeldCopy(): { success: boolean; error?: string } {
+  if (!heldCopyDrop) return { success: false, error: 'this node keeps no mirror copy (not a designated backup in file mode)' };
+  return heldCopyDrop();
 }
 
 export async function initFleet(): Promise<FleetContext> {
@@ -367,6 +399,7 @@ export async function initFleet(): Promise<FleetContext> {
     ...(advertisedTransferUrl ? { transferUrl: advertisedTransferUrl } : {}),
     ...(isBackupMaster() ? { backupMaster: true } : {}),
     ...(consentsToActiveMode() ? { activeCapable: true } : {}),
+    ...(isBackupMaster() ? { seedSource: true } : {}),
   };
 
   const init = { nodeId, nodeName, appVersion, capabilities, runtime };
@@ -579,6 +612,18 @@ async function runStaleMasterFence(
   // second backup promoted by hand, renews its beacon and is a live holder.
   if (envConfirm) {
     console.warn('[Fleet] Takeover CONFIRMED by FLEET_CONFIRM_TAKEOVER; skipping the stale-master fence');
+    // File mode (B4f-3): the seize mints above every beacon, as the brand-new
+    // release does; the backups echo the fleet's term, and a seized master
+    // below it would step down on their fresh beacons within seconds.
+    const seizeToken = (process.env.DISCORD_TOKEN || '').trim();
+    if (!(store instanceof PostgresControlStore) && !standIn && seizeToken !== '') {
+      const beacons = await new DiscordWitness({ token: seizeToken, nodeId: selfNodeId, nodeName: selfNodeName, getChannelId: () => readFleetConfigCache()?.witnessChannelId ?? null }).readClaims();
+      const top = (beacons ?? []).reduce((max, c) => (c.nodeId !== selfNodeId && Number.isFinite(c.term) ? Math.max(max, c.term) : max), 0);
+      if (top > 0) {
+        floorTermAbove(selfNodeId, top);
+        console.warn(`[Fleet] Seize in file mode: the term is floored at ${top}, the highest beacon on the witness, so this boot mints above it`);
+      }
+    }
     // A stand-in seen holding the fleet for this node is the episode this
     // confirm ends (B6-j): whatever it accepted while standing in is discarded.
     const seen = readHolderSighting();
@@ -662,9 +707,10 @@ async function runStaleMasterFence(
   // judges the rest. Under a staged takeover only a beacon still being renewed
   // is a holder: the superseded or dead master's last ones are history, and a
   // lossy failover of a lagging copy must not park on them.
-  const claims = token !== ''
-    ? await new DiscordWitness({ token, nodeId: selfNodeId, nodeName: selfNodeName, getChannelId: () => readFleetConfigCache()?.witnessChannelId ?? null }).readClaims()
+  const fenceWitness = token !== ''
+    ? new DiscordWitness({ token, nodeId: selfNodeId, nodeName: selfNodeName, getChannelId: () => readFleetConfigCache()?.witnessChannelId ?? null })
     : null;
+  const claims = fenceWitness ? await fenceWitness.readClaims() : null;
   const usable = stagedTakeover && claims ? claims.filter(c => Date.now() - c.observedAt <= WITNESS_FRESH_WINDOW_MS) : claims;
   // The c3 re-proof (20.12) needs no probe: the staged fact names the node
   // and its own fresh beacon is already in hand, where a probe it does not
@@ -763,6 +809,31 @@ async function runStaleMasterFence(
       return hold(higher.term, `witness beacon of ${higher.nodeName}`, higher.nodeId, higher.nodeName, `${higher.nodeName} (${higher.nodeId.slice(0, 8)}) is standing in for this node and has taken writes at term ${higher.term} while this node's store holds ${localTerm}: its copy is the fleet database now and this one is behind it`);
     }
     if (higher) {
+      // File mode (B4f-3): a master with no guild data to fork, and no other
+      // node serving the fleet, holds to be seeded from a backup's copy
+      // instead of parking; the operator's exits stay on the hold, and a
+      // live master appearing meanwhile parks it below.
+      if (!(store instanceof PostgresControlStore) && !stagedTakeover && !fileSeeded && !standIn && readMirrorManifest()?.completedAt != null) {
+        console.warn('[Fleet] This node holds a complete copy of a master\'s guild data, so the seed hold does not apply: the park below is the fence; Demote it and Promote from its Fleet tab as a designated backup, which adopts that copy');
+      }
+      if (!(store instanceof PostgresControlStore) && !stagedTakeover && !fileSeeded && !standIn && secret !== '' && claims && seedHoldApplies(claims, selfNodeId, Date.now())) {
+        const outcome = await runSeedHold({
+          selfNodeId,
+          selfNodeName,
+          appVersion: getAppVersion(),
+          controlPort: Number(process.env.CONTROL_PORT) || CONTROL_PORT_DEFAULT,
+          secret,
+          transferPort: Number(process.env.TRANSFER_PORT) || TRANSFER_PORT_DEFAULT,
+          transferUrl: (process.env.TRANSFER_URL || '').trim() || null,
+          controlUrl: (process.env.FLEET_PUBLIC_URL || '').trim() || null,
+          localTerm,
+          claims,
+          witness: fenceWitness,
+          pushStatus: pushFleetStatusNow,
+          park: live => park(live.term, `witness beacon of ${live.nodeName}`, live.nodeId, `${live.nodeName} (${live.nodeId.slice(0, 8)}) beacons as a live master at term ${live.term} while this node holds to be seeded; in file mode terms are per node, so a live master's fresh beacon is the fence whatever the numbers`),
+        });
+        if (outcome === 'released') return null;
+      }
       // The restore tail belongs to THIS half only: the peer half means a
       // foreign master is answering LIVE right now, where the same advice
       // would talk an operator into a dual-master seize.
@@ -1136,6 +1207,16 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   // the first healthy report re-enters them into placement.
   const timeoutDeclinedShards = new Set<number>();
 
+  // A seed that got past its verify finishes here (B4f-3): its adopt, pin and
+  // seed are idempotent on the disk they find, and the override they stage
+  // is what the guard and the fence below read.
+  if (!standalone && !standIn && !(store instanceof PostgresControlStore)) {
+    try {
+      await resumeSeed(nodeId);
+    } catch (error) {
+      console.error('[Fleet] Resuming the seed failed; the boot judges the disk as it is:', error instanceof Error ? error.message : error);
+    }
+  }
   // Boot takeover guard (PLAN_STANDBY 3.2) + previous-holder capture for the
   // ruling-5 takeover chain. The override's one-shot flags are read BEFORE the
   // CAS and consumed right after it succeeds.
@@ -3170,8 +3251,17 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
         // on the wire): a standing retire instruction re-armed on every
         // reconnect would keep a long-retired side flagged forever.
         const promote = readPromoteRecord();
+        // The seed's facts too (B4f-3): the copy's source is a node this master
+        // superseded, and the backup whose mirror seeded it learns the copy is spent.
+        const seed = readSeedRecord();
+        const seeded = seed && seed.phase === 'done' ? seed : null;
         const superseded = promote && promote.supersededNodeId === payload.nodeId && !promote.supersededDelivered
           ? { byNodeId: nodeId, byNodeName: nodeName, term: registry.term, retireRequested: promote.retireOldMaster, at: Date.now() }
+          : seeded && seeded.sourceNodeId === payload.nodeId && !seeded.supersededDelivered
+            ? { byNodeId: nodeId, byNodeName: nodeName, term: registry.term, retireRequested: false, at: Date.now() }
+            : null;
+        const seededFrom = seeded && seeded.kind === 'mirror' && seeded.backupNodeId === payload.nodeId && !seeded.copyReleased
+          ? { seedId: seeded.seedId, sourceNodeId: seeded.sourceNodeId }
           : null;
         // Only a block naming THIS master's own database is relayed: a block
         // inherited from the master this node superseded names a fenced
@@ -3188,6 +3278,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
           dataBackend: buildDataBackendInfo(),
           ...(fleetConfig ? { fleetConfig: fleetConfigPayload() } : {}),
           ...(superseded ? { superseded } : {}),
+          ...(seededFrom ? { seededFrom } : {}),
           ...(copyBlock ? { copyBlock } : {}),
           // Said in the reply because the node's own manager acts only on what
           // its bot recorded (20.11): a standby beside it must keep its place
@@ -3249,6 +3340,13 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
         const delivered = readPromoteRecord();
         if (delivered && delivered.supersededNodeId === registeredNodeId && !delivered.supersededDelivered) {
           writePromoteRecord({ ...delivered, supersededDelivered: true });
+        }
+        const seedDelivered = readSeedRecord();
+        if (seedDelivered && seedDelivered.phase === 'done') {
+          const burned = { ...seedDelivered };
+          if (burned.sourceNodeId === registeredNodeId && !burned.supersededDelivered) burned.supersededDelivered = true;
+          if (burned.kind === 'mirror' && burned.backupNodeId === registeredNodeId && !burned.copyReleased) burned.copyReleased = true;
+          if (burned.supersededDelivered !== seedDelivered.supersededDelivered || burned.copyReleased !== seedDelivered.copyReleased) writeSeedRecord(burned);
         }
         // Sync rides the control channel and never delays lease traffic:
         // push the current manifest fire-and-forget beside the reconcile.
@@ -3801,6 +3899,7 @@ async function initCoWorker(init: CommonInit, followerHold: FollowerHoldBase | n
   let controlClient: ControlClient | null = null;
   let syncEngine: SyncEngine | null = null;
   let mirrorEngine: MirrorEngine | null = null;
+  let seedSource: SeedSource | null = null;
   let executor: MigrationExecutor | null = null;
   if (masterUrls.length > 0 && secret) {
     const engine = new SyncEngine({
@@ -3840,6 +3939,16 @@ async function initCoWorker(init: CommonInit, followerHold: FollowerHoldBase | n
     // Promote-precheck signal: BOTH executors' live work counts (a promotion
     // restart mid-convert would break a transformation guild window).
     migrationWorkActive = () => (executor?.hasActiveLegs() ?? false) || transformExecutor.isBusy();
+    // The seed of a new master (B4f-3): what this node offers a master holding
+    // to be seeded, and the push once the operator confirmed it there.
+    const source = new SeedSource({
+      selfNodeId: nodeId,
+      selfNodeName: nodeName,
+      getTerm: () => controlClient?.getTerm() ?? 0,
+      sendToMaster: (type, data) => controlClient?.sendToMaster(type, data),
+      onChanged: () => pushFleetStatusNow(),
+    });
+    seedSource = source;
     controlClient = new ControlClient({
       masterUrls,
       secret,
@@ -3878,6 +3987,10 @@ async function initCoWorker(init: CommonInit, followerHold: FollowerHoldBase | n
         if (info.retireRequested) console.warn(`[Fleet] The owner asked to retire this side after the transfer to ${info.byNodeName}; the manager performs it`);
       },
       onCopyBlock: block => writeCopyBlock(block),
+      onSeedControl: (type, data) => source.handle(type, data),
+      // The mirror copy this node pushed seeded the master it now registers
+      // with: spent, so the engine drops it and copies that master next.
+      onSeededFrom: info => mirrorEngine?.dropCopyOf(info.sourceNodeId),
       onSlotStatus: payload => {
         // Only this node's own slot is recorded, judged by primary_slot_name
         // from the standby itself, and "my source is this master" by the
@@ -4028,6 +4141,41 @@ async function initCoWorker(init: CommonInit, followerHold: FollowerHoldBase | n
         };
       },
     });
+    // The list this node dials is edited from its own Fleet tab while it is
+    // registered with nobody (B4f-3: the backup is pointed at the machine
+    // seeded as the new master); a master's pushed config replaces it.
+    heldCopyDrop = () => {
+      if (!mirrorEngine) return { success: false, error: 'this node keeps no mirror copy (not a designated backup)' };
+      const report = mirrorEngine.getReport();
+      const source = mirrorEngine.getManifest().sourceNodeId;
+      if (!report || report.status !== 'held' || source === null) return { success: false, error: 'the copy is not held: the mirror copies the master this node is registered with, so there is nothing to drop' };
+      if (adoptStarted()) return { success: false, error: 'a promote is adopting this copy; cancel it first' };
+      // The hold this node is registered with waits for exactly this copy.
+      if (controlClient?.getMasterSeedHold() === true) return { success: false, error: 'the master this node is registered with holds to be seeded, and this copy is what it adopts; confirm the seed on its Fleet tab instead' };
+      const push = seedSource?.getView() ?? null;
+      if (push && (push.phase === 'dialing' || push.phase === 'copying')) return { success: false, error: 'a seed push of this copy is running' };
+      mirrorEngine.dropCopyOf(source);
+      pushFleetStatusNow();
+      return { success: true };
+    };
+    coWorkerDialSet = candidates => {
+      if (controlClient?.masterKnown()) return { ok: false, error: 'this node is registered with a master, whose list it dials; edit the list on that master\'s Fleet tab' };
+      const checked = validateMasterCandidates(candidates);
+      if (!checked.ok) return { ok: false, error: checked.error };
+      const cached = readFleetConfigCache();
+      const next: FleetConfigPayload = {
+        revision: cached?.revision ?? 0,
+        masterCandidates: checked.urls,
+        backupDesignations: cached?.backupDesignations ?? [],
+        ...(cached?.witnessChannelId ? { witnessChannelId: cached.witnessChannelId } : {}),
+        ...(cached?.hadBackup ? { hadBackup: true } : {}),
+      };
+      writeFleetConfigCache(next);
+      controlClient?.updateMasterUrls(stripSelfUrl(checked.urls));
+      console.warn(`[Fleet] Master list edited on this node: ${checked.urls.join(' | ')}`);
+      pushFleetStatusNow();
+      return { ok: true, revision: next.revision };
+    };
     // Decline-lease path (ruled C1): destroy the sessions FIRST (an acked
     // revoke means the token is free), then hand the leases back. Registered
     // module-level so it survives a data-runtime recycle; masters and
@@ -4286,7 +4434,25 @@ async function initCoWorker(init: CommonInit, followerHold: FollowerHoldBase | n
         nodeId,
         nodeName,
         role: 'backup',
-        getTerm: () => controlClient?.getTerm() ?? 0,
+        // Registered: the master's term. Registered with nobody (B4f-3): the
+        // highest term this node knows, the last holder it saw (a file, so a
+        // restart keeps it) and its own last mastership while no master beacons
+        // fresh; a restarted backup echoing 0 would let a fresh master mint and
+        // serve empty, where this echo makes it hold to be seeded.
+        getTerm: () => {
+          const known = controlClient?.getTerm() ?? 0;
+          if (controlClient?.masterKnown()) return known;
+          const status = witness?.getStatus();
+          const sighting = readHolderSighting();
+          // File mode only (a postgres mastership never touches term.json), and
+          // only a mastership newer than the last registration elsewhere: terms
+          // are per node, so an old row of this node's says nothing about the
+          // fleet's term, and an echo of it would park the master's own restart.
+          const own = resolveDataBackend() === 'file' && status && freshMasterClaim(status, nodeId, Date.now()) === null
+            ? ownMastershipTerm(nodeId, sighting && sighting.nodeId !== nodeId ? sighting.seenAt : 0)
+            : 0;
+          return Math.max(known, sighting?.term ?? 0, own);
+        },
         getChannelId: () => readFleetConfigCache()?.witnessChannelId ?? null,
         getBeaconFacts: (): BeaconFacts => {
           const facts: BeaconFacts = {};
@@ -4398,6 +4564,7 @@ async function initCoWorker(init: CommonInit, followerHold: FollowerHoldBase | n
     standInVerdict: isBackupMaster() ? () => armVerdict : null,
     mirror: mirrorEngine ? () => mirrorEngine!.getReport() : null,
     staleCopies: () => staleCopiesNow()?.length ?? null,
+    seedPush: seedSource ? () => seedSource!.getView() : null,
   });
 
   // Owner-info source for .owner manifests: null until the first lease grant.
