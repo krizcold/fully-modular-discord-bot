@@ -248,6 +248,7 @@ export class SeedSource {
   private push: SeedPushView | null = null;
   private lastOffer: SeedOfferView | null = null;
   private ws: WebSocket | null = null;
+  private lastFinal: { seedId: string; guildHashes: Record<string, string> } | null = null;
 
   constructor(private readonly hooks: SeedSourceHooks) {}
 
@@ -307,6 +308,17 @@ export class SeedSource {
     };
     this.hooks.sendToMaster(MSG.SEED_REPORT, payload);
     this.hooks.onChanged();
+  }
+
+  /**
+   * A final report sent while the control channel was down is lost, and the
+   * master would fail a healthy push for want of its hashes: every
+   * registration resends it while the push stands as sent.
+   */
+  resendFinal(): void {
+    const view = this.push;
+    if (!view || view.phase !== 'sent' || !this.lastFinal || this.lastFinal.seedId !== view.seedId) return;
+    this.report(view.seedId, { final: { guildHashes: this.lastFinal.guildHashes } });
   }
 
   /** The holding master's lane failed after this node's push: the view says so instead of sent forever. */
@@ -400,6 +412,7 @@ export class SeedSource {
       if ((view.phase as SeedPushPhase) === 'failed') return;
       view.phase = 'sent';
       view.sentAt = Date.now();
+      this.lastFinal = { seedId, guildHashes };
       this.report(seedId, { final: { guildHashes } });
       console.log(`[Fleet] Seed push ${seedId}: ${payload.guilds.length} guild(s) shipped in ${finalRound + 1} round(s), ${view.filesSent} file(s), hashes reported`);
     } catch (error) {

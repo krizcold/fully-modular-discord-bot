@@ -80,7 +80,7 @@ import { SyncEngine } from './syncEngine';
 import { MirrorAuthority, isMirrorRequest, serveMirrorRequest } from './mirrorAuthority';
 import { MirrorEngine, readMirrorManifest } from './mirrorEngine';
 import { adoptStarted, isStaleCopy, listStaleCopies, STALE_COPY_REASON } from './fileFailover';
-import { abandonSeedRecord, confirmSeed, floorTermAbove, hasGuildData, readSeedRecord, resumeSeed, runSeedHold, seedHoldApplies, writeSeedRecord } from './seedHold';
+import { abandonSeedRecord, confirmSeed, floorTermAbove, hasGuildData, readSeedRecord, resumeSeed, runSeedHold, seedHoldApplies, seedSupersededBy, writeSeedRecord } from './seedHold';
 import { ownMastershipTerm, SeedSource } from './seedSource';
 import { deleteGuildNamespace, getFrozenStats, getGuildDataBackend, setOwnerInfoProvider } from '../utils/dataManager';
 import {
@@ -610,7 +610,13 @@ async function runStaleMasterFence(
   // witness half judges FRESH beacons only: the superseded or dead master's
   // last ones age out, while a stand-in that armed after the decision, or a
   // second backup promoted by hand, renews its beacon and is a live holder.
-  if (envConfirm) {
+  // The seize finishes a stalled seed first (its resume ran before the fence
+  // with the seize): one whose resume failed again parks below with that
+  // failure instead of serving a half-adopted tree and dropping the rest.
+  const seizeStalled = envConfirm && !(store instanceof PostgresControlStore) && !standalone && !standIn ? readSeedRecord() : null;
+  if (seizeStalled && seizeStalled.phase !== 'done' && seizeStalled.phase !== 'push') {
+    console.error(`[Fleet] Takeover CONFIRMED by FLEET_CONFIRM_TAKEOVER, but this node's seed ${seizeStalled.seedId} failed its resume at this boot (logged above); the boot parks instead of seizing onto a half-adopted tree`);
+  } else if (envConfirm) {
     console.warn('[Fleet] Takeover CONFIRMED by FLEET_CONFIRM_TAKEOVER; skipping the stale-master fence');
     // A seed of this master short of done is abandoned with the seize, as a
     // Demote abandons it: its resume at a later boot would put the source's
@@ -706,6 +712,10 @@ async function runStaleMasterFence(
   // and serving a half-adopted tree would fork the copy it was seeded from.
   const stalledSeed = !(store instanceof PostgresControlStore) && !standalone && !standIn ? readSeedRecord() : null;
   if (stalledSeed && stalledSeed.phase !== 'done') {
+    const seen = !envConfirm && stalledSeed.phase !== 'push' ? seedSupersededBy(stalledSeed, selfNodeId) : null;
+    if (seen) {
+      await park(localTerm, `this node (seed ${stalledSeed.seedId})`, selfNodeId, `this node's seed ${stalledSeed.seedId} from ${stalledSeed.backupNodeName} stopped at phase ${stalledSeed.phase}, and ${seen.nodeName} has held the fleet at term ${seen.term} since it began, so finishing it would stage a takeover from that node`, { noSighting: true, exit: 'Demote this node to rejoin as a co-worker (its seed record and the mirror tree go; guild dirs the adopt already moved into the live tree stay as this node\'s residue); FLEET_CONFIRM_TAKEOVER=1 on this node plus a restart finishes the seed and seizes the fleet onto it regardless.' });
+    }
     await park(localTerm, `this node (seed ${stalledSeed.seedId})`, selfNodeId, `this node's seed ${stalledSeed.seedId} from ${stalledSeed.backupNodeName} stopped at phase ${stalledSeed.phase} and its resume failed at this boot (logged above), so ${stalledSeed.phase === 'push' ? 'its staging could not be discarded and nothing was adopted' : stalledSeed.phase === 'adopt' ? 'its tree is half adopted' : 'its copy is adopted but its takeover is not staged'}`, { noSighting: true, exit: 'Restart this bot to retry the resume, or Demote it to abandon the seed (its record and the mirror tree go; guild dirs the adopt already moved into the live tree stay as this node\'s residue).' });
   }
   // File mode (B4f-2): term.json naming ANOTHER node was seeded by a promote
@@ -1285,7 +1295,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   // is what the guard and the fence below read.
   if (!standalone && !standIn && !(store instanceof PostgresControlStore)) {
     try {
-      await resumeSeed(nodeId);
+      await resumeSeed(nodeId, (process.env.FLEET_CONFIRM_TAKEOVER || '').trim() === '1');
     } catch (error) {
       console.error('[Fleet] Resuming the seed failed; the boot judges the disk as it is:', error instanceof Error ? error.message : error);
     }
@@ -4064,6 +4074,7 @@ async function initCoWorker(init: CommonInit, followerHold: FollowerHoldBase | n
       // The mirror copy this node pushed seeded the master it now registers
       // with: spent, so the engine drops it and copies that master next.
       onSeededFrom: info => mirrorEngine?.dropCopyOf(info.sourceNodeId),
+      onRegistered: () => seedSource?.resendFinal(),
       onSlotStatus: payload => {
         // Only this node's own slot is recorded, judged by primary_slot_name
         // from the standby itself, and "my source is this master" by the

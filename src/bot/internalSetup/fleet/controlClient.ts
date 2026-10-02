@@ -67,6 +67,8 @@ export interface ControlClientOptions {
   onSeedControl?: (type: string, data: any) => Promise<any>;
   /** The master this node registered with was seeded from this node's mirror copy (B4f-3): that copy is spent. */
   onSeededFrom?: (info: SeededFromInfo) => void;
+  /** Every accepted registration, after its facts (B4f-3: a sent seed push resends its final report). */
+  onRegistered?: () => void;
 }
 
 export class ControlClient {
@@ -302,6 +304,8 @@ export class ControlClient {
         try { this.opts.onMasterIdentity?.(result.nodeId, result.term); }
         catch (error) { console.warn('[Fleet] Failed to record the master sighting:', error instanceof Error ? error.message : error); }
       }
+      try { this.opts.onRegistered?.(); }
+      catch (error) { console.warn('[Fleet] The post-registration hook failed:', error instanceof Error ? error.message : error); }
       return true;
     } catch (error) {
       console.warn(`[Fleet] Registration failed: ${error instanceof Error ? error.message : error}`);

@@ -26,11 +26,13 @@ import {
   WITNESS_FRESH_WINDOW_MS,
   WITNESS_RENEW_MS,
   XFER_DIAL_RETRY_WINDOW_MS,
+  XFER_STALL_TIMEOUT_MS,
 } from './constants';
 import { ControlServer } from './controlServer';
 import type { PersistedFleetConfig, PersistedTerm } from './controlStore';
 import { adoptMirror, clearAdoptMarker, finishAdopt, pinPlacement, seedTerm } from './fileFailover';
 import { atomicWriteFileSync, renameWithRetry } from './fileControlStore';
+import { readHolderSighting } from './holderSighting';
 import { incomingLegDir, TransferReceiver, TransferServer } from './migration/transferChannel';
 import { MirrorManifest, mirrorDocsDir, mirrorGuildDir, mirrorManifestFile, mirrorRoot, readMirrorManifest } from './mirrorEngine';
 import { rawMasterUrls, writeRoleOverride } from './nodeIdentity';
@@ -81,6 +83,8 @@ export interface SeedRecord {
   supersededDelivered: boolean;
   /** The backup has registered and been told its mirror copy is spent. */
   copyReleased: boolean;
+  /** A live master the hold saw while this seed was stalled after its landing: the seed is not finished over it. */
+  liveSeen: { nodeId: string; nodeName: string; term: number; at: number } | null;
 }
 
 const PHASES: SeedPhase[] = ['push', 'adopt', 'pin', 'seed', 'done'];
@@ -119,11 +123,26 @@ export function readSeedRecord(): SeedRecord | null {
     updatedAt: Number(parsed.updatedAt) || 0,
     supersededDelivered: parsed.supersededDelivered === true,
     copyReleased: parsed.copyReleased === true,
+    liveSeen: parsed.liveSeen && typeof parsed.liveSeen.nodeId === 'string' && Number.isFinite(parsed.liveSeen.term)
+      ? { nodeId: parsed.liveSeen.nodeId, nodeName: typeof parsed.liveSeen.nodeName === 'string' ? parsed.liveSeen.nodeName : parsed.liveSeen.nodeId.slice(0, 8), term: Number(parsed.liveSeen.term), at: Number(parsed.liveSeen.at) || 0 }
+      : null,
   };
 }
 
 export function writeSeedRecord(record: SeedRecord): void {
   atomicWriteFileSync(recordFile(), JSON.stringify({ ...record, updatedAt: Date.now() }, null, 2));
+}
+
+/**
+ * Another node has held the fleet since this seed began: the hold saw it
+ * live while the seed stalled, or this node sighted it holding (the rule
+ * the B4f-2 promote resume applies). Finishing the seed would stage a
+ * takeover from that node.
+ */
+export function seedSupersededBy(record: SeedRecord, selfNodeId: string): { nodeId: string; nodeName: string; term: number } | null {
+  if (record.liveSeen) return record.liveSeen;
+  const seen = readHolderSighting();
+  return seen && seen.nodeId !== selfNodeId && seen.seenAt >= record.startedAt ? { nodeId: seen.nodeId, nodeName: `node ${seen.nodeId.slice(0, 8)}`, term: seen.term } : null;
 }
 
 export function clearSeedRecord(): void {
@@ -282,7 +301,7 @@ let interruptedNote: string | null = null;
  * finished (the boot then runs as the staged takeover it wrote); one caught
  * before its verify is discarded, and the hold that re-forms says so.
  */
-export async function resumeSeed(selfNodeId: string): Promise<void> {
+export async function resumeSeed(selfNodeId: string, seize = false): Promise<void> {
   const record = readSeedRecord();
   if (!record) return;
   if (record.phase === 'push') {
@@ -294,6 +313,11 @@ export async function resumeSeed(selfNodeId: string): Promise<void> {
     return;
   }
   if (record.phase === 'done') return;
+  const seen = seize ? null : seedSupersededBy(record, selfNodeId);
+  if (seen) {
+    console.error(`[Fleet] Seed ${record.seedId} from ${record.backupNodeName} is not resumed: ${seen.nodeName} has held the fleet at term ${seen.term} since it began, and finishing it would stage a takeover from that node; the fence parks this boot`);
+    return;
+  }
   console.warn(`[Fleet] Resuming seed ${record.seedId} from ${record.backupNodeName} at phase ${record.phase}`);
   await finishSeed(record, selfNodeId);
 }
@@ -357,6 +381,9 @@ interface SeedLane {
   stalled: string | null;
   dialTimer: NodeJS.Timeout | null;
   reportTimer: NodeJS.Timeout | null;
+  /** The last transfer frame, report or heartbeat from the backup. */
+  lastActivityAt: number;
+  stallTimer: NodeJS.Timeout | null;
 }
 
 function sanitizeOffer(raw: unknown): SeedOffer | null {
@@ -490,6 +517,7 @@ class SeedHoldRuntime {
       onHeartbeat: nodeId => {
         const entry = this.backups.get(nodeId);
         if (entry) entry.connected = true;
+        if (this.lane && this.lane.record.backupNodeId === nodeId) this.lane.lastActivityAt = Date.now();
       },
       onGuildNotice: () => { /* no shards are held here */ },
       onLeaseRenew: () => ({ ok: false, term: this.serverTerm, epoch: 0, reason: 'seed-hold' }),
@@ -616,6 +644,7 @@ class SeedHoldRuntime {
       updatedAt: now,
       supersededDelivered: false,
       copyReleased: false,
+      liveSeen: null,
     };
     const lane: SeedLane = {
       record, token, tokenSpent: false, expiresAt: now + TRANSFER_TOKEN_TTL_MS,
@@ -629,6 +658,7 @@ class SeedHoldRuntime {
       }),
       receiver: null, ws: null, phase: 'dialing', round: 0, filesSent: 0, bytesSent: 0,
       finalLanded: false, sourceHashes: null, verifying: false, failed: false, stalled: null, dialTimer: null, reportTimer: null,
+      lastActivityAt: now, stallTimer: null,
     };
     this.lane = lane;
     this.lastError = null;
@@ -682,6 +712,19 @@ class SeedHoldRuntime {
     lane.dialTimer = null;
     lane.ws = ws;
     lane.phase = 'copying';
+    // A backup gone silent (asleep, powered off, cut off) closes nothing, so
+    // the lane fails on silence instead: no transfer frame, report or heartbeat.
+    lane.lastActivityAt = Date.now();
+    ws.on('message', () => { lane.lastActivityAt = Date.now(); });
+    lane.stallTimer = setInterval(() => {
+      if (lane.failed || lane.finalLanded) {
+        if (lane.stallTimer) clearInterval(lane.stallTimer);
+        lane.stallTimer = null;
+        return;
+      }
+      if (Date.now() - lane.lastActivityAt > XFER_STALL_TIMEOUT_MS) this.failLane(lane, `${lane.record.backupNodeName} went silent for ${Math.round(XFER_STALL_TIMEOUT_MS / 1000)}s while copying (no transfer, report or heartbeat: asleep, powered off or cut off from this node); nothing was adopted`);
+    }, Math.min(XFER_STALL_TIMEOUT_MS, 10000));
+    lane.stallTimer.unref();
     lane.receiver = new TransferReceiver(ws, lane.record.seedId, 'copy', {
       onRound: round => {
         lane.round = Math.max(lane.round, round);
@@ -703,6 +746,7 @@ class SeedHoldRuntime {
   private onReport(nodeId: string, data: SeedReportPayload): void {
     const lane = this.lane;
     if (!lane || lane.failed || nodeId !== lane.record.backupNodeId || !data || data.seedId !== lane.record.seedId) return;
+    lane.lastActivityAt = Date.now();
     if (Number.isFinite(data.round)) lane.round = Math.max(lane.round, Number(data.round));
     if (Number.isFinite(data.filesSent)) lane.filesSent = Number(data.filesSent);
     if (Number.isFinite(data.bytesSent)) lane.bytesSent = Number(data.bytesSent);
@@ -820,6 +864,7 @@ class SeedHoldRuntime {
     lane.failed = true;
     if (lane.dialTimer) clearTimeout(lane.dialTimer);
     if (lane.reportTimer) clearTimeout(lane.reportTimer);
+    if (lane.stallTimer) clearInterval(lane.stallTimer);
     void lane.receiver?.close();
     try { lane.ws?.terminate(); } catch { /* closing */ }
     lane.transfer.stop();
@@ -849,9 +894,16 @@ class SeedHoldRuntime {
   /** A master alive after all ends the hold: the fleet is served, and this node must not seed itself beside it. */
   private async parkOnLive(live: WitnessClaim): Promise<void> {
     if (this.lane && this.lane.stalled !== null) {
-      // Landed and stalled: the record stays for the next boot, whose fence
-      // judges the staged takeover against that master's fresh beacon.
-      console.warn(`[Fleet] Seed ${this.lane.record.seedId}: ${live.nodeName} beacons as a live master at term ${live.term} while the seed is stalled after its landing; the channel closes and the record stays for the next boot`);
+      // Landed and stalled: the record stays and names that master, so the
+      // next boot parks on it instead of finishing a takeover from it.
+      const seedId = this.lane.record.seedId;
+      try {
+        const onDisk = readSeedRecord();
+        if (onDisk && onDisk.seedId === seedId && onDisk.phase !== 'done') writeSeedRecord({ ...onDisk, liveSeen: { nodeId: live.nodeId, nodeName: live.nodeName, term: live.term, at: Date.now() } });
+      } catch (error) {
+        console.error(`[Fleet] Seed ${seedId}: marking the live master on the record failed (${error instanceof Error ? error.message : error}); the next boot judges it by this node's holder sighting`);
+      }
+      console.warn(`[Fleet] Seed ${seedId}: ${live.nodeName} beacons as a live master at term ${live.term} while the seed is stalled after its landing; the channel closes and the record stays, marked, so the next boot parks instead of finishing it`);
     } else if (this.lane) {
       this.failLane(this.lane, `${live.nodeName} beacons as a live master at term ${live.term}; the seed is abandoned`);
     }
