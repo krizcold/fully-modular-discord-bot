@@ -108,6 +108,7 @@ export class ControlClient {
     this.masterStandingInFor = null;
     this.masterNodeId = null;
     this.masterName = null;
+    this.masterSeedHold = false;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     if (this.ttlTimer) clearInterval(this.ttlTimer);
@@ -152,7 +153,7 @@ export class ControlClient {
     return this.masterName;
   }
 
-  /** The master this node LAST registered with holds to be seeded (B4f-3); kept across blips like the identity above. */
+  /** The master this node is registered with holds to be seeded (B4f-3); false once the connection drops, since whether it still holds is unknown then. */
   getMasterSeedHold(): boolean {
     return this.masterSeedHold;
   }
@@ -217,6 +218,7 @@ export class ControlClient {
     ws.on('close', () => {
       const wasRegistered = this.registered;
       this.registered = false;
+      this.masterSeedHold = false;
       this.failPending(new Error('control connection closed'));
       if (wasRegistered) console.warn('[Fleet] Lost control connection to master; reconnecting');
       // Never registered on this connection: the endpoint is dead, refusing,
@@ -407,7 +409,8 @@ export class ControlClient {
         break;
       }
       case MSG.SEED_OFFER:
-      case MSG.SEED_PUSH: {
+      case MSG.SEED_PUSH:
+      case MSG.SEED_ABORT: {
         // A master holding to be seeded asks what copy this node holds, or
         // hands it the push (B4f-3); the reply rides the ack path.
         const handler = this.opts.onSeedControl;

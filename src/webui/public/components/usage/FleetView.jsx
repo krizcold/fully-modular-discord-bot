@@ -962,7 +962,7 @@ function FleetMirrorLine({ mirror, heartbeatAgoMs, api, canDrop }) {
   // longer serves, kept for a seed or a promote that never came.
   const drop = () => {
     if (busy) return;
-    if (!confirm(`Drop this node's copy of ${mirror.sourceNodeName || 'the old master'}'s guild data (${mirror.guildCount} guild${mirror.guildCount === 1 ? '' : 's'}, ${(mirror.totalBytes / 1048576).toFixed(1)} MB)?\n\nThe master this node is registered with is not the one this copy was taken from, and it adopts nothing from it. The copy is kept only as what a new master could be seeded from or a promote could adopt; once dropped (removed, not graveyarded) the mirror copies the current master instead.`)) return;
+    if (!confirm(`Drop this node's copy of ${mirror.sourceNodeName || 'the old master'}'s guild data (${mirror.guildCount} guild${mirror.guildCount === 1 ? '' : 's'}, ${(mirror.totalBytes / 1048576).toFixed(1)} MB)?\n\nThe master this node is registered with is not the one this copy was taken from, and it adopts nothing from it; a copy of a previous master seeds and promotes nothing either, so the mirror holds it until it is dropped. Once dropped (removed, not graveyarded) the mirror copies the current master instead.`)) return;
     setBusy(true);
     api.post('/fleet/mirror/drop', {})
       .then((res) => {
@@ -984,7 +984,7 @@ function FleetMirrorLine({ mirror, heartbeatAgoMs, api, canDrop }) {
   if (mirror.status === 'held') {
     return (
       <div className="usage-stat-sub" style={{ color: '#d29922' }}>
-        {`Backup copy: ${copy} from ${mirror.sourceNodeName || mirror.sourceNodeId || 'a previous master'}; HELD: ${mirror.error || 'another master serves now'}`}
+        {`Backup copy: ${copy}${mirror.sourceNodeName || mirror.sourceNodeId ? ` from ${mirror.sourceNodeName || mirror.sourceNodeId}` : ''}; HELD: ${mirror.error || 'another master serves now'}`}
         {canDrop && api ? (
           <button onClick={drop} disabled={busy} style={{ marginLeft: '6px', fontSize: '0.72rem', padding: '2px 8px' }}>
             {busy ? 'Dropping...' : 'Drop this copy'}
@@ -1020,7 +1020,8 @@ function FleetConfigCard({ api, fleet }) {
   // A co-worker registered with nobody edits the list it dials (B4f-3: the
   // backup is pointed at the machine seeded as the new master); the master's
   // pushed config replaces it once this node registers.
-  const dialOnly = fleet.role !== 'master' && !fleet.masterKnown;
+  const dialOnly = fleet.role !== 'master' && !fleet.masterKnown && fleet.dialing === true;
+  const idleDialer = fleet.role !== 'master' && !fleet.masterKnown && fleet.dialing !== true;
   const editable = (fleet.role === 'master' && !fleet.standalone) || dialOnly;
   const move = (i, delta) => {
     const next = [...backupsDraft];
@@ -1162,6 +1163,11 @@ function FleetConfigCard({ api, fleet }) {
           {dialOnly && (
             <div className="usage-stat-sub" style={{ marginTop: '4px' }}>
               This node is registered with no master, so the list it dials is edited here (a new master's address, for a backup seeding it); a master's pushed config replaces it once this node registers.
+            </div>
+          )}
+          {idleDialer && (
+            <div className="usage-stat-sub" style={{ marginTop: '4px', color: '#d29922' }}>
+              This node dials no master: set MASTER_URLS (and CONTROL_SECRET) in its environment and restart it; the list is edited here only while it dials one.
             </div>
           )}
           {editable && (
@@ -1753,7 +1759,7 @@ function FleetSeedHoldBanner({ api, hold, reload }) {
     api.post('/fleet/confirm-fresh', {})
       .then((res) => {
         if (!res || res.success === false) { showToast((res && res.error) || 'Confirm failed', 'error'); return; }
-        showToast('Brand-new fleet confirmed; the hold releases on its next check', 'success');
+        showToast('Brand-new fleet confirmed; the hold releases on its next check unless a seed is running by then', 'success');
       })
       .catch((err) => showToast((err && err.message) || 'Confirm failed', 'error'))
       .finally(() => setBusy(false));
@@ -1787,11 +1793,13 @@ function FleetSeedHoldBanner({ api, hold, reload }) {
         );
       })}
       <div><FleetDemoteButton api={api} /></div>
-      <div>
-        <button onClick={confirmFresh} disabled={busy} style={{ marginTop: '6px', fontSize: '0.72rem', padding: '2px 8px' }}>
-          {busy ? 'Confirming...' : 'This is a brand-new fleet'}
-        </button>
-      </div>
+      {push ? null : (
+        <div>
+          <button onClick={confirmFresh} disabled={busy} style={{ marginTop: '6px', fontSize: '0.72rem', padding: '2px 8px' }}>
+            {busy ? 'Confirming...' : 'This is a brand-new fleet'}
+          </button>
+        </div>
+      )}
     </div>
   );
 }
@@ -1804,15 +1812,19 @@ function fleetSeedSourceText(fleet) {
   const self = (fleet.nodes || []).find((n) => n.isSelf);
   const copy = self ? self.mirror : null;
   const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
-  const holds = copy && copy.completedAgoMs != null
-    ? `This node holds a copy of ${copy.sourceNodeName || 'the old master'}'s guild data, last complete ${fleetFormatAge(copy.completedAgoMs)} (${plural(copy.guildCount, 'guild')}, ${(copy.totalBytes / 1048576).toFixed(1)} MB), and offers it.`
-    : 'This node offers what it holds; that master\'s Fleet tab says what, or why nothing.';
+  const offer = fleet.seedOffer;
+  const refused = !!(offer && !offer.offered);
+  const holds = refused
+    ? `This node offers nothing: ${offer.reason || 'no reason given'}.`
+    : copy && copy.completedAgoMs != null
+      ? `This node holds a copy of ${copy.sourceNodeName || 'the old master'}'s guild data, last complete ${fleetFormatAge(copy.completedAgoMs)} (${plural(copy.guildCount, 'guild')}, ${(copy.totalBytes / 1048576).toFixed(1)} MB), and offers it.`
+      : 'This node offers what it holds; that master\'s Fleet tab says what, or why nothing.';
   const progress = push
     ? (push.phase === 'failed' ? ` The last push failed: ${push.error || 'unknown error'}.`
       : push.phase === 'sent' ? ` The copy was pushed (${plural(push.filesSent, 'file')}, ${(push.bytesSent / 1048576).toFixed(1)} MB in ${plural(push.round + 1, 'round')}); the master verifies it and adopts it, or its Fleet tab says why not.`
       : ` Pushing the copy now (${push.phase}, round ${push.round}, ${plural(push.filesSent, 'file')}, ${(push.bytesSent / 1048576).toFixed(1)} MB).`)
     : '';
-  return `SEEDING A NEW MASTER: ${master} holds no guild data and waits to be seeded from a backup's copy before it serves; it grants no shards meanwhile. ${holds} Confirm the seed on ${master}'s Fleet tab.${progress}`;
+  return `SEEDING A NEW MASTER: ${master} holds no guild data and waits to be seeded from a backup's copy before it serves; it grants no shards meanwhile. ${holds} ${refused ? `${master}'s Fleet tab shows the same beside this node.` : `Confirm the seed on ${master}'s Fleet tab.`}${progress}`;
 }
 
 // The emergency lever (B6-k, F11): a node-local enable of active mode for the
@@ -1883,7 +1895,7 @@ function FleetDemoteButton({ api }) {
   const [busy, setBusy] = React.useState(false);
   const demote = () => {
     if (busy) return;
-    if (!confirm('Demote this master to co-worker?\n\nIt restarts, dials the master candidates and re-adopts its shards from the live master at zero identify cost.')) return;
+    if (!confirm('Demote this master to co-worker?\n\nIt restarts as a co-worker and dials the master candidates, re-adopting its shards from the live master at zero identify cost; a held boot with no candidates configured idles instead until MASTER_URLS names one.')) return;
     setBusy(true);
     const send = (confirmFreeze) => api.post('/fleet/demote', confirmFreeze ? { confirm: true } : {});
     send(false)
@@ -2047,7 +2059,7 @@ function FleetView({ api, wsClient, guildNames }) {
         {!fleet.masterKnown && !fleet.servingOnCachedLease && sawCachedLeaseRef.current && (
           <div className="usage-notice">Lease expired; gateway sessions destroyed; waiting for master.</div>
         )}
-        {!fleet.masterKnown && !fleet.servingOnCachedLease && !sawCachedLeaseRef.current && (
+        {!fleet.masterKnown && !fleet.servingOnCachedLease && !sawCachedLeaseRef.current && fleet.dialing !== false && (
           <div className="usage-notice">Master unreachable, retrying...</div>
         )}
         {fleet.draining && (
@@ -2113,7 +2125,7 @@ function FleetView({ api, wsClient, guildNames }) {
 
         {selfNode ? (
           <div className="usage-stat-grid" style={{ marginTop: '14px' }}>
-            <FleetNodeCard node={selfNode} dataBackend={fleet.dataBackend} standbySlot={fleet.standbySlot} api={api} canDrop={!fleet.masterSeedHold && !(fleet.seedPush && (fleet.seedPush.phase === 'dialing' || fleet.seedPush.phase === 'copying'))} />
+            <FleetNodeCard node={selfNode} dataBackend={fleet.dataBackend} standbySlot={fleet.standbySlot} api={api} canDrop={!!fleet.masterKnown && !fleet.masterSeedHold && !(fleet.seedPush && (fleet.seedPush.phase === 'dialing' || fleet.seedPush.phase === 'copying'))} />
           </div>
         ) : null}
 

@@ -89,6 +89,7 @@ export const MSG = {
   SEED_OFFER: 'control:seed:offer',
   SEED_PUSH: 'control:seed:push',
   SEED_REPORT: 'control:seed:report',
+  SEED_ABORT: 'control:seed:abort',
 } as const;
 
 /** STEP_DOWN payload: the new master's identity, term and (optionally) its data backend. */
@@ -579,6 +580,13 @@ export interface SeedPushPayload {
 }
 
 /** The backup's progress, fire-and-forget; the final one carries the hashes of what it shipped. */
+/** Master to backup: the seed lane this node pushed for has failed (B4f-3); its push view says so. */
+export interface SeedAbortPayload {
+  term: number;
+  seedId: string;
+  reason: string;
+}
+
 export interface SeedReportPayload {
   term: number;
   seedId: string;

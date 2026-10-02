@@ -362,10 +362,21 @@ export function createFleetRoutes(botManager: BotManager): Router {
    * Exit for the empty-store boot hold (PLAN_REPLICATION 20.14): the operator
    * confirms this is a brand-new fleet with no backup holding data.
    */
-  router.post('/confirm-fresh', (_req: Request, res: Response) => {
+  router.post('/confirm-fresh', async (_req: Request, res: Response) => {
     try {
+      // The confirm answers a hold standing now; one from a stale banner after
+      // the hold ended would release this node's next hold on its first check.
+      const state = botManager.isRunning() ? (await botManager.getFleetState())?.state ?? null : null;
+      if (!state || !(state.emptyStoreHold || state.seedHold)) {
+        res.json({ success: false, error: 'no empty-store hold or seed hold stands on this node now, so there is nothing to confirm; reload the Fleet tab' });
+        return;
+      }
+      if (state.seedHold?.push) {
+        res.json({ success: false, error: 'a seed is running on this node (the hold adopts the copy and restarts as master), so a brand-new confirm answers nothing now; reload the Fleet tab' });
+        return;
+      }
       writeFreshFleetConfirm();
-      console.warn('[Fleet] Brand-new fleet CONFIRMED via web UI; the empty-store hold releases');
+      console.warn(`[Fleet] Brand-new fleet CONFIRMED via web UI; the ${state.seedHold ? 'seed' : 'empty-store'} hold releases`);
       res.json({ success: true });
     } catch (error) {
       res.json({ success: false, error: error instanceof Error ? error.message : 'confirm failed' });

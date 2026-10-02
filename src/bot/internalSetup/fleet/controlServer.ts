@@ -29,6 +29,8 @@ export interface ControlServerHooks {
   getNodeName?: () => string;
   /** The master this node is temporarily standing in for, if any; the returning master must not fence itself out on it. */
   getStandingInFor?: () => string | null;
+  /** This node holds to be seeded (B4f-3), said in the TERM_PROBE reply: a booting master must not park on a node that holds nothing. */
+  getSeedHold?: () => boolean;
   /** A newer master says step down (B4); answered pre-registration like TERM_PROBE. */
   onStepDown?: (payload: StepDownPayload) => { ok: boolean; reason?: string };
   /** Registry insert + VersionGate; returns the register reply. */
@@ -226,6 +228,7 @@ export class ControlServer {
           term: this.hooks.getTerm(),
           nodeId: this.hooks.getNodeId(),
           ...(standingInFor ? { standingInFor } : {}),
+          ...(this.hooks.getSeedHold?.() ? { seedHold: true } : {}),
         });
       }
       return;

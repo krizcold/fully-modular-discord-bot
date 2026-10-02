@@ -14,6 +14,7 @@ import { resolveDataBackend } from '../../../utils/envLoader';
 import { hashFileStreamed, namespaceHashOf, safeImportTarget } from '../utils/dataInterchange';
 import { MIRROR_DIRNAME, MIRROR_DOC_NAMES, MIRROR_LIST_TIMEOUT_MS, MIRROR_TICK_MS, SYNC_MAX_FILE_BYTES } from './constants';
 import { atomicWriteFileSync, renameWithRetry } from './fileControlStore';
+import { readHolderSighting } from './holderSighting';
 import { MSG, MirrorListReply, MirrorReadKind, MirrorReport, MirrorStatus, SyncFileEntry } from './protocol';
 
 const STAGING_DIRNAME = '.staging';
@@ -209,6 +210,7 @@ export class MirrorEngine {
   private manifest: MirrorManifest;
   private status: MirrorStatus = 'idle';
   private lastError: string | undefined;
+  private degradedError: string | undefined;
   private attemptedAt: number | null = null;
   private running = false;
   private dropPending: string | null = null;
@@ -257,6 +259,23 @@ export class MirrorEngine {
       guildCount += 1;
       for (const file of Object.values(guild.files)) totalBytes += file.size;
     }
+    // A held copy of a master that no longer answers: what held it (a seed
+    // hold, another master) may be gone, so the line says what is known.
+    // Registered with nobody, what the copy is still good for depends on who
+    // held the fleet last: a hold replacing its own master, or a promote of
+    // this node, adopts it; a later master makes it a previous master's.
+    const unregisteredHold = this.status === 'held' && !this.hooks.masterKnown();
+    const sighting = unregisteredHold ? readHolderSighting() : null;
+    const later = sighting && manifest.sourceNodeId !== null && sighting.nodeId !== manifest.sourceNodeId ? sighting : null;
+    const error = unregisteredHold
+      ? (manifest.completedAt === null
+        ? (Object.keys(manifest.guilds).length === 0
+          ? 'this node is registered with no master now; it holds no copy yet, and the mirror starts once a master answers'
+          : 'this node is registered with no master now; the copy is incomplete (it seeds and promotes nothing): the mirror resumes under the copy\'s own master, and under any other it is held for the operator to drop')
+        : later
+          ? `this node is registered with no master now; the copy is a previous master's (node ${later.nodeId.slice(0, 8)} held the fleet after it, at term ${later.term}), so it seeds and promotes nothing and is for the operator to drop once a serving master answers`
+          : 'this node is registered with no master now; the copy is kept as it stood: a hold replacing its master adopts it by a seed, a promote of this node adopts it, and any other master holds it for a drop')
+      : this.lastError;
     const now = Date.now();
     return {
       status: this.status,
@@ -269,7 +288,7 @@ export class MirrorEngine {
       guildCount,
       totalBytes,
       frozenCount: manifest.frozen.length,
-      ...(this.lastError ? { error: this.lastError } : {}),
+      ...(error ? { error } : {}),
     };
   }
 
@@ -286,7 +305,8 @@ export class MirrorEngine {
         // A master holding to be seeded (B4f-3) copies nothing yet; the copy
         // this node holds is what it may adopt, so it stays and the line says so.
         if (reason.startsWith('mirror-seed-hold')) {
-          this.finish('held', 'the master holds to be seeded and copies nothing yet; it adopts the copy this node offers once the seed is confirmed on its Fleet tab');
+          const incomplete = this.manifest.completedAt === null && this.degradedError ? `; this node's copy was never complete: ${this.degradedError}` : '';
+          this.finish('held', `the master holds to be seeded and copies nothing yet; its Fleet tab lists what this node offers it, or why nothing, and takes the confirm${incomplete}`);
           return;
         }
         this.finish(reason.startsWith('mirror-') ? 'refused' : 'degraded', reason);
@@ -353,6 +373,10 @@ export class MirrorEngine {
   private finish(status: MirrorStatus, error?: string): void {
     this.status = status;
     this.lastError = error;
+    // The cause of a failed attempt outlives a hold that follows it: the held
+    // line names why the copy was never complete.
+    if (status === 'degraded') this.degradedError = error;
+    else if (status === 'complete' || status === 'idle') this.degradedError = undefined;
     this.hooks.onChanged();
   }
 
@@ -369,7 +393,7 @@ export class MirrorEngine {
     if (Object.keys(previous.guilds).length === 0) return undefined;
     const kept = previous.sourceNodeName ?? previous.sourceNodeId;
     const serving = typeof listing.sourceNodeName === 'string' ? listing.sourceNodeName : String(listing.sourceNodeId);
-    return `the copy taken from ${kept} is kept; ${serving} serves now and is not mirrored until that copy is adopted or retired`;
+    return `the copy taken from ${kept} is kept; ${serving} serves now and is not mirrored until that copy is dropped (a previous master's copy seeds and promotes nothing)`;
   }
 
   /**

@@ -189,6 +189,9 @@ export const SEED_OFFER_REFRESH_MS = 60000;
 /** After the final round landed, how long the holding master waits for the backup's hashes before the seed fails. */
 export const SEED_REPORT_WAIT_MS = 120000;
 
+/** After its push was sent, how long a backup refuses its own file promote: the seeded master restarts and beacons within this window, and two seeds at one floor would mint equal terms. */
+export const SEED_SENT_PROMOTE_HOLD_MS = 600000;
+
 // ============================================================================
 // MIGRATION (P5): node-to-node data transfer + cutover under commit barriers.
 // ============================================================================

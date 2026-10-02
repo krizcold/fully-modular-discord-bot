@@ -9,11 +9,11 @@ import { WebSocket } from 'ws';
 import { DATA_ROOT, dataPath } from '../../../utils/dataRoot';
 import { FLEET_DIR, MIRROR_DOC_NAMES, XFER_DELTA_THRESHOLD_FILES, XFER_DIAL_RETRY_MS, XFER_DIAL_RETRY_WINDOW_MS, XFER_MAX_ROUNDS } from './constants';
 import type { PersistedFleetConfig, PersistedPlan, PersistedTerm } from './controlStore';
-import { readOwnerNodeId } from './fileFailover';
+import { adoptStarted, readOwnerNodeId } from './fileFailover';
 import { readHolderSighting } from './holderSighting';
 import { mirrorDocsDir, mirrorGuildDir, mirrorRoot, readMirrorManifest } from './mirrorEngine';
 import { dialTransfer, TransferSender } from './migration/transferChannel';
-import { MSG, SeedOffer, SeedOfferGuild, SeedPushPayload, SeedReportPayload } from './protocol';
+import { MSG, SeedAbortPayload, SeedOffer, SeedOfferGuild, SeedPushPayload, SeedReportPayload } from './protocol';
 import { hashNamespaceAt } from '../utils/dataInterchange';
 import { flushGuild } from '../utils/dataManager';
 
@@ -113,27 +113,46 @@ export interface SeedOfferOutcome {
  */
 export function buildSeedOffer(selfNodeId: string, selfNodeName: string): SeedOfferOutcome {
   const now = Date.now();
+  // A promote of this node is adopting its copy (running or parked): what it
+  // moved into the live tree has left the mirror, and a seed would ship the
+  // rest as partial. Cancel it or let it finish first.
+  if (adoptStarted()) return { offer: null, reason: 'a promote of this node is adopting its copy (running or parked), so it offers no copy; Demote the holding master first if this node is registered with one, then Continue the promote on this node\'s Fleet tab' };
   const manifest = readMirrorManifest();
   if (manifest && manifest.sourceNodeId !== null && manifest.sourceNodeId !== selfNodeId) {
     const sourceName = manifest.sourceNodeName ?? manifest.sourceNodeId.slice(0, 8);
     if (manifest.completedAt === null) {
-      return { offer: null, reason: `this node's copy of ${sourceName}'s guild data was never complete (its Backup copy line says why)` };
+      return { offer: null, reason: `this node's copy of ${sourceName}'s guild data was never complete (its Backup copy line names the last failed attempt, if one ran since this node started)` };
+    }
+    // A copy of a previous master (this node registered with a later one since,
+    // the foreign-copy hold of B4f-2): seeding from it would lose that master's
+    // whole tenure, as a promote of it would, so neither takes it.
+    const sighting = readHolderSighting();
+    if (sighting && sighting.nodeId !== selfNodeId && sighting.nodeId !== manifest.sourceNodeId) {
+      return { offer: null, reason: `this node's copy is of ${sourceName}'s guild data, but the master it last registered with is node ${sighting.nodeId.slice(0, 8)} (term ${sighting.term}), which held the fleet after ${sourceName}: a copy of a previous master seeds no new master, as it promotes none; drop it once registered with a serving master` };
     }
     const documents = readDocuments(mirrorDocsDir());
     if (!documents) return { offer: null, reason: `this node's copy of ${sourceName}'s guild data carries no usable placement documents (leases.json, fleet-config.json), so a master seeded from it could not pin the shard plan` };
     const guilds: SeedOfferGuild[] = [];
     let partialCount = 0;
     let totalBytes = 0;
+    const torn: string[] = [];
     for (const guildId of Object.keys(manifest.guilds).filter(isGuildId).sort()) {
       const record = manifest.guilds[guildId];
-      // A guild dir the copy no longer holds ships nothing: offered as partial,
-      // so the operator's confirm names it.
-      const present = fs.existsSync(mirrorGuildDir(guildId));
-      const hash = present ? record.hash : null;
+      // A guild dir the copy no longer holds was moved into this node's live
+      // tree by a promote's adopt (cancelled or parked): the copy is torn, and
+      // a seed from it would land that guild empty.
+      if (!fs.existsSync(mirrorGuildDir(guildId))) {
+        torn.push(guildId);
+        continue;
+      }
+      const hash = record.hash;
       if (hash === null) partialCount += 1;
-      const bytes = present ? sizeOfDir(mirrorGuildDir(guildId)) : 0;
+      const bytes = sizeOfDir(mirrorGuildDir(guildId));
       totalBytes += bytes;
       guilds.push({ guildId, hash, bytes });
+    }
+    if (torn.length > 0) {
+      return { offer: null, reason: `this node's copy of ${sourceName}'s guild data is torn: ${torn.length} guild(s) were moved into this node's live tree by a promote of this node, so it seeds no other master; Demote the holding master first if this node is registered with one, then Promote this node again (it adopts the rest of the copy), or drop the copy once registered with a serving master (under the copy's own master it heals by itself)` };
     }
     return {
       offer: {
@@ -199,7 +218,16 @@ export interface SeedPushView {
   filesSent: number;
   bytesSent: number;
   startedAt: number;
+  /** When the final round and the hashes went out; the backup's own file promote waits on it. */
+  sentAt: number | null;
   error: string | null;
+}
+
+/** What this node last answered a holding master's offer ask with (B4f-3), for its own Fleet tab. */
+export interface SeedOfferView {
+  at: number;
+  offered: boolean;
+  reason: string | null;
 }
 
 export interface SeedSourceHooks {
@@ -218,6 +246,7 @@ export interface SeedSourceHooks {
  */
 export class SeedSource {
   private push: SeedPushView | null = null;
+  private lastOffer: SeedOfferView | null = null;
   private ws: WebSocket | null = null;
 
   constructor(private readonly hooks: SeedSourceHooks) {}
@@ -226,12 +255,19 @@ export class SeedSource {
     return this.push;
   }
 
+  getOfferView(): SeedOfferView | null {
+    return this.lastOffer;
+  }
+
   async handle(type: string, data: any): Promise<any> {
     if (type === MSG.SEED_OFFER) {
       const outcome = buildSeedOffer(this.hooks.selfNodeId, this.hooks.selfNodeName);
+      this.lastOffer = { at: Date.now(), offered: outcome.offer !== null, reason: outcome.reason };
+      this.hooks.onChanged();
       return { ok: true, offer: outcome.offer, ...(outcome.reason ? { reason: outcome.reason } : {}) };
     }
     if (type === MSG.SEED_PUSH) return this.startPush(data as SeedPushPayload);
+    if (type === MSG.SEED_ABORT) return this.abort(data as SeedAbortPayload);
     return { ok: false, reason: `unknown-seed:${type}` };
   }
 
@@ -252,7 +288,7 @@ export class SeedSource {
     const offered = new Set(outcome.offer.guilds.map(g => g.guildId));
     const missing = payload.guilds.filter(g => !offered.has(g));
     if (missing.length > 0) return { ok: false, reason: `the copy no longer holds guild(s) ${missing.slice(0, 5).join(', ')}; ask for the offer again` };
-    this.push = { seedId: payload.seedId, phase: 'dialing', round: 0, filesSent: 0, bytesSent: 0, startedAt: Date.now(), error: null };
+    this.push = { seedId: payload.seedId, phase: 'dialing', round: 0, filesSent: 0, bytesSent: 0, startedAt: Date.now(), sentAt: null, error: null };
     this.hooks.onChanged();
     void this.runPush(payload);
     return { ok: true };
@@ -271,6 +307,21 @@ export class SeedSource {
     };
     this.hooks.sendToMaster(MSG.SEED_REPORT, payload);
     this.hooks.onChanged();
+  }
+
+  /** The holding master's lane failed after this node's push: the view says so instead of sent forever. */
+  private abort(data: SeedAbortPayload): { ok: boolean; reason?: string } {
+    const view = this.push;
+    if (!view || !data || typeof data.seedId !== 'string' || view.seedId !== data.seedId) return { ok: false, reason: 'no such push' };
+    if (view.phase === 'failed') return { ok: true };
+    view.phase = 'failed';
+    view.sentAt = null;
+    view.error = `the master's seed failed: ${typeof data.reason === 'string' && data.reason !== '' ? data.reason : 'no reason given'}`;
+    try { this.ws?.terminate(); } catch { /* closing */ }
+    this.ws = null;
+    console.warn(`[Fleet] Seed push ${view.seedId}: ${view.error}`);
+    this.hooks.onChanged();
+    return { ok: true };
   }
 
   private fail(seedId: string, reason: string): void {
@@ -344,7 +395,11 @@ export class SeedSource {
         if (payload.kind === 'live') await flushGuild(guildId);
         guildHashes[guildId] = (await hashNamespaceAt(path.join(rootDir, guildId))).namespaceHash;
       }
+      // An abort or a failure landed while the hashes were computed (the phase
+      // moves under the awaits, past the narrowing): it stands.
+      if ((view.phase as SeedPushPhase) === 'failed') return;
       view.phase = 'sent';
+      view.sentAt = Date.now();
       this.report(seedId, { final: { guildHashes } });
       console.log(`[Fleet] Seed push ${seedId}: ${payload.guilds.length} guild(s) shipped in ${finalRound + 1} round(s), ${view.filesSent} file(s), hashes reported`);
     } catch (error) {

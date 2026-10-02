@@ -103,7 +103,7 @@ export async function evaluateStandInWrites(ctx: StandInWriteContext, renewOk: b
     let masterAnswers = false;
     for (const url of ctx.candidates()) {
       const peer = await probePeerTerm(url, ctx.secret, PEER_TERM_PROBE_MS);
-      if (peer && peer.nodeId === ctx.coveringNodeId) {
+      if (peer && peer.nodeId === ctx.coveringNodeId && !peer.seedHold) {
         masterAnswers = true;
         break;
       }

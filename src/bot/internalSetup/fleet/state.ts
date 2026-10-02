@@ -28,7 +28,7 @@ import { getDataBootStatus, getDeliveredBackendUrls, hasDelivery, DataBootStatus
 import type { LineageFact } from './lineage';
 import type { TransformationView } from './transformation/transformationCoordinator';
 import type { WitnessStatus } from './witness';
-import type { SeedPushView } from './seedSource';
+import type { SeedOfferView, SeedPushView } from './seedSource';
 
 export interface FleetStateNode {
   nodeId: string;
@@ -144,6 +144,8 @@ export interface FleetState {
   masterSeedHold: boolean;
   /** Co-worker: the seed push this node runs for a holding master (B4f-3); null when none. */
   seedPush: SeedPushView | null;
+  /** Co-worker: what this node last offered a holding master, or why nothing (B4f-3); null before any ask. */
+  seedOffer: SeedOfferView | null;
   /** This master was superseded by a higher term and is stepping down (B4). */
   superseded: SupersededView | null;
   /** The stand-in lane (20.5, B6-f): live while this node holds the fleet for a dead master; its last record otherwise. */
@@ -187,6 +189,8 @@ export interface FleetState {
   pinTestGuildShard: boolean;
   pinnedShardId: number | null;
   masterKnown: boolean;
+  /** This node runs a control client dialing a master list (a co-worker with candidates and a secret); the list edit on its Fleet tab needs one. */
+  dialing: boolean;
   masterUrl: string | null;
   /** Co-worker: the node it registered with stands in for that master (20.5), so the fleet runs on a temporary copy. */
   masterStandingInFor: string | null;
@@ -612,6 +616,8 @@ export interface FleetStateSources {
   staleCopies?: (() => number | null) | null;
   /** The seed push this co-worker runs for a holding master (B4f-3). */
   seedPush?: (() => SeedPushView | null) | null;
+  /** What this co-worker last offered a holding master (B4f-3). */
+  seedOffer?: (() => SeedOfferView | null) | null;
 }
 
 let sources: FleetStateSources | null = null;
@@ -664,6 +670,7 @@ export function getFleetState(): FleetState {
       seedHold,
       masterSeedHold: false,
       seedPush: null,
+      seedOffer: null,
       superseded,
       roleOverride: buildRoleOverrideView(),
       standIn: buildStandInView(),
@@ -691,6 +698,7 @@ export function getFleetState(): FleetState {
       pinTestGuildShard: isPinEnabled(),
       pinnedShardId: null,
       masterKnown: false,
+      dialing: false,
       masterUrl: null,
       masterStandingInFor: null,
       masterNodeId: null,
@@ -796,6 +804,7 @@ export function getFleetState(): FleetState {
       seedHold: null,
       masterSeedHold: false,
       seedPush: null,
+      seedOffer: null,
       superseded,
       roleOverride: buildRoleOverrideView(),
       standIn: buildStandInView(),
@@ -823,6 +832,7 @@ export function getFleetState(): FleetState {
       pinTestGuildShard: isPinEnabled(),
       pinnedShardId,
       masterKnown: true,
+      dialing: false,
       masterUrl: null,
       masterStandingInFor: null,
       masterNodeId: null,
@@ -919,6 +929,7 @@ export function getFleetState(): FleetState {
     seedHold: null,
     masterSeedHold: controlClient?.getMasterSeedHold() ?? false,
     seedPush: sources.seedPush?.() ?? null,
+    seedOffer: sources.seedOffer?.() ?? null,
     superseded,
     roleOverride: buildRoleOverrideView(),
     standIn: buildStandInView(),
@@ -946,6 +957,7 @@ export function getFleetState(): FleetState {
     pinTestGuildShard: isPinEnabled(),
     pinnedShardId: null,
     masterKnown: registered,
+    dialing: controlClient !== null,
     masterUrl: controlClient?.getCurrentMasterUrl() ?? effectiveMasterUrls().urls[0] ?? null,
     masterStandingInFor: controlClient?.getMasterStandingInFor() ?? null,
     masterNodeId: controlClient?.getMasterNodeId() ?? null,

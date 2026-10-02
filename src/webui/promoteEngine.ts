@@ -28,6 +28,7 @@ import {
   PROMOTE_SQL_TIMEOUT_MS,
   REPLICA_LAG_PROMOTE_MAX_MS,
   FILE_PROMOTE_TERM_MARGIN,
+  SEED_SENT_PROMOTE_HOLD_MS,
 } from '../bot/internalSetup/fleet/constants';
 import { isContainerPinned, loadCredentials } from '../utils/envLoader';
 import { clearRoleOverride, getNodeId, getNodeName, invalidateRoleOverrideCache, readRoleOverride, writeRoleOverride } from '../bot/internalSetup/fleet/nodeIdentity';
@@ -146,7 +147,10 @@ type HoldForms = { following: string | null; followingForms: string[] };
  * null when the child is not running or did not answer, which is UNKNOWN and
  * never read as "no hold".
  */
-async function readChildState(botManager: BotManager): Promise<{ initialized: boolean; hold: HoldForms | null; park: { at: number; peerUrl: string; observedTerm: number } | null } | null> {
+/** A seed push of this node's copy, as the child reports it (B4f-3). */
+interface SeedPushFacts { seedId: string; phase: string; sentAt: number | null }
+
+async function readChildState(botManager: BotManager): Promise<{ initialized: boolean; hold: HoldForms | null; park: { at: number; peerUrl: string; observedTerm: number } | null; masterSeedHold: boolean; seedPush: SeedPushFacts | null } | null> {
   if (!botManager.isRunning()) return null;
   const res = await botManager.getFleetState().catch(() => null);
   if (!res?.success || !res.state) return null;
@@ -158,6 +162,10 @@ async function readChildState(botManager: BotManager): Promise<{ initialized: bo
     // A boot parked on a live holder: a foreign node answered at or above this
     // node's term at `at`, which is evidence against any record decided before.
     park: park && Number.isFinite(park.at) ? { at: Number(park.at), peerUrl: String(park.peerUrl ?? ''), observedTerm: Number(park.observedTerm) || 0 } : null,
+    masterSeedHold: res.state.masterSeedHold === true,
+    seedPush: res.state.seedPush && typeof res.state.seedPush === 'object'
+      ? { seedId: String(res.state.seedPush.seedId ?? ''), phase: String(res.state.seedPush.phase ?? ''), sentAt: Number.isFinite(res.state.seedPush.sentAt) ? Number(res.state.seedPush.sentAt) : null }
+      : null,
   };
 }
 
@@ -563,6 +571,20 @@ async function reachabilityRefusal(): Promise<PromoteStartResult | null> {
 }
 
 /**
+ * The seed hold's refusals of a file promote (B4f-3), shared by a fresh promote
+ * and a Continue: the copy is what a hold adopts, a running push is reading
+ * it, and a copy just pushed restarts its master within the window.
+ */
+function fileSeedRefusal(masterSeedHold: boolean, push: SeedPushFacts | null): string | null {
+  if (masterSeedHold) return 'the master this node is registered with holds to be seeded (B4f-3), so it is not dead: seed it from this node\'s copy on its Fleet tab if this node offers one (a promote of this node adopting the copy withdraws the offer), or Demote that master first and promote or Continue here.';
+  if (push && (push.phase === 'dialing' || push.phase === 'copying')) return `a seed push of this node's copy is running (seed ${push.seedId}); let it finish or fail before promoting here`;
+  if (push && push.phase === 'sent' && typeof push.sentAt === 'number' && Date.now() - push.sentAt < SEED_SENT_PROMOTE_HOLD_MS) {
+    return `this node's copy was pushed to a master being seeded ${Math.round((Date.now() - push.sentAt) / 1000)}s ago (seed ${push.seedId}); that master restarts as the fleet's master and this node registers with it, so a promote here would mint beside it. Wait for it (up to ${Math.round(SEED_SENT_PROMOTE_HOLD_MS / 60000)} minutes after the push) and promote only if it never comes back, or if that master was demoted or its seed failed without this node being told (its Fleet tab says).`;
+  }
+  return null;
+}
+
+/**
  * The file-mode verdict (B4f-2, PLAN_REPLICATION 20.20): the designated backup
  * adopts the copy of the master's guild data it holds. Only a DEAD master is
  * taken over here (a live one is moved by the planned transfer, not built
@@ -574,6 +596,8 @@ async function startFilePromote(botManager: BotManager, state: any, opts: Promot
   const fresh = await botManager.readFleetWitness();
   if (fresh?.success && fresh.witness) witnessStatus = fresh.witness;
   else console.warn('[Fleet] Promote has no fresh witness reading (this node runs no witness, or the read failed); judging on the last cached one, which the freshness windows will reject if it is old');
+  const seedRefusal = fileSeedRefusal(state.masterSeedHold === true, state.seedPush ?? null);
+  if (seedRefusal) return { success: false, error: seedRefusal };
   const masterAlive = state.masterKnown === true || (witnessStatus ? freshMasterClaim(witnessStatus, state.nodeId, Date.now()) !== null : false);
   if (masterAlive) {
     return { success: false, error: 'the master is still alive (its control connection is up or its witness beacon is fresh). Moving the master to this node while it is alive is a planned transfer, which file mode does not have yet, so this node cannot take over while the master answers. If it must, stop the old master first and promote again: the copy this node holds is then adopted.' };
@@ -797,12 +821,13 @@ export async function continuePromote(botManager: BotManager): Promise<{ success
   // An unreadable or still-initializing child is unknown, never "no hold":
   // the restart phase stages a takeover override that boots this node as
   // master past the fence, so the phases run only on a child that answered.
+  let child: Awaited<ReturnType<typeof readChildState>> = null;
   if (record.mode !== 'stand-in') {
     const seen = promoteSupersededBy(record);
     if (seen) {
       return { success: false, error: `${supersededText(seen)}, so continuing it would restart this node as master past the fence onto a fleet that node holds; Cancel it, and Promote again on what is reachable now` };
     }
-    const child = await readChildState(botManager);
+    child = await readChildState(botManager);
     if (child?.park && child.park.at >= record.startedAt) {
       return { success: false, error: `the boot is parked on a live holder (${child.park.peerUrl} answers at term ${child.park.observedTerm}) since this promote was decided, and the park is terminal: its takeover restart is what the fence parks. Cancel this promote (it dismisses the record and clears any takeover it staged) and demote this node from the Fleet tab; to seize the fleet deliberately instead, leave this promote on record and set FLEET_CONFIRM_TAKEOVER=1 plus a restart (the override it staged is what puts this node on the master path where that confirm is read)` };
     }
@@ -814,6 +839,8 @@ export async function continuePromote(botManager: BotManager): Promise<{ success
     }
   }
   if (record.backend === 'file') {
+    const seedRefusal = fileSeedRefusal(child?.masterSeedHold === true, child?.seedPush ?? null);
+    if (seedRefusal) return { success: false, error: seedRefusal };
     const moved = readPromoteRecord();
     if (phasesRunning || !moved || moved.parked !== record.parked || moved.startedAt !== record.startedAt || moved.updatedAt !== record.updatedAt) {
       return { success: false, error: 'the promote changed while the continue was being checked; look at its current phase and retry' };

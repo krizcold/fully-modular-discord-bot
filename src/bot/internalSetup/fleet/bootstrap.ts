@@ -80,7 +80,7 @@ import { SyncEngine } from './syncEngine';
 import { MirrorAuthority, isMirrorRequest, serveMirrorRequest } from './mirrorAuthority';
 import { MirrorEngine, readMirrorManifest } from './mirrorEngine';
 import { adoptStarted, isStaleCopy, listStaleCopies, STALE_COPY_REASON } from './fileFailover';
-import { confirmSeed, floorTermAbove, readSeedRecord, resumeSeed, runSeedHold, seedHoldApplies, writeSeedRecord } from './seedHold';
+import { abandonSeedRecord, confirmSeed, floorTermAbove, hasGuildData, readSeedRecord, resumeSeed, runSeedHold, seedHoldApplies, writeSeedRecord } from './seedHold';
 import { ownMastershipTerm, SeedSource } from './seedSource';
 import { deleteGuildNamespace, getFrozenStats, getGuildDataBackend, setOwnerInfoProvider } from '../utils/dataManager';
 import {
@@ -612,6 +612,17 @@ async function runStaleMasterFence(
   // second backup promoted by hand, renews its beacon and is a live holder.
   if (envConfirm) {
     console.warn('[Fleet] Takeover CONFIRMED by FLEET_CONFIRM_TAKEOVER; skipping the stale-master fence');
+    // A seed of this master short of done is abandoned with the seize, as a
+    // Demote abandons it: its resume at a later boot would put the source's
+    // documents and copy back over the fleet this boot serves.
+    if (!(store instanceof PostgresControlStore) && !standIn) {
+      try {
+        const abandoned = abandonSeedRecord();
+        if (abandoned) console.warn(`[Fleet] Seize in file mode: the seed ${abandoned.seedId} from ${abandoned.backupNodeName} (phase ${abandoned.phase}) is abandoned with it; what its adopt moved into the live tree stays as this node's residue`);
+      } catch (error) {
+        console.error('[Fleet] Seize in file mode: abandoning the stalled seed failed; the boot serves the disk as it is:', error instanceof Error ? error.message : error);
+      }
+    }
     // File mode (B4f-3): the seize mints above every beacon, as the brand-new
     // release does; the backups echo the fleet's term, and a seized master
     // below it would step down on their fresh beacons within seconds.
@@ -659,15 +670,21 @@ async function runStaleMasterFence(
     }
   }
   const localTerm = local ? local.term : 0;
-  const park = (observedTerm: number, peerUrl: string, holderNodeId: string, detail: string, extra = ''): Promise<never> => {
+  const park = (observedTerm: number, peerUrl: string, holderNodeId: string, detail: string, opts: { extra?: string; exit?: string; noSighting?: boolean } = {}): Promise<never> => {
     // A stand-in that trips the fence has learned the master is alive after all,
     // which is the best possible outcome: it simply stops standing in. Parking
     // it instead would strand a node that is no longer a backup and no longer a
     // master, with nothing left running to change its mind.
     if (standIn) return disarmStandIn(`${detail}; the master this node was covering is alive`);
-    console.error(`[Fleet] STALE MASTER FENCE: ${detail}; parking the boot instead of acquiring a term on a database the fleet has moved off. Demote this node to rejoin as a co-worker.${extra}`);
-    noteHolderSighting(holderNodeId, observedTerm, 'fence-park', selfNodeId);
-    _setStaleMasterPark({ observedTerm, localTerm, peerUrl, at: Date.now(), ...(store instanceof PostgresControlStore ? {} : { reason: `${detail}. Demote this node to rejoin as a co-worker.` }) });
+    // The exit in the reason is the park's own where one is given. Parked on
+    // a seed hold (B4f-3), or on a beacon while holding a complete copy, this
+    // node keeps the sighting of the master its copy came from, which a later
+    // promote of it checks: a hold holds nothing, and the beacon at the top
+    // term may be a backup's echo of it.
+    const exit = opts.exit ?? 'Demote this node to rejoin as a co-worker.';
+    console.error(`[Fleet] STALE MASTER FENCE: ${detail}; parking the boot instead of acquiring a term on a database the fleet has moved off. ${exit}${opts.extra ?? ''}`);
+    if (!opts.noSighting) noteHolderSighting(holderNodeId, observedTerm, 'fence-park', selfNodeId);
+    _setStaleMasterPark({ observedTerm, localTerm, peerUrl, at: Date.now(), ...(store instanceof PostgresControlStore ? {} : { reason: `${detail}. ${exit}` }) });
     pushFleetStatusNow();
     return (async () => { for (;;) await guardSleep(TERM_GUARD_POLL_MS); })();
   };
@@ -683,6 +700,14 @@ async function runStaleMasterFence(
     return Promise.resolve({ reason: 'behind', standInNodeId, standInName, observedTerm, localTerm, seenVia, since: Date.now() });
   };
 
+  // File mode (B4f-3): a seed of this master whose resume failed at this boot
+  // (its record short of done) parks whatever the witness shows. A dark
+  // witness holds nothing, but the node's own record is the evidence here,
+  // and serving a half-adopted tree would fork the copy it was seeded from.
+  const stalledSeed = !(store instanceof PostgresControlStore) && !standalone && !standIn ? readSeedRecord() : null;
+  if (stalledSeed && stalledSeed.phase !== 'done') {
+    await park(localTerm, `this node (seed ${stalledSeed.seedId})`, selfNodeId, `this node's seed ${stalledSeed.seedId} from ${stalledSeed.backupNodeName} stopped at phase ${stalledSeed.phase} and its resume failed at this boot (logged above), so ${stalledSeed.phase === 'push' ? 'its staging could not be discarded and nothing was adopted' : stalledSeed.phase === 'adopt' ? 'its tree is half adopted' : 'its copy is adopted but its takeover is not staged'}`, { noSighting: true, exit: 'Restart this bot to retry the resume, or Demote it to abandon the seed (its record and the mirror tree go; guild dirs the adopt already moved into the live tree stay as this node\'s residue).' });
+  }
   // File mode (B4f-2): term.json naming ANOTHER node was seeded by a promote
   // (the store's own mint always names this node). The seed sits above every
   // term the fleet has beaconed by a margin, so neither half below could
@@ -695,7 +720,14 @@ async function runStaleMasterFence(
   // too and is not a seed: that boot keeps the former rules.
   const fileSeeded = !(store instanceof PostgresControlStore) && local !== null && local.nodeId !== selfNodeId && !wasNodeIdFreshlyGenerated();
   if (fileSeeded && !stagedTakeover) {
-    const reason = `this node's term (${localTerm}) was seeded by a promote under node ${local!.nodeId.slice(0, 8)}, and that promote's takeover is not staged any more or was not honoured (another node held the fleet after it was decided), so the seed says nothing about the fleet now; the boot is parked. Demote this node to rejoin as a co-worker, then Promote again from its Fleet tab for a fresh verdict once the master is dead; FLEET_CONFIRM_TAKEOVER=1 on this node plus a restart seizes the fleet onto the adopted copy regardless.`;
+    // A seed of this master (B4f-3, an env master) and a designated backup's
+    // promote (B4f-2) seed the same way; the exits differ: a demoted env
+    // master is a plain co-worker with no Promote, and its adopted copy stays.
+    const seedRecord = readSeedRecord();
+    const seededBy = seedRecord ? `the seed ${seedRecord.seedId} from ${seedRecord.backupNodeName}` : 'a seed of this master';
+    const reason = !isBackupMaster()
+      ? `this node's term (${localTerm}) was seeded under node ${local!.nodeId.slice(0, 8)} by ${seededBy}, and that seed's takeover is not staged any more or was not honoured (another node held the fleet after it was decided), so the adopted copy is a fork of the fleet now; the boot is parked. Demote this node to rejoin as a co-worker (the adopted copy stays as its residue); FLEET_CONFIRM_TAKEOVER=1 on this node plus a restart seizes the fleet onto that copy regardless.`
+      : `this node's term (${localTerm}) was seeded by a promote under node ${local!.nodeId.slice(0, 8)}, and that promote's takeover is not staged any more or was not honoured (another node held the fleet after it was decided), so the seed says nothing about the fleet now; the boot is parked. Demote this node to rejoin as a co-worker, then Promote again from its Fleet tab for a fresh verdict once the master is dead; FLEET_CONFIRM_TAKEOVER=1 on this node plus a restart seizes the fleet onto the adopted copy regardless.`;
     console.error(`[Fleet] STALE MASTER FENCE: ${reason}`);
     _setStaleMasterPark({ observedTerm: localTerm, localTerm, peerUrl: `node ${local!.nodeId.slice(0, 8)} (the seed's source)`, at: Date.now(), reason });
     pushFleetStatusNow();
@@ -744,6 +776,35 @@ async function runStaleMasterFence(
       // This node's own answer proves nothing: candidates include its own
       // advertised URL, and a predecessor process may still hold the port.
       if (peer === null || peer.nodeId === selfNodeId) continue;
+      // A seed hold (B4f-3) is a master boot with no guild data waiting for
+      // a copy: it serves nothing, and it parks on this node's beacon once
+      // this boot serves, so it fences nobody holding the fleet's term. It
+      // answers with the highest beacon it has seen, and under that term: a
+      // complete copy of a master's data is a designated backup's, which a
+      // promote adopts or the hold is seeded from; live guild dirs are a
+      // stale fork; a node with no guild data holds too, which the witness
+      // half below decides when this node's own reading shows that term,
+      // and parks when it does not (serving empty is the lineage trap the
+      // hold exists to prevent). The hold is the one fence a dark witness
+      // leaves them, and none of these parks records it as the holder.
+      if (peer.seedHold) {
+        const holdAt = `${url} (node ${peer.nodeId.slice(0, 8)}) holds to be seeded at term ${peer.term}, the highest beacon it has seen on the witness`;
+        if (peer.term <= localTerm) {
+          console.warn(`[Fleet] Stale-master fence: ${holdAt}; not a live master, it parks once this node beacons`);
+          continue;
+        }
+        if (readMirrorManifest()?.completedAt != null) {
+          await park(peer.term, url, peer.nodeId, `${holdAt} while this node holds a complete copy of a master's guild data: that copy is adopted by a promote, never seeded over`, { noSighting: true, exit: 'Switch this node back to backup-master (BOT_NODE_ROLE) and restart it, then seed that hold from this copy on its Fleet tab where this node offers it (a promote adopting the copy, or a copy torn by one, withdraws the offer), or Demote that hold first and Promote here; a Demote of this node now leaves a plain co-worker that offers no copy.' });
+        }
+        if (hasGuildData()) {
+          await park(peer.term, url, peer.nodeId, `${holdAt} while this node's store holds ${localTerm} with live guild data: this copy is a stale fork of the fleet, and the hold is what fences it`, { noSighting: true, exit: 'Demote this node to rejoin as a co-worker.' });
+        }
+        if (usable && witnessWinner(usable, selfNodeId, localTerm)) {
+          console.warn(`[Fleet] Stale-master fence: ${holdAt}; this node holds no guild data, and the witness half of this fence judges it (a hold of this node too)`);
+          continue;
+        }
+        await park(peer.term, url, peer.nodeId, `${holdAt} while this node's store holds ${localTerm} with no guild data, and this node's own witness reading shows no such term (none readable, or another channel): it cannot judge the fleet, so it parks instead of serving empty`, { noSighting: true, exit: 'Seed that hold from a backup, then Demote this node to rejoin as a co-worker; if this node\'s witness read only failed in passing, a restart reads it again.' });
+      }
       // A seeded file-mode boot (above): terms are per node there, so a lower
       // term says nothing about who holds the fleet; any other node answering
       // as a live master falsifies the dead-master premise and is the fence.
@@ -809,12 +870,21 @@ async function runStaleMasterFence(
       return hold(higher.term, `witness beacon of ${higher.nodeName}`, higher.nodeId, higher.nodeName, `${higher.nodeName} (${higher.nodeId.slice(0, 8)}) is standing in for this node and has taken writes at term ${higher.term} while this node's store holds ${localTerm}: its copy is the fleet database now and this one is behind it`);
     }
     if (higher) {
+      // The holder at the top term: a master's own beacon when one is there
+      // (the winner may be a backup's echo of it, by message order), named by
+      // the sighting and judged against the copy's source below.
+      const masterAtTop = usable.find(c => c.nodeId !== selfNodeId && c.term === higher.term && c.role === 'master') ?? null;
       // File mode (B4f-3): a master with no guild data to fork, and no other
       // node serving the fleet, holds to be seeded from a backup's copy
       // instead of parking; the operator's exits stay on the hold, and a
-      // live master appearing meanwhile parks it below.
-      if (!(store instanceof PostgresControlStore) && !stagedTakeover && !fileSeeded && !standIn && readMirrorManifest()?.completedAt != null) {
-        console.warn('[Fleet] This node holds a complete copy of a master\'s guild data, so the seed hold does not apply: the park below is the fence; Demote it and Promote from its Fleet tab as a designated backup, which adopts that copy');
+      // live master appearing meanwhile parks it below. One holding a
+      // complete copy parks below with the exit that copy calls for.
+      let exit: string | undefined;
+      const ownCopy = !(store instanceof PostgresControlStore) && !stagedTakeover && !fileSeeded && !standIn ? readMirrorManifest() : null;
+      if (ownCopy && ownCopy.completedAt != null) {
+        exit = masterAtTop && masterAtTop.nodeId !== ownCopy.sourceNodeId
+          ? `This node holds a complete copy of ${ownCopy.sourceNodeName ?? 'a previous master'}'s guild data, but the fleet's master is ${masterAtTop.nodeName} now: switch this node back to backup-master (BOT_NODE_ROLE) and restart it; registered with that master, it holds this copy as a previous master's (Drop this copy on its Fleet tab) and mirrors the current one.`
+          : 'This node holds a complete copy of a master\'s guild data, which a promote adopts: switch it back to backup-master (BOT_NODE_ROLE) and restart it, then Promote from its Fleet tab; a Demote of this node now leaves a plain co-worker that offers no copy.';
       }
       if (!(store instanceof PostgresControlStore) && !stagedTakeover && !fileSeeded && !standIn && secret !== '' && claims && seedHoldApplies(claims, selfNodeId, Date.now())) {
         const outcome = await runSeedHold({
@@ -837,8 +907,11 @@ async function runStaleMasterFence(
       // The restore tail belongs to THIS half only: the peer half means a
       // foreign master is answering LIVE right now, where the same advice
       // would talk an operator into a dual-master seize.
-      await park(higher.term, `witness beacon of ${higher.nodeName}`, higher.nodeId, `the witness holds a beacon from ${higher.nodeName} (${higher.nodeId.slice(0, 8)}) at term ${higher.term} while this node's store holds ${localTerm}`,
-        ' If this database was DELIBERATELY restored from a dump, the fleet has not moved anywhere: the manager\'s restore lane advances the restored control term automatically, and FLEET_CONFIRM_TAKEOVER=1 on the next start overrides the fence by hand.');
+      // Holding a complete copy, this node records a master's own beacon at the
+      // top term as the holder (a later promote of the copy is then refused as
+      // a copy of a previous master) and skips a backup's echo.
+      await park(higher.term, `witness beacon of ${higher.nodeName}`, (masterAtTop ?? higher).nodeId, `the witness holds a beacon from ${higher.nodeName} (${higher.nodeId.slice(0, 8)}) at term ${higher.term} while this node's store holds ${localTerm}`,
+        { extra: ' If this database was DELIBERATELY restored from a dump, the fleet has not moved anywhere: the manager\'s restore lane advances the restored control term automatically, and FLEET_CONFIRM_TAKEOVER=1 on the next start overrides the fence by hand.', exit, noSighting: exit !== undefined && masterAtTop === null });
     }
   }
   return null;
@@ -4150,8 +4223,11 @@ async function initCoWorker(init: CommonInit, followerHold: FollowerHoldBase | n
       const source = mirrorEngine.getManifest().sourceNodeId;
       if (!report || report.status !== 'held' || source === null) return { success: false, error: 'the copy is not held: the mirror copies the master this node is registered with, so there is nothing to drop' };
       if (adoptStarted()) return { success: false, error: 'a promote is adopting this copy; cancel it first' };
+      // A copy is judged against the master this node is registered with;
+      // with none, it is what a seed hold adopts or a promote restores.
+      if (!controlClient?.masterKnown()) return { success: false, error: 'this node is registered with no master; a held copy is kept until one answers (its Backup copy line says what it is still good for) and dropped from here only while one does' };
       // The hold this node is registered with waits for exactly this copy.
-      if (controlClient?.getMasterSeedHold() === true) return { success: false, error: 'the master this node is registered with holds to be seeded, and this copy is what it adopts; confirm the seed on its Fleet tab instead' };
+      if (controlClient?.getMasterSeedHold() === true) return { success: false, error: 'the master this node is registered with holds to be seeded, and this copy is what it adopts; confirm the seed on its Fleet tab instead (if its tab says this node offers nothing, the copy is dropped from here once this node is registered with a serving master)' };
       const push = seedSource?.getView() ?? null;
       if (push && (push.phase === 'dialing' || push.phase === 'copying')) return { success: false, error: 'a seed push of this copy is running' };
       mirrorEngine.dropCopyOf(source);
@@ -4565,6 +4641,7 @@ async function initCoWorker(init: CommonInit, followerHold: FollowerHoldBase | n
     mirror: mirrorEngine ? () => mirrorEngine!.getReport() : null,
     staleCopies: () => staleCopiesNow()?.length ?? null,
     seedPush: seedSource ? () => seedSource!.getView() : null,
+    seedOffer: seedSource ? () => seedSource!.getOfferView() : null,
   });
 
   // Owner-info source for .owner manifests: null until the first lease grant.

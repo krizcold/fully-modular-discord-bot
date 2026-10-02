@@ -27,6 +27,12 @@ export interface PeerTerm {
    * exact inverse of the automatic failback 20.5 rules (B6 map F21/F28).
    */
   standingInFor?: string;
+  /**
+   * Set when the answering node holds to be seeded (B4f-3): a master boot
+   * with no guild data, which parks on a live master's beacon, so it fences
+   * nobody.
+   */
+  seedHold?: boolean;
 }
 
 /**
@@ -78,10 +84,11 @@ export function probePeerTerm(url: string, secret: string, timeoutMs: number): P
       const term = Number(message.data?.term);
       const nodeId = message.data?.nodeId;
       const standingInFor = message.data?.standingInFor;
+      const seedHold = message.data?.seedHold === true;
       // An unattributable answer is treated as silence: a peer that cannot say
       // who it is cannot be told apart from this node's own echo.
       finish(Number.isFinite(term) && typeof nodeId === 'string' && nodeId !== ''
-        ? { nodeId, term, ...(typeof standingInFor === 'string' && standingInFor !== '' ? { standingInFor } : {}) }
+        ? { nodeId, term, ...(typeof standingInFor === 'string' && standingInFor !== '' ? { standingInFor } : {}), ...(seedHold ? { seedHold: true } : {}) }
         : null);
     });
     ws.on('error', () => finish(null));

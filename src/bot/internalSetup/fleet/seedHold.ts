@@ -29,7 +29,7 @@ import {
 } from './constants';
 import { ControlServer } from './controlServer';
 import type { PersistedFleetConfig, PersistedTerm } from './controlStore';
-import { adoptMirror, finishAdopt, pinPlacement, seedTerm } from './fileFailover';
+import { adoptMirror, clearAdoptMarker, finishAdopt, pinPlacement, seedTerm } from './fileFailover';
 import { atomicWriteFileSync, renameWithRetry } from './fileControlStore';
 import { incomingLegDir, TransferReceiver, TransferServer } from './migration/transferChannel';
 import { MirrorManifest, mirrorDocsDir, mirrorGuildDir, mirrorManifestFile, mirrorRoot, readMirrorManifest } from './mirrorEngine';
@@ -86,6 +86,19 @@ export interface SeedRecord {
 const PHASES: SeedPhase[] = ['push', 'adopt', 'pin', 'seed', 'done'];
 const recordFile = () => dataPath('global', FLEET_DIR, 'seed.json');
 
+/**
+ * The record on disk still names this seed. An unreadable file counts as
+ * present: a transient fault must not stop a healthy seed or pass for a
+ * Demote, which is the one thing that clears the record under a lane.
+ */
+export function seedRecordOnDisk(seedId: string): boolean {
+  try {
+    return (JSON.parse(fs.readFileSync(recordFile(), 'utf-8')) as { seedId?: unknown }).seedId === seedId;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== 'ENOENT';
+  }
+}
+
 export function readSeedRecord(): SeedRecord | null {
   const parsed = readJson<SeedRecord>(recordFile());
   if (!parsed || !PHASES.includes(parsed.phase) || typeof parsed.seedId !== 'string' || parsed.seedId === '') return null;
@@ -115,6 +128,23 @@ export function writeSeedRecord(record: SeedRecord): void {
 
 export function clearSeedRecord(): void {
   fs.rmSync(recordFile(), { force: true });
+}
+
+/**
+ * A seed short of done ends with this node's master identity (a Demote) or
+ * with a seize over it: left on disk, the record would re-run its adopt at a
+ * later master boot and put the source's documents and copy back over the
+ * fleet served since, and the adopt marker would stop a backup's mirror
+ * ticks. What the adopt moved into the live tree stays as this node's
+ * residue. Returns the record abandoned, or null when none or done.
+ */
+export function abandonSeedRecord(): SeedRecord | null {
+  const record = readSeedRecord();
+  if (!record || record.phase === 'done') return null;
+  clearSeedRecord();
+  clearAdoptMarker();
+  fs.rmSync(mirrorRoot(), { recursive: true, force: true });
+  return record;
 }
 
 // ============================================================================
@@ -171,9 +201,16 @@ export function seedHoldApplies(claims: WitnessClaim[], selfNodeId: string, now:
  * re-enters at the phase that did not complete.
  */
 export async function finishSeed(record: SeedRecord, selfNodeId: string): Promise<void> {
+  // A Demote clears the record before it stages its own override
+  // (lifecycleActions): a lane whose record is gone writes neither the
+  // record back nor an override over the demote's.
+  const stillOnDisk = (): void => {
+    if (!seedRecordOnDisk(record.seedId)) throw new Error('the seed record was cleared meanwhile (a Demote abandons the seed); the seed stops here');
+  };
   if (record.phase === 'adopt') {
     const adopted = await adoptMirror(selfNodeId);
     console.warn(`[Fleet] SEED adopt: ${adopted.adopted} guild(s) taken from ${record.backupNodeName}'s copy, ${adopted.kept} already this node's, ${adopted.graveyarded} live dir(s) graveyarded first, ${adopted.skipped} without a copy`);
+    stillOnDisk();
     record.phase = 'pin';
     writeSeedRecord(record);
   }
@@ -181,6 +218,7 @@ export async function finishSeed(record: SeedRecord, selfNodeId: string): Promis
     const pinned = await pinPlacement(selfNodeId, record.sourceNodeId);
     console.warn(`[Fleet] SEED pin: shard(s) [${pinned.movedShards.join(', ')}] of ${record.sourceNodeName} pinned to this node${pinned.removed.length > 0 ? `; stale records removed: ${pinned.removed.join(', ')}` : ''}`);
     repointPinnedConfig();
+    stillOnDisk();
     record.phase = 'seed';
     writeSeedRecord(record);
   }
@@ -190,6 +228,7 @@ export async function finishSeed(record: SeedRecord, selfNodeId: string): Promis
     finishAdopt();
     // The override goes before the record says done: a restart between the
     // two re-runs this phase, which rewrites both.
+    stillOnDisk();
     writeRoleOverride({ role: 'master', takeover: true, setAt: Date.now(), setBy: 'webui-seed' });
     record.phase = 'done';
     writeSeedRecord(record);
@@ -335,7 +374,9 @@ function sanitizeOffer(raw: unknown): SeedOffer | null {
     if (g.hash !== null && typeof g.hash !== 'string') return null;
     const bytes = Number.isFinite(g.bytes) && g.bytes >= 0 ? Number(g.bytes) : 0;
     seen.add(g.guildId);
-    if (g.hash === null) partialCount += 1;
+    // A live offer hashes nothing up front (the hashes come with the push's
+    // final report); only a mirror's null hash is a partial copy.
+    if (g.hash === null && offer.kind === 'mirror') partialCount += 1;
     totalBytes += bytes;
     guilds.push({ guildId: g.guildId, hash: g.hash, bytes });
   }
@@ -404,36 +445,29 @@ class SeedHoldRuntime {
         continue;
       }
       if (hasFreshFleetConfirm()) {
-        if (!this.lane) return this.release();
-        // A seed is running: the confirm answers nothing here, and left on
-        // disk it would release the next hold of this node on its first check.
-        clearFreshFleetConfirm();
-        console.warn('[Fleet] Seed hold: a brand-new-fleet confirmation arrived while a seed runs; cleared, the seed decides');
+        const released = this.lane ? null : await this.release();
+        if (released) return released;
+        if (this.lane) {
+          // A seed is running (or was confirmed while the release read the
+          // witness): the confirm answers nothing here, and left on disk it
+          // would release the next hold of this node on its first check.
+          clearFreshFleetConfirm();
+          console.warn('[Fleet] Seed hold: a brand-new-fleet confirmation arrived while a seed runs; cleared, the seed decides');
+        }
       }
       if (this.opts.witness && Date.now() - lastRead >= WITNESS_RENEW_MS) {
         lastRead = Date.now();
         let claims: WitnessClaim[] | null = null;
         try { claims = await this.opts.witness.readClaims(); } catch { claims = null; }
         if (claims) {
-          for (const claim of claims) {
-            if (claim.nodeId !== this.opts.selfNodeId && claim.term > this.beaconMax) {
-              this.beaconMax = claim.term;
-              this.beaconedBy = claim.nodeName;
-            }
-          }
+          this.noteBeacons(claims);
           const live = liveMasterClaim(claims, this.opts.selfNodeId, Date.now());
           // A master alive after all ends the hold: the fleet is served, and
           // this node must not seed itself beside it. A seed already landing
           // (adopting, restarting) is left to the fence of the boot it stages,
           // which parks a staged takeover on a fresh foreign master beacon.
-          if (live && (!this.lane || this.lane.phase === 'dialing' || this.lane.phase === 'copying' || this.lane.phase === 'verifying')) {
-            if (this.lane) this.failLane(this.lane, `${live.nodeName} beacons as a live master at term ${live.term}; the seed is abandoned`);
-            // A confirm written while this hold stood answers nothing now.
-            clearFreshFleetConfirm();
-            this.closed = true;
-            this.stopServer();
-            _setSeedHold(null);
-            await this.opts.park(live);
+          if (live && (!this.lane || this.lane.phase === 'dialing' || this.lane.phase === 'copying' || this.lane.phase === 'verifying' || this.lane.stalled !== null)) {
+            await this.parkOnLive(live);
           }
         }
       }
@@ -450,6 +484,7 @@ class SeedHoldRuntime {
       getTerm: () => this.serverTerm,
       getNodeId: () => this.opts.selfNodeId,
       getNodeName: () => this.opts.selfNodeName,
+      getSeedHold: () => true,
       onRegister: (payload: RegisterPayload): RegisterResult => this.onRegister(payload),
       afterRegister: nodeId => void this.askOffer(nodeId),
       onHeartbeat: nodeId => {
@@ -553,7 +588,7 @@ class SeedHoldRuntime {
       return {
         success: false,
         needsConfirm: true,
-        error: `Seed this master from ${entry.nodeName}'s ${what} (${offer.guilds.length} guild(s), ${mb} MB${partial})? Everything the old master wrote after that point is LOST. This machine adopts the copy as the fleet's guild data, pins the shard plan to itself, mints a term above every beacon and restarts as master; ${entry.nodeName} then ${offer.kind === 'mirror' ? 'drops the copy and mirrors this master' : 'retires its old copies from its Fleet tab and mirrors this master'}.`,
+        error: `Seed this master from ${entry.nodeName}'s ${what} (${offer.guilds.length} guild(s), ${mb} MB${partial})? Everything the old master wrote after that point is LOST. This machine adopts the copy as the fleet's guild data, pins the shard plan to itself, mints a term above every beacon and restarts as master; ${entry.nodeName} then ${offer.kind === 'mirror' ? 'drops the copy and mirrors this master' : 'retires its old copies from its Fleet tab and, if the pinned fleet config (its own, carried with the copy) designates it as a backup, mirrors this master; otherwise designate it from this master\'s Fleet tab first'}.`,
       };
     }
     void this.startLane(entry, offer);
@@ -759,7 +794,11 @@ class SeedHoldRuntime {
     try {
       await finishSeed(lane.record, this.opts.selfNodeId);
     } catch (error) {
-      lane.stalled = `the copy landed but its adopt stopped at phase ${lane.record.phase}: ${error instanceof Error ? error.message : error}. Restart this bot to finish it (the seed record resumes there), or demote this node.`;
+      // Only a Demote clears the record under a running lane: its restart ends
+      // this boot as a co-worker, and nothing resumes.
+      lane.stalled = !seedRecordOnDisk(lane.record.seedId)
+        ? `the copy landed but a Demote of this node abandoned the seed at phase ${lane.record.phase}; the demote's restart ends this boot as a co-worker (what the adopt moved into the live tree stays as residue)`
+        : `the copy landed but its adopt stopped at phase ${lane.record.phase}: ${error instanceof Error ? error.message : error}. Restart this bot to finish it (the seed record resumes there), or demote this node.`;
       console.error(`[Fleet] SEED stalled: ${lane.stalled}`);
       this.publish(true);
       return;
@@ -784,6 +823,10 @@ class SeedHoldRuntime {
     void lane.receiver?.close();
     try { lane.ws?.terminate(); } catch { /* closing */ }
     lane.transfer.stop();
+    // Told, the backup's push view says failed and why instead of sent forever.
+    if (this.server?.isConnected(lane.record.backupNodeId)) {
+      this.server.request(lane.record.backupNodeId, MSG.SEED_ABORT, { term: this.serverTerm, seedId: lane.record.seedId, reason }, SEED_OFFER_TIMEOUT_MS).catch(() => undefined);
+    }
     fs.rmSync(path.join(DATA_ROOT, '_incoming', lane.record.seedId), { recursive: true, force: true });
     fs.rmSync(mirrorRoot(), { recursive: true, force: true });
     const onDisk = readSeedRecord();
@@ -794,9 +837,54 @@ class SeedHoldRuntime {
     this.publish(true);
   }
 
-  private release(): 'released' {
-    // The operator confirmed a brand-new fleet: this boot mints above every
-    // beacon, so the fleet's term never moves backwards on the witness.
+  private noteBeacons(claims: WitnessClaim[]): void {
+    for (const claim of claims) {
+      if (claim.nodeId !== this.opts.selfNodeId && claim.term > this.beaconMax) {
+        this.beaconMax = claim.term;
+        this.beaconedBy = claim.nodeName;
+      }
+    }
+  }
+
+  /** A master alive after all ends the hold: the fleet is served, and this node must not seed itself beside it. */
+  private async parkOnLive(live: WitnessClaim): Promise<void> {
+    if (this.lane && this.lane.stalled !== null) {
+      // Landed and stalled: the record stays for the next boot, whose fence
+      // judges the staged takeover against that master's fresh beacon.
+      console.warn(`[Fleet] Seed ${this.lane.record.seedId}: ${live.nodeName} beacons as a live master at term ${live.term} while the seed is stalled after its landing; the channel closes and the record stays for the next boot`);
+    } else if (this.lane) {
+      this.failLane(this.lane, `${live.nodeName} beacons as a live master at term ${live.term}; the seed is abandoned`);
+    }
+    // A confirm written while this hold stood answers nothing now.
+    clearFreshFleetConfirm();
+    this.closed = true;
+    this.stopServer();
+    _setSeedHold(null);
+    await this.opts.park(live);
+  }
+
+  private async release(): Promise<'released' | null> {
+    // The operator confirmed a brand-new fleet. The witness is read again
+    // first: the confirm is honoured within seconds and the loop's reads
+    // are further apart, so a master returning in between beacons the term
+    // this boot must floor above, or is live and parks the hold instead.
+    if (this.opts.witness) {
+      let claims: WitnessClaim[] | null = null;
+      try { claims = await this.opts.witness.readClaims(); } catch { claims = null; }
+      if (claims) {
+        this.noteBeacons(claims);
+        const live = liveMasterClaim(claims, this.opts.selfNodeId, Date.now());
+        if (live) {
+          console.warn(`[Fleet] Brand-new fleet confirmed, but ${live.nodeName} beacons as a live master at term ${live.term}; the confirm is cleared and the hold parks`);
+          await this.parkOnLive(live);
+          return null;
+        }
+      }
+    }
+    // A seed confirmed while the witness was read decides instead.
+    if (this.lane) return null;
+    // This boot mints above every beacon, so the fleet's term never moves
+    // backwards on the witness.
     floorTermAbove(this.opts.selfNodeId, this.beaconMax);
     clearFreshFleetConfirm();
     this.closed = true;

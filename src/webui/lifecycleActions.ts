@@ -3,7 +3,7 @@
 // both callers. Promote lives in promoteEngine; this is its counterpart.
 
 import { BotManager } from './botManager';
-import { clearRoleOverride, consentsToActiveMode, getNodeId, getNodeName, invalidateRoleOverrideCache, isBackupMaster, isStandalone, resolveEnvRole, resolveNodeRole, writeRoleOverride } from '../bot/internalSetup/fleet/nodeIdentity';
+import { clearRoleOverride, consentsToActiveMode, getNodeId, getNodeName, invalidateRoleOverrideCache, isBackupMaster, isStandalone, readRoleOverride, resolveEnvRole, resolveNodeRole, writeRoleOverride } from '../bot/internalSetup/fleet/nodeIdentity';
 import { effectiveMasterUrls } from '../bot/internalSetup/fleet/fleetConfig';
 import { isContainerPinned, loadCredentials, removeCredentials } from '../utils/envLoader';
 import { WITNESS_FRESH_WINDOW_MS } from '../bot/internalSetup/fleet/constants';
@@ -151,9 +151,12 @@ export async function runDemote(
       // only master identity was a staged takeover that a Cancel has since
       // cleared still needs the demote as the park's exit.
       const heldMasterBoot = !!(state && (state.takeoverHold || state.staleMasterPark || state.readOnlyStorePark || state.followerHold || state.emptyStoreHold || state.seedHold));
+      // A held master boot's exit is this demote (its banner names it), so an
+      // empty list does not refuse it: the node then idles as a co-worker
+      // until MASTER_URLS names the new master.
       const refusal = !heldMasterBoot && resolveNodeRole() !== 'master' ? 'this node is not a master'
         : isStandalone() ? 'a standalone master has no fleet to rejoin; demotion is meaningless here'
-        : effectiveMasterUrls().urls.length === 0 ? 'no master candidates configured (set MASTER_URLS or the fleet config first, or the demoted node would idle)'
+        : effectiveMasterUrls().urls.length === 0 && !heldMasterBoot ? 'no master candidates configured (set MASTER_URLS or the fleet config first, or the demoted node would idle)'
         : null;
       if (refusal) return { success: false, error: refusal };
     }
@@ -181,21 +184,41 @@ export async function runDemote(
     abandonSeed();
     // A brand-new-fleet confirm answers a hold this node no longer stands in.
     clearFreshFleetConfirm();
-    if (resolveEnvRole() === 'co-worker') {
-      clearRoleOverride();
-    } else {
-      writeRoleOverride({ role: 'co-worker', setAt: Date.now(), setBy });
-    }
-    console.warn(`[Fleet] DEMOTION staged (${setBy}); restarting the bot child as co-worker`);
+    const stage = (): void => {
+      if (resolveEnvRole() === 'co-worker') {
+        clearRoleOverride();
+      } else {
+        writeRoleOverride({ role: 'co-worker', setAt: Date.now(), setBy });
+      }
+    };
     // Retried the way the promote engine restarts: the record and the override
     // are already written, and a child left running past a failed restart
     // would keep serving as a stand-in whose own record says the lane ended.
-    let restart = await botManager.restart();
-    for (let attempt = 0; !restart?.success && restart?.reason === 'operation_in_progress' && attempt < 5; attempt++) {
-      await new Promise(resolve => setTimeout(resolve, 5000));
-      restart = await botManager.restart();
-    }
+    const restartChild = async () => {
+      let result = await botManager.restart();
+      for (let attempt = 0; !result?.success && result?.reason === 'operation_in_progress' && attempt < 5; attempt++) {
+        await new Promise(resolve => setTimeout(resolve, 5000));
+        result = await botManager.restart();
+      }
+      return result;
+    };
+    stage();
+    console.warn(`[Fleet] DEMOTION staged (${setBy}); restarting the bot child as co-worker`);
+    let restart = await restartChild();
     abandonSeed();
+    // A lane in the child can finish its seed between the staging above and
+    // the child's end: its record then says done and its master override
+    // outlives the demote. Both go, and the restart repeats on the re-staged
+    // override.
+    invalidateRoleOverrideCache();
+    if (readRoleOverride()?.setBy === 'webui-seed') {
+      clearSeedRecord();
+      clearAdoptMarker();
+      fs.rmSync(mirrorRoot(), { recursive: true, force: true });
+      stage();
+      console.warn('[Fleet] DEMOTION: a seed finished under the demote; its override is replaced and the bot child restarted again');
+      restart = await restartChild();
+    }
     return restart?.success
       ? { success: true }
       : { success: false, error: restart?.error ?? 'restart failed; the role change is staged and the next start boots as co-worker' };
