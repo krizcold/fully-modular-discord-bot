@@ -545,6 +545,11 @@ export class MigrationExecutor {
   // ABORT is idempotent + retried while connected. TARGET: delete staging.
   // SOURCE: drop .freeze, unfreeze, KEEP originals.
   private async onAbort(payload: XferAbortPayload): Promise<any> {
+    // A release while a cleanup of its leg still runs here (its ask timed
+    // out) leaves everything to that cleanup and is not released yet.
+    if (payload.guilds && (payload.legIds ?? []).some(legId => this.commitsInFlight.has(legId))) {
+      return { ok: true, term: payload.term, released: false, reason: 'a cleanup of that leg still runs on this node' };
+    }
     for (const [legId, leg] of this.legs) {
       if (leg.migrationId !== payload.migrationId) continue;
       leg.aborted = true;
@@ -565,10 +570,26 @@ export class MigrationExecutor {
       this.legs.delete(legId);
       this.tokens.delete(leg.token);
     }
+    // A source's release lifts the freeze its drain took also with no
+    // runtime left (a restarted source) and disarms the graveyard resume a
+    // failed cleanup armed for those guilds; the originals stay. It is acked
+    // released only when neither is left on them.
+    let release: { released: boolean; reason?: string } | undefined;
+    if (payload.guilds) {
+      for (const guildId of payload.guilds) {
+        await removeFreezeSentinel(guildId);
+        unfreezeGuildWrites(guildId);
+      }
+      const frozen = payload.guilds.filter(guildId => fs.existsSync(path.join(DATA_ROOT, guildId, '.freeze')));
+      const disarmed = await disarmSourceGraveyard(payload.migrationId, payload.guilds);
+      release = frozen.length > 0
+        ? { released: false, reason: `the freeze sentinel of guild(s) ${frozen.join(', ')} could not be removed` }
+        : disarmed ? { released: true } : { released: false, reason: 'its graveyard resume marker could not be rewritten' };
+    }
     // Also purge whole-migration staging that has no runtime (crash-restart).
     try { await fs.promises.rm(path.join(DATA_ROOT, INCOMING_DIR, payload.migrationId), { recursive: true, force: true }); } catch { /* best effort */ }
     this.maybeReleaseServer();
-    return { ok: true, term: payload.term };
+    return { ok: true, term: payload.term, ...release };
   }
 
   private async onInventory(): Promise<XferInventoryReply> {
@@ -650,6 +671,27 @@ export class MigrationExecutor {
 // /data/global/fleet/xfer-source-{id}.json).
 function sourceGraveyardMarker(migrationId: string): string {
   return path.join(DATA_ROOT, 'global', 'fleet', `xfer-source-${migrationId}.json`);
+}
+
+// The marker keeps only the guilds still to graveyard and goes when none is
+// left; true once it names none of the released guilds (a corrupt marker
+// graveyards nothing at boot).
+async function disarmSourceGraveyard(migrationId: string, guilds: string[]): Promise<boolean> {
+  const marker = sourceGraveyardMarker(migrationId);
+  let body: string;
+  try { body = await fs.promises.readFile(marker, 'utf-8'); } catch (error) { return (error as NodeJS.ErrnoException).code === 'ENOENT'; }
+  let parsed: any = null;
+  try { parsed = JSON.parse(body); } catch { return true; }
+  if (!Array.isArray(parsed?.guilds)) return true;
+  const left = parsed.guilds.filter((guildId: unknown) => !guilds.includes(String(guildId)));
+  if (left.length === parsed.guilds.length) return true;
+  try {
+    if (left.length === 0) await fs.promises.unlink(marker);
+    else await fs.promises.writeFile(marker, JSON.stringify({ ...parsed, guilds: left }), 'utf-8');
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function writeFreezeSentinel(guildId: string): Promise<void> {

@@ -284,8 +284,9 @@ export class MigrationCoordinator {
    * originals were deferred). Fenced OFF the free pool so a shard freed by a
    * later Declare Lost is never load-placed back onto its own un-cleaned source
    * (or elsewhere) before the deferred cleanup runs. Released naturally when the
-   * leg leaves pendingSourceCleanup (cleanup acked or the ownership guard drops
-   * it). Empty in standalone and in normal non-migration operation.
+   * leg leaves pendingSourceCleanup (its cleanup acked, or its source's release
+   * acked when the shard is back on that source). Empty in standalone and in
+   * normal non-migration operation.
    */
   pendingSourceCleanupShardIds(): ReadonlySet<number> {
     const ids = new Set<number>();
@@ -818,6 +819,7 @@ export class MigrationCoordinator {
   }
 
   private readonly cleanupRuns = new Map<string, Promise<void>>();
+  private readonly releaseWarned = new Set<string>();
 
   private async runSourceCleanup(nodeId: string): Promise<void> {
     const records = this.cleanupRecords();
@@ -840,25 +842,38 @@ export class MigrationCoordinator {
           // so keep it pending rather than clearing it on a guild-less no-op.
           continue;
         }
-        // Ownership guard: if the shard was re-granted back to this same source
-        // (e.g. the migration target was Declared Lost and distribute() re-placed
-        // the freed shard onto its old source), the source's /data copies are now
-        // the live authoritative copies. Graveyarding them here would serve the
-        // guild empty. Drop the pending leg silently WITHOUT graveyarding.
-        if (this.hooks.registry.shardTable.get(leg.shardId)?.nodeId === nodeId) {
-          cleared.add(legId);
-          continue;
-        }
         // A migration fences the shard, or a grant of it to this node awaits
         // confirmation: what the node holds may be what that brought back, so
         // the cleanup stays owed, unsent, until the shard settles.
         if (this.migrating.has(leg.shardId) || this.hooks.registry.pendingConfirmation?.get(leg.shardId)?.nodeId === nodeId) continue;
+        // Ownership guard: the shard is back on this same source, so in file
+        // mode its originals are the live copies again and graveyarding them
+        // would serve the guilds empty. The source is released instead: the
+        // abort a source takes keeps them and lifts its drain's freeze. It waits
+        // while a transformation runs (its own freeze) and while that
+        // migration still runs, since the node's abort is migration-wide and
+        // would stop a later leg of the same retire there.
+        const back = this.hooks.registry.shardTable.get(leg.shardId)?.nodeId === nodeId;
+        const live = this.parentRecord ?? this.record;
+        if (back && (this.hooks.transformationActive?.() || (live !== null && live.id === rec.id && !isTerminal(live.state)))) continue;
         try {
-          const ack = await this.hooks.sendControl(nodeId, MSG.XFER_COMMIT, {
-            migrationId: rec.id, term: rec.term, epoch: rec.epoch ?? this.hooks.registry.epoch,
-            legIds: [legId], sourceCleanup: true, guilds: leg.guilds,
-          });
-          if (ack?.ok) cleared.add(legId);
+          const ack = back
+            ? await this.hooks.sendControl(nodeId, MSG.XFER_ABORT, {
+              migrationId: rec.id, term: rec.term, reason: `shard ${leg.shardId} is back on its source`, guilds: leg.guilds, legIds: [legId],
+            })
+            : await this.hooks.sendControl(nodeId, MSG.XFER_COMMIT, {
+              migrationId: rec.id, term: rec.term, epoch: rec.epoch ?? this.hooks.registry.epoch,
+              legIds: [legId], sourceCleanup: true, guilds: leg.guilds,
+            });
+          // A release counts only when the node reports the freeze and any
+          // armed graveyard gone (an older executor does not report it).
+          if (ack?.ok && (!back || ack.released === true)) {
+            cleared.add(legId);
+            this.releaseWarned.delete(legId);
+          } else if (back && ack?.ok && !this.releaseWarned.has(legId)) {
+            this.releaseWarned.add(legId);
+            console.warn(`[Migration] Shard ${leg.shardId} is back on ${this.hooks.registry.nodes?.get(nodeId)?.nodeName ?? nodeId}, whose release from its owed cleanup is not complete (${ack.reason ?? 'it reports none; it may run an older version'}); retried every ${Math.round(XFER_COMMIT_RETRY_MS / 1000)}s`);
+          }
         } catch {
           // Unanswered: still owed, and asked again.
         }
@@ -1605,11 +1620,13 @@ export class MigrationCoordinator {
     if (reg.healthOf(target) !== 'up') return { ok: false, error: `target ${target.nodeName} is not healthy` };
     const held = reg.shardTable.get(shardId);
     if (!held || held.nodeId !== sourceNodeId) return { ok: false, error: `shard ${shardId} is not owned by ${source.nodeName}` };
-    // The target still owes this shard's cleanup from an earlier move (its
-    // frozen originals): data brought back now is what that cleanup would
-    // graveyard, so the move waits until the cleanup has run.
-    if (this.pendingSourceCleanups().some(owed => owed.nodeId === targetNodeId && owed.shardIds.includes(shardId))) {
-      return { ok: false, error: `${target.nodeName} still owes the cleanup of shard ${shardId} from an earlier move (it missed that commit); the move waits until the cleanup has run` };
+    // A side still owing this shard's cleanup from an earlier move: data
+    // brought back to the target is what that cleanup would graveyard, and
+    // the source's release (the shard back on it) would lift a freeze its
+    // drain takes, so the move waits until the cleanup has run.
+    const owing = [target, source].find(node => this.pendingSourceCleanups().some(owed => owed.nodeId === node.nodeId && owed.shardIds.includes(shardId)));
+    if (owing) {
+      return { ok: false, error: `${owing.nodeName} still owes the cleanup of shard ${shardId} from an earlier move (it missed that commit); the move waits until the cleanup has run` };
     }
     if (leg.direction === 'none') {
       // Defense-in-depth for the lease-only hand-off: both participants must

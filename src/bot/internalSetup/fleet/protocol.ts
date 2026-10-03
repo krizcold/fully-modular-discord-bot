@@ -769,6 +769,10 @@ export interface XferAbortPayload {
   migrationId: string;
   term: number;
   reason: string;
+  /** A source's release (its owed cleanup's shard came back to it): the guilds whose freeze it lifts, keeping them. */
+  guilds?: string[];
+  /** A release: the leg it releases (a cleanup of it still running on the node answers not released). */
+  legIds?: string[];
 }
 
 /** Redistribute inventory request/reply (post-reshard placement). */
