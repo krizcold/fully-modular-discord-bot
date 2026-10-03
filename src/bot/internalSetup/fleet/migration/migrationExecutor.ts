@@ -496,7 +496,11 @@ export class MigrationExecutor {
     return { ok: allDone, term: payload.term };
   }
 
-  private async commitTarget(leg: LegRuntime, term: number, epoch: number): Promise<void> {
+  private commitTarget(leg: LegRuntime, term: number, epoch: number): Promise<void> {
+    return oneStagingFinishAtATime(incomingLegDir(leg.migrationId, leg.legId), () => this.commitTargetNow(leg, term, epoch));
+  }
+
+  private async commitTargetNow(leg: LegRuntime, term: number, epoch: number): Promise<void> {
     await this.writeManifest(leg, 'commit-intent');
     const legDir = incomingLegDir(leg.migrationId, leg.legId);
     // What landed leaves the copy this node may hold, which is older: noted
@@ -716,10 +720,28 @@ async function hashStagedGuild(base: string): Promise<string> {
   return hash.digest('hex');
 }
 
+// One finish of a leg's staging at a time: the executor's commit (live, or
+// from staging after a restart) and the master's boot resolver can each reach
+// it, and two at once can each see a guild still staged, the later
+// graveyarding the dir the earlier just renamed into place. A later caller
+// runs after, on what is left.
+const stagingCommits = new Map<string, Promise<void>>();
+function oneStagingFinishAtATime(legDir: string, finish: () => Promise<void>): Promise<void> {
+  const run = (stagingCommits.get(legDir) ?? Promise.resolve()).then(finish);
+  const settled = run.catch(() => undefined);
+  stagingCommits.set(legDir, settled);
+  void settled.then(() => { if (stagingCommits.get(legDir) === settled) stagingCommits.delete(legDir); });
+  return run;
+}
+
 // Idempotent commit from staging when there is no live runtime (crash-restart
 // commit resolution). Mirrors commitTarget: intent -> per-guild rename + stamp.
-export async function commitFromStaging(migrationId: string, legId: string, term: number, epoch: number): Promise<void> {
+export function commitFromStaging(migrationId: string, legId: string, term: number, epoch: number): Promise<void> {
   const legDir = incomingLegDir(migrationId, legId);
+  return oneStagingFinishAtATime(legDir, () => finishStaging(legDir, migrationId, term, epoch));
+}
+
+async function finishStaging(legDir: string, migrationId: string, term: number, epoch: number): Promise<void> {
   let manifest: any = null;
   try { manifest = JSON.parse(fs.readFileSync(path.join(legDir, '.manifest.json'), 'utf-8')); } catch { return; }
   try {
