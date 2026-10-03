@@ -29,6 +29,9 @@ import {
   REPLICA_LAG_PROMOTE_MAX_MS,
   FILE_PROMOTE_TERM_MARGIN,
   SEED_SENT_PROMOTE_HOLD_MS,
+  TRANSFER_POLL_MS,
+  TRANSFER_STATUS_DARK_MS,
+  WITNESS_FRESH_WINDOW_MS,
 } from '../bot/internalSetup/fleet/constants';
 import { isContainerPinned, loadCredentials } from '../utils/envLoader';
 import { clearRoleOverride, getNodeId, getNodeName, invalidateRoleOverrideCache, readRoleOverride, writeRoleOverride } from '../bot/internalSetup/fleet/nodeIdentity';
@@ -36,7 +39,7 @@ import { promoteReachabilityWarning } from '../bot/internalSetup/fleet/armLane';
 import { fleetMasterCandidates } from '../bot/internalSetup/fleet/fleetConfig';
 import { judgeReachability } from '../bot/internalSetup/fleet/reachability';
 import { PromoteRecord, clearPromoteRecord, readPromoteRecord, writePromoteRecord } from '../bot/internalSetup/fleet/promoteRecord';
-import { adoptMirror, adoptStarted, clearAdoptMarker, finishAdopt, pinPlacement, seedTerm } from '../bot/internalSetup/fleet/fileFailover';
+import { adoptMirror, adoptStarted, clearAdoptMarker, finishAdopt, holdMirrorForTransfer, mirrorPlacementUsable, pinPlacement, plannedSeedTerm, releaseTransferHold, seedTerm, writeHandoverDocuments } from '../bot/internalSetup/fleet/fileFailover';
 import { readMirrorManifest } from '../bot/internalSetup/fleet/mirrorEngine';
 import { HolderSighting, readHolderSighting } from '../bot/internalSetup/fleet/holderSighting';
 import {
@@ -191,7 +194,15 @@ function recordOfHold(record: PromoteRecord, hold: HoldForms): boolean {
 export function promoteSupersededBy(record: PromoteRecord): HolderSighting | null {
   if (record.mode === 'stand-in' || record.phase === 'done') return null;
   const seen = readHolderSighting();
+  // A file-mode transfer (B4f-4) runs registered with the master it moves
+  // the fleet off: that master's own sightings are the lane's, not a holder's.
+  if (seen && isFileTransfer(record) && seen.nodeId === record.supersededNodeId) return null;
   return seen && seen.nodeId !== getNodeId() && seen.seenAt >= record.startedAt ? seen : null;
+}
+
+/** The planned transfer in file mode (B4f-4): a retire migration of the live master onto this node, then its handover. */
+export function isFileTransfer(record: PromoteRecord): boolean {
+  return record.backend === 'file' && record.mode === 'transfer';
 }
 
 /**
@@ -227,7 +238,10 @@ function dismissSupersededRecord(record: PromoteRecord): void {
     clearRoleOverride();
     console.warn('[Fleet] PROMOTE dismissed: the takeover override its restart phase staged is cleared, so the next start boots this node in its configured role (a master through the fence, a designated backup as a co-worker)');
   }
-  if (record.backend === 'file' && (record.phase !== 'adopt' || adoptStarted())) {
+  if (isFileTransfer(record)) {
+    if (record.handoverAt != null) console.error(`[Fleet] PROMOTE dismissed past its handover (transfer, file mode, ${record.parked ? 'parked' : 'stopped'} at ${record.phase}: ${record.lastError ?? 'no error recorded'}); the old master handed over and steps down, the guild data its retire moved here stays this node's, and the plan it handed over stays pinned in this node's fleet directory, driving nothing while this node is a co-worker`);
+    if (adoptStarted()) clearAdoptMarker();
+  } else if (record.backend === 'file' && (record.phase !== 'adopt' || adoptStarted())) {
     console.error(`[Fleet] PROMOTE dismissed past its adopt (file mode, ${record.parked ? 'parked' : 'stopped'} at ${record.phase}: ${record.lastError ?? 'no error recorded'}); the guild data adopted from the old master stays in this node's live tree under its own ownership and the pinned placement in its fleet directory, served by nobody while this node is a co-worker: the next adopt or migration onto this node graveyards those dirs first; the mirror resumes on its next tick`);
     clearAdoptMarker();
   } else if (record.phase === 'promote' || record.phase === 'restart') {
@@ -587,9 +601,9 @@ function fileSeedRefusal(masterSeedHold: boolean, push: SeedPushFacts | null): s
 /**
  * The file-mode verdict (B4f-2, PLAN_REPLICATION 20.20): the designated backup
  * adopts the copy of the master's guild data it holds. Only a DEAD master is
- * taken over here (a live one is moved by the planned transfer, not built
- * yet); the RPO is the age of the last complete copy, confirmed by the
- * operator as the postgres lane confirms a standby's lag.
+ * taken over here (a live one is moved by the planned transfer, B4f-4); the
+ * RPO is the age of the last complete copy, confirmed by the operator as the
+ * postgres lane confirms a standby's lag.
  */
 async function startFilePromote(botManager: BotManager, state: any, opts: PromoteStartOptions, existing: PromoteRecord | null): Promise<PromoteStartResult> {
   let witnessStatus = state.witness ?? null;
@@ -598,13 +612,11 @@ async function startFilePromote(botManager: BotManager, state: any, opts: Promot
   else console.warn('[Fleet] Promote has no fresh witness reading (this node runs no witness, or the read failed); judging on the last cached one, which the freshness windows will reject if it is old');
   const seedRefusal = fileSeedRefusal(state.masterSeedHold === true, state.seedPush ?? null);
   if (seedRefusal) return { success: false, error: seedRefusal };
-  const masterAlive = state.masterKnown === true || (witnessStatus ? freshMasterClaim(witnessStatus, state.nodeId, Date.now()) !== null : false);
-  if (masterAlive) {
-    return { success: false, error: 'the master is still alive (its control connection is up or its witness beacon is fresh). Moving the master to this node while it is alive is a planned transfer, which file mode does not have yet, so this node cannot take over while the master answers. If it must, stop the old master first and promote again: the copy this node holds is then adopted.' };
-  }
   if ((loadCredentials().CONTROL_STORE_URL || '').trim() !== '') {
     return { success: false, error: 'this node keeps its guild data in files but its control store is a database (CONTROL_STORE_URL), a layout the file-mode promote does not cover: the plan it would pin and the term it would seed live in files that boot never reads. Keep the control store in files beside the data, or move the data to postgres, before relying on a promote here.' };
   }
+  const masterAlive = state.masterKnown === true || (witnessStatus ? freshMasterClaim(witnessStatus, state.nodeId, Date.now()) !== null : false);
+  if (masterAlive) return startFileTransfer(botManager, state, opts, existing);
   const manifest = readMirrorManifest();
   if (!manifest || manifest.completedAt === null || manifest.sourceNodeId === null) {
     return { success: false, error: 'this node holds no complete copy of the master\'s guild data (the Backup copy line on the Fleet tab says why); the file-mode promote adopts that copy, so there is nothing to promote from yet' };
@@ -683,6 +695,251 @@ async function startFilePromote(botManager: BotManager, state: any, opts: Promot
   console.warn(`[Fleet] PROMOTE started (failover, file mode): adopting the copy of ${manifest.sourceNodeName ?? manifest.sourceNodeId.slice(0, 8)} (complete ${Math.round(lagMs / 1000)}s ago, ${complete} guild(s))`);
   void runPhases(botManager, record, null);
   return { success: true, record };
+}
+
+/**
+ * The planned transfer in file mode (B4f-4, PLAN_REPLICATION 20.20): the
+ * master is alive and this designated backup is registered with it. The
+ * master retires every shard it holds onto this node (the migration drain:
+ * freeze, final delta, verify, commit, graveyard), hands over its placement
+ * documents and deposes itself; this node pins them, seeds the term above
+ * the master's and restarts as master, whose beacon finishes the old
+ * master's step-down. Nothing is lost, so there is no RPO confirm, and
+ * Transfer and retire is the same action: the retire is the migration.
+ */
+async function startFileTransfer(botManager: BotManager, state: any, opts: PromoteStartOptions, existing: PromoteRecord | null): Promise<PromoteStartResult> {
+  const masterNodeId = typeof state.masterNodeId === 'string' && state.masterNodeId !== '' ? state.masterNodeId : null;
+  const masterUrl = typeof state.masterUrl === 'string' && state.masterUrl !== '' ? state.masterUrl : null;
+  if (state.masterKnown !== true || !masterNodeId || !masterUrl) {
+    return { success: false, error: 'the master beacons fresh on the witness, but this node is not registered with it, and the planned transfer runs over that connection (the master moves its shards here and hands over on it). Wait for the registration (the Fleet tab shows the connection); if the master must go now, stop it and promote again: the copy this node holds is then adopted.' };
+  }
+  const pre = await botManager.fleetTransfer('start', { precheck: true });
+  if (pre?.masterNodeId && pre.masterNodeId !== masterNodeId) return { success: false, error: 'the master this node is registered with changed while the transfer was being decided; retry' };
+  if (!pre?.success) return { success: false, error: `the master refuses to move its shards to this node: ${pre?.error ?? 'no answer'}` };
+  if (opts.confirmReachability !== true) {
+    const refused = await reachabilityRefusal();
+    if (refused) return refused;
+  }
+  const still = readPromoteRecord();
+  if (phasesRunning || (still && still.phase !== 'done' && (still.parked !== existing?.parked || still.updatedAt !== existing?.updatedAt))) {
+    return { success: false, error: 'a promote is already running or was restarted while this one was being decided; look at its current phase and retry' };
+  }
+  const legs = Number.isInteger(pre.legs) ? Number(pre.legs) : 0;
+  const warnings: string[] = Array.isArray(pre.warnings) ? pre.warnings : [];
+  const record: PromoteRecord = {
+    phase: 'retire',
+    mode: 'transfer',
+    backend: 'file',
+    startedAt: Date.now(),
+    updatedAt: Date.now(),
+    parked: false,
+    lastError: null,
+    startedBy: opts.startedBy === 'manager-promote' ? 'manager-promote' : 'webui-promote',
+    // The retire is the migration itself in file mode, so no instruction
+    // travels on the register reply whichever button asked.
+    retireOldMaster: false,
+    supersededNodeId: masterNodeId,
+    supersededTerm: Number.isFinite(state.term) ? Number(state.term) : null,
+    supersededDelivered: false,
+    // The seed's floor, set at the handover from the master's term and every beacon.
+    expectedTerm: null,
+    expectedHolder: masterNodeId,
+    supersededStoreDead: null,
+    claimedTerm: null,
+    fencedLsn: null,
+    lagMs: null,
+    canonicalEndpoint: null,
+    lineageVerdict: null,
+    holdSince: null,
+    promotedCopy: false,
+    transferMasterUrl: masterUrl,
+    transferMigrationId: null,
+    transferNote: `${legs} shard(s) to move${warnings.length > 0 ? ` (${warnings.join('; ')})` : ''}`,
+    handoverAt: null,
+  };
+  writePromoteRecord(record);
+  console.warn(`[Fleet] PROMOTE started (transfer, file mode): ${state.masterName ?? masterNodeId.slice(0, 8)} retires ${legs} shard(s) onto this node, then hands over${warnings.length > 0 ? ` (${warnings.join('; ')})` : ''}`);
+  void runPhases(botManager, record, null);
+  return { success: true, record };
+}
+
+/** The answer came from the master this transfer was decided on, or the lane stops. */
+function assertTransferMaster(record: PromoteRecord, reply: any): void {
+  if (reply?.masterNodeId && reply.masterNodeId !== record.supersededNodeId) {
+    throw new Error(`this node is registered with node ${String(reply.masterNodeId).slice(0, 8)} now, not with the master this transfer was decided on; Cancel this transfer, and Promote again on what is reachable now`);
+  }
+}
+
+/** The lane's Cancel while its retire runs (B4f-4), keyed on the record's start: the loop stops at its next poll. */
+let transferCancelFor: number | null = null;
+class TransferCancelled extends Error {}
+
+/** A step the child could not take because it is not ready (restarting, not registered yet) is asked again within the dark bound. */
+async function childTransfer(botManager: BotManager, op: 'start' | 'handover', data: Record<string, unknown>, record: PromoteRecord): Promise<any> {
+  const since = Date.now();
+  for (;;) {
+    const reply = await botManager.fleetTransfer(op, data);
+    if (reply?.notReady !== true || Date.now() - since > TRANSFER_STATUS_DARK_MS || transferCancelFor === record.startedAt) return reply;
+    await sleep(TRANSFER_POLL_MS);
+  }
+}
+
+/**
+ * The retire (B4f-4): the master is asked to retire every shard it holds
+ * onto this node (or to resume its paused retire), then followed until it
+ * holds none and no migration runs. A paused or aborted retire parks with
+ * the master's reason; the shards already moved stay on this node. A
+ * Cancel asked meanwhile aborts the master's retire and ends the lane.
+ */
+async function phaseTransferRetire(botManager: BotManager, record: PromoteRecord): Promise<void> {
+  // The master's retire is stopped before the lane ends: a master that
+  // refuses the abort (its running leg is past the commit decision) is
+  // asked again at the next poll; one that cannot be reached is not
+  // waited on, the lane ends with that said.
+  const cancelled = async (): Promise<void> => {
+    if (transferCancelFor !== record.startedAt) return;
+    const aborted = await botManager.fleetTransfer('abort', { migrationId: record.transferMigrationId ?? null });
+    if (!aborted?.success && aborted?.notReady !== true) {
+      console.warn(`[Fleet] PROMOTE cancel: the master refuses to abort its retire yet (${aborted?.error ?? 'no answer'}); asked again at the next poll`);
+      return;
+    }
+    transferCancelFor = null;
+    if (!aborted?.success) console.warn(`[Fleet] PROMOTE cancel: the master could not be reached to abort its retire (${aborted?.error ?? 'no answer'}); abort it on the master's Fleet tab if it still runs`);
+    throw new TransferCancelled('cancelled by the operator while the retire ran');
+  };
+  const started = await childTransfer(botManager, 'start', {}, record);
+  await cancelled();
+  assertTransferMaster(record, started);
+  if (!started?.success) {
+    throw new Error(started?.notReady === true
+      ? `this node's bot has not been registered with the master for ${Math.round(TRANSFER_STATUS_DARK_MS / 1000)}s (${started.error ?? 'not ready'}), so the master cannot be asked to move its shards; Continue once the Fleet tab shows it connected, or Cancel`
+      : `the master refused to move its shards here: ${started?.error ?? 'no answer'}; Continue asks again`);
+  }
+  const migrationId = typeof started.migrationId === 'string' ? started.migrationId : null;
+  if (migrationId !== (record.transferMigrationId ?? null)) {
+    record.transferMigrationId = migrationId;
+    writePromoteRecord(record);
+  }
+  let lastAnswer = Date.now();
+  for (;;) {
+    await cancelled();
+    const seen = promoteSupersededBy(record);
+    if (seen) throw new Error(`${supersededText(seen)}; nothing was handed over, and the shards already moved stay on this node: Cancel this transfer, and Promote again on what is reachable now`);
+    const status = await botManager.fleetTransfer('status', { migrationId: record.transferMigrationId ?? null });
+    if (status?.success) {
+      assertTransferMaster(record, status);
+      lastAnswer = Date.now();
+      const held: number[] = Array.isArray(status.heldShards) ? status.heldShards : [];
+      const active = status.active ?? null;
+      if (active) {
+        if (active.paused) throw new Error(`the master's retire paused at shard ${active.shardId ?? '?'} with ${active.legsDone} of ${active.legsTotal} shard(s) moved: ${active.error ?? 'no reason given'}; the shards it moved stay on this node. Continue resumes it, or Cancel`);
+        const note = `${active.legsDone} of ${active.legsTotal} shard(s) moved; shard ${active.shardId ?? '?'} is ${String(active.state).toLowerCase()}`;
+        if (note !== record.transferNote) {
+          record.transferNote = note;
+          writePromoteRecord(record);
+        }
+      } else if (status.otherActive) {
+        throw new Error(`a ${status.otherActive} migration is running on the fleet instead of this transfer's retire; Continue once it has finished`);
+      } else if (held.length === 0) {
+        if (transferCancelFor === record.startedAt) {
+          transferCancelFor = null;
+          console.warn('[Fleet] PROMOTE cancel: the retire finished before the cancel could stop it; every shard the master held is on this node and the master stays master, holding none');
+          throw new TransferCancelled('cancelled by the operator as the retire finished');
+        }
+        record.transferNote = 'every shard the master held is on this node';
+        console.warn(`[Fleet] PROMOTE retire: ${record.transferNote}`);
+        return;
+      } else if (status.finished?.state === 'ABORTED') {
+        throw new Error(`the master's retire was aborted (${status.finished.error ?? 'no reason given'}) with shard(s) [${held.join(', ')}] still on the master; Continue starts a new one for them, or Cancel`);
+      } else {
+        throw new Error(`the master holds shard(s) [${held.join(', ')}] and runs no retire of them (${status.finished ? 'the transfer\'s retire finished and the master took a shard since' : 'it no longer knows the transfer\'s retire'}); Continue starts a new one, or Cancel`);
+      }
+    } else if (Date.now() - lastAnswer > TRANSFER_STATUS_DARK_MS) {
+      throw new Error(status?.notReady === true
+        ? `this node's bot has not been registered with the master for ${Math.round(TRANSFER_STATUS_DARK_MS / 1000)}s while its shards moved here (${status.error ?? 'not ready'}); the shards already moved stay on this node. Continue once the Fleet tab shows it connected, or Cancel`
+        : `the master has not answered for ${Math.round(TRANSFER_STATUS_DARK_MS / 1000)}s while its shards moved here (${status?.error ?? 'no answer'}); the shards already moved stay on this node. Continue once it answers, or Cancel`);
+    }
+    await sleep(TRANSFER_POLL_MS);
+  }
+}
+
+/**
+ * The old master is gone as far as this node can tell: not registered with
+ * it, and a FRESH witness reading shows no live master beacon at all (its
+ * own, or another node's). Darkness is not evidence. True, or the reason.
+ */
+async function transferMasterGone(botManager: BotManager): Promise<true | string> {
+  const stateResult = await botManager.getFleetState();
+  const state: any = stateResult?.success ? stateResult.state : null;
+  if (!state || !state.initialized) return 'this node\'s fleet state cannot be read';
+  if (state.masterKnown === true) return `this node is registered with ${state.masterName ?? 'a master'}`;
+  const fresh = await botManager.readFleetWitness();
+  const status = fresh?.success ? fresh.witness : null;
+  if (!status || status.lastReadAt == null) return 'the witness cannot be read right now, and darkness says nothing about the old master';
+  const live = freshMasterClaim(status, getNodeId(), Date.now());
+  if (live) return `${live.nodeName} (${String(live.nodeId).slice(0, 8)}) beacons as a live master at term ${live.term}`;
+  if (Date.now() - status.lastReadAt > WITNESS_FRESH_WINDOW_MS) return 'the witness has not been read recently, and darkness says nothing about the old master';
+  return true;
+}
+
+/**
+ * The handover (B4f-4, the file-mode claim): the mirror tick stops, the
+ * master is told the term this node mints and answers with its placement
+ * documents, which land where the pin reads them; on the wire it deposes
+ * itself (stops granting, drops every worker, stages its co-worker role)
+ * and this node's beacon finishes its step-down. Once asked the lane goes
+ * forward only: a lost answer is asked again and given again, and a master
+ * that never answers again and beacons as master no more leaves the plan
+ * of the copy's documents to go on with (no adopt: the live data the
+ * retire moved here is the newest). An answer that refuses hands nothing over.
+ */
+async function phaseHandover(botManager: BotManager, record: PromoteRecord): Promise<void> {
+  if (!record.supersededNodeId || !record.transferMasterUrl) throw new Error('this transfer names no master to hand over from; Cancel it');
+  const seen = promoteSupersededBy(record);
+  if (seen) throw new Error(`${supersededText(seen)}; ${record.handoverSentAt != null ? 'the handover was asked, and the old master may have handed over' : 'nothing was handed over'}: Cancel this transfer, and Promote again on what is reachable now`);
+  holdMirrorForTransfer(getNodeId(), record.supersededNodeId);
+  // The seed's floor: the master's term and every beacon on the witness.
+  const fresh = await botManager.readFleetWitness();
+  const claims: { term: number }[] = fresh?.success && Array.isArray(fresh.witness?.claims) ? fresh.witness.claims : [];
+  const anyBeacon = claims.reduce((max, c) => (Number.isFinite(c.term) ? Math.max(max, c.term) : max), 0);
+  const floor = Math.max(record.supersededTerm ?? 0, record.expectedTerm ?? 0, anyBeacon);
+  const term = plannedSeedTerm(floor + FILE_PROMOTE_TERM_MARGIN) + 1;
+  // Written before the ask: from here the master may hand over without this
+  // node hearing it, so the lane goes forward only.
+  if (record.handoverSentAt == null) {
+    record.handoverSentAt = Date.now();
+    writePromoteRecord(record);
+  }
+  const reply = await childTransfer(botManager, 'handover', { url: record.transferMasterUrl, term }, record);
+  if (reply?.success) {
+    if (reply.masterNodeId !== record.supersededNodeId) throw new Error(`the node answering at ${record.transferMasterUrl} is node ${String(reply.masterNodeId ?? '?').slice(0, 8)}, not the master this transfer was decided on; Cancel this transfer`);
+    writeHandoverDocuments(reply.documents);
+    // The floor the term above was announced on: the seed phase writes that
+    // term, so the boot mints exactly what the old master was told.
+    record.expectedTerm = floor;
+    record.handoverAt = Date.now();
+    console.warn(`[Fleet] PROMOTE handover: ${reply.masterNodeName ?? record.supersededNodeId.slice(0, 8)} handed over at term ${reply.masterTerm ?? '?'} and steps down once this node beacons at term ${term}`);
+    return;
+  }
+  if (reply?.answered === true) {
+    record.handoverSentAt = null;
+    releaseTransferHold();
+    const held: number[] = Array.isArray(reply.heldShards) ? reply.heldShards : [];
+    if (held.length > 0) {
+      record.phase = 'retire';
+      throw new Error(`the master holds shard(s) [${held.join(', ')}] again since its retire, so it did not hand over; Continue moves them here first, or Cancel`);
+    }
+    throw new Error(`the master refused the handover: ${reply.error ?? 'no reason given'}; nothing was handed over. Continue asks again, or Cancel`);
+  }
+  const gone = await transferMasterGone(botManager);
+  if (gone === true) {
+    if (!mirrorPlacementUsable(record.supersededNodeId)) throw new Error('the master does not answer the handover and no master beacons any more, but this node\'s copy carries no usable placement documents of that master to go on with (the Backup copy line says why). With that master gone Cancel is open: cancel this transfer, then Promote adopts a complete copy of that master if this node holds one; else FLEET_CONFIRM_TAKEOVER=1 with BOT_NODE_ROLE=master on this node plus a restart seizes the fleet onto the data the retire moved here, the plan made anew');
+    record.expectedTerm = floor;
+    record.handoverAt = Date.now();
+    console.warn('[Fleet] PROMOTE handover: the old master does not answer and no master beacons (it handed over and stepped down, or died after the retire); this node goes on with the plan from its copy\'s documents and adopts nothing, the live data the retire moved here being the newest');
+    return;
+  }
+  throw new Error(`the master did not answer the handover (${reply?.error ?? 'no answer'}) and may have handed over already, so this transfer goes forward only: Continue asks again (a master that handed over answers the same), and once that master neither answers nor beacons, Continue goes on with the plan from this node's copy (and Cancel opens); for now ${gone}`);
 }
 
 /**
@@ -883,6 +1140,23 @@ export async function cancelPromote(botManager?: BotManager): Promise<{ success:
   if (!record) return { success: false, error: 'no promote to cancel' };
   // Liveness is the engine's, not the record's (see continuePromote).
   const idle = record.parked || !phasesRunning;
+  // A transfer's running retire stops at its next poll (B4f-4): the
+  // master's retire is aborted and the lane ends, the legs it completed
+  // standing. A retire that ends or parks meanwhile is judged as it stands.
+  if (isFileTransfer(record) && !idle && record.phase === 'retire' && record.handoverSentAt == null) {
+    transferCancelFor = record.startedAt;
+    const deadline = Date.now() + 30000;
+    while (Date.now() < deadline) {
+      await sleep(250);
+      const now = readPromoteRecord();
+      if (!now || now.startedAt !== record.startedAt) return { success: true };
+      if (now.phase !== 'retire' || now.parked || !phasesRunning) {
+        if (transferCancelFor === record.startedAt) transferCancelFor = null;
+        return now.phase === 'retire' ? cancelPromote(botManager) : { success: false, error: `the retire finished before the cancel reached it; the transfer is at phase ${now.phase} now and goes forward` };
+      }
+    }
+    return { success: false, error: 'the cancel is asked, and the retire stops at its next poll (the master is slow to answer); look at the record again shortly' };
+  }
   // Held by another node since it was decided: nothing it could still do is
   // safe (its restart phase is a takeover past the fence) and the fleet is that
   // node's. Dismissed whatever its phase, from the persisted sighting, so it
@@ -937,11 +1211,39 @@ export async function cancelPromote(botManager?: BotManager): Promise<{ success:
   // phase is the point of no return, as on postgres: its override is staged.
   if (record.backend === 'file' && idle) {
     if (record.phase === 'restart') return { success: false, error: 'the promote is past the point of cancellation (phase restart; the master override is staged); Continue it instead' };
+    // A transfer past its handover has deposed the master: it stopped
+    // granting, dropped its workers and steps down once this node beacons,
+    // so the fleet's next master is this node and forward is the only way.
+    if (isFileTransfer(record) && (record.handoverAt != null || record.phase === 'pin' || record.phase === 'seed')) {
+      return { success: false, error: 'the old master handed over (it stopped granting, dropped its workers and steps down once this node beacons), so this transfer is past the point of cancellation: Continue it instead' };
+    }
+    // Asked and unanswered: forward only while the master may be there,
+    // deposed or not; once it is gone Cancel opens (the copy holds nothing
+    // a migration committed here, so a later Promote adopts no older copy
+    // over the data the retire moved).
+    if (isFileTransfer(record) && record.handoverSentAt != null) {
+      const gone = botManager ? await transferMasterGone(botManager) : 'the bot is not reachable from here';
+      if (gone !== true) {
+        return { success: false, error: `the handover was asked and its answer never came, so the old master may have handed over already (stopped granting and dropped its workers): this transfer goes forward only while that master may be there (${gone}). Continue asks again, and once that master neither answers nor beacons, Continue goes on with the plan from this node's copy, or Cancel` };
+      }
+    }
+    // A retire running for this transfer is aborted first, best effort: the
+    // legs it completed stand, their shards on this node.
+    if (isFileTransfer(record) && record.phase === 'retire' && botManager) {
+      const aborted = await botManager.fleetTransfer('abort', { migrationId: record.transferMigrationId ?? null });
+      if (!aborted?.success && aborted?.notReady !== true) {
+        return { success: false, error: `the master refuses to abort its retire onto this node yet (${aborted?.error ?? 'no answer'}), so cancelling now would leave it moving shards here: Cancel again in a moment, or Continue` };
+      }
+      if (!aborted?.success) console.warn(`[Fleet] PROMOTE cancel: the master could not be reached to abort its retire (${aborted?.error ?? 'no answer'}); abort it on the master's Fleet tab if it still runs`);
+    }
     const moved = readPromoteRecord();
     if (phasesRunning || !moved || moved.parked !== record.parked || moved.startedAt !== record.startedAt || moved.updatedAt !== record.updatedAt) {
       return { success: false, error: 'the promote changed while the cancel was being checked; look at its current phase and retry' };
     }
-    if (adoptStarted()) {
+    if (isFileTransfer(record)) {
+      if (adoptStarted()) clearAdoptMarker();
+      console.warn(`[Fleet] PROMOTE cancelled (transfer, file mode, at ${record.phase}): the shards the retire moved stay on this node`);
+    } else if (adoptStarted()) {
       console.error(`[Fleet] PROMOTE cancelled past its adopt (file mode, at ${record.phase}): the guild data adopted from the old master stays in this node's live tree under its own ownership${record.phase !== 'adopt' ? ' and the pinned placement in its fleet directory' : ''}, served by nobody while this node is a co-worker (the next adopt or migration onto this node graveyards those dirs first); the mirror resumes on its next tick`);
       clearAdoptMarker();
     }
@@ -1126,6 +1428,8 @@ export async function resumePromote(botManager: BotManager): Promise<void> {
 async function runPhases(botManager: BotManager, record: PromoteRecord, spliced: { local: string; public: string } | null): Promise<void> {
   if (phasesRunning) return;
   phasesRunning = true;
+  // A cancel asked of an earlier run of this lane is not this run's.
+  if (transferCancelFor === record.startedAt) transferCancelFor = null;
   const save = (): void => writePromoteRecord(record);
   const db = (): { local: string; public: string } => {
     if (!spliced) throw new Error(`phase ${record.phase} belongs to a postgres promote, not to this file-mode one`);
@@ -1164,6 +1468,14 @@ async function runPhases(botManager: BotManager, record: PromoteRecord, spliced:
             await phasePromote(db());
             record.phase = 'restart';
             break;
+          case 'retire':
+            await phaseTransferRetire(botManager, record);
+            record.phase = 'handover';
+            break;
+          case 'handover':
+            await phaseHandover(botManager, record);
+            record.phase = 'pin';
+            break;
           case 'adopt': {
             // Judged before the first rename, as the postgres lane judges before
             // pg_promote: the sighting can land while the verdict runs.
@@ -1176,7 +1488,7 @@ async function runPhases(botManager: BotManager, record: PromoteRecord, spliced:
           }
           case 'pin': {
             const pinned = await pinPlacement(getNodeId(), record.supersededNodeId);
-            console.warn(`[Fleet] PROMOTE pin: shard(s) [${pinned.movedShards.join(', ')}] of the old master pinned to this node${pinned.removed.length > 0 ? `; stale records removed: ${pinned.removed.join(', ')}` : ''}`);
+            console.warn(`[Fleet] PROMOTE pin: ${isFileTransfer(record) ? 'the plan the old master handed over is this node\'s' : `shard(s) [${pinned.movedShards.join(', ')}] of the old master pinned to this node`}${pinned.removed.length > 0 ? `; stale records removed: ${pinned.removed.join(', ')}` : ''}`);
             record.phase = 'seed';
             break;
           }
@@ -1203,6 +1515,13 @@ async function runPhases(botManager: BotManager, record: PromoteRecord, spliced:
         }
         save();
       } catch (error) {
+        if (error instanceof TransferCancelled) {
+          if (adoptStarted()) clearAdoptMarker();
+          clearPromoteRecord();
+          console.warn(`[Fleet] PROMOTE cancelled (transfer, file mode, while its retire ran): the shards the retire moved stay on this node`);
+          return;
+        }
+        if (transferCancelFor === record.startedAt) transferCancelFor = null;
         record.parked = true;
         record.lastError = error instanceof Error ? error.message : String(error);
         save();
@@ -1357,6 +1676,7 @@ async function phaseRestart(botManager: BotManager, record: PromoteRecord): Prom
     // earlier phases run (the child registers with a master that took the fleet
     // meanwhile), and this is the last point before the fence is skipped.
     const seen = promoteSupersededBy(record);
+    if (seen && isFileTransfer(record)) throw new Error(`${supersededText(seen)}; the takeover restart is not staged, so this node stays a co-worker, holding the guild data the retire moved here (it serves it once a master grants those shards back); the old master handed over and steps down on that node's beacon. Cancel this transfer`);
     if (seen && record.backend === 'file') throw new Error(`${supersededText(seen)}; the takeover restart is not staged, so this node stays a co-worker. The old master's guild data is adopted into this node's live tree under its own ownership and the plan is pinned in its fleet directory, served by nobody (the next adopt or migration onto this node graveyards those dirs first), and the mirror resumes once this promote is cancelled. Cancel this promote; if that node is gone for good, Promote again on what is reachable now`);
     if (seen) throw new Error(`${supersededText(seen)}; the takeover restart is not staged. This machine's copy has already left recovery and /data/.env names it${record.claimedTerm !== null ? `, and this lane claimed term ${record.claimedTerm} on ${record.canonicalEndpoint ?? 'the fleet database'}` : ''}${record.fencedLsn ? ` and left it read-only at ${record.fencedLsn}` : ''}, so there is no Promote left to run here: Cancel this promote, then re-seed this machine as a standby of the node that took the fleet and promote it once it has caught up, or demote this node to stay a co-worker; if that node is gone for good, Cancel this promote and, where this node's Fleet tab still offers Promote (a designated backup, or a hold that still names this node), press it again (this copy is already out of recovery, so the lane left is the repoint and the restart); otherwise seize the fleet onto this copy with FLEET_CONFIRM_TAKEOVER=1 plus a restart on a node whose configured role is master`);
     // The copy is spent once the adopt and the pin stand: the tree goes before
@@ -1369,6 +1689,8 @@ async function phaseRestart(botManager: BotManager, record: PromoteRecord): Prom
       takeover: true,
       ...(record.mode === 'failover' && record.backend !== 'file' ? { chainTakeover: true } : {}),
       ...(record.supersededStoreDead ? { supersededStoreDead: record.supersededStoreDead } : {}),
+      // The transfer's old master waits deposed for this boot's beacon (B4f-4).
+      ...(isFileTransfer(record) && record.supersededNodeId ? { transferFrom: record.supersededNodeId } : {}),
       setAt: Date.now(),
       setBy: record.startedBy,
     });

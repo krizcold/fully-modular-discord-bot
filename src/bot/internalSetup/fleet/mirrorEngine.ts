@@ -46,6 +46,12 @@ export interface MirrorManifest {
   /** Guilds the master held frozen at the last listing; their records above are the last copy taken. */
   frozen: string[];
   documents: Record<string, MirrorFileRecord>;
+  /**
+   * When a migration last committed guilds of this copy onto this node's
+   * live tree (B4f-4): the copy's plan still places them with the master
+   * until a pass begun after that completes, so no seed is offered from it.
+   */
+  droppedAt?: number | null;
 }
 
 export interface MirrorEngineHooks {
@@ -206,6 +212,40 @@ function caseCollisions(paths: string[]): { files: Set<string>; pair: [string, s
   return { files, pair };
 }
 
+/**
+ * Guilds a migration committed onto this node's live tree (B4f-4), with the
+ * time: their live dirs hold the newest data, so the copy of them is spent
+ * and must never be adopted over them. A pass that started before the
+ * commit still names them and leaves them out of what it writes.
+ */
+const committedHere = new Map<string, number>();
+let activeEngine: MirrorEngine | null = null;
+
+/** A migration committed these guilds onto this node: dropped from the copy now (the engine and the disk alike). Never throws. */
+export function noteGuildsCommittedHere(guildIds: string[]): void {
+  try {
+    const at = Date.now();
+    const ids = guildIds.filter(isGuildId);
+    if (ids.length === 0) return;
+    // Only a running engine has a pass that may still name them.
+    if (activeEngine) for (const guildId of ids) committedHere.set(guildId, at);
+    let dropped = ids.filter(guildId => fs.existsSync(mirrorGuildDir(guildId)));
+    const onDisk = readMirrorManifest();
+    if (onDisk && ids.some(guildId => onDisk.guilds[guildId] || onDisk.frozen.includes(guildId))) {
+      dropped = [...new Set([...dropped, ...ids.filter(guildId => onDisk.guilds[guildId] || onDisk.frozen.includes(guildId))])];
+      for (const guildId of ids) delete onDisk.guilds[guildId];
+      onDisk.frozen = onDisk.frozen.filter(guildId => !ids.includes(guildId));
+      onDisk.droppedAt = at;
+      atomicWriteFileSync(mirrorManifestFile(), JSON.stringify(onDisk, null, 2));
+    }
+    for (const guildId of ids) fs.rmSync(mirrorGuildDir(guildId), { recursive: true, force: true });
+    activeEngine?.forgetGuilds(ids, at);
+    if (dropped.length > 0) console.log(`[Fleet] Mirror: guild(s) ${dropped.join(', ')} committed onto this node by a migration leave the copy (the live data is the newest); no seed is offered from the copy until its next pass`);
+  } catch (error) {
+    console.warn('[Fleet] Mirror: dropping guilds a migration committed here from the copy failed; the next pass trims them:', error instanceof Error ? error.message : error);
+  }
+}
+
 export class MirrorEngine {
   private manifest: MirrorManifest;
   private status: MirrorStatus = 'idle';
@@ -221,6 +261,16 @@ export class MirrorEngine {
 
   constructor(private readonly hooks: MirrorEngineHooks) {
     this.manifest = readMirrorManifest() ?? emptyManifest();
+    activeEngine = this;
+  }
+
+  /** The in-memory copy forgets guilds a migration committed here; a pass running drops them as it writes. */
+  forgetGuilds(guildIds: string[], at: number): void {
+    if (this.running) return;
+    const next = { ...this.manifest, guilds: { ...this.manifest.guilds }, frozen: this.manifest.frozen.filter(guildId => !guildIds.includes(guildId)), droppedAt: at };
+    for (const guildId of guildIds) delete next.guilds[guildId];
+    this.manifest = next;
+    this.hooks.onChanged();
   }
 
   start(): void {
@@ -449,6 +499,7 @@ export class MirrorEngine {
       guilds: {},
       frozen: [],
       documents: {},
+      droppedAt: previous.droppedAt ?? null,
     };
     let changed = 0;
     let failures = 0;
@@ -567,7 +618,23 @@ export class MirrorEngine {
       if (target) fs.rmSync(target, { force: true });
     }
 
+    // Guilds a migration committed here since this pass began: the listing
+    // predates the commit, and the live dirs are the newest data.
+    const passStartedAt = this.attemptedAt ?? 0;
+    for (const [guildId, at] of committedHere) {
+      if (at < passStartedAt) {
+        committedHere.delete(guildId);
+        continue;
+      }
+      delete next.guilds[guildId];
+      next.frozen = next.frozen.filter(id => id !== guildId);
+      fs.rmSync(mirrorGuildDir(guildId), { recursive: true, force: true });
+      next.droppedAt = Math.max(next.droppedAt ?? 0, at);
+    }
+
     const complete = failures === 0;
+    // A complete pass begun after the last commit makes the copy whole again.
+    if (complete && next.droppedAt != null && next.droppedAt < passStartedAt) next.droppedAt = null;
     if (complete) {
       next.completedAt = Date.now();
       next.revision = Number.isInteger(listing.revision) ? listing.revision : null;

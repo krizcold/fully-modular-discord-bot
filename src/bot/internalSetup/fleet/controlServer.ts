@@ -56,6 +56,10 @@ export interface ControlServerHooks {
   onXferFlushed?: (nodeId: string, data: any) => void;
   /** A backup's seed push progress and final hashes (B4f-3, fire-and-forget into the seed hold). */
   onSeedReport?: (nodeId: string, data: any) => void;
+  /** The planned transfer's requests from the designated backup (B4f-4): the retire's start, status and abort; term-fenced. */
+  onTransferRequest?: (nodeId: string, type: string, data: any) => Promise<any>;
+  /** The transfer's handover (B4f-4), pre-registration; afterReply runs once the answer is on the wire. */
+  onTransferHandover?: (data: any) => Promise<{ reply: any; afterReply?: () => void }>;
 }
 
 interface ConnState {
@@ -245,6 +249,26 @@ export class ControlServer {
       return;
     }
 
+    // The planned transfer's handover (B4f-4): pre-registration, since a
+    // master that handed over refuses every registration and the backup
+    // whose answer was lost asks again on a fresh socket. What the handover
+    // sets off runs only once the answer is on the wire.
+    if (type === MSG.TRANSFER_HANDOVER) {
+      if (!requestId) return;
+      const handler = this.hooks.onTransferHandover;
+      if (!handler) {
+        this.reply(socket, requestId, { ok: false, term: this.hooks.getTerm(), error: 'transfer-unavailable' });
+        return;
+      }
+      handler(data ?? {})
+        .then(({ reply, afterReply }) => {
+          if (socket.readyState !== WebSocket.OPEN) return;
+          socket.send(JSON.stringify({ requestId, data: reply }), error => { if (!error) afterReply?.(); });
+        })
+        .catch(error => this.reply(socket, requestId, { ok: false, term: this.hooks.getTerm(), error: error instanceof Error ? error.message : String(error) }));
+      return;
+    }
+
     if (!state.nodeId) {
       if (requestId) this.reply(socket, requestId, { ok: false, term: this.hooks.getTerm(), reason: 'not-registered' });
       return;
@@ -314,6 +338,20 @@ export class ControlServer {
       case MSG.SEED_REPORT:
         this.hooks.onSeedReport?.(state.nodeId, data);
         break;
+      case MSG.TRANSFER_START:
+      case MSG.TRANSFER_STATUS:
+      case MSG.TRANSFER_ABORT: {
+        if (!requestId) break;
+        const handler = this.hooks.onTransferRequest;
+        if (!handler) {
+          this.reply(socket, requestId, { ok: false, term: this.hooks.getTerm(), error: 'transfer-unavailable' });
+          break;
+        }
+        handler(state.nodeId, type, data)
+          .then(result => this.reply(socket, requestId, result))
+          .catch(error => this.reply(socket, requestId, { ok: false, term: this.hooks.getTerm(), error: error instanceof Error ? error.message : String(error) }));
+        break;
+      }
       default:
         if (requestId) this.reply(socket, requestId, { ok: false, term: this.hooks.getTerm(), reason: `unknown-type:${type}` });
     }

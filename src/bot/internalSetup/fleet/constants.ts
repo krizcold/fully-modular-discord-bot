@@ -192,6 +192,15 @@ export const SEED_REPORT_WAIT_MS = 120000;
 /** After its push was sent, how long a backup refuses its own file promote: the seeded master restarts and beacons within this window, and two seeds at one floor would mint equal terms. */
 export const SEED_SENT_PROMOTE_HOLD_MS = 600000;
 
+/** The planned transfer (B4f-4): how often the backup asks the master how its retire stands. */
+export const TRANSFER_POLL_MS = 3000;
+
+/** How long the retire phase tolerates a master that does not answer the status before it parks. */
+export const TRANSFER_STATUS_DARK_MS = 120000;
+
+/** The handover's answer (the master reads its placement documents from its control store first). */
+export const TRANSFER_HANDOVER_TIMEOUT_MS = 30000;
+
 // ============================================================================
 // MIGRATION (P5): node-to-node data transfer + cutover under commit barriers.
 // ============================================================================

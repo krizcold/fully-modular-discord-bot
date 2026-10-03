@@ -90,6 +90,19 @@ export const MSG = {
   SEED_PUSH: 'control:seed:push',
   SEED_REPORT: 'control:seed:report',
   SEED_ABORT: 'control:seed:abort',
+  // The planned transfer (B4f-4, file mode): the designated backup asks the
+  // master to retire every shard it holds onto it and follows that retire.
+  TRANSFER_START: 'control:transfer:start',
+  TRANSFER_STATUS: 'control:transfer:status',
+  TRANSFER_ABORT: 'control:transfer:abort',
+  /**
+   * The transfer's handover: the master's placement documents, then its
+   * step-down. Answered ahead of the not-registered gate like STEP_DOWN:
+   * the handover deposes the master, which drops every worker and refuses
+   * their registrations, so a backup whose answer was lost asks again on a
+   * fresh socket.
+   */
+  TRANSFER_HANDOVER: 'control:transfer:handover',
 } as const;
 
 /** STEP_DOWN payload: the new master's identity, term and (optionally) its data backend. */
@@ -601,6 +614,58 @@ export interface SeedReportPayload {
 export interface SeededFromInfo {
   seedId: string;
   sourceNodeId: string;
+}
+
+/** TRANSFER_START (B4f-4): with precheck the master only judges the retire; without, it starts it, or resumes its paused one onto this node. */
+export interface TransferStartRequest {
+  term: number;
+  precheck?: boolean;
+}
+
+export interface TransferStartReply {
+  ok: boolean;
+  error?: string;
+  /** Null when the master holds no shard: nothing to move. */
+  migrationId?: string | null;
+  legs?: number;
+  warnings?: string[];
+}
+
+export interface TransferStatusRequest {
+  term: number;
+  migrationId: string | null;
+}
+
+export interface TransferStatusReply {
+  ok: boolean;
+  error?: string;
+  /** The shards the master holds now. */
+  heldShards?: number[];
+  /** The transfer's retire while it runs. */
+  active?: { state: string; paused: boolean; legsDone: number; legsTotal: number; shardId: number | null; error?: string } | null;
+  /** The transfer's retire once finished (the coordinator's history). */
+  finished?: { state: string; error?: string } | null;
+  /** The kind of another migration running on the fleet. */
+  otherActive?: string | null;
+}
+
+/** TRANSFER_HANDOVER (B4f-4): the backup names itself and the term its boot mints. */
+export interface TransferHandoverRequest {
+  nodeId: string;
+  nodeName: string;
+  term: number;
+}
+
+export interface TransferHandoverReply {
+  ok: boolean;
+  error?: string;
+  masterNodeId?: string;
+  masterNodeName?: string;
+  masterTerm?: number;
+  /** The placement documents as the master's control store held them at the handover, by their fleet-dir names. */
+  documents?: { name: string; body: string }[];
+  /** A refusal because the master holds shards again: the backup moves them first. */
+  heldShards?: number[];
 }
 
 // ============================================================================

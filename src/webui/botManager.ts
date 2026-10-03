@@ -882,6 +882,19 @@ export class BotManager {
     }
   }
 
+  /**
+   * The planned transfer's steps on the designated backup (B4f-4): the
+   * master's retire (start, status, abort) and the handover. The handover's
+   * ceiling stands above the child's own wait for the master's answer.
+   */
+  async fleetTransfer(op: 'start' | 'status' | 'abort' | 'handover', data: Record<string, unknown> = {}): Promise<any> {
+    try {
+      return await this.sendIPCMessage('fleet:transfer', { op, data }, op === 'handover' ? 45000 : 20000);
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error', notReady: true };
+    }
+  }
+
   async retireFleetStaleCopies(confirm: boolean): Promise<any> {
     try {
       return await this.sendIPCMessage('fleet:retireCopies', { confirm });

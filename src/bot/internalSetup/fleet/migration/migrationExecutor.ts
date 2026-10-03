@@ -13,6 +13,7 @@ import { DATA_ROOT } from '../../../../utils/dataRoot';
 import { atomicWriteFileSync } from '../fileControlStore';
 import { getNodeId } from '../nodeIdentity';
 import { readSuperseded } from '../stepDown';
+import { noteGuildsCommittedHere } from '../mirrorEngine';
 import {
   deleteGuildNamespace,
   flushGuild,
@@ -494,6 +495,8 @@ export class MigrationExecutor {
       if (fs.existsSync(live)) await deleteGuildNamespace(guildId, `migration-${leg.migrationId}-replaced`);
       await fs.promises.rename(staged, live);
       writeOwnerStamp(guildId, { shardId: leg.shardId, term, epoch });
+      // The copy this node may hold of the guild is older than what landed.
+      noteGuildsCommittedHere([guildId]);
     }
     try { await fs.promises.rm(legDir, { recursive: true, force: true }); } catch { /* best effort */ }
     // Non-recursive: only reaps the migration dir once its last leg is gone.
@@ -714,6 +717,7 @@ export async function commitFromStaging(migrationId: string, legId: string, term
     if (fs.existsSync(live)) await deleteGuildNamespace(guildId, `migration-${migrationId}-replaced`);
     await fs.promises.rename(staged, live);
     writeOwnerStamp(guildId, { shardId, term, epoch });
+    noteGuildsCommittedHere([guildId]);
   }
   try { await fs.promises.rm(legDir, { recursive: true, force: true }); } catch { /* best effort */ }
   // Non-recursive: only reaps the migration dir once its last leg is gone.

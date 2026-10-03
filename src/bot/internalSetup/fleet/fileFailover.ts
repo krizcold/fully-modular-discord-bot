@@ -232,6 +232,51 @@ export function seedTerm(sourceNodeId: string, floor: number): number {
   return term;
 }
 
+/**
+ * The planned transfer's handover (B4f-4): the mirror tick stops under an
+ * adopt marker naming no guild (a transfer adopts nothing: the retire moved
+ * the live data), so the master's documents written next are what the pin
+ * reads.
+ */
+export function holdMirrorForTransfer(selfNodeId: string, sourceNodeId: string): void {
+  if (fs.existsSync(adoptMarkerFile())) return;
+  fs.mkdirSync(mirrorRoot(), { recursive: true });
+  const marker: AdoptMarker = { nodeId: selfNodeId, sourceNodeId, guilds: [], startedAt: Date.now() };
+  atomicWriteFileSync(adoptMarkerFile(), JSON.stringify(marker, null, 2));
+}
+
+/** A handover that was refused hands the copy back to the mirror tick (the transfer's hold names no guild; an adopt's marker is left). */
+export function releaseTransferHold(): void {
+  const marker = readAdoptMarker();
+  if (marker && marker.guilds.length === 0) clearAdoptMarker();
+}
+
+/** The master's placement documents as its control store held them at the handover, under the mirror layout the pin reads. */
+export function writeHandoverDocuments(documents: { name: string; body: string }[]): void {
+  const bodies = MIRROR_DOC_NAMES.map(name => {
+    const doc = Array.isArray(documents) ? documents.find(d => d && d.name === name && typeof d.body === 'string') : undefined;
+    if (!doc) throw new Error(`the handover carried no ${name}`);
+    JSON.parse(doc.body);
+    return { name, body: doc.body };
+  });
+  fs.mkdirSync(mirrorDocsDir(), { recursive: true });
+  for (const { name, body } of bodies) atomicWriteFileSync(path.join(mirrorDocsDir(), name), body);
+}
+
+/** The copy's placement documents are what the pin needs, from a copy of that master (a transfer whose handover answer never came goes on with them, B4f-4). */
+export function mirrorPlacementUsable(sourceNodeId: string): boolean {
+  if (readMirrorManifest()?.sourceNodeId !== sourceNodeId) return false;
+  const plan = readMirrorDoc<PersistedPlan>('leases.json');
+  const config = readMirrorDoc<PersistedFleetConfig>('fleet-config.json');
+  return !!plan && Array.isArray(plan.assignments) && !!config && Array.isArray(config.masterCandidates);
+}
+
+/** The term the seed phase writes over this floor (the term.json already here may stand above it); the boot mints one above. */
+export function plannedSeedTerm(floor: number): number {
+  const current = readJson<PersistedTerm>(dataPath('global', FLEET_DIR, 'term.json'));
+  return Math.max(floor, current && Number.isFinite(current.term) ? current.term : 0);
+}
+
 /** The copy is spent: the mirror tree (marker, manifest, documents, staging) goes before the master boot. */
 export function finishAdopt(): void {
   fs.rmSync(mirrorRoot(), { recursive: true, force: true });

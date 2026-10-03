@@ -1257,7 +1257,9 @@ function FleetPromoteCard({ api, fleet, reload }) {
   const post = (body) => api.post('/fleet/promote', body);
   const run = (retireOldMaster) => {
     if (busy) return;
-    const text = masterDown
+    const text = fileMode && !masterDown
+      ? 'TRANSFER master to this instance?\n\nNothing is lost: the master moves every shard it holds here as a migration (each guild is frozen for a moment, copied, verified, then its copy on the old master goes to its graveyard), hands over its plan and stops coordinating; this node restarts once as master, the co-workers reconnect to it, and the old master rejoins as a co-worker once it sees this node\'s beacon. Commands on a guild being moved wait a few seconds. In file mode this is also the retire of the old master: no copy of the guild data stays behind on it.'
+      : masterDown
       ? (fileMode
         ? 'Promote this instance to MASTER?\n\nThe master looks unreachable from this node. Its guild data is taken from the copy this node holds; you will be asked to accept how old that copy is. This node restarts once as master.'
         : 'Promote this instance to MASTER?\n\nThe master looks unreachable from this node. If its database still answers, this is a zero-loss transfer: the old database is fenced at a known point, the copy here catches up, then takes over. If nothing answers, the copy is promoted as far as replication reached and you will be asked to accept how current it is. This node restarts once as master; workers keep their sessions.')
@@ -1305,7 +1307,7 @@ function FleetPromoteCard({ api, fleet, reload }) {
     <div className="usage-stat-card" style={{ marginTop: '10px' }}>
       <div className="usage-stat-title">{fleet.followerHold ? 'Returning master' : 'Backup master'}</div>
       <div className="usage-stat-sub">
-        {fileMode ? 'This instance takes over only when you press the button here: the bot restarts as master on the copy of the master\'s guild data it holds.' : 'This instance takes over only when you press a button here: bot and database together, one action.'}
+        {fileMode ? (masterDown ? 'This instance takes over only when you press the button here: the bot restarts as master on the copy of the master\'s guild data it holds.' : 'This instance takes over only when you press the button here: the master moves its guild data here, then the bot restarts as master.') : 'This instance takes over only when you press a button here: bot and database together, one action.'}
       </div>
       {order.length > 1 && (
         <div className="usage-stat-sub" style={{ marginTop: '4px', color: preferred.length ? '#d29922' : undefined }}>
@@ -1325,8 +1327,8 @@ function FleetPromoteCard({ api, fleet, reload }) {
       {fileMode ? (
         <div className="usage-stat-sub" style={{ color: copy && copy.completedAgoMs != null ? undefined : '#d29922' }}>
           {copy && copy.completedAgoMs != null
-            ? `Copy of the master's guild data: last complete ${fleetFormatAge(copy.completedAgoMs)} (${copy.guildCount} guild${copy.guildCount === 1 ? '' : 's'}, ${(copy.totalBytes / 1048576).toFixed(1)} MB); promoting adopts it, and that age is what you accept losing.`
-            : 'No complete copy of the master\'s guild data on this node yet; the promote refuses until the Backup copy line below shows one.'}
+            ? `Copy of the master's guild data: last complete ${fleetFormatAge(copy.completedAgoMs)} (${copy.guildCount} guild${copy.guildCount === 1 ? '' : 's'}, ${(copy.totalBytes / 1048576).toFixed(1)} MB); ${masterDown ? 'promoting adopts it, and that age is what you accept losing.' : 'a transfer while the master answers moves its live data instead, so it loses nothing; the copy is what a promote adopts if the master dies.'}`
+            : masterDown ? 'No complete copy of the master\'s guild data on this node yet; the promote refuses until the Backup copy line below shows one.' : 'No complete copy of the master\'s guild data on this node yet; a transfer while the master answers does not need one (it moves the live data), but a promote after the master dies does.'}
         </div>
       ) : null}
       {!active && (masterDown ? (
@@ -1334,8 +1336,11 @@ function FleetPromoteCard({ api, fleet, reload }) {
           {busy ? 'Working...' : 'Promote to master'}
         </button>
       ) : fileMode ? (
-        <div className="usage-stat-sub" style={{ marginTop: '6px' }}>
-          The master is reachable from this node. Moving the master here while it is alive is a planned transfer, which file mode does not have yet.
+        <div style={{ marginTop: '6px' }}>
+          <button onClick={() => run(false)} disabled={busy}>
+            {busy ? 'Working...' : 'Transfer master here'}
+          </button>
+          <div className="usage-stat-sub" style={{ marginTop: '4px' }}>In file mode the transfer is also the retire of the old master: each guild's copy there goes to its graveyard once this node holds it.</div>
         </div>
       ) : (
         <div style={{ marginTop: '6px' }}>
@@ -1357,6 +1362,8 @@ const PROMOTE_PHASE_TEXT = {
   fence: 'Fencing the old database',
   catchup: 'Catching the copy up to the fenced position',
   promote: 'Promoting the local copy',
+  retire: 'Moving the master\'s shards here',
+  handover: 'Taking the handover from the old master',
   adopt: 'Adopting the copy of the guild data',
   pin: 'Pinning the shard plan to this node',
   seed: 'Seeding the term',
@@ -1391,12 +1398,20 @@ function FleetPromoteRecord({ api, fleet, reload, readOnly = false }) {
   // A boot parked on a live holder since this record was decided: the engine
   // dismisses on Cancel from the park view, and Continue can only refuse.
   const parkedSince = r.mode !== 'stand-in' && fleet.staleMasterPark && fleet.staleMasterPark.at >= r.startedAt ? fleet.staleMasterPark : null;
-  const cancellable = !!heldBy || !!parkedSince || (r.phase === 'claim' && !r.claimedTerm) || (r.mode === 'failover' && r.phase === 'promote') || r.mode === 'stand-in' || (r.backend === 'file' && r.phase !== 'restart');
+  const cancellable = !!heldBy || !!parkedSince || (r.phase === 'claim' && !r.claimedTerm) || (r.mode === 'failover' && r.phase === 'promote') || r.mode === 'stand-in' || (r.backend === 'file' && r.phase !== 'restart' && !(r.mode === 'transfer' && (r.handoverAt || r.phase === 'pin' || r.phase === 'seed')));
   return (
     <div className="usage-stat-card" style={{ marginTop: '10px', borderColor: idle && r.phase !== 'done' ? '#e5534b' : undefined }}>
       <div className="usage-stat-title">{`Promote (${r.mode}${r.backend === 'file' ? ', file mode' : ''}): ${PROMOTE_PHASE_TEXT[r.phase] || r.phase}${r.parked ? ' · PARKED' : idle && r.phase !== 'done' ? ' · STOPPED' : ''}`}</div>
       {r.lastError ? <div className="usage-stat-sub" style={{ color: '#ed4245' }}>{r.lastError}</div> : null}
       {r.fencedLsn ? <div className="usage-stat-sub">{`Old database fenced at ${r.fencedLsn}`}</div> : null}
+      {r.mode === 'transfer' && r.backend === 'file' && r.phase === 'retire' && r.transferNote ? <div className="usage-stat-sub">{r.transferNote}</div> : null}
+      {r.mode === 'transfer' && r.backend === 'file' && r.handoverAt && r.phase !== 'done' ? <div className="usage-stat-sub">The old master handed over: it stopped coordinating and rejoins as a co-worker once this node beacons as master, so this transfer can only go forward.</div> : null}
+      {r.mode === 'transfer' && r.backend === 'file' && r.handoverSentAt && !r.handoverAt && r.phase !== 'done' ? <div className="usage-stat-sub">The handover was asked and its answer has not come: the old master may have handed over already, so this transfer goes forward only (Continue asks again) until that master neither answers nor beacons, when Cancel opens too.</div> : null}
+      {!idle && !readOnly && r.mode === 'transfer' && r.backend === 'file' && r.phase === 'retire' && !r.handoverSentAt ? (
+        <div style={{ marginTop: '6px' }}>
+          <button onClick={() => act('/fleet/promote/cancel', 'Transfer cancelled')} disabled={busy} style={{ fontSize: '0.72rem', padding: '2px 8px' }}>Cancel</button>
+        </div>
+      ) : null}
       {heldBy ? (
         <div className="usage-stat-sub" style={{ color: '#ed4245' }}>{`Node ${heldBy.nodeId.slice(0, 8)} has held the fleet at term ${heldBy.term} since this promote was decided, so continuing it would restart this node as master past the fence${idle ? ': Continue is refused and Cancel dismisses it.' : '; the running phases will refuse to stage the takeover restart and park with that reason, and Cancel then dismisses it.'}`}</div>
       ) : null}

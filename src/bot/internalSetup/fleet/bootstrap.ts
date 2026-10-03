@@ -80,6 +80,8 @@ import { SyncEngine } from './syncEngine';
 import { MirrorAuthority, isMirrorRequest, serveMirrorRequest } from './mirrorAuthority';
 import { MirrorEngine, readMirrorManifest } from './mirrorEngine';
 import { adoptStarted, isStaleCopy, listStaleCopies, STALE_COPY_REASON } from './fileFailover';
+import { requestHandover } from './transferHandover';
+import { TransferAuthority } from './transferAuthority';
 import { abandonSeedRecord, confirmSeed, floorTermAbove, hasGuildData, readSeedRecord, resumeSeed, runSeedHold, seedHoldApplies, seedSupersededBy, writeSeedRecord } from './seedHold';
 import { ownMastershipTerm, SeedSource } from './seedSource';
 import { deleteGuildNamespace, getFrozenStats, getGuildDataBackend, setOwnerInfoProvider } from '../utils/dataManager';
@@ -135,7 +137,7 @@ import {
 import { ARM_MAX_ATTEMPTS, LEASE_TTL_MS, STANDIN_FENCE_HOLD_MS, STEP_DOWN_NOTIFY_MS, STEPDOWN_FALLBACK_MS, STEPDOWN_HANDOVER_DELAY_MS, WITNESS_FRESH_WINDOW_MS } from './constants';
 import type { StepDownPayload } from './protocol';
 import { planPinRestoreLegs } from './placement';
-import { TRANSFER_PORT_DEFAULT } from './constants';
+import { TRANSFER_HANDOVER_TIMEOUT_MS, TRANSFER_PORT_DEFAULT } from './constants';
 
 export interface FleetContext {
   role: NodeRole;
@@ -355,6 +357,18 @@ export async function fleetSetConfig(candidates: unknown, witnessChannelId?: unk
 /** The seed hold's confirm (B4f-3, IPC fleet:seed): seed this holding master from the named backup's copy. */
 export function fleetSeedConfirm(nodeId: string, confirm: boolean): { success: boolean; needsConfirm?: boolean; error?: string } {
   return confirmSeed(nodeId, confirm);
+}
+
+let coWorkerTransfer: ((op: string, data: any) => Promise<any>) | null = null;
+
+/**
+ * The planned transfer's steps on the designated backup (B4f-4, IPC
+ * fleet:transfer): the retire's start, status and abort over the control
+ * link, the handover on a one-shot socket. Co-worker only.
+ */
+export async function fleetTransfer(op: string, data: any): Promise<any> {
+  if (!coWorkerTransfer) return { success: false, error: 'This node is not a co-worker (its bot is restarting, or still initializing)', notReady: true };
+  return coWorkerTransfer(op, data);
 }
 
 let heldCopyDrop: (() => { success: boolean; error?: string }) | null = null;
@@ -598,6 +612,7 @@ async function runStaleMasterFence(
   stagedTakeover: boolean,
   storeDeadPeer: string | null,
   standIn = false,
+  transferPeer: string | null = null,
 ): Promise<FollowerHoldBase | null> {
   if (standalone) return null;
   // Only the operator's env confirm skips this fence. A takeover a promote
@@ -649,7 +664,7 @@ async function runStaleMasterFence(
     }
     return null;
   }
-  if (stagedTakeover) console.warn(`[Fleet] Takeover staged by a promote: keeping the peer half of the stale-master fence (a live holder invalidates the decision${storeDeadPeer ? `; node ${storeDeadPeer.slice(0, 8)}, superseded with its database dead, may answer at this node's own term` : ''}) and only fresh beacons in the witness half`);
+  if (stagedTakeover) console.warn(`[Fleet] Takeover staged by a promote: keeping the peer half of the stale-master fence (a live holder invalidates the decision${storeDeadPeer ? `; node ${storeDeadPeer.slice(0, 8)}, superseded with its database dead, may answer at this node's own term` : ''}${transferPeer ? `; node ${transferPeer.slice(0, 8)}, the master a planned transfer moved the fleet off, may answer below this node's term` : ''}) and only fresh beacons in the witness half`);
   const secret = (process.env.CONTROL_SECRET || '').trim();
   const { urls: candidates } = effectiveMasterUrls();
   const token = (process.env.DISCORD_TOKEN || '').trim();
@@ -820,6 +835,12 @@ async function runStaleMasterFence(
       // as a live master falsifies the dead-master premise and is the fence.
       if (peer.term < localTerm) {
         if (!fileSeeded) continue;
+        // A planned transfer's old master (B4f-4) handed over and waits,
+        // deposed, for this boot's beacon, so it answers below this term.
+        if (transferPeer !== null && peer.nodeId === transferPeer) {
+          console.warn(`[Fleet] Stale-master fence: ${url} is the master this planned transfer moved the fleet off (term ${peer.term}); proceeding, it steps down on this node's beacon`);
+          continue;
+        }
         await park(peer.term, url, peer.nodeId, `${url} answers as a live master on term ${peer.term} while this node's store holds ${localTerm}; in file mode terms are per node, so a live master is the fence whatever the numbers`);
       }
       // 20.12 c3: the promote saw this master alive with its DATABASE dead and
@@ -865,7 +886,7 @@ async function runStaleMasterFence(
   // promote decided over it boots (the verdict refused while one was fresh),
   // so the takeover passes here; a master that came back meanwhile parks it.
   if (fileSeeded && claims) {
-    const live = claims.find(c => c.nodeId !== selfNodeId && c.role === 'master' && Date.now() - c.observedAt <= WITNESS_FRESH_WINDOW_MS);
+    const live = claims.find(c => c.nodeId !== selfNodeId && !(c.nodeId === transferPeer && c.term < localTerm) && c.role === 'master' && Date.now() - c.observedAt <= WITNESS_FRESH_WINDOW_MS);
     if (live) {
       await park(live.term, `witness beacon of ${live.nodeName}`, live.nodeId, `${live.nodeName} (${live.nodeId.slice(0, 8)}) beacons as a live master at term ${live.term} while this node's store holds ${localTerm}; in file mode terms are per node, so a live master's fresh beacon is the fence whatever the numbers`);
     }
@@ -1347,7 +1368,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   // the returning master's and higherTermClaim is strictly-greater; the pre-arm
   // contestedTerm check is what covers an undialable one.
   const stagedTakeover = bootOverride?.takeover === true && !stagedSuperseded;
-  const followerHold = await runStaleMasterFence(store, nodeId, nodeName, standalone, envConfirm, stagedTakeover, stagedTakeover ? bootOverride?.supersededStoreDead ?? null : null, serveOnly);
+  const followerHold = await runStaleMasterFence(store, nodeId, nodeName, standalone, envConfirm, stagedTakeover, stagedTakeover ? bootOverride?.supersededStoreDead ?? null : null, serveOnly, stagedTakeover ? bootOverride?.transferFrom ?? null : null);
   if (followerHold) {
     clearSuperseded();
     if (store instanceof PostgresControlStore) await store.close();
@@ -2926,6 +2947,35 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       if (refusedRegistrations.length > LOSS_LOG_CAP) refusedRegistrations.shift();
       return { accepted: false, term: registry.term, reason };
     };
+    // The planned transfer (B4f-4, file mode) is asked by the designated
+    // backup alone, by this master's own record of the designation and in
+    // the operator's order, as the mirror is served.
+    const transferRefusal = (requester: string): string | null => {
+      if (resolveDataBackend() !== 'file' || store instanceof PostgresControlStore) return 'this master is not in file mode; the postgres transfer fences the database instead';
+      if (controlFenced) return 'this master is deposed';
+      if (standIn) return 'this node stands in for the master; a stand-in hands back, it is not transferred';
+      const first = fleetConfig ? [...fleetConfig.backupDesignations].sort((a, b) => a.priority - b.priority)[0] : undefined;
+      if (!first || first.nodeId !== requester) return 'the asking node is not this master\'s designated backup (the first in the backup order)';
+      const node = registry.nodes.get(requester);
+      if (!node || !node.connected) return 'the asking node is not registered with this master';
+      if (node.capabilities?.dataBackend !== 'file') return `the asking node reports the ${node.capabilities?.dataBackend ?? 'unknown'} data backend`;
+      if (paused) return 'the reshard pause is active; the transfer waits until it ends';
+      return null;
+    };
+    // Its handover deposes this master through the supersession below:
+    // granting stops, every worker is dropped, the co-worker role staged.
+    const transferAuthority = new TransferAuthority({
+      selfNodeId: nodeId,
+      selfNodeName: nodeName,
+      getTerm: () => registry.term,
+      refusal: transferRefusal,
+      heldShards: () => registry.shardIdsOf(nodeId),
+      nodeName: id => registry.nodes.get(id)?.nodeName ?? null,
+      coordinator: () => coordinator,
+      documents: () => placementDocuments(),
+      deposed: () => controlFenced,
+      handOver: by => beginSupersession?.(by, 'step-down'),
+    });
     syncAuthority = new SyncAuthority({
       getTerm: () => registry.term,
       listWorkers: () => [...registry.nodes.values()]
@@ -2934,21 +2984,24 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       pushToNode: (pushNodeId, statePayload) => server!.request(pushNodeId, MSG.SYNC_STATE, statePayload),
     });
     masterSyncBump = scope => syncAuthority!.bump(scope);
+    // The placement documents as the control store holds them now, for the
+    // mirror's listing and the planned transfer's handover (B4f-4).
+    const placementDocuments = async (): Promise<{ name: string; body: string }[]> => {
+      const [plan, persistedRegistry, config] = await Promise.all([store.loadPlan(), store.loadRegistry(), store.loadFleetConfig()]);
+      // Both exist on a serving master, so null is a failed read (the file
+      // store reads every error as null): the listing aborts, the copy stays.
+      if (!plan || !config) throw new Error('control store documents unavailable');
+      return [
+        { name: 'leases.json', body: JSON.stringify(plan, null, 2) },
+        { name: 'registry.json', body: JSON.stringify(persistedRegistry, null, 2) },
+        { name: 'fleet-config.json', body: JSON.stringify(config, null, 2) },
+      ];
+    };
     mirrorAuthority = new MirrorAuthority({
       nodeId,
       nodeName,
       getTerm: () => registry.term,
-      documents: async () => {
-        const [plan, persistedRegistry, config] = await Promise.all([store.loadPlan(), store.loadRegistry(), store.loadFleetConfig()]);
-        // Both exist on a serving master, so null is a failed read (the file
-        // store reads every error as null): the listing aborts, the copy stays.
-        if (!plan || !config) throw new Error('control store documents unavailable');
-        return [
-          { name: 'leases.json', body: JSON.stringify(plan, null, 2) },
-          { name: 'registry.json', body: JSON.stringify(persistedRegistry, null, 2) },
-          { name: 'fleet-config.json', body: JSON.stringify(config, null, 2) },
-        ];
-      },
+      documents: placementDocuments,
     });
 
     // Migration subsystem (fleet master only; never constructed standalone).
@@ -3242,6 +3295,8 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
         })();
         return { ok: true };
       },
+      onTransferRequest: (requester, type, data) => transferAuthority.request(requester, type, data),
+      onTransferHandover: data => transferAuthority.handover(data),
       onRegister: (payload: RegisterPayload, send): RegisterResult => {
         // Deposed: refuse with the reason the client treats as
         // advance-to-next-candidate, so redialing workers find the live master.
@@ -4567,6 +4622,31 @@ async function initCoWorker(init: CommonInit, followerHold: FollowerHoldBase | n
       };
     }
   }
+
+  // The planned transfer (B4f-4): this designated backup asks the master to
+  // retire every shard it holds onto it and follows that retire over the
+  // control link; the handover rides a one-shot socket to the master's URL
+  // the engine recorded, which a deposed master still answers.
+  coWorkerTransfer = async (op: string, data: any): Promise<any> => {
+    if (op === 'handover') {
+      const url = typeof data?.url === 'string' ? data.url : '';
+      const term = Number(data?.term);
+      if (url === '' || !Number.isInteger(term) || secret === '') return { success: false, error: 'the handover needs the master\'s control URL, the term this node mints and CONTROL_SECRET' };
+      const reply = await requestHandover(url, secret, { nodeId, nodeName, term }, TRANSFER_HANDOVER_TIMEOUT_MS);
+      if (!reply) return { success: false, answered: false, error: `the master at ${url} did not answer the handover within ${Math.round(TRANSFER_HANDOVER_TIMEOUT_MS / 1000)}s (unreachable, or busy)` };
+      return reply.ok === true ? { ...reply, success: true } : { success: false, answered: true, error: reply.error ?? 'refused', ...(Array.isArray(reply.heldShards) ? { heldShards: reply.heldShards } : {}) };
+    }
+    const type = op === 'start' ? MSG.TRANSFER_START : op === 'status' ? MSG.TRANSFER_STATUS : op === 'abort' ? MSG.TRANSFER_ABORT : null;
+    if (!type) return { success: false, error: `unknown transfer step: ${op}` };
+    if (!controlClient || !controlClient.masterKnown()) return { success: false, error: 'this node is not registered with a master', notReady: true };
+    const masterNodeId = controlClient.getMasterNodeId();
+    try {
+      const reply = await controlClient.syncRequest(type, { ...(data ?? {}), term: controlClient.getTerm() });
+      return reply?.ok === true ? { ...reply, success: true, masterNodeId } : { success: false, error: reply?.error ?? reply?.reason ?? 'no answer', masterNodeId };
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : String(error), masterNodeId };
+    }
+  };
 
   // The retire reading of a superseded side (B4f-2): the guild copies this node
   // stamped before the fleet moved on and does not hold, judged against the

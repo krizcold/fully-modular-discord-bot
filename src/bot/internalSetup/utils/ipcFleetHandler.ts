@@ -18,6 +18,7 @@ import {
   fleetRetireStaleCopies,
   fleetSeedConfirm,
   fleetDropHeldCopy,
+  fleetTransfer,
   fleetSetConfig,
   fleetSyncBump,
   fleetDevCorruptLease,
@@ -158,6 +159,10 @@ export function setupFleetIPCHandlers(): void {
         }
         case 'fleet:mirror:drop': {
           response = fleetDropHeldCopy();
+          break;
+        }
+        case 'fleet:transfer': {
+          response = await fleetTransfer(String(message.data?.op ?? ''), message.data?.data ?? {});
           break;
         }
         case 'fleet:seed': {

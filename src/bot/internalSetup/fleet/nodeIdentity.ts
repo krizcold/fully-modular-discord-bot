@@ -31,6 +31,12 @@ export interface RoleOverride {
    */
   supersededStoreDead?: string;
   /**
+   * The master a planned transfer moved the fleet off (B4f-4, file mode): it
+   * handed over and waits, deposed, for this boot's beacon, so it is the one
+   * peer the boot fence lets answer as live below this node's term. One-shot.
+   */
+  transferFrom?: string;
+  /**
    * Boot as a TEMPORARY stand-in (20.5): serve from a database still in
    * recovery, at the term already in the replayed row, and keep the backup
    * identity throughout. Unlike the takeover flags this is NOT one-shot: it
@@ -75,6 +81,7 @@ export function readRoleOverride(): RoleOverride | null {
         ...(parsed.takeover === true ? { takeover: true } : {}),
         ...(parsed.chainTakeover === true ? { chainTakeover: true } : {}),
         ...(typeof parsed.supersededStoreDead === 'string' && parsed.supersededStoreDead !== '' ? { supersededStoreDead: parsed.supersededStoreDead } : {}),
+        ...(typeof parsed.transferFrom === 'string' && parsed.transferFrom !== '' ? { transferFrom: parsed.transferFrom } : {}),
         ...(parsed.standIn === true ? { standIn: true } : {}),
         setAt: Number(parsed.setAt) || 0,
         setBy: toSetBy(parsed.setBy),

@@ -135,6 +135,8 @@ export class MigrationCoordinator {
   private history: MigrationRecord[] = [];
   private live = new Map<string, LegLive>(); // legId -> live
   private paused = false; // retire pause (Resume/Abort-remaining)
+  // The running leg's abort ends the whole retire instead of pausing it (B4f-4: the planned transfer's Cancel).
+  private abortWholeRetire = false;
   private drainRan = false; // true once a drain revoked leases (abort rollback re-grants the source)
   // Shards fenced OFF the free pool for the whole in-flight window (DRAINING
   // through GRANTING or abort-rollback). The free-shard distributor consults
@@ -460,7 +462,7 @@ export class MigrationCoordinator {
     return { ok: true, migrationId: rec.id };
   }
 
-  async abort(migrationId: string): Promise<{ ok: boolean; error?: string }> {
+  async abort(migrationId: string, wholeRetire = false): Promise<{ ok: boolean; error?: string }> {
     if (!this.record || this.record.id !== migrationId) return { ok: false, error: 'no such active migration' };
     if (this.record.state === 'COMMITTING' || this.record.state === 'GRANTING') {
       return { ok: false, error: 'commit already decided' };
@@ -470,8 +472,29 @@ export class MigrationCoordinator {
       await this.finish('ABORTED', 'retire aborted; completed legs stand');
       return { ok: true };
     }
+    if (wholeRetire && this.parentRecord && this.parentRecord.kind === 'retire') this.abortWholeRetire = true;
     await this.enterAborting('operator abort');
     return { ok: true };
+  }
+
+  /**
+   * The active retire read across its single-leg slices (B4f-4: the planned
+   * transfer follows the master's retire of itself): the parent record's
+   * legs and pause, the running leg's state.
+   */
+  activeRetire(): { id: string; state: string; paused: boolean; legs: { shardId: number; from: string; to: string; done: boolean }[]; currentLegIndex: number; error?: string } | null {
+    const parent = this.parentRecord ?? this.record;
+    if (!parent || parent.kind !== 'retire' || isTerminal(parent.state)) return null;
+    const running = this.record && this.record !== parent ? this.record : null;
+    const error = running?.error ?? parent.error;
+    return {
+      id: parent.id,
+      state: running ? running.state : parent.state,
+      paused: this.paused,
+      legs: parent.legs.map(l => ({ shardId: l.shardId, from: l.sourceNodeId, to: l.targetNodeId, done: l.legState === 'DONE' })),
+      currentLegIndex: parent.currentLegIndex ?? 0,
+      ...(error ? { error } : {}),
+    };
   }
 
   async resume(migrationId: string): Promise<{ ok: boolean; error?: string }> {
@@ -1132,6 +1155,11 @@ export class MigrationCoordinator {
         return;
       }
       const ok = await this.runSingleLegMove(leg, idx);
+      if (!ok && this.abortWholeRetire) {
+        this.abortWholeRetire = false;
+        await this.finish('ABORTED', 'retire aborted; completed legs stand');
+        return;
+      }
       if (!ok) {
         // The single-leg move aborted safely (data intact on source). Pause.
         this.paused = true;

@@ -8,13 +8,13 @@ import { dataPath } from '../../../utils/dataRoot';
 import { FLEET_DIR } from './constants';
 import { atomicWriteFileSync } from './fileControlStore';
 
-export type PromotePhase = 'verdict' | 'claim' | 'fence' | 'catchup' | 'promote' | 'adopt' | 'pin' | 'seed' | 'restart' | 'done';
-/** The store the phases work on: postgres (claim, fence, catch-up, promote) or file (adopt, pin, seed; B4f-2). */
+export type PromotePhase = 'verdict' | 'claim' | 'fence' | 'catchup' | 'promote' | 'retire' | 'handover' | 'adopt' | 'pin' | 'seed' | 'restart' | 'done';
+/** The store the phases work on: postgres (claim, fence, catch-up, promote) or file (adopt, pin, seed; B4f-2; a transfer's retire and handover, B4f-4). */
 export type PromoteBackend = 'postgres' | 'file';
 /** stand-in: a serving stand-in's copy takes the fleet's writes (20.5, B6 map F2); it keeps its backup identity. */
 export type PromoteMode = 'transfer' | 'failover' | 'stand-in';
 
-const PHASES: PromotePhase[] = ['verdict', 'claim', 'fence', 'catchup', 'promote', 'adopt', 'pin', 'seed', 'restart', 'done'];
+const PHASES: PromotePhase[] = ['verdict', 'claim', 'fence', 'catchup', 'promote', 'retire', 'handover', 'adopt', 'pin', 'seed', 'restart', 'done'];
 
 export interface PromoteRecord {
   phase: PromotePhase;
@@ -54,6 +54,16 @@ export interface PromoteRecord {
   holdSince: number | null;
   /** The decision found this copy already out of recovery: a lane's own promoted database, still holding what that lane took (B6-j). */
   promotedCopy: boolean;
+  /** A file-mode transfer (B4f-4): the control URL of the master it moves the fleet off, which the handover dials. */
+  transferMasterUrl?: string | null;
+  /** The master's retire migration this transfer follows; null while none was started (or the master held no shard). */
+  transferMigrationId?: string | null;
+  /** How the retire stands, as the master last answered. */
+  transferNote?: string | null;
+  /** When the handover was first asked: from then the master may have deposed itself unheard, so only Continue is left. */
+  handoverSentAt?: number | null;
+  /** When the master answered the handover; past it the master is deposed and only Continue is left. */
+  handoverAt?: number | null;
 }
 
 const recordFile = () => dataPath('global', FLEET_DIR, 'promote.json');
@@ -85,6 +95,11 @@ export function readPromoteRecord(): PromoteRecord | null {
       lineageVerdict: typeof parsed.lineageVerdict === 'string' ? parsed.lineageVerdict : null,
       holdSince: Number.isFinite(parsed.holdSince) ? Number(parsed.holdSince) : null,
       promotedCopy: parsed.promotedCopy === true,
+      transferMasterUrl: typeof parsed.transferMasterUrl === 'string' && parsed.transferMasterUrl !== '' ? parsed.transferMasterUrl : null,
+      transferMigrationId: typeof parsed.transferMigrationId === 'string' && parsed.transferMigrationId !== '' ? parsed.transferMigrationId : null,
+      transferNote: typeof parsed.transferNote === 'string' ? parsed.transferNote : null,
+      handoverSentAt: Number.isFinite(parsed.handoverSentAt) ? Number(parsed.handoverSentAt) : null,
+      handoverAt: Number.isFinite(parsed.handoverAt) ? Number(parsed.handoverAt) : null,
     };
   } catch {
     return null;
