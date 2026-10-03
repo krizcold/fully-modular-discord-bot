@@ -291,6 +291,16 @@ export class Registry {
     }
   }
 
+  /** The node's pending grants among shardIds, held as its leases (frozen while it is not connected). */
+  holdPendingAsLeases(nodeId: string, shardIds: number[]): void {
+    for (const shardId of shardIds) {
+      const pending = this.pendingConfirmation.get(shardId);
+      if (pending?.nodeId !== nodeId) continue;
+      this.shardTable.set(shardId, { shardId, nodeId, leaseId: pending.leaseId, term: pending.term, epoch: pending.epoch });
+      this.pendingConfirmation.delete(shardId);
+    }
+  }
+
   clearPendingForNode(nodeId: string): void {
     for (const [shardId, pending] of this.pendingConfirmation) {
       if (pending.nodeId === nodeId) this.pendingConfirmation.delete(shardId);
@@ -342,8 +352,7 @@ export class Registry {
         // Target vanished mid-pending: adopt it as that node's (now frozen)
         // lease so Wait mode holds it until Declare Lost, rather than granting
         // a maybe-identified shard to someone else.
-        this.shardTable.set(shardId, { shardId, nodeId: pending.nodeId, leaseId: pending.leaseId, term: pending.term, epoch: pending.epoch });
-        this.pendingConfirmation.delete(shardId);
+        this.holdPendingAsLeases(pending.nodeId, [shardId]);
         continue;
       }
       if (node.lastHeartbeatAt === null || node.lastHeartbeatAt <= pending.grantedAt) continue;

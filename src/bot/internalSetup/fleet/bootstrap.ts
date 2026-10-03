@@ -97,7 +97,7 @@ import { setLeaseDeclineHandler } from '../utils/dataBackends/dataReadiness';
 import { applyRouteOverrides, currentRouteDefault } from '../utils/dataBackends/routeResolver';
 import { loadCredentials, resolveDataBackend, upsertCredentials } from '../../../utils/envLoader';
 import { MigrationDisposition, resolveIncomingWithMaster, resumeSourceGraveyarding, runResidueSweep } from './migration/residueSweep';
-import { MigrationCoordinator, PrecheckResult, StartPayload } from './migration/migrationCoordinator';
+import { MigrationCoordinator, PrecheckResult, StartPayload, legsPastCommit } from './migration/migrationCoordinator';
 import { MigrationExecutor } from './migration/migrationExecutor';
 import { TransformationCoordinator } from './transformation/transformationCoordinator';
 import { TransformationExecutor } from './transformation/transformationExecutor';
@@ -1603,6 +1603,13 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       if (persistedNode.nodeId === nodeId) continue;
       registry.restoreNode(persistedNode);
     }
+    // A leg past its commit decision was drained off its source before the
+    // restart: the recovered migration grants it to the target, so neither
+    // the self-grant nor a register re-grant may hand it back to the source.
+    const persistedMigrations = await standInGuard('reading the persisted migration', () => store.loadMigrations());
+    for (const leg of legsPastCommit(persistedMigrations.active)) {
+      if (registry.shardTable.get(leg.shardId)?.nodeId === leg.sourceNodeId) registry.shardTable.delete(leg.shardId);
+    }
     const selfShardIds = registry.shardIdsOf(nodeId);
     if (selfShardIds.length > 0) {
       registry.epoch += 1;
@@ -3098,7 +3105,15 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       grantShardsTo: async (targetNodeId, fullShardIds, epoch) => {
         const node = registry.nodes.get(targetNodeId);
         if (!node) return { ok: false, pending: false };
-        return grantShardsTo(node, fullShardIds, epoch);
+        const result = await grantShardsTo(node, fullShardIds, epoch);
+        // A recovered grant reaches a target not yet re-registered, and the
+        // pending reconcile waits out the grace, so a register inside it would
+        // find the shard nowhere and free it: a target still registered and not
+        // connected holds its stamp as its frozen lease now, as that reconcile
+        // would (it drops the stamps of a node Declared Lost meanwhile).
+        const targetNow = registry.nodes.get(targetNodeId);
+        if (result.pending && targetNow && !targetNow.connected) registry.holdPendingAsLeases(targetNodeId, fullShardIds);
+        return result;
       },
       revokeLease: async (targetNodeId, leaseIds, reason) => {
         if (registry.nodes.get(targetNodeId)?.isSelf) {

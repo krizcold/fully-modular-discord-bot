@@ -49,6 +49,19 @@ export interface StartRetirePayload { kind: 'retire'; nodeId: string; targets: R
 export interface StartRedistributePayload { kind: 'redistribute'; }
 export type StartPayload = StartMovePayload | StartSwapPayload | StartRetirePayload | StartRedistributePayload;
 
+/**
+ * The legs of a persisted record past their commit decision: each one's drain
+ * took the shard off its source, which the plan on disk names until the grant.
+ */
+export function legsPastCommit(rec: MigrationRecord | null): MigrationLeg[] {
+  if (!rec || rec.kind === 'redistribute') return [];
+  if (rec.kind === 'retire') {
+    const leg = rec.legs[rec.currentLegIndex ?? 0];
+    return leg && (leg.legState === 'COMMITTING' || leg.legState === 'GRANTING') ? [leg] : [];
+  }
+  return rec.state === 'COMMITTING' || rec.state === 'GRANTING' ? rec.legs : [];
+}
+
 export interface PrecheckResult {
   ok: boolean;
   error?: string;
