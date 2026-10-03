@@ -240,7 +240,7 @@ export function noteGuildsCommittedHere(guildIds: string[]): void {
     }
     for (const guildId of ids) fs.rmSync(mirrorGuildDir(guildId), { recursive: true, force: true });
     activeEngine?.forgetGuilds(ids, at);
-    if (dropped.length > 0) console.log(`[Fleet] Mirror: guild(s) ${dropped.join(', ')} committed onto this node by a migration leave the copy (the live data is the newest); no seed is offered from the copy until its next pass`);
+    if (dropped.length > 0) console.log(`[Fleet] Mirror: guild(s) ${dropped.join(', ')} committed onto this node by a migration leave the copy (the live data is the newest); no seed is offered from the copy until a complete pass listed while the master's plan is settled`);
   } catch (error) {
     console.warn('[Fleet] Mirror: dropping guilds a migration committed here from the copy failed; the next pass trims them:', error instanceof Error ? error.message : error);
   }
@@ -264,9 +264,8 @@ export class MirrorEngine {
     activeEngine = this;
   }
 
-  /** The in-memory copy forgets guilds a migration committed here; a pass running drops them as it writes. */
+  /** The in-memory copy forgets guilds a migration committed here, at once and mid-pass alike; a pass running also leaves them out of what it writes. */
   forgetGuilds(guildIds: string[], at: number): void {
-    if (this.running) return;
     const next = { ...this.manifest, guilds: { ...this.manifest.guilds }, frozen: this.manifest.frozen.filter(guildId => !guildIds.includes(guildId)), droppedAt: at };
     for (const guildId of guildIds) delete next.guilds[guildId];
     this.manifest = next;
@@ -633,8 +632,9 @@ export class MirrorEngine {
     }
 
     const complete = failures === 0;
-    // A complete pass begun after the last commit makes the copy whole again.
-    if (complete && next.droppedAt != null && next.droppedAt < passStartedAt) next.droppedAt = null;
+    // A complete pass begun after the last commit, listed while the master's
+    // plan was settled (it then places what moved), makes the copy whole again.
+    if (complete && listing.placementPending === false && next.droppedAt != null && next.droppedAt < passStartedAt) next.droppedAt = null;
     if (complete) {
       next.completedAt = Date.now();
       next.revision = Number.isInteger(listing.revision) ? listing.revision : null;

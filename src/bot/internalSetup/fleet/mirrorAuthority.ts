@@ -39,6 +39,8 @@ export interface MirrorAuthorityHooks {
    * files under /data/global/fleet, so the files are never read for this.
    */
   documents: () => Promise<{ name: string; body: string }[]>;
+  /** Whether this master's stored plan may not place every shard as it serves them. */
+  placementPending: () => boolean;
 }
 
 function sha256Of(bytes: Buffer): string {
@@ -112,11 +114,14 @@ export class MirrorAuthority {
     return this.revision;
   }
 
-  /** Single-flight: a listing already running answers every concurrent caller. */
+  /**
+   * Single-flight: a listing already running answers every concurrent caller.
+   * One that joins it reads the plan as pending: that listing began before
+   * its request, so it says nothing of the plan since.
+   */
   list(): Promise<MirrorListReply> {
-    if (!this.listing) {
-      this.listing = this.buildListing().finally(() => { this.listing = null; });
-    }
+    if (this.listing) return this.listing.then(listing => ({ ...listing, placementPending: true }));
+    this.listing = this.buildListing().finally(() => { this.listing = null; });
     return this.listing;
   }
 
@@ -175,6 +180,9 @@ export class MirrorAuthority {
   }
 
   private async buildListing(): Promise<MirrorListReply> {
+    // Read first: a plan settled before this point is what the documents
+    // read below hold.
+    const placementPending = this.hooks.placementPending();
     const guilds: MirrorGuildEntry[] = [];
     const frozen: string[] = [];
     const keep = new Set<string>();
@@ -250,6 +258,7 @@ export class MirrorAuthority {
       guilds,
       frozen,
       documents,
+      placementPending,
     };
   }
 

@@ -1312,7 +1312,7 @@ function FleetPromoteCard({ api, fleet, reload }) {
       {order.length > 1 && (
         <div className="usage-stat-sub" style={{ marginTop: '4px', color: preferred.length ? '#d29922' : undefined }}>
           {`Backup order: ${order.map((d) => `${d.priority}. ${nameOf(d.nodeId)}`).join(', ')}.`}
-          {mine ? (preferred.length
+          {mine && !(fileMode && !masterDown) ? (preferred.length
             ? ` ${nameOf(preferred[0].nodeId)} ranks above this node and its beacon is fresh, so it is the preferred stand-in; promoting here is still your call.`
             : witnessRead
               ? ' No higher-ranked backup is beaconing; this node is the preferred stand-in.'
@@ -1335,14 +1335,22 @@ function FleetPromoteCard({ api, fleet, reload }) {
         <button onClick={() => run(false)} disabled={busy} style={{ marginTop: '6px' }}>
           {busy ? 'Working...' : 'Promote to master'}
         </button>
-      ) : fileMode ? (
+      ) : fileMode ? (order.length === 0 || order[0].nodeId !== fleet.nodeId ? (
+        <div className="usage-stat-sub" style={{ marginTop: '6px', color: '#d29922' }}>
+          {order.length === 0
+            ? 'The master transfers only to the first backup in its order, and the order is empty; this node joins it when it next registers, then a transfer can start here.'
+            : mine
+              ? `File mode keeps one designated backup, and the master transfers only to the first in its list (${nameOf(order[0].nodeId)} now); to transfer here, remove every other node from the backup list on the master's Fleet tab config card, so this node is its only entry (and take backup-master out of their env, or they ask again when they reconnect).`
+              : `File mode mirrors the guild data to one designated backup, ${nameOf(order[0].nodeId)} now, and the master transfers only to it. To transfer here, this node must hold that slot: on the master's Fleet tab config card, remove every node from the backup list (and take backup-master out of their env), then check the list names this node, since the master gives the freed slot to one connected node that asked for it.`}
+        </div>
+      ) : (
         <div style={{ marginTop: '6px' }}>
           <button onClick={() => run(false)} disabled={busy}>
             {busy ? 'Working...' : 'Transfer master here'}
           </button>
           <div className="usage-stat-sub" style={{ marginTop: '4px' }}>In file mode the transfer is also the retire of the old master: each guild's copy there goes to its graveyard once this node holds it.</div>
         </div>
-      ) : (
+      )) : (
         <div style={{ marginTop: '6px' }}>
           <button onClick={() => run(false)} disabled={busy}>
             {busy ? 'Working...' : 'Transfer master here'}

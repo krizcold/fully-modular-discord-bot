@@ -97,11 +97,13 @@ export class MigrationExecutor {
   // master's control-server term gate accepts them (split-brain fencing).
   private currentTerm = 0;
 
+  private readonly commitsInFlight = new Set<string>();
+
   constructor(private readonly hooks: ExecutorHooks) {}
 
-  /** Whether any leg runtime is live on this node (gates the periodic staging resolver). */
+  /** Whether any leg runtime is live or a commit runs on this node (gates the periodic staging resolver). */
   hasActiveLegs(): boolean {
-    return this.legs.size > 0;
+    return this.legs.size > 0 || this.commitsInFlight.size > 0;
   }
 
   /** Route a control frame from the master. Returns the ack payload (idempotent). */
@@ -442,44 +444,53 @@ export class MigrationExecutor {
   private async onCommit(payload: XferCommitPayload): Promise<any> {
     let allDone = true;
     for (const legId of payload.legIds) {
-      const leg = this.legs.get(legId);
-      if (!leg) {
-        // No in-memory runtime (crash/restart, or the runtime was released).
-        if (payload.sourceCleanup) {
-          // This is a SOURCE leg retried against a restarted source: it has no
-          // _incoming staging (only targets stage), so commitFromStaging is a
-          // no-op here. Run the source graveyard + unfreeze directly from the
-          // payload's guild list. Ack ok ONLY when it genuinely completed, so a
-          // restarted source cannot false-ack an untouched cleanup (which would
-          // leave its originals write-frozen forever while the master records
-          // the cleanup done). Idempotent: re-graveyarding an already-gone guild
-          // and unfreezing an already-unfrozen guild are both no-ops.
-          const ok = await commitSourceGuilds(payload.migrationId, payload.guilds ?? []);
-          if (!ok) allDone = false;
+      // One commit of a leg at a time, never joined: a re-send while one
+      // runs (a remote round gives up at 10 s, the retry tick) is answered
+      // not done, and the next tick asks again once it has finished.
+      if (this.commitsInFlight.has(legId)) { allDone = false; continue; }
+      this.commitsInFlight.add(legId);
+      try {
+        const leg = this.legs.get(legId);
+        if (!leg) {
+          // No in-memory runtime (crash/restart, or the runtime was released).
+          if (payload.sourceCleanup) {
+            // This is a SOURCE leg retried against a restarted source: it has no
+            // _incoming staging (only targets stage), so commitFromStaging is a
+            // no-op here. Run the source graveyard + unfreeze directly from the
+            // payload's guild list. Ack ok ONLY when it genuinely completed, so a
+            // restarted source cannot false-ack an untouched cleanup (which would
+            // leave its originals write-frozen forever while the master records
+            // the cleanup done). Idempotent: re-graveyarding an already-gone guild
+            // and unfreezing an already-unfrozen guild are both no-ops.
+            const ok = await commitSourceGuilds(payload.migrationId, payload.guilds ?? []);
+            if (!ok) allDone = false;
+            continue;
+          }
+          // Target with commit-intent staging on disk is finished idempotently
+          // from the staging manifest (also handled by the boot sweep).
+          await commitFromStaging(payload.migrationId, legId, payload.term, payload.epoch);
           continue;
         }
-        // Target with commit-intent staging on disk is finished idempotently
-        // from the staging manifest (also handled by the boot sweep).
-        await commitFromStaging(payload.migrationId, legId, payload.term, payload.epoch);
-        continue;
+        if (leg.committed) continue;
+        if (leg.direction === 'none') {
+          // Lease-only: nothing is staged and nothing is graveyarded. The target
+          // takes ownership at hydration after the grant; the source just drops
+          // its frozen-retained working sets.
+          if (leg.role === 'source') {
+            const ws = getWorkingSet();
+            for (const guildId of leg.guilds) ws?.evict(guildId);
+          }
+        } else if (leg.role === 'target') await this.commitTarget(leg, payload.term, payload.epoch);
+        else await this.commitSource(leg);
+        leg.committed = true;
+        // Release the runtime so the lazy listener can unbind; a retried commit
+        // lands in the no-runtime branch above, which is already idempotent.
+        try { leg.ws?.close(); } catch { /* closing */ }
+        this.legs.delete(legId);
+        this.tokens.delete(leg.token);
+      } finally {
+        this.commitsInFlight.delete(legId);
       }
-      if (leg.committed) continue;
-      if (leg.direction === 'none') {
-        // Lease-only: nothing is staged and nothing is graveyarded. The target
-        // takes ownership at hydration after the grant; the source just drops
-        // its frozen-retained working sets.
-        if (leg.role === 'source') {
-          const ws = getWorkingSet();
-          for (const guildId of leg.guilds) ws?.evict(guildId);
-        }
-      } else if (leg.role === 'target') await this.commitTarget(leg, payload.term, payload.epoch);
-      else await this.commitSource(leg);
-      leg.committed = true;
-      // Release the runtime so the lazy listener can unbind; a retried commit
-      // lands in the no-runtime branch above, which is already idempotent.
-      try { leg.ws?.close(); } catch { /* closing */ }
-      this.legs.delete(legId);
-      this.tokens.delete(leg.token);
     }
     this.maybeReleaseServer();
     return { ok: allDone, term: payload.term };
@@ -488,15 +499,22 @@ export class MigrationExecutor {
   private async commitTarget(leg: LegRuntime, term: number, epoch: number): Promise<void> {
     await this.writeManifest(leg, 'commit-intent');
     const legDir = incomingLegDir(leg.migrationId, leg.legId);
-    for (const guildId of leg.guilds) {
-      const staged = path.join(legDir, guildId);
-      if (!fs.existsSync(staged)) continue;
-      const live = path.join(DATA_ROOT, guildId);
-      if (fs.existsSync(live)) await deleteGuildNamespace(guildId, `migration-${leg.migrationId}-replaced`);
-      await fs.promises.rename(staged, live);
-      writeOwnerStamp(guildId, { shardId: leg.shardId, term, epoch });
-      // The copy this node may hold of the guild is older than what landed.
-      noteGuildsCommittedHere([guildId]);
+    // What landed leaves the copy this node may hold, which is older: noted
+    // once (one manifest write), also when a rename throws, and with the
+    // guilds a run before a crash renamed (their staging is gone).
+    const landed: string[] = [];
+    try {
+      for (const guildId of leg.guilds) {
+        const staged = path.join(legDir, guildId);
+        if (!fs.existsSync(staged)) { landed.push(guildId); continue; }
+        const live = path.join(DATA_ROOT, guildId);
+        if (fs.existsSync(live)) await deleteGuildNamespace(guildId, `migration-${leg.migrationId}-replaced`);
+        await fs.promises.rename(staged, live);
+        landed.push(guildId);
+        writeOwnerStamp(guildId, { shardId: leg.shardId, term, epoch });
+      }
+    } finally {
+      noteGuildsCommittedHere(landed);
     }
     try { await fs.promises.rm(legDir, { recursive: true, force: true }); } catch { /* best effort */ }
     // Non-recursive: only reaps the migration dir once its last leg is gone.
@@ -710,14 +728,19 @@ export async function commitFromStaging(migrationId: string, legId: string, term
   } catch { /* best effort */ }
   const guilds: string[] = Array.isArray(manifest?.guilds) ? manifest.guilds : [];
   const shardId = Number.isInteger(manifest?.shardId) ? manifest.shardId : 0;
-  for (const guildId of guilds) {
-    const staged = path.join(legDir, guildId);
-    if (!fs.existsSync(staged)) continue;
-    const live = path.join(DATA_ROOT, guildId);
-    if (fs.existsSync(live)) await deleteGuildNamespace(guildId, `migration-${migrationId}-replaced`);
-    await fs.promises.rename(staged, live);
-    writeOwnerStamp(guildId, { shardId, term, epoch });
-    noteGuildsCommittedHere([guildId]);
+  const landed: string[] = [];
+  try {
+    for (const guildId of guilds) {
+      const staged = path.join(legDir, guildId);
+      if (!fs.existsSync(staged)) { landed.push(guildId); continue; }
+      const live = path.join(DATA_ROOT, guildId);
+      if (fs.existsSync(live)) await deleteGuildNamespace(guildId, `migration-${migrationId}-replaced`);
+      await fs.promises.rename(staged, live);
+      landed.push(guildId);
+      writeOwnerStamp(guildId, { shardId, term, epoch });
+    }
+  } finally {
+    noteGuildsCommittedHere(landed);
   }
   try { await fs.promises.rm(legDir, { recursive: true, force: true }); } catch { /* best effort */ }
   // Non-recursive: only reaps the migration dir once its last leg is gone.

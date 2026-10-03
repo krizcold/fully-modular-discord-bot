@@ -201,37 +201,37 @@ export class MigrationCoordinator {
       return;
     }
     const state = leg.legState ?? 'PREPARING';
-    await new Promise<void>(resolve => {
-      const parent = rec;
-      this.parentRecord = parent;
-      const single: MigrationRecord = { ...parent, legs: [leg], state, epoch: parent.epoch };
-      this.record = single;
-      this.hydrateLive(single);
-      // Re-fence a committing/granting leg (shard already off the table) so
-      // distribute() cannot re-place it before the grant lands. DRAINING/
-      // VERIFYING revoked the source lease, so recovery-abort re-grants it back.
-      if (state === 'COMMITTING' || state === 'GRANTING') this.fenceShards([leg.shardId]);
-      if (state === 'DRAINING' || state === 'VERIFYING') this.drainRan = true;
-      this.finishHooks = (finalState: 'DONE' | 'ABORTED') => {
-        leg.legState = finalState;
-        // Same trailing-frame protection as runSingleLegMove's finishHooks.
-        this.live.delete(leg.legId);
-        if (finalState === 'ABORTED') { leg.error = single.error; parent.error = single.error; }
-        for (const entry of single.pendingSourceCleanup ?? []) {
-          for (const legId of entry.legIds) this.recordPendingSourceLeg(parent, entry.nodeId, legId);
-        }
-        parent.legs[idx] = leg;
-        this.record = parent;
-        this.parentRecord = null;
-        this.finishHooks = null;
-        resolve();
-        if (finalState === 'DONE') void this.runRetire();
-        else { this.paused = true; void this.persist().then(() => this.hooks.pushStatus()); }
-      };
-      if (state === 'COMMITTING') void this.enterCommitting(true);
-      else if (state === 'GRANTING') void this.enterGranting();
-      else void this.enterAborting('master restarted before commit decision');
-    });
+    // Not awaited: the leg finishes through finishHooks, which runs the rest
+    // of the retire; a recovery awaiting it would hold the master's boot
+    // while a target is down.
+    const parent = rec;
+    this.parentRecord = parent;
+    const single: MigrationRecord = { ...parent, legs: [leg], state, epoch: parent.epoch };
+    this.record = single;
+    this.hydrateLive(single);
+    // Re-fence a committing/granting leg (shard already off the table) so
+    // distribute() cannot re-place it before the grant lands. DRAINING/
+    // VERIFYING revoked the source lease, so recovery-abort re-grants it back.
+    if (state === 'COMMITTING' || state === 'GRANTING') this.fenceShards([leg.shardId]);
+    if (state === 'DRAINING' || state === 'VERIFYING') this.drainRan = true;
+    this.finishHooks = (finalState: 'DONE' | 'ABORTED') => {
+      leg.legState = finalState;
+      // Same trailing-frame protection as runSingleLegMove's finishHooks.
+      this.live.delete(leg.legId);
+      if (finalState === 'ABORTED') { leg.error = single.error; parent.error = single.error; }
+      for (const entry of single.pendingSourceCleanup ?? []) {
+        for (const legId of entry.legIds) this.recordPendingSourceLeg(parent, entry.nodeId, legId);
+      }
+      parent.legs[idx] = leg;
+      this.record = parent;
+      this.parentRecord = null;
+      this.finishHooks = null;
+      if (finalState === 'DONE') void this.runRetire();
+      else { this.paused = true; void this.persist().then(() => this.hooks.pushStatus()); }
+    };
+    if (state === 'COMMITTING') void this.enterCommitting(true);
+    else if (state === 'GRANTING') void this.enterGranting();
+    else void this.enterAborting('master restarted before commit decision');
   }
 
   private hydrateLive(rec: MigrationRecord): void {
@@ -276,10 +276,7 @@ export class MigrationCoordinator {
    */
   pendingSourceCleanupShardIds(): ReadonlySet<number> {
     const ids = new Set<number>();
-    const records: MigrationRecord[] = [];
-    const active = this.parentRecord ?? this.record;
-    if (active) records.push(active);
-    for (const h of this.history) records.push(h);
+    const records = this.cleanupRecords();
     for (const rec of records) {
       if (!rec.pendingSourceCleanup) continue;
       for (const entry of rec.pendingSourceCleanup) {
@@ -290,6 +287,33 @@ export class MigrationCoordinator {
       }
     }
     return ids;
+  }
+
+  /** The nodes a deferred source cleanup waits on, with the shards it covers. */
+  pendingSourceCleanups(): { nodeId: string; shardIds: number[] }[] {
+    const byNode = new Map<string, Set<number>>();
+    const records = this.cleanupRecords();
+    for (const rec of records) {
+      for (const entry of rec.pendingSourceCleanup ?? []) {
+        for (const legId of entry.legIds) {
+          const leg = rec.legs.find(l => l.legId === legId);
+          if (!leg) continue;
+          const ids = byNode.get(entry.nodeId) ?? new Set<number>();
+          ids.add(leg.shardId);
+          byNode.set(entry.nodeId, ids);
+        }
+      }
+    }
+    return [...byNode.entries()].map(([nodeId, ids]) => ({ nodeId, shardIds: [...ids].sort((a, b) => a - b) }));
+  }
+
+  /** The records a deferred source cleanup lives on: a retire's parent and its running slice, or the active one, and the history. */
+  private cleanupRecords(): MigrationRecord[] {
+    const records: MigrationRecord[] = [];
+    if (this.parentRecord) records.push(this.parentRecord);
+    if (this.record && this.record !== this.parentRecord) records.push(this.record);
+    for (const h of this.history) records.push(h);
+    return records;
   }
 
   private fenceShards(shardIds: number[]): void {
@@ -762,21 +786,35 @@ export class MigrationCoordinator {
   }
 
   /**
-   * A source that was unreachable at COMMITTING has reconnected: re-send the
-   * idempotent XFER_COMMIT so its originals are graveyarded. Scans the active
-   * record and history for a pending source matching this node. Called from the
-   * register/reconnect path.
+   * A source that missed its cleanup at COMMITTING (down then, or its commit
+   * outran the ack): re-send the idempotent XFER_COMMIT so its originals are
+   * graveyarded. Scans the records a cleanup lives on (cleanupRecords) for this
+   * node's owed legs. Called at the node's register, by the retry tick while it
+   * stays connected and owing, by a planned transfer's refusal, and for the
+   * master's own debt after its recovery.
    */
-  async retrySourceCleanup(nodeId: string): Promise<void> {
-    const records: MigrationRecord[] = [];
-    const active = this.parentRecord ?? this.record;
-    if (active) records.push(active);
-    for (const h of this.history) records.push(h);
+  retrySourceCleanup(nodeId: string): Promise<void> {
+    // One at a time per node (a register's and a transfer refusal's would
+    // race one entry): each runs after the one before it settles.
+    const run = (this.cleanupRuns.get(nodeId) ?? Promise.resolve()).then(() => this.runSourceCleanup(nodeId)).finally(() => this.rearmCleanup(nodeId));
+    const settled: Promise<void> = run.catch(() => undefined).then(() => {
+      if (this.cleanupRuns.get(nodeId) === settled) this.cleanupRuns.delete(nodeId);
+    });
+    this.cleanupRuns.set(nodeId, settled);
+    return run;
+  }
+
+  private readonly cleanupRuns = new Map<string, Promise<void>>();
+
+  private async runSourceCleanup(nodeId: string): Promise<void> {
+    const records = this.cleanupRecords();
     let changed = false;
     for (const rec of records) {
       const entry = rec.pendingSourceCleanup?.find(e => e.nodeId === nodeId);
       if (!entry || entry.legIds.length === 0) continue;
-      const stillPending: string[] = [];
+      // Only the legs this pass settles leave the entry: one recorded
+      // meanwhile (by a commit round, while a send here was awaited) stays.
+      const cleared = new Set<string>();
       for (const legId of entry.legIds) {
         // Thread the leg's guilds + the source-cleanup marker so a RESTARTED
         // source (empty in-memory legs Map, no _incoming staging) can still run
@@ -787,7 +825,6 @@ export class MigrationCoordinator {
         if (!leg) {
           // No leg in the record to name the guilds: cannot verify the cleanup,
           // so keep it pending rather than clearing it on a guild-less no-op.
-          stillPending.push(legId);
           continue;
         }
         // Ownership guard: if the shard was re-granted back to this same source
@@ -795,23 +832,49 @@ export class MigrationCoordinator {
         // the freed shard onto its old source), the source's /data copies are now
         // the live authoritative copies. Graveyarding them here would serve the
         // guild empty. Drop the pending leg silently WITHOUT graveyarding.
-        if (this.hooks.registry.shardTable.get(leg.shardId)?.nodeId === nodeId) continue;
+        if (this.hooks.registry.shardTable.get(leg.shardId)?.nodeId === nodeId) {
+          cleared.add(legId);
+          continue;
+        }
+        // A migration fences the shard, or a grant of it to this node awaits
+        // confirmation: what the node holds may be what that brought back, so
+        // the cleanup stays owed, unsent, until the shard settles.
+        if (this.migrating.has(leg.shardId) || this.hooks.registry.pendingConfirmation?.get(leg.shardId)?.nodeId === nodeId) continue;
         try {
           const ack = await this.hooks.sendControl(nodeId, MSG.XFER_COMMIT, {
             migrationId: rec.id, term: rec.term, epoch: rec.epoch ?? this.hooks.registry.epoch,
             legIds: [legId], sourceCleanup: true, guilds: leg.guilds,
           });
-          if (!ack?.ok) stillPending.push(legId);
+          if (ack?.ok) cleared.add(legId);
         } catch {
-          stillPending.push(legId);
+          // Unanswered: still owed, and asked again.
         }
       }
-      entry.legIds = stillPending;
-      rec.pendingSourceCleanup = rec.pendingSourceCleanup!.filter(e => e.legIds.length > 0);
+      entry.legIds = entry.legIds.filter(id => !cleared.has(id));
+      rec.pendingSourceCleanup = (rec.pendingSourceCleanup ?? []).filter(e => e.legIds.length > 0);
       if (rec.pendingSourceCleanup.length === 0) rec.pendingSourceCleanup = undefined;
       changed = true;
     }
     if (changed) await this.persist();
+  }
+
+  // Still owed by a node that is connected (answered not done while its
+  // commit ran, held while the shard settles, or the ask failed or threw):
+  // asked again after a retry tick.
+  private rearmCleanup(nodeId: string): void {
+    if (this.pendingSourceCleanups().some(owed => owed.nodeId === nodeId) && this.hooks.registry.nodes?.get(nodeId)?.connected) this.scheduleCleanupRetry(nodeId);
+  }
+
+  private readonly cleanupTimers = new Map<string, NodeJS.Timeout>();
+
+  private scheduleCleanupRetry(nodeId: string): void {
+    if (this.cleanupTimers.has(nodeId)) return;
+    const timer = setTimeout(() => {
+      this.cleanupTimers.delete(nodeId);
+      void this.retrySourceCleanup(nodeId).catch(() => undefined);
+    }, XFER_COMMIT_RETRY_MS);
+    timer.unref();
+    this.cleanupTimers.set(nodeId, timer);
   }
 
   private maybeAllVerified(): void {
@@ -880,58 +943,90 @@ export class MigrationCoordinator {
 
   private runCommitRound(): void {
     if (!this.record || this.record.state !== 'COMMITTING') { this.clearCommitTimer(); return; }
+    // One round per record at a time: a round outliving the retry tick (a
+    // slow commit) would ack beside the next, and both would enter GRANTING.
     const rec = this.record;
-    void (async () => {
-      let allTargets = true;
-      let allSources = true;
-      // Targets first.
-      for (const leg of rec.legs) {
-        if ((leg as any)._targetAcked) continue;
-        try {
-          const ack = await this.hooks.sendControl(leg.targetNodeId, MSG.XFER_COMMIT, {
-            migrationId: rec.id, term: rec.term, epoch: rec.epoch ?? this.hooks.registry.epoch, legIds: [leg.legId],
-          });
-          if (ack?.ok) (leg as any)._targetAcked = true;
-          else allTargets = false;
-        } catch {
-          // A down TARGET blocks here (its data is the product); retry next tick.
-          allTargets = false;
+    if (this.commitRoundFor === rec) return;
+    this.commitRoundFor = rec;
+    void this.commitRound(rec).finally(() => { if (this.commitRoundFor === rec) this.commitRoundFor = null; });
+  }
+
+  private commitRoundFor: MigrationRecord | null = null;
+
+  private async commitRound(rec: MigrationRecord): Promise<void> {
+    let allTargets = true;
+    let allSources = true;
+    // Targets first.
+    for (const leg of rec.legs) {
+      if ((leg as any)._targetAcked) continue;
+      try {
+        const ack = await this.hooks.sendControl(leg.targetNodeId, MSG.XFER_COMMIT, {
+          migrationId: rec.id, term: rec.term, epoch: rec.epoch ?? this.hooks.registry.epoch, legIds: [leg.legId],
+        });
+        if (ack?.ok) (leg as any)._targetAcked = true;
+        else allTargets = false;
+      } catch {
+        // A down TARGET blocks here (its data is the product); retry next tick.
+        allTargets = false;
+      }
+    }
+    if (!allTargets) return; // wait for the next retry; targets must all ack
+    // Sources next (graveyard originals). A down source does not block: it is
+    // recorded durably as pendingSourceCleanup and retried when it reconnects.
+    for (const leg of rec.legs) {
+      if ((leg as any)._sourceAcked) continue;
+      try {
+        const ack = await this.hooks.sendControl(leg.sourceNodeId, MSG.XFER_COMMIT, {
+          migrationId: rec.id, term: rec.term, epoch: rec.epoch ?? this.hooks.registry.epoch,
+          legIds: [leg.legId], sourceCleanup: true, guilds: leg.guilds,
+        });
+        if (ack?.ok) {
+          (leg as any)._sourceAcked = true;
+          this.clearPendingSourceLeg(rec, leg.sourceNodeId, leg.legId);
+          if (this.parentRecord && this.parentRecord !== rec) this.clearPendingSourceLeg(this.parentRecord, leg.sourceNodeId, leg.legId);
         }
+        else allSources = false;
+      } catch {
+        // Down source: record pendingSourceCleanup durably (survives the move
+        // to history), retried at reconnect; fencing keeps it from serving
+        // meanwhile. Do NOT block the grant.
+        (leg as any)._sourcePending = true;
+        this.recordPendingSourceLeg(rec, leg.sourceNodeId, leg.legId);
+        // A retire's slice is not what persist writes: its parent carries it too.
+        if (this.parentRecord && this.parentRecord !== rec) this.recordPendingSourceLeg(this.parentRecord, leg.sourceNodeId, leg.legId);
+        // A source still connected (its commit outran the ack) has no
+        // reconnect to retry it: it is asked again after a retry tick.
+        if (this.hooks.registry.nodes?.get(leg.sourceNodeId)?.connected) this.scheduleCleanupRetry(leg.sourceNodeId);
       }
-      if (!allTargets) return; // wait for the next retry; targets must all ack
-      // Sources next (graveyard originals). A down source does not block: it is
-      // recorded durably as pendingSourceCleanup and retried when it reconnects.
-      for (const leg of rec.legs) {
-        if ((leg as any)._sourceAcked) continue;
-        try {
-          const ack = await this.hooks.sendControl(leg.sourceNodeId, MSG.XFER_COMMIT, {
-            migrationId: rec.id, term: rec.term, epoch: rec.epoch ?? this.hooks.registry.epoch,
-            legIds: [leg.legId], sourceCleanup: true, guilds: leg.guilds,
-          });
-          if (ack?.ok) { (leg as any)._sourceAcked = true; this.clearPendingSourceLeg(rec, leg.sourceNodeId, leg.legId); }
-          else allSources = false;
-        } catch {
-          // Down source: record pendingSourceCleanup durably (survives the move
-          // to history), retried at reconnect; fencing keeps it from serving
-          // meanwhile. Do NOT block the grant.
-          (leg as any)._sourcePending = true;
-          this.recordPendingSourceLeg(rec, leg.sourceNodeId, leg.legId);
-        }
-      }
-      const sourcesSettled = rec.legs.every(l => (l as any)._sourceAcked || (l as any)._sourcePending);
-      if (allTargets && sourcesSettled) {
-        this.clearCommitTimer();
-        if ((rec.pendingSourceCleanup?.length ?? 0) > 0) await this.persist();
-        void this.enterGranting();
-      }
-      void allSources;
-    })();
+    }
+    const sourcesSettled = rec.legs.every(l => (l as any)._sourceAcked || (l as any)._sourcePending);
+    if (allTargets && sourcesSettled) {
+      this.clearCommitTimer();
+      if ((rec.pendingSourceCleanup?.length ?? 0) > 0) await this.persist();
+      void this.enterGranting();
+    }
+    void allSources;
   }
 
   // GRANTING: data commit is done - now the gateway swap. Grant the moved
   // shard(s) to the new owners via the metered grant path; Swap ordered
   // remote-first/self-last per execOrder; identifies metered by the ledger.
   private async enterGranting(): Promise<void> {
+    // One pass per record at a time: the grant retry tick or a second entry
+    // must not run beside a slow pass, or both would finish the migration.
+    const rec = this.record;
+    if (!rec || this.grantingFor === rec) return;
+    this.grantingFor = rec;
+    try {
+      await this.runGranting();
+    } finally {
+      if (this.grantingFor === rec) this.grantingFor = null;
+    }
+  }
+
+  private grantingFor: MigrationRecord | null = null;
+
+  private async runGranting(): Promise<void> {
     if (!this.record) return;
     // Redistribute is data-only and pause-time: nothing serves, so it never
     // grants here. Data is placed (COMMITTING done); the operator's Resume
@@ -1497,6 +1592,12 @@ export class MigrationCoordinator {
     if (reg.healthOf(target) !== 'up') return { ok: false, error: `target ${target.nodeName} is not healthy` };
     const held = reg.shardTable.get(shardId);
     if (!held || held.nodeId !== sourceNodeId) return { ok: false, error: `shard ${shardId} is not owned by ${source.nodeName}` };
+    // The target still owes this shard's cleanup from an earlier move (its
+    // frozen originals): data brought back now is what that cleanup would
+    // graveyard, so the move waits until the cleanup has run.
+    if (this.pendingSourceCleanups().some(owed => owed.nodeId === targetNodeId && owed.shardIds.includes(shardId))) {
+      return { ok: false, error: `${target.nodeName} still owes the cleanup of shard ${shardId} from an earlier move (it missed that commit); the move waits until the cleanup has run` };
+    }
     if (leg.direction === 'none') {
       // Defense-in-depth for the lease-only hand-off: both participants must
       // advertise the postgres backend (a runtime backend apply refreshes the

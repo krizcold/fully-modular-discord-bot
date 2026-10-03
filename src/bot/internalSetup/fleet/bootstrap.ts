@@ -1710,6 +1710,10 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     return { ok: true, revision: fleetConfig.revision };
   };
   let coordinator: MigrationCoordinator | null = null;
+  // The assignment last written to the control store: the mirror's listing
+  // reads the plan as pending while the table has moved past it (B4f-4).
+  let persistedPlanKey: string | null = null;
+  let persistFailedKey: string | null = null;
   let selfExecutor: MigrationExecutor | null = null;
   let pinViolation: PinViolationView | null = null;
 
@@ -2234,6 +2238,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       do {
         distributeQueued = false;
         await distributeOnce();
+        await persistIfBehind();
       } while (distributeQueued);
       reportPlacement();
     } catch (error) {
@@ -2569,7 +2574,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
         if (resumePendingShards.size === 0) {
           clearResumeRetry();
           await store.saveRedistributeProposal(null);
-          console.log('[Fleet] Reshard pause resume: all proposal grants landed');
+          console.log('[Fleet] Reshard pause resume: the proposal is settled (each shard landed on its owner, or was freed with an owner Declared Lost)');
           void distribute();
         }
       })();
@@ -2658,6 +2663,13 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       if (pending.nodeId !== targetNodeId) continue;
       shardIds.push(shardId);
       registry.pendingConfirmation.delete(shardId);
+    }
+    // A Resume grant awaiting this node (it held the data the reshard placed
+    // there) can never land now: its shards leave the resume fence with it.
+    for (const [shardId, owner] of resumeProposalOwner) {
+      if (owner !== targetNodeId) continue;
+      if (resumePendingShards.delete(shardId) && !shardIds.includes(shardId)) shardIds.push(shardId);
+      resumeProposalOwner.delete(shardId);
     }
     registry.nodes.delete(targetNodeId);
     if (backupDesignationRefused?.nodeId === targetNodeId) backupDesignationRefused = null;
@@ -2795,7 +2807,29 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     return { backend: 'postgres', url, ...(publicUrl ? { publicUrl } : {}) };
   }
 
+  function planKeyOf(): string {
+    return [...registry.shardTable.values()].map(lease => `${lease.shardId}:${lease.nodeId}`).sort().join(',');
+  }
+
+  // A table a heartbeat confirmed a grant into, with nothing free to place,
+  // is written by no distribute pass, so this writes it. Never mid-migration:
+  // the drain freed its shards from the table only, the stored plan keeps
+  // them under their source (a restart's abort rolls back on that), and the
+  // migration writes its own plan. A failing store warns once per table.
+  async function persistIfBehind(): Promise<void> {
+    if (coordinator?.hasActive()) return;
+    const key = planKeyOf();
+    if (key === persistedPlanKey) return;
+    try {
+      await persist();
+    } catch (error) {
+      if (persistFailedKey !== key) console.warn(`[Fleet] Writing the plan to the control store failed; retried at each distribute: ${error instanceof Error ? error.message : String(error)}`);
+      persistFailedKey = key;
+    }
+  }
+
   async function persist(): Promise<void> {
+    const key = planKeyOf();
     const byNode = new Map<string, { leaseId: string; shardId: number; identifyDelayMs: number }[]>();
     for (const lease of registry.shardTable.values()) {
       const arr = byNode.get(lease.nodeId) ?? [];
@@ -2809,6 +2843,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       assignments: [...byNode.entries()].map(([assignedNodeId, leases]) => ({ nodeId: assignedNodeId, leases })),
       updatedAt: Date.now(),
     });
+    persistedPlanKey = key;
     await store.saveRegistry({
       nodes: [...registry.nodes.values()].map(n => ({
         nodeId: n.nodeId,
@@ -2950,6 +2985,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     // The planned transfer (B4f-4, file mode) is asked by the designated
     // backup alone, by this master's own record of the designation and in
     // the operator's order, as the mirror is served.
+    const cleanupRetrying = new Set<string>();
     const transferRefusal = (requester: string): string | null => {
       if (resolveDataBackend() !== 'file' || store instanceof PostgresControlStore) return 'this master is not in file mode; the postgres transfer fences the database instead';
       if (controlFenced) return 'this master is deposed';
@@ -2960,6 +2996,33 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       if (!node || !node.connected) return 'the asking node is not registered with this master';
       if (node.capabilities?.dataBackend !== 'file') return `the asking node reports the ${node.capabilities?.dataBackend ?? 'unknown'} data backend`;
       if (paused) return 'the reshard pause is active; the transfer waits until it ends';
+      if (transformer?.hasActive()) return 'a backend transformation is active; the transfer waits until it finishes or is aborted';
+      // The pin drops the migration history, and with it the cleanup a
+      // node down at a commit still owes of its frozen originals.
+      for (const owed of coordinator?.pendingSourceCleanups() ?? []) {
+        const owing = registry.nodes.get(owed.nodeId);
+        if (!owing) continue;
+        // Connected yet owing: the coordinator asks it again each retry tick;
+        // this ask is answered now, and kicks one more retry at once.
+        if (owing.connected) {
+          if (!cleanupRetrying.has(owed.nodeId)) {
+            cleanupRetrying.add(owed.nodeId);
+            void coordinator!.retrySourceCleanup(owed.nodeId).catch(() => undefined).finally(() => cleanupRetrying.delete(owed.nodeId));
+          }
+          return `${owing.nodeName} still holds the frozen originals of shard(s) [${owed.shardIds.join(', ')}] from a migration whose cleanup it missed; the cleanup is retried now, so ask again shortly, and restart ${owing.nodeName} if this persists`;
+        }
+        return `${owing.nodeName} was down when a migration of shard(s) [${owed.shardIds.join(', ')}] committed and still holds its frozen originals; the transfer waits until ${owing.nodeName} reconnects (its cleanup then runs), or, if it never returns, until it is Declared Lost`;
+      }
+      return null;
+    };
+    // Why the stored plan may not place every shard as this master serves
+    // them (B4f-4), short of a write it lacks; null when nothing is under way.
+    const placementUnsettled = (): string | null => {
+      if (coordinator?.hasActive()) return 'a migration is running on the fleet';
+      if (paused) return 'the reshard pause is active';
+      if (resumePendingShards.size > 0) return `shard(s) [${[...resumePendingShards].sort((a, b) => a - b).join(', ')}] of the last reshard still await their grant onto the nodes holding their data`;
+      const pending = [...registry.pendingConfirmation.keys()].sort((a, b) => a - b);
+      if (pending.length > 0) return `shard(s) [${pending.join(', ')}] await confirmation from the node that holds or was granted them, which comes with that node's next heartbeat once this master's register grace or recovery hold-down is over, or through its drain`;
       return null;
     };
     // Its handover deposes this master through the supersession below:
@@ -2973,6 +3036,8 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       nodeName: id => registry.nodes.get(id)?.nodeName ?? null,
       coordinator: () => coordinator,
       documents: () => placementDocuments(),
+      unsettled: placementUnsettled,
+      persistPlan: () => persist(),
       deposed: () => controlFenced,
       handOver: by => beginSupersession?.(by, 'step-down'),
     });
@@ -3002,6 +3067,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       nodeName,
       getTerm: () => registry.term,
       documents: placementDocuments,
+      placementPending: () => placementUnsettled() !== null || planKeyOf() !== persistedPlanKey,
     });
 
     // Migration subsystem (fleet master only; never constructed standalone).
@@ -3657,6 +3723,9 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     if (coordinator) {
       await coordinator.recover().catch(error =>
         console.error('[Migration] Recovery failed:', error instanceof Error ? error.message : error));
+      // A cleanup this master owes itself (its own commit threw) has no
+      // register to retry it: asked once here, the retry tick keeps it.
+      if (coordinator.pendingSourceCleanups().some(owed => owed.nodeId === nodeId)) void coordinator.retrySourceCleanup(nodeId).catch(() => undefined);
     }
     const graceMs = rec.recovered || paused ? RECOVERY_HOLDDOWN_MS : REGISTER_GRACE_MS;
     if ((rec.recovered || paused) && recoverySource) recoverySource.holdDownUntil = Date.now() + graceMs;

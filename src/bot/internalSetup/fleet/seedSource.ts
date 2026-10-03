@@ -132,10 +132,10 @@ export function buildSeedOffer(selfNodeId: string, selfNodeName: string): SeedOf
     }
     const documents = readDocuments(mirrorDocsDir());
     if (!documents) return { offer: null, reason: `this node's copy of ${sourceName}'s guild data carries no usable placement documents (leases.json, fleet-config.json), so a master seeded from it could not pin the shard plan` };
-    // A migration moved guilds of this copy onto this node since its last
-    // pass (B4f-4): its plan still places them with that master while their
-    // data is on this node's live tree, so a seed would serve them empty.
-    if (manifest.droppedAt != null) return { offer: null, reason: `a migration moved guild(s) of this node's copy of ${sourceName}'s guild data onto this node's live tree since the copy's last pass, so the copy's plan still places them with ${sourceName}; the copy is whole again after a pass while ${sourceName} serves. If ${sourceName} is gone, Promote this node from its Fleet tab instead (the promote keeps the guilds moved here), and seed the new master from it afterwards` };
+    // A migration moved guilds of this copy onto this node and no settled
+    // pass has run since (B4f-4): its plan may not yet place them on this
+    // node, where their data is, so a seed would serve them empty.
+    if (manifest.droppedAt != null) return { offer: null, reason: `a migration moved guild(s) of this node's copy of ${sourceName}'s guild data onto this node's live tree, and no complete pass has run since with ${sourceName}'s plan settled (no migration, reshard or unconfirmed grant under way there), so the copy's plan may not yet place them on this node; the copy is whole again after such a pass while ${sourceName} serves. If ${sourceName} is gone, Demote the holding master first if this node is registered with one, then Promote this node from its Fleet tab instead (the promote keeps the guilds moved here), and seed the new master from it afterwards` };
     const guilds: SeedOfferGuild[] = [];
     let partialCount = 0;
     let totalBytes = 0;

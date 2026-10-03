@@ -504,6 +504,13 @@ export interface MirrorListReply {
   frozen: string[];
   /** The placement documents (leases, registry, fleet config), read-only copies. */
   documents: SyncFileEntry[];
+  /**
+   * The master's stored plan may not place every shard as it serves them
+   * (B4f-4): a migration, the reshard pause or its Resume grants, a grant its
+   * holder has not confirmed, or a table not yet written ran as this listing
+   * began, or the request joined a listing begun before it.
+   */
+  placementPending: boolean;
 }
 
 export type MirrorReadKind = 'guild' | 'document';
