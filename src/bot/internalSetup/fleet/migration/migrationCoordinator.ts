@@ -184,6 +184,11 @@ export class MigrationCoordinator {
       this.recordsUnreadable = true;
       console.warn(`[Migration] ${RECORDS_UNREADABLE}; every node keeps its migration staging until then`);
     } else {
+      // A hold whose shard the restored plan places is over: its restore
+      // landed, or the Declare Lost never reached the plan.
+      for (const rec of [persisted.active, ...this.history]) {
+        for (const leg of rec?.legs ?? []) if (leg.heldForChoice && !this.unplaced(leg.shardId)) delete leg.heldForChoice;
+      }
       this.recovered = true;
     }
     const rec = persisted.active;
@@ -380,7 +385,9 @@ export class MigrationCoordinator {
 
   /**
    * A Declare Lost: the copies the lost node still owed cleanups of went
-   * with it, and a freed shard an older copy of which survives on a node
+   * with it, and a shard whose newest copy went with it (one it frees, or
+   * one left unplaced, by a drain or the reshard pause, whose newest
+   * committed move went there) with an older copy surviving on a node
    * owing that move's cleanup (maybe its last copy) has that cleanup held
    * for the operator's choice. Returns the shards now held.
    */
@@ -406,8 +413,18 @@ export class MigrationCoordinator {
         changed = true;
       }
     }
+    const lostCopies = new Set(freedShardIds);
+    for (const rec of this.cleanupRecords()) {
+      if (!this.ofCurrentCount(rec)) continue;
+      for (const entry of rec.pendingSourceCleanup ?? []) {
+        for (const legId of entry.legIds) {
+          const leg = rec.legs.find(l => l.legId === legId);
+          if (leg?.targetNodeId === lostNodeId && this.unplaced(leg.shardId) && this.newestCommitOf(leg.shardId)?.leg.targetNodeId === lostNodeId) lostCopies.add(leg.shardId);
+        }
+      }
+    }
     const held = new Set<number>();
-    for (const shardId of freedShardIds) {
+    for (const shardId of lostCopies) {
       for (const { leg } of this.owedLegsOf(shardId)) {
         if (leg.sourceLostAt !== undefined) continue;
         if (!leg.heldForChoice) leg.heldForChoice = { lostNodeName, at };
@@ -421,8 +438,42 @@ export class MigrationCoordinator {
 
   /** A held copy's cleanup waits only while its shard is unplaced; a placement (the restore) ends the wait. */
   private awaitsChoice(leg: MigrationLeg): boolean {
+    return leg.heldForChoice !== undefined && this.unplaced(leg.shardId) && !this.migrating.has(leg.shardId);
+  }
+
+  /** No node serves the shard or awaits its grant. */
+  private unplaced(shardId: number): boolean {
     const registry = this.hooks.registry;
-    return leg.heldForChoice !== undefined && !registry.shardTable.has(leg.shardId) && !registry.pendingConfirmation?.has(leg.shardId);
+    return !registry.shardTable.has(shardId) && !registry.pendingConfirmation?.has(shardId);
+  }
+
+  /** The shard's newest committed move (by its commit epoch) among the records kept, with its record. */
+  private newestCommitOf(shardId: number): { rec: MigrationRecord; leg: MigrationLeg } | null {
+    let newest: { rec: MigrationRecord; leg: MigrationLeg; epoch: number } | null = null;
+    for (const rec of this.cleanupRecords()) {
+      if (!this.ofCurrentCount(rec)) continue;
+      for (const leg of rec.legs) {
+        if (leg.shardId !== shardId || !leg.committed) continue;
+        if (!newest || leg.committed.epoch > newest.epoch) newest = { rec, leg, epoch: leg.committed.epoch };
+      }
+    }
+    return newest;
+  }
+
+  /** The records holding the newest commit of each shard a kept record still owes a cleanup of. */
+  private newestOfOwed(): Set<MigrationRecord> {
+    const keep = new Set<MigrationRecord>();
+    for (const rec of this.cleanupRecords()) {
+      if (!this.ofCurrentCount(rec)) continue;
+      for (const entry of rec.pendingSourceCleanup ?? []) {
+        for (const legId of entry.legIds) {
+          const leg = rec.legs.find(l => l.legId === legId);
+          const newest = leg ? this.newestCommitOf(leg.shardId) : null;
+          if (newest) keep.add(newest.rec);
+        }
+      }
+    }
+    return keep;
   }
 
   /**
@@ -1474,8 +1525,11 @@ export class MigrationCoordinator {
     this.record.updatedAt = Date.now();
     this.history.push(this.record);
     if (this.history.length > MIGRATION_HISTORY_CAP) {
-      // A record still owing a source cleanup stays: the debt lives on it.
-      const evict = this.history.findIndex(r => !r.pendingSourceCleanup);
+      // A record still owing a source cleanup stays: the debt lives on it;
+      // so does the newest commit of a shard owed (a hold reads where that
+      // shard's newest copy went).
+      const keep = this.newestOfOwed();
+      const evict = this.history.findIndex(r => !r.pendingSourceCleanup && !keep.has(r));
       if (evict >= 0) this.history.splice(evict, 1);
     }
     const finished = this.record;
@@ -1707,8 +1761,36 @@ export class MigrationCoordinator {
   // its holder. An operator override UI can replace this map without touching
   // the mechanism.
   private proposal = new Map<number, string>();
+  // Proposal owners Declared Lost since this proposal was built.
+  private readonly lostOwners = new Set<string>();
+  private proposalWrites: Promise<unknown> = Promise.resolve();
+
+  // The stored proposal is read and written one pass at a time, so a
+  // Declare Lost's trim and a redistribute's re-persist never undo each other.
+  private serialProposal<T>(pass: () => Promise<T>): Promise<T> {
+    const run = this.proposalWrites.then(pass, pass);
+    this.proposalWrites = run.catch(() => undefined);
+    return run;
+  }
+
+  /** A proposal owner Declared Lost in the reshard pause: its Resume grants can never land, so its shards leave the stored proposal (returned). */
+  dropProposalOwner(nodeId: string): Promise<number[]> {
+    this.lostOwners.add(nodeId);
+    for (const [shardId, owner] of this.proposal) if (owner === nodeId) this.proposal.delete(shardId);
+    return this.serialProposal(async () => {
+      const stored: Record<number, string> = await this.hooks.loadRedistributeProposal().catch(() => null) ?? {};
+      const dropped = Object.entries(stored).filter(([, owner]) => owner === nodeId).map(([shardKey]) => Number(shardKey));
+      if (dropped.length > 0) {
+        await this.hooks.saveRedistributeProposal(Object.fromEntries(Object.entries(stored).filter(([, owner]) => owner !== nodeId)))
+          .catch(error => console.warn('[Migration] Writing the redistribute proposal without a lost owner failed:', error instanceof Error ? error.message : error));
+      }
+      return dropped.filter(shardId => Number.isInteger(shardId));
+    });
+  }
+
   private buildProposal(shardCount: number, owed: Map<string, Set<string>>): void {
     this.proposal.clear();
+    this.lostOwners.clear();
     const owing = new Map<number, Set<string>>();
     for (const [nodeId, guilds] of owed) {
       for (const guildId of guilds) {
@@ -1800,17 +1882,20 @@ export class MigrationCoordinator {
   // in-memory proposal (full, all shards) is authoritative when present; after a
   // crash it is empty, so the record's legs (moved-shard targets) are overlaid
   // as a best-effort fallback for at least the shards that were being moved.
-  private async persistProposal(): Promise<void> {
+  private persistProposal(): Promise<void> {
     // Start from the durable on-disk proposal so a crash-recovery re-persist
     // (this.proposal empty; record.legs holds ONLY the moved shards) can never
     // drop the unmoved-shard entries the full proposal from startRedistribute
-    // carries. Only ADD moved-shard targets on top; never remove an entry.
-    const proposalMap: Record<number, string> = { ...(await this.hooks.loadRedistributeProposal() ?? {}) };
-    for (const [shardId, targetNodeId] of this.proposal) proposalMap[shardId] = targetNodeId;
-    for (const leg of this.record?.legs ?? []) {
-      if (proposalMap[leg.shardId] === undefined) proposalMap[leg.shardId] = leg.targetNodeId;
-    }
-    await this.hooks.saveRedistributeProposal(proposalMap);
+    // carries. Only ADD moved-shard targets on top (never a lost owner's: a
+    // Declare Lost's trim alone removes its entries); never remove an entry.
+    return this.serialProposal(async () => {
+      const proposalMap: Record<number, string> = { ...(await this.hooks.loadRedistributeProposal() ?? {}) };
+      for (const [shardId, targetNodeId] of this.proposal) proposalMap[shardId] = targetNodeId;
+      for (const leg of this.record?.legs ?? []) {
+        if (proposalMap[leg.shardId] === undefined && !this.lostOwners.has(leg.targetNodeId)) proposalMap[leg.shardId] = leg.targetNodeId;
+      }
+      await this.hooks.saveRedistributeProposal(proposalMap);
+    });
   }
 
   // --------------------------------------------------------------------------

@@ -1776,6 +1776,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   // copy sits on its proposal owner. Emptied as each proposal grant lands.
   const resumePendingShards = new Set<number>();
   const resumeProposalOwner = new Map<number, string>(); // shardId -> its proposal owner
+  const lostNodes = new WeakSet<RegistryNode>(); // node entries a Declare Lost removed
   let resumeRetryTimer: NodeJS.Timeout | null = null;
 
   // STANDALONE master claims EVERY shard regardless of FLEET_SHARD_CAPACITY
@@ -1915,8 +1916,9 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
         void revokeDrainedGrant(node.nodeId, grantLeaseIds);
         return { ok: false, pending: false };
       }
-      // Declared Lost during the ack wait: its shards went with it.
-      if (!registry.nodes.has(node.nodeId)) return { ok: false, pending: false };
+      // Declared Lost during the ack wait (a node re-registered under its
+      // id since is another): its shards went with it.
+      if (!registry.nodes.has(node.nodeId) || lostNodes.has(node)) return { ok: false, pending: false };
       // UNACKED grant fence: the worker may have applied it despite the lost
       // ack; heartbeats resolve the pending shards. The reservation is kept
       // (conservative); the budget refresh reconciles it against live truth.
@@ -2633,10 +2635,13 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       // (ledger floor / worker refusal) stays fenced and is retried on a timer;
       // the proposal file is kept until every proposal shard has landed, so a
       // retry or a fresh crash still re-grants EXACTLY the proposal owner.
+      // A shard waiting on the operator's choice is placed by that choice.
+      const heldIds = new Set(coordinator?.heldShards().map(h => h.shardId) ?? []);
       for (const [shardKey, proposalNodeId] of Object.entries(persistedProposal.proposal)) {
         const shardId = Number(shardKey);
         if (!Number.isInteger(shardId) || shardId < 0 || shardId >= registry.shardCount) continue;
         if (registry.shardTable.has(shardId)) continue; // already owned; do not reassign
+        if (heldIds.has(shardId)) continue;
         resumeProposalOwner.set(shardId, proposalNodeId);
         resumePendingShards.add(shardId);
       }
@@ -2694,6 +2699,14 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     for (const shardId of coordinator?.grantsOwedTo(targetNodeId) ?? []) {
       if (!shardIds.includes(shardId)) shardIds.push(shardId);
     }
+    lostNodes.add(node);
+    registry.nodes.delete(targetNodeId);
+    // In the reshard pause the Resume grants are only on disk: the data the
+    // redistribute placed on this node went with it, so its proposal shards
+    // leave the proposal as freed.
+    if (paused) {
+      for (const shardId of await coordinator?.dropProposalOwner(targetNodeId) ?? []) if (!shardIds.includes(shardId)) shardIds.push(shardId);
+    }
     // A Resume grant awaiting this node (it held the data the reshard placed
     // there) can never land now: its shards leave the resume fence with it.
     for (const [shardId, owner] of resumeProposalOwner) {
@@ -2701,7 +2714,6 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       if (resumePendingShards.delete(shardId) && !shardIds.includes(shardId)) shardIds.push(shardId);
       resumeProposalOwner.delete(shardId);
     }
-    registry.nodes.delete(targetNodeId);
     if (backupDesignationRefused?.nodeId === targetNodeId) backupDesignationRefused = null;
     // A node that is gone cannot stand in; its designation goes with it.
     if (fleetConfig && fleetConfig.backupDesignations.some(d => d.nodeId === targetNodeId)) {
