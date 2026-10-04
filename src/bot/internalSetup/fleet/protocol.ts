@@ -51,6 +51,8 @@ export const MSG = {
   XFER_COMMIT: 'control:xfer:commit',
   XFER_ABORT: 'control:xfer:abort',
   XFER_INVENTORY: 'control:xfer:inventory',
+  /** A node's ask about a migration it stages (node -> master request/reply). */
+  XFER_DISPOSITION: 'control:xfer:disposition',
   /** Lease-only legs: source -> master drain confirmation replacing the dual-hash verify. */
   XFER_FLUSHED: 'control:xfer:flushed',
   // Data backend. TRANSFORM_GUILD/BACKEND_FLIP flow master -> owner
@@ -797,6 +799,20 @@ export interface XferInventoryReply {
   probe?: boolean;
   /** A probe's answer: a cleanup of the asked guilds runs on the node, or its next boot finishes one. */
   cleanupRunning?: boolean;
+}
+
+/** A node's ask about a migration it stages: the master's verdict on the staging. */
+export interface XferDispositionRequest {
+  term: number;
+  migrationId: string;
+}
+
+export interface XferDispositionReply {
+  ok: boolean;
+  term: number;
+  /** Null while the migration runs before its commit decision, or before the master loaded its records. */
+  disposition?: { verdict: 'aborted' | 'unknown' } | { verdict: 'committing'; term: number; epoch: number } | null;
+  reason?: string;
 }
 
 // ============================================================================

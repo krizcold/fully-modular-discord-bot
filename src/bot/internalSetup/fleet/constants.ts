@@ -254,10 +254,7 @@ export const SPACE_MARGIN = 1.5;
 /** Fixed free-space cushion above the margin-scaled estimate. */
 export const SPACE_CUSHION_BYTES = 104857600;
 
-/** _incoming staging retained this long when the master is unreachable at boot, then swept. */
-export const INCOMING_RETENTION_MS = 86400000;
-
-/** Cadence of the post-boot _incoming re-resolution (boot-retained staging is not stuck until the next reboot). */
+/** Cadence of the post-boot _incoming re-resolution (staging kept at boot is asked about again without a reboot). */
 export const INCOMING_RESOLVE_INTERVAL_MS = 3600000;
 
 /** Cap on the persisted finished-migration history ring. */

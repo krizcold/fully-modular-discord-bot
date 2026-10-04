@@ -670,6 +670,7 @@ export class MigrationExecutor {
       sourceNodeId: '',
       shardId: leg.shardId,
       guilds: leg.guilds,
+      term: this.currentTerm,
       phase,
     };
     try {

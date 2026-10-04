@@ -15,7 +15,6 @@
 import { performance } from 'perf_hooks';
 import { randomBytes, randomUUID } from 'crypto';
 import {
-  INCOMING_RETENTION_MS,
   MIGRATION_HISTORY_CAP,
   SPACE_CUSHION_BYTES,
   SPACE_MARGIN,
@@ -149,6 +148,10 @@ interface LegLive {
 export class MigrationCoordinator {
   private record: MigrationRecord | null = null;
   private history: MigrationRecord[] = [];
+  private recovered = false;
+  // The persisted records exist but could not be read: never written over
+  // (their repair and a restart bring them back) and no migration starts.
+  private recordsUnreadable = false;
   private live = new Map<string, LegLive>(); // legId -> live
   private paused = false; // retire pause (Resume/Abort-remaining)
   // The running leg's abort ends the whole retire instead of pausing it (B4f-4: the planned transfer's Cancel).
@@ -169,8 +172,20 @@ export class MigrationCoordinator {
   // Boot recovery (called AFTER the P1 plan/registry reload).
   // --------------------------------------------------------------------------
   async recover(): Promise<void> {
-    const persisted = await this.hooks.store.loadMigrations();
+    let persisted: PersistedMigrations;
+    try {
+      persisted = await this.hooks.store.loadMigrations();
+    } catch (error) {
+      this.recordsUnreadable = true;
+      throw error;
+    }
     this.history = persisted.history ?? [];
+    if (persisted.unreadable) {
+      this.recordsUnreadable = true;
+      console.warn(`[Migration] ${RECORDS_UNREADABLE}; every node keeps its migration staging until then`);
+    } else {
+      this.recovered = true;
+    }
     const rec = persisted.active;
     if (!rec) return;
     this.record = rec;
@@ -485,9 +500,12 @@ export class MigrationCoordinator {
    * carries the (term, epoch) for the staged rename; 'aborted' when the record
    * is aborting/aborted; 'unknown' when the coordinator has no live record and
    * history shows it finished (staging is stale and safe to delete). Null when
-   * the migration is still live in a non-commit state (defer to the broadcast).
+   * the migration is still live in a non-commit state (defer to the broadcast),
+   * and until recover() loaded readable records (an unknown then would delete
+   * staging the recovered record still commits).
    */
   dispositionOf(migrationId: string): { verdict: 'aborted' | 'unknown' } | { verdict: 'committing'; term: number; epoch: number } | null {
+    if (!this.recovered) return null;
     const active = this.parentRecord ?? this.record;
     if (active && active.id === migrationId) {
       if (active.state === 'COMMITTING' || active.state === 'GRANTING') {
@@ -502,6 +520,11 @@ export class MigrationCoordinator {
       return { verdict: 'aborted' };
     }
     return { verdict: 'unknown' };
+  }
+
+  /** Why no migration, transformation, reshard Resume, transfer or Declare Lost may run, while the records cannot be read; null otherwise. */
+  recordsBlock(): string | null {
+    return this.recordsUnreadable ? RECORDS_UNREADABLE : null;
   }
 
   getView(): MigrationView {
@@ -589,6 +612,7 @@ export class MigrationCoordinator {
   }
 
   private validateCommon(payload: StartPayload): PrecheckResult {
+    if (this.recordsUnreadable) return { ok: false, error: RECORDS_UNREADABLE };
     if (this.hooks.isPaused() && payload.kind !== 'redistribute') {
       return { ok: false, error: 'reshard pause active; only Redistribute runs during the pause' };
     }
@@ -1509,6 +1533,7 @@ export class MigrationCoordinator {
   // Redistribute (pause-time, data-only; DRAINING/freeze skipped).
   // --------------------------------------------------------------------------
   private async precheckRedistribute(): Promise<PrecheckResult> {
+    if (this.recordsUnreadable) return { ok: false, error: RECORDS_UNREADABLE };
     if (!this.hooks.isPaused()) return { ok: false, error: 'redistribute runs only during the reshard pause' };
     const assembling = this.assemblingError();
     if (assembling) return { ok: false, error: assembling };
@@ -1926,6 +1951,7 @@ export class MigrationCoordinator {
   private async persist(): Promise<void> {
     // During a retire leg the parent record (all legs + currentLegIndex + per-leg
     // legState) is the crash-recovery unit, not the running one-leg slice.
+    if (this.recordsUnreadable) return;
     const active = this.parentRecord ?? this.record;
     const state: PersistedMigrations = {
       active: active && !isTerminal(active.state) ? active : null,
@@ -1935,6 +1961,8 @@ export class MigrationCoordinator {
     await this.hooks.store.saveMigrations(state);
   }
 }
+
+const RECORDS_UNREADABLE = 'The persisted migration records (migrations.json, or the control store\'s migrations document) cannot be read, so a migration may be under way unseen; no migration, backend transformation, reshard Resume, planned transfer or Declare Lost runs until the master restarts with them readable';
 
 function isTerminal(state: MigrationState): boolean {
   return state === 'DONE' || state === 'ABORTED';
@@ -1953,5 +1981,3 @@ function pushInto<T>(map: Map<string, T[]>, key: string, value: T): void {
   if (arr) arr.push(value);
   else map.set(key, [value]);
 }
-
-export { INCOMING_RETENTION_MS };

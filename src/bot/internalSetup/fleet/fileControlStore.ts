@@ -139,11 +139,18 @@ export class FileControlStore implements ControlStore {
   }
 
   async loadMigrations(): Promise<PersistedMigrations> {
-    const parsed = readJson<PersistedMigrations>(this.file('migrations.json'));
+    let parsed: PersistedMigrations | null = null;
+    let unreadable = false;
+    try {
+      parsed = JSON.parse(fs.readFileSync(this.file('migrations.json'), 'utf-8')) as PersistedMigrations;
+    } catch (error) {
+      unreadable = (error as NodeJS.ErrnoException).code !== 'ENOENT';
+    }
     return {
       active: parsed?.active ?? null,
       history: Array.isArray(parsed?.history) ? parsed!.history! : [],
       updatedAt: Number(parsed?.updatedAt) || 0,
+      ...(unreadable ? { unreadable: true } : {}),
     };
   }
 

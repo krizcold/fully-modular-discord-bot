@@ -334,10 +334,14 @@ export class PostgresControlStore implements ControlStore {
             if (marker === 'corrupt') {
               throw new Error('reshard-pending.json is unreadable; refusing to seed past an unreadable pause marker');
             }
+            const migrations = await fileStore.loadMigrations();
+            if (migrations.unreadable) {
+              throw new Error('migrations.json is unreadable; refusing to seed past unreadable migration records');
+            }
             const docs: Record<string, string | null> = {
               'plan': jsonOrNull(await fileStore.loadPlan()),
               'registry': jsonOrNull(await fileStore.loadRegistry()),
-              'migrations': jsonOrNull(await fileStore.loadMigrations()),
+              'migrations': jsonOrNull(migrations),
               'reshard-pending': jsonOrNull(marker),
               'redistribute-proposal': jsonOrNull(await fileStore.loadRedistributeProposal()),
               'transformation': jsonOrNull(await fileStore.loadTransformation()),
@@ -557,14 +561,16 @@ export class PostgresControlStore implements ControlStore {
 
   async loadMigrations(): Promise<PersistedMigrations> {
     let parsed: PersistedMigrations | null = null;
+    let unreadable = false;
     const body = await this.readDoc('migrations');
     if (body !== null) {
-      try { parsed = JSON.parse(body) as PersistedMigrations; } catch { parsed = null; }
+      try { parsed = JSON.parse(body) as PersistedMigrations; } catch { unreadable = true; }
     }
     return {
       active: parsed?.active ?? null,
       history: Array.isArray(parsed?.history) ? parsed!.history! : [],
       updatedAt: Number(parsed?.updatedAt) || 0,
+      ...(unreadable ? { unreadable: true } : {}),
     };
   }
 

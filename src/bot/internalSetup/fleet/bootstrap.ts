@@ -96,7 +96,7 @@ import { applyDeliveredBackend, ensureRuntimeWith, getActiveBackendUrl, getDataB
 import { setLeaseDeclineHandler } from '../utils/dataBackends/dataReadiness';
 import { applyRouteOverrides, currentRouteDefault } from '../utils/dataBackends/routeResolver';
 import { loadCredentials, resolveDataBackend, upsertCredentials } from '../../../utils/envLoader';
-import { MigrationDisposition, resolveIncomingWithMaster, resumeSourceGraveyarding, runResidueSweep } from './migration/residueSweep';
+import { dispositionFromReply, MigrationDisposition, resolveIncomingWithMaster, resumeSourceGraveyarding, runResidueSweep } from './migration/residueSweep';
 import { MigrationCoordinator, PrecheckResult, StartPayload, legsPastCommit } from './migration/migrationCoordinator';
 import { MigrationExecutor } from './migration/migrationExecutor';
 import { TransformationCoordinator } from './transformation/transformationCoordinator';
@@ -452,27 +452,25 @@ export async function initFleet(): Promise<FleetContext> {
   }
 
   // Node-side _incoming resolution: the master answers from its own coordinator
-  // record; a co-worker retains staging until the master's active-migration
-  // abort/commit broadcast (or the retention TTL) resolves it - staging is never
-  // deleted while the master might still consider the migration live.
+  // record, a co-worker asks its master. Staging goes only on an aborted or
+  // unknown verdict, never on a timer: a master waiting in COMMITTING on this
+  // node commits it whenever the node returns.
   if (!standalone) {
     const resolveIncoming = async (): Promise<void> => {
       try {
-        await resolveIncomingWithMaster(async (migrationId): Promise<MigrationDisposition> => {
-          const decision = migrationDispositionOf(migrationId);
+        await resolveIncomingWithMaster(async (migrationId, stagedTerm): Promise<MigrationDisposition> => {
+          const decision = migrationDispositionOf(migrationId) ?? await askMasterDisposition(migrationId, stagedTerm);
           if (decision) return decision;
-          // Not the master (or migration not in the local coordinator): defer to
-          // the broadcast/TTL path by signalling unreachable (reject).
-          throw new Error('migration status not locally resolvable');
-        });
+          // Before its commit decision, or no master answered: kept.
+          throw new Error('migration status not resolvable now');
+        }, () => migrationWorkActive());
       } catch (error) {
         console.warn('[Fleet] _incoming resolution failed:', error instanceof Error ? error.message : error);
       }
     };
     await resolveIncoming();
-    // Periodic retry: staging retained at boot (master unreachable, or this is
-    // a co-worker) is re-resolved in place, so the retention TTL reclaims
-    // aborted staging within a day of the abort instead of a day plus a reboot.
+    // Periodic retry: staging kept at boot (no verdict yet, or a co-worker not
+    // yet registered) is asked about again in place, without a reboot.
     // Skipped while migration work is live on this node: the resolver's
     // commitFromStaging must never race the executor's own commit path.
     setInterval(() => {
@@ -487,6 +485,9 @@ export async function initFleet(): Promise<FleetContext> {
 // Master-side disposition of a migration id for the boot _incoming resolution;
 // null on co-workers and when the coordinator does not know the migration.
 let migrationDispositionOf: (migrationId: string) => MigrationDisposition | null = () => null;
+// A co-worker's ask of its master for that verdict; null when it is not
+// registered or no verdict comes back.
+let askMasterDisposition: (migrationId: string, stagedTerm: number) => Promise<MigrationDisposition | null> = async () => null;
 // Whether migration work (coordinator active record or a live executor leg) is
 // running on this node; the periodic staging resolver must never race it.
 let migrationWorkActive: () => boolean = () => false;
@@ -2606,6 +2607,8 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
 
   masterResume = async (): Promise<AssignResult> => {
     if (!paused) return { success: false, error: 'No reshard pause is active' };
+    const recordsBlocked = coordinator?.recordsBlock();
+    if (recordsBlocked) return { success: false, error: recordsBlocked };
     if (transformer?.hasActive()) {
       return { success: false, error: 'a backend transformation is active; finish or abort it first' };
     }
@@ -2660,6 +2663,8 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     if (!node) return { success: false, error: `node ${targetNodeId || '(none)'} is unknown` };
     if (node.isSelf) return { success: false, error: 'cannot declare the master node lost' };
     if (node.connected) return { success: false, error: 'node is connected; use Drain' };
+    const recordsBlocked = coordinator?.recordsBlock();
+    if (recordsBlocked) return { success: false, error: recordsBlocked };
     // Refused mid-transformation (spec 3.3) EXCEPT during RETIRING: post-flip
     // the data is safe in the destination and only the lost node's source
     // residue is affected - it is recorded and skipped.
@@ -2956,7 +2961,10 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       if (!result.success) console.warn('[Fleet] Could not persist DATA_BACKEND after the flip:', result.error);
     },
   });
-  masterTransformStart = payload => transformer!.start(payload);
+  masterTransformStart = payload => {
+    const recordsBlocked = coordinator?.recordsBlock();
+    return recordsBlocked ? Promise.resolve({ ok: false, error: recordsBlocked }) : transformer!.start(payload);
+  };
   masterTransformPause = () => transformer!.pause();
   masterTransformResume = () => transformer!.resume();
   masterTransformAbort = () => transformer!.abort();
@@ -3071,6 +3079,8 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       if (node.capabilities?.dataBackend !== 'file') return `the asking node reports the ${node.capabilities?.dataBackend ?? 'unknown'} data backend`;
       if (paused) return 'the reshard pause is active; the transfer waits until it ends';
       if (transformer?.hasActive()) return 'a backend transformation is active; the transfer waits until it finishes or is aborted';
+      const recordsBlocked = coordinator?.recordsBlock();
+      if (recordsBlocked) return recordsBlocked;
       // The pin drops the migration history, and with it a shard held for
       // the operator's choice and the cleanup a node down at a commit owes.
       const held = coordinator?.heldShards() ?? [];
@@ -3096,6 +3106,8 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     // Why the stored plan may not place every shard as this master serves
     // them (B4f-4), short of a write it lacks; null when nothing is under way.
     const placementUnsettled = (): string | null => {
+      const recordsBlocked = coordinator?.recordsBlock();
+      if (recordsBlocked) return recordsBlocked;
       if (coordinator?.hasActive()) return 'a migration is running on the fleet';
       if (paused) return 'the reshard pause is active';
       if (resumePendingShards.size > 0) return `shard(s) [${[...resumePendingShards].sort((a, b) => a - b).join(', ')}] of the last reshard still await their grant onto the nodes holding their data`;
@@ -3723,6 +3735,9 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       onXferProgress: (xferNodeId, data) => coordinator?.onProgress(xferNodeId, data),
       onXferVerify: (xferNodeId, data) => coordinator?.onVerify(xferNodeId, data),
       onXferFlushed: (xferNodeId, data) => coordinator?.onFlushed(xferNodeId, data),
+      onXferDisposition: (_xferNodeId, data) => coordinator && typeof data?.migrationId === 'string' && data.migrationId !== ''
+        ? { ok: true, term: registry.term, disposition: coordinator.dispositionOf(data.migrationId) }
+        : { ok: false, term: registry.term, reason: 'migrations-unavailable' },
       onSyncReport: (reportNodeId, data) => {
         const node = registry.nodes.get(reportNodeId);
         if (!node) return;
@@ -3788,6 +3803,12 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
         }
         if (old.connected) {
           console.warn(`[Fleet] Takeover chain: previous master ${old.nodeName} re-registered; leaving its shards alone`);
+          return;
+        }
+        // Lifted only by a restart, which the chain does not survive.
+        const recordsBlocked = coordinator?.recordsBlock();
+        if (recordsBlocked) {
+          console.error(`[Fleet] Takeover chain stopped before declaring previous master ${old.nodeName} lost: ${recordsBlocked}. After that restart, Declare Lost ${old.nodeName} on the Fleet tab if it has not re-registered`);
           return;
         }
         console.warn(`[Fleet] Takeover chain: declaring previous master ${old.nodeName} lost (stale term ${chainTarget.term})`);
@@ -4232,6 +4253,9 @@ async function initCoWorker(init: CommonInit, followerHold: FollowerHoldBase | n
     // Promote-precheck signal: BOTH executors' live work counts (a promotion
     // restart mid-convert would break a transformation guild window).
     migrationWorkActive = () => (executor?.hasActiveLegs() ?? false) || transformExecutor.isBusy();
+    askMasterDisposition = (migrationId, stagedTerm) => controlClient?.masterKnown()
+      ? controlClient.migrationDisposition(migrationId).then(reply => dispositionFromReply(reply, stagedTerm), () => null)
+      : Promise.resolve(null);
     // The seed of a new master (B4f-3): what this node offers a master holding
     // to be seeded, and the push once the operator confirmed it there.
     const source = new SeedSource({

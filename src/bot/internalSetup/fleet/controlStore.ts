@@ -124,6 +124,8 @@ export interface PersistedMigrations {
   active: MigrationRecord | null;
   history: MigrationRecord[];
   updatedAt: number;
+  /** The records exist but could not be read or parsed (not the same as none). */
+  unreadable?: boolean;
 }
 
 /**

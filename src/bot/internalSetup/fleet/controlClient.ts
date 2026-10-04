@@ -28,6 +28,7 @@ import {
   RegisterResult,
   SyncReportPayload,
   SyncStatePayload,
+  XferDispositionReply,
 } from './protocol';
 import type { LeaseRuntime } from './leaseRuntime';
 import type { CopyBlock, SeededFromInfo, SlotStatusPayload, SupersededInfo, SyncPosturePayload } from './protocol';
@@ -180,6 +181,11 @@ export class ControlClient {
   /** Fire-and-forget frame to the master (migration progress/verify). */
   sendToMaster(type: string, data: any): void {
     this.send(type, data);
+  }
+
+  /** The master's verdict on a migration this node stages (the _incoming resolution). */
+  migrationDisposition(migrationId: string): Promise<XferDispositionReply> {
+    return this.request(MSG.XFER_DISPOSITION, { term: this.term, migrationId });
   }
 
   /** The candidate currently being dialed (or held); for the fleet-state view. */

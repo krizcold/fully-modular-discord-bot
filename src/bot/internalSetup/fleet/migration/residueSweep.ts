@@ -7,10 +7,10 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { DATA_ROOT } from '../../../../utils/dataRoot';
 import { deleteGuildNamespace, listGuilds, stampOwner } from '../../utils/dataManager';
-import { INCOMING_RETENTION_MS } from '../constants';
 import { commitFromStaging } from './migrationExecutor';
 
 const INCOMING_DIR = '_incoming';
+const DELETING_PREFIX = '.deleting-';
 const ORPHAN_TMP_MAX_AGE_MS = 60 * 60 * 1000; // 1h
 
 interface OwnerManifest {
@@ -109,8 +109,9 @@ async function cleanOrphanTmp(dir: string): Promise<void> {
 // _incoming staging disposition. The only self-contained (no-master) crash rule
 // from PLAN_P5 is: a leg in commit-intent finishes its renames locally
 // (idempotent). Non-commit-intent staging is left for the P5 coordinator to
-// resolve against the master (ask -> aborted/unknown delete, else TTL); it is
-// never deleted here so a still-live migration keeps its data.
+// resolve against the master (ask -> aborted/unknown delete, committing
+// finish, else kept); it is never deleted here so a still-live migration
+// keeps its data.
 async function disposeIncoming(): Promise<void> {
   const incomingRoot = path.join(DATA_ROOT, INCOMING_DIR);
   let legs: fs.Dirent[];
@@ -165,20 +166,41 @@ export type MigrationDisposition =
   | { verdict: 'committing'; term: number; epoch: number };
 
 /**
+ * The verdict in a master's answer to a co-worker's ask; null (the staging is
+ * kept) without one. An aborted or unknown from a master below the staging's
+ * own term speaks for an older fleet (a superseded master still taking
+ * registers), so it keeps the staging too.
+ */
+export function dispositionFromReply(reply: any, stagedTerm = 0): MigrationDisposition | null {
+  const disposition = reply?.ok === true ? reply.disposition : null;
+  if (disposition?.verdict === 'aborted' || disposition?.verdict === 'unknown') {
+    return Number(reply.term) >= stagedTerm ? { verdict: disposition.verdict } : null;
+  }
+  if (disposition?.verdict === 'committing' && Number.isInteger(disposition.term) && Number.isInteger(disposition.epoch)) {
+    return { verdict: 'committing', term: disposition.term, epoch: disposition.epoch };
+  }
+  return null;
+}
+
+/**
  * Node-side crash recovery for _incoming staging that is NOT commit-intent
  * (those were already finished locally by disposeIncoming). For each staged
  * migration/leg the master is queried after register:
  *   - aborted/unknown -> delete the staging (safe: the master no longer wants it).
  *   - committing -> finish the renames from the intact staging (the master
  *     decided commit; the target's data is the product).
- *   - master unreachable (query rejects) -> retain; a periodic retry TTL-sweeps
- *     after INCOMING_RETENTION_MS so staging is never deleted while the master
- *     might still consider the migration live.
- * `queryMaster(migrationId)` resolves the disposition or rejects when the master
- * cannot be reached.
+ *   - no verdict (query rejects: no master answers, or the migration runs
+ *     before its commit decision) -> keep it and ask again on the next pass.
+ *     Never deleted on a timer: a master waiting in COMMITTING on this node
+ *     commits the staging whenever the node returns.
+ * `queryMaster(migrationId, stagedTerm)` resolves the disposition or rejects
+ * without one; stagedTerm is the highest term the staging's manifests carry.
+ * `busy()` says migration work is live on this node: a deletion waits for the
+ * next pass then.
  */
 export async function resolveIncomingWithMaster(
-  queryMaster: (migrationId: string) => Promise<MigrationDisposition>,
+  queryMaster: (migrationId: string, stagedTerm: number) => Promise<MigrationDisposition>,
+  busy: () => boolean = () => false,
 ): Promise<void> {
   const incomingRoot = path.join(DATA_ROOT, INCOMING_DIR);
   let migrations: fs.Dirent[];
@@ -187,27 +209,37 @@ export async function resolveIncomingWithMaster(
   } catch {
     return;
   }
-  const now = Date.now();
   for (const mig of migrations) {
     if (!mig.isDirectory()) continue;
     const migDir = path.join(incomingRoot, mig.name);
+    if (mig.name.startsWith(DELETING_PREFIX)) {
+      try { await fs.promises.rm(migDir, { recursive: true, force: true }); } catch { /* best effort */ }
+      continue;
+    }
     let legs: fs.Dirent[];
     try { legs = await fs.promises.readdir(migDir, { withFileTypes: true }); } catch { continue; }
+    let stagedTerm = 0;
+    for (const leg of legs) {
+      if (!leg.isDirectory()) continue;
+      try {
+        const manifest = JSON.parse(await fs.promises.readFile(path.join(migDir, leg.name, '.manifest.json'), 'utf-8'));
+        if (Number.isInteger(manifest?.term)) stagedTerm = Math.max(stagedTerm, manifest.term);
+      } catch { /* no manifest */ }
+    }
     let disposition: MigrationDisposition | null = null;
     try {
-      disposition = await queryMaster(mig.name);
+      disposition = await queryMaster(mig.name, stagedTerm);
     } catch {
-      // Master unreachable: retain unless past the retention TTL.
-      let mtimeMs = now;
-      try { mtimeMs = (await fs.promises.stat(migDir)).mtimeMs; } catch { /* keep now */ }
-      if (now - mtimeMs > INCOMING_RETENTION_MS) {
-        try { await fs.promises.rm(migDir, { recursive: true, force: true }); } catch { /* best effort */ }
-        console.warn(`[Fleet] Purged stale migration staging ${mig.name} (master unreachable past retention TTL)`);
-      }
       continue;
     }
     if (disposition.verdict !== 'committing') {
-      try { await fs.promises.rm(migDir, { recursive: true, force: true }); } catch { /* best effort */ }
+      // Moved aside in the same tick as the live-work check: a prepare
+      // re-running a leg under this id (a resumed retire) stages afresh
+      // instead of into a tree being removed.
+      if (busy()) continue;
+      const doomed = path.join(incomingRoot, `${DELETING_PREFIX}${mig.name}`);
+      try { fs.renameSync(migDir, doomed); } catch { continue; }
+      try { await fs.promises.rm(doomed, { recursive: true, force: true }); } catch { /* best effort; the next pass finishes it */ }
       console.log(`[Fleet] Deleted migration staging ${mig.name} (master verdict: ${disposition.verdict})`);
       continue;
     }

@@ -19,6 +19,8 @@ import {
   RegisterPayload,
   RegisterResult,
   StepDownPayload,
+  XferDispositionReply,
+  XferDispositionRequest,
 } from './protocol';
 
 export interface ControlServerHooks {
@@ -54,6 +56,8 @@ export interface ControlServerHooks {
   onXferVerify?: (nodeId: string, data: any) => void;
   /** Lease-only drain confirmation from a source (fire-and-forget into the coordinator). */
   onXferFlushed?: (nodeId: string, data: any) => void;
+  /** A participant's ask about a migration it stages (the coordinator's verdict); term-fenced. */
+  onXferDisposition?: (nodeId: string, data: XferDispositionRequest) => XferDispositionReply;
   /** A backup's seed push progress and final hashes (B4f-3, fire-and-forget into the seed hold). */
   onSeedReport?: (nodeId: string, data: any) => void;
   /** The planned transfer's requests from the designated backup (B4f-4): the retire's start, status and abort; term-fenced. */
@@ -335,6 +339,12 @@ export class ControlServer {
       case MSG.XFER_FLUSHED:
         this.hooks.onXferFlushed?.(state.nodeId, data);
         break;
+      case MSG.XFER_DISPOSITION: {
+        if (!requestId) break;
+        const handler = this.hooks.onXferDisposition;
+        this.reply(socket, requestId, handler ? handler(state.nodeId, data as XferDispositionRequest) : { ok: false, term: this.hooks.getTerm(), reason: 'migrations-unavailable' });
+        break;
+      }
       case MSG.SEED_REPORT:
         this.hooks.onSeedReport?.(state.nodeId, data);
         break;
