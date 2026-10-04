@@ -238,7 +238,8 @@ export interface FleetState {
    * shardCount differs from Discord's recommendation (DECISION-1);
    * reshardApplied surfaces a confirmed reshard for one boot;
    * reshardNeedsConfirm persists while an override mismatch awaits
-   * FLEET_CONFIRM_RESHARD; reshardPaused persists while the reshard pause
+   * FLEET_CONFIRM_RESHARD; reshardDeferred while a confirmed one waits on a
+   * cleanup a node still owes; reshardPaused persists while the reshard pause
    * marker exists (no shard is assigned until resumed; its fields are null
    * when the marker is corrupt, since the pause fails closed).
    */
@@ -248,6 +249,7 @@ export interface FleetState {
     reshardAdvised: { running: number; recommended: number } | null;
     reshardApplied: { from: number; to: number } | null;
     reshardNeedsConfirm: { from: number; to: number } | null;
+    reshardDeferred: { from: number; to: number; reason: string } | null;
     reshardPaused: { from: number | null; to: number | null; archivedAt: number | null } | null;
   } | null;
   /**
@@ -311,6 +313,7 @@ export interface FleetRecoverySource {
   reshardAdvised: { running: number; recommended: number } | null;
   reshardApplied: { from: number; to: number } | null;
   reshardNeedsConfirm: { from: number; to: number } | null;
+  reshardDeferred: { from: number; to: number; reason: string } | null;
   /** Mutable: fleetResumeAssignments nulls it so the pause banner drops without a restart. */
   reshardPaused: { from: number | null; to: number | null; archivedAt: number | null } | null;
 }
@@ -863,6 +866,7 @@ export function getFleetState(): FleetState {
             reshardAdvised: sources.recovery.reshardAdvised,
             reshardApplied: sources.recovery.reshardApplied,
             reshardNeedsConfirm: sources.recovery.reshardNeedsConfirm,
+            reshardDeferred: sources.recovery.reshardDeferred,
             reshardPaused: sources.recovery.reshardPaused,
           }
         : null,

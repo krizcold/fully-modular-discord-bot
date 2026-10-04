@@ -2387,6 +2387,12 @@ function FleetView({ api, wsClient, guildNames }) {
         </div>
       )}
 
+      {fleet.recovery && fleet.recovery.reshardDeferred && (
+        <div className="usage-notice">
+          {`Shard count change (${fleet.recovery.reshardDeferred.from} -> ${fleet.recovery.reshardDeferred.to}) is confirmed but waits: ${fleet.recovery.reshardDeferred.reason}. ${fleet.recovery.reshardPaused ? 'The reshard pause continues (Resume it to serve the' : 'The fleet keeps running'} ${fleet.recovery.reshardDeferred.from} shard${fleet.recovery.reshardDeferred.from === 1 ? '' : 's'}${fleet.recovery.reshardPaused ? ')' : ''}; restart the master once that is settled to apply it.`}
+        </div>
+      )}
+
       {fleet.recovery && fleet.recovery.reshardPaused && (
         <FleetReshardPauseBanner
           paused={fleet.recovery.reshardPaused}

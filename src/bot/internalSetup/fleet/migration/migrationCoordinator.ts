@@ -323,7 +323,7 @@ export class MigrationCoordinator {
     const ids = new Set<number>();
     const records = this.cleanupRecords();
     for (const rec of records) {
-      if (!rec.pendingSourceCleanup) continue;
+      if (!rec.pendingSourceCleanup || !this.ofCurrentCount(rec)) continue;
       for (const entry of rec.pendingSourceCleanup) {
         for (const legId of entry.legIds) {
           const leg = rec.legs.find(l => l.legId === legId);
@@ -334,28 +334,38 @@ export class MigrationCoordinator {
     return ids;
   }
 
-  /** The nodes a deferred source cleanup waits on, with the shards it covers. */
-  pendingSourceCleanups(): { nodeId: string; shardIds: number[] }[] {
-    const byNode = new Map<string, Set<number>>();
+  /** The nodes a deferred source cleanup waits on, with the shards it covers; crossed when one was made before a reshard. */
+  pendingSourceCleanups(): { nodeId: string; shardIds: number[]; crossed: boolean }[] {
+    const byNode = new Map<string, { ids: Set<number>; crossed: boolean }>();
     const records = this.cleanupRecords();
     for (const rec of records) {
+      const current = this.ofCurrentCount(rec);
       for (const entry of rec.pendingSourceCleanup ?? []) {
         for (const legId of entry.legIds) {
           const leg = rec.legs.find(l => l.legId === legId);
           if (!leg) continue;
-          const ids = byNode.get(entry.nodeId) ?? new Set<number>();
-          ids.add(leg.shardId);
-          byNode.set(entry.nodeId, ids);
+          const owed = byNode.get(entry.nodeId) ?? { ids: new Set<number>(), crossed: false };
+          if (current) owed.ids.add(leg.shardId);
+          else owed.crossed = true;
+          byNode.set(entry.nodeId, owed);
         }
       }
     }
-    return [...byNode.entries()].map(([nodeId, ids]) => ({ nodeId, shardIds: [...ids].sort((a, b) => a - b) }));
+    return [...byNode.entries()].map(([nodeId, owed]) => ({ nodeId, shardIds: [...owed.ids].sort((a, b) => a - b), crossed: owed.crossed }));
+  }
+
+  // A record's legs are numbered under the shard count it was made at. A
+  // note of another count (only a node Declared Lost carries one across a
+  // reshard) names no current shard: it keeps only its cleanup by guild ids.
+  private ofCurrentCount(rec: MigrationRecord): boolean {
+    return rec.shardCount === undefined || rec.shardCount === this.hooks.registry.shardCount;
   }
 
   /** Every owed cleanup of the shard's moves, once each, with the node owing it. */
   private owedLegsOf(shardId: number): OwedLeg[] {
     const found: OwedLeg[] = [];
     for (const rec of this.cleanupRecords()) {
+      if (!this.ofCurrentCount(rec)) continue;
       for (const entry of rec.pendingSourceCleanup ?? []) {
         for (const legId of entry.legIds) {
           const leg = rec.legs.find(l => l.legId === legId);
@@ -671,6 +681,7 @@ export class MigrationCoordinator {
       legs: built.legs,
       state: 'PREPARING',
       term: this.hooks.registry.term,
+      shardCount: this.hooks.registry.shardCount,
       createdAt: Date.now(),
       updatedAt: Date.now(),
     };
@@ -1017,6 +1028,9 @@ export class MigrationCoordinator {
     for (const rec of records) {
       const entry = rec.pendingSourceCleanup?.find(e => e.nodeId === nodeId);
       if (!entry || entry.legIds.length === 0) continue;
+      // A note from before a reshard names no current shard: only its
+      // cleanup by guild ids runs.
+      const current = this.ofCurrentCount(rec);
       // Only the legs this pass settles leave the entry: one recorded
       // meanwhile (by a commit round, while a send here was awaited) stays.
       const cleared = new Set<string>();
@@ -1035,10 +1049,10 @@ export class MigrationCoordinator {
         // A migration fences the shard, or a grant of it to this node awaits
         // confirmation: what the node holds may be what that brought back, so
         // the cleanup stays owed, unsent, until the shard settles.
-        if (this.migrating.has(leg.shardId) || this.hooks.registry.pendingConfirmation?.get(leg.shardId)?.nodeId === nodeId) continue;
+        if (current && (this.migrating.has(leg.shardId) || this.hooks.registry.pendingConfirmation?.get(leg.shardId)?.nodeId === nodeId)) continue;
         // Maybe the last copy of a shard a Declare Lost left unplaced: kept
         // until the operator restores it or starts the shard empty.
-        if (this.awaitsChoice(leg)) continue;
+        if (current && this.awaitsChoice(leg)) continue;
         // Ownership guard: the shard is back on this same source, so in file
         // mode its originals are the live copies again and graveyarding them
         // would serve the guilds empty. The source is released instead: the
@@ -1046,7 +1060,7 @@ export class MigrationCoordinator {
         // while a transformation runs (its own freeze) and while that
         // migration still runs, since the node's abort is migration-wide and
         // would stop a later leg of the same retire there.
-        const back = this.hooks.registry.shardTable.get(leg.shardId)?.nodeId === nodeId;
+        const back = current && this.hooks.registry.shardTable.get(leg.shardId)?.nodeId === nodeId;
         const live = this.parentRecord ?? this.record;
         if (back && (this.hooks.transformationActive?.() || (live !== null && live.id === rec.id && !isTerminal(live.state)))) continue;
         try {
@@ -1061,7 +1075,7 @@ export class MigrationCoordinator {
           // A release counts only when the node reports the freeze and any
           // armed graveyard gone (an older executor does not report it).
           if (ack?.ok && (!back || ack.released === true)) {
-            if (!back && this.awaitsChoice(leg)) {
+            if (!back && current && this.awaitsChoice(leg)) {
               console.warn(`[Migration] Shard ${leg.shardId}: the copy on ${this.hooks.registry.nodes?.get(nodeId)?.nodeName ?? nodeId} went to its graveyard by a cleanup sent before the shard's node was declared lost, so it is not offered`);
             }
             cleared.add(legId);
@@ -1094,7 +1108,7 @@ export class MigrationCoordinator {
     return this.cleanupRecords().some(rec => (rec.pendingSourceCleanup ?? []).some(entry => entry.nodeId === nodeId
       && entry.legIds.some(legId => {
         const leg = rec.legs.find(l => l.legId === legId);
-        return !leg || !this.awaitsChoice(leg);
+        return !leg || !this.ofCurrentCount(rec) || !this.awaitsChoice(leg);
       })));
   }
 
@@ -1598,7 +1612,7 @@ export class MigrationCoordinator {
       return { legId: randomUUID(), shardId: m.shardId, sourceNodeId: m.from, targetNodeId: m.to, direction, guilds: m.guilds };
     });
     const rec: MigrationRecord = {
-      id: randomUUID(), kind: 'redistribute', legs, state: 'PREPARING',
+      id: randomUUID(), kind: 'redistribute', legs, state: 'PREPARING', shardCount: this.hooks.registry.shardCount,
       term: this.hooks.registry.term, createdAt: Date.now(), updatedAt: Date.now(),
     };
     this.record = rec;
@@ -1647,7 +1661,18 @@ export class MigrationCoordinator {
     const shardCount = this.hooks.registry.shardCount;
     // Build the assignment proposal (shard -> node) once for this computation so
     // every guild's new-count shard maps to a stable owner (no per-guild drift).
-    this.buildProposal(shardCount);
+    // A copy its node still owes the cleanup of is stale (the move put the
+    // newer one elsewhere): never moved, and its node never owns the shard,
+    // or the cleanup would graveyard what the redistribute brings there.
+    const owed = new Map<string, Set<string>>();
+    for (const rec of this.cleanupRecords()) {
+      for (const entry of rec.pendingSourceCleanup ?? []) {
+        const guilds = owed.get(entry.nodeId) ?? new Set<string>();
+        for (const legId of entry.legIds) for (const guildId of rec.legs.find(l => l.legId === legId)?.guilds ?? []) guilds.add(guildId);
+        owed.set(entry.nodeId, guilds);
+      }
+    }
+    this.buildProposal(shardCount, owed);
     // Collect per-node inventories over the control channel.
     const byPair = new Map<string, { shardId: number; from: string; to: string; guilds: string[] }>();
     for (const node of this.hooks.registry.nodes.values()) {
@@ -1661,6 +1686,7 @@ export class MigrationCoordinator {
       } catch { unreachable.push({ nodeId: node.nodeId, nodeName: node.nodeName }); continue; }
       if (!inv?.ok) continue;
       for (const g of inv.guilds) {
+        if (owed.get(node.nodeId)?.has(g.guildId)) continue;
         const newShard = guildToShard(g.guildId, shardCount);
         const targetNodeId = this.ownerOfShard(newShard);
         if (!targetNodeId || targetNodeId === node.nodeId) continue;
@@ -1681,8 +1707,15 @@ export class MigrationCoordinator {
   // its holder. An operator override UI can replace this map without touching
   // the mechanism.
   private proposal = new Map<number, string>();
-  private buildProposal(shardCount: number): void {
+  private buildProposal(shardCount: number, owed: Map<string, Set<string>>): void {
     this.proposal.clear();
+    const owing = new Map<number, Set<string>>();
+    for (const [nodeId, guilds] of owed) {
+      for (const guildId of guilds) {
+        const shardId = guildToShard(guildId, shardCount);
+        owing.set(shardId, (owing.get(shardId) ?? new Set<string>()).add(nodeId));
+      }
+    }
     const connected = [...this.hooks.registry.nodes.values()]
       .filter(n => n.connected)
       .sort((a, b) => a.nodeId.localeCompare(b.nodeId));
@@ -1709,6 +1742,7 @@ export class MigrationCoordinator {
       let best: string | null = null;
       let bestScore = Infinity;
       for (const n of candidates) {
+        if (owing.get(shardId)?.has(n.nodeId)) continue;
         const has = held.get(n.nodeId) ?? 0;
         const cap = capOf(n.nodeId);
         const score = has / cap;
@@ -1845,6 +1879,12 @@ export class MigrationCoordinator {
     const owing = [target, source].find(node => this.pendingSourceCleanups().some(owed => owed.nodeId === node.nodeId && owed.shardIds.includes(shardId)));
     if (owing) {
       return { ok: false, error: `${owing.nodeName} still owes the cleanup of shard ${shardId} from an earlier move (it missed that commit); the move waits until the cleanup has run` };
+    }
+    // A cleanup from before a reshard names its guilds, not a current shard:
+    // a node owing one takes no move until it has run.
+    const crossed = [target, source].find(node => this.pendingSourceCleanups().some(owed => owed.nodeId === node.nodeId && owed.crossed));
+    if (crossed) {
+      return { ok: false, error: `${crossed.nodeName} still owes the cleanup of a move made before the last reshard (it missed that commit); the move waits until the cleanup has run` };
     }
     if (leg.direction === 'none') {
       // Defense-in-depth for the lease-only hand-off: both participants must

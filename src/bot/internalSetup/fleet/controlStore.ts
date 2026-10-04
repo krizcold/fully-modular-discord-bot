@@ -108,6 +108,8 @@ export interface MigrationRecord {
   state: MigrationState;
   term: number;
   epoch?: number;
+  /** The shard count its legs' shard ids are numbered under (a reshard renumbers them). */
+  shardCount?: number;
   error?: string;
   /** Retire: index of the leg currently executing; legs before it are committed. */
   currentLegIndex?: number;

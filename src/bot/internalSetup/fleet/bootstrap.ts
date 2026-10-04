@@ -72,7 +72,7 @@ import {
   resolveShardCapacity,
   resolveShardCount,
 } from './placement';
-import { evaluateRecovery } from './recovery';
+import { evaluateRecovery, owingNodes } from './recovery';
 import { _setControlStoreFenced, _setEmptyStoreHold, _setFleetStateSources, _setFollowerFollowingSupplier, _setFollowerHold, _setFollowerLineage, _setOwnCopyLineage, _setReadOnlyStorePark, _setSlotStatus, _setStaleMasterPark, _setSuperseded, _setTakeoverHold, FleetRecoverySource, FleetRefusedRegistration, FollowerHoldBase, getFleetState } from './state';
 import type { BackupDesignationRefusedView, MigrationView, PinViolationView, StandInVerdictView, UnassignedView } from './state';
 import { serveSyncRequest, SyncAuthority } from './syncAuthority';
@@ -1585,6 +1585,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     standalone,
     dataBackend: resolveDataBackend(),
     termInherited: serveOnly,
+    selfNodeId: nodeId,
   }));
   // Reshard pause: while the marker exists NOTHING is auto-assigned - no
   // self-claim, no Phase R/F (distribute returns immediately). Manual assign
@@ -1619,6 +1620,13 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     for (const leg of legsPastCommit(persistedMigrations.active)) {
       if (registry.shardTable.get(leg.shardId)?.nodeId === leg.sourceNodeId) registry.shardTable.delete(leg.shardId);
     }
+    // A node owing a cleanup it missed (not Declared Lost) but holding no
+    // lease is not restored with the plan: kept known, not connected, so
+    // the Fleet tab lists it and a Declare Lost can settle what it owes.
+    for (const owing of owingNodes(persistedMigrations)) {
+      if (owing.nodeId === nodeId || registry.nodes.has(owing.nodeId)) continue;
+      registry.restoreNode({ nodeId: owing.nodeId, nodeName: owing.nodeName, appVersion: '', capabilities: { shardCapacity: 1, dataBackend: 'unknown' } });
+    }
     const selfShardIds = registry.shardIdsOf(nodeId);
     if (selfShardIds.length > 0) {
       registry.epoch += 1;
@@ -1635,6 +1643,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     reshardAdvised: rec.reshardAdvised ?? null,
     reshardApplied: rec.reshardApplied ? { from: rec.reshardApplied.from, to: rec.reshardApplied.to } : null,
     reshardNeedsConfirm: rec.reshardNeedsConfirm ?? null,
+    reshardDeferred: rec.reshardDeferred ?? null,
     reshardPaused: rec.reshardPaused ?? null,
   };
 
@@ -3088,6 +3097,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       for (const owed of coordinator?.pendingSourceCleanups() ?? []) {
         const owing = registry.nodes.get(owed.nodeId);
         if (!owing) continue;
+        const what = owed.shardIds.length > 0 ? `shard(s) [${owed.shardIds.join(', ')}]` : 'shards numbered before the last reshard';
         // Connected yet owing: the coordinator asks it again each retry tick;
         // this ask is answered now, and kicks one more retry at once.
         if (owing.connected) {
@@ -3095,9 +3105,9 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
             cleanupRetrying.add(owed.nodeId);
             void coordinator!.retrySourceCleanup(owed.nodeId).catch(() => undefined).finally(() => cleanupRetrying.delete(owed.nodeId));
           }
-          return `${owing.nodeName} still holds the frozen originals of shard(s) [${owed.shardIds.join(', ')}] from a migration whose cleanup it missed; the cleanup is retried now, so ask again shortly, and restart ${owing.nodeName} if this persists`;
+          return `${owing.nodeName} still holds the frozen originals of ${what} from a migration whose cleanup it missed; the cleanup is retried now, so ask again shortly, and restart ${owing.nodeName} if this persists`;
         }
-        return `${owing.nodeName} was down when a migration of shard(s) [${owed.shardIds.join(', ')}] committed and still holds its frozen originals; the transfer waits until ${owing.nodeName} reconnects (its cleanup then runs), or, if it never returns, until it is Declared Lost`;
+        return `${owing.nodeName} was down when a migration of ${what} committed and still holds its frozen originals; the transfer waits until ${owing.nodeName} reconnects (its cleanup then runs), or, if it never returns, until it is Declared Lost`;
       }
       return null;
     };

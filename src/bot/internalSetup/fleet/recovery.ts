@@ -3,7 +3,7 @@
 // registry.json is missing or stale. Standalone never reads the store, so a
 // zero-fleet-env boot stays byte-identical to today.
 
-import type { ControlStore, PersistedNode, PersistedPlan, ReshardMarker } from './controlStore';
+import type { ControlStore, PersistedMigrations, PersistedNode, PersistedPlan, ReshardMarker } from './controlStore';
 import { isReshardConfirmed } from './placement';
 
 export interface RecoveryOptions {
@@ -23,6 +23,8 @@ export interface RecoveryOptions {
    * held reads as free.
    */
   termInherited?: boolean;
+  /** This master's node id: a cleanup it owes itself runs at its own boot. */
+  selfNodeId?: string;
 }
 
 export interface RecoveryResult {
@@ -36,6 +38,8 @@ export interface RecoveryResult {
   reshardAdvised?: { running: number; recommended: number };
   /** Override mismatch without FLEET_CONFIRM_RESHARD: the plan was adopted unchanged, the change awaits confirmation. */
   reshardNeedsConfirm?: { from: number; to: number };
+  /** Confirmed, but a node not Declared Lost still owes a cleanup it missed, or the migration records cannot be read: the plan was adopted unchanged. */
+  reshardDeferred?: { from: number; to: number; reason: string };
   /**
    * Reshard pause: present while reshard-pending.json exists; the boot must
    * not assign any shard until resumed. Fields are null when the marker is
@@ -107,6 +111,19 @@ export async function evaluateRecovery(store: ControlStore, opts: RecoveryOption
       && Number.isFinite(marker.at) && typeof marker.archiveFile === 'string'
       ? marker
       : null;
+    // A crash's re-run of the marker's own count passed this check when the
+    // marker was written; any other confirm (a re-confirm in the pause
+    // included) checks it now.
+    if (usableMarker?.to !== opts.override) {
+      const deferred = await reshardDeferral(store, plan, opts.selfNodeId, paused !== null);
+      if (deferred) {
+        const result = await adoptPlan(store, plan, opts.dataBackend);
+        result.reshardDeferred = { from: plan.shardCount, to: opts.override, reason: deferred };
+        if (paused) result.reshardPaused = paused;
+        console.warn(`[Fleet] FLEET_SHARD_COUNT ${opts.override} is confirmed, but the reshard waits: ${deferred}; keeping ${plan.shardCount} shard(s); restart the master once that is settled`);
+        return result;
+      }
+    }
     return confirmedReshard(store, plan, opts.override, opts.newTerm, usableMarker);
   }
 
@@ -135,6 +152,59 @@ async function adoptPlan(store: ControlStore, plan: PersistedPlan, dataBackend: 
     },
   );
   return { recovered: true, plan, nodes };
+}
+
+/** The nodes still owing a cleanup they missed and not Declared Lost, named from their notes. */
+export function owingNodes(migrations: PersistedMigrations): { nodeId: string; nodeName: string }[] {
+  const owing = new Map<string, string>();
+  for (const rec of [migrations.active, ...migrations.history]) {
+    for (const entry of rec?.pendingSourceCleanup ?? []) {
+      for (const legId of entry.legIds) {
+        const leg = rec!.legs.find(l => l.legId === legId);
+        if (!leg || leg.sourceLostAt !== undefined) continue;
+        if (owing.get(entry.nodeId) === undefined || owing.get(entry.nodeId) === entry.nodeId) owing.set(entry.nodeId, leg.committed?.sourceName ?? entry.nodeId);
+      }
+    }
+  }
+  return [...owing].map(([nodeId, nodeName]) => ({ nodeId, nodeName }));
+}
+
+// A confirmed reshard renumbers every shard, and a cleanup a node missed
+// names its shard by number: the reshard waits while a node not Declared
+// Lost still owes one (it may come back to that shard), and while the
+// records cannot be read. A lost node's note crosses it, kept only as its
+// cleanup by guild ids.
+async function reshardDeferral(store: ControlStore, plan: PersistedPlan, selfNodeId: string | undefined, inPause: boolean): Promise<string | null> {
+  let migrations: PersistedMigrations;
+  try {
+    migrations = await store.loadMigrations();
+  } catch {
+    return 'the migration records cannot be read';
+  }
+  if (migrations.unreadable) return 'the migration records cannot be read';
+  // A copy held for the operator's choice waits on that choice, not on its node.
+  const placed = new Set(plan.assignments.flatMap(a => a.leases.map(l => l.shardId)));
+  const held = new Set<number>();
+  const waiting = new Set<string>();
+  for (const rec of [migrations.active, ...migrations.history]) {
+    for (const entry of rec?.pendingSourceCleanup ?? []) {
+      for (const legId of entry.legIds) {
+        const leg = rec!.legs.find(l => l.legId === legId);
+        if (!leg || leg.sourceLostAt !== undefined) continue;
+        if (leg.heldForChoice && !placed.has(leg.shardId)) held.add(leg.shardId);
+        else waiting.add(entry.nodeId);
+      }
+    }
+  }
+  const owing = owingNodes(migrations).filter(n => waiting.has(n.nodeId));
+  if (held.size === 0 && owing.length === 0) return null;
+  const stored = await store.loadRegistry().then(r => r.nodes).catch(() => [] as PersistedNode[]);
+  const nameOf = (n: { nodeId: string; nodeName: string }): string => stored.find(s => s.nodeId === n.nodeId)?.nodeName ?? n.nodeName;
+  const reasons = owing.map(n => n.nodeId === selfNodeId
+    ? 'this master still owes the cleanup of a migration it missed (it is retried now; restart the master once more after it has run)'
+    : `${nameOf(n)} still owes the cleanup of a migration it missed (bring it back online so the cleanup runs, or Declare it Lost on the Fleet tab)`);
+  if (held.size > 0) reasons.unshift(`shard(s) [${[...held].sort((a, b) => a - b).join(', ')}] wait on the operator's choice on the Fleet tab${inPause ? ' after Resume' : ''} (restore the surviving copy or start the shard empty)`);
+  return reasons.join('; ');
 }
 
 // Confirmed reshard: ownership records are NEVER discarded, only archived.
