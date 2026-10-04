@@ -95,9 +95,25 @@ export interface MigrationActiveView {
   error?: string;
 }
 
+/**
+ * A shard a Declare Lost freed while older copies of it survive on sources
+ * that missed a move's cleanup: it stays unplaced until the operator restores
+ * the newest copy or starts it empty.
+ */
+export interface HeldShardView {
+  shardId: number;
+  lostNodeName: string;
+  heldAt: number;
+  /** The newest copy: one holder, or one per part when a reshard split the shard's guilds. */
+  holders: { nodeId: string; nodeName: string; connected: boolean; draining: boolean; guilds: number; copyAt: number }[];
+  /** Nodes holding older copies, moved to their graveyards after either choice. */
+  older: string[];
+}
+
 export interface MigrationView {
   active: MigrationActiveView | null;
   history: { id: string; kind: string; state: string; error?: string; updatedAt: number }[];
+  heldShards?: HeldShardView[];
 }
 
 export interface PinViolationLeg {

@@ -775,9 +775,13 @@ export interface XferAbortPayload {
   legIds?: string[];
 }
 
-/** Redistribute inventory request/reply (post-reshard placement). */
+/** Redistribute inventory request/reply (post-reshard placement), and a held copy's probe. */
 export interface XferInventoryRequest {
   term: number;
+  /** A held copy's probe (B4f-4 (h)): only these guilds' folders, whatever their stamps. */
+  guilds?: string[];
+  /** The probe's legs, a cleanup of which the node reports still running. */
+  legIds?: string[];
 }
 
 export interface XferInventoryGuild {
@@ -789,6 +793,10 @@ export interface XferInventoryGuild {
 export interface XferInventoryReply {
   ok: boolean;
   guilds: XferInventoryGuild[];
+  /** Set on a probe's answer; a node that ignores the probe answers its full inventory without it. */
+  probe?: boolean;
+  /** A probe's answer: a cleanup of the asked guilds runs on the node, or its next boot finishes one. */
+  cleanupRunning?: boolean;
 }
 
 // ============================================================================

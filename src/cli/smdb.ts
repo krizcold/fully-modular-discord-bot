@@ -31,6 +31,7 @@ Usage:     usage global | usage guilds | usage guild <guildId>
 Fleet:     fleet state|migrations|resume-assignments | assign --shard N --node ID | declare-lost --node ID | drain --node ID
            fleet migrate --kind move|swap|retire|redistribute --body '{...}' | precheck --kind K --body '{...}'
            fleet abort|resume --migration ID | corrupt-lease --shard N (dev hook)
+           fleet held-shard --shard N --restore NODE | --empty   (a shard a Declare Lost held: restore its older copy or start it empty)
 Transform: transform start [--direction file-to-postgres|postgres-to-file] | pause | resume | abort | status
 Data:      bundle export <guildId> <file> | bundle import <file>
            graveyard list | graveyard restore <guildId> [retiredAt | --retired-at MS]

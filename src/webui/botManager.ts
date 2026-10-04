@@ -861,6 +861,16 @@ export class BotManager {
     }
   }
 
+  /** The choice for a shard a Declare Lost held: restore the copy on restoreOn, or (null) start it empty (master-only; validated in the bot child). */
+  async resolveFleetHeldShard(shardId: number, restoreOn: string | null): Promise<any> {
+    try {
+      return await this.sendIPCMessage('fleet:heldShard', { shardId, restoreOn });
+    } catch (error) {
+      console.error('[BotManager] Error resolving the held shard:', error);
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
   /** Retire the stale guild copies of a superseded co-worker in file mode (B4f-2; validated in the bot child). */
   /** The Retire reading of a held mirror copy (B4f-3): drop it so the mirror copies the master this node is registered with. */
   async dropHeldMirrorCopy(): Promise<any> {

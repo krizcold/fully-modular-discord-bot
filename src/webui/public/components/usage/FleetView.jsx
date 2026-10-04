@@ -588,6 +588,63 @@ function FleetPinViolationBanner({ pin, dataBackend, onStarted }) {
   );
 }
 
+// Master-only: shards a Declare Lost left unplaced because an older copy of
+// each survives on a node that missed a move's cleanup. The operator
+// restores the newest copy (named and dated) or starts the shard empty.
+function FleetHeldShardsBanner({ api, held, onChanged }) {
+  const [busy, setBusy] = React.useState(false);
+  if (!held || held.length === 0) return null;
+
+  const choose = (h, holder) => {
+    if (busy) return;
+    const others = h.holders.filter((x) => x !== holder);
+    const older = h.older.length > 0 ? ` Older copies on ${h.older.join(', ')} go to their graveyards.` : '';
+    const text = holder
+      ? `Restore shard ${h.shardId} from ${holder.nodeName}'s copy as of ${new Date(holder.copyAt).toLocaleString()}? Every change to its guilds after that time is gone.`
+        + (others.length > 0 ? ` The ${others.reduce((n, x) => n + x.guilds, 0)} guilds whose copy is on ${others.map((x) => x.nodeName).join(', ')} start empty; that copy goes to its graveyard.` : '')
+        + older
+      : `Start shard ${h.shardId} empty? Its guilds lose their data; the surviving copy on ${h.holders.map((x) => x.nodeName).join(', ')} is kept in that node's graveyard.`
+        + (h.holders.some((x) => !x.connected) ? ' A node that is down moves its copy there once it is back, and the shard starts after that.' : '') + older;
+    if (!confirm(text)) return;
+    setBusy(true);
+    api.post('/fleet/held-shard', holder ? { shardId: h.shardId, restoreOn: holder.nodeId } : { shardId: h.shardId, empty: true })
+      .then((res) => {
+        if (!res || res.success === false) { showToast((res && res.error) || 'The choice failed', 'error'); return; }
+        showToast(holder ? `Shard ${h.shardId} restored from ${holder.nodeName}` : `Shard ${h.shardId} starts empty`, 'success');
+        if (onChanged) onChanged();
+      })
+      .catch((err) => showToast(err.message || 'The choice failed', 'error'))
+      .finally(() => setBusy(false));
+  };
+
+  const buttonStyle = { fontSize: '0.72rem', padding: '2px 8px' };
+  return (
+    <div className="usage-notice" style={{ borderColor: '#e0a030', color: '#e0a030' }}>
+      {held.map((h) => (
+        <div key={h.shardId} style={{ marginTop: '4px' }}>
+          <div>
+            {`Shard ${h.shardId} is held, unserved: its node ${h.lostNodeName} was declared lost ${fleetFormatAge(Date.now() - h.heldAt)}. `}
+            {h.holders.length === 1
+              ? `Its newest surviving copy is on ${h.holders[0].nodeName}, as of ${new Date(h.holders[0].copyAt).toLocaleString()}; changes after that are gone.`
+              : `Its newest surviving copy, as of ${new Date(h.holders[0].copyAt).toLocaleString()}, is split: ${h.holders.map((x) => `${x.nodeName} holds ${x.guilds} of its guilds`).join(', ')}; changes after that are gone.`}
+            {h.holders.some((x) => !x.connected) ? ` Down: ${h.holders.filter((x) => !x.connected).map((x) => x.nodeName).join(', ')}; a copy there can be restored once its node is back.` : ''}
+            {' Restore that copy, or start the shard empty with the copy kept in its graveyard.'}
+          </div>
+          <div style={{ marginTop: '6px', display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
+            {h.holders.map((x) => (
+              <button key={x.nodeId} onClick={() => choose(h, x)} disabled={busy || x.draining || !x.connected} style={buttonStyle}
+                title={x.draining ? `${x.nodeName} is draining and cannot take the shard back` : !x.connected ? `${x.nodeName} is down; restore once it is back` : ''}>
+                {h.holders.length === 1 ? `Restore ${x.nodeName}'s copy` : `Restore ${x.nodeName}'s ${x.guilds} guilds`}
+              </button>
+            ))}
+            <button onClick={() => choose(h, null)} disabled={busy} style={buttonStyle}>Start empty</button>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 // Master-only reshard pause banner: a confirmed reshard archived the previous
 // ownership and froze all automatic assignment; the Resume button (behind a
 // confirm dialog, locked until the stale-holder hold-down elapses) deletes
@@ -807,7 +864,7 @@ function FleetNodeCard({ node, isMasterView, onAction, masterSyncRevision, retir
 
   const dataCaveat = dataBackend === 'postgres'
     ? 'guild data lives in the central database; reassigned guilds keep their data'
-    : "this node's disk holds those guilds' data; reassigned guilds start fresh";
+    : "this node's disk holds those guilds' data; reassigned guilds start fresh, unless an older copy of a shard survives on another node, when you are asked to restore it or start the shard empty";
   const caveatLabel = dataBackend === 'postgres' ? 'Database backend' : 'File-mode warning';
   const buttonStyle = { fontSize: '0.72rem', padding: '2px 8px' };
 
@@ -2304,6 +2361,8 @@ function FleetView({ api, wsClient, guildNames }) {
           {`Over capacity: this master holds ${fleet.overCapacity.shardIds.length} shard${fleet.overCapacity.shardIds.length === 1 ? '' : 's'} [${fleet.overCapacity.shardIds.join(', ')}]${fleet.overCapacity.pinned != null ? ` (plus pinned shard ${fleet.overCapacity.pinned}, which stays here)` : ''} against its declared capacity of ${fleet.overCapacity.capacity}${fleet.overCapacity.alone ? ' as the only node able to hold shards' : ''}. ${fleet.overCapacity.alone ? 'Start another instance, then move shards to it with Move on their rows' : 'Move shards to another instance with Move on their rows'}${reshardHint(fleet)}.`}
         </div>
       )}
+
+      <FleetHeldShardsBanner api={api} held={fleet.migration && fleet.migration.heldShards} onChanged={loadFleet} />
 
       {fleet.unassigned && fleet.unassigned.length > 0 && (
         <div className="usage-notice">

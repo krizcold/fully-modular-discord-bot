@@ -32,6 +32,7 @@ import {
   TransferDirection,
   XferFlushedPayload,
   XferInventoryReply,
+  XferInventoryRequest,
   XferPrepareLeg,
   XferPreparePayload,
   XferPreparedPayload,
@@ -40,7 +41,7 @@ import {
 } from '../protocol';
 import { routeFor } from '../../utils/dataBackends/routeResolver';
 import type { Registry } from '../registry';
-import type { MigrationActiveView, MigrationLegView, MigrationView } from '../state';
+import type { HeldShardView, MigrationActiveView, MigrationLegView, MigrationView } from '../state';
 
 export interface StartMovePayload { kind: 'move'; shardId: number; toNodeId: string; }
 export interface StartSwapLeg { shardId: number; fromNodeId: string; toNodeId: string; }
@@ -61,6 +62,8 @@ export function legsPastCommit(rec: MigrationRecord | null): MigrationLeg[] {
   }
   return rec.state === 'COMMITTING' || rec.state === 'GRANTING' ? rec.legs : [];
 }
+
+type OwedLeg = { rec: MigrationRecord; leg: MigrationLeg; nodeId: string };
 
 export interface PrecheckResult {
   ok: boolean;
@@ -321,6 +324,145 @@ export class MigrationCoordinator {
     return [...byNode.entries()].map(([nodeId, ids]) => ({ nodeId, shardIds: [...ids].sort((a, b) => a - b) }));
   }
 
+  /** Every owed cleanup of the shard's moves, once each, with the node owing it. */
+  private owedLegsOf(shardId: number): OwedLeg[] {
+    const found: OwedLeg[] = [];
+    for (const rec of this.cleanupRecords()) {
+      for (const entry of rec.pendingSourceCleanup ?? []) {
+        for (const legId of entry.legIds) {
+          const leg = rec.legs.find(l => l.legId === legId);
+          if (!leg || leg.shardId !== shardId || leg.direction === 'none') continue;
+          if (found.some(f => f.leg.legId === legId && f.nodeId === entry.nodeId)) continue;
+          found.push({ rec, leg, nodeId: entry.nodeId });
+        }
+      }
+    }
+    return found;
+  }
+
+  /**
+   * A Declare Lost: the copies the lost node still owed cleanups of went
+   * with it, and a freed shard an older copy of which survives on a node
+   * owing that move's cleanup (maybe its last copy) has that cleanup held
+   * for the operator's choice. Returns the shards now held.
+   */
+  async onNodeDeclaredLost(lostNodeId: string, lostNodeName: string, freedShardIds: number[]): Promise<number[]> {
+    const at = Date.now();
+    let changed = false;
+    for (const rec of this.cleanupRecords()) {
+      for (const legId of rec.pendingSourceCleanup?.find(e => e.nodeId === lostNodeId)?.legIds ?? []) {
+        const leg = rec.legs.find(l => l.legId === legId);
+        if (!leg || leg.sourceLostAt !== undefined) continue;
+        leg.sourceLostAt = at;
+        delete leg.heldForChoice;
+        changed = true;
+      }
+    }
+    const held = new Set<number>();
+    for (const shardId of freedShardIds) {
+      for (const { leg } of this.owedLegsOf(shardId)) {
+        if (leg.sourceLostAt !== undefined) continue;
+        if (!leg.heldForChoice) leg.heldForChoice = { lostNodeName, at };
+        held.add(shardId);
+        changed = true;
+      }
+    }
+    if (changed) await this.persist();
+    return [...held].sort((a, b) => a - b);
+  }
+
+  /** A held copy's cleanup waits only while its shard is unplaced; a placement (the restore) ends the wait. */
+  private awaitsChoice(leg: MigrationLeg): boolean {
+    const registry = this.hooks.registry;
+    return leg.heldForChoice !== undefined && !registry.shardTable.has(leg.shardId) && !registry.pendingConfirmation?.has(leg.shardId);
+  }
+
+  /**
+   * A held shard's surviving copies: the newest (the highest commit epoch
+   * of the leg itself, since a retire's record keeps only its last leg's;
+   * one commit decision can leave it split over several nodes) and the
+   * older ones.
+   */
+  private heldCopiesOf(shardId: number): { newest: OwedLeg[]; older: OwedLeg[] } | null {
+    const copies = this.owedLegsOf(shardId).filter(c => c.leg.sourceLostAt === undefined && this.awaitsChoice(c.leg));
+    if (copies.length === 0) return null;
+    const epochOf = (c: OwedLeg): number => c.leg.committed?.epoch ?? c.rec.epoch ?? 0;
+    const newest = Math.max(...copies.map(epochOf));
+    return { newest: copies.filter(c => epochOf(c) === newest), older: copies.filter(c => epochOf(c) !== newest) };
+  }
+
+  /** The shards waiting on the operator's choice, with their newest surviving copy and the nodes holding older ones. */
+  heldShards(): HeldShardView[] {
+    const nodes = this.hooks.registry.nodes;
+    const nameOf = (c: OwedLeg): string => nodes?.get(c.nodeId)?.nodeName ?? c.leg.committed?.sourceName ?? c.nodeId;
+    const views: HeldShardView[] = [];
+    for (const shardId of new Set(this.pendingSourceCleanups().flatMap(owed => owed.shardIds))) {
+      const copies = this.heldCopiesOf(shardId);
+      if (!copies) continue;
+      const first = copies.newest[0];
+      views.push({
+        shardId,
+        lostNodeName: first.leg.heldForChoice!.lostNodeName,
+        heldAt: first.leg.heldForChoice!.at,
+        holders: copies.newest.map(c => ({
+          nodeId: c.nodeId, nodeName: nameOf(c), connected: nodes?.get(c.nodeId)?.connected === true, draining: nodes?.get(c.nodeId)?.draining === true,
+          guilds: c.leg.guilds.length, copyAt: c.leg.committed?.at ?? c.rec.updatedAt,
+        })),
+        older: [...new Set(copies.older.map(nameOf))],
+      });
+    }
+    return views.sort((a, b) => a.shardId - b.shardId);
+  }
+
+  /**
+   * How much of its newest copy of a held shard a node still holds: a
+   * drain's freeze makes a folder for each of the copy's guilds and a
+   * cleanup moves it to the graveyard, so a folder the node still lists is
+   * a guild kept; it also says whether a cleanup of them still runs there,
+   * and an older node answers without the probe's mark. Null when the node
+   * does not answer.
+   */
+  async heldCopyKept(shardId: number, nodeId: string): Promise<{ kept: number; total: number; cleaning: boolean; probed: boolean } | null> {
+    const copies = (this.heldCopiesOf(shardId)?.newest ?? []).filter(c => c.nodeId === nodeId);
+    const guilds = new Set(copies.flatMap(c => c.leg.guilds));
+    const request: XferInventoryRequest = { term: this.hooks.registry.term, guilds: [...guilds], legIds: copies.map(c => c.leg.legId) };
+    let inv: XferInventoryReply | null = null;
+    try {
+      inv = await this.hooks.sendControl(nodeId, MSG.XFER_INVENTORY, request);
+    } catch {
+      return null;
+    }
+    if (!inv?.ok || !Array.isArray(inv.guilds)) return null;
+    const listed = new Set(inv.guilds.map(g => g.guildId));
+    return { kept: [...guilds].filter(guildId => listed.has(guildId)).length, total: guilds.size, cleaning: inv.cleanupRunning === true, probed: inv.probe === true };
+  }
+
+  /**
+   * Why a restore of a held shard onto this holder must wait: the migration
+   * that left its copy still runs or is paused (the release that lifts the
+   * move's freeze waits on it), or a cleanup to that node is in flight.
+   */
+  restoreBlock(shardId: number, nodeId: string): string | null {
+    const live = this.parentRecord ?? this.record;
+    const copies = (this.heldCopiesOf(shardId)?.newest ?? []).filter(c => c.nodeId === nodeId);
+    if (live !== null && !isTerminal(live.state) && copies.some(c => c.rec.id === live.id)) {
+      return `the ${live.kind} that left this copy is still under way; let it finish or abort it, then restore`;
+    }
+    if (this.cleanupRuns.has(nodeId)) return 'a cleanup on that node is under way; ask again shortly';
+    return null;
+  }
+
+  /** The operator chose for a held shard: its copies' cleanups run again. Returns the nodes owing them. */
+  async releaseHeld(shardId: number): Promise<string[]> {
+    const owing = new Set<string>();
+    for (const { leg, nodeId } of this.owedLegsOf(shardId)) {
+      delete leg.heldForChoice;
+      owing.add(nodeId);
+    }
+    await this.persist();
+    return [...owing];
+  }
+
   /** The records a deferred source cleanup lives on: a retire's parent and its running slice, or the active one, and the history. */
   private cleanupRecords(): MigrationRecord[] {
     const records: MigrationRecord[] = [];
@@ -366,7 +508,8 @@ export class MigrationCoordinator {
     const historyView = this.history.slice(-MIGRATION_HISTORY_CAP).map(r => ({
       id: r.id, kind: r.kind, state: r.state, error: r.error, updatedAt: r.updatedAt,
     }));
-    if (!this.record || isTerminal(this.record.state)) return { active: null, history: historyView };
+    const heldShards = this.heldShards();
+    if (!this.record || isTerminal(this.record.state)) return { active: null, history: historyView, heldShards };
     const legs: MigrationLegView[] = this.record.legs.map(leg => {
       const l = this.live.get(leg.legId);
       return {
@@ -392,7 +535,7 @@ export class MigrationCoordinator {
       paused: this.paused || undefined,
       error: this.record.error,
     };
-    return { active, history: historyView };
+    return { active, history: historyView, heldShards };
   }
 
   // --------------------------------------------------------------------------
@@ -846,6 +989,9 @@ export class MigrationCoordinator {
         // confirmation: what the node holds may be what that brought back, so
         // the cleanup stays owed, unsent, until the shard settles.
         if (this.migrating.has(leg.shardId) || this.hooks.registry.pendingConfirmation?.get(leg.shardId)?.nodeId === nodeId) continue;
+        // Maybe the last copy of a shard a Declare Lost left unplaced: kept
+        // until the operator restores it or starts the shard empty.
+        if (this.awaitsChoice(leg)) continue;
         // Ownership guard: the shard is back on this same source, so in file
         // mode its originals are the live copies again and graveyarding them
         // would serve the guilds empty. The source is released instead: the
@@ -868,6 +1014,9 @@ export class MigrationCoordinator {
           // A release counts only when the node reports the freeze and any
           // armed graveyard gone (an older executor does not report it).
           if (ack?.ok && (!back || ack.released === true)) {
+            if (!back && this.awaitsChoice(leg)) {
+              console.warn(`[Migration] Shard ${leg.shardId}: the copy on ${this.hooks.registry.nodes?.get(nodeId)?.nodeName ?? nodeId} went to its graveyard by a cleanup sent before the shard's node was declared lost, so it is not offered`);
+            }
             cleared.add(legId);
             this.releaseWarned.delete(legId);
           } else if (back && ack?.ok && !this.releaseWarned.has(legId)) {
@@ -881,7 +1030,7 @@ export class MigrationCoordinator {
       entry.legIds = entry.legIds.filter(id => !cleared.has(id));
       rec.pendingSourceCleanup = (rec.pendingSourceCleanup ?? []).filter(e => e.legIds.length > 0);
       if (rec.pendingSourceCleanup.length === 0) rec.pendingSourceCleanup = undefined;
-      changed = true;
+      if (cleared.size > 0) changed = true;
     }
     if (changed) await this.persist();
   }
@@ -890,7 +1039,16 @@ export class MigrationCoordinator {
   // commit ran, held while the shard settles, or the ask failed or threw):
   // asked again after a retry tick.
   private rearmCleanup(nodeId: string): void {
-    if (this.pendingSourceCleanups().some(owed => owed.nodeId === nodeId) && this.hooks.registry.nodes?.get(nodeId)?.connected) this.scheduleCleanupRetry(nodeId);
+    if (this.owesUnheld(nodeId) && this.hooks.registry.nodes?.get(nodeId)?.connected) this.scheduleCleanupRetry(nodeId);
+  }
+
+  /** A cleanup the node owes that does not wait on the operator's choice (the choice asks the held ones again). */
+  private owesUnheld(nodeId: string): boolean {
+    return this.cleanupRecords().some(rec => (rec.pendingSourceCleanup ?? []).some(entry => entry.nodeId === nodeId
+      && entry.legIds.some(legId => {
+        const leg = rec.legs.find(l => l.legId === legId);
+        return !leg || !this.awaitsChoice(leg);
+      })));
   }
 
   private readonly cleanupTimers = new Map<string, NodeJS.Timeout>();
@@ -942,6 +1100,10 @@ export class MigrationCoordinator {
     // All match: bump the epoch, persist COMMITTING BEFORE the first commit.
     this.hooks.registry.epoch += 1;
     this.record.epoch = this.hooks.registry.epoch;
+    const committedAt = Date.now();
+    for (const leg of this.record.legs) {
+      leg.committed = { epoch: this.record.epoch, at: committedAt, sourceName: this.hooks.registry.nodes?.get(leg.sourceNodeId)?.nodeName ?? leg.sourceNodeId };
+    }
     await this.enterCommitting(false);
   }
 
@@ -1246,7 +1408,11 @@ export class MigrationCoordinator {
     if (error) this.record.error = error;
     this.record.updatedAt = Date.now();
     this.history.push(this.record);
-    if (this.history.length > MIGRATION_HISTORY_CAP) this.history.shift();
+    if (this.history.length > MIGRATION_HISTORY_CAP) {
+      // A record still owing a source cleanup stays: the debt lives on it.
+      const evict = this.history.findIndex(r => !r.pendingSourceCleanup);
+      if (evict >= 0) this.history.splice(evict, 1);
+    }
     const finished = this.record;
     this.record = null;
     this.live.clear();
@@ -1763,7 +1929,7 @@ export class MigrationCoordinator {
     const active = this.parentRecord ?? this.record;
     const state: PersistedMigrations = {
       active: active && !isTerminal(active.state) ? active : null,
-      history: this.history.slice(-MIGRATION_HISTORY_CAP),
+      history: this.history,
       updatedAt: Date.now(),
     };
     await this.hooks.store.saveMigrations(state);

@@ -33,6 +33,7 @@ import {
   XferDrainPayload,
   XferFlushedPayload,
   XferInventoryReply,
+  XferInventoryRequest,
   XferPreparePayload,
   XferPreparedPayload,
   XferProgressPayload,
@@ -113,7 +114,7 @@ export class MigrationExecutor {
       case MSG.XFER_DRAIN: return this.onDrain(data as XferDrainPayload);
       case MSG.XFER_COMMIT: return this.onCommit(data as XferCommitPayload);
       case MSG.XFER_ABORT: return this.onAbort(data as XferAbortPayload);
-      case MSG.XFER_INVENTORY: return this.onInventory();
+      case MSG.XFER_INVENTORY: return this.onInventory(data as XferInventoryRequest);
       default: return { ok: false, reason: `unknown-xfer:${type}` };
     }
   }
@@ -592,7 +593,21 @@ export class MigrationExecutor {
     return { ok: true, term: payload.term, ...release };
   }
 
-  private async onInventory(): Promise<XferInventoryReply> {
+  private async onInventory(payload?: XferInventoryRequest): Promise<XferInventoryReply> {
+    // A held copy's probe (B4f-4 (h)): which of these guilds' folders are
+    // still here (a drain's freeze made each, a cleanup moves it to the
+    // graveyard), whatever their stamps, and whether a cleanup of them runs
+    // (its commit of the leg) or is left for the next boot to finish (an
+    // armed graveyard-resume marker naming them).
+    if (Array.isArray(payload?.guilds)) {
+      const asked = payload!.guilds.map(String).filter(guildId => /^\d+$/.test(guildId));
+      const kept = asked.filter(guildId => fs.existsSync(path.join(DATA_ROOT, guildId)));
+      const armed = armedSourceGraveyards();
+      if (!armed) return { ok: false, guilds: [] };
+      const cleanupRunning = (payload!.legIds ?? []).some(legId => this.commitsInFlight.has(legId))
+        || asked.some(guildId => armed.has(guildId));
+      return { ok: true, probe: true, guilds: kept.map(guildId => ({ guildId, bytes: 0 })), cleanupRunning };
+    }
     // Post-P4 inventory reads each locally-owned guild's .owner + size. A
     // superseded side's stale copies (B4f-2: its own stamps below the
     // superseding term) are not its data to move and stay out, or a
@@ -666,6 +681,34 @@ export class MigrationExecutor {
 // ============================================================================
 // Free-standing helpers (also used by the boot sweep resolution).
 // ============================================================================
+
+// The guilds an armed graveyard-resume marker names: a cleanup of them runs
+// now, or the next boot finishes it (a corrupt marker graveyards nothing).
+// Null when the markers cannot be read.
+function armedSourceGraveyards(): Set<string> | null {
+  const armed = new Set<string>();
+  const fleetDir = path.join(DATA_ROOT, 'global', 'fleet');
+  const missing = (error: unknown): boolean => (error as NodeJS.ErrnoException).code === 'ENOENT';
+  let names: string[] = [];
+  try {
+    names = fs.readdirSync(fleetDir).filter(name => /^xfer-source-.+\.json$/.test(name));
+  } catch (error) {
+    return missing(error) ? armed : null;
+  }
+  for (const name of names) {
+    let body: string;
+    try {
+      body = fs.readFileSync(path.join(fleetDir, name), 'utf-8');
+    } catch (error) {
+      if (missing(error)) continue;
+      return null;
+    }
+    let parsed: any = null;
+    try { parsed = JSON.parse(body); } catch { continue; }
+    if (parsed?.phase === 'graveyarding' && Array.isArray(parsed.guilds)) for (const guildId of parsed.guilds) armed.add(String(guildId));
+  }
+  return armed;
+}
 
 // Source graveyard-resume marker path (matches residueSweep's reader:
 // /data/global/fleet/xfer-source-{id}.json).

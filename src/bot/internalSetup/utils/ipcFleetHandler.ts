@@ -8,6 +8,7 @@ import {
   fleetAssignShard,
   fleetDeclareLost,
   fleetDrainNode,
+  fleetResolveHeldShard,
   fleetMigrateAbort,
   fleetMigratePrecheck,
   fleetMigrateResume,
@@ -92,6 +93,13 @@ export function setupFleetIPCHandlers(): void {
         case 'fleet:declareLost': {
           const nodeId = String(message.data?.nodeId ?? '');
           const result = await fleetDeclareLost(nodeId);
+          response = result.success ? { success: true } : { success: false, error: result.error };
+          break;
+        }
+        case 'fleet:heldShard': {
+          const shardId = Number(message.data?.shardId);
+          const restoreOn = typeof message.data?.restoreOn === 'string' ? message.data.restoreOn : null;
+          const result = await fleetResolveHeldShard(shardId, restoreOn);
           response = result.success ? { success: true } : { success: false, error: result.error };
           break;
         }

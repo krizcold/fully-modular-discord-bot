@@ -301,6 +301,14 @@ export class Registry {
     }
   }
 
+  /** A shard the master places on a node holding its copy; the next re-grant sends it. */
+  placeOnHolder(nodeId: string, shardId: number): void {
+    const node = this.nodes.get(nodeId);
+    if (!node) return;
+    this.shardTable.set(shardId, { shardId, nodeId, leaseId: randomUUID(), term: this.term, epoch: this.epoch });
+    node.needsGrant = true;
+  }
+
   clearPendingForNode(nodeId: string): void {
     for (const [shardId, pending] of this.pendingConfirmation) {
       if (pending.nodeId === nodeId) this.pendingConfirmation.delete(shardId);

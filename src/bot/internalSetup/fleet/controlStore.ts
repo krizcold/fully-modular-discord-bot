@@ -81,6 +81,17 @@ export interface MigrationLeg {
   /** Per-leg state for the sequential retire pipeline; undefined for single-barrier kinds. */
   legState?: MigrationState;
   error?: string;
+  /** The commit decision's epoch and time, and the source's name then: they order, date and name the copy a source that missed this cleanup still holds. */
+  committed?: { epoch: number; at: number; sourceName: string };
+  /** The source was Declared Lost while it still owed this cleanup: its copy went with it. */
+  sourceLostAt?: number;
+  /**
+   * A Declare Lost freed this leg's shard while its source still owed this
+   * cleanup: that copy may be the last, so the cleanup waits on the
+   * operator's choice (restore it, or start the shard empty) while the
+   * shard stays unplaced.
+   */
+  heldForChoice?: { lostNodeName: string; at: number };
 }
 
 /**

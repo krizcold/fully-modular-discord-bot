@@ -179,6 +179,7 @@ const HANDLERS: Record<string, Handler> = {
   'fleet resume-assignments': (c) => simple(c, 'POST', '/api/fleet/resume-assignments'),
   'fleet declare-lost': (c) => simple(c, 'POST', '/api/fleet/declare-lost', { nodeId: flagStr(c.flags, 'node') || '' }),
   'fleet drain': (c) => simple(c, 'POST', '/api/fleet/drain', { nodeId: flagStr(c.flags, 'node') || '' }),
+  'fleet held-shard': (c) => simple(c, 'POST', '/api/fleet/held-shard', { shardId: flagInt(c.flags, 'shard', -1), restoreOn: flagStr(c.flags, 'restore') ?? null, empty: c.flags.empty === true }),
   'fleet migrate': (c) => simple(c, 'POST', '/api/fleet/migrate', { kind: flagStr(c.flags, 'kind'), ...(parseBody(c, false) as object || {}) }),
   'fleet precheck': (c) => simple(c, 'POST', '/api/fleet/migrate/precheck', { kind: flagStr(c.flags, 'kind'), ...(parseBody(c, false) as object || {}) }),
   'fleet abort': (c) => simple(c, 'POST', '/api/fleet/migrate/abort', { migrationId: flagStr(c.flags, 'migration') || '' }),

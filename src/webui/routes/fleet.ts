@@ -135,6 +135,31 @@ export function createFleetRoutes(botManager: BotManager): Router {
   });
 
   /**
+   * POST /api/fleet/held-shard { shardId, restoreOn } or { shardId, empty: true }
+   * Master-only choice for a shard a Declare Lost held because an older copy
+   * of it survives: restore that copy on its node, or start the shard empty.
+   * The bot child does the authoritative validation; never a 500.
+   */
+  router.post('/held-shard', async (req: Request, res: Response) => {
+    try {
+      if (!botManager.isRunning()) {
+        res.json({ success: false, error: 'Bot is not running' });
+        return;
+      }
+      const restoreOn = typeof req.body?.restoreOn === 'string' && req.body.restoreOn ? req.body.restoreOn : null;
+      if ((restoreOn === null) === (req.body?.empty !== true)) {
+        res.json({ success: false, error: 'choose one: restoreOn (a node id) or empty' });
+        return;
+      }
+      const result = await botManager.resolveFleetHeldShard(Number(req.body?.shardId), restoreOn);
+      res.json(result?.success ? { success: true } : { success: false, error: result?.error ?? 'the choice failed' });
+    } catch (error) {
+      console.error('[Fleet] Failed to resolve the held shard:', error instanceof Error ? error.message : error);
+      res.json({ success: false, error: error instanceof Error ? error.message : 'the choice failed' });
+    }
+  });
+
+  /**
    * POST /api/fleet/drain { nodeId }
    * Master-only manual lease drain of a live worker. The bot child does the
    * authoritative validation; never a 500.

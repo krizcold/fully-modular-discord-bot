@@ -208,6 +208,14 @@ export async function fleetDeclareLost(nodeId: string): Promise<AssignResult> {
   return masterDeclareLost(nodeId);
 }
 
+let masterResolveHeldShard: ((shardId: number, restoreOn: string | null) => Promise<AssignResult>) | null = null;
+
+/** The operator's choice for a shard a Declare Lost held: restore its newest surviving copy on that node, or (null) start it empty. Master-only. */
+export async function fleetResolveHeldShard(shardId: number, restoreOn: string | null): Promise<AssignResult> {
+  if (!masterResolveHeldShard) return { success: false, error: 'This node is not the fleet master' };
+  return masterResolveHeldShard(shardId, restoreOn);
+}
+
 export interface RetireCopiesResult {
   success: boolean;
   needsConfirm?: boolean;
@@ -2196,8 +2204,11 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       && ledgerRefuses(self, [...reGrantSetOf(nodeId), pinnedShardId, ...free.filter(id => id !== pinnedShardId).slice(0, Math.max(0, roomOf(self) - 1))])
       ? LEDGER : 'placement pending';
     const groups = new Map<string, number[]>();
+    const heldIds = new Set(coordinator?.heldShards().map(h => h.shardId) ?? []);
     for (const shardId of free) {
-      const reason = coordinator?.migratingShardIds().has(shardId) || coordinator?.pendingSourceCleanupShardIds().has(shardId)
+      const reason = heldIds.has(shardId)
+        ? 'held: an older copy survives on another node; restore it or start the shard empty'
+        : coordinator?.migratingShardIds().has(shardId) || coordinator?.pendingSourceCleanupShardIds().has(shardId)
           || transformer?.pinnedShardIds().has(shardId)
         ? 'held back by a migration or transformation in progress'
         : resumePendingShards.has(shardId)
@@ -2698,9 +2709,65 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     lastRevokeSentAt.delete(targetNodeId);
     shardIds.sort((a, b) => a - b);
     healthMonitor?.recordLoss({ nodeId: targetNodeId, nodeName: node.nodeName, shardIds, at: Date.now() });
+    // The lost node's owed copies went with it; a freed shard an older copy
+    // of which survives on a node that missed a move's cleanup is held, that
+    // cleanup with it, for the operator's choice.
+    const heldIds = await coordinator?.onNodeDeclaredLost(targetNodeId, node.nodeName, shardIds) ?? [];
     await persist();
-    console.warn(`[Fleet] Node ${node.nodeName} DECLARED LOST; shards [${shardIds.join(', ')}] freed for redistribution`);
+    const heldNote = heldIds.length > 0
+      ? `; shard${heldIds.length === 1 ? '' : 's'} [${heldIds.join(', ')}] held: an older copy survives on another node; restore it or start it empty on the Fleet tab`
+      : '';
+    console.warn(`[Fleet] Node ${node.nodeName} DECLARED LOST; shards [${shardIds.filter(id => !heldIds.includes(id)).join(', ')}] freed for redistribution${heldNote}`);
     void distribute();
+    return { success: true };
+  };
+
+  // The operator's answer for a held shard. Restore places it back on a
+  // node holding the newest copy once that node confirms it still holds it
+  // (its release then lifts the move's freeze there); start empty lets every
+  // held copy's cleanup move it to its node's graveyard, after which the
+  // shard is placed as usual. Older copies go to their graveyards either way.
+  masterResolveHeldShard = async (shardId: number, restoreOn: string | null): Promise<AssignResult> => {
+    const heldNow = () => coordinator?.heldShards().find(h => h.shardId === shardId);
+    const refusal = (): string | null => {
+      if (controlFenced) return 'this master is fenced by the control store';
+      const holdRemainingMs = recoverySource ? recoverySource.holdDownUntil - Date.now() : 0;
+      if (holdRemainingMs > 0) return `recovery hold-down active, ${Math.ceil(holdRemainingMs / 1000)}s remaining`;
+      if (paused) return 'the reshard pause is active; choose after Resume';
+      if (transformer?.hasActive()) return 'a backend transformation is active; choose once it finishes';
+      const held = heldNow();
+      if (!held) return `shard ${shardId} is not waiting on a choice`;
+      if (restoreOn === null) return null;
+      const holder = held.holders.find(h => h.nodeId === restoreOn);
+      if (!holder) return `${registry.nodes.get(restoreOn)?.nodeName ?? (restoreOn || '(none)')} holds no newest copy of shard ${shardId}`;
+      if (!holder.connected) return `${holder.nodeName} is down; restore its copy once it is back, or start the shard empty`;
+      if (holder.draining) return `${holder.nodeName} is draining and cannot take shard ${shardId} back`;
+      return coordinator?.restoreBlock(shardId, restoreOn) ?? null;
+    };
+    const refused = refusal();
+    if (refused || !coordinator) return { success: false, error: refused ?? 'this node is not the fleet master' };
+    let restored = '';
+    if (restoreOn !== null) {
+      const name = heldNow()?.holders.find(h => h.nodeId === restoreOn)?.nodeName ?? restoreOn;
+      const copy = await coordinator.heldCopyKept(shardId, restoreOn);
+      if (!copy) return { success: false, error: `${name} did not answer which guilds of its copy it still holds; try again` };
+      if (!copy.probed) return { success: false, error: `${name} runs an older version that cannot say whether it still holds that copy; update it, then restore` };
+      if (copy.cleaning) return { success: false, error: `${name} is moving that copy to its graveyard (a cleanup sent before the shard's node was declared lost, running or left for its next start); start the shard empty` };
+      if (copy.kept === 0) return { success: false, error: `${name} no longer holds that copy: a cleanup moved it to its graveyard before the shard's node was declared lost; start the shard empty` };
+      const again = refusal();
+      if (again) return { success: false, error: again };
+      const holder = heldNow()!.holders.find(h => h.nodeId === restoreOn)!;
+      registry.epoch += 1;
+      registry.placeOnHolder(restoreOn, shardId);
+      await persist();
+      restored = `${holder.nodeName}'s copy as of ${new Date(holder.copyAt).toISOString()} restored${copy.kept < copy.total ? ` (${copy.kept} of its ${copy.total} guilds; the others were already in its graveyard)` : ''}`;
+    }
+    const owing = await coordinator.releaseHeld(shardId);
+    console.warn(`[Fleet] Shard ${shardId}: ${restored || 'started empty'} by the operator; the other copies go to their graveyards`);
+    void distribute();
+    for (const owingNodeId of owing) {
+      if (registry.nodes.get(owingNodeId)?.connected) void coordinator.retrySourceCleanup(owingNodeId).catch(() => undefined);
+    }
     return { success: true };
   };
 
@@ -3004,6 +3071,10 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       if (node.capabilities?.dataBackend !== 'file') return `the asking node reports the ${node.capabilities?.dataBackend ?? 'unknown'} data backend`;
       if (paused) return 'the reshard pause is active; the transfer waits until it ends';
       if (transformer?.hasActive()) return 'a backend transformation is active; the transfer waits until it finishes or is aborted';
+      // The pin drops the migration history, and with it a shard held for
+      // the operator's choice and the cleanup a node down at a commit owes.
+      const held = coordinator?.heldShards() ?? [];
+      if (held.length > 0) return `shard(s) [${held.map(h => h.shardId).join(', ')}] wait on the operator's choice on this master's Fleet tab (restore an older surviving copy or start empty); the transfer waits until it is made`;
       // The pin drops the migration history, and with it the cleanup a
       // node down at a commit still owes of its frozen originals.
       for (const owed of coordinator?.pendingSourceCleanups() ?? []) {
