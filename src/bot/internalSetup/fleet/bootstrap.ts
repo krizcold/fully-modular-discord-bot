@@ -26,7 +26,7 @@ import {
   TERM_TAKEOVER_STALE_MS,
   XFER_COMMIT_RETRY_MS,
 } from './constants';
-import { DataBackendInfo, FleetConfigPayload, HeartbeatPayload, LeaseGrantPayload, LeaseInfo, LeaseRenewedPayload, LeaseRevokePayload, MSG, NodeCapabilities, NodeDrainPayload, NodeRole, RegisterPayload, RegisterResult, SlotStatusPayload, SyncPosturePayload } from './protocol';
+import { DataBackendInfo, FleetConfigPayload, HeartbeatPayload, LeaseGrantPayload, LeaseRenewedPayload, LeaseRevokePayload, MSG, NodeCapabilities, NodeDrainPayload, NodeRole, RegisterPayload, RegisterResult, SlotStatusPayload, SyncPosturePayload } from './protocol';
 import {
   clearRoleOverride,
   consentsToActiveMode,
@@ -1825,26 +1825,6 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     return fullShardIds;
   }
 
-  // Mark a maybe-applied grant's NEW shards pending-confirmation (NOT free)
-  // so they are never granted elsewhere and dual-identified.
-  function stampPendingGrant(pendingNodeId: string, leases: LeaseInfo[], epoch: number): number[] {
-    const alreadyHeld = new Set(registry.shardIdsOf(pendingNodeId));
-    const pendingIds: number[] = [];
-    for (const lease of leases) {
-      if (alreadyHeld.has(lease.shardId)) continue;
-      registry.pendingConfirmation.set(lease.shardId, {
-        shardId: lease.shardId,
-        nodeId: pendingNodeId,
-        leaseId: lease.leaseId,
-        term: registry.term,
-        epoch,
-        grantedAt: performance.now(),
-      });
-      pendingIds.push(lease.shardId);
-    }
-    return pendingIds;
-  }
-
   async function grantShardsTo(node: RegistryNode, fullShardIds: number[], epoch: number): Promise<{ ok: boolean; pending: boolean }> {
     const identifying = ledger ? shardsForcingIdentify(node, fullShardIds) : [];
     if (ledger && identifying.length > 0) {
@@ -1887,7 +1867,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     if (node.isSelf) {
       const ack = await runtime.applyGrant(grant);
       if (ack.ok) {
-        registry.applyAssignment(node.nodeId, leases, registry.term, epoch);
+        revokeStrayGrants(registry.applyAssignment(node.nodeId, leases, registry.term, epoch));
         node.needsGrant = false;
       } else {
         ledger?.release(node.nodeId, identifying.length);
@@ -1905,13 +1885,13 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       // pending (off the free pool) until the teardown revoke is confirmed.
       if (registry.nodes.get(node.nodeId)?.draining) {
         if (ack?.ok) {
-          stampPendingGrant(node.nodeId, leases, epoch);
+          registry.stampPendingGrant(node.nodeId, leases, epoch);
           void revokeDrainedGrant(node.nodeId, grantLeaseIds);
         }
         return { ok: false, pending: false };
       }
       if (ack?.ok) {
-        registry.applyAssignment(node.nodeId, leases, registry.term, epoch);
+        revokeStrayGrants(registry.applyAssignment(node.nodeId, leases, registry.term, epoch));
         registry.clearPendingForNode(node.nodeId);
         node.needsGrant = false;
         return { ok: true, pending: false };
@@ -1922,7 +1902,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       return { ok: false, pending: false };
     } catch (error) {
       if (registry.nodes.get(node.nodeId)?.draining) {
-        stampPendingGrant(node.nodeId, leases, epoch);
+        registry.stampPendingGrant(node.nodeId, leases, epoch);
         void revokeDrainedGrant(node.nodeId, grantLeaseIds);
         return { ok: false, pending: false };
       }
@@ -1931,7 +1911,8 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       // UNACKED grant fence: the worker may have applied it despite the lost
       // ack; heartbeats resolve the pending shards. The reservation is kept
       // (conservative); the budget refresh reconciles it against live truth.
-      const pendingIds = stampPendingGrant(node.nodeId, leases, epoch);
+      const pendingIds = registry.stampPendingGrant(node.nodeId, leases, epoch);
+      revokeStrayGrants(registry.placedElsewhere(node.nodeId, leases));
       console.warn(
         `[Fleet] Grant to ${node.nodeName} unacked; shards [${pendingIds.join(', ')}] pending confirmation:`,
         error instanceof Error ? error.message : error,
@@ -1943,18 +1924,10 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     }
   }
 
-  function pendingShardIdsOf(pendingNodeId: string): number[] {
-    const ids: number[] = [];
-    for (const pending of registry.pendingConfirmation.values()) {
-      if (pending.nodeId === pendingNodeId) ids.push(pending.shardId);
-    }
-    return ids;
-  }
-
   // Full re-grant set: table leases plus unconfirmed pending grants, so a
   // re-grant never shrinks (and bounces) a worker that applied an unacked one.
   function reGrantSetOf(grantNodeId: string): number[] {
-    return [...new Set([...registry.shardIdsOf(grantNodeId), ...pendingShardIdsOf(grantNodeId)])].sort((a, b) => a - b);
+    return [...new Set([...registry.shardIdsOf(grantNodeId), ...registry.pendingShardIdsOf(grantNodeId)])].sort((a, b) => a - b);
   }
 
   // Phase R: re-grant each connected node's full CURRENT set under the current
@@ -2067,7 +2040,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     // they book capacity - otherwise a returning worker whose set is split
     // table/pending is undercounted and wins a free shard over its cap.
     const placements = pickFreePlacements(pool, candidates, registry, node =>
-      targetFor(node, alone) - pendingShardIdsOf(node.nodeId).length - (grantsByNode.get(node.nodeId)?.length ?? 0));
+      targetFor(node, alone) - registry.pendingShardIdsOf(node.nodeId).length - (grantsByNode.get(node.nodeId)?.length ?? 0));
     for (const [placedNodeId, shardIds] of placements) {
       for (const shardId of shardIds) addGrant(placedNodeId, shardId);
     }
@@ -2181,7 +2154,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     }
     const alone = !otherNodeCanHoldShards(registry);
     const roomOf = (n: RegistryNode): number =>
-      targetFor(n, alone) - registry.shardIdsOf(n.nodeId).length - pendingShardIdsOf(n.nodeId).length;
+      targetFor(n, alone) - registry.shardIdsOf(n.nodeId).length - registry.pendingShardIdsOf(n.nodeId).length;
     const withRoom = [...registry.nodes.values()].filter(n => n.connected && !n.draining && roomOf(n) > 0);
     // Priced like the grant distributeOnce composes: a changed shape
     // identifies the whole set, a same-shape grant identifies nothing and
@@ -2430,6 +2403,22 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       }
     } catch (error) {
       console.warn(`[Fleet] Drain-race revoke to ${drainNodeId} unacked; retrying off heartbeats:`, error instanceof Error ? error.message : error);
+    }
+  }
+
+  // A session a node may run from a grant whose shard the table (or another
+  // node's stamp) records elsewhere: that record stands, so the session goes.
+  // A node not connected has it revoked by its register's reconcile.
+  function revokeStrayGrants(strays: { nodeId: string; leaseId: string }[]): void {
+    for (const strayNodeId of new Set(strays.map(s => s.nodeId))) {
+      const node = registry.nodes.get(strayNodeId);
+      if (!node?.connected || node.isSelf) continue;
+      const leaseIds = strays.filter(s => s.nodeId === strayNodeId).map(s => s.leaseId);
+      sendRevoke(strayNodeId, { term: registry.term, leaseIds, reason: 'shard placed on another node' })
+        .then(ack => {
+          if (!ack?.ok) console.warn(`[Fleet] Revoke of ${leaseIds.length} stray lease(s) refused by ${node.nodeName}: ${ack?.reason ?? 'unknown'}`);
+        })
+        .catch(error => console.warn(`[Fleet] Revoke of ${leaseIds.length} stray lease(s) to ${node.nodeName} failed:`, error instanceof Error ? error.message : error));
     }
   }
 
@@ -2684,9 +2673,11 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       shardIds.push(shardId);
       registry.shardTable.delete(shardId);
     }
+    // A stamp whose shard the table records under another node was never this node's.
+    const ownStamps = new Set(registry.pendingShardIdsOf(targetNodeId));
     for (const [shardId, pending] of registry.pendingConfirmation) {
       if (pending.nodeId !== targetNodeId) continue;
-      shardIds.push(shardId);
+      if (ownStamps.has(shardId)) shardIds.push(shardId);
       registry.pendingConfirmation.delete(shardId);
     }
     // A migration's grant to this node that has not landed: the copy its
@@ -4032,7 +4023,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     // re-run free-shard distribution so on-hold workers claim newly-free
     // shards and drift cannot persist.
     if (!standalone && graceOver) {
-      registry.reconcilePending();
+      revokeStrayGrants(registry.reconcilePending());
       void distribute();
       evaluatePinViolation();
     }

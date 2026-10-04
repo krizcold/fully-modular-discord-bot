@@ -278,11 +278,19 @@ export class Registry {
     }
   }
 
-  applyAssignment(nodeId: string, leases: LeaseInfo[], term: number, epoch: number): void {
+  /** An acked grant; another node's stamp on a granted shard is dropped and returned for the master to revoke. */
+  applyAssignment(nodeId: string, leases: LeaseInfo[], term: number, epoch: number): { nodeId: string; leaseId: string }[] {
     this.clearNodeAssignment(nodeId);
+    const strays: { nodeId: string; leaseId: string }[] = [];
     for (const lease of leases) {
       this.shardTable.set(lease.shardId, { shardId: lease.shardId, nodeId, leaseId: lease.leaseId, term, epoch });
+      const stamped = this.pendingConfirmation.get(lease.shardId);
+      if (stamped && stamped.nodeId !== nodeId) {
+        strays.push({ nodeId: stamped.nodeId, leaseId: stamped.leaseId });
+        this.pendingConfirmation.delete(lease.shardId);
+      }
     }
+    return strays;
   }
 
   clearNodeAssignment(nodeId: string): void {
@@ -291,13 +299,63 @@ export class Registry {
     }
   }
 
+  /**
+   * Mark a maybe-applied grant's NEW shards pending-confirmation (NOT free)
+   * so they are never granted elsewhere and dual-identified. A shard the
+   * table records (the node's own, or another node's placed there since: a
+   * Declare Lost during the ack wait re-places the node's shards) or another
+   * node's stamp records is left as it is.
+   */
+  stampPendingGrant(nodeId: string, leases: LeaseInfo[], epoch: number): number[] {
+    const pendingIds: number[] = [];
+    for (const lease of leases) {
+      if (this.shardTable.has(lease.shardId)) continue;
+      const stamped = this.pendingConfirmation.get(lease.shardId);
+      if (stamped && stamped.nodeId !== nodeId) continue;
+      this.pendingConfirmation.set(lease.shardId, {
+        shardId: lease.shardId,
+        nodeId,
+        leaseId: lease.leaseId,
+        term: this.term,
+        epoch,
+        grantedAt: performance.now(),
+      });
+      pendingIds.push(lease.shardId);
+    }
+    return pendingIds;
+  }
+
+  /** The node's stamped shards, but for one the table records under another node (the reconcile drops that stamp). */
+  pendingShardIdsOf(nodeId: string): number[] {
+    const ids: number[] = [];
+    for (const pending of this.pendingConfirmation.values()) {
+      if (pending.nodeId !== nodeId) continue;
+      const placed = this.shardTable.get(pending.shardId);
+      if (placed && placed.nodeId !== nodeId) continue;
+      ids.push(pending.shardId);
+    }
+    return ids;
+  }
+
+  /** The node's leases among a grant's whose shard the table or a stamp records under another node. */
+  placedElsewhere(nodeId: string, leases: LeaseInfo[]): { nodeId: string; leaseId: string }[] {
+    return leases.filter(l => {
+      const owner = this.shardTable.get(l.shardId)?.nodeId ?? this.pendingConfirmation.get(l.shardId)?.nodeId;
+      return owner !== undefined && owner !== nodeId;
+    }).map(l => ({ nodeId, leaseId: l.leaseId }));
+  }
+
   /** The node's pending grants among shardIds, held as its leases (frozen while it is not connected). */
   holdPendingAsLeases(nodeId: string, shardIds: number[]): void {
     for (const shardId of shardIds) {
       const pending = this.pendingConfirmation.get(shardId);
       if (pending?.nodeId !== nodeId) continue;
-      this.shardTable.set(shardId, { shardId, nodeId, leaseId: pending.leaseId, term: pending.term, epoch: pending.epoch });
       this.pendingConfirmation.delete(shardId);
+      // Placed on another node since: that record stands (the node's register
+      // revokes a session it kept).
+      const placed = this.shardTable.get(shardId);
+      if (placed && placed.nodeId !== nodeId) continue;
+      this.shardTable.set(shardId, { shardId, nodeId, leaseId: pending.leaseId, term: pending.term, epoch: pending.epoch });
     }
   }
 
@@ -342,11 +400,14 @@ export class Registry {
    * Resolve pending-confirmation shards from heartbeat truth. Heartbeats that
    * reach the registry are already valid-term (the control server fences stale
    * terms), so a target node's reported shard set is authoritative once a
-   * heartbeat lands AFTER the grant: present -> confirm the lease; absent ->
-   * the grant never took, free the shard.
+   * heartbeat lands AFTER the grant: present -> confirm the lease, unless the
+   * shard was placed on another node since (that record stands, and the
+   * session is returned for the master to revoke); absent -> the grant never
+   * took, free the shard.
    */
-  reconcilePending(): void {
+  reconcilePending(): { nodeId: string; leaseId: string }[] {
     const confirmedNodes = new Set<string>();
+    const strays: { nodeId: string; leaseId: string }[] = [];
     for (const [shardId, pending] of this.pendingConfirmation) {
       const node = this.nodes.get(pending.nodeId);
       if (!node) {
@@ -365,8 +426,13 @@ export class Registry {
       }
       if (node.lastHeartbeatAt === null || node.lastHeartbeatAt <= pending.grantedAt) continue;
       if (node.shards.some(s => s.shardId === shardId)) {
-        this.shardTable.set(shardId, { shardId, nodeId: pending.nodeId, leaseId: pending.leaseId, term: pending.term, epoch: pending.epoch });
-        confirmedNodes.add(pending.nodeId);
+        const placed = this.shardTable.get(shardId);
+        if (placed && placed.nodeId !== pending.nodeId) {
+          strays.push({ nodeId: pending.nodeId, leaseId: pending.leaseId });
+        } else {
+          this.shardTable.set(shardId, { shardId, nodeId: pending.nodeId, leaseId: pending.leaseId, term: pending.term, epoch: pending.epoch });
+          confirmedNodes.add(pending.nodeId);
+        }
       }
       this.pendingConfirmation.delete(shardId);
     }
@@ -384,6 +450,7 @@ export class Registry {
           .map(l => ({ leaseId: l.leaseId, shardId: l.shardId })),
       };
     }
+    return strays;
   }
 
   healthOf(node: RegistryNode): NodeHealth {
