@@ -97,6 +97,13 @@ const FENCED_OWNERSHIP_UPDATE = `
    WHERE guild_id = $1
      AND ((term, epoch) < ($4, $5) OR ((term, epoch) = ($4, $5) AND node_id = $2))`;
 
+const OWNER_SELECT = `SELECT node_id, term, epoch FROM smdb_data.guild_ownership WHERE guild_id = $1`;
+
+const OWNERSHIP_RECLAIM = `
+  UPDATE smdb_data.guild_ownership
+     SET shard_id = $3, term = $4, epoch = $5, shard_count = $6, updated_at = now()
+   WHERE guild_id = $1 AND node_id = $2 AND (term, epoch) <= ($4, $5)`;
+
 const OWNERSHIP_INSERT = `
   INSERT INTO smdb_data.guild_ownership (guild_id, node_id, shard_id, term, epoch, shard_count)
   VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (guild_id) DO NOTHING`;
@@ -493,6 +500,57 @@ export class PostgresBackend implements DataBackend {
     }
   }
 
+  /**
+   * A working set kept since its lease left, asked for again: the stamp
+   * moves to the new token only while it still names this node (or the
+   * guild has none), so a claim another node made since is never passed
+   * over. A copy in recovery takes no claim: its stamp is read instead (the
+   * first flush claims it).
+   */
+  async reclaimGuild(guildId: string, token: FenceToken): Promise<'kept' | 'lost' | null> {
+    let client: PoolClient;
+    try {
+      client = await this.pool.connect();
+    } catch (error) {
+      this.noteFailure(error);
+      return null;
+    }
+    const byStamp = async (): Promise<'kept' | 'lost'> => {
+      const nodeId = (await client.query(OWNER_SELECT, [guildId])).rows[0]?.node_id;
+      return nodeId === undefined || nodeId === token.nodeId ? 'kept' : 'lost';
+    };
+    let destroy = false;
+    try {
+      if (this.readOnly && await this.stillInRecovery(client)) {
+        const kept = await byStamp();
+        this.noteSuccess();
+        return kept;
+      }
+      const params = this.fenceParams(guildId, token);
+      let kept = ((await client.query(OWNERSHIP_RECLAIM, params)).rowCount ?? 0) === 1;
+      if (!kept) kept = ((await client.query(OWNERSHIP_INSERT, params)).rowCount ?? 0) === 1;
+      this.noteSuccess();
+      return kept ? 'kept' : 'lost';
+    } catch (error) {
+      let failure: unknown = error;
+      if (isReadOnlyError(error) && await this.recoveryAfterError(client)) {
+        this.markReadOnly();
+        try {
+          const kept = await byStamp();
+          this.noteSuccess();
+          return kept;
+        } catch (again) {
+          failure = again;
+        }
+      }
+      destroy = true;
+      this.noteFailure(failure);
+      return null;
+    } finally {
+      client.release(destroy ? true : undefined);
+    }
+  }
+
   private async readGuildDocs(client: PoolClient, guildId: string): Promise<{ docs: { key: { module: string; filename: string }; doc: string }[]; appendKeys: { module: string; filename: string }[] }> {
     const docsRes = await client.query(
       `SELECT module, filename, doc FROM smdb_data.guild_data WHERE guild_id = $1`, [guildId]);
@@ -690,8 +748,7 @@ export class PostgresBackend implements DataBackend {
 
   private async readOwner(client: PoolClient, guildId: string): Promise<{ nodeId: string; term: number; epoch: number } | undefined> {
     try {
-      const res = await client.query(
-        `SELECT node_id, term, epoch FROM smdb_data.guild_ownership WHERE guild_id = $1`, [guildId]);
+      const res = await client.query(OWNER_SELECT, [guildId]);
       const row = res.rows[0];
       if (!row) return undefined;
       return { nodeId: row.node_id, term: Number(row.term), epoch: Number(row.epoch) };

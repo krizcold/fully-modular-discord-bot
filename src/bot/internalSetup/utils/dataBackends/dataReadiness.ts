@@ -99,9 +99,9 @@ export class DataReadinessDriver {
     this.shardCount = snapshot.shardCount;
     this.lease = snapshot;
     if (this.held) return;
-    // Same-shape re-grant: refresh fences only, never re-hydrate.
+    // Same-shape re-grant: refresh the leased guilds' fences only, never re-hydrate.
     for (const guildId of this.ws.readyGuilds()) {
-      this.ws.refreshFence(guildId, this.fenceFor(guildId));
+      if (this.isLeasedHere(guildId)) this.ws.refreshFence(guildId, this.fenceFor(guildId));
     }
     if (removed.length > 0) void this.unloadShards(removed);
     if (added.length > 0) void this.hydrateShards(added);
@@ -235,7 +235,13 @@ export class DataReadinessDriver {
     for (let attempt = 0; !this.stopped; attempt++) {
       if (!this.isLeasedHere(guildId)) return;
       const outcome = await this.ws.hydrate(guildId, this.fenceFor(guildId));
-      if (outcome === 'ready') return;
+      if (outcome === 'ready') {
+        // Its lease moved while it hydrated: a re-grant renews the fence, a
+        // revoke keeps it frozen, never served unleased.
+        if (this.isLeasedHere(guildId)) this.ws.refreshFence(guildId, this.fenceFor(guildId));
+        else await this.ws.unloadToFrozenRetained(guildId, () => !this.isLeasedHere(guildId));
+        return;
+      }
       if (outcome === 'deposed') {
         // A 0-row claim: a newer owner holds this guild. A healthy node must
         // not sit on a lease it can never serve - decline immediately (fleet
@@ -252,7 +258,7 @@ export class DataReadinessDriver {
     const removed = new Set(shards);
     for (const guildId of this.ws.readyGuilds()) {
       if (removed.has(guildIdToShardId(guildId, this.shardCount || 1))) {
-        await this.ws.unloadToFrozenRetained(guildId);
+        await this.ws.unloadToFrozenRetained(guildId, () => !this.isLeasedHere(guildId));
       }
     }
   }

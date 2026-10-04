@@ -49,6 +49,8 @@ export interface DataBackend {
   connectionState(): { state: 'connecting' | 'ready' | 'outage'; outageSinceMs?: number };
   /** Claim-then-read in one transaction; the claim is the ownership stamp. */
   hydrateGuild(guildId: string, token: FenceToken): Promise<HydrationOutcome>;
+  /** A kept working set asked for again: its guild re-stamped for the token only while the stamp still names this node ('kept'), else 'lost'; null when the store cannot be read. */
+  reclaimGuild(guildId: string, token: FenceToken): Promise<'kept' | 'lost' | null>;
   flushGuild(guildId: string, batch: GuildFlushBatch, token: FenceToken): Promise<FlushOutcome>;
   retireGuild(guildId: string, reason: string, token: FenceToken): Promise<RetireOutcome>;
   restoreGuild(guildId: string, retiredAt: number, token: FenceToken): Promise<{ ok: true; moved: number } | { ok: false; reason: string }>;

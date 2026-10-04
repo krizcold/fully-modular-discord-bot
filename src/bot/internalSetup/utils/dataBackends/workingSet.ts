@@ -255,10 +255,39 @@ export class WorkingSetManager {
    */
   async hydrate(guildId: string, token: FenceToken): Promise<'ready' | 'deposed' | 'unavailable'> {
     let ws = this.sets.get(guildId);
+    // A set kept since its lease left is current only while no other node
+    // has claimed the guild since (an aborted move hands the shard straight
+    // back): re-stamped for the new grant, or dropped and read again. No
+    // flush of its old writes starts meanwhile.
+    if (ws?.state === 'frozen-retained') {
+      if (ws.flushInFlight) return 'unavailable';
+      const retained = ws;
+      retained.flushInFlight = true;
+      const reclaim = await this.backend.reclaimGuild(guildId, token);
+      retained.flushInFlight = false;
+      if (retained.requeue || retained.dirtyKeys.size > 0) {
+        retained.requeue = false;
+        this.scheduleRetry();
+      }
+      if (reclaim === null) return 'unavailable';
+      ws = this.sets.get(guildId);
+      if (reclaim === 'lost' && ws === retained) {
+        if (retained.dirtyKeys.size > 0) {
+          console.warn(`[Data] Guild ${guildId}: ${retained.dirtyKeys.size} unflushed write(s) kept since its lease left are dropped, as another node has owned it since; it is read again from the store`);
+        }
+        this.evict(guildId);
+        ws = undefined;
+      }
+    }
     if (ws && (ws.state === 'ready' || ws.state === 'frozen-retained')) {
       ws.fence = token;
       if (ws.state === 'frozen-retained') ws.state = 'ready';
       return 'ready';
+    }
+    // A deposed set is never revived: a new one is read.
+    if (ws?.state === 'fenced') {
+      this.evict(guildId);
+      ws = undefined;
     }
     if (!ws) {
       ws = new GuildWorkingSet(guildId, token);
@@ -291,10 +320,14 @@ export class WorkingSetManager {
     return 'ready';
   }
 
-  /** Same-shape re-grant: refresh the fence only, never re-hydrate. */
+  /**
+   * Same-shape re-grant: refresh a served set's fence only, never
+   * re-hydrate. A kept set takes a new fence only through hydrate's
+   * re-stamp, so its late flush stays deposed by any newer claim.
+   */
   refreshFence(guildId: string, token: FenceToken): void {
     const ws = this.sets.get(guildId);
-    if (ws) ws.fence = token;
+    if (ws?.state === 'ready') ws.fence = token;
   }
 
   /**
@@ -302,11 +335,12 @@ export class WorkingSetManager {
    * enters frozen-retained (reads keep serving, writes get the frozen
    * rejection). Eviction happens at migration source-cleanup or drain end.
    */
-  async unloadToFrozenRetained(guildId: string): Promise<void> {
+  async unloadToFrozenRetained(guildId: string, stillGone: () => boolean = () => true): Promise<void> {
     const ws = this.sets.get(guildId);
     if (!ws || ws.state === 'fenced') return;
     await this.flushGuildNow(guildId, MAX_DELAY_MS);
-    if (ws.state === 'ready') ws.state = 'frozen-retained';
+    // A lease back while the flush ran keeps the set served.
+    if (ws.state === 'ready' && stillGone()) ws.state = 'frozen-retained';
   }
 
   evict(guildId: string): void {
@@ -567,7 +601,9 @@ export class WorkingSetManager {
     this.forgetDirty(ws);
     ws.state = 'fenced';
     ws.clearTimers();
-    ws.fencedDrainTimer = setTimeout(() => this.evict(ws.guildId), FENCED_DRAIN_MS);
+    ws.fencedDrainTimer = setTimeout(() => {
+      if (this.sets.get(ws.guildId) === ws) this.evict(ws.guildId);
+    }, FENCED_DRAIN_MS);
     ws.fencedDrainTimer.unref();
   }
 
