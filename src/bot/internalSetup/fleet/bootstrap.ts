@@ -1926,6 +1926,8 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
         void revokeDrainedGrant(node.nodeId, grantLeaseIds);
         return { ok: false, pending: false };
       }
+      // Declared Lost during the ack wait: its shards went with it.
+      if (!registry.nodes.has(node.nodeId)) return { ok: false, pending: false };
       // UNACKED grant fence: the worker may have applied it despite the lost
       // ack; heartbeats resolve the pending shards. The reservation is kept
       // (conservative); the budget refresh reconciles it against live truth.
@@ -2686,6 +2688,11 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       if (pending.nodeId !== targetNodeId) continue;
       shardIds.push(shardId);
       registry.pendingConfirmation.delete(shardId);
+    }
+    // A migration's grant to this node that has not landed: the copy its
+    // commit put there went with the node.
+    for (const shardId of coordinator?.grantsOwedTo(targetNodeId) ?? []) {
+      if (!shardIds.includes(shardId)) shardIds.push(shardId);
     }
     // A Resume grant awaiting this node (it held the data the reshard placed
     // there) can never land now: its shards leave the resume fence with it.

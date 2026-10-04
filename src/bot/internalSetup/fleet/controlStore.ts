@@ -85,6 +85,8 @@ export interface MigrationLeg {
   committed?: { epoch: number; at: number; sourceName: string };
   /** The source was Declared Lost while it still owed this cleanup: its copy went with it. */
   sourceLostAt?: number;
+  /** The target was Declared Lost before this leg's grant landed: the copy its commit put there went with it. */
+  targetLostAt?: number;
   /**
    * A Declare Lost freed this leg's shard while its source still owed this
    * cleanup: that copy may be the last, so the cleanup waits on the

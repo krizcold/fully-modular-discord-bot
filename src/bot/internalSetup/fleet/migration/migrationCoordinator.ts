@@ -297,6 +297,19 @@ export class MigrationCoordinator {
     return this.migrating;
   }
 
+  /** The shards the granting migration still owes nodeId. */
+  grantsOwedTo(nodeId: string): number[] {
+    return this.grantLegsOwedTo(nodeId).map(l => l.shardId);
+  }
+
+  // A retire paused between legs keeps its last leg's state on the parent,
+  // so only a running slice of a retire is granting.
+  private grantLegsOwedTo(nodeId: string): MigrationLeg[] {
+    const rec = this.record;
+    if (rec?.state !== 'GRANTING' || (rec.kind === 'retire' && this.parentRecord === null)) return [];
+    return rec.legs.filter(l => l.targetNodeId === nodeId && l.targetLostAt === undefined);
+  }
+
   /**
    * Shards with a still-pending source cleanup (a source down at COMMITTING whose
    * originals were deferred). Fenced OFF the free pool so a shard freed by a
@@ -364,6 +377,16 @@ export class MigrationCoordinator {
   async onNodeDeclaredLost(lostNodeId: string, lostNodeName: string, freedShardIds: number[]): Promise<number[]> {
     const at = Date.now();
     let changed = false;
+    // Its owed grants can never land: the grant round settles them (a
+    // retire's slice is not what persist writes, so its parent's leg too).
+    const lostLegIds = new Set(this.grantLegsOwedTo(lostNodeId).map(l => l.legId));
+    for (const rec of new Set([this.record, this.parentRecord])) {
+      for (const leg of rec?.legs ?? []) {
+        if (!lostLegIds.has(leg.legId) || leg.targetLostAt !== undefined) continue;
+        leg.targetLostAt = at;
+        changed = true;
+      }
+    }
     for (const rec of this.cleanupRecords()) {
       for (const legId of rec.pendingSourceCleanup?.find(e => e.nodeId === lostNodeId)?.legIds ?? []) {
         const leg = rec.legs.find(l => l.legId === legId);
@@ -1261,6 +1284,7 @@ export class MigrationCoordinator {
     const rec = this.record;
     const byTarget = new Map<string, number[]>();
     for (const leg of rec.legs) {
+      if (leg.targetLostAt !== undefined) continue;
       const arr = byTarget.get(leg.targetNodeId) ?? [];
       arr.push(leg.shardId);
       byTarget.set(leg.targetNodeId, arr);
@@ -1288,14 +1312,17 @@ export class MigrationCoordinator {
     // retry. A hard grant refusal (ledger floor, target draining) must NEVER
     // finish DONE with the shard stranded off the free pool it would fall into,
     // so the migrating fence is held until every target's grant lands and the
-    // grant is retried on a timer. An unacked grant is pending-confirmation
-    // fenced by grantShardsTo; that counts as landed here.
+    // grant is retried on a timer. An unacked grant lands only where the
+    // table records the target's lease for each moved shard (the hook holds a
+    // target not connected its stamps as its frozen leases): a connected
+    // target's stamp is freed by its first heartbeat without the shard.
     let allGranted = true;
     for (const targetNodeId of order) {
       const moved = byTarget.get(targetNodeId) ?? [];
       const fullSet = [...new Set([...this.hooks.registry.shardIdsOf(targetNodeId), ...moved])].sort((a, b) => a - b);
       const res = await this.hooks.grantShardsTo(targetNodeId, fullSet, epoch);
-      if (!res.ok && !res.pending) allGranted = false;
+      const held = res.pending && moved.every(shardId => this.hooks.registry.shardTable.get(shardId)?.nodeId === targetNodeId);
+      if (!res.ok && !held) allGranted = false;
     }
     await this.hooks.persistPlan();
     if (!allGranted) {
@@ -1305,7 +1332,7 @@ export class MigrationCoordinator {
       return;
     }
     this.clearGrantRetry();
-    // All targets granted (or pending-confirmation fenced): release the fence.
+    // All targets granted (or held as their leases): release the fence.
     this.unfenceShards(rec.legs.map(l => l.shardId));
     await this.finish('DONE');
   }
