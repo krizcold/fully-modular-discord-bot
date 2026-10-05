@@ -1832,14 +1832,31 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     let settle!: () => void;
     const tail = new Promise<void>(resolve => { settle = resolve; });
     grantTails.set(node.nodeId, tail);
+    // The free shards it brings stay off the free pool from the call until it
+    // settles (acked into the table, stamped pending, or refused).
+    const reserved = compose().filter(id => !registry.shardTable.has(id) && !registry.pendingConfirmation.has(id) && !registry.inFlight.has(id));
+    for (const id of reserved) registry.inFlight.set(id, node.nodeId);
     try {
       if (before) {
         await before;
         // Declared Lost or registered again meanwhile: not this node any more.
         if (!node.isSelf && registry.nodes.get(node.nodeId) !== node) return { ok: false, pending: false };
       }
-      return await sendGrant(node, compose(), epoch);
+      // A shard recorded under another node meanwhile (its table entry, a
+      // grant in flight) stays that node's; another node's pending stamp
+      // yields to this grant, whose ack revokes it as a stray.
+      const ownedHere = (id: number): boolean =>
+        (registry.shardTable.get(id)?.nodeId ?? registry.inFlight.get(id) ?? node.nodeId) === node.nodeId;
+      const sending = compose().filter(ownedHere);
+      // A shard freed while this grant waited is reserved for it now.
+      for (const id of sending) {
+        if (registry.shardTable.has(id) || registry.pendingConfirmation.has(id) || registry.inFlight.has(id)) continue;
+        registry.inFlight.set(id, node.nodeId);
+        reserved.push(id);
+      }
+      return await sendGrant(node, sending, epoch);
     } finally {
+      for (const id of reserved) if (registry.inFlight.get(id) === node.nodeId) registry.inFlight.delete(id);
       settle();
       if (grantTails.get(node.nodeId) === tail) grantTails.delete(node.nodeId);
     }
@@ -2122,7 +2139,9 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       }
       const placed = [...pinnedPlaced, ...trimmable];
       if (placed.length === 0) continue;
-      await grantShardsTo(node, () => [...new Set([...reGrantSetOf(grantNodeId), ...placed])].sort((a, b) => a - b), epoch);
+      // A planned free shard another node's grant stamped meanwhile is not sent.
+      const stillFree = (id: number): boolean => (registry.pendingConfirmation.get(id)?.nodeId ?? grantNodeId) === grantNodeId;
+      await grantShardsTo(node, () => [...new Set([...reGrantSetOf(grantNodeId), ...placed.filter(stillFree)])].sort((a, b) => a - b), epoch);
     }
 
     await persist();
@@ -2298,11 +2317,12 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
             // Reserve the unrecorded held shard across the adoption window:
             // without the stamp the first post-grace/post-resume round could
             // grant it elsewhere before this node's heartbeat adoption lands.
-            // A shard already reserved under ANOTHER node makes this claimant
-            // the loser; register is its only fencing opportunity (a connected
-            // zero-table node is never re-granted or revoked later), so the
-            // contested lease dies here instead of ping-ponging identifies.
-            if (!registry.pendingConfirmation.has(l.shardId)) {
+            // A shard already reserved under ANOTHER node (a stamp, a grant
+            // carrying it) makes this claimant the loser; register is its only
+            // fencing opportunity (a connected zero-table node is never
+            // re-granted or revoked later), so the contested lease dies here
+            // instead of ping-ponging identifies.
+            if (!registry.pendingConfirmation.has(l.shardId) && (registry.inFlight.get(l.shardId) ?? heldNodeId) === heldNodeId) {
               registry.pendingConfirmation.set(l.shardId, {
                 shardId: l.shardId,
                 nodeId: heldNodeId,
@@ -2517,6 +2537,10 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     if (registry.pendingConfirmation.has(shardId)) {
       return { success: false, error: `shard ${shardId} is pending confirmation; try again shortly` };
     }
+    const grantingTo = registry.inFlight.get(shardId);
+    if (grantingTo !== undefined) {
+      return { success: false, error: `shard ${shardId} is being granted to ${registry.nodes.get(grantingTo)?.nodeName ?? grantingTo}; try again shortly` };
+    }
     if (coordinator?.migratingShardIds().has(shardId)) {
       return { success: false, error: `shard ${shardId} is being migrated; wait for the migration to finish` };
     }
@@ -2535,11 +2559,14 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     }
     registry.epoch += 1;
     const result = await grantShardsTo(target, () => [...new Set([...registry.shardIdsOf(targetNodeId), shardId])].sort((a, b) => a - b), registry.epoch);
+    // A shard another node got while the grant waited was not sent.
+    const landed = registry.shardTable.get(shardId)?.nodeId === targetNodeId || registry.pendingConfirmation.get(shardId)?.nodeId === targetNodeId;
     await persist();
     // A manual grant changes the table outside distribute(), whose reports
     // are the only refresh standalone has (no periodic tick there).
     reportPlacement();
-    if (result.ok || result.pending) return { success: true };
+    if ((result.ok || result.pending) && landed) return { success: true };
+    if (result.ok || result.pending) return { success: false, error: `shard ${shardId} was placed on another node meanwhile` };
     return { success: false, error: `grant to ${target.nodeName} was refused` };
   };
 
@@ -2585,7 +2612,9 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
         // its shards stay fenced and are re-granted next retry; if the worker had
         // in fact adopted, its heartbeat confirms the shard into shardTable and
         // the line-992 guard drops the fence on the following pass.
-        for (const shardId of shards) resumePendingShards.delete(shardId);
+        for (const shardId of shards) {
+          if (registry.shardTable.get(shardId)?.nodeId === proposalNodeId) resumePendingShards.delete(shardId);
+        }
       }
     }
     await persist();

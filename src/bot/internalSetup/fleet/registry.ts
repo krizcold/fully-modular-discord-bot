@@ -94,6 +94,8 @@ export class Registry {
   readonly nodes = new Map<string, RegistryNode>();
   readonly shardTable = new Map<number, ShardLease>();
   readonly pendingConfirmation = new Map<number, PendingLease>();
+  /** Free shards a grant carries to a node until it settles (shard id to node id): off the free pool. */
+  readonly inFlight = new Map<number, string>();
   readonly guildMap = new Map<string, number>();
   // Fleet-wide guild count per shard from the master's REST guild list, so
   // unassigned shards (no gateway session) still report their real guild count.
@@ -244,6 +246,7 @@ export class Registry {
       if (entry.status === 'NotStarted') continue;
       if (this.shardTable.has(entry.shardId)) continue;
       if (this.pendingConfirmation.has(entry.shardId)) continue;
+      if ((this.inFlight.get(entry.shardId) ?? nodeId) !== nodeId) continue;
       this.shardTable.set(entry.shardId, {
         shardId: entry.shardId,
         nodeId,
@@ -397,6 +400,7 @@ export class Registry {
     for (let shardId = 0; shardId < this.shardCount; shardId++) {
       if (this.shardTable.has(shardId)) continue; // held (live or frozen)
       if (this.pendingConfirmation.has(shardId)) continue;
+      if (this.inFlight.has(shardId)) continue;
       free.push(shardId);
     }
     return free;
