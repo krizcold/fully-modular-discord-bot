@@ -502,7 +502,7 @@ export class MigrationExecutor {
   }
 
   private async commitTargetNow(leg: LegRuntime, term: number, epoch: number): Promise<void> {
-    await this.writeManifest(leg, 'commit-intent');
+    await this.writeManifest(leg, 'commit-intent', { term, epoch });
     const legDir = incomingLegDir(leg.migrationId, leg.legId);
     // What landed leaves the copy this node may hold, which is older: noted
     // once (one manifest write), also when a rename throws, and with the
@@ -660,7 +660,9 @@ export class MigrationExecutor {
     this.hooks.sendToMaster(MSG.XFER_PROGRESS, { term: this.currentTerm, ...payload });
   }
 
-  private async writeManifest(leg: LegRuntime, phase: 'receiving' | 'verified' | 'commit-intent'): Promise<void> {
+  // A commit-intent manifest names the commit's term and epoch, so a boot
+  // finishes it locally with the stamps the commit gives.
+  private async writeManifest(leg: LegRuntime, phase: 'receiving' | 'verified' | 'commit-intent', commit?: { term: number; epoch: number }): Promise<void> {
     if (leg.role !== 'target') return;
     const legDir = incomingLegDir(leg.migrationId, leg.legId);
     await fs.promises.mkdir(legDir, { recursive: true });
@@ -672,6 +674,7 @@ export class MigrationExecutor {
       guilds: leg.guilds,
       term: this.currentTerm,
       phase,
+      ...(commit ? { commitTerm: commit.term, commitEpoch: commit.epoch } : {}),
     };
     try {
       await fs.promises.writeFile(path.join(legDir, '.manifest.json'), JSON.stringify(manifest, null, 2), 'utf-8');
@@ -840,6 +843,8 @@ async function finishStaging(legDir: string, migrationId: string, term: number, 
   try { manifest = JSON.parse(fs.readFileSync(path.join(legDir, '.manifest.json'), 'utf-8')); } catch { return; }
   try {
     manifest.phase = 'commit-intent';
+    manifest.commitTerm = term;
+    manifest.commitEpoch = epoch;
     fs.writeFileSync(path.join(legDir, '.manifest.json'), JSON.stringify(manifest, null, 2), 'utf-8');
   } catch { /* best effort */ }
   const guilds: string[] = Array.isArray(manifest?.guilds) ? manifest.guilds : [];

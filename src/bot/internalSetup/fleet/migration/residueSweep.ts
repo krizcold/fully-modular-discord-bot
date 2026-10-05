@@ -108,56 +108,38 @@ async function cleanOrphanTmp(dir: string): Promise<void> {
 
 // _incoming staging disposition. The only self-contained (no-master) crash rule
 // from PLAN_P5 is: a leg in commit-intent finishes its renames locally
-// (idempotent). Non-commit-intent staging is left for the P5 coordinator to
-// resolve against the master (ask -> aborted/unknown delete, committing
-// finish, else kept); it is never deleted here so a still-live migration
-// keeps its data.
+// (idempotent), with the commit's term and epoch its manifest names, as the
+// executor's commit does. Other staging, and a commit-intent leg naming
+// neither, is left for the P5 coordinator to resolve against the master (ask
+// -> aborted/unknown delete, committing finish, else kept); it is never
+// deleted here so a still-live migration keeps its data.
 async function disposeIncoming(): Promise<void> {
   const incomingRoot = path.join(DATA_ROOT, INCOMING_DIR);
-  let legs: fs.Dirent[];
+  let migrations: fs.Dirent[];
   try {
-    legs = await fs.promises.readdir(incomingRoot, { withFileTypes: true });
+    migrations = await fs.promises.readdir(incomingRoot, { withFileTypes: true });
   } catch {
     return;
   }
-  for (const leg of legs) {
-    if (!leg.isDirectory()) continue;
-    const legDir = path.join(incomingRoot, leg.name);
-    let manifest: any = null;
-    try {
-      manifest = JSON.parse(await fs.promises.readFile(path.join(legDir, '.manifest.json'), 'utf-8'));
-    } catch { /* no manifest */ }
-    if (manifest?.phase === 'commit-intent') {
-      await finishCommitIntent(legDir, manifest);
+  for (const mig of migrations) {
+    if (!mig.isDirectory() || mig.name.startsWith(DELETING_PREFIX)) continue;
+    let legs: fs.Dirent[];
+    try { legs = await fs.promises.readdir(path.join(incomingRoot, mig.name), { withFileTypes: true }); } catch { continue; }
+    for (const leg of legs) {
+      if (!leg.isDirectory()) continue;
+      let manifest: any = null;
+      try {
+        manifest = JSON.parse(await fs.promises.readFile(path.join(incomingRoot, mig.name, leg.name, '.manifest.json'), 'utf-8'));
+      } catch { /* no manifest */ }
+      if (manifest?.phase !== 'commit-intent' || !Number.isInteger(manifest.commitTerm) || !Number.isInteger(manifest.commitEpoch)) continue;
+      try {
+        await commitFromStaging(mig.name, leg.name, manifest.commitTerm, manifest.commitEpoch);
+        console.log(`[Fleet] Finished commit-intent staging for migration ${mig.name} leg ${leg.name}`);
+      } catch (error) {
+        console.warn(`[Fleet] Commit-intent staging for migration ${mig.name} leg ${leg.name} not finished at boot (its master's verdict or the next boot finishes it):`, error instanceof Error ? error.message : error);
+      }
     }
   }
-}
-
-// Idempotently move each staged guild dir into place. A rename that lost a race
-// (dest already present from a prior partial finish) is skipped.
-async function finishCommitIntent(legDir: string, manifest: any): Promise<void> {
-  let staged: fs.Dirent[];
-  try {
-    staged = await fs.promises.readdir(legDir, { withFileTypes: true });
-  } catch {
-    return;
-  }
-  for (const entry of staged) {
-    if (!entry.isDirectory() || !/^\d+$/.test(entry.name)) continue;
-    const src = path.join(legDir, entry.name);
-    const dest = path.join(DATA_ROOT, entry.name);
-    try {
-      if (fs.existsSync(dest)) continue;
-      await fs.promises.rename(src, dest);
-      stampOwner(entry.name);
-    } catch (error) {
-      console.warn(`[Fleet] commit-intent finish failed for guild ${entry.name}:`, error instanceof Error ? error.message : error);
-    }
-  }
-  try {
-    await fs.promises.rm(legDir, { recursive: true, force: true });
-  } catch { /* best effort */ }
-  console.log(`[Fleet] Finished commit-intent staging for migration ${manifest?.migrationId ?? '(unknown)'}`);
 }
 
 /** How the master answers a node's boot query about a migration it still stages. */
