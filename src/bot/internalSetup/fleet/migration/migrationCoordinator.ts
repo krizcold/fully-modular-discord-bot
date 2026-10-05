@@ -328,16 +328,16 @@ export class MigrationCoordinator {
     return { decided, nodeIds: [...new Set(owed.map(l => l.targetNodeId))] };
   }
 
-  /** The shards the granting migration still owes nodeId. */
+  /** The shards the migration committing or granting still owes nodeId. */
   grantsOwedTo(nodeId: string): number[] {
     return this.grantLegsOwedTo(nodeId).map(l => l.shardId);
   }
 
   // A retire paused between legs keeps its last leg's state on the parent,
-  // so only a running slice of a retire is granting.
+  // so only a running slice of a retire is committing or granting.
   private grantLegsOwedTo(nodeId: string): MigrationLeg[] {
     const rec = this.record;
-    if (rec?.state !== 'GRANTING' || (rec.kind === 'retire' && this.parentRecord === null)) return [];
+    if (!rec || (rec.state !== 'COMMITTING' && rec.state !== 'GRANTING') || (rec.kind === 'retire' && this.parentRecord === null)) return [];
     return rec.legs.filter(l => l.targetNodeId === nodeId && l.targetLostAt === undefined);
   }
 
@@ -422,14 +422,26 @@ export class MigrationCoordinator {
   async onNodeDeclaredLost(lostNodeId: string, lostNodeName: string, freedShardIds: number[]): Promise<number[]> {
     const at = Date.now();
     let changed = false;
-    // Its owed grants can never land: the grant round settles them (a
-    // retire's slice is not what persist writes, so its parent's leg too).
+    // Its owed commits and grants can never land: the rounds settle them
+    // (a retire's slice is not what persist writes, so its parent's leg too).
     const lostLegIds = new Set(this.grantLegsOwedTo(lostNodeId).map(l => l.legId));
     for (const rec of new Set([this.record, this.parentRecord])) {
       for (const leg of rec?.legs ?? []) {
         if (!lostLegIds.has(leg.legId) || leg.targetLostAt !== undefined) continue;
         leg.targetLostAt = at;
         changed = true;
+      }
+    }
+    // A commit under way never cleans the source of a leg into this node:
+    // its originals stay, owed as a cleanup, so the copy is held below (a
+    // redistribute's source is released instead once it ends).
+    const released: MigrationLeg[] = [];
+    if (this.record?.state === 'COMMITTING') {
+      for (const leg of this.record.legs) {
+        if (!lostLegIds.has(leg.legId) || !this.keepsSource(leg) || (leg as any)._sourceAcked) continue;
+        this.recordPendingSourceLeg(this.record, leg.sourceNodeId, leg.legId);
+        if (this.parentRecord && this.parentRecord !== this.record) this.recordPendingSourceLeg(this.parentRecord, leg.sourceNodeId, leg.legId);
+        if (this.releasedOnLoss(this.record, leg)) released.push(leg);
       }
     }
     // A commit under way notes a source's cleanup only when it reaches the
@@ -464,15 +476,32 @@ export class MigrationCoordinator {
     }
     const held = new Set<number>();
     for (const shardId of lostCopies) {
-      for (const { leg } of this.owedLegsOf(shardId)) {
-        if (leg.sourceLostAt !== undefined) continue;
+      for (const { rec, leg } of this.owedLegsOf(shardId)) {
+        if (leg.sourceLostAt !== undefined || this.releasedOnLoss(rec, leg)) continue;
         if (!leg.heldForChoice) leg.heldForChoice = { lostNodeName, at };
         held.add(shardId);
         changed = true;
       }
     }
     if (changed) await this.persist();
+    // A commit round waiting on this node goes on without it.
+    if (this.record?.state === 'COMMITTING') this.runCommitRound();
+    for (const leg of released) {
+      console.warn(`[Migration] Shard ${leg.shardId}: the guilds the redistribute was placing on ${lostNodeName} stay on ${this.hooks.registry.nodes?.get(leg.sourceNodeId)?.nodeName ?? leg.sourceNodeId}, released as it ends; run Redistribute again before Resume to place them`);
+    }
     return [...held].sort((a, b) => a - b);
+  }
+
+  // A leg into a node Declared Lost before its commit was through keeps its
+  // source's originals; a lease-only leg keeps nothing there.
+  private keepsSource(leg: MigrationLeg): boolean {
+    return leg.targetLostAt !== undefined && leg.direction !== 'none';
+  }
+
+  // A redistribute's such leg releases its source, as its abort would: a
+  // re-run Redistribute places the guilds.
+  private releasedOnLoss(rec: MigrationRecord, leg: MigrationLeg): boolean {
+    return rec.kind === 'redistribute' && this.keepsSource(leg);
   }
 
   /** A held copy's cleanup waits only while its shard is unplaced; a placement (the restore) ends the wait. */
@@ -1207,13 +1236,14 @@ export class MigrationCoordinator {
         // while a transformation runs (its own freeze) and while that
         // migration still runs, since the node's abort is migration-wide and
         // would stop a later leg of the same retire there.
-        const back = current && this.hooks.registry.shardTable.get(leg.shardId)?.nodeId === nodeId;
+        // A redistribute's leg into a node Declared Lost is released the same way.
+        const back = this.releasedOnLoss(rec, leg) || (current && this.hooks.registry.shardTable.get(leg.shardId)?.nodeId === nodeId);
         const live = this.parentRecord ?? this.record;
         if (back && (this.hooks.transformationActive?.() || (live !== null && live.id === rec.id && !isTerminal(live.state)))) continue;
         try {
           const ack = back
             ? await this.hooks.sendControl(nodeId, MSG.XFER_ABORT, {
-              migrationId: rec.id, term: rec.term, reason: `shard ${leg.shardId} is back on its source`, guilds: leg.guilds, legIds: [legId],
+              migrationId: rec.id, term: rec.term, reason: this.releasedOnLoss(rec, leg) ? `shard ${leg.shardId}'s target was declared lost` : `shard ${leg.shardId} is back on its source`, guilds: leg.guilds, legIds: [legId],
             })
             : await this.hooks.sendControl(nodeId, MSG.XFER_COMMIT, {
               migrationId: rec.id, term: rec.term, epoch: rec.epoch ?? this.hooks.registry.epoch,
@@ -1229,7 +1259,7 @@ export class MigrationCoordinator {
             this.releaseWarned.delete(legId);
           } else if (back && ack?.ok && !this.releaseWarned.has(legId)) {
             this.releaseWarned.add(legId);
-            console.warn(`[Migration] Shard ${leg.shardId} is back on ${this.hooks.registry.nodes?.get(nodeId)?.nodeName ?? nodeId}, whose release from its owed cleanup is not complete (${ack.reason ?? 'it reports none; it may run an older version'}); retried every ${Math.round(XFER_COMMIT_RETRY_MS / 1000)}s`);
+            console.warn(`[Migration] Shard ${leg.shardId}: ${this.hooks.registry.nodes?.get(nodeId)?.nodeName ?? nodeId}'s release from its owed cleanup is not complete (${ack.reason ?? 'it reports none; it may run an older version'}); retried every ${Math.round(XFER_COMMIT_RETRY_MS / 1000)}s`);
           }
         } catch {
           // Unanswered: still owed, and asked again.
@@ -1370,9 +1400,9 @@ export class MigrationCoordinator {
   private async commitRound(rec: MigrationRecord): Promise<void> {
     let allTargets = true;
     let allSources = true;
-    // Targets first.
+    // Targets first. A target Declared Lost is settled by the Declare Lost.
     for (const leg of rec.legs) {
-      if ((leg as any)._targetAcked) continue;
+      if ((leg as any)._targetAcked || leg.targetLostAt !== undefined) continue;
       try {
         const ack = await this.hooks.sendControl(leg.targetNodeId, MSG.XFER_COMMIT, {
           migrationId: rec.id, term: rec.term, epoch: rec.epoch ?? this.hooks.registry.epoch, legIds: [leg.legId],
@@ -1388,7 +1418,7 @@ export class MigrationCoordinator {
     // Sources next (graveyard originals). A down source does not block: it is
     // recorded durably as pendingSourceCleanup and retried when it reconnects.
     for (const leg of rec.legs) {
-      if ((leg as any)._sourceAcked) continue;
+      if ((leg as any)._sourceAcked || this.keepsSource(leg)) continue;
       try {
         const ack = await this.hooks.sendControl(leg.sourceNodeId, MSG.XFER_COMMIT, {
           migrationId: rec.id, term: rec.term, epoch: rec.epoch ?? this.hooks.registry.epoch,
@@ -1396,6 +1426,9 @@ export class MigrationCoordinator {
         });
         if (ack?.ok) {
           (leg as any)._sourceAcked = true;
+          if (this.keepsSource(leg)) {
+            console.warn(`[Migration] Shard ${leg.shardId}: the copy on ${this.hooks.registry.nodes?.get(leg.sourceNodeId)?.nodeName ?? leg.sourceNodeId} went to its graveyard by a cleanup sent before the shard's node was declared lost, so it is not offered`);
+          }
           this.clearPendingSourceLeg(rec, leg.sourceNodeId, leg.legId);
           if (this.parentRecord && this.parentRecord !== rec) this.clearPendingSourceLeg(this.parentRecord, leg.sourceNodeId, leg.legId);
         }
@@ -1413,7 +1446,7 @@ export class MigrationCoordinator {
         if (this.hooks.registry.nodes?.get(leg.sourceNodeId)?.connected) this.scheduleCleanupRetry(leg.sourceNodeId);
       }
     }
-    const sourcesSettled = rec.legs.every(l => (l as any)._sourceAcked || (l as any)._sourcePending);
+    const sourcesSettled = rec.legs.every(l => (l as any)._sourceAcked || (l as any)._sourcePending || this.keepsSource(l));
     if (allTargets && sourcesSettled) {
       this.clearCommitTimer();
       if ((rec.pendingSourceCleanup?.length ?? 0) > 0) await this.persist();
@@ -1656,6 +1689,17 @@ export class MigrationCoordinator {
     await this.persist();
     this.hooks.pushStatus();
     console.log(`[Migration] ${finished.kind} ${finished.id} -> ${state}${error ? ` (${error})` : ''}`);
+    // A source a redistribute releases (its leg's target Declared Lost),
+    // this one's or one a later run's fence held back, is asked now.
+    const asked = new Set<string>();
+    for (const rec of this.history) {
+      for (const entry of rec.pendingSourceCleanup ?? []) {
+        if (asked.has(entry.nodeId) || !entry.legIds.some(legId => rec.legs.some(l => l.legId === legId && this.releasedOnLoss(rec, l)))) continue;
+        if (entry.nodeId !== this.hooks.selfNodeId && !this.hooks.registry.nodes?.get(entry.nodeId)?.connected) continue;
+        asked.add(entry.nodeId);
+        void this.retrySourceCleanup(entry.nodeId).catch(() => undefined);
+      }
+    }
   }
 
   // --------------------------------------------------------------------------
@@ -1845,12 +1889,17 @@ export class MigrationCoordinator {
     // every guild's new-count shard maps to a stable owner (no per-guild drift).
     // A copy its node still owes the cleanup of is stale (the move put the
     // newer one elsewhere): never moved, and its node never owns the shard,
-    // or the cleanup would graveyard what the redistribute brings there.
+    // or the cleanup would graveyard what the redistribute brings there. A
+    // released one (its target Declared Lost) is the newest.
     const owed = new Map<string, Set<string>>();
     for (const rec of this.cleanupRecords()) {
       for (const entry of rec.pendingSourceCleanup ?? []) {
         const guilds = owed.get(entry.nodeId) ?? new Set<string>();
-        for (const legId of entry.legIds) for (const guildId of rec.legs.find(l => l.legId === legId)?.guilds ?? []) guilds.add(guildId);
+        for (const legId of entry.legIds) {
+          const leg = rec.legs.find(l => l.legId === legId);
+          if (!leg || this.releasedOnLoss(rec, leg)) continue;
+          for (const guildId of leg.guilds) guilds.add(guildId);
+        }
         owed.set(entry.nodeId, guilds);
       }
     }
@@ -2024,7 +2073,7 @@ export class MigrationCoordinator {
       const proposalMap: Record<number, string> = { ...(await this.hooks.loadRedistributeProposal() ?? {}) };
       for (const [shardId, targetNodeId] of this.proposal) proposalMap[shardId] = targetNodeId;
       for (const leg of this.record?.legs ?? []) {
-        if (proposalMap[leg.shardId] === undefined && !this.lostOwners.has(leg.targetNodeId)) proposalMap[leg.shardId] = leg.targetNodeId;
+        if (proposalMap[leg.shardId] === undefined && !this.lostOwners.has(leg.targetNodeId) && leg.targetLostAt === undefined) proposalMap[leg.shardId] = leg.targetNodeId;
       }
       await this.hooks.saveRedistributeProposal(proposalMap);
     });

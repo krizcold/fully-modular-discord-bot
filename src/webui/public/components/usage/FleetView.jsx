@@ -864,7 +864,7 @@ function FleetNodeCard({ node, isMasterView, onAction, masterSyncRevision, retir
 
   const dataCaveat = dataBackend === 'postgres'
     ? 'guild data lives in the central database; reassigned guilds keep their data'
-    : "this node's disk holds those guilds' data; reassigned guilds start fresh, unless an older copy of a shard survives on another node, when you are asked to restore it or start the shard empty";
+    : "this node's disk holds those guilds' data; reassigned guilds start fresh, unless a copy of a shard survives on another node, when you are asked to restore it or start the shard empty";
   const caveatLabel = dataBackend === 'postgres' ? 'Database backend' : 'File-mode warning';
   const buttonStyle = { fontSize: '0.72rem', padding: '2px 8px' };
 

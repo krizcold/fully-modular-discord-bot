@@ -2209,7 +2209,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       const reason = recordsBlocked
         ? 'held back while the migration records cannot be read; placed once the master restarts with them readable'
         : heldIds.has(shardId)
-        ? 'held: an older copy survives on another node; restore it or start the shard empty'
+        ? 'held: a copy survives on another node; restore it or start the shard empty'
         : coordinator?.migratingShardIds().has(shardId) || coordinator?.pendingSourceCleanupShardIds().has(shardId)
           || transformer?.pinnedShardIds().has(shardId)
         ? 'held back by a migration or transformation in progress'
@@ -2718,7 +2718,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       return { success: false, error: 'a backend transformation is active; abort it (or let it finish) before declaring nodes lost' };
     }
     // Declaring a migration participant lost is a node-down event for the
-    // coordinator (pre-commit -> abort; post-commit -> retries at reconnect).
+    // coordinator (pre-commit -> abort; post-commit -> its legs settle below).
     coordinator?.onNodeDown(targetNodeId);
     transformer?.onNodeRemoved(targetNodeId);
     registry.epoch += 1;
@@ -2735,8 +2735,8 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       if (ownStamps.has(shardId)) shardIds.push(shardId);
       registry.pendingConfirmation.delete(shardId);
     }
-    // A migration's grant to this node that has not landed: the copy its
-    // commit put there went with the node.
+    // A migration's commit or grant to this node that has not landed:
+    // what it put there went with the node.
     for (const shardId of coordinator?.grantsOwedTo(targetNodeId) ?? []) {
       if (!shardIds.includes(shardId)) shardIds.push(shardId);
     }
@@ -2780,7 +2780,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     const heldIds = await coordinator?.onNodeDeclaredLost(targetNodeId, node.nodeName, shardIds) ?? [];
     await persist();
     const heldNote = heldIds.length > 0
-      ? `; shard${heldIds.length === 1 ? '' : 's'} [${heldIds.join(', ')}] held: an older copy survives on another node; restore it or start it empty on the Fleet tab`
+      ? `; shard${heldIds.length === 1 ? '' : 's'} [${heldIds.join(', ')}] held: a copy survives on another node; restore it or start it empty on the Fleet tab`
       : '';
     console.warn(`[Fleet] Node ${node.nodeName} DECLARED LOST; shards [${shardIds.filter(id => !heldIds.includes(id)).join(', ')}] freed for redistribution${heldNote}`);
     void distribute();
