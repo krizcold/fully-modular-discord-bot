@@ -188,6 +188,9 @@ export class MigrationCoordinator {
       // landed, or the Declare Lost never reached the plan.
       for (const rec of [persisted.active, ...this.history]) {
         for (const leg of rec?.legs ?? []) if (leg.heldForChoice && !this.unplaced(leg.shardId)) delete leg.heldForChoice;
+        for (const entry of rec?.pendingSourceCleanup ?? []) {
+          for (const legId of entry.legIds) this.keepOwingKnown(entry.nodeId, rec!.legs.find(l => l.legId === legId));
+        }
       }
       this.recovered = true;
     }
@@ -1052,6 +1055,16 @@ export class MigrationCoordinator {
     let entry = list.find(e => e.nodeId === nodeId);
     if (!entry) { entry = { nodeId, legIds: [] }; list.push(entry); }
     if (!entry.legIds.includes(legId)) entry.legIds.push(legId);
+    this.keepOwingKnown(nodeId, rec.legs.find(l => l.legId === legId));
+  }
+
+  // A node owing a note it was not Declared Lost for stays known (not
+  // connected) though it holds no lease, so the Fleet tab lists it, Declare
+  // Lost can settle it and the planned transfer's refusal finds it.
+  private keepOwingKnown(nodeId: string, leg: MigrationLeg | undefined): void {
+    const registry = this.hooks.registry;
+    if (!leg || leg.sourceLostAt !== undefined || nodeId === this.hooks.selfNodeId || registry.nodes.has(nodeId)) return;
+    registry.restoreNode({ nodeId, nodeName: leg.committed?.sourceName ?? nodeId, appVersion: '', capabilities: { shardCapacity: 1, dataBackend: 'unknown' } });
   }
 
   private clearPendingSourceLeg(rec: MigrationRecord, nodeId: string, legId: string): void {

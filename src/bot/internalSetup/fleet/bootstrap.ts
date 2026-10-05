@@ -72,7 +72,7 @@ import {
   resolveShardCapacity,
   resolveShardCount,
 } from './placement';
-import { evaluateRecovery, owingNodes } from './recovery';
+import { evaluateRecovery } from './recovery';
 import { _setControlStoreFenced, _setEmptyStoreHold, _setFleetStateSources, _setFollowerFollowingSupplier, _setFollowerHold, _setFollowerLineage, _setOwnCopyLineage, _setReadOnlyStorePark, _setSlotStatus, _setStaleMasterPark, _setSuperseded, _setTakeoverHold, FleetRecoverySource, FleetRefusedRegistration, FollowerHoldBase, getFleetState } from './state';
 import type { BackupDesignationRefusedView, MigrationView, PinViolationView, StandInVerdictView, UnassignedView } from './state';
 import { serveSyncRequest, SyncAuthority } from './syncAuthority';
@@ -1619,13 +1619,6 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     const persistedMigrations = await standInGuard('reading the persisted migration', () => store.loadMigrations());
     for (const leg of legsPastCommit(persistedMigrations.active)) {
       if (registry.shardTable.get(leg.shardId)?.nodeId === leg.sourceNodeId) registry.shardTable.delete(leg.shardId);
-    }
-    // A node owing a cleanup it missed (not Declared Lost) but holding no
-    // lease is not restored with the plan: kept known, not connected, so
-    // the Fleet tab lists it and a Declare Lost can settle what it owes.
-    for (const owing of owingNodes(persistedMigrations)) {
-      if (owing.nodeId === nodeId || registry.nodes.has(owing.nodeId)) continue;
-      registry.restoreNode({ nodeId: owing.nodeId, nodeName: owing.nodeName, appVersion: '', capabilities: { shardCapacity: 1, dataBackend: 'unknown' } });
     }
     const selfShardIds = registry.shardIdsOf(nodeId);
     if (selfShardIds.length > 0) {
