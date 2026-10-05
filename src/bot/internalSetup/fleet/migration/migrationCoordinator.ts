@@ -49,19 +49,6 @@ export interface StartRetirePayload { kind: 'retire'; nodeId: string; targets: R
 export interface StartRedistributePayload { kind: 'redistribute'; }
 export type StartPayload = StartMovePayload | StartSwapPayload | StartRetirePayload | StartRedistributePayload;
 
-/**
- * The legs of a persisted record past their commit decision: each one's drain
- * took the shard off its source, which the plan on disk names until the grant.
- */
-export function legsPastCommit(rec: MigrationRecord | null): MigrationLeg[] {
-  if (!rec || rec.kind === 'redistribute') return [];
-  if (rec.kind === 'retire') {
-    const leg = rec.legs[rec.currentLegIndex ?? 0];
-    return leg && (leg.legState === 'COMMITTING' || leg.legState === 'GRANTING') ? [leg] : [];
-  }
-  return rec.state === 'COMMITTING' || rec.state === 'GRANTING' ? rec.legs : [];
-}
-
 type OwedLeg = { rec: MigrationRecord; leg: MigrationLeg; nodeId: string };
 
 export interface PrecheckResult {
@@ -219,10 +206,12 @@ export class MigrationCoordinator {
     } else {
       // Any pre-COMMITTING state: abort. Aborts deliver as participants reconnect.
       this.hydrateLive(rec);
-      // DRAINING/VERIFYING already revoked the source lease, so the abort must
-      // re-grant the source (rollback identify). The plan reload restored the
-      // source's table entry, so rollback is a same-shape re-grant.
-      if (rec.state === 'DRAINING' || rec.state === 'VERIFYING') this.drainRan = true;
+      // DRAINING/VERIFYING already revoked the source lease, as did a drained
+      // leg's drain before its abort began, so the abort must re-grant the
+      // source (rollback identify). The rollback sets each source's entry
+      // itself, whether the plan reload restored it or a plan written since
+      // dropped it.
+      if (rec.state === 'DRAINING' || rec.state === 'VERIFYING' || rec.legs.some(l => l.drained)) this.drainRan = true;
       await this.enterAborting('master restarted before commit decision');
     }
   }
@@ -250,11 +239,14 @@ export class MigrationCoordinator {
     this.hydrateLive(single);
     // Re-fence a committing/granting leg (shard already off the table) so
     // distribute() cannot re-place it before the grant lands. DRAINING/
-    // VERIFYING revoked the source lease, so recovery-abort re-grants it back.
+    // VERIFYING, or an abort of a drained leg, revoked the source lease, so
+    // recovery-abort re-grants it back.
     if (state === 'COMMITTING' || state === 'GRANTING') this.fenceShards([leg.shardId]);
-    if (state === 'DRAINING' || state === 'VERIFYING') this.drainRan = true;
+    if (state === 'DRAINING' || state === 'VERIFYING' || leg.drained) this.drainRan = true;
     this.finishHooks = (finalState: 'DONE' | 'ABORTED') => {
       leg.legState = finalState;
+      // Finished, its rollback done: a later recovery owes it none.
+      delete leg.drained;
       // Same trailing-frame protection as runSingleLegMove's finishHooks.
       this.live.delete(leg.legId);
       if (finalState === 'ABORTED') { leg.error = single.error; parent.error = single.error; }
@@ -622,7 +614,7 @@ export class MigrationCoordinator {
     return { verdict: 'unknown' };
   }
 
-  /** Why no migration, transformation, reshard Resume, transfer or Declare Lost may run, while the records cannot be read; null otherwise. */
+  /** Why no migration, transformation, reshard Resume, transfer, Declare Lost, Assign or Drain may run and no free shard is placed, while the records cannot be read; null otherwise. */
   recordsBlock(): string | null {
     return this.recordsUnreadable ? RECORDS_UNREADABLE : null;
   }
@@ -986,6 +978,7 @@ export class MigrationCoordinator {
   private async enterDraining(): Promise<void> {
     if (!this.record) return;
     this.drainRan = true;
+    for (const leg of this.record.legs) leg.drained = true;
     await this.transition('DRAINING');
     this.armDrainTimeout();
     try {
@@ -1259,6 +1252,22 @@ export class MigrationCoordinator {
           return;
         }
       }
+    }
+    // The plan on disk stops naming each drained source before the decision
+    // is written, so no boot hands a committed shard back to its source,
+    // its records readable or not.
+    const rec = this.record;
+    let failed: string | null = null;
+    try {
+      await this.hooks.persistPlan();
+    } catch (error) {
+      failed = error instanceof Error ? error.message : String(error);
+    }
+    // An abort that landed meanwhile stands.
+    if (this.record !== rec || rec.state !== 'VERIFYING' || this.abortInProgress) return;
+    if (failed !== null) {
+      await this.enterAborting(`the plan could not be written before the commit decision: ${failed}`);
+      return;
     }
     // All match: bump the epoch, persist COMMITTING BEFORE the first commit.
     this.hooks.registry.epoch += 1;
@@ -1648,9 +1657,12 @@ export class MigrationCoordinator {
       const single: MigrationRecord = { ...parent, legs: [leg], state: 'PREPARING', epoch: undefined };
       this.record = single;
       leg.legState = 'PREPARING';
+      delete leg.drained;
       this.hydrateLive(single);
       this.finishHooks = (state: 'DONE' | 'ABORTED') => {
         leg.legState = state;
+        // Finished, its rollback done: a later recovery owes it none.
+        delete leg.drained;
         // Drop the finished leg from the live map: a trailing progress/error
         // frame from its dying transfer must not resolve against the restored
         // parent record and abort a paused retire.
@@ -2169,7 +2181,7 @@ export class MigrationCoordinator {
   }
 }
 
-const RECORDS_UNREADABLE = 'The persisted migration records (migrations.json, or the control store\'s migrations document) cannot be read, so a migration may be under way unseen; no migration, backend transformation, reshard Resume, planned transfer or Declare Lost runs until the master restarts with them readable';
+const RECORDS_UNREADABLE = 'The persisted migration records (migrations.json, or the control store\'s migrations document) cannot be read, so a migration may be under way unseen; no migration, backend transformation, reshard Resume, planned transfer, Declare Lost, Assign or Drain runs, and no free shard is placed, until the master restarts with them readable';
 
 function isTerminal(state: MigrationState): boolean {
   return state === 'DONE' || state === 'ABORTED';

@@ -97,7 +97,7 @@ import { setLeaseDeclineHandler } from '../utils/dataBackends/dataReadiness';
 import { applyRouteOverrides, currentRouteDefault } from '../utils/dataBackends/routeResolver';
 import { loadCredentials, resolveDataBackend, upsertCredentials } from '../../../utils/envLoader';
 import { dispositionFromReply, MigrationDisposition, resolveIncomingWithMaster, resumeSourceGraveyarding, runResidueSweep } from './migration/residueSweep';
-import { MigrationCoordinator, PrecheckResult, StartPayload, legsPastCommit } from './migration/migrationCoordinator';
+import { MigrationCoordinator, PrecheckResult, StartPayload } from './migration/migrationCoordinator';
 import { MigrationExecutor } from './migration/migrationExecutor';
 import { TransformationCoordinator } from './transformation/transformationCoordinator';
 import { TransformationExecutor } from './transformation/transformationExecutor';
@@ -1613,13 +1613,6 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       if (persistedNode.nodeId === nodeId) continue;
       registry.restoreNode(persistedNode);
     }
-    // A leg past its commit decision was drained off its source before the
-    // restart: the recovered migration grants it to the target, so neither
-    // the self-grant nor a register re-grant may hand it back to the source.
-    const persistedMigrations = await standInGuard('reading the persisted migration', () => store.loadMigrations());
-    for (const leg of legsPastCommit(persistedMigrations.active)) {
-      if (registry.shardTable.get(leg.shardId)?.nodeId === leg.sourceNodeId) registry.shardTable.delete(leg.shardId);
-    }
     const selfShardIds = registry.shardIdsOf(nodeId);
     if (selfShardIds.length > 0) {
       registry.epoch += 1;
@@ -1980,6 +1973,9 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   // so a joining worker can only ever take shards nobody serves.
   async function distributeOnce(): Promise<void> {
     await reGrantOnly();
+    // Records that cannot be read may fence any free shard (a move past its
+    // commit decision, a hold, an owed cleanup's shard): none is placed.
+    if (coordinator?.recordsBlock()) return;
     // Fence: a shard under an active migration's in-flight window is off the
     // free pool until the migration grants it (or abort rolls it back), so the
     // free-shard distributor can never re-place a drained-but-not-yet-granted
@@ -2185,8 +2181,11 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       ? LEDGER : 'placement pending';
     const groups = new Map<string, number[]>();
     const heldIds = new Set(coordinator?.heldShards().map(h => h.shardId) ?? []);
+    const recordsBlocked = coordinator?.recordsBlock() ?? null;
     for (const shardId of free) {
-      const reason = heldIds.has(shardId)
+      const reason = recordsBlocked
+        ? 'held back while the migration records cannot be read; placed once the master restarts with them readable'
+        : heldIds.has(shardId)
         ? 'held: an older copy survives on another node; restore it or start the shard empty'
         : coordinator?.migratingShardIds().has(shardId) || coordinator?.pendingSourceCleanupShardIds().has(shardId)
           || transformer?.pinnedShardIds().has(shardId)
@@ -2471,6 +2470,8 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
           : `recovery hold-down active, ${Math.ceil(holdRemainingMs / 1000)}s remaining`,
       };
     }
+    const recordsBlocked = coordinator?.recordsBlock();
+    if (recordsBlocked) return { success: false, error: recordsBlocked };
     if (!Number.isInteger(shardId) || shardId < 0 || shardId >= registry.shardCount) {
       return { success: false, error: `shard ${shardId} does not exist (valid 0..${registry.shardCount - 1})` };
     }
@@ -2799,6 +2800,8 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     if (!node) return { success: false, error: `node ${targetNodeId || '(none)'} is unknown` };
     if (node.isSelf) return { success: false, error: 'cannot drain the master node' };
     if (!node.connected) return { success: false, error: 'node is not connected; use Declare Lost' };
+    const recordsBlocked = coordinator?.recordsBlock();
+    if (recordsBlocked) return { success: false, error: recordsBlocked };
     if (transformer?.hasActive()) {
       return { success: false, error: 'a backend transformation is active; draining would move its shards mid-window' };
     }

@@ -87,6 +87,8 @@ export interface MigrationLeg {
   sourceLostAt?: number;
   /** The target was Declared Lost before this leg's grant landed: the copy its commit put there went with it. */
   targetLostAt?: number;
+  /** Its drain began, so its source's lease may be revoked: an abort, after a master restart too, re-grants the source. */
+  drained?: boolean;
   /**
    * A Declare Lost freed this leg's shard while its source still owed this
    * cleanup: that copy may be the last, so the cleanup waits on the
