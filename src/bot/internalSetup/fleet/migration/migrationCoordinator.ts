@@ -239,9 +239,17 @@ export class MigrationCoordinator {
   private async recoverRetire(rec: MigrationRecord): Promise<void> {
     const idx = rec.currentLegIndex ?? 0;
     const leg = rec.legs[idx];
+    if (leg && leg.legState === undefined) {
+      // Never started: its precheck paused the retire, which stays paused
+      // with its reason (a Resume runs that precheck again).
+      rec.state = 'PRECHECK';
+      this.paused = true;
+      return;
+    }
     if (!leg || leg.legState === 'DONE') {
       // The current leg already finished (or none): resume the sequence.
       rec.currentLegIndex = Math.min(rec.legs.length, idx + (leg?.legState === 'DONE' ? 1 : 0));
+      rec.state = 'PRECHECK';
       void this.runRetire();
       return;
     }
@@ -264,6 +272,8 @@ export class MigrationCoordinator {
       leg.legState = finalState;
       // Finished, its rollback done: a later recovery owes it none.
       delete leg.drained;
+      // Between legs no commit is decided: the retire waits on the next leg's precheck.
+      parent.state = 'PRECHECK';
       // Same trailing-frame protection as runSingleLegMove's finishHooks.
       this.live.delete(leg.legId);
       if (finalState === 'ABORTED') { leg.error = single.error; parent.error = single.error; }
@@ -333,8 +343,8 @@ export class MigrationCoordinator {
     return this.grantLegsOwedTo(nodeId).map(l => l.shardId);
   }
 
-  // A retire paused between legs keeps its last leg's state on the parent,
-  // so only a running slice of a retire is committing or granting.
+  // Only a running slice of a retire commits or grants; its parent waits
+  // at PRECHECK between legs.
   private grantLegsOwedTo(nodeId: string): MigrationLeg[] {
     const rec = this.record;
     if (!rec || (rec.state !== 'COMMITTING' && rec.state !== 'GRANTING') || (rec.kind === 'retire' && this.parentRecord === null)) return [];
@@ -989,12 +999,20 @@ export class MigrationCoordinator {
     this.hooks.pushStatus();
   }
 
+  // An abort, or a retire leg's finish, that landed while a step awaited stands.
+  private overtaken(rec: MigrationRecord): boolean {
+    return this.record !== rec || this.abortInProgress || rec.state === 'ABORTING' || isTerminal(rec.state);
+  }
+
   private async enterPreparing(): Promise<void> {
-    if (!this.record) return;
+    const rec = this.record;
+    if (!rec) return;
     await this.transition('PREPARING');
+    if (this.overtaken(rec)) return;
     const leaseOnly = this.recordIsLeaseOnly();
     try {
       const acks = await this.sendPrepareToAll();
+      if (this.overtaken(rec)) return;
       for (const [nodeId, ack] of acks) {
         if (!ack.ok) throw new Error(`prepare nack from ${nodeId}: ${ack.reason ?? 'unknown'}`);
       }
@@ -1012,6 +1030,7 @@ export class MigrationCoordinator {
       // Lease-only: no copy rounds exist; the drain is the whole data phase.
       await (leaseOnly ? this.enterDraining() : this.enterCopying());
     } catch (error) {
+      if (this.overtaken(rec)) return;
       await this.enterAborting(error instanceof Error ? error.message : String(error));
     }
   }
@@ -1057,17 +1076,19 @@ export class MigrationCoordinator {
   }
 
   private async enterDraining(): Promise<void> {
-    if (!this.record) return;
+    const rec = this.record;
+    if (!rec) return;
     this.drainRan = true;
-    for (const leg of this.record.legs) leg.drained = true;
+    for (const leg of rec.legs) leg.drained = true;
     await this.transition('DRAINING');
+    if (this.overtaken(rec)) return;
     this.armDrainTimeout();
     try {
       // Per source leg, in order: revoke the moving lease (bounded gap starts),
       // then XFER_DRAIN so the source freezes + flushes + ships the final delta
       // + hashes + verifies. Swap: both legs drain concurrently (verify set).
       const byNode = new Map<string, MigrationLeg[]>();
-      for (const leg of this.record.legs) {
+      for (const leg of rec.legs) {
         const arr = byNode.get(leg.sourceNodeId) ?? [];
         arr.push(leg);
         byNode.set(leg.sourceNodeId, arr);
@@ -1086,7 +1107,8 @@ export class MigrationCoordinator {
         // be provably destroyed before the target ever identifies.
         const leaseIds = this.hooks.drainLeaseIdsForShards(sourceNodeId, shardIds);
         if (leaseIds.length > 0) {
-          const ok = await this.confirmRevoke(sourceNodeId, leaseIds);
+          const ok = await this.confirmRevoke(rec, sourceNodeId, shardIds, leaseIds);
+          if (this.overtaken(rec)) return;
           if (!ok) {
             await this.enterAborting(`drain revoke to ${sourceNodeId} not confirmed`);
             return;
@@ -1096,12 +1118,14 @@ export class MigrationCoordinator {
         // fence keeps them off the free pool until GRANTING (or abort rollback).
         for (const leg of legs) this.hooks.registry.shardTable.delete(leg.shardId);
         await this.hooks.sendControl(sourceNodeId, MSG.XFER_DRAIN, {
-          migrationId: this.record.id,
-          term: this.record.term,
+          migrationId: rec.id,
+          term: rec.term,
           legIds: legs.map(l => l.legId),
         });
+        if (this.overtaken(rec)) return;
       }
     } catch (error) {
+      if (this.overtaken(rec)) return;
       await this.enterAborting(error instanceof Error ? error.message : String(error));
     }
   }
@@ -1111,12 +1135,13 @@ export class MigrationCoordinator {
   // identifies. A lost/no-op revoke returns ok:false, so we retry a few rounds
   // (recomputing the lease-id union each time so a mid-drain grant is caught)
   // before giving up so the caller can abort.
-  private async confirmRevoke(sourceNodeId: string, initialLeaseIds: string[]): Promise<boolean> {
+  private async confirmRevoke(rec: MigrationRecord, sourceNodeId: string, shardIds: number[], initialLeaseIds: string[]): Promise<boolean> {
     let leaseIds = initialLeaseIds;
     for (let round = 0; round < 3; round++) {
-      const shardIds = [...this.migrating];
-      const { ok } = await this.hooks.revokeLease(sourceNodeId, leaseIds, `migration ${this.record?.id ?? ''} drain`);
+      const { ok } = await this.hooks.revokeLease(sourceNodeId, leaseIds, `migration ${rec.id} drain`);
       if (ok) return true;
+      // An abort's rollback handed the shards back meanwhile: their new leases stand.
+      if (this.overtaken(rec)) return false;
       // Recompute the union: a grant that settled mid-drain adds new lease ids.
       leaseIds = this.hooks.drainLeaseIdsForShards(sourceNodeId, shardIds);
       if (leaseIds.length === 0) return true;
@@ -1717,7 +1742,8 @@ export class MigrationCoordinator {
       // Re-run PRECHECK for this leg.
       const gate = this.precheckLeg(leg);
       if (!gate.ok) {
-        rec.error = `retire leg ${idx} (shard ${leg.shardId}): ${gate.error}`;
+        const gone = !this.hooks.registry.nodes.has(leg.sourceNodeId) || !this.hooks.registry.nodes.has(leg.targetNodeId);
+        rec.error = `retire leg ${idx} (shard ${leg.shardId}): ${gate.error}${gone ? '; Resume cannot pass while that node is unknown (Declared Lost): Abort ends the retire, its completed legs stand' : ''}`;
         this.paused = true;
         await this.persist();
         this.hooks.pushStatus();
@@ -1764,6 +1790,8 @@ export class MigrationCoordinator {
         leg.legState = state;
         // Finished, its rollback done: a later recovery owes it none.
         delete leg.drained;
+        // Between legs no commit is decided: the retire waits on the next leg's precheck.
+        parent.state = 'PRECHECK';
         // Drop the finished leg from the live map: a trailing progress/error
         // frame from its dying transfer must not resolve against the restored
         // parent record and abort a paused retire.
