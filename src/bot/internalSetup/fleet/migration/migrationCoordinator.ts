@@ -332,7 +332,9 @@ export class MigrationCoordinator {
       for (const entry of rec.pendingSourceCleanup) {
         for (const legId of entry.legIds) {
           const leg = rec.legs.find(l => l.legId === legId);
-          if (leg) ids.add(leg.shardId);
+          // A lost node's copy went with it: its note fences the shard only
+          // once the node is back, until its cleanup runs.
+          if (leg && (leg.sourceLostAt === undefined || this.hooks.registry.nodes.has(entry.nodeId))) ids.add(leg.shardId);
         }
       }
     }
@@ -401,6 +403,17 @@ export class MigrationCoordinator {
       for (const leg of rec?.legs ?? []) {
         if (!lostLegIds.has(leg.legId) || leg.targetLostAt !== undefined) continue;
         leg.targetLostAt = at;
+        changed = true;
+      }
+    }
+    // A commit under way notes a source's cleanup only when it reaches the
+    // source: its committed legs from this node are marked now, so a note
+    // written after is a lost node's too.
+    for (const rec of new Set([this.record, this.parentRecord])) {
+      for (const leg of rec?.legs ?? []) {
+        if (leg.sourceNodeId !== lostNodeId || !leg.committed || leg.sourceLostAt !== undefined) continue;
+        leg.sourceLostAt = at;
+        delete leg.heldForChoice;
         changed = true;
       }
     }
