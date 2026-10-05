@@ -3863,9 +3863,11 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
           console.warn(`[Fleet] Takeover chain: previous master ${old.nodeName} re-registered; leaving its shards alone`);
           return;
         }
-        // Lifted only by a restart, which the chain does not survive.
+        // Unreadable records are lifted only by a restart, which the chain
+        // does not survive; records still being read are waited out by the
+        // Declare Lost's refusal and its retry below.
         const recordsBlocked = coordinator?.recordsBlock();
-        if (recordsBlocked) {
+        if (recordsBlocked && !coordinator?.recordsPending()) {
           console.error(`[Fleet] Takeover chain stopped before declaring previous master ${old.nodeName} lost: ${recordsBlocked}. After that restart, Declare Lost ${old.nodeName} on the Fleet tab if it has not re-registered`);
           return;
         }
@@ -3889,8 +3891,12 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       await coordinator.recover().catch(error =>
         console.error('[Migration] Recovery failed:', error instanceof Error ? error.message : error));
       // A cleanup this master owes itself (its own commit threw) has no
-      // register to retry it: asked once here, the retry tick keeps it.
-      if (coordinator.pendingSourceCleanups().some(owed => owed.nodeId === nodeId)) void coordinator.retrySourceCleanup(nodeId).catch(() => undefined);
+      // register to retry it, and a node that registered while the records
+      // were being read was asked against none: each is asked once here,
+      // the retry tick keeps it.
+      for (const owed of coordinator.pendingSourceCleanups()) {
+        if (owed.nodeId === nodeId || registry.nodes.get(owed.nodeId)?.connected) void coordinator.retrySourceCleanup(owed.nodeId).catch(() => undefined);
+      }
       void coordinator.deliverOwedAborts().catch(() => undefined);
     }
     const graceMs = rec.recovered || paused ? RECOVERY_HOLDDOWN_MS : REGISTER_GRACE_MS;

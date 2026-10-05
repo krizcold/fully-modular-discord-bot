@@ -4,6 +4,7 @@
 // zero-fleet-env boot stays byte-identical to today.
 
 import type { ControlStore, PersistedMigrations, PersistedNode, PersistedPlan, ReshardMarker } from './controlStore';
+import { migrationsHoldTogether } from './controlStore';
 import { isReshardConfirmed } from './placement';
 
 export interface RecoveryOptions {
@@ -117,7 +118,7 @@ export async function evaluateRecovery(store: ControlStore, opts: RecoveryOption
     const deferred = usableMarker?.to !== opts.override
       ? await reshardDeferral(store, plan, opts.selfNodeId, paused !== null)
       : await store.loadMigrations().then(
-        m => m.unreadable ? 'the migration records cannot be read' : m.active ? migrationUnderWay(m.active) : null,
+        m => m.unreadable || !migrationsHoldTogether(m) ? 'the migration records cannot be read' : m.active ? migrationUnderWay(m.active) : null,
         () => 'the migration records cannot be read');
     if (deferred) {
       const result = await adoptPlan(store, plan, opts.dataBackend);
@@ -184,7 +185,7 @@ async function reshardDeferral(store: ControlStore, plan: PersistedPlan, selfNod
   } catch {
     return 'the migration records cannot be read';
   }
-  if (migrations.unreadable) return 'the migration records cannot be read';
+  if (migrations.unreadable || !migrationsHoldTogether(migrations)) return 'the migration records cannot be read';
   // A copy held for the operator's choice waits on that choice, not on its node.
   const placed = new Set(plan.assignments.flatMap(a => a.leases.map(l => l.shardId)));
   const held = new Set<number>();

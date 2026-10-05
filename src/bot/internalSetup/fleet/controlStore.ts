@@ -244,3 +244,31 @@ export interface ControlStore {
    */
   saveSyncPosture(fact: SyncPosturePayload | null): Promise<void>;
 }
+
+const MIGRATION_KINDS = new Set<string>(['move', 'swap', 'retire', 'redistribute']);
+const MIGRATION_STATES = new Set<string>(['PRECHECK', 'PREPARING', 'COPYING', 'DRAINING', 'VERIFYING', 'COMMITTING', 'GRANTING', 'DONE', 'ABORTING', 'ABORTED']);
+const isFiniteNumber = (v: unknown): boolean => typeof v === 'number' && Number.isFinite(v);
+const absentOrFinite = (v: unknown): boolean => v === undefined || isFiniteNumber(v);
+const isObject = (v: unknown): boolean => typeof v === 'object' && v !== null;
+
+// Every field the master reads off a persisted record, its legs and its owed cleanups.
+function recordHoldsTogether(rec: unknown): boolean {
+  if (!isObject(rec)) return false;
+  const r = rec as MigrationRecord;
+  return typeof r.id === 'string' && MIGRATION_KINDS.has(r.kind) && MIGRATION_STATES.has(r.state)
+    && isFiniteNumber(r.term) && absentOrFinite(r.epoch) && absentOrFinite(r.updatedAt)
+    && Array.isArray(r.legs) && r.legs.every(l => isObject(l) && typeof l.legId === 'string'
+      && Number.isInteger(l.shardId) && typeof l.sourceNodeId === 'string' && typeof l.targetNodeId === 'string' && Array.isArray(l.guilds)
+      && (l.legState === undefined || MIGRATION_STATES.has(l.legState))
+      && (l.committed === undefined || (isObject(l.committed) && isFiniteNumber(l.committed.epoch) && isFiniteNumber(l.committed.at)))
+      && (l.heldForChoice === undefined || (isObject(l.heldForChoice) && isFiniteNumber(l.heldForChoice.at)))
+      && absentOrFinite(l.sourceLostAt) && absentOrFinite(l.targetLostAt))
+    && (r.currentLegIndex === undefined || (Number.isInteger(r.currentLegIndex) && r.currentLegIndex >= 0 && r.currentLegIndex <= r.legs.length))
+    && (r.pendingSourceCleanup === undefined || (Array.isArray(r.pendingSourceCleanup)
+      && r.pendingSourceCleanup.every(e => isObject(e) && typeof e.nodeId === 'string' && Array.isArray(e.legIds))));
+}
+
+/** The active migration (when any) and every history entry hold together; records that do not read as unreadable. */
+export function migrationsHoldTogether(m: PersistedMigrations): boolean {
+  return (m.active === null || recordHoldsTogether(m.active)) && Array.isArray(m.history) && m.history.every(recordHoldsTogether);
+}

@@ -25,6 +25,7 @@ import {
   XFER_STALL_TIMEOUT_MS,
 } from '../constants';
 import type { ControlStore, MigrationLeg, MigrationRecord, MigrationState, PersistedMigrations } from '../controlStore';
+import { migrationsHoldTogether } from '../controlStore';
 import {
   MSG,
   MigrationKind,
@@ -139,6 +140,9 @@ export class MigrationCoordinator {
   // The persisted records exist but could not be read: never written over
   // (their repair and a restart bring them back) and no migration starts.
   private recordsUnreadable = false;
+  // Until recover() has read them, a later read could contradict anything
+  // that runs: the records block answers meanwhile.
+  private recordsRead = false;
   private live = new Map<string, LegLive>(); // legId -> live
   private paused = false; // retire pause (Resume/Abort-remaining)
   // The running leg's abort ends the whole retire instead of pausing it (B4f-4: the planned transfer's Cancel).
@@ -173,15 +177,27 @@ export class MigrationCoordinator {
     } else {
       // A hold whose shard the restored plan places is over: its restore
       // landed, or the Declare Lost never reached the plan.
-      for (const rec of [persisted.active, ...this.history]) {
-        for (const leg of rec?.legs ?? []) if (leg.heldForChoice && !this.unplaced(leg.shardId)) delete leg.heldForChoice;
-        for (const entry of rec?.pendingSourceCleanup ?? []) {
-          for (const legId of entry.legIds) this.keepOwingKnown(entry.nodeId, rec!.legs.find(l => l.legId === legId));
+      try {
+        if (!migrationsHoldTogether(persisted)) {
+          throw new Error('a persisted migration record does not hold together');
         }
+        for (const rec of [persisted.active, ...this.history]) {
+          for (const leg of rec?.legs ?? []) if (leg.heldForChoice && !this.unplaced(leg.shardId)) delete leg.heldForChoice;
+          for (const entry of rec?.pendingSourceCleanup ?? []) {
+            for (const legId of entry.legIds) this.keepOwingKnown(entry.nodeId, rec!.legs.find(l => l.legId === legId));
+          }
+        }
+      } catch (error) {
+        // Records that parse but do not hold together are unreadable too:
+        // never written over nor read from, every door shut.
+        this.recordsUnreadable = true;
+        this.history = [];
+        throw error;
       }
       this.recovered = true;
     }
     const rec = persisted.active;
+    this.recordsRead = true;
     if (!rec) return;
     this.record = rec;
     console.warn(`[Migration] Recovering ${rec.kind} ${rec.id} in state ${rec.state}`);
@@ -643,9 +659,15 @@ export class MigrationCoordinator {
     return { verdict: 'unknown' };
   }
 
-  /** Why no migration, transformation, reshard Resume, transfer, Declare Lost, Assign or Drain may run and no free shard is placed, while the records cannot be read; null otherwise. */
+  /** Why no migration, transformation, reshard Resume, transfer, Declare Lost, Assign or Drain may run and no free shard is placed, while the records cannot be read or are still being read; null otherwise. */
   recordsBlock(): string | null {
-    return this.recordsUnreadable ? RECORDS_UNREADABLE : null;
+    if (this.recordsUnreadable) return RECORDS_UNREADABLE;
+    return this.recordsRead ? null : RECORDS_PENDING;
+  }
+
+  /** The records are still being read at this boot: the block lifts by itself. */
+  recordsPending(): boolean {
+    return !this.recordsRead && !this.recordsUnreadable;
   }
 
   getView(): MigrationView {
@@ -733,7 +755,8 @@ export class MigrationCoordinator {
   }
 
   private validateCommon(payload: StartPayload): PrecheckResult {
-    if (this.recordsUnreadable) return { ok: false, error: RECORDS_UNREADABLE };
+    const recordsBlocked = this.recordsBlock();
+    if (recordsBlocked) return { ok: false, error: recordsBlocked };
     if (this.hooks.isPaused() && payload.kind !== 'redistribute') {
       return { ok: false, error: 'reshard pause active; only Redistribute runs during the pause' };
     }
@@ -1725,7 +1748,8 @@ export class MigrationCoordinator {
   // Redistribute (pause-time, data-only; DRAINING/freeze skipped).
   // --------------------------------------------------------------------------
   private async precheckRedistribute(): Promise<PrecheckResult> {
-    if (this.recordsUnreadable) return { ok: false, error: RECORDS_UNREADABLE };
+    const recordsBlocked = this.recordsBlock();
+    if (recordsBlocked) return { ok: false, error: recordsBlocked };
     if (!this.hooks.isPaused()) return { ok: false, error: 'redistribute runs only during the reshard pause' };
     const assembling = this.assemblingError();
     if (assembling) return { ok: false, error: assembling };
@@ -2217,6 +2241,8 @@ export class MigrationCoordinator {
     await this.hooks.store.saveMigrations(state);
   }
 }
+
+const RECORDS_PENDING = 'The persisted migration records have not been read yet at this boot; try again shortly, and restart the master if this persists';
 
 const RECORDS_UNREADABLE = 'The persisted migration records (migrations.json, or the control store\'s migrations document) cannot be read, so a migration may be under way unseen; no migration, backend transformation, reshard Resume, planned transfer, Declare Lost, Assign or Drain runs, and no free shard is placed, until the master restarts with them readable';
 
