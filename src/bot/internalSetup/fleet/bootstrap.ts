@@ -2601,10 +2601,26 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     if (resumeRetryTimer) { clearInterval(resumeRetryTimer); resumeRetryTimer = null; }
   }
 
+  // A Resume and a Redistribute's start exclude each other: the start's
+  // proposal and data moves run only under the pause, and Resume grants
+  // the proposal only once its data is placed on every node still here.
+  let resuming = false;
+  let redistributeStarts = 0;
+
   masterResume = async (): Promise<AssignResult> => {
     if (!paused) return { success: false, error: 'No reshard pause is active' };
     const recordsBlocked = coordinator?.recordsBlock();
     if (recordsBlocked) return { success: false, error: recordsBlocked };
+    const owed = coordinator?.redistributeOwed() ?? { decided: false, nodeIds: [] };
+    if (owed.nodeIds.length > 0 || redistributeStarts > 0) {
+      const names = owed.nodeIds.map(id => registry.nodes.get(id)?.nodeName ?? id).join(', ');
+      return {
+        success: false,
+        error: owed.decided
+          ? `a redistribute is committing data on ${names}; Resume once it lands, or Declare a node that never returns Lost`
+          : 'a redistribute is moving data; Resume once it finishes or is aborted',
+      };
+    }
     if (transformer?.hasActive()) {
       return { success: false, error: 'a backend transformation is active; finish or abort it first' };
     }
@@ -2612,6 +2628,16 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     if (holdRemainingMs > 0) {
       return { success: false, error: `waiting for stale-holder leases to expire, ${Math.ceil(holdRemainingMs / 1000)}s remaining` };
     }
+    if (resuming) return { success: false, error: 'a Resume is already under way' };
+    resuming = true;
+    try {
+      return await resumeAssignments();
+    } finally {
+      resuming = false;
+    }
+  };
+
+  async function resumeAssignments(): Promise<AssignResult> {
     // Marker first: if the delete fails the pause must survive the next boot.
     await store.clearReshardMarker();
     paused = false;
@@ -2630,7 +2656,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       // the proposal file is kept until every proposal shard has landed, so a
       // retry or a fresh crash still re-grants EXACTLY the proposal owner.
       // A shard waiting on the operator's choice is placed by that choice.
-      const heldIds = new Set(coordinator?.heldShards().map(h => h.shardId) ?? []);
+      const heldIds = coordinator?.holdShardIds() ?? new Set<number>();
       for (const [shardKey, proposalNodeId] of Object.entries(persistedProposal.proposal)) {
         const shardId = Number(shardKey);
         if (!Number.isInteger(shardId) || shardId < 0 || shardId >= registry.shardCount) continue;
@@ -2652,7 +2678,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     }
     void distribute();
     return { success: true };
-  };
+  }
 
   // Operator verdict on a down node (the Wait alternative). The epoch bump
   // orders every later grant after the verdict; if the node returns, its
@@ -3287,7 +3313,16 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       onNodeDownDuringMigration: () => { /* coordinator aborts; the node-down bump is informational */ },
       transformationActive: () => transformer?.hasActive() ?? false,
     });
-    masterMigrateStart = payload => coordinator!.start(payload);
+    masterMigrateStart = async payload => {
+      if (payload.kind !== 'redistribute') return coordinator!.start(payload);
+      if (resuming) return { ok: false, error: 'the reshard pause is being resumed' };
+      redistributeStarts += 1;
+      try {
+        return await coordinator!.start(payload);
+      } finally {
+        redistributeStarts -= 1;
+      }
+    };
     masterMigrateAbort = migrationId => coordinator!.abort(migrationId);
     masterMigrateResume = migrationId => coordinator!.resume(migrationId);
     masterMigratePrecheck = payload => coordinator!.precheck(payload);

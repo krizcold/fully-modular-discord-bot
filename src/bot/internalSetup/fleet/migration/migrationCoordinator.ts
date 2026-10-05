@@ -297,6 +297,20 @@ export class MigrationCoordinator {
     return this.migrating;
   }
 
+  /**
+   * The registered nodes a running redistribute still places data on:
+   * every target before its commit decision, each whose commit has not
+   * acked after it, none once granting. A node Declared Lost is not
+   * waited on.
+   */
+  redistributeOwed(): { decided: boolean; nodeIds: string[] } {
+    const rec = this.record;
+    if (!rec || rec.kind !== 'redistribute' || isTerminal(rec.state) || rec.state === 'GRANTING') return { decided: false, nodeIds: [] };
+    const decided = rec.state === 'COMMITTING';
+    const owed = rec.legs.filter(l => this.hooks.registry.nodes.has(l.targetNodeId) && !(decided && (l as any)._targetAcked));
+    return { decided, nodeIds: [...new Set(owed.map(l => l.targetNodeId))] };
+  }
+
   /** The shards the granting migration still owes nodeId. */
   grantsOwedTo(nodeId: string): number[] {
     return this.grantLegsOwedTo(nodeId).map(l => l.shardId);
@@ -496,6 +510,20 @@ export class MigrationCoordinator {
     const epochOf = (c: OwedLeg): number => c.leg.committed?.epoch ?? c.rec.epoch ?? 0;
     const newest = Math.max(...copies.map(epochOf));
     return { newest: copies.filter(c => epochOf(c) === newest), older: copies.filter(c => epochOf(c) !== newest) };
+  }
+
+  /**
+   * Every shard a hold waits on, a migration's fence or not: a hold that
+   * began while a redistribute ran stays out of the view until the run
+   * ends, and Resume places none of them.
+   */
+  holdShardIds(): Set<number> {
+    const ids = new Set<number>();
+    for (const shardId of new Set(this.pendingSourceCleanups().flatMap(owed => owed.shardIds))) {
+      if (!this.unplaced(shardId)) continue;
+      if (this.owedLegsOf(shardId).some(c => c.leg.sourceLostAt === undefined && c.leg.heldForChoice !== undefined)) ids.add(shardId);
+    }
+    return ids;
   }
 
   /** The shards waiting on the operator's choice, with their newest surviving copy and the nodes holding older ones. */
@@ -1399,7 +1427,8 @@ export class MigrationCoordinator {
       // MERGES the moved-shard targets onto the durable on-disk proposal (never
       // clobbers the unmoved-shard entries), so after a crash recovery (where
       // this.proposal is empty) Resume still grants EXACTLY the full proposal.
-      await this.persistProposal();
+      // Settled after a Resume ended the pause, its proposal is granted already.
+      if (this.hooks.isPaused()) await this.persistProposal();
       await this.finish('DONE');
       return;
     }
@@ -1738,6 +1767,9 @@ export class MigrationCoordinator {
     };
     this.record = rec;
     this.hydrateLive(rec);
+    // Its shards wait for it, as its recovery fences them: a Resume past a
+    // commit that cannot land places none of them by load.
+    this.fenceShards(legs.map(l => l.shardId));
     await this.persist();
     // Data-only: PREPARING -> COPYING -> (skip DRAINING) -> VERIFYING via a
     // final round trigger -> COMMITTING per batch. Sources freeze nothing (the
@@ -1794,6 +1826,9 @@ export class MigrationCoordinator {
       }
     }
     this.buildProposal(shardCount, owed);
+    // A shard held for the operator's choice is placed by that choice: no
+    // data moves into it, or its fence would hide the hold from Resume.
+    const held = new Set(this.heldShards().map(h => h.shardId));
     // Collect per-node inventories over the control channel.
     const byPair = new Map<string, { shardId: number; from: string; to: string; guilds: string[] }>();
     for (const node of this.hooks.registry.nodes.values()) {
@@ -1809,6 +1844,7 @@ export class MigrationCoordinator {
       for (const g of inv.guilds) {
         if (owed.get(node.nodeId)?.has(g.guildId)) continue;
         const newShard = guildToShard(g.guildId, shardCount);
+        if (held.has(newShard)) continue;
         const targetNodeId = this.ownerOfShard(newShard);
         if (!targetNodeId || targetNodeId === node.nodeId) continue;
         const key = `${node.nodeId}->${targetNodeId}:${newShard}`;
