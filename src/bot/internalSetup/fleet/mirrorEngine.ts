@@ -101,6 +101,8 @@ function isGuildId(value: unknown): value is string {
   return typeof value === 'string' && /^\d+$/.test(value);
 }
 
+const RECORDS_DOC: typeof MIRROR_DOC_NAMES[number] = 'migrations.json';
+
 function isFileEntry(value: unknown): value is SyncFileEntry {
   const entry = value as SyncFileEntry;
   return !!entry && typeof entry.path === 'string' && typeof entry.sha256 === 'string' && Number.isInteger(entry.size) && entry.size >= 0;
@@ -591,30 +593,42 @@ export class MirrorEngine {
     const docsResolved = path.resolve(docsDir);
     fs.mkdirSync(docsDir, { recursive: true });
     const wantedDocs = new Set<string>();
+    // The documents land as one set, the records last, once every changed one
+    // is staged: the copy's records always describe its plan.
+    const staged: { name: string; file: string; record: MirrorFileRecord }[] = [];
+    let docFailed = false;
     for (const doc of listing.documents) {
       if (!isFileEntry(doc) || !(MIRROR_DOC_NAMES as readonly string[]).includes(doc.path)) {
         fail('unexpected document in the listing');
+        docFailed = true;
         continue;
       }
       wantedDocs.add(doc.path);
-      const target = path.join(docsDir, doc.path);
       const have = previous.documents[doc.path];
-      if (have && have.sha256 === doc.sha256 && have.size === doc.size && fs.existsSync(target)) {
-        next.documents[doc.path] = have;
-        continue;
-      }
+      if (have) next.documents[doc.path] = have;
+      if (have && have.sha256 === doc.sha256 && have.size === doc.size && fs.existsSync(path.join(docsDir, doc.path))) continue;
       try {
-        next.documents[doc.path] = await this.fetchFile('document', undefined, doc, target);
-        changed += 1;
+        const { stagingFile, record } = await this.fetchToStaging('document', undefined, doc);
+        staged.push({ name: doc.path, file: stagingFile, record });
       } catch (error) {
-        if (have) next.documents[doc.path] = have;
+        docFailed = true;
         fail(`${doc.path}: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
-    for (const rel of listLocalFiles(docsDir)) {
-      if (wantedDocs.has(rel)) continue;
-      const target = safeImportTarget(docsResolved, rel);
-      if (target) fs.rmSync(target, { force: true });
+    if (docFailed) {
+      for (const [name, record] of Object.entries(previous.documents)) if (!next.documents[name]) next.documents[name] = record;
+    } else {
+      staged.sort((a, b) => Number(a.name === RECORDS_DOC) - Number(b.name === RECORDS_DOC));
+      for (const { name, file, record } of staged) {
+        renameWithRetry(file, path.join(docsDir, name));
+        next.documents[name] = record;
+        changed += 1;
+      }
+      for (const rel of listLocalFiles(docsDir)) {
+        if (wantedDocs.has(rel)) continue;
+        const target = safeImportTarget(docsResolved, rel);
+        if (target) fs.rmSync(target, { force: true });
+      }
     }
 
     // Guilds a migration committed here since this pass began: the listing
@@ -657,6 +671,13 @@ export class MirrorEngine {
    * between); the record returned names the bytes that landed.
    */
   private async fetchFile(kind: MirrorReadKind, guildId: string | undefined, entry: SyncFileEntry, targetAbs: string): Promise<MirrorFileRecord> {
+    const { stagingFile, record } = await this.fetchToStaging(kind, guildId, entry);
+    fs.mkdirSync(path.dirname(targetAbs), { recursive: true });
+    renameWithRetry(stagingFile, targetAbs);
+    return record;
+  }
+
+  private async fetchToStaging(kind: MirrorReadKind, guildId: string | undefined, entry: SyncFileEntry): Promise<{ stagingFile: string; record: MirrorFileRecord }> {
     if (entry.size > SYNC_MAX_FILE_BYTES) throw new Error(`file exceeds the mirror size cap (${entry.size} bytes)`);
     fs.mkdirSync(this.stagingRoot(), { recursive: true });
     const stagingFile = path.join(this.stagingRoot(), `dl-${process.pid}-${++this.stagingCounter}.tmp`);
@@ -690,8 +711,6 @@ export class MirrorEngine {
       fs.rmSync(stagingFile, { force: true });
       throw new Error('sha256 mismatch (the bytes match neither the listing nor the file as served)');
     }
-    fs.mkdirSync(path.dirname(targetAbs), { recursive: true });
-    renameWithRetry(stagingFile, targetAbs);
-    return { size: offset, sha256: got };
+    return { stagingFile, record: { size: offset, sha256: got } };
   }
 }

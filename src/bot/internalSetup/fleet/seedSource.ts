@@ -9,7 +9,7 @@ import { WebSocket } from 'ws';
 import { DATA_ROOT, dataPath } from '../../../utils/dataRoot';
 import { FLEET_DIR, MIRROR_DOC_NAMES, XFER_DELTA_THRESHOLD_FILES, XFER_DIAL_RETRY_MS, XFER_DIAL_RETRY_WINDOW_MS, XFER_MAX_ROUNDS } from './constants';
 import type { PersistedFleetConfig, PersistedPlan, PersistedTerm } from './controlStore';
-import { adoptStarted, readOwnerNodeId } from './fileFailover';
+import { adoptStarted, readOwnerNodeId, recordsOfAnotherPlan } from './fileFailover';
 import { readHolderSighting } from './holderSighting';
 import { mirrorDocsDir, mirrorGuildDir, mirrorRoot, readMirrorManifest } from './mirrorEngine';
 import { dialTransfer, TransferSender } from './migration/transferChannel';
@@ -60,8 +60,9 @@ function sizeOfDir(dir: string): number {
 }
 
 /**
- * The placement documents a copy carries, as text. Null when the plan or the
- * fleet config is missing or does not parse: the pin needs both.
+ * The documents a copy carries, as text. Null when the plan or the fleet
+ * config is missing or does not parse, or the migration records do not
+ * parse or were listed with another plan: the pin needs all three.
  */
 function readDocuments(dir: string): Record<string, string> | null {
   const documents: Record<string, string> = {};
@@ -73,6 +74,10 @@ function readDocuments(dir: string): Record<string, string> | null {
   const plan = documents['leases.json'] === undefined ? null : readJsonText<PersistedPlan>(documents['leases.json']);
   const config = documents['fleet-config.json'] === undefined ? null : readJsonText<PersistedFleetConfig>(documents['fleet-config.json']);
   if (!plan || !Array.isArray(plan.assignments) || !config || !Array.isArray(config.masterCandidates)) return null;
+  if (documents['migrations.json'] !== undefined) {
+    const records = readJsonText<{ planSha256?: unknown }>(documents['migrations.json']);
+    if (records === null || recordsOfAnotherPlan(records, documents['leases.json']!)) return null;
+  }
   return documents;
 }
 
@@ -131,7 +136,7 @@ export function buildSeedOffer(selfNodeId: string, selfNodeName: string): SeedOf
       return { offer: null, reason: `this node's copy is of ${sourceName}'s guild data, but the master it last registered with is node ${sighting.nodeId.slice(0, 8)} (term ${sighting.term}), which held the fleet after ${sourceName}: a copy of a previous master seeds no new master, as it promotes none; drop it once registered with a serving master` };
     }
     const documents = readDocuments(mirrorDocsDir());
-    if (!documents) return { offer: null, reason: `this node's copy of ${sourceName}'s guild data carries no usable placement documents (leases.json, fleet-config.json), so a master seeded from it could not pin the shard plan` };
+    if (!documents) return { offer: null, reason: `this node's copy of ${sourceName}'s guild data carries no usable placement documents (leases.json, fleet-config.json) or its migration records (migrations.json) do not parse or were listed with another plan, so a master seeded from it could not pin the shard plan` };
     // A migration moved guilds of this copy onto this node and no settled
     // pass has run since (B4f-4): its plan may not yet place them on this
     // node, where their data is, so a seed would serve them empty.
@@ -184,7 +189,7 @@ export function buildSeedOffer(selfNodeId: string, selfNodeName: string): SeedOf
     return { offer: null, reason: `this node's own mastership (term ${ownAny}) is older than its last registration with another master (node ${sighting!.nodeId.slice(0, 8)} at term ${sighting!.term}), so its live guild data is not the fleet's latest` };
   }
   const documents = readDocuments(fleetFile(''));
-  if (!documents) return { offer: null, reason: `this node was a master (term ${ownTerm}) but its fleet directory carries no usable placement documents from that mastership` };
+  if (!documents) return { offer: null, reason: `this node was a master (term ${ownTerm}) but its fleet directory carries no usable placement documents from that mastership, or its migration records do not parse or were listed with another plan` };
   const guilds: SeedOfferGuild[] = [];
   let totalBytes = 0;
   for (const guildId of listNumericDirs(DATA_ROOT)) {

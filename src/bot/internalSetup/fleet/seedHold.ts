@@ -30,7 +30,7 @@ import {
 } from './constants';
 import { ControlServer } from './controlServer';
 import type { PersistedFleetConfig, PersistedTerm } from './controlStore';
-import { adoptMirror, clearAdoptMarker, finishAdopt, pinPlacement, seedTerm } from './fileFailover';
+import { adoptMirror, clearAdoptMarker, finishAdopt, pinPlacement, pinRecordsText, seedTerm } from './fileFailover';
 import { atomicWriteFileSync, renameWithRetry } from './fileControlStore';
 import { readHolderSighting } from './holderSighting';
 import { incomingLegDir, TransferReceiver, TransferServer } from './migration/transferChannel';
@@ -234,8 +234,8 @@ export async function finishSeed(record: SeedRecord, selfNodeId: string): Promis
     writeSeedRecord(record);
   }
   if (record.phase === 'pin') {
-    const pinned = await pinPlacement(selfNodeId, record.sourceNodeId);
-    console.warn(`[Fleet] SEED pin: shard(s) [${pinned.movedShards.join(', ')}] of ${record.sourceNodeName} pinned to this node${pinned.removed.length > 0 ? `; stale records removed: ${pinned.removed.join(', ')}` : ''}`);
+    const pinned = await pinPlacement(selfNodeId, record.sourceNodeId, true);
+    console.warn(`[Fleet] SEED pin: shard(s) [${pinned.movedShards.join(', ')}] of ${record.sourceNodeName} pinned to this node${pinned.removed.length > 0 ? `; stale records removed: ${pinned.removed.join(', ')}` : ''}${pinRecordsText(pinned)}`);
     repointPinnedConfig();
     stillOnDisk();
     record.phase = 'seed';

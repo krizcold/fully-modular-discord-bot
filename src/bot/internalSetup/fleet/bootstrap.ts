@@ -79,7 +79,7 @@ import { serveSyncRequest, SyncAuthority } from './syncAuthority';
 import { SyncEngine } from './syncEngine';
 import { MirrorAuthority, isMirrorRequest, serveMirrorRequest } from './mirrorAuthority';
 import { MirrorEngine, readMirrorManifest } from './mirrorEngine';
-import { adoptStarted, isStaleCopy, listStaleCopies, STALE_COPY_REASON } from './fileFailover';
+import { adoptStarted, isStaleCopy, listStaleCopies, planFingerprint, STALE_COPY_REASON } from './fileFailover';
 import { requestHandover } from './transferHandover';
 import { TransferAuthority } from './transferAuthority';
 import { abandonSeedRecord, confirmSeed, floorTermAbove, hasGuildData, readSeedRecord, resumeSeed, runSeedHold, seedHoldApplies, seedSupersededBy, writeSeedRecord } from './seedHold';
@@ -3152,17 +3152,23 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       pushToNode: (pushNodeId, statePayload) => server!.request(pushNodeId, MSG.SYNC_STATE, statePayload),
     });
     masterSyncBump = scope => syncAuthority!.bump(scope);
-    // The placement documents as the control store holds them now, for the
-    // mirror's listing and the planned transfer's handover (B4f-4).
+    // The placement documents and the migration records describing them as
+    // the control store holds them now, read together (the file store reads
+    // synchronously), for the mirror's listing and the planned transfer's
+    // handover (B4f-4).
     const placementDocuments = async (): Promise<{ name: string; body: string }[]> => {
-      const [plan, persistedRegistry, config] = await Promise.all([store.loadPlan(), store.loadRegistry(), store.loadFleetConfig()]);
+      const [plan, persistedRegistry, config, migrations] = await Promise.all([store.loadPlan(), store.loadRegistry(), store.loadFleetConfig(), store.loadMigrations()]);
       // Both exist on a serving master, so null is a failed read (the file
       // store reads every error as null): the listing aborts, the copy stays.
       if (!plan || !config) throw new Error('control store documents unavailable');
+      // Nor does a copy take a plan without the records that describe it.
+      if (migrations.unreadable) throw new Error('the migration records cannot be read');
+      const planBody = JSON.stringify(plan, null, 2);
       return [
-        { name: 'leases.json', body: JSON.stringify(plan, null, 2) },
+        { name: 'leases.json', body: planBody },
         { name: 'registry.json', body: JSON.stringify(persistedRegistry, null, 2) },
         { name: 'fleet-config.json', body: JSON.stringify(config, null, 2) },
+        { name: 'migrations.json', body: JSON.stringify({ active: migrations.active, history: migrations.history, updatedAt: migrations.updatedAt, planSha256: planFingerprint(planBody) }, null, 2) },
       ];
     };
     mirrorAuthority = new MirrorAuthority({
@@ -3671,6 +3677,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
         // heartbeat for it (B7-F23).
         posturePushed.delete(registeredNodeId);
         pushSyncPosture();
+        void coordinator?.deliverOwedAborts(registeredNodeId).catch(() => undefined);
         void (async () => {
           try {
             await reconcileHeldLeases(registeredNodeId);
@@ -3846,6 +3853,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       // A cleanup this master owes itself (its own commit threw) has no
       // register to retry it: asked once here, the retry tick keeps it.
       if (coordinator.pendingSourceCleanups().some(owed => owed.nodeId === nodeId)) void coordinator.retrySourceCleanup(nodeId).catch(() => undefined);
+      void coordinator.deliverOwedAborts().catch(() => undefined);
     }
     const graceMs = rec.recovered || paused ? RECOVERY_HOLDDOWN_MS : REGISTER_GRACE_MS;
     if ((rec.recovered || paused) && recoverySource) recoverySource.holdDownUntil = Date.now() + graceMs;

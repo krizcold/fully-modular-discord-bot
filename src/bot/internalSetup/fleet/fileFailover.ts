@@ -5,11 +5,12 @@
 // engine (the phases) and the bot child (the retire reading). Every step is
 // idempotent on the disk it finds, so a parent restart re-enters it.
 
+import { createHash, randomUUID } from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import { DATA_ROOT, dataPath } from '../../../utils/dataRoot';
-import { FLEET_DIR, MIRROR_DOC_NAMES } from './constants';
-import type { PersistedAssignment, PersistedFleetConfig, PersistedPlan, PersistedRegistry, PersistedTerm } from './controlStore';
+import { FLEET_DIR, MIRROR_DOC_NAMES, PLACEMENT_DOC_NAMES } from './constants';
+import type { MigrationRecord, PersistedAssignment, PersistedFleetConfig, PersistedMigrations, PersistedPlan, PersistedRegistry, PersistedTerm } from './controlStore';
 import { atomicWriteFileSync, renameWithRetry } from './fileControlStore';
 import { adoptMarkerFile, mirrorDocsDir, mirrorGuildDir, mirrorRoot, readMirrorManifest } from './mirrorEngine';
 import { guildIdToShardId } from './placement';
@@ -21,7 +22,7 @@ const GRAVEYARD_DIRNAME = '_graveyard';
  * postgres mastership, it would have the master boot export the old database
  * back over the pinned documents before the fence.
  */
-const STALE_MASTER_RECORDS = ['migrations.json', 'reshard-pending.json', 'redistribute-proposal.json', 'transformation.json', 'control-store-moved.json'];
+const STALE_MASTER_RECORDS = ['reshard-pending.json', 'redistribute-proposal.json', 'transformation.json', 'control-store-moved.json'];
 export const STALE_COPY_REASON = 'superseded-stale-copy';
 
 export interface AdoptMarker {
@@ -41,6 +42,11 @@ export interface AdoptOutcome {
 export interface PinOutcome {
   movedShards: number[];
   removed: string[];
+  recordsCarried: boolean;
+  /** Shards a move decided onto the old master had not yet granted: their newest copy went with it. */
+  lostShards: number[];
+  /** Those of them with an older copy a node still owes the cleanup of, held for the operator's choice. */
+  heldShards: number[];
 }
 
 const isGuildId = (value: unknown): value is string => typeof value === 'string' && /^\d+$/.test(value);
@@ -55,6 +61,16 @@ function readJson<T>(file: string): T | null {
 
 function readMirrorDoc<T>(name: typeof MIRROR_DOC_NAMES[number]): T | null {
   return readJson<T>(path.join(mirrorDocsDir(), name));
+}
+
+/** A mirrored document's text; null when the copy has none. */
+function readMirrorText(name: typeof MIRROR_DOC_NAMES[number]): string | null {
+  try {
+    return fs.readFileSync(path.join(mirrorDocsDir(), name), 'utf-8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
+  }
 }
 
 export function readAdoptMarker(): AdoptMarker | null {
@@ -170,34 +186,179 @@ export async function adoptMirror(selfNodeId: string): Promise<AdoptOutcome> {
   return outcome;
 }
 
+const DECIDED_STATES: ReadonlySet<string> = new Set(['COMMITTING', 'GRANTING']);
+
+/** The fingerprint of a plan document's text: the master's listed migration records name the plan they describe by it. */
+export function planFingerprint(planText: string): string {
+  return createHash('sha256').update(planText, 'utf-8').digest('hex');
+}
+
+/** Migration records listed with another plan than this one (a copy's set torn across two passes); records naming none are a node's own. */
+export function recordsOfAnotherPlan(records: { planSha256?: unknown } | null, planText: string): boolean {
+  return typeof records?.planSha256 === 'string' && records.planSha256 !== planFingerprint(planText);
+}
+
+/** Why the copy's migration records cannot be carried over, judged before the adopt (which cannot be undone); null when they can or the copy has none. */
+export function copyRecordsRefusal(): string | null {
+  const body = readMirrorText('migrations.json');
+  if (body === null) return null;
+  const name = readMirrorManifest()?.sourceNodeName ?? 'the master';
+  const after = `so ${name}'s holds, owed cleanups and running migration cannot be carried over; the copy is whole again after a complete pass while ${name} serves`;
+  let records: { planSha256?: unknown } | null = null;
+  try {
+    records = JSON.parse(body) as { planSha256?: unknown } | null;
+  } catch { /* judged below */ }
+  if (records === null || typeof records !== 'object') return `this node's copy of ${name}'s migration records (migrations.json) does not parse, ${after}`;
+  if (recordsOfAnotherPlan(records, readMirrorText('leases.json') ?? '')) return `this node's copy of ${name}'s documents is torn across two passes (its migration records were listed with another plan than its leases.json), ${after}`;
+  return null;
+}
+
+/**
+ * The copy's migration records made this node's after an adopt, which made
+ * the old master's guild data this node's. The old master's part in a move
+ * passes to this node where that copy stands for it: the originals of a move
+ * out of it (their cleanup graveyards the copy, a release keeps it, an
+ * abort's rollback grants this node), unless the move committed onto this
+ * node (a cleanup here would graveyard what it brought), and a move into it
+ * settled, granted or not yet decided (an abort here has no staging to
+ * drop). A move into it decided and not yet granted lost its target with it
+ * (the copy holds no staging): marked as a Declare Lost marks it, its shard
+ * left unplaced as its drain left it, and the older copies a node still owes
+ * the cleanup of held for the operator's choice. A retire of the old master
+ * has nothing left to move once its shards are pinned here: the legs it had
+ * not run go, and one short of its current leg's commit decision ends there,
+ * that leg aborted (the new master delivers the abort to its nodes) with its
+ * shard on this node (resumed, a leg from this node to itself could never
+ * pass its precheck).
+ */
+function adoptRecords(body: string, planText: string, plan: PersistedPlan, selfNodeId: string, sourceNodeId: string | null, sourceName: string): { records: PersistedMigrations; lost: Set<number>; keep: Set<number>; held: number[] } {
+  let parsed: (Partial<PersistedMigrations> & { planSha256?: unknown }) | null;
+  try {
+    parsed = JSON.parse(body) as (Partial<PersistedMigrations> & { planSha256?: unknown }) | null;
+  } catch {
+    throw new Error('the copy\'s migration records (migrations.json) do not parse, so the old master\'s holds, owed cleanups and running migration cannot go on here');
+  }
+  if (recordsOfAnotherPlan(parsed, planText)) {
+    throw new Error('the copy\'s migration records were listed with another plan than its leases.json (a pass torn by a restart of this node), so the old master\'s holds, owed cleanups and running migration cannot go on here');
+  }
+  let active = parsed?.active ?? null;
+  const history = Array.isArray(parsed?.history) ? parsed!.history! : [];
+  const at = Date.now();
+  const lost = new Set<number>();
+  const keep = new Set<number>();
+  let ended: MigrationRecord | null = null;
+  const records = [active, ...history].filter((rec): rec is MigrationRecord => !!rec && Array.isArray(rec.legs));
+  if (sourceNodeId !== null) {
+    const onSource = new Set<number>();
+    for (const a of plan.assignments) if (a?.nodeId === sourceNodeId && Array.isArray(a.leases)) for (const l of a.leases) if (l) onSource.add(l.shardId);
+    for (const rec of records) {
+      const live = rec === active;
+      const idx = rec.currentLegIndex ?? 0;
+      const retireOfSource = live && rec.kind === 'retire' && rec.legs.every(l => l.sourceNodeId === sourceNodeId);
+      if (retireOfSource && rec.legs.length > idx + 1) rec.legs = rec.legs.slice(0, idx + 1);
+      const passed = new Set<string>();
+      rec.legs.forEach((leg, index) => {
+        const state = !live ? leg.legState ?? rec.state
+          : rec.kind !== 'retire' ? rec.state
+            : index < idx ? leg.legState ?? 'DONE' : index === idx ? leg.legState ?? 'PREPARING' : 'PREPARING';
+        const decided = DECIDED_STATES.has(state);
+        // A grant that landed put the shard on the old master in the copy's plan.
+        const granted = state === 'GRANTING' && onSource.has(leg.shardId);
+        if (leg.sourceNodeId === sourceNodeId) {
+          if (leg.targetNodeId !== selfNodeId || !(decided || state === 'DONE')) {
+            leg.sourceNodeId = selfNodeId;
+            passed.add(leg.legId);
+          }
+        } else if (leg.targetNodeId === sourceNodeId) {
+          if (decided && !granted) {
+            if (leg.targetLostAt === undefined) leg.targetLostAt = at;
+            lost.add(leg.shardId);
+          } else if (leg.sourceNodeId !== selfNodeId || granted) leg.targetNodeId = selfNodeId;
+        }
+      });
+      const notes = rec.pendingSourceCleanup ?? [];
+      const owed = notes.find(e => e.nodeId === sourceNodeId);
+      const moving = owed ? owed.legIds.filter(id => passed.has(id)) : [];
+      if (owed && moving.length > 0) {
+        owed.legIds = owed.legIds.filter(id => !passed.has(id));
+        let mine = notes.find(e => e.nodeId === selfNodeId);
+        if (!mine) notes.push(mine = { nodeId: selfNodeId, legIds: [] });
+        for (const id of moving) if (!mine.legIds.includes(id)) mine.legIds.push(id);
+        rec.pendingSourceCleanup = notes.filter(e => e.legIds.length > 0);
+      }
+      const current = rec.legs[idx];
+      const currentState = current?.legState ?? 'PREPARING';
+      if (retireOfSource && current && currentState !== 'DONE' && !DECIDED_STATES.has(currentState)) {
+        current.legState = 'ABORTED';
+        current.error = rec.error = 'the old master went before this leg\'s commit decision; its shard stays with the node that took over its data';
+        rec.state = 'ABORTED';
+        rec.updatedAt = at;
+        rec.abortUndelivered = [...new Set([current.sourceNodeId, current.targetNodeId])];
+        keep.add(current.shardId);
+        ended = rec;
+      }
+    }
+  }
+  if (ended) {
+    history.push(ended);
+    active = null;
+  }
+  const held = new Set<number>();
+  for (const rec of records) {
+    if (rec.shardCount !== undefined && rec.shardCount !== plan.shardCount) continue;
+    for (const entry of rec.pendingSourceCleanup ?? []) {
+      for (const legId of entry.legIds) {
+        const leg = rec.legs.find(l => l.legId === legId);
+        if (!leg || !lost.has(leg.shardId) || leg.direction === 'none' || leg.sourceLostAt !== undefined) continue;
+        if (!leg.heldForChoice) leg.heldForChoice = { lostNodeName: sourceName, at };
+        held.add(leg.shardId);
+      }
+    }
+  }
+  return { records: { active, history, updatedAt: at }, lost, keep, held: [...held].sort((a, b) => a - b) };
+}
+
 /**
  * The pin phase: the mirrored placement documents become this node's, with
  * every shard the dead master held reassigned to this node, so the master
  * this boot becomes grants none of them to a returning stale copy. Records a
  * past mastership of this node may have left in the fleet dir are removed:
- * a reshard marker would pause the boot and a migration record would resume
- * a migration of a fleet this node no longer coordinates.
+ * a reshard marker would pause the boot. The migration records are the
+ * copy's after an adopt (carryRecords), so the old master's holds, owed
+ * cleanups and running migration go on here; a planned transfer, which hands
+ * over only once they are settled, keeps none.
  */
-export async function pinPlacement(selfNodeId: string, sourceNodeId: string | null): Promise<PinOutcome> {
+export async function pinPlacement(selfNodeId: string, sourceNodeId: string | null, carryRecords: boolean): Promise<PinOutcome> {
   const plan = readMirrorDoc<PersistedPlan>('leases.json');
   const config = readMirrorDoc<PersistedFleetConfig>('fleet-config.json');
   const registry = readMirrorDoc<PersistedRegistry>('registry.json');
   if (!plan || !Array.isArray(plan.assignments) || !config || !Array.isArray(config.masterCandidates)) {
     throw new Error('the copy carries no usable placement documents (leases.json, fleet-config.json), so the plan cannot be pinned; the Backup copy line says whether the copy was complete');
   }
+  const recordsBody = carryRecords ? readMirrorText('migrations.json') : null;
+  const sourceName = (registry && Array.isArray(registry.nodes) ? registry.nodes.find(n => n?.nodeId === sourceNodeId)?.nodeName : undefined) ?? sourceNodeId?.slice(0, 8) ?? 'the old master';
+  const carried = recordsBody === null ? null : adoptRecords(recordsBody, readMirrorText('leases.json') ?? '', plan, selfNodeId, sourceNodeId, sourceName);
+  const lost = carried?.lost ?? new Set<number>();
   const self: PersistedAssignment = { nodeId: selfNodeId, leases: [] };
   const others: PersistedAssignment[] = [];
   const movedShards: number[] = [];
   for (const assignment of plan.assignments) {
     if (!assignment || typeof assignment.nodeId !== 'string' || !Array.isArray(assignment.leases)) continue;
+    const leases = assignment.leases.filter(lease => !(lease && lost.has(lease.shardId)));
     if (assignment.nodeId === selfNodeId || assignment.nodeId === sourceNodeId) {
-      for (const lease of assignment.leases) {
+      for (const lease of leases) {
         self.leases.push(lease);
         if (assignment.nodeId === sourceNodeId) movedShards.push(lease.shardId);
       }
       continue;
     }
-    others.push(assignment);
+    others.push(leases.length === assignment.leases.length ? assignment : { ...assignment, leases });
+  }
+  // An ended retire's leg may have drained its shard off every lease.
+  for (const shardId of carried?.keep ?? []) {
+    if ([...self.leases, ...others.flatMap(a => a.leases)].some(l => l?.shardId === shardId)) continue;
+    self.leases.push({ leaseId: randomUUID(), shardId, identifyDelayMs: 0 });
+    movedShards.push(shardId);
   }
   movedShards.sort((a, b) => a - b);
   const pinned: PersistedPlan = { ...plan, assignments: self.leases.length > 0 ? [...others, self] : others, updatedAt: Date.now() };
@@ -206,7 +367,7 @@ export async function pinPlacement(selfNodeId: string, sourceNodeId: string | nu
   if (registry && Array.isArray(registry.nodes)) atomicWriteFileSync(fleetFile('registry.json'), JSON.stringify(registry, null, 2));
   atomicWriteFileSync(fleetFile('fleet-config.json'), JSON.stringify(config, null, 2));
   const removed: string[] = [];
-  for (const name of STALE_MASTER_RECORDS) {
+  for (const name of carried ? STALE_MASTER_RECORDS : [...STALE_MASTER_RECORDS, 'migrations.json']) {
     try {
       fs.unlinkSync(fleetFile(name));
       removed.push(name);
@@ -214,7 +375,16 @@ export async function pinPlacement(selfNodeId: string, sourceNodeId: string | nu
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
     }
   }
-  return { movedShards, removed };
+  if (carried) atomicWriteFileSync(fleetFile('migrations.json'), JSON.stringify(carried.records, null, 2));
+  return { movedShards, removed, recordsCarried: carried !== null, lostShards: [...lost].sort((a, b) => a - b), heldShards: carried?.held ?? [] };
+}
+
+/** What the pin did with the migration records, for the lane's log line. */
+export function pinRecordsText(outcome: PinOutcome): string {
+  if (!outcome.recordsCarried) return '';
+  const held = outcome.heldShards.length > 0 ? `; shard(s) [${outcome.heldShards.join(', ')}] wait on the operator's choice on the Fleet tab (restore an older surviving copy or start empty)` : '';
+  const lost = outcome.lostShards.length > 0 ? `; shard(s) [${outcome.lostShards.join(', ')}] were moving onto the old master, whose copy of them went with it${held}` : '';
+  return `; the migration records carried over${lost}`;
 }
 
 /**
@@ -253,7 +423,7 @@ export function releaseTransferHold(): void {
 
 /** The master's placement documents as its control store held them at the handover, under the mirror layout the pin reads. */
 export function writeHandoverDocuments(documents: { name: string; body: string }[]): void {
-  const bodies = MIRROR_DOC_NAMES.map(name => {
+  const bodies = PLACEMENT_DOC_NAMES.map(name => {
     const doc = Array.isArray(documents) ? documents.find(d => d && d.name === name && typeof d.body === 'string') : undefined;
     if (!doc) throw new Error(`the handover carried no ${name}`);
     JSON.parse(doc.body);

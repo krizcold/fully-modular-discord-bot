@@ -1078,6 +1078,31 @@ export class MigrationCoordinator {
   }
 
   /**
+   * An aborted record's abort its nodes have not had yet (one a promote's
+   * pin ended): sent to each that answers, this master's own executor
+   * included, after the recovery and at the node's register, until acked.
+   */
+  async deliverOwedAborts(nodeId?: string): Promise<void> {
+    let changed = false;
+    for (const rec of this.history) {
+      for (const owed of [...(rec.abortUndelivered ?? [])]) {
+        if (nodeId !== undefined && owed !== nodeId) continue;
+        if (owed !== this.hooks.selfNodeId && !this.hooks.registry.nodes?.get(owed)?.connected) continue;
+        try {
+          const ack = await this.hooks.sendControl(owed, MSG.XFER_ABORT, { migrationId: rec.id, term: rec.term, reason: rec.error ?? 'aborted' });
+          if (!ack?.ok) continue;
+          rec.abortUndelivered = (rec.abortUndelivered ?? []).filter(id => id !== owed);
+          if (rec.abortUndelivered.length === 0) delete rec.abortUndelivered;
+          changed = true;
+        } catch {
+          // Unanswered: asked again at its register.
+        }
+      }
+    }
+    if (changed) await this.persist();
+  }
+
+  /**
    * A source that missed its cleanup at COMMITTING (down then, or its commit
    * outran the ack): re-send the idempotent XFER_COMMIT so its originals are
    * graveyarded. Scans the records a cleanup lives on (cleanupRecords) for this
@@ -1551,11 +1576,11 @@ export class MigrationCoordinator {
     this.record.updatedAt = Date.now();
     this.history.push(this.record);
     if (this.history.length > MIGRATION_HISTORY_CAP) {
-      // A record still owing a source cleanup stays: the debt lives on it;
-      // so does the newest commit of a shard owed (a hold reads where that
-      // shard's newest copy went).
+      // A record still owing a source cleanup or an abort stays: the debt
+      // lives on it; so does the newest commit of a shard owed (a hold reads
+      // where that shard's newest copy went).
       const keep = this.newestOfOwed();
-      const evict = this.history.findIndex(r => !r.pendingSourceCleanup && !keep.has(r));
+      const evict = this.history.findIndex(r => !r.pendingSourceCleanup && !r.abortUndelivered && !keep.has(r));
       if (evict >= 0) this.history.splice(evict, 1);
     }
     const finished = this.record;

@@ -120,6 +120,8 @@ export interface MigrationRecord {
    * it from serving meanwhile). Cleared per-node as each source cleanup acks.
    */
   pendingSourceCleanup?: { nodeId: string; legIds: string[] }[];
+  /** Nodes an aborted record's abort has not reached yet (a promote's pin ended it for an old master gone before sending it). */
+  abortUndelivered?: string[];
   createdAt: number;
   updatedAt: number;
 }

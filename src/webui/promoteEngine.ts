@@ -39,7 +39,7 @@ import { promoteReachabilityWarning } from '../bot/internalSetup/fleet/armLane';
 import { fleetMasterCandidates } from '../bot/internalSetup/fleet/fleetConfig';
 import { judgeReachability } from '../bot/internalSetup/fleet/reachability';
 import { PromoteRecord, clearPromoteRecord, readPromoteRecord, writePromoteRecord } from '../bot/internalSetup/fleet/promoteRecord';
-import { adoptMirror, adoptStarted, clearAdoptMarker, finishAdopt, holdMirrorForTransfer, mirrorPlacementUsable, pinPlacement, plannedSeedTerm, releaseTransferHold, seedTerm, writeHandoverDocuments } from '../bot/internalSetup/fleet/fileFailover';
+import { adoptMirror, adoptStarted, clearAdoptMarker, copyRecordsRefusal, finishAdopt, holdMirrorForTransfer, mirrorPlacementUsable, pinPlacement, pinRecordsText, plannedSeedTerm, releaseTransferHold, seedTerm, writeHandoverDocuments } from '../bot/internalSetup/fleet/fileFailover';
 import { readMirrorManifest } from '../bot/internalSetup/fleet/mirrorEngine';
 import { HolderSighting, readHolderSighting } from '../bot/internalSetup/fleet/holderSighting';
 import {
@@ -627,6 +627,8 @@ async function startFilePromote(botManager: BotManager, state: any, opts: Promot
   if (sighting && sighting.nodeId !== manifest.sourceNodeId) {
     return { success: false, error: `this node's copy was taken from ${manifest.sourceNodeName ?? manifest.sourceNodeId.slice(0, 8)}, but the master it last registered with is node ${sighting.nodeId.slice(0, 8)} (term ${sighting.term}); a copy of a previous master cannot stand for the one that died` };
   }
+  const recordsRefused = copyRecordsRefusal();
+  if (recordsRefused) return { success: false, error: recordsRefused };
   // The fleet's highest term known here floors the seed: the copy's source
   // term, the registration, and every beacon the witness holds (a master that
   // minted and died after the last listing left one above the copy's term, and
@@ -1481,14 +1483,16 @@ async function runPhases(botManager: BotManager, record: PromoteRecord, spliced:
             // pg_promote: the sighting can land while the verdict runs.
             const seen = promoteSupersededBy(record);
             if (seen) throw new Error(`${supersededText(seen)}; ${adoptStarted() ? 'what the adopt moved so far stays as this node\'s live dirs, served by nobody' : 'nothing has been adopted'}: Cancel this promote, and Promote again on what is reachable now`);
+            const recordsRefused = adoptStarted() ? null : copyRecordsRefusal();
+            if (recordsRefused) throw new Error(`${recordsRefused}; nothing has been adopted: Cancel this promote`);
             const adopted = await adoptMirror(getNodeId());
             console.warn(`[Fleet] PROMOTE adopt: ${adopted.adopted} guild(s) taken from the copy, ${adopted.kept} already this node's, ${adopted.graveyarded} live dir(s) graveyarded first, ${adopted.skipped} without a copy`);
             record.phase = 'pin';
             break;
           }
           case 'pin': {
-            const pinned = await pinPlacement(getNodeId(), record.supersededNodeId);
-            console.warn(`[Fleet] PROMOTE pin: ${isFileTransfer(record) ? 'the plan the old master handed over is this node\'s' : `shard(s) [${pinned.movedShards.join(', ')}] of the old master pinned to this node`}${pinned.removed.length > 0 ? `; stale records removed: ${pinned.removed.join(', ')}` : ''}`);
+            const pinned = await pinPlacement(getNodeId(), record.supersededNodeId, !isFileTransfer(record));
+            console.warn(`[Fleet] PROMOTE pin: ${isFileTransfer(record) ? 'the plan the old master handed over is this node\'s' : `shard(s) [${pinned.movedShards.join(', ')}] of the old master pinned to this node`}${pinned.removed.length > 0 ? `; stale records removed: ${pinned.removed.join(', ')}` : ''}${pinRecordsText(pinned)}`);
             record.phase = 'seed';
             break;
           }
