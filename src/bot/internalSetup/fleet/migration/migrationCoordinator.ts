@@ -210,8 +210,9 @@ export class MigrationCoordinator {
       // leg's drain before its abort began, so the abort must re-grant the
       // source (rollback identify). The rollback sets each source's entry
       // itself, whether the plan reload restored it or a plan written since
-      // dropped it.
-      if (rec.state === 'DRAINING' || rec.state === 'VERIFYING' || rec.legs.some(l => l.drained)) this.drainRan = true;
+      // dropped it. A redistribute revokes nothing (its drain step only asks
+      // for the final round), so its abort grants nothing into the pause.
+      if (rec.kind !== 'redistribute' && (rec.state === 'DRAINING' || rec.state === 'VERIFYING' || rec.legs.some(l => l.drained))) this.drainRan = true;
       await this.enterAborting('master restarted before commit decision');
     }
   }

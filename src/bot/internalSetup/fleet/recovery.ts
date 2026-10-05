@@ -111,18 +111,20 @@ export async function evaluateRecovery(store: ControlStore, opts: RecoveryOption
       && Number.isFinite(marker.at) && typeof marker.archiveFile === 'string'
       ? marker
       : null;
-    // A crash's re-run of the marker's own count passed this check when the
-    // marker was written; any other confirm (a re-confirm in the pause
-    // included) checks it now.
-    if (usableMarker?.to !== opts.override) {
-      const deferred = await reshardDeferral(store, plan, opts.selfNodeId, paused !== null);
-      if (deferred) {
-        const result = await adoptPlan(store, plan, opts.dataBackend);
-        result.reshardDeferred = { from: plan.shardCount, to: opts.override, reason: deferred };
-        if (paused) result.reshardPaused = paused;
-        console.warn(`[Fleet] FLEET_SHARD_COUNT ${opts.override} is confirmed, but the reshard waits: ${deferred}; keeping ${plan.shardCount} shard(s); restart the master once that is settled`);
-        return result;
-      }
+    // A crash's re-run of the marker's own count passed the full wait when
+    // the marker was written; it checks only for a migration a boot in
+    // between may have run in the pause (records that cannot be read wait).
+    const deferred = usableMarker?.to !== opts.override
+      ? await reshardDeferral(store, plan, opts.selfNodeId, paused !== null)
+      : await store.loadMigrations().then(
+        m => m.unreadable ? 'the migration records cannot be read' : m.active ? migrationUnderWay(m.active) : null,
+        () => 'the migration records cannot be read');
+    if (deferred) {
+      const result = await adoptPlan(store, plan, opts.dataBackend);
+      result.reshardDeferred = { from: plan.shardCount, to: opts.override, reason: deferred };
+      if (paused) result.reshardPaused = paused;
+      console.warn(`[Fleet] FLEET_SHARD_COUNT ${opts.override} is confirmed, but the reshard waits: ${deferred}; keeping ${plan.shardCount} shard(s); restart the master once that is settled`);
+      return result;
     }
     return confirmedReshard(store, plan, opts.override, opts.newTerm, usableMarker);
   }
@@ -171,9 +173,10 @@ export function owingNodes(migrations: PersistedMigrations): { nodeId: string; n
 
 // A confirmed reshard renumbers every shard, and a cleanup a node missed
 // names its shard by number: the reshard waits while a node not Declared
-// Lost still owes one (it may come back to that shard), and while the
-// records cannot be read. A lost node's note crosses it, kept only as its
-// cleanup by guild ids.
+// Lost still owes one (it may come back to that shard), while a migration
+// is under way (its recovery would grant or roll back old numbers into the
+// pause), and while the records cannot be read. A lost node's note crosses
+// it, kept only as its cleanup by guild ids.
 async function reshardDeferral(store: ControlStore, plan: PersistedPlan, selfNodeId: string | undefined, inPause: boolean): Promise<string | null> {
   let migrations: PersistedMigrations;
   try {
@@ -197,14 +200,20 @@ async function reshardDeferral(store: ControlStore, plan: PersistedPlan, selfNod
     }
   }
   const owing = owingNodes(migrations).filter(n => waiting.has(n.nodeId));
-  if (held.size === 0 && owing.length === 0) return null;
+  const running = migrations.active;
+  if (!running && held.size === 0 && owing.length === 0) return null;
   const stored = await store.loadRegistry().then(r => r.nodes).catch(() => [] as PersistedNode[]);
   const nameOf = (n: { nodeId: string; nodeName: string }): string => stored.find(s => s.nodeId === n.nodeId)?.nodeName ?? n.nodeName;
   const reasons = owing.map(n => n.nodeId === selfNodeId
     ? 'this master still owes the cleanup of a migration it missed (it is retried now; restart the master once more after it has run)'
     : `${nameOf(n)} still owes the cleanup of a migration it missed (bring it back online so the cleanup runs, or Declare it Lost on the Fleet tab)`);
   if (held.size > 0) reasons.unshift(`shard(s) [${[...held].sort((a, b) => a - b).join(', ')}] wait on the operator's choice on the Fleet tab${inPause ? ' after Resume' : ''} (restore the surviving copy or start the shard empty)`);
+  if (running) reasons.unshift(migrationUnderWay(running));
   return reasons.join('; ');
+}
+
+function migrationUnderWay(rec: NonNullable<PersistedMigrations['active']>): string {
+  return `a ${rec.kind} migration is still under way; restart the master once it has ended (a paused one is continued or aborted on the Fleet tab)`;
 }
 
 // Confirmed reshard: ownership records are NEVER discarded, only archived.
