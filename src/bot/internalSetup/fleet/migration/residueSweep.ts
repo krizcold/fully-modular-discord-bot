@@ -259,9 +259,9 @@ export async function resolveIncomingWithMaster(
 
 /**
  * Source-side graveyard resume: a source that crashed mid-graveyarding wrote
- * /data/global/fleet/xfer-source-{id}.json {phase:'graveyarding', guilds}
- * before starting. At boot finish graveyarding those guilds, then remove the
- * marker.
+ * /data/global/fleet/xfer-source-{id}-{leg}.json {id, phase:'graveyarding',
+ * guilds} before starting. At boot finish graveyarding those guilds, then
+ * remove the marker.
  */
 export async function resumeSourceGraveyarding(): Promise<void> {
   const fleetDir = path.join(DATA_ROOT, 'global', 'fleet');

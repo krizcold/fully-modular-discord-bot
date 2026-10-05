@@ -463,7 +463,7 @@ export class MigrationExecutor {
             // leave its originals write-frozen forever while the master records
             // the cleanup done). Idempotent: re-graveyarding an already-gone guild
             // and unfreezing an already-unfrozen guild are both no-ops.
-            const ok = await commitSourceGuilds(payload.migrationId, payload.guilds ?? []);
+            const ok = await commitSourceGuilds(payload.migrationId, legId, payload.guilds ?? []);
             if (!ok) allDone = false;
             continue;
           }
@@ -530,7 +530,7 @@ export class MigrationExecutor {
     // Write the graveyard-resume marker BEFORE graveyarding so a crash mid-loop
     // is finished at boot by residueSweep.resumeSourceGraveyarding (it reads
     // {id, phase:'graveyarding', guilds}). Cleared after the loop completes.
-    const marker = sourceGraveyardMarker(leg.migrationId);
+    const marker = sourceGraveyardMarker(leg.migrationId, leg.legId);
     try {
       await fs.promises.mkdir(path.dirname(marker), { recursive: true });
       await fs.promises.writeFile(marker, JSON.stringify({ id: leg.migrationId, phase: 'graveyarding', guilds: leg.guilds }), 'utf-8');
@@ -711,31 +711,39 @@ function armedSourceGraveyards(): Set<string> | null {
   return armed;
 }
 
-// Source graveyard-resume marker path (matches residueSweep's reader:
-// /data/global/fleet/xfer-source-{id}.json).
-function sourceGraveyardMarker(migrationId: string): string {
-  return path.join(DATA_ROOT, 'global', 'fleet', `xfer-source-${migrationId}.json`);
+// Source graveyard-resume marker path, one per leg (matches residueSweep's
+// reader: /data/global/fleet/xfer-source-{id}-{leg}.json): two legs of one
+// migration on this source never overwrite or unlink each other's.
+function sourceGraveyardMarker(migrationId: string, legId: string): string {
+  return path.join(DATA_ROOT, 'global', 'fleet', `xfer-source-${migrationId}-${legId.replace(/[^A-Za-z0-9_-]/g, '_')}.json`);
 }
 
-// The marker keeps only the guilds still to graveyard and goes when none is
-// left; true once it names none of the released guilds (a corrupt marker
-// graveyards nothing at boot).
+// Each marker of the migration keeps only the guilds still to graveyard and
+// goes when none is left; true once none names a released guild (a corrupt
+// marker graveyards nothing at boot).
 async function disarmSourceGraveyard(migrationId: string, guilds: string[]): Promise<boolean> {
-  const marker = sourceGraveyardMarker(migrationId);
-  let body: string;
-  try { body = await fs.promises.readFile(marker, 'utf-8'); } catch (error) { return (error as NodeJS.ErrnoException).code === 'ENOENT'; }
-  let parsed: any = null;
-  try { parsed = JSON.parse(body); } catch { return true; }
-  if (!Array.isArray(parsed?.guilds)) return true;
-  const left = parsed.guilds.filter((guildId: unknown) => !guilds.includes(String(guildId)));
-  if (left.length === parsed.guilds.length) return true;
-  try {
-    if (left.length === 0) await fs.promises.unlink(marker);
-    else await fs.promises.writeFile(marker, JSON.stringify({ ...parsed, guilds: left }), 'utf-8');
-    return true;
-  } catch {
-    return false;
+  const fleetDir = path.join(DATA_ROOT, 'global', 'fleet');
+  const missing = (error: unknown): boolean => (error as NodeJS.ErrnoException).code === 'ENOENT';
+  let names: string[];
+  try { names = (await fs.promises.readdir(fleetDir)).filter(name => /^xfer-source-.+\.json$/.test(name)); } catch (error) { return missing(error); }
+  let disarmed = true;
+  for (const name of names) {
+    const marker = path.join(fleetDir, name);
+    let body: string;
+    try { body = await fs.promises.readFile(marker, 'utf-8'); } catch (error) { if (!missing(error)) disarmed = false; continue; }
+    let parsed: any = null;
+    try { parsed = JSON.parse(body); } catch { continue; }
+    if (parsed?.id !== migrationId || !Array.isArray(parsed?.guilds)) continue;
+    const left = parsed.guilds.filter((guildId: unknown) => !guilds.includes(String(guildId)));
+    if (left.length === parsed.guilds.length) continue;
+    try {
+      if (left.length === 0) await fs.promises.unlink(marker);
+      else await fs.promises.writeFile(marker, JSON.stringify({ ...parsed, guilds: left }), 'utf-8');
+    } catch (error) {
+      if (!missing(error)) disarmed = false;
+    }
   }
+  return disarmed;
 }
 
 async function writeFreezeSentinel(guildId: string): Promise<void> {
@@ -862,7 +870,7 @@ async function finishStaging(legDir: string, migrationId: string, term: number, 
 // is a no-op. Returns true only when every named guild is provably gone/unfrozen
 // (or was already), false when a guild still exists live and could not be moved,
 // so the coordinator keeps the leg in pendingSourceCleanup and retries.
-async function commitSourceGuilds(migrationId: string, guilds: string[]): Promise<boolean> {
+async function commitSourceGuilds(migrationId: string, legId: string, guilds: string[]): Promise<boolean> {
   if (guilds.length === 0) return true; // nothing to clean up
   // Postgres-routed guilds have no on-disk originals: their cleanup is just
   // dropping any leftover working set, so a restarted source acks ok as a
@@ -874,7 +882,7 @@ async function commitSourceGuilds(migrationId: string, guilds: string[]): Promis
     else fileGuilds.push(guildId);
   }
   if (fileGuilds.length === 0) return true;
-  const marker = sourceGraveyardMarker(migrationId);
+  const marker = sourceGraveyardMarker(migrationId, legId);
   try {
     await fs.promises.mkdir(path.dirname(marker), { recursive: true });
     await fs.promises.writeFile(marker, JSON.stringify({ id: migrationId, phase: 'graveyarding', guilds: fileGuilds }), 'utf-8');
