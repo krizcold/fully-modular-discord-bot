@@ -1639,6 +1639,10 @@ export class MigrationCoordinator {
     return new Promise<boolean>(resolve => {
       const parent = this.record!;
       this.parentRecord = parent;
+      // A leg starts under this master's term: the one the retire began under
+      // may predate a master restart, and the control server drops frames
+      // below the current term as stale.
+      parent.term = this.hooks.registry.term;
       // The pipeline operates on this.record; give it a one-leg slice while
       // persistence keeps writing the parent (parentRecord set).
       const single: MigrationRecord = { ...parent, legs: [leg], state: 'PREPARING', epoch: undefined };

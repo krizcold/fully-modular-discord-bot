@@ -849,6 +849,10 @@ async function finishStaging(legDir: string, migrationId: string, term: number, 
   } catch { /* best effort */ }
   const guilds: string[] = Array.isArray(manifest?.guilds) ? manifest.guilds : [];
   const shardId = Number.isInteger(manifest?.shardId) ? manifest.shardId : 0;
+  // Staged under an older term, the copy is the master's that prepared it:
+  // its stamp keeps that term, so a superseded side's stale-copy reading
+  // still retires it.
+  const stampTerm = Number.isInteger(manifest?.term) && manifest.term > 0 ? Math.min(term, manifest.term) : term;
   const landed: string[] = [];
   try {
     for (const guildId of guilds) {
@@ -858,7 +862,7 @@ async function finishStaging(legDir: string, migrationId: string, term: number, 
       if (fs.existsSync(live)) await deleteGuildNamespace(guildId, `migration-${migrationId}-replaced`);
       await fs.promises.rename(staged, live);
       landed.push(guildId);
-      writeOwnerStamp(guildId, { shardId, term, epoch });
+      writeOwnerStamp(guildId, { shardId, term: stampTerm, epoch });
     }
   } finally {
     noteGuildsCommittedHere(landed);
