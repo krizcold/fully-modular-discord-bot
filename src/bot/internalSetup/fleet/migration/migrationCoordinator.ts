@@ -1588,8 +1588,6 @@ export class MigrationCoordinator {
         arr.push(leg.shardId);
         bySource.set(leg.sourceNodeId, arr);
       }
-      this.hooks.registry.epoch += 1;
-      const epoch = this.hooks.registry.epoch;
       for (const [sourceNodeId, shardIds] of bySource) {
         for (const shardId of shardIds) {
           const held = this.hooks.registry.shardTable.get(shardId);
@@ -1602,6 +1600,12 @@ export class MigrationCoordinator {
             }
             this.hooks.registry.shardTable.delete(shardId);
           }
+        }
+        // Each source's epoch is taken at its grant: one taken before an earlier
+        // source's wait can fall below a grant sent to this source meanwhile.
+        this.hooks.registry.epoch += 1;
+        const epoch = this.hooks.registry.epoch;
+        for (const shardId of shardIds) {
           this.hooks.registry.shardTable.set(shardId, {
             shardId, nodeId: sourceNodeId, leaseId: randomUUID(), term: this.hooks.registry.term, epoch,
           });

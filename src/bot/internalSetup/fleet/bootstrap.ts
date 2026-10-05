@@ -1572,6 +1572,9 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   // tell the master's own in-flight grant apart from Declare-Lost/drain residue.
   const inFlightGrantLeases = new Map<string, Set<string>>();
 
+  // The last grant queued to each node (grantShardsTo).
+  const grantTails = new Map<string, Promise<void>>();
+
   // Restart recovery (fleet mode only; evaluateRecovery never reads the store
   // standalone): adopt the persisted plan so owned shards never move across a
   // master restart. Self leases are re-granted immediately (the old process's
@@ -1616,7 +1619,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     const selfShardIds = registry.shardIdsOf(nodeId);
     if (selfShardIds.length > 0) {
       registry.epoch += 1;
-      await grantShardsTo(registry.nodes.get(nodeId)!, selfShardIds, registry.epoch);
+      await grantShardsTo(registry.nodes.get(nodeId)!, () => selfShardIds, registry.epoch);
     }
     console.log(`[Fleet] Recovery: adopted plan (term ${term}, epoch ${registry.epoch}, ${registry.shardCount} shards${paused ? ', reshard pause active' : `, hold-down ${Math.round(RECOVERY_HOLDDOWN_MS / 1000)}s`})`);
   }
@@ -1821,7 +1824,28 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     return fullShardIds;
   }
 
-  async function grantShardsTo(node: RegistryNode, fullShardIds: number[], epoch: number): Promise<{ ok: boolean; pending: boolean }> {
+  // Grants to one node go one at a time, each set composed as it is sent: a
+  // set composed beside an in-flight grant lacks what that grant brings, and
+  // its higher epoch would make the node drop it.
+  async function grantShardsTo(node: RegistryNode, compose: () => number[], epoch: number): Promise<{ ok: boolean; pending: boolean }> {
+    const before = grantTails.get(node.nodeId);
+    let settle!: () => void;
+    const tail = new Promise<void>(resolve => { settle = resolve; });
+    grantTails.set(node.nodeId, tail);
+    try {
+      if (before) {
+        await before;
+        // Declared Lost or registered again meanwhile: not this node any more.
+        if (!node.isSelf && registry.nodes.get(node.nodeId) !== node) return { ok: false, pending: false };
+      }
+      return await sendGrant(node, compose(), epoch);
+    } finally {
+      settle();
+      if (grantTails.get(node.nodeId) === tail) grantTails.delete(node.nodeId);
+    }
+  }
+
+  async function sendGrant(node: RegistryNode, fullShardIds: number[], epoch: number): Promise<{ ok: boolean; pending: boolean }> {
     const identifying = ledger ? shardsForcingIdentify(node, fullShardIds) : [];
     if (ledger && identifying.length > 0) {
       // Reserve (permit + debit in one synchronous step) so concurrent grant
@@ -1962,7 +1986,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     registry.epoch += 1;
     const epoch = registry.epoch;
     for (const node of needing) {
-      await grantShardsTo(node, reGrantSetOf(node.nodeId), epoch);
+      await grantShardsTo(node, () => reGrantSetOf(node.nodeId), epoch);
     }
     await persist();
   }
@@ -2098,8 +2122,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       }
       const placed = [...pinnedPlaced, ...trimmable];
       if (placed.length === 0) continue;
-      const fullSet = [...new Set([...reGrant, ...placed])].sort((a, b) => a - b);
-      await grantShardsTo(node, fullSet, epoch);
+      await grantShardsTo(node, () => [...new Set([...reGrantSetOf(grantNodeId), ...placed])].sort((a, b) => a - b), epoch);
     }
 
     await persist();
@@ -2511,8 +2534,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       return { success: false, error: 'a backend transformation is active; shard assignment is locked until it finishes' };
     }
     registry.epoch += 1;
-    const fullSet = [...registry.shardIdsOf(targetNodeId), shardId].sort((a, b) => a - b);
-    const result = await grantShardsTo(target, fullSet, registry.epoch);
+    const result = await grantShardsTo(target, () => [...new Set([...registry.shardIdsOf(targetNodeId), shardId])].sort((a, b) => a - b), registry.epoch);
     await persist();
     // A manual grant changes the table outside distribute(), whose reports
     // are the only refresh standalone has (no periodic tick there).
@@ -2555,8 +2577,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       // A disconnected proposal owner cannot receive the grant now; keep its
       // shards fenced (they hold the data) and retry when it reconnects.
       if (!node || (!node.connected && !node.isSelf)) continue;
-      const fullSet = [...new Set([...registry.shardIdsOf(proposalNodeId), ...shards])].sort((a, b) => a - b);
-      const res = await grantShardsTo(node, fullSet, epoch);
+      const res = await grantShardsTo(node, () => [...new Set([...registry.shardIdsOf(proposalNodeId), ...shards])].sort((a, b) => a - b), epoch);
       if (res.ok) {
         // Adopted into shardTable: drop the resume fence so the shard is now
         // protected by the normal table machinery. A pending (unacked) grant is
@@ -3236,7 +3257,12 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       grantShardsTo: async (targetNodeId, fullShardIds, epoch) => {
         const node = registry.nodes.get(targetNodeId);
         if (!node) return { ok: false, pending: false };
-        const result = await grantShardsTo(node, fullShardIds, epoch);
+        // The coordinator's set is the target's table set and its own changes;
+        // the table set is read again when the grant is sent.
+        const tableSet = registry.shardIdsOf(targetNodeId);
+        const added = fullShardIds.filter(id => !tableSet.includes(id));
+        const dropped = new Set(tableSet.filter(id => !fullShardIds.includes(id)));
+        const result = await grantShardsTo(node, () => [...new Set([...registry.shardIdsOf(targetNodeId), ...added])].filter(id => !dropped.has(id)).sort((a, b) => a - b), epoch);
         // A recovered grant reaches a target not yet re-registered, and the
         // pending reconcile waits out the grace, so a register inside it would
         // find the shard nowhere and free it: a target still registered and not

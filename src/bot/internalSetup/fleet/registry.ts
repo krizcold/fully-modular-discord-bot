@@ -278,9 +278,15 @@ export class Registry {
     }
   }
 
-  /** An acked grant; another node's stamp on a granted shard is dropped and returned for the master to revoke. */
+  /**
+   * An acked grant; another node's stamp on a granted shard is dropped and
+   * returned for the master to revoke. The node's entries the master wrote at
+   * a newer epoch (an abort's rollback, a restore) stand for the next grant.
+   */
   applyAssignment(nodeId: string, leases: LeaseInfo[], term: number, epoch: number): { nodeId: string; leaseId: string }[] {
-    this.clearNodeAssignment(nodeId);
+    for (const [shardId, lease] of this.shardTable) {
+      if (lease.nodeId === nodeId && lease.epoch <= epoch) this.shardTable.delete(shardId);
+    }
     const strays: { nodeId: string; leaseId: string }[] = [];
     for (const lease of leases) {
       this.shardTable.set(lease.shardId, { shardId: lease.shardId, nodeId, leaseId: lease.leaseId, term, epoch });
