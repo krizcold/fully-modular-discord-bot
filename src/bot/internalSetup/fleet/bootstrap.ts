@@ -2769,6 +2769,11 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     for (const shardId of coordinator?.grantsOwedTo(targetNodeId) ?? []) {
       if (!shardIds.includes(shardId)) shardIds.push(shardId);
     }
+    // An abort under way hands back to this node what its drain took off
+    // the table: those shards are freed with it (the rollback skips it).
+    for (const shardId of coordinator?.releaseRollbackOf(targetNodeId) ?? []) {
+      if (!shardIds.includes(shardId)) shardIds.push(shardId);
+    }
     lostNodes.add(node);
     registry.nodes.delete(targetNodeId);
     // In the reshard pause the Resume grants are only on disk: the data the

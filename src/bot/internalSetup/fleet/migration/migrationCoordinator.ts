@@ -343,6 +343,20 @@ export class MigrationCoordinator {
     return this.grantLegsOwedTo(nodeId).map(l => l.shardId);
   }
 
+  /**
+   * A Declare Lost of nodeId: the shards an abort under way would hand back
+   * to it (its drain took them off the table) are freed with it, its legs
+   * marked so the rollback, after a restart too, gives it none.
+   */
+  releaseRollbackOf(nodeId: string): number[] {
+    const rec = this.record;
+    if (!rec || !this.abortInProgress || !this.drainRan) return [];
+    const at = Date.now();
+    const legs = rec.legs.filter(l => l.legState !== 'DONE' && l.sourceNodeId === nodeId);
+    for (const l of legs) if (l.sourceLostAt === undefined) l.sourceLostAt = at;
+    return legs.map(l => l.shardId);
+  }
+
   // Only a running slice of a retire commits or grants; its parent waits
   // at PRECHECK between legs.
   private grantLegsOwedTo(nodeId: string): MigrationLeg[] {
@@ -465,6 +479,8 @@ export class MigrationCoordinator {
         changed = true;
       }
     }
+    // The legs releaseRollbackOf marked are written with the record.
+    if (this.record?.legs.some(l => l.sourceNodeId === lostNodeId && !l.committed && l.sourceLostAt !== undefined)) changed = true;
     for (const rec of this.cleanupRecords()) {
       for (const legId of rec.pendingSourceCleanup?.find(e => e.nodeId === lostNodeId)?.legIds ?? []) {
         const leg = rec.legs.find(l => l.legId === legId);
@@ -1663,6 +1679,8 @@ export class MigrationCoordinator {
             this.hooks.registry.shardTable.delete(shardId);
           }
         }
+        // A source Declared Lost meanwhile gets none back: its Declare Lost freed these shards.
+        if (abortLegs.some(l => l.sourceNodeId === sourceNodeId && l.sourceLostAt !== undefined)) continue;
         // Each source's epoch is taken at its grant: one taken before an earlier
         // source's wait can fall below a grant sent to this source meanwhile.
         this.hooks.registry.epoch += 1;
@@ -1675,6 +1693,8 @@ export class MigrationCoordinator {
         const fullSet = this.hooks.registry.shardIdsOf(sourceNodeId);
         await this.hooks.grantShardsTo(sourceNodeId, fullSet, epoch);
       }
+      // The Declare Lost's marks reach the records before a plan without their source.
+      if (abortLegs.some(l => l.sourceLostAt !== undefined)) await this.persist();
       await this.hooks.persistPlan();
     }
     // Release the fence: the shards are back on the source (drain path) or were
@@ -1789,6 +1809,7 @@ export class MigrationCoordinator {
       this.record = single;
       leg.legState = 'PREPARING';
       delete leg.drained;
+      delete leg.sourceLostAt;
       this.hydrateLive(single);
       this.finishHooks = (state: 'DONE' | 'ABORTED') => {
         leg.legState = state;

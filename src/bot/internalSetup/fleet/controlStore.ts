@@ -83,7 +83,7 @@ export interface MigrationLeg {
   error?: string;
   /** The commit decision's epoch and time, and the source's name then: they order, date and name the copy a source that missed this cleanup still holds. */
   committed?: { epoch: number; at: number; sourceName: string };
-  /** The source was Declared Lost while it still owed this cleanup: its copy went with it. */
+  /** The source was Declared Lost while it still owed this cleanup (its copy went with it), or while this leg's abort would hand its shard back (it gets none). */
   sourceLostAt?: number;
   /** The target was Declared Lost before this leg's grant landed: the copy its commit put there went with it. */
   targetLostAt?: number;
