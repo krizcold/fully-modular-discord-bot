@@ -121,7 +121,7 @@ export interface MigrationRecord {
    * idempotent XFER_COMMIT when the source reconnects (term/epoch fencing keeps
    * it from serving meanwhile). Cleared per-node as each source cleanup acks.
    */
-  pendingSourceCleanup?: { nodeId: string; legIds: string[] }[];
+  pendingSourceCleanup?: { nodeId: string; legIds: string[]; stuck?: Record<string, string[]> }[];
   /** Nodes an aborted record's abort has not reached yet (a promote's pin ended it for an old master gone before sending it). */
   abortUndelivered?: string[];
   createdAt: number;
@@ -267,8 +267,12 @@ function recordHoldsTogether(rec: unknown): boolean {
       && absentOrFinite(l.sourceLostAt) && absentOrFinite(l.targetLostAt))
     && (r.currentLegIndex === undefined || (Number.isInteger(r.currentLegIndex) && r.currentLegIndex >= 0 && r.currentLegIndex <= r.legs.length))
     && (r.pendingSourceCleanup === undefined || (Array.isArray(r.pendingSourceCleanup)
-      && r.pendingSourceCleanup.every(e => isObject(e) && typeof e.nodeId === 'string' && Array.isArray(e.legIds))));
+      && r.pendingSourceCleanup.every(e => isObject(e) && typeof e.nodeId === 'string' && Array.isArray(e.legIds)
+        && (e.stuck === undefined || (isObject(e.stuck) && Object.values(e.stuck).every(g => Array.isArray(g)))))));
 }
+
+/** The way on for guilds a node's cleanup cannot move into its graveyard (a note's stuck). */
+export const STUCK_WAY_ON = 'their data dirs on that node cannot be renamed: check the dirs\' owner and permissions and anything holding them open';
 
 /** The active migration (when any) and every history entry hold together; records that do not read as unreadable. */
 export function migrationsHoldTogether(m: PersistedMigrations): boolean {

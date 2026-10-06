@@ -25,7 +25,7 @@ import {
   XFER_STALL_TIMEOUT_MS,
 } from '../constants';
 import type { ControlStore, MigrationLeg, MigrationRecord, MigrationState, PersistedMigrations } from '../controlStore';
-import { migrationsHoldTogether } from '../controlStore';
+import { migrationsHoldTogether, STUCK_WAY_ON } from '../controlStore';
 import {
   MSG,
   MigrationKind,
@@ -43,7 +43,6 @@ import { routeFor } from '../../utils/dataBackends/routeResolver';
 import type { Registry } from '../registry';
 import type { HeldShardView, MigrationActiveView, MigrationLegView, MigrationView } from '../state';
 
-const STUCK_WAY_ON = 'their data dirs on that node cannot be renamed: check the dirs\' owner and permissions and anything holding them open';
 const REDISTRIBUTE_STARTING = 'a Redistribute is already starting; try again once it has finished';
 
 export interface StartMovePayload { kind: 'move'; shardId: number; toNodeId: string; }
@@ -460,8 +459,15 @@ export class MigrationCoordinator {
    */
   async onNodeDeclaredLost(lostNodeId: string, lostNodeName: string, freedShardIds: number[]): Promise<number[]> {
     const at = Date.now();
-    this.stuckCleanups.delete(lostNodeId);
     let changed = false;
+    // Its stuck guilds are named again only if it returns and still cannot move them.
+    for (const rec of this.cleanupRecords()) {
+      const entry = rec.pendingSourceCleanup?.find(e => e.nodeId === lostNodeId);
+      if (entry?.stuck) {
+        delete entry.stuck;
+        changed = true;
+      }
+    }
     // Its owed commits and grants can never land: the rounds settle them
     // (a retire's slice is not what persist writes, so its parent's leg too).
     const lostLegIds = new Set(this.grantLegsOwedTo(lostNodeId).map(l => l.legId));
@@ -1311,33 +1317,68 @@ export class MigrationCoordinator {
 
   private readonly cleanupRuns = new Map<string, Promise<void>>();
   private readonly releaseWarned = new Set<string>();
-  // nodeId -> legId -> the guilds its cleanup answered it could not move.
-  private readonly stuckCleanups = new Map<string, Map<string, { shardId: number; guilds: string[] }>>();
 
   // A cleanup answered not done names the guilds the node could not move
-  // into its graveyard: warned once per change, named by the refusals it
-  // causes (a restart does not move them), forgotten once it is done.
-  private noteStuck(nodeId: string, leg: MigrationLeg, ack: any): void {
-    const legs = this.stuckCleanups.get(nodeId) ?? new Map<string, { shardId: number; guilds: string[] }>();
+  // into its graveyard: warned once per change, kept on its note (a master
+  // restart does not move them either) and named by the refusals, the
+  // Fleet tab and a reshard deferral, dropped once it is done. True when
+  // the note changed.
+  private noteStuck(nodeId: string, rec: MigrationRecord, leg: MigrationLeg, ack: any): boolean {
+    const entry = rec.pendingSourceCleanup?.find(e => e.nodeId === nodeId);
+    if (!entry) return false;
     const guilds: string[] = Array.isArray(ack?.stuckGuilds) ? ack.stuckGuilds.filter((g: unknown): g is string => typeof g === 'string' && /^\d+$/.test(g)) : [];
-    if (ack?.ok) legs.delete(leg.legId);
-    else if (guilds.length > 0) {
-      if (legs.get(leg.legId)?.guilds.join(',') !== guilds.join(',')) {
-        console.warn(`[Migration] Shard ${leg.shardId}: ${this.hooks.registry.nodes?.get(nodeId)?.nodeName ?? nodeId}'s cleanup is not done: guild(s) [${guilds.join(', ')}] cannot be moved into its graveyard (${STUCK_WAY_ON}); retried every ${Math.round(XFER_COMMIT_RETRY_MS / 1000)}s`);
-      }
-      legs.set(leg.legId, { shardId: leg.shardId, guilds });
-    }
-    if (legs.size > 0) this.stuckCleanups.set(nodeId, legs);
-    else this.stuckCleanups.delete(nodeId);
+    if (ack?.ok) return this.dropStuck(entry, leg.legId);
+    if (guilds.length === 0 || entry.stuck?.[leg.legId]?.join(',') === guilds.join(',')) return false;
+    const named = this.cleanupRecords().some(r => r.pendingSourceCleanup?.find(e => e.nodeId === nodeId)?.stuck?.[leg.legId]?.join(',') === guilds.join(','));
+    if (!named) console.warn(`[Migration] Shard ${leg.shardId}: ${this.hooks.registry.nodes?.get(nodeId)?.nodeName ?? nodeId}'s cleanup is not done: guild(s) [${guilds.join(', ')}] cannot be moved into its graveyard (${STUCK_WAY_ON}); retried every ${Math.round(XFER_COMMIT_RETRY_MS / 1000)}s`);
+    (entry.stuck ??= {})[leg.legId] = guilds;
+    return true;
+  }
+
+  private dropStuck(entry: NonNullable<MigrationRecord['pendingSourceCleanup']>[number], legId: string): boolean {
+    if (!entry.stuck?.[legId]) return false;
+    delete entry.stuck[legId];
+    if (Object.keys(entry.stuck).length === 0) delete entry.stuck;
+    return true;
   }
 
   /** What a refusal says of the guilds a node's cleanup cannot move (of the current-count shard given, else any); null when none. */
   stuckCleanupText(nodeId: string, shardId?: number): string | null {
-    const owed = new Set(this.cleanupRecords().filter(rec => shardId === undefined || this.ofCurrentCount(rec))
-      .flatMap(rec => rec.pendingSourceCleanup?.find(e => e.nodeId === nodeId)?.legIds ?? []));
-    const guilds = [...(this.stuckCleanups.get(nodeId) ?? [])].filter(([legId, s]) => owed.has(legId) && (shardId === undefined || s.shardId === shardId)).flatMap(([, s]) => s.guilds);
+    const guilds: string[] = [];
+    for (const rec of this.cleanupRecords()) {
+      if (shardId !== undefined && !this.ofCurrentCount(rec)) continue;
+      const entry = rec.pendingSourceCleanup?.find(e => e.nodeId === nodeId);
+      for (const legId of entry?.legIds ?? []) {
+        if (shardId !== undefined && rec.legs.find(l => l.legId === legId)?.shardId !== shardId) continue;
+        guilds.push(...(entry!.stuck?.[legId] ?? []));
+      }
+    }
     if (guilds.length === 0) return null;
     return `guild(s) [${[...new Set(guilds)].join(', ')}] cannot be moved into ${this.hooks.registry.nodes?.get(nodeId)?.nodeName ?? nodeId}'s graveyard (${STUCK_WAY_ON})`;
+  }
+
+  /** Why a shard a pending cleanup fences waits: each node owing it, and the guilds one cannot move; null when none fences it. */
+  cleanupFenceReason(shardId: number): string | null {
+    const nodes = this.hooks.registry.nodes;
+    const owing = new Set<string>();
+    for (const rec of this.cleanupRecords()) {
+      if (!this.ofCurrentCount(rec)) continue;
+      for (const entry of rec.pendingSourceCleanup ?? []) {
+        for (const legId of entry.legIds) {
+          const leg = rec.legs.find(l => l.legId === legId);
+          if (leg?.shardId === shardId && (leg.sourceLostAt === undefined || nodes?.has(entry.nodeId))) owing.add(entry.nodeId);
+        }
+      }
+    }
+    if (owing.size === 0) return null;
+    const each = [...owing].map(nodeId => {
+      const node = nodes?.get(nodeId);
+      const name = node?.nodeName ?? nodeId;
+      const stuck = this.stuckCleanupText(nodeId, shardId);
+      if (stuck) return `${name} cannot finish it: ${stuck}`;
+      return node?.connected ? `${name} has not finished it yet` : `${name} is down (bring it back so it runs, or Declare it Lost)`;
+    });
+    return `held back until the cleanup of an earlier move has run: ${each.join('; ')}`;
   }
 
   private async runSourceCleanup(nodeId: string): Promise<void> {
@@ -1391,7 +1432,7 @@ export class MigrationCoordinator {
               migrationId: rec.id, term: rec.term, epoch: rec.epoch ?? this.hooks.registry.epoch,
               legIds: [legId], sourceCleanup: true, guilds: leg.guilds,
             });
-          if (!back) this.noteStuck(nodeId, leg, ack);
+          if (!back && this.noteStuck(nodeId, rec, leg, ack)) changed = true;
           // A release counts only when the node reports the freeze and any
           // armed graveyard gone (an older executor does not report it).
           if (ack?.ok && (!back || ack.released === true)) {
@@ -1400,8 +1441,7 @@ export class MigrationCoordinator {
             }
             cleared.add(legId);
             this.releaseWarned.delete(legId);
-            this.stuckCleanups.get(nodeId)?.delete(legId);
-            if (this.stuckCleanups.get(nodeId)?.size === 0) this.stuckCleanups.delete(nodeId);
+            this.dropStuck(entry, legId);
           } else if (back && ack?.ok && !this.releaseWarned.has(legId)) {
             this.releaseWarned.add(legId);
             console.warn(`[Migration] Shard ${leg.shardId}: ${this.hooks.registry.nodes?.get(nodeId)?.nodeName ?? nodeId}'s release from its owed cleanup is not complete (${ack.reason ?? 'it reports none; it may run an older version'}); retried every ${Math.round(XFER_COMMIT_RETRY_MS / 1000)}s`);
@@ -1583,7 +1623,6 @@ export class MigrationCoordinator {
           migrationId: rec.id, term: rec.term, epoch: rec.epoch ?? this.hooks.registry.epoch,
           legIds: [leg.legId], sourceCleanup: true, guilds: leg.guilds,
         });
-        this.noteStuck(leg.sourceNodeId, leg, ack);
         if (ack?.ok) {
           (leg as any)._sourceAcked = true;
           if (this.keepsSource(leg)) {
@@ -1591,8 +1630,10 @@ export class MigrationCoordinator {
           }
           this.clearPendingSourceLeg(rec, leg.sourceNodeId, leg.legId);
           if (this.parentRecord && this.parentRecord !== rec) this.clearPendingSourceLeg(this.parentRecord, leg.sourceNodeId, leg.legId);
+        } else {
+          this.owePendingSource(rec, leg);
+          this.noteStuck(leg.sourceNodeId, this.parentRecord ?? rec, leg, ack);
         }
-        else this.owePendingSource(rec, leg);
       } catch {
         this.owePendingSource(rec, leg);
       }

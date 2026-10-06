@@ -4,7 +4,7 @@
 // zero-fleet-env boot stays byte-identical to today.
 
 import type { ControlStore, PersistedMigrations, PersistedNode, PersistedPlan, RedistributeProposal, ReshardMarker } from './controlStore';
-import { migrationsHoldTogether } from './controlStore';
+import { migrationsHoldTogether, STUCK_WAY_ON } from './controlStore';
 import { isReshardConfirmed } from './placement';
 
 export interface RecoveryOptions {
@@ -242,13 +242,17 @@ async function reshardDeferral(store: ControlStore, plan: PersistedPlan, selfNod
   const placed = new Set(plan.assignments.flatMap(a => a.leases.map(l => l.shardId)));
   const held = new Set<number>();
   const waiting = new Set<string>();
+  const stuck = new Map<string, Set<string>>();
   for (const rec of [migrations.active, ...migrations.history]) {
     for (const entry of rec?.pendingSourceCleanup ?? []) {
       for (const legId of entry.legIds) {
         const leg = rec!.legs.find(l => l.legId === legId);
         if (!leg || leg.sourceLostAt !== undefined) continue;
         if (leg.heldForChoice && !placed.has(leg.shardId)) held.add(leg.shardId);
-        else waiting.add(entry.nodeId);
+        else {
+          waiting.add(entry.nodeId);
+          for (const guildId of entry.stuck?.[legId] ?? []) (stuck.get(entry.nodeId) ?? stuck.set(entry.nodeId, new Set()).get(entry.nodeId)!).add(guildId);
+        }
       }
     }
   }
@@ -262,7 +266,9 @@ async function reshardDeferral(store: ControlStore, plan: PersistedPlan, selfNod
   }
   if (!running && held.size === 0 && owing.length === 0 && landing.length === 0) return null;
   const nameOf = (n: { nodeId: string; nodeName: string }): string => stored.find(s => s.nodeId === n.nodeId)?.nodeName ?? n.nodeName;
-  const reasons = owing.map(n => n.nodeId === selfNodeId
+  const reasons = owing.map(n => stuck.has(n.nodeId)
+    ? `${n.nodeId === selfNodeId ? 'this master' : nameOf(n)} cannot finish the cleanup of a migration: guild(s) [${[...stuck.get(n.nodeId)!].join(', ')}] cannot be moved into its graveyard (${STUCK_WAY_ON})`
+    : n.nodeId === selfNodeId
     ? 'this master still owes the cleanup of a migration it missed (it is retried now; restart the master once more after it has run)'
     : `${nameOf(n)} still owes the cleanup of a migration it missed (bring it back online so the cleanup runs, or Declare it Lost on the Fleet tab)`);
   if (held.size > 0) reasons.unshift(`shard(s) [${[...held].sort((a, b) => a - b).join(', ')}] wait on the operator's choice on the Fleet tab${inPause ? ' after Resume' : ''} (restore the surviving copy or start the shard empty)`);

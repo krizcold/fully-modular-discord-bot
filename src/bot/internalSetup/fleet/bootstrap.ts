@@ -2240,9 +2240,10 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
         ? 'held back while the migration records cannot be read; placed once the master restarts with them readable'
         : heldIds.has(shardId)
         ? 'held: a copy survives on another node; restore it or start the shard empty'
-        : coordinator?.migratingShardIds().has(shardId) || coordinator?.pendingSourceCleanupShardIds().has(shardId)
-          || transformer?.pinnedShardIds().has(shardId)
+        : coordinator?.migratingShardIds().has(shardId) || transformer?.pinnedShardIds().has(shardId)
         ? 'held back by a migration or transformation in progress'
+        : coordinator?.pendingSourceCleanupShardIds().has(shardId)
+        ? coordinator.cleanupFenceReason(shardId) ?? 'held back until the cleanup of an earlier move has run'
         : resumePendingShards.has(shardId)
           ? 'awaiting its redistribute grant'
           : timeoutDeclinedShards.has(shardId)
