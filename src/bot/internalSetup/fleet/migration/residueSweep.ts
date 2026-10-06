@@ -133,8 +133,9 @@ async function disposeIncoming(): Promise<void> {
       } catch { /* no manifest */ }
       if (manifest?.phase !== 'commit-intent' || !Number.isInteger(manifest.commitTerm) || !Number.isInteger(manifest.commitEpoch)) continue;
       try {
-        await commitFromStaging(mig.name, leg.name, manifest.commitTerm, manifest.commitEpoch);
-        console.log(`[Fleet] Finished commit-intent staging for migration ${mig.name} leg ${leg.name}`);
+        if (await commitFromStaging(mig.name, leg.name, manifest.commitTerm, manifest.commitEpoch)) {
+          console.log(`[Fleet] Finished commit-intent staging for migration ${mig.name} leg ${leg.name}`);
+        }
       } catch (error) {
         console.warn(`[Fleet] Commit-intent staging for migration ${mig.name} leg ${leg.name} not finished at boot (its master's verdict or the next boot finishes it):`, error instanceof Error ? error.message : error);
       }
@@ -229,8 +230,7 @@ export async function resolveIncomingWithMaster(
     let finished = 0;
     for (const leg of legs) {
       if (!leg.isDirectory()) continue;
-      await commitFromStaging(mig.name, leg.name, disposition.term, disposition.epoch);
-      finished += 1;
+      if (await commitFromStaging(mig.name, leg.name, disposition.term, disposition.epoch)) finished += 1;
     }
     // Reap the migration dir when nothing is left (a DONE migration keeps the
     // committing verdict while in history; an empty dir must not log forever).

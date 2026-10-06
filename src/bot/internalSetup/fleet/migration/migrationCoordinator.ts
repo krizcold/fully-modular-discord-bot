@@ -1430,6 +1430,7 @@ export class MigrationCoordinator {
       try {
         const ack = await this.hooks.sendControl(leg.targetNodeId, MSG.XFER_COMMIT, {
           migrationId: rec.id, term: rec.term, epoch: rec.epoch ?? this.hooks.registry.epoch, legIds: [leg.legId],
+          guilds: leg.guilds, shardId: leg.shardId,
         });
         if (ack?.ok) (leg as any)._targetAcked = true;
         else allTargets = false;

@@ -761,10 +761,12 @@ export interface XferCommitPayload {
    * Source-side cleanup marker + the leg's guilds, threaded so a RESTARTED
    * source (empty in-memory legs Map, no _incoming staging) can still graveyard
    * its originals + unfreeze from the payload. The commit acks ok only when that
-   * source cleanup genuinely completed. Absent for target commits.
+   * source cleanup genuinely completed. A target commit names the leg's guilds
+   * and shard too, which stand in for a staging manifest that cannot be read.
    */
   sourceCleanup?: boolean;
   guilds?: string[];
+  shardId?: number;
 }
 
 export interface XferAbortPayload {

@@ -469,7 +469,10 @@ export class MigrationExecutor {
           }
           // Target with commit-intent staging on disk is finished idempotently
           // from the staging manifest (also handled by the boot sweep).
-          await commitFromStaging(payload.migrationId, legId, payload.term, payload.epoch);
+          const named = payload.legIds.length === 1 && Array.isArray(payload.guilds)
+            ? { guilds: payload.guilds.filter(g => typeof g === 'string' && /^\d+$/.test(g)), shardId: payload.shardId ?? 0 }
+            : undefined;
+          if (!(await commitFromStaging(payload.migrationId, legId, payload.term, payload.epoch, named))) allDone = false;
           continue;
         }
         if (leg.committed) continue;
@@ -671,7 +674,7 @@ export class MigrationExecutor {
       ...(commit ? { commitTerm: commit.term, commitEpoch: commit.epoch } : {}),
     };
     try {
-      await fs.promises.writeFile(path.join(legDir, '.manifest.json'), JSON.stringify(manifest, null, 2), 'utf-8');
+      atomicWriteFileSync(path.join(legDir, '.manifest.json'), JSON.stringify(manifest, null, 2));
     } catch { /* best effort; commit re-writes on retry */ }
   }
 }
@@ -816,8 +819,9 @@ async function hashStagedGuild(base: string): Promise<string> {
 // it, and two at once can each see a guild still staged, the later
 // graveyarding the dir the earlier just renamed into place. A later caller
 // runs after, on what is left.
-const stagingCommits = new Map<string, Promise<void>>();
-function oneStagingFinishAtATime(legDir: string, finish: () => Promise<void>): Promise<void> {
+const stagingCommits = new Map<string, Promise<unknown>>();
+const unreadableStaging = new Set<string>();
+function oneStagingFinishAtATime<T>(legDir: string, finish: () => Promise<T>): Promise<T> {
   const run = (stagingCommits.get(legDir) ?? Promise.resolve()).then(finish);
   const settled = run.catch(() => undefined);
   stagingCommits.set(legDir, settled);
@@ -827,26 +831,48 @@ function oneStagingFinishAtATime(legDir: string, finish: () => Promise<void>): P
 
 // Idempotent commit from staging when there is no live runtime (crash-restart
 // commit resolution). Mirrors commitTarget: intent -> per-guild rename + stamp.
-export function commitFromStaging(migrationId: string, legId: string, term: number, epoch: number): Promise<void> {
+export function commitFromStaging(migrationId: string, legId: string, term: number, epoch: number, named?: StagedLeg): Promise<boolean> {
   const legDir = incomingLegDir(migrationId, legId);
-  return oneStagingFinishAtATime(legDir, () => finishStaging(legDir, migrationId, term, epoch));
+  return oneStagingFinishAtATime(legDir, () => finishStaging(legDir, migrationId, term, epoch, named));
 }
 
-async function finishStaging(legDir: string, migrationId: string, term: number, epoch: number): Promise<void> {
+/** The leg's guilds and shard as the master's commit names them. */
+export interface StagedLeg {
+  guilds: string[];
+  shardId: number;
+}
+
+// True once the staging landed, or none is left (a finish already done). A
+// manifest that cannot be read names no guilds: the commit's own list,
+// sealed and verified before the decision, stands for it; without one,
+// staging that holds no guild dir is a finish a crash cut short.
+async function finishStaging(legDir: string, migrationId: string, term: number, epoch: number, named?: StagedLeg): Promise<boolean> {
   let manifest: any = null;
-  try { manifest = JSON.parse(fs.readFileSync(path.join(legDir, '.manifest.json'), 'utf-8')); } catch { return; }
   try {
-    manifest.phase = 'commit-intent';
-    manifest.commitTerm = term;
-    manifest.commitEpoch = epoch;
-    fs.writeFileSync(path.join(legDir, '.manifest.json'), JSON.stringify(manifest, null, 2), 'utf-8');
-  } catch { /* best effort */ }
-  const guilds: string[] = Array.isArray(manifest?.guilds) ? manifest.guilds : [];
-  const shardId = Number.isInteger(manifest?.shardId) ? manifest.shardId : 0;
+    manifest = JSON.parse(fs.readFileSync(path.join(legDir, '.manifest.json'), 'utf-8'));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT' && !fs.existsSync(legDir)) return true;
+  }
+  const readable = !!manifest && typeof manifest === 'object' && Array.isArray(manifest.guilds);
+  const listed = readable ? [] : stagedGuildsIn(legDir);
+  if (listed === null || (!readable && !named && listed.length > 0)) {
+    unreadableOnce(legDir, listed === null ? 'it cannot be read' : 'its manifest cannot be read, so it names no guilds to land');
+    return false;
+  }
+  const guilds: string[] = readable ? manifest.guilds : named?.guilds ?? listed;
+  if (readable) {
+    try {
+      manifest.phase = 'commit-intent';
+      manifest.commitTerm = term;
+      manifest.commitEpoch = epoch;
+      atomicWriteFileSync(path.join(legDir, '.manifest.json'), JSON.stringify(manifest, null, 2));
+    } catch { /* best effort */ }
+  }
+  const shardId = readable ? (Number.isInteger(manifest.shardId) ? manifest.shardId : 0) : named?.shardId ?? 0;
   // Staged under an older term, the copy is the master's that prepared it:
   // its stamp keeps that term, so a superseded side's stale-copy reading
   // still retires it.
-  const stampTerm = Number.isInteger(manifest?.term) && manifest.term > 0 ? Math.min(term, manifest.term) : term;
+  const stampTerm = readable && Number.isInteger(manifest.term) && manifest.term > 0 ? Math.min(term, manifest.term) : term;
   const landed: string[] = [];
   try {
     for (const guildId of guilds) {
@@ -864,6 +890,23 @@ async function finishStaging(legDir: string, migrationId: string, term: number, 
   try { await fs.promises.rm(legDir, { recursive: true, force: true }); } catch { /* best effort */ }
   // Non-recursive: only reaps the migration dir once its last leg is gone.
   try { await fs.promises.rmdir(path.dirname(legDir)); } catch { /* other legs still staged */ }
+  unreadableStaging.delete(legDir);
+  return true;
+}
+
+/** The guild dirs a leg's staging holds; null when it cannot be read. */
+function stagedGuildsIn(legDir: string): string[] | null {
+  try {
+    return fs.readdirSync(legDir, { withFileTypes: true }).filter(entry => entry.isDirectory() && /^\d+$/.test(entry.name)).map(entry => entry.name);
+  } catch {
+    return null;
+  }
+}
+
+function unreadableOnce(legDir: string, why: string): void {
+  if (unreadableStaging.has(legDir)) return;
+  unreadableStaging.add(legDir);
+  console.error(`[Migration] Staging ${legDir} cannot be committed: ${why}; the commit is answered not done`);
 }
 
 // Source-side graveyard + unfreeze for a leg's guilds, on its live runtime and
