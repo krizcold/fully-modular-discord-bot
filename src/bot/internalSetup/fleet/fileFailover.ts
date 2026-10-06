@@ -284,6 +284,16 @@ function adoptRecords(body: string, planText: string, plan: PersistedPlan, selfN
           if (decided && !granted) {
             if (leg.targetLostAt === undefined) leg.targetLostAt = at;
             lost.add(leg.shardId);
+            // As a Declare Lost of the old master would: a commit under way
+            // never cleans this leg's source, so its originals are owed as a
+            // cleanup (held for the operator's choice, a redistribute's
+            // released), which lifts its drain's freeze.
+            if (state === 'COMMITTING' && leg.direction !== 'none') {
+              const notes = rec.pendingSourceCleanup ?? (rec.pendingSourceCleanup = []);
+              let entry = notes.find(e => e.nodeId === leg.sourceNodeId);
+              if (!entry) notes.push(entry = { nodeId: leg.sourceNodeId, legIds: [] });
+              if (!entry.legIds.includes(leg.legId)) entry.legIds.push(leg.legId);
+            }
           } else if (leg.sourceNodeId !== selfNodeId || granted) leg.targetNodeId = selfNodeId;
         }
       });
@@ -321,6 +331,8 @@ function adoptRecords(body: string, planText: string, plan: PersistedPlan, selfN
       for (const legId of entry.legIds) {
         const leg = rec.legs.find(l => l.legId === legId);
         if (!leg || !lost.has(leg.shardId) || leg.direction === 'none' || leg.sourceLostAt !== undefined) continue;
+        // A redistribute's leg into the old master is released instead.
+        if (rec.kind === 'redistribute' && leg.targetLostAt !== undefined) continue;
         if (!leg.heldForChoice) leg.heldForChoice = { lostNodeName: sourceName, at };
         held.add(leg.shardId);
       }
