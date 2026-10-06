@@ -50,7 +50,7 @@ function sha256Of(bytes: Buffer): string {
 // What a placement change rewrites: the plan and the records describing it,
 // their write stamps and grant counters left out (a document rewritten
 // without moving a shard moves nothing).
-const PLACEMENT_KEY_DOCS: readonly string[] = ['leases.json', 'migrations.json'];
+const PLACEMENT_KEY_DOCS: readonly string[] = ['leases.json', 'migrations.json', 'reshard-pending.json', 'redistribute-proposal.json'];
 
 function placementKeyOf(docs: { name: string; body: string }[]): string {
   const hash = createHash('sha256');

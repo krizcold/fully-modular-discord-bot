@@ -69,7 +69,14 @@ function readDocuments(dir: string): Record<string, string> | null {
   for (const name of MIRROR_DOC_NAMES) {
     try {
       documents[name] = fs.readFileSync(path.join(dir, name), 'utf-8');
-    } catch { /* absent: judged below */ }
+    } catch (error) {
+      // An unreadable pause document still counts, as the store reads it: a
+      // marker pauses, a proposal is one the pin names unreadable.
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        if (name === 'reshard-pending.json') documents[name] = '{}';
+        if (name === 'redistribute-proposal.json') documents[name] = '';
+      }
+    }
   }
   const plan = documents['leases.json'] === undefined ? null : readJsonText<PersistedPlan>(documents['leases.json']);
   const config = documents['fleet-config.json'] === undefined ? null : readJsonText<PersistedFleetConfig>(documents['fleet-config.json']);

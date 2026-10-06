@@ -3236,19 +3236,26 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     // synchronously), for the mirror's listing and the planned transfer's
     // handover (B4f-4).
     const placementDocuments = async (): Promise<{ name: string; body: string }[]> => {
-      const [plan, persistedRegistry, config, migrations] = await Promise.all([store.loadPlan(), store.loadRegistry(), store.loadFleetConfig(), store.loadMigrations()]);
+      const [plan, persistedRegistry, config, migrations, marker, proposal] = await Promise.all([
+        store.loadPlan(), store.loadRegistry(), store.loadFleetConfig(), store.loadMigrations(), store.loadReshardMarker(), store.loadRedistributeProposal(),
+      ]);
       // Both exist on a serving master, so null is a failed read (the file
       // store reads every error as null): the listing aborts, the copy stays.
       if (!plan || !config) throw new Error('control store documents unavailable');
       // Nor does a copy take a plan without the records that describe it.
       if (migrations.unreadable) throw new Error('the migration records cannot be read');
       const planBody = JSON.stringify(plan, null, 2);
-      return [
+      const documents = [
         { name: 'leases.json', body: planBody },
         { name: 'registry.json', body: JSON.stringify(persistedRegistry, null, 2) },
         { name: 'fleet-config.json', body: JSON.stringify(config, null, 2) },
         { name: 'migrations.json', body: JSON.stringify({ active: migrations.active, history: migrations.history, updatedAt: migrations.updatedAt, planSha256: planFingerprint(planBody) }, null, 2) },
       ];
+      // A reshard pause goes with them while it runs; an unreadable marker
+      // as an empty one, which a boot reads as malformed and pauses on.
+      if (marker !== null) documents.push({ name: 'reshard-pending.json', body: marker === 'corrupt' ? '{}' : JSON.stringify(marker, null, 2) });
+      if (proposal !== null) documents.push({ name: 'redistribute-proposal.json', body: JSON.stringify(proposal, null, 2) });
+      return documents;
     };
     mirrorAuthority = new MirrorAuthority({
       nodeId,

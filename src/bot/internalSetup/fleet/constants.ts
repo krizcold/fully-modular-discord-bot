@@ -167,8 +167,12 @@ export const MIRROR_LIST_TIMEOUT_MS = 120000;
 /** The master's placement documents, by their fleet-dir file names. */
 export const PLACEMENT_DOC_NAMES = ['leases.json', 'registry.json', 'fleet-config.json'] as const;
 
-/** What rides along with the mirror: the placement documents, then the migration records describing them. */
-export const MIRROR_DOC_NAMES = [...PLACEMENT_DOC_NAMES, 'migrations.json'] as const;
+/**
+ * What rides along with the mirror: the placement documents, then the
+ * migration records describing them, and a reshard pause's marker and
+ * redistribute proposal while they exist.
+ */
+export const MIRROR_DOC_NAMES = [...PLACEMENT_DOC_NAMES, 'migrations.json', 'reshard-pending.json', 'redistribute-proposal.json'] as const;
 
 /** Master-side mirror revision record under /data/global/fleet/. */
 export const MIRROR_REVISION_FILENAME = 'mirror.json';

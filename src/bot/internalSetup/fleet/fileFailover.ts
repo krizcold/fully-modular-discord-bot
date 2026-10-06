@@ -10,7 +10,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { DATA_ROOT, dataPath } from '../../../utils/dataRoot';
 import { FLEET_DIR, MIRROR_DOC_NAMES, PLACEMENT_DOC_NAMES } from './constants';
-import type { MigrationRecord, PersistedAssignment, PersistedFleetConfig, PersistedMigrations, PersistedPlan, PersistedRegistry, PersistedTerm } from './controlStore';
+import type { MigrationRecord, PersistedAssignment, PersistedFleetConfig, PersistedMigrations, PersistedPlan, PersistedRegistry, PersistedTerm, RedistributeProposal } from './controlStore';
 import { atomicWriteFileSync, renameWithRetry } from './fileControlStore';
 import { adoptMarkerFile, mirrorDocsDir, mirrorGuildDir, mirrorRoot, readMirrorManifest } from './mirrorEngine';
 import { guildIdToShardId } from './placement';
@@ -47,6 +47,11 @@ export interface PinOutcome {
   lostShards: number[];
   /** Those of them with an older copy a node still owes the cleanup of, held for the operator's choice. */
   heldShards: number[];
+  /** The old master's reshard pause went on here, and its redistribute proposal with it. */
+  pauseCarried: boolean;
+  proposalCarried: boolean;
+  /** The copy's proposal could not be read or parsed: the pause went on without it. */
+  proposalUnreadable: boolean;
 }
 
 const isGuildId = (value: unknown): value is string => typeof value === 'string' && /^\d+$/.test(value);
@@ -325,8 +330,9 @@ function adoptRecords(body: string, planText: string, plan: PersistedPlan, selfN
  * past mastership of this node may have left in the fleet dir are removed:
  * a reshard marker would pause the boot. The migration records are the
  * copy's after an adopt (carryRecords), so the old master's holds, owed
- * cleanups and running migration go on here; a planned transfer, which hands
- * over only once they are settled, keeps none.
+ * cleanups and running migration go on here, and so do its reshard pause
+ * and redistribute proposal; a planned transfer, which hands over only
+ * once they are settled, keeps none.
  */
 export async function pinPlacement(selfNodeId: string, sourceNodeId: string | null, carryRecords: boolean): Promise<PinOutcome> {
   const plan = readMirrorDoc<PersistedPlan>('leases.json');
@@ -339,6 +345,22 @@ export async function pinPlacement(selfNodeId: string, sourceNodeId: string | nu
   const sourceName = (registry && Array.isArray(registry.nodes) ? registry.nodes.find(n => n?.nodeId === sourceNodeId)?.nodeName : undefined) ?? sourceNodeId?.slice(0, 8) ?? 'the old master';
   const carried = recordsBody === null ? null : adoptRecords(recordsBody, readMirrorText('leases.json') ?? '', plan, selfNodeId, sourceNodeId, sourceName);
   const lost = carried?.lost ?? new Set<number>();
+  // The old master's reshard pause goes on here with its redistribute
+  // proposal (a boot reads the proposal only at Resume, so never alone),
+  // both read as its store reads them: an unreadable marker still pauses,
+  // a proposal that cannot be read or parsed is none.
+  const marker = carryRecords ? readPauseMarker() : null;
+  let stored: RedistributeProposal | null = null;
+  let proposalUnreadable = false;
+  if (marker !== null) {
+    try {
+      const text = readMirrorText('redistribute-proposal.json');
+      if (text !== null) stored = proposalOf(text);
+      proposalUnreadable = text !== null && stored === null;
+    } catch {
+      proposalUnreadable = true;
+    }
+  }
   const self: PersistedAssignment = { nodeId: selfNodeId, leases: [] };
   const others: PersistedAssignment[] = [];
   const movedShards: number[] = [];
@@ -376,7 +398,37 @@ export async function pinPlacement(selfNodeId: string, sourceNodeId: string | nu
     }
   }
   if (carried) atomicWriteFileSync(fleetFile('migrations.json'), JSON.stringify(carried.records, null, 2));
-  return { movedShards, removed, recordsCarried: carried !== null, lostShards: [...lost].sort((a, b) => a - b), heldShards: carried?.held ?? [] };
+  if (marker !== null) atomicWriteFileSync(fleetFile('reshard-pending.json'), marker);
+  if (stored) {
+    // Its shards of the old master were pinned here with the rest; one lost
+    // with it has no owner left to fence it for.
+    const proposal: Record<number, string> = {};
+    for (const [shardKey, owner] of Object.entries(stored.proposal)) {
+      if (typeof owner !== 'string' || lost.has(Number(shardKey))) continue;
+      proposal[Number(shardKey)] = owner === sourceNodeId ? selfNodeId : owner;
+    }
+    atomicWriteFileSync(fleetFile('redistribute-proposal.json'), JSON.stringify({ proposal, updatedAt: Date.now() }, null, 2));
+  }
+  return { movedShards, removed, recordsCarried: carried !== null, lostShards: [...lost].sort((a, b) => a - b), heldShards: carried?.held ?? [], pauseCarried: marker !== null, proposalCarried: stored !== null, proposalUnreadable };
+}
+
+/** A redistribute proposal's text as one; null when it does not parse to one. */
+function proposalOf(text: string): RedistributeProposal | null {
+  try {
+    const parsed = JSON.parse(text) as RedistributeProposal | null;
+    return parsed?.proposal && typeof parsed.proposal === 'object' ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The copy's reshard marker; an unreadable one as an empty one, which a boot reads as malformed and pauses on. */
+function readPauseMarker(): string | null {
+  try {
+    return readMirrorText('reshard-pending.json');
+  } catch {
+    return '{}';
+  }
 }
 
 /** What the pin did with the migration records, for the lane's log line. */
@@ -384,7 +436,12 @@ export function pinRecordsText(outcome: PinOutcome): string {
   if (!outcome.recordsCarried) return '';
   const held = outcome.heldShards.length > 0 ? `; shard(s) [${outcome.heldShards.join(', ')}] wait on the operator's choice on the Fleet tab (restore an older surviving copy or start empty)` : '';
   const lost = outcome.lostShards.length > 0 ? `; shard(s) [${outcome.lostShards.join(', ')}] were moving onto the old master, whose copy of them went with it${held}` : '';
-  return `; the migration records carried over${lost}`;
+  const placeAgain = outcome.lostShards.filter(id => !outcome.heldShards.includes(id));
+  const pause = !outcome.pauseCarried ? ''
+    : `; the reshard pause carried over${outcome.proposalCarried ? ', Resume granting its redistribute proposal' : ''}`
+      + (outcome.proposalUnreadable ? '; its redistribute proposal could not be read: run Redistribute again before Resume' : '')
+      + (placeAgain.length > 0 ? `; run Redistribute again before Resume to place shard(s) [${placeAgain.join(', ')}]` : '');
+  return `; the migration records carried over${lost}${pause}`;
 }
 
 /**
