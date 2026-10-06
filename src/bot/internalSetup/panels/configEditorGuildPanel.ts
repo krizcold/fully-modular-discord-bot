@@ -20,7 +20,7 @@ import {
 import { PanelOptions, PanelContext, PanelResponse } from '../../types/panelTypes';
 import { discoverGuildConfigFiles, ConfigFileMetadata } from '../utils/configDiscovery';
 import { loadGuildConfig, saveGuildConfig, getMergedConfig } from '../utils/configManager';
-import { deleteData } from '../utils/dataManager';
+import { DataOptions, deleteDataOutcome } from '../utils/dataManager';
 import { createV2Response, V2Colors } from '../utils/panel/v2';
 import { validateAndSanitizeJson } from '../utils/json';
 
@@ -247,9 +247,9 @@ const configEditorGuildPanel: PanelOptions = {
 
         if (Object.keys(overridesOnly).length === 0) {
           if (schemaMetadata && schemaMetadata.moduleName) {
-            deleteData(fileId, { guildId: context.guildId!, category: schemaMetadata.moduleName });
+            deleteConfigFile(fileId, { guildId: context.guildId!, category: schemaMetadata.moduleName });
           } else {
-            deleteData(fileId, { guildId: context.guildId! });
+            deleteConfigFile(fileId, { guildId: context.guildId! });
           }
         } else {
           saveGuildConfig(fileId, context.guildId!, overridesOnly);
@@ -299,9 +299,9 @@ const configEditorGuildPanel: PanelOptions = {
       if (Object.keys(overridesOnly).length === 0) {
         // No overrides - delete the config file through the facade.
         if (schemaMetadata && schemaMetadata.moduleName) {
-          deleteData(fileId, { guildId: context.guildId, category: schemaMetadata.moduleName });
+          deleteConfigFile(fileId, { guildId: context.guildId, category: schemaMetadata.moduleName });
         } else {
-          deleteData(fileId, { guildId: context.guildId });
+          deleteConfigFile(fileId, { guildId: context.guildId });
         }
         console.log(`[ConfigEditor] Deleted ${fileId} (no overrides)`);
       } else {
@@ -327,6 +327,13 @@ const configEditorGuildPanel: PanelOptions = {
     return await showConfigView(context, fileId, updatedConfig, fileMetadata);
   },
 };
+
+// A refused delete leaves the old config in place: raised, never shown as saved.
+function deleteConfigFile(fileId: string, options: DataOptions): void {
+  const outcome = deleteDataOutcome(fileId, options);
+  if (outcome === 'frozen') throw new Error('the guild\'s data is frozen for a shard migration; nothing was changed, try again after it completes');
+  if (outcome === 'refused') throw new Error('the guild\'s data could not be changed now; nothing was changed, try again shortly');
+}
 
 // Helper function to show error messages
 function showError(message: string): PanelResponse {

@@ -3,7 +3,7 @@
  */
 
 import type { SettingValue, MergedSettings, HardLimitOverride } from '@bot/types/settingsTypes';
-import { deleteData, loadData, saveData } from '../dataManager';
+import { deleteDataOutcome, loadData, saveData } from '../dataManager';
 import { getSettingsSchema } from './settingsDiscovery';
 import { validateSettingValue, validateValueWithEffectiveLimits } from './settingsValidation';
 
@@ -204,10 +204,14 @@ export function resetModuleSetting(moduleName: string, key: string, guildId?: st
   }
 }
 
-/** Reset all settings (delete file) */
+/** Reset all settings (delete file): false when the delete was refused (a frozen guild, data not ready). */
 export function resetAllModuleSettings(moduleName: string, guildId?: string | null): boolean {
-  deleteData(SETTINGS_FILENAME, settingsOptions(moduleName, guildId));
-  return true;
+  try {
+    const outcome = deleteDataOutcome(SETTINGS_FILENAME, settingsOptions(moduleName, guildId));
+    return outcome === 'deleted' || outcome === 'absent';
+  } catch {
+    return false;
+  }
 }
 
 /** Get schema default for a setting */

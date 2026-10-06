@@ -567,7 +567,10 @@ export async function handleSettingsModal(
         await sendEphemeralError(context, 'Reset cancelled. Type RESET to confirm.');
         return render(state);
       }
-      resetAllModuleSettings(moduleName, context.guildId);
+      if (!resetAllModuleSettings(moduleName, context.guildId)) {
+        await sendEphemeralError(context, 'Reset not applied: the settings could not be deleted now (a shard migration, data not ready, or the database unavailable); nothing was changed, try again shortly.');
+        return render(state);
+      }
       state.pendingChanges = {};
       setState(state);
       return render(state);
