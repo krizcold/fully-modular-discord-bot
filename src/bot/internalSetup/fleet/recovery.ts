@@ -147,34 +147,37 @@ export async function evaluateRecovery(store: ControlStore, opts: RecoveryOption
 async function adoptPlan(store: ControlStore, plan: PersistedPlan, dataBackend: 'file' | 'postgres'): Promise<RecoveryResult> {
   const persisted = (await store.loadRegistry()).nodes;
   const byId = new Map(persisted.map(n => [n.nodeId, n]));
-  const nodes: PersistedNode[] = plan.assignments.map(a =>
-    byId.get(a.nodeId) ?? {
-      nodeId: a.nodeId,
-      nodeName: a.nodeId,
-      appVersion: '',
-      capabilities: { shardCapacity: 1, dataBackend },
-      lastSeenAt: 0,
-    },
-  );
+  const placeholder = (nodeId: string): PersistedNode => ({
+    nodeId,
+    nodeName: nodeId,
+    appVersion: '',
+    capabilities: { shardCapacity: 1, dataBackend },
+    lastSeenAt: 0,
+  });
+  const nodes: PersistedNode[] = plan.assignments.map(a => byId.get(a.nodeId) ?? placeholder(a.nodeId));
   // A node the migration under way still names, or the stored redistribute
   // proposal names as a shard's owner, stays known though it holds no lease
   // (a drained source, an owner no Resume grant has reached): its rollback or
   // grant reaches a listed node, which a Declare Lost can settle. One a
-  // Declare Lost wrote out is not invented. A store read that throws fails
-  // the boot, as a registry read that throws does, rather than write these
-  // nodes out.
+  // Declare Lost wrote out is not invented, but a registry read back with no
+  // node (a master lists itself) cannot tell who was: the named nodes come
+  // back as the lease holders do. Records that cannot be read name no one,
+  // so every listed node stays. A store read that throws fails the boot, as
+  // a registry read that throws does, rather than write these nodes out.
+  const migrations = await store.loadMigrations();
+  const recordsRead = !migrations.unreadable && migrationsHoldTogether(migrations);
   const stored = await store.loadRedistributeProposal();
-  for (const nodeId of [...await migrationParticipants(store), ...proposalOwners(stored, plan)]) {
-    const node = byId.get(nodeId);
+  const named = recordsRead ? migrationParticipants(migrations) : persisted.map(n => n.nodeId);
+  for (const nodeId of [...named, ...proposalOwners(stored, plan)]) {
+    const node = byId.get(nodeId) ?? (persisted.length === 0 ? placeholder(nodeId) : undefined);
     if (node && !nodes.some(n => n.nodeId === nodeId)) nodes.push(node);
   }
   return stored ? { recovered: true, plan, nodes, proposal: stored.proposal } : { recovered: true, plan, nodes };
 }
 
 /** The nodes the unfinished legs of the migration under way name, but a source or target marked Declared Lost. */
-async function migrationParticipants(store: ControlStore): Promise<string[]> {
-  const migrations = await store.loadMigrations();
-  if (migrations.unreadable || !migrationsHoldTogether(migrations) || !migrations.active) return [];
+function migrationParticipants(migrations: PersistedMigrations): string[] {
+  if (!migrations.active) return [];
   const ids = new Set<string>();
   for (const leg of migrations.active.legs) {
     if (leg.legState === 'DONE') continue;
@@ -221,10 +224,11 @@ export function owingNodes(migrations: PersistedMigrations): { nodeId: string; n
 // is under way (its recovery would grant or roll back old numbers into the
 // pause), and while the records cannot be read. A lost node's note crosses
 // it, kept only as its cleanup by guild ids. Outside a pause it waits too
-// while a Resume's proposal still lands on a node the registry knows: that
-// node holds the only copy of those guilds, which nothing would record once
-// the reshard dropped the proposal (in the pause, the next Redistribute reads
-// every node's inventory).
+// while a Resume's proposal still lands on a node the registry knows (any,
+// when the registry reads back with no node): that node holds the only copy
+// of those guilds, which nothing would record once the reshard dropped the
+// proposal (in the pause, the next Redistribute reads every node's
+// inventory).
 async function reshardDeferral(store: ControlStore, plan: PersistedPlan, selfNodeId: string | undefined, inPause: boolean): Promise<string | null> {
   let migrations: PersistedMigrations;
   try {
@@ -253,7 +257,7 @@ async function reshardDeferral(store: ControlStore, plan: PersistedPlan, selfNod
   let landing: [number, string][] = [];
   if (!inPause) {
     const proposal = await store.loadRedistributeProposal();
-    if (proposal) landing = proposalShards(proposal.proposal, plan.shardCount, shardId => placed.has(shardId) || held.has(shardId), nodeId => stored.some(n => n.nodeId === nodeId));
+    if (proposal) landing = proposalShards(proposal.proposal, plan.shardCount, shardId => placed.has(shardId) || held.has(shardId), nodeId => stored.length === 0 || stored.some(n => n.nodeId === nodeId));
   }
   if (!running && held.size === 0 && owing.length === 0 && landing.length === 0) return null;
   const nameOf = (n: { nodeId: string; nodeName: string }): string => stored.find(s => s.nodeId === n.nodeId)?.nodeName ?? n.nodeName;

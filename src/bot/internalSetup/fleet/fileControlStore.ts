@@ -163,8 +163,21 @@ export class FileControlStore implements ControlStore {
     atomicWriteFileSync(file, JSON.stringify(proposal, null, 2));
   }
 
+  // None when missing or not parsed; a read error throws, as the postgres store's does.
   async loadRedistributeProposal(): Promise<RedistributeProposal | null> {
-    const parsed = readJson<RedistributeProposal>(this.file('redistribute-proposal.json'));
+    let raw: string;
+    try {
+      raw = fs.readFileSync(this.file('redistribute-proposal.json'), 'utf-8');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      throw error;
+    }
+    let parsed: RedistributeProposal | null;
+    try {
+      parsed = JSON.parse(raw) as RedistributeProposal | null;
+    } catch {
+      return null;
+    }
     if (!parsed || typeof parsed.proposal !== 'object' || parsed.proposal === null) return null;
     return { proposal: parsed.proposal, updatedAt: Number(parsed.updatedAt) || 0 };
   }

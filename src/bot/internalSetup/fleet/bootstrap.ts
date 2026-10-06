@@ -101,7 +101,7 @@ import { MigrationCoordinator, PrecheckResult, StartPayload } from './migration/
 import { MigrationExecutor } from './migration/migrationExecutor';
 import { TransformationCoordinator } from './transformation/transformationCoordinator';
 import { TransformationExecutor } from './transformation/transformationExecutor';
-import type { ControlStore, PersistedFleetConfig, PersistedTerm, TransformDirection } from './controlStore';
+import type { ControlStore, PersistedFleetConfig, PersistedTerm, RedistributeProposal, TransformDirection } from './controlStore';
 import { migrationsHoldTogether } from './controlStore';
 import { effectiveFleetConfigView, effectiveMasterUrls, emptyStoreHoldEvidence, fleetConfigViewOf, fleetMasterCandidates, forcePassive, readFleetConfigCache, rememberBackups, validateMasterCandidates, renumberDesignations, validateBackupDesignations, validateWitnessChannelId, writeFleetConfigCache } from './fleetConfig';
 import { getLocalReplicaIdentity, getReplicaHealth, getSlotSample, setReplicaProbeListener } from './replicaHealth';
@@ -2710,15 +2710,21 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   };
 
   async function resumeAssignments(): Promise<AssignResult> {
-    // Marker first: if the delete fails the pause must survive the next boot.
-    await store.clearReshardMarker();
-    paused = false;
-    if (recoverySource) recoverySource.reshardPaused = null;
     // Redistribute placed each guild's data on its proposal owner; grant EXACTLY
     // that proposal so a guild is served by the node holding its committed data,
     // not a load-based re-distribute. Only shards actually in the proposal are
     // granted here; anything else (unreachable-holder shards) falls to distribute.
-    const persistedProposal = await store.loadRedistributeProposal();
+    // Read while the pause holds: one that cannot be read keeps it.
+    let persistedProposal: RedistributeProposal | null;
+    try {
+      persistedProposal = await store.loadRedistributeProposal();
+    } catch (error) {
+      return { success: false, error: `the redistribute proposal cannot be read (${error instanceof Error ? error.message : error}); the pause stays, try Resume again` };
+    }
+    // Marker first: if the delete fails the pause must survive the next boot.
+    await store.clearReshardMarker();
+    paused = false;
+    if (recoverySource) recoverySource.reshardPaused = null;
     if (persistedProposal) {
       // Fence EVERY proposal shard off the free pool BEFORE any grant: its only
       // committed copy sits on its proposal owner, so a data-blind distribute()
@@ -2728,9 +2734,10 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       // the proposal file is kept until every proposal shard has landed, so a
       // retry or a fresh crash still re-grants EXACTLY the proposal owner.
       // A shard already owned is not reassigned; one waiting on the
-      // operator's choice is placed by that choice.
+      // operator's choice is placed by that choice; one whose owner a
+      // Declare Lost wrote out meanwhile stays free, as at a boot.
       const heldIds = coordinator?.holdShardIds() ?? new Set<number>();
-      for (const [shardId, proposalNodeId] of proposalShards(persistedProposal.proposal, registry.shardCount, id => registry.shardTable.has(id) || heldIds.has(id))) {
+      for (const [shardId, proposalNodeId] of proposalShards(persistedProposal.proposal, registry.shardCount, id => registry.shardTable.has(id) || heldIds.has(id), id => registry.nodes.has(id))) {
         resumeProposalOwner.set(shardId, proposalNodeId);
         resumePendingShards.add(shardId);
       }
