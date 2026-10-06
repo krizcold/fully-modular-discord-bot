@@ -369,16 +369,18 @@ export class MigrationExecutor {
     await this.finishDrain(leg);
   }
 
-  // Lease-only drain: the coordinator's revoke already put the working sets in
-  // frozen-retained (one final flush queued under the old fence). Confirm that
-  // every guild's writes are durable in the database, then report the outcome;
-  // the master's VERIFYING accepts only ok with zero pending/failed.
+  // Lease-only drain: the revoke's unload freezes the working sets one guild
+  // at a time and nothing orders this drain after it, so each guild is frozen
+  // here first (frozen-retained) and only then confirmed durable in the
+  // database: no write the confirmation misses is accepted. The master's
+  // VERIFYING accepts only ok with zero pending/failed.
   private async drainSourceLeaseOnly(leg: LegRuntime): Promise<void> {
     const ws = getWorkingSet();
     let pendingOps = 0;
     let flushFailures = 0;
     let reason: string | undefined;
     if (ws) {
+      for (const g of leg.guilds) ws.freezeRetained(g);
       const outcomes = await Promise.all(leg.guilds.map(g => ws.flushGuildNow(g, LEASE_ONLY_FLUSH_MS)));
       outcomes.forEach((outcome, i) => {
         if (outcome === 'ok') return;
@@ -555,8 +557,9 @@ export class MigrationExecutor {
       try { leg.ws?.close(); } catch { /* closing */ }
       await leg.receiver?.close();
       if (leg.direction === 'none') {
-        // Lease-only source: no freeze was taken; the abort rollback re-grant
-        // rehydrates the frozen-retained working sets back to ready.
+        // Lease-only source: no facade freeze or sentinel was taken; the abort
+        // rollback re-grant serves the working sets the drain or the revoke's
+        // unload froze (frozen-retained) again.
       } else if (leg.role === 'target') {
         try { await fs.promises.rm(incomingLegDir(leg.migrationId, legId), { recursive: true, force: true }); } catch { /* best effort */ }
       } else {

@@ -343,6 +343,12 @@ export class WorkingSetManager {
     if (ws.state === 'ready' && stillGone()) ws.state = 'frozen-retained';
   }
 
+  /** Refuse the guild's writes from now on, as its lease's unload leaves it; a re-grant serves it again. */
+  freezeRetained(guildId: string): void {
+    const ws = this.sets.get(guildId);
+    if (ws?.state === 'ready') ws.state = 'frozen-retained';
+  }
+
   evict(guildId: string): void {
     const ws = this.sets.get(guildId);
     if (!ws) return;
