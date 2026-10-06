@@ -232,7 +232,8 @@ export class MigrationCoordinator {
       // dropped it. A redistribute revokes nothing (its drain step only asks
       // for the final round), so its abort grants nothing into the pause.
       if (rec.kind !== 'redistribute' && (rec.state === 'DRAINING' || rec.state === 'VERIFYING' || rec.legs.some(l => l.drained))) this.drainRan = true;
-      await this.enterAborting('master restarted before commit decision');
+      // An abort under way runs again with its own reason.
+      await this.enterAborting(rec.state === 'ABORTING' && rec.error ? rec.error : 'master restarted before commit decision');
     }
   }
 
@@ -303,7 +304,7 @@ export class MigrationCoordinator {
     };
     if (state === 'COMMITTING') void this.enterCommitting(true);
     else if (state === 'GRANTING') void this.enterGranting();
-    else void this.enterAborting('master restarted before commit decision');
+    else void this.enterAborting(state === 'ABORTING' && leg.error ? leg.error : 'master restarted before commit decision');
   }
 
   private hydrateLive(rec: MigrationRecord): void {
@@ -1754,6 +1755,9 @@ export class MigrationCoordinator {
     this.clearCommitTimer();
     this.clearGrantRetry();
     this.record.error = reason;
+    // A retire's slice is not what persist writes: its leg (the parent's)
+    // carries the reason, so a restart during the abort keeps it.
+    if (this.parentRecord) for (const leg of this.record.legs) leg.error = reason;
     // A redistribute abort invalidates the persisted proposal: Resume must not
     // grant a proposal whose data placement did not complete (in the serial
     // pass, so a Declare Lost's trim never writes it back).
