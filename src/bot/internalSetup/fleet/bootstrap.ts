@@ -102,6 +102,7 @@ import { MigrationExecutor } from './migration/migrationExecutor';
 import { TransformationCoordinator } from './transformation/transformationCoordinator';
 import { TransformationExecutor } from './transformation/transformationExecutor';
 import type { ControlStore, PersistedFleetConfig, PersistedTerm, TransformDirection } from './controlStore';
+import { migrationsHoldTogether } from './controlStore';
 import { effectiveFleetConfigView, effectiveMasterUrls, emptyStoreHoldEvidence, fleetConfigViewOf, fleetMasterCandidates, forcePassive, readFleetConfigCache, rememberBackups, validateMasterCandidates, renumberDesignations, validateBackupDesignations, validateWitnessChannelId, writeFleetConfigCache } from './fleetConfig';
 import { getLocalReplicaIdentity, getReplicaHealth, getSlotSample, setReplicaProbeListener } from './replicaHealth';
 import { canonicalIsOwnReplica, canonicalStoreReachable, currentCanonicalUrl, hasDbReplica, probeReplica, readTermRow, resolveReplicaEndpoints, spliceFleetCredentials, standInDelivery } from './replicaPromotion';
@@ -3248,7 +3249,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       // store reads every error as null): the listing aborts, the copy stays.
       if (!plan || !config) throw new Error('control store documents unavailable');
       // Nor does a copy take a plan without the records that describe it.
-      if (migrations.unreadable) throw new Error('the migration records cannot be read');
+      if (migrations.unreadable || !migrationsHoldTogether(migrations)) throw new Error('the migration records cannot be read');
       const planBody = JSON.stringify(plan, null, 2);
       const documents = [
         { name: 'leases.json', body: planBody },

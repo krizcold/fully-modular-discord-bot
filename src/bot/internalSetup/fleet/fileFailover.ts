@@ -11,6 +11,7 @@ import * as path from 'path';
 import { DATA_ROOT, dataPath } from '../../../utils/dataRoot';
 import { FLEET_DIR, MIRROR_DOC_NAMES, PLACEMENT_DOC_NAMES } from './constants';
 import type { MigrationRecord, PersistedAssignment, PersistedFleetConfig, PersistedMigrations, PersistedPlan, PersistedRegistry, PersistedTerm, RedistributeProposal } from './controlStore';
+import { migrationsHoldTogether } from './controlStore';
 import { atomicWriteFileSync, renameWithRetry } from './fileControlStore';
 import { adoptMarkerFile, mirrorDocsDir, mirrorGuildDir, mirrorRoot, readMirrorManifest } from './mirrorEngine';
 import { guildIdToShardId } from './placement';
@@ -214,6 +215,7 @@ export function copyRecordsRefusal(): string | null {
     records = JSON.parse(body) as { planSha256?: unknown } | null;
   } catch { /* judged below */ }
   if (records === null || typeof records !== 'object') return `this node's copy of ${name}'s migration records (migrations.json) does not parse, ${after}`;
+  if (!migrationsHoldTogether(records as PersistedMigrations)) return `this node's copy of ${name}'s migration records (migrations.json) does not hold together, ${after}`;
   if (recordsOfAnotherPlan(records, readMirrorText('leases.json') ?? '')) return `this node's copy of ${name}'s documents is torn across two passes (its migration records were listed with another plan than its leases.json), ${after}`;
   return null;
 }
@@ -245,6 +247,9 @@ function adoptRecords(body: string, planText: string, plan: PersistedPlan, selfN
   }
   if (recordsOfAnotherPlan(parsed, planText)) {
     throw new Error('the copy\'s migration records were listed with another plan than its leases.json (a pass torn by a restart of this node), so the old master\'s holds, owed cleanups and running migration cannot go on here');
+  }
+  if (parsed === null || typeof parsed !== 'object' || !migrationsHoldTogether(parsed as PersistedMigrations)) {
+    throw new Error('the copy\'s migration records (migrations.json) do not hold together, so the old master\'s holds, owed cleanups and running migration cannot go on here');
   }
   let active = parsed?.active ?? null;
   const history = Array.isArray(parsed?.history) ? parsed!.history! : [];
