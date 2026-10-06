@@ -351,9 +351,9 @@ export async function pinPlacement(selfNodeId: string, sourceNodeId: string | nu
   const carried = recordsBody === null ? null : adoptRecords(recordsBody, readMirrorText('leases.json') ?? '', plan, selfNodeId, sourceNodeId, sourceName);
   const lost = carried?.lost ?? new Set<number>();
   // The old master's reshard pause goes on here with its redistribute
-  // proposal (a boot reads the proposal only at Resume, so never alone),
-  // both read as its store reads them: an unreadable marker still pauses,
-  // a proposal that cannot be read or parsed is none.
+  // proposal (a boot reads it for its owners and Resume for its grants, so
+  // never alone), both read as its store reads them: an unreadable marker
+  // still pauses, a proposal that cannot be read or parsed is none.
   const marker = carryRecords ? readPauseMarker() : null;
   let stored: RedistributeProposal | null = null;
   let proposalUnreadable = false;

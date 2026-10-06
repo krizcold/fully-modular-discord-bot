@@ -2102,10 +2102,11 @@ export class MigrationCoordinator {
   }
 
   // Redistribute placement is computed from the CONNECTED set, and Resume grants
-  // exactly that proposal. A reshard-pause boot restores no worker entries, so
-  // during the hold-down the registry holds only the master: a redistribute
-  // started then bakes a master-only proposal (behind the benign "nothing to
-  // redistribute") and Resume hands it the whole fleet, past its capacity.
+  // exactly that proposal. A reshard-pause boot connects no worker (a stored
+  // proposal's owners come back known, not connected), so during the hold-down
+  // only the master is connected: a redistribute started then bakes a
+  // master-only proposal (behind the benign "nothing to redistribute") and
+  // Resume hands it the whole fleet, past its capacity.
   // Refuse until the fleet has assembled, the same gate Resume and manual assign
   // already apply. A worker that registered and then dropped is still visible as
   // `unreachable`, so the deliberate offline-holder redistribute is unaffected.

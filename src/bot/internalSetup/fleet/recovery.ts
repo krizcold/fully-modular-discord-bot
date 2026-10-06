@@ -154,10 +154,14 @@ async function adoptPlan(store: ControlStore, plan: PersistedPlan, dataBackend: 
       lastSeenAt: 0,
     },
   );
-  // A node the migration under way still names stays known though it holds
-  // no lease (a drained source): its rollback reaches a listed node, which a
-  // Declare Lost can settle. One a Declare Lost wrote out is not invented.
-  for (const nodeId of await migrationParticipants(store)) {
+  // A node the migration under way still names, or the stored redistribute
+  // proposal names as a shard's owner, stays known though it holds no lease
+  // (a drained source, an owner no Resume grant has reached): its rollback or
+  // grant reaches a listed node, which a Declare Lost can settle. One a
+  // Declare Lost wrote out is not invented. A store read that throws fails
+  // the boot, as a registry read that throws does, rather than write these
+  // nodes out.
+  for (const nodeId of [...await migrationParticipants(store), ...await proposalOwners(store, plan)]) {
     const node = byId.get(nodeId);
     if (node && !nodes.some(n => n.nodeId === nodeId)) nodes.push(node);
   }
@@ -166,8 +170,8 @@ async function adoptPlan(store: ControlStore, plan: PersistedPlan, dataBackend: 
 
 /** The nodes the unfinished legs of the migration under way name, but a source or target marked Declared Lost. */
 async function migrationParticipants(store: ControlStore): Promise<string[]> {
-  const migrations = await store.loadMigrations().catch(() => null);
-  if (!migrations || migrations.unreadable || !migrationsHoldTogether(migrations) || !migrations.active) return [];
+  const migrations = await store.loadMigrations();
+  if (migrations.unreadable || !migrationsHoldTogether(migrations) || !migrations.active) return [];
   const ids = new Set<string>();
   for (const leg of migrations.active.legs) {
     if (leg.legState === 'DONE') continue;
@@ -175,6 +179,18 @@ async function migrationParticipants(store: ControlStore): Promise<string[]> {
     if (leg.targetLostAt === undefined) ids.add(leg.targetNodeId);
   }
   return [...ids];
+}
+
+/** The owners the stored redistribute proposal names for the shards a Resume would grant (of the plan's count, leased by no one); one that cannot be parsed names none. */
+async function proposalOwners(store: ControlStore, plan: PersistedPlan): Promise<string[]> {
+  const stored = await store.loadRedistributeProposal();
+  if (!stored) return [];
+  const leased = new Set(plan.assignments.flatMap(a => a.leases.map(l => l.shardId)));
+  return Object.entries(stored.proposal).flatMap(([shardKey, owner]) => {
+    const shardId = Number(shardKey);
+    const granted = Number.isInteger(shardId) && shardId >= 0 && shardId < plan.shardCount && !leased.has(shardId);
+    return granted && typeof owner === 'string' ? [owner] : [];
+  });
 }
 
 /** The nodes still owing a cleanup they missed and not Declared Lost, named from their notes. */
