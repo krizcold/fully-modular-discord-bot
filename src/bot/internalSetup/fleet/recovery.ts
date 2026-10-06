@@ -220,7 +220,11 @@ export function owingNodes(migrations: PersistedMigrations): { nodeId: string; n
 // Lost still owes one (it may come back to that shard), while a migration
 // is under way (its recovery would grant or roll back old numbers into the
 // pause), and while the records cannot be read. A lost node's note crosses
-// it, kept only as its cleanup by guild ids.
+// it, kept only as its cleanup by guild ids. Outside a pause it waits too
+// while a Resume's proposal still lands on a node the registry knows: that
+// node holds the only copy of those guilds, which nothing would record once
+// the reshard dropped the proposal (in the pause, the next Redistribute reads
+// every node's inventory).
 async function reshardDeferral(store: ControlStore, plan: PersistedPlan, selfNodeId: string | undefined, inPause: boolean): Promise<string | null> {
   let migrations: PersistedMigrations;
   try {
@@ -245,14 +249,27 @@ async function reshardDeferral(store: ControlStore, plan: PersistedPlan, selfNod
   }
   const owing = owingNodes(migrations).filter(n => waiting.has(n.nodeId));
   const running = migrations.active;
-  if (!running && held.size === 0 && owing.length === 0) return null;
-  const stored = await store.loadRegistry().then(r => r.nodes).catch(() => [] as PersistedNode[]);
+  const stored = (await store.loadRegistry()).nodes;
+  let landing: [number, string][] = [];
+  if (!inPause) {
+    const proposal = await store.loadRedistributeProposal();
+    if (proposal) landing = proposalShards(proposal.proposal, plan.shardCount, shardId => placed.has(shardId) || held.has(shardId), nodeId => stored.some(n => n.nodeId === nodeId));
+  }
+  if (!running && held.size === 0 && owing.length === 0 && landing.length === 0) return null;
   const nameOf = (n: { nodeId: string; nodeName: string }): string => stored.find(s => s.nodeId === n.nodeId)?.nodeName ?? n.nodeName;
   const reasons = owing.map(n => n.nodeId === selfNodeId
     ? 'this master still owes the cleanup of a migration it missed (it is retried now; restart the master once more after it has run)'
     : `${nameOf(n)} still owes the cleanup of a migration it missed (bring it back online so the cleanup runs, or Declare it Lost on the Fleet tab)`);
   if (held.size > 0) reasons.unshift(`shard(s) [${[...held].sort((a, b) => a - b).join(', ')}] wait on the operator's choice on the Fleet tab${inPause ? ' after Resume' : ''} (restore the surviving copy or start the shard empty)`);
   if (running) reasons.unshift(migrationUnderWay(running));
+  const shardList = (entries: [number, string][]): string => entries.map(([shardId]) => shardId).sort((a, b) => a - b).join(', ');
+  const elsewhere = landing.filter(([, owner]) => owner !== selfNodeId);
+  if (elsewhere.length > 0) {
+    const owners = [...new Set(elsewhere.map(([, owner]) => owner))].map(nodeId => nameOf({ nodeId, nodeName: nodeId }));
+    reasons.push(`shard(s) [${shardList(elsewhere)}] of the last reshard still await their grant onto ${owners.join(' and ')}, which hold${owners.length === 1 ? 's' : ''} their data (each lands once its node is online; Declare a node that never returns Lost on the Fleet tab)`);
+  }
+  const here = landing.filter(([, owner]) => owner === selfNodeId);
+  if (here.length > 0) reasons.push(`shard(s) [${shardList(here)}] of the last reshard still await their grant onto this master, which holds their data (it takes them now; restart the master once more after it has)`);
   return reasons.join('; ');
 }
 
@@ -260,8 +277,10 @@ function migrationUnderWay(rec: NonNullable<PersistedMigrations['active']>): str
   return `a ${rec.kind} migration is still under way; restart the master once it has ended (a paused one is continued or aborted on the Fleet tab)`;
 }
 
-// Confirmed reshard: ownership records are NEVER discarded, only archived.
-// Write order is load-bearing: archive -> MARKER -> empty plan. A crash after
+// Confirmed reshard: ownership records are NEVER discarded, only archived (a
+// redistribute proposal is none: it names shards of the old count, and a
+// fresh confirm waits while one still lands). Write order is load-bearing:
+// archive -> MARKER -> the proposal dropped -> empty plan. A crash after
 // the marker leaves old plan + marker (the override still mismatches, so the
 // next boot re-runs this path); plan-before-marker could leave an empty
 // new-count plan with NO marker, silently cancelling the pause. When a valid
@@ -292,9 +311,14 @@ async function confirmedReshard(
     archiveFile = await store.archivePlan({ plan, registry, archivedAt: at, from, to });
   }
   await store.saveReshardMarker({ from, to, at, archiveFile });
+  // A stored proposal names shards of the old count: a Resume must never
+  // grant it under the new one (the next Redistribute places each guild
+  // from the nodes' own inventories).
+  const proposalDropped = await store.loadRedistributeProposal() !== null;
+  await store.saveRedistributeProposal(null);
   const emptyPlan: PersistedPlan = { term: newTerm, epoch: plan.epoch, shardCount: to, assignments: [], updatedAt: now };
   await store.savePlan(emptyPlan);
-  console.warn(`[Fleet] CONFIRMED RESHARD ${plan.shardCount} -> ${to}: ownership archived at ${archiveFile}; assignments PAUSED until resumed`);
+  console.warn(`[Fleet] CONFIRMED RESHARD ${plan.shardCount} -> ${to}: ownership archived at ${archiveFile}; assignments PAUSED until resumed${proposalDropped ? '; the stored redistribute proposal (of the old count) was dropped: run Redistribute again before Resume' : ''}`);
   return {
     recovered: true,
     plan: emptyPlan,
