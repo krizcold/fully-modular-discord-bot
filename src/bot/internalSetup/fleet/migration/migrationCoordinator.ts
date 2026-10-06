@@ -1454,13 +1454,16 @@ export class MigrationCoordinator {
   }
 
   private async enterVerifying(): Promise<void> {
-    if (!this.record) return;
+    const rec = this.record;
+    if (!rec) return;
     this.clearDrainTimeout();
     await this.transition('VERIFYING');
+    // A twin step (a verify sent again) may have decided meanwhile.
+    if (this.overtaken(rec) || rec.state !== 'VERIFYING') return;
     if (this.recordIsLeaseOnly()) {
       // Verify = drain confirmation: every source flushed everything durable
       // into the database (data-commit strictly before the gateway swap).
-      for (const leg of this.record.legs) {
+      for (const leg of rec.legs) {
         const f = this.live.get(leg.legId)?.flushed;
         if (!f || !f.ok || f.pendingOps > 0 || f.flushFailures > 0) {
           await this.enterAborting(`drain flush not confirmed on leg ${leg.legId}${f?.reason ? `: ${f.reason}` : ''}`);
@@ -1468,7 +1471,7 @@ export class MigrationCoordinator {
         }
       }
     } else {
-      for (const leg of this.record.legs) {
+      for (const leg of rec.legs) {
         const l = this.live.get(leg.legId)!;
         if (!l.sourceVerify || !l.targetVerify || l.sourceVerify.hash !== l.targetVerify.hash) {
           // Per-guild diff logged on mismatch.
@@ -1481,7 +1484,6 @@ export class MigrationCoordinator {
     // The plan on disk stops naming each drained source before the decision
     // is written, so no boot hands a committed shard back to its source,
     // its records readable or not.
-    const rec = this.record;
     let failed: string | null = null;
     try {
       await this.hooks.persistPlan();
