@@ -154,7 +154,27 @@ async function adoptPlan(store: ControlStore, plan: PersistedPlan, dataBackend: 
       lastSeenAt: 0,
     },
   );
+  // A node the migration under way still names stays known though it holds
+  // no lease (a drained source): its rollback reaches a listed node, which a
+  // Declare Lost can settle. One a Declare Lost wrote out is not invented.
+  for (const nodeId of await migrationParticipants(store)) {
+    const node = byId.get(nodeId);
+    if (node && !nodes.some(n => n.nodeId === nodeId)) nodes.push(node);
+  }
   return { recovered: true, plan, nodes };
+}
+
+/** The nodes the unfinished legs of the migration under way name, but a source or target marked Declared Lost. */
+async function migrationParticipants(store: ControlStore): Promise<string[]> {
+  const migrations = await store.loadMigrations().catch(() => null);
+  if (!migrations || migrations.unreadable || !migrationsHoldTogether(migrations) || !migrations.active) return [];
+  const ids = new Set<string>();
+  for (const leg of migrations.active.legs) {
+    if (leg.legState === 'DONE') continue;
+    if (leg.sourceLostAt === undefined) ids.add(leg.sourceNodeId);
+    if (leg.targetLostAt === undefined) ids.add(leg.targetNodeId);
+  }
+  return [...ids];
 }
 
 /** The nodes still owing a cleanup they missed and not Declared Lost, named from their notes. */
