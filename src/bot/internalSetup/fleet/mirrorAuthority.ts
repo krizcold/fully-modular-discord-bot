@@ -47,6 +47,31 @@ function sha256Of(bytes: Buffer): string {
   return createHash('sha256').update(bytes).digest('hex');
 }
 
+// What a placement change rewrites: the plan and the records describing it,
+// their write stamps and grant counters left out (a document rewritten
+// without moving a shard moves nothing).
+const PLACEMENT_KEY_DOCS: readonly string[] = ['leases.json', 'migrations.json'];
+
+function placementKeyOf(docs: { name: string; body: string }[]): string {
+  const hash = createHash('sha256');
+  for (const doc of docs) {
+    if (!PLACEMENT_KEY_DOCS.includes(doc.name)) continue;
+    let content = doc.body;
+    try {
+      const parsed = JSON.parse(doc.body);
+      if (parsed && typeof parsed === 'object') {
+        delete parsed.updatedAt;
+        delete parsed.planSha256;
+        delete parsed.term;
+        delete parsed.epoch;
+        content = JSON.stringify(parsed);
+      }
+    } catch { /* hashed as written */ }
+    hash.update(`${doc.name}\n${content}\n`);
+  }
+  return hash.digest('hex');
+}
+
 export function isMirrorRequest(type: string): boolean {
   return type === MSG.MIRROR_LIST || type === MSG.MIRROR_READ;
 }
@@ -183,6 +208,10 @@ export class MirrorAuthority {
     // Read first: a plan settled before this point is what the documents
     // read below hold.
     const placementPending = this.hooks.placementPending();
+    // The walk pairs with the documents only if no placement change landed
+    // while it ran: a move committed mid-walk would pair a plan with guild
+    // data from the other side of it.
+    const placementBefore = placementKeyOf(await this.hooks.documents());
     const guilds: MirrorGuildEntry[] = [];
     const frozen: string[] = [];
     const keep = new Set<string>();
@@ -230,9 +259,13 @@ export class MirrorAuthority {
     }
     for (const key of this.snapshot.keys()) if (!keep.has(key)) this.snapshot.delete(key);
 
+    const placed = await this.hooks.documents();
+    if (placementKeyOf(placed) !== placementBefore) {
+      throw new Error('the fleet placement changed while the guild data was listed; the next listing takes it');
+    }
     const documents: SyncFileEntry[] = [];
     const bodies = new Map<string, Buffer>();
-    for (const doc of await this.hooks.documents()) {
+    for (const doc of placed) {
       if (!(MIRROR_DOC_NAMES as readonly string[]).includes(doc.name)) continue;
       const body = Buffer.from(doc.body, 'utf-8');
       bodies.set(doc.name, body);
