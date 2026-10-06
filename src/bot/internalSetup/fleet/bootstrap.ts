@@ -1301,6 +1301,16 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   // supersession hook (assigned once the registry exists) turns the fence
   // into a step-down (B4).
   let controlFenced = false;
+  // A Declare Lost writes its records before any plan without its node (as
+  // a rollback writes them first): plan writes wait while one is under way,
+  // so a crash between leaves the node listed, never its marks unwritten.
+  const planWriteHolds = new Set<Promise<void>>();
+  const holdPlanWrites = (): (() => void) => {
+    let release!: () => void;
+    const hold = new Promise<void>(resolve => { release = resolve; });
+    planWriteHolds.add(hold);
+    return () => { planWriteHolds.delete(hold); release(); };
+  };
   let syncPosture: SyncPostureEngine | null = null;
   let onDeposedTeardown: (() => void) | null = null;
   let onSupersededByStore: ((observedTerm: number) => void) | null = null;
@@ -2755,79 +2765,85 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     if (transformer?.hasActive() && !transformer.isRetiring()) {
       return { success: false, error: 'a backend transformation is active; abort it (or let it finish) before declaring nodes lost' };
     }
-    // Declaring a migration participant lost is a node-down event for the
-    // coordinator (pre-commit -> abort; post-commit -> its legs settle below).
-    coordinator?.onNodeDown(targetNodeId);
-    transformer?.onNodeRemoved(targetNodeId);
-    registry.epoch += 1;
-    const shardIds: number[] = [];
-    for (const [shardId, lease] of registry.shardTable) {
-      if (lease.nodeId !== targetNodeId) continue;
-      shardIds.push(shardId);
-      registry.shardTable.delete(shardId);
+    const releasePlanWrites = holdPlanWrites();
+    try {
+      // Declaring a migration participant lost is a node-down event for the
+      // coordinator (pre-commit -> abort; post-commit -> its legs settle below).
+      coordinator?.onNodeDown(targetNodeId);
+      transformer?.onNodeRemoved(targetNodeId);
+      registry.epoch += 1;
+      const shardIds: number[] = [];
+      for (const [shardId, lease] of registry.shardTable) {
+        if (lease.nodeId !== targetNodeId) continue;
+        shardIds.push(shardId);
+        registry.shardTable.delete(shardId);
+      }
+      // A stamp whose shard the table records under another node was never this node's.
+      const ownStamps = new Set(registry.pendingShardIdsOf(targetNodeId));
+      for (const [shardId, pending] of registry.pendingConfirmation) {
+        if (pending.nodeId !== targetNodeId) continue;
+        if (ownStamps.has(shardId)) shardIds.push(shardId);
+        registry.pendingConfirmation.delete(shardId);
+      }
+      // A migration's commit or grant to this node that has not landed:
+      // what it put there went with the node.
+      for (const shardId of coordinator?.grantsOwedTo(targetNodeId) ?? []) {
+        if (!shardIds.includes(shardId)) shardIds.push(shardId);
+      }
+      // An abort under way hands back to this node what its drain took off
+      // the table: those shards are freed with it (the rollback skips it).
+      for (const shardId of coordinator?.releaseRollbackOf(targetNodeId) ?? []) {
+        if (!shardIds.includes(shardId)) shardIds.push(shardId);
+      }
+      lostNodes.add(node);
+      registry.nodes.delete(targetNodeId);
+      // In the reshard pause the Resume grants are only on disk: the data the
+      // redistribute placed on this node went with it, so its proposal shards
+      // leave the proposal as freed.
+      if (paused) {
+        for (const shardId of await coordinator?.dropProposalOwner(targetNodeId) ?? []) if (!shardIds.includes(shardId)) shardIds.push(shardId);
+      }
+      // A Resume grant awaiting this node (it held the data the reshard placed
+      // there) can never land now: its shards leave the resume fence with it.
+      for (const [shardId, owner] of resumeProposalOwner) {
+        if (owner !== targetNodeId) continue;
+        if (resumePendingShards.delete(shardId) && !shardIds.includes(shardId)) shardIds.push(shardId);
+        resumeProposalOwner.delete(shardId);
+      }
+      if (backupDesignationRefused?.nodeId === targetNodeId) backupDesignationRefused = null;
+      // A node that is gone cannot stand in; its designation goes with it.
+      if (fleetConfig && fleetConfig.backupDesignations.some(d => d.nodeId === targetNodeId)) {
+        fleetConfig = {
+          ...fleetConfig,
+          revision: fleetConfig.revision + 1,
+          backupDesignations: renumberDesignations(fleetConfig.backupDesignations.filter(d => d.nodeId !== targetNodeId)),
+          updatedAt: Date.now(),
+        };
+        persistFleetConfig(`declared lost ${node.nodeName || targetNodeId}`);
+        fillFreedBackupSlot();
+      }
+      drainRevokeAt.delete(targetNodeId);
+      drainExtraLeaseIds.delete(targetNodeId);
+      mismatchRevokeAt.delete(targetNodeId);
+      ledgerDeferWarnAt.delete(targetNodeId);
+      lastRevokeSentAt.delete(targetNodeId);
+      shardIds.sort((a, b) => a - b);
+      healthMonitor?.recordLoss({ nodeId: targetNodeId, nodeName: node.nodeName, shardIds, at: Date.now() });
+      // The lost node's owed copies went with it; a freed shard an older copy
+      // of which survives on a node that missed a move's cleanup is held, that
+      // cleanup with it, for the operator's choice.
+      const heldIds = await coordinator?.onNodeDeclaredLost(targetNodeId, node.nodeName, shardIds) ?? [];
+      releasePlanWrites();
+      await persist();
+      const heldNote = heldIds.length > 0
+        ? `; shard${heldIds.length === 1 ? '' : 's'} [${heldIds.join(', ')}] held: a copy survives on another node; restore it or start it empty on the Fleet tab`
+        : '';
+      console.warn(`[Fleet] Node ${node.nodeName} DECLARED LOST; shards [${shardIds.filter(id => !heldIds.includes(id)).join(', ')}] freed for redistribution${heldNote}`);
+      void distribute();
+      return { success: true };
+    } finally {
+      releasePlanWrites();
     }
-    // A stamp whose shard the table records under another node was never this node's.
-    const ownStamps = new Set(registry.pendingShardIdsOf(targetNodeId));
-    for (const [shardId, pending] of registry.pendingConfirmation) {
-      if (pending.nodeId !== targetNodeId) continue;
-      if (ownStamps.has(shardId)) shardIds.push(shardId);
-      registry.pendingConfirmation.delete(shardId);
-    }
-    // A migration's commit or grant to this node that has not landed:
-    // what it put there went with the node.
-    for (const shardId of coordinator?.grantsOwedTo(targetNodeId) ?? []) {
-      if (!shardIds.includes(shardId)) shardIds.push(shardId);
-    }
-    // An abort under way hands back to this node what its drain took off
-    // the table: those shards are freed with it (the rollback skips it).
-    for (const shardId of coordinator?.releaseRollbackOf(targetNodeId) ?? []) {
-      if (!shardIds.includes(shardId)) shardIds.push(shardId);
-    }
-    lostNodes.add(node);
-    registry.nodes.delete(targetNodeId);
-    // In the reshard pause the Resume grants are only on disk: the data the
-    // redistribute placed on this node went with it, so its proposal shards
-    // leave the proposal as freed.
-    if (paused) {
-      for (const shardId of await coordinator?.dropProposalOwner(targetNodeId) ?? []) if (!shardIds.includes(shardId)) shardIds.push(shardId);
-    }
-    // A Resume grant awaiting this node (it held the data the reshard placed
-    // there) can never land now: its shards leave the resume fence with it.
-    for (const [shardId, owner] of resumeProposalOwner) {
-      if (owner !== targetNodeId) continue;
-      if (resumePendingShards.delete(shardId) && !shardIds.includes(shardId)) shardIds.push(shardId);
-      resumeProposalOwner.delete(shardId);
-    }
-    if (backupDesignationRefused?.nodeId === targetNodeId) backupDesignationRefused = null;
-    // A node that is gone cannot stand in; its designation goes with it.
-    if (fleetConfig && fleetConfig.backupDesignations.some(d => d.nodeId === targetNodeId)) {
-      fleetConfig = {
-        ...fleetConfig,
-        revision: fleetConfig.revision + 1,
-        backupDesignations: renumberDesignations(fleetConfig.backupDesignations.filter(d => d.nodeId !== targetNodeId)),
-        updatedAt: Date.now(),
-      };
-      persistFleetConfig(`declared lost ${node.nodeName || targetNodeId}`);
-      fillFreedBackupSlot();
-    }
-    drainRevokeAt.delete(targetNodeId);
-    drainExtraLeaseIds.delete(targetNodeId);
-    mismatchRevokeAt.delete(targetNodeId);
-    ledgerDeferWarnAt.delete(targetNodeId);
-    lastRevokeSentAt.delete(targetNodeId);
-    shardIds.sort((a, b) => a - b);
-    healthMonitor?.recordLoss({ nodeId: targetNodeId, nodeName: node.nodeName, shardIds, at: Date.now() });
-    // The lost node's owed copies went with it; a freed shard an older copy
-    // of which survives on a node that missed a move's cleanup is held, that
-    // cleanup with it, for the operator's choice.
-    const heldIds = await coordinator?.onNodeDeclaredLost(targetNodeId, node.nodeName, shardIds) ?? [];
-    await persist();
-    const heldNote = heldIds.length > 0
-      ? `; shard${heldIds.length === 1 ? '' : 's'} [${heldIds.join(', ')}] held: a copy survives on another node; restore it or start it empty on the Fleet tab`
-      : '';
-    console.warn(`[Fleet] Node ${node.nodeName} DECLARED LOST; shards [${shardIds.filter(id => !heldIds.includes(id)).join(', ')}] freed for redistribution${heldNote}`);
-    void distribute();
-    return { success: true };
   };
 
   // The operator's answer for a held shard. Restore places it back on a
@@ -3013,6 +3029,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   }
 
   async function persist(): Promise<void> {
+    while (planWriteHolds.size > 0) await Promise.all([...planWriteHolds]);
     const key = planKeyOf();
     const byNode = new Map<string, { leaseId: string; shardId: number; identifyDelayMs: number }[]>();
     for (const lease of registry.shardTable.values()) {
