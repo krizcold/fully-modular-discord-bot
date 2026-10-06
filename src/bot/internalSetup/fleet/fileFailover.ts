@@ -139,7 +139,7 @@ function writeOwnerStamp(guildId: string, nodeId: string, plan: PersistedPlan | 
 }
 
 /** The file backend's graveyard layout ({guildId}-{ms} plus .graveyard.json), so Restore finds the entry. */
-async function graveyardLiveDir(guildId: string, reason: string): Promise<void> {
+export async function graveyardLiveDir(guildId: string, reason: string): Promise<void> {
   const graveyardRoot = path.join(DATA_ROOT, GRAVEYARD_DIRNAME);
   fs.mkdirSync(graveyardRoot, { recursive: true });
   const dest = path.join(graveyardRoot, `${guildId}-${Date.now()}`);

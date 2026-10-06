@@ -7,10 +7,16 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { DATA_ROOT } from '../../../../utils/dataRoot';
 import { deleteGuildNamespace, listGuilds, stampOwner } from '../../utils/dataManager';
+import { atomicWriteFileSync } from '../fileControlStore';
+import { graveyardLiveDir } from '../fileFailover';
+import { getNodeId } from '../nodeIdentity';
 import { commitFromStaging } from './migrationExecutor';
 
 const INCOMING_DIR = '_incoming';
 const DELETING_PREFIX = '.deleting-';
+// The commit-intent legs a boot landed before any ask (a file, so neither
+// staging pass reads it as a migration).
+const BOOT_LANDED_FILE = '.boot-landed.json';
 const ORPHAN_TMP_MAX_AGE_MS = 60 * 60 * 1000; // 1h
 
 interface OwnerManifest {
@@ -132,6 +138,7 @@ async function disposeIncoming(): Promise<void> {
         manifest = JSON.parse(await fs.promises.readFile(path.join(incomingRoot, mig.name, leg.name, '.manifest.json'), 'utf-8'));
       } catch { /* no manifest */ }
       if (manifest?.phase !== 'commit-intent' || !Number.isInteger(manifest.commitTerm) || !Number.isInteger(manifest.commitEpoch)) continue;
+      noteBootLanded(mig.name, leg.name, path.join(incomingRoot, mig.name, leg.name), manifest);
       try {
         if (await commitFromStaging(mig.name, leg.name, manifest.commitTerm, manifest.commitEpoch)) {
           console.log(`[Fleet] Finished commit-intent staging for migration ${mig.name} leg ${leg.name}`);
@@ -141,6 +148,98 @@ async function disposeIncoming(): Promise<void> {
       }
     }
   }
+}
+
+interface BootLanded {
+  migrationId: string;
+  legId: string;
+  guilds: string[];
+  term: number;
+  epoch: number;
+}
+
+const isGuildId = (value: unknown): value is string => typeof value === 'string' && /^\d+$/.test(value);
+
+function readBootLanded(): BootLanded[] {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(path.join(DATA_ROOT, INCOMING_DIR, BOOT_LANDED_FILE), 'utf-8'));
+    return Array.isArray(parsed) ? parsed.filter((n: any) => typeof n?.migrationId === 'string' && typeof n.legId === 'string'
+      && Array.isArray(n.guilds) && n.guilds.every(isGuildId) && Number.isInteger(n.term) && Number.isInteger(n.epoch)) : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeBootLanded(list: BootLanded[]): void {
+  const file = path.join(DATA_ROOT, INCOMING_DIR, BOOT_LANDED_FILE);
+  if (list.length === 0) fs.rmSync(file, { force: true });
+  else atomicWriteFileSync(file, JSON.stringify(list, null, 2));
+}
+
+// Noted before it lands, so a crash in between still has it checked.
+function noteBootLanded(migrationId: string, legId: string, legDir: string, manifest: any): void {
+  try {
+    const noted = readBootLanded();
+    if (noted.some(n => n.migrationId === migrationId && n.legId === legId)) return;
+    const guilds: string[] = Array.isArray(manifest.guilds) ? manifest.guilds.filter(isGuildId)
+      : fs.readdirSync(legDir, { withFileTypes: true }).filter(entry => entry.isDirectory() && isGuildId(entry.name)).map(entry => entry.name);
+    writeBootLanded([...noted, { migrationId, legId, guilds, term: manifest.commitTerm, epoch: manifest.commitEpoch }]);
+  } catch (error) {
+    console.warn(`[Fleet] Commit-intent staging ${migrationId}/${legId} could not be noted before it lands, so its master's verdict is not checked:`, error instanceof Error ? error.message : error);
+  }
+}
+
+// A leg the boot landed is asked about as staging is. A committing verdict
+// naming it aborted (its target was Declared Lost, its shard freed) moves
+// each of its guilds still as the boot left it (this node's stamp of that
+// commit) to the graveyard, but one whose shard this node serves now (the
+// freed shard placed here) stays; one naming it pending asks again; any
+// other ends the check (no other verdict says this leg must not land).
+// No verdict asks again on the next pass.
+async function checkBootLanded(
+  queryMaster: (migrationId: string, stagedTerm: number) => Promise<MigrationDisposition>,
+  busy: () => boolean,
+  servedHere: (guildId: string) => boolean,
+): Promise<void> {
+  const noted = readBootLanded();
+  if (noted.length === 0) return;
+  const selfNodeId = getNodeId();
+  const left: BootLanded[] = [];
+  for (const landed of noted) {
+    let disposition: MigrationDisposition;
+    try {
+      disposition = await queryMaster(landed.migrationId, landed.term);
+    } catch {
+      left.push(landed);
+      continue;
+    }
+    const own = disposition.verdict === 'committing' ? disposition.legs?.[landed.legId] : undefined;
+    if (own === 'pending' || (own === 'aborted' && busy())) {
+      left.push(landed);
+      continue;
+    }
+    if (own !== 'aborted') continue;
+    let moved = 0;
+    let served = 0;
+    let failed = false;
+    for (const guildId of landed.guilds) {
+      const owner = readOwner(guildId);
+      if (!owner || owner.nodeId !== selfNodeId || owner.epoch !== landed.epoch) continue;
+      if (servedHere(guildId)) {
+        served += 1;
+        continue;
+      }
+      try {
+        await graveyardLiveDir(guildId, `migration-${landed.migrationId}-not-landing`);
+        moved += 1;
+      } catch {
+        failed = true;
+      }
+    }
+    if (failed) left.push(landed);
+    console.warn(`[Fleet] Commit-intent staging of migration ${landed.migrationId} leg ${landed.legId} landed at this node's boot, but the master says it must not land (its target was declared lost or the leg aborted): ${moved} guild(s) moved to the graveyard${served > 0 ? `, ${served} kept as this node now serves their shard` : ''}${failed ? '; the rest are retried on the next pass' : ''}`);
+  }
+  writeBootLanded(left);
 }
 
 /** How the master answers a node's boot query about a migration it still stages. */
@@ -189,6 +288,7 @@ export function dispositionFromReply(reply: any, stagedTerm = 0): MigrationDispo
 export async function resolveIncomingWithMaster(
   queryMaster: (migrationId: string, stagedTerm: number) => Promise<MigrationDisposition>,
   busy: () => boolean = () => false,
+  servedHere: (guildId: string) => boolean = () => false,
 ): Promise<void> {
   const incomingRoot = path.join(DATA_ROOT, INCOMING_DIR);
   let migrations: fs.Dirent[];
@@ -255,6 +355,7 @@ export async function resolveIncomingWithMaster(
     try { await fs.promises.rmdir(migDir); } catch { /* not empty or already gone */ }
     if (finished > 0) console.log(`[Fleet] Resumed commit for migration staging ${mig.name} (master verdict: committing)`);
   }
+  await checkBootLanded(queryMaster, busy, servedHere);
 }
 
 /**

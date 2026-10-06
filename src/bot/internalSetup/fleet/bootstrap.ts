@@ -464,12 +464,19 @@ export async function initFleet(): Promise<FleetContext> {
           if (decision) return decision;
           // Before its commit decision, or no master answered: kept.
           throw new Error('migration status not resolvable now');
-        }, () => migrationWorkActive());
+        }, () => migrationWorkActive(), guildId => {
+          const held = runtime.getHeldSummary();
+          return !!held && held.leases.some(l => l.shardId === guildIdToShardId(guildId, held.shardCount));
+        });
       } catch (error) {
         console.warn('[Fleet] _incoming resolution failed:', error instanceof Error ? error.message : error);
       }
     };
     await resolveIncoming();
+    // A co-worker's first answer comes once it registers.
+    resolveIncomingOnRegister = () => {
+      if (!migrationWorkActive()) void resolveIncoming();
+    };
     // Periodic retry: staging kept at boot (no verdict yet, or a co-worker not
     // yet registered) is asked about again in place, without a reboot.
     // Skipped while migration work is live on this node: the resolver's
@@ -486,6 +493,8 @@ export async function initFleet(): Promise<FleetContext> {
 // Master-side disposition of a migration id for the boot _incoming resolution;
 // null on co-workers and when the coordinator does not know the migration.
 let migrationDispositionOf: (migrationId: string) => MigrationDisposition | null = () => null;
+// The staging resolver, asked again once a co-worker registers.
+let resolveIncomingOnRegister: () => void = () => {};
 // A co-worker's ask of its master for that verdict; null when it is not
 // registered or no verdict comes back.
 let askMasterDisposition: (migrationId: string, stagedTerm: number) => Promise<MigrationDisposition | null> = async () => null;
@@ -4494,7 +4503,10 @@ async function initCoWorker(init: CommonInit, followerHold: FollowerHoldBase | n
       // The mirror copy this node pushed seeded the master it now registers
       // with: spent, so the engine drops it and copies that master next.
       onSeededFrom: info => mirrorEngine?.dropCopyOf(info.sourceNodeId),
-      onRegistered: () => seedSource?.resendFinal(),
+      onRegistered: () => {
+        seedSource?.resendFinal();
+        resolveIncomingOnRegister();
+      },
       onSlotStatus: payload => {
         // Only this node's own slot is recorded, judged by primary_slot_name
         // from the standby itself, and "my source is this master" by the
