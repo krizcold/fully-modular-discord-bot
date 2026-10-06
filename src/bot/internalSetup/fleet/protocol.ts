@@ -812,8 +812,8 @@ export interface XferDispositionRequest {
 export interface XferDispositionReply {
   ok: boolean;
   term: number;
-  /** Null while the migration runs before its commit decision, or before the master loaded its records. */
-  disposition?: { verdict: 'aborted' | 'unknown' } | { verdict: 'committing'; term: number; epoch: number } | null;
+  /** Null while the migration runs before its commit decision, or before the master loaded its records; a committing one names its legs that must not land. */
+  disposition?: { verdict: 'aborted' | 'unknown' } | { verdict: 'committing'; term: number; epoch: number; legs?: Record<string, 'aborted' | 'pending'> } | null;
   reason?: string;
 }
 

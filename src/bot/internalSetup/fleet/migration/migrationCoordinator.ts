@@ -710,22 +710,36 @@ export class MigrationCoordinator {
    * and until recover() loaded readable records (an unknown then would delete
    * staging the recovered record still commits).
    */
-  dispositionOf(migrationId: string): { verdict: 'aborted' | 'unknown' } | { verdict: 'committing'; term: number; epoch: number } | null {
+  dispositionOf(migrationId: string): { verdict: 'aborted' | 'unknown' } | { verdict: 'committing'; term: number; epoch: number; legs?: Record<string, 'aborted' | 'pending'> } | null {
     if (!this.recovered) return null;
     const active = this.parentRecord ?? this.record;
     if (active && active.id === migrationId) {
       if (active.state === 'COMMITTING' || active.state === 'GRANTING') {
-        return { verdict: 'committing', term: active.term, epoch: active.epoch ?? this.hooks.registry.epoch };
+        return { verdict: 'committing', term: active.term, epoch: active.epoch ?? this.hooks.registry.epoch, ...this.legsNotLanding(active) };
       }
       if (active.state === 'ABORTING' || active.state === 'ABORTED') return { verdict: 'aborted' };
       return null; // still live pre-commit; the abort/commit broadcast resolves it
     }
     if (this.history.some(h => h.id === migrationId)) {
       const h = this.history.find(r => r.id === migrationId)!;
-      if (h.state === 'DONE') return { verdict: 'committing', term: h.term, epoch: h.epoch ?? this.hooks.registry.epoch };
+      if (h.state === 'DONE') return { verdict: 'committing', term: h.term, epoch: h.epoch ?? this.hooks.registry.epoch, ...this.legsNotLanding(h) };
       return { verdict: 'aborted' };
     }
     return { verdict: 'unknown' };
+  }
+
+  // A committing verdict speaks for the migration: a leg of it that did not
+  // reach its own commit is named. An aborted one (a retire slice whose abort
+  // may still be owed to its target) or one into a node Declared Lost (its
+  // shard freed) must never land; one before its decision is kept.
+  private legsNotLanding(rec: MigrationRecord): { legs?: Record<string, 'aborted' | 'pending'> } {
+    const legs: Record<string, 'aborted' | 'pending'> = {};
+    for (const leg of rec.legs) {
+      const state = leg.legState ?? (rec.kind === 'retire' ? 'PREPARING' : rec.state);
+      if (state === 'ABORTED' || state === 'ABORTING' || leg.targetLostAt !== undefined) legs[leg.legId] = 'aborted';
+      else if (state !== 'COMMITTING' && state !== 'GRANTING' && state !== 'DONE') legs[leg.legId] = 'pending';
+    }
+    return Object.keys(legs).length > 0 ? { legs } : {};
   }
 
   /** Why no migration, transformation, reshard Resume, transfer, Declare Lost, Assign or Drain may run and no free shard is placed, while the records cannot be read or are still being read; null otherwise. */

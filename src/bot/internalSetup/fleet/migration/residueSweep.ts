@@ -146,7 +146,7 @@ async function disposeIncoming(): Promise<void> {
 /** How the master answers a node's boot query about a migration it still stages. */
 export type MigrationDisposition =
   | { verdict: 'aborted' | 'unknown' }
-  | { verdict: 'committing'; term: number; epoch: number };
+  | { verdict: 'committing'; term: number; epoch: number; legs?: Record<string, 'aborted' | 'pending'> };
 
 /**
  * The verdict in a master's answer to a co-worker's ask; null (the staging is
@@ -160,7 +160,11 @@ export function dispositionFromReply(reply: any, stagedTerm = 0): MigrationDispo
     return Number(reply.term) >= stagedTerm ? { verdict: disposition.verdict } : null;
   }
   if (disposition?.verdict === 'committing' && Number.isInteger(disposition.term) && Number.isInteger(disposition.epoch)) {
-    return { verdict: 'committing', term: disposition.term, epoch: disposition.epoch };
+    const legs: Record<string, 'aborted' | 'pending'> = {};
+    for (const [legId, own] of Object.entries(disposition.legs && typeof disposition.legs === 'object' ? disposition.legs : {})) {
+      if (own === 'aborted' || own === 'pending') legs[legId] = own;
+    }
+    return { verdict: 'committing', term: disposition.term, epoch: disposition.epoch, ...(Object.keys(legs).length > 0 ? { legs } : {}) };
   }
   return null;
 }
@@ -171,7 +175,8 @@ export function dispositionFromReply(reply: any, stagedTerm = 0): MigrationDispo
  * migration/leg the master is queried after register:
  *   - aborted/unknown -> delete the staging (safe: the master no longer wants it).
  *   - committing -> finish the renames from the intact staging (the master
- *     decided commit; the target's data is the product).
+ *     decided commit; the target's data is the product), but for the legs
+ *     it names: an aborted one is deleted, one before its own decision kept.
  *   - no verdict (query rejects: no master answers, or the migration runs
  *     before its commit decision) -> keep it and ask again on the next pass.
  *     Never deleted on a timer: a master waiting in COMMITTING on this node
@@ -226,10 +231,23 @@ export async function resolveIncomingWithMaster(
       console.log(`[Fleet] Deleted migration staging ${mig.name} (master verdict: ${disposition.verdict})`);
       continue;
     }
-    // committing: finish each leg's renames from its intact staging.
+    // committing: finish each leg's renames from its intact staging. A leg
+    // the verdict names did not reach its own commit: an aborted one (a
+    // retire slice whose abort is still owed here) goes, one before its
+    // decision is kept.
     let finished = 0;
     for (const leg of legs) {
       if (!leg.isDirectory()) continue;
+      const own = disposition.legs?.[leg.name];
+      if (own === 'pending') continue;
+      if (own === 'aborted') {
+        if (busy()) continue;
+        const doomed = path.join(incomingRoot, `${DELETING_PREFIX}${mig.name}-${leg.name}`);
+        try { fs.renameSync(path.join(migDir, leg.name), doomed); } catch { continue; }
+        try { await fs.promises.rm(doomed, { recursive: true, force: true }); } catch { /* best effort; the next pass finishes it */ }
+        console.log(`[Fleet] Deleted migration staging ${mig.name}/${leg.name} (master verdict: that leg aborted)`);
+        continue;
+      }
       if (await commitFromStaging(mig.name, leg.name, disposition.term, disposition.epoch)) finished += 1;
     }
     // Reap the migration dir when nothing is left (a DONE migration keeps the
