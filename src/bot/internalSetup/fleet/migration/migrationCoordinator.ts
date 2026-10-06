@@ -541,7 +541,8 @@ export class MigrationCoordinator {
     // A commit round waiting on this node goes on without it.
     if (this.record?.state === 'COMMITTING') this.runCommitRound();
     for (const leg of released) {
-      console.warn(`[Migration] Shard ${leg.shardId}: the guilds the redistribute was placing on ${lostNodeName} stay on ${this.hooks.registry.nodes?.get(leg.sourceNodeId)?.nodeName ?? leg.sourceNodeId}, released as it ends; run Redistribute again before Resume to place them`);
+      const holder = this.hooks.registry.nodes?.get(leg.sourceNodeId)?.nodeName ?? leg.sourceNodeId;
+      console.warn(`[Migration] Shard ${leg.shardId}: the guilds the redistribute was placing on ${lostNodeName} stay on ${holder}, released as it ends; ${paused ? 'run Redistribute again before Resume to place them' : `the shard is placed as any free shard once released (Declare ${holder} Lost if it never returns), those guilds starting fresh unless it lands on ${holder}`}`);
     }
     for (const { leg, nodeId } of kept) {
       console.warn(`[Migration] Shard ${leg.shardId}: ${this.hooks.registry.nodes?.get(nodeId)?.nodeName ?? nodeId} keeps its copy of guilds the redistribute moved, as new as the one lost with ${lostNodeName} (nothing has served in the reshard pause), released; run Redistribute again before Resume to place them`);

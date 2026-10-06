@@ -48,6 +48,9 @@ export interface PinOutcome {
   lostShards: number[];
   /** Those of them with an older copy a node still owes the cleanup of, held for the operator's choice. */
   heldShards: number[];
+  /** Those of them a redistribute was placing there, not held: the nodes it was moving their guilds from keep them (released), named in releasedOn. */
+  releasedShards: number[];
+  releasedOn: string[];
   /** The old master's reshard pause went on here. */
   pauseCarried: boolean;
   /** Its redistribute proposal went on here, with the pause or alone (a Resume's grants still landing). */
@@ -248,7 +251,7 @@ export function copyRecordsRefusal(): string | null {
  * shard on this node (resumed, a leg from this node to itself could never
  * pass its precheck).
  */
-function adoptRecords(body: string, planText: string, plan: PersistedPlan, selfNodeId: string, sourceNodeId: string | null, sourceName: string): { records: PersistedMigrations; lost: Set<number>; keep: Set<number>; held: number[] } {
+function adoptRecords(body: string, planText: string, plan: PersistedPlan, selfNodeId: string, sourceNodeId: string | null, sourceName: string): { records: PersistedMigrations; lost: Set<number>; keep: Set<number>; held: number[]; released: { shardId: number; nodeId: string }[] } {
   let parsed: (Partial<PersistedMigrations> & { planSha256?: unknown }) | null;
   try {
     parsed = JSON.parse(body) as (Partial<PersistedMigrations> & { planSha256?: unknown }) | null;
@@ -334,6 +337,7 @@ function adoptRecords(body: string, planText: string, plan: PersistedPlan, selfN
     active = null;
   }
   const held = new Set<number>();
+  const released: { shardId: number; nodeId: string }[] = [];
   for (const rec of records) {
     if (rec.shardCount !== undefined && rec.shardCount !== plan.shardCount) continue;
     for (const entry of rec.pendingSourceCleanup ?? []) {
@@ -341,13 +345,16 @@ function adoptRecords(body: string, planText: string, plan: PersistedPlan, selfN
         const leg = rec.legs.find(l => l.legId === legId);
         if (!leg || !lost.has(leg.shardId) || leg.direction === 'none' || leg.sourceLostAt !== undefined) continue;
         // A redistribute's leg into the old master is released instead.
-        if (rec.kind === 'redistribute' && leg.targetLostAt !== undefined) continue;
+        if (rec.kind === 'redistribute' && leg.targetLostAt !== undefined) {
+          released.push({ shardId: leg.shardId, nodeId: entry.nodeId });
+          continue;
+        }
         if (!leg.heldForChoice) leg.heldForChoice = { lostNodeName: sourceName, at };
         held.add(leg.shardId);
       }
     }
   }
-  return { records: { active, history, updatedAt: at }, lost, keep, held: [...held].sort((a, b) => a - b) };
+  return { records: { active, history, updatedAt: at }, lost, keep, held: [...held].sort((a, b) => a - b), released };
 }
 
 /**
@@ -369,7 +376,8 @@ export async function pinPlacement(selfNodeId: string, sourceNodeId: string | nu
     throw new Error('the copy carries no usable placement documents (leases.json, fleet-config.json), so the plan cannot be pinned; the Backup copy line says whether the copy was complete');
   }
   const recordsBody = carryRecords ? readMirrorText('migrations.json') : null;
-  const sourceName = (registry && Array.isArray(registry.nodes) ? registry.nodes.find(n => n?.nodeId === sourceNodeId)?.nodeName : undefined) ?? sourceNodeId?.slice(0, 8) ?? 'the old master';
+  const listedName = (nodeId: string | null): string | undefined => (registry && Array.isArray(registry.nodes) ? registry.nodes.find(n => n?.nodeId === nodeId)?.nodeName : undefined);
+  const sourceName = listedName(sourceNodeId) ?? sourceNodeId?.slice(0, 8) ?? 'the old master';
   const carried = recordsBody === null ? null : adoptRecords(recordsBody, readMirrorText('leases.json') ?? '', plan, selfNodeId, sourceNodeId, sourceName);
   const lost = carried?.lost ?? new Set<number>();
   // The old master's reshard pause goes on here, and its redistribute
@@ -437,7 +445,13 @@ export async function pinPlacement(selfNodeId: string, sourceNodeId: string | nu
     }
     atomicWriteFileSync(fleetFile('redistribute-proposal.json'), JSON.stringify({ proposal, updatedAt: Date.now() }, null, 2));
   }
-  return { movedShards, removed, recordsCarried: carried !== null, lostShards: [...lost].sort((a, b) => a - b), heldShards: carried?.held ?? [], pauseCarried: marker !== null, proposalCarried: stored !== null, proposalUnreadable };
+  const released = (carried?.released ?? []).filter(r => !(carried?.held ?? []).includes(r.shardId));
+  return {
+    movedShards, removed, recordsCarried: carried !== null, lostShards: [...lost].sort((a, b) => a - b), heldShards: carried?.held ?? [],
+    releasedShards: [...new Set(released.map(r => r.shardId))].sort((a, b) => a - b),
+    releasedOn: [...new Set(released.map(r => listedName(r.nodeId) ?? r.nodeId.slice(0, 8)))],
+    pauseCarried: marker !== null, proposalCarried: stored !== null, proposalUnreadable,
+  };
 }
 
 /** A redistribute proposal's text as one; null when it does not parse to one. */
@@ -465,9 +479,14 @@ export function pinRecordsText(outcome: PinOutcome): string {
   const held = outcome.heldShards.length > 0 ? `; shard(s) [${outcome.heldShards.join(', ')}] wait on the operator's choice on the Fleet tab (restore an older surviving copy or start empty)` : '';
   const lost = outcome.lostShards.length > 0 ? `; shard(s) [${outcome.lostShards.join(', ')}] were moving onto the old master, whose copy of them went with it${held}` : '';
   const placeAgain = outcome.lostShards.filter(id => !outcome.heldShards.includes(id));
+  // Outside a pause no Redistribute places them again.
+  const holders = outcome.releasedOn.join(' and ');
+  const released = outcome.releasedShards.length > 0
+    ? `; shard(s) [${outcome.releasedShards.join(', ')}] are placed as any free shard once ${holders} release${outcome.releasedOn.length === 1 ? 's' : ''} them (Declare a node that never returns Lost), and the guilds the redistribute was moving there start fresh unless the shard lands on this node, whose copy of the old master's data may hold them; their last data otherwise stays with ${holders} (released, unless already cleaned)`
+    : '';
   const landing = (outcome.proposalCarried ? '; the last Resume\'s redistribute proposal carried over: its shards not yet granted land on the nodes holding their data as each registers' : '')
     + (outcome.proposalUnreadable ? '; the last Resume\'s redistribute proposal could not be read: its shards not yet granted are placed as any free shard' : '');
-  const pause = !outcome.pauseCarried ? landing
+  const pause = !outcome.pauseCarried ? released + landing
     : `; the reshard pause carried over${outcome.proposalCarried ? ', Resume granting its redistribute proposal' : ''}`
       + (outcome.proposalUnreadable ? '; its redistribute proposal could not be read: run Redistribute again before Resume' : '')
       + (placeAgain.length > 0 ? `; run Redistribute again before Resume to place shard(s) [${placeAgain.join(', ')}]` : '');
