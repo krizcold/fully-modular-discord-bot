@@ -251,7 +251,7 @@ export function copyRecordsRefusal(): string | null {
  * shard on this node (resumed, a leg from this node to itself could never
  * pass its precheck).
  */
-function adoptRecords(body: string, planText: string, plan: PersistedPlan, selfNodeId: string, sourceNodeId: string | null, sourceName: string): { records: PersistedMigrations; lost: Set<number>; keep: Set<number>; held: number[]; released: { shardId: number; nodeId: string }[] } {
+function adoptRecords(body: string, planText: string, plan: PersistedPlan, selfNodeId: string, sourceNodeId: string | null, sourceName: string, adoptedHere: (guildId: string) => boolean): { records: PersistedMigrations; lost: Set<number>; keep: Set<number>; held: number[]; released: { shardId: number; nodeId: string }[] } {
   let parsed: (Partial<PersistedMigrations> & { planSha256?: unknown }) | null;
   try {
     parsed = JSON.parse(body) as (Partial<PersistedMigrations> & { planSha256?: unknown }) | null;
@@ -302,9 +302,16 @@ function adoptRecords(body: string, planText: string, plan: PersistedPlan, selfN
             // released), which lifts its drain's freeze.
             if (state === 'COMMITTING' && leg.direction !== 'none') {
               const notes = rec.pendingSourceCleanup ?? (rec.pendingSourceCleanup = []);
-              let entry = notes.find(e => e.nodeId === leg.sourceNodeId);
-              if (!entry) notes.push(entry = { nodeId: leg.sourceNodeId, legIds: [] });
-              if (!entry.legIds.includes(leg.legId)) entry.legIds.push(leg.legId);
+              const owe = (nodeId: string): void => {
+                let entry = notes.find(e => e.nodeId === nodeId);
+                if (!entry) notes.push(entry = { nodeId, legIds: [] });
+                if (!entry.legIds.includes(leg.legId)) entry.legIds.push(leg.legId);
+              };
+              owe(leg.sourceNodeId);
+              // What the old master's commit had landed came with the copy
+              // adopted here: when every guild of the leg did, the choice
+              // offers this node's copy too.
+              if (rec.kind !== 'redistribute' && leg.guilds.length > 0 && leg.guilds.every(adoptedHere)) owe(selfNodeId);
             }
           } else if (leg.sourceNodeId !== selfNodeId || granted) leg.targetNodeId = selfNodeId;
         }
@@ -378,7 +385,10 @@ export async function pinPlacement(selfNodeId: string, sourceNodeId: string | nu
   const recordsBody = carryRecords ? readMirrorText('migrations.json') : null;
   const listedName = (nodeId: string | null): string | undefined => (registry && Array.isArray(registry.nodes) ? registry.nodes.find(n => n?.nodeId === nodeId)?.nodeName : undefined);
   const sourceName = listedName(sourceNodeId) ?? sourceNodeId?.slice(0, 8) ?? 'the old master';
-  const carried = recordsBody === null ? null : adoptRecords(recordsBody, readMirrorText('leases.json') ?? '', plan, selfNodeId, sourceNodeId, sourceName);
+  // The guilds the adopt brought here (its marker stays until finishAdopt).
+  const adopted = new Set(readAdoptMarker()?.guilds ?? []);
+  const adoptedHere = (guildId: string): boolean => adopted.has(guildId) && fs.existsSync(dataPath(guildId));
+  const carried = recordsBody === null ? null : adoptRecords(recordsBody, readMirrorText('leases.json') ?? '', plan, selfNodeId, sourceNodeId, sourceName, adoptedHere);
   const lost = carried?.lost ?? new Set<number>();
   // The old master's reshard pause goes on here, and its redistribute
   // proposal with the pause or alone (a Resume's grants still landing, which
@@ -476,7 +486,7 @@ function readPauseMarker(): string | null {
 /** What the pin did with the migration records, for the lane's log line. */
 export function pinRecordsText(outcome: PinOutcome): string {
   if (!outcome.recordsCarried) return '';
-  const held = outcome.heldShards.length > 0 ? `; shard(s) [${outcome.heldShards.join(', ')}] wait on the operator's choice on the Fleet tab (restore an older surviving copy or start empty)` : '';
+  const held = outcome.heldShards.length > 0 ? `; shard(s) [${outcome.heldShards.join(', ')}] wait on the operator's choice on the Fleet tab (restore a surviving copy or start empty)` : '';
   const lost = outcome.lostShards.length > 0 ? `; shard(s) [${outcome.lostShards.join(', ')}] were moving onto the old master, whose copy of them went with it${held}` : '';
   const placeAgain = outcome.lostShards.filter(id => !outcome.heldShards.includes(id));
   // Outside a pause no Redistribute places them again.
