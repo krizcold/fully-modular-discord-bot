@@ -18,7 +18,7 @@ import {
   listGuildDataKeys,
   readGuildDocRaw,
   restoreGuildFromGraveyard,
-  saveData,
+  saveDataOutcome,
 } from './dataManager';
 import { DataBackendUnavailableError, getWorkingSet } from './dataBackends/workingSet';
 import { awaitGuildDataReady } from './dataBackends/boot';
@@ -140,11 +140,9 @@ export async function applyOperatorDataWrite(req: GuildDataWriteRequest): Promis
       } catch {
         return { ok: false, code: 'invalid', error: 'contentJson is not valid JSON' };
       }
-      if (!saveData(filename, options, parsed)) {
-        // The facade already surfaced the reason (frozen counts, not-ready);
-        // the operator-visible truth is that the write was not accepted.
-        return { ok: false, code: 'backend-unavailable', error: 'write not accepted' };
-      }
+      const saved = saveDataOutcome(filename, options, parsed);
+      if (saved === 'frozen') return { ok: false, code: 'frozen' };
+      if (saved === 'refused') return { ok: false, code: 'backend-unavailable', error: 'write not accepted' };
     }
   } catch (error) {
     if (error instanceof DataBackendUnavailableError) {

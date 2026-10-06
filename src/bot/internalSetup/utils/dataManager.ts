@@ -476,26 +476,31 @@ export function saveData<T = any>(
   options: DataOptions,
   data: T
 ): boolean {
+  return saveDataOutcome(filename, options, data) === 'saved';
+}
+
+/** A save that says whether it was accepted, met a frozen guild, or was refused (a set not ready, an I/O error). */
+export function saveDataOutcome<T = any>(filename: string, options: DataOptions, data: T): 'saved' | 'frozen' | 'refused' {
   try {
     if (isGuildFrozen(options)) {
       frozenWriteRejections += 1;
-      return false;
+      return 'frozen';
     }
     const wsGuild = wsRouted(options);
     if (wsGuild !== null) {
       const ws = getWorkingSet();
       if (!ws) {
         console.warn(`[Data] Write for postgres-routed guild ${wsGuild} outside the bot process; refused`);
-        return false;
+        return 'refused';
       }
       const content = JSON.stringify(data, null, 2);
       const result = ws.save(wsGuild, options.category ?? '', filename, content);
       if (result === 'accepted') {
         getMetricsCollector().recordIO('write', options.guildId ?? null, options.category ?? null);
-        return true;
+        return 'saved';
       }
-      if (result === 'frozen-window') { frozenWriteRejections += 1; return false; }
-      if (result === 'not-ready') return false;
+      if (result === 'frozen-window') { frozenWriteRejections += 1; return 'frozen'; }
+      if (result === 'not-ready') return 'refused';
       throw new DataBackendUnavailableError(result === 'fenced' ? 'guild-fenced' : result === 'read-only' ? 'database-read-only' : 'database-unreachable');
     }
     const dir = getDataDirectory(options);
@@ -512,11 +517,11 @@ export function saveData<T = any>(
     getMetricsCollector().recordIO('write', scope === 'global' ? null : options.guildId ?? null, options.category ?? null);
 
     console.log(`[DataManager] Saved ${filename} to ${filePath}`);
-    return true;
+    return 'saved';
   } catch (error) {
     if (error instanceof DataBackendUnavailableError) throw error;
     console.error(`[DataManager] Error saving ${filename}:`, error);
-    return false;
+    return 'refused';
   }
 }
 
