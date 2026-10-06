@@ -44,6 +44,7 @@ import type { Registry } from '../registry';
 import type { HeldShardView, MigrationActiveView, MigrationLegView, MigrationView } from '../state';
 
 const STUCK_WAY_ON = 'their data dirs on that node cannot be renamed: check the dirs\' owner and permissions and anything holding them open';
+const REDISTRIBUTE_STARTING = 'a Redistribute is already starting; try again once it has finished';
 
 export interface StartMovePayload { kind: 'move'; shardId: number; toNodeId: string; }
 export interface StartSwapLeg { shardId: number; fromNodeId: string; toNodeId: string; }
@@ -1970,11 +1971,27 @@ export class MigrationCoordinator {
     const assembling = this.assemblingError();
     if (assembling) return { ok: false, error: assembling };
     if (this.hasActive()) return { ok: false, error: 'migration-in-progress' };
+    // Its proposal would replace the one a start is planning with.
+    if (this.redistributeStarting) return { ok: false, error: REDISTRIBUTE_STARTING };
     const { moveSet, unreachable, totalBytes } = await this.computeRedistribute();
     return { ok: true, moveSet, unreachable, estBytes: totalBytes, warnings: this.proposalWarnings(unreachable) };
   }
 
+  private redistributeStarting = false;
+
+  // Its record is made after the inventories' awaits, which a second start
+  // would pass too (no record runs yet), its record replacing this one's.
   private async startRedistribute(): Promise<{ ok: boolean; error?: string; migrationId?: string }> {
+    if (this.redistributeStarting) return { ok: false, error: REDISTRIBUTE_STARTING };
+    this.redistributeStarting = true;
+    try {
+      return await this.beginRedistribute();
+    } finally {
+      this.redistributeStarting = false;
+    }
+  }
+
+  private async beginRedistribute(): Promise<{ ok: boolean; error?: string; migrationId?: string }> {
     if (!this.hooks.isPaused()) return { ok: false, error: 'redistribute runs only during the reshard pause' };
     const assembling = this.assemblingError();
     if (assembling) return { ok: false, error: assembling };
