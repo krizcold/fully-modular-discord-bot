@@ -2419,6 +2419,7 @@ export class MigrationCoordinator {
         legs,
         term: this.record!.term,
         epoch: this.hooks.registry.epoch,
+        shardCount: this.record!.shardCount ?? this.hooks.registry.shardCount,
       };
       try {
         const ack = await this.withTimeout(this.hooks.sendControl(nodeId, MSG.XFER_PREPARE, payload), XFER_PREPARE_TIMEOUT_MS);

@@ -704,6 +704,8 @@ export interface XferPreparePayload {
   legs: XferPrepareLeg[];
   term: number;
   epoch: number;
+  /** The count the legs' shard ids are numbered under. */
+  shardCount?: number;
 }
 
 export interface XferPreparedPayload {

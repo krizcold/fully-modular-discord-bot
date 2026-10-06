@@ -238,8 +238,12 @@ export class DataReadinessDriver {
       if (outcome === 'ready') {
         // Its lease moved while it hydrated: a re-grant renews the fence, a
         // revoke keeps it frozen, never served unleased.
-        if (this.isLeasedHere(guildId)) this.ws.refreshFence(guildId, this.fenceFor(guildId));
-        else await this.ws.unloadToFrozenRetained(guildId, () => !this.isLeasedHere(guildId));
+        if (this.isLeasedHere(guildId)) {
+          // A drain froze it under the grant before (its move aborted and
+          // the shard is granted here again): hydrated again, it serves.
+          if (this.ws.frozenBefore(guildId, this.fenceFor(guildId))) continue;
+          this.ws.refreshFence(guildId, this.fenceFor(guildId));
+        } else await this.ws.unloadToFrozenRetained(guildId, () => !this.isLeasedHere(guildId));
         return;
       }
       if (outcome === 'deposed') {

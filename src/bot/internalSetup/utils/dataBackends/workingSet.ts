@@ -64,6 +64,8 @@ class GuildWorkingSet {
   requeue = false;
   fencedDrainTimer: NodeJS.Timeout | null = null;
   readyWaiters: Array<() => void> = [];
+  // A drain froze it while it hydrated: it comes up frozen-retained.
+  freezeWhenReady = false;
 
   constructor(readonly guildId: string, public fence: FenceToken) {}
 
@@ -242,6 +244,11 @@ export class WorkingSetManager {
     return this.sets.get(guildId)?.state ?? null;
   }
 
+  /** Every guild with a working set here, in any state. */
+  guildIds(): string[] {
+    return [...this.sets.keys()];
+  }
+
   readyGuilds(): string[] {
     return [...this.sets.values()]
       .filter(ws => ws.state === 'ready' || ws.state === 'frozen-retained')
@@ -293,6 +300,8 @@ export class WorkingSetManager {
       ws = new GuildWorkingSet(guildId, token);
       this.sets.set(guildId, ws);
     }
+    // A new grant serves it, whatever froze it under the one before.
+    if (ws.fence.term !== token.term || ws.fence.epoch !== token.epoch) ws.freezeWhenReady = false;
     ws.fence = token;
     const outcome = await this.backend.hydrateGuild(guildId, token);
     if (!outcome.ok) {
@@ -309,7 +318,7 @@ export class WorkingSetManager {
     for (const key of outcome.appendKeys) {
       ws.appendKeys.add(docKeyOf(key.module, key.filename));
     }
-    ws.state = 'ready';
+    ws.state = ws.freezeWhenReady ? 'frozen-retained' : 'ready';
     this.pruneAdoptions();
     const adoption = this.adoptions.get(guildId);
     if (adoption) {
@@ -343,10 +352,17 @@ export class WorkingSetManager {
     if (ws.state === 'ready' && stillGone()) ws.state = 'frozen-retained';
   }
 
+  /** Frozen under an older grant than the token's: a hydrate under the token serves it again. */
+  frozenBefore(guildId: string, token: FenceToken): boolean {
+    const ws = this.sets.get(guildId);
+    return ws?.state === 'frozen-retained' && (ws.fence.term !== token.term || ws.fence.epoch !== token.epoch);
+  }
+
   /** Refuse the guild's writes from now on, as its lease's unload leaves it; a re-grant serves it again. */
   freezeRetained(guildId: string): void {
     const ws = this.sets.get(guildId);
     if (ws?.state === 'ready') ws.state = 'frozen-retained';
+    else if (ws?.state === 'hydrating') ws.freezeWhenReady = true;
   }
 
   evict(guildId: string): void {

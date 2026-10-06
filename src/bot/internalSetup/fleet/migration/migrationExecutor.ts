@@ -24,6 +24,7 @@ import {
 import { hashLeg } from '../../utils/dataInterchange';
 import { routeFor } from '../../utils/dataBackends/routeResolver';
 import { getWorkingSet } from '../../utils/dataBackends/workingSet';
+import { guildIdToShardId } from '../placement';
 import { TRANSFER_PORT_DEFAULT, TRANSFER_TOKEN_TTL_MS, XFER_MAX_ROUNDS, XFER_DELTA_THRESHOLD_FILES, XFER_DIAL_RETRY_MS, XFER_DIAL_RETRY_WINDOW_MS } from '../constants';
 import {
   MSG,
@@ -64,6 +65,8 @@ interface LegRuntime {
   migrationId: string;
   legId: string;
   shardId: number;
+  /** The count shardId is numbered under, when the prepare carried it. */
+  shardCount?: number;
   role: 'source' | 'target';
   guilds: string[];
   direction: TransferDirection;
@@ -172,6 +175,7 @@ export class MigrationExecutor {
           migrationId: payload.migrationId,
           legId: legInfo.legId,
           shardId: legInfo.shardId,
+          ...(Number.isInteger(payload.shardCount) && payload.shardCount! > 0 ? { shardCount: payload.shardCount } : {}),
           role: legInfo.role,
           guilds: legInfo.guilds,
           direction: legInfo.direction,
@@ -380,13 +384,14 @@ export class MigrationExecutor {
     let flushFailures = 0;
     let reason: string | undefined;
     if (ws) {
-      for (const g of leg.guilds) ws.freezeRetained(g);
-      const outcomes = await Promise.all(leg.guilds.map(g => ws.flushGuildNow(g, LEASE_ONLY_FLUSH_MS)));
+      const guilds = this.leaseOnlyGuilds(leg);
+      for (const g of guilds) ws.freezeRetained(g);
+      const outcomes = await Promise.all(guilds.map(g => ws.flushGuildNow(g, LEASE_ONLY_FLUSH_MS)));
       outcomes.forEach((outcome, i) => {
         if (outcome === 'ok') return;
         if (outcome === 'pending') pendingOps += 1;
         else flushFailures += 1;
-        if (!reason) reason = `guild ${leg.guilds[i]}: ${outcome}`;
+        if (!reason) reason = `guild ${guilds[i]}: ${outcome}`;
       });
     }
     leg.finalHashDone = true;
@@ -400,6 +405,22 @@ export class MigrationExecutor {
       ...(reason ? { reason } : {}),
     };
     this.hooks.sendToMaster(MSG.XFER_FLUSHED, payload);
+  }
+
+  // The leg's guilds and every working set of its shard here: the master's
+  // list misses a guild it has not seen yet.
+  private leaseOnlyGuilds(leg: LegRuntime): string[] {
+    const guilds = new Set(leg.guilds);
+    const ws = getWorkingSet();
+    if (ws && leg.shardCount !== undefined) {
+      for (const guildId of ws.guildIds()) {
+        // A deposed or failed set holds nothing this node may confirm.
+        const state = ws.stateOf(guildId);
+        if (state !== 'ready' && state !== 'frozen-retained' && state !== 'hydrating') continue;
+        if (guildIdToShardId(guildId, leg.shardCount) === leg.shardId) guilds.add(guildId);
+      }
+    }
+    return [...guilds];
   }
 
   private async finishDrain(leg: LegRuntime): Promise<void> {
@@ -485,7 +506,7 @@ export class MigrationExecutor {
           // its frozen-retained working sets.
           if (leg.role === 'source') {
             const ws = getWorkingSet();
-            for (const guildId of leg.guilds) ws?.evict(guildId);
+            for (const guildId of this.leaseOnlyGuilds(leg)) ws?.evict(guildId);
           }
         } else if (leg.role === 'target') await this.commitTarget(leg, payload.term, payload.epoch);
         else {
