@@ -30,7 +30,7 @@ import {
 } from './constants';
 import { ControlServer } from './controlServer';
 import type { PersistedFleetConfig, PersistedTerm } from './controlStore';
-import { adoptMirror, clearAdoptMarker, finishAdopt, pinPlacement, pinRecordsText, seedTerm } from './fileFailover';
+import { adoptMirror, clearAdoptMarker, finishAdopt, pinPlacement, pinRecordsText, recordsFault, seedTerm } from './fileFailover';
 import { atomicWriteFileSync, renameWithRetry } from './fileControlStore';
 import { readHolderSighting } from './holderSighting';
 import { incomingLegDir, TransferReceiver, TransferServer } from './migration/transferChannel';
@@ -427,6 +427,20 @@ function sanitizeOffer(raw: unknown): SeedOffer | null {
   };
 }
 
+/**
+ * Why an offer's migration records cannot be carried over, judged as the
+ * backup judges its copy before offering it: one on a build without that
+ * judgement would leave the pin refusing them after the adopt, which
+ * cannot be undone. Null when they can or the copy has none.
+ */
+export function offerRecordsRefusal(offer: SeedOffer): string | null {
+  const body = offer.documents['migrations.json'];
+  const fault = body === undefined ? null : recordsFault(body, offer.documents['leases.json'] ?? '');
+  if (fault === null) return null;
+  const what = fault === 'parse' ? 'do not parse' : fault === 'together' ? 'do not hold together' : 'were listed with another plan than its leases.json';
+  return `the migration records of its copy (migrations.json) ${what}, so ${offer.sourceNodeName}'s holds, owed cleanups and running migration cannot be carried over; update it to this master's build, which judges its copy before offering it`;
+}
+
 export interface SeedConfirmResult {
   success: boolean;
   needsConfirm?: boolean;
@@ -585,8 +599,9 @@ class SeedHoldRuntime {
     try {
       const reply = await this.server.request(nodeId, MSG.SEED_OFFER, { term: this.serverTerm }, SEED_OFFER_TIMEOUT_MS) as SeedOfferReply;
       const offer = reply && reply.ok !== false ? sanitizeOffer(reply.offer) : null;
-      entry.offer = offer;
-      entry.offerReason = offer ? null : typeof reply?.reason === 'string' ? reply.reason : reply?.offer ? 'its offer was malformed' : 'no copy offered';
+      const unfit = offer ? offerRecordsRefusal(offer) : null;
+      entry.offer = unfit === null ? offer : null;
+      entry.offerReason = unfit ?? (offer ? null : typeof reply?.reason === 'string' ? reply.reason : reply?.offer ? 'its offer was malformed' : 'no copy offered');
     } catch (error) {
       entry.offer = null;
       entry.offerReason = `its offer could not be read: ${error instanceof Error ? error.message : error}`;

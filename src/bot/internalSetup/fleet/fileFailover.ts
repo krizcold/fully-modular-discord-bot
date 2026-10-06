@@ -205,19 +205,28 @@ export function recordsOfAnotherPlan(records: { planSha256?: unknown } | null, p
   return typeof records?.planSha256 === 'string' && records.planSha256 !== planFingerprint(planText);
 }
 
+/** What keeps migration records from being carried over by an adopt: they do not parse, do not hold together, or were listed with another plan than the leases.json beside them; null when they can. */
+export function recordsFault(body: string, planText: string): 'parse' | 'together' | 'torn' | null {
+  let records: { planSha256?: unknown } | null = null;
+  try {
+    records = JSON.parse(body) as { planSha256?: unknown } | null;
+  } catch { /* judged below */ }
+  if (records === null || typeof records !== 'object') return 'parse';
+  if (!migrationsHoldTogether(records as PersistedMigrations)) return 'together';
+  if (recordsOfAnotherPlan(records, planText)) return 'torn';
+  return null;
+}
+
 /** Why the copy's migration records cannot be carried over, judged before the adopt (which cannot be undone); null when they can or the copy has none. */
 export function copyRecordsRefusal(): string | null {
   const body = readMirrorText('migrations.json');
   if (body === null) return null;
   const name = readMirrorManifest()?.sourceNodeName ?? 'the master';
   const after = `so ${name}'s holds, owed cleanups and running migration cannot be carried over; the copy is whole again after a complete pass while ${name} serves`;
-  let records: { planSha256?: unknown } | null = null;
-  try {
-    records = JSON.parse(body) as { planSha256?: unknown } | null;
-  } catch { /* judged below */ }
-  if (records === null || typeof records !== 'object') return `this node's copy of ${name}'s migration records (migrations.json) does not parse, ${after}`;
-  if (!migrationsHoldTogether(records as PersistedMigrations)) return `this node's copy of ${name}'s migration records (migrations.json) does not hold together, ${after}`;
-  if (recordsOfAnotherPlan(records, readMirrorText('leases.json') ?? '')) return `this node's copy of ${name}'s documents is torn across two passes (its migration records were listed with another plan than its leases.json), ${after}`;
+  const fault = recordsFault(body, readMirrorText('leases.json') ?? '');
+  if (fault === 'parse') return `this node's copy of ${name}'s migration records (migrations.json) does not parse, ${after}`;
+  if (fault === 'together') return `this node's copy of ${name}'s migration records (migrations.json) does not hold together, ${after}`;
+  if (fault === 'torn') return `this node's copy of ${name}'s documents is torn across two passes (its migration records were listed with another plan than its leases.json), ${after}`;
   return null;
 }
 
