@@ -583,29 +583,34 @@ export function dataExists(filename: string, options: DataOptions): boolean {
  * Delete data file
  */
 export function deleteData(filename: string, options: DataOptions): boolean {
+  return deleteDataOutcome(filename, options) === 'deleted';
+}
+
+/** A delete that says whether it was done, found nothing to delete, met a frozen guild, or was refused (a set not ready, an I/O error). */
+export function deleteDataOutcome(filename: string, options: DataOptions): 'deleted' | 'absent' | 'frozen' | 'refused' {
   try {
     if (isGuildFrozen(options)) {
       frozenWriteRejections += 1;
-      return false;
+      return 'frozen';
     }
     const wsGuild = wsRouted(options);
     if (wsGuild !== null) {
       const ws = getWorkingSet();
       if (!ws) {
         console.warn(`[Data] Delete for postgres-routed guild ${wsGuild} outside the bot process; refused`);
-        return false;
+        return 'refused';
       }
       const result = ws.delete(wsGuild, options.category ?? '', filename);
       if (result === 'absent') {
         console.log(`[DataManager] File not found for deletion: ${wsGuild}/${options.category ?? ''}/${filename}`);
-        return false;
+        return 'absent';
       }
       if (result === 'accepted') {
         console.log(`[DataManager] Deleted ${wsGuild}/${options.category ?? ''}/${filename}`);
-        return true;
+        return 'deleted';
       }
-      if (result === 'frozen-window') { frozenWriteRejections += 1; return false; }
-      if (result === 'not-ready') return false;
+      if (result === 'frozen-window') { frozenWriteRejections += 1; return 'frozen'; }
+      if (result === 'not-ready') return 'refused';
       throw new DataBackendUnavailableError(result === 'fenced' ? 'guild-fenced' : result === 'read-only' ? 'database-read-only' : 'database-unreachable');
     }
     const filePath = getDataFilePath(filename, options);
@@ -615,18 +620,18 @@ export function deleteData(filename: string, options: DataOptions): boolean {
     // Nothing to delete: neither a queued write nor a file on disk.
     if (!existsNow && (!pending || pending.op === 'delete')) {
       console.log(`[DataManager] File not found for deletion: ${filePath}`);
-      return false;
+      return 'absent';
     }
 
     // Enqueue a delete tombstone (serialized with in-flight writes so a queued
     // write cannot resurrect the file).
     enqueueDelete(filePath);
     console.log(`[DataManager] Deleted ${filePath}`);
-    return true;
+    return 'deleted';
   } catch (error) {
     if (error instanceof DataBackendUnavailableError) throw error;
     console.error(`[DataManager] Error deleting ${filename}:`, error);
-    return false;
+    return 'refused';
   }
 }
 

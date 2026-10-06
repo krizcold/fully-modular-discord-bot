@@ -10,7 +10,7 @@
 import * as fs from 'fs';
 import { dataPath } from '../../../utils/dataRoot';
 import {
-  deleteData,
+  deleteDataOutcome,
   deleteGuildNamespace,
   flushGuildOutcome,
   isGuildWriteFrozen,
@@ -122,7 +122,10 @@ export async function applyOperatorDataWrite(req: GuildDataWriteRequest): Promis
     }
     const options = module ? { guildId, category: module } : { guildId };
     if (op === 'delete') {
-      deleteData(filename, options);
+      // Nothing to delete is done; a frozen guild or a refusal is not.
+      const deleted = deleteDataOutcome(filename, options);
+      if (deleted === 'frozen') return { ok: false, code: 'frozen' };
+      if (deleted === 'refused') return { ok: false, code: 'backend-unavailable', error: 'delete not accepted' };
     } else {
       let parsed: unknown;
       try {
