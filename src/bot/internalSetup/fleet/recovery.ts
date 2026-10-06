@@ -95,7 +95,7 @@ export async function evaluateRecovery(store: ControlStore, opts: RecoveryOption
   // zero shards - strictly worse than never arming.
   if (opts.termInherited && opts.override !== null && opts.override !== plan.shardCount) {
     console.warn(`[Fleet] Standing in: ignoring the FLEET_SHARD_COUNT override ${opts.override} and adopting the persisted ${plan.shardCount}-shard plan`);
-    const result = await adoptPlan(store, plan, opts.dataBackend);
+    const result = await adoptPlan(store, plan, opts.dataBackend, paused !== null);
     if (paused) result.reshardPaused = paused;
     return result;
   }
@@ -103,7 +103,7 @@ export async function evaluateRecovery(store: ControlStore, opts: RecoveryOption
     if (!isReshardConfirmed()) {
       // Unconfirmed count change: adopt the old count (zero downtime); an
       // unconfirmed change can never wipe or remap anything.
-      const result = await adoptPlan(store, plan, opts.dataBackend);
+      const result = await adoptPlan(store, plan, opts.dataBackend, paused !== null);
       result.reshardNeedsConfirm = { from: plan.shardCount, to: opts.override };
       if (paused) result.reshardPaused = paused;
       console.warn(`[Fleet] FLEET_SHARD_COUNT ${opts.override} != persisted ${plan.shardCount} without FLEET_CONFIRM_RESHARD; keeping ${plan.shardCount} shard(s); set FLEET_CONFIRM_RESHARD=1 and restart to apply`);
@@ -123,16 +123,16 @@ export async function evaluateRecovery(store: ControlStore, opts: RecoveryOption
         m => m.unreadable || !migrationsHoldTogether(m) ? 'the migration records cannot be read' : m.active ? migrationUnderWay(m.active) : null,
         () => 'the migration records cannot be read');
     if (deferred) {
-      const result = await adoptPlan(store, plan, opts.dataBackend);
+      const result = await adoptPlan(store, plan, opts.dataBackend, paused !== null);
       result.reshardDeferred = { from: plan.shardCount, to: opts.override, reason: deferred };
       if (paused) result.reshardPaused = paused;
       console.warn(`[Fleet] FLEET_SHARD_COUNT ${opts.override} is confirmed, but the reshard waits: ${deferred}; keeping ${plan.shardCount} shard(s); restart the master once that is settled`);
       return result;
     }
-    return confirmedReshard(store, plan, opts.override, opts.newTerm, usableMarker);
+    return confirmedReshard(store, plan, opts.override, opts.newTerm, usableMarker, opts.dataBackend);
   }
 
-  const result = await adoptPlan(store, plan, opts.dataBackend);
+  const result = await adoptPlan(store, plan, opts.dataBackend, paused !== null);
   if (paused) result.reshardPaused = paused;
   if (opts.liveRecommendation !== null && opts.liveRecommendation !== plan.shardCount) {
     // DECISION-1: adopt the persisted shardCount even when Discord's live
@@ -144,17 +144,15 @@ export async function evaluateRecovery(store: ControlStore, opts: RecoveryOption
   return result;
 }
 
-async function adoptPlan(store: ControlStore, plan: PersistedPlan, dataBackend: 'file' | 'postgres'): Promise<RecoveryResult> {
+/** A node a boot keeps known with no stored record of it, named by its id until it registers. */
+function placeholderNode(nodeId: string, dataBackend: 'file' | 'postgres'): PersistedNode {
+  return { nodeId, nodeName: nodeId, appVersion: '', capabilities: { shardCapacity: 1, dataBackend }, lastSeenAt: 0 };
+}
+
+async function adoptPlan(store: ControlStore, plan: PersistedPlan, dataBackend: 'file' | 'postgres', inPause: boolean): Promise<RecoveryResult> {
   const persisted = (await store.loadRegistry()).nodes;
   const byId = new Map(persisted.map(n => [n.nodeId, n]));
-  const placeholder = (nodeId: string): PersistedNode => ({
-    nodeId,
-    nodeName: nodeId,
-    appVersion: '',
-    capabilities: { shardCapacity: 1, dataBackend },
-    lastSeenAt: 0,
-  });
-  const nodes: PersistedNode[] = plan.assignments.map(a => byId.get(a.nodeId) ?? placeholder(a.nodeId));
+  const nodes: PersistedNode[] = plan.assignments.map(a => byId.get(a.nodeId) ?? placeholderNode(a.nodeId, dataBackend));
   // A node the migration under way still names, or the stored redistribute
   // proposal names as a shard's owner, stays known though it holds no lease
   // (a drained source, an owner no Resume grant has reached): its rollback or
@@ -162,14 +160,17 @@ async function adoptPlan(store: ControlStore, plan: PersistedPlan, dataBackend: 
   // Declare Lost wrote out is not invented, but a registry read back with no
   // node (a master lists itself) cannot tell who was: the named nodes come
   // back as the lease holders do. Records that cannot be read name no one,
-  // so every listed node stays. A store read that throws fails the boot, as
-  // a registry read that throws does, rather than write these nodes out.
+  // so every listed node stays, as in the reshard pause, which places
+  // nothing until Resume while its Redistribute asks each node for its
+  // guilds (or names it unreachable). A store read that throws fails the
+  // boot, as a registry read that throws does, rather than write these
+  // nodes out.
   const migrations = await store.loadMigrations();
   const recordsRead = !migrations.unreadable && migrationsHoldTogether(migrations);
   const stored = await store.loadRedistributeProposal();
-  const named = recordsRead ? migrationParticipants(migrations) : persisted.map(n => n.nodeId);
+  const named = [...(recordsRead ? migrationParticipants(migrations) : []), ...(recordsRead && !inPause ? [] : persisted.map(n => n.nodeId))];
   for (const nodeId of [...named, ...proposalOwners(stored, plan)]) {
-    const node = byId.get(nodeId) ?? (persisted.length === 0 ? placeholder(nodeId) : undefined);
+    const node = byId.get(nodeId) ?? (persisted.length === 0 ? placeholderNode(nodeId, dataBackend) : undefined);
     if (node && !nodes.some(n => n.nodeId === nodeId)) nodes.push(node);
   }
   return stored ? { recovered: true, plan, nodes, proposal: stored.proposal } : { recovered: true, plan, nodes };
@@ -299,8 +300,12 @@ async function confirmedReshard(
   to: number,
   newTerm: number,
   existingMarker: ReshardMarker | null,
+  dataBackend: 'file' | 'postgres',
 ): Promise<RecoveryResult> {
   const now = Date.now();
+  // The old plan's holders and every listed node stay known in the pause:
+  // its Redistribute asks each for its guilds, or names it unreachable.
+  const registry = (await store.loadRegistry()).nodes;
   let from: number;
   let at: number;
   let archiveFile: string;
@@ -311,7 +316,6 @@ async function confirmedReshard(
   } else {
     from = plan.shardCount;
     at = now;
-    const registry = (await store.loadRegistry()).nodes;
     archiveFile = await store.archivePlan({ plan, registry, archivedAt: at, from, to });
   }
   await store.saveReshardMarker({ from, to, at, archiveFile });
@@ -323,10 +327,14 @@ async function confirmedReshard(
   const emptyPlan: PersistedPlan = { term: newTerm, epoch: plan.epoch, shardCount: to, assignments: [], updatedAt: now };
   await store.savePlan(emptyPlan);
   console.warn(`[Fleet] CONFIRMED RESHARD ${plan.shardCount} -> ${to}: ownership archived at ${archiveFile}; assignments PAUSED until resumed${proposalDropped ? '; the stored redistribute proposal (of the old count) was dropped: run Redistribute again before Resume' : ''}`);
+  const nodes = [...registry];
+  for (const assignment of plan.assignments) {
+    if (!nodes.some(n => n.nodeId === assignment.nodeId)) nodes.push(placeholderNode(assignment.nodeId, dataBackend));
+  }
   return {
     recovered: true,
     plan: emptyPlan,
-    nodes: [],
+    nodes,
     reshardApplied: { from: plan.shardCount, to, source: 'override' },
     reshardPaused: { from, to, archivedAt: at },
   };
