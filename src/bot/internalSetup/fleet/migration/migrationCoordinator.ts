@@ -514,10 +514,22 @@ export class MigrationCoordinator {
         }
       }
     }
+    // In the reshard pause nothing has served since a redistribute copied
+    // a guild, so every surviving copy of one whose newest copy went with
+    // this node is as new as the lost one: each is released (a re-run
+    // Redistribute places the guild, one copy replacing another), none held.
+    const paused = this.hooks.isPaused();
+    const kept: OwedLeg[] = [];
+    for (const copy of paused ? this.survivingCopies(lostNodeId) : []) {
+      if (this.releasedOnLoss(copy.rec, copy.leg)) continue;
+      copy.leg.targetLostAt = at;
+      kept.push(copy);
+      changed = true;
+    }
     const held = new Set<number>();
     for (const shardId of lostCopies) {
       for (const { rec, leg } of this.owedLegsOf(shardId)) {
-        if (leg.sourceLostAt !== undefined || this.releasedOnLoss(rec, leg)) continue;
+        if (leg.sourceLostAt !== undefined || this.releasedOnLoss(rec, leg) || (paused && rec.kind === 'redistribute')) continue;
         if (!leg.heldForChoice) leg.heldForChoice = { lostNodeName, at };
         held.add(shardId);
         changed = true;
@@ -529,7 +541,37 @@ export class MigrationCoordinator {
     for (const leg of released) {
       console.warn(`[Migration] Shard ${leg.shardId}: the guilds the redistribute was placing on ${lostNodeName} stay on ${this.hooks.registry.nodes?.get(leg.sourceNodeId)?.nodeName ?? leg.sourceNodeId}, released as it ends; run Redistribute again before Resume to place them`);
     }
+    for (const { leg, nodeId } of kept) {
+      console.warn(`[Migration] Shard ${leg.shardId}: ${this.hooks.registry.nodes?.get(nodeId)?.nodeName ?? nodeId} keeps its copy of guilds the redistribute moved, as new as the one lost with ${lostNodeName} (nothing has served in the reshard pause), released; run Redistribute again before Resume to place them`);
+    }
     return [...held].sort((a, b) => a - b);
+  }
+
+  /** The owed redistribute copies holding a guild whose newest commit went to the lost node. */
+  private survivingCopies(lostNodeId: string): OwedLeg[] {
+    const newestCommit = new Map<string, { leg: MigrationLeg; epoch: number }>();
+    for (const rec of this.cleanupRecords()) {
+      if (!this.ofCurrentCount(rec)) continue;
+      for (const leg of rec.legs) {
+        if (!leg.committed) continue;
+        for (const guildId of leg.guilds) {
+          const seen = newestCommit.get(guildId);
+          if (!seen || leg.committed.epoch > seen.epoch) newestCommit.set(guildId, { leg, epoch: leg.committed.epoch });
+        }
+      }
+    }
+    const copies = new Map<MigrationLeg, OwedLeg>();
+    for (const rec of this.cleanupRecords()) {
+      if (!this.ofCurrentCount(rec) || rec.kind !== 'redistribute') continue;
+      for (const entry of rec.pendingSourceCleanup ?? []) {
+        for (const legId of entry.legIds) {
+          const leg = rec.legs.find(l => l.legId === legId);
+          if (!leg || leg.direction === 'none' || leg.sourceLostAt !== undefined || copies.has(leg)) continue;
+          if (leg.guilds.some(guildId => newestCommit.get(guildId)?.leg.targetNodeId === lostNodeId)) copies.set(leg, { rec, leg, nodeId: entry.nodeId });
+        }
+      }
+    }
+    return [...copies.values()];
   }
 
   // A leg into a node Declared Lost before its commit was through keeps its
