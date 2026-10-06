@@ -1392,6 +1392,18 @@ export class MigrationCoordinator {
       await this.enterAborting(`the plan could not be written before the commit decision: ${failed}`);
       return;
     }
+    // A hold begun while a redistribute ran (a Declare Lost) offers only the
+    // copies it knows, never the one this run places: the run ends here,
+    // and a new one leaves the held shard out.
+    if (rec.kind === 'redistribute') {
+      const holds = this.holdShardIds();
+      const held = [...new Set(rec.legs.map(l => l.shardId).filter(id => holds.has(id)))].sort((a, b) => a - b);
+      if (held.length > 0) {
+        const one = held.length === 1;
+        await this.enterAborting(`shard${one ? '' : 's'} [${held.join(', ')}] now wait${one ? 's' : ''} on the operator's choice (a Declare Lost during the run); run Redistribute again before Resume, which leaves ${one ? 'it' : 'them'} out, and choose after Resume`);
+        return;
+      }
+    }
     // All match: bump the epoch, persist COMMITTING BEFORE the first commit.
     this.hooks.registry.epoch += 1;
     this.record.epoch = this.hooks.registry.epoch;
