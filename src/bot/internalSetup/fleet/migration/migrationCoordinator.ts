@@ -1917,30 +1917,37 @@ export class MigrationCoordinator {
   }
 
   private async enterPreparingRedistribute(): Promise<void> {
-    if (!this.record) return;
+    const rec = this.record;
+    if (!rec) return;
     await this.transition('PREPARING');
+    if (this.overtaken(rec)) return;
     try {
       const acks = await this.sendPrepareToAll();
+      if (this.overtaken(rec)) return;
       for (const [nodeId, ack] of acks) if (!ack.ok) throw new Error(`prepare nack from ${nodeId}: ${ack.reason ?? 'unknown'}`);
       await this.transition('COPYING');
+      if (this.overtaken(rec)) return;
       this.armStallWatchdog();
       // No freeze/drain: ask sources to run their final hashed round now (they
       // are not serving during the pause). Reuse XFER_DRAIN, which freezes a
       // non-serving guild harmlessly and ships the final hashed round.
       const byNode = new Map<string, MigrationLeg[]>();
-      for (const leg of this.record.legs) {
+      for (const leg of rec.legs) {
         const arr = byNode.get(leg.sourceNodeId) ?? [];
         arr.push(leg);
         byNode.set(leg.sourceNodeId, arr);
       }
       await this.transition('DRAINING');
+      if (this.overtaken(rec)) return;
       this.armDrainTimeout();
       for (const [sourceNodeId, legs] of byNode) {
         await this.hooks.sendControl(sourceNodeId, MSG.XFER_DRAIN, {
-          migrationId: this.record.id, term: this.record.term, legIds: legs.map(l => l.legId),
+          migrationId: rec.id, term: rec.term, legIds: legs.map(l => l.legId),
         });
+        if (this.overtaken(rec)) return;
       }
     } catch (error) {
+      if (this.overtaken(rec)) return;
       await this.enterAborting(error instanceof Error ? error.message : String(error));
     }
   }
