@@ -72,7 +72,7 @@ import {
   resolveShardCapacity,
   resolveShardCount,
 } from './placement';
-import { evaluateRecovery } from './recovery';
+import { evaluateRecovery, proposalShards } from './recovery';
 import { _setControlStoreFenced, _setEmptyStoreHold, _setFleetStateSources, _setFollowerFollowingSupplier, _setFollowerHold, _setFollowerLineage, _setOwnCopyLineage, _setReadOnlyStorePark, _setSlotStatus, _setStaleMasterPark, _setSuperseded, _setTakeoverHold, FleetRecoverySource, FleetRefusedRegistration, FollowerHoldBase, getFleetState } from './state';
 import type { BackupDesignationRefusedView, MigrationView, PinViolationView, StandInVerdictView, UnassignedView } from './state';
 import { serveSyncRequest, SyncAuthority } from './syncAuthority';
@@ -2578,8 +2578,14 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   // pending stamp), so a data-blind distribute() could otherwise load-place it.
   // A hard refusal ({ok:false,pending:false}, ledger floor / worker refusal /
   // disconnected owner) likewise keeps the shard fenced for the next retry.
+  // The nodes the fenced proposal shards await, by name.
+  const resumeOwnerNames = (): string => [...new Set([...resumePendingShards].flatMap(id => resumeProposalOwner.get(id) ?? []))]
+    .map(id => registry.nodes.get(id)?.nodeName ?? id).join(', ');
+
   async function grantResumeProposal(): Promise<void> {
-    if (resumePendingShards.size === 0) return;
+    // Nothing is placed while this master is fenced or its records cannot
+    // be read (a hold or a decided move may own a fenced shard): they wait.
+    if (resumePendingShards.size === 0 || controlFenced || coordinator?.recordsBlock()) return;
     const byNode = new Map<string, number[]>();
     for (const shardId of resumePendingShards) {
       // A proposal owner that is already serving this shard (a prior retry landed
@@ -2592,6 +2598,8 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       byNode.set(owner, arr);
     }
     if (byNode.size === 0) return;
+    // A pass with no owner to reach grants nothing: no epoch, no write.
+    if (![...byNode.keys()].some(id => { const node = registry.nodes.get(id); return node !== undefined && (node.connected || node.isSelf); })) return;
     registry.epoch += 1;
     const epoch = registry.epoch;
     const order = [...byNode.keys()].sort((a, b) => {
@@ -2639,7 +2647,8 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
         }
         if (resumePendingShards.size === 0) {
           clearResumeRetry();
-          await store.saveRedistributeProposal(null);
+          await store.saveRedistributeProposal(null).catch(error =>
+            console.warn('[Fleet] Clearing the settled redistribute proposal failed:', error instanceof Error ? error.message : error));
           console.log('[Fleet] Reshard pause resume: the proposal is settled (each shard landed on its owner, or was freed with an owner Declared Lost)');
           void distribute();
         }
@@ -2706,13 +2715,10 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       // (ledger floor / worker refusal) stays fenced and is retried on a timer;
       // the proposal file is kept until every proposal shard has landed, so a
       // retry or a fresh crash still re-grants EXACTLY the proposal owner.
-      // A shard waiting on the operator's choice is placed by that choice.
+      // A shard already owned is not reassigned; one waiting on the
+      // operator's choice is placed by that choice.
       const heldIds = coordinator?.holdShardIds() ?? new Set<number>();
-      for (const [shardKey, proposalNodeId] of Object.entries(persistedProposal.proposal)) {
-        const shardId = Number(shardKey);
-        if (!Number.isInteger(shardId) || shardId < 0 || shardId >= registry.shardCount) continue;
-        if (registry.shardTable.has(shardId)) continue; // already owned; do not reassign
-        if (heldIds.has(shardId)) continue;
+      for (const [shardId, proposalNodeId] of proposalShards(persistedProposal.proposal, registry.shardCount, id => registry.shardTable.has(id) || heldIds.has(id))) {
         resumeProposalOwner.set(shardId, proposalNodeId);
         resumePendingShards.add(shardId);
       }
@@ -3208,7 +3214,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       if (recordsBlocked) return recordsBlocked;
       if (coordinator?.hasActive()) return 'a migration is running on the fleet';
       if (paused) return 'the reshard pause is active';
-      if (resumePendingShards.size > 0) return `shard(s) [${[...resumePendingShards].sort((a, b) => a - b).join(', ')}] of the last reshard still await their grant onto the nodes holding their data`;
+      if (resumePendingShards.size > 0) return `shard(s) [${[...resumePendingShards].sort((a, b) => a - b).join(', ')}] of the last reshard still await their grant onto the nodes holding their data (${resumeOwnerNames()}); they land as those nodes register, or Declare Lost one that never returns`;
       const pending = [...registry.pendingConfirmation.keys()].sort((a, b) => a - b);
       if (pending.length > 0) return `shard(s) [${pending.join(', ')}] await confirmation from the node that holds or was granted them, which comes with that node's next heartbeat once this master's register grace or recovery hold-down is over, or through its drain`;
       return null;
@@ -3966,6 +3972,24 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
         if (owed.nodeId === nodeId || registry.nodes.get(owed.nodeId)?.connected) void coordinator.retrySourceCleanup(owed.nodeId).catch(() => undefined);
       }
       void coordinator.deliverOwedAborts().catch(() => undefined);
+    }
+    // A Resume's proposal grants still landing when the master stopped are
+    // fenced again for their owners, the nodes holding the data the
+    // redistribute placed there, as the Resume fenced them; a shard whose
+    // owner is no longer known (Declared Lost) stays free, as that left it.
+    if (!paused && rec.proposal) {
+      const heldIds = coordinator?.holdShardIds() ?? new Set<number>();
+      for (const [shardId, owner] of proposalShards(rec.proposal, registry.shardCount, id => registry.shardTable.has(id) || heldIds.has(id), id => registry.nodes.has(id))) {
+        resumeProposalOwner.set(shardId, owner);
+        resumePendingShards.add(shardId);
+      }
+      if (resumePendingShards.size > 0) {
+        console.warn(`[Fleet] Recovery: shard(s) [${[...resumePendingShards].sort((a, b) => a - b).join(', ')}] of the last reshard still await their grant onto the nodes holding their data (${resumeOwnerNames()}); each lands as its node registers, or is freed by a Declare Lost of that node`);
+        scheduleResumeRetry();
+      } else {
+        await store.saveRedistributeProposal(null).catch(error =>
+          console.warn('[Fleet] Clearing the settled redistribute proposal failed:', error instanceof Error ? error.message : error));
+      }
     }
     const graceMs = rec.recovered || paused ? RECOVERY_HOLDDOWN_MS : REGISTER_GRACE_MS;
     if ((rec.recovered || paused) && recoverySource) recoverySource.holdDownUntil = Date.now() + graceMs;

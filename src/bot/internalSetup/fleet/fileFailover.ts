@@ -48,10 +48,11 @@ export interface PinOutcome {
   lostShards: number[];
   /** Those of them with an older copy a node still owes the cleanup of, held for the operator's choice. */
   heldShards: number[];
-  /** The old master's reshard pause went on here, and its redistribute proposal with it. */
+  /** The old master's reshard pause went on here. */
   pauseCarried: boolean;
+  /** Its redistribute proposal went on here, with the pause or alone (a Resume's grants still landing). */
   proposalCarried: boolean;
-  /** The copy's proposal could not be read or parsed: the pause went on without it. */
+  /** The copy's proposal could not be read or parsed: the pause, or the Resume's landing, went on without it. */
   proposalUnreadable: boolean;
 }
 
@@ -350,14 +351,15 @@ export async function pinPlacement(selfNodeId: string, sourceNodeId: string | nu
   const sourceName = (registry && Array.isArray(registry.nodes) ? registry.nodes.find(n => n?.nodeId === sourceNodeId)?.nodeName : undefined) ?? sourceNodeId?.slice(0, 8) ?? 'the old master';
   const carried = recordsBody === null ? null : adoptRecords(recordsBody, readMirrorText('leases.json') ?? '', plan, selfNodeId, sourceNodeId, sourceName);
   const lost = carried?.lost ?? new Set<number>();
-  // The old master's reshard pause goes on here with its redistribute
-  // proposal (a boot reads it for its owners and Resume for its grants, so
-  // never alone), both read as its store reads them: an unreadable marker
-  // still pauses, a proposal that cannot be read or parsed is none.
+  // The old master's reshard pause goes on here, and its redistribute
+  // proposal with the pause or alone (a Resume's grants still landing, which
+  // the boot fences again for their owners), both read as its store reads
+  // them: an unreadable marker still pauses, a proposal that cannot be read
+  // or parsed is none.
   const marker = carryRecords ? readPauseMarker() : null;
   let stored: RedistributeProposal | null = null;
   let proposalUnreadable = false;
-  if (marker !== null) {
+  if (carryRecords) {
     try {
       const text = readMirrorText('redistribute-proposal.json');
       if (text !== null) stored = proposalOf(text);
@@ -442,7 +444,9 @@ export function pinRecordsText(outcome: PinOutcome): string {
   const held = outcome.heldShards.length > 0 ? `; shard(s) [${outcome.heldShards.join(', ')}] wait on the operator's choice on the Fleet tab (restore an older surviving copy or start empty)` : '';
   const lost = outcome.lostShards.length > 0 ? `; shard(s) [${outcome.lostShards.join(', ')}] were moving onto the old master, whose copy of them went with it${held}` : '';
   const placeAgain = outcome.lostShards.filter(id => !outcome.heldShards.includes(id));
-  const pause = !outcome.pauseCarried ? ''
+  const landing = (outcome.proposalCarried ? '; the last Resume\'s redistribute proposal carried over: its shards not yet granted land on the nodes holding their data as each registers' : '')
+    + (outcome.proposalUnreadable ? '; the last Resume\'s redistribute proposal could not be read: its shards not yet granted are placed as any free shard' : '');
+  const pause = !outcome.pauseCarried ? landing
     : `; the reshard pause carried over${outcome.proposalCarried ? ', Resume granting its redistribute proposal' : ''}`
       + (outcome.proposalUnreadable ? '; its redistribute proposal could not be read: run Redistribute again before Resume' : '')
       + (placeAgain.length > 0 ? `; run Redistribute again before Resume to place shard(s) [${placeAgain.join(', ')}]` : '');

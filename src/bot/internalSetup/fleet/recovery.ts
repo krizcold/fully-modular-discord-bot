@@ -3,7 +3,7 @@
 // registry.json is missing or stale. Standalone never reads the store, so a
 // zero-fleet-env boot stays byte-identical to today.
 
-import type { ControlStore, PersistedMigrations, PersistedNode, PersistedPlan, ReshardMarker } from './controlStore';
+import type { ControlStore, PersistedMigrations, PersistedNode, PersistedPlan, RedistributeProposal, ReshardMarker } from './controlStore';
 import { migrationsHoldTogether } from './controlStore';
 import { isReshardConfirmed } from './placement';
 
@@ -35,6 +35,8 @@ export interface RecoveryResult {
   plan?: PersistedPlan;
   /** One stub per plan assignment, from registry.json where available, synthesized otherwise. */
   nodes?: PersistedNode[];
+  /** The stored redistribute proposal, read with the plan: outside the pause, a Resume's grants still landing. */
+  proposal?: Record<number, string>;
   reshardApplied?: { from: number; to: number; source: 'override' };
   reshardAdvised?: { running: number; recommended: number };
   /** Override mismatch without FLEET_CONFIRM_RESHARD: the plan was adopted unchanged, the change awaits confirmation. */
@@ -161,11 +163,12 @@ async function adoptPlan(store: ControlStore, plan: PersistedPlan, dataBackend: 
   // Declare Lost wrote out is not invented. A store read that throws fails
   // the boot, as a registry read that throws does, rather than write these
   // nodes out.
-  for (const nodeId of [...await migrationParticipants(store), ...await proposalOwners(store, plan)]) {
+  const stored = await store.loadRedistributeProposal();
+  for (const nodeId of [...await migrationParticipants(store), ...proposalOwners(stored, plan)]) {
     const node = byId.get(nodeId);
     if (node && !nodes.some(n => n.nodeId === nodeId)) nodes.push(node);
   }
-  return { recovered: true, plan, nodes };
+  return stored ? { recovered: true, plan, nodes, proposal: stored.proposal } : { recovered: true, plan, nodes };
 }
 
 /** The nodes the unfinished legs of the migration under way name, but a source or target marked Declared Lost. */
@@ -182,14 +185,18 @@ async function migrationParticipants(store: ControlStore): Promise<string[]> {
 }
 
 /** The owners the stored redistribute proposal names for the shards a Resume would grant (of the plan's count, leased by no one); one that cannot be parsed names none. */
-async function proposalOwners(store: ControlStore, plan: PersistedPlan): Promise<string[]> {
-  const stored = await store.loadRedistributeProposal();
+function proposalOwners(stored: RedistributeProposal | null, plan: PersistedPlan): string[] {
   if (!stored) return [];
   const leased = new Set(plan.assignments.flatMap(a => a.leases.map(l => l.shardId)));
-  return Object.entries(stored.proposal).flatMap(([shardKey, owner]) => {
+  return proposalShards(stored.proposal, plan.shardCount, shardId => leased.has(shardId)).map(([, owner]) => owner);
+}
+
+/** A redistribute proposal's shards a grant must still land, each with its owner: a shard of the count not settled (already placed, or held for the operator's choice), its owner a node id the caller still knows. */
+export function proposalShards(proposal: Record<number, string>, shardCount: number, settled: (shardId: number) => boolean, known: (nodeId: string) => boolean = () => true): [number, string][] {
+  return Object.entries(proposal).flatMap(([shardKey, owner]): [number, string][] => {
     const shardId = Number(shardKey);
-    const granted = Number.isInteger(shardId) && shardId >= 0 && shardId < plan.shardCount && !leased.has(shardId);
-    return granted && typeof owner === 'string' ? [owner] : [];
+    if (!Number.isInteger(shardId) || shardId < 0 || shardId >= shardCount || settled(shardId)) return [];
+    return typeof owner === 'string' && known(owner) ? [[shardId, owner]] : [];
   });
 }
 
