@@ -536,11 +536,12 @@ export class WorkingSetManager {
     return { batch, flushedKeys, appendLens, bytes };
   }
 
-  private async flush(ws: GuildWorkingSet): Promise<void> {
-    if (this.quiesced) return;
-    if (ws.flushInFlight) { ws.requeue = true; return; }
+  /** True once this call's batch committed. */
+  private async flush(ws: GuildWorkingSet): Promise<boolean> {
+    if (this.quiesced) return false;
+    if (ws.flushInFlight) { ws.requeue = true; return false; }
     if (ws.debounceTimer) { clearTimeout(ws.debounceTimer); ws.debounceTimer = null; }
-    if (ws.dirtyKeys.size === 0) { ws.windowOpenedAt = null; return; }
+    if (ws.dirtyKeys.size === 0) { ws.windowOpenedAt = null; return false; }
 
     const { batch, flushedKeys, appendLens, bytes } = this.buildBatch(ws);
     ws.dirtyKeys = new Set();
@@ -569,12 +570,12 @@ export class WorkingSetManager {
         this.markDirty(ws, [...ws.dirtyKeys][0] ?? '', Date.now());
         if (ws.dirtyKeys.size === 0) { ws.windowOpenedAt = null; if (ws.debounceTimer) { clearTimeout(ws.debounceTimer); ws.debounceTimer = null; } }
       }
-      return;
+      return true;
     }
 
     if (outcome.reason === 'deposed') {
       this.onDeposed(ws, outcome.currentOwner);
-      return;
+      return false;
     }
     if (outcome.reason === 'read-only') {
       // Accepted before the copy showed itself read-only: kept dirty for the
@@ -583,13 +584,14 @@ export class WorkingSetManager {
       ws.requeue = false;
       this.lastError = 'flush refused: the database is read-only (SQLSTATE 25006)';
       this.scheduleRetry();
-      return;
+      return false;
     }
     // unavailable: everything stays dirty; merge back and retry under backoff.
     for (const key of flushedKeys) ws.dirtyKeys.add(key);
     ws.requeue = false;
     this.noteFlushFailure('flush unavailable');
     this.scheduleRetry();
+    return false;
   }
 
   private onDeposed(ws: GuildWorkingSet, owner?: { nodeId: string; term: number; epoch: number }): void {
@@ -621,21 +623,38 @@ export class WorkingSetManager {
 
   /**
    * Deadline-bounded immediate flush ('ok' = committed, 'pending' = accepted
-   * and still retrying - callers report "queued, not yet durable").
+   * and still retrying - callers report "queued, not yet durable"). A flush
+   * already on the wire emptied the dirty set before awaiting, so it is
+   * waited for: its writes are durable only once it settles.
    */
   async flushGuildNow(guildId: string, deadlineMs: number): Promise<FlushNowOutcome> {
+    // Writes carried in from a recycle wait for the guild to hydrate here.
+    if (this.adoptions.has(guildId)) return 'pending';
     const ws = this.sets.get(guildId);
-    if (!ws || ws.dirtyKeys.size === 0) return 'ok';
-    if (ws.state === 'fenced') return 'deposed';
-    const done = this.flush(ws);
-    const timeout = new Promise<'timeout'>(resolve => {
-      const t = setTimeout(() => resolve('timeout'), deadlineMs);
-      t.unref();
-    });
-    const raced = await Promise.race([done.then(() => 'done' as const), timeout]);
-    if (raced === 'timeout') return 'pending';
-    if ((this.sets.get(guildId)?.state ?? 'ready') === 'fenced') return 'deposed';
-    return this.sets.get(guildId)?.dirtyKeys.size === 0 ? 'ok' : 'unavailable';
+    if (!ws) return 'ok';
+    const deadline = Date.now() + deadlineMs;
+    for (;;) {
+      if (ws.state === 'fenced') return 'deposed';
+      // A recycle may have carried the writes off to its read-only copy.
+      if (this.quiesced) return 'unavailable';
+      if (this.sets.get(guildId) !== ws) return 'unavailable';
+      const left = deadline - Date.now();
+      if (ws.flushInFlight) {
+        if (left <= 0) return 'pending';
+        await new Promise<void>(resolve => { setTimeout(resolve, Math.min(20, left)); });
+        continue;
+      }
+      if (ws.dirtyKeys.size === 0) return 'ok';
+      if (left <= 0) return 'pending';
+      const timeout = new Promise<'timeout'>(resolve => {
+        const t = setTimeout(() => resolve('timeout'), left);
+        t.unref();
+      });
+      const committed = await Promise.race([this.flush(ws), timeout]);
+      if (committed === 'timeout') return 'pending';
+      if (committed) return 'ok';
+      return (ws.state as WsState) === 'fenced' ? 'deposed' : 'unavailable';
+    }
   }
 
   /** Flush every dirty guild (shutdown drain; the caller bounds it). */
