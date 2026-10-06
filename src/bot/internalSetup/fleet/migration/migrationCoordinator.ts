@@ -1424,7 +1424,6 @@ export class MigrationCoordinator {
 
   private async commitRound(rec: MigrationRecord): Promise<void> {
     let allTargets = true;
-    let allSources = true;
     // Targets first. A target Declared Lost is settled by the Declare Lost.
     for (const leg of rec.legs) {
       if ((leg as any)._targetAcked || leg.targetLostAt !== undefined) continue;
@@ -1457,18 +1456,9 @@ export class MigrationCoordinator {
           this.clearPendingSourceLeg(rec, leg.sourceNodeId, leg.legId);
           if (this.parentRecord && this.parentRecord !== rec) this.clearPendingSourceLeg(this.parentRecord, leg.sourceNodeId, leg.legId);
         }
-        else allSources = false;
+        else this.owePendingSource(rec, leg);
       } catch {
-        // Down source: record pendingSourceCleanup durably (survives the move
-        // to history), retried at reconnect; fencing keeps it from serving
-        // meanwhile. Do NOT block the grant.
-        (leg as any)._sourcePending = true;
-        this.recordPendingSourceLeg(rec, leg.sourceNodeId, leg.legId);
-        // A retire's slice is not what persist writes: its parent carries it too.
-        if (this.parentRecord && this.parentRecord !== rec) this.recordPendingSourceLeg(this.parentRecord, leg.sourceNodeId, leg.legId);
-        // A source still connected (its commit outran the ack) has no
-        // reconnect to retry it: it is asked again after a retry tick.
-        if (this.hooks.registry.nodes?.get(leg.sourceNodeId)?.connected) this.scheduleCleanupRetry(leg.sourceNodeId);
+        this.owePendingSource(rec, leg);
       }
     }
     const sourcesSettled = rec.legs.every(l => (l as any)._sourceAcked || (l as any)._sourcePending || this.keepsSource(l));
@@ -1477,7 +1467,20 @@ export class MigrationCoordinator {
       if ((rec.pendingSourceCleanup?.length ?? 0) > 0) await this.persist();
       void this.enterGranting();
     }
-    void allSources;
+  }
+
+  // A source down, unanswered, or answering its cleanup not done (a guild
+  // it could not move): the cleanup is owed durably (it survives the move to
+  // history) and retried; fencing keeps the source from serving meanwhile.
+  // It never blocks the grant.
+  private owePendingSource(rec: MigrationRecord, leg: MigrationLeg): void {
+    (leg as any)._sourcePending = true;
+    this.recordPendingSourceLeg(rec, leg.sourceNodeId, leg.legId);
+    // A retire's slice is not what persist writes: its parent carries it too.
+    if (this.parentRecord && this.parentRecord !== rec) this.recordPendingSourceLeg(this.parentRecord, leg.sourceNodeId, leg.legId);
+    // A source still connected has no reconnect to retry it: it is asked
+    // again after a retry tick.
+    if (this.hooks.registry.nodes?.get(leg.sourceNodeId)?.connected) this.scheduleCleanupRetry(leg.sourceNodeId);
   }
 
   // GRANTING: data commit is done - now the gateway swap. Grant the moved

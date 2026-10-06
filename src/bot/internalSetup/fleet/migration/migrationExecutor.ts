@@ -482,7 +482,12 @@ export class MigrationExecutor {
             for (const guildId of leg.guilds) ws?.evict(guildId);
           }
         } else if (leg.role === 'target') await this.commitTarget(leg, payload.term, payload.epoch);
-        else await this.commitSource(leg);
+        else if (!(await this.commitSource(leg))) {
+          // A guild still live (its graveyard move kept failing): not done,
+          // and the master's retry, which names the guilds, finishes it
+          // with no runtime.
+          allDone = false;
+        }
         leg.committed = true;
         // Release the runtime so the lazy listener can unbind; a retried commit
         // lands in the no-runtime branch above, which is already idempotent.
@@ -526,21 +531,10 @@ export class MigrationExecutor {
     try { await fs.promises.rmdir(path.dirname(legDir)); } catch { /* other legs still staged */ }
   }
 
-  private async commitSource(leg: LegRuntime): Promise<void> {
-    // Write the graveyard-resume marker BEFORE graveyarding so a crash mid-loop
-    // is finished at boot by residueSweep.resumeSourceGraveyarding (it reads
-    // {id, phase:'graveyarding', guilds}). Cleared after the loop completes.
-    const marker = sourceGraveyardMarker(leg.migrationId, leg.legId);
-    try {
-      await fs.promises.mkdir(path.dirname(marker), { recursive: true });
-      await fs.promises.writeFile(marker, JSON.stringify({ id: leg.migrationId, phase: 'graveyarding', guilds: leg.guilds }), 'utf-8');
-    } catch { /* best effort; boot resume only covers a crash after this point */ }
-    for (const guildId of leg.guilds) {
-      await removeFreezeSentinel(guildId);
-      unfreezeGuildWrites(guildId);
-      await deleteGuildNamespace(guildId, `migration-${leg.migrationId}-source-retired`);
-    }
-    try { await fs.promises.unlink(marker); } catch { /* best effort; already gone or never written */ }
+  // True only when every guild is provably gone; the graveyard-resume
+  // marker stays for a crash or a failed move (residueSweep finishes it).
+  private commitSource(leg: LegRuntime): Promise<boolean> {
+    return commitSourceGuilds(leg.migrationId, leg.legId, leg.guilds);
   }
 
   // ABORT is idempotent + retried while connected. TARGET: delete staging.
@@ -872,9 +866,9 @@ async function finishStaging(legDir: string, migrationId: string, term: number, 
   try { await fs.promises.rmdir(path.dirname(legDir)); } catch { /* other legs still staged */ }
 }
 
-// Source-side graveyard + unfreeze for a leg's guilds when there is NO in-memory
-// leg runtime (a RESTARTED source retried at reconnect). Mirrors commitSource's
-// sequence and its crash-resume marker, and is fully idempotent: a guild already
+// Source-side graveyard + unfreeze for a leg's guilds, on its live runtime and
+// with NO in-memory leg runtime (a RESTARTED source retried at reconnect), with
+// its crash-resume marker. Fully idempotent: a guild already
 // graveyarded (its /data dir gone) is treated as done, an already-unfrozen guild
 // is a no-op. Returns true only when every named guild is provably gone/unfrozen
 // (or was already), false when a guild still exists live and could not be moved,
