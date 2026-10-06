@@ -246,6 +246,17 @@ export class MigrationCoordinator {
       this.paused = true;
       return;
     }
+    if (leg && leg.legState === 'ABORTED') {
+      // Its abort ended before the restart: the retire stays paused with
+      // that abort's reason; the abort goes out again for a participant
+      // that missed it, nothing re-run.
+      rec.state = 'PRECHECK';
+      this.paused = true;
+      for (const nodeId of new Set([leg.sourceNodeId, leg.targetNodeId])) {
+        void this.hooks.sendControl(nodeId, MSG.XFER_ABORT, { migrationId: rec.id, term: rec.term, reason: leg.error ?? rec.error ?? 'aborted' }).catch(() => undefined);
+      }
+      return;
+    }
     if (!leg || leg.legState === 'DONE') {
       // The current leg already finished (or none): resume the sequence.
       rec.currentLegIndex = Math.min(rec.legs.length, idx + (leg?.legState === 'DONE' ? 1 : 0));
