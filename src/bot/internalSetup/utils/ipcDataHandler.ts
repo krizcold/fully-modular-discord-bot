@@ -20,7 +20,7 @@ import {
   restoreGuildFromGraveyard,
   saveData,
 } from './dataManager';
-import { DataBackendUnavailableError } from './dataBackends/workingSet';
+import { DataBackendUnavailableError, getWorkingSet } from './dataBackends/workingSet';
 import { awaitGuildDataReady } from './dataBackends/boot';
 import { getFleetState } from '../fleet/state';
 import { guildIdToShardId } from '../fleet/placement';
@@ -85,6 +85,10 @@ function servedLocally(guildId: string): boolean {
  * Owner-side apply (identical on master and worker): freeze check, facade
  * write so coalescing/metrics/fencing engage, then a bounded durability flush.
  */
+// Inside the master's 10 s hop to the owner (and the web UI's 15 s wait),
+// so the delete's answer is the one the operator sees.
+const OPERATOR_FLUSH_MS = 5000;
+
 export async function applyOperatorDataWrite(req: GuildDataWriteRequest): Promise<DataWriteReply> {
   const invalid = validateWrite(req);
   if (invalid) return { ok: false, code: 'invalid', error: invalid };
@@ -116,7 +120,10 @@ export async function applyOperatorDataWrite(req: GuildDataWriteRequest): Promis
       return { ok: true };
     }
     if (op === 'delete-namespace') {
-      const moved = await deleteGuildNamespace(guildId, 'webui-operator-delete');
+      // Its working set frozen (a move's drain, a lease leaving): deleting
+      // it now would drop that freeze and the data mid-move.
+      if (getWorkingSet()?.stateOf(guildId) === 'frozen-retained') return { ok: false, code: 'frozen' };
+      const moved = await deleteGuildNamespace(guildId, 'webui-operator-delete', OPERATOR_FLUSH_MS);
       if (!moved) return { ok: false, code: 'io-error', error: 'guild data delete failed; nothing was removed' };
       return { ok: true };
     }

@@ -644,12 +644,17 @@ export function deleteDataOutcome(filename: string, options: DataOptions): 'dele
  * any pending state for the guild, then renames the dir under _graveyard and
  * writes a .graveyard.json reason marker inside.
  */
-export async function deleteGuildNamespace(guildId: string, reason: string): Promise<boolean> {
+export async function deleteGuildNamespace(guildId: string, reason: string, flushMs = 30000): Promise<boolean> {
   if (routeFor(guildId) === 'postgres') {
     if (!pgBackend) return false;
     const ws = getWorkingSet();
     if (ws) {
-      await ws.flushGuildNow(guildId, 30000);
+      // Writes that did not reach the store are kept, and nothing removed.
+      const flushed = await ws.flushGuildNow(guildId, flushMs);
+      if (flushed !== 'ok') {
+        console.error(`[DataManager] Cannot retire guild ${guildId}: its unflushed writes did not reach the store (${flushed}); nothing was removed`);
+        return false;
+      }
       ws.evict(guildId);
     }
     frozenGuilds.delete(guildId);
