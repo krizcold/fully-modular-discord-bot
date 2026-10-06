@@ -1752,8 +1752,9 @@ export class MigrationCoordinator {
     this.clearGrantRetry();
     this.record.error = reason;
     // A redistribute abort invalidates the persisted proposal: Resume must not
-    // grant a proposal whose data placement did not complete.
-    if (this.record.kind === 'redistribute') await this.hooks.saveRedistributeProposal(null);
+    // grant a proposal whose data placement did not complete (in the serial
+    // pass, so a Declare Lost's trim never writes it back).
+    if (this.record.kind === 'redistribute') await this.serialProposal(() => this.hooks.saveRedistributeProposal(null));
     await this.transition('ABORTING');
     console.warn(`[Migration] Aborting ${this.record.id}: ${reason}`);
     const rec = this.record;
