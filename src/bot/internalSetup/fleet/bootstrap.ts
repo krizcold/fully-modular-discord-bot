@@ -2553,7 +2553,9 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     if (coordinator?.pendingSourceCleanupShardIds().has(shardId)) {
       // The old source still holds this shard's frozen guilds pending cleanup;
       // assigning it there would serve stale data and never unfreeze.
-      return { success: false, error: `shard ${shardId} has a pending source cleanup; try again shortly` };
+      const stuck = coordinator.pendingSourceCleanups().filter(owed => owed.shardIds.includes(shardId))
+        .map(owed => coordinator!.stuckCleanupText(owed.nodeId, shardId)).find(text => text !== null) ?? null;
+      return { success: false, error: stuck ? `shard ${shardId} has a pending source cleanup that cannot finish: ${stuck}; assign it once that cleanup has run` : `shard ${shardId} has a pending source cleanup; try again shortly` };
     }
     if (transformer?.hasActive()) {
       return { success: false, error: 'a backend transformation is active; shard assignment is locked until it finishes' };
@@ -3201,6 +3203,8 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
             cleanupRetrying.add(owed.nodeId);
             void coordinator!.retrySourceCleanup(owed.nodeId).catch(() => undefined).finally(() => cleanupRetrying.delete(owed.nodeId));
           }
+          const stuck = coordinator!.stuckCleanupText(owed.nodeId);
+          if (stuck) return `${owing.nodeName} cannot finish the cleanup of ${what}: ${stuck}; the transfer waits until the cleanup has run`;
           return `${owing.nodeName} still holds the frozen originals of ${what} from a migration whose cleanup it missed; the cleanup is retried now, so ask again shortly, and restart ${owing.nodeName} if this persists`;
         }
         return `${owing.nodeName} was down when a migration of ${what} committed and still holds its frozen originals; the transfer waits until ${owing.nodeName} reconnects (its cleanup then runs), or, if it never returns, until it is Declared Lost`;

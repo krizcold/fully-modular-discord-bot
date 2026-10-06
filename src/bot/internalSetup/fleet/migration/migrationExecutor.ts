@@ -446,6 +446,7 @@ export class MigrationExecutor {
   // SOURCE: graveyard each guild (deleteGuildNamespace), drop .freeze, unfreeze.
   private async onCommit(payload: XferCommitPayload): Promise<any> {
     let allDone = true;
+    const stuck: string[] = [];
     for (const legId of payload.legIds) {
       // One commit of a leg at a time, never joined: a re-send while one
       // runs (a remote round gives up at 10 s, the retry tick) is answered
@@ -465,8 +466,8 @@ export class MigrationExecutor {
             // leave its originals write-frozen forever while the master records
             // the cleanup done). Idempotent: re-graveyarding an already-gone guild
             // and unfreezing an already-unfrozen guild are both no-ops.
-            const ok = await commitSourceGuilds(payload.migrationId, legId, payload.guilds ?? []);
-            if (!ok) allDone = false;
+            const left = await commitSourceGuilds(payload.migrationId, legId, payload.guilds ?? []);
+            if (left.length > 0) { allDone = false; stuck.push(...left); }
             continue;
           }
           // Target with commit-intent staging on disk is finished idempotently
@@ -487,11 +488,12 @@ export class MigrationExecutor {
             for (const guildId of leg.guilds) ws?.evict(guildId);
           }
         } else if (leg.role === 'target') await this.commitTarget(leg, payload.term, payload.epoch);
-        else if (!(await this.commitSource(leg))) {
+        else {
           // A guild still live (its graveyard move kept failing): not done,
-          // and the master's retry, which names the guilds, finishes it
-          // with no runtime.
-          allDone = false;
+          // named, and the master's retry, which names the guilds, finishes
+          // it with no runtime.
+          const left = await this.commitSource(leg);
+          if (left.length > 0) { allDone = false; stuck.push(...left); }
         }
         leg.committed = true;
         // Release the runtime so the lazy listener can unbind; a retried commit
@@ -504,7 +506,7 @@ export class MigrationExecutor {
       }
     }
     this.maybeReleaseServer();
-    return { ok: allDone, term: payload.term };
+    return { ok: allDone, term: payload.term, ...(stuck.length > 0 ? { stuckGuilds: stuck } : {}) };
   }
 
   private commitTarget(leg: LegRuntime, term: number, epoch: number): Promise<void> {
@@ -536,9 +538,10 @@ export class MigrationExecutor {
     try { await fs.promises.rmdir(path.dirname(legDir)); } catch { /* other legs still staged */ }
   }
 
-  // True only when every guild is provably gone; the graveyard-resume
-  // marker stays for a crash or a failed move (residueSweep finishes it).
-  private commitSource(leg: LegRuntime): Promise<boolean> {
+  // The guilds still live (none once every guild is provably gone); the
+  // graveyard-resume marker stays for a crash or a failed move (residueSweep
+  // finishes it).
+  private commitSource(leg: LegRuntime): Promise<string[]> {
     return commitSourceGuilds(leg.migrationId, leg.legId, leg.guilds);
   }
 
@@ -916,11 +919,11 @@ function unreadableOnce(legDir: string, why: string): void {
 // with NO in-memory leg runtime (a RESTARTED source retried at reconnect), with
 // its crash-resume marker. Fully idempotent: a guild already
 // graveyarded (its /data dir gone) is treated as done, an already-unfrozen guild
-// is a no-op. Returns true only when every named guild is provably gone/unfrozen
-// (or was already), false when a guild still exists live and could not be moved,
-// so the coordinator keeps the leg in pendingSourceCleanup and retries.
-async function commitSourceGuilds(migrationId: string, legId: string, guilds: string[]): Promise<boolean> {
-  if (guilds.length === 0) return true; // nothing to clean up
+// is a no-op. Returns the guilds still live that could not be moved, none when
+// every named guild is provably gone/unfrozen (or was already), so the
+// coordinator keeps the leg in pendingSourceCleanup, names them and retries.
+async function commitSourceGuilds(migrationId: string, legId: string, guilds: string[]): Promise<string[]> {
+  if (guilds.length === 0) return []; // nothing to clean up
   // Postgres-routed guilds have no on-disk originals: their cleanup is just
   // dropping any leftover working set, so a restarted source acks ok as a
   // natural no-op. Only file-routed guilds need the graveyard sequence.
@@ -930,13 +933,13 @@ async function commitSourceGuilds(migrationId: string, legId: string, guilds: st
     if (routeFor(guildId) === 'postgres') ws?.evict(guildId);
     else fileGuilds.push(guildId);
   }
-  if (fileGuilds.length === 0) return true;
+  if (fileGuilds.length === 0) return [];
   const marker = sourceGraveyardMarker(migrationId, legId);
   try {
     await fs.promises.mkdir(path.dirname(marker), { recursive: true });
     await fs.promises.writeFile(marker, JSON.stringify({ id: migrationId, phase: 'graveyarding', guilds: fileGuilds }), 'utf-8');
   } catch { /* best effort; boot resume only covers a crash after this point */ }
-  let allDone = true;
+  const stuck: string[] = [];
   for (const guildId of fileGuilds) {
     await removeFreezeSentinel(guildId);
     unfreezeGuildWrites(guildId);
@@ -944,12 +947,12 @@ async function commitSourceGuilds(migrationId: string, legId: string, guilds: st
     const existed = fs.existsSync(live);
     const moved = await deleteGuildNamespace(guildId, `migration-${migrationId}-source-retired`);
     // existed && !moved => the dir is still live (rename kept failing): not done.
-    if (existed && !moved) allDone = false;
+    if (existed && !moved) stuck.push(guildId);
   }
   // Only clear the resume marker once every guild is provably handled, so a
   // partial failure is finished by residueSweep.resumeSourceGraveyarding at boot.
-  if (allDone) { try { await fs.promises.unlink(marker); } catch { /* already gone */ } }
-  return allDone;
+  if (stuck.length === 0) { try { await fs.promises.unlink(marker); } catch { /* already gone */ } }
+  return stuck;
 }
 
 // statfs free bytes; undefined when unsupported (tolerated with a UI warning).

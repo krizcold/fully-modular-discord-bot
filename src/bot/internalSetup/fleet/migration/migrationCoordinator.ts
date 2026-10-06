@@ -43,6 +43,8 @@ import { routeFor } from '../../utils/dataBackends/routeResolver';
 import type { Registry } from '../registry';
 import type { HeldShardView, MigrationActiveView, MigrationLegView, MigrationView } from '../state';
 
+const STUCK_WAY_ON = 'their data dirs on that node cannot be renamed: check the dirs\' owner and permissions and anything holding them open';
+
 export interface StartMovePayload { kind: 'move'; shardId: number; toNodeId: string; }
 export interface StartSwapLeg { shardId: number; fromNodeId: string; toNodeId: string; }
 export interface StartSwapPayload { kind: 'swap'; legs: StartSwapLeg[]; }
@@ -456,6 +458,7 @@ export class MigrationCoordinator {
    */
   async onNodeDeclaredLost(lostNodeId: string, lostNodeName: string, freedShardIds: number[]): Promise<number[]> {
     const at = Date.now();
+    this.stuckCleanups.delete(lostNodeId);
     let changed = false;
     // Its owed commits and grants can never land: the rounds settle them
     // (a retire's slice is not what persist writes, so its parent's leg too).
@@ -1249,6 +1252,34 @@ export class MigrationCoordinator {
 
   private readonly cleanupRuns = new Map<string, Promise<void>>();
   private readonly releaseWarned = new Set<string>();
+  // nodeId -> legId -> the guilds its cleanup answered it could not move.
+  private readonly stuckCleanups = new Map<string, Map<string, { shardId: number; guilds: string[] }>>();
+
+  // A cleanup answered not done names the guilds the node could not move
+  // into its graveyard: warned once per change, named by the refusals it
+  // causes (a restart does not move them), forgotten once it is done.
+  private noteStuck(nodeId: string, leg: MigrationLeg, ack: any): void {
+    const legs = this.stuckCleanups.get(nodeId) ?? new Map<string, { shardId: number; guilds: string[] }>();
+    const guilds: string[] = Array.isArray(ack?.stuckGuilds) ? ack.stuckGuilds.filter((g: unknown): g is string => typeof g === 'string' && /^\d+$/.test(g)) : [];
+    if (ack?.ok) legs.delete(leg.legId);
+    else if (guilds.length > 0) {
+      if (legs.get(leg.legId)?.guilds.join(',') !== guilds.join(',')) {
+        console.warn(`[Migration] Shard ${leg.shardId}: ${this.hooks.registry.nodes?.get(nodeId)?.nodeName ?? nodeId}'s cleanup is not done: guild(s) [${guilds.join(', ')}] cannot be moved into its graveyard (${STUCK_WAY_ON}); retried every ${Math.round(XFER_COMMIT_RETRY_MS / 1000)}s`);
+      }
+      legs.set(leg.legId, { shardId: leg.shardId, guilds });
+    }
+    if (legs.size > 0) this.stuckCleanups.set(nodeId, legs);
+    else this.stuckCleanups.delete(nodeId);
+  }
+
+  /** What a refusal says of the guilds a node's cleanup cannot move (of the current-count shard given, else any); null when none. */
+  stuckCleanupText(nodeId: string, shardId?: number): string | null {
+    const owed = new Set(this.cleanupRecords().filter(rec => shardId === undefined || this.ofCurrentCount(rec))
+      .flatMap(rec => rec.pendingSourceCleanup?.find(e => e.nodeId === nodeId)?.legIds ?? []));
+    const guilds = [...(this.stuckCleanups.get(nodeId) ?? [])].filter(([legId, s]) => owed.has(legId) && (shardId === undefined || s.shardId === shardId)).flatMap(([, s]) => s.guilds);
+    if (guilds.length === 0) return null;
+    return `guild(s) [${[...new Set(guilds)].join(', ')}] cannot be moved into ${this.hooks.registry.nodes?.get(nodeId)?.nodeName ?? nodeId}'s graveyard (${STUCK_WAY_ON})`;
+  }
 
   private async runSourceCleanup(nodeId: string): Promise<void> {
     const records = this.cleanupRecords();
@@ -1301,6 +1332,7 @@ export class MigrationCoordinator {
               migrationId: rec.id, term: rec.term, epoch: rec.epoch ?? this.hooks.registry.epoch,
               legIds: [legId], sourceCleanup: true, guilds: leg.guilds,
             });
+          if (!back) this.noteStuck(nodeId, leg, ack);
           // A release counts only when the node reports the freeze and any
           // armed graveyard gone (an older executor does not report it).
           if (ack?.ok && (!back || ack.released === true)) {
@@ -1309,6 +1341,8 @@ export class MigrationCoordinator {
             }
             cleared.add(legId);
             this.releaseWarned.delete(legId);
+            this.stuckCleanups.get(nodeId)?.delete(legId);
+            if (this.stuckCleanups.get(nodeId)?.size === 0) this.stuckCleanups.delete(nodeId);
           } else if (back && ack?.ok && !this.releaseWarned.has(legId)) {
             this.releaseWarned.add(legId);
             console.warn(`[Migration] Shard ${leg.shardId}: ${this.hooks.registry.nodes?.get(nodeId)?.nodeName ?? nodeId}'s release from its owed cleanup is not complete (${ack.reason ?? 'it reports none; it may run an older version'}); retried every ${Math.round(XFER_COMMIT_RETRY_MS / 1000)}s`);
@@ -1488,6 +1522,7 @@ export class MigrationCoordinator {
           migrationId: rec.id, term: rec.term, epoch: rec.epoch ?? this.hooks.registry.epoch,
           legIds: [leg.legId], sourceCleanup: true, guilds: leg.guilds,
         });
+        this.noteStuck(leg.sourceNodeId, leg, ack);
         if (ack?.ok) {
           (leg as any)._sourceAcked = true;
           if (this.keepsSource(leg)) {
@@ -2228,13 +2263,19 @@ export class MigrationCoordinator {
     // drain takes, so the move waits until the cleanup has run.
     const owing = [target, source].find(node => this.pendingSourceCleanups().some(owed => owed.nodeId === node.nodeId && owed.shardIds.includes(shardId)));
     if (owing) {
-      return { ok: false, error: `${owing.nodeName} still owes the cleanup of shard ${shardId} from an earlier move (it missed that commit); the move waits until the cleanup has run` };
+      const stuck = this.stuckCleanupText(owing.nodeId, shardId);
+      return { ok: false, error: stuck
+        ? `${owing.nodeName} cannot finish the cleanup of shard ${shardId} from an earlier move: ${stuck}; the move waits until the cleanup has run`
+        : `${owing.nodeName} still owes the cleanup of shard ${shardId} from an earlier move (it missed that commit); the move waits until the cleanup has run` };
     }
     // A cleanup from before a reshard names its guilds, not a current shard:
     // a node owing one takes no move until it has run.
     const crossed = [target, source].find(node => this.pendingSourceCleanups().some(owed => owed.nodeId === node.nodeId && owed.crossed));
     if (crossed) {
-      return { ok: false, error: `${crossed.nodeName} still owes the cleanup of a move made before the last reshard (it missed that commit); the move waits until the cleanup has run` };
+      const stuck = this.stuckCleanupText(crossed.nodeId);
+      return { ok: false, error: stuck
+        ? `${crossed.nodeName} cannot finish the cleanup of a move made before the last reshard: ${stuck}; the move waits until the cleanup has run`
+        : `${crossed.nodeName} still owes the cleanup of a move made before the last reshard (it missed that commit); the move waits until the cleanup has run` };
     }
     if (leg.direction === 'none') {
       // Defense-in-depth for the lease-only hand-off: both participants must
