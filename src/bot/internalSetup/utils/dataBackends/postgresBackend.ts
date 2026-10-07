@@ -87,6 +87,15 @@ const PROVISION_DDL: string[] = [
 // within one node_id; across nodes the fence is strict <.
 const READ_ONLY_PROBE_MS = 5_000;
 
+// The term a delivered database must hold in its control row (B7-F7), raised
+// by the data boot on each delivery; 0 while none was delivered.
+let requiredControlTerm = 0;
+
+/** Raise the term every backend must be proven to hold before anything lands on it or hydrates from it. */
+export function requireControlTerm(term: number): void {
+  if (Number.isSafeInteger(term) && term > requiredControlTerm) requiredControlTerm = term;
+}
+
 function isReadOnlyError(error: unknown): boolean {
   return (error as { code?: unknown } | null)?.code === '25006';
 }
@@ -131,6 +140,8 @@ export class PostgresBackend implements DataBackend {
   private probing = false;
   private readOnly = false;
   private readOnlyProbing = false;
+  private staleCopy = false;
+  private provenTerm = 0;
   private readonly listeners: AlertListener[] = [];
   private readonly pendingSleeps = new Set<{ timer: NodeJS.Timeout; resolve: () => void }>();
 
@@ -193,6 +204,32 @@ export class PostgresBackend implements DataBackend {
 
   isReadOnly(): boolean {
     return this.readOnly;
+  }
+
+  /**
+   * The database turned out to be an older copy of the fleet's (B7-F7): every
+   * write is refused from now on, as on a copy in recovery, and nothing lifts
+   * it, so the working set keeps what it accepted for the database the node
+   * moves to.
+   */
+  fenceAsStale(): void {
+    this.staleCopy = true;
+    this.readOnly = true;
+  }
+
+  /** This database was read holding at least term in its control row. */
+  markProven(term: number): void {
+    if (term > this.provenTerm) this.provenTerm = term;
+  }
+
+  /**
+   * Not yet proven to hold the term its delivering master holds: nothing
+   * lands here and nothing hydrates from here until it is, the writes
+   * staying dirty in the working set, so an older copy of the fleet database
+   * takes none (B7-F7).
+   */
+  isUnproven(): boolean {
+    return requiredControlTerm > 0 && this.provenTerm < requiredControlTerm;
   }
 
   onAlert(cb: AlertListener): void {
@@ -278,6 +315,7 @@ export class PostgresBackend implements DataBackend {
   }
 
   private async stillInRecovery(client: PoolClient): Promise<boolean> {
+    if (this.staleCopy) return true;
     try {
       const res = await client.query('SELECT pg_is_in_recovery() AS in_recovery');
       if (res.rows[0]?.in_recovery === false) {
@@ -296,7 +334,7 @@ export class PostgresBackend implements DataBackend {
     try {
       while (!this.stopped && this.readOnly) {
         await this.sleep(READ_ONLY_PROBE_MS);
-        if (this.stopped || !this.readOnly) return;
+        if (this.stopped || !this.readOnly || this.staleCopy) return;
         try {
           const res = await this.pool.query('SELECT pg_is_in_recovery() AS in_recovery');
           if (!this.readOnly) return;
@@ -442,6 +480,7 @@ export class PostgresBackend implements DataBackend {
   // ==========================================================================
 
   async hydrateGuild(guildId: string, token: FenceToken): Promise<HydrationOutcome> {
+    if (this.isUnproven()) return { ok: false, reason: 'unavailable' };
     let client: PoolClient;
     try {
       client = await this.pool.connect();
@@ -508,6 +547,7 @@ export class PostgresBackend implements DataBackend {
    * first flush claims it).
    */
   async reclaimGuild(guildId: string, token: FenceToken): Promise<'kept' | 'lost' | null> {
+    if (this.isUnproven()) return null;
     let client: PoolClient;
     try {
       client = await this.pool.connect();
@@ -563,7 +603,7 @@ export class PostgresBackend implements DataBackend {
   }
 
   async flushGuild(guildId: string, batch: GuildFlushBatch, token: FenceToken): Promise<FlushOutcome> {
-    if (this.readOnly) return { ok: false, reason: 'read-only' };
+    if (this.readOnly || this.isUnproven()) return { ok: false, reason: 'read-only' };
     let client: PoolClient;
     try {
       client = await this.pool.connect();
@@ -631,6 +671,7 @@ export class PostgresBackend implements DataBackend {
   }
 
   async retireGuild(guildId: string, reason: string, token: FenceToken): Promise<RetireOutcome> {
+    if (this.isUnproven()) return { ok: false, reason: 'unavailable' };
     let client: PoolClient;
     try {
       client = await this.pool.connect();
@@ -1009,6 +1050,26 @@ export async function readStoreId(url: string): Promise<string | null> {
     if (res.rows.length === 0) return null;
     const parsed: unknown = JSON.parse(res.rows[0].value);
     return typeof parsed === 'string' ? parsed : null;
+  } finally {
+    await client.end().catch(() => { /* best effort */ });
+  }
+}
+
+/** The fleet term this database's control row holds; 0 when it holds no control store. Throws PostgresUnreachableError while it cannot be read. */
+export async function readControlTerm(url: string): Promise<number> {
+  const client = await metaClient(url);
+  try {
+    let res: QueryResult;
+    try {
+      res = await client.query('SELECT term FROM smdb_control.term WHERE id = 1');
+    } catch (error) {
+      if (isMissingRelation(error)) return 0;
+      throw new PostgresUnreachableError('control term read failed', error);
+    }
+    if (res.rows.length === 0) return 0;
+    const term = Number(res.rows[0].term);
+    if (!Number.isSafeInteger(term) || term < 0) throw new PostgresUnreachableError('control term read failed', new Error(`unusable term ${String(res.rows[0].term)}`));
+    return term;
   } finally {
     await client.end().catch(() => { /* best effort */ });
   }

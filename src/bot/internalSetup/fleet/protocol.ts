@@ -217,6 +217,12 @@ export interface DataBackendInfo {
   publicUrl?: string;
   /** Delivered by a serve-only stand-in: a copy still in recovery, followed in process and never persisted as the node's database. */
   serveOnly?: boolean;
+  /**
+   * The term the delivering master holds in this database's own control row,
+   * sent only when its control store is this database: the one a receiver
+   * serves from must hold at least this term, or it is an older copy (B7-F7).
+   */
+  controlTerm?: number;
   /** Active transformation, if any. */
   transformationId?: string;
   /** Per-guild routing overrides while a transformation is active. */

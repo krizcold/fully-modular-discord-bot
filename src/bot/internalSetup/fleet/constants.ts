@@ -345,6 +345,9 @@ export const STEPDOWN_FALLBACK_MS = 300_000;
 /** Grace between the step-down decision and the restart request, so a delivered backend can drain. */
 export const STEPDOWN_HANDOVER_DELAY_MS = 3000;
 
+/** How long a superseded master waits for its own database's proof against the successor's term before it restarts (B7-F7). */
+export const STEPDOWN_PROOF_WAIT_MS = 20_000;
+
 /** Per-candidate deadline for the new master's STEP_DOWN notification (best effort, fire and forget). */
 export const STEP_DOWN_NOTIFY_MS = PEER_TERM_PROBE_MS;
 

@@ -89,6 +89,19 @@ export class DataReadinessDriver {
     }
   }
 
+  /**
+   * Delivery hook (B7-F7): back to held, so nothing more hydrates from a
+   * database not yet proven against its master's term. idleOnly holds only a
+   * driver no lease or hydrated guild has reached yet; the result says whether
+   * the driver is held.
+   */
+  hold(idleOnly = false): boolean {
+    if (this.held) return true;
+    if (this.stopped || (idleOnly && (this.shardIds.length > 0 || this.ws.readyGuilds().length > 0))) return false;
+    this.held = true;
+    return true;
+  }
+
   /** Fleet hook: the node's lease set changed (grant adoption). */
   onLeaseChanged(snapshot: LeaseSnapshot): void {
     const prev = new Set(this.shardIds);

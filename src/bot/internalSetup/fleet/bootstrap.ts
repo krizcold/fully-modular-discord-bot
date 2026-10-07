@@ -92,7 +92,7 @@ import {
   GuildDataWriteRequest,
   setDataOpForwarder,
 } from '../utils/ipcDataHandler';
-import { applyDeliveredBackend, ensureRuntimeWith, getActiveBackendUrl, getDataBootStatus, getDeliveredBackendUrls, hasDelivery, holdOwnRuntimeForDelivery, pickDeliveredUrl, repointRuntimeForThisProcess } from '../utils/dataBackends/boot';
+import { applyDeliveredBackend, ensureRuntimeWith, getActiveBackendUrl, getDataBootStatus, getDeliveredBackendUrls, hasDelivery, holdOwnRuntimeForDelivery, pickDeliveredUrl, repointRuntimeForThisProcess, setRuntimeRecycledHandler, awaitServingProven } from '../utils/dataBackends/boot';
 import { setLeaseDeclineHandler } from '../utils/dataBackends/dataReadiness';
 import { applyRouteOverrides, currentRouteDefault } from '../utils/dataBackends/routeResolver';
 import { loadCredentials, resolveDataBackend, upsertCredentials } from '../../../utils/envLoader';
@@ -137,7 +137,7 @@ import {
   writeCopyBlock,
   writeSuperseded,
 } from './stepDown';
-import { ARM_MAX_ATTEMPTS, LEASE_TTL_MS, STANDIN_FENCE_HOLD_MS, STEP_DOWN_NOTIFY_MS, STEPDOWN_FALLBACK_MS, STEPDOWN_HANDOVER_DELAY_MS, WITNESS_FRESH_WINDOW_MS } from './constants';
+import { ARM_MAX_ATTEMPTS, LEASE_TTL_MS, STANDIN_FENCE_HOLD_MS, STEP_DOWN_NOTIFY_MS, STEPDOWN_FALLBACK_MS, STEPDOWN_HANDOVER_DELAY_MS, STEPDOWN_PROOF_WAIT_MS, WITNESS_FRESH_WINDOW_MS } from './constants';
 import type { StepDownPayload } from './protocol';
 import { planPinRestoreLegs } from './placement';
 import { TRANSFER_HANDOVER_TIMEOUT_MS, TRANSFER_PORT_DEFAULT } from './constants';
@@ -416,6 +416,16 @@ export async function initFleet(): Promise<FleetContext> {
   const appVersion = getAppVersion();
   const ingest = getIngestService();
   const runtime = new LeaseRuntime(ingest);
+  // A runtime the data layer rebuilt on its own (it found the database it
+  // served from an older copy, B7-F7) is re-mirrored as a delivery's is, and
+  // one it could not install restarts the process as a delivery's does.
+  setRuntimeRecycledHandler(outcome => {
+    if (outcome.recycled) runtime.renotifyDataLayer();
+    if (outcome.unreachable) {
+      console.error(`[Fleet] The delivered database cannot be installed from this node (${outcome.reason ?? 'no reason given'}); restarting in 3s to pick its form again on the register`);
+      setTimeout(() => requestStepDownRestart(), STEPDOWN_HANDOVER_DELAY_MS).unref();
+    }
+  });
   devRuntime = runtime;
   const advertisedTransferUrl = (process.env.TRANSFER_URL || '').trim() || undefined;
   const capabilities: NodeCapabilities = {
@@ -1361,6 +1371,9 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   let onSupersededByStore: ((observedTerm: number) => void) | null = null;
   let beginSupersession: ((by: { nodeId: string; nodeName: string; term: number }, source: SupersededSource) => void) | null = null;
   let finishStepDown: ((reason: string) => void) | null = null;
+  // The step-down notice's drain into the successor's database and the proof
+  // of this node's own, while they run: the restart waits on them (B7-F7).
+  let stepDownDrain: Promise<void> | null = null;
   if (store instanceof PostgresControlStore) {
     store.onFenced(observedTerm => {
       controlFenced = true;
@@ -3043,7 +3056,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     // its workers are handed the copy's forms instead (B7-F26).
     if (serveOnly) {
       const copy = standInDelivery();
-      if (copy) return { backend: 'postgres', url: copy.url, publicUrl: copy.publicUrl, serveOnly: true };
+      if (copy) return { backend: 'postgres', url: copy.url, publicUrl: copy.publicUrl, serveOnly: true, controlTerm: registry.term };
     }
     let live: 'file' | 'postgres' = 'file';
     try {
@@ -3070,7 +3083,12 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       };
     }
     if (live !== 'postgres') return { backend: 'file' };
-    return { backend: 'postgres', url, ...(publicUrl ? { publicUrl } : {}) };
+    // The master's control row lives in the delivered database unless
+    // CONTROL_STORE_URL splits it off, which leaves that database no term of
+    // its own to prove (B7-F7).
+    const controlUrl = (creds.CONTROL_STORE_URL || '').trim();
+    const ownRow = store instanceof PostgresControlStore && (controlUrl === '' || controlUrl === (creds.DATA_BACKEND_URL || '').trim());
+    return { backend: 'postgres', url, ...(publicUrl ? { publicUrl } : {}), ...(ownRow ? { controlTerm: registry.term } : {}) };
   }
 
   function planKeyOf(): string {
@@ -3568,7 +3586,13 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       }
       persistSupersession(true);
       console.warn(`[Fleet] STEP-DOWN (${reason}): restarting in ${Math.round(STEPDOWN_HANDOVER_DELAY_MS / 1000)}s to rejoin under ${supersededBy.nodeName} (term ${supersededBy.term})`);
-      setTimeout(() => requestStepDownRestart(), STEPDOWN_HANDOVER_DELAY_MS).unref();
+      // The notice's drain or proof still running (it can land after a fresh
+      // beacon staged this) holds the restart back, bounded, so the writes it
+      // carries land before the process goes (B7-F7).
+      setTimeout(() => {
+        const bound = new Promise<void>(resolve => { setTimeout(resolve, STEPDOWN_PROOF_WAIT_MS).unref(); });
+        void Promise.race([stepDownDrain ?? Promise.resolve(), bound]).catch(() => undefined).then(() => requestStepDownRestart());
+      }, STEPDOWN_HANDOVER_DELAY_MS).unref();
       // The IPC send is the only way back to a co-worker, and it can be lost
       // (parent mid-restart, detached child), so it repeats until the process
       // is replaced. The override is already on disk either way.
@@ -3634,8 +3658,14 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     // control store shares (it still reads the store until the restart).
     const stepDownAfterBackend = (info: StepDownPayload['dataBackend']): void => {
       if (!info) { finishStepDown?.('step-down notice'); return; }
-      void applyDeliveredBackend(info, { keepPrevious: true })
-        .then(({ recycled }) => { if (recycled) runtime.renotifyDataLayer(); })
+      stepDownDrain = applyDeliveredBackend(info, { keepPrevious: true })
+        .then(async ({ recycled }) => {
+          if (recycled) runtime.renotifyDataLayer();
+          // Its own database, kept but not yet proven against the successor's
+          // term, holds the buffered writes back: the restart waits a bounded
+          // while for the proof, so its shutdown flush lands them (B7-F7).
+          if (!(await awaitServingProven(STEPDOWN_PROOF_WAIT_MS))) console.error('[Fleet] Stepping down with writes held: the database this node served from could not be proven to hold the successor\'s term');
+        })
         .catch(error => console.error('[Fleet] Could not drain into the new master\'s database before stepping down:', error instanceof Error ? error.message : error))
         .finally(() => finishStepDown?.('step-down notice'));
     };

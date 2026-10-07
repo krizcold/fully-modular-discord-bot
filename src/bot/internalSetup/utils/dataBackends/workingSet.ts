@@ -604,7 +604,9 @@ export class WorkingSetManager {
       // retry without degrading acceptance (the gate refuses new writes).
       for (const key of flushedKeys) ws.dirtyKeys.add(key);
       ws.requeue = false;
-      this.lastError = 'flush refused: the database is read-only (SQLSTATE 25006)';
+      this.lastError = (this.backend as { isUnproven?: () => boolean }).isUnproven?.() === true
+        ? 'flush held: the database is not yet proven to hold its master\'s term'
+        : 'flush refused: the database is read-only (SQLSTATE 25006)';
       this.scheduleRetry();
       return false;
     }
