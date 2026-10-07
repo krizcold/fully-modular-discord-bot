@@ -6,6 +6,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { DATA_ROOT } from '../../../../utils/dataRoot';
+import { graveyardGuildDir } from '../../utils/dataBackends/fileBackend';
 import { deleteGuildNamespace, listGuilds, stampOwner } from '../../utils/dataManager';
 import { atomicWriteFileSync } from '../fileControlStore';
 import { graveyardLiveDir } from '../fileFailover';
@@ -70,7 +71,8 @@ export async function runResidueSweep(selfNodeId: string, nodeIdFreshlyGenerated
       }
       // Foreign residue: another live node's data on this disk (cloned volume,
       // stale migration source), and this node's identity was LOADED (not
-      // regenerated), so the mismatch is genuine. Quarantine it rather than serve it.
+      // regenerated), so the mismatch is genuine. Quarantine it rather than serve it:
+      // the dir itself, whatever the guild's route (a guild now on postgres keeps its rows).
       console.warn(
         `[Fleet] FOREIGN RESIDUE detected: /data/${guildId}/.owner belongs to node ${owner.nodeId}, ` +
         `not this node (${selfNodeId}).\n` +
@@ -78,7 +80,7 @@ export async function runResidueSweep(selfNodeId: string, nodeIdFreshlyGenerated
         `[Fleet] If this box was cloned from another node's data volume, that is expected; ` +
         `the original owner still holds this guild.`,
       );
-      await deleteGuildNamespace(guildId, 'foreign-residue');
+      await graveyardGuildDir(guildId, 'foreign-residue');
     }
   }
 
