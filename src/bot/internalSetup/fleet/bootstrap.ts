@@ -129,6 +129,7 @@ import {
   notifyStepDown,
   readCopyBlock,
   readSuperseded,
+  recordParkSupersession,
   requestStepDownRestart,
   SupersededSource,
   witnessWinner,
@@ -710,7 +711,7 @@ async function runStaleMasterFence(
     }
   }
   const localTerm = local ? local.term : 0;
-  const park = (observedTerm: number, peerUrl: string, holderNodeId: string, detail: string, opts: { extra?: string; exit?: string; noSighting?: boolean } = {}): Promise<never> => {
+  const park = (observedTerm: number, peerUrl: string, holderNodeId: string, detail: string, opts: { extra?: string; exit?: string; noSighting?: boolean; superseded?: { nodeName: string; source: SupersededSource } } = {}): Promise<never> => {
     // A stand-in that trips the fence has learned the master is alive after all,
     // which is the best possible outcome: it simply stops standing in. Parking
     // it instead would strand a node that is no longer a backup and no longer a
@@ -724,6 +725,15 @@ async function runStaleMasterFence(
     const exit = opts.exit ?? 'Demote this node to rejoin as a co-worker.';
     console.error(`[Fleet] STALE MASTER FENCE: ${detail}; parking the boot instead of acquiring a term on a database the fleet has moved off. ${exit}${opts.extra ?? ''}`);
     if (!opts.noSighting) noteHolderSighting(holderNodeId, observedTerm, 'fence-park', selfNodeId);
+    // File mode only (on postgres the manager's re-seed retires the side),
+    // and only for a node that held a term of its own the fleet moved past.
+    if (opts.superseded && !(store instanceof PostgresControlStore) && holderNodeId !== selfNodeId && localTerm > 0 && observedTerm > localTerm) {
+      try {
+        recordParkSupersession(holderNodeId, opts.superseded.nodeName, observedTerm, opts.superseded.source);
+      } catch (error) {
+        console.warn(`[Fleet] The supersession this park found could not be recorded: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
     _setStaleMasterPark({ observedTerm, localTerm, peerUrl, at: Date.now(), ...(store instanceof PostgresControlStore ? {} : { reason: `${detail}. ${exit}` }) });
     pushFleetStatusNow();
     return (async () => { for (;;) await guardSleep(TERM_GUARD_POLL_MS); })();
@@ -895,7 +905,8 @@ async function runStaleMasterFence(
         // data the outage produced.
         return hold(peer.term, url, peer.nodeId, null, `${url} is standing in for this node and has taken writes at term ${peer.term} while this node's store holds ${localTerm}: its copy is the fleet database now and this one is behind it`);
       }
-      await park(peer.term, url, peer.nodeId, `${url} answers as a live master on term ${peer.term} while this node's store holds ${localTerm} and nothing is writing to it`);
+      await park(peer.term, url, peer.nodeId, `${url} answers as a live master on term ${peer.term} while this node's store holds ${localTerm} and nothing is writing to it`,
+        stagedTakeover || fileSeeded ? {} : { superseded: { nodeName: claims?.find(c => c.nodeId === peer.nodeId)?.nodeName ?? `node ${peer.nodeId.slice(0, 8)}`, source: 'store-fence' } });
     }
   }
 
@@ -961,7 +972,7 @@ async function runStaleMasterFence(
       // top term as the holder (a later promote of the copy is then refused as
       // a copy of a previous master) and skips a backup's echo.
       await park(higher.term, `witness beacon of ${higher.nodeName}`, (masterAtTop ?? higher).nodeId, `the witness holds a beacon from ${higher.nodeName} (${higher.nodeId.slice(0, 8)}) at term ${higher.term} while this node's store holds ${localTerm}`,
-        { extra: ' If this database was DELIBERATELY restored from a dump, the fleet has not moved anywhere: the manager\'s restore lane advances the restored control term automatically, and FLEET_CONFIRM_TAKEOVER=1 on the next start overrides the fence by hand.', exit, noSighting: exit !== undefined && masterAtTop === null });
+        { extra: ' If this database was DELIBERATELY restored from a dump, the fleet has not moved anywhere: the manager\'s restore lane advances the restored control term automatically, and FLEET_CONFIRM_TAKEOVER=1 on the next start overrides the fence by hand.', exit, noSighting: exit !== undefined && masterAtTop === null, ...(exit === undefined && !stagedTakeover && !fileSeeded ? { superseded: { nodeName: (masterAtTop ?? higher).nodeName, source: 'witness' as const } } : {}) });
     }
   }
   return null;

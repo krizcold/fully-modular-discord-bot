@@ -49,6 +49,17 @@ export function clearSuperseded(): void {
   try { fs.unlinkSync(supersededFile()); } catch { /* already absent */ }
 }
 
+/**
+ * A master boot parked on another node's higher term (B4f-5): the fleet
+ * moved past this node, and the co-worker a Demote makes reads the fact for
+ * its Retire and its stale-copy inventory. A record at that term or above stands.
+ */
+export function recordParkSupersession(byNodeId: string, byNodeName: string, term: number, source: SupersededSource): void {
+  const existing = readSuperseded();
+  if (existing && existing.term >= term) return;
+  writeSuperseded({ byNodeId, byNodeName, term, retireRequested: existing?.retireRequested === true, at: Date.now(), source, steppedDown: false });
+}
+
 export function readCopyBlock(): CopyBlock | null {
   try {
     const parsed = JSON.parse(fs.readFileSync(copyBlockFile(), 'utf-8'));
