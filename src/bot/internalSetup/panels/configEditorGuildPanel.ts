@@ -172,7 +172,11 @@ const configEditorGuildPanel: PanelOptions = {
       }
 
       // Perform the reset
-      saveGuildConfig(fileId, context.guildId, {});
+      try {
+        saveConfigFile(fileId, context.guildId, {});
+      } catch (error) {
+        return showError(`Reset failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      }
 
       // Return to config view
       const guildConfigs = discoverGuildConfigFiles(context.guildId);
@@ -252,7 +256,7 @@ const configEditorGuildPanel: PanelOptions = {
             deleteConfigFile(fileId, { guildId: context.guildId! });
           }
         } else {
-          saveGuildConfig(fileId, context.guildId!, overridesOnly);
+          saveConfigFile(fileId, context.guildId!, overridesOnly);
         }
 
         const updatedConfig = loadGuildConfig(fileId, context.guildId!);
@@ -306,7 +310,7 @@ const configEditorGuildPanel: PanelOptions = {
         console.log(`[ConfigEditor] Deleted ${fileId} (no overrides)`);
       } else {
         // Save only overrides
-        saveGuildConfig(fileId, context.guildId, overridesOnly);
+        saveConfigFile(fileId, context.guildId, overridesOnly);
       }
     } catch (error) {
       const container = new ContainerBuilder()
@@ -328,11 +332,18 @@ const configEditorGuildPanel: PanelOptions = {
   },
 };
 
-// A refused delete leaves the old config in place: raised, never shown as saved.
-function deleteConfigFile(fileId: string, options: DataOptions): void {
-  const outcome = deleteDataOutcome(fileId, options);
+// A refused write or delete leaves the old config in place: raised, never shown as saved.
+function raiseRefusal(outcome: string): void {
   if (outcome === 'frozen') throw new Error('the guild\'s data is frozen for a shard migration; nothing was changed, try again after it completes');
   if (outcome === 'refused') throw new Error('the guild\'s data could not be changed now; nothing was changed, try again shortly');
+}
+
+function deleteConfigFile(fileId: string, options: DataOptions): void {
+  raiseRefusal(deleteDataOutcome(fileId, options));
+}
+
+function saveConfigFile(fileId: string, guildId: string, data: any): void {
+  raiseRefusal(saveGuildConfig(fileId, guildId, data));
 }
 
 // Helper function to show error messages

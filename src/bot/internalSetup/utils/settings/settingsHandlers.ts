@@ -30,7 +30,7 @@ import {
 } from './settingsBuilder';
 import {
   loadModuleSettings,
-  saveModuleSetting,
+  saveModuleSettings,
   resetAllModuleSettings,
   exportModuleSettings,
   loadHardLimits,
@@ -296,8 +296,9 @@ export async function handleSettingsButton(
         return render(state);
       }
 
-      for (const [key, value] of Object.entries(state.pendingChanges)) {
-        saveModuleSetting(moduleName, key, value, context.guildId);
+      if (Object.keys(state.pendingChanges).length > 0 && !saveModuleSettings(moduleName, state.pendingChanges, context.guildId)) {
+        await sendEphemeralError(context, 'Save not applied: the settings could not be written now (a shard migration, data not ready, or the database unavailable); your changes are kept, try again shortly.');
+        return render(state);
       }
 
       state.pendingChanges = {};
@@ -604,11 +605,13 @@ export async function handleSettingsModal(
         // Validate each imported value against effective limits so a JSON
         // upload cannot bypass the caps the user sees in the panel UI.
         const mergedLimits = getMergedHardLimits(moduleName, context.guildId);
+        const accepted: Record<string, any> = {};
         for (const [key, value] of Object.entries(parsedSettings)) {
           const definition = schema.settings[key];
-          if (definition && validateValueWithEffectiveLimits(value, definition, mergedLimits[key]).valid) {
-            saveModuleSetting(moduleName, key, value, context.guildId);
-          }
+          if (definition && validateValueWithEffectiveLimits(value, definition, mergedLimits[key]).valid) accepted[key] = value;
+        }
+        if (Object.keys(accepted).length > 0 && !saveModuleSettings(moduleName, accepted, context.guildId)) {
+          return createV2Response(buildErrorPanel('Upload failed: the settings could not be written now (a shard migration, data not ready, or the database unavailable); nothing was changed, try again shortly.'));
         }
 
         state.pendingChanges = {};

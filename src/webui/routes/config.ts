@@ -269,7 +269,8 @@ export function createConfigRoutes(botManager: BotManager): Router {
 
       // Use appropriate save function based on context
       if (guildId) {
-        saveGuildConfig(fileId, guildId, newConfig);
+        const outcome = saveGuildConfig(fileId, guildId, newConfig);
+        if (outcome !== 'saved') throw new Error(`the guild config was not written (${outcome})`);
         console.log(`[Config] ${fileId} updated successfully for guild ${guildId}`);
       } else {
         saveGlobalConfig(fileId, newConfig);

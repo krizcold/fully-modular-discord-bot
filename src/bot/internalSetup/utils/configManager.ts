@@ -1,7 +1,7 @@
 import * as path from 'path';
 import { getConfigFileMetadata } from './configDiscovery';
 import { dataPath } from '../../../utils/dataRoot';
-import { loadData, readRaw, saveData, writeRawAtomic } from './dataManager';
+import { loadData, readRaw, saveData, saveDataOutcome, writeRawAtomic } from './dataManager';
 import type { ModuleConfigSchema, ConfigFieldSchema } from '../../types/moduleTypes';
 
 // Use dist/bot/config.json in production, src/bot/config.json in development
@@ -247,25 +247,25 @@ export function loadGuildConfig(filename: string, guildId: string): any {
 }
 
 /**
- * Save entire guild-specific config file
+ * Save entire guild-specific config file: 'frozen' or 'refused' when the
+ * write did not land.
  * Guild configs are stored in /data/{guildId}/_guildConfig/config.json
  * Module configs are stored in /data/{guildId}/{moduleName}/{filename}
  */
-export function saveGuildConfig(filename: string, guildId: string, data: any): void {
+export function saveGuildConfig(filename: string, guildId: string, data: any): 'saved' | 'frozen' | 'refused' {
   // Guild-specific config now lives inside the guild namespace.
   if (filename === 'config.json') {
-    saveData('config.json', { guildId, category: '_guildConfig' }, data);
-    return;
+    return saveDataOutcome('config.json', { guildId, category: '_guildConfig' }, data);
   }
 
   // For module config files, use metadata to get correct path
   const metadata = getConfigFileMetadata(filename);
   if (!metadata || !metadata.moduleName) {
     console.warn(`[ConfigManager] saveGuildConfig called with undiscovered filename "${filename}"; skipping`);
-    return;
+    return 'refused';
   }
 
-  saveData(filename, { guildId, category: metadata.moduleName }, data);
+  return saveDataOutcome(filename, { guildId, category: metadata.moduleName }, data);
 }
 
 /**
