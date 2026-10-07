@@ -299,7 +299,12 @@ export class MigrationCoordinator {
       this.parentRecord = null;
       this.finishHooks = null;
       if (finalState === 'DONE') void this.runRetire();
-      else { this.paused = true; void this.persist().then(() => this.hooks.pushStatus()); }
+      else {
+        this.paused = true;
+        void this.persist()
+          .catch(error => console.warn(`[Migration] Retire ${parent.id} is paused, but its pause could not be written: ${error instanceof Error ? error.message : error}`))
+          .then(() => this.hooks.pushStatus());
+      }
     };
     if (state === 'COMMITTING') void this.enterCommitting(true);
     else if (state === 'GRANTING') void this.enterGranting();
@@ -344,12 +349,14 @@ export class MigrationCoordinator {
    * acked after it, none once granting. A node Declared Lost is not
    * waited on.
    */
-  redistributeOwed(): { decided: boolean; nodeIds: string[] } {
+  redistributeOwed(): { decided: boolean; nodeIds: string[]; aborting: boolean } {
     const rec = this.record;
-    if (!rec || rec.kind !== 'redistribute' || isTerminal(rec.state) || rec.state === 'GRANTING') return { decided: false, nodeIds: [] };
+    if (!rec || rec.kind !== 'redistribute' || isTerminal(rec.state) || rec.state === 'GRANTING') return { decided: false, nodeIds: [], aborting: false };
+    // Its proposal is cleared as the abort begins, retried with it.
+    if (this.abortInProgress) return { decided: false, nodeIds: [], aborting: true };
     const decided = rec.state === 'COMMITTING';
     const owed = rec.legs.filter(l => this.hooks.registry.nodes.has(l.targetNodeId) && !(decided && (l as any)._targetAcked));
-    return { decided, nodeIds: [...new Set(owed.map(l => l.targetNodeId))] };
+    return { decided, nodeIds: [...new Set(owed.map(l => l.targetNodeId))], aborting: false };
   }
 
   /** The shards the migration committing or granting still owes nodeId. */
@@ -765,6 +772,8 @@ export class MigrationCoordinator {
     if (!this.recovered) return null;
     const active = this.parentRecord ?? this.record;
     if (active && active.id === migrationId) {
+      // A decision not yet written is not one: a refused write aborts.
+      if (this.decisionWriting !== null && this.decisionWriting === this.record && active.state === 'COMMITTING') return null;
       if (active.state === 'COMMITTING' || active.state === 'GRANTING') {
         return { verdict: 'committing', term: active.term, epoch: active.epoch ?? this.hooks.registry.epoch, ...this.legsNotLanding(active) };
       }
@@ -1099,11 +1108,23 @@ export class MigrationCoordinator {
     return this.record !== rec || this.abortInProgress || rec.state === 'ABORTING' || isTerminal(rec.state);
   }
 
+  // A step before the commit decision whose record the control store
+  // refuses aborts the migration, as a step that fails does, unless the
+  // record moved on meanwhile (a twin step); true when the step goes on.
+  private async stepTo(rec: MigrationRecord, state: MigrationState): Promise<boolean> {
+    try {
+      await this.transition(state);
+    } catch (error) {
+      if (!this.overtaken(rec) && rec.state === state) await this.enterAborting(`the ${state} step could not be written: ${error instanceof Error ? error.message : error}`);
+      return false;
+    }
+    return !this.overtaken(rec);
+  }
+
   private async enterPreparing(): Promise<void> {
     const rec = this.record;
     if (!rec) return;
-    await this.transition('PREPARING');
-    if (this.overtaken(rec)) return;
+    if (!await this.stepTo(rec, 'PREPARING')) return;
     const leaseOnly = this.recordIsLeaseOnly();
     try {
       const acks = await this.sendPrepareToAll();
@@ -1175,8 +1196,7 @@ export class MigrationCoordinator {
     if (!rec) return;
     this.drainRan = true;
     for (const leg of rec.legs) leg.drained = true;
-    await this.transition('DRAINING');
-    if (this.overtaken(rec)) return;
+    if (!await this.stepTo(rec, 'DRAINING')) return;
     this.armDrainTimeout();
     try {
       // Per source leg, in order: revoke the moving lease (bounded gap starts),
@@ -1499,9 +1519,8 @@ export class MigrationCoordinator {
     const rec = this.record;
     if (!rec) return;
     this.clearDrainTimeout();
-    await this.transition('VERIFYING');
     // A twin step (a verify sent again) may have decided meanwhile.
-    if (this.overtaken(rec) || rec.state !== 'VERIFYING') return;
+    if (!await this.stepTo(rec, 'VERIFYING') || rec.state !== 'VERIFYING') return;
     if (this.recordIsLeaseOnly()) {
       // Verify = drain confirmation: every source flushed everything durable
       // into the database (data-commit strictly before the gateway swap).
@@ -1557,7 +1576,15 @@ export class MigrationCoordinator {
     for (const leg of this.record.legs) {
       leg.committed = { epoch: this.record.epoch, at: committedAt, sourceName: this.hooks.registry.nodes?.get(leg.sourceNodeId)?.nodeName ?? leg.sourceNodeId };
     }
-    await this.enterCommitting(false);
+    // No commit is sent before the decision is written: one the control
+    // store refuses was never acted on, so the migration aborts unstamped.
+    try {
+      await this.enterCommitting(false);
+    } catch (error) {
+      if (this.record !== rec || this.abortInProgress) return;
+      for (const leg of rec.legs) delete leg.committed;
+      await this.enterAborting(`the commit decision could not be written: ${error instanceof Error ? error.message : error}`);
+    }
   }
 
   private logHashDiff(leg: MigrationLeg, l: LegLive): void {
@@ -1575,8 +1602,11 @@ export class MigrationCoordinator {
   // product), then sources (graveyard originals). All idempotent + retried.
   private async enterCommitting(resuming: boolean): Promise<void> {
     if (!this.record) return;
-    if (!resuming) await this.transition('COMMITTING');
-    else this.hooks.pushStatus();
+    if (!resuming) {
+      this.decisionWriting = this.record;
+      await this.transition('COMMITTING');
+      this.decisionWriting = null;
+    } else this.hooks.pushStatus();
     this.runCommitRound();
     if (!this.commitTimer) {
       this.commitTimer = setInterval(() => this.runCommitRound(), XFER_COMMIT_RETRY_MS);
@@ -1586,15 +1616,27 @@ export class MigrationCoordinator {
 
   private runCommitRound(): void {
     if (!this.record || this.record.state !== 'COMMITTING') { this.clearCommitTimer(); return; }
+    // No commit is sent before the decision is written: its write starts the first round.
+    if (this.decisionWriting === this.record) return;
     // One round per record at a time: a round outliving the retry tick (a
     // slow commit) would ack beside the next, and both would enter GRANTING.
     const rec = this.record;
     if (this.commitRoundFor === rec) return;
     this.commitRoundFor = rec;
-    void this.commitRound(rec).finally(() => { if (this.commitRoundFor === rec) this.commitRoundFor = null; });
+    void this.commitRound(rec)
+      .catch(error => {
+        // A write the control store refuses: the commit timer runs the round again.
+        if (this.commitWarned.has(rec)) return;
+        this.commitWarned.add(rec);
+        console.warn(`[Migration] A commit round of ${rec.id} did not complete: ${error instanceof Error ? error.message : error}; retried every ${XFER_COMMIT_RETRY_MS / 1000} s`);
+      })
+      .finally(() => { if (this.commitRoundFor === rec) this.commitRoundFor = null; });
   }
 
   private commitRoundFor: MigrationRecord | null = null;
+  // The record whose commit decision is being written, or was refused.
+  private decisionWriting: MigrationRecord | null = null;
+  private readonly commitWarned = new WeakSet<MigrationRecord>();
 
   private async commitRound(rec: MigrationRecord): Promise<void> {
     let allTargets = true;
@@ -1640,8 +1682,10 @@ export class MigrationCoordinator {
     }
     const sourcesSettled = rec.legs.every(l => (l as any)._sourceAcked || (l as any)._sourcePending || this.keepsSource(l));
     if (allTargets && sourcesSettled) {
-      this.clearCommitTimer();
+      // The owed cleanups are written before the timer stops: a write the
+      // control store refuses runs the round again on its next tick.
       if ((rec.pendingSourceCleanup?.length ?? 0) > 0) await this.persist();
+      this.clearCommitTimer();
       void this.enterGranting();
     }
   }
@@ -1671,6 +1715,12 @@ export class MigrationCoordinator {
     this.grantingFor = rec;
     try {
       await this.runGranting();
+    } catch (error) {
+      // A store write refused or a proposal that cannot be read: the
+      // migration stays in GRANTING and the grant round runs again.
+      const retried = this.record === rec && rec.state === 'GRANTING';
+      if (!this.grantTimer) console.warn(`[Migration] Granting ${rec.id} did not complete: ${error instanceof Error ? error.message : error}${retried ? `; retried every ${XFER_COMMIT_RETRY_MS / 1000} s` : ''}`);
+      if (retried) this.scheduleGrantRetry();
     } finally {
       if (this.grantingFor === rec) this.grantingFor = null;
     }
@@ -1783,11 +1833,24 @@ export class MigrationCoordinator {
     // must not terminally abort it. Operator Abort-remaining goes via abort().
     if (this.record.kind === 'retire' && this.paused) return;
     this.abortInProgress = true;
+    await this.runAbort(reason, false);
+  }
+
+  // A write the control store refuses mid-abort (the proposal's clear, the
+  // record's) leaves the abort under way, retried until it lands: the
+  // migration's steps stand down and Resume waits meanwhile.
+  private async runAbort(reason: string, retried: boolean): Promise<void> {
+    const rec = this.record;
     try {
       await this.enterAbortingImpl(reason);
-    } finally {
-      this.abortInProgress = false;
+    } catch (error) {
+      if (rec && this.record === rec) {
+        if (!retried) console.warn(`[Migration] Aborting ${rec.id} did not complete: ${error instanceof Error ? error.message : error}; the abort stays under way and is retried every ${XFER_COMMIT_RETRY_MS / 1000} s`);
+        setTimeout(() => void this.runAbort(reason, true), XFER_COMMIT_RETRY_MS).unref();
+        return;
+      }
     }
+    this.abortInProgress = false;
   }
 
   private async enterAbortingImpl(reason: string): Promise<void> {
@@ -1918,7 +1981,21 @@ export class MigrationCoordinator {
   // --------------------------------------------------------------------------
   // Retire: sequential legs, each a complete Move with its own barrier.
   // --------------------------------------------------------------------------
+  // A control store write refused between legs (a pause, the finish)
+  // stops the run where it stands, the retire paused for Resume.
   private async runRetire(): Promise<void> {
+    const rec = this.record;
+    try {
+      await this.runRetireLegs();
+    } catch (error) {
+      const held = !!rec && this.record === rec;
+      if (held) this.paused = true;
+      console.warn(`[Migration] Retire ${rec?.id} did not complete: ${error instanceof Error ? error.message : error}${held ? '; it is paused, Resume it once the control store takes writes' : ''}`);
+      this.hooks.pushStatus();
+    }
+  }
+
+  private async runRetireLegs(): Promise<void> {
     if (!this.record || this.record.kind !== 'retire') return;
     const rec = this.record;
     for (let idx = rec.currentLegIndex ?? 0; idx < rec.legs.length; idx++) {
@@ -1999,7 +2076,8 @@ export class MigrationCoordinator {
         this.finishHooks = null;
         resolve(state === 'DONE');
       };
-      void this.persist().then(() => this.enterPreparing());
+      // A leg whose start the control store refuses aborts: nothing moved.
+      void this.persist().then(() => this.enterPreparing(), error => this.enterAborting(`the leg's start could not be written: ${error instanceof Error ? error.message : error}`));
     });
   }
 
@@ -2087,8 +2165,7 @@ export class MigrationCoordinator {
   private async enterPreparingRedistribute(): Promise<void> {
     const rec = this.record;
     if (!rec) return;
-    await this.transition('PREPARING');
-    if (this.overtaken(rec)) return;
+    if (!await this.stepTo(rec, 'PREPARING')) return;
     try {
       const acks = await this.sendPrepareToAll();
       if (this.overtaken(rec)) return;

@@ -2699,7 +2699,8 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     if (!paused) return { success: false, error: 'No reshard pause is active' };
     const recordsBlocked = coordinator?.recordsBlock();
     if (recordsBlocked) return { success: false, error: recordsBlocked };
-    const owed = coordinator?.redistributeOwed() ?? { decided: false, nodeIds: [] };
+    const owed = coordinator?.redistributeOwed() ?? { decided: false, nodeIds: [], aborting: false };
+    if (owed.aborting) return { success: false, error: 'a redistribute is being aborted; Resume once its abort ends' };
     if (owed.nodeIds.length > 0 || redistributeStarts > 0) {
       const names = owed.nodeIds.map(id => registry.nodes.get(id)?.nodeName ?? id).join(', ');
       return {
