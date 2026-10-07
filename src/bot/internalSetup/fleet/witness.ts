@@ -26,6 +26,14 @@ export type WitnessRole = 'master' | 'backup';
  */
 export type StoreState = 'healthy' | 'stalled' | 'dead';
 
+/** The master's synchronous posture as its beacon carries it, ordered like the posture facts by (term, seq). */
+export interface BeaconPosture {
+  state: 'armed' | 'relaxed';
+  slotName: string | null;
+  term: number;
+  seq: number;
+}
+
 /** What a node publishes about itself beyond its term and role. */
 export interface BeaconFacts {
   storeState?: StoreState;
@@ -52,6 +60,12 @@ export interface BeaconFacts {
    * and no other channel carries it once the master is unreachable.
    */
   masterSeen?: boolean;
+  /**
+   * Master only: its synchronous posture, recorded here before any relax
+   * releases a waiting write, so a copy cut off from the master by stream and
+   * control connection alike still reads the relax (B7-F23's full partition).
+   */
+  posture?: BeaconPosture;
 }
 
 export interface WitnessClaim {
@@ -64,6 +78,7 @@ export interface WitnessClaim {
   promoting?: boolean;
   backupPriority?: number;
   masterSeen?: boolean;
+  posture?: BeaconPosture;
   /** Discord's edited_timestamp (falls back to the post timestamp), ms epoch. */
   observedAt: number;
 }
@@ -85,6 +100,8 @@ export interface FleetWitness {
   /** Latest claim per node from the beacon home. Null = witness dark. */
   readClaims(): Promise<WitnessClaim[] | null>;
   getStatus(): WitnessStatus;
+  /** Renews now with the loop's current facts, after any renew in flight; true once Discord holds it. */
+  renewNow(): Promise<boolean>;
 }
 
 const BEACON_MARKER = 'FLEET BEACON v1';
@@ -152,6 +169,12 @@ function rest(method: string, path: string, token: string, body?: unknown): Prom
   });
 }
 
+function parsePosture(raw: any): BeaconPosture | null {
+  if (!raw || (raw.state !== 'armed' && raw.state !== 'relaxed')) return null;
+  if (!Number.isFinite(raw.term) || !Number.isFinite(raw.seq)) return null;
+  return { state: raw.state, slotName: typeof raw.slotName === 'string' && raw.slotName !== '' ? raw.slotName : null, term: Number(raw.term), seq: Number(raw.seq) };
+}
+
 function parseBeacon(content: unknown): { nodeId: string; nodeName: string; term: number; role: WitnessRole } & BeaconFacts | null {
   if (typeof content !== 'string') return null;
   const lines = content.split('\n');
@@ -159,6 +182,7 @@ function parseBeacon(content: unknown): { nodeId: string; nodeName: string; term
   try {
     const parsed = JSON.parse(lines.slice(1).join('\n'));
     if (typeof parsed?.nodeId !== 'string' || parsed.nodeId === '' || !Number.isFinite(parsed?.term)) return null;
+    const posture = parsePosture(parsed.posture);
     return {
       nodeId: parsed.nodeId,
       nodeName: typeof parsed.nodeName === 'string' && parsed.nodeName !== '' ? parsed.nodeName : parsed.nodeId,
@@ -172,6 +196,7 @@ function parseBeacon(content: unknown): { nodeId: string; nodeName: string; term
       ...(parsed.promoting === true ? { promoting: true } : {}),
       ...(Number.isFinite(parsed.backupPriority) ? { backupPriority: Number(parsed.backupPriority) } : {}),
       ...(parsed.masterSeen === true ? { masterSeen: true } : {}),
+      ...(posture ? { posture } : {}),
     };
   } catch {
     return null;
@@ -203,6 +228,9 @@ export class DiscordWitness implements FleetWitness {
   // never resume at a previously-used value.
   private seq = Date.now();
 
+  /** A renew loop replaces this (startWitnessLoop); a bare witness holds no current facts to renew with. */
+  renewNow: () => Promise<boolean> = async () => false;
+
   constructor(private readonly opts: DiscordWitnessOptions) {}
 
   getStatus(): WitnessStatus {
@@ -231,6 +259,7 @@ export class DiscordWitness implements FleetWitness {
       ...(facts.promoting ? { promoting: true } : {}),
       ...(Number.isFinite(facts.backupPriority) ? { backupPriority: facts.backupPriority } : {}),
       ...(facts.masterSeen ? { masterSeen: true } : {}),
+      ...(facts.posture ? { posture: facts.posture } : {}),
       seq: ++this.seq,
     })}`;
     if (this.beaconMessageId === null) {
@@ -387,7 +416,7 @@ export interface WitnessLoopOptions extends DiscordWitnessOptions {
 /** Build a witness and drive its renew loop; a successful renew is followed by a read so drills can verify both halves. */
 /** Only the facts a reader ACTS on; a changed value here is worth an out-of-band renew, the seq counter is not. */
 function factsKey(facts: BeaconFacts): string {
-  return [facts.storeState ?? '', facts.standingInFor ?? '', facts.promoting ? '1' : '', facts.backupPriority ?? '', facts.masterSeen ? '1' : ''].join('|');
+  return [facts.storeState ?? '', facts.standingInFor ?? '', facts.promoting ? '1' : '', facts.backupPriority ?? '', facts.masterSeen ? '1' : '', facts.posture ? `${facts.posture.state}:${facts.posture.slotName ?? ''}:${facts.posture.term}` : ''].join('|');
 }
 
 export function startWitnessLoop(opts: WitnessLoopOptions): FleetWitness {
@@ -424,6 +453,24 @@ export function startWitnessLoop(opts: WitnessLoopOptions): FleetWitness {
       // The suppliers are externally owned; a throw here must never become an
       // unhandled rejection that takes the bot child down.
       console.warn('[Fleet] Witness tick failed:', error instanceof Error ? error.message : error);
+    } finally {
+      inFlight = false;
+    }
+  };
+  // An awaited renew for a fact that must be on Discord before its owner acts
+  // (the posture's relax): it waits out a tick in flight rather than overlap
+  // it, then renews with the facts as they are now.
+  witness.renewNow = async () => {
+    for (let waited = 0; inFlight && waited < WITNESS_REST_TIMEOUT_MS * 3; waited += 50) await new Promise(resolve => setTimeout(resolve, 50));
+    if (inFlight) return false;
+    inFlight = true;
+    try {
+      const facts = opts.getBeaconFacts?.() ?? {};
+      const ok = await witness.renewClaim(opts.getTerm(), opts.role, facts);
+      if (ok) publishedFacts = factsKey(facts);
+      return ok;
+    } catch {
+      return false;
     } finally {
       inFlight = false;
     }

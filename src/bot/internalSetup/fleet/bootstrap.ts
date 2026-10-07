@@ -113,7 +113,7 @@ import { readReshardPending, readStandbyTermRow } from './armProbe';
 import { clearSlotStatus, readSlotStatus, recordFromPush, sourceMatchesAny, writeSlotStatus } from './slotStatus';
 import { startSyncPostureEngine, SyncPostureEngine, SyncPostureTarget } from './syncPostureEngine';
 import { clearSyncPostureRecord, recordFromPosturePush, writeSyncPostureRecord } from './syncPostureFact';
-import { BeaconFacts, DiscordWitness, FleetWitness, startWitnessLoop, WitnessStatus } from './witness';
+import { BeaconFacts, BeaconPosture, DiscordWitness, FleetWitness, startWitnessLoop, WitnessStatus } from './witness';
 import { probePeerTerm } from './peerTermProbe';
 import { probeStoreEmpty } from './emptyStore';
 import { readPromoteRecord, writePromoteRecord } from './promoteRecord';
@@ -1320,7 +1320,18 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   // cluster it does not serve from. The copy's OWN inherited
   // synchronous_standby_names still has to go, but only when it leaves recovery,
   // which is the write step's job.
-  const bootRelaxed = serveOnly ? false : await clearOwnSyncPosture();
+  // A cluster that came back armed is relaxed only once the relax is on this
+  // master's beacon (B7-F23's full partition), stamped one term above the row
+  // the cluster holds: after every attestation of the incarnation that armed
+  // it, before any of this boot's, whose term is at least that. With no
+  // token there is no witness to record on, so the relax waits.
+  const bootRelaxToken = (process.env.DISCORD_TOKEN || '').trim();
+  const recordBootRelax = (rowTerm: number): Promise<boolean> => bootRelaxToken === ''
+    ? Promise.resolve(false)
+    : new DiscordWitness({ token: bootRelaxToken, nodeId, nodeName, getChannelId: () => readFleetConfigCache()?.witnessChannelId ?? null })
+      .renewClaim(rowTerm, 'master', { posture: { state: 'relaxed', slotName: null, term: rowTerm + 1, seq: 0 } });
+  const bootClear = serveOnly ? null : await clearOwnSyncPosture(recordBootRelax, { selfNodeId: nodeId });
+  let bootRelaxed = bootClear?.ok === true;
   const store = serveOnly
     ? createStandInControlStore(standInUrl, stagingHooksFor(armRecord!.armedAt))
     : await prepareControlStore(standalone).catch((error: unknown) => {
@@ -1412,6 +1423,12 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   // the write step before either override was written.
   if (store instanceof PostgresControlStore && !standalone && !standIn) {
     previousHolder = await runTakeoverGuard(store, nodeId, takeoverConfirmed);
+  }
+  // A cluster another master armed is relaxed only once the guard has let
+  // this boot past that master (its row stopped advancing, or the takeover
+  // is confirmed), and under the same recorded rule.
+  if (bootClear?.foreign && !standalone) {
+    bootRelaxed = (await clearOwnSyncPosture(recordBootRelax, { selfNodeId: nodeId, foreignAllowed: true })).ok;
   }
   // The fence stays ON for a stand-in: its PEER half parks on any answering peer
   // at an equal or higher term, which is how a master that came back between the
@@ -3145,6 +3162,8 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   // older publish that overtakes a newer one must never become the stored
   // truth, and the stored truth is what every standby replays.
   let publishedPosture: SyncPosturePayload | null = null;
+  /** The posture this master's beacon carries: every attestation, and a relax before it lands. */
+  let beaconPosture: BeaconPosture | null = null;
   let posturePending: SyncPosturePayload | null = null;
   let postureSeq = 0;
   let postureWriting = false;
@@ -3175,6 +3194,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   const publishSyncPosture = (fact: { state: 'armed' | 'relaxed'; slotName: string | null; nodeId: string | null; heldToLsn: string | null }): void => {
     const stamped: SyncPosturePayload = { ...fact, updatedAt: Date.now(), masterNodeId: nodeId, term: registry.term, seq: ++postureSeq };
     publishedPosture = stamped;
+    beaconPosture = { state: stamped.state, slotName: stamped.slotName, term: stamped.term, seq: stamped.seq };
     posturePending = stamped;
     void drainPostureWrites();
     // Pushed now rather than on the next heartbeat: a master that dies inside
@@ -4112,6 +4132,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
         // TTL is a dead store, not a blip.
         getBeaconFacts: (): BeaconFacts => {
           const facts: BeaconFacts = { storeState: 'healthy' };
+          if (beaconPosture) facts.posture = beaconPosture;
           // The flag that makes every other node treat this one as the fleet's
           // coordinator while keeping the node it names out of the park path
           // (F21). Published from the master loop because a serving stand-in IS
@@ -4172,6 +4193,13 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       url: () => getActiveBackendUrl(),
       publish: fact => publishSyncPosture(fact),
       attested: () => publishedPosture !== null,
+      // Every relax lands on this master's beacon before it releases a
+      // waiting write (B7-F23's full partition); with no token there is no
+      // witness to record on, so the relax waits.
+      recordRelax: async () => {
+        beaconPosture = { state: 'relaxed', slotName: null, term: registry.term, seq: ++postureSeq };
+        return witness ? witness.renewNow() : false;
+      },
       foreignCancelAt: () => {
         let newest = 0;
         for (const node of registry.nodes.values()) {

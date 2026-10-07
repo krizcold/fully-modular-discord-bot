@@ -35,14 +35,13 @@
  * so a cached read cannot skew it either. If WAL kept arriving after the last
  * attestation, the tail of this copy is unattested and nothing is claimed.
  *
- * WHAT REMAINS UNCLOSED, stated rather than papered over: if the master
- * relaxes while this node's control connection is down as well, then
- * acknowledges writes this copy never receives, then dies, this copy sees
- * neither those writes nor the relax on either carrier, and reads as
- * consistent. No fact reaching this machine can distinguish that (only the
- * master's beacon could carry it), which is one reason the arming conjunction
- * is not this file's to make. Where the control connection outlived the
- * stream, the pushed relax IS that fact, and the verdict honours it above.
+ * THE THIRD CARRIER is the master's witness beacon, for the full partition:
+ * a master whose stream and control connection to this copy are cut
+ * together records every relax on its beacon BEFORE the relax releases a
+ * waiting write (syncPostureEngine's recordRelax, and the boot clear's), and
+ * holds the writes while it cannot. A copy reads the witness to arm at all,
+ * so a relax there later than the replayed row contradicts at any age, like
+ * a later pushed one.
  *
  * Fail-closed throughout, on the slot signal's precedent (B6 map D16): a
  * missing, stale, or not-from-this-master fact is no verdict at all, never a
@@ -208,6 +207,10 @@ export interface SyncPostureEvidence {
    * already released writes this copy was never waited for.
    */
   copyTerm: number | null;
+  /** The master's posture as its witness beacon last carried it; like the pushed fact it can only contradict. */
+  beaconed?: SyncPostureFact | null;
+  /** The highest term any other node's beacon shows, its own or its posture's; null when unread. */
+  witnessTerm?: number | null;
 }
 
 export interface SyncPostureVerdict {
@@ -229,6 +232,8 @@ export interface SyncPostureVerdict {
  */
 export function syncPostureVerdict(evidence: SyncPostureEvidence, now = Date.now()): SyncPostureVerdict {
   const { replayed, pushed, mySlotName, sourceIsCurrentMaster, copyTerm } = evidence;
+  const beaconed = evidence.beaconed ?? null;
+  const witnessTerm = evidence.witnessTerm ?? null;
   const no = (reason: string): SyncPostureVerdict => ({ inSync: false, heldToLsn: null, reason });
   if (!mySlotName) return no('this node hosts no standby of the fleet database');
   // A copy that follows some other database is not evidence about this fleet,
@@ -258,6 +263,12 @@ export function syncPostureVerdict(evidence: SyncPostureEvidence, now = Date.now
   if (replayed.fact.term < copyTerm) {
     return no('this copy has replayed a term the master took after its last attestation, so nothing vouches for the writes since');
   }
+  // A mastership the witness shows above the attestation's term, from any
+  // node, is one this copy never replayed: a second master on this cluster
+  // after a full partition records its relax on its OWN beacon.
+  if (witnessTerm !== null && witnessTerm > replayed.fact.term) {
+    return no(`the witness shows a mastership at term ${witnessTerm}, after the term ${replayed.fact.term} of the posture this copy replayed, so writes since then may be missing from this copy`);
+  }
   if (pushedIsFresh && pushed!.masterNodeId !== replayed.fact.masterNodeId) {
     return no('the replayed posture came from a different master than the one now speaking');
   }
@@ -268,6 +279,13 @@ export function syncPostureVerdict(evidence: SyncPostureEvidence, now = Date.now
   if (order === 1) {
     if (pushed!.state !== 'armed') return no('the master later said it was waiting for no copy, and this copy never replayed that relax');
     if (pushed!.slotName !== mySlotName) return no('the master later said it was waiting for a different copy');
+  }
+  // The same rule on the beacon, the carrier a full partition leaves: the
+  // master records every relax there before it releases a waiting write.
+  if (beaconed && beaconed.masterNodeId === replayed.fact.masterNodeId
+    && (beaconed.term !== replayed.fact.term ? beaconed.term > replayed.fact.term : beaconed.seq > replayed.fact.seq)) {
+    if (beaconed.state !== 'armed') return no('the master\'s witness beacon records a relax later than the posture this copy replayed');
+    if (beaconed.slotName !== mySlotName) return no('the master\'s witness beacon records a later posture naming a different copy');
   }
   // F23's rule, and the one that closes the unilateral degrade: if this copy
   // has replayed transactions from after the last attestation, WAL kept

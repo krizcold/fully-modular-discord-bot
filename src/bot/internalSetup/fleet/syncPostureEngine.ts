@@ -9,7 +9,7 @@
  * this must work in a hand-deployed fleet, and the relax has to be immediate
  * (F12).
  *
- * Four properties the rest of this file exists to hold:
+ * Five properties the rest of this file exists to hold:
  *
  *  - THE CONNECTION IS DEDICATED. An armed cluster stalls every write, so a
  *    relax issued through a pool would queue behind the very stall it is
@@ -28,6 +28,12 @@
  *    poll re-reads the live setting and corrects this engine's own idea of it,
  *    because a state variable that says "relaxed" while the cluster is armed
  *    would disable every path that could relax it.
+ *  - EVERY RELAX IS RECORDED BEFORE IT RELEASES A WRITE. A relax lets the
+ *    waiting commits through as acknowledged writes the copy never gets, so
+ *    it first lands on this master's witness beacon (recordRelax), which a
+ *    copy cut off by stream and control connection alike still reads; while
+ *    it cannot, the posture stays armed and the writes keep waiting
+ *    (B7-F23's full partition).
  *
  * The budget this pays for is ruled: about one to two seconds of fleet-wide
  * write stall on a drop (F3).
@@ -98,6 +104,9 @@ const STOP_FENCE_MS = 6000;
  * replayed copy of it evidence.
  */
 const PUBLISH_REFRESH_MS = 30_000;
+
+/** How often a relax that cannot be recorded is reported while the writes it would release keep waiting. */
+const UNRECORDED_NOTE_MS = 30_000;
 
 const sleep = (ms: number): Promise<void> => new Promise(resolve => { setTimeout(resolve, ms); });
 
@@ -190,6 +199,13 @@ export function startSyncPostureEngine(inputs: {
   foreignCancelAt?: () => number;
   /** Whether this process has already published a posture fact (the boot attestation), so the engine's own is redundant. */
   attested?: () => boolean;
+  /**
+   * Records that this master is about to stop waiting where a copy cut off by
+   * stream and control connection alike still reads it (the witness beacon);
+   * true once recorded. Every relax awaits it before releasing a waiting
+   * write, and a false keeps the posture armed.
+   */
+  recordRelax?: () => Promise<boolean>;
 }): SyncPostureEngine {
   let client: Client | null = null;
   let clientUrl = '';
@@ -214,6 +230,7 @@ export function startSyncPostureEngine(inputs: {
   const steadyTicks = new Map<string, number>();
   let complainedAboutCommitLevel = '';
   let publishedAt = 0;
+  let unrecordedNotedAt = 0;
   let lastSampleAt = 0;
   let stopped = false;
   let ticking = false;
@@ -260,6 +277,13 @@ export function startSyncPostureEngine(inputs: {
   /** Returns true once the cluster is actually relaxed; false leaves the state alone so every later tick retries. */
   const drop = async (live: Client, reason: string): Promise<boolean> => {
     const was = named;
+    if (inputs.recordRelax && !(await inputs.recordRelax().catch(() => false))) {
+      if (Date.now() - unrecordedNotedAt >= UNRECORDED_NOTE_MS) {
+        unrecordedNotedAt = Date.now();
+        console.error(`[Fleet] SYNC POSTURE: ${reason}, but the relax could not be recorded on the witness, so fleet writes keep waiting for ${was?.slotName ?? 'the named copy'} rather than be acknowledged without it; retried every second`);
+      }
+      return false;
+    }
     try {
       await relaxSyncPosture(live);
     } catch (error) {
@@ -517,14 +541,19 @@ export function startSyncPostureEngine(inputs: {
       // Fence a tick that is already mid-arm: its write would otherwise land
       // AFTER the relax below and leave the cluster armed with nothing running.
       for (let waited = 0; ticking && waited < STOP_FENCE_MS; waited += 25) await sleep(25);
-      // Unconditional: this engine's own state cannot be trusted to say what
-      // is on the cluster, and a master that stops being one must leave
-      // nothing armed behind it. The next boot's clear is the backstop, not
-      // the plan.
+      // Judged on the live setting, not this engine's state, which cannot be
+      // trusted to say what is on the cluster: a master that stops being one
+      // leaves nothing armed behind it unless the relax cannot be recorded,
+      // and then the next boot's clear releases it under the same rule.
       const url = (inputs.url() || '').trim();
       const live = url ? await connect(url) : null;
       let relaxed = false;
-      if (live) {
+      const armedNames = live
+        ? await live.query(`SELECT current_setting('synchronous_standby_names') AS names`).then(r => String(r.rows[0]?.names ?? '').trim()).catch(() => 'unknown')
+        : '';
+      const recorded = armedNames === '' || !inputs.recordRelax || await inputs.recordRelax().catch(() => false);
+      if (!recorded) console.error('[Fleet] SYNC POSTURE: left armed while standing down: the relax could not be recorded on the witness, so writes stay waiting until a master serving this database records and relaxes it (this node\'s next boot as master, or the watchdog of the master that now serves it)');
+      if (live && recorded) {
         relaxed = await relaxSyncPosture(live).then(() => true).catch(error => {
           console.error(`[Fleet] SYNC POSTURE: could not relax while standing down; the next master boot clears it: ${error instanceof Error ? error.message : String(error)}`);
           return false;

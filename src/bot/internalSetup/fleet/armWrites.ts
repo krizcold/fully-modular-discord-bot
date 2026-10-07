@@ -120,12 +120,16 @@ export async function evaluateStandInWrites(ctx: StandInWriteContext, renewOk: b
     const replayed = await readReplayedSyncPosture(ctx.standInUrl);
     const pushed = readSyncPostureRecord();
     const termRow = await readStandbyTermRow(ctx.standInUrl);
+    const beacon = status.claims.find(c => c.nodeId === ctx.coveringNodeId)?.posture ?? null;
+    const witnessTerm = status.claims.reduce((max, c) => (c.nodeId === ctx.nodeId ? max : Math.max(max, c.term, c.posture?.term ?? 0)), 0);
     const sync = syncPostureVerdict({
       replayed,
       pushed,
       mySlotName: copy.slotName ?? null,
       sourceIsCurrentMaster: replayed !== null && replayed.fact.masterNodeId === ctx.coveringNodeId && pushed?.sourceIsCurrentMaster !== false,
       copyTerm: termRow?.term ?? null,
+      beaconed: beacon ? { state: beacon.state, slotName: beacon.slotName, nodeId: null, heldToLsn: null, updatedAt: 0, masterNodeId: ctx.coveringNodeId, term: beacon.term, seq: beacon.seq } : null,
+      witnessTerm,
     }, now);
     const verdict = writeStepVerdict(evidence, sync, free.absent);
     if (!verdict.arm) {
