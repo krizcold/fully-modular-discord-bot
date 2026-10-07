@@ -2187,8 +2187,9 @@ export class MigrationCoordinator {
   private proposalWrites: Promise<unknown> = Promise.resolve();
 
   // The stored proposal is read and written one pass at a time, so a
-  // Declare Lost's trim and a redistribute's re-persist never undo each other.
-  private serialProposal<T>(pass: () => Promise<T>): Promise<T> {
+  // Declare Lost's trim, a redistribute's re-persist and the master's own
+  // reads and clears (Resume's among them) never undo each other.
+  serialProposal<T>(pass: () => Promise<T>): Promise<T> {
     const run = this.proposalWrites.then(pass, pass);
     this.proposalWrites = run.catch(() => undefined);
     return run;

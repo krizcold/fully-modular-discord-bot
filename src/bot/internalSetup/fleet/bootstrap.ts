@@ -2651,6 +2651,12 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     await persist();
   }
 
+  // The stored proposal's reads and clears here take their turn behind a
+  // trim or a re-persist the coordinator has queued, so none writes it back.
+  function proposalPass<T>(pass: () => Promise<T>): Promise<T> {
+    return coordinator ? coordinator.serialProposal(pass) : pass();
+  }
+
   // Bounded retry of the redistribute-proposal grants that hard-refused at Resume
   // (or whose owner was disconnected). Each tick re-runs grantResumeProposal; when
   // every proposal shard has landed the fence empties, the proposal file is
@@ -2669,7 +2675,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
         }
         if (resumePendingShards.size === 0) {
           clearResumeRetry();
-          await store.saveRedistributeProposal(null).catch(error =>
+          await proposalPass(() => store.saveRedistributeProposal(null)).catch(error =>
             console.warn('[Fleet] Clearing the settled redistribute proposal failed:', error instanceof Error ? error.message : error));
           console.log('[Fleet] Reshard pause resume: the proposal is settled (each shard landed on its owner, or was freed with an owner Declared Lost)');
           void distribute();
@@ -2727,7 +2733,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     // Read while the pause holds: one that cannot be read keeps it.
     let persistedProposal: RedistributeProposal | null;
     try {
-      persistedProposal = await store.loadRedistributeProposal();
+      persistedProposal = await proposalPass(() => store.loadRedistributeProposal());
     } catch (error) {
       return { success: false, error: `the redistribute proposal cannot be read (${error instanceof Error ? error.message : error}); the pause stays, try Resume again` };
     }
@@ -2754,9 +2760,9 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       if (resumePendingShards.size > 0) {
         await grantResumeProposal();
         if (resumePendingShards.size > 0) scheduleResumeRetry();
-        else await store.saveRedistributeProposal(null);
+        else await proposalPass(() => store.saveRedistributeProposal(null));
       } else {
-        await store.saveRedistributeProposal(null);
+        await proposalPass(() => store.saveRedistributeProposal(null));
       }
       console.log('[Fleet] Reshard pause resumed: granted the redistribute proposal');
     } else {
@@ -3838,7 +3844,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
               await grantResumeProposal();
               if (resumePendingShards.size === 0) {
                 clearResumeRetry();
-                await store.saveRedistributeProposal(null);
+                await proposalPass(() => store.saveRedistributeProposal(null));
               }
             }
             await distribute();
@@ -4025,7 +4031,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
         console.warn(`[Fleet] Recovery: shard(s) [${[...resumePendingShards].sort((a, b) => a - b).join(', ')}] of the last reshard still await their grant onto the nodes holding their data (${resumeOwnerNames()}); each lands as its node registers, or is freed by a Declare Lost of that node`);
         scheduleResumeRetry();
       } else {
-        await store.saveRedistributeProposal(null).catch(error =>
+        await proposalPass(() => store.saveRedistributeProposal(null)).catch(error =>
           console.warn('[Fleet] Clearing the settled redistribute proposal failed:', error instanceof Error ? error.message : error));
       }
     }
