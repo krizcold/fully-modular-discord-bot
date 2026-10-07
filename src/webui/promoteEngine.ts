@@ -151,7 +151,7 @@ type HoldForms = { following: string | null; followingForms: string[] };
  * never read as "no hold".
  */
 /** A seed push of this node's copy, as the child reports it (B4f-3). */
-interface SeedPushFacts { seedId: string; phase: string; sentAt: number | null }
+interface SeedPushFacts { seedId: string; phase: string; sentAt: number | null; landedAt?: number | null }
 
 async function readChildState(botManager: BotManager): Promise<{ initialized: boolean; hold: HoldForms | null; park: { at: number; peerUrl: string; observedTerm: number } | null; masterSeedHold: boolean; seedPush: SeedPushFacts | null } | null> {
   if (!botManager.isRunning()) return null;
@@ -167,7 +167,7 @@ async function readChildState(botManager: BotManager): Promise<{ initialized: bo
     park: park && Number.isFinite(park.at) ? { at: Number(park.at), peerUrl: String(park.peerUrl ?? ''), observedTerm: Number(park.observedTerm) || 0 } : null,
     masterSeedHold: res.state.masterSeedHold === true,
     seedPush: res.state.seedPush && typeof res.state.seedPush === 'object'
-      ? { seedId: String(res.state.seedPush.seedId ?? ''), phase: String(res.state.seedPush.phase ?? ''), sentAt: Number.isFinite(res.state.seedPush.sentAt) ? Number(res.state.seedPush.sentAt) : null }
+      ? { seedId: String(res.state.seedPush.seedId ?? ''), phase: String(res.state.seedPush.phase ?? ''), sentAt: Number.isFinite(res.state.seedPush.sentAt) ? Number(res.state.seedPush.sentAt) : null, landedAt: Number.isFinite(res.state.seedPush.landedAt) ? Number(res.state.seedPush.landedAt) : null }
       : null,
   };
 }
@@ -592,8 +592,8 @@ async function reachabilityRefusal(): Promise<PromoteStartResult | null> {
 function fileSeedRefusal(masterSeedHold: boolean, push: SeedPushFacts | null): string | null {
   if (masterSeedHold) return 'the master this node is registered with holds to be seeded (B4f-3), so it is not dead: seed it from this node\'s copy on its Fleet tab if this node offers one (a promote of this node adopting the copy withdraws the offer), or Demote that master first and promote or Continue here.';
   if (push && (push.phase === 'dialing' || push.phase === 'copying')) return `a seed push of this node's copy is running (seed ${push.seedId}); let it finish or fail before promoting here`;
-  if (push && push.phase === 'sent' && typeof push.sentAt === 'number' && Date.now() - push.sentAt < SEED_SENT_PROMOTE_HOLD_MS) {
-    return `this node's copy was pushed to a master being seeded ${Math.round((Date.now() - push.sentAt) / 1000)}s ago (seed ${push.seedId}); that master restarts as the fleet's master and this node registers with it, so a promote here would mint beside it. Wait for it (up to ${Math.round(SEED_SENT_PROMOTE_HOLD_MS / 60000)} minutes after the push) and promote only if it never comes back, or if that master was demoted or its seed failed without this node being told (its Fleet tab says).`;
+  if (push && push.phase === 'sent' && push.landedAt == null && typeof push.sentAt === 'number' && Date.now() - push.sentAt < SEED_SENT_PROMOTE_HOLD_MS) {
+    return `this node's copy was pushed to a master being seeded ${Math.round((Date.now() - push.sentAt) / 1000)}s ago (seed ${push.seedId}); that master restarts as the fleet's master and this node registers with it, so a promote here would mint beside it. Wait for it (up to ${Math.round(SEED_SENT_PROMOTE_HOLD_MS / 60000)} minutes after the push; the wait ends as soon as this node registers with it serving) and promote only if it never comes back, or if that master was demoted or its seed failed without this node being told (its Fleet tab says).`;
   }
   return null;
 }

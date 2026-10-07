@@ -238,6 +238,10 @@ export interface SeedPushView {
   startedAt: number;
   /** When the final round and the hashes went out; the backup's own file promote waits on it. */
   sentAt: number | null;
+  /** The master that asked for the push; a seeded master keeps its node id. */
+  masterNodeId: string | null;
+  /** When this node registered with that master serving, after the push was sent: the seed landed. */
+  landedAt: number | null;
   error: string | null;
 }
 
@@ -252,6 +256,8 @@ export interface SeedSourceHooks {
   selfNodeId: string;
   selfNodeName: string;
   getTerm: () => number;
+  /** The master this node last registered with. */
+  masterNodeId: () => string | null;
   sendToMaster: (type: string, data: any) => void;
   onChanged: () => void;
 }
@@ -276,6 +282,14 @@ export class SeedSource {
 
   getOfferView(): SeedOfferView | null {
     return this.lastOffer;
+  }
+
+  /** The master this node pushed to registers it as a serving master: the seed landed. */
+  noteServingMaster(masterNodeId: string): void {
+    const view = this.push;
+    if (!view || view.phase !== 'sent' || view.landedAt !== null || view.masterNodeId !== masterNodeId) return;
+    view.landedAt = Date.now();
+    this.hooks.onChanged();
   }
 
   async handle(type: string, data: any): Promise<any> {
@@ -307,7 +321,7 @@ export class SeedSource {
     const offered = new Set(outcome.offer.guilds.map(g => g.guildId));
     const missing = payload.guilds.filter(g => !offered.has(g));
     if (missing.length > 0) return { ok: false, reason: `the copy no longer holds guild(s) ${missing.slice(0, 5).join(', ')}; ask for the offer again` };
-    this.push = { seedId: payload.seedId, phase: 'dialing', round: 0, filesSent: 0, bytesSent: 0, startedAt: Date.now(), sentAt: null, error: null };
+    this.push = { seedId: payload.seedId, phase: 'dialing', round: 0, filesSent: 0, bytesSent: 0, startedAt: Date.now(), sentAt: null, masterNodeId: this.hooks.masterNodeId(), landedAt: null, error: null };
     this.hooks.onChanged();
     void this.runPush(payload);
     return { ok: true };

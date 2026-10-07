@@ -4464,6 +4464,7 @@ async function initCoWorker(init: CommonInit, followerHold: FollowerHoldBase | n
       selfNodeId: nodeId,
       selfNodeName: nodeName,
       getTerm: () => controlClient?.getTerm() ?? 0,
+      masterNodeId: () => controlClient?.getMasterNodeId() ?? null,
       sendToMaster: (type, data) => controlClient?.sendToMaster(type, data),
       onChanged: () => pushFleetStatusNow(),
     });
@@ -4489,6 +4490,7 @@ async function initCoWorker(init: CommonInit, followerHold: FollowerHoldBase | n
       },
       onMasterIdentity: (masterNodeId, term) => {
         noteHolderSighting(masterNodeId, term, 'register', nodeId);
+        source.noteServingMaster(masterNodeId);
         mirrorEngine?.tickNow();
       },
       onSuperseded: info => {
