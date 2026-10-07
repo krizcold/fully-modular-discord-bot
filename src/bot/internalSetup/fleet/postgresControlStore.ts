@@ -97,6 +97,7 @@ export class PostgresControlStore implements ControlStore {
   private readOnlyNoted = false;
   private stageFailureNoted = false;
   private mintedTerm: number | null = null;
+  private termFloor = 0;
   private fenced = false;
   private fencedCb: ((observedTerm: number) => void) | null = null;
 
@@ -190,9 +191,15 @@ export class PostgresControlStore implements ControlStore {
     }
   }
 
+  /** The next mint lands above this term: a boot let past higher beacons mints above them (B4f-5 F4). */
+  floorNextTerm(term: number): void {
+    if (Number.isSafeInteger(term) && term > this.termFloor) this.termFloor = term;
+  }
+
   /**
    * CAS term acquisition; the floor is seeded from guild_ownership so a fresh
-   * control schema on an existing data store can never mint a stale term.
+   * control schema on an existing data store can never mint a stale term,
+   * and the mint lands above any floorNextTerm set.
    * Unreachable store: infinite backoff (master boot waits, never crashes).
    * Read-only store: ControlStoreReadOnlyError, on which the boot parks.
    */
@@ -213,10 +220,10 @@ export class PostgresControlStore implements ControlStore {
           } catch { /* separate control instance: no data schema to seed from */ }
           const res = await client.query(
             `INSERT INTO smdb_control.term AS t (id, term, node_id, updated_at)
-             VALUES (1, $1 + 1, $2, $3)
-             ON CONFLICT (id) DO UPDATE SET term = t.term + 1, node_id = $2, updated_at = $3
+             VALUES (1, GREATEST($1::bigint, $4::bigint) + 1, $2, $3)
+             ON CONFLICT (id) DO UPDATE SET term = GREATEST(t.term, $4::bigint) + 1, node_id = $2, updated_at = $3
              RETURNING term`,
-            [floor, nodeId, Date.now()]);
+            [floor, nodeId, Date.now(), this.termFloor]);
           const term = Number(res.rows[0].term);
           this.mintedTerm = term;
           return term;

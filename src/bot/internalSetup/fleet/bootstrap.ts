@@ -132,6 +132,7 @@ import {
   recordParkSupersession,
   requestStepDownRestart,
   SupersededSource,
+  topForeignBeaconTerm,
   witnessWinner,
   writeCopyBlock,
   writeSuperseded,
@@ -664,16 +665,19 @@ async function runStaleMasterFence(
         console.error('[Fleet] Seize in file mode: abandoning the stalled seed failed; the boot serves the disk as it is:', error instanceof Error ? error.message : error);
       }
     }
-    // File mode (B4f-3): the seize mints above every beacon, as the brand-new
-    // release does; the backups echo the fleet's term, and a seized master
-    // below it would step down on their fresh beacons within seconds.
+    // The seize mints above every beacon, as the brand-new file-mode release
+    // does (B4f-3): in file mode the backups echo the fleet's term, and a
+    // seized master below it would step down on their fresh beacons within
+    // seconds; on either backend a beacon left above it parks every later
+    // boot (B4f-5 F4).
     const seizeToken = (process.env.DISCORD_TOKEN || '').trim();
-    if (!(store instanceof PostgresControlStore) && !standIn && seizeToken !== '') {
+    if (!standIn && seizeToken !== '') {
       const beacons = await new DiscordWitness({ token: seizeToken, nodeId: selfNodeId, nodeName: selfNodeName, getChannelId: () => readFleetConfigCache()?.witnessChannelId ?? null }).readClaims();
-      const top = (beacons ?? []).reduce((max, c) => (c.nodeId !== selfNodeId && Number.isFinite(c.term) ? Math.max(max, c.term) : max), 0);
+      const top = topForeignBeaconTerm(beacons ?? [], selfNodeId);
       if (top > 0) {
-        floorTermAbove(selfNodeId, top);
-        console.warn(`[Fleet] Seize in file mode: the term is floored at ${top}, the highest beacon on the witness, so this boot mints above it`);
+        if (store instanceof PostgresControlStore) store.floorNextTerm(top);
+        else floorTermAbove(selfNodeId, top);
+        console.warn(`[Fleet] Seize: the term is floored at ${top}, the highest beacon on the witness, so this boot mints above it`);
       }
     }
     // A stand-in seen holding the fleet for this node is the episode this
@@ -973,6 +977,16 @@ async function runStaleMasterFence(
       // a copy of a previous master) and skips a backup's echo.
       await park(higher.term, `witness beacon of ${higher.nodeName}`, (masterAtTop ?? higher).nodeId, `the witness holds a beacon from ${higher.nodeName} (${higher.nodeId.slice(0, 8)}) at term ${higher.term} while this node's store holds ${localTerm}`,
         { extra: ' If this database was DELIBERATELY restored from a dump, the fleet has not moved anywhere: the manager\'s restore lane advances the restored control term automatically, and FLEET_CONFIRM_TAKEOVER=1 on the next start overrides the fence by hand.', exit, noSighting: exit !== undefined && masterAtTop === null, ...(exit === undefined && !stagedTakeover && !fileSeeded ? { superseded: { nodeName: masterAtTop ? masterAtTop.nodeName : `the fleet's master (last beaconed by ${higher.nodeName})`, source: 'witness' as const } } : {}) });
+    }
+  }
+  // A staged takeover judges fresh beacons only (above); on postgres its
+  // mint lands above the stale ones it passed, which the next boot judges
+  // with the rest (B4f-5 F4). A file-mode seed already sits above them.
+  if (stagedTakeover && !standIn && store instanceof PostgresControlStore && claims) {
+    const passed = topForeignBeaconTerm(claims, selfNodeId);
+    if (passed > localTerm) {
+      store.floorNextTerm(passed);
+      console.warn(`[Fleet] Takeover staged by a promote: the witness holds beacons that are not fresh up to term ${passed}, above this node's term ${localTerm}; the term is floored there, so this boot mints above them and a later boot does not park on them`);
     }
   }
   return null;

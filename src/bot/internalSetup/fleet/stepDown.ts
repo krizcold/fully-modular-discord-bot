@@ -182,6 +182,11 @@ export function higherTermClaim(claims: WitnessClaim[], selfNodeId: string, self
   return best;
 }
 
+/** The highest term any other node's beacon holds, fresh or not; 0 when none. */
+export function topForeignBeaconTerm(claims: WitnessClaim[], selfNodeId: string): number {
+  return claims.reduce((max, c) => (c.nodeId !== selfNodeId && Number.isSafeInteger(c.term) ? Math.max(max, c.term) : max), 0);
+}
+
 /**
  * A FRESH higher-term claim from another node: that node is up and holds a
  * newer term than this one, so this master steps down now. Freshness is judged
