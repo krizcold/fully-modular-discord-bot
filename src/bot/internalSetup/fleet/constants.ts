@@ -161,6 +161,12 @@ export const MIRROR_DIRNAME = '_mirror';
 /** Backup-side mirror cadence; one extra tick follows every registration. */
 export const MIRROR_TICK_MS = 60000;
 
+/** How many small files one mirror pass fetches at once: each fetch is one round trip or more. */
+export const MIRROR_FETCH_CONCURRENCY = 8;
+
+/** The largest file the mirror fetches in its pool; larger ones go one at a time, so the bytes in flight stay small. */
+export const MIRROR_POOL_MAX_FILE_BYTES = 16384;
+
 /** Ack timeout for the mirror listing alone: a first listing hashes every guild file, which the 10 s control ack timeout does not fit. */
 export const MIRROR_LIST_TIMEOUT_MS = 120000;
 

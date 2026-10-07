@@ -12,7 +12,7 @@ import { createHash } from 'crypto';
 import { DATA_ROOT } from '../../../utils/dataRoot';
 import { resolveDataBackend } from '../../../utils/envLoader';
 import { hashFileStreamed, namespaceHashOf, safeImportTarget } from '../utils/dataInterchange';
-import { MIRROR_DIRNAME, MIRROR_DOC_NAMES, MIRROR_LIST_TIMEOUT_MS, MIRROR_TICK_MS, SYNC_MAX_FILE_BYTES } from './constants';
+import { MIRROR_DIRNAME, MIRROR_DOC_NAMES, MIRROR_FETCH_CONCURRENCY, MIRROR_LIST_TIMEOUT_MS, MIRROR_POOL_MAX_FILE_BYTES, MIRROR_TICK_MS, SYNC_MAX_FILE_BYTES } from './constants';
 import { atomicWriteFileSync, renameWithRetry } from './fileControlStore';
 import { readHolderSighting } from './holderSighting';
 import { MSG, MirrorListReply, MirrorReadKind, MirrorReport, MirrorStatus, SyncFileEntry } from './protocol';
@@ -106,6 +106,19 @@ const RECORDS_DOC: typeof MIRROR_DOC_NAMES[number] = 'migrations.json';
 function isFileEntry(value: unknown): value is SyncFileEntry {
   const entry = value as SyncFileEntry;
   return !!entry && typeof entry.path === 'string' && typeof entry.sha256 === 'string' && Number.isInteger(entry.size) && entry.size >= 0;
+}
+
+/** Runs the tasks at most `width` at a time; each task settles on its own (none rejects). */
+async function runPool(tasks: Array<() => Promise<void>>, width: number): Promise<void> {
+  let next = 0;
+  const lane = async (): Promise<void> => {
+    while (next < tasks.length) {
+      const task = tasks[next];
+      next += 1;
+      await task();
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(width, tasks.length) }, lane));
 }
 
 /** Remove directories left empty under root (never root itself): the listing carries files, not directories. */
@@ -510,6 +523,13 @@ export class MirrorEngine {
       if (firstError === undefined) firstError = message;
     };
 
+    // One round trip per file bounds a pass by the link's latency, so the small
+    // files of every guild are fetched a few at a time and larger ones one at a
+    // time (the bytes in flight stay small beside the lease traffic); each
+    // guild's removals and hash wait for all of them.
+    const pooled: Array<() => Promise<void>> = [];
+    const single: Array<() => Promise<void>> = [];
+    const finishes: Array<() => void> = [];
     for (const guild of listing.guilds) {
       if (!isGuildId(guild?.guildId) || !Array.isArray(guild.files) || typeof guild.hash !== 'string') {
         fail('malformed guild entry in the listing');
@@ -542,35 +562,42 @@ export class MirrorEngine {
         }
         const have = record.files[file.path];
         if (have && have.sha256 === file.sha256 && have.size === file.size && fs.existsSync(target)) continue;
-        try {
-          record.files[file.path] = await this.fetchFile('guild', guild.guildId, file, target);
-          changed += 1;
-        } catch (error) {
-          // The old bytes, if any, are intact: staging verified before the rename.
-          guildOk = false;
-          fail(`${guild.guildId}/${file.path}: ${error instanceof Error ? error.message : String(error)}`);
-        }
+        (file.size <= MIRROR_POOL_MAX_FILE_BYTES ? pooled : single).push(async () => {
+          try {
+            record.files[file.path] = await this.fetchFile('guild', guild.guildId, file, target);
+            changed += 1;
+          } catch (error) {
+            // The old bytes, if any, are intact: staging verified before the rename.
+            guildOk = false;
+            fail(`${guild.guildId}/${file.path}: ${error instanceof Error ? error.message : String(error)}`);
+          }
+        });
       }
-      // What the master no longer has, and anything the manifest never knew, leaves
-      // the copy. Compared case-folded where the disk folds case: the name on disk
-      // (or in an old record) may spell a wanted file differently, and removing it
-      // by that spelling would remove the file that just landed.
-      const wantedFolded = new Set([...wanted].map(fold));
-      for (const rel of new Set([...Object.keys(record.files), ...listLocalFiles(dir)])) {
-        if (wanted.has(rel)) continue;
-        if (!wantedFolded.has(fold(rel))) {
-          const target = safeImportTarget(dirResolved, rel);
-          if (target) fs.rmSync(target, { force: true });
+      finishes.push(() => {
+        // What the master no longer has, and anything the manifest never knew, leaves
+        // the copy. Compared case-folded where the disk folds case: the name on disk
+        // (or in an old record) may spell a wanted file differently, and removing it
+        // by that spelling would remove the file that just landed.
+        const wantedFolded = new Set([...wanted].map(fold));
+        for (const rel of new Set([...Object.keys(record.files), ...listLocalFiles(dir)])) {
+          if (wanted.has(rel)) continue;
+          if (!wantedFolded.has(fold(rel))) {
+            const target = safeImportTarget(dirResolved, rel);
+            if (target) fs.rmSync(target, { force: true });
+          }
+          if (record.files[rel]) changed += 1;
+          delete record.files[rel];
         }
-        if (record.files[rel]) changed += 1;
-        delete record.files[rel];
-      }
-      pruneEmptyDirs(dir);
-      // Over what landed, not the listing's figure: a file that changed between
-      // the listing and its read lands with the hash of the bytes served.
-      record.hash = guildOk ? recordHash(record.files) : null;
-      next.guilds[guild.guildId] = record;
+        pruneEmptyDirs(dir);
+        // Over what landed, not the listing's figure: a file that changed between
+        // the listing and its read lands with the hash of the bytes served.
+        record.hash = guildOk ? recordHash(record.files) : null;
+        next.guilds[guild.guildId] = record;
+      });
     }
+    await runPool(pooled, MIRROR_FETCH_CONCURRENCY);
+    for (const task of single) await task();
+    for (const finish of finishes) finish();
 
     for (const guildId of listing.frozen) {
       if (!isGuildId(guildId) || next.guilds[guildId]) continue;
