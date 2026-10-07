@@ -1633,7 +1633,7 @@ function FleetSupersededBanner({ api, fleet, reload }) {
     : promoting
       ? ' A promote from this node is under way; the stale copies it kept are judged again once it has ended (its adopt replaces the ones the copy covers).'
     : stale > 0
-      ? ` ${stale} guild cop${stale === 1 ? 'y' : 'ies'} this node kept ${stale === 1 ? 'is' : 'are'} stale: ${s.byNodeName} adopted the backup's copy of that data, and anything written here after the backup's last copy exists only on this disk. Retire ${stale === 1 ? 'it' : 'them'} to the graveyard below, then make this node the new master's backup (BOT_NODE_ROLE=backup-master) so it starts mirroring.`
+      ? ` ${stale} guild cop${stale === 1 ? 'y' : 'ies'} this node kept ${stale === 1 ? 'is' : 'are'} stale: ${s.byNodeName} took the fleet, and whatever was written here that its data does not hold exists only on this disk. Retire ${stale === 1 ? 'it' : 'them'} to the graveyard below, then make this node the new master's backup (BOT_NODE_ROLE=backup-master) so it starts mirroring.`
       : ' No stale guild copies remain on this disk; set BOT_NODE_ROLE=backup-master to make this node the new master\'s backup.';
   const tail = fileMode ? fileTail : thisEpisode
     ? ` The fleet moved onto a database built from this machine's copy (the failback, or a promote through it), so the writes taken during the outage survived on ${s.byNodeName}'s database. This copy is re-seeded as a standby of it by the drop-back run on this machine's manager when the failback asked this side to retire (its Database modal parks and asks first); otherwise re-seed it by hand from that node's Database modal.`

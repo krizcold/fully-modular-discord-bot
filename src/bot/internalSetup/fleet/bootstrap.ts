@@ -723,7 +723,7 @@ async function runStaleMasterFence(
     // promote of it checks: a hold holds nothing, and the beacon at the top
     // term may be a backup's echo of it.
     const exit = opts.exit ?? 'Demote this node to rejoin as a co-worker.';
-    console.error(`[Fleet] STALE MASTER FENCE: ${detail}; parking the boot instead of acquiring a term on a database the fleet has moved off. ${exit}${opts.extra ?? ''}`);
+    console.error(`[Fleet] STALE MASTER FENCE: ${detail}; parking the boot instead of acquiring a term${store instanceof PostgresControlStore ? ' on a database the fleet has moved off' : ''}. ${exit}${opts.extra ?? ''}`);
     if (!opts.noSighting) noteHolderSighting(holderNodeId, observedTerm, 'fence-park', selfNodeId);
     // File mode only (on postgres the manager's re-seed retires the side),
     // and only for a node that held a term of its own the fleet moved past.
@@ -972,7 +972,7 @@ async function runStaleMasterFence(
       // top term as the holder (a later promote of the copy is then refused as
       // a copy of a previous master) and skips a backup's echo.
       await park(higher.term, `witness beacon of ${higher.nodeName}`, (masterAtTop ?? higher).nodeId, `the witness holds a beacon from ${higher.nodeName} (${higher.nodeId.slice(0, 8)}) at term ${higher.term} while this node's store holds ${localTerm}`,
-        { extra: ' If this database was DELIBERATELY restored from a dump, the fleet has not moved anywhere: the manager\'s restore lane advances the restored control term automatically, and FLEET_CONFIRM_TAKEOVER=1 on the next start overrides the fence by hand.', exit, noSighting: exit !== undefined && masterAtTop === null, ...(exit === undefined && !stagedTakeover && !fileSeeded ? { superseded: { nodeName: (masterAtTop ?? higher).nodeName, source: 'witness' as const } } : {}) });
+        { extra: ' If this database was DELIBERATELY restored from a dump, the fleet has not moved anywhere: the manager\'s restore lane advances the restored control term automatically, and FLEET_CONFIRM_TAKEOVER=1 on the next start overrides the fence by hand.', exit, noSighting: exit !== undefined && masterAtTop === null, ...(exit === undefined && !stagedTakeover && !fileSeeded ? { superseded: { nodeName: masterAtTop ? masterAtTop.nodeName : `the fleet's master (last beaconed by ${higher.nodeName})`, source: 'witness' as const } } : {}) });
     }
   }
   return null;
@@ -5078,7 +5078,7 @@ async function initCoWorker(init: CommonInit, followerHold: FollowerHoldBase | n
         success: false,
         needsConfirm: true,
         count: stale.length,
-        error: `${stale.length} guild cop${stale.length === 1 ? 'y' : 'ies'} on this disk ${stale.length === 1 ? 'is' : 'are'} stale: ${superseded.byNodeName} took the fleet at term ${superseded.term} on the backup's copy of this data. Anything this node wrote after the backup's last copy exists only here. Retiring moves ${stale.length === 1 ? 'that directory' : 'these directories'} to the graveyard (kept for the retention period, restorable from the Graveyard tab) and touches nothing the new master serves.`,
+        error: `${stale.length} guild cop${stale.length === 1 ? 'y' : 'ies'} on this disk ${stale.length === 1 ? 'is' : 'are'} stale: ${superseded.byNodeName} took the fleet at term ${superseded.term}; whatever this node wrote that the new master's data does not hold exists only here. Retiring moves ${stale.length === 1 ? 'that directory' : 'these directories'} to the graveyard (kept for the retention period, restorable from the Graveyard tab) and touches nothing the new master serves.`,
       };
     }
     retireRunning = true;

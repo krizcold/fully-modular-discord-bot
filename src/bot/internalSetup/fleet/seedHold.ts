@@ -631,7 +631,7 @@ class SeedHoldRuntime {
       return {
         success: false,
         needsConfirm: true,
-        error: `Seed this master from ${entry.nodeName}'s ${what} (${offer.guilds.length} guild(s), ${mb} MB${partial})? Everything the old master wrote after that point is LOST. This machine adopts the copy as the fleet's guild data, pins the shard plan to itself, mints a term above every beacon and restarts as master; ${entry.nodeName} then ${offer.kind === 'mirror' ? 'drops the copy and mirrors this master' : 'retires its old copies from its Fleet tab and, if the pinned fleet config (its own, carried with the copy) designates it as a backup, mirrors this master; otherwise designate it from this master\'s Fleet tab first'}.`,
+        error: `Seed this master from ${entry.nodeName}'s ${what} (${offer.guilds.length} guild(s), ${mb} MB${partial})?${offer.kind === 'mirror' ? ' Everything the old master wrote after that point is LOST.' : ''}${offer.sourceTerm < this.beaconMax ? ` ${this.beaconedBy ?? 'Another node'} beaconed term ${this.beaconMax}, above ${offer.kind === 'mirror' ? 'the copy\'s' : 'this mastership\'s'} term ${offer.sourceTerm}: anything written under that term is not in this data and is LOST.` : ''} This machine adopts the copy as the fleet's guild data, pins the shard plan to itself, mints a term above every beacon and restarts as master; ${entry.nodeName} then ${offer.kind === 'mirror' ? 'drops the copy and mirrors this master' : 'retires its old copies from its Fleet tab and, if the pinned fleet config (its own, carried with the copy) designates it as a backup, mirrors this master; otherwise designate it from this master\'s Fleet tab first'}.`,
       };
     }
     void this.startLane(entry, offer);
