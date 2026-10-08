@@ -85,6 +85,8 @@ export interface PostureClear {
   leftArmed?: boolean;
   /** Left armed because its term row names this other node, whose own watchdog owns the posture. */
   foreign?: string;
+  /** Left armed because recordRelax deferred it: the boot's stale-master fence judges first, and the clear runs again past it. */
+  deferred?: boolean;
 }
 
 /**
@@ -97,7 +99,7 @@ export interface PostureClear {
  * another node is that node's to relax, so it is left armed unless the
  * caller has been let past that node (foreignAllowed).
  */
-export async function clearSyncPosture(url: string, recordRelax?: (rowTerm: number) => Promise<boolean>, opts: { selfNodeId?: string; foreignAllowed?: boolean } = {}): Promise<PostureClear> {
+export async function clearSyncPosture(url: string, recordRelax?: (rowTerm: number) => Promise<boolean | 'deferred'>, opts: { selfNodeId?: string; foreignAllowed?: boolean } = {}): Promise<PostureClear> {
   const open = async (): Promise<Client | null> => {
     const fresh = shortLivedClient({
       connectionString: url,
@@ -122,7 +124,9 @@ export async function clearSyncPosture(url: string, recordRelax?: (rowTerm: numb
         if (row && row.nodeId !== null && opts.selfNodeId && row.nodeId !== opts.selfNodeId && !opts.foreignAllowed) {
           return { ok: false, foreign: row.nodeId };
         }
-        if (row && await recordRelax(row.term).catch(() => false)) break;
+        const recorded = row ? await recordRelax(row.term).catch(() => false) : false;
+        if (recorded === 'deferred') return { ok: false, deferred: true };
+        if (recorded) break;
         // A read that failed can be a connection that died under it (the
         // database restarted during the wait): a fresh one is dialed.
         if (!row) {
@@ -157,7 +161,7 @@ export async function clearSyncPosture(url: string, recordRelax?: (rowTerm: numb
  * Its ok is true only when the cluster was actually relaxed, which is what the
  * boot attestation rests on.
  */
-export async function clearOwnSyncPosture(recordRelax?: (rowTerm: number) => Promise<boolean>, opts: { selfNodeId?: string; foreignAllowed?: boolean } = {}): Promise<PostureClear> {
+export async function clearOwnSyncPosture(recordRelax?: (rowTerm: number) => Promise<boolean | 'deferred'>, opts: { selfNodeId?: string; foreignAllowed?: boolean } = {}): Promise<PostureClear> {
   // Keyed on the backend KIND, not on the url alone: a url left over from a
   // postgres phase outlives the flip back to file, and dialing it would relax
   // a cluster this node no longer serves from.

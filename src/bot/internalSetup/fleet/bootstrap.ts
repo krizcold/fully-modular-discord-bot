@@ -1336,11 +1336,26 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   // the cluster holds: after every attestation of the incarnation that armed
   // it, before any of this boot's, whose term is at least that. With no
   // token there is no witness to record on, so the relax waits.
+  // Until the stale-master fence has let this boot through, a beacon holding a
+  // term above the cluster's row defers the relax: the fleet may have moved to
+  // another database, and this one's waiting commits would be acknowledged on
+  // a fork no master serves. Past the fence the clear runs again.
   const bootRelaxToken = (process.env.DISCORD_TOKEN || '').trim();
-  const recordBootRelax = (rowTerm: number): Promise<boolean> => bootRelaxToken === ''
-    ? Promise.resolve(false)
-    : new DiscordWitness({ token: bootRelaxToken, nodeId, nodeName, getChannelId: () => readFleetConfigCache()?.witnessChannelId ?? null })
-      .renewClaim(rowTerm, 'master', { posture: { state: 'relaxed', slotName: null, term: rowTerm + 1, seq: 0 } });
+  let bootFencePassed = false;
+  const recordBootRelax = async (rowTerm: number): Promise<boolean | 'deferred'> => {
+    if (bootRelaxToken === '') return false;
+    const witness = new DiscordWitness({ token: bootRelaxToken, nodeId, nodeName, getChannelId: () => readFleetConfigCache()?.witnessChannelId ?? null });
+    if (!bootFencePassed) {
+      const claims = await witness.readClaims();
+      if (claims === null) return false;
+      const above = witnessWinner(claims, nodeId, rowTerm);
+      if (above) {
+        console.warn(`[Fleet] The database is armed, and ${above.nodeName}'s beacon holds term ${above.term} above its row (${rowTerm}): it may be a fork the fleet has left, so its waiting writes stay unreleased until the stale-master fence has let this boot through`);
+        return 'deferred';
+      }
+    }
+    return witness.renewClaim(rowTerm, 'master', { posture: { state: 'relaxed', slotName: null, term: rowTerm + 1, seq: 0 } });
+  };
   const bootClear = serveOnly ? null : await clearOwnSyncPosture(recordBootRelax, { selfNodeId: nodeId });
   let bootRelaxed = bootClear?.ok === true;
   const store = serveOnly
@@ -1447,8 +1462,11 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   // A cluster another master armed is relaxed only once the guard has let
   // this boot past that master (its row stopped advancing, or the takeover
   // is confirmed), and under the same recorded rule.
+  let clearDeferred = bootClear?.deferred === true;
   if (bootClear?.foreign && !standalone) {
-    bootRelaxed = (await clearOwnSyncPosture(recordBootRelax, { selfNodeId: nodeId, foreignAllowed: true })).ok;
+    const foreignClear = await clearOwnSyncPosture(recordBootRelax, { selfNodeId: nodeId, foreignAllowed: true });
+    bootRelaxed = foreignClear.ok;
+    clearDeferred = foreignClear.deferred === true;
   }
   // The fence stays ON for a stand-in: its PEER half parks on any answering peer
   // at an equal or higher term, which is how a master that came back between the
@@ -1464,6 +1482,11 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     clearSuperseded();
     if (store instanceof PostgresControlStore) await store.close();
     return { followerHold };
+  }
+  bootFencePassed = true;
+  if (clearDeferred) {
+    console.warn('[Fleet] The stale-master fence let this boot through; the posture held for it is cleared now, under the recorded rule');
+    bootRelaxed = (await clearOwnSyncPosture(recordBootRelax, { selfNodeId: nodeId, foreignAllowed: true })).ok;
   }
 
   // The boot cleared every gate, so the brand-new-fleet answer has been spent
