@@ -738,7 +738,7 @@ function dataHopTarget(fileId: string, guildId: string): { module: string; filen
 function sendHopReply(res: Response, reply: any): void {
   if (reply && reply.ok) {
     if (reply.pending) {
-      res.status(202).json({ success: true, pending: true, message: 'saved, not yet confirmed durable' });
+      res.status(202).json({ success: true, pending: true, message: reply.note ? `not yet durable: ${reply.note}` : 'saved, not yet confirmed durable' });
     } else {
       res.status(200).json({ success: true });
     }

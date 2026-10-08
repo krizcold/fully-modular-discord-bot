@@ -154,7 +154,10 @@ export async function applyOperatorDataWrite(req: GuildDataWriteRequest): Promis
   if (outcome === 'ok') return { ok: true };
   if (outcome === 'pending') return { ok: true, pending: true };
   if (outcome === 'deposed') return { ok: false, code: 'not-owner', error: 'guild ownership moved mid-write' };
-  return { ok: false, code: 'backend-unavailable', error: 'flush did not complete' };
+  // Refused by the store, the write is kept and retried: no failure, and the
+  // operator learns it is not durable yet.
+  if (outcome === 'held') return { ok: true, pending: true, note: 'it is not saved yet; this node retries while it serves this guild, and loses it if the bot stops, the guild moves or the node loses its database first' };
+  return { ok: false, code: 'backend-unavailable', error: 'this node switched databases while saving; whether the write was carried over is unknown, so reload the data to check' };
 }
 
 /**

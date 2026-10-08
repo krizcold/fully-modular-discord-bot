@@ -35,6 +35,8 @@ import {
 import {
   flushAll as flushAllFiles,
   flushGuild as flushGuildFiles,
+  pendingGuildFiles,
+  filesPending,
   sweepGraveyard as sweepFileGraveyard,
   listGuilds as listGuildDirs,
   sizeOfGuildData as sizeOfGuildDir,
@@ -159,13 +161,24 @@ export function listGuildDataFiles(guildId: string, category?: string): string[]
 
 /**
  * Deadline-bounded durability confirmation for one guild (operator writes:
- * 'ok' = committed, 'pending' = accepted but still retrying).
+ * 'ok' = committed, 'pending' = accepted but still retrying, 'held' = the store
+ * refused it, kept and retried, 'unavailable' = the node moved stores under it
+ * and whether it was carried is unknown).
  */
-export async function flushGuildOutcome(guildId: string, deadlineMs: number): Promise<'ok' | 'pending' | 'deposed' | 'unavailable'> {
+export async function flushGuildOutcome(guildId: string, deadlineMs: number): Promise<'ok' | 'pending' | 'held' | 'deposed' | 'unavailable'> {
+  // Only the files queued when this call began are its to answer for: a write
+  // to another file meanwhile is its writer's, one to the same file carries this.
+  const queued = pendingGuildFiles(guildId);
   await flushGuildFiles(guildId);
+  if (filesPending(queued)) return 'held';
   const ws = getWorkingSet();
   if (ws && routeFor(guildId) === 'postgres') {
-    return ws.flushGuildNow(guildId, deadlineMs);
+    const outcome = await ws.flushGuildNow(guildId, deadlineMs);
+    if (outcome !== 'unavailable') return outcome;
+    // Its successor still holds the writes, or they landed there or were
+    // dropped, which this side cannot tell apart.
+    const now = getWorkingSet();
+    return now && now !== ws && now.holdsWritesFor(guildId) ? 'pending' : 'unavailable';
   }
   return 'ok';
 }

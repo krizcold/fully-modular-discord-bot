@@ -39,6 +39,10 @@ const pendingOps = new Map<string, PendingOp>();
 const flushing = new Set<string>();
 const scheduled = new Set<string>();
 let opSeq = 0;
+// A failed flush is tried again on its own, backing off to a minute, so a
+// write held through a disk fault lands once the disk takes it.
+const retryAttempts = new Map<string, number>();
+const retryTimers = new Map<string, NodeJS.Timeout>();
 
 let flushFailures = 0;
 
@@ -56,6 +60,25 @@ function scheduleFlush(absPath: string): void {
     scheduled.delete(absPath);
     void flushPath(absPath);
   });
+}
+
+function scheduleRetry(absPath: string): void {
+  if (retryTimers.has(absPath)) return;
+  const attempt = (retryAttempts.get(absPath) ?? 0) + 1;
+  retryAttempts.set(absPath, attempt);
+  const timer = setTimeout(() => {
+    retryTimers.delete(absPath);
+    void flushPath(absPath);
+  }, Math.min(1000 * 2 ** (attempt - 1), 60_000));
+  timer.unref();
+  retryTimers.set(absPath, timer);
+}
+
+function clearRetry(absPath: string): void {
+  const timer = retryTimers.get(absPath);
+  if (timer) clearTimeout(timer);
+  retryTimers.delete(absPath);
+  retryAttempts.delete(absPath);
 }
 
 const IS_WINDOWS = process.platform === 'win32';
@@ -127,13 +150,16 @@ async function flushPath(absPath: string): Promise<void> {
           if (cur.content.length === 0) pendingOps.delete(absPath);
           else scheduleFlush(absPath); // flush only the remaining tail
         }
+        retryAttempts.delete(absPath);
         return; // bypass the generic seq-drop below (only correct for write/delete)
       }
     } catch (error) {
       flushFailures += 1;
       console.error(`[DataManager] Flush failed for ${absPath} (will retry):`, error);
-      return; // keep the pending entry + tmp file; next write / flushAll retries
+      scheduleRetry(absPath);
+      return; // keep the pending entry + tmp file; the retry, the next write or flushAll tries again
     }
+    retryAttempts.delete(absPath);
     // Drop the entry only if no newer op arrived while we were flushing.
     const current = pendingOps.get(absPath);
     if (current && current.seq === seqAtStart) {
@@ -190,6 +216,18 @@ export async function flushGuild(guildId: string): Promise<void> {
   const guildDir = path.join(BASE_DATA_DIR, guildId);
   const paths = [...pendingOps.keys()].filter(p => p === guildDir || p.startsWith(prefix));
   await flushPaths(paths);
+}
+
+/** The guild's files with a write still queued (a failed flush keeps it for the next try). */
+export function pendingGuildFiles(guildId: string): string[] {
+  const prefix = path.join(BASE_DATA_DIR, guildId) + path.sep;
+  const guildDir = path.join(BASE_DATA_DIR, guildId);
+  return [...pendingOps.keys()].filter(p => p === guildDir || p.startsWith(prefix));
+}
+
+/** Whether any of these files still has a write queued. */
+export function filesPending(paths: string[]): boolean {
+  return paths.some(p => pendingOps.has(p));
 }
 
 /** Count of paths whose flush is currently failing (surfaced in diagnostics). */
@@ -318,7 +356,10 @@ export function dropPendingForGuild(guildId: string): void {
   const src = path.join(BASE_DATA_DIR, guildId);
   const prefix = src + path.sep;
   for (const key of [...pendingOps.keys()]) {
-    if (key === src || key.startsWith(prefix)) pendingOps.delete(key);
+    if (key === src || key.startsWith(prefix)) {
+      pendingOps.delete(key);
+      clearRetry(key);
+    }
   }
 }
 
@@ -328,6 +369,10 @@ export function dropPendingForGuild(guildId: string): void {
  */
 export async function graveyardGuildDir(guildId: string, reason: string): Promise<boolean> {
   const src = path.join(BASE_DATA_DIR, guildId);
+  // A retry on the wire when the guild's writes were dropped would re-create
+  // the dir beside its graveyard copy: it settles first (bounded).
+  const deadline = Date.now() + 5000;
+  while ([...flushing].some(p => p === src || p.startsWith(src + path.sep)) && Date.now() < deadline) await delay(5);
   const graveyardRoot = path.join(BASE_DATA_DIR, GRAVEYARD_DIR);
   await fs.promises.mkdir(graveyardRoot, { recursive: true });
   const dest = path.join(graveyardRoot, `${guildId}-${Date.now()}`);

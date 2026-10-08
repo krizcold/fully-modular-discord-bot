@@ -21,7 +21,7 @@ export type WsWriteResult = 'accepted' | 'frozen-window' | 'refusing' | 'fenced'
 export type WsReadResult =
   | { status: 'ready'; value: unknown | undefined }   // undefined = absent or tombstoned
   | { status: 'not-ready' };
-export type FlushNowOutcome = 'ok' | 'pending' | 'deposed' | 'unavailable';
+export type FlushNowOutcome = 'ok' | 'pending' | 'held' | 'deposed' | 'unavailable';
 
 /**
  * Thrown by the facade for a guild write the backend cannot honor (acceptance
@@ -677,8 +677,18 @@ export class WorkingSetManager {
       const committed = await Promise.race([this.flush(ws), timeout]);
       if (committed === 'timeout') return 'pending';
       if (committed) return 'ok';
-      return (ws.state as WsState) === 'fenced' ? 'deposed' : 'unavailable';
+      if ((ws.state as WsState) === 'fenced') return 'deposed';
+      // Refused by the store (unreachable, read-only): kept dirty and retried.
+      return this.quiesced ? 'unavailable' : 'held';
     }
+  }
+
+  /** Whether this manager still holds unflushed writes of the guild: dirty, on the wire, or a carry it keeps. */
+  holdsWritesFor(guildId: string): boolean {
+    const ws = this.sets.get(guildId);
+    if (ws && (ws.dirtyKeys.size > 0 || ws.flushInFlight)) return true;
+    const adoption = this.adoptions.get(guildId);
+    return !!adoption && adoption.store.isReadOnly();
   }
 
   /** Flush every dirty guild (shutdown drain; the caller bounds it). */

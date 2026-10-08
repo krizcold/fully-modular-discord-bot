@@ -238,7 +238,7 @@ function ConfigPanel({ isCoWorker }) {
         } else {
           message = 'Config saved successfully.';
         }
-        setSuccess(message + ' Backup created.');
+        setSuccess(res.pending ? `${isDataFile ? 'Data file' : 'Config'} accepted: ${res.message}` : message + ' Backup created.');
         setConfig(parsedConfig); // Keep full config in state
         setInitialized(true);
         setInitMessage('');

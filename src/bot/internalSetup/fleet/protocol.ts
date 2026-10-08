@@ -881,6 +881,8 @@ export interface DataWriteReply {
   error?: string;
   /** Accepted, flush still retrying. */
   pending?: boolean;
+  /** Why an accepted write is not durable yet. */
+  note?: string;
 }
 
 /** Symmetric read hop; no filename = list the module's files. */
