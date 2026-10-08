@@ -1583,7 +1583,7 @@ export class MigrationCoordinator {
     } catch (error) {
       if (this.record !== rec || this.abortInProgress) return;
       for (const leg of rec.legs) delete leg.committed;
-      await this.enterAborting(`the commit decision could not be written: ${error instanceof Error ? error.message : error}`);
+      await this.enterAborting(`the commit decision could not be written: ${error instanceof Error ? error.message : error}`, true);
     }
   }
 
@@ -1826,8 +1826,16 @@ export class MigrationCoordinator {
   // re-enters with a leg already persisted as ABORTING, which a bare state
   // check would break.
   private abortInProgress = false;
-  private async enterAborting(reason: string): Promise<void> {
+  private async enterAborting(reason: string, decisionRefused = false): Promise<void> {
     if (!this.record || this.abortInProgress) return;
+    // A decided migration only goes forward (its commit rounds and grants
+    // retry until they land): an abort now would leave the source and target
+    // copies apart. Only a decision the control store refused, never acted on,
+    // may still abort.
+    if (!decisionRefused && (this.record.state === 'COMMITTING' || this.record.state === 'GRANTING')) {
+      console.warn(`[Migration] ${this.record.id} is not aborted (${reason}): its commit is already decided, so it goes on`);
+      return;
+    }
     // A paused retire has no leg in flight: a pipeline straggler from the
     // aborted leg (timed-out prepare/drain rejection landing after the pause)
     // must not terminally abort it. Operator Abort-remaining goes via abort().
