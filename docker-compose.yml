@@ -53,6 +53,8 @@ services:
     image: ghcr.io/krizcold/fully-modular-discord-bot:latest
     container_name: fullymodulardiscordbotapp
     restart: unless-stopped
+    # A stop waits for the bot to drain its accepted writes (up to about 45 s).
+    stop_grace_period: 60s
     cpu_shares: 50
     environment:
       DISCORD_TOKEN: ''

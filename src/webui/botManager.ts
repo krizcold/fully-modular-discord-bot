@@ -17,6 +17,10 @@ import { startStandInWrites } from './promoteEngine';
 const CRASH_RESTART_DELAY_MS = 5000;
 const CRASH_RESTARTS_MAX = 5;
 const CRASH_STABLE_UPTIME_MS = 10 * 60_000;
+// The child's own stop: its gateway closed (2 s), the posture relaxed (1.5 s)
+// and its accepted writes drained (30 s), with a margin.
+const CHILD_STOP_WAIT_MS = 40_000;
+const CHILD_KILL_WAIT_MS = 5_000;
 
 export interface BotStartResult {
   success: boolean;
@@ -52,6 +56,9 @@ export class BotManager {
   private startingAfterCrash = false;
   private stopRequested = false;
   private crashRestartTimer: NodeJS.Timeout | null = null;
+  private stoppingRestart: { result: Promise<BotStartResult>; stopping: () => boolean } | null = null;
+  private stopsRequested = 0;
+  private exiting = false;
   private wsManager: WebSocketManager | null = null;
   private operationInProgress: boolean = false; // Prevents race conditions
   private safeMode: boolean = false;
@@ -161,6 +168,11 @@ export class BotManager {
    * Start the bot process
    */
   async start(): Promise<BotStartResult> {
+    // The process is exiting: a child started now would outlive it.
+    if (this.exiting) {
+      return { success: false, reason: 'exiting', error: 'The process is exiting' };
+    }
+
     // Check if another operation is in progress
     if (this.operationInProgress) {
       return {
@@ -419,10 +431,20 @@ export class BotManager {
     }
   }
 
+  /** The process is about to exit: nothing starts the child again. */
+  beginExit(): void {
+    this.exiting = true;
+  }
+
   /**
    * Restart the bot process
    */
   async restart(): Promise<BotStartResult> {
+    // A restart still stopping its child is this one too: its start comes
+    // after this call, so the child it boots reads what this caller staged.
+    const inFlight = this.stoppingRestart;
+    if (inFlight?.stopping()) return inFlight.result;
+
     // Check if another operation is in progress
     if (this.operationInProgress) {
       return {
@@ -434,13 +456,33 @@ export class BotManager {
 
     console.log('[BotManager] Restarting bot...');
 
-    if (this.isRunning()) {
-      await this.shutdown(false); // Graceful shutdown
-      // Wait for process to exit
-      await this.sleep(2000);
+    let stopping = true;
+    const result = (async (): Promise<BotStartResult> => {
+      let stoppedMeanwhile = false;
+      try {
+        if (this.isRunning()) {
+          const own = this.stopsRequested + 1;
+          await this.shutdown(false);
+          // A stop asked for while this one drained (an operator's, the
+          // container's) wins over the start.
+          stoppedMeanwhile = this.stopsRequested !== own;
+        }
+      } finally {
+        stopping = false;
+      }
+      if (stoppedMeanwhile) {
+        console.log('[BotManager] The restart was called off by a stop requested while the bot drained');
+        return { success: false, reason: 'stopped', error: 'A stop was requested while the restart waited for the bot to exit' };
+      }
+      return await this.start();
+    })();
+    const flight = { result, stopping: () => stopping };
+    this.stoppingRestart = flight;
+    try {
+      return await result;
+    } finally {
+      if (this.stoppingRestart === flight) this.stoppingRestart = null;
     }
-
-    return await this.start();
   }
 
   /**
@@ -455,6 +497,7 @@ export class BotManager {
     }
 
     this.cancelCrashRestart();
+    this.stopsRequested += 1;
     if (!this.botProcess) {
       console.log('[BotManager] Bot is not running');
       return;
@@ -465,32 +508,32 @@ export class BotManager {
       this.operationInProgress = true;
     }
 
-    // A start that lands during the sleep below owns a new child; this stop
+    // A start that lands during the wait below owns a new child; this stop
     // only ever acts on the one it signalled.
     const child = this.botProcess;
     try {
       const signal = emergency ? 'SIGKILL' : 'SIGTERM';
       console.log(`[BotManager] Shutting down bot with ${signal}...`);
+      const exited = this.exitOf(child);
 
       child.kill(signal);
       this.addLog(`[BotManager] Bot shutdown initiated (${signal})`);
       this.emitEvent('bot:shutdown', { signal, emergency });
 
-      // Wait for process to exit
-      await this.sleep(1000);
-
-      // Force kill if still running
-      if (this.botProcess === child && this.isRunning() && !emergency) {
+      // The child drains its accepted writes before it exits; nothing may
+      // start beside it until it has.
+      if (!await this.within(exited, emergency ? CHILD_KILL_WAIT_MS : CHILD_STOP_WAIT_MS) && !emergency) {
         console.log('[BotManager] Bot did not exit gracefully, forcing shutdown');
         child.kill('SIGKILL');
+        await this.within(exited, CHILD_KILL_WAIT_MS);
       }
 
       if (this.botProcess === child) {
         this.botProcess = null;
         setWebuiDataStoreUrl(null);
         this.botStartTime = 0;
-        // The child may drain past this point; its exit is stale by then and
-        // settles nothing, so requests still waiting on it fail here.
+        // A child that outlived even its kill exits stale and settles
+        // nothing, so requests still waiting on it fail here.
         this.failPendingIpc('bot process was stopped before replying');
       }
     } finally {
@@ -505,7 +548,8 @@ export class BotManager {
    * Check if bot is running
    */
   isRunning(): boolean {
-    return this.botProcess !== null && !this.botProcess.killed;
+    // Node marks a child killed when a signal is sent; it runs until it exits.
+    return this.botProcess !== null && this.botProcess.exitCode === null && this.botProcess.signalCode === null;
   }
 
   /**
@@ -630,6 +674,22 @@ export class BotManager {
    */
   private sleep(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  private exitOf(child: ChildProcess): Promise<void> {
+    if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+    return new Promise(resolve => child.once('exit', () => resolve()));
+  }
+
+  /** Whether done settled within ms. */
+  private async within(done: Promise<void>, ms: number): Promise<boolean> {
+    let timer: NodeJS.Timeout | undefined;
+    const expired = new Promise<boolean>(resolve => { timer = setTimeout(() => resolve(false), ms); });
+    try {
+      return await Promise.race([done.then(() => true), expired]);
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   /**

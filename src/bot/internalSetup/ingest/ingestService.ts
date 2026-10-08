@@ -15,6 +15,7 @@ export class IngestService {
   private starting: Promise<string> | null = null;
   private unwinding: Promise<unknown> | null = null;
   private shardPlan: { shards: number[]; shardCount: number } | null = null;
+  private closed = false;
 
   buildClient(options: ClientOptions): Client {
     if (this.client) throw new Error('[Ingest] buildClient() called twice');
@@ -54,6 +55,7 @@ export class IngestService {
   /** Only LeaseRuntime may call this; the lease gate and identify pacing live there. */
   async start(token: string | undefined): Promise<string> {
     if (!this.client) throw new Error('[Ingest] start() before buildClient()');
+    if (this.closed) return '';
     // One login at a time: a second grant while a live start is parked below
     // joins it instead of identifying the same shards twice. A start whose
     // login a stop cancelled is superseded, never joined: its promise may
@@ -121,6 +123,12 @@ export class IngestService {
     } finally {
       if (this.stopping === run) this.stopping = null;
     }
+  }
+
+  /** Stops the gateway for good: the process is shutting down, so no later grant logs it in again. */
+  async close(reason: string): Promise<void> {
+    this.closed = true;
+    await this.stop(reason);
   }
 
   private async destroySessions(reason: string): Promise<void> {

@@ -725,6 +725,13 @@ async function main() {
     if (shuttingDown) return;
     shuttingDown = true;
     stopSamplers();
+    // No event is handled while the writes drain: a gateway left up keeps
+    // taking writes the drain may never reach. Bounded, since a destroy
+    // stalls on a shard caught mid-connect.
+    await Promise.race([
+      getIngestService().close('shutting down').catch(err => console.warn('[clientInitializer] Could not close the gateway on shutdown:', err)),
+      new Promise(resolve => setTimeout(resolve, 2000)),
+    ]);
     // Before anything writes: an armed synchronous posture stalls every write
     // below for its whole bound, and nothing would be watching it after exit.
     // Bounded, because the drain is the part that must not be lost and the

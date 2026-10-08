@@ -88,6 +88,7 @@ export function createControlRoutes(botManager: BotManager): Router {
         // Shutdown bot and exit cleanly - Docker will restart us
         setTimeout(async () => {
           console.log('[Control] Shutting down for container restart...');
+          botManager.beginExit();
           try {
             await botManager.shutdown(false);
           } catch (err) {
@@ -133,6 +134,7 @@ export function createControlRoutes(botManager: BotManager): Router {
       // Give time for response to be sent
       setTimeout(async () => {
         // Stop bot first
+        botManager.beginExit();
         try {
           await botManager.shutdown(false);
         } catch (err) {

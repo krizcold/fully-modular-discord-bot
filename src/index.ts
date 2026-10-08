@@ -105,6 +105,7 @@ async function main() {
   // Handle graceful shutdown
   process.on('SIGTERM', async () => {
     console.log('[Main] SIGTERM received, shutting down...');
+    botManager.beginExit();
     await botManager.shutdown(false);
     await flushBeforeExit();
     process.exit(0);
@@ -112,6 +113,7 @@ async function main() {
 
   process.on('SIGINT', async () => {
     console.log('[Main] SIGINT received, shutting down...');
+    botManager.beginExit();
     await botManager.shutdown(false);
     await flushBeforeExit();
     process.exit(0);

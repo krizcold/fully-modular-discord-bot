@@ -223,7 +223,7 @@ export async function runDemote(
     }
     return restart?.success
       ? { success: true }
-      : { success: false, error: restart?.error ?? 'restart failed; the role change is staged and the next start boots as co-worker' };
+      : { success: false, error: `${restart?.error ?? 'restart failed'}; the role change is staged and the next start boots as co-worker` };
   } catch (error) {
     console.error('[Fleet] Demotion failed:', error instanceof Error ? error.message : error);
     return { success: false, error: error instanceof Error ? error.message : 'demotion failed' };
@@ -272,7 +272,7 @@ export async function runRoleReset(botManager: BotManager, restart: boolean): Pr
     }
     return result?.success
       ? { success: true, formsCleared: pinned }
-      : { success: false, error: result?.error ?? 'restart failed; the reset is written and the next start applies it' };
+      : { success: false, error: `${result?.error ?? 'restart failed'}; the reset is written and the next start applies it` };
   } catch (error) {
     console.error('[Fleet] Role reset failed:', error instanceof Error ? error.message : error);
     return { success: false, error: error instanceof Error ? error.message : 'role reset failed' };

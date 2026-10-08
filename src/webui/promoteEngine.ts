@@ -1706,7 +1706,7 @@ async function phaseRestart(botManager: BotManager, record: PromoteRecord): Prom
       return;
     }
     if (restart.reason !== 'operation_in_progress' || attempt >= 5) {
-      throw new Error(restart.error ?? 'restart failed; the role override is staged and the next start boots as master');
+      throw new Error(`${restart.error ?? 'restart failed'}; the role override is staged and the next start boots as master`);
     }
     await sleep(5000);
   }
