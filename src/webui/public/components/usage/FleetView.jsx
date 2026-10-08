@@ -2312,6 +2312,12 @@ function FleetView({ api, wsClient, guildNames }) {
         </div>
       )}
 
+      {fleet.witnessDark && (
+        <div className="usage-notice">
+          {`This master could not refresh its Discord beacon for over two minutes with active mode on (dark since ${fleetFormatAge(Date.now() - fleet.witnessDark.since)}), so a backup may be standing in. It places no shards and holds back any save a takeover could lose; the workers keep serving and other saves go on. It carries on by itself once its beacon renews and every designated backup is accounted for. Now waiting: ${fleet.witnessDark.waitingOn}.`}
+        </div>
+      )}
+
       {fleet.backupDesignationRefused && (
         <div className="usage-notice" style={{ borderColor: '#e0a030', color: '#e0a030' }}>
           {`${fleet.backupDesignationRefused.nodeName} asked to be a designated backup ${fleetFormatAge(Date.now() - fleet.backupDesignationRefused.at)}, but file mode mirrors the guild data to one backup, so it joined as a plain co-worker. To move the copy to it, remove the current designated backup on the config card below: the list then takes this node. A node that should stop being a backup also needs backup-master taken out of its env, or it is designated again when it reconnects.`}

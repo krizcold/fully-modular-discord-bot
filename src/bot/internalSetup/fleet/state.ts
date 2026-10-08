@@ -3,6 +3,7 @@
 
 import { performance } from 'perf_hooks';
 import { ARM_MAX_ATTEMPTS, ARM_SPACING_MS, CONTROL_PORT_DEFAULT, LEASE_TTL_MS, PROTOCOL_VERSION, WITNESS_FRESH_WINDOW_MS } from './constants';
+import type { WitnessDarkView } from './witnessDark';
 import { ArmPhase, readArmRecord } from './armRecord';
 import { EpisodeRecord, readEpisodeRecord } from './episodeRecord';
 import { getShardSource, isPinEnabled, overCapacityOf, resolveShardCapacity } from './placement';
@@ -271,6 +272,8 @@ export interface FleetState {
   refusedRegistrations: FleetRefusedRegistration[];
   /** Fleet master in file mode: the latest node whose backup designation was refused, one backup being the rule (B4f-1); null when none. */
   backupDesignationRefused: BackupDesignationRefusedView | null;
+  /** Fleet master in active mode whose own beacon renew has not landed for a full fresh window (F10); null otherwise. */
+  witnessDark: WitnessDarkView | null;
   /** Co-worker in file mode that a higher term superseded (B4f-2): live guild dirs it keeps for shards it does not hold; null elsewhere. */
   staleCopies: number | null;
   /** Co-worker only: lease still held while the master is unreachable. */
@@ -631,6 +634,8 @@ export interface FleetStateSources {
   mirror?: (() => MirrorReport | null) | null;
   /** The latest refused backup designation (B4f-1); fleet master only. */
   backupDesignationRefused?: (() => BackupDesignationRefusedView | null) | null;
+  /** The dark master's latch (F10); fleet master only. */
+  witnessDark?: (() => WitnessDarkView | null) | null;
   /** Stale guild copies of a superseded co-worker in file mode (B4f-2). */
   staleCopies?: (() => number | null) | null;
   /** The seed push this co-worker runs for a holding master (B4f-3). */
@@ -731,6 +736,7 @@ export function getFleetState(): FleetState {
       lossLog: [],
       refusedRegistrations: [],
       backupDesignationRefused: null,
+      witnessDark: null,
       staleCopies: null,
       leases: [],
       nodes: [],
@@ -875,6 +881,7 @@ export function getFleetState(): FleetState {
       lossLog: healthMonitor?.getLossEvents() ?? [],
       refusedRegistrations: refusedRegistrations ?? [],
       backupDesignationRefused: sources.backupDesignationRefused?.() ?? null,
+      witnessDark: sources.witnessDark?.() ?? null,
       staleCopies: null,
       leases,
       nodes,
@@ -991,6 +998,7 @@ export function getFleetState(): FleetState {
     lossLog: [],
     refusedRegistrations: [],
     backupDesignationRefused: null,
+    witnessDark: null,
     staleCopies: sources.staleCopies?.() ?? null,
     servingOnCachedLease,
     cachedLeaseTtlRemainingMs,

@@ -114,6 +114,7 @@ import { clearSlotStatus, readSlotStatus, recordFromPush, sourceMatchesAny, writ
 import { startSyncPostureEngine, SyncPostureEngine, SyncPostureTarget } from './syncPostureEngine';
 import { clearSyncPostureRecord, recordFromPosturePush, writeSyncPostureRecord } from './syncPostureFact';
 import { BeaconFacts, BeaconPosture, DiscordWitness, FleetWitness, startWitnessLoop, WitnessStatus } from './witness';
+import { ownRenewWait, WitnessDarkView, witnessDarkDue, witnessDarkHold } from './witnessDark';
 import { probePeerTerm } from './peerTermProbe';
 import { probeStoreEmpty } from './emptyStore';
 import { readPromoteRecord, writePromoteRecord } from './promoteRecord';
@@ -1356,6 +1357,12 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   // supersession hook (assigned once the registry exists) turns the fence
   // into a step-down (B4).
   let controlFenced = false;
+  // The dark master's latch (F10, witnessDark.ts): placement and the posture's
+  // relax wait while it is up.
+  let witnessDark: WitnessDarkView | null = null;
+  const darkRefusal = (): string | null => (witnessDark
+    ? `this master's own beacon has not been renewed for a full fresh window in active mode, so a backup may stand in; nothing is placed until it resumes (now waiting: ${witnessDark.waitingOn})`
+    : null);
   // A Declare Lost writes its records before any plan without its node (as
   // a rollback writes them first): plan writes wait while one is under way,
   // so a crash between leaves the node listed, never its marks unwritten.
@@ -1899,6 +1906,24 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     return fullShardIds;
   }
 
+  // The shards a node runs now, on its own latest word: a heartbeat under the
+  // current shard count since it registered and since its last revoke, else
+  // its register summary; the runtime for this node itself.
+  function runningShardIds(node: RegistryNode): Set<number> {
+    if (node.isSelf) {
+      const current = runtime.getCurrent();
+      return new Set(current && current.shardCount === registry.shardCount ? current.leases.map(l => l.shardId) : []);
+    }
+    if (node.lastHeartbeatAt !== null && node.lastHeartbeatAt > node.registeredAt
+        && !revokesInFlight.has(node.nodeId)
+        && node.lastHeartbeatAt > (lastRevokeSentAt.get(node.nodeId) ?? 0)
+        && node.lastShardCount === registry.shardCount) {
+      return new Set(node.shards.map(s => s.shardId));
+    }
+    if (node.heldLeases && node.heldLeases.shardCount === registry.shardCount) return new Set(node.heldLeases.leases.map(l => l.shardId));
+    return new Set();
+  }
+
   // Grants to one node go one at a time, each set composed as it is sent: a
   // set composed beside an in-flight grant lacks what that grant brings, and
   // its higher epoch would make the node drop it.
@@ -1923,6 +1948,12 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       const ownedHere = (id: number): boolean =>
         (registry.shardTable.get(id)?.nodeId ?? registry.inFlight.get(id) ?? node.nodeId) === node.nodeId;
       const sending = compose().filter(ownedHere);
+      // A dark master grants nothing a node is not already running, whoever
+      // asks (F10): a stand-in on the far side may be placing that shard.
+      if (witnessDark) {
+        const running = runningShardIds(node);
+        if (sending.some(id => !running.has(id))) return { ok: false, pending: false };
+      }
       // A shard freed while this grant waited is reserved for it now.
       for (const id of sending) {
         if (registry.shardTable.has(id) || registry.pendingConfirmation.has(id) || registry.inFlight.has(id)) continue;
@@ -2061,6 +2092,10 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
         }
       }
       if (!wants) return false;
+      if (witnessDark) {
+        const running = runningShardIds(node);
+        if (reGrantSetOf(node.nodeId).some(id => !running.has(id))) return false;
+      }
       if (ledger) {
         const identifying = shardsForcingIdentify(node, reGrantSetOf(node.nodeId));
         if (identifying.length > 0) {
@@ -2320,10 +2355,10 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     setUnassigned([...groups].map(([reason, shardIds]) => ({ shardIds, reason })));
   }
 
-  // Both reports, dropped while a fence, the reshard pause or the grace and
+  // Both reports, dropped while a fence, the dark latch, the reshard pause or the grace and
   // hold-down defer distribution (each carries its own banner).
   function reportPlacement(): void {
-    if (controlFenced || paused || !graceOver) {
+    if (controlFenced || witnessDark || paused || !graceOver) {
       unassigned = null;
       unassignedKey = '';
       return;
@@ -2333,10 +2368,11 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   }
 
   async function distribute(): Promise<void> {
-    if (controlFenced || paused || !graceOver) reportPlacement();
+    if (controlFenced || witnessDark || paused || !graceOver) reportPlacement();
     if (controlFenced) return;
     if (paused) return;
-    if (!graceOver) {
+    // A dark master gives a node back only the shards it already serves.
+    if (!graceOver || witnessDark) {
       try {
         await reGrantOnly();
       } catch (error) {
@@ -2591,6 +2627,8 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     }
     const recordsBlocked = coordinator?.recordsBlock();
     if (recordsBlocked) return { success: false, error: recordsBlocked };
+    const dark = darkRefusal();
+    if (dark) return { success: false, error: dark };
     if (!Number.isInteger(shardId) || shardId < 0 || shardId >= registry.shardCount) {
       return { success: false, error: `shard ${shardId} does not exist (valid 0..${registry.shardCount - 1})` };
     }
@@ -2662,7 +2700,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   async function grantResumeProposal(): Promise<void> {
     // Nothing is placed while this master is fenced or its records cannot
     // be read (a hold or a decided move may own a fenced shard): they wait.
-    if (resumePendingShards.size === 0 || controlFenced || coordinator?.recordsBlock()) return;
+    if (resumePendingShards.size === 0 || controlFenced || witnessDark || coordinator?.recordsBlock()) return;
     const byNode = new Map<string, number[]>();
     for (const shardId of resumePendingShards) {
       // A proposal owner that is already serving this shard (a prior retry landed
@@ -2941,6 +2979,8 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       const held = heldNow();
       if (!held) return `shard ${shardId} is not waiting on a choice`;
       if (restoreOn === null) return null;
+      const dark = darkRefusal();
+      if (dark) return dark;
       const holder = held.holders.find(h => h.nodeId === restoreOn);
       if (!holder) return `${registry.nodes.get(restoreOn)?.nodeName ?? (restoreOn || '(none)')} holds no newest copy of shard ${shardId}`;
       if (!holder.connected) return `${holder.nodeName} is down; restore its copy once it is back, or start the shard empty`;
@@ -3496,6 +3536,8 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       transformationActive: () => transformer?.hasActive() ?? false,
     });
     masterMigrateStart = async payload => {
+      const dark = darkRefusal();
+      if (dark) return { ok: false, error: dark };
       if (payload.kind !== 'redistribute') return coordinator!.start(payload);
       if (resuming) return { ok: false, error: 'the reshard pause is being resumed' };
       redistributeStarts += 1;
@@ -4129,6 +4171,29 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   }
 
   let witness: FleetWitness | null = null;
+  let witnessLoopStartedAt = 0;
+  const darkEligible = (): boolean => !standIn && !serveOnly && resolveDataBackend() === 'postgres'
+    && (fleetConfig?.backupDesignations.some(d => d.mode === 'active') ?? false);
+  function evaluateWitnessDark(renewOk: boolean, status: WitnessStatus): void {
+    if (!witnessDark) return;
+    const backups = (fleetConfig?.backupDesignations ?? []).map(d => ({
+      nodeId: d.nodeId,
+      nodeName: registry.nodes.get(d.nodeId)?.nodeName ?? status.claims.find(c => c.nodeId === d.nodeId)?.nodeName ?? d.nodeId.slice(0, 8),
+    }));
+    const hold = witnessDarkHold(renewOk, status, nodeId, registry.term, backups);
+    if (hold === null) {
+      console.warn(`[Fleet] Master dark ended after ${Math.round((Date.now() - witnessDark.since) / 1000)}s: its beacon renews again and every designated backup is accounted for; placing shards and relaxing the sync posture as usual`);
+      witnessDark = null;
+      pushFleetStatusNow();
+      void distribute();
+      return;
+    }
+    if (hold !== witnessDark.waitingOn) {
+      witnessDark = { ...witnessDark, lastRenewAt: status.lastRenewAt, waitingOn: hold };
+      console.warn(`[Fleet] Master still dark: ${hold}`);
+      pushFleetStatusNow();
+    }
+  }
   if (!standalone) {
     const witnessToken = (process.env.DISCORD_TOKEN || '').trim();
     if (witnessToken === '') {
@@ -4146,6 +4211,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
         candidates: () => effectiveMasterUrls().urls,
         peerRegisteredHere: id => registry.nodes.get(id)?.connected === true,
       } : null;
+      witnessLoopStartedAt = Date.now();
       witness = startWitnessLoop({
         token: witnessToken,
         nodeId,
@@ -4201,7 +4267,10 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
           return facts;
         },
         getChannelId: () => fleetConfig?.witnessChannelId ?? null,
-        ...(writeCtx ? { onTick: (renewOk: boolean, status: WitnessStatus) => void evaluateStandInWrites(writeCtx, renewOk, status) } : {}),
+        onTick: (renewOk: boolean, status: WitnessStatus) => {
+          if (writeCtx) void evaluateStandInWrites(writeCtx, renewOk, status);
+          else evaluateWitnessDark(renewOk, status);
+        },
       });
       readWitnessNow = async () => {
         // Null when the read itself failed: readClaims leaves the previous
@@ -4227,8 +4296,11 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       // waiting write (B7-F23's full partition); with no token there is no
       // witness to record on, so the relax waits.
       recordRelax: async () => {
+        // A stand-in may already hold the writes a dark master's relax would release.
+        if (witnessDark) return false;
         beaconPosture = { state: 'relaxed', slotName: null, term: registry.term, seq: ++postureSeq };
-        return witness ? witness.renewNow() : false;
+        const recorded = witness ? await witness.renewNow() : false;
+        return recorded && !witnessDark;
       },
       foreignCancelAt: () => {
         let newest = 0;
@@ -4296,6 +4368,13 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     pushSlotStatus();
     pushSyncPosture();
     reconcileRefusedBackup();
+    if (witness && !witnessDark && darkEligible() && witnessDarkDue(witness.getStatus(), witnessLoopStartedAt, Date.now())) {
+      const status = witness.getStatus();
+      witnessDark = { since: Date.now(), lastRenewAt: status.lastRenewAt, waitingOn: ownRenewWait(status) };
+      console.error(`[Fleet] MASTER DARK TO DISCORD: no beacon renew has landed for a full fresh window in active mode${status.lastError ? ` (${status.lastError})` : ''}, so a backup may stand in; this master places no shards and relaxes no sync posture until a renew lands and every designated backup is accounted for (F10). Workers keep serving.`);
+      reportPlacement();
+      pushFleetStatusNow();
+    }
     // Witness consumer (20.6): a FRESH beacon with a higher term from another
     // node means a newer master is up, whether or not this node's own store
     // could tell it (a dead store never fences). Begin or finish the step-down.
@@ -4376,6 +4455,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     witness: witness ? () => witness!.getStatus() : null,
     migrationActive: null,
     backupDesignationRefused: standalone ? null : () => backupDesignationRefused,
+    witnessDark: standalone ? null : () => witnessDark,
   });
 
   // Owner-info source for .owner manifests (dataManager cannot import fleet).
