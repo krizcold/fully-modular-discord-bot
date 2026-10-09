@@ -1,10 +1,11 @@
 // Discord witness (PLAN_REPLICATION 20.6): the third evidence channel for
 // leader election. Each election participant (master + designated backups)
 // maintains exactly ONE self-describing beacon message and edits it in place;
-// freshness is judged by Discord's edited_timestamp so local clocks never
-// enter the verdict. REST only - the witness must never identify, so it works
-// on nodes holding no lease. Every failure mode reads as "witness dark"
-// (null / false), never as a crash: darkness means hold steady.
+// freshness is judged by Discord's edited_timestamp, carried onto this host's
+// clock by the Date header of the response that delivered it, so a host's
+// clock offset never enters the verdict. REST only - the witness must never
+// identify, so it works on nodes holding no lease. Every failure mode reads as
+// "witness dark" (null / false), never as a crash: darkness means hold steady.
 
 import * as https from 'https';
 import { WITNESS_FACT_WATCH_MS, WITNESS_RENEW_MS, WITNESS_REST_TIMEOUT_MS } from './constants';
@@ -79,7 +80,11 @@ export interface WitnessClaim {
   backupPriority?: number;
   masterSeen?: boolean;
   posture?: BeaconPosture;
-  /** Discord's edited_timestamp (falls back to the post timestamp), ms epoch. */
+  /**
+   * Discord's edited_timestamp (falls back to the post timestamp) on this
+   * host's clock, ms epoch: shifted by the read's offset from Discord's (its
+   * Date header), so ages read up to about two seconds young, never older.
+   */
   observedAt: number;
 }
 
@@ -115,6 +120,8 @@ const SCAN_PAGE_CAP = 4;
 interface RestResult {
   status: number;
   json: any;
+  /** This host's clock minus Discord's at the response (its Date header); null without one. */
+  clockOffsetMs: number | null;
 }
 
 function rest(method: string, path: string, token: string, body?: unknown): Promise<RestResult | null> {
@@ -143,12 +150,14 @@ function rest(method: string, path: string, token: string, body?: unknown): Prom
         timeout: WITNESS_REST_TIMEOUT_MS,
       },
       res => {
+        const served = Date.parse(String(res.headers.date ?? ''));
+        const clockOffsetMs = Number.isFinite(served) ? Date.now() - served : null;
         let raw = '';
         res.on('data', chunk => { raw += chunk; });
         res.on('end', () => {
           let json: any = null;
           try { json = raw === '' ? null : JSON.parse(raw); } catch { /* non-JSON body reads as null */ }
-          finish({ status: res.statusCode ?? 0, json });
+          finish({ status: res.statusCode ?? 0, json, clockOffsetMs });
         });
         // A connection killed after headers but before the body completes fires
         // neither 'end' nor a request 'error'; without this the promise hangs.
@@ -295,7 +304,7 @@ export class DiscordWitness implements FleetWitness {
       if (!parsed || seen.has(parsed.nodeId)) continue;
       seen.add(parsed.nodeId);
       const stamp = Date.parse(msg.edited_timestamp ?? msg.timestamp ?? '');
-      claims.push({ ...parsed, observedAt: Number.isFinite(stamp) ? stamp : 0 });
+      claims.push({ ...parsed, observedAt: Number.isFinite(stamp) ? stamp + (msg.clockOffsetMs ?? 0) : 0 });
     }
     this.lastClaims = claims;
     this.lastReadAt = Date.now();
@@ -327,6 +336,7 @@ export class DiscordWitness implements FleetWitness {
     for (let page = 0; page < SCAN_PAGE_CAP; page++) {
       const res = await rest('GET', `/channels/${channelId}/messages?limit=${SCAN_PAGE_SIZE}${before ? `&before=${before}` : ''}`, this.opts.token);
       if (!res || res.status !== 200 || !Array.isArray(res.json)) return null;
+      for (const msg of res.json) if (msg && typeof msg === 'object') msg.clockOffsetMs = res.clockOffsetMs;
       messages.push(...res.json);
       if (res.json.length < SCAN_PAGE_SIZE) break;
       const last = res.json[res.json.length - 1];
