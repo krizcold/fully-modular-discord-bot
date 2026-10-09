@@ -96,6 +96,11 @@ export function requireControlTerm(term: number): void {
   if (Number.isSafeInteger(term) && term > requiredControlTerm) requiredControlTerm = term;
 }
 
+/** Back down to term, for the witness floor alone when no notice came (the data boot's releaseServingTerm). */
+export function releaseControlTerm(term: number): void {
+  if (Number.isSafeInteger(term) && term >= 0 && term < requiredControlTerm) requiredControlTerm = term;
+}
+
 function isReadOnlyError(error: unknown): boolean {
   return (error as { code?: unknown } | null)?.code === '25006';
 }

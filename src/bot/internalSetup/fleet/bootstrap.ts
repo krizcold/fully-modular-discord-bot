@@ -92,7 +92,7 @@ import {
   GuildDataWriteRequest,
   setDataOpForwarder,
 } from '../utils/ipcDataHandler';
-import { applyDeliveredBackend, ensureRuntimeWith, getActiveBackendUrl, getDataBootStatus, getDeliveredBackendUrls, hasDelivery, holdOwnRuntimeForDelivery, pickDeliveredUrl, repointRuntimeForThisProcess, setRuntimeRecycledHandler, awaitServingProven } from '../utils/dataBackends/boot';
+import { applyDeliveredBackend, ensureRuntimeWith, getActiveBackendUrl, getDataBootStatus, getDeliveredBackendUrls, hasDelivery, holdOwnRuntimeForDelivery, pickDeliveredUrl, repointRuntimeForThisProcess, setRuntimeRecycledHandler, awaitServingProven, releaseServingTerm, requireServingTerm } from '../utils/dataBackends/boot';
 import { setLeaseDeclineHandler } from '../utils/dataBackends/dataReadiness';
 import { applyRouteOverrides, currentRouteDefault } from '../utils/dataBackends/routeResolver';
 import { loadCredentials, resolveDataBackend, upsertCredentials } from '../../../utils/envLoader';
@@ -1392,7 +1392,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   let onDeposedTeardown: (() => void) | null = null;
   let onSupersededByStore: ((observedTerm: number) => void) | null = null;
   let beginSupersession: ((by: { nodeId: string; nodeName: string; term: number }, source: SupersededSource) => void) | null = null;
-  let finishStepDown: ((reason: string) => void) | null = null;
+  let finishStepDown: ((reason: string, awaitNotice?: boolean) => void) | null = null;
   // The step-down notice's drain into the successor's database and the proof
   // of this node's own, while they run: the restart waits on them (B7-F7).
   let stepDownDrain: Promise<void> | null = null;
@@ -3636,7 +3636,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       _setSuperseded({ byNodeId: supersededBy.nodeId, byNodeName: supersededBy.nodeName, term: supersededBy.term, source: supersededSource, since: supersededSince, steppedDown });
       pushFleetStatusNow();
     };
-    finishStepDown = (reason: string): void => {
+    finishStepDown = (reason: string, awaitNotice = false): void => {
       if (stepDownStaged || !supersededBy) return;
       stepDownStaged = true;
       if (standIn) {
@@ -3654,9 +3654,20 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       // The notice's drain or proof still running (it can land after a fresh
       // beacon staged this) holds the restart back, bounded, so the writes it
       // carries land before the process goes (B7-F7).
+      // Staged by the witness alone, it first waits a bounded while for the
+      // notice: its drain is the one way the held writes reach the successor.
       setTimeout(() => {
-        const bound = new Promise<void>(resolve => { setTimeout(resolve, STEPDOWN_PROOF_WAIT_MS).unref(); });
-        void Promise.race([stepDownDrain ?? Promise.resolve(), bound]).catch(() => undefined).then(() => requestStepDownRestart());
+        void (async () => {
+          for (let waited = 0; awaitNotice && !stepDownDrain && waited < STEPDOWN_PROOF_WAIT_MS; waited += 250) {
+            await new Promise<void>(resolve => { setTimeout(resolve, 250).unref(); });
+          }
+          if (awaitNotice && !stepDownDrain && releaseServingTerm()) {
+            console.error(`[Fleet] No step-down notice came to carry this master's held writes into ${supersededBy?.nodeName ?? 'the successor'}'s database, so the restart's flush lands them on this node's own database as before; after a failover that is an older copy of the fleet's, and they are recovered from it there`);
+          }
+          const bound = new Promise<void>(resolve => { setTimeout(resolve, STEPDOWN_PROOF_WAIT_MS).unref(); });
+          await Promise.race([stepDownDrain ?? Promise.resolve(), bound]).catch(() => undefined);
+          requestStepDownRestart();
+        })();
       }, STEPDOWN_HANDOVER_DELAY_MS).unref();
       // The IPC send is the only way back to a co-worker, and it can be lost
       // (parent mid-restart, detached child), so it repeats until the process
@@ -4404,8 +4415,9 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     if (witness && beginSupersession && finishStepDown) {
       const claim = freshHigherTermClaim(witness.getStatus(), nodeId, registry.term, Date.now());
       if (claim) {
+        requireServingTerm(claim.term);
         beginSupersession({ nodeId: claim.nodeId, nodeName: claim.nodeName, term: claim.term }, 'witness');
-        finishStepDown('fresh higher-term beacon');
+        finishStepDown('fresh higher-term beacon', true);
       }
     }
     // Periodic reconcile tick: adopt heartbeat truth for pending leases, then

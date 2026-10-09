@@ -6,7 +6,7 @@
 import { MessageFlags } from 'discord.js';
 import { connect } from 'net';
 import { DataBackendKind, loadCredentials, setFleetDataBackend, upsertCredentials } from '../../../../utils/envLoader';
-import { PostgresBackend, readControlTerm, requireControlTerm } from './postgresBackend';
+import { PostgresBackend, readControlTerm, releaseControlTerm, requireControlTerm } from './postgresBackend';
 import { initWorkingSet, getWorkingSet } from './workingSet';
 import type { DirtyCarry } from './workingSet';
 import { initDataReadiness, getDataReadiness, DataReadinessDriver } from './dataReadiness';
@@ -193,6 +193,50 @@ async function proveLoop(url: string, own: PostgresBackend): Promise<void> {
       return;
     }
   }
+}
+
+// The floor before a witness-staged step-down raised it; null while none did.
+let witnessFloorFrom: number | null = null;
+// Released for the restart's flush: the heartbeat's later raises must not close it again.
+let witnessReleased = false;
+
+/**
+ * A successor seen only on the witness raises the floor to its beacon's term:
+ * the database this node serves from takes no further write until its control
+ * row proves that term, so an older copy the fleet moved off takes none while a
+ * notice may still carry the writes into the successor's. It proves once and
+ * fences nothing: a delivery fences an older copy, and without one
+ * releaseServingTerm hands the writes back to this database.
+ */
+export function requireServingTerm(term: number): void {
+  if (witnessReleased || !Number.isSafeInteger(term) || term <= requiredFloor) return;
+  if (witnessFloorFrom === null) witnessFloorFrom = requiredFloor;
+  requiredFloor = term;
+  requireControlTerm(term);
+  const own = getGuildDataBackend();
+  const url = activeUrl;
+  if (url === null || !(own instanceof PostgresBackend) || !own.isUnproven()) return;
+  void floorVerdict(url, term).then(proof => {
+    if (proof.verdict !== 'ok' || activeUrl !== url || getGuildDataBackend() !== own || requiredFloor !== term) return;
+    provenFloor = { url, floor: term };
+    own.markProven(term);
+  });
+}
+
+/**
+ * No notice came to carry the held writes into the successor's database: the
+ * floor goes back to where the witness found it, so the shutdown flush lands
+ * them on this node's own database, recoverable there if it is an older copy,
+ * instead of the exit dropping them. False when no witness floor was raised.
+ */
+export function releaseServingTerm(): boolean {
+  if (witnessFloorFrom === null) return false;
+  const from = witnessFloorFrom;
+  witnessFloorFrom = null;
+  requiredFloor = from;
+  releaseControlTerm(from);
+  witnessReleased = true;
+  return true;
 }
 
 /** Another of the given forms of one database that answers a TCP connect now and is no older copy of it, if any. */
