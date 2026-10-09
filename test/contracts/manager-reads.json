@@ -1,0 +1,11 @@
+{
+  "about": "Exact strings the manager compares against values this bot writes. Changing one on either side breaks the other silently, so each entry names the bot writer and the manager reader. VERIFY.md L4 (cross-repo golden contract fixtures).",
+  "strings": [
+    {
+      "id": "arm-record.disarmReason.promoted-by-hand",
+      "value": "promoted by hand into the true master",
+      "botWriter": "src/bot/internalSetup/fleet/armRecord.ts PROMOTED_BY_HAND",
+      "managerReader": "src/instance/appLifecycle.ts"
+    }
+  ]
+}
