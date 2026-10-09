@@ -42,6 +42,15 @@ const MOVED_SENTINEL = () => dataPath('global', FLEET_DIR, 'control-store-moved.
 // relationship to one live copy, so carrying it across a backend change would
 // assert a guarantee about a database that no longer exists (B6 map F23).
 const DOC_NAMES = ['plan', 'registry', 'migrations', 'reshard-pending', 'redistribute-proposal', 'transformation', 'fleet-config'] as const;
+const DOC_FILES: Record<string, string> = {
+  'plan': 'leases.json',
+  'registry': 'registry.json',
+  'migrations': 'migrations.json',
+  'reshard-pending': 'reshard-pending.json',
+  'redistribute-proposal': 'redistribute-proposal.json',
+  'transformation': 'transformation.json',
+  'fleet-config': 'fleet-config.json',
+};
 
 /** The fleet's coordination schema: rows here are this node's own bookkeeping, never application data (B6 map F31). */
 export const CONTROL_SCHEMA = 'smdb_control';
@@ -336,7 +345,25 @@ export class PostgresControlStore implements ControlStore {
             console.warn(`[Fleet] Control store is fenced read-only (default_transaction_read_only = on; the term row holds ${pgTerm}); nothing seeded from files, the boot fence judges this node`);
             return;
           }
-          if (fileTerm > pgTerm) {
+          // Only a store no fleet serves takes this node's files: one with no
+          // term row, or one the fleet left for files (the export-back marker).
+          // Over a live row they would replace a serving fleet's records, so
+          // they go aside, where their term holds no later export-back.
+          const seed = fileTerm > pgTerm && (res.rows.length === 0
+            || (await client.query(`SELECT 1 FROM smdb_control.docs WHERE name = 'superseded'`)).rows.length > 0);
+          if (fileTerm > pgTerm && !seed) {
+            const aside = dataPath('global', FLEET_DIR, `file-records-${Date.now()}`);
+            fs.mkdirSync(aside, { recursive: true });
+            for (const file of ['term.json', ...Object.values(DOC_FILES)]) {
+              try {
+                fs.renameSync(dataPath('global', FLEET_DIR, file), `${aside}/${file}`);
+              } catch (error) {
+                if ((error as NodeJS.ErrnoException).code !== 'ENOENT') console.warn(`[Fleet] Could not move ${file} aside:`, error instanceof Error ? error.message : error);
+              }
+            }
+            console.warn(`[Fleet] This node's file-mode fleet records (term ${fileTerm}) are above the control store's row (term ${pgTerm}), whose records are live (no export-back marker), so they are not seeded over it; they are kept in ${aside}, and the boot fence judges this node from the row`);
+          }
+          if (seed) {
             const marker = await fileStore.loadReshardMarker();
             if (marker === 'corrupt') {
               throw new Error('reshard-pending.json is unreadable; refusing to seed past an unreadable pause marker');
@@ -738,17 +765,8 @@ async function exportBackToFileStore(): Promise<void> {
         nodeId: termRes.rows[0].node_id,
         updatedAt: Number(termRes.rows[0].updated_at),
       }, null, 2));
-      const fileFor: Record<string, string> = {
-        'plan': 'leases.json',
-        'registry': 'registry.json',
-        'migrations': 'migrations.json',
-        'reshard-pending': 'reshard-pending.json',
-        'redistribute-proposal': 'redistribute-proposal.json',
-        'transformation': 'transformation.json',
-        'fleet-config': 'fleet-config.json',
-      };
       for (const name of DOC_NAMES) {
-        const target = dataPath('global', FLEET_DIR, fileFor[name]);
+        const target = dataPath('global', FLEET_DIR, DOC_FILES[name]);
         const body = bodies.get(name);
         if (body === undefined) {
           try { fs.unlinkSync(target); } catch { /* absent on both sides */ }
