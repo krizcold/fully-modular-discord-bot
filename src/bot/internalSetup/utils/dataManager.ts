@@ -34,6 +34,9 @@ import {
 
 import {
   flushAll as flushAllFiles,
+  queuedFileWrites,
+  fileFlushOnTheWire,
+  fileFlushesLanded,
   flushGuild as flushGuildFiles,
   pendingGuildFiles,
   filesPending,
@@ -110,8 +113,8 @@ export function getBackendHealth(): { state: string; oldestDirtyMs: number; dirt
 }
 
 /**
- * Flush every queued write to durable storage. Awaited on shutdown; in
- * postgres mode any guilds still dirty at the caller's bound are logged.
+ * Flush every queued write to durable storage, one pass; in postgres mode any
+ * guilds still dirty after it are logged.
  */
 export async function flushAll(): Promise<void> {
   const ws = getWorkingSet();
@@ -120,8 +123,70 @@ export async function flushAll(): Promise<void> {
     ws ? ws.flushAllDirty() : Promise.resolve([] as string[]),
   ]);
   if (leftover.length > 0) {
-    console.warn(`[Data] Shutdown drain left ${leftover.length} guild(s) with unflushed writes: ${leftover.join(', ')}`);
+    console.warn(`[Data] A full flush left ${leftover.length} guild(s) with unflushed writes: ${leftover.join(', ')}`);
   }
+}
+
+const EXIT_DRAIN_POLL_MS = 100;
+const EXIT_DRAIN_GIVEUP_MS = 3000;
+let exitDrain: Promise<void> | null = null;
+let closedForExit = false;
+
+const pause = (ms: number) => new Promise<void>(resolve => { setTimeout(resolve, Math.max(0, ms)); });
+
+function writesSettled(): boolean {
+  const ws = getWorkingSet();
+  return queuedFileWrites() === 0 && (!ws || ws.writesSettled());
+}
+
+const landedFlushes = () => fileFlushesLanded() + (getWorkingSet()?.landedFlushes() ?? 0);
+const flushOnTheWire = () => fileFlushOnTheWire() || (getWorkingSet()?.flushOnTheWire() ?? false);
+
+// A pass flushes what is queued when it starts: a write accepted during it and
+// a flush already on the wire are the next pass's, and the pause hands a flush
+// on the wire the event loop. A store that refuses (down, read-only, a failing
+// disk) is retried until nothing has landed for EXIT_DRAIN_GIVEUP_MS and
+// nothing is on the wire, so a blip drains and a dead store costs that window,
+// not the bound.
+async function drainUntilSettled(deadline: number, progress: { at: number; landed: number }): Promise<void> {
+  while (!writesSettled() && Date.now() < deadline) {
+    const ws = getWorkingSet();
+    await Promise.race([
+      Promise.all([flushAllFiles(), ws ? ws.flushAllDirty() : null]).catch(() => undefined),
+      pause(deadline - Date.now()),
+    ]);
+    if (writesSettled()) return;
+    if (landedFlushes() !== progress.landed) {
+      progress.landed = landedFlushes();
+      progress.at = Date.now();
+    } else if (!flushOnTheWire() && Date.now() - progress.at >= EXIT_DRAIN_GIVEUP_MS) return;
+    await pause(Math.min(EXIT_DRAIN_POLL_MS, deadline - Date.now()));
+  }
+}
+
+/**
+ * The exit drain, within boundMs: flush until nothing is queued or on the wire,
+ * then refuse every later write and flush once more, so the exit drops no write
+ * it accepted. Only for an exit: writes stay refused after it.
+ */
+export function drainForExit(boundMs: number): Promise<void> {
+  if (!exitDrain) {
+    exitDrain = (async () => {
+      const deadline = Date.now() + boundMs;
+      const progress = { at: Date.now(), landed: landedFlushes() };
+      // A refused write in code that does not catch it must not end the
+      // process before the drain does.
+      process.on('uncaughtException', error => console.error('[Data] Error during the exit drain (the drain goes on):', error));
+      await drainUntilSettled(deadline - Math.floor(boundMs / 5), progress);
+      closedForExit = true;
+      await drainUntilSettled(deadline, progress);
+      const left = getWorkingSet()?.dirtyGuildIds() ?? [];
+      if (left.length > 0) console.warn(`[Data] Shutdown drain left ${left.length} guild(s) with unflushed writes: ${left.join(', ')}`);
+      const files = queuedFileWrites();
+      if (files > 0) console.warn(`[Data] Shutdown drain left ${files} file(s) with queued writes`);
+    })();
+  }
+  return exitDrain;
 }
 
 /**
@@ -494,6 +559,7 @@ export function saveData<T = any>(
 
 /** A save that says whether it was accepted, met a frozen guild, or was refused (a set not ready, an I/O error). */
 export function saveDataOutcome<T = any>(filename: string, options: DataOptions, data: T): 'saved' | 'frozen' | 'refused' {
+  if (closedForExit) throw new DataBackendUnavailableError('node-stopping');
   try {
     if (isGuildFrozen(options)) {
       frozenWriteRejections += 1;
@@ -543,6 +609,7 @@ export function saveDataOutcome<T = any>(filename: string, options: DataOptions,
  * line on crash is tolerated by callers (they skip bad lines on read).
  */
 export function appendData(filename: string, options: DataOptions, line: string): boolean {
+  if (closedForExit) throw new DataBackendUnavailableError('node-stopping');
   try {
     if (isGuildFrozen(options)) {
       frozenWriteRejections += 1;
@@ -606,6 +673,7 @@ export function deleteData(filename: string, options: DataOptions): boolean {
 
 /** A delete that says whether it was done, found nothing to delete, met a frozen guild, or was refused (a set not ready, an I/O error). */
 export function deleteDataOutcome(filename: string, options: DataOptions): 'deleted' | 'absent' | 'frozen' | 'refused' {
+  if (closedForExit) throw new DataBackendUnavailableError('node-stopping');
   try {
     if (isGuildFrozen(options)) {
       frozenWriteRejections += 1;

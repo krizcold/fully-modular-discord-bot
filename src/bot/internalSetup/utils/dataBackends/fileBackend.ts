@@ -45,6 +45,7 @@ const retryAttempts = new Map<string, number>();
 const retryTimers = new Map<string, NodeJS.Timeout>();
 
 let flushFailures = 0;
+let flushesLanded = 0;
 
 // Monotonic tmp-name suffix so two saves to the same path in the same ms never
 // collide on the temp file. Pattern mirrors fleet/fileControlStore.ts.
@@ -150,6 +151,7 @@ async function flushPath(absPath: string): Promise<void> {
           if (cur.content.length === 0) pendingOps.delete(absPath);
           else scheduleFlush(absPath); // flush only the remaining tail
         }
+        flushesLanded += 1;
         retryAttempts.delete(absPath);
         return; // bypass the generic seq-drop below (only correct for write/delete)
       }
@@ -159,6 +161,7 @@ async function flushPath(absPath: string): Promise<void> {
       scheduleRetry(absPath);
       return; // keep the pending entry + tmp file; the retry, the next write or flushAll tries again
     }
+    flushesLanded += 1;
     retryAttempts.delete(absPath);
     // Drop the entry only if no newer op arrived while we were flushing.
     const current = pendingOps.get(absPath);
@@ -206,6 +209,20 @@ async function flushPaths(paths: string[]): Promise<void> {
  */
 export async function flushAll(): Promise<void> {
   await flushPaths([...pendingOps.keys()]);
+}
+
+/** Files with a write, delete or append still queued; an entry stays until its flush lands. */
+export function queuedFileWrites(): number {
+  return pendingOps.size;
+}
+
+export function fileFlushOnTheWire(): boolean {
+  return flushing.size > 0;
+}
+
+/** File flushes landed so far (the exit drain's progress test). */
+export function fileFlushesLanded(): number {
+  return flushesLanded;
 }
 
 /**

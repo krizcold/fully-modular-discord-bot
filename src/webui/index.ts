@@ -9,7 +9,7 @@ import { getInstallQueue } from './utils/installQueue';
 import { setNotificationIPCDispatcher } from '../bot/internalSetup/utils/premiumNotifications';
 import { initSyncNudge, nudgeSync } from './utils/syncNudge';
 import { ensureDurableSessionSecret } from '../utils/envLoader';
-import { flushAll } from '../bot/internalSetup/utils/dataManager';
+import { drainForExit } from '../bot/internalSetup/utils/dataManager';
 import { applyRouteDefaultFromMarker } from '../bot/internalSetup/utils/dataBackends/recognitionGuard';
 import { stopSessionStore } from './auth/sessionManager';
 
@@ -20,7 +20,7 @@ import { stopSessionStore } from './auth/sessionManager';
  * exit without this loses them. Mirrors the bot child's clientInitializer drain.
  */
 export async function flushBeforeExit(): Promise<void> {
-  await Promise.race([flushAll(), new Promise(resolve => setTimeout(resolve, 5000))]);
+  await drainForExit(5000);
 }
 
 /**

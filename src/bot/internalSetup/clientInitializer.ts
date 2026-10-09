@@ -13,7 +13,7 @@ import { setupMetricsIPCHandlers } from './utils/ipcMetricsHandler';
 import { setupFleetIPCHandlers } from './utils/ipcFleetHandler';
 import { getMetricsCollector } from './utils/metrics/metricsCollector';
 import { startSamplers, stopSamplers } from './utils/metrics/samplers';
-import { flushAll, sweepGraveyard, DataBackendUnavailableError } from './utils/dataManager';
+import { drainForExit, sweepGraveyard, DataBackendUnavailableError } from './utils/dataManager';
 import { initDataBackendLayer, awaitDataStartupBarrier, gateEventDispatch, dataUnavailableMessage } from './utils/dataBackends/boot';
 import { getWorkingSet } from './utils/dataBackends/workingSet';
 import { setupReloadIPCHandlers } from './utils/ipcReloadHandler';
@@ -740,13 +740,12 @@ async function main() {
       relaxFleetSyncPosture().catch(err => console.warn('[clientInitializer] Could not relax the synchronous posture on shutdown:', err)),
       new Promise(resolve => setTimeout(resolve, 1500)),
     ]);
-    metrics.flushTotals(); // writes via saveData, so it must precede flushAll
-    // Drain the write queue before exit (bounded), so no accepted write is
-    // lost. Postgres mode gets a wider bound: a coalesced Working Set can hold
-    // more dirty state than the file queue, and losing a fenced flush window
-    // costs real writes.
+    metrics.flushTotals(); // writes via saveData, so it must precede the drain
+    // Postgres mode gets a wider bound: a coalesced Working Set can hold more
+    // dirty state than the file queue, and losing a fenced flush window costs
+    // real writes.
     const drainMs = getWorkingSet() ? 30000 : 5000;
-    await Promise.race([flushAll(), new Promise(resolve => setTimeout(resolve, drainMs))]);
+    await drainForExit(drainMs);
     process.exit(0);
   };
   process.on('SIGTERM', () => void shutdownHandler());

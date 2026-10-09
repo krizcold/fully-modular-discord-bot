@@ -8,7 +8,7 @@ import { connect } from 'net';
 import { DataBackendKind, loadCredentials, setFleetDataBackend, upsertCredentials } from '../../../../utils/envLoader';
 import { PostgresBackend, readControlTerm, releaseControlTerm, requireControlTerm } from './postgresBackend';
 import { initWorkingSet, getWorkingSet } from './workingSet';
-import type { DirtyCarry } from './workingSet';
+import type { DirtyCarry, DataUnavailableCause } from './workingSet';
 import { initDataReadiness, getDataReadiness, DataReadinessDriver } from './dataReadiness';
 import { forceRouteDefault, routeFor, applyRouteOverrides } from './routeResolver';
 import { evaluateRecognitionGuard, verifyStoreIdentity, readFileMarker, writeFileMarker, GuardVerdict } from './recognitionGuard';
@@ -987,7 +987,8 @@ function noticeText(property: string, fallback: string): string {
 }
 
 /** User-visible text for a refused write; the database-unreachable notice is operator-editable in config.json. */
-export function dataUnavailableMessage(causeKey: 'database-unreachable' | 'guild-fenced' | 'database-read-only'): string {
+export function dataUnavailableMessage(causeKey: DataUnavailableCause): string {
+  if (causeKey === 'node-stopping') return 'The bot is restarting, so your change was not saved. Please try again in a moment.';
   if (causeKey === 'database-read-only') return "The bot's database is read-only while a backup covers an outage, so your change was not saved. Please try again in a few minutes.";
   return causeKey === 'guild-fenced'
     ? "This server's data just moved to another bot node; please try again in a moment."

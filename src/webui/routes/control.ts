@@ -1,12 +1,12 @@
 import { Router, Request, Response } from 'express';
 import { BotManager } from '../botManager';
 import { getWebuiLogs, clearWebuiLogs } from '../utils/logCapture';
-import { flushAll } from '../../bot/internalSetup/utils/dataManager';
+import { drainForExit } from '../../bot/internalSetup/utils/dataManager';
 
 // Drain the parent's write queue before a deterministic exit (bounded), so a
 // config write accepted just before Restart/Shutdown is not lost.
 async function flushBeforeExit(): Promise<void> {
-  await Promise.race([flushAll(), new Promise(resolve => setTimeout(resolve, 5000))]);
+  await drainForExit(5000);
 }
 
 export function createControlRoutes(botManager: BotManager): Router {

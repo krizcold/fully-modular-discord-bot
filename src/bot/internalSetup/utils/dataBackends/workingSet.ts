@@ -24,11 +24,12 @@ export type WsReadResult =
 export type FlushNowOutcome = 'ok' | 'pending' | 'held' | 'deposed' | 'unavailable';
 
 /**
- * Thrown by the facade for a guild write the backend cannot honor (acceptance
- * window closed, or the guild was fenced by a newer owner). Module code never
- * catches it by contract; the dispatch wrappers do and surface the cause.
+ * Thrown by the facade for a write the backend cannot honor (acceptance window
+ * closed, the guild fenced by a newer owner, or the process past its exit
+ * drain). Module code never catches it by contract; the dispatch wrappers do
+ * and surface the cause.
  */
-export type DataUnavailableCause = 'database-unreachable' | 'guild-fenced' | 'database-read-only';
+export type DataUnavailableCause = 'database-unreachable' | 'guild-fenced' | 'database-read-only' | 'node-stopping';
 
 export class DataBackendUnavailableError extends Error {
   constructor(readonly causeKey: DataUnavailableCause) {
@@ -36,7 +37,9 @@ export class DataBackendUnavailableError extends Error {
       ? '[Data] This guild was taken over by another node; the write was not saved'
       : causeKey === 'database-read-only'
         ? '[Data] The database serving this node is a copy in recovery and accepts no writes (SQLSTATE 25006); the write was not saved'
-        : '[Data] The data backend is unreachable and the write buffer is full; the write was not saved');
+        : causeKey === 'node-stopping'
+          ? '[Data] This process is stopping and its exit drain has closed; the write was not saved'
+          : '[Data] The data backend is unreachable and the write buffer is full; the write was not saved');
     this.name = 'DataBackendUnavailableError';
   }
 }
@@ -115,6 +118,7 @@ export class WorkingSetManager {
   private wsBypassReads = 0;
   private wsBypassWrites = 0;
   private fencedFlushRejections = 0;
+  private landed = 0;
 
   constructor(private backend: DataBackend) {}
 
@@ -586,6 +590,7 @@ export class WorkingSetManager {
         if (buf.chunk.length === 0 && !ws.dirtyKeys.has(key)) ws.appendBuf.delete(key);
       }
       this.dirtyBytes = Math.max(0, this.dirtyBytes - bytes);
+      this.landed += 1;
       this.noteFlushSuccess();
       if (ws.requeue || ws.dirtyKeys.size > 0) {
         ws.requeue = false;
@@ -699,6 +704,20 @@ export class WorkingSetManager {
     this.pruneAdoptions();
     for (const id of this.adoptions.keys()) if (!left.includes(id)) left.push(id);
     return left;
+  }
+
+  /** No guild holds a dirty write or a flush on the wire (the exit drain's test). */
+  writesSettled(): boolean {
+    return ![...this.sets.values()].some(ws => ws.dirtyKeys.size > 0 || ws.flushInFlight);
+  }
+
+  flushOnTheWire(): boolean {
+    return [...this.sets.values()].some(ws => ws.flushInFlight);
+  }
+
+  /** Guild flushes committed so far (the exit drain's progress test). */
+  landedFlushes(): number {
+    return this.landed;
   }
 
   // --------------------------------------------------------------------------
