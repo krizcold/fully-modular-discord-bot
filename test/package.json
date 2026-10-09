@@ -1,0 +1,20 @@
+{
+  "name": "smdb-bot-tests",
+  "private": true,
+  "description": "Verification suite for the bot (Documentation/process/VERIFY.md). Kept out of the root package so the production image never installs test tooling.",
+  "license": "GPL-3.0-only",
+  "type": "module",
+  "scripts": {
+    "test": "node run.cjs",
+    "typecheck": "node ../node_modules/typescript/bin/tsc -p tsconfig.json"
+  },
+  "devDependencies": {
+    "@testcontainers/postgresql": "^12.2.0",
+    "fast-check": "^4.10.2",
+    "testcontainers": "^12.2.0",
+    "vitest": "^5.0.3"
+  },
+  "overrides": {
+    "@types/node": "^22.13.5"
+  }
+}

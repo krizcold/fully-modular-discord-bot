@@ -14,7 +14,9 @@
     "dev:bot": "cross-env NODE_ENV=development nodemon --watch src/bot --ext ts,json --ignore src/bot/config.json --exec ts-node -r tsconfig-paths/register src/bot/index.ts",
     "dev:webui": "cross-env NODE_ENV=development nodemon --watch src/webui --ext ts,json --exec ts-node -r tsconfig-paths/register src/webui/index.ts",
     "dockerPublish": "dotenv node scripts/dockerPublish.js",
-    "exportContext": "node scripts/exportContext.js"
+    "exportContext": "node scripts/exportContext.js",
+    "test": "node test/run.cjs",
+    "test:install": "npm --prefix test ci"
   },
   "keywords": [],
   "author": "kriz_cold",
