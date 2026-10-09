@@ -32,7 +32,7 @@ export function setModeOverride(setBy: string): ModeOverrideResult {
     return { success: false, error: 'This node is not the designated backup master (BOT_NODE_ROLE); only a backup master can stand in.', override: readModeOverride() };
   }
   if (!consentsToActiveMode()) {
-    return { success: false, error: 'This node does not consent to active mode: set FLEET_BACKUP_MODE=active in its env (the manager\'s Backup Mode row) and restart it first; the lever supplies only the master\'s key.', override: readModeOverride() };
+    return { success: false, error: 'This node declines active mode: its env sets FLEET_BACKUP_MODE=passive (the manager\'s Backup Mode row); set it to active and restart it first; the lever supplies only the master\'s key.', override: readModeOverride() };
   }
   try {
     return { success: true, override: writeModeOverride(setBy) };

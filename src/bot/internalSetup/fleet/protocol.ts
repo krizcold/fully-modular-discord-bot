@@ -139,7 +139,7 @@ export interface NodeCapabilities {
   transferUrl?: string;
   /** Designated backup master (BOT_NODE_ROLE=backup-master); badges the fleet view and gates the promote surface. */
   backupMaster?: boolean;
-  /** This node consents to active (stand-in) mode (FLEET_BACKUP_MODE=active); the master's stored entry still has to enable it (20.5). */
+  /** This node consents to active (stand-in) mode (unless FLEET_BACKUP_MODE=passive); the master's stored entry still has to enable it (20.5). */
   activeCapable?: boolean;
   /** This build answers a seed hold's offer and push (B4f-3); a hold refuses a backup without it, naming the update. */
   seedSource?: boolean;
@@ -182,13 +182,15 @@ export interface RegisterResult {
 }
 
 /**
- * One designated backup. mode is the master's half of the active-mode key and is
- * absent on entries written before 2026-09-09, which read as passive (20.5).
+ * One designated backup. mode is the master's half of the active-mode key (20.5);
+ * an entry with none reads as active, the default (R-F1), and passive is written out.
  */
 export interface BackupDesignation {
   nodeId: string;
   priority: number;
   mode?: 'passive' | 'active';
+  /** A passive the node caused by withdrawing its consent, undone by its next consenting register; an operator's passive has none. */
+  withdrawn?: boolean;
 }
 
 /** Wire form of PersistedFleetConfig (control-store side); pushed on CONFIG_UPDATE and in register replies. */

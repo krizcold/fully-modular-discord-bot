@@ -1104,7 +1104,7 @@ function FleetConfigCard({ api, fleet }) {
   const toggleMode = (i) => {
     const next = [...backupsDraft];
     next[i] = next[i].mode === 'active'
-      ? { nodeId: next[i].nodeId, priority: next[i].priority }
+      ? { nodeId: next[i].nodeId, priority: next[i].priority, mode: 'passive' }
       : { nodeId: next[i].nodeId, priority: next[i].priority, mode: 'active' };
     setBackupsDraft(next);
     setBackupsEdited(true);
@@ -1113,7 +1113,7 @@ function FleetConfigCard({ api, fleet }) {
     if (busy) return;
     const urls = draft.split('\n').map((u) => u.trim()).filter(Boolean);
     setBusy(true);
-    api.post('/fleet/config', dialOnly ? { masterCandidates: urls } : { masterCandidates: urls, witnessChannelId: witnessDraft.trim(), ...(backupsEdited ? { backupDesignations: backupsDraft.map((d, i) => (d.mode === 'active' ? { nodeId: d.nodeId, priority: i + 1, mode: 'active' } : { nodeId: d.nodeId, priority: i + 1 })) } : {}) })
+    api.post('/fleet/config', dialOnly ? { masterCandidates: urls } : { masterCandidates: urls, witnessChannelId: witnessDraft.trim(), ...(backupsEdited ? { backupDesignations: backupsDraft.map((d, i) => ({ nodeId: d.nodeId, priority: i + 1, mode: d.mode === 'active' ? 'active' : 'passive', ...(d.mode !== 'active' && d.withdrawn === true ? { withdrawn: true } : {}) })) } : {}) })
       .then((res) => {
         if (!res || res.success === false) { showToast((res && res.error) || 'Config update failed', 'error'); return; }
         showToast(dialOnly ? 'Master list saved on this node; it dials that list now' : `Fleet config saved (revision ${res.revision}) and pushed to every node`, 'success');
@@ -1145,7 +1145,7 @@ function FleetConfigCard({ api, fleet }) {
           />)}
           {!dialOnly && backupsDraft.length > 0 && (
             <div style={{ marginTop: '6px' }}>
-              <div className="usage-stat-sub">Backup order: the first stands in first, and breaks a tie between equally fresh copies. Active mode lets a backup stand in temporarily while the master is gone, and needs that node's own consent too. It is not free: while it is on, every write in the fleet waits for that copy, so losing it costs about a second or two of stalled writes before replication drops back to asynchronous.</div>
+              <div className="usage-stat-sub">Backup order: the first stands in first, and breaks a tie between equally fresh copies. Active mode, the default, lets a backup stand in temporarily while the master is gone, and needs that node's own consent too (its env declines it with FLEET_BACKUP_MODE=passive). It is not free: while it is on, every write in the fleet waits for that copy, so losing it costs about a second or two of stalled writes before replication drops back to asynchronous.</div>
               {backupsDraft.map((d, i) => (
                 <div key={d.nodeId} style={{ display: 'flex', alignItems: 'center', gap: '6px', marginTop: '2px' }}>
                   <span style={{ fontFamily: 'monospace', fontSize: '0.75rem' }}>{`${i + 1}. ${nodeName(d.nodeId)}`}</span>
@@ -1161,7 +1161,7 @@ function FleetConfigCard({ api, fleet }) {
                         : 'That node is not registered here, so its consent cannot be read; active mode cannot be enabled for it until it registers')
                       : consents(d.nodeId)
                         ? 'Active lets this backup stand in temporarily while the master is gone; passive means it only stores data'
-                        : 'This node has not declared FLEET_BACKUP_MODE=active, so it cannot be enabled for active mode from here'}
+                        : 'This node declines active mode (FLEET_BACKUP_MODE=passive in its env), so it cannot be enabled for it from here'}
                   >
                     {d.mode === 'active' ? 'Active' : 'Passive'}
                   </button>
@@ -1197,12 +1197,13 @@ function FleetConfigCard({ api, fleet }) {
                 const mode = fleet.role !== 'master'
                   ? (!self ? (enabled ? 'active' : 'passive')
                     : enabled && fleet.activeCapable ? 'active (enabled by the master; this node consents)'
-                    : enabled ? 'enabled by the master, but this node does not consent (FLEET_BACKUP_MODE is not active here), so it stays passive and will not stand in'
+                    : enabled ? 'enabled by the master, but this node does not consent (FLEET_BACKUP_MODE=passive here), so it stays passive and will not stand in'
                     : fleet.activeCapable ? 'passive (this node consents to active; the master has not enabled it)'
                     : 'passive')
                   : !known ? (enabled ? 'active (enabled here; that node is not registered here, so its consent cannot be read)' : 'passive (that node is not registered here)')
                   : enabled && consent ? 'active (enabled here; the node consents)'
-                  : enabled ? 'active enabled here, but the node does not consent (FLEET_BACKUP_MODE is not active there), so it drops to passive on its next register'
+                  : enabled ? 'active enabled here, but the node does not consent (FLEET_BACKUP_MODE=passive there), so it drops to passive on its next register, and back to active once it consents again'
+                  : d.withdrawn === true ? 'passive because the node declined active mode; it returns to active once the node consents again'
                   : consent ? 'passive here, while the node consents to active (enable it under Edit fleet config)'
                   : 'passive';
                 const lever = self && fleet.role !== 'master' && fleet.modeOverride
@@ -1210,7 +1211,7 @@ function FleetConfigCard({ api, fleet }) {
                     : fleet.backupMaster !== true ? '; the local emergency lever is set, but this node\'s env role is not backup-master (BOT_NODE_ROLE), so it cannot stand in'
                     : fleet.dataBackend && fleet.dataBackend !== 'postgres' ? '; the local emergency lever is set, but this node is in file mode, which has no standby, so it cannot stand in'
                     : fleet.masterKnown ? '; the local emergency lever is set but ignored while the master is reachable'
-                    : !fleet.activeCapable ? '; the local emergency lever is set, but this node does not consent (FLEET_BACKUP_MODE is not active), so it stays passive'
+                    : !fleet.activeCapable ? '; the local emergency lever is set, but this node does not consent (FLEET_BACKUP_MODE=passive), so it stays passive'
                     : '; the local emergency lever is enabling it (read-only) while the master is dark')
                   : '';
                 return <div key={d.nodeId}>{`${i + 1}. ${nodeName(d.nodeId)}: ${mode}${lever}`}</div>;
@@ -1960,7 +1961,7 @@ function FleetModeLeverCard({ api, fleet, reload }) {
             : `Active mode is ENABLED LOCALLY (set ${at(o.setAt)} by ${o.setBy}): while the master is unreachable this node may stand in READ-ONLY as a designated backup would; taking writes still needs the master's own in-sync attestation replicated into this copy, and without it writes stay a manual promote with its RPO confirm.${now} It survives restarts until cleared here.`
           : (storedActive ? 'The master\'s stored designation already enables active mode for this node, so the lever would add nothing here now; it exists for a node the master never enabled. ' : '')
             + 'If the master is dark and its stored designation does not enable active mode for this node, this enables it locally for the outage: the node may then stand in READ-ONLY; taking writes stays a manual promote with its RPO confirm. It ranks below the stored designation whenever the master is reachable, and it survives restarts until cleared here.')
-          + (fleet.activeCapable ? '' : ' This node does not CONSENT to active mode (FLEET_BACKUP_MODE is not active), so the lever has no effect until its env consents.')}
+          + (fleet.activeCapable ? '' : ' This node does not CONSENT to active mode (FLEET_BACKUP_MODE=passive), so the lever has no effect until its env consents.')}
       </div>
       <button onClick={() => send(!!o)} disabled={busy} style={{ marginTop: '6px', fontSize: '0.72rem', padding: '2px 8px' }}>
         {o ? 'Clear the local enable' : 'Enable active mode locally'}
