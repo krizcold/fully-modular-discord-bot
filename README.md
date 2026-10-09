@@ -670,7 +670,7 @@ hand.
 
 ## License
 
-MIT License - See LICENSE file for details
+Licensed under the GNU General Public License v3.0 only (GPL-3.0-only). See the [LICENSE](LICENSE) file for the full text.
 
 ## Contributing
 

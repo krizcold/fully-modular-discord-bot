@@ -18,7 +18,7 @@
   },
   "keywords": [],
   "author": "kriz_cold",
-  "license": "MIT",
+  "license": "GPL-3.0-only",
   "dependencies": {
     "@discordjs/voice": "^0.18.0",
     "@oauth-everything/passport-discord": "^1.0.2",
