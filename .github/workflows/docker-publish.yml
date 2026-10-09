@@ -14,7 +14,40 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
+  # Documentation/process/VERIFY.md: no image is published unless the source
+  # type-checks and the test suite passes. Green here means "tsc plus the
+  # ported tests"; the local gate stays mandatory until the regression set is
+  # ported.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            test/package-lock.json
+
+      - name: Install
+        run: |
+          npm ci --no-audit --no-fund
+          npm run test:install
+
+      - name: Type-check the source and the tests
+        run: |
+          npx tsc --noEmit
+          npm --prefix test run typecheck
+
+      - name: Run the test suite
+        run: npm test
+
   build-and-push:
+    needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: read
