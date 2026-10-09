@@ -2,7 +2,13 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { describe, expect, it } from 'vitest';
-import { PROMOTED_BY_HAND } from '../../src/bot/internalSetup/fleet/armRecord';
+import { PROMOTED_BY_HAND, type ArmPhase } from '../../src/bot/internalSetup/fleet/armRecord';
+import type { FollowerHoldView } from '../../src/bot/internalSetup/fleet/state';
+
+// Compile-time half for values that exist only as types: renaming one on the
+// bot side stops this file from type-checking, which CI runs.
+const PHASES = ['promoted', 'disarmed'] as const satisfies readonly ArmPhase[];
+const HOLD_REASONS = ['behind', 'copy'] as const satisfies readonly FollowerHoldView['reason'][];
 
 interface ContractString { id: string; value: string; botWriter: string; managerReader: string }
 
@@ -22,6 +28,12 @@ const managerPresent = fs.existsSync(path.join(managerRoot, 'src'));
 describe('strings the manager compares against what this bot writes', () => {
   it('the bot still writes exactly the contracted text', () => {
     expect(PROMOTED_BY_HAND).toBe(entry('arm-record.disarmReason.promoted-by-hand').value);
+  });
+
+  it('the contract and the typed values agree both ways', () => {
+    const valuesOf = (prefix: string) => contract.strings.filter(s => s.id.startsWith(prefix)).map(s => s.value).sort();
+    expect(valuesOf('arm-record.phase.')).toEqual([...PHASES].sort());
+    expect(valuesOf('follower-hold.reason.')).toEqual([...HOLD_REASONS].sort());
   });
 
   // Interim until the manager has its own suite asserting against its copy of
