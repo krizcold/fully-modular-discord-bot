@@ -5,6 +5,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { Pool } from 'pg';
 import type { StartedPostgreSqlContainer } from '@testcontainers/postgresql';
+import { GenericContainer } from 'testcontainers';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { poolFor, startPostgres } from '../helpers/postgres';
 import { FAKE_SCHEMA, startFakeApp, type DeleteFault, type WriteFault } from '../oracle/fakeApp';
@@ -331,6 +332,12 @@ describe('the data-loss oracle end to end', () => {
         expect(r.code).toBe(0);
         return out;
       }));
+      // A read line names its own lane; the lane the served content names goes under `by`.
+      const reads = logs.map((l, i) => parseLog(fs.readFileSync(l, 'utf8')).filter(e => e.t === 'read').map(e => ({ ...e, own: ['a', 'b'][i] })));
+      expect(reads.flat().every(e => e.lane === e.own)).toBe(true);
+      const present = reads.flat().filter(e => e.s === 'present');
+      expect(present.length).toBeGreaterThan(0);
+      expect(present.every(e => typeof e.by === 'string')).toBe(true);
       const both = logs.flatMap(l => ['--log', l]);
       expect((await runNode([ORACLE, 'read', ...both, '--target', app.url, '--name', 'two-app', '--limiter', 'off', '--out', file('two-app.jsonl')])).code).toBe(0);
       const c = await check([...both, '--db', `db=${await dump('test', 'two', 'two-db.jsonl')}`, '--app', file('two-app.jsonl'), '--no-fleet', '--k', '3']);
@@ -418,4 +425,43 @@ describe('the data-loss oracle end to end', () => {
     expect(events.filter(e => e.t === 'mark').map(e => e.label)).toEqual(['begin x', 'end x']);
     expect(events.at(-1)?.t).toBe('end');
   });
+
+  it('ends its log on SIGHUP, and on a second signal mid-request', async () => {
+    // A Node child takes signals only on POSIX, so the writer runs in the image the live procedure uses.
+    const box = await new GenericContainer('node:24-alpine')
+      .withCopyFilesToContainer([{ source: ORACLE, target: '/o/oracle.mjs' }])
+      .withCommand(['sleep', '600'])
+      .start();
+    const sh = async (cmd: string) => (await box.exec(['sh', '-c', cmd])).stdout;
+    const start = (run: string, port: number) => sh(`node /o/oracle.mjs write --run ${run} --guild ${GUILD} --lane a=http://127.0.0.1:${port} `
+      + `--duration 0 --rate 5 --limiter off --timeout 60000 --log /tmp/${run}.jsonl > /dev/null 2>&1 & echo $! > /tmp/${run}.pid`);
+    const ended = async (run: string) => {
+      for (let i = 0; i < 100; i++) {
+        const events = parseLog(await sh(`cat /tmp/${run}.jsonl`));
+        if (events.at(-1)?.t === 'end') return events;
+        await sleep(100);
+      }
+      throw new Error(`${run}: no end line`);
+    };
+    try {
+      // Nothing listens on 8080, so requests fail at once.
+      await start('hup', 8080);
+      await sleep(1000);
+      await sh('kill -HUP $(cat /tmp/hup.pid)');
+      expect((await ended('hup')).some(e => e.t === 'ans')).toBe(true);
+      // A server that never answers holds the first request through the stop grace; a second signal ends the run at once.
+      await sh(`node -e "require('net').createServer(() => {}).listen(8081)" > /dev/null 2>&1 &`);
+      await sleep(500);
+      await start('term', 8081);
+      await sleep(1000);
+      await sh('kill -TERM $(cat /tmp/term.pid)');
+      await sleep(300);
+      await sh('kill -TERM $(cat /tmp/term.pid)');
+      const term = await ended('term');
+      const answered = new Set(term.filter(e => e.t === 'ans').map(e => e.id));
+      expect(term.some(e => e.t === 'send' && !answered.has(e.id))).toBe(true);
+    } finally {
+      await box.stop();
+    }
+  }, 120_000);
 });

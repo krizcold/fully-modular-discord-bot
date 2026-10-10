@@ -32,11 +32,15 @@ by this process's monotonic clock:
 - `REFUSED`: any other status, with `definite` true only for refusals given before anything was applied;
 - `UNKNOWN`: no answer, including requests cut short when the writer stops.
 
-On a stop (`--duration` elapsed, SIGINT or SIGTERM), the writer sends nothing new and gives in-flight requests 5 seconds.
-Then it cuts them short, logs them as UNKNOWN, and writes its end line.
+A `read` line names the lane that read, and under `by` the lane that the served content names.
+
+On a stop (`--duration` elapsed, SIGINT, SIGTERM or SIGHUP), the writer sends nothing new and gives in-flight requests 5
+seconds. Then it cuts them short, logs them as UNKNOWN, and writes its end line. A second signal ends it at once: it
+writes its end line and exits, and its in-flight requests stay unanswered, so they read as UNKNOWN.
 
 Lines in the marks file mark critical windows on the same clock, and inside a window the writer runs `--burst` times
-faster. A line must be exactly `begin NAME` or `end NAME`; anything else makes the run inconclusive.
+faster. A line must be exactly `begin NAME` or `end NAME`; anything else makes the run inconclusive. A mark is stamped
+when the writer reads it: it polls the file every `--marks-every` ms (50), and once more before its end line.
 
 ## The web UI's limits
 
@@ -68,7 +72,7 @@ answering 500 "An error occurred" from its error handler.
 | CONTROL | A shard is leased to two nodes, a node leases a shard that a master's shard table gives to another node (a grant still pending is skipped), nodes disagree on the shard count, or a guild maps to two shards or out of range. With two sets of control facts, only a CONTROL that both sets show counts. |
 
 `(during)` marks a verdict from a read made during the run, judged against what was acknowledged before that read was
-sent.
+sent. `(provisional)` marks one that the lost tail of a log with no end line could explain (below).
 
 How the checker judges:
 - **One clock per log.** Order is judged only inside one log. Two writer processes on two hosts never have their clocks
@@ -76,16 +80,26 @@ How the checker judges:
 - **Late landings.** A write that got no answer may land at any time, so it never counts as superseded. A doc that ends
   on such a write after committed ones makes the run inconclusive, because a late landing and a rollback look the same.
 
-The result is FAIL on any verdict. It is INCONCLUSIVE, never PASS, in any of these cases:
+The result is FAIL on any verdict that is not provisional. It is INCONCLUSIVE, never PASS, in any of these cases:
 - a mark is malformed, unpaired (a begin with no end, or an end with no begin) or repeated;
+- a log with marks polled its marks file less often than once a second, so its window edges may be that late;
 - a window named with `--window` was never marked;
 - a marked window holds fewer than `--k` acknowledged operations, or, with no window marked, the whole run does;
 - no judged copy was given;
 - a judged app copy could not read a committed doc, has no row for one (unless it is a sample), or is a sample that
   holds no committed doc;
-- a log has no end line (the writer died or its stream was cut). Nothing bounds what the lost tail held: a writer whose
-  stream dropped runs on in its container for the rest of `--duration`. So the run is INCONCLUSIVE whatever it finds,
-  and its verdicts are listed as provisional, until the writer's own complete log is judged instead (step 3);
+- a log has no end line: the writer died, or its stream was cut while it ran on. Each send line is logged before its
+  request, so such a log lacks only a tail of requests after its last line, and nothing bounds that tail (a writer whose
+  stream dropped runs on in its container for the rest of `--duration`). The verdicts that tail could explain are listed
+  as `(provisional)` and do not fail the run:
+  - an acknowledged unique doc of a cut lane is absent (a delete in the tail);
+  - a doc that no log names, or hot content that no logged write has, names a cut lane (a write in the tail);
+  - another writer's read served such content;
+  - a FORK in which one copy lacks only docs of cut lanes.
+
+  Every other verdict still fails the run. To settle the provisional ones, judge the writer's complete host log instead
+  (step 2). If the writer itself died (killed outright, out of memory, its host rebooted), its own file holds every
+  request but no end line, so no complete log exists and the run is repeated;
 - a doc ends on an unanswered write after committed ones;
 - no control facts were given, or a node gave none (its bot child down or not answering). `--no-fleet` waives this
   only where there is no fleet to check.
@@ -99,13 +113,15 @@ on what "saved" means for module saves [A18].
 fleet.
 - **test/oracle/model.ts** holds a model of a correct store and every check, written against a judge module:
   - **No false verdict.** The checker raises no verdict on any history the model allows. That includes writes that
-    land after their timeout, failed reads, partial app copies, a lagging copy, and two logs on two clocks.
+    land after their timeout, failed reads, partial app copies, a lagging copy, and two logs on two clocks. With a log
+    cut short at any point, whatever its tail did, every verdict it raises is provisional.
   - **Each injected fault is named on its doc:** LOST, ROLLBACK (acknowledged or held), HELD-MISSING (unique or
     hot), RESURRECTED, PHANTOM, WRONG-CONTENT, FORK, and stale reads during the run.
-  - **Hand-built cases** cover the ordering rules, the reads during the run, the CONTROL rules and two-set counting,
-    and each INCONCLUSIVE case above.
+  - **Hand-built cases** cover the ordering rules, the reads during the run, the CONTROL rules and two-set counting
+    (each rule, in both orders), what a cut log makes provisional and what it does not, and each INCONCLUSIVE case
+    above.
 - **test/unit/oracleJudge.test.ts** runs those checks against judge.mjs.
-- **test/unit/oracleMutants.test.ts** runs them against 38 mutants of judge.mjs, each breaking one rule. A hand-built
+- **test/unit/oracleMutants.test.ts** runs them against 54 mutants of judge.mjs, each breaking one rule. A hand-built
   check must kill each one, so the result does not depend on what the generator draws.
 - **test/integration/oracle.test.ts** runs the tools as child processes against stand-in nodes on real Postgres, and
   takes the database copy with the exact `sql` query:
@@ -118,10 +134,15 @@ fleet.
   - the writer stays inside the real rate and body limits;
   - `read` and `cleanup` go past the limiter's burst without errors;
   - a stop with hung requests ends within its grace and still writes the end line, and no delete goes out after a stop;
-  - two writers on one run, each with its own log, are read, judged and cleaned up together;
+  - in node:24-alpine, SIGHUP ends the log, and a second signal mid-request ends it at once with the request
+    unanswered;
+  - an end mark written just before the stop is logged;
+  - two writers on one run, each with its own log, are read, judged and cleaned up together, and each read line names
+    its own lane;
   - `fleet` exits 1 for a node whose bot child gave no state;
   - piped mode works;
-  - a shard leased twice is named.
+  - a shard leased twice is named, with one set of control facts or two (`--fleet-again`, which needs `--fleet`);
+  - the test's own database copy fails when psql fails.
 
 ## On the live fleet (the main session's runs)
 
@@ -138,23 +159,30 @@ Guardrails: the secret filter on every read; `ssh <host> ...` with no flag befor
          ssh contabo-dbot "mkdir -p /root/smdb-oracle && cat > /root/smdb-oracle/oracle.mjs" < test/oracle/oracle.mjs
          ssh contabo-dbot "docker run --rm --name smdb-oracle-<run> --network host -v /root/smdb-oracle:/o node:24-alpine node /o/oracle.mjs write --run <run> --guild <guild> --lane m=http://127.0.0.1:<port> --duration 1800 --marks /o/marks-<run>.txt --log /o/<run>.host.jsonl --log -" > <run>.jsonl
 
-     If the ssh session drops, the writer runs on in its container and only the host file is complete: once the
-     container has exited, fetch it (`ssh contabo-dbot cat /root/smdb-oracle/<run>.host.jsonl > <run>.jsonl`) and judge
-     that.
+     If the ssh session drops, the writer runs on in its container and only the host file is complete. Wait until the
+     container is gone (`ssh contabo-dbot docker inspect smdb-oracle-<run>` fails once `--rm` has removed it), or end
+     it with `ssh contabo-dbot docker stop smdb-oracle-<run>`. Then fetch the host file (`ssh contabo-dbot cat
+     /root/smdb-oracle/<run>.host.jsonl > <run>.jsonl`) and judge that.
 
    - **When the scenario kills or cuts off a whole host,** do not run the writer on that host. Its tail would be lost and
-     the run would only be inconclusive. Run it on the dev box instead, through an ssh tunnel to each node's loopback
-     port (`ssh -N -L <local>:127.0.0.1:<port> <host>`, flags before the host, so it needs the owner's approval once).
+     the run would only be inconclusive. Run it on the dev box instead, with its log in a file there (`--log
+     <run>.jsonl`), through an ssh tunnel to each node's loopback port (`ssh -N -L <local>:127.0.0.1:<port> <host>`,
+     flags before the host, so it needs the owner's approval once).
    - Mark a window: `ssh contabo-dbot "echo 'begin kill-master' >> /root/smdb-oracle/marks-<run>.txt"`, and the same
      with `end` afterwards. Pass `--window kill-master` to the checker so that a missing mark cannot pass.
    - Stop early: write every `end` mark first, then `ssh contabo-dbot docker stop smdb-oracle-<run>`. The writer reads
      the marks file once more and ends within its 5-second grace, inside docker stop's 10.
    - On the Windows node, run oracle.mjs directly with the dev box's node.
-   - Lanes on two hosts need two writers: the same `--run`, distinct lane names, one log each. Every later command
-     (`sql`, `read`, `check`, `cleanup`) then gets one `--log` per writer log, copied to the host where it runs;
-     given only some, `read` and `cleanup` miss the other writer's docs.
-   - Piping into `node --input-type=module -` also works and leaves no file on the host.
-3. **Let held writes settle, then take the copies before any failback or re-seed wipes the evidence [A15].**
+   - Lanes on two hosts need two writers: the same `--run`, distinct lane names, one log each. Name each writer's files
+     with its own tag where `<run>` stands in a file name (`<run>-<w>.host.jsonl`, `<run>-<w>.jsonl`,
+     `<run>-<w>.copy.jsonl`). Every later command (`sql`, `read`, `check`, `cleanup`) then gets one `--log` per writer
+     log, copied to the host where it runs; given only some, `read` and `cleanup` miss the other writer's docs.
+   - Piping into `node --input-type=module -` also works but leaves no file on the host: if its stream drops, no
+     complete log exists and the run is repeated.
+3. **Once the writer has ended, let held writes settle, then take the copies before any failback or re-seed wipes the
+   evidence [A15].**
+   - The writer must have ended first: the log to be judged ends with its end line. A copy taken while the writer still
+     runs lacks the docs it acknowledges later, and the checker calls them LOST.
    - If the log has HELD answers, wait until the owner has written its backlog (a few minutes after the scenario
      recovers).
    - A HELD-MISSING counts only if it is still there in a copy taken again later.
@@ -190,7 +218,9 @@ Guardrails: the secret filter on every read; `ssh <host> ...` with no flag befor
 5. **The bite test, once, before trusting a baseline (VERIFY.md 5.5):** after a short clean run, `oracle.mjs bite --log
    <run>.jsonl` prints two SQL statements for the judged copy's database. Run them, dump the copy again, and check. The
    result must be FAIL, with exactly LOST and ROLLBACK on the named docs. Then run the 30-minute baseline.
-6. **Clean up** once nothing more is to be judged. It takes about as long as `read`:
+6. **Clean up** once nothing more is to be judged, on a host that holds the log: the writer's own host with
+   `<run>.host.jsonl`, or a host the log was copied to with `<run>.copy.jsonl` (the dev-box writer's case). It takes about
+   as long as `read`:
 
        ssh contabo-dbot "docker run --rm --network host -v /root/smdb-oracle:/o node:24-alpine node /o/oracle.mjs cleanup --log /o/<run>.host.jsonl --target http://127.0.0.1:<master port>"
 

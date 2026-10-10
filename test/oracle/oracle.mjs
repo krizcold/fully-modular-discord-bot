@@ -31,6 +31,8 @@ const LIMITER = '9/520';
 // After a stop, in-flight requests get this long before they are cut and
 // logged as unknown, inside docker stop's 10 s.
 const STOP_GRACE_MS = 5000;
+// SIGHUP too: closing the terminal of a writer run by hand stops it cleanly.
+const STOP_SIGNALS = /** @type {const} */ (['SIGINT', 'SIGTERM', 'SIGHUP']);
 
 /** @typedef {'ACKED' | 'HELD' | 'REFUSED' | 'UNKNOWN'} AnswerClass */
 /** @typedef {{ cls: AnswerClass, definite: boolean }} Answer */
@@ -426,7 +428,7 @@ async function write(argv) {
   emit({
     t: 'start', v: LOG_VERSION, run, guild, module: MODULE, seed, startedAt: new Date().toISOString(),
     lanes: lanes.map((/** @type {{ name: string, base: string }} */ l) => ({ name: l.name, route: 'operator', base: l.base })),
-    settings: { duration, rate, hotCount, hotRatio, deleteRatio, readEvery, maxSize, maxBody, burst, limiter: limiterSpec, timeoutMs },
+    settings: { duration, rate, hotCount, hotRatio, deleteRatio, readEvery, maxSize, maxBody, burst, limiter: limiterSpec, timeoutMs, marksEvery },
   });
 
   /**
@@ -503,7 +505,9 @@ async function write(argv) {
     const state = docStateOf(r);
     counts.reads += 1;
     if (state.s === 'error') counts.readErrors += 1;
-    emit({ t: 'read', id, lane: lane.name, key, kind, at0, at1: clock(), ...state });
+    // The lane the served content names goes under `by`, so it cannot replace the reading lane.
+    const served = state.s === 'present' ? { s: state.s, h: state.h, by: state.lane, c: state.c } : state;
+    emit({ t: 'read', id, lane: lane.name, key, kind, at0, at1: clock(), ...served });
     return state;
   };
 
@@ -603,25 +607,31 @@ async function write(argv) {
     marksTimer = setInterval(pollMarks, marksEvery);
   }
 
+  const finish = () => {
+    // An end mark written just before the stop is not lost between two polls.
+    pollMarks();
+    emit({ t: 'end', at: clock(), endedAt: new Date().toISOString(), counts });
+  };
   let signals = 0;
   const onSignal = () => {
     signals += 1;
-    if (signals > 1) process.exit(130);
+    // Every request sent so far is logged and none follows the exit, so the
+    // log is still complete: its unanswered requests read as unknown.
+    if (signals > 1) {
+      finish();
+      process.exit(130);
+    }
     halt();
   };
-  process.on('SIGINT', onSignal);
-  process.on('SIGTERM', onSignal);
+  for (const signal of STOP_SIGNALS) process.on(signal, onSignal);
   /** @type {NodeJS.Timeout | undefined} */
   const timer = duration > 0 ? setTimeout(halt, duration * 1000) : undefined;
 
   await Promise.all(lanes.map(runLane));
   if (timer) clearTimeout(timer);
   if (marksTimer) clearInterval(marksTimer);
-  // An end mark written just before the stop is not lost between two polls.
-  pollMarks();
-  emit({ t: 'end', at: clock(), endedAt: new Date().toISOString(), counts });
-  process.off('SIGINT', onSignal);
-  process.off('SIGTERM', onSignal);
+  finish();
+  for (const signal of STOP_SIGNALS) process.off(signal, onSignal);
 }
 
 /**

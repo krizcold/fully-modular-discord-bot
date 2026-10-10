@@ -124,16 +124,39 @@ function logsOf(world: World, split = false): any[][] {
     const status = o.cls === 'ACKED' ? 200 : o.cls === 'HELD' ? 202 : o.cls === 'UNKNOWN' ? 0 : 503;
     log.push({ t: 'ans', id: o.id, at: o.ansAt + d, status, cls, definite: o.cls === 'REFUSED-D' || o.cls === 'ACKED' || o.cls === 'HELD' });
   }
+  const names = namesOf(world);
   for (const r of world.reads) {
     const d = shift(r.lane);
-    logs[laneLog(r.lane)].push({ t: 'read', id: r.id, lane: r.lane, key: r.key, kind: r.kind, at0: r.at0 + d, at1: r.at1 + d, ...r.result });
+    const by = r.result.s === 'present' ? { by: names.get(r.result.h)?.lane } : {};
+    logs[laneLog(r.lane)].push({ t: 'read', id: r.id, lane: r.lane, key: r.key, kind: r.kind, at0: r.at0 + d, at1: r.at1 + d, ...r.result, ...by });
   }
   for (const log of logs) log.push({ t: 'end' });
   return logs;
 }
 
+/**
+ * The logs as a writer leaves them when log `which` is cut at world time t:
+ * its later lines and its end line never arrive.
+ */
+function cutLogs(world: World, split: boolean, which: number, t: number): any[][] {
+  return logsOf(world, split).map((log, i) => {
+    if (i !== which) return log;
+    const shift = split && i === 1 ? 1e6 : 0;
+    return log.filter(e => e.t === 'start' || (e.t !== 'end' && (e.t === 'read' ? e.at1 : e.at) - shift < t));
+  });
+}
+
+/** Each written hash, with the lane and counter its content names. */
+const namesOf = (world: World) => new Map(world.ops.filter(o => o.op === 'write').map(o => [o.h as string, { lane: o.lane, c: o.c }]));
+
 export function copyOf(name: string, docs: Map<string, string>, mode: 'judged' | 'lagging' = 'judged') {
   return { name, mode, complete: true, docs: new Map([...docs].map(([k, h]) => [k, { s: 'present' as const, h }])) };
+}
+
+/** A database copy of a world's docs, with the lane and counter each doc's content names, as dbCopy reads them. */
+function namedCopyOf(world: World, docs: Map<string, string>) {
+  const names = namesOf(world);
+  return { name: 'db', mode: 'judged' as const, complete: true, docs: new Map([...docs].map(([k, h]) => [k, { s: 'present' as const, h, ...names.get(h) }])) };
 }
 
 const writesTo = (world: World, key: string) => world.ops.filter(o => o.op === 'write' && o.key === key);
@@ -193,6 +216,12 @@ export function checks(): Check[] {
         else older.delete(e.key);
       }
       expect(judgeWorld(J, world, [copyOf('db', world.final), copyOf('standby', older, 'lagging')]).verdicts).toEqual([]);
+    }), { numRuns }) },
+    { name: 'no firm verdict when a log is cut short, whatever its tail did', run: (J, numRuns) => fc.assert(fc.property(worldArb, fc.double({ min: 0, max: 1, noNaN: true }), fc.boolean(), (world, frac, split) => {
+      const end = Math.max(0, ...world.ops.map(o => o.ansAt), ...world.reads.map(r => r.at1));
+      const logs = cutLogs(world, split, split ? 1 : 0, frac * end);
+      const r = J.judge({ history: J.buildHistory(logs), copies: [namedCopyOf(world, world.final)], k: 0, noFleet: true });
+      expect(r.verdicts.filter(v => !v.provisional)).toEqual([]);
     }), { numRuns }) },
     { name: 'no verdict from failed reads or a partial app copy', run: (J, numRuns) => fc.assert(fc.property(worldArb, fc.array(fc.nat(2), { minLength: 200, maxLength: 200 }), (world, picks) => {
       const keys = [...new Set(world.ops.map(o => o.key))];
@@ -359,6 +388,10 @@ export function checks(): Check[] {
       }
       const good = [start(['a']), { t: 'mark', label: 'begin kill', at: 5 }, ...sixAcked(), { t: 'mark', label: 'end kill', at: 70 }, { t: 'end' }];
       expect(judgeLog(J, good, [copyOf('db', sixDocs())]).result).toBe('PASS');
+      // A mark is stamped when the writer polls for it, so a slow poll moves window edges.
+      const polled = (marksEvery: number) => [{ ...start(['a']), settings: { marksEvery } }, ...good.slice(1)];
+      expect(judgeLog(J, polled(1000), [copyOf('db', sixDocs())]).result).toBe('PASS');
+      expect(judgeLog(J, polled(60000), [copyOf('db', sixDocs())]).result).toBe('INCONCLUSIVE');
     } },
     { name: 'a run with no marks and too few acknowledged writes is inconclusive', run: J => {
       const log = [start(['a']), ...sixAcked(), { t: 'end' }];
@@ -403,20 +436,61 @@ export function checks(): Check[] {
       const r = judgeLog(J, log, [copyOf('db', sixDocs()), copyOf('other', five, 'lagging')], { agree: ['db', 'other'] });
       expect(r.verdicts.some(v => v.v === 'FORK')).toBe(true);
     } },
-    { name: 'a cut log is inconclusive, and its verdicts only provisional', run: J => {
+    { name: 'a cut log is inconclusive, and only what its unlogged tail could explain is provisional', run: J => {
       const cutLog = [start(['a']), ...sixAcked()];
       expect(judgeLog(J, cutLog, [copyOf('db', sixDocs())]).result).toBe('INCONCLUSIVE');
-      // A writer that ran on past its cut log leaves docs the log never names: listed, not a FAIL.
-      const ranOn = judgeLog(J, cutLog, [copyOf('db', new Map([...sixDocs(), [u('a', 400), 'x']]))]);
+      const named = (h: string, lane: string, c: number) => ({ s: 'present' as const, h, lane, c });
+      const db = (docs: [string, ReturnType<typeof named>][], base = sixDocs()) => {
+        const copy = copyOf('db', base);
+        for (const [key, state] of docs) copy.docs.set(key, state);
+        return copy;
+      };
+      // A writer that ran on past its cut log leaves docs only its tail names: listed, not a FAIL.
+      const ranOn = judgeLog(J, cutLog, [db([[u('a', 400), named('x', 'a', 400)], [hot(0), named('h', 'a', 9)]])]);
       expect(ranOn.result).toBe('INCONCLUSIVE');
-      expect(ranOn.provisional).toBe(true);
-      expect(ranOn.verdicts.map(v => v.v)).toEqual(['PHANTOM']);
-      // A mass loss stays listed for the writer's complete log to settle.
+      expect(ranOn.verdicts.map(v => `${v.v} ${v.provisional}`)).toEqual(['PHANTOM true', 'PHANTOM true']);
+      // A mass loss in the cut lane waits for the writer's complete log; with its end line it fails.
       const many = judgeLog(J, [start(['a']), ...ackedRun('a', 50)], [copyOf('db', new Map())]);
       expect(many.result).toBe('INCONCLUSIVE');
-      expect(many.verdicts.filter(v => v.v === 'LOST')).toHaveLength(50);
-      // The same log with its end line: FAIL.
+      expect(many.verdicts.filter(v => v.v === 'LOST' && v.provisional)).toHaveLength(50);
       expect(judgeLog(J, [start(['a']), ...ackedRun('a', 50), { t: 'end' }], [copyOf('db', new Map())]).result).toBe('FAIL');
+      // Content naming an ended lane is no tail's: a cut log beside it changes nothing.
+      const twoLogs = J.buildHistory([[start(['a']), send(1, 'a', hot(0), 1, 'h1', 10), ans(1, 11)], [start(['b']), { t: 'end' }]]);
+      const judgeTwo = (docs: [string, ReturnType<typeof named>][]) => J.judge({ history: twoLogs, copies: [db(docs, new Map())], k: 0, noFleet: true }).result;
+      expect(judgeTwo([[hot(0), named('h1', 'a', 1)]])).toBe('INCONCLUSIVE');
+      expect(judgeTwo([[hot(0), named('altered', 'a', 2)]])).toBe('INCONCLUSIVE');
+      expect(judgeTwo([[hot(0), named('altered', 'b', 2)]])).toBe('FAIL');
+      expect(judgeTwo([[hot(0), named('h1', 'a', 1)], [u('a', 9), named('x', 'a', 9)]])).toBe('INCONCLUSIVE');
+      expect(judgeTwo([[hot(0), named('h1', 'a', 1)], [u('b', 9), named('x', 'b', 9)]])).toBe('FAIL');
+      // What no tail can explain still fails: a double lease, a resurrected doc, a rollback, a stale read, another writer's loss.
+      expect(J.judge({ history: J.buildHistory([cutLog]), copies: [copyOf('db', sixDocs())], k: 0, fleet: [fleetNode('m', [0, 1]), fleetNode('w', [1])] }).result).toBe('FAIL');
+      const del = [...cutLog, { t: 'send', id: 7, lane: 'a', op: 'delete', kind: 'u', key: u('a', 1), c: 0, h: null, at: 70 }, ans(7, 71)];
+      expect(judgeLog(J, del, [copyOf('db', sixDocs())]).result).toBe('FAIL');
+      const rolled = [start(['a']), send(1, 'a', hot(0), 1, 'h1', 10), ans(1, 11), send(2, 'a', hot(0), 2, 'h2', 20), ans(2, 21)];
+      expect(judgeLog(J, rolled, [copyOf('db', new Map([[hot(0), 'h1']]))]).result).toBe('FAIL');
+      const stale = [...cutLog, { t: 'read', id: 7, lane: 'a', key: u('a', 1), kind: 'u', at0: 70, at1: 71, s: 'absent' }];
+      expect(judgeLog(J, stale, [copyOf('db', sixDocs())]).result).toBe('FAIL');
+      const other = [start(['b']), send(1, 'b', u('b', 1), 1, 'y1', 10), ans(1, 11), { t: 'end' }];
+      expect(J.judge({ history: J.buildHistory([cutLog, other]), copies: [copyOf('db', sixDocs())], k: 0, noFleet: true }).result).toBe('FAIL');
+      // A read of hot content no logged write has: its own log holds every send before it, another writer's cut log may not.
+      const hotA = [start(['a']), send(1, 'a', hot(0), 1, 'h1', 10), ans(1, 11)];
+      const served = (id: number, lane: string, at: number) => ({ t: 'read', id, lane, key: hot(0), kind: 'h', at0: at, at1: at + 1, s: 'present', h: 'altered', by: 'a', c: 2 });
+      const hotDb = () => copyOf('db', new Map([[hot(0), 'h1']]));
+      expect(judgeLog(J, [...hotA, served(2, 'a', 20)], [hotDb()]).result).toBe('FAIL');
+      const readInB = J.buildHistory([hotA, [start(['b']), served(1, 'b', 5), { t: 'end' }]]);
+      expect(J.judge({ history: readInB, copies: [hotDb()], k: 0, noFleet: true }).result).toBe('INCONCLUSIVE');
+      // A FORK whose one side lacks only docs of cut lanes may be unlogged deletes beside lag; of ended lanes it fails.
+      const docsOf = (n: number[]) => new Map(n.map(i => [u('a', i), `x${i}`]));
+      const forkA = judgeLog(J, cutLog, [copyOf('db', docsOf([1, 2, 3, 4, 5])), copyOf('standby', docsOf([1, 2, 3, 4, 6]), 'lagging')]);
+      expect(forkA.verdicts.map(v => `${v.v} ${v.provisional}`).sort()).toEqual(['FORK true', 'LOST true']);
+      const both = new Map([...sixDocs(), [u('b', 1), 'y1'], [u('b', 2), 'y2']]);
+      const twoB = [start(['b']), send(1, 'b', u('b', 1), 1, 'y1', 10), ans(1, 11), send(2, 'b', u('b', 2), 2, 'y2', 20), ans(2, 21), { t: 'end' }];
+      const forkB = J.judge({
+        history: J.buildHistory([cutLog, twoB]), k: 0, noFleet: true,
+        copies: [copyOf('db', both), copyOf('s1', new Map([[u('b', 1), 'y1']]), 'lagging'), copyOf('s2', new Map([[u('b', 2), 'y2']]), 'lagging')],
+      });
+      expect(forkB.result).toBe('FAIL');
+      expect(forkB.verdicts.map(v => v.v)).toEqual(['FORK']);
     } },
     { name: 'reads during the run name resurrected, wrong and vanished docs', run: J => {
       const one = [start(['a']), send(1, 'a', u('a', 1), 1, 'x1', 10), ans(1, 11)];
@@ -499,6 +573,24 @@ export function checks(): Check[] {
       const missing = J.judge({ history, copies, k: 0, fleet: handoff, fleetAgain: [fleetNode('x', [1])] });
       expect(missing.result).toBe('INCONCLUSIVE');
       expect(missing.inconclusive.join('\n')).toMatch(/node w is in the first set/);
+      expect(J.judge({ history, copies, k: 0, fleet: [fleetNode('x', [1])], fleetAgain: handoff }).inconclusive.join('\n')).toMatch(/node w is in the second set/);
+      // Nodes are matched by id, so per-set file names leave nothing unmatched.
+      expect(J.judge({ history, copies, k: 0, fleet: tableSet('1'), fleetAgain: tableSet('2') }).inconclusive).toEqual([]);
+      // Each rule counts only what both sets show, in either order: a table conflict, two shard counts, a guild split, an out-of-range map.
+      const seenOnce: [any[], any[]][] = [
+        [[fleetNode('m', [0], { table: [[1, 'w']] }), fleetNode('x', [1])], [fleetNode('m', [0], { table: [[1, 'x']] }), fleetNode('x', [1])]],
+        [[fleetNode('m', [0]), fleetNode('w', [1], { shardCount: 3 })], [fleetNode('m', [0]), fleetNode('w', [1])]],
+        [[fleetNode('m', [0], { guildMap: { 10: 0 } }), fleetNode('w', [1], { guildMap: { 10: 1 } })], [fleetNode('m', [0], { guildMap: { 10: 1 } }), fleetNode('w', [1], { guildMap: { 10: 1 } })]],
+        [[fleetNode('m', [0, 1], { guildMap: { 10: 5 } })], [fleetNode('m', [0, 1], { guildMap: { 10: 1 } })]],
+      ];
+      for (const [seen, gone] of seenOnce) {
+        expect(controls(seen, gone)).toEqual([]);
+        expect(controls(gone, seen)).toEqual([]);
+        expect(controls(seen, seen)).toEqual(['CONTROL']);
+      }
+      // An out-of-range map is one node's state at one instant: a shard count that changed between the sets does not hide it.
+      const outOfRange = (count: number) => [fleetNode('m', Array.from({ length: count }, (_, i) => i), { shardCount: count, guildMap: { 10: 5 } })];
+      expect(controls(outOfRange(2), outOfRange(4))).toEqual(['CONTROL']);
       expect(J.judge({ history, copies, k: 0, fleet: handoff, fleetAgain: handoff }).verdicts.map(v => v.v)).toEqual(['CONTROL']);
     } },
   ];

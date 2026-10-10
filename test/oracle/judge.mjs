@@ -10,8 +10,10 @@
  * must hold every acknowledged effect; a lagging copy (an async standby) is
  * judged only for content, phantoms and divergence.
  *
- * The result is FAIL on any verdict, INCONCLUSIVE when something needed to
- * judge the run is missing, and PASS only when nothing is.
+ * The result is FAIL on any verdict that is not provisional, INCONCLUSIVE
+ * when something needed to judge the run is missing, and PASS only when
+ * nothing is. A verdict is provisional when the unlogged tail of a log with
+ * no end line could explain it.
  */
 import { MARK, presentState } from './oracle.mjs';
 
@@ -28,10 +30,12 @@ import { MARK, presentState } from './oracle.mjs';
  *   logs: { lanes: string[], ended: boolean }[], problems: string[] }} History
  * @typedef {{ name: string, mode: 'judged' | 'lagging', complete: boolean, docs: Map<string, DocState>,
  *   run?: string, guild?: string, sample?: boolean }} Copy
- * @typedef {{ v: string, key?: string, copy?: string, during?: boolean, detail: string }} Verdict
+ * @typedef {{ v: string, key?: string, copy?: string, during?: boolean, provisional?: boolean, detail: string }} Verdict
  */
 
 export const VERDICTS = ['LOST', 'ROLLBACK', 'FORK', 'PHANTOM', 'HELD-MISSING', 'RESURRECTED', 'WRONG-CONTENT', 'CONTROL'];
+/** The slowest marks poll whose window edges are still judged, in ms. */
+const MARKS_EVERY_MAX = 1000;
 
 /**
  * @param {any[][]} logs parsed events, one array per writer log
@@ -99,7 +103,9 @@ export function buildHistory(logs) {
         if (entry.kind !== op.kind) throw new Error(`key ${op.key} is both unique and hot`);
         (op.op === 'write' ? entry.writes : entry.deletes).push(op);
       } else if (e.t === 'read') {
-        const state = /** @type {DocState} */ (e.s === 'present' ? { s: 'present', h: e.h } : e.s === 'absent' ? { s: 'absent' } : { s: 'error', err: e.err ?? '' });
+        // `by` is the lane the served content names.
+        const facts = typeof e.by === 'string' ? { lane: e.by, c: e.c } : {};
+        const state = /** @type {DocState} */ (e.s === 'present' ? { s: 'present', h: e.h, ...facts } : e.s === 'absent' ? { s: 'absent' } : { s: 'error', err: e.err ?? '' });
         reads.push({ log, id: e.id, lane: e.lane, key: e.key, kind: e.kind, at0: e.at0, at1: e.at1, state });
       } else if (e.t === 'mark') {
         // A mark the checker cannot pair is a window it cannot judge [A13].
@@ -119,6 +125,11 @@ export function buildHistory(logs) {
     for (const [name, begin] of open) {
       windows.push({ log, name, begin, end: last });
       problems.push(`window ${name} in log ${log + 1} begins but never ends`);
+    }
+    // Marks are stamped when the writer polls its marks file.
+    const every = start.settings?.marksEvery ?? 50;
+    if (every > MARKS_EVERY_MAX && events.some(e => e.t === 'mark')) {
+      problems.push(`log ${log + 1} polled its marks every ${every} ms, so its window edges may be that late`);
     }
   });
 
@@ -187,6 +198,18 @@ function committedAfterUnanswered(entry, shown, before) {
 }
 
 /**
+ * The lanes of logs with no end line. Each send line is logged before its
+ * request, so what such a log lost is a tail of requests after its last line:
+ * new unique keys of its lanes, hot content naming its lanes, and deletes of
+ * its lanes' acknowledged unique docs. A verdict that tail could explain is
+ * provisional; nothing else is.
+ * @param {History} history
+ */
+function cutLanes(history) {
+  return new Set(history.logs.filter(l => !l.ended).flatMap(l => l.lanes));
+}
+
+/**
  * @param {History} history
  * @param {Copy} copy
  * @returns {{ verdicts: Verdict[], unread: string[], reasons: string[] }}
@@ -199,7 +222,11 @@ export function judgeCopy(history, copy) {
   /** @type {string[]} */
   const reasons = [];
   const judged = copy.mode === 'judged';
-  const add = (/** @type {string} */ v, /** @type {string} */ key, /** @type {string} */ detail) => verdicts.push({ v, key, copy: copy.name, detail });
+  const cut = cutLanes(history);
+  const namesCut = (/** @type {DocState} */ s) => s.s === 'present' && s.lane !== undefined && cut.has(s.lane);
+  const add = (/** @type {string} */ v, /** @type {string} */ key, /** @type {string} */ detail, provisional = false) => {
+    verdicts.push({ v, key, copy: copy.name, detail, ...(provisional ? { provisional } : {}) });
+  };
 
   for (const [key, entry] of history.keys) {
     const state = stateIn(copy, key);
@@ -216,7 +243,7 @@ export function judgeCopy(history, copy) {
         else if (judged && del && del.cls === 'HELD') add('HELD-MISSING', key, `present after delete #${del.id} was held`);
         else if (!possiblyApplied(w)) add('PHANTOM', key, `present though write #${w.id} was refused before applying (${w.status})`);
       } else if (judged && !del) {
-        if (w.cls === 'ACKED') add('LOST', key, `absent though write #${w.id} was acknowledged`);
+        if (w.cls === 'ACKED') add('LOST', key, `absent though write #${w.id} was acknowledged`, cut.has(w.lane));
         else if (w.cls === 'HELD') add('HELD-MISSING', key, `absent though write #${w.id} was held`);
       }
       continue;
@@ -225,7 +252,7 @@ export function judgeCopy(history, copy) {
     if (state.s === 'present') {
       const shown = writeWithHash(entry, state.h);
       if (!shown) {
-        add('WRONG-CONTENT', key, 'holds content that no lane wrote');
+        add('WRONG-CONTENT', key, 'holds content that no lane wrote', namesCut(state));
         continue;
       }
       if (!possiblyApplied(shown)) add('PHANTOM', key, `holds write #${shown.id} (${shown.lane} c=${shown.c}), refused before applying`);
@@ -256,7 +283,7 @@ export function judgeCopy(history, copy) {
   // A database listing also shows docs of this run that no writer sent.
   if (copy.complete) {
     for (const [key, state] of copy.docs) {
-      if (!history.keys.has(key) && state.s === 'present') add('PHANTOM', key, 'a doc of this run that no writer sent');
+      if (!history.keys.has(key) && state.s === 'present') add('PHANTOM', key, 'a doc of this run that no writer sent', namesCut(state));
     }
   }
   return { verdicts, unread, reasons };
@@ -274,10 +301,13 @@ export function judgeReads(history) {
   const verdicts = [];
   /** @type {string[]} */
   const reasons = [];
+  const cut = cutLanes(history);
   for (const r of history.reads) {
     const entry = history.keys.get(r.key);
     if (!entry || r.state.s === 'error') continue;
-    const add = (/** @type {string} */ v, /** @type {string} */ detail) => verdicts.push({ v, key: r.key, copy: `read #${r.id} via ${r.lane}`, during: true, detail });
+    const add = (/** @type {string} */ v, /** @type {string} */ detail, provisional = false) => {
+      verdicts.push({ v, key: r.key, copy: `read #${r.id} via ${r.lane}`, during: true, detail, ...(provisional ? { provisional } : {}) });
+    };
     const sameLog = (/** @type {Op} */ op) => op.log === r.log;
     if (entry.kind === 'u') {
       const w = entry.writes[0];
@@ -295,7 +325,10 @@ export function judgeReads(history) {
     if (r.state.s === 'present') {
       const shown = writeWithHash(entry, r.state.h);
       if (!shown) {
-        add('WRONG-CONTENT', 'served content that no lane wrote');
+        // Everything this read's own log sent before it is logged; another writer's cut log is not.
+        const by = r.state.lane;
+        const tail = by !== undefined && cut.has(by) && !history.logs[r.log].lanes.includes(by);
+        add('WRONG-CONTENT', 'served content that no lane wrote', tail);
         continue;
       }
       if (shown.log !== r.log) continue;
@@ -331,6 +364,9 @@ export function judgeForks(history, copies, agree) {
   /** @type {Verdict[]} */
   const verdicts = [];
   const live = [...history.keys].filter(([, e]) => e.kind === 'u' && e.deletes.length === 0).map(([k]) => k);
+  const cut = cutLanes(history);
+  // A side whose missing docs are all of cut lanes may be missing them to unlogged deletes, the other side to lag.
+  const tailSide = (/** @type {string[]} */ keys) => keys.every(key => cut.has(history.keys.get(key)?.writes[0]?.lane ?? ''));
   for (let i = 0; i < copies.length; i++) {
     for (let j = i + 1; j < copies.length; j++) {
       const A = copies[i];
@@ -347,9 +383,11 @@ export function judgeForks(history, copies, agree) {
         if (b.s === 'present' && a.s === 'absent') onlyB.push(key);
       }
       if (onlyA.length > 0 && onlyB.length > 0) {
+        const provisional = tailSide(onlyA) || tailSide(onlyB);
         verdicts.push({
           v: 'FORK', copy: `${A.name} | ${B.name}`,
           detail: `${A.name} alone holds ${onlyA.length} docs (${onlyA.slice(0, 3).join(', ')}) and ${B.name} alone holds ${onlyB.length} (${onlyB.slice(0, 3).join(', ')})`,
+          ...(provisional ? { provisional } : {}),
         });
       }
     }
@@ -426,9 +464,17 @@ export function commonFacts(a, b) {
     }
     return out;
   };
+  // An out-of-range map is one node's state at one instant, so no handoff
+  // explains it: both sets show it whatever shard count each read with it.
+  /** @type {Map<string, Set<string>>} */
+  const outOfRange = new Map();
+  for (const [key, values] of a.outOfRange) {
+    const other = b.outOfRange.get(key);
+    if (other) outOfRange.set(key, new Set([...values, ...other]));
+  }
   return {
     holders: meet(a.holders, b.holders), owners: meet(a.owners, b.owners), counts: meet(a.counts, b.counts),
-    guildShards: meet(a.guildShards, b.guildShards), outOfRange: meet(a.outOfRange, b.outOfRange),
+    guildShards: meet(a.guildShards, b.guildShards), outOfRange,
   };
 }
 
@@ -610,28 +656,27 @@ export function judge(input) {
     verdicts.push(...both);
     const counted = new Set(both.map(v => v.detail));
     for (const detail of new Set([...controlVerdicts(first), ...controlVerdicts(second)].map(v => v.detail))) {
-      if (!counted.has(detail)) notes.push(`CONTROL in one set of control facts only, so not counted: ${detail}`);
+      if (!counted.has(detail)) notes.push(`CONTROL seen in one set of control facts only: ${detail}`);
     }
   }
 
   inconclusive.push(...coverage(history, k, input.windows ?? []));
   if (!copies.some(c => c.mode === 'judged')) inconclusive.push('no judged copy was given');
-  // A cut log's lost tail could explain a phantom, an altered hot doc or a
-  // vanished one, and no bound on that tail holds (the writer may have run on
-  // for minutes). Its verdicts stand only as provisional until the writer's
-  // own complete log is judged instead.
-  const cut = history.logs.some(l => !l.ended);
+  // No bound holds on a cut log's tail (a writer whose stream dropped runs on
+  // in its container), so the verdicts it could explain wait for the writer's
+  // complete log.
   history.logs.forEach((l, i) => {
-    if (!l.ended) inconclusive.push(`log ${i + 1} (${l.lanes.join(', ')}) has no end line: the writer died or its stream was cut. Judge the writer's own complete log; verdicts until then are provisional`);
+    if (!l.ended) {
+      inconclusive.push(`log ${i + 1} (${l.lanes.join(', ')}) has no end line: the writer died or its stream was cut. Verdicts its unlogged requests could explain are provisional: judge the writer's complete host log instead, or rerun if the writer itself died`);
+    }
   });
   const readErrors = history.reads.filter(r => r.state.s === 'error').length;
   if (readErrors > 0) notes.push(`${readErrors} of ${history.reads.length} reads during the run got no answer`);
 
-  const result = verdicts.length > 0 && !cut ? 'FAIL' : inconclusive.length > 0 ? 'INCONCLUSIVE' : 'PASS';
+  const firm = verdicts.filter(v => !v.provisional);
+  const result = firm.length > 0 ? 'FAIL' : inconclusive.length > 0 ? 'INCONCLUSIVE' : 'PASS';
   /** @type {Record<string, number>} */
   const answers = { ACKED: 0, HELD: 0, REFUSED: 0, UNKNOWN: 0 };
   for (const op of history.ops) answers[op.cls] += 1;
-  return {
-    result, verdicts, provisional: cut, inconclusive, notes, answers, reads: history.reads.length, copies: copies.map(c => `${c.name} (${c.mode})`),
-  };
+  return { result, verdicts, inconclusive, notes, answers, reads: history.reads.length, copies: copies.map(c => `${c.name} (${c.mode})`) };
 }
