@@ -175,7 +175,7 @@ export interface FleetState {
   roleOverride: { role: NodeRole; setBy: string; setAt: number } | null;
   /** This node is the designated backup master (BOT_NODE_ROLE=backup-master). */
   backupMaster: boolean;
-  /** This node CONSENTS to active stand-in mode (unless FLEET_BACKUP_MODE=passive); the master's stored entry still has to enable it (20.5). */
+  /** This node CONSENTS to active stand-in mode (FLEET_BACKUP_MODE=active); the master's stored entry still has to enable it (20.5). */
   activeCapable: boolean;
   /** The emergency lever (B6-k): a node-local enable that counts only while the master is unreachable; null when not set. */
   modeOverride: { mode: 'active'; setAt: number; setBy: string } | null;

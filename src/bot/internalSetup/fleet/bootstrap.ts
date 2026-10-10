@@ -103,7 +103,7 @@ import { TransformationCoordinator } from './transformation/transformationCoordi
 import { TransformationExecutor } from './transformation/transformationExecutor';
 import type { ControlStore, PersistedFleetConfig, PersistedTerm, RedistributeProposal, TransformDirection } from './controlStore';
 import { migrationsHoldTogether } from './controlStore';
-import { effectiveFleetConfigView, effectiveMasterUrls, emptyStoreHoldEvidence, fleetConfigViewOf, fleetMasterCandidates, forcePassive, normalizeDesignation, readFleetConfigCache, restoreConsented, rememberBackups, validateMasterCandidates, renumberDesignations, validateBackupDesignations, validateWitnessChannelId, writeFleetConfigCache } from './fleetConfig';
+import { effectiveFleetConfigView, effectiveMasterUrls, emptyStoreHoldEvidence, fleetConfigViewOf, fleetMasterCandidates, forcePassive, readFleetConfigCache, rememberBackups, validateMasterCandidates, renumberDesignations, validateBackupDesignations, validateWitnessChannelId, writeFleetConfigCache } from './fleetConfig';
 import { getLocalReplicaIdentity, getReplicaHealth, getSlotSample, setReplicaProbeListener } from './replicaHealth';
 import { canonicalIsOwnReplica, canonicalStoreReachable, currentCanonicalUrl, hasDbReplica, probeReplica, readTermRow, resolveReplicaEndpoints, spliceFleetCredentials, standInDelivery } from './replicaPromotion';
 import { ArmEvidenceInputs, armDeferral, evaluateArmEvidence, freeArmTerms, ledgerAllowsArm, missingArmTerms, preArmRefusal, reachabilityWarning } from './armLane';
@@ -1573,7 +1573,6 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   let fleetConfig: PersistedFleetConfig | null = null;
   if (!standalone) {
     fleetConfig = await standInGuard('reading the fleet config', () => store.loadFleetConfig());
-    if (fleetConfig) fleetConfig = { ...fleetConfig, backupDesignations: fleetConfig.backupDesignations.map(normalizeDesignation) };
     // A stand-in reads the topology and never rewrites it: the seed and the
     // self-removal below are both writes, and the list it would be editing
     // belongs to the master it is covering.
@@ -1772,7 +1771,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     const declared = [...registry.nodes.values()].filter(n => !n.isSelf && n.connected && n.capabilities?.backupMaster === true);
     const pick = declared.find(n => n.nodeId === refusedId) ?? declared[0];
     if (!pick) return;
-    fleetConfig = { ...fleetConfig, revision: fleetConfig.revision + 1, backupDesignations: [{ nodeId: pick.nodeId, priority: 1, mode: pick.capabilities?.activeCapable === true ? 'active' : 'passive' }], updatedAt: Date.now() };
+    fleetConfig = { ...fleetConfig, revision: fleetConfig.revision + 1, backupDesignations: [{ nodeId: pick.nodeId, priority: 1 }], updatedAt: Date.now() };
     backupDesignationRefused = null;
     persistFleetConfig(`designated backup ${pick.nodeName || pick.nodeId} (freed slot)`);
   };
@@ -1788,7 +1787,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     if (!fleetConfig || !node || !node.connected || node.capabilities?.backupMaster !== true) return;
     if (fleetConfig.backupDesignations.some(d => d.nodeId === node.nodeId)) return;
     const priority = fleetConfig.backupDesignations.reduce((max, d) => Math.max(max, d.priority), 0) + 1;
-    fleetConfig = { ...fleetConfig, revision: fleetConfig.revision + 1, backupDesignations: [...fleetConfig.backupDesignations, { nodeId: node.nodeId, priority, mode: node.capabilities?.activeCapable === true ? 'active' : 'passive' }], updatedAt: Date.now() };
+    fleetConfig = { ...fleetConfig, revision: fleetConfig.revision + 1, backupDesignations: [...fleetConfig.backupDesignations, { nodeId: node.nodeId, priority }], updatedAt: Date.now() };
     persistFleetConfig(`designated backup ${node.nodeName || node.nodeId} (postgres mode)`);
   };
   masterConfigSet = async (candidates: string[], witnessChannelId: unknown, backupDesignations: unknown) => {
@@ -1805,8 +1804,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       if (!order.ok) return { ok: false, error: order.error };
       if (order.designations.some(d => d.nodeId === nodeId)) return { ok: false, error: 'the master is not its own backup' };
       if (resolveDataBackend() === 'file' && order.designations.length > 1) return { ok: false, error: 'file mode mirrors the guild data to one backup; keep a single designated backup' };
-      const asked = new Set(Array.isArray(backupDesignations) ? backupDesignations.filter((r: any) => r?.withdrawn === true).map((r: any) => r.nodeId) : []);
-      designations = order.designations.map(d => (d.mode === 'passive' && asked.has(d.nodeId) && fleetConfig!.backupDesignations.some(s => s.nodeId === d.nodeId && s.withdrawn === true) ? { ...d, withdrawn: true } : d));
+      designations = order.designations;
     }
     // Undefined = the caller did not touch the witness field; empty = clear to the owner DM default.
     const witness = witnessChannelId === undefined
@@ -3848,7 +3846,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
           fleetConfig = {
             ...fleetConfig,
             revision: fleetConfig.revision + 1,
-            backupDesignations: [...fleetConfig.backupDesignations, { nodeId: payload.nodeId, priority, mode: payload.capabilities?.activeCapable === true ? 'active' : 'passive' }],
+            backupDesignations: [...fleetConfig.backupDesignations, { nodeId: payload.nodeId, priority }],
             updatedAt: Date.now(),
           };
           persistFleetConfig(`designated backup ${payload.nodeName || payload.nodeId}`);
@@ -3863,9 +3861,9 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
           fillFreedBackupSlot();
         } else if (fleetConfig && listed && payload.capabilities?.activeCapable !== true
           && fleetConfig.backupDesignations.some(d => d.nodeId === payload.nodeId && d.mode === 'active')) {
-          // Consent withdrawn (or never declared by this build): the enable goes,
-          // marked as the node's, so its consent coming back restores it (R-F1);
-          // a passive the master's operator set is never undone here (20.5, B6 map F7).
+          // Consent withdrawn (or never declared by this build): the enable goes.
+          // Only ever downward, so a master's own downgrade is never undone here
+          // and re-enabling stays the master operator's act (20.5, B6 map F7).
           fleetConfig = {
             ...fleetConfig,
             revision: fleetConfig.revision + 1,
@@ -3873,15 +3871,6 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
             updatedAt: Date.now(),
           };
           persistFleetConfig(`active mode withdrawn ${payload.nodeName || payload.nodeId}`);
-        } else if (fleetConfig && listed && payload.capabilities?.activeCapable === true
-          && fleetConfig.backupDesignations.some(d => d.nodeId === payload.nodeId && d.withdrawn === true)) {
-          fleetConfig = {
-            ...fleetConfig,
-            revision: fleetConfig.revision + 1,
-            backupDesignations: restoreConsented(fleetConfig.backupDesignations, payload.nodeId),
-            updatedAt: Date.now(),
-          };
-          persistFleetConfig(`active mode restored ${payload.nodeName || payload.nodeId} (it consents again)`);
         }
         // B4 facts: the node this master superseded learns it here (and
         // whether the owner asked to retire it); designated backups, and the
@@ -4994,7 +4983,7 @@ async function initCoWorker(init: CommonInit, followerHold: FollowerHoldBase | n
       const activeMode = consentsToActiveMode() && backupModeEnabled(designation?.mode, readModeOverride(), cheap.masterUnreachable);
       if (!activeMode || resolveDataBackend() !== 'postgres') {
         reportNoArm([resolveDataBackend() !== 'postgres' ? 'this node is not on the postgres backend, so it has no copy to serve from'
-          : !consentsToActiveMode() ? 'this node declines active mode (FLEET_BACKUP_MODE=passive)'
+          : !consentsToActiveMode() ? 'this node does not consent to active mode (FLEET_BACKUP_MODE is not active)'
           : 'the master has not enabled active mode for this node and no local lever is set'], null, true);
         return;
       }

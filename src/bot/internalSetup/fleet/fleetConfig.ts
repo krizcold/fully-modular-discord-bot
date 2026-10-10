@@ -23,7 +23,7 @@ export function readFleetConfigCache(): FleetConfigPayload | null {
       backupDesignations: Array.isArray(parsed.backupDesignations)
         ? parsed.backupDesignations
           .filter((d: any) => typeof d?.nodeId === 'string' && Number.isFinite(d?.priority))
-          .map((d: any) => normalizeDesignation(d))
+          .map((d: any) => (d.mode === 'active' ? { nodeId: d.nodeId, priority: d.priority, mode: 'active' as const } : { nodeId: d.nodeId, priority: d.priority }))
         : [],
       ...(typeof parsed.witnessChannelId === 'string' && parsed.witnessChannelId !== ''
         ? { witnessChannelId: parsed.witnessChannelId }
@@ -187,36 +187,24 @@ export function validateBackupDesignations(input: unknown, known: Set<string>, a
     if (!known.has(nodeId)) return { ok: false, error: `node ${nodeId.slice(0, 8)} is not known to this master` };
     if (ids.includes(nodeId)) return { ok: false, error: `node ${nodeId.slice(0, 8)} is listed twice` };
     // The master owns the ENABLE, never the consent: it may not put a node into a
-    // mode that node's own capability declines (20.5, B6 map F7). An entry that
-    // names no mode takes the default, active where the node consents (R-F1).
-    const mode = typeof raw === 'string' ? undefined : raw?.mode;
-    if (mode === 'active' && activeCapable && !activeCapable(nodeId)) {
-      return { ok: false, error: `node ${nodeId.slice(0, 8)} declines active mode (FLEET_BACKUP_MODE=passive), so it cannot be enabled for it here` };
+    // mode that node's own capability declines (20.5, B6 map F7).
+    if (typeof raw !== 'string' && raw?.mode === 'active') {
+      if (activeCapable && !activeCapable(nodeId)) {
+        return { ok: false, error: `node ${nodeId.slice(0, 8)} does not declare active mode, so it cannot be enabled for it here` };
+      }
+      active.add(nodeId);
     }
-    if (mode === 'active' || (mode !== 'passive' && (!activeCapable || activeCapable(nodeId)))) active.add(nodeId);
     ids.push(nodeId);
   }
-  return { ok: true, designations: ids.map((nodeId, index) => ({ nodeId, priority: index + 1, mode: active.has(nodeId) ? 'active' as const : 'passive' as const })) };
+  return { ok: true, designations: ids.map((nodeId, index) => (active.has(nodeId) ? { nodeId, priority: index + 1, mode: 'active' as const } : { nodeId, priority: index + 1 })) };
 }
 
 /** Priorities are 1..n in order; a removal closes the gap. The mode rides along: it is the master's own enable, not a function of the order. */
 export function renumberDesignations(list: BackupDesignation[]): BackupDesignation[] {
-  return [...list].sort((a, b) => a.priority - b.priority).map((d, index) => normalizeDesignation({ ...d, priority: index + 1 }));
+  return [...list].sort((a, b) => a.priority - b.priority).map((d, index) => (d.mode === 'active' ? { nodeId: d.nodeId, priority: index + 1, mode: 'active' as const } : { nodeId: d.nodeId, priority: index + 1 }));
 }
 
-/** Drop an entry's active enable, keeping everything else (a node that withdrew its consent), marked as the node's own. */
+/** Drop an entry's active enable, keeping everything else (a node that withdrew its consent). */
 export function forcePassive(list: BackupDesignation[], nodeId: string): BackupDesignation[] {
-  return list.map(d => (d.nodeId === nodeId ? { nodeId: d.nodeId, priority: d.priority, mode: 'passive' as const, withdrawn: true } : d));
-}
-
-/** A node consenting again gets back the active its withdrawal took; an operator's passive is left alone. */
-export function restoreConsented(list: BackupDesignation[], nodeId: string): BackupDesignation[] {
-  return list.map(d => (d.nodeId === nodeId && d.withdrawn === true ? { nodeId: d.nodeId, priority: d.priority, mode: 'active' as const } : d));
-}
-
-/** An entry's mode written out: none reads as active, the default (R-F1); passive is the opt-out. */
-export function normalizeDesignation(d: { nodeId: string; priority: number; mode?: unknown; withdrawn?: unknown }): BackupDesignation {
-  return d.mode === 'passive'
-    ? { nodeId: d.nodeId, priority: d.priority, mode: 'passive', ...(d.withdrawn === true ? { withdrawn: true } : {}) }
-    : { nodeId: d.nodeId, priority: d.priority, mode: 'active' };
+  return list.map(d => (d.nodeId === nodeId ? { nodeId: d.nodeId, priority: d.priority } : d));
 }

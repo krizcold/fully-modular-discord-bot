@@ -208,11 +208,11 @@ export function isBackupMaster(): boolean {
 /**
  * This node's CONSENT to standing in as an active backup (20.5, B6 map F7). It is
  * only half the key: the master's stored designation entry carries the enable, and
- * either side saying passive means passive. Active is the default (R-F1,
- * PLAN_REPLICATION Section 21): only FLEET_BACKUP_MODE=passive declines it.
+ * either side saying passive means passive. Absent or unreadable means passive,
+ * because standing in takes writes and silence must never buy that.
  */
 export function consentsToActiveMode(): boolean {
-  return (process.env.FLEET_BACKUP_MODE || '').trim().toLowerCase() !== 'passive';
+  return (process.env.FLEET_BACKUP_MODE || '').trim().toLowerCase() === 'active';
 }
 
 export function getNodeName(): string {
