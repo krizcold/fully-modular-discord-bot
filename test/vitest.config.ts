@@ -6,6 +6,12 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const repo = path.resolve(here, '..');
 const src = path.join(repo, 'src');
 
+// The tiers are projects so a run can pick one (the mutation passes do, see
+// mutation/README.md): fast takes every test file outside the other two, so a
+// new directory is never left out; integration needs Docker; child runs real
+// processes on a dist that its globalSetup builds when src has changed.
+const SLOW = ['integration/**', 'child/**'];
+
 // Mirrors the paths of the root tsconfig.json; the exact @bot/types entry
 // comes before the @bot/* prefix it would otherwise match.
 export default defineConfig({
@@ -22,11 +28,14 @@ export default defineConfig({
   server: { fs: { allow: [repo] } },
   test: {
     root: here,
-    include: ['**/*.test.ts'],
-    exclude: ['node_modules/**'],
     setupFiles: ['./helpers/setup.ts'],
     pool: 'forks',
     testTimeout: 30_000,
     hookTimeout: 180_000,
+    projects: [
+      { extends: true, test: { name: 'fast', include: ['**/*.test.ts'], exclude: ['node_modules/**', ...SLOW] } },
+      { extends: true, test: { name: 'integration', include: ['integration/**/*.test.ts'] } },
+      { extends: true, test: { name: 'child', include: ['child/**/*.test.ts'], globalSetup: ['./helpers/childBuild.ts'] } },
+    ],
   },
 });
