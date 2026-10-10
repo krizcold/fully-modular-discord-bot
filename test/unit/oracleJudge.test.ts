@@ -44,9 +44,11 @@ describe('answers, content and logs', () => {
     }));
   });
 
-  it('drops a torn last line and refuses a torn middle line', () => {
+  it('drops a bad last line and refuses a bad middle line', () => {
     const lines = ['{"t":"start","run":"r1","guild":"123456789012","lanes":[{"name":"l0"}]}', '{"t":"send","id":1'];
     expect(parseLog(lines.join('\n'))).toHaveLength(1);
+    // A whole bad last line too, with only blank lines after it.
+    expect(parseLog(`${lines[0]}\nnot json\n\n`)).toHaveLength(1);
     expect(() => parseLog([lines[1], lines[0]].join('\n'))).toThrow(/line 1/);
   });
 });
