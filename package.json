@@ -16,6 +16,7 @@
     "dockerPublish": "dotenv node scripts/dockerPublish.js",
     "exportContext": "node scripts/exportContext.js",
     "test": "node test/run.cjs",
+    "test:mutate": "node test/mutation/touched.mjs",
     "test:install": "npm --prefix test ci"
   },
   "keywords": [],

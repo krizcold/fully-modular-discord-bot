@@ -8,6 +8,6 @@
     "allowJs": true,
     "checkJs": true
   },
-  "include": ["**/*.ts", "oracle/**/*.mjs"],
+  "include": ["**/*.ts", "oracle/**/*.mjs", "mutation/**/*.mjs"],
   "exclude": ["node_modules"]
 }
