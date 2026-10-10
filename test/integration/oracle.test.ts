@@ -386,7 +386,36 @@ describe('the data-loss oracle end to end', () => {
       await down.close();
     }
     const db = await dump('test', 'clean', 'twice-db.jsonl');
-    const r = await check(['--log', cleanLog, '--db', `db=${db}`, '--fleet', file('twice-m.json'), '--fleet', file('twice-w.json'), '--k', '3']);
+    const fleets = ['--fleet', file('twice-m.json'), '--fleet', file('twice-w.json')];
+    const r = await check(['--log', cleanLog, '--db', `db=${db}`, ...fleets, '--k', '3']);
     expect(r.result.verdicts.some((v: any) => v.v === 'CONTROL' && /shard 1 is leased to 2 nodes/.test(v.detail))).toBe(true);
+    // Seen again in a second set, listed the other way round, it still counts.
+    const again = await check(['--log', cleanLog, '--db', `db=${db}`, ...fleets, '--fleet-again', file('twice-w.json'), '--fleet-again', file('twice-m.json'), '--k', '3']);
+    expect(again.result.verdicts.filter((v: any) => v.v === 'CONTROL').map((v: any) => v.detail)).toEqual(['shard 1 is leased to 2 nodes at once: m, w']);
+    expect(again.code).toBe(1);
+    expect((await runNode([CHECK, '--log', cleanLog, '--db', `db=${db}`, '--fleet-again', file('twice-m.json')])).code).toBe(64);
+  });
+
+  it('refuses a database copy when psql fails', async () => {
+    await expect(dump('nosuchdb', 'none', 'none-db.jsonl')).rejects.toThrow(/psql/);
+  });
+
+  it('logs an end mark written just before the stop', async () => {
+    const app = await startFakeApp({ pools: [pool] });
+    const marks = file('last-marks.txt');
+    fs.writeFileSync(marks, '');
+    let log = '';
+    try {
+      // The marks file is polled once a minute here, so only the poll at the stop can see these lines.
+      log = await write('last', [`a=${app.url}`], ['--duration', '2', '--limiter', 'off', '--marks', marks, '--marks-every', '60000'], async () => {
+        await sleep(500);
+        fs.appendFileSync(marks, 'begin x\nend x\n');
+      });
+    } finally {
+      await app.close();
+    }
+    const events = parseLog(fs.readFileSync(log, 'utf8'));
+    expect(events.filter(e => e.t === 'mark').map(e => e.label)).toEqual(['begin x', 'end x']);
+    expect(events.at(-1)?.t).toBe('end');
   });
 });

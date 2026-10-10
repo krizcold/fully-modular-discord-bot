@@ -365,7 +365,7 @@ function checkBase(base) {
 const WRITE_USAGE = `oracle.mjs write --run ID --guild ID --lane NAME=URL [--lane NAME=URL ...]
   [--duration S (1800, 0 = until stopped)] [--rate REQUESTS_PER_S (1.5, per lane, reads included)]
   [--hot N (3)] [--hot-ratio R (0.3)] [--delete-ratio R (0.1)] [--read-every N (5 writes, 0 = never)]
-  [--max-size CHARS (8000)] [--max-body BYTES (10000)] [--seed N] [--marks FILE] [--burst X (4)]
+  [--max-size CHARS (8000)] [--max-body BYTES (10000)] [--seed N] [--marks FILE] [--marks-every MS (50)] [--burst X (4)]
   [--limiter CAPACITY/MS (${LIMITER}) | off] [--timeout MS (20000)] [--log FILE (- = stdout, the default; may repeat)]`;
 
 /** @param {string[]} argv */
@@ -373,7 +373,7 @@ async function write(argv) {
   const a = parseArgs(argv, {
     run: 'one', guild: 'one', lane: 'many', duration: 'one', rate: 'one', hot: 'one', 'hot-ratio': 'one',
     'delete-ratio': 'one', 'read-every': 'one', 'max-size': 'one', 'max-body': 'one', seed: 'one', marks: 'one',
-    burst: 'one', limiter: 'one', timeout: 'one', log: 'many',
+    'marks-every': 'one', burst: 'one', limiter: 'one', timeout: 'one', log: 'many',
   });
   if (!RUN_ID.test(a.run ?? '')) throw new Error('--run must be 1 to 24 of a-z and 0-9');
   checkGuild(a.guild);
@@ -398,6 +398,7 @@ async function write(argv) {
   const burst = Math.max(1, num(a.burst, 'burst', 4));
   const limiterSpec = a.limiter ?? LIMITER;
   const timeoutMs = num(a.timeout, 'timeout', 20000);
+  const marksEvery = Math.max(1, num(a['marks-every'], 'marks-every', 50));
   const seed = a.seed !== undefined ? Math.floor(num(a.seed, 'seed', 0)) : Math.floor(Math.random() * 2 ** 31);
   if (rate <= 0) throw new Error('--rate must be above 0');
   if (hotRatio + deleteRatio > 1) throw new Error('--hot-ratio plus --delete-ratio must stay at or under 1');
@@ -599,7 +600,7 @@ async function write(argv) {
         emit({ t: 'mark', label, at: clock() });
       }
     };
-    marksTimer = setInterval(pollMarks, 50);
+    marksTimer = setInterval(pollMarks, marksEvery);
   }
 
   let signals = 0;

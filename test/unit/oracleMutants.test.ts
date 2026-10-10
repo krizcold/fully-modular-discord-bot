@@ -45,6 +45,8 @@ const MUTANTS: [string, string, string][] = [
   ['late landing silent', 'const late = committedAfterUnanswered(entry, shown, Infinity);', 'const late = [];'],
   ['fleet optional', 'if (fleet.length === 0 && !input.noFleet) inconclusive.push(', 'if (false) inconclusive.push('],
   ['unreadable node silent', 'if (!n.state.initialized || !n.state.running) inconclusive.push(', 'if (false) inconclusive.push('],
+  ['second set unreadable silent', 'for (const n of [...fleet, ...again]) {', 'for (const n of fleet) {'],
+  ['single set not judged', 'if (fleet.length > 0 && again.length === 0) verdicts.push(', 'if (false) verdicts.push('],
   ['double lease not checked', 'if (set.size > 1) add(`shard', 'if (false) add(`shard'],
   ['run mismatch accepted', 'if (c.run !== undefined && (c.run !== history.run || c.guild !== history.guild)) {', 'if (false) {'],
   ['required windows ignored', 'for (const name of required) {', 'for (const name of []) {'],

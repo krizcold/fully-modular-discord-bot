@@ -454,6 +454,9 @@ export function checks(): Check[] {
       expect(J.judge({ history, copies, k: 0 }).result).toBe('INCONCLUSIVE');
       expect(J.judge({ history, copies, k: 0, fleet: [fleetNode('m', [0]), fleetNode('w', [1])] }).result).toBe('PASS');
       expect(J.judge({ history, copies, k: 0, fleet: [fleetNode('m', [0]), fleetNode('w', [1], { initialized: false })] }).result).toBe('INCONCLUSIVE');
+      // In the second set too.
+      const again = [fleetNode('m', [0]), fleetNode('w', [1], { initialized: false })];
+      expect(J.judge({ history, copies, k: 0, fleet: [fleetNode('m', [0]), fleetNode('w', [1])], fleetAgain: again }).result).toBe('INCONCLUSIVE');
     } },
     { name: 'a shard leased twice, or against the shard table, is CONTROL', run: J => {
       const twice = J.judgeFleet([fleetNode('m', [0, 1]), fleetNode('w', [1])]).map(v => v.detail);
@@ -463,6 +466,10 @@ export function checks(): Check[] {
       expect(J.judgeFleet([fleetNode('m', [0], { table: [[0, 'm'], [1, 'w']] }), fleetNode('w', [1])])).toEqual([]);
       // A grant not yet confirmed names its target before the old holder lets go.
       expect(J.judgeFleet([fleetNode('m', [0], { table: [[0, 'm'], [1, 'w', 'pending']] }), fleetNode('x', [1])])).toEqual([]);
+      // judge() counts them from one set of facts.
+      const history = J.buildHistory([[start(['a']), ...sixAcked(), { t: 'end' }]]);
+      const one = J.judge({ history, copies: [copyOf('db', sixDocs())], k: 0, fleet: [fleetNode('m', [0, 1]), fleetNode('w', [1])] });
+      expect(one.verdicts.map(v => v.v)).toEqual(['CONTROL']);
     } },
     { name: 'a guild on two shards or out of range, or two shard counts, is CONTROL', run: J => {
       const guilds = J.judgeFleet([fleetNode('m', [0], { guildMap: { 10: 0, 11: 1 } }), fleetNode('w', [1], { guildMap: { 10: 1, 12: 5 } })]).map(v => v.detail);
