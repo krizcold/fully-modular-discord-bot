@@ -28,6 +28,8 @@ const MUTANTS: [string, string, string][] = [
   ['cut log not inconclusive', 'if (!l.ended) {\n      inconclusive.push(', 'if (!l.ended) {\n      notes.push('],
   ['cut stream judged', "if (!ended && start.sink === 'stream') {", 'if (false) {'],
   ['start line with no sink accepted', "if (start.sink !== 'file' && start.sink !== 'stream') throw", 'if (false) throw'],
+  ['end counts not compared', 'if (mismatched.length > 0) {', 'if (false) {'],
+  ['read lines not counted', '          held.reads += 1;\n', ''],
   ['slow marks poll accepted', 'if (every > MARKS_EVERY_MAX && events.some(', 'if (false && events.some('],
   ['begin without end accepted', '      problems.push(`window ${name} in log ${log + 1} begins but never ends`);\n', ''],
   ['read late landing silent', 'committedAfterUnanswered(entry, shown, r.at0)', '[]'],

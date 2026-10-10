@@ -35,8 +35,9 @@ by this process's monotonic clock:
 A `read` line names the lane that read, and under `by` the lane that the served content names.
 
 Each log's start line names its sink. A `file` log (`--log FILE`) gets each send line, whole, before its request goes
-out (a line that does not fit stops the writer instead), so even a killed writer's file holds every request it sent. A
-`stream` log (`--log -`, stdout) can be cut on its way.
+out (a line that cannot be written ends the writer at once, with no end line), so even a killed writer's file holds
+every request it sent. A `stream` log (`--log -`, stdout) can be cut on its way. The end line counts the answers and
+reads, and the checker calls a log whose lines do not match those counts inconclusive.
 
 On a stop (`--duration` elapsed, a `stop` line in the marks file, SIGINT, SIGTERM or SIGHUP), the writer sends nothing
 new and gives in-flight requests 5 seconds. Then it cuts them short, logs them as UNKNOWN, and writes its end line. A
@@ -91,6 +92,7 @@ own file log instead (step 2).
 The result is FAIL on any verdict. It is INCONCLUSIVE, never PASS, in any of these cases:
 - a mark is malformed, unpaired (a begin with no end, or an end with no begin) or repeated;
 - a log with marks polled its marks file less often than once a second, so its window edges may be that late;
+- a log's end line counts answers or reads that its lines do not hold, so lines are missing;
 - a window named with `--window` was never marked;
 - a marked window holds fewer than `--k` acknowledged operations, or, with no window marked, the whole run does;
 - no judged copy was given;
@@ -121,7 +123,7 @@ fleet.
   - **Hand-built cases** cover the ordering rules, the reads during the run, the CONTROL rules and two-set counting
     (each rule, in both orders), a killed writer's file and a cut stream, and each INCONCLUSIVE case above.
 - **test/unit/oracleJudge.test.ts** runs those checks against judge.mjs.
-- **test/unit/oracleMutants.test.ts** runs them against 47 mutants of judge.mjs, each breaking one rule. A hand-built
+- **test/unit/oracleMutants.test.ts** runs them against 49 mutants of judge.mjs, each breaking one rule. A hand-built
   check must kill each one, so the result does not depend on what the generator draws.
 - **test/integration/oracle.test.ts** runs the tools as child processes against stand-in nodes on real Postgres, and
   takes the database copy with the exact `sql` query:
@@ -135,7 +137,8 @@ fleet.
   - `read` and `cleanup` go past the limiter's burst without errors;
   - a stop with hung requests ends within its grace and still writes the end line, and no delete goes out after a stop;
   - in node:24-alpine, SIGHUP ends the log, a second signal mid-request ends it at once with the request unanswered,
-    and a file log line that runs past a file size limit is an error, not a short write;
+    a file log line that runs past a file size limit is an error, not a short write, and a writer whose log fills up
+    exits 64 at once with a log the checker can still read and no end line;
   - a `stop` line in the marks file ends the writer on any host, with the marks before it logged;
   - an end mark written just before the stop is logged;
   - two writers on one run, each with its own log, are read, judged and cleaned up together, and each read line names
@@ -162,10 +165,11 @@ Guardrails: the secret filter on every read; `ssh <host> ...` with no flag befor
          ssh contabo-dbot "docker run --rm --name smdb-oracle-<run> --network host -v /root/smdb-oracle:/o node:24-alpine node /o/oracle.mjs write --run <run> --guild <guild> --lane m=http://127.0.0.1:<port> --duration 1800 --marks /o/marks-<run>.txt --log /o/<run>.host.jsonl --log -" > <run>.jsonl
 
      If the ssh session drops, the streamed copy is cut (the checker refuses it) while the writer runs on in its
-     container, and only the host file is complete. Wait until the container is gone (`ssh contabo-dbot docker inspect
-     smdb-oracle-<run>` prints "No such object" once `--rm` has removed it; a failed ssh proves nothing), or stop it
-     first (below). Then fetch the host file (`ssh contabo-dbot cat /root/smdb-oracle/<run>.host.jsonl > <run>.jsonl`),
-     and judge it only once its size matches the host file's (`wc -c < <run>.jsonl` against `ssh contabo-dbot "wc -c <
+     container, and only the host file is complete. Stop it if it should not run on (below), then wait until the
+     container is gone: `ssh contabo-dbot docker inspect smdb-oracle-<run>` prints "No such object" once `--rm` has
+     removed it (a failed ssh proves nothing, and a stop line returns before the writer has ended). Then fetch the host
+     file (`ssh contabo-dbot cat /root/smdb-oracle/<run>.host.jsonl > <run>.jsonl`), and judge it only once its size
+     matches the host file's (`wc -c < <run>.jsonl` against `ssh contabo-dbot "wc -c <
      /root/smdb-oracle/<run>.host.jsonl"`); fetch again if not.
 
    - **When the scenario kills or cuts off a whole host,** do not run the writer on that host. Its file's last lines

@@ -469,11 +469,11 @@ describe('the data-loss oracle end to end', () => {
     expect(events.at(-1)?.t).toBe('end');
   });
 
-  it('in node:24-alpine, ends its log on SIGHUP and on a second signal, and never writes half a line', async () => {
+  it('in node:24-alpine, ends its log on SIGHUP and on a second signal, and stops at once when its log cannot be written', async () => {
     // A Node child takes signals only on POSIX, and a file size limit is POSIX too, so the writer runs in the image the live procedure uses.
     const fill = [
       "import { openOut } from '/o/oracle.mjs';",
-      "const write = openOut('/tmp/full.jsonl');",
+      "const write = openOut('/tmp/fill.jsonl');",
       "try { write({ pad: 'x'.repeat(40000) }); console.log('written'); } catch (error) { console.log(error.code); }",
     ].join('\n');
     const box = await new GenericContainer('node:24-alpine')
@@ -511,6 +511,15 @@ describe('the data-loss oracle end to end', () => {
       expect(term.some(e => e.t === 'send' && !answered.has(e.id))).toBe(true);
       // A line that runs past the file size limit is an error, not a short write the request would follow.
       expect((await sh("trap '' XFSZ; ulimit -f 16; node /o/fill.mjs")).trim()).toBe('EFBIG');
+      // A writer whose log fills up exits at once, with a log the checker can read and no end line.
+      const full = await sh(`trap '' XFSZ; ulimit -f 4; timeout -s KILL 15 node /o/oracle.mjs write --run full --guild ${GUILD} `
+        + '--lane a=http://127.0.0.1:8080 --lane b=http://127.0.0.1:8080 --duration 0 --rate 20 --hot 0 --hot-ratio 0 --limiter off '
+        + '--marks /tmp/full-marks.txt --log /tmp/full.jsonl > /dev/null 2> /tmp/full.err; echo $?');
+      expect(full.trim()).toBe('64');
+      expect(await sh('cat /tmp/full.err')).toMatch(/EFBIG/);
+      const filled = parseLog(await sh('cat /tmp/full.jsonl'));
+      expect(filled.length).toBeGreaterThan(1);
+      expect(filled.some(e => e.t === 'end')).toBe(false);
     } finally {
       await box.stop();
     }

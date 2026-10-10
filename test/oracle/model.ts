@@ -437,6 +437,21 @@ export function checks(): Check[] {
       const r = judgeLog(J, log, [copyOf('db', sixDocs()), copyOf('other', five, 'lagging')], { agree: ['db', 'other'] });
       expect(r.verdicts.some(v => v.v === 'FORK')).toBe(true);
     } },
+    { name: 'an end line whose counts its lines do not hold is inconclusive', run: J => {
+      const counted = (acked: number, reads = 0) => ({ t: 'end', counts: { ACKED: acked, HELD: 0, REFUSED: 0, UNKNOWN: 0, reads, readErrors: 0 } });
+      expect(judgeLog(J, [start(['a']), ...sixAcked(), counted(6)], [copyOf('db', sixDocs())]).result).toBe('PASS');
+      const more = judgeLog(J, [start(['a']), ...sixAcked(), counted(7)], [copyOf('db', sixDocs())]);
+      expect(more.result).toBe('INCONCLUSIVE');
+      expect(more.inconclusive.join('\n')).toMatch(/end line counts ACKED 7, but its lines hold ACKED 6/);
+      // An answer line lost from the middle reads its write as unknown, so the loss of that doc alone would pass.
+      const five = sixDocs();
+      five.delete(u('a', 6));
+      const lostAnswer = [start(['a']), ...sixAcked().filter(e => !(e.t === 'ans' && e.id === 6)), counted(6)];
+      expect(judgeLog(J, lostAnswer, [copyOf('db', five)]).result).toBe('INCONCLUSIVE');
+      const read = { t: 'read', id: 7, lane: 'a', key: u('a', 1), kind: 'u', at0: 70, at1: 71, s: 'present', h: 'x1' };
+      expect(judgeLog(J, [start(['a']), ...sixAcked(), read, counted(6, 1)], [copyOf('db', sixDocs())]).result).toBe('PASS');
+      expect(judgeLog(J, [start(['a']), ...sixAcked(), read, counted(6)], [copyOf('db', sixDocs())]).result).toBe('INCONCLUSIVE');
+    } },
     { name: 'a killed writer\'s file is judged in full but cannot pass, and a cut stream is refused', run: J => {
       const killed = [start(['a']), ...sixAcked()];
       // Every request the writer sent is in its file: nothing wrong here, but the run was cut short.

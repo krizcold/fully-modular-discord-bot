@@ -131,6 +131,24 @@ export function buildHistory(logs) {
       windows.push({ log, name, begin, end: last });
       problems.push(`window ${name} in log ${log + 1} begins but never ends`);
     }
+    // The end line's counts must match the lines above it: a log missing an
+    // answer line would read an acknowledged write as unknown.
+    const end = events.find(e => e.t === 'end');
+    if (end?.counts) {
+      /** @type {Record<string, number>} */
+      const held = { ACKED: 0, HELD: 0, REFUSED: 0, UNKNOWN: 0, reads: 0, readErrors: 0 };
+      for (const e of events) {
+        if (e.t === 'ans') held[e.cls] = (held[e.cls] ?? 0) + 1;
+        if (e.t === 'read') {
+          held.reads += 1;
+          if (e.s === 'error') held.readErrors += 1;
+        }
+      }
+      const mismatched = Object.keys(held).filter(key => end.counts[key] !== held[key]);
+      if (mismatched.length > 0) {
+        problems.push(`log ${log + 1}'s end line counts ${mismatched.map(key => `${key} ${end.counts[key]}`).join(', ')}, but its lines hold ${mismatched.map(key => `${key} ${held[key]}`).join(', ')}: lines are missing`);
+      }
+    }
     // Marks are stamped when the writer polls its marks file.
     const every = start.settings?.marksEvery ?? 50;
     if (every > MARKS_EVERY_MAX && events.some(e => e.t === 'mark')) {

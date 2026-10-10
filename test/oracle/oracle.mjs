@@ -22,7 +22,7 @@ export const MODULE = 'oracle';
 export const RUN_ID = /^[a-z0-9]{1,24}$/;
 export const LANE_NAME = /^[a-z0-9]{1,12}$/;
 export const LOG_VERSION = 1;
-/** A marks-file line: exactly `begin NAME` or `end NAME`. */
+/** A mark line in the marks file: exactly `begin NAME` or `end NAME` (the other allowed line is `stop`). */
 export const MARK = /^(begin|end) (\S+)$/;
 // The web UI's limiter as one client sees it (webui/server.ts): 10 requests at
 // once, then one per 500 ms per client address. 9 and 520 ms leave a margin
@@ -415,7 +415,18 @@ async function write(argv) {
   // holds every request even if the writer is killed. A stream (stdout) can
   // be cut on its way, so the checker refuses one with no end line.
   const sinks = (a.log.length > 0 ? a.log : ['-']).map((/** @type {string} */ target) => ({ write: openOut(target), sink: target === '-' ? 'stream' : 'file' }));
-  const emit = (/** @type {object} */ event) => { for (const s of sinks) s.write(event); };
+  // A line that cannot be written ends the writer at once: no lane goes on,
+  // nothing follows the half line, and no end line can claim a whole log.
+  /** @param {(sink: string) => object} lineFor */
+  const writeAll = lineFor => {
+    try {
+      for (const s of sinks) s.write(lineFor(s.sink));
+    } catch (error) {
+      console.error(`oracle write: a log line could not be written, so the writer stops at once: ${error instanceof Error ? error.message : String(error)}`);
+      process.exit(64);
+    }
+  };
+  const emit = (/** @type {object} */ event) => writeAll(() => event);
   const clock = () => Math.round(performance.now() * 1000) / 1000;
   // stop: no new requests; cut: in-flight requests end, logged as unknown.
   const stop = new AbortController();
@@ -435,7 +446,7 @@ async function write(argv) {
     lanes: lanes.map((/** @type {{ name: string, base: string }} */ l) => ({ name: l.name, route: 'operator', base: l.base })),
     settings: { duration, rate, hotCount, hotRatio, deleteRatio, readEvery, maxSize, maxBody, burst, limiter: limiterSpec, timeoutMs, marksEvery },
   };
-  for (const s of sinks) s.write({ ...startLine, sink: s.sink });
+  writeAll(sink => ({ ...startLine, sink }));
 
   /**
    * Shortens the payload until the request fits the body limit.
@@ -606,7 +617,7 @@ async function write(argv) {
           continue;
         }
         const m = MARK.exec(label);
-        if (!m) console.error(`mark "${label}" is not "begin NAME" or "end NAME": the checker will call the run inconclusive`);
+        if (!m) console.error(`mark "${label}" is not "begin NAME", "end NAME" or "stop": the checker will call the run inconclusive`);
         if (m && m[1] === 'begin') openWindows.push(m[2]);
         if (m && m[1] === 'end') {
           const i = openWindows.indexOf(m[2]);
