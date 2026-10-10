@@ -95,7 +95,7 @@ export function buildHistory(logs) {
         /** @type {Op} */
         const op = {
           log, id: e.id, lane: e.lane, op: e.op, kind: e.kind, key: e.key, c: e.c, h: e.h ?? null, at: e.at,
-          // A send with no answer (the writer died, or stopped mid-request) is unknown.
+          // A send with no answer in the log is unknown: it may have landed.
           cls: ans ? ans.cls : 'UNKNOWN',
           definite: ans ? ans.definite === true : false,
           ansAt: ans ? ans.at : Infinity,
@@ -651,9 +651,8 @@ export function judge(input) {
 
   inconclusive.push(...coverage(history, k, input.windows ?? []));
   if (!copies.some(c => c.mode === 'judged')) inconclusive.push('no judged copy was given');
-  // A file log with no end line is from a writer that did not finish: every
-  // request is in it, so its verdicts stand, but the run was cut short and
-  // cannot pass. A copy of the file cut short in transit looks the same.
+  // A file log with no end line was cut short, so the run cannot pass; the
+  // reason names what to check.
   history.logs.forEach((l, i) => {
     if (!l.ended) {
       inconclusive.push(`log ${i + 1} (${l.lanes.join(', ')}) has no end line: its writer did not finish (it was killed, or stopped on an error its stderr names), so the run was cut short, or this is a copy of its file cut short in transit (compare its size with the writer's own file). If the writer's host went down, the file's last lines may be lost too: rerun`);
