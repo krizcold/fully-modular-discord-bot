@@ -634,10 +634,11 @@ export function judge(input) {
   inconclusive.push(...coverage(history, k, input.windows ?? []));
   if (!copies.some(c => c.mode === 'judged')) inconclusive.push('no judged copy was given');
   // A file log with no end line is a killed writer's: every request is in it,
-  // so its verdicts stand, but the run was cut short and cannot pass.
+  // so its verdicts stand, but the run was cut short and cannot pass. A copy
+  // of the file cut short in transit looks the same.
   history.logs.forEach((l, i) => {
     if (!l.ended) {
-      inconclusive.push(`log ${i + 1} (${l.lanes.join(', ')}) has no end line: its writer was killed, so the run was cut short. If the writer's host went down, the file's last lines may be lost too: rerun`);
+      inconclusive.push(`log ${i + 1} (${l.lanes.join(', ')}) has no end line: its writer was killed, so the run was cut short, or this is a copy of its file cut short in transit (compare its size with the writer's own file). If the writer's host went down, the file's last lines may be lost too: rerun`);
     }
   });
   const readErrors = history.reads.filter(r => r.state.s === 'error').length;

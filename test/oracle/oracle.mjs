@@ -78,8 +78,8 @@ export function hashOf(value) {
 }
 
 /**
- * The state of a present doc: its hash, plus the lane and counter it names,
- * which let the checker tell a write it never saw logged from a corruption.
+ * The state of a present doc: its hash, which the checker judges by, plus the
+ * lane and counter it names, for a person reading a copy.
  * @param {unknown} data
  * @returns {DocState}
  */
@@ -287,13 +287,15 @@ export function docStateOf(r) {
 const readUrl = (base, guild, key) => `${base}/api/config/data/get?file=${encodeURIComponent(fileId(key))}&guildId=${guild}`;
 
 /** @param {string} target */
-function openOut(target) {
+export function openOut(target) {
   if (target === '-') {
     return (/** @type {object} */ event) => { process.stdout.write(`${JSON.stringify(event)}\n`); };
   }
   // Never appended to: a second run into one file would merge two clocks.
   const fd = fs.openSync(target, 'wx');
-  return (/** @type {object} */ event) => { fs.writeSync(fd, `${JSON.stringify(event)}\n`); };
+  // The whole line or an error: a short write on a full disk must stop the
+  // request the line names from going out.
+  return (/** @type {object} */ event) => { fs.writeFileSync(fd, `${JSON.stringify(event)}\n`); };
 }
 
 /**
@@ -598,6 +600,11 @@ async function write(argv) {
       for (const raw of lines) {
         const label = raw.trim();
         if (label === '') continue;
+        // A stop that needs no signal, so it works the same on every host (Windows cannot send one to node).
+        if (label === 'stop') {
+          halt();
+          continue;
+        }
         const m = MARK.exec(label);
         if (!m) console.error(`mark "${label}" is not "begin NAME" or "end NAME": the checker will call the run inconclusive`);
         if (m && m[1] === 'begin') openWindows.push(m[2]);

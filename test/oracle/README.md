@@ -34,17 +34,18 @@ by this process's monotonic clock:
 
 A `read` line names the lane that read, and under `by` the lane that the served content names.
 
-Each log's start line names its sink. A `file` log (`--log FILE`) gets every line before the request it names goes out,
-so even a killed writer's file holds every request it sent. A `stream` log (`--log -`, stdout) can be cut on its way.
+Each log's start line names its sink. A `file` log (`--log FILE`) gets each send line, whole, before its request goes
+out (a line that does not fit stops the writer instead), so even a killed writer's file holds every request it sent. A
+`stream` log (`--log -`, stdout) can be cut on its way.
 
-On a stop (`--duration` elapsed, SIGINT, SIGTERM or SIGHUP), the writer sends nothing new and gives in-flight requests 5
-seconds. Then it cuts them short, logs them as UNKNOWN, and writes its end line. A second signal ends it at once: it
-writes its end line to each file log and exits (a stream may lose its last lines), and its in-flight requests stay
-unanswered, so they read as UNKNOWN.
+On a stop (`--duration` elapsed, a `stop` line in the marks file, SIGINT, SIGTERM or SIGHUP), the writer sends nothing
+new and gives in-flight requests 5 seconds. Then it cuts them short, logs them as UNKNOWN, and writes its end line. A
+second signal ends it at once: it writes its end line to each file log and exits (a stream may lose its last lines), and
+its in-flight requests stay unanswered, so they read as UNKNOWN.
 
 Lines in the marks file mark critical windows on the same clock, and inside a window the writer runs `--burst` times
-faster. A line must be exactly `begin NAME` or `end NAME`; anything else makes the run inconclusive. A mark is stamped
-when the writer reads it: it polls the file every `--marks-every` ms (50), and once more before its end line.
+faster. A line must be exactly `begin NAME`, `end NAME` or `stop`; anything else makes the run inconclusive. A mark is
+stamped when the writer reads it: it polls the file every `--marks-every` ms (50), and once more before its end line.
 
 ## The web UI's limits
 
@@ -97,7 +98,8 @@ The result is FAIL on any verdict. It is INCONCLUSIVE, never PASS, in any of the
   holds no committed doc;
 - a file log has no end line: its writer was killed (outright, or out of memory). The file still holds every request it
   sent, so its verdicts fail the run, but a run cut short cannot pass. If the writer's host went down, the file's last
-  lines may be lost too: repeat the run;
+  lines may be lost too: repeat the run. A copy of a file cut short in transit looks the same and would raise false
+  verdicts, so a copy is judged only once its size matches the writer's own file (step 2);
 - a doc ends on an unanswered write after committed ones;
 - no control facts were given, or a node gave none (its bot child down or not answering). `--no-fleet` waives this
   only where there is no fleet to check.
@@ -132,8 +134,9 @@ fleet.
   - the writer stays inside the real rate and body limits;
   - `read` and `cleanup` go past the limiter's burst without errors;
   - a stop with hung requests ends within its grace and still writes the end line, and no delete goes out after a stop;
-  - in node:24-alpine, SIGHUP ends the log, and a second signal mid-request ends it at once with the request
-    unanswered;
+  - in node:24-alpine, SIGHUP ends the log, a second signal mid-request ends it at once with the request unanswered,
+    and a file log line that runs past a file size limit is an error, not a short write;
+  - a `stop` line in the marks file ends the writer on any host, with the marks before it logged;
   - an end mark written just before the stop is logged;
   - two writers on one run, each with its own log, are read, judged and cleaned up together, and each read line names
     its own lane;
@@ -159,10 +162,11 @@ Guardrails: the secret filter on every read; `ssh <host> ...` with no flag befor
          ssh contabo-dbot "docker run --rm --name smdb-oracle-<run> --network host -v /root/smdb-oracle:/o node:24-alpine node /o/oracle.mjs write --run <run> --guild <guild> --lane m=http://127.0.0.1:<port> --duration 1800 --marks /o/marks-<run>.txt --log /o/<run>.host.jsonl --log -" > <run>.jsonl
 
      If the ssh session drops, the streamed copy is cut (the checker refuses it) while the writer runs on in its
-     container, and only the host file is complete. Wait until the
-     container is gone (`ssh contabo-dbot docker inspect smdb-oracle-<run>` fails once `--rm` has removed it), or end
-     it with `ssh contabo-dbot docker stop smdb-oracle-<run>`. Then fetch the host file (`ssh contabo-dbot cat
-     /root/smdb-oracle/<run>.host.jsonl > <run>.jsonl`) and judge that.
+     container, and only the host file is complete. Wait until the container is gone (`ssh contabo-dbot docker inspect
+     smdb-oracle-<run>` prints "No such object" once `--rm` has removed it; a failed ssh proves nothing), or stop it
+     first (below). Then fetch the host file (`ssh contabo-dbot cat /root/smdb-oracle/<run>.host.jsonl > <run>.jsonl`),
+     and judge it only once its size matches the host file's (`wc -c < <run>.jsonl` against `ssh contabo-dbot "wc -c <
+     /root/smdb-oracle/<run>.host.jsonl"`); fetch again if not.
 
    - **When the scenario kills or cuts off a whole host,** do not run the writer on that host. Its file's last lines
      could be lost and the run would have to be repeated. Run it on the dev box instead, with its log and marks in files
@@ -173,9 +177,10 @@ Guardrails: the secret filter on every read; `ssh <host> ...` with no flag befor
      /root/smdb-oracle/marks-<run>.txt"` for a container writer, `echo 'begin kill-master' >> marks-<run>.txt` for one
      on the dev box. Write the `end` line the same way afterwards. Pass `--window kill-master` to the checker so that a
      missing mark cannot pass.
-   - Stop early: write every `end` mark first, then stop the writer once: `ssh contabo-dbot docker stop
-     smdb-oracle-<run>` for a container writer, one Ctrl+C for one on the dev box. The writer reads the marks file once
-     more and ends within its 5-second grace, inside docker stop's 10.
+   - Stop early: write every `end` mark, then a `stop` line, to the same marks file (`echo stop >> ...` as above). It
+     needs no signal, so it works the same for a container writer and for one on the dev box, where Windows cannot
+     signal node. The writer ends within its 5-second grace. `ssh contabo-dbot docker stop smdb-oracle-<run>` also
+     stops a container writer, inside docker stop's 10 seconds.
    - Lanes on two hosts need two writers: the same `--run`, distinct lane names, one log each. Name each writer's files
      with its own tag where `<run>` stands in a file name (`<run>-<w>.host.jsonl`, `<run>-<w>.jsonl`,
      `<run>-<w>.copy.jsonl`). Every later command (`sql`, `read`, `check`, `cleanup`) then gets one `--log` per writer

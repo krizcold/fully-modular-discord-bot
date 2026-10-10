@@ -449,10 +449,36 @@ describe('the data-loss oracle end to end', () => {
     expect(events.at(-1)?.t).toBe('end');
   });
 
-  it('ends its log on SIGHUP, and on a second signal mid-request', async () => {
-    // A Node child takes signals only on POSIX, so the writer runs in the image the live procedure uses.
+  it('stops on a stop line in its marks file, on any host', async () => {
+    const app = await startFakeApp({ pools: [pool] });
+    const marks = file('stopline-marks.txt');
+    fs.writeFileSync(marks, '');
+    const began = Date.now();
+    let log = '';
+    try {
+      log = await write('stopline', [`a=${app.url}`], ['--duration', '60', '--rate', '20', '--limiter', 'off', '--marks', marks], async () => {
+        await sleep(500);
+        fs.appendFileSync(marks, 'begin x\nend x\nstop\n');
+      });
+    } finally {
+      await app.close();
+    }
+    expect(Date.now() - began).toBeLessThan(15_000);
+    const events = parseLog(fs.readFileSync(log, 'utf8'));
+    expect(events.filter(e => e.t === 'mark').map(e => e.label)).toEqual(['begin x', 'end x']);
+    expect(events.at(-1)?.t).toBe('end');
+  });
+
+  it('in node:24-alpine, ends its log on SIGHUP and on a second signal, and never writes half a line', async () => {
+    // A Node child takes signals only on POSIX, and a file size limit is POSIX too, so the writer runs in the image the live procedure uses.
+    const fill = [
+      "import { openOut } from '/o/oracle.mjs';",
+      "const write = openOut('/tmp/full.jsonl');",
+      "try { write({ pad: 'x'.repeat(40000) }); console.log('written'); } catch (error) { console.log(error.code); }",
+    ].join('\n');
     const box = await new GenericContainer('node:24-alpine')
       .withCopyFilesToContainer([{ source: ORACLE, target: '/o/oracle.mjs' }])
+      .withCopyContentToContainer([{ content: fill, target: '/o/fill.mjs' }])
       .withCommand(['sleep', '600'])
       .start();
     const sh = async (cmd: string) => (await box.exec(['sh', '-c', cmd])).stdout;
@@ -483,6 +509,8 @@ describe('the data-loss oracle end to end', () => {
       const term = await ended('term');
       const answered = new Set(term.filter(e => e.t === 'ans').map(e => e.id));
       expect(term.some(e => e.t === 'send' && !answered.has(e.id))).toBe(true);
+      // A line that runs past the file size limit is an error, not a short write the request would follow.
+      expect((await sh("trap '' XFSZ; ulimit -f 16; node /o/fill.mjs")).trim()).toBe('EFBIG');
     } finally {
       await box.stop();
     }
