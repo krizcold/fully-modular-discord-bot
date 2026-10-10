@@ -403,6 +403,29 @@ describe('the data-loss oracle end to end', () => {
     expect((await runNode([CHECK, '--log', cleanLog, '--db', `db=${db}`, '--fleet-again', file('twice-m.json')])).code).toBe(64);
   });
 
+  it('refuses a streamed copy cut short, and judges the writer\'s own file', async () => {
+    const app = await startFakeApp({ pools: [pool] });
+    let r;
+    try {
+      r = await runNode([ORACLE, 'write', '--run', 'sinks', '--guild', GUILD, '--lane', `a=${app.url}`, '--log', file('sinks.jsonl'), '--log', '-',
+        '--duration', '1', '--rate', '20', '--limiter', 'off']);
+    } finally {
+      await app.close();
+    }
+    expect(r.code).toBe(0);
+    const streamed = r.stdout.trim().split('\n');
+    expect(JSON.parse(streamed[0]).sink).toBe('stream');
+    expect(parseLog(fs.readFileSync(file('sinks.jsonl'), 'utf8'))[0].sink).toBe('file');
+    fs.writeFileSync(file('sinks-cut.jsonl'), `${streamed.slice(0, -1).join('\n')}\n`);
+    const db = await dump('test', 'sinks', 'sinks-db.jsonl');
+    const cut = await runNode([CHECK, '--log', file('sinks-cut.jsonl'), '--db', `db=${db}`, '--no-fleet', '--k', '3']);
+    expect(cut.code).toBe(64);
+    expect(cut.stderr).toMatch(/streamed copy with no end line/);
+    const whole = await check(['--log', file('sinks.jsonl'), '--db', `db=${db}`, '--no-fleet', '--k', '3']);
+    expect(whole.result.verdicts).toEqual([]);
+    expect(whole.code).toBe(0);
+  });
+
   it('refuses a database copy when psql fails', async () => {
     await expect(dump('nosuchdb', 'none', 'none-db.jsonl')).rejects.toThrow(/psql/);
   });

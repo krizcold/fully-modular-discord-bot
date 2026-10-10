@@ -409,8 +409,11 @@ async function write(argv) {
   const buckets = new Map();
   for (const l of lanes) if (!buckets.has(l.base)) buckets.set(l.base, bucket(limiterSpec));
 
-  const sinks = (a.log.length > 0 ? a.log : ['-']).map(openOut);
-  const emit = (/** @type {object} */ event) => { for (const sink of sinks) sink(event); };
+  // A file log gets each line before the request it names goes out, so it
+  // holds every request even if the writer is killed. A stream (stdout) can
+  // be cut on its way, so the checker refuses one with no end line.
+  const sinks = (a.log.length > 0 ? a.log : ['-']).map((/** @type {string} */ target) => ({ write: openOut(target), sink: target === '-' ? 'stream' : 'file' }));
+  const emit = (/** @type {object} */ event) => { for (const s of sinks) s.write(event); };
   const clock = () => Math.round(performance.now() * 1000) / 1000;
   // stop: no new requests; cut: in-flight requests end, logged as unknown.
   const stop = new AbortController();
@@ -425,11 +428,12 @@ async function write(argv) {
   const openWindows = [];
   const counts = { ACKED: 0, HELD: 0, REFUSED: 0, UNKNOWN: 0, reads: 0, readErrors: 0 };
 
-  emit({
+  const startLine = {
     t: 'start', v: LOG_VERSION, run, guild, module: MODULE, seed, startedAt: new Date().toISOString(),
     lanes: lanes.map((/** @type {{ name: string, base: string }} */ l) => ({ name: l.name, route: 'operator', base: l.base })),
     settings: { duration, rate, hotCount, hotRatio, deleteRatio, readEvery, maxSize, maxBody, burst, limiter: limiterSpec, timeoutMs, marksEvery },
-  });
+  };
+  for (const s of sinks) s.write({ ...startLine, sink: s.sink });
 
   /**
    * Shortens the payload until the request fits the body limit.
@@ -615,8 +619,9 @@ async function write(argv) {
   let signals = 0;
   const onSignal = () => {
     signals += 1;
-    // Every request sent so far is logged and none follows the exit, so the
-    // log is still complete: its unanswered requests read as unknown.
+    // Every request sent so far is in each file log and none follows the
+    // exit, so a file log stays complete: its unanswered requests read as
+    // unknown. A stream may lose its last lines, end line included.
     if (signals > 1) {
       finish();
       process.exit(130);

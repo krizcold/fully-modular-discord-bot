@@ -67,8 +67,7 @@ export function render({ result, run, guild }) {
   const lines = [`run ${run} on guild ${guild}; copies: ${result.copies.join(', ') || 'none'}`];
   lines.push(`answers: ${Object.entries(result.answers).map(([k, v]) => `${k} ${v}`).join(', ')}; reads during the run: ${result.reads}`);
   for (const v of result.verdicts) {
-    const marks = `${v.during ? ' (during)' : ''}${v.provisional ? ' (provisional)' : ''}`;
-    lines.push(`${v.v}${marks} ${v.key ?? ''} [${v.copy ?? 'fleet'}] ${v.detail}`.replace(/ {2,}/g, ' '));
+    lines.push(`${v.v}${v.during ? ' (during)' : ''} ${v.key ?? ''} [${v.copy ?? 'fleet'}] ${v.detail}`.replace(/ {2,}/g, ' '));
   }
   for (const reason of result.inconclusive) lines.push(`INCONCLUSIVE ${reason}`);
   for (const note of result.notes) lines.push(`note: ${note}`);
