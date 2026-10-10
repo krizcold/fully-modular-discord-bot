@@ -7,8 +7,9 @@ WORKDIR /app
 # Copy package.json and install dependencies
 COPY package*.json tsconfigprod.json ./
 
-# Update npm to latest version
-RUN npm install -g npm@latest
+# npm 11: npm 12 blocks dependency install scripts by default, and
+# ffmpeg-static's script is what downloads the ffmpeg binary voice needs
+RUN npm install -g npm@11
 
 # Install git (needed by AppStore module manager)
 RUN apk add --no-cache git
