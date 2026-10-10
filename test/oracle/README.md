@@ -98,9 +98,9 @@ The result is FAIL on any verdict. It is INCONCLUSIVE, never PASS, in any of the
 - no judged copy was given;
 - a judged app copy could not read a committed doc, has no row for one (unless it is a sample), or is a sample that
   holds no committed doc;
-- a file log has no end line: its writer was killed (outright, or out of memory), or it stopped because a log line could
-  not be written (exit 64, the error on its stderr: free the space before a rerun). The file still holds every request it
-  sent, so its verdicts fail the run, but a run cut short cannot pass. If the writer's host went down, the file's last
+- a file log has no end line: its writer did not finish. It was killed, or it stopped on an error its stderr names (one
+  is a log line that could not be written: free the space before a rerun). The file still holds every request it sent,
+  so its verdicts fail the run, but a run cut short cannot pass. If the writer's host went down, the file's last
   lines may be lost too: repeat the run. A copy of a file cut short in transit looks the same and would raise false
   verdicts, so a copy is judged only once its size matches the writer's own file (step 2);
 - a doc ends on an unanswered write after committed ones;

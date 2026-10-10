@@ -299,8 +299,8 @@ export function openOut(target) {
 }
 
 /**
- * Every line of each writer log, parsed; a torn last line (the writer killed
- * mid-write) is dropped, any other bad line is an error.
+ * Every line of each writer log, parsed; a torn last line (the writer
+ * stopped mid-write) is dropped, any other bad line is an error.
  * @param {string} text
  * @returns {any[]}
  */
