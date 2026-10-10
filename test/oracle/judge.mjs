@@ -656,7 +656,7 @@ export function judge(input) {
   // of the file cut short in transit looks the same.
   history.logs.forEach((l, i) => {
     if (!l.ended) {
-      inconclusive.push(`log ${i + 1} (${l.lanes.join(', ')}) has no end line: its writer was killed, so the run was cut short, or this is a copy of its file cut short in transit (compare its size with the writer's own file). If the writer's host went down, the file's last lines may be lost too: rerun`);
+      inconclusive.push(`log ${i + 1} (${l.lanes.join(', ')}) has no end line: its writer was killed or stopped because a log line could not be written (exit 64, named on its stderr), so the run was cut short, or this is a copy of its file cut short in transit (compare its size with the writer's own file). If the writer's host went down, the file's last lines may be lost too: rerun`);
     }
   });
   const readErrors = history.reads.filter(r => r.state.s === 'error').length;

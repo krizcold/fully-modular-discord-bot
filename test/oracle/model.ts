@@ -136,7 +136,16 @@ function logsOf(world: World, split = false): any[][] {
     const d = shift(r.lane);
     logs[laneLog(r.lane)].push({ t: 'read', id: r.id, lane: r.lane, key: r.key, kind: r.kind, at0: r.at0 + d, at1: r.at1 + d, ...r.result });
   }
-  for (const log of logs) log.push({ t: 'end' });
+  // The end line counts what the writer counted: each answer by class, and the reads.
+  for (const log of logs) {
+    const counts: Record<string, number> = { ACKED: 0, HELD: 0, REFUSED: 0, UNKNOWN: 0, reads: 0, readErrors: 0 };
+    for (const e of log) {
+      if (e.t === 'ans') counts[e.cls] += 1;
+      if (e.t === 'read') counts.reads += 1;
+      if (e.t === 'read' && e.s === 'error') counts.readErrors += 1;
+    }
+    log.push({ t: 'end', counts });
+  }
   return logs;
 }
 
@@ -196,14 +205,19 @@ export function checks(): Check[] {
   };
   const judgeLog = (J: J, log: any[], copies: any[], extra: Record<string, unknown> = {}) =>
     J.judge({ history: J.buildHistory([log]), copies, k: 0, noFleet: true, ...extra });
+  // Silence: no verdict, and no complaint that a whole log lost lines.
+  const silent = (r: { verdicts: unknown[]; inconclusive: string[] }) => {
+    expect(r.verdicts).toEqual([]);
+    expect(r.inconclusive.filter(x => /end line counts/.test(x))).toEqual([]);
+  };
 
   return [
     // Silence on a correct store.
     { name: 'no verdict on any history a correct store allows', run: (J, numRuns) => fc.assert(fc.property(worldArb, world => {
-      expect(judgeWorld(J, world, [copyOf('db', world.final)]).verdicts).toEqual([]);
+      silent(judgeWorld(J, world, [copyOf('db', world.final)]));
     }), { numRuns }) },
     { name: 'no verdict across two logs on two clocks', run: (J, numRuns) => fc.assert(fc.property(worldArb, world => {
-      expect(judgeWorld(J, world, [copyOf('db', world.final)], true).verdicts).toEqual([]);
+      silent(judgeWorld(J, world, [copyOf('db', world.final)], true));
     }), { numRuns }) },
     { name: 'no verdict beside a lagging copy holding an older prefix', run: (J, numRuns) => fc.assert(fc.property(worldArb, fc.double({ min: 0, max: 1, noNaN: true }), (world, cut) => {
       const end = Math.max(0, ...world.ops.map(o => o.ansAt));
@@ -212,7 +226,17 @@ export function checks(): Check[] {
         if (e.op === 'write') older.set(e.key, e.h as string);
         else older.delete(e.key);
       }
-      expect(judgeWorld(J, world, [copyOf('db', world.final), copyOf('standby', older, 'lagging')]).verdicts).toEqual([]);
+      silent(judgeWorld(J, world, [copyOf('db', world.final), copyOf('standby', older, 'lagging')]));
+    }), { numRuns }) },
+    { name: 'a log that lost an answer or read line never passes', run: (J, numRuns) => fc.assert(fc.property(worldArb, fc.boolean(), fc.nat(), (world, split, pick) => {
+      const logs = logsOf(world, split);
+      const lines = logs.flatMap((log, i) => log.map((e, j) => [i, j, e] as const)).filter(([, , e]) => e.t === 'ans' || e.t === 'read');
+      if (lines.length === 0) return;
+      const [i, j] = lines[pick % lines.length];
+      logs[i].splice(j, 1);
+      const r = J.judge({ history: J.buildHistory(logs), copies: [copyOf('db', world.final)], k: 0, noFleet: true });
+      expect(r.inconclusive.some(x => /end line counts/.test(x))).toBe(true);
+      expect(r.result === 'PASS').toBe(false);
     }), { numRuns }) },
     { name: 'no verdict on a writer killed at any point, though its run cannot pass', run: (J, numRuns) => fc.assert(fc.property(
       fc.array(fc.record(stepModel), { minLength: 1, maxLength: 80 }), fc.double({ min: 0, max: 1, noNaN: true }), fc.boolean(), (steps, frac, split) => {
@@ -233,7 +257,7 @@ export function checks(): Check[] {
         if (pick === 2) docs.set(key, world.final.has(key) ? { s: 'present', h: world.final.get(key) } : { s: 'absent' });
       });
       const app = { name: 'app', mode: 'judged' as const, complete: false, docs, run: RUN, guild: GUILD, sample: false };
-      expect(judgeWorld(J, world, [copyOf('db', world.final), app as any]).verdicts).toEqual([]);
+      silent(judgeWorld(J, world, [copyOf('db', world.final), app as any]));
     }), { numRuns }) },
 
     // Each fault, named on the doc it hit.
@@ -451,6 +475,20 @@ export function checks(): Check[] {
       const read = { t: 'read', id: 7, lane: 'a', key: u('a', 1), kind: 'u', at0: 70, at1: 71, s: 'present', h: 'x1' };
       expect(judgeLog(J, [start(['a']), ...sixAcked(), read, counted(6, 1)], [copyOf('db', sixDocs())]).result).toBe('PASS');
       expect(judgeLog(J, [start(['a']), ...sixAcked(), read, counted(6)], [copyOf('db', sixDocs())]).result).toBe('INCONCLUSIVE');
+      // Every answer class and the read errors are counted, and one off is caught for each.
+      const mixed = [start(['a']), send(1, 'a', u('a', 1), 1, 'x1', 10), ans(1, 11), send(2, 'a', u('a', 2), 2, 'x2', 20), ans(2, 21, 'HELD'),
+        send(3, 'a', u('a', 3), 3, 'x3', 30), ans(3, 31, 'REFUSED'), send(4, 'a', u('a', 4), 4, 'x4', 40), ans(4, 41, 'UNKNOWN'),
+        { t: 'read', id: 5, lane: 'a', key: u('a', 1), kind: 'u', at0: 50, at1: 51, s: 'error', err: '429' }];
+      const all = { ACKED: 1, HELD: 1, REFUSED: 1, UNKNOWN: 1, reads: 1, readErrors: 1 };
+      const mixedDb = () => copyOf('db', new Map([[u('a', 1), 'x1'], [u('a', 2), 'x2']]));
+      expect(judgeLog(J, [...mixed, { t: 'end', counts: all }], [mixedDb()]).result).toBe('PASS');
+      for (const key of Object.keys(all) as (keyof typeof all)[]) {
+        expect(judgeLog(J, [...mixed, { t: 'end', counts: { ...all, [key]: all[key] - 1 } }], [mixedDb()]).result).toBe('INCONCLUSIVE');
+      }
+      // In every log, not only the first.
+      const logB = [start(['b']), send(1, 'b', u('b', 1), 1, 'y1', 10), ans(1, 11), counted(2)];
+      const bothDb = copyOf('db', new Map([...sixDocs(), [u('b', 1), 'y1']]));
+      expect(J.judge({ history: J.buildHistory([[start(['a']), ...sixAcked(), counted(6)], logB]), copies: [bothDb], k: 0, noFleet: true }).result).toBe('INCONCLUSIVE');
     } },
     { name: 'a killed writer\'s file is judged in full but cannot pass, and a cut stream is refused', run: J => {
       const killed = [start(['a']), ...sixAcked()];

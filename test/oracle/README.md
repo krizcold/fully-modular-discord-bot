@@ -98,7 +98,8 @@ The result is FAIL on any verdict. It is INCONCLUSIVE, never PASS, in any of the
 - no judged copy was given;
 - a judged app copy could not read a committed doc, has no row for one (unless it is a sample), or is a sample that
   holds no committed doc;
-- a file log has no end line: its writer was killed (outright, or out of memory). The file still holds every request it
+- a file log has no end line: its writer was killed (outright, or out of memory), or it stopped because a log line could
+  not be written (exit 64, the error on its stderr: free the space before a rerun). The file still holds every request it
   sent, so its verdicts fail the run, but a run cut short cannot pass. If the writer's host went down, the file's last
   lines may be lost too: repeat the run. A copy of a file cut short in transit looks the same and would raise false
   verdicts, so a copy is judged only once its size matches the writer's own file (step 2);
@@ -123,7 +124,7 @@ fleet.
   - **Hand-built cases** cover the ordering rules, the reads during the run, the CONTROL rules and two-set counting
     (each rule, in both orders), a killed writer's file and a cut stream, and each INCONCLUSIVE case above.
 - **test/unit/oracleJudge.test.ts** runs those checks against judge.mjs.
-- **test/unit/oracleMutants.test.ts** runs them against 49 mutants of judge.mjs, each breaking one rule. A hand-built
+- **test/unit/oracleMutants.test.ts** runs them against 53 mutants of judge.mjs, each breaking one rule. A hand-built
   check must kill each one, so the result does not depend on what the generator draws.
 - **test/integration/oracle.test.ts** runs the tools as child processes against stand-in nodes on real Postgres, and
   takes the database copy with the exact `sql` query:
