@@ -7,4 +7,5 @@ import { scrubEnv } from './env';
 // strip every bot configuration key (helpers/env.ts) before any source module
 // is imported.
 scrubEnv(process.env);
+process.env.NODE_ENV = 'test';
 process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-test-'));

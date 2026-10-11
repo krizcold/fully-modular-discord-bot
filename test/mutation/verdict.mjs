@@ -12,15 +12,19 @@
  */
 
 // A failure the machine causes, not the mutant: a connection or a container
-// that would not come up, a resource that ran out.
+// that would not come up, a resource that ran out. Matched against the first
+// line of a failure (the error's own message), never against an assertion, a
+// stack or a child's stderr, which may name such an error as the thing under
+// test. The list cannot be complete, so every kill in pass B, where machines
+// fail, must also repeat when the mutant runs alone (toConfirm).
 export const INFRASTRUCTURE = new RegExp([
   'ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'EAI_AGAIN', 'EPIPE', 'EMFILE', 'ENOMEM', 'ENOSPC', 'heap out of memory',
-  'Connection terminated', 'timeout exceeded when trying to connect', 'too many clients', 'Health check not healthy',
-  'Wait strategy', 'waiting for container', 'Container failed to start', 'container runtime', 'HTTP code 5\\d\\d',
-  'toomanyrequests',
-].join('|'), 'i');
-// A test that ran out of time: the mutant may hang it, or the host was slow.
-export const TIMEOUT = /Test timed out in \d+ ?ms|did not finish in \d+ ms/;
+  'Connection terminated', 'timeout exceeded when trying to connect', 'too many clients', 'not queryable',
+  'the database system is', 'Health check not healthy', 'Wait strategy', 'waiting for container', 'Container failed to start',
+  'container runtime', 'HTTP code 5\\d\\d', 'toomanyrequests',
+].join('|'));
+// A test or its hook that ran out of time: the mutant may hang it, or the host was slow.
+export const TIMEOUT = /(Test|Hook) timed out in \d+ ?ms|did not finish in \d+ ms/;
 
 /** @param {string} name */
 const testFile = name => name.split('\\').join('/').replace(/^.*\/\.stryker-tmp\/sandbox-[^/]+\/test\//, '');
@@ -52,9 +56,15 @@ export function classifyKill(reports) {
   if (failed.length === 0) {
     return { inconclusive: `no test failed: the run failed in a hook, at file level or on an unhandled error${fileMessage ? ` (${fileMessage})` : ''}` };
   }
-  const real = failed.find(f => !INFRASTRUCTURE.test(f.message) && !TIMEOUT.test(f.message));
+  /** @param {{ message: string }} f */
+  const assertion = f => f.message.startsWith('AssertionError');
+  /** @param {{ message: string }} f */
+  const machine = f => !assertion(f) && INFRASTRUCTURE.test(firstLine(f.message));
+  /** @param {{ message: string }} f */
+  const timedOutTest = f => !assertion(f) && TIMEOUT.test(firstLine(f.message));
+  const real = failed.find(f => !machine(f) && !timedOutTest(f));
   if (real) return { killedBy: real.test };
-  const timedOut = failed.find(f => TIMEOUT.test(f.message));
+  const timedOut = failed.find(timedOutTest);
   if (timedOut) return { timeout: timedOut.test };
   return { inconclusive: `only the machine failed: ${firstLine(failed[0].message)}` };
 }
@@ -77,13 +87,15 @@ export const outcome = m => outcomeOf(latest(m));
 export const FAILING = ['Survived', 'NoCoverage', 'Missing', 'Inconclusive', 'RuntimeError', 'Ignored'];
 
 /**
- * The gating mutants a pass's timeouts send to a confirming run of their own
- * (one at a time, with a larger budget): a timeout counts as a kill only when
- * the mutant hangs the tests alone too.
+ * The gating mutants a pass sends to a confirming run of their own (one at a
+ * time, with a larger budget): its timeouts, which count as kills only when the
+ * mutant hangs the tests alone too, and in pass B its kills as well, which
+ * count only when a test fails for the mutant again.
  * @param {MutantRecord[]} mutants
  * @param {'a' | 'b'} pass
  */
-export const toConfirm = (mutants, pass) => mutants.filter(m => m.gating && m.passes[pass] && outcome(m) === 'Timeout');
+export const toConfirm = (mutants, pass) =>
+  mutants.filter(m => m.gating && m.passes[pass] && (outcome(m) === 'Timeout' || (pass === 'b' && outcome(m) === 'Killed')));
 
 /**
  * The gating mutants pass B takes: the ones no in-process test killed.
@@ -108,8 +120,9 @@ export function judge(run) {
   let verdict = failing.length > 0 ? 'FAIL' : 'PASS';
   let why = '';
   if (run.stopped) { verdict = 'NO RESULT'; why = 'the gate stopped before it finished'; }
-  else if (run.emptyScope) { verdict = 'NO RESULT'; why = 'nothing changed in src: a job already committed needs --base set to the commit before it'; }
+  else if (run.emptyScope) { verdict = 'NO RESULT'; why = 'no src file changed; for a job already committed, pass --base the commit before it'; }
   else if (gating.length === 0) { verdict = 'NO RESULT'; why = 'no gating mutant was made, so L5 tested nothing (see what was not mutated, and why)'; }
+  else if (gating.every(m => outcome(m) === 'CompileError')) { verdict = 'NO RESULT'; why = 'every gating mutant was a type error, so no test ran against the change'; }
 
   /** @param {MutantRecord} m */
   const where = m => `${m.file}:${m.location.start.line}:${m.location.start.column}`;

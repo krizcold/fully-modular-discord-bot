@@ -5,7 +5,7 @@ import path from 'path';
 import { Instrumenter } from '@stryker-mutator/instrumenter';
 import ts from 'typescript';
 import { describe, expect, it, onTestFinished } from 'vitest';
-import { codeLines, diffArgs, gates, mergeRanges, notMutated, parseDiff, patternsOf, planTargets } from '../mutation/ranges.mjs';
+import { codeLines, diffArgs, gates, linesOfTarget, mergeRanges, notMutated, parseDiff, patternsOf, planTargets } from '../mutation/ranges.mjs';
 
 // The touched-line ranges of the L5 gate (mutation/README.md): which lines a
 // change touched, and how far each widens so that Stryker makes the mutants
@@ -125,17 +125,25 @@ describe('the diff reader', () => {
       '@@ -1,2 +0,0 @@',
       '-x',
       '-y',
-      'diff --git "a/src/odd name.ts" "b/src/odd name.ts"',
-      '--- "a/src/odd name.ts"',
-      '+++ "b/src/odd name.ts"',
+      // git ends a name holding a space with a tab, and quotes one holding a quote.
+      'diff --git a/src/odd name.ts b/src/odd name.ts',
+      '--- a/src/odd name.ts\t',
+      '+++ b/src/odd name.ts\t',
       '@@ -1 +1,2 @@',
       '-x',
       '+y',
       '+z',
+      'diff --git "a/src/quote\\"d.ts" "b/src/quote\\"d.ts"',
+      '--- "a/src/quote\\"d.ts"',
+      '+++ "b/src/quote\\"d.ts"',
+      '@@ -4 +4 @@',
+      '-a',
+      '+b',
     ].join('\n');
     expect(parseDiff(diff)).toEqual([
       { file: 'src/a.ts', changed: [3, 19, 20, 21], deletedAfter: [10] },
       { file: 'src/odd name.ts', changed: [1, 2], deletedAfter: [] },
+      { file: 'src/quote"d.ts', changed: [4], deletedAfter: [] },
     ]);
   });
 
@@ -147,8 +155,10 @@ describe('the diff reader', () => {
     fs.mkdirSync(path.join(repo, 'src'));
     const body = Array.from({ length: 30 }, (_, i) => `export const v${i} = ${i};`);
     fs.writeFileSync(path.join(repo, 'src', 'a.ts'), `${body.join('\n')}\n`);
+    fs.writeFileSync(path.join(repo, 'src', 'odd name.ts'), 'export const o = 1;\n');
     git('add', '.');
     git('commit', '-q', '-m', 'base');
+    fs.writeFileSync(path.join(repo, 'src', 'odd name.ts'), 'export const o = 2;\n');
     const base = git('rev-parse', 'HEAD').trim();
     // Line 3 and line 6 change; a new file is a near copy of a.ts, staged.
     const changed = body.map((line, i) => (i === 2 || i === 5 ? line.replace('= ', '= 100 + ') : line));
@@ -160,6 +170,7 @@ describe('the diff reader', () => {
     expect(parseDiff(git(...hostile, ...diffArgs(base)))).toEqual(plain);
     expect(plain.find(f => f.file === 'src/a.ts')?.changed).toEqual([3, 6]);
     expect(plain.find(f => f.file === 'src/b.ts')?.changed.length).toBeGreaterThan(0);
+    expect(plain.find(f => f.file === 'src/odd name.ts')?.changed).toEqual([1]);
   });
 });
 
@@ -296,6 +307,12 @@ describe('the targets', () => {
     expect(plan.targets).toEqual([{ file: 'src/new.ts', ranges: null, gating: null }]);
     expect(patternsOf(plan.targets[0])).toEqual(['src/new.ts']);
     expect(notMutated('test/x.ts')).toBe('outside src');
+  });
+
+  it('answers for every line a whole file or a pattern covers, and for the changed lines of a diff', () => {
+    expect(linesOfTarget({ gating: [3, 7], patterns: ['src/a.ts:2-9'] }, 11)).toEqual([3, 7]);
+    expect(linesOfTarget({ gating: null, patterns: ['src/new.ts'] }, 4)).toEqual([1, 2, 3, 4]);
+    expect(linesOfTarget({ gating: null, patterns: ['src/a.ts:3-5', 'src/a.ts:5:2-6:9', 'src/a.ts:10-99'] }, 11)).toEqual([3, 4, 5, 6, 10, 11]);
   });
 
   it('widens a pure deletion to its neighbours as context only', () => {

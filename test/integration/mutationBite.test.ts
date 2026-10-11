@@ -67,6 +67,8 @@ describe('the touched-line mutation gate', () => {
       if (dir) fs.rmSync(path.join(root, dir), { recursive: true, force: true });
     };
 
+    expect(gate('--help').status).toBe(2);
+
     const unknown = gate('--base', 'no-such-ref-anywhere');
     clean(unknown.stdout);
     expect(unknown.status, unknown.stderr).toBe(2);

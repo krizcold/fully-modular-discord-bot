@@ -37,20 +37,25 @@ detection, hunk joining).
 
 ## What it mutates
 
-- Each changed line widens to the statement it sits in, or to the part of a compound statement it sits in (an `if`
-  condition, a signature, a loop header), taken whole even when a block-bodied callback sits inside, so every mutant of a
-  changed operator, condition or call exists. A body is never taken because its header line changed; a line inside a
-  body (a callback's included) widens within that body. Stryker makes a mutant only when one range holds all of it.
+- Each changed line widens to the statement it sits in, taken whole even when a block-bodied callback sits inside, so
+  every mutant of a changed operator, condition or call exists. Stryker makes a mutant only when one range holds all of
+  it. A line wholly inside a body (a callback's included) widens within that body.
+- The headers of compound statements and declarations (an `if`, `for`, `while` or `switch` header, a `catch`, the
+  signature of a function declaration, method, constructor or accessor, a class header) widen to that header only,
+  never to the body. Any other line holding the start or end of a callback (a route's `router.get('/x', async (req,
+  res) => {`, a `});`, a property whose value is an arrow with a body, a plain line of an object that holds a method)
+  takes its whole statement: the callback's body runs as context, and the emptying of that body, which touches the
+  line, gates.
 - **Gating** mutants touch a changed line. Two kinds that touch one are not made: the whole callback around a changed
-  line of its body, and the emptying of a block that only begins or ends on the changed line (the body of a changed
-  `if (...) {` or signature); a block wholly made of changed lines is made. unit/mutationRanges.test.ts holds this rule
-  to Stryker's own instrumenter, line by line, on made-up shapes and on two real files.
+  line of its body, and the emptying of a block that only begins or ends on a changed compound header; a block wholly
+  made of changed lines is made. unit/mutationRanges.test.ts holds this rule to Stryker's own instrumenter, line by
+  line, on made-up shapes and on two real files.
 - The other mutants in the widened ranges are **context**: they run in pass A and are listed, but never fail the gate.
 - A pure deletion has no line left to mutate: its two neighbouring lines are context only.
 - Not mutated, and named in the report with the reason: files outside src, files that are not code, `.d.ts` files, and
   the browser views under src/webui/public (copied into dist, never compiled, and no test loads them yet).
-- A changed line of code that no mutant touches (types and imports land here) is named in the report: L5 says nothing
-  about it.
+- A changed line of code that no mutant touches (types and imports land here), in a diff, an untracked file or a
+  `--mutate` pattern, is named in the report: L5 says nothing about it. A deleted src file is named too.
 
 ## The passes
 
@@ -62,14 +67,17 @@ detection, hunk joining).
 2. **Pass B, the rest, on pass A's gating survivors only.** The sandbox's dist is built from the instrumented src
    (build.cjs), then each survivor runs `vitest related` on the integration tier and then the whole child tier, whose
    scenarios start real processes on that dist. A child sees the mutant through the env.
-3. **Timeouts are rerun.** A gating mutant that timed out in pass A or B runs again alone, one at a time, with a larger
-   budget. It counts as killed only if it hangs the tests alone too; one that then survives pass A goes on to pass B.
+3. **Reruns alone.** A gating mutant that timed out in pass A or B, and every gating kill of pass B (where containers
+   and children can fail on their own), runs again alone, one at a time, with a larger budget. It counts only if it is
+   killed, or hangs the tests, alone too; one that then survives pass A goes on to pass B.
 
 A run Stryker counts as a kill is checked against vitest's report of it: it is a kill only when a test itself failed for
-a reason other than the machine. When every failing test timed out it is a timeout (rerun as above). Anything else is
-**inconclusive**: no report, a failure only in a hook or at file level, an unhandled error with every test passing, or
-only machine failures (refused or reset connections, a container that would not start, a database connection dropped,
-exhausted resources).
+a reason other than the machine. When every failing test (or its hook) timed out it is a timeout (rerun as above).
+Anything else is **inconclusive**: no report, a failure only in a hook or at file level, an unhandled error with every
+test passing, or only machine failures (refused or reset connections, a container that would not start, a database
+connection dropped, exhausted resources). The machine's texts are matched against the first line of each failure only,
+never an assertion or a child's stderr, which may name such an error as the thing under test; the list cannot be
+complete, which is why pass B's kills must repeat.
 
 ## The report
 
@@ -84,8 +92,9 @@ exhausted resources).
 
 The verdict is FAIL when a gating mutant ends Survived, NoCoverage, Missing, inconclusive, RuntimeError, or Ignored (a
 `// Stryker disable` comment needs the same justification in the notes as a survivor). A confirmed timeout counts as
-killed and is listed. CompileError counts as killed by the type checker. The verdict is NO RESULT when nothing changed,
-when no gating mutant was made, or when a pass could not run; the report then says why, with the passes that did finish.
+killed and is listed. CompileError counts as killed by the type checker. The verdict is NO RESULT when no src file
+changed, when no gating mutant was made, when every gating mutant was a type error (no test ran against the change), or
+when a pass could not run; the report then says why, with the passes that did finish.
 
 ## Child scenarios
 
@@ -96,16 +105,18 @@ child away from anything real:
 - the bot root comes from the file's own place (never a fixed path), so a sandbox runs its own dist;
 - the child's cwd is its own data dir (the bot's `dotenv/config` imports read `.env` from the cwd, and the root `.env`
   of a main checkout holds the real token);
-- its env is the test's minus every bot configuration key (helpers/env.ts: every key src reads from process.env and the
-  payment providers' prefixes envLoader copies; unit/envScrub.test.ts holds the list to src), plus DATA_DIR; the active
-  mutant passes;
+- its env is the test's minus every bot configuration key (helpers/env.ts: every key src reads from process.env by name
+  and the payment providers' prefixes envLoader copies; unit/envScrub.test.ts holds the list to src), with NODE_ENV
+  `test` and its own DATA_DIR; the active mutant passes. Not covered: configManager also reads process.env[key] for any
+  config key; DEVS and testMode are scrubbed, a module's own config key is not;
 - every wait is bounded, and a step prints one `RESULT` line with its result and the bot modules it loaded; the helper
   fails unless every one sits under this root's dist.
 
 The child tier's globalSetup runs build.cjs `--if-stale`: it rebuilds dist unless the stamp matches both what dist was
-built from (src, tsconfig.json, build.cjs, the typescript version) and what dist holds now, so a dist that another build,
-a branch switch or a hand edit changed is rebuilt. A lock in dist keeps two runs in one checkout from building over each
-other. Like `npm run build`, it never deletes the output of a removed source file.
+built from (src, tsconfig.json, build.cjs, the typescript version, hashed before the build, so an edit saved meanwhile
+fails the build) and what dist holds now, so a dist that another build, a branch switch or a hand edit changed is
+rebuilt. A lock in dist keeps two runs in one checkout from building over each other; a lock whose owner is gone, or
+older than five minutes, is taken over. Like `npm run build`, it never deletes the output of a removed source file.
 
 ## Proven locally
 

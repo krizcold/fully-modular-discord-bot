@@ -60,9 +60,11 @@ export function parseDiff(text) {
   return [...files.values()];
 }
 
+// git quotes a name holding special characters, and ends a name holding a
+// space with a tab (for patch's sake).
 /** @param {string} name */
 function unquote(name) {
-  return name.startsWith('"') ? String(JSON.parse(name)) : name;
+  return name.startsWith('"') ? String(JSON.parse(name)) : name.replace(/\t$/, '');
 }
 
 /**
@@ -257,6 +259,24 @@ export function planTargets({ diff, untracked, read }) {
  */
 export function patternsOf(target) {
   return target.ranges ? target.ranges.map(([start, end]) => `${target.file}:${start}-${end}`) : [target.file];
+}
+
+/**
+ * The lines a target answers for: its changed lines, or for a whole file or a
+ * --mutate pattern, every line it covers.
+ * @param {{ gating: number[] | null, patterns: string[] }} target
+ * @param {number} lineCount
+ * @returns {number[]}
+ */
+export function linesOfTarget(target, lineCount) {
+  if (target.gating !== null) return target.gating;
+  const lines = new Set();
+  for (const pattern of target.patterns) {
+    const range = /:(\d+)(?::\d+)?-(\d+)(?::\d+)?$/.exec(pattern);
+    const [from, to] = range ? [Number(range[1]), Math.min(Number(range[2]), lineCount)] : [1, lineCount];
+    for (let n = from; n <= to; n++) lines.add(n);
+  }
+  return [...lines].sort((a, b) => a - b);
 }
 
 /**

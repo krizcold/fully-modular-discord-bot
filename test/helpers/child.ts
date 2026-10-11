@@ -27,10 +27,11 @@ export interface ScenarioRun<T> {
 // Runs one scenario step in its own process and returns its RESULT line. The
 // child's cwd is its data dir, so a `dotenv/config` import in the bot finds no
 // .env; its env is this one minus every bot configuration key (helpers/env.ts),
-// plus DATA_DIR. It fails on a missing RESULT line, a nonzero exit, a timeout,
-// or a bot module loaded from anywhere but this repo's dist.
+// with NODE_ENV 'test' and its own DATA_DIR. It fails on a missing RESULT line,
+// a nonzero exit, a timeout, or a bot module loaded from anywhere but this
+// repo's dist.
 export function runScenario<T>(script: string, args: string[], dataDir: string, timeoutMs = 20_000): Promise<ScenarioRun<T>> {
-  const env: NodeJS.ProcessEnv = { ...scrubEnv({ ...process.env }), DATA_DIR: dataDir };
+  const env: NodeJS.ProcessEnv = { ...scrubEnv({ ...process.env }), NODE_ENV: 'test', DATA_DIR: dataDir };
   const child = spawn(process.execPath, [path.join(SCENARIOS, script), ...args], { cwd: dataDir, env, stdio: ['ignore', 'pipe', 'pipe'] });
   let stdout = '';
   let stderr = '';

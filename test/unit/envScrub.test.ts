@@ -28,6 +28,10 @@ describe('the env scrub', () => {
     expect(prefixes.filter(prefix => !scrubbed(`${prefix}ANY`))).toEqual([]);
   });
 
+  it('runs tests with NODE_ENV test, whatever the shell set', () => {
+    expect(process.env.NODE_ENV).toBe('test');
+  });
+
   it('takes those keys out and leaves the rest, the active mutant included', () => {
     const env = scrubEnv({ DISCORD_TOKEN: 't', STRIPE_SECRET_KEY: 's', SESSION_SECRET: 'x', FLEET_CONFIRM_TAKEOVER: '1', DATA_BACKEND_URL: 'u', PATH: 'p', __STRYKER_ACTIVE_MUTANT__: '7', NODE_ENV: 'test' });
     expect(env).toEqual({ PATH: 'p', __STRYKER_ACTIVE_MUTANT__: '7', NODE_ENV: 'test' });

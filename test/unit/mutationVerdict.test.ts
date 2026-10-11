@@ -21,6 +21,10 @@ const FIXTURES: Record<string, string> = {
   'hang.test.mjs': "it('answers', () => new Promise(() => {}), 200);",
   'unhandled.test.mjs': "it('passes', () => { Promise.reject(new Error('late')); });",
   'mixed.test.mjs': "it('connects', () => { throw new Error('read ECONNRESET'); });\nit('keeps the role', () => { expect(1).toBe(2); });",
+  'hookHang.test.mjs': "beforeEach(() => new Promise(() => {}), 200);\nit('reads', () => {});",
+  'notQueryable.test.mjs': "it('queries', () => { throw new Error('Client has encountered a connection error and is not queryable'); });",
+  'childFault.test.mjs': "it('survives a full disk', () => { throw new Error('scenario diskFull.cjs step2 exited 1 with no RESULT line\\nError: ENOSPC: no space left on device'); });",
+  'assertsOnError.test.mjs': "it('classifies a refusal', () => { expect('connect ECONNREFUSED 10.0.0.2:5432').toBe('unreachable'); });",
 };
 
 describe('a run Stryker counted as a kill', () => {
@@ -40,6 +44,12 @@ describe('a run Stryker counted as a kill', () => {
     expect(of('hang.test.mjs')).toEqual({ timeout: expect.stringMatching(/hang\.test\.mjs > answers$/) });
     expect(of('unhandled.test.mjs')).toEqual({ inconclusive: expect.stringMatching(/^no test failed/) });
     expect(of('mixed.test.mjs')).toEqual({ killedBy: expect.stringMatching(/mixed\.test\.mjs > keeps the role$/) });
+    expect(of('hookHang.test.mjs')).toEqual({ timeout: expect.stringMatching(/hookHang\.test\.mjs > reads$/) });
+    expect(of('notQueryable.test.mjs')).toEqual({ inconclusive: expect.stringMatching(/^only the machine failed: .*not queryable/) });
+    // A child that fails for the mutant names the injected fault in its stderr,
+    // and an assertion may name an error as the value under test: both are kills.
+    expect(of('childFault.test.mjs')).toEqual({ killedBy: expect.stringMatching(/childFault\.test\.mjs > survives a full disk$/) });
+    expect(of('assertsOnError.test.mjs')).toEqual({ killedBy: expect.stringMatching(/assertsOnError\.test\.mjs > classifies a refusal$/) });
     expect(classifyKill([])).toEqual({ inconclusive: 'no vitest report was written' });
   });
 });
@@ -66,6 +76,11 @@ describe('the passes a mutant goes through', () => {
     const killedInB = mutant(7, true, { a: pass('Survived'), b: pass('Killed', { killedBy: 'child > x' }) });
     expect(outcome(killedInB)).toBe('Killed');
     expect(toConfirm([mutant(8, true, { a: pass('Survived'), b: pass('Timeout') })], 'b')).toHaveLength(1);
+    // Pass B's kills must repeat alone; pass A's need not.
+    expect(toConfirm([killedInB], 'b')).toEqual([killedInB]);
+    expect(toConfirm([killed], 'a')).toEqual([]);
+    const flake = mutant(9, true, { a: pass('Survived'), b: pass('Killed', { killedBy: 'x' }), b2: pass('Survived') });
+    expect(outcome(flake)).toBe('Survived');
   });
 });
 
@@ -100,6 +115,8 @@ describe('the verdict', () => {
 
   it('has no result when nothing changed or no gating mutant was made, and names what was not tested', () => {
     expect(run([], { emptyScope: true })).toMatchObject({ verdict: 'NO RESULT', code: 2 });
+    expect(run([mutant(1, true, { a: pass('CompileError') }), mutant(2, false, { a: pass('Killed', { killedBy: 'x' }) })]).lines.at(-1))
+      .toBe('Verdict: NO RESULT (every gating mutant was a type error, so no test ran against the change)');
     const none = run([mutant(1, false, { a: pass('Killed', { killedBy: 'x' }) })], {
       skipped: [{ file: 'src/webui/public/app.jsx', why: 'a browser view' }],
       unmatched: ['src/missing.ts:1-2'],

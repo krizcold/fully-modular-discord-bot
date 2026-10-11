@@ -8,8 +8,6 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { codeLines, diffArgs, gates, parseDiff, patternsOf, planTargets } from './ranges.mjs';
-import { classifyKill, judge, toConfirm, toPassB } from './verdict.mjs';
 
 /**
  * @typedef {import('./ranges.mjs').Location} Location
@@ -30,8 +28,24 @@ if (major < 22 || (major === 22 && minor < 12)) {
   }
   const run = spawnSync(node, [fileURLToPath(import.meta.url), ...process.argv.slice(2)], { stdio: 'inherit' });
   if (run.error) console.error(`The mutation gate could not start ${node}: ${run.error.message}`);
-  process.exit(run.status ?? 2);
+  process.exit(run.status ?? (run.signal ? 130 : 2));
 }
+
+// The libraries load here, so a checkout without the test packages (npm run
+// test:install) ends NO RESULT rather than with a crash's exit code.
+/** @type {typeof import('./ranges.mjs')} */
+let ranges;
+/** @type {typeof import('./verdict.mjs')} */
+let verdicts;
+try {
+  ranges = await import('./ranges.mjs');
+  verdicts = await import('./verdict.mjs');
+} catch (error) {
+  console.error(`Verdict: NO RESULT (the gate could not load: ${error instanceof Error ? error.message.split('\n')[0] : String(error)}; run npm run test:install)`);
+  process.exit(2);
+}
+const { codeLines, diffArgs, gates, linesOfTarget, parseDiff, patternsOf, planTargets } = ranges;
+const { classifyKill, judge, toConfirm, toPassB } = verdicts;
 
 const USAGE = 'usage: node test/mutation/touched.mjs [--base REF] [--mutate PATTERN]... [--concurrency N] [--keep]';
 /** @type {{ base: string, mutate: string[], concurrency: number, keep: boolean }} */
@@ -47,7 +61,7 @@ for (let i = 0; i < argv.length; i++) {
   else if (arg === '--mutate') opts.mutate.push(value());
   else if (arg === '--concurrency') opts.concurrency = Math.max(1, Number(value()) || 1);
   else if (arg === '--keep') opts.keep = true;
-  else { console.error(USAGE); process.exit(arg === '--help' ? 0 : 2); }
+  else { console.error(USAGE); process.exit(2); }
 }
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -59,7 +73,6 @@ const posix = file => file.split(path.sep).join('/');
 
 const stamp = new Date().toISOString().replace(/[:.]/g, '-');
 const reportDir = path.join(root, 'test', 'mutation', 'reports', stamp);
-fs.mkdirSync(reportDir, { recursive: true });
 
 /** @type {PassTarget[]} */
 let targets = [];
@@ -165,16 +178,12 @@ async function pass(name, tier, mutate, passFiles, extra) {
     return await new Stryker({ ...common, mutate, ...extra }).runMutationTest();
   } catch (error) {
     const lines = [`pass ${name} could not run: ${error instanceof Error ? error.message.split('\n')[0] : String(error)}`];
-    const dry = reportsOf(name, 'dry');
-    if (dry.length > 0) {
-      for (const report of dry) for (const file of report.testResults ?? []) {
-        if (file.status !== 'failed') continue;
-        const failed = (file.assertionResults ?? []).filter((/** @type {{ status: string }} */ t) => t.status === 'failed');
-        lines.push(`the run with no mutant failed in ${file.name}: ${(failed[0]?.failureMessages?.[0] ?? file.message ?? '').split('\n')[0]}`);
-      }
-    } else if (fs.readdirSync(out).some(f => f.startsWith('dry-'))) {
-      lines.push(`the run with no mutant wrote no report: see ${posix(path.relative(root, out))}/dry-*.log`);
+    for (const report of reportsOf(name, 'dry')) for (const file of report.testResults ?? []) {
+      if (file.status !== 'failed') continue;
+      const failed = (file.assertionResults ?? []).filter((/** @type {{ status: string }} */ t) => t.status === 'failed');
+      lines.push(`the run with no mutant failed in ${file.name}: ${(failed[0]?.failureMessages?.[0] ?? file.message ?? '').split('\n')[0]}`);
     }
+    if (fs.readdirSync(out).some(f => f.startsWith('dry-'))) lines.push(`the run with no mutant logged to ${posix(path.relative(root, out))}/dry-*.log`);
     throw new PassError(lines.join('\n'));
   }
 }
@@ -216,15 +225,18 @@ function report(stopped) {
   const unmatched = [];
   for (const target of targets) {
     const made = mutants.filter(m => m.file === target.file);
-    if (target.gating === null) {
-      if (made.length === 0 && !stopped) unmatched.push(...target.patterns);
+    if (stopped && mutants.length === 0) continue;
+    if (target.gating === null && made.length === 0) {
+      unmatched.push(...target.patterns);
       continue;
     }
-    const lines = codeLines(target.file, linesOf(target.file).join('\n'), target.gating)
+    const text = linesOf(target.file).join('\n');
+    const lines = codeLines(target.file, text, linesOfTarget(target, text.split('\n').length))
       .filter(n => !made.some(m => m.location.start.line <= n && n <= m.location.end.line));
-    if (lines.length > 0 && (mutants.length > 0 || !stopped)) noMutant.push({ file: target.file, lines });
+    if (lines.length > 0) noMutant.push({ file: target.file, lines });
   }
   const result = judge({ stamp, scope, emptyScope, skipped, mutants, noMutant, unmatched, report: posix(path.relative(root, reportDir)), stopped });
+  fs.mkdirSync(reportDir, { recursive: true });
   fs.writeFileSync(path.join(reportDir, 'mutants.json'), `${JSON.stringify({ scope, skipped, targets, mutants, verdict: result.verdict, stopped }, null, 2)}\n`);
   fs.writeFileSync(path.join(reportDir, 'summary.txt'), `${result.lines.join('\n')}\n`);
   console.log(result.lines.join('\n'));
@@ -240,11 +252,12 @@ try {
     const base = git('merge-base', opts.base, 'HEAD').trim();
     const diff = parseDiff(git(...diffArgs(base)));
     const untracked = git('ls-files', '-z', '--others', '--exclude-standard', '--', 'src').split('\0').filter(Boolean);
+    const deleted = git('-c', 'diff.renames=true', 'diff', '--name-only', '-z', '--no-relative', '--diff-filter=D', base, '--', 'src').split('\0').filter(Boolean);
     const plan = planTargets({ diff, untracked, read: file => linesOf(file).join('\n') });
     targets = plan.targets.map(target => ({ ...target, patterns: patternsOf(target) }));
-    skipped = plan.skipped;
+    skipped = [...plan.skipped, ...deleted.map(file => ({ file, why: 'deleted: nothing is left to mutate' }))];
     scope = `the change from ${opts.base} (merge-base ${base.slice(0, 7)}) to the working tree`;
-    emptyScope = diff.length === 0 && untracked.length === 0;
+    emptyScope = diff.length === 0 && untracked.length === 0 && deleted.length === 0;
   }
   if (targets.length === 0) finish();
 
@@ -292,7 +305,7 @@ try {
     await passOn('b', 'b', forB, { ...b, concurrency: Math.max(1, Math.floor(opts.concurrency / 2)), timeoutMS: 60_000, timeoutFactor: 2 });
     const confirmB = toConfirm(mutants, 'b');
     if (confirmB.length > 0) {
-      console.log(`L5: pass B again, one at a time, on ${confirmB.length} timeout(s)`);
+      console.log(`L5: pass B again, one at a time, on ${confirmB.length} kill(s) and timeout(s), which count only if they repeat`);
       await passOn('b2', 'b', confirmB, { ...b, concurrency: 1, timeoutMS: 180_000, timeoutFactor: 4 });
     }
   }
