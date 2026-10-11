@@ -4,7 +4,7 @@ import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { onTestFinished } from 'vitest';
-import { FLEET_ENV } from './env';
+import { scrubEnv } from './env';
 
 // The repo this suite sits in, found from this file's own place, so a copy of
 // the repo (a Stryker sandbox) runs its own dist and never another checkout's.
@@ -26,12 +26,11 @@ export interface ScenarioRun<T> {
 
 // Runs one scenario step in its own process and returns its RESULT line. The
 // child's cwd is its data dir, so a `dotenv/config` import in the bot finds no
-// .env; its env is this one minus the fleet keys, plus DATA_DIR. It fails on a
-// missing RESULT line, a nonzero exit, a timeout, or a bot module loaded from
-// anywhere but this repo's dist.
+// .env; its env is this one minus every bot configuration key (helpers/env.ts),
+// plus DATA_DIR. It fails on a missing RESULT line, a nonzero exit, a timeout,
+// or a bot module loaded from anywhere but this repo's dist.
 export function runScenario<T>(script: string, args: string[], dataDir: string, timeoutMs = 20_000): Promise<ScenarioRun<T>> {
-  const env: NodeJS.ProcessEnv = { ...process.env, DATA_DIR: dataDir };
-  for (const key of FLEET_ENV) delete env[key];
+  const env: NodeJS.ProcessEnv = { ...scrubEnv({ ...process.env }), DATA_DIR: dataDir };
   const child = spawn(process.execPath, [path.join(SCENARIOS, script), ...args], { cwd: dataDir, env, stdio: ['ignore', 'pipe', 'pipe'] });
   let stdout = '';
   let stderr = '';

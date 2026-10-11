@@ -1,4 +1,5 @@
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { fileURLToPath, pathToFileURL } from 'url';
 import { afterAll, describe, expect, it } from 'vitest';
@@ -10,7 +11,9 @@ import { checks } from '../oracle/model';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const oracleDir = path.join(here, '../oracle');
-const work = path.join(here, `../.mutants-${process.pid}`);
+// Outside the repo, so nothing appears and vanishes in the checkout while a
+// mutation run copies it.
+const work = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-oracle-mutants-'));
 
 const SUPERSEDE_END = '    || (w.lane !== shown.lane && w.log === shown.log && w.at > shown.ansAt)));\n}\n\n/**\n * Committed writes';
 

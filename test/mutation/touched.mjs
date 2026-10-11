@@ -2,12 +2,24 @@
 // through Stryker's command runner, so code that only child processes run is
 // mutated too. How to run it and read it: mutation/README.md.
 // Usage: node test/mutation/touched.mjs [--base REF] [--mutate PATTERN]... [--concurrency N] [--keep]
+// Exit: 0 PASS, 1 FAIL, 2 NO RESULT; any other code: interrupted.
 import { execFileSync, spawnSync } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { gates, parseDiff, patternsOf, planTargets } from './ranges.mjs';
+import { codeLines, diffArgs, gates, parseDiff, patternsOf, planTargets } from './ranges.mjs';
+import { classifyKill, judge, toConfirm, toPassB } from './verdict.mjs';
+
+/**
+ * @typedef {import('./ranges.mjs').Location} Location
+ * @typedef {import('./verdict.mjs').MutantRecord} MutantRecord
+ * @typedef {import('./verdict.mjs').PassName} PassName
+ * @typedef {import('./verdict.mjs').PassResult} PassResult
+ * @typedef {{ file: string, patterns: string[], gating: number[] | null }} PassTarget
+ * @typedef {{ id: string, fileName: string, location: Location, mutatorName: string, replacement?: string, status: string, statusReason?: string }} StrykerResult
+ * @typedef {import('@stryker-mutator/api/core').PartialStrykerOptions} Options
+ */
 
 const [major, minor] = process.versions.node.split('.').map(Number);
 if (major < 22 || (major === 22 && minor < 12)) {
@@ -17,17 +29,9 @@ if (major < 22 || (major === 22 && minor < 12)) {
     process.exit(2);
   }
   const run = spawnSync(node, [fileURLToPath(import.meta.url), ...process.argv.slice(2)], { stdio: 'inherit' });
+  if (run.error) console.error(`The mutation gate could not start ${node}: ${run.error.message}`);
   process.exit(run.status ?? 2);
 }
-
-/**
- * @typedef {import('./ranges.mjs').Location} Location
- * @typedef {{ file: string, patterns: string[], gating: number[] | null }} PassTarget
- * @typedef {{ id: string | null, status: string, killedBy?: string, inconclusive?: string }} PassResult
- * @typedef {{ file: string, location: Location, mutator: string, original: string, replacement: string, gating: boolean,
- *   a: PassResult, b: PassResult | null }} MutantRecord
- * @typedef {{ id: string, fileName: string, location: Location, mutatorName: string, replacement?: string, status: string }} StrykerResult
- */
 
 const USAGE = 'usage: node test/mutation/touched.mjs [--base REF] [--mutate PATTERN]... [--concurrency N] [--keep]';
 /** @type {{ base: string, mutate: string[], concurrency: number, keep: boolean }} */
@@ -53,42 +57,80 @@ const git = (...args) => execFileSync('git', ['-c', 'core.quotePath=false', ...a
 /** @param {string} file */
 const posix = file => file.split(path.sep).join('/');
 
-// What to mutate: the explicit patterns (every mutant gates), or the change
-// from the merge-base of --base and HEAD to the working tree.
-/** @type {PassTarget[]} */
-let targets;
-/** @type {{ file: string, why: string }[]} */
-let skipped = [];
-let scope;
-if (opts.mutate.length > 0) {
-  targets = opts.mutate.map(pattern => ({ file: pattern.replace(/:\d+(:\d+)?-\d+(:\d+)?$/, ''), patterns: [pattern], gating: null }));
-  scope = `the patterns ${opts.mutate.join(' ')}`;
-} else {
-  const base = git('merge-base', opts.base, 'HEAD').trim();
-  const diff = parseDiff(git('diff', '-U0', '--no-color', '--no-ext-diff', '--diff-filter=AMR', base, '--', 'src'));
-  const untracked = git('ls-files', '-z', '--others', '--exclude-standard', '--', 'src').split('\0').filter(Boolean);
-  const plan = planTargets({ diff, untracked, read: file => fs.readFileSync(path.join(root, file), 'utf8') });
-  targets = plan.targets.map(target => ({ ...target, patterns: patternsOf(target) }));
-  skipped = plan.skipped;
-  scope = `the change from ${opts.base} (merge-base ${base.slice(0, 7)}) to the working tree`;
-}
-const files = [...new Set(targets.map(target => target.file))];
-
 const stamp = new Date().toISOString().replace(/[:.]/g, '-');
 const reportDir = path.join(root, 'test', 'mutation', 'reports', stamp);
-fs.mkdirSync(path.join(reportDir, 'a'), { recursive: true });
-fs.mkdirSync(path.join(reportDir, 'b'), { recursive: true });
+fs.mkdirSync(reportDir, { recursive: true });
 
-// The sandbox holds what a clean checkout holds: everything git ignores stays
-// out (.env, data dirs, dist, private module repos), node_modules aside, which
-// Stryker links. Its temp dir ignores itself, so git status stays clean.
-const ignored = git('ls-files', '-z', '--others', '--ignored', '--exclude-standard', '--directory').split('\0').filter(Boolean);
-const ignorePatterns = [...new Set(['/dist/', ...ignored.filter(p => path.posix.basename(p.replace(/\/$/, '')) !== 'node_modules').map(p => `/${p}`)])];
-fs.mkdirSync(path.join(root, '.stryker-tmp'), { recursive: true });
-fs.writeFileSync(path.join(root, '.stryker-tmp', '.gitignore'), '*\n');
+/** @type {PassTarget[]} */
+let targets = [];
+/** @type {{ file: string, why: string }[]} */
+let skipped = [];
+let scope = opts.mutate.length > 0 ? `the patterns ${opts.mutate.join(' ')}` : `the change from ${opts.base} to the working tree`;
+let emptyScope = false;
+/** @type {MutantRecord[]} */
+let mutants = [];
+/** @type {Map<string, string[]>} */
+const sources = new Map();
 
-const { Stryker } = await import('@stryker-mutator/core');
-/** @typedef {import('@stryker-mutator/api/core').PartialStrykerOptions} Options */
+/** @param {string} file */
+function linesOf(file) {
+  if (!sources.has(file)) sources.set(file, fs.readFileSync(path.join(root, file), 'utf8').split('\n'));
+  return sources.get(file) ?? [];
+}
+
+/**
+ * @param {string} file
+ * @param {Location} location
+ */
+function originalOf(file, location) {
+  const first = linesOf(file)[location.start.line - 1] ?? '';
+  const text = location.start.line === location.end.line
+    ? first.slice(location.start.column - 1, location.end.column - 1)
+    : `${first.slice(location.start.column - 1)} ...`;
+  return text.length > 100 ? `${text.slice(0, 97)}...` : text;
+}
+
+/**
+ * @param {string} file
+ * @param {string} mutator
+ * @param {string} replacement
+ * @param {Location} l
+ */
+const keyOf = (file, mutator, replacement, l) => `${file}|${mutator}|${replacement}|${l.start.line}:${l.start.column}-${l.end.line}:${l.end.column}`;
+/** @param {StrykerResult} r */
+const fileOf = r => posix(path.relative(root, path.resolve(root, r.fileName)));
+/** @param {StrykerResult} r */
+const resultKey = r => keyOf(fileOf(r), r.mutatorName, r.replacement ?? '', r.location);
+/** @param {MutantRecord} m */
+const recordKey = m => keyOf(m.file, m.mutator, m.replacement, m.location);
+/** @param {MutantRecord} m */
+const spanOf = m => `${m.file}:${m.location.start.line}:${m.location.start.column - 1}-${m.location.end.line}:${m.location.end.column - 1}`;
+
+/**
+ * The vitest reports one run left in a pass's dir.
+ * @param {PassName} name
+ * @param {string} id
+ */
+function reportsOf(name, id) {
+  return ['fast', 'integration', 'child'].flatMap(project => {
+    try { return [JSON.parse(fs.readFileSync(path.join(reportDir, name, `${id}-${project}.json`), 'utf8'))]; } catch { return []; }
+  });
+}
+
+/**
+ * One pass's result for a mutant, with a kill checked against the reports.
+ * @param {PassName} name
+ * @param {StrykerResult} r
+ * @returns {PassResult}
+ */
+function resultOf(name, r) {
+  /** @type {PassResult} */
+  const result = { id: r.id, status: r.status, ...(r.statusReason ? { statusReason: r.statusReason.split('\n')[0] } : {}) };
+  return r.status === 'Killed' ? { ...result, ...classifyKill(reportsOf(name, r.id)) } : result;
+}
+
+class PassError extends Error {}
+
 /** @type {Options} */
 const common = {
   testRunner: 'command',
@@ -96,195 +138,165 @@ const common = {
   coverageAnalysis: 'off',
   tsconfigFile: 'tsconfig.json',
   tempDirName: '.stryker-tmp',
-  cleanTempDir: !opts.keep,
-  ignorePatterns,
+  cleanTempDir: opts.keep ? false : 'always',
   incremental: false,
   reporters: ['progress'],
   logLevel: /** @type {import('@stryker-mutator/api/core').LogLevel} */ ('warn'),
 };
 
 /**
- * @param {'a' | 'b'} name
+ * Runs one Stryker pass. `tier` picks the tests (runner.mjs): a for the fast
+ * tier, b for the integration and child tiers.
+ * @param {PassName} name
+ * @param {'a' | 'b'} tier
  * @param {string[]} mutate
  * @param {string[]} passFiles
  * @param {Options} extra
  * @returns {Promise<StrykerResult[]>}
  */
-async function pass(name, mutate, passFiles, extra) {
-  process.env.SMDB_MUTATION_PASS = name;
+async function pass(name, tier, mutate, passFiles, extra) {
+  const out = path.join(reportDir, name);
+  fs.mkdirSync(out, { recursive: true });
+  process.env.SMDB_MUTATION_PASS = tier;
   process.env.SMDB_MUTATION_FILES = JSON.stringify(passFiles);
-  process.env.SMDB_MUTATION_OUT = path.join(reportDir, name);
+  process.env.SMDB_MUTATION_OUT = out;
+  const { Stryker } = await import('@stryker-mutator/core');
   try {
     return await new Stryker({ ...common, mutate, ...extra }).runMutationTest();
   } catch (error) {
-    const lines = [`pass ${name} could not run: ${error instanceof Error ? error.message : String(error)}`, ...dryRunFailures(name)];
-    fs.writeFileSync(path.join(reportDir, 'summary.txt'), `${lines.join('\n')}\n`);
-    console.error(lines.join('\n'));
-    console.error(`Verdict: NO RESULT (report: ${posix(path.relative(root, reportDir))})`);
+    const lines = [`pass ${name} could not run: ${error instanceof Error ? error.message.split('\n')[0] : String(error)}`];
+    const dry = reportsOf(name, 'dry');
+    if (dry.length > 0) {
+      for (const report of dry) for (const file of report.testResults ?? []) {
+        if (file.status !== 'failed') continue;
+        const failed = (file.assertionResults ?? []).filter((/** @type {{ status: string }} */ t) => t.status === 'failed');
+        lines.push(`the run with no mutant failed in ${file.name}: ${(failed[0]?.failureMessages?.[0] ?? file.message ?? '').split('\n')[0]}`);
+      }
+    } else if (fs.readdirSync(out).some(f => f.startsWith('dry-'))) {
+      lines.push(`the run with no mutant wrote no report: see ${posix(path.relative(root, out))}/dry-*.log`);
+    }
+    throw new PassError(lines.join('\n'));
+  }
+}
+
+/**
+ * Runs a pass on exactly the given mutants and records its results on them.
+ * @param {PassName} name
+ * @param {'a' | 'b'} tier
+ * @param {MutantRecord[]} on
+ * @param {Options} extra
+ */
+async function passOn(name, tier, on, extra) {
+  const results = await pass(name, tier, [...new Set(on.map(spanOf))], [...new Set(on.map(m => m.file))], extra);
+  const byKey = new Map(results.map(r => [resultKey(r), r]));
+  for (const m of on) {
+    const r = byKey.get(recordKey(m));
+    m.passes[name] = r ? resultOf(name, r) : { id: null, status: 'Missing' };
+  }
+}
+
+/**
+ * The verdict, the report files and the exit.
+ * @param {string[]} [stopped]
+ */
+function finish(stopped) {
+  try {
+    report(stopped);
+  } catch (error) {
+    console.error(`Verdict: NO RESULT (the report could not be written: ${error instanceof Error ? error.message.split('\n')[0] : String(error)})`);
     process.exit(2);
   }
 }
 
-// The vitest reports a run left behind: per test file, the failures. Test
-// files are named from their sandbox's test dir.
-/** @param {string} name */
-const testFile = name => posix(name).replace(/^.*\/\.stryker-tmp\/sandbox-[^/]+\/test\//, '');
-/**
- * @param {'a' | 'b'} name
- * @param {string | null} mutant
- * @returns {{ test: string, message: string }[] | null} null when no report was written
- */
-function failuresOf(name, mutant) {
-  /** @type {{ test: string, message: string }[]} */
-  const failures = [];
-  let found = false;
-  for (const project of ['fast', 'integration', 'child']) {
-    let report;
-    try { report = JSON.parse(fs.readFileSync(path.join(reportDir, name, `${mutant}-${project}.json`), 'utf8')); } catch { continue; }
-    found = true;
-    for (const file of report.testResults ?? []) {
-      /** @type {{ status: string, fullName: string, failureMessages?: string[] }[]} */
-      const failed = (file.assertionResults ?? []).filter((/** @type {{ status: string }} */ test) => test.status === 'failed');
-      for (const test of failed) failures.push({ test: `${testFile(file.name)} > ${test.fullName}`, message: (test.failureMessages ?? []).join('\n') });
-      if (file.status === 'failed' && failed.length === 0) failures.push({ test: testFile(file.name), message: file.message ?? '' });
+/** @param {string[]} [stopped] */
+function report(stopped) {
+  /** @type {{ file: string, lines: number[] }[]} */
+  const noMutant = [];
+  /** @type {string[]} */
+  const unmatched = [];
+  for (const target of targets) {
+    const made = mutants.filter(m => m.file === target.file);
+    if (target.gating === null) {
+      if (made.length === 0 && !stopped) unmatched.push(...target.patterns);
+      continue;
     }
+    const lines = codeLines(target.file, linesOf(target.file).join('\n'), target.gating)
+      .filter(n => !made.some(m => m.location.start.line <= n && n <= m.location.end.line));
+    if (lines.length > 0 && (mutants.length > 0 || !stopped)) noMutant.push({ file: target.file, lines });
   }
-  return found ? failures : null;
+  const result = judge({ stamp, scope, emptyScope, skipped, mutants, noMutant, unmatched, report: posix(path.relative(root, reportDir)), stopped });
+  fs.writeFileSync(path.join(reportDir, 'mutants.json'), `${JSON.stringify({ scope, skipped, targets, mutants, verdict: result.verdict, stopped }, null, 2)}\n`);
+  fs.writeFileSync(path.join(reportDir, 'summary.txt'), `${result.lines.join('\n')}\n`);
+  console.log(result.lines.join('\n'));
+  process.exit(result.code);
 }
 
-/** @param {'a' | 'b'} name */
-function dryRunFailures(name) {
-  const failures = failuresOf(name, 'dry');
-  if (failures === null) return [`  no vitest report: see ${posix(path.relative(root, path.join(reportDir, name)))}/dry-*.log`];
-  return failures.slice(0, 10).map(f => `  ${f.test}: ${f.message.split('\n')[0]}`);
-}
+try {
+  // What to mutate: the explicit patterns (every mutant gates), or the change
+  // from the merge-base of --base and HEAD to the working tree.
+  if (opts.mutate.length > 0) {
+    targets = opts.mutate.map(pattern => ({ file: pattern.replace(/:\d+(:\d+)?-\d+(:\d+)?$/, ''), patterns: [pattern], gating: null }));
+  } else {
+    const base = git('merge-base', opts.base, 'HEAD').trim();
+    const diff = parseDiff(git(...diffArgs(base)));
+    const untracked = git('ls-files', '-z', '--others', '--exclude-standard', '--', 'src').split('\0').filter(Boolean);
+    const plan = planTargets({ diff, untracked, read: file => linesOf(file).join('\n') });
+    targets = plan.targets.map(target => ({ ...target, patterns: patternsOf(target) }));
+    skipped = plan.skipped;
+    scope = `the change from ${opts.base} (merge-base ${base.slice(0, 7)}) to the working tree`;
+    emptyScope = diff.length === 0 && untracked.length === 0;
+  }
+  if (targets.length === 0) finish();
 
-// A kill whose every failure is the machine, not the mutant, proves nothing.
-const INFRASTRUCTURE = /ECONNREFUSED|ECONNRESET|ETIMEDOUT|EAI_AGAIN|EMFILE|ENOMEM|ENOSPC|heap out of memory|Hook timed out|container runtime|Could not find a working container/i;
-/**
- * @param {'a' | 'b'} name
- * @param {string | null} mutant
- */
-function killVerdict(name, mutant) {
-  const failures = failuresOf(name, mutant);
-  if (failures === null) return { inconclusive: 'no vitest report was written' };
-  if (failures.length === 0) return { inconclusive: 'vitest failed with no failing test' };
-  if (failures.every(f => INFRASTRUCTURE.test(f.message))) return { inconclusive: `only infrastructure failed: ${failures[0].message.split('\n')[0]}` };
-  return { killedBy: failures[0].test };
-}
+  // The sandbox holds the tracked files and the untracked ones git does not
+  // ignore; everything git ignores stays out (.env, data dirs, dist, private
+  // module repos), node_modules aside, which Stryker links. The temp dir
+  // ignores itself, so git status stays clean.
+  const ignored = git('ls-files', '-z', '--others', '--ignored', '--exclude-standard', '--directory').split('\0').filter(Boolean);
+  common.ignorePatterns = [...new Set(['/dist/', ...ignored.filter(p => path.posix.basename(p.replace(/\/$/, '')) !== 'node_modules').map(p => `/${p}`)])];
+  fs.mkdirSync(path.join(root, '.stryker-tmp'), { recursive: true });
+  fs.writeFileSync(path.join(root, '.stryker-tmp', '.gitignore'), '*\n');
 
-/** @type {Map<string, string[]>} */
-const sources = new Map();
-/**
- * @param {string} file
- * @param {Location} location
- */
-function originalOf(file, location) {
-  if (!sources.has(file)) sources.set(file, fs.readFileSync(path.join(root, file), 'utf8').split('\n'));
-  const lines = sources.get(file) ?? [];
-  const first = lines[location.start.line - 1] ?? '';
-  const text = location.start.line === location.end.line
-    ? first.slice(location.start.column - 1, location.end.column - 1)
-    : `${first.slice(location.start.column - 1)} ...`;
-  return text.length > 100 ? `${text.slice(0, 97)}...` : text;
-}
-
-/** @param {MutantRecord} m */
-const keyOf = m => `${m.file}|${m.mutator}|${m.replacement}|${m.location.start.line}:${m.location.start.column}-${m.location.end.line}:${m.location.end.column}`;
-/**
- * @param {StrykerResult} result
- * @returns {MutantRecord}
- */
-const recordOf = result => {
-  const file = posix(path.relative(root, path.resolve(root, result.fileName)));
-  const target = targets.find(t => t.file === file);
-  return {
-    file,
-    location: result.location,
-    mutator: result.mutatorName,
-    original: originalOf(file, result.location),
-    replacement: result.replacement ?? '',
-    gating: target ? gates(target, result.location) : true,
-    a: { id: result.id, status: result.status },
-    b: null,
-  };
-};
-
-/** @type {MutantRecord[]} */
-let mutants = [];
-if (targets.length > 0) {
+  const files = [...new Set(targets.map(target => target.file))];
   console.log(`L5: mutating ${scope}: ${files.length} file(s), pass A (in-process tests that import them)`);
-  const resultsA = await pass('a', targets.flatMap(t => t.patterns), files, {
+  const resultsA = await pass('a', 'a', targets.flatMap(t => t.patterns), files, {
     checkers: ['typescript'],
     concurrency: opts.concurrency,
     timeoutMS: 10_000,
     timeoutFactor: 2,
   });
-  mutants = resultsA.map(recordOf);
-  for (const m of mutants) if (m.a.status === 'Killed') Object.assign(m.a, killVerdict('a', m.a.id));
+  mutants = resultsA.map(r => {
+    const file = fileOf(r);
+    const target = targets.find(t => t.file === file);
+    return {
+      file,
+      location: r.location,
+      mutator: r.mutatorName,
+      original: originalOf(file, r.location),
+      replacement: r.replacement ?? '',
+      gating: target ? gates(target, r.location) : true,
+      passes: { a: resultOf('a', r) },
+    };
+  });
 
-  const survivors = mutants.filter(m => m.gating && (m.a.status === 'Survived' || m.a.status === 'NoCoverage'));
-  if (survivors.length > 0) {
-    console.log(`L5: pass B (integration tests that import them, then every child scenario) on ${survivors.length} survivor(s)`);
-    const spans = survivors.map(m => `${m.file}:${m.location.start.line}:${m.location.start.column - 1}-${m.location.end.line}:${m.location.end.column - 1}`);
-    const resultsB = await pass('b', [...new Set(spans)], [...new Set(survivors.map(m => m.file))], {
-      buildCommand: 'node test/helpers/build.cjs',
-      checkers: [],
-      concurrency: Math.max(1, Math.floor(opts.concurrency / 2)),
-      timeoutMS: 60_000,
-      timeoutFactor: 2,
-      dryRunTimeoutMinutes: 15,
-    });
-    const byKey = new Map(resultsB.map(result => [keyOf(recordOf(result)), result]));
-    for (const m of survivors) {
-      const result = byKey.get(keyOf(m));
-      /** @type {PassResult} */
-      const b = result ? { id: result.id, status: result.status } : { id: null, status: 'Missing' };
-      if (b.status === 'Killed') Object.assign(b, killVerdict('b', b.id));
-      m.b = b;
+  const confirmA = toConfirm(mutants, 'a');
+  if (confirmA.length > 0) {
+    console.log(`L5: pass A again, one at a time, on ${confirmA.length} timeout(s)`);
+    await passOn('a2', 'a', confirmA, { checkers: [], concurrency: 1, timeoutMS: 60_000, timeoutFactor: 4 });
+  }
+
+  const forB = toPassB(mutants);
+  if (forB.length > 0) {
+    console.log(`L5: pass B (integration tests that import them, then every child scenario) on ${forB.length} survivor(s)`);
+    const b = { buildCommand: 'node test/helpers/build.cjs', checkers: [], dryRunTimeoutMinutes: 15 };
+    await passOn('b', 'b', forB, { ...b, concurrency: Math.max(1, Math.floor(opts.concurrency / 2)), timeoutMS: 60_000, timeoutFactor: 2 });
+    const confirmB = toConfirm(mutants, 'b');
+    if (confirmB.length > 0) {
+      console.log(`L5: pass B again, one at a time, on ${confirmB.length} timeout(s)`);
+      await passOn('b2', 'b', confirmB, { ...b, concurrency: 1, timeoutMS: 180_000, timeoutFactor: 4 });
     }
   }
+  finish();
+} catch (error) {
+  finish(error instanceof PassError ? error.message.split('\n') : [`the gate stopped: ${error instanceof Error ? error.message.split('\n')[0] : String(error)}`]);
 }
-
-// The verdict: a gating mutant must end Killed (or Timeout, listed apart) with
-// a kill that is not the machine's alone.
-/** @param {MutantRecord} m */
-const final = m => (m.b ?? m.a);
-/** @param {MutantRecord} m */
-const statusOf = m => (final(m).inconclusive ? 'Inconclusive' : final(m).status);
-const gating = mutants.filter(m => m.gating);
-const context = mutants.filter(m => !m.gating);
-const failing = gating.filter(m => ['Survived', 'NoCoverage', 'Missing', 'Inconclusive'].includes(statusOf(m)));
-/** @param {MutantRecord} m */
-const where = m => `${m.file}:${m.location.start.line}:${m.location.start.column}`;
-/** @param {MutantRecord} m */
-const show = m => `  ${where(m)} ${m.mutator}: \`${m.original}\` -> \`${m.replacement}\`${final(m).inconclusive ? ` (${final(m).inconclusive})` : ''}`;
-/** @param {MutantRecord[]} list */
-const tally = list => ['Killed', 'Timeout', 'Survived', 'NoCoverage', 'Inconclusive', 'Missing', 'CompileError', 'RuntimeError', 'Ignored']
-  .map(status => `${list.filter(m => statusOf(m) === status).length} ${status}`).filter(entry => !entry.startsWith('0 ')).join(', ') || 'none';
-/**
- * @param {string} title
- * @param {MutantRecord[]} list
- */
-const section = (title, list) => (list.length > 0 ? [title, ...list.map(show)] : []);
-
-const verdict = failing.length === 0 ? 'PASS' : 'FAIL';
-const summary = [
-  `L5 touched-line mutation, ${stamp}`,
-  `Scope: ${scope}`,
-  `Mutated: ${files.length > 0 ? files.join(', ') : 'nothing'}`,
-  ...(skipped.length > 0 ? ['Not mutated:', ...skipped.map(s => `  ${s.file}: ${s.why}`)] : []),
-  `Gating mutants (they touch a changed line): ${gating.length}: ${tally(gating)}`,
-  `  killed in pass A: ${gating.filter(m => m.a.status === 'Killed' && !m.a.inconclusive && !m.b).length}; sent to pass B: ${gating.filter(m => m.b).length}, killed there: ${gating.filter(m => m.b && m.b.status === 'Killed' && !m.b.inconclusive).length}`,
-  ...section('Survivors (each needs a test that kills it, or a justification in the notes):', gating.filter(m => ['Survived', 'NoCoverage', 'Missing'].includes(statusOf(m)))),
-  ...section('Inconclusive (the kill came from the machine alone; rerun):', gating.filter(m => statusOf(m) === 'Inconclusive')),
-  ...section('Timeouts (counted as killed; a slow host can cause one):', gating.filter(m => statusOf(m) === 'Timeout')),
-  `Context mutants (in the widened statements, not on a changed line; not gating): ${context.length}: ${tally(context)}`,
-  ...section('Context survivors:', context.filter(m => statusOf(m) === 'Survived')),
-  `Report: ${posix(path.relative(root, reportDir))} (mutants.json has every mutant, its passes and what killed it)`,
-  `Verdict: ${verdict}`,
-];
-fs.writeFileSync(path.join(reportDir, 'mutants.json'), `${JSON.stringify({ scope, files, skipped, targets, mutants, verdict }, null, 2)}\n`);
-fs.writeFileSync(path.join(reportDir, 'summary.txt'), `${summary.join('\n')}\n`);
-console.log(summary.join('\n'));
-process.exit(verdict === 'PASS' ? 0 : 1);

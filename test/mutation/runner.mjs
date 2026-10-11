@@ -27,7 +27,9 @@ function tier(project, args) {
   const base = path.join(out, `${mutant}-${project}`);
   const log = fs.openSync(`${base}.log`, 'w');
   try {
-    const run = spawnSync(process.execPath, [vitest, ...args, '--bail=1', '--project', project, '--reporter=json', `--outputFile=${base}.json`], {
+    // One worker per run: Stryker already runs several at once, and a run's
+    // time must match the run with no mutant it is timed against.
+    const run = spawnSync(process.execPath, [vitest, ...args, '--bail=1', '--maxWorkers=1', '--project', project, '--reporter=json', `--outputFile=${base}.json`], {
       cwd: testDir,
       stdio: ['ignore', log, log],
     });

@@ -9,7 +9,8 @@ const src = path.join(repo, 'src');
 // The tiers are projects so a run can pick one (the mutation passes do, see
 // mutation/README.md): fast takes every test file outside the other two, so a
 // new directory is never left out; integration needs Docker; child runs real
-// processes on a dist that its globalSetup builds when src has changed.
+// processes on a dist that its globalSetup rebuilds unless it holds a build of
+// exactly this src (helpers/build.cjs).
 const SLOW = ['integration/**', 'child/**'];
 
 // Mirrors the paths of the root tsconfig.json; the exact @bot/types entry

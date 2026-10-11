@@ -83,11 +83,16 @@ export function mergeRanges(ranges) {
   return out;
 }
 
-// Nodes that hold statements: a range never takes one whole because one of
-// its lines changed.
-const CONTAINERS = new Set([
-  ts.SyntaxKind.SourceFile, ts.SyntaxKind.Block, ts.SyntaxKind.ModuleBlock, ts.SyntaxKind.CaseBlock,
-  ts.SyntaxKind.ClassDeclaration, ts.SyntaxKind.ClassExpression,
+// Statement lists in braces: a line wholly inside one widens by the statements in it.
+const CONTAINERS = new Set([ts.SyntaxKind.Block, ts.SyntaxKind.ModuleBlock, ts.SyntaxKind.CaseBlock]);
+// Statements and declarations whose parts (a condition, the parameters, a
+// catch variable) widen apart from the bodies they hold.
+const COMPOUND = new Set([
+  ts.SyntaxKind.IfStatement, ts.SyntaxKind.DoStatement, ts.SyntaxKind.WhileStatement, ts.SyntaxKind.ForStatement,
+  ts.SyntaxKind.ForInStatement, ts.SyntaxKind.ForOfStatement, ts.SyntaxKind.SwitchStatement, ts.SyntaxKind.TryStatement,
+  ts.SyntaxKind.CatchClause, ts.SyntaxKind.LabeledStatement, ts.SyntaxKind.WithStatement, ts.SyntaxKind.FunctionDeclaration,
+  ts.SyntaxKind.ClassDeclaration, ts.SyntaxKind.MethodDeclaration, ts.SyntaxKind.Constructor, ts.SyntaxKind.GetAccessor,
+  ts.SyntaxKind.SetAccessor, ts.SyntaxKind.ModuleDeclaration, ts.SyntaxKind.ClassStaticBlockDeclaration,
 ]);
 
 /** @param {string} file */
@@ -98,51 +103,97 @@ function scriptKind(file) {
 }
 
 /**
- * The line spans of the outermost nodes that hold no container: a whole
- * statement, or the condition or parameters of one that holds a block.
- * @param {string} file
- * @param {string} text
+ * The spans one line widens to: the statement it sits in, or the part of a
+ * compound statement it sits in (a condition, a signature), taken whole even
+ * when a block-bodied callback sits inside it, so every mutant of a changed
+ * operator, condition or call exists. A body is never taken because its
+ * header line changed: a line wholly inside a body widens within that body.
+ * @param {ts.SourceFile} sf
+ * @param {number} line 1-based
  * @returns {Range[]}
  */
-export function blockFreeSpans(file, text) {
-  const sf = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true, scriptKind(file));
+function unitsOf(sf, line) {
+  const starts = sf.getLineStarts();
+  const lineStart = starts[line - 1];
+  const code = sf.text.slice(lineStart, line < starts.length ? starts[line] : sf.text.length);
+  const first = code.search(/\S/);
+  if (first < 0) return [];
+  const span = { start: lineStart + first, end: lineStart + code.trimEnd().length };
   /** @param {number} pos */
   const lineOf = pos => sf.getLineAndCharacterOfPosition(pos).line + 1;
   /** @type {Range[]} */
-  const spans = [];
+  const units = [];
+  /** @param {ts.Node} node */
+  const overlaps = node => node.getStart(sf) < span.end && node.getEnd() > span.start;
+  /** @param {ts.Node} node */
+  const holdsLine = node => CONTAINERS.has(node.kind) && node.getStart(sf) < span.start && span.end < node.getEnd();
   /**
+   * The innermost statement list below node whose braces hold the whole line.
    * @param {ts.Node} node
-   * @returns {boolean}
+   * @returns {ts.Node | null}
    */
-  const holdsContainer = node => {
-    /** @type {ts.Node[]} */
-    const children = [];
-    ts.forEachChild(node, child => { children.push(child); });
-    const held = children.map(holdsContainer);
-    const holds = CONTAINERS.has(node.kind) || held.some(Boolean);
-    if (holds) children.forEach((child, i) => { if (!held[i]) spans.push([lineOf(child.getStart(sf)), lineOf(child.getEnd())]); });
-    return holds;
+  const innermost = node => {
+    /** @type {ts.Node | null} */
+    let found = null;
+    ts.forEachChild(node, child => {
+      if (found || child.getStart(sf) > span.start || child.getEnd() < span.end) return;
+      found = innermost(child) ?? (holdsLine(child) ? child : null);
+    });
+    return found;
   };
-  holdsContainer(sf);
-  return spans;
+  /** @param {ts.Node} node */
+  const visit = node => {
+    ts.forEachChild(node, child => {
+      if (!overlaps(child)) return;
+      if (CONTAINERS.has(child.kind) || COMPOUND.has(child.kind)) { visit(child); return; }
+      const inner = innermost(child);
+      if (inner) visit(inner);
+      else units.push([lineOf(child.getStart(sf)), lineOf(child.getEnd())]);
+    });
+  };
+  visit(sf);
+  return units;
 }
 
 /**
- * Each line widens to the block-free spans that cross it, so a mutant of a
- * whole multi-line condition or statement exists when one of its lines
- * changed, without the body that condition guards.
- * @param {Range[]} spans
+ * The merged ranges for a file's changed lines (each line itself, plus what it widens to).
+ * @param {string} file
+ * @param {string} text
  * @param {number[]} lines
  * @returns {Range[]}
  */
-export function widen(spans, lines) {
+export function widen(file, text, lines) {
+  const sf = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true, scriptKind(file));
   /** @type {Range[]} */
   const ranges = [];
-  for (const line of lines) {
-    ranges.push([line, line]);
-    for (const span of spans) if (span[0] <= line && line <= span[1]) ranges.push([span[0], span[1]]);
-  }
+  for (const line of lines) ranges.push([line, line], ...unitsOf(sf, line));
   return mergeRanges(ranges);
+}
+
+/**
+ * The lines that hold code (a statement or part of one), leaving out blank,
+ * comment-only and brace-only lines, which no mutant could touch.
+ * @param {string} file
+ * @param {string} text
+ * @param {number[]} lines
+ */
+export function codeLines(file, text, lines) {
+  const sf = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true, scriptKind(file));
+  return lines.filter(line => line >= 1 && line <= sf.getLineStarts().length && unitsOf(sf, line).length > 0);
+}
+
+/**
+ * git arguments for the diff of src from base to the working tree, with every
+ * option a user's config could change set here: the path prefixes, rename and
+ * copy detection, hunk joining, relative paths, colour, external diff tools.
+ * @param {string} base
+ */
+export function diffArgs(base) {
+  return [
+    '-c', 'core.quotePath=false', '-c', 'diff.noprefix=false', '-c', 'diff.mnemonicPrefix=false', '-c', 'diff.renames=true',
+    'diff', '-U0', '--inter-hunk-context=0', '--src-prefix=a/', '--dst-prefix=b/', '--no-relative', '--no-color',
+    '--no-ext-diff', '--no-textconv', '--diff-filter=ACMR', base, '--', 'src',
+  ];
 }
 
 /**
@@ -167,7 +218,7 @@ export function planTargets({ diff, untracked, read }) {
     const neighbours = entry.deletedAfter.flatMap(n => [n, n + 1]).filter(n => n >= 1 && n <= lineCount);
     const lines = [...new Set([...entry.changed, ...neighbours])];
     if (lines.length === 0) { skipped.push({ file: entry.file, why: 'no changed lines (a rename or a mode change)' }); continue; }
-    targets.push({ file: entry.file, ranges: widen(blockFreeSpans(entry.file, text), lines), gating: [...new Set(entry.changed)].sort((a, b) => a - b) });
+    targets.push({ file: entry.file, ranges: widen(entry.file, text, lines), gating: [...new Set(entry.changed)].sort((a, b) => a - b) });
   }
   for (const file of untracked) {
     const why = notMutated(file);

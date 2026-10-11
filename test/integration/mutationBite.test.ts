@@ -18,7 +18,7 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '.
 const TARGET = 'src/bot/internalSetup/fleet/nodeIdentity.ts';
 
 interface Pass { status: string; killedBy?: string; inconclusive?: string }
-interface Mutant { location: { start: { line: number } }; mutator: string; original: string; a: Pass; b: Pass | null }
+interface Mutant { location: { start: { line: number } }; mutator: string; original: string; passes: { a: Pass; b?: Pass } }
 
 function lineOf(text: string): number {
   const index = fs.readFileSync(path.join(root, TARGET), 'utf8').split('\n').findIndex(line => line.includes(text));
@@ -39,24 +39,44 @@ describe('the touched-line mutation gate', () => {
     const reportDir = /^Report: (\S+)/m.exec(run.stdout)?.[1];
     expect(reportDir, `${run.stdout}\n${run.stderr}`).toBeDefined();
     const { mutants } = JSON.parse(fs.readFileSync(path.join(root, reportDir!, 'mutants.json'), 'utf8')) as { mutants: Mutant[] };
-    const on = (line: number) => mutants.filter(m => m.location.start.line === line && m.a.status !== 'CompileError');
+    const on = (line: number) => mutants.filter(m => m.location.start.line === line && m.passes.a.status !== 'CompileError');
 
     const equivalent = (m: Mutant) => m.mutator === 'StringLiteral' && m.original === "''";
     expect(on(fast).filter(equivalent)).toHaveLength(1);
     for (const m of on(fast).filter(m => !equivalent(m))) {
-      expect(m.a, `${m.mutator} ${m.original}`).toMatchObject({ status: 'Killed', killedBy: expect.stringMatching(/^unit\/backupMode\.test\.ts > /) });
+      expect(m.passes.a, `${m.mutator} ${m.original}`).toMatchObject({ status: 'Killed', killedBy: expect.stringMatching(/^unit\/backupMode\.test\.ts > /) });
     }
-    expect(on(fast).filter(equivalent)[0]).toMatchObject({ a: { status: 'Survived' }, b: { status: 'Survived' } });
+    expect(on(fast).filter(equivalent)[0]).toMatchObject({ passes: { a: { status: 'Survived' }, b: { status: 'Survived' } } });
 
     expect(on(child).length).toBeGreaterThan(0);
     for (const m of on(child)) {
-      expect(m.a.status, `${m.mutator} ${m.original}`).toBe('Survived');
-      expect(m.b, `${m.mutator} ${m.original}`).toMatchObject({ status: 'Killed', killedBy: expect.stringMatching(/^child\/fleetIdentity\.test\.ts > /) });
+      expect(m.passes.a.status, `${m.mutator} ${m.original}`).toBe('Survived');
+      expect(m.passes.b, `${m.mutator} ${m.original}`).toMatchObject({ status: 'Killed', killedBy: expect.stringMatching(/^child\/fleetIdentity\.test\.ts > /) });
     }
 
     expect(run.status).toBe(1);
     expect(run.stdout).toMatch(/^Survivors .*\n {2}src\/bot\/internalSetup\/fleet\/nodeIdentity\.ts:\d+:\d+ StringLiteral: `''`/m);
     expect(run.stdout).toMatch(/^Verdict: FAIL$/m);
     fs.rmSync(path.join(root, reportDir!), { recursive: true, force: true });
+  });
+
+  it('has no result, exit 2, when its base is unknown or its patterns make no mutant', { timeout: 300_000 }, () => {
+    const gate = (...args: string[]) => spawnSync(process.execPath, [path.join(root, 'test', 'mutation', 'touched.mjs'), ...args], { cwd: root, encoding: 'utf8', timeout: 280_000 });
+    const clean = (stdout: string) => {
+      const dir = /^Report: (\S+)/m.exec(stdout)?.[1];
+      if (dir) fs.rmSync(path.join(root, dir), { recursive: true, force: true });
+    };
+
+    const unknown = gate('--base', 'no-such-ref-anywhere');
+    clean(unknown.stdout);
+    expect(unknown.status, unknown.stderr).toBe(2);
+    expect(unknown.stdout).toMatch(/^Stopped:\n {2}the gate stopped: Command failed: git .*merge-base no-such-ref-anywhere HEAD/m);
+    expect(unknown.stdout).toMatch(/^Verdict: NO RESULT \(the gate stopped before it finished\)$/m);
+
+    const nothing = gate('--mutate', 'src/no/such/file.ts:1-5', '--concurrency', '1');
+    clean(nothing.stdout);
+    expect(nothing.status, nothing.stderr).toBe(2);
+    expect(nothing.stdout).toMatch(/^Patterns that made no mutant:\n {2}src\/no\/such\/file\.ts:1-5$/m);
+    expect(nothing.stdout).toMatch(/^Verdict: NO RESULT \(no gating mutant was made/m);
   });
 });
