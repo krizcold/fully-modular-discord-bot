@@ -309,7 +309,7 @@ describe('the widening, against what Stryker makes', () => {
     expect(untouched('src/a.ts', text, Array.from({ length: 10 }, (_, i) => i + 1), spansOf(whole))).toEqual([1, 2, 3, 4]);
   });
 
-  it('names the lines after the first of an emptied object, array or arrow body, and of a condition split over lines', async () => {
+  it('names every line no mutant lies wholly on: an emptied object, array or arrow body, a split condition, a chained call', async () => {
     const text = [
       'export function names(items: { id: string; title: string }[]) {',
       '  return items.map(item => ({',
@@ -327,12 +327,23 @@ describe('the widening, against what Stryker makes', () => {
       '];',
       'export const ready = isReady() &&',
       '  hasLease();',
+      'export function pick(rows: { ok: boolean }[], other: { ok: boolean }[]) {',
+      '  const ready = other',
+      '    .filter(r => r.ok)',
+      '    .sort();',
+      '  return ready;',
+      '}',
+      'export const config = Object.freeze({',
+      '  retries: 3,',
+      '});',
       '',
     ].join('\n');
     const whole = await made(text, true);
     expect(whole.map(m => `${m.mutatorName} ${m.location.start.line + 1}-${m.location.end.line + 1}`)).toEqual(expect.arrayContaining(
-      ['ArrowFunction 2-5', 'ObjectLiteral 2-5', 'ObjectLiteral 7-10', 'ArrayDeclaration 11-14', 'LogicalOperator 15-16']));
-    expect(untouched('src/a.ts', text, Array.from({ length: 17 }, (_, i) => i + 1), spansOf(whole))).toEqual([1, 3, 4, 8, 9, 12, 13, 16]);
+      ['ArrowFunction 2-5', 'ObjectLiteral 2-5', 'ObjectLiteral 7-10', 'ArrayDeclaration 11-14', 'LogicalOperator 15-16', 'MethodExpression 18-20',
+        'ArrowFunction 19-19', 'ObjectLiteral 23-25']));
+    expect(untouched('src/a.ts', text, Array.from({ length: 26 }, (_, i) => i + 1), spansOf(whole)))
+      .toEqual([1, 2, 3, 4, 7, 8, 9, 11, 12, 13, 15, 16, 17, 18, 20, 21, 23, 24]);
   });
 });
 

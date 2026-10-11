@@ -2,13 +2,13 @@
 // the report dir in the env; Stryker adds the active mutant). It runs vitest on
 // this tree's own tests: pass a, the fast tier's tests that import the mutated
 // files; pass b, the integration tests that import them, then the whole child
-// tier. A run stops at its first failure, except a rerun alone
-// (SMDB_MUTATION_CONFIRM=1), which runs every test of both tiers, so the order
-// vitest picks cannot decide what it finds, and gives every test four times its
-// time (SMDB_TEST_TIME_SCALE, read by vitest.config.ts and helpers/child.ts).
-// Vitest's output goes to files, one JSON report and one log per run, because
-// Stryker buffers what a command prints with Node's 1 MB exec limit and an
-// overflow would end the run and count as a kill.
+// tier; or only the test files SMDB_MUTATION_ONLY names (the rerun of a pass B
+// kill with the file that killed it), each in its tier. Every run stops at its
+// first failure. A rerun alone (SMDB_MUTATION_CONFIRM=1) gives every test four
+// times its time (SMDB_TEST_TIME_SCALE, read by vitest.config.ts and
+// helpers/child.ts). Vitest's output goes to files, one JSON report and one log
+// per run, because Stryker buffers what a command prints with Node's 1 MB exec
+// limit and an overflow would end the run and count as a kill.
 import { spawnSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
@@ -22,6 +22,8 @@ const confirm = process.env.SMDB_MUTATION_CONFIRM === '1';
 const pass = process.env.SMDB_MUTATION_PASS;
 /** @type {string[]} */
 const files = JSON.parse(process.env.SMDB_MUTATION_FILES ?? '[]').map((/** @type {string} */ file) => path.join(root, file));
+/** @type {string[]} test files, relative to test/ */
+const only = JSON.parse(process.env.SMDB_MUTATION_ONLY || '[]');
 const out = process.env.SMDB_MUTATION_OUT ?? '';
 const mutant = process.env.__STRYKER_ACTIVE_MUTANT__ ?? 'dry';
 
@@ -35,7 +37,7 @@ function tier(project, args) {
   try {
     // One worker per run: Stryker already runs several at once, and a run's
     // time must match the run with no mutant it is timed against.
-    const run = spawnSync(process.execPath, [vitest, ...args, ...(confirm ? [] : ['--bail=1']), '--maxWorkers=1', '--project', project, '--reporter=json', `--outputFile=${base}.json`], {
+    const run = spawnSync(process.execPath, [vitest, ...args, '--bail=1', '--maxWorkers=1', '--project', project, '--reporter=json', `--outputFile=${base}.json`], {
       cwd: testDir,
       stdio: ['ignore', log, log],
       env: { ...process.env, SMDB_TEST_TIME_SCALE: confirm ? '4' : '1' },
@@ -46,11 +48,19 @@ function tier(project, args) {
   }
 }
 
+/** @param {string} file */
+const projectOf = file => (file.startsWith('integration/') ? 'integration' : file.startsWith('child/') ? 'child' : 'fast');
+
 if (!out || files.length === 0 || (pass !== 'a' && pass !== 'b')) {
   console.error('runner.mjs is run by touched.mjs, which sets SMDB_MUTATION_PASS, SMDB_MUTATION_FILES and SMDB_MUTATION_OUT');
   process.exit(2);
 }
+if (only.length > 0) {
+  for (const project of ['fast', 'integration', 'child']) {
+    const these = only.filter(file => projectOf(file) === project);
+    if (these.length > 0 && tier(project, ['run', ...these])) process.exit(1);
+  }
+  process.exit(0);
+}
 const related = ['related', ...files, '--run'];
-if (pass === 'a') process.exit(tier('fast', related));
-const integration = tier('integration', related);
-process.exit(integration && !confirm ? integration : integration | tier('child', ['run']));
+process.exit(pass === 'a' ? tier('fast', related) : tier('integration', related) || tier('child', ['run']));

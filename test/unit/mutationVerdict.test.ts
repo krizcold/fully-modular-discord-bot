@@ -3,7 +3,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { describe, expect, it, onTestFinished } from 'vitest';
-import { classifyKill, confirmed, judge, outcome, toConfirm, toPassB, type MutantRecord, type PassResult } from '../mutation/verdict.mjs';
+import { byKiller, classifyKill, confirmed, judge, outcome, toConfirm, toPassB, type MutantRecord, type PassResult } from '../mutation/verdict.mjs';
 
 // What the L5 gate concludes (mutation/README.md): when a run counts as a
 // kill, which mutants go to which pass, and the verdict.
@@ -25,6 +25,7 @@ const FIXTURES: Record<string, string> = {
   'notQueryable.test.mjs': "it('queries', () => { throw new Error('Client has encountered a connection error and is not queryable'); });",
   'childFault.test.mjs': "it('survives a full disk', () => { throw new Error('scenario diskFull.cjs step2 exited 1 with no RESULT line\\nError: ENOSPC: no space left on device'); });",
   'assertsOnError.test.mjs': "it('classifies a refusal', () => { expect('connect ECONNREFUSED 10.0.0.2:5432').toBe('unreachable'); });",
+  'stepBound.test.mjs': "it('restarts', () => { throw new Error('scenario fleetIdentity.cjs read did not finish in 20000 ms\\nwaiting for the lease'); });",
 };
 
 describe('a run Stryker counted as a kill', () => {
@@ -50,6 +51,14 @@ describe('a run Stryker counted as a kill', () => {
     // and an assertion may name an error as the value under test: both are kills.
     expect(of('childFault.test.mjs')).toEqual({ killedBy: expect.stringMatching(/childFault\.test\.mjs > survives a full disk$/) });
     expect(of('assertsOnError.test.mjs')).toEqual({ killedBy: expect.stringMatching(/assertsOnError\.test\.mjs > classifies a refusal$/) });
+    // A child step's own bound is the test's assertion that the step ends.
+    expect(of('stepBound.test.mjs')).toEqual({ killedBy: expect.stringMatching(/stepBound\.test\.mjs > restarts$/) });
+    // A run is a timeout only when every failure timed out: a machine failure
+    // beside a timeout, in another tier's report or at file level, proves nothing.
+    const ofAll = (...names: string[]) => classifyKill(names.map(name => ({ testResults: report.testResults.filter(file => file.name.endsWith(name)) as never })));
+    expect(ofAll('hang.test.mjs', 'hookHang.test.mjs')).toEqual({ timeout: expect.stringMatching(/hang\.test\.mjs > answers$/) });
+    expect(ofAll('connectionDrop.test.mjs', 'hang.test.mjs')).toEqual({ inconclusive: 'a test timed out while the machine failed: Error: Connection terminated unexpectedly' });
+    expect(ofAll('containerStart.test.mjs', 'hang.test.mjs')).toEqual({ inconclusive: expect.stringMatching(/^a test timed out while the machine failed: .*Health check not healthy/) });
     expect(classifyKill([])).toEqual({ inconclusive: 'no vitest report was written' });
   });
 });
@@ -74,8 +83,9 @@ describe('the passes a mutant goes through', () => {
     const confirmedSurvivor = mutant(6, true, { a: pass('Timeout'), a2: pass('Survived') });
     expect(toPassB([confirmedSurvivor])).toEqual([confirmedSurvivor]);
     const killedInB = mutant(7, true, { a: pass('Survived'), b: pass('Killed', { killedBy: 'child > x' }) });
-    expect(toConfirm([mutant(8, true, { a: pass('Survived'), b: pass('Timeout') })], 'b')).toHaveLength(1);
-    // Pass B's kills must repeat alone; pass A's need not.
+    // Pass B's kills must repeat alone; pass A's need not; a hang in pass B is never rerun.
+    expect(toConfirm([mutant(8, true, { a: pass('Survived'), b: pass('Timeout') })], 'b')).toEqual([]);
+    expect(toConfirm([mutant(8, true, { a: pass('Survived'), b: pass('Killed', { timeout: 'child > x' }) })], 'b')).toEqual([]);
     expect(toConfirm([killedInB], 'b')).toEqual([killedInB]);
     expect(toConfirm([killed], 'a')).toEqual([]);
     const flake = mutant(9, true, { a: pass('Survived'), b: pass('Killed', { killedBy: 'x' }), b2: pass('Survived') });
@@ -88,11 +98,17 @@ describe('the passes a mutant goes through', () => {
     expect(outcome(b(pass('Killed', { timeout: 'child/y.test.ts > y' })))).toBe('Inconclusive');
     expect(outcome(b(pass('Timeout')))).toBe('Inconclusive');
     expect(outcome(b())).toBe('Inconclusive');
-    const hungInB = (b2: PassResult) => mutant(1, true, { a: pass('Survived'), b: pass('Timeout'), b2 });
-    expect(outcome(hungInB(pass('Timeout')))).toBe('Timeout');
-    expect(outcome(hungInB(pass('Killed', { killedBy: 'child/y.test.ts > y' })))).toBe('Killed');
+    for (const hang of [pass('Timeout'), pass('Killed', { timeout: 'child/y.test.ts > y' })]) {
+      expect(confirmed(mutant(1, true, { a: pass('Survived'), b: hang }))).toEqual({ outcome: 'Inconclusive', why: 'hung in pass B, where a hang is not counted' });
+    }
     expect(outcome(mutant(1, true, { a: pass('Timeout') }))).toBe('Inconclusive');
     expect(outcome(mutant(1, false, { a: pass('Timeout') }))).toBe('Timeout');
+  });
+
+  it('reruns each pass B kill with the test file that killed it', () => {
+    const by = (file: string) => mutant(1, true, { a: pass('Survived'), b: pass('Killed', { killedBy: `${file} > the role override > keeps it` }) });
+    const [one, two, three] = [by('child/fleetIdentity.test.ts'), by('integration/store.test.ts'), by('child/fleetIdentity.test.ts')];
+    expect([...byKiller([one, two, three])]).toEqual([['child/fleetIdentity.test.ts', [one, three]], ['integration/store.test.ts', [two]]]);
   });
 
   it('counts nothing a rerun found when the run with no mutant after it failed', () => {
@@ -162,6 +178,12 @@ describe('the verdict', () => {
     expect(text).toContain('  src/webui/public/app.jsx: a browser view');
     expect(text).toContain('  src/missing.ts:1-2');
     expect(text).toContain('  src/a.ts: 4, 9');
+  });
+
+  it('has no result when a test replaced vitest, whatever the mutants did', () => {
+    const result = run([mutant(1, true, { a: pass('Killed', { killedBy: 'x' }) })], { standIn: '/tmp/vitest.cjs' });
+    expect(result).toMatchObject({ verdict: 'NO RESULT', code: 2 });
+    expect(result.lines.at(-1)).toBe("Verdict: NO RESULT (vitest was replaced by a test's stand-in (SMDB_MUTATION_VITEST=/tmp/vitest.cjs))");
   });
 
   it('has no result when the gate stopped before it finished, and still reports the passes it finished', () => {

@@ -24,8 +24,11 @@ export const INFRASTRUCTURE = new RegExp([
   'the database system is', 'Health check not healthy', 'Wait strategy', 'waiting for container', 'Container failed to start',
   'container runtime', 'HTTP code 5\\d\\d', 'toomanyrequests',
 ].join('|'));
-// A test or its hook that ran out of time: the mutant may hang it, or the host was slow.
-export const TIMEOUT = /(Test|Hook) timed out in \d+ ?ms|did not finish in \d+ ms/;
+// A test or its hook that ran out of vitest's time: the mutant may hang it, or
+// the host was slow. A child scenario step's own bound ("did not finish in N
+// ms", helpers/child.ts) is not one: it is the test's assertion that the step
+// ends, and fails like any other.
+export const TIMEOUT = /(Test|Hook) timed out in \d+ ?ms/;
 
 /** @param {string} name */
 const testFile = name => name.split('\\').join('/').replace(/^.*\/\.stryker-tmp\/sandbox-[^/]+\/test\//, '');
@@ -35,9 +38,10 @@ const firstLine = text => text.split('\n')[0];
 /**
  * What a run that Stryker counted as a kill shows, from the vitest reports it
  * left: a kill only when a test itself failed for a reason other than the
- * machine; a run whose failing tests all timed out is a timeout; anything
+ * machine; a timeout only when every failing test timed out and nothing else
+ * failed for the machine (a file that could not start included); anything
  * else (no report, a failure in a hook or at file level, an unhandled error,
- * only machine failures) proves nothing.
+ * a machine failure) proves nothing.
  * @param {{ testResults?: FileReport[] }[]} reports
  * @returns {{ killedBy: string } | { timeout: string } | { inconclusive: string }}
  */
@@ -45,17 +49,18 @@ export function classifyKill(reports) {
   if (reports.length === 0) return { inconclusive: 'no vitest report was written' };
   /** @type {{ test: string, message: string }[]} */
   const failed = [];
-  let fileMessage = '';
+  /** @type {string[]} */
+  const fileMessages = [];
   for (const report of reports) {
     for (const file of report.testResults ?? []) {
-      if (file.status === 'failed' && file.message && !fileMessage) fileMessage = firstLine(file.message);
+      if (file.status === 'failed' && file.message) fileMessages.push(firstLine(file.message));
       for (const test of file.assertionResults ?? []) {
         if (test.status === 'failed') failed.push({ test: `${testFile(file.name)} > ${test.fullName}`, message: (test.failureMessages ?? []).join('\n') });
       }
     }
   }
   if (failed.length === 0) {
-    return { inconclusive: `no test failed: the run failed in a hook, at file level or on an unhandled error${fileMessage ? ` (${fileMessage})` : ''}` };
+    return { inconclusive: `no test failed: the run failed in a hook, at file level or on an unhandled error${fileMessages[0] ? ` (${fileMessages[0]})` : ''}` };
   }
   /** @param {{ message: string }} f */
   const assertion = f => f.message.startsWith('AssertionError');
@@ -65,9 +70,10 @@ export function classifyKill(reports) {
   const timedOutTest = f => !assertion(f) && TIMEOUT.test(firstLine(f.message));
   const real = failed.find(f => !machine(f) && !timedOutTest(f));
   if (real) return { killedBy: real.test };
+  const machineText = [...failed.filter(machine).map(f => firstLine(f.message)), ...fileMessages.filter(text => INFRASTRUCTURE.test(text))][0];
   const timedOut = failed.find(timedOutTest);
-  if (timedOut) return { timeout: timedOut.test };
-  return { inconclusive: `only the machine failed: ${firstLine(failed[0].message)}` };
+  if (timedOut && machineText === undefined) return { timeout: timedOut.test };
+  return { inconclusive: timedOut ? `a test timed out while the machine failed: ${machineText}` : `only the machine failed: ${firstLine(failed[0].message)}` };
 }
 
 /**
@@ -84,10 +90,11 @@ export const latest = m => /** @type {PassResult} */ (m.passes.b2 ?? m.passes.b 
 
 /**
  * A mutant's outcome, counting for a gating one only what its rerun alone
- * confirmed: a timeout counts when the rerun hangs too or fails a test, and a
- * pass B kill only when the rerun fails a test again (a hang is not the same
- * evidence). One the gate never reran, or whose rerun was voided (the run with
- * no mutant after it failed), is inconclusive.
+ * confirmed. In pass A a timeout counts when the rerun hangs too or fails a
+ * test. In pass B, where containers and children can be slow on their own, a
+ * hang never counts, and a kill counts only when the test file that killed it
+ * fails for it again when run alone. One the gate never reran, or whose rerun
+ * was voided (the run with no mutant after it failed), is inconclusive.
  * @param {MutantRecord} m
  * @returns {{ outcome: string, why?: string }}
  */
@@ -97,10 +104,9 @@ export function confirmed(m) {
   if (!m.gating || (last !== 'Killed' && last !== 'Timeout')) return { outcome: last };
   const { voided } = latest(m);
   if (voided) return { outcome: 'Inconclusive', why: voided };
-  if (b2 && b && outcomeOf(b) === 'Killed' && last === 'Timeout') {
-    return { outcome: 'Inconclusive', why: `killed in pass B by ${b.killedBy}, but hung instead of failing when run alone` };
-  }
-  if (b && !b2) return { outcome: 'Inconclusive', why: last === 'Killed' ? 'killed in pass B, never rerun alone' : 'timed out, never rerun alone' };
+  if (b && outcomeOf(b) === 'Timeout') return { outcome: 'Inconclusive', why: 'hung in pass B, where a hang is not counted' };
+  if (b2 && last === 'Timeout') return { outcome: 'Inconclusive', why: `killed in pass B by ${b?.killedBy}, but hung instead of failing when run alone` };
+  if (b && !b2) return { outcome: 'Inconclusive', why: 'killed in pass B, never rerun alone' };
   if (!b && !a2 && last === 'Timeout') return { outcome: 'Inconclusive', why: 'timed out, never rerun alone' };
   return { outcome: last };
 }
@@ -112,17 +118,32 @@ export const FAILING = ['Survived', 'NoCoverage', 'Missing', 'Inconclusive', 'Ru
 
 /**
  * The gating mutants a pass sends to a confirming run of their own (one at a
- * time, with a larger budget): its timeouts, which count as kills only when the
- * mutant hangs the tests alone too, and in pass B its kills as well, which
- * count only when a test fails for the mutant again.
+ * time, with four times the time): pass A's timeouts, which count as kills only
+ * when the mutant hangs the tests alone too, and pass B's kills, which count
+ * only when the test file that killed them fails for them again.
  * @param {MutantRecord[]} mutants
  * @param {'a' | 'b'} pass
  */
 export const toConfirm = (mutants, pass) => mutants.filter(m => {
   const result = m.passes[pass];
   const status = result && outcomeOf(result);
-  return m.gating && (status === 'Timeout' || (pass === 'b' && status === 'Killed'));
+  return m.gating && status === (pass === 'a' ? 'Timeout' : 'Killed');
 });
+
+/**
+ * Pass B's confirmed kills by the test file that killed each, in order: each
+ * file reruns alone on its own mutants.
+ * @param {MutantRecord[]} mutants
+ */
+export function byKiller(mutants) {
+  /** @type {Map<string, MutantRecord[]>} */
+  const groups = new Map();
+  for (const m of mutants) {
+    const file = (m.passes.b?.killedBy ?? '').split(' > ')[0];
+    groups.set(file, [...(groups.get(file) ?? []), m]);
+  }
+  return groups;
+}
 
 /**
  * The gating mutants pass B takes: the ones no in-process test killed.
@@ -135,8 +156,11 @@ export const toPassB = mutants => mutants.filter(m => m.gating && ['Survived', '
  * `stopped` names why the gate stopped before it finished (a pass that could
  * not run); the passes it did finish are still reported.
  * `controls` names the runs with no mutant made after the reruns, each passed.
+ * `standIn` is set when a test replaced vitest (runner.mjs's
+ * SMDB_MUTATION_VITEST): such a run proves nothing about the code.
  * @param {{ stamp: string, scope: string, emptyScope: boolean, skipped: { file: string, why: string }[], mutants: MutantRecord[],
- *   noMutant: { file: string, lines: number[] }[], unmatched: string[], report: string, stopped?: string[], controls?: string[] }} run
+ *   noMutant: { file: string, lines: number[] }[], unmatched: string[], report: string, stopped?: string[], controls?: string[],
+ *   standIn?: string }} run
  * @returns {{ verdict: 'PASS' | 'FAIL' | 'NO RESULT', code: 0 | 1 | 2, lines: string[] }}
  */
 export function judge(run) {
@@ -147,7 +171,8 @@ export function judge(run) {
   /** @type {'PASS' | 'FAIL' | 'NO RESULT'} */
   let verdict = failing.length > 0 ? 'FAIL' : 'PASS';
   let why = '';
-  if (run.stopped) { verdict = 'NO RESULT'; why = 'the gate stopped before it finished'; }
+  if (run.standIn) { verdict = 'NO RESULT'; why = `vitest was replaced by a test's stand-in (SMDB_MUTATION_VITEST=${run.standIn})`; }
+  else if (run.stopped) { verdict = 'NO RESULT'; why = 'the gate stopped before it finished'; }
   else if (run.emptyScope) { verdict = 'NO RESULT'; why = 'no src file changed; for a job already committed, pass --base the commit before it'; }
   else if (gating.length === 0) { verdict = 'NO RESULT'; why = 'no gating mutant was made, so L5 tested nothing (see what was not mutated, and why)'; }
   else if (gating.every(m => outcome(m) === 'CompileError')) { verdict = 'NO RESULT'; why = 'every gating mutant was a type error, so no test ran against the change'; }

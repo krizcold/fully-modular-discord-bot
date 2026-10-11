@@ -194,14 +194,7 @@ const STRUCTURE = new Set([
  * @param {number[]} lines
  */
 export function codeLines(file, text, lines) {
-  return codeLinesOf(parse(file, text), lines);
-}
-
-/**
- * @param {ts.SourceFile} sf
- * @param {number[]} lines
- */
-function codeLinesOf(sf, lines) {
+  const sf = parse(file, text);
   /** @param {number} pos */
   const lineOf = pos => sf.getLineAndCharacterOfPosition(pos).line + 1;
   /** @type {Set<number>} */
@@ -219,25 +212,20 @@ function codeLinesOf(sf, lines) {
 }
 
 /**
- * The code lines among `lines` that no mutant starts on. A mutant counts only
- * for the line it starts on, and only when it lies within one of the spans
- * that line widens to by itself: emptying a body, an object or an array, or
- * flipping a condition split over lines, says nothing about the lines after
- * its first, and the body of a header is not the header's. So the lines of a
- * file taken whole are judged the way the same lines changed alone are, and a
- * line can be named that a mutant only reaches through another line.
+ * The code lines among `lines` that no mutant lies wholly on. A mutant that
+ * spans several lines (emptying a body, an object or an array, flipping a
+ * condition split over lines, a chained call) counts for none of them: it says
+ * nothing about each line it spans. A mutant on one line counts for that whole
+ * line, as Stryker counts it. So the lines of a file taken whole are judged the
+ * way the same lines changed alone are, and the list can name a line some
+ * mutant reaches, but never leaves out one no mutant lies on.
  * @param {string} file
  * @param {string} text
  * @param {number[]} lines
  * @param {Range[]} spans each mutant's first and last line
  */
 export function untouched(file, text, lines, spans) {
-  const sf = parse(file, text);
-  return codeLinesOf(sf, lines).filter(n => {
-    /** @type {Range[]} */
-    const units = [[n, n], ...unitsOf(sf, n)];
-    return !spans.some(([first, last]) => first === n && units.some(([from, to]) => from <= first && last <= to));
-  });
+  return codeLines(file, text, lines).filter(n => !spans.some(([first, last]) => first === n && last === n));
 }
 
 /**

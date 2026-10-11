@@ -64,6 +64,13 @@ describe('the touched-line mutation gate', () => {
     expect(run.stdout).toContain(`\n  killed in pass A: ${killedInA}; sent to pass B: ${on(child).length + 1}, killed there: ${on(child).length}\n`);
     expect(run.stdout).toMatch(/^Runs with no mutant after the reruns:\n {2}after pass b2: passed /m);
     expect(run.stdout).toMatch(/^Verdict: FAIL$/m);
+    // Pass B's kills reran with the one file that killed them, and so did the run with no mutant after them.
+    for (const dir of ['b2-1', 'control-b2']) {
+      const written = fs.readdirSync(path.join(root, reportDir!, dir));
+      expect(written.some(file => file.endsWith('-child.json')), dir).toBe(true);
+      expect(written.filter(file => !file.includes('-child.')), dir).toEqual([]);
+    }
+    expect(fs.existsSync(path.join(root, reportDir!, 'b2-2'))).toBe(false);
     fs.rmSync(path.join(root, reportDir!), { recursive: true, force: true });
   });
 
@@ -96,6 +103,7 @@ describe('the touched-line mutation gate', () => {
     expect(reran.length).toBeGreaterThan(0);
     for (const m of reran) expect(m.passes.a2).toMatchObject({ voided: 'the run with no mutant after pass a2 failed' });
     expect(run.status).toBe(2);
+    expect(run.stdout).toMatch(/^Verdict: NO RESULT \(vitest was replaced by a test's stand-in /m);
     expect(run.stdout).toMatch(/^Stopped:\n {2}the run with no mutant after pass a2 failed \(exit 1\), so what its reruns counted cannot be told from the machine's failures$/m);
     expect(run.stdout).toMatch(/^ {2}the run with no mutant failed in unit\/x\.test\.ts: Error: the database went away$/m);
     expect(run.stdout).toMatch(/^Inconclusive .*\n {2}src\/bot\/internalSetup\/fleet\/nodeIdentity\.ts:\d+:\d+ .*\(the run with no mutant after pass a2 failed\)$/m);
@@ -111,10 +119,13 @@ describe('the touched-line mutation gate', () => {
     };
 
     expect(gate('--help').status).toBe(2);
-    for (const pattern of ['src/**/*.ts', 'src/bot/internalSetup/fleet/+(nodeIdentity|takeover).ts', 'src/no/such/file.ts:1-5']) {
+    // Stryker would mutate each of these, but the report matches mutants to
+    // targets by git's name for the file.
+    for (const pattern of ['src/**/*.ts', 'src/bot/internalSetup/fleet/+(nodeIdentity|takeover).ts', 'src/no/such/file.ts:1-5',
+      `./${TARGET}`, TARGET.split('/').join('\\'), 'src/bot/internalSetup/../internalSetup/fleet/nodeIdentity.ts:1-5']) {
       const refused = gate('--mutate', pattern);
       expect(refused.status, pattern).toBe(2);
-      expect(refused.stderr).toContain(`--mutate takes a file that exists, or a file and lines, never a glob: ${pattern}`);
+      expect(refused.stderr).toContain(`--mutate takes a file that exists, named from the bot root with forward slashes, or such a file and lines, never a glob: ${pattern}`);
     }
 
     const unknown = gate('--base', 'no-such-ref-anywhere');

@@ -32,46 +32,65 @@ function fakeVitest(fail: string[]) {
   return { script, out, read };
 }
 
-function runner(fake: { script: string; out: string }, confirm: string) {
+function runner(fake: { script: string; out: string }, pass: string, confirm: string, only: string[] = []) {
   return spawnSync(process.execPath, [path.join(root, 'test', 'mutation', 'runner.mjs')], {
     encoding: 'utf8',
-    env: { ...process.env, SMDB_MUTATION_VITEST: fake.script, SMDB_MUTATION_PASS: 'b', SMDB_MUTATION_FILES: '["src/a.ts"]', SMDB_MUTATION_OUT: fake.out, SMDB_MUTATION_CONFIRM: confirm, __STRYKER_ACTIVE_MUTANT__: '7' },
+    env: {
+      ...process.env, SMDB_MUTATION_VITEST: fake.script, SMDB_MUTATION_PASS: pass, SMDB_MUTATION_FILES: '["src/a.ts"]', SMDB_MUTATION_OUT: fake.out,
+      SMDB_MUTATION_CONFIRM: confirm, SMDB_MUTATION_ONLY: JSON.stringify(only), __STRYKER_ACTIVE_MUTANT__: '7',
+    },
   });
 }
 
 describe('a mutant run', () => {
   it('stops at the first failing test and tier, at vitest\'s own time limits', () => {
     const fake = fakeVitest(['integration']);
-    expect(runner(fake, '').status).toBe(1);
+    expect(runner(fake, 'b', '').status).toBe(1);
     const calls = fake.read();
     expect(calls.map(call => call.project)).toEqual(['integration']);
     expect(calls[0]).toMatchObject({ scale: '1', mutant: '7' });
-    expect(calls[0].args).toContain('--bail=1');
+    expect(calls[0].args).toEqual(expect.arrayContaining(['related', path.join(root, 'src', 'a.ts'), '--bail=1']));
   });
 
-  it('runs every test of both tiers, with four times the time, when it reruns a mutant alone', () => {
-    const fake = fakeVitest(['integration']);
-    expect(runner(fake, '1').status).toBe(1);
+  it('reruns pass A\'s tests with four times the time', () => {
+    const fake = fakeVitest([]);
+    expect(runner(fake, 'a', '1').status).toBe(0);
     const calls = fake.read();
-    expect(calls.map(call => call.project)).toEqual(['integration', 'child']);
-    for (const call of calls) {
-      expect(call).toMatchObject({ scale: '4', mutant: '7' });
-      expect(call.args.some(arg => arg.startsWith('--bail'))).toBe(false);
-    }
+    expect(calls.map(call => call.project)).toEqual(['fast']);
+    expect(calls[0]).toMatchObject({ scale: '4', mutant: '7' });
+    expect(calls[0].args).toEqual(expect.arrayContaining(['related', '--bail=1']));
+  });
+
+  it('reruns only the test files given, each in its tier, stopping at the first failure', () => {
+    const only = ['integration/store.test.ts', 'child/fleetIdentity.test.ts', 'child/takeover.test.ts'];
+    const failing = fakeVitest(['integration']);
+    expect(runner(failing, 'b', '1', only).status).toBe(1);
+    expect(failing.read().map(call => call.project)).toEqual(['integration']);
+
+    const passing = fakeVitest([]);
+    expect(runner(passing, 'b', '1', only).status).toBe(0);
+    const calls = passing.read();
+    expect(calls.map(call => [call.project, call.scale])).toEqual([['integration', '4'], ['child', '4']]);
+    expect(calls[0].args.slice(0, 2)).toEqual(['run', 'integration/store.test.ts']);
+    expect(calls[1].args.slice(0, 3)).toEqual(['run', 'child/fleetIdentity.test.ts', 'child/takeover.test.ts']);
+    for (const call of calls) expect(call.args).toContain('--bail=1');
   });
 });
 
 describe('the run with no mutant after the reruns', () => {
-  it('runs in the reruns\' way with no active mutant, and fails when a tier fails', () => {
+  it('runs the reruns\' tests their way with no active mutant, and fails when a tier fails', () => {
     const failing = fakeVitest(['child']);
     const env = { ...process.env, SMDB_MUTATION_VITEST: failing.script, __STRYKER_ACTIVE_MUTANT__: '7' };
-    expect(runControl({ root, out: failing.out, tier: 'b', files: ['src/a.ts'], env })).toEqual({ passed: false, why: 'exit 1' });
-    expect(failing.read().map(call => [call.project, call.mutant, call.scale])).toEqual([['integration', null, '4'], ['child', null, '4']]);
+    expect(runControl({ root, out: failing.out, tier: 'b', files: ['src/a.ts'], only: ['child/fleetIdentity.test.ts'], env }))
+      .toEqual({ passed: false, why: 'exit 1' });
+    const calls = failing.read();
+    expect(calls.map(call => [call.project, call.mutant, call.scale])).toEqual([['child', null, '4']]);
+    expect(calls[0].args.slice(0, 2)).toEqual(['run', 'child/fleetIdentity.test.ts']);
 
     const passing = fakeVitest([]);
-    expect(runControl({ root, out: passing.out, tier: 'a', files: ['src/a.ts'], env: { ...env, SMDB_MUTATION_VITEST: passing.script } }))
+    expect(runControl({ root, out: passing.out, tier: 'a', files: ['src/a.ts'], only: [], env: { ...env, SMDB_MUTATION_VITEST: passing.script } }))
       .toEqual({ passed: true, why: '' });
-    expect(passing.read().map(call => call.project)).toEqual(['fast']);
+    expect(passing.read().map(call => [call.project, call.scale])).toEqual([['fast', '4']]);
   });
 });
 

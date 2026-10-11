@@ -58,13 +58,13 @@ detection, hunk joining).
 - A pure deletion has no line left to mutate: its two neighbouring lines are context only.
 - Not mutated, and named in the report with the reason: files outside src, files that are not code, `.d.ts` files, and
   the browser views under src/webui/public (copied into dist, never compiled, and no test loads them yet).
-- A changed line of code that no mutant starts on, in a diff, an untracked file or a `--mutate` pattern, is named in
-  the report: L5 says nothing about it. A mutant counts only for the line it starts on, and only when it lies within
-  what that line widens to by itself. So types, imports, signatures, a bare `await f();`, and the lines after the first
-  of a multi-line object, array, arrow body, call or condition land in the list: emptying an object or flipping a whole
-  condition says nothing about each of its lines. A file taken whole names the same lines as each of its lines changed
-  alone. The list can name a line some mutant does reach; it never leaves out one that no mutant starts on. A deleted
-  src file is named too.
+- A changed line of code that no mutant lies wholly on, in a diff, an untracked file or a `--mutate` pattern, is named
+  in the report: L5 says nothing about it. A mutant that spans several lines (emptying a body, an object or an array,
+  flipping a condition split over lines, a chained call) counts for none of them, since it says nothing about each
+  line it spans; a mutant on one line counts for that whole line, as Stryker counts it. So types, imports, signatures,
+  a bare `await f();`, and every line of a multi-line object, array, arrow body, call or condition with no mutant of
+  its own land in the list. A file taken whole names the same lines as each of its lines changed alone. The list can
+  name a line some mutant reaches; it never leaves out one that no mutant lies on. A deleted src file is named too.
 
 ## The passes
 
@@ -76,21 +76,26 @@ detection, hunk joining).
 2. **Pass B, the rest, on pass A's gating survivors only.** The sandbox's dist is built from the instrumented src
    (build.cjs), then each survivor runs `vitest related` on the integration tier and then the whole child tier, whose
    scenarios start real processes on that dist. A child sees the mutant through the env.
-3. **Reruns alone.** A gating mutant that timed out in pass A or B, and every gating kill of pass B (where containers
-   and children can fail on their own), runs again alone, one at a time. A rerun gives every test, hook and child
-   scenario step four times its time limit (a test's own explicit limit is not scaled), and Stryker a larger budget for
-   the whole run. It does not stop at the first failure and runs both tiers of pass B, so the order vitest picks (it
-   puts files that failed last time first) cannot decide what it finds. A timeout counts as killed when the rerun
-   hangs the tests again or fails a test; a pass B kill counts only when the rerun fails a test again, since a hang is
-   not the same evidence. One that then survives pass A goes on to pass B. A mutant the gate never reran (it stopped
-   first) is inconclusive.
+3. **Reruns alone.** Every run stops at its first failure. A rerun runs one mutant at a time and gives every test, hook
+   and child scenario step four times its time limit (a test's own explicit limit is not scaled), and Stryker a larger
+   budget for the whole run.
+   - A gating mutant that timed out in pass A reruns with pass A's tests. It counts as killed when the rerun hangs the
+     tests again or fails a test; one that then survives goes on to pass B.
+   - In pass B, where containers and children can be slow or fail on their own, a hang never counts: a mutant that
+     only hangs a test there is inconclusive. A test that waits must bound its wait and fail, as a child scenario step
+     does ("did not finish in N ms" is a failure, not a hang).
+   - A gating kill of pass B reruns with the one test file that killed it, alone (one rerun per such file), so no
+     other file's order or hang can decide it. It counts only when that file fails for the mutant again.
+   - A mutant the gate never reran (it stopped first) is inconclusive.
 4. **A run with no mutant after the reruns.** When a rerun counted a kill or a timeout, the same tests run once more
    with no mutant, in the checkout itself, the way the reruns ran them (mutation/control.mjs). If they fail, the
    machine or a container went bad during the reruns, so what the reruns counted is inconclusive and the gate ends NO
-   RESULT. What it cannot see: a machine that was four times slower for one rerun only and well again by the end.
+   RESULT. What it cannot see: a machine that was four times slower for one pass A rerun only and well again by the
+   end.
 
 A run Stryker counts as a kill is checked against vitest's report of it: it is a kill only when a test itself failed for
-a reason other than the machine. When every failing test (or its hook) timed out it is a timeout (rerun as above).
+a reason other than the machine. When every failing test (or its hook) timed out, and nothing in the run failed for the
+machine, it is a timeout.
 Anything else is **inconclusive**: no report, a failure only in a hook or at file level, an unhandled error with every
 test passing, or only machine failures (refused or reset connections, a container that would not start, a database
 connection dropped, exhausted resources). The machine's texts are matched against the first line of each failure only,
@@ -107,15 +112,17 @@ complete, which is why pass B's kills must repeat.
   mutant after the reruns, and the verdict.
 - `mutants.json` has every mutant: its place, original text and replacement, whether it gates, and per pass its status
   and the test that killed it.
-- `a/`, `a2/`, `b/` and `b2/` hold one vitest JSON report and log per mutant run (`dry-*` is the run with no mutant);
-  `control-a2/` and `control-b2/` hold the runs with no mutant after the reruns.
+- `a/`, `a2/`, `b/` and `b2-1/`, `b2-2/` (one per test file that killed in pass B) hold one vitest JSON report and log
+  per mutant run (`dry-*` is the run with no mutant); `control-a2/` and `control-b2/` hold the runs with no mutant
+  after the reruns.
 
 The verdict is FAIL when a gating mutant ends Survived, NoCoverage, Missing, inconclusive, RuntimeError, or Ignored (a
 `// Stryker disable` comment needs the same justification in the notes as a survivor). A confirmed timeout counts as
 killed and is listed. CompileError counts as killed by the type checker. The verdict is NO RESULT when no src file
 changed, when no gating mutant was made, when every gating mutant was a type error (no test ran against the change),
-when a pass could not run, or when the run with no mutant after the reruns failed; the report then says why, with the
-passes that did finish.
+when a pass could not run, when Stryker mutated a file no target names, when the run with no mutant after the reruns
+failed, or when a test's stand-in replaced vitest (SMDB_MUTATION_VITEST, for the gate's own tests only); the report then
+says why, with the passes that did finish.
 
 ## Child scenarios
 

@@ -47,7 +47,7 @@ try {
   process.exit(2);
 }
 const { diffArgs, gates, linesOfTarget, parseDiff, patternsOf, planTargets, untouched } = ranges;
-const { classifyKill, judge, outcome, toConfirm, toPassB } = verdicts;
+const { byKiller, classifyKill, judge, outcome, toConfirm, toPassB } = verdicts;
 
 const USAGE = 'usage: node test/mutation/touched.mjs [--base REF] [--mutate PATTERN]... [--concurrency N] [--keep]';
 /** @type {{ base: string, mutate: string[], concurrency: number, keep: boolean }} */
@@ -68,22 +68,23 @@ for (let i = 0; i < argv.length; i++) {
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 process.chdir(root);
-/** @param {string} pattern */
-const fileOfPattern = pattern => pattern.replace(/:\d+(:\d+)?-\d+(:\d+)?$/, '');
-// A --mutate value names one file that exists: Stryker reads it as a glob
-// (extglobs included), and a target that is not a plain file would leave its
-// mutants with no target to report against.
-for (const pattern of opts.mutate) {
-  const file = fileOfPattern(pattern);
-  if (/[*?[\]{}()!|+@]/.test(file) || !fs.statSync(path.join(root, file), { throwIfNoEntry: false })?.isFile()) {
-    console.error(`--mutate takes a file that exists, or a file and lines, never a glob: ${pattern}\n${USAGE}`);
-    process.exit(2);
-  }
-}
 /** @param {string[]} args */
 const git = (...args) => execFileSync('git', ['-c', 'core.quotePath=false', ...args], { cwd: root, encoding: 'utf8', maxBuffer: 256 * 1024 * 1024 });
 /** @param {string} file */
 const posix = file => file.split(path.sep).join('/');
+/** @param {string} pattern */
+const fileOfPattern = pattern => pattern.replace(/:\d+(:\d+)?-\d+(:\d+)?$/, '');
+// A --mutate value names one file that exists, the way git names it, since the
+// report matches each mutant to its target by that name: Stryker reads the
+// value as a glob (extglobs included) and resolves any spelling of a path.
+for (const pattern of opts.mutate) {
+  const file = fileOfPattern(pattern);
+  const canonical = posix(path.relative(root, path.resolve(root, file)));
+  if (/[*?[\]{}()!|+@]/.test(file) || canonical !== file || !fs.statSync(path.join(root, file), { throwIfNoEntry: false })?.isFile()) {
+    console.error(`--mutate takes a file that exists, named from the bot root with forward slashes, or such a file and lines, never a glob: ${pattern}\n${USAGE}`);
+    process.exit(2);
+  }
+}
 
 const stamp = new Date().toISOString().replace(/[:.]/g, '-');
 const reportDir = path.join(root, 'test', 'mutation', 'reports', stamp);
@@ -163,14 +164,14 @@ function dryFailures(name) {
 
 /**
  * One pass's result for a mutant, with a kill checked against the reports.
- * @param {PassName} name
+ * @param {string} dir the pass's report dir
  * @param {StrykerResult} r
  * @returns {PassResult}
  */
-function resultOf(name, r) {
+function resultOf(dir, r) {
   /** @type {PassResult} */
   const result = { id: r.id, status: r.status, ...(r.statusReason ? { statusReason: r.statusReason.split('\n')[0] } : {}) };
-  return r.status === 'Killed' ? { ...result, ...classifyKill(reportsOf(name, r.id)) } : result;
+  return r.status === 'Killed' ? { ...result, ...classifyKill(reportsOf(dir, r.id)) } : result;
 }
 
 class PassError extends Error {}
@@ -190,27 +191,25 @@ const common = {
 
 /**
  * Runs one Stryker pass. `tier` picks the tests (runner.mjs): a for the fast
- * tier, b for the integration and child tiers. The reruns alone, a2 and b2,
- * run in runner.mjs's rerun mode.
- * @param {PassName} name
- * @param {'a' | 'b'} tier
- * @param {string[]} mutate
- * @param {string[]} passFiles
- * @param {Options} extra
+ * tier, b for the integration and child tiers; `only`, when given, names the
+ * test files to run instead. The reruns alone, a2 and b2, get four times the
+ * time.
+ * @param {{ name: PassName, dir: string, tier: 'a' | 'b', mutate: string[], files: string[], only?: string[], extra: Options }} run
  * @returns {Promise<StrykerResult[]>}
  */
-async function pass(name, tier, mutate, passFiles, extra) {
-  const out = path.join(reportDir, name);
+async function pass({ name, dir, tier, mutate, files, only = [], extra }) {
+  const out = path.join(reportDir, dir);
   fs.mkdirSync(out, { recursive: true });
   process.env.SMDB_MUTATION_PASS = tier;
   process.env.SMDB_MUTATION_CONFIRM = name === 'a2' || name === 'b2' ? '1' : '';
-  process.env.SMDB_MUTATION_FILES = JSON.stringify(passFiles);
+  process.env.SMDB_MUTATION_FILES = JSON.stringify(files);
+  process.env.SMDB_MUTATION_ONLY = JSON.stringify(only);
   process.env.SMDB_MUTATION_OUT = out;
   const { Stryker } = await import('@stryker-mutator/core');
   try {
     return await new Stryker({ ...common, mutate, ...extra }).runMutationTest();
   } catch (error) {
-    const lines = [`pass ${name} could not run: ${error instanceof Error ? error.message.split('\n')[0] : String(error)}`, ...dryFailures(name)];
+    const lines = [`pass ${dir} could not run: ${error instanceof Error ? error.message.split('\n')[0] : String(error)}`, ...dryFailures(dir)];
     if (fs.readdirSync(out).some(f => f.startsWith('dry-'))) lines.push(`the run with no mutant logged to ${posix(path.relative(root, out))}/dry-*.log`);
     throw new PassError(lines.join('\n'));
   }
@@ -225,13 +224,14 @@ async function pass(name, tier, mutate, passFiles, extra) {
  * @param {PassName} after
  * @param {'a' | 'b'} tier
  * @param {MutantRecord[]} on
+ * @param {string[]} only the test files the reruns ran, or none
  */
-function control(after, tier, on) {
+function control(after, tier, on, only) {
   const name = `control-${after}`;
   const out = path.join(reportDir, name);
   fs.mkdirSync(out, { recursive: true });
   console.log(`L5: the same tests once with no mutant, to check the machine after pass ${after}`);
-  const run = runControl({ root, out, tier, files: [...new Set(on.map(m => m.file))] });
+  const run = runControl({ root, out, tier, files: [...new Set(on.map(m => m.file))], only });
   const logs = `${posix(path.relative(root, out))}/dry-*.log`;
   if (!run.passed) {
     const why = `the run with no mutant after pass ${after} failed`;
@@ -250,16 +250,18 @@ const credited = m => ['Killed', 'Timeout'].includes(outcome(m));
 /**
  * Runs a pass on exactly the given mutants and records its results on them.
  * @param {PassName} name
+ * @param {string} dir
  * @param {'a' | 'b'} tier
  * @param {MutantRecord[]} on
  * @param {Options} extra
+ * @param {string[]} [only]
  */
-async function passOn(name, tier, on, extra) {
-  const results = await pass(name, tier, [...new Set(on.map(spanOf))], [...new Set(on.map(m => m.file))], extra);
+async function passOn(name, dir, tier, on, extra, only) {
+  const results = await pass({ name, dir, tier, mutate: [...new Set(on.map(spanOf))], files: [...new Set(on.map(m => m.file))], only, extra });
   const byKey = new Map(results.map(r => [resultKey(r), r]));
   for (const m of on) {
     const r = byKey.get(recordKey(m));
-    m.passes[name] = r ? resultOf(name, r) : { id: null, status: 'Missing' };
+    m.passes[name] = r ? resultOf(dir, r) : { id: null, status: 'Missing' };
   }
 }
 
@@ -295,7 +297,7 @@ function report(stopped) {
     const lines = untouched(target.file, text, linesOfTarget(target, text.split('\n').length), spans);
     if (lines.length > 0) noMutant.push({ file: target.file, lines });
   }
-  const result = judge({ stamp, scope, emptyScope, skipped, mutants, noMutant, unmatched, report: posix(path.relative(root, reportDir)), stopped, controls });
+  const result = judge({ stamp, scope, emptyScope, skipped, mutants, noMutant, unmatched, report: posix(path.relative(root, reportDir)), stopped, controls, standIn: process.env.SMDB_MUTATION_VITEST });
   fs.mkdirSync(reportDir, { recursive: true });
   fs.writeFileSync(path.join(reportDir, 'mutants.json'), `${JSON.stringify({ scope, skipped, targets, mutants, controls, verdict: result.verdict, stopped }, null, 2)}\n`);
   fs.writeFileSync(path.join(reportDir, 'summary.txt'), `${result.lines.join('\n')}\n`);
@@ -332,12 +334,14 @@ try {
 
   const files = [...new Set(targets.map(target => target.file))];
   console.log(`L5: mutating ${scope}: ${files.length} file(s), pass A (in-process tests that import them)`);
-  const resultsA = await pass('a', 'a', targets.flatMap(t => t.patterns), files, {
+  const resultsA = await pass({ name: 'a', dir: 'a', tier: 'a', mutate: targets.flatMap(t => t.patterns), files, extra: {
     checkers: ['typescript'],
     concurrency: opts.concurrency,
     timeoutMS: 10_000,
     timeoutFactor: 2,
-  });
+  } });
+  const orphans = [...new Set(resultsA.map(fileOf).filter(file => !targets.some(t => t.file === file)))];
+  if (orphans.length > 0) throw new PassError(`Stryker mutated ${orphans.join(', ')}, which no target names, so the report could not answer for it`);
   mutants = resultsA.map(r => {
     const file = fileOf(r);
     const target = targets.find(t => t.file === file);
@@ -355,21 +359,24 @@ try {
   const confirmA = toConfirm(mutants, 'a');
   if (confirmA.length > 0) {
     console.log(`L5: pass A again, one at a time, on ${confirmA.length} timeout(s)`);
-    await passOn('a2', 'a', confirmA, { checkers: [], concurrency: 1, timeoutMS: 60_000, timeoutFactor: 4 });
-    if (confirmA.some(credited)) control('a2', 'a', confirmA);
+    await passOn('a2', 'a2', 'a', confirmA, { checkers: [], concurrency: 1, timeoutMS: 60_000, timeoutFactor: 4 });
+    if (confirmA.some(credited)) control('a2', 'a', confirmA, []);
   }
 
   const forB = toPassB(mutants);
   if (forB.length > 0) {
     console.log(`L5: pass B (integration tests that import them, then every child scenario) on ${forB.length} survivor(s)`);
     const b = { buildCommand: 'node test/helpers/build.cjs', checkers: [], dryRunTimeoutMinutes: 15 };
-    await passOn('b', 'b', forB, { ...b, concurrency: Math.max(1, Math.floor(opts.concurrency / 2)), timeoutMS: 60_000, timeoutFactor: 2 });
+    await passOn('b', 'b', 'b', forB, { ...b, concurrency: Math.max(1, Math.floor(opts.concurrency / 2)), timeoutMS: 60_000, timeoutFactor: 2 });
     const confirmB = toConfirm(mutants, 'b');
-    if (confirmB.length > 0) {
-      console.log(`L5: pass B again, one at a time, on ${confirmB.length} kill(s) and timeout(s), which count only if they repeat`);
-      await passOn('b2', 'b', confirmB, { ...b, concurrency: 1, timeoutMS: 180_000, timeoutFactor: 4 });
-      if (confirmB.some(credited)) control('b2', 'b', confirmB);
+    const killers = byKiller(confirmB);
+    let group = 0;
+    for (const [killer, on] of killers) {
+      group += 1;
+      console.log(`L5: pass B again, one at a time, on ${on.length} kill(s) by ${killer}, with that file alone; a kill counts only if it repeats`);
+      await passOn('b2', `b2-${group}`, 'b', on, { ...b, concurrency: 1, timeoutMS: 180_000, timeoutFactor: 4 }, [killer]);
     }
+    if (confirmB.some(credited)) control('b2', 'b', confirmB, [...killers.keys()]);
   }
   finish();
 } catch (error) {
