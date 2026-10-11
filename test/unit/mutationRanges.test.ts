@@ -5,7 +5,8 @@ import path from 'path';
 import { Instrumenter } from '@stryker-mutator/instrumenter';
 import ts from 'typescript';
 import { describe, expect, it, onTestFinished } from 'vitest';
-import { codeLines, diffArgs, gates, linesOfTarget, mergeRanges, notMutated, parseDiff, patternsOf, planTargets, untouched } from '../mutation/ranges.mjs';
+import { canonicalName } from '../mutation/keys.mjs';
+import { codeLines, diffArgs, gates, inPattern, linesOfTarget, mergeRanges, notMutated, parseDiff, patternsOf, planTargets, unmatchedPatterns, untouched } from '../mutation/ranges.mjs';
 
 // The touched-line ranges of the L5 gate (mutation/README.md): which lines a
 // change touched, and how far each widens so that Stryker makes the mutants
@@ -156,21 +157,32 @@ describe('the diff reader', () => {
     const body = Array.from({ length: 30 }, (_, i) => `export const v${i} = ${i};`);
     fs.writeFileSync(path.join(repo, 'src', 'a.ts'), `${body.join('\n')}\n`);
     fs.writeFileSync(path.join(repo, 'src', 'odd name.ts'), 'export const o = 1;\n');
+    // Two functions that trade places: diff algorithms read such a move differently.
+    const fn = (name: string, arg: string) => [`export function ${name}(${arg}: number) {`, `  if (${arg} > 0) {`, '    return 1;', '  }', '  return 0;', '}', ''];
+    fs.writeFileSync(path.join(repo, 'src', 'm.ts'), [...fn('f', 'a'), ...fn('g', 'b')].join('\n'));
+    fs.writeFileSync(path.join(repo, 'safety-check.js'), 'module.exports = 1;\n');
     git('add', '.');
     git('commit', '-q', '-m', 'base');
     fs.writeFileSync(path.join(repo, 'src', 'odd name.ts'), 'export const o = 2;\n');
+    fs.writeFileSync(path.join(repo, 'src', 'm.ts'), [...fn('g', 'b'), ...fn('f', 'a')].join('\n'));
+    fs.writeFileSync(path.join(repo, 'safety-check.js'), 'module.exports = 2;\n');
     const base = git('rev-parse', 'HEAD').trim();
     // Line 3 and line 6 change; a new file is a near copy of a.ts, staged.
     const changed = body.map((line, i) => (i === 2 || i === 5 ? line.replace('= ', '= 100 + ') : line));
     fs.writeFileSync(path.join(repo, 'src', 'a.ts'), `${changed.join('\n')}\n`);
     fs.writeFileSync(path.join(repo, 'src', 'b.ts'), `${[...body, 'export const extra = 1;'].join('\n')}\n`);
     git('add', 'src/b.ts');
-    const hostile = ['-c', 'diff.mnemonicPrefix=true', '-c', 'diff.noprefix=true', '-c', 'diff.renames=copies', '-c', 'diff.interHunkContext=10', '-c', 'diff.relative=true'];
+    const hostile = ['-c', 'diff.mnemonicPrefix=true', '-c', 'diff.noprefix=true', '-c', 'diff.renames=copies', '-c', 'diff.interHunkContext=10', '-c', 'diff.relative=true',
+      '-c', 'diff.algorithm=histogram'];
     const plain = parseDiff(git(...diffArgs(base)));
     expect(parseDiff(git(...hostile, ...diffArgs(base)))).toEqual(plain);
     expect(plain.find(f => f.file === 'src/a.ts')?.changed).toEqual([3, 6]);
     expect(plain.find(f => f.file === 'src/b.ts')?.changed.length).toBeGreaterThan(0);
     expect(plain.find(f => f.file === 'src/odd name.ts')?.changed).toEqual([1]);
+    expect(plain.find(f => f.file === 'src/m.ts')?.changed).toEqual([1, 2, 8, 9]);
+    // A change outside src is read too, and named as not mutated.
+    const plan = planTargets({ diff: plain, untracked: [], read: file => fs.readFileSync(path.join(repo, file), 'utf8') });
+    expect(plan.skipped).toContainEqual({ file: 'safety-check.js', why: 'outside src' });
   });
 });
 
@@ -222,7 +234,7 @@ describe('the widening', () => {
       '  f(2, 1);', // 24
       '}', // 25
     ].join('\n');
-    expect(codeLines('src/a.ts', text, Array.from({ length: 25 }, (_, i) => i + 1))).toEqual([1, 2, 3, 4, 6, 7, 8, 10, 14, 16, 19, 20, 21, 22, 24]);
+    expect(codeLines('src/a.ts', text, Array.from({ length: 25 }, (_, i) => i + 1))).toEqual([1, 2, 3, 4, 6, 7, 8, 10, 14, 16, 19, 20, 21, 22, 23, 24]);
   });
 
   it('joins ranges that meet, since Stryker needs one range to hold a whole mutant', () => {
@@ -345,6 +357,29 @@ describe('the widening, against what Stryker makes', () => {
     expect(untouched('src/a.ts', text, Array.from({ length: 26 }, (_, i) => i + 1), spansOf(whole)))
       .toEqual([1, 2, 3, 4, 7, 8, 9, 11, 12, 13, 15, 16, 17, 18, 20, 21, 23, 24]);
   });
+
+  it('names an else, try, finally or do line no mutant lies on: each carries behaviour', async () => {
+    const text = [
+      'export function f(ok: boolean) {',
+      '  if (ok) {',
+      '    run();',
+      '  } else {',
+      '    wait();',
+      '  }',
+      '  try {',
+      '    run();',
+      '  } finally {',
+      '    done();',
+      '  }',
+      '  do {',
+      '    run();',
+      '  } while (ok);',
+      '}',
+      '',
+    ].join('\n');
+    const whole = await made(text, true);
+    expect(untouched('src/a.ts', text, [4, 7, 9, 12], spansOf(whole))).toEqual([4, 7, 9, 12]);
+  });
 });
 
 describe('the targets', () => {
@@ -372,6 +407,49 @@ describe('the targets', () => {
     expect(linesOfTarget({ gating: [3, 7], patterns: ['src/a.ts:2-9'] }, 11)).toEqual([3, 7]);
     expect(linesOfTarget({ gating: null, patterns: ['src/new.ts'] }, 4)).toEqual([1, 2, 3, 4]);
     expect(linesOfTarget({ gating: null, patterns: ['src/a.ts:3-5', 'src/a.ts:5:2-6:9', 'src/a.ts:10-99'] }, 11)).toEqual([3, 4, 5, 6, 10, 11]);
+  });
+
+  it('does not mutate a file holding a line break git does not count, and says why', () => {
+    const texts: Record<string, string> = {
+      'src/sep.ts': "export const s = 'a\u2028b';\nexport const t = 1;\n",
+      'src/cr.ts': 'export const a = 1;\r\rexport const b = 2;\n',
+      'src/crlf.ts': 'export const a = 1;\r\nexport const b = 2;\r\n',
+      'src/new.ts': "export const n = 'x\u2029y';\n",
+    };
+    const plan = planTargets({
+      diff: ['src/sep.ts', 'src/cr.ts', 'src/crlf.ts'].map(file => ({ file, changed: [2], deletedAfter: [] })),
+      untracked: ['src/new.ts'],
+      read: file => texts[file],
+    });
+    expect(plan.skipped.map(s => s.file)).toEqual(['src/sep.ts', 'src/cr.ts', 'src/new.ts']);
+    for (const s of plan.skipped) expect(s.why).toMatch(/^it holds a line break git does not count/);
+    expect(plan.targets.map(t => t.file)).toEqual(['src/crlf.ts']);
+  });
+
+  it('takes a file under the name it has on disk, relative to the bot root', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-names-'));
+    const outside = path.join(os.tmpdir(), `smdb-outside-${process.pid}.ts`);
+    onTestFinished(() => { fs.rmSync(root, { recursive: true, force: true }); fs.rmSync(outside, { force: true }); });
+    fs.mkdirSync(path.join(root, 'src'));
+    fs.writeFileSync(path.join(root, 'src', 'Foo.ts'), 'export const x = 1;\n');
+    fs.writeFileSync(outside, 'export const y = 1;\n');
+    expect(canonicalName(root, 'src/Foo.ts')).toBe('src/Foo.ts');
+    expect(canonicalName(root, `.${path.sep}src${path.sep}Foo.ts`)).toBe('src/Foo.ts');
+    expect(canonicalName(root, 'src/../src/Foo.ts')).toBe('src/Foo.ts');
+    if (process.platform === 'win32') expect(canonicalName(root, 'SRC/foo.TS')).toBe('src/Foo.ts');
+    for (const refused of ['src/missing.ts', 'src', 'src/*.ts', 'src/+(Foo|Bar).ts', outside]) expect(canonicalName(root, refused), refused).toBe(null);
+  });
+
+  it('tells which mutants a pattern made by its lines', () => {
+    const at = (start: number, end: number) => ({ start: { line: start, column: 1 }, end: { line: end, column: 9 } });
+    expect(inPattern('src/a.ts', at(3, 4))).toBe(true);
+    expect(inPattern('src/a.ts:2-5', at(3, 4))).toBe(true);
+    expect(inPattern('src/a.ts:2-5', at(5, 6))).toBe(false);
+    expect(inPattern('src/a.ts:2150-2150', at(215, 215))).toBe(false);
+    expect(inPattern('src/a.ts:5:2-6:9', at(5, 6))).toBe(true);
+    const targets = ['src/a.ts:215-215', 'src/a.ts:2150-2150', 'src/a.ts:1-3', 'src/b.ts'].map(pattern => ({ file: pattern.replace(/:.*$/, ''), patterns: [pattern], gating: null }));
+    expect(unmatchedPatterns(targets, [{ file: 'src/a.ts', location: at(215, 215) }])).toEqual(['src/a.ts:2150-2150', 'src/a.ts:1-3', 'src/b.ts']);
+    expect(unmatchedPatterns([{ file: 'src/a.ts', patterns: ['src/a.ts:1-3'], gating: [2] }], [])).toEqual([]);
   });
 
   it('widens a pure deletion to its neighbours as context only', () => {

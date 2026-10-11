@@ -13,6 +13,8 @@ active mutant travels in `__STRYKER_ACTIVE_MUTANT__` and reaches child processes
 | runner.mjs | the command every pass runs inside Stryker's sandbox; unit/mutationRunner.test.ts |
 | control.mjs | (library) the run with no mutant after the reruns; unit/mutationRunner.test.ts |
 | passes.mjs | (data) each pass's Stryker options and budget; unit/mutationRunner.test.ts |
+| keys.mjs | (library) how a file and a mutant are named across passes; unit/mutationRanges.test.ts |
+| targets.mjs | (Stryker reporter) which mutant ids a later pass runs tests for; unit/mutationRunner.test.ts and the bite |
 | ../helpers/time.mjs | the factor on every test's time limits (4 in a rerun alone) |
 | ../helpers/build.cjs | builds dist the way `npm run build` does, stamped and locked; pass B's buildCommand |
 | ../helpers/child.ts | runs a child scenario (test/child/scenarios/) and checks what it loaded |
@@ -28,8 +30,9 @@ From the bot root, with Node 22.12 or newer (or SMDB_TEST_NODE set, as for `npm 
   committed, pass `--base` the commit before it; `--base main` takes everything since the merge-base with main (a
   branch). Untracked files under src are taken whole.
 - `--mutate src/x.ts:10-20` (a file in the bot root that exists, or such a file and lines, repeatable; never a glob)
-  skips git; every mutant it makes gates. The file is taken under the name git gives it, however it was spelled
-  (`./`, backslashes, `..`, another case on Windows).
+  skips git; every mutant it makes gates. The file is taken under the name it has on disk, from the bot root with
+  forward slashes (its case, and its path once links are resolved), however it was spelled: `./`, `..`, and on Windows
+  backslashes or another case. A file in a diff is matched by that name too, for Stryker matches the names on disk.
 - `--concurrency N` sets pass A's parallel runs (default: half the cores); pass B uses half of that.
 - `--keep` keeps the sandboxes in `.stryker-tmp/` for a look after the run. Without it every sandbox is removed, a
   failed pass's too.
@@ -38,8 +41,8 @@ From the bot root, with Node 22.12 or newer (or SMDB_TEST_NODE set, as for `npm 
   killed on Windows exits 1 too.
 
 Pass A needs nothing running. Pass B runs the integration tests that import the mutated files, so it needs Docker when
-there are any. The git diff sets every option a user's git config could change (path prefixes, rename and copy
-detection, hunk joining).
+there are any. The git diff covers the whole repo and sets every option a user's git config could change (path
+prefixes, rename and copy detection, the diff algorithm, hunk joining).
 
 ## What it mutates
 
@@ -52,21 +55,27 @@ detection, hunk joining).
   res) => {`, a `});`, a property whose value is an arrow with a body, a plain line of an object that holds a method)
   takes its whole statement: the callback's body runs as context, and the emptying of that body, which touches the
   line, gates.
-- **Gating** mutants touch a changed line. Two kinds that touch one are not made: the whole callback around a changed
-  line of its body, and the emptying of a block that only begins or ends on a changed compound header; a block wholly
-  made of changed lines is made. unit/mutationRanges.test.ts holds this rule to Stryker's own instrumenter, line by
-  line, on made-up shapes and on two real files.
+- **Gating** mutants touch a changed line. Some that touch one are not made: one that touches it only through a block
+  holding the line (the emptying of that block, or the whole callback around it), and the emptying of a block that
+  only begins or ends on a changed compound header; a block wholly made of changed lines is made.
+  unit/mutationRanges.test.ts holds this rule to Stryker's own instrumenter, line by line, on made-up shapes and on two
+  real files.
 - The other mutants in the widened ranges are **context**: they run in pass A and are listed, but never fail the gate.
 - A pure deletion has no line left to mutate: its two neighbouring lines are context only.
-- Not mutated, and named in the report with the reason: files outside src, files that are not code, `.d.ts` files, and
-  the browser views under src/webui/public (copied into dist, never compiled, and no test loads them yet).
+- Not mutated, and named in the report with the reason: files outside src (the root scripts, updaters/, tests and
+  docs), files that are not code, `.d.ts` files, the browser views under src/webui/public (copied into dist, never
+  compiled, and no test loads them yet), and a file that holds a line break git does not count (a lone CR, U+2028 or
+  U+2029), whose lines git and Stryker would number differently; `--mutate` refuses such a file.
 - A changed line of code that no mutant lies wholly on, in a diff, an untracked file or a `--mutate` pattern, is named
   in the report: L5 says nothing about it. A mutant that spans several lines (emptying a body, an object or an array,
   flipping a condition split over lines, a chained call) counts for none of them, since it says nothing about each
   line it spans; a mutant on one line counts for that whole line, as Stryker counts it. So types, imports, signatures,
-  a bare `await f();`, and every line of a multi-line object, array, arrow body, call or condition with no mutant of
-  its own land in the list. A file taken whole names the same lines as each of its lines changed alone. The list can
-  name a line some mutant reaches; it never leaves out one that no mutant lies on. A deleted src file is named too.
+  a bare `await f();`, an `else`, `try`, `finally` or `do` line, and every line of a multi-line object, array, arrow
+  body, call or condition with no mutant of its own land in the list. A file taken whole names the same lines as each
+  of its lines changed alone. The list can name a line some mutant reaches; it never leaves out a line of code that no
+  mutant lies on. A line of brackets and separators only is not a line of code: no mutant can lie on it, and what was
+  taken out of it (`}, 100);` made `});`), like a pure deletion, is neither mutated nor named. A deleted file is named
+  too. A `--mutate` pattern that made no mutant is named on its own, beside other patterns on the same file.
 
 ## The passes
 
@@ -77,7 +86,9 @@ detection, hunk joining).
    runs those tests.
 2. **Pass B, the rest, on pass A's gating survivors only.** The sandbox's dist is built from the instrumented src
    (build.cjs), then each survivor runs `vitest related` on the integration tier and then the whole child tier, whose
-   scenarios start real processes on that dist. A child sees the mutant through the env.
+   scenarios start real processes on that dist. A child sees the mutant through the env. Stryker makes every mutant a
+   span holds, so a survivor that spans lines brings in the mutants nested inside it; in pass B and every rerun those
+   run no test (targets.mjs gives the runner the ids the pass is for) and their results are dropped.
 3. **Reruns alone.** Every run stops at its first failure. A rerun runs one mutant at a time and gives every test, hook
    and child scenario step four times its time limit (a test's own explicit limit is not scaled), and Stryker a larger
    budget for the whole run.
@@ -138,8 +149,9 @@ child away from anything real:
 - the bot root comes from the file's own place (never a fixed path), so a sandbox runs its own dist;
 - the child's cwd is its own data dir (the bot's `dotenv/config` imports read `.env` from the cwd, and the root `.env`
   of a main checkout holds the real token);
-- its env is the test's minus every bot configuration key (helpers/env.ts: every key src reads from process.env by name
-  and the payment providers' prefixes envLoader copies; unit/envScrub.test.ts holds the list to src), with NODE_ENV
+- its env is the test's minus every bot configuration key (helpers/env.ts: every key src reads from process.env by name,
+  the payment providers' prefixes envLoader copies, and dotenv's own DOTENV_ keys, which could load a real .env from
+  anywhere; unit/envScrub.test.ts holds the list to src), with NODE_ENV
   `test` and its own DATA_DIR; the active mutant passes. Not covered: configManager also reads process.env[key] for any
   config key; DEVS and testMode are scrubbed, a module's own config key is not;
 - every wait is bounded, and a step prints one `RESULT` line with its result and the bot modules it loaded; the helper

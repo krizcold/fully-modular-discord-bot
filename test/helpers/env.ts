@@ -7,9 +7,11 @@
 // Not covered: configManager's getConfigProperty also reads process.env[key]
 // for any config key it is asked for; the known ones (DEVS, testMode) are
 // scrubbed here, a module's own config key is not.
+// DOTENV_ is read by dotenv itself (src's `dotenv/config` imports): it could
+// load a real .env from anywhere, whatever a child's cwd.
 const PREFIXES = [
   'DATA_BACKEND', 'CONTROL_', 'FLEET_', 'TRANSFER_', 'BOT_', 'DISCORD_', 'WEBUI_', 'OAUTH_',
-  'STRIPE_', 'LEMONSQUEEZY_', 'PAYPAL_', 'PATREON_',
+  'STRIPE_', 'LEMONSQUEEZY_', 'PAYPAL_', 'PATREON_', 'DOTENV_',
 ];
 const NAMES = [
   'MASTER_URLS', 'SESSION_SECRET', 'CLIENT_ID', 'GUILD_ID', 'MAIN_GUILD_ID', 'NODE_NAME', 'GRAVEYARD_TTL_DAYS',

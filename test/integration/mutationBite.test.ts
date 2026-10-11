@@ -18,7 +18,10 @@ import { describe, expect, it } from 'vitest';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const TARGET = 'src/bot/internalSetup/fleet/nodeIdentity.ts';
 
-interface Pass { status: string; killedBy?: string; inconclusive?: string }
+interface Pass { id: string | null; status: string; killedBy?: string; inconclusive?: string }
+
+// The ids a pass ran tests for (targets.mjs), as runner.mjs read them.
+const ranFor = (reportDir: string, dir: string) => (JSON.parse(fs.readFileSync(path.join(root, reportDir, dir, 'run-ids.json'), 'utf8')) as string[]).sort();
 interface Mutant { location: { start: { line: number } }; mutator: string; original: string; passes: { a: Pass; b?: Pass; b2?: Pass } }
 
 function lineOf(text: string): number {
@@ -66,11 +69,14 @@ describe('the touched-line mutation gate', () => {
     expect(run.stdout).toMatch(/^Verdict: FAIL$/m);
     // Pass B's kills reran with the one file that killed them, and so did the run with no mutant after them.
     for (const dir of ['b2-1', 'control-b2']) {
-      const written = fs.readdirSync(path.join(root, reportDir!, dir));
+      const written = fs.readdirSync(path.join(root, reportDir!, dir)).filter(file => file !== 'targets.json' && file !== 'run-ids.json');
       expect(written.some(file => file.endsWith('-child.json')), dir).toBe(true);
       expect(written.filter(file => !file.includes('-child.')), dir).toEqual([]);
     }
     expect(fs.existsSync(path.join(root, reportDir!, 'b2-2'))).toBe(false);
+    // Pass B and its rerun ran tests for exactly the mutants they were for, matched in Stryker's own plan.
+    expect(ranFor(reportDir!, 'b')).toEqual(mutants.filter(m => m.passes.b).map(m => m.passes.b!.id).sort());
+    expect(ranFor(reportDir!, 'b2-1')).toEqual(on(child).map(m => m.passes.b2!.id).sort());
     fs.rmSync(path.join(root, reportDir!), { recursive: true, force: true });
   });
 
@@ -97,7 +103,9 @@ describe('the touched-line mutation gate', () => {
     const reportDir = /^Report: (\S+)/m.exec(run.stdout)?.[1];
     expect(reportDir, `${run.stdout}\n${run.stderr}`).toBeDefined();
     const { mutants } = JSON.parse(fs.readFileSync(path.join(root, reportDir!, 'mutants.json'), 'utf8')) as { mutants: (Mutant & { passes: { a2?: Pass & { voided?: string } } })[] };
+    const a2Ran = ranFor(reportDir!, 'a2');
     fs.rmSync(path.join(root, reportDir!), { recursive: true, force: true });
+    expect(a2Ran).toEqual(mutants.filter(m => m.passes.a2).map(m => m.passes.a2!.id).sort());
 
     const reran = mutants.filter(m => m.passes.a2);
     expect(reran.length).toBeGreaterThan(0);

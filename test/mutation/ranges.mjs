@@ -1,5 +1,6 @@
-// Which lines of src a change touched, and the Stryker mutate ranges that
-// cover them (VERIFY.md L5). Pure: the caller runs git and reads the files.
+// Which lines a change touched, which files it mutates, and the Stryker mutate
+// ranges that cover them (VERIFY.md L5). Pure: the caller runs git and reads
+// the files.
 import ts from 'typescript';
 
 /**
@@ -24,6 +25,14 @@ export function notMutated(file) {
   if (DECLARATION.test(file) || !CODE.test(file)) return 'not code';
   return null;
 }
+
+// Line breaks TypeScript and Stryker's parser count but git does not: in a
+// file that holds one, git's line numbers and theirs disagree after it.
+const EXTRA_BREAK = /\r(?!\n)|[\u2028\u2029]/;
+export const EXTRA_BREAK_WHY = 'it holds a line break git does not count (a lone CR, U+2028 or U+2029), so its lines cannot be matched to the change; make it a plain line feed or an escape';
+
+/** @param {string} text */
+export const holdsExtraBreak = text => EXTRA_BREAK.test(text);
 
 /**
  * Reads `git diff -U0` output: per file, the new-side lines added or changed,
@@ -176,19 +185,20 @@ export function widen(file, text, lines) {
   return mergeRanges(ranges);
 }
 
-// Tokens no mutant is made of: brackets, separators, and the keywords that only join blocks.
+// Tokens no mutant is made of and that carry no behaviour of their own: brackets and separators.
 const STRUCTURE = new Set([
   ts.SyntaxKind.OpenBraceToken, ts.SyntaxKind.CloseBraceToken, ts.SyntaxKind.OpenParenToken, ts.SyntaxKind.CloseParenToken,
   ts.SyntaxKind.OpenBracketToken, ts.SyntaxKind.CloseBracketToken, ts.SyntaxKind.SemicolonToken, ts.SyntaxKind.CommaToken,
-  ts.SyntaxKind.ElseKeyword, ts.SyntaxKind.TryKeyword, ts.SyntaxKind.FinallyKeyword, ts.SyntaxKind.DoKeyword,
   ts.SyntaxKind.EndOfFileToken,
 ]);
 
 /**
- * The lines that hold code: a token other than a bracket, a separator or a
- * block-joining keyword starts on them or runs across them (a multi-line
- * template). Blank, comment-only and brace-only lines are left out, wherever
- * they sit, since no mutant could touch them.
+ * The lines that hold code: a token other than a bracket or a separator starts
+ * on them or runs across them (a multi-line template). An else, try, finally
+ * or do line holds code. Blank and comment-only lines are left out, and so is
+ * a line of brackets and separators only, wherever it sits: no mutant can lie
+ * on it, and what was taken out of it (`}, 100);` made `});`), like a pure
+ * deletion, cannot be mutated.
  * @param {string} file
  * @param {string} text
  * @param {number[]} lines
@@ -229,16 +239,17 @@ export function untouched(file, text, lines, spans) {
 }
 
 /**
- * git arguments for the diff of src from base to the working tree, with every
- * option a user's config could change set here: the path prefixes, rename and
- * copy detection, hunk joining, relative paths, colour, external diff tools.
+ * git arguments for the diff of the whole repo from base to the working tree
+ * (planTargets names what it does not mutate), with every option a user's
+ * config could change set here: the path prefixes, rename and copy detection,
+ * the diff algorithm, hunk joining, relative paths, colour, external diff tools.
  * @param {string} base
  */
 export function diffArgs(base) {
   return [
     '-c', 'core.quotePath=false', '-c', 'diff.noprefix=false', '-c', 'diff.mnemonicPrefix=false', '-c', 'diff.renames=true',
-    'diff', '-U0', '--inter-hunk-context=0', '--src-prefix=a/', '--dst-prefix=b/', '--no-relative', '--no-color',
-    '--no-ext-diff', '--no-textconv', '--diff-filter=ACMR', base, '--', 'src',
+    'diff', '-U0', '--inter-hunk-context=0', '--diff-algorithm=myers', '--src-prefix=a/', '--dst-prefix=b/', '--no-relative',
+    '--no-color', '--no-ext-diff', '--no-textconv', '--diff-filter=ACMR', base, '--',
   ];
 }
 
@@ -247,7 +258,8 @@ export function diffArgs(base) {
  * that touches one of them must be killed; the others in the widened ranges
  * are context, run and listed but never gating. A pure deletion widens its two
  * neighbouring lines as context. An untracked file is taken whole (gating null:
- * every mutant gates).
+ * every mutant gates). A file that holds a line break git does not count is
+ * named and not mutated (EXTRA_BREAK_WHY).
  * @param {{ diff: FileChange[], untracked: string[], read: (file: string) => string }} change
  * @returns {{ targets: Target[], skipped: { file: string, why: string }[] }}
  */
@@ -260,6 +272,7 @@ export function planTargets({ diff, untracked, read }) {
     const why = notMutated(entry.file);
     if (why) { skipped.push({ file: entry.file, why }); continue; }
     const text = read(entry.file);
+    if (holdsExtraBreak(text)) { skipped.push({ file: entry.file, why: EXTRA_BREAK_WHY }); continue; }
     const lineCount = text.split('\n').length;
     const neighbours = entry.deletedAfter.flatMap(n => [n, n + 1]).filter(n => n >= 1 && n <= lineCount);
     const lines = [...new Set([...entry.changed, ...neighbours])];
@@ -267,7 +280,7 @@ export function planTargets({ diff, untracked, read }) {
     targets.push({ file: entry.file, ranges: widen(entry.file, text, lines), gating: [...new Set(entry.changed)].sort((a, b) => a - b) });
   }
   for (const file of untracked) {
-    const why = notMutated(file);
+    const why = notMutated(file) ?? (holdsExtraBreak(read(file)) ? EXTRA_BREAK_WHY : null);
     if (why) skipped.push({ file, why });
     else targets.push({ file, ranges: null, gating: null });
   }
@@ -299,6 +312,27 @@ export function linesOfTarget(target, lineCount) {
   }
   return [...lines].sort((a, b) => a - b);
 }
+
+/**
+ * Whether a mutant (1-based lines, as Stryker reports them) lies within the
+ * lines a --mutate pattern names (anywhere, when it names the whole file).
+ * @param {string} pattern
+ * @param {Location} location
+ */
+export function inPattern(pattern, location) {
+  const range = /:(\d+)(?::\d+)?-(\d+)(?::\d+)?$/.exec(pattern);
+  return !range || (Number(range[1]) <= location.start.line && location.end.line <= Number(range[2]));
+}
+
+/**
+ * The --mutate patterns that made no mutant, each judged on its own lines, so
+ * one beside another pattern on the same file is still named.
+ * @param {{ file: string, patterns: string[], gating: number[] | null }[]} targets
+ * @param {{ file: string, location: Location }[]} mutants
+ */
+export const unmatchedPatterns = (targets, mutants) => targets
+  .filter(target => target.gating === null)
+  .flatMap(target => target.patterns.filter(pattern => !mutants.some(m => m.file === target.file && inPattern(pattern, m.location))));
 
 /**
  * Whether a mutant (1-based lines, as Stryker reports them) touches a gating line.

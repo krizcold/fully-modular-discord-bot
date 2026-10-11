@@ -55,6 +55,16 @@ if (!out || files.length === 0 || (pass !== 'a' && pass !== 'b')) {
   console.error('runner.mjs is run by touched.mjs, which sets SMDB_MUTATION_PASS, SMDB_MUTATION_FILES and SMDB_MUTATION_OUT');
   process.exit(2);
 }
+// A pass on some of the mutants Stryker made runs no test for the others
+// (targets.mjs lists the ids it is for; touched.mjs drops the rest's results).
+// With no readable list, every mutant runs.
+const runIds = process.env.SMDB_MUTATION_RUN;
+if (runIds && mutant !== 'dry') {
+  /** @type {unknown} */
+  let ids = null;
+  try { ids = JSON.parse(fs.readFileSync(runIds, 'utf8')); } catch { ids = null; }
+  if (Array.isArray(ids) && !ids.includes(mutant)) process.exit(0);
+}
 if (only.length > 0) {
   for (const project of ['fast', 'integration', 'child']) {
     const these = only.filter(file => projectOf(file) === project);

@@ -32,12 +32,12 @@ function fakeVitest(fail: string[]) {
   return { script, out, read };
 }
 
-function runner(fake: { script: string; out: string }, pass: string, confirm: string, only: string[] = []) {
+function runner(fake: { script: string; out: string }, pass: string, confirm: string, only: string[] = [], env: NodeJS.ProcessEnv = {}) {
   return spawnSync(process.execPath, [path.join(root, 'test', 'mutation', 'runner.mjs')], {
     encoding: 'utf8',
     env: {
       ...process.env, SMDB_MUTATION_VITEST: fake.script, SMDB_MUTATION_PASS: pass, SMDB_MUTATION_FILES: '["src/a.ts"]', SMDB_MUTATION_OUT: fake.out,
-      SMDB_MUTATION_CONFIRM: confirm, SMDB_MUTATION_ONLY: JSON.stringify(only), __STRYKER_ACTIVE_MUTANT__: '7',
+      SMDB_MUTATION_CONFIRM: confirm, SMDB_MUTATION_ONLY: JSON.stringify(only), SMDB_MUTATION_RUN: '', __STRYKER_ACTIVE_MUTANT__: '7', ...env,
     },
   });
 }
@@ -77,6 +77,37 @@ describe('a mutant run', () => {
   });
 });
 
+describe('a pass on some of the mutants Stryker made', () => {
+  it('runs no test for a mutant the pass is not for, as its plan says, and every test when the plan is missing', () => {
+    const fake = fakeVitest([]);
+    const plan = path.join(fake.out, 'run-ids.json');
+    fs.writeFileSync(plan, JSON.stringify(['3']));
+    expect(runner(fake, 'b', '', [], { SMDB_MUTATION_RUN: plan }).status).toBe(0);
+    expect(fake.read()).toEqual([]);
+    expect(runner(fake, 'b', '', [], { SMDB_MUTATION_RUN: plan, __STRYKER_ACTIVE_MUTANT__: '3' }).status).toBe(0);
+    expect(fake.read().map(call => call.mutant)).toEqual(['3', '3']);
+    expect(runner(fake, 'b', '', [], { SMDB_MUTATION_RUN: path.join(fake.out, 'missing.json') }).status).toBe(0);
+    expect(fake.read().map(call => call.mutant)).toEqual(['3', '3', '7', '7']);
+  });
+
+  it('learns from Stryker\'s plan which mutant ids those are, by file, mutator, replacement and place', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-plan-'));
+    onTestFinished(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const targets = path.join(dir, 'targets.json');
+    const run = path.join(dir, 'run-ids.json');
+    fs.writeFileSync(targets, JSON.stringify(['src/a.ts|EqualityOperator|a >= 0|10:3-10:9']));
+    vi.stubEnv('SMDB_MUTATION_TARGETS', targets);
+    vi.stubEnv('SMDB_MUTATION_RUN', run);
+    const { strykerPlugins } = await import('../mutation/targets.mjs');
+    const Reporter = strykerPlugins[0].injectableClass as unknown as new () => { onMutationTestingPlanReady(event: unknown): void };
+    // Stryker's plan holds 0-based places; its results, and so the targets, 1-based ones.
+    const planned = (id: string, replacement: string, line: number) =>
+      ({ plan: 'Run', mutant: { id, fileName: path.join(root, 'src', 'a.ts'), mutatorName: 'EqualityOperator', replacement, location: { start: { line, column: 2 }, end: { line, column: 8 } } } });
+    new Reporter().onMutationTestingPlanReady({ mutantPlans: [planned('1', 'a >= 0', 9), planned('2', 'a <= 0', 9), planned('3', 'a >= 0', 10)] });
+    expect(JSON.parse(fs.readFileSync(run, 'utf8'))).toEqual(['1']);
+  });
+});
+
 describe('the run with no mutant after the reruns', () => {
   it('runs the reruns\' tests their way with no active mutant, and fails when a tier fails', () => {
     const failing = fakeVitest(['child']);
@@ -91,6 +122,19 @@ describe('the run with no mutant after the reruns', () => {
     expect(runControl({ root, out: passing.out, tier: 'a', files: ['src/a.ts'], only: [], env: { ...env, SMDB_MUTATION_VITEST: passing.script } }))
       .toEqual({ passed: true, why: '' });
     expect(passing.read().map(call => [call.project, call.scale])).toEqual([['fast', '4']]);
+  });
+});
+
+describe('the gate under an old node', () => {
+  // The node on PATH may be older than 22.12 (the lane's Windows box has 20.16); CI's is not, and skips this.
+  const probe = spawnSync('node', ['-p', 'process.versions.node'], { encoding: 'utf8', shell: process.platform === 'win32' });
+  const version = probe.status === 0 ? probe.stdout.trim() : '';
+  const [major, minor] = version.split('.').map(Number);
+  it.runIf(version !== '' && (major < 22 || (major === 22 && minor < 12)))('stops, naming the version, when SMDB_TEST_NODE is old too, instead of relaunching again', () => {
+    const run = spawnSync('node', [path.join(root, 'test', 'mutation', 'touched.mjs'), '--help'],
+      { encoding: 'utf8', timeout: 30_000, shell: process.platform === 'win32', env: { ...process.env, SMDB_TEST_NODE: 'node', SMDB_MUTATION_RELAUNCHED: '' } });
+    expect(run.status).toBe(2);
+    expect(run.stderr).toContain(`SMDB_TEST_NODE (node) runs v${version}`);
   });
 });
 

@@ -10,6 +10,7 @@ import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { runControl } from './control.mjs';
+import { canonicalName, fileOf as nameOf, keyOf } from './keys.mjs';
 import { PASSES } from './passes.mjs';
 
 /**
@@ -25,11 +26,14 @@ import { PASSES } from './passes.mjs';
 const [major, minor] = process.versions.node.split('.').map(Number);
 if (major < 22 || (major === 22 && minor < 12)) {
   const node = process.env.SMDB_TEST_NODE;
-  if (!node) {
-    console.error(`The mutation gate needs Node 22.12 or newer (this is ${process.version}); set SMDB_TEST_NODE to a newer node binary.`);
+  // A relaunch that is still too old stops here, instead of relaunching again.
+  if (!node || process.env.SMDB_MUTATION_RELAUNCHED) {
+    console.error(node
+      ? `The mutation gate needs Node 22.12 or newer, and SMDB_TEST_NODE (${node}) runs ${process.version}; point it at a newer node binary.`
+      : `The mutation gate needs Node 22.12 or newer (this is ${process.version}); set SMDB_TEST_NODE to a newer node binary.`);
     process.exit(2);
   }
-  const run = spawnSync(node, [fileURLToPath(import.meta.url), ...process.argv.slice(2)], { stdio: 'inherit' });
+  const run = spawnSync(node, [fileURLToPath(import.meta.url), ...process.argv.slice(2)], { stdio: 'inherit', env: { ...process.env, SMDB_MUTATION_RELAUNCHED: '1' } });
   if (run.error) console.error(`The mutation gate could not start ${node}: ${run.error.message}`);
   process.exit(run.status ?? (run.signal ? 130 : 2));
 }
@@ -47,7 +51,7 @@ try {
   console.error(`Verdict: NO RESULT (the gate could not load: ${error instanceof Error ? error.message.split('\n')[0] : String(error)}; run npm run test:install)`);
   process.exit(2);
 }
-const { diffArgs, gates, linesOfTarget, parseDiff, patternsOf, planTargets, untouched } = ranges;
+const { diffArgs, EXTRA_BREAK_WHY, gates, holdsExtraBreak, linesOfTarget, parseDiff, patternsOf, planTargets, unmatchedPatterns, untouched } = ranges;
 const { byKiller, classifyKill, judge, outcome, toConfirm, toPassB } = verdicts;
 
 const USAGE = 'usage: node test/mutation/touched.mjs [--base REF] [--mutate PATTERN]... [--concurrency N] [--keep]';
@@ -75,29 +79,17 @@ const git = (...args) => execFileSync('git', ['-c', 'core.quotePath=false', ...a
 const posix = file => file.split(path.sep).join('/');
 /** @param {string} pattern */
 const fileOfPattern = pattern => pattern.replace(/:\d+(:\d+)?-\d+(:\d+)?$/, '');
-const GLOB = /[*?[\]{}()!|+@]/;
-/**
- * A --mutate value's file under the name git gives it (from the bot root, with
- * forward slashes, the case and the path it has on disk), or null when it is no
- * file in the bot root. Stryker reads the value as a glob (extglobs included)
- * and the report matches mutants to targets by name, so both get this name.
- * @param {string} file
- */
-function canonicalFile(file) {
-  if (GLOB.test(file)) return null;
-  let real;
-  try { real = fs.realpathSync.native(path.resolve(root, file)); } catch { return null; }
-  if (!fs.statSync(real).isFile()) return null;
-  const relative = path.relative(fs.realpathSync.native(root), real);
-  if (path.isAbsolute(relative) || relative === '..' || relative.startsWith(`..${path.sep}`)) return null;
-  const name = posix(relative);
-  return GLOB.test(name) ? null : name;
-}
+// Each --mutate file is taken under the name it has on disk (keys.mjs), the
+// name Stryker matches, so its mutants find their target in the report.
 opts.mutate = opts.mutate.map(pattern => {
   const file = fileOfPattern(pattern);
-  const name = canonicalFile(file);
+  const name = canonicalName(root, file);
   if (name === null) {
     console.error(`--mutate takes a file in the bot root that exists, or such a file and lines, never a glob: ${pattern}\n${USAGE}`);
+    process.exit(2);
+  }
+  if (holdsExtraBreak(fs.readFileSync(path.join(root, name), 'utf8'))) {
+    console.error(`--mutate cannot take ${name}: ${EXTRA_BREAK_WHY}`);
     process.exit(2);
   }
   return `${name}${pattern.slice(file.length)}`;
@@ -137,15 +129,8 @@ function originalOf(file, location) {
   return text.length > 100 ? `${text.slice(0, 97)}...` : text;
 }
 
-/**
- * @param {string} file
- * @param {string} mutator
- * @param {string} replacement
- * @param {Location} l
- */
-const keyOf = (file, mutator, replacement, l) => `${file}|${mutator}|${replacement}|${l.start.line}:${l.start.column}-${l.end.line}:${l.end.column}`;
 /** @param {StrykerResult} r */
-const fileOf = r => posix(path.relative(root, path.resolve(root, r.fileName)));
+const fileOf = r => nameOf(root, r.fileName);
 /** @param {StrykerResult} r */
 const resultKey = r => keyOf(fileOf(r), r.mutatorName, r.replacement ?? '', r.location);
 /** @param {MutantRecord} m */
@@ -202,7 +187,9 @@ const common = {
   tempDirName: '.stryker-tmp',
   cleanTempDir: opts.keep ? false : 'always',
   incremental: false,
-  reporters: ['progress'],
+  // targets.mjs: in a pass on some of the mutants, the ids runner.mjs runs.
+  plugins: ['@stryker-mutator/*', path.join(root, 'test', 'mutation', 'targets.mjs')],
+  reporters: ['progress', 'smdb-targets'],
   logLevel: /** @type {import('@stryker-mutator/api/core').LogLevel} */ ('warn'),
 };
 
@@ -210,11 +197,12 @@ const common = {
  * Runs one Stryker pass. `tier` picks the tests (runner.mjs): a for the fast
  * tier, b for the integration and child tiers; `only`, when given, names the
  * test files to run instead. The reruns alone, a2 and b2, get four times the
- * time.
- * @param {{ name: PassName, dir: string, tier: 'a' | 'b', mutate: string[], files: string[], only?: string[], extra: Options }} run
+ * time. `keys`, when given, are the mutants the pass is for: Stryker makes every
+ * mutant its spans hold, and the others run no test (targets.mjs).
+ * @param {{ name: PassName, dir: string, tier: 'a' | 'b', mutate: string[], files: string[], only?: string[], keys?: string[], extra: Options }} run
  * @returns {Promise<StrykerResult[]>}
  */
-async function pass({ name, dir, tier, mutate, files, only = [], extra }) {
+async function pass({ name, dir, tier, mutate, files, only = [], keys, extra }) {
   const out = path.join(reportDir, dir);
   fs.mkdirSync(out, { recursive: true });
   process.env.SMDB_MUTATION_PASS = tier;
@@ -222,6 +210,9 @@ async function pass({ name, dir, tier, mutate, files, only = [], extra }) {
   process.env.SMDB_MUTATION_FILES = JSON.stringify(files);
   process.env.SMDB_MUTATION_ONLY = JSON.stringify(only);
   process.env.SMDB_MUTATION_OUT = out;
+  process.env.SMDB_MUTATION_TARGETS = keys ? path.join(out, 'targets.json') : '';
+  process.env.SMDB_MUTATION_RUN = keys ? path.join(out, 'run-ids.json') : '';
+  if (keys) fs.writeFileSync(path.join(out, 'targets.json'), JSON.stringify(keys));
   const { Stryker } = await import('@stryker-mutator/core');
   try {
     return await new Stryker({ ...common, mutate, ...extra }).runMutationTest();
@@ -274,7 +265,7 @@ const credited = m => ['Killed', 'Timeout'].includes(outcome(m));
  * @param {string[]} [only]
  */
 async function passOn(name, dir, tier, on, extra, only) {
-  const results = await pass({ name, dir, tier, mutate: [...new Set(on.map(spanOf))], files: [...new Set(on.map(m => m.file))], only, extra });
+  const results = await pass({ name, dir, tier, mutate: [...new Set(on.map(spanOf))], files: [...new Set(on.map(m => m.file))], only, keys: on.map(recordKey), extra });
   const byKey = new Map(results.map(r => [resultKey(r), r]));
   for (const m of on) {
     const r = byKey.get(recordKey(m));
@@ -299,12 +290,10 @@ function finish(stopped) {
 function report(stopped) {
   /** @type {{ file: string, lines: number[] }[]} */
   const noMutant = [];
-  /** @type {string[]} */
-  const unmatched = [];
+  const unmatched = stopped && mutants.length === 0 ? [] : unmatchedPatterns(targets, mutants);
   for (const target of targets) {
     const made = mutants.filter(m => m.file === target.file);
     if (stopped && mutants.length === 0) continue;
-    if (target.gating === null && made.length === 0) unmatched.push(...target.patterns);
     const text = linesOf(target.file).join('\n');
     /** @type {[number, number][]} */
     const spans = made.map(m => [m.location.start.line, m.location.end.line]);
@@ -327,13 +316,19 @@ try {
   } else {
     const base = git('merge-base', opts.base, 'HEAD').trim();
     const diff = parseDiff(git(...diffArgs(base)));
-    const untracked = git('ls-files', '-z', '--others', '--exclude-standard', '--', 'src').split('\0').filter(Boolean);
-    const deleted = git('-c', 'diff.renames=true', 'diff', '--name-only', '-z', '--no-relative', '--diff-filter=D', base, '--', 'src').split('\0').filter(Boolean);
+    const untracked = git('ls-files', '-z', '--others', '--exclude-standard').split('\0').filter(Boolean);
+    const deleted = git('-c', 'diff.renames=true', 'diff', '--name-only', '-z', '--no-relative', '--diff-filter=D', base, '--').split('\0').filter(Boolean);
     const plan = planTargets({ diff, untracked, read: file => linesOf(file).join('\n') });
-    targets = plan.targets.map(target => ({ ...target, patterns: patternsOf(target) }));
+    // git's names, under the name each file has on disk (keys.mjs), which Stryker matches.
+    targets = plan.targets.map(target => {
+      const file = canonicalName(root, target.file) ?? target.file;
+      return { ...target, file, patterns: patternsOf({ ...target, file }) };
+    });
     skipped = [...plan.skipped, ...deleted.map(file => ({ file, why: 'deleted: nothing is left to mutate' }))];
     scope = `the change from ${opts.base} (merge-base ${base.slice(0, 7)}) to the working tree`;
-    emptyScope = diff.length === 0 && untracked.length === 0 && deleted.length === 0;
+    /** @param {string} file */
+    const inSrc = file => file.startsWith('src/');
+    emptyScope = !diff.some(entry => inSrc(entry.file)) && !untracked.some(inSrc) && !deleted.some(inSrc);
   }
   if (targets.length === 0) finish();
 

@@ -36,4 +36,10 @@ describe('the env scrub', () => {
     const env = scrubEnv({ DISCORD_TOKEN: 't', STRIPE_SECRET_KEY: 's', SESSION_SECRET: 'x', FLEET_CONFIRM_TAKEOVER: '1', DATA_BACKEND_URL: 'u', PATH: 'p', __STRYKER_ACTIVE_MUTANT__: '7', NODE_ENV: 'test' });
     expect(env).toEqual({ PATH: 'p', __STRYKER_ACTIVE_MUTANT__: '7', NODE_ENV: 'test' });
   });
+
+  // dotenv, which src's `dotenv/config` imports load, reads these itself: one
+  // would load a real .env from anywhere, whatever the child's cwd.
+  it('takes out the keys dotenv reads, which the scan of src cannot find', () => {
+    expect(scrubEnv({ DOTENV_CONFIG_PATH: '/srv/bot/.env', DOTENV_CONFIG_OVERRIDE: 'true', DOTENV_KEY: 'k', PATH: 'p' })).toEqual({ PATH: 'p' });
+  });
 });
