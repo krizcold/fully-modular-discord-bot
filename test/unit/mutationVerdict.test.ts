@@ -3,7 +3,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { describe, expect, it, onTestFinished } from 'vitest';
-import { classifyKill, judge, outcome, toConfirm, toPassB, type MutantRecord, type PassResult } from '../mutation/verdict.mjs';
+import { classifyKill, confirmed, judge, outcome, toConfirm, toPassB, type MutantRecord, type PassResult } from '../mutation/verdict.mjs';
 
 // What the L5 gate concludes (mutation/README.md): when a run counts as a
 // kill, which mutants go to which pass, and the verdict.
@@ -93,6 +93,14 @@ describe('the passes a mutant goes through', () => {
     expect(outcome(hungInB(pass('Killed', { killedBy: 'child/y.test.ts > y' })))).toBe('Killed');
     expect(outcome(mutant(1, true, { a: pass('Timeout') }))).toBe('Inconclusive');
     expect(outcome(mutant(1, false, { a: pass('Timeout') }))).toBe('Timeout');
+  });
+
+  it('counts nothing a rerun found when the run with no mutant after it failed', () => {
+    const voided = { voided: 'the run with no mutant after pass b2 failed' };
+    expect(confirmed(mutant(1, true, { a: pass('Survived'), b: pass('Killed', { killedBy: 'x' }), b2: pass('Killed', { killedBy: 'y', ...voided }) })))
+      .toEqual({ outcome: 'Inconclusive', why: 'the run with no mutant after pass b2 failed' });
+    expect(outcome(mutant(1, true, { a: pass('Timeout'), a2: pass('Timeout', { voided: 'x' }) }))).toBe('Inconclusive');
+    expect(outcome(mutant(1, true, { a: pass('Survived'), b: pass('Killed', { killedBy: 'x' }), b2: pass('Survived', voided) }))).toBe('Survived');
   });
 });
 

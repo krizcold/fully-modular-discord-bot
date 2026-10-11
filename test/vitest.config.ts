@@ -1,6 +1,7 @@
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { defineConfig } from 'vitest/config';
+import { TIME_SCALE } from './helpers/time.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repo = path.resolve(here, '..');
@@ -34,8 +35,8 @@ export default defineConfig({
     // setup.ts puts it right (unit/envScrub.test.ts).
     env: { NODE_ENV: 'development' },
     pool: 'forks',
-    testTimeout: 30_000,
-    hookTimeout: 180_000,
+    testTimeout: 30_000 * TIME_SCALE,
+    hookTimeout: 180_000 * TIME_SCALE,
     projects: [
       { extends: true, test: { name: 'fast', include: ['**/*.test.ts'], exclude: ['node_modules/**', ...SLOW] } },
       { extends: true, test: { name: 'integration', include: ['integration/**/*.test.ts'] } },

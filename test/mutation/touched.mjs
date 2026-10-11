@@ -9,6 +9,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { runControl } from './control.mjs';
 
 /**
  * @typedef {import('./ranges.mjs').Location} Location
@@ -59,11 +60,7 @@ for (let i = 0; i < argv.length; i++) {
     return argv[++i];
   };
   if (arg === '--base') opts.base = value();
-  else if (arg === '--mutate') {
-    const pattern = value();
-    if (/[*?[\]{}!]/.test(pattern)) { console.error(`--mutate takes a file or file:lines, not a glob: ${pattern}\n${USAGE}`); process.exit(2); }
-    opts.mutate.push(pattern);
-  }
+  else if (arg === '--mutate') opts.mutate.push(value());
   else if (arg === '--concurrency') opts.concurrency = Math.max(1, Number(value()) || 1);
   else if (arg === '--keep') opts.keep = true;
   else { console.error(USAGE); process.exit(2); }
@@ -71,6 +68,18 @@ for (let i = 0; i < argv.length; i++) {
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 process.chdir(root);
+/** @param {string} pattern */
+const fileOfPattern = pattern => pattern.replace(/:\d+(:\d+)?-\d+(:\d+)?$/, '');
+// A --mutate value names one file that exists: Stryker reads it as a glob
+// (extglobs included), and a target that is not a plain file would leave its
+// mutants with no target to report against.
+for (const pattern of opts.mutate) {
+  const file = fileOfPattern(pattern);
+  if (/[*?[\]{}()!|+@]/.test(file) || !fs.statSync(path.join(root, file), { throwIfNoEntry: false })?.isFile()) {
+    console.error(`--mutate takes a file that exists, or a file and lines, never a glob: ${pattern}\n${USAGE}`);
+    process.exit(2);
+  }
+}
 /** @param {string[]} args */
 const git = (...args) => execFileSync('git', ['-c', 'core.quotePath=false', ...args], { cwd: root, encoding: 'utf8', maxBuffer: 256 * 1024 * 1024 });
 /** @param {string} file */
@@ -181,7 +190,8 @@ const common = {
 
 /**
  * Runs one Stryker pass. `tier` picks the tests (runner.mjs): a for the fast
- * tier, b for the integration and child tiers.
+ * tier, b for the integration and child tiers. The reruns alone, a2 and b2,
+ * run in runner.mjs's rerun mode.
  * @param {PassName} name
  * @param {'a' | 'b'} tier
  * @param {string[]} mutate
@@ -193,6 +203,7 @@ async function pass(name, tier, mutate, passFiles, extra) {
   const out = path.join(reportDir, name);
   fs.mkdirSync(out, { recursive: true });
   process.env.SMDB_MUTATION_PASS = tier;
+  process.env.SMDB_MUTATION_CONFIRM = name === 'a2' || name === 'b2' ? '1' : '';
   process.env.SMDB_MUTATION_FILES = JSON.stringify(passFiles);
   process.env.SMDB_MUTATION_OUT = out;
   const { Stryker } = await import('@stryker-mutator/core');
@@ -207,9 +218,10 @@ async function pass(name, tier, mutate, passFiles, extra) {
 
 /**
  * Runs a pass's tests once more with no mutant, here in the checkout, after
- * the reruns alone counted a kill or a timeout: those count only if the tests
- * still pass without a mutant, so a machine or a container that went bad
- * during the reruns stops the gate instead.
+ * the reruns alone counted a kill or a timeout (control.mjs): those count only
+ * if the tests still pass without a mutant. When they fail, a machine or a
+ * container went bad during the reruns, so their results are voided and the
+ * gate stops.
  * @param {PassName} after
  * @param {'a' | 'b'} tier
  * @param {MutantRecord[]} on
@@ -219,20 +231,15 @@ function control(after, tier, on) {
   const out = path.join(reportDir, name);
   fs.mkdirSync(out, { recursive: true });
   console.log(`L5: the same tests once with no mutant, to check the machine after pass ${after}`);
-  const { __STRYKER_ACTIVE_MUTANT__: _active, ...env } = process.env;
-  const run = spawnSync(process.execPath, [path.join(root, 'test', 'mutation', 'runner.mjs')], {
-    cwd: root,
-    stdio: 'ignore',
-    timeout: 60 * 60_000,
-    env: { ...env, SMDB_MUTATION_PASS: tier, SMDB_MUTATION_FILES: JSON.stringify([...new Set(on.map(m => m.file))]), SMDB_MUTATION_OUT: out },
-  });
+  const run = runControl({ root, out, tier, files: [...new Set(on.map(m => m.file))] });
   const logs = `${posix(path.relative(root, out))}/dry-*.log`;
-  if (run.status !== 0) {
-    throw new PassError([
-      `the run with no mutant after pass ${after} failed (${run.error ? run.error.message : `exit ${run.status ?? run.signal}`}), so what its reruns counted cannot be told from the machine's failures`,
-      ...dryFailures(name),
-      `its logs: ${logs}`,
-    ].join('\n'));
+  if (!run.passed) {
+    const why = `the run with no mutant after pass ${after} failed`;
+    for (const m of on) {
+      const result = m.passes[after];
+      if (result) m.passes[after] = { ...result, voided: why };
+    }
+    throw new PassError([`${why} (${run.why}), so what its reruns counted cannot be told from the machine's failures`, ...dryFailures(name), `its logs: ${logs}`].join('\n'));
   }
   controls.push(`after pass ${after}: passed (${logs})`);
 }
@@ -300,7 +307,7 @@ try {
   // What to mutate: the explicit patterns (every mutant gates), or the change
   // from the merge-base of --base and HEAD to the working tree.
   if (opts.mutate.length > 0) {
-    targets = opts.mutate.map(pattern => ({ file: pattern.replace(/:\d+(:\d+)?-\d+(:\d+)?$/, ''), patterns: [pattern], gating: null }));
+    targets = opts.mutate.map(pattern => ({ file: fileOfPattern(pattern), patterns: [pattern], gating: null }));
   } else {
     const base = git('merge-base', opts.base, 'HEAD').trim();
     const diff = parseDiff(git(...diffArgs(base)));

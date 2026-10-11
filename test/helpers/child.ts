@@ -5,6 +5,10 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { onTestFinished } from 'vitest';
 import { scrubEnv } from './env';
+import { TIME_SCALE } from './time.mjs';
+
+// How long one scenario step may take.
+export const STEP_MS = 20_000 * TIME_SCALE;
 
 // The repo this suite sits in, found from this file's own place, so a copy of
 // the repo (a Stryker sandbox) runs its own dist and never another checkout's.
@@ -30,7 +34,7 @@ export interface ScenarioRun<T> {
 // with NODE_ENV 'test' and its own DATA_DIR. It fails on a missing RESULT line,
 // a nonzero exit, a timeout, or a bot module loaded from anywhere but this
 // repo's dist.
-export function runScenario<T>(script: string, args: string[], dataDir: string, timeoutMs = 20_000): Promise<ScenarioRun<T>> {
+export function runScenario<T>(script: string, args: string[], dataDir: string, timeoutMs = STEP_MS): Promise<ScenarioRun<T>> {
   const env: NodeJS.ProcessEnv = { ...scrubEnv({ ...process.env }), NODE_ENV: 'test', DATA_DIR: dataDir };
   const child = spawn(process.execPath, [path.join(SCENARIOS, script), ...args], { cwd: dataDir, env, stdio: ['ignore', 'pipe', 'pipe'] });
   let stdout = '';

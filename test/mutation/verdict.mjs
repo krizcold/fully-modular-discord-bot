@@ -4,7 +4,8 @@
 /**
  * @typedef {import('./ranges.mjs').Location} Location
  * @typedef {'a' | 'a2' | 'b' | 'b2'} PassName
- * @typedef {{ id: string | null, status: string, statusReason?: string, killedBy?: string, timeout?: string, inconclusive?: string }} PassResult
+ * @typedef {{ id: string | null, status: string, statusReason?: string, killedBy?: string, timeout?: string, inconclusive?: string,
+ *   voided?: string }} PassResult voided: why a rerun's kill or timeout no longer counts
  * @typedef {{ file: string, location: Location, mutator: string, original: string, replacement: string, gating: boolean,
  *   passes: Partial<Record<PassName, PassResult>> }} MutantRecord
  * @typedef {{ name: string, status?: string, message?: string,
@@ -85,7 +86,8 @@ export const latest = m => /** @type {PassResult} */ (m.passes.b2 ?? m.passes.b 
  * A mutant's outcome, counting for a gating one only what its rerun alone
  * confirmed: a timeout counts when the rerun hangs too or fails a test, and a
  * pass B kill only when the rerun fails a test again (a hang is not the same
- * evidence). One the gate never reran is inconclusive.
+ * evidence). One the gate never reran, or whose rerun was voided (the run with
+ * no mutant after it failed), is inconclusive.
  * @param {MutantRecord} m
  * @returns {{ outcome: string, why?: string }}
  */
@@ -93,6 +95,8 @@ export function confirmed(m) {
   const { a2, b, b2 } = m.passes;
   const last = outcomeOf(latest(m));
   if (!m.gating || (last !== 'Killed' && last !== 'Timeout')) return { outcome: last };
+  const { voided } = latest(m);
+  if (voided) return { outcome: 'Inconclusive', why: voided };
   if (b2 && b && outcomeOf(b) === 'Killed' && last === 'Timeout') {
     return { outcome: 'Inconclusive', why: `killed in pass B by ${b.killedBy}, but hung instead of failing when run alone` };
   }
@@ -174,7 +178,7 @@ export function judge(run) {
     `Mutated: ${made.length > 0 ? made.join(', ') : 'nothing'}`,
     ...(run.skipped.length > 0 ? ['Not mutated:', ...run.skipped.map(s => `  ${s.file}: ${s.why}`)] : []),
     ...(run.unmatched.length > 0 ? ['Patterns that made no mutant:', ...run.unmatched.map(p => `  ${p}`)] : []),
-    ...(run.noMutant.length > 0 ? ['Changed lines no mutant touches (L5 says nothing about them; types and imports land here):',
+    ...(run.noMutant.length > 0 ? ['Changed lines no mutant starts on (L5 says nothing about them; types, imports, signatures and the later lines of a multi-line object, array, call or condition land here):',
       ...run.noMutant.map(n => `  ${n.file}: ${n.lines.join(', ')}`)] : []),
     `Gating mutants (they touch a changed line): ${gating.length}: ${tally(gating)}`,
     `  killed in pass A: ${gating.filter(m => !m.passes.b && outcome(m) === 'Killed').length}; sent to pass B: ${gating.filter(m => m.passes.b).length}, killed there: ${gating.filter(m => m.passes.b && outcome(m) === 'Killed').length}`,

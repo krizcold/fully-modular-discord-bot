@@ -10,7 +10,9 @@ active mutant travels in `__STRYKER_ACTIVE_MUTANT__` and reaches child processes
 | touched.mjs | the gate: finds the touched lines, runs the passes, writes the report; exit 0 PASS, 1 FAIL, 2 NO RESULT |
 | ranges.mjs | (library) the touched lines from `git diff -U0` and how far each widens; unit/mutationRanges.test.ts |
 | verdict.mjs | (library) when a run counts as a kill, which mutants go to which pass, the verdict; unit/mutationVerdict.test.ts |
-| runner.mjs | the command every pass runs inside Stryker's sandbox |
+| runner.mjs | the command every pass runs inside Stryker's sandbox; unit/mutationRunner.test.ts |
+| control.mjs | (library) the run with no mutant after the reruns; unit/mutationRunner.test.ts |
+| ../helpers/time.mjs | the factor on every test's time limits (4 in a rerun alone) |
 | ../helpers/build.cjs | builds dist the way `npm run build` does, stamped and locked; pass B's buildCommand |
 | ../helpers/child.ts | runs a child scenario (test/child/scenarios/) and checks what it loaded |
 
@@ -24,8 +26,8 @@ From the bot root, with Node 22.12 or newer (or SMDB_TEST_NODE set, as for `npm 
 - With no option it mutates the change from HEAD to the working tree: the job before it is committed. For a job already
   committed, pass `--base` the commit before it; `--base main` takes everything since the merge-base with main (a
   branch). Untracked files under src are taken whole.
-- `--mutate src/x.ts:10-20` (a file, or a file and lines, repeatable; never a glob) skips git; every mutant it makes
-  gates.
+- `--mutate src/x.ts:10-20` (a file that exists, or a file and lines, repeatable; never a glob) skips git; every
+  mutant it makes gates.
 - `--concurrency N` sets pass A's parallel runs (default: half the cores); pass B uses half of that.
 - `--keep` keeps the sandboxes in `.stryker-tmp/` for a look after the run. Without it every sandbox is removed, a
   failed pass's too.
@@ -56,11 +58,13 @@ detection, hunk joining).
 - A pure deletion has no line left to mutate: its two neighbouring lines are context only.
 - Not mutated, and named in the report with the reason: files outside src, files that are not code, `.d.ts` files, and
   the browser views under src/webui/public (copied into dist, never compiled, and no test loads them yet).
-- A changed line of code that no mutant touches (types, imports, signatures and a bare `await f();` land here), in a
-  diff, an untracked file or a `--mutate` pattern, is named in the report: L5 says nothing about it. A mutant touches a
-  line only when it lies within what that line widens to by itself, so the emptying of a body touches none of the lines
-  inside it, and a file taken whole names the same lines as each of its lines changed alone. A deleted src file is
-  named too.
+- A changed line of code that no mutant starts on, in a diff, an untracked file or a `--mutate` pattern, is named in
+  the report: L5 says nothing about it. A mutant counts only for the line it starts on, and only when it lies within
+  what that line widens to by itself. So types, imports, signatures, a bare `await f();`, and the lines after the first
+  of a multi-line object, array, arrow body, call or condition land in the list: emptying an object or flipping a whole
+  condition says nothing about each of its lines. A file taken whole names the same lines as each of its lines changed
+  alone. The list can name a line some mutant does reach; it never leaves out one that no mutant starts on. A deleted
+  src file is named too.
 
 ## The passes
 
@@ -73,14 +77,17 @@ detection, hunk joining).
    (build.cjs), then each survivor runs `vitest related` on the integration tier and then the whole child tier, whose
    scenarios start real processes on that dist. A child sees the mutant through the env.
 3. **Reruns alone.** A gating mutant that timed out in pass A or B, and every gating kill of pass B (where containers
-   and children can fail on their own), runs again alone, one at a time, with a larger budget for the whole run
-   (vitest's own limits per test and per hook stay as they are). A timeout counts as killed when the rerun hangs the
-   tests again or fails a test; a pass B kill counts only when the rerun fails a test again, since a hang is not the
-   same evidence. One that then survives pass A goes on to pass B. A mutant the gate never reran (it stopped first) is
-   inconclusive.
+   and children can fail on their own), runs again alone, one at a time. A rerun gives every test, hook and child
+   scenario step four times its time limit (a test's own explicit limit is not scaled), and Stryker a larger budget for
+   the whole run. It does not stop at the first failure and runs both tiers of pass B, so the order vitest picks (it
+   puts files that failed last time first) cannot decide what it finds. A timeout counts as killed when the rerun
+   hangs the tests again or fails a test; a pass B kill counts only when the rerun fails a test again, since a hang is
+   not the same evidence. One that then survives pass A goes on to pass B. A mutant the gate never reran (it stopped
+   first) is inconclusive.
 4. **A run with no mutant after the reruns.** When a rerun counted a kill or a timeout, the same tests run once more
-   with no mutant, in the checkout itself. If they fail, the machine or a container went bad during the reruns, so the
-   gate ends NO RESULT instead of counting what they found.
+   with no mutant, in the checkout itself, the way the reruns ran them (mutation/control.mjs). If they fail, the
+   machine or a container went bad during the reruns, so what the reruns counted is inconclusive and the gate ends NO
+   RESULT. What it cannot see: a machine that was four times slower for one rerun only and well again by the end.
 
 A run Stryker counts as a kill is checked against vitest's report of it: it is a kill only when a test itself failed for
 a reason other than the machine. When every failing test (or its hook) timed out it is a timeout (rerun as above).
@@ -143,7 +150,9 @@ removed source file.
   shows, survives pass A and dies in pass B to child/fleetIdentity.test.ts, again when rerun alone, and the run with no
   mutant after that rerun passes. One mutant of the first line is equivalent (`''` and the replacement both read as "not
   active"), so the run also shows the FAIL verdict and how a survivor is listed. The same file checks that an unknown
-  base and a pattern that makes no mutant both end NO RESULT, exit 2, and that a glob is refused.
+  base and a pattern that makes no mutant both end NO RESULT, exit 2, and that a glob or a missing file is refused.
+- A gate run on a stand-in for vitest (every mutant times out, then the run with no mutant after the reruns fails)
+  ends NO RESULT, with every timeout the reruns confirmed listed as inconclusive.
 - The bite fails when the plumbing breaks: with the active mutant dropped from the child's env the child-only mutants
   survive, and with the scenario loading another checkout's dist pass B refuses at its first run.
 

@@ -219,10 +219,13 @@ function codeLinesOf(sf, lines) {
 }
 
 /**
- * The code lines among `lines` that no mutant tests. A mutant tests a line
- * when it spans the line and lies within one of the spans the line widens to
- * by itself: emptying a body says nothing about each line in it, so the lines
- * of a file taken whole are judged the way the same lines changed alone are.
+ * The code lines among `lines` that no mutant starts on. A mutant counts only
+ * for the line it starts on, and only when it lies within one of the spans
+ * that line widens to by itself: emptying a body, an object or an array, or
+ * flipping a condition split over lines, says nothing about the lines after
+ * its first, and the body of a header is not the header's. So the lines of a
+ * file taken whole are judged the way the same lines changed alone are, and a
+ * line can be named that a mutant only reaches through another line.
  * @param {string} file
  * @param {string} text
  * @param {number[]} lines
@@ -233,7 +236,7 @@ export function untouched(file, text, lines, spans) {
   return codeLinesOf(sf, lines).filter(n => {
     /** @type {Range[]} */
     const units = [[n, n], ...unitsOf(sf, n)];
-    return !spans.some(([first, last]) => first <= n && n <= last && units.some(([from, to]) => from <= first && last <= to));
+    return !spans.some(([first, last]) => first === n && units.some(([from, to]) => from <= first && last <= to));
   });
 }
 

@@ -1,5 +1,6 @@
 import { spawnSync } from 'child_process';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { describe, expect, it } from 'vitest';
@@ -66,7 +67,43 @@ describe('the touched-line mutation gate', () => {
     fs.rmSync(path.join(root, reportDir!), { recursive: true, force: true });
   });
 
-  it('has no result, exit 2, when its base is unknown or its patterns make no mutant', { timeout: 300_000 }, () => {
+  it('counts nothing its reruns found, and has no result, when the run with no mutant after them fails', { timeout: 600_000 }, () => {
+    // A stand-in for vitest: the run with no mutant passes, every mutant's test
+    // times out, and the run with no mutant after the reruns fails.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-control-'));
+    const fake = path.join(dir, 'vitest.cjs');
+    fs.writeFileSync(fake, [
+      "const fs = require('fs');",
+      "const file = process.argv.find(arg => arg.startsWith('--outputFile=')).slice('--outputFile='.length);",
+      'const mutant = process.env.__STRYKER_ACTIVE_MUTANT__;',
+      "const control = file.split('\\\\').join('/').includes('/control-');",
+      "const message = control ? 'Error: the database went away' : mutant ? 'Error: Test timed out in 30000ms' : '';",
+      "const test = { status: message ? 'failed' : 'passed', fullName: 'reads', failureMessages: message ? [message] : [] };",
+      "fs.writeFileSync(file, JSON.stringify({ testResults: [{ name: 'unit/x.test.ts', status: test.status, assertionResults: [test] }] }));",
+      'process.exit(message ? 1 : 0);',
+      '',
+    ].join('\n'));
+    const line = lineOf("return (process.env.FLEET_BACKUP_MODE || '').trim().toLowerCase() === 'active';");
+    const run = spawnSync(process.execPath, [path.join(root, 'test', 'mutation', 'touched.mjs'), '--mutate', `${TARGET}:${line}-${line}`, '--concurrency', '1'],
+      { cwd: root, encoding: 'utf8', timeout: 580_000, env: { ...process.env, SMDB_MUTATION_VITEST: fake } });
+    fs.rmSync(dir, { recursive: true, force: true });
+    const reportDir = /^Report: (\S+)/m.exec(run.stdout)?.[1];
+    expect(reportDir, `${run.stdout}\n${run.stderr}`).toBeDefined();
+    const { mutants } = JSON.parse(fs.readFileSync(path.join(root, reportDir!, 'mutants.json'), 'utf8')) as { mutants: (Mutant & { passes: { a2?: Pass & { voided?: string } } })[] };
+    fs.rmSync(path.join(root, reportDir!), { recursive: true, force: true });
+
+    const reran = mutants.filter(m => m.passes.a2);
+    expect(reran.length).toBeGreaterThan(0);
+    for (const m of reran) expect(m.passes.a2).toMatchObject({ voided: 'the run with no mutant after pass a2 failed' });
+    expect(run.status).toBe(2);
+    expect(run.stdout).toMatch(/^Stopped:\n {2}the run with no mutant after pass a2 failed \(exit 1\), so what its reruns counted cannot be told from the machine's failures$/m);
+    expect(run.stdout).toMatch(/^ {2}the run with no mutant failed in unit\/x\.test\.ts: Error: the database went away$/m);
+    expect(run.stdout).toMatch(/^Inconclusive .*\n {2}src\/bot\/internalSetup\/fleet\/nodeIdentity\.ts:\d+:\d+ .*\(the run with no mutant after pass a2 failed\)$/m);
+    expect(run.stdout).not.toMatch(/^Timeouts /m);
+    expect(run.stdout).not.toMatch(/^Runs with no mutant after the reruns:/m);
+  });
+
+  it('has no result, exit 2, when its base is unknown or its patterns make no mutant, and refuses a glob or a missing file', { timeout: 300_000 }, () => {
     const gate = (...args: string[]) => spawnSync(process.execPath, [path.join(root, 'test', 'mutation', 'touched.mjs'), ...args], { cwd: root, encoding: 'utf8', timeout: 280_000 });
     const clean = (stdout: string) => {
       const dir = /^Report: (\S+)/m.exec(stdout)?.[1];
@@ -74,9 +111,11 @@ describe('the touched-line mutation gate', () => {
     };
 
     expect(gate('--help').status).toBe(2);
-    const glob = gate('--mutate', 'src/**/*.ts');
-    expect(glob.status).toBe(2);
-    expect(glob.stderr).toContain('--mutate takes a file or file:lines, not a glob: src/**/*.ts');
+    for (const pattern of ['src/**/*.ts', 'src/bot/internalSetup/fleet/+(nodeIdentity|takeover).ts', 'src/no/such/file.ts:1-5']) {
+      const refused = gate('--mutate', pattern);
+      expect(refused.status, pattern).toBe(2);
+      expect(refused.stderr).toContain(`--mutate takes a file that exists, or a file and lines, never a glob: ${pattern}`);
+    }
 
     const unknown = gate('--base', 'no-such-ref-anywhere');
     clean(unknown.stdout);
@@ -84,10 +123,11 @@ describe('the touched-line mutation gate', () => {
     expect(unknown.stdout).toMatch(/^Stopped:\n {2}the gate stopped: Command failed: git .*merge-base no-such-ref-anywhere HEAD/m);
     expect(unknown.stdout).toMatch(/^Verdict: NO RESULT \(the gate stopped before it finished\)$/m);
 
-    const nothing = gate('--mutate', 'src/no/such/file.ts:1-5', '--concurrency', '1');
+    // The file's opening comment and first import: no mutant can be made there.
+    const nothing = gate('--mutate', `${TARGET}:1-5`, '--concurrency', '1');
     clean(nothing.stdout);
     expect(nothing.status, nothing.stderr).toBe(2);
-    expect(nothing.stdout).toMatch(/^Patterns that made no mutant:\n {2}src\/no\/such\/file\.ts:1-5$/m);
+    expect(nothing.stdout).toMatch(/^Patterns that made no mutant:\n {2}src\/bot\/internalSetup\/fleet\/nodeIdentity\.ts:1-5$/m);
     expect(nothing.stdout).toMatch(/^Verdict: NO RESULT \(no gating mutant was made/m);
   });
 });
