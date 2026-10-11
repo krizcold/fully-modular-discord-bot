@@ -170,16 +170,39 @@ export function widen(file, text, lines) {
   return mergeRanges(ranges);
 }
 
+// Tokens no mutant is made of: brackets, separators, and the keywords that only join blocks.
+const STRUCTURE = new Set([
+  ts.SyntaxKind.OpenBraceToken, ts.SyntaxKind.CloseBraceToken, ts.SyntaxKind.OpenParenToken, ts.SyntaxKind.CloseParenToken,
+  ts.SyntaxKind.OpenBracketToken, ts.SyntaxKind.CloseBracketToken, ts.SyntaxKind.SemicolonToken, ts.SyntaxKind.CommaToken,
+  ts.SyntaxKind.ElseKeyword, ts.SyntaxKind.TryKeyword, ts.SyntaxKind.FinallyKeyword, ts.SyntaxKind.DoKeyword,
+  ts.SyntaxKind.EndOfFileToken,
+]);
+
 /**
- * The lines that hold code (a statement or part of one), leaving out blank,
- * comment-only and brace-only lines, which no mutant could touch.
+ * The lines that hold code: a token other than a bracket, a separator or a
+ * block-joining keyword starts on them or runs across them (a multi-line
+ * template). Blank, comment-only and brace-only lines are left out, wherever
+ * they sit, since no mutant could touch them.
  * @param {string} file
  * @param {string} text
  * @param {number[]} lines
  */
 export function codeLines(file, text, lines) {
   const sf = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true, scriptKind(file));
-  return lines.filter(line => line >= 1 && line <= sf.getLineStarts().length && unitsOf(sf, line).length > 0);
+  /** @param {number} pos */
+  const lineOf = pos => sf.getLineAndCharacterOfPosition(pos).line + 1;
+  /** @type {Set<number>} */
+  const withCode = new Set();
+  /** @param {ts.Node} node */
+  const walk = node => {
+    if (node.kind >= ts.SyntaxKind.FirstJSDocNode && node.kind <= ts.SyntaxKind.LastJSDocNode) return;
+    const children = node.getChildren(sf);
+    if (children.length > 0) { children.forEach(walk); return; }
+    if (STRUCTURE.has(node.kind) || node.getStart(sf) === node.getEnd()) return;
+    for (let n = lineOf(node.getStart(sf)); n <= lineOf(node.getEnd() - 1); n++) withCode.add(n);
+  };
+  walk(sf);
+  return lines.filter(line => withCode.has(line));
 }
 
 /**

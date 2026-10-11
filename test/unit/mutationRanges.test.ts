@@ -193,9 +193,25 @@ describe('the widening', () => {
     expect(rangesOf(SHAPES.conditionWithCallback, [6])).toEqual([[6, 6]]);
   });
 
-  it('tells lines that hold code from blank, comment-only and brace-only ones', () => {
-    const text = [SAMPLE, '// a comment', '', '/**', ' * a doc', ' */', 'export const z = 1;'].join('\n');
-    expect(codeLines('src/a.ts', text, Array.from({ length: 17 }, (_, i) => i + 1))).toEqual([1, 2, 3, 4, 6, 7, 8, 9, 10, 17]);
+  it('tells lines that hold code from blank, comment-only and brace-only ones, inside a statement too', () => {
+    const text = [
+      SAMPLE, // 1 to 11
+      '// a comment', // 12
+      '', // 13
+      'export interface Role {', // 14
+      '  /** a doc */', // 15
+      '  name?: string;', // 16
+      '  // a note', // 17
+      '}', // 18
+      'export const t = `a', // 19
+      'b`;', // 20
+      'if (t) {', // 21
+      '  f(1, 2);', // 22
+      '} else {', // 23
+      '  f(2, 1);', // 24
+      '}', // 25
+    ].join('\n');
+    expect(codeLines('src/a.ts', text, Array.from({ length: 25 }, (_, i) => i + 1))).toEqual([1, 2, 3, 4, 6, 7, 8, 10, 14, 16, 19, 20, 21, 22, 24]);
   });
 
   it('joins ranges that meet, since Stryker needs one range to hold a whole mutant', () => {
