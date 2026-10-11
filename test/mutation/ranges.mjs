@@ -97,19 +97,23 @@ const COMPOUND = new Set([
   ts.SyntaxKind.SetAccessor, ts.SyntaxKind.ModuleDeclaration, ts.SyntaxKind.ClassStaticBlockDeclaration,
 ]);
 
-/** @param {string} file */
-function scriptKind(file) {
-  if (file.endsWith('.tsx')) return ts.ScriptKind.TSX;
-  if (file.endsWith('.ts')) return ts.ScriptKind.TS;
-  return ts.ScriptKind.JS;
+/**
+ * @param {string} file
+ * @param {string} text
+ */
+function parse(file, text) {
+  const kind = file.endsWith('.tsx') ? ts.ScriptKind.TSX : file.endsWith('.ts') ? ts.ScriptKind.TS : ts.ScriptKind.JS;
+  return ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true, kind);
 }
 
 /**
- * The spans one line widens to: the statement it sits in, or the part of a
- * compound statement it sits in (a condition, a signature), taken whole even
+ * The spans one line widens to: the statement it sits in, taken whole even
  * when a block-bodied callback sits inside it, so every mutant of a changed
- * operator, condition or call exists. A body is never taken because its
- * header line changed: a line wholly inside a body widens within that body.
+ * operator, condition or call exists. The header of a compound statement or
+ * declaration (a condition, a signature, a catch) widens to that header only,
+ * never to its body; any other line holding a callback's start or end (a
+ * route's header, a `});`) takes its whole statement, the callback's body
+ * included. A line wholly inside a body widens within that body.
  * @param {ts.SourceFile} sf
  * @param {number} line 1-based
  * @returns {Range[]}
@@ -165,7 +169,7 @@ function unitsOf(sf, line) {
  * @returns {Range[]}
  */
 export function widen(file, text, lines) {
-  const sf = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true, scriptKind(file));
+  const sf = parse(file, text);
   /** @type {Range[]} */
   const ranges = [];
   for (const line of lines) ranges.push([line, line], ...unitsOf(sf, line));
@@ -190,7 +194,14 @@ const STRUCTURE = new Set([
  * @param {number[]} lines
  */
 export function codeLines(file, text, lines) {
-  const sf = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true, scriptKind(file));
+  return codeLinesOf(parse(file, text), lines);
+}
+
+/**
+ * @param {ts.SourceFile} sf
+ * @param {number[]} lines
+ */
+function codeLinesOf(sf, lines) {
   /** @param {number} pos */
   const lineOf = pos => sf.getLineAndCharacterOfPosition(pos).line + 1;
   /** @type {Set<number>} */
@@ -205,6 +216,25 @@ export function codeLines(file, text, lines) {
   };
   walk(sf);
   return lines.filter(line => withCode.has(line));
+}
+
+/**
+ * The code lines among `lines` that no mutant tests. A mutant tests a line
+ * when it spans the line and lies within one of the spans the line widens to
+ * by itself: emptying a body says nothing about each line in it, so the lines
+ * of a file taken whole are judged the way the same lines changed alone are.
+ * @param {string} file
+ * @param {string} text
+ * @param {number[]} lines
+ * @param {Range[]} spans each mutant's first and last line
+ */
+export function untouched(file, text, lines, spans) {
+  const sf = parse(file, text);
+  return codeLinesOf(sf, lines).filter(n => {
+    /** @type {Range[]} */
+    const units = [[n, n], ...unitsOf(sf, n)];
+    return !spans.some(([first, last]) => first <= n && n <= last && units.some(([from, to]) => from <= first && last <= to));
+  });
 }
 
 /**

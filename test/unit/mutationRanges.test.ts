@@ -5,7 +5,7 @@ import path from 'path';
 import { Instrumenter } from '@stryker-mutator/instrumenter';
 import ts from 'typescript';
 import { describe, expect, it, onTestFinished } from 'vitest';
-import { codeLines, diffArgs, gates, linesOfTarget, mergeRanges, notMutated, parseDiff, patternsOf, planTargets } from '../mutation/ranges.mjs';
+import { codeLines, diffArgs, gates, linesOfTarget, mergeRanges, notMutated, parseDiff, patternsOf, planTargets, untouched } from '../mutation/ranges.mjs';
 
 // The touched-line ranges of the L5 gate (mutation/README.md): which lines a
 // change touched, and how far each widens so that Stryker makes the mutants
@@ -246,6 +246,7 @@ describe('the widening, against what Stryker makes', () => {
   const made = async (text: string, mutate: unknown): Promise<Made[]> =>
     (await instrumenter.instrument([{ name: 'src/a.ts', content: text, mutate } as never], OPTIONS)).mutants as unknown as Made[];
   const key = (m: Made) => `${m.mutatorName}|${m.replacement}|${m.location.start.line}:${m.location.start.column}-${m.location.end.line}:${m.location.end.column}`;
+  const spansOf = (list: Made[]) => list.map((m): [number, number] => [m.location.start.line + 1, m.location.end.line + 1]);
 
   // The shapes above, and two real files: one with plain statements, one a
   // route file of block-bodied handlers.
@@ -278,14 +279,35 @@ describe('the widening, against what Stryker makes', () => {
         const expected = whole.filter(m => m.location.start.line + 1 <= n && n <= m.location.end.line + 1 && !throughBlock(m) && !braceOnly(m));
         const ranges = rangesOf(text, [n]) ?? [];
         const mutate = ranges.map(([s, e]) => ({ start: { line: s - 1, column: 0 }, end: { line: e - 1, column: Number.MAX_SAFE_INTEGER } }));
-        const got = new Set((await made(text, mutate)).map(key));
+        const here = await made(text, mutate);
+        const got = new Set(here.map(key));
         const missing = expected.filter(m => !got.has(key(m))).map(m => `${m.mutatorName} ${key(m)}`);
         expect(missing, `${name} line ${n}: ${code.trim()}`).toEqual([]);
         checked += expected.length;
+        // The file taken whole names the line exactly when the line changed alone would.
+        expect(untouched(name, text, [n], spansOf(whole)), `${name} line ${n}: ${code.trim()}`).toEqual(untouched(name, text, [n], spansOf(here)));
       }
       expect(checked).toBeGreaterThan(lines.length / 4);
     });
   }
+
+  it('names the lines of a file taken whole that only the emptying of their body covers', async () => {
+    const text = [
+      "import { Pool } from 'pg';",
+      'export async function sweep(pool: Pool, a: string, b: string): Promise<void> {',
+      '  await pool.query(a);',
+      '  await pool.query(b);',
+      '  if (a === b) return;',
+      '  [a, b].forEach(name => {',
+      '    console.log(name);',
+      '  });',
+      '}',
+      '',
+    ].join('\n');
+    const whole = await made(text, true);
+    expect(whole.filter(m => m.mutatorName === 'BlockStatement').map(m => m.location.start.line + 1)).toEqual([2, 6]);
+    expect(untouched('src/a.ts', text, Array.from({ length: 10 }, (_, i) => i + 1), spansOf(whole))).toEqual([1, 2, 3, 4]);
+  });
 });
 
 describe('the targets', () => {

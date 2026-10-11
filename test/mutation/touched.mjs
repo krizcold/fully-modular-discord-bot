@@ -2,7 +2,8 @@
 // through Stryker's command runner, so code that only child processes run is
 // mutated too. How to run it and read it: mutation/README.md.
 // Usage: node test/mutation/touched.mjs [--base REF] [--mutate PATTERN]... [--concurrency N] [--keep]
-// Exit: 0 PASS, 1 FAIL, 2 NO RESULT; any other code: interrupted.
+// Exit: 0 PASS, 1 FAIL, 2 NO RESULT or a usage error; any other code: interrupted.
+// Trust 0 and 1 only after a Verdict line: a process killed on Windows exits 1 too.
 import { execFileSync, spawnSync } from 'child_process';
 import fs from 'fs';
 import os from 'os';
@@ -44,8 +45,8 @@ try {
   console.error(`Verdict: NO RESULT (the gate could not load: ${error instanceof Error ? error.message.split('\n')[0] : String(error)}; run npm run test:install)`);
   process.exit(2);
 }
-const { codeLines, diffArgs, gates, linesOfTarget, parseDiff, patternsOf, planTargets } = ranges;
-const { classifyKill, judge, toConfirm, toPassB } = verdicts;
+const { diffArgs, gates, linesOfTarget, parseDiff, patternsOf, planTargets, untouched } = ranges;
+const { classifyKill, judge, outcome, toConfirm, toPassB } = verdicts;
 
 const USAGE = 'usage: node test/mutation/touched.mjs [--base REF] [--mutate PATTERN]... [--concurrency N] [--keep]';
 /** @type {{ base: string, mutate: string[], concurrency: number, keep: boolean }} */
@@ -58,7 +59,11 @@ for (let i = 0; i < argv.length; i++) {
     return argv[++i];
   };
   if (arg === '--base') opts.base = value();
-  else if (arg === '--mutate') opts.mutate.push(value());
+  else if (arg === '--mutate') {
+    const pattern = value();
+    if (/[*?[\]{}!]/.test(pattern)) { console.error(`--mutate takes a file or file:lines, not a glob: ${pattern}\n${USAGE}`); process.exit(2); }
+    opts.mutate.push(pattern);
+  }
   else if (arg === '--concurrency') opts.concurrency = Math.max(1, Number(value()) || 1);
   else if (arg === '--keep') opts.keep = true;
   else { console.error(USAGE); process.exit(2); }
@@ -82,6 +87,8 @@ let scope = opts.mutate.length > 0 ? `the patterns ${opts.mutate.join(' ')}` : `
 let emptyScope = false;
 /** @type {MutantRecord[]} */
 let mutants = [];
+/** @type {string[]} */
+const controls = [];
 /** @type {Map<string, string[]>} */
 const sources = new Map();
 
@@ -121,13 +128,28 @@ const spanOf = m => `${m.file}:${m.location.start.line}:${m.location.start.colum
 
 /**
  * The vitest reports one run left in a pass's dir.
- * @param {PassName} name
+ * @param {string} name
  * @param {string} id
  */
 function reportsOf(name, id) {
   return ['fast', 'integration', 'child'].flatMap(project => {
     try { return [JSON.parse(fs.readFileSync(path.join(reportDir, name, `${id}-${project}.json`), 'utf8'))]; } catch { return []; }
   });
+}
+
+/**
+ * What failed in the run with no mutant that a dir holds, a line per test file.
+ * @param {string} name
+ */
+function dryFailures(name) {
+  /** @type {string[]} */
+  const lines = [];
+  for (const report of reportsOf(name, 'dry')) for (const file of report.testResults ?? []) {
+    if (file.status !== 'failed') continue;
+    const failed = (file.assertionResults ?? []).filter((/** @type {{ status: string }} */ t) => t.status === 'failed');
+    lines.push(`the run with no mutant failed in ${file.name}: ${(failed[0]?.failureMessages?.[0] ?? file.message ?? '').split('\n')[0]}`);
+  }
+  return lines;
 }
 
 /**
@@ -177,16 +199,46 @@ async function pass(name, tier, mutate, passFiles, extra) {
   try {
     return await new Stryker({ ...common, mutate, ...extra }).runMutationTest();
   } catch (error) {
-    const lines = [`pass ${name} could not run: ${error instanceof Error ? error.message.split('\n')[0] : String(error)}`];
-    for (const report of reportsOf(name, 'dry')) for (const file of report.testResults ?? []) {
-      if (file.status !== 'failed') continue;
-      const failed = (file.assertionResults ?? []).filter((/** @type {{ status: string }} */ t) => t.status === 'failed');
-      lines.push(`the run with no mutant failed in ${file.name}: ${(failed[0]?.failureMessages?.[0] ?? file.message ?? '').split('\n')[0]}`);
-    }
+    const lines = [`pass ${name} could not run: ${error instanceof Error ? error.message.split('\n')[0] : String(error)}`, ...dryFailures(name)];
     if (fs.readdirSync(out).some(f => f.startsWith('dry-'))) lines.push(`the run with no mutant logged to ${posix(path.relative(root, out))}/dry-*.log`);
     throw new PassError(lines.join('\n'));
   }
 }
+
+/**
+ * Runs a pass's tests once more with no mutant, here in the checkout, after
+ * the reruns alone counted a kill or a timeout: those count only if the tests
+ * still pass without a mutant, so a machine or a container that went bad
+ * during the reruns stops the gate instead.
+ * @param {PassName} after
+ * @param {'a' | 'b'} tier
+ * @param {MutantRecord[]} on
+ */
+function control(after, tier, on) {
+  const name = `control-${after}`;
+  const out = path.join(reportDir, name);
+  fs.mkdirSync(out, { recursive: true });
+  console.log(`L5: the same tests once with no mutant, to check the machine after pass ${after}`);
+  const { __STRYKER_ACTIVE_MUTANT__: _active, ...env } = process.env;
+  const run = spawnSync(process.execPath, [path.join(root, 'test', 'mutation', 'runner.mjs')], {
+    cwd: root,
+    stdio: 'ignore',
+    timeout: 60 * 60_000,
+    env: { ...env, SMDB_MUTATION_PASS: tier, SMDB_MUTATION_FILES: JSON.stringify([...new Set(on.map(m => m.file))]), SMDB_MUTATION_OUT: out },
+  });
+  const logs = `${posix(path.relative(root, out))}/dry-*.log`;
+  if (run.status !== 0) {
+    throw new PassError([
+      `the run with no mutant after pass ${after} failed (${run.error ? run.error.message : `exit ${run.status ?? run.signal}`}), so what its reruns counted cannot be told from the machine's failures`,
+      ...dryFailures(name),
+      `its logs: ${logs}`,
+    ].join('\n'));
+  }
+  controls.push(`after pass ${after}: passed (${logs})`);
+}
+
+/** @param {MutantRecord} m */
+const credited = m => ['Killed', 'Timeout'].includes(outcome(m));
 
 /**
  * Runs a pass on exactly the given mutants and records its results on them.
@@ -231,13 +283,14 @@ function report(stopped) {
       continue;
     }
     const text = linesOf(target.file).join('\n');
-    const lines = codeLines(target.file, text, linesOfTarget(target, text.split('\n').length))
-      .filter(n => !made.some(m => m.location.start.line <= n && n <= m.location.end.line));
+    /** @type {[number, number][]} */
+    const spans = made.map(m => [m.location.start.line, m.location.end.line]);
+    const lines = untouched(target.file, text, linesOfTarget(target, text.split('\n').length), spans);
     if (lines.length > 0) noMutant.push({ file: target.file, lines });
   }
-  const result = judge({ stamp, scope, emptyScope, skipped, mutants, noMutant, unmatched, report: posix(path.relative(root, reportDir)), stopped });
+  const result = judge({ stamp, scope, emptyScope, skipped, mutants, noMutant, unmatched, report: posix(path.relative(root, reportDir)), stopped, controls });
   fs.mkdirSync(reportDir, { recursive: true });
-  fs.writeFileSync(path.join(reportDir, 'mutants.json'), `${JSON.stringify({ scope, skipped, targets, mutants, verdict: result.verdict, stopped }, null, 2)}\n`);
+  fs.writeFileSync(path.join(reportDir, 'mutants.json'), `${JSON.stringify({ scope, skipped, targets, mutants, controls, verdict: result.verdict, stopped }, null, 2)}\n`);
   fs.writeFileSync(path.join(reportDir, 'summary.txt'), `${result.lines.join('\n')}\n`);
   console.log(result.lines.join('\n'));
   process.exit(result.code);
@@ -296,6 +349,7 @@ try {
   if (confirmA.length > 0) {
     console.log(`L5: pass A again, one at a time, on ${confirmA.length} timeout(s)`);
     await passOn('a2', 'a', confirmA, { checkers: [], concurrency: 1, timeoutMS: 60_000, timeoutFactor: 4 });
+    if (confirmA.some(credited)) control('a2', 'a', confirmA);
   }
 
   const forB = toPassB(mutants);
@@ -307,6 +361,7 @@ try {
     if (confirmB.length > 0) {
       console.log(`L5: pass B again, one at a time, on ${confirmB.length} kill(s) and timeout(s), which count only if they repeat`);
       await passOn('b2', 'b', confirmB, { ...b, concurrency: 1, timeoutMS: 180_000, timeoutFactor: 4 });
+      if (confirmB.some(credited)) control('b2', 'b', confirmB);
     }
   }
   finish();

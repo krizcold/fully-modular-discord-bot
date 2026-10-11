@@ -30,6 +30,9 @@ export default defineConfig({
   test: {
     root: here,
     setupFiles: ['./helpers/setup.ts'],
+    // Not 'test', as a developer's shell may set it, so every run shows that
+    // setup.ts puts it right (unit/envScrub.test.ts).
+    env: { NODE_ENV: 'development' },
     pool: 'forks',
     testTimeout: 30_000,
     hookTimeout: 180_000,

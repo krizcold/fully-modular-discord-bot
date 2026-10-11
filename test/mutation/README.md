@@ -24,12 +24,14 @@ From the bot root, with Node 22.12 or newer (or SMDB_TEST_NODE set, as for `npm 
 - With no option it mutates the change from HEAD to the working tree: the job before it is committed. For a job already
   committed, pass `--base` the commit before it; `--base main` takes everything since the merge-base with main (a
   branch). Untracked files under src are taken whole.
-- `--mutate src/x.ts:10-20` (Stryker's pattern, repeatable) skips git; every mutant it makes gates.
+- `--mutate src/x.ts:10-20` (a file, or a file and lines, repeatable; never a glob) skips git; every mutant it makes
+  gates.
 - `--concurrency N` sets pass A's parallel runs (default: half the cores); pass B uses half of that.
 - `--keep` keeps the sandboxes in `.stryker-tmp/` for a look after the run. Without it every sandbox is removed, a
   failed pass's too.
-- Exit 0 is PASS, 1 FAIL, 2 NO RESULT (nothing was tested, or the gate stopped: the report says which). Any other code
-  means the run was interrupted.
+- Exit 0 is PASS, 1 FAIL, 2 NO RESULT (nothing was tested, or the gate stopped: the report says which) or a usage
+  error. Any other code means the run was interrupted. Trust 0 and 1 only after the report's `Verdict:` line: a process
+  killed on Windows exits 1 too.
 
 Pass A needs nothing running. Pass B runs the integration tests that import the mutated files, so it needs Docker when
 there are any. The git diff sets every option a user's git config could change (path prefixes, rename and copy
@@ -54,8 +56,11 @@ detection, hunk joining).
 - A pure deletion has no line left to mutate: its two neighbouring lines are context only.
 - Not mutated, and named in the report with the reason: files outside src, files that are not code, `.d.ts` files, and
   the browser views under src/webui/public (copied into dist, never compiled, and no test loads them yet).
-- A changed line of code that no mutant touches (types and imports land here), in a diff, an untracked file or a
-  `--mutate` pattern, is named in the report: L5 says nothing about it. A deleted src file is named too.
+- A changed line of code that no mutant touches (types, imports, signatures and a bare `await f();` land here), in a
+  diff, an untracked file or a `--mutate` pattern, is named in the report: L5 says nothing about it. A mutant touches a
+  line only when it lies within what that line widens to by itself, so the emptying of a body touches none of the lines
+  inside it, and a file taken whole names the same lines as each of its lines changed alone. A deleted src file is
+  named too.
 
 ## The passes
 
@@ -68,8 +73,14 @@ detection, hunk joining).
    (build.cjs), then each survivor runs `vitest related` on the integration tier and then the whole child tier, whose
    scenarios start real processes on that dist. A child sees the mutant through the env.
 3. **Reruns alone.** A gating mutant that timed out in pass A or B, and every gating kill of pass B (where containers
-   and children can fail on their own), runs again alone, one at a time, with a larger budget. It counts only if it is
-   killed, or hangs the tests, alone too; one that then survives pass A goes on to pass B.
+   and children can fail on their own), runs again alone, one at a time, with a larger budget for the whole run
+   (vitest's own limits per test and per hook stay as they are). A timeout counts as killed when the rerun hangs the
+   tests again or fails a test; a pass B kill counts only when the rerun fails a test again, since a hang is not the
+   same evidence. One that then survives pass A goes on to pass B. A mutant the gate never reran (it stopped first) is
+   inconclusive.
+4. **A run with no mutant after the reruns.** When a rerun counted a kill or a timeout, the same tests run once more
+   with no mutant, in the checkout itself. If they fail, the machine or a container went bad during the reruns, so the
+   gate ends NO RESULT instead of counting what they found.
 
 A run Stryker counts as a kill is checked against vitest's report of it: it is a kill only when a test itself failed for
 a reason other than the machine. When every failing test (or its hook) timed out it is a timeout (rerun as above).
@@ -85,16 +96,19 @@ complete, which is why pass B's kills must repeat.
 
 - `summary.txt` is the L5 report for the review packet: the scope, what was not mutated and why, patterns or lines no
   mutant touched, the gating mutants by outcome, every survivor, silenced and inconclusive mutant with its place and
-  replacement, the confirmed timeouts, the context mutants, and the verdict.
+  replacement (with why a kill or timeout did not count), the confirmed timeouts, the context mutants, the runs with no
+  mutant after the reruns, and the verdict.
 - `mutants.json` has every mutant: its place, original text and replacement, whether it gates, and per pass its status
   and the test that killed it.
-- `a/`, `a2/`, `b/` and `b2/` hold one vitest JSON report and log per mutant run (`dry-*` is the run with no mutant).
+- `a/`, `a2/`, `b/` and `b2/` hold one vitest JSON report and log per mutant run (`dry-*` is the run with no mutant);
+  `control-a2/` and `control-b2/` hold the runs with no mutant after the reruns.
 
 The verdict is FAIL when a gating mutant ends Survived, NoCoverage, Missing, inconclusive, RuntimeError, or Ignored (a
 `// Stryker disable` comment needs the same justification in the notes as a survivor). A confirmed timeout counts as
 killed and is listed. CompileError counts as killed by the type checker. The verdict is NO RESULT when no src file
-changed, when no gating mutant was made, when every gating mutant was a type error (no test ran against the change), or
-when a pass could not run; the report then says why, with the passes that did finish.
+changed, when no gating mutant was made, when every gating mutant was a type error (no test ran against the change),
+when a pass could not run, or when the run with no mutant after the reruns failed; the report then says why, with the
+passes that did finish.
 
 ## Child scenarios
 
@@ -113,18 +127,23 @@ child away from anything real:
   fails unless every one sits under this root's dist.
 
 The child tier's globalSetup runs build.cjs `--if-stale`: it rebuilds dist unless the stamp matches both what dist was
-built from (src, tsconfig.json, build.cjs, the typescript version, hashed before the build, so an edit saved meanwhile
-fails the build) and what dist holds now, so a dist that another build, a branch switch or a hand edit changed is
-rebuilt. A lock in dist keeps two runs in one checkout from building over each other; a lock whose owner is gone, or
-older than five minutes, is taken over. Like `npm run build`, it never deletes the output of a removed source file.
+built from (src, tsconfig.json, build.cjs, the typescript version) and what dist holds now, so a dist that another
+build, a branch switch or a hand edit changed is rebuilt. The source is hashed before the build, and its files' sizes
+and write times are checked after it, so an edit saved meanwhile, even one undone again (a stash, then a pop), fails the
+build unstamped. A fresh dist is seen without taking the lock. The lock, `dist/.build-lock`, is a file that holds its
+owner's process id, taken only to build, and keeps two runs in one checkout from building over each other: a live owner
+is waited for up to ten minutes. A lock is never taken from another process, so one left by a build that died (killed
+mid-build) stops the next run, which names the file to remove. Like `npm run build`, it never deletes the output of a
+removed source file.
 
 ## Proven locally
 
 - The bite, integration/mutationBite.test.ts: one gate run on two lines of nodeIdentity.ts. consentsToActiveMode's
   return dies in pass A to unit/backupMode.test.ts; the stand-in carry in consumeTakeoverFlags, which only a restart
-  shows, survives pass A and dies in pass B to child/fleetIdentity.test.ts. One mutant of the first line is equivalent
-  (`''` and the replacement both read as "not active"), so the run also shows the FAIL verdict and how a survivor is
-  listed. The same file checks that an unknown base and a pattern that makes no mutant both end NO RESULT, exit 2.
+  shows, survives pass A and dies in pass B to child/fleetIdentity.test.ts, again when rerun alone, and the run with no
+  mutant after that rerun passes. One mutant of the first line is equivalent (`''` and the replacement both read as "not
+  active"), so the run also shows the FAIL verdict and how a survivor is listed. The same file checks that an unknown
+  base and a pattern that makes no mutant both end NO RESULT, exit 2, and that a glob is refused.
 - The bite fails when the plumbing breaks: with the active mutant dropped from the child's env the child-only mutants
   survive, and with the scenario loading another checkout's dist pass B refuses at its first run.
 

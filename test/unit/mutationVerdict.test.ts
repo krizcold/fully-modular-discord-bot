@@ -74,13 +74,25 @@ describe('the passes a mutant goes through', () => {
     const confirmedSurvivor = mutant(6, true, { a: pass('Timeout'), a2: pass('Survived') });
     expect(toPassB([confirmedSurvivor])).toEqual([confirmedSurvivor]);
     const killedInB = mutant(7, true, { a: pass('Survived'), b: pass('Killed', { killedBy: 'child > x' }) });
-    expect(outcome(killedInB)).toBe('Killed');
     expect(toConfirm([mutant(8, true, { a: pass('Survived'), b: pass('Timeout') })], 'b')).toHaveLength(1);
     // Pass B's kills must repeat alone; pass A's need not.
     expect(toConfirm([killedInB], 'b')).toEqual([killedInB]);
     expect(toConfirm([killed], 'a')).toEqual([]);
     const flake = mutant(9, true, { a: pass('Survived'), b: pass('Killed', { killedBy: 'x' }), b2: pass('Survived') });
     expect(outcome(flake)).toBe('Survived');
+  });
+
+  it('counts a pass B kill only when a test fails for it again alone, and nothing it never reran', () => {
+    const b = (b2?: PassResult) => mutant(1, true, { a: pass('Survived'), b: pass('Killed', { killedBy: 'integration/x.test.ts > x' }), ...(b2 ? { b2 } : {}) });
+    expect(outcome(b(pass('Killed', { killedBy: 'child/y.test.ts > y' })))).toBe('Killed');
+    expect(outcome(b(pass('Killed', { timeout: 'child/y.test.ts > y' })))).toBe('Inconclusive');
+    expect(outcome(b(pass('Timeout')))).toBe('Inconclusive');
+    expect(outcome(b())).toBe('Inconclusive');
+    const hungInB = (b2: PassResult) => mutant(1, true, { a: pass('Survived'), b: pass('Timeout'), b2 });
+    expect(outcome(hungInB(pass('Timeout')))).toBe('Timeout');
+    expect(outcome(hungInB(pass('Killed', { killedBy: 'child/y.test.ts > y' })))).toBe('Killed');
+    expect(outcome(mutant(1, true, { a: pass('Timeout') }))).toBe('Inconclusive');
+    expect(outcome(mutant(1, false, { a: pass('Timeout') }))).toBe('Timeout');
   });
 });
 
@@ -92,6 +104,8 @@ describe('the verdict', () => {
       { a: pass('Killed', { inconclusive: 'only the machine failed: x' }) },
       { a: pass('RuntimeError', { statusReason: 'spawn EAGAIN' }) },
       { a: pass('Survived'), b: pass('Killed', { inconclusive: 'no vitest report was written' }) },
+      { a: pass('Survived'), b: pass('Killed', { killedBy: 'x' }), b2: pass('Killed', { timeout: 'x' }) },
+      { a: pass('Survived'), b: pass('Killed', { killedBy: 'x' }) },
     ]) {
       const result = run([mutant(1, true, passes), mutant(2, true, { a: pass('Killed', { killedBy: 'x' }) })]);
       expect(result.verdict, JSON.stringify(passes)).toBe('FAIL');
@@ -105,12 +119,25 @@ describe('the verdict', () => {
       mutant(1, true, { a: pass('Killed', { killedBy: 'x' }) }),
       mutant(2, true, { a: pass('Timeout'), a2: pass('Timeout') }),
       mutant(3, true, { a: pass('CompileError') }),
-      mutant(4, true, { a: pass('Survived'), b: pass('Killed', { killedBy: 'child > y' }) }),
+      mutant(4, true, { a: pass('Survived'), b: pass('Killed', { killedBy: 'child > y' }), b2: pass('Killed', { killedBy: 'child > y' }) }),
       mutant(5, false, { a: pass('Survived') }),
-    ]);
+    ], { controls: ['after pass b2: passed'] });
     expect(result).toMatchObject({ verdict: 'PASS', code: 0 });
     expect(result.lines.join('\n')).toMatch(/^Timeouts .*\n {2}src\/a\.ts:2:3 /m);
     expect(result.lines.join('\n')).toMatch(/^Context survivors:\n {2}src\/a\.ts:5:3 /m);
+    expect(result.lines.join('\n')).toMatch(/^Runs with no mutant after the reruns:\n {2}after pass b2: passed$/m);
+  });
+
+  it('names why a kill or timeout was not counted', () => {
+    const text = run([
+      mutant(1, true, { a: pass('Survived'), b: pass('Killed', { killedBy: 'child/x.test.ts > x' }), b2: pass('Killed', { timeout: 'child/x.test.ts > x' }) }),
+      mutant(2, true, { a: pass('Survived'), b: pass('Killed', { killedBy: 'child/x.test.ts > x' }) }),
+      mutant(3, true, { a: pass('Timeout') }),
+    ], { stopped: ['pass b2 could not run: x'] }).lines.join('\n');
+    expect(text).toMatch(/^Inconclusive .*\n {2}src\/a\.ts:1:3 .*\(killed in pass B by child\/x\.test\.ts > x, but hung instead of failing when run alone\)$/m);
+    expect(text).toMatch(/^ {2}src\/a\.ts:2:3 .*\(killed in pass B, never rerun alone\)$/m);
+    expect(text).toMatch(/^ {2}src\/a\.ts:3:3 .*\(timed out, never rerun alone\)$/m);
+    expect(text).toMatch(/^ {2}killed in pass A: 0; sent to pass B: 2, killed there: 0$/m);
   });
 
   it('has no result when nothing changed or no gating mutant was made, and names what was not tested', () => {

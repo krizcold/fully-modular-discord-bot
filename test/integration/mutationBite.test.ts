@@ -18,7 +18,7 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '.
 const TARGET = 'src/bot/internalSetup/fleet/nodeIdentity.ts';
 
 interface Pass { status: string; killedBy?: string; inconclusive?: string }
-interface Mutant { location: { start: { line: number } }; mutator: string; original: string; passes: { a: Pass; b?: Pass } }
+interface Mutant { location: { start: { line: number } }; mutator: string; original: string; passes: { a: Pass; b?: Pass; b2?: Pass } }
 
 function lineOf(text: string): number {
   const index = fs.readFileSync(path.join(root, TARGET), 'utf8').split('\n').findIndex(line => line.includes(text));
@@ -50,12 +50,18 @@ describe('the touched-line mutation gate', () => {
 
     expect(on(child).length).toBeGreaterThan(0);
     for (const m of on(child)) {
+      const byChild = { status: 'Killed', killedBy: expect.stringMatching(/^child\/fleetIdentity\.test\.ts > /) };
       expect(m.passes.a.status, `${m.mutator} ${m.original}`).toBe('Survived');
-      expect(m.passes.b, `${m.mutator} ${m.original}`).toMatchObject({ status: 'Killed', killedBy: expect.stringMatching(/^child\/fleetIdentity\.test\.ts > /) });
+      expect(m.passes.b, `${m.mutator} ${m.original}`).toMatchObject(byChild);
+      expect(m.passes.b2, `${m.mutator} ${m.original}: pass B's kill rerun alone`).toMatchObject(byChild);
     }
 
     expect(run.status).toBe(1);
     expect(run.stdout).toMatch(/^Survivors .*\n {2}src\/bot\/internalSetup\/fleet\/nodeIdentity\.ts:\d+:\d+ StringLiteral: `''`/m);
+    expect(run.stdout).not.toContain(`nodeIdentity.ts:${child}:`);
+    const killedInA = on(fast).filter(m => !equivalent(m)).length;
+    expect(run.stdout).toContain(`\n  killed in pass A: ${killedInA}; sent to pass B: ${on(child).length + 1}, killed there: ${on(child).length}\n`);
+    expect(run.stdout).toMatch(/^Runs with no mutant after the reruns:\n {2}after pass b2: passed /m);
     expect(run.stdout).toMatch(/^Verdict: FAIL$/m);
     fs.rmSync(path.join(root, reportDir!), { recursive: true, force: true });
   });
@@ -68,6 +74,9 @@ describe('the touched-line mutation gate', () => {
     };
 
     expect(gate('--help').status).toBe(2);
+    const glob = gate('--mutate', 'src/**/*.ts');
+    expect(glob.status).toBe(2);
+    expect(glob.stderr).toContain('--mutate takes a file or file:lines, not a glob: src/**/*.ts');
 
     const unknown = gate('--base', 'no-such-ref-anywhere');
     clean(unknown.stdout);

@@ -54,53 +54,70 @@ describe('the dist stamp', () => {
 });
 
 describe('the build lock', () => {
-  it('takes over a lock whose owner is gone, waits on a live one, and always lets go', () => {
+  it('waits on a live owner, and always lets go', () => {
     const root = fakeRoot();
     const lock = path.join(root, 'dist', '.build-lock');
-    const gone = spawnSync(process.execPath, ['-e', '0']).pid!;
-    fs.mkdirSync(lock);
-    fs.writeFileSync(path.join(lock, 'owner'), String(gone));
-    expect(builder.withLock(root, () => 'built')).toBe('built');
+    fs.writeFileSync(lock, String(process.pid));
+    expect(() => builder.withLock(root, () => 'built', 300)).toThrow(/is held by process \d+, still building/);
+    fs.rmSync(lock);
+
+    expect(builder.withLock(root, () => fs.readFileSync(lock, 'utf8'))).toBe(String(process.pid));
     expect(fs.existsSync(lock)).toBe(false);
-
-    fs.mkdirSync(lock);
-    fs.writeFileSync(path.join(lock, 'owner'), String(process.pid));
-    expect(() => builder.withLock(root, () => 'built', 300)).toThrow(/dist is locked by process/);
-    fs.rmSync(lock, { recursive: true });
-
     expect(() => builder.withLock(root, () => { throw new Error('tsc failed'); })).toThrow('tsc failed');
     expect(fs.existsSync(lock)).toBe(false);
   });
 
-  it('takes over a lock left long ago even when its pid is alive again (a reused pid)', () => {
+  it('never takes a lock from another process: one a dead build left stops the run and names the file', () => {
     const root = fakeRoot();
     const lock = path.join(root, 'dist', '.build-lock');
-    fs.mkdirSync(lock);
-    fs.writeFileSync(path.join(lock, 'owner'), `${process.pid} old`);
-    const longAgo = new Date(Date.now() - 60 * 60_000);
+    const gone = spawnSync(process.execPath, ['-e', '0']).pid!;
+    fs.writeFileSync(lock, String(gone));
+    expect(() => builder.withLock(root, () => 'built', 300)).toThrow(`${lock} was left by a build that died (process ${gone} is gone); remove that file`);
+    expect(fs.readFileSync(lock, 'utf8')).toBe(String(gone));
+
+    fs.writeFileSync(lock, '');
+    expect(() => builder.withLock(root, () => 'built', 300)).toThrow(/is held by process \(none yet\)/);
+    const longAgo = new Date(Date.now() - 60_000);
     fs.utimesSync(lock, longAgo, longAgo);
-    expect(builder.withLock(root, () => 'built', 300)).toBe('built');
+    expect(() => builder.withLock(root, () => 'built', 300)).toThrow(`${lock} was left by a build that died (it holds no process id)`);
+    expect(fs.existsSync(lock)).toBe(true);
   });
 
-  it('removes only the lock it judged stale: a live lock taken meanwhile is put back', () => {
+  it('sees a fresh dist without the lock, so a run that only checks never waits on a build', () => {
     const root = fakeRoot();
-    const lock = path.join(root, 'dist', '.build-lock');
-    fs.mkdirSync(lock);
-    fs.writeFileSync(path.join(lock, 'owner'), '4242 live');
-    expect(builder.claimStale(lock, '999999 dead')).toBe(false);
-    expect(fs.readFileSync(path.join(lock, 'owner'), 'utf8')).toBe('4242 live');
-    expect(builder.claimStale(lock, '4242 live')).toBe(true);
-    expect(fs.existsSync(lock)).toBe(false);
-    expect(fs.readdirSync(path.join(root, 'dist')).filter(f => f.startsWith('.build-lock'))).toEqual([]);
+    builder.writeStamp(root, builder.sourceHash(root));
+    fs.writeFileSync(path.join(root, 'dist', '.build-lock'), String(process.pid));
+    expect(builder.run(root, true, 300)).toBe(0);
   });
 });
 
 describe('a build', () => {
+  // A stand-in for tsc that writes dist and, given a script, does more first.
+  function withTsc(root: string, script = ''): void {
+    const bin = path.join(root, 'node_modules', 'typescript', 'bin');
+    fs.mkdirSync(bin, { recursive: true });
+    fs.writeFileSync(path.join(root, 'node_modules', 'typescript', 'package.json'), '{ "version": "5.9.3" }\n');
+    fs.writeFileSync(path.join(bin, 'tsc'), `const fs = require('fs');\nconst path = require('path');\nconst root = ${JSON.stringify(root)};\n${script}\nfs.writeFileSync(path.join(root, 'dist', 'a.js'), 'exports.a = 1;\\n');\n`);
+    fs.mkdirSync(path.join(root, 'src', 'webui', 'public'), { recursive: true });
+    fs.mkdirSync(path.join(root, 'src', 'bot', 'modules'), { recursive: true });
+  }
+
   it('stamps the src it started from, so an edit saved while it ran leaves dist stale', () => {
     const root = fakeRoot();
     const before = builder.sourceHash(root);
     fs.writeFileSync(path.join(root, 'src', 'a.ts'), 'export const a = 3;\n');
     builder.writeStamp(root, before);
     expect(builder.isFresh(root)).toBe(false);
+  });
+
+  it('leaves dist unstamped when src is rewritten while it builds, even back to the same bytes (a stash, then a pop)', () => {
+    const root = fakeRoot();
+    const stamp = path.join(root, 'dist', '.smdb-build.json');
+    withTsc(root, "const a = path.join(root, 'src', 'a.ts');\nconst text = fs.readFileSync(a);\nfs.writeFileSync(a, 'export const a = 2;\\n');\nfs.writeFileSync(a, text);");
+    expect(builder.build(root)).toBe(1);
+    expect(fs.existsSync(stamp)).toBe(false);
+    withTsc(root);
+    expect(builder.build(root)).toBe(0);
+    expect(builder.isFresh(root)).toBe(true);
   });
 });

@@ -57,16 +57,32 @@ function typescriptVersion(root) {
 }
 
 /** @param {string} root */
+function sourceFiles(root) {
+  return [...filesUnder(path.join(root, 'src')), path.join(root, 'tsconfig.json'), __filename];
+}
+
+/** @param {string} root */
 function sourceHash(root) {
-  return hashOf(root, [...filesUnder(path.join(root, 'src')), path.join(root, 'tsconfig.json'), __filename], `typescript ${typescriptVersion(root)}`);
+  return hashOf(root, sourceFiles(root), `typescript ${typescriptVersion(root)}`);
+}
+
+/**
+ * The size and write time of every source file: a file rewritten while tsc
+ * ran changes them even when its bytes end up the same (a stash, then a pop).
+ * @param {string} root
+ */
+function sourceTimes(root) {
+  return sourceFiles(root).map(file => {
+    const stat = fs.statSync(file);
+    return `${file}\0${stat.size}\0${stat.mtimeMs}`;
+  }).sort().join('\n');
 }
 
 /** @param {string} root */
 function distHash(root) {
   const dist = path.join(root, 'dist');
   if (!fs.existsSync(dist)) return 'none';
-  const lock = path.join(dist, LOCK) + path.sep;
-  return hashOf(root, filesUnder(dist).filter(f => path.basename(f) !== STAMP && !f.startsWith(lock)), 'dist');
+  return hashOf(root, filesUnder(dist).filter(f => path.basename(f) !== STAMP && f !== path.join(dist, LOCK)), 'dist');
 }
 
 /** @param {string} root */
@@ -99,37 +115,15 @@ function alive(pid) {
   }
 }
 
-// A build takes seconds: a lock older than this is left from a run that died,
-// even when its pid now belongs to another process.
-const STALE_MS = 5 * 60_000;
-
-/** @param {string} lock */
-function ownerOf(lock) {
-  try { return fs.readFileSync(path.join(lock, 'owner'), 'utf8'); } catch { return null; }
-}
+// A lock is written with its owner's process id at once: one that holds none
+// for longer than this was left by a process that died taking it.
+const BIRTH_MS = 10_000;
 
 /**
- * Takes a stale lock away, but only the one that was judged stale: it is
- * renamed (one waiter wins), and put back when another waiter's live lock
- * was renamed instead.
- * @param {string} lock
- * @param {string} seen the owner line read when the lock was judged stale
- */
-function claimStale(lock, seen) {
-  const aside = `${lock}.stale-${process.pid}-${crypto.randomBytes(4).toString('hex')}`;
-  try { fs.renameSync(lock, aside); } catch { return false; }
-  if (ownerOf(aside) === seen) {
-    fs.rmSync(aside, { recursive: true, force: true });
-    return true;
-  }
-  try { fs.renameSync(aside, lock); } catch { fs.rmSync(aside, { recursive: true, force: true }); }
-  return false;
-}
-
-/**
- * Runs fn holding dist's build lock. A lock whose owner process is gone, or
- * that is older than STALE_MS, is taken over; a live one is waited for, up to
- * waitMs.
+ * Runs fn holding dist's build lock, a file that holds its owner's process id.
+ * A live owner is waited for, up to waitMs. A lock is never taken from another
+ * process: one a build left when it died stops the run and names the file to
+ * remove.
  * @template T
  * @param {string} root
  * @param {() => T} fn
@@ -141,26 +135,45 @@ function withLock(root, fn, waitMs = 10 * 60_000) {
   fs.mkdirSync(path.dirname(lock), { recursive: true });
   const started = Date.now();
   for (;;) {
+    /** @type {number | undefined} */
+    let fd;
     try {
-      fs.mkdirSync(lock);
-      fs.writeFileSync(path.join(lock, 'owner'), `${process.pid} ${crypto.randomBytes(8).toString('hex')}`);
-      break;
+      fd = fs.openSync(lock, 'wx');
     } catch (error) {
       if (/** @type {NodeJS.ErrnoException} */ (error).code !== 'EEXIST') throw error;
-      const seen = ownerOf(lock);
-      const pid = seen === null ? NaN : Number(seen.split(' ')[0]);
-      let age = 0;
-      try { age = Date.now() - fs.statSync(lock).mtimeMs; } catch { continue; }
-      const stale = (Number.isInteger(pid) && pid > 0 && !alive(pid)) || age > STALE_MS;
-      if (stale && seen !== null && claimStale(lock, seen)) continue;
-      if (Date.now() - started > waitMs) throw new Error(`build: dist is locked by process ${pid} (${lock}); remove the lock if that process is gone`);
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 250);
     }
+    if (fd !== undefined) {
+      try {
+        fs.writeSync(fd, String(process.pid));
+      } catch (error) {
+        fs.closeSync(fd);
+        fs.rmSync(lock, { force: true });
+        throw error;
+      }
+      fs.closeSync(fd);
+      break;
+    }
+    let owner = '';
+    let age = 0;
+    try {
+      owner = fs.readFileSync(lock, 'utf8').trim();
+      age = Date.now() - fs.statSync(lock).mtimeMs;
+    } catch (error) {
+      if (/** @type {NodeJS.ErrnoException} */ (error).code === 'ENOENT') continue;
+      throw error;
+    }
+    if (owner ? !alive(Number(owner)) : age > BIRTH_MS) {
+      throw new Error(`build: ${lock} was left by a build that died (${owner ? `process ${owner} is gone` : 'it holds no process id'}); remove that file and run again`);
+    }
+    if (Date.now() - started > waitMs) {
+      throw new Error(`build: ${lock} is held by process ${owner || '(none yet)'}, still building after ${Math.round(waitMs / 1000)} s; remove that file if no build is running`);
+    }
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 250);
   }
   try {
     return fn();
   } finally {
-    fs.rmSync(lock, { recursive: true, force: true });
+    fs.rmSync(lock, { force: true });
   }
 }
 
@@ -182,6 +195,7 @@ function copyAssets(root) {
 /** @param {string} root */
 function build(root) {
   fs.rmSync(path.join(root, 'dist', STAMP), { force: true });
+  const times = sourceTimes(root);
   const source = sourceHash(root);
   const tsc = require.resolve('typescript/bin/tsc', { paths: [root] });
   const run = spawnSync(process.execPath, [tsc, '-p', path.join(root, 'tsconfig.json')], { cwd: root, stdio: 'inherit' });
@@ -190,7 +204,7 @@ function build(root) {
     return 1;
   }
   copyAssets(root);
-  if (sourceHash(root) !== source) {
+  if (sourceTimes(root) !== times || sourceHash(root) !== source) {
     console.error('build: src changed while dist was built, so dist is not stamped; run again');
     return 1;
   }
@@ -198,10 +212,25 @@ function build(root) {
   return 0;
 }
 
-module.exports = { sourceHash, distHash, isFresh, writeStamp, withLock, claimStale };
+/**
+ * Builds dist, or with ifStale only when its stamp no longer matches. A fresh
+ * dist is seen without the lock, so a run that only checks never waits on one.
+ * @param {string} root
+ * @param {boolean} ifStale
+ * @param {number} [waitMs]
+ */
+function run(root, ifStale, waitMs) {
+  if (ifStale && isFresh(root)) return 0;
+  return withLock(root, () => (ifStale && isFresh(root) ? 0 : build(root)), waitMs);
+}
+
+module.exports = { sourceHash, distHash, isFresh, writeStamp, withLock, build, run };
 
 if (require.main === module) {
-  const root = path.resolve(__dirname, '..', '..');
-  const ifStale = process.argv.includes('--if-stale');
-  process.exit(withLock(root, () => (ifStale && isFresh(root) ? 0 : build(root))));
+  try {
+    process.exit(run(path.resolve(__dirname, '..', '..'), process.argv.includes('--if-stale')));
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exit(1);
+  }
 }

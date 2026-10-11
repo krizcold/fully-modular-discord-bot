@@ -80,8 +80,28 @@ export function outcomeOf(result) {
 
 /** @param {MutantRecord} m */
 export const latest = m => /** @type {PassResult} */ (m.passes.b2 ?? m.passes.b ?? m.passes.a2 ?? m.passes.a);
+
+/**
+ * A mutant's outcome, counting for a gating one only what its rerun alone
+ * confirmed: a timeout counts when the rerun hangs too or fails a test, and a
+ * pass B kill only when the rerun fails a test again (a hang is not the same
+ * evidence). One the gate never reran is inconclusive.
+ * @param {MutantRecord} m
+ * @returns {{ outcome: string, why?: string }}
+ */
+export function confirmed(m) {
+  const { a2, b, b2 } = m.passes;
+  const last = outcomeOf(latest(m));
+  if (!m.gating || (last !== 'Killed' && last !== 'Timeout')) return { outcome: last };
+  if (b2 && b && outcomeOf(b) === 'Killed' && last === 'Timeout') {
+    return { outcome: 'Inconclusive', why: `killed in pass B by ${b.killedBy}, but hung instead of failing when run alone` };
+  }
+  if (b && !b2) return { outcome: 'Inconclusive', why: last === 'Killed' ? 'killed in pass B, never rerun alone' : 'timed out, never rerun alone' };
+  if (!b && !a2 && last === 'Timeout') return { outcome: 'Inconclusive', why: 'timed out, never rerun alone' };
+  return { outcome: last };
+}
 /** @param {MutantRecord} m */
-export const outcome = m => outcomeOf(latest(m));
+export const outcome = m => confirmed(m).outcome;
 
 // A gating mutant that ends in one of these fails the gate.
 export const FAILING = ['Survived', 'NoCoverage', 'Missing', 'Inconclusive', 'RuntimeError', 'Ignored'];
@@ -94,8 +114,11 @@ export const FAILING = ['Survived', 'NoCoverage', 'Missing', 'Inconclusive', 'Ru
  * @param {MutantRecord[]} mutants
  * @param {'a' | 'b'} pass
  */
-export const toConfirm = (mutants, pass) =>
-  mutants.filter(m => m.gating && m.passes[pass] && (outcome(m) === 'Timeout' || (pass === 'b' && outcome(m) === 'Killed')));
+export const toConfirm = (mutants, pass) => mutants.filter(m => {
+  const result = m.passes[pass];
+  const status = result && outcomeOf(result);
+  return m.gating && (status === 'Timeout' || (pass === 'b' && status === 'Killed'));
+});
 
 /**
  * The gating mutants pass B takes: the ones no in-process test killed.
@@ -107,8 +130,9 @@ export const toPassB = mutants => mutants.filter(m => m.gating && ['Survived', '
  * The verdict and the L5 report.
  * `stopped` names why the gate stopped before it finished (a pass that could
  * not run); the passes it did finish are still reported.
+ * `controls` names the runs with no mutant made after the reruns, each passed.
  * @param {{ stamp: string, scope: string, emptyScope: boolean, skipped: { file: string, why: string }[], mutants: MutantRecord[],
- *   noMutant: { file: string, lines: number[] }[], unmatched: string[], report: string, stopped?: string[] }} run
+ *   noMutant: { file: string, lines: number[] }[], unmatched: string[], report: string, stopped?: string[], controls?: string[] }} run
  * @returns {{ verdict: 'PASS' | 'FAIL' | 'NO RESULT', code: 0 | 1 | 2, lines: string[] }}
  */
 export function judge(run) {
@@ -129,7 +153,7 @@ export function judge(run) {
   /** @param {MutantRecord} m */
   const note = m => {
     const last = latest(m);
-    return last.inconclusive ?? last.statusReason ?? (outcome(m) === 'Timeout' ? `hung alone too: ${last.timeout ?? 'Stryker timeout'}` : '');
+    return confirmed(m).why ?? last.inconclusive ?? last.statusReason ?? (outcome(m) === 'Timeout' ? `hung alone too: ${last.timeout ?? 'Stryker timeout'}` : '');
   };
   /** @param {MutantRecord} m */
   const show = m => `  ${where(m)} ${m.mutator}: \`${m.original}\` -> \`${m.replacement}\`${note(m) ? ` (${note(m)})` : ''}`;
@@ -160,6 +184,7 @@ export function judge(run) {
     ...section('Timeouts (each hung the tests again when run alone; counted as killed):', gatingAt('Timeout')),
     `Context mutants (in the widened statements, not on a changed line; not gating): ${context.length}: ${tally(context)}`,
     ...section('Context survivors:', context.filter(m => outcome(m) === 'Survived')),
+    ...(run.controls?.length ? ['Runs with no mutant after the reruns:', ...run.controls.map(line => `  ${line}`)] : []),
     ...(run.stopped ? ['Stopped:', ...run.stopped.map(line => `  ${line}`)] : []),
     `Report: ${run.report} (mutants.json has every mutant, its passes and what killed it)`,
     `Verdict: ${verdict}${why ? ` (${why})` : ''}`,
