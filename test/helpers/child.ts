@@ -5,10 +5,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { onTestFinished } from 'vitest';
 import { scrubEnv } from './env';
-import { TIME_SCALE } from './time.mjs';
-
-// How long one scenario step may take.
-export const STEP_MS = 20_000 * TIME_SCALE;
+import { STEP_MS } from './time.mjs';
 
 // The repo this suite sits in, found from this file's own place, so a copy of
 // the repo (a Stryker sandbox) runs its own dist and never another checkout's.

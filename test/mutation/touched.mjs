@@ -10,6 +10,7 @@ import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { runControl } from './control.mjs';
+import { PASSES } from './passes.mjs';
 
 /**
  * @typedef {import('./ranges.mjs').Location} Location
@@ -74,17 +75,33 @@ const git = (...args) => execFileSync('git', ['-c', 'core.quotePath=false', ...a
 const posix = file => file.split(path.sep).join('/');
 /** @param {string} pattern */
 const fileOfPattern = pattern => pattern.replace(/:\d+(:\d+)?-\d+(:\d+)?$/, '');
-// A --mutate value names one file that exists, the way git names it, since the
-// report matches each mutant to its target by that name: Stryker reads the
-// value as a glob (extglobs included) and resolves any spelling of a path.
-for (const pattern of opts.mutate) {
+const GLOB = /[*?[\]{}()!|+@]/;
+/**
+ * A --mutate value's file under the name git gives it (from the bot root, with
+ * forward slashes, the case and the path it has on disk), or null when it is no
+ * file in the bot root. Stryker reads the value as a glob (extglobs included)
+ * and the report matches mutants to targets by name, so both get this name.
+ * @param {string} file
+ */
+function canonicalFile(file) {
+  if (GLOB.test(file)) return null;
+  let real;
+  try { real = fs.realpathSync.native(path.resolve(root, file)); } catch { return null; }
+  if (!fs.statSync(real).isFile()) return null;
+  const relative = path.relative(fs.realpathSync.native(root), real);
+  if (path.isAbsolute(relative) || relative === '..' || relative.startsWith(`..${path.sep}`)) return null;
+  const name = posix(relative);
+  return GLOB.test(name) ? null : name;
+}
+opts.mutate = opts.mutate.map(pattern => {
   const file = fileOfPattern(pattern);
-  const canonical = posix(path.relative(root, path.resolve(root, file)));
-  if (/[*?[\]{}()!|+@]/.test(file) || canonical !== file || !fs.statSync(path.join(root, file), { throwIfNoEntry: false })?.isFile()) {
-    console.error(`--mutate takes a file that exists, named from the bot root with forward slashes, or such a file and lines, never a glob: ${pattern}\n${USAGE}`);
+  const name = canonicalFile(file);
+  if (name === null) {
+    console.error(`--mutate takes a file in the bot root that exists, or such a file and lines, never a glob: ${pattern}\n${USAGE}`);
     process.exit(2);
   }
-}
+  return `${name}${pattern.slice(file.length)}`;
+});
 
 const stamp = new Date().toISOString().replace(/[:.]/g, '-');
 const reportDir = path.join(root, 'test', 'mutation', 'reports', stamp);
@@ -287,10 +304,7 @@ function report(stopped) {
   for (const target of targets) {
     const made = mutants.filter(m => m.file === target.file);
     if (stopped && mutants.length === 0) continue;
-    if (target.gating === null && made.length === 0) {
-      unmatched.push(...target.patterns);
-      continue;
-    }
+    if (target.gating === null && made.length === 0) unmatched.push(...target.patterns);
     const text = linesOf(target.file).join('\n');
     /** @type {[number, number][]} */
     const spans = made.map(m => [m.location.start.line, m.location.end.line]);
@@ -334,12 +348,7 @@ try {
 
   const files = [...new Set(targets.map(target => target.file))];
   console.log(`L5: mutating ${scope}: ${files.length} file(s), pass A (in-process tests that import them)`);
-  const resultsA = await pass({ name: 'a', dir: 'a', tier: 'a', mutate: targets.flatMap(t => t.patterns), files, extra: {
-    checkers: ['typescript'],
-    concurrency: opts.concurrency,
-    timeoutMS: 10_000,
-    timeoutFactor: 2,
-  } });
+  const resultsA = await pass({ name: 'a', dir: 'a', tier: 'a', mutate: targets.flatMap(t => t.patterns), files, extra: { ...PASSES.a, concurrency: opts.concurrency } });
   const orphans = [...new Set(resultsA.map(fileOf).filter(file => !targets.some(t => t.file === file)))];
   if (orphans.length > 0) throw new PassError(`Stryker mutated ${orphans.join(', ')}, which no target names, so the report could not answer for it`);
   mutants = resultsA.map(r => {
@@ -359,22 +368,21 @@ try {
   const confirmA = toConfirm(mutants, 'a');
   if (confirmA.length > 0) {
     console.log(`L5: pass A again, one at a time, on ${confirmA.length} timeout(s)`);
-    await passOn('a2', 'a2', 'a', confirmA, { checkers: [], concurrency: 1, timeoutMS: 60_000, timeoutFactor: 4 });
+    await passOn('a2', 'a2', 'a', confirmA, PASSES.a2);
     if (confirmA.some(credited)) control('a2', 'a', confirmA, []);
   }
 
   const forB = toPassB(mutants);
   if (forB.length > 0) {
     console.log(`L5: pass B (integration tests that import them, then every child scenario) on ${forB.length} survivor(s)`);
-    const b = { buildCommand: 'node test/helpers/build.cjs', checkers: [], dryRunTimeoutMinutes: 15 };
-    await passOn('b', 'b', 'b', forB, { ...b, concurrency: Math.max(1, Math.floor(opts.concurrency / 2)), timeoutMS: 60_000, timeoutFactor: 2 });
+    await passOn('b', 'b', 'b', forB, { ...PASSES.b, concurrency: Math.max(1, Math.floor(opts.concurrency / 2)) });
     const confirmB = toConfirm(mutants, 'b');
     const killers = byKiller(confirmB);
     let group = 0;
     for (const [killer, on] of killers) {
       group += 1;
       console.log(`L5: pass B again, one at a time, on ${on.length} kill(s) by ${killer}, with that file alone; a kill counts only if it repeats`);
-      await passOn('b2', `b2-${group}`, 'b', on, { ...b, concurrency: 1, timeoutMS: 180_000, timeoutFactor: 4 }, [killer]);
+      await passOn('b2', `b2-${group}`, 'b', on, PASSES.b2, [killer]);
     }
     if (confirmB.some(credited)) control('b2', 'b', confirmB, [...killers.keys()]);
   }

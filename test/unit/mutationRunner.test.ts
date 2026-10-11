@@ -105,6 +105,22 @@ describe('the time limits', () => {
     vi.resetModules();
     const config = (await import('../vitest.config')).default as { test: { testTimeout: number; hookTimeout: number } };
     expect(config.test).toMatchObject({ testTimeout: 120_000, hookTimeout: 720_000 });
-    expect((await import('../helpers/child')).STEP_MS).toBe(80_000);
+    expect((await import('../helpers/time.mjs')).STEP_MS).toBe(80_000);
+  });
+
+  it('let a hung child step fail by its own bound, and a one-file rerun that fails always leave its report', async () => {
+    for (const scale of ['1', '4']) {
+      vi.stubEnv('SMDB_TEST_TIME_SCALE', scale);
+      vi.resetModules();
+      const config = (await import('../vitest.config')).default as { test: { hookTimeout: number; projects: { test: { name: string; testTimeout?: number } }[] } };
+      const { STEP_MS } = await import('../helpers/time.mjs');
+      const child = config.test.projects.find(project => project.test.name === 'child')!.test;
+      // A child test of up to 14 steps, each within its bound, ends before its own limit.
+      expect(child.testTimeout, scale).toBe(15 * STEP_MS);
+      if (scale === '4') {
+        const { PASSES } = await import('../mutation/passes.mjs');
+        expect(PASSES.b2.timeoutMS).toBeGreaterThan(child.testTimeout! + 3 * config.test.hookTimeout);
+      }
+    }
   });
 });

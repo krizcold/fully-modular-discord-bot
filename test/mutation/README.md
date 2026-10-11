@@ -12,6 +12,7 @@ active mutant travels in `__STRYKER_ACTIVE_MUTANT__` and reaches child processes
 | verdict.mjs | (library) when a run counts as a kill, which mutants go to which pass, the verdict; unit/mutationVerdict.test.ts |
 | runner.mjs | the command every pass runs inside Stryker's sandbox; unit/mutationRunner.test.ts |
 | control.mjs | (library) the run with no mutant after the reruns; unit/mutationRunner.test.ts |
+| passes.mjs | (data) each pass's Stryker options and budget; unit/mutationRunner.test.ts |
 | ../helpers/time.mjs | the factor on every test's time limits (4 in a rerun alone) |
 | ../helpers/build.cjs | builds dist the way `npm run build` does, stamped and locked; pass B's buildCommand |
 | ../helpers/child.ts | runs a child scenario (test/child/scenarios/) and checks what it loaded |
@@ -26,8 +27,9 @@ From the bot root, with Node 22.12 or newer (or SMDB_TEST_NODE set, as for `npm 
 - With no option it mutates the change from HEAD to the working tree: the job before it is committed. For a job already
   committed, pass `--base` the commit before it; `--base main` takes everything since the merge-base with main (a
   branch). Untracked files under src are taken whole.
-- `--mutate src/x.ts:10-20` (a file that exists, or a file and lines, repeatable; never a glob) skips git; every
-  mutant it makes gates.
+- `--mutate src/x.ts:10-20` (a file in the bot root that exists, or such a file and lines, repeatable; never a glob)
+  skips git; every mutant it makes gates. The file is taken under the name git gives it, however it was spelled
+  (`./`, backslashes, `..`, another case on Windows).
 - `--concurrency N` sets pass A's parallel runs (default: half the cores); pass B uses half of that.
 - `--keep` keeps the sandboxes in `.stryker-tmp/` for a look after the run. Without it every sandbox is removed, a
   failed pass's too.
@@ -83,15 +85,18 @@ detection, hunk joining).
      tests again or fails a test; one that then survives goes on to pass B.
    - In pass B, where containers and children can be slow or fail on their own, a hang never counts: a mutant that
      only hangs a test there is inconclusive. A test that waits must bound its wait and fail, as a child scenario step
-     does ("did not finish in N ms" is a failure, not a hang).
+     does ("did not finish in N ms" is a failure, not a hang). A child test's own limit is fifteen steps' bounds, so in
+     a test of up to fourteen steps a hung step fails by its bound first.
    - A gating kill of pass B reruns with the one test file that killed it, alone (one rerun per such file), so no
-     other file's order or hang can decide it. It counts only when that file fails for the mutant again.
+     other file's order or hang can decide it. It counts only when that file fails for the mutant again. Its Stryker
+     budget is an hour, above anything vitest's own limits let the file take after its first failure, so a rerun that
+     fails always leaves its report.
    - A mutant the gate never reran (it stopped first) is inconclusive.
 4. **A run with no mutant after the reruns.** When a rerun counted a kill or a timeout, the same tests run once more
    with no mutant, in the checkout itself, the way the reruns ran them (mutation/control.mjs). If they fail, the
    machine or a container went bad during the reruns, so what the reruns counted is inconclusive and the gate ends NO
-   RESULT. What it cannot see: a machine that was four times slower for one pass A rerun only and well again by the
-   end.
+   RESULT. What it cannot see: a machine that was four times slower for one rerun only and well again by the end (a
+   pass A rerun that timed out, or a pass B rerun whose child step ran past its bound).
 
 A run Stryker counts as a kill is checked against vitest's report of it: it is a kill only when a test itself failed for
 a reason other than the machine. When every failing test (or its hook) timed out, and nothing in the run failed for the

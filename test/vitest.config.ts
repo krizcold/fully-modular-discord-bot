@@ -1,7 +1,7 @@
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { defineConfig } from 'vitest/config';
-import { TIME_SCALE } from './helpers/time.mjs';
+import { STEP_MS, TIME_SCALE } from './helpers/time.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repo = path.resolve(here, '..');
@@ -40,7 +40,8 @@ export default defineConfig({
     projects: [
       { extends: true, test: { name: 'fast', include: ['**/*.test.ts'], exclude: ['node_modules/**', ...SLOW] } },
       { extends: true, test: { name: 'integration', include: ['integration/**/*.test.ts'] } },
-      { extends: true, test: { name: 'child', include: ['child/**/*.test.ts'], globalSetup: ['./helpers/childBuild.ts'] } },
+      // A child test may run up to 14 steps: one that hangs fails by its own bound first.
+      { extends: true, test: { name: 'child', include: ['child/**/*.test.ts'], globalSetup: ['./helpers/childBuild.ts'], testTimeout: 15 * STEP_MS } },
     ],
   },
 });

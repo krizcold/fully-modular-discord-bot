@@ -177,7 +177,7 @@ describe('the verdict', () => {
     const text = none.lines.join('\n');
     expect(text).toContain('  src/webui/public/app.jsx: a browser view');
     expect(text).toContain('  src/missing.ts:1-2');
-    expect(text).toContain('  src/a.ts: 4, 9');
+    expect(text).toMatch(/^Changed lines no mutant lies wholly on \(.*every line of a multi-line object, array, arrow body, call or condition with no mutant of its own\):\n {2}src\/a\.ts: 4, 9$/m);
   });
 
   it('has no result when a test replaced vitest, whatever the mutants did', () => {

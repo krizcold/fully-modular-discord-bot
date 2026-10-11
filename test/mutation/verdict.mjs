@@ -203,7 +203,7 @@ export function judge(run) {
     `Mutated: ${made.length > 0 ? made.join(', ') : 'nothing'}`,
     ...(run.skipped.length > 0 ? ['Not mutated:', ...run.skipped.map(s => `  ${s.file}: ${s.why}`)] : []),
     ...(run.unmatched.length > 0 ? ['Patterns that made no mutant:', ...run.unmatched.map(p => `  ${p}`)] : []),
-    ...(run.noMutant.length > 0 ? ['Changed lines no mutant starts on (L5 says nothing about them; types, imports, signatures and the later lines of a multi-line object, array, call or condition land here):',
+    ...(run.noMutant.length > 0 ? ['Changed lines no mutant lies wholly on (L5 says nothing about them; types, imports, signatures, and every line of a multi-line object, array, arrow body, call or condition with no mutant of its own):',
       ...run.noMutant.map(n => `  ${n.file}: ${n.lines.join(', ')}`)] : []),
     `Gating mutants (they touch a changed line): ${gating.length}: ${tally(gating)}`,
     `  killed in pass A: ${gating.filter(m => !m.passes.b && outcome(m) === 'Killed').length}; sent to pass B: ${gating.filter(m => m.passes.b).length}, killed there: ${gating.filter(m => m.passes.b && outcome(m) === 'Killed').length}`,

@@ -119,13 +119,16 @@ describe('the touched-line mutation gate', () => {
     };
 
     expect(gate('--help').status).toBe(2);
-    // Stryker would mutate each of these, but the report matches mutants to
-    // targets by git's name for the file.
-    for (const pattern of ['src/**/*.ts', 'src/bot/internalSetup/fleet/+(nodeIdentity|takeover).ts', 'src/no/such/file.ts:1-5',
-      `./${TARGET}`, TARGET.split('/').join('\\'), 'src/bot/internalSetup/../internalSetup/fleet/nodeIdentity.ts:1-5']) {
-      const refused = gate('--mutate', pattern);
-      expect(refused.status, pattern).toBe(2);
-      expect(refused.stderr).toContain(`--mutate takes a file that exists, named from the bot root with forward slashes, or such a file and lines, never a glob: ${pattern}`);
+    const outside = path.join(os.tmpdir(), `smdb-outside-${process.pid}.ts`);
+    fs.writeFileSync(outside, 'export const x = 1;\n');
+    try {
+      for (const pattern of ['src/**/*.ts', 'src/bot/internalSetup/fleet/+(nodeIdentity|takeover).ts', 'src/no/such/file.ts:1-5', outside]) {
+        const refused = gate('--mutate', pattern);
+        expect(refused.status, pattern).toBe(2);
+        expect(refused.stderr).toContain(`--mutate takes a file in the bot root that exists, or such a file and lines, never a glob: ${pattern}`);
+      }
+    } finally {
+      fs.rmSync(outside, { force: true });
     }
 
     const unknown = gate('--base', 'no-such-ref-anywhere');
@@ -135,10 +138,14 @@ describe('the touched-line mutation gate', () => {
     expect(unknown.stdout).toMatch(/^Verdict: NO RESULT \(the gate stopped before it finished\)$/m);
 
     // The file's opening comment and first import: no mutant can be made there.
-    const nothing = gate('--mutate', `${TARGET}:1-5`, '--concurrency', '1');
+    // Spelled the way a shell may complete it (on Windows, in another case too),
+    // it is taken under the name git gives the file.
+    const spelled = process.platform === 'win32' ? `.\\${TARGET.replace(/^src/, 'SRC').split('/').join('\\')}` : `./${TARGET}`;
+    const nothing = gate('--mutate', `${spelled}:1-5`, '--concurrency', '1');
     clean(nothing.stdout);
     expect(nothing.status, nothing.stderr).toBe(2);
     expect(nothing.stdout).toMatch(/^Patterns that made no mutant:\n {2}src\/bot\/internalSetup\/fleet\/nodeIdentity\.ts:1-5$/m);
+    expect(nothing.stdout).toMatch(/^Changed lines no mutant lies wholly on .*\n {2}src\/bot\/internalSetup\/fleet\/nodeIdentity\.ts: 5$/m);
     expect(nothing.stdout).toMatch(/^Verdict: NO RESULT \(no gating mutant was made/m);
   });
 });
