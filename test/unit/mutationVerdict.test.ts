@@ -3,7 +3,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { describe, expect, it, onTestFinished } from 'vitest';
-import { byKiller, classifyKill, confirmed, judge, outcome, toConfirm, toPassB, type MutantRecord, type PassResult } from '../mutation/verdict.mjs';
+import { byKiller, classifyKill, confirmed, INFRASTRUCTURE, judge, outcome, toConfirm, toPassB, type MutantRecord, type PassResult } from '../mutation/verdict.mjs';
 
 // What the L5 gate concludes (mutation/README.md): when a run counts as a
 // kill, which mutants go to which pass, and the verdict.
@@ -26,7 +26,8 @@ const FIXTURES: Record<string, string> = {
   'childFault.test.mjs': "it('survives a full disk', () => { throw new Error('scenario diskFull.cjs step2 exited 1 with no RESULT line\\nError: ENOSPC: no space left on device'); });",
   'assertsOnError.test.mjs': "it('classifies a refusal', () => { expect('connect ECONNREFUSED 10.0.0.2:5432').toBe('unreachable'); });",
   'stepBound.test.mjs': "it('restarts', () => { throw new Error('scenario fleetIdentity.cjs read did not finish in 20000 ms\\nwaiting for the lease'); });",
-  'eachHook.test.mjs': "beforeEach(() => { throw new Error('EBUSY: resource busy or locked, rmdir'); });\nit('reads', () => {});",
+  'eachHook.test.mjs': "beforeEach(() => { throw new Error('the hook failed'); });\nit('reads', () => {});",
+  'lockedDir.test.mjs': "afterEach(() => { throw new Error(\"EBUSY: resource busy or locked, rmdir 'smdb-x'\"); });\nit('reads', () => {});",
 };
 
 describe('a run Stryker counted as a kill', () => {
@@ -56,6 +57,9 @@ describe('a run Stryker counted as a kill', () => {
     expect(of('stepBound.test.mjs')).toEqual({ killedBy: expect.stringMatching(/stepBound\.test\.mjs > restarts$/) });
     // vitest gives a beforeEach failure to its test, so it counts as the test's.
     expect(of('eachHook.test.mjs')).toEqual({ killedBy: expect.stringMatching(/eachHook\.test\.mjs > reads$/) });
+    // A file another process holds is the machine's, in a test or its afterEach (pass A never reruns a kill).
+    expect(of('lockedDir.test.mjs')).toEqual({ inconclusive: "only the machine failed: Error: EBUSY: resource busy or locked, rmdir 'smdb-x'" });
+    for (const code of ['EBUSY', 'EPERM', 'ENOTEMPTY', 'EACCES']) expect(INFRASTRUCTURE.test(`Error: ${code}: x`), code).toBe(true);
     // A run is a timeout only when every failure timed out: a machine failure
     // beside a timeout, in another tier's report or at file level, proves nothing.
     const ofAll = (...names: string[]) => classifyKill(names.map(name => ({ testResults: report.testResults.filter(file => file.name.endsWith(name)) as never })));

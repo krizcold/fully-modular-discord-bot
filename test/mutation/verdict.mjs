@@ -13,13 +13,16 @@
  */
 
 // A failure the machine causes, not the mutant: a connection or a container
-// that would not come up, a resource that ran out. Matched against the first
-// line of a failure (the error's own message), never against an assertion, a
-// stack or a child's stderr, which may name such an error as the thing under
-// test. The list cannot be complete, so every kill in pass B, where machines
-// fail, must also repeat when the mutant runs alone (toConfirm).
+// that would not come up, a resource that ran out, a file held or refused (on
+// Windows, a temp dir a test removes while a run beside it or the indexer
+// holds a file in it). Matched against the first line of a failure (the
+// error's own message), never against an assertion, a stack or a child's
+// stderr, which may name such an error as the thing under test. The list
+// cannot be complete, so every kill in pass B, where machines fail, must also
+// repeat when the mutant runs alone (toConfirm).
 export const INFRASTRUCTURE = new RegExp([
   'ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'EAI_AGAIN', 'EPIPE', 'EMFILE', 'ENOMEM', 'ENOSPC', 'heap out of memory',
+  'EBUSY', 'EPERM', 'ENOTEMPTY', 'EACCES',
   'Connection terminated', 'timeout exceeded when trying to connect', 'too many clients', 'not queryable',
   'the database system is', 'Health check not healthy', 'Wait strategy', 'waiting for container', 'Container failed to start',
   'container runtime', 'HTTP code 5\\d\\d', 'toomanyrequests',

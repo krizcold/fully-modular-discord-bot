@@ -3,6 +3,7 @@ import { createRequire } from 'module';
 import os from 'os';
 import path from 'path';
 import fc from 'fast-check';
+import { afterAll } from 'vitest';
 import { DEAD_ENDS, scrubEnv } from './env';
 
 // Every test file runs in its own fork: before any source module is imported,
@@ -13,7 +14,16 @@ createRequire(import.meta.url)('./forkGuard.cjs');
 scrubEnv(process.env);
 Object.assign(process.env, DEAD_ENDS);
 process.env.NODE_ENV = 'test';
-process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-test-'));
+const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-test-'));
+process.env.DATA_DIR = dataDir;
+// Removed after the file's own afterAll hooks (vitest runs them in reverse),
+// unless SMDB_KEEP_TEST_FILES keeps it for a look; a file a process still
+// holds leaves it behind rather than failing the file.
+afterAll(() => {
+  if (!process.env.SMDB_KEEP_TEST_FILES) {
+    try { fs.rmSync(dataDir, { recursive: true, force: true, maxRetries: 5 }); } catch {}
+  }
+});
 
 // The mutation gate draws one seed per run (mutation/touched.mjs), so a
 // property draws the same inputs with a mutant as without one. A seed that is

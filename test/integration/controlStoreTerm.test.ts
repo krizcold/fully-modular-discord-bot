@@ -2,6 +2,7 @@ import type { StartedPostgreSqlContainer } from '@testcontainers/postgresql';
 import type { Pool } from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { PostgresControlStore } from '../../src/bot/internalSetup/fleet/postgresControlStore';
+import { endPool } from '../helpers/endPool';
 import { poolFor, startPostgres } from '../helpers/postgres';
 
 let container: StartedPostgreSqlContainer;
@@ -13,7 +14,7 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
-  await pool?.end();
+  await endPool(pool);
   await container?.stop();
 });
 

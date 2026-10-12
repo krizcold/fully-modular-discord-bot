@@ -712,10 +712,11 @@ describe('the widening', () => {
 // of its body), and the emptying of the body of a compound statement or
 // declaration, or of a bare block, that only begins or ends on the line (a
 // changed `if (...) {`, signature or closing brace: making it would bring in
-// the whole body), and the false condition of a for with no condition, which
-// spans the loop. Every other body's emptying is made (a callback's, a case
-// clause's block, a method of an object or a class expression), and what is
-// not made is checked not to be.
+// the whole body), and the false condition of a for with no condition that
+// spans more than one line, which spans the loop (a one-line loop's is made,
+// and so is one whose every line changed, below). Every other body's emptying
+// is made (a callback's, a case clause's block, a method of an object or a
+// class expression), and what is not made is checked not to be.
 describe('the widening, against what Stryker makes', () => {
   const quiet = () => {};
   const logger = { debug: quiet, info: quiet, warn: quiet, error: quiet, trace: quiet, fatal: quiet, isDebugEnabled: () => false, isTraceEnabled: () => false, isInfoEnabled: () => false, isWarnEnabled: () => false, isErrorEnabled: () => false, isFatalEnabled: () => false };
@@ -743,7 +744,8 @@ describe('the widening, against what Stryker makes', () => {
       // The bodies of compound statements and declarations, and bare blocks: never a callback's body, a case
       // clause's block, or the body of a method or accessor of an object or a class expression, each taken whole.
       const bodies = new Set<string>();
-      // Each for with no condition, whose false condition Stryker makes over the whole loop.
+      // Each for with no condition on more than one line: its false condition spans the loop, so one changed line
+      // does not make it (a one-line loop's is made, and the filter below keeps those out).
       const loops = new Set<string>();
       const inExpression = (node: ts.Node) => (ts.isMethodDeclaration(node) || ts.isGetAccessor(node) || ts.isSetAccessor(node) || ts.isConstructorDeclaration(node))
         && (ts.isObjectLiteralExpression(node.parent) || ts.isClassExpression(node.parent));
@@ -814,6 +816,20 @@ describe('the widening, against what Stryker makes', () => {
     const gating = here.filter(m => gates(target, loc(m)));
     expect(gating.length).toBeGreaterThan(0);
     expect(gating.every(m => m.location.start.line + 1 === 4 && m.location.end.line + 1 === 4)).toBe(true);
+  });
+
+  it('makes and gates the false condition of a for with no condition when every line of the loop changed', async () => {
+    const text = ['export async function wait(ready: () => Promise<boolean>) {', '  for (;;) {', '    if (await ready()) return;', '  }', '}'].join('\n');
+    const loop = (m: Made) => m.mutatorName === 'ConditionalExpression' && m.location.start.line + 1 === 2 && m.location.end.line + 1 === 4;
+    const of = async (changed: number[]) => {
+      const target = changeTarget('src/a.ts', text, { changed, deletedAfter: [] })!;
+      const here = await made(text, target.ranges!.map(([s, e]) => ({ start: { line: s - 1, column: 0 }, end: { line: e - 1, column: Number.MAX_SAFE_INTEGER } })));
+      const found = here.find(loop);
+      return found && gates(target, { start: { line: found.location.start.line + 1, column: 1 }, end: { line: found.location.end.line + 1, column: 1 } });
+    };
+    expect(await of([2, 3, 4])).toBe(true);
+    // With the closer unchanged, the loop's range is not held whole, so it is not made.
+    expect(await of([2, 3])).toBeUndefined();
   });
 
   it('names the lines of a file taken whole that only the emptying of their body covers', async () => {

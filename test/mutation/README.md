@@ -29,7 +29,7 @@ active mutant travels in `__STRYKER_ACTIVE_MUTANT__` and reaches child processes
 From the bot root, with Node 22.12 or newer (or SMDB_TEST_NODE set, as for `npm test`):
 
     npm run test:mutate -- [--base REF] [--mutate PATTERN]... [--concurrency N] [--keep]
-    npm run test:mutate > l5.txt; test $? -eq 0
+    npm run test:mutate > l5.log; test $? -eq 0
 
 - With no option it mutates the change from HEAD to the working tree: the job before it is committed. For a job already
   committed, pass `--base` the commit before it; `--base main` takes everything since the merge-base with main (a
@@ -44,6 +44,9 @@ From the bot root, with Node 22.12 or newer (or SMDB_TEST_NODE set, as for `npm 
 - `--concurrency N` sets pass A's parallel runs (default: half the cores); pass B uses half of that.
 - `--keep` keeps the sandboxes in `.stryker-tmp/` for a look after the run. Without it every sandbox is removed, a
   failed pass's too.
+- The gate fingerprints every file git tracks or would add (below), so its output goes to a file git ignores (`l5.log`
+  above, under the root's `*.log`) or one outside the checkout: a file in the tree that the run writes to changes
+  during the run, which ends it NO RESULT.
 - Exit 0 is PASS, 1 FAIL, 2 NO RESULT (nothing was tested, the tree changed during the run, or the gate stopped: the
   report says which; or, with no report, the test packages are missing (`npm run test:install`), .stryker-tmp could not
   be made, git could not list the tree, or the report itself could not be written; every `Verdict:` line goes to
@@ -71,9 +74,11 @@ runs it under a hostile config). git runs with no file-system monitor, so it loo
 - **Gating** mutants touch a changed line. Some that touch one are not made: one that touches it only through a block
   holding the line (the emptying of that block, or the whole callback around it), the emptying of the body of a
   compound statement or declaration (above), or of a bare block, that only begins or ends on the changed line: its
-  header or its closing brace, and the false condition Stryker gives a `for` with no condition that spans more than
-  one line, which spans the whole loop (a reviewer checks a changed header of such a loop; the structure list below
-  names it only when it holds the body's `{`; a one-line loop's false condition is made and gates). A block wholly made of
+  header or its closing brace, and the false condition Stryker gives a `for` with no condition, which spans the whole
+  loop: it is made only where one range holds the whole loop (a loop on one line, one whose every line changed, one
+  inside a statement taken whole), and then gates as any mutant does. A reviewer checks a changed header of a longer
+  loop: the no-mutant list below names it when it has no mutant of its own, and the structure list when it holds the
+  body's `{`; one with a mutant of its own (`for (let i = 0; ; i++)`) and no `{` is named in neither. A block wholly made of
   changed lines is made, and so is every other body's emptying. unit/mutationRanges.test.ts holds this rule to
   Stryker's own instrumenter, line by line, both what is made and what is not, on made-up shapes and on two real files.
 - The other mutants in the widened ranges are **context**: they run in pass A and are listed, but never fail the gate.
@@ -88,8 +93,9 @@ runs it under a hostile config). git runs with no file-system monitor, so it loo
   edited line beside it or not): every place their first or last lines, or the whole run, could slide to passes only
   such lines. This can gate an unchanged line no shortest diff changes. The window starts from the pieces the diff
   makes, though: with another change in the same file, the diff can split a run added or taken out in one place into
-  several pieces, and then which of its copies count is again the diff's choice (one placement of the run is always
-  counted); so is it where repeated lines are spread among other changes.
+  several pieces, and then which of its copies count is again the diff's choice: a line the job added can go unmutated,
+  and be named nowhere, while an unchanged copy of it gates. So is it where repeated lines are spread among other
+  changes.
 - Only the lines the diff changed count. A change can also move an unchanged line into or out of a block (a bracket,
   an `else`, a `finally` or a `case` moved past it, a header put around it, an if's two bodies swapped): that line is
   not gated, so its mutants run as context at most. The changed lines that make such a move are named under their own
@@ -153,9 +159,9 @@ runs it under a hostile config). git runs with no file-system monitor, so it loo
 3. **Reruns alone.** Every run stops at its first failure. A rerun runs one mutant at a time and gives every test, hook
    and child scenario step four times its time limit (a test's own explicit limit is not scaled), and Stryker a larger
    budget for the whole run.
-   - A gating mutant that timed out in pass A reruns with the fast tests that import the files of the mutants rerun
-     (pass A ran those for every mutated file, so a test that reached it only through another file's imports does not
-     run again, and it goes on to pass B). It counts as killed when the rerun fails a
+   - A gating mutant that timed out in pass A reruns with the fast tests that import the files of the mutants rerun,
+     directly or through other files (`vitest related`; a test that reaches them by no import vitest can see, such as a
+     computed require, a file read or a child process, does not run again). It counts as killed when the rerun fails a
      test, or times out again: a test or its beforeEach or afterEach hook past four times its limit (a beforeAll or
      afterAll hook's timeout is inconclusive, below), or the whole run past Stryker's budget for
      it, which is four times what those tests take with no mutant, plus a minute. That budget fires first whenever
@@ -166,9 +172,11 @@ runs it under a hostile config). git runs with no file-system monitor, so it loo
      only hangs a test there is inconclusive. A test that waits must bound its wait and fail, as a child scenario step
      does ("did not finish in N ms" is a failure, not a hang). A child test's own limit is fifteen steps' bounds, so in
      a test of up to fourteen steps a hung step fails by its bound first. Stryker's budget for a pass B run is twice
-     its run with no mutant plus a minute, below vitest's limit on a hook, so a run that fails a test and then waits in
-     an afterAll past that budget (a `pool.end()` held by a client still checked out) counts as a hang too: an afterAll
-     must bound its waits as a test does.
+     its run with no mutant plus a minute. While that run takes under a minute, the budget is below vitest's limit on a
+     hook, so a run that fails a test and then waits in an afterAll past the budget (a `pool.end()` held by a client
+     still checked out) counts as a hang too; past a minute, vitest's limit can end the afterAll first, and the failed
+     test counts as a kill. Either way an afterAll must bound its waits as a test does (the suite's own end their pools
+     through helpers/endPool.ts).
    - A gating kill of pass B reruns with the one test file that killed it, alone (one rerun per such file), so no
      other file's order or hang can decide it. It counts only when that file fails for the mutant again. Its Stryker
      budget is an hour, above anything vitest's own limits let the file take after its first failure, so a rerun that
@@ -197,16 +205,17 @@ a reason other than the machine. When every failing test (or its beforeEach or a
 the run failed for the machine, it is a timeout.
 Anything else is **inconclusive**: no report, a failure (a timeout included) only in a beforeAll or afterAll hook or at file level, an
 unhandled error with every test passing, or only machine failures (refused or reset connections, a container that would not start, a database
-connection dropped, exhausted resources). The machine's texts are matched against the first line of each failure only,
-never an assertion or a child's stderr, which may name such an error as the thing under test; the list cannot be
-complete, which is why pass B's kills must repeat. vitest counts a failure in a beforeEach or afterEach hook as its
+connection dropped, exhausted resources, a file held or refused: EBUSY, EPERM, ENOTEMPTY or EACCES, as on Windows when
+a test removes its temp dir while a run beside it or the indexer holds a file in it). The machine's texts are matched
+against the first line of each failure only, never an assertion or a child's stderr, which may name such an error as
+the thing under test; the list cannot be complete, which is why pass B's kills must repeat. vitest counts a failure in a beforeEach or afterEach hook as its
 test's, so such a failure counts as the test's too.
 
 Every run of the gate draws one fast-check seed (named on the Scope line; set SMDB_TEST_SEED to an integer to run with a
 given one, anything else is refused), so a property draws the same inputs in every mutant's run as in the run with no
 mutant: a property that fails in a mutant's run fails for the mutant. A pass A kill stands on one run, so a test that
-can fail by chance there still credits a kill: one random in another way (its own Math.random, the clock), and one
-that uses a fixed port or path, since every mutant's run in pass A shares one sandbox and one temp dir: a run beside it
+can fail by chance there still credits a kill: one random in another way (its own Math.random, the clock), one that
+fails for the machine in a way the list above does not hold, and one that uses a fixed port or path, since every mutant's run in pass A shares one sandbox and one temp dir: a run beside it
 can hold the port or the path, and a run before it can leave the path behind. Fast tests use mkdtemp and port 0;
 `--concurrency 1` rules out only the runs beside it.
 

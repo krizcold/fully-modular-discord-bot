@@ -1,4 +1,4 @@
-import { execFileSync } from 'child_process';
+import { execFileSync, spawnSync } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -90,5 +90,39 @@ describe('the env scrub', () => {
     const ceiling = [path.dirname(sandbox), temp].join(path.delimiter);
     expect(run(path.join(sandbox, 'test'), ceiling)).toMatch(/not a git repository/);
     expect(run(path.join(temp, 'smdb-test-1', 'cache'), ceiling)).toMatch(/not a git repository/);
+  });
+
+  // Every test file of every mutant run makes one: left behind, they pile up in the temp dir.
+  it("removes a test file's data root after the file's own afterAll hooks, unless SMDB_KEEP_TEST_FILES keeps it", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-dataroot-'));
+    onTestFinished(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const out = path.join(dir, 'root.txt');
+    fs.writeFileSync(path.join(dir, 'root.test.mjs'), [
+      "import fs from 'fs';",
+      "import path from 'path';",
+      "afterAll(() => { fs.writeFileSync(path.join(process.env.DATA_DIR, 'late.txt'), 'x'); });",
+      "it('writes', () => {",
+      "  fs.mkdirSync(path.join(process.env.DATA_DIR, 'guild'));",
+      "  fs.writeFileSync(path.join(process.env.DATA_DIR, 'guild', 'a.json'), '{}');",
+      '  fs.writeFileSync(process.env.SMDB_PROBE_OUT, process.env.DATA_DIR);',
+      '});',
+    ].join('\n'));
+    const vitest = path.join(__dirname, '..', 'node_modules', 'vitest', 'vitest.mjs');
+    const setup = path.join(__dirname, '..', 'helpers', 'setup.ts');
+    fs.writeFileSync(path.join(dir, 'vitest.config.mjs'), `export default { test: { setupFiles: [${JSON.stringify(setup)}] } };\n`);
+    const run = (keep: boolean) => {
+      const env: NodeJS.ProcessEnv = { ...process.env, SMDB_PROBE_OUT: out };
+      delete env.SMDB_KEEP_TEST_FILES;
+      if (keep) env.SMDB_KEEP_TEST_FILES = '1';
+      const result = spawnSync(process.execPath, [vitest, 'run', '--root', dir, '--globals'], { cwd: dir, env, encoding: 'utf8', timeout: 120_000 });
+      expect(result.status, `${result.stdout}${result.stderr}`).toBe(0);
+      const root = fs.readFileSync(out, 'utf8');
+      expect(path.basename(root)).toMatch(/^smdb-test-/);
+      return root;
+    };
+    expect(fs.existsSync(run(false))).toBe(false);
+    const left = run(true);
+    onTestFinished(() => fs.rmSync(left, { recursive: true, force: true }));
+    expect(fs.readFileSync(path.join(left, 'late.txt'), 'utf8')).toBe('x');
   });
 });

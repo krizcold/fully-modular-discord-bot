@@ -7,6 +7,7 @@ import { Pool } from 'pg';
 import type { StartedPostgreSqlContainer } from '@testcontainers/postgresql';
 import { GenericContainer } from 'testcontainers';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { endPool } from '../helpers/endPool';
 import { poolFor, startPostgres } from '../helpers/postgres';
 import { FAKE_SCHEMA, startFakeApp, type DeleteFault, type WriteFault } from '../oracle/fakeApp';
 import { dbCopy } from '../oracle/judge.mjs';
@@ -91,8 +92,8 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
-  await forkPool?.end();
-  await pool?.end();
+  await endPool(forkPool);
+  await endPool(pool);
   await container?.stop();
   // SMDB_KEEP_TEST_FILES keeps the logs and copies for a look after a failure.
   if (dir && !process.env.SMDB_KEEP_TEST_FILES) fs.rmSync(dir, { recursive: true, force: true });

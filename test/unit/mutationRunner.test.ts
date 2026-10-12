@@ -335,6 +335,17 @@ describe('the time limits', () => {
     const { PASSES } = await import('../mutation/passes.mjs');
     expect((config.test.testTimeout - PASSES.a2.timeoutMS) / PASSES.a2.timeoutFactor).toBe(15_000);
   });
+
+  // mutation/README.md: a pass B run's budget (factor times T, its run with no
+  // mutant, plus timeoutMS) fires before vitest's limit on a hook whenever T is
+  // under a minute.
+  it('let a pass B run past its whole budget before an afterAll times out, while its run with no mutant takes under a minute', async () => {
+    vi.stubEnv('SMDB_TEST_TIME_SCALE', '1');
+    vi.resetModules();
+    const config = (await import('../vitest.config')).default as { test: { hookTimeout: number } };
+    const { PASSES } = await import('../mutation/passes.mjs');
+    expect((config.test.hookTimeout - PASSES.b.timeoutMS) / PASSES.b.timeoutFactor).toBe(60_000);
+  });
 });
 
 describe('the Stryker options', () => {
