@@ -26,6 +26,7 @@ const FIXTURES: Record<string, string> = {
   'childFault.test.mjs': "it('survives a full disk', () => { throw new Error('scenario diskFull.cjs step2 exited 1 with no RESULT line\\nError: ENOSPC: no space left on device'); });",
   'assertsOnError.test.mjs': "it('classifies a refusal', () => { expect('connect ECONNREFUSED 10.0.0.2:5432').toBe('unreachable'); });",
   'stepBound.test.mjs': "it('restarts', () => { throw new Error('scenario fleetIdentity.cjs read did not finish in 20000 ms\\nwaiting for the lease'); });",
+  'eachHook.test.mjs': "beforeEach(() => { throw new Error('EBUSY: resource busy or locked, rmdir'); });\nit('reads', () => {});",
 };
 
 describe('a run Stryker counted as a kill', () => {
@@ -53,6 +54,8 @@ describe('a run Stryker counted as a kill', () => {
     expect(of('assertsOnError.test.mjs')).toEqual({ killedBy: expect.stringMatching(/assertsOnError\.test\.mjs > classifies a refusal$/) });
     // A child step's own bound is the test's assertion that the step ends.
     expect(of('stepBound.test.mjs')).toEqual({ killedBy: expect.stringMatching(/stepBound\.test\.mjs > restarts$/) });
+    // vitest gives a beforeEach failure to its test, so it counts as the test's.
+    expect(of('eachHook.test.mjs')).toEqual({ killedBy: expect.stringMatching(/eachHook\.test\.mjs > reads$/) });
     // A run is a timeout only when every failure timed out: a machine failure
     // beside a timeout, in another tier's report or at file level, proves nothing.
     const ofAll = (...names: string[]) => classifyKill(names.map(name => ({ testResults: report.testResults.filter(file => file.name.endsWith(name)) as never })));
@@ -145,9 +148,13 @@ describe('the verdict', () => {
       mutant(3, true, { a: pass('CompileError') }),
       mutant(4, true, { a: pass('Survived'), b: pass('Killed', { killedBy: 'child > y' }), b2: pass('Killed', { killedBy: 'child > y' }) }),
       mutant(5, false, { a: pass('Survived') }),
+      mutant(6, true, { a: pass('Timeout'), a2: pass('Killed', { timeout: 'unit/x.test.ts > slow' }) }),
     ], { controls: ['after pass b2: passed'] });
     expect(result).toMatchObject({ verdict: 'PASS', code: 0 });
     expect(result.lines.join('\n')).toMatch(/^Timeouts \(each timed out again when run alone with four times the time: a test, a hook, or the whole run past its budget; .*\n {2}src\/a\.ts:2:3 /m);
+    // A rerun past Stryker's budget may only have slowed the tests: it is not said to have hung.
+    expect(result.lines.join('\n')).toMatch(/^ {2}src\/a\.ts:2:3 .*\(ran past Stryker's budget alone too\)$/m);
+    expect(result.lines.join('\n')).toMatch(/^ {2}src\/a\.ts:6:3 .*\(timed out alone too: unit\/x\.test\.ts > slow\)$/m);
     expect(result.lines.join('\n')).toMatch(/^Context survivors:\n {2}src\/a\.ts:5:3 /m);
     expect(result.lines.join('\n')).toMatch(/^Runs with no mutant after the reruns:\n {2}after pass b2: passed$/m);
   });

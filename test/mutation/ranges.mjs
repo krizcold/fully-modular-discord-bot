@@ -5,6 +5,7 @@
 // The caller runs git.
 import fs from 'fs';
 import path from 'path';
+import { Minimatch, minimatch } from 'minimatch';
 import ts from 'typescript';
 import { canonicalName } from './keys.mjs';
 
@@ -144,15 +145,19 @@ export function commonLines(a, b) {
  * What changed from `before` to `after`, as lines of `after` (from 1): the
  * lines no longest common subsequence of the two keeps, and the lines after
  * which lines of `before` were only taken out (0: before the first line). Lines
- * end at LF or CRLF, so line endings alone change nothing. A run that was only
- * added or only taken out, and could sit in more than one place because the
- * lines beside it repeat it, counts in every place it could sit: the copy that
- * changed is never left to the diff's choice.
+ * end at LF or CRLF, so line endings alone change nothing. The lines added in
+ * one place, or only taken out, count also where they could slide to: their
+ * first or last lines, or the whole run, pass through unchanged lines beside
+ * them that repeat them (an `if` block added after an equal one counts in both
+ * places). Given the file's name, a line kept whose place in the code changed
+ * (a bracket moved past it puts it in or out of a block, a block's header and
+ * bracket put around it or taken away) counts as changed too.
  * @param {string} before
  * @param {string} after
+ * @param {string} [file] its name, to parse both texts by
  * @returns {{ changed: number[], deletedAfter: number[] }}
  */
-export function lineDiff(before, after) {
+export function lineDiff(before, after, file) {
   const a = splitLines(before);
   const b = splitLines(after);
   const pairs = commonLines(a, b);
@@ -167,22 +172,55 @@ export function lineDiff(before, after) {
   for (const [i, j] of [...pairs, [a.length, b.length]]) {
     const [i0, i1, j0, j1] = [pi + 1, i, pj + 1, j];
     for (let k = j0; k < j1; k++) changed.add(k + 1);
-    if (i1 === i0 && j1 > j0) {
-      // Added only: slide the run up, then down, while the line it passes repeats it.
-      for (let u = i0, s = j0, e = j1; u > 0 && partner[u - 1] === s - 1 && b[s - 1] === b[e - 1]; u--, s--, e--) changed.add(s);
-      for (let u = i0, s = j0, e = j1; u < a.length && partner[u] === e && b[s] === b[e]; u++, s++, e++) changed.add(e + 1);
-    } else if (j1 === j0 && i1 > i0) {
+    // Each head of the lines added (its first k) slides up, and each tail (its
+    // last k) down, while the unchanged line it passes repeats it.
+    for (let k = 1; k <= j1 - j0; k++) {
+      for (let t = 1; i0 - t >= 0 && partner[i0 - t] === j0 - t && b[j0 - t] === b[j0 + k - t]; t++) changed.add(j0 - t + 1);
+      for (let t = 0; i1 + t < a.length && partner[i1 + t] === j1 + t && b[j1 + t] === b[j1 - k + t]; t++) changed.add(j1 + t + 1);
+    }
+    if (j1 === j0 && i1 > i0) {
       // Taken out only: the same, for the place in `after` where it was.
       deletedAfter.add(j0);
-      for (let s = i0, e = i1, p = j0; s > 0 && partner[s - 1] === p - 1 && a[s - 1] === a[e - 1]; s--, e--, p--) deletedAfter.add(p - 1);
-      for (let s = i0, e = i1, p = j0; e < a.length && partner[e] === p && a[s] === a[e]; s++, e++, p++) deletedAfter.add(p + 1);
+      for (let k = 1; k <= i1 - i0; k++) {
+        for (let t = 1; i0 - t >= 0 && partner[i0 - t] === j0 - t && a[i0 - t] === a[i0 + k - t]; t++) deletedAfter.add(j0 - t);
+        for (let t = 0; i1 + t < a.length && partner[i1 + t] === j0 + t && a[i1 + t] === a[i1 - k + t]; t++) deletedAfter.add(j0 + t + 1);
+      }
     }
     pi = i;
     pj = j;
   }
+  if (file !== undefined) {
+    const was = depthsOf(file, before);
+    const is = depthsOf(file, after);
+    for (const [i, j] of pairs) if (was.get(i + 1) !== is.get(j + 1)) changed.add(j + 1);
+  }
   /** @param {Set<number>} set */
   const sorted = set => [...set].sort((x, y) => x - y);
   return { changed: sorted(changed), deletedAfter: sorted(deletedAfter) };
+}
+
+/**
+ * Per line (from 1), how deep in the syntax tree the outermost node that
+ * starts on it sits; a line no node starts on (a bracket, a comment) has none.
+ * A line kept whose depth changed sits in another block than before.
+ * @param {string} file
+ * @param {string} text
+ */
+function depthsOf(file, text) {
+  const sf = parse(file, text);
+  /** @type {Map<number, number>} */
+  const depths = new Map();
+  /**
+   * @param {ts.Node} node
+   * @param {number} depth
+   */
+  const walk = (node, depth) => {
+    const line = sf.getLineAndCharacterOfPosition(node.getStart(sf)).line + 1;
+    if (!depths.has(line)) depths.set(line, depth);
+    ts.forEachChild(node, child => walk(child, depth + 1));
+  };
+  ts.forEachChild(sf, child => walk(child, 1));
+  return depths;
 }
 
 /**
@@ -376,7 +414,7 @@ export function untouched(file, text, lines, spans) {
  * names come from here: the changed lines come from lineDiff.
  * @param {string} base
  */
-export const changedArgs = base => ['diff', '--name-status', '-z', '-M', '-l0', '--no-relative', '--no-ext-diff', '--no-textconv', base, '--'];
+export const changedArgs = base => ['diff', '--name-status', '-z', '-M', '-l0', '--ignore-submodules=none', '--no-relative', '--no-ext-diff', '--no-textconv', base, '--'];
 
 /**
  * The target for a file's changed lines. `gating` lists them: a mutant that
@@ -412,59 +450,118 @@ export const wholeTarget = file => ({ file, ranges: null, gating: null, patterns
  * moved in from a name never mutated (outside src, a browser view, a file that
  * is not code). One moved out of the mutated code is named, as a deletion is.
  * A file that holds a line break Stryker counts and the diff does not is named
- * and not mutated (EXTRA_BREAK_WHY). `nameOf` gives the name a file is mutated
- * under (its name on disk, keys.mjs). emptyScope: nothing in src changed.
- * @param {{ entries: Entry[], untracked: string[], read: (file: string) => string, readBase: (file: string) => string, nameOf: (file: string) => string }} change
+ * and not mutated (EXTRA_BREAK_WHY), and so is a git submodule (`isDir`: git
+ * names only its commit) and a file whose name Stryker would read as a glob
+ * (`nameOf` gives null). `nameOf` gives the name a file is mutated under (its
+ * name on disk, keys.mjs). emptyScope: nothing in src changed.
+ * @param {{ entries: Entry[], untracked: string[], read: (file: string) => string, readBase: (file: string) => string,
+ *   nameOf: (file: string) => string | null, isDir?: (file: string) => boolean }} change
  * @returns {{ targets: Target[], skipped: { file: string, why: string }[], emptyScope: boolean }}
  */
-export function planChange({ entries, untracked, read, readBase, nameOf }) {
+export function planChange({ entries, untracked, read, readBase, nameOf, isDir = () => false }) {
   /** @type {Target[]} */
   const targets = [];
   /** @type {{ file: string, why: string }[]} */
   const skipped = [];
   for (const entry of entries) {
     if (entry.status === 'D') { skipped.push({ file: entry.file, why: 'deleted: nothing is left to mutate' }); continue; }
+    if (isDir(entry.file)) { skipped.push({ file: entry.file, why: 'a git submodule: git names only its commit, so none of its files is mutated' }); continue; }
     const why = notMutated(entry.file);
     if (why) {
       skipped.push({ file: entry.file, why });
       if (entry.from !== undefined && notMutated(entry.from) === null) skipped.push({ file: entry.from, why: `moved to ${entry.file}: nothing is left to mutate` });
       continue;
     }
+    const name = nameOf(entry.file);
+    if (name === null) { skipped.push({ file: entry.file, why: GLOB_NAME_WHY }); continue; }
     const text = read(entry.file);
     if (holdsExtraBreak(text)) { skipped.push({ file: entry.file, why: EXTRA_BREAK_WHY }); continue; }
     const before = entry.status === 'A' || entry.status === 'C' ? null : entry.from ?? entry.file;
-    if (before === null || notMutated(before) !== null) { targets.push(wholeTarget(nameOf(entry.file))); continue; }
-    const target = changeTarget(nameOf(entry.file), text, lineDiff(readBase(before), text));
+    if (before === null || notMutated(before) !== null) { targets.push(wholeTarget(name)); continue; }
+    const target = changeTarget(name, text, lineDiff(readBase(before), text, entry.file));
     if (target) targets.push(target);
     else skipped.push({ file: entry.file, why: 'no changed lines (a rename, a mode change, or line endings only)' });
   }
   for (const file of untracked) {
-    const why = file.startsWith('src/') && file.endsWith('/')
-      ? 'an untracked git repository: git lists none of its files, so none is mutated'
-      : notMutated(file) ?? (holdsExtraBreak(read(file)) ? EXTRA_BREAK_WHY : null);
+    if (file.startsWith('src/') && file.endsWith('/')) {
+      skipped.push({ file, why: 'an untracked git repository: git lists none of its files, so none is mutated' });
+      continue;
+    }
+    const why = notMutated(file);
+    const name = why ? null : nameOf(file);
     if (why) skipped.push({ file, why });
-    else targets.push(wholeTarget(nameOf(file)));
+    else if (name === null) skipped.push({ file, why: GLOB_NAME_WHY });
+    else if (holdsExtraBreak(read(file))) skipped.push({ file, why: EXTRA_BREAK_WHY });
+    else targets.push(wholeTarget(name));
   }
   /** @param {string | undefined} file */
   const inSrc = file => file !== undefined && file.startsWith('src/');
   return { targets, skipped, emptyScope: !entries.some(entry => inSrc(entry.file) || inSrc(entry.from)) && !untracked.some(inSrc) };
 }
 
+export const GLOB_NAME_WHY = 'its name holds characters Stryker reads as a glob, so it cannot be given to Stryker; rename it';
+
 /**
  * planChange on what git says changed from base to the working tree of the bot
  * root `root`: `git` runs git there and returns what it printed, and `read`
  * gives a file's text. Each file is mutated under the name it has on disk
  * (keys.mjs), which Stryker matches: a file renamed by case outside git too.
+ * git does not look at a file its index marks assume-unchanged or
+ * skip-worktree (core.ignoreStat marks every file it adds), so each such file
+ * is compared with its base text here, and named as changed when it differs.
  * @param {{ git: (...args: string[]) => string, base: string, root: string, read?: (file: string) => string }} io
  */
 export function planFromGit({ git, base, root, read = file => fs.readFileSync(path.join(root, file), 'utf8') }) {
+  /** @param {string} file */
+  const readBase = file => git('cat-file', 'blob', `${base}:${file}`);
+  /** @param {string} file */
+  const isFile = file => { try { return fs.statSync(path.join(root, file)).isFile(); } catch { return false; } };
+  const entries = parseNameStatus(git(...changedArgs(base)));
+  const listed = new Set(entries.flatMap(entry => [entry.file, entry.from]));
+  const hidden = git('ls-files', '-v', '-z').split('\0').filter(line => /^([a-z]|S) /.test(line)).map(line => line.slice(2));
+  for (const file of hidden) {
+    if (listed.has(file) || !isFile(file)) continue;
+    let was = null;
+    try { was = readBase(file); } catch { was = null; }
+    if (was === null) entries.push({ status: 'A', file });
+    else if (was !== read(file)) entries.push({ status: 'M', file });
+  }
   return planChange({
-    entries: parseNameStatus(git(...changedArgs(base))),
+    entries,
     untracked: git('ls-files', '-z', '--others', '--exclude-standard').split('\0').filter(Boolean),
     read,
-    readBase: file => git('cat-file', 'blob', `${base}:${file}`),
-    nameOf: file => canonicalName(root, file) ?? file,
+    readBase,
+    nameOf: file => canonicalName(root, file) ?? (globFree(root, file) ? file : null),
+    isDir: file => { try { return fs.statSync(path.join(root, file)).isDirectory(); } catch { return false; } },
   });
+}
+
+/**
+ * Whether Stryker can be given a file under this name: it reads a mutate
+ * pattern as a glob, refuses one with lines when it holds a glob, and matches
+ * files to it with minimatch, so the name must hold no glob and match itself.
+ * @param {string} root
+ * @param {string} file
+ */
+function globFree(root, file) {
+  const name = path.resolve(root, file).split(path.sep).join('/');
+  return !new Minimatch(name).hasMagic() && minimatch(name, name, { dot: true });
+}
+
+// The one src file whose mutant can turn the tests from their own data dir to
+// '/data' (resolveDataRoot's DATA_DIR check), on a developer's machine a real one.
+export const DATA_ROOT_FILE = 'src/utils/dataRoot.ts';
+
+/**
+ * The real data roots a run would reach through a mutant of DATA_ROOT_FILE:
+ * '/data' as the tests resolve it, from the bot root's drive and from the temp
+ * dir's, where it exists. None when no target is that file.
+ * @param {string[]} files the targets' files
+ * @param {{ root: string, tmp: string, exists: (dir: string) => boolean }} where
+ */
+export function dataRootsInReach(files, { root, tmp, exists }) {
+  if (!files.includes(DATA_ROOT_FILE)) return [];
+  return [...new Set([path.resolve(root, '/data'), path.resolve(tmp, '/data')])].filter(exists);
 }
 
 /**

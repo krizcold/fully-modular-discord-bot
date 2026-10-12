@@ -84,14 +84,17 @@ describe('the touched-line mutation gate', () => {
 
   it('counts nothing its reruns found, and has no result, when the run with no mutant after them fails', { timeout: 600_000 }, () => {
     // A stand-in for vitest: the run with no mutant passes, every mutant's test
-    // times out, and the run with no mutant after the reruns fails.
+    // times out, and the run with no mutant after the reruns fails, after it
+    // adds a file to the checkout (the tree changed during the run).
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-control-'));
     const fake = path.join(dir, 'vitest.cjs');
+    const added = `test/mutation/smdb-tree-${process.pid}.txt`;
     fs.writeFileSync(fake, [
       "const fs = require('fs');",
       "const file = process.argv.find(arg => arg.startsWith('--outputFile=')).slice('--outputFile='.length);",
       'const mutant = process.env.__STRYKER_ACTIVE_MUTANT__;',
       "const control = file.split('\\\\').join('/').includes('/control-');",
+      `if (control) fs.writeFileSync(${JSON.stringify(path.join(root, added))}, 'changed');`,
       "const message = control ? 'Error: the database went away' : mutant ? 'Error: Test timed out in 30000ms' : '';",
       "const test = { status: message ? 'failed' : 'passed', fullName: 'reads', failureMessages: message ? [message] : [] };",
       "fs.writeFileSync(file, JSON.stringify({ testResults: [{ name: 'unit/x.test.ts', status: test.status, assertionResults: [test] }] }));",
@@ -102,6 +105,7 @@ describe('the touched-line mutation gate', () => {
     const run = spawnSync(process.execPath, [path.join(root, 'test', 'mutation', 'touched.mjs'), '--mutate', `${TARGET}:${line}-${line}`, '--concurrency', '1'],
       { cwd: root, encoding: 'utf8', timeout: 580_000, env: { ...process.env, SMDB_MUTATION_VITEST: fake } });
     fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(path.join(root, added), { force: true });
     const reportDir = /^Report: (\S+)/m.exec(run.stdout)?.[1];
     expect(reportDir, `${run.stdout}\n${run.stderr}`).toBeDefined();
     const { mutants } = JSON.parse(fs.readFileSync(path.join(root, reportDir!, 'mutants.json'), 'utf8')) as { mutants: (Mutant & { passes: { a2?: Pass & { voided?: string } } })[] };
@@ -116,6 +120,7 @@ describe('the touched-line mutation gate', () => {
     expect(run.stdout).toMatch(/^Verdict: NO RESULT \(vitest was replaced by a test's stand-in /m);
     expect(run.stdout).toMatch(/^Stopped:\n {2}the run with no mutant after pass a2 failed \(exit 1\), so what its reruns counted cannot be told from the machine's failures$/m);
     expect(run.stdout).toMatch(/^ {2}the run with no mutant failed in unit\/x\.test\.ts: Error: the database went away$/m);
+    expect(run.stdout).toContain(`  the tree changed during the run, so no one tree was tested: ${added}`);
     expect(run.stdout).toMatch(/^Inconclusive .*\n {2}src\/bot\/internalSetup\/fleet\/nodeIdentity\.ts:\d+:\d+ .*\(the run with no mutant after pass a2 failed\)$/m);
     expect(run.stdout).not.toMatch(/^Timeouts /m);
     expect(run.stdout).not.toMatch(/^Runs with no mutant after the reruns:/m);
@@ -165,5 +170,14 @@ describe('the touched-line mutation gate', () => {
     expect(nothing.stdout).toMatch(/^Patterns that made no mutant:\n {2}src\/bot\/internalSetup\/fleet\/nodeIdentity\.ts:1-5$/m);
     expect(nothing.stdout).toMatch(/^Changed lines of code no mutant lies wholly on .*\n {2}src\/bot\/internalSetup\/fleet\/nodeIdentity\.ts: 5$/m);
     expect(nothing.stdout).toMatch(/^Verdict: NO RESULT \(no gating mutant was made/m);
+
+    // Where a real /data is in reach (this lane's box has one), dataRoot.ts is not mutated.
+    const dataRoots = [...new Set([path.resolve(root, '/data'), path.resolve(os.tmpdir(), '/data')])].filter(dir => fs.existsSync(dir));
+    if (dataRoots.length > 0) {
+      const data = gate('--mutate', 'src/utils/dataRoot.ts:8-8', '--concurrency', '1');
+      clean(data.stdout);
+      expect(data.status, data.stderr).toBe(2);
+      expect(data.stdout).toContain(`a mutant of src/utils/dataRoot.ts's DATA_DIR check would run the tests against ${dataRoots.join(' and ')}`);
+    }
   });
 });

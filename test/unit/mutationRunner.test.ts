@@ -109,19 +109,43 @@ describe('a pass on some of the mutants Stryker made', () => {
 });
 
 describe('the run with no mutant after the reruns', () => {
-  it('runs the reruns\' tests their way with no active mutant, and fails when a tier fails', () => {
+  it('runs the reruns\' tests their way with no active mutant, and fails when a tier fails', async () => {
     const failing = fakeVitest(['child']);
     const env = { ...process.env, SMDB_MUTATION_VITEST: failing.script, __STRYKER_ACTIVE_MUTANT__: '7' };
-    expect(runControl({ root, out: failing.out, tier: 'b', files: ['src/a.ts'], only: ['child/fleetIdentity.test.ts'], env }))
+    expect(await runControl({ root, out: failing.out, tier: 'b', files: ['src/a.ts'], only: ['child/fleetIdentity.test.ts'], env }))
       .toEqual({ passed: false, why: 'exit 1' });
     const calls = failing.read();
     expect(calls.map(call => [call.project, call.mutant, call.scale])).toEqual([['child', null, '4']]);
     expect(calls[0].args.slice(0, 2)).toEqual(['run', 'child/fleetIdentity.test.ts']);
 
     const passing = fakeVitest([]);
-    expect(runControl({ root, out: passing.out, tier: 'a', files: ['src/a.ts'], only: [], env: { ...env, SMDB_MUTATION_VITEST: passing.script } }))
+    expect(await runControl({ root, out: passing.out, tier: 'a', files: ['src/a.ts'], only: [], env: { ...env, SMDB_MUTATION_VITEST: passing.script } }))
       .toEqual({ passed: true, why: '' });
     expect(passing.read().map(call => [call.project, call.scale])).toEqual([['fast', '4']]);
+  });
+
+  it('ends a run past its bound with every process it started', async () => {
+    // A stand-in for vitest that starts a process of its own, then hangs.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-hang-'));
+    onTestFinished(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const pidFile = path.join(dir, 'grandchild.pid');
+    const script = path.join(dir, 'vitest.cjs');
+    fs.writeFileSync(script, [
+      "const { spawn } = require('child_process');",
+      "const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });",
+      `require('fs').writeFileSync(${JSON.stringify(pidFile)}, String(child.pid));`,
+      'setInterval(() => {}, 1000);',
+      '',
+    ].join('\n'));
+    const out = path.join(dir, 'out');
+    fs.mkdirSync(out);
+    const env = { ...process.env, SMDB_MUTATION_VITEST: script };
+    const run = await runControl({ root, out, tier: 'a', files: ['src/a.ts'], only: [], env, timeoutMs: 4_000 });
+    expect(run).toEqual({ passed: false, why: 'it ran past its bound of 4 s, and was ended with every process it started' });
+    const pid = Number(fs.readFileSync(pidFile, 'utf8'));
+    const alive = () => { try { process.kill(pid, 0); return true; } catch { return false; } };
+    for (let tries = 0; alive() && tries < 50; tries++) await new Promise(resolve => setTimeout(resolve, 100));
+    expect(alive()).toBe(false);
   });
 });
 
@@ -209,5 +233,16 @@ describe('a property under the gate', () => {
     });
     expect(run.status, `${run.stdout}\n${run.stderr}`).toBe(0);
     expect(run.stdout).toMatch(/1 passed/);
+  });
+
+  it('refuses a seed that is no integer, in the gate and in every test file', { timeout: 180_000 }, () => {
+    const env = { ...process.env, SMDB_TEST_SEED: '1.5' };
+    const gate = spawnSync(process.execPath, [path.join(root, 'test', 'mutation', 'touched.mjs'), '--mutate', 'src/bot/internalSetup/fleet/nodeIdentity.ts:1-1'], { cwd: root, encoding: 'utf8', timeout: 60_000, env });
+    expect(gate.status).toBe(2);
+    expect(gate.stderr).toContain('SMDB_TEST_SEED must be an integer, not 1.5');
+    const vitest = path.join(root, 'test', 'node_modules', 'vitest', 'vitest.mjs');
+    const tests = spawnSync(process.execPath, [vitest, 'run', '--project', 'fast', 'unit/propertySeed.test.ts'], { cwd: path.join(root, 'test'), encoding: 'utf8', timeout: 150_000, env });
+    expect(tests.status).not.toBe(0);
+    expect(`${tests.stdout}${tests.stderr}`).toContain('SMDB_TEST_SEED must be an integer, not 1.5');
   });
 });

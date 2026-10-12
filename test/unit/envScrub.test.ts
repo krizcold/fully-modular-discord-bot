@@ -56,7 +56,7 @@ describe('the env scrub', () => {
     for (const [key, value] of Object.entries(DEAD_ENDS)) expect(process.env[key], key).toBe(value);
     expect(fs.existsSync(DEAD_ENDS.PGHOST)).toBe(false);
     expect(fs.existsSync(DEAD_ENDS.PGPASSFILE)).toBe(false);
-    expect(DEAD_ENDS.GIT_CEILING_DIRECTORIES).toBe(path.resolve(__dirname, '..', '..', '..'));
+    expect(DEAD_ENDS.GIT_CEILING_DIRECTORIES).toBe([path.resolve(__dirname, '..', '..', '..'), os.tmpdir()].join(path.delimiter));
   });
 
   it('gives a child scenario the same, with pg and git pointed at nothing whatever the test set', () => {
@@ -68,22 +68,27 @@ describe('the env scrub', () => {
     expect(env.DISCORD_TOKEN).toBeUndefined();
   });
 
-  // A Stryker sandbox sits inside the checkout and holds no .git: a mutant's git
-  // call must find no repository there, never the checkout's.
-  it('stops git at the dir that holds the bot root', () => {
+  // A Stryker sandbox sits inside the checkout and holds no .git, and a test's
+  // data dir or a child's cwd sits under the temp dir: a mutant's git call must
+  // find no repository from either, never the checkout's or one holding the temp dir.
+  it('stops git at the dir that holds the bot root, and at the temp dir', () => {
     const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-ceiling-'));
     onTestFinished(() => fs.rmSync(repo, { recursive: true, force: true }));
     execFileSync('git', ['init', '-q', repo]);
     const sandbox = path.join(repo, '.stryker-tmp', 'sandbox-1');
+    const temp = path.join(repo, 'Temp');
     fs.mkdirSync(path.join(sandbox, 'test'), { recursive: true });
-    const run = (env: NodeJS.ProcessEnv) => {
+    fs.mkdirSync(path.join(temp, 'smdb-test-1', 'cache'), { recursive: true });
+    const run = (cwd: string, ceiling: string) => {
       try {
-        return execFileSync('git', ['rev-parse', '--show-toplevel'], { cwd: path.join(sandbox, 'test'), env, encoding: 'utf8', stdio: 'pipe' }).trim();
+        return execFileSync('git', ['rev-parse', '--show-toplevel'], { cwd, env: { ...process.env, GIT_CEILING_DIRECTORIES: ceiling }, encoding: 'utf8', stdio: 'pipe' }).trim();
       } catch (error) {
         return String((error as { stderr?: string }).stderr);
       }
     };
-    expect(fs.realpathSync(run({ ...process.env, GIT_CEILING_DIRECTORIES: '' }))).toBe(fs.realpathSync(repo));
-    expect(run({ ...process.env, GIT_CEILING_DIRECTORIES: path.dirname(sandbox) })).toMatch(/not a git repository/);
+    expect(fs.realpathSync(run(path.join(sandbox, 'test'), ''))).toBe(fs.realpathSync(repo));
+    const ceiling = [path.dirname(sandbox), temp].join(path.delimiter);
+    expect(run(path.join(sandbox, 'test'), ceiling)).toMatch(/not a git repository/);
+    expect(run(path.join(temp, 'smdb-test-1', 'cache'), ceiling)).toMatch(/not a git repository/);
   });
 });

@@ -1,3 +1,4 @@
+import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
@@ -37,12 +38,14 @@ export function scrubEnv<T extends Record<string, string | undefined>>(env: T): 
 // Where nothing names them, pg connects to localhost:5432 as the OS user with
 // the user's password file, and git looks for a repository in every dir above
 // its cwd: from a Stryker sandbox, which sits inside the checkout and holds no
-// .git, that is the checkout's own. These point both at nothing: PGHOST at a
-// socket dir that does not exist, PGPASSFILE at no file, and git no higher
-// than the dir that holds the bot root (in a sandbox, .stryker-tmp).
+// .git, that is the checkout's own, and from a test's data dir or a child's
+// cwd, under the temp dir, whatever repository holds the temp dir. These point
+// both at nothing: PGHOST at a socket dir that does not exist, PGPASSFILE at no
+// file, and git no higher than the dir that holds the bot root (in a sandbox,
+// .stryker-tmp) or than the temp dir.
 const botRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 export const DEAD_ENDS = {
   PGHOST: '/smdb-no-postgres',
   PGPASSFILE: path.join(botRoot, 'test', 'no-pgpass'),
-  GIT_CEILING_DIRECTORIES: path.dirname(botRoot),
+  GIT_CEILING_DIRECTORIES: [path.dirname(botRoot), os.tmpdir()].join(path.delimiter),
 };

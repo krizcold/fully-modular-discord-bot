@@ -11,6 +11,7 @@ import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { runControl } from './control.mjs';
+import { treeChanges, treePrint } from './tree.mjs';
 import { canonicalName, fileOf as nameOf, keyOf } from './keys.mjs';
 import { COMMON, PASSES } from './passes.mjs';
 
@@ -52,7 +53,7 @@ try {
   console.error(`Verdict: NO RESULT (the gate could not load: ${error instanceof Error ? error.message.split('\n')[0] : String(error)}; run npm run test:install)`);
   process.exit(2);
 }
-const { EXTRA_BREAK_WHY, gates, holdsExtraBreak, linesOfTarget, planFromGit, unmatchedPatterns, untouched } = ranges;
+const { DATA_ROOT_FILE, dataRootsInReach, EXTRA_BREAK_WHY, gates, holdsExtraBreak, linesOfTarget, planFromGit, unmatchedPatterns, untouched } = ranges;
 const { byKiller, classifyKill, judge, outcome, toConfirm, toPassB } = verdicts;
 
 const USAGE = 'usage: node test/mutation/touched.mjs [--base REF] [--mutate PATTERN]... [--concurrency N] [--keep]';
@@ -100,6 +101,11 @@ opts.mutate = opts.mutate.map(pattern => {
 // One fast-check seed for every run of the gate (helpers/setup.ts reads it), so
 // a property draws the same inputs with a mutant as without one: a property
 // that fails in a mutant's run fails for the mutant.
+const givenSeed = process.env.SMDB_TEST_SEED;
+if (givenSeed && (!/^-?\d+$/.test(givenSeed) || !Number.isSafeInteger(Number(givenSeed)))) {
+  console.error(`SMDB_TEST_SEED must be an integer, not ${givenSeed}\n${USAGE}`);
+  process.exit(2);
+}
 process.env.SMDB_TEST_SEED ||= String(crypto.randomInt(2 ** 31));
 
 const stamp = new Date().toISOString().replace(/[:.]/g, '-');
@@ -111,6 +117,11 @@ let targets = [];
 let skipped = [];
 let scope = opts.mutate.length > 0 ? `the patterns ${opts.mutate.join(' ')}` : `the change from ${opts.base} to the working tree`;
 let emptyScope = false;
+// The tree as the gate planned it (tree.mjs), and the files that make it: what
+// the sandboxes copy, the tracked files and the untracked ones git does not ignore.
+/** @type {Map<string, string> | null} */
+let planned = null;
+const treeFiles = () => git('ls-files', '-z', '--cached', '--others', '--exclude-standard').split('\0').filter(Boolean);
 /** @type {MutantRecord[]} */
 let mutants = [];
 /** @type {string[]} */
@@ -235,12 +246,12 @@ async function pass({ name, dir, tier, mutate, files, only = [], keys, extra }) 
  * @param {MutantRecord[]} on
  * @param {string[]} only the test files the reruns ran, or none
  */
-function control(after, tier, on, only) {
+async function control(after, tier, on, only) {
   const name = `control-${after}`;
   const out = path.join(reportDir, name);
   fs.mkdirSync(out, { recursive: true });
   console.log(`L5: the same tests once with no mutant, to check the machine after pass ${after}`);
-  const run = runControl({ root, out, tier, files: [...new Set(on.map(m => m.file))], only });
+  const run = await runControl({ root, out, tier, files: [...new Set(on.map(m => m.file))], only });
   const logs = `${posix(path.relative(root, out))}/dry-*.log`;
   if (!run.passed) {
     const why = `the run with no mutant after pass ${after} failed`;
@@ -280,6 +291,10 @@ async function passOn(name, dir, tier, on, extra, only) {
  */
 function finish(stopped) {
   try {
+    const changed = planned ? treeChanges(planned, treePrint(root, treeFiles())) : [];
+    if (changed.length > 0) {
+      stopped = [...(stopped ?? []), `the tree changed during the run, so no one tree was tested: ${changed.slice(0, 10).join(', ')}${changed.length > 10 ? ` and ${changed.length - 10} more` : ''}`];
+    }
     report(stopped);
   } catch (error) {
     console.error(`Verdict: NO RESULT (the report could not be written: ${error instanceof Error ? error.message.split('\n')[0] : String(error)})`);
@@ -330,8 +345,13 @@ try {
   common.ignorePatterns = [...new Set(['/dist/', ...ignored.filter(p => path.posix.basename(p.replace(/\/$/, '')) !== 'node_modules').map(p => `/${p}`)])];
   fs.mkdirSync(path.join(root, '.stryker-tmp'), { recursive: true });
   fs.writeFileSync(path.join(root, '.stryker-tmp', '.gitignore'), '*\n');
+  planned = treePrint(root, treeFiles());
 
   const files = [...new Set(targets.map(target => target.file))];
+  const reached = dataRootsInReach(files, { root, tmp: os.tmpdir(), exists: fs.existsSync });
+  if (reached.length > 0) {
+    throw new PassError(`a mutant of ${DATA_ROOT_FILE}'s DATA_DIR check would run the tests against ${reached.join(' and ')}, which this machine holds; move ${reached.length > 1 ? 'them' : 'it'} away to mutate that file`);
+  }
   console.log(`L5: mutating ${scope}: ${files.length} file(s), pass A (in-process tests that import them)`);
   const resultsA = await pass({ name: 'a', dir: 'a', tier: 'a', mutate: targets.flatMap(t => t.patterns), files, extra: { ...PASSES.a, concurrency: opts.concurrency } });
   const orphans = [...new Set(resultsA.map(fileOf).filter(file => !targets.some(t => t.file === file)))];
@@ -354,7 +374,7 @@ try {
   if (confirmA.length > 0) {
     console.log(`L5: pass A again, one at a time, on ${confirmA.length} timeout(s)`);
     await passOn('a2', 'a2', 'a', confirmA, PASSES.a2);
-    if (confirmA.some(credited)) control('a2', 'a', confirmA, []);
+    if (confirmA.some(credited)) await control('a2', 'a', confirmA, []);
   }
 
   const forB = toPassB(mutants);
@@ -369,7 +389,7 @@ try {
       console.log(`L5: pass B again, one at a time, on ${on.length} kill(s) by ${killer}, with that file alone; a kill counts only if it repeats`);
       await passOn('b2', `b2-${group}`, 'b', on, PASSES.b2, [killer]);
     }
-    if (confirmB.some(credited)) control('b2', 'b', confirmB, [...killers.keys()]);
+    if (confirmB.some(credited)) await control('b2', 'b', confirmB, [...killers.keys()]);
   }
   finish();
 } catch (error) {

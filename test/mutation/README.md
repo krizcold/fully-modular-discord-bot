@@ -16,6 +16,7 @@ active mutant travels in `__STRYKER_ACTIVE_MUTANT__` and reaches child processes
 | stryker.json | (data) empty on purpose: every pass names it as its config file, so Stryker never reads one it finds in the bot root |
 | keys.mjs | (library) how a file and a mutant are named across passes; unit/mutationRanges.test.ts |
 | targets.mjs | (Stryker reporter) which mutant ids a later pass runs tests for; unit/mutationRunner.test.ts and the bite |
+| tree.mjs | (library) the fingerprint of the tree a run reads, taken at the plan and before the verdict; unit/mutationRanges.test.ts and the bite |
 | ../helpers/time.mjs | the factor on every test's time limits (4 in a rerun alone) |
 | ../helpers/env.ts, setup.ts | what a test and its children keep of the environment, and the run's fast-check seed |
 | ../helpers/build.cjs | builds dist the way `npm run build` does, stamped and locked; pass B's buildCommand |
@@ -67,15 +68,25 @@ runs it under a hostile config).
   real files.
 - The other mutants in the widened ranges are **context**: they run in pass A and are listed, but never fail the gate.
 - A pure deletion has no line left to mutate: its two neighbouring lines are context only.
-- A run of lines only added, or only taken out, that could sit in more than one place because the lines beside it repeat
-  it (an `if` block added after an equal one) counts in every place it could sit, so the copy that changed is never
-  left to the diff's choice.
+- Lines added in one place, or only taken out, count also where they could slide to: their first or last lines, or the
+  whole run, pass through unchanged lines beside them that repeat them (an `if` block added after an equal one counts
+  in both places, an edited line beside it or not). Where repeated lines are spread among other changes, which copy
+  counts is still the diff's choice.
+- A line whose text is unchanged but whose place in the code changed counts as changed: a bracket moved past it puts it
+  in or out of a block, a block's header and bracket put around it or taken away (the gate compares how deep each kept
+  line sits in the syntax tree, before and after).
+- git does not look at a file its index marks assume-unchanged or skip-worktree (core.ignoreStat marks every file it
+  adds), so the gate compares each such file with its base text itself.
 - Not mutated, and named in the report with the reason: files outside src (the root scripts, updaters/, tests, docs and
   images), files that are not code, `.d.ts` files, the browser views under src/webui/public (copied into dist, never
-  compiled, and no test loads them yet), a file deleted or moved out of src, an untracked git repository under src (git
-  lists none of its files), a change that leaves no line changed (a rename, a mode change, line endings only), and a
+  compiled, and no test loads them yet), a file deleted or moved out of src, an untracked git repository or a git
+  submodule under src (git lists none of its files), a file whose name Stryker would read as a glob (`[id].ts`,
+  `a{1,2}.ts`; rename it), a change that leaves no line changed (a rename, a mode change, line endings only), and a
   file that holds a line break Stryker counts and the gate does not (a lone CR, U+2028 or U+2029), whose lines the two
   would number differently; `--mutate` refuses such a file.
+- src/utils/dataRoot.ts is mutated only where no `/data` exists (from the bot root's drive or the temp dir's): a mutant
+  of its DATA_DIR check sends the tests to `/data`, which on a developer's machine may be a real data root. Where one
+  exists, the gate ends NO RESULT and names it.
 - A changed line of code that no mutant lies wholly on, in a diff, an untracked file or a `--mutate` pattern, is named
   in the report: L5 says nothing about it. A mutant that spans several lines (emptying a body, an object or an array,
   flipping a condition split over lines, a chained call) counts for none of them, since it says nothing about each
@@ -120,22 +131,30 @@ runs it under a hostile config).
 4. **A run with no mutant after the reruns.** When a rerun counted a kill or a timeout, the same tests run once more
    with no mutant, in the checkout itself, the way the reruns ran them (mutation/control.mjs). If they fail, the
    machine or a container went bad during the reruns, so what the reruns counted is inconclusive and the gate ends NO
-   RESULT. What it cannot see: a machine that was four times slower for one rerun only and well again by the end (a
-   pass A rerun that timed out, or a pass B rerun whose child step ran past its bound).
+   RESULT. Its own bound is an hour; past it, it is ended with every process it started. What it cannot see: a machine
+   that was four times slower for one rerun only and well again by the end (a pass A rerun that timed out, or a pass B
+   rerun whose child step ran past its bound).
+
+The tree the gate planned is fingerprinted (every file git tracks or would add: size, time and content), and again
+before the verdict: each pass copies the tree as it is when it starts and the run with no mutant reads the checkout
+then, so a tree that changed during the run (an edit, a formatter, another session) ends NO RESULT, naming the files.
 
 A run Stryker counts as a kill is checked against vitest's report of it: it is a kill only when a test itself failed for
 a reason other than the machine. When every failing test (or its hook) timed out, and nothing in the run failed for the
 machine, it is a timeout.
-Anything else is **inconclusive**: no report, a failure only in a hook or at file level, an unhandled error with every
-test passing, or only machine failures (refused or reset connections, a container that would not start, a database
+Anything else is **inconclusive**: no report, a failure only in a beforeAll or afterAll hook or at file level, an
+unhandled error with every test passing, or only machine failures (refused or reset connections, a container that would not start, a database
 connection dropped, exhausted resources). The machine's texts are matched against the first line of each failure only,
 never an assertion or a child's stderr, which may name such an error as the thing under test; the list cannot be
-complete, which is why pass B's kills must repeat.
+complete, which is why pass B's kills must repeat. vitest counts a failure in a beforeEach or afterEach hook as its
+test's, so such a failure counts as the test's too.
 
-Every run of the gate draws one fast-check seed (named on the Scope line; set SMDB_TEST_SEED to run with a given one),
-so a property draws the same inputs in every mutant's run as in the run with no mutant: a property that fails in a
-mutant's run fails for the mutant. A test that is random in another way (its own Math.random, the clock) can still fail
-by chance in one mutant's run, and a pass A kill stands on that one run.
+Every run of the gate draws one fast-check seed (named on the Scope line; set SMDB_TEST_SEED to an integer to run with a
+given one, anything else is refused), so a property draws the same inputs in every mutant's run as in the run with no
+mutant: a property that fails in a mutant's run fails for the mutant. A pass A kill stands on one run, so a test that
+can fail by chance there still credits a kill: one random in another way (its own Math.random, the clock), and one
+that shares a fixed port or path, since pass A runs mutants side by side in one sandbox and one temp dir. Fast tests
+use mkdtemp and port 0; `--concurrency 1` rules the second out when a kill looks doubtful.
 
 ## The report
 
@@ -147,16 +166,19 @@ by chance in one mutant's run, and a pass A kill stands on that one run.
   mutant after the reruns, and the verdict.
 - `mutants.json` has the run's fast-check seed and every mutant: its place, original text and replacement, whether it
   gates, and per pass its status and the test that killed it.
-- `a/`, `a2/`, `b/` and `b2-1/`, `b2-2/` (one per test file that killed in pass B) hold one vitest JSON report and log
-  per mutant run (`dry-*` is the run with no mutant); `control-a2/` and `control-b2/` hold the runs with no mutant
-  after the reruns.
+- `a/`, `a2/`, `b/` and `b2-1/`, `b2-2/` (one per test file that killed in pass B) hold, for each mutant run, one vitest
+  JSON report and log per tier it ran (`<id>-<tier>.json` and `.log`; a run in `b/` can reach both integration and
+  child; a nested mutant a pass is not for runs nothing; `dry-*` is the run with no mutant). `a2/`, `b/` and `b2-*/`
+  also hold targets.json and run-ids.json, the mutants the pass is for. `control-a2/` and `control-b2/` hold the runs
+  with no mutant after the reruns.
 
 The verdict is FAIL when a gating mutant ends Survived, NoCoverage, Missing, inconclusive, RuntimeError, or Ignored (a
 `// Stryker disable` comment needs the same justification in the notes as a survivor). A confirmed timeout counts as
 killed and is listed. CompileError counts as killed by the type checker. The verdict is NO RESULT when no src file
 changed, when no gating mutant was made, when every gating mutant was a type error (no test ran against the change),
 when a pass could not run, when Stryker mutated a file no target names, when the run with no mutant after the reruns
-failed, or when a test's stand-in replaced vitest (SMDB_MUTATION_VITEST, for the gate's own tests only); the report then
+failed, when the tree changed during the run, when a real `/data` is in reach of a dataRoot.ts mutant, or when a test's
+stand-in replaced vitest (SMDB_MUTATION_VITEST, for the gate's own tests only); the report then
 says why, with the passes that did finish.
 
 ## Child scenarios
@@ -172,8 +194,9 @@ child away from anything real:
   Docker, testcontainers, the active mutant) and the suite's own SMDB_ ones (helpers/env.ts): every other variable is
   taken out, whoever would read it (src by name or through configManager, pg, dotenv, discord.js, git), and
   unit/envScrub.test.ts holds the list against what src reads. pg is pointed at no server (PGHOST, PGPASSFILE) and git
-  at no repository above the bot root (GIT_CEILING_DIRECTORIES: a sandbox sits inside the checkout and holds no .git),
-  with NODE_ENV `test` and its own DATA_DIR;
+  at no repository above the bot root or the temp dir (GIT_CEILING_DIRECTORIES: a sandbox sits inside the checkout and
+  holds no .git, and test data dirs and child cwds sit under the temp dir), with NODE_ENV `test` and its own DATA_DIR;
+  the one route src has around DATA_DIR, `/data`, is kept away by the gate (What it mutates);
 - every wait is bounded, and a step prints one `RESULT` line with its result and the bot modules it loaded; the helper
   fails unless every one sits under this root's dist.
 

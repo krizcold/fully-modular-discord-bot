@@ -40,8 +40,9 @@ const firstLine = text => text.split('\n')[0];
  * left: a kill only when a test itself failed for a reason other than the
  * machine; a timeout only when every failing test timed out and nothing else
  * failed for the machine (a file that could not start included); anything
- * else (no report, a failure in a hook or at file level, an unhandled error,
- * a machine failure) proves nothing.
+ * else (no report, a failure only in a beforeAll or afterAll hook or at file
+ * level, an unhandled error, a machine failure) proves nothing. vitest counts a
+ * beforeEach or afterEach failure as its test's, so it counts as a test's.
  * @param {{ testResults?: FileReport[] }[]} reports
  * @returns {{ killedBy: string } | { timeout: string } | { inconclusive: string }}
  */
@@ -184,7 +185,8 @@ export function judge(run) {
   /** @param {MutantRecord} m */
   const note = m => {
     const last = latest(m);
-    return confirmed(m).why ?? last.inconclusive ?? last.statusReason ?? (outcome(m) === 'Timeout' ? `hung alone too: ${last.timeout ?? 'Stryker timeout'}` : '');
+    return confirmed(m).why ?? last.inconclusive ?? last.statusReason
+      ?? (outcome(m) === 'Timeout' ? (last.timeout ? `timed out alone too: ${last.timeout}` : "ran past Stryker's budget alone too") : '');
   };
   /** @param {MutantRecord} m */
   const show = m => `  ${where(m)} ${m.mutator}: \`${m.original}\` -> \`${m.replacement}\`${note(m) ? ` (${note(m)})` : ''}`;

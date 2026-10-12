@@ -9,8 +9,9 @@ import { describe, expect, it, onTestFinished } from 'vitest';
 import { canonicalName } from '../mutation/keys.mjs';
 import {
   changeTarget, codeLines, commonLines, gates, inPattern, lineDiff, linesOfTarget, mergeRanges, notMutated, parseNameStatus, planChange, planFromGit,
-  unmatchedPatterns, untouched, wholeTarget,
+  unmatchedPatterns, untouched, wholeTarget, DATA_ROOT_FILE, dataRootsInReach, GLOB_NAME_WHY,
 } from '../mutation/ranges.mjs';
+import { treeChanges, treePrint } from '../mutation/tree.mjs';
 
 // The touched-line ranges of the L5 gate (mutation/README.md): which lines a
 // change touched, and how far each widens so that Stryker makes the mutants
@@ -278,6 +279,99 @@ describe('the change', () => {
     two.git(['mv', 'src/x.ts', 'tools/x.ts']);
     expect(two.plan().emptyScope).toBe(false);
   });
+  it('counts a copy beside an edited line, and a repeated head or tail of the lines added, in every place it could sit', () => {
+    const block = ['  if (queue.length > 0) {', '    handle(queue.shift());', '  }'];
+    const drain = (first: string, blocks: number) =>
+      ['export function drain(queue: number[], note: string) {', first, ...Array.from({ length: blocks }, () => block).flat(), '}'].join('\n');
+    // The line before the blocks is edited too: both copies count.
+    expect(lineDiff(drain('  console.log(note);', 1), drain('  console.log(`drain ${note}`);', 2)).changed).toEqual([2, 3, 4, 5, 6, 7, 8]);
+    expect(lineDiff(['start();', 'bar();', 'end();'].join('\n'), ['start();', 'foo();', 'bar();', 'bar();', 'end();'].join('\n')).changed).toEqual([2, 3, 4]);
+    expect(lineDiff(['start();', 'end();'].join('\n'), ['start();', 'start();', 'foo();', 'end();'].join('\n')).changed).toEqual([1, 2, 3]);
+  });
+
+  it('counts a line kept whose place in the code changed: moved into or out of a block, or a block put around it or taken away', () => {
+    const into = [
+      'export function settle(ready: boolean, log: string[], lease: { release(): void }) {',
+      '  if (ready) {',
+      "    log.push('ready');",
+      '  }',
+      '  lease.release();',
+      "  log.push('done');",
+      '}',
+    ];
+    const moved = [into[0], into[1], into[2], into[4], into[3], into[5], into[6]];
+    // The bracket moved below release(): it now runs only when ready.
+    expect(lineDiff(into.join('\n'), moved.join('\n'), 'src/a.ts').changed).toContain(4);
+    expect(lineDiff(moved.join('\n'), into.join('\n'), 'src/a.ts').changed).toContain(5);
+    // The block's header and bracket taken away: its body runs always.
+    expect(lineDiff(into.join('\n'), [into[0], into[2], into[4], into[5], into[6]].join('\n'), 'src/a.ts').changed).toContain(2);
+    // An edited condition moves no other line.
+    expect(lineDiff(into.join('\n'), [into[0], '  if (ready && log.length > 0) {', ...into.slice(2)].join('\n'), 'src/a.ts').changed).toEqual([2]);
+  });
+
+  it('names a submodule, and a file whose name Stryker would read as a glob, with the reason', () => {
+    const plan = planChange({
+      entries: [{ status: 'M', file: 'src/sub' }, { status: 'M', file: 'src/[id].ts' }],
+      untracked: ['src/a{1,2}.ts'],
+      read: () => 'export const x = 1;\n',
+      readBase: () => '',
+      nameOf: file => (/[[{]/.test(file) ? null : file),
+      isDir: file => file === 'src/sub',
+    });
+    expect(plan.targets).toEqual([]);
+    expect(plan.skipped).toEqual([
+      { file: 'src/sub', why: 'a git submodule: git names only its commit, so none of its files is mutated' },
+      { file: 'src/[id].ts', why: GLOB_NAME_WHY },
+      { file: 'src/a{1,2}.ts', why: GLOB_NAME_WHY },
+    ]);
+  });
+
+  it('sees a change git is told not to look at, and names a submodule and a name Stryker would read as a glob', () => {
+    const edited = (name: string) => text(lines(name, 3).map((line, i) => (i === 1 ? `${line} // edited` : line)));
+    const sub = repoWith({ 'index.ts': text(lines('s', 2)) });
+    const { git, write, plan } = repoWith({
+      'src/a.ts': text(lines('a', 3)), 'src/b.ts': text(lines('b', 3)), 'src/c.ts': text(lines('c', 3)), 'src/[id].ts': text(lines('id', 3)),
+    });
+    git(['-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', sub.repo.split(path.sep).join('/'), 'src/sub']);
+    git(['update-index', '--assume-unchanged', 'src/a.ts']);
+    git(['update-index', '--skip-worktree', 'src/b.ts']);
+    // core.ignoreStat marks each file git adds after it is set.
+    git(['config', 'core.ignoreStat', 'true']);
+    git(['add', 'src/c.ts']);
+    for (const name of ['a', 'b', 'c', 'id']) write(`src/${name === 'id' ? '[id]' : name}.ts`, edited(name));
+    write('src/new[1].ts', text(lines('n', 2)));
+    // A config that hides submodules from the diff hides nothing from the gate.
+    const result = plan(['-c', 'diff.ignoreSubmodules=all']);
+    expect(result.targets.map(t => [t.file, t.gating]).sort()).toEqual([['src/a.ts', [2]], ['src/b.ts', [2]], ['src/c.ts', [2]]]);
+    expect(result.skipped).toEqual(expect.arrayContaining([
+      { file: 'src/sub', why: 'a git submodule: git names only its commit, so none of its files is mutated' },
+      { file: 'src/[id].ts', why: GLOB_NAME_WHY },
+      { file: 'src/new[1].ts', why: GLOB_NAME_WHY },
+    ]));
+  });
+
+  it("finds a real /data a dataRoot.ts mutant would reach, from the bot root's drive and the temp dir's", () => {
+    const real = path.resolve('/x', '/data');
+    const asked: string[] = [];
+    const exists = (dir: string) => { asked.push(dir); return dir === real; };
+    expect(dataRootsInReach(['src/a.ts'], { root: path.resolve('/x'), tmp: path.resolve('/y'), exists })).toEqual([]);
+    expect(asked).toEqual([]);
+    expect(dataRootsInReach([DATA_ROOT_FILE, 'src/a.ts'], { root: path.resolve('/x'), tmp: path.resolve('/y'), exists })).toEqual([real]);
+  });
+
+  it('fingerprints the tree a run reads, and names what changed in it', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-tree-'));
+    onTestFinished(() => fs.rmSync(root, { recursive: true, force: true }));
+    fs.writeFileSync(path.join(root, 'a.ts'), 'a');
+    fs.writeFileSync(path.join(root, 'b.ts'), 'b');
+    const before = treePrint(root, ['a.ts', 'b.ts', 'gone.ts']);
+    expect(treeChanges(before, treePrint(root, ['a.ts', 'b.ts', 'gone.ts']))).toEqual([]);
+    // The same size, and perhaps the same time: the content tells.
+    fs.writeFileSync(path.join(root, 'a.ts'), 'A');
+    fs.writeFileSync(path.join(root, 'c.ts'), 'c');
+    expect(treeChanges(before, treePrint(root, ['a.ts', 'b.ts', 'c.ts', 'gone.ts']))).toEqual(['a.ts', 'c.ts']);
+  });
+
 });
 
 describe('the widening', () => {
