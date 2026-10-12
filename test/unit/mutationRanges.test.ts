@@ -6,11 +6,13 @@ import path from 'path';
 import { Instrumenter } from '@stryker-mutator/instrumenter';
 import fc from 'fast-check';
 import ts from 'typescript';
+import { pathToFileURL } from 'url';
 import { describe, expect, it, onTestFinished } from 'vitest';
+import { runScenario } from '../helpers/child';
 import { canonicalName } from '../mutation/keys.mjs';
 import {
   changeTarget, codeLines, commonLines, gates, inPattern, lineDiff, linesOfTarget, mergeRanges, notMutated, parseNameStatus, planChange, planFromGit,
-  unmatchedPatterns, untouched, wholeTarget, structureLines, DATA_ROUTE_WHY, GLOB_NAME_WHY, holdsDataRoute, sandboxIgnores,
+  unmatchedPatterns, untouched, wholeTarget, structureLines, DATA_ROUTE_WHY, GLOB_NAME_WHY, holdsDataRoute, sandboxPatterns,
 } from '../mutation/ranges.mjs';
 import { treeChanges, treePrint } from '../mutation/tree.mjs';
 
@@ -297,7 +299,7 @@ describe('the change', () => {
     expect(lineDiff(['start();', 'end();'].join('\n'), ['start();', 'start();', 'foo();', 'end();'].join('\n')).changed).toEqual([1, 2, 3]);
   });
 
-  it('counts only the lines the diff changes, and names a changed line of brackets only, which can move the lines beside it', () => {
+  it('counts only the lines the diff changes, and names a changed line that can move the lines beside it', () => {
     const into = [
       'export function settle(ready: boolean, log: string[], lease: { release(): void }) {',
       '  if (ready) {',
@@ -312,12 +314,48 @@ describe('the change', () => {
     const { changed } = lineDiff(into.join('\n'), moved);
     expect(changed).toEqual([5]);
     expect(structureLines('src/a.ts', moved, changed)).toEqual([5]);
-    const lines = ['export function k(on: (f: () => void, g: () => void) => void, log: string[]) {', '  on(() => {', "    log.push('a');", '  }, () => {', '  });', '  if (log.length > 0) {', '  } else {', '  }', '  log.push(String(1),', '  );', '}'];
-    // Brackets and separators only, or an else: not a callback's start or a line with a call.
-    expect(structureLines('src/a.ts', lines.join('\n'), lines.map((_, i) => i + 1))).toEqual([5, 7, 8, 10, 11]);
-    // A line that opens the next part of a statement, mutants of its own or not.
-    const parts = ['export function p(n: string, b: boolean, log: string[]) {', '  if (b) {', '  } else if (n) {', '  }', '  switch (n) {', "    case 'two':", '    default:', '  }', '  try {', '  } catch {', '  } finally {', '  }', '}'];
-    expect(structureLines('src/a.ts', parts.join('\n'), parts.map((_, i) => i + 1))).toEqual([3, 4, 6, 7, 8, 10, 11, 12, 13]);
+    // A closer with code of its own moved below report(): report() now runs in the loop, and only the closer changed.
+    const loop = ['export function drain(q: { v: boolean }, report: () => void) {', '  do {', '    q.v = false;', '  } while (q.v);', '  report();', '}'];
+    const down = [loop[0], loop[1], loop[2], loop[4], loop[3], loop[5]].join('\n');
+    expect(lineDiff(loop.join('\n'), down).changed).toEqual([5]);
+    expect(structureLines('src/a.ts', down, [5])).toEqual([5]);
+    const lines = [
+      'export function k(on: (f: () => void, g: () => void) => void, q: { v: boolean }, log: string[]) {', // 1
+      '  on(() => {', // 2
+      "    log.push('a');", // 3
+      '  }, () => {', // 4
+      '  });', // 5
+      '  do {', // 6
+      "    log.push('b');", // 7
+      '  } while (q.v);', // 8
+      '  Promise.resolve().then(() => {', // 9
+      '  }).catch(e => log.push(String(e)));', // 10
+      '  const o = {', // 11
+      '    x: 1,', // 12
+      '  };', // 13
+      '  log.push(String(o.x),', // 14
+      '  );', // 15
+      '}', // 16
+    ];
+    // Brackets and separators only, or a brace of a block, code of its own or not (a header, a closer with a
+    // condition or a call): not an object's brace or a line of code alone.
+    expect(structureLines('src/a.ts', lines.join('\n'), lines.map((_, i) => i + 1))).toEqual([1, 2, 4, 5, 6, 8, 9, 10, 13, 15, 16]);
+    // A line that opens the next part of a statement, with braces or none, mutants of its own or not: a default
+    // only in a switch, never in an export or an object.
+    const parts = [
+      'export function p(n: string, b: boolean, log: string[]) {', // 1
+      "  if (b) log.push('b');", // 2
+      "  else log.push('c');", // 3
+      '  switch (n) {', // 4
+      "    case 'two': log.push('2'); break;", // 5
+      "    default: log.push('d');", // 6
+      '  }', // 7
+      '  const d = { default: 1 };', // 8
+      '  return d;', // 9
+      '}', // 10
+      'export default p;', // 11
+    ];
+    expect(structureLines('src/a.ts', parts.join('\n'), parts.map((_, i) => i + 1))).toEqual([1, 3, 4, 5, 6, 7, 10]);
   });
 
   it('names a submodule, and a file whose name Stryker would read as a glob, with the reason', () => {
@@ -422,6 +460,18 @@ describe('the change', () => {
     expect(esm.stderr).toContain('lacks DATA_DIR would take /data as its data root');
   });
 
+  it('ends a child step past its bound with every process it started (helpers/child.ts)', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-bound-'));
+    onTestFinished(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const pidFile = path.join(dir, 'started.pid');
+    await expect(runScenario('startsAndHangs.cjs', [pidFile], dir, 4000)).rejects.toThrow('did not finish in 4000 ms');
+    const started = Number(fs.readFileSync(pidFile, 'utf8'));
+    const alive = () => { try { process.kill(started, 0); return true; } catch { return false; } };
+    onTestFinished(() => { if (alive()) process.kill(started, 'SIGKILL'); });
+    for (let i = 0; i < 50 && alive(); i++) await new Promise(resolve => setTimeout(resolve, 100));
+    expect(alive()).toBe(false);
+  });
+
   it('looks at every file itself, whatever a file-system monitor says', () => {
     const { repo, git, write, plan } = repoWith({ 'src/a.ts': text(lines('a', 3)), 'src/b.ts': text(lines('b', 3)) });
     // A monitor (protocol 2) that says nothing changed but a.ts.
@@ -438,27 +488,61 @@ describe('the change', () => {
     expect(plan().targets.map(t => t.file).sort()).toEqual(['src/a.ts', 'src/b.ts']);
   });
 
-  it('keeps out of a sandbox what git ignores, every untracked git repository and what a submodule ignores, or names what it cannot', () => {
+  it('lets into a sandbox only the files git lists: nothing it ignores, nothing of a repository inside, nothing made later', async () => {
     const sub = repoWith({ '.gitignore': '.env\n', 'index.ts': text(lines('s', 2)) });
-    const { repo, git, write } = repoWith({ '.gitignore': '.env\nnode_modules/\nbackup*/\n', 'src/a.ts': text(lines('a', 3)) });
+    const odd = 'src/[id] {1,2} (x) !y #z +(w) @(v).ts';
+    const { repo, git, write } = repoWith({ '.gitignore': '.env\nnode_modules/\nbackup*/\n', 'src/a.ts': text(lines('a', 3)), [odd]: text(lines('o', 1)) });
     git(['-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', sub.repo.split(path.sep).join('/'), 'src/sub']);
     write('.env', 'TOKEN=x\n');
     write('node_modules/x/index.js', '');
     write('backup[1]/.env', 'TOKEN=z\n');
     write('src/fresh/b.ts', text(lines('b', 2)));
     write('src/sub/.env', 'TOKEN=s\n');
-    for (const name of ['mod', 'm{1,2}']) {
-      write(`src/${name}/index.ts`, text(lines('m', 2)));
-      write(`src/${name}/.gitignore`, '.env\n');
-      write(`src/${name}/.env`, 'TOKEN=y\n');
-      git(['-C', path.join(repo, 'src', name), 'init', '-q']);
+    write('src/mod/index.ts', text(lines('m', 2)));
+    git(['-C', path.join(repo, 'src', 'mod'), 'init', '-q']);
+    // A file git tracks in a node_modules dir, which Stryker links into the sandbox instead.
+    write('lib/node_modules/v/index.js', '');
+    git(['add', '-f', 'lib/node_modules/v/index.js']);
+    // The gate's list (touched.mjs treeFiles): the tracked files, and the untracked ones git does not ignore.
+    const listed = git(['-c', 'core.quotePath=false', 'ls-files', '-z', '--cached', '--others', '--exclude-standard']).split('\0').filter(Boolean);
+    const { patterns, unkept } = sandboxPatterns(listed);
+    expect(unkept).toEqual([]);
+    // Made after the list: a .env, a data dir, an untracked file.
+    write('src/.env', 'TOKEN=late\n');
+    write('data/state.json', '{}');
+    write('src/late.ts', text(lines('l', 1)));
+    // What Stryker's own crawl copies under these patterns.
+    const core = path.dirname(createRequire(__filename).resolve('@stryker-mutator/core/package.json'));
+    // Stryker's entry first: its modules need to load in its own order.
+    await import(pathToFileURL(path.join(core, 'dist', 'src', 'index.js')).href);
+    const { ProjectReader } = await import(pathToFileURL(path.join(core, 'dist', 'src', 'fs', 'project-reader.js')).href);
+    const quiet = { warn() {}, info() {}, debug() {} };
+    const reader = new ProjectReader(fs.promises, quiet, {
+      mutate: [], tempDirName: '.stryker-tmp', ignorePatterns: patterns, incremental: false, incrementalFile: 'reports/stryker-incremental.json', force: false,
+      htmlReporter: { fileName: 'reports/mutation/mutation.html' }, jsonReporter: { fileName: 'reports/mutation/mutation.json' }, testFiles: [],
+    });
+    const cwd = process.cwd();
+    process.chdir(repo);
+    let copied: string[];
+    try {
+      copied = ((await reader.resolveInputFileNames()) as string[]).map(file => path.relative(repo, file).split(path.sep).join('/')).sort();
+    } finally {
+      process.chdir(cwd);
     }
-    // A backslash in a name, which only POSIX allows: no escape keeps it, so the path is named.
-    if (process.platform !== 'win32') write('backup\\2/.env', 'TOKEN=w\n');
-    const { patterns, unkept } = sandboxIgnores((...args: string[]) => git(args), repo);
-    // Each pattern as Stryker's matcher reads it: brackets and braces escaped.
-    expect(patterns.sort()).toEqual(['/.env', '/backup\\[1\\]/', '/dist/', '/src/m\\{1,2\\}/', '/src/mod/', '/src/sub/.env']);
-    expect(unkept).toEqual(process.platform !== 'win32' ? ['backup\\2/'] : []);
+    expect(copied).toEqual(['.gitignore', '.gitmodules', odd, 'src/a.ts', 'src/fresh/b.ts'].sort());
+    // Each name escaped as Stryker's matcher reads it, on Linux and on Windows; one it still cannot match is named.
+    const BS = String.fromCharCode(92);
+    const names = [`a${BS}b.ts`, `m{1}${BS}2.ts`, 'x{a,b}.ts', 'backup[1]/a.ts', 'src/mod/'];
+    const ranges = pathToFileURL(path.join(botRoot, 'test', 'mutation', 'ranges.mjs')).href;
+    for (const [platform, left] of [['linux', [`m{1}${BS}2.ts`]], ['win32', [`a${BS}b.ts`, `m{1}${BS}2.ts`]]] as const) {
+      const run = spawnSync(process.execPath, ['--input-type=module', '-e',
+        `import { sandboxPatterns } from ${JSON.stringify(ranges)}; console.log(JSON.stringify(sandboxPatterns(JSON.parse(process.env.SMDB_NAMES))));`],
+      { encoding: 'utf8', env: { ...process.env, __MINIMATCH_TESTING_PLATFORM__: platform, SMDB_NAMES: JSON.stringify(names) } });
+      const result = JSON.parse(run.stdout) as { patterns: string[], unkept: string[] };
+      expect(result.unkept, platform).toEqual(left);
+      expect(result.patterns, platform).toContain(`!/backup${BS}[1${BS}]/a.ts`);
+      expect(result.patterns.length, platform).toBe(1 + names.length - 1 - left.length);
+    }
   });
 
   it('fingerprints the tree a run reads, and names what changed in it', () => {
@@ -768,8 +852,9 @@ describe('the targets', () => {
     expect(unmatchedPatterns([{ file: 'src/a.ts', patterns: ['src/a.ts:1-3'], gating: [2] }], [])).toEqual([]);
   });
 
-  it('widens a pure deletion to its neighbours as context only', () => {
-    expect(changeTarget('src/a.ts', SAMPLE, { changed: [], deletedAfter: [3] })).toEqual({ file: 'src/a.ts', ranges: [[2, 4]], gating: [], patterns: ['src/a.ts:2-4'] });
+  it('widens a pure deletion to its neighbours as context only, and says where it was', () => {
+    expect(changeTarget('src/a.ts', SAMPLE, { changed: [], deletedAfter: [3] })).toEqual({ file: 'src/a.ts', ranges: [[2, 4]], gating: [], patterns: ['src/a.ts:2-4'], deleted: [3] });
+    expect(changeTarget('src/a.ts', SAMPLE, { changed: [7], deletedAfter: [] })).not.toHaveProperty('deleted');
   });
 
   it('gates the mutants that touch a changed line, and calls the rest context', () => {

@@ -16,7 +16,8 @@ const { Minimatch, minimatch, escape } = strykerRequire('minimatch');
 /**
  * @typedef {[number, number]} Range first and last line, 1-based
  * @typedef {{ status: string, file: string, from?: string }} Entry a file git names as changed; from: a rename's old name
- * @typedef {{ file: string, ranges: Range[] | null, gating: number[] | null, patterns: string[] }} Target ranges null: the whole file
+ * @typedef {{ file: string, ranges: Range[] | null, gating: number[] | null, patterns: string[], deleted?: number[] }} Target ranges null: the whole file;
+ *   deleted: where lines were only taken out, each after the line named (0: the top)
  * @typedef {{ start: { line: number, column: number }, end: { line: number, column: number } }} Location
  */
 
@@ -388,14 +389,25 @@ export function codeLines(file, text, lines) {
 }
 
 // Keywords that open the next part of a statement: a changed line holding one
-// can move the lines beside it from one part to another.
+// can move the lines beside it from one part to another. A default counts only
+// in a switch, never in an export.
 const PARTS = new Set([ts.SyntaxKind.ElseKeyword, ts.SyntaxKind.CaseKeyword, ts.SyntaxKind.DefaultKeyword, ts.SyntaxKind.CatchKeyword, ts.SyntaxKind.FinallyKeyword]);
 
 /**
+ * Whether a token opens or closes a block of statements or members: a body, a
+ * switch's cases, a namespace, a class; never an object or a type.
+ * @param {ts.Node} node
+ */
+const blockBrace = node => (node.kind === ts.SyntaxKind.OpenBraceToken || node.kind === ts.SyntaxKind.CloseBraceToken)
+  && (ts.isBlock(node.parent) || ts.isCaseBlock(node.parent) || ts.isModuleBlock(node.parent) || ts.isClassLike(node.parent));
+
+/**
  * The lines among `lines` that hold brackets and separators and nothing else,
- * or an else, case, default, catch or finally. Such a line, changed, can move
- * the unchanged lines beside it into or out of a block, which the gate does not
- * gate (mutation/README.md), so the report names it, mutants of its own or not.
+ * a brace of a block (a header's `{`, a closer with code: `} while (x);`,
+ * `}).catch(log);`), or an else, case, default, catch or finally. Such a line,
+ * changed, can move the unchanged lines beside it into or out of a block, which
+ * the gate does not gate (mutation/README.md), so the report names it, mutants
+ * of its own or not.
  * @param {string} file
  * @param {string} text
  * @param {number[]} lines
@@ -416,7 +428,8 @@ export function structureLines(file, text, lines) {
     const children = node.getChildren(sf);
     if (children.length > 0) { children.forEach(walk); return; }
     if (node.kind === ts.SyntaxKind.EndOfFileToken || node.getStart(sf) === node.getEnd()) return;
-    if (PARTS.has(node.kind)) parts.add(lineOf(node.getStart(sf)));
+    const part = PARTS.has(node.kind) && (node.kind !== ts.SyntaxKind.DefaultKeyword || ts.isDefaultClause(node.parent));
+    if (part || blockBrace(node)) parts.add(lineOf(node.getStart(sf)));
     const into = STRUCTURE.has(node.kind) ? brackets : code;
     for (let n = lineOf(node.getStart(sf)); n <= lineOf(node.getEnd() - 1); n++) into.add(n);
   };
@@ -455,7 +468,8 @@ export const changedArgs = base => ['diff', '--name-status', '-z', '-M', '-l0', 
  * The target for a file's changed lines. `gating` lists them: a mutant that
  * touches one of them must be killed; the others in the widened ranges are
  * context, run and listed but never gating. A pure deletion widens its two
- * neighbouring lines as context. Null when the change leaves no line to mutate.
+ * neighbouring lines as context, and `deleted` names where it was, for nothing
+ * is left there to mutate. Null when the change leaves no line to mutate.
  * @param {string} file the name to mutate it under
  * @param {string} text
  * @param {{ changed: number[], deletedAfter: number[] }} change
@@ -467,7 +481,10 @@ export function changeTarget(file, text, { changed, deletedAfter }) {
   const lines = [...new Set([...changed, ...neighbours])];
   if (lines.length === 0) return null;
   const ranges = widen(file, text, lines);
-  return { file, ranges, gating: [...new Set(changed)].sort((a, b) => a - b), patterns: ranges.map(([start, end]) => `${file}:${start}-${end}`) };
+  return {
+    file, ranges, gating: [...new Set(changed)].sort((a, b) => a - b), patterns: ranges.map(([start, end]) => `${file}:${start}-${end}`),
+    ...(deletedAfter.length > 0 ? { deleted: deletedAfter } : {}),
+  };
 }
 
 /**
@@ -584,41 +601,30 @@ export function planFromGit({ git: run, base, root, read = file => fs.readFileSy
 }
 
 /**
- * What Stryker must not copy into a sandbox, as its ignorePatterns: dist (pass
- * B builds its own), everything git ignores (.env, data dirs, private module
- * repos; node_modules aside, which Stryker links), every untracked git
- * repository, whose own ignored files (its .env) git never lists, and what each
- * git submodule's own git ignores. Each path is escaped as Stryker's matcher
- * reads a pattern; one whose pattern still does not match it (a backslash in its
- * name) is `unkept`, and the gate stops rather than copy it.
- * @param {(...args: string[]) => string} git runs git in the bot root
- * @param {string} root the bot root
+ * What Stryker copies into a sandbox, as its ignorePatterns: everything left
+ * out, then each of `files` let back in, so a sandbox holds those files and
+ * nothing else (node_modules aside, which Stryker links, so a file git tracks
+ * inside one is never let in over the link). Given the files the
+ * gate fingerprints (tracked, or untracked and not ignored), no file git
+ * ignores (.env, data dirs, dist), none of an untracked repository or a
+ * submodule (git lists the dir only, and a dir lets nothing in), and none made
+ * after the list is ever copied. Each name is escaped as Stryker's matcher
+ * reads a pattern; one whose pattern still does not match it (on POSIX, a name
+ * holding a backslash and a brace) is `unkept`, and the gate stops rather than
+ * run without it.
+ * @param {string[]} files from the bot root, with forward slashes; a dir ends in '/'
  * @returns {{ patterns: string[], unkept: string[] }}
  */
-export function sandboxIgnores(git, root) {
-  /** @type {string[]} */
-  const paths = [];
-  /** @param {string} dir a repository's path from the bot root: '' or one ending in '/' */
-  const walk = dir => {
-    /** @param {string[]} args */
-    const list = (...args) => git(...(dir ? ['-C', dir] : []), ...args).split('\0').filter(Boolean);
-    paths.push(...list('ls-files', '-z', '--others', '--ignored', '--exclude-standard', '--directory')
-      .filter(p => path.posix.basename(p.replace(/\/$/, '')) !== 'node_modules').map(p => dir + p));
-    paths.push(...list('ls-files', '-z', '--others', '--exclude-standard').filter(p => p.endsWith('/')).map(p => dir + p));
-    for (const entry of list('ls-files', '-z', '--stage')) {
-      const [info, file] = entry.split('\t');
-      if (info.startsWith('160000 ') && fs.existsSync(path.join(root, dir, file, '.git'))) walk(`${dir}${file}/`);
-    }
-  };
-  walk('');
+export function sandboxPatterns(files) {
   const options = { dot: true, flipNegate: true, nocase: true };
-  const patterns = ['/dist/'];
+  const patterns = ['/**'];
   /** @type {string[]} */
   const unkept = [];
-  for (const p of new Set(paths)) {
-    const pattern = `/${escape(p, { magicalBraces: true })}`;
-    if (new Minimatch(pattern, options).match(`/${p}`)) patterns.push(pattern);
-    else unkept.push(p);
+  for (const file of files) {
+    if (file.endsWith('/') || file.split('/').includes('node_modules')) continue;
+    const pattern = `!/${escape(file, { magicalBraces: true })}`;
+    if (new Minimatch(pattern, options).match(`/${file}`)) patterns.push(pattern);
+    else unkept.push(file);
   }
   return { patterns, unkept };
 }

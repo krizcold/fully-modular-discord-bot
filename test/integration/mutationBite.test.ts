@@ -1,4 +1,4 @@
-import { spawnSync } from 'child_process';
+import { execFileSync, spawnSync } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -121,6 +121,8 @@ describe('the touched-line mutation gate', () => {
     expect(run.stdout).not.toContain('the sandbox holds a git-ignored file');
     const reportDir = /^Report: (\S+)/m.exec(run.stdout)?.[1];
     expect(reportDir, `${run.stdout}\n${run.stderr}`).toBeDefined();
+    // A dir of its own: two runs that start in the same millisecond never share one.
+    expect(reportDir!.endsWith(`-${run.pid}`), reportDir).toBe(true);
     const { mutants } = JSON.parse(fs.readFileSync(path.join(root, reportDir!, 'mutants.json'), 'utf8')) as { mutants: (Mutant & { passes: { a2?: Pass & { voided?: string } } })[] };
     const a2Ran = fs.existsSync(path.join(root, reportDir!, 'a2', 'run-ids.json')) ? ranFor(reportDir!, 'a2') : null;
     fs.rmSync(path.join(root, reportDir!), { recursive: true, force: true });
@@ -241,7 +243,20 @@ describe('the touched-line mutation gate', () => {
     const broken = `test/mutation/reports/smdb-break-${process.pid}.ts`;
     fs.mkdirSync(path.dirname(path.join(root, broken)), { recursive: true });
     fs.writeFileSync(path.join(root, broken), `export const s = 'a${String.fromCharCode(0x2028)}b';\n`);
+    // Files in src that git neither tracks nor would add: one it ignores (a logs dir) and one in an untracked repository.
+    const unlisted = [`src/smdb-ignored-${process.pid}/logs/x.ts`, `src/smdb-repo-${process.pid}/x.ts`];
+    for (const old of fs.readdirSync(path.join(root, 'src')).filter(name => /^smdb-(ignored|repo)-/.test(name))) fs.rmSync(path.join(root, 'src', old), { recursive: true, force: true });
     try {
+      for (const file of unlisted) {
+        fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true });
+        fs.writeFileSync(path.join(root, file), 'export const x = 1;\n');
+      }
+      execFileSync('git', ['init', '-q'], { cwd: path.join(root, path.dirname(unlisted[1])) });
+      for (const file of unlisted) {
+        const refused = refuse('--mutate', file);
+        expect(refused.status, file).toBe(2);
+        expect(refused.stderr).toContain(`--mutate cannot take ${file}: git neither tracks it nor would add it`);
+      }
       for (const pattern of ['src/**/*.ts', 'src/bot/internalSetup/fleet/+(nodeIdentity|takeover).ts', 'src/no/such/file.ts:1-5', `${TARGET}:3:0-3:10`, outside]) {
         const refused = refuse('--mutate', pattern);
         expect(refused.status, pattern).toBe(2);
@@ -260,6 +275,7 @@ describe('the touched-line mutation gate', () => {
     } finally {
       fs.rmSync(outside, { force: true });
       fs.rmSync(path.join(root, broken), { force: true });
+      for (const file of unlisted) fs.rmSync(path.join(root, file.split('/').slice(0, 2).join('/')), { recursive: true, force: true });
     }
 
     const unknown = gate('--base', 'no-such-ref-anywhere');

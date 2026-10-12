@@ -35,16 +35,16 @@ From the bot root, with Node 22.12 or newer (or SMDB_TEST_NODE set, as for `npm 
   branch). A file new to src is taken whole: an untracked one, one added, and one moved in from outside src (or from a
   browser view, or from a name that is not code). A file renamed within src gates its changed lines only.
 - `--mutate src/x.ts:10-20` (a file in the bot root that exists and that a diff would mutate, or such a file and lines,
-  repeatable; never a glob, never columns, never the suite's own files) skips git's diff (git still lists the tree and
-  what a sandbox leaves out); every mutant it makes gates. A git-ignored file, or one inside a submodule, is taken, but
-  no sandbox holds it, so such a run ends NO RESULT. The file is taken under the name it has on disk, from the bot root with
+  repeatable; never a glob, never columns, never the suite's own files) skips git's diff (git still lists the tree, which
+  is what a sandbox holds); every mutant it makes gates. A file git neither tracks nor would add (one it ignores, or one
+  inside a submodule or an untracked repository) is refused: no sandbox holds it. The file is taken under the name it has on disk, from the bot root with
   forward slashes (its case, and its path once links are resolved), however it was spelled: `./`, `..`, and on Windows
   backslashes or another case. A file in a diff is matched by that name too, for Stryker matches the names on disk.
 - `--concurrency N` sets pass A's parallel runs (default: half the cores); pass B uses half of that.
 - `--keep` keeps the sandboxes in `.stryker-tmp/` for a look after the run. Without it every sandbox is removed, a
   failed pass's too.
-- Exit 0 is PASS, 1 FAIL, 2 NO RESULT (nothing was tested, or the gate stopped: the report says which; or git could
-  not list the tree, before any report) or a usage error. A mutant id left in the shell (`__STRYKER_ACTIVE_MUTANT__`)
+- Exit 0 is PASS, 1 FAIL, 2 NO RESULT (nothing was tested, or the gate stopped: the report says which; or, before any
+  report, .stryker-tmp could not be made or git could not list the tree) or a usage error. A mutant id left in the shell (`__STRYKER_ACTIVE_MUTANT__`)
   is ignored. Any other code means the run was interrupted. Trust 0 and 1 only after the report's `Verdict:` line: a process
   killed on Windows exits 1 too.
 
@@ -65,14 +65,16 @@ runs it under a hostile config). git runs with no file-system monitor, so it loo
   res) => {`, a `});`, a property whose value is an arrow with a body, a plain line of an object that holds a method)
   takes its whole statement: the callback's body runs as context, and the emptying of that body, which touches the
   line, gates. A `for` with no condition is taken whole from its header: Stryker's mutant that gives it a false one
-  spans the loop.
+  spans the loop, and the emptying of its body, an endless loop that ends as a confirmed timeout, is made and gates too.
 - **Gating** mutants touch a changed line. Some that touch one are not made: one that touches it only through a block
   holding the line (the emptying of that block, or the whole callback around it), and the emptying of a block that
-  only begins or ends on a changed compound header; a block wholly made of changed lines is made.
+  only begins or ends on a changed compound header (but a `for` with no condition, above); a block wholly made of
+  changed lines is made.
   unit/mutationRanges.test.ts holds this rule to Stryker's own instrumenter, line by line, on made-up shapes and on two
   real files.
 - The other mutants in the widened ranges are **context**: they run in pass A and are listed, but never fail the gate.
-- A pure deletion has no line left to mutate: its two neighbouring lines are context only.
+- A pure deletion has no line left to mutate: its two neighbouring lines are context only, and the report names where
+  lines were only taken out, so a reviewer checks the code around each.
 - Lines added in one place, or only taken out, count also where they could slide to: their first or last lines, or the
   whole run, pass through unchanged lines beside them that repeat them (an `if` block added after an equal one counts
   in both places, an edited line beside it or not). Where repeated lines are spread among other changes, which copy
@@ -80,11 +82,12 @@ runs it under a hostile config). git runs with no file-system monitor, so it loo
 - Only the lines the diff changed count. A change can also move an unchanged line into or out of a block (a bracket,
   an `else`, a `finally` or a `case` moved past it, a header put around it, an if's two bodies swapped): that line is
   not gated, so its mutants run as context at most. The changed lines that make such a move are named under their own
-  heading, mutants of their own or not: a line of brackets and separators only, and one holding an `else`, `case`,
-  `default`, `catch` or `finally`, so a reviewer checks the lines beside each. Not named: a header with code of its
-  own put around lines (an `if (x) {`, which gates its own mutants), a line moved into or out of a braceless body, and
-  a block taken away (its header and bracket deleted), which is a pure deletion; a reviewer reads each changed header
-  for these.
+  heading, mutants of their own or not: a line of brackets and separators only, one holding a brace of a block (a
+  header's `{`, a closer with code of its own such as `} while (x);` or `}).catch(log);`), and one holding an `else`,
+  `case`, `default` (in a switch), `catch` or `finally`, so a reviewer checks the lines beside each; a block taken
+  away (its header and bracket deleted) is named with the pure deletions. Not named: a line moved into or out of a
+  braceless body (an `if (x)` with no brace put above a line, or lines swapped below one); a reviewer reads each
+  changed braceless header for these.
 - git does not look at a file its index marks assume-unchanged or skip-worktree (core.ignoreStat marks every file it
   adds), so the gate compares each such file with its base text itself, and names one marked assume-unchanged that is
   gone as deleted; one marked skip-worktree that is gone is taken as left out by a sparse checkout.
@@ -115,12 +118,15 @@ runs it under a hostile config). git runs with no file-system monitor, so it loo
 
 ## The passes
 
-1. **Pass A, in-process.** Stryker instruments the ranges in a sandbox copy of the repo: the tracked files and the
-   untracked ones git does not ignore (git's ignored files, `.env` and the data dirs among them, stay out, and so do an
-   untracked git repository, whose own `.env` git never lists, and what a submodule's own git ignores; the list is made
-   again before every pass, so a `.env` or data dir made meanwhile stays out too; a name among them that Stryker would
-   read as a glob even when escaped, one holding a backslash, which only POSIX allows, stops the gate with NO RESULT,
-   since it could not be kept out). Stryker also walks every dir of the checkout, ignored ones too, for node_modules to link:
+1. **Pass A, in-process.** Stryker instruments the ranges in a sandbox copy of the repo that holds the files the gate
+   fingerprints and nothing else: the tracked files and the untracked ones git does not ignore (ranges.mjs
+   sandboxPatterns gives Stryker a pattern that leaves everything out, then lets each of those files back in). So
+   git's ignored files (`.env`, the data dirs, dist), the files of an untracked git repository or a submodule (git
+   lists only its dir, which lets nothing in; code that needs them fails there, NO RESULT) and any file made after the
+   gate started stay out of every sandbox. A name Stryker would read as a glob even when escaped (on POSIX, one holding
+   a backslash and a brace) stops the gate with NO RESULT, since the sandbox would lack it. Stryker matches names with
+   no regard to case, so on a disk that tells case apart, a file whose path differs from a listed one's only in case
+   is copied too. Stryker also walks every dir of the checkout, ignored ones too, for node_modules to link:
    a dir the user cannot read (a data dir a container made as root) stops the pass. The TypeScript checker turns type-invalid mutants
    into CompileError. Each mutant run is `vitest related <mutated files>` on the fast tier with one worker, so only
    tests that import them run. There is no coverage analysis: every mutant runs those tests. The files go on vitest's
@@ -159,7 +165,8 @@ runs it under a hostile config). git runs with no file-system monitor, so it loo
    four times slower for one rerun only and well again by the end (a pass A rerun that timed out, or a pass B rerun
    whose child step ran past its bound).
 
-The tree is fingerprinted (every file git tracks or would add: size, time and content) before the plan reads a file,
+The tree is fingerprinted (every file git tracks or would add, which is what each sandbox holds: size, time and
+content) before the plan reads a file,
 and again before the verdict: the plan reads the tree then, each pass copies it as it is when it starts and the run with
 no mutant reads the checkout then, so a tree that changed during the run (an edit, a formatter, another session) ends
 NO RESULT, naming the files.
@@ -184,7 +191,7 @@ can hold the port or the path, and a run before it can leave the path behind. Fa
 
 ## The report
 
-`test/mutation/reports/<time>/` (ignored by git; delete it whenever you like):
+`test/mutation/reports/<time>-<process id>/` (ignored by git; delete it whenever you like):
 
 - `summary.txt` is the L5 report for the review packet: the scope, what was not mutated and why, patterns or lines no
   mutant touched, the gating mutants by outcome, every survivor, silenced and inconclusive mutant with its place and
@@ -225,8 +232,9 @@ child away from anything real:
   the code that reads DATA_DIR or falls back to `/data` is never mutated (What it mutates), and a fork whose own env
   lacks DATA_DIR throws, in a test and in every child step (helpers/forkGuard.cjs, which setup.ts loads and child.ts
   preloads; src/webui/botManager.ts forks the bot so, and a mutant that empties that env must fail, not reach `/data`);
-- every wait is bounded, and a step prints one `RESULT` line with its result and the modules it loaded; the helper
-  fails unless the fork guard is among them and every other one sits under this root's dist.
+- every wait is bounded, and a step past its bound is ended with every process it started; a step prints one `RESULT`
+  line with its result and the modules it loaded; the helper fails unless the fork guard is among them and every other
+  one sits under this root's dist.
 
 The child tier's globalSetup runs build.cjs `--if-stale`: it rebuilds dist unless the stamp matches both what dist was
 built from (src, tsconfig.json, build.cjs, the typescript version) and what dist holds now, so a dist that another
@@ -246,9 +254,9 @@ removed source file.
   mutant after that rerun passes. One mutant of the first line is equivalent (`''` and the replacement both read as "not
   active"), so the run also shows the FAIL verdict and how a survivor is listed. The same file checks that an unknown
   base and a pattern that makes no mutant both end NO RESULT, exit 2, and that a glob, a missing file, a pattern with
-  columns, a file holding a line break the gate does not count, src/utils/dataRoot.ts and the suite's own
-  helpers/env.ts and vitest.config.ts are refused (each with a stand-in for vitest that does not exist, so a refusal
-  that broke would run no test).
+  columns, a file holding a line break the gate does not count, a file in src that git ignores or that sits in an
+  untracked repository, src/utils/dataRoot.ts and the suite's own helpers/env.ts and vitest.config.ts are refused (each
+  with a stand-in for vitest that does not exist, so a refusal that broke would run no test).
 - Gate runs on a stand-in for vitest (every mutant times out) end NO RESULT: when the run with no mutant after the
   reruns fails, with every timeout the reruns confirmed listed as inconclusive; when it passes past the reruns' budget;
   and when the target (a throwaway untracked file) gains a way to `/data` during pass A, which pass A2's run with no

@@ -180,13 +180,18 @@ describe('the verdict', () => {
       unmatched: ['src/missing.ts:1-2'],
       noMutant: [{ file: 'src/a.ts', lines: [4, 9] }],
       brackets: [{ file: 'src/a.ts', lines: [5] }],
+      deleted: [{ file: 'src/b.ts', lines: [0, 2] }],
     });
     expect(none).toMatchObject({ verdict: 'NO RESULT', code: 2 });
     const text = none.lines.join('\n');
     expect(text).toContain('  src/webui/public/app.jsx: a browser view');
     expect(text).toContain('  src/missing.ts:1-2');
     expect(text).toMatch(/^Changed lines of code no mutant lies wholly on \(.*the code lines of a multi-line object, array, arrow body, call or condition with no mutant of their own; a changed line of brackets and separators only, in a diff, is listed apart\):\n {2}src\/a\.ts: 4, 9$/m);
-    expect(text).toMatch(/^Changed lines that can move the unchanged lines beside them into or out of a block \(brackets and separators only, or an else, case, default, catch or finally; the lines they move are not gated, so check them\):\n {2}src\/a\.ts: 5$/m);
+    expect(text).toMatch(/^Changed lines that can move the unchanged lines beside them into or out of a block \(brackets and separators only, a brace of a block, or an else, case, default, catch or finally; the lines they move are not gated, so check them\):\n {2}src\/a\.ts: 5$/m);
+    expect(text).toMatch(/^Lines only taken out, with nothing left there to mutate \(each after the line named, as the file is now; 0 is its top\), so check the code around each:\n {2}src\/b\.ts: after 0, 2$/m);
+    expect(none.lines.at(-1)).toBe('Verdict: NO RESULT (no gating mutant was made, so L5 tested nothing (see what was not mutated, and why, and where lines were only taken out))');
+    expect(run([mutant(1, false, { a: pass('Killed', { killedBy: 'x' }) })], {}).lines.at(-1))
+      .toBe('Verdict: NO RESULT (no gating mutant was made, so L5 tested nothing (see what was not mutated, and why))');
   });
 
   it('has no result when a test replaced vitest, whatever the mutants did', () => {

@@ -162,9 +162,11 @@ export const toPassB = mutants => mutants.filter(m => m.gating && ['Survived', '
  * `standIn` is set when a test replaced vitest (runner.mjs's
  * SMDB_MUTATION_VITEST): such a run proves nothing about the code.
  * @param {{ stamp: string, scope: string, emptyScope: boolean, skipped: { file: string, why: string }[], mutants: MutantRecord[],
- *   noMutant: { file: string, lines: number[] }[], brackets?: { file: string, lines: number[] }[], unmatched: string[], report: string,
- *   stopped?: string[], controls?: string[], standIn?: string }} run
- *   brackets: the changed lines of brackets and separators only
+ *   noMutant: { file: string, lines: number[] }[], brackets?: { file: string, lines: number[] }[], deleted?: { file: string, lines: number[] }[],
+ *   unmatched: string[], report: string, stopped?: string[], controls?: string[], standIn?: string }} run
+ *   brackets: the changed lines that can move others (ranges.mjs structureLines): brackets and separators only, a brace
+ *   of a block, or an else, case, default, catch or finally; deleted: where lines were only taken out, each after the
+ *   line named (0: the top)
  * @returns {{ verdict: 'PASS' | 'FAIL' | 'NO RESULT', code: 0 | 1 | 2, lines: string[] }}
  */
 export function judge(run) {
@@ -178,7 +180,10 @@ export function judge(run) {
   if (run.standIn) { verdict = 'NO RESULT'; why = `vitest was replaced by a test's stand-in (SMDB_MUTATION_VITEST=${run.standIn})`; }
   else if (run.stopped) { verdict = 'NO RESULT'; why = 'the gate stopped before it finished'; }
   else if (run.emptyScope) { verdict = 'NO RESULT'; why = 'no src file changed; for a job already committed, pass --base the commit before it'; }
-  else if (gating.length === 0) { verdict = 'NO RESULT'; why = 'no gating mutant was made, so L5 tested nothing (see what was not mutated, and why)'; }
+  else if (gating.length === 0) {
+    verdict = 'NO RESULT';
+    why = `no gating mutant was made, so L5 tested nothing (see what was not mutated, and why${(run.deleted ?? []).length > 0 ? ', and where lines were only taken out' : ''})`;
+  }
   else if (gating.every(m => outcome(m) === 'CompileError')) { verdict = 'NO RESULT'; why = 'every gating mutant was a type error, so no test ran against the change'; }
 
   /** @param {MutantRecord} m */
@@ -210,8 +215,10 @@ export function judge(run) {
     ...(run.unmatched.length > 0 ? ['Patterns that made no mutant:', ...run.unmatched.map(p => `  ${p}`)] : []),
     ...(run.noMutant.length > 0 ? ['Changed lines of code no mutant lies wholly on (L5 says nothing about them; types, imports, signatures, and the code lines of a multi-line object, array, arrow body, call or condition with no mutant of their own; a changed line of brackets and separators only, in a diff, is listed apart):',
       ...run.noMutant.map(n => `  ${n.file}: ${n.lines.join(', ')}`)] : []),
-    ...((run.brackets ?? []).length > 0 ? ['Changed lines that can move the unchanged lines beside them into or out of a block (brackets and separators only, or an else, case, default, catch or finally; the lines they move are not gated, so check them):',
+    ...((run.brackets ?? []).length > 0 ? ['Changed lines that can move the unchanged lines beside them into or out of a block (brackets and separators only, a brace of a block, or an else, case, default, catch or finally; the lines they move are not gated, so check them):',
       ...(run.brackets ?? []).map(n => `  ${n.file}: ${n.lines.join(', ')}`)] : []),
+    ...((run.deleted ?? []).length > 0 ? ['Lines only taken out, with nothing left there to mutate (each after the line named, as the file is now; 0 is its top), so check the code around each:',
+      ...(run.deleted ?? []).map(n => `  ${n.file}: after ${n.lines.join(', ')}`)] : []),
     `Gating mutants (they touch a changed line): ${gating.length}: ${tally(gating)}`,
     `  killed in pass A: ${gating.filter(m => !m.passes.b && outcome(m) === 'Killed').length}; sent to pass B: ${gating.filter(m => m.passes.b).length}, killed there: ${gating.filter(m => m.passes.b && outcome(m) === 'Killed').length}`,
     ...section('Survivors (each needs a test that kills it, or a justification in the notes):', [...gatingAt('Survived'), ...gatingAt('NoCoverage'), ...gatingAt('Missing')]),

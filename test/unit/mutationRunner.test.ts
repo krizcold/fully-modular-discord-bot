@@ -240,6 +240,22 @@ describe('the tree fingerprint', () => {
     expect(run.stdout).toMatch(/^Verdict: NO RESULT \(the gate could not read the tree: /m);
   });
 
+  it('ends the gate NO RESULT, exit 2, when it cannot make .stryker-tmp, and says so', () => {
+    // The gate copied to a root of its own, whose .stryker-tmp is a file; its packages are linked, never copied.
+    const copy = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-tmpdir-'));
+    const packages = path.join(copy, 'test', 'node_modules');
+    onTestFinished(() => {
+      fs.unlinkSync(packages);
+      fs.rmSync(copy, { recursive: true, force: true });
+    });
+    fs.cpSync(path.join(root, 'test', 'mutation'), path.join(copy, 'test', 'mutation'), { recursive: true, filter: source => path.basename(source) !== 'reports' });
+    fs.symlinkSync(path.join(root, 'test', 'node_modules'), packages, 'junction');
+    fs.writeFileSync(path.join(copy, '.stryker-tmp'), '');
+    const run = spawnSync(process.execPath, [path.join(copy, 'test', 'mutation', 'touched.mjs')], { cwd: copy, encoding: 'utf8' });
+    expect(run.status, run.stderr).toBe(2);
+    expect(run.stdout).toMatch(/^Verdict: NO RESULT \(the gate could not make \.stryker-tmp, where Stryker puts its sandboxes: /m);
+  });
+
   it('is taken, in the gate, before it reads a file: the --mutate checks and the plan', () => {
     const gate = fs.readFileSync(path.join(root, 'test', 'mutation', 'touched.mjs'), 'utf8');
     const print = gate.indexOf('planned = treePrint(');

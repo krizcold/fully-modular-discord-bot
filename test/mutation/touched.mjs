@@ -20,7 +20,7 @@ import { COMMON, PASSES } from './passes.mjs';
  * @typedef {import('./verdict.mjs').MutantRecord} MutantRecord
  * @typedef {import('./verdict.mjs').PassName} PassName
  * @typedef {import('./verdict.mjs').PassResult} PassResult
- * @typedef {{ file: string, patterns: string[], gating: number[] | null }} PassTarget
+ * @typedef {{ file: string, patterns: string[], gating: number[] | null, deleted?: number[] }} PassTarget
  * @typedef {{ id: string, fileName: string, location: Location, mutatorName: string, replacement?: string, status: string, statusReason?: string }} StrykerResult
  * @typedef {import('@stryker-mutator/api/core').PartialStrykerOptions} Options
  */
@@ -53,7 +53,7 @@ try {
   console.error(`Verdict: NO RESULT (the gate could not load: ${error instanceof Error ? error.message.split('\n')[0] : String(error)}; run npm run test:install)`);
   process.exit(2);
 }
-const { structureLines, DATA_ROUTE_WHY, EXTRA_BREAK_WHY, gates, holdsDataRoute, holdsExtraBreak, linesOfTarget, notMutated, planFromGit, sandboxIgnores, unmatchedPatterns, untouched } = ranges;
+const { structureLines, DATA_ROUTE_WHY, EXTRA_BREAK_WHY, gates, holdsDataRoute, holdsExtraBreak, linesOfTarget, notMutated, planFromGit, sandboxPatterns, unmatchedPatterns, untouched } = ranges;
 const { byKiller, classifyKill, judge, outcome, toConfirm, toPassB } = verdicts;
 
 const USAGE = 'usage: node test/mutation/touched.mjs [--base REF] [--mutate PATTERN]... [--concurrency N] [--keep]';
@@ -80,30 +80,42 @@ process.chdir(root);
 const git = (...args) => execFileSync('git', ['-c', 'core.quotePath=false', '-c', 'core.fsmonitor=false', ...args], { cwd: root, encoding: 'utf8', maxBuffer: 256 * 1024 * 1024 });
 /** @param {string} file */
 const posix = file => file.split(path.sep).join('/');
+/** @param {unknown} error */
+const firstLine = error => (error instanceof Error ? error.message.split('\n')[0] : String(error));
+// The sandboxes' dir ignores itself, so git status stays clean, from the first
+// print on: a sandbox another Stryker run left there is no change.
+try {
+  fs.mkdirSync(path.join(root, '.stryker-tmp'), { recursive: true });
+  fs.writeFileSync(path.join(root, '.stryker-tmp', '.gitignore'), '*\n');
+} catch (error) {
+  console.log(`Verdict: NO RESULT (the gate could not make .stryker-tmp, where Stryker puts its sandboxes: ${firstLine(error)})`);
+  process.exit(2);
+}
 // The tree as the gate found it before reading any file (tree.mjs), and the
-// files that make it: what the sandboxes copy, the tracked files and the
-// untracked ones git does not ignore. An edit saved from here on shows at the end.
+// files that make it: the tracked files and the untracked ones git does not
+// ignore. An edit saved from here on shows at the end.
 const treeFiles = () => git('ls-files', '-z', '--cached', '--others', '--exclude-standard').split('\0').filter(Boolean);
 /** @type {Map<string, string>} */
 let planned;
 try {
-  // The sandboxes' dir ignores itself, so git status stays clean, from the
-  // first print on: a sandbox another Stryker run left there is no change.
-  fs.mkdirSync(path.join(root, '.stryker-tmp'), { recursive: true });
-  fs.writeFileSync(path.join(root, '.stryker-tmp', '.gitignore'), '*\n');
   planned = treePrint(root, treeFiles());
 } catch (error) {
-  console.log(`Verdict: NO RESULT (the gate could not read the tree: ${error instanceof Error ? error.message.split('\n')[0] : String(error)})`);
+  console.log(`Verdict: NO RESULT (the gate could not read the tree: ${firstLine(error)})`);
   process.exit(2);
 }
+// Every sandbox holds those files and nothing else (ranges.mjs sandboxPatterns).
+const sandbox = sandboxPatterns([...planned.keys()]);
 // A mutant id set in the shell would make every run with no mutant a mutant's
 // run: Stryker passes its own env on to the command it runs.
 delete process.env.__STRYKER_ACTIVE_MUTANT__;
 // A pattern is a file, or a file and lines; one with columns names no file, so it is refused.
 /** @param {string} pattern */
 const fileOfPattern = pattern => pattern.replace(/:\d+-\d+$/, '');
+/** @type {Set<string> | undefined} */
+let inTree;
 // Each --mutate file is taken under the name it has on disk (keys.mjs), the
-// name Stryker matches, so its mutants find their target in the report.
+// name Stryker matches, so its mutants find their target in the report. It
+// must be in the tree, which is what a sandbox holds and the fingerprint covers.
 opts.mutate = opts.mutate.map(pattern => {
   const file = fileOfPattern(pattern);
   const name = canonicalName(root, file);
@@ -112,7 +124,9 @@ opts.mutate = opts.mutate.map(pattern => {
     process.exit(2);
   }
   const text = fs.readFileSync(path.join(root, name), 'utf8');
-  const why = holdsExtraBreak(text) ? EXTRA_BREAK_WHY : holdsDataRoute(name, text) ? DATA_ROUTE_WHY : notMutated(name);
+  inTree ??= new Set([...planned.keys()].map(file => canonicalName(root, file)).filter(file => file !== null));
+  const why = holdsExtraBreak(text) ? EXTRA_BREAK_WHY : holdsDataRoute(name, text) ? DATA_ROUTE_WHY : notMutated(name)
+    ?? (inTree.has(name) ? null : 'git neither tracks it nor would add it (it is ignored, or inside a submodule or an untracked repository), so no sandbox holds it');
   if (why) {
     console.error(`--mutate cannot take ${name}: ${why}`);
     process.exit(2);
@@ -131,7 +145,9 @@ if (givenSeed && (!/^-?\d+$/.test(givenSeed) || !Number.isSafeInteger(Number(giv
 process.env.SMDB_TEST_SEED ||= String(crypto.randomInt(2 ** 31));
 
 const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-const reportDir = path.join(root, 'test', 'mutation', 'reports', stamp);
+// The process id too: two runs in one checkout that start in the same
+// millisecond would otherwise read each other's vitest reports.
+const reportDir = path.join(root, 'test', 'mutation', 'reports', `${stamp}-${process.pid}`);
 
 /** @type {PassTarget[]} */
 let targets = [];
@@ -242,17 +258,14 @@ async function pass({ name, dir, tier, mutate, files, only = [], keys, extra }) 
   process.env.SMDB_MUTATION_TARGETS = keys ? path.join(out, 'targets.json') : '';
   process.env.SMDB_MUTATION_RUN = keys ? path.join(out, 'run-ids.json') : '';
   if (keys) fs.writeFileSync(path.join(out, 'targets.json'), JSON.stringify(keys));
-  // What the sandbox leaves out, as the checkout is now: a .env or a data dir
-  // made since the last pass stays out too (ranges.mjs sandboxIgnores).
-  const sandbox = sandboxIgnores(git, root);
   if (sandbox.unkept.length > 0) {
-    throw new PassError(`the gate cannot keep ${sandbox.unkept.join(', ')} out of a sandbox, for Stryker would read the name as a glob; rename or remove it`);
+    throw new PassError(`the gate cannot give Stryker ${sandbox.unkept.join(', ')} for a sandbox, for it would read the name as a glob; rename it`);
   }
   const { Stryker } = await import('@stryker-mutator/core');
   try {
     return await new Stryker({ ...common, ignorePatterns: sandbox.patterns, mutate, ...extra }).runMutationTest();
   } catch (error) {
-    const lines = [`pass ${dir} could not run: ${error instanceof Error ? error.message.split('\n')[0] : String(error)}`, ...dryFailures(dir), ...refusalIn(out)];
+    const lines = [`pass ${dir} could not run: ${firstLine(error)}`, ...dryFailures(dir), ...refusalIn(out)];
     if (fs.readdirSync(out).some(f => f.startsWith('dry-') && f.endsWith('.log'))) lines.push(`the run with no mutant logged to ${posix(path.relative(root, out))}/dry-*.log`);
     throw new PassError(lines.join('\n'));
   }
@@ -338,7 +351,7 @@ function finish(stopped) {
     }
     report(stopped);
   } catch (error) {
-    console.error(`Verdict: NO RESULT (the report could not be written: ${error instanceof Error ? error.message.split('\n')[0] : String(error)})`);
+    console.error(`Verdict: NO RESULT (the report could not be written: ${firstLine(error)})`);
     process.exit(2);
   }
 }
@@ -349,6 +362,8 @@ function report(stopped) {
   const noMutant = [];
   /** @type {{ file: string, lines: number[] }[]} */
   const brackets = [];
+  /** @type {{ file: string, lines: number[] }[]} */
+  const deleted = [];
   const unmatched = stopped && mutants.length === 0 ? [] : unmatchedPatterns(targets, mutants);
   for (const target of targets) {
     const made = mutants.filter(m => m.file === target.file);
@@ -356,13 +371,14 @@ function report(stopped) {
     const text = linesOf(target.file).join('\n');
     const moved = target.gating ? structureLines(target.file, text, target.gating) : [];
     if (moved.length > 0) brackets.push({ file: target.file, lines: moved });
+    if (target.deleted) deleted.push({ file: target.file, lines: target.deleted });
     /** @type {[number, number][]} */
     const spans = made.map(m => [m.location.start.line, m.location.end.line]);
     const lines = untouched(target.file, text, linesOfTarget(target, text.split('\n').length), spans);
     if (lines.length > 0) noMutant.push({ file: target.file, lines });
   }
   const seed = process.env.SMDB_TEST_SEED;
-  const result = judge({ stamp, scope: `${scope}; fast-check seed ${seed}`, emptyScope, skipped, mutants, noMutant, brackets, unmatched, report: posix(path.relative(root, reportDir)), stopped, controls, standIn: process.env.SMDB_MUTATION_VITEST });
+  const result = judge({ stamp, scope: `${scope}; fast-check seed ${seed}`, emptyScope, skipped, mutants, noMutant, brackets, deleted, unmatched, report: posix(path.relative(root, reportDir)), stopped, controls, standIn: process.env.SMDB_MUTATION_VITEST });
   fs.mkdirSync(reportDir, { recursive: true });
   fs.writeFileSync(path.join(reportDir, 'mutants.json'), `${JSON.stringify({ scope, seed, skipped, targets, mutants, controls, verdict: result.verdict, stopped }, null, 2)}\n`);
   fs.writeFileSync(path.join(reportDir, 'summary.txt'), `${result.lines.join('\n')}\n`);
@@ -425,5 +441,5 @@ try {
   }
   finish();
 } catch (error) {
-  finish(error instanceof PassError ? error.message.split('\n') : [`the gate stopped: ${error instanceof Error ? error.message.split('\n')[0] : String(error)}`]);
+  finish(error instanceof PassError ? error.message.split('\n') : [`the gate stopped: ${firstLine(error)}`]);
 }
