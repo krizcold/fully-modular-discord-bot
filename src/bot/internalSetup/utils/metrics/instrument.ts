@@ -2,6 +2,7 @@
 // are recorded separately and never summed. Pass-through when metrics are disabled.
 
 import { getMetricsCollector, MetricKind } from './metricsCollector';
+import { withModule } from '../dataBackends/writeLedger';
 
 export async function instrument<T>(
   kind: MetricKind,
@@ -10,15 +11,17 @@ export async function instrument<T>(
   label: string,
   fn: () => T | Promise<T>
 ): Promise<T> {
+  // The writes fn makes are recorded under its module in the entry's write ledger.
+  const tagged = () => withModule(moduleName, fn);
   const collector = getMetricsCollector();
   if (!collector.isEnabled()) {
-    return fn();
+    return tagged();
   }
   const cpuStart = process.cpuUsage();
   const wallStart = process.hrtime.bigint();
   let errored = false;
   try {
-    return await fn();
+    return await tagged();
   } catch (error) {
     errored = true;
     throw error;

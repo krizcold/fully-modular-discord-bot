@@ -6,7 +6,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { Store, SessionData } from 'express-session';
 import { dataPath } from '../../utils/dataRoot';
-import { writeRawAtomic, readRaw, deleteRawAtomic } from '../../bot/internalSetup/utils/dataManager';
+import { writeRawAtomic, readRaw, deleteRawAtomic, DataBackendUnavailableError } from '../../bot/internalSetup/utils/dataManager';
 
 // Path-traversal guard: a sid that fails this never touches the filesystem.
 const SID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
@@ -99,21 +99,30 @@ export class FileSessionStore extends Store {
       updatedAt: Date.now(),
       session,
     };
-    writeRawAtomic(file, JSON.stringify(record));
+    // Refused once the exit drain has closed: express-session reports it.
+    try {
+      writeRawAtomic(file, JSON.stringify(record));
+    } catch (error) {
+      return void callback?.(error);
+    }
     callback?.();
   }
 
   destroy(sid: string, callback?: (err?: any) => void): void {
     const file = this.fileFor(sid);
     if (!file) return void callback?.();
+    try {
+      deleteRawAtomic(file);
+    } catch (error) {
+      return void callback?.(error);
+    }
     this.destroyed.add(sid);
-    deleteRawAtomic(file);
     const timer = setTimeout(() => this.destroyed.delete(sid), DESTROYED_GRACE_MS);
     timer.unref();
     callback?.();
   }
 
-  touch(sid: string, session: SessionData, callback?: () => void): void {
+  touch(sid: string, session: SessionData, callback?: (err?: any) => void): void {
     const file = this.fileFor(sid);
     if (!file || this.destroyed.has(sid)) return void callback?.();
     const raw = readRaw(file);
@@ -125,7 +134,11 @@ export class FileSessionStore extends Store {
     record.expiresAt = nextExpiresAt;
     record.updatedAt = Date.now();
     if (session.cookie) record.session.cookie = session.cookie;
-    writeRawAtomic(file, JSON.stringify(record));
+    try {
+      writeRawAtomic(file, JSON.stringify(record));
+    } catch (error) {
+      return void callback?.(error);
+    }
     callback?.();
   }
 
@@ -134,7 +147,11 @@ export class FileSessionStore extends Store {
   }
 
   clear(callback?: (err?: any) => void): void {
-    for (const sid of this.listSids()) this.destroy(sid);
+    for (const sid of this.listSids()) {
+      let refused: unknown;
+      this.destroy(sid, error => { refused = error; });
+      if (refused) return void callback?.(refused);
+    }
     callback?.();
   }
 
@@ -180,20 +197,28 @@ export class FileSessionStore extends Store {
 
   private sweep(): void {
     const now = Date.now();
-    for (const sid of this.listSids()) {
-      const file = this.fileFor(sid)!;
-      const raw = readRaw(file);
-      if (raw === null) continue;
-      const record = this.parseRecord(raw);
-      if (record) {
-        if (record.expiresAt < now) deleteRawAtomic(file);
-        continue;
+    try {
+      for (const sid of this.listSids()) {
+        const file = this.fileFor(sid)!;
+        const raw = readRaw(file);
+        if (raw === null) continue;
+        const record = this.parseRecord(raw);
+        if (record) {
+          if (record.expiresAt < now) deleteRawAtomic(file);
+          continue;
+        }
+        // Corrupt file: delete only once stale, so a file another process is
+        // mid-writing is not swept from under it.
+        try {
+          if (now - fs.statSync(file).mtimeMs > this.defaultTtlMs) deleteRawAtomic(file);
+        } catch (error) {
+          if (error instanceof DataBackendUnavailableError) throw error;
+          /* already gone */
+        }
       }
-      // Corrupt file: delete only once stale, so a file another process is
-      // mid-writing is not swept from under it.
-      try {
-        if (now - fs.statSync(file).mtimeMs > this.defaultTtlMs) deleteRawAtomic(file);
-      } catch { /* already gone */ }
+    } catch (error) {
+      // The exit drain has closed: the sweep stops, and the next process sweeps.
+      if (!(error instanceof DataBackendUnavailableError)) throw error;
     }
   }
 }

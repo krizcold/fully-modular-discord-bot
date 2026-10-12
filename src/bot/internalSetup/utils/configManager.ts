@@ -94,16 +94,6 @@ export function ensureConfigPopulated(): void {
 }
 
 /**
- * Ensures a specific config file exists in a given directory. If not, creates an empty one.
- */
-function ensureConfigFile(filePath: string, defaultContent: string = '{}'): void {
-  if (readRaw(filePath) === null) {
-    writeRawAtomic(filePath, defaultContent);
-    console.log(`[ConfigManager] Created default config file: ${path.relative(path.resolve(__dirname, '../..'), filePath)}`);
-  }
-}
-
-/**
  * Reads a JSON config file through the facade (read-your-writes against the queue).
  */
 function readConfigFile<T>(filePath: string, defaultValue: T): T {
@@ -126,11 +116,9 @@ function readConfigFile<T>(filePath: string, defaultValue: T): T {
  * 2. Environment variable (fallback - docker-compose defaults)
  * 3. Schema default (lowest - code defaults)
  *
- * Auto-documents: If property is missing from config.json, writes the default to file.
+ * It only reads: a missing config.json answers 2 or 3, and the file is created by the boot's populate or a save.
  */
 export function getConfigProperty<T>(property: string): T {
-  ensureConfigFile(rootConfigPath);
-
   // Get default from schema
   const defaultValue = MAIN_CONFIG_SCHEMA[property] as T;
 

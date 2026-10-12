@@ -29,7 +29,8 @@ import {
   dropPendingForGuild,
   graveyardGuildDir,
   restoreGuildDirFromGraveyard,
-  writeRawAtomic,
+  writeRawAtomic as writeRawAtomicFile,
+  deleteRawAtomic as deleteRawAtomicFile,
   listGuildDataFiles as listGuildDataFilesFs,
   listGlobalDataFiles,
 } from './dataBackends/fileBackend';
@@ -53,14 +54,13 @@ import type { FileTicket } from './dataBackends/fileBackend';
 import { sweepGraveyardRows, PostgresBackend } from './dataBackends/postgresBackend';
 import type { DataBackend, FenceToken } from './dataBackends/backend';
 import { loadCredentials } from '../../../utils/envLoader';
+import { recordRefusal, recordTicket } from './dataBackends/writeLedger';
 
 export { listGlobalDataFiles };
 export { DataBackendUnavailableError } from './dataBackends/workingSet';
 export {
   getFlushFailures,
-  writeRawAtomic,
   readRaw,
-  deleteRawAtomic,
   sizeOfGlobalData,
   listGraveyardEntries,
 } from './dataBackends/fileBackend';
@@ -511,7 +511,35 @@ export function stampOwner(guildId: string): void {
     updatedAt: Date.now(),
   };
   const target = path.join(BASE_DATA_DIR, guildId, '.owner');
-  writeRawAtomic(target, JSON.stringify(manifest, null, 2));
+  writeRawAtomicFile(target, JSON.stringify(manifest, null, 2));
+}
+
+// ============================================================================
+// RAW PATHS (root config, session files and other files outside the namespaces)
+// ============================================================================
+
+/** Queue an atomic write to an absolute path; refused once the exit drain has closed. */
+export function writeRawAtomic(absPath: string, contents: string): boolean {
+  if (closedForExit) {
+    recordRefusal('node-stopping');
+    throw new DataBackendUnavailableError('node-stopping');
+  }
+  const accepted = writeRawAtomicFile(absPath, contents);
+  if (accepted) recordTicket(fileTicket(absPath));
+  else recordRefusal('io');
+  return accepted;
+}
+
+/** Queue an atomic delete of an absolute path (false: nothing to delete); refused once the exit drain has closed. */
+export function deleteRawAtomic(absPath: string): boolean {
+  if (closedForExit) {
+    recordRefusal('node-stopping');
+    throw new DataBackendUnavailableError('node-stopping');
+  }
+  const accepted = deleteRawAtomicFile(absPath);
+  // A delete still queued for the path has not landed: it answers for this one.
+  if (accepted || getPending(absPath)?.op === 'delete') recordTicket(fileTicket(absPath));
+  return accepted;
 }
 
 // ============================================================================
@@ -575,6 +603,22 @@ export type AppendTracked = { outcome: 'appended'; ticket: WriteTicket } | { out
 /** An absent delete carries a ticket while an earlier delete of the same document has not landed. */
 export type DeleteTracked = { outcome: 'deleted'; ticket: WriteTicket } | { outcome: 'absent'; ticket?: WriteTicket } | { outcome: 'frozen' } | { outcome: 'refused'; cause: WriteRefusal };
 
+/** Records a tracked write's outcome in the entry's ledger (writeLedger.ts), and a refusal's cause before its throw. */
+function recorded<R extends SaveTracked | AppendTracked | DeleteTracked>(accept: () => R): R {
+  let result: R;
+  try {
+    result = accept();
+  } catch (error) {
+    if (error instanceof DataBackendUnavailableError) recordRefusal(error.causeKey);
+    throw error;
+  }
+  const outcome: SaveTracked | AppendTracked | DeleteTracked = result;
+  if ('ticket' in outcome && outcome.ticket) recordTicket(outcome.ticket);
+  else if (outcome.outcome === 'frozen') recordRefusal('frozen');
+  else if (outcome.outcome === 'refused') recordRefusal(outcome.cause);
+  return result;
+}
+
 /**
  * Save JSON data to file
  * Automatically creates directory if needed
@@ -594,6 +638,10 @@ export function saveDataOutcome<T = any>(filename: string, options: DataOptions,
 
 /** saveDataOutcome with the ticket of an accepted write, or the cause of a refusal. */
 export function saveDataTracked<T = any>(filename: string, options: DataOptions, data: T): SaveTracked {
+  return recorded(() => acceptSave(filename, options, data));
+}
+
+function acceptSave<T>(filename: string, options: DataOptions, data: T): SaveTracked {
   if (closedForExit) throw new DataBackendUnavailableError('node-stopping');
   try {
     if (isGuildFrozen(options)) {
@@ -651,6 +699,10 @@ export function appendData(filename: string, options: DataOptions, line: string)
 
 /** appendData with the ticket of an accepted append, or the cause of a refusal. */
 export function appendDataTracked(filename: string, options: DataOptions, line: string): AppendTracked {
+  return recorded(() => acceptAppend(filename, options, line));
+}
+
+function acceptAppend(filename: string, options: DataOptions, line: string): AppendTracked {
   if (closedForExit) throw new DataBackendUnavailableError('node-stopping');
   try {
     if (isGuildFrozen(options)) {
@@ -722,6 +774,10 @@ export function deleteDataOutcome(filename: string, options: DataOptions): 'dele
 
 /** deleteDataOutcome with the ticket of an accepted delete, or the cause of a refusal. */
 export function deleteDataTracked(filename: string, options: DataOptions): DeleteTracked {
+  return recorded(() => acceptDelete(filename, options));
+}
+
+function acceptDelete(filename: string, options: DataOptions): DeleteTracked {
   if (closedForExit) throw new DataBackendUnavailableError('node-stopping');
   try {
     if (isGuildFrozen(options)) {

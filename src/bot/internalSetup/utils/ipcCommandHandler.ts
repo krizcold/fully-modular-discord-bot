@@ -12,6 +12,7 @@ import { buildConsoleInteraction } from './consoleInteraction';
 import { getFleetState } from '../fleet/state';
 import { guildIdToShardId } from '../fleet/placement';
 import { awaitGuildDataReady } from './dataBackends/boot';
+import { runSealed } from './dataBackends/writeLedger';
 
 interface InvokePayload {
   command?: string;
@@ -80,8 +81,9 @@ async function handleInvoke(data: InvokePayload): Promise<Record<string, unknown
   const startedAt = Date.now();
   // handleCommands owns its own try/catch: a command-internal throw is logged
   // there (visible via `smdb logs`), not surfaced inline. Pre-dispatch failures
-  // (bad command, unserved guild) are returned as errors above.
-  await handleCommands(client, interaction as never);
+  // (bad command, unserved guild) are returned as errors above. Its writes are
+  // recorded in a ledger keyed to the interaction, sealed once it returns.
+  await runSealed('console', interaction as object, null, () => handleCommands(client, interaction as never));
   return {
     success: true,
     command,

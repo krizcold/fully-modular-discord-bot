@@ -63,7 +63,7 @@ function buildUpgradeButtons(guildId: string): ButtonBuilder[] {
  * Settings panels use IDs like "settings_moduleName" or "settings_global_moduleName".
  * Module panels may have _moduleName set during registration.
  */
-function extractModuleNameFromPanel(panel: PanelOptions): string | null {
+export function extractModuleNameFromPanel(panel: PanelOptions): string | null {
   if ((panel as any)._moduleName) return (panel as any)._moduleName;
   const id = panel.id;
   if (id.startsWith('settings_global_')) return id.replace('settings_global_', '');

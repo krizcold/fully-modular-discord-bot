@@ -6,6 +6,7 @@
 // changes bounce its gateway sessions, never the object.
 
 import { Client, ClientOptions } from 'discord.js';
+import { installInteractionLedgers } from '../utils/dataBackends/writeLedger';
 
 export class IngestService {
   private client: Client | null = null;
@@ -29,6 +30,7 @@ export class IngestService {
       (opts as any).shardCount = plan.shardCount;
     }
     this.client = new Client(opts);
+    installInteractionLedgers(this.client);
     return this.client;
   }
 

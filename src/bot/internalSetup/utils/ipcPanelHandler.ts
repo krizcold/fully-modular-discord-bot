@@ -1,8 +1,9 @@
 // IPC Panel Handler - Handles IPC messages from Web-UI for panel operations
 
-import { getPanelManager } from './panelManager';
+import { extractModuleNameFromPanel, getPanelManager } from './panelManager';
 import { getConfigProperty } from './configManager';
 import { awaitGuildDataReady } from './dataBackends/boot';
+import { runSealed } from './dataBackends/writeLedger';
 
 /**
  * Set up IPC message handlers for Web-UI panel integration
@@ -91,7 +92,10 @@ export function setupPanelIPCHandlers(): void {
     }
 
     try {
-      const response = await handleIPCMessage(type, data, panelManager);
+      // A panel action's writes are recorded in its own ledger, sealed once it answers.
+      const response = PANEL_ACTIONS.has(type)
+        ? await runSealed('panel', null, panelModule(panelManager, data?.panelId), () => handleIPCMessage(type, data, panelManager))
+        : await handleIPCMessage(type, data, panelManager);
       process.send!({ requestId, data: response });
     } catch (error) {
       console.error(`[IPCPanelHandler] Error handling IPC message ${type}:`, error);
@@ -136,14 +140,20 @@ function validateMessage(message: any): boolean {
 }
 
 
+const PANEL_ACTIONS = new Set(['panel:execute', 'panel:button', 'panel:dropdown', 'panel:modal']);
+
+function panelModule(panelManager: any, panelId: unknown): string | null {
+  const panel = typeof panelId === 'string' ? panelManager.getPanel?.(panelId) : undefined;
+  return panel ? extractModuleNameFromPanel(panel) : null;
+}
+
 /**
  * Handle IPC message and return response
  */
 async function handleIPCMessage(type: string, data: any, panelManager: any): Promise<any> {
   // Synthetic-entry data gate: webui-driven panel actions read/write guild
   // data without passing the Discord dispatch gate, so wait here the same way.
-  const panelActions = new Set(['panel:execute', 'panel:button', 'panel:dropdown', 'panel:modal']);
-  if (panelActions.has(type) && data?.guildId && !(await awaitGuildDataReady(String(data.guildId)))) {
+  if (PANEL_ACTIONS.has(type) && data?.guildId && !(await awaitGuildDataReady(String(data.guildId)))) {
     return { success: false, error: "This server's data is still loading; try again in a moment" };
   }
   switch (type) {
