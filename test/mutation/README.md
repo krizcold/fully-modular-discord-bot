@@ -41,8 +41,9 @@ From the bot root, with Node 22.12 or newer (or SMDB_TEST_NODE set, as for `npm 
 - `--concurrency N` sets pass A's parallel runs (default: half the cores); pass B uses half of that.
 - `--keep` keeps the sandboxes in `.stryker-tmp/` for a look after the run. Without it every sandbox is removed, a
   failed pass's too.
-- Exit 0 is PASS, 1 FAIL, 2 NO RESULT (nothing was tested, or the gate stopped: the report says which) or a usage
-  error. Any other code means the run was interrupted. Trust 0 and 1 only after the report's `Verdict:` line: a process
+- Exit 0 is PASS, 1 FAIL, 2 NO RESULT (nothing was tested, or the gate stopped: the report says which; or git could
+  not list the tree, before any report) or a usage error. A mutant id left in the shell (`__STRYKER_ACTIVE_MUTANT__`)
+  is ignored. Any other code means the run was interrupted. Trust 0 and 1 only after the report's `Verdict:` line: a process
   killed on Windows exits 1 too.
 
 Pass A needs nothing running. Pass B runs the integration tests that import the mutated files, so it needs Docker when
@@ -73,15 +74,12 @@ runs it under a hostile config). git runs with no file-system monitor, so it loo
   whole run, pass through unchanged lines beside them that repeat them (an `if` block added after an equal one counts
   in both places, an edited line beside it or not). Where repeated lines are spread among other changes, which copy
   counts is still the diff's choice.
-- A line whose text is unchanged but that another block now holds counts as changed: a bracket moved past it (a `}`, a
-  `} else {`, a `} finally {`, a `case` label, a `}, () => {`), a block put around it or taken away, an if's two bodies
-  swapped, a line moved between two calls' arguments or across `), () => (`. The gate finds what holds each kept line
-  (the innermost block, case, class body, object, array, call's arguments or arrow's expression body opened above it)
-  before and after: it must open on a kept line paired with the old one, or, when the lines that open both were
-  edited, on what is one edited line (between the same kept lines, or of the same text) that plays the same part (a
-  then or an else, a try or a finally, a function's body), so an edited `if` condition, a function made an arrow or an
-  `await` put before a call moves no line inside it. Where that cannot be told (two methods both made async with a
-  line moved between them), the lines it holds count too.
+- Only the lines the diff changed count. A change can also move an unchanged line into or out of a block (a bracket,
+  an `else`, a `finally` or a `case` moved past it, a header put around it, an if's two bodies swapped): that line is
+  not gated, so its mutants run as context at most. The changed lines that move it are named when no mutant lies
+  wholly on them (an `else` line, a `case` label, and a line of brackets only, under its own heading), so a reviewer
+  sees each such move and checks the lines beside it; a header that has mutants of its own gates as usual. A block
+  taken away (its header and bracket deleted) is a pure deletion, which nothing names.
 - git does not look at a file its index marks assume-unchanged or skip-worktree (core.ignoreStat marks every file it
   adds), so the gate compares each such file with its base text itself, and names one marked assume-unchanged that is
   gone as deleted; one marked skip-worktree that is gone is taken as left out by a sparse checkout.
@@ -106,14 +104,18 @@ runs it under a hostile config). git runs with no file-system monitor, so it loo
   body, call or condition with no mutant of its own land in the list. A file taken whole names the same lines as each
   of its lines changed alone. The list can name a line some mutant reaches; it never leaves out a line of code that no
   mutant lies on. A line of brackets and separators only is not a line of code: what was taken out of it (`}, 100);`
-  made `});`), like a pure deletion, is neither mutated nor named. A deleted file is named too. A `--mutate` pattern that
+  made `});`), like a pure deletion, is not mutated, and a changed one in a diff is named under its own heading. A
+  deleted file is named too. A `--mutate` pattern that
   made no mutant is named on its own, beside other patterns on the same file.
 
 ## The passes
 
 1. **Pass A, in-process.** Stryker instruments the ranges in a sandbox copy of the repo: the tracked files and the
-   untracked ones git does not ignore (git's ignored files, `.env` and the data dirs among them, stay out, and so does
-   an untracked git repository, whose own `.env` git never lists). The TypeScript checker turns type-invalid mutants
+   untracked ones git does not ignore (git's ignored files, `.env` and the data dirs among them, stay out, and so do an
+   untracked git repository, whose own `.env` git never lists, and what a submodule's own git ignores; a name among
+   them that Stryker would read as a glob even when escaped, one holding a brace, stops the gate with NO RESULT, since
+   it could not be kept out). Stryker also walks every dir of the checkout, ignored ones too, for node_modules to link:
+   a dir the user cannot read (a data dir a container made as root) stops the pass. The TypeScript checker turns type-invalid mutants
    into CompileError. Each mutant run is `vitest related <mutated files>` on the fast tier with one worker, so only
    tests that import them run. There is no coverage analysis: every mutant runs those tests. The files go on vitest's
    command line relative to test/; a change of many hundreds of files can pass Windows' limit on a command line, and
@@ -243,7 +245,9 @@ removed source file.
   that broke would run no test).
 - Gate runs on a stand-in for vitest (every mutant times out) end NO RESULT: when the run with no mutant after the
   reruns fails, with every timeout the reruns confirmed listed as inconclusive; when it passes past the reruns' budget;
-  and when the target gains a way to `/data` during pass A, which pass A2's run with no mutant refuses.
+  and when the target (a throwaway untracked file) gains a way to `/data` during pass A, which pass A2's run with no
+  mutant refuses, or during pass A2's reruns, which the run with no mutant after them refuses. Each is run with a
+  mutant id left in the env, which the gate ignores.
 - The bite fails when the plumbing breaks: with the active mutant dropped from the child's env the child-only mutants
   survive, and with the scenario loading another checkout's dist pass B refuses at its first run.
 
@@ -255,3 +259,6 @@ removed source file.
 - src/index.ts pins its alias base to /app/dist: a child scenario that boots the parent process from a sandbox needs that
   base to come from the file's own place first.
 - Browser views are never mutated (no render tests yet).
+- The CLI (src/cli) falls back to 127.0.0.1:8080 (WEBUI_PORT, which the scrub takes out) and to the manager's 8090,
+  where a developer's own bot and manager listen and take a loopback request unasked. No test runs the CLI yet; one
+  that does must give it a port of its own.

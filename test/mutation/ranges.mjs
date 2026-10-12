@@ -11,7 +11,7 @@ import { canonicalName } from './keys.mjs';
 
 // Stryker's own copy of minimatch, which it matches mutate patterns with.
 const strykerRequire = createRequire(createRequire(import.meta.url).resolve('@stryker-mutator/core/package.json'));
-const { Minimatch, minimatch } = strykerRequire('minimatch');
+const { Minimatch, minimatch, escape } = strykerRequire('minimatch');
 
 /**
  * @typedef {[number, number]} Range first and last line, 1-based
@@ -174,15 +174,13 @@ export function commonLines(a, b) {
  * one place, or only taken out, count also where they could slide to: their
  * first or last lines, or the whole run, pass through unchanged lines beside
  * them that repeat them (an `if` block added after an equal one counts in both
- * places). Given the file's name, a line kept that another block now holds (a
- * bracket moved past it, `} else {` among them, a block put around it or taken
- * away) counts as changed too (holdersOf).
+ * places). A line kept counts only where the diff marks it, even when a
+ * change moves it into or out of a block (mutation/README.md).
  * @param {string} before
  * @param {string} after
- * @param {string} [file] its name, to parse both texts by
  * @returns {{ changed: number[], deletedAfter: number[] }}
  */
-export function lineDiff(before, after, file) {
+export function lineDiff(before, after) {
   const a = splitLines(before);
   const b = splitLines(after);
   const pairs = commonLines(a, b);
@@ -214,124 +212,9 @@ export function lineDiff(before, after, file) {
     pi = i;
     pj = j;
   }
-  if (file !== undefined) {
-    // The same holder: its opening lines are a kept pair, or one edited line
-    // (between the same kept lines, or of the same text) that plays the same
-    // part (an `if` whose condition changed).
-    const was = holdersOf(file, before);
-    const is = holdersOf(file, after);
-    const newOf = new Map([[0, 0], ...pairs.map(([i, j]) => /** @type {[number, number]} */ ([i + 1, j + 1]))]);
-    const oldOf = new Map([[0, 0], ...pairs.map(([i, j]) => /** @type {[number, number]} */ ([j + 1, i + 1]))]);
-    // keptBefore[n]: how many kept lines come before line n (from 1) of a text.
-    /**
-     * @param {number} length
-     * @param {(k: number) => boolean} isKept
-     */
-    const keptBefore = (length, isKept) => {
-      const counts = new Int32Array(length + 1);
-      for (let k = 0; k < length; k++) counts[k + 1] = counts[k] + (isKept(k) ? 1 : 0);
-      return counts;
-    };
-    const oldGap = keptBefore(a.length, k => partner[k] !== -1);
-    const newGap = keptBefore(b.length, k => oldOf.has(k + 1));
-    /**
-     * @param {number} h
-     * @param {number} g
-     */
-    const oneEdit = (h, g) => oldGap[h - 1] === newGap[g - 1] || a[h - 1].trim() === b[g - 1].trim();
-    for (const [i, j] of pairs) {
-      const held = was.get(i + 1);
-      const holds = is.get(j + 1);
-      if (!held || !holds) { if (held !== holds) changed.add(j + 1); continue; }
-      const kept = newOf.has(held.line) || oldOf.has(holds.line);
-      if (kept ? newOf.get(held.line) !== holds.line : held.role !== holds.role || !oneEdit(held.line, holds.line)) changed.add(j + 1);
-    }
-  }
   /** @param {Set<number>} set */
   const sorted = set => [...set].sort((x, y) => x - y);
   return { changed: sorted(changed), deletedAfter: sorted(deletedAfter) };
-}
-
-// What can hold a line of code besides a class body, a call's arguments and an
-// arrow's expression body (holderOf): a block, a case, an object or an array.
-const HOLDERS = new Set([
-  ts.SyntaxKind.Block, ts.SyntaxKind.ModuleBlock, ts.SyntaxKind.CaseClause, ts.SyntaxKind.DefaultClause,
-  ts.SyntaxKind.ObjectLiteralExpression, ts.SyntaxKind.ArrayLiteralExpression,
-]);
-
-/**
- * Per line (from 1) that a node starts on, what holds it: the innermost block,
- * case, class body, object, array, call's arguments or arrow's expression body
- * opened on an earlier line, as the line it opens on (0: the file itself) and
- * the part it plays (a then or an else block, a try or a finally block, a
- * function's body, a case). A line no node starts on (a bracket, a comment)
- * has none. Lines are counted at LF only, as the line diff counts them.
- * @param {string} file
- * @param {string} text
- */
-function holdersOf(file, text) {
-  const sf = parse(file, text);
-  const starts = [0];
-  for (let at = text.indexOf('\n'); at !== -1; at = text.indexOf('\n', at + 1)) starts.push(at + 1);
-  /** @param {number} pos */
-  const lineOf = pos => {
-    let lo = 0;
-    let hi = starts.length - 1;
-    while (lo < hi) {
-      const mid = (lo + hi + 1) >> 1;
-      if (starts[mid] <= pos) lo = mid;
-      else hi = mid - 1;
-    }
-    return lo + 1;
-  };
-  /** @typedef {{ line: number, role: string }} Holder */
-  /** @type {Map<number, Holder>} */
-  const holders = new Map();
-  /**
-   * @param {ts.Node} node
-   * @param {Holder[]} open the holders around it, outermost first
-   */
-  const walk = (node, open) => {
-    const line = lineOf(node.getStart(sf));
-    if (!holders.has(line)) {
-      let k = open.length - 1;
-      while (k >= 0 && open[k].line >= line) k--;
-      holders.set(line, k >= 0 ? open[k] : { line: 0, role: 'the file' });
-    }
-    const holder = holderOf(node, sf);
-    const inner = holder ? [...open, { line: lineOf(holder.at), role: holder.role }] : open;
-    ts.forEachChild(node, child => walk(child, inner));
-  };
-  ts.forEachChild(sf, child => walk(child, []));
-  return holders;
-}
-
-/**
- * Whether a node holds lines, where it opens and the part it plays: a class at
- * its brace (a decorator above it moves nothing), a call's arguments at their
- * bracket, an arrow's expression body at its `=>`, the others where they start.
- * @param {ts.Node} node
- * @param {ts.SourceFile} sf
- * @returns {{ at: number, role: string } | null}
- */
-function holderOf(node, sf) {
-  if (ts.isClassLike(node)) return { at: node.members.pos - 1, role: 'a class' };
-  if ((ts.isCallExpression(node) || ts.isNewExpression(node)) && node.arguments) return { at: node.arguments.pos - 1, role: 'a call' };
-  if (ts.isArrowFunction(node) && !ts.isBlock(node.body)) return { at: node.equalsGreaterThanToken.getStart(sf), role: 'an arrow body' };
-  return HOLDERS.has(node.kind) ? { at: node.getStart(sf), role: roleOf(node) } : null;
-}
-
-/**
- * The part a holder plays: for a block, which part of what holds it (a then or
- * an else, a try or a finally, a loop's body; any function's body is one part,
- * so a function made an arrow moves nothing).
- * @param {ts.Node} node
- */
-function roleOf(node) {
-  if (node.kind !== ts.SyntaxKind.Block) return ts.SyntaxKind[node.kind];
-  const parent = /** @type {ts.Node & Record<string, unknown>} */ (node.parent);
-  const slot = Object.keys(parent).find(key => key !== 'parent' && (parent[key] === node || (Array.isArray(parent[key]) && parent[key].includes(node))));
-  return `${ts.isFunctionLike(parent) ? 'a function' : ts.SyntaxKind[parent.kind]}.${slot}`;
 }
 
 /**
@@ -501,6 +384,35 @@ export function codeLines(file, text, lines) {
 }
 
 /**
+ * The lines among `lines` that hold brackets and separators and nothing else.
+ * Such a line, changed, can move the unchanged lines beside it into or out of a
+ * block, which the gate does not gate (mutation/README.md), so the report names it.
+ * @param {string} file
+ * @param {string} text
+ * @param {number[]} lines
+ */
+export function bracketLines(file, text, lines) {
+  const sf = parse(file, text);
+  /** @param {number} pos */
+  const lineOf = pos => sf.getLineAndCharacterOfPosition(pos).line + 1;
+  /** @type {Set<number>} */
+  const code = new Set();
+  /** @type {Set<number>} */
+  const brackets = new Set();
+  /** @param {ts.Node} node */
+  const walk = node => {
+    if (node.kind >= ts.SyntaxKind.FirstJSDocNode && node.kind <= ts.SyntaxKind.LastJSDocNode) return;
+    const children = node.getChildren(sf);
+    if (children.length > 0) { children.forEach(walk); return; }
+    if (node.kind === ts.SyntaxKind.EndOfFileToken || node.getStart(sf) === node.getEnd()) return;
+    const into = STRUCTURE.has(node.kind) ? brackets : code;
+    for (let n = lineOf(node.getStart(sf)); n <= lineOf(node.getEnd() - 1); n++) into.add(n);
+  };
+  walk(sf);
+  return lines.filter(line => brackets.has(line) && !code.has(line));
+}
+
+/**
  * The code lines among `lines` that no mutant lies wholly on. A mutant that
  * spans several lines (emptying a body, an object or an array, flipping a
  * condition split over lines, a chained call) counts for none of them: it says
@@ -591,7 +503,7 @@ export function planChange({ entries, untracked, read, readBase, nameOf, isDir =
     if (holdsDataRoute(entry.file, text)) { skipped.push({ file: entry.file, why: DATA_ROUTE_WHY }); continue; }
     const before = entry.status === 'A' || entry.status === 'C' ? null : entry.from ?? entry.file;
     if (before === null || notMutated(before) !== null) { targets.push(wholeTarget(name)); continue; }
-    const target = changeTarget(name, text, lineDiff(readBase(before), text, entry.file));
+    const target = changeTarget(name, text, lineDiff(readBase(before), text));
     if (target) targets.push(target);
     else skipped.push({ file: entry.file, why: 'no changed lines (a rename, a mode change, or line endings only)' });
   }
@@ -662,16 +574,41 @@ export function planFromGit({ git: run, base, root, read = file => fs.readFileSy
 /**
  * What Stryker must not copy into a sandbox, as its ignorePatterns: dist (pass
  * B builds its own), everything git ignores (.env, data dirs, private module
- * repos; node_modules aside, which Stryker links), and every untracked git
- * repository, whose own ignored files (its .env) git never lists, as it lists
- * none of its files.
+ * repos; node_modules aside, which Stryker links), every untracked git
+ * repository, whose own ignored files (its .env) git never lists, and what each
+ * git submodule's own git ignores. Each path is escaped as Stryker's matcher
+ * reads a pattern; one whose pattern still does not match it (a brace in its
+ * name) is `unkept`, and the gate stops rather than copy it.
  * @param {(...args: string[]) => string} git runs git in the bot root
+ * @param {string} root the bot root
+ * @returns {{ patterns: string[], unkept: string[] }}
  */
-export function sandboxIgnores(git) {
-  const ignored = git('ls-files', '-z', '--others', '--ignored', '--exclude-standard', '--directory').split('\0')
-    .filter(p => p !== '' && path.posix.basename(p.replace(/\/$/, '')) !== 'node_modules');
-  const repos = git('ls-files', '-z', '--others', '--exclude-standard').split('\0').filter(p => p.endsWith('/'));
-  return [...new Set(['/dist/', ...[...ignored, ...repos].map(p => `/${p}`)])];
+export function sandboxIgnores(git, root) {
+  /** @type {string[]} */
+  const paths = [];
+  /** @param {string} dir a repository's path from the bot root: '' or one ending in '/' */
+  const walk = dir => {
+    /** @param {string[]} args */
+    const list = (...args) => git(...(dir ? ['-C', dir] : []), ...args).split('\0').filter(Boolean);
+    paths.push(...list('ls-files', '-z', '--others', '--ignored', '--exclude-standard', '--directory')
+      .filter(p => path.posix.basename(p.replace(/\/$/, '')) !== 'node_modules').map(p => dir + p));
+    paths.push(...list('ls-files', '-z', '--others', '--exclude-standard').filter(p => p.endsWith('/')).map(p => dir + p));
+    for (const entry of list('ls-files', '-z', '--stage')) {
+      const [info, file] = entry.split('\t');
+      if (info.startsWith('160000 ') && fs.existsSync(path.join(root, dir, file, '.git'))) walk(`${dir}${file}/`);
+    }
+  };
+  walk('');
+  const options = { dot: true, flipNegate: true, nocase: true };
+  const patterns = ['/dist/'];
+  /** @type {string[]} */
+  const unkept = [];
+  for (const p of new Set(paths)) {
+    const pattern = `/${escape(p, { windowsPathsNoEscape: true })}`;
+    if (new Minimatch(pattern, options).match(`/${p}`)) patterns.push(pattern);
+    else unkept.push(p);
+  }
+  return { patterns, unkept };
 }
 
 /**

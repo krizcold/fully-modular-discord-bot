@@ -10,7 +10,7 @@ import { describe, expect, it, onTestFinished } from 'vitest';
 import { canonicalName } from '../mutation/keys.mjs';
 import {
   changeTarget, codeLines, commonLines, gates, inPattern, lineDiff, linesOfTarget, mergeRanges, notMutated, parseNameStatus, planChange, planFromGit,
-  unmatchedPatterns, untouched, wholeTarget, DATA_ROUTE_WHY, GLOB_NAME_WHY, holdsDataRoute, sandboxIgnores,
+  unmatchedPatterns, untouched, wholeTarget, bracketLines, DATA_ROUTE_WHY, GLOB_NAME_WHY, holdsDataRoute, sandboxIgnores,
 } from '../mutation/ranges.mjs';
 import { treeChanges, treePrint } from '../mutation/tree.mjs';
 
@@ -290,7 +290,7 @@ describe('the change', () => {
     expect(lineDiff(['start();', 'end();'].join('\n'), ['start();', 'start();', 'foo();', 'end();'].join('\n')).changed).toEqual([1, 2, 3]);
   });
 
-  it('counts a line kept whose place in the code changed: moved into or out of a block, or a block put around it or taken away', () => {
+  it('counts only the lines the diff changes, and names a changed line of brackets only, which can move the lines beside it', () => {
     const into = [
       'export function settle(ready: boolean, log: string[], lease: { release(): void }) {',
       '  if (ready) {',
@@ -300,82 +300,14 @@ describe('the change', () => {
       "  log.push('done');",
       '}',
     ];
-    const moved = [into[0], into[1], into[2], into[4], into[3], into[5], into[6]];
-    // The bracket moved below release(): it now runs only when ready.
-    expect(lineDiff(into.join('\n'), moved.join('\n'), 'src/a.ts').changed).toContain(4);
-    expect(lineDiff(moved.join('\n'), into.join('\n'), 'src/a.ts').changed).toContain(5);
-    // The block's header and bracket taken away: its body runs always.
-    expect(lineDiff(into.join('\n'), [into[0], into[2], into[4], into[5], into[6]].join('\n'), 'src/a.ts').changed).toContain(2);
-    // An edited condition moves no other line.
-    expect(lineDiff(into.join('\n'), [into[0], '  if (ready && log.length > 0) {', ...into.slice(2)].join('\n'), 'src/a.ts').changed).toEqual([2]);
-    // A block put around it.
-    expect(lineDiff(into.join('\n'), [...into.slice(0, 4), '  if (log.length > 0) {', into[4], '  }', ...into.slice(5)].join('\n'), 'src/a.ts').changed).toEqual([5, 6, 7]);
-  });
-
-  it('counts a line kept that a sibling block now holds: across `} else {`, `} finally {`, a case label or `}, () => {`', () => {
-    const head = 'export function step(failed: boolean, state: { retries: number, backoff: number }) {';
-    const up = ['    state.retries = state.retries + 1;', '    state.backoff = Math.min(state.backoff * 2, 60);'];
-    const down = ['    state.retries = Math.max(state.retries - 1, 0);', '    state.backoff = state.backoff / 2;'];
-    const ifElse = (then: string[], other: string[]) => [head, '  if (failed) {', ...then, '  } else {', ...other, '  }', '}'].join('\n');
-    // The two bodies swapped: every line of both counts.
-    expect(lineDiff(ifElse(up, down), ifElse(down, up), 'src/a.ts').changed).toEqual([3, 4, 5, 6, 7]);
-    const branches = ['export function f(a: boolean, log: string[]) {', '  if (a) {', "    log.push('x');", '  } else {', "    log.push('y');", "    log.push('z');", '  }', '}'];
-    const swap = (lines: string[], k: number) => [...lines.slice(0, k), lines[k + 1], lines[k], ...lines.slice(k + 2)].join('\n');
-    // `} else {` moved below log.push('y'): y now runs when a holds.
-    expect(lineDiff(branches.join('\n'), swap(branches, 3), 'src/a.ts').changed).toContain(4);
-    // The same with the condition edited too: both blocks open on edited lines, and y went from the else to the then.
-    expect(lineDiff(branches.join('\n'), swap(branches, 3).replace('if (a) {', 'if (!a) {'), 'src/a.ts').changed).toContain(4);
-    const guarded = ['export function g(work: () => void, lease: { release(): void }, log: string[]) {', '  try {', '    work();', "    log.push('ok');", '  } finally {', '    lease.release();', '  }', '}'];
-    // `} finally {` moved below release(): it no longer runs when work() throws.
-    expect(lineDiff(guarded.join('\n'), swap(guarded, 4), 'src/a.ts').changed).toContain(5);
-    const cases = ['export function h(n: number, log: string[]) {', '  switch (n) {', '    case 1:', "      log.push('one');", '      break;', '    case 2:', "      log.push('two');", '      break;', '  }', '}'];
-    // `case 2:` moved above case 1's break: case 1 falls through into it.
-    expect(lineDiff(cases.join('\n'), swap(cases, 4), 'src/a.ts').changed).toContain(6);
-    const callbacks = ['export function k(on: (a: () => void, b: () => void) => void, log: string[]) {', '  on(() => {', "    log.push('a');", '  }, () => {', "    log.push('b');", "    log.push('c');", '  });', '}'];
-    // `}, () => {` moved below log.push('b'): b now runs in the first callback.
-    expect(lineDiff(callbacks.join('\n'), swap(callbacks, 3), 'src/a.ts').changed).toContain(4);
-    const classes = ['export class A {', '  x = 1;', '}', 'export class B {', '  y = 2;', '}'];
-    expect(lineDiff(classes.join('\n'), [classes[0], classes[1], classes[4], classes[2], classes[3], classes[5]].join('\n'), 'src/a.ts').changed).toContain(3);
-  });
-
-  it('counts a line moved between two holders of the same part whose opening lines were both edited', () => {
-    const methods = ['export class S {', '  start(log: string[]) {', "    log.push('a');", '  }', '  stop(log: string[]) {', "    log.push('b');", "    log.push('c');", '  }', '}'];
-    const asyncMethods = ['export class S {', '  async start(log: string[]) {', "    log.push('a');", "    log.push('b');", '  }', '  async stop(log: string[]) {', "    log.push('c');", '  }', '}'];
-    expect(lineDiff(methods.join('\n'), asyncMethods.join('\n'), 'src/a.ts').changed).toContain(4);
-    const ifs = ['export function f(a: number, b: number, log: string[]) {', '  if (a) {', "    log.push('x');", '  }', '  if (b) {', "    log.push('y');", "    log.push('z');", '  }', '}'];
-    expect(lineDiff(ifs.join('\n'), [ifs[0], '  if (a > 0) {', ifs[2], ifs[5], '  }', '  if (b > 0) {', ifs[6], '  }', '}'].join('\n'), 'src/a.ts').changed).toContain(4);
-    // Both conditions edited and nothing moved: only the conditions.
-    expect(lineDiff(ifs.join('\n'), [ifs[0], '  if (a > 0) {', ...ifs.slice(2, 4), '  if (b > 0) {', ...ifs.slice(5)].join('\n'), 'src/a.ts').changed).toEqual([2, 5]);
-    const callbacks = ['export function k(on: (a: () => void, b: () => void) => void, log: string[]) {', '  on(() => {', "    log.push('a');", '  }, () => {', "    log.push('b');", "    log.push('c');", '  });', '}'];
-    expect(lineDiff(callbacks.join('\n'), [callbacks[0], '  on(async () => {', callbacks[2], callbacks[4], '  }, async () => {', ...callbacks.slice(5)].join('\n'), 'src/a.ts').changed).toContain(4);
-    const cases = ['export function h(n: number, log: string[]) {', '  switch (n) {', '    case 1:', "      log.push('one');", '    case 2:', "      log.push('two');", '      break;', '  }', '}'];
-    expect(lineDiff(cases.join('\n'), [cases[0], cases[1], '    case 10:', cases[3], cases[5], '    case 20:', ...cases.slice(6)].join('\n'), 'src/a.ts').changed).toContain(5);
-  });
-
-  it("counts a line moved between two calls' arguments or two arrows' expression bodies", () => {
-    // `), bar(` moved below two of bar's arguments: they are foo's now.
-    const head = 'export function m(outer: (...x: unknown[]) => void, foo: (...x: number[]) => number, bar: (...x: number[]) => number) {';
-    const calls = [head, '  outer(foo(', '    1,', '  ), bar(', '    2,', '    20,', '    3,', '  ));', '}'];
-    expect(lineDiff(calls.join('\n'), [head, '  outer(foo(', '    1,', '    2,', '    20,', '  ), bar(', '    3,', '  ));', '}'].join('\n'), 'src/a.ts').changed).toEqual([4, 5, 6]);
-    const arrows = ['export const k = (on: (a: () => number, b: () => number) => void, x: number, y: number) =>', '  on(() => (', '    x', '  ), () => (', '    y', '    + 1', '  ));'];
-    expect(lineDiff(arrows.join('\n'), [arrows[0], arrows[1], arrows[2], arrows[4], arrows[3], arrows[5], arrows[6]].join('\n'), 'src/a.ts').changed).toContain(4);
-  });
-
-  it('counts no line a change only wraps or renames the holder of, and numbers lines as the diff does', () => {
-    const fn = ['export function sum(items: number[]) {', '  let total = 0;', '  for (const n of items) total += n;', '  return total;', '}'];
-    expect(lineDiff(fn.join('\n'), ['export const sum = (items: number[]) => {', ...fn.slice(1, 4), '};'].join('\n'), 'src/a.ts').changed).toEqual([1, 5]);
-    const call = ['export async function m(send: (a: number, b: number) => Promise<void>) {', '  send(', '    1,', '    2,', '  );', '}'];
-    expect(lineDiff(call.join('\n'), [call[0], '  await send(', ...call.slice(2)].join('\n'), 'src/a.ts').changed).toEqual([2]);
-    const table = ['export const table = {', '  a: 1,', '  b: 2,', '};'];
-    expect(lineDiff(table.join('\n'), ['export const table = Object.freeze({', '  a: 1,', '  b: 2,', '});'].join('\n'), 'src/a.ts').changed).toEqual([1, 4]);
-    const cls = ['export class A {', '  x = 1;', '  y() { return 2; }', '}'];
-    expect(lineDiff(cls.join('\n'), ['@sealed', ...cls].join('\n'), 'src/a.ts').changed).toEqual([1]);
-    // A base that holds U+2028 (TypeScript counts it as a line break, the diff does not).
-    const ls = String.fromCharCode(0x2028);
-    const base = ['export function q(log: string[]) {', `  const s = 'a${ls}b';`, '  log.push(s);', '  if (s) {', "    log.push('x');", '  }', "  log.push('y');", '}'];
-    expect(lineDiff(base.join('\n'), [base[0], "  const s = 'ab';", ...base.slice(2, 6), "  log.push('y!');", base[7]].join('\n'), 'src/a.ts').changed).toEqual([2, 7]);
-    // A line that was inside a template and is code now.
-    expect(lineDiff(['export const t = `', 'run();', '`;'].join('\n'), ['export const t = 1;', 'run();', ''].join('\n'), 'src/a.ts').changed).toContain(2);
+    // The bracket moved below release(): release() now runs only when ready, and only the bracket line changed.
+    const moved = [into[0], into[1], into[2], into[4], into[3], into[5], into[6]].join('\n');
+    const { changed } = lineDiff(into.join('\n'), moved);
+    expect(changed).toEqual([5]);
+    expect(bracketLines('src/a.ts', moved, changed)).toEqual([5]);
+    const lines = ['export function k(on: (f: () => void, g: () => void) => void, log: string[]) {', '  on(() => {', "    log.push('a');", '  }, () => {', '  });', '  if (log.length > 0) {', '  } else {', '  }', '  log.push(String(1),', '  );', '}'];
+    // Brackets and separators only: not an else, a callback's start or a line with a call.
+    expect(bracketLines('src/a.ts', lines.join('\n'), lines.map((_, i) => i + 1))).toEqual([5, 8, 10, 11]);
   });
 
   it('names a submodule, and a file whose name Stryker would read as a glob, with the reason', () => {
@@ -496,16 +428,25 @@ describe('the change', () => {
     expect(plan().targets.map(t => t.file).sort()).toEqual(['src/a.ts', 'src/b.ts']);
   });
 
-  it('keeps out of a sandbox what git ignores and every untracked git repository, with the .env git never lists', () => {
-    const { repo, git, write } = repoWith({ '.gitignore': '.env\nnode_modules/\n', 'src/a.ts': text(lines('a', 3)) });
+  it('keeps out of a sandbox what git ignores, every untracked git repository and what a submodule ignores, or names what it cannot', () => {
+    const sub = repoWith({ '.gitignore': '.env\n', 'index.ts': text(lines('s', 2)) });
+    const { repo, git, write } = repoWith({ '.gitignore': '.env\nnode_modules/\nbackup*/\n', 'src/a.ts': text(lines('a', 3)) });
+    git(['-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', sub.repo.split(path.sep).join('/'), 'src/sub']);
     write('.env', 'TOKEN=x\n');
     write('node_modules/x/index.js', '');
+    write('backup[1]/.env', 'TOKEN=z\n');
     write('src/fresh/b.ts', text(lines('b', 2)));
-    write('src/mod/index.ts', text(lines('m', 2)));
-    write('src/mod/.gitignore', '.env\n');
-    write('src/mod/.env', 'TOKEN=y\n');
-    git(['-C', path.join(repo, 'src', 'mod'), 'init', '-q']);
-    expect(sandboxIgnores((...args: string[]) => git(args)).sort()).toEqual(['/.env', '/dist/', '/src/mod/']);
+    write('src/sub/.env', 'TOKEN=s\n');
+    for (const name of ['mod', 'm{1,2}']) {
+      write(`src/${name}/index.ts`, text(lines('m', 2)));
+      write(`src/${name}/.gitignore`, '.env\n');
+      write(`src/${name}/.env`, 'TOKEN=y\n');
+      git(['-C', path.join(repo, 'src', name), 'init', '-q']);
+    }
+    const { patterns, unkept } = sandboxIgnores((...args: string[]) => git(args), repo);
+    // Each pattern as Stryker's matcher reads it: a bracket escaped; a brace cannot be, so that path is named.
+    expect(patterns.sort()).toEqual(['/.env', '/backup[[]1[]]/', '/dist/', '/src/mod/', '/src/sub/.env']);
+    expect(unkept).toEqual(['src/m{1,2}/']);
   });
 
   it('fingerprints the tree a run reads, and names what changed in it', () => {

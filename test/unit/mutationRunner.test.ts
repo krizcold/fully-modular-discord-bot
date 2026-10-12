@@ -233,9 +233,16 @@ describe('the run with no mutant after the reruns', () => {
 });
 
 describe('the tree fingerprint', () => {
+  it('ends the gate NO RESULT, exit 2, when git cannot list the tree', () => {
+    const run = spawnSync(process.execPath, [path.join(root, 'test', 'mutation', 'touched.mjs'), '--concurrency', '1'],
+      { cwd: root, encoding: 'utf8', env: { ...process.env, GIT_DIR: path.join(os.tmpdir(), `smdb-no-git-${process.pid}`) } });
+    expect(run.status).toBe(2);
+    expect(run.stdout).toMatch(/^Verdict: NO RESULT \(the gate could not read the tree: /m);
+  });
+
   it('is taken, in the gate, before it reads a file: the --mutate checks and the plan', () => {
     const gate = fs.readFileSync(path.join(root, 'test', 'mutation', 'touched.mjs'), 'utf8');
-    const print = gate.indexOf('const planned = treePrint(');
+    const print = gate.indexOf('planned = treePrint(');
     expect(print).toBeGreaterThan(0);
     expect(print).toBeLessThan(gate.indexOf('opts.mutate = opts.mutate.map('));
     expect(print).toBeLessThan(gate.indexOf('planFromGit({'));

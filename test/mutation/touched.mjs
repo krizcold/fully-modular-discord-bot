@@ -53,7 +53,7 @@ try {
   console.error(`Verdict: NO RESULT (the gate could not load: ${error instanceof Error ? error.message.split('\n')[0] : String(error)}; run npm run test:install)`);
   process.exit(2);
 }
-const { DATA_ROUTE_WHY, EXTRA_BREAK_WHY, gates, holdsDataRoute, holdsExtraBreak, linesOfTarget, notMutated, planFromGit, sandboxIgnores, unmatchedPatterns, untouched } = ranges;
+const { bracketLines, DATA_ROUTE_WHY, EXTRA_BREAK_WHY, gates, holdsDataRoute, holdsExtraBreak, linesOfTarget, notMutated, planFromGit, sandboxIgnores, unmatchedPatterns, untouched } = ranges;
 const { byKiller, classifyKill, judge, outcome, toConfirm, toPassB } = verdicts;
 
 const USAGE = 'usage: node test/mutation/touched.mjs [--base REF] [--mutate PATTERN]... [--concurrency N] [--keep]';
@@ -84,7 +84,17 @@ const posix = file => file.split(path.sep).join('/');
 // files that make it: what the sandboxes copy, the tracked files and the
 // untracked ones git does not ignore. An edit saved from here on shows at the end.
 const treeFiles = () => git('ls-files', '-z', '--cached', '--others', '--exclude-standard').split('\0').filter(Boolean);
-const planned = treePrint(root, treeFiles());
+/** @type {Map<string, string>} */
+let planned;
+try {
+  planned = treePrint(root, treeFiles());
+} catch (error) {
+  console.log(`Verdict: NO RESULT (the gate could not read the tree: ${error instanceof Error ? error.message.split('\n')[0] : String(error)})`);
+  process.exit(2);
+}
+// A mutant id set in the shell would make every run with no mutant a mutant's
+// run: Stryker passes its own env on to the command it runs.
+delete process.env.__STRYKER_ACTIVE_MUTANT__;
 // A pattern is a file, or a file and lines; one with columns names no file, so it is refused.
 /** @param {string} pattern */
 const fileOfPattern = pattern => pattern.replace(/:\d+-\d+$/, '');
@@ -232,10 +242,8 @@ async function pass({ name, dir, tier, mutate, files, only = [], keys, extra }) 
   try {
     return await new Stryker({ ...common, mutate, ...extra }).runMutationTest();
   } catch (error) {
-    const lines = [`pass ${dir} could not run: ${error instanceof Error ? error.message.split('\n')[0] : String(error)}`, ...dryFailures(dir)];
-    // runner.mjs refused the files as the pass copied them (a way to /data).
-    try { lines.push(fs.readFileSync(path.join(out, 'dry-refused.txt'), 'utf8').trim()); } catch { /* not refused */ }
-    if (fs.readdirSync(out).some(f => f.startsWith('dry-'))) lines.push(`the run with no mutant logged to ${posix(path.relative(root, out))}/dry-*.log`);
+    const lines = [`pass ${dir} could not run: ${error instanceof Error ? error.message.split('\n')[0] : String(error)}`, ...dryFailures(dir), ...refusalIn(out)];
+    if (fs.readdirSync(out).some(f => f.startsWith('dry-') && f.endsWith('.log'))) lines.push(`the run with no mutant logged to ${posix(path.relative(root, out))}/dry-*.log`);
     throw new PassError(lines.join('\n'));
   }
 }
@@ -268,9 +276,23 @@ async function control(after, tier, on, only, timed = false) {
       const result = m.passes[after];
       if (result) m.passes[after] = { ...result, voided: why };
     }
-    throw new PassError([`${why} (${failed}), so what its reruns counted cannot be told from the machine's failures`, ...dryFailures(name), `its logs: ${logs}`].join('\n'));
+    const refusal = refusalIn(out);
+    throw new PassError([
+      refusal.length > 0 ? `${why}: it refused the files the reruns ran on` : `${why} (${failed}), so what its reruns counted cannot be told from the machine's failures`,
+      ...dryFailures(name), ...refusal, ...(fs.readdirSync(out).some(f => f.endsWith('.log')) ? [`its logs: ${logs}`] : []),
+    ].join('\n'));
   }
   controls.push(`after pass ${after}: passed (${logs})`);
+}
+
+/**
+ * runner.mjs's refusal of the files a run with no mutant was given (a way to
+ * /data), if it refused them.
+ * @param {string} dir the run's report dir
+ * @returns {string[]}
+ */
+function refusalIn(dir) {
+  try { return [fs.readFileSync(path.join(dir, 'dry-refused.txt'), 'utf8').trim()]; } catch { return []; }
 }
 
 /** @param {MutantRecord} m */
@@ -315,18 +337,22 @@ function finish(stopped) {
 function report(stopped) {
   /** @type {{ file: string, lines: number[] }[]} */
   const noMutant = [];
+  /** @type {{ file: string, lines: number[] }[]} */
+  const brackets = [];
   const unmatched = stopped && mutants.length === 0 ? [] : unmatchedPatterns(targets, mutants);
   for (const target of targets) {
     const made = mutants.filter(m => m.file === target.file);
     if (stopped && mutants.length === 0) continue;
     const text = linesOf(target.file).join('\n');
+    const moved = target.gating ? bracketLines(target.file, text, target.gating) : [];
+    if (moved.length > 0) brackets.push({ file: target.file, lines: moved });
     /** @type {[number, number][]} */
     const spans = made.map(m => [m.location.start.line, m.location.end.line]);
     const lines = untouched(target.file, text, linesOfTarget(target, text.split('\n').length), spans);
     if (lines.length > 0) noMutant.push({ file: target.file, lines });
   }
   const seed = process.env.SMDB_TEST_SEED;
-  const result = judge({ stamp, scope: `${scope}; fast-check seed ${seed}`, emptyScope, skipped, mutants, noMutant, unmatched, report: posix(path.relative(root, reportDir)), stopped, controls, standIn: process.env.SMDB_MUTATION_VITEST });
+  const result = judge({ stamp, scope: `${scope}; fast-check seed ${seed}`, emptyScope, skipped, mutants, noMutant, brackets, unmatched, report: posix(path.relative(root, reportDir)), stopped, controls, standIn: process.env.SMDB_MUTATION_VITEST });
   fs.mkdirSync(reportDir, { recursive: true });
   fs.writeFileSync(path.join(reportDir, 'mutants.json'), `${JSON.stringify({ scope, seed, skipped, targets, mutants, controls, verdict: result.verdict, stopped }, null, 2)}\n`);
   fs.writeFileSync(path.join(reportDir, 'summary.txt'), `${result.lines.join('\n')}\n`);
@@ -349,7 +375,11 @@ try {
   // The sandbox holds the tracked files and the untracked ones git does not
   // ignore (ranges.mjs sandboxIgnores). The temp dir ignores itself, so git
   // status stays clean.
-  common.ignorePatterns = sandboxIgnores(git);
+  const sandbox = sandboxIgnores(git, root);
+  if (sandbox.unkept.length > 0) {
+    throw new PassError(`the gate cannot keep ${sandbox.unkept.join(', ')} out of a sandbox, for Stryker would read the name as a glob; rename or remove it`);
+  }
+  common.ignorePatterns = sandbox.patterns;
   fs.mkdirSync(path.join(root, '.stryker-tmp'), { recursive: true });
   fs.writeFileSync(path.join(root, '.stryker-tmp', '.gitignore'), '*\n');
 

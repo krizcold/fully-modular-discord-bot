@@ -88,8 +88,9 @@ describe('the touched-line mutation gate', () => {
    * stand-in's own JavaScript, with `file` its report's path, `pass` its
    * pass's dir name (`control-a2` for the run with no mutant after the
    * reruns) and `mutant` the active mutant; its `message`, if any, fails it.
+   * The gate mutates `pattern`, by default one line of the bite's target.
    */
-  function standInRun(code: string) {
+  function standInRun(code: string, pattern?: string) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-control-'));
     const fake = path.join(dir, 'vitest.cjs');
     fs.writeFileSync(fake, [
@@ -106,8 +107,9 @@ describe('the touched-line mutation gate', () => {
       '',
     ].join('\n'));
     const line = lineOf("return (process.env.FLEET_BACKUP_MODE || '').trim().toLowerCase() === 'active';");
-    const run = spawnSync(process.execPath, [path.join(root, 'test', 'mutation', 'touched.mjs'), '--mutate', `${TARGET}:${line}-${line}`, '--concurrency', '1'],
-      { cwd: root, encoding: 'utf8', timeout: 580_000, env: { ...process.env, SMDB_MUTATION_VITEST: fake } });
+    // A mutant id left in the shell, which the gate must ignore.
+    const run = spawnSync(process.execPath, [path.join(root, 'test', 'mutation', 'touched.mjs'), '--mutate', pattern ?? `${TARGET}:${line}-${line}`, '--concurrency', '1'],
+      { cwd: root, encoding: 'utf8', timeout: 580_000, env: { ...process.env, SMDB_MUTATION_VITEST: fake, __STRYKER_ACTIVE_MUTANT__: '3' } });
     fs.rmSync(dir, { recursive: true, force: true });
     const reportDir = /^Report: (\S+)/m.exec(run.stdout)?.[1];
     expect(reportDir, `${run.stdout}\n${run.stderr}`).toBeDefined();
@@ -161,25 +163,44 @@ describe('the touched-line mutation gate', () => {
     expect(run.stdout).not.toMatch(/^Timeouts /m);
   });
 
+  /**
+   * A stand-in gate run on a throwaway untracked file in src (never a tracked
+   * one: a run cut short leaves it behind) that gains a way to /data in the
+   * checkout during pass `when`'s mutant runs.
+   */
+  function probeRun(when: 'a' | 'a2') {
+    const src = path.join(root, 'src');
+    for (const old of fs.readdirSync(src).filter(name => name.startsWith('smdb-bite-probe-'))) fs.rmSync(path.join(src, old), { force: true });
+    const probe = `src/smdb-bite-probe-${process.pid}.ts`;
+    fs.writeFileSync(path.join(root, probe), 'export function smdbProbe(a: number): number {\n  return a + 1;\n}\n');
+    try {
+      const { run } = standInRun([
+        `const probe = ${JSON.stringify(path.join(root, probe))};`,
+        `if (pass === '${when}' && mutant && !fs.readFileSync(probe, 'utf8').includes('smdbRoute')) fs.appendFileSync(probe, "export const smdbRoute = 'DATA_DIR';\\n");`,
+      ].join('\n'), probe);
+      return { run, probe };
+    } finally {
+      fs.rmSync(path.join(root, probe), { force: true });
+    }
+  }
+
   it('refuses a way to /data that a file gains after the plan, before any mutant runs on it', { timeout: 600_000 }, () => {
-    // A mutant's run in pass A adds one to the target in the checkout, so pass
-    // A2 copies it; the target's text is put back after the run.
-    const target = path.join(root, TARGET);
-    const original = fs.readFileSync(target, 'utf8');
-    const { run } = (() => {
-      try {
-        return standInRun([
-          `const target = ${JSON.stringify(target)};`,
-          "if (pass === 'a' && mutant && !fs.readFileSync(target, 'utf8').includes('smdbProbe')) fs.appendFileSync(target, \"export const smdbProbe = 'DATA_DIR';\\n\");",
-        ].join('\n'));
-      } finally {
-        fs.writeFileSync(target, original);
-      }
-    })();
+    // Gained during pass A: pass A2 copies it, and its run with no mutant refuses it.
+    const { run, probe } = probeRun('a');
     expect(run.status).toBe(2);
     expect(run.stdout).toMatch(/^Stopped:\n {2}pass a2 could not run: /m);
-    expect(run.stdout).toContain(`\n  ${TARGET}: it reads DATA_DIR or holds the '/data' fallback`);
-    expect(run.stdout).toContain(`  the tree changed during the run, so no one tree was tested: ${TARGET}`);
+    expect(run.stdout).toContain(`\n  ${probe}: it reads DATA_DIR or holds the '/data' fallback`);
+    expect(run.stdout).not.toContain('a2/dry-*.log');
+    expect(run.stdout).toContain(`  the tree changed during the run, so no one tree was tested: ${probe}`);
+  });
+
+  it('refuses it in the run with no mutant after the reruns, too, and says so', { timeout: 600_000 }, () => {
+    // Gained during pass A2's reruns, which ran on the copy without it: the run after them, in the checkout, refuses it.
+    const { run, probe } = probeRun('a2');
+    expect(run.status).toBe(2);
+    expect(run.stdout).toMatch(/^Stopped:\n {2}the run with no mutant after pass a2 failed: it refused the files the reruns ran on$/m);
+    expect(run.stdout).toContain(`\n  ${probe}: it reads DATA_DIR or holds the '/data' fallback`);
+    expect(run.stdout).not.toContain('its logs:');
   });
 
   it('has no result, exit 2, when its base is unknown or its patterns make no mutant, and refuses a glob or a missing file', { timeout: 300_000 }, () => {

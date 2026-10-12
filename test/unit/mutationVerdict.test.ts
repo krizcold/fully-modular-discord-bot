@@ -179,12 +179,14 @@ describe('the verdict', () => {
       skipped: [{ file: 'src/webui/public/app.jsx', why: 'a browser view' }],
       unmatched: ['src/missing.ts:1-2'],
       noMutant: [{ file: 'src/a.ts', lines: [4, 9] }],
+      brackets: [{ file: 'src/a.ts', lines: [5] }],
     });
     expect(none).toMatchObject({ verdict: 'NO RESULT', code: 2 });
     const text = none.lines.join('\n');
     expect(text).toContain('  src/webui/public/app.jsx: a browser view');
     expect(text).toContain('  src/missing.ts:1-2');
-    expect(text).toMatch(/^Changed lines of code no mutant lies wholly on \(.*the code lines of a multi-line object, array, arrow body, call or condition with no mutant of their own; a line of brackets and separators only is never listed\):\n {2}src\/a\.ts: 4, 9$/m);
+    expect(text).toMatch(/^Changed lines of code no mutant lies wholly on \(.*the code lines of a multi-line object, array, arrow body, call or condition with no mutant of their own; a line of brackets and separators only is listed apart\):\n {2}src\/a\.ts: 4, 9$/m);
+    expect(text).toMatch(/^Changed lines of brackets and separators only \(each can move the unchanged lines beside it into or out of a block, and those lines are not gated; check them\):\n {2}src\/a\.ts: 5$/m);
   });
 
   it('has no result when a test replaced vitest, whatever the mutants did', () => {

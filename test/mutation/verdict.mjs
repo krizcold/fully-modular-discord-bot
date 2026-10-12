@@ -162,8 +162,9 @@ export const toPassB = mutants => mutants.filter(m => m.gating && ['Survived', '
  * `standIn` is set when a test replaced vitest (runner.mjs's
  * SMDB_MUTATION_VITEST): such a run proves nothing about the code.
  * @param {{ stamp: string, scope: string, emptyScope: boolean, skipped: { file: string, why: string }[], mutants: MutantRecord[],
- *   noMutant: { file: string, lines: number[] }[], unmatched: string[], report: string, stopped?: string[], controls?: string[],
- *   standIn?: string }} run
+ *   noMutant: { file: string, lines: number[] }[], brackets?: { file: string, lines: number[] }[], unmatched: string[], report: string,
+ *   stopped?: string[], controls?: string[], standIn?: string }} run
+ *   brackets: the changed lines of brackets and separators only
  * @returns {{ verdict: 'PASS' | 'FAIL' | 'NO RESULT', code: 0 | 1 | 2, lines: string[] }}
  */
 export function judge(run) {
@@ -207,8 +208,10 @@ export function judge(run) {
     `Mutated: ${made.length > 0 ? made.join(', ') : 'nothing'}`,
     ...(run.skipped.length > 0 ? ['Not mutated:', ...run.skipped.map(s => `  ${s.file}: ${s.why}`)] : []),
     ...(run.unmatched.length > 0 ? ['Patterns that made no mutant:', ...run.unmatched.map(p => `  ${p}`)] : []),
-    ...(run.noMutant.length > 0 ? ['Changed lines of code no mutant lies wholly on (L5 says nothing about them; types, imports, signatures, and the code lines of a multi-line object, array, arrow body, call or condition with no mutant of their own; a line of brackets and separators only is never listed):',
+    ...(run.noMutant.length > 0 ? ['Changed lines of code no mutant lies wholly on (L5 says nothing about them; types, imports, signatures, and the code lines of a multi-line object, array, arrow body, call or condition with no mutant of their own; a line of brackets and separators only is listed apart):',
       ...run.noMutant.map(n => `  ${n.file}: ${n.lines.join(', ')}`)] : []),
+    ...((run.brackets ?? []).length > 0 ? ['Changed lines of brackets and separators only (each can move the unchanged lines beside it into or out of a block, and those lines are not gated; check them):',
+      ...(run.brackets ?? []).map(n => `  ${n.file}: ${n.lines.join(', ')}`)] : []),
     `Gating mutants (they touch a changed line): ${gating.length}: ${tally(gating)}`,
     `  killed in pass A: ${gating.filter(m => !m.passes.b && outcome(m) === 'Killed').length}; sent to pass B: ${gating.filter(m => m.passes.b).length}, killed there: ${gating.filter(m => m.passes.b && outcome(m) === 'Killed').length}`,
     ...section('Survivors (each needs a test that kills it, or a justification in the notes):', [...gatingAt('Survived'), ...gatingAt('NoCoverage'), ...gatingAt('Missing')]),
