@@ -1,5 +1,6 @@
-import { execFileSync } from 'child_process';
+import { execFileSync, spawnSync } from 'child_process';
 import fs from 'fs';
+import { createRequire } from 'module';
 import os from 'os';
 import path from 'path';
 import { Instrumenter } from '@stryker-mutator/instrumenter';
@@ -9,7 +10,7 @@ import { describe, expect, it, onTestFinished } from 'vitest';
 import { canonicalName } from '../mutation/keys.mjs';
 import {
   changeTarget, codeLines, commonLines, gates, inPattern, lineDiff, linesOfTarget, mergeRanges, notMutated, parseNameStatus, planChange, planFromGit,
-  unmatchedPatterns, untouched, wholeTarget, DATA_ROUTE_WHY, GLOB_NAME_WHY, holdsDataRoute,
+  unmatchedPatterns, untouched, wholeTarget, DATA_ROUTE_WHY, GLOB_NAME_WHY, holdsDataRoute, sandboxIgnores,
 } from '../mutation/ranges.mjs';
 import { treeChanges, treePrint } from '../mutation/tree.mjs';
 
@@ -337,6 +338,29 @@ describe('the change', () => {
     expect(lineDiff(classes.join('\n'), [classes[0], classes[1], classes[4], classes[2], classes[3], classes[5]].join('\n'), 'src/a.ts').changed).toContain(3);
   });
 
+  it('counts a line moved between two holders of the same part whose opening lines were both edited', () => {
+    const methods = ['export class S {', '  start(log: string[]) {', "    log.push('a');", '  }', '  stop(log: string[]) {', "    log.push('b');", "    log.push('c');", '  }', '}'];
+    const asyncMethods = ['export class S {', '  async start(log: string[]) {', "    log.push('a');", "    log.push('b');", '  }', '  async stop(log: string[]) {', "    log.push('c');", '  }', '}'];
+    expect(lineDiff(methods.join('\n'), asyncMethods.join('\n'), 'src/a.ts').changed).toContain(4);
+    const ifs = ['export function f(a: number, b: number, log: string[]) {', '  if (a) {', "    log.push('x');", '  }', '  if (b) {', "    log.push('y');", "    log.push('z');", '  }', '}'];
+    expect(lineDiff(ifs.join('\n'), [ifs[0], '  if (a > 0) {', ifs[2], ifs[5], '  }', '  if (b > 0) {', ifs[6], '  }', '}'].join('\n'), 'src/a.ts').changed).toContain(4);
+    // Both conditions edited and nothing moved: only the conditions.
+    expect(lineDiff(ifs.join('\n'), [ifs[0], '  if (a > 0) {', ...ifs.slice(2, 4), '  if (b > 0) {', ...ifs.slice(5)].join('\n'), 'src/a.ts').changed).toEqual([2, 5]);
+    const callbacks = ['export function k(on: (a: () => void, b: () => void) => void, log: string[]) {', '  on(() => {', "    log.push('a');", '  }, () => {', "    log.push('b');", "    log.push('c');", '  });', '}'];
+    expect(lineDiff(callbacks.join('\n'), [callbacks[0], '  on(async () => {', callbacks[2], callbacks[4], '  }, async () => {', ...callbacks.slice(5)].join('\n'), 'src/a.ts').changed).toContain(4);
+    const cases = ['export function h(n: number, log: string[]) {', '  switch (n) {', '    case 1:', "      log.push('one');", '    case 2:', "      log.push('two');", '      break;', '  }', '}'];
+    expect(lineDiff(cases.join('\n'), [cases[0], cases[1], '    case 10:', cases[3], cases[5], '    case 20:', ...cases.slice(6)].join('\n'), 'src/a.ts').changed).toContain(5);
+  });
+
+  it("counts a line moved between two calls' arguments or two arrows' expression bodies", () => {
+    // `), bar(` moved below two of bar's arguments: they are foo's now.
+    const head = 'export function m(outer: (...x: unknown[]) => void, foo: (...x: number[]) => number, bar: (...x: number[]) => number) {';
+    const calls = [head, '  outer(foo(', '    1,', '  ), bar(', '    2,', '    20,', '    3,', '  ));', '}'];
+    expect(lineDiff(calls.join('\n'), [head, '  outer(foo(', '    1,', '    2,', '    20,', '  ), bar(', '    3,', '  ));', '}'].join('\n'), 'src/a.ts').changed).toEqual([4, 5, 6]);
+    const arrows = ['export const k = (on: (a: () => number, b: () => number) => void, x: number, y: number) =>', '  on(() => (', '    x', '  ), () => (', '    y', '    + 1', '  ));'];
+    expect(lineDiff(arrows.join('\n'), [arrows[0], arrows[1], arrows[2], arrows[4], arrows[3], arrows[5], arrows[6]].join('\n'), 'src/a.ts').changed).toContain(4);
+  });
+
   it('counts no line a change only wraps or renames the holder of, and numbers lines as the diff does', () => {
     const fn = ['export function sum(items: number[]) {', '  let total = 0;', '  for (const n of items) total += n;', '  return total;', '}'];
     expect(lineDiff(fn.join('\n'), ['export const sum = (items: number[]) => {', ...fn.slice(1, 4), '};'].join('\n'), 'src/a.ts').changed).toEqual([1, 5]);
@@ -421,17 +445,67 @@ describe('the change', () => {
     expect(plan.skipped).toEqual([{ file: 'src/utils/paths/dataRoot.ts', why: DATA_ROUTE_WHY }, { file: 'src/c.ts', why: DATA_ROUTE_WHY }]);
   });
 
-  it('fails when a test names botManager, whose fork of the bot is a way to /data the gate does not close yet (mutation/README.md)', () => {
-    const named: string[] = [];
-    const walk = (dir: string) => {
-      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-        const full = path.join(dir, entry.name);
-        if (entry.isDirectory()) { if (!['node_modules', 'reports', '.stryker-tmp'].includes(entry.name)) walk(full); continue; }
-        if (/\.(ts|mjs|cjs|js)$/.test(entry.name) && full !== __filename && fs.readFileSync(full, 'utf8').includes('botManager')) named.push(path.relative(botRoot, full));
-      }
-    };
-    walk(path.join(botRoot, 'test'));
-    expect(named).toEqual([]);
+  it('refuses, in a test and in a child, a fork whose own env lacks DATA_DIR (helpers/forkGuard.cjs)', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-fork-'));
+    onTestFinished(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const script = path.join(dir, 'done.cjs');
+    fs.writeFileSync(script, 'process.exit(0);\n');
+    // In this test: through require and through an ES import, as src's `import { fork }` reads it.
+    const required = createRequire(__filename)('child_process') as typeof import('child_process');
+    const imported = await import('child_process');
+    for (const cp of [required, imported]) {
+      expect(() => cp.fork(script, [], { env: { PATH: process.env.PATH } })).toThrow(/lacks DATA_DIR/);
+      expect(() => cp.fork(script, { env: {} })).toThrow(/lacks DATA_DIR/);
+    }
+    const forked = imported.fork(script, [], { env: { ...process.env }, stdio: 'ignore' });
+    expect(await new Promise(resolve => forked.on('exit', resolve))).toBe(0);
+    // In a child that preloads it, as helpers/child.ts starts every scenario step.
+    const child = path.join(dir, 'child.cjs');
+    fs.writeFileSync(child, `require('child_process').fork(${JSON.stringify(script)}, [], { env: {} });\n`);
+    const guard = path.join(botRoot, 'test', 'helpers', 'forkGuard.cjs');
+    const run = spawnSync(process.execPath, ['--require', guard, child], { encoding: 'utf8' });
+    expect(run.status).not.toBe(0);
+    expect(run.stderr).toContain('lacks DATA_DIR would take /data as its data root');
+    // In an ES module that took child_process's exports before the guard loaded.
+    const early = path.join(dir, 'early.mjs');
+    fs.writeFileSync(early, [
+      "import * as cp from 'child_process';",
+      "import { createRequire } from 'module';",
+      `createRequire(import.meta.url)(${JSON.stringify(guard)});`,
+      `cp.fork(${JSON.stringify(script)}, [], { env: {} });`,
+      '',
+    ].join('\n'));
+    const esm = spawnSync(process.execPath, [early], { encoding: 'utf8' });
+    expect(esm.status).not.toBe(0);
+    expect(esm.stderr).toContain('lacks DATA_DIR would take /data as its data root');
+  });
+
+  it('looks at every file itself, whatever a file-system monitor says', () => {
+    const { repo, git, write, plan } = repoWith({ 'src/a.ts': text(lines('a', 3)), 'src/b.ts': text(lines('b', 3)) });
+    // A monitor (protocol 2) that says nothing changed but a.ts.
+    const hook = path.join(repo, '.git', 'monitor.sh');
+    fs.writeFileSync(hook, "#!/bin/sh\nprintf 'token\\0src/a.ts\\0'\n");
+    fs.chmodSync(hook, 0o755);
+    git(['config', 'core.fsmonitor', hook.split(path.sep).join('/')]);
+    git(['config', 'core.fsmonitorHookVersion', '2']);
+    git(['update-index', '--fsmonitor']);
+    git(['status', '--porcelain']);
+    for (const name of ['a', 'b']) write(`src/${name}.ts`, text(lines(name, 3).map((line, i) => (i === 1 ? `${line} // edited` : line))));
+    // git itself misses b.ts here.
+    expect(git(['diff', '--name-only'])).not.toContain('src/b.ts');
+    expect(plan().targets.map(t => t.file).sort()).toEqual(['src/a.ts', 'src/b.ts']);
+  });
+
+  it('keeps out of a sandbox what git ignores and every untracked git repository, with the .env git never lists', () => {
+    const { repo, git, write } = repoWith({ '.gitignore': '.env\nnode_modules/\n', 'src/a.ts': text(lines('a', 3)) });
+    write('.env', 'TOKEN=x\n');
+    write('node_modules/x/index.js', '');
+    write('src/fresh/b.ts', text(lines('b', 2)));
+    write('src/mod/index.ts', text(lines('m', 2)));
+    write('src/mod/.gitignore', '.env\n');
+    write('src/mod/.env', 'TOKEN=y\n');
+    git(['-C', path.join(repo, 'src', 'mod'), 'init', '-q']);
+    expect(sandboxIgnores((...args: string[]) => git(args)).sort()).toEqual(['/.env', '/dist/', '/src/mod/']);
   });
 
   it('fingerprints the tree a run reads, and names what changed in it', () => {

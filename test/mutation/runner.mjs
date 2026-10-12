@@ -43,6 +43,8 @@ function tier(project, args) {
       stdio: ['ignore', log, log],
       env: { ...process.env, SMDB_TEST_TIME_SCALE: confirm ? '4' : '1' },
     });
+    // A command line past the platform's limit, for one, starts nothing: say so where the report points.
+    if (run.error) fs.writeSync(log, `runner.mjs could not start vitest: ${run.error.message}\n`);
     return run.status === 0 ? 0 : 1;
   } finally {
     fs.closeSync(log);
@@ -66,6 +68,17 @@ if (runIds && mutant !== 'dry') {
   try { ids = JSON.parse(fs.readFileSync(runIds, 'utf8')); } catch { ids = null; }
   if (Array.isArray(ids) && !ids.includes(mutant)) process.exit(0);
 }
+// The run with no mutant comes first in every pass: here the files as the pass
+// copied them must hold no way to /data, whatever changed since the gate
+// planned (ranges.mjs holdsDataRoute; an instrumented file still names it).
+if (mutant === 'dry') {
+  const { DATA_ROUTE_WHY, holdsDataRoute } = await import('./ranges.mjs');
+  const routes = files.filter(file => { try { return holdsDataRoute(file, fs.readFileSync(file, 'utf8')); } catch { return false; } });
+  if (routes.length > 0) {
+    fs.writeFileSync(path.join(out, 'dry-refused.txt'), `${routes.map(file => path.relative(root, file).split(path.sep).join('/')).join(', ')}: ${DATA_ROUTE_WHY}\n`);
+    process.exit(1);
+  }
+}
 /**
  * Ends the run. A run with no mutant leaves its time, which the run with no
  * mutant after a rerun's timeouts is held to (touched.mjs).
@@ -82,5 +95,6 @@ if (only.length > 0) {
   }
   end(0);
 }
-const related = ['related', ...files, '--run'];
+// Relative to test/: more files fit on a command line than with the sandbox's absolute paths.
+const related = ['related', ...files.map(file => path.relative(testDir, file).split(path.sep).join('/')), '--run'];
 end(pass === 'a' ? tier('fast', related) : tier('integration', related) || tier('child', ['run']));

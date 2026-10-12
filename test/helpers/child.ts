@@ -12,6 +12,8 @@ import { STEP_MS } from './time.mjs';
 export const botRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const DIST = path.join(botRoot, 'dist') + path.sep;
 const SCENARIOS = path.join(botRoot, 'test', 'child', 'scenarios');
+// Preloaded in every scenario step: a fork that would lose DATA_DIR throws.
+export const FORK_GUARD = path.join(botRoot, 'test', 'helpers', 'forkGuard.cjs');
 
 // A throwaway data dir for one test, removed when the test ends.
 export function freshDataDir(): string {
@@ -37,7 +39,7 @@ export function childEnv(dataDir: string): NodeJS.ProcessEnv {
 // exit, a timeout, or a bot module loaded from anywhere but this repo's dist.
 export function runScenario<T>(script: string, args: string[], dataDir: string, timeoutMs = STEP_MS): Promise<ScenarioRun<T>> {
   const env = childEnv(dataDir);
-  const child = spawn(process.execPath, [path.join(SCENARIOS, script), ...args], { cwd: dataDir, env, stdio: ['ignore', 'pipe', 'pipe'] });
+  const child = spawn(process.execPath, ['--require', FORK_GUARD, path.join(SCENARIOS, script), ...args], { cwd: dataDir, env, stdio: ['ignore', 'pipe', 'pipe'] });
   let stdout = '';
   let stderr = '';
   child.stdout.on('data', chunk => { stdout += chunk; });
@@ -55,7 +57,13 @@ export function runScenario<T>(script: string, args: string[], dataDir: string, 
         reject(new Error(`scenario ${script} ${args.join(' ')} exited ${code ?? signal} with ${line ? 'a' : 'no'} RESULT line\n${stderr}`));
         return;
       }
-      const run = JSON.parse(line.slice('RESULT '.length)) as ScenarioRun<T>;
+      const parsed = JSON.parse(line.slice('RESULT '.length)) as ScenarioRun<T>;
+      const guard = new Set([FORK_GUARD, fs.realpathSync(FORK_GUARD)]);
+      if (!parsed.loaded.some(file => guard.has(file))) {
+        reject(new Error(`scenario ${script} ran without ${FORK_GUARD} preloaded`));
+        return;
+      }
+      const run = { ...parsed, loaded: parsed.loaded.filter(file => !guard.has(file)) };
       const foreign = run.loaded.filter(file => !file.startsWith(DIST));
       if (run.loaded.length === 0 || foreign.length > 0) {
         reject(new Error(`scenario ${script} must load the bot from ${DIST}, but loaded ${run.loaded.length === 0 ? 'nothing' : foreign.join(', ')}`));

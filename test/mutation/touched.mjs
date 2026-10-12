@@ -53,7 +53,7 @@ try {
   console.error(`Verdict: NO RESULT (the gate could not load: ${error instanceof Error ? error.message.split('\n')[0] : String(error)}; run npm run test:install)`);
   process.exit(2);
 }
-const { DATA_ROUTE_WHY, EXTRA_BREAK_WHY, gates, holdsDataRoute, holdsExtraBreak, linesOfTarget, planFromGit, unmatchedPatterns, untouched } = ranges;
+const { DATA_ROUTE_WHY, EXTRA_BREAK_WHY, gates, holdsDataRoute, holdsExtraBreak, linesOfTarget, notMutated, planFromGit, sandboxIgnores, unmatchedPatterns, untouched } = ranges;
 const { byKiller, classifyKill, judge, outcome, toConfirm, toPassB } = verdicts;
 
 const USAGE = 'usage: node test/mutation/touched.mjs [--base REF] [--mutate PATTERN]... [--concurrency N] [--keep]';
@@ -75,10 +75,16 @@ for (let i = 0; i < argv.length; i++) {
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 process.chdir(root);
+// No file-system monitor: git looks at every file itself, so one the monitor missed is still seen.
 /** @param {string[]} args */
-const git = (...args) => execFileSync('git', ['-c', 'core.quotePath=false', ...args], { cwd: root, encoding: 'utf8', maxBuffer: 256 * 1024 * 1024 });
+const git = (...args) => execFileSync('git', ['-c', 'core.quotePath=false', '-c', 'core.fsmonitor=false', ...args], { cwd: root, encoding: 'utf8', maxBuffer: 256 * 1024 * 1024 });
 /** @param {string} file */
 const posix = file => file.split(path.sep).join('/');
+// The tree as the gate found it before reading any file (tree.mjs), and the
+// files that make it: what the sandboxes copy, the tracked files and the
+// untracked ones git does not ignore. An edit saved from here on shows at the end.
+const treeFiles = () => git('ls-files', '-z', '--cached', '--others', '--exclude-standard').split('\0').filter(Boolean);
+const planned = treePrint(root, treeFiles());
 // A pattern is a file, or a file and lines; one with columns names no file, so it is refused.
 /** @param {string} pattern */
 const fileOfPattern = pattern => pattern.replace(/:\d+-\d+$/, '');
@@ -92,7 +98,7 @@ opts.mutate = opts.mutate.map(pattern => {
     process.exit(2);
   }
   const text = fs.readFileSync(path.join(root, name), 'utf8');
-  const why = holdsExtraBreak(text) ? EXTRA_BREAK_WHY : holdsDataRoute(name, text) ? DATA_ROUTE_WHY : null;
+  const why = holdsExtraBreak(text) ? EXTRA_BREAK_WHY : holdsDataRoute(name, text) ? DATA_ROUTE_WHY : notMutated(name);
   if (why) {
     console.error(`--mutate cannot take ${name}: ${why}`);
     process.exit(2);
@@ -119,11 +125,6 @@ let targets = [];
 let skipped = [];
 let scope = opts.mutate.length > 0 ? `the patterns ${opts.mutate.join(' ')}` : `the change from ${opts.base} to the working tree`;
 let emptyScope = false;
-// The tree as the gate planned it (tree.mjs), and the files that make it: what
-// the sandboxes copy, the tracked files and the untracked ones git does not ignore.
-/** @type {Map<string, string> | null} */
-let planned = null;
-const treeFiles = () => git('ls-files', '-z', '--cached', '--others', '--exclude-standard').split('\0').filter(Boolean);
 /** @type {MutantRecord[]} */
 let mutants = [];
 /** @type {string[]} */
@@ -232,6 +233,8 @@ async function pass({ name, dir, tier, mutate, files, only = [], keys, extra }) 
     return await new Stryker({ ...common, mutate, ...extra }).runMutationTest();
   } catch (error) {
     const lines = [`pass ${dir} could not run: ${error instanceof Error ? error.message.split('\n')[0] : String(error)}`, ...dryFailures(dir)];
+    // runner.mjs refused the files as the pass copied them (a way to /data).
+    try { lines.push(fs.readFileSync(path.join(out, 'dry-refused.txt'), 'utf8').trim()); } catch { /* not refused */ }
     if (fs.readdirSync(out).some(f => f.startsWith('dry-'))) lines.push(`the run with no mutant logged to ${posix(path.relative(root, out))}/dry-*.log`);
     throw new PassError(lines.join('\n'));
   }
@@ -297,7 +300,7 @@ async function passOn(name, dir, tier, on, extra, only) {
  */
 function finish(stopped) {
   try {
-    const changed = planned ? treeChanges(planned, treePrint(root, treeFiles())) : [];
+    const changed = treeChanges(planned, treePrint(root, treeFiles()));
     if (changed.length > 0) {
       stopped = [...(stopped ?? []), `the tree changed during the run, so no one tree was tested: ${changed.slice(0, 10).join(', ')}${changed.length > 10 ? ` and ${changed.length - 10} more` : ''}`];
     }
@@ -332,8 +335,6 @@ function report(stopped) {
 }
 
 try {
-  // Before the plan reads a file, so an edit saved from here on shows at the end.
-  planned = treePrint(root, treeFiles());
   // What to mutate: the explicit patterns (every mutant gates), or the change
   // from the merge-base of --base and HEAD to the working tree.
   if (opts.mutate.length > 0) {
@@ -346,11 +347,9 @@ try {
   if (targets.length === 0) finish();
 
   // The sandbox holds the tracked files and the untracked ones git does not
-  // ignore; everything git ignores stays out (.env, data dirs, dist, private
-  // module repos), node_modules aside, which Stryker links. The temp dir
-  // ignores itself, so git status stays clean.
-  const ignored = git('ls-files', '-z', '--others', '--ignored', '--exclude-standard', '--directory').split('\0').filter(Boolean);
-  common.ignorePatterns = [...new Set(['/dist/', ...ignored.filter(p => path.posix.basename(p.replace(/\/$/, '')) !== 'node_modules').map(p => `/${p}`)])];
+  // ignore (ranges.mjs sandboxIgnores). The temp dir ignores itself, so git
+  // status stays clean.
+  common.ignorePatterns = sandboxIgnores(git);
   fs.mkdirSync(path.join(root, '.stryker-tmp'), { recursive: true });
   fs.writeFileSync(path.join(root, '.stryker-tmp', '.gitignore'), '*\n');
 

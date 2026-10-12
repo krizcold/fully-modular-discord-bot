@@ -50,7 +50,24 @@ describe('a mutant run', () => {
     const calls = fake.read();
     expect(calls.map(call => call.project)).toEqual(['integration']);
     expect(calls[0]).toMatchObject({ scale: '1', mutant: '7' });
-    expect(calls[0].args).toEqual(expect.arrayContaining(['related', path.join(root, 'src', 'a.ts'), '--bail=1']));
+    expect(calls[0].args).toEqual(expect.arrayContaining(['related', '../src/a.ts', '--bail=1']));
+  });
+
+  it('refuses, before any mutant, a file that holds a way to /data as the pass copied it', () => {
+    const fake = fakeVitest([]);
+    const run = runner(fake, 'a', '', [], { __STRYKER_ACTIVE_MUTANT__: undefined, SMDB_MUTATION_FILES: '["src/utils/dataRoot.ts"]' });
+    expect(run.status).toBe(1);
+    expect(fs.readFileSync(path.join(fake.out, 'dry-refused.txt'), 'utf8')).toMatch(/^src\/utils\/dataRoot\.ts: it reads DATA_DIR or holds the '\/data' fallback/);
+    expect(fake.read()).toEqual([]);
+  });
+
+  it.runIf(process.platform === 'win32')('names a command line too long to start vitest in the run\'s log', () => {
+    const fake = fakeVitest([]);
+    const files: string[] = [];
+    while (JSON.stringify(files).length < 32_500) files.push(`src/${'x'.repeat(40)}${files.length}.ts`);
+    expect(runner(fake, 'a', '', [], { SMDB_MUTATION_FILES: JSON.stringify(files) }).status).toBe(1);
+    expect(fs.readFileSync(path.join(fake.out, '7-fast.log'), 'utf8')).toMatch(/^runner\.mjs could not start vitest: /);
+    expect(fake.read()).toEqual([]);
   });
 
   it('reruns pass A\'s tests with four times the time', () => {
@@ -216,12 +233,12 @@ describe('the run with no mutant after the reruns', () => {
 });
 
 describe('the tree fingerprint', () => {
-  it('is taken, in the gate, before the plan reads a file', () => {
+  it('is taken, in the gate, before it reads a file: the --mutate checks and the plan', () => {
     const gate = fs.readFileSync(path.join(root, 'test', 'mutation', 'touched.mjs'), 'utf8');
-    const body = gate.slice(gate.indexOf('\ntry {'));
-    const print = body.indexOf('planned = treePrint(');
+    const print = gate.indexOf('const planned = treePrint(');
     expect(print).toBeGreaterThan(0);
-    expect(print).toBeLessThan(body.indexOf('planFromGit('));
+    expect(print).toBeLessThan(gate.indexOf('opts.mutate = opts.mutate.map('));
+    expect(print).toBeLessThan(gate.indexOf('planFromGit({'));
   });
 });
 

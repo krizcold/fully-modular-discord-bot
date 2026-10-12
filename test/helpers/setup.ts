@@ -1,4 +1,5 @@
 import fs from 'fs';
+import { createRequire } from 'module';
 import os from 'os';
 import path from 'path';
 import fc from 'fast-check';
@@ -6,7 +7,9 @@ import { DEAD_ENDS, scrubEnv } from './env';
 
 // Every test file runs in its own fork: before any source module is imported,
 // keep only the variables helpers/env.ts lets through, point pg and git at
-// nothing, and give it a throwaway data root.
+// nothing, give it a throwaway data root, and refuse a fork that would lose it
+// (forkGuard.cjs).
+createRequire(import.meta.url)('./forkGuard.cjs');
 scrubEnv(process.env);
 Object.assign(process.env, DEAD_ENDS);
 process.env.NODE_ENV = 'test';

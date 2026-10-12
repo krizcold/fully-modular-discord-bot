@@ -215,18 +215,36 @@ export function lineDiff(before, after, file) {
     pj = j;
   }
   if (file !== undefined) {
-    // The same holder: its opening lines are a kept pair, or both were edited
-    // and it plays the same part (an `if` whose condition changed).
+    // The same holder: its opening lines are a kept pair, or one edited line
+    // (between the same kept lines, or of the same text) that plays the same
+    // part (an `if` whose condition changed).
     const was = holdersOf(file, before);
     const is = holdersOf(file, after);
     const newOf = new Map([[0, 0], ...pairs.map(([i, j]) => /** @type {[number, number]} */ ([i + 1, j + 1]))]);
     const oldOf = new Map([[0, 0], ...pairs.map(([i, j]) => /** @type {[number, number]} */ ([j + 1, i + 1]))]);
+    // keptBefore[n]: how many kept lines come before line n (from 1) of a text.
+    /**
+     * @param {number} length
+     * @param {(k: number) => boolean} isKept
+     */
+    const keptBefore = (length, isKept) => {
+      const counts = new Int32Array(length + 1);
+      for (let k = 0; k < length; k++) counts[k + 1] = counts[k] + (isKept(k) ? 1 : 0);
+      return counts;
+    };
+    const oldGap = keptBefore(a.length, k => partner[k] !== -1);
+    const newGap = keptBefore(b.length, k => oldOf.has(k + 1));
+    /**
+     * @param {number} h
+     * @param {number} g
+     */
+    const oneEdit = (h, g) => oldGap[h - 1] === newGap[g - 1] || a[h - 1].trim() === b[g - 1].trim();
     for (const [i, j] of pairs) {
       const held = was.get(i + 1);
       const holds = is.get(j + 1);
       if (!held || !holds) { if (held !== holds) changed.add(j + 1); continue; }
       const kept = newOf.has(held.line) || oldOf.has(holds.line);
-      if (kept ? newOf.get(held.line) !== holds.line : held.role !== holds.role) changed.add(j + 1);
+      if (kept ? newOf.get(held.line) !== holds.line : held.role !== holds.role || !oneEdit(held.line, holds.line)) changed.add(j + 1);
     }
   }
   /** @param {Set<number>} set */
@@ -234,19 +252,20 @@ export function lineDiff(before, after, file) {
   return { changed: sorted(changed), deletedAfter: sorted(deletedAfter) };
 }
 
-// What can hold a line of code: a block, a case, a class body, an object or an array.
+// What can hold a line of code besides a class body, a call's arguments and an
+// arrow's expression body (holderOf): a block, a case, an object or an array.
 const HOLDERS = new Set([
-  ts.SyntaxKind.Block, ts.SyntaxKind.ModuleBlock, ts.SyntaxKind.CaseClause, ts.SyntaxKind.DefaultClause, ts.SyntaxKind.ClassDeclaration,
-  ts.SyntaxKind.ClassExpression, ts.SyntaxKind.ObjectLiteralExpression, ts.SyntaxKind.ArrayLiteralExpression,
+  ts.SyntaxKind.Block, ts.SyntaxKind.ModuleBlock, ts.SyntaxKind.CaseClause, ts.SyntaxKind.DefaultClause,
+  ts.SyntaxKind.ObjectLiteralExpression, ts.SyntaxKind.ArrayLiteralExpression,
 ]);
 
 /**
  * Per line (from 1) that a node starts on, what holds it: the innermost block,
- * case, class body, object or array opened on an earlier line, as the line it
- * opens on (0: the file itself) and the part it plays (a then or an else
- * block, a try or a finally block, a function's body, a case). A line no node
- * starts on (a bracket, a comment) has none. Lines are counted at LF only, as
- * the line diff counts them.
+ * case, class body, object, array, call's arguments or arrow's expression body
+ * opened on an earlier line, as the line it opens on (0: the file itself) and
+ * the part it plays (a then or an else block, a try or a finally block, a
+ * function's body, a case). A line no node starts on (a bracket, a comment)
+ * has none. Lines are counted at LF only, as the line diff counts them.
  * @param {string} file
  * @param {string} text
  */
@@ -279,7 +298,8 @@ function holdersOf(file, text) {
       while (k >= 0 && open[k].line >= line) k--;
       holders.set(line, k >= 0 ? open[k] : { line: 0, role: 'the file' });
     }
-    const inner = HOLDERS.has(node.kind) ? [...open, { line: lineOf(openingOf(node, sf)), role: roleOf(node) }] : open;
+    const holder = holderOf(node, sf);
+    const inner = holder ? [...open, { line: lineOf(holder.at), role: holder.role }] : open;
     ts.forEachChild(node, child => walk(child, inner));
   };
   ts.forEachChild(sf, child => walk(child, []));
@@ -287,12 +307,18 @@ function holdersOf(file, text) {
 }
 
 /**
- * Where a holder opens: a class at its brace (a decorator above it moves nothing), the others where they start.
+ * Whether a node holds lines, where it opens and the part it plays: a class at
+ * its brace (a decorator above it moves nothing), a call's arguments at their
+ * bracket, an arrow's expression body at its `=>`, the others where they start.
  * @param {ts.Node} node
  * @param {ts.SourceFile} sf
+ * @returns {{ at: number, role: string } | null}
  */
-function openingOf(node, sf) {
-  return ts.isClassLike(node) ? node.members.pos - 1 : node.getStart(sf);
+function holderOf(node, sf) {
+  if (ts.isClassLike(node)) return { at: node.members.pos - 1, role: 'a class' };
+  if ((ts.isCallExpression(node) || ts.isNewExpression(node)) && node.arguments) return { at: node.arguments.pos - 1, role: 'a call' };
+  if (ts.isArrowFunction(node) && !ts.isBlock(node.body)) return { at: node.equalsGreaterThanToken.getStart(sf), role: 'an arrow body' };
+  return HOLDERS.has(node.kind) ? { at: node.getStart(sf), role: roleOf(node) } : null;
 }
 
 /**
@@ -302,7 +328,6 @@ function openingOf(node, sf) {
  * @param {ts.Node} node
  */
 function roleOf(node) {
-  if (ts.isClassLike(node)) return 'a class';
   if (node.kind !== ts.SyntaxKind.Block) return ts.SyntaxKind[node.kind];
   const parent = /** @type {ts.Node & Record<string, unknown>} */ (node.parent);
   const slot = Object.keys(parent).find(key => key !== 'parent' && (parent[key] === node || (Array.isArray(parent[key]) && parent[key].includes(node))));
@@ -598,9 +623,12 @@ export const GLOB_NAME_WHY = 'its name holds characters Stryker reads as a glob,
  * git does not look at a file its index marks assume-unchanged or
  * skip-worktree (core.ignoreStat marks every file it adds), so each such file
  * is compared with its base text here, and named as changed when it differs.
+ * Nor at one a file-system monitor said is unchanged, so no monitor is used.
  * @param {{ git: (...args: string[]) => string, base: string, root: string, read?: (file: string) => string }} io
  */
-export function planFromGit({ git, base, root, read = file => fs.readFileSync(path.join(root, file), 'utf8') }) {
+export function planFromGit({ git: run, base, root, read = file => fs.readFileSync(path.join(root, file), 'utf8') }) {
+  /** @param {string[]} args */
+  const git = (...args) => run('-c', 'core.fsmonitor=false', ...args);
   /** @param {string} file */
   const readBase = file => git('cat-file', 'blob', `${base}:${file}`);
   /** @param {string} file */
@@ -629,6 +657,21 @@ export function planFromGit({ git, base, root, read = file => fs.readFileSync(pa
     nameOf: file => canonicalName(root, file) ?? (globFree(root, file) ? file : null),
     isDir: file => { try { return fs.statSync(path.join(root, file)).isDirectory(); } catch { return false; } },
   });
+}
+
+/**
+ * What Stryker must not copy into a sandbox, as its ignorePatterns: dist (pass
+ * B builds its own), everything git ignores (.env, data dirs, private module
+ * repos; node_modules aside, which Stryker links), and every untracked git
+ * repository, whose own ignored files (its .env) git never lists, as it lists
+ * none of its files.
+ * @param {(...args: string[]) => string} git runs git in the bot root
+ */
+export function sandboxIgnores(git) {
+  const ignored = git('ls-files', '-z', '--others', '--ignored', '--exclude-standard', '--directory').split('\0')
+    .filter(p => p !== '' && path.posix.basename(p.replace(/\/$/, '')) !== 'node_modules');
+  const repos = git('ls-files', '-z', '--others', '--exclude-standard').split('\0').filter(p => p.endsWith('/'));
+  return [...new Set(['/dist/', ...[...ignored, ...repos].map(p => `/${p}`)])];
 }
 
 /**

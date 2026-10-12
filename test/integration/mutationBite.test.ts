@@ -84,22 +84,22 @@ describe('the touched-line mutation gate', () => {
 
   /**
    * A gate run on one line with a stand-in for vitest: the run with no mutant
-   * passes and every mutant's test times out; in the run with no mutant after
-   * the reruns, `control` runs (the stand-in's own JavaScript, with `file` its
-   * report's path) and its `message`, if any, fails it.
+   * passes and every mutant's test times out. Each run first runs `code`, the
+   * stand-in's own JavaScript, with `file` its report's path, `pass` its
+   * pass's dir name (`control-a2` for the run with no mutant after the
+   * reruns) and `mutant` the active mutant; its `message`, if any, fails it.
    */
-  function standInRun(control: string) {
+  function standInRun(code: string) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-control-'));
     const fake = path.join(dir, 'vitest.cjs');
     fs.writeFileSync(fake, [
       "const fs = require('fs');",
       "const path = require('path');",
       "const file = process.argv.find(arg => arg.startsWith('--outputFile=')).slice('--outputFile='.length);",
+      'const pass = path.basename(path.dirname(file));',
       'const mutant = process.env.__STRYKER_ACTIVE_MUTANT__;',
       "let message = mutant ? 'Error: Test timed out in 30000ms' : '';",
-      "if (file.split('\\\\').join('/').includes('/control-')) {",
-      control,
-      '}',
+      code,
       "const test = { status: message ? 'failed' : 'passed', fullName: 'reads', failureMessages: message ? [message] : [] };",
       "fs.writeFileSync(file, JSON.stringify({ testResults: [{ name: 'unit/x.test.ts', status: test.status, assertionResults: [test] }] }));",
       'process.exit(message ? 1 : 0);',
@@ -112,9 +112,9 @@ describe('the touched-line mutation gate', () => {
     const reportDir = /^Report: (\S+)/m.exec(run.stdout)?.[1];
     expect(reportDir, `${run.stdout}\n${run.stderr}`).toBeDefined();
     const { mutants } = JSON.parse(fs.readFileSync(path.join(root, reportDir!, 'mutants.json'), 'utf8')) as { mutants: (Mutant & { passes: { a2?: Pass & { voided?: string } } })[] };
-    const a2Ran = ranFor(reportDir!, 'a2');
+    const a2Ran = fs.existsSync(path.join(root, reportDir!, 'a2', 'run-ids.json')) ? ranFor(reportDir!, 'a2') : null;
     fs.rmSync(path.join(root, reportDir!), { recursive: true, force: true });
-    expect(a2Ran).toEqual(mutants.filter(m => m.passes.a2).map(m => m.passes.a2!.id).sort());
+    if (a2Ran) expect(a2Ran).toEqual(mutants.filter(m => m.passes.a2).map(m => m.passes.a2!.id).sort());
     return { run, mutants };
   }
 
@@ -124,7 +124,7 @@ describe('the touched-line mutation gate', () => {
     const added = `test/mutation/smdb-tree-${process.pid}.txt`;
     const { run, mutants } = (() => {
       try {
-        return standInRun(`fs.writeFileSync(${JSON.stringify(path.join(root, added))}, 'changed'); message = 'Error: the database went away';`);
+        return standInRun(`if (pass === 'control-a2') { fs.writeFileSync(${JSON.stringify(path.join(root, added))}, 'changed'); message = 'Error: the database went away'; }`);
       } finally {
         fs.rmSync(path.join(root, added), { force: true });
       }
@@ -148,8 +148,10 @@ describe('the touched-line mutation gate', () => {
     // nothing (runner.mjs times it in a2/dry-ms.txt), so their budget is
     // 4 x -14 s + 60 s = 4 s, and the run after them passes in 5 s.
     const { run, mutants } = standInRun([
-      "fs.writeFileSync(path.join(path.dirname(path.dirname(file)), 'a2', 'dry-ms.txt'), '-14000');",
-      'Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5000);',
+      "if (pass === 'control-a2') {",
+      "  fs.writeFileSync(path.join(path.dirname(path.dirname(file)), 'a2', 'dry-ms.txt'), '-14000');",
+      '  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5000);',
+      '}',
     ].join('\n'));
     const reran = mutants.filter(m => m.passes.a2);
     expect(reran.length).toBeGreaterThan(0);
@@ -159,8 +161,33 @@ describe('the touched-line mutation gate', () => {
     expect(run.stdout).not.toMatch(/^Timeouts /m);
   });
 
+  it('refuses a way to /data that a file gains after the plan, before any mutant runs on it', { timeout: 600_000 }, () => {
+    // A mutant's run in pass A adds one to the target in the checkout, so pass
+    // A2 copies it; the target's text is put back after the run.
+    const target = path.join(root, TARGET);
+    const original = fs.readFileSync(target, 'utf8');
+    const { run } = (() => {
+      try {
+        return standInRun([
+          `const target = ${JSON.stringify(target)};`,
+          "if (pass === 'a' && mutant && !fs.readFileSync(target, 'utf8').includes('smdbProbe')) fs.appendFileSync(target, \"export const smdbProbe = 'DATA_DIR';\\n\");",
+        ].join('\n'));
+      } finally {
+        fs.writeFileSync(target, original);
+      }
+    })();
+    expect(run.status).toBe(2);
+    expect(run.stdout).toMatch(/^Stopped:\n {2}pass a2 could not run: /m);
+    expect(run.stdout).toContain(`\n  ${TARGET}: it reads DATA_DIR or holds the '/data' fallback`);
+    expect(run.stdout).toContain(`  the tree changed during the run, so no one tree was tested: ${TARGET}`);
+  });
+
   it('has no result, exit 2, when its base is unknown or its patterns make no mutant, and refuses a glob or a missing file', { timeout: 300_000 }, () => {
     const gate = (...args: string[]) => spawnSync(process.execPath, [path.join(root, 'test', 'mutation', 'touched.mjs'), ...args], { cwd: root, encoding: 'utf8', timeout: 280_000 });
+    // Each refusal runs with a stand-in for vitest that does not exist, so a
+    // refusal that broke would run no test (dataRoot.ts's against /data).
+    const refuse = (...args: string[]) => spawnSync(process.execPath, [path.join(root, 'test', 'mutation', 'touched.mjs'), ...args, '--concurrency', '1'],
+      { cwd: root, encoding: 'utf8', timeout: 280_000, env: { ...process.env, SMDB_MUTATION_VITEST: path.join(os.tmpdir(), `smdb-no-vitest-${process.pid}.cjs`) } });
     const clean = (stdout: string) => {
       const dir = /^Report: (\S+)/m.exec(stdout)?.[1];
       if (dir) fs.rmSync(path.join(root, dir), { recursive: true, force: true });
@@ -175,13 +202,20 @@ describe('the touched-line mutation gate', () => {
     fs.writeFileSync(path.join(root, broken), `export const s = 'a${String.fromCharCode(0x2028)}b';\n`);
     try {
       for (const pattern of ['src/**/*.ts', 'src/bot/internalSetup/fleet/+(nodeIdentity|takeover).ts', 'src/no/such/file.ts:1-5', `${TARGET}:3:0-3:10`, outside]) {
-        const refused = gate('--mutate', pattern);
+        const refused = refuse('--mutate', pattern);
         expect(refused.status, pattern).toBe(2);
         expect(refused.stderr).toContain(`--mutate takes a file in the bot root that exists, or such a file and lines, never a glob: ${pattern}`);
       }
-      const refused = gate('--mutate', broken);
+      const refused = refuse('--mutate', broken);
       expect(refused.status).toBe(2);
       expect(refused.stderr).toContain(`--mutate cannot take ${broken}: it holds a line break Stryker counts and the gate does not`);
+      // The suite's own env scrub and config: --mutate takes only what a diff would mutate.
+      for (const file of ['test/helpers/env.ts', 'test/vitest.config.ts']) {
+        const outsideSrc = refuse('--mutate', file);
+        clean(outsideSrc.stdout);
+        expect(outsideSrc.status, file).toBe(2);
+        expect(outsideSrc.stderr).toContain(`--mutate cannot take ${file}: outside src`);
+      }
     } finally {
       fs.rmSync(outside, { force: true });
       fs.rmSync(path.join(root, broken), { force: true });
@@ -204,10 +238,8 @@ describe('the touched-line mutation gate', () => {
     expect(nothing.stdout).toMatch(/^Changed lines of code no mutant lies wholly on .*\n {2}src\/bot\/internalSetup\/fleet\/nodeIdentity\.ts: 5$/m);
     expect(nothing.stdout).toMatch(/^Verdict: NO RESULT \(no gating mutant was made/m);
 
-    // dataRoot.ts is never mutated. A stand-in for vitest that does not exist
-    // makes sure a refusal that broke would run no test against /data.
-    const data = spawnSync(process.execPath, [path.join(root, 'test', 'mutation', 'touched.mjs'), '--mutate', 'src/utils/dataRoot.ts:8-8', '--concurrency', '1'],
-      { cwd: root, encoding: 'utf8', timeout: 280_000, env: { ...process.env, SMDB_MUTATION_VITEST: path.join(os.tmpdir(), `smdb-no-vitest-${process.pid}.cjs`) } });
+    // dataRoot.ts is never mutated.
+    const data = refuse('--mutate', 'src/utils/dataRoot.ts:8-8');
     clean(data.stdout);
     expect(data.status, data.stderr).toBe(2);
     expect(data.stderr).toContain("--mutate cannot take src/utils/dataRoot.ts: it reads DATA_DIR or holds the '/data' fallback");

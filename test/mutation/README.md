@@ -19,6 +19,7 @@ active mutant travels in `__STRYKER_ACTIVE_MUTANT__` and reaches child processes
 | tree.mjs | (library) the fingerprint of the tree a run reads, taken before the plan and before the verdict; unit/mutationRanges.test.ts and the bite |
 | ../helpers/time.mjs | the factor on every test's time limits (4 in a rerun alone) |
 | ../helpers/env.ts, setup.ts | what a test and its children keep of the environment, and the run's fast-check seed |
+| ../helpers/forkGuard.cjs | a fork whose own env lacks DATA_DIR throws, in a test and in a child step |
 | ../helpers/build.cjs | builds dist the way `npm run build` does, stamped and locked; pass B's buildCommand |
 | ../helpers/child.ts | runs a child scenario (test/child/scenarios/) and checks what it loaded |
 
@@ -33,8 +34,8 @@ From the bot root, with Node 22.12 or newer (or SMDB_TEST_NODE set, as for `npm 
   committed, pass `--base` the commit before it; `--base main` takes everything since the merge-base with main (a
   branch). A file new to src is taken whole: an untracked one, one added, and one moved in from outside src (or from a
   browser view, or from a name that is not code). A file renamed within src gates its changed lines only.
-- `--mutate src/x.ts:10-20` (a file in the bot root that exists, or such a file and lines, repeatable; never a glob,
-  never columns) skips git; every mutant it makes gates. The file is taken under the name it has on disk, from the bot root with
+- `--mutate src/x.ts:10-20` (a file in the bot root that exists and that a diff would mutate, or such a file and lines,
+  repeatable; never a glob, never columns, never the suite's own files) skips git; every mutant it makes gates. The file is taken under the name it has on disk, from the bot root with
   forward slashes (its case, and its path once links are resolved), however it was spelled: `./`, `..`, and on Windows
   backslashes or another case. A file in a diff is matched by that name too, for Stryker matches the names on disk.
 - `--concurrency N` sets pass A's parallel runs (default: half the cores); pass B uses half of that.
@@ -48,7 +49,7 @@ Pass A needs nothing running. Pass B runs the integration tests that import the 
 there are any. git only names the files that changed, over the whole repo (a rename found by git's own measure, with no
 limit on how many files it compares), and gives each one's text at the base; the gate finds the changed lines itself, a
 shortest line diff of the two texts, so no git setting, attribute or variable moves them (unit/mutationRanges.test.ts
-runs it under a hostile config).
+runs it under a hostile config). git runs with no file-system monitor, so it looks at every file itself.
 
 ## What it mutates
 
@@ -74,24 +75,29 @@ runs it under a hostile config).
   counts is still the diff's choice.
 - A line whose text is unchanged but that another block now holds counts as changed: a bracket moved past it (a `}`, a
   `} else {`, a `} finally {`, a `case` label, a `}, () => {`), a block put around it or taken away, an if's two bodies
-  swapped. The gate finds what holds each kept line (the innermost block, case, class body, object or array opened
-  above it) before and after: it must open on a kept line paired with the old one, or, when the lines that open both
-  were edited, play the same part (a then or an else, a try or a finally, a function's body), so an edited `if`
-  condition, a function made an arrow or an `await` put before a call moves no line inside it.
+  swapped, a line moved between two calls' arguments or across `), () => (`. The gate finds what holds each kept line
+  (the innermost block, case, class body, object, array, call's arguments or arrow's expression body opened above it)
+  before and after: it must open on a kept line paired with the old one, or, when the lines that open both were
+  edited, on what is one edited line (between the same kept lines, or of the same text) that plays the same part (a
+  then or an else, a try or a finally, a function's body), so an edited `if` condition, a function made an arrow or an
+  `await` put before a call moves no line inside it. Where that cannot be told (two methods both made async with a
+  line moved between them), the lines it holds count too.
 - git does not look at a file its index marks assume-unchanged or skip-worktree (core.ignoreStat marks every file it
   adds), so the gate compares each such file with its base text itself, and names one marked assume-unchanged that is
   gone as deleted; one marked skip-worktree that is gone is taken as left out by a sparse checkout.
 - Not mutated, and named in the report with the reason: files outside src (the root scripts, updaters/, tests, docs and
   images), files that are not code, `.d.ts` files, the browser views under src/webui/public (copied into dist, never
-  compiled, and no test loads them yet), a file deleted or moved out of src, an untracked git repository or a git
-  submodule under src (git lists none of its files), a file whose name Stryker would read as a glob (`[id].ts`,
+  compiled, and no test loads them yet), a file deleted or moved out of src, an untracked git repository (git lists
+  none of its files, and none is copied into a sandbox) or a git submodule under src, a file whose name Stryker would read as a glob (`[id].ts`,
   `a{1,2}.ts`; rename it), a change that leaves no line changed (a rename, a mode change, line endings only), and a
   file that holds a line break Stryker counts and the gate does not (a lone CR, U+2028 or U+2029), whose lines the two
   would number differently; `--mutate` refuses such a file.
 - Never mutated, on any machine, and named: a file whose code names the DATA_DIR variable or holds `'/data'` as a
   string (src/utils/dataRoot.ts today, under any name or split into others). A mutant of it (the DATA_DIR check made
   false, the fallback chosen) sends the tests to `/data`, on a developer's machine a real data root and anywhere else
-  one the run would make outside the sandbox. `--mutate` refuses such a file.
+  one the run would make outside the sandbox. `--mutate` refuses such a file, and each pass's run with no mutant, which
+  comes before any mutant's, checks the files as that pass copied them, so a file that gains such code after the plan
+  stops the pass (NO RESULT, naming it).
 - A changed line of code that no mutant lies wholly on, in a diff, an untracked file or a `--mutate` pattern, is named
   in the report: L5 says nothing about it. A mutant that spans several lines (emptying a body, an object or an array,
   flipping a condition split over lines, a chained call) counts for none of them, since it says nothing about each
@@ -106,10 +112,12 @@ runs it under a hostile config).
 ## The passes
 
 1. **Pass A, in-process.** Stryker instruments the ranges in a sandbox copy of the repo: the tracked files and the
-   untracked ones git does not ignore (git's ignored files, `.env` and the data dirs among them, stay out). The
-   TypeScript checker turns type-invalid mutants into CompileError. Each mutant run is `vitest related <mutated files>`
-   on the fast tier with one worker, so only tests that import them run. There is no coverage analysis: every mutant
-   runs those tests.
+   untracked ones git does not ignore (git's ignored files, `.env` and the data dirs among them, stay out, and so does
+   an untracked git repository, whose own `.env` git never lists). The TypeScript checker turns type-invalid mutants
+   into CompileError. Each mutant run is `vitest related <mutated files>` on the fast tier with one worker, so only
+   tests that import them run. There is no coverage analysis: every mutant runs those tests. The files go on vitest's
+   command line relative to test/; a change of many hundreds of files can pass Windows' limit on a command line, and
+   then the run's log says vitest could not start.
 2. **Pass B, the rest, on pass A's gating survivors only.** The sandbox's dist is built from the instrumented src
    (build.cjs), then each survivor runs `vitest related` on the integration tier and then the whole child tier, whose
    scenarios start real processes on that dist. A child sees the mutant through the env. Stryker makes every mutant a
@@ -206,9 +214,11 @@ child away from anything real:
   unit/envScrub.test.ts holds the list against what src reads. pg is pointed at no server (PGHOST, PGPASSFILE) and git
   at no repository above the bot root or the temp dir (GIT_CEILING_DIRECTORIES: a sandbox sits inside the checkout and
   holds no .git, and test data dirs and child cwds sit under the temp dir), with NODE_ENV `test` and its own DATA_DIR;
-  the code that reads DATA_DIR or falls back to `/data` is never mutated (What it mutates);
-- every wait is bounded, and a step prints one `RESULT` line with its result and the bot modules it loaded; the helper
-  fails unless every one sits under this root's dist.
+  the code that reads DATA_DIR or falls back to `/data` is never mutated (What it mutates), and a fork whose own env
+  lacks DATA_DIR throws, in a test and in every child step (helpers/forkGuard.cjs, which setup.ts loads and child.ts
+  preloads; src/webui/botManager.ts forks the bot so, and a mutant that empties that env must fail, not reach `/data`);
+- every wait is bounded, and a step prints one `RESULT` line with its result and the modules it loaded; the helper
+  fails unless the fork guard is among them and every other one sits under this root's dist.
 
 The child tier's globalSetup runs build.cjs `--if-stale`: it rebuilds dist unless the stamp matches both what dist was
 built from (src, tsconfig.json, build.cjs, the typescript version) and what dist holds now, so a dist that another
@@ -228,10 +238,12 @@ removed source file.
   mutant after that rerun passes. One mutant of the first line is equivalent (`''` and the replacement both read as "not
   active"), so the run also shows the FAIL verdict and how a survivor is listed. The same file checks that an unknown
   base and a pattern that makes no mutant both end NO RESULT, exit 2, and that a glob, a missing file, a pattern with
-  columns, a file holding a line break the gate does not count and src/utils/dataRoot.ts are refused (each with a
-  stand-in for vitest, so a refusal that broke would run no test).
-- A gate run on a stand-in for vitest (every mutant times out, then the run with no mutant after the reruns fails)
-  ends NO RESULT, with every timeout the reruns confirmed listed as inconclusive.
+  columns, a file holding a line break the gate does not count, src/utils/dataRoot.ts and the suite's own
+  helpers/env.ts and vitest.config.ts are refused (each with a stand-in for vitest that does not exist, so a refusal
+  that broke would run no test).
+- Gate runs on a stand-in for vitest (every mutant times out) end NO RESULT: when the run with no mutant after the
+  reruns fails, with every timeout the reruns confirmed listed as inconclusive; when it passes past the reruns' budget;
+  and when the target gains a way to `/data` during pass A, which pass A2's run with no mutant refuses.
 - The bite fails when the plumbing breaks: with the active mutant dropped from the child's env the child-only mutants
   survive, and with the scenario loading another checkout's dist pass B refuses at its first run.
 
@@ -243,6 +255,3 @@ removed source file.
 - src/index.ts pins its alias base to /app/dist: a child scenario that boots the parent process from a sandbox needs that
   base to come from the file's own place first.
 - Browser views are never mutated (no render tests yet).
-- src/webui/botManager.ts forks the bot with an env of its own: a mutant that empties it would send that bot to `/data`.
-  No test forks the bot yet; unit/mutationRanges.test.ts fails when a test names botManager, so the rule for files on
-  the way to `/data` grows before one does.
