@@ -227,7 +227,7 @@ export function judge(run) {
     ...section('Silenced by a Stryker disable comment (each needs a justification in the notes):', gatingAt('Ignored')),
     ...section('Inconclusive (no test failed for the mutant itself; rerun, or add a test that fails on it):', [...gatingAt('Inconclusive'), ...gatingAt('RuntimeError')]),
     ...section('Timeouts (each timed out again when run alone with four times the time: a test or its beforeEach or afterEach hook, or the whole run past its budget; counted as killed, so check each replacement):', gatingAt('Timeout')),
-    `Context mutants (in the widened statements, not on a changed line; not gating): ${context.length}: ${tally(context)}`,
+    `Context mutants (in the widened statements, not gating: ones that touch no changed line, and ones beyond what the changed lines widen to by themselves, which can span one, as the emptying of a body around a deletion does): ${context.length}: ${tally(context)}`,
     ...section('Context survivors:', context.filter(m => outcome(m) === 'Survived')),
     ...(run.controls?.length ? ['Runs with no mutant after the reruns:', ...run.controls.map(line => `  ${line}`)] : []),
     ...(run.stopped ? ['Stopped:', ...run.stopped.map(line => `  ${line}`)] : []),

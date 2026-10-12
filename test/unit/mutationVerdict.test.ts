@@ -188,6 +188,7 @@ describe('the verdict', () => {
     expect(text).toContain('  src/missing.ts:1-2');
     expect(text).toMatch(/^Changed lines of code no mutant lies wholly on \(.*the code lines of a multi-line object, array, arrow body, call or condition with no mutant of their own; a changed line of brackets and separators only, in a diff, is listed apart\):\n {2}src\/a\.ts: 4, 9$/m);
     expect(text).toMatch(/^Changed lines that can move the unchanged lines beside them into or out of a block \(brackets and separators only, a brace of a block, or an else, case, default, catch or finally; the lines they move are not gated, so check them\):\n {2}src\/a\.ts: 5$/m);
+    expect(text).toMatch(/^Context mutants \(in the widened statements, not gating: ones that touch no changed line, and ones beyond what the changed lines widen to by themselves, which can span one, as the emptying of a body around a deletion does\): 1: 1 Killed$/m);
     expect(text).toMatch(/^Places where lines were taken out with fewer or none put back, so what was taken out is left nowhere to mutate \(each after the line named, as the file is now; 0 is its top\); check the code around each:\n {2}src\/b\.ts: after 0, 2$/m);
     expect(none.lines.at(-1)).toBe('Verdict: NO RESULT (no gating mutant was made, so L5 tested nothing (see what was not mutated, and why, and where lines were taken out))');
     expect(run([mutant(1, false, { a: pass('Killed', { killedBy: 'x' }) })], {}).lines.at(-1))

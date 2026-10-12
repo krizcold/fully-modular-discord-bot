@@ -178,8 +178,10 @@ export function commonLines(a, b) {
  * them that repeats one of them, and on through each further one that does (an
  * `if` block added after an equal one counts in both places): every place
  * their first or last lines, or the whole run, could slide to passes only such
- * lines. A line kept counts only where the diff marks it, even when a change
- * moves it into or out of a block (mutation/README.md).
+ * lines. The window starts from each piece the diff makes, and another change
+ * in the file can split a run into pieces, so then which copy counts is the
+ * diff's choice. A line kept counts only where the diff marks it, even when a
+ * change moves it into or out of a block (mutation/README.md).
  * @param {string} before
  * @param {string} after
  * @returns {{ changed: number[], deletedAfter: number[] }}

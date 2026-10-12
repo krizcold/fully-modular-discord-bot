@@ -71,8 +71,9 @@ runs it under a hostile config). git runs with no file-system monitor, so it loo
 - **Gating** mutants touch a changed line. Some that touch one are not made: one that touches it only through a block
   holding the line (the emptying of that block, or the whole callback around it), the emptying of the body of a
   compound statement or declaration (above), or of a bare block, that only begins or ends on the changed line: its
-  header or its closing brace, and the false condition Stryker gives a `for` with no condition, which spans the whole
-  loop (a reviewer checks a changed header of such a loop; the structure list below names it). A block wholly made of
+  header or its closing brace, and the false condition Stryker gives a `for` with no condition that spans more than
+  one line, which spans the whole loop (a reviewer checks a changed header of such a loop; the structure list below
+  names it only when it holds the body's `{`; a one-line loop's false condition is made and gates). A block wholly made of
   changed lines is made, and so is every other body's emptying. unit/mutationRanges.test.ts holds this rule to
   Stryker's own instrumenter, line by line, both what is made and what is not, on made-up shapes and on two real files.
 - The other mutants in the widened ranges are **context**: they run in pass A and are listed, but never fail the gate.
@@ -81,12 +82,14 @@ runs it under a hostile config). git runs with no file-system monitor, so it loo
   inside what the changed lines widen to by themselves. The report names each place where lines were taken out with
   fewer or none put back (a pure deletion, a line deleted beside an edited one, a block taken away with its body
   re-indented), so a reviewer checks the code around each; a line replaced one for one, or a block taken away where as
-  many lines are put back, shows only as changed lines.
+  many or more lines are put back, shows only as changed lines.
 - Lines added in one place, or only taken out, count also over each unchanged line beside them that repeats one of
   them, and on through each further one that does (an `if` block added after an equal one counts in both places, an
   edited line beside it or not): every place their first or last lines, or the whole run, could slide to passes only
-  such lines. This can gate an unchanged line no shortest diff changes, never miss one that a placement of the run
-  would. Where repeated lines are spread among other changes, which copy counts is still the diff's choice.
+  such lines. This can gate an unchanged line no shortest diff changes. The window starts from the pieces the diff
+  makes, though: with another change in the same file, the diff can split a run added or taken out in one place into
+  several pieces, and then which of its copies count is again the diff's choice (one placement of the run is always
+  counted); so is it where repeated lines are spread among other changes.
 - Only the lines the diff changed count. A change can also move an unchanged line into or out of a block (a bracket,
   an `else`, a `finally` or a `case` moved past it, a header put around it, an if's two bodies swapped): that line is
   not gated, so its mutants run as context at most. The changed lines that make such a move are named under their own
@@ -94,7 +97,7 @@ runs it under a hostile config). git runs with no file-system monitor, so it loo
   header's `{`, a closer with code of its own such as `} while (x);` or `}).catch(log);`), and one holding an `else`,
   `case`, `default` (in a switch), `catch` or `finally`, so a reviewer checks the lines beside each; a block taken
   away (its header and bracket deleted) is named with the places lines were taken out when fewer lines are put back
-  there. Not named: a block taken away where as many lines are put back, and a line moved into or out of a
+  there. Not named: a block taken away where as many or more lines are put back, and a line moved into or out of a
   braceless body (an `if (x)` with no brace put above a line, or lines swapped below one); a reviewer reads each
   changed braceless header for these.
 - git does not look at a file its index marks assume-unchanged or skip-worktree (core.ignoreStat marks every file it
@@ -150,7 +153,9 @@ runs it under a hostile config). git runs with no file-system monitor, so it loo
 3. **Reruns alone.** Every run stops at its first failure. A rerun runs one mutant at a time and gives every test, hook
    and child scenario step four times its time limit (a test's own explicit limit is not scaled), and Stryker a larger
    budget for the whole run.
-   - A gating mutant that timed out in pass A reruns with pass A's tests. It counts as killed when the rerun fails a
+   - A gating mutant that timed out in pass A reruns with the fast tests that import the files of the mutants rerun
+     (pass A ran those for every mutated file, so a test that reached it only through another file's imports does not
+     run again, and it goes on to pass B). It counts as killed when the rerun fails a
      test, or times out again: a test or its beforeEach or afterEach hook past four times its limit (a beforeAll or
      afterAll hook's timeout is inconclusive, below), or the whole run past Stryker's budget for
      it, which is four times what those tests take with no mutant, plus a minute. That budget fires first whenever
@@ -160,7 +165,10 @@ runs it under a hostile config). git runs with no file-system monitor, so it loo
    - In pass B, where containers and children can be slow or fail on their own, a hang never counts: a mutant that
      only hangs a test there is inconclusive. A test that waits must bound its wait and fail, as a child scenario step
      does ("did not finish in N ms" is a failure, not a hang). A child test's own limit is fifteen steps' bounds, so in
-     a test of up to fourteen steps a hung step fails by its bound first.
+     a test of up to fourteen steps a hung step fails by its bound first. Stryker's budget for a pass B run is twice
+     its run with no mutant plus a minute, below vitest's limit on a hook, so a run that fails a test and then waits in
+     an afterAll past that budget (a `pool.end()` held by a client still checked out) counts as a hang too: an afterAll
+     must bound its waits as a test does.
    - A gating kill of pass B reruns with the one test file that killed it, alone (one rerun per such file), so no
      other file's order or hang can decide it. It counts only when that file fails for the mutant again. Its Stryker
      budget is an hour, above anything vitest's own limits let the file take after its first failure, so a rerun that

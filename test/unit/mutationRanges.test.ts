@@ -102,6 +102,12 @@ const SHAPES: Record<string, string> = {
     '  }',
     '}',
   ].join('\n'),
+  // On one line, the loop's false condition lies on the line, so it is made.
+  forNoConditionOneLine: [
+    'export async function poll(ready: () => Promise<boolean>): Promise<void> {',
+    '  for (;;) if (await ready()) return;',
+    '}',
+  ].join('\n'),
   tryCatch: [
     'export async function load(read: () => Promise<string>): Promise<string | null> {',
     '  try {',
@@ -747,7 +753,8 @@ describe('the widening, against what Stryker makes', () => {
           && !ts.isDefaultClause(node.parent) && !inExpression(node.parent)) {
           bodies.add(`${node.getStart(sf)}-${node.getEnd()}`);
         }
-        if (ts.isForStatement(node) && !node.condition) loops.add(`${node.getStart(sf)}-${node.getEnd()}`);
+        const lineAt = (pos: number) => sf.getLineAndCharacterOfPosition(pos).line;
+        if (ts.isForStatement(node) && !node.condition && lineAt(node.getStart(sf)) < lineAt(node.getEnd())) loops.add(`${node.getStart(sf)}-${node.getEnd()}`);
         ts.forEachChild(node, walk);
       };
       walk(sf);
@@ -774,6 +781,8 @@ describe('the widening, against what Stryker makes', () => {
         // And what the README says is not made, is not.
         const unmade = touching.filter(m => (braceOnly(m) || loopCondition(m)) && got.has(key(m))).map(m => `${m.mutatorName} ${key(m)}`);
         expect(unmade, `${name} line ${n}: ${code.trim()}`).toEqual([]);
+        const through = whole.filter(m => m.location.start.line + 1 <= n && n <= m.location.end.line + 1 && throughBlock(m) && got.has(key(m)));
+        expect(through.map(m => `${m.mutatorName} ${key(m)}`), `${name} line ${n}: ${code.trim()}`).toEqual([]);
         checked += expected.length;
         // The file taken whole names the line exactly when the line changed alone would.
         expect(untouched(name, text, [n], spansOf(whole)), `${name} line ${n}: ${code.trim()}`).toEqual(untouched(name, text, [n], spansOf(here)));
