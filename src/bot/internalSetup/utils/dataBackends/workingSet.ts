@@ -23,6 +23,15 @@ export type WsReadResult =
   | { status: 'not-ready' };
 export type FlushNowOutcome = 'ok' | 'pending' | 'held' | 'deposed' | 'unavailable';
 
+/** One accepted write, as confirm answers for it; opaque to its holder. */
+export interface WsTicket {
+  readonly kind: 'ws';
+  readonly manager: WorkingSetManager;
+  readonly set: GuildWorkingSet;
+  readonly guildId: string;
+  readonly seq: number;
+}
+
 /**
  * Thrown by the facade for a write the backend cannot honor (acceptance window
  * closed, the guild fenced by a newer owner, or the process past its exit
@@ -55,11 +64,16 @@ interface WorkingDoc {
 
 type WsState = 'hydrating' | 'ready' | 'frozen-retained' | 'fenced' | 'failed';
 
+interface AppendBuffer {
+  chunk: string;
+  dirtySince: number;
+}
+
 class GuildWorkingSet {
   state: WsState = 'hydrating';
   readonly docs = new Map<string, WorkingDoc>();
   readonly appendKeys = new Set<string>();
-  readonly appendBuf = new Map<string, { chunk: string; dirtySince: number }>();
+  readonly appendBuf = new Map<string, AppendBuffer>();
   dirtyKeys = new Set<string>();
   windowOpenedAt: number | null = null;
   debounceTimer: NodeJS.Timeout | null = null;
@@ -69,6 +83,13 @@ class GuildWorkingSet {
   readyWaiters: Array<() => void> = [];
   // A drain froze it while it hydrated: it comes up frozen-retained.
   freezeWhenReady = false;
+  // Stamped at every accepted save, append and delete. landedSeq is the stamp
+  // a committed batch was built at: every write at or below it landed, or a
+  // later write of its document did.
+  writeSeq = 0;
+  landedSeq = 0;
+  // exportDirty carried its unflushed writes off: its later commits vouch for none of them.
+  exported = false;
 
   constructor(readonly guildId: string, public fence: FenceToken) {}
 
@@ -186,6 +207,7 @@ export class WorkingSetManager {
           if (buf.chunk.length > 0) appends.push({ key, chunk: buf.chunk, dirtySince: buf.dirtySince });
         }
         this.forgetDirty(ws);
+        ws.exported = true;
       }
       this.adoptions.delete(guildId);
       if (docs.length > 0 || appends.length > 0) out.push({ guildId, docs, appends });
@@ -427,6 +449,7 @@ export class WorkingSetManager {
     if (prev) this.dirtyBytes -= prev.dirty ? prev.content.length : 0;
     ws.docs.set(key, { content, tombstone: false, dirty: true, dirtySince: prev?.dirty ? prev.dirtySince : now });
     this.dirtyBytes += content.length;
+    ws.writeSeq += 1;
     this.markDirty(ws, key, now);
     return 'accepted';
   }
@@ -442,6 +465,7 @@ export class WorkingSetManager {
     else ws.appendBuf.set(key, { chunk: line, dirtySince: now });
     ws.appendKeys.add(key);
     this.dirtyBytes += line.length;
+    ws.writeSeq += 1;
     this.markDirty(ws, key, now);
     return 'accepted';
   }
@@ -467,8 +491,27 @@ export class WorkingSetManager {
     const buf = ws.appendBuf.get(key);
     if (buf) { this.dirtyBytes -= buf.chunk.length; ws.appendBuf.delete(key); }
     ws.appendKeys.delete(key);
+    ws.writeSeq += 1;
     this.markDirty(ws, key, now);
     return 'accepted';
+  }
+
+  /**
+   * A ticket at this guild's set's latest write: taken in that write's own synchronous run, or by
+   * unlandedDeleteTicket for an earlier delete, which any batch built from now on still carries.
+   */
+  ticketFor(guildId: string): WsTicket {
+    const ws = this.sets.get(guildId)!;
+    return { kind: 'ws', manager: this, set: ws, guildId, seq: ws.writeSeq };
+  }
+
+  /**
+   * For a delete that found the document already deleted: a ticket while that
+   * earlier delete has not landed, else null. A served set drops a tombstone
+   * once it commits, so every tombstone it still holds is unlanded.
+   */
+  unlandedDeleteTicket(guildId: string, module: string, filename: string): WsTicket | null {
+    return this.sets.get(guildId)?.docs.get(docKeyOf(module, filename))?.tombstone ? this.ticketFor(guildId) : null;
   }
 
   /** Non-recursive top-level .json listing parity for a module dir. */
@@ -538,9 +581,9 @@ export class WorkingSetManager {
     this.checkBounds(now);
   }
 
-  private buildBatch(ws: GuildWorkingSet): { batch: GuildFlushBatch; flushedKeys: string[]; appendLens: Map<string, number>; bytes: number } {
+  private buildBatch(ws: GuildWorkingSet): { batch: GuildFlushBatch; flushedKeys: string[]; appendLens: Map<string, { buf: AppendBuffer; len: number }>; bytes: number; seq: number } {
     const batch: GuildFlushBatch = { upserts: [], deletes: [], appends: [] };
-    const appendLens = new Map<string, number>();
+    const appendLens = new Map<string, { buf: AppendBuffer; len: number }>();
     let bytes = 0;
     const flushedKeys = [...ws.dirtyKeys];
     for (const key of flushedKeys) {
@@ -555,11 +598,11 @@ export class WorkingSetManager {
       }
       if (buf && buf.chunk.length > 0) {
         batch.appends.push({ key: dk, chunk: buf.chunk });
-        appendLens.set(key, buf.chunk.length);
+        appendLens.set(key, { buf, len: buf.chunk.length });
         bytes += buf.chunk.length;
       }
     }
-    return { batch, flushedKeys, appendLens, bytes };
+    return { batch, flushedKeys, appendLens, bytes, seq: ws.writeSeq };
   }
 
   /** True once this call's batch committed. */
@@ -569,7 +612,7 @@ export class WorkingSetManager {
     if (ws.debounceTimer) { clearTimeout(ws.debounceTimer); ws.debounceTimer = null; }
     if (ws.dirtyKeys.size === 0) { ws.windowOpenedAt = null; return false; }
 
-    const { batch, flushedKeys, appendLens, bytes } = this.buildBatch(ws);
+    const { batch, flushedKeys, appendLens, bytes, seq } = this.buildBatch(ws);
     ws.dirtyKeys = new Set();
     ws.windowOpenedAt = null;
     ws.flushInFlight = true;
@@ -577,15 +620,18 @@ export class WorkingSetManager {
     ws.flushInFlight = false;
 
     if (outcome.ok) {
+      // An evicted, replaced, exported or recycled set dropped or carried off
+      // its unflushed writes, so what it commits after that vouches for none.
+      if (!this.quiesced && this.sets.get(ws.guildId) === ws && !ws.exported) ws.landedSeq = seq;
       for (const key of flushedKeys) {
         if (ws.dirtyKeys.has(key)) continue; // re-dirtied mid-flight; next window owns it
         const doc = ws.docs.get(key);
         if (doc?.tombstone) ws.docs.delete(key);
         else if (doc) doc.dirty = false;
       }
-      for (const [key, len] of appendLens) {
-        const buf = ws.appendBuf.get(key);
-        if (!buf) continue;
+      for (const [key, { buf, len }] of appendLens) {
+        // A delete dropped the flushed buffer meanwhile: one there now holds only newer appends.
+        if (ws.appendBuf.get(key) !== buf) continue;
         buf.chunk = buf.chunk.slice(len);
         if (buf.chunk.length === 0 && !ws.dirtyKeys.has(key)) ws.appendBuf.delete(key);
       }
@@ -685,6 +731,45 @@ export class WorkingSetManager {
       if ((ws.state as WsState) === 'fenced') return 'deposed';
       // Refused by the store (unreachable, read-only): kept dirty and retried.
       return this.quiesced ? 'unavailable' : 'held';
+    }
+  }
+
+  /**
+   * flushGuildNow for one accepted write: 'ok' once a batch its set built at
+   * or after it committed (so a later write of the same document landing
+   * counts), 'held' when the store refused the commit, 'pending' at the
+   * deadline. Only the set that took the write answers for it: evicted,
+   * replaced, exported or recycled away before it landed, it is 'unavailable'.
+   */
+  async confirm(ticket: WsTicket, deadlineMs: number): Promise<FlushNowOutcome> {
+    const ws = ticket.set;
+    const deadline = performance.now() + deadlineMs;
+    for (;;) {
+      if (ws.landedSeq >= ticket.seq) return 'ok';
+      if (ws.state === 'fenced') return 'deposed';
+      if (this.quiesced || this.sets.get(ws.guildId) !== ws || ws.exported) return 'unavailable';
+      // Neither dirty nor on the wire: it left the set without landing.
+      if (!ws.flushInFlight && ws.dirtyKeys.size === 0) return 'unavailable';
+      const left = deadline - performance.now();
+      if (left <= 0) return 'pending';
+      if (ws.flushInFlight) {
+        // Referenced: the flush can end first and leave nothing else holding the process open.
+        await new Promise<void>(resolve => { setTimeout(resolve, Math.min(20, left)); });
+        continue;
+      }
+      let timer: NodeJS.Timeout | undefined;
+      const timeout = new Promise<'timeout'>(resolve => {
+        timer = setTimeout(() => resolve('timeout'), left);
+        timer.unref();
+      });
+      const committed = await Promise.race([this.flush(ws), timeout]);
+      clearTimeout(timer);
+      if (committed === 'timeout') return 'pending';
+      // Its batch was built after the write, so it carried it, unless the set left meanwhile.
+      if (committed) return ws.landedSeq >= ticket.seq ? 'ok' : 'unavailable';
+      if ((ws.state as WsState) === 'fenced') return 'deposed';
+      // Refused by the store (unreachable, read-only): kept dirty and retried.
+      return this.quiesced || this.sets.get(ws.guildId) !== ws || ws.exported ? 'unavailable' : 'held';
     }
   }
 

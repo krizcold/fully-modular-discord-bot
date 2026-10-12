@@ -19,6 +19,8 @@ import {
   enqueueWrite,
   enqueueAppend,
   enqueueDelete,
+  fileTicket,
+  confirmFile,
   existsOnDisk,
   readFileUtf8,
   readRaw,
@@ -46,6 +48,8 @@ import {
 } from './dataBackends/fileBackend';
 import { routeFor } from './dataBackends/routeResolver';
 import { getWorkingSet, DataBackendUnavailableError } from './dataBackends/workingSet';
+import type { WsTicket } from './dataBackends/workingSet';
+import type { FileTicket } from './dataBackends/fileBackend';
 import { sweepGraveyardRows, PostgresBackend } from './dataBackends/postgresBackend';
 import type { DataBackend, FenceToken } from './dataBackends/backend';
 import { loadCredentials } from '../../../utils/envLoader';
@@ -246,6 +250,21 @@ export async function flushGuildOutcome(guildId: string, deadlineMs: number): Pr
     return now && now !== ws && now.holdsWritesFor(guildId) ? 'pending' : 'unavailable';
   }
   return 'ok';
+}
+
+/**
+ * flushGuildOutcome for one accepted write: a later write of the same
+ * document landing counts for it, and other writes of the guild still
+ * queued do not.
+ */
+export async function confirmWrite(ticket: WriteTicket, deadlineMs: number): Promise<'ok' | 'pending' | 'held' | 'deposed' | 'unavailable'> {
+  if (ticket.kind === 'file') return confirmFile(ticket, deadlineMs);
+  const outcome = await ticket.manager.confirm(ticket, deadlineMs);
+  if (outcome !== 'unavailable') return outcome;
+  // Recycled: the successor may hold it carried, or it landed there or was
+  // dropped, which this side cannot tell apart.
+  const now = getWorkingSet();
+  return now && now !== ticket.manager && now.holdsWritesFor(ticket.guildId) ? 'pending' : 'unavailable';
 }
 
 /**
@@ -545,6 +564,17 @@ export function loadData<T = any>(
   }
 }
 
+/** One accepted write, as confirmWrite answers for it. */
+export type WriteTicket = WsTicket | FileTicket;
+
+/** Why a write was refused without a throw: its guild's working set is not ready (or not in this process), or storage failed. */
+export type WriteRefusal = 'not-ready' | 'io';
+
+export type SaveTracked = { outcome: 'saved'; ticket: WriteTicket } | { outcome: 'frozen' } | { outcome: 'refused'; cause: WriteRefusal };
+export type AppendTracked = { outcome: 'appended'; ticket: WriteTicket } | { outcome: 'frozen' } | { outcome: 'refused'; cause: WriteRefusal };
+/** An absent delete carries a ticket while an earlier delete of the same document has not landed. */
+export type DeleteTracked = { outcome: 'deleted'; ticket: WriteTicket } | { outcome: 'absent'; ticket?: WriteTicket } | { outcome: 'frozen' } | { outcome: 'refused'; cause: WriteRefusal };
+
 /**
  * Save JSON data to file
  * Automatically creates directory if needed
@@ -559,27 +589,33 @@ export function saveData<T = any>(
 
 /** A save that says whether it was accepted, met a frozen guild, or was refused (a set not ready, an I/O error). */
 export function saveDataOutcome<T = any>(filename: string, options: DataOptions, data: T): 'saved' | 'frozen' | 'refused' {
+  return saveDataTracked(filename, options, data).outcome;
+}
+
+/** saveDataOutcome with the ticket of an accepted write, or the cause of a refusal. */
+export function saveDataTracked<T = any>(filename: string, options: DataOptions, data: T): SaveTracked {
   if (closedForExit) throw new DataBackendUnavailableError('node-stopping');
   try {
     if (isGuildFrozen(options)) {
       frozenWriteRejections += 1;
-      return 'frozen';
+      return { outcome: 'frozen' };
     }
     const wsGuild = wsRouted(options);
     if (wsGuild !== null) {
       const ws = getWorkingSet();
       if (!ws) {
         console.warn(`[Data] Write for postgres-routed guild ${wsGuild} outside the bot process; refused`);
-        return 'refused';
+        return { outcome: 'refused', cause: 'not-ready' };
       }
       const content = JSON.stringify(data, null, 2);
       const result = ws.save(wsGuild, options.category ?? '', filename, content);
       if (result === 'accepted') {
+        const ticket = ws.ticketFor(wsGuild);
         getMetricsCollector().recordIO('write', options.guildId ?? null, options.category ?? null);
-        return 'saved';
+        return { outcome: 'saved', ticket };
       }
-      if (result === 'frozen-window') { frozenWriteRejections += 1; return 'frozen'; }
-      if (result === 'not-ready') return 'refused';
+      if (result === 'frozen-window') { frozenWriteRejections += 1; return { outcome: 'frozen' }; }
+      if (result === 'not-ready') return { outcome: 'refused', cause: 'not-ready' };
       throw new DataBackendUnavailableError(result === 'fenced' ? 'guild-fenced' : result === 'read-only' ? 'database-read-only' : 'database-unreachable');
     }
     const dir = getDataDirectory(options);
@@ -593,14 +629,15 @@ export function saveDataOutcome<T = any>(filename: string, options: DataOptions,
 
     const content = JSON.stringify(data, null, 2);
     enqueueWrite(filePath, content);
+    const ticket = fileTicket(filePath);
     getMetricsCollector().recordIO('write', scope === 'global' ? null : options.guildId ?? null, options.category ?? null);
 
     console.log(`[DataManager] Saved ${filename} to ${filePath}`);
-    return 'saved';
+    return { outcome: 'saved', ticket };
   } catch (error) {
     if (error instanceof DataBackendUnavailableError) throw error;
     console.error(`[DataManager] Error saving ${filename}:`, error);
-    return 'refused';
+    return { outcome: 'refused', cause: 'io' };
   }
 }
 
@@ -609,26 +646,32 @@ export function saveDataOutcome<T = any>(filename: string, options: DataOptions,
  * line on crash is tolerated by callers (they skip bad lines on read).
  */
 export function appendData(filename: string, options: DataOptions, line: string): boolean {
+  return appendDataTracked(filename, options, line).outcome === 'appended';
+}
+
+/** appendData with the ticket of an accepted append, or the cause of a refusal. */
+export function appendDataTracked(filename: string, options: DataOptions, line: string): AppendTracked {
   if (closedForExit) throw new DataBackendUnavailableError('node-stopping');
   try {
     if (isGuildFrozen(options)) {
       frozenWriteRejections += 1;
-      return false;
+      return { outcome: 'frozen' };
     }
     const wsGuild = wsRouted(options);
     if (wsGuild !== null) {
       const ws = getWorkingSet();
       if (!ws) {
         console.warn(`[Data] Append for postgres-routed guild ${wsGuild} outside the bot process; refused`);
-        return false;
+        return { outcome: 'refused', cause: 'not-ready' };
       }
       const result = ws.append(wsGuild, options.category ?? '', filename, line);
       if (result === 'accepted') {
+        const ticket = ws.ticketFor(wsGuild);
         getMetricsCollector().recordIO('write', options.guildId ?? null, options.category ?? null);
-        return true;
+        return { outcome: 'appended', ticket };
       }
-      if (result === 'frozen-window') { frozenWriteRejections += 1; return false; }
-      if (result === 'not-ready') return false;
+      if (result === 'frozen-window') { frozenWriteRejections += 1; return { outcome: 'frozen' }; }
+      if (result === 'not-ready') return { outcome: 'refused', cause: 'not-ready' };
       throw new DataBackendUnavailableError(result === 'fenced' ? 'guild-fenced' : result === 'read-only' ? 'database-read-only' : 'database-unreachable');
     }
     const dir = getDataDirectory(options);
@@ -638,12 +681,13 @@ export function appendData(filename: string, options: DataOptions, line: string)
     if (scope === 'guild' && options.guildId) stampOwner(options.guildId);
 
     enqueueAppend(filePath, line);
+    const ticket = fileTicket(filePath);
     getMetricsCollector().recordIO('write', scope === 'global' ? null : options.guildId ?? null, options.category ?? null);
-    return true;
+    return { outcome: 'appended', ticket };
   } catch (error) {
     if (error instanceof DataBackendUnavailableError) throw error;
     console.error(`[DataManager] Error appending ${filename}:`, error);
-    return false;
+    return { outcome: 'refused', cause: 'io' };
   }
 }
 
@@ -673,51 +717,60 @@ export function deleteData(filename: string, options: DataOptions): boolean {
 
 /** A delete that says whether it was done, found nothing to delete, met a frozen guild, or was refused (a set not ready, an I/O error). */
 export function deleteDataOutcome(filename: string, options: DataOptions): 'deleted' | 'absent' | 'frozen' | 'refused' {
+  return deleteDataTracked(filename, options).outcome;
+}
+
+/** deleteDataOutcome with the ticket of an accepted delete, or the cause of a refusal. */
+export function deleteDataTracked(filename: string, options: DataOptions): DeleteTracked {
   if (closedForExit) throw new DataBackendUnavailableError('node-stopping');
   try {
     if (isGuildFrozen(options)) {
       frozenWriteRejections += 1;
-      return 'frozen';
+      return { outcome: 'frozen' };
     }
     const wsGuild = wsRouted(options);
     if (wsGuild !== null) {
       const ws = getWorkingSet();
       if (!ws) {
         console.warn(`[Data] Delete for postgres-routed guild ${wsGuild} outside the bot process; refused`);
-        return 'refused';
+        return { outcome: 'refused', cause: 'not-ready' };
       }
       const result = ws.delete(wsGuild, options.category ?? '', filename);
       if (result === 'absent') {
         console.log(`[DataManager] File not found for deletion: ${wsGuild}/${options.category ?? ''}/${filename}`);
-        return 'absent';
+        const earlier = ws.unlandedDeleteTicket(wsGuild, options.category ?? '', filename);
+        return earlier ? { outcome: 'absent', ticket: earlier } : { outcome: 'absent' };
       }
       if (result === 'accepted') {
+        const ticket = ws.ticketFor(wsGuild);
         console.log(`[DataManager] Deleted ${wsGuild}/${options.category ?? ''}/${filename}`);
-        return 'deleted';
+        return { outcome: 'deleted', ticket };
       }
-      if (result === 'frozen-window') { frozenWriteRejections += 1; return 'frozen'; }
-      if (result === 'not-ready') return 'refused';
+      if (result === 'frozen-window') { frozenWriteRejections += 1; return { outcome: 'frozen' }; }
+      if (result === 'not-ready') return { outcome: 'refused', cause: 'not-ready' };
       throw new DataBackendUnavailableError(result === 'fenced' ? 'guild-fenced' : result === 'read-only' ? 'database-read-only' : 'database-unreachable');
     }
     const filePath = getDataFilePath(filename, options);
 
     const pending = getPending(filePath);
     const existsNow = existsOnDisk(filePath);
-    // Nothing to delete: neither a queued write nor a file on disk.
+    // Nothing to delete: neither a queued write nor a file on disk. A queued
+    // delete has not landed, and an op on the wire ahead of it may create the file.
     if (!existsNow && (!pending || pending.op === 'delete')) {
       console.log(`[DataManager] File not found for deletion: ${filePath}`);
-      return 'absent';
+      return pending ? { outcome: 'absent', ticket: fileTicket(filePath) } : { outcome: 'absent' };
     }
 
     // Enqueue a delete tombstone (serialized with in-flight writes so a queued
     // write cannot resurrect the file).
     enqueueDelete(filePath);
+    const ticket = fileTicket(filePath);
     console.log(`[DataManager] Deleted ${filePath}`);
-    return 'deleted';
+    return { outcome: 'deleted', ticket };
   } catch (error) {
     if (error instanceof DataBackendUnavailableError) throw error;
     console.error(`[DataManager] Error deleting ${filename}:`, error);
-    return 'refused';
+    return { outcome: 'refused', cause: 'io' };
   }
 }
 

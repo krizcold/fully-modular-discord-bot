@@ -3,23 +3,26 @@
  * (spec 6.3). The parent never writes a postgres-routed guild itself: every
  * guild data op lands here, is applied locally when this node owns the guild,
  * and is otherwise forwarded by the master to the owning worker over the
- * control channel. Operator writes are durability-immediate (flushed before
- * the ok), so 'ok' means committed and 'pending' means accepted-but-retrying.
+ * control channel. Operator writes are durability-immediate (confirmed before
+ * the ok), so 'ok' means committed and 'pending' means accepted-but-retrying;
+ * a delete that finds nothing, with no earlier delete of it still to land, is
+ * done at once.
  */
 
 import * as fs from 'fs';
 import { dataPath } from '../../../utils/dataRoot';
 import {
-  deleteDataOutcome,
+  confirmWrite,
+  deleteDataTracked,
   deleteGuildNamespace,
-  flushGuildOutcome,
   isGuildWriteFrozen,
   listGuildDataFiles,
   listGuildDataKeys,
   readGuildDocRaw,
   restoreGuildFromGraveyard,
-  saveDataOutcome,
+  saveDataTracked,
 } from './dataManager';
+import type { WriteTicket } from './dataManager';
 import { DataBackendUnavailableError, getWorkingSet } from './dataBackends/workingSet';
 import { awaitGuildDataReady } from './dataBackends/boot';
 import { getFleetState } from '../fleet/state';
@@ -97,6 +100,7 @@ export async function applyOperatorDataWrite(req: GuildDataWriteRequest): Promis
   if (!(await awaitGuildDataReady(guildId))) {
     return { ok: false, code: 'backend-unavailable', error: 'guild data is not ready' };
   }
+  let ticket: WriteTicket;
   try {
     if (op === 'restore-graveyard') {
       let retiredAt: number | undefined;
@@ -129,10 +133,14 @@ export async function applyOperatorDataWrite(req: GuildDataWriteRequest): Promis
     }
     const options = module ? { guildId, category: module } : { guildId };
     if (op === 'delete') {
-      // Nothing to delete is done; a frozen guild or a refusal is not.
-      const deleted = deleteDataOutcome(filename, options);
-      if (deleted === 'frozen') return { ok: false, code: 'frozen' };
-      if (deleted === 'refused') return { ok: false, code: 'backend-unavailable', error: 'delete not accepted' };
+      // Nothing to delete is done, with nothing to confirm; an earlier delete
+      // of it not landed yet is confirmed as this one. A frozen guild or a
+      // refusal is not done.
+      const deleted = deleteDataTracked(filename, options);
+      if (deleted.outcome === 'frozen') return { ok: false, code: 'frozen' };
+      if (deleted.outcome === 'refused') return { ok: false, code: 'backend-unavailable', error: 'delete not accepted' };
+      if (!deleted.ticket) return { ok: true };
+      ticket = deleted.ticket;
     } else {
       let parsed: unknown;
       try {
@@ -140,9 +148,10 @@ export async function applyOperatorDataWrite(req: GuildDataWriteRequest): Promis
       } catch {
         return { ok: false, code: 'invalid', error: 'contentJson is not valid JSON' };
       }
-      const saved = saveDataOutcome(filename, options, parsed);
-      if (saved === 'frozen') return { ok: false, code: 'frozen' };
-      if (saved === 'refused') return { ok: false, code: 'backend-unavailable', error: 'write not accepted' };
+      const saved = saveDataTracked(filename, options, parsed);
+      if (saved.outcome === 'frozen') return { ok: false, code: 'frozen' };
+      if (saved.outcome === 'refused') return { ok: false, code: 'backend-unavailable', error: 'write not accepted' };
+      ticket = saved.ticket;
     }
   } catch (error) {
     if (error instanceof DataBackendUnavailableError) {
@@ -150,14 +159,15 @@ export async function applyOperatorDataWrite(req: GuildDataWriteRequest): Promis
     }
     return { ok: false, code: 'io-error', error: error instanceof Error ? error.message : String(error) };
   }
-  const outcome = await flushGuildOutcome(guildId, 8000);
+  // This write's own confirmation: other writers' queued writes to the guild are theirs.
+  const outcome = await confirmWrite(ticket, 8000);
   if (outcome === 'ok') return { ok: true };
   if (outcome === 'pending') return { ok: true, pending: true };
   if (outcome === 'deposed') return { ok: false, code: 'not-owner', error: 'guild ownership moved mid-write' };
   // Refused by the store, the write is kept and retried: no failure, and the
   // operator learns it is not durable yet.
   if (outcome === 'held') return { ok: true, pending: true, note: 'it is not saved yet; this node retries while it serves this guild, and loses it if the bot stops, the guild moves or the node loses its database first' };
-  return { ok: false, code: 'backend-unavailable', error: 'this node switched databases while saving; whether the write was carried over is unknown, so reload the data to check' };
+  return { ok: false, code: 'backend-unavailable', error: 'this write left this node before it was confirmed saved (the guild moved or was unloaded, its data was deleted or restored from the graveyard, or the node switched databases), so whether it was saved is unknown; reload the data to check' };
 }
 
 /**

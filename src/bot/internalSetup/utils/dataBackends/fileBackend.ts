@@ -39,6 +39,26 @@ const pendingOps = new Map<string, PendingOp>();
 const flushing = new Set<string>();
 const scheduled = new Set<string>();
 let opSeq = 0;
+// Per path a ticket was issued for, while an op is queued for it: the seq of
+// the last op that landed, so an op at or below it landed itself or was
+// followed by one that did. Its tickets hold the record, so it leaves the map
+// once nothing is queued for the path, and a later record starts afresh.
+export interface LandingRecord {
+  landed: number;
+}
+const landingRecords = new Map<string, LandingRecord>();
+
+// The landed op's tickets hold the record its path had when the flush began,
+// which a drop may have retired since, or else one a ticket made meanwhile.
+function noteLanded(absPath: string, atStart: LandingRecord | undefined, seq: number): void {
+  const record = atStart ?? landingRecords.get(absPath);
+  if (record && seq > record.landed) record.landed = seq;
+}
+
+/** Landing records held for ticketed paths with an op still queued. */
+export function fileLandingRecords(): number {
+  return landingRecords.size;
+}
 // A failed flush is tried again on its own, backing off to a minute, so a
 // write held through a disk fault lands once the disk takes it.
 const retryAttempts = new Map<string, number>();
@@ -121,11 +141,13 @@ function delay(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-async function flushPath(absPath: string): Promise<void> {
-  if (flushing.has(absPath)) return;
+/** True once this call's op landed. */
+async function flushPath(absPath: string): Promise<boolean> {
+  if (flushing.has(absPath)) return false;
   const entry = pendingOps.get(absPath);
-  if (!entry) return;
+  if (!entry) return false;
   flushing.add(absPath);
+  const record = landingRecords.get(absPath);
   try {
     const seqAtStart = entry.seq;
     try {
@@ -143,33 +165,45 @@ async function flushPath(absPath: string): Promise<void> {
         // must trim ONLY the bytes we persisted, never re-append them.
         await fs.promises.mkdir(path.dirname(absPath), { recursive: true });
         const flushed = entry.content; // snapshot before the await
+        const flushedSeq = entry.seq;
         await fs.promises.appendFile(absPath, flushed, 'utf-8');
+        noteLanded(absPath, record, flushedSeq);
         // A concurrent append may have grown the entry mid-flush; keep the tail.
+        // An op that replaced the entry meanwhile is flushed next, untrimmed.
         const cur = pendingOps.get(absPath);
-        if (cur && cur.op === 'append') {
-          cur.content = cur.content.slice(flushed.length);
-          if (cur.content.length === 0) pendingOps.delete(absPath);
-          else scheduleFlush(absPath); // flush only the remaining tail
+        if (cur === entry) {
+          entry.content = entry.content.slice(flushed.length);
+          if (entry.content.length === 0) {
+            pendingOps.delete(absPath);
+            landingRecords.delete(absPath);
+          } else {
+            scheduleFlush(absPath); // flush only the remaining tail
+          }
+        } else if (cur) {
+          scheduleFlush(absPath);
         }
         flushesLanded += 1;
         retryAttempts.delete(absPath);
-        return; // bypass the generic seq-drop below (only correct for write/delete)
+        return true; // bypass the generic seq-drop below (only correct for write/delete)
       }
     } catch (error) {
       flushFailures += 1;
       console.error(`[DataManager] Flush failed for ${absPath} (will retry):`, error);
       scheduleRetry(absPath);
-      return; // keep the pending entry + tmp file; the retry, the next write or flushAll tries again
+      return false; // keep the pending entry + tmp file; the retry, the next write or flushAll tries again
     }
     flushesLanded += 1;
     retryAttempts.delete(absPath);
+    noteLanded(absPath, record, seqAtStart);
     // Drop the entry only if no newer op arrived while we were flushing.
     const current = pendingOps.get(absPath);
     if (current && current.seq === seqAtStart) {
       pendingOps.delete(absPath);
+      landingRecords.delete(absPath);
     } else if (current) {
       scheduleFlush(absPath);
     }
+    return true;
   } finally {
     flushing.delete(absPath);
   }
@@ -268,10 +302,14 @@ export function enqueueWrite(absPath: string, content: string): void {
 
 export function enqueueAppend(absPath: string, line: string): void {
   const existing = pendingOps.get(absPath);
-  // Coalesce consecutive appends waiting on the same flush into one op.
+  // Coalesce consecutive appends waiting on the same flush into one op. Behind
+  // a queued write or delete, the append joins it as one whole-file write, so
+  // that op is not dropped.
   if (existing && existing.op === 'append') {
     existing.content += line;
     existing.seq = ++opSeq;
+  } else if (existing) {
+    pendingOps.set(absPath, { op: 'write', content: (existing.op === 'write' ? existing.content : '') + line, seq: ++opSeq });
   } else {
     pendingOps.set(absPath, { op: 'append', content: line, seq: ++opSeq });
   }
@@ -281,6 +319,67 @@ export function enqueueAppend(absPath: string, line: string): void {
 export function enqueueDelete(absPath: string): void {
   pendingOps.set(absPath, { op: 'delete', seq: ++opSeq });
   scheduleFlush(absPath);
+}
+
+/** One queued op, as confirmFile answers for it. */
+export interface FileTicket {
+  readonly kind: 'file';
+  readonly path: string;
+  readonly seq: number;
+  readonly record: LandingRecord;
+}
+
+/** The ticket for the op queued on this path now: taken in the enqueue's own synchronous run, or for a delete still queued that an absent delete finds. */
+export function fileTicket(absPath: string): FileTicket {
+  let record = landingRecords.get(absPath);
+  if (!record) {
+    record = { landed: 0 };
+    landingRecords.set(absPath, record);
+  }
+  return { kind: 'file', path: absPath, seq: pendingOps.get(absPath)!.seq, record };
+}
+
+/**
+ * Whether the disk holds one queued op, flushing it now: 'ok' once it, or a
+ * later op to the same path, landed; 'pending' at the deadline. As flushPaths
+ * gives up in line, three failed attempts, 25 and then 50 ms apart, with no
+ * newer op arriving while one is under way, answer 'held' for an entry still
+ * queued, and its retry owns the rest. Its waits are referenced: the flush they
+ * wait on can end first and leave nothing else holding the process open.
+ */
+export async function confirmFile(ticket: FileTicket, deadlineMs: number): Promise<'ok' | 'pending' | 'held' | 'unavailable'> {
+  const deadline = performance.now() + deadlineMs;
+  let stuckAttempts = 0;
+  for (;;) {
+    if (ticket.record.landed >= ticket.seq) return 'ok';
+    // Its record retired without reaching it, or nothing queued: it was dropped.
+    if (landingRecords.get(ticket.path) !== ticket.record || !pendingOps.has(ticket.path)) return 'unavailable';
+    const left = deadline - performance.now();
+    if (left <= 0) return 'pending';
+    if (flushing.has(ticket.path)) {
+      await new Promise<void>(resolve => { setTimeout(resolve, Math.min(20, left)); });
+      continue;
+    }
+    const before = pendingOps.get(ticket.path)!.seq;
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<'timeout'>(resolve => {
+      timer = setTimeout(() => resolve('timeout'), left);
+      timer.unref();
+    });
+    const landed = await Promise.race([flushPath(ticket.path), timeout]);
+    clearTimeout(timer);
+    if (landed === 'timeout') return 'pending';
+    if (landed) continue;
+    const after = pendingOps.get(ticket.path);
+    if (!after) continue;
+    if (after.seq !== before) {
+      stuckAttempts = 0; // a newer op arrived: progress
+      continue;
+    }
+    if (++stuckAttempts >= 3) return 'held';
+    const wait = Math.min(25 * stuckAttempts, deadline - performance.now());
+    if (wait > 0) await new Promise<void>(resolve => { setTimeout(resolve, wait); });
+  }
 }
 
 export function existsOnDisk(absPath: string): boolean {
@@ -375,6 +474,7 @@ export function dropPendingForGuild(guildId: string): void {
   for (const key of [...pendingOps.keys()]) {
     if (key === src || key.startsWith(prefix)) {
       pendingOps.delete(key);
+      landingRecords.delete(key);
       clearRetry(key);
     }
   }
