@@ -4,7 +4,7 @@ import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { onTestFinished } from 'vitest';
-import { scrubEnv } from './env';
+import { DEAD_ENDS, scrubEnv } from './env';
 import { STEP_MS } from './time.mjs';
 
 // The repo this suite sits in, found from this file's own place, so a copy of
@@ -25,14 +25,18 @@ export interface ScenarioRun<T> {
   loaded: string[];
 }
 
+// The env a scenario step runs with: only what helpers/env.ts lets through, pg
+// and git pointed at nothing, NODE_ENV 'test' and its own DATA_DIR.
+export function childEnv(dataDir: string): NodeJS.ProcessEnv {
+  return { ...scrubEnv({ ...process.env }), ...DEAD_ENDS, NODE_ENV: 'test', DATA_DIR: dataDir };
+}
+
 // Runs one scenario step in its own process and returns its RESULT line. The
 // child's cwd is its data dir, so a `dotenv/config` import in the bot finds no
-// .env; its env is this one minus every bot configuration key (helpers/env.ts),
-// with NODE_ENV 'test' and its own DATA_DIR. It fails on a missing RESULT line,
-// a nonzero exit, a timeout, or a bot module loaded from anywhere but this
-// repo's dist.
+// .env; its env is childEnv's. It fails on a missing RESULT line, a nonzero
+// exit, a timeout, or a bot module loaded from anywhere but this repo's dist.
 export function runScenario<T>(script: string, args: string[], dataDir: string, timeoutMs = STEP_MS): Promise<ScenarioRun<T>> {
-  const env: NodeJS.ProcessEnv = { ...scrubEnv({ ...process.env }), NODE_ENV: 'test', DATA_DIR: dataDir };
+  const env = childEnv(dataDir);
   const child = spawn(process.execPath, [path.join(SCENARIOS, script), ...args], { cwd: dataDir, env, stdio: ['ignore', 'pipe', 'pipe'] });
   let stdout = '';
   let stderr = '';

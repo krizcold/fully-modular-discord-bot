@@ -8,14 +8,16 @@ active mutant travels in `__STRYKER_ACTIVE_MUTANT__` and reaches child processes
 | File | What it does |
 |---|---|
 | touched.mjs | the gate: finds the touched lines, runs the passes, writes the report; exit 0 PASS, 1 FAIL, 2 NO RESULT |
-| ranges.mjs | (library) the touched lines from `git diff -U0` and how far each widens; unit/mutationRanges.test.ts |
+| ranges.mjs | (library) the files git names as changed, their changed lines from the gate's own line diff, and how far each widens; unit/mutationRanges.test.ts |
 | verdict.mjs | (library) when a run counts as a kill, which mutants go to which pass, the verdict; unit/mutationVerdict.test.ts |
 | runner.mjs | the command every pass runs inside Stryker's sandbox; unit/mutationRunner.test.ts |
 | control.mjs | (library) the run with no mutant after the reruns; unit/mutationRunner.test.ts |
-| passes.mjs | (data) each pass's Stryker options and budget; unit/mutationRunner.test.ts |
+| passes.mjs | (data) the Stryker options every pass shares, and each pass's own options and budget; unit/mutationRunner.test.ts |
+| stryker.json | (data) empty on purpose: every pass names it as its config file, so Stryker never reads one it finds in the bot root |
 | keys.mjs | (library) how a file and a mutant are named across passes; unit/mutationRanges.test.ts |
 | targets.mjs | (Stryker reporter) which mutant ids a later pass runs tests for; unit/mutationRunner.test.ts and the bite |
 | ../helpers/time.mjs | the factor on every test's time limits (4 in a rerun alone) |
+| ../helpers/env.ts, setup.ts | what a test and its children keep of the environment, and the run's fast-check seed |
 | ../helpers/build.cjs | builds dist the way `npm run build` does, stamped and locked; pass B's buildCommand |
 | ../helpers/child.ts | runs a child scenario (test/child/scenarios/) and checks what it loaded |
 
@@ -28,9 +30,10 @@ From the bot root, with Node 22.12 or newer (or SMDB_TEST_NODE set, as for `npm 
 
 - With no option it mutates the change from HEAD to the working tree: the job before it is committed. For a job already
   committed, pass `--base` the commit before it; `--base main` takes everything since the merge-base with main (a
-  branch). Untracked files under src are taken whole.
-- `--mutate src/x.ts:10-20` (a file in the bot root that exists, or such a file and lines, repeatable; never a glob)
-  skips git; every mutant it makes gates. The file is taken under the name it has on disk, from the bot root with
+  branch). A file new to src is taken whole: an untracked one, one added, and one moved in from outside src (or from a
+  browser view, or from a name that is not code). A file renamed within src gates its changed lines only.
+- `--mutate src/x.ts:10-20` (a file in the bot root that exists, or such a file and lines, repeatable; never a glob,
+  never columns) skips git; every mutant it makes gates. The file is taken under the name it has on disk, from the bot root with
   forward slashes (its case, and its path once links are resolved), however it was spelled: `./`, `..`, and on Windows
   backslashes or another case. A file in a diff is matched by that name too, for Stryker matches the names on disk.
 - `--concurrency N` sets pass A's parallel runs (default: half the cores); pass B uses half of that.
@@ -41,8 +44,10 @@ From the bot root, with Node 22.12 or newer (or SMDB_TEST_NODE set, as for `npm 
   killed on Windows exits 1 too.
 
 Pass A needs nothing running. Pass B runs the integration tests that import the mutated files, so it needs Docker when
-there are any. The git diff covers the whole repo and sets every option a user's git config could change (path
-prefixes, rename and copy detection, the diff algorithm, hunk joining).
+there are any. git only names the files that changed, over the whole repo (a rename found by git's own measure, with no
+limit on how many files it compares), and gives each one's text at the base; the gate finds the changed lines itself, a
+shortest line diff of the two texts, so no git setting, attribute or variable moves them (unit/mutationRanges.test.ts
+runs it under a hostile config).
 
 ## What it mutates
 
@@ -62,10 +67,15 @@ prefixes, rename and copy detection, the diff algorithm, hunk joining).
   real files.
 - The other mutants in the widened ranges are **context**: they run in pass A and are listed, but never fail the gate.
 - A pure deletion has no line left to mutate: its two neighbouring lines are context only.
-- Not mutated, and named in the report with the reason: files outside src (the root scripts, updaters/, tests and
-  docs), files that are not code, `.d.ts` files, the browser views under src/webui/public (copied into dist, never
-  compiled, and no test loads them yet), and a file that holds a line break git does not count (a lone CR, U+2028 or
-  U+2029), whose lines git and Stryker would number differently; `--mutate` refuses such a file.
+- A run of lines only added, or only taken out, that could sit in more than one place because the lines beside it repeat
+  it (an `if` block added after an equal one) counts in every place it could sit, so the copy that changed is never
+  left to the diff's choice.
+- Not mutated, and named in the report with the reason: files outside src (the root scripts, updaters/, tests, docs and
+  images), files that are not code, `.d.ts` files, the browser views under src/webui/public (copied into dist, never
+  compiled, and no test loads them yet), a file deleted or moved out of src, an untracked git repository under src (git
+  lists none of its files), a change that leaves no line changed (a rename, a mode change, line endings only), and a
+  file that holds a line break Stryker counts and the gate does not (a lone CR, U+2028 or U+2029), whose lines the two
+  would number differently; `--mutate` refuses such a file.
 - A changed line of code that no mutant lies wholly on, in a diff, an untracked file or a `--mutate` pattern, is named
   in the report: L5 says nothing about it. A mutant that spans several lines (emptying a body, an object or an array,
   flipping a condition split over lines, a chained call) counts for none of them, since it says nothing about each
@@ -73,9 +83,9 @@ prefixes, rename and copy detection, the diff algorithm, hunk joining).
   a bare `await f();`, an `else`, `try`, `finally` or `do` line, and every line of a multi-line object, array, arrow
   body, call or condition with no mutant of its own land in the list. A file taken whole names the same lines as each
   of its lines changed alone. The list can name a line some mutant reaches; it never leaves out a line of code that no
-  mutant lies on. A line of brackets and separators only is not a line of code: no mutant can lie on it, and what was
-  taken out of it (`}, 100);` made `});`), like a pure deletion, is neither mutated nor named. A deleted file is named
-  too. A `--mutate` pattern that made no mutant is named on its own, beside other patterns on the same file.
+  mutant lies on. A line of brackets and separators only is not a line of code: what was taken out of it (`}, 100);`
+  made `});`), like a pure deletion, is neither mutated nor named. A deleted file is named too. A `--mutate` pattern that
+  made no mutant is named on its own, beside other patterns on the same file.
 
 ## The passes
 
@@ -92,8 +102,12 @@ prefixes, rename and copy detection, the diff algorithm, hunk joining).
 3. **Reruns alone.** Every run stops at its first failure. A rerun runs one mutant at a time and gives every test, hook
    and child scenario step four times its time limit (a test's own explicit limit is not scaled), and Stryker a larger
    budget for the whole run.
-   - A gating mutant that timed out in pass A reruns with pass A's tests. It counts as killed when the rerun hangs the
-     tests again or fails a test; one that then survives goes on to pass B.
+   - A gating mutant that timed out in pass A reruns with pass A's tests. It counts as killed when the rerun fails a
+     test, or times out again: a test or a hook past four times its limit, or the whole run past Stryker's budget for
+     it, which is four times what those tests take with no mutant, plus a minute. That budget fires first whenever
+     those tests take under 15 seconds, so a mutant that only slows several tests, each within its own limit, by that
+     much in all counts as killed; each confirmed timeout is listed with its replacement, to check. One that survives
+     the rerun goes on to pass B.
    - In pass B, where containers and children can be slow or fail on their own, a hang never counts: a mutant that
      only hangs a test there is inconclusive. A test that waits must bound its wait and fail, as a child scenario step
      does ("did not finish in N ms" is a failure, not a hang). A child test's own limit is fifteen steps' bounds, so in
@@ -118,6 +132,11 @@ connection dropped, exhausted resources). The machine's texts are matched agains
 never an assertion or a child's stderr, which may name such an error as the thing under test; the list cannot be
 complete, which is why pass B's kills must repeat.
 
+Every run of the gate draws one fast-check seed (named on the Scope line; set SMDB_TEST_SEED to run with a given one),
+so a property draws the same inputs in every mutant's run as in the run with no mutant: a property that fails in a
+mutant's run fails for the mutant. A test that is random in another way (its own Math.random, the clock) can still fail
+by chance in one mutant's run, and a pass A kill stands on that one run.
+
 ## The report
 
 `test/mutation/reports/<time>/` (ignored by git; delete it whenever you like):
@@ -126,8 +145,8 @@ complete, which is why pass B's kills must repeat.
   mutant touched, the gating mutants by outcome, every survivor, silenced and inconclusive mutant with its place and
   replacement (with why a kill or timeout did not count), the confirmed timeouts, the context mutants, the runs with no
   mutant after the reruns, and the verdict.
-- `mutants.json` has every mutant: its place, original text and replacement, whether it gates, and per pass its status
-  and the test that killed it.
+- `mutants.json` has the run's fast-check seed and every mutant: its place, original text and replacement, whether it
+  gates, and per pass its status and the test that killed it.
 - `a/`, `a2/`, `b/` and `b2-1/`, `b2-2/` (one per test file that killed in pass B) hold one vitest JSON report and log
   per mutant run (`dry-*` is the run with no mutant); `control-a2/` and `control-b2/` hold the runs with no mutant
   after the reruns.
@@ -149,11 +168,12 @@ child away from anything real:
 - the bot root comes from the file's own place (never a fixed path), so a sandbox runs its own dist;
 - the child's cwd is its own data dir (the bot's `dotenv/config` imports read `.env` from the cwd, and the root `.env`
   of a main checkout holds the real token);
-- its env is the test's minus every bot configuration key (helpers/env.ts: every key src reads from process.env by name,
-  the payment providers' prefixes envLoader copies, and dotenv's own DOTENV_ keys, which could load a real .env from
-  anywhere; unit/envScrub.test.ts holds the list to src), with NODE_ENV
-  `test` and its own DATA_DIR; the active mutant passes. Not covered: configManager also reads process.env[key] for any
-  config key; DEVS and testMode are scrubbed, a module's own config key is not;
+- its env, like each test's own (helpers/setup.ts), keeps only the platform's variables, the test tools' (vitest,
+  Docker, testcontainers, the active mutant) and the suite's own SMDB_ ones (helpers/env.ts): every other variable is
+  taken out, whoever would read it (src by name or through configManager, pg, dotenv, discord.js, git), and
+  unit/envScrub.test.ts holds the list against what src reads. pg is pointed at no server (PGHOST, PGPASSFILE) and git
+  at no repository above the bot root (GIT_CEILING_DIRECTORIES: a sandbox sits inside the checkout and holds no .git),
+  with NODE_ENV `test` and its own DATA_DIR;
 - every wait is bounded, and a step prints one `RESULT` line with its result and the bot modules it loaded; the helper
   fails unless every one sits under this root's dist.
 
@@ -174,7 +194,8 @@ removed source file.
   shows, survives pass A and dies in pass B to child/fleetIdentity.test.ts, again when rerun alone, and the run with no
   mutant after that rerun passes. One mutant of the first line is equivalent (`''` and the replacement both read as "not
   active"), so the run also shows the FAIL verdict and how a survivor is listed. The same file checks that an unknown
-  base and a pattern that makes no mutant both end NO RESULT, exit 2, and that a glob or a missing file is refused.
+  base and a pattern that makes no mutant both end NO RESULT, exit 2, and that a glob, a missing file, a pattern with
+  columns and a file holding a line break the gate does not count are refused.
 - A gate run on a stand-in for vitest (every mutant times out, then the run with no mutant after the reruns fails)
   ends NO RESULT, with every timeout the reruns confirmed listed as inconclusive.
 - The bite fails when the plumbing breaks: with the active mutant dropped from the child's env the child-only mutants

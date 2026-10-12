@@ -127,12 +127,13 @@ describe('the run with no mutant after the reruns', () => {
 
 describe('the gate under an old node', () => {
   // The node on PATH may be older than 22.12 (the lane's Windows box has 20.16); CI's is not, and skips this.
-  const probe = spawnSync('node', ['-p', 'process.versions.node'], { encoding: 'utf8', shell: process.platform === 'win32' });
+  // No shell: one would split a checkout path that holds a space.
+  const probe = spawnSync('node', ['-p', 'process.versions.node'], { encoding: 'utf8' });
   const version = probe.status === 0 ? probe.stdout.trim() : '';
   const [major, minor] = version.split('.').map(Number);
   it.runIf(version !== '' && (major < 22 || (major === 22 && minor < 12)))('stops, naming the version, when SMDB_TEST_NODE is old too, instead of relaunching again', () => {
     const run = spawnSync('node', [path.join(root, 'test', 'mutation', 'touched.mjs'), '--help'],
-      { encoding: 'utf8', timeout: 30_000, shell: process.platform === 'win32', env: { ...process.env, SMDB_TEST_NODE: 'node', SMDB_MUTATION_RELAUNCHED: '' } });
+      { encoding: 'utf8', timeout: 30_000, env: { ...process.env, SMDB_TEST_NODE: 'node', SMDB_MUTATION_RELAUNCHED: '' } });
     expect(run.status).toBe(2);
     expect(run.stderr).toContain(`SMDB_TEST_NODE (node) runs v${version}`);
   });
@@ -166,5 +167,47 @@ describe('the time limits', () => {
         expect(PASSES.b2.timeoutMS).toBeGreaterThan(child.testTimeout! + 3 * config.test.hookTimeout);
       }
     }
+  });
+
+  // mutation/README.md: a pass A rerun's budget (factor times T, the time pass
+  // A's related tests take with no mutant, plus timeoutMS) fires before any
+  // test's scaled limit whenever T is under 15 s.
+  it('let a pass A rerun run past its whole budget before any one test times out, while those tests take under 15 s', async () => {
+    vi.stubEnv('SMDB_TEST_TIME_SCALE', '4');
+    vi.resetModules();
+    const config = (await import('../vitest.config')).default as { test: { testTimeout: number } };
+    const { PASSES } = await import('../mutation/passes.mjs');
+    expect((config.test.testTimeout - PASSES.a2.timeoutMS) / PASSES.a2.timeoutFactor).toBe(15_000);
+  });
+});
+
+describe('the Stryker options', () => {
+  it('take nothing from a Stryker config file in the bot root, and never mutate in place', async () => {
+    const { ConfigReader } = await import('../node_modules/@stryker-mutator/core/dist/src/config/config-reader.js');
+    const { COMMON, PASSES } = await import('../mutation/passes.mjs');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-config-'));
+    const cwd = process.cwd();
+    onTestFinished(() => { process.chdir(cwd); fs.rmSync(dir, { recursive: true, force: true }); });
+    fs.writeFileSync(path.join(dir, 'stryker.config.json'), JSON.stringify({ inPlace: true, buildCommand: 'npm run build', mutator: { excludedMutations: ['EqualityOperator'] } }));
+    process.chdir(dir);
+    const quiet = () => {};
+    const log = { debug: quiet, info: quiet, warn: quiet, error: quiet, trace: quiet, fatal: quiet, isDebugEnabled: () => false, isTraceEnabled: () => false };
+    for (const [name, pass] of Object.entries(PASSES)) {
+      const options = await new ConfigReader(log as never, { validate() {} } as never).readConfig({ ...COMMON, ...pass, mutate: ['src/a.ts:1-2'] });
+      expect(options.inPlace, name).toBe(false);
+      expect(options.mutator?.excludedMutations ?? [], name).toEqual([]);
+      expect(options.buildCommand, name).toBe('buildCommand' in pass ? pass.buildCommand : undefined);
+    }
+  });
+});
+
+describe('a property under the gate', () => {
+  it('draws from the one seed the gate sets for its run', { timeout: 180_000 }, () => {
+    const vitest = path.join(root, 'test', 'node_modules', 'vitest', 'vitest.mjs');
+    const run = spawnSync(process.execPath, [vitest, 'run', '--project', 'fast', 'unit/propertySeed.test.ts'], {
+      cwd: path.join(root, 'test'), encoding: 'utf8', timeout: 150_000, env: { ...process.env, SMDB_TEST_SEED: '12345' },
+    });
+    expect(run.status, `${run.stdout}\n${run.stderr}`).toBe(0);
+    expect(run.stdout).toMatch(/1 passed/);
   });
 });

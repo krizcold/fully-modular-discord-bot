@@ -3,10 +3,14 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { Instrumenter } from '@stryker-mutator/instrumenter';
+import fc from 'fast-check';
 import ts from 'typescript';
 import { describe, expect, it, onTestFinished } from 'vitest';
 import { canonicalName } from '../mutation/keys.mjs';
-import { codeLines, diffArgs, gates, inPattern, linesOfTarget, mergeRanges, notMutated, parseDiff, patternsOf, planTargets, unmatchedPatterns, untouched } from '../mutation/ranges.mjs';
+import {
+  changeTarget, codeLines, commonLines, gates, inPattern, lineDiff, linesOfTarget, mergeRanges, notMutated, parseNameStatus, planChange, planFromGit,
+  unmatchedPatterns, untouched, wholeTarget,
+} from '../mutation/ranges.mjs';
 
 // The touched-line ranges of the L5 gate (mutation/README.md): which lines a
 // change touched, and how far each widens so that Stryker makes the mutants
@@ -99,90 +103,180 @@ const SHAPES: Record<string, string> = {
   ].join('\n'),
 };
 
-const rangesOf = (text: string, lines: number[]) =>
-  planTargets({ diff: [{ file: 'src/a.ts', changed: lines, deletedAfter: [] }], untracked: [], read: () => text }).targets[0]?.ranges;
+const rangesOf = (text: string, lines: number[]) => changeTarget('src/a.ts', text, { changed: lines, deletedAfter: [] })?.ranges;
 
-describe('the diff reader', () => {
-  it('takes changed lines and deletions per file, with an omitted count meaning one line', () => {
-    const diff = [
-      'diff --git a/src/a.ts b/src/a.ts',
-      'index 1..2 100644',
-      '--- a/src/a.ts',
-      '+++ b/src/a.ts',
-      '@@ -3 +3 @@ x',
-      '-old',
-      '+new',
-      '@@ -10,2 +10,0 @@',
-      '-gone',
-      '-gone too',
-      '@@ -20,0 +19,3 @@',
-      '+++ this added line is content, not a header',
-      '+b',
-      '+c',
-      'diff --git a/src/b.ts b/src/b.ts',
-      'deleted file mode 100644',
-      '--- a/src/b.ts',
-      '+++ /dev/null',
-      '@@ -1,2 +0,0 @@',
-      '-x',
-      '-y',
-      // git ends a name holding a space with a tab, and quotes one holding a quote.
-      'diff --git a/src/odd name.ts b/src/odd name.ts',
-      '--- a/src/odd name.ts\t',
-      '+++ b/src/odd name.ts\t',
-      '@@ -1 +1,2 @@',
-      '-x',
-      '+y',
-      '+z',
-      'diff --git "a/src/quote\\"d.ts" "b/src/quote\\"d.ts"',
-      '--- "a/src/quote\\"d.ts"',
-      '+++ "b/src/quote\\"d.ts"',
-      '@@ -4 +4 @@',
-      '-a',
-      '+b',
-    ].join('\n');
-    expect(parseDiff(diff)).toEqual([
-      { file: 'src/a.ts', changed: [3, 19, 20, 21], deletedAfter: [10] },
-      { file: 'src/odd name.ts', changed: [1, 2], deletedAfter: [] },
-      { file: 'src/quote"d.ts', changed: [4], deletedAfter: [] },
+describe('the change', () => {
+  // A longest common subsequence's length the slow way, to hold commonLines to.
+  const lcsLength = (a: string[], b: string[]) => {
+    const row = new Array<number>(b.length + 1).fill(0);
+    for (const x of a) {
+      let diagonal = 0;
+      for (let j = 1; j <= b.length; j++) {
+        const above = row[j];
+        row[j] = x === b[j - 1] ? diagonal + 1 : Math.max(row[j], row[j - 1]);
+        diagonal = above;
+      }
+    }
+    return row[b.length];
+  };
+
+  it('keeps as many lines as any common subsequence can, each pair equal and in order', () => {
+    const lines = fc.array(fc.constantFrom('a', 'b', 'c', '}', ''), { maxLength: 14 });
+    fc.assert(fc.property(lines, lines, (a, b) => {
+      const pairs = commonLines(a, b);
+      pairs.forEach(([i, j], k) => {
+        expect(a[i]).toBe(b[j]);
+        if (k > 0) expect(i > pairs[k - 1][0] && j > pairs[k - 1][1]).toBe(true);
+      });
+      expect(pairs.length).toBe(lcsLength(a, b));
+    }), { numRuns: 3000 });
+  });
+
+  it('names the lines added or changed, and where lines were only taken out', () => {
+    const before = ['a', 'b', 'c', 'd', 'e'].join('\n');
+    expect(lineDiff(before, ['a', 'B', 'c', 'd', 'e'].join('\n'))).toEqual({ changed: [2], deletedAfter: [] });
+    expect(lineDiff(before, ['a', 'b', 'd', 'e'].join('\n'))).toEqual({ changed: [], deletedAfter: [2] });
+    expect(lineDiff(before, ['b', 'c', 'd', 'e'].join('\n'))).toEqual({ changed: [], deletedAfter: [0] });
+    expect(lineDiff(before, ['a', 'b', 'c', 'd', 'e', 'f'].join('\n'))).toEqual({ changed: [6], deletedAfter: [] });
+    // Line endings alone change nothing, nor does the break after the last line.
+    expect(lineDiff(`${before}\n`, before.split('\n').join('\r\n'))).toEqual({ changed: [], deletedAfter: [] });
+  });
+
+  it('finds the few lines that changed in a long file, and copes with two that share nothing', () => {
+    const long = Array.from({ length: 3000 }, (_, i) => `line ${i}`);
+    const edited = long.map((line, i) => (i === 10 || i === 2000 ? `${line} edited` : line));
+    edited.splice(1500, 0, 'inserted');
+    expect(lineDiff(long.join('\n'), edited.join('\n'))).toEqual({ changed: [11, 1501, 2002], deletedAfter: [] });
+    const other = Array.from({ length: 3000 }, (_, i) => `other ${i}`);
+    expect(lineDiff(long.join('\n'), other.join('\n')).changed).toHaveLength(3000);
+  });
+
+  it('counts a run that could sit in more than one place in every place it could sit', () => {
+    // An if block added after an equal one: either copy could be the new one.
+    const block = ['  if (ready) {', '    count++;', '  }', ''];
+    const before = ['export function f(ready: boolean) {', '  let count = 0;', ...block, '  return count;', '}'].join('\n');
+    const after = ['export function f(ready: boolean) {', '  let count = 0;', ...block, ...block, '  return count;', '}'].join('\n');
+    expect(lineDiff(before, after).changed).toEqual([3, 4, 5, 6, 7, 8, 9, 10]);
+    // A repeated line taken out could have been any of its copies.
+    expect(lineDiff(['a', 'x', 'x', 'x', 'b'].join('\n'), ['a', 'x', 'x', 'b'].join('\n'))).toEqual({ changed: [], deletedAfter: [1, 2, 3] });
+  });
+
+  it("reads git's names, a rename's two included", () => {
+    expect(parseNameStatus(['M', 'src/a.ts', 'R096', 'updaters/u.ts', 'src/u.ts', 'D', 'src/odd name.ts', 'A', 'src/quote"d.ts', ''].join('\0'))).toEqual([
+      { status: 'M', file: 'src/a.ts' },
+      { status: 'R', from: 'updaters/u.ts', file: 'src/u.ts' },
+      { status: 'D', file: 'src/odd name.ts' },
+      { status: 'A', file: 'src/quote"d.ts' },
     ]);
   });
 
-  it("reads git's own output the same whatever the user's diff config says", () => {
-    const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-diff-'));
+  /** A throwaway repo, and the gate's plan of what changed in it from its first commit. */
+  function repoWith(files: Record<string, string | Buffer>) {
+    const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-change-'));
     onTestFinished(() => fs.rmSync(repo, { recursive: true, force: true }));
-    const git = (...args: string[]) => execFileSync('git', ['-C', repo, '-c', 'user.name=t', '-c', 'user.email=t@t', ...args], { encoding: 'utf8' });
-    git('init', '-q');
-    fs.mkdirSync(path.join(repo, 'src'));
-    const body = Array.from({ length: 30 }, (_, i) => `export const v${i} = ${i};`);
-    fs.writeFileSync(path.join(repo, 'src', 'a.ts'), `${body.join('\n')}\n`);
-    fs.writeFileSync(path.join(repo, 'src', 'odd name.ts'), 'export const o = 1;\n');
-    // Two functions that trade places: diff algorithms read such a move differently.
+    const git = (args: string[], env: NodeJS.ProcessEnv = {}) =>
+      execFileSync('git', ['-C', repo, '-c', 'user.name=t', '-c', 'user.email=t@t', ...args], { encoding: 'utf8', env: { ...process.env, ...env } });
+    const write = (file: string, text: string | Buffer) => {
+      fs.mkdirSync(path.dirname(path.join(repo, file)), { recursive: true });
+      fs.writeFileSync(path.join(repo, file), text);
+    };
+    git(['init', '-q']);
+    for (const [file, text] of Object.entries(files)) write(file, text);
+    git(['add', '.']);
+    git(['commit', '-q', '-m', 'base']);
+    const base = git(['rev-parse', 'HEAD']).trim();
+    const plan = (config: string[] = [], env: NodeJS.ProcessEnv = {}) => planFromGit({ git: (...args: string[]) => git([...config, ...args], env), base, root: repo });
+    return { repo, git, write, plan };
+  }
+  const lines = (name: string, n: number) => Array.from({ length: n }, (_, i) => `export const ${name}${i} = ${i};`);
+  const text = (list: string[]) => `${list.join('\n')}\n`;
+
+  it('finds the same targets whatever git setting, attribute or variable the user has', () => {
     const fn = (name: string, arg: string) => [`export function ${name}(${arg}: number) {`, `  if (${arg} > 0) {`, '    return 1;', '  }', '  return 0;', '}', ''];
-    fs.writeFileSync(path.join(repo, 'src', 'm.ts'), [...fn('f', 'a'), ...fn('g', 'b')].join('\n'));
-    fs.writeFileSync(path.join(repo, 'safety-check.js'), 'module.exports = 1;\n');
-    git('add', '.');
-    git('commit', '-q', '-m', 'base');
-    fs.writeFileSync(path.join(repo, 'src', 'odd name.ts'), 'export const o = 2;\n');
-    fs.writeFileSync(path.join(repo, 'src', 'm.ts'), [...fn('g', 'b'), ...fn('f', 'a')].join('\n'));
-    fs.writeFileSync(path.join(repo, 'safety-check.js'), 'module.exports = 2;\n');
-    const base = git('rev-parse', 'HEAD').trim();
-    // Line 3 and line 6 change; a new file is a near copy of a.ts, staged.
-    const changed = body.map((line, i) => (i === 2 || i === 5 ? line.replace('= ', '= 100 + ') : line));
-    fs.writeFileSync(path.join(repo, 'src', 'a.ts'), `${changed.join('\n')}\n`);
-    fs.writeFileSync(path.join(repo, 'src', 'b.ts'), `${[...body, 'export const extra = 1;'].join('\n')}\n`);
-    git('add', 'src/b.ts');
-    const hostile = ['-c', 'diff.mnemonicPrefix=true', '-c', 'diff.noprefix=true', '-c', 'diff.renames=copies', '-c', 'diff.interHunkContext=10', '-c', 'diff.relative=true',
-      '-c', 'diff.algorithm=histogram'];
-    const plain = parseDiff(git(...diffArgs(base)));
-    expect(parseDiff(git(...hostile, ...diffArgs(base)))).toEqual(plain);
-    expect(plain.find(f => f.file === 'src/a.ts')?.changed).toEqual([3, 6]);
-    expect(plain.find(f => f.file === 'src/b.ts')?.changed.length).toBeGreaterThan(0);
-    expect(plain.find(f => f.file === 'src/odd name.ts')?.changed).toEqual([1]);
-    expect(plain.find(f => f.file === 'src/m.ts')?.changed).toEqual([1, 2, 8, 9]);
-    // A change outside src is read too, and named as not mutated.
-    const plan = planTargets({ diff: plain, untracked: [], read: file => fs.readFileSync(path.join(repo, file), 'utf8') });
-    expect(plan.skipped).toContainEqual({ file: 'safety-check.js', why: 'outside src' });
+    const block = ['  if (ready) {', '    count++;', '  }', ''];
+    const dup = (blocks: number) => text(['export function f(ready: boolean) {', '  let count = 0;', ...Array.from({ length: blocks }, () => block).flat(), '  return count;', '}']);
+    const nul = String.fromCharCode(0);
+    const { repo, git, write, plan } = repoWith({
+      'src/a.ts': text(lines('a', 30)),
+      'src/m.ts': [...fn('f', 'a'), ...fn('g', 'b')].join('\n'),
+      'src/bin.ts': text(lines('bin', 10)),
+      'src/zerobyte.ts': text([`export const z = '${nul}';`, ...lines('zero', 5)]),
+      'src/old.ts': text(lines('old', 20)),
+      'src/x.ts': text(lines('x', 20)),
+      'src/gone.ts': '// gone\n',
+      'src/dup.ts': dup(1),
+      'src/case.ts': text(lines('kase', 5)),
+      'updaters/u.ts': text(lines('u', 30)),
+      'safety-check.js': 'module.exports = 1;\n',
+      'readmeAssets/img.png': Buffer.from([0x89, 0x50, 0x4e, 0x47, 0, 1, 2, 3]),
+    });
+    write('src/a.ts', text(lines('a', 30).map((line, i) => (i === 2 || i === 5 ? line.replace('= ', '= 100 + ') : line))));
+    write('src/m.ts', [...fn('g', 'b'), ...fn('f', 'a')].join('\n'));
+    write('src/bin.ts', text(lines('bin', 10).map((line, i) => (i === 1 ? `${line} // edited` : line))));
+    write('src/zerobyte.ts', text([`export const z = '${nul}';`, ...lines('zero', 5).map((line, i) => (i === 1 ? `${line} // edited` : line))]));
+    git(['mv', 'src/old.ts', 'src/new.ts']);
+    write('src/new.ts', text(lines('old', 20).map((line, i) => (i === 4 ? `${line} // edited` : line))));
+    fs.mkdirSync(path.join(repo, 'tools'));
+    git(['mv', 'src/x.ts', 'tools/x.ts']);
+    fs.rmSync(path.join(repo, 'src', 'gone.ts'));
+    write('src/dup.ts', dup(2));
+    git(['mv', 'updaters/u.ts', 'src/u.ts']);
+    write('src/u.ts', text(lines('u', 30).map((line, i) => (i === 1 ? `${line} // edited` : line))));
+    write('safety-check.js', 'module.exports = 2;\n');
+    write('readmeAssets/img.png', Buffer.from([0x89, 0x50, 0x4e, 0x47, 0, 9, 9, 9]));
+    write('src/fresh.ts', text(lines('fresh', 3)));
+    write('src/mod/index.ts', text(lines('mod', 3)));
+    git(['-C', path.join(repo, 'src', 'mod'), 'init', '-q']);
+    // A file renamed by case outside git, where the disk does not tell case apart.
+    if (process.platform === 'win32') {
+      fs.renameSync(path.join(repo, 'src', 'case.ts'), path.join(repo, 'src', 'Case.ts'));
+      write('src/Case.ts', text(lines('kase', 5).map((line, i) => (i === 0 ? `${line} // edited` : line))));
+    }
+
+    const attributes = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-attributes-')), 'attributes');
+    onTestFinished(() => fs.rmSync(path.dirname(attributes), { recursive: true, force: true }));
+    fs.writeFileSync(attributes, '*.ts binary\n*.ts -diff\n');
+    const hostile = [
+      '-c', 'diff.algorithm=histogram', '-c', 'diff.indentHeuristic=false', '-c', 'diff.renameLimit=1', '-c', 'diff.renames=false',
+      '-c', 'diff.noprefix=true', '-c', 'diff.mnemonicPrefix=true', '-c', 'diff.relative=true', '-c', 'diff.context=5', '-c', 'diff.interHunkContext=20',
+      '-c', 'core.quotePath=true', '-c', 'core.bigFileThreshold=16', '-c', `core.attributesFile=${attributes}`,
+    ];
+    const plain = plan();
+    expect(plan(hostile, { GIT_DIFF_OPTS: '--unified=3' })).toEqual(plain);
+
+    const target = (file: string) => plain.targets.find(t => t.file === file);
+    expect(target('src/a.ts')?.gating).toEqual([3, 6]);
+    expect(target('src/bin.ts')?.gating).toEqual([2]);
+    expect(target('src/zerobyte.ts')?.gating).toEqual([3]);
+    // Renamed within src: only its changed line. Moved in from outside src, new, untracked: whole.
+    expect(target('src/new.ts')?.gating).toEqual([5]);
+    for (const file of ['src/u.ts', 'src/fresh.ts']) expect(target(file), file).toEqual(wholeTarget(file));
+    // The copy added could be either one: both gate.
+    expect(target('src/dup.ts')?.gating).toEqual([3, 4, 5, 6, 7, 8, 9, 10]);
+    expect(target('src/m.ts')?.gating?.length).toBeGreaterThan(0);
+    if (process.platform === 'win32') expect(target('src/Case.ts')?.gating).toEqual([1]);
+    expect(plain.skipped).toEqual(expect.arrayContaining([
+      { file: 'tools/x.ts', why: 'outside src' },
+      { file: 'src/x.ts', why: 'moved to tools/x.ts: nothing is left to mutate' },
+      { file: 'src/gone.ts', why: 'deleted: nothing is left to mutate' },
+      { file: 'safety-check.js', why: 'outside src' },
+      { file: 'readmeAssets/img.png', why: 'outside src' },
+      { file: 'src/mod/', why: 'an untracked git repository: git lists none of its files, so none is mutated' },
+    ]));
+    expect(plain.skipped.map(s => s.file)).not.toContain('src/u.ts');
+    expect(plain.emptyScope).toBe(false);
+  });
+
+  it('says no src file changed only when none did: a deletion or a move out of src is a change', () => {
+    const one = repoWith({ 'src/a.ts': text(lines('a', 3)), 'tools/t.js': 'module.exports = 1;\n' });
+    one.write('tools/t.js', 'module.exports = 2;\n');
+    expect(one.plan()).toEqual({ targets: [], skipped: [{ file: 'tools/t.js', why: 'outside src' }], emptyScope: true });
+    fs.rmSync(path.join(one.repo, 'src', 'a.ts'));
+    expect(one.plan().emptyScope).toBe(false);
+    const two = repoWith({ 'src/x.ts': text(lines('x', 3)) });
+    fs.mkdirSync(path.join(two.repo, 'tools'));
+    two.git(['mv', 'src/x.ts', 'tools/x.ts']);
+    expect(two.plan().emptyScope).toBe(false);
   });
 });
 
@@ -383,47 +477,74 @@ describe('the widening, against what Stryker makes', () => {
 });
 
 describe('the targets', () => {
-  const read = (file: string) => (file === 'src/a.ts' ? SAMPLE : 'export const x = 1;\nexport const y = 2;\n');
+  // A plan of the given entries and untracked files: each file's text, and its
+  // text at the base where that differs.
+  const planOf = (entries: { status: string; file: string; from?: string }[], untracked: string[], texts: Record<string, string>, bases: Record<string, string> = {}) =>
+    planChange({ entries, untracked, read: file => texts[file], readBase: file => bases[file] ?? texts[file], nameOf: file => file });
+  const changedAt = (text: string, n: number) => text.split('\n').map((line, i) => (i === n - 1 ? `${line} // was` : line)).join('\n');
 
   it('names every changed file it does not mutate, and why', () => {
-    const plan = planTargets({
-      diff: [
-        { file: 'src/webui/public/app.jsx', changed: [1], deletedAfter: [] },
-        { file: 'src/bot/types.d.ts', changed: [1], deletedAfter: [] },
-        { file: 'src/bot/modules/x/module.json', changed: [1], deletedAfter: [] },
-        { file: 'src/a.ts', changed: [], deletedAfter: [] },
+    const plan = planOf(
+      [
+        { status: 'M', file: 'src/webui/public/app.jsx' },
+        { status: 'M', file: 'src/bot/types.d.ts' },
+        { status: 'M', file: 'src/bot/modules/x/module.json' },
+        { status: 'M', file: 'src/a.ts' },
+        { status: 'D', file: 'src/gone.ts' },
       ],
-      untracked: ['src/webui/public/new.js', 'src/new.ts'],
-      read,
-    });
-    expect(plan.skipped.map(s => s.file)).toEqual(['src/webui/public/app.jsx', 'src/bot/types.d.ts', 'src/bot/modules/x/module.json', 'src/a.ts', 'src/webui/public/new.js']);
+      ['src/webui/public/new.js', 'src/new.ts', 'src/mod/', 'tools/mod/'],
+      { 'src/a.ts': SAMPLE, 'src/new.ts': 'export const n = 1;\n' },
+    );
+    expect(plan.skipped.map(s => s.file)).toEqual([
+      'src/webui/public/app.jsx', 'src/bot/types.d.ts', 'src/bot/modules/x/module.json', 'src/a.ts', 'src/gone.ts', 'src/webui/public/new.js', 'src/mod/', 'tools/mod/',
+    ]);
     expect(plan.skipped.every(s => s.why.length > 0)).toBe(true);
-    expect(plan.targets).toEqual([{ file: 'src/new.ts', ranges: null, gating: null }]);
-    expect(patternsOf(plan.targets[0])).toEqual(['src/new.ts']);
+    expect(plan.skipped.find(s => s.file === 'src/a.ts')?.why).toBe('no changed lines (a rename, a mode change, or line endings only)');
+    expect(plan.skipped.find(s => s.file === 'src/mod/')?.why).toBe('an untracked git repository: git lists none of its files, so none is mutated');
+    expect(plan.skipped.find(s => s.file === 'tools/mod/')?.why).toBe('outside src');
+    expect(plan.targets).toEqual([wholeTarget('src/new.ts')]);
     expect(notMutated('test/x.ts')).toBe('outside src');
+  });
+
+  it('takes a file new to the mutated code whole, and names one moved out of it', () => {
+    const plan = planOf(
+      [
+        { status: 'R', from: 'updaters/u.ts', file: 'src/u.ts' },
+        { status: 'R', from: 'src/webui/public/v.js', file: 'src/v.ts' },
+        { status: 'A', file: 'src/added.ts' },
+        { status: 'R', from: 'src/old.ts', file: 'src/new.ts' },
+        { status: 'R', from: 'src/x.ts', file: 'tools/x.ts' },
+      ],
+      [],
+      { 'src/u.ts': SAMPLE, 'src/v.ts': SAMPLE, 'src/added.ts': SAMPLE, 'src/new.ts': SAMPLE },
+      { 'src/old.ts': changedAt(SAMPLE, 7) },
+    );
+    expect(plan.targets).toEqual([
+      wholeTarget('src/u.ts'), wholeTarget('src/v.ts'), wholeTarget('src/added.ts'), changeTarget('src/new.ts', SAMPLE, { changed: [7], deletedAfter: [] }),
+    ]);
+    expect(plan.skipped).toEqual([{ file: 'tools/x.ts', why: 'outside src' }, { file: 'src/x.ts', why: 'moved to tools/x.ts: nothing is left to mutate' }]);
+    expect(plan.emptyScope).toBe(false);
   });
 
   it('answers for every line a whole file or a pattern covers, and for the changed lines of a diff', () => {
     expect(linesOfTarget({ gating: [3, 7], patterns: ['src/a.ts:2-9'] }, 11)).toEqual([3, 7]);
     expect(linesOfTarget({ gating: null, patterns: ['src/new.ts'] }, 4)).toEqual([1, 2, 3, 4]);
-    expect(linesOfTarget({ gating: null, patterns: ['src/a.ts:3-5', 'src/a.ts:5:2-6:9', 'src/a.ts:10-99'] }, 11)).toEqual([3, 4, 5, 6, 10, 11]);
+    expect(linesOfTarget({ gating: null, patterns: ['src/a.ts:3-5', 'src/a.ts:5-6', 'src/a.ts:10-99'] }, 11)).toEqual([3, 4, 5, 6, 10, 11]);
   });
 
-  it('does not mutate a file holding a line break git does not count, and says why', () => {
+  it('does not mutate a file holding a line break the gate does not count, and says why', () => {
+    const [ls, ps] = [String.fromCharCode(0x2028), String.fromCharCode(0x2029)];
     const texts: Record<string, string> = {
-      'src/sep.ts': "export const s = 'a\u2028b';\nexport const t = 1;\n",
+      'src/sep.ts': `export const s = 'a${ls}b';\nexport const t = 1;\n`,
       'src/cr.ts': 'export const a = 1;\r\rexport const b = 2;\n',
       'src/crlf.ts': 'export const a = 1;\r\nexport const b = 2;\r\n',
-      'src/new.ts': "export const n = 'x\u2029y';\n",
+      'src/new.ts': `export const n = 'x${ps}y';\n`,
     };
-    const plan = planTargets({
-      diff: ['src/sep.ts', 'src/cr.ts', 'src/crlf.ts'].map(file => ({ file, changed: [2], deletedAfter: [] })),
-      untracked: ['src/new.ts'],
-      read: file => texts[file],
-    });
+    const plan = planOf(['src/sep.ts', 'src/cr.ts', 'src/crlf.ts'].map(file => ({ status: 'M', file })), ['src/new.ts'], texts,
+      { 'src/sep.ts': '', 'src/cr.ts': '', 'src/crlf.ts': 'export const a = 1;\nexport const b = 3;\n' });
     expect(plan.skipped.map(s => s.file)).toEqual(['src/sep.ts', 'src/cr.ts', 'src/new.ts']);
-    for (const s of plan.skipped) expect(s.why).toMatch(/^it holds a line break git does not count/);
-    expect(plan.targets.map(t => t.file)).toEqual(['src/crlf.ts']);
+    for (const s of plan.skipped) expect(s.why).toMatch(/^it holds a line break Stryker counts and the gate does not/);
+    expect(plan.targets.map(t => [t.file, t.gating])).toEqual([['src/crlf.ts', [2]]]);
   });
 
   it('takes a file under the name it has on disk, relative to the bot root', () => {
@@ -446,25 +567,22 @@ describe('the targets', () => {
     expect(inPattern('src/a.ts:2-5', at(3, 4))).toBe(true);
     expect(inPattern('src/a.ts:2-5', at(5, 6))).toBe(false);
     expect(inPattern('src/a.ts:2150-2150', at(215, 215))).toBe(false);
-    expect(inPattern('src/a.ts:5:2-6:9', at(5, 6))).toBe(true);
     const targets = ['src/a.ts:215-215', 'src/a.ts:2150-2150', 'src/a.ts:1-3', 'src/b.ts'].map(pattern => ({ file: pattern.replace(/:.*$/, ''), patterns: [pattern], gating: null }));
     expect(unmatchedPatterns(targets, [{ file: 'src/a.ts', location: at(215, 215) }])).toEqual(['src/a.ts:2150-2150', 'src/a.ts:1-3', 'src/b.ts']);
     expect(unmatchedPatterns([{ file: 'src/a.ts', patterns: ['src/a.ts:1-3'], gating: [2] }], [])).toEqual([]);
   });
 
   it('widens a pure deletion to its neighbours as context only', () => {
-    const plan = planTargets({ diff: [{ file: 'src/a.ts', changed: [], deletedAfter: [3] }], untracked: [], read });
-    expect(plan.targets).toEqual([{ file: 'src/a.ts', ranges: [[2, 4]], gating: [] }]);
+    expect(changeTarget('src/a.ts', SAMPLE, { changed: [], deletedAfter: [3] })).toEqual({ file: 'src/a.ts', ranges: [[2, 4]], gating: [], patterns: ['src/a.ts:2-4'] });
   });
 
   it('gates the mutants that touch a changed line, and calls the rest context', () => {
-    const plan = planTargets({ diff: [{ file: 'src/a.ts', changed: [7], deletedAfter: [] }], untracked: [], read });
-    const [target] = plan.targets;
-    expect(patternsOf(target)).toEqual(['src/a.ts:6-9']);
+    const target = changeTarget('src/a.ts', SAMPLE, { changed: [7], deletedAfter: [] });
+    expect(target?.patterns).toEqual(['src/a.ts:6-9']);
     const at = (start: number, end: number) => ({ start: { line: start, column: 1 }, end: { line: end, column: 1 } });
-    expect(gates(target, at(7, 7))).toBe(true);
-    expect(gates(target, at(6, 9))).toBe(true);
-    expect(gates(target, at(8, 8))).toBe(false);
+    expect(gates({ gating: target?.gating ?? null }, at(7, 7))).toBe(true);
+    expect(gates({ gating: target?.gating ?? null }, at(6, 9))).toBe(true);
+    expect(gates({ gating: target?.gating ?? null }, at(8, 8))).toBe(false);
     expect(gates({ gating: null }, at(1, 1))).toBe(true);
   });
 });

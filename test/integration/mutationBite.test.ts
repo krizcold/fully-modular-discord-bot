@@ -61,6 +61,8 @@ describe('the touched-line mutation gate', () => {
     }
 
     expect(run.status).toBe(1);
+    // One fast-check seed for the whole run, named in the report.
+    expect(run.stdout).toMatch(/^Scope: the patterns .*; fast-check seed \d+$/m);
     expect(run.stdout).toMatch(/^Survivors .*\n {2}src\/bot\/internalSetup\/fleet\/nodeIdentity\.ts:\d+:\d+ StringLiteral: `''`/m);
     expect(run.stdout).not.toContain(`nodeIdentity.ts:${child}:`);
     const killedInA = on(fast).filter(m => !equivalent(m)).length;
@@ -129,14 +131,22 @@ describe('the touched-line mutation gate', () => {
     expect(gate('--help').status).toBe(2);
     const outside = path.join(os.tmpdir(), `smdb-outside-${process.pid}.ts`);
     fs.writeFileSync(outside, 'export const x = 1;\n');
+    // A file in the bot root (the git-ignored report dir) holding a line break Stryker counts and the gate does not.
+    const broken = `test/mutation/reports/smdb-break-${process.pid}.ts`;
+    fs.mkdirSync(path.dirname(path.join(root, broken)), { recursive: true });
+    fs.writeFileSync(path.join(root, broken), `export const s = 'a${String.fromCharCode(0x2028)}b';\n`);
     try {
-      for (const pattern of ['src/**/*.ts', 'src/bot/internalSetup/fleet/+(nodeIdentity|takeover).ts', 'src/no/such/file.ts:1-5', outside]) {
+      for (const pattern of ['src/**/*.ts', 'src/bot/internalSetup/fleet/+(nodeIdentity|takeover).ts', 'src/no/such/file.ts:1-5', `${TARGET}:3:0-3:10`, outside]) {
         const refused = gate('--mutate', pattern);
         expect(refused.status, pattern).toBe(2);
         expect(refused.stderr).toContain(`--mutate takes a file in the bot root that exists, or such a file and lines, never a glob: ${pattern}`);
       }
+      const refused = gate('--mutate', broken);
+      expect(refused.status).toBe(2);
+      expect(refused.stderr).toContain(`--mutate cannot take ${broken}: it holds a line break Stryker counts and the gate does not`);
     } finally {
       fs.rmSync(outside, { force: true });
+      fs.rmSync(path.join(root, broken), { force: true });
     }
 
     const unknown = gate('--base', 'no-such-ref-anywhere');
@@ -147,13 +157,13 @@ describe('the touched-line mutation gate', () => {
 
     // The file's opening comment and first import: no mutant can be made there.
     // Spelled the way a shell may complete it (on Windows, in another case too),
-    // it is taken under the name git gives the file.
+    // it is taken under the name it has on disk.
     const spelled = process.platform === 'win32' ? `.\\${TARGET.replace(/^src/, 'SRC').split('/').join('\\')}` : `./${TARGET}`;
     const nothing = gate('--mutate', `${spelled}:1-5`, '--concurrency', '1');
     clean(nothing.stdout);
     expect(nothing.status, nothing.stderr).toBe(2);
     expect(nothing.stdout).toMatch(/^Patterns that made no mutant:\n {2}src\/bot\/internalSetup\/fleet\/nodeIdentity\.ts:1-5$/m);
-    expect(nothing.stdout).toMatch(/^Changed lines no mutant lies wholly on .*\n {2}src\/bot\/internalSetup\/fleet\/nodeIdentity\.ts: 5$/m);
+    expect(nothing.stdout).toMatch(/^Changed lines of code no mutant lies wholly on .*\n {2}src\/bot\/internalSetup\/fleet\/nodeIdentity\.ts: 5$/m);
     expect(nothing.stdout).toMatch(/^Verdict: NO RESULT \(no gating mutant was made/m);
   });
 });

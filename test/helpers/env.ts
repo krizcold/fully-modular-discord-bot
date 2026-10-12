@@ -1,32 +1,48 @@
-// The variables through which the bot is configured: every key src reads from
-// process.env by name, and every key envLoader copies by prefix (the payment
-// providers'). Tests and the children they start never carry one, so a
-// developer's shell can point no run at a real fleet, database, manager,
-// payment provider or Discord account. Every other variable passes, the active
-// Stryker mutant included. unit/envScrub.test.ts holds the names to src.
-// Not covered: configManager's getConfigProperty also reads process.env[key]
-// for any config key it is asked for; the known ones (DEVS, testMode) are
-// scrubbed here, a module's own config key is not.
-// DOTENV_ is read by dotenv itself (src's `dotenv/config` imports): it could
-// load a real .env from anywhere, whatever a child's cwd.
-const PREFIXES = [
-  'DATA_BACKEND', 'CONTROL_', 'FLEET_', 'TRANSFER_', 'BOT_', 'DISCORD_', 'WEBUI_', 'OAUTH_',
-  'STRIPE_', 'LEMONSQUEEZY_', 'PAYPAL_', 'PATREON_', 'DOTENV_',
-];
-const NAMES = [
-  'MASTER_URLS', 'SESSION_SECRET', 'CLIENT_ID', 'GUILD_ID', 'MAIN_GUILD_ID', 'NODE_NAME', 'GRAVEYARD_TTL_DAYS',
-  'PIN_TEST_GUILD_SHARD', 'XFER_TEST_CORRUPT', 'ENABLE_GUILD_WEBUI', 'DEV_USER_IDS', 'BUILD_MODE', 'BOOST_TARGET_GUILD_ID',
-  'DEVS', 'testMode',
-];
-// Read by src and set by the tests themselves: DATA_DIR per test, NODE_ENV to
-// 'test' (vitest keeps a shell's value, and 'development' switches the bot's paths).
-export const KEPT = ['DATA_DIR', 'NODE_ENV'];
+import path from 'path';
+import { fileURLToPath } from 'url';
 
-export function scrubbed(key: string): boolean {
-  return NAMES.includes(key) || PREFIXES.some(prefix => key.startsWith(prefix));
+// What a test, and a child process it starts, keeps of the environment it was
+// started in: the platform's own variables, vitest's, the active Stryker
+// mutant, Docker's and testcontainers' (the integration tier starts its
+// containers from the tests), and this suite's own (SMDB_). Every other
+// variable is taken out, whoever would read it (src by name or through
+// configManager's process.env[key], pg, dotenv, discord.js, git), so a
+// developer's shell can point no run at a real fleet, database, manager,
+// payment provider or Discord account. unit/envScrub.test.ts holds the list
+// against what src reads.
+const KEPT_NAMES = new Set([
+  // Windows
+  'ALLUSERSPROFILE', 'APPDATA', 'COMMONPROGRAMFILES', 'COMMONPROGRAMFILES(X86)', 'COMMONPROGRAMW6432', 'COMPUTERNAME',
+  'COMSPEC', 'HOMEDRIVE', 'HOMEPATH', 'LOCALAPPDATA', 'NUMBER_OF_PROCESSORS', 'OS', 'PATHEXT', 'PROCESSOR_ARCHITECTURE',
+  'PROCESSOR_IDENTIFIER', 'PROCESSOR_LEVEL', 'PROCESSOR_REVISION', 'PROGRAMDATA', 'PROGRAMFILES', 'PROGRAMFILES(X86)',
+  'PROGRAMW6432', 'PUBLIC', 'SYSTEMDRIVE', 'SYSTEMROOT', 'TEMP', 'TMP', 'USERDOMAIN', 'USERNAME', 'USERPROFILE', 'WINDIR',
+  // POSIX
+  'HOME', 'LANG', 'LOGNAME', 'PATH', 'SHELL', 'TERM', 'TMPDIR', 'TZ', 'USER',
+  // the test tools
+  'CI', 'FORCE_COLOR', 'NO_COLOR', 'TEST',
+]);
+const KEPT_PREFIXES = ['LC_', 'XDG_', 'VITEST', 'SMDB_', 'DOCKER_', 'TESTCONTAINERS_', '__STRYKER_'];
+
+// Windows names its variables in any case.
+export function kept(key: string): boolean {
+  const name = key.toUpperCase();
+  return KEPT_NAMES.has(name) || KEPT_PREFIXES.some(prefix => name.startsWith(prefix));
 }
 
 export function scrubEnv<T extends Record<string, string | undefined>>(env: T): T {
-  for (const key of Object.keys(env)) if (scrubbed(key)) delete env[key];
+  for (const key of Object.keys(env)) if (!kept(key)) delete env[key];
   return env;
 }
+
+// Where nothing names them, pg connects to localhost:5432 as the OS user with
+// the user's password file, and git looks for a repository in every dir above
+// its cwd: from a Stryker sandbox, which sits inside the checkout and holds no
+// .git, that is the checkout's own. These point both at nothing: PGHOST at a
+// socket dir that does not exist, PGPASSFILE at no file, and git no higher
+// than the dir that holds the bot root (in a sandbox, .stryker-tmp).
+const botRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
+export const DEAD_ENDS = {
+  PGHOST: '/smdb-no-postgres',
+  PGPASSFILE: path.join(botRoot, 'test', 'no-pgpass'),
+  GIT_CEILING_DIRECTORIES: path.dirname(botRoot),
+};

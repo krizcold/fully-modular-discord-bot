@@ -5,13 +5,14 @@
 // Exit: 0 PASS, 1 FAIL, 2 NO RESULT or a usage error; any other code: interrupted.
 // Trust 0 and 1 only after a Verdict line: a process killed on Windows exits 1 too.
 import { execFileSync, spawnSync } from 'child_process';
+import crypto from 'crypto';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { runControl } from './control.mjs';
 import { canonicalName, fileOf as nameOf, keyOf } from './keys.mjs';
-import { PASSES } from './passes.mjs';
+import { COMMON, PASSES } from './passes.mjs';
 
 /**
  * @typedef {import('./ranges.mjs').Location} Location
@@ -51,7 +52,7 @@ try {
   console.error(`Verdict: NO RESULT (the gate could not load: ${error instanceof Error ? error.message.split('\n')[0] : String(error)}; run npm run test:install)`);
   process.exit(2);
 }
-const { diffArgs, EXTRA_BREAK_WHY, gates, holdsExtraBreak, linesOfTarget, parseDiff, patternsOf, planTargets, unmatchedPatterns, untouched } = ranges;
+const { EXTRA_BREAK_WHY, gates, holdsExtraBreak, linesOfTarget, planFromGit, unmatchedPatterns, untouched } = ranges;
 const { byKiller, classifyKill, judge, outcome, toConfirm, toPassB } = verdicts;
 
 const USAGE = 'usage: node test/mutation/touched.mjs [--base REF] [--mutate PATTERN]... [--concurrency N] [--keep]';
@@ -77,8 +78,9 @@ process.chdir(root);
 const git = (...args) => execFileSync('git', ['-c', 'core.quotePath=false', ...args], { cwd: root, encoding: 'utf8', maxBuffer: 256 * 1024 * 1024 });
 /** @param {string} file */
 const posix = file => file.split(path.sep).join('/');
+// A pattern is a file, or a file and lines; one with columns names no file, so it is refused.
 /** @param {string} pattern */
-const fileOfPattern = pattern => pattern.replace(/:\d+(:\d+)?-\d+(:\d+)?$/, '');
+const fileOfPattern = pattern => pattern.replace(/:\d+-\d+$/, '');
 // Each --mutate file is taken under the name it has on disk (keys.mjs), the
 // name Stryker matches, so its mutants find their target in the report.
 opts.mutate = opts.mutate.map(pattern => {
@@ -94,6 +96,11 @@ opts.mutate = opts.mutate.map(pattern => {
   }
   return `${name}${pattern.slice(file.length)}`;
 });
+
+// One fast-check seed for every run of the gate (helpers/setup.ts reads it), so
+// a property draws the same inputs with a mutant as without one: a property
+// that fails in a mutant's run fails for the mutant.
+process.env.SMDB_TEST_SEED ||= String(crypto.randomInt(2 ** 31));
 
 const stamp = new Date().toISOString().replace(/[:.]/g, '-');
 const reportDir = path.join(root, 'test', 'mutation', 'reports', stamp);
@@ -180,17 +187,11 @@ class PassError extends Error {}
 
 /** @type {Options} */
 const common = {
-  testRunner: 'command',
+  ...COMMON,
   commandRunner: { command: `"${process.execPath}" test/mutation/runner.mjs` },
-  coverageAnalysis: 'off',
-  tsconfigFile: 'tsconfig.json',
-  tempDirName: '.stryker-tmp',
   cleanTempDir: opts.keep ? false : 'always',
-  incremental: false,
   // targets.mjs: in a pass on some of the mutants, the ids runner.mjs runs.
   plugins: ['@stryker-mutator/*', path.join(root, 'test', 'mutation', 'targets.mjs')],
-  reporters: ['progress', 'smdb-targets'],
-  logLevel: /** @type {import('@stryker-mutator/api/core').LogLevel} */ ('warn'),
 };
 
 /**
@@ -300,9 +301,10 @@ function report(stopped) {
     const lines = untouched(target.file, text, linesOfTarget(target, text.split('\n').length), spans);
     if (lines.length > 0) noMutant.push({ file: target.file, lines });
   }
-  const result = judge({ stamp, scope, emptyScope, skipped, mutants, noMutant, unmatched, report: posix(path.relative(root, reportDir)), stopped, controls, standIn: process.env.SMDB_MUTATION_VITEST });
+  const seed = process.env.SMDB_TEST_SEED;
+  const result = judge({ stamp, scope: `${scope}; fast-check seed ${seed}`, emptyScope, skipped, mutants, noMutant, unmatched, report: posix(path.relative(root, reportDir)), stopped, controls, standIn: process.env.SMDB_MUTATION_VITEST });
   fs.mkdirSync(reportDir, { recursive: true });
-  fs.writeFileSync(path.join(reportDir, 'mutants.json'), `${JSON.stringify({ scope, skipped, targets, mutants, controls, verdict: result.verdict, stopped }, null, 2)}\n`);
+  fs.writeFileSync(path.join(reportDir, 'mutants.json'), `${JSON.stringify({ scope, seed, skipped, targets, mutants, controls, verdict: result.verdict, stopped }, null, 2)}\n`);
   fs.writeFileSync(path.join(reportDir, 'summary.txt'), `${result.lines.join('\n')}\n`);
   console.log(result.lines.join('\n'));
   process.exit(result.code);
@@ -315,20 +317,8 @@ try {
     targets = opts.mutate.map(pattern => ({ file: fileOfPattern(pattern), patterns: [pattern], gating: null }));
   } else {
     const base = git('merge-base', opts.base, 'HEAD').trim();
-    const diff = parseDiff(git(...diffArgs(base)));
-    const untracked = git('ls-files', '-z', '--others', '--exclude-standard').split('\0').filter(Boolean);
-    const deleted = git('-c', 'diff.renames=true', 'diff', '--name-only', '-z', '--no-relative', '--diff-filter=D', base, '--').split('\0').filter(Boolean);
-    const plan = planTargets({ diff, untracked, read: file => linesOf(file).join('\n') });
-    // git's names, under the name each file has on disk (keys.mjs), which Stryker matches.
-    targets = plan.targets.map(target => {
-      const file = canonicalName(root, target.file) ?? target.file;
-      return { ...target, file, patterns: patternsOf({ ...target, file }) };
-    });
-    skipped = [...plan.skipped, ...deleted.map(file => ({ file, why: 'deleted: nothing is left to mutate' }))];
+    ({ targets, skipped, emptyScope } = planFromGit({ git, base, root, read: file => linesOf(file).join('\n') }));
     scope = `the change from ${opts.base} (merge-base ${base.slice(0, 7)}) to the working tree`;
-    /** @param {string} file */
-    const inSrc = file => file.startsWith('src/');
-    emptyScope = !diff.some(entry => inSrc(entry.file)) && !untracked.some(inSrc) && !deleted.some(inSrc);
   }
   if (targets.length === 0) finish();
 

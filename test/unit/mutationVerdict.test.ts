@@ -147,7 +147,7 @@ describe('the verdict', () => {
       mutant(5, false, { a: pass('Survived') }),
     ], { controls: ['after pass b2: passed'] });
     expect(result).toMatchObject({ verdict: 'PASS', code: 0 });
-    expect(result.lines.join('\n')).toMatch(/^Timeouts .*\n {2}src\/a\.ts:2:3 /m);
+    expect(result.lines.join('\n')).toMatch(/^Timeouts \(each timed out again when run alone with four times the time: a test, a hook, or the whole run past its budget; .*\n {2}src\/a\.ts:2:3 /m);
     expect(result.lines.join('\n')).toMatch(/^Context survivors:\n {2}src\/a\.ts:5:3 /m);
     expect(result.lines.join('\n')).toMatch(/^Runs with no mutant after the reruns:\n {2}after pass b2: passed$/m);
   });
@@ -177,7 +177,7 @@ describe('the verdict', () => {
     const text = none.lines.join('\n');
     expect(text).toContain('  src/webui/public/app.jsx: a browser view');
     expect(text).toContain('  src/missing.ts:1-2');
-    expect(text).toMatch(/^Changed lines no mutant lies wholly on \(.*every line of a multi-line object, array, arrow body, call or condition with no mutant of its own\):\n {2}src\/a\.ts: 4, 9$/m);
+    expect(text).toMatch(/^Changed lines of code no mutant lies wholly on \(.*the code lines of a multi-line object, array, arrow body, call or condition with no mutant of their own; a line of brackets and separators only is never listed\):\n {2}src\/a\.ts: 4, 9$/m);
   });
 
   it('has no result when a test replaced vitest, whatever the mutants did', () => {

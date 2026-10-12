@@ -90,11 +90,13 @@ export const latest = m => /** @type {PassResult} */ (m.passes.b2 ?? m.passes.b 
 
 /**
  * A mutant's outcome, counting for a gating one only what its rerun alone
- * confirmed. In pass A a timeout counts when the rerun hangs too or fails a
- * test. In pass B, where containers and children can be slow on their own, a
- * hang never counts, and a kill counts only when the test file that killed it
- * fails for it again when run alone. One the gate never reran, or whose rerun
- * was voided (the run with no mutant after it failed), is inconclusive.
+ * confirmed. In pass A a timeout counts when the rerun, with four times the
+ * time, times out again (a test, a hook, or the whole run past Stryker's
+ * budget) or fails a test. In pass B, where containers and children can be
+ * slow on their own, a hang never counts, and a kill counts only when the test
+ * file that killed it fails for it again when run alone. One the gate never
+ * reran, or whose rerun was voided (the run with no mutant after it failed),
+ * is inconclusive.
  * @param {MutantRecord} m
  * @returns {{ outcome: string, why?: string }}
  */
@@ -119,7 +121,7 @@ export const FAILING = ['Survived', 'NoCoverage', 'Missing', 'Inconclusive', 'Ru
 /**
  * The gating mutants a pass sends to a confirming run of their own (one at a
  * time, with four times the time): pass A's timeouts, which count as kills only
- * when the mutant hangs the tests alone too, and pass B's kills, which count
+ * when the mutant times the tests out alone too, and pass B's kills, which count
  * only when the test file that killed them fails for them again.
  * @param {MutantRecord[]} mutants
  * @param {'a' | 'b'} pass
@@ -203,14 +205,14 @@ export function judge(run) {
     `Mutated: ${made.length > 0 ? made.join(', ') : 'nothing'}`,
     ...(run.skipped.length > 0 ? ['Not mutated:', ...run.skipped.map(s => `  ${s.file}: ${s.why}`)] : []),
     ...(run.unmatched.length > 0 ? ['Patterns that made no mutant:', ...run.unmatched.map(p => `  ${p}`)] : []),
-    ...(run.noMutant.length > 0 ? ['Changed lines no mutant lies wholly on (L5 says nothing about them; types, imports, signatures, and every line of a multi-line object, array, arrow body, call or condition with no mutant of its own):',
+    ...(run.noMutant.length > 0 ? ['Changed lines of code no mutant lies wholly on (L5 says nothing about them; types, imports, signatures, and the code lines of a multi-line object, array, arrow body, call or condition with no mutant of their own; a line of brackets and separators only is never listed):',
       ...run.noMutant.map(n => `  ${n.file}: ${n.lines.join(', ')}`)] : []),
     `Gating mutants (they touch a changed line): ${gating.length}: ${tally(gating)}`,
     `  killed in pass A: ${gating.filter(m => !m.passes.b && outcome(m) === 'Killed').length}; sent to pass B: ${gating.filter(m => m.passes.b).length}, killed there: ${gating.filter(m => m.passes.b && outcome(m) === 'Killed').length}`,
     ...section('Survivors (each needs a test that kills it, or a justification in the notes):', [...gatingAt('Survived'), ...gatingAt('NoCoverage'), ...gatingAt('Missing')]),
     ...section('Silenced by a Stryker disable comment (each needs a justification in the notes):', gatingAt('Ignored')),
     ...section('Inconclusive (no test failed for the mutant itself; rerun, or add a test that fails on it):', [...gatingAt('Inconclusive'), ...gatingAt('RuntimeError')]),
-    ...section('Timeouts (each hung the tests again when run alone; counted as killed):', gatingAt('Timeout')),
+    ...section('Timeouts (each timed out again when run alone with four times the time: a test, a hook, or the whole run past its budget; counted as killed, so check each replacement):', gatingAt('Timeout')),
     `Context mutants (in the widened statements, not on a changed line; not gating): ${context.length}: ${tally(context)}`,
     ...section('Context survivors:', context.filter(m => outcome(m) === 'Survived')),
     ...(run.controls?.length ? ['Runs with no mutant after the reruns:', ...run.controls.map(line => `  ${line}`)] : []),
