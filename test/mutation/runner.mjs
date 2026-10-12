@@ -14,6 +14,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
+const started = Date.now();
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const testDir = path.join(root, 'test');
 // SMDB_MUTATION_VITEST: a test's stand-in for vitest (unit/mutationRunner.test.ts).
@@ -65,12 +66,21 @@ if (runIds && mutant !== 'dry') {
   try { ids = JSON.parse(fs.readFileSync(runIds, 'utf8')); } catch { ids = null; }
   if (Array.isArray(ids) && !ids.includes(mutant)) process.exit(0);
 }
+/**
+ * Ends the run. A run with no mutant leaves its time, which the run with no
+ * mutant after a rerun's timeouts is held to (touched.mjs).
+ * @param {number} code
+ */
+const end = code => {
+  if (mutant === 'dry') fs.writeFileSync(path.join(out, 'dry-ms.txt'), String(Date.now() - started));
+  process.exit(code);
+};
 if (only.length > 0) {
   for (const project of ['fast', 'integration', 'child']) {
     const these = only.filter(file => projectOf(file) === project);
-    if (these.length > 0 && tier(project, ['run', ...these])) process.exit(1);
+    if (these.length > 0 && tier(project, ['run', ...these])) end(1);
   }
-  process.exit(0);
+  end(0);
 }
 const related = ['related', ...files, '--run'];
-process.exit(pass === 'a' ? tier('fast', related) : tier('integration', related) || tier('child', ['run']));
+end(pass === 'a' ? tier('fast', related) : tier('integration', related) || tier('child', ['run']));

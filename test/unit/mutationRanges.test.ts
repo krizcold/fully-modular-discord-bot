@@ -9,7 +9,7 @@ import { describe, expect, it, onTestFinished } from 'vitest';
 import { canonicalName } from '../mutation/keys.mjs';
 import {
   changeTarget, codeLines, commonLines, gates, inPattern, lineDiff, linesOfTarget, mergeRanges, notMutated, parseNameStatus, planChange, planFromGit,
-  unmatchedPatterns, untouched, wholeTarget, DATA_ROOT_FILE, dataRootsInReach, GLOB_NAME_WHY,
+  unmatchedPatterns, untouched, wholeTarget, DATA_ROUTE_WHY, GLOB_NAME_WHY, holdsDataRoute,
 } from '../mutation/ranges.mjs';
 import { treeChanges, treePrint } from '../mutation/tree.mjs';
 
@@ -307,6 +307,51 @@ describe('the change', () => {
     expect(lineDiff(into.join('\n'), [into[0], into[2], into[4], into[5], into[6]].join('\n'), 'src/a.ts').changed).toContain(2);
     // An edited condition moves no other line.
     expect(lineDiff(into.join('\n'), [into[0], '  if (ready && log.length > 0) {', ...into.slice(2)].join('\n'), 'src/a.ts').changed).toEqual([2]);
+    // A block put around it.
+    expect(lineDiff(into.join('\n'), [...into.slice(0, 4), '  if (log.length > 0) {', into[4], '  }', ...into.slice(5)].join('\n'), 'src/a.ts').changed).toEqual([5, 6, 7]);
+  });
+
+  it('counts a line kept that a sibling block now holds: across `} else {`, `} finally {`, a case label or `}, () => {`', () => {
+    const head = 'export function step(failed: boolean, state: { retries: number, backoff: number }) {';
+    const up = ['    state.retries = state.retries + 1;', '    state.backoff = Math.min(state.backoff * 2, 60);'];
+    const down = ['    state.retries = Math.max(state.retries - 1, 0);', '    state.backoff = state.backoff / 2;'];
+    const ifElse = (then: string[], other: string[]) => [head, '  if (failed) {', ...then, '  } else {', ...other, '  }', '}'].join('\n');
+    // The two bodies swapped: every line of both counts.
+    expect(lineDiff(ifElse(up, down), ifElse(down, up), 'src/a.ts').changed).toEqual([3, 4, 5, 6, 7]);
+    const branches = ['export function f(a: boolean, log: string[]) {', '  if (a) {', "    log.push('x');", '  } else {', "    log.push('y');", "    log.push('z');", '  }', '}'];
+    const swap = (lines: string[], k: number) => [...lines.slice(0, k), lines[k + 1], lines[k], ...lines.slice(k + 2)].join('\n');
+    // `} else {` moved below log.push('y'): y now runs when a holds.
+    expect(lineDiff(branches.join('\n'), swap(branches, 3), 'src/a.ts').changed).toContain(4);
+    // The same with the condition edited too: both blocks open on edited lines, and y went from the else to the then.
+    expect(lineDiff(branches.join('\n'), swap(branches, 3).replace('if (a) {', 'if (!a) {'), 'src/a.ts').changed).toContain(4);
+    const guarded = ['export function g(work: () => void, lease: { release(): void }, log: string[]) {', '  try {', '    work();', "    log.push('ok');", '  } finally {', '    lease.release();', '  }', '}'];
+    // `} finally {` moved below release(): it no longer runs when work() throws.
+    expect(lineDiff(guarded.join('\n'), swap(guarded, 4), 'src/a.ts').changed).toContain(5);
+    const cases = ['export function h(n: number, log: string[]) {', '  switch (n) {', '    case 1:', "      log.push('one');", '      break;', '    case 2:', "      log.push('two');", '      break;', '  }', '}'];
+    // `case 2:` moved above case 1's break: case 1 falls through into it.
+    expect(lineDiff(cases.join('\n'), swap(cases, 4), 'src/a.ts').changed).toContain(6);
+    const callbacks = ['export function k(on: (a: () => void, b: () => void) => void, log: string[]) {', '  on(() => {', "    log.push('a');", '  }, () => {', "    log.push('b');", "    log.push('c');", '  });', '}'];
+    // `}, () => {` moved below log.push('b'): b now runs in the first callback.
+    expect(lineDiff(callbacks.join('\n'), swap(callbacks, 3), 'src/a.ts').changed).toContain(4);
+    const classes = ['export class A {', '  x = 1;', '}', 'export class B {', '  y = 2;', '}'];
+    expect(lineDiff(classes.join('\n'), [classes[0], classes[1], classes[4], classes[2], classes[3], classes[5]].join('\n'), 'src/a.ts').changed).toContain(3);
+  });
+
+  it('counts no line a change only wraps or renames the holder of, and numbers lines as the diff does', () => {
+    const fn = ['export function sum(items: number[]) {', '  let total = 0;', '  for (const n of items) total += n;', '  return total;', '}'];
+    expect(lineDiff(fn.join('\n'), ['export const sum = (items: number[]) => {', ...fn.slice(1, 4), '};'].join('\n'), 'src/a.ts').changed).toEqual([1, 5]);
+    const call = ['export async function m(send: (a: number, b: number) => Promise<void>) {', '  send(', '    1,', '    2,', '  );', '}'];
+    expect(lineDiff(call.join('\n'), [call[0], '  await send(', ...call.slice(2)].join('\n'), 'src/a.ts').changed).toEqual([2]);
+    const table = ['export const table = {', '  a: 1,', '  b: 2,', '};'];
+    expect(lineDiff(table.join('\n'), ['export const table = Object.freeze({', '  a: 1,', '  b: 2,', '});'].join('\n'), 'src/a.ts').changed).toEqual([1, 4]);
+    const cls = ['export class A {', '  x = 1;', '  y() { return 2; }', '}'];
+    expect(lineDiff(cls.join('\n'), ['@sealed', ...cls].join('\n'), 'src/a.ts').changed).toEqual([1]);
+    // A base that holds U+2028 (TypeScript counts it as a line break, the diff does not).
+    const ls = String.fromCharCode(0x2028);
+    const base = ['export function q(log: string[]) {', `  const s = 'a${ls}b';`, '  log.push(s);', '  if (s) {', "    log.push('x');", '  }', "  log.push('y');", '}'];
+    expect(lineDiff(base.join('\n'), [base[0], "  const s = 'ab';", ...base.slice(2, 6), "  log.push('y!');", base[7]].join('\n'), 'src/a.ts').changed).toEqual([2, 7]);
+    // A line that was inside a template and is code now.
+    expect(lineDiff(['export const t = `', 'run();', '`;'].join('\n'), ['export const t = 1;', 'run();', ''].join('\n'), 'src/a.ts').changed).toContain(2);
   });
 
   it('names a submodule, and a file whose name Stryker would read as a glob, with the reason', () => {
@@ -329,12 +374,16 @@ describe('the change', () => {
   it('sees a change git is told not to look at, and names a submodule and a name Stryker would read as a glob', () => {
     const edited = (name: string) => text(lines(name, 3).map((line, i) => (i === 1 ? `${line} // edited` : line)));
     const sub = repoWith({ 'index.ts': text(lines('s', 2)) });
-    const { git, write, plan } = repoWith({
+    const { repo, git, write, plan } = repoWith({
       'src/a.ts': text(lines('a', 3)), 'src/b.ts': text(lines('b', 3)), 'src/c.ts': text(lines('c', 3)), 'src/[id].ts': text(lines('id', 3)),
+      'src/d.ts': text(lines('d', 3)), 'src/e.ts': text(lines('e', 3)),
     });
     git(['-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', sub.repo.split(path.sep).join('/'), 'src/sub']);
-    git(['update-index', '--assume-unchanged', 'src/a.ts']);
-    git(['update-index', '--skip-worktree', 'src/b.ts']);
+    git(['update-index', '--assume-unchanged', 'src/a.ts', 'src/d.ts']);
+    git(['update-index', '--skip-worktree', 'src/b.ts', 'src/e.ts']);
+    // Gone: d deleted (named), e left out as a sparse checkout leaves a file out.
+    fs.rmSync(path.join(repo, 'src', 'd.ts'));
+    fs.rmSync(path.join(repo, 'src', 'e.ts'));
     // core.ignoreStat marks each file git adds after it is set.
     git(['config', 'core.ignoreStat', 'true']);
     git(['add', 'src/c.ts']);
@@ -347,16 +396,42 @@ describe('the change', () => {
       { file: 'src/sub', why: 'a git submodule: git names only its commit, so none of its files is mutated' },
       { file: 'src/[id].ts', why: GLOB_NAME_WHY },
       { file: 'src/new[1].ts', why: GLOB_NAME_WHY },
+      { file: 'src/d.ts', why: 'deleted: nothing is left to mutate' },
     ]));
+    expect(result.skipped.map(s => s.file)).not.toContain('src/e.ts');
   });
 
-  it("finds a real /data a dataRoot.ts mutant would reach, from the bot root's drive and the temp dir's", () => {
-    const real = path.resolve('/x', '/data');
-    const asked: string[] = [];
-    const exists = (dir: string) => { asked.push(dir); return dir === real; };
-    expect(dataRootsInReach(['src/a.ts'], { root: path.resolve('/x'), tmp: path.resolve('/y'), exists })).toEqual([]);
-    expect(asked).toEqual([]);
-    expect(dataRootsInReach([DATA_ROOT_FILE, 'src/a.ts'], { root: path.resolve('/x'), tmp: path.resolve('/y'), exists })).toEqual([real]);
+  const botRoot = path.resolve(__dirname, '..', '..');
+
+  it('never mutates code on the way to /data, under any name, and names it', () => {
+    const dataRoot = fs.readFileSync(path.join(botRoot, 'src', 'utils', 'dataRoot.ts'), 'utf8');
+    expect(holdsDataRoute('src/utils/dataRoot.ts', dataRoot)).toBe(true);
+    expect(holdsDataRoute('src/a.ts', "export const root = process.env['DATA_DIR'] ?? 'here';\n")).toBe(true);
+    expect(holdsDataRoute('src/a.js', 'module.exports = process.env.X || `/data/`;\n')).toBe(true);
+    // A name that holds it, a route that starts with it, or a comment is no way there.
+    expect(holdsDataRoute('src/a.ts', "// DATA_DIR, '/data'\nconst BASE_DATA_DIR = DATA_ROOT;\napp.get('/data/get', h);\n")).toBe(false);
+    const plan = planChange({
+      entries: [{ status: 'R', from: 'src/utils/dataRoot.ts', file: 'src/utils/paths/dataRoot.ts' }, { status: 'M', file: 'src/b.ts' }],
+      untracked: ['src/c.ts'],
+      read: file => (file === 'src/b.ts' ? 'export const b = 1;\n' : dataRoot),
+      readBase: () => 'export const b = 0;\n',
+      nameOf: file => file,
+    });
+    expect(plan.targets.map(t => t.file)).toEqual(['src/b.ts']);
+    expect(plan.skipped).toEqual([{ file: 'src/utils/paths/dataRoot.ts', why: DATA_ROUTE_WHY }, { file: 'src/c.ts', why: DATA_ROUTE_WHY }]);
+  });
+
+  it('fails when a test names botManager, whose fork of the bot is a way to /data the gate does not close yet (mutation/README.md)', () => {
+    const named: string[] = [];
+    const walk = (dir: string) => {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) { if (!['node_modules', 'reports', '.stryker-tmp'].includes(entry.name)) walk(full); continue; }
+        if (/\.(ts|mjs|cjs|js)$/.test(entry.name) && full !== __filename && fs.readFileSync(full, 'utf8').includes('botManager')) named.push(path.relative(botRoot, full));
+      }
+    };
+    walk(path.join(botRoot, 'test'));
+    expect(named).toEqual([]);
   });
 
   it('fingerprints the tree a run reads, and names what changed in it', () => {

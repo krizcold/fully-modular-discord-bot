@@ -10,7 +10,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { runControl } from './control.mjs';
+import { pastBudget, runControl } from './control.mjs';
 import { treeChanges, treePrint } from './tree.mjs';
 import { canonicalName, fileOf as nameOf, keyOf } from './keys.mjs';
 import { COMMON, PASSES } from './passes.mjs';
@@ -53,7 +53,7 @@ try {
   console.error(`Verdict: NO RESULT (the gate could not load: ${error instanceof Error ? error.message.split('\n')[0] : String(error)}; run npm run test:install)`);
   process.exit(2);
 }
-const { DATA_ROOT_FILE, dataRootsInReach, EXTRA_BREAK_WHY, gates, holdsExtraBreak, linesOfTarget, planFromGit, unmatchedPatterns, untouched } = ranges;
+const { DATA_ROUTE_WHY, EXTRA_BREAK_WHY, gates, holdsDataRoute, holdsExtraBreak, linesOfTarget, planFromGit, unmatchedPatterns, untouched } = ranges;
 const { byKiller, classifyKill, judge, outcome, toConfirm, toPassB } = verdicts;
 
 const USAGE = 'usage: node test/mutation/touched.mjs [--base REF] [--mutate PATTERN]... [--concurrency N] [--keep]';
@@ -91,8 +91,10 @@ opts.mutate = opts.mutate.map(pattern => {
     console.error(`--mutate takes a file in the bot root that exists, or such a file and lines, never a glob: ${pattern}\n${USAGE}`);
     process.exit(2);
   }
-  if (holdsExtraBreak(fs.readFileSync(path.join(root, name), 'utf8'))) {
-    console.error(`--mutate cannot take ${name}: ${EXTRA_BREAK_WHY}`);
+  const text = fs.readFileSync(path.join(root, name), 'utf8');
+  const why = holdsExtraBreak(text) ? EXTRA_BREAK_WHY : holdsDataRoute(name, text) ? DATA_ROUTE_WHY : null;
+  if (why) {
+    console.error(`--mutate cannot take ${name}: ${why}`);
     process.exit(2);
   }
   return `${name}${pattern.slice(file.length)}`;
@@ -240,26 +242,30 @@ async function pass({ name, dir, tier, mutate, files, only = [], keys, extra }) 
  * the reruns alone counted a kill or a timeout (control.mjs): those count only
  * if the tests still pass without a mutant. When they fail, a machine or a
  * container went bad during the reruns, so their results are voided and the
- * gate stops.
+ * gate stops. When the reruns confirmed a timeout (`timed`), the tests must
+ * also fit, with no mutant, in the budget Stryker gave each rerun, or the
+ * machine was as slow as the mutants seemed.
  * @param {PassName} after
  * @param {'a' | 'b'} tier
  * @param {MutantRecord[]} on
  * @param {string[]} only the test files the reruns ran, or none
+ * @param {boolean} [timed]
  */
-async function control(after, tier, on, only) {
+async function control(after, tier, on, only, timed = false) {
   const name = `control-${after}`;
   const out = path.join(reportDir, name);
   fs.mkdirSync(out, { recursive: true });
   console.log(`L5: the same tests once with no mutant, to check the machine after pass ${after}`);
   const run = await runControl({ root, out, tier, files: [...new Set(on.map(m => m.file))], only });
   const logs = `${posix(path.relative(root, out))}/dry-*.log`;
-  if (!run.passed) {
+  const failed = !run.passed ? run.why : timed ? pastBudget(path.join(reportDir, after), out, PASSES.a2) : '';
+  if (failed) {
     const why = `the run with no mutant after pass ${after} failed`;
     for (const m of on) {
       const result = m.passes[after];
       if (result) m.passes[after] = { ...result, voided: why };
     }
-    throw new PassError([`${why} (${run.why}), so what its reruns counted cannot be told from the machine's failures`, ...dryFailures(name), `its logs: ${logs}`].join('\n'));
+    throw new PassError([`${why} (${failed}), so what its reruns counted cannot be told from the machine's failures`, ...dryFailures(name), `its logs: ${logs}`].join('\n'));
   }
   controls.push(`after pass ${after}: passed (${logs})`);
 }
@@ -326,6 +332,8 @@ function report(stopped) {
 }
 
 try {
+  // Before the plan reads a file, so an edit saved from here on shows at the end.
+  planned = treePrint(root, treeFiles());
   // What to mutate: the explicit patterns (every mutant gates), or the change
   // from the merge-base of --base and HEAD to the working tree.
   if (opts.mutate.length > 0) {
@@ -345,13 +353,8 @@ try {
   common.ignorePatterns = [...new Set(['/dist/', ...ignored.filter(p => path.posix.basename(p.replace(/\/$/, '')) !== 'node_modules').map(p => `/${p}`)])];
   fs.mkdirSync(path.join(root, '.stryker-tmp'), { recursive: true });
   fs.writeFileSync(path.join(root, '.stryker-tmp', '.gitignore'), '*\n');
-  planned = treePrint(root, treeFiles());
 
   const files = [...new Set(targets.map(target => target.file))];
-  const reached = dataRootsInReach(files, { root, tmp: os.tmpdir(), exists: fs.existsSync });
-  if (reached.length > 0) {
-    throw new PassError(`a mutant of ${DATA_ROOT_FILE}'s DATA_DIR check would run the tests against ${reached.join(' and ')}, which this machine holds; move ${reached.length > 1 ? 'them' : 'it'} away to mutate that file`);
-  }
   console.log(`L5: mutating ${scope}: ${files.length} file(s), pass A (in-process tests that import them)`);
   const resultsA = await pass({ name: 'a', dir: 'a', tier: 'a', mutate: targets.flatMap(t => t.patterns), files, extra: { ...PASSES.a, concurrency: opts.concurrency } });
   const orphans = [...new Set(resultsA.map(fileOf).filter(file => !targets.some(t => t.file === file)))];
@@ -374,7 +377,7 @@ try {
   if (confirmA.length > 0) {
     console.log(`L5: pass A again, one at a time, on ${confirmA.length} timeout(s)`);
     await passOn('a2', 'a2', 'a', confirmA, PASSES.a2);
-    if (confirmA.some(credited)) await control('a2', 'a', confirmA, []);
+    if (confirmA.some(credited)) await control('a2', 'a', confirmA, [], confirmA.some(m => outcome(m) === 'Timeout'));
   }
 
   const forB = toPassB(mutants);

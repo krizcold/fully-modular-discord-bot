@@ -1,9 +1,10 @@
-import { spawnSync } from 'child_process';
+import { spawn, spawnSync } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { pathToFileURL } from 'url';
 import { afterEach, describe, expect, it, onTestFinished, vi } from 'vitest';
-import { runControl } from '../mutation/control.mjs';
+import { pastBudget, runControl } from '../mutation/control.mjs';
 
 // The command every mutant run executes (mutation/runner.mjs) and the run with
 // no mutant after the reruns (mutation/control.mjs), against a stand-in for
@@ -75,6 +76,14 @@ describe('a mutant run', () => {
     expect(calls[1].args.slice(0, 3)).toEqual(['run', 'child/fleetIdentity.test.ts', 'child/takeover.test.ts']);
     for (const call of calls) expect(call.args).toContain('--bail=1');
   });
+
+  it('leaves the time of a run with no mutant, which the run after the reruns is held to, and only of one', () => {
+    const fake = fakeVitest([]);
+    expect(runner(fake, 'a', '1').status).toBe(0);
+    expect(fs.existsSync(path.join(fake.out, 'dry-ms.txt'))).toBe(false);
+    expect(runner(fake, 'a', '1', [], { __STRYKER_ACTIVE_MUTANT__: undefined }).status).toBe(0);
+    expect(fs.readFileSync(path.join(fake.out, 'dry-ms.txt'), 'utf8')).toMatch(/^\d+$/);
+  });
 });
 
 describe('a pass on some of the mutants Stryker made', () => {
@@ -124,8 +133,8 @@ describe('the run with no mutant after the reruns', () => {
     expect(passing.read().map(call => [call.project, call.scale])).toEqual([['fast', '4']]);
   });
 
-  it('ends a run past its bound with every process it started', async () => {
-    // A stand-in for vitest that starts a process of its own, then hangs.
+  /** A stand-in for vitest that starts a process of its own, then hangs; and whether that process still runs. */
+  function hangingVitest() {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-hang-'));
     onTestFinished(() => fs.rmSync(dir, { recursive: true, force: true }));
     const pidFile = path.join(dir, 'grandchild.pid');
@@ -139,13 +148,80 @@ describe('the run with no mutant after the reruns', () => {
     ].join('\n'));
     const out = path.join(dir, 'out');
     fs.mkdirSync(out);
-    const env = { ...process.env, SMDB_MUTATION_VITEST: script };
-    const run = await runControl({ root, out, tier: 'a', files: ['src/a.ts'], only: [], env, timeoutMs: 4_000 });
+    const gone = async () => {
+      const pid = Number(fs.readFileSync(pidFile, 'utf8'));
+      const alive = () => { try { process.kill(pid, 0); return true; } catch { return false; } };
+      for (let tries = 0; alive() && tries < 50; tries++) await new Promise(resolve => setTimeout(resolve, 100));
+      return !alive();
+    };
+    return { dir, script, out, pidFile, gone };
+  }
+
+  it('ends a run past its bound with every process it started', async () => {
+    const hang = hangingVitest();
+    const env = { ...process.env, SMDB_MUTATION_VITEST: hang.script };
+    const run = await runControl({ root, out: hang.out, tier: 'a', files: ['src/a.ts'], only: [], env, timeoutMs: 4_000 });
     expect(run).toEqual({ passed: false, why: 'it ran past its bound of 4 s, and was ended with every process it started' });
-    const pid = Number(fs.readFileSync(pidFile, 'utf8'));
-    const alive = () => { try { process.kill(pid, 0); return true; } catch { return false; } };
-    for (let tries = 0; alive() && tries < 50; tries++) await new Promise(resolve => setTimeout(resolve, 100));
-    expect(alive()).toBe(false);
+    expect(await hang.gone()).toBe(true);
+  });
+
+  it('listens for an interrupt of the gate while it runs, and only then', async () => {
+    const signals = ['SIGINT', 'SIGTERM', 'SIGHUP'] as const;
+    const before = signals.map(signal => process.listenerCount(signal));
+    const fake = fakeVitest([]);
+    const running = runControl({ root, out: fake.out, tier: 'a', files: ['src/a.ts'], only: [], env: { ...process.env, SMDB_MUTATION_VITEST: fake.script } });
+    expect(signals.map(signal => process.listenerCount(signal))).toEqual(before.map(n => n + 1));
+    expect(await running).toEqual({ passed: true, why: '' });
+    expect(signals.map(signal => process.listenerCount(signal))).toEqual(before);
+  });
+
+  // On Windows the run shares the gate's console and job, so it ends with the gate anyway.
+  it.skipIf(process.platform === 'win32')('ends the run, with every process it started, when the gate is interrupted', async () => {
+    const hang = hangingVitest();
+    const gate = path.join(hang.dir, 'gate.mjs');
+    fs.writeFileSync(gate, [
+      `import { runControl } from ${JSON.stringify(pathToFileURL(path.join(root, 'test', 'mutation', 'control.mjs')).href)};`,
+      `await runControl({ root: ${JSON.stringify(root)}, out: ${JSON.stringify(hang.out)}, tier: 'a', files: ['src/a.ts'], only: [], env: { ...process.env, SMDB_MUTATION_VITEST: ${JSON.stringify(hang.script)} } });`,
+      '',
+    ].join('\n'));
+    const child = spawn(process.execPath, [gate], { stdio: 'ignore' });
+    const exited = new Promise<NodeJS.Signals | null>(resolve => child.on('exit', (_code, signal) => resolve(signal)));
+    for (let tries = 0; !fs.existsSync(hang.pidFile) && tries < 100; tries++) await new Promise(resolve => setTimeout(resolve, 100));
+    child.kill('SIGINT');
+    expect(await exited).toBe('SIGINT');
+    expect(await hang.gone()).toBe(true);
+  });
+
+  it('clears the reruns\' timeouts only when it fits in the budget Stryker gave each rerun', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-budget-'));
+    onTestFinished(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const [reruns, out] = [path.join(dir, 'a2'), path.join(dir, 'control-a2')];
+    fs.mkdirSync(reruns);
+    fs.mkdirSync(out);
+    const time = (where: string, ms: string) => fs.writeFileSync(path.join(where, 'dry-ms.txt'), ms);
+    const budget = { timeoutFactor: 4, timeoutMS: 60_000 };
+    time(reruns, '10000');
+    time(out, '100000');
+    expect(pastBudget(reruns, out, budget)).toBe('');
+    time(out, '100600');
+    expect(pastBudget(reruns, out, budget)).toBe('it took 101 s, past the 100 s Stryker gave each rerun, so the machine was too slow then to tell a slow mutant from a slow run');
+    const unread = "its time, or the time of the reruns' own run with no mutant, could not be read";
+    time(out, 'soon');
+    expect(pastBudget(reruns, out, budget)).toBe(unread);
+    time(out, '1');
+    fs.rmSync(path.join(reruns, 'dry-ms.txt'));
+    expect(pastBudget(reruns, out, budget)).toBe(unread);
+  });
+
+});
+
+describe('the tree fingerprint', () => {
+  it('is taken, in the gate, before the plan reads a file', () => {
+    const gate = fs.readFileSync(path.join(root, 'test', 'mutation', 'touched.mjs'), 'utf8');
+    const body = gate.slice(gate.indexOf('\ntry {'));
+    const print = body.indexOf('planned = treePrint(');
+    expect(print).toBeGreaterThan(0);
+    expect(print).toBeLessThan(body.indexOf('planFromGit('));
   });
 });
 

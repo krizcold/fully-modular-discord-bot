@@ -4,10 +4,14 @@
 // line diff (lineDiff), so no git setting, attribute or variable moves them.
 // The caller runs git.
 import fs from 'fs';
+import { createRequire } from 'module';
 import path from 'path';
-import { Minimatch, minimatch } from 'minimatch';
 import ts from 'typescript';
 import { canonicalName } from './keys.mjs';
+
+// Stryker's own copy of minimatch, which it matches mutate patterns with.
+const strykerRequire = createRequire(createRequire(import.meta.url).resolve('@stryker-mutator/core/package.json'));
+const { Minimatch, minimatch } = strykerRequire('minimatch');
 
 /**
  * @typedef {[number, number]} Range first and last line, 1-based
@@ -39,6 +43,27 @@ export const EXTRA_BREAK_WHY = 'it holds a line break Stryker counts and the gat
 
 /** @param {string} text */
 export const holdsExtraBreak = text => EXTRA_BREAK.test(text);
+
+export const DATA_ROUTE_WHY = "it reads DATA_DIR or holds the '/data' fallback, so a mutant of it could send the tests to /data, on a developer's machine a real data root and anywhere else one the run would make";
+
+/**
+ * Whether a file's code names the DATA_DIR variable or holds '/data' as a
+ * string: a mutant of it (a check of DATA_DIR made false, the fallback chosen)
+ * could send the tests to '/data', so the gate never mutates it.
+ * @param {string} file
+ * @param {string} text
+ */
+export function holdsDataRoute(file, text) {
+  let found = false;
+  /** @param {ts.Node} node */
+  const walk = node => {
+    if (ts.isIdentifier(node) && node.text === 'DATA_DIR') found = true;
+    else if ((ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) && /^(DATA_DIR|\/data\/?)$/.test(node.text)) found = true;
+    else if (!found) ts.forEachChild(node, walk);
+  };
+  walk(parse(file, text));
+  return found;
+}
 
 /**
  * A text's lines, split at LF or CRLF, without the empty one after a final break.
@@ -149,9 +174,9 @@ export function commonLines(a, b) {
  * one place, or only taken out, count also where they could slide to: their
  * first or last lines, or the whole run, pass through unchanged lines beside
  * them that repeat them (an `if` block added after an equal one counts in both
- * places). Given the file's name, a line kept whose place in the code changed
- * (a bracket moved past it puts it in or out of a block, a block's header and
- * bracket put around it or taken away) counts as changed too.
+ * places). Given the file's name, a line kept that another block now holds (a
+ * bracket moved past it, `} else {` among them, a block put around it or taken
+ * away) counts as changed too (holdersOf).
  * @param {string} before
  * @param {string} after
  * @param {string} [file] its name, to parse both texts by
@@ -190,37 +215,98 @@ export function lineDiff(before, after, file) {
     pj = j;
   }
   if (file !== undefined) {
-    const was = depthsOf(file, before);
-    const is = depthsOf(file, after);
-    for (const [i, j] of pairs) if (was.get(i + 1) !== is.get(j + 1)) changed.add(j + 1);
+    // The same holder: its opening lines are a kept pair, or both were edited
+    // and it plays the same part (an `if` whose condition changed).
+    const was = holdersOf(file, before);
+    const is = holdersOf(file, after);
+    const newOf = new Map([[0, 0], ...pairs.map(([i, j]) => /** @type {[number, number]} */ ([i + 1, j + 1]))]);
+    const oldOf = new Map([[0, 0], ...pairs.map(([i, j]) => /** @type {[number, number]} */ ([j + 1, i + 1]))]);
+    for (const [i, j] of pairs) {
+      const held = was.get(i + 1);
+      const holds = is.get(j + 1);
+      if (!held || !holds) { if (held !== holds) changed.add(j + 1); continue; }
+      const kept = newOf.has(held.line) || oldOf.has(holds.line);
+      if (kept ? newOf.get(held.line) !== holds.line : held.role !== holds.role) changed.add(j + 1);
+    }
   }
   /** @param {Set<number>} set */
   const sorted = set => [...set].sort((x, y) => x - y);
   return { changed: sorted(changed), deletedAfter: sorted(deletedAfter) };
 }
 
+// What can hold a line of code: a block, a case, a class body, an object or an array.
+const HOLDERS = new Set([
+  ts.SyntaxKind.Block, ts.SyntaxKind.ModuleBlock, ts.SyntaxKind.CaseClause, ts.SyntaxKind.DefaultClause, ts.SyntaxKind.ClassDeclaration,
+  ts.SyntaxKind.ClassExpression, ts.SyntaxKind.ObjectLiteralExpression, ts.SyntaxKind.ArrayLiteralExpression,
+]);
+
 /**
- * Per line (from 1), how deep in the syntax tree the outermost node that
- * starts on it sits; a line no node starts on (a bracket, a comment) has none.
- * A line kept whose depth changed sits in another block than before.
+ * Per line (from 1) that a node starts on, what holds it: the innermost block,
+ * case, class body, object or array opened on an earlier line, as the line it
+ * opens on (0: the file itself) and the part it plays (a then or an else
+ * block, a try or a finally block, a function's body, a case). A line no node
+ * starts on (a bracket, a comment) has none. Lines are counted at LF only, as
+ * the line diff counts them.
  * @param {string} file
  * @param {string} text
  */
-function depthsOf(file, text) {
+function holdersOf(file, text) {
   const sf = parse(file, text);
-  /** @type {Map<number, number>} */
-  const depths = new Map();
+  const starts = [0];
+  for (let at = text.indexOf('\n'); at !== -1; at = text.indexOf('\n', at + 1)) starts.push(at + 1);
+  /** @param {number} pos */
+  const lineOf = pos => {
+    let lo = 0;
+    let hi = starts.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >> 1;
+      if (starts[mid] <= pos) lo = mid;
+      else hi = mid - 1;
+    }
+    return lo + 1;
+  };
+  /** @typedef {{ line: number, role: string }} Holder */
+  /** @type {Map<number, Holder>} */
+  const holders = new Map();
   /**
    * @param {ts.Node} node
-   * @param {number} depth
+   * @param {Holder[]} open the holders around it, outermost first
    */
-  const walk = (node, depth) => {
-    const line = sf.getLineAndCharacterOfPosition(node.getStart(sf)).line + 1;
-    if (!depths.has(line)) depths.set(line, depth);
-    ts.forEachChild(node, child => walk(child, depth + 1));
+  const walk = (node, open) => {
+    const line = lineOf(node.getStart(sf));
+    if (!holders.has(line)) {
+      let k = open.length - 1;
+      while (k >= 0 && open[k].line >= line) k--;
+      holders.set(line, k >= 0 ? open[k] : { line: 0, role: 'the file' });
+    }
+    const inner = HOLDERS.has(node.kind) ? [...open, { line: lineOf(openingOf(node, sf)), role: roleOf(node) }] : open;
+    ts.forEachChild(node, child => walk(child, inner));
   };
-  ts.forEachChild(sf, child => walk(child, 1));
-  return depths;
+  ts.forEachChild(sf, child => walk(child, []));
+  return holders;
+}
+
+/**
+ * Where a holder opens: a class at its brace (a decorator above it moves nothing), the others where they start.
+ * @param {ts.Node} node
+ * @param {ts.SourceFile} sf
+ */
+function openingOf(node, sf) {
+  return ts.isClassLike(node) ? node.members.pos - 1 : node.getStart(sf);
+}
+
+/**
+ * The part a holder plays: for a block, which part of what holds it (a then or
+ * an else, a try or a finally, a loop's body; any function's body is one part,
+ * so a function made an arrow moves nothing).
+ * @param {ts.Node} node
+ */
+function roleOf(node) {
+  if (ts.isClassLike(node)) return 'a class';
+  if (node.kind !== ts.SyntaxKind.Block) return ts.SyntaxKind[node.kind];
+  const parent = /** @type {ts.Node & Record<string, unknown>} */ (node.parent);
+  const slot = Object.keys(parent).find(key => key !== 'parent' && (parent[key] === node || (Array.isArray(parent[key]) && parent[key].includes(node))));
+  return `${ts.isFunctionLike(parent) ? 'a function' : ts.SyntaxKind[parent.kind]}.${slot}`;
 }
 
 /**
@@ -450,7 +536,8 @@ export const wholeTarget = file => ({ file, ranges: null, gating: null, patterns
  * moved in from a name never mutated (outside src, a browser view, a file that
  * is not code). One moved out of the mutated code is named, as a deletion is.
  * A file that holds a line break Stryker counts and the diff does not is named
- * and not mutated (EXTRA_BREAK_WHY), and so is a git submodule (`isDir`: git
+ * and not mutated (EXTRA_BREAK_WHY), and so is a file on the way to '/data'
+ * (DATA_ROUTE_WHY), a git submodule (`isDir`: git
  * names only its commit) and a file whose name Stryker would read as a glob
  * (`nameOf` gives null). `nameOf` gives the name a file is mutated under (its
  * name on disk, keys.mjs). emptyScope: nothing in src changed.
@@ -476,6 +563,7 @@ export function planChange({ entries, untracked, read, readBase, nameOf, isDir =
     if (name === null) { skipped.push({ file: entry.file, why: GLOB_NAME_WHY }); continue; }
     const text = read(entry.file);
     if (holdsExtraBreak(text)) { skipped.push({ file: entry.file, why: EXTRA_BREAK_WHY }); continue; }
+    if (holdsDataRoute(entry.file, text)) { skipped.push({ file: entry.file, why: DATA_ROUTE_WHY }); continue; }
     const before = entry.status === 'A' || entry.status === 'C' ? null : entry.from ?? entry.file;
     if (before === null || notMutated(before) !== null) { targets.push(wholeTarget(name)); continue; }
     const target = changeTarget(name, text, lineDiff(readBase(before), text, entry.file));
@@ -492,6 +580,7 @@ export function planChange({ entries, untracked, read, readBase, nameOf, isDir =
     if (why) skipped.push({ file, why });
     else if (name === null) skipped.push({ file, why: GLOB_NAME_WHY });
     else if (holdsExtraBreak(read(file))) skipped.push({ file, why: EXTRA_BREAK_WHY });
+    else if (holdsDataRoute(file, read(file))) skipped.push({ file, why: DATA_ROUTE_WHY });
     else targets.push(wholeTarget(name));
   }
   /** @param {string | undefined} file */
@@ -518,9 +607,15 @@ export function planFromGit({ git, base, root, read = file => fs.readFileSync(pa
   const isFile = file => { try { return fs.statSync(path.join(root, file)).isFile(); } catch { return false; } };
   const entries = parseNameStatus(git(...changedArgs(base)));
   const listed = new Set(entries.flatMap(entry => [entry.file, entry.from]));
-  const hidden = git('ls-files', '-v', '-z').split('\0').filter(line => /^([a-z]|S) /.test(line)).map(line => line.slice(2));
-  for (const file of hidden) {
-    if (listed.has(file) || !isFile(file)) continue;
+  const hidden = git('ls-files', '-v', '-z').split('\0').filter(line => /^([a-z]|S) /.test(line));
+  for (const line of hidden) {
+    const file = line.slice(2);
+    if (listed.has(file)) continue;
+    if (!isFile(file)) {
+      // Gone: deleted, unless skip-worktree left it out (a sparse checkout).
+      if (!/^[sS]/.test(line) && !fs.existsSync(path.join(root, file))) entries.push({ status: 'D', file });
+      continue;
+    }
     let was = null;
     try { was = readBase(file); } catch { was = null; }
     if (was === null) entries.push({ status: 'A', file });
@@ -546,22 +641,6 @@ export function planFromGit({ git, base, root, read = file => fs.readFileSync(pa
 function globFree(root, file) {
   const name = path.resolve(root, file).split(path.sep).join('/');
   return !new Minimatch(name).hasMagic() && minimatch(name, name, { dot: true });
-}
-
-// The one src file whose mutant can turn the tests from their own data dir to
-// '/data' (resolveDataRoot's DATA_DIR check), on a developer's machine a real one.
-export const DATA_ROOT_FILE = 'src/utils/dataRoot.ts';
-
-/**
- * The real data roots a run would reach through a mutant of DATA_ROOT_FILE:
- * '/data' as the tests resolve it, from the bot root's drive and from the temp
- * dir's, where it exists. None when no target is that file.
- * @param {string[]} files the targets' files
- * @param {{ root: string, tmp: string, exists: (dir: string) => boolean }} where
- */
-export function dataRootsInReach(files, { root, tmp, exists }) {
-  if (!files.includes(DATA_ROOT_FILE)) return [];
-  return [...new Set([path.resolve(root, '/data'), path.resolve(tmp, '/data')])].filter(exists);
 }
 
 /**
