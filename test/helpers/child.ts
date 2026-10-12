@@ -1,9 +1,10 @@
-import { execFileSync, spawn } from 'child_process';
+import { spawn } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { onTestFinished } from 'vitest';
+import { endTree } from './endTree.mjs';
 import { DEAD_ENDS, scrubEnv } from './env';
 import { STEP_MS } from './time.mjs';
 
@@ -33,29 +34,10 @@ export function childEnv(dataDir: string): NodeJS.ProcessEnv {
   return { ...scrubEnv({ ...process.env }), ...DEAD_ENDS, NODE_ENV: 'test', DATA_DIR: dataDir };
 }
 
-// Ends a process and every process it started that still descends from it,
-// found by their parents while the tree stands: a process a step started would
-// outlive the step's end. One whose parent already exited is not found, and
-// where ps is missing, only the step is ended.
-function endTree(pid: number): void {
-  try {
-    if (process.platform === 'win32') {
-      execFileSync('taskkill', ['/pid', String(pid), '/T', '/F'], { stdio: 'ignore' });
-      return;
-    }
-    const rows = execFileSync('ps', ['-A', '-o', 'pid=,ppid='], { encoding: 'utf8' }).trim().split('\n').map(row => row.trim().split(/\s+/).map(Number));
-    const tree = [pid];
-    for (let i = 0; i < tree.length; i++) for (const [child, parent] of rows) if (parent === tree[i]) tree.push(child);
-    for (const each of tree) {
-      try { process.kill(each, 'SIGKILL'); } catch { /* already gone */ }
-    }
-  } catch { /* the caller ends the step itself */ }
-}
-
 // Runs one scenario step in its own process and returns its RESULT line. The
 // child's cwd is its data dir, so a `dotenv/config` import in the bot finds no
 // .env; its env is childEnv's. It fails on a missing RESULT line, a nonzero
-// exit, a timeout (and ends the step's processes, endTree), or a bot module
+// exit, a timeout (and ends the step's processes, helpers/endTree.mjs), or a bot module
 // loaded from anywhere but this repo's dist.
 export function runScenario<T>(script: string, args: string[], dataDir: string, timeoutMs = STEP_MS): Promise<ScenarioRun<T>> {
   const env = childEnv(dataDir);

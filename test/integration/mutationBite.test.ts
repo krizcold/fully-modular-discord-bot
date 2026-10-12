@@ -225,6 +225,21 @@ describe('the touched-line mutation gate', () => {
     expect(run.stdout).not.toContain('its logs:');
   });
 
+  it('still writes its report, naming the file, when a target that made no mutant is deleted during the run', { timeout: 600_000 }, () => {
+    const src = path.join(root, 'src');
+    for (const old of fs.readdirSync(src).filter(name => name.startsWith('smdb-bite-gone-'))) fs.rmSync(path.join(src, old), { force: true });
+    const gone = `src/smdb-bite-gone-${process.pid}.ts`;
+    fs.writeFileSync(path.join(root, gone), 'export type Gone = number;\n');
+    try {
+      // Taken out of the checkout by pass A's run with no mutant (its copy in the sandbox stays).
+      const { run } = standInRun(`if (pass === 'a') fs.rmSync(${JSON.stringify(path.join(root, gone))}, { force: true });`, `${gone}:1-1`);
+      expect(run.stdout).toContain(`\nChanged during the run (so no one tree was tested):\n  ${gone}`);
+      expect(run.stdout).not.toContain('the report could not be written');
+    } finally {
+      fs.rmSync(path.join(root, gone), { force: true });
+    }
+  });
+
   it('has no result, exit 2, when its base is unknown or its patterns make no mutant, and refuses a glob or a missing file', { timeout: 300_000 }, () => {
     const gate = (...args: string[]) => spawnSync(process.execPath, [path.join(root, 'test', 'mutation', 'touched.mjs'), ...args], { cwd: root, encoding: 'utf8', timeout: 280_000 });
     // Each refusal runs with a stand-in for vitest that does not exist, so a

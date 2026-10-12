@@ -178,7 +178,7 @@ describe('the run with no mutant after the reruns', () => {
     const hang = hangingVitest();
     const env = { ...process.env, SMDB_MUTATION_VITEST: hang.script };
     const run = await runControl({ root, out: hang.out, tier: 'a', files: ['src/a.ts'], only: [], env, timeoutMs: 4_000 });
-    expect(run).toEqual({ passed: false, why: 'it ran past its bound of 4 s, and was ended with every process it started' });
+    expect(run).toEqual({ passed: false, why: 'it ran past its bound of 4 s, and was ended with the processes it started' });
     expect(await hang.gone()).toBe(true);
   });
 
@@ -240,6 +240,13 @@ describe('the tree fingerprint', () => {
     expect(run.stdout).toMatch(/^Verdict: NO RESULT \(the gate could not read the tree: /m);
   });
 
+  // The gate, and the helper it imports, copied to a root of its own.
+  const copyGate = (copy: string) => {
+    fs.cpSync(path.join(root, 'test', 'mutation'), path.join(copy, 'test', 'mutation'), { recursive: true, filter: source => path.basename(source) !== 'reports' });
+    fs.mkdirSync(path.join(copy, 'test', 'helpers'));
+    fs.copyFileSync(path.join(root, 'test', 'helpers', 'endTree.mjs'), path.join(copy, 'test', 'helpers', 'endTree.mjs'));
+  };
+
   it('ends the gate NO RESULT, exit 2, when it cannot make .stryker-tmp, and says so', () => {
     // The gate copied to a root of its own, whose .stryker-tmp is a file; its packages are linked, never copied.
     const copy = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-tmpdir-'));
@@ -248,7 +255,7 @@ describe('the tree fingerprint', () => {
       fs.unlinkSync(packages);
       fs.rmSync(copy, { recursive: true, force: true });
     });
-    fs.cpSync(path.join(root, 'test', 'mutation'), path.join(copy, 'test', 'mutation'), { recursive: true, filter: source => path.basename(source) !== 'reports' });
+    copyGate(copy);
     fs.symlinkSync(path.join(root, 'test', 'node_modules'), packages, 'junction');
     fs.writeFileSync(path.join(copy, '.stryker-tmp'), '');
     const run = spawnSync(process.execPath, [path.join(copy, 'test', 'mutation', 'touched.mjs')], { cwd: copy, encoding: 'utf8' });
@@ -259,7 +266,7 @@ describe('the tree fingerprint', () => {
   it('ends the gate NO RESULT, exit 2, on stdout with every other verdict, when the test packages are missing', () => {
     const copy = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-noinstall-'));
     onTestFinished(() => fs.rmSync(copy, { recursive: true, force: true }));
-    fs.cpSync(path.join(root, 'test', 'mutation'), path.join(copy, 'test', 'mutation'), { recursive: true, filter: source => path.basename(source) !== 'reports' });
+    copyGate(copy);
     const run = spawnSync(process.execPath, [path.join(copy, 'test', 'mutation', 'touched.mjs')], { cwd: copy, encoding: 'utf8' });
     expect(run.status, run.stderr).toBe(2);
     expect(run.stdout).toMatch(/^Verdict: NO RESULT \(the gate could not load: .*; run npm run test:install\)$/m);

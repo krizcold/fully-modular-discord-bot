@@ -112,6 +112,33 @@ const SHAPES: Record<string, string> = {
     '  }',
     '}',
   ].join('\n'),
+  bodiesTakenWhole: [
+    'export function pick(n: number, log: string[]): number {',
+    '  switch (n) {',
+    '    case 1: {',
+    "      log.push('one');",
+    '      break;',
+    '    }',
+    '    default: {',
+    "      log.push('other');",
+    '    }',
+    '  }',
+    '  const handlers = {',
+    '    run(x: number) {',
+    '      return x + 1;',
+    '    },',
+    '    get size() {',
+    '      return log.length;',
+    '    },',
+    '  };',
+    '  const K = class {',
+    '    twice(x: number) {',
+    '      return x * 2;',
+    '    }',
+    '  };',
+    '  return handlers.run(new K().twice(n)) + handlers.size;',
+    '}',
+  ].join('\n'),
 };
 
 const rangesOf = (text: string, lines: number[]) => changeTarget('src/a.ts', text, { changed: lines, deletedAfter: [] })?.ranges;
@@ -174,6 +201,38 @@ describe('the change', () => {
     expect(lineDiff(before, after).changed).toEqual([3, 4, 5, 6, 7, 8, 9, 10]);
     // A repeated line taken out could have been any of its copies.
     expect(lineDiff(['a', 'x', 'x', 'x', 'b'].join('\n'), ['a', 'x', 'x', 'b'].join('\n'))).toEqual({ changed: [], deletedAfter: [1, 2, 3] });
+    // A head of the run where another placement of it would sit: `a(); c();` of the run at 7-10 slides over line 6.
+    const body = ['b();', 'k();', 'c();', 'c();', 'c();', 'a();'];
+    const fn = (lines: string[]) => ['export function f() {', ...lines.map(line => `  ${line}`), '}'].join('\n');
+    expect(lineDiff(fn(body), fn([...body.slice(0, 5), 'a();', 'c();', 'b();', 'a();', ...body.slice(5)])).changed).toContain(6);
+    // And for lines taken out: `c(); b();` taken from b b c b x x could have sat after line 0 too.
+    expect(lineDiff(['b', 'b', 'c', 'b', 'x', 'x'].join('\n'), ['b', 'b', 'x', 'x'].join('\n')).deletedAfter).toContain(0);
+  });
+
+  it('counts every place a run added or taken out in one place could sit', () => {
+    // Small texts over three lines: wherever the one text reads as the other with a run of as many lines added (or
+    // taken out) in one place, those lines are counted (or that place named). It can count more: a line beside the
+    // run that repeats one of its lines, though no shortest diff changes it (a b gaining b a counts the first a).
+    const same = (x: string[], y: string[]) => x.join('\n') === y.join('\n');
+    const lines = fc.array(fc.constantFrom('a', 'b', 'c'), { maxLength: 6 });
+    const run = fc.array(fc.constantFrom('a', 'b', 'c'), { minLength: 1, maxLength: 4 });
+    fc.assert(fc.property(lines, fc.nat(6), run, (a, at, added) => {
+      const place = Math.min(at, a.length);
+      const b = [...a.slice(0, place), ...added, ...a.slice(place)];
+      const { changed, deletedAfter } = lineDiff(a.join('\n'), b.join('\n'));
+      const r = added.length;
+      for (let p = 0; p <= a.length; p++) {
+        if (!same(b.slice(0, p), a.slice(0, p)) || !same(b.slice(p + r), a.slice(p))) continue;
+        for (let k = 0; k < r; k++) expect(changed).toContain(p + k + 1);
+      }
+      // The same change the other way: b's lines taken out leave a.
+      const back = lineDiff(b.join('\n'), a.join('\n')).deletedAfter;
+      for (let q = 0; q <= a.length; q++) {
+        if (!same(b.slice(0, q), a.slice(0, q)) || !same(b.slice(q + r), a.slice(q))) continue;
+        expect(back).toContain(q);
+      }
+      expect(deletedAfter).toEqual([]);
+    }), { numRuns: 500 });
   });
 
   it("reads git's names, a rename's two included", () => {
@@ -377,6 +436,26 @@ describe('the change', () => {
       { file: 'src/[id].ts', why: GLOB_NAME_WHY },
       { file: 'src/a{1,2}.ts', why: GLOB_NAME_WHY },
     ]);
+  });
+
+  it('never mutates, through a link in src, a file that is not mutated: the suite\'s env scrub, say', () => {
+    const plan = planChange({
+      entries: [{ status: 'A', file: 'src/env.ts' }],
+      untracked: ['src/config.ts'],
+      read: () => 'export const x = 1;\n',
+      readBase: () => '',
+      nameOf: file => (file === 'src/env.ts' ? 'test/helpers/env.ts' : 'test/vitest.config.ts'),
+    });
+    expect(plan.targets).toEqual([]);
+    expect(plan.skipped).toEqual([
+      { file: 'src/env.ts', why: 'a link to test/helpers/env.ts, which is not mutated: outside src' },
+      { file: 'src/config.ts', why: 'a link to test/vitest.config.ts, which is not mutated: outside src' },
+    ]);
+    // On disk, through git: a link to a dir (a junction on Windows, which git walks into).
+    const { repo, plan: fromGit } = repoWith({ 'src/a.ts': text(lines('a', 2)), 'test/helpers/env.ts': text(lines('e', 2)) });
+    fs.symlinkSync(path.join(repo, 'test', 'helpers'), path.join(repo, 'src', 'link'), 'junction');
+    onTestFinished(() => fs.unlinkSync(path.join(repo, 'src', 'link')));
+    expect(fromGit().targets.filter(target => !target.file.startsWith('src/'))).toEqual([]);
   });
 
   it('sees a change git is told not to look at, and names a submodule and a name Stryker would read as a glob', () => {
@@ -627,8 +706,10 @@ describe('the widening', () => {
 // of its body), and the emptying of the body of a compound statement or
 // declaration, or of a bare block, that only begins or ends on the line (a
 // changed `if (...) {`, signature or closing brace: making it would bring in
-// the whole body). A callback's body, and that of a for with no condition, is
-// made.
+// the whole body), and the false condition of a for with no condition, which
+// spans the loop. Every other body's emptying is made (a callback's, a case
+// clause's block, a method of an object or a class expression), and what is
+// not made is checked not to be.
 describe('the widening, against what Stryker makes', () => {
   const quiet = () => {};
   const logger = { debug: quiet, info: quiet, warn: quiet, error: quiet, trace: quiet, fatal: quiet, isDebugEnabled: () => false, isTraceEnabled: () => false, isInfoEnabled: () => false, isWarnEnabled: () => false, isErrorEnabled: () => false, isFatalEnabled: () => false };
@@ -653,14 +734,20 @@ describe('the widening, against what Stryker makes', () => {
       const sf = ts.createSourceFile('a.ts', text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
       const at = (p: { line: number; column: number }) => sf.getPositionOfLineAndCharacter(p.line, p.column);
       const blocks: { start: number; end: number }[] = [];
-      // The bodies of compound statements and declarations, and bare blocks: never a callback's body, nor the body of
-      // a for with no condition, which is taken whole.
+      // The bodies of compound statements and declarations, and bare blocks: never a callback's body, a case
+      // clause's block, or the body of a method or accessor of an object or a class expression, each taken whole.
       const bodies = new Set<string>();
+      // Each for with no condition, whose false condition Stryker makes over the whole loop.
+      const loops = new Set<string>();
+      const inExpression = (node: ts.Node) => (ts.isMethodDeclaration(node) || ts.isGetAccessor(node) || ts.isSetAccessor(node) || ts.isConstructorDeclaration(node))
+        && (ts.isObjectLiteralExpression(node.parent) || ts.isClassExpression(node.parent));
       const walk = (node: ts.Node) => {
         if (ts.isBlock(node) || ts.isModuleBlock(node) || ts.isCaseBlock(node)) blocks.push({ start: node.getStart(sf), end: node.getEnd() });
-        if (ts.isBlock(node) && !ts.isArrowFunction(node.parent) && !ts.isFunctionExpression(node.parent) && !(ts.isForStatement(node.parent) && !node.parent.condition)) {
+        if (ts.isBlock(node) && !ts.isArrowFunction(node.parent) && !ts.isFunctionExpression(node.parent) && !ts.isCaseClause(node.parent)
+          && !ts.isDefaultClause(node.parent) && !inExpression(node.parent)) {
           bodies.add(`${node.getStart(sf)}-${node.getEnd()}`);
         }
+        if (ts.isForStatement(node) && !node.condition) loops.add(`${node.getStart(sf)}-${node.getEnd()}`);
         ts.forEachChild(node, walk);
       };
       walk(sf);
@@ -673,15 +760,20 @@ describe('the widening, against what Stryker makes', () => {
         const lineStart = sf.getPositionOfLineAndCharacter(n - 1, 0);
         const span = { start: lineStart + code.search(/\S/), end: lineStart + code.trimEnd().length };
         const throughBlock = (m: Made) => blocks.some(b => at(m.location.start) <= b.start && b.end <= at(m.location.end) && b.start < span.start && span.end < b.end);
-        const braceOnly = (m: Made) => m.mutatorName === 'BlockStatement' && m.location.start.line < m.location.end.line
-          && bodies.has(`${at(m.location.start)}-${at(m.location.end)}`);
-        const expected = whole.filter(m => m.location.start.line + 1 <= n && n <= m.location.end.line + 1 && !throughBlock(m) && !braceOnly(m));
+        const spanOf = (m: Made) => `${at(m.location.start)}-${at(m.location.end)}`;
+        const braceOnly = (m: Made) => m.mutatorName === 'BlockStatement' && m.location.start.line < m.location.end.line && bodies.has(spanOf(m));
+        const loopCondition = (m: Made) => m.mutatorName === 'ConditionalExpression' && loops.has(spanOf(m));
+        const touching = whole.filter(m => m.location.start.line + 1 <= n && n <= m.location.end.line + 1 && !throughBlock(m));
+        const expected = touching.filter(m => !braceOnly(m) && !loopCondition(m));
         const ranges = rangesOf(text, [n]) ?? [];
         const mutate = ranges.map(([s, e]) => ({ start: { line: s - 1, column: 0 }, end: { line: e - 1, column: Number.MAX_SAFE_INTEGER } }));
         const here = await made(text, mutate);
         const got = new Set(here.map(key));
         const missing = expected.filter(m => !got.has(key(m))).map(m => `${m.mutatorName} ${key(m)}`);
         expect(missing, `${name} line ${n}: ${code.trim()}`).toEqual([]);
+        // And what the README says is not made, is not.
+        const unmade = touching.filter(m => (braceOnly(m) || loopCondition(m)) && got.has(key(m))).map(m => `${m.mutatorName} ${key(m)}`);
+        expect(unmade, `${name} line ${n}: ${code.trim()}`).toEqual([]);
         checked += expected.length;
         // The file taken whole names the line exactly when the line changed alone would.
         expect(untouched(name, text, [n], spansOf(whole)), `${name} line ${n}: ${code.trim()}`).toEqual(untouched(name, text, [n], spansOf(here)));
@@ -689,6 +781,31 @@ describe('the widening, against what Stryker makes', () => {
       expect(checked).toBeGreaterThan(lines.length / 4);
     });
   }
+
+  it("gates only what the changed lines make by themselves: what a deletion's neighbour brings in is context", async () => {
+    const base = [
+      "import { Router } from 'express';",
+      'export const router = Router();',
+      "router.get('/x', async (req, res) => {",
+      '  const id = String(req.query.id);',
+      '  res.json({ ok: true, id });',
+      '});',
+    ];
+    // The handler's first line taken out and the next one edited: one hunk, two lines out and one in.
+    const text = [base[0], base[1], base[2], '  res.json({ ok: false });', base[5]].join('\n');
+    const change = lineDiff(base.join('\n'), text);
+    expect(change).toEqual({ changed: [4], deletedAfter: [3] });
+    const target = changeTarget('src/a.ts', text, change)!;
+    const here = await made(text, target.ranges!.map(([s, e]) => ({ start: { line: s - 1, column: 0 }, end: { line: e - 1, column: Number.MAX_SAFE_INTEGER } })));
+    const loc = (m: Made) => ({ start: { line: m.location.start.line + 1, column: m.location.start.column + 1 }, end: { line: m.location.end.line + 1, column: m.location.end.column + 1 } });
+    // The neighbour (the route's header) takes the whole route, so the handler's emptying is made, and is context.
+    const body = here.find(m => m.mutatorName === 'BlockStatement' && m.location.start.line + 1 === 3);
+    expect(body).toBeDefined();
+    expect(gates(target, loc(body!))).toBe(false);
+    const gating = here.filter(m => gates(target, loc(m)));
+    expect(gating.length).toBeGreaterThan(0);
+    expect(gating.every(m => m.location.start.line + 1 === 4 && m.location.end.line + 1 === 4)).toBe(true);
+  });
 
   it('names the lines of a file taken whole that only the emptying of their body covers', async () => {
     const text = [
@@ -866,8 +983,9 @@ describe('the targets', () => {
   });
 
   it('widens a pure deletion to its neighbours as context only, and says where it was', () => {
-    expect(changeTarget('src/a.ts', SAMPLE, { changed: [], deletedAfter: [3] })).toEqual({ file: 'src/a.ts', ranges: [[2, 4]], gating: [], patterns: ['src/a.ts:2-4'], deleted: [3] });
+    expect(changeTarget('src/a.ts', SAMPLE, { changed: [], deletedAfter: [3] })).toEqual({ file: 'src/a.ts', ranges: [[2, 4]], gating: [], patterns: ['src/a.ts:2-4'], deleted: [3], own: [] });
     expect(changeTarget('src/a.ts', SAMPLE, { changed: [7], deletedAfter: [] })).not.toHaveProperty('deleted');
+    expect(changeTarget('src/a.ts', SAMPLE, { changed: [7], deletedAfter: [] })).not.toHaveProperty('own');
   });
 
   it('gates the mutants that touch a changed line, and calls the rest context', () => {

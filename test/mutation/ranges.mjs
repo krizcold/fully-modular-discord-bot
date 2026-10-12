@@ -16,8 +16,9 @@ const { Minimatch, minimatch, escape } = strykerRequire('minimatch');
 /**
  * @typedef {[number, number]} Range first and last line, 1-based
  * @typedef {{ status: string, file: string, from?: string }} Entry a file git names as changed; from: a rename's old name
- * @typedef {{ file: string, ranges: Range[] | null, gating: number[] | null, patterns: string[], deleted?: number[] }} Target ranges null: the whole file;
- *   deleted: where lines were taken out with fewer or none put back, each after the line named (0: the top)
+ * @typedef {{ file: string, ranges: Range[] | null, gating: number[] | null, patterns: string[], deleted?: number[], own?: Range[] }} Target
+ *   ranges null: the whole file; deleted: where lines were taken out with fewer or none put back, each after the line
+ *   named (0: the top); own: the ranges the changed lines widen to by themselves, when a deletion's neighbours widen too
  * @typedef {{ start: { line: number, column: number }, end: { line: number, column: number } }} Location
  */
 
@@ -173,11 +174,12 @@ export function commonLines(a, b) {
  * which lines of `before` were taken out with fewer or none put back (0:
  * before the first line; a line replaced one for one is only changed). Lines
  * end at LF or CRLF, so line endings alone change nothing. The lines added in
- * one place, or only taken out, count also where they could slide to: their
- * first or last lines, or the whole run, pass through unchanged lines beside
- * them that repeat them (an `if` block added after an equal one counts in both
- * places). A line kept counts only where the diff marks it, even when a
- * change moves it into or out of a block (mutation/README.md).
+ * one place, or only taken out, count also over each unchanged line beside
+ * them that repeats one of them, and on through each further one that does (an
+ * `if` block added after an equal one counts in both places): every place
+ * their first or last lines, or the whole run, could slide to passes only such
+ * lines. A line kept counts only where the diff marks it, even when a change
+ * moves it into or out of a block (mutation/README.md).
  * @param {string} before
  * @param {string} after
  * @returns {{ changed: number[], deletedAfter: number[] }}
@@ -197,19 +199,17 @@ export function lineDiff(before, after) {
   for (const [i, j] of [...pairs, [a.length, b.length]]) {
     const [i0, i1, j0, j1] = [pi + 1, i, pj + 1, j];
     for (let k = j0; k < j1; k++) changed.add(k + 1);
-    // Each head of the lines added (its first k) slides up, and each tail (its
-    // last k) down, while the unchanged line it passes repeats it.
-    for (let k = 1; k <= j1 - j0; k++) {
-      for (let t = 1; i0 - t >= 0 && partner[i0 - t] === j0 - t && b[j0 - t] === b[j0 + k - t]; t++) changed.add(j0 - t + 1);
-      for (let t = 0; i1 + t < a.length && partner[i1 + t] === j1 + t && b[j1 + t] === b[j1 - k + t]; t++) changed.add(j1 + t + 1);
-    }
+    // The unchanged lines beside the lines added, up and down, while each
+    // repeats one of them.
+    const added = new Set(b.slice(j0, j1));
+    for (let t = 1; i0 - t >= 0 && partner[i0 - t] === j0 - t && added.has(b[j0 - t]); t++) changed.add(j0 - t + 1);
+    for (let t = 0; i1 + t < a.length && partner[i1 + t] === j1 + t && added.has(b[j1 + t]); t++) changed.add(j1 + t + 1);
     if (j1 === j0 && i1 > i0) {
-      // Taken out only: the same, for the place in `after` where it was.
+      // Taken out only: the same, for the places in `after` where it could have been.
       deletedAfter.add(j0);
-      for (let k = 1; k <= i1 - i0; k++) {
-        for (let t = 1; i0 - t >= 0 && partner[i0 - t] === j0 - t && a[i0 - t] === a[i0 + k - t]; t++) deletedAfter.add(j0 - t);
-        for (let t = 0; i1 + t < a.length && partner[i1 + t] === j0 + t && a[i1 + t] === a[i1 - k + t]; t++) deletedAfter.add(j0 + t + 1);
-      }
+      const taken = new Set(a.slice(i0, i1));
+      for (let t = 1; i0 - t >= 0 && partner[i0 - t] === j0 - t && taken.has(a[i0 - t]); t++) deletedAfter.add(j0 - t);
+      for (let t = 0; i1 + t < a.length && partner[i1 + t] === j0 + t && taken.has(a[i1 + t]); t++) deletedAfter.add(j0 + t + 1);
     } else if (i1 - i0 > j1 - j0) {
       // More taken out than put back (a line deleted beside an edited one, a block taken away and its body re-indented).
       deletedAfter.add(j0);
@@ -328,10 +328,6 @@ function unitsOf(sf, line) {
   const visit = node => {
     ts.forEachChild(node, child => {
       if (!overlaps(child)) return;
-      // A for with no condition: Stryker's mutant that gives it one (false) spans the whole loop.
-      if (ts.isForStatement(child) && !child.condition && !(ts.isBlock(child.statement) && holdsLine(child.statement))) {
-        units.push([lineOf(child.getStart(sf)), lineOf(child.getEnd())]);
-      }
       if (CONTAINERS.has(child.kind) || COMPOUND.has(child.kind)) { visit(child); return; }
       const inner = innermost(child);
       if (inner) visit(inner);
@@ -473,8 +469,10 @@ export const changedArgs = base => ['diff', '--name-status', '-z', '-M', '-l0', 
  * touches one of them must be killed; the others in the widened ranges are
  * context, run and listed but never gating. A place where lines were taken out
  * with fewer or none put back widens its two neighbouring lines as context, and
- * `deleted` names it, for what was taken out is left nowhere to mutate. Null
- * when the change leaves no line to mutate.
+ * `deleted` names it, for what was taken out is left nowhere to mutate. What
+ * only those neighbours bring in (the emptying of a body around the changed
+ * lines) stays context: a mutant gates only inside `own`, the ranges the changed
+ * lines widen to by themselves. Null when the change leaves no line to mutate.
  * @param {string} file the name to mutate it under
  * @param {string} text
  * @param {{ changed: number[], deletedAfter: number[] }} change
@@ -488,7 +486,7 @@ export function changeTarget(file, text, { changed, deletedAfter }) {
   const ranges = widen(file, text, lines);
   return {
     file, ranges, gating: [...new Set(changed)].sort((a, b) => a - b), patterns: ranges.map(([start, end]) => `${file}:${start}-${end}`),
-    ...(deletedAfter.length > 0 ? { deleted: deletedAfter } : {}),
+    ...(deletedAfter.length > 0 ? { deleted: deletedAfter, own: widen(file, text, changed) } : {}),
   };
 }
 
@@ -509,8 +507,9 @@ export const wholeTarget = file => ({ file, ranges: null, gating: null, patterns
  * A file that holds a line break Stryker counts and the diff does not is named
  * and not mutated (EXTRA_BREAK_WHY), and so is a file on the way to '/data'
  * (DATA_ROUTE_WHY), a git submodule (`isDir`: git
- * names only its commit) and a file whose name Stryker would read as a glob
- * (`nameOf` gives null). `nameOf` gives the name a file is mutated under (its
+ * names only its commit), a file whose name Stryker would read as a glob
+ * (`nameOf` gives null) and one whose name on disk, through a link, is not
+ * mutated (a link in src to the suite's env scrub). `nameOf` gives the name a file is mutated under (its
  * name on disk, keys.mjs). emptyScope: nothing in src changed.
  * @param {{ entries: Entry[], untracked: string[], read: (file: string) => string, readBase: (file: string) => string,
  *   nameOf: (file: string) => string | null, isDir?: (file: string) => boolean }} change
@@ -532,6 +531,7 @@ export function planChange({ entries, untracked, read, readBase, nameOf, isDir =
     }
     const name = nameOf(entry.file);
     if (name === null) { skipped.push({ file: entry.file, why: GLOB_NAME_WHY }); continue; }
+    if (notMutated(name)) { skipped.push({ file: entry.file, why: linkWhy(name) }); continue; }
     const text = read(entry.file);
     if (holdsExtraBreak(text)) { skipped.push({ file: entry.file, why: EXTRA_BREAK_WHY }); continue; }
     if (holdsDataRoute(entry.file, text)) { skipped.push({ file: entry.file, why: DATA_ROUTE_WHY }); continue; }
@@ -550,6 +550,7 @@ export function planChange({ entries, untracked, read, readBase, nameOf, isDir =
     const name = why ? null : nameOf(file);
     if (why) skipped.push({ file, why });
     else if (name === null) skipped.push({ file, why: GLOB_NAME_WHY });
+    else if (notMutated(name)) skipped.push({ file, why: linkWhy(name) });
     else if (holdsExtraBreak(read(file))) skipped.push({ file, why: EXTRA_BREAK_WHY });
     else if (holdsDataRoute(file, read(file))) skipped.push({ file, why: DATA_ROUTE_WHY });
     else targets.push(wholeTarget(name));
@@ -560,6 +561,13 @@ export function planChange({ entries, untracked, read, readBase, nameOf, isDir =
 }
 
 export const GLOB_NAME_WHY = 'its name holds characters Stryker reads as a glob, so it cannot be given to Stryker; rename it';
+
+/**
+ * Why a file in src is not mutated when its name leads, through a link, to a
+ * file that is not (the suite's own env scrub, say).
+ * @param {string} name the name on disk
+ */
+const linkWhy = name => `a link to ${name}, which is not mutated: ${notMutated(name)}`;
 
 /**
  * planChange on what git says changed from base to the working tree of the bot
@@ -687,10 +695,14 @@ export const unmatchedPatterns = (targets, mutants) => targets
   .flatMap(target => target.patterns.filter(pattern => !mutants.some(m => m.file === target.file && inPattern(pattern, m.location))));
 
 /**
- * Whether a mutant (1-based lines, as Stryker reports them) touches a gating line.
- * @param {{ gating: number[] | null }} target
+ * Whether a mutant (1-based lines, as Stryker reports them) touches a gating
+ * line and, for a target that holds `own`, lies inside one of those ranges.
+ * @param {{ gating: number[] | null, own?: Range[] }} target
  * @param {Location} location
  */
 export function gates(target, location) {
-  return target.gating === null || target.gating.some(n => location.start.line <= n && n <= location.end.line);
+  if (target.gating === null) return true;
+  const own = target.own;
+  return target.gating.some(n => location.start.line <= n && n <= location.end.line)
+    && (!own || own.some(([start, end]) => start <= location.start.line && location.end.line <= end));
 }

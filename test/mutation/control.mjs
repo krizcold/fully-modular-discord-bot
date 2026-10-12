@@ -1,9 +1,10 @@
 // The run with no mutant after the reruns alone (mutation/README.md): the
 // reruns' tests once more, in the checkout itself, the way the reruns ran them.
 // What the reruns counted holds only if this passes.
-import { spawn, spawnSync } from 'child_process';
+import { spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
+import { endTree } from '../helpers/endTree.mjs';
 
 /** @type {NodeJS.Signals[]} */
 const SIGNALS = ['SIGINT', 'SIGTERM', 'SIGHUP'];
@@ -16,8 +17,9 @@ const SIGNALS = ['SIGINT', 'SIGTERM', 'SIGHUP'];
 export function runControl({ root, out, tier, files, only, env = process.env, timeoutMs = 60 * 60_000 }) {
   const { __STRYKER_ACTIVE_MUTANT__: _active, ...rest } = env;
   return new Promise(resolve => {
-    // On POSIX the run gets its own process group, so the bound ends vitest and
-    // every process it started with it, as Stryker ends a mutant's run.
+    // On POSIX the run gets its own process group, so the bound ends vitest, the
+    // processes that descend from it and whatever is left in its group
+    // (helpers/endTree.mjs).
     const child = spawn(process.execPath, [path.join(root, 'test', 'mutation', 'runner.mjs')], {
       cwd: root,
       stdio: 'ignore',
@@ -46,7 +48,7 @@ export function runControl({ root, out, tier, files, only, env = process.env, ti
     child.on('error', error => { settle(); resolve({ passed: false, why: error.message }); });
     child.on('exit', (code, signal) => {
       settle();
-      if (timedOut) resolve({ passed: false, why: `it ran past its bound of ${Math.round(timeoutMs / 1000)} s, and was ended with every process it started` });
+      if (timedOut) resolve({ passed: false, why: `it ran past its bound of ${Math.round(timeoutMs / 1000)} s, and was ended with the processes it started` });
       else resolve(code === 0 ? { passed: true, why: '' } : { passed: false, why: `exit ${code ?? signal}` });
     });
   });
@@ -73,13 +75,9 @@ export function pastBudget(reruns, out, { timeoutFactor, timeoutMS }) {
 }
 
 /**
- * Ends a process and every process it started.
+ * Ends the run and the processes it started (helpers/endTree.mjs), its group on POSIX too.
  * @param {number | undefined} pid
  */
 function killTree(pid) {
-  if (pid === undefined) return;
-  if (process.platform === 'win32') spawnSync('taskkill', ['/pid', String(pid), '/T', '/F'], { stdio: 'ignore' });
-  else {
-    try { process.kill(-pid, 'SIGKILL'); } catch { /* already gone */ }
-  }
+  if (pid !== undefined) endTree(pid, true);
 }

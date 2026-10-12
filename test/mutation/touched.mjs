@@ -20,7 +20,7 @@ import { COMMON, PASSES } from './passes.mjs';
  * @typedef {import('./verdict.mjs').MutantRecord} MutantRecord
  * @typedef {import('./verdict.mjs').PassName} PassName
  * @typedef {import('./verdict.mjs').PassResult} PassResult
- * @typedef {{ file: string, patterns: string[], gating: number[] | null, deleted?: number[] }} PassTarget
+ * @typedef {{ file: string, patterns: string[], gating: number[] | null, deleted?: number[], own?: [number, number][] }} PassTarget
  * @typedef {{ id: string, fileName: string, location: Location, mutatorName: string, replacement?: string, status: string, statusReason?: string }} StrykerResult
  * @typedef {import('@stryker-mutator/api/core').PartialStrykerOptions} Options
  */
@@ -340,8 +340,10 @@ async function passOn(name, dir, tier, on, extra, only) {
 }
 
 /**
- * The verdict, the report files and the exit.
+ * The verdict, the report files and the exit, once the report has reached
+ * stdout: awaited, it never settles, so nothing runs after it.
  * @param {string[]} [stopped]
+ * @returns {Promise<never>}
  */
 function finish(stopped) {
   try {
@@ -350,6 +352,7 @@ function finish(stopped) {
     console.log(`Verdict: NO RESULT (the report could not be written: ${firstLine(error)})`);
     process.exit(2);
   }
+  return new Promise(() => {});
 }
 
 /**
@@ -367,7 +370,14 @@ function report(stopped, treeChanged) {
   for (const target of targets) {
     const made = mutants.filter(m => m.file === target.file);
     if (stopped && mutants.length === 0) continue;
-    const text = linesOf(target.file).join('\n');
+    let text;
+    try {
+      text = linesOf(target.file).join('\n');
+    } catch (error) {
+      // Deleted during the run: the tree check names it.
+      if (treeChanged.length > 0) continue;
+      throw error;
+    }
     const moved = target.gating ? structureLines(target.file, text, target.gating) : [];
     if (moved.length > 0) brackets.push({ file: target.file, lines: moved });
     if (target.deleted) deleted.push({ file: target.file, lines: target.deleted });
@@ -381,8 +391,8 @@ function report(stopped, treeChanged) {
   fs.mkdirSync(reportDir, { recursive: true });
   fs.writeFileSync(path.join(reportDir, 'mutants.json'), `${JSON.stringify({ scope, seed, skipped, targets, mutants, controls, verdict: result.verdict, stopped, treeChanged }, null, 2)}\n`);
   fs.writeFileSync(path.join(reportDir, 'summary.txt'), `${result.lines.join('\n')}\n`);
-  console.log(result.lines.join('\n'));
-  process.exit(result.code);
+  // On POSIX a pipe takes stdout asynchronously: exit only once it has all of it.
+  process.stdout.write(`${result.lines.join('\n')}\n`, () => process.exit(result.code));
 }
 
 try {
@@ -395,7 +405,7 @@ try {
     ({ targets, skipped, emptyScope } = planFromGit({ git, base, root, read: file => linesOf(file).join('\n') }));
     scope = `the change from ${opts.base} (merge-base ${base.slice(0, 7)}) to the working tree`;
   }
-  if (targets.length === 0) finish();
+  if (targets.length === 0) await finish();
 
 
   const files = [...new Set(targets.map(target => target.file))];
@@ -438,7 +448,7 @@ try {
     }
     if (confirmB.some(credited)) await control('b2', 'b', confirmB, [...killers.keys()]);
   }
-  finish();
+  await finish();
 } catch (error) {
-  finish(error instanceof PassError ? error.message.split('\n') : [`the gate stopped: ${firstLine(error)}`]);
+  await finish(error instanceof PassError ? error.message.split('\n') : [`the gate stopped: ${firstLine(error)}`]);
 }
