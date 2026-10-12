@@ -185,8 +185,8 @@ describe('the verdict', () => {
     const text = none.lines.join('\n');
     expect(text).toContain('  src/webui/public/app.jsx: a browser view');
     expect(text).toContain('  src/missing.ts:1-2');
-    expect(text).toMatch(/^Changed lines of code no mutant lies wholly on \(.*the code lines of a multi-line object, array, arrow body, call or condition with no mutant of their own; a line of brackets and separators only is listed apart\):\n {2}src\/a\.ts: 4, 9$/m);
-    expect(text).toMatch(/^Changed lines of brackets and separators only \(each can move the unchanged lines beside it into or out of a block, and those lines are not gated; check them\):\n {2}src\/a\.ts: 5$/m);
+    expect(text).toMatch(/^Changed lines of code no mutant lies wholly on \(.*the code lines of a multi-line object, array, arrow body, call or condition with no mutant of their own; a changed line of brackets and separators only, in a diff, is listed apart\):\n {2}src\/a\.ts: 4, 9$/m);
+    expect(text).toMatch(/^Changed lines that can move the unchanged lines beside them into or out of a block \(brackets and separators only, or an else, case, default, catch or finally; the lines they move are not gated, so check them\):\n {2}src\/a\.ts: 5$/m);
   });
 
   it('has no result when a test replaced vitest, whatever the mutants did', () => {

@@ -10,7 +10,7 @@ import { describe, expect, it, onTestFinished } from 'vitest';
 import { canonicalName } from '../mutation/keys.mjs';
 import {
   changeTarget, codeLines, commonLines, gates, inPattern, lineDiff, linesOfTarget, mergeRanges, notMutated, parseNameStatus, planChange, planFromGit,
-  unmatchedPatterns, untouched, wholeTarget, bracketLines, DATA_ROUTE_WHY, GLOB_NAME_WHY, holdsDataRoute, sandboxIgnores,
+  unmatchedPatterns, untouched, wholeTarget, structureLines, DATA_ROUTE_WHY, GLOB_NAME_WHY, holdsDataRoute, sandboxIgnores,
 } from '../mutation/ranges.mjs';
 import { treeChanges, treePrint } from '../mutation/tree.mjs';
 
@@ -92,6 +92,13 @@ const SHAPES: Record<string, string> = {
     'export const total = [1, 2, 3].reduce((sum, n) => {',
     '  return sum + n;',
     '}, 0);',
+  ].join('\n'),
+  forNoCondition: [
+    'export function retry(work: () => boolean): number {',
+    '  for (let attempt = 0; ; attempt++) {',
+    '    if (work()) return attempt;',
+    '  }',
+    '}',
   ].join('\n'),
   tryCatch: [
     'export async function load(read: () => Promise<string>): Promise<string | null> {',
@@ -304,10 +311,13 @@ describe('the change', () => {
     const moved = [into[0], into[1], into[2], into[4], into[3], into[5], into[6]].join('\n');
     const { changed } = lineDiff(into.join('\n'), moved);
     expect(changed).toEqual([5]);
-    expect(bracketLines('src/a.ts', moved, changed)).toEqual([5]);
+    expect(structureLines('src/a.ts', moved, changed)).toEqual([5]);
     const lines = ['export function k(on: (f: () => void, g: () => void) => void, log: string[]) {', '  on(() => {', "    log.push('a');", '  }, () => {', '  });', '  if (log.length > 0) {', '  } else {', '  }', '  log.push(String(1),', '  );', '}'];
-    // Brackets and separators only: not an else, a callback's start or a line with a call.
-    expect(bracketLines('src/a.ts', lines.join('\n'), lines.map((_, i) => i + 1))).toEqual([5, 8, 10, 11]);
+    // Brackets and separators only, or an else: not a callback's start or a line with a call.
+    expect(structureLines('src/a.ts', lines.join('\n'), lines.map((_, i) => i + 1))).toEqual([5, 7, 8, 10, 11]);
+    // A line that opens the next part of a statement, mutants of its own or not.
+    const parts = ['export function p(n: string, b: boolean, log: string[]) {', '  if (b) {', '  } else if (n) {', '  }', '  switch (n) {', "    case 'two':", '    default:', '  }', '  try {', '  } catch {', '  } finally {', '  }', '}'];
+    expect(structureLines('src/a.ts', parts.join('\n'), parts.map((_, i) => i + 1))).toEqual([3, 4, 6, 7, 8, 10, 11, 12, 13]);
   });
 
   it('names a submodule, and a file whose name Stryker would read as a glob, with the reason', () => {
@@ -443,10 +453,12 @@ describe('the change', () => {
       write(`src/${name}/.env`, 'TOKEN=y\n');
       git(['-C', path.join(repo, 'src', name), 'init', '-q']);
     }
+    // A backslash in a name, which only POSIX allows: no escape keeps it, so the path is named.
+    if (process.platform !== 'win32') write('backup\\2/.env', 'TOKEN=w\n');
     const { patterns, unkept } = sandboxIgnores((...args: string[]) => git(args), repo);
-    // Each pattern as Stryker's matcher reads it: a bracket escaped; a brace cannot be, so that path is named.
-    expect(patterns.sort()).toEqual(['/.env', '/backup[[]1[]]/', '/dist/', '/src/mod/', '/src/sub/.env']);
-    expect(unkept).toEqual(['src/m{1,2}/']);
+    // Each pattern as Stryker's matcher reads it: brackets and braces escaped.
+    expect(patterns.sort()).toEqual(['/.env', '/backup\\[1\\]/', '/dist/', '/src/m\\{1,2\\}/', '/src/mod/', '/src/sub/.env']);
+    expect(unkept).toEqual(process.platform !== 'win32' ? ['backup\\2/'] : []);
   });
 
   it('fingerprints the tree a run reads, and names what changed in it', () => {

@@ -35,7 +35,9 @@ From the bot root, with Node 22.12 or newer (or SMDB_TEST_NODE set, as for `npm 
   branch). A file new to src is taken whole: an untracked one, one added, and one moved in from outside src (or from a
   browser view, or from a name that is not code). A file renamed within src gates its changed lines only.
 - `--mutate src/x.ts:10-20` (a file in the bot root that exists and that a diff would mutate, or such a file and lines,
-  repeatable; never a glob, never columns, never the suite's own files) skips git; every mutant it makes gates. The file is taken under the name it has on disk, from the bot root with
+  repeatable; never a glob, never columns, never the suite's own files) skips git's diff (git still lists the tree and
+  what a sandbox leaves out); every mutant it makes gates. A git-ignored file, or one inside a submodule, is taken, but
+  no sandbox holds it, so such a run ends NO RESULT. The file is taken under the name it has on disk, from the bot root with
   forward slashes (its case, and its path once links are resolved), however it was spelled: `./`, `..`, and on Windows
   backslashes or another case. A file in a diff is matched by that name too, for Stryker matches the names on disk.
 - `--concurrency N` sets pass A's parallel runs (default: half the cores); pass B uses half of that.
@@ -62,7 +64,8 @@ runs it under a hostile config). git runs with no file-system monitor, so it loo
   never to the body. Any other line holding the start or end of a callback (a route's `router.get('/x', async (req,
   res) => {`, a `});`, a property whose value is an arrow with a body, a plain line of an object that holds a method)
   takes its whole statement: the callback's body runs as context, and the emptying of that body, which touches the
-  line, gates.
+  line, gates. A `for` with no condition is taken whole from its header: Stryker's mutant that gives it a false one
+  spans the loop.
 - **Gating** mutants touch a changed line. Some that touch one are not made: one that touches it only through a block
   holding the line (the emptying of that block, or the whole callback around it), and the emptying of a block that
   only begins or ends on a changed compound header; a block wholly made of changed lines is made.
@@ -76,10 +79,12 @@ runs it under a hostile config). git runs with no file-system monitor, so it loo
   counts is still the diff's choice.
 - Only the lines the diff changed count. A change can also move an unchanged line into or out of a block (a bracket,
   an `else`, a `finally` or a `case` moved past it, a header put around it, an if's two bodies swapped): that line is
-  not gated, so its mutants run as context at most. The changed lines that move it are named when no mutant lies
-  wholly on them (an `else` line, a `case` label, and a line of brackets only, under its own heading), so a reviewer
-  sees each such move and checks the lines beside it; a header that has mutants of its own gates as usual. A block
-  taken away (its header and bracket deleted) is a pure deletion, which nothing names.
+  not gated, so its mutants run as context at most. The changed lines that make such a move are named under their own
+  heading, mutants of their own or not: a line of brackets and separators only, and one holding an `else`, `case`,
+  `default`, `catch` or `finally`, so a reviewer checks the lines beside each. Not named: a header with code of its
+  own put around lines (an `if (x) {`, which gates its own mutants), a line moved into or out of a braceless body, and
+  a block taken away (its header and bracket deleted), which is a pure deletion; a reviewer reads each changed header
+  for these.
 - git does not look at a file its index marks assume-unchanged or skip-worktree (core.ignoreStat marks every file it
   adds), so the gate compares each such file with its base text itself, and names one marked assume-unchanged that is
   gone as deleted; one marked skip-worktree that is gone is taken as left out by a sparse checkout.
@@ -112,9 +117,10 @@ runs it under a hostile config). git runs with no file-system monitor, so it loo
 
 1. **Pass A, in-process.** Stryker instruments the ranges in a sandbox copy of the repo: the tracked files and the
    untracked ones git does not ignore (git's ignored files, `.env` and the data dirs among them, stay out, and so do an
-   untracked git repository, whose own `.env` git never lists, and what a submodule's own git ignores; a name among
-   them that Stryker would read as a glob even when escaped, one holding a brace, stops the gate with NO RESULT, since
-   it could not be kept out). Stryker also walks every dir of the checkout, ignored ones too, for node_modules to link:
+   untracked git repository, whose own `.env` git never lists, and what a submodule's own git ignores; the list is made
+   again before every pass, so a `.env` or data dir made meanwhile stays out too; a name among them that Stryker would
+   read as a glob even when escaped, one holding a backslash, which only POSIX allows, stops the gate with NO RESULT,
+   since it could not be kept out). Stryker also walks every dir of the checkout, ignored ones too, for node_modules to link:
    a dir the user cannot read (a data dir a container made as root) stops the pass. The TypeScript checker turns type-invalid mutants
    into CompileError. Each mutant run is `vitest related <mutated files>` on the fast tier with one worker, so only
    tests that import them run. There is no coverage analysis: every mutant runs those tests. The files go on vitest's

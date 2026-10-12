@@ -53,7 +53,7 @@ try {
   console.error(`Verdict: NO RESULT (the gate could not load: ${error instanceof Error ? error.message.split('\n')[0] : String(error)}; run npm run test:install)`);
   process.exit(2);
 }
-const { bracketLines, DATA_ROUTE_WHY, EXTRA_BREAK_WHY, gates, holdsDataRoute, holdsExtraBreak, linesOfTarget, notMutated, planFromGit, sandboxIgnores, unmatchedPatterns, untouched } = ranges;
+const { structureLines, DATA_ROUTE_WHY, EXTRA_BREAK_WHY, gates, holdsDataRoute, holdsExtraBreak, linesOfTarget, notMutated, planFromGit, sandboxIgnores, unmatchedPatterns, untouched } = ranges;
 const { byKiller, classifyKill, judge, outcome, toConfirm, toPassB } = verdicts;
 
 const USAGE = 'usage: node test/mutation/touched.mjs [--base REF] [--mutate PATTERN]... [--concurrency N] [--keep]';
@@ -87,6 +87,10 @@ const treeFiles = () => git('ls-files', '-z', '--cached', '--others', '--exclude
 /** @type {Map<string, string>} */
 let planned;
 try {
+  // The sandboxes' dir ignores itself, so git status stays clean, from the
+  // first print on: a sandbox another Stryker run left there is no change.
+  fs.mkdirSync(path.join(root, '.stryker-tmp'), { recursive: true });
+  fs.writeFileSync(path.join(root, '.stryker-tmp', '.gitignore'), '*\n');
   planned = treePrint(root, treeFiles());
 } catch (error) {
   console.log(`Verdict: NO RESULT (the gate could not read the tree: ${error instanceof Error ? error.message.split('\n')[0] : String(error)})`);
@@ -238,9 +242,15 @@ async function pass({ name, dir, tier, mutate, files, only = [], keys, extra }) 
   process.env.SMDB_MUTATION_TARGETS = keys ? path.join(out, 'targets.json') : '';
   process.env.SMDB_MUTATION_RUN = keys ? path.join(out, 'run-ids.json') : '';
   if (keys) fs.writeFileSync(path.join(out, 'targets.json'), JSON.stringify(keys));
+  // What the sandbox leaves out, as the checkout is now: a .env or a data dir
+  // made since the last pass stays out too (ranges.mjs sandboxIgnores).
+  const sandbox = sandboxIgnores(git, root);
+  if (sandbox.unkept.length > 0) {
+    throw new PassError(`the gate cannot keep ${sandbox.unkept.join(', ')} out of a sandbox, for Stryker would read the name as a glob; rename or remove it`);
+  }
   const { Stryker } = await import('@stryker-mutator/core');
   try {
-    return await new Stryker({ ...common, mutate, ...extra }).runMutationTest();
+    return await new Stryker({ ...common, ignorePatterns: sandbox.patterns, mutate, ...extra }).runMutationTest();
   } catch (error) {
     const lines = [`pass ${dir} could not run: ${error instanceof Error ? error.message.split('\n')[0] : String(error)}`, ...dryFailures(dir), ...refusalIn(out)];
     if (fs.readdirSync(out).some(f => f.startsWith('dry-') && f.endsWith('.log'))) lines.push(`the run with no mutant logged to ${posix(path.relative(root, out))}/dry-*.log`);
@@ -344,7 +354,7 @@ function report(stopped) {
     const made = mutants.filter(m => m.file === target.file);
     if (stopped && mutants.length === 0) continue;
     const text = linesOf(target.file).join('\n');
-    const moved = target.gating ? bracketLines(target.file, text, target.gating) : [];
+    const moved = target.gating ? structureLines(target.file, text, target.gating) : [];
     if (moved.length > 0) brackets.push({ file: target.file, lines: moved });
     /** @type {[number, number][]} */
     const spans = made.map(m => [m.location.start.line, m.location.end.line]);
@@ -372,16 +382,6 @@ try {
   }
   if (targets.length === 0) finish();
 
-  // The sandbox holds the tracked files and the untracked ones git does not
-  // ignore (ranges.mjs sandboxIgnores). The temp dir ignores itself, so git
-  // status stays clean.
-  const sandbox = sandboxIgnores(git, root);
-  if (sandbox.unkept.length > 0) {
-    throw new PassError(`the gate cannot keep ${sandbox.unkept.join(', ')} out of a sandbox, for Stryker would read the name as a glob; rename or remove it`);
-  }
-  common.ignorePatterns = sandbox.patterns;
-  fs.mkdirSync(path.join(root, '.stryker-tmp'), { recursive: true });
-  fs.writeFileSync(path.join(root, '.stryker-tmp', '.gitignore'), '*\n');
 
   const files = [...new Set(targets.map(target => target.file))];
   console.log(`L5: mutating ${scope}: ${files.length} file(s), pass A (in-process tests that import them)`);

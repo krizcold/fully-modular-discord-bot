@@ -93,6 +93,10 @@ describe('the touched-line mutation gate', () => {
   function standInRun(code: string, pattern?: string) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-control-'));
     const fake = path.join(dir, 'vitest.cjs');
+    // Git-ignored files in the checkout (*.log), which no sandbox may hold: one
+    // there from the start, one made during pass A, before pass A2 copies it.
+    const canaries = [`smdb-canary-${process.pid}.log`, `smdb-canary-late-${process.pid}.log`];
+    fs.writeFileSync(path.join(root, canaries[0]), 'ignored');
     fs.writeFileSync(fake, [
       "const fs = require('fs');",
       "const path = require('path');",
@@ -100,6 +104,8 @@ describe('the touched-line mutation gate', () => {
       'const pass = path.basename(path.dirname(file));',
       'const mutant = process.env.__STRYKER_ACTIVE_MUTANT__;',
       "let message = mutant ? 'Error: Test timed out in 30000ms' : '';",
+      `if (pass === 'a' && mutant) fs.writeFileSync(${JSON.stringify(path.join(root, canaries[1]))}, 'ignored');`,
+      `if (!pass.startsWith('control-') && ${JSON.stringify(canaries)}.some(name => fs.existsSync(path.join('..', name)))) message = 'Error: the sandbox holds a git-ignored file';`,
       code,
       "const test = { status: message ? 'failed' : 'passed', fullName: 'reads', failureMessages: message ? [message] : [] };",
       "fs.writeFileSync(file, JSON.stringify({ testResults: [{ name: 'unit/x.test.ts', status: test.status, assertionResults: [test] }] }));",
@@ -111,6 +117,8 @@ describe('the touched-line mutation gate', () => {
     const run = spawnSync(process.execPath, [path.join(root, 'test', 'mutation', 'touched.mjs'), '--mutate', pattern ?? `${TARGET}:${line}-${line}`, '--concurrency', '1'],
       { cwd: root, encoding: 'utf8', timeout: 580_000, env: { ...process.env, SMDB_MUTATION_VITEST: fake, __STRYKER_ACTIVE_MUTANT__: '3' } });
     fs.rmSync(dir, { recursive: true, force: true });
+    for (const name of canaries) fs.rmSync(path.join(root, name), { force: true });
+    expect(run.stdout).not.toContain('the sandbox holds a git-ignored file');
     const reportDir = /^Report: (\S+)/m.exec(run.stdout)?.[1];
     expect(reportDir, `${run.stdout}\n${run.stderr}`).toBeDefined();
     const { mutants } = JSON.parse(fs.readFileSync(path.join(root, reportDir!, 'mutants.json'), 'utf8')) as { mutants: (Mutant & { passes: { a2?: Pass & { voided?: string } } })[] };
@@ -148,13 +156,25 @@ describe('the touched-line mutation gate', () => {
   it('counts no timeout its reruns confirmed when the run with no mutant after them passes past their budget', { timeout: 600_000 }, () => {
     // The reruns' own run with no mutant is made to read 14 s shorter than
     // nothing (runner.mjs times it in a2/dry-ms.txt), so their budget is
-    // 4 x -14 s + 60 s = 4 s, and the run after them passes in 5 s.
-    const { run, mutants } = standInRun([
-      "if (pass === 'control-a2') {",
-      "  fs.writeFileSync(path.join(path.dirname(path.dirname(file)), 'a2', 'dry-ms.txt'), '-14000');",
-      '  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5000);',
-      '}',
-    ].join('\n'));
+    // 4 x -14 s + 60 s = 4 s, and the run after them passes in 5 s. A sandbox
+    // another Stryker run left behind, with no .gitignore, is no change.
+    const leftover = path.join(root, '.stryker-tmp', `smdb-leftover-${process.pid}`);
+    fs.rmSync(path.join(root, '.stryker-tmp', '.gitignore'), { force: true });
+    fs.mkdirSync(leftover, { recursive: true });
+    fs.writeFileSync(path.join(leftover, 'a.ts'), 'export const a = 1;\n');
+    const { run, mutants } = (() => {
+      try {
+        return standInRun([
+          "if (pass === 'control-a2') {",
+          "  fs.writeFileSync(path.join(path.dirname(path.dirname(file)), 'a2', 'dry-ms.txt'), '-14000');",
+          '  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5000);',
+          '}',
+        ].join('\n'));
+      } finally {
+        fs.rmSync(leftover, { recursive: true, force: true });
+      }
+    })();
+    expect(run.stdout).not.toContain('the tree changed');
     const reran = mutants.filter(m => m.passes.a2);
     expect(reran.length).toBeGreaterThan(0);
     for (const m of reran) expect(m.passes.a2).toMatchObject({ voided: 'the run with no mutant after pass a2 failed' });

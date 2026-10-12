@@ -323,6 +323,10 @@ function unitsOf(sf, line) {
   const visit = node => {
     ts.forEachChild(node, child => {
       if (!overlaps(child)) return;
+      // A for with no condition: Stryker's mutant that gives it one (false) spans the whole loop.
+      if (ts.isForStatement(child) && !child.condition && !(ts.isBlock(child.statement) && holdsLine(child.statement))) {
+        units.push([lineOf(child.getStart(sf)), lineOf(child.getEnd())]);
+      }
       if (CONTAINERS.has(child.kind) || COMPOUND.has(child.kind)) { visit(child); return; }
       const inner = innermost(child);
       if (inner) visit(inner);
@@ -383,15 +387,20 @@ export function codeLines(file, text, lines) {
   return lines.filter(line => withCode.has(line));
 }
 
+// Keywords that open the next part of a statement: a changed line holding one
+// can move the lines beside it from one part to another.
+const PARTS = new Set([ts.SyntaxKind.ElseKeyword, ts.SyntaxKind.CaseKeyword, ts.SyntaxKind.DefaultKeyword, ts.SyntaxKind.CatchKeyword, ts.SyntaxKind.FinallyKeyword]);
+
 /**
- * The lines among `lines` that hold brackets and separators and nothing else.
- * Such a line, changed, can move the unchanged lines beside it into or out of a
- * block, which the gate does not gate (mutation/README.md), so the report names it.
+ * The lines among `lines` that hold brackets and separators and nothing else,
+ * or an else, case, default, catch or finally. Such a line, changed, can move
+ * the unchanged lines beside it into or out of a block, which the gate does not
+ * gate (mutation/README.md), so the report names it, mutants of its own or not.
  * @param {string} file
  * @param {string} text
  * @param {number[]} lines
  */
-export function bracketLines(file, text, lines) {
+export function structureLines(file, text, lines) {
   const sf = parse(file, text);
   /** @param {number} pos */
   const lineOf = pos => sf.getLineAndCharacterOfPosition(pos).line + 1;
@@ -399,17 +408,20 @@ export function bracketLines(file, text, lines) {
   const code = new Set();
   /** @type {Set<number>} */
   const brackets = new Set();
+  /** @type {Set<number>} */
+  const parts = new Set();
   /** @param {ts.Node} node */
   const walk = node => {
     if (node.kind >= ts.SyntaxKind.FirstJSDocNode && node.kind <= ts.SyntaxKind.LastJSDocNode) return;
     const children = node.getChildren(sf);
     if (children.length > 0) { children.forEach(walk); return; }
     if (node.kind === ts.SyntaxKind.EndOfFileToken || node.getStart(sf) === node.getEnd()) return;
+    if (PARTS.has(node.kind)) parts.add(lineOf(node.getStart(sf)));
     const into = STRUCTURE.has(node.kind) ? brackets : code;
     for (let n = lineOf(node.getStart(sf)); n <= lineOf(node.getEnd() - 1); n++) into.add(n);
   };
   walk(sf);
-  return lines.filter(line => brackets.has(line) && !code.has(line));
+  return lines.filter(line => parts.has(line) || (brackets.has(line) && !code.has(line)));
 }
 
 /**
@@ -577,7 +589,7 @@ export function planFromGit({ git: run, base, root, read = file => fs.readFileSy
  * repos; node_modules aside, which Stryker links), every untracked git
  * repository, whose own ignored files (its .env) git never lists, and what each
  * git submodule's own git ignores. Each path is escaped as Stryker's matcher
- * reads a pattern; one whose pattern still does not match it (a brace in its
+ * reads a pattern; one whose pattern still does not match it (a backslash in its
  * name) is `unkept`, and the gate stops rather than copy it.
  * @param {(...args: string[]) => string} git runs git in the bot root
  * @param {string} root the bot root
@@ -604,7 +616,7 @@ export function sandboxIgnores(git, root) {
   /** @type {string[]} */
   const unkept = [];
   for (const p of new Set(paths)) {
-    const pattern = `/${escape(p, { windowsPathsNoEscape: true })}`;
+    const pattern = `/${escape(p, { magicalBraces: true })}`;
     if (new Minimatch(pattern, options).match(`/${p}`)) patterns.push(pattern);
     else unkept.push(p);
   }
