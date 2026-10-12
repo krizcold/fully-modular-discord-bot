@@ -151,7 +151,7 @@ describe('the verdict', () => {
       mutant(6, true, { a: pass('Timeout'), a2: pass('Killed', { timeout: 'unit/x.test.ts > slow' }) }),
     ], { controls: ['after pass b2: passed'] });
     expect(result).toMatchObject({ verdict: 'PASS', code: 0 });
-    expect(result.lines.join('\n')).toMatch(/^Timeouts \(each timed out again when run alone with four times the time: a test, a hook, or the whole run past its budget; .*\n {2}src\/a\.ts:2:3 /m);
+    expect(result.lines.join('\n')).toMatch(/^Timeouts \(each timed out again when run alone with four times the time: a test or its beforeEach or afterEach hook, or the whole run past its budget; .*\n {2}src\/a\.ts:2:3 /m);
     // A rerun past Stryker's budget may only have slowed the tests: it is not said to have hung.
     expect(result.lines.join('\n')).toMatch(/^ {2}src\/a\.ts:2:3 .*\(ran past Stryker's budget alone too\)$/m);
     expect(result.lines.join('\n')).toMatch(/^ {2}src\/a\.ts:6:3 .*\(timed out alone too: unit\/x\.test\.ts > slow\)$/m);
@@ -188,8 +188,8 @@ describe('the verdict', () => {
     expect(text).toContain('  src/missing.ts:1-2');
     expect(text).toMatch(/^Changed lines of code no mutant lies wholly on \(.*the code lines of a multi-line object, array, arrow body, call or condition with no mutant of their own; a changed line of brackets and separators only, in a diff, is listed apart\):\n {2}src\/a\.ts: 4, 9$/m);
     expect(text).toMatch(/^Changed lines that can move the unchanged lines beside them into or out of a block \(brackets and separators only, a brace of a block, or an else, case, default, catch or finally; the lines they move are not gated, so check them\):\n {2}src\/a\.ts: 5$/m);
-    expect(text).toMatch(/^Lines only taken out, with nothing left there to mutate \(each after the line named, as the file is now; 0 is its top\), so check the code around each:\n {2}src\/b\.ts: after 0, 2$/m);
-    expect(none.lines.at(-1)).toBe('Verdict: NO RESULT (no gating mutant was made, so L5 tested nothing (see what was not mutated, and why, and where lines were only taken out))');
+    expect(text).toMatch(/^Places where lines were taken out with fewer or none put back, so what was taken out is left nowhere to mutate \(each after the line named, as the file is now; 0 is its top\); check the code around each:\n {2}src\/b\.ts: after 0, 2$/m);
+    expect(none.lines.at(-1)).toBe('Verdict: NO RESULT (no gating mutant was made, so L5 tested nothing (see what was not mutated, and why, and where lines were taken out))');
     expect(run([mutant(1, false, { a: pass('Killed', { killedBy: 'x' }) })], {}).lines.at(-1))
       .toBe('Verdict: NO RESULT (no gating mutant was made, so L5 tested nothing (see what was not mutated, and why))');
   });
@@ -204,5 +204,16 @@ describe('the verdict', () => {
     const result = run([mutant(1, true, { a: pass('Killed', { killedBy: 'x' }) })], { stopped: ['pass b could not run: Docker is not running'] });
     expect(result).toMatchObject({ verdict: 'NO RESULT', code: 2 });
     expect(result.lines.join('\n')).toMatch(/^Gating mutants .*: 1: 1 Killed\n[\s\S]*^Stopped:\n {2}pass b could not run: Docker is not running$/m);
+  });
+
+  it('has no result when the tree changed during a run that finished, and says that, not that it stopped', () => {
+    const files = Array.from({ length: 12 }, (_, i) => `src/f${i}.ts`);
+    const result = run([mutant(1, true, { a: pass('Killed', { killedBy: 'x' }) })], { treeChanged: files });
+    expect(result).toMatchObject({ verdict: 'NO RESULT', code: 2 });
+    const text = result.lines.join('\n');
+    expect(text).not.toMatch(/^Stopped:/m);
+    expect(text).toContain(`\nChanged during the run (so no one tree was tested):\n  ${files.slice(0, 10).join(', ')} and 2 more\n`);
+    expect(result.lines.at(-1)).toBe('Verdict: NO RESULT (the tree changed during the run, so no one tree was tested)');
+    expect(run([mutant(1, true, { a: pass('Killed', { killedBy: 'x' }) })], { treeChanged: [] })).toMatchObject({ verdict: 'PASS', code: 0 });
   });
 });

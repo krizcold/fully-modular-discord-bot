@@ -43,8 +43,9 @@ From the bot root, with Node 22.12 or newer (or SMDB_TEST_NODE set, as for `npm 
 - `--concurrency N` sets pass A's parallel runs (default: half the cores); pass B uses half of that.
 - `--keep` keeps the sandboxes in `.stryker-tmp/` for a look after the run. Without it every sandbox is removed, a
   failed pass's too.
-- Exit 0 is PASS, 1 FAIL, 2 NO RESULT (nothing was tested, or the gate stopped: the report says which; or, before any
-  report, .stryker-tmp could not be made or git could not list the tree) or a usage error. A mutant id left in the shell (`__STRYKER_ACTIVE_MUTANT__`)
+- Exit 0 is PASS, 1 FAIL, 2 NO RESULT (nothing was tested, or the gate stopped: the report says which; or, with no
+  report, the test packages are missing (`npm run test:install`), .stryker-tmp could not be made, git could not list
+  the tree, or the report itself could not be written; every `Verdict:` line goes to stdout) or a usage error. A mutant id left in the shell (`__STRYKER_ACTIVE_MUTANT__`)
   is ignored. Any other code means the run was interrupted. Trust 0 and 1 only after the report's `Verdict:` line: a process
   killed on Windows exits 1 too.
 
@@ -65,16 +66,21 @@ runs it under a hostile config). git runs with no file-system monitor, so it loo
   res) => {`, a `});`, a property whose value is an arrow with a body, a plain line of an object that holds a method)
   takes its whole statement: the callback's body runs as context, and the emptying of that body, which touches the
   line, gates. A `for` with no condition is taken whole from its header: Stryker's mutant that gives it a false one
-  spans the loop, and the emptying of its body, an endless loop that ends as a confirmed timeout, is made and gates too.
+  spans the loop, and the emptying of its body, an endless loop, is made and gates too. Where a fast test reaches the
+  loop, that emptying ends as a confirmed timeout; where only an integration test reaches it, it hangs in pass B, which
+  is inconclusive and fails the gate (add a fast test that reaches the loop, or justify it in the notes); a child
+  scenario's step bound kills it.
 - **Gating** mutants touch a changed line. Some that touch one are not made: one that touches it only through a block
-  holding the line (the emptying of that block, or the whole callback around it), and the emptying of a block that
-  only begins or ends on a changed compound header (but a `for` with no condition, above); a block wholly made of
-  changed lines is made.
-  unit/mutationRanges.test.ts holds this rule to Stryker's own instrumenter, line by line, on made-up shapes and on two
-  real files.
+  holding the line (the emptying of that block, or the whole callback around it), and the emptying of the body of a
+  compound statement or declaration, or of a bare block, that only begins or ends on the changed line: its header or
+  its closing brace (but a `for` with no condition, above); a block wholly made of changed lines is made, and so is a
+  callback's body. unit/mutationRanges.test.ts holds this rule to Stryker's own instrumenter, line by line, on made-up
+  shapes and on two real files.
 - The other mutants in the widened ranges are **context**: they run in pass A and are listed, but never fail the gate.
-- A pure deletion has no line left to mutate: its two neighbouring lines are context only, and the report names where
-  lines were only taken out, so a reviewer checks the code around each.
+- What was taken out has no line left to mutate. A pure deletion's two neighbouring lines are context only, and the
+  report names each place where lines were taken out with fewer or none put back (a pure deletion, a line deleted
+  beside an edited one, a block taken away with its body re-indented), so a reviewer checks the code around each; a
+  line replaced one for one shows only as a changed line.
 - Lines added in one place, or only taken out, count also where they could slide to: their first or last lines, or the
   whole run, pass through unchanged lines beside them that repeat them (an `if` block added after an equal one counts
   in both places, an edited line beside it or not). Where repeated lines are spread among other changes, which copy
@@ -85,7 +91,7 @@ runs it under a hostile config). git runs with no file-system monitor, so it loo
   heading, mutants of their own or not: a line of brackets and separators only, one holding a brace of a block (a
   header's `{`, a closer with code of its own such as `} while (x);` or `}).catch(log);`), and one holding an `else`,
   `case`, `default` (in a switch), `catch` or `finally`, so a reviewer checks the lines beside each; a block taken
-  away (its header and bracket deleted) is named with the pure deletions. Not named: a line moved into or out of a
+  away (its header and bracket deleted) is named with the places lines were taken out. Not named: a line moved into or out of a
   braceless body (an `if (x)` with no brace put above a line, or lines swapped below one); a reviewer reads each
   changed braceless header for these.
 - git does not look at a file its index marks assume-unchanged or skip-worktree (core.ignoreStat marks every file it
@@ -141,7 +147,8 @@ runs it under a hostile config). git runs with no file-system monitor, so it loo
    and child scenario step four times its time limit (a test's own explicit limit is not scaled), and Stryker a larger
    budget for the whole run.
    - A gating mutant that timed out in pass A reruns with pass A's tests. It counts as killed when the rerun fails a
-     test, or times out again: a test or a hook past four times its limit, or the whole run past Stryker's budget for
+     test, or times out again: a test or its beforeEach or afterEach hook past four times its limit (a beforeAll or
+     afterAll hook's timeout is inconclusive, below), or the whole run past Stryker's budget for
      it, which is four times what those tests take with no mutant, plus a minute. That budget fires first whenever
      those tests take under 15 seconds, so a mutant that only slows several tests, each within its own limit, by that
      much in all counts as killed; each confirmed timeout is listed with its replacement, to check. One that survives
@@ -172,9 +179,9 @@ no mutant reads the checkout then, so a tree that changed during the run (an edi
 NO RESULT, naming the files.
 
 A run Stryker counts as a kill is checked against vitest's report of it: it is a kill only when a test itself failed for
-a reason other than the machine. When every failing test (or its hook) timed out, and nothing in the run failed for the
-machine, it is a timeout.
-Anything else is **inconclusive**: no report, a failure only in a beforeAll or afterAll hook or at file level, an
+a reason other than the machine. When every failing test (or its beforeEach or afterEach hook) timed out, and nothing in
+the run failed for the machine, it is a timeout.
+Anything else is **inconclusive**: no report, a failure (a timeout included) only in a beforeAll or afterAll hook or at file level, an
 unhandled error with every test passing, or only machine failures (refused or reset connections, a container that would not start, a database
 connection dropped, exhausted resources). The machine's texts are matched against the first line of each failure only,
 never an assertion or a child's stderr, which may name such an error as the thing under test; the list cannot be
@@ -194,9 +201,10 @@ can hold the port or the path, and a run before it can leave the path behind. Fa
 `test/mutation/reports/<time>-<process id>/` (ignored by git; delete it whenever you like):
 
 - `summary.txt` is the L5 report for the review packet: the scope, what was not mutated and why, patterns or lines no
-  mutant touched, the gating mutants by outcome, every survivor, silenced and inconclusive mutant with its place and
-  replacement (with why a kill or timeout did not count), the confirmed timeouts, the context mutants, the runs with no
-  mutant after the reruns, and the verdict.
+  mutant touched, the changed lines that can move others, the places lines were taken out, the gating mutants by
+  outcome, every survivor, silenced and inconclusive mutant with its place and replacement (with why a kill or timeout
+  did not count), the confirmed timeouts, the context mutants, the runs with no mutant after the reruns, why the gate
+  stopped or which files changed during the run, and the verdict.
 - `mutants.json` has the run's fast-check seed and every mutant: its place, original text and replacement, whether it
   gates, and per pass its status and the test that killed it.
 - `a/`, `a2/`, `b/` and `b2-1/`, `b2-2/` (one per test file that killed in pass B) hold, for each mutant run, one vitest
@@ -232,7 +240,9 @@ child away from anything real:
   the code that reads DATA_DIR or falls back to `/data` is never mutated (What it mutates), and a fork whose own env
   lacks DATA_DIR throws, in a test and in every child step (helpers/forkGuard.cjs, which setup.ts loads and child.ts
   preloads; src/webui/botManager.ts forks the bot so, and a mutant that empties that env must fail, not reach `/data`);
-- every wait is bounded, and a step past its bound is ended with every process it started; a step prints one `RESULT`
+- every wait is bounded, and a step past its bound is ended with every process it started that still descends from it
+  (found by parent links: one whose parent already exited is not found, and none is where ps is missing, so a scenario
+  that starts processes keeps each one's parent alive); a step prints one `RESULT`
   line with its result and the modules it loaded; the helper fails unless the fork guard is among them and every other
   one sits under this root's dist.
 

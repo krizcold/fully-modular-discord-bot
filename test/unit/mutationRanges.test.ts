@@ -143,11 +143,15 @@ describe('the change', () => {
     }), { numRuns: 3000 });
   });
 
-  it('names the lines added or changed, and where lines were only taken out', () => {
+  it('names the lines added or changed, and where lines were taken out with fewer or none put back', () => {
     const before = ['a', 'b', 'c', 'd', 'e'].join('\n');
     expect(lineDiff(before, ['a', 'B', 'c', 'd', 'e'].join('\n'))).toEqual({ changed: [2], deletedAfter: [] });
     expect(lineDiff(before, ['a', 'b', 'd', 'e'].join('\n'))).toEqual({ changed: [], deletedAfter: [2] });
     expect(lineDiff(before, ['b', 'c', 'd', 'e'].join('\n'))).toEqual({ changed: [], deletedAfter: [0] });
+    // A line taken out beside an edited one, and a block taken away with its body re-indented.
+    expect(lineDiff(before, ['a', 'B', 'd', 'e'].join('\n'))).toEqual({ changed: [2], deletedAfter: [1] });
+    const guarded = ['export function f(ok: boolean) {', '  if (!ok) {', '    a();', '    b();', '  }', '}'].join('\n');
+    expect(lineDiff(guarded, ['export function f(ok: boolean) {', '  a();', '  b();', '}'].join('\n'))).toEqual({ changed: [2, 3], deletedAfter: [1] });
     expect(lineDiff(before, ['a', 'b', 'c', 'd', 'e', 'f'].join('\n'))).toEqual({ changed: [6], deletedAfter: [] });
     // Line endings alone change nothing, nor does the break after the last line.
     expect(lineDiff(`${before}\n`, before.split('\n').join('\r\n'))).toEqual({ changed: [], deletedAfter: [] });
@@ -620,9 +624,11 @@ describe('the widening', () => {
 // Stryker's own instrumenter, in memory: every mutant that touches a changed
 // line must be made by the ranges, except one that touches the line only
 // through a block nested inside it (the whole callback around a changed line
-// of its body), and the emptying of a block that only begins or ends on the
-// line (the body of a changed `if (...) {` or signature: making it would bring
-// in the whole body).
+// of its body), and the emptying of the body of a compound statement or
+// declaration, or of a bare block, that only begins or ends on the line (a
+// changed `if (...) {`, signature or closing brace: making it would bring in
+// the whole body). A callback's body, and that of a for with no condition, is
+// made.
 describe('the widening, against what Stryker makes', () => {
   const quiet = () => {};
   const logger = { debug: quiet, info: quiet, warn: quiet, error: quiet, trace: quiet, fatal: quiet, isDebugEnabled: () => false, isTraceEnabled: () => false, isInfoEnabled: () => false, isWarnEnabled: () => false, isErrorEnabled: () => false, isFatalEnabled: () => false };
@@ -647,8 +653,14 @@ describe('the widening, against what Stryker makes', () => {
       const sf = ts.createSourceFile('a.ts', text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
       const at = (p: { line: number; column: number }) => sf.getPositionOfLineAndCharacter(p.line, p.column);
       const blocks: { start: number; end: number }[] = [];
+      // The bodies of compound statements and declarations, and bare blocks: never a callback's body, nor the body of
+      // a for with no condition, which is taken whole.
+      const bodies = new Set<string>();
       const walk = (node: ts.Node) => {
         if (ts.isBlock(node) || ts.isModuleBlock(node) || ts.isCaseBlock(node)) blocks.push({ start: node.getStart(sf), end: node.getEnd() });
+        if (ts.isBlock(node) && !ts.isArrowFunction(node.parent) && !ts.isFunctionExpression(node.parent) && !(ts.isForStatement(node.parent) && !node.parent.condition)) {
+          bodies.add(`${node.getStart(sf)}-${node.getEnd()}`);
+        }
         ts.forEachChild(node, walk);
       };
       walk(sf);
@@ -661,7 +673,8 @@ describe('the widening, against what Stryker makes', () => {
         const lineStart = sf.getPositionOfLineAndCharacter(n - 1, 0);
         const span = { start: lineStart + code.search(/\S/), end: lineStart + code.trimEnd().length };
         const throughBlock = (m: Made) => blocks.some(b => at(m.location.start) <= b.start && b.end <= at(m.location.end) && b.start < span.start && span.end < b.end);
-        const braceOnly = (m: Made) => m.mutatorName === 'BlockStatement' && (m.location.start.line + 1 < n || n < m.location.end.line + 1);
+        const braceOnly = (m: Made) => m.mutatorName === 'BlockStatement' && m.location.start.line < m.location.end.line
+          && bodies.has(`${at(m.location.start)}-${at(m.location.end)}`);
         const expected = whole.filter(m => m.location.start.line + 1 <= n && n <= m.location.end.line + 1 && !throughBlock(m) && !braceOnly(m));
         const ranges = rangesOf(text, [n]) ?? [];
         const mutate = ranges.map(([s, e]) => ({ start: { line: s - 1, column: 0 }, end: { line: e - 1, column: Number.MAX_SAFE_INTEGER } }));

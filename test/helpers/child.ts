@@ -33,8 +33,10 @@ export function childEnv(dataDir: string): NodeJS.ProcessEnv {
   return { ...scrubEnv({ ...process.env }), ...DEAD_ENDS, NODE_ENV: 'test', DATA_DIR: dataDir };
 }
 
-// Ends a process and every process it started, found by their parents while
-// the tree still stands: a process a step started would outlive the step's end.
+// Ends a process and every process it started that still descends from it,
+// found by their parents while the tree stands: a process a step started would
+// outlive the step's end. One whose parent already exited is not found, and
+// where ps is missing, only the step is ended.
 function endTree(pid: number): void {
   try {
     if (process.platform === 'win32') {
@@ -53,7 +55,7 @@ function endTree(pid: number): void {
 // Runs one scenario step in its own process and returns its RESULT line. The
 // child's cwd is its data dir, so a `dotenv/config` import in the bot finds no
 // .env; its env is childEnv's. It fails on a missing RESULT line, a nonzero
-// exit, a timeout (and ends every process the step started), or a bot module
+// exit, a timeout (and ends the step's processes, endTree), or a bot module
 // loaded from anywhere but this repo's dist.
 export function runScenario<T>(script: string, args: string[], dataDir: string, timeoutMs = STEP_MS): Promise<ScenarioRun<T>> {
   const env = childEnv(dataDir);

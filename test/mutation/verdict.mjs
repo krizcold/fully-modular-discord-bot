@@ -92,8 +92,8 @@ export const latest = m => /** @type {PassResult} */ (m.passes.b2 ?? m.passes.b 
 /**
  * A mutant's outcome, counting for a gating one only what its rerun alone
  * confirmed. In pass A a timeout counts when the rerun, with four times the
- * time, times out again (a test, a hook, or the whole run past Stryker's
- * budget) or fails a test. In pass B, where containers and children can be
+ * time, times out again (a test or its beforeEach or afterEach hook, or the
+ * whole run past Stryker's budget) or fails a test. In pass B, where containers and children can be
  * slow on their own, a hang never counts, and a kill counts only when the test
  * file that killed it fails for it again when run alone. One the gate never
  * reran, or whose rerun was voided (the run with no mutant after it failed),
@@ -157,16 +157,17 @@ export const toPassB = mutants => mutants.filter(m => m.gating && ['Survived', '
 /**
  * The verdict and the L5 report.
  * `stopped` names why the gate stopped before it finished (a pass that could
- * not run); the passes it did finish are still reported.
+ * not run); the passes it did finish are still reported. `treeChanged` names
+ * the files that changed during the run (tree.mjs), so no one tree was tested.
  * `controls` names the runs with no mutant made after the reruns, each passed.
  * `standIn` is set when a test replaced vitest (runner.mjs's
  * SMDB_MUTATION_VITEST): such a run proves nothing about the code.
  * @param {{ stamp: string, scope: string, emptyScope: boolean, skipped: { file: string, why: string }[], mutants: MutantRecord[],
  *   noMutant: { file: string, lines: number[] }[], brackets?: { file: string, lines: number[] }[], deleted?: { file: string, lines: number[] }[],
- *   unmatched: string[], report: string, stopped?: string[], controls?: string[], standIn?: string }} run
+ *   unmatched: string[], report: string, stopped?: string[], treeChanged?: string[], controls?: string[], standIn?: string }} run
  *   brackets: the changed lines that can move others (ranges.mjs structureLines): brackets and separators only, a brace
- *   of a block, or an else, case, default, catch or finally; deleted: where lines were only taken out, each after the
- *   line named (0: the top)
+ *   of a block, or an else, case, default, catch or finally; deleted: where lines were taken out with fewer or none put
+ *   back, each after the line named (0: the top)
  * @returns {{ verdict: 'PASS' | 'FAIL' | 'NO RESULT', code: 0 | 1 | 2, lines: string[] }}
  */
 export function judge(run) {
@@ -179,10 +180,11 @@ export function judge(run) {
   let why = '';
   if (run.standIn) { verdict = 'NO RESULT'; why = `vitest was replaced by a test's stand-in (SMDB_MUTATION_VITEST=${run.standIn})`; }
   else if (run.stopped) { verdict = 'NO RESULT'; why = 'the gate stopped before it finished'; }
+  else if (run.treeChanged?.length) { verdict = 'NO RESULT'; why = 'the tree changed during the run, so no one tree was tested'; }
   else if (run.emptyScope) { verdict = 'NO RESULT'; why = 'no src file changed; for a job already committed, pass --base the commit before it'; }
   else if (gating.length === 0) {
     verdict = 'NO RESULT';
-    why = `no gating mutant was made, so L5 tested nothing (see what was not mutated, and why${(run.deleted ?? []).length > 0 ? ', and where lines were only taken out' : ''})`;
+    why = `no gating mutant was made, so L5 tested nothing (see what was not mutated, and why${(run.deleted ?? []).length > 0 ? ', and where lines were taken out' : ''})`;
   }
   else if (gating.every(m => outcome(m) === 'CompileError')) { verdict = 'NO RESULT'; why = 'every gating mutant was a type error, so no test ran against the change'; }
 
@@ -217,18 +219,20 @@ export function judge(run) {
       ...run.noMutant.map(n => `  ${n.file}: ${n.lines.join(', ')}`)] : []),
     ...((run.brackets ?? []).length > 0 ? ['Changed lines that can move the unchanged lines beside them into or out of a block (brackets and separators only, a brace of a block, or an else, case, default, catch or finally; the lines they move are not gated, so check them):',
       ...(run.brackets ?? []).map(n => `  ${n.file}: ${n.lines.join(', ')}`)] : []),
-    ...((run.deleted ?? []).length > 0 ? ['Lines only taken out, with nothing left there to mutate (each after the line named, as the file is now; 0 is its top), so check the code around each:',
+    ...((run.deleted ?? []).length > 0 ? ['Places where lines were taken out with fewer or none put back, so what was taken out is left nowhere to mutate (each after the line named, as the file is now; 0 is its top); check the code around each:',
       ...(run.deleted ?? []).map(n => `  ${n.file}: after ${n.lines.join(', ')}`)] : []),
     `Gating mutants (they touch a changed line): ${gating.length}: ${tally(gating)}`,
     `  killed in pass A: ${gating.filter(m => !m.passes.b && outcome(m) === 'Killed').length}; sent to pass B: ${gating.filter(m => m.passes.b).length}, killed there: ${gating.filter(m => m.passes.b && outcome(m) === 'Killed').length}`,
     ...section('Survivors (each needs a test that kills it, or a justification in the notes):', [...gatingAt('Survived'), ...gatingAt('NoCoverage'), ...gatingAt('Missing')]),
     ...section('Silenced by a Stryker disable comment (each needs a justification in the notes):', gatingAt('Ignored')),
     ...section('Inconclusive (no test failed for the mutant itself; rerun, or add a test that fails on it):', [...gatingAt('Inconclusive'), ...gatingAt('RuntimeError')]),
-    ...section('Timeouts (each timed out again when run alone with four times the time: a test, a hook, or the whole run past its budget; counted as killed, so check each replacement):', gatingAt('Timeout')),
+    ...section('Timeouts (each timed out again when run alone with four times the time: a test or its beforeEach or afterEach hook, or the whole run past its budget; counted as killed, so check each replacement):', gatingAt('Timeout')),
     `Context mutants (in the widened statements, not on a changed line; not gating): ${context.length}: ${tally(context)}`,
     ...section('Context survivors:', context.filter(m => outcome(m) === 'Survived')),
     ...(run.controls?.length ? ['Runs with no mutant after the reruns:', ...run.controls.map(line => `  ${line}`)] : []),
     ...(run.stopped ? ['Stopped:', ...run.stopped.map(line => `  ${line}`)] : []),
+    ...(run.treeChanged?.length ? ['Changed during the run (so no one tree was tested):',
+      `  ${run.treeChanged.slice(0, 10).join(', ')}${run.treeChanged.length > 10 ? ` and ${run.treeChanged.length - 10} more` : ''}`] : []),
     `Report: ${run.report} (mutants.json has every mutant, its passes and what killed it)`,
     `Verdict: ${verdict}${why ? ` (${why})` : ''}`,
   ];

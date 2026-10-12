@@ -17,7 +17,7 @@ const { Minimatch, minimatch, escape } = strykerRequire('minimatch');
  * @typedef {[number, number]} Range first and last line, 1-based
  * @typedef {{ status: string, file: string, from?: string }} Entry a file git names as changed; from: a rename's old name
  * @typedef {{ file: string, ranges: Range[] | null, gating: number[] | null, patterns: string[], deleted?: number[] }} Target ranges null: the whole file;
- *   deleted: where lines were only taken out, each after the line named (0: the top)
+ *   deleted: where lines were taken out with fewer or none put back, each after the line named (0: the top)
  * @typedef {{ start: { line: number, column: number }, end: { line: number, column: number } }} Location
  */
 
@@ -170,7 +170,8 @@ export function commonLines(a, b) {
 /**
  * What changed from `before` to `after`, as lines of `after` (from 1): the
  * lines no longest common subsequence of the two keeps, and the lines after
- * which lines of `before` were only taken out (0: before the first line). Lines
+ * which lines of `before` were taken out with fewer or none put back (0:
+ * before the first line; a line replaced one for one is only changed). Lines
  * end at LF or CRLF, so line endings alone change nothing. The lines added in
  * one place, or only taken out, count also where they could slide to: their
  * first or last lines, or the whole run, pass through unchanged lines beside
@@ -209,6 +210,9 @@ export function lineDiff(before, after) {
         for (let t = 1; i0 - t >= 0 && partner[i0 - t] === j0 - t && a[i0 - t] === a[i0 + k - t]; t++) deletedAfter.add(j0 - t);
         for (let t = 0; i1 + t < a.length && partner[i1 + t] === j0 + t && a[i1 + t] === a[i1 - k + t]; t++) deletedAfter.add(j0 + t + 1);
       }
+    } else if (i1 - i0 > j1 - j0) {
+      // More taken out than put back (a line deleted beside an edited one, a block taken away and its body re-indented).
+      deletedAfter.add(j0);
     }
     pi = i;
     pj = j;
@@ -467,9 +471,10 @@ export const changedArgs = base => ['diff', '--name-status', '-z', '-M', '-l0', 
 /**
  * The target for a file's changed lines. `gating` lists them: a mutant that
  * touches one of them must be killed; the others in the widened ranges are
- * context, run and listed but never gating. A pure deletion widens its two
- * neighbouring lines as context, and `deleted` names where it was, for nothing
- * is left there to mutate. Null when the change leaves no line to mutate.
+ * context, run and listed but never gating. A place where lines were taken out
+ * with fewer or none put back widens its two neighbouring lines as context, and
+ * `deleted` names it, for what was taken out is left nowhere to mutate. Null
+ * when the change leaves no line to mutate.
  * @param {string} file the name to mutate it under
  * @param {string} text
  * @param {{ changed: number[], deletedAfter: number[] }} change

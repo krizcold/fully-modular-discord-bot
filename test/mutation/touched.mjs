@@ -50,7 +50,7 @@ try {
   ranges = await import('./ranges.mjs');
   verdicts = await import('./verdict.mjs');
 } catch (error) {
-  console.error(`Verdict: NO RESULT (the gate could not load: ${error instanceof Error ? error.message.split('\n')[0] : String(error)}; run npm run test:install)`);
+  console.log(`Verdict: NO RESULT (the gate could not load: ${error instanceof Error ? error.message.split('\n')[0] : String(error)}; run npm run test:install)`);
   process.exit(2);
 }
 const { structureLines, DATA_ROUTE_WHY, EXTRA_BREAK_WHY, gates, holdsDataRoute, holdsExtraBreak, linesOfTarget, notMutated, planFromGit, sandboxPatterns, unmatchedPatterns, untouched } = ranges;
@@ -345,19 +345,18 @@ async function passOn(name, dir, tier, on, extra, only) {
  */
 function finish(stopped) {
   try {
-    const changed = treeChanges(planned, treePrint(root, treeFiles()));
-    if (changed.length > 0) {
-      stopped = [...(stopped ?? []), `the tree changed during the run, so no one tree was tested: ${changed.slice(0, 10).join(', ')}${changed.length > 10 ? ` and ${changed.length - 10} more` : ''}`];
-    }
-    report(stopped);
+    report(stopped, treeChanges(planned, treePrint(root, treeFiles())));
   } catch (error) {
-    console.error(`Verdict: NO RESULT (the report could not be written: ${firstLine(error)})`);
+    console.log(`Verdict: NO RESULT (the report could not be written: ${firstLine(error)})`);
     process.exit(2);
   }
 }
 
-/** @param {string[]} [stopped] */
-function report(stopped) {
+/**
+ * @param {string[] | undefined} stopped
+ * @param {string[]} treeChanged
+ */
+function report(stopped, treeChanged) {
   /** @type {{ file: string, lines: number[] }[]} */
   const noMutant = [];
   /** @type {{ file: string, lines: number[] }[]} */
@@ -378,9 +377,9 @@ function report(stopped) {
     if (lines.length > 0) noMutant.push({ file: target.file, lines });
   }
   const seed = process.env.SMDB_TEST_SEED;
-  const result = judge({ stamp, scope: `${scope}; fast-check seed ${seed}`, emptyScope, skipped, mutants, noMutant, brackets, deleted, unmatched, report: posix(path.relative(root, reportDir)), stopped, controls, standIn: process.env.SMDB_MUTATION_VITEST });
+  const result = judge({ stamp, scope: `${scope}; fast-check seed ${seed}`, emptyScope, skipped, mutants, noMutant, brackets, deleted, unmatched, report: posix(path.relative(root, reportDir)), stopped, treeChanged, controls, standIn: process.env.SMDB_MUTATION_VITEST });
   fs.mkdirSync(reportDir, { recursive: true });
-  fs.writeFileSync(path.join(reportDir, 'mutants.json'), `${JSON.stringify({ scope, seed, skipped, targets, mutants, controls, verdict: result.verdict, stopped }, null, 2)}\n`);
+  fs.writeFileSync(path.join(reportDir, 'mutants.json'), `${JSON.stringify({ scope, seed, skipped, targets, mutants, controls, verdict: result.verdict, stopped, treeChanged }, null, 2)}\n`);
   fs.writeFileSync(path.join(reportDir, 'summary.txt'), `${result.lines.join('\n')}\n`);
   console.log(result.lines.join('\n'));
   process.exit(result.code);

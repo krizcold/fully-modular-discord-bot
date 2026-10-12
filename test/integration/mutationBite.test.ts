@@ -149,7 +149,7 @@ describe('the touched-line mutation gate', () => {
     expect(run.stdout).toMatch(/^Verdict: NO RESULT \(vitest was replaced by a test's stand-in /m);
     expect(run.stdout).toMatch(/^Stopped:\n {2}the run with no mutant after pass a2 failed \(exit 1\), so what its reruns counted cannot be told from the machine's failures$/m);
     expect(run.stdout).toMatch(/^ {2}the run with no mutant failed in unit\/x\.test\.ts: Error: the database went away$/m);
-    expect(run.stdout).toContain(`  the tree changed during the run, so no one tree was tested: ${added}`);
+    expect(run.stdout).toContain(`\nChanged during the run (so no one tree was tested):\n  ${added}`);
     expect(run.stdout).toMatch(/^Inconclusive .*\n {2}src\/bot\/internalSetup\/fleet\/nodeIdentity\.ts:\d+:\d+ .*\(the run with no mutant after pass a2 failed\)$/m);
     expect(run.stdout).not.toMatch(/^Timeouts /m);
     expect(run.stdout).not.toMatch(/^Runs with no mutant after the reruns:/m);
@@ -176,7 +176,7 @@ describe('the touched-line mutation gate', () => {
         fs.rmSync(leftover, { recursive: true, force: true });
       }
     })();
-    expect(run.stdout).not.toContain('the tree changed');
+    expect(run.stdout).not.toContain('Changed during the run');
     const reran = mutants.filter(m => m.passes.a2);
     expect(reran.length).toBeGreaterThan(0);
     for (const m of reran) expect(m.passes.a2).toMatchObject({ voided: 'the run with no mutant after pass a2 failed' });
@@ -213,7 +213,7 @@ describe('the touched-line mutation gate', () => {
     expect(run.stdout).toMatch(/^Stopped:\n {2}pass a2 could not run: /m);
     expect(run.stdout).toContain(`\n  ${probe}: it reads DATA_DIR or holds the '/data' fallback`);
     expect(run.stdout).not.toContain('a2/dry-*.log');
-    expect(run.stdout).toContain(`  the tree changed during the run, so no one tree was tested: ${probe}`);
+    expect(run.stdout).toContain(`\nChanged during the run (so no one tree was tested):\n  ${probe}`);
   });
 
   it('refuses it in the run with no mutant after the reruns, too, and says so', { timeout: 600_000 }, () => {

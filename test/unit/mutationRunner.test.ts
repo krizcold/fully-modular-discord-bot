@@ -256,6 +256,15 @@ describe('the tree fingerprint', () => {
     expect(run.stdout).toMatch(/^Verdict: NO RESULT \(the gate could not make \.stryker-tmp, where Stryker puts its sandboxes: /m);
   });
 
+  it('ends the gate NO RESULT, exit 2, on stdout with every other verdict, when the test packages are missing', () => {
+    const copy = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-noinstall-'));
+    onTestFinished(() => fs.rmSync(copy, { recursive: true, force: true }));
+    fs.cpSync(path.join(root, 'test', 'mutation'), path.join(copy, 'test', 'mutation'), { recursive: true, filter: source => path.basename(source) !== 'reports' });
+    const run = spawnSync(process.execPath, [path.join(copy, 'test', 'mutation', 'touched.mjs')], { cwd: copy, encoding: 'utf8' });
+    expect(run.status, run.stderr).toBe(2);
+    expect(run.stdout).toMatch(/^Verdict: NO RESULT \(the gate could not load: .*; run npm run test:install\)$/m);
+  });
+
   it('is taken, in the gate, before it reads a file: the --mutate checks and the plan', () => {
     const gate = fs.readFileSync(path.join(root, 'test', 'mutation', 'touched.mjs'), 'utf8');
     const print = gate.indexOf('planned = treePrint(');
