@@ -18,7 +18,7 @@ import { describe, expect, it } from 'vitest';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const TARGET = 'src/bot/internalSetup/fleet/nodeIdentity.ts';
 
-interface Pass { id: string | null; status: string; killedBy?: string; inconclusive?: string; recheck?: string }
+interface Pass { id: string | null; dir?: string; status: string; killedBy?: string; inconclusive?: string; recheck?: string }
 
 // The ids a pass ran tests for (targets.mjs), as runner.mjs read them.
 const ranFor = (reportDir: string, dir: string) => (JSON.parse(fs.readFileSync(path.join(root, reportDir, dir, 'run-ids.json'), 'utf8')) as string[]).sort();
@@ -90,7 +90,7 @@ describe('the touched-line mutation gate', () => {
    * reruns) and `mutant` the active mutant; its `message`, if any, fails it.
    * The gate mutates `pattern`, by default one line of the bite's target.
    */
-  function standInRun(code: string, pattern?: string) {
+  function standInRun(code: string, patterns?: string[]) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-control-'));
     const fake = path.join(dir, 'vitest.cjs');
     // Git-ignored files in the checkout (*.log), which no sandbox may hold: one
@@ -114,7 +114,7 @@ describe('the touched-line mutation gate', () => {
     ].join('\n'));
     const line = lineOf("return (process.env.FLEET_BACKUP_MODE || '').trim().toLowerCase() === 'active';");
     // A mutant id left in the shell, which the gate must ignore.
-    const run = spawnSync(process.execPath, [path.join(root, 'test', 'mutation', 'touched.mjs'), '--mutate', pattern ?? `${TARGET}:${line}-${line}`, '--concurrency', '1'],
+    const run = spawnSync(process.execPath, [path.join(root, 'test', 'mutation', 'touched.mjs'), ...(patterns ?? [`${TARGET}:${line}-${line}`]).flatMap(pattern => ['--mutate', pattern]), '--concurrency', '1'],
       { cwd: root, encoding: 'utf8', timeout: 580_000, env: { ...process.env, SMDB_MUTATION_VITEST: fake, __STRYKER_ACTIVE_MUTANT__: '3' } });
     fs.rmSync(dir, { recursive: true, force: true });
     for (const name of canaries) fs.rmSync(path.join(root, name), { force: true });
@@ -203,9 +203,12 @@ describe('the touched-line mutation gate', () => {
   it('type-checks only the tree, and gives a mutant whose only type error is an unused @ts-expect-error pass A again with no checker', { timeout: 600_000 }, () => {
     const src = path.join(root, 'src');
     const ignored = path.join(src, 'bot', 'modulesDev');
-    for (const old of fs.readdirSync(src).filter(name => name.startsWith('smdb-bite-directive-'))) fs.rmSync(path.join(src, old), { force: true });
+    for (const old of fs.readdirSync(src).filter(name => /^smdb-bite-(directive|other)-/.test(name))) fs.rmSync(path.join(src, old), { force: true });
     for (const old of fs.readdirSync(ignored).filter(name => name.startsWith('smdb-bite-reader-'))) fs.rmSync(path.join(ignored, old), { force: true });
     const probe = `src/smdb-bite-directive-${process.pid}.ts`;
+    // A second file the job changed: the run with no checker must take its related tests too, as pass A does.
+    const other = `src/smdb-bite-other-${process.pid}.ts`;
+    fs.writeFileSync(path.join(root, other), 'export function smdbOther(n: number): number {\n  return n + 1;\n}\n');
     const reader = path.join(ignored, `smdb-bite-reader-${process.pid}.ts`);
     fs.writeFileSync(path.join(root, probe), [
       'export const SMDB_PROBE = { retries: 3 };',
@@ -218,27 +221,33 @@ describe('the touched-line mutation gate', () => {
     // A module cloned into the git-ignored src/bot/modulesDev that reads the probe: no sandbox holds it.
     fs.writeFileSync(reader, `import { SMDB_PROBE } from '../../smdb-bite-directive-${process.pid}';\nexport const smdbRetries: number = SMDB_PROBE.retries;\n`);
     try {
-      // Pass A with no checker, and every rerun alone, fail only on the machine's texts.
-      const { run, mutants } = standInRun(`if (mutant && (pass === 'a-unchecked' || pass === 'a2')) message = "Error: EBUSY: resource busy or locked, rmdir 'x'";`, probe);
+      // Pass A with no checker, and every rerun alone, fail only on the machine's texts; pass A with no checker fails
+      // outright (its run with no mutant too) unless vitest is given the other file as well.
+      const { run, mutants } = standInRun([
+        `if (mutant && (pass === 'a-unchecked' || pass === 'a2')) message = "Error: EBUSY: resource busy or locked, rmdir 'x'";`,
+        "if (pass === 'a-unchecked' && !process.argv.some(arg => arg.includes('smdb-bite-other-'))) message = \"Error: the run with no checker lacks pass A's files\";",
+      ].join('\n'), [probe, other]);
       expect(run.stdout).not.toMatch(/^Stopped:/m);
       // Emptying the object is a type error only in the ignored file, so it meets the tests (the stand-in times them
       // out), and its rerun alone counts the failure, whatever it says.
       const emptied = mutants.find(m => m.mutator === 'ObjectLiteral' && m.location.start.line === 1);
-      expect(emptied?.passes.a.status).toBe('Killed');
-      expect(emptied?.passes.a2?.killedBy).toBe('unit/x.test.ts > reads');
+      expect(emptied?.passes.a).toMatchObject({ status: 'Killed', dir: 'a' });
+      expect(emptied?.passes.a2).toMatchObject({ killedBy: 'unit/x.test.ts > reads', dir: 'a2' });
       // The condition's mutants leave the directive unused: they meet pass A's tests again with no checker, where the
       // machine's texts make a first run's failure a recheck, and go on like any other: their rerun alone counts it.
       const unused = mutants.filter(m => /^only the machine failed: Error: EBUSY/.test(m.passes.a.inconclusive ?? ''));
       expect(unused.length).toBeGreaterThan(0);
       expect(run.stdout).toMatch(new RegExp(`^L5: pass A again, with no type checker, on ${unused.length} mutant\\(s\\) whose only type error is an unused @ts-expect-error$`, 'm'));
       for (const m of unused) {
-        expect(m.passes.a, m.mutator).toMatchObject({ status: 'Killed', recheck: 'unit/x.test.ts > reads' });
+        // Its pass A id is that run's, in its own dir: Stryker numbers each run's mutants anew.
+        expect(m.passes.a, m.mutator).toMatchObject({ status: 'Killed', recheck: 'unit/x.test.ts > reads', dir: 'a-unchecked' });
         expect(m.passes.a2?.killedBy, m.mutator).toBe('unit/x.test.ts > reads');
       }
       expect(mutants.filter(m => m.passes.a.status === 'CompileError' && m.passes.a.inconclusive)).toEqual([]);
       expect(run.stdout).not.toMatch(/^Inconclusive /m);
     } finally {
       fs.rmSync(path.join(root, probe), { force: true });
+      fs.rmSync(path.join(root, other), { force: true });
       fs.rmSync(reader, { force: true });
     }
   });
@@ -257,7 +266,7 @@ describe('the touched-line mutation gate', () => {
       const { run } = standInRun([
         `const probe = ${JSON.stringify(path.join(root, probe))};`,
         `if (pass === '${when}' && mutant && !fs.readFileSync(probe, 'utf8').includes('smdbRoute')) fs.appendFileSync(probe, "export const smdbRoute = 'DATA_DIR';\\n");`,
-      ].join('\n'), probe);
+      ].join('\n'), [probe]);
       return { run, probe };
     } finally {
       fs.rmSync(path.join(root, probe), { force: true });
@@ -290,7 +299,7 @@ describe('the touched-line mutation gate', () => {
     fs.writeFileSync(path.join(root, gone), 'export type Gone = number;\n');
     try {
       // Taken out of the checkout by pass A's run with no mutant (its copy in the sandbox stays).
-      const { run } = standInRun(`if (pass === 'a') fs.rmSync(${JSON.stringify(path.join(root, gone))}, { force: true });`, `${gone}:1-1`);
+      const { run } = standInRun(`if (pass === 'a') fs.rmSync(${JSON.stringify(path.join(root, gone))}, { force: true });`, [`${gone}:1-1`]);
       expect(run.stdout).toContain(`\nChanged during the run (so no one tree was tested):\n  ${gone}`);
       expect(run.stdout).not.toContain('the report could not be written');
     } finally {

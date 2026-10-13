@@ -4,8 +4,9 @@
 /**
  * @typedef {import('./ranges.mjs').Location} Location
  * @typedef {'a' | 'a2' | 'b' | 'b2'} PassName
- * @typedef {{ id: string | null, status: string, statusReason?: string, killedBy?: string, timeout?: string, inconclusive?: string,
- *   recheck?: string, voided?: string }} PassResult recheck: the test that failed only on the machine's texts, so the
+ * @typedef {{ id: string | null, dir?: string, status: string, statusReason?: string, killedBy?: string, timeout?: string,
+ *   inconclusive?: string, recheck?: string, voided?: string }} PassResult dir: the report dir the id's runs are in
+ *   (Stryker numbers each run's mutants anew); recheck: the test that failed only on the machine's texts, so the
  *   mutant reruns alone; voided: why a rerun's kill or timeout no longer counts; a CompileError with an inconclusive
  *   is one only of an unused `@ts-expect-error` (TS2578), which no test met
  * @typedef {{ file: string, location: Location, mutator: string, original: string, replacement: string, gating: boolean,

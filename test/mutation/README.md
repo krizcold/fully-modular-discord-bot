@@ -168,8 +168,8 @@ does not name by its content.
    so when the checker would judge a file outside the tree, packages under node_modules aside, the gate stops before
    pass A with NO RESULT and names it (ranges.mjs beyondTree): a mutant that broke only that file would count as killed
    with no test run. A gating mutant whose only type error is an unused `@ts-expect-error` (TS2578) type-checks, so it
-   meets pass A's tests again with no checker (`a-unchecked/`), and that run is its pass A: from there it goes on like
-   any other mutant. Each mutant run is `vitest related <mutated files>` on the fast tier with one worker, so only
+   meets pass A's tests again with no checker (`a-unchecked/`, `vitest related` on all of pass A's files), and that run
+   is its pass A: from there it goes on like any other mutant. Each mutant run is `vitest related <mutated files>` on the fast tier with one worker, so only
    tests that import them run. There is no coverage analysis: every mutant runs those tests. The files go on vitest's
    command line relative to test/; a change of many hundreds of files can pass Windows' limit on a command line, and
    then the run's log says vitest could not start.
@@ -265,8 +265,8 @@ can hold the port or the path, and a run before it can leave the path behind. Fa
   did not count), the confirmed timeouts, the context mutants, the runs with no mutant after the reruns, why the gate
   stopped or which files changed during the run, and the verdict.
 - `mutants.json` has the run's fast-check seed and every mutant: its place, original text and replacement, whether it
-  gates, and per pass its status and the test that killed it (for a mutant pass A met again with no checker, its pass
-  A is that run).
+  gates, and per pass its status, the report dir its id is in (Stryker numbers each run's mutants anew) and the test
+  that killed it (for a mutant pass A met again with no checker, its pass A is that run, in `a-unchecked/`).
 - `a/`, `a-unchecked/` (pass A again with no checker), `a2/`, `b/` and `b2-1/`, `b2-2/` (one per test file that failed in pass B: a kill, or a failure only on the machine's texts) hold, for each mutant run, one vitest
   JSON report and log per tier it ran (`<id>-<tier>.json` and `.log`; a run in `b/` can reach both integration and
   child; a nested mutant a pass is not for runs nothing; `dry-*` is the run with no mutant, and `dry-ms.txt` its time).

@@ -152,6 +152,8 @@ describe('the passes a mutant goes through', () => {
     // A pass B recheck the gate stopped before rerunning says so, though a2 reran its pass A timeout alone.
     const reranInA = mutant(4, true, { a: pass('Timeout'), a2: pass('Survived'), b: pass('Killed', { recheck: 'integration/s.test.ts > reads', inconclusive: 'only the machine failed: Error: ECONNRESET' }) });
     expect(confirmed(reranInA, true)).toEqual({ outcome: 'Inconclusive', why: 'only the machine failed: Error: ECONNRESET, in pass B, never rerun alone' });
+    const onlyInB = mutant(5, true, { a: pass('Survived'), b: pass('Killed', { recheck: 'integration/s.test.ts > reads', inconclusive: 'only the machine failed: Error: ECONNRESET' }) });
+    expect(confirmed(onlyInB, true)).toEqual({ outcome: 'Inconclusive', why: 'only the machine failed: Error: ECONNRESET, in pass B, never rerun alone' });
   });
 
   it('sends a gating mutant whose only type error is an unused @ts-expect-error to pass A again, with no type checker', () => {

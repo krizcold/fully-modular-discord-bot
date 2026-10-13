@@ -231,7 +231,7 @@ function dryFailures(name) {
  */
 function resultOf(dir, r, alone = false) {
   /** @type {PassResult} */
-  const result = { id: r.id, status: r.status, ...(r.statusReason ? { statusReason: r.statusReason.split('\n')[0] } : {}) };
+  const result = { id: r.id, dir, status: r.status, ...(r.statusReason ? { statusReason: r.statusReason.split('\n')[0] } : {}) };
   // A type error only of an unused @ts-expect-error proves nothing: a gating one meets pass A's tests again, with no checker.
   if (r.status === 'CompileError' && onlyUnusedDirective(r.statusReason ?? '')) {
     return { ...result, inconclusive: 'a type error only because a @ts-expect-error went unused (TS2578), so no test ran on it' };
@@ -340,14 +340,15 @@ const credited = m => ['Killed', 'Timeout'].includes(outcome(m));
  * @param {'a' | 'b'} tier
  * @param {MutantRecord[]} on
  * @param {Options} extra
- * @param {string[]} [only]
+ * @param {{ only?: string[], files?: string[] }} [run] the test files to run instead, and the files whose related
+ *   tests run (the mutants' own by default)
  */
-async function passOn(name, dir, tier, on, extra, only) {
-  const results = await pass({ name, dir, tier, mutate: [...new Set(on.map(spanOf))], files: [...new Set(on.map(m => m.file))], only, keys: on.map(recordKey), extra });
+async function passOn(name, dir, tier, on, extra, { only, files = [...new Set(on.map(m => m.file))] } = {}) {
+  const results = await pass({ name, dir, tier, mutate: [...new Set(on.map(spanOf))], files, only, keys: on.map(recordKey), extra });
   const byKey = new Map(results.map(r => [resultKey(r), r]));
   for (const m of on) {
     const r = byKey.get(recordKey(m));
-    m.passes[name] = r ? resultOf(dir, r, name === 'a2' || name === 'b2') : { id: null, status: 'Missing' };
+    m.passes[name] = r ? resultOf(dir, r, name === 'a2' || name === 'b2') : { id: null, dir, status: 'Missing' };
   }
 }
 
@@ -448,11 +449,11 @@ try {
     };
   });
 
-  // Their run with no checker is their pass A, and they go on from it like any other.
+  // Their run with no checker, on pass A's files, is their pass A, and they go on from it like any other.
   const unchecked = toUncheck(mutants);
   if (unchecked.length > 0) {
     console.log(`L5: pass A again, with no type checker, on ${unchecked.length} mutant(s) whose only type error is an unused @ts-expect-error`);
-    await passOn('a', 'a-unchecked', 'a', unchecked, { ...PASSES.a, checkers: [], concurrency: opts.concurrency });
+    await passOn('a', 'a-unchecked', 'a', unchecked, { ...PASSES.a, checkers: [], concurrency: opts.concurrency }, { files });
   }
 
   const confirmA = toConfirm(mutants, 'a');
@@ -472,7 +473,7 @@ try {
     for (const [killer, on] of killers) {
       group += 1;
       console.log(`L5: pass B again, one at a time, on ${on.length} mutant(s) whose run failed in ${killer}, with that file alone; a failure counts only if it repeats`);
-      await passOn('b2', `b2-${group}`, 'b', on, PASSES.b2, [killer]);
+      await passOn('b2', `b2-${group}`, 'b', on, PASSES.b2, { only: [killer] });
     }
     if (confirmB.some(credited)) await control('b2', 'b', confirmB, [...killers.keys()]);
   }
