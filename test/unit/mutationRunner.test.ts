@@ -295,6 +295,15 @@ describe('the tree fingerprint', () => {
     expect(print).toBeLessThan(gate.indexOf('opts.mutate = opts.mutate.map('));
     expect(print).toBeLessThan(gate.indexOf('planFromGit({'));
   });
+
+  it('gives pass A every target of a file, gates by any of them, and runs only when one can gate (ranges.mjs)', () => {
+    const gate = fs.readFileSync(path.join(root, 'test', 'mutation', 'touched.mjs'), 'utf8');
+    expect(gate).toContain('mutate: mutatePatterns(targets)');
+    expect(gate).toContain('gating: gatesIn(targets, file, r.location)');
+    const guard = gate.indexOf('if (!targets.some(target => target.gating === null || target.gating.length > 0)) await finish();');
+    expect(guard).toBeGreaterThan(0);
+    expect(guard).toBeLessThan(gate.indexOf("await pass({ name: 'a'"));
+  });
 });
 
 describe('the gate under an old node', () => {

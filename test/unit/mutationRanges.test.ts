@@ -14,7 +14,7 @@ import { canonicalName } from '../mutation/keys.mjs';
 import {
   changeTarget, CODE, codeLines, commonLines, gates, gatesIn, inPattern, lineDiff, linesOfTarget, mergeRanges, mutatePatterns, notMutated, parseNameStatus,
   planChange, planFromGit, unmatchedPatterns, untouched, wholeTarget, structureLines, DATA_ROUTE_WHY, GLOB_NAME_WHY, beyondTree, holdsDataRoute, rootGlobFree,
-  sandboxPatterns, strykerTakes, tokenLines, treeTsconfig,
+  sandboxPatterns, strykerTakes, tokenLines, treeTsconfig, NO_CODE_WHY,
 } from '../mutation/ranges.mjs';
 import { treeChanges, treePrint } from '../mutation/tree.mjs';
 
@@ -226,6 +226,19 @@ describe('the change', () => {
     expect(lineDiff(before, ['a', 'b', 'c', 'd', 'e', 'f'].join('\n'))).toEqual({ changed: [6], deletedAfter: [] });
     // Line endings alone change nothing, nor does the break after the last line.
     expect(lineDiff(`${before}\n`, before.split('\n').join('\r\n'))).toEqual({ changed: [], deletedAfter: [] });
+  });
+
+  it('counts lines of code taken out: one made a comment or a blank line is, a comment or a blank line is not', () => {
+    const before = ['a();', 'b();', 'c();'].join('\n');
+    expect(lineDiff(before, ['a();', '// b();', 'c();'].join('\n'))).toEqual({ changed: [2], deletedAfter: [1] });
+    expect(lineDiff(before, ['a();', '', 'c();'].join('\n'))).toEqual({ changed: [2], deletedAfter: [1] });
+    expect(lineDiff(before, ['a();', 'B();', 'c();'].join('\n'))).toEqual({ changed: [2], deletedAfter: [] });
+    const noted = ['a();', '// one', '', 'c();'].join('\n');
+    expect(lineDiff(noted, ['a();', '// two', 'c();'].join('\n'))).toEqual({ changed: [2], deletedAfter: [] });
+    expect(lineDiff(noted, ['a();', 'c();'].join('\n'))).toEqual({ changed: [], deletedAfter: [] });
+    // Counted on the diff's own lines: a lone CR in the base ends none, so b() is on its line 2 there.
+    const crossed = ['a();', '/* \r */ b();', 'c();'].join('\n');
+    expect(lineDiff(crossed, ['a();', '/* \r */ // b();', 'c();'].join('\n'))).toEqual({ changed: [2], deletedAfter: [1] });
   });
 
   it('finds the few lines that changed in a long file, and copes with two that share nothing', () => {
@@ -583,9 +596,13 @@ describe('the change', () => {
     // The job's own edit, at line 3, is the second diff's: the first target alone would call it context.
     expect(gates(plan.targets[0], at(3))).toBe(false);
     expect(gatesIn(plan.targets, 'src/real/x.ts', at(3))).toBe(true);
+    expect(gatesIn(plan.targets, 'src/real/x.ts', at(2))).toBe(true);
     expect(gatesIn(plan.targets, 'src/real/x.ts', at(5))).toBe(false);
     // Merged, so a mutant that spans both lines is made too.
     expect(mutatePatterns(plan.targets)).toEqual(['src/real/x.ts:2-3']);
+    // A diff that only takes code out names its place and brings in nothing: the other diff's lines are all that is made.
+    const taken = changeTarget('src/real/x.ts', now, { changed: [], deletedAfter: [3] })!;
+    expect(mutatePatterns([taken, changeTarget('src/real/x.ts', now, { changed: [5], deletedAfter: [] })!])).toEqual(['src/real/x.ts:5-5']);
     expect(mutatePatterns([...plan.targets, wholeTarget('src/real/x.ts')])).toEqual(['src/real/x.ts']);
     // --mutate patterns stay as given.
     expect(mutatePatterns([{ file: 'src/a.ts', patterns: ['src/a.ts:1-2'] }, { file: 'src/a.ts', patterns: ['src/a.ts:2-3'] }])).toEqual(['src/a.ts:1-2', 'src/a.ts:2-3']);
@@ -877,6 +894,10 @@ describe('the widening', () => {
   it('takes a whole statement that holds no block', () => {
     expect(rangesOf(SAMPLE, [7])).toEqual([[6, 9]]);
     expect(rangesOf(SAMPLE, [8])).toEqual([[6, 9]]);
+    // A blank line inside a multi-line template is part of the template's text, so it widens as its other lines do.
+    const usage = ['export function usage() {', '  return `usage:', '', '  smdb run`;', '}'].join('\n');
+    expect(rangesOf(usage, [2])).toEqual([[2, 4]]);
+    expect(rangesOf(usage, [3])).toEqual([[2, 4]]);
   });
 
   it('keeps a changed signature to the signature, and a closing brace or else line to its own line', () => {
@@ -975,7 +996,9 @@ describe('the widening, against what Stryker makes', () => {
         if ((ts.isCaseClause(node) || ts.isDefaultClause(node)) && lineAt(node.getStart(sf)) < lineAt(node.getEnd())) {
           const [label, end] = [lineAt(node.getStart(sf)), lineAt(node.getEnd())];
           // The statements ranges.mjs COMPOUND widens apart from their bodies, listed here by hand: a kind added to
-          // one list and not the other fails a clause shape that holds it.
+          // one list and not the other fails a clause shape that holds it. Only the clause's own statements are
+          // read, so a braceless compound one on the label line whose statement ends the clause (`case 1: if (a)
+          // g(` ... `);`) fails it too, though the widening makes the emptying from that statement's lines rightly.
           const compound = (part: ts.Node) => ts.isBlock(part) || ts.isIfStatement(part) || ts.isIterationStatement(part, false) || ts.isSwitchStatement(part)
             || ts.isTryStatement(part) || ts.isLabeledStatement(part) || ts.isWithStatement(part) || ts.isFunctionDeclaration(part) || ts.isClassDeclaration(part);
           const takers = new Set<number>();
@@ -1021,7 +1044,7 @@ describe('the widening, against what Stryker makes', () => {
     });
   }
 
-  it("gates only what the changed lines make by themselves: what a deletion's neighbour brings in is context", async () => {
+  it('makes and gates what the changed lines widen to, a place where code was taken out beside them or not', async () => {
     const base = [
       "import { Router } from 'express';",
       'export const router = Router();',
@@ -1030,20 +1053,32 @@ describe('the widening, against what Stryker makes', () => {
       '  res.json({ ok: true, id });',
       '});',
     ];
-    // The handler's first line taken out and the next one edited: one hunk, two lines out and one in.
-    const text = [base[0], base[1], base[2], '  res.json({ ok: false });', base[5]].join('\n');
-    const change = lineDiff(base.join('\n'), text);
-    expect(change).toEqual({ changed: [4], deletedAfter: [3] });
-    const target = changeTarget('src/a.ts', text, change)!;
-    const here = await made(text, target.ranges!.map(([s, e]) => ({ start: { line: s - 1, column: 0 }, end: { line: e - 1, column: Number.MAX_SAFE_INTEGER } })));
     const loc = (m: Made) => ({ start: { line: m.location.start.line + 1, column: m.location.start.column + 1 }, end: { line: m.location.end.line + 1, column: m.location.end.column + 1 } });
-    // The neighbour (the route's header) takes the whole route, so the handler's emptying is made, and is context.
-    const body = here.find(m => m.mutatorName === 'BlockStatement' && m.location.start.line + 1 === 3);
-    expect(body).toBeDefined();
-    expect(gates(target, loc(body!))).toBe(false);
-    const gating = here.filter(m => gates(target, loc(m)));
-    expect(gating.length).toBeGreaterThan(0);
-    expect(gating.every(m => m.location.start.line + 1 === 4 && m.location.end.line + 1 === 4)).toBe(true);
+    const of = async (before: string, text: string) => {
+      const target = changeTarget('src/a.ts', text, lineDiff(before, text))!;
+      const here = await made(text, target.ranges!.map(([s, e]) => ({ start: { line: s - 1, column: 0 }, end: { line: e - 1, column: Number.MAX_SAFE_INTEGER } })));
+      return { target, here, gating: here.filter(m => gates(target, loc(m))) };
+    };
+    // The handler's first line taken out and the next one edited: one hunk, two lines out and one in. The route's
+    // header beside it is not widened, so the handler's emptying (an endless loop for a `for (;;)` body) is not made.
+    const text = [base[0], base[1], base[2], '  res.json({ ok: false });', base[5]].join('\n');
+    expect(lineDiff(base.join('\n'), text)).toEqual({ changed: [4], deletedAfter: [3] });
+    const route = await of(base.join('\n'), text);
+    expect(route.here.some(m => m.mutatorName === 'BlockStatement' && m.location.start.line + 1 === 3)).toBe(false);
+    expect(route.gating.length).toBeGreaterThan(0);
+    expect(route.here.every(m => m.location.start.line + 1 === 4 && m.location.end.line + 1 === 4)).toBe(true);
+    // A new function whose body holds a blank or a comment line is made whole, and its emptying gates, with code
+    // taken out of another function in the file or not.
+    const g = ['export function g(b: number) {', '  const c = b * 2;', '  return c;', '}'];
+    for (const gap of ['', '  // then the other']) {
+      const fresh = ['export function remember(state: { last?: string; seen?: boolean }): void {', "  state.last = 'ok';", gap, '  state.seen = true;', '}'];
+      for (const rest of [g, [g[0], '  return b > 3 ? b : 0;', g[3]]]) {
+        const { target, here } = await of(g.join('\n'), [...fresh, ...rest].join('\n'));
+        expect(target.deleted, JSON.stringify(gap)).toEqual(rest === g ? undefined : [6]);
+        const body = here.find(m => m.mutatorName === 'BlockStatement' && m.location.start.line + 1 === 1 && m.location.end.line + 1 === 5);
+        expect(body && gates(target, loc(body)), JSON.stringify(gap)).toBe(true);
+      }
+    }
   });
 
   it('makes and gates the false condition of a for with no condition when every line of the loop changed', async () => {
@@ -1093,7 +1128,7 @@ describe('the widening, against what Stryker makes', () => {
     for (const line of [3, 4, 5, 6, 8, 9, 10]) expect(rangesOf(text, [line]), `line ${line}`).toEqual([[line, line]]);
   });
 
-  it('widens a changed comment-only line to nothing and gates nothing by it, inside an object or a condition too', async () => {
+  it('widens a changed comment-only line to itself only and gates nothing by it, inside an object or a condition too', async () => {
     const text = [
       'export function f(a: number, b: number) {',
       '  const table = {',
@@ -1108,7 +1143,7 @@ describe('the widening, against what Stryker makes', () => {
       '  if (a > 0 &&',
       '      // and b',
       '      b > 0) return table;',
-      '  return null;',
+      '  return a + b > 0;',
       '}',
     ].join('\n');
     const gating = async (changed: number[]) => {
@@ -1117,9 +1152,13 @@ describe('the widening, against what Stryker makes', () => {
       return here.filter(m => gates(target, { start: { line: m.location.start.line + 1, column: 1 }, end: { line: m.location.end.line + 1, column: 1 } }))
         .map(m => `${m.mutatorName} ${m.location.start.line + 1}-${m.location.end.line + 1}`);
     };
-    expect(rangesOf(text, [4])).toEqual([[4, 4]]);
-    expect(await gating([4])).toEqual([]);
-    expect(await gating([12])).toEqual([]);
+    // Alone such a line changes no code, so there is no target; beside a line of code elsewhere it widens to itself.
+    expect(changeTarget('src/a.ts', text, { changed: [4], deletedAfter: [] })).toBeNull();
+    expect(rangesOf(text, [4, 14])).toEqual([[4, 4], [14, 14]]);
+    const alone = await gating([14]);
+    expect(alone.length).toBeGreaterThan(0);
+    expect(await gating([4, 14])).toEqual(alone);
+    expect(await gating([12, 14])).toEqual(alone);
     // Beside a changed code line that takes the statement whole, the comment in the nested object gates nothing.
     const beside = await gating([3, 7]);
     expect(beside).toContain('ObjectLiteral 2-10');
@@ -1228,7 +1267,7 @@ describe('the targets', () => {
       'src/webui/public/app.jsx', 'src/bot/types.d.ts', 'src/bot/modules/x/module.json', 'src/a.ts', 'src/gone.ts', 'src/webui/public/new.js', 'src/mod/', 'tools/mod/',
     ]);
     expect(plan.skipped.every(s => s.why.length > 0)).toBe(true);
-    expect(plan.skipped.find(s => s.file === 'src/a.ts')?.why).toBe('no changed lines (a rename, a mode change, line endings only, or a file only taken out of the index)');
+    expect(plan.skipped.find(s => s.file === 'src/a.ts')?.why).toBe('no code changed (a rename, a mode change, line endings only, only blank lines or comments, or a file only taken out of the index)');
     expect(plan.skipped.find(s => s.file === 'src/mod/')?.why).toBe('an untracked git repository: git lists none of its files, so none is mutated');
     expect(plan.skipped.find(s => s.file === 'tools/mod/')?.why).toBe('outside src');
     expect(plan.targets).toEqual([wholeTarget('src/new.ts')]);
@@ -1237,6 +1276,20 @@ describe('the targets', () => {
     for (const file of ['src/a.mts', 'src/a.cts', 'src/a.tsx']) expect(notMutated(file), file).toBeNull();
     for (const file of ['src/a.d.mts', 'src/a.d.cts', 'src/a.d.ts']) expect(notMutated(file), file).toBe('not code');
     for (const file of ['src/a.mts', 'src/a.cts']) expect(holdsDataRoute(file, "export const root = <string>(process.env.ROOT || '/data');"), file).toBe(true);
+  });
+
+  it('does not mutate a file where only comments changed, and names code made a comment as code taken out', () => {
+    const lines = SAMPLE.split('\n');
+    const noted = [...lines.slice(0, 6), '    // the first key', ...lines.slice(6)].join('\n');
+    const commented = lines.map((line, i) => (i === 9 ? '  // return table.x;' : line)).join('\n');
+    const plan = planOf(
+      [{ status: 'M', file: 'src/noted.ts' }, { status: 'M', file: 'src/commented.ts' }],
+      [],
+      { 'src/noted.ts': noted, 'src/commented.ts': commented },
+      { 'src/noted.ts': SAMPLE, 'src/commented.ts': SAMPLE },
+    );
+    expect(plan.skipped).toEqual([{ file: 'src/noted.ts', why: NO_CODE_WHY }]);
+    expect(plan.targets).toEqual([{ file: 'src/commented.ts', ranges: [[10, 10]], gating: [], patterns: ['src/commented.ts:10-10'], deleted: [9] }]);
   });
 
   it('takes a file new to the mutated code whole, and names one moved out of it', () => {
@@ -1268,7 +1321,7 @@ describe('the targets', () => {
     );
     expect(plan.targets).toEqual([changeTarget('src/edited.ts', SAMPLE, { changed: [4], deletedAfter: [] }), wholeTarget('src/fresh.ts')]);
     expect(plan.skipped).toEqual([
-      { file: 'src/kept.ts', why: 'no changed lines (a rename, a mode change, line endings only, or a file only taken out of the index)' },
+      { file: 'src/kept.ts', why: NO_CODE_WHY },
       { file: 'src/gone.ts', why: 'deleted: nothing is left to mutate' },
     ]);
   });
@@ -1339,10 +1392,12 @@ describe('the targets', () => {
     expect(unmatchedPatterns([{ file: 'src/a.ts', patterns: ['src/a.ts:1-3'], gating: [2] }], [])).toEqual([]);
   });
 
-  it('widens a pure deletion to its neighbours as context only, and says where it was', () => {
-    expect(changeTarget('src/a.ts', SAMPLE, { changed: [], deletedAfter: [3] })).toEqual({ file: 'src/a.ts', ranges: [[2, 4]], gating: [], patterns: ['src/a.ts:2-4'], deleted: [3], own: [] });
-    expect(changeTarget('src/a.ts', SAMPLE, { changed: [7], deletedAfter: [] })).not.toHaveProperty('deleted');
-    expect(changeTarget('src/a.ts', SAMPLE, { changed: [7], deletedAfter: [] })).not.toHaveProperty('own');
+  it('names a place where code was taken out and widens nothing for it', () => {
+    expect(changeTarget('src/a.ts', SAMPLE, { changed: [], deletedAfter: [3] })).toEqual({ file: 'src/a.ts', ranges: [], gating: [], patterns: [], deleted: [3] });
+    const edited = changeTarget('src/a.ts', SAMPLE, { changed: [7], deletedAfter: [] });
+    expect(edited).not.toHaveProperty('deleted');
+    expect(changeTarget('src/a.ts', SAMPLE, { changed: [7], deletedAfter: [3] })).toEqual({ ...edited, deleted: [3] });
+    expect(changeTarget('src/a.ts', SAMPLE, { changed: [], deletedAfter: [] })).toBeNull();
   });
 
   it('gates the mutants that touch a changed line, and calls the rest context', () => {

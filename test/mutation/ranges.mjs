@@ -16,9 +16,9 @@ const { Minimatch, minimatch, escape } = strykerRequire('minimatch');
 /**
  * @typedef {[number, number]} Range first and last line, 1-based
  * @typedef {{ status: string, file: string, from?: string }} Entry a file git names as changed; from: a rename's old name
- * @typedef {{ file: string, ranges: Range[] | null, gating: number[] | null, patterns: string[], deleted?: number[], own?: Range[] }} Target
- *   ranges null: the whole file; deleted: where lines were taken out with fewer or none put back, each after the line
- *   named (0: the top); own: the ranges the changed lines widen to by themselves, when a deletion's neighbours widen too
+ * @typedef {{ file: string, ranges: Range[] | null, gating: number[] | null, patterns: string[], deleted?: number[] }} Target
+ *   ranges null: the whole file; deleted: where lines of code were taken out with fewer or none put back, each after
+ *   the line named (0: the top)
  * @typedef {{ start: { line: number, column: number }, end: { line: number, column: number } }} Location
  */
 
@@ -174,8 +174,10 @@ export function commonLines(a, b) {
 /**
  * What changed from `before` to `after`, as lines of `after` (from 1): the
  * lines no longest common subsequence of the two keeps, and the lines after
- * which lines of `before` were taken out with fewer or none put back (0:
- * before the first line; a line replaced one for one is only changed). Lines
+ * which lines of code (a token on them) were taken out with fewer or none put
+ * back (0: before the first line; a line of code made a comment or a blank line
+ * counts, a line replaced one for one by code is only changed). Each text is
+ * read as its name says (`file`, `baseFile`). Lines
  * end at LF or CRLF, so line endings alone change nothing. The lines added in
  * one place, or only taken out, count also over each unchanged line beside
  * them that repeats one of them, and on through each further one that does (an
@@ -187,11 +189,21 @@ export function commonLines(a, b) {
  * change moves it into or out of a block (mutation/README.md).
  * @param {string} before
  * @param {string} after
+ * @param {string} [file] the name `after` is read under
+ * @param {string} [baseFile] the name `before` is read under
  * @returns {{ changed: number[], deletedAfter: number[] }}
  */
-export function lineDiff(before, after) {
+export function lineDiff(before, after, file = 'a.ts', baseFile = file) {
   const a = splitLines(before);
   const b = splitLines(after);
+  const codeOut = splitTokenLines(baseFile, before);
+  const codeIn = splitTokenLines(file, after);
+  /**
+   * @param {Set<number>} code
+   * @param {number} from
+   * @param {number} to
+   */
+  const count = (code, from, to) => Array.from({ length: to - from }, (_, k) => from + k + 1).filter(n => code.has(n)).length;
   const pairs = commonLines(a, b);
   const partner = new Int32Array(a.length).fill(-1);
   for (const [i, j] of pairs) partner[i] = j;
@@ -209,15 +221,14 @@ export function lineDiff(before, after) {
     const added = new Set(b.slice(j0, j1));
     for (let t = 1; i0 - t >= 0 && partner[i0 - t] === j0 - t && added.has(b[j0 - t]); t++) changed.add(j0 - t + 1);
     for (let t = 0; i1 + t < a.length && partner[i1 + t] === j1 + t && added.has(b[j1 + t]); t++) changed.add(j1 + t + 1);
-    if (j1 === j0 && i1 > i0) {
+    // More lines of code taken out than put back (a line deleted, or made a comment, beside an edited one or not; a
+    // block taken away and its body re-indented).
+    if (count(codeOut, i0, i1) > count(codeIn, j0, j1)) deletedAfter.add(j0);
+    if (j1 === j0 && count(codeOut, i0, i1) > 0) {
       // Taken out only: the same, for the places in `after` where it could have been.
-      deletedAfter.add(j0);
       const taken = new Set(a.slice(i0, i1));
       for (let t = 1; i0 - t >= 0 && partner[i0 - t] === j0 - t && taken.has(a[i0 - t]); t++) deletedAfter.add(j0 - t);
       for (let t = 0; i1 + t < a.length && partner[i1 + t] === j0 + t && taken.has(a[i1 + t]); t++) deletedAfter.add(j0 + t + 1);
-    } else if (i1 - i0 > j1 - j0) {
-      // More taken out than put back (a line deleted beside an edited one, a block taken away and its body re-indented).
-      deletedAfter.add(j0);
     }
     pi = i;
     pj = j;
@@ -307,8 +318,8 @@ function unitsOf(sf, line) {
   const lineStart = starts[line - 1];
   const code = sf.text.slice(lineStart, line < starts.length ? starts[line] : sf.text.length);
   const first = code.search(/\S/);
-  if (first < 0) return [];
-  const span = { start: lineStart + first, end: lineStart + code.trimEnd().length };
+  // A blank line reaches here only inside a token (a multi-line template): it widens as the token's other lines do.
+  const span = first < 0 ? { start: lineStart, end: lineStart } : { start: lineStart + first, end: lineStart + code.trimEnd().length };
   /** @param {number} pos */
   const lineOf = pos => sf.getLineAndCharacterOfPosition(pos).line + 1;
   /** @type {Range[]} */
@@ -348,7 +359,7 @@ function unitsOf(sf, line) {
 /**
  * The merged ranges for a file's changed lines (each line itself, plus what it
  * widens to). A line that holds no token (blank, or a comment only) widens to
- * nothing: inside an object or a call it would otherwise take the statement.
+ * itself only: inside an object or a call it would otherwise take the statement.
  * @param {string} file
  * @param {string} text
  * @param {number[]} lines
@@ -375,11 +386,10 @@ const STRUCTURE = new Set([
  * JSDoc block's; brackets and separators count only when `structure` is set.
  * @param {ts.SourceFile} sf
  * @param {boolean} structure
+ * @param {(pos: number) => number} [lineOf] the 1-based line a position is on (TypeScript's lines by default)
  * @returns {Set<number>}
  */
-function heldLines(sf, structure) {
-  /** @param {number} pos */
-  const lineOf = pos => sf.getLineAndCharacterOfPosition(pos).line + 1;
+function heldLines(sf, structure, lineOf = pos => sf.getLineAndCharacterOfPosition(pos).line + 1) {
   /** @type {Set<number>} */
   const held = new Set();
   /** @param {ts.Node} node */
@@ -396,7 +406,8 @@ function heldLines(sf, structure) {
 
 /**
  * The lines among `lines` that hold a token, brackets and separators included:
- * a blank or comment-only line changes no code, so it neither widens nor gates.
+ * a blank or comment-only line changes no code, so it widens only to itself and
+ * never gates.
  * @param {string} file
  * @param {string} text
  * @param {number[]} lines
@@ -404,6 +415,30 @@ function heldLines(sf, structure) {
 export function tokenLines(file, text, lines) {
   const held = heldLines(parse(file, text), true);
   return lines.filter(line => held.has(line));
+}
+
+/**
+ * The lines that hold a token, brackets and separators included, numbered as
+ * lineDiff splits them (at LF or CRLF only): TypeScript also ends a line at a
+ * lone CR or a line separator, which a base text may hold.
+ * @param {string} file
+ * @param {string} text
+ */
+function splitTokenLines(file, text) {
+  const starts = [0];
+  for (let at = text.indexOf('\n'); at >= 0; at = text.indexOf('\n', at + 1)) starts.push(at + 1);
+  /** @param {number} pos */
+  const lineOf = pos => {
+    let low = 0;
+    let high = starts.length - 1;
+    while (low < high) {
+      const mid = (low + high + 1) >> 1;
+      if (starts[mid] <= pos) low = mid;
+      else high = mid - 1;
+    }
+    return low + 1;
+  };
+  return heldLines(parse(file, text), true, lineOf);
 }
 
 /**
@@ -498,30 +533,25 @@ export function untouched(file, text, lines, spans) {
 export const changedArgs = base => ['diff', '--name-status', '-z', '-M', '-l0', '--ignore-submodules=none', '--no-relative', '--no-ext-diff', '--no-textconv', base, '--'];
 
 /**
- * The target for a file's changed lines. `gating` lists them: a mutant that
- * touches one of them must be killed; the others in the widened ranges are
- * context, run and listed but never gating. A place where lines were taken out
- * with fewer or none put back widens its two neighbouring lines as context, and
- * `deleted` names it, for what was taken out is left nowhere to mutate. What
- * only those neighbours bring in (the emptying of a body around the changed
- * lines) stays context: a mutant gates only inside `own`, the ranges the changed
- * lines widen to by themselves. Null when the change leaves no line to mutate.
+ * The target for a file's changed lines, widened. `gating` lists those that
+ * hold code (a token): a mutant that touches one must be killed; the others in
+ * the widened ranges are context, run and listed but never gating. `deleted`
+ * names each place where lines of code were taken out with fewer or none put
+ * back, for what was taken out is left nowhere to mutate; the lines beside it
+ * are mutated only where a changed line widens to them. Null when no changed
+ * line holds code and no code was taken out.
  * @param {string} file the name to mutate it under
  * @param {string} text
  * @param {{ changed: number[], deletedAfter: number[] }} change
  * @returns {Target | null}
  */
 export function changeTarget(file, text, { changed, deletedAfter }) {
-  const lineCount = text.split('\n').length;
-  const neighbours = deletedAfter.flatMap(n => [n, n + 1]).filter(n => n >= 1 && n <= lineCount);
-  const lines = [...new Set([...changed, ...neighbours])];
-  if (lines.length === 0) return null;
-  const ranges = widen(file, text, lines);
-  // A changed line that holds no token (a comment) changes no code, so it gates nothing.
-  const coded = tokenLines(file, text, changed);
+  const gating = [...new Set(tokenLines(file, text, changed))].sort((a, b) => a - b);
+  if (gating.length === 0 && deletedAfter.length === 0) return null;
+  const ranges = widen(file, text, changed);
   return {
-    file, ranges, gating: [...new Set(coded)].sort((a, b) => a - b), patterns: ranges.map(([start, end]) => `${file}:${start}-${end}`),
-    ...(deletedAfter.length > 0 ? { deleted: deletedAfter, own: widen(file, text, coded) } : {}),
+    file, ranges, gating, patterns: ranges.map(([start, end]) => `${file}:${start}-${end}`),
+    ...(deletedAfter.length > 0 ? { deleted: deletedAfter } : {}),
   };
 }
 
@@ -596,9 +626,9 @@ export function planChange({ entries, untracked, read, readBase, nameOf, isDir =
     if (holdsDataRoute(entry.file, text)) { skipped.push({ file: entry.file, why: DATA_ROUTE_WHY }); continue; }
     const before = entry.status === 'A' || entry.status === 'C' ? null : entry.from ?? entry.file;
     if (before === null || notMutated(before) !== null) { targets.push(wholeTarget(name)); continue; }
-    const target = changeTarget(name, text, lineDiff(readBase(before), text));
+    const target = changeTarget(name, text, lineDiff(readBase(before), text, name, before));
     if (target) targets.push(target);
-    else skipped.push({ file: entry.file, why: 'no changed lines (a rename, a mode change, line endings only, or a file only taken out of the index)' });
+    else skipped.push({ file: entry.file, why: NO_CODE_WHY });
   }
   for (const file of untracked) {
     if (file.startsWith('src/') && file.endsWith('/')) {
@@ -620,6 +650,8 @@ export function planChange({ entries, untracked, read, readBase, nameOf, isDir =
 }
 
 export const GLOB_NAME_WHY = 'its name holds characters Stryker reads as a glob, so it cannot be given to Stryker; rename it';
+
+export const NO_CODE_WHY = 'no code changed (a rename, a mode change, line endings only, only blank lines or comments, or a file only taken out of the index)';
 
 /**
  * Why a file in src is not mutated when its name leads, through a link, to a
@@ -844,21 +876,19 @@ export const unmatchedPatterns = (targets, mutants) => targets
 
 /**
  * Whether a mutant (1-based lines, as Stryker reports them) touches a gating
- * line and, for a target that holds `own`, lies inside one of those ranges.
- * @param {{ gating: number[] | null, own?: Range[] }} target
+ * line.
+ * @param {{ gating: number[] | null }} target
  * @param {Location} location
  */
 export function gates(target, location) {
-  if (target.gating === null) return true;
-  const own = target.own;
-  return target.gating.some(n => location.start.line <= n && n <= location.end.line)
-    && (!own || own.some(([start, end]) => start <= location.start.line && location.end.line <= end));
+  return target.gating === null || target.gating.some(n => location.start.line <= n && n <= location.end.line);
 }
 
 /**
  * Whether a mutant of `file` gates for any target that names the file: two can
- * (a link and the file it leads to, both changed), each with its own diff.
- * @param {{ file: string, gating: number[] | null, own?: Range[] }[]} targets
+ * (a link and the file it leads to, both changed), each with its own diff, and
+ * together they mutate and gate as one diff of all their changed lines would.
+ * @param {{ file: string, gating: number[] | null }[]} targets
  * @param {string} file
  * @param {Location} location
  */

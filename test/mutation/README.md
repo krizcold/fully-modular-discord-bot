@@ -40,7 +40,7 @@ From the bot root, with Node 22.12 or newer (or SMDB_TEST_NODE set, as for `npm 
   move whose new name is not staged (a plain `mv`, an editor's rename), or one that changed most of the file. A file
   only taken out of the index (`git rm --cached`, kept on disk and not ignored) is diffed against the base as a changed
   one; one git ignores is out of the tree, so it is a deletion. Two changed names that lead to one file on disk (a link
-  in src and the file it leads to) each gate their own changed lines in it.
+  in src and the file it leads to) are mutated and gated as one diff of all their changed lines would be.
 - `--mutate src/x.ts:10-20` (a file in the bot root that exists and that a diff would mutate, or such a file and lines,
   repeatable; never a glob, never columns, never the suite's own files) skips git's diff (git still lists the tree, which
   is what a sandbox holds); every mutant it makes gates. A file git neither tracks nor would add (one it ignores, or one
@@ -84,10 +84,12 @@ does not name by its content.
   `router.get('/x', async (req, res) => {`, a `});`, a property whose value is an arrow with a body, a method of an
   object or of a class expression) takes its whole statement: the body runs as context, and its emptying, which
   touches the line, gates.
-- A changed line that holds no token (blank, or a comment only) changes no code: it widens to nothing and gates nothing,
-  so a job that changes only comments makes no gating mutant (NO RESULT), and a comment edited inside an object or a
-  call brings in none of its mutants.
-- **Gating** mutants touch a changed line. Some that touch one are not made: one that touches it only through a block
+- A changed line that holds no token (blank, or a comment only; a blank line inside a multi-line template holds one)
+  changes no code: it widens to itself only and gates nothing, so a comment edited inside an object or a call brings in
+  none of its mutants. It still joins the ranges on either side of it, so a new function whose body holds a blank line
+  is made whole. A file where only such lines changed, and no code was taken out, is not mutated (below); a line of
+  code made a comment or a blank line is code taken out (below).
+- **Gating** mutants touch a changed line that holds code. Some that touch one are not made: one that touches it only through a block
   holding the line (the emptying of that block, or the whole callback around it), the emptying of the body of a
   compound statement or declaration (above), or of a bare block, that only begins or ends on the changed line: its
   header or its closing brace, and the false condition Stryker gives a `for` with no condition, which spans the whole
@@ -101,17 +103,17 @@ does not name by its content.
   starts on the label line and ends the clause), and then gates as any mutant does; otherwise a changed label widens
   to the label only and a body line to its statement within the clause, and neither makes it. A changed label is in
   the structure list, and in the no-mutant list too when no mutant lies wholly on its line (`case 1:` alone, not
-  `case 1: return 1;`). Each of these exceptions holds outside a statement a changed line, or a deletion's neighbour,
-  takes whole: there one range holds everything inside it, and what only a neighbour brings in is context (below). A block wholly made of
+  `case 1: return 1;`). Each of these exceptions holds outside a statement a changed line takes whole: there one range
+  holds everything inside it. A block wholly made of
   changed lines is made, and so is every other body's emptying. unit/mutationRanges.test.ts holds this rule to
   Stryker's own instrumenter, line by line, both what is made and what is not, on made-up shapes and on two real files.
 - The other mutants in the widened ranges are **context**: they run in pass A and are listed, but never fail the gate.
-- What was taken out has no line left to mutate. A pure deletion's two neighbouring lines are context only, and so is
-  whatever their widening alone brings in (the emptying of the body around the changed lines): a mutant gates only
-  inside what the changed lines widen to by themselves. The report names each place where lines were taken out with
-  fewer or none put back (a pure deletion, a line deleted beside an edited one, a block taken away with its body
-  re-indented), so a reviewer checks the code around each; a line replaced one for one, or a block taken away where as
-  many or more lines are put back, shows only as changed lines.
+- What was taken out has no line left to mutate, and the lines beside it are mutated only where a changed line widens
+  to them. The report names each place where lines of code (a token on them) were taken out with fewer or none put
+  back (a pure deletion, a line deleted beside an edited one, one made a comment or a blank line, a block taken away with
+  its body re-indented), so a reviewer checks the code around each; a line of code replaced one for one by code, or a
+  block taken away where as many or more lines of code are put back, shows only as changed lines. A job that only
+  takes code out makes no mutant: the gate names the places and ends NO RESULT, with no pass run.
 - Lines added in one place, or only taken out, count also over each unchanged line beside them that repeats one of
   them, and on through each further one that does (an `if` block added after an equal one counts in both places, an
   edited line beside it or not): every place their first or last lines, or the whole run, could slide to passes only
@@ -126,8 +128,8 @@ does not name by its content.
   heading, mutants of their own or not: a line of brackets and separators only, one holding a brace of a block (a
   header's `{`, a closer with code of its own such as `} while (x);` or `}).catch(log);`), and one holding an `else`,
   `case`, `default` (in a switch), `catch` or `finally`, so a reviewer checks the lines beside each; a block taken
-  away (its header and bracket deleted) is named with the places lines were taken out when fewer lines are put back
-  there. Not named: a block taken away where as many or more lines are put back, and a line moved into or out of a
+  away (its header and bracket deleted) is named with the places code was taken out when fewer lines of code are put
+  back there. Not named: a block taken away where as many or more lines of code are put back, and a line moved into or out of a
   braceless body (an `if (x)` with no brace put above a line, or lines swapped below one); a reviewer reads each
   changed braceless header for these.
 - git does not look at every file: not at one its index marks assume-unchanged or skip-worktree (core.ignoreStat marks
@@ -144,8 +146,8 @@ does not name by its content.
   compiled, and no test loads them yet), a file deleted or moved out of src, an untracked git repository (git lists
   none of its files, and none is copied into a sandbox) or a git submodule under src, a file whose name Stryker would read as a glob (`[id].ts`,
   `a{1,2}.ts`; rename it), a file in src that is a link to one that is not mutated (the suite's own env scrub, say),
-  a change that leaves no line changed (a rename git sees, a mode change, line endings only, a file only taken out of
-  the index), and a
+  a change that leaves no code changed (a rename git sees, a mode change, line endings only, only blank lines or
+  comments, a file only taken out of the index), and a
   file that holds a line break Stryker counts and the gate does not (a lone CR, U+2028 or U+2029), whose lines the two
   would number differently; `--mutate` refuses such a file.
 - Never mutated, on any machine, and named: a file whose code names the DATA_DIR variable or holds `'/data'` as a
@@ -291,7 +293,7 @@ can hold the port or the path, and a run before it can leave the path behind. Fa
 `test/mutation/reports/<time>-<process id>/` (ignored by git; delete it whenever you like):
 
 - `summary.txt` is the L5 report for the review packet: the scope, what was not mutated and why, patterns or lines no
-  mutant touched, the changed lines that can move others, the places lines were taken out, the gating mutants by
+  mutant touched, the changed lines that can move others, the places code was taken out, the gating mutants by
   outcome, every survivor, silenced and inconclusive mutant with its place and replacement (with why a kill or timeout
   did not count), the confirmed timeouts, the context mutants, the runs with no mutant after the reruns, why the gate
   stopped or which files changed during the run, and the verdict.

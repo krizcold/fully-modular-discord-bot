@@ -20,7 +20,7 @@ import { COMMON, PASSES } from './passes.mjs';
  * @typedef {import('./verdict.mjs').MutantRecord} MutantRecord
  * @typedef {import('./verdict.mjs').PassName} PassName
  * @typedef {import('./verdict.mjs').PassResult} PassResult
- * @typedef {{ file: string, patterns: string[], gating: number[] | null, deleted?: number[], own?: [number, number][] }} PassTarget
+ * @typedef {{ file: string, patterns: string[], gating: number[] | null, deleted?: number[] }} PassTarget
  * @typedef {{ id: string, fileName: string, location: Location, mutatorName: string, replacement?: string, status: string, statusReason?: string }} StrykerResult
  * @typedef {import('@stryker-mutator/api/core').PartialStrykerOptions} Options
  */
@@ -421,8 +421,9 @@ try {
     ({ targets, skipped, emptyScope } = planFromGit({ git, base, root, read: file => linesOf(file).join('\n') }));
     scope = `the change from ${opts.base} (merge-base ${base.slice(0, 7)}) to the working tree`;
   }
-  if (targets.length === 0) await finish();
-
+  // Nothing that could gate (only places where code was taken out): the report names them, and Stryker is never
+  // given an empty list to mutate.
+  if (!targets.some(target => target.gating === null || target.gating.length > 0)) await finish();
 
   console.log(`L5: mutating ${scope}: ${changedFiles().length} file(s), pass A (in-process tests that import them)`);
   // The type checker judges the tree's files only (ranges.mjs treeTsconfig, beyondTree).
