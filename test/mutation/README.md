@@ -35,9 +35,12 @@ From the bot root, with Node 22.12 or newer (or SMDB_TEST_NODE set, as for `npm 
   committed, pass `--base` the commit before it; `--base main` takes everything since the merge-base with main (a
   branch). A file new to src is taken whole: an untracked one, one added, and one moved in from outside src (or from a
   browser view, or from a name that is not code). A file renamed within src gates its changed lines only when git sees
-  the rename, that is when the new name is staged (`git add`, or `git add -N`): a move git does not see (a plain `mv`,
-  an editor's rename) is a deletion and an untracked file, which is taken whole. A file only taken out of the index
-  (`git rm --cached`, kept on disk) is diffed against the base as a changed one.
+  the rename: the new name is staged (`git add`, or `git add -N`) and the file is like enough to the old one for git's
+  own measure (half its content, by default) to pair them. Otherwise it is a deletion and a new file, taken whole: a
+  move whose new name is not staged (a plain `mv`, an editor's rename), or one that changed most of the file. A file
+  only taken out of the index (`git rm --cached`, kept on disk and not ignored) is diffed against the base as a changed
+  one; one git ignores is out of the tree, so it is a deletion. Two changed names that lead to one file on disk (a link
+  in src and the file it leads to) each gate their own changed lines in it.
 - `--mutate src/x.ts:10-20` (a file in the bot root that exists and that a diff would mutate, or such a file and lines,
   repeatable; never a glob, never columns, never the suite's own files) skips git's diff (git still lists the tree, which
   is what a sandbox holds); every mutant it makes gates. A file git neither tracks nor would add (one it ignores, or one
@@ -81,6 +84,9 @@ does not name by its content.
   `router.get('/x', async (req, res) => {`, a `});`, a property whose value is an arrow with a body, a method of an
   object or of a class expression) takes its whole statement: the body runs as context, and its emptying, which
   touches the line, gates.
+- A changed line that holds no token (blank, or a comment only) changes no code: it widens to nothing and gates nothing,
+  so a job that changes only comments makes no gating mutant (NO RESULT), and a comment edited inside an object or a
+  call brings in none of its mutants.
 - **Gating** mutants touch a changed line. Some that touch one are not made: one that touches it only through a block
   holding the line (the emptying of that block, or the whole callback around it), the emptying of the body of a
   compound statement or declaration (above), or of a bare block, that only begins or ends on the changed line: its
@@ -95,8 +101,8 @@ does not name by its content.
   starts on the label line and ends the clause), and then gates as any mutant does; otherwise a changed label widens
   to the label only and a body line to its statement within the clause, and neither makes it. A changed label is in
   the structure list, and in the no-mutant list too when no mutant lies wholly on its line (`case 1:` alone, not
-  `case 1: return 1;`). Each of these exceptions holds outside a statement a changed line takes whole, where one range
-  holds everything inside it. A block wholly made of
+  `case 1: return 1;`). Each of these exceptions holds outside a statement a changed line, or a deletion's neighbour,
+  takes whole: there one range holds everything inside it, and what only a neighbour brings in is context (below). A block wholly made of
   changed lines is made, and so is every other body's emptying. unit/mutationRanges.test.ts holds this rule to
   Stryker's own instrumenter, line by line, both what is made and what is not, on made-up shapes and on two real files.
 - The other mutants in the widened ranges are **context**: they run in pass A and are listed, but never fail the gate.
@@ -138,7 +144,8 @@ does not name by its content.
   compiled, and no test loads them yet), a file deleted or moved out of src, an untracked git repository (git lists
   none of its files, and none is copied into a sandbox) or a git submodule under src, a file whose name Stryker would read as a glob (`[id].ts`,
   `a{1,2}.ts`; rename it), a file in src that is a link to one that is not mutated (the suite's own env scrub, say),
-  a change that leaves no line changed (a rename git sees, a mode change, line endings only), and a
+  a change that leaves no line changed (a rename git sees, a mode change, line endings only, a file only taken out of
+  the index), and a
   file that holds a line break Stryker counts and the gate does not (a lone CR, U+2028 or U+2029), whose lines the two
   would number differently; `--mutate` refuses such a file.
 - Never mutated, on any machine, and named: a file whose code names the DATA_DIR variable or holds `'/data'` as a

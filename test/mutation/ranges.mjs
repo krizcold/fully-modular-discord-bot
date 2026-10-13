@@ -346,7 +346,9 @@ function unitsOf(sf, line) {
 }
 
 /**
- * The merged ranges for a file's changed lines (each line itself, plus what it widens to).
+ * The merged ranges for a file's changed lines (each line itself, plus what it
+ * widens to). A line that holds no token (blank, or a comment only) widens to
+ * nothing: inside an object or a call it would otherwise take the statement.
  * @param {string} file
  * @param {string} text
  * @param {number[]} lines
@@ -354,9 +356,10 @@ function unitsOf(sf, line) {
  */
 export function widen(file, text, lines) {
   const sf = parse(file, text);
+  const held = heldLines(sf, true);
   /** @type {Range[]} */
   const ranges = [];
-  for (const line of lines) ranges.push([line, line], ...unitsOf(sf, line));
+  for (const line of lines) ranges.push([line, line], ...(held.has(line) ? unitsOf(sf, line) : []));
   return mergeRanges(ranges);
 }
 
@@ -366,6 +369,42 @@ const STRUCTURE = new Set([
   ts.SyntaxKind.OpenBracketToken, ts.SyntaxKind.CloseBracketToken, ts.SyntaxKind.SemicolonToken, ts.SyntaxKind.CommaToken,
   ts.SyntaxKind.EndOfFileToken,
 ]);
+
+/**
+ * The lines a token starts on or runs across (a multi-line template), never a
+ * JSDoc block's; brackets and separators count only when `structure` is set.
+ * @param {ts.SourceFile} sf
+ * @param {boolean} structure
+ * @returns {Set<number>}
+ */
+function heldLines(sf, structure) {
+  /** @param {number} pos */
+  const lineOf = pos => sf.getLineAndCharacterOfPosition(pos).line + 1;
+  /** @type {Set<number>} */
+  const held = new Set();
+  /** @param {ts.Node} node */
+  const walk = node => {
+    if (node.kind >= ts.SyntaxKind.FirstJSDocNode && node.kind <= ts.SyntaxKind.LastJSDocNode) return;
+    const children = node.getChildren(sf);
+    if (children.length > 0) { children.forEach(walk); return; }
+    if ((!structure && STRUCTURE.has(node.kind)) || node.getStart(sf) === node.getEnd()) return;
+    for (let n = lineOf(node.getStart(sf)); n <= lineOf(node.getEnd() - 1); n++) held.add(n);
+  };
+  walk(sf);
+  return held;
+}
+
+/**
+ * The lines among `lines` that hold a token, brackets and separators included:
+ * a blank or comment-only line changes no code, so it neither widens nor gates.
+ * @param {string} file
+ * @param {string} text
+ * @param {number[]} lines
+ */
+export function tokenLines(file, text, lines) {
+  const held = heldLines(parse(file, text), true);
+  return lines.filter(line => held.has(line));
+}
 
 /**
  * The lines that hold code: a token other than a bracket or a separator starts
@@ -378,21 +417,8 @@ const STRUCTURE = new Set([
  * @param {number[]} lines
  */
 export function codeLines(file, text, lines) {
-  const sf = parse(file, text);
-  /** @param {number} pos */
-  const lineOf = pos => sf.getLineAndCharacterOfPosition(pos).line + 1;
-  /** @type {Set<number>} */
-  const withCode = new Set();
-  /** @param {ts.Node} node */
-  const walk = node => {
-    if (node.kind >= ts.SyntaxKind.FirstJSDocNode && node.kind <= ts.SyntaxKind.LastJSDocNode) return;
-    const children = node.getChildren(sf);
-    if (children.length > 0) { children.forEach(walk); return; }
-    if (STRUCTURE.has(node.kind) || node.getStart(sf) === node.getEnd()) return;
-    for (let n = lineOf(node.getStart(sf)); n <= lineOf(node.getEnd() - 1); n++) withCode.add(n);
-  };
-  walk(sf);
-  return lines.filter(line => withCode.has(line));
+  const held = heldLines(parse(file, text), false);
+  return lines.filter(line => held.has(line));
 }
 
 // Keywords that open the next part of a statement: a changed line holding one
@@ -491,9 +517,11 @@ export function changeTarget(file, text, { changed, deletedAfter }) {
   const lines = [...new Set([...changed, ...neighbours])];
   if (lines.length === 0) return null;
   const ranges = widen(file, text, lines);
+  // A changed line that holds no token (a comment) changes no code, so it gates nothing.
+  const coded = tokenLines(file, text, changed);
   return {
-    file, ranges, gating: [...new Set(changed)].sort((a, b) => a - b), patterns: ranges.map(([start, end]) => `${file}:${start}-${end}`),
-    ...(deletedAfter.length > 0 ? { deleted: deletedAfter, own: widen(file, text, changed) } : {}),
+    file, ranges, gating: [...new Set(coded)].sort((a, b) => a - b), patterns: ranges.map(([start, end]) => `${file}:${start}-${end}`),
+    ...(deletedAfter.length > 0 ? { deleted: deletedAfter, own: widen(file, text, coded) } : {}),
   };
 }
 
@@ -503,6 +531,25 @@ export function changeTarget(file, text, { changed, deletedAfter }) {
  * @returns {Target}
  */
 export const wholeTarget = file => ({ file, ranges: null, gating: null, patterns: [file] });
+
+/**
+ * The patterns pass A gives Stryker, one set per file. Two targets can name one
+ * file (a link and the file it leads to, both changed): the file is taken whole
+ * when one of them takes it whole, or else by their ranges merged, since Stryker
+ * makes a mutant only where one range holds it. --mutate patterns stay as given.
+ * @param {{ file: string, patterns: string[], ranges?: Range[] | null }[]} targets
+ * @returns {string[]}
+ */
+export function mutatePatterns(targets) {
+  return [...new Set(targets.map(target => target.file))].flatMap(file => {
+    const of = targets.filter(target => target.file === file);
+    if (of.length === 1) return of[0].patterns;
+    if (of.some(target => target.patterns.includes(file))) return [file];
+    const ranges = of.map(target => target.ranges);
+    if (ranges.every(Array.isArray)) return mergeRanges(ranges.flat()).map(([start, end]) => `${file}:${start}-${end}`);
+    return of.flatMap(target => target.patterns);
+  });
+}
 
 /**
  * The mutate targets for a change, and every changed file it does not mutate,
@@ -551,7 +598,7 @@ export function planChange({ entries, untracked, read, readBase, nameOf, isDir =
     if (before === null || notMutated(before) !== null) { targets.push(wholeTarget(name)); continue; }
     const target = changeTarget(name, text, lineDiff(readBase(before), text));
     if (target) targets.push(target);
-    else skipped.push({ file: entry.file, why: 'no changed lines (a rename, a mode change, or line endings only)' });
+    else skipped.push({ file: entry.file, why: 'no changed lines (a rename, a mode change, line endings only, or a file only taken out of the index)' });
   }
   for (const file of untracked) {
     if (file.startsWith('src/') && file.endsWith('/')) {
@@ -807,3 +854,12 @@ export function gates(target, location) {
   return target.gating.some(n => location.start.line <= n && n <= location.end.line)
     && (!own || own.some(([start, end]) => start <= location.start.line && location.end.line <= end));
 }
+
+/**
+ * Whether a mutant of `file` gates for any target that names the file: two can
+ * (a link and the file it leads to, both changed), each with its own diff.
+ * @param {{ file: string, gating: number[] | null, own?: Range[] }[]} targets
+ * @param {string} file
+ * @param {Location} location
+ */
+export const gatesIn = (targets, file, location) => targets.filter(target => target.file === file).some(target => gates(target, location));

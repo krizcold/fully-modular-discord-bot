@@ -54,8 +54,8 @@ try {
   process.exit(2);
 }
 const {
-  structureLines, DATA_ROUTE_WHY, EXTRA_BREAK_WHY, GLOB_NAME_WHY, beyondTree, gates, holdsDataRoute, holdsExtraBreak, linesOfTarget, notMutated, planFromGit,
-  rootGlobFree, sandboxPatterns, strykerTakes, treeTsconfig, unmatchedPatterns, untouched,
+  structureLines, DATA_ROUTE_WHY, EXTRA_BREAK_WHY, GLOB_NAME_WHY, beyondTree, gatesIn, holdsDataRoute, holdsExtraBreak, linesOfTarget, mutatePatterns, notMutated,
+  planFromGit, rootGlobFree, sandboxPatterns, strykerTakes, treeTsconfig, unmatchedPatterns, untouched,
 } = ranges;
 const { byKiller, classifyKill, judge, onlyUnusedDirective, outcome, toConfirm, toPassB, toUncheck } = verdicts;
 
@@ -433,20 +433,19 @@ try {
     throw new PassError(`the type checker would judge ${beyond.join(', ')}, which a file in the tree imports or references but no sandbox holds, so a mutant that broke only it would count as killed with no test run`);
   }
   fs.writeFileSync(path.join(root, checkerConfig), `${JSON.stringify(checker, null, 2)}\n`);
-  const resultsA = await pass({ name: 'a', dir: 'a', tier: 'a', mutate: targets.flatMap(t => t.patterns), extra: { ...PASSES.a, concurrency: opts.concurrency, tsconfigFile: checkerConfig } })
+  const resultsA = await pass({ name: 'a', dir: 'a', tier: 'a', mutate: mutatePatterns(targets), extra: { ...PASSES.a, concurrency: opts.concurrency, tsconfigFile: checkerConfig } })
     .finally(() => fs.rmSync(path.join(root, checkerConfig), { force: true }));
   const orphans = [...new Set(resultsA.map(fileOf).filter(file => !targets.some(t => t.file === file)))];
   if (orphans.length > 0) throw new PassError(`Stryker mutated ${orphans.join(', ')}, which no target names, so the report could not answer for it`);
   mutants = resultsA.map(r => {
     const file = fileOf(r);
-    const target = targets.find(t => t.file === file);
     return {
       file,
       location: r.location,
       mutator: r.mutatorName,
       original: originalOf(file, r.location),
       replacement: r.replacement ?? '',
-      gating: target ? gates(target, r.location) : true,
+      gating: gatesIn(targets, file, r.location),
       passes: { a: resultOf('a', r) },
     };
   });
