@@ -1,14 +1,13 @@
-import { spawn, spawnSync } from 'child_process';
+import { spawnSync } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { pathToFileURL } from 'url';
 import { afterEach, describe, expect, it, onTestFinished, vi } from 'vitest';
-import { pastBudget, runControl } from '../mutation/control.mjs';
+import { pastBudget } from '../mutation/control.mjs';
 
-// The command every mutant run executes (mutation/runner.mjs) and the run with
-// no mutant after the reruns (mutation/control.mjs), against a stand-in for
-// vitest that records how it was called and fails the tiers it is told to.
+// The command every mutant run executes (mutation/runner.mjs), against a
+// stand-in for vitest that records how it was called and fails the tiers it is
+// told to; and the time check of the run with no mutant after the reruns.
 
 const root = path.resolve(__dirname, '..', '..');
 
@@ -135,80 +134,6 @@ describe('a pass on some of the mutants Stryker made', () => {
 });
 
 describe('the run with no mutant after the reruns', () => {
-  it('runs the reruns\' tests their way with no active mutant, and fails when a tier fails', async () => {
-    const failing = fakeVitest(['child']);
-    const env = { ...process.env, SMDB_MUTATION_VITEST: failing.script, __STRYKER_ACTIVE_MUTANT__: '7' };
-    expect(await runControl({ root, out: failing.out, tier: 'b', files: ['src/a.ts'], only: ['child/fleetIdentity.test.ts'], env }))
-      .toEqual({ passed: false, why: 'exit 1' });
-    const calls = failing.read();
-    expect(calls.map(call => [call.project, call.mutant, call.scale])).toEqual([['child', null, '4']]);
-    expect(calls[0].args.slice(0, 2)).toEqual(['run', 'child/fleetIdentity.test.ts']);
-
-    const passing = fakeVitest([]);
-    expect(await runControl({ root, out: passing.out, tier: 'a', files: ['src/a.ts'], only: [], env: { ...env, SMDB_MUTATION_VITEST: passing.script } }))
-      .toEqual({ passed: true, why: '' });
-    expect(passing.read().map(call => [call.project, call.scale])).toEqual([['fast', '4']]);
-  });
-
-  /** A stand-in for vitest that starts a process of its own, then hangs; and whether that process still runs. */
-  function hangingVitest() {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-hang-'));
-    onTestFinished(() => fs.rmSync(dir, { recursive: true, force: true }));
-    const pidFile = path.join(dir, 'grandchild.pid');
-    const script = path.join(dir, 'vitest.cjs');
-    fs.writeFileSync(script, [
-      "const { spawn } = require('child_process');",
-      "const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });",
-      `require('fs').writeFileSync(${JSON.stringify(pidFile)}, String(child.pid));`,
-      'setInterval(() => {}, 1000);',
-      '',
-    ].join('\n'));
-    const out = path.join(dir, 'out');
-    fs.mkdirSync(out);
-    const gone = async () => {
-      const pid = Number(fs.readFileSync(pidFile, 'utf8'));
-      const alive = () => { try { process.kill(pid, 0); return true; } catch { return false; } };
-      for (let tries = 0; alive() && tries < 50; tries++) await new Promise(resolve => setTimeout(resolve, 100));
-      return !alive();
-    };
-    return { dir, script, out, pidFile, gone };
-  }
-
-  it('ends a run past its bound with every process it started', async () => {
-    const hang = hangingVitest();
-    const env = { ...process.env, SMDB_MUTATION_VITEST: hang.script };
-    const run = await runControl({ root, out: hang.out, tier: 'a', files: ['src/a.ts'], only: [], env, timeoutMs: 4_000 });
-    expect(run).toEqual({ passed: false, why: 'it ran past its bound of 4 s, and was ended with the processes it started' });
-    expect(await hang.gone()).toBe(true);
-  });
-
-  it('listens for an interrupt of the gate while it runs, and only then', async () => {
-    const signals = ['SIGINT', 'SIGTERM', 'SIGHUP'] as const;
-    const before = signals.map(signal => process.listenerCount(signal));
-    const fake = fakeVitest([]);
-    const running = runControl({ root, out: fake.out, tier: 'a', files: ['src/a.ts'], only: [], env: { ...process.env, SMDB_MUTATION_VITEST: fake.script } });
-    expect(signals.map(signal => process.listenerCount(signal))).toEqual(before.map(n => n + 1));
-    expect(await running).toEqual({ passed: true, why: '' });
-    expect(signals.map(signal => process.listenerCount(signal))).toEqual(before);
-  });
-
-  // On Windows the run shares the gate's console and job, so it ends with the gate anyway.
-  it.skipIf(process.platform === 'win32')('ends the run, with every process it started, when the gate is interrupted', async () => {
-    const hang = hangingVitest();
-    const gate = path.join(hang.dir, 'gate.mjs');
-    fs.writeFileSync(gate, [
-      `import { runControl } from ${JSON.stringify(pathToFileURL(path.join(root, 'test', 'mutation', 'control.mjs')).href)};`,
-      `await runControl({ root: ${JSON.stringify(root)}, out: ${JSON.stringify(hang.out)}, tier: 'a', files: ['src/a.ts'], only: [], env: { ...process.env, SMDB_MUTATION_VITEST: ${JSON.stringify(hang.script)} } });`,
-      '',
-    ].join('\n'));
-    const child = spawn(process.execPath, [gate], { stdio: 'ignore' });
-    const exited = new Promise<NodeJS.Signals | null>(resolve => child.on('exit', (_code, signal) => resolve(signal)));
-    for (let tries = 0; !fs.existsSync(hang.pidFile) && tries < 100; tries++) await new Promise(resolve => setTimeout(resolve, 100));
-    child.kill('SIGINT');
-    expect(await exited).toBe('SIGINT');
-    expect(await hang.gone()).toBe(true);
-  });
-
   it('clears the reruns\' timeouts only when it fits in the budget Stryker gave each rerun', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-budget-'));
     onTestFinished(() => fs.rmSync(dir, { recursive: true, force: true }));
@@ -240,11 +165,9 @@ describe('the tree fingerprint', () => {
     expect(run.stdout).toMatch(/^Verdict: NO RESULT \(the gate could not read the tree: /m);
   });
 
-  // The gate, and the helper it imports, copied to a root of its own.
+  // The gate copied to a root of its own.
   const copyGate = (copy: string) => {
     fs.cpSync(path.join(root, 'test', 'mutation'), path.join(copy, 'test', 'mutation'), { recursive: true, filter: source => path.basename(source) !== 'reports' });
-    fs.mkdirSync(path.join(copy, 'test', 'helpers'));
-    fs.copyFileSync(path.join(root, 'test', 'helpers', 'endTree.mjs'), path.join(copy, 'test', 'helpers', 'endTree.mjs'));
   };
 
   it('ends the gate NO RESULT, exit 2, when it cannot make .stryker-tmp, and says so', () => {
@@ -300,9 +223,12 @@ describe('the tree fingerprint', () => {
     const gate = fs.readFileSync(path.join(root, 'test', 'mutation', 'touched.mjs'), 'utf8');
     expect(gate).toContain('mutate: mutatePatterns(targets)');
     expect(gate).toContain('gating: gatesIn(targets, file, r.location)');
-    const guard = gate.indexOf('if (!targets.some(target => target.gating === null || target.gating.length > 0)) await finish();');
+    expect(gate).toContain('const canGate = target => target.gating === null || target.gating.length > 0;');
+    // Every run is given the files a target can gate in, never one where code was only taken out.
+    expect(gate).toContain('const changedFiles = () => [...new Set(targets.filter(canGate).map(target => target.file))];');
+    const guard = gate.indexOf('if (!targets.some(canGate)) await finish();');
     expect(guard).toBeGreaterThan(0);
-    expect(guard).toBeLessThan(gate.indexOf("await pass({ name: 'a'"));
+    expect(guard).toBeLessThan(gate.indexOf("await pass({ dir: 'a'"));
   });
 });
 

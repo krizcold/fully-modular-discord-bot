@@ -442,8 +442,8 @@ function splitTokenLines(file, text) {
 }
 
 /**
- * The lines that hold code: a token other than a bracket or a separator starts
- * on them or runs across them (a multi-line template). An else, try, finally
+ * The lines the no-mutant list counts: a token other than a bracket or a
+ * separator starts on them or runs across them (a multi-line template). An else, try, finally
  * or do line holds code. Blank and comment-only lines are left out, and so is
  * a line of brackets and separators only, wherever it sits: what was taken out
  * of it (`}, 100);` made `});`), like a pure deletion, cannot be mutated.

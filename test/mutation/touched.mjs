@@ -10,7 +10,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { pastBudget, runControl } from './control.mjs';
+import { pastBudget } from './control.mjs';
 import { treeChanges, treePrint } from './tree.mjs';
 import { canonicalName, fileOf as nameOf, keyOf } from './keys.mjs';
 import { COMMON, PASSES } from './passes.mjs';
@@ -158,9 +158,15 @@ const reportDir = path.join(root, 'test', 'mutation', 'reports', `${stamp}-${pro
 
 /** @type {PassTarget[]} */
 let targets = [];
+/**
+ * Whether a target can gate: one whose changed lines hold no token, beside a
+ * place code was taken out, makes no mutant.
+ * @param {PassTarget} target
+ */
+const canGate = target => target.gating === null || target.gating.length > 0;
 // Every run, each pass and rerun and each run with no mutant, is given every
-// file the gate mutates (each target's file), as pass A is.
-const changedFiles = () => [...new Set(targets.map(target => target.file))];
+// file the gate mutates (each file a target can gate in), as pass A is.
+const changedFiles = () => [...new Set(targets.filter(canGate).map(target => target.file))];
 /** @type {{ file: string, why: string }[]} */
 let skipped = [];
 let scope = opts.mutate.length > 0 ? `the patterns ${opts.mutate.join(' ')}` : `the change from ${opts.base} to the working tree`;
@@ -254,20 +260,21 @@ const common = {
 };
 
 /**
- * Runs one Stryker pass. `tier` picks the tests (runner.mjs): a for the fast
+ * Runs Stryker once. `tier` picks the tests (runner.mjs): a for the fast
  * tier's tests related to every file the gate mutates, b for the integration
  * tier's related tests and then the whole child tier; `only`, when given,
- * names the test files to run instead. The reruns alone, a2 and b2, get four times the config's time
+ * names the test files to run instead. A run `alone` (the reruns, a2 and b2,
+ * and the runs with no mutant after them) gets four times the config's time
  * limits. `keys`, when given, are the mutants the pass is for: Stryker makes
  * every mutant its spans hold, and the others run no test (targets.mjs).
- * @param {{ name: PassName, dir: string, tier: 'a' | 'b', mutate: string[], only?: string[], keys?: string[], extra: Options }} run
+ * @param {{ dir: string, tier: 'a' | 'b', mutate: string[], only?: string[], keys?: string[], alone?: boolean, extra: Options }} run
  * @returns {Promise<StrykerResult[]>}
  */
-async function pass({ name, dir, tier, mutate, only = [], keys, extra }) {
+async function stryker({ dir, tier, mutate, only = [], keys, alone = false, extra }) {
   const out = path.join(reportDir, dir);
   fs.mkdirSync(out, { recursive: true });
   process.env.SMDB_MUTATION_PASS = tier;
-  process.env.SMDB_MUTATION_CONFIRM = name === 'a2' || name === 'b2' ? '1' : '';
+  process.env.SMDB_MUTATION_CONFIRM = alone ? '1' : '';
   process.env.SMDB_MUTATION_FILES = JSON.stringify(changedFiles());
   process.env.SMDB_MUTATION_ONLY = JSON.stringify(only);
   process.env.SMDB_MUTATION_OUT = out;
@@ -278,23 +285,37 @@ async function pass({ name, dir, tier, mutate, only = [], keys, extra }) {
     throw new PassError(`the gate cannot give Stryker ${sandbox.unkept.join(', ')} for a sandbox, for it would read the name as a glob; rename it`);
   }
   const { Stryker } = await import('@stryker-mutator/core');
+  return new Stryker({ ...common, ignorePatterns: sandbox.patterns, mutate, ...extra }).runMutationTest();
+}
+
+/**
+ * Runs one Stryker pass (stryker()); one that cannot run stops the gate, with
+ * what its run with no mutant said.
+ * @param {{ dir: string, tier: 'a' | 'b', mutate: string[], only?: string[], keys?: string[], alone?: boolean, extra: Options }} run
+ * @returns {Promise<StrykerResult[]>}
+ */
+async function pass(run) {
   try {
-    return await new Stryker({ ...common, ignorePatterns: sandbox.patterns, mutate, ...extra }).runMutationTest();
+    return await stryker(run);
   } catch (error) {
-    const lines = [`pass ${dir} could not run: ${firstLine(error)}`, ...dryFailures(dir), ...refusalIn(out)];
+    if (error instanceof PassError) throw error;
+    const out = path.join(reportDir, run.dir);
+    const lines = [`pass ${run.dir} could not run: ${firstLine(error)}`, ...dryFailures(run.dir), ...refusalIn(out)];
     if (fs.readdirSync(out).some(f => f.startsWith('dry-') && f.endsWith('.log'))) lines.push(`the run with no mutant logged to ${posix(path.relative(root, out))}/dry-*.log`);
     throw new PassError(lines.join('\n'));
   }
 }
 
 /**
- * Runs a pass's tests once more with no mutant, here in the checkout, after
- * the reruns alone counted a kill or a timeout (control.mjs): those count only
- * if the tests still pass without a mutant. When they fail, a machine or a
- * container went bad during the reruns, so their results are voided and the
- * gate stops. When the reruns confirmed a timeout (`timed`), the tests must
- * also fit, with no mutant, in the budget Stryker gave each rerun, or the
- * machine was as slow as the mutants seemed.
+ * Runs a pass's tests once more with no mutant after the reruns alone counted
+ * a kill or a timeout: those count only if the tests still pass without a
+ * mutant. It runs as the reruns did, a Stryker run of its own over their spans
+ * (a fresh sandbox of the tree, the same code made and none of it active), that
+ * ends after its run with no mutant (dryRunOnly). When the tests fail, a
+ * machine or a container went bad during the reruns, so their results are
+ * voided and the gate stops. When the reruns confirmed a timeout (`timed`),
+ * the tests must also fit in the budget Stryker gave each rerun (control.mjs),
+ * or the machine was as slow as the mutants seemed.
  * @param {PassName} after
  * @param {'a' | 'b'} tier
  * @param {MutantRecord[]} on
@@ -302,13 +323,18 @@ async function pass({ name, dir, tier, mutate, only = [], keys, extra }) {
  * @param {boolean} [timed]
  */
 async function control(after, tier, on, only, timed = false) {
-  const name = `control-${after}`;
-  const out = path.join(reportDir, name);
-  fs.mkdirSync(out, { recursive: true });
+  const dir = `control-${after}`;
+  const out = path.join(reportDir, dir);
   console.log(`L5: the same tests once with no mutant, to check the machine after pass ${after}`);
-  const run = await runControl({ root, out, tier, files: changedFiles(), only });
+  let failed = '';
+  try {
+    await stryker({ dir, tier, mutate: [...new Set(on.map(spanOf))], only, alone: true, extra: { ...(tier === 'a' ? PASSES.a2 : PASSES.b2), dryRunOnly: true } });
+    if (timed) failed = pastBudget(path.join(reportDir, after), out, PASSES.a2);
+  } catch (error) {
+    if (error instanceof PassError) throw error;
+    failed = firstLine(error);
+  }
   const logs = `${posix(path.relative(root, out))}/dry-*.log`;
-  const failed = !run.passed ? run.why : timed ? pastBudget(path.join(reportDir, after), out, PASSES.a2) : '';
   if (failed) {
     const why = `the run with no mutant after pass ${after} failed`;
     for (const m of on) {
@@ -318,7 +344,7 @@ async function control(after, tier, on, only, timed = false) {
     const refusal = refusalIn(out);
     throw new PassError([
       refusal.length > 0 ? `${why}: it refused the files the reruns ran on` : `${why} (${failed}), so what its reruns counted cannot be told from the machine's failures`,
-      ...dryFailures(name), ...refusal, ...(fs.readdirSync(out).some(f => f.endsWith('.log')) ? [`its logs: ${logs}`] : []),
+      ...dryFailures(dir), ...refusal, ...(fs.readdirSync(out).some(f => f.endsWith('.log')) ? [`its logs: ${logs}`] : []),
     ].join('\n'));
   }
   controls.push(`after pass ${after}: passed (${logs})`);
@@ -347,7 +373,7 @@ const credited = m => ['Killed', 'Timeout'].includes(outcome(m));
  * @param {string[]} [only]
  */
 async function passOn(name, dir, tier, on, extra, only) {
-  const results = await pass({ name, dir, tier, mutate: [...new Set(on.map(spanOf))], only, keys: on.map(recordKey), extra });
+  const results = await pass({ dir, tier, mutate: [...new Set(on.map(spanOf))], only, keys: on.map(recordKey), alone: name === 'a2' || name === 'b2', extra });
   const byKey = new Map(results.map(r => [resultKey(r), r]));
   for (const m of on) {
     const r = byKey.get(recordKey(m));
@@ -423,7 +449,7 @@ try {
   }
   // Nothing that could gate (only places where code was taken out): the report names them, and Stryker is never
   // given an empty list to mutate.
-  if (!targets.some(target => target.gating === null || target.gating.length > 0)) await finish();
+  if (!targets.some(canGate)) await finish();
 
   console.log(`L5: mutating ${scope}: ${changedFiles().length} file(s), pass A (in-process tests that import them)`);
   // The type checker judges the tree's files only (ranges.mjs treeTsconfig, beyondTree).
@@ -434,7 +460,7 @@ try {
     throw new PassError(`the type checker would judge ${beyond.join(', ')}, which a file in the tree imports or references but no sandbox holds, so a mutant that broke only it would count as killed with no test run`);
   }
   fs.writeFileSync(path.join(root, checkerConfig), `${JSON.stringify(checker, null, 2)}\n`);
-  const resultsA = await pass({ name: 'a', dir: 'a', tier: 'a', mutate: mutatePatterns(targets), extra: { ...PASSES.a, concurrency: opts.concurrency, tsconfigFile: checkerConfig } })
+  const resultsA = await pass({ dir: 'a', tier: 'a', mutate: mutatePatterns(targets), extra: { ...PASSES.a, concurrency: opts.concurrency, tsconfigFile: checkerConfig } })
     .finally(() => fs.rmSync(path.join(root, checkerConfig), { force: true }));
   const orphans = [...new Set(resultsA.map(fileOf).filter(file => !targets.some(t => t.file === file)))];
   if (orphans.length > 0) throw new PassError(`Stryker mutated ${orphans.join(', ')}, which no target names, so the report could not answer for it`);

@@ -11,7 +11,7 @@ active mutant travels in `__STRYKER_ACTIVE_MUTANT__` and reaches child processes
 | ranges.mjs | (library) the files git names as changed, their changed lines from the gate's own line diff, and how far each widens; unit/mutationRanges.test.ts |
 | verdict.mjs | (library) when a run counts as a kill, which mutants go to which pass, the verdict; unit/mutationVerdict.test.ts |
 | runner.mjs | the command every pass runs inside Stryker's sandbox; unit/mutationRunner.test.ts |
-| control.mjs | (library) the run with no mutant after the reruns; unit/mutationRunner.test.ts |
+| control.mjs | (library) the time check of the run with no mutant after the reruns; unit/mutationRunner.test.ts |
 | passes.mjs | (data) the Stryker options every pass shares, and each pass's own options and budget; unit/mutationRunner.test.ts |
 | stryker.json | (data) empty on purpose: every pass names it as its config file, so Stryker never reads one it finds in the bot root |
 | keys.mjs | (library) how a file and a mutant are named across passes; unit/mutationRanges.test.ts |
@@ -22,7 +22,7 @@ active mutant travels in `__STRYKER_ACTIVE_MUTANT__` and reaches child processes
 | ../helpers/forkGuard.cjs | a process started with an env of its own that lacks DATA_DIR throws (fork, spawn, exec, execFile, a Worker), in a test and in a child step |
 | ../helpers/build.cjs | builds dist the way `npm run build` does, stamped and locked; pass B's buildCommand |
 | ../helpers/child.ts | runs a child scenario (test/child/scenarios/) and checks what it loaded |
-| ../helpers/endTree.mjs | ends a process and those it started: a child step past its bound, and the run with no mutant after the reruns |
+| ../helpers/endTree.mjs | ends a process and those it started: a child step past its bound |
 
 ## Running it
 
@@ -89,7 +89,7 @@ does not name by its content.
   none of its mutants. It still joins the ranges on either side of it, so a new function whose body holds a blank line
   is made whole. A file where only such lines changed, and no code was taken out, is not mutated (below); a line of
   code made a comment or a blank line is code taken out (below).
-- **Gating** mutants touch a changed line that holds code. Some that touch one are not made: one that touches it only through a block
+- **Gating** mutants touch a changed line that holds code (a token, brackets and separators included). Some that touch one are not made: one that touches it only through a block
   holding the line (the emptying of that block, or the whole callback around it), the emptying of the body of a
   compound statement or declaration (above), or of a bare block, that only begins or ends on the changed line: its
   header or its closing brace, and the false condition Stryker gives a `for` with no condition, which spans the whole
@@ -171,7 +171,7 @@ does not name by its content.
   body, call or condition with no mutant of its own land in the list. A file taken whole names the same lines as each
   of its lines changed alone. The list can name a line some mutant reaches; it never leaves out a line of code the
   diff marks changed that no mutant lies on (a line the job added can still go unmarked, as the window's limit above
-  says). A line of brackets and separators only is not a line of code: what was taken out of it (`}, 100);`
+  says). A line of brackets and separators only is left out of this list (the one place it is not counted as code): what was taken out of it (`}, 100);`
   made `});`), like a pure deletion, is not mutated, and a changed one in a diff is named under its own heading. A
   deleted file is named too. A `--mutate` pattern that
   made no mutant is named on its own, beside other patterns on the same file.
@@ -196,8 +196,8 @@ does not name by its content.
    with no test run. A gating mutant whose only type error is an unused `@ts-expect-error` (TS2578) type-checks, so it
    meets pass A's tests again with no checker (`a-unchecked/`), and that run is its pass A: from there it goes on like
    any other mutant. Each mutant run is `vitest related <mutated files>` on the fast tier with one worker: every pass
-   and rerun, and each run with no mutant, is given every file the gate mutates (each target's file, not the changed
-   files it does not mutate), and where it runs related tests (pass A, its run with no checker, a2 and the run after
+   and rerun, and each run with no mutant, is given every file the gate mutates (each file a target can gate in: not
+   a changed file it does not mutate, nor one where code was only taken out or only comments changed), and where it runs related tests (pass A, its run with no checker, a2 and the run after
    it, pass B's integration tier) only tests that import one of them, directly or through other files, run (a test
    that reaches them by no import vitest can see, such as a computed require, a file read or a child process, does
    not). Pass B's child tier runs whole; each b2 run runs the one file that failed, and the run after them runs every such file. There is no coverage analysis: every mutant runs those tests. The files go on vitest's
@@ -238,26 +238,27 @@ does not name by its content.
      gate never ran through pass B, and a pass B kill that failed again alone in one b2 run while a later one stopped
      the gate before the run with no mutant after them.
 4. **A run with no mutant after the reruns.** When a rerun counted a kill or a timeout, the same tests run once more
-   with no mutant, in the checkout itself, the way the reruns ran them (mutation/control.mjs). If they fail, the
+   with no mutant, the way the reruns ran them: a Stryker run of its own over the reruns' spans, in a fresh sandbox of
+   the tree, with the same code made and none of it active (the tree's files only, git-ignored ones never, and pass
+   B's dist built from that code), which ends after its run with no mutant (`dryRunOnly`). If they fail, the
    machine or a container went bad during the reruns, so what the reruns counted is inconclusive and the gate ends NO
    RESULT. When a rerun of pass A confirmed a timeout, the run must also fit in the budget Stryker gave each rerun (four
-   times the reruns' own run with no mutant, plus a minute; runner.mjs times both), or the machine was as slow as the
-   mutant seemed and the gate ends NO RESULT the same way. Its own bound is an hour; past it, or when the gate is
-   interrupted (Ctrl-C, a hangup), it is ended with every process that still descends from it and, on POSIX, with
-   its whole process group (helpers/endTree.mjs: a process whose parent exited and that left the group outlives it).
+   times the reruns' own run with no mutant, plus a minute; runner.mjs times both, mutation/control.mjs holds one to
+   the other), or the machine was as slow as the mutant seemed and the gate ends NO RESULT the same way. Its bound is
+   Stryker's for a run with no mutant, as the reruns' own had (five minutes after pass A, fifteen after pass B).
    What it cannot see: a machine that was
    four times slower for one rerun only and well again by the end (a pass A rerun that timed out, or a pass B rerun
    whose child step ran past its bound), or, for a test, hook or step that sets its own limit, which is not scaled,
    one only as much slower as that limit allows (no test that reaches src sets one today); nor what an earlier rerun,
    or the pass's own run with no mutant, left inside that pass's one sandbox (a file written under its test or src
-   through a path a mutant made relative, a module a scenario put into its dist), which can fail a later rerun: it
-   runs in the checkout, which holds none of it (no test or scenario writes there today).
+   through a path a mutant made relative, a module a scenario put into its dist), which can fail a later rerun: its
+   sandbox is fresh, so it holds none of it (no test or scenario writes there today).
 
 The tree is fingerprinted (every file git tracks or would add, which is what each sandbox holds: size, time and
 content) before the plan reads a file,
-and again before the verdict: the plan reads the tree then, each pass copies it as it is when it starts and the run with
-no mutant reads the checkout then, so a tree that changed during the run (an edit, a formatter, another session) ends
-NO RESULT, naming the files.
+and again before the verdict: the plan reads the tree then, and each pass, and each run with no mutant after the
+reruns, copies it as it is when it starts, so a tree that changed during the run (an edit, a formatter, another
+session) ends NO RESULT, naming the files.
 
 A run Stryker counts as a kill is checked against vitest's report of it: it is a kill when a test itself failed, and a
 timeout when every failing test (or its beforeEach or afterEach hook) timed out. In a pass's first run (A, its run

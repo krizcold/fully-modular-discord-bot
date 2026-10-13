@@ -3,7 +3,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { describe, expect, it } from 'vitest';
+import { beforeAll, describe, expect, it } from 'vitest';
 
 // The L5 bite (VERIFY.md L5 and [A2]): one run of the gate on two lines of
 // nodeIdentity.ts. consentsToActiveMode's return is in-process code, so the
@@ -31,6 +31,15 @@ function lineOf(text: string): number {
 }
 
 describe('the touched-line mutation gate', () => {
+  // What a run cut short left in src, before any test: each test removes its own files when it ends, but an
+  // interrupt skips that, and a leftover importer of an ignored module would stop every gate run before pass A.
+  beforeAll(() => {
+    const src = path.join(root, 'src');
+    const dev = path.join(src, 'bot', 'modulesDev');
+    for (const old of fs.readdirSync(src).filter(name => /^smdb-(bite|ignored|repo|glob|beyond)-/.test(name))) fs.rmSync(path.join(src, old), { recursive: true, force: true });
+    if (fs.existsSync(dev)) for (const old of fs.readdirSync(dev).filter(name => name.startsWith('smdb-'))) fs.rmSync(path.join(dev, old), { recursive: true, force: true });
+  });
+
   it('kills in-process code in pass A and restart-only code in pass B through a child', { timeout: 900_000 }, () => {
     const fast = lineOf("return (process.env.FLEET_BACKUP_MODE || '').trim().toLowerCase() === 'active';");
     const child = lineOf('...(override.standIn === true ? { standIn: true } : {}),');
@@ -106,7 +115,11 @@ describe('the touched-line mutation gate', () => {
       'const mutant = process.env.__STRYKER_ACTIVE_MUTANT__;',
       "let message = mutant ? 'Error: Test timed out in 30000ms' : '';",
       `if (pass === 'a' && mutant) fs.writeFileSync(${JSON.stringify(path.join(root, canaries[1]))}, 'ignored');`,
-      `if (!pass.startsWith('control-') && ${JSON.stringify(canaries)}.some(name => fs.existsSync(path.join('..', name)))) message = 'Error: the sandbox holds a git-ignored file';`,
+      `if (${JSON.stringify(canaries)}.some(name => fs.existsSync(path.join('..', name)))) message = 'Error: the sandbox holds a git-ignored file';`,
+      // The run with no mutant after the reruns runs the code they ran: made by Stryker, with no mutant active.
+      "const made = name => { try { return fs.readFileSync(path.join('..', name), 'utf8').includes('stryMutAct_'); } catch { return false; } };",
+      "if (pass.startsWith('control-') && !JSON.parse(process.env.SMDB_MUTATION_FILES).some(made)) message = 'Error: the run ran code the reruns did not';",
+      "if (pass.startsWith('control-') && process.env.SMDB_TEST_TIME_SCALE !== '4') message = 'Error: the run had other time limits than the reruns';",
       code,
       "const test = { status: message ? 'failed' : 'passed', fullName: 'reads', failureMessages: message ? [message] : [] };",
       "fs.writeFileSync(file, JSON.stringify({ testResults: [{ name: 'unit/x.test.ts', status: test.status, assertionResults: [test] }] }));",
@@ -120,6 +133,8 @@ describe('the touched-line mutation gate', () => {
     fs.rmSync(dir, { recursive: true, force: true });
     for (const name of canaries) fs.rmSync(path.join(root, name), { force: true });
     expect(run.stdout).not.toContain('the sandbox holds a git-ignored file');
+    expect(run.stdout).not.toContain('the run ran code the reruns did not');
+    expect(run.stdout).not.toContain('the run had other time limits than the reruns');
     const reportDir = /^Report: (\S+)/m.exec(run.stdout)?.[1];
     expect(reportDir, `${run.stdout}\n${run.stderr}`).toBeDefined();
     // A dir of its own: two runs that start in the same millisecond never share one.
@@ -148,7 +163,7 @@ describe('the touched-line mutation gate', () => {
     for (const m of reran) expect(m.passes.a2).toMatchObject({ voided: 'the run with no mutant after pass a2 failed' });
     expect(run.status).toBe(2);
     expect(run.stdout).toMatch(/^Verdict: NO RESULT \(vitest was replaced by a test's stand-in /m);
-    expect(run.stdout).toMatch(/^Stopped:\n {2}the run with no mutant after pass a2 failed \(exit 1\), so what its reruns counted cannot be told from the machine's failures$/m);
+    expect(run.stdout).toMatch(/^Stopped:\n {2}the run with no mutant after pass a2 failed \(There were failed tests in the initial test run\.\), so what its reruns counted cannot be told from the machine's failures$/m);
     expect(run.stdout).toMatch(/^ {2}the run with no mutant failed in unit\/x\.test\.ts: Error: the database went away$/m);
     expect(run.stdout).toContain(`\nChanged during the run (so no one tree was tested):\n  ${added}`);
     expect(run.stdout).toMatch(/^Inconclusive .*\n {2}src\/bot\/internalSetup\/fleet\/nodeIdentity\.ts:\d+:\d+ .*\(the run with no mutant after pass a2 failed\)$/m);
@@ -287,7 +302,7 @@ describe('the touched-line mutation gate', () => {
   });
 
   it('refuses it in the run with no mutant after the reruns, too, and says so', { timeout: 600_000 }, () => {
-    // Gained during pass A2's reruns, which ran on the copy without it: the run after them, in the checkout, refuses it.
+    // Gained during pass A2's reruns, which ran on the copy without it: the run after them, on a copy made then, refuses it.
     const { run, probe } = probeRun('a2');
     expect(run.status).toBe(2);
     expect(run.stdout).toMatch(/^Stopped:\n {2}the run with no mutant after pass a2 failed: it refused the files the reruns ran on$/m);
@@ -334,8 +349,6 @@ describe('the touched-line mutation gate', () => {
     // A file in src that imports, by type only, a module in the git-ignored src/bot/modulesDev.
     const importer = `src/smdb-beyond-${process.pid}.ts`;
     const imported = `src/bot/modulesDev/smdb-beyond-${process.pid}.ts`;
-    for (const old of fs.readdirSync(path.join(root, 'src')).filter(name => /^smdb-(ignored|repo|glob|beyond)-/.test(name))) fs.rmSync(path.join(root, 'src', old), { recursive: true, force: true });
-    for (const old of fs.readdirSync(path.join(root, 'src', 'bot', 'modulesDev')).filter(name => name.startsWith('smdb-beyond-'))) fs.rmSync(path.join(root, 'src', 'bot', 'modulesDev', old), { force: true });
     try {
       for (const file of unlisted) {
         fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true });
