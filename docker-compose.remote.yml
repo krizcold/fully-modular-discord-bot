@@ -3,8 +3,9 @@
 # (Authelia) - the same stack the Bot Manager uses for its remote install.
 #
 # The admin Web-UI is reachable ONLY through Caddy + a completed Authelia login.
-# The member routes /guild and /auth stay public (they carry their own Discord
-# OAuth login). The bot publishes no host port; only Caddy listens on 80/443.
+# Public without that login: the member page /guild (it carries its own Discord
+# OAuth login, at /auth) and its files under /assets/. The bot publishes no host
+# port; only Caddy listens on 80/443.
 #
 # Setup: run `sudo ./setup.sh` (automates all of the below; see README).
 # To do it by hand instead:
@@ -12,7 +13,10 @@
 #   2. put an argon2id hash in ./authelia/users_database.yml
 #   3. create a .env with PUBLIC_HOST, AUTHELIA_HOST, COOKIE_DOMAIN, ACME_EMAIL, TZ
 #   4. open inbound TCP 80 + 443 (and your provider's external firewall if enabled)
-#   5. docker compose -f docker-compose.remote.yml up -d
+#   5. docker compose -f docker-compose.remote.yml up -d --build
+# To update by hand after a git pull, rebuild the bot and restart Authelia (it reads configuration.yml only at start):
+#   docker compose -f docker-compose.remote.yml up -d --build
+#   docker compose -f docker-compose.remote.yml restart authelia
 
 name: fullymodulardiscordbot-remote
 
@@ -27,7 +31,7 @@ services:
       fleet.transfer-port: "3929"  # only meaningful under the Bot Manager; harmless here
       # Reachable only through Caddy (no host port published). Caddy serves it at
       # PUBLIC_HOST over TLS and forwards every request through Authelia first;
-      # /guild and /auth are bypass rules in authelia/configuration.yml.
+      # /guild, /auth and /assets/ are bypass rules in authelia/configuration.yml.
       caddy: ${PUBLIC_HOST}
       caddy.reverse_proxy: "{{upstreams 8080}}"
       caddy.forward_auth: "authelia:9091"

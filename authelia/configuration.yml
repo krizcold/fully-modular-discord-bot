@@ -38,14 +38,20 @@ authentication_backend:
         key_length: 32
         salt_length: 16
 
-# Default deny; the admin Web-UI requires an admin login. The member routes
-# /guild and /auth bypass this gate: they carry the bot's own Discord OAuth
-# login and must stay reachable by guild members (first match wins, so the
-# bypass rules sit above the admin rule). Static assets bypass too - the public
-# /guild page loads them from root paths (same posture as ALLOWED_EXTENSIONS on
-# the Yundera gateway); the pattern excludes '?' so a query string can never
-# smuggle an extension past the gate (resources match path AND query). The
-# factor count comes from setup.sh's MFA question:
+# Default deny; the admin Web-UI requires an admin login. Three things bypass
+# it, for guild members (first match wins, so the bypass rules sit above the
+# admin rule):
+# - /guild, the member page and its API, which carry the bot's own Discord
+#   OAuth login (the member API uses every method);
+# - /auth, that login's routes, GET and HEAD only (the bot answers only GET);
+# - /assets/, the member page's own files, GET and HEAD only. The pattern
+#   excludes '?' so a query string cannot widen it (resources match path AND
+#   query). The admin page's files sit outside /assets/ and need the login.
+# Before any route, the bot refuses a raw path holding an encoded slash,
+# backslash, "?", "#", unreserved or control character, a literal backslash or
+# "#", a doubled slash or a dot segment, and its admin catch-all serves the
+# admin page only at a plain path. The factor count comes from setup.sh's MFA
+# question:
 # ACCESS_POLICY=two_factor|one_factor (compose defaults it to two_factor).
 access_control:
   default_policy: 'deny'
@@ -54,8 +60,14 @@ access_control:
       policy: 'bypass'
       resources:
         - '^/guild([/?].*)?$'
+    - domain: '{{ env "PUBLIC_HOST" }}'
+      policy: 'bypass'
+      methods:
+        - 'GET'
+        - 'HEAD'
+      resources:
         - '^/auth([/?].*)?$'
-        - '^/[^?]*\.(js|jsx|css|png|ico|svg|jpg|jpeg|gif|woff|woff2|ttf|eot)$'
+        - '^/assets/[^?]*$'
     - domain: '{{ env "PUBLIC_HOST" }}'
       policy: '{{ env "ACCESS_POLICY" }}'
       subject:

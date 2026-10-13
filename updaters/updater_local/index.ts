@@ -220,12 +220,13 @@ export async function checkForUpdates(): Promise<UpdateCheckResult> {
 }
 
 /**
- * Self-hosted updates are applied manually: pull a new image (or git pull) and restart.
+ * Self-hosted updates are applied by hand: on the public Linux stack, git pull and rerun setup.sh (it rebuilds the bot
+ * and restarts Authelia); otherwise pull a new image (or git pull) and restart.
  */
 export async function triggerUpdate(): Promise<UpdateTriggerResult> {
   return {
     success: false,
-    error: 'Self-hosted mode: pull the latest image (or git pull) and restart the bot manually.'
+    error: 'Self-hosted mode: update by hand. On the public Linux stack, git pull and rerun sudo ./setup.sh; otherwise pull the latest image (or git pull) and restart the bot.'
   };
 }
 

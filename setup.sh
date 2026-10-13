@@ -308,17 +308,16 @@ ok "Wrote $ENV_FILE"
 # ── Deploy ────────────────────────────────────────────────────────────────────
 info "Starting the stack (the first build can take a few minutes) ..."
 deploy_started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-docker compose -f "$COMPOSE_FILE" up -d || die "docker compose up failed."
+docker compose -f "$COMPOSE_FILE" up -d --build || die "docker compose up failed."
 
-if [ "$need_password" -eq 1 ]; then
-  # Authelia runs with watch: false and the users file is a bind mount, so a content
-  # change does not alter the compose config hash - a running container keeps the old password.
-  info "Restarting Authelia to load the new admin password ..."
-  if docker compose -f "$COMPOSE_FILE" restart authelia >/dev/null 2>&1; then
-    ok "Authelia restarted with the new password."
-  else
-    warn "Could not restart Authelia - run 'docker compose -f $COMPOSE_FILE restart authelia' so the new password takes effect."
-  fi
+# Authelia reads configuration.yml only at start, and the users file runs with watch: false. Both are bind
+# mounts, so a content change (a new password, or access rules from an update) does not alter the compose
+# config hash: a running container keeps the old ones until it restarts.
+info "Restarting Authelia to load its configuration and the admin password ..."
+if docker compose -f "$COMPOSE_FILE" restart authelia >/dev/null 2>&1; then
+  ok "Authelia restarted with the current configuration."
+else
+  warn "Could not restart Authelia - run 'docker compose -f $COMPOSE_FILE restart authelia' so the current configuration takes effect."
 fi
 
 info "Waiting for containers to settle ..."
@@ -407,7 +406,7 @@ ${c_grn}${c_bold}Done.${c_off}
   Login       : $login_line
 $mfa_line
 
-  The member routes stay public with their own Discord login:
+  The member page stays public, with its own Discord login:
     https://$PUBLIC_HOST/guild
 
   Next: open the Web-UI and enter the Discord credentials in the Credentials tab.

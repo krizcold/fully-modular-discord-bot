@@ -236,7 +236,8 @@ Authelia (login + optional MFA, default on) from `docker-compose.remote.yml` -
 the same stack the Bot Manager's remote install uses. The script asks for a
 domain (or derives sslip.io hosts from your server IP), sets the admin
 password, and prints a TOTP QR code for your authenticator app. The member
-routes `/guild` and `/auth` stay public with their own Discord OAuth login.
+page stays public with its own Discord OAuth login: `/guild`, `/auth`, and its
+files under `/assets/`.
 Re-run it any time to reconfigure (`--reset-password`, `--reset-mfa`).
 
 **Bot Manager / Yundera deployments** are reached through the AppShield
@@ -654,9 +655,10 @@ bind mount) and survive container rebuilds.
 
 The bot, Caddy (automatic Let's Encrypt TLS), and Authelia (login +
 TOTP/WebAuthn MFA enforced via `forward_auth`). The admin Web-UI is reachable only through Caddy after an
-Authelia login; `/guild` and `/auth` bypass the gate (they carry the bot's own
-Discord OAuth). Deployed and reconfigured by `sudo ./setup.sh`; the compose
-header documents the equivalent manual steps.
+Authelia login; `/guild`, `/auth` and the member page's files under `/assets/`
+bypass the gate (the member page carries the bot's own Discord OAuth). Deployed
+and reconfigured by `sudo ./setup.sh`, which rebuilds the bot and restarts Authelia so its rules load; the compose
+header documents the equivalent manual steps, updates included.
 
 ### docker-compose.yml (Bot Manager / Yundera)
 

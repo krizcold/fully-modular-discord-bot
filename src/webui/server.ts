@@ -23,6 +23,7 @@ import { createFleetRoutes } from './routes/fleet';
 import { createManagedRoutes } from './routes/managed';
 import { createGraveyardRoutes } from './routes/graveyard';
 import { requireAuth } from './middleware/auth';
+import { adminPageFallback, pathGuard, pathMiss } from './middleware/pathGuard';
 import { blockWritesOnCoWorker, isCoWorkerNode, requireMasterNode } from './middleware/fleetGate';
 import { configureOAuth, isGuildWebUIEnabled } from './auth/oauthConfig';
 import { requireGuildWebUIEnabled } from './auth/oauthMiddleware';
@@ -94,6 +95,10 @@ export async function createServer(botManager: BotManager): Promise<Express> {
     res.setHeader('Permissions-Policy', 'geolocation=(), microphone=(), camera=()');
     next();
   });
+
+  // Before every route: refuses the raw path forms middleware/pathGuard.ts lists, which a gateway could read as
+  // another segment, prefix or extension.
+  app.use(pathGuard);
 
   // CORS configuration - Disable CORS entirely. The web UI is not authenticated by the
   // bot itself (auth lives at the deployment boundary), so no cross-origin requests are
@@ -300,7 +305,8 @@ export async function createServer(botManager: BotManager): Promise<Express> {
   // the boundary gateway that authenticates every route above.
   app.use('/api/managed', createManagedRoutes(botManager));
 
-  // Serve static frontend files (auth is enforced at the deployment boundary; requireAuth passes)
+  // Serve static frontend files. The admin page's files need the gateway's login; the member page's own files
+  // under /assets/ are reachable without it (requireAuth passes; auth lives at the deployment boundary).
   const publicDir = path.join(__dirname, 'public');
   app.use(express.static(publicDir, {
     setHeaders: (res) => {
@@ -320,8 +326,8 @@ export async function createServer(botManager: BotManager): Promise<Express> {
     res.sendFile(path.join(publicDir, 'index.html'));
   });
 
-  // Guild Web-UI routes (NO requireAuth - public via the gateway's AppShield
-  // ALLOWED_PATHS: "/guild,/auth"). The wildcard `/guild/*` serves the same SPA
+  // Guild Web-UI routes (NO requireAuth: the gateway lets /guild, /auth and the
+  // member page's files under /assets/ through without the admin login). The wildcard `/guild/*` serves the same SPA
   // shell so deep links like /guild/{id}/subscription work after a full
   // page reload (used by Stripe return URLs and refresh-restores-state
   // browser behaviour). Both must be registered before the auth-gated
@@ -345,11 +351,13 @@ export async function createServer(botManager: BotManager): Promise<Express> {
   app.get('/guild', guildHtmlHandler);
   app.get('/guild/*', guildHtmlHandler);
 
-  // Catch-all for SPA routing (requireAuth passes; auth at the boundary)
+  // The gateway lets /auth and /assets/ through without the admin login: a path there that nothing answered gets 404.
+  app.use(['/auth', '/assets'], pathMiss);
+
+  // Catch-all for SPA routing (requireAuth passes; auth at the boundary). The admin page's tabs are plain paths, so
+  // only a plain path gets it: any other form, which a gateway may have read as a public path, gets 404.
   // MUST be last to not interfere with specific routes
-  app.get('*', requireAuth, (req: Request, res: Response) => {
-    res.sendFile(path.join(publicDir, 'index.html'));
-  });
+  app.get('*', requireAuth, adminPageFallback(publicDir));
 
   // Error handling - Sanitized to prevent information disclosure
   app.use((err: Error, req: Request, res: Response, next: any) => {
