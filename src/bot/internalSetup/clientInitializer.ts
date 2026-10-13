@@ -25,7 +25,7 @@ import { startModuleAutoUpdater } from './utils/moduleAutoUpdater';
 import { loadCredentials } from '../../utils/envLoader';
 import { initFleet, relaxFleetSyncPosture } from './fleet/bootstrap';
 import { getIngestService } from './ingest/ingestService';
-import { installReplyGate } from './utils/dataBackends/replyGate';
+import { installReplyGate, sweepLateWrites } from './utils/dataBackends/replyGate';
 import { ModuleLoader } from './utils/moduleLoader';
 import { getModuleRegistry } from './utils/moduleRegistry';
 import { getModuleEventManager } from './utils/moduleEventManager';
@@ -371,6 +371,7 @@ async function loadEventHandlers(client: Client) {
       // polite ephemeral reject (interactions) or ordered replay (events).
       if (!(await gateEventDispatch(eventName, args, () => void dispatchOrdered(...args)))) return;
       await dispatchOrdered(...args);
+      if (eventName === 'interactionCreate') void sweepLateWrites(args[0]);
     });
   }
 }

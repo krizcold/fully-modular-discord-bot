@@ -6,31 +6,7 @@ import { PanelContext, PanelResponse } from '../../../types/panelTypes';
 import { DISCORD_EPHEMERAL_FLAG } from '../../../constants';
 import { getNavigationContext, storeNavigationContext, detectAccessMethodFromMessage } from './panelButtonHandler';
 import { isActiveInstance } from './persistentPanelStorage';
-
-/**
- * Parse panel dropdown customId: panel_{panelId}_dropdown_{dropdownId}
- */
-export function parseDropdownCustomId(customId: string): { panelId: string; dropdownId: string } | null {
-  const parts = customId.split('_');
-  if (parts.length < 4 || parts[0] !== 'panel') {
-    console.log(`[PanelDropdownHandler] Invalid panel dropdown format: ${customId}`);
-    return null;
-  }
-
-  // Find the 'dropdown' part in the array
-  const dropdownIndex = parts.indexOf('dropdown');
-  if (dropdownIndex === -1 || dropdownIndex === parts.length - 1) {
-    console.log(`[PanelDropdownHandler] No 'dropdown' found or no dropdown ID after 'dropdown': ${customId}`);
-    return null;
-  }
-
-  // Everything between 'panel' and 'dropdown' is the panel ID
-  const panelId = parts.slice(1, dropdownIndex).join('_');
-  // Everything after 'dropdown' is the dropdown ID
-  const dropdownId = parts.slice(dropdownIndex + 1).join('_');
-
-  return { panelId, dropdownId };
-}
+import { parseDropdownCustomId } from './panelCustomIds';
 
 /**
  * Register the panel dropdown handler with the Discord bot

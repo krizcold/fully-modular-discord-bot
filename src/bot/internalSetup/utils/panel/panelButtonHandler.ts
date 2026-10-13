@@ -8,6 +8,7 @@ import {
 } from './persistentPanelWarning';
 import { getPersistentPanel, updatePersistentPanelState, isActiveInstance } from './persistentPanelStorage';
 import { createTitledContainer, createText, V2Colors } from './v2';
+import { parseButtonCustomId } from './panelCustomIds';
 
 /**
  * Navigation context storage
@@ -139,28 +140,6 @@ export function detectAccessMethodFromMessage(
   }
 
   return scanComponentsForAdminButtons(componentsToScan);
-}
-
-/**
- * Parse panel button customId: panel_{panelId}_btn_{buttonId}
- */
-export function parseButtonCustomId(customId: string): { panelId: string; buttonId: string } | null {
-  const parts = customId.split('_');
-  if (parts.length < 4 || parts[0] !== 'panel') {
-    console.log(`[PanelButtonHandler] Invalid panel button format: ${customId}`);
-    return null;
-  }
-
-  const btnIndex = parts.indexOf('btn');
-  if (btnIndex === -1 || btnIndex === parts.length - 1) {
-    console.log(`[PanelButtonHandler] No 'btn' found or no button ID after 'btn': ${customId}`);
-    return null;
-  }
-
-  const panelId = parts.slice(1, btnIndex).join('_');
-  const buttonId = parts.slice(btnIndex + 1).join('_');
-
-  return { panelId, buttonId };
 }
 
 /**

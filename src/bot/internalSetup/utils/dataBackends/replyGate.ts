@@ -5,7 +5,8 @@
 import { ContainerBuilder, InteractionResponseType, MessageFlags, MessageFlagsBitField, TextDisplayBuilder, type Client } from 'discord.js';
 import { getConfigProperty } from '../configManager';
 import { confirmWrite } from '../dataManager';
-import { currentLedger, installInteractionLedgers, landed, ledgerOf, type LedgerCause, type LedgerTicket, type WriteLedger } from './writeLedger';
+import { parseButtonCustomId, parseDropdownCustomId, parseModalCustomId } from '../panel/panelCustomIds';
+import { currentLedger, currentModule, installInteractionLedgers, landed, ledgerOf, type LedgerCause, type LedgerTicket, type WriteLedger } from './writeLedger';
 
 /** From the interaction's emit to the gate's own defer. Discord's 3 s also pays the gateway's delivery and the callback. */
 export const ACK_MS = 2000;
@@ -90,7 +91,7 @@ function pendingIn(ledgers: WriteLedger[]): Pending {
 const refusalAnswer = (r: Refused): TruthAnswer => (r.rewritten ? 'unavailable' : r.cause);
 const refusalKey = (r: Refused): string => `${refusalAnswer(r)}|${r.doc}|${r.seq}`;
 
-async function judge(pending: Pending): Promise<Verdict> {
+async function judge(pending: Pending, waitMs = CONFIRM_MS): Promise<Verdict> {
   if (pending.refused.length > 0) {
     return {
       ok: false,
@@ -99,7 +100,7 @@ async function judge(pending: Pending): Promise<Verdict> {
       failed: pending.refused.map(r => ({ refusal: refusalKey(r) })),
     };
   }
-  const first = await Promise.all(pending.unlanded.map(ticket => confirmWrite(ticket, CONFIRM_MS).catch(() => 'unavailable' as const)));
+  const first = await Promise.all(pending.unlanded.map(ticket => confirmWrite(ticket, waitMs).catch(() => 'unavailable' as const)));
   // A held write is retried while slower confirms finish, so it is read again when the verdict is taken.
   const answers = await Promise.all(first.map((answer, i) => answer !== 'held'
     ? answer
@@ -114,6 +115,82 @@ async function judge(pending: Pending): Promise<Verdict> {
     failed: failed.map(ticket => ({ key: keyOf(ticket), seq: ticket.seq })),
   };
 }
+
+/** A synthetic entry's verdict (BT-4): ok only when every write in its ledgers landed and none was refused. */
+export type WritesVerdict = { ok: true } | { ok: false; answer: TruthAnswer; partial: boolean };
+
+/**
+ * The verdict over these ledgers within CONFIRM_MS. After each ok judgement they are read again, so a write recorded
+ * while it waited is judged too, with the time left: a refusal at once, an unconfirmed write as pending.
+ */
+export async function verdictOf(ledgers: WriteLedger[]): Promise<WritesVerdict> {
+  const deadline = performance.now() + CONFIRM_MS;
+  const confirmed = new Map<object, number>();
+  for (;;) {
+    const read = pendingIn(ledgers);
+    const pending = {
+      ...read,
+      unlanded: read.unlanded.filter(ticket => (confirmed.get(keyOf(ticket)) ?? -1) < ticket.seq),
+      landedBefore: read.landedBefore || confirmed.size > 0,
+    };
+    if (pending.refused.length === 0 && pending.unlanded.length === 0) return { ok: true };
+    const verdict = await judge(pending, Math.max(0, deadline - performance.now()));
+    if (!verdict.ok) return { ok: false, answer: verdict.answer, partial: verdict.partial };
+    for (const ticket of pending.unlanded) confirmed.set(keyOf(ticket), ticket.seq);
+  }
+}
+
+/** The union a module's last payload was judged on, and the module that sent it, for the sweep. */
+interface Mark {
+  module: string;
+  ledgers: WriteLedger[];
+  seqs: Map<object, number>;
+  stamps: Map<string, number>;
+}
+
+function markOf(pending: Pending, ledgers: WriteLedger[], module: string): Mark {
+  const seqs = new Map<object, number>();
+  for (const ticket of pending.tickets) seqs.set(keyOf(ticket), Math.max(ticket.seq, seqs.get(keyOf(ticket)) ?? -1));
+  const stamps = new Map<string, number>();
+  for (const r of pending.refused) stamps.set(r.doc, Math.max(r.seq, stamps.get(r.doc) ?? 0));
+  return { module, ledgers, seqs, stamps };
+}
+
+/** A write recorded since the mark: a new key, a higher seq, or a refusal with a higher stamp. */
+function wroteSince(mark: Mark): boolean {
+  return mark.ledgers.some(ledger =>
+    ledger.tickets().some(({ ticket }) => ticket.seq > (mark.seqs.get(keyOf(ticket)) ?? -1))
+    || ledger.refusedDocs().some(({ doc, seq }) => seq > (mark.stamps.get(doc) ?? 0)));
+}
+
+/** The key a component or modal was dispatched by, as the internal handlers match it; never its custom id, which carries ids. */
+function handlerKey(handlers: unknown, customId: string): string {
+  if (!(handlers instanceof Map)) return 'unregistered';
+  if (handlers.has(customId)) return customId;
+  for (const key of handlers.keys()) {
+    if (customId.startsWith(key) && (customId.length === key.length || customId.charAt(key.length) === '_')) return key;
+  }
+  return 'unregistered';
+}
+
+const PANEL_IDS = { button: parseButtonCustomId, dropdown: parseDropdownCustomId, modal: parseModalCustomId };
+
+/** Core's panel dispatcher holds every panel's components under one key, so a panel's site is its panel id instead. */
+function componentSite(kind: keyof typeof PANEL_IDS, handlers: unknown, customId: string): { kind: string; name: string } {
+  const key = handlerKey(handlers, customId);
+  return { kind, name: (key === 'panel' && PANEL_IDS[kind](customId)?.panelId) || key };
+}
+
+function siteOf(interaction: Record<string, any>): { kind: string; name: string } {
+  if (typeof interaction.commandName === 'string') return { kind: 'command', name: interaction.commandName };
+  const client = interaction.client ?? {};
+  if (interaction.isButton?.()) return componentSite('button', client.buttonHandlers, interaction.customId);
+  if (interaction.isAnySelectMenu?.()) return componentSite('dropdown', client.dropdownHandlers, interaction.customId);
+  if (interaction.isModalSubmit?.()) return componentSite('modal', client.modalHandlers, interaction.customId);
+  return { kind: 'interaction', name: 'unknown' };
+}
+
+const reported = new Set<string>();
 
 /** The verdict by the deadline, or undefined once it passes. A verdict already in (a refusal) wins even past it. */
 function within<T>(promise: Promise<T>, ms: number): Promise<T | undefined> {
@@ -250,10 +327,18 @@ export function installReplyGate(interaction: object, ledger: WriteLedger): void
     return result;
   };
 
-  const gated = async (name: string, args: unknown[], frameLedger: WriteLedger | undefined): Promise<unknown> => {
+  // The sweep's mark: taken once a module's payload went out, never for the truth, a deferral or an acknowledgement.
+  let mark: Mark | null = null;
+
+  const gated = async (name: string, args: unknown[], frameLedger: WriteLedger | undefined, sender: string): Promise<unknown> => {
     const ledgers = frameLedger && frameLedger !== ledger ? [frameLedger, ledger] : [ledger];
     const pending = pendingIn(ledgers);
-    if (pending.refused.length === 0 && pending.unlanded.length === 0) return send(name, args);
+    const payload = async (call: string, callArgs: unknown[]): Promise<unknown> => {
+      const result = await send(call, callArgs);
+      mark = markOf(pending, ledgers, sender);
+      return result;
+    };
+    if (pending.refused.length === 0 && pending.unlanded.length === 0) return payload(name, args);
     const verdicts = judge(pending);
     const initial = name === 'reply' || name === 'update';
     if (initial && !real.deferred && !real.replied) {
@@ -265,27 +350,33 @@ export function installReplyGate(interaction: object, ledger: WriteLedger): void
           ? await send('deferReply', [{ flags: ephemeral ? MessageFlags.Ephemeral : undefined, withResponse: options.withResponse }])
           : await send('deferUpdate', [{ withResponse: options.withResponse }]);
         const verdict = await verdicts;
-        const edited = verdict.ok ? await send('editReply', [asEdit(args[0])]) : await tell('editReply', verdict, args[0]);
+        const edited = verdict.ok ? await payload('editReply', [asEdit(args[0])]) : await tell('editReply', verdict, args[0]);
         // As discord.js does, withResponse wins over fetchReply.
         if (options.withResponse) return withMessage(ack, name === 'reply' ? 'reply' : 'update', edited);
         return options.fetchReply ? edited : ack;
       }
-      return early.ok ? send(name, args) : tell(name, early, args[0]);
+      return early.ok ? payload(name, args) : tell(name, early, args[0]);
     }
     const verdict = await verdicts;
-    return verdict.ok ? send(name, args) : tell(name, verdict, args[0]);
+    return verdict.ok ? payload(name, args) : tell(name, verdict, args[0]);
   };
 
   // A core sender whose result is a Discord message, not a response: true when every write is confirmed; otherwise
   // false. With tellMember, once it has a write to wait on it always answers the interaction: acknowledged before true,
   // or told the truth before false. Without tellMember it never acknowledges, so the caller's own response stays
   // possible; it then answers false once the ack deadline passes unconfirmed.
-  const answer = async (frameLedger: WriteLedger | undefined, tellMember: boolean): Promise<boolean> => {
-    const pending = pendingIn(frameLedger && frameLedger !== ledger ? [frameLedger, ledger] : [ledger]);
-    if (pending.refused.length === 0 && pending.unlanded.length === 0) return true;
+  const answer = async (frameLedger: WriteLedger | undefined, tellMember: boolean, caller: string | undefined): Promise<boolean> => {
+    const ledgers = frameLedger && frameLedger !== ledger ? [frameLedger, ledger] : [ledger];
+    const pending = pendingIn(ledgers);
+    // The caller's visible result goes out next, outside the gate, so a true marks as a payload does.
+    const confirmed = (): true => {
+      mark = markOf(pending, ledgers, caller ?? ledger.kind);
+      return true;
+    };
+    if (pending.refused.length === 0 && pending.unlanded.length === 0) return confirmed();
     const verdicts = judge(pending);
     const remaining = ledger.openedAt + ACK_MS - performance.now();
-    if (!tellMember) return (await within(verdicts, remaining))?.ok === true;
+    if (!tellMember) return (await within(verdicts, remaining))?.ok === true && confirmed();
     // Its own acknowledgements read as made from the moment they are due, as a held call's do, so a reader of the
     // flags (the panel's auto-defer) sends no second one while they are on the wire.
     const raised: Array<'deferred' | 'replied'> = [];
@@ -307,7 +398,7 @@ export function installReplyGate(interaction: object, ledger: WriteLedger): void
       if (verdict.ok) {
         // The caller acts on a message before its own first response; after this wait, the acknowledgement goes first.
         if (!real.deferred && !real.replied) await acknowledge();
-        return true;
+        return confirmed();
       }
       due('replied');
       await tell(real.deferred || real.replied ? 'followUp' : 'reply', verdict, undefined);
@@ -329,22 +420,40 @@ export function installReplyGate(interaction: object, ledger: WriteLedger): void
   for (const name of Object.keys(original)) {
     target[name] = (...args: unknown[]): Promise<unknown> => {
       const frameLedger = currentLedger();
-      return enqueue(SETS[name], () => (GATED.has(name) ? gated(name, args, frameLedger) : send(name, args)));
+      const sender = currentModule() ?? ledger.kind;
+      return enqueue(SETS[name], () => (GATED.has(name) ? gated(name, args, frameLedger, sender) : send(name, args)));
     };
   }
-  answers.set(interaction, (frameLedger, tellMember) => enqueue(null, () => answer(frameLedger, tellMember)));
+  // Logs once per site, never to the member; the mark is cleared so it keeps no working set alive.
+  const sweep = async (): Promise<void> => {
+    const last = mark;
+    mark = null;
+    if (!last || !wroteSince(last)) return;
+    const { kind, name } = siteOf(target);
+    const site = `${last.module}|${kind}|${name}`;
+    if (reported.has(site)) return;
+    reported.add(site);
+    console.warn(`[Truth] ${last.module} sent a reply that did not wait on a write (${kind} ${name})`);
+  };
+  gates.set(interaction, {
+    answer: (frameLedger, tellMember, caller) => enqueue(null, () => answer(frameLedger, tellMember, caller)),
+    sweep: () => enqueue(null, sweep),
+  });
 }
 
-const answers = new WeakMap<object, (frameLedger: WriteLedger | undefined, tellMember: boolean) => Promise<boolean>>();
+interface Gate {
+  answer(frameLedger: WriteLedger | undefined, tellMember: boolean, caller: string | undefined): Promise<boolean>;
+  sweep(): Promise<void>;
+}
+
+const gates = new WeakMap<object, Gate>();
 
 /** An interaction no gate holds (never emitted): the frame's and its own ledger, judged without sending anything. */
 async function judgedOk(interaction: object | null | undefined): Promise<boolean> {
   const frameLedger = currentLedger();
   const own = interaction ? ledgerOf(interaction) : undefined;
   const ledgers = [frameLedger, own].filter((l, i, all): l is WriteLedger => l !== undefined && all.indexOf(l) === i);
-  const pending = pendingIn(ledgers);
-  if (pending.refused.length === 0 && pending.unlanded.length === 0) return true;
-  return (await judge(pending)).ok;
+  return (await verdictOf(ledgers)).ok;
 }
 
 /**
@@ -354,8 +463,8 @@ async function judgedOk(interaction: object | null | undefined): Promise<boolean
  * ephemeral deferral. An interaction no gate holds is judged without anything being sent.
  */
 export function answerWrites(interaction: object | null | undefined): Promise<boolean> {
-  const gate = interaction ? answers.get(interaction) : undefined;
-  return gate ? gate(currentLedger(), true) : judgedOk(interaction);
+  const gate = interaction ? gates.get(interaction) : undefined;
+  return gate ? gate.answer(currentLedger(), true, currentModule()) : judgedOk(interaction);
 }
 
 /**
@@ -363,8 +472,20 @@ export function answerWrites(interaction: object | null | undefined): Promise<bo
  * ack deadline passes with the verdict still out, so the caller's own response stays possible.
  */
 export function writesConfirmed(interaction: object | null | undefined): Promise<boolean> {
-  const gate = interaction ? answers.get(interaction) : undefined;
-  return gate ? gate(currentLedger(), false) : judgedOk(interaction);
+  const gate = interaction ? gates.get(interaction) : undefined;
+  return gate ? gate.answer(currentLedger(), false, currentModule()) : judgedOk(interaction);
+}
+
+/**
+ * The sweep (BT-4), at the end of an interaction's dispatch: when a write was recorded that the last payload was not
+ * judged on, so that payload did not wait on it, it logs the module that sent it, once per site. Only the last
+ * payload is compared, so an earlier one sent before a write that a later payload waited on (a progress reply) is not
+ * logged. It runs after every call still queued, and sends nothing; an interaction no gate holds is not swept, nor
+ * a dispatch that outlives the interaction ledger's life (15 minutes), whose ledger is sealed by then.
+ */
+export function sweepLateWrites(interaction: object): Promise<void> {
+  const gate = gates.get(interaction);
+  return gate ? gate.sweep().catch(() => undefined) : Promise.resolve();
 }
 
 /** The gateway Client's interactions: each gets its ledger (BT-2) and its reply gate. */

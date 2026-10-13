@@ -27,6 +27,7 @@ import { injectReturnButtonIfNeeded } from './panelResponseUtils';
 import { serializePanelResponse } from '../panelSerializer';
 import { DISCORD_EPHEMERAL_FLAG } from '@bot/constants';
 import { answerWrites, writesConfirmed } from '../dataBackends/replyGate';
+import { noteConsoleOutcome } from '../consoleInteraction';
 import {
   createTitledContainer,
   createText,
@@ -62,8 +63,10 @@ export async function createPersistentPanel(
 
     // Posted only once the callback's writes are confirmed. When they are not by the ack deadline, the panel is not
     // posted: the caller's own response then carries the truth, or the view if the writes land by its own confirm.
+    // The console's answer says so, since no success may cover a missing post.
     if (!(await writesConfirmed(context.interaction))) {
       console.warn(`[PersistentPanel] Panel ${panel.id} was not posted: the writes its callback made are not confirmed`);
+      noteConsoleOutcome(context.interaction, { refusal: 'the panel was not posted: its writes were not confirmed in time' });
       return null;
     }
 

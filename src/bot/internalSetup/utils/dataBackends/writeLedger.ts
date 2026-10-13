@@ -198,6 +198,12 @@ export function currentLedger(): WriteLedger | undefined {
   return frames.getStore()?.ledger;
 }
 
+/** The module a write made here would be recorded under. */
+export function currentModule(): string | undefined {
+  const frame = frames.getStore();
+  return frame ? frame.module ?? frame.ledger.kind : undefined;
+}
+
 /** Runs fn with its writes tagged with this module, inside the ledger in scope; with none, just runs fn. */
 export function withModule<T>(module: string | null | undefined, fn: () => T): T {
   const frame = frames.getStore();

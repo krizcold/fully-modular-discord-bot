@@ -6,15 +6,19 @@ import { serializePanelResponse, SerializedPanelResponse, extractUserIdsFromResp
 import { getAdminPanelList } from './adminPanelUI';
 import { PanelManagerConfig, PanelListItem } from '../../../types/panelTypes';
 import { loadCredentials } from '../../../../utils/envLoader';
-import { parseButtonCustomId } from './panelButtonHandler';
+import { parseButtonCustomId } from './panelCustomIds';
 import { checkPanelPermissions } from './panelPermissions';
 import type { RegisteredButtonInfo } from '../../../types/commandTypes';
+import { withModule } from '../dataBackends/writeLedger';
+
+/** Core's own panel button keys: panel.handleButton has already handled their custom ids. */
+const CORE_PANEL_KEYS = new Set(['panel', 'persistent_warning']);
 
 /**
  * Broadcast panel update to all WebSocket clients via IPC
  * This enables real-time updates when Web-UI users interact with panels
  */
-function broadcastWebUIPanelUpdate(
+export function broadcastWebUIPanelUpdate(
   panelId: string,
   serializedResponse: SerializedPanelResponse,
   guildId?: string | null
@@ -51,6 +55,8 @@ export interface WebUIResponse<T = any> {
   success: boolean;
   data?: T;
   error?: string;
+  /** The update for every viewer of the panel, broadcast by the panel IPC handler once the run's writes are confirmed; never sent over IPC. */
+  liveUpdate?: { panelId: string; guildId: string | null; response: SerializedPanelResponse };
 }
 
 /**
@@ -191,7 +197,7 @@ function createWebUIContext(
 
 /**
  * Execute a panel callback and serialize the response for Web-UI
- * @param broadcast - If true, broadcast the update to all WebSocket clients
+ * @param broadcast - If true, the response carries the live update for all WebSocket clients
  */
 async function executeWebUIPanel(
   panel: PanelOptions,
@@ -222,15 +228,11 @@ async function executeWebUIPanel(
 
     const serialized = serializePanelResponse(response, resolvedUsersMap);
 
-    // Broadcast update to all WebSocket clients if requested
-    // This enables real-time updates for other users viewing the same panel
-    if (broadcast && serialized) {
-      broadcastWebUIPanelUpdate(context.panelId, serialized, context.guildId);
-    }
-
+    // If requested, the update for other users viewing the same panel, broadcast once the run's writes are confirmed
     return {
       success: true,
-      data: serialized
+      data: serialized,
+      ...(broadcast && serialized && { liveUpdate: { panelId: context.panelId, guildId: context.guildId || null, response: serialized } })
     };
   } catch (error) {
     console.error(`[PanelWebUIAdapter] Error executing panel ${context.panelId}:`, error);
@@ -424,15 +426,11 @@ export class PanelWebUIAdapter {
 
       const serialized = serializePanelResponse(response, resolvedUsersMap);
 
-      // Broadcast update to all WebSocket clients
-      // Button interactions change panel state that should be visible to other users
-      if (serialized) {
-        broadcastWebUIPanelUpdate(panelId, serialized, guildId);
-      }
-
+      // Button interactions change panel state that should be visible to other users, once the run's writes are confirmed
       return {
         success: true,
-        data: serialized
+        data: serialized,
+        ...(serialized && { liveUpdate: { panelId, guildId: guildId || null, response: serialized } })
       };
     } catch (error) {
       console.error(`[PanelWebUIAdapter] Error executing button ${parsedButtonId}:`, error);
@@ -563,12 +561,13 @@ export class PanelWebUIAdapter {
     let matchedKey: string | undefined;
 
     // Check exact match first
-    if (registeredButtons.has(buttonId)) {
+    if (registeredButtons.has(buttonId) && !CORE_PANEL_KEYS.has(buttonId)) {
       handlerInfo = registeredButtons.get(buttonId);
       matchedKey = buttonId;
     } else {
       // Check prefix match
       for (const [prefix, info] of registeredButtons.entries()) {
+        if (CORE_PANEL_KEYS.has(prefix)) continue;
         if (buttonId.startsWith(prefix) &&
             (buttonId.length === prefix.length || buttonId.charAt(prefix.length) === '_')) {
           handlerInfo = info;
@@ -595,8 +594,9 @@ export class PanelWebUIAdapter {
         return null;
       }
 
-      // Execute the handler
-      await handlerInfo.handler(this.client, mockInteraction as unknown as ButtonInteraction, -1);
+      // Execute the handler; its writes carry its own module
+      const { handler } = handlerInfo;
+      await withModule(handlerInfo._moduleName, () => handler(this.client, mockInteraction as unknown as ButtonInteraction, -1));
 
       // Check if a modal was captured
       if (modalCapture.modal) {
@@ -615,7 +615,10 @@ export class PanelWebUIAdapter {
 
     } catch (error) {
       console.error(`[PanelWebUIAdapter] Error executing registered handler for ${buttonId}:`, error);
-      return null;
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
     }
   }
 

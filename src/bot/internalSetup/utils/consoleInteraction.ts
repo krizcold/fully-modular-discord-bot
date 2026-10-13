@@ -10,7 +10,8 @@
  *
  * Not exercised: Discord's own interaction routing and ack tokens. A module that
  * reaches for interaction surface beyond what is implemented here throws a natural
- * error, which handleCommands logs (visible via `smdb logs`).
+ * error, which handleCommands logs (visible via `smdb logs`) and records as the
+ * invoke's outcome.
  */
 
 import { Client, Guild, GuildMember, User } from 'discord.js';
@@ -20,10 +21,22 @@ export interface CapturedReply {
   payload: unknown;
 }
 
+/** Why an invoke did not succeed, apart from its writes: the dispatcher refused it, or the command threw. */
+export type ConsoleOutcome = { refusal: string } | { error: string };
+
 export interface ConsoleInvokeResult {
   captured: CapturedReply[];
   replied: boolean;
   deferred: boolean;
+  outcome?: ConsoleOutcome;
+}
+
+const invokes = new WeakMap<object, ConsoleInvokeResult>();
+
+/** Records the first outcome of a console invoke; does nothing for any interaction not built here. */
+export function noteConsoleOutcome(interaction: unknown, outcome: ConsoleOutcome): void {
+  const result = typeof interaction === 'object' && interaction !== null ? invokes.get(interaction) : undefined;
+  if (result && !result.outcome) result.outcome = outcome;
 }
 
 interface BuildOpts {
@@ -144,5 +157,6 @@ export function buildConsoleInteraction(opts: BuildOpts): {
     fetchReply: async () => fakeMessage,
   };
 
+  invokes.set(interaction, result);
   return { interaction, result };
 }
