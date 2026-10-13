@@ -325,8 +325,8 @@ async function control(after, tier, on, only, timed = false) {
 }
 
 /**
- * runner.mjs's refusal of the files a run with no mutant was given (a way to
- * /data), if it refused them.
+ * runner.mjs's refusal of the files a run with no mutant was given (a way to a
+ * fixed root: /data, or /app or a path under it), if it refused them.
  * @param {string} dir the run's report dir
  * @returns {string[]}
  */
@@ -467,7 +467,7 @@ try {
 
   const forB = toPassB(mutants);
   if (forB.length > 0) {
-    console.log(`L5: pass B (integration tests that import the changed files, then every child scenario) on ${forB.length} survivor(s)`);
+    console.log(`L5: pass B (integration tests that import the mutated files, then every child scenario) on ${forB.length} survivor(s)`);
     await passOn('b', 'b', 'b', forB, { ...PASSES.b, concurrency: Math.max(1, Math.floor(opts.concurrency / 2)) });
     const confirmB = toConfirm(mutants, 'b');
     const killers = byKiller(confirmB);

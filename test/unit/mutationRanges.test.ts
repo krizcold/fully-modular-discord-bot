@@ -900,10 +900,12 @@ describe('the widening', () => {
 // spans more than one line, which spans the loop (a one-line loop's is made,
 // and so is one whose every line changed, below), and the emptying of a case
 // clause on more than one line (its label is a header, its statements a body,
-// braces or not), unless the line takes whole a statement that starts on the
-// label line and ends the clause (and one whose every line changed is made,
-// below; a label and a body line widen to themselves, below). Every other body's emptying is made (a callback's, a method
-// of an object or a class expression), and what is not made is checked not to be.
+// braces or not), unless the line lies in its label or in a statement that is
+// neither a block nor a compound statement, when that starts on the label line
+// and ends the clause (one whose every line changed is made, below; a label
+// and a body line widen to themselves, below). Every other body's emptying is
+// made (a callback's, a method of an object or a class expression), and what
+// is not made is checked not to be.
 describe('the widening, against what Stryker makes', () => {
   const quiet = () => {};
   const logger = { debug: quiet, info: quiet, warn: quiet, error: quiet, trace: quiet, fatal: quiet, isDebugEnabled: () => false, isTraceEnabled: () => false, isInfoEnabled: () => false, isWarnEnabled: () => false, isErrorEnabled: () => false, isFatalEnabled: () => false };
@@ -934,9 +936,11 @@ describe('the widening, against what Stryker makes', () => {
       // Each for with no condition on more than one line: its false condition spans the loop, so one changed line
       // does not make it (a one-line loop's is made, and the filter below keeps those out).
       const loops = new Set<string>();
-      // Each case or default clause on more than one line: its emptying spans its body, so one changed line makes it
-      // only when the line takes whole a statement that starts on the label line and ends the clause.
-      const clauses = new Set<string>();
+      // Each case or default clause on more than one line, with the lines that make its emptying, which spans its
+      // body: those of its label, or of a statement of it that is neither a block nor a compound statement, when
+      // that starts on the label line and ends the clause (a line of it takes it whole). From any other line it is not
+      // made. Read from the tree, not from the widening, so a widening that takes too much or too little fails.
+      const clauses = new Map<string, Set<number>>();
       const inExpression = (node: ts.Node) => (ts.isMethodDeclaration(node) || ts.isGetAccessor(node) || ts.isSetAccessor(node) || ts.isConstructorDeclaration(node))
         && (ts.isObjectLiteralExpression(node.parent) || ts.isClassExpression(node.parent));
       const walk = (node: ts.Node) => {
@@ -946,7 +950,15 @@ describe('the widening, against what Stryker makes', () => {
         }
         const lineAt = (pos: number) => sf.getLineAndCharacterOfPosition(pos).line;
         if (ts.isForStatement(node) && !node.condition && lineAt(node.getStart(sf)) < lineAt(node.getEnd())) loops.add(`${node.getStart(sf)}-${node.getEnd()}`);
-        if ((ts.isCaseClause(node) || ts.isDefaultClause(node)) && lineAt(node.getStart(sf)) < lineAt(node.getEnd())) clauses.add(`${node.getStart(sf)}-${node.getEnd()}`);
+        if ((ts.isCaseClause(node) || ts.isDefaultClause(node)) && lineAt(node.getStart(sf)) < lineAt(node.getEnd())) {
+          const [label, end] = [lineAt(node.getStart(sf)), lineAt(node.getEnd())];
+          const compound = (part: ts.Node) => ts.isBlock(part) || ts.isIfStatement(part) || ts.isIterationStatement(part, false) || ts.isSwitchStatement(part) || ts.isTryStatement(part);
+          const takers = new Set<number>();
+          for (const part of [...(ts.isCaseClause(node) ? [node.expression] : []), ...node.statements]) {
+            if (!compound(part) && lineAt(part.getStart(sf)) === label && lineAt(part.getEnd()) === end) for (let l = label; l <= end; l++) takers.add(l + 1);
+          }
+          clauses.set(`${node.getStart(sf)}-${node.getEnd()}`, takers);
+        }
         ts.forEachChild(node, walk);
       };
       walk(sf);
@@ -962,8 +974,7 @@ describe('the widening, against what Stryker makes', () => {
         const spanOf = (m: Made) => `${at(m.location.start)}-${at(m.location.end)}`;
         const braceOnly = (m: Made) => m.mutatorName === 'BlockStatement' && m.location.start.line < m.location.end.line && bodies.has(spanOf(m));
         const ranges = rangesOf(text, [n]) ?? [];
-        const heldWhole = (m: Made) => ranges.some(([s, e]) => s <= m.location.start.line + 1 && m.location.end.line + 1 <= e);
-        const spansBody = (m: Made) => m.mutatorName === 'ConditionalExpression' && (loops.has(spanOf(m)) || (clauses.has(spanOf(m)) && !heldWhole(m)));
+        const spansBody = (m: Made) => m.mutatorName === 'ConditionalExpression' && (loops.has(spanOf(m)) || clauses.get(spanOf(m))?.has(n) === false);
         const touching = whole.filter(m => m.location.start.line + 1 <= n && n <= m.location.end.line + 1 && !throughBlock(m));
         const expected = touching.filter(m => !braceOnly(m) && !spansBody(m));
         const mutate = ranges.map(([s, e]) => ({ start: { line: s - 1, column: 0 }, end: { line: e - 1, column: Number.MAX_SAFE_INTEGER } }));
@@ -1187,6 +1198,20 @@ describe('the targets', () => {
     ]);
     expect(plan.skipped).toEqual([{ file: 'tools/x.ts', why: 'outside src' }, { file: 'src/x.ts', why: 'moved to tools/x.ts: nothing is left to mutate' }]);
     expect(plan.emptyScope).toBe(false);
+  });
+
+  it('diffs a file only taken out of the index (git rm --cached) against the base, never as both deleted and new', () => {
+    const plan = planOf(
+      [{ status: 'D', file: 'src/kept.ts' }, { status: 'D', file: 'src/edited.ts' }, { status: 'D', file: 'src/gone.ts' }],
+      ['src/kept.ts', 'src/edited.ts', 'src/fresh.ts'],
+      { 'src/kept.ts': SAMPLE, 'src/edited.ts': SAMPLE, 'src/fresh.ts': SAMPLE },
+      { 'src/edited.ts': changedAt(SAMPLE, 4) },
+    );
+    expect(plan.targets).toEqual([changeTarget('src/edited.ts', SAMPLE, { changed: [4], deletedAfter: [] }), wholeTarget('src/fresh.ts')]);
+    expect(plan.skipped).toEqual([
+      { file: 'src/kept.ts', why: 'no changed lines (a rename, a mode change, or line endings only)' },
+      { file: 'src/gone.ts', why: 'deleted: nothing is left to mutate' },
+    ]);
   });
 
   it('answers for every line a whole file or a pattern covers, and for the changed lines of a diff', () => {

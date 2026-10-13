@@ -128,9 +128,11 @@ const failedInB = b => (b?.killedBy ? `killed in pass B by ${b.killedBy}` : `fai
  * it again when run alone; when that file passes alone, the tests after it in
  * pass B never ran on the mutant, so it is no survivor either. One the gate
  * never reran, or whose rerun was voided (the run with no mutant after it
- * failed), is inconclusive.
+ * failed) or never checked by that run (the gate stopped first), is
+ * inconclusive.
  * @param {MutantRecord} m
- * @param {boolean} [stopped] the gate stopped before it finished: a survivor pass B never ran on is no survivor
+ * @param {boolean} [stopped] the gate stopped before it finished: a survivor pass B never ran on is no survivor, and
+ *   a b2 kill no run with no mutant checked is no kill
  * @returns {{ outcome: string, why?: string }}
  */
 export function confirmed(m, stopped = false) {
@@ -151,6 +153,9 @@ export function confirmed(m, stopped = false) {
   if (voided) return { outcome: 'Inconclusive', why: voided };
   if (b && outcomeOf(b) === 'Timeout') return { outcome: 'Inconclusive', why: 'hung in pass B, where a hang is not counted' };
   if (b2 && last === 'Timeout') return { outcome: 'Inconclusive', why: `${failedInB(b)}, but hung instead of failing when run alone` };
+  // The run with no mutant after b2 comes after every b2 run, and the gate only
+  // finishes once it passes, so a stopped gate's b2 kill was never checked by it.
+  if (stopped && b2) return { outcome: 'Inconclusive', why: `${failedInB(b)}, and again alone, but the gate stopped before the run with no mutant after the reruns` };
   if (b && !b2) return { outcome: 'Inconclusive', why: 'killed in pass B, never rerun alone' };
   if (!b && !a2 && last === 'Timeout') return { outcome: 'Inconclusive', why: 'timed out, never rerun alone' };
   return { outcome: last };

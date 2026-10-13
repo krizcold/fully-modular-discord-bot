@@ -237,15 +237,19 @@ describe('the verdict', () => {
       mutant(5, true, { a: pass('Survived'), b: pass('Killed', { killedBy: 'child/x.test.ts > x' }), b2: pass('Missing') }),
       // A pass A survivor the stopped gate never sent through pass B.
       mutant(6, true, { a: pass('Survived') }),
+      // A pass B kill that failed again alone in an earlier b2 group, before a later group stopped the gate: the run
+      // with no mutant after the reruns never ran.
+      mutant(7, true, { a: pass('Survived'), b: pass('Killed', { killedBy: 'child/x.test.ts > x' }), b2: pass('Killed', { killedBy: 'child/x.test.ts > x' }) }),
     ], { stopped: ['pass b2 could not run: x'] }).lines.join('\n');
     expect(text).toMatch(/^ {2}src\/a\.ts:6:3 .*\(pass B never ran on it: the gate stopped first\)$/m);
+    expect(text).toMatch(/^ {2}src\/a\.ts:7:3 .*\(killed in pass B by child\/x\.test\.ts > x, and again alone, but the gate stopped before the run with no mutant after the reruns\)$/m);
     expect(text).toMatch(/^ {2}src\/a\.ts:4:3 .*\(pass a2 made no mutant at this place, so it ran no test on it\)$/m);
     expect(text).toMatch(/^ {2}src\/a\.ts:5:3 .*\(pass b2 made no mutant at this place, so it ran no test on it\)$/m);
     expect(text).not.toMatch(/^Survivors /m);
     expect(text).toMatch(/^Inconclusive .*\n {2}src\/a\.ts:1:3 .*\(killed in pass B by child\/x\.test\.ts > x, but hung instead of failing when run alone\)$/m);
     expect(text).toMatch(/^ {2}src\/a\.ts:2:3 .*\(killed in pass B, never rerun alone\)$/m);
     expect(text).toMatch(/^ {2}src\/a\.ts:3:3 .*\(timed out, never rerun alone\)$/m);
-    expect(text).toMatch(/^ {2}killed in pass A: 0; run in pass B: 3, killed there: 0$/m);
+    expect(text).toMatch(/^ {2}killed in pass A: 0; run in pass B: 4, killed there: 0$/m);
   });
 
   it('has no result when nothing changed or no gating mutant was made, and names what was not tested', () => {

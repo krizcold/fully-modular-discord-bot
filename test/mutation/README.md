@@ -34,7 +34,10 @@ From the bot root, with Node 22.12 or newer (or SMDB_TEST_NODE set, as for `npm 
 - With no option it mutates the change from HEAD to the working tree: the job before it is committed. For a job already
   committed, pass `--base` the commit before it; `--base main` takes everything since the merge-base with main (a
   branch). A file new to src is taken whole: an untracked one, one added, and one moved in from outside src (or from a
-  browser view, or from a name that is not code). A file renamed within src gates its changed lines only.
+  browser view, or from a name that is not code). A file renamed within src gates its changed lines only when git sees
+  the rename, that is when the new name is staged (`git add`, or `git add -N`): a move git does not see (a plain `mv`,
+  an editor's rename) is a deletion and an untracked file, which is taken whole. A file only taken out of the index
+  (`git rm --cached`, kept on disk) is diffed against the base as a changed one.
 - `--mutate src/x.ts:10-20` (a file in the bot root that exists and that a diff would mutate, or such a file and lines,
   repeatable; never a glob, never columns, never the suite's own files) skips git's diff (git still lists the tree, which
   is what a sandbox holds); every mutant it makes gates. A file git neither tracks nor would add (one it ignores, or one
@@ -87,10 +90,13 @@ does not name by its content.
   loop: the no-mutant list below names it when it has no mutant of its own, and the structure list when it holds the
   body's `{`; one with a mutant of its own (`for (let i = 0; ; i++)`) and no `{` is named in neither. The emptying of
   a case clause spans the clause, so it is made the same way: only where one range holds the whole clause (a clause
-  on one line, one whose every line changed, as a clause a job adds, or a changed line that takes whole a statement
-  starting on the label line and ending the clause), and then it gates; a changed label or body line otherwise
-  widens to itself and does not make it. A changed label is in the structure list,
-  and in the no-mutant list too when no mutant lies wholly on its line (`case 1:` alone, not `case 1: return 1;`). A block wholly made of
+  on one line, one whose every line changed, as a clause a job adds, one inside a statement a changed line takes
+  whole, or a changed line that takes whole a label or a statement, neither a block nor a compound statement, that
+  starts on the label line and ends the clause), and then gates as any mutant does; otherwise a changed label widens
+  to the label only and a body line to its statement within the clause, and neither makes it. A changed label is in
+  the structure list, and in the no-mutant list too when no mutant lies wholly on its line (`case 1:` alone, not
+  `case 1: return 1;`). Each of these exceptions holds outside a statement a changed line takes whole, where one range
+  holds everything inside it. A block wholly made of
   changed lines is made, and so is every other body's emptying. unit/mutationRanges.test.ts holds this rule to
   Stryker's own instrumenter, line by line, both what is made and what is not, on made-up shapes and on two real files.
 - The other mutants in the widened ranges are **context**: they run in pass A and are listed, but never fail the gate.
@@ -132,7 +138,7 @@ does not name by its content.
   compiled, and no test loads them yet), a file deleted or moved out of src, an untracked git repository (git lists
   none of its files, and none is copied into a sandbox) or a git submodule under src, a file whose name Stryker would read as a glob (`[id].ts`,
   `a{1,2}.ts`; rename it), a file in src that is a link to one that is not mutated (the suite's own env scrub, say),
-  a change that leaves no line changed (a rename, a mode change, line endings only), and a
+  a change that leaves no line changed (a rename git sees, a mode change, line endings only), and a
   file that holds a line break Stryker counts and the gate does not (a lone CR, U+2028 or U+2029), whose lines the two
   would number differently; `--mutate` refuses such a file.
 - Never mutated, on any machine, and named: a file whose code names the DATA_DIR variable or holds `'/data'` as a
@@ -140,7 +146,9 @@ does not name by its content.
   others), or holds the image's `'/app'` root or a path under it (`'/app/build'`, `` `/app/${x}` ``: the module path
   helpers, the snapshot and update code and src/index.ts today). A mutant of it (the DATA_DIR check made false, the
   image's marker taken as found, the fallback chosen) sends the tests to such a root, on a developer's machine a real
-  data root (on Windows at the root of the run's drive: `D:\app` for a checkout on D:) and anywhere else one the run would make outside the sandbox. A path under
+  data root (on Windows at the root of the drive of the process's cwd: the checkout's for a test, the temp dir's for a
+  child step, so `D:\app` or `C:\data` for a checkout on D: with TEMP on C:) and anywhere else one the run would make
+  outside the sandbox. A path under
   `/data` written out in full (`'/data/global'`) is not matched, since route paths such as `'/data/get'` read the
   same: unit/mutationRanges.test.ts fails when a file in src that git tracks or would add (what the gate can mutate)
   gains a string that starts with `/data/` and is not one of the known routes, so such a path goes through dataRoot.ts. `--mutate` refuses such a file, and each pass's run with no mutant, which
@@ -183,7 +191,7 @@ does not name by its content.
    files it does not mutate), and where it runs related tests (pass A, its run with no checker, a2 and the run after
    it, pass B's integration tier) only tests that import one of them, directly or through other files, run (a test
    that reaches them by no import vitest can see, such as a computed require, a file read or a child process, does
-   not). Pass B's child tier runs whole, and b2 and the run after it run the one file that failed. There is no coverage analysis: every mutant runs those tests. The files go on vitest's
+   not). Pass B's child tier runs whole; each b2 run runs the one file that failed, and the run after them runs every such file. There is no coverage analysis: every mutant runs those tests. The files go on vitest's
    command line relative to test/; a change of many hundreds of files can pass Windows' limit on a command line, and
    then the run's log says vitest could not start.
 2. **Pass B, the rest, on pass A's gating survivors only.** The sandbox's dist is built from the instrumented src
@@ -218,7 +226,8 @@ does not name by its content.
      budget is an hour, above anything vitest's own limits let the file take after its first failure, so a rerun that
      fails always leaves its report.
    - A mutant the gate never reran (it stopped first) is inconclusive, and so is a survivor of pass A that the stopped
-     gate never ran through pass B.
+     gate never ran through pass B, and a pass B kill that failed again alone in one b2 run while a later one stopped
+     the gate before the run with no mutant after them.
 4. **A run with no mutant after the reruns.** When a rerun counted a kill or a timeout, the same tests run once more
    with no mutant, in the checkout itself, the way the reruns ran them (mutation/control.mjs). If they fail, the
    machine or a container went bad during the reruns, so what the reruns counted is inconclusive and the gate ends NO
@@ -313,7 +322,7 @@ child away from anything real:
   unit/envScrub.test.ts holds the list against what src reads. pg is pointed at no server (PGHOST, PGPASSFILE) and git
   at no repository above the bot root or the temp dir (GIT_CEILING_DIRECTORIES: a sandbox sits inside the checkout and
   holds no .git, and test data dirs and child cwds sit under the temp dir), with NODE_ENV `test` and its own DATA_DIR;
-  the code that reads DATA_DIR or falls back to `/data` is never mutated (What it mutates), and a process started
+  the code that reads DATA_DIR or holds a fixed root (`/data`, `/app`) is never mutated (What it mutates), and a process started
   with an env of its own that lacks DATA_DIR throws, in a test and in every child step: fork, spawn, exec, execFile,
   their sync forms, a promisified exec or execFile, and a worker_threads Worker (helpers/forkGuard.cjs, which setup.ts
   loads and child.ts preloads; src/webui/botManager.ts forks the bot so, and a mutant that empties that env must fail,

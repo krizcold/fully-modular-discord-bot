@@ -512,7 +512,7 @@ export const wholeTarget = file => ({ file, ranges: null, gating: null, patterns
  * moved in from a name never mutated (outside src, a browser view, a file that
  * is not code). One moved out of the mutated code is named, as a deletion is.
  * A file that holds a line break Stryker counts and the diff does not is named
- * and not mutated (EXTRA_BREAK_WHY), and so is a file on the way to '/data'
+ * and not mutated (EXTRA_BREAK_WHY), and so is a file on the way to a fixed root
  * (DATA_ROUTE_WHY), a git submodule (`isDir`: git
  * names only its commit), a file whose name Stryker would read as a glob
  * (`nameOf` gives null) and one whose name on disk, through a link, is not
@@ -523,6 +523,11 @@ export const wholeTarget = file => ({ file, ranges: null, gating: null, patterns
  * @returns {{ targets: Target[], skipped: { file: string, why: string }[], emptyScope: boolean }}
  */
 export function planChange({ entries, untracked, read, readBase, nameOf, isDir = () => false }) {
+  // A file only taken out of the index (git rm --cached) is deleted to git and
+  // untracked on disk: it is the base's file still, diffed as a changed one.
+  const unindexed = new Set(entries.filter(entry => entry.status === 'D' && untracked.includes(entry.file)).map(entry => entry.file));
+  entries = entries.map(entry => (entry.status === 'D' && unindexed.has(entry.file) ? { status: 'M', file: entry.file } : entry));
+  untracked = untracked.filter(file => !unindexed.has(file));
   /** @type {Target[]} */
   const targets = [];
   /** @type {{ file: string, why: string }[]} */

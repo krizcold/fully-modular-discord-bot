@@ -71,7 +71,7 @@ if (runIds && mutant !== 'dry') {
   if (Array.isArray(ids) && !ids.includes(mutant)) process.exit(0);
 }
 // The run with no mutant comes first in every pass: here the files as the pass
-// copied them must hold no way to /data, whatever changed since the gate
+// copied them must hold no way to a fixed root, whatever changed since the gate
 // planned (ranges.mjs holdsDataRoute; an instrumented file still names it).
 if (mutant === 'dry') {
   const { DATA_ROUTE_WHY, holdsDataRoute } = await import('./ranges.mjs');
