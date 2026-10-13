@@ -25,6 +25,7 @@ import { startModuleAutoUpdater } from './utils/moduleAutoUpdater';
 import { loadCredentials } from '../../utils/envLoader';
 import { initFleet, relaxFleetSyncPosture } from './fleet/bootstrap';
 import { getIngestService } from './ingest/ingestService';
+import { installReplyGate } from './utils/dataBackends/replyGate';
 import { ModuleLoader } from './utils/moduleLoader';
 import { getModuleRegistry } from './utils/moduleRegistry';
 import { getModuleEventManager } from './utils/moduleEventManager';
@@ -536,11 +537,12 @@ async function main() {
   // discord.js silently drops those events. Every internal and module
   // reaction handler already fetches partials before use.
   // Construction goes through IngestService: {shards, shardCount} come from
-  // this node's lease (standalone lease = the whole shard set).
+  // this node's lease (standalone lease = the whole shard set). Every
+  // interaction gets its write ledger and its reply gate (BT-3).
   const client = getIngestService().buildClient({
     intents: finalIntents,
     partials: [Partials.Message, Partials.Reaction, Partials.User],
-  });
+  }, installReplyGate);
   fleet.attachClient(client);
 
   client.buttonHandlers = new Map<string, RegisteredButtonInfo>();

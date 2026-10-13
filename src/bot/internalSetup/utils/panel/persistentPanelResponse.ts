@@ -26,6 +26,7 @@ import {
 import { injectReturnButtonIfNeeded } from './panelResponseUtils';
 import { serializePanelResponse } from '../panelSerializer';
 import { DISCORD_EPHEMERAL_FLAG } from '@bot/constants';
+import { answerWrites, writesConfirmed } from '../dataBackends/replyGate';
 import {
   createTitledContainer,
   createText,
@@ -56,6 +57,13 @@ export async function createPersistentPanel(
     const channel = context.interaction.channel;
     if (!channel || !('send' in channel)) {
       console.error('Cannot send persistent panel - invalid channel');
+      return null;
+    }
+
+    // Posted only once the callback's writes are confirmed. When they are not by the ack deadline, the panel is not
+    // posted: the caller's own response then carries the truth, or the view if the writes land by its own confirm.
+    if (!(await writesConfirmed(context.interaction))) {
+      console.warn(`[PersistentPanel] Panel ${panel.id} was not posted: the writes its callback made are not confirmed`);
       return null;
     }
 
@@ -343,7 +351,9 @@ export async function handlePersistentPanelButton(
 
   response = injectReturnButtonIfNeeded(response, context);
 
-  if (panel.persistent) {
+  // The shared message shows the handler's writes only once they are confirmed; otherwise the member has the truth.
+  // A modal is the member's own response, not a view of the panel: it leaves the shared message as it was.
+  if (panel.persistent && !response.modal && await answerWrites(context.interaction)) {
     const updated = await updatePersistentPanel(
       context.client,
       panel.id,
@@ -378,7 +388,7 @@ export async function handlePersistentPanelModal(
 
   response = injectReturnButtonIfNeeded(response, context);
 
-  if (panel.persistent) {
+  if (panel.persistent && await answerWrites(context.interaction)) {
     const updated = await updatePersistentPanel(
       context.client,
       panel.id,

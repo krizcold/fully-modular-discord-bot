@@ -521,24 +521,24 @@ export function stampOwner(guildId: string): void {
 /** Queue an atomic write to an absolute path; refused once the exit drain has closed. */
 export function writeRawAtomic(absPath: string, contents: string): boolean {
   if (closedForExit) {
-    recordRefusal('node-stopping');
+    recordRefusal('node-stopping', `file:${absPath}`);
     throw new DataBackendUnavailableError('node-stopping');
   }
   const accepted = writeRawAtomicFile(absPath, contents);
-  if (accepted) recordTicket(fileTicket(absPath));
-  else recordRefusal('io');
+  if (accepted) recordTicket(fileTicket(absPath), `file:${absPath}`);
+  else recordRefusal('io', `file:${absPath}`);
   return accepted;
 }
 
 /** Queue an atomic delete of an absolute path (false: nothing to delete); refused once the exit drain has closed. */
 export function deleteRawAtomic(absPath: string): boolean {
   if (closedForExit) {
-    recordRefusal('node-stopping');
+    recordRefusal('node-stopping', `file:${absPath}`);
     throw new DataBackendUnavailableError('node-stopping');
   }
   const accepted = deleteRawAtomicFile(absPath);
   // A delete still queued for the path has not landed: it answers for this one.
-  if (accepted || getPending(absPath)?.op === 'delete') recordTicket(fileTicket(absPath));
+  if (accepted || getPending(absPath)?.op === 'delete') recordTicket(fileTicket(absPath), `file:${absPath}`);
   return accepted;
 }
 
@@ -603,19 +603,29 @@ export type AppendTracked = { outcome: 'appended'; ticket: WriteTicket } | { out
 /** An absent delete carries a ticket while an earlier delete of the same document has not landed. */
 export type DeleteTracked = { outcome: 'deleted'; ticket: WriteTicket } | { outcome: 'absent'; ticket?: WriteTicket } | { outcome: 'frozen' } | { outcome: 'refused'; cause: WriteRefusal };
 
-/** Records a tracked write's outcome in the entry's ledger (writeLedger.ts), and a refusal's cause before its throw. */
-function recorded<R extends SaveTracked | AppendTracked | DeleteTracked>(accept: () => R): R {
+/** The document a facade write names, for the ledger's refusals. */
+function docOf(filename: string, options: DataOptions): string {
+  const owner = options.scope === 'global' ? 'global' : `guild:${options.guildId ?? ''}`;
+  return `${owner}:${options.category ?? ''}/${filename}`;
+}
+
+/**
+ * Records a tracked write's outcome in the entry's ledger (writeLedger.ts), and a refusal's cause before its throw.
+ * whole: the write replaces the whole document (a save or a delete); an earlier refusal of that document then cannot
+ * be confirmed either way, since the rewrite may or may not carry the refused change.
+ */
+function recorded<R extends SaveTracked | AppendTracked | DeleteTracked>(doc: string, whole: boolean, accept: () => R): R {
   let result: R;
   try {
     result = accept();
   } catch (error) {
-    if (error instanceof DataBackendUnavailableError) recordRefusal(error.causeKey);
+    if (error instanceof DataBackendUnavailableError) recordRefusal(error.causeKey, doc);
     throw error;
   }
   const outcome: SaveTracked | AppendTracked | DeleteTracked = result;
-  if ('ticket' in outcome && outcome.ticket) recordTicket(outcome.ticket);
-  else if (outcome.outcome === 'frozen') recordRefusal('frozen');
-  else if (outcome.outcome === 'refused') recordRefusal(outcome.cause);
+  if ('ticket' in outcome && outcome.ticket) recordTicket(outcome.ticket, whole ? doc : undefined);
+  else if (outcome.outcome === 'frozen') recordRefusal('frozen', doc);
+  else if (outcome.outcome === 'refused') recordRefusal(outcome.cause, doc);
   return result;
 }
 
@@ -638,7 +648,7 @@ export function saveDataOutcome<T = any>(filename: string, options: DataOptions,
 
 /** saveDataOutcome with the ticket of an accepted write, or the cause of a refusal. */
 export function saveDataTracked<T = any>(filename: string, options: DataOptions, data: T): SaveTracked {
-  return recorded(() => acceptSave(filename, options, data));
+  return recorded(docOf(filename, options), true, () => acceptSave(filename, options, data));
 }
 
 function acceptSave<T>(filename: string, options: DataOptions, data: T): SaveTracked {
@@ -699,7 +709,7 @@ export function appendData(filename: string, options: DataOptions, line: string)
 
 /** appendData with the ticket of an accepted append, or the cause of a refusal. */
 export function appendDataTracked(filename: string, options: DataOptions, line: string): AppendTracked {
-  return recorded(() => acceptAppend(filename, options, line));
+  return recorded(docOf(filename, options), false, () => acceptAppend(filename, options, line));
 }
 
 function acceptAppend(filename: string, options: DataOptions, line: string): AppendTracked {
@@ -774,7 +784,7 @@ export function deleteDataOutcome(filename: string, options: DataOptions): 'dele
 
 /** deleteDataOutcome with the ticket of an accepted delete, or the cause of a refusal. */
 export function deleteDataTracked(filename: string, options: DataOptions): DeleteTracked {
-  return recorded(() => acceptDelete(filename, options));
+  return recorded(docOf(filename, options), true, () => acceptDelete(filename, options));
 }
 
 function acceptDelete(filename: string, options: DataOptions): DeleteTracked {

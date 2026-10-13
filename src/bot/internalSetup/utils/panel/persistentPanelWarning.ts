@@ -17,6 +17,7 @@ import { PanelContext, PanelOptions, PanelResponse, PanelInteraction } from '@bo
 import { getPanelManager } from '../panelManager';
 import { storePersistentPanel } from './persistentPanelStorage';
 import { storeNavigationContext } from './panelButtonHandler';
+import { answerWrites } from '../dataBackends/replyGate';
 import { injectReturnButtonIfNeeded } from './panelResponseUtils';
 import {
   createTitledContainer,
@@ -109,6 +110,9 @@ export async function handlePersistentWarningButton(
       } as any);
       return;
     }
+
+    // Not posted until the callback's writes are confirmed; otherwise the member has the truth.
+    if (!(await answerWrites(interaction))) return;
 
     const message = await channel.send({
       ...response,

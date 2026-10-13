@@ -21,14 +21,22 @@ interface Entry {
   modules: Set<string>;
 }
 
+/** Orders refusals and whole-document rewrites across every ledger, so a reader of two ledgers can tell which came last. */
+let docSeq = 0;
+
 export class WriteLedger {
-  private readonly openedAt = performance.now();
+  readonly openedAt = performance.now();
   private closed = false;
   /** Keyed by the ticket's working set or landing record: a later ticket on it covers every earlier one. */
   private readonly entries = new Map<object, Entry>();
   /** The keys holding entries for one guild's sets or one path's records. */
   private readonly keysByTarget = new Map<string, Set<object>>();
-  private readonly refused = new Map<LedgerCause, Set<string>>();
+  /** Per cause, the modules, and the documents whose writes were refused, each with its latest refusal's stamp. */
+  private readonly refused = new Map<LedgerCause, { modules: Set<string>; docs: Map<string, number> }>();
+  /** The documents rewritten whole (a save or a delete), each with its latest rewrite's stamp. */
+  private readonly rewritten = new Map<string, number>();
+  /** Compaction dropped an entry whose write had landed, so the ledger no longer lists that confirmed write. */
+  private droppedLanded = false;
 
   constructor(readonly kind: LedgerKind, private readonly lifeMs: number | null) {}
 
@@ -43,15 +51,24 @@ export class WriteLedger {
     this.entries.clear();
     this.keysByTarget.clear();
     this.refused.clear();
+    this.rewritten.clear();
   }
 
-  noteTicket(ticket: LedgerTicket, module: string): void {
+  /**
+   * rewrites: the document this write replaces whole (a save or a delete). An earlier refusal of that document stays
+   * recorded, since the rewrite may not carry the refused change, and its reader can no longer confirm it either way.
+   */
+  noteTicket(ticket: LedgerTicket, module: string, rewrites?: string): void {
     if (this.sealed) return;
+    if (rewrites !== undefined) this.rewritten.set(rewrites, ++docSeq);
     const key = ticket.kind === 'file' ? ticket.record : ticket.set;
     const target = ticket.kind === 'file' ? `file:${ticket.path}` : `ws:${ticket.guildId}`;
     const entry = this.entries.get(key);
     if (entry) {
-      if (ticket.seq > entry.ticket.seq) entry.ticket = ticket;
+      if (ticket.seq > entry.ticket.seq) {
+        if (landed(entry.ticket)) this.droppedLanded = true;
+        entry.ticket = ticket;
+      }
       entry.modules.add(module);
       return;
     }
@@ -65,17 +82,22 @@ export class WriteLedger {
       if (landed(this.entries.get(other)!.ticket)) {
         this.entries.delete(other);
         keys.delete(other);
+        this.droppedLanded = true;
       }
     }
     this.entries.set(key, { ticket, modules: new Set([module]) });
     keys.add(key);
   }
 
-  noteRefusal(cause: LedgerCause, module: string): void {
+  noteRefusal(cause: LedgerCause, module: string, doc: string): void {
     if (this.sealed) return;
-    const modules = this.refused.get(cause);
-    if (modules) modules.add(module);
-    else this.refused.set(cause, new Set([module]));
+    const record = this.refused.get(cause);
+    if (record) {
+      record.modules.add(module);
+      record.docs.set(doc, ++docSeq);
+    } else {
+      this.refused.set(cause, { modules: new Set([module]), docs: new Map([[doc, ++docSeq]]) });
+    }
   }
 
   /** The tickets every recorded write is confirmed by, each with the modules whose writes it covers. */
@@ -86,11 +108,28 @@ export class WriteLedger {
 
   refusals(): Array<{ cause: LedgerCause; modules: string[] }> {
     if (this.sealed) return [];
-    return [...this.refused].map(([cause, modules]) => ({ cause, modules: [...modules].sort() }));
+    return [...this.refused].map(([cause, { modules }]) => ({ cause, modules: [...modules].sort() }));
+  }
+
+  /** Each refused document with its cause and its latest refusal's stamp. */
+  refusedDocs(): Array<{ cause: LedgerCause; doc: string; seq: number }> {
+    if (this.sealed) return [];
+    return [...this.refused].flatMap(([cause, { docs }]) => [...docs].map(([doc, seq]) => ({ cause, doc, seq })));
+  }
+
+  /** The stamp of this document's latest whole rewrite in this ledger, or 0. */
+  rewriteSeq(doc: string): number {
+    if (this.sealed) return 0;
+    return this.rewritten.get(doc) ?? 0;
+  }
+
+  /** True once compaction dropped an entry whose write had landed: some write of this ledger is confirmed saved. */
+  get landedDropped(): boolean {
+    return !this.sealed && this.droppedLanded;
   }
 }
 
-function landed(ticket: LedgerTicket): boolean {
+export function landed(ticket: LedgerTicket): boolean {
   return ticket.kind === 'file' ? ticket.record.landed >= ticket.seq : ticket.set.landedSeq >= ticket.seq;
 }
 
@@ -165,22 +204,23 @@ export function withModule<T>(module: string | null | undefined, fn: () => T): T
   return frame ? frames.run({ ledger: frame.ledger, module: module ?? frame.module }, fn) : fn();
 }
 
-export function recordTicket(ticket: LedgerTicket): void {
+export function recordTicket(ticket: LedgerTicket, rewrites?: string): void {
   const frame = frames.getStore();
-  frame?.ledger.noteTicket(ticket, frame.module ?? frame.ledger.kind);
+  frame?.ledger.noteTicket(ticket, frame.module ?? frame.ledger.kind, rewrites);
 }
 
-export function recordRefusal(cause: LedgerCause): void {
+export function recordRefusal(cause: LedgerCause, doc: string): void {
   const frame = frames.getStore();
-  frame?.ledger.noteRefusal(cause, frame.module ?? frame.ledger.kind);
+  frame?.ledger.noteRefusal(cause, frame.module ?? frame.ledger.kind, doc);
 }
 
 /**
  * Wraps the gateway Client's emit once: interactionCreate opens a ledger keyed
  * to the interaction and runs every listener inside it (the dispatcher, module
- * listeners, collectors). Every other event passes through unchanged.
+ * listeners, collectors). Every other event passes through unchanged. onOpen
+ * sees each interaction and its ledger before any listener (BT-3's reply gate).
  */
-export function installInteractionLedgers(client: Client): void {
+export function installInteractionLedgers(client: Client, onOpen?: (interaction: object, ledger: WriteLedger) => void): void {
   const emit = client.emit;
   client.emit = function emitWithLedger(this: Client, event: string | symbol, ...args: unknown[]): boolean {
     const interaction = args[0];
@@ -188,6 +228,7 @@ export function installInteractionLedgers(client: Client): void {
       return (emit as (event: string | symbol, ...args: unknown[]) => boolean).call(this, event, ...args);
     }
     const ledger = openLedger('interaction', interaction);
+    onOpen?.(interaction, ledger);
     return runInLedger(ledger, null, () => (emit as (event: string | symbol, ...args: unknown[]) => boolean).call(this, event, ...args));
   } as Client['emit'];
 }
