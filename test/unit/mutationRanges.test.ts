@@ -12,7 +12,7 @@ import { runScenario } from '../helpers/child';
 import { canonicalName } from '../mutation/keys.mjs';
 import {
   changeTarget, codeLines, commonLines, gates, inPattern, lineDiff, linesOfTarget, mergeRanges, notMutated, parseNameStatus, planChange, planFromGit,
-  unmatchedPatterns, untouched, wholeTarget, structureLines, DATA_ROUTE_WHY, GLOB_NAME_WHY, holdsDataRoute, rootGlobFree, sandboxPatterns,
+  unmatchedPatterns, untouched, wholeTarget, structureLines, DATA_ROUTE_WHY, GLOB_NAME_WHY, holdsDataRoute, rootGlobFree, sandboxPatterns, strykerTakes,
 } from '../mutation/ranges.mjs';
 import { treeChanges, treePrint } from '../mutation/tree.mjs';
 
@@ -286,6 +286,7 @@ describe('the change', () => {
       'src/gone.ts': '// gone\n',
       'src/dup.ts': dup(1),
       'src/case.ts': text(lines('kase', 5)),
+      'src/case (1).ts': text(lines('kaseOne', 5)),
       'updaters/u.ts': text(lines('u', 30)),
       'safety-check.js': 'module.exports = 1;\n',
       'readmeAssets/img.png': Buffer.from([0x89, 0x50, 0x4e, 0x47, 0, 1, 2, 3]),
@@ -311,6 +312,9 @@ describe('the change', () => {
     if (process.platform === 'win32') {
       fs.renameSync(path.join(repo, 'src', 'case.ts'), path.join(repo, 'src', 'Case.ts'));
       write('src/Case.ts', text(lines('kase', 5).map((line, i) => (i === 0 ? `${line} // edited` : line))));
+      // A name with characters a glob reads, but Stryker reads as themselves, is taken on disk the same way.
+      fs.renameSync(path.join(repo, 'src', 'case (1).ts'), path.join(repo, 'src', 'Case (1).ts'));
+      write('src/Case (1).ts', text(lines('kaseOne', 5).map((line, i) => (i === 0 ? `${line} // edited` : line))));
     }
 
     const attributes = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-attributes-')), 'attributes');
@@ -335,6 +339,7 @@ describe('the change', () => {
     expect(target('src/dup.ts')?.gating).toEqual([3, 4, 5, 6, 7, 8, 9, 10]);
     expect(target('src/m.ts')?.gating?.length).toBeGreaterThan(0);
     if (process.platform === 'win32') expect(target('src/Case.ts')?.gating).toEqual([1]);
+    if (process.platform === 'win32') expect(target('src/Case (1).ts')?.gating).toEqual([1]);
     expect(plain.skipped).toEqual(expect.arrayContaining([
       { file: 'tools/x.ts', why: 'outside src' },
       { file: 'src/x.ts', why: 'moved to tools/x.ts: nothing is left to mutate' },
@@ -632,6 +637,21 @@ describe('the change', () => {
     expect(git(['status', '--porcelain'])).toBe('');
     expect(plan().targets.map(t => t.file)).toEqual(['src/a.ts']);
     expect(plan().targets[0].gating).toEqual([1]);
+  });
+
+  it("names nothing the content check's hash alone tells apart: a blob that holds CRLF, an edit staged and then undone", () => {
+    const { repo, git, write } = repoWith({ 'src/b.ts': text(lines('b', 3)) });
+    write('src/a.ts', 'export const a = 1;\r\nexport const b = 2;\r\n');
+    git(['-c', 'core.autocrlf=false', 'add', 'src/a.ts']);
+    git(['-c', 'core.autocrlf=false', 'commit', '-q', '-m', 'crlf']);
+    // git add would keep the CRLF blob as it is; hash-object, which reads no index, makes it LF.
+    git(['config', 'core.autocrlf', 'true']);
+    write('src/b.ts', text(lines('b', 3).map((line, i) => (i === 1 ? `${line} // staged` : line))));
+    git(['add', 'src/b.ts']);
+    write('src/b.ts', text(lines('b', 3)));
+    for (const file of ['src/a.ts', 'src/b.ts']) expect(git(['hash-object', file]).trim(), file).not.toBe(git(['rev-parse', `:${file}`]).trim());
+    const plan = planFromGit({ git: (...args: string[]) => git(args), base: git(['rev-parse', 'HEAD']).trim(), root: repo });
+    expect(plan).toEqual({ targets: [], skipped: [], emptyScope: true });
   });
 
   it('lets into a sandbox only the files git lists: nothing it ignores, nothing of a repository inside, nothing made later', async () => {
@@ -1051,6 +1071,26 @@ describe('the targets', () => {
     expect(canonicalName(root, 'src/../src/Foo.ts')).toBe('src/Foo.ts');
     if (process.platform === 'win32') expect(canonicalName(root, 'SRC/foo.TS')).toBe('src/Foo.ts');
     for (const refused of ['src/missing.ts', 'src', 'src/*.ts', 'src/+(Foo|Bar).ts', outside]) expect(canonicalName(root, refused), refused).toBe(null);
+  });
+
+  it('gives Stryker a name exactly when Stryker reads it as itself: no glob magic, and its whole path matches itself', async () => {
+    const { FileMatcher } = await import('../node_modules/@stryker-mutator/core/dist/src/config/file-matcher.js');
+    const { Minimatch } = createRequire(createRequire(__filename).resolve('@stryker-mutator/core/package.json'))('minimatch') as typeof import('minimatch');
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-strykernames-'));
+    onTestFinished(() => fs.rmSync(root, { recursive: true, force: true }));
+    const taken = ['src/plain.ts', 'src/a+b.ts', 'src/x!.ts', 'src/(old)/y.ts', 'src/@types/x.ts', 'src/foo (1).ts'];
+    const refused = ['src/[id].ts', 'src/a{1,2}.ts', 'src/a{1..3}.ts', 'src/+(x).ts'];
+    for (const name of [...taken, ...refused]) {
+      fs.mkdirSync(path.dirname(path.join(root, name)), { recursive: true });
+      fs.writeFileSync(path.join(root, name), 'export const x = 1;\n');
+      // The name on disk, whatever it holds; whether Stryker takes it is asked apart.
+      expect(canonicalName(root, name), name).toBe(name);
+      const whole = path.join(root, name);
+      // Stryker refuses a pattern with lines that holds magic, and matches a pattern to the files it crawls.
+      const stryker = !new Minimatch(`${name}:1-2`).hasMagic() && (() => { try { return new FileMatcher(whole, false).matches(whole); } catch { return false; } })();
+      expect(stryker, name).toBe(taken.includes(name));
+      expect(strykerTakes(root, name), name).toBe(taken.includes(name));
+    }
   });
 
   it('tells which mutants a pattern made by its lines', () => {

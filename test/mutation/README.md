@@ -41,6 +41,8 @@ From the bot root, with Node 22.12 or newer (or SMDB_TEST_NODE set, as for `npm 
   inside a submodule or an untracked repository) is refused: no sandbox holds it. The file is taken under the name it has on disk, from the bot root with
   forward slashes (its case, and its path once links are resolved), however it was spelled: `./`, `..`, and on Windows
   backslashes or another case. A file in a diff is matched by that name too, for Stryker matches the names on disk.
+  Either way the name must be one Stryker reads as itself (ranges.mjs strykerTakes: no glob magic in it, and its whole
+  path matches itself as Stryker matches it), so `( ) ! + @` in a name are taken, and `[id].ts` or `a{1,2}.ts` is not.
 - `--concurrency N` sets pass A's parallel runs (default: half the cores); pass B uses half of that.
 - `--keep` keeps the sandboxes in `.stryker-tmp/` for a look after the run. Without it every sandbox is removed, a
   failed pass's too.
@@ -112,9 +114,10 @@ does not name by its content.
 - git does not look at every file: not at one its index marks assume-unchanged or skip-worktree (core.ignoreStat marks
   every file it adds), not at one a file-system monitor says is unchanged, and not at one whose cached size and time
   (and, on Windows, creation time) still hold, so a same-size edit whose time was set back shows in no diff. So the
-  gate checks every tracked file git does not name by its content: it hashes the file as `git add` would and names it
-  changed when that differs from git's index, and names one that is gone as deleted, unless skip-worktree left it out
-  (a sparse checkout).
+  gate checks every tracked file git does not name by its content: it hashes the file with git's filters, and names it
+  changed when that differs from git's index and its lines differ from the base's (the hash reads no index, so a blob
+  that holds CRLF, or an edit staged and then undone, differs with nothing changed); and it names one that is gone as
+  deleted, unless skip-worktree left it out (a sparse checkout).
 - Not mutated, and named in the report with the reason: files outside src (the root scripts, updaters/, tests, docs and
   images), files that are not code, `.d.ts` files, the browser views under src/webui/public (copied into dist, never
   compiled, and no test loads them yet), a file deleted or moved out of src, an untracked git repository (git lists
@@ -249,13 +252,13 @@ can hold the port or the path, and a run before it can leave the path behind. Fa
   stopped or which files changed during the run, and the verdict.
 - `mutants.json` has the run's fast-check seed and every mutant: its place, original text and replacement, whether it
   gates, and per pass its status and the test that killed it.
-- `a/`, `a2/`, `b/` and `b2-1/`, `b2-2/` (one per test file that killed in pass B) hold, for each mutant run, one vitest
+- `a/`, `a2/`, `b/` and `b2-1/`, `b2-2/` (one per test file that failed in pass B: a kill, or a failure only on the machine's texts) hold, for each mutant run, one vitest
   JSON report and log per tier it ran (`<id>-<tier>.json` and `.log`; a run in `b/` can reach both integration and
   child; a nested mutant a pass is not for runs nothing; `dry-*` is the run with no mutant, and `dry-ms.txt` its time).
   `a2/`, `b/` and `b2-*/` also hold targets.json and run-ids.json, the mutants the pass is for. `control-a2/` and
   `control-b2/` hold the runs with no mutant after the reruns.
 
-The verdict is FAIL when a gating mutant ends Survived, NoCoverage, Missing, inconclusive, RuntimeError, or Ignored (a
+The verdict is FAIL when a gating mutant ends Survived, NoCoverage, inconclusive (a pass that made no mutant at its place included), RuntimeError, or Ignored (a
 `// Stryker disable` comment needs the same justification in the notes as a survivor). A confirmed timeout counts as
 killed and is listed. CompileError counts as killed by the type checker. The verdict is NO RESULT when no src file
 changed, when no gating mutant was made, when every gating mutant was a type error (no test ran against the change),

@@ -120,6 +120,8 @@ export function confirmed(m) {
   const { a2, b, b2 } = m.passes;
   const last = outcomeOf(latest(m));
   if (last === 'Recheck') return { outcome: 'Inconclusive', why: `${latest(m).inconclusive}, never rerun alone` };
+  // Only a rerun or pass B can find no mutant at a place pass A made one.
+  if (last === 'Missing') return { outcome: 'Inconclusive', why: `pass ${b2 ? 'b2' : b ? 'b' : 'a2'} made no mutant at this place, so it ran no test on it` };
   if (m.gating && b2 && last === 'Survived') {
     return { outcome: 'Inconclusive', why: `${failedInB(b)}, but not when that file ran alone, and the tests after it in pass B never ran on it` };
   }
@@ -136,14 +138,14 @@ export function confirmed(m) {
 export const outcome = m => confirmed(m).outcome;
 
 // A gating mutant that ends in one of these fails the gate.
-export const FAILING = ['Survived', 'NoCoverage', 'Missing', 'Inconclusive', 'RuntimeError', 'Ignored'];
+export const FAILING = ['Survived', 'NoCoverage', 'Inconclusive', 'RuntimeError', 'Ignored'];
 
 /**
  * The gating mutants a pass sends to a confirming run of their own (one at a
- * time, with four times the time): pass A's timeouts, which count as kills only
- * when the mutant times the tests out alone too, and pass B's kills, which count
- * only when the test file that killed them fails for them again; in both, the
- * runs that failed only on the machine's texts, which count when they fail alone.
+ * time, with four times the time): pass A's timeouts, which count when the
+ * rerun alone times out or fails a test, and pass B's kills, which count only
+ * when the test file that killed them fails for them again; in both, the runs
+ * that failed only on the machine's texts, which count when they fail alone.
  * @param {MutantRecord[]} mutants
  * @param {'a' | 'b'} pass
  */
@@ -154,8 +156,9 @@ export const toConfirm = (mutants, pass) => mutants.filter(m => {
 });
 
 /**
- * Pass B's confirmed kills by the test file that killed each, in order: each
- * file reruns alone on its own mutants.
+ * The pass B runs to confirm (kills, and runs that failed only on the
+ * machine's texts), grouped by the test file that failed in each, in order:
+ * each file reruns alone on its own mutants.
  * @param {MutantRecord[]} mutants
  */
 export function byKiller(mutants) {
@@ -213,14 +216,13 @@ export function judge(run) {
   /** @param {MutantRecord} m */
   const note = m => {
     const last = latest(m);
-    if (outcome(m) === 'Missing') return 'its pass made no mutant at this place, so no test ran on it';
     return confirmed(m).why ?? last.inconclusive ?? last.statusReason
       ?? (outcome(m) === 'Timeout' ? (last.timeout ? `timed out alone: ${last.timeout}` : "ran past Stryker's budget alone") : '');
   };
   /** @param {MutantRecord} m */
   const show = m => `  ${where(m)} ${m.mutator}: \`${m.original}\` -> \`${m.replacement}\`${note(m) ? ` (${note(m)})` : ''}`;
   /** @param {MutantRecord[]} list */
-  const tally = list => ['Killed', 'Timeout', 'Survived', 'NoCoverage', 'Inconclusive', 'Missing', 'RuntimeError', 'Ignored', 'CompileError']
+  const tally = list => ['Killed', 'Timeout', 'Survived', 'NoCoverage', 'Inconclusive', 'RuntimeError', 'Ignored', 'CompileError']
     .map(status => `${list.filter(m => outcome(m) === status).length} ${status}`).filter(entry => !entry.startsWith('0 ')).join(', ') || 'none';
   /**
    * @param {string} title
@@ -244,7 +246,7 @@ export function judge(run) {
       ...(run.deleted ?? []).map(n => `  ${n.file}: after ${n.lines.join(', ')}`)] : []),
     `Gating mutants (they touch a changed line): ${gating.length}: ${tally(gating)}`,
     `  killed in pass A: ${gating.filter(m => !m.passes.b && outcome(m) === 'Killed').length}; sent to pass B: ${gating.filter(m => m.passes.b).length}, killed there: ${gating.filter(m => m.passes.b && outcome(m) === 'Killed').length}`,
-    ...section('Survivors (each needs a test that kills it, or a justification in the notes):', [...gatingAt('Survived'), ...gatingAt('NoCoverage'), ...gatingAt('Missing')]),
+    ...section('Survivors (each needs a test that kills it, or a justification in the notes):', [...gatingAt('Survived'), ...gatingAt('NoCoverage')]),
     ...section('Silenced by a Stryker disable comment (each needs a justification in the notes):', gatingAt('Ignored')),
     ...section('Inconclusive (no test failed for the mutant itself; rerun, or add a test that fails on it):', [...gatingAt('Inconclusive'), ...gatingAt('RuntimeError')]),
     ...section('Timeouts (each timed out when run alone with four times the time: a test or its beforeEach or afterEach hook, or the whole run past its budget; counted as killed, so check each replacement):', gatingAt('Timeout')),

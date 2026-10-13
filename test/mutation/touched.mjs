@@ -53,7 +53,10 @@ try {
   console.log(`Verdict: NO RESULT (the gate could not load: ${error instanceof Error ? error.message.split('\n')[0] : String(error)}; run npm run test:install)`);
   process.exit(2);
 }
-const { structureLines, DATA_ROUTE_WHY, EXTRA_BREAK_WHY, gates, holdsDataRoute, holdsExtraBreak, linesOfTarget, notMutated, planFromGit, rootGlobFree, sandboxPatterns, unmatchedPatterns, untouched } = ranges;
+const {
+  structureLines, DATA_ROUTE_WHY, EXTRA_BREAK_WHY, GLOB_NAME_WHY, gates, holdsDataRoute, holdsExtraBreak, linesOfTarget, notMutated, planFromGit, rootGlobFree,
+  sandboxPatterns, strykerTakes, unmatchedPatterns, untouched,
+} = ranges;
 const { byKiller, classifyKill, judge, outcome, toConfirm, toPassB } = verdicts;
 
 const USAGE = 'usage: node test/mutation/touched.mjs [--base REF] [--mutate PATTERN]... [--concurrency N] [--keep]';
@@ -75,7 +78,7 @@ for (let i = 0; i < argv.length; i++) {
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 process.chdir(root);
-// No file-system monitor: git looks at every file itself, so one the monitor missed is still seen.
+// No file-system monitor; planFromGit checks by content the files git still skips or trusts.
 /** @param {string[]} args */
 const git = (...args) => execFileSync('git', ['-c', 'core.quotePath=false', '-c', 'core.fsmonitor=false', ...args], { cwd: root, encoding: 'utf8', maxBuffer: 256 * 1024 * 1024 });
 /** @param {string} file */
@@ -129,7 +132,7 @@ opts.mutate = opts.mutate.map(pattern => {
   }
   const text = fs.readFileSync(path.join(root, name), 'utf8');
   inTree ??= new Set([...planned.keys()].map(file => canonicalName(root, file)).filter(file => file !== null));
-  const why = holdsExtraBreak(text) ? EXTRA_BREAK_WHY : holdsDataRoute(name, text) ? DATA_ROUTE_WHY : notMutated(name)
+  const why = !strykerTakes(root, name) ? GLOB_NAME_WHY : holdsExtraBreak(text) ? EXTRA_BREAK_WHY : holdsDataRoute(name, text) ? DATA_ROUTE_WHY : notMutated(name)
     ?? (inTree.has(name) ? null : 'git neither tracks it nor would add it (it is ignored, or inside a submodule or an untracked repository), so no sandbox holds it');
   if (why) {
     console.error(`--mutate cannot take ${name}: ${why}`);

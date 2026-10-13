@@ -206,13 +206,17 @@ describe('the verdict', () => {
       mutant(1, true, { a: pass('Survived'), b: pass('Killed', { killedBy: 'child/x.test.ts > x' }), b2: pass('Killed', { timeout: 'child/x.test.ts > x' }) }),
       mutant(2, true, { a: pass('Survived'), b: pass('Killed', { killedBy: 'child/x.test.ts > x' }) }),
       mutant(3, true, { a: pass('Timeout') }),
-      mutant(4, true, { a: pass('Missing') }),
+      // A pass that made no mutant where pass A made one (its file changed, say): only a rerun or pass B can.
+      mutant(4, true, { a: pass('Timeout'), a2: pass('Missing') }),
+      mutant(5, true, { a: pass('Survived'), b: pass('Killed', { killedBy: 'child/x.test.ts > x' }), b2: pass('Missing') }),
     ], { stopped: ['pass b2 could not run: x'] }).lines.join('\n');
-    expect(text).toMatch(/^Survivors .*\n {2}src\/a\.ts:4:3 .*\(its pass made no mutant at this place, so no test ran on it\)$/m);
+    expect(text).toMatch(/^ {2}src\/a\.ts:4:3 .*\(pass a2 made no mutant at this place, so it ran no test on it\)$/m);
+    expect(text).toMatch(/^ {2}src\/a\.ts:5:3 .*\(pass b2 made no mutant at this place, so it ran no test on it\)$/m);
+    expect(text).not.toMatch(/^Survivors /m);
     expect(text).toMatch(/^Inconclusive .*\n {2}src\/a\.ts:1:3 .*\(killed in pass B by child\/x\.test\.ts > x, but hung instead of failing when run alone\)$/m);
     expect(text).toMatch(/^ {2}src\/a\.ts:2:3 .*\(killed in pass B, never rerun alone\)$/m);
     expect(text).toMatch(/^ {2}src\/a\.ts:3:3 .*\(timed out, never rerun alone\)$/m);
-    expect(text).toMatch(/^ {2}killed in pass A: 0; sent to pass B: 2, killed there: 0$/m);
+    expect(text).toMatch(/^ {2}killed in pass A: 0; sent to pass B: 3, killed there: 0$/m);
   });
 
   it('has no result when nothing changed or no gating mutant was made, and names what was not tested', () => {

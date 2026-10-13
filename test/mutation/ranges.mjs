@@ -584,8 +584,8 @@ const linkWhy = name => `a link to ${name}, which is not mutated: ${notMutated(n
  * Windows is when the file was made), so a same-size edit whose time was set
  * back shows in no diff. So every tracked file git did not name is checked by
  * its content: one gone is deleted, unless skip-worktree left it out (a sparse
- * checkout), and one hashed as git add would that differs from its index blob
- * (for a file git did not name, the base's) is changed.
+ * checkout), and one whose hash with git's filters differs from its index blob
+ * is changed when its lines differ from the base's too.
  * @param {{ git: (...args: string[]) => string, base: string, root: string, read?: (file: string) => string }} io
  */
 export function planFromGit({ git: run, base, root, read = file => fs.readFileSync(path.join(root, file), 'utf8') }) {
@@ -598,6 +598,15 @@ export function planFromGit({ git: run, base, root, read = file => fs.readFileSy
   const entries = parseNameStatus(git(...changedArgs(base)));
   const listed = new Set(entries.flatMap(entry => [entry.file, entry.from]));
   const sparse = new Set(git('ls-files', '-v', '-z').split('\0').filter(line => /^[sS] /.test(line)).map(line => line.slice(2)));
+  // hash-object reads no index, so it can differ from it with nothing changed
+  // (a blob that holds CRLF under text=auto, an edit staged and then undone):
+  // a file it flags is changed only when its lines differ from the base's.
+  /** @param {string} file */
+  const linesDiffer = file => {
+    let was;
+    try { was = readBase(file); } catch { return true; }
+    return splitLines(was).join('\n') !== splitLines(read(file)).join('\n');
+  };
   /** @type {{ blob: string, file: string }[]} */
   const staged = [];
   for (const line of git('ls-files', '-s', '-z').split('\0')) {
@@ -612,7 +621,7 @@ export function planFromGit({ git: run, base, root, read = file => fs.readFileSy
     for (let length = 0; end < staged.length && (end === start || length + staged[end].file.length < 8000); end++) length += staged[end].file.length + 1;
     const batch = staged.slice(start, end);
     const blobs = git('hash-object', '--', ...batch.map(s => s.file)).split('\n');
-    batch.forEach((s, i) => { if (blobs[i] !== s.blob) entries.push({ status: 'M', file: s.file }); });
+    batch.forEach((s, i) => { if (blobs[i] !== s.blob && linesDiffer(s.file)) entries.push({ status: 'M', file: s.file }); });
     start = end;
   }
   return planChange({
@@ -620,7 +629,10 @@ export function planFromGit({ git: run, base, root, read = file => fs.readFileSy
     untracked: git('ls-files', '-z', '--others', '--exclude-standard').split('\0').filter(Boolean),
     read,
     readBase,
-    nameOf: file => canonicalName(root, file) ?? (globFree(root, file) ? file : null),
+    nameOf: file => {
+      const name = canonicalName(root, file) ?? file;
+      return strykerTakes(root, name) ? name : null;
+    },
     isDir: file => { try { return fs.statSync(path.join(root, file)).isDirectory(); } catch { return false; } },
   });
 }
@@ -655,34 +667,32 @@ export function sandboxPatterns(files) {
 }
 
 /**
- * Whether Stryker can be given a file under this name: it reads a mutate
- * pattern as a glob, refuses one with lines when it holds a glob, and matches
- * files to it with minimatch, so the name must hold no glob and match itself.
+ * Whether Stryker takes a file under this name, from the bot root, as itself:
+ * it refuses a mutate pattern with lines whose name holds glob magic, and it
+ * matches a pattern to the files it crawls by resolving it against the root,
+ * turning backslashes into slashes and matching the whole path, read as a
+ * glob, with minimatch. So the name must hold no magic, and its whole path must
+ * match itself so: a [ ] class, a { } with a comma or a range, or an extglob
+ * such as +( ) anywhere in it does not, nor does a pattern minimatch cannot
+ * read and throws on. Other characters ( ) ! + @ are taken as they are.
  * @param {string} root
- * @param {string} file
+ * @param {string} name
  */
-function globFree(root, file) {
-  const name = path.resolve(root, file).split(path.sep).join('/');
-  return !new Minimatch(name).hasMagic() && minimatch(name, name, { dot: true });
-}
-
-/**
- * Whether Stryker can match any file under the bot root, read as it reads one:
- * it resolves each mutate pattern against the root, turns backslashes into
- * slashes and matches the whole path, read as a glob, with minimatch. A root
- * that does not match itself so (a [ ] class, a { } with a comma or a range,
- * an extglob such as +( ), or a pattern minimatch cannot read and throws on)
- * matches no file, and nothing is mutated.
- * @param {string} root
- */
-export function rootGlobFree(root) {
-  const name = path.resolve(root, 'package.json').replace(/\\/g, '/');
+export function strykerTakes(root, name) {
+  const whole = path.resolve(root, name).replace(/\\/g, '/');
   try {
-    return minimatch(name, name, { dot: false });
+    return !new Minimatch(name).hasMagic() && minimatch(whole, whole, { dot: false });
   } catch {
     return false;
   }
 }
+
+/**
+ * Whether Stryker can match any file under the bot root: when it cannot, it
+ * matches no file, and nothing is mutated.
+ * @param {string} root
+ */
+export const rootGlobFree = root => strykerTakes(root, 'package.json');
 
 /**
  * The lines a target answers for: its changed lines, or for a whole file or a

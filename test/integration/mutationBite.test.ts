@@ -275,6 +275,7 @@ describe('the touched-line mutation gate', () => {
     fs.writeFileSync(path.join(root, broken), `export const s = 'a${String.fromCharCode(0x2028)}b';\n`);
     // Files in src that git neither tracks nor would add: one it ignores (a logs dir) and one in an untracked repository.
     const unlisted = [`src/smdb-ignored-${process.pid}/logs/x.ts`, `src/smdb-repo-${process.pid}/x.ts`];
+    const globbed = `src/smdb-glob-[x]-${process.pid}.ts`;
     for (const old of fs.readdirSync(path.join(root, 'src')).filter(name => /^smdb-(ignored|repo)-/.test(name))) fs.rmSync(path.join(root, 'src', old), { recursive: true, force: true });
     try {
       for (const file of unlisted) {
@@ -295,6 +296,11 @@ describe('the touched-line mutation gate', () => {
       const refused = refuse('--mutate', broken);
       expect(refused.status).toBe(2);
       expect(refused.stderr).toContain(`--mutate cannot take ${broken}: it holds a line break Stryker counts and the gate does not`);
+      // A file that exists, in the tree, under a name Stryker reads as a glob.
+      fs.writeFileSync(path.join(root, globbed), 'export const x = 1;\n');
+      const globRefused = refuse('--mutate', globbed);
+      expect(globRefused.status).toBe(2);
+      expect(globRefused.stderr).toContain(`--mutate cannot take ${globbed}: its name holds characters Stryker reads as a glob`);
       // The suite's own env scrub and config: --mutate takes only what a diff would mutate.
       for (const file of ['test/helpers/env.ts', 'test/vitest.config.ts']) {
         const outsideSrc = refuse('--mutate', file);
@@ -305,6 +311,7 @@ describe('the touched-line mutation gate', () => {
     } finally {
       fs.rmSync(outside, { force: true });
       fs.rmSync(path.join(root, broken), { force: true });
+      fs.rmSync(path.join(root, globbed), { force: true });
       for (const file of unlisted) fs.rmSync(path.join(root, file.split('/').slice(0, 2).join('/')), { recursive: true, force: true });
     }
 

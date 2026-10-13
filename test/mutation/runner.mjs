@@ -3,7 +3,7 @@
 // this tree's own tests: pass a, the fast tier's tests that import the mutated
 // files; pass b, the integration tests that import them, then the whole child
 // tier; or only the test files SMDB_MUTATION_ONLY names (the rerun of a pass B
-// kill with the file that killed it), each in its tier. Every run stops at its
+// failure with the file that failed), each in its tier. Every run stops at its
 // first failure. A rerun alone (SMDB_MUTATION_CONFIRM=1) gives every test four
 // times its time (SMDB_TEST_TIME_SCALE, read by vitest.config.ts and
 // helpers/child.ts). Vitest's output goes to files, one JSON report and one log
