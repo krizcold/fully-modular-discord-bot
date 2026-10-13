@@ -87,11 +87,24 @@ export function classifyKill(reports, alone = false) {
 }
 
 /**
+ * Whether a type checker's reason (tsc's formatted errors) names only unused
+ * `@ts-expect-error` directives (TS2578): the mutated code type-checks, and the
+ * one error is that a line under such a directive no longer needs it, so the
+ * checker proves nothing and the mutant must meet the tests.
+ * @param {string} reason
+ */
+export function onlyUnusedDirective(reason) {
+  const codes = [...reason.matchAll(/error TS(\d+):/g)].map(m => m[1]);
+  return codes.length > 0 && codes.every(code => code === '2578');
+}
+
+/**
  * One pass's outcome for a mutant.
  * @param {PassResult} result
  */
 export function outcomeOf(result) {
   if (result.status === 'Killed') return result.killedBy ? 'Killed' : result.timeout ? 'Timeout' : result.recheck ? 'Recheck' : 'Inconclusive';
+  if (result.status === 'CompileError' && result.recheck) return 'Recheck';
   return result.status;
 }
 
@@ -114,9 +127,10 @@ const failedInB = b => (b?.killedBy ? `killed in pass B by ${b.killedBy}` : `fai
  * never reran, or whose rerun was voided (the run with no mutant after it
  * failed), is inconclusive.
  * @param {MutantRecord} m
+ * @param {boolean} [stopped] the gate stopped before it finished: a survivor pass B never ran on is no survivor
  * @returns {{ outcome: string, why?: string }}
  */
-export function confirmed(m) {
+export function confirmed(m, stopped = false) {
   const { a2, b, b2 } = m.passes;
   const last = outcomeOf(latest(m));
   if (last === 'Recheck') return { outcome: 'Inconclusive', why: `${latest(m).inconclusive}, never rerun alone` };
@@ -125,6 +139,7 @@ export function confirmed(m) {
   if (m.gating && b2 && last === 'Survived') {
     return { outcome: 'Inconclusive', why: `${failedInB(b)}, but not when that file ran alone, and the tests after it in pass B never ran on it` };
   }
+  if (stopped && m.gating && !b && (last === 'Survived' || last === 'NoCoverage')) return { outcome: 'Inconclusive', why: 'pass B never ran on it: the gate stopped first' };
   if (!m.gating || (last !== 'Killed' && last !== 'Timeout')) return { outcome: last };
   const { voided } = latest(m);
   if (voided) return { outcome: 'Inconclusive', why: voided };
@@ -194,9 +209,13 @@ export const toPassB = mutants => mutants.filter(m => m.gating && ['Survived', '
  * @returns {{ verdict: 'PASS' | 'FAIL' | 'NO RESULT', code: 0 | 1 | 2, lines: string[] }}
  */
 export function judge(run) {
+  /** @param {MutantRecord} m */
+  const confirmedIn = m => confirmed(m, Boolean(run.stopped));
+  /** @param {MutantRecord} m */
+  const outcomeIn = m => confirmedIn(m).outcome;
   const gating = run.mutants.filter(m => m.gating);
   const context = run.mutants.filter(m => !m.gating);
-  const failing = gating.filter(m => FAILING.includes(outcome(m)));
+  const failing = gating.filter(m => FAILING.includes(outcomeIn(m)));
   const made = [...new Set(run.mutants.map(m => m.file))];
   /** @type {'PASS' | 'FAIL' | 'NO RESULT'} */
   let verdict = failing.length > 0 ? 'FAIL' : 'PASS';
@@ -209,28 +228,28 @@ export function judge(run) {
     verdict = 'NO RESULT';
     why = `no gating mutant was made, so L5 tested nothing (see what was not mutated, and why${(run.deleted ?? []).length > 0 ? ', and where lines were taken out' : ''})`;
   }
-  else if (gating.every(m => outcome(m) === 'CompileError')) { verdict = 'NO RESULT'; why = 'every gating mutant was a type error, so no test ran against the change'; }
+  else if (gating.every(m => outcomeIn(m) === 'CompileError')) { verdict = 'NO RESULT'; why = 'every gating mutant was a type error, so no test ran against the change'; }
 
   /** @param {MutantRecord} m */
   const where = m => `${m.file}:${m.location.start.line}:${m.location.start.column}`;
   /** @param {MutantRecord} m */
   const note = m => {
     const last = latest(m);
-    return confirmed(m).why ?? last.inconclusive ?? last.statusReason
-      ?? (outcome(m) === 'Timeout' ? (last.timeout ? `timed out alone: ${last.timeout}` : "ran past Stryker's budget alone") : '');
+    return confirmedIn(m).why ?? last.inconclusive ?? last.statusReason
+      ?? (outcomeIn(m) === 'Timeout' ? (last.timeout ? `timed out alone: ${last.timeout}` : "ran past Stryker's budget alone") : '');
   };
   /** @param {MutantRecord} m */
   const show = m => `  ${where(m)} ${m.mutator}: \`${m.original}\` -> \`${m.replacement}\`${note(m) ? ` (${note(m)})` : ''}`;
   /** @param {MutantRecord[]} list */
   const tally = list => ['Killed', 'Timeout', 'Survived', 'NoCoverage', 'Inconclusive', 'RuntimeError', 'Ignored', 'CompileError']
-    .map(status => `${list.filter(m => outcome(m) === status).length} ${status}`).filter(entry => !entry.startsWith('0 ')).join(', ') || 'none';
+    .map(status => `${list.filter(m => outcomeIn(m) === status).length} ${status}`).filter(entry => !entry.startsWith('0 ')).join(', ') || 'none';
   /**
    * @param {string} title
    * @param {MutantRecord[]} list
    */
   const section = (title, list) => (list.length > 0 ? [title, ...list.map(show)] : []);
   /** @param {string} status */
-  const gatingAt = status => gating.filter(m => outcome(m) === status);
+  const gatingAt = status => gating.filter(m => outcomeIn(m) === status);
 
   const lines = [
     `L5 touched-line mutation, ${run.stamp}`,
@@ -245,13 +264,13 @@ export function judge(run) {
     ...((run.deleted ?? []).length > 0 ? ['Places where lines were taken out with fewer or none put back, so what was taken out is left nowhere to mutate (each after the line named, as the file is now; 0 is its top); check the code around each:',
       ...(run.deleted ?? []).map(n => `  ${n.file}: after ${n.lines.join(', ')}`)] : []),
     `Gating mutants (they touch a changed line): ${gating.length}: ${tally(gating)}`,
-    `  killed in pass A: ${gating.filter(m => !m.passes.b && outcome(m) === 'Killed').length}; sent to pass B: ${gating.filter(m => m.passes.b).length}, killed there: ${gating.filter(m => m.passes.b && outcome(m) === 'Killed').length}`,
+    `  killed in pass A: ${gating.filter(m => !m.passes.b && outcomeIn(m) === 'Killed').length}; run in pass B: ${gating.filter(m => m.passes.b).length}, killed there: ${gating.filter(m => m.passes.b && outcomeIn(m) === 'Killed').length}`,
     ...section('Survivors (each needs a test that kills it, or a justification in the notes):', [...gatingAt('Survived'), ...gatingAt('NoCoverage')]),
     ...section('Silenced by a Stryker disable comment (each needs a justification in the notes):', gatingAt('Ignored')),
     ...section('Inconclusive (no test failed for the mutant itself; rerun, or add a test that fails on it):', [...gatingAt('Inconclusive'), ...gatingAt('RuntimeError')]),
     ...section('Timeouts (each timed out when run alone with four times the time: a test or its beforeEach or afterEach hook, or the whole run past its budget; counted as killed, so check each replacement):', gatingAt('Timeout')),
     `Context mutants (in the widened statements, not gating: ones that touch no changed line, and ones beyond what the changed lines widen to by themselves, which can span one, as the emptying of a body around a deletion does): ${context.length}: ${tally(context)}`,
-    ...section('Context survivors:', context.filter(m => outcome(m) === 'Survived')),
+    ...section('Context survivors:', context.filter(m => outcomeIn(m) === 'Survived')),
     ...(run.controls?.length ? ['Runs with no mutant after the reruns:', ...run.controls.map(line => `  ${line}`)] : []),
     ...(run.stopped ? ['Stopped:', ...run.stopped.map(line => `  ${line}`)] : []),
     ...(run.treeChanged?.length ? ['Changed during the run (so no one tree was tested):',

@@ -598,9 +598,10 @@ export function planFromGit({ git: run, base, root, read = file => fs.readFileSy
   const entries = parseNameStatus(git(...changedArgs(base)));
   const listed = new Set(entries.flatMap(entry => [entry.file, entry.from]));
   const sparse = new Set(git('ls-files', '-v', '-z').split('\0').filter(line => /^[sS] /.test(line)).map(line => line.slice(2)));
-  // hash-object reads no index, so it can differ from it with nothing changed
-  // (a blob that holds CRLF under text=auto, an edit staged and then undone):
-  // a file it flags is changed only when its lines differ from the base's.
+  // The hash can differ from the index with nothing changed: the index can hold
+  // an edit staged and then undone, and hash-object reads no index, so a blob
+  // that holds CRLF under text=auto hashes as LF. A file it flags is changed
+  // only when its lines differ from the base's.
   /** @param {string} file */
   const linesDiffer = file => {
     let was;
@@ -693,6 +694,29 @@ export function strykerTakes(root, name) {
  * @param {string} root
  */
 export const rootGlobFree = root => strykerTakes(root, 'package.json');
+
+/**
+ * The tsconfig pass A's type checker is given. Stryker's checker compiles the
+ * checkout from its working directory, not the sandbox, so with the root's
+ * tsconfig it would judge files git ignores that the root's includes (a module
+ * cloned into src), which no sandbox holds: such a file could turn a mutant
+ * into a CompileError, counted as killed, or stop the pass. This one extends
+ * the root's and lists only the files of the tree that the root's holds.
+ * @param {string} root
+ * @param {Iterable<string>} tree the tree's files, from the bot root with forward slashes
+ * @param {string} dir the dir it is written to, from the bot root
+ */
+export function treeTsconfig(root, tree, dir) {
+  const rootConfig = path.join(root, 'tsconfig.json');
+  const { config } = ts.readConfigFile(rootConfig, ts.sys.readFile);
+  const held = ts.parseJsonConfigFileContent(config, ts.sys, root, undefined, rootConfig).fileNames;
+  /** @param {string} file */
+  const key = file => (process.platform === 'win32' ? path.resolve(file).toLowerCase() : path.resolve(file));
+  const inTree = new Set([...tree].map(file => key(path.join(root, file))));
+  /** @param {string} file */
+  const from = file => path.relative(path.join(root, dir), file).split(path.sep).join('/');
+  return { extends: from(rootConfig), include: [], files: held.filter(file => inTree.has(key(file))).map(file => from(path.resolve(file))) };
+}
 
 /**
  * The lines a target answers for: its changed lines, or for a whole file or a

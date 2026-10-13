@@ -7,12 +7,13 @@ import { Instrumenter } from '@stryker-mutator/instrumenter';
 import fc from 'fast-check';
 import ts from 'typescript';
 import { pathToFileURL } from 'url';
+import { promisify } from 'util';
 import { describe, expect, it, onTestFinished } from 'vitest';
 import { runScenario } from '../helpers/child';
 import { canonicalName } from '../mutation/keys.mjs';
 import {
   changeTarget, codeLines, commonLines, gates, inPattern, lineDiff, linesOfTarget, mergeRanges, notMutated, parseNameStatus, planChange, planFromGit,
-  unmatchedPatterns, untouched, wholeTarget, structureLines, DATA_ROUTE_WHY, GLOB_NAME_WHY, holdsDataRoute, rootGlobFree, sandboxPatterns, strykerTakes,
+  unmatchedPatterns, untouched, wholeTarget, structureLines, DATA_ROUTE_WHY, GLOB_NAME_WHY, holdsDataRoute, rootGlobFree, sandboxPatterns, strykerTakes, treeTsconfig,
 } from '../mutation/ranges.mjs';
 import { treeChanges, treePrint } from '../mutation/tree.mjs';
 
@@ -261,6 +262,8 @@ describe('the change', () => {
       fs.writeFileSync(path.join(repo, file), text);
     };
     git(['init', '-q']);
+    // A user's core.safecrlf would make a test's own git add fatal where it converts line endings.
+    git(['config', 'core.safecrlf', 'false']);
     for (const [file, text] of Object.entries(files)) write(file, text);
     git(['add', '.']);
     git(['commit', '-q', '-m', 'base']);
@@ -449,6 +452,29 @@ describe('the change', () => {
     ]);
   });
 
+  it("gives pass A's type checker the tree's files only, never one git ignores that the root's tsconfig includes", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-checker-'));
+    onTestFinished(() => fs.rmSync(root, { recursive: true, force: true }));
+    const put = (file: string, text: string) => {
+      fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true });
+      fs.writeFileSync(path.join(root, file), text);
+    };
+    put('tsconfig.json', JSON.stringify({ compilerOptions: { strict: true, noEmit: true }, include: ['src'] }));
+    put('src/api.ts', 'export const DEFAULTS = { retries: 3 };\n');
+    // A module cloned into a dir git ignores: it reads the API, and holds an error of its own.
+    put('src/modulesDev/m.ts', "import { DEFAULTS } from '../api';\nexport const n: number = DEFAULTS.retries;\nexport const s: number = 'stale';\n");
+    const config = treeTsconfig(root, ['tsconfig.json', 'src/api.ts'], '.stryker-tmp');
+    expect(config).toEqual({ extends: '../tsconfig.json', include: [], files: ['../src/api.ts'] });
+    put('.stryker-tmp/tsconfig.l5.json', JSON.stringify(config));
+    const errorsOf = (file: string) => {
+      const { config: raw } = ts.readConfigFile(file, ts.sys.readFile);
+      const parsed = ts.parseJsonConfigFileContent(raw, ts.sys, path.dirname(file), undefined, file);
+      return ts.getPreEmitDiagnostics(ts.createProgram(parsed.fileNames, parsed.options)).map(d => ts.flattenDiagnosticMessageText(d.messageText, '\n'));
+    };
+    expect(errorsOf(path.join(root, 'tsconfig.json')).length).toBeGreaterThan(0);
+    expect(errorsOf(path.join(root, '.stryker-tmp', 'tsconfig.l5.json'))).toEqual([]);
+  });
+
   it("refuses a checkout path Stryker would read as a glob, exactly where Stryker's own matcher matches no file under it", async () => {
     const { FileMatcher } = await import('../node_modules/@stryker-mutator/core/dist/src/config/file-matcher.js');
     const base = path.join(os.tmpdir(), 'smdb-roots');
@@ -571,9 +597,21 @@ describe('the change', () => {
     for (const cp of [required, imported]) {
       expect(() => cp.fork(script, [], { env: { PATH: process.env.PATH } })).toThrow(/lacks DATA_DIR/);
       expect(() => cp.fork(script, { env: {} })).toThrow(/lacks DATA_DIR/);
+      // Every other way to start a process, a promisified exec included, and a worker.
+      const command = `"${process.execPath}" "${script}"`;
+      for (const start of [
+        () => cp.spawn(process.execPath, [script], { env: {} }), () => cp.spawnSync(process.execPath, [script], { env: {} }),
+        () => cp.execFile(process.execPath, [script], { env: {} }), () => cp.execFileSync(process.execPath, [script], { env: {} }),
+        () => cp.exec(command, { env: {} }), () => cp.execSync(command, { env: {} }), () => promisify(cp.exec)(command, { env: {} }),
+      ]) expect(start).toThrow(/lacks DATA_DIR/);
     }
+    const { Worker } = await import('worker_threads');
+    expect(() => new Worker(script, { env: {} })).toThrow(/lacks DATA_DIR/);
     const forked = imported.fork(script, [], { env: { ...process.env }, stdio: 'ignore' });
     expect(await new Promise(resolve => forked.on('exit', resolve))).toBe(0);
+    expect(imported.spawnSync(process.execPath, [script], { env: { ...process.env } }).status).toBe(0);
+    // A promisified exec still gives { stdout, stderr }.
+    expect(await promisify(imported.exec)(`"${process.execPath}" -e "process.stdout.write('ok')"`)).toMatchObject({ stdout: 'ok' });
     // In a child that preloads it, as helpers/child.ts starts every scenario step.
     const child = path.join(dir, 'child.cjs');
     fs.writeFileSync(child, `require('child_process').fork(${JSON.stringify(script)}, [], { env: {} });\n`);

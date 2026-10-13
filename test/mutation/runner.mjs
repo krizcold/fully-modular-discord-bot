@@ -4,9 +4,10 @@
 // files; pass b, the integration tests that import them, then the whole child
 // tier; or only the test files SMDB_MUTATION_ONLY names (the rerun of a pass B
 // failure with the file that failed), each in its tier. Every run stops at its
-// first failure. A rerun alone (SMDB_MUTATION_CONFIRM=1) gives every test four
-// times its time (SMDB_TEST_TIME_SCALE, read by vitest.config.ts and
-// helpers/child.ts). Vitest's output goes to files, one JSON report and one log
+// first failure. A rerun alone (SMDB_MUTATION_CONFIRM=1) gives the config's
+// test and hook limits and a step's default bound four times their time
+// (SMDB_TEST_TIME_SCALE, read by vitest.config.ts and helpers/child.ts); a limit
+// a test sets itself is not scaled. Vitest's output goes to files, one JSON report and one log
 // per run, because Stryker buffers what a command prints with Node's 1 MB exec
 // limit and an overflow would end the run and count as a kill.
 import { spawnSync } from 'child_process';

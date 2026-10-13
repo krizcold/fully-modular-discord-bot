@@ -19,7 +19,7 @@ active mutant travels in `__STRYKER_ACTIVE_MUTANT__` and reaches child processes
 | tree.mjs | (library) the fingerprint of the tree a run reads, taken before the plan and before the verdict; unit/mutationRanges.test.ts and the bite |
 | ../helpers/time.mjs | the factor on every test's time limits (4 in a rerun alone) |
 | ../helpers/env.ts, setup.ts | what a test and its children keep of the environment, and the run's fast-check seed |
-| ../helpers/forkGuard.cjs | a fork whose own env lacks DATA_DIR throws, in a test and in a child step |
+| ../helpers/forkGuard.cjs | a process started with an env of its own that lacks DATA_DIR throws (fork, spawn, exec, execFile, a Worker), in a test and in a child step |
 | ../helpers/build.cjs | builds dist the way `npm run build` does, stamped and locked; pass B's buildCommand |
 | ../helpers/child.ts | runs a child scenario (test/child/scenarios/) and checks what it loaded |
 | ../helpers/endTree.mjs | ends a process and those it started: a child step past its bound, and the run with no mutant after the reruns |
@@ -42,7 +42,8 @@ From the bot root, with Node 22.12 or newer (or SMDB_TEST_NODE set, as for `npm 
   forward slashes (its case, and its path once links are resolved), however it was spelled: `./`, `..`, and on Windows
   backslashes or another case. A file in a diff is matched by that name too, for Stryker matches the names on disk.
   Either way the name must be one Stryker reads as itself (ranges.mjs strykerTakes: no glob magic in it, and its whole
-  path matches itself as Stryker matches it), so `( ) ! + @` in a name are taken, and `[id].ts` or `a{1,2}.ts` is not.
+  path matches itself as Stryker matches it), so `( ) ! + @` in a name are taken unless they make an extglob such as
+  `+(x)` or `@(x)`, and `[id].ts` or `a{1,2}.ts` is not.
 - `--concurrency N` sets pass A's parallel runs (default: half the cores); pass B uses half of that.
 - `--keep` keeps the sandboxes in `.stryker-tmp/` for a look after the run. Without it every sandbox is removed, a
   failed pass's too.
@@ -115,8 +116,9 @@ does not name by its content.
   every file it adds), not at one a file-system monitor says is unchanged, and not at one whose cached size and time
   (and, on Windows, creation time) still hold, so a same-size edit whose time was set back shows in no diff. So the
   gate checks every tracked file git does not name by its content: it hashes the file with git's filters, and names it
-  changed when that differs from git's index and its lines differ from the base's (the hash reads no index, so a blob
-  that holds CRLF, or an edit staged and then undone, differs with nothing changed); and it names one that is gone as
+  changed when that differs from git's index and its lines differ from the base's (the index can hold an edit staged
+  and then undone, and the hash reads no index, so a blob that holds CRLF under text=auto hashes as LF: either differs
+  with nothing changed); and it names one that is gone as
   deleted, unless skip-worktree left it out (a sparse checkout).
 - Not mutated, and named in the report with the reason: files outside src (the root scripts, updaters/, tests, docs and
   images), files that are not code, `.d.ts` files, the browser views under src/webui/public (copied into dist, never
@@ -160,7 +162,10 @@ does not name by its content.
    no regard to case, so on a disk that tells case apart, a file whose path differs from a listed one's only in case
    is copied too. Stryker also walks every dir of the checkout, ignored ones too, for node_modules to link:
    a dir the user cannot read (a data dir a container made as root) stops the pass. The TypeScript checker turns type-invalid mutants
-   into CompileError. Each mutant run is `vitest related <mutated files>` on the fast tier with one worker, so only
+   into CompileError. It compiles the checkout, not the sandbox, so it is given a tsconfig that extends the root's and
+   lists the tree's files only (ranges.mjs treeTsconfig): a file git ignores (a module cloned into src) can neither
+   make a mutant a CompileError nor stop the pass. A mutant whose only type error is an unused `@ts-expect-error`
+   (TS2578) type-checks, so it reruns alone with no checker, as a timeout does. Each mutant run is `vitest related <mutated files>` on the fast tier with one worker, so only
    tests that import them run. There is no coverage analysis: every mutant runs those tests. The files go on vitest's
    command line relative to test/; a change of many hundreds of files can pass Windows' limit on a command line, and
    then the run's log says vitest could not start.
@@ -175,7 +180,7 @@ does not name by its content.
    - A gating mutant that timed out in pass A, or whose run there failed only on the machine's texts (below), reruns
      with the fast tests that import the files of the mutants rerun, directly or through other files (`vitest related`;
      a test that reaches them by no import vitest can see, such as a computed require, a file read or a child process,
-     does not run again). It counts as killed when the rerun fails a test, whatever the failure says, or times out when run alone: a test or its beforeEach or afterEach hook past four times its limit (a beforeAll or
+     does not run again). It counts as killed when the rerun fails a test, whatever the failure says, or times out when run alone: a test or its beforeEach or afterEach hook past four times its limit, or past its own limit when it sets one (a beforeAll or
      afterAll hook's timeout is inconclusive, below), or the whole run past Stryker's budget for
      it, which is four times what those tests take with no mutant, plus a minute. That budget fires first whenever
      those tests take under 15 seconds, so a mutant that only slows several tests, each within its own limit, by that
@@ -191,12 +196,14 @@ does not name by its content.
      test counts as a kill. Either way an afterAll must bound its waits as a test does (the suite's own end their pools
      through helpers/endPool.ts).
    - A gating kill of pass B, or a run there that failed only on the machine's texts, reruns with the one test file
-     that failed, alone (one rerun per such file), so no other file's order or hang can decide it. It counts only when
+     that failed, alone (one rerun per such file), so no other file's order or hang can decide it (vitest takes the
+     name as part of a path, ignoring case, so a test file whose path holds it runs too). It counts only when
      that file fails for the mutant again, whatever the failure says; when the file passes alone, the mutant is
      inconclusive, not a survivor, since pass B stopped at that failure and its later tests never ran on it. Its Stryker
      budget is an hour, above anything vitest's own limits let the file take after its first failure, so a rerun that
      fails always leaves its report.
-   - A mutant the gate never reran (it stopped first) is inconclusive.
+   - A mutant the gate never reran (it stopped first) is inconclusive, and so is a survivor of pass A that the stopped
+     gate never ran through pass B.
 4. **A run with no mutant after the reruns.** When a rerun counted a kill or a timeout, the same tests run once more
    with no mutant, in the checkout itself, the way the reruns ran them (mutation/control.mjs). If they fail, the
    machine or a container went bad during the reruns, so what the reruns counted is inconclusive and the gate ends NO
@@ -207,7 +214,8 @@ does not name by its content.
    its whole process group (helpers/endTree.mjs: a process whose parent exited and that left the group outlives it).
    What it cannot see: a machine that was
    four times slower for one rerun only and well again by the end (a pass A rerun that timed out, or a pass B rerun
-   whose child step ran past its bound).
+   whose child step ran past its bound), or, for a test, hook or step that sets its own limit, which is not scaled,
+   one only as much slower as that limit allows (no test that reaches src sets one today).
 
 The tree is fingerprinted (every file git tracks or would add, which is what each sandbox holds: size, time and
 content) before the plan reads a file,
@@ -260,7 +268,8 @@ can hold the port or the path, and a run before it can leave the path behind. Fa
 
 The verdict is FAIL when a gating mutant ends Survived, NoCoverage, inconclusive (a pass that made no mutant at its place included), RuntimeError, or Ignored (a
 `// Stryker disable` comment needs the same justification in the notes as a survivor). A confirmed timeout counts as
-killed and is listed. CompileError counts as killed by the type checker. The verdict is NO RESULT when no src file
+killed and is listed. CompileError counts as killed by the type checker, unless its only error is an unused
+`@ts-expect-error` (it then reruns alone, above). The verdict is NO RESULT when no src file
 changed, when no gating mutant was made, when every gating mutant was a type error (no test ran against the change),
 when a pass could not run, when Stryker mutated a file no target names, when the run with no mutant after the reruns
 failed (or ran past the reruns' budget), when the tree changed during the run, or when a test's stand-in replaced
@@ -282,9 +291,11 @@ child away from anything real:
   unit/envScrub.test.ts holds the list against what src reads. pg is pointed at no server (PGHOST, PGPASSFILE) and git
   at no repository above the bot root or the temp dir (GIT_CEILING_DIRECTORIES: a sandbox sits inside the checkout and
   holds no .git, and test data dirs and child cwds sit under the temp dir), with NODE_ENV `test` and its own DATA_DIR;
-  the code that reads DATA_DIR or falls back to `/data` is never mutated (What it mutates), and a fork whose own env
-  lacks DATA_DIR throws, in a test and in every child step (helpers/forkGuard.cjs, which setup.ts loads and child.ts
-  preloads; src/webui/botManager.ts forks the bot so, and a mutant that empties that env must fail, not reach `/data`);
+  the code that reads DATA_DIR or falls back to `/data` is never mutated (What it mutates), and a process started
+  with an env of its own that lacks DATA_DIR throws, in a test and in every child step: fork, spawn, exec, execFile,
+  their sync forms, a promisified exec or execFile, and a worker_threads Worker (helpers/forkGuard.cjs, which setup.ts
+  loads and child.ts preloads; src/webui/botManager.ts forks the bot so, and a mutant that empties that env must fail,
+  not reach `/data`);
 - every wait is bounded, and a step past its bound is ended with every process it started that still descends from it
   (helpers/endTree.mjs, by parent links: one whose parent already exited is not found, and none is where ps is
   missing, so a scenario that starts processes keeps each one's parent alive); a step prints one `RESULT`

@@ -3,7 +3,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { describe, expect, it, onTestFinished } from 'vitest';
-import { byKiller, classifyKill, confirmed, INFRASTRUCTURE, judge, outcome, toConfirm, toPassB, type MutantRecord, type PassResult } from '../mutation/verdict.mjs';
+import { byKiller, classifyKill, confirmed, INFRASTRUCTURE, judge, onlyUnusedDirective, outcome, toConfirm, toPassB, type MutantRecord, type PassResult } from '../mutation/verdict.mjs';
 
 // What the L5 gate concludes (mutation/README.md): when a run counts as a
 // kill, which mutants go to which pass, and the verdict.
@@ -149,6 +149,19 @@ describe('the passes a mutant goes through', () => {
     expect(toConfirm([mutant(3, false, { a: pass('Killed', machineOnly) })], 'a')).toEqual([]);
   });
 
+  it('reruns alone, with no type checker, a mutant whose only type error is an unused @ts-expect-error', () => {
+    const unused = "src/a.ts(4,3): error TS2578: Unused '@ts-expect-error' directive.\n";
+    expect(onlyUnusedDirective(unused)).toBe(true);
+    expect(onlyUnusedDirective(`${unused}src/a.ts(5,9): error TS2322: Type 'string' is not assignable to type 'number'.\n`)).toBe(false);
+    expect(onlyUnusedDirective('')).toBe(false);
+    const directive = { recheck: 'the type checker', inconclusive: 'a type error only because a @ts-expect-error went unused (TS2578), so no test ran on it' };
+    const m = mutant(1, true, { a: pass('CompileError', directive) });
+    expect(toConfirm([m, mutant(2, true, { a: pass('CompileError') })], 'a')).toEqual([m]);
+    expect(confirmed(m)).toEqual({ outcome: 'Inconclusive', why: `${directive.inconclusive}, never rerun alone` });
+    expect(outcome(mutant(1, true, { a: pass('CompileError', directive), a2: pass('Killed', { killedBy: 'unit/x.test.ts > x' }) }))).toBe('Killed');
+    expect(toPassB([mutant(1, true, { a: pass('CompileError', directive), a2: pass('Survived') })])).toHaveLength(1);
+  });
+
   it('reruns each pass B kill with the test file that killed it', () => {
     const by = (file: string) => mutant(1, true, { a: pass('Survived'), b: pass('Killed', { killedBy: `${file} > the role override > keeps it` }) });
     const [one, two, three] = [by('child/fleetIdentity.test.ts'), by('integration/store.test.ts'), by('child/fleetIdentity.test.ts')];
@@ -209,14 +222,17 @@ describe('the verdict', () => {
       // A pass that made no mutant where pass A made one (its file changed, say): only a rerun or pass B can.
       mutant(4, true, { a: pass('Timeout'), a2: pass('Missing') }),
       mutant(5, true, { a: pass('Survived'), b: pass('Killed', { killedBy: 'child/x.test.ts > x' }), b2: pass('Missing') }),
+      // A pass A survivor the stopped gate never sent through pass B.
+      mutant(6, true, { a: pass('Survived') }),
     ], { stopped: ['pass b2 could not run: x'] }).lines.join('\n');
+    expect(text).toMatch(/^ {2}src\/a\.ts:6:3 .*\(pass B never ran on it: the gate stopped first\)$/m);
     expect(text).toMatch(/^ {2}src\/a\.ts:4:3 .*\(pass a2 made no mutant at this place, so it ran no test on it\)$/m);
     expect(text).toMatch(/^ {2}src\/a\.ts:5:3 .*\(pass b2 made no mutant at this place, so it ran no test on it\)$/m);
     expect(text).not.toMatch(/^Survivors /m);
     expect(text).toMatch(/^Inconclusive .*\n {2}src\/a\.ts:1:3 .*\(killed in pass B by child\/x\.test\.ts > x, but hung instead of failing when run alone\)$/m);
     expect(text).toMatch(/^ {2}src\/a\.ts:2:3 .*\(killed in pass B, never rerun alone\)$/m);
     expect(text).toMatch(/^ {2}src\/a\.ts:3:3 .*\(timed out, never rerun alone\)$/m);
-    expect(text).toMatch(/^ {2}killed in pass A: 0; sent to pass B: 3, killed there: 0$/m);
+    expect(text).toMatch(/^ {2}killed in pass A: 0; run in pass B: 3, killed there: 0$/m);
   });
 
   it('has no result when nothing changed or no gating mutant was made, and names what was not tested', () => {

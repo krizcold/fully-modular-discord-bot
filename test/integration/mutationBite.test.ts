@@ -66,7 +66,7 @@ describe('the touched-line mutation gate', () => {
     expect(run.stdout).toMatch(/^Survivors .*\n {2}src\/bot\/internalSetup\/fleet\/nodeIdentity\.ts:\d+:\d+ StringLiteral: `''`/m);
     expect(run.stdout).not.toContain(`nodeIdentity.ts:${child}:`);
     const killedInA = on(fast).filter(m => !equivalent(m)).length;
-    expect(run.stdout).toContain(`\n  killed in pass A: ${killedInA}; sent to pass B: ${on(child).length + 1}, killed there: ${on(child).length}\n`);
+    expect(run.stdout).toContain(`\n  killed in pass A: ${killedInA}; run in pass B: ${on(child).length + 1}, killed there: ${on(child).length}\n`);
     expect(run.stdout).toMatch(/^Runs with no mutant after the reruns:\n {2}after pass b2: passed /m);
     expect(run.stdout).toMatch(/^Verdict: FAIL$/m);
     // Pass B's kills reran with the one file that killed them, and so did the run with no mutant after them.
@@ -195,9 +195,42 @@ describe('the touched-line mutation gate', () => {
       expect(m.passes.a).toMatchObject({ recheck: 'unit/x.test.ts > reads', inconclusive: expect.stringMatching(/^only the machine failed: Error: EPERM/) });
       expect(m.passes.a2).toMatchObject({ killedBy: 'unit/x.test.ts > reads' });
     }
-    expect(run.stdout).toMatch(new RegExp(`^L5: pass A again, one at a time, on ${ran.length} timeout\\(s\\) or run\\(s\\) that failed only on the machine's texts$`, 'm'));
+    expect(run.stdout).toMatch(new RegExp(`^L5: pass A again, one at a time, on ${ran.length} mutant\\(s\\) to confirm alone: `, 'm'));
     expect(run.stdout).toMatch(/^Runs with no mutant after the reruns:\n {2}after pass a2: passed/m);
     expect(run.stdout).not.toMatch(/^Inconclusive /m);
+  });
+
+  it('type-checks only the tree, and reruns alone a mutant whose only type error is an unused @ts-expect-error', { timeout: 600_000 }, () => {
+    const src = path.join(root, 'src');
+    const ignored = path.join(src, 'bot', 'modulesDev');
+    for (const old of fs.readdirSync(src).filter(name => name.startsWith('smdb-bite-directive-'))) fs.rmSync(path.join(src, old), { force: true });
+    for (const old of fs.readdirSync(ignored).filter(name => name.startsWith('smdb-bite-reader-'))) fs.rmSync(path.join(ignored, old), { force: true });
+    const probe = `src/smdb-bite-directive-${process.pid}.ts`;
+    const reader = path.join(ignored, `smdb-bite-reader-${process.pid}.ts`);
+    fs.writeFileSync(path.join(root, probe), [
+      'export const SMDB_PROBE = { retries: 3 };',
+      'export function smdbDirective(log: (n: number) => void, ready: boolean): void {',
+      '  // @ts-expect-error: a boolean has no such field',
+      '  if (ready.missing) log(1);',
+      '}',
+      '',
+    ].join('\n'));
+    // A module cloned into the git-ignored src/bot/modulesDev that reads the probe: no sandbox holds it.
+    fs.writeFileSync(reader, `import { SMDB_PROBE } from '../../smdb-bite-directive-${process.pid}';\nexport const smdbRetries: number = SMDB_PROBE.retries;\n`);
+    try {
+      const { run, mutants } = standInRun('', probe);
+      expect(run.stdout).not.toMatch(/^Stopped:/m);
+      // Emptying the object is a type error only in the ignored file, so it meets the tests (the stand-in times them out).
+      const emptied = mutants.find(m => m.mutator === 'ObjectLiteral' && m.location.start.line === 1);
+      expect(emptied?.passes.a.status).toBe('Killed');
+      // The condition's mutants leave the directive unused: they rerun alone, where no checker runs.
+      const unused = mutants.filter(m => m.passes.a.status === 'CompileError' && m.passes.a.recheck);
+      expect(unused.length).toBeGreaterThan(0);
+      for (const m of unused) expect(m.passes.a2, m.mutator).toBeDefined();
+    } finally {
+      fs.rmSync(path.join(root, probe), { force: true });
+      fs.rmSync(reader, { force: true });
+    }
   });
 
   /**
@@ -276,7 +309,7 @@ describe('the touched-line mutation gate', () => {
     // Files in src that git neither tracks nor would add: one it ignores (a logs dir) and one in an untracked repository.
     const unlisted = [`src/smdb-ignored-${process.pid}/logs/x.ts`, `src/smdb-repo-${process.pid}/x.ts`];
     const globbed = `src/smdb-glob-[x]-${process.pid}.ts`;
-    for (const old of fs.readdirSync(path.join(root, 'src')).filter(name => /^smdb-(ignored|repo)-/.test(name))) fs.rmSync(path.join(root, 'src', old), { recursive: true, force: true });
+    for (const old of fs.readdirSync(path.join(root, 'src')).filter(name => /^smdb-(ignored|repo|glob)-/.test(name))) fs.rmSync(path.join(root, 'src', old), { recursive: true, force: true });
     try {
       for (const file of unlisted) {
         fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true });
