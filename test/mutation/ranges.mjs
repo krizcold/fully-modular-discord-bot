@@ -47,13 +47,14 @@ export const EXTRA_BREAK_WHY = 'it holds a line break Stryker counts and the gat
 /** @param {string} text */
 export const holdsExtraBreak = text => EXTRA_BREAK.test(text);
 
-export const DATA_ROUTE_WHY = "it reads DATA_DIR or holds the '/data' fallback, so a mutant of it could send the tests to /data, on a developer's machine a real data root and anywhere else one the run would make";
+export const DATA_ROUTE_WHY = "it reads DATA_DIR or holds a fixed root (the '/data' fallback, or '/app' or a path under it), so a mutant of it could send the tests there, on a developer's machine a real data root and anywhere else one the run would make";
 
 /**
- * Whether a file's code names the DATA_DIR variable or holds '/data' as a
- * string or a template's head: a mutant of it (a check of DATA_DIR made false,
- * the fallback chosen) could send the tests to '/data', so the gate never
- * mutates it.
+ * Whether a file's code names the DATA_DIR variable, or holds as a string or a
+ * template's head the '/data' fallback or the image's '/app' root or a path
+ * under it: a mutant of it (a check of DATA_DIR or of the image made false or
+ * true, the fallback chosen) could send the tests to a fixed root outside the
+ * sandbox, so the gate never mutates it.
  * @param {string} file
  * @param {string} text
  */
@@ -62,7 +63,7 @@ export function holdsDataRoute(file, text) {
   /** @param {ts.Node} node */
   const walk = node => {
     if (ts.isIdentifier(node) && node.text === 'DATA_DIR') found = true;
-    else if ((ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node) || ts.isTemplateHead(node)) && /^(DATA_DIR|\/data\/?)$/.test(node.text)) found = true;
+    else if ((ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node) || ts.isTemplateHead(node)) && /^(DATA_DIR|\/data\/?|\/app(\/.*)?)$/s.test(node.text)) found = true;
     else if (!found) ts.forEachChild(node, walk);
   };
   walk(parse(file, text));

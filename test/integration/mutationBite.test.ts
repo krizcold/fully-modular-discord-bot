@@ -281,7 +281,7 @@ describe('the touched-line mutation gate', () => {
     const { run, probe } = probeRun('a');
     expect(run.status).toBe(2);
     expect(run.stdout).toMatch(/^Stopped:\n {2}pass a2 could not run: /m);
-    expect(run.stdout).toContain(`\n  ${probe}: it reads DATA_DIR or holds the '/data' fallback`);
+    expect(run.stdout).toContain(`\n  ${probe}: it reads DATA_DIR or holds a fixed root`);
     expect(run.stdout).not.toContain('a2/dry-*.log');
     expect(run.stdout).toContain(`\nChanged during the run (so no one tree was tested):\n  ${probe}`);
   });
@@ -291,7 +291,7 @@ describe('the touched-line mutation gate', () => {
     const { run, probe } = probeRun('a2');
     expect(run.status).toBe(2);
     expect(run.stdout).toMatch(/^Stopped:\n {2}the run with no mutant after pass a2 failed: it refused the files the reruns ran on$/m);
-    expect(run.stdout).toContain(`\n  ${probe}: it reads DATA_DIR or holds the '/data' fallback`);
+    expect(run.stdout).toContain(`\n  ${probe}: it reads DATA_DIR or holds a fixed root`);
     expect(run.stdout).not.toContain('its logs:');
   });
 
@@ -404,6 +404,6 @@ describe('the touched-line mutation gate', () => {
     const data = refuse('--mutate', 'src/utils/dataRoot.ts:8-8');
     clean(data.stdout);
     expect(data.status, data.stderr).toBe(2);
-    expect(data.stderr).toContain("--mutate cannot take src/utils/dataRoot.ts: it reads DATA_DIR or holds the '/data' fallback");
+    expect(data.stderr).toContain("--mutate cannot take src/utils/dataRoot.ts: it reads DATA_DIR or holds a fixed root");
   });
 });

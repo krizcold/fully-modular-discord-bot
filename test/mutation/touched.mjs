@@ -158,8 +158,8 @@ const reportDir = path.join(root, 'test', 'mutation', 'reports', `${stamp}-${pro
 
 /** @type {PassTarget[]} */
 let targets = [];
-// Every run, each pass and rerun and each run with no mutant, takes the tests
-// related to every file the change touched, as pass A does.
+// Every run, each pass and rerun and each run with no mutant, is given every
+// file the gate mutates (each target's file), as pass A is.
 const changedFiles = () => [...new Set(targets.map(target => target.file))];
 /** @type {{ file: string, why: string }[]} */
 let skipped = [];
@@ -255,9 +255,9 @@ const common = {
 
 /**
  * Runs one Stryker pass. `tier` picks the tests (runner.mjs): a for the fast
- * tier, b for the integration and child tiers, each the tests related to every
- * file the change touched; `only`, when given, names the test files to run
- * instead. The reruns alone, a2 and b2, get four times the config's time
+ * tier's tests related to every file the gate mutates, b for the integration
+ * tier's related tests and then the whole child tier; `only`, when given,
+ * names the test files to run instead. The reruns alone, a2 and b2, get four times the config's time
  * limits. `keys`, when given, are the mutants the pass is for: Stryker makes
  * every mutant its spans hold, and the others run no test (targets.mjs).
  * @param {{ name: PassName, dir: string, tier: 'a' | 'b', mutate: string[], only?: string[], keys?: string[], extra: Options }} run

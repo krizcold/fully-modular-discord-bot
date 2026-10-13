@@ -143,6 +143,19 @@ const SHAPES: Record<string, string> = {
     '  }',
     '}',
   ].join('\n'),
+  // A clause whose one statement starts on its label line: any of its lines takes the whole clause.
+  clauseFromItsLabel: [
+    'export function tag(n: number, log: string[]): number {',
+    '  switch (n) {',
+    '    case 1: return log.push(',
+    "      'one');",
+    "    case 2: log.push('two');",
+    '      return 2;',
+    '    default:',
+    '      return 0;',
+    '  }',
+    '}',
+  ].join('\n'),
   clauseBlocksAndMethods: [
     'export function pick(n: number, log: string[]): number {',
     '  switch (n) {',
@@ -597,6 +610,16 @@ describe('the change', () => {
     expect(holdsDataRoute('src/a.ts', 'export const at = (g: string) => `/data${g}`;\n')).toBe(true);
     // A name that holds it, a route that starts with it, or a comment is no way there.
     expect(holdsDataRoute('src/a.ts', "// DATA_DIR, '/data'\nconst BASE_DATA_DIR = DATA_ROOT;\napp.get('/data/get', h);\n")).toBe(false);
+    // The image's /app root and every path under it are fixed roots too (D:\app on Windows): the file that picks
+    // them when the image's marker exists is never mutated, nor is any that holds one.
+    const pathHelpers = fs.readFileSync(path.join(botRoot, 'src', 'bot', 'internalSetup', 'utils', 'pathHelpers.ts'), 'utf8');
+    expect(holdsDataRoute('src/bot/internalSetup/utils/pathHelpers.ts', pathHelpers)).toBe(true);
+    for (const text of ["export const at = '/app';\n", "export const at = '/app/build';\n", 'export const at = (x: string) => `/app/${x}`;\n']) {
+      expect(holdsDataRoute('src/a.ts', text), text).toBe(true);
+    }
+    for (const text of ["export const at = '/apps/x';\n", "export const at = '/apply';\n", "export const at = 'app/x';\n"]) {
+      expect(holdsDataRoute('src/a.ts', text), text).toBe(false);
+    }
     const plan = planChange({
       entries: [{ status: 'R', from: 'src/utils/dataRoot.ts', file: 'src/utils/paths/dataRoot.ts' }, { status: 'M', file: 'src/b.ts' }],
       untracked: ['src/c.ts'],
@@ -877,7 +900,9 @@ describe('the widening', () => {
 // spans more than one line, which spans the loop (a one-line loop's is made,
 // and so is one whose every line changed, below), and the emptying of a case
 // clause on more than one line (its label is a header, its statements a body,
-// braces or not). Every other body's emptying is made (a callback's, a method
+// braces or not), unless the line takes whole a statement that starts on the
+// label line and ends the clause (and one whose every line changed is made,
+// below; a label and a body line widen to themselves, below). Every other body's emptying is made (a callback's, a method
 // of an object or a class expression), and what is not made is checked not to be.
 describe('the widening, against what Stryker makes', () => {
   const quiet = () => {};
@@ -909,7 +934,8 @@ describe('the widening, against what Stryker makes', () => {
       // Each for with no condition on more than one line: its false condition spans the loop, so one changed line
       // does not make it (a one-line loop's is made, and the filter below keeps those out).
       const loops = new Set<string>();
-      // Each case or default clause on more than one line: its emptying spans its body.
+      // Each case or default clause on more than one line: its emptying spans its body, so one changed line makes it
+      // only when the line takes whole a statement that starts on the label line and ends the clause.
       const clauses = new Set<string>();
       const inExpression = (node: ts.Node) => (ts.isMethodDeclaration(node) || ts.isGetAccessor(node) || ts.isSetAccessor(node) || ts.isConstructorDeclaration(node))
         && (ts.isObjectLiteralExpression(node.parent) || ts.isClassExpression(node.parent));
@@ -935,10 +961,11 @@ describe('the widening, against what Stryker makes', () => {
         const throughBlock = (m: Made) => blocks.some(b => at(m.location.start) <= b.start && b.end <= at(m.location.end) && b.start < span.start && span.end < b.end);
         const spanOf = (m: Made) => `${at(m.location.start)}-${at(m.location.end)}`;
         const braceOnly = (m: Made) => m.mutatorName === 'BlockStatement' && m.location.start.line < m.location.end.line && bodies.has(spanOf(m));
-        const spansBody = (m: Made) => m.mutatorName === 'ConditionalExpression' && (loops.has(spanOf(m)) || clauses.has(spanOf(m)));
+        const ranges = rangesOf(text, [n]) ?? [];
+        const heldWhole = (m: Made) => ranges.some(([s, e]) => s <= m.location.start.line + 1 && m.location.end.line + 1 <= e);
+        const spansBody = (m: Made) => m.mutatorName === 'ConditionalExpression' && (loops.has(spanOf(m)) || (clauses.has(spanOf(m)) && !heldWhole(m)));
         const touching = whole.filter(m => m.location.start.line + 1 <= n && n <= m.location.end.line + 1 && !throughBlock(m));
         const expected = touching.filter(m => !braceOnly(m) && !spansBody(m));
-        const ranges = rangesOf(text, [n]) ?? [];
         const mutate = ranges.map(([s, e]) => ({ start: { line: s - 1, column: 0 }, end: { line: e - 1, column: Number.MAX_SAFE_INTEGER } }));
         const here = await made(text, mutate);
         const got = new Set(here.map(key));
@@ -994,6 +1021,39 @@ describe('the widening, against what Stryker makes', () => {
     expect(await of([2, 3, 4])).toBe(true);
     // With the closer unchanged, the loop's range is not held whole, so it is not made.
     expect(await of([2, 3])).toBeUndefined();
+  });
+
+  it('makes and gates the emptying of a case clause when every line of it changed, as a clause a job adds', async () => {
+    const text = ['export function f(n: number): number {', '  switch (n) {', '    case 1:', '      return 1;', '    default:', '      return 0;', '  }', '}'].join('\n');
+    const clause = (m: Made) => m.mutatorName === 'ConditionalExpression' && m.location.start.line + 1 === 3 && m.location.end.line + 1 === 4;
+    const of = async (changed: number[]) => {
+      const target = changeTarget('src/a.ts', text, { changed, deletedAfter: [] })!;
+      const here = await made(text, target.ranges!.map(([s, e]) => ({ start: { line: s - 1, column: 0 }, end: { line: e - 1, column: Number.MAX_SAFE_INTEGER } })));
+      const found = here.find(clause);
+      return found && gates(target, { start: { line: found.location.start.line + 1, column: 1 }, end: { line: found.location.end.line + 1, column: 1 } });
+    };
+    expect(await of([3, 4])).toBe(true);
+    // One line of it alone holds neither the label's body nor the clause whole.
+    expect(await of([3])).toBeUndefined();
+    expect(await of([4])).toBeUndefined();
+  });
+
+  it('widens a changed case label, and a line of its body, to that line only, braces or not', () => {
+    const text = [
+      'export function f(n: number, log: () => void): number {',
+      '  switch (n) {',
+      '    case 0:',
+      '      return -1;',
+      '    case 1: {',
+      '      log();',
+      '      return 1;',
+      '    }',
+      '    default: log();',
+      '      return 0;',
+      '  }',
+      '}',
+    ].join('\n');
+    for (const line of [3, 4, 5, 6, 8, 9, 10]) expect(rangesOf(text, [line]), `line ${line}`).toEqual([[line, line]]);
   });
 
   it('names the lines of a file taken whole that only the emptying of their body covers', async () => {

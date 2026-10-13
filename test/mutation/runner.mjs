@@ -1,10 +1,10 @@
 // The command both Stryker passes run (touched.mjs sets the pass, the files and
 // the report dir in the env; Stryker adds the active mutant). It runs vitest on
-// this tree's own tests: pass a, the fast tier's tests that import the changed
-// files (every file the change touched, in every run); pass b, the integration
-// tests that import them, then the whole child
-// tier; or only the test files SMDB_MUTATION_ONLY names (the rerun of a pass B
-// failure with the file that failed), each in its tier. Every run stops at its
+// this tree's own tests: pass a, the fast tier's tests that import the mutated
+// files (every file the gate mutates, in every run); pass b, the integration
+// tests that import them, then the whole child tier; or only the test files
+// SMDB_MUTATION_ONLY names (the rerun of a pass B failure with the file that
+// failed), each in its tier. Every run stops at its
 // first failure. A rerun alone (SMDB_MUTATION_CONFIRM=1) gives the config's
 // test and hook limits and a step's default bound four times their time
 // (SMDB_TEST_TIME_SCALE, read by vitest.config.ts and helpers/child.ts); a limit

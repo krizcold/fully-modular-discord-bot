@@ -86,8 +86,11 @@ does not name by its content.
   inside a statement taken whole), and then gates as any mutant does. A reviewer checks a changed header of a longer
   loop: the no-mutant list below names it when it has no mutant of its own, and the structure list when it holds the
   body's `{`; one with a mutant of its own (`for (let i = 0; ; i++)`) and no `{` is named in neither. The emptying of
-  a case clause on more than one line is not made either: it spans the clause's body. A changed label is in the
-  structure list, and in the no-mutant list too when its value has no mutant of its own (`case 1:`). A block wholly made of
+  a case clause spans the clause, so it is made the same way: only where one range holds the whole clause (a clause
+  on one line, one whose every line changed, as a clause a job adds, or a changed line that takes whole a statement
+  starting on the label line and ending the clause), and then it gates; a changed label or body line otherwise
+  widens to itself and does not make it. A changed label is in the structure list,
+  and in the no-mutant list too when no mutant lies wholly on its line (`case 1:` alone, not `case 1: return 1;`). A block wholly made of
   changed lines is made, and so is every other body's emptying. unit/mutationRanges.test.ts holds this rule to
   Stryker's own instrumenter, line by line, both what is made and what is not, on made-up shapes and on two real files.
 - The other mutants in the widened ranges are **context**: they run in pass A and are listed, but never fail the gate.
@@ -134,8 +137,10 @@ does not name by its content.
   would number differently; `--mutate` refuses such a file.
 - Never mutated, on any machine, and named: a file whose code names the DATA_DIR variable or holds `'/data'` as a
   string or as the head of a template (`` `/data/${x}` ``; src/utils/dataRoot.ts today, under any name or split into
-  others). A mutant of it (the DATA_DIR check made false, the fallback chosen) sends the tests to `/data`, on a
-  developer's machine a real data root and anywhere else one the run would make outside the sandbox. A path under
+  others), or holds the image's `'/app'` root or a path under it (`'/app/build'`, `` `/app/${x}` ``: the module path
+  helpers, the snapshot and update code and src/index.ts today). A mutant of it (the DATA_DIR check made false, the
+  image's marker taken as found, the fallback chosen) sends the tests to such a root, on a developer's machine a real
+  data root (on Windows at the root of the run's drive: `D:\app` for a checkout on D:) and anywhere else one the run would make outside the sandbox. A path under
   `/data` written out in full (`'/data/global'`) is not matched, since route paths such as `'/data/get'` read the
   same: unit/mutationRanges.test.ts fails when a file in src that git tracks or would add (what the gate can mutate)
   gains a string that starts with `/data/` and is not one of the known routes, so such a path goes through dataRoot.ts. `--mutate` refuses such a file, and each pass's run with no mutant, which
@@ -173,14 +178,16 @@ does not name by its content.
    pass A with NO RESULT and names it (ranges.mjs beyondTree): a mutant that broke only that file would count as killed
    with no test run. A gating mutant whose only type error is an unused `@ts-expect-error` (TS2578) type-checks, so it
    meets pass A's tests again with no checker (`a-unchecked/`), and that run is its pass A: from there it goes on like
-   any other mutant. Each mutant run is `vitest related <changed files>` on the fast tier with one worker: every pass
-   and rerun, and each run with no mutant, takes every file the change touched, so only tests that import one of them,
-   directly or through other files, run (a test that reaches them by no import vitest can see, such as a computed
-   require, a file read or a child process, does not). There is no coverage analysis: every mutant runs those tests. The files go on vitest's
+   any other mutant. Each mutant run is `vitest related <mutated files>` on the fast tier with one worker: every pass
+   and rerun, and each run with no mutant, is given every file the gate mutates (each target's file, not the changed
+   files it does not mutate), and where it runs related tests (pass A, its run with no checker, a2 and the run after
+   it, pass B's integration tier) only tests that import one of them, directly or through other files, run (a test
+   that reaches them by no import vitest can see, such as a computed require, a file read or a child process, does
+   not). Pass B's child tier runs whole, and b2 and the run after it run the one file that failed. There is no coverage analysis: every mutant runs those tests. The files go on vitest's
    command line relative to test/; a change of many hundreds of files can pass Windows' limit on a command line, and
    then the run's log says vitest could not start.
 2. **Pass B, the rest, on pass A's gating survivors only.** The sandbox's dist is built from the instrumented src
-   (build.cjs), then each survivor runs `vitest related <changed files>` on the integration tier and then the whole child tier, whose
+   (build.cjs), then each survivor runs `vitest related <mutated files>` on the integration tier and then the whole child tier, whose
    scenarios start real processes on that dist. A child sees the mutant through the env. Stryker makes every mutant a
    span holds, so a survivor that spans lines brings in the mutants nested inside it; in pass B and every rerun those
    run no test (targets.mjs gives the runner the ids the pass is for) and their results are dropped.
@@ -223,7 +230,10 @@ does not name by its content.
    What it cannot see: a machine that was
    four times slower for one rerun only and well again by the end (a pass A rerun that timed out, or a pass B rerun
    whose child step ran past its bound), or, for a test, hook or step that sets its own limit, which is not scaled,
-   one only as much slower as that limit allows (no test that reaches src sets one today).
+   one only as much slower as that limit allows (no test that reaches src sets one today); nor what an earlier rerun,
+   or the pass's own run with no mutant, left inside that pass's one sandbox (a file written under its test or src
+   through a path a mutant made relative, a module a scenario put into its dist), which can fail a later rerun: it
+   runs in the checkout, which holds none of it (no test or scenario writes there today).
 
 The tree is fingerprinted (every file git tracks or would add, which is what each sandbox holds: size, time and
 content) before the plan reads a file,
@@ -243,8 +253,9 @@ that repeats with the mutant alone, while the run with no mutant after the rerun
 are matched against the first line of each failure unless it is an AssertionError (a sync `expect` or `assert`; a failed
 `.resolves`, `.rejects` or `expect.poll` begins `Error:` and is read like any error, which at most sends it to a rerun),
 never against a stack or a child's stderr. So the list only spares reruns, and need not be complete. What the reruns
-cannot see: a chance failure that hits a mutant's first run and again its rerun alone, while the run with no mutant
-after passes, credits a kill.
+cannot see: a chance failure (a timeout included) that hits a mutant's first run, and one that hits its rerun alone,
+while the run with no mutant after passes, credits a kill; so does what an earlier rerun left in the rerun sandbox
+(above).
 Anything else is **inconclusive**: no report, a failure (a timeout included) only in a beforeAll or afterAll hook or at
 file level, an unhandled error with every test passing, or a first run that failed only on the machine's texts and was
 never rerun (the gate stopped first), or a type error only of an unused `@ts-expect-error` that never met the tests
