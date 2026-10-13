@@ -13,7 +13,8 @@ import { runScenario } from '../helpers/child';
 import { canonicalName } from '../mutation/keys.mjs';
 import {
   changeTarget, codeLines, commonLines, gates, inPattern, lineDiff, linesOfTarget, mergeRanges, notMutated, parseNameStatus, planChange, planFromGit,
-  unmatchedPatterns, untouched, wholeTarget, structureLines, DATA_ROUTE_WHY, GLOB_NAME_WHY, holdsDataRoute, rootGlobFree, sandboxPatterns, strykerTakes, treeTsconfig,
+  unmatchedPatterns, untouched, wholeTarget, structureLines, DATA_ROUTE_WHY, GLOB_NAME_WHY, beyondTree, holdsDataRoute, rootGlobFree, sandboxPatterns, strykerTakes,
+  treeTsconfig,
 } from '../mutation/ranges.mjs';
 import { treeChanges, treePrint } from '../mutation/tree.mjs';
 
@@ -473,6 +474,28 @@ describe('the change', () => {
     };
     expect(errorsOf(path.join(root, 'tsconfig.json')).length).toBeGreaterThan(0);
     expect(errorsOf(path.join(root, '.stryker-tmp', 'tsconfig.l5.json'))).toEqual([]);
+  });
+
+  it('names a file outside the tree that a tree file imports or references, which the type checker would still judge', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-beyond-'));
+    onTestFinished(() => fs.rmSync(root, { recursive: true, force: true }));
+    const put = (file: string, text: string) => {
+      fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true });
+      fs.writeFileSync(path.join(root, file), text);
+    };
+    put('tsconfig.json', JSON.stringify({ compilerOptions: { strict: true, noEmit: true, moduleResolution: 'node' }, include: ['src'] }));
+    put('src/api.ts', 'export const DEFAULTS = { retries: 3 };\n');
+    put('src/modulesDev/m.ts', "import { DEFAULTS } from '../api';\nexport type N = typeof DEFAULTS.retries;\n");
+    put('node_modules/pkg/index.d.ts', 'export type P = number;\n');
+    const tree = ['tsconfig.json', 'src/api.ts', 'src/tree.ts'];
+    const beyond = (text: string) => {
+      put('src/tree.ts', text);
+      return beyondTree(root, tree, treeTsconfig(root, tree, '.stryker-tmp'), '.stryker-tmp');
+    };
+    expect(beyond('export const x = 1;\n')).toEqual([]);
+    expect(beyond("import type { P } from 'pkg';\nexport const x: P = 1;\n")).toEqual([]);
+    expect(beyond("import type { N } from './modulesDev/m';\nexport const x: N = 1;\n")).toEqual(['src/modulesDev/m.ts']);
+    expect(beyond('/// <reference path="./modulesDev/m.ts" />\nexport const x = 1;\n')).toEqual(['src/modulesDev/m.ts']);
   });
 
   it("refuses a checkout path Stryker would read as a glob, exactly where Stryker's own matcher matches no file under it", async () => {

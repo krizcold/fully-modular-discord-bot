@@ -17,7 +17,7 @@ active mutant travels in `__STRYKER_ACTIVE_MUTANT__` and reaches child processes
 | keys.mjs | (library) how a file and a mutant are named across passes; unit/mutationRanges.test.ts |
 | targets.mjs | (Stryker reporter) which mutant ids a later pass runs tests for; unit/mutationRunner.test.ts and the bite |
 | tree.mjs | (library) the fingerprint of the tree a run reads, taken before the plan and before the verdict; unit/mutationRanges.test.ts and the bite |
-| ../helpers/time.mjs | the factor on every test's time limits (4 in a rerun alone) |
+| ../helpers/time.mjs | the factor on the config's test and hook limits and a child step's default bound (4 in a rerun alone and in the run with no mutant after the reruns; a limit a test, hook or step sets itself is not scaled) |
 | ../helpers/env.ts, setup.ts | what a test and its children keep of the environment, and the run's fast-check seed |
 | ../helpers/forkGuard.cjs | a process started with an env of its own that lacks DATA_DIR throws (fork, spawn, exec, execFile, a Worker), in a test and in a child step |
 | ../helpers/build.cjs | builds dist the way `npm run build` does, stamped and locked; pass B's buildCommand |
@@ -163,9 +163,13 @@ does not name by its content.
    is copied too. Stryker also walks every dir of the checkout, ignored ones too, for node_modules to link:
    a dir the user cannot read (a data dir a container made as root) stops the pass. The TypeScript checker turns type-invalid mutants
    into CompileError. It compiles the checkout, not the sandbox, so it is given a tsconfig that extends the root's and
-   lists the tree's files only (ranges.mjs treeTsconfig): a file git ignores (a module cloned into src) can neither
-   make a mutant a CompileError nor stop the pass. A mutant whose only type error is an unused `@ts-expect-error`
-   (TS2578) type-checks, so it reruns alone with no checker, as a timeout does. Each mutant run is `vitest related <mutated files>` on the fast tier with one worker, so only
+   lists the tree's files only (ranges.mjs treeTsconfig), so a file git ignores (a module cloned into src) is not
+   judged for being in src. TypeScript still follows a tree file's imports and references (a type-only one included),
+   so when the checker would judge a file outside the tree, packages under node_modules aside, the gate stops before
+   pass A with NO RESULT and names it (ranges.mjs beyondTree): a mutant that broke only that file would count as killed
+   with no test run. A gating mutant whose only type error is an unused `@ts-expect-error` (TS2578) type-checks, so it
+   reruns alone with no checker, as a timeout does; that rerun is its first run of the tests, so it reads the
+   machine's texts as a first run does (below). Each mutant run is `vitest related <mutated files>` on the fast tier with one worker, so only
    tests that import them run. There is no coverage analysis: every mutant runs those tests. The files go on vitest's
    command line relative to test/; a change of many hundreds of files can pass Windows' limit on a command line, and
    then the run's log says vitest could not start.
@@ -174,9 +178,9 @@ does not name by its content.
    scenarios start real processes on that dist. A child sees the mutant through the env. Stryker makes every mutant a
    span holds, so a survivor that spans lines brings in the mutants nested inside it; in pass B and every rerun those
    run no test (targets.mjs gives the runner the ids the pass is for) and their results are dropped.
-3. **Reruns alone.** Every run stops at its first failure. A rerun runs one mutant at a time and gives every test, hook
-   and child scenario step four times its time limit (a test's own explicit limit is not scaled), and Stryker a larger
-   budget for the whole run.
+3. **Reruns alone.** Every run stops at its first failure. A rerun runs one mutant at a time and gives the config's
+   limit for each test and hook, and a child scenario step's default bound, four times their time (a limit a test,
+   hook or step sets itself is not scaled), and Stryker a larger budget for the whole run.
    - A gating mutant that timed out in pass A, or whose run there failed only on the machine's texts (below), reruns
      with the fast tests that import the files of the mutants rerun, directly or through other files (`vitest related`;
      a test that reaches them by no import vitest can see, such as a computed require, a file read or a child process,
@@ -224,7 +228,8 @@ no mutant reads the checkout then, so a tree that changed during the run (an edi
 NO RESULT, naming the files.
 
 A run Stryker counts as a kill is checked against vitest's report of it: it is a kill when a test itself failed, and a
-timeout when every failing test (or its beforeEach or afterEach hook) timed out. In a pass's first run (A or B), a
+timeout when every failing test (or its beforeEach or afterEach hook) timed out. In a mutant's first run of the tests
+(pass A or B, or the rerun alone of a type error only of an unused `@ts-expect-error`, which ran none in pass A), a
 failure that reads like the machine's proves nothing by itself, for the machine may cause it as well as the mutant:
 refused or reset connections, a container that would not start, a database connection dropped, exhausted resources,
 a file held or refused (EBUSY, EPERM, ENOTEMPTY or EACCES, as on Windows when a test removes its temp dir while a run
@@ -238,7 +243,7 @@ cannot see: a chance failure that hits a mutant's first run and again its rerun 
 after passes, credits a kill.
 Anything else is **inconclusive**: no report, a failure (a timeout included) only in a beforeAll or afterAll hook or at
 file level, an unhandled error with every test passing, or a first run that failed only on the machine's texts and was
-never rerun (the gate stopped first). vitest counts a failure in a beforeEach or afterEach hook as its test's, so such a
+never rerun (the gate stopped first, or it was already that type error's rerun alone). vitest counts a failure in a beforeEach or afterEach hook as its test's, so such a
 failure counts as the test's too.
 
 Every run of the gate draws one fast-check seed (named on the Scope line; set SMDB_TEST_SEED to an integer to run with a
@@ -269,9 +274,9 @@ can hold the port or the path, and a run before it can leave the path behind. Fa
 The verdict is FAIL when a gating mutant ends Survived, NoCoverage, inconclusive (a pass that made no mutant at its place included), RuntimeError, or Ignored (a
 `// Stryker disable` comment needs the same justification in the notes as a survivor). A confirmed timeout counts as
 killed and is listed. CompileError counts as killed by the type checker, unless its only error is an unused
-`@ts-expect-error` (it then reruns alone, above). The verdict is NO RESULT when no src file
+`@ts-expect-error` (a gating one then reruns alone, above). The verdict is NO RESULT when no src file
 changed, when no gating mutant was made, when every gating mutant was a type error (no test ran against the change),
-when a pass could not run, when Stryker mutated a file no target names, when the run with no mutant after the reruns
+when the type checker would judge a file outside the tree, when a pass could not run, when Stryker mutated a file no target names, when the run with no mutant after the reruns
 failed (or ran past the reruns' budget), when the tree changed during the run, or when a test's stand-in replaced
 vitest (SMDB_MUTATION_VITEST, for the gate's own tests only); the report then
 says why, with the passes that did finish.

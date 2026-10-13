@@ -54,10 +54,10 @@ try {
   process.exit(2);
 }
 const {
-  structureLines, DATA_ROUTE_WHY, EXTRA_BREAK_WHY, GLOB_NAME_WHY, gates, holdsDataRoute, holdsExtraBreak, linesOfTarget, notMutated, planFromGit, rootGlobFree,
-  sandboxPatterns, strykerTakes, treeTsconfig, unmatchedPatterns, untouched,
+  structureLines, DATA_ROUTE_WHY, EXTRA_BREAK_WHY, GLOB_NAME_WHY, beyondTree, gates, holdsDataRoute, holdsExtraBreak, linesOfTarget, notMutated, planFromGit,
+  rootGlobFree, sandboxPatterns, strykerTakes, treeTsconfig, unmatchedPatterns, untouched,
 } = ranges;
-const { byKiller, classifyKill, judge, onlyUnusedDirective, outcome, toConfirm, toPassB } = verdicts;
+const { byKiller, classifyKill, judge, onlyUnusedDirective, outcome, rerunAlone, toConfirm, toPassB } = verdicts;
 
 const USAGE = 'usage: node test/mutation/touched.mjs [--base REF] [--mutate PATTERN]... [--concurrency N] [--keep]';
 /** @type {{ base: string, mutate: string[], concurrency: number, keep: boolean }} */
@@ -254,7 +254,7 @@ const common = {
  * Runs one Stryker pass. `tier` picks the tests (runner.mjs): a for the fast
  * tier, b for the integration and child tiers; `only`, when given, names the
  * test files to run instead. The reruns alone, a2 and b2, get four times the
- * time. `keys`, when given, are the mutants the pass is for: Stryker makes every
+ * config's time limits. `keys`, when given, are the mutants the pass is for: Stryker makes every
  * mutant its spans hold, and the others run no test (targets.mjs).
  * @param {{ name: PassName, dir: string, tier: 'a' | 'b', mutate: string[], files: string[], only?: string[], keys?: string[], extra: Options }} run
  * @returns {Promise<StrykerResult[]>}
@@ -347,7 +347,7 @@ async function passOn(name, dir, tier, on, extra, only) {
   const byKey = new Map(results.map(r => [resultKey(r), r]));
   for (const m of on) {
     const r = byKey.get(recordKey(m));
-    m.passes[name] = r ? resultOf(dir, r, name === 'a2' || name === 'b2') : { id: null, status: 'Missing' };
+    m.passes[name] = r ? resultOf(dir, r, rerunAlone(m, name)) : { id: null, status: 'Missing' };
   }
 }
 
@@ -422,9 +422,14 @@ try {
 
   const files = [...new Set(targets.map(target => target.file))];
   console.log(`L5: mutating ${scope}: ${files.length} file(s), pass A (in-process tests that import them)`);
-  // The type checker judges the tree's files only (ranges.mjs treeTsconfig).
+  // The type checker judges the tree's files only (ranges.mjs treeTsconfig, beyondTree).
   const checkerConfig = `.stryker-tmp/tsconfig.l5-${process.pid}.json`;
-  fs.writeFileSync(path.join(root, checkerConfig), `${JSON.stringify(treeTsconfig(root, planned.keys(), '.stryker-tmp'), null, 2)}\n`);
+  const checker = treeTsconfig(root, planned.keys(), '.stryker-tmp');
+  const beyond = beyondTree(root, planned.keys(), checker, '.stryker-tmp');
+  if (beyond.length > 0) {
+    throw new PassError(`the type checker would judge ${beyond.join(', ')}, which a file in the tree imports or references but no sandbox holds, so a mutant that broke only it would count as killed with no test run`);
+  }
+  fs.writeFileSync(path.join(root, checkerConfig), `${JSON.stringify(checker, null, 2)}\n`);
   const resultsA = await pass({ name: 'a', dir: 'a', tier: 'a', mutate: targets.flatMap(t => t.patterns), files, extra: { ...PASSES.a, concurrency: opts.concurrency, tsconfigFile: checkerConfig } })
     .finally(() => fs.rmSync(path.join(root, checkerConfig), { force: true }));
   const orphans = [...new Set(resultsA.map(fileOf).filter(file => !targets.some(t => t.file === file)))];

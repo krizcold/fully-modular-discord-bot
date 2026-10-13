@@ -701,7 +701,8 @@ export const rootGlobFree = root => strykerTakes(root, 'package.json');
  * tsconfig it would judge files git ignores that the root's includes (a module
  * cloned into src), which no sandbox holds: such a file could turn a mutant
  * into a CompileError, counted as killed, or stop the pass. This one extends
- * the root's and lists only the files of the tree that the root's holds.
+ * the root's and lists only the files of the tree that the root's holds; a
+ * file they import from outside the tree is still judged (beyondTree).
  * @param {string} root
  * @param {Iterable<string>} tree the tree's files, from the bot root with forward slashes
  * @param {string} dir the dir it is written to, from the bot root
@@ -710,13 +711,40 @@ export function treeTsconfig(root, tree, dir) {
   const rootConfig = path.join(root, 'tsconfig.json');
   const { config } = ts.readConfigFile(rootConfig, ts.sys.readFile);
   const held = ts.parseJsonConfigFileContent(config, ts.sys, root, undefined, rootConfig).fileNames;
-  /** @param {string} file */
-  const key = file => (process.platform === 'win32' ? path.resolve(file).toLowerCase() : path.resolve(file));
-  const inTree = new Set([...tree].map(file => key(path.join(root, file))));
+  const inTree = treeKeys(root, tree);
   /** @param {string} file */
   const from = file => path.relative(path.join(root, dir), file).split(path.sep).join('/');
-  return { extends: from(rootConfig), include: [], files: held.filter(file => inTree.has(key(file))).map(file => from(path.resolve(file))) };
+  return { extends: from(rootConfig), include: [], files: held.filter(file => inTree.has(fileKey(file))).map(file => from(path.resolve(file))) };
 }
+
+/**
+ * The files outside the tree that the type checker still judges with the
+ * config treeTsconfig gives: TypeScript follows a tree file's imports and
+ * references (a type-only one included) to a file git ignores, which no
+ * sandbox holds. Packages under node_modules are not counted.
+ * @param {string} root
+ * @param {Iterable<string>} tree the tree's files, from the bot root with forward slashes
+ * @param {object} config what treeTsconfig gave
+ * @param {string} dir the dir it is written to, from the bot root
+ * @returns {string[]} from the bot root with forward slashes
+ */
+export function beyondTree(root, tree, config, dir) {
+  const parsed = ts.parseJsonConfigFileContent(config, ts.sys, path.join(root, dir), undefined, path.join(root, dir, 'tsconfig.json'));
+  const program = ts.createProgram({ rootNames: parsed.fileNames, options: parsed.options, projectReferences: parsed.projectReferences });
+  const inTree = treeKeys(root, tree);
+  return program.getSourceFiles().map(source => path.relative(root, path.resolve(source.fileName)))
+    .filter(file => !file.split(path.sep).includes('node_modules') && !inTree.has(fileKey(path.join(root, file))))
+    .map(file => file.split(path.sep).join('/'));
+}
+
+/** @param {string} file a path, compared as the file system does (no case on Windows) */
+const fileKey = file => (process.platform === 'win32' ? path.resolve(file).toLowerCase() : path.resolve(file));
+
+/**
+ * @param {string} root
+ * @param {Iterable<string>} tree
+ */
+const treeKeys = (root, tree) => new Set([...tree].map(file => fileKey(path.join(root, file))));
 
 /**
  * The lines a target answers for: its changed lines, or for a whole file or a

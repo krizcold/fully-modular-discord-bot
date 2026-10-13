@@ -3,7 +3,9 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { describe, expect, it, onTestFinished } from 'vitest';
-import { byKiller, classifyKill, confirmed, INFRASTRUCTURE, judge, onlyUnusedDirective, outcome, toConfirm, toPassB, type MutantRecord, type PassResult } from '../mutation/verdict.mjs';
+import {
+  byKiller, classifyKill, confirmed, INFRASTRUCTURE, judge, onlyUnusedDirective, outcome, rerunAlone, toConfirm, toPassB, type MutantRecord, type PassResult,
+} from '../mutation/verdict.mjs';
 
 // What the L5 gate concludes (mutation/README.md): when a run counts as a
 // kill, which mutants go to which pass, and the verdict.
@@ -160,6 +162,15 @@ describe('the passes a mutant goes through', () => {
     expect(confirmed(m)).toEqual({ outcome: 'Inconclusive', why: `${directive.inconclusive}, never rerun alone` });
     expect(outcome(mutant(1, true, { a: pass('CompileError', directive), a2: pass('Killed', { killedBy: 'unit/x.test.ts > x' }) }))).toBe('Killed');
     expect(toPassB([mutant(1, true, { a: pass('CompileError', directive), a2: pass('Survived') })])).toHaveLength(1);
+    // Its rerun alone is its first run of the tests, so a failure there only on the machine's texts counts for nothing.
+    expect(rerunAlone(m, 'a2')).toBe(false);
+    expect(rerunAlone(mutant(1, true, { a: pass('Timeout') }), 'a2')).toBe(true);
+    expect(rerunAlone(mutant(1, true, { a: pass('Survived'), b: pass('Killed', { killedBy: 'x' }) }), 'b2')).toBe(true);
+    expect(rerunAlone(m, 'a')).toBe(false);
+    expect(rerunAlone(m, 'b')).toBe(false);
+    const machineOnce = mutant(1, true, { a: pass('CompileError', directive), a2: pass('Killed', { recheck: 'unit/x.test.ts > x', inconclusive: 'only the machine failed: Error: EBUSY: x' }) });
+    expect(confirmed(machineOnce)).toEqual({ outcome: 'Inconclusive', why: 'only the machine failed: Error: EBUSY: x, in the only run of tests on it (in pass A the type checker judged it)' });
+    expect(toPassB([machineOnce])).toEqual([]);
   });
 
   it('reruns each pass B kill with the test file that killed it', () => {
@@ -206,7 +217,7 @@ describe('the verdict', () => {
       mutant(6, true, { a: pass('Timeout'), a2: pass('Killed', { timeout: 'unit/x.test.ts > slow' }) }),
     ], { controls: ['after pass b2: passed'] });
     expect(result).toMatchObject({ verdict: 'PASS', code: 0 });
-    expect(result.lines.join('\n')).toMatch(/^Timeouts \(each timed out when run alone with four times the time: a test or its beforeEach or afterEach hook, or the whole run past its budget; .*\n {2}src\/a\.ts:2:3 /m);
+    expect(result.lines.join('\n')).toMatch(/^Timeouts \(each timed out when run alone with four times the config's limit, or past the limit a test or hook sets itself: a test or its beforeEach or afterEach hook, or the whole run past its budget; .*\n {2}src\/a\.ts:2:3 /m);
     // A rerun past Stryker's budget may only have slowed the tests: it is not said to have hung.
     expect(result.lines.join('\n')).toMatch(/^ {2}src\/a\.ts:2:3 .*\(ran past Stryker's budget alone\)$/m);
     expect(result.lines.join('\n')).toMatch(/^ {2}src\/a\.ts:6:3 .*\(timed out alone: unit\/x\.test\.ts > slow\)$/m);

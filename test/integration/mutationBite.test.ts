@@ -200,7 +200,7 @@ describe('the touched-line mutation gate', () => {
     expect(run.stdout).not.toMatch(/^Inconclusive /m);
   });
 
-  it('type-checks only the tree, and reruns alone a mutant whose only type error is an unused @ts-expect-error', { timeout: 600_000 }, () => {
+  it('type-checks only the tree, and reruns alone a mutant whose only type error is an unused @ts-expect-error, as its first run', { timeout: 600_000 }, () => {
     const src = path.join(root, 'src');
     const ignored = path.join(src, 'bot', 'modulesDev');
     for (const old of fs.readdirSync(src).filter(name => name.startsWith('smdb-bite-directive-'))) fs.rmSync(path.join(src, old), { force: true });
@@ -218,15 +218,22 @@ describe('the touched-line mutation gate', () => {
     // A module cloned into the git-ignored src/bot/modulesDev that reads the probe: no sandbox holds it.
     fs.writeFileSync(reader, `import { SMDB_PROBE } from '../../smdb-bite-directive-${process.pid}';\nexport const smdbRetries: number = SMDB_PROBE.retries;\n`);
     try {
-      const { run, mutants } = standInRun('', probe);
+      // Every rerun alone fails only on the machine's texts.
+      const { run, mutants } = standInRun(`if (mutant && pass === 'a2') message = "Error: EBUSY: resource busy or locked, rmdir 'x'";`, probe);
       expect(run.stdout).not.toMatch(/^Stopped:/m);
-      // Emptying the object is a type error only in the ignored file, so it meets the tests (the stand-in times them out).
+      // Emptying the object is a type error only in the ignored file, so it meets the tests (the stand-in times them
+      // out), and its rerun alone counts the failure, whatever it says.
       const emptied = mutants.find(m => m.mutator === 'ObjectLiteral' && m.location.start.line === 1);
       expect(emptied?.passes.a.status).toBe('Killed');
-      // The condition's mutants leave the directive unused: they rerun alone, where no checker runs.
+      expect(emptied?.passes.a2?.killedBy).toBe('unit/x.test.ts > reads');
+      // The condition's mutants leave the directive unused: they rerun alone, where no checker runs, and that rerun
+      // is their first run of the tests, so a failure only on the machine's texts counts for nothing.
       const unused = mutants.filter(m => m.passes.a.status === 'CompileError' && m.passes.a.recheck);
       expect(unused.length).toBeGreaterThan(0);
-      for (const m of unused) expect(m.passes.a2, m.mutator).toBeDefined();
+      for (const m of unused) {
+        expect(m.passes.a2, m.mutator).toMatchObject({ recheck: 'unit/x.test.ts > reads', inconclusive: expect.stringMatching(/^only the machine failed: Error: EBUSY/) });
+      }
+      expect(run.stdout).toMatch(/, in the only run of tests on it \(in pass A the type checker judged it\)\)$/m);
     } finally {
       fs.rmSync(path.join(root, probe), { force: true });
       fs.rmSync(reader, { force: true });
@@ -309,7 +316,11 @@ describe('the touched-line mutation gate', () => {
     // Files in src that git neither tracks nor would add: one it ignores (a logs dir) and one in an untracked repository.
     const unlisted = [`src/smdb-ignored-${process.pid}/logs/x.ts`, `src/smdb-repo-${process.pid}/x.ts`];
     const globbed = `src/smdb-glob-[x]-${process.pid}.ts`;
-    for (const old of fs.readdirSync(path.join(root, 'src')).filter(name => /^smdb-(ignored|repo|glob)-/.test(name))) fs.rmSync(path.join(root, 'src', old), { recursive: true, force: true });
+    // A file in src that imports, by type only, a module in the git-ignored src/bot/modulesDev.
+    const importer = `src/smdb-beyond-${process.pid}.ts`;
+    const imported = `src/bot/modulesDev/smdb-beyond-${process.pid}.ts`;
+    for (const old of fs.readdirSync(path.join(root, 'src')).filter(name => /^smdb-(ignored|repo|glob|beyond)-/.test(name))) fs.rmSync(path.join(root, 'src', old), { recursive: true, force: true });
+    for (const old of fs.readdirSync(path.join(root, 'src', 'bot', 'modulesDev')).filter(name => name.startsWith('smdb-beyond-'))) fs.rmSync(path.join(root, 'src', 'bot', 'modulesDev', old), { force: true });
     try {
       for (const file of unlisted) {
         fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true });
@@ -329,6 +340,13 @@ describe('the touched-line mutation gate', () => {
       const refused = refuse('--mutate', broken);
       expect(refused.status).toBe(2);
       expect(refused.stderr).toContain(`--mutate cannot take ${broken}: it holds a line break Stryker counts and the gate does not`);
+      // The type checker would judge the imported module, which no sandbox holds: the gate stops before pass A.
+      fs.writeFileSync(path.join(root, imported), 'export type SmdbBeyond = number;\n');
+      fs.writeFileSync(path.join(root, importer), `import type { SmdbBeyond } from './bot/modulesDev/smdb-beyond-${process.pid}';\nexport const smdbBeyond: SmdbBeyond = 1;\n`);
+      const beyondRefused = refuse('--mutate', importer);
+      clean(beyondRefused.stdout);
+      expect(beyondRefused.status, beyondRefused.stdout).toBe(2);
+      expect(beyondRefused.stdout).toContain(`\nStopped:\n  the type checker would judge ${imported}, which a file in the tree imports or references but no sandbox holds,`);
       // A file that exists, in the tree, under a name Stryker reads as a glob.
       fs.writeFileSync(path.join(root, globbed), 'export const x = 1;\n');
       const globRefused = refuse('--mutate', globbed);
@@ -345,6 +363,8 @@ describe('the touched-line mutation gate', () => {
       fs.rmSync(outside, { force: true });
       fs.rmSync(path.join(root, broken), { force: true });
       fs.rmSync(path.join(root, globbed), { force: true });
+      fs.rmSync(path.join(root, importer), { force: true });
+      fs.rmSync(path.join(root, imported), { force: true });
       for (const file of unlisted) fs.rmSync(path.join(root, file.split('/').slice(0, 2).join('/')), { recursive: true, force: true });
     }
 

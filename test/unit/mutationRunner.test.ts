@@ -317,7 +317,7 @@ describe('the time limits', () => {
     vi.resetModules();
   });
 
-  it('give every test, hook and child step four times its time in a rerun', async () => {
+  it("give the config's test and hook limits and a child step's default bound four times their time in a rerun", async () => {
     vi.stubEnv('SMDB_TEST_TIME_SCALE', '4');
     vi.resetModules();
     const config = (await import('../vitest.config')).default as { test: { testTimeout: number; hookTimeout: number } };
