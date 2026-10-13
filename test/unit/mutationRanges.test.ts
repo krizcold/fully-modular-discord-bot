@@ -12,7 +12,7 @@ import { runScenario } from '../helpers/child';
 import { canonicalName } from '../mutation/keys.mjs';
 import {
   changeTarget, codeLines, commonLines, gates, inPattern, lineDiff, linesOfTarget, mergeRanges, notMutated, parseNameStatus, planChange, planFromGit,
-  unmatchedPatterns, untouched, wholeTarget, structureLines, DATA_ROUTE_WHY, GLOB_NAME_WHY, holdsDataRoute, sandboxPatterns,
+  unmatchedPatterns, untouched, wholeTarget, structureLines, DATA_ROUTE_WHY, GLOB_NAME_WHY, holdsDataRoute, rootGlobFree, sandboxPatterns,
 } from '../mutation/ranges.mjs';
 import { treeChanges, treePrint } from '../mutation/tree.mjs';
 
@@ -444,6 +444,19 @@ describe('the change', () => {
     ]);
   });
 
+  it("refuses a checkout path Stryker would read as a glob, exactly where Stryker's own matcher matches no file under it", async () => {
+    const { FileMatcher } = await import('../node_modules/@stryker-mutator/core/dist/src/config/file-matcher.js');
+    const base = path.join(os.tmpdir(), 'smdb-roots');
+    const refused = ['x [old]', 'x {a,b}', 'x {1..3}', 'x +(y)', 'x @(y)'];
+    const taken = ['plain', 'x (copy)', 'x [old', 'x {a}', 'a+b', 'x#1 !y', 'Program Files (x86)'];
+    for (const dir of [...refused, ...taken]) {
+      const root = path.join(base, dir, 'bot');
+      const file = path.join(root, 'src', 'a.ts');
+      expect(rootGlobFree(root), dir).toBe(taken.includes(dir));
+      expect(new FileMatcher(file, false).matches(file), dir).toBe(taken.includes(dir));
+    }
+  });
+
   it('never mutates, through a link in src, a file that is not mutated: the suite\'s env scrub, say', () => {
     const plan = planChange({
       entries: [{ status: 'A', file: 'src/env.ts' }],
@@ -501,6 +514,8 @@ describe('the change', () => {
     expect(holdsDataRoute('src/utils/dataRoot.ts', dataRoot)).toBe(true);
     expect(holdsDataRoute('src/a.ts', "export const root = process.env['DATA_DIR'] ?? 'here';\n")).toBe(true);
     expect(holdsDataRoute('src/a.js', 'module.exports = process.env.X || `/data/`;\n')).toBe(true);
+    expect(holdsDataRoute('src/a.ts', 'export const at = (g: string) => `/data/${g}/settings.json`;\n')).toBe(true);
+    expect(holdsDataRoute('src/a.ts', 'export const at = (g: string) => `/data${g}`;\n')).toBe(true);
     // A name that holds it, a route that starts with it, or a comment is no way there.
     expect(holdsDataRoute('src/a.ts', "// DATA_DIR, '/data'\nconst BASE_DATA_DIR = DATA_ROOT;\napp.get('/data/get', h);\n")).toBe(false);
     const plan = planChange({
@@ -512,6 +527,37 @@ describe('the change', () => {
     });
     expect(plan.targets.map(t => t.file)).toEqual(['src/b.ts']);
     expect(plan.skipped).toEqual([{ file: 'src/utils/paths/dataRoot.ts', why: DATA_ROUTE_WHY }, { file: 'src/c.ts', why: DATA_ROUTE_WHY }]);
+  });
+
+  // holdsDataRoute matches the '/data' root, not a path under it written out in
+  // full, which reads the same as a route path: a mutant of code that holds one
+  // could reach a real data root, so src holds none but the routes named here.
+  it("finds in src no path under /data written out in full, but the config page's routes", () => {
+    const ROUTES = ['/data/delete', '/data/delete-guild', '/data/get', '/data/update'];
+    const found = new Map<string, string>();
+    let files = 0;
+    const walk = (dir: string) => {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const file = path.join(dir, entry.name);
+        if (entry.isDirectory()) walk(file);
+        else if (/\.(ts|tsx|js|jsx|mjs|cjs)$/.test(entry.name)) {
+          files += 1;
+          const text = fs.readFileSync(file, 'utf8');
+          if (holdsDataRoute(file, text)) continue;
+          const visit = (node: ts.Node) => {
+            if ((ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node) || ts.isTemplateHead(node)) && node.text.startsWith('/data/')) {
+              found.set(node.text, path.relative(botRoot, file));
+            }
+            ts.forEachChild(node, visit);
+          };
+          visit(ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true));
+        }
+      }
+    };
+    walk(path.join(botRoot, 'src'));
+    expect(files).toBeGreaterThan(100);
+    // A new one: route it through src/utils/dataRoot.ts, or, for a route path, add it here.
+    expect([...found].filter(([text]) => !ROUTES.includes(text))).toEqual([]);
   });
 
   it('refuses, in a test and in a child, a fork whose own env lacks DATA_DIR (helpers/forkGuard.cjs)', async () => {

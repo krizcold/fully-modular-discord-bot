@@ -28,27 +28,30 @@ const FIXTURES: Record<string, string> = {
   'stepBound.test.mjs': "it('restarts', () => { throw new Error('scenario fleetIdentity.cjs read did not finish in 20000 ms\\nwaiting for the lease'); });",
   'eachHook.test.mjs': "beforeEach(() => { throw new Error('the hook failed'); });\nit('reads', () => {});",
   'lockedDir.test.mjs': "afterEach(() => { throw new Error(\"EBUSY: resource busy or locked, rmdir 'smdb-x'\"); });\nit('reads', () => {});",
+  'ownFileError.test.mjs': "it('saves', () => { const error = new Error(\"EPERM: operation not permitted, rename 'a.tmp' -> 'a'\"); error.code = 'EPERM'; throw error; });",
+  'rejectsCode.test.mjs': "it('refuses', async () => { const error = new Error('ENOENT: x'); error.code = 'ENOENT'; await expect(Promise.reject(error)).rejects.toMatchObject({ code: 'EACCES' }); });",
 };
 
 describe('a run Stryker counted as a kill', () => {
-  it('is a kill only when a test itself failed for a reason other than the machine', () => {
+  it('is a kill when a test failed for the mutant, and reruns alone a run that failed only on the machine\'s texts', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-verdict-'));
     onTestFinished(() => fs.rmSync(dir, { recursive: true, force: true }));
     for (const [name, body] of Object.entries(FIXTURES)) fs.writeFileSync(path.join(dir, name), `${body}\n`);
     const out = path.join(dir, 'report.json');
     spawnSync(process.execPath, [vitest, 'run', '--root', dir, '--globals', '--reporter=json', `--outputFile=${out}`], { cwd: dir, stdio: 'ignore', timeout: 120_000 });
     const report = JSON.parse(fs.readFileSync(out, 'utf8')) as { testResults: { name: string }[] };
-    const of = (name: string) => classifyKill([{ testResults: report.testResults.filter(file => file.name.endsWith(name)) as never }]);
+    const of = (name: string, alone = false) => classifyKill([{ testResults: report.testResults.filter(file => file.name.endsWith(name)) as never }], alone);
+    const recheck = (test: RegExp, why: string | RegExp) => ({ recheck: expect.stringMatching(test), inconclusive: typeof why === 'string' ? why : expect.stringMatching(why) });
 
     expect(of('containerStart.test.mjs')).toEqual({ inconclusive: expect.stringMatching(/^no test failed.*Health check not healthy/) });
     expect(of('nestedHook.test.mjs')).toEqual({ inconclusive: expect.stringMatching(/^no test failed/) });
-    expect(of('connectionDrop.test.mjs')).toEqual({ inconclusive: 'only the machine failed: Error: Connection terminated unexpectedly' });
+    expect(of('connectionDrop.test.mjs')).toEqual(recheck(/connectionDrop\.test\.mjs > queries$/, 'only the machine failed: Error: Connection terminated unexpectedly'));
     expect(of('assertion.test.mjs')).toEqual({ killedBy: expect.stringMatching(/assertion\.test\.mjs > keeps the role$/) });
     expect(of('hang.test.mjs')).toEqual({ timeout: expect.stringMatching(/hang\.test\.mjs > answers$/) });
     expect(of('unhandled.test.mjs')).toEqual({ inconclusive: expect.stringMatching(/^no test failed/) });
     expect(of('mixed.test.mjs')).toEqual({ killedBy: expect.stringMatching(/mixed\.test\.mjs > keeps the role$/) });
     expect(of('hookHang.test.mjs')).toEqual({ timeout: expect.stringMatching(/hookHang\.test\.mjs > reads$/) });
-    expect(of('notQueryable.test.mjs')).toEqual({ inconclusive: expect.stringMatching(/^only the machine failed: .*not queryable/) });
+    expect(of('notQueryable.test.mjs')).toEqual(recheck(/notQueryable\.test\.mjs > queries$/, /^only the machine failed: .*not queryable/));
     // A child that fails for the mutant names the injected fault in its stderr,
     // and an assertion may name an error as the value under test: both are kills.
     expect(of('childFault.test.mjs')).toEqual({ killedBy: expect.stringMatching(/childFault\.test\.mjs > survives a full disk$/) });
@@ -57,15 +60,24 @@ describe('a run Stryker counted as a kill', () => {
     expect(of('stepBound.test.mjs')).toEqual({ killedBy: expect.stringMatching(/stepBound\.test\.mjs > restarts$/) });
     // vitest gives a beforeEach failure to its test, so it counts as the test's.
     expect(of('eachHook.test.mjs')).toEqual({ killedBy: expect.stringMatching(/eachHook\.test\.mjs > reads$/) });
-    // A file another process holds is the machine's, in a test or its afterEach (pass A never reruns a kill).
-    expect(of('lockedDir.test.mjs')).toEqual({ inconclusive: "only the machine failed: Error: EBUSY: resource busy or locked, rmdir 'smdb-x'" });
+    // A file held or refused may be the machine's (a temp dir a run beside it holds) or the
+    // mutant's (code that throws it, or an async assertion that names it, which vitest does not
+    // mark AssertionError): the run reruns alone, where whatever repeats counts.
+    expect(of('lockedDir.test.mjs')).toEqual(recheck(/lockedDir\.test\.mjs > reads$/, "only the machine failed: Error: EBUSY: resource busy or locked, rmdir 'smdb-x'"));
+    expect(of('ownFileError.test.mjs')).toEqual(recheck(/ownFileError\.test\.mjs > saves$/, /^only the machine failed: Error: EPERM: operation not permitted, rename/));
+    expect(of('rejectsCode.test.mjs')).toEqual(recheck(/rejectsCode\.test\.mjs > refuses$/, /^only the machine failed: .*EACCES/));
     for (const code of ['EBUSY', 'EPERM', 'ENOTEMPTY', 'EACCES']) expect(INFRASTRUCTURE.test(`Error: ${code}: x`), code).toBe(true);
+    for (const name of ['connectionDrop', 'lockedDir', 'ownFileError', 'rejectsCode']) {
+      expect(of(`${name}.test.mjs`, true), name).toEqual({ killedBy: expect.stringMatching(new RegExp(`${name}\\.test\\.mjs > `)) });
+    }
     // A run is a timeout only when every failure timed out: a machine failure
-    // beside a timeout, in another tier's report or at file level, proves nothing.
-    const ofAll = (...names: string[]) => classifyKill(names.map(name => ({ testResults: report.testResults.filter(file => file.name.endsWith(name)) as never })));
-    expect(ofAll('hang.test.mjs', 'hookHang.test.mjs')).toEqual({ timeout: expect.stringMatching(/hang\.test\.mjs > answers$/) });
-    expect(ofAll('connectionDrop.test.mjs', 'hang.test.mjs')).toEqual({ inconclusive: 'a test timed out while the machine failed: Error: Connection terminated unexpectedly' });
-    expect(ofAll('containerStart.test.mjs', 'hang.test.mjs')).toEqual({ inconclusive: expect.stringMatching(/^a test timed out while the machine failed: .*Health check not healthy/) });
+    // beside a timeout, in another tier's report or at file level, reruns it alone.
+    const ofAll = (alone: boolean, ...names: string[]) => classifyKill(names.map(name => ({ testResults: report.testResults.filter(file => file.name.endsWith(name)) as never })), alone);
+    expect(ofAll(false, 'hang.test.mjs', 'hookHang.test.mjs')).toEqual({ timeout: expect.stringMatching(/hang\.test\.mjs > answers$/) });
+    expect(ofAll(false, 'connectionDrop.test.mjs', 'hang.test.mjs')).toEqual(recheck(/connectionDrop\.test\.mjs > queries$/, 'a test timed out while the machine failed: Error: Connection terminated unexpectedly'));
+    expect(ofAll(false, 'containerStart.test.mjs', 'hang.test.mjs')).toEqual(recheck(/hang\.test\.mjs > answers$/, /^a test timed out while the machine failed: .*Health check not healthy/));
+    expect(ofAll(true, 'containerStart.test.mjs', 'hang.test.mjs')).toEqual({ timeout: expect.stringMatching(/hang\.test\.mjs > answers$/) });
+    expect(of('containerStart.test.mjs', true)).toEqual({ inconclusive: expect.stringMatching(/^no test failed/) });
     expect(classifyKill([])).toEqual({ inconclusive: 'no vitest report was written' });
   });
 });
@@ -112,6 +124,24 @@ describe('the passes a mutant goes through', () => {
     expect(outcome(mutant(1, false, { a: pass('Timeout') }))).toBe('Timeout');
   });
 
+  it("reruns alone a run that failed only on the machine's texts, and counts it when a test fails again", () => {
+    const machineOnly = { recheck: 'unit/x.test.ts > saves', inconclusive: 'only the machine failed: Error: EPERM: x' };
+    const inA = mutant(1, true, { a: pass('Killed', machineOnly) });
+    expect(toConfirm([inA], 'a')).toEqual([inA]);
+    expect(confirmed(inA)).toEqual({ outcome: 'Inconclusive', why: 'only the machine failed: Error: EPERM: x, never rerun alone' });
+    expect(outcome(mutant(1, true, { a: pass('Killed', machineOnly), a2: pass('Killed', { killedBy: 'unit/x.test.ts > saves' }) }))).toBe('Killed');
+    const chance = mutant(1, true, { a: pass('Killed', machineOnly), a2: pass('Survived') });
+    expect(toPassB([chance])).toEqual([chance]);
+    const inB = mutant(2, true, { a: pass('Survived'), b: pass('Killed', { ...machineOnly, recheck: 'integration/s.test.ts > reads' }) });
+    expect(toConfirm([inB], 'b')).toEqual([inB]);
+    expect([...byKiller([inB]).keys()]).toEqual(['integration/s.test.ts']);
+    expect(outcome({ ...inB, passes: { ...inB.passes, b2: pass('Killed', { killedBy: 'integration/s.test.ts > reads' }) } })).toBe('Killed');
+    expect(confirmed({ ...inB, passes: { ...inB.passes, b2: pass('Timeout') } }))
+      .toEqual({ outcome: 'Inconclusive', why: 'killed in pass B by integration/s.test.ts > reads, but hung instead of failing when run alone' });
+    // A context mutant is never rerun.
+    expect(toConfirm([mutant(3, false, { a: pass('Killed', machineOnly) })], 'a')).toEqual([]);
+  });
+
   it('reruns each pass B kill with the test file that killed it', () => {
     const by = (file: string) => mutant(1, true, { a: pass('Survived'), b: pass('Killed', { killedBy: `${file} > the role override > keeps it` }) });
     const [one, two, three] = [by('child/fleetIdentity.test.ts'), by('integration/store.test.ts'), by('child/fleetIdentity.test.ts')];
@@ -132,7 +162,8 @@ describe('the verdict', () => {
     for (const passes of [
       { a: pass('Survived'), b: pass('Survived') },
       { a: pass('Ignored', { statusReason: 'disabled by a comment' }) },
-      { a: pass('Killed', { inconclusive: 'only the machine failed: x' }) },
+      { a: pass('Killed', { inconclusive: 'no vitest report was written' }) },
+      { a: pass('Killed', { recheck: 'x', inconclusive: 'only the machine failed: x' }) },
       { a: pass('RuntimeError', { statusReason: 'spawn EAGAIN' }) },
       { a: pass('Survived'), b: pass('Killed', { inconclusive: 'no vitest report was written' }) },
       { a: pass('Survived'), b: pass('Killed', { killedBy: 'x' }), b2: pass('Killed', { timeout: 'x' }) },

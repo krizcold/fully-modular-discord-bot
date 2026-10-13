@@ -18,7 +18,7 @@ import { describe, expect, it } from 'vitest';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const TARGET = 'src/bot/internalSetup/fleet/nodeIdentity.ts';
 
-interface Pass { id: string | null; status: string; killedBy?: string; inconclusive?: string }
+interface Pass { id: string | null; status: string; killedBy?: string; inconclusive?: string; recheck?: string }
 
 // The ids a pass ran tests for (targets.mjs), as runner.mjs read them.
 const ranFor = (reportDir: string, dir: string) => (JSON.parse(fs.readFileSync(path.join(root, reportDir, dir, 'run-ids.json'), 'utf8')) as string[]).sort();
@@ -183,6 +183,21 @@ describe('the touched-line mutation gate', () => {
     expect(run.status).toBe(2);
     expect(run.stdout).toMatch(/^Stopped:\n {2}the run with no mutant after pass a2 failed \(it took \d+ s, past the 4 s Stryker gave each rerun, so the machine was too slow then to tell a slow mutant from a slow run\)/m);
     expect(run.stdout).not.toMatch(/^Timeouts /m);
+  });
+
+  it("reruns alone a mutant whose run failed only on the machine's texts, and counts the failure when it repeats", { timeout: 600_000 }, () => {
+    // Each mutant's code throws a file error, as code that renames onto a directory does on Windows.
+    const { run, mutants } = standInRun(`if (mutant) message = "Error: EPERM: operation not permitted, rename 'a.tmp' -> 'a'";`);
+    // The ones the type checker did not stop first.
+    const ran = mutants.filter(m => m.passes.a.status !== 'CompileError');
+    expect(ran.length).toBeGreaterThan(0);
+    for (const m of ran) {
+      expect(m.passes.a).toMatchObject({ recheck: 'unit/x.test.ts > reads', inconclusive: expect.stringMatching(/^only the machine failed: Error: EPERM/) });
+      expect(m.passes.a2).toMatchObject({ killedBy: 'unit/x.test.ts > reads' });
+    }
+    expect(run.stdout).toMatch(new RegExp(`^L5: pass A again, one at a time, on ${ran.length} timeout\\(s\\) or run\\(s\\) that failed only on the machine's texts$`, 'm'));
+    expect(run.stdout).toMatch(/^Runs with no mutant after the reruns:\n {2}after pass a2: passed/m);
+    expect(run.stdout).not.toMatch(/^Inconclusive /m);
   });
 
   /**

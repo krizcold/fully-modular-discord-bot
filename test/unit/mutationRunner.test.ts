@@ -263,6 +263,22 @@ describe('the tree fingerprint', () => {
     expect(run.stdout).toMatch(/^Verdict: NO RESULT \(the gate could not make \.stryker-tmp, where Stryker puts its sandboxes: /m);
   });
 
+  it("ends the gate NO RESULT, exit 2, naming the path, in a checkout whose path Stryker reads as a glob", () => {
+    const outer = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-globroot-'));
+    const copy = path.join(outer, 'bot [old]');
+    const packages = path.join(copy, 'test', 'node_modules');
+    onTestFinished(() => {
+      fs.unlinkSync(packages);
+      fs.rmSync(outer, { recursive: true, force: true });
+    });
+    copyGate(copy);
+    fs.symlinkSync(path.join(root, 'test', 'node_modules'), packages, 'junction');
+    const run = spawnSync(process.execPath, [path.join(copy, 'test', 'mutation', 'touched.mjs')], { cwd: copy, encoding: 'utf8' });
+    expect(run.status, run.stderr).toBe(2);
+    expect(run.stdout).toMatch(/^Verdict: NO RESULT \(the checkout's path, .*\/bot \[old\], holds characters Stryker reads as a glob: /m);
+    expect(fs.existsSync(path.join(copy, '.stryker-tmp'))).toBe(false);
+  });
+
   it('ends the gate NO RESULT, exit 2, on stdout with every other verdict, when the test packages are missing', () => {
     const copy = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-noinstall-'));
     onTestFinished(() => fs.rmSync(copy, { recursive: true, force: true }));

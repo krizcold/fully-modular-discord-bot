@@ -50,8 +50,9 @@ export const DATA_ROUTE_WHY = "it reads DATA_DIR or holds the '/data' fallback, 
 
 /**
  * Whether a file's code names the DATA_DIR variable or holds '/data' as a
- * string: a mutant of it (a check of DATA_DIR made false, the fallback chosen)
- * could send the tests to '/data', so the gate never mutates it.
+ * string or a template's head: a mutant of it (a check of DATA_DIR made false,
+ * the fallback chosen) could send the tests to '/data', so the gate never
+ * mutates it.
  * @param {string} file
  * @param {string} text
  */
@@ -60,7 +61,7 @@ export function holdsDataRoute(file, text) {
   /** @param {ts.Node} node */
   const walk = node => {
     if (ts.isIdentifier(node) && node.text === 'DATA_DIR') found = true;
-    else if ((ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) && /^(DATA_DIR|\/data\/?)$/.test(node.text)) found = true;
+    else if ((ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node) || ts.isTemplateHead(node)) && /^(DATA_DIR|\/data\/?)$/.test(node.text)) found = true;
     else if (!found) ts.forEachChild(node, walk);
   };
   walk(parse(file, text));
@@ -655,6 +656,15 @@ function globFree(root, file) {
   const name = path.resolve(root, file).split(path.sep).join('/');
   return !new Minimatch(name).hasMagic() && minimatch(name, name, { dot: true });
 }
+
+/**
+ * Whether Stryker can match any file under the bot root: it resolves each
+ * mutate pattern against the root and reads the whole path as a glob, so a
+ * root holding a [ ] class, a { } with a comma or a range, or an extglob such
+ * as +( ) matches no file, and nothing is mutated.
+ * @param {string} root
+ */
+export const rootGlobFree = root => globFree(root, 'package.json');
 
 /**
  * The lines a target answers for: its changed lines, or for a whole file or a

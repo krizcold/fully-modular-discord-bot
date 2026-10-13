@@ -48,8 +48,10 @@ From the bot root, with Node 22.12 or newer (or SMDB_TEST_NODE set, as for `npm 
   above, under the root's `*.log`) or one outside the checkout: a file in the tree that the run writes to changes
   during the run, which ends it NO RESULT.
 - Exit 0 is PASS, 1 FAIL, 2 NO RESULT (nothing was tested, the tree changed during the run, or the gate stopped: the
-  report says which; or, with no report, the test packages are missing (`npm run test:install`), .stryker-tmp could not
-  be made, git could not list the tree, or the report itself could not be written; every `Verdict:` line goes to
+  report says which; or, with no report, the test packages are missing (`npm run test:install`), the checkout's path
+  holds characters Stryker reads as a glob (a `[ ]` class, a `{ }` with a comma or a range, or an extglob such as
+  `+( )`, with which Stryker matches no file to mutate), .stryker-tmp could not be made, git could not list the tree,
+  or the report itself could not be written; every `Verdict:` line goes to
   stdout, and the gate exits only once stdout has taken the whole report) or a usage error. A mutant id left in the shell (`__STRYKER_ACTIVE_MUTANT__`)
   is ignored. Any other code means the run was interrupted. Trust 0 and 1 only after the report's `Verdict:` line: a process
   killed on Windows exits 1 too.
@@ -118,9 +120,12 @@ runs it under a hostile config). git runs with no file-system monitor, so it loo
   file that holds a line break Stryker counts and the gate does not (a lone CR, U+2028 or U+2029), whose lines the two
   would number differently; `--mutate` refuses such a file.
 - Never mutated, on any machine, and named: a file whose code names the DATA_DIR variable or holds `'/data'` as a
-  string (src/utils/dataRoot.ts today, under any name or split into others). A mutant of it (the DATA_DIR check made
-  false, the fallback chosen) sends the tests to `/data`, on a developer's machine a real data root and anywhere else
-  one the run would make outside the sandbox. `--mutate` refuses such a file, and each pass's run with no mutant, which
+  string or as the head of a template (`` `/data/${x}` ``; src/utils/dataRoot.ts today, under any name or split into
+  others). A mutant of it (the DATA_DIR check made false, the fallback chosen) sends the tests to `/data`, on a
+  developer's machine a real data root and anywhere else one the run would make outside the sandbox. A path under
+  `/data` written out in full (`'/data/global'`) is not matched, since route paths such as `'/data/get'` read the
+  same: unit/mutationRanges.test.ts fails when src gains a string that starts with `/data/` and is not one of the
+  known routes, so such a path goes through dataRoot.ts. `--mutate` refuses such a file, and each pass's run with no mutant, which
   comes before any mutant's, checks the files as that pass copied them, so a file that gains such code after the plan
   stops the pass (NO RESULT, naming it).
 - A changed line of code that no mutant lies wholly on, in a diff, an untracked file or a `--mutate` pattern, is named
@@ -129,8 +134,9 @@ runs it under a hostile config). git runs with no file-system monitor, so it loo
   line it spans; a mutant on one line counts for that whole line, as Stryker counts it. So types, imports, signatures,
   a bare `await f();`, an `else`, `try`, `finally` or `do` line, and every line of a multi-line object, array, arrow
   body, call or condition with no mutant of its own land in the list. A file taken whole names the same lines as each
-  of its lines changed alone. The list can name a line some mutant reaches; it never leaves out a line of code that no
-  mutant lies on. A line of brackets and separators only is not a line of code: what was taken out of it (`}, 100);`
+  of its lines changed alone. The list can name a line some mutant reaches; it never leaves out a line of code the
+  diff marks changed that no mutant lies on (a line the job added can still go unmarked, as the window's limit above
+  says). A line of brackets and separators only is not a line of code: what was taken out of it (`}, 100);`
   made `});`), like a pure deletion, is not mutated, and a changed one in a diff is named under its own heading. A
   deleted file is named too. A `--mutate` pattern that
   made no mutant is named on its own, beside other patterns on the same file.
@@ -159,10 +165,10 @@ runs it under a hostile config). git runs with no file-system monitor, so it loo
 3. **Reruns alone.** Every run stops at its first failure. A rerun runs one mutant at a time and gives every test, hook
    and child scenario step four times its time limit (a test's own explicit limit is not scaled), and Stryker a larger
    budget for the whole run.
-   - A gating mutant that timed out in pass A reruns with the fast tests that import the files of the mutants rerun,
-     directly or through other files (`vitest related`; a test that reaches them by no import vitest can see, such as a
-     computed require, a file read or a child process, does not run again). It counts as killed when the rerun fails a
-     test, or times out again: a test or its beforeEach or afterEach hook past four times its limit (a beforeAll or
+   - A gating mutant that timed out in pass A, or whose run there failed only on the machine's texts (below), reruns
+     with the fast tests that import the files of the mutants rerun, directly or through other files (`vitest related`;
+     a test that reaches them by no import vitest can see, such as a computed require, a file read or a child process,
+     does not run again). It counts as killed when the rerun fails a test, whatever the failure says, or times out again: a test or its beforeEach or afterEach hook past four times its limit (a beforeAll or
      afterAll hook's timeout is inconclusive, below), or the whole run past Stryker's budget for
      it, which is four times what those tests take with no mutant, plus a minute. That budget fires first whenever
      those tests take under 15 seconds, so a mutant that only slows several tests, each within its own limit, by that
@@ -177,8 +183,9 @@ runs it under a hostile config). git runs with no file-system monitor, so it loo
      still checked out) counts as a hang too; past a minute, vitest's limit can end the afterAll first, and the failed
      test counts as a kill. Either way an afterAll must bound its waits as a test does (the suite's own end their pools
      through helpers/endPool.ts).
-   - A gating kill of pass B reruns with the one test file that killed it, alone (one rerun per such file), so no
-     other file's order or hang can decide it. It counts only when that file fails for the mutant again. Its Stryker
+   - A gating kill of pass B, or a run there that failed only on the machine's texts, reruns with the one test file
+     that failed, alone (one rerun per such file), so no other file's order or hang can decide it. It counts only when
+     that file fails for the mutant again, whatever the failure says. Its Stryker
      budget is an hour, above anything vitest's own limits let the file take after its first failure, so a rerun that
      fails always leaves its report.
    - A mutant the gate never reran (it stopped first) is inconclusive.
@@ -200,16 +207,23 @@ and again before the verdict: the plan reads the tree then, each pass copies it 
 no mutant reads the checkout then, so a tree that changed during the run (an edit, a formatter, another session) ends
 NO RESULT, naming the files.
 
-A run Stryker counts as a kill is checked against vitest's report of it: it is a kill only when a test itself failed for
-a reason other than the machine. When every failing test (or its beforeEach or afterEach hook) timed out, and nothing in
-the run failed for the machine, it is a timeout.
-Anything else is **inconclusive**: no report, a failure (a timeout included) only in a beforeAll or afterAll hook or at file level, an
-unhandled error with every test passing, or only machine failures (refused or reset connections, a container that would not start, a database
-connection dropped, exhausted resources, a file held or refused: EBUSY, EPERM, ENOTEMPTY or EACCES, as on Windows when
-a test removes its temp dir while a run beside it or the indexer holds a file in it). The machine's texts are matched
-against the first line of each failure only, never an assertion or a child's stderr, which may name such an error as
-the thing under test; the list cannot be complete, which is why pass B's kills must repeat. vitest counts a failure in a beforeEach or afterEach hook as its
-test's, so such a failure counts as the test's too.
+A run Stryker counts as a kill is checked against vitest's report of it: it is a kill when a test itself failed, and a
+timeout when every failing test (or its beforeEach or afterEach hook) timed out. In a pass's first run (A or B), a
+failure that reads like the machine's proves nothing by itself, for the machine may cause it as well as the mutant:
+refused or reset connections, a container that would not start, a database connection dropped, exhausted resources,
+a file held or refused (EBUSY, EPERM, ENOTEMPTY or EACCES, as on Windows when a test removes its temp dir while a run
+beside it or the indexer holds a file in it, or when code unlinks or renames onto a directory). When every failing test
+failed so, or timed out beside such a failure, the mutant reruns alone (above), where the texts are not read: a failure
+that repeats with the mutant alone, while the run with no mutant after the reruns passes, is the mutant's. The texts
+are matched against the first line of each failure unless it is an AssertionError (a sync `expect` or `assert`; a failed
+`.resolves`, `.rejects` or `expect.poll` begins `Error:` and is read like any error, which at most sends it to a rerun),
+never against a stack or a child's stderr. So the list only spares reruns, and need not be complete. What the reruns
+cannot see: a chance failure that hits a mutant's first run and again its rerun alone, while the run with no mutant
+after passes, credits a kill.
+Anything else is **inconclusive**: no report, a failure (a timeout included) only in a beforeAll or afterAll hook or at
+file level, an unhandled error with every test passing, or a first run that failed only on the machine's texts and was
+never rerun (the gate stopped first). vitest counts a failure in a beforeEach or afterEach hook as its test's, so such a
+failure counts as the test's too.
 
 Every run of the gate draws one fast-check seed (named on the Scope line; set SMDB_TEST_SEED to an integer to run with a
 given one, anything else is refused), so a property draws the same inputs in every mutant's run as in the run with no

@@ -5,21 +5,23 @@
  * @typedef {import('./ranges.mjs').Location} Location
  * @typedef {'a' | 'a2' | 'b' | 'b2'} PassName
  * @typedef {{ id: string | null, status: string, statusReason?: string, killedBy?: string, timeout?: string, inconclusive?: string,
- *   voided?: string }} PassResult voided: why a rerun's kill or timeout no longer counts
+ *   recheck?: string, voided?: string }} PassResult recheck: the test that failed only on the machine's texts, so the
+ *   mutant reruns alone; voided: why a rerun's kill or timeout no longer counts
  * @typedef {{ file: string, location: Location, mutator: string, original: string, replacement: string, gating: boolean,
  *   passes: Partial<Record<PassName, PassResult>> }} MutantRecord
  * @typedef {{ name: string, status?: string, message?: string,
  *   assertionResults?: { status: string, fullName: string, failureMessages?: string[] }[] }} FileReport
  */
 
-// A failure the machine causes, not the mutant: a connection or a container
-// that would not come up, a resource that ran out, a file held or refused (on
-// Windows, a temp dir a test removes while a run beside it or the indexer
-// holds a file in it). Matched against the first line of a failure (the
-// error's own message), never against an assertion, a stack or a child's
-// stderr, which may name such an error as the thing under test. The list
-// cannot be complete, so every kill in pass B, where machines fail, must also
-// repeat when the mutant runs alone (toConfirm).
+// A failure the machine may cause as well as the mutant: a connection or a
+// container that would not come up, a resource that ran out, a file held or
+// refused (on Windows, a temp dir a test removes while a run beside it or the
+// indexer holds a file in it). Matched against the first line of a failure
+// unless it is an AssertionError (a stack or a child's stderr is never read),
+// and only in a pass's first run: a run whose failures all match reruns the
+// mutant alone (toConfirm), where the texts are not read, since a failure that
+// repeats with the mutant alone, while the run with no mutant after the reruns
+// passes, is the mutant's. The list only spares reruns, so it need not be complete.
 export const INFRASTRUCTURE = new RegExp([
   'ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'EAI_AGAIN', 'EPIPE', 'EMFILE', 'ENOMEM', 'ENOSPC', 'heap out of memory',
   'EBUSY', 'EPERM', 'ENOTEMPTY', 'EACCES',
@@ -40,16 +42,19 @@ const firstLine = text => text.split('\n')[0];
 
 /**
  * What a run that Stryker counted as a kill shows, from the vitest reports it
- * left: a kill only when a test itself failed for a reason other than the
- * machine; a timeout only when every failing test timed out and nothing else
- * failed for the machine (a file that could not start included); anything
- * else (no report, a failure only in a beforeAll or afterAll hook or at file
- * level, an unhandled error, a machine failure) proves nothing. vitest counts a
- * beforeEach or afterEach failure as its test's, so it counts as a test's.
+ * left: a kill when a test itself failed, in a first run for a reason other
+ * than the machine's texts; a timeout only when every failing test timed out
+ * and, in a first run, nothing else failed on the machine's texts (a file that
+ * could not start included); a recheck when a first run's failing tests failed
+ * only on them, or timed out beside them; anything else (no report, a failure
+ * only in a beforeAll or afterAll hook or at file level, an unhandled error)
+ * proves nothing. vitest counts a beforeEach or afterEach failure as its
+ * test's, so it counts as a test's.
  * @param {{ testResults?: FileReport[] }[]} reports
- * @returns {{ killedBy: string } | { timeout: string } | { inconclusive: string }}
+ * @param {boolean} [alone] a rerun of the mutant alone: the machine's texts are not read
+ * @returns {{ killedBy: string } | { timeout: string } | { recheck: string, inconclusive: string } | { inconclusive: string }}
  */
-export function classifyKill(reports) {
+export function classifyKill(reports, alone = false) {
   if (reports.length === 0) return { inconclusive: 'no vitest report was written' };
   /** @type {{ test: string, message: string }[]} */
   const failed = [];
@@ -69,15 +74,16 @@ export function classifyKill(reports) {
   /** @param {{ message: string }} f */
   const assertion = f => f.message.startsWith('AssertionError');
   /** @param {{ message: string }} f */
-  const machine = f => !assertion(f) && INFRASTRUCTURE.test(firstLine(f.message));
+  const machine = f => !alone && !assertion(f) && INFRASTRUCTURE.test(firstLine(f.message));
   /** @param {{ message: string }} f */
   const timedOutTest = f => !assertion(f) && TIMEOUT.test(firstLine(f.message));
   const real = failed.find(f => !machine(f) && !timedOutTest(f));
   if (real) return { killedBy: real.test };
-  const machineText = [...failed.filter(machine).map(f => firstLine(f.message)), ...fileMessages.filter(text => INFRASTRUCTURE.test(text))][0];
+  const machineText = [...failed.filter(machine).map(f => firstLine(f.message)), ...(alone ? [] : fileMessages.filter(text => INFRASTRUCTURE.test(text)))][0];
   const timedOut = failed.find(timedOutTest);
   if (timedOut && machineText === undefined) return { timeout: timedOut.test };
-  return { inconclusive: timedOut ? `a test timed out while the machine failed: ${machineText}` : `only the machine failed: ${firstLine(failed[0].message)}` };
+  const recheck = (failed.find(machine) ?? failed[0]).test;
+  return { recheck, inconclusive: timedOut ? `a test timed out while the machine failed: ${machineText}` : `only the machine failed: ${firstLine(failed[0].message)}` };
 }
 
 /**
@@ -85,7 +91,7 @@ export function classifyKill(reports) {
  * @param {PassResult} result
  */
 export function outcomeOf(result) {
-  if (result.status === 'Killed') return result.killedBy ? 'Killed' : result.timeout ? 'Timeout' : 'Inconclusive';
+  if (result.status === 'Killed') return result.killedBy ? 'Killed' : result.timeout ? 'Timeout' : result.recheck ? 'Recheck' : 'Inconclusive';
   return result.status;
 }
 
@@ -96,22 +102,24 @@ export const latest = m => /** @type {PassResult} */ (m.passes.b2 ?? m.passes.b 
  * A mutant's outcome, counting for a gating one only what its rerun alone
  * confirmed. In pass A a timeout counts when the rerun, with four times the
  * time, times out again (a test or its beforeEach or afterEach hook, or the
- * whole run past Stryker's budget) or fails a test. In pass B, where containers and children can be
- * slow on their own, a hang never counts, and a kill counts only when the test
- * file that killed it fails for it again when run alone. One the gate never
- * reran, or whose rerun was voided (the run with no mutant after it failed),
- * is inconclusive.
+ * whole run past Stryker's budget) or fails a test, and so does a run that
+ * failed only on the machine's texts. In pass B, where containers and children can be
+ * slow on their own, a hang never counts, and a kill (or a run that failed only
+ * on the machine's texts) counts only when the test file that failed fails for
+ * it again when run alone. One the gate never reran, or whose rerun was voided
+ * (the run with no mutant after it failed), is inconclusive.
  * @param {MutantRecord} m
  * @returns {{ outcome: string, why?: string }}
  */
 export function confirmed(m) {
   const { a2, b, b2 } = m.passes;
   const last = outcomeOf(latest(m));
+  if (last === 'Recheck') return { outcome: 'Inconclusive', why: `${latest(m).inconclusive}, never rerun alone` };
   if (!m.gating || (last !== 'Killed' && last !== 'Timeout')) return { outcome: last };
   const { voided } = latest(m);
   if (voided) return { outcome: 'Inconclusive', why: voided };
   if (b && outcomeOf(b) === 'Timeout') return { outcome: 'Inconclusive', why: 'hung in pass B, where a hang is not counted' };
-  if (b2 && last === 'Timeout') return { outcome: 'Inconclusive', why: `killed in pass B by ${b?.killedBy}, but hung instead of failing when run alone` };
+  if (b2 && last === 'Timeout') return { outcome: 'Inconclusive', why: `killed in pass B by ${b?.killedBy ?? b?.recheck}, but hung instead of failing when run alone` };
   if (b && !b2) return { outcome: 'Inconclusive', why: 'killed in pass B, never rerun alone' };
   if (!b && !a2 && last === 'Timeout') return { outcome: 'Inconclusive', why: 'timed out, never rerun alone' };
   return { outcome: last };
@@ -126,14 +134,15 @@ export const FAILING = ['Survived', 'NoCoverage', 'Missing', 'Inconclusive', 'Ru
  * The gating mutants a pass sends to a confirming run of their own (one at a
  * time, with four times the time): pass A's timeouts, which count as kills only
  * when the mutant times the tests out alone too, and pass B's kills, which count
- * only when the test file that killed them fails for them again.
+ * only when the test file that killed them fails for them again; in both, the
+ * runs that failed only on the machine's texts, which count when they fail alone.
  * @param {MutantRecord[]} mutants
  * @param {'a' | 'b'} pass
  */
 export const toConfirm = (mutants, pass) => mutants.filter(m => {
   const result = m.passes[pass];
   const status = result && outcomeOf(result);
-  return m.gating && status === (pass === 'a' ? 'Timeout' : 'Killed');
+  return m.gating && (status === 'Recheck' || status === (pass === 'a' ? 'Timeout' : 'Killed'));
 });
 
 /**
@@ -145,7 +154,7 @@ export function byKiller(mutants) {
   /** @type {Map<string, MutantRecord[]>} */
   const groups = new Map();
   for (const m of mutants) {
-    const file = (m.passes.b?.killedBy ?? '').split(' > ')[0];
+    const file = (m.passes.b?.killedBy ?? m.passes.b?.recheck ?? '').split(' > ')[0];
     groups.set(file, [...(groups.get(file) ?? []), m]);
   }
   return groups;

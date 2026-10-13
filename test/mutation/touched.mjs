@@ -53,7 +53,7 @@ try {
   console.log(`Verdict: NO RESULT (the gate could not load: ${error instanceof Error ? error.message.split('\n')[0] : String(error)}; run npm run test:install)`);
   process.exit(2);
 }
-const { structureLines, DATA_ROUTE_WHY, EXTRA_BREAK_WHY, gates, holdsDataRoute, holdsExtraBreak, linesOfTarget, notMutated, planFromGit, sandboxPatterns, unmatchedPatterns, untouched } = ranges;
+const { structureLines, DATA_ROUTE_WHY, EXTRA_BREAK_WHY, gates, holdsDataRoute, holdsExtraBreak, linesOfTarget, notMutated, planFromGit, rootGlobFree, sandboxPatterns, unmatchedPatterns, untouched } = ranges;
 const { byKiller, classifyKill, judge, outcome, toConfirm, toPassB } = verdicts;
 
 const USAGE = 'usage: node test/mutation/touched.mjs [--base REF] [--mutate PATTERN]... [--concurrency N] [--keep]';
@@ -82,6 +82,10 @@ const git = (...args) => execFileSync('git', ['-c', 'core.quotePath=false', '-c'
 const posix = file => file.split(path.sep).join('/');
 /** @param {unknown} error */
 const firstLine = error => (error instanceof Error ? error.message.split('\n')[0] : String(error));
+if (!rootGlobFree(root)) {
+  console.log(`Verdict: NO RESULT (the checkout's path, ${posix(root)}, holds characters Stryker reads as a glob: a [ ] class, a { } with a comma or a range, or an extglob such as +( ); Stryker matches no file to mutate there, so move the checkout)`);
+  process.exit(2);
+}
 // The sandboxes' dir ignores itself, so git status stays clean, from the first
 // print on: a sandbox another Stryker run left there is no change.
 try {
@@ -219,12 +223,13 @@ function dryFailures(name) {
  * One pass's result for a mutant, with a kill checked against the reports.
  * @param {string} dir the pass's report dir
  * @param {StrykerResult} r
+ * @param {boolean} [alone] a rerun of the mutant alone
  * @returns {PassResult}
  */
-function resultOf(dir, r) {
+function resultOf(dir, r, alone = false) {
   /** @type {PassResult} */
   const result = { id: r.id, status: r.status, ...(r.statusReason ? { statusReason: r.statusReason.split('\n')[0] } : {}) };
-  return r.status === 'Killed' ? { ...result, ...classifyKill(reportsOf(dir, r.id)) } : result;
+  return r.status === 'Killed' ? { ...result, ...classifyKill(reportsOf(dir, r.id), alone) } : result;
 }
 
 class PassError extends Error {}
@@ -335,7 +340,7 @@ async function passOn(name, dir, tier, on, extra, only) {
   const byKey = new Map(results.map(r => [resultKey(r), r]));
   for (const m of on) {
     const r = byKey.get(recordKey(m));
-    m.passes[name] = r ? resultOf(dir, r) : { id: null, status: 'Missing' };
+    m.passes[name] = r ? resultOf(dir, r, name === 'a2' || name === 'b2') : { id: null, status: 'Missing' };
   }
 }
 
@@ -429,7 +434,7 @@ try {
 
   const confirmA = toConfirm(mutants, 'a');
   if (confirmA.length > 0) {
-    console.log(`L5: pass A again, one at a time, on ${confirmA.length} timeout(s)`);
+    console.log(`L5: pass A again, one at a time, on ${confirmA.length} timeout(s) or run(s) that failed only on the machine's texts`);
     await passOn('a2', 'a2', 'a', confirmA, PASSES.a2);
     if (confirmA.some(credited)) await control('a2', 'a', confirmA, [], confirmA.some(m => outcome(m) === 'Timeout'));
   }
