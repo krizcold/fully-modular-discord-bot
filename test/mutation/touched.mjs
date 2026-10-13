@@ -83,7 +83,7 @@ const posix = file => file.split(path.sep).join('/');
 /** @param {unknown} error */
 const firstLine = error => (error instanceof Error ? error.message.split('\n')[0] : String(error));
 if (!rootGlobFree(root)) {
-  console.log(`Verdict: NO RESULT (the checkout's path, ${posix(root)}, holds characters Stryker reads as a glob: a [ ] class, a { } with a comma or a range, or an extglob such as +( ); Stryker matches no file to mutate there, so move the checkout)`);
+  console.log(`Verdict: NO RESULT (the checkout's path, ${posix(root)}, does not match itself read as a glob, as Stryker reads it: a [ ] class, a { } with a comma or a range, an extglob such as +( ), or one minimatch cannot read; Stryker matches no file to mutate there, so move the checkout)`);
   process.exit(2);
 }
 // The sandboxes' dir ignores itself, so git status stays clean, from the first
@@ -448,7 +448,7 @@ try {
     let group = 0;
     for (const [killer, on] of killers) {
       group += 1;
-      console.log(`L5: pass B again, one at a time, on ${on.length} kill(s) by ${killer}, with that file alone; a kill counts only if it repeats`);
+      console.log(`L5: pass B again, one at a time, on ${on.length} mutant(s) whose run failed in ${killer}, with that file alone; a failure counts only if it repeats`);
       await passOn('b2', `b2-${group}`, 'b', on, PASSES.b2, [killer]);
     }
     if (confirmB.some(credited)) await control('b2', 'b', confirmB, [...killers.keys()]);

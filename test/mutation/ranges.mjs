@@ -577,10 +577,15 @@ const linkWhy = name => `a link to ${name}, which is not mutated: ${notMutated(n
  * root `root`: `git` runs git there and returns what it printed, and `read`
  * gives a file's text. Each file is mutated under the name it has on disk
  * (keys.mjs), which Stryker matches: a file renamed by case outside git too.
- * git does not look at a file its index marks assume-unchanged or
- * skip-worktree (core.ignoreStat marks every file it adds), so each such file
- * is compared with its base text here, and named as changed when it differs.
- * Nor at one a file-system monitor said is unchanged, so no monitor is used.
+ * git does not look at every file: not at one its index marks assume-unchanged
+ * or skip-worktree (core.ignoreStat marks every file it adds), not at one a
+ * file-system monitor says is unchanged, and not at one whose cached stat
+ * still holds (its size and whole-second mtime, and its ctime, which on
+ * Windows is when the file was made), so a same-size edit whose time was set
+ * back shows in no diff. So every tracked file git did not name is checked by
+ * its content: one gone is deleted, unless skip-worktree left it out (a sparse
+ * checkout), and one hashed as git add would that differs from its index blob
+ * (for a file git did not name, the base's) is changed.
  * @param {{ git: (...args: string[]) => string, base: string, root: string, read?: (file: string) => string }} io
  */
 export function planFromGit({ git: run, base, root, read = file => fs.readFileSync(path.join(root, file), 'utf8') }) {
@@ -592,19 +597,23 @@ export function planFromGit({ git: run, base, root, read = file => fs.readFileSy
   const isFile = file => { try { return fs.statSync(path.join(root, file)).isFile(); } catch { return false; } };
   const entries = parseNameStatus(git(...changedArgs(base)));
   const listed = new Set(entries.flatMap(entry => [entry.file, entry.from]));
-  const hidden = git('ls-files', '-v', '-z').split('\0').filter(line => /^([a-z]|S) /.test(line));
-  for (const line of hidden) {
-    const file = line.slice(2);
-    if (listed.has(file)) continue;
-    if (!isFile(file)) {
-      // Gone: deleted, unless skip-worktree left it out (a sparse checkout).
-      if (!/^[sS]/.test(line) && !fs.existsSync(path.join(root, file))) entries.push({ status: 'D', file });
-      continue;
-    }
-    let was = null;
-    try { was = readBase(file); } catch { was = null; }
-    if (was === null) entries.push({ status: 'A', file });
-    else if (was !== read(file)) entries.push({ status: 'M', file });
+  const sparse = new Set(git('ls-files', '-v', '-z').split('\0').filter(line => /^[sS] /.test(line)).map(line => line.slice(2)));
+  /** @type {{ blob: string, file: string }[]} */
+  const staged = [];
+  for (const line of git('ls-files', '-s', '-z').split('\0')) {
+    const m = /^10(?:0644|0755) ([0-9a-f]+) 0\t(.+)$/s.exec(line);
+    if (!m || listed.has(m[2])) continue;
+    if (isFile(m[2])) staged.push({ blob: m[1], file: m[2] });
+    else if (!fs.existsSync(path.join(root, m[2])) && !sparse.has(m[2])) entries.push({ status: 'D', file: m[2] });
+  }
+  // In batches, as a command line has a length limit (32767 characters on Windows).
+  for (let start = 0; start < staged.length;) {
+    let end = start;
+    for (let length = 0; end < staged.length && (end === start || length + staged[end].file.length < 8000); end++) length += staged[end].file.length + 1;
+    const batch = staged.slice(start, end);
+    const blobs = git('hash-object', '--', ...batch.map(s => s.file)).split('\n');
+    batch.forEach((s, i) => { if (blobs[i] !== s.blob) entries.push({ status: 'M', file: s.file }); });
+    start = end;
   }
   return planChange({
     entries,
@@ -658,13 +667,22 @@ function globFree(root, file) {
 }
 
 /**
- * Whether Stryker can match any file under the bot root: it resolves each
- * mutate pattern against the root and reads the whole path as a glob, so a
- * root holding a [ ] class, a { } with a comma or a range, or an extglob such
- * as +( ) matches no file, and nothing is mutated.
+ * Whether Stryker can match any file under the bot root, read as it reads one:
+ * it resolves each mutate pattern against the root, turns backslashes into
+ * slashes and matches the whole path, read as a glob, with minimatch. A root
+ * that does not match itself so (a [ ] class, a { } with a comma or a range,
+ * an extglob such as +( ), or a pattern minimatch cannot read and throws on)
+ * matches no file, and nothing is mutated.
  * @param {string} root
  */
-export const rootGlobFree = root => globFree(root, 'package.json');
+export function rootGlobFree(root) {
+  const name = path.resolve(root, 'package.json').replace(/\\/g, '/');
+  try {
+    return minimatch(name, name, { dot: false });
+  } catch {
+    return false;
+  }
+}
 
 /**
  * The lines a target answers for: its changed lines, or for a whole file or a

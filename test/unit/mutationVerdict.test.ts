@@ -107,8 +107,11 @@ describe('the passes a mutant goes through', () => {
     expect(toConfirm([mutant(8, true, { a: pass('Survived'), b: pass('Killed', { timeout: 'child > x' }) })], 'b')).toEqual([]);
     expect(toConfirm([killedInB], 'b')).toEqual([killedInB]);
     expect(toConfirm([killed], 'a')).toEqual([]);
-    const flake = mutant(9, true, { a: pass('Survived'), b: pass('Killed', { killedBy: 'x' }), b2: pass('Survived') });
-    expect(outcome(flake)).toBe('Survived');
+    // A pass B kill whose file passes alone: pass B stopped at it, so its later tests never ran on the mutant.
+    const flake = mutant(9, true, { a: pass('Survived'), b: pass('Killed', { killedBy: 'integration/x.test.ts > x' }), b2: pass('Survived') });
+    expect(confirmed(flake)).toEqual({
+      outcome: 'Inconclusive', why: 'killed in pass B by integration/x.test.ts > x, but not when that file ran alone, and the tests after it in pass B never ran on it',
+    });
   });
 
   it('counts a pass B kill only when a test fails for it again alone, and nothing it never reran', () => {
@@ -137,7 +140,11 @@ describe('the passes a mutant goes through', () => {
     expect([...byKiller([inB]).keys()]).toEqual(['integration/s.test.ts']);
     expect(outcome({ ...inB, passes: { ...inB.passes, b2: pass('Killed', { killedBy: 'integration/s.test.ts > reads' }) } })).toBe('Killed');
     expect(confirmed({ ...inB, passes: { ...inB.passes, b2: pass('Timeout') } }))
-      .toEqual({ outcome: 'Inconclusive', why: 'killed in pass B by integration/s.test.ts > reads, but hung instead of failing when run alone' });
+      .toEqual({ outcome: 'Inconclusive', why: "failed in pass B only on the machine's texts (integration/s.test.ts > reads), but hung instead of failing when run alone" });
+    expect(confirmed({ ...inB, passes: { ...inB.passes, b2: pass('Survived') } })).toEqual({
+      outcome: 'Inconclusive',
+      why: "failed in pass B only on the machine's texts (integration/s.test.ts > reads), but not when that file ran alone, and the tests after it in pass B never ran on it",
+    });
     // A context mutant is never rerun.
     expect(toConfirm([mutant(3, false, { a: pass('Killed', machineOnly) })], 'a')).toEqual([]);
   });
@@ -153,7 +160,7 @@ describe('the passes a mutant goes through', () => {
     expect(confirmed(mutant(1, true, { a: pass('Survived'), b: pass('Killed', { killedBy: 'x' }), b2: pass('Killed', { killedBy: 'y', ...voided }) })))
       .toEqual({ outcome: 'Inconclusive', why: 'the run with no mutant after pass b2 failed' });
     expect(outcome(mutant(1, true, { a: pass('Timeout'), a2: pass('Timeout', { voided: 'x' }) }))).toBe('Inconclusive');
-    expect(outcome(mutant(1, true, { a: pass('Survived'), b: pass('Killed', { killedBy: 'x' }), b2: pass('Survived', voided) }))).toBe('Survived');
+    expect(outcome(mutant(1, true, { a: pass('Survived'), b: pass('Killed', { killedBy: 'x' }), b2: pass('Survived', voided) }))).toBe('Inconclusive');
   });
 });
 
@@ -186,10 +193,10 @@ describe('the verdict', () => {
       mutant(6, true, { a: pass('Timeout'), a2: pass('Killed', { timeout: 'unit/x.test.ts > slow' }) }),
     ], { controls: ['after pass b2: passed'] });
     expect(result).toMatchObject({ verdict: 'PASS', code: 0 });
-    expect(result.lines.join('\n')).toMatch(/^Timeouts \(each timed out again when run alone with four times the time: a test or its beforeEach or afterEach hook, or the whole run past its budget; .*\n {2}src\/a\.ts:2:3 /m);
+    expect(result.lines.join('\n')).toMatch(/^Timeouts \(each timed out when run alone with four times the time: a test or its beforeEach or afterEach hook, or the whole run past its budget; .*\n {2}src\/a\.ts:2:3 /m);
     // A rerun past Stryker's budget may only have slowed the tests: it is not said to have hung.
-    expect(result.lines.join('\n')).toMatch(/^ {2}src\/a\.ts:2:3 .*\(ran past Stryker's budget alone too\)$/m);
-    expect(result.lines.join('\n')).toMatch(/^ {2}src\/a\.ts:6:3 .*\(timed out alone too: unit\/x\.test\.ts > slow\)$/m);
+    expect(result.lines.join('\n')).toMatch(/^ {2}src\/a\.ts:2:3 .*\(ran past Stryker's budget alone\)$/m);
+    expect(result.lines.join('\n')).toMatch(/^ {2}src\/a\.ts:6:3 .*\(timed out alone: unit\/x\.test\.ts > slow\)$/m);
     expect(result.lines.join('\n')).toMatch(/^Context survivors:\n {2}src\/a\.ts:5:3 /m);
     expect(result.lines.join('\n')).toMatch(/^Runs with no mutant after the reruns:\n {2}after pass b2: passed$/m);
   });
@@ -199,7 +206,9 @@ describe('the verdict', () => {
       mutant(1, true, { a: pass('Survived'), b: pass('Killed', { killedBy: 'child/x.test.ts > x' }), b2: pass('Killed', { timeout: 'child/x.test.ts > x' }) }),
       mutant(2, true, { a: pass('Survived'), b: pass('Killed', { killedBy: 'child/x.test.ts > x' }) }),
       mutant(3, true, { a: pass('Timeout') }),
+      mutant(4, true, { a: pass('Missing') }),
     ], { stopped: ['pass b2 could not run: x'] }).lines.join('\n');
+    expect(text).toMatch(/^Survivors .*\n {2}src\/a\.ts:4:3 .*\(its pass made no mutant at this place, so no test ran on it\)$/m);
     expect(text).toMatch(/^Inconclusive .*\n {2}src\/a\.ts:1:3 .*\(killed in pass B by child\/x\.test\.ts > x, but hung instead of failing when run alone\)$/m);
     expect(text).toMatch(/^ {2}src\/a\.ts:2:3 .*\(killed in pass B, never rerun alone\)$/m);
     expect(text).toMatch(/^ {2}src\/a\.ts:3:3 .*\(timed out, never rerun alone\)$/m);

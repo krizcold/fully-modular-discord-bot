@@ -275,7 +275,7 @@ describe('the tree fingerprint', () => {
     fs.symlinkSync(path.join(root, 'test', 'node_modules'), packages, 'junction');
     const run = spawnSync(process.execPath, [path.join(copy, 'test', 'mutation', 'touched.mjs')], { cwd: copy, encoding: 'utf8' });
     expect(run.status, run.stderr).toBe(2);
-    expect(run.stdout).toMatch(/^Verdict: NO RESULT \(the checkout's path, .*\/bot \[old\], holds characters Stryker reads as a glob: /m);
+    expect(run.stdout).toMatch(/^Verdict: NO RESULT \(the checkout's path, .*\/bot \[old\], does not match itself read as a glob, as Stryker reads it: /m);
     expect(fs.existsSync(path.join(copy, '.stryker-tmp'))).toBe(false);
   });
 

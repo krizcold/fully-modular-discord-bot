@@ -447,13 +447,15 @@ describe('the change', () => {
   it("refuses a checkout path Stryker would read as a glob, exactly where Stryker's own matcher matches no file under it", async () => {
     const { FileMatcher } = await import('../node_modules/@stryker-mutator/core/dist/src/config/file-matcher.js');
     const base = path.join(os.tmpdir(), 'smdb-roots');
-    const refused = ['x [old]', 'x {a,b}', 'x {1..3}', 'x +(y)', 'x @(y)'];
-    const taken = ['plain', 'x (copy)', 'x [old', 'x {a}', 'a+b', 'x#1 !y', 'Program Files (x86)'];
+    // A POSIX class is a pattern minimatch cannot read: it throws, and Stryker can match nothing there.
+    const refused = ['x [old]', 'x {a,b}', 'x {1..3}', 'x +(y)', 'x @(y)', 'x [[:digit:]]'];
+    const taken = ['plain', 'x (copy)', 'x [old', 'x {a}', 'a+b', 'x#1 !y', 'Program Files (x86)', 'x !(y)', '!x', '#x'];
     for (const dir of [...refused, ...taken]) {
       const root = path.join(base, dir, 'bot');
       const file = path.join(root, 'src', 'a.ts');
+      const stryker = (() => { try { return new FileMatcher(file, false).matches(file); } catch { return false; } })();
       expect(rootGlobFree(root), dir).toBe(taken.includes(dir));
-      expect(new FileMatcher(file, false).matches(file), dir).toBe(taken.includes(dir));
+      expect(stryker, dir).toBe(taken.includes(dir));
     }
   });
 
@@ -532,30 +534,23 @@ describe('the change', () => {
   // holdsDataRoute matches the '/data' root, not a path under it written out in
   // full, which reads the same as a route path: a mutant of code that holds one
   // could reach a real data root, so src holds none but the routes named here.
+  // Only what the gate can mutate is read: the files git tracks or would add,
+  // never a module cloned into a dir git ignores.
   it("finds in src no path under /data written out in full, but the config page's routes", () => {
     const ROUTES = ['/data/delete', '/data/delete-guild', '/data/get', '/data/update'];
     const found = new Map<string, string>();
-    let files = 0;
-    const walk = (dir: string) => {
-      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-        const file = path.join(dir, entry.name);
-        if (entry.isDirectory()) walk(file);
-        else if (/\.(ts|tsx|js|jsx|mjs|cjs)$/.test(entry.name)) {
-          files += 1;
-          const text = fs.readFileSync(file, 'utf8');
-          if (holdsDataRoute(file, text)) continue;
-          const visit = (node: ts.Node) => {
-            if ((ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node) || ts.isTemplateHead(node)) && node.text.startsWith('/data/')) {
-              found.set(node.text, path.relative(botRoot, file));
-            }
-            ts.forEachChild(node, visit);
-          };
-          visit(ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true));
-        }
-      }
-    };
-    walk(path.join(botRoot, 'src'));
-    expect(files).toBeGreaterThan(100);
+    const listed = execFileSync('git', ['-c', 'core.quotePath=false', 'ls-files', '-z', '--cached', '--others', '--exclude-standard', 'src'], { cwd: botRoot, encoding: 'utf8' })
+      .split('\0').filter(file => /\.(ts|tsx|js|jsx|mjs|cjs)$/.test(file) && fs.existsSync(path.join(botRoot, file)));
+    for (const file of listed) {
+      const text = fs.readFileSync(path.join(botRoot, file), 'utf8');
+      if (holdsDataRoute(file, text)) continue;
+      const visit = (node: ts.Node) => {
+        if ((ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node) || ts.isTemplateHead(node)) && node.text.startsWith('/data/')) found.set(node.text, file);
+        ts.forEachChild(node, visit);
+      };
+      visit(ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true));
+    }
+    expect(listed.length).toBeGreaterThan(100);
     // A new one: route it through src/utils/dataRoot.ts, or, for a route path, add it here.
     expect([...found].filter(([text]) => !ROUTES.includes(text))).toEqual([]);
   });
@@ -621,6 +616,22 @@ describe('the change', () => {
     // git itself misses b.ts here.
     expect(git(['diff', '--name-only'])).not.toContain('src/b.ts');
     expect(plan().targets.map(t => t.file).sort()).toEqual(['src/a.ts', 'src/b.ts']);
+  });
+
+  it("sees a same-size edit whose time was set back, which git's stat cache hides", () => {
+    const { repo, git, plan } = repoWith({ 'src/a.ts': 'export const big = (n: number) => n > 10;\n', 'src/b.ts': text(lines('b', 3)) });
+    // ctime is a file's creation time on Windows, and git need not look at it: here it never does.
+    git(['config', 'core.trustctime', 'false']);
+    const file = path.join(repo, 'src', 'a.ts');
+    const { atime, mtime } = fs.statSync(file);
+    // The index caches a.ts's stat a second later, so that time no longer reads as one git must check.
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1_100);
+    git(['status', '--porcelain']);
+    fs.writeFileSync(file, 'export const big = (n: number) => n < 10;\n');
+    fs.utimesSync(file, atime, mtime);
+    expect(git(['status', '--porcelain'])).toBe('');
+    expect(plan().targets.map(t => t.file)).toEqual(['src/a.ts']);
+    expect(plan().targets[0].gating).toEqual([1]);
   });
 
   it('lets into a sandbox only the files git lists: nothing it ignores, nothing of a repository inside, nothing made later', async () => {

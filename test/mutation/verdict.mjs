@@ -98,16 +98,21 @@ export function outcomeOf(result) {
 /** @param {MutantRecord} m */
 export const latest = m => /** @type {PassResult} */ (m.passes.b2 ?? m.passes.b ?? m.passes.a2 ?? m.passes.a);
 
+/** @param {PassResult | undefined} b what pass B found, which sent the mutant to a rerun alone */
+const failedInB = b => (b?.killedBy ? `killed in pass B by ${b.killedBy}` : `failed in pass B only on the machine's texts (${b?.recheck})`);
+
 /**
  * A mutant's outcome, counting for a gating one only what its rerun alone
  * confirmed. In pass A a timeout counts when the rerun, with four times the
- * time, times out again (a test or its beforeEach or afterEach hook, or the
+ * time, times out alone (a test or its beforeEach or afterEach hook, or the
  * whole run past Stryker's budget) or fails a test, and so does a run that
  * failed only on the machine's texts. In pass B, where containers and children can be
  * slow on their own, a hang never counts, and a kill (or a run that failed only
  * on the machine's texts) counts only when the test file that failed fails for
- * it again when run alone. One the gate never reran, or whose rerun was voided
- * (the run with no mutant after it failed), is inconclusive.
+ * it again when run alone; when that file passes alone, the tests after it in
+ * pass B never ran on the mutant, so it is no survivor either. One the gate
+ * never reran, or whose rerun was voided (the run with no mutant after it
+ * failed), is inconclusive.
  * @param {MutantRecord} m
  * @returns {{ outcome: string, why?: string }}
  */
@@ -115,11 +120,14 @@ export function confirmed(m) {
   const { a2, b, b2 } = m.passes;
   const last = outcomeOf(latest(m));
   if (last === 'Recheck') return { outcome: 'Inconclusive', why: `${latest(m).inconclusive}, never rerun alone` };
+  if (m.gating && b2 && last === 'Survived') {
+    return { outcome: 'Inconclusive', why: `${failedInB(b)}, but not when that file ran alone, and the tests after it in pass B never ran on it` };
+  }
   if (!m.gating || (last !== 'Killed' && last !== 'Timeout')) return { outcome: last };
   const { voided } = latest(m);
   if (voided) return { outcome: 'Inconclusive', why: voided };
   if (b && outcomeOf(b) === 'Timeout') return { outcome: 'Inconclusive', why: 'hung in pass B, where a hang is not counted' };
-  if (b2 && last === 'Timeout') return { outcome: 'Inconclusive', why: `killed in pass B by ${b?.killedBy ?? b?.recheck}, but hung instead of failing when run alone` };
+  if (b2 && last === 'Timeout') return { outcome: 'Inconclusive', why: `${failedInB(b)}, but hung instead of failing when run alone` };
   if (b && !b2) return { outcome: 'Inconclusive', why: 'killed in pass B, never rerun alone' };
   if (!b && !a2 && last === 'Timeout') return { outcome: 'Inconclusive', why: 'timed out, never rerun alone' };
   return { outcome: last };
@@ -205,8 +213,9 @@ export function judge(run) {
   /** @param {MutantRecord} m */
   const note = m => {
     const last = latest(m);
+    if (outcome(m) === 'Missing') return 'its pass made no mutant at this place, so no test ran on it';
     return confirmed(m).why ?? last.inconclusive ?? last.statusReason
-      ?? (outcome(m) === 'Timeout' ? (last.timeout ? `timed out alone too: ${last.timeout}` : "ran past Stryker's budget alone too") : '');
+      ?? (outcome(m) === 'Timeout' ? (last.timeout ? `timed out alone: ${last.timeout}` : "ran past Stryker's budget alone") : '');
   };
   /** @param {MutantRecord} m */
   const show = m => `  ${where(m)} ${m.mutator}: \`${m.original}\` -> \`${m.replacement}\`${note(m) ? ` (${note(m)})` : ''}`;
@@ -238,7 +247,7 @@ export function judge(run) {
     ...section('Survivors (each needs a test that kills it, or a justification in the notes):', [...gatingAt('Survived'), ...gatingAt('NoCoverage'), ...gatingAt('Missing')]),
     ...section('Silenced by a Stryker disable comment (each needs a justification in the notes):', gatingAt('Ignored')),
     ...section('Inconclusive (no test failed for the mutant itself; rerun, or add a test that fails on it):', [...gatingAt('Inconclusive'), ...gatingAt('RuntimeError')]),
-    ...section('Timeouts (each timed out again when run alone with four times the time: a test or its beforeEach or afterEach hook, or the whole run past its budget; counted as killed, so check each replacement):', gatingAt('Timeout')),
+    ...section('Timeouts (each timed out when run alone with four times the time: a test or its beforeEach or afterEach hook, or the whole run past its budget; counted as killed, so check each replacement):', gatingAt('Timeout')),
     `Context mutants (in the widened statements, not gating: ones that touch no changed line, and ones beyond what the changed lines widen to by themselves, which can span one, as the emptying of a body around a deletion does): ${context.length}: ${tally(context)}`,
     ...section('Context survivors:', context.filter(m => outcome(m) === 'Survived')),
     ...(run.controls?.length ? ['Runs with no mutant after the reruns:', ...run.controls.map(line => `  ${line}`)] : []),

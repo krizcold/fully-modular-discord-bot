@@ -49,8 +49,8 @@ From the bot root, with Node 22.12 or newer (or SMDB_TEST_NODE set, as for `npm 
   during the run, which ends it NO RESULT.
 - Exit 0 is PASS, 1 FAIL, 2 NO RESULT (nothing was tested, the tree changed during the run, or the gate stopped: the
   report says which; or, with no report, the test packages are missing (`npm run test:install`), the checkout's path
-  holds characters Stryker reads as a glob (a `[ ]` class, a `{ }` with a comma or a range, or an extglob such as
-  `+( )`, with which Stryker matches no file to mutate), .stryker-tmp could not be made, git could not list the tree,
+  does not match itself read as a glob, as Stryker reads it (a `[ ]` class, a `{ }` with a comma or a range, an extglob
+  such as `+( )`, or one minimatch cannot read: Stryker then matches no file to mutate), .stryker-tmp could not be made, git could not list the tree,
   or the report itself could not be written; every `Verdict:` line goes to
   stdout, and the gate exits only once stdout has taken the whole report) or a usage error. A mutant id left in the shell (`__STRYKER_ACTIVE_MUTANT__`)
   is ignored. Any other code means the run was interrupted. Trust 0 and 1 only after the report's `Verdict:` line: a process
@@ -60,7 +60,8 @@ Pass A needs nothing running. Pass B runs the integration tests that import the 
 there are any. git only names the files that changed, over the whole repo (a rename found by git's own measure, with no
 limit on how many files it compares), and gives each one's text at the base; the gate finds the changed lines itself, a
 shortest line diff of the two texts, so no git setting, attribute or variable moves them (unit/mutationRanges.test.ts
-runs it under a hostile config). git runs with no file-system monitor, so it looks at every file itself.
+runs it under a hostile config). git does not look at every file (below), so the gate checks every tracked file git
+does not name by its content.
 
 ## What it mutates
 
@@ -108,9 +109,12 @@ runs it under a hostile config). git runs with no file-system monitor, so it loo
   there. Not named: a block taken away where as many or more lines are put back, and a line moved into or out of a
   braceless body (an `if (x)` with no brace put above a line, or lines swapped below one); a reviewer reads each
   changed braceless header for these.
-- git does not look at a file its index marks assume-unchanged or skip-worktree (core.ignoreStat marks every file it
-  adds), so the gate compares each such file with its base text itself, and names one marked assume-unchanged that is
-  gone as deleted; one marked skip-worktree that is gone is taken as left out by a sparse checkout.
+- git does not look at every file: not at one its index marks assume-unchanged or skip-worktree (core.ignoreStat marks
+  every file it adds), not at one a file-system monitor says is unchanged, and not at one whose cached size and time
+  (and, on Windows, creation time) still hold, so a same-size edit whose time was set back shows in no diff. So the
+  gate checks every tracked file git does not name by its content: it hashes the file as `git add` would and names it
+  changed when that differs from git's index, and names one that is gone as deleted, unless skip-worktree left it out
+  (a sparse checkout).
 - Not mutated, and named in the report with the reason: files outside src (the root scripts, updaters/, tests, docs and
   images), files that are not code, `.d.ts` files, the browser views under src/webui/public (copied into dist, never
   compiled, and no test loads them yet), a file deleted or moved out of src, an untracked git repository (git lists
@@ -124,8 +128,8 @@ runs it under a hostile config). git runs with no file-system monitor, so it loo
   others). A mutant of it (the DATA_DIR check made false, the fallback chosen) sends the tests to `/data`, on a
   developer's machine a real data root and anywhere else one the run would make outside the sandbox. A path under
   `/data` written out in full (`'/data/global'`) is not matched, since route paths such as `'/data/get'` read the
-  same: unit/mutationRanges.test.ts fails when src gains a string that starts with `/data/` and is not one of the
-  known routes, so such a path goes through dataRoot.ts. `--mutate` refuses such a file, and each pass's run with no mutant, which
+  same: unit/mutationRanges.test.ts fails when a file in src that git tracks or would add (what the gate can mutate)
+  gains a string that starts with `/data/` and is not one of the known routes, so such a path goes through dataRoot.ts. `--mutate` refuses such a file, and each pass's run with no mutant, which
   comes before any mutant's, checks the files as that pass copied them, so a file that gains such code after the plan
   stops the pass (NO RESULT, naming it).
 - A changed line of code that no mutant lies wholly on, in a diff, an untracked file or a `--mutate` pattern, is named
@@ -168,7 +172,7 @@ runs it under a hostile config). git runs with no file-system monitor, so it loo
    - A gating mutant that timed out in pass A, or whose run there failed only on the machine's texts (below), reruns
      with the fast tests that import the files of the mutants rerun, directly or through other files (`vitest related`;
      a test that reaches them by no import vitest can see, such as a computed require, a file read or a child process,
-     does not run again). It counts as killed when the rerun fails a test, whatever the failure says, or times out again: a test or its beforeEach or afterEach hook past four times its limit (a beforeAll or
+     does not run again). It counts as killed when the rerun fails a test, whatever the failure says, or times out when run alone: a test or its beforeEach or afterEach hook past four times its limit (a beforeAll or
      afterAll hook's timeout is inconclusive, below), or the whole run past Stryker's budget for
      it, which is four times what those tests take with no mutant, plus a minute. That budget fires first whenever
      those tests take under 15 seconds, so a mutant that only slows several tests, each within its own limit, by that
@@ -185,7 +189,8 @@ runs it under a hostile config). git runs with no file-system monitor, so it loo
      through helpers/endPool.ts).
    - A gating kill of pass B, or a run there that failed only on the machine's texts, reruns with the one test file
      that failed, alone (one rerun per such file), so no other file's order or hang can decide it. It counts only when
-     that file fails for the mutant again, whatever the failure says. Its Stryker
+     that file fails for the mutant again, whatever the failure says; when the file passes alone, the mutant is
+     inconclusive, not a survivor, since pass B stopped at that failure and its later tests never ran on it. Its Stryker
      budget is an hour, above anything vitest's own limits let the file take after its first failure, so a rerun that
      fails always leaves its report.
    - A mutant the gate never reran (it stopped first) is inconclusive.
