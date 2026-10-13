@@ -1,8 +1,8 @@
 // A fingerprint of the files a run reads (touched.mjs): taken when the gate
-// plans and again before its verdict. Each pass copies the tree as it is when
-// the pass starts and the run with no mutant reads the checkout as it is then,
-// so a tree that changed in between (an edit, a formatter, another session)
-// leaves the verdict about no one tree, and the gate has no result.
+// plans and again before its verdict. Each pass, and each run with no mutant
+// after the reruns, copies the tree as it is when it starts, so a tree that
+// changed in between (an edit, a formatter, another session) leaves the
+// verdict about no one tree, and the gate has no result.
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';

@@ -656,8 +656,13 @@ describe('the change', () => {
     for (const text of ["export const at = '/app';\n", "export const at = '/app/build';\n", 'export const at = (x: string) => `/app/${x}`;\n']) {
       expect(holdsDataRoute('src/a.ts', text), text).toBe(true);
     }
-    for (const text of ["export const at = '/apps/x';\n", "export const at = '/apply';\n", "export const at = 'app/x';\n"]) {
+    for (const text of ["export const at = '/apps/x';\n", "export const at = '/apply';\n", "export const at = 'app/x';\n", "app.get('/Data/get', h);\n"]) {
       expect(holdsDataRoute('src/a.ts', text), text).toBe(false);
+    }
+    // Windows reads these as the same roots and the same variable: any case, either slash.
+    for (const text of ["export const at = '/Data';\n", "export const at = '/DATA/';\n", "export const at = '\\\\data';\n", "export const at = '/App/build';\n",
+      "export const at = '\\\\app\\\\build';\n", "export const root = process.env.data_dir ?? 'here';\n"]) {
+      expect(holdsDataRoute('src/a.ts', text), text).toBe(true);
     }
     const plan = planChange({
       entries: [{ status: 'R', from: 'src/utils/dataRoot.ts', file: 'src/utils/paths/dataRoot.ts' }, { status: 'M', file: 'src/b.ts' }],
@@ -684,7 +689,7 @@ describe('the change', () => {
       const text = fs.readFileSync(path.join(botRoot, file), 'utf8');
       if (holdsDataRoute(file, text)) continue;
       const visit = (node: ts.Node) => {
-        if ((ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node) || ts.isTemplateHead(node)) && node.text.startsWith('/data/')) found.set(node.text, file);
+        if ((ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node) || ts.isTemplateHead(node)) && /^[\\/]data[\\/]/i.test(node.text)) found.set(node.text, file);
         ts.forEachChild(node, visit);
       };
       visit(ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true));

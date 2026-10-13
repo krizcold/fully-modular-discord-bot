@@ -153,7 +153,8 @@ does not name by its content.
 - Never mutated, on any machine, and named: a file whose code names the DATA_DIR variable or holds `'/data'` as a
   string or as the head of a template (`` `/data/${x}` ``; src/utils/dataRoot.ts today, under any name or split into
   others), or holds the image's `'/app'` root or a path under it (`'/app/build'`, `` `/app/${x}` ``: the module path
-  helpers, the snapshot and update code and src/index.ts today). A mutant of it (the DATA_DIR check made false, the
+  helpers, the snapshot and update code and src/index.ts today), in any case and with either slash (Windows reads
+  `/Data`, `\data` and `data_dir` as the same). A root built at run time (`path.join('/', 'data')`) is not seen. A mutant of it (the DATA_DIR check made false, the
   image's marker taken as found, the fallback chosen) sends the tests to such a root, on a developer's machine a real
   data root (on Windows at the root of the drive of the process's cwd: the checkout's for a test, the temp dir's for a
   child step, so `D:\app` or `C:\data` for a checkout on D: with TEMP on C:) and anywhere else one the run would make
@@ -183,7 +184,9 @@ does not name by its content.
    sandboxPatterns gives Stryker a pattern that leaves everything out, then lets each of those files back in). So
    git's ignored files (`.env`, the data dirs, dist), the files of an untracked git repository or a submodule (git
    lists only its dir, which lets nothing in; code that needs them fails there, NO RESULT) and any file made after the
-   gate started stay out of every sandbox. A name Stryker would read as a glob even when escaped (on POSIX, one holding
+   gate started stay out of every sandbox. Stryker's copy does not follow a link to a directory either: the files git
+   lists under a junction in the tree (Windows) stay out, and a tracked link to a directory (POSIX) fails the copy, so
+   code that reaches files through such a link fails there too (NO RESULT). A name Stryker would read as a glob even when escaped (on POSIX, one holding
    a backslash and a brace) stops the gate with NO RESULT, since the sandbox would lack it. Stryker matches names with
    no regard to case, so on a disk that tells case apart, a file whose path differs from a listed one's only in case
    is copied too. Stryker also walks every dir of the checkout, ignored ones too, for node_modules to link:
@@ -196,11 +199,12 @@ does not name by its content.
    with no test run. A gating mutant whose only type error is an unused `@ts-expect-error` (TS2578) type-checks, so it
    meets pass A's tests again with no checker (`a-unchecked/`), and that run is its pass A: from there it goes on like
    any other mutant. Each mutant run is `vitest related <mutated files>` on the fast tier with one worker: every pass
-   and rerun, and each run with no mutant, is given every file the gate mutates (each file a target can gate in: not
-   a changed file it does not mutate, nor one where code was only taken out or only comments changed), and where it runs related tests (pass A, its run with no checker, a2 and the run after
-   it, pass B's integration tier) only tests that import one of them, directly or through other files, run (a test
-   that reaches them by no import vitest can see, such as a computed require, a file read or a child process, does
-   not). Pass B's child tier runs whole; each b2 run runs the one file that failed, and the run after them runs every such file. There is no coverage analysis: every mutant runs those tests. The files go on vitest's
+   and rerun, and each run with no mutant, is given every file the gate mutates, and pass A gives Stryker those files
+   only (each file a target can gate in: not a changed file it does not mutate, nor one where code was only taken out
+   or only comments changed), and where it runs related tests (pass A, its run with no checker, a2 and the run after
+   it, pass B's integration tier) only tests that import one of them, directly or through other files, run: by an ES
+   import or an `import()` of a written-out name. A test that reaches them any other way does not: by any require,
+   written out or computed (src's lazy requires), a file read or a child process. Pass B's child tier runs whole; each b2 run runs the one file that failed, and the run after them runs every such file. There is no coverage analysis: every mutant runs those tests. The files go on vitest's
    command line relative to test/; a change of many hundreds of files can pass Windows' limit on a command line, and
    then the run's log says vitest could not start.
 2. **Pass B, the rest, on pass A's gating survivors only.** The sandbox's dist is built from the instrumented src
@@ -245,7 +249,8 @@ does not name by its content.
    RESULT. When a rerun of pass A confirmed a timeout, the run must also fit in the budget Stryker gave each rerun (four
    times the reruns' own run with no mutant, plus a minute; runner.mjs times both, mutation/control.mjs holds one to
    the other), or the machine was as slow as the mutant seemed and the gate ends NO RESULT the same way. Its bound is
-   Stryker's for a run with no mutant, as the reruns' own had (five minutes after pass A, fifteen after pass B).
+   an hour, above the budget any rerun of pass A had (its own run with no mutant ran under Stryker's five minutes), so
+   the budget, not the bound, judges its time.
    What it cannot see: a machine that was
    four times slower for one rerun only and well again by the end (a pass A rerun that timed out, or a pass B rerun
    whose child step ran past its bound), or, for a test, hook or step that sets its own limit, which is not scaled,

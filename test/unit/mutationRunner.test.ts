@@ -221,11 +221,16 @@ describe('the tree fingerprint', () => {
 
   it('gives pass A every target of a file, gates by any of them, and runs only when one can gate (ranges.mjs)', () => {
     const gate = fs.readFileSync(path.join(root, 'test', 'mutation', 'touched.mjs'), 'utf8');
-    expect(gate).toContain('mutate: mutatePatterns(targets)');
     expect(gate).toContain('gating: gatesIn(targets, file, r.location)');
     expect(gate).toContain('const canGate = target => target.gating === null || target.gating.length > 0;');
-    // Every run is given the files a target can gate in, never one where code was only taken out.
-    expect(gate).toContain('const changedFiles = () => [...new Set(targets.filter(canGate).map(target => target.file))];');
+    // One list: Stryker mutates, and every run is given, the files a target can gate in (each with all its targets),
+    // never one where code was only taken out, so each run with no mutant checks every file Stryker made code in.
+    expect(gate).toContain('const mutated = () => targets.filter(target => targets.some(other => other.file === target.file && canGate(other)));');
+    expect(gate).toContain('const changedFiles = () => [...new Set(mutated().map(target => target.file))];');
+    expect(gate).toContain('mutate: mutatePatterns(mutated())');
+    // The run with no mutant after the reruns makes their spans, with their time limits, bound above their budget.
+    expect(gate).toContain("await stryker({ dir, tier, mutate: [...new Set(on.map(spanOf))], only, alone: true, extra: { ...(tier === 'a' ? PASSES.a2 : PASSES.b2), dryRunOnly: true, dryRunTimeoutMinutes: 60 } });");
+    expect(gate).toContain('const results = await pass({ dir, tier, mutate: [...new Set(on.map(spanOf))],');
     const guard = gate.indexOf('if (!targets.some(canGate)) await finish();');
     expect(guard).toBeGreaterThan(0);
     expect(guard).toBeLessThan(gate.indexOf("await pass({ dir: 'a'"));

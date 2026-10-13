@@ -30,14 +30,40 @@ function lineOf(text: string): number {
   return index + 1;
 }
 
+/**
+ * Removes what a bite run cut short left under `at`'s src: each test removes its own files when it ends, but an
+ * interrupt skips that, and a leftover importer of an ignored module would stop every gate run before pass A. Only
+ * the names the tests below write: a developer's own clone in src/bot/modulesDev can start with smdb- too.
+ * @param at a bot root
+ */
+function sweepLeftovers(at: string) {
+  const src = path.join(at, 'src');
+  const dev = path.join(src, 'bot', 'modulesDev');
+  for (const old of fs.readdirSync(src)) {
+    if (/^smdb-(bite-(directive|other|probe|gone)|beyond|glob-\[x\])-\d+\.ts$/.test(old)) fs.rmSync(path.join(src, old), { force: true });
+    else if (/^smdb-(ignored|repo)-\d+$/.test(old)) fs.rmSync(path.join(src, old), { recursive: true, force: true });
+  }
+  if (fs.existsSync(dev)) for (const old of fs.readdirSync(dev).filter(name => /^smdb-(beyond|bite-reader)-\d+\.ts$/.test(name))) fs.rmSync(path.join(dev, old), { force: true });
+}
+
 describe('the touched-line mutation gate', () => {
-  // What a run cut short left in src, before any test: each test removes its own files when it ends, but an
-  // interrupt skips that, and a leftover importer of an ignored module would stop every gate run before pass A.
-  beforeAll(() => {
-    const src = path.join(root, 'src');
-    const dev = path.join(src, 'bot', 'modulesDev');
-    for (const old of fs.readdirSync(src).filter(name => /^smdb-(bite|ignored|repo|glob|beyond)-/.test(name))) fs.rmSync(path.join(src, old), { recursive: true, force: true });
-    if (fs.existsSync(dev)) for (const old of fs.readdirSync(dev).filter(name => name.startsWith('smdb-'))) fs.rmSync(path.join(dev, old), { recursive: true, force: true });
+  beforeAll(() => sweepLeftovers(root));
+
+  it('sweeps only what a run cut short left, never a clone whose name starts the same', () => {
+    const at = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-sweep-'));
+    try {
+      const dev = path.join(at, 'src', 'bot', 'modulesDev');
+      fs.mkdirSync(path.join(dev, 'smdb-appstore'), { recursive: true });
+      fs.writeFileSync(path.join(dev, 'smdb-appstore', 'index.ts'), 'export const x = 1;\n');
+      for (const name of ['smdb-beyond-1.ts', 'smdb-bite-reader-1.ts']) fs.writeFileSync(path.join(dev, name), '');
+      fs.mkdirSync(path.join(at, 'src', 'smdb-repo-1', '.git'), { recursive: true });
+      for (const name of ['smdb-beyond-1.ts', 'smdb-bite-probe-1.ts', 'smdb-glob-[x]-1.ts', 'smdb-kept.ts']) fs.writeFileSync(path.join(at, 'src', name), '');
+      sweepLeftovers(at);
+      expect(fs.readdirSync(dev)).toEqual(['smdb-appstore']);
+      expect(fs.readdirSync(path.join(at, 'src')).sort()).toEqual(['bot', 'smdb-kept.ts']);
+    } finally {
+      fs.rmSync(at, { recursive: true, force: true });
+    }
   });
 
   it('kills in-process code in pass A and restart-only code in pass B through a child', { timeout: 900_000 }, () => {

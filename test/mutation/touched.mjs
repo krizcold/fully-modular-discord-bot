@@ -164,9 +164,12 @@ let targets = [];
  * @param {PassTarget} target
  */
 const canGate = target => target.gating === null || target.gating.length > 0;
-// Every run, each pass and rerun and each run with no mutant, is given every
-// file the gate mutates (each file a target can gate in), as pass A is.
-const changedFiles = () => [...new Set(targets.filter(canGate).map(target => target.file))];
+// One list: what pass A gives Stryker to mutate is every target of each file a
+// target can gate in (all of them, so two names of one file merge as one diff),
+// and every run, each pass and rerun and each run with no mutant, is given
+// exactly those files, so its run with no mutant checks each.
+const mutated = () => targets.filter(target => targets.some(other => other.file === target.file && canGate(other)));
+const changedFiles = () => [...new Set(mutated().map(target => target.file))];
 /** @type {{ file: string, why: string }[]} */
 let skipped = [];
 let scope = opts.mutate.length > 0 ? `the patterns ${opts.mutate.join(' ')}` : `the change from ${opts.base} to the working tree`;
@@ -328,7 +331,9 @@ async function control(after, tier, on, only, timed = false) {
   console.log(`L5: the same tests once with no mutant, to check the machine after pass ${after}`);
   let failed = '';
   try {
-    await stryker({ dir, tier, mutate: [...new Set(on.map(spanOf))], only, alone: true, extra: { ...(tier === 'a' ? PASSES.a2 : PASSES.b2), dryRunOnly: true } });
+    // Bound by an hour, above the budget any rerun of pass A had (four times its own run with no mutant, which ran
+    // under Stryker's five minutes, plus a minute), so the budget, not the bound, judges the time.
+    await stryker({ dir, tier, mutate: [...new Set(on.map(spanOf))], only, alone: true, extra: { ...(tier === 'a' ? PASSES.a2 : PASSES.b2), dryRunOnly: true, dryRunTimeoutMinutes: 60 } });
     if (timed) failed = pastBudget(path.join(reportDir, after), out, PASSES.a2);
   } catch (error) {
     if (error instanceof PassError) throw error;
@@ -460,7 +465,7 @@ try {
     throw new PassError(`the type checker would judge ${beyond.join(', ')}, which a file in the tree imports or references but no sandbox holds, so a mutant that broke only it would count as killed with no test run`);
   }
   fs.writeFileSync(path.join(root, checkerConfig), `${JSON.stringify(checker, null, 2)}\n`);
-  const resultsA = await pass({ dir: 'a', tier: 'a', mutate: mutatePatterns(targets), extra: { ...PASSES.a, concurrency: opts.concurrency, tsconfigFile: checkerConfig } })
+  const resultsA = await pass({ dir: 'a', tier: 'a', mutate: mutatePatterns(mutated()), extra: { ...PASSES.a, concurrency: opts.concurrency, tsconfigFile: checkerConfig } })
     .finally(() => fs.rmSync(path.join(root, checkerConfig), { force: true }));
   const orphans = [...new Set(resultsA.map(fileOf).filter(file => !targets.some(t => t.file === file)))];
   if (orphans.length > 0) throw new PassError(`Stryker mutated ${orphans.join(', ')}, which no target names, so the report could not answer for it`);

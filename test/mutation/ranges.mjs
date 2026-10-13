@@ -47,14 +47,19 @@ export const EXTRA_BREAK_WHY = 'it holds a line break Stryker counts and the gat
 /** @param {string} text */
 export const holdsExtraBreak = text => EXTRA_BREAK.test(text);
 
+// The variable's name as a string, the '/data' fallback itself (not a path under it, as the config page's routes such
+// as '/data/get' are), and '/app' or a path under it, in any case and with either slash.
+const DATA_ROUTE = /^(DATA_DIR|[\\/]data[\\/]?|[\\/]app([\\/].*)?)$/is;
+
 export const DATA_ROUTE_WHY = "it reads DATA_DIR or holds a fixed root (the '/data' fallback, or '/app' or a path under it), so a mutant of it could send the tests there, on a developer's machine a real data root and anywhere else one the run would make";
 
 /**
  * Whether a file's code names the DATA_DIR variable, or holds as a string or a
  * template's head the '/data' fallback or the image's '/app' root or a path
- * under it: a mutant of it (a check of DATA_DIR or of the image made false or
- * true, the fallback chosen) could send the tests to a fixed root outside the
- * sandbox, so the gate never mutates it.
+ * under it, in any case and with either slash (Windows reads `/Data`, `\data`
+ * and `data_dir` as the same): a mutant of it (a check of DATA_DIR or of the
+ * image made false or true, the fallback chosen) could send the tests to a
+ * fixed root outside the sandbox, so the gate never mutates it.
  * @param {string} file
  * @param {string} text
  */
@@ -62,8 +67,8 @@ export function holdsDataRoute(file, text) {
   let found = false;
   /** @param {ts.Node} node */
   const walk = node => {
-    if (ts.isIdentifier(node) && node.text === 'DATA_DIR') found = true;
-    else if ((ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node) || ts.isTemplateHead(node)) && /^(DATA_DIR|\/data\/?|\/app(\/.*)?)$/s.test(node.text)) found = true;
+    if (ts.isIdentifier(node) && node.text.toUpperCase() === 'DATA_DIR') found = true;
+    else if ((ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node) || ts.isTemplateHead(node)) && DATA_ROUTE.test(node.text)) found = true;
     else if (!found) ts.forEachChild(node, walk);
   };
   walk(parse(file, text));
@@ -737,7 +742,9 @@ export function planFromGit({ git: run, base, root, read = file => fs.readFileSy
  * after the list is ever copied. Each name is escaped as Stryker's matcher
  * reads a pattern; one whose pattern still does not match it (on POSIX, a name
  * holding a backslash and a brace) is `unkept`, and the gate stops rather than
- * run without it.
+ * run without it. Stryker's copy does not follow a link to a directory, so a
+ * file listed under a junction is not copied, and a tracked link to a
+ * directory fails the copy.
  * @param {string[]} files from the bot root, with forward slashes; a dir ends in '/'
  * @returns {{ patterns: string[], unkept: string[] }}
  */
