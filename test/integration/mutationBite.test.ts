@@ -200,7 +200,7 @@ describe('the touched-line mutation gate', () => {
     expect(run.stdout).not.toMatch(/^Inconclusive /m);
   });
 
-  it('type-checks only the tree, and reruns alone a mutant whose only type error is an unused @ts-expect-error, as its first run', { timeout: 600_000 }, () => {
+  it('type-checks only the tree, and gives a mutant whose only type error is an unused @ts-expect-error pass A again with no checker', { timeout: 600_000 }, () => {
     const src = path.join(root, 'src');
     const ignored = path.join(src, 'bot', 'modulesDev');
     for (const old of fs.readdirSync(src).filter(name => name.startsWith('smdb-bite-directive-'))) fs.rmSync(path.join(src, old), { force: true });
@@ -218,22 +218,25 @@ describe('the touched-line mutation gate', () => {
     // A module cloned into the git-ignored src/bot/modulesDev that reads the probe: no sandbox holds it.
     fs.writeFileSync(reader, `import { SMDB_PROBE } from '../../smdb-bite-directive-${process.pid}';\nexport const smdbRetries: number = SMDB_PROBE.retries;\n`);
     try {
-      // Every rerun alone fails only on the machine's texts.
-      const { run, mutants } = standInRun(`if (mutant && pass === 'a2') message = "Error: EBUSY: resource busy or locked, rmdir 'x'";`, probe);
+      // Pass A with no checker, and every rerun alone, fail only on the machine's texts.
+      const { run, mutants } = standInRun(`if (mutant && (pass === 'a-unchecked' || pass === 'a2')) message = "Error: EBUSY: resource busy or locked, rmdir 'x'";`, probe);
       expect(run.stdout).not.toMatch(/^Stopped:/m);
       // Emptying the object is a type error only in the ignored file, so it meets the tests (the stand-in times them
       // out), and its rerun alone counts the failure, whatever it says.
       const emptied = mutants.find(m => m.mutator === 'ObjectLiteral' && m.location.start.line === 1);
       expect(emptied?.passes.a.status).toBe('Killed');
       expect(emptied?.passes.a2?.killedBy).toBe('unit/x.test.ts > reads');
-      // The condition's mutants leave the directive unused: they rerun alone, where no checker runs, and that rerun
-      // is their first run of the tests, so a failure only on the machine's texts counts for nothing.
-      const unused = mutants.filter(m => m.passes.a.status === 'CompileError' && m.passes.a.recheck);
+      // The condition's mutants leave the directive unused: they meet pass A's tests again with no checker, where the
+      // machine's texts make a first run's failure a recheck, and go on like any other: their rerun alone counts it.
+      const unused = mutants.filter(m => /^only the machine failed: Error: EBUSY/.test(m.passes.a.inconclusive ?? ''));
       expect(unused.length).toBeGreaterThan(0);
+      expect(run.stdout).toMatch(new RegExp(`^L5: pass A again, with no type checker, on ${unused.length} mutant\\(s\\) whose only type error is an unused @ts-expect-error$`, 'm'));
       for (const m of unused) {
-        expect(m.passes.a2, m.mutator).toMatchObject({ recheck: 'unit/x.test.ts > reads', inconclusive: expect.stringMatching(/^only the machine failed: Error: EBUSY/) });
+        expect(m.passes.a, m.mutator).toMatchObject({ status: 'Killed', recheck: 'unit/x.test.ts > reads' });
+        expect(m.passes.a2?.killedBy, m.mutator).toBe('unit/x.test.ts > reads');
       }
-      expect(run.stdout).toMatch(/, in the only run of tests on it \(in pass A the type checker judged it\)\)$/m);
+      expect(mutants.filter(m => m.passes.a.status === 'CompileError' && m.passes.a.inconclusive)).toEqual([]);
+      expect(run.stdout).not.toMatch(/^Inconclusive /m);
     } finally {
       fs.rmSync(path.join(root, probe), { force: true });
       fs.rmSync(reader, { force: true });

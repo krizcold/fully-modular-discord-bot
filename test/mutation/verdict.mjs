@@ -5,9 +5,9 @@
  * @typedef {import('./ranges.mjs').Location} Location
  * @typedef {'a' | 'a2' | 'b' | 'b2'} PassName
  * @typedef {{ id: string | null, status: string, statusReason?: string, killedBy?: string, timeout?: string, inconclusive?: string,
- *   recheck?: string, voided?: string }} PassResult recheck: why the mutant reruns alone: the test that failed only on
- *   the machine's texts, or 'the type checker' for a CompileError only of an unused `@ts-expect-error` (TS2578);
- *   voided: why a rerun's kill or timeout no longer counts
+ *   recheck?: string, voided?: string }} PassResult recheck: the test that failed only on the machine's texts, so the
+ *   mutant reruns alone; voided: why a rerun's kill or timeout no longer counts; a CompileError with an inconclusive
+ *   is one only of an unused `@ts-expect-error` (TS2578), which no test met
  * @typedef {{ file: string, location: Location, mutator: string, original: string, replacement: string, gating: boolean,
  *   passes: Partial<Record<PassName, PassResult>> }} MutantRecord
  * @typedef {{ name: string, status?: string, message?: string,
@@ -91,7 +91,8 @@ export function classifyKill(reports, alone = false) {
  * Whether a type checker's reason (tsc's formatted errors) names only unused
  * `@ts-expect-error` directives (TS2578): the mutated code type-checks, and the
  * one error is that a line under such a directive no longer needs it, so the
- * checker proves nothing and the mutant must meet the tests.
+ * checker proves nothing and the mutant must meet the tests: a gating one meets
+ * pass A's tests again with no checker, and that run is its pass A.
  * @param {string} reason
  */
 export function onlyUnusedDirective(reason) {
@@ -105,7 +106,7 @@ export function onlyUnusedDirective(reason) {
  */
 export function outcomeOf(result) {
   if (result.status === 'Killed') return result.killedBy ? 'Killed' : result.timeout ? 'Timeout' : result.recheck ? 'Recheck' : 'Inconclusive';
-  if (result.status === 'CompileError' && result.recheck) return 'Recheck';
+  if (result.status === 'CompileError' && result.inconclusive) return 'Inconclusive';
   return result.status;
 }
 
@@ -120,10 +121,7 @@ const failedInB = b => (b?.killedBy ? `killed in pass B by ${b.killedBy}` : `fai
  * confirmed. In pass A a timeout counts when the rerun, with four times the
  * config's time limits, times out alone (a test or its beforeEach or afterEach
  * hook, or the whole run past Stryker's budget) or fails a test, and so does a
- * run that failed only on the machine's texts. A type error only of an unused
- * `@ts-expect-error` ran no test in pass A, so its rerun alone is its first run
- * of the tests and is read as one: a failure there only on the machine's texts
- * is inconclusive. In pass B, where containers and children can be
+ * run that failed only on the machine's texts. In pass B, where containers and children can be
  * slow on their own, a hang never counts, and a kill (or a run that failed only
  * on the machine's texts) counts only when the test file that failed fails for
  * it again when run alone; when that file passes alone, the tests after it in
@@ -137,11 +135,12 @@ const failedInB = b => (b?.killedBy ? `killed in pass B by ${b.killedBy}` : `fai
 export function confirmed(m, stopped = false) {
   const { a2, b, b2 } = m.passes;
   const last = outcomeOf(latest(m));
-  if (last === 'Recheck') {
-    return { outcome: 'Inconclusive', why: `${latest(m).inconclusive}, ${a2 ? 'in the only run of tests on it (in pass A the type checker judged it)' : 'never rerun alone'}` };
+  if (last === 'Recheck') return { outcome: 'Inconclusive', why: `${latest(m).inconclusive}, ${b ? 'in pass B, ' : ''}never rerun alone` };
+  // Only a later pass can find no mutant at a place pass A made one: a rerun,
+  // pass B, or pass A again with no checker.
+  if (last === 'Missing') {
+    return { outcome: 'Inconclusive', why: `pass ${b2 ? 'b2' : b ? 'b' : a2 ? 'a2' : 'A with no checker'} made no mutant at this place, so it ran no test on it` };
   }
-  // Only a rerun or pass B can find no mutant at a place pass A made one.
-  if (last === 'Missing') return { outcome: 'Inconclusive', why: `pass ${b2 ? 'b2' : b ? 'b' : 'a2'} made no mutant at this place, so it ran no test on it` };
   if (m.gating && b2 && last === 'Survived') {
     return { outcome: 'Inconclusive', why: `${failedInB(b)}, but not when that file ran alone, and the tests after it in pass B never ran on it` };
   }
@@ -167,8 +166,7 @@ export const FAILING = ['Survived', 'NoCoverage', 'Inconclusive', 'RuntimeError'
  * count when the rerun alone times out or fails a test, and pass B's kills,
  * which count only when the test file that killed them fails for them again;
  * in both, the runs that failed only on the machine's texts, which count when
- * they fail alone; and pass A's type errors only of an unused
- * `@ts-expect-error`, which meet the tests there with no checker.
+ * they fail alone.
  * @param {MutantRecord[]} mutants
  * @param {'a' | 'b'} pass
  */
@@ -179,14 +177,11 @@ export const toConfirm = (mutants, pass) => mutants.filter(m => {
 });
 
 /**
- * Whether a pass's run of a mutant is a rerun alone, whose failure counts
- * whatever it says (classifyKill): a2's and b2's, except a2's of a mutant
- * that pass A's type checker sent there, for which it is the first run of
- * the tests.
- * @param {MutantRecord} m
- * @param {PassName} name
+ * The gating mutants whose only type error in pass A was an unused
+ * `@ts-expect-error`: they meet pass A's tests again with no checker.
+ * @param {MutantRecord[]} mutants
  */
-export const rerunAlone = (m, name) => name === 'b2' || (name === 'a2' && m.passes.a?.status !== 'CompileError');
+export const toUncheck = mutants => mutants.filter(m => m.gating && m.passes.a?.status === 'CompileError' && Boolean(m.passes.a.inconclusive));
 
 /**
  * The pass B runs to confirm (kills, and runs that failed only on the

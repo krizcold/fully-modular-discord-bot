@@ -168,8 +168,8 @@ does not name by its content.
    so when the checker would judge a file outside the tree, packages under node_modules aside, the gate stops before
    pass A with NO RESULT and names it (ranges.mjs beyondTree): a mutant that broke only that file would count as killed
    with no test run. A gating mutant whose only type error is an unused `@ts-expect-error` (TS2578) type-checks, so it
-   reruns alone with no checker, as a timeout does; that rerun is its first run of the tests, so it reads the
-   machine's texts as a first run does (below). Each mutant run is `vitest related <mutated files>` on the fast tier with one worker, so only
+   meets pass A's tests again with no checker (`a-unchecked/`), and that run is its pass A: from there it goes on like
+   any other mutant. Each mutant run is `vitest related <mutated files>` on the fast tier with one worker, so only
    tests that import them run. There is no coverage analysis: every mutant runs those tests. The files go on vitest's
    command line relative to test/; a change of many hundreds of files can pass Windows' limit on a command line, and
    then the run's log says vitest could not start.
@@ -228,8 +228,8 @@ no mutant reads the checkout then, so a tree that changed during the run (an edi
 NO RESULT, naming the files.
 
 A run Stryker counts as a kill is checked against vitest's report of it: it is a kill when a test itself failed, and a
-timeout when every failing test (or its beforeEach or afterEach hook) timed out. In a mutant's first run of the tests
-(pass A or B, or the rerun alone of a type error only of an unused `@ts-expect-error`, which ran none in pass A), a
+timeout when every failing test (or its beforeEach or afterEach hook) timed out. In a pass's first run (A, its run
+with no checker included, or B), a
 failure that reads like the machine's proves nothing by itself, for the machine may cause it as well as the mutant:
 refused or reset connections, a container that would not start, a database connection dropped, exhausted resources,
 a file held or refused (EBUSY, EPERM, ENOTEMPTY or EACCES, as on Windows when a test removes its temp dir while a run
@@ -243,7 +243,8 @@ cannot see: a chance failure that hits a mutant's first run and again its rerun 
 after passes, credits a kill.
 Anything else is **inconclusive**: no report, a failure (a timeout included) only in a beforeAll or afterAll hook or at
 file level, an unhandled error with every test passing, or a first run that failed only on the machine's texts and was
-never rerun (the gate stopped first, or it was already that type error's rerun alone). vitest counts a failure in a beforeEach or afterEach hook as its test's, so such a
+never rerun (the gate stopped first), or a type error only of an unused `@ts-expect-error` that never met the tests
+(the gate stopped first, or it is a context mutant). vitest counts a failure in a beforeEach or afterEach hook as its test's, so such a
 failure counts as the test's too.
 
 Every run of the gate draws one fast-check seed (named on the Scope line; set SMDB_TEST_SEED to an integer to run with a
@@ -264,17 +265,18 @@ can hold the port or the path, and a run before it can leave the path behind. Fa
   did not count), the confirmed timeouts, the context mutants, the runs with no mutant after the reruns, why the gate
   stopped or which files changed during the run, and the verdict.
 - `mutants.json` has the run's fast-check seed and every mutant: its place, original text and replacement, whether it
-  gates, and per pass its status and the test that killed it.
-- `a/`, `a2/`, `b/` and `b2-1/`, `b2-2/` (one per test file that failed in pass B: a kill, or a failure only on the machine's texts) hold, for each mutant run, one vitest
+  gates, and per pass its status and the test that killed it (for a mutant pass A met again with no checker, its pass
+  A is that run).
+- `a/`, `a-unchecked/` (pass A again with no checker), `a2/`, `b/` and `b2-1/`, `b2-2/` (one per test file that failed in pass B: a kill, or a failure only on the machine's texts) hold, for each mutant run, one vitest
   JSON report and log per tier it ran (`<id>-<tier>.json` and `.log`; a run in `b/` can reach both integration and
   child; a nested mutant a pass is not for runs nothing; `dry-*` is the run with no mutant, and `dry-ms.txt` its time).
-  `a2/`, `b/` and `b2-*/` also hold targets.json and run-ids.json, the mutants the pass is for. `control-a2/` and
+  `a-unchecked/`, `a2/`, `b/` and `b2-*/` also hold targets.json and run-ids.json, the mutants the pass is for. `control-a2/` and
   `control-b2/` hold the runs with no mutant after the reruns.
 
 The verdict is FAIL when a gating mutant ends Survived, NoCoverage, inconclusive (a pass that made no mutant at its place included), RuntimeError, or Ignored (a
 `// Stryker disable` comment needs the same justification in the notes as a survivor). A confirmed timeout counts as
 killed and is listed. CompileError counts as killed by the type checker, unless its only error is an unused
-`@ts-expect-error` (a gating one then reruns alone, above). The verdict is NO RESULT when no src file
+`@ts-expect-error` (a gating one then meets pass A's tests with no checker, above). The verdict is NO RESULT when no src file
 changed, when no gating mutant was made, when every gating mutant was a type error (no test ran against the change),
 when the type checker would judge a file outside the tree, when a pass could not run, when Stryker mutated a file no target names, when the run with no mutant after the reruns
 failed (or ran past the reruns' budget), when the tree changed during the run, or when a test's stand-in replaced

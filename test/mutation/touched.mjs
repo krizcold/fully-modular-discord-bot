@@ -57,7 +57,7 @@ const {
   structureLines, DATA_ROUTE_WHY, EXTRA_BREAK_WHY, GLOB_NAME_WHY, beyondTree, gates, holdsDataRoute, holdsExtraBreak, linesOfTarget, notMutated, planFromGit,
   rootGlobFree, sandboxPatterns, strykerTakes, treeTsconfig, unmatchedPatterns, untouched,
 } = ranges;
-const { byKiller, classifyKill, judge, onlyUnusedDirective, outcome, rerunAlone, toConfirm, toPassB } = verdicts;
+const { byKiller, classifyKill, judge, onlyUnusedDirective, outcome, toConfirm, toPassB, toUncheck } = verdicts;
 
 const USAGE = 'usage: node test/mutation/touched.mjs [--base REF] [--mutate PATTERN]... [--concurrency N] [--keep]';
 /** @type {{ base: string, mutate: string[], concurrency: number, keep: boolean }} */
@@ -232,9 +232,9 @@ function dryFailures(name) {
 function resultOf(dir, r, alone = false) {
   /** @type {PassResult} */
   const result = { id: r.id, status: r.status, ...(r.statusReason ? { statusReason: r.statusReason.split('\n')[0] } : {}) };
-  // A type error only of an unused @ts-expect-error proves nothing: the mutant reruns alone, with no checker.
+  // A type error only of an unused @ts-expect-error proves nothing: a gating one meets pass A's tests again, with no checker.
   if (r.status === 'CompileError' && onlyUnusedDirective(r.statusReason ?? '')) {
-    return { ...result, recheck: 'the type checker', inconclusive: 'a type error only because a @ts-expect-error went unused (TS2578), so no test ran on it' };
+    return { ...result, inconclusive: 'a type error only because a @ts-expect-error went unused (TS2578), so no test ran on it' };
   }
   return r.status === 'Killed' ? { ...result, ...classifyKill(reportsOf(dir, r.id), alone) } : result;
 }
@@ -347,7 +347,7 @@ async function passOn(name, dir, tier, on, extra, only) {
   const byKey = new Map(results.map(r => [resultKey(r), r]));
   for (const m of on) {
     const r = byKey.get(recordKey(m));
-    m.passes[name] = r ? resultOf(dir, r, rerunAlone(m, name)) : { id: null, status: 'Missing' };
+    m.passes[name] = r ? resultOf(dir, r, name === 'a2' || name === 'b2') : { id: null, status: 'Missing' };
   }
 }
 
@@ -448,9 +448,16 @@ try {
     };
   });
 
+  // Their run with no checker is their pass A, and they go on from it like any other.
+  const unchecked = toUncheck(mutants);
+  if (unchecked.length > 0) {
+    console.log(`L5: pass A again, with no type checker, on ${unchecked.length} mutant(s) whose only type error is an unused @ts-expect-error`);
+    await passOn('a', 'a-unchecked', 'a', unchecked, { ...PASSES.a, checkers: [], concurrency: opts.concurrency });
+  }
+
   const confirmA = toConfirm(mutants, 'a');
   if (confirmA.length > 0) {
-    console.log(`L5: pass A again, one at a time, on ${confirmA.length} mutant(s) to confirm alone: timeouts, runs that failed only on the machine's texts, and type errors only of an unused @ts-expect-error`);
+    console.log(`L5: pass A again, one at a time, on ${confirmA.length} mutant(s) to confirm alone: timeouts, and runs that failed only on the machine's texts`);
     await passOn('a2', 'a2', 'a', confirmA, PASSES.a2);
     if (confirmA.some(credited)) await control('a2', 'a', confirmA, [], confirmA.some(m => outcome(m) === 'Timeout'));
   }

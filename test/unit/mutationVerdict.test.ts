@@ -4,7 +4,7 @@ import os from 'os';
 import path from 'path';
 import { describe, expect, it, onTestFinished } from 'vitest';
 import {
-  byKiller, classifyKill, confirmed, INFRASTRUCTURE, judge, onlyUnusedDirective, outcome, rerunAlone, toConfirm, toPassB, type MutantRecord, type PassResult,
+  byKiller, classifyKill, confirmed, INFRASTRUCTURE, judge, onlyUnusedDirective, outcome, toConfirm, toPassB, toUncheck, type MutantRecord, type PassResult,
 } from '../mutation/verdict.mjs';
 
 // What the L5 gate concludes (mutation/README.md): when a run counts as a
@@ -149,28 +149,28 @@ describe('the passes a mutant goes through', () => {
     });
     // A context mutant is never rerun.
     expect(toConfirm([mutant(3, false, { a: pass('Killed', machineOnly) })], 'a')).toEqual([]);
+    // A pass B recheck the gate stopped before rerunning says so, though a2 reran its pass A timeout alone.
+    const reranInA = mutant(4, true, { a: pass('Timeout'), a2: pass('Survived'), b: pass('Killed', { recheck: 'integration/s.test.ts > reads', inconclusive: 'only the machine failed: Error: ECONNRESET' }) });
+    expect(confirmed(reranInA, true)).toEqual({ outcome: 'Inconclusive', why: 'only the machine failed: Error: ECONNRESET, in pass B, never rerun alone' });
   });
 
-  it('reruns alone, with no type checker, a mutant whose only type error is an unused @ts-expect-error', () => {
+  it('sends a gating mutant whose only type error is an unused @ts-expect-error to pass A again, with no type checker', () => {
     const unused = "src/a.ts(4,3): error TS2578: Unused '@ts-expect-error' directive.\n";
     expect(onlyUnusedDirective(unused)).toBe(true);
     expect(onlyUnusedDirective(`${unused}src/a.ts(5,9): error TS2322: Type 'string' is not assignable to type 'number'.\n`)).toBe(false);
     expect(onlyUnusedDirective('')).toBe(false);
-    const directive = { recheck: 'the type checker', inconclusive: 'a type error only because a @ts-expect-error went unused (TS2578), so no test ran on it' };
+    const directive = { inconclusive: 'a type error only because a @ts-expect-error went unused (TS2578), so no test ran on it' };
     const m = mutant(1, true, { a: pass('CompileError', directive) });
-    expect(toConfirm([m, mutant(2, true, { a: pass('CompileError') })], 'a')).toEqual([m]);
-    expect(confirmed(m)).toEqual({ outcome: 'Inconclusive', why: `${directive.inconclusive}, never rerun alone` });
-    expect(outcome(mutant(1, true, { a: pass('CompileError', directive), a2: pass('Killed', { killedBy: 'unit/x.test.ts > x' }) }))).toBe('Killed');
-    expect(toPassB([mutant(1, true, { a: pass('CompileError', directive), a2: pass('Survived') })])).toHaveLength(1);
-    // Its rerun alone is its first run of the tests, so a failure there only on the machine's texts counts for nothing.
-    expect(rerunAlone(m, 'a2')).toBe(false);
-    expect(rerunAlone(mutant(1, true, { a: pass('Timeout') }), 'a2')).toBe(true);
-    expect(rerunAlone(mutant(1, true, { a: pass('Survived'), b: pass('Killed', { killedBy: 'x' }) }), 'b2')).toBe(true);
-    expect(rerunAlone(m, 'a')).toBe(false);
-    expect(rerunAlone(m, 'b')).toBe(false);
-    const machineOnce = mutant(1, true, { a: pass('CompileError', directive), a2: pass('Killed', { recheck: 'unit/x.test.ts > x', inconclusive: 'only the machine failed: Error: EBUSY: x' }) });
-    expect(confirmed(machineOnce)).toEqual({ outcome: 'Inconclusive', why: 'only the machine failed: Error: EBUSY: x, in the only run of tests on it (in pass A the type checker judged it)' });
-    expect(toPassB([machineOnce])).toEqual([]);
+    const typeError = mutant(2, true, { a: pass('CompileError') });
+    expect(toUncheck([m, typeError, mutant(3, false, { a: pass('CompileError', directive) })])).toEqual([m]);
+    expect(toConfirm([m], 'a')).toEqual([]);
+    expect(outcome(typeError)).toBe('CompileError');
+    // Until it meets the tests (the gate stopped first, or a context one), it is no kill, and the report says why.
+    expect(outcome(m)).toBe('Inconclusive');
+    expect(run([m, mutant(4, true, { a: pass('Killed', { killedBy: 'x' }) })], { stopped: ['x'] }).lines.join('\n'))
+      .toContain(`src/a.ts:1:3 EqualityOperator: \`a > 0\` -> \`a >= 0\` (${directive.inconclusive})`);
+    // That run is its pass A: one that made no mutant there is named.
+    expect(confirmed(mutant(1, true, { a: pass('Missing') }))).toEqual({ outcome: 'Inconclusive', why: 'pass A with no checker made no mutant at this place, so it ran no test on it' });
   });
 
   it('reruns each pass B kill with the test file that killed it', () => {
