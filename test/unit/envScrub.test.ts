@@ -5,6 +5,7 @@ import path from 'path';
 import { describe, expect, it, onTestFinished, vi } from 'vitest';
 import { childEnv } from '../helpers/child';
 import { DEAD_ENDS, kept, scrubEnv } from '../helpers/env';
+import { CODE } from '../mutation/ranges.mjs';
 
 // The env scrub (helpers/env.ts): tests and the children they start keep only
 // the platform's, the test tools' and the suite's own variables, so whatever a
@@ -13,7 +14,7 @@ import { DEAD_ENDS, kept, scrubEnv } from '../helpers/env';
 
 const src = path.join(__dirname, '..', '..', 'src');
 const filesUnder = (dir: string): string[] => fs.readdirSync(dir, { withFileTypes: true }).flatMap(entry =>
-  entry.isDirectory() ? filesUnder(path.join(dir, entry.name)) : /\.(ts|js|cjs|mjs)$/.test(entry.name) ? [path.join(dir, entry.name)] : []);
+  entry.isDirectory() ? filesUnder(path.join(dir, entry.name)) : CODE.test(entry.name) ? [path.join(dir, entry.name)] : []);
 
 describe('the env scrub', () => {
   const texts = filesUnder(src).map(file => fs.readFileSync(file, 'utf8'));

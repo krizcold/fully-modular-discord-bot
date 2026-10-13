@@ -83,12 +83,13 @@ describe('the touched-line mutation gate', () => {
   });
 
   /**
-   * A gate run on one line with a stand-in for vitest: the run with no mutant
-   * passes and every mutant's test times out. Each run first runs `code`, the
-   * stand-in's own JavaScript, with `file` its report's path, `pass` its
-   * pass's dir name (`control-a2` for the run with no mutant after the
-   * reruns) and `mutant` the active mutant; its `message`, if any, fails it.
-   * The gate mutates `pattern`, by default one line of the bite's target.
+   * A gate run with a stand-in for vitest: the run with no mutant passes and
+   * every mutant's test times out. Each run first runs `code`, the stand-in's
+   * own JavaScript, with `file` its report's path, `pass` its pass's dir name
+   * (`control-a2` for the run with no mutant after the reruns) and `mutant`
+   * the active mutant; its `message`, if any, fails it. The gate mutates each
+   * of `patterns` (whole files or line ranges), by default one line of the
+   * bite's target.
    */
   function standInRun(code: string, patterns?: string[]) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-control-'));
@@ -206,9 +207,9 @@ describe('the touched-line mutation gate', () => {
     for (const old of fs.readdirSync(src).filter(name => /^smdb-bite-(directive|other)-/.test(name))) fs.rmSync(path.join(src, old), { force: true });
     for (const old of fs.readdirSync(ignored).filter(name => name.startsWith('smdb-bite-reader-'))) fs.rmSync(path.join(ignored, old), { force: true });
     const probe = `src/smdb-bite-directive-${process.pid}.ts`;
-    // A second file the job changed: the run with no checker must take its related tests too, as pass A does.
+    // A second file the job changed, with no mutant of its own: every run must take its related tests too, as pass A does.
     const other = `src/smdb-bite-other-${process.pid}.ts`;
-    fs.writeFileSync(path.join(root, other), 'export function smdbOther(n: number): number {\n  return n + 1;\n}\n');
+    fs.writeFileSync(path.join(root, other), 'export type SmdbOther = number;\n');
     const reader = path.join(ignored, `smdb-bite-reader-${process.pid}.ts`);
     fs.writeFileSync(path.join(root, probe), [
       'export const SMDB_PROBE = { retries: 3 };',
@@ -221,12 +222,14 @@ describe('the touched-line mutation gate', () => {
     // A module cloned into the git-ignored src/bot/modulesDev that reads the probe: no sandbox holds it.
     fs.writeFileSync(reader, `import { SMDB_PROBE } from '../../smdb-bite-directive-${process.pid}';\nexport const smdbRetries: number = SMDB_PROBE.retries;\n`);
     try {
-      // Pass A with no checker, and every rerun alone, fail only on the machine's texts; pass A with no checker fails
-      // outright (its run with no mutant too) unless vitest is given the other file as well.
+      // Pass A with no checker, and every rerun alone, fail only on the machine's texts; any run (its run with no
+      // mutant too) fails outright unless vitest is given the other file as well.
       const { run, mutants } = standInRun([
         `if (mutant && (pass === 'a-unchecked' || pass === 'a2')) message = "Error: EBUSY: resource busy or locked, rmdir 'x'";`,
-        "if (pass === 'a-unchecked' && !process.argv.some(arg => arg.includes('smdb-bite-other-'))) message = \"Error: the run with no checker lacks pass A's files\";",
+        "if (!process.argv.some(arg => arg.includes('smdb-bite-other-'))) message = \"Error: the run lacks the change's files\";",
       ].join('\n'), [probe, other]);
+      expect(run.stdout).toContain(`\nPatterns that made no mutant:\n  ${other}`);
+      expect(run.stdout).toMatch(/^Runs with no mutant after the reruns:\n {2}after pass a2: passed/m);
       expect(run.stdout).not.toMatch(/^Stopped:/m);
       // Emptying the object is a type error only in the ignored file, so it meets the tests (the stand-in times them
       // out), and its rerun alone counts the failure, whatever it says.

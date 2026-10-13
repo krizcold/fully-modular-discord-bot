@@ -71,12 +71,13 @@ does not name by its content.
 - Each changed line widens to the statement it sits in, taken whole even when a block-bodied callback sits inside, so
   every mutant of a changed operator, condition or call exists. Stryker makes a mutant only when one range holds all of
   it. A line wholly inside a body (a callback's included) widens within that body.
-- The headers of compound statements and declarations (an `if`, `for`, `while` or `switch` header, a `catch`, the
-  signature of a function declaration, or of a method, constructor or accessor of a class declaration, a class
-  header) widen to that header only, never to the body. Any other line holding the start or end of a callback or a
-  body (a route's `router.get('/x', async (req, res) => {`, a `});`, a property whose value is an arrow with a body, a
-  method of an object or of a class expression, a `case x: {` block, which takes its clause) takes its whole statement:
-  the body runs as context, and its emptying, which touches the line, gates.
+- The headers of compound statements and declarations (an `if`, `for`, `while` or `switch` header, a `catch`, a
+  `case` or `default` label, the signature of a function declaration, or of a method, constructor or accessor of a
+  class declaration, a class header) widen to that header only, never to the body: a case clause's statements are its
+  body, braces or not. Any other line holding the start or end of a callback or a body (a route's
+  `router.get('/x', async (req, res) => {`, a `});`, a property whose value is an arrow with a body, a method of an
+  object or of a class expression) takes its whole statement: the body runs as context, and its emptying, which
+  touches the line, gates.
 - **Gating** mutants touch a changed line. Some that touch one are not made: one that touches it only through a block
   holding the line (the emptying of that block, or the whole callback around it), the emptying of the body of a
   compound statement or declaration (above), or of a bare block, that only begins or ends on the changed line: its
@@ -84,7 +85,9 @@ does not name by its content.
   loop: it is made only where one range holds the whole loop (a loop on one line, one whose every line changed, one
   inside a statement taken whole), and then gates as any mutant does. A reviewer checks a changed header of a longer
   loop: the no-mutant list below names it when it has no mutant of its own, and the structure list when it holds the
-  body's `{`; one with a mutant of its own (`for (let i = 0; ; i++)`) and no `{` is named in neither. A block wholly made of
+  body's `{`; one with a mutant of its own (`for (let i = 0; ; i++)`) and no `{` is named in neither. The emptying of
+  a case clause on more than one line is not made either: it spans the clause's body. A changed label is in the
+  structure list, and in the no-mutant list too when its value has no mutant of its own (`case 1:`). A block wholly made of
   changed lines is made, and so is every other body's emptying. unit/mutationRanges.test.ts holds this rule to
   Stryker's own instrumenter, line by line, both what is made and what is not, on made-up shapes and on two real files.
 - The other mutants in the widened ranges are **context**: they run in pass A and are listed, but never fail the gate.
@@ -121,7 +124,8 @@ does not name by its content.
   with nothing changed); and it names one that is gone as
   deleted, unless skip-worktree left it out (a sparse checkout).
 - Not mutated, and named in the report with the reason: files outside src (the root scripts, updaters/, tests, docs and
-  images), files that are not code, `.d.ts` files, the browser views under src/webui/public (copied into dist, never
+  images), files that are not code (code is `.ts`, `.tsx`, `.mts`, `.cts`, `.js`, `.cjs` and `.mjs`), declaration files
+  (`.d.ts`, `.d.mts`, `.d.cts`), the browser views under src/webui/public (copied into dist, never
   compiled, and no test loads them yet), a file deleted or moved out of src, an untracked git repository (git lists
   none of its files, and none is copied into a sandbox) or a git submodule under src, a file whose name Stryker would read as a glob (`[id].ts`,
   `a{1,2}.ts`; rename it), a file in src that is a link to one that is not mutated (the suite's own env scrub, say),
@@ -168,13 +172,15 @@ does not name by its content.
    so when the checker would judge a file outside the tree, packages under node_modules aside, the gate stops before
    pass A with NO RESULT and names it (ranges.mjs beyondTree): a mutant that broke only that file would count as killed
    with no test run. A gating mutant whose only type error is an unused `@ts-expect-error` (TS2578) type-checks, so it
-   meets pass A's tests again with no checker (`a-unchecked/`, `vitest related` on all of pass A's files), and that run
-   is its pass A: from there it goes on like any other mutant. Each mutant run is `vitest related <mutated files>` on the fast tier with one worker, so only
-   tests that import them run. There is no coverage analysis: every mutant runs those tests. The files go on vitest's
+   meets pass A's tests again with no checker (`a-unchecked/`), and that run is its pass A: from there it goes on like
+   any other mutant. Each mutant run is `vitest related <changed files>` on the fast tier with one worker: every pass
+   and rerun, and each run with no mutant, takes every file the change touched, so only tests that import one of them,
+   directly or through other files, run (a test that reaches them by no import vitest can see, such as a computed
+   require, a file read or a child process, does not). There is no coverage analysis: every mutant runs those tests. The files go on vitest's
    command line relative to test/; a change of many hundreds of files can pass Windows' limit on a command line, and
    then the run's log says vitest could not start.
 2. **Pass B, the rest, on pass A's gating survivors only.** The sandbox's dist is built from the instrumented src
-   (build.cjs), then each survivor runs `vitest related` on the integration tier and then the whole child tier, whose
+   (build.cjs), then each survivor runs `vitest related <changed files>` on the integration tier and then the whole child tier, whose
    scenarios start real processes on that dist. A child sees the mutant through the env. Stryker makes every mutant a
    span holds, so a survivor that spans lines brings in the mutants nested inside it; in pass B and every rerun those
    run no test (targets.mjs gives the runner the ids the pass is for) and their results are dropped.
@@ -182,9 +188,7 @@ does not name by its content.
    limit for each test and hook, and a child scenario step's default bound, four times their time (a limit a test,
    hook or step sets itself is not scaled), and Stryker a larger budget for the whole run.
    - A gating mutant that timed out in pass A, or whose run there failed only on the machine's texts (below), reruns
-     with the fast tests that import the files of the mutants rerun, directly or through other files (`vitest related`;
-     a test that reaches them by no import vitest can see, such as a computed require, a file read or a child process,
-     does not run again). It counts as killed when the rerun fails a test, whatever the failure says, or times out when run alone: a test or its beforeEach or afterEach hook past four times its limit, or past its own limit when it sets one (a beforeAll or
+     with pass A's fast tests. It counts as killed when the rerun fails a test, whatever the failure says, or times out when run alone: a test or its beforeEach or afterEach hook past four times its limit, or past its own limit when it sets one (a beforeAll or
      afterAll hook's timeout is inconclusive, below), or the whole run past Stryker's budget for
      it, which is four times what those tests take with no mutant, plus a minute. That budget fires first whenever
      those tests take under 15 seconds, so a mutant that only slows several tests, each within its own limit, by that

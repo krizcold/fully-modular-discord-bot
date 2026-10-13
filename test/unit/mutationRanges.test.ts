@@ -12,7 +12,7 @@ import { describe, expect, it, onTestFinished } from 'vitest';
 import { runScenario } from '../helpers/child';
 import { canonicalName } from '../mutation/keys.mjs';
 import {
-  changeTarget, codeLines, commonLines, gates, inPattern, lineDiff, linesOfTarget, mergeRanges, notMutated, parseNameStatus, planChange, planFromGit,
+  changeTarget, CODE, codeLines, commonLines, gates, inPattern, lineDiff, linesOfTarget, mergeRanges, notMutated, parseNameStatus, planChange, planFromGit,
   unmatchedPatterns, untouched, wholeTarget, structureLines, DATA_ROUTE_WHY, GLOB_NAME_WHY, beyondTree, holdsDataRoute, rootGlobFree, sandboxPatterns, strykerTakes,
   treeTsconfig,
 } from '../mutation/ranges.mjs';
@@ -120,7 +120,30 @@ const SHAPES: Record<string, string> = {
     '  }',
     '}',
   ].join('\n'),
-  bodiesTakenWhole: [
+  // Clauses with no braces whose statements open bodies of their own: each line widens within the clause.
+  bracelessClauses: [
+    'export async function step(n: number, ready: () => Promise<boolean>, log: string[]): Promise<number> {',
+    '  switch (n) {',
+    '    case 1:',
+    '      if (n > 0) {',
+    "        log.push('one');",
+    '      }',
+    '      return 1;',
+    "    case 2: log.push('two');",
+    '      try {',
+    "        log.push('again');",
+    '      } catch {',
+    '        return -2;',
+    '      }',
+    '      return 2;',
+    '    default:',
+    '      for (let i = 0; ; i++) {',
+    '        if (await ready()) return i;',
+    '      }',
+    '  }',
+    '}',
+  ].join('\n'),
+  clauseBlocksAndMethods: [
     'export function pick(n: number, log: string[]): number {',
     '  switch (n) {',
     '    case 1: {',
@@ -594,7 +617,7 @@ describe('the change', () => {
     const ROUTES = ['/data/delete', '/data/delete-guild', '/data/get', '/data/update'];
     const found = new Map<string, string>();
     const listed = execFileSync('git', ['-c', 'core.quotePath=false', 'ls-files', '-z', '--cached', '--others', '--exclude-standard', 'src'], { cwd: botRoot, encoding: 'utf8' })
-      .split('\0').filter(file => /\.(ts|tsx|js|jsx|mjs|cjs)$/.test(file) && fs.existsSync(path.join(botRoot, file)));
+      .split('\0').filter(file => CODE.test(file) && fs.existsSync(path.join(botRoot, file)));
     for (const file of listed) {
       const text = fs.readFileSync(path.join(botRoot, file), 'utf8');
       if (holdsDataRoute(file, text)) continue;
@@ -852,9 +875,10 @@ describe('the widening', () => {
 // changed `if (...) {`, signature or closing brace: making it would bring in
 // the whole body), and the false condition of a for with no condition that
 // spans more than one line, which spans the loop (a one-line loop's is made,
-// and so is one whose every line changed, below). Every other body's emptying
-// is made (a callback's, a case clause's block, a method of an object or a
-// class expression), and what is not made is checked not to be.
+// and so is one whose every line changed, below), and the emptying of a case
+// clause on more than one line (its label is a header, its statements a body,
+// braces or not). Every other body's emptying is made (a callback's, a method
+// of an object or a class expression), and what is not made is checked not to be.
 describe('the widening, against what Stryker makes', () => {
   const quiet = () => {};
   const logger = { debug: quiet, info: quiet, warn: quiet, error: quiet, trace: quiet, fatal: quiet, isDebugEnabled: () => false, isTraceEnabled: () => false, isInfoEnabled: () => false, isWarnEnabled: () => false, isErrorEnabled: () => false, isFatalEnabled: () => false };
@@ -879,22 +903,24 @@ describe('the widening, against what Stryker makes', () => {
       const sf = ts.createSourceFile('a.ts', text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
       const at = (p: { line: number; column: number }) => sf.getPositionOfLineAndCharacter(p.line, p.column);
       const blocks: { start: number; end: number }[] = [];
-      // The bodies of compound statements and declarations, and bare blocks: never a callback's body, a case
-      // clause's block, or the body of a method or accessor of an object or a class expression, each taken whole.
+      // The bodies of compound statements and declarations (a case clause's block included), and bare blocks: never
+      // a callback's body, or the body of a method or accessor of an object or a class expression, each taken whole.
       const bodies = new Set<string>();
       // Each for with no condition on more than one line: its false condition spans the loop, so one changed line
       // does not make it (a one-line loop's is made, and the filter below keeps those out).
       const loops = new Set<string>();
+      // Each case or default clause on more than one line: its emptying spans its body.
+      const clauses = new Set<string>();
       const inExpression = (node: ts.Node) => (ts.isMethodDeclaration(node) || ts.isGetAccessor(node) || ts.isSetAccessor(node) || ts.isConstructorDeclaration(node))
         && (ts.isObjectLiteralExpression(node.parent) || ts.isClassExpression(node.parent));
       const walk = (node: ts.Node) => {
         if (ts.isBlock(node) || ts.isModuleBlock(node) || ts.isCaseBlock(node)) blocks.push({ start: node.getStart(sf), end: node.getEnd() });
-        if (ts.isBlock(node) && !ts.isArrowFunction(node.parent) && !ts.isFunctionExpression(node.parent) && !ts.isCaseClause(node.parent)
-          && !ts.isDefaultClause(node.parent) && !inExpression(node.parent)) {
+        if (ts.isBlock(node) && !ts.isArrowFunction(node.parent) && !ts.isFunctionExpression(node.parent) && !inExpression(node.parent)) {
           bodies.add(`${node.getStart(sf)}-${node.getEnd()}`);
         }
         const lineAt = (pos: number) => sf.getLineAndCharacterOfPosition(pos).line;
         if (ts.isForStatement(node) && !node.condition && lineAt(node.getStart(sf)) < lineAt(node.getEnd())) loops.add(`${node.getStart(sf)}-${node.getEnd()}`);
+        if ((ts.isCaseClause(node) || ts.isDefaultClause(node)) && lineAt(node.getStart(sf)) < lineAt(node.getEnd())) clauses.add(`${node.getStart(sf)}-${node.getEnd()}`);
         ts.forEachChild(node, walk);
       };
       walk(sf);
@@ -909,9 +935,9 @@ describe('the widening, against what Stryker makes', () => {
         const throughBlock = (m: Made) => blocks.some(b => at(m.location.start) <= b.start && b.end <= at(m.location.end) && b.start < span.start && span.end < b.end);
         const spanOf = (m: Made) => `${at(m.location.start)}-${at(m.location.end)}`;
         const braceOnly = (m: Made) => m.mutatorName === 'BlockStatement' && m.location.start.line < m.location.end.line && bodies.has(spanOf(m));
-        const loopCondition = (m: Made) => m.mutatorName === 'ConditionalExpression' && loops.has(spanOf(m));
+        const spansBody = (m: Made) => m.mutatorName === 'ConditionalExpression' && (loops.has(spanOf(m)) || clauses.has(spanOf(m)));
         const touching = whole.filter(m => m.location.start.line + 1 <= n && n <= m.location.end.line + 1 && !throughBlock(m));
-        const expected = touching.filter(m => !braceOnly(m) && !loopCondition(m));
+        const expected = touching.filter(m => !braceOnly(m) && !spansBody(m));
         const ranges = rangesOf(text, [n]) ?? [];
         const mutate = ranges.map(([s, e]) => ({ start: { line: s - 1, column: 0 }, end: { line: e - 1, column: Number.MAX_SAFE_INTEGER } }));
         const here = await made(text, mutate);
@@ -919,7 +945,7 @@ describe('the widening, against what Stryker makes', () => {
         const missing = expected.filter(m => !got.has(key(m))).map(m => `${m.mutatorName} ${key(m)}`);
         expect(missing, `${name} line ${n}: ${code.trim()}`).toEqual([]);
         // And what the README says is not made, is not.
-        const unmade = touching.filter(m => (braceOnly(m) || loopCondition(m)) && got.has(key(m))).map(m => `${m.mutatorName} ${key(m)}`);
+        const unmade = touching.filter(m => (braceOnly(m) || spansBody(m)) && got.has(key(m))).map(m => `${m.mutatorName} ${key(m)}`);
         expect(unmade, `${name} line ${n}: ${code.trim()}`).toEqual([]);
         const through = whole.filter(m => m.location.start.line + 1 <= n && n <= m.location.end.line + 1 && throughBlock(m) && got.has(key(m)));
         expect(through.map(m => `${m.mutatorName} ${key(m)}`), `${name} line ${n}: ${code.trim()}`).toEqual([]);
@@ -1077,6 +1103,10 @@ describe('the targets', () => {
     expect(plan.skipped.find(s => s.file === 'tools/mod/')?.why).toBe('outside src');
     expect(plan.targets).toEqual([wholeTarget('src/new.ts')]);
     expect(notMutated('test/x.ts')).toBe('outside src');
+    // A TypeScript module named for its output's format is code, its declarations are not, and it is read as TypeScript.
+    for (const file of ['src/a.mts', 'src/a.cts', 'src/a.tsx']) expect(notMutated(file), file).toBeNull();
+    for (const file of ['src/a.d.mts', 'src/a.d.cts', 'src/a.d.ts']) expect(notMutated(file), file).toBe('not code');
+    for (const file of ['src/a.mts', 'src/a.cts']) expect(holdsDataRoute(file, "export const root = <string>(process.env.ROOT || '/data');"), file).toBe(true);
   });
 
   it('takes a file new to the mutated code whole, and names one moved out of it', () => {

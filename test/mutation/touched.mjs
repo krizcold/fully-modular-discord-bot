@@ -158,6 +158,9 @@ const reportDir = path.join(root, 'test', 'mutation', 'reports', `${stamp}-${pro
 
 /** @type {PassTarget[]} */
 let targets = [];
+// Every run, each pass and rerun and each run with no mutant, takes the tests
+// related to every file the change touched, as pass A does.
+const changedFiles = () => [...new Set(targets.map(target => target.file))];
 /** @type {{ file: string, why: string }[]} */
 let skipped = [];
 let scope = opts.mutate.length > 0 ? `the patterns ${opts.mutate.join(' ')}` : `the change from ${opts.base} to the working tree`;
@@ -252,19 +255,20 @@ const common = {
 
 /**
  * Runs one Stryker pass. `tier` picks the tests (runner.mjs): a for the fast
- * tier, b for the integration and child tiers; `only`, when given, names the
- * test files to run instead. The reruns alone, a2 and b2, get four times the
- * config's time limits. `keys`, when given, are the mutants the pass is for: Stryker makes every
- * mutant its spans hold, and the others run no test (targets.mjs).
- * @param {{ name: PassName, dir: string, tier: 'a' | 'b', mutate: string[], files: string[], only?: string[], keys?: string[], extra: Options }} run
+ * tier, b for the integration and child tiers, each the tests related to every
+ * file the change touched; `only`, when given, names the test files to run
+ * instead. The reruns alone, a2 and b2, get four times the config's time
+ * limits. `keys`, when given, are the mutants the pass is for: Stryker makes
+ * every mutant its spans hold, and the others run no test (targets.mjs).
+ * @param {{ name: PassName, dir: string, tier: 'a' | 'b', mutate: string[], only?: string[], keys?: string[], extra: Options }} run
  * @returns {Promise<StrykerResult[]>}
  */
-async function pass({ name, dir, tier, mutate, files, only = [], keys, extra }) {
+async function pass({ name, dir, tier, mutate, only = [], keys, extra }) {
   const out = path.join(reportDir, dir);
   fs.mkdirSync(out, { recursive: true });
   process.env.SMDB_MUTATION_PASS = tier;
   process.env.SMDB_MUTATION_CONFIRM = name === 'a2' || name === 'b2' ? '1' : '';
-  process.env.SMDB_MUTATION_FILES = JSON.stringify(files);
+  process.env.SMDB_MUTATION_FILES = JSON.stringify(changedFiles());
   process.env.SMDB_MUTATION_ONLY = JSON.stringify(only);
   process.env.SMDB_MUTATION_OUT = out;
   process.env.SMDB_MUTATION_TARGETS = keys ? path.join(out, 'targets.json') : '';
@@ -302,7 +306,7 @@ async function control(after, tier, on, only, timed = false) {
   const out = path.join(reportDir, name);
   fs.mkdirSync(out, { recursive: true });
   console.log(`L5: the same tests once with no mutant, to check the machine after pass ${after}`);
-  const run = await runControl({ root, out, tier, files: [...new Set(on.map(m => m.file))], only });
+  const run = await runControl({ root, out, tier, files: changedFiles(), only });
   const logs = `${posix(path.relative(root, out))}/dry-*.log`;
   const failed = !run.passed ? run.why : timed ? pastBudget(path.join(reportDir, after), out, PASSES.a2) : '';
   if (failed) {
@@ -340,11 +344,10 @@ const credited = m => ['Killed', 'Timeout'].includes(outcome(m));
  * @param {'a' | 'b'} tier
  * @param {MutantRecord[]} on
  * @param {Options} extra
- * @param {{ only?: string[], files?: string[] }} [run] the test files to run instead, and the files whose related
- *   tests run (the mutants' own by default)
+ * @param {string[]} [only]
  */
-async function passOn(name, dir, tier, on, extra, { only, files = [...new Set(on.map(m => m.file))] } = {}) {
-  const results = await pass({ name, dir, tier, mutate: [...new Set(on.map(spanOf))], files, only, keys: on.map(recordKey), extra });
+async function passOn(name, dir, tier, on, extra, only) {
+  const results = await pass({ name, dir, tier, mutate: [...new Set(on.map(spanOf))], only, keys: on.map(recordKey), extra });
   const byKey = new Map(results.map(r => [resultKey(r), r]));
   for (const m of on) {
     const r = byKey.get(recordKey(m));
@@ -421,8 +424,7 @@ try {
   if (targets.length === 0) await finish();
 
 
-  const files = [...new Set(targets.map(target => target.file))];
-  console.log(`L5: mutating ${scope}: ${files.length} file(s), pass A (in-process tests that import them)`);
+  console.log(`L5: mutating ${scope}: ${changedFiles().length} file(s), pass A (in-process tests that import them)`);
   // The type checker judges the tree's files only (ranges.mjs treeTsconfig, beyondTree).
   const checkerConfig = `.stryker-tmp/tsconfig.l5-${process.pid}.json`;
   const checker = treeTsconfig(root, planned.keys(), '.stryker-tmp');
@@ -431,7 +433,7 @@ try {
     throw new PassError(`the type checker would judge ${beyond.join(', ')}, which a file in the tree imports or references but no sandbox holds, so a mutant that broke only it would count as killed with no test run`);
   }
   fs.writeFileSync(path.join(root, checkerConfig), `${JSON.stringify(checker, null, 2)}\n`);
-  const resultsA = await pass({ name: 'a', dir: 'a', tier: 'a', mutate: targets.flatMap(t => t.patterns), files, extra: { ...PASSES.a, concurrency: opts.concurrency, tsconfigFile: checkerConfig } })
+  const resultsA = await pass({ name: 'a', dir: 'a', tier: 'a', mutate: targets.flatMap(t => t.patterns), extra: { ...PASSES.a, concurrency: opts.concurrency, tsconfigFile: checkerConfig } })
     .finally(() => fs.rmSync(path.join(root, checkerConfig), { force: true }));
   const orphans = [...new Set(resultsA.map(fileOf).filter(file => !targets.some(t => t.file === file)))];
   if (orphans.length > 0) throw new PassError(`Stryker mutated ${orphans.join(', ')}, which no target names, so the report could not answer for it`);
@@ -449,11 +451,11 @@ try {
     };
   });
 
-  // Their run with no checker, on pass A's files, is their pass A, and they go on from it like any other.
+  // Their run with no checker is their pass A, and they go on from it like any other.
   const unchecked = toUncheck(mutants);
   if (unchecked.length > 0) {
     console.log(`L5: pass A again, with no type checker, on ${unchecked.length} mutant(s) whose only type error is an unused @ts-expect-error`);
-    await passOn('a', 'a-unchecked', 'a', unchecked, { ...PASSES.a, checkers: [], concurrency: opts.concurrency }, { files });
+    await passOn('a', 'a-unchecked', 'a', unchecked, { ...PASSES.a, checkers: [], concurrency: opts.concurrency });
   }
 
   const confirmA = toConfirm(mutants, 'a');
@@ -465,7 +467,7 @@ try {
 
   const forB = toPassB(mutants);
   if (forB.length > 0) {
-    console.log(`L5: pass B (integration tests that import them, then every child scenario) on ${forB.length} survivor(s)`);
+    console.log(`L5: pass B (integration tests that import the changed files, then every child scenario) on ${forB.length} survivor(s)`);
     await passOn('b', 'b', 'b', forB, { ...PASSES.b, concurrency: Math.max(1, Math.floor(opts.concurrency / 2)) });
     const confirmB = toConfirm(mutants, 'b');
     const killers = byKiller(confirmB);
@@ -473,7 +475,7 @@ try {
     for (const [killer, on] of killers) {
       group += 1;
       console.log(`L5: pass B again, one at a time, on ${on.length} mutant(s) whose run failed in ${killer}, with that file alone; a failure counts only if it repeats`);
-      await passOn('b2', `b2-${group}`, 'b', on, PASSES.b2, { only: [killer] });
+      await passOn('b2', `b2-${group}`, 'b', on, PASSES.b2, [killer]);
     }
     if (confirmB.some(credited)) await control('b2', 'b', confirmB, [...killers.keys()]);
   }

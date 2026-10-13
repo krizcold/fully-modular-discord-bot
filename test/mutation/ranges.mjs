@@ -22,8 +22,9 @@ const { Minimatch, minimatch, escape } = strykerRequire('minimatch');
  * @typedef {{ start: { line: number, column: number }, end: { line: number, column: number } }} Location
  */
 
-const CODE = /\.(ts|tsx|js|cjs|mjs)$/;
-const DECLARATION = /\.d\.ts$/;
+// The code the gate mutates, by name (the suite's scans of src read the same).
+export const CODE = /\.(ts|tsx|mts|cts|js|cjs|mjs)$/;
+const DECLARATION = /\.d\.[cm]?ts$/;
 const VIEWS = 'src/webui/public/';
 
 /**
@@ -268,30 +269,32 @@ export function mergeRanges(ranges) {
 // Statement lists in braces: a line wholly inside one widens by the statements in it.
 const CONTAINERS = new Set([ts.SyntaxKind.Block, ts.SyntaxKind.ModuleBlock, ts.SyntaxKind.CaseBlock]);
 // Statements and declarations whose parts (a condition, the parameters, a
-// catch variable) widen apart from the bodies they hold.
+// catch variable, a case label) widen apart from the bodies they hold: a case
+// clause's statements are its body, braces or not.
 const COMPOUND = new Set([
   ts.SyntaxKind.IfStatement, ts.SyntaxKind.DoStatement, ts.SyntaxKind.WhileStatement, ts.SyntaxKind.ForStatement,
   ts.SyntaxKind.ForInStatement, ts.SyntaxKind.ForOfStatement, ts.SyntaxKind.SwitchStatement, ts.SyntaxKind.TryStatement,
-  ts.SyntaxKind.CatchClause, ts.SyntaxKind.LabeledStatement, ts.SyntaxKind.WithStatement, ts.SyntaxKind.FunctionDeclaration,
+  ts.SyntaxKind.CatchClause, ts.SyntaxKind.CaseClause, ts.SyntaxKind.DefaultClause, ts.SyntaxKind.LabeledStatement, ts.SyntaxKind.WithStatement, ts.SyntaxKind.FunctionDeclaration,
   ts.SyntaxKind.ClassDeclaration, ts.SyntaxKind.MethodDeclaration, ts.SyntaxKind.Constructor, ts.SyntaxKind.GetAccessor,
   ts.SyntaxKind.SetAccessor, ts.SyntaxKind.ModuleDeclaration, ts.SyntaxKind.ClassStaticBlockDeclaration,
 ]);
 
 /**
+ * A file read as its name says (TypeScript's own reading of .ts, .tsx, .mts,
+ * .cts, .js, .cjs and .mjs).
  * @param {string} file
  * @param {string} text
  */
 function parse(file, text) {
-  const kind = file.endsWith('.tsx') ? ts.ScriptKind.TSX : file.endsWith('.ts') ? ts.ScriptKind.TS : ts.ScriptKind.JS;
-  return ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true, kind);
+  return ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true);
 }
 
 /**
  * The spans one line widens to: the statement it sits in, taken whole even
  * when a block-bodied callback sits inside it, so every mutant of a changed
  * operator, condition or call exists. The header of a compound statement or
- * declaration (a condition, a signature, a catch) widens to that header only,
- * never to its body; any other line holding a callback's start or end (a
+ * declaration (a condition, a signature, a catch, a case label) widens to that
+ * header only, never to its body; any other line holding a callback's start or end (a
  * route's header, a `});`) takes its whole statement, the callback's body
  * included. A line wholly inside a body widens within that body.
  * @param {ts.SourceFile} sf
