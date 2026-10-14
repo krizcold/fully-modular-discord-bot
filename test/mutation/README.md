@@ -147,9 +147,11 @@ does not name by its content.
   (`.d.ts`, `.d.mts`, `.d.cts`), the browser views under src/webui/public (copied into dist, never
   compiled, and no test loads them yet), a file deleted or moved out of src, an untracked git repository (git lists
   none of its files, and none is copied into a sandbox) or a git submodule under src, a file whose name Stryker would read as a glob (`[id].ts`,
-  `a{1,2}.ts`; rename it), a name that leads through a link (a link in src, a file under a junction, one out of the
-  bot root: Stryker's copy does not follow a link, so a file is mutated under its own name only, when git lists it
-  changed; `--mutate` takes the file a link leads to under its own name, and refuses one out of the bot root),
+  `a{1,2}.ts`; rename it), a name that leads through a link, as the disk tells it (a link in src, one that differs
+  from its file only in case included, a file under a junction, one out of the bot root: a file is mutated under its
+  own name only, when git lists it changed, for Stryker's copy does not follow a link to a directory, and a copy made
+  through a link to a file is not the file the tests import; `--mutate` takes the file a link leads to under its own
+  name when the tree lists it so, and refuses one it does not, such as one out of the bot root),
   a change that leaves no code changed (a rename git sees, a mode change, line endings only, only blank lines or
   comments, a file only taken out of the index), and a
   file that holds a line break Stryker counts and the gate does not (a lone CR, U+2028 or U+2029), whose lines the two

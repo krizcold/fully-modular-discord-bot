@@ -233,10 +233,12 @@ describe('the tree fingerprint', () => {
     expect(gate).toContain('const results = await pass({ dir, tier, mutate: [...new Set(on.map(spanOf))],');
     // ... handed the very mutants the reruns ran on.
     expect(gate).toContain("await passOn('a2', 'a2', 'a', confirmA, PASSES.a2);");
-    expect(gate).toContain("await control('a2', 'a', confirmA, [], confirmA.some(m => outcome(m) === 'Timeout'));");
+    expect(gate).toContain("if (confirmA.some(credited)) await control('a2', 'a', confirmA, [], confirmA.some(m => outcome(m) === 'Timeout'));");
     expect(gate).toContain('for (const [killer, on] of killers) {');
     expect(gate).toContain("const killers = byKiller(confirmB);");
-    expect(gate).toContain("await control('b2', 'b', confirmB, [...killers.keys()]);");
+    expect(gate).toContain("if (confirmB.some(credited)) await control('b2', 'b', confirmB, [...killers.keys()]);");
+    // ... and mutated with --mutate only where the tree lists a file under its own name.
+    expect(gate).toContain('inTree ??= ownNames(root, planned.keys());');
     const guard = gate.indexOf('if (!targets.some(canGate)) await finish();');
     expect(guard).toBeGreaterThan(0);
     expect(guard).toBeLessThan(gate.indexOf("await pass({ dir: 'a'"));

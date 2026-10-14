@@ -54,8 +54,8 @@ try {
   process.exit(2);
 }
 const {
-  structureLines, DATA_ROUTE_WHY, EXTRA_BREAK_WHY, GLOB_NAME_WHY, beyondTree, gatesIn, holdsDataRoute, holdsExtraBreak, linesOfTarget, mutatePatterns, notMutated,
-  planFromGit, rootGlobFree, sandboxPatterns, strykerTakes, treeTsconfig, unmatchedPatterns, untouched,
+  structureLines, DATA_ROUTE_WHY, EXTRA_BREAK_WHY, GLOB_NAME_WHY, beyondTree, gatesIn, holdsDataRoute, holdsExtraBreak, linesOfTarget, mutatePatterns,
+  notMutated, ownNames, planFromGit, rootGlobFree, sandboxPatterns, strykerTakes, treeTsconfig, unmatchedPatterns, untouched,
 } = ranges;
 const { byKiller, classifyKill, judge, onlyUnusedDirective, outcome, toConfirm, toPassB, toUncheck } = verdicts;
 
@@ -131,7 +131,7 @@ opts.mutate = opts.mutate.map(pattern => {
     process.exit(2);
   }
   const text = fs.readFileSync(path.join(root, name), 'utf8');
-  inTree ??= new Set([...planned.keys()].map(file => canonicalName(root, file)).filter(file => file !== null));
+  inTree ??= ownNames(root, planned.keys());
   const why = !strykerTakes(root, name) ? GLOB_NAME_WHY : holdsExtraBreak(text) ? EXTRA_BREAK_WHY : holdsDataRoute(name, text) ? DATA_ROUTE_WHY : notMutated(name)
     ?? (inTree.has(name) ? null : 'git neither tracks it nor would add it (it is ignored, or inside a submodule or an untracked repository), so no sandbox holds it');
   if (why) {

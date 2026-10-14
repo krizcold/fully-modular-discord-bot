@@ -14,7 +14,7 @@ import { canonicalName } from '../mutation/keys.mjs';
 import {
   changeTarget, CODE, codeLines, commonLines, gates, gatesIn, inPattern, lineDiff, linesOfTarget, mergeRanges, mutatePatterns, notMutated, parseNameStatus,
   planChange, planFromGit, unmatchedPatterns, untouched, wholeTarget, structureLines, DATA_ROUTE_WHY, GLOB_NAME_WHY, beyondTree, holdsDataRoute, rootGlobFree,
-  sandboxPatterns, strykerTakes, tokenLines, treeTsconfig, NO_CODE_WHY,
+  sandboxPatterns, strykerTakes, tokenLines, treeTsconfig, NO_CODE_WHY, linkOf, ownNames,
 } from '../mutation/ranges.mjs';
 import { treeChanges, treePrint } from '../mutation/tree.mjs';
 
@@ -562,23 +562,26 @@ describe('the change', () => {
     }
   });
 
-  it('names, and never mutates, a file listed under a name that leads through a link, out of the bot root too', () => {
-    const disk: Record<string, string> = { 'src/env.ts': 'test/helpers/env.ts', 'src/config.ts': 'test/vitest.config.ts', 'src/old/x.ts': 'src/real/x.ts', 'src/real/X.ts': 'src/real/x.ts' };
+  it('names, and never mutates, a file listed under a name that leads through a link, as the disk tells it', () => {
+    const links: Record<string, string | null> = { 'src/env.ts': 'test/helpers/env.ts', 'src/config.ts': 'test/vitest.config.ts', 'src/old/x.ts': 'src/real/x.ts', 'src/A.ts': 'src/a.ts', 'src/out/y.ts': null };
     const plan = planChange({
-      entries: [{ status: 'A', file: 'src/env.ts' }, { status: 'M', file: 'src/old/x.ts' }, { status: 'M', file: 'src/real/X.ts' }],
+      entries: [{ status: 'A', file: 'src/env.ts' }, { status: 'M', file: 'src/old/x.ts' }, { status: 'M', file: 'src/real/X.ts' }, { status: 'M', file: 'src/A.ts' }],
       untracked: ['src/config.ts', 'src/out/y.ts'],
       read: () => 'export const x = 1;\n',
       readBase: () => 'export const x = 0;\n',
-      nameOf: file => disk[file],
+      nameOf: file => (file === 'src/real/X.ts' ? 'src/real/x.ts' : file),
+      linkOf: file => (file in links ? links[file] : undefined),
     });
-    // A name that differs only in case is the file's own (renamed by case outside git).
+    // A file renamed by case outside git keeps its own name; a link that differs from its file only in case is a link.
     expect(plan.targets.map(target => target.file)).toEqual(['src/real/x.ts']);
     const to = (name: string) => `a link to ${name}: a file is mutated under its own name only, when git lists it changed`;
+    const nowhere = 'it leads to no file in the bot root (a link to a directory or out of the root, a broken link, or a file gone since git listed it), so no sandbox holds it';
     expect(plan.skipped).toEqual([
       { file: 'src/env.ts', why: to('test/helpers/env.ts') },
       { file: 'src/old/x.ts', why: to('src/real/x.ts') },
+      { file: 'src/A.ts', why: to('src/a.ts') },
       { file: 'src/config.ts', why: to('test/vitest.config.ts') },
-      { file: 'src/out/y.ts', why: 'it leads to no file in the bot root (a link out of it), so no sandbox holds it' },
+      { file: 'src/out/y.ts', why: nowhere },
     ]);
     // On disk, through git: a link to a dir in the bot root and one to a dir out of it (junctions on Windows, which
     // git walks into; on POSIX git lists each link as a file).
@@ -595,14 +598,28 @@ describe('the change', () => {
     const linked = fromGit();
     expect(linked.targets).toEqual([]);
     if (process.platform === 'win32') {
-      expect(linked.skipped).toEqual([
-        { file: 'src/link/env.ts', why: to('test/helpers/env.ts') },
-        { file: 'src/out/y.ts', why: 'it leads to no file in the bot root (a link out of it), so no sandbox holds it' },
-      ]);
+      expect(linked.skipped).toEqual([{ file: 'src/link/env.ts', why: to('test/helpers/env.ts') }, { file: 'src/out/y.ts', why: nowhere }]);
     } else {
       // On POSIX git lists each link as a file, whose name is not code.
       expect(linked.skipped.map(s => s.file).sort()).toEqual(['src/link', 'src/out']);
     }
+    // The disk decides, through every link on the way.
+    expect(linkOf(repo, 'src/a.ts')).toBeUndefined();
+    expect(linkOf(repo, 'src/link/env.ts')).toBe('test/helpers/env.ts');
+    expect(linkOf(repo, 'src/out/y.ts')).toBeNull();
+    // --mutate's tree holds a file reached only through a link under no name.
+    expect([...ownNames(repo, ['src/a.ts', 'src/link/env.ts', 'src/out/y.ts'])]).toEqual(['src/a.ts']);
+    if (fs.existsSync(path.join(repo, 'src', 'A.ts'))) {
+      // A disk that does not tell case apart: another case of a file's name is the file itself, no link.
+      expect(linkOf(repo, 'src/A.ts')).toBeUndefined();
+    } else {
+      // One that does: a link whose name differs from its file's only in case is a link (where links can be made).
+      let made = true;
+      try { fs.symlinkSync('a.ts', path.join(repo, 'src', 'A.ts')); } catch { made = false; }
+      if (made) expect(linkOf(repo, 'src/A.ts')).toBe('src/a.ts');
+    }
+    // A submodule is a real dir, and a link to one is a link (lstat).
+    expect(fs.readFileSync(path.join(__dirname, '..', 'mutation', 'ranges.mjs'), 'utf8')).toContain('fs.lstatSync(path.join(root, file)).isDirectory()');
   });
 
   it('gates a file that two changed names lead to (names that differ only in case) by either diff, and gives Stryker their ranges merged', () => {

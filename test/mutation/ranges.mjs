@@ -599,16 +599,14 @@ export function mutatePatterns(targets) {
  * (DATA_ROUTE_WHY), a git submodule (`isDir`: git
  * names only its commit), a file whose name Stryker would read as a glob
  * (`nameOf` gives null) and one listed under a name that leads through a link
- * (its name on disk is another, other than by case, or there is none in the
- * bot root, where `nameOf` gives undefined): Stryker's copy does not follow a
- * link, so a file is mutated under its own name only. `nameOf` gives the name a
- * file is mutated under (its name on disk, keys.mjs). emptyScope: nothing in
- * src changed.
+ * (`linkOf`, as ranges.mjs linkOf decides it on the disk: a file is mutated
+ * under its own name only). `nameOf` gives the name a file is mutated under
+ * (its name on disk, keys.mjs). emptyScope: nothing in src changed.
  * @param {{ entries: Entry[], untracked: string[], read: (file: string) => string, readBase: (file: string) => string,
- *   nameOf: (file: string) => string | null | undefined, isDir?: (file: string) => boolean }} change
+ *   nameOf: (file: string) => string | null, linkOf?: (file: string) => string | null | undefined, isDir?: (file: string) => boolean }} change
  * @returns {{ targets: Target[], skipped: { file: string, why: string }[], emptyScope: boolean }}
  */
-export function planChange({ entries, untracked, read, readBase, nameOf, isDir = () => false }) {
+export function planChange({ entries, untracked, read, readBase, nameOf, linkOf: linkedTo = () => undefined, isDir = () => false }) {
   // A file only taken out of the index (git rm --cached) is deleted to git and
   // untracked on disk: it is the base's file still, diffed as a changed one.
   const unindexed = new Set(entries.filter(entry => entry.status === 'D' && untracked.includes(entry.file)).map(entry => entry.file));
@@ -627,9 +625,10 @@ export function planChange({ entries, untracked, read, readBase, nameOf, isDir =
       if (entry.from !== undefined && notMutated(entry.from) === null) skipped.push({ file: entry.from, why: `moved to ${entry.file}: nothing is left to mutate` });
       continue;
     }
+    const link = linkedTo(entry.file);
+    if (link !== undefined) { skipped.push({ file: entry.file, why: linkWhy(link) }); continue; }
     const name = nameOf(entry.file);
     if (name === null) { skipped.push({ file: entry.file, why: GLOB_NAME_WHY }); continue; }
-    if (name === undefined || throughLink(entry.file, name)) { skipped.push({ file: entry.file, why: linkWhy(name) }); continue; }
     const text = read(entry.file);
     if (holdsExtraBreak(text)) { skipped.push({ file: entry.file, why: EXTRA_BREAK_WHY }); continue; }
     if (holdsDataRoute(entry.file, text)) { skipped.push({ file: entry.file, why: DATA_ROUTE_WHY }); continue; }
@@ -645,10 +644,11 @@ export function planChange({ entries, untracked, read, readBase, nameOf, isDir =
       continue;
     }
     const why = notMutated(file);
-    const name = why ? null : nameOf(file);
+    const link = why ? undefined : linkedTo(file);
+    const name = why || link !== undefined ? null : nameOf(file);
     if (why) skipped.push({ file, why });
+    else if (link !== undefined) skipped.push({ file, why: linkWhy(link) });
     else if (name === null) skipped.push({ file, why: GLOB_NAME_WHY });
-    else if (name === undefined || throughLink(file, name)) skipped.push({ file, why: linkWhy(name) });
     else if (holdsExtraBreak(read(file))) skipped.push({ file, why: EXTRA_BREAK_WHY });
     else if (holdsDataRoute(file, read(file))) skipped.push({ file, why: DATA_ROUTE_WHY });
     else targets.push(wholeTarget(name));
@@ -664,21 +664,47 @@ export const NO_CODE_WHY = 'no code changed (a rename, a mode change, line endin
 
 /**
  * Why a file listed under a name that leads through a link is not mutated
- * under it: Stryker's copy does not follow a link, so a file is mutated under
- * its own name only, when git lists it changed.
- * @param {string | undefined} name the name on disk; undefined when there is none in the bot root
+ * under it: a file is mutated under its own name only, when git lists it
+ * changed (Stryker's copy does not follow a link to a directory, and a copy
+ * made through a link to a file is not the file the tests import).
+ * @param {string | null} name the file's own name; null when there is none in the bot root
  */
-const linkWhy = name => (name === undefined
-  ? 'it leads to no file in the bot root (a link out of it), so no sandbox holds it'
+const linkWhy = name => (name === null
+  ? 'it leads to no file in the bot root (a link to a directory or out of the root, a broken link, or a file gone since git listed it), so no sandbox holds it'
   : `a link to ${name}: a file is mutated under its own name only, when git lists it changed`);
 
 /**
- * Whether a listed name leads through a link to its name on disk: another,
- * other than by case (a file renamed by case outside git keeps its own).
+ * Where a listed name leads through a link, decided on the disk: undefined when
+ * no link is on its way (a file renamed by case outside git included), the
+ * file's own name (keys.mjs) when one is, null when it leads to no file in the
+ * bot root. Node's own realpath, unlike the native one, keeps the case it is
+ * given, so only a link changes the name.
+ * @param {string} root
  * @param {string} file
- * @param {string} name
+ * @returns {string | null | undefined}
  */
-const throughLink = (file, name) => name.toLowerCase() !== file.toLowerCase();
+export function linkOf(root, file) {
+  const name = canonicalName(root, file);
+  if (name === null) return null;
+  try {
+    const real = path.relative(fs.realpathSync(root), fs.realpathSync(path.join(root, file))).split(path.sep).join('/');
+    return real === file ? undefined : name;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The files listed under their own names (keys.mjs), as a sandbox holds them:
+ * one reached only through a link is none of them, so `--mutate` refuses it.
+ * @param {string} root
+ * @param {Iterable<string>} files
+ * @returns {Set<string>}
+ */
+export const ownNames = (root, files) => new Set([...files].filter(file => linkOf(root, file) === undefined).flatMap(file => {
+  const name = canonicalName(root, file);
+  return name === null ? [] : [name];
+}));
 
 /**
  * planChange on what git says changed from base to the working tree of the bot
@@ -738,12 +764,14 @@ export function planFromGit({ git: run, base, root, read = file => fs.readFileSy
     untracked: git('ls-files', '-z', '--others', '--exclude-standard').split('\0').filter(Boolean),
     read,
     readBase,
+    // linkOf comes first, so a name here is the file's own.
     nameOf: file => {
       const name = canonicalName(root, file);
-      if (name === null) return undefined;
-      return strykerTakes(root, name) ? name : null;
+      return name !== null && strykerTakes(root, name) ? name : null;
     },
-    isDir: file => { try { return fs.statSync(path.join(root, file)).isDirectory(); } catch { return false; } },
+    linkOf: file => linkOf(root, file),
+    // A submodule is a real dir; a link to one is a link (lstat).
+    isDir: file => { try { return fs.lstatSync(path.join(root, file)).isDirectory(); } catch { return false; } },
   });
 }
 
