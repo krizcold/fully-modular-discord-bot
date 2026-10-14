@@ -48,7 +48,8 @@ export function runScenario<T>(script: string, args: string[], dataDir: string, 
   child.stderr.on('data', chunk => { stderr += chunk; });
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
-      if (child.pid !== undefined) endTree(child.pid);
+      // Only while Node still holds the step: once it exited its pid can be another process's.
+      if (child.pid !== undefined && child.exitCode === null && child.signalCode === null) endTree(child.pid);
       child.kill('SIGKILL');
       reject(new Error(`scenario ${script} ${args.join(' ')} did not finish in ${timeoutMs} ms\n${stderr}`));
     }, timeoutMs);

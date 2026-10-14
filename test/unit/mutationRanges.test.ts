@@ -796,6 +796,8 @@ describe('the change', () => {
     onTestFinished(() => { if (alive()) process.kill(started, 'SIGKILL'); });
     for (let i = 0; i < 50 && alive(); i++) await new Promise(resolve => setTimeout(resolve, 100));
     expect(alive()).toBe(false);
+    // A step that already exited is never walked: its pid can be another process's by then.
+    expect(fs.readFileSync(path.join(__dirname, '..', 'helpers', 'child.ts'), 'utf8')).toContain('&& child.exitCode === null && child.signalCode === null) endTree(child.pid);');
   });
 
   it('looks at every file itself, whatever a file-system monitor says', () => {

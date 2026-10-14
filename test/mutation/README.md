@@ -351,7 +351,9 @@ child away from anything real:
   not reach `/data`);
 - every wait is bounded, and a step past its bound is ended with every process it started that still descends from it
   (helpers/endTree.mjs, by parent links: one whose parent already exited is not found, and none is where ps is
-  missing, so a scenario that starts processes keeps each one's parent alive); a step prints one `RESULT`
+  missing, so a scenario that starts processes keeps each one's parent alive; a step that already exited is not
+  walked, since its pid can be another process's by then, so what it started and left holding its output is not
+  ended either); a step prints one `RESULT`
   line with its result and the modules it loaded; the helper fails unless the fork guard is among them and every other
   one sits under this root's dist.
 
