@@ -165,7 +165,8 @@ let targets = [];
  */
 const canGate = target => target.gating === null || target.gating.length > 0;
 // One list: what pass A gives Stryker to mutate is every target of each file a
-// target can gate in (all of them, so two names of one file merge as one diff),
+// target can gate in (all of them, so two names of one file, which differ only
+// in case, merge as one diff),
 // and every run, each pass and rerun and each run with no mutant, is given
 // exactly those files, so its run with no mutant checks each.
 const mutated = () => targets.filter(target => targets.some(other => other.file === target.file && canGate(other)));

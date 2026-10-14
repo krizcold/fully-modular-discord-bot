@@ -231,6 +231,12 @@ describe('the tree fingerprint', () => {
     // The run with no mutant after the reruns makes their spans, with their time limits, bound above their budget.
     expect(gate).toContain("await stryker({ dir, tier, mutate: [...new Set(on.map(spanOf))], only, alone: true, extra: { ...(tier === 'a' ? PASSES.a2 : PASSES.b2), dryRunOnly: true, dryRunTimeoutMinutes: 60 } });");
     expect(gate).toContain('const results = await pass({ dir, tier, mutate: [...new Set(on.map(spanOf))],');
+    // ... handed the very mutants the reruns ran on.
+    expect(gate).toContain("await passOn('a2', 'a2', 'a', confirmA, PASSES.a2);");
+    expect(gate).toContain("await control('a2', 'a', confirmA, [], confirmA.some(m => outcome(m) === 'Timeout'));");
+    expect(gate).toContain('for (const [killer, on] of killers) {');
+    expect(gate).toContain("const killers = byKiller(confirmB);");
+    expect(gate).toContain("await control('b2', 'b', confirmB, [...killers.keys()]);");
     const guard = gate.indexOf('if (!targets.some(canGate)) await finish();');
     expect(guard).toBeGreaterThan(0);
     expect(guard).toBeLessThan(gate.indexOf("await pass({ dir: 'a'"));

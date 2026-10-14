@@ -39,8 +39,10 @@ From the bot root, with Node 22.12 or newer (or SMDB_TEST_NODE set, as for `npm 
   own measure (half its content, by default) to pair them. Otherwise it is a deletion and a new file, taken whole: a
   move whose new name is not staged (a plain `mv`, an editor's rename), or one that changed most of the file. A file
   only taken out of the index (`git rm --cached`, kept on disk and not ignored) is diffed against the base as a changed
-  one; one git ignores is out of the tree, so it is a deletion. Two changed names that lead to one file on disk (a link
-  in src and the file it leads to) are mutated and gated as one diff of all their changed lines would be.
+  one; one git ignores is out of the tree, so it is a deletion. A name that leads through a link (a link in src, a file
+  under a junction) is not mutated, and is named (below): a file is mutated under its own name only, when git lists it
+  changed. Two changed names git lists for one file that differ only in case (on a disk that does not tell case apart)
+  are mutated and gated as one diff of all their changed lines would be.
 - `--mutate src/x.ts:10-20` (a file in the bot root that exists and that a diff would mutate, or such a file and lines,
   repeatable; never a glob, never columns, never the suite's own files) skips git's diff (git still lists the tree, which
   is what a sandbox holds); every mutant it makes gates. A file git neither tracks nor would add (one it ignores, or one
@@ -145,7 +147,9 @@ does not name by its content.
   (`.d.ts`, `.d.mts`, `.d.cts`), the browser views under src/webui/public (copied into dist, never
   compiled, and no test loads them yet), a file deleted or moved out of src, an untracked git repository (git lists
   none of its files, and none is copied into a sandbox) or a git submodule under src, a file whose name Stryker would read as a glob (`[id].ts`,
-  `a{1,2}.ts`; rename it), a file in src that is a link to one that is not mutated (the suite's own env scrub, say),
+  `a{1,2}.ts`; rename it), a name that leads through a link (a link in src, a file under a junction, one out of the
+  bot root: Stryker's copy does not follow a link, so a file is mutated under its own name only, when git lists it
+  changed; `--mutate` takes the file a link leads to under its own name, and refuses one out of the bot root),
   a change that leaves no code changed (a rename git sees, a mode change, line endings only, only blank lines or
   comments, a file only taken out of the index), and a
   file that holds a line break Stryker counts and the gate does not (a lone CR, U+2028 or U+2029), whose lines the two
@@ -185,8 +189,9 @@ does not name by its content.
    git's ignored files (`.env`, the data dirs, dist), the files of an untracked git repository or a submodule (git
    lists only its dir, which lets nothing in; code that needs them fails there, NO RESULT) and any file made after the
    gate started stay out of every sandbox. Stryker's copy does not follow a link to a directory either: the files git
-   lists under a junction in the tree (Windows) stay out, and a tracked link to a directory (POSIX) fails the copy, so
-   code that reaches files through such a link fails there too (NO RESULT). A name Stryker would read as a glob even when escaped (on POSIX, one holding
+   lists under a junction in the tree (Windows) stay out (the plan names them as links and mutates none), and a tracked
+   link to a directory (POSIX) fails the copy, so code that reaches files through such a link fails there too (NO
+   RESULT). A name Stryker would read as a glob even when escaped (on POSIX, one holding
    a backslash and a brace) stops the gate with NO RESULT, since the sandbox would lack it. Stryker matches names with
    no regard to case, so on a disk that tells case apart, a file whose path differs from a listed one's only in case
    is copied too. Stryker also walks every dir of the checkout, ignored ones too, for node_modules to link:

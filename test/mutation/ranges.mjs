@@ -569,7 +569,8 @@ export const wholeTarget = file => ({ file, ranges: null, gating: null, patterns
 
 /**
  * The patterns pass A gives Stryker, one set per file. Two targets can name one
- * file (a link and the file it leads to, both changed): the file is taken whole
+ * file (two names git lists that differ only in case, on a disk that does not
+ * tell case apart, both changed): the file is taken whole
  * when one of them takes it whole, or else by their ranges merged, since Stryker
  * makes a mutant only where one range holds it. --mutate patterns stay as given.
  * @param {{ file: string, patterns: string[], ranges?: Range[] | null }[]} targets
@@ -597,11 +598,14 @@ export function mutatePatterns(targets) {
  * and not mutated (EXTRA_BREAK_WHY), and so is a file on the way to a fixed root
  * (DATA_ROUTE_WHY), a git submodule (`isDir`: git
  * names only its commit), a file whose name Stryker would read as a glob
- * (`nameOf` gives null) and one whose name on disk, through a link, is not
- * mutated (a link in src to the suite's env scrub). `nameOf` gives the name a file is mutated under (its
- * name on disk, keys.mjs). emptyScope: nothing in src changed.
+ * (`nameOf` gives null) and one listed under a name that leads through a link
+ * (its name on disk is another, other than by case, or there is none in the
+ * bot root, where `nameOf` gives undefined): Stryker's copy does not follow a
+ * link, so a file is mutated under its own name only. `nameOf` gives the name a
+ * file is mutated under (its name on disk, keys.mjs). emptyScope: nothing in
+ * src changed.
  * @param {{ entries: Entry[], untracked: string[], read: (file: string) => string, readBase: (file: string) => string,
- *   nameOf: (file: string) => string | null, isDir?: (file: string) => boolean }} change
+ *   nameOf: (file: string) => string | null | undefined, isDir?: (file: string) => boolean }} change
  * @returns {{ targets: Target[], skipped: { file: string, why: string }[], emptyScope: boolean }}
  */
 export function planChange({ entries, untracked, read, readBase, nameOf, isDir = () => false }) {
@@ -625,7 +629,7 @@ export function planChange({ entries, untracked, read, readBase, nameOf, isDir =
     }
     const name = nameOf(entry.file);
     if (name === null) { skipped.push({ file: entry.file, why: GLOB_NAME_WHY }); continue; }
-    if (notMutated(name)) { skipped.push({ file: entry.file, why: linkWhy(name) }); continue; }
+    if (name === undefined || throughLink(entry.file, name)) { skipped.push({ file: entry.file, why: linkWhy(name) }); continue; }
     const text = read(entry.file);
     if (holdsExtraBreak(text)) { skipped.push({ file: entry.file, why: EXTRA_BREAK_WHY }); continue; }
     if (holdsDataRoute(entry.file, text)) { skipped.push({ file: entry.file, why: DATA_ROUTE_WHY }); continue; }
@@ -644,7 +648,7 @@ export function planChange({ entries, untracked, read, readBase, nameOf, isDir =
     const name = why ? null : nameOf(file);
     if (why) skipped.push({ file, why });
     else if (name === null) skipped.push({ file, why: GLOB_NAME_WHY });
-    else if (notMutated(name)) skipped.push({ file, why: linkWhy(name) });
+    else if (name === undefined || throughLink(file, name)) skipped.push({ file, why: linkWhy(name) });
     else if (holdsExtraBreak(read(file))) skipped.push({ file, why: EXTRA_BREAK_WHY });
     else if (holdsDataRoute(file, read(file))) skipped.push({ file, why: DATA_ROUTE_WHY });
     else targets.push(wholeTarget(name));
@@ -659,11 +663,22 @@ export const GLOB_NAME_WHY = 'its name holds characters Stryker reads as a glob,
 export const NO_CODE_WHY = 'no code changed (a rename, a mode change, line endings only, only blank lines or comments, or a file only taken out of the index)';
 
 /**
- * Why a file in src is not mutated when its name leads, through a link, to a
- * file that is not (the suite's own env scrub, say).
- * @param {string} name the name on disk
+ * Why a file listed under a name that leads through a link is not mutated
+ * under it: Stryker's copy does not follow a link, so a file is mutated under
+ * its own name only, when git lists it changed.
+ * @param {string | undefined} name the name on disk; undefined when there is none in the bot root
  */
-const linkWhy = name => `a link to ${name}, which is not mutated: ${notMutated(name)}`;
+const linkWhy = name => (name === undefined
+  ? 'it leads to no file in the bot root (a link out of it), so no sandbox holds it'
+  : `a link to ${name}: a file is mutated under its own name only, when git lists it changed`);
+
+/**
+ * Whether a listed name leads through a link to its name on disk: another,
+ * other than by case (a file renamed by case outside git keeps its own).
+ * @param {string} file
+ * @param {string} name
+ */
+const throughLink = (file, name) => name.toLowerCase() !== file.toLowerCase();
 
 /**
  * planChange on what git says changed from base to the working tree of the bot
@@ -724,7 +739,8 @@ export function planFromGit({ git: run, base, root, read = file => fs.readFileSy
     read,
     readBase,
     nameOf: file => {
-      const name = canonicalName(root, file) ?? file;
+      const name = canonicalName(root, file);
+      if (name === null) return undefined;
       return strykerTakes(root, name) ? name : null;
     },
     isDir: file => { try { return fs.statSync(path.join(root, file)).isDirectory(); } catch { return false; } },
@@ -893,7 +909,7 @@ export function gates(target, location) {
 
 /**
  * Whether a mutant of `file` gates for any target that names the file: two can
- * (a link and the file it leads to, both changed), each with its own diff, and
+ * (two names git lists that differ only in case), each with its own diff, and
  * together they mutate and gate as one diff of all their changed lines would.
  * @param {{ file: string, gating: number[] | null }[]} targets
  * @param {string} file

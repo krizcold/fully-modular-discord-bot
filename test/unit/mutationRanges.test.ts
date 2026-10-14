@@ -562,33 +562,56 @@ describe('the change', () => {
     }
   });
 
-  it('never mutates, through a link in src, a file that is not mutated: the suite\'s env scrub, say', () => {
+  it('names, and never mutates, a file listed under a name that leads through a link, out of the bot root too', () => {
+    const disk: Record<string, string> = { 'src/env.ts': 'test/helpers/env.ts', 'src/config.ts': 'test/vitest.config.ts', 'src/old/x.ts': 'src/real/x.ts', 'src/real/X.ts': 'src/real/x.ts' };
     const plan = planChange({
-      entries: [{ status: 'A', file: 'src/env.ts' }],
-      untracked: ['src/config.ts'],
+      entries: [{ status: 'A', file: 'src/env.ts' }, { status: 'M', file: 'src/old/x.ts' }, { status: 'M', file: 'src/real/X.ts' }],
+      untracked: ['src/config.ts', 'src/out/y.ts'],
       read: () => 'export const x = 1;\n',
-      readBase: () => '',
-      nameOf: file => (file === 'src/env.ts' ? 'test/helpers/env.ts' : 'test/vitest.config.ts'),
+      readBase: () => 'export const x = 0;\n',
+      nameOf: file => disk[file],
     });
-    expect(plan.targets).toEqual([]);
+    // A name that differs only in case is the file's own (renamed by case outside git).
+    expect(plan.targets.map(target => target.file)).toEqual(['src/real/x.ts']);
+    const to = (name: string) => `a link to ${name}: a file is mutated under its own name only, when git lists it changed`;
     expect(plan.skipped).toEqual([
-      { file: 'src/env.ts', why: 'a link to test/helpers/env.ts, which is not mutated: outside src' },
-      { file: 'src/config.ts', why: 'a link to test/vitest.config.ts, which is not mutated: outside src' },
+      { file: 'src/env.ts', why: to('test/helpers/env.ts') },
+      { file: 'src/old/x.ts', why: to('src/real/x.ts') },
+      { file: 'src/config.ts', why: to('test/vitest.config.ts') },
+      { file: 'src/out/y.ts', why: 'it leads to no file in the bot root (a link out of it), so no sandbox holds it' },
     ]);
-    // On disk, through git: a link to a dir (a junction on Windows, which git walks into).
+    // On disk, through git: a link to a dir in the bot root and one to a dir out of it (junctions on Windows, which
+    // git walks into; on POSIX git lists each link as a file).
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-outside-'));
+    onTestFinished(() => fs.rmSync(outside, { recursive: true, force: true }));
+    fs.writeFileSync(path.join(outside, 'y.ts'), 'export const y = 1;\n');
     const { repo, plan: fromGit } = repoWith({ 'src/a.ts': text(lines('a', 2)), 'test/helpers/env.ts': text(lines('e', 2)) });
     fs.symlinkSync(path.join(repo, 'test', 'helpers'), path.join(repo, 'src', 'link'), 'junction');
-    onTestFinished(() => fs.unlinkSync(path.join(repo, 'src', 'link')));
-    expect(fromGit().targets.filter(target => !target.file.startsWith('src/'))).toEqual([]);
+    fs.symlinkSync(outside, path.join(repo, 'src', 'out'), 'junction');
+    onTestFinished(() => {
+      fs.unlinkSync(path.join(repo, 'src', 'link'));
+      fs.unlinkSync(path.join(repo, 'src', 'out'));
+    });
+    const linked = fromGit();
+    expect(linked.targets).toEqual([]);
+    if (process.platform === 'win32') {
+      expect(linked.skipped).toEqual([
+        { file: 'src/link/env.ts', why: to('test/helpers/env.ts') },
+        { file: 'src/out/y.ts', why: 'it leads to no file in the bot root (a link out of it), so no sandbox holds it' },
+      ]);
+    } else {
+      // On POSIX git lists each link as a file, whose name is not code.
+      expect(linked.skipped.map(s => s.file).sort()).toEqual(['src/link', 'src/out']);
+    }
   });
 
-  it('gates a file that two changed names lead to (a link and its file) by either diff, and gives Stryker their ranges merged', () => {
+  it('gates a file that two changed names lead to (names that differ only in case) by either diff, and gives Stryker their ranges merged', () => {
     const now = ['export const a = 1;', 'export const b = 2;', 'export const c = 3;', 'export const d = 4;', 'export const e = 5;', ''].join('\n');
     const plan = planChange({
-      entries: [{ status: 'M', file: 'src/old/x.ts' }, { status: 'M', file: 'src/real/x.ts' }],
+      entries: [{ status: 'M', file: 'src/REAL/x.ts' }, { status: 'M', file: 'src/real/x.ts' }],
       untracked: [],
       read: () => now,
-      readBase: file => now.replace(file === 'src/old/x.ts' ? 'b = 2' : 'c = 3', 'z = 0'),
+      readBase: file => now.replace(file === 'src/REAL/x.ts' ? 'b = 2' : 'c = 3', 'z = 0'),
       nameOf: () => 'src/real/x.ts',
     });
     expect(plan.targets.map(target => [target.file, target.gating])).toEqual([['src/real/x.ts', [2]], ['src/real/x.ts', [3]]]);

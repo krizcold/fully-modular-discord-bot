@@ -12,15 +12,18 @@ import { CODE } from '../mutation/ranges.mjs';
 // developer's shell sets, by any name, reaches no run; pg and git are pointed
 // at nothing.
 
-const src = path.join(__dirname, '..', '..', 'src');
-const filesUnder = (dir: string): string[] => fs.readdirSync(dir, { withFileTypes: true }).flatMap(entry =>
-  entry.isDirectory() ? filesUnder(path.join(dir, entry.name)) : CODE.test(entry.name) ? [path.join(dir, entry.name)] : []);
+// The code in src that git tracks or would add: never a module cloned into a
+// dir git ignores (src/bot/modulesDev), which no test loads and no sandbox holds.
+const botRoot = path.join(__dirname, '..', '..');
+const srcFiles = () => execFileSync('git', ['-c', 'core.quotePath=false', 'ls-files', '-z', '--cached', '--others', '--exclude-standard', 'src'], { cwd: botRoot, encoding: 'utf8' })
+  .split('\0').filter(file => CODE.test(file) && fs.existsSync(path.join(botRoot, file))).map(file => path.join(botRoot, file));
 
 describe('the env scrub', () => {
-  const texts = filesUnder(src).map(file => fs.readFileSync(file, 'utf8'));
+  const texts = srcFiles().map(file => fs.readFileSync(file, 'utf8'));
   const found = (pattern: RegExp) => [...new Set(texts.flatMap(text => [...text.matchAll(pattern)].map(m => m[1] ?? m[2])))].sort();
 
-  it('takes out every key src reads from process.env, but the platform ones it reads on purpose', () => {
+  // A key the scrub keeps (a platform one) that src reads fails this: such a read is a decision, made here.
+  it('takes out every key src reads from process.env', () => {
     const keys = found(/process\.env(?:\.([A-Za-z_][A-Za-z0-9_]*)|\[\s*['"]([A-Za-z_][A-Za-z0-9_]*)['"]\s*\])/g);
     expect(keys.length).toBeGreaterThan(30);
     expect(keys.filter(kept)).toEqual([]);
