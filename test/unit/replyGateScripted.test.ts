@@ -13,9 +13,9 @@ vi.mock('../../src/bot/internalSetup/utils/dataManager', async importOriginal =>
   const real = await importOriginal<typeof import('../../src/bot/internalSetup/utils/dataManager')>();
   return {
     ...real,
-    confirmWrite: async (...args: Parameters<typeof real.confirmWrite>) => {
+    confirmFrom: async (...args: Parameters<typeof real.confirmFrom>) => {
       const rule = script.rules.find(r => r.match(args[0] as never));
-      return rule ? (rule.answer(args[1]) as never) : real.confirmWrite(...args);
+      return rule ? (rule.answer(args[1]) as never) : real.confirmFrom(...args);
     },
   };
 });

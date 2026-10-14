@@ -6,6 +6,7 @@
 import { AsyncLocalStorage } from 'async_hooks';
 import type { Client } from 'discord.js';
 import type { FileTicket } from './fileBackend';
+import { saveMark, type SaveMark } from './scopeRecord';
 import type { DataUnavailableCause, WsTicket } from './workingSet';
 
 export type LedgerKind = 'interaction' | 'panel' | 'console';
@@ -18,6 +19,9 @@ export const INTERACTION_LEDGER_LIFE_MS = 15 * 60 * 1000;
 
 interface Entry {
   ticket: LedgerTicket;
+  // The lowest unlanded seq noted on it (a lower write of the set, or an absent delete): a successor's carry must
+  // hold the entry's writes from there to its ticket's.
+  from: number;
   modules: Set<string>;
 }
 
@@ -26,6 +30,8 @@ let docSeq = 0;
 
 export class WriteLedger {
   readonly openedAt = performance.now();
+  /** confirmSaved's default since inside this ledger's frame: the writes accepted after it opened. */
+  readonly openedMark: SaveMark = saveMark();
   private closed = false;
   /** Keyed by the ticket's working set or landing record: a later ticket on it covers every earlier one. */
   private readonly entries = new Map<object, Entry>();
@@ -66,9 +72,14 @@ export class WriteLedger {
     const entry = this.entries.get(key);
     if (entry) {
       if (ticket.seq > entry.ticket.seq) {
-        if (landed(entry.ticket)) this.droppedLanded = true;
+        // Every write the entry held landed: it answers from the new one.
+        if (landed(entry.ticket)) {
+          this.droppedLanded = true;
+          entry.from = ticket.seq;
+        }
         entry.ticket = ticket;
       }
+      if (!landed(ticket)) entry.from = Math.min(entry.from, ticket.seq);
       entry.modules.add(module);
       return;
     }
@@ -85,7 +96,7 @@ export class WriteLedger {
         this.droppedLanded = true;
       }
     }
-    this.entries.set(key, { ticket, modules: new Set([module]) });
+    this.entries.set(key, { ticket, from: ticket.seq, modules: new Set([module]) });
     keys.add(key);
   }
 
@@ -100,10 +111,10 @@ export class WriteLedger {
     }
   }
 
-  /** The tickets every recorded write is confirmed by, each with the modules whose writes it covers. */
-  tickets(): Array<{ ticket: LedgerTicket; modules: string[] }> {
+  /** The tickets every recorded write is confirmed by, each from its entry's lowest seq, with the modules it covers. */
+  tickets(): Array<{ ticket: LedgerTicket; from: number; modules: string[] }> {
     if (this.sealed) return [];
-    return [...this.entries.values()].map(({ ticket, modules }) => ({ ticket, modules: [...modules].sort() }));
+    return [...this.entries.values()].map(({ ticket, from, modules }) => ({ ticket, from, modules: [...modules].sort() }));
   }
 
   refusals(): Array<{ cause: LedgerCause; modules: string[] }> {

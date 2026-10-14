@@ -9,9 +9,9 @@ vi.mock('../../src/bot/internalSetup/utils/dataManager', async importOriginal =>
   const real = await importOriginal<typeof import('../../src/bot/internalSetup/utils/dataManager')>();
   return {
     ...real,
-    confirmWrite: async (...args: Parameters<typeof real.confirmWrite>) => {
+    confirmFrom: async (...args: Parameters<typeof real.confirmFrom>) => {
       if (confirm.throws) throw new Error('confirm failed');
-      return real.confirmWrite(...args);
+      return real.confirmFrom(...args);
     },
   };
 });

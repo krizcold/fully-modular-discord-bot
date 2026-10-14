@@ -1,11 +1,14 @@
 // The interaction reply gate (BT-3): on a real interaction, a response method sends the module's payload only once
 // every write in the union of its ledgers has landed and none was refused; otherwise a truthful text goes in its
-// place. A response called before ACK_MS from the emit is acknowledged by then; one called later, at once.
+// place. A response called before ACK_MS from the emit is acknowledged by then; one called later, at once. A module
+// that declares dataContract 2 (BT-5) is judged on refusals only: its payload goes out at once, unless a write was
+// refused, and the gate defers nothing for it.
 
 import { ContainerBuilder, InteractionResponseType, MessageFlags, MessageFlagsBitField, TextDisplayBuilder, type Client } from 'discord.js';
 import { getConfigProperty } from '../configManager';
-import { confirmWrite } from '../dataManager';
+import { confirmFrom } from '../dataManager';
 import { parseButtonCustomId, parseDropdownCustomId, parseModalCustomId } from '../panel/panelCustomIds';
+import { declaresOwnOutcomes } from './dataContract';
 import { currentLedger, currentModule, installInteractionLedgers, landed, ledgerOf, type LedgerCause, type LedgerTicket, type WriteLedger } from './writeLedger';
 
 /** From the interaction's emit to the gate's own defer. Discord's 3 s also pays the gateway's delivery and the callback. */
@@ -70,6 +73,8 @@ interface Refused {
 interface Pending {
   tickets: LedgerTicket[];
   unlanded: LedgerTicket[];
+  /** The lowest seq each ticket answers for: its ledger entry's, a lower write of its set or an absent delete. */
+  from: Map<LedgerTicket, number>;
   refused: Refused[];
   /** A confirmed write is no longer listed: its entry gave way to a later write of the same guild or path. */
   landedBefore: boolean;
@@ -78,11 +83,14 @@ interface Pending {
 const keyOf = (ticket: LedgerTicket): object => (ticket.kind === 'file' ? ticket.record : ticket.set);
 
 function pendingIn(ledgers: WriteLedger[]): Pending {
-  const tickets = ledgers.flatMap(ledger => ledger.tickets().map(entry => entry.ticket));
+  const entries = ledgers.flatMap(ledger => ledger.tickets());
+  const tickets = entries.map(entry => entry.ticket);
+  const from = new Map<LedgerTicket, number>();
+  for (const entry of entries) from.set(entry.ticket, Math.min(entry.from, from.get(entry.ticket) ?? entry.from));
   const refused = ledgers.flatMap(ledger => ledger.refusedDocs()).map(({ cause, doc, seq }) => ({
     cause, doc, seq, rewritten: ledgers.some(ledger => ledger.rewriteSeq(doc) > seq),
   }));
-  return { tickets, unlanded: tickets.filter(ticket => !landed(ticket)), refused, landedBefore: ledgers.some(ledger => ledger.landedDropped) };
+  return { tickets, unlanded: tickets.filter(ticket => !landed(ticket)), from, refused, landedBefore: ledgers.some(ledger => ledger.landedDropped) };
 }
 
 // A refused write later rewritten whole cannot be confirmed either way: the rewrite may or may not carry the refused
@@ -100,11 +108,12 @@ async function judge(pending: Pending, waitMs = CONFIRM_MS): Promise<Verdict> {
       failed: pending.refused.map(r => ({ refusal: refusalKey(r) })),
     };
   }
-  const first = await Promise.all(pending.unlanded.map(ticket => confirmWrite(ticket, waitMs).catch(() => 'unavailable' as const)));
+  const fromOf = (ticket: LedgerTicket): number => pending.from.get(ticket) ?? ticket.seq;
+  const first = await Promise.all(pending.unlanded.map(ticket => confirmFrom(ticket, waitMs, fromOf(ticket)).catch(() => 'unavailable' as const)));
   // A held write is retried while slower confirms finish, so it is read again when the verdict is taken.
   const answers = await Promise.all(first.map((answer, i) => answer !== 'held'
     ? answer
-    : confirmWrite(pending.unlanded[i], 0).then(now => (now === 'pending' ? 'held' as const : now), () => 'unavailable' as const)));
+    : confirmFrom(pending.unlanded[i], 0, fromOf(pending.unlanded[i])).then(now => (now === 'pending' ? 'held' as const : now), () => 'unavailable' as const)));
   const failed = pending.unlanded.filter((_, i) => answers[i] !== 'ok');
   if (failed.length === 0) return { ok: true };
   const partial = answers.some(answer => answer === 'ok') || pending.tickets.length > pending.unlanded.length || pending.landedBefore;
@@ -327,15 +336,19 @@ export function installReplyGate(interaction: object, ledger: WriteLedger): void
     return result;
   };
 
-  // The sweep's mark: taken once a module's payload went out, never for the truth, a deferral or an acknowledgement.
+  // The sweep's mark: taken once a module's payload went out, never for the truth, a deferral or an acknowledgement;
+  // a flagged module's payload (BT-5) takes none and clears the last one.
   let mark: Mark | null = null;
 
   const gated = async (name: string, args: unknown[], frameLedger: WriteLedger | undefined, sender: string): Promise<unknown> => {
     const ledgers = frameLedger && frameLedger !== ledger ? [frameLedger, ledger] : [ledger];
-    const pending = pendingIn(ledgers);
+    // A module that handles its own outcomes (BT-5) is judged on refusals only, and its payload is never the sweep's.
+    const ownOutcomes = declaresOwnOutcomes(sender);
+    const read = pendingIn(ledgers);
+    const pending = ownOutcomes ? { ...read, unlanded: [] } : read;
     const payload = async (call: string, callArgs: unknown[]): Promise<unknown> => {
       const result = await send(call, callArgs);
-      mark = markOf(pending, ledgers, sender);
+      mark = ownOutcomes ? null : markOf(pending, ledgers, sender);
       return result;
     };
     if (pending.refused.length === 0 && pending.unlanded.length === 0) return payload(name, args);
@@ -480,8 +493,9 @@ export function writesConfirmed(interaction: object | null | undefined): Promise
  * The sweep (BT-4), at the end of an interaction's dispatch: when a write was recorded that the last payload was not
  * judged on, so that payload did not wait on it, it logs the module that sent it, once per site. Only the last
  * payload is compared, so an earlier one sent before a write that a later payload waited on (a progress reply) is not
- * logged. It runs after every call still queued, and sends nothing; an interaction no gate holds is not swept, nor
- * a dispatch that outlives the interaction ledger's life (15 minutes), whose ledger is sealed by then.
+ * logged, and a last payload from a module that declares dataContract 2 (BT-5) is never compared: that module owns
+ * its outcomes. It runs after every call still queued, and sends nothing; an interaction no gate holds is not swept,
+ * nor a dispatch that outlives the interaction ledger's life (15 minutes), whose ledger is sealed by then.
  */
 export function sweepLateWrites(interaction: object): Promise<void> {
   const gate = gates.get(interaction);

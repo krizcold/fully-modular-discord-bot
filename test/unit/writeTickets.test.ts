@@ -416,7 +416,7 @@ const workingSetRows: Row[] = [
       store.unproven = unproven;
       const ticket = save(ws, 'a.json', { a: 1 });
       const refused = await answer(ws.confirm(ticket, 1000), 1000);
-      expect(ws.holdsWritesFor(GUILD)).toBe(true);
+      expect(ws.writesSettled()).toBe(false);
       expect(store.doc(GUILD, 'a.json')).toBeUndefined();
       store.mode = 'commit';
       store.unproven = false;
@@ -447,7 +447,7 @@ const workingSetRows: Row[] = [
       store.mode = 'unavailable';
       const ticket = save(ws, 'a.json', { a: 1 });
       await vi.advanceTimersByTimeAsync(600);
-      expect(ws.holdsWritesFor(GUILD)).toBe(true);
+      expect(ws.writesSettled()).toBe(false);
       return [await answer(ws.confirm(ticket, 0), 0)];
     },
   },
@@ -640,7 +640,7 @@ const workingSetRows: Row[] = [
     },
   },
   {
-    row: 'recycled: the manager answers unavailable; the facade says pending while the successor holds writes for the guild',
+    row: 'recycled: the manager answers unavailable; the facade says pending while the successor keeps the carry, and unavailable once it landed',
     expected: ['unavailable', 'pending', 'unavailable'],
     run: async () => {
       const guildId = '9100';
@@ -1221,7 +1221,7 @@ describe('a write that landed is confirmed while a second writer keeps its guild
     store.release();
     await vi.advanceTimersByTimeAsync(600);
     expect(store.doc(guildId, 'a.json')).toBe(JSON.stringify({ a: 1 }, null, 2));
-    expect(ws.holdsWritesFor(guildId)).toBe(true);
+    expect(ws.writesSettled()).toBe(false);
     expect(await answer(confirmWrite(first.ticket, 8000), 8000)).toBe('ok');
     // The guild-wide answer waits on the second writer's flush instead.
     expect(await answer(flushGuildOutcome(guildId, 100), 100)).toBe('pending');
@@ -1249,7 +1249,7 @@ describe('a write that landed is confirmed while a second writer keeps its guild
     store.release();
     expect(await answer(reply, 8000)).toEqual({ ok: true });
     expect(store.doc(guildId, 'a.json')).toBe(JSON.stringify({ a: 1 }, null, 2));
-    expect(ws.holdsWritesFor(guildId)).toBe(true);
+    expect(ws.writesSettled()).toBe(false);
   });
 
   it('answers a delete of a document that never existed on the operator route at once, whatever the guild has on the wire', async () => {

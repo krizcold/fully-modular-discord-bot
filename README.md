@@ -526,6 +526,13 @@ saveGlobalModuleData('settings.json', 'my-module', globalData);
 - Guild data: `/data/{guildId}/{moduleName}/filename.json`
 - Global data: `/data/global/{moduleName}/filename.json`
 
+**Saved, or only accepted:** the save and delete helpers return `true` once the bot accepts a write (queued to be
+stored), not once it is stored. A reply from a command, button or modal handler waits until that interaction's writes
+are stored, or is replaced with a short message saying a write was refused or is not confirmed stored. A module that
+words these outcomes itself declares `"dataContract": 2` in its module.json and awaits `confirmSaved(guildId)` (or
+`confirmSaved('global')`) before it says "saved"; a refused write still replaces its reply with the bot's own message.
+From a timer or event, take `saveMark()` before the writes and pass it as `{ since }`.
+
 ### Creating Commands
 
 **Slash Command Example:**
