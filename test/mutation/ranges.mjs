@@ -729,6 +729,9 @@ export function planFromGit({ git: run, base, root, read = file => fs.readFileSy
   const readBase = file => git('cat-file', 'blob', `${base}:${file}`);
   /** @param {string} file */
   const isFile = file => { try { return fs.statSync(path.join(root, file)).isFile(); } catch { return false; } };
+  // ls-tree reads its paths as written, and prints nothing for one the base lacks.
+  /** @param {string} file */
+  const atBase = file => / blob [0-9a-f]+\t/.test(git('ls-tree', '-z', base, '--', file));
   const entries = parseNameStatus(git(...changedArgs(base)));
   const listed = new Set(entries.flatMap(entry => [entry.file, entry.from]));
   const sparse = new Set(git('ls-files', '-v', '-z').split('\0').filter(line => /^[sS] /.test(line)).map(line => line.slice(2)));
@@ -748,7 +751,7 @@ export function planFromGit({ git: run, base, root, read = file => fs.readFileSy
     const m = /^10(?:0644|0755) ([0-9a-f]+) 0\t(.+)$/s.exec(line);
     if (!m || listed.has(m[2])) continue;
     if (isFile(m[2])) staged.push({ blob: m[1], file: m[2] });
-    else if (!fs.existsSync(path.join(root, m[2])) && !sparse.has(m[2])) entries.push({ status: 'D', file: m[2] });
+    else if (!fs.existsSync(path.join(root, m[2])) && !sparse.has(m[2]) && atBase(m[2])) entries.push({ status: 'D', file: m[2] });
   }
   // In batches, as a command line has a length limit (32767 characters on Windows).
   for (let start = 0; start < staged.length;) {

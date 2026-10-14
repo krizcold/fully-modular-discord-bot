@@ -678,6 +678,28 @@ describe('the change', () => {
     expect(result.skipped.map(s => s.file)).not.toContain('src/e.ts');
   });
 
+  it('names no file deleted that the base never held as a file (a new file staged, then taken off the disk)', () => {
+    const { repo, git, write, plan } = repoWith({ 'src/a.ts': text(lines('a', 3)), 'src/x/y.ts': text(lines('y', 2)) });
+    write('src/b.ts', text(lines('b', 2)));
+    write('src/c.ts', text(lines('c', 2)));
+    git(['add', 'src/b.ts']);
+    git(['add', '-N', 'src/c.ts']);
+    // A file staged where the base held a dir.
+    fs.rmSync(path.join(repo, 'src', 'x'), { recursive: true });
+    write('src/x', text(lines('x', 2)));
+    git(['add', '-A', 'src/x']);
+    for (const file of ['b.ts', 'c.ts', 'x']) fs.rmSync(path.join(repo, 'src', file));
+    const result = plan();
+    expect(result.targets).toEqual([]);
+    expect(result.skipped).toEqual([{ file: 'src/x/y.ts', why: 'deleted: nothing is left to mutate' }]);
+    // Alone, such a file leaves no src file changed, and the report says so.
+    const { repo: alone, git: gitAlone, write: writeAlone, plan: planAlone } = repoWith({ 'src/a.ts': text(lines('a', 3)) });
+    writeAlone('src/b.ts', text(lines('b', 2)));
+    gitAlone(['add', 'src/b.ts']);
+    fs.rmSync(path.join(alone, 'src', 'b.ts'));
+    expect(planAlone()).toEqual({ targets: [], skipped: [], emptyScope: true });
+  });
+
   const botRoot = path.resolve(__dirname, '..', '..');
 
   it('never mutates code on the way to /data, under any name, and names it', () => {
@@ -737,6 +759,40 @@ describe('the change', () => {
     expect(listed.length).toBeGreaterThan(100);
     // A new one: route it through src/utils/dataRoot.ts, or, for a route path, add it here.
     expect([...found].filter(([text]) => !ROUTES.includes(text))).toEqual([]);
+  });
+
+  // holdsDataRoute reads one file: a check that takes the DATA_DIR name or a
+  // fixed root from another file's constant holds neither, so it is mutated,
+  // and a mutant of it can pick that root. src exports no such constant.
+  it('finds in src no exported constant that holds the DATA_DIR name or a fixed root', () => {
+    const found: string[] = [];
+    const listed = execFileSync('git', ['-c', 'core.quotePath=false', 'ls-files', '-z', '--cached', '--others', '--exclude-standard', 'src'], { cwd: botRoot, encoding: 'utf8' })
+      .split('\0').filter(file => CODE.test(file) && fs.existsSync(path.join(botRoot, file)));
+    const exportsOne = (file: string, text: string) => {
+      const sf = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true);
+      const named = new Set(sf.statements.filter(ts.isExportDeclaration).filter(st => !st.moduleSpecifier && st.exportClause && ts.isNamedExports(st.exportClause))
+        .flatMap(st => (st.exportClause as ts.NamedExports).elements.map(el => (el.propertyName ?? el.name).text)));
+      return sf.statements.flatMap(st => {
+        if (ts.isExportAssignment(st)) return [st.expression];
+        if (!ts.isVariableStatement(st)) return [];
+        const exported = (st.modifiers ?? []).some(m => m.kind === ts.SyntaxKind.ExportKeyword);
+        return st.declarationList.declarations.filter(d => exported || (ts.isIdentifier(d.name) && named.has(d.name.text))).flatMap(d => (d.initializer ? [d.initializer] : []));
+      }).some(value => holdsDataRoute(file, value.getText(sf)));
+    };
+    for (const file of listed) {
+      const text = fs.readFileSync(path.join(botRoot, file), 'utf8');
+      if (holdsDataRoute(file, text) && exportsOne(file, text)) found.push(file);
+    }
+    expect(listed.length).toBeGreaterThan(100);
+    // A new one: keep the check that picks the root and the root in one file, the way src/utils/dataRoot.ts does.
+    expect(found).toEqual([]);
+    // Each way to export one is seen.
+    for (const text of ["export const ROOT = '/data';\n", "const ENV = 'DATA_DIR';\nexport { ENV as NAME };\n", "export default '/app/build';\n",
+      'export const at = (x: string) => `/app/${x}`;\n']) {
+      expect(exportsOne('src/a.ts', text), text).toBe(true);
+    }
+    // A constant that holds the root a call chose, or a function that chooses it, is no such constant.
+    expect(exportsOne('src/a.ts', "export const DATA_ROOT = resolve();\nfunction resolve() { return process.env.DATA_DIR ?? '/data'; }\n")).toBe(false);
   });
 
   it('refuses, in a test and in a child, a fork whose own env lacks DATA_DIR (helpers/forkGuard.cjs)', async () => {

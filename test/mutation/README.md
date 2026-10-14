@@ -141,7 +141,8 @@ does not name by its content.
   changed when that differs from git's index and its lines differ from the base's (the index can hold an edit staged
   and then undone, and the hash reads no index, so a blob that holds CRLF under text=auto hashes as LF: either differs
   with nothing changed); and it names one that is gone as
-  deleted, unless skip-worktree left it out (a sparse checkout).
+  deleted, unless skip-worktree left it out (a sparse checkout) or the base never held it (a new file staged, then
+  taken off the disk).
 - Not mutated, and named in the report with the reason: files outside src (the root scripts, updaters/, tests, docs and
   images), files that are not code (code is `.ts`, `.tsx`, `.mts`, `.cts`, `.js`, `.cjs` and `.mjs`), declaration files
   (`.d.ts`, `.d.mts`, `.d.cts`), the browser views under src/webui/public (copied into dist, never
@@ -157,10 +158,15 @@ does not name by its content.
   file that holds a line break Stryker counts and the gate does not (a lone CR, U+2028 or U+2029), whose lines the two
   would number differently; `--mutate` refuses such a file.
 - Never mutated, on any machine, and named: a file whose code names the DATA_DIR variable or holds `'/data'` as a
-  string or as the head of a template (`` `/data/${x}` ``; src/utils/dataRoot.ts today, under any name or split into
-  others), or holds the image's `'/app'` root or a path under it (`'/app/build'`, `` `/app/${x}` ``: the module path
-  helpers, the snapshot and update code and src/index.ts today), in any case and with either slash (Windows reads
-  `/Data`, `\data` and `data_dir` as the same). A root built at run time (`path.join('/', 'data')`) is not seen. A mutant of it (the DATA_DIR check made false, the
+  string or as the head of a template (`` `/data/${x}` ``; src/utils/dataRoot.ts today, under any name), or holds the
+  image's `'/app'` root or a path under it (`'/app/build'`, `` `/app/${x}` ``: the module path helpers, the snapshot
+  and update code and src/index.ts today), in any case and with either slash (Windows reads `/Data`, `\data` and
+  `data_dir` as the same). The rule reads one file at a time: a root built at run time (`path.join('/', 'data')`), or
+  a check that takes the variable's name or a fixed root from another file (an imported constant, a function that
+  returns a root it does not choose), is not seen, so the check that picks a root and the root it picks stay in one
+  file (the module path helpers return a root their own check chose). unit/mutationRanges.test.ts fails when a file in
+  src that git tracks or would add exports a constant that holds the name or a fixed root, the way such a split
+  would start. A mutant of a file the rule names (the DATA_DIR check made false, the
   image's marker taken as found, the fallback chosen) sends the tests to such a root, on a developer's machine a real
   data root (on Windows at the root of the drive of the process's cwd: the checkout's for a test, the temp dir's for a
   child step, so `D:\app` or `C:\data` for a checkout on D: with TEMP on C:) and anywhere else one the run would make
