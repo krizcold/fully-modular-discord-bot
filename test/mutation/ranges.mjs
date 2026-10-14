@@ -718,8 +718,9 @@ export const ownNames = (root, files) => new Set([...files].filter(file => linkO
  * Windows is when the file was made), so a same-size edit whose time was set
  * back shows in no diff. So every tracked file git did not name is checked by
  * its content: one gone is deleted, unless skip-worktree left it out (a sparse
- * checkout), and one whose hash with git's filters differs from its index blob
- * is changed when its lines differ from the base's too.
+ * checkout) or the base does not hold it as a file (a new file staged, then
+ * taken off the disk), and one whose hash with git's filters differs from its
+ * index blob is changed when its lines differ from the base's too.
  * @param {{ git: (...args: string[]) => string, base: string, root: string, read?: (file: string) => string }} io
  */
 export function planFromGit({ git: run, base, root, read = file => fs.readFileSync(path.join(root, file), 'utf8') }) {
@@ -729,9 +730,10 @@ export function planFromGit({ git: run, base, root, read = file => fs.readFileSy
   const readBase = file => git('cat-file', 'blob', `${base}:${file}`);
   /** @param {string} file */
   const isFile = file => { try { return fs.statSync(path.join(root, file)).isFile(); } catch { return false; } };
-  // ls-tree reads its paths as written, and prints nothing for one the base lacks.
+  // base:file names the path as written, with no pathspec (so no GIT_*_PATHSPECS
+  // variable reaches it), and -q fails with no message for one the base lacks.
   /** @param {string} file */
-  const atBase = file => / blob [0-9a-f]+\t/.test(git('ls-tree', '-z', base, '--', file));
+  const atBase = file => { try { return git('cat-file', '-t', git('rev-parse', '-q', '--verify', `${base}:${file}`).trim()).trim() === 'blob'; } catch { return false; } };
   const entries = parseNameStatus(git(...changedArgs(base)));
   const listed = new Set(entries.flatMap(entry => [entry.file, entry.from]));
   const sparse = new Set(git('ls-files', '-v', '-z').split('\0').filter(line => /^[sS] /.test(line)).map(line => line.slice(2)));

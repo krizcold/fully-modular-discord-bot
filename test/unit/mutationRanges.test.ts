@@ -678,8 +678,8 @@ describe('the change', () => {
     expect(result.skipped.map(s => s.file)).not.toContain('src/e.ts');
   });
 
-  it('names no file deleted that the base never held as a file (a new file staged, then taken off the disk)', () => {
-    const { repo, git, write, plan } = repoWith({ 'src/a.ts': text(lines('a', 3)), 'src/x/y.ts': text(lines('y', 2)) });
+  it('names a gone file deleted only when the base held it as a file, whatever pathspec variable the user has', () => {
+    const { repo, git, write, plan } = repoWith({ 'src/a.ts': text(lines('a', 3)), 'src/d.ts': text(lines('d', 2)), 'src/x/y.ts': text(lines('y', 2)) });
     write('src/b.ts', text(lines('b', 2)));
     write('src/c.ts', text(lines('c', 2)));
     git(['add', 'src/b.ts']);
@@ -688,10 +688,14 @@ describe('the change', () => {
     fs.rmSync(path.join(repo, 'src', 'x'), { recursive: true });
     write('src/x', text(lines('x', 2)));
     git(['add', '-A', 'src/x']);
-    for (const file of ['b.ts', 'c.ts', 'x']) fs.rmSync(path.join(repo, 'src', file));
+    // A base file git is told not to look at: it is deleted.
+    git(['update-index', '--assume-unchanged', 'src/d.ts']);
+    for (const file of ['b.ts', 'c.ts', 'x', 'd.ts']) fs.rmSync(path.join(repo, 'src', file));
     const result = plan();
     expect(result.targets).toEqual([]);
-    expect(result.skipped).toEqual([{ file: 'src/x/y.ts', why: 'deleted: nothing is left to mutate' }]);
+    expect(result.skipped).toEqual([{ file: 'src/x/y.ts', why: 'deleted: nothing is left to mutate' }, { file: 'src/d.ts', why: 'deleted: nothing is left to mutate' }]);
+    // git takes these from the user's env, and a command that reads a pathspec dies under them.
+    for (const env of [{ GIT_GLOB_PATHSPECS: '1' }, { GIT_ICASE_PATHSPECS: '1' }]) expect(plan([], env), JSON.stringify(env)).toEqual(result);
     // Alone, such a file leaves no src file changed, and the report says so.
     const { repo: alone, git: gitAlone, write: writeAlone, plan: planAlone } = repoWith({ 'src/a.ts': text(lines('a', 3)) });
     writeAlone('src/b.ts', text(lines('b', 2)));
@@ -762,37 +766,23 @@ describe('the change', () => {
   });
 
   // holdsDataRoute reads one file: a check that takes the DATA_DIR name or a
-  // fixed root from another file's constant holds neither, so it is mutated,
-  // and a mutant of it can pick that root. src exports no such constant.
-  it('finds in src no exported constant that holds the DATA_DIR name or a fixed root', () => {
-    const found: string[] = [];
+  // fixed root from another file holds neither, so it is mutated, and a mutant
+  // of it can pick that root. A split of one of these files, in any form, takes
+  // it off this list (and may add another), so the list is pinned.
+  it('finds in src the files the content rule names today, and no other', () => {
     const listed = execFileSync('git', ['-c', 'core.quotePath=false', 'ls-files', '-z', '--cached', '--others', '--exclude-standard', 'src'], { cwd: botRoot, encoding: 'utf8' })
       .split('\0').filter(file => CODE.test(file) && fs.existsSync(path.join(botRoot, file)));
-    const exportsOne = (file: string, text: string) => {
-      const sf = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true);
-      const named = new Set(sf.statements.filter(ts.isExportDeclaration).filter(st => !st.moduleSpecifier && st.exportClause && ts.isNamedExports(st.exportClause))
-        .flatMap(st => (st.exportClause as ts.NamedExports).elements.map(el => (el.propertyName ?? el.name).text)));
-      return sf.statements.flatMap(st => {
-        if (ts.isExportAssignment(st)) return [st.expression];
-        if (!ts.isVariableStatement(st)) return [];
-        const exported = (st.modifiers ?? []).some(m => m.kind === ts.SyntaxKind.ExportKeyword);
-        return st.declarationList.declarations.filter(d => exported || (ts.isIdentifier(d.name) && named.has(d.name.text))).flatMap(d => (d.initializer ? [d.initializer] : []));
-      }).some(value => holdsDataRoute(file, value.getText(sf)));
-    };
-    for (const file of listed) {
-      const text = fs.readFileSync(path.join(botRoot, file), 'utf8');
-      if (holdsDataRoute(file, text) && exportsOne(file, text)) found.push(file);
-    }
+    // The bite's probe, which a bite run cut short leaves holding DATA_DIR until its next run sweeps it.
+    const named = listed.filter(file => !/^src\/smdb-bite-probe-\d+\.ts$/.test(file) && holdsDataRoute(file, fs.readFileSync(path.join(botRoot, file), 'utf8')));
     expect(listed.length).toBeGreaterThan(100);
-    // A new one: keep the check that picks the root and the root in one file, the way src/utils/dataRoot.ts does.
-    expect(found).toEqual([]);
-    // Each way to export one is seen.
-    for (const text of ["export const ROOT = '/data';\n", "const ENV = 'DATA_DIR';\nexport { ENV as NAME };\n", "export default '/app/build';\n",
-      'export const at = (x: string) => `/app/${x}`;\n']) {
-      expect(exportsOne('src/a.ts', text), text).toBe(true);
-    }
-    // A constant that holds the root a call chose, or a function that chooses it, is no such constant.
-    expect(exportsOne('src/a.ts', "export const DATA_ROOT = resolve();\nfunction resolve() { return process.env.DATA_DIR ?? '/data'; }\n")).toBe(false);
+    // A change: see that each check that picks a root still holds the root it picks, as dataRoot.ts does, then set the list.
+    expect(named.sort()).toEqual([
+      'src/bot/internalSetup/utils/pathHelpers.ts',
+      'src/index.ts',
+      'src/utils/autoSnapshot.ts',
+      'src/utils/dataRoot.ts',
+      'src/webui/routes/update.ts',
+    ]);
   });
 
   it('refuses, in a test and in a child, a fork whose own env lacks DATA_DIR (helpers/forkGuard.cjs)', async () => {

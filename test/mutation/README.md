@@ -164,9 +164,12 @@ does not name by its content.
   `data_dir` as the same). The rule reads one file at a time: a root built at run time (`path.join('/', 'data')`), or
   a check that takes the variable's name or a fixed root from another file (an imported constant, a function that
   returns a root it does not choose), is not seen, so the check that picks a root and the root it picks stay in one
-  file (the module path helpers return a root their own check chose). unit/mutationRanges.test.ts fails when a file in
-  src that git tracks or would add exports a constant that holds the name or a fixed root, the way such a split
-  would start. A mutant of a file the rule names (the DATA_DIR check made false, the
+  file (the module path helpers return a root their own check chose). unit/mutationRanges.test.ts pins the files in src
+  that git tracks or would add which the rule names today (these five) and fails when that list changes, so one that
+  a split leaves holding neither the name nor a root, whatever took them (a constants file, an enum, a JSON file), is
+  looked at. Not seen: a check written new, in
+  a file the rule never named, that takes its root or the name from another file from the start. A mutant of a file
+  the rule names (the DATA_DIR check made false, the
   image's marker taken as found, the fallback chosen) sends the tests to such a root, on a developer's machine a real
   data root (on Windows at the root of the drive of the process's cwd: the checkout's for a test, the temp dir's for a
   child step, so `D:\app` or `C:\data` for a checkout on D: with TEMP on C:) and anywhere else one the run would make
