@@ -60,6 +60,16 @@ describe('a mutant run', () => {
     expect(fake.read()).toEqual([]);
   });
 
+  it('refuses, before any mutant, a file it cannot read, as it may hold such a way', () => {
+    const fake = fakeVitest([]);
+    // A dir in a file's place: every platform fails to read it as one.
+    const run = runner(fake, 'a', '', [], { __STRYKER_ACTIVE_MUTANT__: undefined, SMDB_MUTATION_FILES: '["src/utils", "src/utils/dataRoot.ts"]' });
+    expect(run.status).toBe(1);
+    expect(fs.readFileSync(path.join(fake.out, 'dry-refused.txt'), 'utf8'))
+      .toMatch(/^src\/utils\/dataRoot\.ts: it reads DATA_DIR .*; src\/utils: it could not be read, so it was not checked for a way to a fixed root\n$/);
+    expect(fake.read()).toEqual([]);
+  });
+
   it.runIf(process.platform === 'win32')('names a command line too long to start vitest in the run\'s log', () => {
     const fake = fakeVitest([]);
     const files: string[] = [];
@@ -97,8 +107,10 @@ describe('a mutant run', () => {
     const fake = fakeVitest([]);
     expect(runner(fake, 'a', '1').status).toBe(0);
     expect(fs.existsSync(path.join(fake.out, 'dry-ms.txt'))).toBe(false);
-    expect(runner(fake, 'a', '1', [], { __STRYKER_ACTIVE_MUTANT__: undefined }).status).toBe(0);
-    expect(fs.readFileSync(path.join(fake.out, 'dry-ms.txt'), 'utf8')).toMatch(/^\d+$/);
+    // A run with no mutant reads its files: one that exists and holds no way to a fixed root.
+    expect(runner(fake, 'a', '1', [], { __STRYKER_ACTIVE_MUTANT__: undefined, SMDB_MUTATION_FILES: '["test/mutation/control.mjs"]' }).status).toBe(0);
+    // By the wall clock, then by a monotonic one.
+    expect(fs.readFileSync(path.join(fake.out, 'dry-ms.txt'), 'utf8')).toMatch(/^-?\d+ \d+$/);
   });
 });
 
@@ -142,15 +154,24 @@ describe('the run with no mutant after the reruns', () => {
     fs.mkdirSync(out);
     const time = (where: string, ms: string) => fs.writeFileSync(path.join(where, 'dry-ms.txt'), ms);
     const budget = { timeoutFactor: 4, timeoutMS: 60_000 };
-    time(reruns, '10000');
-    time(out, '100000');
+    // The budget from the reruns' wall time, as Stryker built it: 4 x 10 s + 60 s.
+    time(reruns, '10000 99999');
+    time(out, '100000 100000');
     expect(pastBudget(reruns, out, budget)).toBe('');
-    time(out, '100600');
-    expect(pastBudget(reruns, out, budget)).toBe('it took 101 s, past the 100 s Stryker gave each rerun, so the machine was too slow then to tell a slow mutant from a slow run');
+    const past = 'it took 101 s, past the 100 s Stryker gave each rerun, so the machine was too slow then to tell a slow mutant from a slow run';
+    time(out, '100600 100600');
+    expect(pastBudget(reruns, out, budget)).toBe(past);
+    // This run by its monotonic time: a clock stepped back during it moves only its wall time.
+    time(out, '50600 100600');
+    expect(pastBudget(reruns, out, budget)).toBe(past);
+    time(out, '150000 100000');
+    expect(pastBudget(reruns, out, budget)).toBe('');
     const unread = "its time, or the time of the reruns' own run with no mutant, could not be read";
-    time(out, 'soon');
-    expect(pastBudget(reruns, out, budget)).toBe(unread);
-    time(out, '1');
+    for (const text of ['soon', '100000', '100000 soon']) {
+      time(out, text);
+      expect(pastBudget(reruns, out, budget), text).toBe(unread);
+    }
+    time(out, '1 1');
     fs.rmSync(path.join(reruns, 'dry-ms.txt'));
     expect(pastBudget(reruns, out, budget)).toBe(unread);
   });

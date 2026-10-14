@@ -463,7 +463,7 @@ try {
   const checker = treeTsconfig(root, planned.keys(), '.stryker-tmp');
   const beyond = beyondTree(root, planned.keys(), checker, '.stryker-tmp');
   if (beyond.length > 0) {
-    throw new PassError(`the type checker would judge ${beyond.join(', ')}, which a file in the tree imports or references but no sandbox holds, so a mutant that broke only it would count as killed with no test run`);
+    throw new PassError(`the type checker would judge ${beyond.join(', ')}, which a file in the tree imports or references but no sandbox holds, so a mutant that broke only it would count as killed with no test run; make the tree's file stop importing or referencing it, or add it to the tree if it belongs there`);
   }
   fs.writeFileSync(path.join(root, checkerConfig), `${JSON.stringify(checker, null, 2)}\n`);
   const resultsA = await pass({ dir: 'a', tier: 'a', mutate: mutatePatterns(mutated()), extra: { ...PASSES.a, concurrency: opts.concurrency, tsconfigFile: checkerConfig } })

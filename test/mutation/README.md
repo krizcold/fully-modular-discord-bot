@@ -167,8 +167,8 @@ does not name by its content.
   file (the module path helpers return a root their own check chose). unit/mutationRanges.test.ts pins the files in src
   that git tracks or would add which the rule names today (these five) and fails when that list changes, so one that
   a split leaves holding neither the name nor a root, whatever took them (a constants file, an enum, a JSON file), is
-  looked at. Not seen: a check written new, in
-  a file the rule never named, that takes its root or the name from another file from the start. A mutant of a file
+  looked at. Not seen: a check, written new or moved out of one of these files, in a file the rule never named, that
+  takes its root or the name from another file (one of these included). A mutant of a file
   the rule names (the DATA_DIR check made false, the
   image's marker taken as found, the fallback chosen) sends the tests to such a root, on a developer's machine a real
   data root (on Windows at the root of the drive of the process's cwd: the checkout's for a test, the temp dir's for a
@@ -178,7 +178,7 @@ does not name by its content.
   same: unit/mutationRanges.test.ts fails when a file in src that git tracks or would add (what the gate can mutate)
   gains a string that starts with `/data/` and is not one of the known routes, so such a path goes through dataRoot.ts. `--mutate` refuses such a file, and each pass's run with no mutant, which
   comes before any mutant's, checks the files as that pass copied them, so a file that gains such code after the plan
-  stops the pass (NO RESULT, naming it).
+  stops the pass (NO RESULT, naming it), as does one it cannot read.
 - A changed line of code that no mutant lies wholly on, in a diff, an untracked file or a `--mutate` pattern, is named
   in the report: L5 says nothing about it. A mutant that spans several lines (emptying a body, an object or an array,
   flipping a condition split over lines, a chained call) counts for none of them, since it says nothing about each
@@ -212,7 +212,8 @@ does not name by its content.
    judged for being in src. TypeScript still follows a tree file's imports and references (a type-only one included),
    so when the checker would judge a file outside the tree, packages under node_modules aside, the gate stops before
    pass A with NO RESULT and names it (ranges.mjs beyondTree): a mutant that broke only that file would count as killed
-   with no test run. A gating mutant whose only type error is an unused `@ts-expect-error` (TS2578) type-checks, so it
+   with no test run. The way on: make the tree's file stop importing or referencing it, or add it to the tree if it
+   belongs there. A gating mutant whose only type error is an unused `@ts-expect-error` (TS2578) type-checks, so it
    meets pass A's tests again with no checker (`a-unchecked/`), and that run is its pass A: from there it goes on like
    any other mutant. Each mutant run is `vitest related <mutated files>` on the fast tier with one worker: every pass
    and rerun, and each run with no mutant, is given every file the gate mutates, and pass A gives Stryker those files
@@ -263,8 +264,10 @@ does not name by its content.
    B's dist built from that code), which ends after its run with no mutant (`dryRunOnly`). If they fail, the
    machine or a container went bad during the reruns, so what the reruns counted is inconclusive and the gate ends NO
    RESULT. When a rerun of pass A confirmed a timeout, the run must also fit in the budget Stryker gave each rerun (four
-   times the reruns' own run with no mutant, plus a minute; runner.mjs times both, mutation/control.mjs holds one to
-   the other), or the machine was as slow as the mutant seemed and the gate ends NO RESULT the same way. Its bound is
+   times the reruns' own run with no mutant, plus a minute; runner.mjs times both, by the wall clock, as Stryker times
+   a run to set that budget, and by a monotonic clock, which no clock step moves, as Stryker's timer holds a rerun to
+   it; mutation/control.mjs builds the budget from the first and holds this run to it by the second), or the machine
+   was as slow as the mutant seemed and the gate ends NO RESULT the same way. Its bound is
    an hour, above the budget any rerun of pass A had (its own run with no mutant ran under Stryker's five minutes), so
    the budget, not the bound, judges its time.
    What it cannot see: a machine that was

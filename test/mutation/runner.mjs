@@ -17,6 +17,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 
 const started = Date.now();
+const startedMono = performance.now();
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const testDir = path.join(root, 'test');
 // SMDB_MUTATION_VITEST: a test's stand-in for vitest (unit/mutationRunner.test.ts).
@@ -73,21 +74,32 @@ if (runIds && mutant !== 'dry') {
 // The run with no mutant comes first in every pass: here the files as the pass
 // copied them must hold no way to a fixed root, whatever changed since the gate
 // planned (ranges.mjs holdsDataRoute; an instrumented file still names it).
+// One it cannot read is refused too, as it may hold one.
 if (mutant === 'dry') {
   const { DATA_ROUTE_WHY, holdsDataRoute } = await import('./ranges.mjs');
-  const routes = files.filter(file => { try { return holdsDataRoute(file, fs.readFileSync(file, 'utf8')); } catch { return false; } });
-  if (routes.length > 0) {
-    fs.writeFileSync(path.join(out, 'dry-refused.txt'), `${routes.map(file => path.relative(root, file).split(path.sep).join('/')).join(', ')}: ${DATA_ROUTE_WHY}\n`);
+  /** @param {string[]} list */
+  const names = list => list.map(file => path.relative(root, file).split(path.sep).join('/')).join(', ');
+  /** @type {string[]} */
+  const unread = [];
+  const routes = files.filter(file => { try { return holdsDataRoute(file, fs.readFileSync(file, 'utf8')); } catch { unread.push(file); return false; } });
+  const refused = [
+    ...(routes.length > 0 ? [`${names(routes)}: ${DATA_ROUTE_WHY}`] : []),
+    ...(unread.length > 0 ? [`${names(unread)}: it could not be read, so it was not checked for a way to a fixed root`] : []),
+  ];
+  if (refused.length > 0) {
+    fs.writeFileSync(path.join(out, 'dry-refused.txt'), `${refused.join('; ')}\n`);
     process.exit(1);
   }
 }
 /**
  * Ends the run. A run with no mutant leaves its time, which the run with no
- * mutant after a rerun's timeouts is held to (touched.mjs).
+ * mutant after a rerun's timeouts is held to (control.mjs): by the wall clock,
+ * as Stryker times a run to set each rerun's budget, then by a monotonic
+ * clock, which no clock step moves, as Stryker's timer holds a rerun to it.
  * @param {number} code
  */
 const end = code => {
-  if (mutant === 'dry') fs.writeFileSync(path.join(out, 'dry-ms.txt'), String(Date.now() - started));
+  if (mutant === 'dry') fs.writeFileSync(path.join(out, 'dry-ms.txt'), `${Date.now() - started} ${Math.round(performance.now() - startedMono)}`);
   process.exit(code);
 };
 if (only.length > 0) {

@@ -401,6 +401,7 @@ describe('the touched-line mutation gate', () => {
       clean(beyondRefused.stdout);
       expect(beyondRefused.status, beyondRefused.stdout).toBe(2);
       expect(beyondRefused.stdout).toContain(`\nStopped:\n  the type checker would judge ${imported}, which a file in the tree imports or references but no sandbox holds,`);
+      expect(beyondRefused.stdout).toContain("; make the tree's file stop importing or referencing it, or add it to the tree if it belongs there\n");
       // A file that exists, in the tree, under a name Stryker reads as a glob.
       fs.writeFileSync(path.join(root, globbed), 'export const x = 1;\n');
       const globRefused = refuse('--mutate', globbed);

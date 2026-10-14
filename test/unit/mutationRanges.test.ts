@@ -12,7 +12,7 @@ import { describe, expect, it, onTestFinished } from 'vitest';
 import { runScenario } from '../helpers/child';
 import { canonicalName } from '../mutation/keys.mjs';
 import {
-  changeTarget, CODE, codeLines, commonLines, gates, gatesIn, inPattern, lineDiff, linesOfTarget, mergeRanges, mutatePatterns, notMutated, parseNameStatus,
+  changeTarget, codeLines, commonLines, gates, gatesIn, inPattern, lineDiff, linesOfTarget, mergeRanges, mutatePatterns, notMutated, parseNameStatus,
   planChange, planFromGit, unmatchedPatterns, untouched, wholeTarget, structureLines, DATA_ROUTE_WHY, GLOB_NAME_WHY, beyondTree, holdsDataRoute, rootGlobFree,
   sandboxPatterns, strykerTakes, tokenLines, treeTsconfig, NO_CODE_WHY, linkOf, ownNames,
 } from '../mutation/ranges.mjs';
@@ -745,12 +745,13 @@ describe('the change', () => {
   // full, which reads the same as a route path: a mutant of code that holds one
   // could reach a real data root, so src holds none but the routes named here.
   // Only what the gate can mutate is read: the files git tracks or would add,
-  // never a module cloned into a dir git ignores.
+  // never a module cloned into a dir git ignores, and of those the code it
+  // mutates (notMutated: no declaration file, no browser view).
   it("finds in src no path under /data written out in full, but the config page's routes", () => {
     const ROUTES = ['/data/delete', '/data/delete-guild', '/data/get', '/data/update'];
     const found = new Map<string, string>();
     const listed = execFileSync('git', ['-c', 'core.quotePath=false', 'ls-files', '-z', '--cached', '--others', '--exclude-standard', 'src'], { cwd: botRoot, encoding: 'utf8' })
-      .split('\0').filter(file => CODE.test(file) && fs.existsSync(path.join(botRoot, file)));
+      .split('\0').filter(file => notMutated(file) === null && fs.existsSync(path.join(botRoot, file)));
     for (const file of listed) {
       const text = fs.readFileSync(path.join(botRoot, file), 'utf8');
       if (holdsDataRoute(file, text)) continue;
@@ -767,11 +768,13 @@ describe('the change', () => {
 
   // holdsDataRoute reads one file: a check that takes the DATA_DIR name or a
   // fixed root from another file holds neither, so it is mutated, and a mutant
-  // of it can pick that root. A split of one of these files, in any form, takes
-  // it off this list (and may add another), so the list is pinned.
+  // of it can pick that root. A split that leaves one of these files holding
+  // neither takes it off this list (and may add another), so the list is
+  // pinned. A check moved out to a file that takes the name or the root from
+  // here leaves the list as it was, and is not seen (README).
   it('finds in src the files the content rule names today, and no other', () => {
     const listed = execFileSync('git', ['-c', 'core.quotePath=false', 'ls-files', '-z', '--cached', '--others', '--exclude-standard', 'src'], { cwd: botRoot, encoding: 'utf8' })
-      .split('\0').filter(file => CODE.test(file) && fs.existsSync(path.join(botRoot, file)));
+      .split('\0').filter(file => notMutated(file) === null && fs.existsSync(path.join(botRoot, file)));
     // The bite's probe, which a bite run cut short leaves holding DATA_DIR until its next run sweeps it.
     const named = listed.filter(file => !/^src\/smdb-bite-probe-\d+\.ts$/.test(file) && holdsDataRoute(file, fs.readFileSync(path.join(botRoot, file), 'utf8')));
     expect(listed.length).toBeGreaterThan(100);
