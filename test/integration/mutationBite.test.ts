@@ -47,7 +47,7 @@ function sweepLeftovers(at: string) {
     else if (/^smdb-(ignored|repo)-\d+$/.test(old)) fs.rmSync(path.join(src, old), { recursive: true, force: true });
   }
   if (fs.existsSync(dev)) for (const old of fs.readdirSync(dev).filter(name => /^smdb-(beyond|bite-reader)-\d+\.ts$/.test(name))) fs.rmSync(path.join(dev, old), { force: true });
-  if (fs.existsSync(mutation)) for (const old of fs.readdirSync(mutation).filter(name => /^smdb-tree-\d+(\.txt)?$/.test(name))) fs.rmSync(path.join(mutation, old), { recursive: true, force: true });
+  if (fs.existsSync(mutation)) for (const old of fs.readdirSync(mutation).filter(name => /^smdb-tree-\d+\.txt$/.test(name))) fs.rmSync(path.join(mutation, old), { force: true });
 }
 
 describe('the touched-line mutation gate', () => {
@@ -62,9 +62,9 @@ describe('the touched-line mutation gate', () => {
       for (const name of ['smdb-beyond-1.ts', 'smdb-bite-reader-1.ts']) fs.writeFileSync(path.join(dev, name), '');
       fs.mkdirSync(path.join(at, 'src', 'smdb-repo-1', '.git'), { recursive: true });
       for (const name of ['smdb-beyond-1.ts', 'smdb-bite-probe-1.ts', 'smdb-glob-[x]-1.ts', 'smdb-kept.ts']) fs.writeFileSync(path.join(at, 'src', name), '');
-      // The tree probes the run after the reruns adds: a file git does not ignore, and a dir of packages it does.
+      // The tree probe the run after the reruns adds, which git does not ignore.
       const mutation = path.join(at, 'test', 'mutation');
-      fs.mkdirSync(path.join(mutation, 'smdb-tree-1', 'node_modules'), { recursive: true });
+      fs.mkdirSync(mutation, { recursive: true });
       for (const name of ['smdb-tree-1.txt', 'smdb-tree-x.txt']) fs.writeFileSync(path.join(mutation, name), '');
       sweepLeftovers(at);
       expect(fs.readdirSync(dev)).toEqual(['smdb-appstore']);
@@ -190,24 +190,21 @@ describe('the touched-line mutation gate', () => {
 
   it('counts nothing its reruns found, and has no result, when the run with no mutant after them fails', { timeout: 600_000 }, () => {
     // The run with no mutant after the reruns fails, after it adds a file to
-    // the checkout and installs a dir of packages, which git ignores (the tree
-    // changed during the run).
+    // the checkout and, as an install would, stamps the suite's packages'
+    // lockfile anew (a file git ignores): the tree changed during the run.
     const added = `test/mutation/smdb-tree-${process.pid}.txt`;
-    const packages = `test/mutation/smdb-tree-${process.pid}`;
-    const lock = `${packages}/node_modules/.package-lock.json`;
+    const lock = 'test/node_modules/.package-lock.json';
     const { run, mutants } = (() => {
       try {
         return standInRun([
           "if (pass === 'control-a2') {",
           `  fs.writeFileSync(${JSON.stringify(path.join(root, added))}, 'changed');`,
-          `  fs.mkdirSync(${JSON.stringify(path.join(root, packages, 'node_modules'))}, { recursive: true });`,
-          `  fs.writeFileSync(${JSON.stringify(path.join(root, lock))}, '{}');`,
+          `  fs.utimesSync(${JSON.stringify(path.join(root, lock))}, new Date(), new Date());`,
           "  message = 'Error: the database went away';",
           '}',
         ].join('\n'));
       } finally {
         fs.rmSync(path.join(root, added), { force: true });
-        fs.rmSync(path.join(root, packages), { recursive: true, force: true });
       }
     })();
 

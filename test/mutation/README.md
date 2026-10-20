@@ -16,7 +16,7 @@ active mutant travels in `__STRYKER_ACTIVE_MUTANT__` and reaches child processes
 | stryker.json | (data) empty on purpose: every pass names it as its config file, so Stryker never reads one it finds in the bot root |
 | keys.mjs | (library) how a file and a mutant are named across passes; unit/mutationRanges.test.ts |
 | targets.mjs | (Stryker reporter) which mutant ids a later pass runs tests for, and Stryker's own time for each run with no mutant; unit/mutationRunner.test.ts and the bite |
-| tree.mjs | (library) the fingerprint of the tree a run reads and of the packages it links, taken before the plan and before the verdict; unit/mutationRanges.test.ts and the bite |
+| tree.mjs | (library) the fingerprint of the tree a run reads and of the packages it loads, taken before the plan and before the verdict; unit/mutationRanges.test.ts and the bite |
 | ../helpers/time.mjs | the factor on the config's test and hook limits and a child step's default bound (4 in a rerun alone and in the run with no mutant after the reruns; a limit a test, hook or step sets itself is not scaled) |
 | ../helpers/env.ts, setup.ts | what a test and its children keep of the environment, and the run's fast-check seed |
 | ../helpers/forkGuard.cjs | a process started with an env of its own that lacks DATA_DIR throws (fork, spawn, exec, execFile, a Worker), in a test and in a child step |
@@ -59,7 +59,8 @@ From the bot root, with Node 22.12 or newer (or SMDB_TEST_NODE set, as for `npm 
   above, under the root's `*.log`) or one outside the checkout: a file in the tree that the run writes to changes
   during the run, which ends it NO RESULT.
 - Exit 0 is PASS, 1 FAIL, 2 NO RESULT (nothing was tested, the tree changed during the run, or the gate stopped: the
-  report says which; or, with no report, the test packages are missing (`npm run test:install`), the checkout's path
+  report says which; or, with no report, the test packages are missing or test/node_modules is a link (`npm run
+  test:install`), the checkout's path
   does not match itself read as a glob, as Stryker reads it (a `[ ]` class, a `{ }` with a comma or a range, an extglob
   such as `+( )`, or one minimatch cannot read: Stryker then matches no file to mutate), .stryker-tmp could not be made, git could not list the tree,
   or the report itself could not be written; every `Verdict:` line goes to
@@ -286,11 +287,17 @@ The tree is fingerprinted (every file git tracks or would add, which is what eac
 content) before the plan reads a file,
 and again before the verdict: the plan reads the tree then, and each pass, and each run with no mutant after the
 reruns, copies it as it is when it starts, so a tree that changed during the run (an edit, a formatter, another
-session) ends NO RESULT, naming the files. The packages are linked into each sandbox, not copied (Stryker links every
-node_modules dir under the root), so each run loads them as they are then: the print holds npm's hidden lockfile in
-each of those dirs (`node_modules/.package-lock.json`), which npm rewrites when an install changes the dir and npm ci
-removes first, so an install during the run ends NO RESULT too. Not seen: an install still running when the last
-print is taken, and packages changed by anything but npm.
+session) ends NO RESULT, naming the files. The packages are not copied, so each run loads them as they are then:
+Stryker links into each sandbox every node_modules under the root that is a dir, not a link, and a run reaches the
+root's from the sandbox through the parent dirs when it is a link (a worktree sharing the main checkout's). The print
+holds npm's hidden lockfile (`.package-lock.json`) of the two dirs the runs load, the root's node_modules (src's
+packages) and test/node_modules (the suite's), read through a link to the dir it names; npm rewrites it at the end of
+an install that changes the dir and npm ci removes it first, so an install during the run ends NO RESULT too.
+test/node_modules must be a dir of the checkout's own: as a link Stryker would link none of the suite's packages, so
+the gate stops at its start (`npm run test:install` in that checkout). Not seen: an install still running when the
+last print is taken, or one stopped before it finished (npm writes the record last); an `npm rebuild` (it never
+rewrites the record); packages changed by any other tool; and packages in any other node_modules (a module's own, in
+a clone under src), which Stryker links too.
 
 A run Stryker counts as a kill is checked against vitest's report of it: it is a kill when a test itself failed, and a
 timeout when every failing test (or its beforeEach or afterEach hook) timed out. In a pass's first run (A, its run
@@ -401,8 +408,9 @@ removed source file.
   untracked repository, src/utils/dataRoot.ts and the suite's own helpers/env.ts and vitest.config.ts are refused (each
   with a stand-in for vitest that does not exist, so a refusal that broke would run no test).
 - Gate runs on a stand-in for vitest (every mutant times out) end NO RESULT: when the run with no mutant after the
-  reruns fails, with every timeout the reruns confirmed listed as inconclusive (that run also adds a file and a dir of
-  packages, which the verdict names as changed); when it passes past the reruns' budget;
+  reruns fails, with every timeout the reruns confirmed listed as inconclusive (that run also adds a file and stamps
+  test/node_modules' lockfile anew, as an install would, and the verdict names both as changed); when it passes past
+  the reruns' budget;
   and when the target (a throwaway untracked file) gains a way to `/data` during pass A, which pass A2's run with no
   mutant refuses, or during pass A2's reruns, which the run with no mutant after them refuses. Each is run with a
   mutant id left in the env, which the gate ignores.

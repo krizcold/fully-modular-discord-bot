@@ -483,7 +483,9 @@ describe('the data-loss oracle end to end', () => {
       .withCommand(['sleep', '600'])
       .start();
     const sh = async (cmd: string) => (await box.exec(['sh', '-c', cmd])).stdout;
-    const start = (run: string, port: number) => sh(`node /o/oracle.mjs write --run ${run} --guild ${GUILD} --lane a=http://127.0.0.1:${port} `
+    // Each writer starts 2 s late, asleep before its own code runs, as on a busy machine, so the waits below are pinned.
+    const late = Buffer.from('Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2000);').toString('base64');
+    const start = (run: string, port: number) => sh(`NODE_OPTIONS='--import=data:text/javascript;base64,${late}' node /o/oracle.mjs write --run ${run} --guild ${GUILD} --lane a=http://127.0.0.1:${port} `
       + `--duration 0 --rate 5 --limiter off --timeout 60000 --log /tmp/${run}.jsonl > /dev/null 2>&1 & echo $! > /tmp/${run}.pid`);
     const ended = async (run: string) => {
       for (let i = 0; i < 100; i++) {
@@ -493,17 +495,29 @@ describe('the data-loss oracle end to end', () => {
       }
       throw new Error(`${run}: no end line`);
     };
+    // The writer takes signals once it logs a request: it sets its handlers before the first one (a signal before
+    // that ends node at once, with no end line).
+    const logged = async (run: string, t: string) => {
+      for (let i = 0; i < 300; i++) {
+        if (parseLog(await sh(`cat /tmp/${run}.jsonl 2>/dev/null`)).some(e => e.t === t)) return;
+        await sleep(100);
+      }
+      throw new Error(`${run}: no ${t} line`);
+    };
     try {
       // Nothing listens on 8080, so requests fail at once.
       await start('hup', 8080);
-      await sleep(1000);
+      await logged('hup', 'ans');
       await sh('kill -HUP $(cat /tmp/hup.pid)');
       expect((await ended('hup')).some(e => e.t === 'ans')).toBe(true);
       // A server that never answers holds the first request through the stop grace; a second signal ends the run at once.
-      await sh(`node -e "require('net').createServer(() => {}).listen(8081)" > /dev/null 2>&1 &`);
-      await sleep(500);
+      await sh(`node -e "require('net').createServer(() => {}).listen(8081, () => require('fs').writeFileSync('/tmp/8081.up', ''))" > /dev/null 2>&1 &`);
+      for (let i = 0; (await sh('test -f /tmp/8081.up && echo up')).trim() !== 'up'; i++) {
+        if (i === 300) throw new Error('nothing listens on 8081');
+        await sleep(100);
+      }
       await start('term', 8081);
-      await sleep(1000);
+      await logged('term', 'send');
       await sh('kill -TERM $(cat /tmp/term.pid)');
       await sleep(300);
       await sh('kill -TERM $(cat /tmp/term.pid)');

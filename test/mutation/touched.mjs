@@ -11,7 +11,7 @@ import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { pastBudget } from './control.mjs';
-import { linkedLockfiles, treeChanges, treePrint } from './tree.mjs';
+import { PACKAGE_LOCKS, treeChanges, treePrint } from './tree.mjs';
 import { canonicalName, fileOf as nameOf, keyOf } from './keys.mjs';
 import { COMMON, PASSES } from './passes.mjs';
 
@@ -98,18 +98,22 @@ try {
   console.log(`Verdict: NO RESULT (the gate could not make .stryker-tmp, where Stryker puts its sandboxes: ${firstLine(error)})`);
   process.exit(2);
 }
+// Stryker links into each sandbox only a node_modules that is a dir, never a
+// link, and runner.mjs starts vitest from the sandbox's test/node_modules.
+if (!fs.lstatSync(path.join(root, 'test', 'node_modules'), { throwIfNoEntry: false })?.isDirectory()) {
+  console.log("Verdict: NO RESULT (test/node_modules is a link, not a dir of this checkout's own, and Stryker links only a dir into its sandboxes, so no run would find the suite's packages; run npm run test:install in this checkout)");
+  process.exit(2);
+}
 // The tree as the gate found it before reading any file (tree.mjs), and the
 // files that make it: the tracked files and the untracked ones git does not
 // ignore. An edit saved from here on shows at the end, and so does an install
-// in a dir of packages the sandboxes link (tree.mjs linkedLockfiles).
+// in a dir of packages the runs load (tree.mjs PACKAGE_LOCKS).
 const treeFiles = () => git('ls-files', '-z', '--cached', '--others', '--exclude-standard').split('\0').filter(Boolean);
+const packages = treePrint(root, PACKAGE_LOCKS);
 /** @type {Map<string, string>} */
 let planned;
-/** @type {Map<string, string>} */
-let linked;
 try {
   planned = treePrint(root, treeFiles());
-  linked = treePrint(root, linkedLockfiles(root));
 } catch (error) {
   console.log(`Verdict: NO RESULT (the gate could not read the tree: ${firstLine(error)})`);
   process.exit(2);
@@ -400,7 +404,7 @@ async function passOn(name, dir, tier, on, extra, only) {
  */
 function finish(stopped) {
   try {
-    report(stopped, [...treeChanges(planned, treePrint(root, treeFiles())), ...treeChanges(linked, treePrint(root, linkedLockfiles(root)))].sort());
+    report(stopped, [...treeChanges(planned, treePrint(root, treeFiles())), ...treeChanges(packages, treePrint(root, PACKAGE_LOCKS))].sort());
   } catch (error) {
     console.log(`Verdict: NO RESULT (the report could not be written: ${firstLine(error)})`);
     process.exit(2);

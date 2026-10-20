@@ -258,6 +258,20 @@ describe('the tree fingerprint', () => {
     expect(fs.existsSync(path.join(copy, '.stryker-tmp'))).toBe(false);
   });
 
+  it('ends the gate NO RESULT, exit 2, when test/node_modules is a link, which Stryker would not link into a sandbox', () => {
+    const copy = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-linked-'));
+    const packages = path.join(copy, 'test', 'node_modules');
+    onTestFinished(() => {
+      fs.unlinkSync(packages);
+      fs.rmSync(copy, { recursive: true, force: true });
+    });
+    copyGate(copy);
+    fs.symlinkSync(path.join(root, 'test', 'node_modules'), packages, 'junction');
+    const run = spawnSync(process.execPath, [path.join(copy, 'test', 'mutation', 'touched.mjs')], { cwd: copy, encoding: 'utf8' });
+    expect(run.status, run.stderr).toBe(2);
+    expect(run.stdout).toMatch(/^Verdict: NO RESULT \(test\/node_modules is a link, not a dir of this checkout's own, .*; run npm run test:install in this checkout\)$/m);
+  });
+
   it('ends the gate NO RESULT, exit 2, on stdout with every other verdict, when the test packages are missing', () => {
     const copy = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-noinstall-'));
     onTestFinished(() => fs.rmSync(copy, { recursive: true, force: true }));

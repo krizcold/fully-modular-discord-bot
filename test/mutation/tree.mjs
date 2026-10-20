@@ -2,9 +2,9 @@
 // plans and again before its verdict. Each pass, and each run with no mutant
 // after the reruns, copies the tree as it is when it starts, so a tree that
 // changed in between (an edit, a formatter, another session) leaves the
-// verdict about no one tree, and the gate has no result. The packages are
-// linked into each sandbox, not copied, so each run loads them as they are
-// then; the print holds npm's own record of each linked dir (linkedLockfiles).
+// verdict about no one tree, and the gate has no result. The packages are not
+// copied, so each run loads them as they are then; the print holds npm's own
+// record of each dir of them the runs load (PACKAGE_LOCKS).
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
@@ -19,30 +19,14 @@ export function treePrint(root, files) {
 }
 
 /**
- * npm's hidden lockfile in each node_modules dir Stryker links into every
- * sandbox, found as Stryker finds them (core's findNodeModulesList): every
- * node_modules under the root, not under .stryker-tmp and not inside another,
- * links not followed. npm rewrites the file when an install changes the dir,
- * and npm ci removes it first.
- * @param {string} root
- * @returns {string[]} from the root
+ * npm's hidden lockfile in each dir of packages the runs load: the root's
+ * (src's packages: Stryker links it into each sandbox, or, when it is itself a
+ * link, a run reaches it from the sandbox through the parent dirs) and test/'s
+ * (the suite's, linked). A link is read as the dir it names. npm rewrites the
+ * file at the end of an install that changes the dir, and npm ci removes it
+ * first.
  */
-export function linkedLockfiles(root) {
-  /** @type {string[]} */
-  const found = [];
-  const queue = ['.'];
-  let dir;
-  while ((dir = queue.pop()) !== undefined) {
-    const name = path.posix.basename(dir);
-    if (name === '.stryker-tmp') continue;
-    if (name === 'node_modules') {
-      found.push(path.posix.join(dir, '.package-lock.json'));
-      continue;
-    }
-    for (const entry of fs.readdirSync(path.join(root, dir), { withFileTypes: true })) if (entry.isDirectory()) queue.push(path.posix.join(dir, entry.name));
-  }
-  return found.sort();
-}
+export const PACKAGE_LOCKS = ['node_modules/.package-lock.json', 'test/node_modules/.package-lock.json'];
 
 /** @param {string} full */
 function stampOf(full) {

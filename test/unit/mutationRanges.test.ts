@@ -16,7 +16,7 @@ import {
   planChange, planFromGit, unmatchedPatterns, untouched, wholeTarget, structureLines, DATA_ROUTE_WHY, GLOB_NAME_WHY, beyondTree, holdsDataRoute, rootGlobFree,
   sandboxPatterns, strykerTakes, tokenLines, treeTsconfig, NO_CODE_WHY, linkOf, ownNames, mutatedName,
 } from '../mutation/ranges.mjs';
-import { linkedLockfiles, treeChanges, treePrint } from '../mutation/tree.mjs';
+import { PACKAGE_LOCKS, treeChanges, treePrint } from '../mutation/tree.mjs';
 
 // The touched-line ranges of the L5 gate (mutation/README.md): which lines a
 // change touched, and how far each widens so that Stryker makes the mutants
@@ -964,30 +964,27 @@ describe('the change', () => {
     expect(treeChanges(before, treePrint(root, ['a.ts', 'b.ts', 'c.ts', 'gone.ts']))).toEqual(['a.ts', 'c.ts']);
   });
 
-  it('fingerprints the packages each sandbox links, by the lockfile npm keeps in each dir Stryker links', () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-linked-'));
-    onTestFinished(() => fs.rmSync(root, { recursive: true, force: true }));
-    const at = (...parts: string[]) => {
-      fs.mkdirSync(path.join(root, ...parts), { recursive: true });
-      return path.join(root, ...parts);
-    };
-    fs.writeFileSync(path.join(at('node_modules'), '.package-lock.json'), '{}');
-    fs.writeFileSync(path.join(at('test', 'node_modules'), '.package-lock.json'), '{}');
-    at('updaters', 'x', 'node_modules', 'dep', 'node_modules');
-    at('.stryker-tmp', 'sandbox-1', 'node_modules');
-    at('src', 'empty');
-    // A link is not followed, as Stryker does not follow it.
-    fs.symlinkSync(at('outside', 'pkg'), path.join(root, 'src', 'linked'), 'junction');
-    at('outside', 'pkg', 'node_modules');
-    const found = ['node_modules/.package-lock.json', 'outside/pkg/node_modules/.package-lock.json', 'test/node_modules/.package-lock.json', 'updaters/x/node_modules/.package-lock.json'];
-    expect(linkedLockfiles(root)).toEqual(found);
-    const before = treePrint(root, linkedLockfiles(root));
-    expect(treeChanges(before, treePrint(root, linkedLockfiles(root)))).toEqual([]);
-    // An install rewrites the lockfile; npm ci removes it first; a new dir of packages shows too.
-    fs.writeFileSync(path.join(root, 'test', 'node_modules', '.package-lock.json'), '{"x":1}');
-    fs.rmSync(path.join(root, 'node_modules', '.package-lock.json'));
-    fs.writeFileSync(path.join(at('src', 'empty', 'node_modules'), '.package-lock.json'), '{}');
-    expect(treeChanges(before, treePrint(root, linkedLockfiles(root)))).toEqual(['node_modules/.package-lock.json', 'src/empty/node_modules/.package-lock.json', 'test/node_modules/.package-lock.json']);
+  it('fingerprints the packages the runs load, by the lockfile npm keeps in the root\'s and test/\'s node_modules', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-packages-'));
+    const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-main-'));
+    onTestFinished(() => {
+      fs.unlinkSync(path.join(root, 'node_modules'));
+      for (const dir of [root, elsewhere]) fs.rmSync(dir, { recursive: true, force: true });
+    });
+    expect(PACKAGE_LOCKS).toEqual(['node_modules/.package-lock.json', 'test/node_modules/.package-lock.json']);
+    // The root's packages through a link (a worktree sharing the main checkout's), test/'s a dir.
+    fs.mkdirSync(path.join(elsewhere, 'node_modules'));
+    fs.writeFileSync(path.join(elsewhere, 'node_modules', '.package-lock.json'), '{}');
+    fs.symlinkSync(path.join(elsewhere, 'node_modules'), path.join(root, 'node_modules'), 'junction');
+    fs.mkdirSync(path.join(root, 'test', 'node_modules'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'test', 'node_modules', '.package-lock.json'), '{}');
+    const before = treePrint(root, PACKAGE_LOCKS);
+    expect([...before.values()].every(stamp => /^\d+:[\d.]+:[0-9a-f]{40}$/.test(stamp))).toBe(true);
+    expect(treeChanges(before, treePrint(root, PACKAGE_LOCKS))).toEqual([]);
+    // An install in the linked dir rewrites its lockfile; npm ci in test/ removes it first.
+    fs.writeFileSync(path.join(elsewhere, 'node_modules', '.package-lock.json'), '{"x":1}');
+    fs.rmSync(path.join(root, 'test', 'node_modules', '.package-lock.json'));
+    expect(treeChanges(before, treePrint(root, PACKAGE_LOCKS))).toEqual(PACKAGE_LOCKS);
   });
 
 });
