@@ -52,13 +52,15 @@ From the bot root, with Node 22.12 or newer (or SMDB_TEST_NODE set, as for `npm 
   Either way the name must be one Stryker reads as itself (ranges.mjs strykerTakes: no glob magic in it, and its whole
   path matches itself as Stryker matches it), so `( ) ! + @` in a name are taken unless they make an extglob such as
   `+(x)` or `@(x)`, and `[id].ts` or `a{1,2}.ts` is not.
-- `--concurrency N` sets pass A's parallel runs (default: half the cores); pass B uses half of that.
+- `--concurrency N` sets pass A's parallel runs (default: half the cores): up to N test commands at once, and two at
+  N = 1, since Stryker hands the type checker's slot to a test runner once checking ends. Pass B uses half of N, at
+  least one.
 - `--keep` keeps the sandboxes in `.stryker-tmp/` for a look after the run. Without it every sandbox is removed, a
   failed pass's too, unless the run is interrupted: Stryker then exits at once and leaves that pass's sandbox (and,
   in pass A, `.stryker-tmp/tsconfig.l5-<pid>.json`), which is safe to delete (its node_modules are links, which a
   delete removes and does not follow) and which no later run reads. A signal or kill that reaches the gate's process
   alone (`kill <pid>`, `taskkill /F` without `/T`) also leaves the test commands it was running going, with nothing to
-  bound them: up to `--concurrency` of them in pass A and half that in pass B, each a runner.mjs and the vitest under
+  bound them: as many as pass A or pass B runs at once (above), each a runner.mjs and the vitest under
   it. End each of those trees: find them by `runner.mjs` in their command line (on Windows the shell above each is
   already gone, and ending a runner.mjs ends the Node processes under it). Ctrl-C in the gate's terminal reaches all
   of it.
@@ -162,7 +164,9 @@ does not name by its content.
 - Not mutated, and named in the report with the reason: files outside src (the root scripts, updaters/, tests, docs and
   images), files that are not code (code is `.ts`, `.tsx`, `.mts`, `.cts`, `.js`, `.cjs` and `.mjs`), declaration files
   (`.d.ts`, `.d.mts`, `.d.cts`), the browser views under src/webui/public (copied into dist, never
-  compiled, and no test loads them yet), a file deleted or moved out of src, an untracked git repository (git lists
+  compiled, and no test loads them yet), a file under a node_modules dir in src (tracked only when forced past the
+  root's ignore rule: Stryker links such a dir into a sandbox and never copies it), a file deleted or moved out of src,
+  an untracked git repository (git lists
   none of its files, and none is copied into a sandbox) or a git submodule under src, a file whose name Stryker would read as a glob (`[id].ts`,
   `a{1,2}.ts`; rename it), a name that leads through a link, as the disk tells it (a link in src, one that differs
   from its file only in case included, a file under a junction, one out of the bot root: a file is mutated under its
@@ -212,8 +216,9 @@ does not name by its content.
 ## The passes
 
 1. **Pass A, in-process.** Stryker instruments the ranges in a sandbox copy of the repo that holds the files the gate
-   fingerprints and nothing else: the tracked files and the untracked ones git does not ignore (ranges.mjs
-   sandboxPatterns gives Stryker a pattern that leaves everything out, then lets each of those files back in). So
+   fingerprints and nothing else: the tracked files and the untracked ones git does not ignore, those under a
+   node_modules dir aside, which Stryker links instead (ranges.mjs sandboxPatterns gives Stryker a pattern that leaves
+   everything out, then lets each of those files back in). So
    git's ignored files (`.env`, the data dirs, dist), the files of an untracked git repository or a submodule (git
    lists only its dir, which lets nothing in; code that needs them fails there, NO RESULT) and any file made after the
    gate started stay out of every sandbox. Stryker's copy does not follow a link to a directory either: the files git
@@ -230,10 +235,12 @@ does not name by its content.
    so when the checker would judge a file outside the tree, packages under node_modules aside, the gate stops before
    pass A with NO RESULT and names it (ranges.mjs beyondTree): a mutant that broke only that file would count as killed
    with no test run. The way on: make the tree's file stop importing or referencing it, or add it to the tree if it
-   belongs there. The checker runs test/'s TypeScript, and dist and the shipped build compile with the bot root's, so
-   when the two versions differ the gate stops before pass A too, with NO RESULT naming both (ranges.mjs
-   checkerDiffers): a mutant only one of them rejects would count as killed by a compiler the code never meets. The
-   two lockfiles pin one version, and a unit test holds them to it. A gating mutant whose only type error is an unused `@ts-expect-error` (TS2578) type-checks, so it
+   belongs there. The checker runs test/'s installed TypeScript, and the build that ships installs the one the root
+   lockfile names (npm ci in the image and in CI), so when the two differ the gate stops before pass A too, with NO
+   RESULT naming both (ranges.mjs checkerDiffers): a mutant the checker rejects and the shipped build accepts would
+   count as killed with no test run. The way on is to pin test/package.json and its lockfile to the root lockfile's
+   version and run `npm run test:install`. dist and pass B's build compile with the root's installed copy, but no
+   mutant meets their type judgment. A unit test holds the two lockfiles to one version. A gating mutant whose only type error is an unused `@ts-expect-error` (TS2578) type-checks, so it
    meets pass A's tests again with no checker (`a-unchecked/`), and that run is its pass A: from there it goes on like
    any other mutant. Each mutant run is `vitest related <mutated files>` on the fast tier with one worker: every pass
    and rerun, and each run with no mutant, is given every file the gate mutates, and pass A gives Stryker those files
@@ -345,8 +352,9 @@ given one, anything else is refused), so a property draws the same inputs in eve
 mutant: a property that fails in a mutant's run fails for the mutant. A pass A kill stands on one run, so a test that
 can fail by chance there still credits a kill: one random in another way (its own Math.random, the clock), one that
 fails for the machine in a way the list above does not hold, and one that uses a fixed port or path, since every mutant's run in pass A shares one sandbox and one temp dir: a run beside it
-can hold the port or the path, and a run before it can leave the path behind. Fast tests use mkdtemp and port 0;
-`--concurrency 1` rules out only the runs beside it.
+can hold the port or the path, and a run before it can leave the path behind. Fast tests use mkdtemp and port 0. No
+`--concurrency` rules out a run beside a pass A run (pass A runs two at 1, above); only the reruns alone (a2, b2) and
+the runs with no mutant after them run one at a time, and so do the unchecked pass A runs and pass B at 1.
 
 ## The report
 
@@ -371,7 +379,8 @@ The verdict is FAIL when a gating mutant ends Survived, NoCoverage, inconclusive
 killed and is listed. CompileError counts as killed by the type checker, unless its only error is an unused
 `@ts-expect-error` (a gating one then meets pass A's tests with no checker, above). The verdict is NO RESULT when no src file
 changed, when no gating mutant was made, when every gating mutant was a type error (no test ran against the change),
-when the type checker would judge a file outside the tree, when a pass could not run, when Stryker mutated a file no target names, when the run with no mutant after the reruns
+when the type checker would judge a file outside the tree, when its TypeScript is not the one the root lockfile
+ships, when a pass could not run, when Stryker mutated a file no target names, when the run with no mutant after the reruns
 failed (or ran past the reruns' budget), when the tree changed during the run, or when a test's stand-in replaced
 vitest (SMDB_MUTATION_VITEST, for the gate's own tests only); the report then
 says why, with the passes that did finish.

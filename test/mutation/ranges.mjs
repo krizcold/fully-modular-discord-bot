@@ -39,6 +39,7 @@ export function notMutated(file) {
   if (!file.startsWith('src/')) return 'outside src';
   if (file.startsWith(VIEWS)) return 'a browser view: copied into dist, never compiled, and no test loads it';
   if (DECLARATION.test(file) || !CODE.test(file)) return 'not code';
+  if (file.split('/').includes('node_modules')) return 'under a node_modules dir, which Stryker links into a sandbox and never copies, so no mutant can be made in it';
   return null;
 }
 
@@ -936,21 +937,24 @@ export function beyondTree(root, tree, config, dir) {
 }
 
 /**
- * Why the type checker cannot stand in for the build, or '': it runs test/'s
- * TypeScript, the one this file loads, while dist and the shipped build
- * compile with the bot root's, so a mutant only one of them rejects would count
- * as killed by a compiler the code never meets.
+ * Why the type checker cannot stand in for the shipped build, or '': it runs
+ * test/'s installed TypeScript, the one this file loads, and the build that
+ * ships installs the root lockfile's (npm ci in the image and in CI), so a
+ * mutant the checker rejects and that build accepts would count as killed with
+ * no test run. The lockfile is a tracked file, read through no link; dist and
+ * pass B's build compile with the root's installed copy, but no mutant meets
+ * their type judgment (the sandbox's src is not type-checked there).
  * @param {string} root
  */
 export function checkerDiffers(root) {
-  let built = 'none';
+  let shipped = 'none';
   try {
-    built = String(JSON.parse(fs.readFileSync(createRequire(path.join(root, 'package.json')).resolve('typescript/package.json'), 'utf8')).version);
+    shipped = String(JSON.parse(fs.readFileSync(path.join(root, 'package-lock.json'), 'utf8')).packages['node_modules/typescript'].version);
   } catch {
-    // No TypeScript the bot root can load: it differs.
+    // No TypeScript the root lockfile ships: it differs.
   }
-  if (built === ts.version) return '';
-  return `the type checker runs TypeScript ${ts.version} (test/'s) and the bot root builds with ${built}, so a mutant only one of them rejects would count as killed by a compiler the shipped code never meets; install one version in both (test/package.json pins it)`;
+  if (shipped === ts.version) return '';
+  return `the type checker runs TypeScript ${ts.version} (test/'s, installed) and the root lockfile ships ${shipped}, so a mutant the checker rejects and the shipped build accepts would count as killed with no test run; pin test/package.json and its lockfile to ${shipped} and run npm run test:install`;
 }
 
 /** @param {string} file a path, compared as the file system does (no case on Windows) */

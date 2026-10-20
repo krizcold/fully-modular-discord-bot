@@ -588,17 +588,20 @@ describe('the change', () => {
     expect(beyond('/// <reference path="./modulesDev/m.ts" />\nexport const x = 1;\n')).toEqual(['src/modulesDev/m.ts']);
   });
 
-  it('refuses a type checker whose TypeScript is not the one the bot root builds with, and the two lockfiles pin one', () => {
+  it('refuses a type checker whose TypeScript is not the one the root lockfile ships, and the two lockfiles pin one', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-tsroot-'));
     onTestFinished(() => fs.rmSync(root, { recursive: true, force: true }));
     const checking = (JSON.parse(fs.readFileSync(path.join(botRoot, 'test', 'node_modules', 'typescript', 'package.json'), 'utf8')) as { version: string }).version;
-    fs.writeFileSync(path.join(root, 'package.json'), '{}');
+    const ships = (version: string) => fs.writeFileSync(path.join(root, 'package-lock.json'), JSON.stringify({ packages: { 'node_modules/typescript': { version } } }));
+    // An installed copy at the root is not what ships: the image and CI install the lockfile's.
     fs.mkdirSync(path.join(root, 'node_modules', 'typescript'), { recursive: true });
-    const builds = (version: string) => fs.writeFileSync(path.join(root, 'node_modules', 'typescript', 'package.json'), JSON.stringify({ name: 'typescript', version }));
-    builds(checking);
+    fs.writeFileSync(path.join(root, 'node_modules', 'typescript', 'package.json'), JSON.stringify({ name: 'typescript', version: checking }));
+    ships(checking);
     expect(checkerDiffers(root)).toBe('');
-    builds('6.0.3');
-    expect(checkerDiffers(root)).toBe(`the type checker runs TypeScript ${checking} (test/'s) and the bot root builds with 6.0.3, so a mutant only one of them rejects would count as killed by a compiler the shipped code never meets; install one version in both (test/package.json pins it)`);
+    ships('6.0.3');
+    expect(checkerDiffers(root)).toBe(`the type checker runs TypeScript ${checking} (test/'s, installed) and the root lockfile ships 6.0.3, so a mutant the checker rejects and the shipped build accepts would count as killed with no test run; pin test/package.json and its lockfile to 6.0.3 and run npm run test:install`);
+    fs.rmSync(path.join(root, 'package-lock.json'));
+    expect(checkerDiffers(root)).toMatch(/and the root lockfile ships none, /);
     expect(checkerDiffers(botRoot)).toBe('');
     const locked = (dir: string) => (JSON.parse(fs.readFileSync(path.join(dir, 'package-lock.json'), 'utf8')) as { packages: Record<string, { version: string }> }).packages['node_modules/typescript'].version;
     expect(locked(path.join(botRoot, 'test'))).toBe(locked(botRoot));
@@ -1438,11 +1441,12 @@ describe('the targets', () => {
         { status: 'M', file: 'src/a.ts' },
         { status: 'D', file: 'src/gone.ts' },
       ],
-      ['src/webui/public/new.js', 'src/new.ts', 'src/mod/', 'tools/mod/'],
-      { 'src/a.ts': SAMPLE, 'src/new.ts': 'export const n = 1;\n' },
+      ['src/webui/public/new.js', 'src/new.ts', 'src/mod/', 'tools/mod/', 'src/vend/node_modules/a.ts'],
+      { 'src/a.ts': SAMPLE, 'src/new.ts': 'export const n = 1;\n', 'src/vend/node_modules/a.ts': 'export const v = 1;\n' },
     );
     expect(plan.skipped.map(s => s.file)).toEqual([
       'src/webui/public/app.jsx', 'src/bot/types.d.ts', 'src/bot/modules/x/module.json', 'src/a.ts', 'src/gone.ts', 'src/webui/public/new.js', 'src/mod/', 'tools/mod/',
+      'src/vend/node_modules/a.ts',
     ]);
     expect(plan.skipped.every(s => s.why.length > 0)).toBe(true);
     expect(plan.skipped.find(s => s.file === 'src/a.ts')?.why).toBe('no code changed (a rename, a mode change, line endings only, only blank lines or comments, or a file only taken out of the index)');
@@ -1453,6 +1457,9 @@ describe('the targets', () => {
     // A TypeScript module named for its output's format is code, its declarations are not, and it is read as TypeScript.
     for (const file of ['src/a.mts', 'src/a.cts', 'src/a.tsx']) expect(notMutated(file), file).toBeNull();
     for (const file of ['src/a.d.mts', 'src/a.d.cts', 'src/a.d.ts']) expect(notMutated(file), file).toBe('not code');
+    // Stryker links a node_modules dir into a sandbox and never copies it; a name that only starts so is code.
+    expect(notMutated('src/vend/node_modules/a.ts')).toBe('under a node_modules dir, which Stryker links into a sandbox and never copies, so no mutant can be made in it');
+    expect(notMutated('src/node_modules.ts')).toBeNull();
     for (const file of ['src/a.mts', 'src/a.cts']) expect(holdsDataRoute(file, "export const root = <string>(process.env.ROOT || '/data');"), file).toBe(true);
   });
 
