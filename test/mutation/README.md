@@ -57,8 +57,11 @@ From the bot root, with Node 22.12 or newer (or SMDB_TEST_NODE set, as for `npm 
   failed pass's too, unless the run is interrupted: Stryker then exits at once and leaves that pass's sandbox (and,
   in pass A, `.stryker-tmp/tsconfig.l5-<pid>.json`), which is safe to delete (its node_modules are links, which a
   delete removes and does not follow) and which no later run reads. A signal or kill that reaches the gate's process
-  alone (`kill <pid>`, `taskkill /F` without `/T`) also leaves the test command it was running going, with nothing to
-  bound it: end that process tree too (Ctrl-C in the gate's terminal reaches all of it).
+  alone (`kill <pid>`, `taskkill /F` without `/T`) also leaves the test commands it was running going, with nothing to
+  bound them: up to `--concurrency` of them in pass A and half that in pass B, each a runner.mjs and the vitest under
+  it. End each of those trees: find them by `runner.mjs` in their command line (on Windows the shell above each is
+  already gone, and ending a runner.mjs ends the Node processes under it). Ctrl-C in the gate's terminal reaches all
+  of it.
 - The gate fingerprints every file git tracks or would add (below), so its output goes to a file git ignores (`l5.log`
   above, under the root's `*.log`) or one outside the checkout: a file in the tree that the run writes to changes
   during the run, which ends it NO RESULT.
@@ -227,7 +230,10 @@ does not name by its content.
    so when the checker would judge a file outside the tree, packages under node_modules aside, the gate stops before
    pass A with NO RESULT and names it (ranges.mjs beyondTree): a mutant that broke only that file would count as killed
    with no test run. The way on: make the tree's file stop importing or referencing it, or add it to the tree if it
-   belongs there. A gating mutant whose only type error is an unused `@ts-expect-error` (TS2578) type-checks, so it
+   belongs there. The checker runs test/'s TypeScript, and dist and the shipped build compile with the bot root's, so
+   when the two versions differ the gate stops before pass A too, with NO RESULT naming both (ranges.mjs
+   checkerDiffers): a mutant only one of them rejects would count as killed by a compiler the code never meets. The
+   two lockfiles pin one version, and a unit test holds them to it. A gating mutant whose only type error is an unused `@ts-expect-error` (TS2578) type-checks, so it
    meets pass A's tests again with no checker (`a-unchecked/`), and that run is its pass A: from there it goes on like
    any other mutant. Each mutant run is `vitest related <mutated files>` on the fast tier with one worker: every pass
    and rerun, and each run with no mutant, is given every file the gate mutates, and pass A gives Stryker those files

@@ -64,7 +64,7 @@ try {
   process.exit(2);
 }
 const {
-  structureLines, DATA_ROUTE_WHY, EXTRA_BREAK_WHY, GLOB_NAME_WHY, beyondTree, gatesIn, holdsDataRoute, holdsExtraBreak, linesOfTarget, mutatePatterns,
+  structureLines, DATA_ROUTE_WHY, EXTRA_BREAK_WHY, GLOB_NAME_WHY, beyondTree, checkerDiffers, gatesIn, holdsDataRoute, holdsExtraBreak, linesOfTarget, mutatePatterns,
   notMutated, ownNames, planFromGit, rootGlobFree, sandboxPatterns, strykerTakes, treeTsconfig, unmatchedPatterns, untouched,
 } = ranges;
 const { byKiller, classifyKill, judge, onlyUnusedDirective, outcome, toConfirm, toPassB, toUncheck } = verdicts;
@@ -471,7 +471,10 @@ try {
   if (!targets.some(canGate)) await finish();
 
   console.log(`L5: mutating ${scope}: ${changedFiles().length} file(s), pass A (in-process tests that import them)`);
-  // The type checker judges the tree's files only (ranges.mjs treeTsconfig, beyondTree).
+  // The type checker judges the tree's files only (ranges.mjs treeTsconfig, beyondTree), with the TypeScript the
+  // build uses (checkerDiffers).
+  const compiler = checkerDiffers(root);
+  if (compiler) throw new PassError(compiler);
   const checkerConfig = `.stryker-tmp/tsconfig.l5-${process.pid}.json`;
   const checker = treeTsconfig(root, planned.keys(), '.stryker-tmp');
   const beyond = beyondTree(root, planned.keys(), checker, '.stryker-tmp');

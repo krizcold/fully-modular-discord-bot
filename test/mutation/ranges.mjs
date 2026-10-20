@@ -935,6 +935,24 @@ export function beyondTree(root, tree, config, dir) {
     .map(file => file.split(path.sep).join('/'));
 }
 
+/**
+ * Why the type checker cannot stand in for the build, or '': it runs test/'s
+ * TypeScript, the one this file loads, while dist and the shipped build
+ * compile with the bot root's, so a mutant only one of them rejects would count
+ * as killed by a compiler the code never meets.
+ * @param {string} root
+ */
+export function checkerDiffers(root) {
+  let built = 'none';
+  try {
+    built = String(JSON.parse(fs.readFileSync(createRequire(path.join(root, 'package.json')).resolve('typescript/package.json'), 'utf8')).version);
+  } catch {
+    // No TypeScript the bot root can load: it differs.
+  }
+  if (built === ts.version) return '';
+  return `the type checker runs TypeScript ${ts.version} (test/'s) and the bot root builds with ${built}, so a mutant only one of them rejects would count as killed by a compiler the shipped code never meets; install one version in both (test/package.json pins it)`;
+}
+
 /** @param {string} file a path, compared as the file system does (no case on Windows) */
 const fileKey = file => (process.platform === 'win32' ? path.resolve(file).toLowerCase() : path.resolve(file));
 

@@ -13,7 +13,7 @@ import { runScenario } from '../helpers/child';
 import { canonicalName } from '../mutation/keys.mjs';
 import {
   changeTarget, codeLines, commonLines, gates, gatesIn, inPattern, lineDiff, linesOfTarget, mergeRanges, mutatePatterns, notMutated, parseNameStatus,
-  planChange, planFromGit, unmatchedPatterns, untouched, wholeTarget, structureLines, DATA_ROUTE_WHY, GLOB_NAME_WHY, beyondTree, holdsDataRoute, rootGlobFree,
+  planChange, planFromGit, unmatchedPatterns, untouched, wholeTarget, structureLines, DATA_ROUTE_WHY, GLOB_NAME_WHY, beyondTree, checkerDiffers, holdsDataRoute, rootGlobFree,
   sandboxPatterns, strykerTakes, tokenLines, treeTsconfig, NO_CODE_WHY, linkOf, ownNames, mutatedName,
 } from '../mutation/ranges.mjs';
 import { PACKAGE_LOCKS, treeChanges, treePrint } from '../mutation/tree.mjs';
@@ -586,6 +586,26 @@ describe('the change', () => {
     expect(beyond("import type { P } from 'pkg';\nexport const x: P = 1;\n")).toEqual([]);
     expect(beyond("import type { N } from './modulesDev/m';\nexport const x: N = 1;\n")).toEqual(['src/modulesDev/m.ts']);
     expect(beyond('/// <reference path="./modulesDev/m.ts" />\nexport const x = 1;\n')).toEqual(['src/modulesDev/m.ts']);
+  });
+
+  it('refuses a type checker whose TypeScript is not the one the bot root builds with, and the two lockfiles pin one', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-tsroot-'));
+    onTestFinished(() => fs.rmSync(root, { recursive: true, force: true }));
+    const checking = (JSON.parse(fs.readFileSync(path.join(botRoot, 'test', 'node_modules', 'typescript', 'package.json'), 'utf8')) as { version: string }).version;
+    fs.writeFileSync(path.join(root, 'package.json'), '{}');
+    fs.mkdirSync(path.join(root, 'node_modules', 'typescript'), { recursive: true });
+    const builds = (version: string) => fs.writeFileSync(path.join(root, 'node_modules', 'typescript', 'package.json'), JSON.stringify({ name: 'typescript', version }));
+    builds(checking);
+    expect(checkerDiffers(root)).toBe('');
+    builds('6.0.3');
+    expect(checkerDiffers(root)).toBe(`the type checker runs TypeScript ${checking} (test/'s) and the bot root builds with 6.0.3, so a mutant only one of them rejects would count as killed by a compiler the shipped code never meets; install one version in both (test/package.json pins it)`);
+    expect(checkerDiffers(botRoot)).toBe('');
+    const locked = (dir: string) => (JSON.parse(fs.readFileSync(path.join(dir, 'package-lock.json'), 'utf8')) as { packages: Record<string, { version: string }> }).packages['node_modules/typescript'].version;
+    expect(locked(path.join(botRoot, 'test'))).toBe(locked(botRoot));
+    // The gate asks before pass A.
+    const gate = fs.readFileSync(path.join(botRoot, 'test', 'mutation', 'touched.mjs'), 'utf8');
+    expect(gate.indexOf('if (compiler) throw new PassError(compiler);')).toBeGreaterThan(0);
+    expect(gate.indexOf('if (compiler) throw new PassError(compiler);')).toBeLessThan(gate.indexOf("dir: 'a', tier: 'a'"));
   });
 
   it("refuses a checkout path Stryker would read as a glob, exactly where Stryker's own matcher matches no file under it", async () => {
