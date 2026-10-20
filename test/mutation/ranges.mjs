@@ -22,9 +22,10 @@ const { Minimatch, minimatch, escape } = strykerRequire('minimatch');
  * @typedef {{ start: { line: number, column: number }, end: { line: number, column: number } }} Location
  */
 
-// Code, by its name; notMutated narrows it to what the gate mutates (the env
-// scrub's scans of src read CODE as it is, the /data scans what the planner
-// makes of src).
+// Code, by its name; notMutated narrows it by name to src's code, and the
+// planner (planChange) skips more, by link, name and content. The env scrub's
+// scans of src read CODE as it is; the content rule's pinned list
+// (unit/mutationRanges.test.ts) reads what the planner makes of src.
 export const CODE = /\.(ts|tsx|mts|cts|js|cjs|mjs)$/;
 const DECLARATION = /\.d\.[cm]?ts$/;
 const VIEWS = 'src/webui/public/';
@@ -49,19 +50,23 @@ export const EXTRA_BREAK_WHY = 'it holds a line break Stryker counts and the gat
 /** @param {string} text */
 export const holdsExtraBreak = text => EXTRA_BREAK.test(text);
 
-// The variable's name as a string, the '/data' fallback itself (not a path under it, as the config page's routes such
-// as '/data/get' are), and '/app' or a path under it, in any case and with either slash.
-const DATA_ROUTE = /^(DATA_DIR|[\\/]data[\\/]?|[\\/]app([\\/].*)?)$/is;
+// The variable's name as a string, and the fixed roots '/data' and '/app' or a path under either, in any case and
+// with either slash.
+const DATA_ROUTE = /^(DATA_DIR|[\\/](data|app)([\\/].*)?)$/is;
 
-export const DATA_ROUTE_WHY = "it reads DATA_DIR or holds a fixed root (the '/data' fallback, or '/app' or a path under it), so a mutant of it could send the tests there, on a developer's machine a real data root and anywhere else one the run would make";
+// The config page's route paths, which read like paths under '/data' and are no root (src/webui/routes/config.ts).
+export const CONFIG_ROUTES = ['/data/delete', '/data/delete-guild', '/data/get', '/data/update'];
+
+export const DATA_ROUTE_WHY = "it reads DATA_DIR or holds a fixed root ('/data' or '/app', or a path under either), so a mutant of it could send the tests there, on a developer's machine a real data root and anywhere else one the run would make";
 
 /**
  * Whether a file's code names the DATA_DIR variable, or holds as a string or a
- * template's head the '/data' fallback or the image's '/app' root or a path
- * under it, in any case and with either slash (Windows reads `/Data`, `\data`
- * and `data_dir` as the same): a mutant of it (a check of DATA_DIR or of the
- * image made false or true, the fallback chosen) could send the tests to a
- * fixed root outside the sandbox, so the gate never mutates it.
+ * template's head the '/data' or the image's '/app' root or a path under
+ * either (but the config page's route paths), in any case and with either
+ * slash (Windows reads `/Data`, `\data` and `data_dir` as the same): a mutant
+ * of it (a check of DATA_DIR or of the image made false or true, a fallback
+ * chosen) could send the tests to a fixed root outside the sandbox, so the
+ * gate never mutates it.
  * @param {string} file
  * @param {string} text
  */
@@ -70,7 +75,7 @@ export function holdsDataRoute(file, text) {
   /** @param {ts.Node} node */
   const walk = node => {
     if (ts.isIdentifier(node) && node.text.toUpperCase() === 'DATA_DIR') found = true;
-    else if ((ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node) || ts.isTemplateHead(node)) && DATA_ROUTE.test(node.text)) found = true;
+    else if ((ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node) || ts.isTemplateHead(node)) && DATA_ROUTE.test(node.text) && !CONFIG_ROUTES.includes(node.text)) found = true;
     else if (!found) ts.forEachChild(node, walk);
   };
   walk(parse(file, text));
@@ -709,6 +714,19 @@ export const ownNames = (root, files) => new Set([...files].filter(file => linkO
 }));
 
 /**
+ * The name a file in the bot root `root` is mutated under: the one it has on
+ * disk (keys.mjs), when Stryker can take it; null when it cannot
+ * (GLOB_NAME_WHY). The planner's nameOf, which the content rule's pinned list
+ * uses too.
+ * @param {string} root
+ * @param {string} file
+ */
+export function mutatedName(root, file) {
+  const name = canonicalName(root, file);
+  return name !== null && strykerTakes(root, name) ? name : null;
+}
+
+/**
  * planChange on what git says changed from base to the working tree of the bot
  * root `root`: `git` runs git there and returns what it printed, and `read`
  * gives a file's text. Each file is mutated under the name it has on disk
@@ -772,10 +790,7 @@ export function planFromGit({ git: run, base, root, read = file => fs.readFileSy
     read,
     readBase,
     // linkOf comes first, so a name here is the file's own.
-    nameOf: file => {
-      const name = canonicalName(root, file);
-      return name !== null && strykerTakes(root, name) ? name : null;
-    },
+    nameOf: file => mutatedName(root, file),
     linkOf: file => linkOf(root, file),
     // A submodule is a real dir; a link to one is a link (lstat).
     isDir: file => { try { return fs.lstatSync(path.join(root, file)).isDirectory(); } catch { return false; } },

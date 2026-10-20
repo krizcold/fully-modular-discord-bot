@@ -157,29 +157,28 @@ does not name by its content.
   comments, a file only taken out of the index), and a
   file that holds a line break Stryker counts and the gate does not (a lone CR, U+2028 or U+2029), whose lines the two
   would number differently; `--mutate` refuses such a file.
-- Never mutated, on any machine, and named: a file whose code names the DATA_DIR variable or holds `'/data'` as a
-  string or as the head of a template (`` `/data/${x}` ``; src/utils/dataRoot.ts today, under any name), or holds the
-  image's `'/app'` root or a path under it (`'/app/build'`, `` `/app/${x}` ``: the module path helpers, the snapshot
-  and update code and src/index.ts today), in any case and with either slash (Windows reads `/Data`, `\data` and
-  `data_dir` as the same). The rule reads one file at a time: a root built at run time (`path.join('/', 'data')`), or
+- Never mutated, on any machine, and named: a file whose code names the DATA_DIR variable, or holds as a string or as
+  the head of a template the `'/data'` root or a path under it (`'/data/global'`, `` `/data/${x}` ``;
+  src/utils/dataRoot.ts today, under any name) or the image's `'/app'` root or a path under it (`'/app/build'`,
+  `` `/app/${x}` ``: the module path helpers, the snapshot and update code and src/index.ts today), in any case and
+  with either slash (Windows reads `/Data`, `\data` and `data_dir` as the same). The config page's four route paths
+  (`'/data/get'` and the like, ranges.mjs CONFIG_ROUTES), which read like paths under `/data`, are no root, so
+  src/webui/routes/config.ts stays mutated; a new route of that form joins that list. The rule reads one file at a time: a root built at run time (`path.join('/', 'data')`), or
   a check that takes the variable's name or a fixed root from another file (an imported constant, a function that
   returns a root it does not choose), is not seen, so the check that picks a root and the root it picks stay in one
   file (the module path helpers return a root their own check chose). unit/mutationRanges.test.ts runs the gate's
   planner on every file in src that git tracks or would add, pins the files it names for this rule (these five today)
-  and fails when that list changes, so one that
-  a split leaves holding neither the name nor a root, whatever took them (a constants file, an enum, a JSON file), is
-  looked at. Not seen: a check, written new or moved out of one of these files, in a file the rule never named, that
+  and fails when that list changes, so one that a split leaves holding neither the name nor a root, whatever took
+  them (a constants file, an enum, a JSON file), is looked at, and so is a file that gains a fixed path (route it
+  through src/utils/dataRoot.ts, or, for a route path, add it to CONFIG_ROUTES). Not seen: a check, written new or moved out of one of these files, in a file the rule never named, that
   takes its root or the name from another file (one of these included). A mutant of a file
   the rule names (the DATA_DIR check made false, the
   image's marker taken as found, the fallback chosen) sends the tests to such a root, on a developer's machine a real
   data root (on Windows at the root of the drive of the process's cwd: the checkout's for a test, the temp dir's for a
   child step, so `D:\app` or `C:\data` for a checkout on D: with TEMP on C:) and anywhere else one the run would make
-  outside the sandbox. A path under
-  `/data` written out in full (`'/data/global'`) is not matched, since route paths such as `'/data/get'` read the
-  same: unit/mutationRanges.test.ts fails when a file in src the planner would mutate (among those git tracks or would
-  add) gains a string that starts with `/data/` and is not one of the known routes, so such a path goes through dataRoot.ts. `--mutate` refuses such a file, and each pass's run with no mutant, which
-  comes before any mutant's, checks the files as that pass copied them, so a file that gains such code after the plan
-  stops the pass (NO RESULT, naming it), as does one it cannot read.
+  outside the sandbox. `--mutate` refuses a file the rule names, and each pass's run with no mutant, which comes
+  before any mutant's, checks the files as that pass copied them, so a file that gains such code after the plan stops
+  the pass (NO RESULT, naming it), as does one it cannot read.
 - A changed line of code that no mutant lies wholly on, in a diff, an untracked file or a `--mutate` pattern, is named
   in the report: L5 says nothing about it. A mutant that spans several lines (emptying a body, an object or an array,
   flipping a condition split over lines, a chained call) counts for none of them, since it says nothing about each

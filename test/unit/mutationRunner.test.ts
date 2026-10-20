@@ -56,7 +56,7 @@ describe('a mutant run', () => {
     const fake = fakeVitest([]);
     const run = runner(fake, 'a', '', [], { __STRYKER_ACTIVE_MUTANT__: undefined, SMDB_MUTATION_FILES: '["src/utils/dataRoot.ts"]' });
     expect(run.status).toBe(1);
-    expect(fs.readFileSync(path.join(fake.out, 'dry-refused.txt'), 'utf8')).toMatch(/^src\/utils\/dataRoot\.ts: it reads DATA_DIR or holds a fixed root \(the '\/data' fallback/);
+    expect(fs.readFileSync(path.join(fake.out, 'dry-refused.txt'), 'utf8')).toMatch(/^src\/utils\/dataRoot\.ts: it reads DATA_DIR or holds a fixed root \('\/data' or '\/app', or a path under either\)/);
     expect(fake.read()).toEqual([]);
   });
 

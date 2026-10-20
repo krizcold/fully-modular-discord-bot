@@ -14,7 +14,7 @@ import { canonicalName } from '../mutation/keys.mjs';
 import {
   changeTarget, codeLines, commonLines, gates, gatesIn, inPattern, lineDiff, linesOfTarget, mergeRanges, mutatePatterns, notMutated, parseNameStatus,
   planChange, planFromGit, unmatchedPatterns, untouched, wholeTarget, structureLines, DATA_ROUTE_WHY, GLOB_NAME_WHY, beyondTree, holdsDataRoute, rootGlobFree,
-  sandboxPatterns, strykerTakes, tokenLines, treeTsconfig, NO_CODE_WHY, linkOf, ownNames,
+  sandboxPatterns, strykerTakes, tokenLines, treeTsconfig, NO_CODE_WHY, linkOf, ownNames, CONFIG_ROUTES, mutatedName,
 } from '../mutation/ranges.mjs';
 import { treeChanges, treePrint } from '../mutation/tree.mjs';
 
@@ -713,8 +713,14 @@ describe('the change', () => {
     expect(holdsDataRoute('src/a.js', 'module.exports = process.env.X || `/data/`;\n')).toBe(true);
     expect(holdsDataRoute('src/a.ts', 'export const at = (g: string) => `/data/${g}/settings.json`;\n')).toBe(true);
     expect(holdsDataRoute('src/a.ts', 'export const at = (g: string) => `/data${g}`;\n')).toBe(true);
-    // A name that holds it, a route that starts with it, or a comment is no way there.
+    // A path under it is a fixed root too: a mutant of `base ?? '/data/exports'` writes there.
+    for (const text of ["export const at = (base?: string) => base ?? '/data/exports';\n", "export const at = '/data/global';\n"]) {
+      expect(holdsDataRoute('src/a.ts', text), text).toBe(true);
+    }
+    // A name that holds it, the config page's routes, a word that starts with it, or a comment is no way there.
     expect(holdsDataRoute('src/a.ts', "// DATA_DIR, '/data'\nconst BASE_DATA_DIR = DATA_ROOT;\napp.get('/data/get', h);\n")).toBe(false);
+    for (const route of CONFIG_ROUTES) expect(holdsDataRoute('src/a.ts', `router.post('${route}', h);\n`), route).toBe(false);
+    for (const text of ["export const at = '/database';\n", "export const at = '/data-x';\n"]) expect(holdsDataRoute('src/a.ts', text), text).toBe(false);
     // The image's /app root and every path under it are fixed roots too (D:\app on Windows): the file that picks
     // them when the image's marker exists is never mutated, nor is any that holds one.
     const pathHelpers = fs.readFileSync(path.join(botRoot, 'src', 'bot', 'internalSetup', 'utils', 'pathHelpers.ts'), 'utf8');
@@ -722,12 +728,13 @@ describe('the change', () => {
     for (const text of ["export const at = '/app';\n", "export const at = '/app/build';\n", 'export const at = (x: string) => `/app/${x}`;\n']) {
       expect(holdsDataRoute('src/a.ts', text), text).toBe(true);
     }
-    for (const text of ["export const at = '/apps/x';\n", "export const at = '/apply';\n", "export const at = 'app/x';\n", "app.get('/Data/get', h);\n"]) {
+    for (const text of ["export const at = '/apps/x';\n", "export const at = '/apply';\n", "export const at = 'app/x';\n"]) {
       expect(holdsDataRoute('src/a.ts', text), text).toBe(false);
     }
-    // Windows reads these as the same roots and the same variable: any case, either slash.
+    // Windows reads these as the same roots and the same variable: any case, either slash (a route in another case
+    // is a path, not the config page's route).
     for (const text of ["export const at = '/Data';\n", "export const at = '/DATA/';\n", "export const at = '\\\\data';\n", "export const at = '/App/build';\n",
-      "export const at = '\\\\app\\\\build';\n", "export const root = process.env.data_dir ?? 'here';\n"]) {
+      "export const at = '\\\\app\\\\build';\n", "export const root = process.env.data_dir ?? 'here';\n", "app.get('/Data/get', h);\n"]) {
       expect(holdsDataRoute('src/a.ts', text), text).toBe(true);
     }
     const plan = planChange({
@@ -741,58 +748,33 @@ describe('the change', () => {
     expect(plan.skipped).toEqual([{ file: 'src/utils/paths/dataRoot.ts', why: DATA_ROUTE_WHY }, { file: 'src/c.ts', why: DATA_ROUTE_WHY }]);
   });
 
-  // What the gate's planner makes of every file in src that git tracks or would
-  // add, each taken as new: the two scans below read its sets, never a filter
-  // of their own, so they cannot drift from what the gate mutates and names.
-  const srcPlan = () => {
+  // holdsDataRoute reads one file: a check that takes the DATA_DIR name or a
+  // fixed root from another file holds neither, so it is mutated, and a mutant
+  // of it can pick that root. A split that leaves one of these files holding
+  // neither takes it off this list (and may add another), and a file that
+  // gains a fixed path joins it, so the list is pinned. A check moved out to a
+  // file that takes the name or the root from here leaves the list as it was,
+  // and is not seen (README). The list is what the gate's planner, with its own
+  // name and link rules, makes of every file in src that git tracks or would
+  // add, each taken as new; it drops only the bite's probe.
+  it('finds in src the files the content rule names today, and no other', () => {
     const listed = execFileSync('git', ['-c', 'core.quotePath=false', 'ls-files', '-z', '--cached', '--others', '--exclude-standard', 'src'], { cwd: botRoot, encoding: 'utf8' })
       .split('\0').filter(file => file !== '' && fs.existsSync(path.join(botRoot, file)));
-    return planChange({
+    const { targets, skipped } = planChange({
       entries: [],
       untracked: listed,
       read: file => fs.readFileSync(path.join(botRoot, file), 'utf8'),
       readBase: () => '',
-      nameOf: file => {
-        const name = canonicalName(botRoot, file);
-        return name !== null && strykerTakes(botRoot, name) ? name : null;
-      },
+      nameOf: file => mutatedName(botRoot, file),
       linkOf: file => linkOf(botRoot, file),
     });
-  };
-
-  // holdsDataRoute matches the '/data' root, not a path under it written out in
-  // full, which reads the same as a route path: a mutant of code that holds one
-  // could reach a real data root, so src holds none but the routes named here.
-  // Only what the gate would mutate is read (the planner's targets).
-  it("finds in src no path under /data written out in full, but the config page's routes", () => {
-    const ROUTES = ['/data/delete', '/data/delete-guild', '/data/get', '/data/update'];
-    const found = new Map<string, string>();
-    const { targets } = srcPlan();
-    for (const { file } of targets) {
-      const text = fs.readFileSync(path.join(botRoot, file), 'utf8');
-      const visit = (node: ts.Node) => {
-        if ((ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node) || ts.isTemplateHead(node)) && /^[\\/]data[\\/]/i.test(node.text)) found.set(node.text, file);
-        ts.forEachChild(node, visit);
-      };
-      visit(ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true));
-    }
-    expect(targets.length).toBeGreaterThan(100);
-    // A new one: route it through src/utils/dataRoot.ts, or, for a route path, add it here.
-    expect([...found].filter(([text]) => !ROUTES.includes(text))).toEqual([]);
-  });
-
-  // holdsDataRoute reads one file: a check that takes the DATA_DIR name or a
-  // fixed root from another file holds neither, so it is mutated, and a mutant
-  // of it can pick that root. A split that leaves one of these files holding
-  // neither takes it off this list (and may add another), so the list is
-  // pinned. A check moved out to a file that takes the name or the root from
-  // here leaves the list as it was, and is not seen (README).
-  it('finds in src the files the content rule names today, and no other', () => {
-    const { targets, skipped } = srcPlan();
     // The bite's probe, which a bite run cut short leaves holding DATA_DIR until its next run sweeps it.
     const named = skipped.filter(s => s.why === DATA_ROUTE_WHY && !/^src\/smdb-bite-probe-\d+\.ts$/.test(s.file)).map(s => s.file);
     expect(targets.length).toBeGreaterThan(100);
-    // A change: see that each check that picks a root still holds the root it picks, as dataRoot.ts does, then set the list.
+    // The config page holds only its routes, so it stays mutated.
+    expect(targets.map(t => t.file)).toContain('src/webui/routes/config.ts');
+    // A change: see that each check that picks a root still holds the root it picks, as dataRoot.ts does, and route a
+    // fixed path through src/utils/dataRoot.ts (or, for a route path, add it to ranges.mjs CONFIG_ROUTES); then set the list.
     expect(named.sort()).toEqual([
       'src/bot/internalSetup/utils/pathHelpers.ts',
       'src/index.ts',
