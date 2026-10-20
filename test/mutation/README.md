@@ -16,7 +16,7 @@ active mutant travels in `__STRYKER_ACTIVE_MUTANT__` and reaches child processes
 | stryker.json | (data) empty on purpose: every pass names it as its config file, so Stryker never reads one it finds in the bot root |
 | keys.mjs | (library) how a file and a mutant are named across passes; unit/mutationRanges.test.ts |
 | targets.mjs | (Stryker reporter) which mutant ids a later pass runs tests for, and Stryker's own time for each run with no mutant; unit/mutationRunner.test.ts and the bite |
-| tree.mjs | (library) the fingerprint of the tree a run reads, taken before the plan and before the verdict; unit/mutationRanges.test.ts and the bite |
+| tree.mjs | (library) the fingerprint of the tree a run reads and of the packages it links, taken before the plan and before the verdict; unit/mutationRanges.test.ts and the bite |
 | ../helpers/time.mjs | the factor on the config's test and hook limits and a child step's default bound (4 in a rerun alone and in the run with no mutant after the reruns; a limit a test, hook or step sets itself is not scaled) |
 | ../helpers/env.ts, setup.ts | what a test and its children keep of the environment, and the run's fast-check seed |
 | ../helpers/forkGuard.cjs | a process started with an env of its own that lacks DATA_DIR throws (fork, spawn, exec, execFile, a Worker), in a test and in a child step |
@@ -286,7 +286,11 @@ The tree is fingerprinted (every file git tracks or would add, which is what eac
 content) before the plan reads a file,
 and again before the verdict: the plan reads the tree then, and each pass, and each run with no mutant after the
 reruns, copies it as it is when it starts, so a tree that changed during the run (an edit, a formatter, another
-session) ends NO RESULT, naming the files.
+session) ends NO RESULT, naming the files. The packages are linked into each sandbox, not copied (Stryker links every
+node_modules dir under the root), so each run loads them as they are then: the print holds npm's hidden lockfile in
+each of those dirs (`node_modules/.package-lock.json`), which npm rewrites when an install changes the dir and npm ci
+removes first, so an install during the run ends NO RESULT too. Not seen: an install still running when the last
+print is taken, and packages changed by anything but npm.
 
 A run Stryker counts as a kill is checked against vitest's report of it: it is a kill when a test itself failed, and a
 timeout when every failing test (or its beforeEach or afterEach hook) timed out. In a pass's first run (A, its run
@@ -389,13 +393,16 @@ removed source file.
   return dies in pass A to unit/backupMode.test.ts; the stand-in carry in consumeTakeoverFlags, which only a restart
   shows, survives pass A and dies in pass B to child/fleetIdentity.test.ts, again when rerun alone, and the run with no
   mutant after that rerun passes. One mutant of the first line is equivalent (`''` and the replacement both read as "not
-  active"), so the run also shows the FAIL verdict and how a survivor is listed. The same file checks that an unknown
+  active"), so the run also shows the FAIL verdict and how a survivor is listed. Each of its real passes leaves
+  Stryker's own time for its run with no mutant and runner.mjs's monotonic one, and the two agree, so a sound run is
+  never taken for a clock step. The same file checks that an unknown
   base and a pattern that makes no mutant both end NO RESULT, exit 2, and that a glob, a missing file, a pattern with
   columns, a file holding a line break the gate does not count, a file in src that git ignores or that sits in an
   untracked repository, src/utils/dataRoot.ts and the suite's own helpers/env.ts and vitest.config.ts are refused (each
   with a stand-in for vitest that does not exist, so a refusal that broke would run no test).
 - Gate runs on a stand-in for vitest (every mutant times out) end NO RESULT: when the run with no mutant after the
-  reruns fails, with every timeout the reruns confirmed listed as inconclusive; when it passes past the reruns' budget;
+  reruns fails, with every timeout the reruns confirmed listed as inconclusive (that run also adds a file and a dir of
+  packages, which the verdict names as changed); when it passes past the reruns' budget;
   and when the target (a throwaway untracked file) gains a way to `/data` during pass A, which pass A2's run with no
   mutant refuses, or during pass A2's reruns, which the run with no mutant after them refuses. Each is run with a
   mutant id left in the env, which the gate ignores.

@@ -188,6 +188,14 @@ describe('the run with no mutant after the reruns', () => {
       stryker(timing);
       expect(pastBudget(reruns, out, budget), JSON.stringify(timing)).toBe(stepped);
     }
+    // The margin is a second plus a tenth of the run, 4 s on 30 s, either way, and for the overhead.
+    for (const [timing, why] of [
+      [{ net: 34_000, overhead: 0 }, ''], [{ net: 26_000, overhead: 0 }, ''], [{ net: 30_000, overhead: 4000 }, ''],
+      [{ net: 34_001, overhead: 0 }, stepped], [{ net: 25_999, overhead: 0 }, stepped], [{ net: 30_000, overhead: 4001 }, stepped],
+    ] as const) {
+      stryker(timing);
+      expect(pastBudget(reruns, out, budget), JSON.stringify(timing)).toBe(why);
+    }
     const unread = "its time, or the time of the reruns' own run with no mutant, could not be read";
     stryker({ net: 30_000, overhead: 0 });
     for (const text of ['soon', '']) {

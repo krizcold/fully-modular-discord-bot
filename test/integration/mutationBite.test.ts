@@ -4,6 +4,8 @@ import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { beforeAll, describe, expect, it } from 'vitest';
+import { pastBudget } from '../mutation/control.mjs';
+import { PASSES } from '../mutation/passes.mjs';
 
 // The L5 bite (VERIFY.md L5 and [A2]): one run of the gate on two lines of
 // nodeIdentity.ts. consentsToActiveMode's return is in-process code, so the
@@ -45,7 +47,7 @@ function sweepLeftovers(at: string) {
     else if (/^smdb-(ignored|repo)-\d+$/.test(old)) fs.rmSync(path.join(src, old), { recursive: true, force: true });
   }
   if (fs.existsSync(dev)) for (const old of fs.readdirSync(dev).filter(name => /^smdb-(beyond|bite-reader)-\d+\.ts$/.test(name))) fs.rmSync(path.join(dev, old), { force: true });
-  if (fs.existsSync(mutation)) for (const old of fs.readdirSync(mutation).filter(name => /^smdb-tree-\d+\.txt$/.test(name))) fs.rmSync(path.join(mutation, old), { force: true });
+  if (fs.existsSync(mutation)) for (const old of fs.readdirSync(mutation).filter(name => /^smdb-tree-\d+(\.txt)?$/.test(name))) fs.rmSync(path.join(mutation, old), { recursive: true, force: true });
 }
 
 describe('the touched-line mutation gate', () => {
@@ -60,9 +62,9 @@ describe('the touched-line mutation gate', () => {
       for (const name of ['smdb-beyond-1.ts', 'smdb-bite-reader-1.ts']) fs.writeFileSync(path.join(dev, name), '');
       fs.mkdirSync(path.join(at, 'src', 'smdb-repo-1', '.git'), { recursive: true });
       for (const name of ['smdb-beyond-1.ts', 'smdb-bite-probe-1.ts', 'smdb-glob-[x]-1.ts', 'smdb-kept.ts']) fs.writeFileSync(path.join(at, 'src', name), '');
-      // The tree probe the run after the reruns adds, which git does not ignore.
+      // The tree probes the run after the reruns adds: a file git does not ignore, and a dir of packages it does.
       const mutation = path.join(at, 'test', 'mutation');
-      fs.mkdirSync(mutation, { recursive: true });
+      fs.mkdirSync(path.join(mutation, 'smdb-tree-1', 'node_modules'), { recursive: true });
       for (const name of ['smdb-tree-1.txt', 'smdb-tree-x.txt']) fs.writeFileSync(path.join(mutation, name), '');
       sweepLeftovers(at);
       expect(fs.readdirSync(dev)).toEqual(['smdb-appstore']);
@@ -118,6 +120,13 @@ describe('the touched-line mutation gate', () => {
       expect(written.filter(file => !file.includes('-child.')), dir).toEqual([]);
     }
     expect(fs.existsSync(path.join(root, reportDir!, 'b2-2'))).toBe(false);
+    // Each real pass left Stryker's own time for its run with no mutant (targets.mjs) and runner.mjs's monotonic one,
+    // and the two agree, so a sound run's reruns would be judged by their budget, not taken for a clock step.
+    for (const dir of ['a', 'b', 'b2-1', 'control-b2']) {
+      const at = path.join(root, reportDir!, dir);
+      expect(pastBudget(at, at, PASSES.a2), dir).toBe('');
+    }
+    expect(pastBudget(path.join(root, reportDir!, 'b2-1'), path.join(root, reportDir!, 'control-b2'), PASSES.b2)).toBe('');
     // Pass B and its rerun ran tests for exactly the mutants they were for, matched in Stryker's own plan.
     expect(ranFor(reportDir!, 'b')).toEqual(mutants.filter(m => m.passes.b).map(m => m.passes.b!.id).sort());
     expect(ranFor(reportDir!, 'b2-1')).toEqual(on(child).map(m => m.passes.b2!.id).sort());
@@ -181,13 +190,24 @@ describe('the touched-line mutation gate', () => {
 
   it('counts nothing its reruns found, and has no result, when the run with no mutant after them fails', { timeout: 600_000 }, () => {
     // The run with no mutant after the reruns fails, after it adds a file to
-    // the checkout (the tree changed during the run).
+    // the checkout and installs a dir of packages, which git ignores (the tree
+    // changed during the run).
     const added = `test/mutation/smdb-tree-${process.pid}.txt`;
+    const packages = `test/mutation/smdb-tree-${process.pid}`;
+    const lock = `${packages}/node_modules/.package-lock.json`;
     const { run, mutants } = (() => {
       try {
-        return standInRun(`if (pass === 'control-a2') { fs.writeFileSync(${JSON.stringify(path.join(root, added))}, 'changed'); message = 'Error: the database went away'; }`);
+        return standInRun([
+          "if (pass === 'control-a2') {",
+          `  fs.writeFileSync(${JSON.stringify(path.join(root, added))}, 'changed');`,
+          `  fs.mkdirSync(${JSON.stringify(path.join(root, packages, 'node_modules'))}, { recursive: true });`,
+          `  fs.writeFileSync(${JSON.stringify(path.join(root, lock))}, '{}');`,
+          "  message = 'Error: the database went away';",
+          '}',
+        ].join('\n'));
       } finally {
         fs.rmSync(path.join(root, added), { force: true });
+        fs.rmSync(path.join(root, packages), { recursive: true, force: true });
       }
     })();
 
@@ -198,7 +218,7 @@ describe('the touched-line mutation gate', () => {
     expect(run.stdout).toMatch(/^Verdict: NO RESULT \(vitest was replaced by a test's stand-in /m);
     expect(run.stdout).toMatch(/^Stopped:\n {2}the run with no mutant after pass a2 failed \(There were failed tests in the initial test run\.\), so what its reruns counted cannot be told from the machine's failures$/m);
     expect(run.stdout).toMatch(/^ {2}the run with no mutant failed in unit\/x\.test\.ts: Error: the database went away$/m);
-    expect(run.stdout).toContain(`\nChanged during the run (so no one tree was tested):\n  ${added}`);
+    expect(run.stdout).toContain(`\nChanged during the run (so no one tree was tested):\n  ${added}, ${lock}\n`);
     expect(run.stdout).toMatch(/^Inconclusive .*\n {2}src\/bot\/internalSetup\/fleet\/nodeIdentity\.ts:\d+:\d+ .*\(the run with no mutant after pass a2 failed\)$/m);
     expect(run.stdout).not.toMatch(/^Timeouts /m);
     expect(run.stdout).not.toMatch(/^Runs with no mutant after the reruns:/m);

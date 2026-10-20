@@ -11,7 +11,7 @@ import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { pastBudget } from './control.mjs';
-import { treeChanges, treePrint } from './tree.mjs';
+import { linkedLockfiles, treeChanges, treePrint } from './tree.mjs';
 import { canonicalName, fileOf as nameOf, keyOf } from './keys.mjs';
 import { COMMON, PASSES } from './passes.mjs';
 
@@ -100,12 +100,16 @@ try {
 }
 // The tree as the gate found it before reading any file (tree.mjs), and the
 // files that make it: the tracked files and the untracked ones git does not
-// ignore. An edit saved from here on shows at the end.
+// ignore. An edit saved from here on shows at the end, and so does an install
+// in a dir of packages the sandboxes link (tree.mjs linkedLockfiles).
 const treeFiles = () => git('ls-files', '-z', '--cached', '--others', '--exclude-standard').split('\0').filter(Boolean);
 /** @type {Map<string, string>} */
 let planned;
+/** @type {Map<string, string>} */
+let linked;
 try {
   planned = treePrint(root, treeFiles());
+  linked = treePrint(root, linkedLockfiles(root));
 } catch (error) {
   console.log(`Verdict: NO RESULT (the gate could not read the tree: ${firstLine(error)})`);
   process.exit(2);
@@ -396,7 +400,7 @@ async function passOn(name, dir, tier, on, extra, only) {
  */
 function finish(stopped) {
   try {
-    report(stopped, treeChanges(planned, treePrint(root, treeFiles())));
+    report(stopped, [...treeChanges(planned, treePrint(root, treeFiles())), ...treeChanges(linked, treePrint(root, linkedLockfiles(root)))].sort());
   } catch (error) {
     console.log(`Verdict: NO RESULT (the report could not be written: ${firstLine(error)})`);
     process.exit(2);
