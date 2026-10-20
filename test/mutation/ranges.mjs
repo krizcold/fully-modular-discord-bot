@@ -937,24 +937,41 @@ export function beyondTree(root, tree, config, dir) {
 }
 
 /**
- * Why the type checker cannot stand in for the shipped build, or '': it runs
- * test/'s installed TypeScript, the one this file loads, and the build that
- * ships installs the root lockfile's (npm ci in the image and in CI), so a
- * mutant the checker rejects and that build accepts would count as killed with
- * no test run. The lockfile is a tracked file, read through no link; dist and
- * pass B's build compile with the root's installed copy, but no mutant meets
- * their type judgment (the sandbox's src is not type-checked there).
+ * Why the type checker cannot stand in for the shipped build, or '': what it
+ * reads is held to the root lockfile, which the build that ships installs (npm
+ * ci in the image and in CI), since a mutant the checker rejects and that build
+ * accepts would count as killed with no test run. It runs test/'s installed
+ * TypeScript, the one this file loads, and reads the packages' declarations
+ * installed at the root (through a link, another checkout's): the TypeScript
+ * must be the lockfile's, and every package the lockfile names installed at its
+ * version (an optional one may be absent). dist and pass B's build compile
+ * with the root's install too, but no mutant meets their type judgment (the
+ * sandbox's src is not type-checked there).
  * @param {string} root
  */
 export function checkerDiffers(root) {
-  let shipped = 'none';
-  try {
-    shipped = String(JSON.parse(fs.readFileSync(path.join(root, 'package-lock.json'), 'utf8')).packages['node_modules/typescript'].version);
-  } catch {
-    // No TypeScript the root lockfile ships: it differs.
+  /**
+   * @param {string} file
+   * @returns {Record<string, { version?: string, optional?: boolean, link?: boolean }> | undefined}
+   */
+  const read = file => { try { return JSON.parse(fs.readFileSync(path.join(root, file), 'utf8')).packages; } catch { return undefined; } };
+  const shipped = read('package-lock.json');
+  const why = 'so a mutant the checker rejects and the shipped build accepts would count as killed with no test run';
+  if (shipped?.['node_modules/typescript']?.version === undefined) {
+    return 'the root lockfile (package-lock.json) names no TypeScript or could not be read, so what the shipped build compiles with is not known and the type checker cannot be held to it; restore the lockfile';
   }
-  if (shipped === ts.version) return '';
-  return `the type checker runs TypeScript ${ts.version} (test/'s, installed) and the root lockfile ships ${shipped}, so a mutant the checker rejects and the shipped build accepts would count as killed with no test run; pin test/package.json and its lockfile to ${shipped} and run npm run test:install`;
+  const version = String(shipped['node_modules/typescript'].version);
+  if (version !== ts.version) {
+    return `the type checker runs TypeScript ${ts.version} (test/'s, installed) and the root lockfile ships ${version}, ${why}; pin test/package.json and its lockfile to ${version} and run npm run test:install in a checkout whose test/node_modules is a dir of its own (a link names another checkout's: remove the link itself first)`;
+  }
+  const installed = read('node_modules/.package-lock.json') ?? {};
+  for (const [name, entry] of Object.entries(shipped)) {
+    if (name === '' || entry.link || (entry.optional && !installed[name])) continue;
+    if (installed[name]?.version !== entry.version) {
+      return `the type checker reads the packages installed at the root, and ${name} there is ${installed[name]?.version ?? 'not installed'} where the root lockfile ships ${entry.version}, ${why}; run npm ci at the root of a checkout whose node_modules is a dir of its own (a link names another checkout's install: remove the link itself first, never what it names)`;
+    }
+  }
+  return '';
 }
 
 /** @param {string} file a path, compared as the file system does (no case on Windows) */

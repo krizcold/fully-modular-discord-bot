@@ -588,20 +588,38 @@ describe('the change', () => {
     expect(beyond('/// <reference path="./modulesDev/m.ts" />\nexport const x = 1;\n')).toEqual(['src/modulesDev/m.ts']);
   });
 
-  it('refuses a type checker whose TypeScript is not the one the root lockfile ships, and the two lockfiles pin one', () => {
+  it('holds what the type checker reads to the root lockfile: test/\'s TypeScript and every package installed at the root', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-tsroot-'));
     onTestFinished(() => fs.rmSync(root, { recursive: true, force: true }));
     const checking = (JSON.parse(fs.readFileSync(path.join(botRoot, 'test', 'node_modules', 'typescript', 'package.json'), 'utf8')) as { version: string }).version;
-    const ships = (version: string) => fs.writeFileSync(path.join(root, 'package-lock.json'), JSON.stringify({ packages: { 'node_modules/typescript': { version } } }));
-    // An installed copy at the root is not what ships: the image and CI install the lockfile's.
-    fs.mkdirSync(path.join(root, 'node_modules', 'typescript'), { recursive: true });
-    fs.writeFileSync(path.join(root, 'node_modules', 'typescript', 'package.json'), JSON.stringify({ name: 'typescript', version: checking }));
-    ships(checking);
+    type Entry = { version: string; optional?: boolean };
+    const lock = (file: string, packages: Record<string, Entry>) => {
+      fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true });
+      fs.writeFileSync(path.join(root, file), JSON.stringify({ packages }));
+    };
+    const ships = (packages: Record<string, Entry>) => lock('package-lock.json', { '': { version: '1.0.0' }, ...packages });
+    const installs = (packages: Record<string, Entry>) => lock('node_modules/.package-lock.json', packages);
+    const both = { 'node_modules/typescript': { version: checking }, 'node_modules/@types/express': { version: '5.0.1' } };
+    ships(both);
+    installs(both);
     expect(checkerDiffers(root)).toBe('');
-    ships('6.0.3');
-    expect(checkerDiffers(root)).toBe(`the type checker runs TypeScript ${checking} (test/'s, installed) and the root lockfile ships 6.0.3, so a mutant the checker rejects and the shipped build accepts would count as killed with no test run; pin test/package.json and its lockfile to 6.0.3 and run npm run test:install`);
+    // An optional package the platform skips may be absent; nothing else may be.
+    ships({ ...both, 'node_modules/fsevents': { version: '2.3.3', optional: true } });
+    expect(checkerDiffers(root)).toBe('');
+    const why = 'so a mutant the checker rejects and the shipped build accepts would count as killed with no test run';
+    ships({ ...both, 'node_modules/typescript': { version: '6.0.3' } });
+    expect(checkerDiffers(root)).toBe(`the type checker runs TypeScript ${checking} (test/'s, installed) and the root lockfile ships 6.0.3, ${why}; pin test/package.json and its lockfile to 6.0.3 and run npm run test:install in a checkout whose test/node_modules is a dir of its own (a link names another checkout's: remove the link itself first)`);
+    // A pull that moved a package's declarations, with no install since: the checker would read the old ones.
+    ships({ ...both, 'node_modules/@types/express': { version: '5.0.3' } });
+    const stale = (installed: string) => `the type checker reads the packages installed at the root, and node_modules/@types/express there is ${installed} where the root lockfile ships 5.0.3, ${why}; run npm ci at the root of a checkout whose node_modules is a dir of its own (a link names another checkout's install: remove the link itself first, never what it names)`;
+    expect(checkerDiffers(root)).toBe(stale('5.0.1'));
+    installs({ 'node_modules/typescript': { version: checking } });
+    expect(checkerDiffers(root)).toBe(stale('not installed'));
+    // No install at all: the first package the lockfile names.
+    fs.rmSync(path.join(root, 'node_modules', '.package-lock.json'));
+    expect(checkerDiffers(root)).toMatch(/, and node_modules\/typescript there is not installed where the root lockfile ships /);
     fs.rmSync(path.join(root, 'package-lock.json'));
-    expect(checkerDiffers(root)).toMatch(/and the root lockfile ships none, /);
+    expect(checkerDiffers(root)).toBe('the root lockfile (package-lock.json) names no TypeScript or could not be read, so what the shipped build compiles with is not known and the type checker cannot be held to it; restore the lockfile');
     expect(checkerDiffers(botRoot)).toBe('');
     const locked = (dir: string) => (JSON.parse(fs.readFileSync(path.join(dir, 'package-lock.json'), 'utf8')) as { packages: Record<string, { version: string }> }).packages['node_modules/typescript'].version;
     expect(locked(path.join(botRoot, 'test'))).toBe(locked(botRoot));

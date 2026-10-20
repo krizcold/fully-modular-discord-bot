@@ -62,8 +62,10 @@ From the bot root, with Node 22.12 or newer (or SMDB_TEST_NODE set, as for `npm 
   alone (`kill <pid>`, `taskkill /F` without `/T`) also leaves the test commands it was running going, with nothing to
   bound them: as many as pass A or pass B runs at once (above), each a runner.mjs and the vitest under
   it. End each of those trees: find them by `runner.mjs` in their command line (on Windows the shell above each is
-  already gone, and ending a runner.mjs ends the Node processes under it). Ctrl-C in the gate's terminal reaches all
-  of it.
+  already gone, and ending a runner.mjs ends the Node processes under it). On POSIX, when the gate relaunched itself
+  under SMDB_TEST_NODE (two touched.mjs processes are listed), a kill of the first alone leaves the relaunched one
+  going on to its next passes: end it first (on Windows it ends with the first). Ctrl-C in the gate's terminal
+  reaches all of it.
 - The gate fingerprints every file git tracks or would add (below), so its output goes to a file git ignores (`l5.log`
   above, under the root's `*.log`) or one outside the checkout: a file in the tree that the run writes to changes
   during the run, which ends it NO RESULT.
@@ -164,7 +166,7 @@ does not name by its content.
 - Not mutated, and named in the report with the reason: files outside src (the root scripts, updaters/, tests, docs and
   images), files that are not code (code is `.ts`, `.tsx`, `.mts`, `.cts`, `.js`, `.cjs` and `.mjs`), declaration files
   (`.d.ts`, `.d.mts`, `.d.cts`), the browser views under src/webui/public (copied into dist, never
-  compiled, and no test loads them yet), a file under a node_modules dir in src (tracked only when forced past the
+  compiled, and no test loads them yet), a file under a node_modules dir in src (in the tree only when added with -f or when a deeper .gitignore lifts the
   root's ignore rule: Stryker links such a dir into a sandbox and never copies it), a file deleted or moved out of src,
   an untracked git repository (git lists
   none of its files, and none is copied into a sandbox) or a git submodule under src, a file whose name Stryker would read as a glob (`[id].ts`,
@@ -190,8 +192,10 @@ does not name by its content.
   file (the module path helpers return a root their own check chose). unit/mutationRanges.test.ts runs the gate's
   planner on every file in src that git tracks or would add, pins the files it names for this rule (these six today)
   and fails when that list changes, so one that a split leaves holding neither the name nor a root, whatever took
-  them (a constants file, an enum, a JSON file), is looked at, and so is a file that gains a fixed path (route it
-  through src/utils/dataRoot.ts). Not seen: a check, written new or moved out of one of these files, in a file the rule never named, that
+  them (a constants file, an enum, a JSON file), is looked at, and so is a file the gate would mutate that gains a
+  fixed path (route it through src/utils/dataRoot.ts). A file the gate never mutates (a browser view, a declaration or
+  JSON file, one under a node_modules dir) is not pinned, and a check that takes its root from such a file falls under
+  what follows. Not seen: a check, written new or moved out of one of these files, in a file the rule never named, that
   takes its root or the name from another file (one of these included). A mutant of a file
   the rule names (the DATA_DIR check made false, the
   image's marker taken as found, the fallback chosen) sends the tests to such a root, on a developer's machine a real
@@ -235,12 +239,16 @@ does not name by its content.
    so when the checker would judge a file outside the tree, packages under node_modules aside, the gate stops before
    pass A with NO RESULT and names it (ranges.mjs beyondTree): a mutant that broke only that file would count as killed
    with no test run. The way on: make the tree's file stop importing or referencing it, or add it to the tree if it
-   belongs there. The checker runs test/'s installed TypeScript, and the build that ships installs the one the root
-   lockfile names (npm ci in the image and in CI), so when the two differ the gate stops before pass A too, with NO
-   RESULT naming both (ranges.mjs checkerDiffers): a mutant the checker rejects and the shipped build accepts would
-   count as killed with no test run. The way on is to pin test/package.json and its lockfile to the root lockfile's
-   version and run `npm run test:install`. dist and pass B's build compile with the root's installed copy, but no
-   mutant meets their type judgment. A unit test holds the two lockfiles to one version. A gating mutant whose only type error is an unused `@ts-expect-error` (TS2578) type-checks, so it
+   belongs there. What the checker reads is held to the root lockfile, which the build that ships installs (npm ci in
+   the image and in CI): it runs test/'s installed TypeScript, which must be the lockfile's, and reads the packages'
+   declarations installed at the root (another checkout's, when the root node_modules is a link), each of which must
+   be at the lockfile's version (an optional one may be absent). Otherwise the gate stops before pass A too, with NO
+   RESULT naming the first that differs (ranges.mjs checkerDiffers): a mutant the checker rejects and the shipped
+   build accepts would count as killed with no test run. The way on is to pin test/package.json and its lockfile to
+   the root lockfile's TypeScript and run `npm run test:install`, or to run `npm ci` at the root, each in a checkout
+   whose node_modules dir is its own (remove a link itself first, never what it names). dist and pass B's build
+   compile with the root's install too, but no mutant meets their type judgment. A unit test holds the two lockfiles
+   to one TypeScript. A gating mutant whose only type error is an unused `@ts-expect-error` (TS2578) type-checks, so it
    meets pass A's tests again with no checker (`a-unchecked/`), and that run is its pass A: from there it goes on like
    any other mutant. Each mutant run is `vitest related <mutated files>` on the fast tier with one worker: every pass
    and rerun, and each run with no mutant, is given every file the gate mutates, and pass A gives Stryker those files
@@ -354,7 +362,8 @@ can fail by chance there still credits a kill: one random in another way (its ow
 fails for the machine in a way the list above does not hold, and one that uses a fixed port or path, since every mutant's run in pass A shares one sandbox and one temp dir: a run beside it
 can hold the port or the path, and a run before it can leave the path behind. Fast tests use mkdtemp and port 0. No
 `--concurrency` rules out a run beside a pass A run (pass A runs two at 1, above); only the reruns alone (a2, b2) and
-the runs with no mutant after them run one at a time, and so do the unchecked pass A runs and pass B at 1.
+the runs with no mutant after them run one at a time, and so do the unchecked pass A runs at 1 and pass B below 4
+(it runs half of `--concurrency`, at least one).
 
 ## The report
 
