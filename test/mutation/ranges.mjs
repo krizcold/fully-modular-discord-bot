@@ -194,7 +194,10 @@ export function commonLines(a, b) {
  * lines. The window starts from each piece the diff makes, and another change
  * in the file can split a run into pieces, so then which copy counts is the
  * diff's choice. A line kept counts only where the diff marks it, even when a
- * change moves it into or out of a block (mutation/README.md).
+ * change moves it into or out of a block (mutation/README.md), or when it
+ * holds code before and after: a comment opened or closed on another line
+ * that turns it into code makes it changed, and one that turns it out of code
+ * makes a place there.
  * @param {string} before
  * @param {string} after
  * @param {string} [file] the name `after` is read under
@@ -240,6 +243,12 @@ export function lineDiff(before, after, file = 'a.ts', baseFile = file) {
     }
     pi = i;
     pj = j;
+  }
+  // A kept line that a comment opened or closed on another line turned into
+  // code is changed; one it turned out of code is code taken out there.
+  for (const [i, j] of pairs) {
+    if (!codeOut.has(i + 1) && codeIn.has(j + 1)) changed.add(j + 1);
+    else if (codeOut.has(i + 1) && !codeIn.has(j + 1)) deletedAfter.add(j);
   }
   /** @param {Set<number>} set */
   const sorted = set => [...set].sort((x, y) => x - y);

@@ -241,6 +241,19 @@ describe('the change', () => {
     expect(lineDiff(crossed, ['a();', '/* \r */ // b();', 'c();'].join('\n'))).toEqual({ changed: [2], deletedAfter: [1] });
   });
 
+  it('counts an unchanged line a comment opened or closed elsewhere switched: on, as changed; off, as code taken out', () => {
+    const hidden = ['a();', '/*', 'b();', '*/', 'n > 10;'].join('\n');
+    // The comment taken away brings b() back, alone or beside an edit.
+    expect(lineDiff(hidden, ['a();', 'b();', 'n > 10;'].join('\n'))).toEqual({ changed: [2], deletedAfter: [] });
+    expect(lineDiff(hidden, ['a();', 'b();', 'n > 20;'].join('\n'))).toEqual({ changed: [2, 3], deletedAfter: [] });
+    // A comment put around b() takes it out there, alone or beside an edit.
+    const live = ['a();', 'b();', 'c();'].join('\n');
+    expect(lineDiff(live, ['a();', '/*', 'b();', '*/', 'c();'].join('\n'))).toEqual({ changed: [2, 4], deletedAfter: [2] });
+    expect(lineDiff(live, ['a();', '/*', 'b();', '*/', 'C();'].join('\n'))).toEqual({ changed: [2, 4, 5], deletedAfter: [2] });
+    // Around a comment only, nothing is switched.
+    expect(lineDiff(['a();', '// note', 'c();'].join('\n'), ['a();', '/*', '// note', '*/', 'c();'].join('\n'))).toEqual({ changed: [2, 4], deletedAfter: [] });
+  });
+
   it('finds the few lines that changed in a long file, and copes with two that share nothing', () => {
     const long = Array.from({ length: 3000 }, (_, i) => `line ${i}`);
     const edited = long.map((line, i) => (i === 10 || i === 2000 ? `${line} edited` : line));
@@ -1407,6 +1420,14 @@ describe('the targets', () => {
     );
     expect(plan.skipped).toEqual([{ file: 'src/noted.ts', why: NO_CODE_WHY }]);
     expect(plan.targets).toEqual([{ file: 'src/commented.ts', ranges: [[10, 10]], gating: [], patterns: ['src/commented.ts:10-10'], deleted: [9] }]);
+  });
+
+  it('gates code a comment taken away brings back, though only comment lines changed', () => {
+    const lines = SAMPLE.split('\n');
+    const hidden = [...lines.slice(0, 9), '  /*', lines[9], '  */', ...lines.slice(10)].join('\n');
+    const plan = planOf([{ status: 'M', file: 'src/revived.ts' }], [], { 'src/revived.ts': SAMPLE }, { 'src/revived.ts': hidden });
+    expect(plan.skipped).toEqual([]);
+    expect(plan.targets).toEqual([{ file: 'src/revived.ts', ranges: [[10, 10]], gating: [10], patterns: ['src/revived.ts:10-10'] }]);
   });
 
   it('takes a file new to the mutated code whole, and names one moved out of it', () => {

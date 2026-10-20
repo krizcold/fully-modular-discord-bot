@@ -225,17 +225,26 @@ describe('the tree fingerprint', () => {
   const copyGate = (copy: string) => {
     fs.cpSync(path.join(root, 'test', 'mutation'), path.join(copy, 'test', 'mutation'), { recursive: true, filter: source => path.basename(source) !== 'reports' });
   };
+  // The copy's test/node_modules: a dir of its own, as the gate asks, holding a link to each of the suite's packages
+  // (never a copy). The links go before the copy does, so nothing removes what they name.
+  const linkPackages = (copy: string) => {
+    const from = path.join(root, 'test', 'node_modules');
+    const to = path.join(copy, 'test', 'node_modules');
+    fs.mkdirSync(to, { recursive: true });
+    const names = fs.readdirSync(from, { withFileTypes: true }).filter(entry => entry.isDirectory()).map(entry => entry.name);
+    for (const name of names) fs.symlinkSync(path.join(from, name), path.join(to, name), 'junction');
+    return () => { for (const name of names) fs.unlinkSync(path.join(to, name)); };
+  };
 
   it('ends the gate NO RESULT, exit 2, when it cannot make .stryker-tmp, and says so', () => {
     // The gate copied to a root of its own, whose .stryker-tmp is a file; its packages are linked, never copied.
     const copy = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-tmpdir-'));
-    const packages = path.join(copy, 'test', 'node_modules');
+    copyGate(copy);
+    const unlink = linkPackages(copy);
     onTestFinished(() => {
-      fs.unlinkSync(packages);
+      unlink();
       fs.rmSync(copy, { recursive: true, force: true });
     });
-    copyGate(copy);
-    fs.symlinkSync(path.join(root, 'test', 'node_modules'), packages, 'junction');
     fs.writeFileSync(path.join(copy, '.stryker-tmp'), '');
     const run = spawnSync(process.execPath, [path.join(copy, 'test', 'mutation', 'touched.mjs')], { cwd: copy, encoding: 'utf8' });
     expect(run.status, run.stderr).toBe(2);
@@ -245,31 +254,43 @@ describe('the tree fingerprint', () => {
   it("ends the gate NO RESULT, exit 2, naming the path, in a checkout whose path Stryker reads as a glob", () => {
     const outer = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-globroot-'));
     const copy = path.join(outer, 'bot [old]');
-    const packages = path.join(copy, 'test', 'node_modules');
+    copyGate(copy);
+    const unlink = linkPackages(copy);
     onTestFinished(() => {
-      fs.unlinkSync(packages);
+      unlink();
       fs.rmSync(outer, { recursive: true, force: true });
     });
-    copyGate(copy);
-    fs.symlinkSync(path.join(root, 'test', 'node_modules'), packages, 'junction');
     const run = spawnSync(process.execPath, [path.join(copy, 'test', 'mutation', 'touched.mjs')], { cwd: copy, encoding: 'utf8' });
     expect(run.status, run.stderr).toBe(2);
     expect(run.stdout).toMatch(/^Verdict: NO RESULT \(the checkout's path, .*\/bot \[old\], does not match itself read as a glob, as Stryker reads it: /m);
     expect(fs.existsSync(path.join(copy, '.stryker-tmp'))).toBe(false);
   });
 
-  it('ends the gate NO RESULT, exit 2, when test/node_modules is a link, which Stryker would not link into a sandbox', () => {
+  it('ends the gate NO RESULT, exit 2, when test/node_modules is a link, before it loads a package through it, and says to remove the link first', () => {
     const copy = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-linked-'));
     const packages = path.join(copy, 'test', 'node_modules');
+    // To the suite's packages, and to a dir without them (the gate must not load through the link first).
+    const empty = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-nopackages-'));
     onTestFinished(() => {
-      fs.unlinkSync(packages);
-      fs.rmSync(copy, { recursive: true, force: true });
+      if (fs.lstatSync(packages, { throwIfNoEntry: false })) fs.unlinkSync(packages);
+      for (const dir of [copy, empty]) fs.rmSync(dir, { recursive: true, force: true });
     });
     copyGate(copy);
-    fs.symlinkSync(path.join(root, 'test', 'node_modules'), packages, 'junction');
-    const run = spawnSync(process.execPath, [path.join(copy, 'test', 'mutation', 'touched.mjs')], { cwd: copy, encoding: 'utf8' });
-    expect(run.status, run.stderr).toBe(2);
-    expect(run.stdout).toMatch(/^Verdict: NO RESULT \(test\/node_modules is a link, not a dir of this checkout's own, .*; run npm run test:install in this checkout\)$/m);
+    for (const target of [path.join(root, 'test', 'node_modules'), empty]) {
+      fs.symlinkSync(target, packages, 'junction');
+      const run = spawnSync(process.execPath, [path.join(copy, 'test', 'mutation', 'touched.mjs')], { cwd: copy, encoding: 'utf8' });
+      expect(run.status, run.stderr).toBe(2);
+      expect(run.stdout, target).toMatch(/^Verdict: NO RESULT \(test\/node_modules is a link, not a dir of this checkout's own, .*; first remove the link itself, never what it names, with node -e "require\('fs'\)\.rmSync\('test\/node_modules'\)" from the bot root \(it refuses a real dir\), then run npm run test:install: npm ci through the link would empty the other checkout's test\/node_modules\)$/m);
+      fs.unlinkSync(packages);
+    }
+    // The way on the message gives removes the link and keeps what it named.
+    fs.symlinkSync(empty, packages, 'junction');
+    fs.writeFileSync(path.join(empty, 'kept'), '');
+    fs.rmSync(packages);
+    expect(fs.existsSync(packages)).toBe(false);
+    expect(fs.readdirSync(empty)).toEqual(['kept']);
+    expect(() => fs.rmSync(empty)).toThrow();
+    expect(fs.readdirSync(empty)).toEqual(['kept']);
   });
 
   it('ends the gate NO RESULT, exit 2, on stdout with every other verdict, when the test packages are missing', () => {

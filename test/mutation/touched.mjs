@@ -40,6 +40,16 @@ if (major < 22 || (major === 22 && minor < 12)) {
   process.exit(run.status ?? (run.signal ? 130 : 2));
 }
 
+// Stryker links into each sandbox only a node_modules that is a dir, never a
+// link, and runner.mjs starts vitest from the sandbox's test/node_modules. Read
+// before the libraries load through it: npm ci through a link empties the dir
+// it names, another checkout's.
+const testPackages = fs.lstatSync(fileURLToPath(new URL('../node_modules', import.meta.url)), { throwIfNoEntry: false });
+if (testPackages !== undefined && !testPackages.isDirectory()) {
+  console.log("Verdict: NO RESULT (test/node_modules is a link, not a dir of this checkout's own, and Stryker links only a dir into its sandboxes, so no run would find the suite's packages; first remove the link itself, never what it names, with node -e \"require('fs').rmSync('test/node_modules')\" from the bot root (it refuses a real dir), then run npm run test:install: npm ci through the link would empty the other checkout's test/node_modules)");
+  process.exit(2);
+}
+
 // The libraries load here, so a checkout without the test packages (npm run
 // test:install) ends NO RESULT rather than with a crash's exit code.
 /** @type {typeof import('./ranges.mjs')} */
@@ -96,12 +106,6 @@ try {
   fs.writeFileSync(path.join(root, '.stryker-tmp', '.gitignore'), '*\n');
 } catch (error) {
   console.log(`Verdict: NO RESULT (the gate could not make .stryker-tmp, where Stryker puts its sandboxes: ${firstLine(error)})`);
-  process.exit(2);
-}
-// Stryker links into each sandbox only a node_modules that is a dir, never a
-// link, and runner.mjs starts vitest from the sandbox's test/node_modules.
-if (!fs.lstatSync(path.join(root, 'test', 'node_modules'), { throwIfNoEntry: false })?.isDirectory()) {
-  console.log("Verdict: NO RESULT (test/node_modules is a link, not a dir of this checkout's own, and Stryker links only a dir into its sandboxes, so no run would find the suite's packages; run npm run test:install in this checkout)");
   process.exit(2);
 }
 // The tree as the gate found it before reading any file (tree.mjs), and the

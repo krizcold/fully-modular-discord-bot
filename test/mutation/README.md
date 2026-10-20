@@ -59,8 +59,8 @@ From the bot root, with Node 22.12 or newer (or SMDB_TEST_NODE set, as for `npm 
   above, under the root's `*.log`) or one outside the checkout: a file in the tree that the run writes to changes
   during the run, which ends it NO RESULT.
 - Exit 0 is PASS, 1 FAIL, 2 NO RESULT (nothing was tested, the tree changed during the run, or the gate stopped: the
-  report says which; or, with no report, the test packages are missing or test/node_modules is a link (`npm run
-  test:install`), the checkout's path
+  report says which; or, with no report, the test packages are missing (`npm run test:install`) or test/node_modules
+  is a link (below), the checkout's path
   does not match itself read as a glob, as Stryker reads it (a `[ ]` class, a `{ }` with a comma or a range, an extglob
   such as `+( )`, or one minimatch cannot read: Stryker then matches no file to mutate), .stryker-tmp could not be made, git could not list the tree,
   or the report itself could not be written; every `Verdict:` line goes to
@@ -91,7 +91,9 @@ does not name by its content.
   changes no code: it widens to itself only and gates nothing, so a comment edited inside an object or a call brings in
   none of its mutants. It still joins the ranges on either side of it, so a new function whose body holds a blank line
   is made whole. A file where only such lines changed, and no code was taken out, is not mutated (below); a line of
-  code made a comment or a blank line is code taken out (below).
+  code made a comment or a blank line is code taken out (below). A `/*` or `*/` on such a line can also switch the
+  unchanged lines it reaches: one it turns into code counts as a changed line (it widens and gates), and one it turns
+  out of code is code taken out there.
 - **Gating** mutants touch a changed line that holds code (a token, brackets and separators included). Some that touch one are not made: one that touches it only through a block
   holding the line (the emptying of that block, or the whole callback around it), the emptying of the body of a
   compound statement or declaration (above), or of a bare block, that only begins or ends on the changed line: its
@@ -113,8 +115,8 @@ does not name by its content.
 - The other mutants in the widened ranges are **context**: they run in pass A and are listed, but never fail the gate.
 - What was taken out has no line left to mutate, and the lines beside it are mutated only where a changed line widens
   to them. The report names each place where lines of code (a token on them) were taken out with fewer or none put
-  back (a pure deletion, a line deleted beside an edited one, one made a comment or a blank line, a block taken away with
-  its body re-indented), so a reviewer checks the code around each; a line of code replaced one for one by code, or a
+  back (a pure deletion, a line deleted beside an edited one, one made a comment or a blank line, an unchanged one a
+  `/*` and `*/` now hold, a block taken away with its body re-indented), so a reviewer checks the code around each; a line of code replaced one for one by code, or a
   block taken away where as many or more lines of code are put back, shows only as changed lines. A job that only
   takes code out makes no mutant: the gate names the places and ends NO RESULT, with no pass run.
 - Lines added in one place, or only taken out, count also over each unchanged line beside them that repeats one of
@@ -125,7 +127,10 @@ does not name by its content.
   several pieces, and then which of its copies count is again the diff's choice: a line the job added can go unmutated,
   and be named nowhere, while an unchanged copy of it gates. So is it where repeated lines are spread among other
   changes.
-- Only the lines the diff changed count. A change can also move an unchanged line into or out of a block (a bracket,
+- Only the lines the diff changed count, and the unchanged ones a comment switched (above). An unchanged line that
+  holds a token before and after but of another kind (template text made code, or code made template text, by a
+  backtick added or taken out on another line) is not seen: only the line with the backtick counts. A change can also
+  move an unchanged line into or out of a block (a bracket,
   an `else`, a `finally` or a `case` moved past it, a header put around it, an if's two bodies swapped): that line is
   not gated, so its mutants run as context at most. The changed lines that make such a move are named under their own
   heading, mutants of their own or not: a line of brackets and separators only, one holding a brace of a block (a
@@ -294,7 +299,9 @@ holds npm's hidden lockfile (`.package-lock.json`) of the two dirs the runs load
 packages) and test/node_modules (the suite's), read through a link to the dir it names; npm rewrites it at the end of
 an install that changes the dir and npm ci removes it first, so an install during the run ends NO RESULT too.
 test/node_modules must be a dir of the checkout's own: as a link Stryker would link none of the suite's packages, so
-the gate stops at its start (`npm run test:install` in that checkout). Not seen: an install still running when the
+the gate stops at its start, before it loads a package through the link. Remove the link itself first, never what it
+names (from the bot root, `node -e "require('fs').rmSync('test/node_modules')"`, which refuses a real dir), and only
+then run `npm run test:install`: npm ci through the link empties the other checkout's test/node_modules. Not seen: an install still running when the
 last print is taken, or one stopped before it finished (npm writes the record last); an `npm rebuild` (it never
 rewrites the record); packages changed by any other tool; and packages in any other node_modules (a module's own, in
 a clone under src), which Stryker links too.
