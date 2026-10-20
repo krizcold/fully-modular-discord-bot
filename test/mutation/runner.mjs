@@ -95,7 +95,7 @@ if (mutant === 'dry') {
  * Ends the run. A run with no mutant leaves its time, which the run with no
  * mutant after a rerun's timeouts is held to (control.mjs): by the wall clock,
  * as Stryker times a run to set each rerun's budget, then by a monotonic
- * clock, which no clock step moves, as Stryker's timer holds a rerun to it.
+ * clock, which no clock step moves; where the two disagree, the clock stepped.
  * @param {number} code
  */
 const end = code => {

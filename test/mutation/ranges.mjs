@@ -51,35 +51,27 @@ export const EXTRA_BREAK_WHY = 'it holds a line break Stryker counts and the gat
 export const holdsExtraBreak = text => EXTRA_BREAK.test(text);
 
 // The variable's name as a string, and the fixed roots '/data' and '/app' or a path under either, in any case and
-// with either slash.
+// with either slash, in every file (a route path that reads like one, as the config page's do, counts too).
 const DATA_ROUTE = /^(DATA_DIR|[\\/](data|app)([\\/].*)?)$/is;
-
-// The config page's route paths, which read like paths under '/data' and are no root there, as plain strings: the
-// same text anywhere else, or as a template's head, can be a path.
-export const CONFIG_ROUTES = ['/data/delete', '/data/delete-guild', '/data/get', '/data/update'];
-const CONFIG_PAGE = '/src/webui/routes/config.ts';
 
 export const DATA_ROUTE_WHY = "it reads DATA_DIR or holds a fixed root ('/data' or '/app', or a path under either), so a mutant of it could send the tests there, on a developer's machine a real data root and anywhere else one the run would make";
 
 /**
  * Whether a file's code names the DATA_DIR variable, or holds as a string or a
  * template's head the '/data' or the image's '/app' root or a path under
- * either (but the config page's route paths, in that page, as plain strings),
- * in any case and with either slash (Windows reads `/Data`, `\data` and
- * `data_dir` as the same): a mutant of it (a check of DATA_DIR or of the image
- * made false or true, a fallback chosen) could send the tests to a fixed root
- * outside the sandbox, so the gate never mutates it.
- * @param {string} file its name from the bot root, or its path in a sandbox
+ * either, in any case and with either slash (Windows reads `/Data`, `\data`
+ * and `data_dir` as the same): a mutant of it (a check of DATA_DIR or of the
+ * image made false or true, a fallback chosen) could send the tests to a fixed
+ * root outside the sandbox, so the gate never mutates it.
+ * @param {string} file
  * @param {string} text
  */
 export function holdsDataRoute(file, text) {
-  const page = `/${file}`.replace(/\\/g, '/').endsWith(CONFIG_PAGE);
   let found = false;
   /** @param {ts.Node} node */
   const walk = node => {
     if (ts.isIdentifier(node) && node.text.toUpperCase() === 'DATA_DIR') found = true;
-    else if (ts.isTemplateHead(node) && DATA_ROUTE.test(node.text)) found = true;
-    else if ((ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) && DATA_ROUTE.test(node.text) && !(page && CONFIG_ROUTES.includes(node.text))) found = true;
+    else if ((ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node) || ts.isTemplateHead(node)) && DATA_ROUTE.test(node.text)) found = true;
     else if (!found) ts.forEachChild(node, walk);
   };
   walk(parse(file, text));

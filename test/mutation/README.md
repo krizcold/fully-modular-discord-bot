@@ -161,18 +161,17 @@ does not name by its content.
   the head of a template the `'/data'` root or a path under it (`'/data/global'`, `` `/data/${x}` ``;
   src/utils/dataRoot.ts today, under any name) or the image's `'/app'` root or a path under it (`'/app/build'`,
   `` `/app/${x}` ``: the module path helpers, the snapshot and update code and src/index.ts today), in any case and
-  with either slash (Windows reads `/Data`, `\data` and `data_dir` as the same). In the config page,
-  src/webui/routes/config.ts, its four route paths (`'/data/get'` and the like, ranges.mjs CONFIG_ROUTES) as plain
-  strings are no root, so that page stays mutated; a new route of that form joins that list. The same strings
-  anywhere else, or as a template's head, are roots. The rule reads one file at a time: a root built at run time
-  (`path.join('/', 'data')`), or
+  with either slash (Windows reads `/Data`, `\data` and `data_dir` as the same), in every file: a route path that
+  reads like a path under `/data` counts too, so src/webui/routes/config.ts, whose data routes are `'/data/get'` and
+  the like, is named and never mutated (a route path of another shape would let it be). The rule reads one file at a
+  time: a root built at run time (`path.join('/', 'data')`), or
   a check that takes the variable's name or a fixed root from another file (an imported constant, a function that
   returns a root it does not choose), is not seen, so the check that picks a root and the root it picks stay in one
   file (the module path helpers return a root their own check chose). unit/mutationRanges.test.ts runs the gate's
-  planner on every file in src that git tracks or would add, pins the files it names for this rule (these five today)
+  planner on every file in src that git tracks or would add, pins the files it names for this rule (these six today)
   and fails when that list changes, so one that a split leaves holding neither the name nor a root, whatever took
   them (a constants file, an enum, a JSON file), is looked at, and so is a file that gains a fixed path (route it
-  through src/utils/dataRoot.ts, or, for a route path, add it to CONFIG_ROUTES). Not seen: a check, written new or moved out of one of these files, in a file the rule never named, that
+  through src/utils/dataRoot.ts). Not seen: a check, written new or moved out of one of these files, in a file the rule never named, that
   takes its root or the name from another file (one of these included). A mutant of a file
   the rule names (the DATA_DIR check made false, the
   image's marker taken as found, the fallback chosen) sends the tests to such a root, on a developer's machine a real
@@ -266,10 +265,13 @@ does not name by its content.
    B's dist built from that code), which ends after its run with no mutant (`dryRunOnly`). If they fail, the
    machine or a container went bad during the reruns, so what the reruns counted is inconclusive and the gate ends NO
    RESULT. When a rerun of pass A confirmed a timeout, the run must also fit in the budget Stryker gave each rerun (four
-   times the reruns' own run with no mutant, plus a minute; runner.mjs times both, by the wall clock, as Stryker times
-   a run to set that budget, and by a monotonic clock, which no clock step moves, as Stryker's timer holds a rerun to
-   it; mutation/control.mjs builds the budget from the first and holds this run to it by the second), or the machine
-   was as slow as the mutant seemed and the gate ends NO RESULT the same way. Its bound is
+   times the reruns' own run with no mutant, plus a minute, which Stryker builds from that run's wall time), or the
+   machine was as slow as the mutant seemed and the gate ends NO RESULT the same way. runner.mjs times both runs by the
+   wall clock and by a monotonic clock, which no clock step moves; where the two disagree for either run (by more than
+   a second and a tenth), the clock stepped, so the budget is not what the reruns took (a step forward of days
+   overflows Node's timer, which then holds each rerun to 1 ms), and the gate ends NO RESULT the same way
+   (mutation/control.mjs). A step within that margin moves the budget by at most four times it, and one in the moment
+   before runner.mjs starts its clocks is seen by neither. Its bound is
    an hour, above the budget any rerun of pass A had (its own run with no mutant ran under Stryker's five minutes), so
    the budget, not the bound, judges its time.
    What it cannot see: a machine that was

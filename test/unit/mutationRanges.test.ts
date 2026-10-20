@@ -14,7 +14,7 @@ import { canonicalName } from '../mutation/keys.mjs';
 import {
   changeTarget, codeLines, commonLines, gates, gatesIn, inPattern, lineDiff, linesOfTarget, mergeRanges, mutatePatterns, notMutated, parseNameStatus,
   planChange, planFromGit, unmatchedPatterns, untouched, wholeTarget, structureLines, DATA_ROUTE_WHY, GLOB_NAME_WHY, beyondTree, holdsDataRoute, rootGlobFree,
-  sandboxPatterns, strykerTakes, tokenLines, treeTsconfig, NO_CODE_WHY, linkOf, ownNames, CONFIG_ROUTES, mutatedName,
+  sandboxPatterns, strykerTakes, tokenLines, treeTsconfig, NO_CODE_WHY, linkOf, ownNames, mutatedName,
 } from '../mutation/ranges.mjs';
 import { treeChanges, treePrint } from '../mutation/tree.mjs';
 
@@ -717,20 +717,13 @@ describe('the change', () => {
     for (const text of ["export const at = (base?: string) => base ?? '/data/exports';\n", "export const at = '/data/global';\n"]) {
       expect(holdsDataRoute('src/a.ts', text), text).toBe(true);
     }
-    // A name that holds it, the config page's routes, a word that starts with it, or a comment is no way there.
-    expect(holdsDataRoute('src/webui/routes/config.ts', "// DATA_DIR, '/data'\nconst BASE_DATA_DIR = DATA_ROOT;\napp.get('/data/get', h);\n")).toBe(false);
-    // The config page's routes are no root there, as plain strings, under the planner's name or a sandbox's path;
-    // the same text in another file, or as a template's head, is a path a mutant could write to.
-    const page = 'src/webui/routes/config.ts';
-    for (const route of CONFIG_ROUTES) {
-      for (const name of [page, path.join(os.tmpdir(), 'sandbox', page), `C:\\sandbox\\${page.split('/').join('\\')}`]) {
-        expect(holdsDataRoute(name, `router.post('${route}', h);\nrouter.get(\`${route}\`, h);\n`), `${name} ${route}`).toBe(false);
-      }
-      expect(holdsDataRoute('src/a.ts', `router.post('${route}', h);\n`), route).toBe(true);
-      expect(holdsDataRoute('src/a.ts', `export const at = (base?: string) => base ?? '${route}';\n`), route).toBe(true);
-      expect(holdsDataRoute(page, `router.post(\`${route}\${''}\`, h);\n`), route).toBe(true);
-      expect(holdsDataRoute('src/webui/routes/myconfig.ts', `router.post('${route}', h);\n`), route).toBe(true);
+    // A route path that reads like one is one, in every file and under every name: the config page's own included.
+    for (const name of ['src/webui/routes/config.ts', 'src/a.ts']) {
+      expect(holdsDataRoute(name, "router.post('/data/get', h);\n"), name).toBe(true);
+      expect(holdsDataRoute(name, 'router.get(`/data/update`, h);\n'), name).toBe(true);
     }
+    // A name that holds it, a word that starts with it, or a comment is no way there.
+    expect(holdsDataRoute('src/a.ts', "// DATA_DIR, '/data'\nconst BASE_DATA_DIR = DATA_ROOT;\n")).toBe(false);
     for (const text of ["export const at = '/database';\n", "export const at = '/data-x';\n"]) expect(holdsDataRoute('src/a.ts', text), text).toBe(false);
     // The image's /app root and every path under it are fixed roots too (D:\app on Windows): the file that picks
     // them when the image's marker exists is never mutated, nor is any that holds one.
@@ -742,8 +735,7 @@ describe('the change', () => {
     for (const text of ["export const at = '/apps/x';\n", "export const at = '/apply';\n", "export const at = 'app/x';\n"]) {
       expect(holdsDataRoute('src/a.ts', text), text).toBe(false);
     }
-    // Windows reads these as the same roots and the same variable: any case, either slash (a route in another case
-    // is a path, not the config page's route).
+    // Windows reads these as the same roots and the same variable: any case, either slash.
     for (const text of ["export const at = '/Data';\n", "export const at = '/DATA/';\n", "export const at = '\\\\data';\n", "export const at = '/App/build';\n",
       "export const at = '\\\\app\\\\build';\n", "export const root = process.env.data_dir ?? 'here';\n", "app.get('/Data/get', h);\n"]) {
       expect(holdsDataRoute('src/a.ts', text), text).toBe(true);
@@ -782,15 +774,14 @@ describe('the change', () => {
     // The bite's probe, which a bite run cut short leaves holding DATA_DIR until its next run sweeps it.
     const named = skipped.filter(s => s.why === DATA_ROUTE_WHY && !/^src\/smdb-bite-probe-\d+\.ts$/.test(s.file)).map(s => s.file);
     expect(targets.length).toBeGreaterThan(100);
-    // The config page holds only its routes, so it stays mutated.
-    expect(targets.map(t => t.file)).toContain('src/webui/routes/config.ts');
     // A change: see that each check that picks a root still holds the root it picks, as dataRoot.ts does, and route a
-    // fixed path through src/utils/dataRoot.ts (or, for a route path, add it to ranges.mjs CONFIG_ROUTES); then set the list.
+    // fixed path through src/utils/dataRoot.ts; then set the list. The config page is on it for its data routes.
     expect(named.sort()).toEqual([
       'src/bot/internalSetup/utils/pathHelpers.ts',
       'src/index.ts',
       'src/utils/autoSnapshot.ts',
       'src/utils/dataRoot.ts',
+      'src/webui/routes/config.ts',
       'src/webui/routes/update.ts',
     ]);
   });

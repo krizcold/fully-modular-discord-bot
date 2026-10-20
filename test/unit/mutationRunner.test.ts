@@ -155,17 +155,24 @@ describe('the run with no mutant after the reruns', () => {
     const time = (where: string, ms: string) => fs.writeFileSync(path.join(where, 'dry-ms.txt'), ms);
     const budget = { timeoutFactor: 4, timeoutMS: 60_000 };
     // The budget from the reruns' wall time, as Stryker built it: 4 x 10 s + 60 s.
-    time(reruns, '10000 99999');
+    time(reruns, '10000 10000');
     time(out, '100000 100000');
     expect(pastBudget(reruns, out, budget)).toBe('');
     const past = 'it took 101 s, past the 100 s Stryker gave each rerun, so the machine was too slow then to tell a slow mutant from a slow run';
     time(out, '100600 100600');
     expect(pastBudget(reruns, out, budget)).toBe(past);
-    // This run by its monotonic time: a clock stepped back during it moves only its wall time.
-    time(out, '50600 100600');
-    expect(pastBudget(reruns, out, budget)).toBe(past);
-    time(out, '150000 100000');
+    // Clocks that drift a little apart are no step.
+    time(reruns, '10500 10000');
+    time(out, '100000 100900');
     expect(pastBudget(reruns, out, budget)).toBe('');
+    // A clock that stepped during either run: the budget Stryker built is not what the reruns took.
+    const stepped = "the clock stepped during it or during the reruns' own run with no mutant, so the budget Stryker gave each rerun was not four times what they took";
+    for (const [a2, run] of [['10000 10000', '50600 100600'], ['10000 10000', '150000 100000'], ['604830000 30000', '30400 30400'], ['1000 30000', '30400 30400']]) {
+      time(reruns, a2);
+      time(out, run);
+      expect(pastBudget(reruns, out, budget), `${a2} / ${run}`).toBe(stepped);
+    }
+    time(reruns, '10000 10000');
     const unread = "its time, or the time of the reruns' own run with no mutant, could not be read";
     for (const text of ['soon', '100000', '100000 soon']) {
       time(out, text);
