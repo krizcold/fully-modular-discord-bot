@@ -113,7 +113,7 @@ describe('the touched-line mutation gate', () => {
     expect(run.stdout).toMatch(/^Verdict: FAIL$/m);
     // Pass B's kills reran with the one file that killed them, and so did the run with no mutant after them.
     for (const dir of ['b2-1', 'control-b2']) {
-      const written = fs.readdirSync(path.join(root, reportDir!, dir)).filter(file => !['targets.json', 'run-ids.json', 'dry-ms.txt'].includes(file));
+      const written = fs.readdirSync(path.join(root, reportDir!, dir)).filter(file => !['targets.json', 'run-ids.json', 'dry-ms.txt', 'dry-timing.json'].includes(file));
       expect(written.some(file => file.endsWith('-child.json')), dir).toBe(true);
       expect(written.filter(file => !file.includes('-child.')), dir).toEqual([]);
     }
@@ -206,8 +206,9 @@ describe('the touched-line mutation gate', () => {
 
   it('counts no timeout its reruns confirmed when the run with no mutant after them passes past their budget', { timeout: 600_000 }, () => {
     // The reruns' own run with no mutant is made to read 14 s shorter than
-    // nothing on both clocks (runner.mjs times it in a2/dry-ms.txt), so their
-    // budget is 4 x -14 s + 60 s = 4 s, and the run after them passes in 5 s. A sandbox
+    // nothing, on Stryker's clock (a2/dry-timing.json) and on runner.mjs's
+    // (a2/dry-ms.txt), so their budget is 4 x -14 s + 60 s = 4 s, and the run
+    // after them passes in 5 s. A sandbox
     // another Stryker run left behind, with no .gitignore, is no change.
     const leftover = path.join(root, '.stryker-tmp', `smdb-leftover-${process.pid}`);
     fs.rmSync(path.join(root, '.stryker-tmp', '.gitignore'), { force: true });
@@ -217,7 +218,8 @@ describe('the touched-line mutation gate', () => {
       try {
         return standInRun([
           "if (pass === 'control-a2') {",
-          "  fs.writeFileSync(path.join(path.dirname(path.dirname(file)), 'a2', 'dry-ms.txt'), '-14000 -14000');",
+          "  fs.writeFileSync(path.join(path.dirname(path.dirname(file)), 'a2', 'dry-ms.txt'), '-14000');",
+          "  fs.writeFileSync(path.join(path.dirname(path.dirname(file)), 'a2', 'dry-timing.json'), JSON.stringify({ net: -14000, overhead: 0 }));",
           '  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5000);',
           '}',
         ].join('\n'));

@@ -4,7 +4,9 @@
 // Stryker has made its plan, before any mutant runs, this writes the ids of the
 // mutants the pass is for (their keys are in the file SMDB_MUTATION_TARGETS
 // names; the ids go to the one SMDB_MUTATION_RUN names), and runner.mjs runs no
-// test for the others, whose results touched.mjs drops.
+// test for the others, whose results touched.mjs drops. In every pass it also
+// leaves Stryker's own time for the run with no mutant (dry-timing.json in the
+// pass's dir), which each rerun's budget is built from (control.mjs).
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -33,6 +35,17 @@ class TargetsReporter {
       .filter(m => keys.has(keyOf(fileOf(root, m.fileName), m.mutatorName, m.replacement ?? '', { start: fromOne(m.location.start), end: fromOne(m.location.end) })))
       .map(m => m.id);
     fs.writeFileSync(run, JSON.stringify(ids));
+  }
+
+  /**
+   * Stryker times the run with no mutant on its own clock: each rerun's budget
+   * is timeoutFactor times `net`, plus timeoutMS, plus `overhead`.
+   * @param {{ timing: { net: number, overhead: number } }} event
+   */
+  onDryRunCompleted({ timing }) {
+    const out = process.env.SMDB_MUTATION_OUT;
+    if (!out) return;
+    fs.writeFileSync(path.join(out, 'dry-timing.json'), JSON.stringify({ net: timing.net, overhead: timing.overhead }));
   }
 }
 

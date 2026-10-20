@@ -16,8 +16,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
-const started = Date.now();
-const startedMono = performance.now();
+const started = performance.now();
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const testDir = path.join(root, 'test');
 // SMDB_MUTATION_VITEST: a test's stand-in for vitest (unit/mutationRunner.test.ts).
@@ -93,13 +92,12 @@ if (mutant === 'dry') {
 }
 /**
  * Ends the run. A run with no mutant leaves its time, which the run with no
- * mutant after a rerun's timeouts is held to (control.mjs): by the wall clock,
- * as Stryker times a run to set each rerun's budget, then by a monotonic
- * clock, which no clock step moves; where the two disagree, the clock stepped.
+ * mutant after a rerun's timeouts is held to (control.mjs), by a monotonic
+ * clock, which no clock step moves.
  * @param {number} code
  */
 const end = code => {
-  if (mutant === 'dry') fs.writeFileSync(path.join(out, 'dry-ms.txt'), `${Date.now() - started} ${Math.round(performance.now() - startedMono)}`);
+  if (mutant === 'dry') fs.writeFileSync(path.join(out, 'dry-ms.txt'), String(Math.round(performance.now() - started)));
   process.exit(code);
 };
 if (only.length > 0) {

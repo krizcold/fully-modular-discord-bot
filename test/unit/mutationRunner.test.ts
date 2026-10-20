@@ -109,8 +109,8 @@ describe('a mutant run', () => {
     expect(fs.existsSync(path.join(fake.out, 'dry-ms.txt'))).toBe(false);
     // A run with no mutant reads its files: one that exists and holds no way to a fixed root.
     expect(runner(fake, 'a', '1', [], { __STRYKER_ACTIVE_MUTANT__: undefined, SMDB_MUTATION_FILES: '["test/mutation/control.mjs"]' }).status).toBe(0);
-    // By the wall clock, then by a monotonic one.
-    expect(fs.readFileSync(path.join(fake.out, 'dry-ms.txt'), 'utf8')).toMatch(/^-?\d+ \d+$/);
+    // By a monotonic clock.
+    expect(fs.readFileSync(path.join(fake.out, 'dry-ms.txt'), 'utf8')).toMatch(/^\d+$/);
   });
 });
 
@@ -143,6 +143,16 @@ describe('a pass on some of the mutants Stryker made', () => {
     new Reporter().onMutationTestingPlanReady({ mutantPlans: [planned('1', 'a >= 0', 9), planned('2', 'a <= 0', 9), planned('3', 'a >= 0', 10)] });
     expect(JSON.parse(fs.readFileSync(run, 'utf8'))).toEqual(['1']);
   });
+
+  it("leaves, in every pass, Stryker's own time for the run with no mutant, which each rerun's budget is built from", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-timing-'));
+    onTestFinished(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const { strykerPlugins } = await import('../mutation/targets.mjs');
+    const Reporter = strykerPlugins[0].injectableClass as unknown as new () => { onDryRunCompleted(event: unknown): void };
+    vi.stubEnv('SMDB_MUTATION_OUT', dir);
+    new Reporter().onDryRunCompleted({ result: {}, timing: { net: 30_012, overhead: 41 }, capabilities: {} });
+    expect(JSON.parse(fs.readFileSync(path.join(dir, 'dry-timing.json'), 'utf8'))).toEqual({ net: 30_012, overhead: 41 });
+  });
 });
 
 describe('the run with no mutant after the reruns', () => {
@@ -153,33 +163,43 @@ describe('the run with no mutant after the reruns', () => {
     fs.mkdirSync(reruns);
     fs.mkdirSync(out);
     const time = (where: string, ms: string) => fs.writeFileSync(path.join(where, 'dry-ms.txt'), ms);
+    const stryker = (timing: unknown) => fs.writeFileSync(path.join(reruns, 'dry-timing.json'), JSON.stringify(timing));
     const budget = { timeoutFactor: 4, timeoutMS: 60_000 };
-    // The budget from the reruns' wall time, as Stryker built it: 4 x 10 s + 60 s.
-    time(reruns, '10000 10000');
-    time(out, '100000 100000');
+    // The budget as Stryker built it, from its own time for the reruns' run: 4 x 10 s + 60 s + its overhead.
+    stryker({ net: 10_000, overhead: 0 });
+    time(reruns, '10000');
+    time(out, '100000');
     expect(pastBudget(reruns, out, budget)).toBe('');
     const past = 'it took 101 s, past the 100 s Stryker gave each rerun, so the machine was too slow then to tell a slow mutant from a slow run';
-    time(out, '100600 100600');
+    time(out, '100600');
     expect(pastBudget(reruns, out, budget)).toBe(past);
-    // Clocks that drift a little apart are no step.
-    time(reruns, '10500 10000');
-    time(out, '100000 100900');
+    stryker({ net: 10_000, overhead: 700 });
     expect(pastBudget(reruns, out, budget)).toBe('');
-    // A clock that stepped during either run: the budget Stryker built is not what the reruns took.
-    const stepped = "the clock stepped during it or during the reruns' own run with no mutant, so the budget Stryker gave each rerun was not four times what they took";
-    for (const [a2, run] of [['10000 10000', '50600 100600'], ['10000 10000', '150000 100000'], ['604830000 30000', '30400 30400'], ['1000 30000', '30400 30400']]) {
-      time(reruns, a2);
-      time(out, run);
-      expect(pastBudget(reruns, out, budget), `${a2} / ${run}`).toBe(stepped);
+    // Stryker's clock and the run's monotonic one a little apart (the shell and Node's start) is no step.
+    stryker({ net: 10_400, overhead: 0 });
+    time(reruns, '10000');
+    time(out, '101500');
+    expect(pastBudget(reruns, out, budget)).toBe('');
+    // Stryker's process took in a clock step during the reruns' run (forward days, back seconds, or in its overhead).
+    const stepped = "Stryker's own time for the reruns' run with no mutant does not match that run's monotonic time, so the clock of Stryker's process stepped and the budget it gave each rerun was not four times what they took";
+    time(reruns, '30000');
+    time(out, '30400');
+    for (const timing of [{ net: 604_830_000, overhead: 0 }, { net: 1000, overhead: 0 }, { net: 30_000, overhead: 604_800_000 }, { net: 30_000, overhead: -5 }]) {
+      stryker(timing);
+      expect(pastBudget(reruns, out, budget), JSON.stringify(timing)).toBe(stepped);
     }
-    time(reruns, '10000 10000');
     const unread = "its time, or the time of the reruns' own run with no mutant, could not be read";
-    for (const text of ['soon', '100000', '100000 soon']) {
+    stryker({ net: 30_000, overhead: 0 });
+    for (const text of ['soon', '']) {
       time(out, text);
       expect(pastBudget(reruns, out, budget), text).toBe(unread);
     }
-    time(out, '1 1');
-    fs.rmSync(path.join(reruns, 'dry-ms.txt'));
+    time(out, '1');
+    for (const timing of [{ net: 30_000 }, { net: 'soon', overhead: 0 }, null]) {
+      stryker(timing);
+      expect(pastBudget(reruns, out, budget), JSON.stringify(timing)).toBe(unread);
+    }
+    fs.rmSync(path.join(reruns, 'dry-timing.json'));
     expect(pastBudget(reruns, out, budget)).toBe(unread);
   });
 

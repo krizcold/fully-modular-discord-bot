@@ -15,7 +15,7 @@ active mutant travels in `__STRYKER_ACTIVE_MUTANT__` and reaches child processes
 | passes.mjs | (data) the Stryker options every pass shares, and each pass's own options and budget; unit/mutationRunner.test.ts |
 | stryker.json | (data) empty on purpose: every pass names it as its config file, so Stryker never reads one it finds in the bot root |
 | keys.mjs | (library) how a file and a mutant are named across passes; unit/mutationRanges.test.ts |
-| targets.mjs | (Stryker reporter) which mutant ids a later pass runs tests for; unit/mutationRunner.test.ts and the bite |
+| targets.mjs | (Stryker reporter) which mutant ids a later pass runs tests for, and Stryker's own time for each run with no mutant; unit/mutationRunner.test.ts and the bite |
 | tree.mjs | (library) the fingerprint of the tree a run reads, taken before the plan and before the verdict; unit/mutationRanges.test.ts and the bite |
 | ../helpers/time.mjs | the factor on the config's test and hook limits and a child step's default bound (4 in a rerun alone and in the run with no mutant after the reruns; a limit a test, hook or step sets itself is not scaled) |
 | ../helpers/env.ts, setup.ts | what a test and its children keep of the environment, and the run's fast-check seed |
@@ -265,13 +265,13 @@ does not name by its content.
    B's dist built from that code), which ends after its run with no mutant (`dryRunOnly`). If they fail, the
    machine or a container went bad during the reruns, so what the reruns counted is inconclusive and the gate ends NO
    RESULT. When a rerun of pass A confirmed a timeout, the run must also fit in the budget Stryker gave each rerun (four
-   times the reruns' own run with no mutant, plus a minute, which Stryker builds from that run's wall time), or the
-   machine was as slow as the mutant seemed and the gate ends NO RESULT the same way. runner.mjs times both runs by the
-   wall clock and by a monotonic clock, which no clock step moves; where the two disagree for either run (by more than
-   a second and a tenth), the clock stepped, so the budget is not what the reruns took (a step forward of days
-   overflows Node's timer, which then holds each rerun to 1 ms), and the gate ends NO RESULT the same way
-   (mutation/control.mjs). A step within that margin moves the budget by at most four times it, and one in the moment
-   before runner.mjs starts its clocks is seen by neither. Its bound is
+   times the reruns' own run with no mutant, plus a minute, plus Stryker's overhead), by a monotonic clock, which no
+   clock step moves, or the machine was as slow as the mutant seemed and the gate ends NO RESULT the same way. The
+   budget is Stryker's own: its reporter leaves Stryker's time for the reruns' run with no mutant (dry-timing.json),
+   and runner.mjs times that run by a monotonic clock (dry-ms.txt). Where the two disagree by more than a second plus
+   a tenth of the run, the clock of Stryker's process stepped, so the budget is not what the reruns took (a step
+   forward of days overflows Node's timer, which then holds each rerun to 1 ms), and the gate ends NO RESULT the same
+   way (mutation/control.mjs). A step within that margin moves the budget by at most four times it. Its bound is
    an hour, above the budget any rerun of pass A had (its own run with no mutant ran under Stryker's five minutes), so
    the budget, not the bound, judges its time.
    What it cannot see: a machine that was
@@ -331,7 +331,7 @@ can hold the port or the path, and a run before it can leave the path behind. Fa
   that killed it (for a mutant pass A met again with no checker, its pass A is that run, in `a-unchecked/`).
 - `a/`, `a-unchecked/` (pass A again with no checker), `a2/`, `b/` and `b2-1/`, `b2-2/` (one per test file that failed in pass B: a kill, or a failure only on the machine's texts) hold, for each mutant run, one vitest
   JSON report and log per tier it ran (`<id>-<tier>.json` and `.log`; a run in `b/` can reach both integration and
-  child; a nested mutant a pass is not for runs nothing; `dry-*` is the run with no mutant, and `dry-ms.txt` its time).
+  child; a nested mutant a pass is not for runs nothing; `dry-*` is the run with no mutant, `dry-ms.txt` its monotonic time and `dry-timing.json` Stryker's).
   `a-unchecked/`, `a2/`, `b/` and `b2-*/` also hold targets.json and run-ids.json, the mutants the pass is for. `control-a2/` and
   `control-b2/` hold the runs with no mutant after the reruns.
 
