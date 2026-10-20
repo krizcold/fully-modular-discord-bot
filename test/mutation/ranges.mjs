@@ -194,10 +194,10 @@ export function commonLines(a, b) {
  * lines. The window starts from each piece the diff makes, and another change
  * in the file can split a run into pieces, so then which copy counts is the
  * diff's choice. A line kept counts only where the diff marks it, even when a
- * change moves it into or out of a block (mutation/README.md), or when it
- * holds code before and after: a comment opened or closed on another line
- * that turns it into code makes it changed, and one that turns it out of code
- * makes a place there.
+ * change moves it into or out of a block (mutation/README.md), unless the code
+ * it holds differs (lineCode): a change on another line opened or closed a
+ * comment, a string or a template over part or all of it. Then it is changed
+ * when it holds code after, and a place too when it holds fewer tokens.
  * @param {string} before
  * @param {string} after
  * @param {string} [file] the name `after` is read under
@@ -207,10 +207,10 @@ export function commonLines(a, b) {
 export function lineDiff(before, after, file = 'a.ts', baseFile = file) {
   const a = splitLines(before);
   const b = splitLines(after);
-  const codeOut = splitTokenLines(baseFile, before);
-  const codeIn = splitTokenLines(file, after);
+  const codeOut = lineCode(baseFile, before);
+  const codeIn = lineCode(file, after);
   /**
-   * @param {Set<number>} code
+   * @param {Map<number, number[]>} code
    * @param {number} from
    * @param {number} to
    */
@@ -244,11 +244,14 @@ export function lineDiff(before, after, file = 'a.ts', baseFile = file) {
     pi = i;
     pj = j;
   }
-  // A kept line that a comment opened or closed on another line turned into
-  // code is changed; one it turned out of code is code taken out there.
+  // A kept line whose code differs: changed when it holds code after, and code
+  // taken out there when it holds fewer tokens.
   for (const [i, j] of pairs) {
-    if (!codeOut.has(i + 1) && codeIn.has(j + 1)) changed.add(j + 1);
-    else if (codeOut.has(i + 1) && !codeIn.has(j + 1)) deletedAfter.add(j);
+    const was = codeOut.get(i + 1) ?? [];
+    const is = codeIn.get(j + 1) ?? [];
+    if (was.length === is.length && was.every((part, k) => part === is[k])) continue;
+    if (is.length > 0) changed.add(j + 1);
+    if (was.length > is.length) deletedAfter.add(j);
   }
   /** @param {Set<number>} set */
   const sorted = set => [...set].sort((x, y) => x - y);
@@ -403,10 +406,11 @@ const STRUCTURE = new Set([
  * JSDoc block's; brackets and separators count only when `structure` is set.
  * @param {ts.SourceFile} sf
  * @param {boolean} structure
- * @param {(pos: number) => number} [lineOf] the 1-based line a position is on (TypeScript's lines by default)
  * @returns {Set<number>}
  */
-function heldLines(sf, structure, lineOf = pos => sf.getLineAndCharacterOfPosition(pos).line + 1) {
+function heldLines(sf, structure) {
+  /** @param {number} pos */
+  const lineOf = pos => sf.getLineAndCharacterOfPosition(pos).line + 1;
   /** @type {Set<number>} */
   const held = new Set();
   /** @param {ts.Node} node */
@@ -434,14 +438,22 @@ export function tokenLines(file, text, lines) {
   return lines.filter(line => held.has(line));
 }
 
+const TEMPLATE_PARTS = new Set([ts.SyntaxKind.NoSubstitutionTemplateLiteral, ts.SyntaxKind.TemplateHead, ts.SyntaxKind.TemplateMiddle, ts.SyntaxKind.TemplateTail]);
+
 /**
- * The lines that hold a token, brackets and separators included, numbered as
+ * The code each line holds: the kind of each token on it, in order, brackets
+ * and separators included (a comment, and a JSDoc one, holds none; a
+ * template's parts are one kind, so a substitution added on one of its lines
+ * leaves the others as they were). A line that holds a token is a key. A line
+ * kept as it was holds the same text, so only what its text is read as (code,
+ * a comment, a string, a template, JSX text) can differ. Lines are numbered as
  * lineDiff splits them (at LF or CRLF only): TypeScript also ends a line at a
  * lone CR or a line separator, which a base text may hold.
  * @param {string} file
  * @param {string} text
+ * @returns {Map<number, number[]>}
  */
-function splitTokenLines(file, text) {
+function lineCode(file, text) {
   const starts = [0];
   for (let at = text.indexOf('\n'); at >= 0; at = text.indexOf('\n', at + 1)) starts.push(at + 1);
   /** @param {number} pos */
@@ -455,7 +467,20 @@ function splitTokenLines(file, text) {
     }
     return low + 1;
   };
-  return heldLines(parse(file, text), true, lineOf);
+  const sf = parse(file, text);
+  /** @type {Map<number, number[]>} */
+  const code = new Map();
+  /** @param {ts.Node} node */
+  const walk = node => {
+    if (node.kind >= ts.SyntaxKind.FirstJSDocNode && node.kind <= ts.SyntaxKind.LastJSDocNode) return;
+    const children = node.getChildren(sf);
+    if (children.length > 0) { children.forEach(walk); return; }
+    if (node.getStart(sf) === node.getEnd()) return;
+    const kind = TEMPLATE_PARTS.has(node.kind) ? ts.SyntaxKind.NoSubstitutionTemplateLiteral : node.kind;
+    for (let n = lineOf(node.getStart(sf)); n <= lineOf(node.getEnd() - 1); n++) code.set(n, [...(code.get(n) ?? []), kind]);
+  };
+  walk(sf);
+  return code;
 }
 
 /**

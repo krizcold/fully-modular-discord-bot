@@ -241,6 +241,31 @@ describe('the change', () => {
     expect(lineDiff(crossed, ['a();', '/* \r */ // b();', 'c();'].join('\n'))).toEqual({ changed: [2], deletedAfter: [1] });
   });
 
+  it('counts an unchanged line whose code a change on another line switched, in part too: changed, and taken out when it lost tokens', () => {
+    // A comment that ran into the line ends earlier now: a(x > 0) is code again, b() was code all along.
+    const opened = ['f();', '  /* off while the flag is out', '  a(x > 0); /* see the flag */ b();', 'g();'].join('\n');
+    const closed = ['f();', '  // off while the flag is out', '  a(x > 0); /* see the flag */ b();', 'g();'].join('\n');
+    expect(lineDiff(opened, closed)).toEqual({ changed: [2, 3], deletedAfter: [] });
+    expect(lineDiff(closed, opened)).toEqual({ changed: [2, 3], deletedAfter: [2] });
+    // A comment opened on a line of code hides the next line whole and stops at a comment on the one after.
+    expect(lineDiff(["log('start');", 'a();', '/* x */ b();'].join('\n'), ["log('start'); /*", 'a();', '/* x */ b();'].join('\n')))
+      .toEqual({ changed: [1], deletedAfter: [1] });
+    // Template text made code by a backtick moved elsewhere, a line of one token made another of one token too.
+    expect(lineDiff(['const s = `', 'f(admin);', '`;'].join('\n'), ['const s = ``;', 'f(admin);', 'const t = 1;'].join('\n')))
+      .toEqual({ changed: [1, 2, 3], deletedAfter: [] });
+    expect(lineDiff(['const s = `', '}', '`;'].join('\n'), ['function f() {', '}', 'const s = ``;'].join('\n')))
+      .toEqual({ changed: [1, 2, 3], deletedAfter: [] });
+    // A substitution added to one line of a template leaves the code of its other lines as it was.
+    expect(lineDiff(['const t = `one', 'two', 'three`;'].join('\n'), ['const t = `one', 'two ${x}', 'three`;'].join('\n')))
+      .toEqual({ changed: [2], deletedAfter: [] });
+    // Line endings alone change no line's code, a template's lines included.
+    expect(lineDiff(['const t = `one', 'two', 'three`;'].join('\n'), ['const t = `one', 'two', 'three`;'].join('\r\n')))
+      .toEqual({ changed: [], deletedAfter: [] });
+    const plan = planChange({ entries: [{ status: 'M', file: 'src/a.ts' }], untracked: [], read: () => closed, readBase: () => opened, nameOf: file => file });
+    expect(plan.skipped).toEqual([]);
+    expect(plan.targets).toMatchObject([{ file: 'src/a.ts', gating: [3] }]);
+  });
+
   it('counts an unchanged line a comment opened or closed elsewhere switched: on, as changed; off, as code taken out', () => {
     const hidden = ['a();', '/*', 'b();', '*/', 'n > 10;'].join('\n');
     // The comment taken away brings b() back, alone or beside an edit.

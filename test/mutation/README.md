@@ -91,9 +91,9 @@ does not name by its content.
   changes no code: it widens to itself only and gates nothing, so a comment edited inside an object or a call brings in
   none of its mutants. It still joins the ranges on either side of it, so a new function whose body holds a blank line
   is made whole. A file where only such lines changed, and no code was taken out, is not mutated (below); a line of
-  code made a comment or a blank line is code taken out (below). A `/*` or `*/` on such a line can also switch the
-  unchanged lines it reaches: one it turns into code counts as a changed line (it widens and gates), and one it turns
-  out of code is code taken out there.
+  code made a comment or a blank line is code taken out (below). Such a line can still change the code of unchanged
+  lines (a `/*` or `*/` on it), and so can a line of code (a backtick, a string's line continuation, a JSX tag): see
+  "Only the lines" below.
 - **Gating** mutants touch a changed line that holds code (a token, brackets and separators included). Some that touch one are not made: one that touches it only through a block
   holding the line (the emptying of that block, or the whole callback around it), the emptying of the body of a
   compound statement or declaration (above), or of a bare block, that only begins or ends on the changed line: its
@@ -115,8 +115,8 @@ does not name by its content.
 - The other mutants in the widened ranges are **context**: they run in pass A and are listed, but never fail the gate.
 - What was taken out has no line left to mutate, and the lines beside it are mutated only where a changed line widens
   to them. The report names each place where lines of code (a token on them) were taken out with fewer or none put
-  back (a pure deletion, a line deleted beside an edited one, one made a comment or a blank line, an unchanged one a
-  `/*` and `*/` now hold, a block taken away with its body re-indented), so a reviewer checks the code around each; a line of code replaced one for one by code, or a
+  back (a pure deletion, a line deleted beside an edited one, one made a comment or a blank line, an unchanged one that
+  a change on another line left with fewer tokens, a block taken away with its body re-indented), so a reviewer checks the code around each; a line of code replaced one for one by code, or a
   block taken away where as many or more lines of code are put back, shows only as changed lines. A job that only
   takes code out makes no mutant: the gate names the places and ends NO RESULT, with no pass run.
 - Lines added in one place, or only taken out, count also over each unchanged line beside them that repeats one of
@@ -127,9 +127,11 @@ does not name by its content.
   several pieces, and then which of its copies count is again the diff's choice: a line the job added can go unmutated,
   and be named nowhere, while an unchanged copy of it gates. So is it where repeated lines are spread among other
   changes.
-- Only the lines the diff changed count, and the unchanged ones a comment switched (above). An unchanged line that
-  holds a token before and after but of another kind (template text made code, or code made template text, by a
-  backtick added or taken out on another line) is not seen: only the line with the backtick counts. A change can also
+- Only the lines the diff changed count, and the unchanged ones whose code changed: an unchanged line holds the same
+  text in both, so its code is the kinds of the tokens on it (a comment holds none, a template's parts are one kind),
+  read in both texts. When a change on another line moved all or part of it into or out of a comment, a string, a
+  template or JSX text, the line counts as changed if it holds code after (it widens and gates), and as a place where
+  code was taken out if it holds fewer tokens. A change can also
   move an unchanged line into or out of a block (a bracket,
   an `else`, a `finally` or a `case` moved past it, a header put around it, an if's two bodies swapped): that line is
   not gated, so its mutants run as context at most. The changed lines that make such a move are named under their own
