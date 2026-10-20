@@ -31,19 +31,21 @@ function lineOf(text: string): number {
 }
 
 /**
- * Removes what a bite run cut short left under `at`'s src: each test removes its own files when it ends, but an
- * interrupt skips that, and a leftover importer of an ignored module would stop every gate run before pass A. Only
- * the names the tests below write: a developer's own clone in src/bot/modulesDev can start with smdb- too.
+ * Removes what a bite run cut short left under `at`'s src and test/mutation: each test removes its own files when it
+ * ends, but an interrupt skips that, and a leftover importer of an ignored module would stop every gate run before
+ * pass A. Only the names the tests below write: a developer's own clone in src/bot/modulesDev can start with smdb- too.
  * @param at a bot root
  */
 function sweepLeftovers(at: string) {
   const src = path.join(at, 'src');
   const dev = path.join(src, 'bot', 'modulesDev');
+  const mutation = path.join(at, 'test', 'mutation');
   for (const old of fs.readdirSync(src)) {
     if (/^smdb-(bite-(directive|other|probe|gone)|beyond|glob-\[x\])-\d+\.ts$/.test(old)) fs.rmSync(path.join(src, old), { force: true });
     else if (/^smdb-(ignored|repo)-\d+$/.test(old)) fs.rmSync(path.join(src, old), { recursive: true, force: true });
   }
   if (fs.existsSync(dev)) for (const old of fs.readdirSync(dev).filter(name => /^smdb-(beyond|bite-reader)-\d+\.ts$/.test(name))) fs.rmSync(path.join(dev, old), { force: true });
+  if (fs.existsSync(mutation)) for (const old of fs.readdirSync(mutation).filter(name => /^smdb-tree-\d+\.txt$/.test(name))) fs.rmSync(path.join(mutation, old), { force: true });
 }
 
 describe('the touched-line mutation gate', () => {
@@ -58,9 +60,14 @@ describe('the touched-line mutation gate', () => {
       for (const name of ['smdb-beyond-1.ts', 'smdb-bite-reader-1.ts']) fs.writeFileSync(path.join(dev, name), '');
       fs.mkdirSync(path.join(at, 'src', 'smdb-repo-1', '.git'), { recursive: true });
       for (const name of ['smdb-beyond-1.ts', 'smdb-bite-probe-1.ts', 'smdb-glob-[x]-1.ts', 'smdb-kept.ts']) fs.writeFileSync(path.join(at, 'src', name), '');
+      // The tree probe the run after the reruns adds, which git does not ignore.
+      const mutation = path.join(at, 'test', 'mutation');
+      fs.mkdirSync(mutation, { recursive: true });
+      for (const name of ['smdb-tree-1.txt', 'smdb-tree-x.txt']) fs.writeFileSync(path.join(mutation, name), '');
       sweepLeftovers(at);
       expect(fs.readdirSync(dev)).toEqual(['smdb-appstore']);
       expect(fs.readdirSync(path.join(at, 'src')).sort()).toEqual(['bot', 'smdb-kept.ts']);
+      expect(fs.readdirSync(mutation)).toEqual(['smdb-tree-x.txt']);
     } finally {
       fs.rmSync(at, { recursive: true, force: true });
     }

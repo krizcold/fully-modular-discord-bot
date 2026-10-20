@@ -22,7 +22,9 @@ const { Minimatch, minimatch, escape } = strykerRequire('minimatch');
  * @typedef {{ start: { line: number, column: number }, end: { line: number, column: number } }} Location
  */
 
-// The code the gate mutates, by name (the suite's scans of src read the same).
+// Code, by its name; notMutated narrows it to what the gate mutates (the env
+// scrub's scans of src read CODE as it is, the /data scans what the planner
+// makes of src).
 export const CODE = /\.(ts|tsx|mts|cts|js|cjs|mjs)$/;
 const DECLARATION = /\.d\.[cm]?ts$/;
 const VIEWS = 'src/webui/public/';

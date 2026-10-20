@@ -741,27 +741,42 @@ describe('the change', () => {
     expect(plan.skipped).toEqual([{ file: 'src/utils/paths/dataRoot.ts', why: DATA_ROUTE_WHY }, { file: 'src/c.ts', why: DATA_ROUTE_WHY }]);
   });
 
+  // What the gate's planner makes of every file in src that git tracks or would
+  // add, each taken as new: the two scans below read its sets, never a filter
+  // of their own, so they cannot drift from what the gate mutates and names.
+  const srcPlan = () => {
+    const listed = execFileSync('git', ['-c', 'core.quotePath=false', 'ls-files', '-z', '--cached', '--others', '--exclude-standard', 'src'], { cwd: botRoot, encoding: 'utf8' })
+      .split('\0').filter(file => file !== '' && fs.existsSync(path.join(botRoot, file)));
+    return planChange({
+      entries: [],
+      untracked: listed,
+      read: file => fs.readFileSync(path.join(botRoot, file), 'utf8'),
+      readBase: () => '',
+      nameOf: file => {
+        const name = canonicalName(botRoot, file);
+        return name !== null && strykerTakes(botRoot, name) ? name : null;
+      },
+      linkOf: file => linkOf(botRoot, file),
+    });
+  };
+
   // holdsDataRoute matches the '/data' root, not a path under it written out in
   // full, which reads the same as a route path: a mutant of code that holds one
   // could reach a real data root, so src holds none but the routes named here.
-  // Only what the gate can mutate is read: the files git tracks or would add,
-  // never a module cloned into a dir git ignores, and of those the code it
-  // mutates (notMutated: no declaration file, no browser view).
+  // Only what the gate would mutate is read (the planner's targets).
   it("finds in src no path under /data written out in full, but the config page's routes", () => {
     const ROUTES = ['/data/delete', '/data/delete-guild', '/data/get', '/data/update'];
     const found = new Map<string, string>();
-    const listed = execFileSync('git', ['-c', 'core.quotePath=false', 'ls-files', '-z', '--cached', '--others', '--exclude-standard', 'src'], { cwd: botRoot, encoding: 'utf8' })
-      .split('\0').filter(file => notMutated(file) === null && fs.existsSync(path.join(botRoot, file)));
-    for (const file of listed) {
+    const { targets } = srcPlan();
+    for (const { file } of targets) {
       const text = fs.readFileSync(path.join(botRoot, file), 'utf8');
-      if (holdsDataRoute(file, text)) continue;
       const visit = (node: ts.Node) => {
         if ((ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node) || ts.isTemplateHead(node)) && /^[\\/]data[\\/]/i.test(node.text)) found.set(node.text, file);
         ts.forEachChild(node, visit);
       };
       visit(ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true));
     }
-    expect(listed.length).toBeGreaterThan(100);
+    expect(targets.length).toBeGreaterThan(100);
     // A new one: route it through src/utils/dataRoot.ts, or, for a route path, add it here.
     expect([...found].filter(([text]) => !ROUTES.includes(text))).toEqual([]);
   });
@@ -773,11 +788,10 @@ describe('the change', () => {
   // pinned. A check moved out to a file that takes the name or the root from
   // here leaves the list as it was, and is not seen (README).
   it('finds in src the files the content rule names today, and no other', () => {
-    const listed = execFileSync('git', ['-c', 'core.quotePath=false', 'ls-files', '-z', '--cached', '--others', '--exclude-standard', 'src'], { cwd: botRoot, encoding: 'utf8' })
-      .split('\0').filter(file => notMutated(file) === null && fs.existsSync(path.join(botRoot, file)));
+    const { targets, skipped } = srcPlan();
     // The bite's probe, which a bite run cut short leaves holding DATA_DIR until its next run sweeps it.
-    const named = listed.filter(file => !/^src\/smdb-bite-probe-\d+\.ts$/.test(file) && holdsDataRoute(file, fs.readFileSync(path.join(botRoot, file), 'utf8')));
-    expect(listed.length).toBeGreaterThan(100);
+    const named = skipped.filter(s => s.why === DATA_ROUTE_WHY && !/^src\/smdb-bite-probe-\d+\.ts$/.test(s.file)).map(s => s.file);
+    expect(targets.length).toBeGreaterThan(100);
     // A change: see that each check that picks a root still holds the root it picks, as dataRoot.ts does, then set the list.
     expect(named.sort()).toEqual([
       'src/bot/internalSetup/utils/pathHelpers.ts',

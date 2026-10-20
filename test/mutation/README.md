@@ -164,8 +164,9 @@ does not name by its content.
   `data_dir` as the same). The rule reads one file at a time: a root built at run time (`path.join('/', 'data')`), or
   a check that takes the variable's name or a fixed root from another file (an imported constant, a function that
   returns a root it does not choose), is not seen, so the check that picks a root and the root it picks stay in one
-  file (the module path helpers return a root their own check chose). unit/mutationRanges.test.ts pins the files in src
-  that git tracks or would add which the rule names today (these five) and fails when that list changes, so one that
+  file (the module path helpers return a root their own check chose). unit/mutationRanges.test.ts runs the gate's
+  planner on every file in src that git tracks or would add, pins the files it names for this rule (these five today)
+  and fails when that list changes, so one that
   a split leaves holding neither the name nor a root, whatever took them (a constants file, an enum, a JSON file), is
   looked at. Not seen: a check, written new or moved out of one of these files, in a file the rule never named, that
   takes its root or the name from another file (one of these included). A mutant of a file
@@ -175,8 +176,8 @@ does not name by its content.
   child step, so `D:\app` or `C:\data` for a checkout on D: with TEMP on C:) and anywhere else one the run would make
   outside the sandbox. A path under
   `/data` written out in full (`'/data/global'`) is not matched, since route paths such as `'/data/get'` read the
-  same: unit/mutationRanges.test.ts fails when a file in src that git tracks or would add (what the gate can mutate)
-  gains a string that starts with `/data/` and is not one of the known routes, so such a path goes through dataRoot.ts. `--mutate` refuses such a file, and each pass's run with no mutant, which
+  same: unit/mutationRanges.test.ts fails when a file in src the planner would mutate (among those git tracks or would
+  add) gains a string that starts with `/data/` and is not one of the known routes, so such a path goes through dataRoot.ts. `--mutate` refuses such a file, and each pass's run with no mutant, which
   comes before any mutant's, checks the files as that pass copied them, so a file that gains such code after the plan
   stops the pass (NO RESULT, naming it), as does one it cannot read.
 - A changed line of code that no mutant lies wholly on, in a diff, an untracked file or a `--mutate` pattern, is named
