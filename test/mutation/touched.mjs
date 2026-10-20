@@ -358,7 +358,8 @@ async function control(after, tier, on, only, timed = false) {
 
 /**
  * runner.mjs's refusal of the files a run with no mutant was given (a way to a
- * fixed root: /data, or /app or a path under it), if it refused them.
+ * fixed root, ranges.mjs DATA_ROUTE_WHY, or a file it could not read), if it
+ * refused them.
  * @param {string} dir the run's report dir
  * @returns {string[]}
  */

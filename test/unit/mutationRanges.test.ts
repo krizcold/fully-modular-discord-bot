@@ -718,8 +718,19 @@ describe('the change', () => {
       expect(holdsDataRoute('src/a.ts', text), text).toBe(true);
     }
     // A name that holds it, the config page's routes, a word that starts with it, or a comment is no way there.
-    expect(holdsDataRoute('src/a.ts', "// DATA_DIR, '/data'\nconst BASE_DATA_DIR = DATA_ROOT;\napp.get('/data/get', h);\n")).toBe(false);
-    for (const route of CONFIG_ROUTES) expect(holdsDataRoute('src/a.ts', `router.post('${route}', h);\n`), route).toBe(false);
+    expect(holdsDataRoute('src/webui/routes/config.ts', "// DATA_DIR, '/data'\nconst BASE_DATA_DIR = DATA_ROOT;\napp.get('/data/get', h);\n")).toBe(false);
+    // The config page's routes are no root there, as plain strings, under the planner's name or a sandbox's path;
+    // the same text in another file, or as a template's head, is a path a mutant could write to.
+    const page = 'src/webui/routes/config.ts';
+    for (const route of CONFIG_ROUTES) {
+      for (const name of [page, path.join(os.tmpdir(), 'sandbox', page), `C:\\sandbox\\${page.split('/').join('\\')}`]) {
+        expect(holdsDataRoute(name, `router.post('${route}', h);\nrouter.get(\`${route}\`, h);\n`), `${name} ${route}`).toBe(false);
+      }
+      expect(holdsDataRoute('src/a.ts', `router.post('${route}', h);\n`), route).toBe(true);
+      expect(holdsDataRoute('src/a.ts', `export const at = (base?: string) => base ?? '${route}';\n`), route).toBe(true);
+      expect(holdsDataRoute(page, `router.post(\`${route}\${''}\`, h);\n`), route).toBe(true);
+      expect(holdsDataRoute('src/webui/routes/myconfig.ts', `router.post('${route}', h);\n`), route).toBe(true);
+    }
     for (const text of ["export const at = '/database';\n", "export const at = '/data-x';\n"]) expect(holdsDataRoute('src/a.ts', text), text).toBe(false);
     // The image's /app root and every path under it are fixed roots too (D:\app on Windows): the file that picks
     // them when the image's marker exists is never mutated, nor is any that holds one.

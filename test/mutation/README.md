@@ -161,9 +161,11 @@ does not name by its content.
   the head of a template the `'/data'` root or a path under it (`'/data/global'`, `` `/data/${x}` ``;
   src/utils/dataRoot.ts today, under any name) or the image's `'/app'` root or a path under it (`'/app/build'`,
   `` `/app/${x}` ``: the module path helpers, the snapshot and update code and src/index.ts today), in any case and
-  with either slash (Windows reads `/Data`, `\data` and `data_dir` as the same). The config page's four route paths
-  (`'/data/get'` and the like, ranges.mjs CONFIG_ROUTES), which read like paths under `/data`, are no root, so
-  src/webui/routes/config.ts stays mutated; a new route of that form joins that list. The rule reads one file at a time: a root built at run time (`path.join('/', 'data')`), or
+  with either slash (Windows reads `/Data`, `\data` and `data_dir` as the same). In the config page,
+  src/webui/routes/config.ts, its four route paths (`'/data/get'` and the like, ranges.mjs CONFIG_ROUTES) as plain
+  strings are no root, so that page stays mutated; a new route of that form joins that list. The same strings
+  anywhere else, or as a template's head, are roots. The rule reads one file at a time: a root built at run time
+  (`path.join('/', 'data')`), or
   a check that takes the variable's name or a fixed root from another file (an imported constant, a function that
   returns a root it does not choose), is not seen, so the check that picks a root and the root it picks stay in one
   file (the module path helpers return a root their own check chose). unit/mutationRanges.test.ts runs the gate's
