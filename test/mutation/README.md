@@ -54,7 +54,11 @@ From the bot root, with Node 22.12 or newer (or SMDB_TEST_NODE set, as for `npm 
   `+(x)` or `@(x)`, and `[id].ts` or `a{1,2}.ts` is not.
 - `--concurrency N` sets pass A's parallel runs (default: half the cores); pass B uses half of that.
 - `--keep` keeps the sandboxes in `.stryker-tmp/` for a look after the run. Without it every sandbox is removed, a
-  failed pass's too.
+  failed pass's too, unless the run is interrupted: Stryker then exits at once and leaves that pass's sandbox (and,
+  in pass A, `.stryker-tmp/tsconfig.l5-<pid>.json`), which is safe to delete (its node_modules are links, which a
+  delete removes and does not follow) and which no later run reads. A signal or kill that reaches the gate's process
+  alone (`kill <pid>`, `taskkill /F` without `/T`) also leaves the test command it was running going, with nothing to
+  bound it: end that process tree too (Ctrl-C in the gate's terminal reaches all of it).
 - The gate fingerprints every file git tracks or would add (below), so its output goes to a file git ignores (`l5.log`
   above, under the root's `*.log`) or one outside the checkout: a file in the tree that the run writes to changes
   during the run, which ends it NO RESULT.
@@ -129,9 +133,10 @@ does not name by its content.
   changes.
 - Only the lines the diff changed count, and the unchanged ones whose code changed: an unchanged line holds the same
   text in both, so its code is the kinds of the tokens on it (a comment holds none, a template's parts are one kind),
-  read in both texts. When a change on another line moved all or part of it into or out of a comment, a string, a
-  template or JSX text, the line counts as changed if it holds code after (it widens and gates), and as a place where
-  code was taken out if it holds fewer tokens. A change can also
+  read in both texts, in order. When they differ, whatever on another line made them (for example a comment, a
+  string, a template or JSX text opened or closed over all or part of it, or a regex read as a division, a type as a
+  value), the line counts as changed if it holds code after (it widens and gates), and as a place where code was
+  taken out if it holds fewer tokens. A change can also
   move an unchanged line into or out of a block (a bracket,
   an `else`, a `finally` or a `case` moved past it, a header put around it, an if's two bodies swapped): that line is
   not gated, so its mutants run as context at most. The changed lines that make such a move are named under their own

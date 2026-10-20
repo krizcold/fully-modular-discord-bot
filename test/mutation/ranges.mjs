@@ -195,9 +195,11 @@ export function commonLines(a, b) {
  * in the file can split a run into pieces, so then which copy counts is the
  * diff's choice. A line kept counts only where the diff marks it, even when a
  * change moves it into or out of a block (mutation/README.md), unless the code
- * it holds differs (lineCode): a change on another line opened or closed a
- * comment, a string or a template over part or all of it. Then it is changed
- * when it holds code after, and a place too when it holds fewer tokens.
+ * it holds differs: the kinds of its tokens, in order (lineCode), whatever on
+ * another line made them differ (for example a comment, a string, a template or
+ * JSX text opened or closed over part or all of it, or a regex read as a
+ * division, a type as a value). Then it is changed when it holds code after,
+ * and a place too when it holds fewer tokens.
  * @param {string} before
  * @param {string} after
  * @param {string} [file] the name `after` is read under
@@ -445,8 +447,9 @@ const TEMPLATE_PARTS = new Set([ts.SyntaxKind.NoSubstitutionTemplateLiteral, ts.
  * and separators included (a comment, and a JSDoc one, holds none; a
  * template's parts are one kind, so a substitution added on one of its lines
  * leaves the others as they were). A line that holds a token is a key. A line
- * kept as it was holds the same text, so only what its text is read as (code,
- * a comment, a string, a template, JSX text) can differ. Lines are numbered as
+ * kept as it was holds the same text, so only how that text is read can
+ * differ: as code of other kinds, or as a comment, a string, a template or JSX
+ * text, for example. Lines are numbered as
  * lineDiff splits them (at LF or CRLF only): TypeScript also ends a line at a
  * lone CR or a line separator, which a base text may hold.
  * @param {string} file
@@ -477,7 +480,11 @@ function lineCode(file, text) {
     if (children.length > 0) { children.forEach(walk); return; }
     if (node.getStart(sf) === node.getEnd()) return;
     const kind = TEMPLATE_PARTS.has(node.kind) ? ts.SyntaxKind.NoSubstitutionTemplateLiteral : node.kind;
-    for (let n = lineOf(node.getStart(sf)); n <= lineOf(node.getEnd() - 1); n++) code.set(n, [...(code.get(n) ?? []), kind]);
+    for (let n = lineOf(node.getStart(sf)); n <= lineOf(node.getEnd() - 1); n++) {
+      const kinds = code.get(n);
+      if (kinds) kinds.push(kind);
+      else code.set(n, [kind]);
+    }
   };
   walk(sf);
   return code;

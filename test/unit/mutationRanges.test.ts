@@ -255,6 +255,9 @@ describe('the change', () => {
       .toEqual({ changed: [1, 2, 3], deletedAfter: [] });
     expect(lineDiff(['const s = `', '}', '`;'].join('\n'), ['function f() {', '}', 'const s = ``;'].join('\n')))
       .toEqual({ changed: [1, 2, 3], deletedAfter: [] });
+    // The same kinds in another order: the backtick moved from after a > b to before it.
+    expect(lineDiff(['a > b;; `; a > b;', '`;'].join('\n'), ['x = `', 'a > b;; `; a > b;', 'y();'].join('\n')))
+      .toEqual({ changed: [1, 2, 3], deletedAfter: [] });
     // A substitution added to one line of a template leaves the code of its other lines as it was.
     expect(lineDiff(['const t = `one', 'two', 'three`;'].join('\n'), ['const t = `one', 'two ${x}', 'three`;'].join('\n')))
       .toEqual({ changed: [2], deletedAfter: [] });
