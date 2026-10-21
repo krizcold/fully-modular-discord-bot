@@ -66,9 +66,11 @@ From the bot root, with Node 22.12 or newer (or SMDB_TEST_NODE set, as for `npm 
   already gone, and ending a runner.mjs ends the Node processes under it). On POSIX, when the gate relaunched itself
   under SMDB_TEST_NODE (two touched.mjs processes are listed), a kill of the first alone leaves the relaunched one
   going on to its next passes: end it first (on Windows it ends with the first). Ctrl-C in the gate's terminal
-  reaches all of it. A test file whose process ends before its afterAll hooks run (killed, or ended by a mutant)
-  leaves its throwaway data root, an `smdb-test-*` dir in the OS temp dir, behind; such dirs are safe to delete once
-  no test runs.
+  reaches all of it. A test file that fails at load (a module it imports throws, a mutant's included), whose
+  process is killed or crashes before its afterAll hooks run, or whose data root a process still holds when they
+  run (setup.ts leaves it rather than fail the file), leaves that throwaway data root, an `smdb-test-*` dir in the OS
+  temp dir, behind, and a child test killed mid-scenario leaves its `smdb-child-*` dir; such dirs are safe to delete
+  once no test runs.
 - The gate fingerprints every file git tracks or would add (below), so its output goes to a file git ignores (`l5.log`
   above, under the root's `*.log`) or one outside the checkout: a file in the tree that the run writes to changes
   during the run, which ends it NO RESULT.
@@ -499,8 +501,8 @@ child away from anything real:
   one sits under this root's dist.
 
 The child tier's globalSetup runs build.cjs `--if-stale`: it rebuilds dist unless the stamp matches both what dist was
-built from (src, its links followed as tsc follows them, tsconfig.json, build.cjs, the typescript version) and what
-dist holds now, so a dist that another
+built from (src, its links followed as tsc follows them, though a dir under one that cannot be listed stops the
+build, tsconfig.json, build.cjs, the typescript version) and what dist holds now, so a dist that another
 build, a branch switch or a hand edit changed is rebuilt. The source is hashed before the build, and its files' sizes
 and write times are checked after it, so an edit saved meanwhile, even one undone again (a stash, then a pop), fails the
 build unstamped. A fresh dist is seen without taking the lock. The lock, `dist/.build-lock`, is a file that holds its

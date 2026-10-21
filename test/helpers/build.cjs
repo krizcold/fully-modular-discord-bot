@@ -1,8 +1,8 @@
 // Builds dist the way `npm run build` does (tsc, then the copy-assets step
 // written in Node so it also runs on Windows and without a shell) and stamps
-// it with a hash of what it was built from (src, its links followed as tsc
-// follows them, tsconfig.json, this file, the typescript version) and of what
-// dist then holds. With --if-stale it builds
+// it with a hash of what it was built from (src, its links followed, as
+// filesUnder says; tsconfig.json, this file, the typescript version) and of
+// what dist then holds. With --if-stale it builds
 // only when either hash no longer matches, so a dist that another build, a
 // branch switch or a hand edit changed is rebuilt. A lock in dist keeps two
 // runs in one checkout from building over each other. The child tier's
@@ -20,8 +20,9 @@ const LOCK = '.build-lock';
 
 /**
  * The files under dir. Given `seen` (the real paths of the dirs walked), it
- * follows links as tsc does: it leaves out a dir already walked, and whatever
- * a link leads to that cannot be read (a broken link, a loop, a denied one).
+ * follows links as tsc does, leaving out a dir already walked and a link it
+ * cannot stat (broken, a loop, denied, as tsc leaves it out); a dir under a
+ * link that cannot be listed stops the walk, as one under src does.
  * @param {string} dir
  * @param {Set<string>} [seen]
  * @returns {string[]}
@@ -36,15 +37,17 @@ function filesUnder(dir, seen) {
   }
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
     const full = path.join(dir, entry.name);
+    /** @type {{ isDirectory(): boolean, isFile(): boolean }} */
+    let kind = entry;
     if (seen && entry.isSymbolicLink()) {
       try {
-        const kind = fs.statSync(full);
-        out.push(...(kind.isDirectory() ? filesUnder(full, seen) : kind.isFile() ? [full] : []));
+        kind = fs.statSync(full);
       } catch {
-        // Left out, as tsc leaves it out.
+        continue;
       }
-    } else if (entry.isDirectory()) out.push(...filesUnder(full, seen));
-    else if (entry.isFile()) out.push(full);
+    }
+    if (kind.isDirectory()) out.push(...filesUnder(full, seen));
+    else if (kind.isFile()) out.push(full);
   }
   return out;
 }

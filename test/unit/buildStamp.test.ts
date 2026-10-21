@@ -2,7 +2,7 @@ import { spawnSync } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { describe, expect, it, onTestFinished } from 'vitest';
+import { describe, expect, it, onTestFinished, vi } from 'vitest';
 import builder from '../helpers/build.cjs';
 
 // The child tier's dist stamp (helpers/build.cjs): a dist counts as fresh only
@@ -68,6 +68,28 @@ describe('the dist stamp', () => {
       expect(builder.isFresh(root)).toBe(false);
     } finally {
       for (const [, name] of links) fs.rmSync(path.join(root, 'src', name), { force: true });
+    }
+  });
+
+  it('stops on a dir under a link it cannot list, rather than hash what the link leads to as nothing', () => {
+    const root = fakeRoot();
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-linked-src-'));
+    onTestFinished(() => fs.rmSync(outside, { recursive: true, force: true }));
+    fs.mkdirSync(path.join(outside, 'locked'));
+    fs.writeFileSync(path.join(outside, 'b.ts'), 'export const b = 1;\n');
+    const link = path.join(root, 'src', 'linked');
+    const list = fs.readdirSync;
+    // A dir this user cannot list, on any platform: tsc still compiles what it reaches under the link.
+    const denied = vi.spyOn(fs, 'readdirSync').mockImplementation(((dir: fs.PathLike, options?: never) => {
+      if (path.basename(String(dir)) === 'locked') throw Object.assign(new Error(`EACCES: permission denied, scandir '${String(dir)}'`), { code: 'EACCES' });
+      return list(dir, options);
+    }) as typeof fs.readdirSync);
+    try {
+      fs.symlinkSync(outside, link, 'junction');
+      expect(() => builder.sourceHash(root)).toThrow(/EACCES/);
+    } finally {
+      denied.mockRestore();
+      fs.rmSync(link, { force: true });
     }
   });
 });
