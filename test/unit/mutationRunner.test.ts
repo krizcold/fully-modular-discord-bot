@@ -54,7 +54,8 @@ describe('a mutant run', () => {
 
   it('refuses, before any mutant, a file that holds a way to /data as the pass copied it', () => {
     const fake = fakeVitest([]);
-    const run = runner(fake, 'a', '', [], { __STRYKER_ACTIVE_MUTANT__: undefined, SMDB_MUTATION_FILES: '["src/utils/dataRoot.ts"]' });
+    // The id touched.mjs gives every run with no mutant.
+    const run = runner(fake, 'a', '', [], { __STRYKER_ACTIVE_MUTANT__: 'none', SMDB_MUTATION_FILES: '["src/utils/dataRoot.ts"]' });
     expect(run.status).toBe(1);
     expect(fs.readFileSync(path.join(fake.out, 'dry-refused.txt'), 'utf8')).toMatch(/^src\/utils\/dataRoot\.ts: it reads DATA_DIR or holds a fixed root \('\/data' or '\/app', or a path under either\)/);
     expect(fake.read()).toEqual([]);
@@ -119,8 +120,10 @@ describe('a mutant run', () => {
       '',
     ].join('\n'));
     // A run with no mutant reads its files: one that exists and holds no way to a fixed root.
-    const env = { __STRYKER_ACTIVE_MUTANT__: undefined, SMDB_MUTATION_FILES: '["test/mutation/control.mjs"]', NODE_OPTIONS: `--require "${step.split(path.sep).join('/')}"` };
+    const env = { __STRYKER_ACTIVE_MUTANT__: 'none', SMDB_MUTATION_FILES: '["test/mutation/control.mjs"]', NODE_OPTIONS: `--require "${step.split(path.sep).join('/')}"` };
     expect(runner(fake, 'a', '1', [], env).status).toBe(0);
+    // Its tests see the id too.
+    expect(fake.read().map(call => call.mutant)).toEqual(['7', 'none']);
     const took = fs.readFileSync(path.join(fake.out, 'dry-ms.txt'), 'utf8');
     expect(took).toMatch(/^\d+$/);
     expect(Number(took)).toBeLessThan(300_000);
@@ -345,6 +348,8 @@ describe('the tree fingerprint', () => {
     const run = spawnSync(process.execPath, [path.join(copy, 'test', 'mutation', 'touched.mjs'), '--mutate', 'src/x.ts'], { cwd: copy, encoding: 'utf8' });
     expect(run.status, run.stderr).toBe(2);
     expect(run.stderr).toMatch(/^--mutate cannot take src\/x\.ts: it could not be read \(E[A-Z]+\)$/m);
+    // The sandboxes' dir ignores itself from before the first tree print, which comes before this refusal.
+    expect(fs.readFileSync(path.join(copy, '.stryker-tmp', '.gitignore'), 'utf8')).toBe('*\n');
   });
 
   it('ends the gate NO RESULT, exit 2, when test/node_modules is a link, before it loads a package through it, and says to remove the link first', () => {

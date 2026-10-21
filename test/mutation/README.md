@@ -416,7 +416,8 @@ are matched against the first line of each failure unless it is an AssertionErro
 never against a stack or a child's stderr. So the list only spares reruns, and need not be complete. What the reruns
 cannot see: a chance failure (a timeout included) that hits a mutant's first run, and one that hits its rerun alone,
 while the run with no mutant after passes, credits a kill; so does what an earlier rerun left in the rerun sandbox
-(above).
+(above), and a test that tells a mutant's id in `__STRYKER_ACTIVE_MUTANT__` from `none`, the id every run with no
+mutant carries (one that reacts to the variable being there fails those runs too, so the gate has no result).
 Anything else is **inconclusive**: no report, a failure (a timeout included) only in a beforeAll or afterAll hook or at
 file level, an unhandled error with every test passing, or a first run that failed only on the machine's texts and was
 never rerun (the gate stopped first), or a type error only of an unused `@ts-expect-error` that never met the tests

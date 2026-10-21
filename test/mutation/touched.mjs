@@ -128,9 +128,11 @@ try {
 }
 // Every sandbox holds those files and nothing else (ranges.mjs sandboxPatterns).
 const sandbox = sandboxPatterns([...planned.keys()]);
-// A mutant id set in the shell would make every run with no mutant a mutant's
-// run: Stryker passes its own env on to the command it runs.
-delete process.env.__STRYKER_ACTIVE_MUTANT__;
+// Every run with no mutant carries the id 'none' (runner.mjs), which names no
+// mutant, so a test that reacts to the variable being there fails those runs
+// too; it also overrides an id set in the shell, which Stryker passes on to the
+// command it runs.
+process.env.__STRYKER_ACTIVE_MUTANT__ = 'none';
 // A pattern is a file, or a file and lines; one with columns names no file, so it is refused.
 /** @param {string} pattern */
 const fileOfPattern = pattern => pattern.replace(/:\d+-\d+$/, '');

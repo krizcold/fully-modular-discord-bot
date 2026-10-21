@@ -170,8 +170,9 @@ describe('the touched-line mutation gate', () => {
       "const path = require('path');",
       "const file = process.argv.find(arg => arg.startsWith('--outputFile=')).slice('--outputFile='.length);",
       'const pass = path.basename(path.dirname(file));',
-      'const mutant = process.env.__STRYKER_ACTIVE_MUTANT__;',
-      "let message = mutant ? 'Error: Test timed out in 30000ms' : '';",
+      'const id = process.env.__STRYKER_ACTIVE_MUTANT__;',
+      "const mutant = id === 'none' ? undefined : id;",
+      "let message = mutant ? 'Error: Test timed out in 30000ms' : id ? '' : 'Error: a run with no mutant carried no id';",
       `if (pass === 'a' && mutant) fs.writeFileSync(${JSON.stringify(path.join(root, canaries[1]))}, 'ignored');`,
       `if (${JSON.stringify(canaries)}.some(name => fs.existsSync(path.join('..', name)))) message = 'Error: the sandbox holds a git-ignored file';`,
       // The run with no mutant after the reruns runs the code they ran: made by Stryker, with no mutant active.
@@ -198,6 +199,7 @@ describe('the touched-line mutation gate', () => {
     expect(run.stdout).not.toContain('the sandbox holds a git-ignored file');
     expect(run.stdout).not.toContain('the run ran code the reruns did not');
     expect(run.stdout).not.toContain('the run had other time limits than the reruns');
+    expect(run.stdout).not.toContain('a run with no mutant carried no id');
     const reportDir = /^Report: (\S+)/m.exec(run.stdout)?.[1];
     expect(reportDir, `${run.stdout}\n${run.stderr}`).toBeDefined();
     // A dir of its own: two runs that start in the same millisecond never share one.

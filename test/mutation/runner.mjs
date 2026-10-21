@@ -28,7 +28,9 @@ const files = JSON.parse(process.env.SMDB_MUTATION_FILES ?? '[]').map((/** @type
 /** @type {string[]} test files, relative to test/ */
 const only = JSON.parse(process.env.SMDB_MUTATION_ONLY || '[]');
 const out = process.env.SMDB_MUTATION_OUT ?? '';
-const mutant = process.env.__STRYKER_ACTIVE_MUTANT__ ?? 'dry';
+// touched.mjs gives every run with no mutant the id 'none'.
+const active = process.env.__STRYKER_ACTIVE_MUTANT__ ?? 'none';
+const mutant = active === 'none' ? 'dry' : active;
 
 /**
  * @param {string} project
