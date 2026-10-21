@@ -905,7 +905,7 @@ export const rootGlobFree = root => strykerTakes(root, 'package.json');
  * @types it takes with no import, it takes the root's node_modules' only, as
  * the image's build does, not a node_modules' above the checkout, which
  * TypeScript would take too, unless the root's sets typeRoots of its own; an
- * import or a reference that reaches one is named by beyondTree.
+ * import or a reference that reaches one is not seen (beyondTree).
  * @param {string} root
  * @param {Iterable<string>} tree the tree's files, from the bot root with forward slashes
  * @param {string} dir the dir it is written to, from the bot root
@@ -926,12 +926,12 @@ export function treeTsconfig(root, tree, dir) {
  * The files outside the tree that the type checker still judges with the
  * config treeTsconfig gives: TypeScript follows a tree file's imports and
  * references (a type-only one included) to a file git ignores, which no
- * sandbox holds, and to a package in a node_modules above the checkout (a
- * stray install in a home dir), which the image's build never has. The
- * checkout's own packages are not counted: those under a node_modules dir in
- * it, those under the dir the root's node_modules links to (another
- * checkout's install, which checkerDiffers holds to the lockfile), and the lib
- * files of the TypeScript the checker runs.
+ * sandbox holds. A file under a node_modules dir, wherever that dir is, is a
+ * package and never named: the root's install (through a link, another
+ * checkout's, which checkerDiffers holds to the lockfile), the TypeScript the
+ * checker runs, and also a node_modules above the checkout, which the image's
+ * build never has, so a package TypeScript reaches there by an import or a
+ * reference the root's install does not satisfy is not seen.
  * @param {string} root
  * @param {Iterable<string>} tree the tree's files, from the bot root with forward slashes
  * @param {object} config what treeTsconfig gave
@@ -942,23 +942,9 @@ export function beyondTree(root, tree, config, dir) {
   const parsed = ts.parseJsonConfigFileContent(config, ts.sys, path.join(root, dir), undefined, path.join(root, dir, 'tsconfig.json'));
   const program = ts.createProgram({ rootNames: parsed.fileNames, options: parsed.options, projectReferences: parsed.projectReferences });
   const inTree = treeKeys(root, tree);
-  const libs = fileKey(path.dirname(ts.sys.getExecutingFilePath()));
-  let linked = '';
-  try { linked = fileKey(fs.realpathSync(path.join(root, 'node_modules'))); } catch { linked = ''; }
-  /**
-   * @param {string} file
-   * @param {string} dir
-   */
-  const under = (file, dir) => dir !== '' && fileKey(file).startsWith(dir + path.sep);
-  /** @param {string} file */
-  const ownPackage = file => {
-    const local = path.relative(root, file);
-    if (local !== '..' && !local.startsWith(`..${path.sep}`) && !path.isAbsolute(local)) return local.split(path.sep).includes('node_modules');
-    return under(file, linked) || under(file, libs);
-  };
-  return program.getSourceFiles().map(source => path.resolve(source.fileName))
-    .filter(file => !ownPackage(file) && !inTree.has(fileKey(file)))
-    .map(file => path.relative(root, file).split(path.sep).join('/'));
+  return program.getSourceFiles().map(source => path.relative(root, path.resolve(source.fileName)))
+    .filter(file => !file.split(path.sep).includes('node_modules') && !inTree.has(fileKey(path.join(root, file))))
+    .map(file => file.split(path.sep).join('/'));
 }
 
 /**
@@ -972,10 +958,10 @@ export function beyondTree(root, tree, config, dir) {
  * lockfile's packages and no other (an optional one may be absent), each at
  * its version with the content the lockfile names (its integrity; a git
  * dependency, which has none, its resolved commit). npm writes that record at
- * its install, so a package's files changed since (by hand, by another tool,
- * by an npm rebuild) are not seen; npm's linked layout records links, not
- * versions, and an install that omits dev packages lacks them, so either
- * always differs. '' says only that: the checker judges the tree's program,
+ * its install, so a package placed at the root, or a package's files changed,
+ * since (by hand, by another tool, by an npm rebuild) is not seen; npm's linked
+ * layout records links, not versions, and an install that omits dev packages
+ * lacks them, so either always differs. '' says only that: the checker judges the tree's program,
  * not the image's (README, The passes). dist and pass B's build compile with
  * the root's install too, but no mutant meets their type judgment (the
  * sandbox's src is not type-checked there).

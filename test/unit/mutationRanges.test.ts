@@ -616,7 +616,7 @@ describe('the change', () => {
     expect(beyond('/// <reference path="./modulesDev/m.ts" />\nexport const x = 1;\n')).toEqual(['src/modulesDev/m.ts']);
   });
 
-  it("names a package the type checker would read from a node_modules above the checkout, never one of the root's install through a link", () => {
+  it('never names a file under a node_modules dir: the root install through a link, and one above the checkout, which is not seen', () => {
     const outer = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-above-'));
     onTestFinished(() => {
       // The link first, so the removal never walks into the dir it names.
@@ -640,9 +640,12 @@ describe('the change', () => {
       return beyondTree(root, tree, treeTsconfig(root, tree, '.stryker-tmp'), '.stryker-tmp');
     };
     expect(beyond("import type { S } from 'shared';\nexport const x: S = 1;\n")).toEqual([]);
-    expect(beyond("import type { T } from 'stray';\nexport const x: T = 1;\n")).toEqual(['../node_modules/stray/index.d.ts']);
-    // An untyped package's import the image leaves as any, which @types above the checkout would type.
-    expect(beyond("// @ts-ignore\nimport { f } from 'untyped';\nexport const x = f(1);\n")).toEqual(['../node_modules/@types/untyped/index.d.ts']);
+    // Not seen: what the image's build never has, a package above the checkout, an untyped one's @types there included.
+    expect(beyond("import type { T } from 'stray';\nexport const x: T = 1;\n")).toEqual([]);
+    expect(beyond("// @ts-ignore\nimport { f } from 'untyped';\nexport const x = f(1);\n")).toEqual([]);
+    // A file git ignores beside them is still named.
+    put('bot/src/modulesDev/m.ts', 'export type M = number;\n');
+    expect(beyond("import type { S } from 'shared';\nimport type { M } from './modulesDev/m';\nexport const x: S & M = 1;\n")).toEqual(['src/modulesDev/m.ts']);
   });
 
   it("holds what the type checker reads to the root lockfile: test/'s TypeScript, and npm's record of the root install holding the lockfile's packages and no other", () => {

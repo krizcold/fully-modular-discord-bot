@@ -11,7 +11,7 @@ active mutant travels in `__STRYKER_ACTIVE_MUTANT__` and reaches child processes
 | ranges.mjs | (library) the files git names as changed, their changed lines from the gate's own line diff, and how far each widens; unit/mutationRanges.test.ts |
 | verdict.mjs | (library) when a run counts as a kill, which mutants go to which pass, the verdict; unit/mutationVerdict.test.ts |
 | runner.mjs | the command every pass runs inside Stryker's sandbox; unit/mutationRunner.test.ts |
-| control.mjs | (library) the time check of the run with no mutant after the reruns; unit/mutationRunner.test.ts |
+| control.mjs | (library) the time checks: Stryker's clock in pass B and in each b2 pass where a run timed out, and the run with no mutant after the reruns; unit/mutationRunner.test.ts |
 | passes.mjs | (data) the Stryker options every pass shares, and each pass's own options and budget; unit/mutationRunner.test.ts |
 | stryker.json | (data) empty on purpose: every pass names it as its config file, so Stryker never reads one it finds in the bot root |
 | keys.mjs | (library) how a file and a mutant are named across passes; unit/mutationRanges.test.ts |
@@ -238,29 +238,29 @@ does not name by its content.
    lists the tree's files only (ranges.mjs treeTsconfig), so a file git ignores (a module cloned into src) is not
    judged for being in src. TypeScript still follows a tree file's imports and references (a type-only one included),
    so when the checker would judge a file outside the tree, the gate stops before pass A with NO RESULT and names it
-   (ranges.mjs beyondTree): a file git ignores, or a package in a node_modules above the checkout (a stray install in
-   a home dir), which the image's build never has. A mutant that broke only that file, or that only its declarations
-   reject, would count as killed with no test run. The checkout's own packages are not named: those under a
-   node_modules dir in it, those under the dir the root's node_modules links to (another checkout's install, held
-   below), and the lib files of the TypeScript the checker runs. The way on: make the tree's file stop importing or
-   referencing it, add it to the tree if it belongs there, or move a node_modules above the checkout away. What the
-   checker reads is held to the root lockfile, which the build that ships installs (npm ci in the image and in CI): it
-   runs test/'s installed TypeScript, which must be the lockfile's, and reads the packages installed at the root
-   (another checkout's, when the root node_modules is a link), whose record npm keeps there
-   (`node_modules/.package-lock.json`): that record must hold the lockfile's packages and no other (an optional one
+   (ranges.mjs beyondTree): a mutant that broke only that file would count as killed with no test run. A file under a
+   node_modules dir, wherever that dir is, is a package and never named (the root's install, held below, and the
+   TypeScript the checker runs). The way on: make the tree's file stop importing or referencing it, or add it to the
+   tree if it belongs there. What the checker reads is held to the root lockfile, which the build that ships installs
+   (npm ci in the image and in CI): it runs test/'s installed TypeScript, which must be the lockfile's, and reads the
+   packages installed at the root (another checkout's, when the root node_modules is a link), whose record npm keeps
+   there (`node_modules/.package-lock.json`): that record must hold the lockfile's packages and no other (an optional one
    may be absent), each at its version with the content the lockfile names (its integrity; a git dependency, which
    has none, its resolved commit). When test/'s TypeScript or that record differs, the gate stops before pass A too,
    with NO RESULT naming the first difference (ranges.mjs checkerDiffers): a mutant the checker rejects and the
    shipped build accepts would count as killed with no test run. Of the @types it takes with no import, the checker
    takes the root's node_modules' only, as the image's build does, not a node_modules' above the checkout, unless the
-   root's tsconfig sets typeRoots of its own (an import or a reference that reaches one is named, above). The way on
+   root's tsconfig sets typeRoots of its own. The way on
    is to pin test/package.json and its lockfile to the root lockfile's TypeScript and run `npm run test:install`, or
    to run `npm ci --install-strategy=hoisted --include=dev` at the root, each in a checkout whose node_modules dir is
    its own (remove a link itself first, never what it names). The gate reads npm's default layout with the dev
    packages, whatever a config or `NODE_ENV=production` sets: a linked install (`install-strategy=linked`) records
-   links, not versions, and one that omits dev packages lacks them, so either always stops. Not seen: a package's
-   files changed after npm recorded its install (by hand, by another tool, or by an `npm rebuild`, which never
-   rewrites the record), since the gate reads no package's own files, and what the image compiles that the checker
+   links, not versions, and one that omits dev packages lacks them, so either always stops. Not seen: a package placed
+   at the root, or a package's files changed, after npm recorded its install (by hand, by another tool, or by an
+   `npm rebuild`, which never rewrites the record), since the gate reads no package's own files; a package
+   TypeScript reaches in a node_modules above the checkout (a stray install in a home dir) by an import or a
+   reference the root's install does not satisfy, or a `@typescript/lib-*` replacement there, which the image's build
+   never has (a mutant only its declarations reject counts as killed); and what the image compiles that the checker
    does not. The image builds with
    tsconfigprod.json (only `.ts` roots, under build/) and puts updaters/updater_local (the published image) or
    updaters/updater_managed (the manager's builds) in place of src/updater, while the checker judges the tree's
@@ -315,7 +315,8 @@ does not name by its content.
      clear it, so it stands on the budget Stryker built from that pass's own run with no mutant. When a run there
      timed out, that pass's time is checked as the reruns' is below (Stryker's own time against the run's monotonic
      one): where the clock of Stryker's process stepped during that run, every budget there was wrong (a step back can
-     make it negative), and the gate ends NO RESULT naming the pass rather than count its mutants hung.
+     make it negative), so the gate ends NO RESULT naming the pass rather than count its mutants hung, and it does
+     the same where those times could not be read.
    - A mutant the gate never reran (it stopped first) is inconclusive, and so is a survivor of pass A that the stopped
      gate never ran through pass B, and a pass B kill that failed again alone in one b2 run while a later one stopped
      the gate before the run with no mutant after them.
@@ -417,10 +418,10 @@ changed, when no gating mutant was made, when every gating mutant was a type err
 when the type checker would judge a file outside the tree, when what it reads is not what the root lockfile ships
 (test/'s TypeScript, or npm's record of the root install) or that lockfile names no TypeScript or cannot be read,
 when a pass could not run, when a run of pass B or b2 timed out while the clock of Stryker's process stepped during
-that pass's run with no mutant, when Stryker mutated a file no target names, when the run with no mutant after the
-reruns failed (or ran past the reruns' budget), when the tree changed during the run, or when a test's stand-in replaced
-vitest (SMDB_MUTATION_VITEST, for the gate's own tests only); the report then
-says why, with the passes that did finish.
+that pass's run with no mutant (or its times could not be read), when Stryker mutated a file no target names, when
+the run with no mutant after the reruns failed (or ran past the reruns' budget, or its times could not be read),
+when the tree changed during the run, or when a test's stand-in replaced vitest (SMDB_MUTATION_VITEST, for the
+gate's own tests only); the report then says why, with the passes that did finish.
 
 ## Child scenarios
 
