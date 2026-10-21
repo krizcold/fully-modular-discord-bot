@@ -107,9 +107,19 @@ describe('a mutant run', () => {
     const fake = fakeVitest([]);
     expect(runner(fake, 'a', '1').status).toBe(0);
     expect(fs.existsSync(path.join(fake.out, 'dry-ms.txt'))).toBe(false);
+    // By a monotonic clock: with the wall clock stepped back ten minutes once the run has read it, the time is still
+    // whole (one taken by Date.now or new Date() comes out negative).
+    const step = path.join(path.dirname(fake.out), 'step.cjs');
+    fs.writeFileSync(step, [
+      'const Wall = Date;',
+      'let reads = 0;',
+      'const read = () => Wall.now() - (reads++ > 0 ? 600_000 : 0);',
+      'globalThis.Date = class extends Wall { constructor(...args) { super(...(args.length > 0 ? args : [read()])); } static now() { return read(); } };',
+      '',
+    ].join('\n'));
+    const stepped = `${process.env.NODE_OPTIONS ?? ''} --require "${step.split(path.sep).join('/')}"`;
     // A run with no mutant reads its files: one that exists and holds no way to a fixed root.
-    expect(runner(fake, 'a', '1', [], { __STRYKER_ACTIVE_MUTANT__: undefined, SMDB_MUTATION_FILES: '["test/mutation/control.mjs"]' }).status).toBe(0);
-    // By a monotonic clock.
+    expect(runner(fake, 'a', '1', [], { __STRYKER_ACTIVE_MUTANT__: undefined, SMDB_MUTATION_FILES: '["test/mutation/control.mjs"]', NODE_OPTIONS: stepped }).status).toBe(0);
     expect(fs.readFileSync(path.join(fake.out, 'dry-ms.txt'), 'utf8')).toMatch(/^\d+$/);
   });
 });
