@@ -522,14 +522,19 @@ describe('a property under the gate', () => {
     expect(run.stdout).toMatch(/1 passed/);
   });
 
-  it('refuses a seed that is no integer, in the gate and in every test file', { timeout: 180_000 }, () => {
+  it('refuses a seed that is no integer, in the gate and in every test file, before the file makes its data root', { timeout: 180_000 }, () => {
     const env = { ...process.env, SMDB_TEST_SEED: '1.5' };
     const gate = spawnSync(process.execPath, [path.join(root, 'test', 'mutation', 'touched.mjs'), '--mutate', 'src/bot/internalSetup/fleet/nodeIdentity.ts:1-1'], { cwd: root, encoding: 'utf8', timeout: 60_000, env });
     expect(gate.status).toBe(2);
     expect(gate.stderr).toContain('SMDB_TEST_SEED must be an integer, not 1.5');
     const vitest = path.join(root, 'test', 'node_modules', 'vitest', 'vitest.mjs');
-    const tests = spawnSync(process.execPath, [vitest, 'run', '--project', 'fast', 'unit/propertySeed.test.ts'], { cwd: path.join(root, 'test'), encoding: 'utf8', timeout: 150_000, env });
+    // A temp dir of its own, so the refused file's leftovers, if any, are its alone.
+    const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-seedtemp-'));
+    onTestFinished(() => fs.rmSync(temp, { recursive: true, force: true }));
+    const tests = spawnSync(process.execPath, [vitest, 'run', '--project', 'fast', 'unit/propertySeed.test.ts'],
+      { cwd: path.join(root, 'test'), encoding: 'utf8', timeout: 150_000, env: { ...env, TEMP: temp, TMP: temp, TMPDIR: temp } });
     expect(tests.status).not.toBe(0);
     expect(`${tests.stdout}${tests.stderr}`).toContain('SMDB_TEST_SEED must be an integer, not 1.5');
+    expect(fs.readdirSync(temp).filter(name => name.startsWith('smdb-test-'))).toEqual([]);
   });
 });

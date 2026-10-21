@@ -57,8 +57,9 @@ describe('the dist stamp', () => {
     const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-linked-src-'));
     onTestFinished(() => fs.rmSync(outside, { recursive: true, force: true }));
     fs.writeFileSync(path.join(outside, 'b.ts'), 'export const b = 1;\n');
-    // A junction on Windows, a dir symlink elsewhere; a link back to src and a broken one are walked past.
-    const links = [[outside, 'linked'], [path.join(root, 'src'), 'loop'], [path.join(outside, 'gone'), 'broken']];
+    // A junction on Windows, a dir symlink elsewhere; a link back to src, a broken one and one to itself are walked past.
+    const self = path.join(root, 'src', 'self');
+    const links = [[outside, 'linked'], [path.join(root, 'src'), 'loop'], [path.join(outside, 'gone'), 'broken'], [self, 'self']];
     try {
       for (const [target, name] of links) fs.symlinkSync(target, path.join(root, 'src', name), 'junction');
       builder.writeStamp(root, builder.sourceHash(root));

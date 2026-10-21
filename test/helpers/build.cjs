@@ -20,7 +20,8 @@ const LOCK = '.build-lock';
 
 /**
  * The files under dir. Given `seen` (the real paths of the dirs walked), it
- * follows links as tsc does, leaving out a broken one and a dir already walked.
+ * follows links as tsc does: it leaves out a dir already walked, and whatever
+ * a link leads to that cannot be read (a broken link, a loop, a denied one).
  * @param {string} dir
  * @param {Set<string>} [seen]
  * @returns {string[]}
@@ -35,9 +36,15 @@ function filesUnder(dir, seen) {
   }
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
     const full = path.join(dir, entry.name);
-    const kind = seen && entry.isSymbolicLink() ? fs.statSync(full, { throwIfNoEntry: false }) : entry;
-    if (kind?.isDirectory()) out.push(...filesUnder(full, seen));
-    else if (kind?.isFile()) out.push(full);
+    if (seen && entry.isSymbolicLink()) {
+      try {
+        const kind = fs.statSync(full);
+        out.push(...(kind.isDirectory() ? filesUnder(full, seen) : kind.isFile() ? [full] : []));
+      } catch {
+        // Left out, as tsc leaves it out.
+      }
+    } else if (entry.isDirectory()) out.push(...filesUnder(full, seen));
+    else if (entry.isFile()) out.push(full);
   }
   return out;
 }

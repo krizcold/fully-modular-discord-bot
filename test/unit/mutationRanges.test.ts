@@ -1681,6 +1681,10 @@ describe('the targets', () => {
     const renamed = planOf([{ status: 'R', from: 'src/old.ts', file: 'src/new.ts' }], ['src/old.ts'], { 'src/old.ts': changedAt(SAMPLE, 4), 'src/new.ts': SAMPLE });
     expect(renamed.targets).toEqual([changeTarget('src/new.ts', SAMPLE, { changed: [4], deletedAfter: [] })]);
     expect(renamed.skipped).toEqual([{ file: 'src/old.ts', why: NO_CODE_WHY }]);
+    // A move out of src keeps the file on disk diffed, never named as moved away.
+    const out = planOf([{ status: 'R', from: 'src/old.ts', file: 'tools/old.ts' }], ['src/old.ts'], { 'src/old.ts': SAMPLE });
+    expect(out.targets).toEqual([]);
+    expect(out.skipped).toEqual([{ file: 'tools/old.ts', why: 'outside src' }, { file: 'src/old.ts', why: NO_CODE_WHY }]);
   });
 
   it('answers for every line a whole file or a pattern covers, and for the changed lines of a diff', () => {

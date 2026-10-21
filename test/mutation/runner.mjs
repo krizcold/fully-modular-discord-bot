@@ -5,7 +5,7 @@
 // tests that import them, then the whole child tier; or only the test files
 // SMDB_MUTATION_ONLY names (the rerun of a pass B failure with the file that
 // failed), each in its tier. Every run stops at its
-// first failed test. A rerun alone (SMDB_MUTATION_CONFIRM=1) gives the config's
+// first failed test, or after a tier that fails. A rerun alone (SMDB_MUTATION_CONFIRM=1) gives the config's
 // test and hook limits and a step's default bound four times their time
 // (SMDB_TEST_TIME_SCALE, read by vitest.config.ts and helpers/child.ts); a limit
 // a test sets itself is not scaled. Vitest's output goes to files, one JSON report and one log

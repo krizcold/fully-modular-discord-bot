@@ -66,7 +66,9 @@ From the bot root, with Node 22.12 or newer (or SMDB_TEST_NODE set, as for `npm 
   already gone, and ending a runner.mjs ends the Node processes under it). On POSIX, when the gate relaunched itself
   under SMDB_TEST_NODE (two touched.mjs processes are listed), a kill of the first alone leaves the relaunched one
   going on to its next passes: end it first (on Windows it ends with the first). Ctrl-C in the gate's terminal
-  reaches all of it.
+  reaches all of it. A test file whose process ends before its afterAll hooks run (killed, or ended by a mutant)
+  leaves its throwaway data root, an `smdb-test-*` dir in the OS temp dir, behind; such dirs are safe to delete once
+  no test runs.
 - The gate fingerprints every file git tracks or would add (below), so its output goes to a file git ignores (`l5.log`
   above, under the root's `*.log`) or one outside the checkout: a file in the tree that the run writes to changes
   during the run, which ends it NO RESULT.
@@ -305,10 +307,11 @@ does not name by its content.
    scenarios start real processes on that dist. A child sees the mutant through the env. Stryker makes every mutant a
    span holds, so a survivor that spans lines brings in the mutants nested inside it; in pass B and every rerun those
    run no test (targets.mjs gives the runner the ids the pass is for) and their results are dropped.
-3. **Reruns alone.** Every run stops at its first failed test (a file that fails at load or in a beforeAll or
-   afterAll fails without stopping it), and takes its tiers in turn (fast, then integration, then child), each in
-   vitest's own order, never in one earlier runs chose (`--no-cache`: every sandbox links the one results cache in
-   test/node_modules, which vitest would read to take a file that failed or ran long before first). A rerun runs one
+3. **Reruns alone.** Every run takes its tiers in turn (fast, then integration, then child), each in vitest's own
+   order, never in one earlier runs chose (`--no-cache`: every sandbox links the one results cache in
+   test/node_modules, which vitest would read to take a file that failed or ran long before first), and ends at its
+   first failed test, or after the first tier that fails in another way (a file failing at load or in a hook). A
+   rerun runs one
    mutant at a time and gives the config's
    limit for each test and hook, and a child scenario step's default bound, four times their time (a limit a test,
    hook or step sets itself is not scaled), and Stryker a larger budget for the whole run.
@@ -328,8 +331,8 @@ does not name by its content.
      hook, so a run that fails a test and then waits in an afterAll past the budget (a `pool.end()` held by a client
      still checked out) counts as a hang too; past a minute, vitest's limit can end the afterAll first, and the failed
      test counts as a kill. A beforeAll that waits is the same: while that run takes under a minute the budget ends
-     it, a hang; past a minute, vitest's limit can end it first, its file's tests are skipped and the run goes on to
-     the next file. Either way
+     it, a hang; past a minute, vitest's limit can end it first, failing its file with no test failed (inconclusive,
+     unless a later file of its tier fails a test). Either way
      a hook must bound its waits as a test does (the suite's own afterAll hooks end their pools through
      helpers/endPool.ts).
    - A gating kill of pass B, or a run there that failed only on the machine's texts, reruns with the one test file
