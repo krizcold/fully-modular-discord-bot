@@ -43,13 +43,13 @@ function runner(fake: { script: string; out: string }, pass: string, confirm: st
 }
 
 describe('a mutant run', () => {
-  it('stops at the first failing test and tier, at vitest\'s own time limits', () => {
+  it('stops at the first failing test and tier, at vitest\'s own time limits, in an order no earlier run chose', () => {
     const fake = fakeVitest(['integration']);
     expect(runner(fake, 'b', '').status).toBe(1);
     const calls = fake.read();
     expect(calls.map(call => call.project)).toEqual(['integration']);
     expect(calls[0]).toMatchObject({ scale: '1', mutant: '7' });
-    expect(calls[0].args).toEqual(expect.arrayContaining(['related', '../src/a.ts', '--bail=1']));
+    expect(calls[0].args).toEqual(expect.arrayContaining(['related', '../src/a.ts', '--bail=1', '--no-cache']));
   });
 
   it('refuses, before any mutant, a file that holds a way to /data as the pass copied it', () => {
@@ -107,13 +107,14 @@ describe('a mutant run', () => {
     const fake = fakeVitest([]);
     expect(runner(fake, 'a', '1').status).toBe(0);
     expect(fs.existsSync(path.join(fake.out, 'dry-ms.txt'))).toBe(false);
-    // By a monotonic clock: with the wall clock stepped ten minutes forward once the run has read it, the time stays
-    // far below that (one taken by Date.now or new Date() reads ten minutes, however it is clamped or made absolute).
+    // By a monotonic clock: with the wall clock (Date.now, new Date()) jumping ten minutes further ahead at every read,
+    // the first included, a time with such a read in it, from one read or two, clamped at zero or made absolute,
+    // reads ten minutes or more, while a monotonic one stays far below.
     const step = path.join(path.dirname(fake.out), 'step.cjs');
     fs.writeFileSync(step, [
       'const Wall = Date;',
       'let reads = 0;',
-      'const read = () => Wall.now() + (reads++ > 0 ? 600_000 : 0);',
+      'const read = () => Wall.now() + 600_000 * ++reads;',
       'globalThis.Date = class extends Wall { constructor(...args) { super(...(args.length > 0 ? args : [read()])); } static now() { return read(); } };',
       '',
     ].join('\n'));

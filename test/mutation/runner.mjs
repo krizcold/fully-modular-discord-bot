@@ -39,8 +39,10 @@ function tier(project, args) {
   const log = fs.openSync(`${base}.log`, 'w');
   try {
     // One worker per run: Stryker already runs several at once, and a run's
-    // time must match the run with no mutant it is timed against.
-    const run = spawnSync(process.execPath, [vitest, ...args, '--bail=1', '--maxWorkers=1', '--project', project, '--reporter=json', `--outputFile=${base}.json`], {
+    // time must match the run with no mutant it is timed against. No results
+    // cache: every sandbox links the one in test/node_modules, so earlier runs
+    // would choose which file a run takes first.
+    const run = spawnSync(process.execPath, [vitest, ...args, '--bail=1', '--no-cache', '--maxWorkers=1', '--project', project, '--reporter=json', `--outputFile=${base}.json`], {
       cwd: testDir,
       stdio: ['ignore', log, log],
       env: { ...process.env, SMDB_TEST_TIME_SCALE: confirm ? '4' : '1' },
