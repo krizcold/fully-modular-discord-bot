@@ -251,17 +251,20 @@ does not name by its content.
    shipped build accepts would count as killed with no test run. Of the @types it takes with no import, the checker
    takes the root's node_modules' only, as the image's build does, not a node_modules' above the checkout, unless the
    root's tsconfig sets typeRoots of its own. The way on is to pin test/package.json and its lockfile to the root
-   lockfile's TypeScript and run `npm run test:install`, or to run `npm ci --install-strategy=hoisted --include=dev`
-   at the root, each in a checkout whose node_modules dir is its own (remove a link itself first, never what it names). The gate reads npm's default layout with the dev
-   packages, whatever a config or `NODE_ENV=production` sets: a linked install (`install-strategy=linked`) records
-   links, not versions, and one that omits dev packages lacks them, so either always stops. Not seen: a package placed
-   at the root, or a package's files changed, after npm recorded its install (by hand, by another tool, or by an
-   `npm rebuild`, which never rewrites the record), since the gate reads no package's own files; any node_modules
-   other than the root's install that TypeScript reads, which the image's build never has (a mutant only its
-   declarations reject counts as killed): one inside the checkout (made by hand in src, which TypeScript takes before
-   the root's for a file below it), and one above the checkout or above the dir the root's node_modules links to (in
-   bt1 or hf1, above the main checkout; a stray install in a home dir), which an import or a reference the root's
-   install does not satisfy reaches, a `@typescript/lib-*` replacement included; and what the image compiles that
+   lockfile's TypeScript and run `npm run test:install` in a checkout whose test/node_modules is a dir of its own, or
+   to run `npm ci --install-strategy=hoisted --include=dev` at the root of one whose node_modules is (remove a link
+   itself first, never what it names: either command run through a link writes the other checkout's install). The
+   gate reads npm's default layout with the dev packages, whatever a config or `NODE_ENV=production` sets: a linked
+   install (`install-strategy=linked`) records links, not versions, and one that omits dev packages lacks them, so
+   either always stops. Not seen: a package placed at the root, or a package's files changed, after npm recorded its
+   install (by hand, by another tool, or by an `npm rebuild`, which never rewrites the record), since the gate reads
+   no package's own files; any node_modules
+   other than the root's install that TypeScript reads (a mutant only its declarations reject counts as killed): one
+   inside the checkout (made by hand in src, which TypeScript takes before the root's for a file below it, and which
+   an image built from a clean checkout never has), and one above the checkout or above the dir the root's
+   node_modules links to (in bt1 or hf1, above the main checkout; a stray install in a home dir), which an import or a
+   reference the root's install does not satisfy reaches, a `@typescript/lib-*` replacement included, and which the
+   image's build never has; and what the image compiles that
    the checker does not. The image builds with tsconfigprod.json (only `.ts` roots, under build/) and puts updaters/updater_local (the published image) or
    updaters/updater_managed (the manager's builds) in place of src/updater, while the checker judges the tree's
    program, whose src/updater is the managed copy. So a type error only the managed updater's types give (its
@@ -382,8 +385,10 @@ never rerun (the gate stopped first), or a type error only of an unused `@ts-exp
 (the gate stopped first, or it is a context mutant). vitest counts a failure in a beforeEach or afterEach hook as its test's, so such a
 failure counts as the test's too. A failure the mutant itself causes only at load (a module that throws while a test
 file imports it), only in a beforeAll or afterAll, or only as an unhandled error repeats on every rerun, so no rerun
-clears it: the test that does must fail inside its own body (import the module with `import()` in a test, call the
-hook's code in a test, await what rejects).
+clears it: the test that does must fail inside its own body, where nothing stops it first. Import the module with
+`import()` in a test file none of whose static imports reaches it, directly or through other files; call the hook's
+code in a test of a file or describe that hook does not run for; await what rejects. A machine's failure in such a
+hook (a container that would not start) is the other kind: a rerun of the gate on a sound machine can clear it.
 
 Every run of the gate draws one fast-check seed (named on the Scope line; set SMDB_TEST_SEED to an integer to run with a
 given one, anything else is refused), so a property draws the same inputs in every mutant's run as in the run with no
