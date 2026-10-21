@@ -286,7 +286,7 @@ export function judge(run) {
     `  killed in pass A: ${gating.filter(m => !m.passes.b && outcomeIn(m) === 'Killed').length}; run in pass B: ${gating.filter(m => m.passes.b).length}, killed there: ${gating.filter(m => m.passes.b && outcomeIn(m) === 'Killed').length}`,
     ...section('Survivors (each needs a test that kills it, or a justification in the notes):', [...gatingAt('Survived'), ...gatingAt('NoCoverage')]),
     ...section('Silenced by a Stryker disable comment (each needs a justification in the notes):', gatingAt('Ignored')),
-    ...section('Inconclusive (no test failed for the mutant itself; rerun, or add a test that fails on it):', [...gatingAt('Inconclusive'), ...gatingAt('RuntimeError')]),
+    ...section("Inconclusive (no test failed for the mutant itself; rerun, or add a test that fails on it: a failure only at load, in a beforeAll or afterAll, or as an unhandled error repeats on every rerun, so that test must fail inside its own body):", [...gatingAt('Inconclusive'), ...gatingAt('RuntimeError')]),
     ...section("Timeouts (each timed out when run alone with four times the config's limit, or past the limit a test or hook sets itself: a test or its beforeEach or afterEach hook, or the whole run past its budget; counted as killed, so check each replacement):", gatingAt('Timeout')),
     `Context mutants (in the widened statements, not gating: they touch no changed line that holds code): ${context.length}: ${tally(context)}`,
     ...section('Context survivors:', context.filter(m => outcomeIn(m) === 'Survived')),

@@ -927,11 +927,13 @@ export function treeTsconfig(root, tree, dir) {
  * config treeTsconfig gives: TypeScript follows a tree file's imports and
  * references (a type-only one included) to a file git ignores, which no
  * sandbox holds. A file under a node_modules dir, wherever that dir is, is a
- * package and never named: the root's install (through a link, another
- * checkout's, which checkerDiffers holds to the lockfile), the TypeScript the
- * checker runs, and also a node_modules above the checkout, which the image's
- * build never has, so a package TypeScript reaches there by an import or a
- * reference the root's install does not satisfy is not seen.
+ * package and never named. Of those, checkerDiffers holds only the root's
+ * install (through a link, another checkout's) and the TypeScript the checker
+ * runs; any other node_modules TypeScript reads is not seen: one inside the
+ * checkout other than the root's (made by hand in src, which TypeScript takes
+ * before the root's for a file below it), and one above the checkout or above
+ * the dir the root's node_modules links to, which an import or a reference the
+ * root's install does not satisfy reaches, and which the image never has.
  * @param {string} root
  * @param {Iterable<string>} tree the tree's files, from the bot root with forward slashes
  * @param {object} config what treeTsconfig gave
