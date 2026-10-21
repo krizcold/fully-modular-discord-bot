@@ -166,8 +166,9 @@ does not name by its content.
 - Not mutated, and named in the report with the reason: files outside src (the root scripts, updaters/, tests, docs and
   images), files that are not code (code is `.ts`, `.tsx`, `.mts`, `.cts`, `.js`, `.cjs` and `.mjs`), declaration files
   (`.d.ts`, `.d.mts`, `.d.cts`), the browser views under src/webui/public (copied into dist, never
-  compiled, and no test loads them yet), a file under a node_modules dir in src (in the tree only when added with -f or when a deeper .gitignore lifts the
-  root's ignore rule: Stryker links such a dir into a sandbox and never copies it), a file deleted or moved out of src,
+  compiled, and no test loads them yet), a file under a node_modules dir in src (git ignores such a dir, but a file there is in the tree whenever the index
+  holds it: added with -f, moved in with git mv, tracked before the rule, or let in by a deeper .gitignore that lifts
+  it; Stryker links such a dir into a sandbox and never copies it), a file deleted or moved out of src,
   an untracked git repository (git lists
   none of its files, and none is copied into a sandbox) or a git submodule under src, a file whose name Stryker would read as a glob (`[id].ts`,
   `a{1,2}.ts`; rename it), a name that leads through a link, as the disk tells it (a link in src, one that differs
@@ -240,15 +241,25 @@ does not name by its content.
    pass A with NO RESULT and names it (ranges.mjs beyondTree): a mutant that broke only that file would count as killed
    with no test run. The way on: make the tree's file stop importing or referencing it, or add it to the tree if it
    belongs there. What the checker reads is held to the root lockfile, which the build that ships installs (npm ci in
-   the image and in CI): it runs test/'s installed TypeScript, which must be the lockfile's, and reads the packages'
-   declarations installed at the root (another checkout's, when the root node_modules is a link), each of which must
-   be at the lockfile's version (an optional one may be absent). Otherwise the gate stops before pass A too, with NO
-   RESULT naming the first that differs (ranges.mjs checkerDiffers): a mutant the checker rejects and the shipped
-   build accepts would count as killed with no test run. The way on is to pin test/package.json and its lockfile to
-   the root lockfile's TypeScript and run `npm run test:install`, or to run `npm ci` at the root, each in a checkout
-   whose node_modules dir is its own (remove a link itself first, never what it names). dist and pass B's build
-   compile with the root's install too, but no mutant meets their type judgment. A unit test holds the two lockfiles
-   to one TypeScript. A gating mutant whose only type error is an unused `@ts-expect-error` (TS2578) type-checks, so it
+   the image and in CI): it runs test/'s installed TypeScript, which must be the lockfile's, and reads the packages
+   installed at the root (another checkout's, when the root node_modules is a link), whose record npm keeps there
+   (`node_modules/.package-lock.json`): that record must hold the lockfile's packages at their versions and no other
+   (an optional one may be absent). It reads @types from the root's node_modules only, as the image's build does,
+   never from a node_modules above the checkout, unless the root's tsconfig sets typeRoots of its own. Otherwise the
+   gate stops before pass A too, with NO RESULT naming the first that differs (ranges.mjs checkerDiffers): a mutant
+   the checker rejects and the shipped build accepts would count as killed with no test run. The way on is to pin
+   test/package.json and its lockfile to the root lockfile's TypeScript and run `npm run test:install`, or to run
+   `npm ci` at the root, each in a checkout whose node_modules dir is its own (remove a link itself first, never what
+   it names). The gate reads npm's default layout: a linked install (`install-strategy=linked`) records links, not
+   versions, so it always stops; install with `--install-strategy=hoisted`. Not seen: a package placed or changed at
+   the root since npm's last install by anything but npm (npm writes the record at its install, and the gate reads no
+   package's own files), and what the image compiles that the checker does not. The image builds with
+   tsconfigprod.json (only `.ts` roots, under build/) and puts updaters/updater_local (the published image) or
+   updaters/updater_managed (the manager's builds) in place of src/updater, while the checker judges the tree's
+   program, whose src/updater is the managed copy. So a type error only the managed updater's types give (its
+   UpdateStatus requires `mode`), or one only in a `.tsx`, `.mts` or `.cts` root that no `.ts` file imports, counts as
+   killed, though the published image accepts the mutant. dist and pass B's build compile with the root's install too,
+   but no mutant meets their type judgment. A unit test holds the two lockfiles to one TypeScript. A gating mutant whose only type error is an unused `@ts-expect-error` (TS2578) type-checks, so it
    meets pass A's tests again with no checker (`a-unchecked/`), and that run is its pass A: from there it goes on like
    any other mutant. Each mutant run is `vitest related <mutated files>` on the fast tier with one worker: every pass
    and rerun, and each run with no mutant, is given every file the gate mutates, and pass A gives Stryker those files
@@ -388,8 +399,9 @@ The verdict is FAIL when a gating mutant ends Survived, NoCoverage, inconclusive
 killed and is listed. CompileError counts as killed by the type checker, unless its only error is an unused
 `@ts-expect-error` (a gating one then meets pass A's tests with no checker, above). The verdict is NO RESULT when no src file
 changed, when no gating mutant was made, when every gating mutant was a type error (no test ran against the change),
-when the type checker would judge a file outside the tree, when its TypeScript is not the one the root lockfile
-ships, when a pass could not run, when Stryker mutated a file no target names, when the run with no mutant after the reruns
+when the type checker would judge a file outside the tree, when what it reads is not what the root lockfile ships
+(test/'s TypeScript, or npm's record of the root install) or that lockfile names no TypeScript or cannot be read,
+when a pass could not run, when Stryker mutated a file no target names, when the run with no mutant after the reruns
 failed (or ran past the reruns' budget), when the tree changed during the run, or when a test's stand-in replaced
 vitest (SMDB_MUTATION_VITEST, for the gate's own tests only); the report then
 says why, with the passes that did finish.

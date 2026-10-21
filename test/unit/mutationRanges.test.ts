@@ -555,7 +555,7 @@ describe('the change', () => {
     // A module cloned into a dir git ignores: it reads the API, and holds an error of its own.
     put('src/modulesDev/m.ts', "import { DEFAULTS } from '../api';\nexport const n: number = DEFAULTS.retries;\nexport const s: number = 'stale';\n");
     const config = treeTsconfig(root, ['tsconfig.json', 'src/api.ts'], '.stryker-tmp');
-    expect(config).toEqual({ extends: '../tsconfig.json', include: [], files: ['../src/api.ts'] });
+    expect(config).toEqual({ extends: '../tsconfig.json', compilerOptions: { typeRoots: ['../node_modules/@types'] }, include: [], files: ['../src/api.ts'] });
     put('.stryker-tmp/tsconfig.l5.json', JSON.stringify(config));
     const errorsOf = (file: string) => {
       const { config: raw } = ts.readConfigFile(file, ts.sys.readFile);
@@ -564,6 +564,34 @@ describe('the change', () => {
     };
     expect(errorsOf(path.join(root, 'tsconfig.json')).length).toBeGreaterThan(0);
     expect(errorsOf(path.join(root, '.stryker-tmp', 'tsconfig.l5.json'))).toEqual([]);
+  });
+
+  it("gives pass A's type checker the root's @types only, as the image's build reads them, never a dir's above the checkout", () => {
+    const outer = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-types-'));
+    onTestFinished(() => fs.rmSync(outer, { recursive: true, force: true }));
+    const root = path.join(outer, 'bot');
+    const put = (file: string, text: string) => {
+      fs.mkdirSync(path.dirname(path.join(outer, file)), { recursive: true });
+      fs.writeFileSync(path.join(outer, file), text);
+    };
+    const configure = (typeRoots?: string[]) => put('bot/tsconfig.json', JSON.stringify({ compilerOptions: { strict: true, noEmit: true, typeRoots }, include: ['src'] }));
+    put('bot/src/a.ts', 'export const fromRoot: string = OWN;\nexport const fromAbove: string = UP;\n');
+    put('bot/node_modules/@types/own/index.d.ts', 'declare const OWN: string;\n');
+    put('node_modules/@types/up/index.d.ts', 'declare const UP: string;\n');
+    const tree = ['tsconfig.json', 'src/a.ts'];
+    const errorsOf = (config: object, dir: string) => {
+      const parsed = ts.parseJsonConfigFileContent(config, ts.sys, path.join(root, dir), undefined, path.join(root, dir, 'tsconfig.json'));
+      return ts.getPreEmitDiagnostics(ts.createProgram(parsed.fileNames, parsed.options)).map(d => ts.flattenDiagnosticMessageText(d.messageText, '\n'));
+    };
+    const rootConfig = () => ts.readConfigFile(path.join(root, 'tsconfig.json'), ts.sys.readFile).config as object;
+    configure();
+    // tsc at the root takes a node_modules/@types above the checkout too; the image has none above /app.
+    expect(errorsOf(rootConfig(), '.')).toEqual([]);
+    expect(errorsOf(treeTsconfig(root, tree, '.stryker-tmp'), '.stryker-tmp')).toEqual(["Cannot find name 'UP'."]);
+    // typeRoots the root's config sets are its own, and the image's build reads them too.
+    configure(['node_modules/@types', '../node_modules/@types']);
+    expect(treeTsconfig(root, tree, '.stryker-tmp')).toEqual({ extends: '../tsconfig.json', include: [], files: ['../src/a.ts'] });
+    expect(errorsOf(treeTsconfig(root, tree, '.stryker-tmp'), '.stryker-tmp')).toEqual([]);
   });
 
   it('names a file outside the tree that a tree file imports or references, which the type checker would still judge', () => {
@@ -588,11 +616,11 @@ describe('the change', () => {
     expect(beyond('/// <reference path="./modulesDev/m.ts" />\nexport const x = 1;\n')).toEqual(['src/modulesDev/m.ts']);
   });
 
-  it('holds what the type checker reads to the root lockfile: test/\'s TypeScript and every package installed at the root', () => {
+  it("holds what the type checker reads to the root lockfile: test/'s TypeScript, and npm's record of the root install holding the lockfile's packages and no other", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-tsroot-'));
     onTestFinished(() => fs.rmSync(root, { recursive: true, force: true }));
     const checking = (JSON.parse(fs.readFileSync(path.join(botRoot, 'test', 'node_modules', 'typescript', 'package.json'), 'utf8')) as { version: string }).version;
-    type Entry = { version: string; optional?: boolean };
+    type Entry = { version?: string; optional?: boolean; link?: boolean; resolved?: string };
     const lock = (file: string, packages: Record<string, Entry>) => {
       fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true });
       fs.writeFileSync(path.join(root, file), JSON.stringify({ packages }));
@@ -609,15 +637,27 @@ describe('the change', () => {
     const why = 'so a mutant the checker rejects and the shipped build accepts would count as killed with no test run';
     ships({ ...both, 'node_modules/typescript': { version: '6.0.3' } });
     expect(checkerDiffers(root)).toBe(`the type checker runs TypeScript ${checking} (test/'s, installed) and the root lockfile ships 6.0.3, ${why}; pin test/package.json and its lockfile to 6.0.3 and run npm run test:install in a checkout whose test/node_modules is a dir of its own (a link names another checkout's: remove the link itself first)`);
+    const stale = (name: string, is: string, shipsText: string) => `the type checker reads the packages installed at the root, and in npm's record of that install (node_modules/.package-lock.json) ${name} is ${is} where the root lockfile ${shipsText}, ${why}; run npm ci at the root, in npm's default layout (--install-strategy=hoisted where a config sets linked), of a checkout whose node_modules is a dir of its own (a link names another checkout's install: remove the link itself first, never what it names)`;
+    // An optional package that is installed is held like any other.
+    ships({ ...both, 'node_modules/pg-cloudflare': { version: '1.4.0', optional: true } });
+    installs({ ...both, 'node_modules/pg-cloudflare': { version: '1.3.0' } });
+    expect(checkerDiffers(root)).toBe(stale('node_modules/pg-cloudflare', 'at 1.3.0', 'ships 1.4.0'));
     // A pull that moved a package's declarations, with no install since: the checker would read the old ones.
     ships({ ...both, 'node_modules/@types/express': { version: '5.0.3' } });
-    const stale = (installed: string) => `the type checker reads the packages installed at the root, and node_modules/@types/express there is ${installed} where the root lockfile ships 5.0.3, ${why}; run npm ci at the root of a checkout whose node_modules is a dir of its own (a link names another checkout's install: remove the link itself first, never what it names)`;
-    expect(checkerDiffers(root)).toBe(stale('5.0.1'));
+    installs(both);
+    expect(checkerDiffers(root)).toBe(stale('node_modules/@types/express', 'at 5.0.1', 'ships 5.0.3'));
     installs({ 'node_modules/typescript': { version: checking } });
-    expect(checkerDiffers(root)).toBe(stale('not installed'));
+    expect(checkerDiffers(root)).toBe(stale('node_modules/@types/express', 'missing', 'ships 5.0.3'));
+    // A package the lockfile does not name (a branch that dropped it, npm install --no-save): TypeScript would take its @types.
+    ships(both);
+    installs({ ...both, 'node_modules/@types/stale': { version: '1.0.0' } });
+    expect(checkerDiffers(root)).toBe(stale('node_modules/@types/stale', 'at 1.0.0', 'names no such package'));
+    // npm's linked layout records each package the root names as a link, with no version.
+    installs({ ...both, 'node_modules/typescript': { resolved: `node_modules/.store/typescript@${checking}/node_modules/typescript`, link: true } });
+    expect(checkerDiffers(root)).toBe(stale('node_modules/typescript', 'a link', `ships ${checking}`));
     // No install at all: the first package the lockfile names.
     fs.rmSync(path.join(root, 'node_modules', '.package-lock.json'));
-    expect(checkerDiffers(root)).toMatch(/, and node_modules\/typescript there is not installed where the root lockfile ships /);
+    expect(checkerDiffers(root)).toBe(stale('node_modules/typescript', 'missing', `ships ${checking}`));
     fs.rmSync(path.join(root, 'package-lock.json'));
     expect(checkerDiffers(root)).toBe('the root lockfile (package-lock.json) names no TypeScript or could not be read, so what the shipped build compiles with is not known and the type checker cannot be held to it; restore the lockfile');
     expect(checkerDiffers(botRoot)).toBe('');

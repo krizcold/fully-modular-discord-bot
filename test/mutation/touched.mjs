@@ -471,8 +471,8 @@ try {
   if (!targets.some(canGate)) await finish();
 
   console.log(`L5: mutating ${scope}: ${changedFiles().length} file(s), pass A (in-process tests that import them)`);
-  // The type checker judges the tree's files only (ranges.mjs treeTsconfig, beyondTree), with the TypeScript the
-  // build uses (checkerDiffers).
+  // The type checker judges the tree's files only (ranges.mjs treeTsconfig, beyondTree), with the TypeScript and
+  // the packages the root lockfile ships (checkerDiffers).
   const compiler = checkerDiffers(root);
   if (compiler) throw new PassError(compiler);
   const checkerConfig = `.stryker-tmp/tsconfig.l5-${process.pid}.json`;

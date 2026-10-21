@@ -901,7 +901,10 @@ export const rootGlobFree = root => strykerTakes(root, 'package.json');
  * cloned into src), which no sandbox holds: such a file could turn a mutant
  * into a CompileError, counted as killed, or stop the pass. This one extends
  * the root's and lists only the files of the tree that the root's holds; a
- * file they import from outside the tree is still judged (beyondTree).
+ * file they import from outside the tree is still judged (beyondTree). It
+ * reads @types from the root's node_modules only, as the image's build does,
+ * never from a node_modules above the checkout, which TypeScript would take
+ * too, unless the root's sets typeRoots of its own.
  * @param {string} root
  * @param {Iterable<string>} tree the tree's files, from the bot root with forward slashes
  * @param {string} dir the dir it is written to, from the bot root
@@ -909,11 +912,13 @@ export const rootGlobFree = root => strykerTakes(root, 'package.json');
 export function treeTsconfig(root, tree, dir) {
   const rootConfig = path.join(root, 'tsconfig.json');
   const { config } = ts.readConfigFile(rootConfig, ts.sys.readFile);
-  const held = ts.parseJsonConfigFileContent(config, ts.sys, root, undefined, rootConfig).fileNames;
+  const held = ts.parseJsonConfigFileContent(config, ts.sys, root, undefined, rootConfig);
   const inTree = treeKeys(root, tree);
   /** @param {string} file */
   const from = file => path.relative(path.join(root, dir), file).split(path.sep).join('/');
-  return { extends: from(rootConfig), include: [], files: held.filter(file => inTree.has(fileKey(file))).map(file => from(path.resolve(file))) };
+  const files = held.fileNames.filter(file => inTree.has(fileKey(file))).map(file => from(path.resolve(file)));
+  if (held.options.typeRoots) return { extends: from(rootConfig), include: [], files };
+  return { extends: from(rootConfig), compilerOptions: { typeRoots: [from(path.join(root, 'node_modules', '@types'))] }, include: [], files };
 }
 
 /**
@@ -941,12 +946,16 @@ export function beyondTree(root, tree, config, dir) {
  * reads is held to the root lockfile, which the build that ships installs (npm
  * ci in the image and in CI), since a mutant the checker rejects and that build
  * accepts would count as killed with no test run. It runs test/'s installed
- * TypeScript, the one this file loads, and reads the packages' declarations
- * installed at the root (through a link, another checkout's): the TypeScript
- * must be the lockfile's, and every package the lockfile names installed at its
- * version (an optional one may be absent). dist and pass B's build compile
- * with the root's install too, but no mutant meets their type judgment (the
- * sandbox's src is not type-checked there).
+ * TypeScript, the one this file loads, which must be the lockfile's, and reads
+ * the packages installed at the root (through a link, another checkout's),
+ * whose record npm keeps (node_modules/.package-lock.json): it must hold the
+ * lockfile's packages at their versions and no other (an optional one may be
+ * absent). npm writes that record at its install, so a package placed or
+ * changed at the root since by anything but npm is not seen, and npm's linked
+ * layout records links, not versions, so it always differs. '' says only
+ * that: the checker judges the tree's program, not the image's (README, The
+ * passes). dist and pass B's build compile with the root's install too, but no
+ * mutant meets their type judgment (the sandbox's src is not type-checked there).
  * @param {string} root
  */
 export function checkerDiffers(root) {
@@ -965,11 +974,13 @@ export function checkerDiffers(root) {
     return `the type checker runs TypeScript ${ts.version} (test/'s, installed) and the root lockfile ships ${version}, ${why}; pin test/package.json and its lockfile to ${version} and run npm run test:install in a checkout whose test/node_modules is a dir of its own (a link names another checkout's: remove the link itself first)`;
   }
   const installed = read('node_modules/.package-lock.json') ?? {};
-  for (const [name, entry] of Object.entries(shipped)) {
-    if (name === '' || entry.link || (entry.optional && !installed[name])) continue;
-    if (installed[name]?.version !== entry.version) {
-      return `the type checker reads the packages installed at the root, and ${name} there is ${installed[name]?.version ?? 'not installed'} where the root lockfile ships ${entry.version}, ${why}; run npm ci at the root of a checkout whose node_modules is a dir of its own (a link names another checkout's install: remove the link itself first, never what it names)`;
-    }
+  for (const name of new Set([...Object.keys(shipped), ...Object.keys(installed)])) {
+    const want = shipped[name];
+    const have = installed[name];
+    if (name === '' || (want?.optional && have === undefined) || (want && have && want.version === have.version)) continue;
+    const is = have === undefined ? 'missing' : have.link ? 'a link' : `at ${have.version}`;
+    const ships = want === undefined ? 'names no such package' : want.link ? 'holds a link' : `ships ${want.version}`;
+    return `the type checker reads the packages installed at the root, and in npm's record of that install (node_modules/.package-lock.json) ${name} is ${is} where the root lockfile ${ships}, ${why}; run npm ci at the root, in npm's default layout (--install-strategy=hoisted where a config sets linked), of a checkout whose node_modules is a dir of its own (a link names another checkout's install: remove the link itself first, never what it names)`;
   }
   return '';
 }
