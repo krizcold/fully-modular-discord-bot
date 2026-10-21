@@ -665,16 +665,21 @@ export function planChange({ entries, untracked, read, readBase, nameOf, linkOf:
   for (const entry of entries) {
     if (entry.status === 'D') { skipped.push({ file: entry.file, why: 'deleted: nothing is left to mutate' }); continue; }
     if (isDir(entry.file)) { skipped.push({ file: entry.file, why: 'a git submodule: git names only its commit, so none of its files is mutated' }); continue; }
+    /** @param {string} file @param {string} why */
+    const refuse = (file, why) => {
+      skipped.push({ file, why });
+      if (entry.from !== undefined && notMutated(entry.from) === null) skipped.push({ file: entry.from, why: `moved to ${file}: nothing is left to mutate` });
+    };
     const why = notMutated(entry.file);
-    if (why) {
-      skipped.push({ file: entry.file, why });
-      if (entry.from !== undefined && notMutated(entry.from) === null) skipped.push({ file: entry.from, why: `moved to ${entry.file}: nothing is left to mutate` });
-      continue;
-    }
+    if (why) { refuse(entry.file, why); continue; }
     const link = linkedTo(entry.file);
     if (link !== undefined) { skipped.push({ file: entry.file, why: linkWhy(link) }); continue; }
     const name = nameOf(entry.file);
     if (name === null) { skipped.push({ file: entry.file, why: GLOB_NAME_WHY }); continue; }
+    // Its name on disk, the one it is mutated under and vitest reaches it by,
+    // differs from git's after a rename by case outside git.
+    const onDisk = notMutated(name);
+    if (onDisk) { refuse(name, onDisk); continue; }
     const text = read(entry.file);
     if (holdsExtraBreak(text)) { skipped.push({ file: entry.file, why: EXTRA_BREAK_WHY }); continue; }
     if (holdsDataRoute(entry.file, text)) { skipped.push({ file: entry.file, why: DATA_ROUTE_WHY }); continue; }
@@ -899,10 +904,10 @@ export const rootGlobFree = root => strykerTakes(root, 'package.json');
  * Whether vitest's related runs can find a test from the bot root: vitest 5
  * drops every import whose path holds the text node_modules anywhere, not only
  * as a dir of its own, and a sandbox's files lie under the root's path, so under
- * such a path no test of the fast or integration tier would meet a mutant (only
- * pass B's child tier, which runs whole, would). Read on the path as given and
- * on the real path, which vitest resolves imports to. A src file whose own path
- * holds the text is not mutated (notMutated), for the same reason.
+ * such a path no test of the fast or integration tier would meet a mutant. Read
+ * on the path as given and on the real path, which vitest resolves imports to.
+ * A src file whose own path holds the text is not mutated (notMutated), for the
+ * same reason.
  * @param {string} root
  */
 export function rootRelatable(root) {

@@ -1596,6 +1596,20 @@ describe('the targets', () => {
     const text = "its path holds the text node_modules, and vitest's related runs drop every import whose path holds it, so no test of the fast or integration tier would reach its mutants; rename it";
     for (const file of ['src/node_modules.ts', 'src/bot/utils/node_modules_paths.ts', 'src/node_modules_cache/x.ts']) expect(notMutated(file), file).toBe(text);
     expect(notMutated('src/Node_Modules.ts')).toBeNull();
+    // A diff names a file by git's name; after a rename by case outside git, its name on disk is judged too.
+    const renamed = planChange({
+      entries: [{ status: 'M', file: 'src/bot/utils/Node_Modules_Paths.ts' }, { status: 'R', from: 'src/old.ts', file: 'src/Node_Modules.ts' }],
+      untracked: [],
+      read: () => 'export const x = 1;\n',
+      readBase: () => 'export const x = 0;\n',
+      nameOf: file => file.toLowerCase(),
+    });
+    expect(renamed.targets).toEqual([]);
+    expect(renamed.skipped).toEqual([
+      { file: 'src/bot/utils/node_modules_paths.ts', why: text },
+      { file: 'src/node_modules.ts', why: text },
+      { file: 'src/old.ts', why: 'moved to src/node_modules.ts: nothing is left to mutate' },
+    ]);
     for (const file of ['src/a.mts', 'src/a.cts']) expect(holdsDataRoute(file, "export const root = <string>(process.env.ROOT || '/data');"), file).toBe(true);
   });
 

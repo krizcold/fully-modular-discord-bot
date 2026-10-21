@@ -53,14 +53,15 @@ From the bot root, with Node 22.12 or newer (or SMDB_TEST_NODE set, as for `npm 
   path matches itself as Stryker matches it), so `( ) ! + @` in a name are taken unless they make an extglob such as
   `+(x)` or `@(x)`, and `[id].ts` or `a{1,2}.ts` is not.
 - `--concurrency N` sets pass A's parallel runs (default: half the cores): up to N test commands at once, and two at
-  N = 1, since Stryker hands the type checker's slot to a test runner once checking ends. Pass B uses half of N, at
-  least one.
+  N = 1, since Stryker hands the type checker's slot to a test runner once checking ends. Pass B runs one at a time,
+  as the reruns do: Stryker builds each run's budget from the pass's run with no mutant, made alone, and a hang in
+  pass B counts against its mutant with no rerun to clear it, so the runs it judges are made the same way.
 - `--keep` keeps the sandboxes in `.stryker-tmp/` for a look after the run. Without it every sandbox is removed, a
   failed pass's too, unless the run is interrupted: Stryker then exits at once and leaves that pass's sandbox (and,
   in pass A, `.stryker-tmp/tsconfig.l5-<pid>.json`), which is safe to delete (its node_modules are links, which a
   delete removes and does not follow) and which no later run reads. A signal or kill that reaches the gate's process
   alone (`kill <pid>`, `taskkill /F` without `/T`) also leaves the test commands it was running going, with nothing to
-  bound them: as many as pass A or pass B runs at once (above), each a runner.mjs and the vitest under
+  bound them: as many as pass A runs at once (above), each a runner.mjs and the vitest under
   it. End each of those trees: find them by `runner.mjs` in their command line (on Windows the shell above each is
   already gone, and ending a runner.mjs ends the Node processes under it). On POSIX, when the gate relaunched itself
   under SMDB_TEST_NODE (two touched.mjs processes are listed), a kill of the first alone leaves the relaunched one
@@ -75,7 +76,7 @@ From the bot root, with Node 22.12 or newer (or SMDB_TEST_NODE set, as for `npm 
   does not match itself read as a glob, as Stryker reads it (a `[ ]` class, a `{ }` with a comma or a range, an extglob
   such as `+( )`, or one minimatch cannot read: Stryker then matches no file to mutate), the checkout's path, as given
   or as its real path, holds the text node_modules anywhere (vitest's related runs drop every import under such a path,
-  so no fast or integration test would meet a mutant, only pass B's child tier, which runs whole), .stryker-tmp
+  so no fast or integration test would meet a mutant), .stryker-tmp
   could not be made, git could not list the tree,
   or the report itself could not be written; every `Verdict:` line goes to
   stdout, and the gate exits only once stdout has taken the whole report) or a usage error. A mutant id left in the shell (`__STRYKER_ACTIVE_MUTANT__`)
@@ -170,7 +171,9 @@ does not name by its content.
   with nothing changed); and it names one that is gone as
   deleted, unless skip-worktree left it out (a sparse checkout) or the base never held it (a new file staged, then
   taken off the disk).
-- Not mutated, and named in the report with the reason: files outside src (the root scripts, updaters/, tests, docs and
+- Not mutated, and named in the report with the reason (a changed file is judged by git's name and by its name on disk,
+  which differ after a rename by case outside git: adding such a rename keeps git's old case, git mv records the new
+  one): files outside src (the root scripts, updaters/, tests, docs and
   images), files that are not code (code is `.ts`, `.tsx`, `.mts`, `.cts`, `.js`, `.cjs` and `.mjs`), declaration files
   (`.d.ts`, `.d.mts`, `.d.cts`), the browser views under src/webui/public (copied into dist, never
   compiled, and no test loads them yet), a file under a node_modules dir in src (git ignores such a dir, but a file there is in the tree whenever the index
@@ -329,7 +332,8 @@ does not name by its content.
      budget is four times that file's own run with no mutant, plus an hour, plus Stryker's overhead, above anything
      vitest's own limits let the file take after its first failure, so a rerun that fails always leaves its report.
    - A timeout in pass B or in a b2 rerun counts against its mutant (hung, never a kill) with no run after it to
-     clear it, so it stands on the budget Stryker built from that pass's own run with no mutant. When a run there
+     clear it, so it stands on the budget Stryker built from that pass's own run with no mutant, made alone as each
+     of the pass's runs is (both run one at a time). When a run there
      timed out, that pass's time is checked as the reruns' is below (Stryker's own time against the run's monotonic
      one): where the clock of Stryker's process stepped during that run, every budget there was wrong (a step back can
      make it negative), so the gate ends NO RESULT naming the pass rather than count its mutants hung, and it does
@@ -418,9 +422,8 @@ mutant: a property that fails in a mutant's run fails for the mutant. A pass A k
 can fail by chance there still credits a kill: one random in another way (its own Math.random, the clock), one that
 fails for the machine in a way the list above does not hold, and one that uses a fixed port or path, since every mutant's run in pass A shares one sandbox and one temp dir: a run beside it
 can hold the port or the path, and a run before it can leave the path behind. Fast tests use mkdtemp and port 0. No
-`--concurrency` rules out a run beside a pass A run (pass A runs two at 1, above); only the reruns alone (a2, b2) and
-the runs with no mutant after them run one at a time, and so do the unchecked pass A runs at 1 and pass B below 4
-(it runs half of `--concurrency`, at least one).
+`--concurrency` rules out a run beside a pass A run (pass A runs two at 1, above); only pass B, the reruns alone (a2,
+b2) and the runs with no mutant after them run one at a time, and so do the unchecked pass A runs at 1.
 
 ## The report
 

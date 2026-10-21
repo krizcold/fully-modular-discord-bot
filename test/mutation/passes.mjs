@@ -24,7 +24,9 @@ const BUILD = { buildCommand: 'node test/helpers/build.cjs', checkers: [], dryRu
 export const PASSES = {
   a: { checkers: ['typescript'], timeoutMS: 10_000, timeoutFactor: 2 },
   a2: { checkers: [], concurrency: 1, timeoutMS: 60_000, timeoutFactor: 4 },
-  b: { ...BUILD, timeoutMS: 60_000, timeoutFactor: 2 },
+  // One at a time, as its run with no mutant is made: Stryker builds each run's
+  // budget from that run, and a hang in pass B stands with no rerun to clear it.
+  b: { ...BUILD, concurrency: 1, timeoutMS: 60_000, timeoutFactor: 2 },
   // A pass B failure rerun with one file: an hour is above anything vitest's own
   // limits let that file take after its first failure (the rest of a child
   // test, then its hooks), so a rerun that fails always leaves its report.

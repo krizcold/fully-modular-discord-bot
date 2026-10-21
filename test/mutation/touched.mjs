@@ -100,7 +100,7 @@ if (!rootGlobFree(root)) {
   process.exit(2);
 }
 if (!rootRelatable(root)) {
-  console.log(`Verdict: NO RESULT (the checkout's path, ${posix(root)}, holds the text node_modules, as given or as its real path, and vitest's related runs drop every import under such a path, so no test of the fast or integration tier would meet a mutant, and only pass B's child tier would; move the checkout)`);
+  console.log(`Verdict: NO RESULT (the checkout's path, ${posix(root)}, holds the text node_modules, as given or as its real path, and vitest's related runs drop every import under such a path, so no test of the fast or integration tier would meet a mutant; move the checkout)`);
   process.exit(2);
 }
 // The sandboxes' dir ignores itself, so git status stays clean, from the first
@@ -541,7 +541,7 @@ try {
   const forB = toPassB(mutants);
   if (forB.length > 0) {
     console.log(`L5: pass B (integration tests that import the mutated files, then every child scenario) on ${forB.length} survivor(s)`);
-    await passOn('b', 'b', 'b', forB, { ...PASSES.b, concurrency: Math.max(1, Math.floor(opts.concurrency / 2)) });
+    await passOn('b', 'b', 'b', forB, PASSES.b);
     const confirmB = toConfirm(mutants, 'b');
     const killers = byKiller(confirmB);
     let group = 0;

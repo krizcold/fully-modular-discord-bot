@@ -304,26 +304,32 @@ describe('the tree fingerprint', () => {
     expect(fs.existsSync(path.join(copy, '.stryker-tmp'))).toBe(false);
   });
 
-  it('refuses, exit 2, a --mutate file that exists but cannot be read, rather than crash', { timeout: 180_000 }, () => {
+  it('refuses, exit 2, a --mutate file that exists but cannot be read, rather than crash', () => {
     const copy = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-unread-'));
     copyGate(copy);
     const unlink = linkPackages(copy);
     const file = path.join(copy, 'src', 'x.ts');
+    const user = os.userInfo().username;
+    onTestFinished(() => {
+      try {
+        if (process.platform === 'win32') execFileSync('icacls', [file, '/remove:d', user], { stdio: 'ignore' });
+        else fs.chmodSync(file, 0o644);
+      } finally {
+        unlink();
+        fs.rmSync(copy, { recursive: true, force: true });
+      }
+    });
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.writeFileSync(file, 'export const x = 1;\n');
-    const user = os.userInfo().username;
     // Read denied to this user: a deny-read ACL on Windows, mode 000 elsewhere (CI runs as a user, not root).
     if (process.platform === 'win32') execFileSync('icacls', [file, '/deny', `${user}:(RD)`], { stdio: 'ignore' });
     else fs.chmodSync(file, 0);
-    onTestFinished(() => {
-      if (process.platform === 'win32') execFileSync('icacls', [file, '/remove:d', user], { stdio: 'ignore' });
-      else fs.chmodSync(file, 0o644);
-      unlink();
-      fs.rmSync(copy, { recursive: true, force: true });
-    });
     expect(() => fs.readFileSync(file)).toThrow();
+    // The bot root's rule, or git lists the packages through their links and the gate's tree print reads them all.
+    fs.writeFileSync(path.join(copy, '.gitignore'), 'node_modules/\n');
     execFileSync('git', ['init', '-q'], { cwd: copy });
-    const run = spawnSync(process.execPath, [path.join(copy, 'test', 'mutation', 'touched.mjs'), '--mutate', 'src/x.ts'], { cwd: copy, encoding: 'utf8', timeout: 150_000 });
+    expect(execFileSync('git', ['ls-files', '--others', '--exclude-standard'], { cwd: copy, encoding: 'utf8' })).not.toContain('node_modules');
+    const run = spawnSync(process.execPath, [path.join(copy, 'test', 'mutation', 'touched.mjs'), '--mutate', 'src/x.ts'], { cwd: copy, encoding: 'utf8' });
     expect(run.status, run.stderr).toBe(2);
     expect(run.stderr).toMatch(/^--mutate cannot take src\/x\.ts: it could not be read \(E[A-Z]+\)$/m);
   });
@@ -482,6 +488,14 @@ describe('the Stryker options', () => {
       expect(options.mutator?.excludedMutations ?? [], name).toEqual([]);
       expect(options.buildCommand, name).toBe('buildCommand' in pass ? pass.buildCommand : undefined);
     }
+  });
+
+  it('run pass B and the reruns one at a time, as their runs with no mutant are, since no rerun clears a hang there', async () => {
+    const { PASSES } = await import('../mutation/passes.mjs');
+    for (const name of ['a2', 'b', 'b2'] as const) expect(PASSES[name].concurrency, name).toBe(1);
+    const gate = fs.readFileSync(path.join(root, 'test', 'mutation', 'touched.mjs'), 'utf8');
+    expect(gate).toContain("await passOn('b', 'b', 'b', forB, PASSES.b);");
+    expect(gate).toContain("await passOn('b2', `b2-${group}`, 'b', on, PASSES.b2, [killer]);");
   });
 });
 
