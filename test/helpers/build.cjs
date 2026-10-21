@@ -1,7 +1,8 @@
 // Builds dist the way `npm run build` does (tsc, then the copy-assets step
 // written in Node so it also runs on Windows and without a shell) and stamps
-// it with a hash of what it was built from (src, tsconfig.json, this file, the
-// typescript version) and of what dist then holds. With --if-stale it builds
+// it with a hash of what it was built from (src, its links followed as tsc
+// follows them, tsconfig.json, this file, the typescript version) and of what
+// dist then holds. With --if-stale it builds
 // only when either hash no longer matches, so a dist that another build, a
 // branch switch or a hand edit changed is rebuilt. A lock in dist keeps two
 // runs in one checkout from building over each other. The child tier's
@@ -18,16 +19,25 @@ const STAMP = '.smdb-build.json';
 const LOCK = '.build-lock';
 
 /**
+ * The files under dir. Given `seen` (the real paths of the dirs walked), it
+ * follows links as tsc does, leaving out a broken one and a dir already walked.
  * @param {string} dir
+ * @param {Set<string>} [seen]
  * @returns {string[]}
  */
-function filesUnder(dir) {
+function filesUnder(dir, seen) {
   /** @type {string[]} */
   const out = [];
+  if (seen) {
+    const real = fs.realpathSync(dir);
+    if (seen.has(real)) return out;
+    seen.add(real);
+  }
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
     const full = path.join(dir, entry.name);
-    if (entry.isDirectory()) out.push(...filesUnder(full));
-    else if (entry.isFile()) out.push(full);
+    const kind = seen && entry.isSymbolicLink() ? fs.statSync(full, { throwIfNoEntry: false }) : entry;
+    if (kind?.isDirectory()) out.push(...filesUnder(full, seen));
+    else if (kind?.isFile()) out.push(full);
   }
   return out;
 }
@@ -58,7 +68,7 @@ function typescriptVersion(root) {
 
 /** @param {string} root */
 function sourceFiles(root) {
-  return [...filesUnder(path.join(root, 'src')), path.join(root, 'tsconfig.json'), __filename];
+  return [...filesUnder(path.join(root, 'src'), new Set()), path.join(root, 'tsconfig.json'), __filename];
 }
 
 /** @param {string} root */

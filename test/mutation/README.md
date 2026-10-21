@@ -305,10 +305,11 @@ does not name by its content.
    scenarios start real processes on that dist. A child sees the mutant through the env. Stryker makes every mutant a
    span holds, so a survivor that spans lines brings in the mutants nested inside it; in pass B and every rerun those
    run no test (targets.mjs gives the runner the ids the pass is for) and their results are dropped.
-3. **Reruns alone.** Every run stops at its first failure, and takes its tiers in turn (fast, then integration, then
-   child) and each tier's files larger first, never in an order earlier runs chose (`--no-cache`: every sandbox links
-   the one results cache in test/node_modules, which vitest would read to take a file that failed or ran long before
-   first). A rerun runs one mutant at a time and gives the config's
+3. **Reruns alone.** Every run stops at its first failed test (a file that fails at load or in a beforeAll or
+   afterAll fails without stopping it), and takes its tiers in turn (fast, then integration, then child), each in
+   vitest's own order, never in one earlier runs chose (`--no-cache`: every sandbox links the one results cache in
+   test/node_modules, which vitest would read to take a file that failed or ran long before first). A rerun runs one
+   mutant at a time and gives the config's
    limit for each test and hook, and a child scenario step's default bound, four times their time (a limit a test,
    hook or step sets itself is not scaled), and Stryker a larger budget for the whole run.
    - A gating mutant that timed out in pass A, or whose run there failed only on the machine's texts (below), reruns
@@ -319,16 +320,18 @@ does not name by its content.
      much in all counts as killed; each confirmed timeout is listed with its replacement, to check. One that survives
      the rerun goes on to pass B.
    - In pass B, where containers and children can be slow or fail on their own, a hang never counts: a mutant that
-     only hangs a test there is inconclusive, and so is one that hangs a file taken before the file that would kill it
-     (an earlier tier's file, or a larger one of the same tier, above). A test that waits must bound its wait and
-     fail, as a child scenario step
+     only hangs a test there is inconclusive, and so is one that hangs a test run before the one that would kill it
+     (in the order above). A test that waits must bound its wait and fail, as a child scenario step
      does ("did not finish in N ms" is a failure, not a hang). A child test's own limit is fifteen steps' bounds, so in
      a test of up to fourteen steps a hung step fails by its bound first. Stryker's budget for a pass B run is twice
      its run with no mutant plus a minute. While that run takes under a minute, the budget is below vitest's limit on a
      hook, so a run that fails a test and then waits in an afterAll past the budget (a `pool.end()` held by a client
      still checked out) counts as a hang too; past a minute, vitest's limit can end the afterAll first, and the failed
-     test counts as a kill. Either way an afterAll must bound its waits as a test does (the suite's own end their pools
-     through helpers/endPool.ts).
+     test counts as a kill. A beforeAll that waits is the same: while that run takes under a minute the budget ends
+     it, a hang; past a minute, vitest's limit can end it first, its file's tests are skipped and the run goes on to
+     the next file. Either way
+     a hook must bound its waits as a test does (the suite's own afterAll hooks end their pools through
+     helpers/endPool.ts).
    - A gating kill of pass B, or a run there that failed only on the machine's texts, reruns with the one test file
      that failed, alone (one rerun per such file), so no other file's order or hang can decide it (vitest takes the
      name as part of a path, ignoring case, so a test file whose path holds it runs too). It counts only when
@@ -493,7 +496,8 @@ child away from anything real:
   one sits under this root's dist.
 
 The child tier's globalSetup runs build.cjs `--if-stale`: it rebuilds dist unless the stamp matches both what dist was
-built from (src, tsconfig.json, build.cjs, the typescript version) and what dist holds now, so a dist that another
+built from (src, its links followed as tsc follows them, tsconfig.json, build.cjs, the typescript version) and what
+dist holds now, so a dist that another
 build, a branch switch or a hand edit changed is rebuilt. The source is hashed before the build, and its files' sizes
 and write times are checked after it, so an edit saved meanwhile, even one undone again (a stash, then a pop), fails the
 build unstamped. A fresh dist is seen without taking the lock. The lock, `dist/.build-lock`, is a file that holds its

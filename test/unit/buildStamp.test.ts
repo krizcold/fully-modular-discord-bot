@@ -51,6 +51,24 @@ describe('the dist stamp', () => {
     fs.writeFileSync(path.join(ts, 'package.json'), '{ "version": "7.0.0" }\n');
     expect(builder.isFresh(root)).toBe(false);
   });
+
+  it('goes stale when a file src reaches through a link changes, as tsc compiles it', () => {
+    const root = fakeRoot();
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-linked-src-'));
+    onTestFinished(() => fs.rmSync(outside, { recursive: true, force: true }));
+    fs.writeFileSync(path.join(outside, 'b.ts'), 'export const b = 1;\n');
+    // A junction on Windows, a dir symlink elsewhere; a link back to src and a broken one are walked past.
+    const links = [[outside, 'linked'], [path.join(root, 'src'), 'loop'], [path.join(outside, 'gone'), 'broken']];
+    try {
+      for (const [target, name] of links) fs.symlinkSync(target, path.join(root, 'src', name), 'junction');
+      builder.writeStamp(root, builder.sourceHash(root));
+      expect(builder.isFresh(root)).toBe(true);
+      fs.writeFileSync(path.join(outside, 'b.ts'), 'export const b = 2;\n');
+      expect(builder.isFresh(root)).toBe(false);
+    } finally {
+      for (const [, name] of links) fs.rmSync(path.join(root, 'src', name), { force: true });
+    }
+  });
 });
 
 describe('the build lock', () => {

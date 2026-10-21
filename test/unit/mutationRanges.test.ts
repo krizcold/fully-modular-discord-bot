@@ -463,6 +463,16 @@ describe('the change', () => {
     two.git(['mv', 'src/x.ts', 'tools/x.ts']);
     expect(two.plan().emptyScope).toBe(false);
   });
+
+  it('diffs a file only taken out of the index that git pairs with a near copy staged as a rename, and keeps the rename', () => {
+    const { git, write, plan } = repoWith({ 'src/a.ts': text(lines('a', 20)) });
+    write('src/b.ts', text(lines('a', 20).map((line, i) => (i === 3 ? line.replace('= ', '= 100 + ') : line))));
+    git(['add', 'src/b.ts']);
+    git(['rm', '--cached', '-q', 'src/a.ts']);
+    const { targets, skipped } = plan();
+    expect(targets.map(t => [t.file, t.gating])).toEqual([['src/b.ts', [4]]]);
+    expect(skipped).toEqual([{ file: 'src/a.ts', why: NO_CODE_WHY }]);
+  });
   it('counts a copy beside an edited line, and a repeated head or tail of the lines added, in every place it could sit', () => {
     const block = ['  if (queue.length > 0) {', '    handle(queue.shift());', '  }'];
     const drain = (first: string, blocks: number) =>
@@ -1667,6 +1677,10 @@ describe('the targets', () => {
       { file: 'src/kept.ts', why: NO_CODE_WHY },
       { file: 'src/gone.ts', why: 'deleted: nothing is left to mutate' },
     ]);
+    // ... and so is one git pairs with an added file as a rename; the rename stays one, as the index holds it.
+    const renamed = planOf([{ status: 'R', from: 'src/old.ts', file: 'src/new.ts' }], ['src/old.ts'], { 'src/old.ts': changedAt(SAMPLE, 4), 'src/new.ts': SAMPLE });
+    expect(renamed.targets).toEqual([changeTarget('src/new.ts', SAMPLE, { changed: [4], deletedAfter: [] })]);
+    expect(renamed.skipped).toEqual([{ file: 'src/old.ts', why: NO_CODE_WHY }]);
   });
 
   it('answers for every line a whole file or a pattern covers, and for the changed lines of a diff', () => {

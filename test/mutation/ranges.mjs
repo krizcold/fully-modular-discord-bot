@@ -653,10 +653,14 @@ export function mutatePatterns(targets) {
  * @returns {{ targets: Target[], skipped: { file: string, why: string }[], emptyScope: boolean }}
  */
 export function planChange({ entries, untracked, read, readBase, nameOf, linkOf: linkedTo = () => undefined, isDir = () => false }) {
-  // A file only taken out of the index (git rm --cached) is deleted to git and
-  // untracked on disk: it is the base's file still, diffed as a changed one.
-  const unindexed = new Set(entries.filter(entry => entry.status === 'D' && untracked.includes(entry.file)).map(entry => entry.file));
-  entries = entries.map(entry => (entry.status === 'D' && unindexed.has(entry.file) ? { status: 'M', file: entry.file } : entry));
+  // A file only taken out of the index (git rm --cached) is untracked on disk
+  // and, to git, deleted or the old name of a rename it paired with an added
+  // file: it is the base's file still, diffed as a changed one, and the rename
+  // stays a rename, as the index holds it.
+  const unindexed = new Set(entries.map(entry => (entry.status === 'D' ? entry.file : entry.status === 'R' ? entry.from : undefined))
+    .filter(file => file !== undefined && untracked.includes(file)));
+  entries = entries.flatMap(entry => (entry.status === 'D' && unindexed.has(entry.file) ? [{ status: 'M', file: entry.file }]
+    : entry.status === 'R' && entry.from !== undefined && unindexed.has(entry.from) ? [entry, { status: 'M', file: entry.from }] : [entry]));
   untracked = untracked.filter(file => !unindexed.has(file));
   /** @type {Target[]} */
   const targets = [];
@@ -668,7 +672,7 @@ export function planChange({ entries, untracked, read, readBase, nameOf, linkOf:
     /** @param {string} file @param {string} why */
     const refuse = (file, why) => {
       skipped.push({ file, why });
-      if (entry.from !== undefined && notMutated(entry.from) === null) skipped.push({ file: entry.from, why: `moved to ${file}: nothing is left to mutate` });
+      if (entry.from !== undefined && !unindexed.has(entry.from) && notMutated(entry.from) === null) skipped.push({ file: entry.from, why: `moved to ${file}: nothing is left to mutate` });
     };
     const why = notMutated(entry.file);
     if (why) { refuse(entry.file, why); continue; }
