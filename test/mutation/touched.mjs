@@ -100,7 +100,7 @@ if (!rootGlobFree(root)) {
   process.exit(2);
 }
 if (!rootRelatable(root)) {
-  console.log(`Verdict: NO RESULT (the checkout's path, ${posix(root)}, holds the text node_modules, as given or as its real path, and vitest's related runs drop every import under such a path, so no test would meet a mutant and every one would survive; move the checkout)`);
+  console.log(`Verdict: NO RESULT (the checkout's path, ${posix(root)}, holds the text node_modules, as given or as its real path, and vitest's related runs drop every import under such a path, so no test of the fast or integration tier would meet a mutant, and only pass B's child tier would; move the checkout)`);
   process.exit(2);
 }
 // The sandboxes' dir ignores itself, so git status stays clean, from the first
@@ -146,7 +146,13 @@ opts.mutate = opts.mutate.map(pattern => {
     console.error(`--mutate takes a file in the bot root that exists, or such a file and lines, never a glob: ${pattern}\n${USAGE}`);
     process.exit(2);
   }
-  const text = fs.readFileSync(path.join(root, name), 'utf8');
+  let text = '';
+  try {
+    text = fs.readFileSync(path.join(root, name), 'utf8');
+  } catch (error) {
+    console.error(`--mutate cannot take ${name}: it could not be read (${/** @type {NodeJS.ErrnoException} */ (error).code ?? firstLine(error)})`);
+    process.exit(2);
+  }
   inTree ??= ownNames(root, planned.keys());
   const why = !strykerTakes(root, name) ? GLOB_NAME_WHY : holdsExtraBreak(text) ? EXTRA_BREAK_WHY : holdsDataRoute(name, text) ? DATA_ROUTE_WHY : notMutated(name)
     ?? (inTree.has(name) ? null : 'git neither tracks it nor would add it (it is ignored, or inside a submodule or an untracked repository), so no sandbox holds it');

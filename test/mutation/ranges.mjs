@@ -40,6 +40,7 @@ export function notMutated(file) {
   if (file.startsWith(VIEWS)) return 'a browser view: copied into dist, never compiled, and no test loads it';
   if (DECLARATION.test(file) || !CODE.test(file)) return 'not code';
   if (file.split('/').includes('node_modules')) return 'under a node_modules dir, which Stryker links into a sandbox and never copies, so no mutant can be made in it';
+  if (file.includes('node_modules')) return "its path holds the text node_modules, and vitest's related runs drop every import whose path holds it, so no test of the fast or integration tier would reach its mutants; rename it";
   return null;
 }
 
@@ -241,7 +242,7 @@ export function lineDiff(before, after, file = 'a.ts', baseFile = file) {
     if (j1 === j0 && count(codeOut, i0, i1) > 0) {
       // Taken out only: the same, for the places in `after` where it could have been.
       const taken = new Set(a.slice(i0, i1));
-      for (let t = 1; i0 - t >= 0 && partner[i0 - t] === j0 - t && taken.has(a[i0 - t]); t++) deletedAfter.add(j0 - t);
+      for (let t = 1; i0 - t >= 0 && j0 - t >= 0 && partner[i0 - t] === j0 - t && taken.has(a[i0 - t]); t++) deletedAfter.add(j0 - t);
       for (let t = 0; i1 + t < a.length && partner[i1 + t] === j0 + t && taken.has(a[i1 + t]); t++) deletedAfter.add(j0 + t + 1);
     }
     pi = i;
@@ -898,8 +899,10 @@ export const rootGlobFree = root => strykerTakes(root, 'package.json');
  * Whether vitest's related runs can find a test from the bot root: vitest 5
  * drops every import whose path holds the text node_modules anywhere, not only
  * as a dir of its own, and a sandbox's files lie under the root's path, so under
- * such a path no test would meet a mutant and every one would survive. Read on
- * the path as given and on the real path, which vitest resolves imports to.
+ * such a path no test of the fast or integration tier would meet a mutant (only
+ * pass B's child tier, which runs whole, would). Read on the path as given and
+ * on the real path, which vitest resolves imports to. A src file whose own path
+ * holds the text is not mutated (notMutated), for the same reason.
  * @param {string} root
  */
 export function rootRelatable(root) {

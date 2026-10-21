@@ -1,4 +1,4 @@
-import { spawnSync } from 'child_process';
+import { execFileSync, spawnSync } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -287,6 +287,45 @@ describe('the tree fingerprint', () => {
     expect(run.status, run.stderr).toBe(2);
     expect(run.stdout).toMatch(/^Verdict: NO RESULT \(the checkout's path, .*\/bot \[old\], does not match itself read as a glob, as Stryker reads it: /m);
     expect(fs.existsSync(path.join(copy, '.stryker-tmp'))).toBe(false);
+  });
+
+  it('ends the gate NO RESULT, exit 2, naming the path, in a checkout whose path holds the text node_modules', () => {
+    const outer = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-nmroot-'));
+    const copy = path.join(outer, 'node_modules_old', 'bot');
+    copyGate(copy);
+    const unlink = linkPackages(copy);
+    onTestFinished(() => {
+      unlink();
+      fs.rmSync(outer, { recursive: true, force: true });
+    });
+    const run = spawnSync(process.execPath, [path.join(copy, 'test', 'mutation', 'touched.mjs')], { cwd: copy, encoding: 'utf8' });
+    expect(run.status, run.stderr).toBe(2);
+    expect(run.stdout).toMatch(/^Verdict: NO RESULT \(the checkout's path, .*\/node_modules_old\/bot, holds the text node_modules, as given or as its real path, /m);
+    expect(fs.existsSync(path.join(copy, '.stryker-tmp'))).toBe(false);
+  });
+
+  it('refuses, exit 2, a --mutate file that exists but cannot be read, rather than crash', { timeout: 180_000 }, () => {
+    const copy = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-unread-'));
+    copyGate(copy);
+    const unlink = linkPackages(copy);
+    const file = path.join(copy, 'src', 'x.ts');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, 'export const x = 1;\n');
+    const user = os.userInfo().username;
+    // Read denied to this user: a deny-read ACL on Windows, mode 000 elsewhere (CI runs as a user, not root).
+    if (process.platform === 'win32') execFileSync('icacls', [file, '/deny', `${user}:(RD)`], { stdio: 'ignore' });
+    else fs.chmodSync(file, 0);
+    onTestFinished(() => {
+      if (process.platform === 'win32') execFileSync('icacls', [file, '/remove:d', user], { stdio: 'ignore' });
+      else fs.chmodSync(file, 0o644);
+      unlink();
+      fs.rmSync(copy, { recursive: true, force: true });
+    });
+    expect(() => fs.readFileSync(file)).toThrow();
+    execFileSync('git', ['init', '-q'], { cwd: copy });
+    const run = spawnSync(process.execPath, [path.join(copy, 'test', 'mutation', 'touched.mjs'), '--mutate', 'src/x.ts'], { cwd: copy, encoding: 'utf8', timeout: 150_000 });
+    expect(run.status, run.stderr).toBe(2);
+    expect(run.stderr).toMatch(/^--mutate cannot take src\/x\.ts: it could not be read \(E[A-Z]+\)$/m);
   });
 
   it('ends the gate NO RESULT, exit 2, when test/node_modules is a link, before it loads a package through it, and says to remove the link first', () => {

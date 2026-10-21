@@ -329,8 +329,14 @@ describe('the change', () => {
         if (!same(b.slice(0, q), a.slice(0, q)) || !same(b.slice(q + r), a.slice(q))) continue;
         expect(back).toContain(q);
       }
+      expect(back.every(place => place >= 0)).toBe(true);
       expect(deletedAfter).toEqual([]);
     }), { numRuns: 500 });
+  });
+
+  it('never names a place above the top for code taken out, where the walk up passes a line it does not keep', () => {
+    expect(lineDiff(['p', 'q', 'p', 'q', 'p', 's'].join('\n'), ['q', 's'].join('\n')).deletedAfter).toEqual([0, 1]);
+    expect(lineDiff(['p', 'q', 'r', 'p', 'q', 'r', 'p', 's'].join('\n'), ['q', 'r', 's'].join('\n')).deletedAfter).toEqual([0, 1, 2]);
   });
 
   it("reads git's names, a rename's two included", () => {
@@ -1584,9 +1590,12 @@ describe('the targets', () => {
     // A TypeScript module named for its output's format is code, its declarations are not, and it is read as TypeScript.
     for (const file of ['src/a.mts', 'src/a.cts', 'src/a.tsx']) expect(notMutated(file), file).toBeNull();
     for (const file of ['src/a.d.mts', 'src/a.d.cts', 'src/a.d.ts']) expect(notMutated(file), file).toBe('not code');
-    // Stryker links a node_modules dir into a sandbox and never copies it; a name that only starts so is code.
+    // Stryker links a node_modules dir into a sandbox and never copies it; and vitest's related runs drop an import whose
+    // path holds the text anywhere, so a name that only holds it is named too.
     expect(notMutated('src/vend/node_modules/a.ts')).toBe('under a node_modules dir, which Stryker links into a sandbox and never copies, so no mutant can be made in it');
-    expect(notMutated('src/node_modules.ts')).toBeNull();
+    const text = "its path holds the text node_modules, and vitest's related runs drop every import whose path holds it, so no test of the fast or integration tier would reach its mutants; rename it";
+    for (const file of ['src/node_modules.ts', 'src/bot/utils/node_modules_paths.ts', 'src/node_modules_cache/x.ts']) expect(notMutated(file), file).toBe(text);
+    expect(notMutated('src/Node_Modules.ts')).toBeNull();
     for (const file of ['src/a.mts', 'src/a.cts']) expect(holdsDataRoute(file, "export const root = <string>(process.env.ROOT || '/data');"), file).toBe(true);
   });
 

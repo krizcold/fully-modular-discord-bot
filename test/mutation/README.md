@@ -75,7 +75,8 @@ From the bot root, with Node 22.12 or newer (or SMDB_TEST_NODE set, as for `npm 
   does not match itself read as a glob, as Stryker reads it (a `[ ]` class, a `{ }` with a comma or a range, an extglob
   such as `+( )`, or one minimatch cannot read: Stryker then matches no file to mutate), the checkout's path, as given
   or as its real path, holds the text node_modules anywhere (vitest's related runs drop every import under such a path,
-  so no test would meet a mutant), .stryker-tmp could not be made, git could not list the tree,
+  so no fast or integration test would meet a mutant, only pass B's child tier, which runs whole), .stryker-tmp
+  could not be made, git could not list the tree,
   or the report itself could not be written; every `Verdict:` line goes to
   stdout, and the gate exits only once stdout has taken the whole report) or a usage error. A mutant id left in the shell (`__STRYKER_ACTIVE_MUTANT__`)
   is ignored. Any other code means the run was interrupted. Trust 0 and 1 only after the report's `Verdict:` line: a process
@@ -174,7 +175,9 @@ does not name by its content.
   (`.d.ts`, `.d.mts`, `.d.cts`), the browser views under src/webui/public (copied into dist, never
   compiled, and no test loads them yet), a file under a node_modules dir in src (git ignores such a dir, but a file there is in the tree whenever the index
   holds it: added with -f, moved in with git mv, tracked before the rule, or let in by a deeper .gitignore that lifts
-  it; Stryker links such a dir into a sandbox and never copies it), a file deleted or moved out of src,
+  it; Stryker links such a dir into a sandbox and never copies it), a file whose path only holds the text node_modules
+  (`src/node_modules_paths.ts`; vitest's related runs drop every import whose path holds it, so no fast or integration
+  test would reach its mutants; rename it), a file deleted or moved out of src,
   an untracked git repository (git lists
   none of its files, and none is copied into a sandbox) or a git submodule under src, a file whose name Stryker would read as a glob (`[id].ts`,
   `a{1,2}.ts`; rename it), a name that leads through a link, as the disk tells it (a link in src, one that differs
@@ -289,7 +292,8 @@ does not name by its content.
    only (each file a target can gate in: not a changed file it does not mutate, nor one where code was only taken out
    or only comments changed), and where it runs related tests (pass A, its run with no checker, a2 and the run after
    it, pass B's integration tier) only tests that import one of them, directly or through other files, run: by an ES
-   import or an `import()` of a written-out name. A test that reaches them any other way does not: by any require,
+   import or an `import()` of a written-out name. A test that reaches them any other way does not: through a file
+   whose path holds the text node_modules (vitest drops that import), by any require,
    written out or computed (src's lazy requires), a file read or a child process. Pass B's child tier runs whole; each b2 run runs the one file that failed, and the run after them runs every such file. There is no coverage analysis: every mutant runs those tests. The files go on vitest's
    command line relative to test/; a change of many hundreds of files can pass Windows' limit on a command line, and
    then the run's log says vitest could not start.
