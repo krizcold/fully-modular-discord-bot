@@ -151,9 +151,11 @@ does not name by its content.
   header's `{`, a closer with code of its own such as `} while (x);` or `}).catch(log);`), and one holding an `else`,
   `case`, `default` (in a switch), `catch` or `finally`, so a reviewer checks the lines beside each; a block taken
   away (its header and bracket deleted) is named with the places code was taken out when fewer lines of code are put
-  back there. Not named: a block taken away where as many or more lines of code are put back, and a line moved into or out of a
-  braceless body (an `if (x)` with no brace put above a line, or lines swapped below one); a reviewer reads each
-  changed braceless header for these.
+  back there. Not named: a block taken away where as many or more lines of code are put back, a line moved into or
+  out of a braceless body (an `if (x)` with no brace put above a line, or lines swapped below one), and a changed
+  line that gains or loses its ending `;` where the next line starts with `(`, `[`, a backtick, `+`, `-` or `/`, which
+  joins that unchanged line into its statement or splits it out with the same token kinds; a reviewer reads each
+  changed braceless header and each such `;` for these.
 - git does not look at every file: not at one its index marks assume-unchanged or skip-worktree (core.ignoreStat marks
   every file it adds), not at one a file-system monitor says is unchanged, and not at one whose cached size and time
   (and, on Windows, creation time) still hold, so a same-size edit whose time was set back shows in no diff. So the
@@ -252,8 +254,9 @@ does not name by its content.
    takes the root's node_modules' only, as the image's build does, not a node_modules' above the checkout, unless the
    root's tsconfig sets typeRoots of its own. The way on is to pin test/package.json and its lockfile to the root
    lockfile's TypeScript and run `npm run test:install` in a checkout whose test/node_modules is a dir of its own, or
-   to run `npm ci --install-strategy=hoisted --include=dev` at the root of one whose node_modules is (remove a link
-   itself first, never what it names: either command run through a link writes the other checkout's install). The
+   to run `npm ci --install-strategy=hoisted --include=dev` at the root of one whose node_modules is. While either
+   dir is a link, remove the link itself first, never what it names: any npm command that changes packages run
+   through a link, the pin's npm install included, writes the other checkout's install. The
    gate reads npm's default layout with the dev packages, whatever a config or `NODE_ENV=production` sets: a linked
    install (`install-strategy=linked`) records links, not versions, and one that omits dev packages lacks them, so
    either always stops. Not seen: a package placed at the root, or a package's files changed, after npm recorded its
@@ -261,7 +264,8 @@ does not name by its content.
    no package's own files; any node_modules
    other than the root's install that TypeScript reads (a mutant only its declarations reject counts as killed): one
    inside the checkout (made by hand in src, which TypeScript takes before the root's for a file below it, and which
-   an image built from a clean checkout never has), and one above the checkout or above the dir the root's
+   an image built from a clean checkout never has while git does not track it; a tracked one ships in that image
+   too, so there the checker agrees with it), and one above the checkout or above the dir the root's
    node_modules links to (in bt1 or hf1, above the main checkout; a stray install in a home dir), which an import or a
    reference the root's install does not satisfy reaches, a `@typescript/lib-*` replacement included, and which the
    image's build never has; and what the image compiles that
@@ -319,7 +323,12 @@ does not name by its content.
      timed out, that pass's time is checked as the reruns' is below (Stryker's own time against the run's monotonic
      one): where the clock of Stryker's process stepped during that run, every budget there was wrong (a step back can
      make it negative), so the gate ends NO RESULT naming the pass rather than count its mutants hung, and it does
-     the same where those times could not be read.
+     the same where those times could not be read. Not seen in time: a forward step (on Linux, a suspend too) during
+     any pass's run with no mutant raises that pass's budget by up to `timeoutFactor` times the step, so a mutant
+     that loops without yielding (vitest's own limit cannot fire in a blocked worker) holds its slot that long before
+     anything reads the clock: pass A and A with no checker never read it (their timeouts rerun in a2), and a2, B and
+     b2 read it only after the whole pass. The verdict stays right; the run can take hours, or never end for a step
+     of days.
    - A mutant the gate never reran (it stopped first) is inconclusive, and so is a survivor of pass A that the stopped
      gate never ran through pass B, and a pass B kill that failed again alone in one b2 run while a later one stopped
      the gate before the run with no mutant after them.
