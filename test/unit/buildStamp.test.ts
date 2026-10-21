@@ -92,6 +92,32 @@ describe('the dist stamp', () => {
       fs.rmSync(link, { force: true });
     }
   });
+
+  it('leaves out .git and node_modules dirs under src, which tsc compiles nothing from, a linked one included', () => {
+    const root = fakeRoot();
+    const clone = path.join(root, 'src', 'clone');
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-linked-src-'));
+    onTestFinished(() => fs.rmSync(outside, { recursive: true, force: true }));
+    for (const dir of ['.git', 'node_modules/pkg', 'Modules']) fs.mkdirSync(path.join(clone, dir), { recursive: true });
+    fs.writeFileSync(path.join(outside, 'c.ts'), 'export const c = 1;\n');
+    const linked = path.join(root, 'src', 'other', 'node_modules');
+    fs.mkdirSync(path.dirname(linked));
+    const kept = path.join(clone, 'Modules', 'x.ts');
+    const ignored = [path.join(clone, '.git', 'FETCH_HEAD'), path.join(clone, 'node_modules', 'pkg', 'b.ts'), path.join(outside, 'c.ts')];
+    try {
+      fs.symlinkSync(outside, linked, 'junction');
+      for (const file of [kept, ...ignored]) fs.writeFileSync(file, 'export const v = 1;\n');
+      builder.writeStamp(root, builder.sourceHash(root));
+      for (const file of ignored) {
+        fs.writeFileSync(file, 'export const v = 2;\n');
+        expect(builder.isFresh(root), file).toBe(true);
+      }
+      fs.writeFileSync(kept, 'export const v = 2;\n');
+      expect(builder.isFresh(root)).toBe(false);
+    } finally {
+      fs.rmSync(linked, { force: true });
+    }
+  });
 });
 
 describe('the build lock', () => {
