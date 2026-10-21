@@ -3,7 +3,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { afterEach, describe, expect, it, onTestFinished, vi } from 'vitest';
-import { pastBudget } from '../mutation/control.mjs';
+import { pastBudget, strykerClock } from '../mutation/control.mjs';
 
 // The command every mutant run executes (mutation/runner.mjs), against a
 // stand-in for vitest that records how it was called and fails the tiers it is
@@ -211,6 +211,29 @@ describe('the run with no mutant after the reruns', () => {
     expect(pastBudget(reruns, out, budget)).toBe(unread);
   });
 
+  it("reads Stryker's clock in pass B and each b2 pass when a run there timed out, since no run after them clears a timeout", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-clock-'));
+    onTestFinished(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const time = (ms: string) => fs.writeFileSync(path.join(dir, 'dry-ms.txt'), ms);
+    const stryker = (timing: unknown) => fs.writeFileSync(path.join(dir, 'dry-timing.json'), JSON.stringify(timing));
+    time('120000');
+    stryker({ net: 119_800, overhead: 3000 });
+    expect(strykerClock(dir)).toEqual({ clock: '', net: 119_800, overhead: 3000 });
+    // The clock stepped back 3 minutes during pass B's 2-minute run with no mutant: each budget, 2 x net + 60 s, is
+    // below zero, so Node fires every run's timer at once. Forward days overflow it the same way.
+    for (const timing of [{ net: -60_000, overhead: 0 }, { net: 1_100_000_000, overhead: 0 }, { net: 120_000, overhead: -1 }]) {
+      stryker(timing);
+      expect(strykerClock(dir).clock, JSON.stringify(timing)).toBe('stepped');
+    }
+    fs.rmSync(path.join(dir, 'dry-ms.txt'));
+    expect(strykerClock(dir).clock).toBe('unread');
+    const gate = fs.readFileSync(path.join(root, 'test', 'mutation', 'touched.mjs'), 'utf8');
+    const check = "if ((name === 'b' || name === 'b2') && on.some(m => m.passes[name]?.status === 'Timeout')) {";
+    expect(gate.split(check).length).toBe(2);
+    expect(gate.indexOf(check)).toBeGreaterThan(gate.indexOf('async function passOn('));
+    expect(gate.slice(gate.indexOf(check)).indexOf('throw new PassError(')).toBeLessThan(gate.slice(gate.indexOf(check)).indexOf('\n}\n'));
+  });
+
 });
 
 describe('the tree fingerprint', () => {
@@ -299,7 +322,7 @@ describe('the tree fingerprint', () => {
     copyGate(copy);
     const run = spawnSync(process.execPath, [path.join(copy, 'test', 'mutation', 'touched.mjs')], { cwd: copy, encoding: 'utf8' });
     expect(run.status, run.stderr).toBe(2);
-    expect(run.stdout).toMatch(/^Verdict: NO RESULT \(the gate could not load: .*; run npm run test:install\)$/m);
+    expect(run.stdout).toMatch(/^Verdict: NO RESULT \(the gate could not load: .*; run npm run test:install, adding -- --include=dev where a config or NODE_ENV=production leaves dev packages out\)$/m);
   });
 
   it('is taken, in the gate, before it reads a file: the --mutate checks and the plan', () => {

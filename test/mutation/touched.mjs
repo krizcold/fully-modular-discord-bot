@@ -10,7 +10,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { pastBudget } from './control.mjs';
+import { pastBudget, strykerClock } from './control.mjs';
 import { PACKAGE_LOCKS, treeChanges, treePrint } from './tree.mjs';
 import { canonicalName, fileOf as nameOf, keyOf } from './keys.mjs';
 import { COMMON, PASSES } from './passes.mjs';
@@ -60,7 +60,7 @@ try {
   ranges = await import('./ranges.mjs');
   verdicts = await import('./verdict.mjs');
 } catch (error) {
-  console.log(`Verdict: NO RESULT (the gate could not load: ${error instanceof Error ? error.message.split('\n')[0] : String(error)}; run npm run test:install)`);
+  console.log(`Verdict: NO RESULT (the gate could not load: ${error instanceof Error ? error.message.split('\n')[0] : String(error)}; run npm run test:install, adding -- --include=dev where a config or NODE_ENV=production leaves dev packages out)`);
   process.exit(2);
 }
 const {
@@ -398,6 +398,21 @@ async function passOn(name, dir, tier, on, extra, only) {
     const r = byKey.get(recordKey(m));
     m.passes[name] = r ? resultOf(dir, r, name === 'a2' || name === 'b2') : { id: null, dir, status: 'Missing' };
   }
+  // A timeout in pass B or a b2 rerun counts against its mutant with no run after it to clear it, so it stands on the
+  // budget Stryker built from that pass's own run with no mutant, which a clock step during that run makes meaningless.
+  if ((name === 'b' || name === 'b2') && on.some(m => m.passes[name]?.status === 'Timeout')) {
+    const { clock } = strykerClock(path.join(reportDir, dir));
+    if (clock) {
+      const why = clock === 'unread'
+        ? `the time of pass ${dir}'s run with no mutant could not be read`
+        : `Stryker's own time for pass ${dir}'s run with no mutant does not match that run's monotonic time, so the clock of Stryker's process stepped and the budget it gave each run there was not what that run took`;
+      for (const m of on) {
+        const result = m.passes[name];
+        if (result) m.passes[name] = { ...result, voided: why };
+      }
+      throw new PassError(`a run in pass ${dir} timed out, but ${why}, so the timeout says nothing of the mutant`);
+    }
+  }
 }
 
 /**
@@ -479,7 +494,7 @@ try {
   const checker = treeTsconfig(root, planned.keys(), '.stryker-tmp');
   const beyond = beyondTree(root, planned.keys(), checker, '.stryker-tmp');
   if (beyond.length > 0) {
-    throw new PassError(`the type checker would judge ${beyond.join(', ')}, which a file in the tree imports or references but no sandbox holds, so a mutant that broke only it would count as killed with no test run; make the tree's file stop importing or referencing it, or add it to the tree if it belongs there`);
+    throw new PassError(`the type checker would judge ${beyond.join(', ')}, which a file in the tree imports or references but no sandbox holds (a file git ignores, or a package in a node_modules above the checkout, which the image's build never has), so a mutant that broke only it, or that only it rejects, would count as killed with no test run; make the tree's file stop importing or referencing it, add it to the tree if it belongs there, or move a node_modules above the checkout away`);
   }
   fs.writeFileSync(path.join(root, checkerConfig), `${JSON.stringify(checker, null, 2)}\n`);
   const resultsA = await pass({ dir: 'a', tier: 'a', mutate: mutatePatterns(mutated()), extra: { ...PASSES.a, concurrency: opts.concurrency, tsconfigFile: checkerConfig } })

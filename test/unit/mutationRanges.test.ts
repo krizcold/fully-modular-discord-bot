@@ -566,7 +566,7 @@ describe('the change', () => {
     expect(errorsOf(path.join(root, '.stryker-tmp', 'tsconfig.l5.json'))).toEqual([]);
   });
 
-  it("gives pass A's type checker the root's @types only, as the image's build reads them, never a dir's above the checkout", () => {
+  it("gives pass A's type checker, of the @types it takes with no import, the root's only, as the image's build does, not a dir's above the checkout", () => {
     const outer = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-types-'));
     onTestFinished(() => fs.rmSync(outer, { recursive: true, force: true }));
     const root = path.join(outer, 'bot');
@@ -616,18 +616,47 @@ describe('the change', () => {
     expect(beyond('/// <reference path="./modulesDev/m.ts" />\nexport const x = 1;\n')).toEqual(['src/modulesDev/m.ts']);
   });
 
+  it("names a package the type checker would read from a node_modules above the checkout, never one of the root's install through a link", () => {
+    const outer = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-above-'));
+    onTestFinished(() => {
+      // The link first, so the removal never walks into the dir it names.
+      fs.rmSync(path.join(outer, 'bot', 'node_modules'), { force: true });
+      fs.rmSync(outer, { recursive: true, force: true });
+    });
+    const root = path.join(outer, 'bot');
+    const put = (file: string, text: string) => {
+      fs.mkdirSync(path.dirname(path.join(outer, file)), { recursive: true });
+      fs.writeFileSync(path.join(outer, file), text);
+    };
+    put('bot/tsconfig.json', JSON.stringify({ compilerOptions: { strict: true, noEmit: true, moduleResolution: 'node' }, include: ['src'] }));
+    // A job worktree whose root node_modules links to the main checkout's install, and a stray install above both.
+    put('main/node_modules/shared/index.d.ts', 'export type S = number;\n');
+    fs.symlinkSync(path.join(outer, 'main', 'node_modules'), path.join(root, 'node_modules'), 'junction');
+    put('node_modules/stray/index.d.ts', 'export type T = number;\n');
+    put('node_modules/@types/untyped/index.d.ts', 'export declare function f(n: number): void;\n');
+    const tree = ['tsconfig.json', 'src/tree.ts'];
+    const beyond = (text: string) => {
+      put('bot/src/tree.ts', text);
+      return beyondTree(root, tree, treeTsconfig(root, tree, '.stryker-tmp'), '.stryker-tmp');
+    };
+    expect(beyond("import type { S } from 'shared';\nexport const x: S = 1;\n")).toEqual([]);
+    expect(beyond("import type { T } from 'stray';\nexport const x: T = 1;\n")).toEqual(['../node_modules/stray/index.d.ts']);
+    // An untyped package's import the image leaves as any, which @types above the checkout would type.
+    expect(beyond("// @ts-ignore\nimport { f } from 'untyped';\nexport const x = f(1);\n")).toEqual(['../node_modules/@types/untyped/index.d.ts']);
+  });
+
   it("holds what the type checker reads to the root lockfile: test/'s TypeScript, and npm's record of the root install holding the lockfile's packages and no other", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-tsroot-'));
     onTestFinished(() => fs.rmSync(root, { recursive: true, force: true }));
     const checking = (JSON.parse(fs.readFileSync(path.join(botRoot, 'test', 'node_modules', 'typescript', 'package.json'), 'utf8')) as { version: string }).version;
-    type Entry = { version?: string; optional?: boolean; link?: boolean; resolved?: string };
+    type Entry = { version?: string; integrity?: string; optional?: boolean; link?: boolean; resolved?: string };
     const lock = (file: string, packages: Record<string, Entry>) => {
       fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true });
       fs.writeFileSync(path.join(root, file), JSON.stringify({ packages }));
     };
     const ships = (packages: Record<string, Entry>) => lock('package-lock.json', { '': { version: '1.0.0' }, ...packages });
     const installs = (packages: Record<string, Entry>) => lock('node_modules/.package-lock.json', packages);
-    const both = { 'node_modules/typescript': { version: checking }, 'node_modules/@types/express': { version: '5.0.1' } };
+    const both = { 'node_modules/typescript': { version: checking }, 'node_modules/@types/express': { version: '5.0.1', integrity: 'sha512-registry' } };
     ships(both);
     installs(both);
     expect(checkerDiffers(root)).toBe('');
@@ -637,7 +666,20 @@ describe('the change', () => {
     const why = 'so a mutant the checker rejects and the shipped build accepts would count as killed with no test run';
     ships({ ...both, 'node_modules/typescript': { version: '6.0.3' } });
     expect(checkerDiffers(root)).toBe(`the type checker runs TypeScript ${checking} (test/'s, installed) and the root lockfile ships 6.0.3, ${why}; pin test/package.json and its lockfile to 6.0.3 and run npm run test:install in a checkout whose test/node_modules is a dir of its own (a link names another checkout's: remove the link itself first)`);
-    const stale = (name: string, is: string, shipsText: string) => `the type checker reads the packages installed at the root, and in npm's record of that install (node_modules/.package-lock.json) ${name} is ${is} where the root lockfile ${shipsText}, ${why}; run npm ci at the root, in npm's default layout (--install-strategy=hoisted where a config sets linked), of a checkout whose node_modules is a dir of its own (a link names another checkout's install: remove the link itself first, never what it names)`;
+    const stale = (name: string, is: string, shipsText: string) => `the type checker reads the packages installed at the root, and in npm's record of that install (node_modules/.package-lock.json) ${name} is ${is} where the root lockfile ${shipsText}, ${why}; run npm ci --install-strategy=hoisted --include=dev at the root (npm's default layout with the dev packages, whatever a config or NODE_ENV says) of a checkout whose node_modules is a dir of its own (a link names another checkout's install: remove the link itself first, never what it names)`;
+    // npm itself installed other content at the lockfile's version (npm install --no-save of a tarball, a fork, an alias).
+    ships(both);
+    installs({ ...both, 'node_modules/@types/express': { version: '5.0.1', integrity: 'sha512-fork', resolved: 'file:../fork.tgz' } });
+    expect(checkerDiffers(root)).toBe(stale('node_modules/@types/express', 'at 5.0.1 with other content (file:../fork.tgz)', 'ships 5.0.1'));
+    // A git dependency has no integrity: its resolved commit names its content.
+    const git = (commit: string) => ({ version: '1.0.0', resolved: `git+ssh://git@github.com/org/lib.git#${commit}` });
+    ships({ ...both, 'node_modules/lib': git('2222') });
+    installs({ ...both, 'node_modules/lib': git('1111') });
+    expect(checkerDiffers(root)).toBe(stale('node_modules/lib', `at 1.0.0 with other content (${git('1111').resolved})`, 'ships 1.0.0'));
+    // A registry package's resolved, which npm can leave out of its record (omit-lockfile-registry-resolved), is not compared.
+    ships({ ...both, 'node_modules/@types/express': { ...both['node_modules/@types/express'], resolved: 'https://registry.npmjs.org/@types/express/-/express-5.0.1.tgz' } });
+    installs(both);
+    expect(checkerDiffers(root)).toBe('');
     // An optional package that is installed is held like any other.
     ships({ ...both, 'node_modules/pg-cloudflare': { version: '1.4.0', optional: true } });
     installs({ ...both, 'node_modules/pg-cloudflare': { version: '1.3.0' } });
