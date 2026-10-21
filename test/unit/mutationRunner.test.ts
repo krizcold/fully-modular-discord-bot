@@ -108,8 +108,8 @@ describe('a mutant run', () => {
     expect(runner(fake, 'a', '1').status).toBe(0);
     expect(fs.existsSync(path.join(fake.out, 'dry-ms.txt'))).toBe(false);
     // By a monotonic clock: with the wall clock (Date.now, new Date()) jumping ten minutes further ahead at every read,
-    // the first included, a time with such a read in it, from one read or two, clamped at zero or made absolute,
-    // reads ten minutes or more, while a monotonic one stays far below.
+    // the first included, a time that ends on such a read, clamped at zero or made absolute, reads ten minutes or
+    // more, while a monotonic one stays far below.
     const step = path.join(path.dirname(fake.out), 'step.cjs');
     fs.writeFileSync(step, [
       'const Wall = Date;',
