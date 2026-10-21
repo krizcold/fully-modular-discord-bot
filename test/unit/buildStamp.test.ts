@@ -93,7 +93,7 @@ describe('the dist stamp', () => {
     }
   });
 
-  it('leaves out .git and node_modules dirs under src, which tsc compiles nothing from, a linked one included', () => {
+  it('leaves out what sits under an entry named .git or node_modules in src, a linked one included', () => {
     const root = fakeRoot();
     const clone = path.join(root, 'src', 'clone');
     const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-linked-src-'));

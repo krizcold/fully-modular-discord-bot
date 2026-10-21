@@ -33,21 +33,29 @@ function lineOf(text: string): number {
 }
 
 /**
- * Removes what a bite run cut short left under `at`'s src and test/mutation: each test removes its own files when it
- * ends, but an interrupt skips that, and a leftover importer of an ignored module would stop every gate run before
- * pass A. Only the names the tests below write: a developer's own clone in src/bot/modulesDev can start with smdb- too.
+ * Removes what a bite run cut short left in `at` (under src and test/mutation, the root's canary logs and the
+ * leftover sandbox in .stryker-tmp): each test removes its own files when it ends, but an interrupt or an early
+ * throw skips that, and a leftover importer of an ignored module would stop every gate run before pass A. Only the
+ * names the tests below write: a developer's own clone in src/bot/modulesDev can start with smdb- too. A .stryker-tmp
+ * whose .gitignore the budget case took away gets it back, so git never lists a sandbox there.
  * @param at a bot root
  */
 function sweepLeftovers(at: string) {
   const src = path.join(at, 'src');
   const dev = path.join(src, 'bot', 'modulesDev');
   const mutation = path.join(at, 'test', 'mutation');
+  const sandboxes = path.join(at, '.stryker-tmp');
   for (const old of fs.readdirSync(src)) {
     if (/^smdb-(bite-(directive|other|probe|gone)|beyond|glob-\[x\])-\d+\.ts$/.test(old)) fs.rmSync(path.join(src, old), { force: true });
     else if (/^smdb-(ignored|repo)-\d+$/.test(old)) fs.rmSync(path.join(src, old), { recursive: true, force: true });
   }
   if (fs.existsSync(dev)) for (const old of fs.readdirSync(dev).filter(name => /^smdb-(beyond|bite-reader)-\d+\.ts$/.test(name))) fs.rmSync(path.join(dev, old), { force: true });
   if (fs.existsSync(mutation)) for (const old of fs.readdirSync(mutation).filter(name => /^smdb-tree-\d+\.txt$/.test(name))) fs.rmSync(path.join(mutation, old), { force: true });
+  for (const old of fs.readdirSync(at).filter(name => /^smdb-canary(-late)?-\d+\.log$/.test(name))) fs.rmSync(path.join(at, old), { force: true });
+  if (fs.existsSync(sandboxes)) {
+    for (const old of fs.readdirSync(sandboxes).filter(name => /^smdb-leftover-\d+$/.test(name))) fs.rmSync(path.join(sandboxes, old), { recursive: true, force: true });
+    fs.writeFileSync(path.join(sandboxes, '.gitignore'), '*\n');
+  }
 }
 
 describe('the touched-line mutation gate', () => {
@@ -66,10 +74,18 @@ describe('the touched-line mutation gate', () => {
       const mutation = path.join(at, 'test', 'mutation');
       fs.mkdirSync(mutation, { recursive: true });
       for (const name of ['smdb-tree-1.txt', 'smdb-tree-x.txt']) fs.writeFileSync(path.join(mutation, name), '');
+      // The canary logs a stand-in run writes in the root, and the budget case's leftover sandbox, its .gitignore gone.
+      for (const name of ['smdb-canary-1.log', 'smdb-canary-late-1.log', 'smdb-canary-x.log']) fs.writeFileSync(path.join(at, name), '');
+      const sandboxes = path.join(at, '.stryker-tmp');
+      for (const name of ['smdb-leftover-1', 'smdb-leftover-x']) fs.mkdirSync(path.join(sandboxes, name), { recursive: true });
+      fs.writeFileSync(path.join(sandboxes, 'smdb-leftover-1', 'a.ts'), '');
       sweepLeftovers(at);
       expect(fs.readdirSync(dev)).toEqual(['smdb-appstore']);
       expect(fs.readdirSync(path.join(at, 'src')).sort()).toEqual(['bot', 'smdb-kept.ts']);
       expect(fs.readdirSync(mutation)).toEqual(['smdb-tree-x.txt']);
+      expect(fs.readdirSync(at).filter(name => name.startsWith('smdb-canary'))).toEqual(['smdb-canary-x.log']);
+      expect(fs.readdirSync(sandboxes).sort()).toEqual(['.gitignore', 'smdb-leftover-x']);
+      expect(fs.readFileSync(path.join(sandboxes, '.gitignore'), 'utf8')).toBe('*\n');
     } finally {
       fs.rmSync(at, { recursive: true, force: true });
     }
@@ -143,12 +159,12 @@ describe('the touched-line mutation gate', () => {
    * bite's target.
    */
   function standInRun(code: string, patterns?: string[]) {
+    const line = lineOf("return (process.env.FLEET_BACKUP_MODE || '').trim().toLowerCase() === 'active';");
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-control-'));
     const fake = path.join(dir, 'vitest.cjs');
     // Git-ignored files in the checkout (*.log), which no sandbox may hold: one
     // there from the start, one made during pass A, before pass A2 copies it.
     const canaries = [`smdb-canary-${process.pid}.log`, `smdb-canary-late-${process.pid}.log`];
-    fs.writeFileSync(path.join(root, canaries[0]), 'ignored');
     fs.writeFileSync(fake, [
       "const fs = require('fs');",
       "const path = require('path');",
@@ -168,12 +184,17 @@ describe('the touched-line mutation gate', () => {
       'process.exit(message ? 1 : 0);',
       '',
     ].join('\n'));
-    const line = lineOf("return (process.env.FLEET_BACKUP_MODE || '').trim().toLowerCase() === 'active';");
-    // A mutant id left in the shell, which the gate must ignore.
-    const run = spawnSync(process.execPath, [path.join(root, 'test', 'mutation', 'touched.mjs'), ...(patterns ?? [`${TARGET}:${line}-${line}`]).flatMap(pattern => ['--mutate', pattern]), '--concurrency', '1'],
-      { cwd: root, encoding: 'utf8', timeout: 580_000, env: { ...process.env, SMDB_MUTATION_VITEST: fake, __STRYKER_ACTIVE_MUTANT__: '3' } });
-    fs.rmSync(dir, { recursive: true, force: true });
-    for (const name of canaries) fs.rmSync(path.join(root, name), { force: true });
+    const run = (() => {
+      try {
+        fs.writeFileSync(path.join(root, canaries[0]), 'ignored');
+        // A mutant id left in the shell, which the gate must ignore.
+        return spawnSync(process.execPath, [path.join(root, 'test', 'mutation', 'touched.mjs'), ...(patterns ?? [`${TARGET}:${line}-${line}`]).flatMap(pattern => ['--mutate', pattern]), '--concurrency', '1'],
+          { cwd: root, encoding: 'utf8', timeout: 580_000, env: { ...process.env, SMDB_MUTATION_VITEST: fake, __STRYKER_ACTIVE_MUTANT__: '3' } });
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+        for (const name of canaries) fs.rmSync(path.join(root, name), { force: true });
+      }
+    })();
     expect(run.stdout).not.toContain('the sandbox holds a git-ignored file');
     expect(run.stdout).not.toContain('the run ran code the reruns did not');
     expect(run.stdout).not.toContain('the run had other time limits than the reruns');
@@ -242,6 +263,8 @@ describe('the touched-line mutation gate', () => {
         ].join('\n'));
       } finally {
         fs.rmSync(leftover, { recursive: true, force: true });
+        // The gate writes it back when it starts; one that stopped before that must not leave the sandboxes listed.
+        fs.writeFileSync(path.join(root, '.stryker-tmp', '.gitignore'), '*\n');
       }
     })();
     expect(run.stdout).not.toContain('Changed during the run');

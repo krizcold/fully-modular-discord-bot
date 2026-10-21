@@ -1,6 +1,6 @@
 // Builds dist the way `npm run build` does (tsc, then the copy-assets step
 // written in Node so it also runs on Windows and without a shell) and stamps
-// it with a hash of what it was built from (src as tsc reads it, filesUnder;
+// it with a hash of what it was built from (src, walked as filesUnder says;
 // tsconfig.json, this file, the typescript version) and of what dist then
 // holds. With --if-stale it builds
 // only when either hash no longer matches, so a dist that another build, a
@@ -20,10 +20,10 @@ const LOCK = '.build-lock';
 
 /**
  * The files under dir. Given `seen` (the real paths of the dirs walked), it
- * reads src as tsc does: it leaves out .git and node_modules, which tsc
- * compiles nothing from, a dir already walked and a link it cannot stat
- * (broken, a loop, denied); it follows any other link, and a dir it cannot
- * list stops the walk.
+ * walks src for the stamp: every file, links followed, but none under an
+ * entry named .git or node_modules (held, like the root's install, only
+ * through the typescript version), no dir walked twice and no link it cannot
+ * stat (broken, a loop, denied); a dir it cannot list stops the walk.
  * @param {string} dir
  * @param {Set<string>} [seen]
  * @returns {string[]}

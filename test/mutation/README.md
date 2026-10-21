@@ -68,8 +68,8 @@ From the bot root, with Node 22.12 or newer (or SMDB_TEST_NODE set, as for `npm 
   going on to its next passes: end it first (on Windows it ends with the first). Ctrl-C in the gate's terminal
   reaches all of it. Test runs can leave throwaway dirs in the OS temp dir, `smdb-test-*` (a test file's data root)
   and `smdb-child-*` (a child test's), whenever their cleanup does not run or fails (a file that fails at load or in
-  an afterAll hook, a hook timeout included; a process killed; a dir still held); such dirs are safe to delete once
-  no test runs.
+  an afterAll hook, a hook timeout included; a file whose every test is skipped, as by a `-t` filter; a process
+  killed; a dir still held); such dirs are safe to delete once no test runs.
 - The gate fingerprints every file git tracks or would add (below), so its output goes to a file git ignores (`l5.log`
   above, under the root's `*.log`) or one outside the checkout: a file in the tree that the run writes to changes
   during the run, which ends it NO RESULT.
@@ -500,10 +500,12 @@ child away from anything real:
   one sits under this root's dist.
 
 The child tier's globalSetup runs build.cjs `--if-stale`: it rebuilds dist unless the stamp matches both what dist was
-built from (src as tsc reads it: links followed, .git and node_modules dirs left out, though a dir that cannot be
-listed stops the build; tsconfig.json, build.cjs, the typescript version) and what dist holds now, so a dist that
-another
-build, a branch switch or a hand edit changed is rebuilt. The source is hashed before the build, and its files' sizes
+built from (every file under src, links followed, but none under an entry named .git or node_modules, a dir it
+cannot list stopping the build; tsconfig.json, build.cjs, the typescript version) and what dist holds now, so a dist
+that another build, a branch switch or a hand edit changed is rebuilt. A package installed under src is held, like
+the root's install, only through the typescript version, though tsc can carry from it into dist (a const enum's
+value, a file a reference path reaches); none is installed there today. The source is hashed before the build, and
+its files' sizes
 and write times are checked after it, so an edit saved meanwhile, even one undone again (a stash, then a pop), fails the
 build unstamped. A fresh dist is seen without taking the lock. The lock, `dist/.build-lock`, is a file that holds its
 owner's process id, taken only to build, and keeps two runs in one checkout from building over each other: a live owner

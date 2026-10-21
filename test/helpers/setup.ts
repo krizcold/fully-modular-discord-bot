@@ -27,10 +27,9 @@ if (seed) {
 
 const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-test-'));
 process.env.DATA_DIR = dataDir;
-// Removed after the file's own afterAll hooks (vitest runs them in reverse),
-// unless SMDB_KEEP_TEST_FILES keeps it for a look; one of them that throws or
-// times out skips this, and a file a process still holds leaves it behind
-// rather than failing the file.
+// Removed by this afterAll when vitest runs it (mutation/README.md says when it
+// does not), unless SMDB_KEEP_TEST_FILES keeps it for a look; a dir a process
+// still holds is left behind rather than failing the file.
 afterAll(() => {
   if (!process.env.SMDB_KEEP_TEST_FILES) {
     try { fs.rmSync(dataDir, { recursive: true, force: true, maxRetries: 5 }); } catch {}
