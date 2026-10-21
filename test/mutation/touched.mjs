@@ -65,7 +65,7 @@ try {
 }
 const {
   structureLines, DATA_ROUTE_WHY, EXTRA_BREAK_WHY, GLOB_NAME_WHY, beyondTree, checkerDiffers, gatesIn, holdsDataRoute, holdsExtraBreak, linesOfTarget, mutatePatterns,
-  notMutated, ownNames, planFromGit, rootGlobFree, sandboxPatterns, strykerTakes, treeTsconfig, unmatchedPatterns, untouched,
+  notMutated, ownNames, planFromGit, rootGlobFree, rootRelatable, sandboxPatterns, strykerTakes, treeTsconfig, unmatchedPatterns, untouched,
 } = ranges;
 const { byKiller, classifyKill, judge, onlyUnusedDirective, outcome, toConfirm, toPassB, toUncheck } = verdicts;
 
@@ -97,6 +97,10 @@ const posix = file => file.split(path.sep).join('/');
 const firstLine = error => (error instanceof Error ? error.message.split('\n')[0] : String(error));
 if (!rootGlobFree(root)) {
   console.log(`Verdict: NO RESULT (the checkout's path, ${posix(root)}, does not match itself read as a glob, as Stryker reads it: a [ ] class, a { } with a comma or a range, an extglob such as +( ), or one minimatch cannot read; Stryker matches no file to mutate there, so move the checkout)`);
+  process.exit(2);
+}
+if (!rootRelatable(root)) {
+  console.log(`Verdict: NO RESULT (the checkout's path, ${posix(root)}, holds the text node_modules, as given or as its real path, and vitest's related runs drop every import under such a path, so no test would meet a mutant and every one would survive; move the checkout)`);
   process.exit(2);
 }
 // The sandboxes' dir ignores itself, so git status stays clean, from the first

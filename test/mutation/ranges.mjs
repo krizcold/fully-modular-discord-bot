@@ -895,6 +895,20 @@ export function strykerTakes(root, name) {
 export const rootGlobFree = root => strykerTakes(root, 'package.json');
 
 /**
+ * Whether vitest's related runs can find a test from the bot root: vitest 5
+ * drops every import whose path holds the text node_modules anywhere, not only
+ * as a dir of its own, and a sandbox's files lie under the root's path, so under
+ * such a path no test would meet a mutant and every one would survive. Read on
+ * the path as given and on the real path, which vitest resolves imports to.
+ * @param {string} root
+ */
+export function rootRelatable(root) {
+  let real = root;
+  try { real = fs.realpathSync.native(root); } catch { real = root; }
+  return ![root, real].some(dir => dir.includes('node_modules'));
+}
+
+/**
  * The tsconfig pass A's type checker is given. Stryker's checker compiles the
  * checkout from its working directory, not the sandbox, so with the root's
  * tsconfig it would judge files git ignores that the root's includes (a module
@@ -982,7 +996,7 @@ export function checkerDiffers(root) {
   }
   const version = String(shipped['node_modules/typescript'].version);
   if (version !== ts.version) {
-    return `the type checker runs TypeScript ${ts.version} (test/'s, installed) and the root lockfile ships ${version}, ${why}; pin test/package.json and its lockfile to ${version} and run npm run test:install in a checkout whose test/node_modules is a dir of its own (a link names another checkout's: remove the link itself first)`;
+    return `the type checker runs TypeScript ${ts.version} (test/'s, installed) and the root lockfile ships ${version}, ${why}; pin test/package.json and its lockfile to ${version} and run npm run test:install in a checkout whose test/node_modules is a dir of its own (a link names another checkout's: remove the link itself first, never what it names, from the bot root with node -e "require('fs').rmSync('test/node_modules')", which refuses a real dir)`;
   }
   const installed = read('node_modules/.package-lock.json') ?? {};
   for (const name of new Set([...Object.keys(shipped), ...Object.keys(installed)])) {
@@ -993,7 +1007,7 @@ export function checkerDiffers(root) {
     const other = want && have && want.version === have.version ? ` with other content (${have.resolved ?? 'no source recorded'})` : '';
     const is = have === undefined ? 'missing' : have.link ? 'a link' : `at ${have.version}${other}`;
     const ships = want === undefined ? 'names no such package' : want.link ? 'holds a link' : `ships ${want.version}`;
-    return `the type checker reads the packages installed at the root, and in npm's record of that install (node_modules/.package-lock.json) ${name} is ${is} where the root lockfile ${ships}, ${why}; run npm ci --install-strategy=hoisted --include=dev at the root (npm's default layout with the dev packages, whatever a config or NODE_ENV says) of a checkout whose node_modules is a dir of its own (a link names another checkout's install: remove the link itself first, never what it names)`;
+    return `the type checker reads the packages installed at the root, and in npm's record of that install (node_modules/.package-lock.json) ${name} is ${is} where the root lockfile ${ships}, ${why}; run npm ci --install-strategy=hoisted --include=dev at the root (npm's default layout with the dev packages, whatever a config or NODE_ENV says) of a checkout whose node_modules is a dir of its own (a link names another checkout's install: remove the link itself first, never what it names, from the bot root with node -e "require('fs').rmSync('node_modules')", which refuses a real dir)`;
   }
   return '';
 }

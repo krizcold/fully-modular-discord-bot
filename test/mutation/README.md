@@ -73,7 +73,9 @@ From the bot root, with Node 22.12 or newer (or SMDB_TEST_NODE set, as for `npm 
   report says which; or, with no report, the test packages are missing (`npm run test:install`) or test/node_modules
   is a link (below), the checkout's path
   does not match itself read as a glob, as Stryker reads it (a `[ ]` class, a `{ }` with a comma or a range, an extglob
-  such as `+( )`, or one minimatch cannot read: Stryker then matches no file to mutate), .stryker-tmp could not be made, git could not list the tree,
+  such as `+( )`, or one minimatch cannot read: Stryker then matches no file to mutate), the checkout's path, as given
+  or as its real path, holds the text node_modules anywhere (vitest's related runs drop every import under such a path,
+  so no test would meet a mutant), .stryker-tmp could not be made, git could not list the tree,
   or the report itself could not be written; every `Verdict:` line goes to
   stdout, and the gate exits only once stdout has taken the whole report) or a usage error. A mutant id left in the shell (`__STRYKER_ACTIVE_MUTANT__`)
   is ignored. Any other code means the run was interrupted. Trust 0 and 1 only after the report's `Verdict:` line: a process
@@ -153,9 +155,11 @@ does not name by its content.
   away (its header and bracket deleted) is named with the places code was taken out when fewer lines of code are put
   back there. Not named: a block taken away where as many or more lines of code are put back, a line moved into or
   out of a braceless body (an `if (x)` with no brace put above a line, or lines swapped below one), and a changed
-  line that gains or loses its ending `;` where the next line starts with `(`, `[`, a backtick, `+`, `-` or `/`, which
-  joins that unchanged line into its statement or splits it out with the same token kinds; a reviewer reads each
-  changed braceless header and each such `;` for these.
+  line whose first or last token comes to join an unchanged line beside it into one statement, or stops doing so,
+  so that line joins in or splits out with the same token kinds: an ending `;` gained, lost or made a `,`; an
+  operator, comma, dot, `?`, `:` or `=>` gained or lost at its end; a dot, an operator, `(`, `[` or a backtick gained
+  or lost at its start after a line with no `;` (a joined line that then reads a regex as a division is marked, as
+  above). A reviewer reads each changed braceless header, and both ends of every changed line, for these.
 - git does not look at every file: not at one its index marks assume-unchanged or skip-worktree (core.ignoreStat marks
   every file it adds), not at one a file-system monitor says is unchanged, and not at one whose cached size and time
   (and, on Windows, creation time) still hold, so a same-size edit whose time was set back shows in no diff. So the
@@ -255,14 +259,16 @@ does not name by its content.
    root's tsconfig sets typeRoots of its own. The way on is to pin test/package.json and its lockfile to the root
    lockfile's TypeScript and run `npm run test:install` in a checkout whose test/node_modules is a dir of its own, or
    to run `npm ci --install-strategy=hoisted --include=dev` at the root of one whose node_modules is. While either
-   dir is a link, remove the link itself first, never what it names: any npm command that changes packages run
-   through a link, the pin's npm install included, writes the other checkout's install. The
-   gate reads npm's default layout with the dev packages, whatever a config or `NODE_ENV=production` sets: a linked
-   install (`install-strategy=linked`) records links, not versions, and one that omits dev packages lacks them, so
-   either always stops. Not seen: a package placed at the root, or a package's files changed, after npm recorded its
-   install (by hand, by another tool, or by an `npm rebuild`, which never rewrites the record), since the gate reads
-   no package's own files; any node_modules
-   other than the root's install that TypeScript reads (a mutant only its declarations reject counts as killed): one
+   dir is a link, remove the link itself first, never what it names, from the bot root: `node -e
+   "require('fs').rmSync('test/node_modules')"` for test/'s, `node -e "require('fs').rmSync('node_modules')"` for
+   the root's (each refuses a real dir; a shell's `rm -rf` given the link with a trailing slash empties the dir it
+   names instead). Any npm command that changes packages run through a link, the pin's npm install included, writes
+   the other checkout's install. The gate reads npm's default layout with the dev packages, whatever a config or
+   `NODE_ENV=production` sets: a linked install (`install-strategy=linked`) records links, not versions, and one
+   that omits dev packages lacks them, so either always stops. Not seen: a package placed at the root, or a
+   package's files changed, after npm recorded its install (by hand, by another tool, or by an `npm rebuild`, which
+   never rewrites the record), since the gate reads no package's own files; any node_modules other than the root's
+   install that TypeScript reads (a mutant only its declarations reject counts as killed): one
    inside the checkout (made by hand in src, which TypeScript takes before the root's for a file below it, and which
    an image built from a clean checkout never has while git does not track it; a tracked one ships in that image
    too, so there the checker agrees with it), and one above the checkout or above the dir the root's
@@ -323,12 +329,15 @@ does not name by its content.
      timed out, that pass's time is checked as the reruns' is below (Stryker's own time against the run's monotonic
      one): where the clock of Stryker's process stepped during that run, every budget there was wrong (a step back can
      make it negative), so the gate ends NO RESULT naming the pass rather than count its mutants hung, and it does
-     the same where those times could not be read. Not seen in time: a forward step (on Linux, a suspend too) during
-     any pass's run with no mutant raises that pass's budget by up to `timeoutFactor` times the step, so a mutant
-     that loops without yielding (vitest's own limit cannot fire in a blocked worker) holds its slot that long before
-     anything reads the clock: pass A and A with no checker never read it (their timeouts rerun in a2), and a2, B and
-     b2 read it only after the whole pass. The verdict stays right; the run can take hours, or never end for a step
-     of days.
+     the same where those times could not be read. Not seen otherwise: Stryker times by the wall clock, so a forward
+     step, or a suspend on any system, during any pass's run with no mutant raises that pass's budget by up to
+     `timeoutFactor` times the step, and the gate reads the clock only where a timeout counts: in B and b2 when a run
+     there timed out, and after a2 when a rerun confirmed one. So a raised budget can let a mutant that only slows
+     its tests finish and survive (FAIL) where a sound one would time it out and a2 count it killed, and a mutant that
+     loops without yielding (vitest's own limit cannot fire in a blocked worker) holds its slot that long, so the run
+     can take hours. A step past Node's timer limit (about six days in a2 or b2, twelve in A or B) times every run
+     there out at once instead, as a step back does, which the checks above catch where it counts. None of these
+     turns the verdict into a wrong PASS.
    - A mutant the gate never reran (it stopped first) is inconclusive, and so is a survivor of pass A that the stopped
      gate never ran through pass B, and a pass B kill that failed again alone in one b2 run while a later one stopped
      the gate before the run with no mutant after them.
@@ -434,8 +443,11 @@ killed and is listed. CompileError counts as killed by the type checker, unless 
 changed, when no gating mutant was made, when every gating mutant was a type error (no test ran against the change),
 when the type checker would judge a file outside the tree, when what it reads is not what the root lockfile ships
 (test/'s TypeScript, or npm's record of the root install) or that lockfile names no TypeScript or cannot be read,
-when a pass could not run, when a run of pass B or b2 timed out while the clock of Stryker's process stepped during
-that pass's run with no mutant (or its times could not be read), when Stryker mutated a file no target names, when
+when a pass could not run (its run with no mutant past Stryker's bound on it included: five minutes for A, A with no
+checker and a2, fifteen for B and b2, each on one vitest worker; Stryker's log above the report then says the
+initial test run timed out, and no option raises the bound), when a run of pass B or b2 timed out while the clock
+of Stryker's process stepped during that pass's run with no mutant (or its times could not be read), when Stryker
+mutated a file no target names, when
 the run with no mutant after the reruns failed (or ran past the reruns' budget, or its times could not be read),
 when the tree changed during the run, or when a test's stand-in replaced vitest (SMDB_MUTATION_VITEST, for the
 gate's own tests only); the report then says why, with the passes that did finish.

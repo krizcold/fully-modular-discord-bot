@@ -13,7 +13,7 @@ import { runScenario } from '../helpers/child';
 import { canonicalName } from '../mutation/keys.mjs';
 import {
   changeTarget, codeLines, commonLines, gates, gatesIn, inPattern, lineDiff, linesOfTarget, mergeRanges, mutatePatterns, notMutated, parseNameStatus,
-  planChange, planFromGit, unmatchedPatterns, untouched, wholeTarget, structureLines, DATA_ROUTE_WHY, GLOB_NAME_WHY, beyondTree, checkerDiffers, holdsDataRoute, rootGlobFree,
+  planChange, planFromGit, unmatchedPatterns, untouched, wholeTarget, structureLines, DATA_ROUTE_WHY, GLOB_NAME_WHY, beyondTree, checkerDiffers, holdsDataRoute, rootGlobFree, rootRelatable,
   sandboxPatterns, strykerTakes, tokenLines, treeTsconfig, NO_CODE_WHY, linkOf, ownNames, mutatedName,
 } from '../mutation/ranges.mjs';
 import { PACKAGE_LOCKS, treeChanges, treePrint } from '../mutation/tree.mjs';
@@ -668,8 +668,8 @@ describe('the change', () => {
     expect(checkerDiffers(root)).toBe('');
     const why = 'so a mutant the checker rejects and the shipped build accepts would count as killed with no test run';
     ships({ ...both, 'node_modules/typescript': { version: '6.0.3' } });
-    expect(checkerDiffers(root)).toBe(`the type checker runs TypeScript ${checking} (test/'s, installed) and the root lockfile ships 6.0.3, ${why}; pin test/package.json and its lockfile to 6.0.3 and run npm run test:install in a checkout whose test/node_modules is a dir of its own (a link names another checkout's: remove the link itself first)`);
-    const stale = (name: string, is: string, shipsText: string) => `the type checker reads the packages installed at the root, and in npm's record of that install (node_modules/.package-lock.json) ${name} is ${is} where the root lockfile ${shipsText}, ${why}; run npm ci --install-strategy=hoisted --include=dev at the root (npm's default layout with the dev packages, whatever a config or NODE_ENV says) of a checkout whose node_modules is a dir of its own (a link names another checkout's install: remove the link itself first, never what it names)`;
+    expect(checkerDiffers(root)).toBe(`the type checker runs TypeScript ${checking} (test/'s, installed) and the root lockfile ships 6.0.3, ${why}; pin test/package.json and its lockfile to 6.0.3 and run npm run test:install in a checkout whose test/node_modules is a dir of its own (a link names another checkout's: remove the link itself first, never what it names, from the bot root with node -e "require('fs').rmSync('test/node_modules')", which refuses a real dir)`);
+    const stale = (name: string, is: string, shipsText: string) => `the type checker reads the packages installed at the root, and in npm's record of that install (node_modules/.package-lock.json) ${name} is ${is} where the root lockfile ${shipsText}, ${why}; run npm ci --install-strategy=hoisted --include=dev at the root (npm's default layout with the dev packages, whatever a config or NODE_ENV says) of a checkout whose node_modules is a dir of its own (a link names another checkout's install: remove the link itself first, never what it names, from the bot root with node -e "require('fs').rmSync('node_modules')", which refuses a real dir)`;
     // npm itself installed other content at the lockfile's version (npm install --no-save of a tarball, a fork, an alias).
     ships(both);
     installs({ ...both, 'node_modules/@types/express': { version: '5.0.1', integrity: 'sha512-fork', resolved: 'file:../fork.tgz' } });
@@ -727,6 +727,30 @@ describe('the change', () => {
       expect(rootGlobFree(root), dir).toBe(taken.includes(dir));
       expect(stryker, dir).toBe(taken.includes(dir));
     }
+  });
+
+  it("refuses a checkout path that holds the text node_modules, as given or real, under which vitest's related runs drop every import", () => {
+    // vitest's own rule, in the version installed: a related run skips an import whose path holds the text anywhere.
+    const chunks = path.join(botRoot, 'test', 'node_modules', 'vitest', 'dist', 'chunks');
+    expect(fs.readdirSync(chunks).some(file => fs.readFileSync(path.join(chunks, file), 'utf8').includes('if (fsPath.includes("node_modules") ||'))).toBe(true);
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-relatable-'));
+    onTestFinished(() => {
+      // The link first, so the removal never walks into the dir it names.
+      fs.rmSync(path.join(base, 'plain', 'link'), { force: true });
+      fs.rmSync(base, { recursive: true, force: true });
+    });
+    for (const dir of ['plain/bot', 'node_modules_old/bot', 'x/node_modules/bot']) fs.mkdirSync(path.join(base, dir), { recursive: true });
+    expect(rootRelatable(path.join(base, 'plain', 'bot'))).toBe(true);
+    expect(rootRelatable(path.join(base, 'node_modules_old', 'bot'))).toBe(false);
+    expect(rootRelatable(path.join(base, 'x', 'node_modules', 'bot'))).toBe(false);
+    // vitest resolves an import to its real path, so a link to such a dir is refused too.
+    fs.symlinkSync(path.join(base, 'node_modules_old', 'bot'), path.join(base, 'plain', 'link'), 'junction');
+    expect(rootRelatable(path.join(base, 'plain', 'link'))).toBe(false);
+    expect(rootRelatable(botRoot)).toBe(true);
+    // The gate asks at its start, after the glob check and before it reads git.
+    const gate = fs.readFileSync(path.join(botRoot, 'test', 'mutation', 'touched.mjs'), 'utf8');
+    expect(gate.indexOf('if (!rootRelatable(root)) {')).toBeGreaterThan(gate.indexOf('if (!rootGlobFree(root)) {'));
+    expect(gate.indexOf('if (!rootRelatable(root)) {')).toBeLessThan(gate.indexOf('planFromGit('));
   });
 
   it('names, and never mutates, a file listed under a name that leads through a link, as the disk tells it', () => {
