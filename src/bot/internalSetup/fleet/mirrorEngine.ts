@@ -318,10 +318,18 @@ export class MirrorEngine {
     const manifest = this.manifest;
     let guildCount = 0;
     let totalBytes = 0;
+    let partialCount = 0;
+    let partialBytes = 0;
     for (const guild of Object.values(manifest.guilds)) {
-      if (guild.hash === null) continue;
-      guildCount += 1;
-      for (const file of Object.values(guild.files)) totalBytes += file.size;
+      let bytes = 0;
+      for (const file of Object.values(guild.files)) bytes += file.size;
+      if (guild.hash === null) {
+        partialCount += 1;
+        partialBytes += bytes;
+      } else {
+        guildCount += 1;
+        totalBytes += bytes;
+      }
     }
     // A held copy of a master that no longer answers: what held it (a seed
     // hold, another master) may be gone, so the line says what is known.
@@ -351,6 +359,8 @@ export class MirrorEngine {
       sourceTerm: manifest.sourceTerm,
       guildCount,
       totalBytes,
+      partialCount,
+      partialBytes,
       frozenCount: manifest.frozen.length,
       ...(error ? { error } : {}),
     };

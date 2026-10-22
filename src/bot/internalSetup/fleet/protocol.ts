@@ -549,8 +549,12 @@ export interface MirrorReport {
   sourceNodeId: string | null;
   sourceNodeName: string | null;
   sourceTerm: number | null;
+  /** Guilds the copy holds now whose last pass completed, and their bytes. */
   guildCount: number;
   totalBytes: number;
+  /** Guilds the copy holds now mid-pass, their files mixing two points in time. */
+  partialCount?: number;
+  partialBytes?: number;
   frozenCount: number;
   error?: string;
 }

@@ -1013,13 +1013,25 @@ function FleetReplicaLine({ replica }) {
 // own engine on its Fleet tab, from its heartbeat on the master's. The age
 // is the RPO a dead-master promote would carry, so a copy that stopped
 // refreshing is stated in colour rather than left to a growing number.
+function fleetCopyHolds(m) {
+  const n = (m.guildCount || 0) + (m.partialCount || 0);
+  const bytes = (m.totalBytes || 0) + (m.partialBytes || 0);
+  const partial = m.partialCount > 0 ? `, ${m.partialCount} of them partial (incomplete, possibly mixing two passes)` : '';
+  return `${n} guild${n === 1 ? '' : 's'}, ${(bytes / 1048576).toFixed(1)} MB${partial}`;
+}
+
+function fleetMirrorCopyText(mirror, skew) {
+  if (mirror.completedAgoMs != null) return `last complete copy ${fleetFormatAge(mirror.completedAgoMs + skew)}, holding ${fleetCopyHolds(mirror)}`;
+  return (mirror.partialCount || 0) > 0 ? `none complete yet, holding ${fleetCopyHolds(mirror)}` : 'none yet';
+}
+
 function FleetMirrorLine({ mirror, heartbeatAgoMs, api, canDrop }) {
   const [busy, setBusy] = React.useState(false);
   // The Retire reading of a held copy (B4f-3): a copy of a master that no
   // longer serves, kept for a seed or a promote that never came.
   const drop = () => {
     if (busy) return;
-    if (!confirm(`Drop this node's copy of ${mirror.sourceNodeName || 'the old master'}'s guild data (${mirror.guildCount} guild${mirror.guildCount === 1 ? '' : 's'}, ${(mirror.totalBytes / 1048576).toFixed(1)} MB)?\n\nThe master this node is registered with is not the one this copy was taken from, and it adopts nothing from it; a copy of a previous master seeds and promotes nothing either, so the mirror holds it until it is dropped. Once dropped (removed, not graveyarded) the mirror copies the current master instead.`)) return;
+    if (!confirm(`Drop this node's copy of ${mirror.sourceNodeName || 'the old master'}'s guild data (${fleetCopyHolds(mirror)})?\n\nThe master this node is registered with is not the one this copy was taken from, and it adopts nothing from it; a copy of a previous master seeds and promotes nothing either, so the mirror holds it until it is dropped. Once dropped (removed, not graveyarded) the mirror copies the current master instead.`)) return;
     setBusy(true);
     api.post('/fleet/mirror/drop', {})
       .then((res) => {
@@ -1030,9 +1042,7 @@ function FleetMirrorLine({ mirror, heartbeatAgoMs, api, canDrop }) {
       .finally(() => setBusy(false));
   };
   const skew = heartbeatAgoMs == null ? 0 : heartbeatAgoMs;
-  const copy = mirror.completedAgoMs == null
-    ? 'none yet'
-    : `last complete copy ${fleetFormatAge(mirror.completedAgoMs + skew)} (${mirror.guildCount} guild${mirror.guildCount === 1 ? '' : 's'}, ${(mirror.totalBytes / 1048576).toFixed(1)} MB)`;
+  const copy = fleetMirrorCopyText(mirror, skew);
   const frozen = mirror.frozenCount > 0 ? `; ${mirror.frozenCount} guild${mirror.frozenCount === 1 ? '' : 's'} frozen by a migration, kept as last copied` : '';
   const stale = mirror.completedAgoMs != null && mirror.completedAgoMs + skew > 180000;
   if (mirror.status === 'refused') {
@@ -1384,7 +1394,7 @@ function FleetPromoteCard({ api, fleet, reload }) {
       {fileMode ? (
         <div className="usage-stat-sub" style={{ color: copy && copy.completedAgoMs != null ? undefined : '#d29922' }}>
           {copy && copy.completedAgoMs != null
-            ? `Copy of the master's guild data: last complete ${fleetFormatAge(copy.completedAgoMs)} (${copy.guildCount} guild${copy.guildCount === 1 ? '' : 's'}, ${(copy.totalBytes / 1048576).toFixed(1)} MB); ${masterDown ? 'promoting adopts it, and that age is what you accept losing.' : 'a transfer while the master answers moves its live data instead, so it loses nothing; the copy is what a promote adopts if the master dies.'}`
+            ? `Copy of the master's guild data: last complete ${fleetFormatAge(copy.completedAgoMs)}, holding ${fleetCopyHolds(copy)}; ${masterDown ? 'promoting adopts it, and that age is what you accept losing.' : 'a transfer while the master answers moves its live data instead, so it loses nothing; the copy is what a promote adopts if the master dies.'}`
             : masterDown ? 'No complete copy of the master\'s guild data on this node yet; the promote refuses until the Backup copy line below shows one.' : 'No complete copy of the master\'s guild data on this node yet; a transfer while the master answers does not need one (it moves the live data), but a promote after the master dies does.'}
         </div>
       ) : null}
@@ -1897,7 +1907,7 @@ function fleetSeedSourceText(fleet) {
   const holds = refused
     ? `This node offers nothing: ${offer.reason || 'no reason given'}.`
     : copy && copy.completedAgoMs != null
-      ? `This node holds a copy of ${copy.sourceNodeName || 'the old master'}'s guild data, last complete ${fleetFormatAge(copy.completedAgoMs)} (${plural(copy.guildCount, 'guild')}, ${(copy.totalBytes / 1048576).toFixed(1)} MB), and offers it.`
+      ? `This node holds a copy of ${copy.sourceNodeName || 'the old master'}'s guild data, last complete ${fleetFormatAge(copy.completedAgoMs)}, holding ${fleetCopyHolds(copy)}, and offers it.`
       : 'This node offers what it holds; that master\'s Fleet tab says what, or why nothing.';
   const progress = push
     ? (push.phase === 'failed' ? ` The last push failed: ${push.error || 'unknown error'}.`
