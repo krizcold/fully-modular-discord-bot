@@ -1,4 +1,4 @@
-import { Client, ComponentType, Events, InteractionType, MessageFlags, type BaseInteraction } from 'discord.js';
+import { Client, ComponentType, DiscordAPIError, Events, InteractionResponseType, InteractionType, MessageFlags, type BaseInteraction } from 'discord.js';
 import { expect } from 'vitest';
 
 import { setRouteOverride } from '../../src/bot/internalSetup/utils/dataBackends/routeResolver';
@@ -52,13 +52,80 @@ export const rawModal = (id: string, fromMessage: boolean) => ({
 });
 export const fakeMessage = { id: '700', channel_id: '600', author: { ...user, id: '11', username: 'bot' }, content: '', timestamp: new Date(0).toISOString(), edited_timestamp: null, tts: false, mention_everyone: false, mentions: [], mention_roles: [], attachments: [], embeds: [], pinned: false, type: 0, flags: 0, components: [] };
 
+export const unknownMessage = (method: string, route: string) =>
+  new DiscordAPIError({ code: 10008, message: 'Unknown Message' }, 10008, 404, method.toUpperCase(), route, {});
+
+/** How Discord reads back a deferral: whether it carries MessageFlags.Loading while thinking, and after a fill. */
+export interface ReadBack {
+  loadingFlag: boolean;
+  loadingAfterFill: boolean;
+}
+
+const FILL_FIELDS = ['content', 'embeds', 'components', 'attachments', 'poll'] as const;
+
+/** A sent body's content-bearing fields as Discord would hold them in the message. */
+function fillOf(body: any): Record<string, unknown> {
+  const fill: Record<string, unknown> = {};
+  for (const field of FILL_FIELDS) {
+    if (body?.[field] !== undefined) fill[field] = body[field];
+  }
+  if (Array.isArray(fill.attachments)) {
+    fill.attachments = (fill.attachments as any[]).map(a => ({ size: 1, url: 'https://cdn/a', proxy_url: 'https://cdn/a', ...a, id: String(a.id) }));
+  }
+  if (fill.poll) {
+    fill.poll = { channel_id: '600', expiry: null, results: null, ...(fill.poll as object), answers: ((fill.poll as any).answers ?? []).map((a: any, i: number) => ({ answer_id: i + 1, ...a })) };
+  }
+  return fill;
+}
+
+/**
+ * The original response as Discord holds it, by interaction token: a deferral reads back loading (MessageFlags.Loading
+ * unless readBack says otherwise) until an edit of it or the first followUp fills it (bt3_facts 1.4), and then with
+ * what the fill wrote; once deleted it answers Unknown Message.
+ */
+function originalModel(readBack: ReadBack) {
+  const originals = new Map<string, { loading: boolean; flags: number; gone: boolean; filled: boolean; fill: Record<string, unknown> }>();
+  return (method: WireCall['method'], route: string, body: any): object | undefined => {
+    const token = /token-[^/?]+/.exec(route)?.[0];
+    if (!token) return undefined;
+    const original = route.endsWith('/messages/%40original');
+    const state = originals.get(token);
+    if (route.includes('/callback')) {
+      if (body?.type === InteractionResponseType.DeferredChannelMessageWithSource) {
+        originals.set(token, { loading: true, flags: body.data?.flags ?? 0, gone: false, filled: false, fill: {} });
+      } else if (body?.type === InteractionResponseType.ChannelMessageWithSource) {
+        originals.set(token, { loading: false, flags: body.data?.flags ?? 0, gone: false, filled: true, fill: fillOf(body.data) });
+      }
+      return undefined;
+    }
+    if (!state) return undefined;
+    if (original && state.gone) throw unknownMessage(method, route);
+    if (method === 'delete' && original) state.gone = true;
+    else if ((method === 'patch' && original) || (method === 'post' && !route.includes('/messages') && state.loading)) {
+      state.loading = false;
+      state.filled = true;
+      state.fill = { ...state.fill, ...fillOf(body) };
+    } else if (method === 'get' && original) {
+      const loading = readBack.loadingFlag && (state.loading || (state.filled && readBack.loadingAfterFill));
+      return { ...fakeMessage, ...state.fill, flags: loading ? MessageFlags.Loading | state.flags : 0 };
+    }
+    return undefined;
+  };
+}
+
 /** A gateway Client with the ledgers (and so the gate) installed, whose REST records every call in order. */
 export function rig() {
   const client = new Client({ intents: [] });
   installGatedInteractions(client);
   const wire: WireCall[] = [];
-  const control = { failNext: null as Error | null, onSend: null as ((call: WireCall) => void) | null, delayMs: 0 };
+  const control = {
+    failNext: null as Error | null,
+    onSend: null as ((call: WireCall) => void) | null,
+    delayMs: 0,
+    readBack: { loadingFlag: true, loadingAfterFill: false } as ReadBack,
+  };
   const rest = client.rest as unknown as Record<string, (route: string, options?: { body?: unknown }) => Promise<unknown>>;
+  const discord = originalModel(control.readBack);
   for (const method of ['post', 'patch', 'delete', 'get'] as const) {
     rest[method] = async (route, options = {}) => {
       if (control.failNext) {
@@ -71,7 +138,8 @@ export function rig() {
       wire.push(call);
       // A call on the wire for a while: discord.js sets its flags only once it returns.
       if (control.delayMs > 0) await new Promise(resolve => setTimeout(resolve, control.delayMs));
-      return route.includes('/callback') ? undefined : fakeMessage;
+      const held = discord(method, route, options.body);
+      return route.includes('/callback') ? undefined : held ?? fakeMessage;
     };
   }
   /** Emits one interaction; the handler runs as its listener, inside its ledger. */

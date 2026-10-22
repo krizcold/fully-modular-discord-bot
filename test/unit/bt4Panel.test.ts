@@ -5,6 +5,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 // every write its run recorded landed and none was refused; otherwise the truth, and its live update is not broadcast.
 const loading = vi.hoisted(() => new Set<string>());
 const manager = vi.hoisted(() => ({ current: null as unknown }));
+// BT1C-3: a stop begun, without the exit drain closing this file's writes for good.
+const stop = vi.hoisted(() => ({ on: false }));
+vi.mock('../../src/bot/internalSetup/utils/dataManager', async importOriginal => {
+  const real = await importOriginal<typeof import('../../src/bot/internalSetup/utils/dataManager')>();
+  return { ...real, isStopping: () => stop.on || real.isStopping() };
+});
 
 vi.mock('../../src/bot/internalSetup/utils/dataBackends/boot', async importOriginal => {
   const real = await importOriginal<typeof import('../../src/bot/internalSetup/utils/dataBackends/boot')>();
@@ -55,6 +61,7 @@ afterEach(() => {
   process.send = originalSend;
   vi.useRealTimers();
   loading.clear();
+  stop.on = false;
 });
 
 /** A panel behind a panelManager stub over the real PanelWebUIAdapter, as panelManager.ts:441-484 delegates. */
@@ -168,6 +175,18 @@ describe('a panel run whose writes are not confirmed', () => {
       return VIEW;
     }, guildId);
     expect(answer).toEqual({ success: false, error: truthText('held', false) });
+    expect(broadcasts).toEqual([]);
+  });
+
+  it('a held write while the bot stops says the change may be lost', async () => {
+    const { guildId, store, options } = await storeGuild();
+    store.mode = 'read-only';
+    const answer = await run('panel:modal', async () => {
+      saveData('x.json', options, { v: 1 });
+      stop.on = true;
+      return VIEW;
+    }, guildId);
+    expect(answer).toEqual({ success: false, error: 'The bot is restarting and could not confirm your change was saved; it may be lost. Please check once it is back.' });
     expect(broadcasts).toEqual([]);
   });
 

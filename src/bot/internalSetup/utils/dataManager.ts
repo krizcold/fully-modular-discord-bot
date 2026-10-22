@@ -200,6 +200,22 @@ export function isClosedForExit(): boolean {
   return closedForExit;
 }
 
+let stopBegun = false;
+
+/** The process's shutdown handler: runs its steps once, the stop marked begun before the first of them. */
+export function stopHandler(steps: () => Promise<void>): () => Promise<void> {
+  return async () => {
+    if (stopBegun) return;
+    stopBegun = true;
+    await steps();
+  };
+}
+
+/** A stop has begun or the exit drain runs: a write not saved by now may never be retried, and may be lost. */
+export function isStopping(): boolean {
+  return stopBegun || exitDrain !== null;
+}
+
 /**
  * Flush every queued op for one guild (migration drain primitive).
  */

@@ -1,12 +1,21 @@
 // The interaction reply gate (BT-3): on a real interaction, a response method sends the module's payload only once
-// every write in the union of its ledgers has landed and none was refused; otherwise a truthful text goes in its
-// place. A response called before ACK_MS from the emit is acknowledged by then; one called later, at once. A module
-// that declares dataContract 2 (BT-5) is judged on refusals only: its payload goes out at once, unless a write was
-// refused, and the gate defers nothing for it.
+// every write in the union of its ledgers has landed and none was refused; otherwise the member is told a truthful
+// text in its place (tell says where it goes). A response called before ACK_MS from the emit is acknowledged by then;
+// one called later, at once. A module that declares dataContract 2 (BT-5) is judged on refusals only: its payload goes
+// out at once, unless a write was refused, and the gate defers nothing for it.
 
-import { ContainerBuilder, InteractionResponseType, MessageFlags, MessageFlagsBitField, TextDisplayBuilder, type Client } from 'discord.js';
+import {
+  ContainerBuilder,
+  InteractionCallbackResponse,
+  InteractionResponseType,
+  Message,
+  MessageFlags,
+  MessageFlagsBitField,
+  TextDisplayBuilder,
+  type Client,
+} from 'discord.js';
 import { getConfigProperty } from '../configManager';
-import { confirmFrom } from '../dataManager';
+import { confirmFrom, isStopping } from '../dataManager';
 import { parseButtonCustomId, parseDropdownCustomId, parseModalCustomId } from '../panel/panelCustomIds';
 import { declaresOwnOutcomes } from './dataContract';
 import { currentLedger, currentModule, installInteractionLedgers, landed, ledgerOf, type LedgerCause, type LedgerTicket, type WriteLedger } from './writeLedger';
@@ -29,6 +38,10 @@ const worst = (answers: TruthAnswer[]): TruthAnswer => answers.reduce((a, b) => 
 export function truthText(answer: TruthAnswer, partial: boolean): string {
   const notSaved = partial ? 'not saved in full' : 'not saved';
   const inFull = partial ? ' in full' : '';
+  // The exit drain may give up on a held or pending write and the process exits, so no retry is promised.
+  if ((answer === 'held' || answer === 'pending') && isStopping()) {
+    return `The bot is restarting and could not confirm your change was saved${inFull}; it may be lost. Please check once it is back.`;
+  }
   switch (answer) {
     case 'node-stopping':
       return `The bot is restarting, so your change was ${notSaved}. Please try again in a moment.`;
@@ -234,14 +247,54 @@ function optionsOf(payload: unknown): Options {
   return {};
 }
 
-/** The gate's deferral's callback response, given the message the caller's call showed, which withResponse reads. */
-function withMessage(ack: unknown, name: 'reply' | 'update', message: unknown): unknown {
+const isEphemeral = (options: Options): boolean => options.ephemeral === true || flagsOf(options.flags).has(MessageFlags.Ephemeral);
+
+/** The message a deleteReply or fetchReply argument names, as discord.js reads it. */
+function idOf(message: unknown): string {
+  if (message === undefined || message === null) return '@original';
+  return typeof message === 'string' ? message : String((message as { id?: unknown }).id);
+}
+
+/** The message an editReply's options name. */
+const targetOf = (options: Options): string => idOf(options.message);
+
+/** The message id a response method's result shows, if any (an InteractionResponse's id is the interaction's). */
+function messageIdOf(result: unknown): string | undefined {
+  if (result instanceof Message) return result.id;
+  if (result instanceof InteractionCallbackResponse) return result.resource?.message?.id ?? result.interaction.responseMessageId ?? undefined;
+  return undefined;
+}
+
+const isUnknownMessage = (error: unknown): boolean => (error as { code?: unknown } | null)?.code === 10008;
+
+/**
+ * A deferral with nothing in it yet. Discord takes no empty edit or followUp, so a fill always left content, an
+ * embed, a component, an attachment or a poll. Whether the Loading flag reads back (before or after a fill) is not
+ * measured (RK-2), so it decides nothing.
+ */
+function isEmptyDeferral(message: Message): boolean {
+  return !message.content && message.embeds.length === 0 && message.components.length === 0
+    && message.attachments.size === 0 && !message.poll;
+}
+
+/**
+ * The gate's deferral's callback response, given the message the caller's call showed, which withResponse reads. When
+ * that message is the followUp standing in for the deleted deferral, the response names it as its message too.
+ */
+function withMessage(ack: unknown, name: 'reply' | 'update', message: unknown, standIn = false): unknown {
   if (!ack || typeof ack !== 'object') return ack;
-  const response = ack as { resource: Record<string, unknown> | null };
+  const response = ack as { resource: Record<string, unknown> | null; interaction?: Record<string, unknown> };
   if (response.resource) response.resource.message = message;
   else {
     const type = name === 'reply' ? InteractionResponseType.DeferredChannelMessageWithSource : InteractionResponseType.DeferredMessageUpdate;
     response.resource = { type, activityInstance: null, message };
+  }
+  if (standIn && response.interaction) {
+    Object.assign(response.interaction, {
+      responseMessageId: messageIdOf(message) ?? null,
+      responseMessageLoading: false,
+      responseMessageEphemeral: true,
+    });
   }
   return ack;
 }
@@ -263,12 +316,13 @@ const GATED = new Set(['reply', 'update', 'editReply', 'followUp']);
 
 /** Installs the gate on one interaction, before any listener sees it. */
 export function installReplyGate(interaction: object, ledger: WriteLedger): void {
-  const target = interaction as Record<string, unknown> & { message?: { flags?: unknown } | null };
+  const target = interaction as Record<string, unknown> & { message?: { id?: string; flags?: unknown } | null };
   if (typeof target.reply !== 'function') return;
   const original: Record<string, Method> = {};
   for (const name of Object.keys(SETS)) {
     if (typeof target[name] === 'function') original[name] = target[name] as Method;
   }
+  const fetchMessage = target.fetchReply as Method;
 
   // discord.js sets these only after its REST call returns. While the gate holds a call, they answer as if it had
   // gone out; the gate's own sends see the real values, so discord.js's guards behave as without the gate.
@@ -294,6 +348,17 @@ export function installReplyGate(interaction: object, ledger: WriteLedger): void
     else told.tickets.set(failure.key, Math.max(failure.seq, told.tickets.get(failure.key) ?? -1));
   };
   let originalIsV2 = flagsOf(target.message?.flags).has(MessageFlags.IsComponentsV2);
+  const componentEphemeral = flagsOf(target.message?.flags).has(MessageFlags.Ephemeral);
+  // What the calls made of the original (the message an editReply edits by default): whether the member alone is known
+  // to see it, and whether it is a deferral no call is known to have filled. That one is read back before any delete.
+  const shown = { ephemeral: false, emptyDeferral: false };
+  // The original's message id once a result showed it, so a call naming it by id or by its Message is a call on it.
+  let originalId: string | undefined;
+  // Once the gate deleted an empty public deferral, its truth's followUp stands in the original's place.
+  let standIn: string | undefined;
+  let deletedOriginal = false;
+  const isOriginal = (id: string): boolean => id === '@original' || id === originalId;
+  const onOriginal = (id: string): boolean => (standIn === undefined ? isOriginal(id) : id === standIn);
 
   const send = async (name: string, args: unknown[]): Promise<unknown> => {
     let call: Promise<unknown>;
@@ -304,10 +369,28 @@ export function installReplyGate(interaction: object, ledger: WriteLedger): void
       hidden -= 1;
     }
     const result = await call;
-    const isV2 = flagsOf(optionsOf(args[0]).flags).has(MessageFlags.IsComponentsV2);
+    const options = optionsOf(args[0]);
+    const isV2 = flagsOf(options.flags).has(MessageFlags.IsComponentsV2);
     // A reply or a deferral makes a new original message; an update or an edit can only turn the current one V2.
     if (name === 'reply' || name === 'deferReply') originalIsV2 = name === 'reply' && isV2;
     else if ((name === 'update' || name === 'editReply') && isV2) originalIsV2 = true;
+    if (name === 'reply' || name === 'deferReply') {
+      // discord.js records the flags it sent; an ephemeral option on a payload built for another target is not sent.
+      shown.ephemeral = typeof target.ephemeral === 'boolean' ? target.ephemeral : isEphemeral(options);
+      shown.emptyDeferral = name === 'deferReply';
+      originalId ??= messageIdOf(result);
+    } else if (name === 'update' || name === 'deferUpdate') {
+      // The original is the component's message.
+      shown.ephemeral = componentEphemeral;
+      shown.emptyDeferral = false;
+      originalId = target.message?.id;
+    } else if (name === 'editReply' && onOriginal(targetOf(options))) {
+      shown.emptyDeferral = false;
+      if (standIn === undefined) originalId ??= messageIdOf(result);
+    } else if (name === 'deleteReply' && isOriginal(idOf(args[0]))) {
+      shown.ephemeral = false;
+      shown.emptyDeferral = false;
+    }
     return result;
   };
 
@@ -320,22 +403,102 @@ export function installReplyGate(interaction: object, ledger: WriteLedger): void
       return { content: text, flags: MessageFlags.Ephemeral, embeds: [], components: [], files: [], allowedMentions, ...asked };
     }
     // An edit of the acknowledged message keeps its ephemerality, and a V2 message stays V2.
+    const message = name === 'editReply' ? { message: targetOf(optionsOf(payload)) } : {};
     if (originalIsV2 || flagsOf(optionsOf(payload).flags).has(MessageFlags.IsComponentsV2)) {
       const container = new ContainerBuilder().addTextDisplayComponents(new TextDisplayBuilder().setContent(text));
-      return { components: [container], flags: MessageFlags.IsComponentsV2, attachments: [], allowedMentions, ...asked };
+      return { components: [container], flags: MessageFlags.IsComponentsV2, attachments: [], allowedMentions, ...message, ...asked };
     }
-    return { content: text, embeds: [], components: [], attachments: [], allowedMentions, ...asked };
+    return { content: text, embeds: [], components: [], attachments: [], allowedMentions, ...message, ...asked };
   };
 
-  const tell = async (name: string, verdict: Extract<Verdict, { ok: false }>, payload: unknown): Promise<unknown> => {
+  // A public deferral no call is known to have filled is read back first, and deleted only while it holds nothing
+  // (isEmptyDeferral). One Discord no longer holds counts as deleted; either way the truth's followUp
+  // then stands in its place. A delete that fails otherwise rejects the call, and the next call tries again.
+  const dropEmptyDeferral = async (): Promise<void> => {
+    const message = await (fetchMessage.call(target, '@original') as Promise<Message>).catch(error => {
+      if (isUnknownMessage(error)) return null;
+      throw error;
+    });
+    if (message && !isEmptyDeferral(message)) {
+      shown.emptyDeferral = false;
+      return;
+    }
+    if (message) {
+      await send('deleteReply', []).catch(error => {
+        if (!isUnknownMessage(error)) throw error;
+      });
+    }
+    shown.ephemeral = false;
+    shown.emptyDeferral = false;
+    deletedOriginal = true;
+  };
+
+  // The truth goes into a message in place only when the member alone is known to see it: a refused first reply goes
+  // as an ephemeral reply; the ephemeral message a button, select menu or form came from takes the update, or the edit
+  // after an update or deferUpdate of it; an original a reply or a deferral sent ephemeral takes the edit; and so does
+  // the truth's own followUp standing in for a deleted deferral. Otherwise it goes to the member by an ephemeral
+  // followUp (after an update's acknowledgement) and the message others see is left as it is, except an empty public
+  // deferral, deleted first (dropEmptyDeferral) so no public placeholder stays. An ephemeral message the member
+  // dismissed answers Unknown Message to the edit, and the truth then goes by a new ephemeral followUp.
+  const tell = async (name: string, verdict: Extract<Verdict, { ok: false }>, payload: unknown, wantMessage = true): Promise<unknown> => {
+    const options = optionsOf(payload);
     if (!verdict.failed.some(isNew)) {
       // Told already: a later edit leaves the message as it stands, and a later followUp is dropped.
-      if (name === 'editReply') return (target.fetchReply as Method).call(target);
+      if (name === 'editReply') return fetchMessage.call(target, targetOf(options));
       if (name === 'followUp') return undefined;
     }
-    const result = await send(name, [truthPayload(name, truthText(verdict.answer, verdict.partial), payload)]);
+    const text = truthText(verdict.answer, verdict.partial);
+    const inPlace = name === 'reply'
+      || (name === 'update' && componentEphemeral)
+      || (name === 'editReply' && onOriginal(targetOf(options)) && shown.ephemeral);
+    let gone = false;
+    if (inPlace) {
+      try {
+        const result = await send(name, [truthPayload(name, text, payload)]);
+        verdict.failed.forEach(markTold);
+        return result;
+      } catch (error) {
+        if (name !== 'editReply' || !isUnknownMessage(error)) throw error;
+        gone = true;
+        shown.ephemeral = false;
+        shown.emptyDeferral = false;
+        standIn = undefined;
+      }
+    }
+    const ack = name === 'update' ? await send('deferUpdate', [{ withResponse: options.withResponse }]) : undefined;
+    if (shown.emptyDeferral && !shown.ephemeral && standIn === undefined) await dropEmptyDeferral();
+    let told: unknown;
+    try {
+      told = await send('followUp', [truthPayload('followUp', text, undefined)]);
+    } catch (error) {
+      // Not measured (RK-2): whether Discord takes a followUp once its deferral was deleted. If it answers Unknown
+      // Message, every later call would fail the same way, so this truth counts as told, and that is logged.
+      if (deletedOriginal && standIn === undefined && isUnknownMessage(error)) {
+        verdict.failed.forEach(markTold);
+        const { kind, name: site } = siteOf(target);
+        console.warn(`[Truth] Discord refused the truth's followUp after its deferral was deleted (${kind} ${site})`);
+      }
+      throw error;
+    }
     verdict.failed.forEach(markTold);
-    return result;
+    // The truth whose followUp failed after the delete is told on a later call, which then stands in for it.
+    const replacing = deletedOriginal && standIn === undefined;
+    if (replacing) {
+      standIn = (told as { id?: string } | undefined)?.id;
+      shown.ephemeral = standIn !== undefined;
+      originalIsV2 = false;
+    }
+    if (name === 'followUp') return told;
+    if (name === 'update') {
+      if (!options.withResponse && !options.fetchReply) return ack;
+      // The caller asked for the message it showed: the component message, as it stands.
+      const message = await fetchMessage.call(target);
+      return options.withResponse ? withMessage(ack, 'update', message) : message;
+    }
+    if (!wantMessage) return undefined;
+    // The message that stands: the truth's followUp in place of a deleted deferral or a dismissed message, otherwise
+    // the one the edit named.
+    return replacing || gone ? told : fetchMessage.call(target, targetOf(options));
   };
 
   // The sweep's mark: taken once a module's payload went out, never for the truth, a deferral or an acknowledgement;
@@ -360,14 +523,15 @@ export function installReplyGate(interaction: object, ledger: WriteLedger): void
       const early = await within(verdicts, ledger.openedAt + ACK_MS - performance.now());
       if (early === undefined) {
         const options = optionsOf(args[0]);
-        const ephemeral = options.ephemeral === true || flagsOf(options.flags).has(MessageFlags.Ephemeral);
+        const ephemeral = isEphemeral(options);
         const ack = name === 'reply'
           ? await send('deferReply', [{ flags: ephemeral ? MessageFlags.Ephemeral : undefined, withResponse: options.withResponse }])
           : await send('deferUpdate', [{ withResponse: options.withResponse }]);
         const verdict = await verdicts;
-        const edited = verdict.ok ? await payload('editReply', [asEdit(args[0])]) : await tell('editReply', verdict, args[0]);
+        const wantMessage = Boolean(options.withResponse || options.fetchReply);
+        const edited = verdict.ok ? await payload('editReply', [asEdit(args[0])]) : await tell('editReply', verdict, args[0], wantMessage);
         // As discord.js does, withResponse wins over fetchReply.
-        if (options.withResponse) return withMessage(ack, name === 'reply' ? 'reply' : 'update', edited);
+        if (options.withResponse) return withMessage(ack, name === 'reply' ? 'reply' : 'update', edited, standIn !== undefined);
         return options.fetchReply ? edited : ack;
       }
       return early.ok ? payload(name, args) : tell(name, early, args[0]);
@@ -432,11 +596,35 @@ export function installReplyGate(interaction: object, ledger: WriteLedger): void
     queue = settled.catch(() => undefined);
     return settled;
   };
+  // A call on the original (by @original, its id or its Message) after the gate deleted it goes to the followUp
+  // standing in its place, and a delete of it, or of that followUp, is done: the truth stays in front of the member.
+  // InteractionResponse's edit, delete and fetch call these.
+  const retarget = (name: string, args: unknown[]): unknown[] | null => {
+    if (standIn === undefined) return args;
+    if (name === 'editReply') {
+      const options = optionsOf(args[0]);
+      return isOriginal(targetOf(options)) ? [{ ...options, message: standIn }, ...args.slice(1)] : args;
+    }
+    return name === 'deleteReply' && (isOriginal(idOf(args[0])) || idOf(args[0]) === standIn) ? null : args;
+  };
   for (const name of Object.keys(original)) {
     target[name] = (...args: unknown[]): Promise<unknown> => {
       const frameLedger = currentLedger();
       const sender = currentModule() ?? ledger.kind;
-      return enqueue(SETS[name], () => (GATED.has(name) ? gated(name, args, frameLedger, sender) : send(name, args)));
+      return enqueue(SETS[name], async () => {
+        const callArgs = retarget(name, args);
+        if (callArgs === null) return undefined;
+        return GATED.has(name) ? gated(name, callArgs, frameLedger, sender) : send(name, callArgs);
+      });
+    };
+  }
+  // A read, so neither gated nor queued; discord.js's own fetchReply inside a reply or deferral comes through it too.
+  if (typeof fetchMessage === 'function') {
+    target.fetchReply = async (message?: unknown): Promise<unknown> => {
+      const id = idOf(message);
+      const result = await fetchMessage.call(target, standIn !== undefined && isOriginal(id) ? standIn : message);
+      if (standIn === undefined && id === '@original') originalId ??= messageIdOf(result);
+      return result;
     };
   }
   // Logs once per site, never to the member; the mark is cleared so it keeps no working set alive.

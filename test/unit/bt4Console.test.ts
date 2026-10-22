@@ -6,6 +6,12 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 const local = vi.hoisted(() => ({ commands: [] as any[], calls: 0, vanishAfter: Infinity }));
 const premium = vi.hoisted(() => ({ overrides: {} as Record<string, unknown>, access: true }));
 const bot = vi.hoisted(() => ({ client: null as any }));
+// BT1C-3: a stop begun, without the exit drain closing this file's writes for good.
+const stop = vi.hoisted(() => ({ on: false }));
+vi.mock('../../src/bot/internalSetup/utils/dataManager', async importOriginal => {
+  const real = await importOriginal<typeof import('../../src/bot/internalSetup/utils/dataManager')>();
+  return { ...real, isStopping: () => stop.on || real.isStopping() };
+});
 
 vi.mock('../../src/bot/internalSetup/utils/getLocalCommands', () => ({
   default: () => (++local.calls > local.vanishAfter ? [] : local.commands),
@@ -39,6 +45,7 @@ afterEach(() => {
   local.vanishAfter = Infinity;
   premium.overrides = {};
   premium.access = true;
+  stop.on = false;
 });
 
 function fakeClient(guild?: unknown) {
@@ -98,6 +105,16 @@ describe('a console run whose writes are not confirmed', () => {
       saveData('x.json', options, { v: 1 });
     }, {}, guildId);
     expect(answer).toMatchObject({ success: false, error: truthText('held', false), truth: 'held', pending: true });
+  });
+
+  it('a held write while the bot stops says the change may be lost, still marked pending', async () => {
+    const { guildId, store, options } = await storeGuild();
+    store.mode = 'read-only';
+    const { answer } = await invoke(async () => {
+      saveData('x.json', options, { v: 1 });
+      stop.on = true;
+    }, {}, guildId);
+    expect(answer).toMatchObject({ success: false, error: 'The bot is restarting and could not confirm your change was saved; it may be lost. Please check once it is back.', truth: 'held', pending: true });
   });
 
   it('a guild taken over answers deposed, not pending', async () => {

@@ -13,7 +13,7 @@ import { setupMetricsIPCHandlers } from './utils/ipcMetricsHandler';
 import { setupFleetIPCHandlers } from './utils/ipcFleetHandler';
 import { getMetricsCollector } from './utils/metrics/metricsCollector';
 import { startSamplers, stopSamplers } from './utils/metrics/samplers';
-import { drainForExit, sweepGraveyard, DataBackendUnavailableError } from './utils/dataManager';
+import { drainForExit, stopHandler, sweepGraveyard, DataBackendUnavailableError } from './utils/dataManager';
 import { initDataBackendLayer, awaitDataStartupBarrier, dispatchGated, dataUnavailableMessage } from './utils/dataBackends/boot';
 import { getWorkingSet } from './utils/dataBackends/workingSet';
 import { setupReloadIPCHandlers } from './utils/ipcReloadHandler';
@@ -724,10 +724,7 @@ async function main() {
   }, 24 * 60 * 60 * 1000);
   graveyardTimer.unref();
 
-  let shuttingDown = false;
-  const shutdownHandler = async () => {
-    if (shuttingDown) return;
-    shuttingDown = true;
+  const shutdownHandler = stopHandler(async () => {
     stopSamplers();
     // No event is handled while the writes drain: a gateway left up keeps
     // taking writes the drain may never reach. Bounded, since a destroy
@@ -751,7 +748,7 @@ async function main() {
     const drainMs = getWorkingSet() ? 30000 : 5000;
     await drainForExit(drainMs);
     process.exit(0);
-  };
+  });
   process.on('SIGTERM', () => void shutdownHandler());
   process.on('SIGINT', () => void shutdownHandler());
 

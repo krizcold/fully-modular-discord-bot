@@ -1,8 +1,9 @@
+import { InteractionResponseType } from 'discord.js';
 import fc from 'fast-check';
 import { describe, expect, it } from 'vitest';
 
 import { appendData, saveData, saveDataOutcome } from '../../src/bot/internalSetup/utils/dataManager';
-import { notReadyGuild, rawCommand, rig, storeGuild, textOf } from '../helpers/gateRig';
+import { EPHEMERAL, notReadyGuild, rawCommand, rig, storeGuild, textOf } from '../helpers/gateRig';
 
 // BT-3's properties (notes/BT.md, "BT-3 design sheet (L0)"), with an oracle that does not use the gate:
 // - truth: the payload reaches the wire only when no write was refused and every write is committed in the store at
@@ -67,6 +68,15 @@ describe('the reply gate, over random interactions', () => {
           } else {
             expect(payloads).toEqual([]);
             expect(texts.length).toBeGreaterThan(0);
+            // Every original here is public: each truth carries the Ephemeral flag, none edits a message, and each
+            // deferral (the module's or the gate's), still empty when refused, is deleted.
+            for (const call of wire.filter(c => textOf(c) !== undefined)) {
+              expect(call.method).toBe('post');
+              expect(((call.route.includes('/callback') ? call.body?.data?.flags : call.body?.flags) ?? 0) & EPHEMERAL).toBe(EPHEMERAL);
+            }
+            const deferrals = wire.filter(c => c.route.includes('/callback') && c.body?.type === InteractionResponseType.DeferredChannelMessageWithSource);
+            expect(wire.filter(c => c.method === 'delete')).toHaveLength(deferrals.length);
+            if (shape === 'deferThenEdit') expect(deferrals).toHaveLength(1);
           }
           wire.forEach((call, n) => {
             if (textOf(call)?.startsWith('PAYLOAD')) expect(committedAtSend[n]).toBe(true);
