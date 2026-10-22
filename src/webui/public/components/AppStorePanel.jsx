@@ -2648,39 +2648,30 @@ function MigrationsPanel({ tiers, providers, sectionStyle, showSuccess, setError
     } catch (err) { setError(err.message); }
   }
 
-  // Helpers for the schedule form: when the admin picks a source variant,
-  // pre-fill source tier+offering by scanning the wired tiers/offerings.
-  // Likewise for target. Non-destructive - admin can override.
-  function applySourceVariant(variantId) {
-    setDraft(d => ({ ...d, sourceVariantId: variantId }));
-    if (!variantId) return;
-    for (const [tierId, t] of Object.entries(tiers)) {
-      for (const o of (t.offerings || [])) {
-        for (const link of (o.providerLinks || [])) {
-          const variants = link.cache?.variants || [];
-          if (variants.some(v => v.variantId === variantId)) {
-            setDraft(d => ({ ...d, sourceTierId: tierId, sourceOfferingId: o.id, providerId: link.providerId }));
-            return;
-          }
-        }
+  // Each picker option names provider, tier, offering and variant, so a pick
+  // fills the whole side of the draft. A source pick on another provider
+  // clears the target, which the target picker would no longer list.
+  const variantKey = (providerId, tierId, offeringId, variantId) =>
+    [providerId, tierId, offeringId, variantId].map(encodeURIComponent).join(':');
+
+  function applySourceVariant(key) {
+    const v = allKnownVariants.find(x => x.key === key);
+    setDraft(d => {
+      if (!v) return { ...d, sourceTierId: '', sourceOfferingId: '', sourceVariantId: '' };
+      const next = { ...d, providerId: v.providerId, sourceTierId: v.tierId, sourceOfferingId: v.offeringId, sourceVariantId: v.variantId };
+      if (d.targetVariantId && d.providerId !== v.providerId) {
+        next.targetTierId = ''; next.targetOfferingId = ''; next.targetVariantId = '';
       }
-    }
+      return next;
+    });
   }
 
-  function applyTargetVariant(variantId) {
-    setDraft(d => ({ ...d, targetVariantId: variantId }));
-    if (!variantId) return;
-    for (const [tierId, t] of Object.entries(tiers)) {
-      for (const o of (t.offerings || [])) {
-        for (const link of (o.providerLinks || [])) {
-          const variants = link.cache?.variants || [];
-          if (variants.some(v => v.variantId === variantId)) {
-            setDraft(d => ({ ...d, targetTierId: tierId, targetOfferingId: o.id }));
-            return;
-          }
-        }
-      }
-    }
+  function applyTargetVariant(key) {
+    const v = allKnownVariants.find(x => x.key === key);
+    setDraft(d => {
+      if (!v) return { ...d, targetTierId: '', targetOfferingId: '', targetVariantId: '' };
+      return { ...d, providerId: v.providerId, targetTierId: v.tierId, targetOfferingId: v.offeringId, targetVariantId: v.variantId };
+    });
   }
 
   // Flatten all known variants (per provider) for the source/target pickers.
@@ -2691,6 +2682,7 @@ function MigrationsPanel({ tiers, providers, sectionStyle, showSuccess, setError
         for (const link of (o.providerLinks || [])) {
           for (const v of (link.cache?.variants || [])) {
             out.push({
+              key: variantKey(link.providerId, tierId, o.id, v.variantId),
               providerId: link.providerId,
               tierId, tierName: t.displayName,
               offeringId: o.id, offeringLabel: o.label,
@@ -2710,6 +2702,12 @@ function MigrationsPanel({ tiers, providers, sectionStyle, showSuccess, setError
       'targetTierId', 'targetOfferingId', 'targetVariantId', 'effectiveDate'];
     for (const k of required) {
       if (!draft[k]) { setError(`${k} is required`); return; }
+    }
+    const srcKey = variantKey(draft.providerId, draft.sourceTierId, draft.sourceOfferingId, draft.sourceVariantId);
+    const tgtKey = variantKey(draft.providerId, draft.targetTierId, draft.targetOfferingId, draft.targetVariantId);
+    if (!allKnownVariants.some(v => v.key === srcKey) || !allKnownVariants.some(v => v.key === tgtKey)) {
+      setError('Pick a source and a target variant on the same provider');
+      return;
     }
     const eff = new Date(draft.effectiveDate);
     if (isNaN(eff.getTime()) || eff.getTime() <= Date.now()) {
@@ -2811,11 +2809,11 @@ function MigrationsPanel({ tiers, providers, sectionStyle, showSuccess, setError
                   <div>
                     <label style={labelStyle}>Source variant</label>
                     <select style={{ ...inputStyle, width: '100%' }}
-                      value={draft.sourceVariantId}
+                      value={draft.sourceVariantId ? variantKey(draft.providerId, draft.sourceTierId, draft.sourceOfferingId, draft.sourceVariantId) : ''}
                       onChange={e => applySourceVariant(e.target.value)}>
                       <option value="">Pick source variant...</option>
-                      {allKnownVariants.map((v, i) => (
-                        <option key={`${v.providerId}:${v.variantId}:${i}`} value={v.variantId}>
+                      {allKnownVariants.map(v => (
+                        <option key={v.key} value={v.key}>
                           [{v.providerId}] {v.tierName} / {v.offeringLabel} - {v.label} ({(v.amount / 100).toFixed(2)} {v.currency})
                         </option>
                       ))}
@@ -2824,13 +2822,13 @@ function MigrationsPanel({ tiers, providers, sectionStyle, showSuccess, setError
                   <div>
                     <label style={labelStyle}>Target variant</label>
                     <select style={{ ...inputStyle, width: '100%' }}
-                      value={draft.targetVariantId}
+                      value={draft.targetVariantId ? variantKey(draft.providerId, draft.targetTierId, draft.targetOfferingId, draft.targetVariantId) : ''}
                       onChange={e => applyTargetVariant(e.target.value)}>
                       <option value="">Pick target variant...</option>
                       {allKnownVariants
                         .filter(v => !draft.providerId || v.providerId === draft.providerId)
-                        .map((v, i) => (
-                          <option key={`tgt:${v.providerId}:${v.variantId}:${i}`} value={v.variantId}>
+                        .map(v => (
+                          <option key={`tgt:${v.key}`} value={v.key}>
                             [{v.providerId}] {v.tierName} / {v.offeringLabel} - {v.label} ({(v.amount / 100).toFixed(2)} {v.currency})
                           </option>
                         ))}

@@ -228,9 +228,8 @@ export interface Migration {
   targetTierId: string;
   targetOfferingId: string;
   targetVariantId: string;
-  /** ISO timestamp when the scheduler will apply decisions. Spec says
-   * >=30 days from scheduling for compliance; we soft-validate (warn but
-   * allow) to keep the dev loop sane. */
+  /** ISO timestamp when the scheduler will apply decisions. Only a future
+   * date is required; no notice period is enforced. */
   effectiveDate: string;
   /** Free-form announcement copy admins write, shown in subscriber DMs. */
   message: string;
@@ -2496,6 +2495,12 @@ export class PremiumManager {
     const sourceOffering = sourceTier.offerings.find(o => o.id === opts.sourceOfferingId);
     const targetOffering = targetTier.offerings.find(o => o.id === opts.targetOfferingId);
     if (!sourceOffering || !targetOffering) throw new Error('Unknown source or target offering.');
+    if (!this.findCachedVariant(sourceOffering, opts.providerId, opts.sourceVariantId)) {
+      throw new Error(`Source variant '${opts.sourceVariantId}' is not on offering '${opts.sourceOfferingId}' for provider '${opts.providerId}'.`);
+    }
+    if (!this.findCachedVariant(targetOffering, opts.providerId, opts.targetVariantId)) {
+      throw new Error(`Target variant '${opts.targetVariantId}' is not on offering '${opts.targetOfferingId}' for provider '${opts.providerId}'.`);
+    }
 
     const decisions: MigrationGuildDecision[] = [];
     for (const [guildId, subs] of Object.entries(this.config.subscriptions)) {
