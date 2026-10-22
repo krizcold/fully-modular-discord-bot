@@ -4,6 +4,7 @@
 // never the reverse).
 
 import { DataBackend, FenceToken } from './backend';
+import { routeFor } from './routeResolver';
 import { WorkingSetManager } from './workingSet';
 import { setOwnedGuildCatalog } from '../dataManager';
 
@@ -60,6 +61,7 @@ export class DataReadinessDriver {
   private bufferDrops = 0;
   // When each guild's last claim here was deposed (performance.now()); a hold counts only one made since it began.
   private readonly deposedAt = new Map<string, number>();
+  private readonly loops = new Map<string, RetryLoop>();
   private initialResolved = false;
   private resolveInitial: (() => void) | null = null;
   private readonly initialHydration = new Promise<void>(resolve => { this.resolveInitial = resolve; });
@@ -153,9 +155,15 @@ export class DataReadinessDriver {
    * for the guild's working set. False = the route refuses.
    */
   async admitInteraction(guildId: string): Promise<boolean> {
-    if (this.isReadyNow(guildId)) return true;
-    this.hydrateOnDemand(guildId);
-    return this.ws.awaitReady(guildId, INTERACTION_WAIT_MS);
+    const until = performance.now() + INTERACTION_WAIT_MS;
+    for (;;) {
+      if (this.isReadyNow(guildId)) return true;
+      this.hydrateOnDemand(guildId);
+      const waited = await this.ws.awaitReady(guildId, Math.max(0, until - performance.now()));
+      if (waited !== 'gone') return waited === 'ready';
+      // The set it waited on was evicted with none hydrating in its place: the route that serves the guild now decides.
+      if (routeFor(guildId) === 'file') return true;
+    }
   }
 
   /**
@@ -170,7 +178,7 @@ export class DataReadinessDriver {
     if (!queue) {
       queue = [];
       this.buffers.set(guildId, queue);
-      void this.ws.awaitReady(guildId, 24 * 60 * 60 * 1000).then(ready => this.drainBuffer(guildId, ready));
+      void this.ws.awaitReady(guildId, 24 * 60 * 60 * 1000).then(waited => this.drainBuffer(guildId, waited));
     }
     if (queue.length >= EVENT_BUFFER_CAP) {
       queue.shift();
@@ -267,10 +275,36 @@ export class DataReadinessDriver {
     }
   }
 
-  private async hydrateWithRetry(guildId: string): Promise<void> {
-    for (let attempt = 0; !this.stopped; attempt++) {
+  /**
+   * One retry loop per guild: a second caller shares the running one and wakes it, from its backoff or, once the
+   * attempt on the wire ends, before it sleeps. A loop whose set was evicted is replaced by a new one, which reads
+   * the guild at once, so a caller gated on that new set finds it hydrating.
+   */
+  private hydrateWithRetry(guildId: string): Promise<void> {
+    const running = this.loops.get(guildId);
+    if (running && this.ws.has(guildId)) {
+      running.woken = true;
+      running.resume?.();
+      return running.done;
+    }
+    if (running) {
+      running.replaced = true;
+      running.resume?.();
+    }
+    const loop: RetryLoop = { woken: false, replaced: false, resume: null, done: Promise.resolve() };
+    this.loops.set(guildId, loop);
+    loop.done = this.retryHydrate(guildId, loop).finally(() => { if (this.loops.get(guildId) === loop) this.loops.delete(guildId); });
+    return loop.done;
+  }
+
+  private async retryHydrate(guildId: string, loop: RetryLoop): Promise<void> {
+    for (let attempt = 0; !this.stopped && !loop.replaced; attempt++) {
       if (!this.isLeasedHere(guildId)) return;
+      loop.woken = false;
       const outcome = await this.ws.hydrate(guildId, this.fenceFor(guildId));
+      if (loop.replaced) return;
+      // Evicted as it read, with nothing in its place: its next access reads it again.
+      if (outcome === 'evicted') return;
       if (outcome === 'ready') {
         // Its lease moved while it hydrated: a re-grant renews the fence, a
         // revoke keeps it frozen, never served unleased.
@@ -282,16 +316,26 @@ export class DataReadinessDriver {
         } else await this.ws.unloadToFrozenRetained(guildId, () => !this.isLeasedHere(guildId));
         return;
       }
+      // A caller joined while this attempt was on the wire, under a fresh grant or the same one: it claims again at
+      // once, from the first backoff, under the grant held now; a deposed answer declines only when no caller joined while it was on the wire.
+      if (loop.woken) {
+        attempt = -1;
+        continue;
+      }
       if (outcome === 'deposed') {
         // A 0-row claim: a newer owner holds this guild. A healthy node must
         // not sit on a lease it can never serve - decline immediately (fleet
         // wiring; masters and standalone log only).
         this.deposedAt.set(guildId, performance.now());
         console.error(`[Data] Hydration claim for guild ${guildId} lost to a newer owner; not serving it`);
+        this.ws.dropWaiters(guildId);
         declineHandler?.('deposed-at-hydration', [guildIdToShardId(guildId, this.shardCount || 1)]);
         return;
       }
-      await sleep(backoff(attempt));
+      await Promise.race([sleep(backoff(attempt)), new Promise<void>(resolve => { loop.resume = resolve; })]);
+      loop.resume = null;
+      // A joining caller woke it: its next wait starts from the first backoff again, as a new loop's would.
+      if (loop.woken) attempt = -1;
     }
   }
 
@@ -304,20 +348,27 @@ export class DataReadinessDriver {
     }
   }
 
-  private drainBuffer(guildId: string, ready: boolean): void {
+  private drainBuffer(guildId: string, waited: 'ready' | 'gone' | 'not-ready'): void {
     const queue = this.buffers.get(guildId);
     this.buffers.delete(guildId);
     if (!queue) return;
-    if (!ready) {
-      if (queue.length > 0) console.warn(`[Data] Dropping ${queue.length} buffered event(s) for guild ${guildId} (working set never became ready)`);
-      return;
-    }
-    for (const replay of queue) {
-      try {
-        replay();
-      } catch (error) {
-        console.error(`[Data] Buffered event replay failed for guild ${guildId}:`, error);
+    let dropped = waited === 'not-ready' ? queue.length : 0;
+    if (waited !== 'not-ready') {
+      for (const replay of queue) {
+        // 'gone': the set they waited on was evicted with none hydrating in its place, so each goes back through the gate.
+        if (waited === 'ready' || routeFor(guildId) === 'file' || this.isReadyNow(guildId)) this.replay(guildId, replay);
+        else if (this.isLeasedHere(guildId)) this.admitEvent(guildId, replay);
+        else dropped += 1;
       }
+    }
+    if (dropped > 0) console.warn(`[Data] Dropping ${dropped} buffered event(s) for guild ${guildId} (working set never became ready)`);
+  }
+
+  private replay(guildId: string, replay: () => void): void {
+    try {
+      replay();
+    } catch (error) {
+      console.error(`[Data] Buffered event replay failed for guild ${guildId}:`, error);
     }
   }
 
@@ -343,6 +394,14 @@ export class DataReadinessDriver {
       setOwnedGuildCatalog(this.lastCatalog);
     } catch { /* catalog snapshot refresh is best-effort; the next tick retries */ }
   }
+}
+
+/** A guild's hydrate retry loop; woken by a caller that joined it, resume ends its backoff, replaced ends it. */
+interface RetryLoop {
+  woken: boolean;
+  replaced: boolean;
+  resume: (() => void) | null;
+  done: Promise<void>;
 }
 
 function sleep(ms: number): Promise<void> {

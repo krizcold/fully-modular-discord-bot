@@ -98,7 +98,7 @@ class GuildWorkingSet {
   flushInFlight = false;
   requeue = false;
   fencedDrainTimer: NodeJS.Timeout | null = null;
-  readyWaiters: Array<() => void> = [];
+  readyWaiters: ReadyWaiter[] = [];
   // A drain froze it while it hydrated: it comes up frozen-retained.
   freezeWhenReady = false;
   // Stamped at every accepted save, append and delete. landedSeq is the stamp
@@ -199,6 +199,20 @@ export interface BackendHealth {
   lastError: string | null;
 }
 
+type HydrateOutcome = 'ready' | 'deposed' | 'unavailable' | 'evicted';
+type ReadyWaiter = (result: 'ready' | 'gone' | 'not-ready') => void;
+
+/** A hydrate on the wire: the set it reads the store for, once it has one. */
+interface HydrationInFlight {
+  token: FenceToken;
+  set: GuildWorkingSet | undefined;
+  outcome: Promise<HydrateOutcome>;
+}
+
+function sameGrant(a: FenceToken, b: FenceToken): boolean {
+  return a.term === b.term && a.epoch === b.epoch;
+}
+
 export class WorkingSetManager {
   private readonly sets = new Map<string, GuildWorkingSet>();
   private health: BackendHealth['state'] = 'healthy';
@@ -210,6 +224,9 @@ export class WorkingSetManager {
   // has taken writes, another node may have written newer data, so a carry not
   // yet applied is dropped rather than flushed over it.
   private readonly adoptions = new Map<string, { carry: DirtyCarry; store: DataBackend }>();
+  private readonly hydrations = new Map<string, HydrationInFlight>();
+  // Those waiting on a set evicted before it went ready, until the next set read for the guild takes them on.
+  private readonly parkedWaiters = new Map<string, ReadyWaiter[]>();
   // Counters driven to zero by the drill matrix (non-gated callers touching
   // guilds whose working set is not ready).
   private wsBypassReads = 0;
@@ -406,11 +423,31 @@ export class WorkingSetManager {
   }
 
   /**
-   * Hydrate a guild (claim-then-read). Returns 'ready' | 'deposed' |
-   * 'unavailable'. On 'unavailable' the working set stays in 'hydrating' and
-   * the caller retries; a partially hydrated guild is never served.
+   * Hydrate a guild (claim-then-read); a partially hydrated guild is never served. 'unavailable': the store did not
+   * answer and the set keeps waiting, or the set was replaced while it read; the caller retries against whatever
+   * serves the guild now. 'evicted': the set was evicted while it read or reclaimed and none took its place, whatever
+   * the store answered (a deposed read still answers 'deposed'), so nothing is retried; the guild's next access reads
+   * it again. Those waiting on a set evicted before it went ready wait on the next set read for the guild, or, with
+   * none hydrating in its place when its read answers, are told it is gone (awaitReady answers 'gone') and go back
+   * through their gate.
    */
-  async hydrate(guildId: string, token: FenceToken): Promise<'ready' | 'deposed' | 'unavailable'> {
+  hydrate(guildId: string, token: FenceToken): Promise<HydrateOutcome> {
+    // One store hydration per set: a second call joins it, or under another grant runs once it ends, so no read of
+    // the store lands over the writes, carries and freezes made since the first one ended. A set that replaced the
+    // one on the wire is hydrated by its own call; the call on the wire leaves it alone.
+    const running = this.hydrations.get(guildId);
+    if (running && running.set === this.sets.get(guildId)) {
+      return running.outcome.then(outcome => sameGrant(running.token, token) ? outcome : this.hydrate(guildId, token));
+    }
+    const entry: HydrationInFlight = { token, set: undefined, outcome: Promise.resolve<HydrateOutcome>('unavailable') };
+    this.hydrations.set(guildId, entry);
+    entry.outcome = this.hydrateSet(guildId, token, ws => { entry.set = ws; });
+    const clear = () => { if (this.hydrations.get(guildId) === entry) this.hydrations.delete(guildId); };
+    entry.outcome.then(clear, clear);
+    return entry.outcome;
+  }
+
+  private async hydrateSet(guildId: string, token: FenceToken, sending: (ws: GuildWorkingSet) => void): Promise<HydrateOutcome> {
     let ws = this.sets.get(guildId);
     // A set kept since its lease left is current only while no other node
     // has claimed the guild since (an aborted move hands the shard straight
@@ -420,14 +457,18 @@ export class WorkingSetManager {
       if (ws.flushInFlight) return 'unavailable';
       const retained = ws;
       retained.flushInFlight = true;
+      sending(retained);
       const reclaim = await this.backend.reclaimGuild(guildId, token);
       retained.flushInFlight = false;
       if (retained.requeue || retained.dirtyKeys.size > 0) {
         retained.requeue = false;
         this.scheduleRetry();
       }
-      if (reclaim === null) return 'unavailable';
       ws = this.sets.get(guildId);
+      // Evicted while it reclaimed: another set in its place is served by its own call, and with none the guild's
+      // next access reads it again, whatever the store answered.
+      if (!ws) return 'evicted';
+      if (reclaim === null || ws !== retained) return 'unavailable';
       if (reclaim === 'lost' && ws === retained) {
         if (retained.dirtyKeys.size > 0) {
           console.warn(`[Data] Guild ${guildId}: ${retained.dirtyKeys.size} unflushed write(s) kept since its lease left are dropped, as another node has owned it since; it is read again from the store`);
@@ -449,21 +490,33 @@ export class WorkingSetManager {
     if (!ws) {
       ws = new GuildWorkingSet(guildId, token);
       this.sets.set(guildId, ws);
+      ws.readyWaiters.push(...this.takeParked(guildId));
     }
     // A new grant serves it, whatever froze it under the one before.
     if (ws.fence.term !== token.term || ws.fence.epoch !== token.epoch) ws.freezeWhenReady = false;
     ws.fence = token;
+    sending(ws);
     const outcome = await this.backend.hydrateGuild(guildId, token);
+    // Evicted or replaced while it read: what it read is applied to nothing. With none in its place, a deposed
+    // answer still says a newer owner holds the guild; any other answer is 'evicted'.
+    if (this.sets.get(guildId) !== ws) {
+      this.handOnWaiters(guildId);
+      if (!outcome.ok && outcome.reason === 'deposed') return 'deposed';
+      return this.sets.has(guildId) ? 'unavailable' : 'evicted';
+    }
     if (!outcome.ok) {
       if (outcome.reason === 'deposed') {
-        this.sets.delete(guildId);
+        if (ws.state === 'hydrating') this.evict(guildId);
         return 'deposed';
       }
       return 'unavailable';
     }
+    if (ws.state !== 'hydrating') return 'unavailable';
     // A no-rows guild becomes ready empty; docs land as raw text, parsed lazily.
     for (const { key, doc } of outcome.docs) {
-      ws.docs.set(docKeyOf(key.module, key.filename), { content: doc, tombstone: false, dirty: false, dirtySince: 0, sinceBatch: 0, seq: 0 });
+      const docKey = docKeyOf(key.module, key.filename);
+      if (ws.docs.get(docKey)?.dirty) continue;
+      ws.docs.set(docKey, { content: doc, tombstone: false, dirty: false, dirtySince: 0, sinceBatch: 0, seq: 0 });
     }
     for (const key of outcome.appendKeys) {
       ws.appendKeys.add(docKeyOf(key.module, key.filename));
@@ -475,8 +528,33 @@ export class WorkingSetManager {
       this.adoptions.delete(guildId);
       this.applyCarry(ws, adoption.carry);
     }
-    for (const wake of ws.readyWaiters.splice(0)) wake();
+    for (const wake of ws.readyWaiters.splice(0)) wake('ready');
     return 'ready';
+  }
+
+  /**
+   * A set evicted before it went ready, as its read answers: those waiting on it wait on the set hydrating in its
+   * place, or are told it is gone, so their gate decides again from the guild's route, lease and set now.
+   */
+  private handOnWaiters(guildId: string): void {
+    const next = this.sets.get(guildId);
+    const parked = this.takeParked(guildId);
+    if (next?.state === 'hydrating') next.readyWaiters.push(...parked);
+    else for (const wake of parked) wake('gone');
+  }
+
+  /**
+   * Its claim declined: those waiting on the guild's evicted set are answered not ready (an event is dropped with the
+   * warning, an interaction refused) rather than told it is gone, which would claim the guild again.
+   */
+  dropWaiters(guildId: string): void {
+    for (const wake of this.takeParked(guildId)) wake('not-ready');
+  }
+
+  private takeParked(guildId: string): ReadyWaiter[] {
+    const parked = this.parkedWaiters.get(guildId) ?? [];
+    this.parkedWaiters.delete(guildId);
+    return parked;
   }
 
   /**
@@ -529,19 +607,32 @@ export class WorkingSetManager {
     for (const applied of ws.carried) applied.fate.settle('dropped');
     ws.carried = [];
     this.sets.delete(guildId);
+    // Its waiters wait on the next set read for the guild; until then its read's answer, a declined claim or their
+    // timer answers them.
+    if (ws.readyWaiters.length > 0) this.parkedWaiters.set(guildId, [...this.takeParked(guildId), ...ws.readyWaiters.splice(0)]);
     setLeft(ws, (from, to) => carriedIn(ws, from, to));
   }
 
-  /** Await a guild's working set becoming ready (the data-ready gate). */
-  awaitReady(guildId: string, timeoutMs: number): Promise<boolean> {
+  /**
+   * Await a guild's working set becoming ready (the data-ready gate). 'gone': the set was evicted before it went
+   * ready, with none hydrating in its place, so the caller's gate decides again. 'not-ready': the wait ended with the
+   * guild not ready, or the guild's claim was declined (dropWaiters).
+   */
+  awaitReady(guildId: string, timeoutMs: number): Promise<'ready' | 'gone' | 'not-ready'> {
     const ws = this.sets.get(guildId);
-    if (!ws) return Promise.resolve(false);
-    if (ws.state === 'ready' || ws.state === 'frozen-retained') return Promise.resolve(true);
-    if (ws.state !== 'hydrating') return Promise.resolve(false);
-    return new Promise<boolean>(resolve => {
-      const timer = setTimeout(() => resolve(this.stateOf(guildId) === 'ready'), timeoutMs);
+    if (!ws) return Promise.resolve('not-ready');
+    if (ws.state === 'ready' || ws.state === 'frozen-retained') return Promise.resolve('ready');
+    if (ws.state !== 'hydrating') return Promise.resolve('not-ready');
+    return new Promise(resolve => {
+      const waiter: ReadyWaiter = result => { clearTimeout(timer); resolve(result); };
+      const timer = setTimeout(() => {
+        const parked = this.parkedWaiters.get(guildId) ?? [];
+        if (parked.includes(waiter)) parked.splice(parked.indexOf(waiter), 1);
+        if (parked.length === 0) this.parkedWaiters.delete(guildId);
+        resolve(this.stateOf(guildId) === 'ready' ? 'ready' : 'not-ready');
+      }, timeoutMs);
       timer.unref();
-      ws.readyWaiters.push(() => { clearTimeout(timer); resolve(true); });
+      ws.readyWaiters.push(waiter);
     });
   }
 

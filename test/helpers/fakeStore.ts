@@ -48,7 +48,7 @@ export class FakeStore implements DataBackend {
   hydrateMode: HydrateMode = 'ok';
   hydrationsSent = 0;
   private readonly wire: Array<() => void> = [];
-  private readonly hydrations: Array<() => void> = [];
+  private readonly hydrations: Array<(mode: HydrateMode) => void> = [];
 
   start(): void { /* nothing to connect */ }
   async stop(): Promise<void> { /* nothing to close */ }
@@ -58,9 +58,10 @@ export class FakeStore implements DataBackend {
 
   async hydrateGuild(guildId: string): Promise<HydrationOutcome> {
     this.hydrationsSent += 1;
-    if (this.hydrateMode === 'held') await new Promise<void>(resolve => { this.hydrations.push(resolve); });
-    if (this.hydrateMode === 'deposed') return { ok: false, reason: 'deposed' };
-    if (this.hydrateMode === 'unavailable') return { ok: false, reason: 'unavailable' };
+    let mode = this.hydrateMode;
+    if (mode === 'held') mode = await new Promise<HydrateMode>(resolve => { this.hydrations.push(resolve); });
+    if (mode === 'deposed') return { ok: false, reason: 'deposed' };
+    if (mode === 'unavailable') return { ok: false, reason: 'unavailable' };
     const own = (row: string) => row.startsWith(`${guildId}|`);
     return {
       ok: true,
@@ -95,7 +96,12 @@ export class FakeStore implements DataBackend {
   /** Every held hydration answers by mode from now on. */
   releaseHydrations(mode: Exclude<HydrateMode, 'held'> = 'ok'): void {
     this.hydrateMode = mode;
-    for (const resume of this.hydrations.splice(0)) resume();
+    for (const resume of this.hydrations.splice(0)) resume(mode);
+  }
+
+  /** The oldest held hydration answers by mode; the rest stay held. */
+  releaseFirstHydration(mode: Exclude<HydrateMode, 'held'> = 'ok'): void {
+    this.hydrations.shift()?.(mode);
   }
 
   /** Every flush held on the wire comes off it. */
