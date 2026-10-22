@@ -86,7 +86,7 @@ services:
       volumes:
         - container: /app/custom
           description:
-            en_us: User overrides directory. Files placed here overlay /app/src at boot.
+            en_us: "User overrides directory. Files placed here overlay /app/src. Applied when the container is rebuilt: a new image or a recreate; a plain restart keeps the previous build."
         - container: /data
           description:
             en_us: Persistent data directory for AppStore modules, applied-version, and bot data.
