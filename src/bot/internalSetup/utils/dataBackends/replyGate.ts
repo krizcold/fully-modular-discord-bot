@@ -18,7 +18,7 @@ import { getConfigProperty } from '../configManager';
 import { confirmFrom, isStopping } from '../dataManager';
 import { parseButtonCustomId, parseDropdownCustomId, parseModalCustomId } from '../panel/panelCustomIds';
 import { declaresOwnOutcomes } from './dataContract';
-import { currentLedger, currentModule, installInteractionLedgers, landed, ledgerOf, type LedgerCause, type LedgerTicket, type WriteLedger } from './writeLedger';
+import { currentLedger, currentModule, installInteractionLedgers, landed, ledgerOf, openLedger, runInLedger, type LedgerCause, type LedgerTicket, type WriteLedger } from './writeLedger';
 
 /** From the interaction's emit to the gate's own defer. Discord's 3 s also pays the gateway's delivery and the callback. */
 export const ACK_MS = 2000;
@@ -152,6 +152,11 @@ export type WritesVerdict = { ok: true } | { ok: false; answer: TruthAnswer; par
  * while it waited is judged too, with the time left: a refusal at once, an unconfirmed write as pending.
  */
 export async function verdictOf(ledgers: WriteLedger[]): Promise<WritesVerdict> {
+  const verdict = await failuresOf(ledgers);
+  return verdict.ok ? verdict : { ok: false, answer: verdict.answer, partial: verdict.partial };
+}
+
+async function failuresOf(ledgers: WriteLedger[]): Promise<Verdict> {
   const deadline = performance.now() + CONFIRM_MS;
   const confirmed = new Map<object, number>();
   for (;;) {
@@ -163,7 +168,7 @@ export async function verdictOf(ledgers: WriteLedger[]): Promise<WritesVerdict> 
     };
     if (pending.refused.length === 0 && pending.unlanded.length === 0) return { ok: true };
     const verdict = await judge(pending, Math.max(0, deadline - performance.now()));
-    if (!verdict.ok) return { ok: false, answer: verdict.answer, partial: verdict.partial };
+    if (!verdict.ok) return verdict;
     for (const ticket of pending.unlanded) confirmed.set(keyOf(ticket), ticket.seq);
   }
 }
@@ -699,4 +704,91 @@ export function sweepLateWrites(interaction: object): Promise<void> {
 /** The gateway Client's interactions: each gets its ledger (BT-2) and its reply gate. */
 export function installGatedInteractions(client: Client): void {
   installInteractionLedgers(client, installReplyGate);
+}
+
+const MESSAGE_SENDS = ['reply', 'editReply', 'followUp'] as const;
+const gatedCallbacks = new WeakSet<Function>();
+
+/**
+ * A command called with no reply gate (a message-triggered proxy; never a gated interaction or the console invoke)
+ * runs in its own ledger, and its argument's reply, editReply and followUp send the truth text in place of the
+ * module's payload unless every write so far landed. A write recorded after the last payload is logged, as the sweep does.
+ */
+export function gateCommandCallback(command: { callback?: unknown; _moduleName?: string; name?: string }): void {
+  const callback = command.callback;
+  if (typeof callback !== 'function' || gatedCallbacks.has(callback)) return;
+  const wrapped = async function gatedCallback(this: unknown, ...args: unknown[]): Promise<unknown> {
+    const target = args[1] as Record<string, unknown> | null | undefined;
+    if (!target || typeof target !== 'object' || ledgerOf(target) || currentLedger()) return callback.apply(this, args);
+    const ledger = openLedger('message');
+    const module = command._moduleName ?? null;
+    const name = command.name ?? 'unknown';
+    const saved: Array<[string, PropertyDescriptor | undefined]> = [];
+    let mark: Mark | null = null;
+    let postedV2 = false;
+    const told = { refusals: new Set<string>(), tickets: new Map<object, number>() };
+    const isNew = (failure: Failure) =>
+      'refusal' in failure ? !told.refusals.has(failure.refusal) : (told.tickets.get(failure.key) ?? -1) < failure.seq;
+    const markTold = (failure: Failure) => {
+      if ('refusal' in failure) told.refusals.add(failure.refusal);
+      else told.tickets.set(failure.key, Math.max(failure.seq, told.tickets.get(failure.key) ?? -1));
+    };
+    const editedFlags = async (): Promise<unknown> => {
+      const posted = target.replyMessage as { flags?: unknown } | null | undefined;
+      if (posted?.flags !== undefined) return posted.flags;
+      if (typeof target.fetchReply !== 'function') return undefined;
+      const message = await Promise.resolve((target.fetchReply as () => unknown).call(target)).catch(() => null);
+      return (message as { flags?: unknown } | null)?.flags;
+    };
+    for (const method of MESSAGE_SENDS) {
+      const send = target[method];
+      if (typeof send !== 'function') continue;
+      saved.push([method, Object.getOwnPropertyDescriptor(target, method)]);
+      target[method] = async (...callArgs: unknown[]): Promise<unknown> => {
+        const verdict = await failuresOf([ledger]);
+        if (!verdict.ok) {
+          mark = null;
+          if (!verdict.failed.some(isNew)) {
+            // Told already: a later followUp is dropped and a later edit leaves the message as it stands.
+            if (method === 'followUp') return undefined;
+            return typeof target.fetchReply === 'function' ? (target.fetchReply as () => unknown).call(target) : undefined;
+          }
+          const text = truthText(verdict.answer, verdict.partial);
+          const allowedMentions = { parse: [] };
+          let payload: Record<string, unknown> = { content: text };
+          if (method === 'editReply') {
+            const v2 = postedV2 || flagsOf(optionsOf(callArgs[0]).flags).has(MessageFlags.IsComponentsV2)
+              || flagsOf(await editedFlags()).has(MessageFlags.IsComponentsV2);
+            payload = v2
+              ? { components: [new ContainerBuilder().addTextDisplayComponents(new TextDisplayBuilder().setContent(text))], flags: MessageFlags.IsComponentsV2, attachments: [], allowedMentions }
+              : { content: text, embeds: [], components: [], attachments: [], allowedMentions };
+          }
+          const result = await send.call(target, payload);
+          verdict.failed.forEach(markTold);
+          return result;
+        }
+        if (method !== 'followUp' && flagsOf(optionsOf(callArgs[0]).flags).has(MessageFlags.IsComponentsV2)) postedV2 = true;
+        const result = await send.apply(target, callArgs);
+        mark = markOf(pendingIn([ledger]), [ledger], module ?? 'message');
+        return result;
+      };
+    }
+    try {
+      return await runInLedger(ledger, module, () => callback.apply(this, args));
+    } finally {
+      for (const [method, descriptor] of saved) {
+        if (descriptor) Object.defineProperty(target, method, descriptor);
+        else delete target[method];
+      }
+      const last = mark as Mark | null;
+      const site = `${last?.module}|message|${name}`;
+      if (last && wroteSince(last) && !reported.has(site)) {
+        reported.add(site);
+        console.warn(`[Truth] ${last.module} sent a reply that did not wait on a write (message ${name})`);
+      }
+      ledger.seal();
+    }
+  };
+  gatedCallbacks.add(wrapped);
+  command.callback = wrapped;
 }

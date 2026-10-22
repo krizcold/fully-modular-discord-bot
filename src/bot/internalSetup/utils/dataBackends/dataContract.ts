@@ -7,7 +7,7 @@ type ManifestReader = (name: string) => { dataContract?: unknown } | undefined;
 let reader: ManifestReader | null = null;
 
 /** The ledger kinds tag core's own writes and replies: a module named like one never ungates them. */
-const KINDS = new Set(['interaction', 'panel', 'console']);
+const KINDS = new Set(['interaction', 'panel', 'console', 'message']);
 
 export function setManifestReader(next: ManifestReader | null): void {
   reader = next;

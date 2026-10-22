@@ -1,3 +1,4 @@
+import { gateCommandCallback } from './dataBackends/replyGate';
 import { getModuleRegistry } from './moduleRegistry';
 import { recordLoadFailure } from './loadFailures';
 import * as fs from 'fs';
@@ -34,6 +35,7 @@ export default function getLocalCommands(exceptions: string[] = []): any[] {
           const commandDef = command.default || command;
 
           if (commandDef && commandDef.name && !exceptions.includes(commandDef.name)) {
+            gateCommandCallback(commandDef);
             localCommands.push(commandDef);
           }
         } catch (error) {
@@ -65,6 +67,7 @@ export default function getLocalCommands(exceptions: string[] = []): any[] {
           if (module.manifest.tierRequirement) {
             command._tierRequirement = module.manifest.tierRequirement;
           }
+          gateCommandCallback(command);
           localCommands.push(command);
           moduleCommandCount++;
         }

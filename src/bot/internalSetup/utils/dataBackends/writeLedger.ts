@@ -9,7 +9,7 @@ import type { FileTicket } from './fileBackend';
 import { saveMark, type SaveMark } from './scopeRecord';
 import type { DataUnavailableCause, WsTicket } from './workingSet';
 
-export type LedgerKind = 'interaction' | 'panel' | 'console';
+export type LedgerKind = 'interaction' | 'panel' | 'console' | 'message';
 export type LedgerTicket = WsTicket | FileTicket;
 /** Why a write was refused: the facade's own refusals, or the cause of a DataBackendUnavailableError. */
 export type LedgerCause = 'frozen' | 'not-ready' | 'io' | DataUnavailableCause;
