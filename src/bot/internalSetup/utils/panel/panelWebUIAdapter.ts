@@ -111,11 +111,11 @@ function createWebUIContext(
       getField: (customId: string) => {
         const value = modalFields[customId];
         if (!value) return null;
-        // Return field object with values array (single value wrapped in array)
+        // A multi pick arrives as its whole array; a single pick is wrapped
         return {
           customId,
           type: 6, // RoleSelect type (or other entity select)
-          values: [value], // Web-UI sends single value, wrap in array
+          values: Array.isArray(value) ? value : [value],
           value // Also include value directly for text inputs
         };
       },

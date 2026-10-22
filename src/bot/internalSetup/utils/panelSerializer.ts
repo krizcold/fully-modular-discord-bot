@@ -405,6 +405,16 @@ function serializeTextInput(input: TextInputBuilder): SerializedTextInput {
  * Serialize a Discord ModalBuilder to plain JSON
  * Handles both ActionRow components (TextInput) and Label components (FileUpload)
  */
+function serializeEntityPick(component: any) {
+  const minValues = component.min_values ?? 1;
+  return {
+    required: minValues === 0 ? false : (component.required ?? true),
+    minValues,
+    maxValues: component.max_values ?? 1,
+    defaultValues: (component.default_values ?? []).map((value: { id: string }) => value.id),
+  };
+}
+
 export function serializeModal(modal: ModalBuilder): SerializedModal {
   const data = modal.toJSON();
   const components: SerializedActionRow[] = [];
@@ -468,9 +478,7 @@ export function serializeModal(modal: ModalBuilder): SerializedModal {
           label: labelData.label || 'Select Role',
           description: labelData.description,
           placeholder: innerComponent.placeholder,
-          required: true,
-          minValues: innerComponent.min_values ?? 1,
-          maxValues: innerComponent.max_values ?? 1,
+          ...serializeEntityPick(innerComponent),
         } as any);
       }
       // ComponentType.UserSelect = 5
@@ -481,9 +489,7 @@ export function serializeModal(modal: ModalBuilder): SerializedModal {
           label: labelData.label || 'Select User',
           description: labelData.description,
           placeholder: innerComponent.placeholder,
-          required: true,
-          minValues: innerComponent.min_values ?? 1,
-          maxValues: innerComponent.max_values ?? 1,
+          ...serializeEntityPick(innerComponent),
         } as any);
       }
       // ComponentType.ChannelSelect = 8
@@ -494,9 +500,7 @@ export function serializeModal(modal: ModalBuilder): SerializedModal {
           label: labelData.label || 'Select Channel',
           description: labelData.description,
           placeholder: innerComponent.placeholder,
-          required: true,
-          minValues: innerComponent.min_values ?? 1,
-          maxValues: innerComponent.max_values ?? 1,
+          ...serializeEntityPick(innerComponent),
         } as any);
       }
       // ComponentType.TextInput = 4 (text input in label)
