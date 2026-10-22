@@ -1034,8 +1034,8 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
    * Body: { values?, hardLimits?, moduleEnabled?, disabledCommands? }
    *
    * Writes a partial update to the module's deployment baseline. Paid-tier
-   * deltas are re-sanitized/pruned against the new baseline so they don't
-   * carry "worse than Free" remnants.
+   * entries are re-sanitized against the new baseline (state worse than Free
+   * is dropped) but not pruned, so a value equal to Free stays stored.
    */
   router.put('/global-config/:moduleName', async (req: Request, res: Response) => {
     try {

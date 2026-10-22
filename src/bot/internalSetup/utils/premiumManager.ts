@@ -941,6 +941,7 @@ export class PremiumManager {
       priority: tier.priority,
       overrides: this.pruneOverridesAgainstFree(
         this.sanitizeTierAgainstFree(tier.overrides || {}),
+        before?.overrides,
       ),
       offerings: (tier.offerings || []).map(normalizeOffering),
     };
@@ -980,31 +981,30 @@ export class PremiumManager {
    * view.
    *
    * After writing, every paid tier's `overrides[module]` is re-sanitized
-   * and re-pruned against the new baseline (mirrors what the old
-   * Free-tier path of setTier did, but scoped to the touched module).
+   * against the new baseline. It is not pruned: a paid value equal to the
+   * new baseline stays stored, so a later lower baseline cannot drag it down.
    */
   setGlobalModuleConfig(moduleName: string, partial: Partial<GlobalModuleConfig>, base?: Record<string, any>): boolean {
     this.ensureLoaded();
     const ok = saveGlobalModuleConfig(moduleName, partial, base);
     if (!ok) return false;
 
-    // Re-sanitize + re-prune every paid tier's entry for this module against
-    // the new baseline. Free has no `overrides` payload of its own so it
-    // doesn't need touching.
+    let changed = false;
     for (const [tierId, tier] of Object.entries(this.config.tiers)) {
       if (tierId === 'free') continue;
       if (!tier.overrides[moduleName]) continue;
-      const singleModuleSet = { [moduleName]: tier.overrides[moduleName] };
-      const sanitized = this.pruneOverridesAgainstFree(
-        this.sanitizeTierAgainstFree(singleModuleSet),
-      );
+      const sanitized = this.sanitizeTierAgainstFree({ [moduleName]: tier.overrides[moduleName] });
+      if (deepEqual(sanitized[moduleName], tier.overrides[moduleName])) continue;
+      changed = true;
       if (sanitized[moduleName]) {
         tier.overrides[moduleName] = sanitized[moduleName];
       } else {
         delete tier.overrides[moduleName];
       }
     }
-    this.save();
+    if (changed && !this.save()) {
+      console.error(`[PremiumManager] Global config for ${moduleName} saved, but the paid tier cleanup did not save`);
+    }
     return true;
   }
 
@@ -1148,9 +1148,15 @@ export class PremiumManager {
   /** Drop module entries fully redundant vs Free's effective baseline. */
   private pruneOverridesAgainstFree(
     tierOverrides: Record<string, Record<string, any>>,
+    stored?: Record<string, Record<string, any>>,
   ): Record<string, Record<string, any>> {
     const result: Record<string, Record<string, any>> = {};
     for (const [moduleName, tierMod] of Object.entries(tierOverrides || {})) {
+      const storedMod = stored?.[moduleName];
+      if (storedMod && Object.keys(tierMod).some(k => storedMod[k] !== undefined && deepEqual(storedMod[k], tierMod[k]))) {
+        result[moduleName] = tierMod;
+        continue;
+      }
       const freeMod = freeBaselineFromGlobal(loadGlobalModuleConfig(moduleName));
       if (moduleOverrideRedundantVsFree(tierMod, freeMod)) continue;
       result[moduleName] = tierMod;

@@ -35,7 +35,7 @@ function _canonicalizeValue(value) {
 // toggling a boolean checkbox on then off leaves `{Y: false}` in the data,
 // structurally a delta vs `{}` baseline, but visually and semantically the
 // same as no override when the schema default is `false`.
-function effectiveOverrides(rawOverrides, moduleSchemas, freeOverrides, isFreeTier) {
+function effectiveOverrides(rawOverrides, moduleSchemas, freeOverrides, isFreeTier, storedOverrides) {
   const safeFree = freeOverrides || {};
   const out = {};
   for (const modName of Object.keys(rawOverrides || {}).sort()) {
@@ -78,7 +78,10 @@ function effectiveOverrides(rawOverrides, moduleSchemas, freeOverrides, isFreeTi
       } else {
         matches = val === inherited;
       }
-      if (matches) continue; // redundant - drop from the effective view
+      const storedVal = storedOverrides?.[modName]?.[key];
+      const isStored = storedVal !== undefined
+        && JSON.stringify(_canonicalizeValue(storedVal)) === JSON.stringify(_canonicalizeValue(val));
+      if (matches && !isStored) continue; // redundant - drop from the effective view
       cleanMod[key] = Array.isArray(val) ? [...val].sort() : _canonicalizeValue(val);
     }
     if (Object.keys(cleanMod).length > 0) out[modName] = cleanMod;
@@ -467,7 +470,7 @@ function TierEditorPanel({ tierId, tier, freeTier, onSave, onClose }) {
     // override count all agree. Without this, a tier "made identical to Free"
     // would still show "N overrides" on its card because the backend's prune
     // is whole-module-only.
-    const effective = effectiveOverrides(overrides, moduleSchemas, freeOverrides, isFreeTier);
+    const effective = effectiveOverrides(overrides, moduleSchemas, freeOverrides, isFreeTier, isFreeTier ? undefined : baseline);
     const snapshot = JSON.parse(JSON.stringify(effective));
     try {
       if (isFreeTier) {
