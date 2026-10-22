@@ -349,8 +349,14 @@ function GuildSubscriptionPanel({ guild, subData, onRefresh }) {
     try {
       const res = await guildApi.cancelPaidSubscription(guild.id);
       if (res.success) await onRefresh();
-      else setError('Failed to cancel');
-    } catch (err) { setError(err.message); }
+      else {
+        setError(res.error || 'Failed to cancel');
+        await onRefresh();
+      }
+    } catch (err) {
+      setError(`Could not confirm the cancellation: ${err.message}`);
+      await onRefresh();
+    }
     finally { setProcessing(false); }
   }
 
@@ -359,8 +365,14 @@ function GuildSubscriptionPanel({ guild, subData, onRefresh }) {
     try {
       const res = await guildApi.reactivatePaidSubscription(guild.id);
       if (res.success) await onRefresh();
-      else setError('Failed to reactivate');
-    } catch (err) { setError(err.message); }
+      else {
+        setError(res.error || 'Failed to reactivate');
+        await onRefresh();
+      }
+    } catch (err) {
+      setError(`Could not confirm the reactivation: ${err.message}`);
+      await onRefresh();
+    }
     finally { setProcessing(false); }
   }
 
@@ -1111,20 +1123,41 @@ function SubscribeModal({ guildId, tierId, tier, providers, willBePaused, active
     return v.label;
   }
 
+  const couponSupported = !!selectedProvider?.capabilities?.supportsCoupons;
+  const trimmedCoupon = (couponCode || '').trim();
+  const couponCheckRef = React.useRef(0);
+
   async function handleCouponBlur() {
-    const code = (couponCode || '').trim();
-    if (!code) { setCouponPreview(null); return; }
-    if (!selectedProviderId) { setCouponPreview(null); return; }
+    const check = ++couponCheckRef.current;
+    const code = trimmedCoupon;
+    if (!code || !selectedProviderId || !couponSupported) { setCouponPreview(null); setCouponChecking(false); return; }
+    const tag = { providerId: selectedProviderId, variantId: selectedVariantId, code };
     setCouponChecking(true);
+    let preview;
     try {
       const res = await guildApi.previewCoupon(guildId, selectedProviderId, code, selectedVariantId || undefined);
-      setCouponPreview(res);
+      preview = res && res.success === true
+        ? { ...tag, valid: res.valid === true, effectText: res.effectText, reason: res.reason }
+        : { ...tag, checkError: (res && res.error) || 'no answer from the server' };
     } catch (err) {
-      setCouponPreview({ valid: false, reason: err.message });
-    } finally {
-      setCouponChecking(false);
+      preview = { ...tag, checkError: err.message };
     }
+    if (check !== couponCheckRef.current) return;
+    setCouponPreview(preview);
+    setCouponChecking(false);
   }
+
+  useSubEffect(() => {
+    setCouponPreview(null);
+    if (trimmedCoupon) handleCouponBlur();
+    else { couponCheckRef.current++; setCouponChecking(false); }
+  }, [selectionKey]);
+
+  const shownCoupon = couponPreview
+    && couponPreview.providerId === selectedProviderId
+    && couponPreview.variantId === selectedVariantId
+    && couponPreview.code === trimmedCoupon
+    ? couponPreview : null;
 
   async function handleSubmit() {
     if (!selectedOfferingId || !selectedProviderId || !selectedVariantId) return;
@@ -1132,7 +1165,7 @@ function SubscribeModal({ guildId, tierId, tier, providers, willBePaused, active
     try {
       const res = await guildApi.subscribePaid(
         guildId, tierId, selectedOfferingId, selectedProviderId, selectedVariantId,
-        couponCode || undefined, autoRenewOptOut,
+        (couponSupported && trimmedCoupon) || undefined, autoRenewOptOut,
       );
       if (res.success) {
         const result = res.result || {};
@@ -1338,32 +1371,41 @@ function SubscribeModal({ guildId, tierId, tier, providers, willBePaused, active
           </label>
         )}
 
-        {selectedProvider?.capabilities?.supportsCoupons && (
+        {couponSupported && (
           <React.Fragment>
             <label style={labelStyle}>Coupon (optional)</label>
             <input type="text" style={inputStyle} value={couponCode}
-              onChange={e => { setCouponCode(e.target.value); setCouponPreview(null); }}
+              onChange={e => { couponCheckRef.current++; setCouponCode(e.target.value); setCouponPreview(null); setCouponChecking(false); }}
               onBlur={handleCouponBlur}
               placeholder={`Enter ${selectedProvider.displayName} coupon code`} />
             {couponChecking && (
               <div style={{ color: '#888', fontSize: '0.78rem', marginTop: '6px' }}>Checking...</div>
             )}
-            {!couponChecking && couponPreview && couponPreview.valid && (
+            {!couponChecking && shownCoupon && shownCoupon.valid && (
               <div style={{
                 color: '#3ba55d', fontSize: '0.82rem', marginTop: '6px',
                 background: 'rgba(59, 165, 93, 0.08)', border: '1px solid rgba(59, 165, 93, 0.3)',
                 padding: '6px 10px', borderRadius: '4px',
               }}>
-                Coupon valid: {couponPreview.effectText || 'applied at checkout'}
+                Coupon valid: {shownCoupon.effectText || 'applied at checkout'}
               </div>
             )}
-            {!couponChecking && couponPreview && !couponPreview.valid && couponCode.trim() && (
+            {!couponChecking && shownCoupon && shownCoupon.checkError && (
+              <div style={{
+                color: '#e67e22', fontSize: '0.82rem', marginTop: '6px',
+                background: 'rgba(230, 126, 34, 0.08)', border: '1px solid rgba(230, 126, 34, 0.3)',
+                padding: '6px 10px', borderRadius: '4px',
+              }}>
+                Could not check the coupon: {shownCoupon.checkError}; try again
+              </div>
+            )}
+            {!couponChecking && shownCoupon && !shownCoupon.checkError && !shownCoupon.valid && (
               <div style={{
                 color: '#ed4245', fontSize: '0.82rem', marginTop: '6px',
                 background: 'rgba(237, 66, 69, 0.08)', border: '1px solid rgba(237, 66, 69, 0.3)',
                 padding: '6px 10px', borderRadius: '4px',
               }}>
-                {couponPreview.reason || 'Coupon not accepted'}
+                {shownCoupon.reason || 'Coupon not accepted'}
               </div>
             )}
           </React.Fragment>

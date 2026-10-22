@@ -187,7 +187,7 @@ export class LemonSqueezyProvider implements PaymentProvider {
 
   async validateCoupon(code: string, _variantId?: string): Promise<ProviderCouponValidation> {
     const c = loadCredentials();
-    if (!c.LEMONSQUEEZY_STORE_ID) return { valid: false, reason: 'Lemon Squeezy not configured' };
+    if (!c.LEMONSQUEEZY_STORE_ID) throw new Error('Lemon Squeezy not configured');
     const data = await this.api<{ data: any[] }>('GET',
       `/discounts?filter[store_id]=${encodeURIComponent(c.LEMONSQUEEZY_STORE_ID)}&filter[code]=${encodeURIComponent(code)}`);
     const match = (data?.data || [])[0];

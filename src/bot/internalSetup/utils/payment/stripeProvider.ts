@@ -252,15 +252,10 @@ export class StripeProvider implements PaymentProvider {
   async validateCoupon(code: string, _variantId?: string): Promise<ProviderCouponValidation> {
     const trimmed = (code || '').trim();
     if (!trimmed) return { valid: false, reason: 'empty code' };
-    let result: { data: StripePromotionCode[] };
-    try {
-      result = await this.api<{ data: StripePromotionCode[] }>(
-        'GET',
-        `/v1/promotion_codes?code=${encodeURIComponent(trimmed)}&active=true&limit=1`,
-      );
-    } catch (err: any) {
-      return { valid: false, reason: err?.message || 'lookup failed' };
-    }
+    const result = await this.api<{ data: StripePromotionCode[] }>(
+      'GET',
+      `/v1/promotion_codes?code=${encodeURIComponent(trimmed)}&active=true&limit=1`,
+    );
     const promo = result.data[0];
     if (!promo) return { valid: false, reason: 'not found' };
     const c = promo.coupon;
