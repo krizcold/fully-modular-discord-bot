@@ -80,6 +80,10 @@ async function recoverUpdatePanel(
       await removePersistentPanel('update_manager', guildId);
       return;
     }
+    if (error.code === 50001) {
+      console.warn(`[PersistentPanelRecovery] UPDATE panel channel ${instance.channelId} is not visible to the bot (missing View Channel); the record is kept`);
+      return;
+    }
     throw error;
   }
 
@@ -89,26 +93,9 @@ async function recoverUpdatePanel(
     return;
   }
 
-  let message;
-  try {
-    message = await (channel as TextChannel).messages.fetch(instance.messageId);
-  } catch (error: any) {
-    if (error.code === 10008) {
-      console.log('[PersistentPanelRecovery] UPDATE panel message no longer exists, removing from storage');
-      await removePersistentPanel('update_manager', guildId);
-      return;
-    }
-    throw error;
-  }
-
-  if (!message) {
-    console.log('[PersistentPanelRecovery] UPDATE panel message not found, removing from storage');
-    await removePersistentPanel('update_manager', guildId);
-    return;
-  }
-
+  const messageId: string = instance.messageId;
   const accessMethod = instance.accessMethod || 'direct_command';
-  storeNavigationContext(message.id, [], accessMethod);
+  storeNavigationContext(messageId, [], accessMethod);
 
   const context: PanelContext = {
     client,
@@ -133,7 +120,7 @@ async function recoverUpdatePanel(
         summary: { totalUpdatesAvailable: 0, hasAnyUpdates: false }
       });
 
-      await updatePanelDynamic(context, 'update_manager', response);
+      if (!(await updatePanelDynamic(context, 'update_manager', response, undefined, messageId))) return;
 
       await updatePersistentPanelState('update_manager', 'recovered', guildId, undefined, {
         lastCheckResult: combinedCheck

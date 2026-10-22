@@ -19,6 +19,7 @@ import { storePersistentPanel } from './persistentPanelStorage';
 import { storeNavigationContext } from './panelButtonHandler';
 import { answerWrites } from '../dataBackends/replyGate';
 import { injectReturnButtonIfNeeded } from './panelResponseUtils';
+import { retireReplacedPanel } from './persistentPanelResponse';
 import {
   createTitledContainer,
   createText,
@@ -120,7 +121,7 @@ export async function handlePersistentWarningButton(
     });
 
     if (message instanceof Message) {
-      await storePersistentPanel(
+      const stored = await storePersistentPanel(
         panelId,
         {
           messageId: message.id,
@@ -136,6 +137,10 @@ export async function handlePersistentWarningButton(
         undefined,
         panel.maxActiveInstances
       );
+
+      if (stored.replacedInstance && stored.replacedInstance.messageId !== message.id) {
+        await retireReplacedPanel(interaction.client, panel, stored.replacedInstance);
+      }
 
       storeNavigationContext(message.id, [], accessMethod);
 

@@ -353,10 +353,10 @@ describe('a persistent panel button', () => {
     const { wire, emit } = rig();
     const { guildId, options } = await storeGuild();
     const panelId = `panel-${guildId}`;
-    await storePersistentPanel(panelId, { messageId: '900', channelId: '901', userId: '13', guildId, createdAt: 0, lastUpdated: 0 }, guildId);
+    await storePersistentPanel(panelId, { messageId: '500', channelId: '901', userId: '13', guildId, createdAt: 0, lastUpdated: 0 }, guildId);
     const edits: unknown[] = [];
-    const message = { id: '900', edit: async (payload: unknown) => { edits.push(payload); return message; } };
-    const channel = { isTextBased: () => true, messages: { fetch: async () => message } };
+    const message = { id: '500', edit: async (payload: unknown) => { edits.push(payload); return message; } };
+    const channel = { isTextBased: () => true, messages: { fetch: async () => message, edit: async (_id: string, payload: unknown) => message.edit(payload) } };
     const client = { channels: { fetch: async () => channel } };
     const write = () => {
       if (refuse) saveDataOutcome('x.json', notReadyGuild(), { v: 1 });
@@ -395,10 +395,10 @@ describe('a persistent panel button', () => {
     const { guildId, store, options } = await storeGuild();
     store.holding = true;
     const panelId = `panel-${guildId}`;
-    await storePersistentPanel(panelId, { messageId: '900', channelId: '901', userId: '13', guildId, createdAt: 0, lastUpdated: 0 }, guildId);
+    await storePersistentPanel(panelId, { messageId: '500', channelId: '901', userId: '13', guildId, createdAt: 0, lastUpdated: 0 }, guildId);
     const edits: unknown[] = [];
-    const message = { id: '900', edit: async (payload: unknown) => { edits.push(payload); return message; } };
-    const client = { channels: { fetch: async () => ({ isTextBased: () => true, messages: { fetch: async () => message } }) } };
+    const message = { id: '500', edit: async (payload: unknown) => { edits.push(payload); return message; } };
+    const client = { channels: { fetch: async () => ({ isTextBased: () => true, messages: { fetch: async () => message, edit: async (_id: string, payload: unknown) => message.edit(payload) } }) } };
     const modal = new ModalBuilder({
       custom_id: 'panel_m',
       title: 'Edit',

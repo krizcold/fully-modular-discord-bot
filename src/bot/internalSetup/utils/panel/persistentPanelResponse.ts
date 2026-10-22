@@ -34,6 +34,49 @@ import {
   V2Colors,
 } from './v2';
 
+export type PanelEditOutcome = 'edited' | 'gone' | 'refused';
+
+const GONE_CODES = new Set([10003, 10008]);
+const REFUSED_CODES = new Set([50001, 50013]);
+
+/**
+ * Edit (or delete) a stored panel message by its id, with no read of the message first. A missing channel or message
+ * answers 'gone'; a missing permission answers 'refused' and is logged by name, leaving the caller to keep the record.
+ */
+export async function editPanelMessageById(
+  client: Client,
+  instance: Pick<PersistentPanelInstance, 'channelId' | 'messageId'>,
+  payload: any | null
+): Promise<PanelEditOutcome> {
+  try {
+    const channel = await client.channels.fetch(instance.channelId);
+    if (!channel || !channel.isTextBased()) return 'gone';
+    if (payload === null) await (channel as TextChannel).messages.delete(instance.messageId);
+    else await (channel as TextChannel).messages.edit(instance.messageId, payload);
+    return 'edited';
+  } catch (error: any) {
+    if (GONE_CODES.has(error?.code)) return 'gone';
+    if (REFUSED_CODES.has(error?.code)) {
+      const missing = error.code === 50001 ? 'View Channel' : 'the permission to edit or delete its own message';
+      console.warn(`[PersistentPanel] Panel message ${instance.messageId} in channel ${instance.channelId} was not changed: the bot lacks ${missing}. The record is kept.`);
+      return 'refused';
+    }
+    throw error;
+  }
+}
+
+/**
+ * Show the inactive view on, or delete, a panel message a newer instance replaced.
+ */
+export async function retireReplacedPanel(
+  client: Client,
+  panel: PanelOptions,
+  replaced: PersistentPanelInstance
+): Promise<void> {
+  if (panel.unique) await deletePanelMessage(client, replaced);
+  else await convertPanelToError(client, replaced, 'A new instance of this panel has been opened. This panel is now inactive.');
+}
+
 /**
  * Create a new persistent panel message
  */
@@ -93,18 +136,8 @@ export async function createPersistentPanel(
         panel.maxActiveInstances
       );
 
-      if (result.replacedInstance) {
-        if (panel.unique) {
-          // For unique panels, delete the old message entirely
-          await deletePanelMessage(context.client, result.replacedInstance);
-        } else {
-          // For non-unique panels, just show error state
-          await convertPanelToError(
-            context.client,
-            result.replacedInstance,
-            'A new instance of this panel has been opened. This panel is now inactive.'
-          );
-        }
+      if (result.replacedInstance && result.replacedInstance.messageId !== message.id) {
+        await retireReplacedPanel(context.client, panel, result.replacedInstance);
       }
 
       return message;
@@ -126,7 +159,8 @@ export async function updatePersistentPanel(
   response: PanelResponse | null,
   guildId?: string,
   sessionId?: string,
-  newState?: string
+  newState?: string,
+  originMessageId?: string
 ): Promise<boolean> {
   // Skip update if response is null (e.g., message was deleted by handler)
   if (!response) {
@@ -140,17 +174,8 @@ export async function updatePersistentPanel(
       return false;
     }
 
-    const channel = await client.channels.fetch(instance.channelId);
-    if (!channel || !channel.isTextBased()) {
-      console.error(`Channel not found or not text-based: ${instance.channelId}`);
-      await removePersistentPanel(panelId, guildId, sessionId);
-      return false;
-    }
-
-    const message = await (channel as TextChannel).messages.fetch(instance.messageId);
-    if (!message) {
-      console.error(`Message not found: ${instance.messageId}`);
-      await removePersistentPanel(panelId, guildId, sessionId);
+    if (originMessageId && instance.messageId !== originMessageId) {
+      console.warn(`[PersistentPanel] Result for panel ${panelId} dropped: it started on message ${originMessageId}, which is no longer the panel's message`);
       return false;
     }
 
@@ -174,7 +199,14 @@ export async function updatePersistentPanel(
       ephemeral: undefined
     };
 
-    await message.edit(cleanedResponse);
+    const outcome = await editPanelMessageById(client, instance, cleanedResponse);
+    if (outcome === 'gone') {
+      console.error(`Panel message not found: ${instance.messageId}`);
+      const current = await getPersistentPanel(panelId, guildId, sessionId);
+      if (current?.messageId === instance.messageId) await removePersistentPanel(panelId, guildId, sessionId);
+      return false;
+    }
+    if (outcome === 'refused') return false;
 
     // Send IPC notification for Web-UI real-time update
     if (process.send) {
@@ -198,18 +230,16 @@ export async function updatePersistentPanel(
       await updatePersistentPanelState(panelId, newState, guildId, sessionId);
     }
 
-    instance.sessionData = response;
-    instance.lastUpdated = Date.now();
-    await storePersistentPanel(panelId, instance, guildId, sessionId);
+    const current = await getPersistentPanel(panelId, guildId, sessionId);
+    if (current?.messageId === instance.messageId) {
+      instance.sessionData = response;
+      instance.lastUpdated = Date.now();
+      await storePersistentPanel(panelId, instance, guildId, sessionId);
+    }
 
     return true;
   } catch (error: any) {
     console.error('Error updating persistent panel:', error);
-
-    if (error.code === 10008 || error.message?.includes('Unknown Message')) {
-      await removePersistentPanel(panelId, guildId, sessionId);
-    }
-
     return false;
   }
 }
@@ -223,34 +253,11 @@ export async function deletePanelMessage(
   instance: PersistentPanelInstance
 ): Promise<boolean> {
   try {
-    const channel = await client.channels.fetch(instance.channelId);
-    if (!channel || !channel.isTextBased()) {
-      // Channel doesn't exist or isn't text-based - nothing to delete
-      return true;
-    }
-
-    try {
-      const message = await (channel as TextChannel).messages.fetch(instance.messageId);
-      if (message) {
-        await message.delete();
-        console.log(`[PersistentPanel] Deleted old panel message: ${instance.messageId}`);
-      }
-    } catch (fetchError: any) {
-      // Message already deleted or doesn't exist - that's fine
-      if (fetchError.code === 10008) { // Unknown Message
-        return true;
-      }
-      throw fetchError;
-    }
-
-    return true;
-  } catch (error: any) {
-    // Permission errors or other issues - log but don't fail
-    if (error.code === 50013) { // Missing Permissions
-      console.warn('[PersistentPanel] Missing permissions to delete old panel message');
-    } else {
-      console.error('[PersistentPanel] Error deleting panel message:', error);
-    }
+    const outcome = await editPanelMessageById(client, instance, null);
+    if (outcome === 'edited') console.log(`[PersistentPanel] Deleted old panel message: ${instance.messageId}`);
+    return outcome !== 'refused';
+  } catch (error) {
+    console.error('[PersistentPanel] Error deleting panel message:', error);
     return false;
   }
 }
@@ -264,16 +271,6 @@ export async function convertPanelToError(
   errorMessage: string
 ): Promise<void> {
   try {
-    const channel = await client.channels.fetch(instance.channelId);
-    if (!channel || !channel.isTextBased()) {
-      return;
-    }
-
-    const message = await (channel as TextChannel).messages.fetch(instance.messageId);
-    if (!message) {
-      return;
-    }
-
     // V2-native edit: the persistent panel was originally posted with the
     // IsComponentsV2 flag, and Discord rejects edits that try to remove
     // that flag. Build the inactive-state notice as a V2 container.
@@ -281,7 +278,7 @@ export async function convertPanelToError(
     container.addTextDisplayComponents(createText(errorMessage));
     container.addTextDisplayComponents(createText('-# This panel is no longer active'));
 
-    await message.edit({
+    await editPanelMessageById(client, instance, {
       components: [container],
       flags: MessageFlags.IsComponentsV2,
       embeds: [],
@@ -362,7 +359,9 @@ export async function handlePersistentPanelButton(
       panel.id,
       response,
       context.guildId || undefined,
-      sessionId
+      sessionId,
+      undefined,
+      (context.interaction as any)?.message?.id
     );
 
     if (!updated) {
@@ -397,7 +396,9 @@ export async function handlePersistentPanelModal(
       panel.id,
       response,
       context.guildId || undefined,
-      sessionId
+      sessionId,
+      undefined,
+      (context.interaction as any)?.message?.id
     );
 
     if (!updated) {
@@ -483,7 +484,8 @@ export async function updatePanelDynamic(
   context: PanelContext,
   panelId: string,
   response: PanelResponse,
-  sessionId?: string
+  sessionId?: string,
+  originMessageId?: string
 ): Promise<boolean> {
   // Inject return button if needed
   const injectedResponse = injectReturnButtonIfNeeded(response, context);
@@ -500,6 +502,8 @@ export async function updatePanelDynamic(
     panelId,
     response,  // Don't pass injected - updatePersistentPanel does its own injection
     context.guildId || undefined,
-    sessionId
+    sessionId,
+    undefined,
+    originMessageId ?? (context.interaction as any)?.message?.id
   );
 }
