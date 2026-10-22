@@ -17,6 +17,8 @@ import type { DataFileMetadata } from '../../bot/types/moduleTypes';
 import { routeFor } from '../../bot/internalSetup/utils/dataBackends/routeResolver';
 import { getWebuiDataReader, isDataBackendUnreachable } from '../utils/webuiDataReader';
 import {
+  configVersionOf,
+  guildOverridesFrom,
   mergeConfigValues,
   ROOT_CONFIG_PATH,
   saveGlobalConfig,
@@ -402,6 +404,7 @@ export function createConfigRoutes(botManager: BotManager): Router {
         success: true,
         config,
         mergedConfig, // Include full merged config for advanced rendering
+        version: configVersionOf(savedValues, globalValues, t.configInfo),
         initialized: own.content !== null,
         hasSchema: mergedConfig.metadata.hasSchema,
         ...(notice ? { notice } : {})
@@ -491,6 +494,35 @@ export function createConfigRoutes(botManager: BotManager): Router {
           return;
         }
         if (refusedAfterRead(res, t)) return;
+        let toStore: Record<string, any> = newConfig;
+        if (req.body.version !== undefined || req.body.effective === true) {
+          let globalBody: string | null = null;
+          if (t.globalTwin) {
+            const twin = await readServedGlobal(botManager, t.globalTwin);
+            if (!twin.ok) {
+              fail(res, twin);
+              return;
+            }
+            globalBody = twin.content;
+          }
+          let savedValues: Record<string, any>;
+          let globalValues: Record<string, any>;
+          try {
+            savedValues = current.content === null ? {} : JSON.parse(current.content);
+            globalValues = globalBody === null ? {} : JSON.parse(globalBody);
+          } catch {
+            res.status(500).json({ success: false, error: 'Failed to update config: the stored file is not valid JSON; nothing was saved' });
+            return;
+          }
+          if (req.body.version !== undefined && req.body.version !== configVersionOf(savedValues, globalValues, t.configInfo)) {
+            res.status(409).json({ success: false, error: 'This config changed since you loaded it; nothing was saved. Reload it to see the current values.' });
+            return;
+          }
+          if (req.body.effective === true && t.guildId) {
+            toStore = guildOverridesFrom(newConfig, savedValues, globalValues, t.configInfo);
+          }
+          if (refusedAfterRead(res, t)) return;
+        }
         let backupCreated: boolean;
         try {
           backupCreated = backupCurrent(t, current.content);
@@ -508,15 +540,15 @@ export function createConfigRoutes(botManager: BotManager): Router {
             module: t.guild!.module,
             filename: t.guild!.filename,
             op: 'write',
-            contentJson: JSON.stringify(newConfig, null, 2)
+            contentJson: JSON.stringify(toStore, null, 2)
           });
-          sendHopReply(res, reply ?? { ok: false, code: 'bot-down' }, { backupCreated });
+          sendHopReply(res, reply ?? { ok: false, code: 'bot-down' }, { backupCreated, storedKeys: Object.keys(toStore).length });
           return;
         }
 
         // Use appropriate save function based on context
         if (guildId) {
-          const outcome = saveGuildConfig(fileId, guildId, newConfig);
+          const outcome = saveGuildConfig(fileId, guildId, toStore);
           if (outcome === 'frozen') {
             res.status(503).json({ success: false, error: FROZEN });
             return;
@@ -524,7 +556,7 @@ export function createConfigRoutes(botManager: BotManager): Router {
           if (outcome !== 'saved') throw new Error(`the guild config was not written (${outcome})`);
           console.log(`[Config] ${fileId} updated successfully for guild ${guildId}`);
         } else {
-          saveGlobalConfig(fileId, newConfig);
+          saveGlobalConfig(fileId, toStore);
           console.log(`[Config] ${fileId} updated successfully (global)`);
           nudgeSync('config');
         }
@@ -532,7 +564,8 @@ export function createConfigRoutes(botManager: BotManager): Router {
         res.json({
           success: true,
           message: 'Config updated successfully',
-          backupCreated
+          backupCreated,
+          storedKeys: Object.keys(toStore).length
         });
       });
     } catch (error) {

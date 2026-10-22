@@ -19,7 +19,7 @@ import {
 } from 'discord.js';
 import { PanelOptions, PanelContext, PanelResponse } from '../../types/panelTypes';
 import { discoverGuildConfigFiles, ConfigFileMetadata } from '../utils/configDiscovery';
-import { loadGuildConfig, saveGuildConfig, getMergedConfig } from '../utils/configManager';
+import { loadGuildConfig, loadGlobalConfig, saveGuildConfig, getMergedConfig, configVersionOf, guildOverridesFrom } from '../utils/configManager';
 import { DataOptions, deleteDataOutcome } from '../utils/dataManager';
 import { createV2Response, V2Colors } from '../utils/panel/v2';
 import { validateAndSanitizeJson } from '../utils/json';
@@ -233,22 +233,9 @@ const configEditorGuildPanel: PanelOptions = {
         }
         const parsedConfig = result.data;
 
-        // Filter to overrides only
         const guildConfigs = discoverGuildConfigFiles(context.guildId!);
         const schemaMetadata = guildConfigs.find(f => f.id === fileId);
-        let overridesOnly: Record<string, any> = {};
-
-        if (schemaMetadata?.schema) {
-          for (const [key, value] of Object.entries(parsedConfig)) {
-            const schemaField = schemaMetadata.schema.properties[key];
-            const defaultValue = schemaField?.default;
-            if (JSON.stringify(value) !== JSON.stringify(defaultValue)) {
-              overridesOnly[key] = value;
-            }
-          }
-        } else {
-          overridesOnly = parsedConfig;
-        }
+        const overridesOnly = guildOverridesFrom(parsedConfig, loadGuildConfig(fileId, context.guildId!), loadGlobalConfig(fileId), schemaMetadata);
 
         requireSchema(schemaMetadata);
         if (Object.keys(overridesOnly).length === 0) {
@@ -270,6 +257,16 @@ const configEditorGuildPanel: PanelOptions = {
       }
     }
 
+    const versionEnd = fileId.indexOf('_');
+    const openedVersion = versionEnd > -1 ? fileId.substring(0, versionEnd) : '';
+    fileId = fileId.substring(versionEnd + 1);
+    if (!openedVersion || versionEnd < 0) {
+      return showError('This edit form is not valid any more; nothing was saved. Reopen Edit.');
+    }
+    if (configVersionOf(loadGuildConfig(fileId, context.guildId), loadGlobalConfig(fileId), discoverGuildConfigFiles(context.guildId).find(f => f.id === fileId)) !== openedVersion) {
+      return showError('This config changed since you opened it; nothing was saved. Reopen Edit to see the current values.');
+    }
+
     const jsonInput = interaction.fields.getTextInputValue('config_json');
 
     // Validate and sanitize JSON
@@ -279,26 +276,9 @@ const configEditorGuildPanel: PanelOptions = {
     }
     const parsedConfig = result.data;
 
-    // Get schema to filter out defaults (use guild config discovery)
     const guildConfigs = discoverGuildConfigFiles(context.guildId!);
     const schemaMetadata = guildConfigs.find(f => f.id === fileId);
-    let overridesOnly: Record<string, any> = {};
-
-    if (schemaMetadata?.schema) {
-      // Compare each property to schema defaults and keep only differences
-      for (const [key, value] of Object.entries(parsedConfig)) {
-        const schemaField = schemaMetadata.schema.properties[key];
-        const defaultValue = schemaField?.default;
-
-        // Keep property if it differs from default (or if no default exists)
-        if (JSON.stringify(value) !== JSON.stringify(defaultValue)) {
-          overridesOnly[key] = value;
-        }
-      }
-    } else {
-      // No schema - save as-is
-      overridesOnly = parsedConfig;
-    }
+    const overridesOnly = guildOverridesFrom(parsedConfig, loadGuildConfig(fileId, context.guildId), loadGlobalConfig(fileId), schemaMetadata);
 
     // Save config (or delete if no overrides)
     try {
@@ -607,8 +587,13 @@ async function showEditModal(context: PanelContext, fileId: string): Promise<Pan
     return showError(`This config is too large to edit here (${formattedJson.length} characters, the limit is ${MODAL_VALUE_LIMIT}); use Download and Upload JSON instead.`);
   }
 
+  const customId = `panel_config_editor_guild_modal_edit_${configVersionOf(loadGuildConfig(fileId, context.guildId!), loadGlobalConfig(fileId), metadata)}_${fileId}`;
+  if (customId.length > 100) {
+    return showError('The name of this config file is too long to edit here; use Download and Upload JSON instead.');
+  }
+
   const modal = new ModalBuilder()
-    .setCustomId(`panel_config_editor_guild_modal_edit_${fileId}`)
+    .setCustomId(customId)
     .setTitle(`Edit ${metadata?.name || fileId}`.substring(0, 45));
 
   const jsonInput = new TextInputBuilder()

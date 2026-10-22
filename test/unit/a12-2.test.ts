@@ -14,6 +14,8 @@ vi.mock('../../src/bot/internalSetup/utils/configManager', () => ({
   loadGuildConfig: () => ({ a: 1 }),
   saveGlobalConfig: () => 'saved',
   saveGuildConfig: () => 'saved',
+  configVersionOf: () => 'v1',
+  guildOverridesFrom: (posted: any) => posted,
 }));
 
 import globalPanel from '../../src/bot/internalSetup/panels/configEditorGlobalPanel';

@@ -1,4 +1,5 @@
 import * as path from 'path';
+import { createHash } from 'crypto';
 import { getConfigFileMetadata } from './configDiscovery';
 import type { ConfigFileMetadata } from './configDiscovery';
 import { dataPath } from '../../../utils/dataRoot';
@@ -473,3 +474,39 @@ export function mergeConfigValues(
   return result;
 }
 
+
+/** A short fingerprint of what an editor showed: the target file's own values, for a guild the global ones it inherits, and the schema defaults. */
+export function configVersionOf(
+  savedValues: Record<string, any>,
+  globalValues: Record<string, any>,
+  metadata: ConfigFileMetadata | null | undefined
+): string {
+  const defaults = Object.entries(metadata?.schema?.properties ?? {}).map(([key, field]) => [key, (field as any)?.default ?? null]);
+  return createHash('sha256').update(JSON.stringify([savedValues, globalValues, defaults])).digest('hex').slice(0, 12);
+}
+
+/**
+ * The guild overrides an editor's effective values mean: a key is stored when
+ * it differs from what the guild inherits (the global value, then the schema
+ * default), or when it is the guild's own stored value left as it was. An
+ * untouched inherited key is never pinned.
+ */
+export function guildOverridesFrom(
+  posted: Record<string, any>,
+  savedValues: Record<string, any>,
+  globalValues: Record<string, any>,
+  metadata: ConfigFileMetadata | null | undefined
+): Record<string, any> {
+  const own = (o: Record<string, any>, k: string) => Object.prototype.hasOwnProperty.call(o, k);
+  const overrides: Record<string, any> = {};
+  for (const [key, value] of Object.entries(posted)) {
+    const text = JSON.stringify(value);
+    if (own(savedValues, key) && JSON.stringify(savedValues[key]) === text) {
+      overrides[key] = value;
+      continue;
+    }
+    const inherited = own(globalValues, key) ? globalValues[key] : metadata?.schema?.properties?.[key]?.default;
+    if (text !== JSON.stringify(inherited)) overrides[key] = value;
+  }
+  return overrides;
+}

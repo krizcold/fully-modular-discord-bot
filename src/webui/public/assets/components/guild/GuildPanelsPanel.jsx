@@ -368,7 +368,7 @@ function GuildPanelsPanel({ guild, user, onBack }) {
               onBack={handleBackToList}
               onRefresh={() => handleExecutePanel(selectedPanel, selectedChannel)}
               onModalCancel={handleModalCancel}
-              loading={loading}
+              executing={loading}
               disabled={interactionsDisabled}
               guildId={guild.id === 'system' ? null : guild.id}
             />

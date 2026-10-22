@@ -61,7 +61,7 @@ describe('the Config Editor reloads on a guild switch (R3-J9)', () => {
     await ui.answer(getFor(G1), { success: true, config: { who: 'g1' } });
     await ui.answer(new RegExp(`^/config/backups\\?file=config\\.json&guildId=${G1}`), { success: true, backups: [] });
     await ui.clickSave();
-    expect(updates(ui.calls).map(c => c.body)).toEqual([{ file: 'config.json', config: { who: 'g1' }, guildId: G1 }]);
+    expect(updates(ui.calls).map(c => c.body)).toEqual([{ file: 'config.json', config: { who: 'g1' }, guildId: G1, effective: true }]);
   });
 
   it('never saves the content of the old guild into the new one while the new load is in flight', async () => {
@@ -89,7 +89,7 @@ describe('every load is stamped and a late answer never lands (R46-J7)', () => {
     await settle();
     expect(JSON.parse(ui.panel.textarea().props.value)).toEqual({ who: 'g2' });
     await ui.clickSave();
-    expect(updates(ui.calls).map(c => c.body)).toEqual([{ file: 'config.json', config: { who: 'g2' }, guildId: G2 }]);
+    expect(updates(ui.calls).map(c => c.body)).toEqual([{ file: 'config.json', config: { who: 'g2' }, guildId: G2, effective: true }]);
   });
 
   it('disables the guild, tab and file selectors while a load is in flight', async () => {

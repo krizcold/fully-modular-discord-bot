@@ -215,7 +215,7 @@ function ConfigPanel({ isCoWorker }) {
         setInitialized(isDataFile ? res.exists !== false : res.initialized !== false);
         setInitMessage(res.message || '');
         if (res.notice) showToast(res.notice, 'warning');
-        setLoaded(stamp);
+        setLoaded(isDataFile ? stamp : { ...stamp, version: res.version });
       } else {
         setLoadFailed(true);
         setError(res.error || 'Failed to load file');
@@ -286,10 +286,9 @@ function ConfigPanel({ isCoWorker }) {
       const guildId = stamp.guildId;
       const isDataFile = selectedInfo?.category === 'data';
 
-      // For config files with schemas, filter out defaults
-      // For data files, save as-is (no filtering)
+      // A guild's overrides are derived by the server from what it inherits; data files save as-is.
       let dataToSave = parsedConfig;
-      if (!isDataFile && selectedInfo?.moduleName && selectedInfo?.schema) {
+      if (!isDataFile && !guildId && selectedInfo?.moduleName && selectedInfo?.schema) {
         dataToSave = {};
 
         // Only include values that differ from schema defaults
@@ -310,7 +309,7 @@ function ConfigPanel({ isCoWorker }) {
       const endpoint = isDataFile ? '/config/data/update' : '/config/update';
       const payload = isDataFile
         ? { file: stamp.fileKey, data: dataToSave, guildId }
-        : { file: stamp.fileKey, config: dataToSave, guildId };
+        : { file: stamp.fileKey, config: dataToSave, guildId, version: stamp.version, effective: !!guildId };
 
       const res = await api.post(endpoint, payload);
 
@@ -318,6 +317,10 @@ function ConfigPanel({ isCoWorker }) {
         let message;
         if (isDataFile) {
           message = 'Data file saved successfully.';
+        } else if (guildId && typeof res.storedKeys === 'number') {
+          message = res.storedKeys === 0
+            ? 'Guild config saved: no overrides stored, every value is inherited.'
+            : `Guild config saved: ${res.storedKeys} override${res.storedKeys === 1 ? '' : 's'} stored.`;
         } else if (selectedInfo?.moduleName) {
           message = 'Module config saved (only overrides stored).';
         } else {
