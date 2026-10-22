@@ -24,6 +24,7 @@ export interface InstallJob {
   finishedAt?: number;
   error?: string;
   loaded?: boolean;     // install: hot-load result
+  loadError?: string;
   unloaded?: boolean;   // uninstall: hot-unload result
   skipped?: boolean;    // idempotent no-op
 }
@@ -205,10 +206,12 @@ export class InstallQueue extends EventEmitter {
     await manager.installModule(job.moduleName, job.repoId);
 
     let loaded = false;
+    let loadError: string | undefined;
     if (this.botManager) {
       try {
         const loadResult = await this.botManager.loadModule(job.moduleName);
         loaded = loadResult?.success === true;
+        if (!loaded && loadResult?.unconfirmed !== true && typeof loadResult?.error === 'string') loadError = loadResult.error;
       } catch {
         loaded = false;
       }
@@ -216,6 +219,7 @@ export class InstallQueue extends EventEmitter {
 
     job.status = 'completed';
     job.loaded = loaded;
+    if (loadError) job.loadError = loadError;
     job.finishedAt = Date.now();
     this.emit('completed', this.redact(job));
   }

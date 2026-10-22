@@ -277,7 +277,18 @@ function DevModuleCard({ module: mod, reloading: isReloading, onReload }) {
             letterSpacing: '0.5px',
           }}>LOADED</span>
         )}
-        {mod.loaded === false && (
+        {mod.loaded === false && mod.shadowedBy && (
+          <span title={`Another copy runs: ${mod.shadowedBy.path}`} style={{
+            background: '#faa61a',
+            color: '#1a1a1a',
+            padding: '2px 8px',
+            borderRadius: '4px',
+            fontSize: '0.7rem',
+            fontWeight: 700,
+            letterSpacing: '0.5px',
+          }}>SHADOWED</span>
+        )}
+        {mod.loaded === false && !mod.shadowedBy && (
           <span style={{
             background: '#555',
             color: '#aaa',
@@ -315,6 +326,11 @@ function DevModuleCard({ module: mod, reloading: isReloading, onReload }) {
           overflow: 'hidden',
         }}>
           {mod.description}
+        </p>
+      )}
+      {mod.shadowedBy && (
+        <p style={{ margin: '0 0 12px 0', color: '#faa61a', fontSize: '0.78rem', lineHeight: 1.4, wordBreak: 'break-all' }}>
+          The running copy is {mod.shadowedBy.path}{mod.shadowedBy.version ? ` (v${mod.shadowedBy.version})` : ''}, not this one.
         </p>
       )}
 

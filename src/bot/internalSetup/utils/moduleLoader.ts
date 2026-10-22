@@ -1,6 +1,6 @@
 import fs from 'fs';
 import path from 'path';
-import { Client } from 'discord.js';
+import { Client, GatewayIntentBits, IntentsBitField } from 'discord.js';
 import {
   ModuleManifest,
   LoadedModule,
@@ -202,7 +202,7 @@ export class ModuleLoader {
    * @param manifest - Module manifest to validate
    * @returns Validation result
    */
-  private validateManifest(manifest: ModuleManifest): ModuleValidationResult {
+  validateManifest(manifest: ModuleManifest): ModuleValidationResult {
     const errors: string[] = [];
     const warnings: string[] = [];
 
@@ -518,4 +518,26 @@ export class ModuleLoader {
 
     return files;
   }
+}
+
+const PRIVILEGED_INTENTS = new Set(['GuildMembers', 'GuildPresences', 'MessageContent']);
+
+/**
+ * The boot loader's gates for a module loaded into a running session: a valid
+ * manifest, enabled, and every required intent already requested by this session.
+ */
+export function hotLoadRefusal(manifest: ModuleManifest, client: Client): string | null {
+  const validation = new ModuleLoader(client).validateManifest(manifest);
+  if (!validation.valid) return `Manifest is invalid: ${validation.errors.join('; ')}`;
+  if (manifest.enabled === false) return 'Module is disabled in its manifest (enabled: false)';
+  const session = new IntentsBitField(client.options.intents);
+  for (const intentName of manifest.requiredIntents ?? []) {
+    const value = GatewayIntentBits[intentName as keyof typeof GatewayIntentBits];
+    if (typeof value !== 'number' || session.has(value)) continue;
+    const privileged = PRIVILEGED_INTENTS.has(intentName)
+      ? ' It is a privileged intent, so it must also be enabled in the Discord Developer Portal.'
+      : '';
+    return `Needs the ${intentName} gateway intent this session did not request; restart the bot to load it.${privileged}`;
+  }
+  return null;
 }

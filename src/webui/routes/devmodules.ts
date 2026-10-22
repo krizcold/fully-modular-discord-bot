@@ -23,6 +23,14 @@ interface DevModuleInfo {
   author: string;
   category: string;
   loaded: boolean | null;
+  shadowedBy?: { path: string; version: string };
+}
+
+type LoadedCopy = { name: string; path: string; version: string };
+
+function isCopyAt(loadedPath: string, repoName: string, entryName: string): boolean {
+  const normalized = loadedPath.split(path.sep).join('/').replace(/\/+$/, '');
+  return `/${normalized}`.endsWith(`/modulesDev/${repoName}/Modules/${entryName}`);
 }
 
 interface DevRepoInfo {
@@ -30,12 +38,12 @@ interface DevRepoInfo {
   modules: DevModuleInfo[];
 }
 
-function scanDevModules(loadedModules: string[] | null): DevRepoInfo[] {
+export function scanDevModules(loadedModules: LoadedCopy[] | null): DevRepoInfo[] {
   const devDir = getModulesDevDir();
   if (!fs.existsSync(devDir)) return [];
 
   const repos: DevRepoInfo[] = [];
-  const loadedSet = loadedModules ? new Set(loadedModules) : null;
+  const loadedByName = loadedModules ? new Map(loadedModules.map(m => [m.name, m])) : null;
 
   const repoDirs = fs.readdirSync(devDir, { withFileTypes: true })
     .filter(d => d.isDirectory() && !d.name.startsWith('.'));
@@ -53,6 +61,8 @@ function scanDevModules(loadedModules: string[] | null): DevRepoInfo[] {
         try {
           if (!fs.existsSync(manifestPath)) continue;
           const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8'));
+          const copy = loadedByName?.get(manifest.name || entry.name);
+          const runsHere = !!copy && isCopyAt(copy.path, repoDir.name, entry.name);
           modules.push({
             name: manifest.name || entry.name,
             displayName: manifest.displayName || manifest.name || entry.name,
@@ -60,7 +70,8 @@ function scanDevModules(loadedModules: string[] | null): DevRepoInfo[] {
             description: manifest.description || '',
             author: manifest.author || '',
             category: manifest.category || 'misc',
-            loaded: loadedSet ? loadedSet.has(manifest.name || entry.name) : null,
+            loaded: loadedByName ? runsHere : null,
+            ...(copy && !runsHere ? { shadowedBy: { path: copy.path, version: copy.version } } : {}),
           });
         } catch (err) {
           console.warn(`[DevModules] Failed to read manifest for ${entry.name}:`, err);
@@ -80,7 +91,7 @@ export function createDevModulesRoutes(botManager: BotManager): Router {
   // List all dev modules grouped by repo
   router.get('/list', async (req: Request, res: Response) => {
     try {
-      const loadedModules = await botManager.listLoadedModules();
+      const loadedModules = await botManager.listLoadedModuleCopies();
       const repos = scanDevModules(loadedModules);
       res.json({ success: true, repos });
     } catch (error) {
@@ -112,18 +123,14 @@ export function createDevModulesRoutes(botManager: BotManager): Router {
         return;
       }
 
-      const loadedModules = await botManager.listLoadedModules();
+      const loadedModules = await botManager.listLoadedModuleCopies();
       if (!loadedModules) {
         res.json({ success: true, reloaded: [], message: 'Could not query loaded modules' });
         return;
       }
 
-      // Get all dev module names
       const repos = scanDevModules(loadedModules);
-      const devModuleNames = repos.flatMap(r => r.modules.map(m => m.name));
-
-      // Only reload dev modules that are currently loaded
-      const toReload = devModuleNames.filter(name => loadedModules.includes(name));
+      const toReload = repos.flatMap(r => r.modules.filter(m => m.loaded === true).map(m => m.name));
 
       if (toReload.length === 0) {
         res.json({ success: true, reloaded: [], message: 'No dev modules are currently loaded' });

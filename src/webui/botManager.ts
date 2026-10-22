@@ -1241,7 +1241,7 @@ export class BotManager {
       return await this.sendIPCMessage('module:load', { moduleName }, IPC_TIMEOUT_MODULE_OP_MS);
     } catch (error) {
       console.error('[BotManager] Error loading module:', error);
-      return { success: false, moduleName, error: error instanceof Error ? error.message : 'Unknown error' };
+      return { success: false, unconfirmed: true, moduleName, error: error instanceof Error ? error.message : 'Unknown error' };
     }
   }
 
@@ -1350,6 +1350,21 @@ export class BotManager {
       const res: any = await this.sendIPCMessage('module:list-loaded', {});
       if (res && res.success && Array.isArray(res.modules)) {
         return res.modules.map((m: any) => m.name).filter((n: any) => typeof n === 'string');
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  async listLoadedModuleCopies(): Promise<Array<{ name: string; path: string; version: string }> | null> {
+    if (!this.isRunning()) return null;
+    try {
+      const res: any = await this.sendIPCMessage('module:list-loaded', {});
+      if (res && res.success && Array.isArray(res.modules)) {
+        return res.modules
+          .filter((m: any) => typeof m.name === 'string')
+          .map((m: any) => ({ name: m.name, path: typeof m.path === 'string' ? m.path : '', version: m.version || '' }));
       }
       return null;
     } catch {

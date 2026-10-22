@@ -104,7 +104,7 @@ function fakeClient(globals: string[], opts: FakeOptions = {}) {
       await opts.onDelete?.(key);
     }),
   };
-  const client: any = { application: { commands }, guilds: { cache: new Map() } };
+  const client: any = { application: { commands }, guilds: { cache: new Map() }, options: { intents: 0 } };
   return { client, deleted };
 }
 

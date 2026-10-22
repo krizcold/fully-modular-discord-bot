@@ -15,8 +15,8 @@ import path from 'path';
 import fs from 'fs';
 import { getModuleRegistry } from './moduleRegistry';
 import { getModuleEventManager } from './moduleEventManager';
-import { ModuleLoader } from './moduleLoader';
-import { LoadedModule } from '../../types/moduleTypes';
+import { ModuleLoader, hotLoadRefusal } from './moduleLoader';
+import { LoadedModule, ModuleManifest } from '../../types/moduleTypes';
 import { getPanelManager } from './panelManager';
 import {
   findModuleManifests,
@@ -168,21 +168,32 @@ export async function recompileTypeScript(): Promise<{ success: boolean; error?:
 }
 
 /**
- * Find a module's manifest path by name.
+ * Find a module's manifest by name and pass it through the boot loader's gates.
+ * Two manifests with one name are refused: boot would load only the first, and
+ * a reload by name cannot tell which copy is meant.
  */
-function findModuleManifestPath(moduleName: string): string | null {
-  const manifestPaths = findModuleManifests();
-  for (const manifestPath of manifestPaths) {
+function resolveHotLoad(
+  client: Client,
+  moduleName: string
+): { manifest: ModuleManifest; modulePath: string } | { error: string } {
+  const matches: Array<{ manifest: ModuleManifest; manifestPath: string }> = [];
+  for (const manifestPath of findModuleManifests()) {
     try {
       const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8'));
-      if (manifest.name === moduleName) {
-        return manifestPath;
-      }
+      if (manifest.name === moduleName) matches.push({ manifest, manifestPath });
     } catch {
       continue;
     }
   }
-  return null;
+  if (matches.length === 0) return { error: 'Module manifest not found' };
+  if (matches.length > 1) {
+    return {
+      error: `Two modules are named "${moduleName}" (${matches.map(m => path.dirname(m.manifestPath)).join(', ')}); remove or rename one, then restart the bot`
+    };
+  }
+  const refusal = hotLoadRefusal(matches[0].manifest, client);
+  if (refusal) return { error: refusal };
+  return { manifest: matches[0].manifest, modulePath: path.dirname(matches[0].manifestPath) };
 }
 
 /**
@@ -340,14 +351,12 @@ async function reloadModuleBody(client: Client, moduleName: string): Promise<Rel
       return { success: false, moduleName, error: `Compilation failed: ${compile.error}`, duration: Date.now() - start };
     }
 
-    const manifestPath = findModuleManifestPath(moduleName);
-    if (!manifestPath) {
+    const target = resolveHotLoad(client, moduleName);
+    if ('error' in target) {
       recordLoadFailure(moduleName);
-      return { success: false, moduleName, error: 'Module manifest not found after recompile', duration: Date.now() - start };
+      return { success: false, moduleName, error: target.error, duration: Date.now() - start };
     }
-
-    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8'));
-    const modulePath = path.dirname(manifestPath);
+    const { manifest, modulePath } = target;
 
     const loader = new ModuleLoader(client);
     const newModule = await loader.loadModule(manifest, modulePath);
@@ -436,20 +445,10 @@ async function reloadModulesBody(client: Client, moduleNames: string[]): Promise
     totalDuration: 0
   };
 
-  // Mark all as reloading
   for (const name of available) reloadingModules.add(name);
 
   try {
-    // 1. Unload all target modules
-    for (const name of available) {
-      const existing = registry.getModule(name);
-      if (existing) {
-        await registry.unloadModule(name);
-        getMetricsCollector().dropModule(name);
-      }
-    }
-
-    // 2. Single recompile for all changes
+    // 1. Single recompile for all changes, so the gate reads the manifest the compile produced
     const compile = await recompileTypeScript();
     result.compileDuration = compile.duration;
     if (!compile.success) {
@@ -462,19 +461,30 @@ async function reloadModulesBody(client: Client, moduleNames: string[]): Promise
       return result;
     }
 
+    const targets = new Map<string, { manifest: ModuleManifest; modulePath: string }>();
+    for (const name of available) {
+      const target = resolveHotLoad(client, name);
+      if ('error' in target) {
+        recordLoadFailure(name);
+        result.failed.push({ moduleName: name, error: target.error });
+      } else targets.set(name, target);
+    }
+    const accepted = [...targets.keys()];
+
+    // 2. Unload only the accepted modules
+    for (const name of accepted) {
+      const existing = registry.getModule(name);
+      if (existing) {
+        await registry.unloadModule(name);
+        getMetricsCollector().dropModule(name);
+      }
+    }
+
     // 3. Reload each module via ModuleLoader
     const loader = new ModuleLoader(client);
-    for (const name of available) {
+    for (const name of accepted) {
       try {
-        const manifestPath = findModuleManifestPath(name);
-        if (!manifestPath) {
-          recordLoadFailure(name);
-          result.failed.push({ moduleName: name, error: 'Module manifest not found' });
-          continue;
-        }
-
-        const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8'));
-        const modulePath = path.dirname(manifestPath);
+        const { manifest, modulePath } = targets.get(name)!;
 
         const module = await loader.loadModule(manifest, modulePath);
         await registerReloadedModule(client, module);

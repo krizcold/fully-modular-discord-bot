@@ -72,6 +72,7 @@ export function setupReloadIPCHandlers(client: Client): void {
             name: m.manifest.name,
             displayName: m.manifest.displayName,
             version: m.manifest.version,
+            path: m.path,
             commands: m.commands.length,
             events: m.events.size,
             panels: m.panels.length,

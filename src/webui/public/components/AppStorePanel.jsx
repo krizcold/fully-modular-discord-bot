@@ -87,11 +87,8 @@ function AppStorePanel() {
       loadData();
       if (job.kind === 'install') {
         if (job.skipped) return;
-        if (job.loaded === false) {
-          showToast(`${job.moduleName} installed, but failed to hot-load. Restart the bot to activate it.`, 'warning', { sticky: true });
-        } else {
-          showToast(`${job.moduleName} installed.`, 'success');
-        }
+        const toast = appStoreInstallToast(job);
+        showToast(toast.text, toast.kind, toast.kind === 'success' ? undefined : { sticky: true });
       } else {
         if (job.skipped) return;
         if (job.unloaded === false) showToast(`${job.moduleName} uninstalled. Changes apply on next bot start.`, 'info');
@@ -709,6 +706,12 @@ const appStoreOwnJobIds = new Set();
 
 // A module can hold several jobs at once (an install running, an uninstall queued behind it), so jobs are keyed by
 // id and an event touches only its own job. A newly queued job supersedes the module's failed ones.
+function appStoreInstallToast(job) {
+  if (job.loaded !== false) return { text: `${job.moduleName} installed.`, kind: 'success' };
+  if (job.loadError) return { text: `${job.moduleName} installed, but the bot did not load it: ${job.loadError}`, kind: 'warning' };
+  return { text: `${job.moduleName} installed, but the bot could not confirm it loaded. Check the bot is running, or restart it to load the module.`, kind: 'warning' };
+}
+
 function appStoreApplyJobEvent(jobs, event, job) {
   const next = { ...jobs };
   if (event === 'pending') {
