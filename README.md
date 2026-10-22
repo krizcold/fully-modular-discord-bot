@@ -100,7 +100,7 @@ Each module has a `module.json` manifest that defines its metadata, dependencies
 ### Module Structure
 
 ```
-src/bot/modules/{category}/{module-name}/
+src/bot/modules/{module-name}/   # one level deep; the name is lowercase kebab-case
 ├── module.json           # Module manifest (required)
 ├── README.md            # Module documentation
 ├── commands/            # Slash and context commands
@@ -147,7 +147,7 @@ src/bot/modules/{category}/{module-name}/
 
 1. **Create module directory:**
    ```bash
-   mkdir -p src/bot/modules/misc/my-module
+   mkdir -p src/bot/modules/my-module
    ```
 
 2. **Create `module.json`:**
@@ -173,7 +173,7 @@ src/bot/modules/{category}/{module-name}/
 
 3. **Create a command:**
    ```typescript
-   // src/bot/modules/misc/my-module/commands/hello.ts
+   // src/bot/modules/my-module/commands/hello.ts
    import { Client, CommandInteraction } from 'discord.js';
    import { CommandOptions } from '@bot/types/commandTypes';
 
@@ -193,6 +193,8 @@ src/bot/modules/{category}/{module-name}/
 
 ### Module Categories
 
+`category` is a manifest field only; it does not set the folder.
+
 - **fun** - Entertainment and game features
 - **misc** - Utility and general-purpose commands
 - **moderation** - Server management and admin tools
@@ -211,7 +213,7 @@ The bot includes a browser-based management interface for monitoring and control
 - **Logs** - Real-time log viewing (last 50 lines)
 - **Panels** - Execute Discord panels from the browser
 - **Bot Control** - Start, stop, restart the bot process
-- **`smdb` console** - Loopback CLI with full panel-API parity, plus synthetic slash-command execution (see [Documentation/DiscordBot/Console.md](../Documentation/DiscordBot/Console.md))
+- **`smdb` console** - Loopback CLI with full panel-API parity, plus synthetic slash-command execution (run `./smdb.sh <container> --help` for its commands)
 
 ### Accessing Web-UI
 
@@ -288,15 +290,13 @@ Guild Web-UI provides a separate interface at `/guild` where Discord server admi
 
 Access the owner Web-UI (`http://localhost:8080/`) and go to **Credentials** tab:
 
-1. Expand **"🔐 Advanced: Guild Web-UI OAuth (Optional)"** section
-2. Enable **"Enable Guild Web-UI"** checkbox
-3. Fill in OAuth credentials:
+1. In the **Guild Web-UI Authentication** card, tick **Enable Guild Web-UI**
+2. Fill in the OAuth credentials:
    - **Discord OAuth Client ID**: From OAuth2 application (General tab)
    - **Discord OAuth Client Secret**: Click "Reset Secret" button, copy immediately
-   - **OAuth Callback URL**: Must match Discord redirect URI exactly
    - **Session Secret**: Click "Generate" button or provide your own (min 16 chars)
-
-4. Click **"Update & Restart"** to apply changes
+3. Copy the shown **OAuth Callback URL** (auto-generated, read-only) into the Discord redirect URIs
+4. Click **"Save Changes"** (Guild Web-UI changes apply live, without a restart)
 
 **4. Test OAuth Login:**
 ```bash
@@ -314,7 +314,7 @@ http://localhost:8080/guild
 | **Enable Guild Web-UI** | Yes | Toggle to enable OAuth feature | `true` or `false` |
 | **Discord OAuth Client ID** | Yes* | OAuth application ID (not bot CLIENT_ID) | `987654321098765432` |
 | **Discord OAuth Client Secret** | Yes* | OAuth application secret (keep secure!) | `AbCdEf123456_XXX` |
-| **OAuth Callback URL** | Yes* | Discord redirect URI (must match exactly) | `http://localhost:8080/auth/discord/callback` |
+| **OAuth Callback URL** | Read-only | Auto-generated; copy it into the Discord redirect URIs | `http://localhost:8080/auth/discord/callback` |
 | **Session Secret** | Yes* | Random string for session encryption | Click "Generate" button |
 
 *Required only when **Enable Guild Web-UI** is enabled
@@ -377,7 +377,7 @@ MAIN_GUILD_ID=987654321098765432   # Production/main server (optional)
 }
 ```
 
-**Guild Override** (`/data/guildConfigs/{guildId}.json`):
+**Guild Override** (`/data/{guildId}/_guildConfig/config.json`; in PostgreSQL mode, the database):
 ```json
 {
   "adminPanel.itemsPerPage": 25
@@ -403,31 +403,28 @@ These panels are only accessible:
 
 **Note:** The managed update system works with Bot Manager deployments. Self-hosted instances use the local git-based updater.
 
-### Update Modes
+### Update Actions
 
-Access via `/admin-panel` command → Bot Update Manager
+Access via `/system-panel` command → Bot Update Manager
 
-#### 🔧 Basic Update (Recommended)
-- Updates only core framework files
-- Preserves all modules and customizations
-- **Best for:** Security patches, framework improvements
+#### ⬆️ Update System
+- Updates the base code (core framework, internal events and commands), then rebuilds and restarts the container
+- Preserves all modules and custom modules
+- Self-hosted instances apply it by hand instead (pull the new code or image, then rebuild or recreate the container)
 
-#### 📈 Relative Update (Enhanced)
-- Updates core framework + adds new files
-- Never overwrites existing customizations
-- **Best for:** Version updates with new features
+#### 📦 Update Modules
+- Updates App Store modules to their latest versions and hot-reloads them, with no restart
+- Custom modules (`modulesDev/`) are never affected
 
-#### ⚠️ Full Update (Use with caution)
-- Replaces ALL source files
-- **Deletes all customizations**
-- **Best for:** Major breaking changes, starting fresh
+#### 🔄 Update Everything
+- Runs the system update first, then the modules sync on boot
+- Only available when both have updates
 
 ### Data Preservation
 
-**All update modes preserve:**
-- `/data/{guildId}/` - Guild-specific data
+**All update actions preserve:**
+- `/data/{guildId}/` - Guild-specific data, including the per-guild config at `/data/{guildId}/_guildConfig/config.json`
 - `/data/global/` - Global data
-- `/data/guildConfigs/` - Per-guild configs
 
 ---
 
@@ -470,7 +467,6 @@ Access via `/admin-panel` command → Bot Update Manager
 ```bash
 npm run dev              # Run with ts-node and auto-restart
 npm run dev:bot          # Run bot only (for Web-UI development)
-npm run dev:webui        # Run Web-UI only
 ```
 
 **Building:**
@@ -543,7 +539,7 @@ From a timer or event, take `saveMark()` before the writes and pass it as `{ sin
 
 **Slash Command Example:**
 ```typescript
-// src/bot/modules/misc/my-module/commands/ping.ts
+// src/bot/modules/my-module/commands/ping.ts
 import { Client, CommandInteraction } from 'discord.js';
 import { CommandOptions } from '@bot/types/commandTypes';
 
@@ -562,7 +558,7 @@ export = pingCommand;
 
 **Context Menu Example:**
 ```typescript
-// src/bot/modules/misc/my-module/commands/userInfo.ts
+// src/bot/modules/my-module/commands/userInfo.ts
 import { Client, UserContextMenuCommandInteraction, ApplicationCommandType } from 'discord.js';
 import { CommandOptions } from '@bot/types/commandTypes';
 

@@ -35,7 +35,7 @@ services:
       # MASTER_URLS: ws://master-host:3928  # co-worker only: master candidates (ordered, comma-separated)
       # CONTROL_SECRET: ${CONTROL_SECRET:-}  # shared secret; required on both master and worker
       # FLEET_SHARD_COUNT: ${FLEET_SHARD_COUNT:-}  # override the auto-derived shard count
-      # PIN_TEST_GUILD_SHARD: ${PIN_TEST_GUILD_SHARD:-}  # keep the test guild's shard on the master
+      # PIN_TEST_GUILD_SHARD: "false"  # the image keeps the test guild's shard on the master; "false" stops that
       # NODE_NAME: ${NODE_NAME:-}        # friendly name shown in the Fleet view
     volumes:
       # Persistent data: saved credentials (/data/.env), AppStore modules,

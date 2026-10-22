@@ -1,6 +1,6 @@
 # Bot Modules
 
-This directory contains all bot feature modules organized by category.
+This directory contains all bot feature modules, one folder per module.
 
 ## Structure
 
@@ -14,15 +14,12 @@ Each module is a self-contained feature with its own:
 
 ## Categories
 
-- **fun/** - Entertainment and game features
-- **misc/** - Miscellaneous utilities and examples
-- **moderation/** - Server management and moderation tools
-- **system/** - Core system configuration and management
+The manifest's `category` field (`fun`, `misc`, `moderation` or `system`) groups a module; it does not set the folder.
 
 ## Module Structure
 
 ```
-modules/{category}/{moduleName}/
+modules/{module-name}/   # one level deep; module.json must sit directly inside
 ├── module.json          # Module manifest (required)
 ├── README.md            # Module documentation
 ├── commands/            # Slash/context commands
@@ -38,7 +35,7 @@ Every module requires a `module.json` manifest:
 
 ```json
 {
-  "name": "moduleName",
+  "name": "module-name",
   "version": "1.0.0",
   "displayName": "Module Display Name",
   "description": "What this module does",
@@ -58,17 +55,16 @@ Every module requires a `module.json` manifest:
 
 ## Creating a New Module
 
-1. Choose the appropriate category folder
-2. Create a new folder with your module name
-3. Add a `module.json` manifest
-4. Organize your code in the standard structure
-5. Use `@internal/` and `@types` imports for core dependencies
-6. Use relative imports within your module
+1. Create a folder directly under `modules/`, named like the module (lowercase kebab-case, for example `my-module`; any other name fails validation and the module is skipped)
+2. Add a `module.json` manifest whose `name` matches
+3. Organize your code in the standard structure
+4. Use `@internal/` and `@bot/types` imports for core dependencies
+5. Use relative imports within your module
 
 ## Path Aliases
 
 - `@internal/*` - Core framework utilities
-- `@types` - Shared type definitions
+- `@bot/types` - Shared type definitions
 - `@modules/*` - Other modules
 - Relative paths - Within your module
 

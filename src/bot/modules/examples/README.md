@@ -6,9 +6,9 @@ Example commands and panels demonstrating Discord.js features and modular archit
 
 ### Slash Commands
 
-- **`/ping`** - Simple pong response with latency
+(`/ping` itself is a core command, not part of this module.)
+
 - **`/ping-button`** - Demonstrates button interactions
-- **`/pingchat`** - Works with both slash and message triggers
 - **`/modal-example`** - Shows modal (popup form) usage
 - **`/dropdown-example`** - Demonstrates dropdown menus
 
@@ -20,7 +20,7 @@ Example commands and panels demonstrating Discord.js features and modular archit
 ## Panels
 
 - **Example Module Panel** - Demonstrates how modules can include panels
-  - Access via `/admin-panel` → Select "Example Module Panel"
+  - Access via `/guild-panel` → Select "Example Module Panel"
   - Shows panel features: buttons, dynamic content, interactions
   - Example of modular panel architecture
 
