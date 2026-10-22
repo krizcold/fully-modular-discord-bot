@@ -36,19 +36,7 @@ router.get(
       user: u ? { id: u.id, username: u.username } : undefined,
     });
 
-    // Successful authentication. Validate returnTo to prevent open-redirect:
-    // must be a same-origin absolute path ("/..."), not protocol-relative ("//...")
-    // or absolute URL ("https://evil.com/...").
-    const stored = req.session.returnTo;
-    delete req.session.returnTo;
-
-    const isSafe = typeof stored === 'string'
-      && stored.length > 0
-      && stored.startsWith('/')
-      && !stored.startsWith('//');
-    const returnTo = isSafe ? stored as string : '/guild';
-
-    res.redirect(returnTo);
+    res.redirect('/guild');
   }
 );
 

@@ -17,6 +17,22 @@ function guildsSignature(guilds: DiscordGuild[] | undefined): string {
 }
 
 /**
+ * Persist a refreshed user into the current session in place, only when its tokens or guild access changed.
+ * Never req.login(): passport regenerates the session id on every login, which races parallel requests and
+ * mints a new session file per refresh.
+ */
+export function saveRefreshedUser(req: Request, user: DiscordUser, refreshedUser: DiscordUser): Promise<void> {
+  const tokensChanged = refreshedUser.accessToken !== user.accessToken
+    || refreshedUser.tokenExpiresAt !== user.tokenExpiresAt;
+  const guildsChanged = guildsSignature(refreshedUser.guilds) !== guildsSignature(user.guilds);
+  (req as any).user = refreshedUser;
+  if (!tokensChanged && !guildsChanged) return Promise.resolve();
+  const sess = req.session as any;
+  if (sess && sess.passport) sess.passport.user = refreshedUser;
+  return new Promise((resolve, reject) => req.session.save(err => err ? reject(err) : resolve()));
+}
+
+/**
  * Middleware: Require the Guild Web-UI to be currently enabled AND OAuth configured.
  * Evaluated at request time so credentials can be added / removed via the
  * Credentials panel without restarting the bot.
@@ -48,12 +64,6 @@ declare global {
   }
 }
 
-declare module 'express-session' {
-  interface SessionData {
-    returnTo?: string;
-  }
-}
-
 /**
  * Middleware: Require OAuth authentication
  * Redirects to /auth/discord if not authenticated
@@ -62,9 +72,6 @@ export function requireOAuth(req: Request, res: Response, next: NextFunction): v
   if (req.isAuthenticated()) {
     return next();
   }
-
-  // Store original URL for redirect after login
-  req.session.returnTo = req.originalUrl;
 
   res.status(401).json({
     success: false,
@@ -136,23 +143,7 @@ export function requireGuildAccess(req: Request, res: Response, next: NextFuncti
   // simultaneously) and leaves the client with a session cookie the server
   // doesn't recognise, looking like a spurious logout.
   refreshUserGuilds(user)
-    .then(refreshedUser => new Promise<DiscordUser>((resolve, reject) => {
-      const tokensChanged = refreshedUser.accessToken !== user.accessToken
-        || refreshedUser.tokenExpiresAt !== user.tokenExpiresAt;
-      // Reference-compare is useless here: the refresher always returns a new
-      // object. Compare by a canonical signature over id+permissions+owner.
-      const guildsChanged = guildsSignature(refreshedUser.guilds) !== guildsSignature(user.guilds);
-      if (!tokensChanged && !guildsChanged) {
-        // Nothing changed: skip the session write entirely.
-        resolve(refreshedUser);
-        return;
-      }
-      // Mutate passport's session user in place, then persist.
-      const sess = req.session as any;
-      if (sess && sess.passport) sess.passport.user = refreshedUser;
-      (req as any).user = refreshedUser;
-      req.session.save((err) => err ? reject(err) : resolve(refreshedUser));
-    }))
+    .then(refreshedUser => saveRefreshedUser(req, user, refreshedUser).then(() => refreshedUser))
     .then(refreshedUser => {
       if (!hasGuildAccess(refreshedUser, guildId as string)) {
         res.status(403).json({

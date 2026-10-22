@@ -8,8 +8,7 @@ const GUILD_API_BASE = '/guild/api';
 /**
  * fetch wrapper for guild-scoped API calls.
  * On 401 Unauthorized (session expired), redirect the user into the Discord
- * OAuth flow. The backend session stores req.originalUrl and sends the user
- * back here after login.
+ * OAuth flow; after login the user returns to /guild.
  *
  * Do NOT use this for `/auth/*` endpoints; those legitimately 401 when the
  * user isn't logged in, and the OAuthLogin screen renders the login button

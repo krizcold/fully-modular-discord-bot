@@ -2,7 +2,7 @@
 
 import { Router, Request, Response } from 'express';
 import { BotManager } from '../botManager';
-import { requireOAuth, requireGuildAccess } from '../auth/oauthMiddleware';
+import { requireOAuth, requireGuildAccess, saveRefreshedUser } from '../auth/oauthMiddleware';
 import { DiscordUser } from '../auth/oauthConfig';
 import { refreshUserGuilds } from '../auth/guildPermissionRefresher';
 import { hasGuildAccess as permHasGuildAccess } from '../auth/permissionChecker';
@@ -26,13 +26,9 @@ async function cachedIsUserDev(botManager: BotManager, userId: string): Promise<
   return cached?.isDev ?? false;
 }
 
-// Refresh user guilds AND persist the fresh user into the session via
-// req.login() so subsequent requests see up-to-date guild/permissions data.
 async function refreshAndSaveUser(req: Request, user: DiscordUser): Promise<DiscordUser> {
   const refreshedUser = await refreshUserGuilds(user);
-  await new Promise<void>((resolve, reject) => {
-    req.login(refreshedUser, (err) => err ? reject(err) : resolve());
-  });
+  await saveRefreshedUser(req, user, refreshedUser);
   return refreshedUser;
 }
 

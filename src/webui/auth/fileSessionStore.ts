@@ -19,6 +19,9 @@ const DEFAULT_SWEEP_INTERVAL_MS = 10 * 60 * 1000;
 // (pendingOps is last-op-wins by path).
 const DESTROYED_GRACE_MS = 30 * 1000;
 const DEFAULT_CONFIRM_MS = 8000;
+const DEFAULT_MAX_SESSIONS = 10000;
+const DEFAULT_MAX_ANONYMOUS = 1000;
+const DEFAULT_MAX_PER_USER = 10;
 
 export type SessionSaveOutcome = 'ok' | 'pending' | 'refused';
 const SAVE_OUTCOME = Symbol('sessionSaveOutcome');
@@ -46,6 +49,21 @@ export interface FileSessionStoreOptions {
   sweepIntervalMs?: number;
   defaultTtlMs?: number;
   confirmMs?: number;
+  maxSessions?: number;
+  maxAnonymous?: number;
+  maxPerUser?: number;
+}
+
+interface IndexEntry {
+  user: string | null;
+  updatedAt: number;
+}
+
+function sessionUser(session: SessionData): string | null {
+  const user = (session as { passport?: { user?: unknown } }).passport?.user;
+  if (user && typeof user === 'object' && typeof (user as { id?: unknown }).id === 'string') return (user as { id: string }).id;
+  if (typeof user === 'string') return user;
+  return null;
 }
 
 export class FileSessionStore extends Store {
@@ -56,7 +74,11 @@ export class FileSessionStore extends Store {
   private readonly touchWriteThresholdMs: number;
   private readonly defaultTtlMs: number;
   private readonly confirmMs: number;
+  private readonly maxSessions: number;
+  private readonly maxAnonymous: number;
+  private readonly maxPerUser: number;
   private readonly destroyed = new Set<string>();
+  private index: Map<string, IndexEntry> | null = null;
   private sweepTimer: NodeJS.Timeout | null = null;
 
   constructor(options: FileSessionStoreOptions = {}) {
@@ -65,6 +87,9 @@ export class FileSessionStore extends Store {
     this.touchWriteThresholdMs = options.touchWriteThresholdMs ?? DEFAULT_TOUCH_WRITE_THRESHOLD_MS;
     this.defaultTtlMs = options.defaultTtlMs ?? DEFAULT_TTL_MS;
     this.confirmMs = options.confirmMs ?? DEFAULT_CONFIRM_MS;
+    this.maxSessions = options.maxSessions ?? DEFAULT_MAX_SESSIONS;
+    this.maxAnonymous = options.maxAnonymous ?? DEFAULT_MAX_ANONYMOUS;
+    this.maxPerUser = options.maxPerUser ?? DEFAULT_MAX_PER_USER;
     this.probeOk = this.probe();
     if (this.probeOk) {
       this.sweepTimer = setInterval(() => this.sweep(), options.sweepIntervalMs ?? DEFAULT_SWEEP_INTERVAL_MS);
@@ -108,6 +133,12 @@ export class FileSessionStore extends Store {
     const file = this.fileFor(sid);
     if (!file) return void callback?.(new Error('[FileSessionStore] Invalid session id'));
     if (this.destroyed.has(sid)) return void callback?.();
+    const user = sessionUser(session);
+    const room = this.makeRoom(sid, user);
+    if (room) {
+      markSave(session, 'refused');
+      return void callback?.(room);
+    }
     const record: SessionFileRecord = {
       v: 1,
       sid,
@@ -127,6 +158,7 @@ export class FileSessionStore extends Store {
       markSave(session, 'refused');
       return void callback?.(new Error('[FileSessionStore] The session was not saved'));
     }
+    this.sessionIndex().set(sid, { user, updatedAt: record.updatedAt });
     this.afterLanding(file, callback, outcome => markSave(session, outcome));
   }
 
@@ -141,6 +173,7 @@ export class FileSessionStore extends Store {
     }
     if (!deleted && readRaw(file) !== null) return void callback?.(new Error('[FileSessionStore] The session was not deleted'));
     this.destroyed.add(sid);
+    this.index?.delete(sid);
     const timer = setTimeout(() => this.destroyed.delete(sid), DESTROYED_GRACE_MS);
     timer.unref();
     this.afterLanding(file, callback);
@@ -165,6 +198,8 @@ export class FileSessionStore extends Store {
       return void callback?.(error);
     }
     if (!accepted) return void callback?.(new Error('[FileSessionStore] The session was not saved'));
+    const entry = this.index?.get(sid);
+    if (entry) entry.updatedAt = record.updatedAt;
     callback?.();
   }
 
@@ -207,6 +242,42 @@ export class FileSessionStore extends Store {
         callback?.(error);
       },
     );
+  }
+
+  private sessionIndex(): Map<string, IndexEntry> {
+    if (this.index) return this.index;
+    const index = new Map<string, IndexEntry>();
+    for (const sid of this.listSids()) {
+      const raw = readRaw(this.fileFor(sid)!);
+      const record = raw === null ? null : this.parseRecord(raw);
+      index.set(sid, record
+        ? { user: sessionUser(record.session), updatedAt: record.updatedAt ?? 0 }
+        : { user: null, updatedAt: 0 });
+    }
+    this.index = index;
+    return index;
+  }
+
+  // A new session past a cap evicts the oldest session of its own kind (the same user's, or an anonymous one);
+  // a signed-in session never evicts another user's, so a full store refuses the new one instead.
+  private makeRoom(sid: string, user: string | null): Error | null {
+    const index = this.sessionIndex();
+    const existing = index.get(sid);
+    if (existing && existing.user === user) return null;
+    const evictOldest = (match: (entry: IndexEntry) => boolean, keep: number): void => {
+      const own = [...index.entries()].filter(([other, entry]) => other !== sid && match(entry))
+        .sort((a, b) => a[1].updatedAt - b[1].updatedAt);
+      for (const [other] of own.slice(0, Math.max(0, own.length - keep))) this.destroy(other);
+    };
+    if (user === null) evictOldest(entry => entry.user === null, this.maxAnonymous - 1);
+    else evictOldest(entry => entry.user === user, this.maxPerUser - 1);
+    let others = index.size - (index.has(sid) ? 1 : 0);
+    if (others >= this.maxSessions) {
+      evictOldest(entry => entry.user === null, Math.max(0, [...index.values()].filter(e => e.user === null).length - (others - this.maxSessions + 1)));
+      others = index.size - (index.has(sid) ? 1 : 0);
+    }
+    if (others >= this.maxSessions) return new Error('[FileSessionStore] Session store is full');
+    return null;
   }
 
   private fileFor(sid: string): string | null {
@@ -258,7 +329,9 @@ export class FileSessionStore extends Store {
         if (raw === null) continue;
         const record = this.parseRecord(raw);
         if (record) {
-          if (record.expiresAt < now) deleteRawAtomic(file);
+          if (record.expiresAt < now) {
+            if (deleteRawAtomic(file)) this.index?.delete(sid);
+          }
           continue;
         }
         // Corrupt file: delete only once stale, so a file another process is

@@ -104,7 +104,7 @@ describe('the bot mounts the path guard before every route', () => {
     expect(server.match(/app\.use\(pathGuard\)/g)).toHaveLength(1);
     const guard = at('app.use(pathGuard)');
     expect(guard).toBeGreaterThan(at("res.setHeader('Permissions-Policy'"));
-    for (const later of ["'/webhook/:providerId'", 'app.use(express.json(', "app.use('/api/', apiLimiter)", "app.use('/auth'",
+    for (const later of ["'/webhook/:providerId'", 'app.use(express.json(', 'mountRateLimits(app);', "app.use('/auth'",
       "app.use('/guild/api/panels'", "app.use('/api/managed'", 'app.use(express.static(', "app.get('/', requireAuth",
       "app.get('/guild', guildHtmlHandler)", "app.get('*', requireAuth"]) {
       expect(guard, later).toBeLessThan(at(later));

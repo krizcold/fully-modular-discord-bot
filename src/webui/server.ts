@@ -3,7 +3,7 @@
 import express, { Express, Request, Response } from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
-import rateLimit from 'express-rate-limit';
+import { mountRateLimits, TRUST_PROXY } from './middleware/tokenLimiter';
 import session from 'express-session';
 import passport from 'passport';
 import * as path from 'path';
@@ -39,9 +39,8 @@ export async function createServer(botManager: BotManager): Promise<Express> {
   // sessions to the bot child (no-op unless security.accessLog is enabled).
   setAccessLogDispatcher((info) => botManager.postAccessLog(info));
 
-  // Trust proxy - required when a reverse proxy / auth gateway (AppShield, Authelia)
-  // fronts the app, so express-rate-limit reads client IPs from X-Forwarded-For.
-  app.set('trust proxy', 1);
+  // Trust only private and loopback hops, so the rate limits key on the client's own address.
+  app.set('trust proxy', TRUST_PROXY);
 
   // Session middleware + Passport are ALWAYS installed so that Guild Web-UI
   // credentials can be added / removed at runtime via the Credentials panel
@@ -158,97 +157,7 @@ export async function createServer(botManager: BotManager): Promise<Express> {
   app.use(express.json({ limit: '10kb' })); // Strict limit for most requests
   app.use(express.urlencoded({ extended: true, limit: '10kb' }));
 
-  // Token bucket rate limiter with burst capacity
-  // - Bucket capacity: 10 tokens (allows burst of 10 rapid requests)
-  // - Refill rate: 1 token per 500ms (120 requests/minute sustained)
-  // - When bucket is empty, requests are rejected until tokens refill
-  const tokenBuckets = new Map<string, { tokens: number; lastRefill: number }>();
-  const BUCKET_CAPACITY = 10;       // Max burst size
-  const REFILL_RATE = 500;          // ms per token (1 token every 500ms = 120/min)
-  const SUSTAINED_RATE = 120;       // requests per minute (for headers)
-
-  function getClientKey(req: express.Request): string {
-    // Use IP address as key, falling back to 'unknown'
-    return (req.ip || req.socket.remoteAddress || 'unknown');
-  }
-
-  function consumeToken(key: string): { allowed: boolean; tokensRemaining: number; retryAfter: number } {
-    const now = Date.now();
-    let bucket = tokenBuckets.get(key);
-
-    if (!bucket) {
-      // New client gets a full bucket
-      bucket = { tokens: BUCKET_CAPACITY, lastRefill: now };
-      tokenBuckets.set(key, bucket);
-    }
-
-    // Calculate tokens to add based on time elapsed
-    const elapsed = now - bucket.lastRefill;
-    const tokensToAdd = Math.floor(elapsed / REFILL_RATE);
-
-    if (tokensToAdd > 0) {
-      bucket.tokens = Math.min(BUCKET_CAPACITY, bucket.tokens + tokensToAdd);
-      bucket.lastRefill = now - (elapsed % REFILL_RATE); // Keep remainder for partial token
-    }
-
-    if (bucket.tokens > 0) {
-      bucket.tokens--;
-      return { allowed: true, tokensRemaining: bucket.tokens, retryAfter: 0 };
-    } else {
-      // Calculate time until next token
-      const timeUntilNextToken = REFILL_RATE - (now - bucket.lastRefill);
-      return { allowed: false, tokensRemaining: 0, retryAfter: Math.ceil(timeUntilNextToken / 1000) };
-    }
-  }
-
-  // Cleanup old buckets periodically (every 5 minutes)
-  setInterval(() => {
-    const now = Date.now();
-    const maxAge = 5 * 60 * 1000; // 5 minutes
-    for (const [key, bucket] of tokenBuckets.entries()) {
-      if (now - bucket.lastRefill > maxAge) {
-        tokenBuckets.delete(key);
-      }
-    }
-  }, 5 * 60 * 1000);
-
-  const apiLimiter: express.RequestHandler = (req, res, next) => {
-    // Skip health checks
-    if (req.path === '/api/health') {
-      return next();
-    }
-
-    const key = getClientKey(req);
-    const result = consumeToken(key);
-
-    console.log(`[RateLimit] ${req.method} ${req.path} | Key: ${key} | Tokens: ${result.tokensRemaining} | Allowed: ${result.allowed}`);
-
-    // Set standard rate limit headers
-    res.setHeader('RateLimit-Limit', SUSTAINED_RATE);
-    res.setHeader('RateLimit-Remaining', result.tokensRemaining);
-    res.setHeader('RateLimit-Reset', Math.ceil(Date.now() / 1000) + (result.retryAfter || 1));
-
-    if (result.allowed) {
-      next();
-    } else {
-      console.log(`[RateLimit] BLOCKED: ${key} - retry after ${result.retryAfter}s`);
-      res.setHeader('Retry-After', result.retryAfter);
-      res.status(429).json({ error: 'Rate limit exceeded. Please wait a moment.' });
-    }
-  };
-
-  // Stricter rate limiting for sensitive operations
-  const authLimiter = rateLimit({
-    windowMs: 15 * 60 * 1000, // 15 minutes
-    max: 10, // 10 requests per 15 minutes
-    standardHeaders: true,
-    legacyHeaders: false,
-    message: { error: 'Too many authentication attempts, please wait' }
-  });
-
-  // Apply rate limiting to API routes
-  app.use('/api/', apiLimiter);
-  app.use('/api/setup/credentials', authLimiter);
+  mountRateLimits(app);
 
   // Cache control for API responses
   app.use('/api/', (req, res, next) => {
@@ -260,7 +169,7 @@ export async function createServer(botManager: BotManager): Promise<Express> {
 
   // Request logging
   app.use((req: Request, res: Response, next) => {
-    console.log(`[WebUI] ${req.method} ${req.path}`);
+    console.log(`[WebUI] ${req.method} ${req.path.slice(0, 200)}`);
     next();
   });
 
