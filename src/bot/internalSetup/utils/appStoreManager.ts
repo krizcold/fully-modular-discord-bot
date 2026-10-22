@@ -921,6 +921,7 @@ export class AppStoreManager {
     if (!fs.existsSync(sourceDir) && !fs.existsSync(buildDir) && !fs.existsSync(runtimeDir)) {
       delete this.installedConfig.modules[moduleName];
       this.saveInstalled();
+      this.deleteCredentials(moduleName);
       return true;
     }
 
