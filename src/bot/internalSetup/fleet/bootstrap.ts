@@ -52,7 +52,8 @@ import { clearStandInStaging, landStandInStagingOrWarn, reconcileStandInStaging,
 import { closeStandInLane, rememberLineageVerdict, seizedEpisode, standInEnding, writeEpisodeRecordOrWarn } from './episodeRecord';
 import { backupModeEnabled, leverRank, readModeOverride } from './modeOverride';
 import { clearOwnSyncPosture } from './syncPosture';
-import { Registry, RegistryNode } from './registry';
+import { Registry, RegistryNode, ShardLease } from './registry';
+import { choiceNotSavedText, ControlWriteError, declareLostRegisterRefusal, declareNotDoneText, planLanded, proposalClearable, recordWriteNote, refusedWriteNote, restorePlacement, unconfirmed } from './controlWrites';
 import { ControlServer } from './controlServer';
 import { ControlClient } from './controlClient';
 import { LeaseRuntime } from './leaseRuntime';
@@ -1833,6 +1834,12 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   // reads the plan as pending while the table has moved past it (B4f-4).
   let persistedPlanKey: string | null = null;
   let persistFailedKey: string | null = null;
+  // The registry document's last write was refused: written again with the plan's next retry.
+  let registryBehind = false;
+  // Held shards whose operator choice is being written: no other choice, and no placement, until it settles.
+  const resolvingHeld = new Set<number>();
+  // Nodes whose Declare Lost is being written: their register waits until the verdict stands.
+  const declaringLost = new Set<string>();
   let selfExecutor: MigrationExecutor | null = null;
   let pinViolation: PinViolationView | null = null;
 
@@ -2169,10 +2176,10 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     // place normally; grant-carried routes make that safe.
     const transformPinned = transformer?.pinnedShardIds();
     const fenced = (migratingShards?.size ?? 0) > 0 || (pendingCleanupShards?.size ?? 0) > 0
-      || (transformPinned?.size ?? 0) > 0 || resumePendingShards.size > 0;
+      || (transformPinned?.size ?? 0) > 0 || resumePendingShards.size > 0 || resolvingHeld.size > 0;
     const free = fenced
       ? registry.freeShards().filter(id => !migratingShards?.has(id) && !pendingCleanupShards?.has(id)
-        && !transformPinned?.has(id) && !resumePendingShards.has(id))
+        && !transformPinned?.has(id) && !resumePendingShards.has(id) && !resolvingHeld.has(id))
       : registry.freeShards();
     if (free.length === 0) return;
 
@@ -2700,13 +2707,20 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     const result = await grantShardsTo(target, () => [...new Set([...registry.shardIdsOf(targetNodeId), shardId])].sort((a, b) => a - b), registry.epoch);
     // A shard another node got while the grant waited was not sent.
     const landed = registry.shardTable.get(shardId)?.nodeId === targetNodeId || registry.pendingConfirmation.get(shardId)?.nodeId === targetNodeId;
-    await persist();
+    let unwritten = '';
+    try {
+      await persist();
+    } catch (error) {
+      unwritten = `; ${refusedWriteNote(error)}`;
+    }
     // A manual grant changes the table outside distribute(), whose reports
     // are the only refresh standalone has (no periodic tick there).
     reportPlacement();
-    if ((result.ok || result.pending) && landed) return { success: true };
-    if (result.ok || result.pending) return { success: false, error: `shard ${shardId} was placed on another node meanwhile` };
-    return { success: false, error: `grant to ${target.nodeName} was refused` };
+    if ((result.ok || result.pending) && landed) {
+      return unwritten === '' ? { success: true } : { success: false, error: `shard ${shardId} is granted to ${target.nodeName}${unwritten}` };
+    }
+    if (result.ok || result.pending) return { success: false, error: `shard ${shardId} was placed on another node meanwhile${unwritten}` };
+    return { success: false, error: `grant to ${target.nodeName} was refused${unwritten}` };
   };
 
   // One grant pass over the still-fenced redistribute-proposal shards, grouped by
@@ -2790,6 +2804,17 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
           return;
         }
         if (resumePendingShards.size === 0) {
+          // The proposal goes only once the plan holding its shards is stored.
+          if (!proposalClearable(0, planKeyOf(), persistedPlanKey)) {
+            // Mid-migration the migration writes its own plan.
+            if (coordinator?.hasActive()) return;
+            try {
+              await persist();
+            } catch (error) {
+              console.warn(`[Fleet] Resume proposal kept: ${refusedWriteNote(error)}`);
+              if (!planLanded(error)) return;
+            }
+          }
           clearResumeRetry();
           await proposalPass(() => store.saveRedistributeProposal(null)).catch(error =>
             console.warn('[Fleet] Clearing the settled redistribute proposal failed:', error instanceof Error ? error.message : error));
@@ -2875,8 +2900,17 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
         resumePendingShards.add(shardId);
       }
       if (resumePendingShards.size > 0) {
-        await grantResumeProposal();
-        if (resumePendingShards.size > 0) scheduleResumeRetry();
+        const total = resumePendingShards.size;
+        try {
+          await grantResumeProposal();
+        } catch (error) {
+          const left = resumePendingShards.size;
+          scheduleResumeRetry();
+          void distribute();
+          console.warn(`[Fleet] Reshard pause resumed, but ${refusedWriteNote(error)}`);
+          return { success: false, error: `resumed: ${total - left} of ${total} proposal shard(s) landed, but ${refusedWriteNote(error)}; ${left > 0 ? `the rest are granted again every ${Math.round(XFER_COMMIT_RETRY_MS / 1000)}s` : `the proposal is kept until the plan is stored, retried every ${Math.round(XFER_COMMIT_RETRY_MS / 1000)}s`}` };
+        }
+        if (!proposalClearable(resumePendingShards.size, planKeyOf(), persistedPlanKey)) scheduleResumeRetry();
         else await proposalPass(() => store.saveRedistributeProposal(null));
       } else {
         await proposalPass(() => store.saveRedistributeProposal(null));
@@ -2905,49 +2939,58 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     if (transformer?.hasActive() && !transformer.isRetiring()) {
       return { success: false, error: 'a backend transformation is active; abort it (or let it finish) before declaring nodes lost' };
     }
+    if (declaringLost.has(targetNodeId)) return { success: false, error: `a Declare Lost of ${node.nodeName} is under way` };
+    declaringLost.add(targetNodeId);
     const releasePlanWrites = holdPlanWrites();
     try {
       // Declaring a migration participant lost is a node-down event for the
       // coordinator (pre-commit -> abort; post-commit -> its legs settle below).
       coordinator?.onNodeDown(targetNodeId);
-      transformer?.onNodeRemoved(targetNodeId);
-      registry.epoch += 1;
+      // What the verdict frees is read before anything changes: the migration
+      // records are written first, and a refused write changes nothing here.
       const shardIds: number[] = [];
-      for (const [shardId, lease] of registry.shardTable) {
-        if (lease.nodeId !== targetNodeId) continue;
-        shardIds.push(shardId);
-        registry.shardTable.delete(shardId);
-      }
+      const free = (shardId: number): void => { if (!shardIds.includes(shardId)) shardIds.push(shardId); };
+      for (const [shardId, lease] of registry.shardTable) if (lease.nodeId === targetNodeId) free(shardId);
       // A stamp whose shard the table records under another node was never this node's.
       const ownStamps = new Set(registry.pendingShardIdsOf(targetNodeId));
-      for (const [shardId, pending] of registry.pendingConfirmation) {
-        if (pending.nodeId !== targetNodeId) continue;
-        if (ownStamps.has(shardId)) shardIds.push(shardId);
-        registry.pendingConfirmation.delete(shardId);
-      }
+      for (const [shardId, pending] of registry.pendingConfirmation) if (pending.nodeId === targetNodeId && ownStamps.has(shardId)) free(shardId);
       // A migration's commit or grant to this node that has not landed:
       // what it put there went with the node.
-      for (const shardId of coordinator?.grantsOwedTo(targetNodeId) ?? []) {
-        if (!shardIds.includes(shardId)) shardIds.push(shardId);
-      }
+      for (const shardId of coordinator?.grantsOwedTo(targetNodeId) ?? []) free(shardId);
       // An abort under way hands back to this node what its drain took off
       // the table: those shards are freed with it (the rollback skips it).
-      for (const shardId of coordinator?.releaseRollbackOf(targetNodeId) ?? []) {
-        if (!shardIds.includes(shardId)) shardIds.push(shardId);
-      }
-      lostNodes.add(node);
-      registry.nodes.delete(targetNodeId);
+      for (const shardId of coordinator?.rollbackShardsOf(targetNodeId) ?? []) free(shardId);
       // In the reshard pause the Resume grants are only on disk: the data the
       // redistribute placed on this node went with it, so its proposal shards
       // leave the proposal as freed.
-      if (paused) {
-        for (const shardId of await coordinator?.dropProposalOwner(targetNodeId) ?? []) if (!shardIds.includes(shardId)) shardIds.push(shardId);
-      }
+      if (paused) for (const shardId of await coordinator?.proposalShardsOf(targetNodeId) ?? []) free(shardId);
       // A Resume grant awaiting this node (it held the data the reshard placed
       // there) can never land now: its shards leave the resume fence with it.
+      for (const [shardId, owner] of resumeProposalOwner) if (owner === targetNodeId && resumePendingShards.has(shardId)) free(shardId);
+      shardIds.sort((a, b) => a - b);
+      // The lost node's owed copies went with it; a freed shard an older copy
+      // of which survives on a node that missed a move's cleanup is held, that
+      // cleanup with it, for the operator's choice.
+      let heldIds: number[];
+      try {
+        heldIds = await coordinator?.onNodeDeclaredLost(targetNodeId, node.nodeName, shardIds) ?? [];
+      } catch (error) {
+        return { success: false, error: declareNotDoneText(error, node.nodeName) };
+      }
+      transformer?.onNodeRemoved(targetNodeId);
+      registry.epoch += 1;
+      for (const shardId of shardIds) {
+        if (registry.shardTable.get(shardId)?.nodeId === targetNodeId) registry.shardTable.delete(shardId);
+      }
+      for (const [shardId, pending] of registry.pendingConfirmation) {
+        if (pending.nodeId === targetNodeId) registry.pendingConfirmation.delete(shardId);
+      }
+      lostNodes.add(node);
+      registry.nodes.delete(targetNodeId);
+      if (paused) for (const shardId of await coordinator?.dropProposalOwner(targetNodeId) ?? []) free(shardId);
       for (const [shardId, owner] of resumeProposalOwner) {
         if (owner !== targetNodeId) continue;
-        if (resumePendingShards.delete(shardId) && !shardIds.includes(shardId)) shardIds.push(shardId);
+        resumePendingShards.delete(shardId);
         resumeProposalOwner.delete(shardId);
       }
       if (backupDesignationRefused?.nodeId === targetNodeId) backupDesignationRefused = null;
@@ -2969,20 +3012,24 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       lastRevokeSentAt.delete(targetNodeId);
       shardIds.sort((a, b) => a - b);
       healthMonitor?.recordLoss({ nodeId: targetNodeId, nodeName: node.nodeName, shardIds, at: Date.now() });
-      // The lost node's owed copies went with it; a freed shard an older copy
-      // of which survives on a node that missed a move's cleanup is held, that
-      // cleanup with it, for the operator's choice.
-      const heldIds = await coordinator?.onNodeDeclaredLost(targetNodeId, node.nodeName, shardIds) ?? [];
       releasePlanWrites();
-      await persist();
+      const freedIds = shardIds.filter(id => !heldIds.includes(id));
       const heldNote = heldIds.length > 0
         ? `; shard${heldIds.length === 1 ? '' : 's'} [${heldIds.join(', ')}] held: a copy survives on another node; restore it or start it empty on the Fleet tab`
         : '';
-      console.warn(`[Fleet] Node ${node.nodeName} DECLARED LOST; shards [${shardIds.filter(id => !heldIds.includes(id)).join(', ')}] freed for redistribution${heldNote}`);
+      try {
+        await persist();
+      } catch (error) {
+        console.warn(`[Fleet] Node ${node.nodeName} DECLARED LOST; shards [${freedIds.join(', ')}] freed${heldNote}; the migration record is stored, but ${refusedWriteNote(error)}`);
+        void distribute();
+        return { success: false, error: `${node.nodeName} is declared lost (the migration record is stored): shard(s) [${freedIds.join(', ')}] freed${heldNote}; but ${refusedWriteNote(error)}` };
+      }
+      console.warn(`[Fleet] Node ${node.nodeName} DECLARED LOST; shards [${freedIds.join(', ')}] freed for redistribution${heldNote}`);
       void distribute();
       return { success: true };
     } finally {
       releasePlanWrites();
+      declaringLost.delete(targetNodeId);
     }
   };
 
@@ -3012,10 +3059,21 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     };
     const refused = refusal();
     if (refused || !coordinator) return { success: false, error: refused ?? 'this node is not the fleet master' };
+    if (resolvingHeld.has(shardId)) return { success: false, error: `a choice for shard ${shardId} is being saved; try again shortly` };
+    resolvingHeld.add(shardId);
+    try {
+      return await resolveHeld(coordinator, shardId, restoreOn, heldNow, refusal);
+    } finally {
+      resolvingHeld.delete(shardId);
+    }
+  };
+
+  async function resolveHeld(migrations: MigrationCoordinator, shardId: number, restoreOn: string | null, heldNow: () => ReturnType<MigrationCoordinator['heldShards']>[number] | undefined, refusal: () => string | null): Promise<AssignResult> {
     let restored = '';
+    let registryNote = '';
     if (restoreOn !== null) {
       const name = heldNow()?.holders.find(h => h.nodeId === restoreOn)?.nodeName ?? restoreOn;
-      const copy = await coordinator.heldCopyKept(shardId, restoreOn);
+      const copy = await migrations.heldCopyKept(shardId, restoreOn);
       if (!copy) return { success: false, error: `${name} did not answer which guilds of its copy it still holds; try again` };
       if (!copy.probed) return { success: false, error: `${name} runs an older version that cannot say whether it still holds that copy; update it, then restore` };
       if (copy.cleaning) return { success: false, error: `${name} is moving that copy to its graveyard (a cleanup sent before the shard's node was declared lost, running or left for its next start); start the shard empty` };
@@ -3023,19 +3081,45 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
       const again = refusal();
       if (again) return { success: false, error: again };
       const holder = heldNow()!.holders.find(h => h.nodeId === restoreOn)!;
-      registry.epoch += 1;
-      registry.placeOnHolder(restoreOn, shardId);
-      await persist();
+      const epoch = registry.epoch + 1;
+      const lease = registry.holderLease(restoreOn, shardId, epoch);
+      let writeError: unknown = null;
+      try {
+        await persist(() => ({ table: new Map(registry.shardTable).set(shardId, lease), epoch }));
+      } catch (error) {
+        writeError = error;
+      }
+      const placement = restorePlacement(writeError, registry.nodes.get(restoreOn));
+      if (placement === 'unsaved') return { success: false, error: choiceNotSavedText(writeError, shardId) };
+      if (writeError !== null) registryNote = `; ${refusedWriteNote(writeError)}`;
+      if (placement === 'holder-gone') {
+        return { success: false, error: `the plan stored shard ${shardId} on ${holder.nodeName}, but ${holder.nodeName} left the fleet before it was placed: it is not placed, the plan is written again without it on a later placement pass, and shard ${shardId} still waits on a choice${registryNote}` };
+      }
+      registry.epoch = Math.max(registry.epoch, epoch);
+      registry.placeOnHolder(lease);
       restored = `${holder.nodeName}'s copy as of ${new Date(holder.copyAt).toISOString()} restored${copy.kept < copy.total ? ` (${copy.kept} of its ${copy.total} guilds; the others were already in its graveyard)` : ''}`;
+      if (placement === 'place-down') registryNote = `; ${holder.nodeName} disconnected meanwhile, so it serves the shard once it reconnects${registryNote}`;
     }
-    const owing = await coordinator.releaseHeld(shardId);
-    console.warn(`[Fleet] Shard ${shardId}: ${restored || 'started empty'} by the operator; the other copies go to their graveyards`);
-    void distribute();
-    for (const owingNodeId of owing) {
-      if (registry.nodes.get(owingNodeId)?.connected) void coordinator.retrySourceCleanup(owingNodeId).catch(() => undefined);
+    const kick = (owing: string[]): void => {
+      void distribute();
+      for (const owingNodeId of owing) {
+        if (registry.nodes.get(owingNodeId)?.connected) void migrations.retrySourceCleanup(owingNodeId).catch(() => undefined);
+      }
+    };
+    const owers = migrations.cleanupOwersOf(shardId);
+    let owing: string[];
+    try {
+      owing = await migrations.releaseHeld(shardId);
+    } catch (error) {
+      if (!restored) return { success: false, error: choiceNotSavedText(error, shardId) };
+      console.warn(`[Fleet] Shard ${shardId}: ${restored} by the operator, but ${recordWriteNote(error)}`);
+      kick(owers);
+      return { success: false, error: `shard ${shardId}: ${restored}, but ${recordWriteNote(error)}; the other copies still go to their graveyards${registryNote}` };
     }
-    return { success: true };
-  };
+    console.warn(`[Fleet] Shard ${shardId}: ${restored || 'started empty'} by the operator; the other copies go to their graveyards${registryNote}`);
+    kick(owing);
+    return registryNote === '' ? { success: true } : { success: false, error: `shard ${shardId}: ${restored}${registryNote}` };
+  }
 
   // Manual lease drain (Part 3.3): the node is fenced out of placement FIRST
   // (draining set before any await; cleared on its next re-register), then
@@ -3101,10 +3185,21 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     if (drainCancelled()) return cancelledResult;
     if (unacked || recordedLeaseIdsOf(targetNodeId).length > 0) {
       drainRevokeAt.set(targetNodeId, Date.now());
-      await persist();
-      return { success: false, error: `drain pending confirmation: ${node.nodeName} has not confirmed the revoke; its leases stay recorded and the master retries off its heartbeats` };
+      const pending = `drain pending confirmation: ${node.nodeName} has not confirmed the revoke; its leases stay recorded and the master retries off its heartbeats`;
+      try {
+        await persist();
+      } catch (error) {
+        return { success: false, error: `${pending}; ${refusedWriteNote(error)}` };
+      }
+      return { success: false, error: pending };
     }
-    await persist();
+    try {
+      await persist();
+    } catch (error) {
+      console.warn(`[Fleet] Node ${node.nodeName} drained (${revokedIds.size} lease(s) revoked), but ${refusedWriteNote(error)}`);
+      void distribute();
+      return { success: false, error: `${node.nodeName} is drained (${revokedIds.size} lease(s) revoked, its shards freed), but ${refusedWriteNote(error)}` };
+    }
     console.log(`[Fleet] Node ${node.nodeName} drained (${revokedIds.size} lease(s) revoked); excluded from placement until it re-registers`);
     void distribute();
     return { success: true };
@@ -3166,7 +3261,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   async function persistIfBehind(): Promise<void> {
     if (coordinator?.hasActive()) return;
     const key = planKeyOf();
-    if (key === persistedPlanKey) return;
+    if (key === persistedPlanKey && !registryBehind) return;
     try {
       await persist();
     } catch (error) {
@@ -3175,23 +3270,41 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     }
   }
 
-  async function persist(): Promise<void> {
+  // A plan given is written as it stands, before the table holds it.
+  async function persist(next?: () => { table: Map<number, ShardLease>; epoch: number }): Promise<void> {
     while (planWriteHolds.size > 0) await Promise.all([...planWriteHolds]);
-    const key = planKeyOf();
+    const plan = next ? next() : { table: registry.shardTable, epoch: registry.epoch };
+    const key = [...plan.table.values()].map(lease => `${lease.shardId}:${lease.nodeId}`).sort().join(',');
     const byNode = new Map<string, { leaseId: string; shardId: number; identifyDelayMs: number }[]>();
-    for (const lease of registry.shardTable.values()) {
+    for (const lease of plan.table.values()) {
       const arr = byNode.get(lease.nodeId) ?? [];
       arr.push({ leaseId: lease.leaseId, shardId: lease.shardId, identifyDelayMs: 0 });
       byNode.set(lease.nodeId, arr);
     }
-    await store.savePlan({
-      term: registry.term,
-      epoch: registry.epoch,
-      shardCount: registry.shardCount,
-      assignments: [...byNode.entries()].map(([assignedNodeId, leases]) => ({ nodeId: assignedNodeId, leases })),
-      updatedAt: Date.now(),
-    });
+    try {
+      await store.savePlan({
+        term: registry.term,
+        epoch: plan.epoch,
+        shardCount: registry.shardCount,
+        assignments: [...byNode.entries()].map(([assignedNodeId, leases]) => ({ nodeId: assignedNodeId, leases })),
+        updatedAt: Date.now(),
+      });
+    } catch (error) {
+      // A plan write that may still land leaves no stored plan known: the next pass writes the table again.
+      if (unconfirmed(error)) persistedPlanKey = null;
+      throw new ControlWriteError(false, error);
+    }
     persistedPlanKey = key;
+    try {
+      await saveRegistryDoc();
+      registryBehind = false;
+    } catch (error) {
+      registryBehind = true;
+      throw new ControlWriteError(true, error);
+    }
+  }
+
+  async function saveRegistryDoc(): Promise<void> {
     await store.saveRegistry({
       nodes: [...registry.nodes.values()].map(n => ({
         nodeId: n.nodeId,
@@ -3810,6 +3923,10 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
         if (payload.heldLeases != null && !isValidHeldLeases(payload.heldLeases)) {
           return refuse('bad-held-leases', payload);
         }
+        // Not through refuse(): a register racing its own Declare Lost is no
+        // refused registration, only one too early; it rejoins as a fresh node.
+        const declaring = declareLostRegisterRefusal(declaringLost, payload.nodeId, registry.term);
+        if (declaring) return declaring;
         const node = registry.upsertNode({
           nodeId: payload.nodeId,
           nodeName: payload.nodeName || payload.nodeId,
@@ -3994,9 +4111,11 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
             // its shards leave resumePendingShards only once the grant lands.
             if (resumePendingShards.size > 0) {
               await grantResumeProposal();
-              if (resumePendingShards.size === 0) {
+              if (proposalClearable(resumePendingShards.size, planKeyOf(), persistedPlanKey)) {
                 clearResumeRetry();
                 await proposalPass(() => store.saveRedistributeProposal(null));
+              } else if (resumePendingShards.size === 0) {
+                scheduleResumeRetry();
               }
             }
             await distribute();
