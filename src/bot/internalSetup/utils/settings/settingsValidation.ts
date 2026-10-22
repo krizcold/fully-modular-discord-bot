@@ -5,6 +5,7 @@
  * Handles value validation, condition evaluation, and batch validation.
  */
 
+import { isDeepStrictEqual } from 'util';
 import type {
   SettingsSchema,
   SettingDefinition,
@@ -66,7 +67,7 @@ export function validateHardLimits(
   validation: ValidationRules | undefined,
   settingType: string
 ): string | null {
-  if (!validation) return null;
+  validation = validation ?? {};
 
   // Number type validations
   if (settingType === 'number') {
@@ -152,6 +153,30 @@ export function validateHardLimits(
   return null;
 }
 
+const COLOR_PATTERN = /^(0x|#)?[0-9a-f]{6}$/i;
+
+export function settingTypeError(value: SettingValue, settingType: string): string | null {
+  switch (settingType) {
+    case 'number':
+      return typeof value === 'number' && Number.isFinite(value) ? null : 'Must be a valid number';
+    case 'boolean':
+      return typeof value === 'boolean' ? null : 'Must be true or false';
+    case 'string':
+    case 'select':
+    case 'channel':
+    case 'role':
+      return typeof value === 'string' ? null : 'Must be text';
+    case 'color':
+      return typeof value === 'string' && COLOR_PATTERN.test(value) ? null : 'Must be a hex color such as 0xFF0000';
+    case 'multiSelect':
+    case 'multiChannel':
+    case 'multiRole':
+      return Array.isArray(value) && value.every(v => typeof v === 'string') ? null : 'Must be a list of ids';
+    default:
+      return null;
+  }
+}
+
 /**
  * Validate a single value against validation rules
  *
@@ -165,13 +190,8 @@ export function validateValue(
   rules: ValidationRules | undefined,
   settingType: string
 ): SingleValidationResult {
-  // No rules = always valid
-  if (!rules) {
-    return { valid: true };
-  }
-
   // Required check
-  if (rules.required) {
+  if (rules?.required) {
     if (value === null || value === undefined) {
       return { valid: false, error: 'This field is required' };
     }
@@ -188,10 +208,17 @@ export function validateValue(
     return { valid: true };
   }
 
+  const typeError = settingTypeError(value, settingType);
+  if (typeError) return { valid: false, error: typeError };
+
+  if (!rules) {
+    return { valid: true };
+  }
+
   // Number validation
   if (settingType === 'number' && typeof value === 'number') {
-    if (isNaN(value)) {
-      return { valid: false, error: 'Must be a valid number' };
+    if (rules.integer && !Number.isInteger(value)) {
+      return { valid: false, error: 'Must be a whole number' };
     }
     // Absolute limits take priority (immutable bounds)
     if (rules.absoluteMin !== undefined && value < rules.absoluteMin) {
@@ -497,6 +524,14 @@ export function validateVisibleSettings(
   };
 }
 
+/** A number only when the whole trimmed text is one; null for blank or partial input such as '10m'. */
+export function parseWholeNumber(value: string): number | null {
+  const trimmed = value.trim();
+  if (trimmed === '') return null;
+  const num = Number(trimmed);
+  return Number.isFinite(num) ? num : null;
+}
+
 /**
  * Parse a string value into the appropriate type for a setting
  *
@@ -513,8 +548,7 @@ export function parseSettingValue(
       return value.toLowerCase() === 'true';
 
     case 'number':
-      const num = parseFloat(value);
-      return isNaN(num) ? null : num;
+      return parseWholeNumber(value);
 
     case 'string':
       return value;
@@ -578,4 +612,64 @@ export function validateValueWithEffectiveLimits(
   };
 
   return validateValue(value, effectiveRules, definition.type);
+}
+
+/** Two stored setting values are the same; a list holding the same members in another order counts as the same. */
+export function sameSettingValue(a: unknown, b: unknown): boolean {
+  if (isDeepStrictEqual(a, b)) return true;
+  if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+  const key = (v: unknown) => JSON.stringify(v) ?? '';
+  return isDeepStrictEqual([...a].sort((x, y) => key(x).localeCompare(key(y))), [...b].sort((x, y) => key(x).localeCompare(key(y))));
+}
+
+type StoredModuleConfig = { values?: Record<string, unknown>; hardLimits?: Record<string, unknown> };
+
+/**
+ * Check a module config write (Free baseline or a paid tier's override) before it is stored: every value against its
+ * type and the caps it will meet, and every cap after the per-field merge onto the base caps (Free's, for a tier).
+ * Each error names its key. Keys the schema does not define are left alone. A value or cap that deep-equals the stored
+ * one is not checked, so an untouched stored entry (kept past a lowered cap on purpose) never blocks the rest of a save.
+ * stored may list several sets (a tier's own and Free's, whose values a new tier inherits); a match in any one counts.
+ */
+export function moduleConfigErrors(
+  schema: SettingsSchema | null,
+  values: Record<string, unknown>,
+  hardLimits: Record<string, unknown>,
+  baseHardLimits: Record<string, HardLimitOverride> = {},
+  stored: StoredModuleConfig | StoredModuleConfig[] = {}
+): string[] {
+  if (!schema) return [];
+  const storedSets = Array.isArray(stored) ? stored : [stored];
+  const matchesStored = (field: 'values' | 'hardLimits', key: string, value: unknown) => storedSets.some(set => {
+    const entries = set[field];
+    return entries !== undefined && Object.prototype.hasOwnProperty.call(entries, key) && sameSettingValue(entries[key], value);
+  });
+  const errors: string[] = [];
+  const merged: Record<string, HardLimitOverride> = {};
+  for (const [key, limit] of Object.entries(hardLimits)) {
+    const definition = schema.settings[key];
+    if (!definition) continue;
+    if (!limit || typeof limit !== 'object' || Array.isArray(limit)) {
+      errors.push(`${key}: limits must be an object`);
+      continue;
+    }
+    const unchanged = matchesStored('hardLimits', key, limit);
+    const bad = Object.entries(limit).find(([, v]) => v !== undefined && (typeof v !== 'number' || !Number.isFinite(v)));
+    if (bad) {
+      if (!unchanged) errors.push(`${key}: limit ${bad[0]} must be a number`);
+      continue;
+    }
+    merged[key] = { ...(baseHardLimits[key] || {}), ...(limit as HardLimitOverride) };
+    if (unchanged) continue;
+    const limitError = validateHardLimits(merged[key], definition.validation, definition.type);
+    if (limitError) errors.push(`${key}: ${limitError}`);
+  }
+  for (const [key, value] of Object.entries(values)) {
+    const definition = schema.settings[key];
+    if (!definition || value === null) continue;
+    if (matchesStored('values', key, value)) continue;
+    const result = validateValueWithEffectiveLimits(value as SettingValue, definition, merged[key] ?? baseHardLimits[key]);
+    if (!result.valid) errors.push(`${key}: ${result.error ?? 'invalid value'}`);
+  }
+  return errors;
 }

@@ -39,7 +39,7 @@ import {
   loadGlobalModuleConfig,
 } from './settingsStorage';
 import { getPremiumManager } from '../premiumManager';
-import { parseSettingValue, validateSettingValue, validateValueWithEffectiveLimits, validateHardLimits, getEffectiveLimits } from './settingsValidation';
+import { parseSettingValue, parseWholeNumber, validateSettingValue, validateValueWithEffectiveLimits, validateHardLimits, getEffectiveLimits } from './settingsValidation';
 
 // Types duplicated here to avoid circular dependency with settingsPanelFactory
 export interface SettingsPanelState {
@@ -47,6 +47,23 @@ export interface SettingsPanelState {
   currentPage: number;
   pendingChanges: Record<string, SettingValue>;
 }
+
+const SYSTEM_CAP_FIELDS: Record<string, Array<{ id: string; key: keyof HardLimitOverride; label: string; integer: boolean }>> = {
+  number: [
+    { id: 'hard_min', key: 'min', label: 'Hard Limit Min', integer: false },
+    { id: 'hard_max', key: 'max', label: 'Hard Limit Max', integer: false },
+  ],
+  string: [
+    { id: 'hard_min_length', key: 'minLength', label: 'Hard Limit Min Length', integer: true },
+    { id: 'hard_max_length', key: 'maxLength', label: 'Hard Limit Max Length', integer: true },
+  ],
+  multiSelect: [
+    { id: 'hard_min_items', key: 'minItems', label: 'Hard Limit Min Items', integer: true },
+    { id: 'hard_max_items', key: 'maxItems', label: 'Hard Limit Max Items', integer: true },
+  ],
+};
+SYSTEM_CAP_FIELDS.multiChannel = SYSTEM_CAP_FIELDS.multiSelect;
+SYSTEM_CAP_FIELDS.multiRole = SYSTEM_CAP_FIELDS.multiSelect;
 
 export type RenderFunction = (state: SettingsPanelState) => PanelResponse;
 
@@ -157,6 +174,18 @@ export interface HandlerContext {
   getState: () => SettingsPanelState;
   setState: (state: SettingsPanelState) => void;
   render: RenderFunction;
+}
+
+function rangeText(limits: { min?: number; max?: number }): string {
+  if (limits.min !== undefined && limits.max !== undefined) return ` (allowed ${limits.min} to ${limits.max})`;
+  if (limits.min !== undefined) return ` (allowed ${limits.min} or more)`;
+  if (limits.max !== undefined) return ` (allowed up to ${limits.max})`;
+  return '';
+}
+
+function sameHardLimits(a: HardLimitOverride, b: HardLimitOverride): boolean {
+  const keys = new Set([...Object.keys(a), ...Object.keys(b)] as (keyof HardLimitOverride)[]);
+  return [...keys].every(k => a[k] === b[k]);
 }
 
 /**
@@ -336,7 +365,7 @@ export async function handleSettingsButton(
     }
 
     case 'reset':
-      return { modal: buildResetModal(panelId, moduleName, category) } as any;
+      return { modal: buildResetModal(panelId, moduleName, category, !context.guildId) } as any;
 
     case 'upload':
       return { modal: buildUploadModal(panelId, moduleName, category, schema.name) } as any;
@@ -445,11 +474,16 @@ export async function handleSettingsModal(
       // Validate against effective limits (schema + system + tier) so the cap
       // shown in the modal label is also enforced on submit.
       const mergedLimits = getMergedHardLimits(moduleName, context.guildId);
+      if (definition.type === 'number' && rawValue.trim() !== '' && parsed === null) {
+        await sendEphemeralError(context, `**${definition.label}**: "${rawValue.trim()}" is not a number${rangeText(getEffectiveLimits(definition, mergedLimits[settingKey]))}; the value was not changed.`);
+        return render(state);
+      }
       const result = validateValueWithEffectiveLimits(parsed, definition, mergedLimits[settingKey]);
 
       if (!result.valid && result.error) {
-        // Send ephemeral error message instead of storing in state
-        await sendEphemeralError(context, result.error);
+        await sendEphemeralError(context, definition.type === 'number'
+          ? `**${definition.label}**: "${rawValue.trim()}" refused: ${result.error}${rangeText(getEffectiveLimits(definition, mergedLimits[settingKey]))}; the value was not changed.`
+          : result.error);
       } else {
         state.pendingChanges[settingKey] = parsed;
       }
@@ -463,128 +497,63 @@ export async function handleSettingsModal(
       const definition = schema.settings[settingKey];
       if (!definition) return createV2Response(buildErrorPanel(`Setting "${settingKey}" not found.`));
 
+      const capFields = SYSTEM_CAP_FIELDS[definition.type];
+      if (!capFields) {
+        setState(state);
+        return render(state);
+      }
+
       const errors: string[] = [];
+      const notes: string[] = [];
 
-      // Parse based on setting type
-      if (definition.type === 'number') {
+      if (definition.type === 'number' || definition.type === 'string') {
         const rawValue = getModalFieldValue(context, 'value');
-        const rawMin = getModalFieldValue(context, 'hard_min');
-        const rawMax = getModalFieldValue(context, 'hard_max');
-
-        // Parse value
         if (rawValue.trim() !== '') {
-          const parsed = parseSettingValue(rawValue, 'number');
-          const result = validateSettingValue(parsed, definition);
-          if (!result.valid && result.error) {
-            errors.push(`Value: ${result.error}`);
+          const parsed = definition.type === 'number' ? parseWholeNumber(rawValue) : rawValue;
+          if (parsed === null) {
+            errors.push(`Value: "${rawValue.trim()}" is not a number${rangeText(getEffectiveLimits(definition, loadHardLimits(moduleName)[settingKey]))}; the value was not changed`);
           } else {
-            state.pendingChanges[settingKey] = parsed;
-          }
-        }
-
-        // Parse and validate hard limits
-        const newHardLimits: HardLimitOverride = {};
-        if (rawMin.trim() !== '') {
-          const parsedMin = parseFloat(rawMin);
-          if (isNaN(parsedMin)) {
-            errors.push('Hard Limit Min must be a valid number');
-          } else {
-            newHardLimits.min = parsedMin;
-          }
-        }
-        if (rawMax.trim() !== '') {
-          const parsedMax = parseFloat(rawMax);
-          if (isNaN(parsedMax)) {
-            errors.push('Hard Limit Max must be a valid number');
-          } else {
-            newHardLimits.max = parsedMax;
-          }
-        }
-
-        // Validate hard limits against absolute limits
-        if (Object.keys(newHardLimits).length > 0) {
-          const hardLimitError = validateHardLimits(newHardLimits, definition.validation, definition.type);
-          if (hardLimitError) {
-            errors.push(hardLimitError);
-          } else {
-            // Save hard limits
-            saveHardLimit(moduleName, settingKey, newHardLimits);
-          }
-        }
-      } else if (definition.type === 'string') {
-        const rawValue = getModalFieldValue(context, 'value');
-        const rawMinLength = getModalFieldValue(context, 'hard_min_length');
-        const rawMaxLength = getModalFieldValue(context, 'hard_max_length');
-
-        // Parse value
-        if (rawValue.trim() !== '') {
-          state.pendingChanges[settingKey] = rawValue;
-        }
-
-        // Parse and validate hard limits
-        const newHardLimits: HardLimitOverride = {};
-        if (rawMinLength.trim() !== '') {
-          const parsedMinLength = parseInt(rawMinLength, 10);
-          if (isNaN(parsedMinLength)) {
-            errors.push('Hard Limit Min Length must be a valid number');
-          } else {
-            newHardLimits.minLength = parsedMinLength;
-          }
-        }
-        if (rawMaxLength.trim() !== '') {
-          const parsedMaxLength = parseInt(rawMaxLength, 10);
-          if (isNaN(parsedMaxLength)) {
-            errors.push('Hard Limit Max Length must be a valid number');
-          } else {
-            newHardLimits.maxLength = parsedMaxLength;
-          }
-        }
-
-        // Validate hard limits against absolute limits
-        if (Object.keys(newHardLimits).length > 0) {
-          const hardLimitError = validateHardLimits(newHardLimits, definition.validation, definition.type);
-          if (hardLimitError) {
-            errors.push(hardLimitError);
-          } else {
-            saveHardLimit(moduleName, settingKey, newHardLimits);
-          }
-        }
-      } else if (['multiSelect', 'multiChannel', 'multiRole'].includes(definition.type)) {
-        const rawMinItems = getModalFieldValue(context, 'hard_min_items');
-        const rawMaxItems = getModalFieldValue(context, 'hard_max_items');
-
-        // Parse and validate hard limits
-        const newHardLimits: HardLimitOverride = {};
-        if (rawMinItems.trim() !== '') {
-          const parsedMinItems = parseInt(rawMinItems, 10);
-          if (isNaN(parsedMinItems)) {
-            errors.push('Hard Limit Min Items must be a valid number');
-          } else {
-            newHardLimits.minItems = parsedMinItems;
-          }
-        }
-        if (rawMaxItems.trim() !== '') {
-          const parsedMaxItems = parseInt(rawMaxItems, 10);
-          if (isNaN(parsedMaxItems)) {
-            errors.push('Hard Limit Max Items must be a valid number');
-          } else {
-            newHardLimits.maxItems = parsedMaxItems;
-          }
-        }
-
-        // Validate hard limits against absolute limits
-        if (Object.keys(newHardLimits).length > 0) {
-          const hardLimitError = validateHardLimits(newHardLimits, definition.validation, definition.type);
-          if (hardLimitError) {
-            errors.push(hardLimitError);
-          } else {
-            saveHardLimit(moduleName, settingKey, newHardLimits);
+            const result = validateSettingValue(parsed, definition);
+            if (!result.valid && result.error) {
+              errors.push(definition.type === 'number'
+                ? `Value: "${rawValue.trim()}" refused: ${result.error}${rangeText(getEffectiveLimits(definition, loadHardLimits(moduleName)[settingKey]))}; the value was not changed`
+                : `Value: ${result.error}; the value was not changed`);
+            } else {
+              state.pendingChanges[settingKey] = parsed;
+            }
           }
         }
       }
 
+      const newHardLimits: HardLimitOverride = {};
+      let capsParsed = true;
+      for (const field of capFields) {
+        const raw = getModalFieldValue(context, field.id).trim();
+        if (raw === '') continue;
+        const parsed = parseWholeNumber(raw);
+        const whole = field.integer || definition.validation?.integer === true;
+        if (parsed === null || (whole && !Number.isInteger(parsed))) {
+          errors.push(`${field.label}: "${raw}" is not ${whole ? 'a whole number' : 'a number'}`);
+          capsParsed = false;
+        } else {
+          newHardLimits[field.key] = parsed;
+        }
+      }
+
+      if (!capsParsed) {
+        notes.push('Hard limits were not changed.');
+      } else {
+        const hardLimitError = validateHardLimits(newHardLimits, definition.validation, definition.type);
+        if (hardLimitError) {
+          errors.push(hardLimitError);
+          notes.push('Hard limits were not changed.');
+        } else if (!sameHardLimits(newHardLimits, loadHardLimits(moduleName)[settingKey] ?? {}) && !saveHardLimit(moduleName, settingKey, newHardLimits)) {
+          errors.push('Hard limits not saved: the settings could not be written now; try again shortly.');
+        }
+      }
+
       if (errors.length > 0) {
-        await sendEphemeralError(context, errors.join('\n'));
+        await sendEphemeralError(context, [...errors, ...notes].join('\n'));
       }
 
       setState(state);
@@ -597,7 +566,10 @@ export async function handleSettingsModal(
         await sendEphemeralError(context, 'Reset cancelled. Type RESET to confirm.');
         return render(state);
       }
-      if (!resetAllModuleSettings(moduleName, context.guildId)) {
+      const reset = context.guildId
+        ? resetAllModuleSettings(moduleName, context.guildId)
+        : getPremiumManager().setGlobalModuleConfig(moduleName, { values: {} });
+      if (!reset) {
         await sendEphemeralError(context, 'Reset not applied: the settings could not be deleted now (a shard migration, data not ready, or the database unavailable); nothing was changed, try again shortly.');
         return render(state);
       }
@@ -642,14 +614,27 @@ export async function handleSettingsModal(
 
         const mergedLimits = getMergedHardLimits(moduleName, context.guildId);
         const accepted: Record<string, any> = {};
+        const notRestored: string[] = [];
         for (const [key, value] of Object.entries(parsedSettings)) {
           const definition = schema.settings[key];
           if (definition && validateValueWithEffectiveLimits(value, definition, mergedLimits[key]).valid) accepted[key] = value;
+          else notRestored.push(key);
         }
         if (Object.keys(accepted).length > 0 && !saveModuleSettings(moduleName, accepted, context.guildId)) {
           return createV2Response(buildErrorPanel('Upload failed: the settings could not be written now (a shard migration, data not ready, or the database unavailable); nothing was changed, try again shortly.'));
         }
 
+        if (Object.keys(parsedSettings).length === 0) {
+          await sendEphemeralError(context, 'Upload not applied: the file holds no settings; nothing was changed.');
+          return render(state);
+        }
+        if (Object.keys(accepted).length === 0) {
+          await sendEphemeralError(context, `Upload not applied: none of the keys could be restored (no matching setting, or the value is invalid): ${notRestored.join(', ')}; nothing was changed.`);
+          return render(state);
+        }
+        if (notRestored.length > 0) {
+          await sendEphemeralError(context, `Upload applied, but these keys were not restored (no matching setting, or the value is invalid): ${notRestored.join(', ')}`);
+        }
         state.pendingChanges = {};
         setState(state);
         return render(state);
@@ -706,7 +691,11 @@ export async function handleSettingsModal(
         finalHex = normalized;
       } else if (presetHex && presetHex !== '__custom__') {
         // Use preset if selected and not the "Custom" placeholder
-        finalHex = presetHex;
+        finalHex = parseHexColor(presetHex);
+        if (!finalHex) {
+          await sendEphemeralError(context, 'Invalid preset color; the value was not changed');
+          return render(state);
+        }
       } else {
         // "Custom" selected but no hex entered
         await sendEphemeralError(context, 'Please enter a custom hex value');

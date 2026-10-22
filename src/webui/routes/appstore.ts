@@ -21,6 +21,7 @@ import {
   type GlobalModuleConfig,
 } from '../../bot/internalSetup/utils/settings/settingsStorage';
 import { getModulesWithSettings, getSettingsSchema } from '../../bot/internalSetup/utils/settings/settingsDiscovery';
+import { moduleConfigErrors } from '../../bot/internalSetup/utils/settings/settingsValidation';
 import type { HardLimitOverride, SettingValue } from '../../bot/types/settingsTypes';
 import { getPaymentRegistry } from '../../bot/internalSetup/utils/payment/paymentRegistry';
 import type { OfferingVariant } from '../../bot/internalSetup/utils/payment/paymentTypes';
@@ -829,6 +830,30 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
         });
       }
 
+      if (overrides !== undefined && (!overrides || typeof overrides !== 'object' || Array.isArray(overrides))) {
+        return res.status(400).json({ success: false, error: 'overrides must be an object' });
+      }
+      const overrideErrors: string[] = [];
+      const storedOverrides = (getPremiumManager().getTier(id)?.overrides ?? {}) as Record<string, unknown>;
+      for (const [moduleName, moduleOverride] of Object.entries((overrides || {}) as Record<string, any>)) {
+        if (!moduleOverride || typeof moduleOverride !== 'object' || Array.isArray(moduleOverride)) {
+          overrideErrors.push(`${moduleName}: must be an object`);
+          continue;
+        }
+        const { _hardLimits, ...rest } = moduleOverride;
+        const values = Object.fromEntries(Object.entries(rest).filter(([k]) => !k.startsWith('_')));
+        const storedOverride = (storedOverrides[moduleName] ?? {}) as Record<string, any>;
+        const free = loadGlobalModuleConfig(moduleName);
+        const errors = moduleConfigErrors(getSettingsSchema(moduleName), values, _hardLimits ?? {}, free.hardLimits, [{
+          values: storedOverride,
+          hardLimits: storedOverride._hardLimits && typeof storedOverride._hardLimits === 'object' ? storedOverride._hardLimits : {},
+        }, { values: free.values, hardLimits: free.hardLimits }]);
+        overrideErrors.push(...errors.map(e => `${moduleName}.${e}`));
+      }
+      if (overrideErrors.length > 0) {
+        return res.status(400).json({ success: false, error: `Not saved: ${overrideErrors.join('; ')}` });
+      }
+
       const inputOfferings = Array.isArray(offerings) ? offerings : [];
       const refreshedOfferings: any[] = [];
       const warnings: string[] = [];
@@ -1070,6 +1095,19 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
         // The read is awaited: a demotion to co-worker may have begun meanwhile.
         if (isCoWorkerNode()) {
           coWorkerReadonlyResponse(res);
+          return;
+        }
+
+        const storedLimits = served.raw?._hardLimits && typeof served.raw._hardLimits === 'object' ? served.raw._hardLimits : {};
+        const configErrors = moduleConfigErrors(
+          getSettingsSchema(moduleName),
+          partial.values ?? {},
+          partial.hardLimits ?? {},
+          partial.hardLimits ? {} : storedLimits,
+          { values: globalModuleConfigFrom(served.raw ?? {}).values, hardLimits: storedLimits },
+        );
+        if (configErrors.length > 0) {
+          res.status(400).json({ success: false, error: `Not saved: ${configErrors.join('; ')}` });
           return;
         }
 

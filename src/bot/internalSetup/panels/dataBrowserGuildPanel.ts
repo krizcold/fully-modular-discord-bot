@@ -16,6 +16,8 @@ import {
 import { PanelOptions, PanelContext, PanelResponse } from '../../types/panelTypes';
 import { loadGuildData, saveGuildData } from '../utils/dataManager';
 import { discoverGuildDataFiles } from '../utils/configDiscovery';
+import { guildSettingsFileErrors } from '../utils/settings/settingsStorage';
+import { getSettingsSchema } from '../utils/settings/settingsDiscovery';
 import { createV2Response, V2Colors } from '../utils/panel/v2';
 import {
   isDataEmpty,
@@ -80,6 +82,10 @@ function createEditorConfig(
   if (metadata?.description) {
     infoLines.push(`**Description:** ${metadata.description}`);
   }
+  const checksSettings = parts.length === 2 && displayName === 'settings.json' && getSettingsSchema(moduleName) !== null;
+  if (!checksSettings) {
+    infoLines.push("**Note:** saved as written; this file is not checked against the module's limits.");
+  }
 
   return {
     panelId: PANEL_ID,
@@ -89,6 +95,12 @@ function createEditorConfig(
     getData: () => loadGuildData(fileKey, guildId, null),
     saveData: (data) => { saveGuildData(fileKey, guildId, data); },
     template: metadata?.template,
+    validate: checksSettings
+      ? (data) => {
+        const errors = guildSettingsFileErrors(moduleName, guildId, data, loadGuildData(fileKey, guildId, null)) ?? [];
+        return errors.length > 0 ? `Not saved, these settings are invalid or past their limits: ${errors.join('; ')}. Nothing was changed.` : null;
+      }
+      : undefined,
     reload: () => createEditorConfig(fileKey, guildId, metadata && { ...metadata, exists: loadGuildData(fileKey, guildId, null) !== null }),
     fileExists: metadata?.exists ?? (loadGuildData(fileKey, guildId, null) !== null),
     accentColor: 0x3498DB,

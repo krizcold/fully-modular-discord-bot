@@ -98,6 +98,8 @@ export interface JsonEditorConfig {
   extraButtons?: JsonEditorButton[];
   /** Whether file exists (for showing "Not created" vs "Empty") */
   fileExists?: boolean;
+  /** Refuses a parsed value before it is saved; returns the reason, or null to save */
+  validate?: (data: any) => string | null;
   /** Rebuilds the config from the stored data, used to redraw after a save */
   reload?: () => JsonEditorConfig;
 }
@@ -406,6 +408,9 @@ export async function handleJsonEditorModal(
         return showErrorAndReturnView(result.error, config, context);
       }
 
+      const refusal = config.validate?.(result.data);
+      if (refusal) return showErrorAndReturnView(refusal, config, context);
+
       try {
         await config.saveData(result.data);
       } catch (error) {
@@ -421,6 +426,9 @@ export async function handleJsonEditorModal(
       if (!uploadResult.success) {
         return showErrorAndReturnView(uploadResult.error, config, context);
       }
+
+      const uploadRefusal = config.validate?.(uploadResult.data);
+      if (uploadRefusal) return showErrorAndReturnView(uploadRefusal, config, context);
 
       try {
         await config.saveData(uploadResult.data);

@@ -5,7 +5,7 @@
 import type { SettingValue, MergedSettings, HardLimitOverride } from '@bot/types/settingsTypes';
 import { deleteDataOutcome, loadData, saveData } from '../dataManager';
 import { getSettingsSchema } from './settingsDiscovery';
-import { validateSettingValue, validateValueWithEffectiveLimits } from './settingsValidation';
+import { sameSettingValue, settingTypeError, validateSettingValue, validateValueWithEffectiveLimits } from './settingsValidation';
 
 const SETTINGS_FILENAME = 'settings.json';
 
@@ -62,15 +62,18 @@ export function loadModuleSettings(moduleName: string, guildId?: string | null):
   const sources: Record<string, 'default' | 'global' | 'tier' | 'guild'> = {};
   const clamped: Record<string, { stored: SettingValue; effective: SettingValue }> = {};
 
+  const usable = (layer: Record<string, any>, key: string, type: string) =>
+    layer.hasOwnProperty(key) && layer[key] !== null && layer[key] !== undefined && !settingTypeError(layer[key], type);
+
   for (const [key, definition] of Object.entries(schema.settings)) {
     let value: SettingValue;
-    if (guildId && guildSettings.hasOwnProperty(key)) {
+    if (guildId && usable(guildSettings, key, definition.type)) {
       value = guildSettings[key];
       sources[key] = 'guild';
-    } else if (tierOverrides.hasOwnProperty(key)) {
+    } else if (usable(tierOverrides, key, definition.type)) {
       value = tierOverrides[key];
       sources[key] = 'tier';
-    } else if (globalSettings.hasOwnProperty(key)) {
+    } else if (usable(globalSettings, key, definition.type)) {
       value = globalSettings[key];
       sources[key] = 'global';
     } else {
@@ -352,6 +355,28 @@ export interface GlobalModuleConfig {
   moduleEnabled: boolean;
   /** Command names disabled bot-wide. */
   disabledCommands: string[];
+}
+
+/**
+ * Keys of a raw guild settings.json whose values fail the type or the effective caps, each with its reason; null when
+ * the module has no schema. A key whose value deep-equals the stored file's is not checked: storage keeps a value past
+ * a lowered cap on purpose, and an edit of another key must not force it down.
+ */
+export function guildSettingsFileErrors(moduleName: string, guildId: string, data: unknown, stored?: unknown): string[] | null {
+  const schema = getSettingsSchema(moduleName);
+  if (!schema) return null;
+  if (data === null || typeof data !== 'object' || Array.isArray(data)) return ['the file must be an object of setting keys'];
+  const limits = getMergedHardLimits(moduleName, guildId);
+  const storedValues = stored && typeof stored === 'object' && !Array.isArray(stored) ? stored as Record<string, unknown> : null;
+  const errors: string[] = [];
+  for (const [key, value] of Object.entries(data as Record<string, SettingValue>)) {
+    const definition = schema.settings[key];
+    if (!definition) continue;
+    if (storedValues && Object.prototype.hasOwnProperty.call(storedValues, key) && sameSettingValue(storedValues[key], value)) continue;
+    const result = validateValueWithEffectiveLimits(value, definition, limits[key]);
+    if (!result.valid) errors.push(`${key}: ${result.error ?? 'invalid value'}`);
+  }
+  return errors;
 }
 
 /** Where a module's global settings live, as 'module/settings.json' under /data/global. */

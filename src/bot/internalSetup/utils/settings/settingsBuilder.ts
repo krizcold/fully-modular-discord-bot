@@ -270,15 +270,15 @@ export function buildEditModal(
     );
 }
 
-export function buildResetModal(panelId: string, moduleName: string, category: string): ModalBuilder {
+export function buildResetModal(panelId: string, moduleName: string, category: string, system = false): ModalBuilder {
   return new ModalBuilder()
     .setCustomId(`panel_${panelId}_modal_reset_${moduleName}_${category}`)
-    .setTitle('Confirm Reset to Defaults')
+    .setTitle(system ? 'Reset Values to Defaults' : 'Confirm Reset to Defaults')
     .addComponents(
       new ActionRowBuilder<TextInputBuilder>().addComponents(
         new TextInputBuilder()
           .setCustomId('confirm_text')
-          .setLabel('Type RESET to confirm')
+          .setLabel(system ? 'Type RESET; caps/switches/commands kept' : 'Type RESET to confirm')
           .setStyle(TextInputStyle.Short)
           .setPlaceholder('RESET')
           .setRequired(true).setMinLength(5).setMaxLength(5)

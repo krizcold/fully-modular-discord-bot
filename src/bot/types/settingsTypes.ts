@@ -162,6 +162,8 @@ export interface ValidationRules {
   min?: number;
   /** Maximum value for numbers */
   max?: number;
+  /** Numbers must be whole (counts, minutes) */
+  integer?: boolean;
   /** Minimum length for strings */
   minLength?: number;
   /** Maximum length for strings */

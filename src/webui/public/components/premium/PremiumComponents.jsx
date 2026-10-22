@@ -694,9 +694,12 @@ function TierEditorPanel({ tierId, tier, freeTier, onSave, onClose }) {
       // Also enforces `min <= max` (equal is allowed): typing min=10 when
       // max=5 already exists clamps the new min to 5; typing max=5 when
       // min=10 already exists clamps the new max to 10. The sibling cap
-      // pulls the typed value toward the valid range.
+      // pulls the typed value toward the valid range. While typing only the
+      // absolute ceiling applies (more digits only grow the number); the
+      // floor and the sibling clamp run on blur and on each step, so a
+      // keystroke on the way to 20 is not pulled up to a sibling min of 5.
       const siblingKey = siblingCapKey(capKey);
-      const siblingValue = siblingKey ? cap[siblingKey] : undefined;
+      const siblingValue = siblingKey ? effectiveCap(moduleName, key)[siblingKey] : undefined;
       const clamp = (n) => {
         if (typeof n !== 'number' || Number.isNaN(n)) return n;
         if (typeof minAttr === 'number' && n < minAttr) return minAttr;
@@ -751,7 +754,13 @@ function TierEditorPanel({ tierId, tier, freeTier, onSave, onClose }) {
               if (raw === '') { patchCap(moduleName, key, { [capKey]: undefined }); return; }
               const num = parseFloat(raw);
               if (Number.isNaN(num)) return;
-              patchCap(moduleName, key, { [capKey]: clamp(num) });
+              patchCap(moduleName, key, { [capKey]: typeof maxAttr === 'number' && num > maxAttr ? maxAttr : num });
+            }}
+            onBlur={() => {
+              const n = cap[capKey];
+              if (typeof n !== 'number' || !Number.isFinite(n)) return;
+              const clamped = clamp(n);
+              if (clamped !== n) patchCap(moduleName, key, { [capKey]: clamped });
             }} />
           <div style={{ display: 'flex', flexDirection: 'column' }}>
             <button type="button" onClick={() => stepBy(1)}
@@ -1008,6 +1017,30 @@ function TierEditorPanel({ tierId, tier, freeTier, onSave, onClose }) {
               }
             }} />
         </div>
+      );
+    } else if (type === 'multiSelect' || type === 'multiChannel' || type === 'multiRole') {
+      // Ids separated by commas or spaces, stored as a list on blur so a
+      // half-typed separator is not eaten mid-edit. A stored string (an older
+      // editor's) is shown as its text so a blur keeps its ids. A list over
+      // the cap is kept as typed: the save check refuses it, never a silent cut.
+      const listText = Array.isArray(current) ? current.join(', ') : (typeof current === 'string' ? current : '');
+      const { maxItems } = effectiveCap(moduleName, key);
+      const absMaxItems = (setting.validation || {}).absoluteMaxItems;
+      const itemCap = typeof maxItems === 'number' ? maxItems : absMaxItems;
+      input = (
+        <input type="text" key={listText} style={{ ...inputStyle, width: '100%', maxWidth: '300px' }}
+          defaultValue={listText}
+          placeholder={typeof itemCap === 'number' ? `ids, separated by commas (at most ${itemCap})` : 'ids, separated by commas'}
+          title={typeof itemCap === 'number' ? `At most ${itemCap}` : undefined}
+          onBlur={e => {
+            const ids = e.target.value.split(/[ ,]+/).filter(Boolean);
+            if (Array.isArray(current) && ids.length === current.length && ids.every((id, i) => id === current[i])) return;
+            if (ids.length === 0) {
+              if (current !== undefined && current !== null) removeSettingOverride(moduleName, key);
+              return;
+            }
+            setSettingValue(moduleName, key, ids);
+          }} />
       );
     } else {
       // Fallback for string-shaped settings (type: 'string', or anything
