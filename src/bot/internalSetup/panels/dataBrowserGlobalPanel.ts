@@ -89,6 +89,7 @@ function createEditorConfig(
     getData: () => loadGlobalData(fileKey, null),
     saveData: (data) => { saveGlobalData(fileKey, data); },
     template: metadata?.template,
+    reload: () => createEditorConfig(fileKey, metadata && { ...metadata, exists: loadGlobalData(fileKey, null) !== null }),
     fileExists: metadata?.exists ?? (loadGlobalData(fileKey, null) !== null),
     accentColor: 0xE74C3C,
     emptyAccentColor: 0x95A5A6,

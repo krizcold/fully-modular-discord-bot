@@ -98,6 +98,8 @@ export interface JsonEditorConfig {
   extraButtons?: JsonEditorButton[];
   /** Whether file exists (for showing "Not created" vs "Empty") */
   fileExists?: boolean;
+  /** Rebuilds the config from the stored data, used to redraw after a save */
+  reload?: () => JsonEditorConfig;
 }
 
 /**
@@ -410,7 +412,7 @@ export async function handleJsonEditorModal(
         return showErrorAndReturnView(`Save failed: ${error instanceof Error ? error.message : 'Unknown error'}`, config, context);
       }
 
-      return createV2Response([buildJsonEditorView(config, context)]);
+      return createV2Response([buildJsonEditorView(savedConfig(config), context)]);
     }
 
     case ACTIONS.UPLOAD: {
@@ -426,12 +428,16 @@ export async function handleJsonEditorModal(
         return showErrorAndReturnView(`Save failed: ${error instanceof Error ? error.message : 'Unknown error'}`, config, context);
       }
 
-      return createV2Response([buildJsonEditorView(config, context)]);
+      return createV2Response([buildJsonEditorView(savedConfig(config), context)]);
     }
 
     default:
       return null;
   }
+}
+
+function savedConfig(config: JsonEditorConfig): JsonEditorConfig {
+  return config.reload?.() ?? { ...config, fileExists: undefined };
 }
 
 /**
