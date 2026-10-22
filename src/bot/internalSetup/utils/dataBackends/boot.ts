@@ -5,7 +5,7 @@
 
 import { Guild, MessageFlags } from 'discord.js';
 import { connect } from 'net';
-import { DataBackendKind, loadCredentials, setFleetDataBackend, upsertCredentials } from '../../../../utils/envLoader';
+import { credentialsReadError, DataBackendKind, loadCredentials, setFleetDataBackend, upsertCredentials } from '../../../../utils/envLoader';
 import { PostgresBackend, readControlTerm, releaseControlTerm, requireControlTerm } from './postgresBackend';
 import { initWorkingSet, getWorkingSet } from './workingSet';
 import type { DirtyCarry, DataUnavailableCause } from './workingSet';
@@ -161,6 +161,15 @@ export function setRuntimeRecycledHandler(cb: (outcome: RecycleNotice) => void):
 // How the last delivery asked to be applied, for a move the data layer makes on its own.
 let deliveryPersists = true;
 let deliveryKeepsPrevious = false;
+
+/**
+ * Whether a delivery writes /data/.env: never while the last read of it failed,
+ * so no write of this delivery (its own, or a recycle's re-picked form) can
+ * land beside keys it never saw.
+ */
+export function deliveryPersistsFor(persist: boolean | undefined): boolean {
+  return persist !== false && credentialsReadError() === null;
+}
 // The backends a proof loop runs for: one loop each, however many deliveries find one unproven.
 const proving = new WeakSet<PostgresBackend>();
 
@@ -396,7 +405,7 @@ export async function applyDeliveredBackend(
     requiredFloor = delivered;
     requireControlTerm(delivered);
   }
-  deliveryPersists = opts?.persist !== false;
+  deliveryPersists = deliveryPersistsFor(opts?.persist);
   deliveryKeepsPrevious = opts?.keepPrevious === true;
   // A runtime that opened its gates before any master was heard (the boot's,
   // on the url /data/.env names) and serves no lease yet goes back behind them
@@ -463,7 +472,12 @@ export async function applyDeliveredBackend(
 
   setFleetDataBackend(backend === 'postgres' ? { backend, url } : { backend });
 
-  if (changed && opts?.persist !== false) {
+  const persists = deliveryPersistsFor(opts?.persist);
+  deliveryPersists = persists;
+  const readError = credentialsReadError();
+  if (readError && opts?.persist !== false) {
+    console.warn('[Data] Could not read /data/.env, so the delivered backend is applied in-memory only and nothing is written there:', readError);
+  } else if (changed && persists) {
     const patch: Record<string, string> = { DATA_BACKEND: backend };
     if (backend === 'postgres') {
       patch.DATA_BACKEND_URL = url;
@@ -511,7 +525,7 @@ export async function applyDeliveredBackend(
       // carried; with none, nothing is left this node may serve from.
       const other = named.find(u => u !== url);
       if (other) {
-        const outcome = await recyclePostgresRuntime(other, opts?.keepPrevious === true, { forms: named, persist: opts?.persist !== false });
+        const outcome = await recyclePostgresRuntime(other, opts?.keepPrevious === true, { forms: named, persist: persists });
         return { changed, recycled: outcome.recycled, unreachable: outcome.unreachable, reason: outcome.reason };
       }
       const outcome = giveUpDelivery(getDataReadiness(), getWorkingSet(), opts?.keepPrevious !== true, `the database this node serves from holds term ${staleServing}, below term ${requiredFloor} its master holds, and no other form of the delivered one is named`);
@@ -520,7 +534,7 @@ export async function applyDeliveredBackend(
     if (activeUrl === url) return { changed, recycled: false };
     if (activeUrl !== null) {
       console.warn('[Data] Delivered backend URL changed; recycling the postgres runtime and carrying unflushed writes to the new database');
-      const outcome = await recyclePostgresRuntime(url, opts?.keepPrevious === true, { forms: named, persist: opts?.persist !== false });
+      const outcome = await recyclePostgresRuntime(url, opts?.keepPrevious === true, { forms: named, persist: persists });
       return { changed, recycled: outcome.recycled, unreachable: outcome.unreachable, reason: outcome.reason };
     }
     startPostgresRuntime(url);

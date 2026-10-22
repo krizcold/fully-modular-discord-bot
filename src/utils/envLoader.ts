@@ -72,6 +72,27 @@ export interface CredentialValidation {
 // compose env is never in this set and keeps its precedence.
 const fileSeededEnvKeys = new Set<string>();
 
+// Why the last loadCredentials could not read /data/.env (null: read, or no file).
+let envReadError: string | null = null;
+
+/**
+ * Non-null when the last loadCredentials found /data/.env in place but could
+ * not read it, so its answer is the container env alone: a caller must not
+ * decide or write anything from that view.
+ */
+export function credentialsReadError(): string | null {
+  return envReadError;
+}
+
+function readEnvLines(dataEnvPath: string): string[] | null {
+  try {
+    return fs.readFileSync(dataEnvPath, 'utf-8').split(/\r?\n/);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
 function isPlaceholderValue(value?: string): boolean {
   if (!value) return true;
   const v = value.trim().toUpperCase();
@@ -154,9 +175,19 @@ export function loadCredentials(): BotCredentials {
 
   // Override with /data/.env if it exists (Web-UI managed)
   const dataEnvPath = dataPath('.env');
-  if (fs.existsSync(dataEnvPath)) {
+  envReadError = null;
+  let raw: Buffer | null = null;
+  try {
+    raw = fs.readFileSync(dataEnvPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') {
+      envReadError = error instanceof Error ? error.message : String(error);
+      console.error('[EnvLoader] Error loading /data/.env:', error);
+    }
+  }
+  if (raw !== null) {
     try {
-      const dataEnv = dotenv.parse(fs.readFileSync(dataEnvPath));
+      const dataEnv = dotenv.parse(raw);
       // Only override if docker-compose value is a placeholder
       for (const [key, value] of Object.entries(dataEnv)) {
         // Compose defaults like ${VAR:-} leave the var set to an empty string,
@@ -185,6 +216,7 @@ export function loadCredentials(): BotCredentials {
       }
       console.log('[EnvLoader] Loaded credentials from /data/.env');
     } catch (error) {
+      envReadError = error instanceof Error ? error.message : String(error);
       console.error('[EnvLoader] Error loading /data/.env:', error);
     }
   }
@@ -329,10 +361,7 @@ export function upsertCredentials(patch: Record<string, string>): { success: boo
   const dataEnvPath = dataPath('.env');
   try {
     fs.mkdirSync(path.dirname(dataEnvPath), { recursive: true });
-    let lines: string[] = [];
-    try {
-      lines = fs.readFileSync(dataEnvPath, 'utf-8').split(/\r?\n/);
-    } catch { /* no file yet */ }
+    const lines = readEnvLines(dataEnvPath) ?? [];
     const remaining = new Set(Object.keys(patch));
     const updated = lines.map(line => {
       const match = line.match(/^([A-Za-z_][A-Za-z0-9_]*)=/);
@@ -359,10 +388,8 @@ export function upsertCredentials(patch: Record<string, string>): { success: boo
 export function removeCredentials(keys: string[]): { success: boolean; error?: string } {
   const dataEnvPath = dataPath('.env');
   try {
-    let lines: string[] = [];
-    try {
-      lines = fs.readFileSync(dataEnvPath, 'utf-8').split(/\r?\n/);
-    } catch { return { success: true }; }
+    const lines = readEnvLines(dataEnvPath);
+    if (lines === null) return { success: true };
     const drop = new Set(keys);
     const kept = lines.filter(line => {
       const match = line.match(/^([A-Za-z_][A-Za-z0-9_]*)=/);

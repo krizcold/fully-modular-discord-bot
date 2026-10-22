@@ -10,7 +10,7 @@
 
 import { Client } from 'pg';
 import { shortLivedClient } from '../utils/pgClient';
-import { loadCredentials, upsertCredentials } from '../../../utils/envLoader';
+import { credentialsReadError, loadCredentials, upsertCredentials } from '../../../utils/envLoader';
 import { REPLICA_CATCHUP_POLL_MS, REPLICA_CATCHUP_WAIT_MS } from './constants';
 
 export interface ReplicaEndpoints {
@@ -311,6 +311,8 @@ export async function promoteReplica(splicedLocalUrl: string): Promise<{ success
  */
 export function persistPromotedUrls(splicedLocalUrl: string, splicedPublicUrl: string): { success: boolean; error?: string } {
   const hadControlUrl = (loadCredentials().CONTROL_STORE_URL || '').trim() !== '';
+  const readError = credentialsReadError();
+  if (readError) return { success: false, error: `could not read /data/.env, so the promoted database URL is not persisted: ${readError}` };
   // This node dials its own database by the LOCAL form (F1: the public form
   // cannot hairpin from beside the sidecar); the public form is recorded for
   // delivery to remote workers on their next register.
@@ -326,6 +328,8 @@ export function persistPromotedUrls(splicedLocalUrl: string, splicedPublicUrl: s
   const result = upsertCredentials(patch);
   if (!result.success) return { success: false, error: `could not persist the promoted database URL: ${result.error}` };
   const creds = loadCredentials();
+  const readBack = credentialsReadError();
+  if (readBack) return { success: false, error: `the promoted database URL was written but /data/.env could not be read back to confirm it takes effect: ${readBack}` };
   const effective = (creds.DATA_BACKEND_URL || '').trim();
   const controlEffective = (creds.CONTROL_STORE_URL || '').trim();
   if (effective !== splicedLocalUrl || (hadControlUrl && controlEffective !== splicedLocalUrl)) {

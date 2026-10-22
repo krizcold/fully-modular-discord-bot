@@ -22,7 +22,7 @@ import { getSettingsSchema } from '../../bot/internalSetup/utils/settings/settin
 import type { HardLimitOverride, SettingValue } from '../../bot/types/settingsTypes';
 import { getPaymentRegistry } from '../../bot/internalSetup/utils/payment/paymentRegistry';
 import type { OfferingVariant } from '../../bot/internalSetup/utils/payment/paymentTypes';
-import { loadCredentials, saveCredentials, BotCredentials } from '../../utils/envLoader';
+import { credentialsReadError, loadCredentials, saveCredentials, BotCredentials } from '../../utils/envLoader';
 import { dataPath } from '../../utils/dataRoot';
 import { getModulesDir, getModulesDevDir } from '../../bot/internalSetup/utils/pathHelpers';
 import { BotManager } from '../botManager';
@@ -1757,6 +1757,10 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
       const RESERVED = new Set(['DISCORD_TOKEN', 'CLIENT_ID', 'GUILD_ID']);
       const allowed = new Set(fields.map(f => f.key));
       const existing = loadCredentials();
+      const readError = credentialsReadError();
+      if (readError) {
+        return res.status(500).json({ success: false, error: `Could not read /data/.env, so nothing was saved: ${readError}` });
+      }
       const next: BotCredentials = { ...existing };
 
       for (const f of fields) {
