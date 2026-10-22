@@ -92,6 +92,8 @@ class Ring {
   }
 }
 
+export type DiskScope = 'local' | 'localOnly';
+
 export class MetricsCollector {
   private enabled: boolean;
   private seeded = false;
@@ -99,6 +101,10 @@ export class MetricsCollector {
   private readonly activeSinceFlush = new Set<string>();
   private readonly guildDisk = new Map<string, GuildDisk>();
   private globalDataBytes = 0;
+  // What the disk walk measures: 'local' is all of the bot's data (file mode);
+  // 'localOnly' is this server's disk while the data lives in postgres; null
+  // until the samplers set it.
+  private diskScope: DiskScope | null = null;
   private readonly ramEstimates = new Map<string, number>();
   private readonly rings = {
     cpu: new Ring(),
@@ -248,6 +254,10 @@ export class MetricsCollector {
     this.ramEstimates.set(guildId, bytes);
   }
 
+  setDiskScope(scope: DiskScope): void {
+    this.diskScope = scope;
+  }
+
   getDiskTotalBytes(): number {
     let total = this.globalDataBytes;
     for (const d of this.guildDisk.values()) total += d.totalBytes;
@@ -284,6 +294,7 @@ export class MetricsCollector {
         uptimeSec: Math.floor(process.uptime()),
         diskTotalBytes: this.getDiskTotalBytes(),
         diskGlobalBytes: this.globalDataBytes,
+        diskScope: this.diskScope,
       },
       series: {
         cpu: this.rings.cpu.toArray(),
@@ -304,6 +315,7 @@ export class MetricsCollector {
       system: {
         cpuPct: 0, rssBytes: 0, heapBytes: 0, loopP50Ms: 0, loopP95Ms: 0, loopMaxMs: 0,
         uptimeSec: Math.floor(process.uptime()), diskTotalBytes: 0, diskGlobalBytes: 0,
+        diskScope: this.diskScope,
       },
       series: { cpu: [], memRss: [], heap: [], loop: [] },
       leaderboard: { modules: [], commands: [], guilds: [] },
@@ -313,7 +325,7 @@ export class MetricsCollector {
 
   getGuildSnapshot(guildId: string): any {
     if (!this.enabled) {
-      return { enabled: false, guildId, modules: [], disk: { totalBytes: 0, byModule: [] }, ramEstimateBytes: 0, totals: newStat() };
+      return { enabled: false, guildId, modules: [], disk: { totalBytes: 0, byModule: [], scope: this.diskScope }, ramEstimateBytes: 0, totals: newStat() };
     }
     const guild = this.acc.get(guildId);
     const modules: any[] = [];
@@ -348,6 +360,7 @@ export class MetricsCollector {
       modules,
       disk: {
         totalBytes: disk ? disk.totalBytes : 0,
+        scope: this.diskScope,
         byModule: disk
           ? Object.entries(disk.byModule)
               .map(([module, bytes]) => ({ module, bytes }))
@@ -360,7 +373,7 @@ export class MetricsCollector {
   }
 
   getLeaderboard(): any {
-    if (!this.enabled) return { modules: [], commands: [], guilds: [] };
+    if (!this.enabled) return { modules: [], commands: [], guilds: [], diskScope: this.diskScope };
     const byModule = new Map<string, { calls: number; errors: number; cpuMicros: number; wallMicros: number; ioReads: number; ioWrites: number }>();
     const byCommand = new Map<string, { module: string; calls: number; errors: number; cpuMicros: number; wallMicros: number }>();
     const guilds: any[] = [];
@@ -434,6 +447,7 @@ export class MetricsCollector {
       modules: Array.from(byModule, ([module, m]) => ({ module, ...m })).sort((a, b) => b.calls - a.calls),
       commands: Array.from(byCommand, ([command, c]) => ({ command, ...c })).sort((a, b) => b.calls - a.calls),
       guilds,
+      diskScope: this.diskScope,
     };
   }
 

@@ -76,6 +76,13 @@ function qs(pairs: Record<string, string | undefined>): string {
   return parts.length ? '?' + parts.join('&') : '';
 }
 
+/** A fleet state the child could not answer is a failure, never a 'null' transformation. */
+export function asFleetStateFailure(res: CliResponse): CliResponse {
+  const b = res.body as { reachable?: unknown } | null;
+  if (b && typeof b === 'object' && b.reachable === false) return { ...res, body: { ...b, success: false } };
+  return res;
+}
+
 type Handler = (ctx: Ctx) => Promise<void>;
 
 const HANDLERS: Record<string, Handler> = {
@@ -174,7 +181,10 @@ const HANDLERS: Record<string, Handler> = {
   'usage guild': (c) => simple(c, 'GET', `/api/usage/guild/${encodeURIComponent(need(c, 0, 'guildId'))}`),
 
   // --- fleet control plane ---
-  'fleet state': (c) => simple(c, 'GET', '/api/fleet/state'),
+  'fleet state': async (c) => {
+    const res = await c.client.request('GET', '/api/fleet/state', {});
+    emit(asFleetStateFailure(res), c.flags);
+  },
   'fleet assign': (c) => simple(c, 'POST', '/api/fleet/assign', { shardId: flagInt(c.flags, 'shard', -1), nodeId: flagStr(c.flags, 'node') || '' }),
   'fleet resume-assignments': (c) => simple(c, 'POST', '/api/fleet/resume-assignments'),
   'fleet declare-lost': (c) => simple(c, 'POST', '/api/fleet/declare-lost', { nodeId: flagStr(c.flags, 'node') || '' }),
@@ -196,11 +206,14 @@ const HANDLERS: Record<string, Handler> = {
   'transform pause': (c) => simple(c, 'POST', '/api/fleet/transform/pause'),
   'transform resume': (c) => simple(c, 'POST', '/api/fleet/transform/resume'),
   'transform abort': (c) => simple(c, 'POST', '/api/fleet/transform/abort'),
-  'transform status': (c) =>
-    simple(c, 'GET', '/api/fleet/state', undefined, (b) => {
+  'transform status': async (c) => {
+    const res = await c.client.request('GET', '/api/fleet/state', {});
+    emit(asFleetStateFailure(res), c.flags, (b) => {
+      if ((b as { reachable?: unknown }).reachable === false) return;
       const t = (b as { transformation?: unknown }).transformation;
       console.log(JSON.stringify(t ?? null, null, 2));
-    }),
+    });
+  },
 
   // --- data bundle round-trip (local disk, same primitives as tools/dataBundle) ---
   'bundle export': (c) => bundleExport(c),

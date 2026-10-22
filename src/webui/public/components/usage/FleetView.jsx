@@ -2120,7 +2120,17 @@ function FleetView({ api, wsClient, guildNames }) {
     return (
       <div className="usage-board">
         <h3>Fleet</h3>
-        {fleet.takeoverHold && (
+        {fleet.takeoverGuardUnreadableSince != null && (
+          <div className="usage-notice" style={{ borderColor: '#e0a030', color: '#e0a030' }}>
+            {`TAKEOVER GUARD: the control store has not answered for ${Math.round((Date.now() - fleet.takeoverGuardUnreadableSince) / 1000)}s, so whether another master holds the fleet cannot be read. This master boot holds until the store answers.`}
+          </div>
+        )}
+        {fleet.takeoverHold && fleet.takeoverHold.storeUnreachableSince != null && (
+          <div className="usage-notice" style={{ borderColor: '#e0a030', color: '#e0a030' }}>
+            {`TAKEOVER GUARD: the control store has not answered for ${Math.round((Date.now() - fleet.takeoverHold.storeUnreachableSince) / 1000)}s, so whether the master at term ${fleet.takeoverHold.observedTerm} is still alive cannot be read. This master boot holds, and its observation window restarts once the store answers.`}
+          </div>
+        )}
+        {fleet.takeoverHold && fleet.takeoverHold.storeUnreachableSince == null && (
           <div className="usage-notice" style={{ borderColor: '#e0a030', color: '#e0a030' }}>
             {`TAKEOVER GUARD: another master (term ${fleet.takeoverHold.observedTerm}) still looks alive, so this master boot is holding: ${Math.round((fleet.takeoverHold.observingForMs || 0) / 1000)}s of ${Math.round((fleet.takeoverHold.requiredMs || 0) / 1000)}s without its stamp advancing. It proceeds automatically once the incumbent goes silent; a deliberate takeover is started from the backup's Promote button instead. If this node is a returned OLD master, demote it here to rejoin the fleet as a co-worker.`}
             <div><FleetDemoteButton api={api} /></div>
@@ -2154,6 +2164,10 @@ function FleetView({ api, wsClient, guildNames }) {
         <div className="usage-empty">
           {!fleet.running
             ? 'Fleet state becomes available once the bot process is running.'
+            : fleet.reachable === false ? (fleet.error || 'Fleet state unavailable: no reason given')
+            : fleet.staleMasterPark || fleet.readOnlyStorePark ? 'The boot is parked and does not continue on its own: the notice above names the way out.'
+            : fleet.emptyStoreHold || fleet.seedHold ? 'Waiting for the confirm above.'
+            : fleet.takeoverHold || fleet.takeoverGuardUnreadableSince != null || fleet.followerHold ? 'The boot is holding: the notice above says on what.'
             : 'Fleet layer is initializing...'}
         </div>
       </div>

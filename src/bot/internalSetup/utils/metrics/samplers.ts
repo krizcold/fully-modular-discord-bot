@@ -7,8 +7,9 @@ import { monitorEventLoopDelay, IntervalHistogram } from 'perf_hooks';
 import type { Client } from 'discord.js';
 import { getMetricsCollector, MetricsSample } from './metricsCollector';
 import { pushFleetStatus } from '../ipcFleetHandler';
-import { listGuilds, sizeOfGlobalData } from '../dataManager';
+import { getGuildDataBackend, listGuilds, sizeOfGlobalData } from '../dataManager';
 import { SAMPLE_MS, DISK_WALK_MS, FLUSH_MS, BYTES_PER_CACHE_OBJECT } from './constants';
+import { getDataBootStatus } from '../dataBackends/boot';
 import { DATA_ROOT } from '../../../../utils/dataRoot';
 
 const BASE_DATA_DIR = DATA_ROOT;
@@ -24,9 +25,15 @@ let walking = false;
 let lastEnabled: boolean | null = null;
 const tickErrorsLogged = new Set<string>();
 
+/** 'local' only on a file-mode node with no live guild backend: a held, refused or undelivered postgres node is never exact. */
+export function diskScopeFor(mode: string, liveBackend: boolean): 'local' | 'localOnly' {
+  return mode !== 'file' || liveBackend ? 'localOnly' : 'local';
+}
+
 export function startSamplers(client: Client): void {
   const collector = getMetricsCollector();
   clientRef = client;
+  collector.setDiskScope(diskScopeFor(getDataBootStatus().mode, getGuildDataBackend() != null));
 
   loopHistogram = monitorEventLoopDelay({ resolution: 20 });
   loopHistogram.enable();
@@ -134,6 +141,7 @@ async function runDiskWalk(): Promise<void> {
   walking = true;
   try {
     const collector = getMetricsCollector();
+    collector.setDiskScope(diskScopeFor(getDataBootStatus().mode, getGuildDataBackend() != null));
     // listGuilds() is numeric-only, so _graveyard, _incoming, global and dist
     // are never walked here; sizeOfGlobalData() excludes the fleet subdir.
     for (const guildId of listGuilds()) {

@@ -147,6 +147,8 @@ export interface FleetState {
   controlStoreFenced: { observedTerm: number; at: number } | null;
   /** Boot takeover guard: holding on a foreign term row that still advances (PLAN_STANDBY 3.2). */
   takeoverHold: TakeoverHoldView | null;
+  /** Boot takeover guard, before its first read: epoch ms since the control store has not answered; null once it answers. */
+  takeoverGuardUnreadableSince: number | null;
   /** Stale-master boot fence: parked because a live peer holds a term this node's own store cannot beat (PLAN_REPLICATION Stage 4). */
   staleMasterPark: StaleMasterParkView | null;
   /** Read-only control store (B7-F6): parked because no term can be minted on a fenced or in-recovery store; Demote is the exit. */
@@ -337,12 +339,23 @@ export interface TakeoverHoldView {
   observedNodeId: string;
   observingForMs: number;
   requiredMs: number;
+  /** Epoch ms since the control store stopped answering the guard's polls; null while it answers. */
+  storeUnreachableSince: number | null;
 }
 
 let takeoverHold: TakeoverHoldView | null = null;
+let takeoverGuardUnreadableSince: number | null = null;
 
 export function _setTakeoverHold(hold: TakeoverHoldView | null): void {
   takeoverHold = hold;
+}
+
+export function _setTakeoverGuardUnreadable(since: number | null): void {
+  takeoverGuardUnreadableSince = since;
+}
+
+export function _getTakeoverGuardView(): { takeoverHold: TakeoverHoldView | null; takeoverGuardUnreadableSince: number | null } {
+  return { takeoverHold, takeoverGuardUnreadableSince };
 }
 
 /**
@@ -728,6 +741,7 @@ export function getFleetState(): FleetState {
       // fence both hold BEFORE the state sources exist, and this pre-init
       // branch is what the UI polls then.
       takeoverHold,
+      takeoverGuardUnreadableSince,
       staleMasterPark,
       readOnlyStorePark,
       followerHold: buildFollowerHoldView(),
@@ -862,6 +876,7 @@ export function getFleetState(): FleetState {
       appVersion,
       controlStoreFenced,
       takeoverHold,
+      takeoverGuardUnreadableSince,
       staleMasterPark,
       readOnlyStorePark,
       followerHold: buildFollowerHoldView(),
@@ -990,6 +1005,7 @@ export function getFleetState(): FleetState {
     appVersion,
     controlStoreFenced: null,
     takeoverHold,
+    takeoverGuardUnreadableSince,
     staleMasterPark,
     readOnlyStorePark,
     followerHold: buildFollowerHoldView(),

@@ -38,13 +38,13 @@ export function createFleetRoutes(botManager: BotManager): Router {
       }
       const result = await botManager.getFleetState();
       if (!result?.success || !result.state) {
-        res.json({ success: true, running: true, initialized: false, ...lever, promote, promoteHeldBy, promoteRunning });
+        res.json({ success: true, running: true, initialized: false, reachable: false, error: `Fleet state unavailable: ${result?.error || 'the bot sent no fleet state'}`, ...lever, promote, promoteHeldBy, promoteRunning });
         return;
       }
       res.json({ success: true, running: true, ...result.state, promote, promoteHeldBy, promoteRunning });
     } catch (error) {
       console.error('[Fleet] Failed to get fleet state:', error instanceof Error ? error.message : error);
-      res.json({ success: true, running: botManager.isRunning(), initialized: false, ...lever, promote, promoteHeldBy, promoteRunning });
+      res.json({ success: true, running: botManager.isRunning(), initialized: false, reachable: false, error: `Fleet state unavailable: ${error instanceof Error ? error.message : 'Unknown error'}`, ...lever, promote, promoteHeldBy, promoteRunning });
     }
   });
 
@@ -264,10 +264,14 @@ export function createFleetRoutes(botManager: BotManager): Router {
         return;
       }
       const result = await botManager.listFleetMigrations();
-      res.json({ success: true, running: true, migrations: result?.migrations ?? { active: null, history: [] } });
+      if (!result?.migrations) {
+        res.json({ success: false, running: true, error: `Fleet state unavailable: ${result?.error || 'the bot sent no migration list'}` });
+        return;
+      }
+      res.json({ success: true, running: true, migrations: result.migrations });
     } catch (error) {
       console.error('[Fleet] Failed to list migrations:', error instanceof Error ? error.message : error);
-      res.json({ success: true, running: botManager.isRunning(), migrations: { active: null, history: [] } });
+      res.json({ success: false, running: botManager.isRunning(), error: `Fleet state unavailable: ${error instanceof Error ? error.message : 'Unknown error'}` });
     }
   });
 

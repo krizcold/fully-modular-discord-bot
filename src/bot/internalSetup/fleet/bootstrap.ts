@@ -76,7 +76,7 @@ import {
   resolveShardCount,
 } from './placement';
 import { evaluateRecovery, proposalShards } from './recovery';
-import { _setControlStoreFenced, _setEmptyStoreHold, _setFleetStateSources, _setFollowerFollowingSupplier, _setFollowerHold, _setFollowerLineage, _setOwnCopyLineage, _setReadOnlyStorePark, _setSlotStatus, _setStaleMasterPark, _setSuperseded, _setTakeoverHold, FleetRecoverySource, FleetRefusedRegistration, FollowerHoldBase, getFleetState } from './state';
+import { _setControlStoreFenced, _setEmptyStoreHold, _setFleetStateSources, _setFollowerFollowingSupplier, _setFollowerHold, _setFollowerLineage, _setOwnCopyLineage, _setReadOnlyStorePark, _setSlotStatus, _setStaleMasterPark, _setSuperseded, _setTakeoverGuardUnreadable, _setTakeoverHold, FleetRecoverySource, FleetRefusedRegistration, FollowerHoldBase, getFleetState } from './state';
 import type { BackupDesignationRefusedView, MigrationView, PinViolationView, StandInVerdictView, UnassignedView } from './state';
 import { serveSyncRequest, SyncAuthority } from './syncAuthority';
 import { SyncEngine } from './syncEngine';
@@ -551,7 +551,7 @@ function isValidHeldLeases(held: NonNullable<RegisterPayload['heldLeases']>): bo
 // window of local time before an unconfirmed boot may take over; no
 // cross-machine clock comparison ever happens. An unreachable store yields no
 // evidence either way, so it resets the observation window (fail safe).
-async function runTakeoverGuard(
+export async function _runTakeoverGuard(
   store: PostgresControlStore,
   selfNodeId: string,
   takeoverConfirmed: boolean,
@@ -564,12 +564,18 @@ async function runTakeoverGuard(
     }
   };
   let row = await read();
+  if (row === 'unreachable') {
+    const since = Date.now();
+    _setTakeoverGuardUnreadable(since);
+    console.warn('[Fleet] TAKEOVER GUARD: the control store did not answer, so whether another master holds the fleet cannot be read; holding until it answers');
+  }
   while (row === 'unreachable') {
     // Cannot observe, cannot CAS either; hold here rather than inside
     // acquireTerm so the guard is never skipped by a store blip.
     await guardSleep(TERM_GUARD_POLL_MS);
     row = await read();
   }
+  _setTakeoverGuardUnreadable(null);
   if (!row || row.nodeId === selfNodeId) return null;
   if (takeoverConfirmed) {
     console.warn(`[Fleet] Takeover CONFIRMED over term ${row.term} (node ${row.nodeId.slice(0, 8)}); skipping the guard`);
@@ -578,6 +584,7 @@ async function runTakeoverGuard(
   console.warn(`[Fleet] TAKEOVER GUARD: term ${row.term} is held by another node (${row.nodeId.slice(0, 8)}); holding until its stamp stops advancing for ${Math.round(TERM_TAKEOVER_STALE_MS / 1000)}s (Promote sets takeover; FLEET_CONFIRM_TAKEOVER=1 is the env override)`);
   let baseline = row;
   let lastAdvanceAt = Date.now();
+  let unreachableSince: number | null = null;
   for (;;) {
     const observingForMs = Date.now() - lastAdvanceAt;
     if (observingForMs >= TERM_TAKEOVER_STALE_MS) break;
@@ -586,13 +593,19 @@ async function runTakeoverGuard(
       observedNodeId: baseline.nodeId,
       observingForMs,
       requiredMs: TERM_TAKEOVER_STALE_MS,
+      storeUnreachableSince: unreachableSince,
     });
     await guardSleep(TERM_GUARD_POLL_MS);
     const next = await read();
     if (next === 'unreachable') {
+      if (unreachableSince === null) {
+        unreachableSince = Date.now();
+        console.warn(`[Fleet] TAKEOVER GUARD: the control store did not answer, so whether term ${baseline.term} still advances cannot be read; the observation window restarts once it answers`);
+      }
       lastAdvanceAt = Date.now();
       continue;
     }
+    unreachableSince = null;
     if (!next) {
       _setTakeoverHold(null);
       return null;
@@ -1460,7 +1473,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   // would have supplied was gathered by the arm conjunction and re-proved by
   // the write step before either override was written.
   if (store instanceof PostgresControlStore && !standalone && !standIn) {
-    previousHolder = await runTakeoverGuard(store, nodeId, takeoverConfirmed);
+    previousHolder = await _runTakeoverGuard(store, nodeId, takeoverConfirmed);
   }
   // A cluster another master armed is relaxed only once the guard has let
   // this boot past that master (its row stopped advancing, or the takeover

@@ -9,7 +9,7 @@ import { setupPanelIPCHandlers } from './utils/ipcPanelHandler';
 import { setupCommandIPCHandlers } from './utils/ipcCommandHandler';
 import { setupDataIPCHandlers } from './utils/ipcDataHandler';
 import { setupAccessLogChannel } from './utils/accessLogChannel';
-import { setupMetricsIPCHandlers } from './utils/ipcMetricsHandler';
+import { markMetricsReady, setupMetricsIPCHandlers } from './utils/ipcMetricsHandler';
 import { setupFleetIPCHandlers } from './utils/ipcFleetHandler';
 import { getMetricsCollector } from './utils/metrics/metricsCollector';
 import { startSamplers, stopSamplers } from './utils/metrics/samplers';
@@ -480,6 +480,7 @@ async function main() {
   // boot takeover guard can hold a master boot for its whole observation
   // window, and the webui must render that hold (pre-init fleet state) live.
   setupFleetIPCHandlers();
+  setupMetricsIPCHandlers();
 
   // Fleet boot: role resolution, term acquisition, shard leases. Standalone
   // resolves to a master with self-granted leases; a co-worker holds here
@@ -671,8 +672,7 @@ async function main() {
   // Set up the optional access-log channel (embed + dev-only shutdown buttons)
   setupAccessLogChannel(client);
 
-  // Set up IPC message handlers for metrics
-  setupMetricsIPCHandlers();
+  markMetricsReady();
 
   // Set up IPC message handlers for module hot-reload
   setupReloadIPCHandlers(client);

@@ -1,7 +1,8 @@
 // IPC Metrics Handler - answers metrics requests from the Web-UI parent.
 // Same {requestId, data} echo contract as ipcPanelHandler. When metrics are
 // disabled it responds with an EMPTY snapshot (never silence) so the webui's
-// sendIPCMessage cannot time out.
+// sendIPCMessage cannot time out. Registered before the fleet boot, it answers
+// 'not ready' until the client is up (markMetricsReady).
 
 import { getMetricsCollector } from './metrics/metricsCollector';
 import { getModuleRegistry } from './moduleRegistry';
@@ -19,6 +20,36 @@ function annotateHeavyLoad(leaderboard: any): any {
   return leaderboard;
 }
 
+let ready = false;
+
+export function markMetricsReady(): void {
+  ready = true;
+}
+
+export function answerMetricsRequest(type: string, data: any): any {
+  if (!ready) return { success: false, error: 'metrics are not available until the fleet boot completes' };
+  const collector = getMetricsCollector();
+  switch (type) {
+    case 'metrics:global': {
+      const snapshot = collector.getGlobalSnapshot();
+      annotateHeavyLoad(snapshot.leaderboard);
+      return { success: true, snapshot };
+    }
+    case 'metrics:guild': {
+      const guildId = data?.guildId;
+      if (!guildId || typeof guildId !== 'string') return { success: false, error: 'guildId is required' };
+      return { success: true, snapshot: collector.getGuildSnapshot(guildId) };
+    }
+    case 'metrics:leaderboard':
+      return { success: true, leaderboard: annotateHeavyLoad(collector.getLeaderboard()) };
+    case 'metrics:reset':
+      collector.reset();
+      return { success: true };
+    default:
+      return { success: false, error: `Unknown metrics IPC type: ${type}` };
+  }
+}
+
 export function setupMetricsIPCHandlers(): void {
   if (!process.send) {
     console.warn('[IPCMetricsHandler] process.send not available - IPC handlers not registered');
@@ -32,37 +63,8 @@ export function setupMetricsIPCHandlers(): void {
     const { type, requestId, data } = message;
     if (typeof type !== 'string' || !type.startsWith('metrics:') || !requestId) return;
 
-    const collector = getMetricsCollector();
     try {
-      let response: any;
-      switch (type) {
-        case 'metrics:global': {
-          const snapshot = collector.getGlobalSnapshot();
-          annotateHeavyLoad(snapshot.leaderboard);
-          response = { success: true, snapshot };
-          break;
-        }
-        case 'metrics:guild': {
-          const guildId = data?.guildId;
-          if (!guildId || typeof guildId !== 'string') {
-            response = { success: false, error: 'guildId is required' };
-          } else {
-            response = { success: true, snapshot: collector.getGuildSnapshot(guildId) };
-          }
-          break;
-        }
-        case 'metrics:leaderboard': {
-          response = { success: true, leaderboard: annotateHeavyLoad(collector.getLeaderboard()) };
-          break;
-        }
-        case 'metrics:reset': {
-          collector.reset();
-          response = { success: true };
-          break;
-        }
-        default:
-          response = { success: false, error: `Unknown metrics IPC type: ${type}` };
-      }
+      const response = answerMetricsRequest(type, data);
       process.send!({ requestId, data: response });
     } catch (error) {
       console.error(`[IPCMetricsHandler] Error handling ${type}:`, error);

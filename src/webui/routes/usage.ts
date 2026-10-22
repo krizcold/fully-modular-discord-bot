@@ -1,7 +1,8 @@
 // Usage API - bundle-style metrics endpoints for the main web-UI Usage tab.
 // Micros arrive as integers over IPC; floats (ms / MB / shares) are produced
 // only here at serialization. Bot offline responds success:true running:false
-// with EMPTY arrays and zeroed totals - the tab degrades, never errors.
+// with EMPTY arrays and zeroed totals; a running child that does not answer is
+// success:false with the reason, never zeros.
 
 import { Router, Request, Response } from 'express';
 import { BotManager } from '../botManager';
@@ -19,11 +20,15 @@ function emptyGlobalPayload(running: boolean): any {
     success: true,
     running,
     metricsEnabled: false,
-    system: { cpuPct: 0, memRssMb: 0, heapMb: 0, loopLagMs: 0, diskTotalMb: 0, uptime: 0 },
+    system: { cpuPct: 0, memRssMb: 0, heapMb: 0, loopLagMs: 0, diskTotalMb: 0, diskScope: null, uptime: 0 },
     series: { cpu: [], mem: [], loop: [] },
     leaderboard: { modules: [], commands: [] },
     totals: { calls: 0, errors: 0, cpuMs: 0, wallMs: 0, ioReads: 0, ioWrites: 0 },
   };
+}
+
+function unreadMetrics(result: any): any {
+  return { success: false, running: true, error: `Could not read metrics from the bot: ${result?.error || 'the bot sent no snapshot'}` };
 }
 
 function serializeModules(modules: any[], totalCpuMicros: number): any[] {
@@ -71,7 +76,7 @@ export function createUsageRoutes(botManager: BotManager): Router {
       }
       const result = await botManager.getGlobalMetrics();
       if (!result?.success || !result.snapshot) {
-        res.json(emptyGlobalPayload(true));
+        res.json(unreadMetrics(result));
         return;
       }
       const snap = result.snapshot;
@@ -85,6 +90,7 @@ export function createUsageRoutes(botManager: BotManager): Router {
           heapMb: toMb(snap.system.heapBytes),
           loopLagMs: snap.system.loopP95Ms,
           diskTotalMb: toMb(snap.system.diskTotalBytes),
+          diskScope: snap.system.diskScope ?? null,
           uptime: snap.system.uptimeSec,
         },
         series: {
@@ -127,7 +133,7 @@ export function createUsageRoutes(botManager: BotManager): Router {
         botManager.getBotGuilds(),
       ]);
       if (!boardResult?.success || !boardResult.leaderboard) {
-        res.json({ success: true, running: true, guilds: [] });
+        res.json(unreadMetrics(boardResult));
         return;
       }
       const names = new Map<string, string>();
@@ -139,6 +145,7 @@ export function createUsageRoutes(botManager: BotManager): Router {
       res.json({
         success: true,
         running: true,
+        diskScope: boardResult.leaderboard.diskScope ?? null,
         guilds: rows.map((r: any) => ({
           guildId: r.guildId,
           name: names.get(r.guildId) || r.guildId,
@@ -158,7 +165,7 @@ export function createUsageRoutes(botManager: BotManager): Router {
 
   /**
    * GET /api/usage/guild/:guildId
-   * Drilldown for one guild: disk by module (exact), module/command
+   * Drilldown for one guild: disk by module (scope in disk.scope), module/command
    * leaderboard, counters, RAM cache estimate.
    */
   router.get('/guild/:guildId', async (req: Request, res: Response) => {
@@ -181,7 +188,7 @@ export function createUsageRoutes(botManager: BotManager): Router {
       }
       const result = await botManager.getGuildMetrics(guildId);
       if (!result?.success || !result.snapshot) {
-        res.status(500).json({ success: false, error: result?.error || 'Failed to get guild metrics' });
+        res.status(500).json(unreadMetrics(result));
         return;
       }
       const snap = result.snapshot;
@@ -205,6 +212,7 @@ export function createUsageRoutes(botManager: BotManager): Router {
         running: true,
         disk: {
           totalMb: toMb(snap.disk.totalBytes),
+          scope: snap.disk.scope ?? null,
           byModule: (snap.disk.byModule || []).map((d: any) => ({ module: d.module, mb: toMb(d.bytes) })),
         },
         leaderboard: {

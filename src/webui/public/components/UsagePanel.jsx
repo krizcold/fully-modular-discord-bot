@@ -1,5 +1,6 @@
 // Usage tab - the bot "task manager". Honesty rules baked into the UI:
-// per-guild DISK is exact, per-guild CPU is attributed-approximate
+// DISK is exact only in file mode (local disk only when the data lives in
+// postgres), per-guild CPU is attributed-approximate
 // ("~ share of bot work"), per-guild RAM is a cache estimate, process totals
 // are real. Bare global function (no import/export).
 
@@ -15,6 +16,12 @@ function usageFormatUptime(sec) {
   if (h > 0) return `${h}h ${m}m`;
   if (m > 0) return `${m}m ${s}s`;
   return `${s}s`;
+}
+
+function usageDiskScopeLabel(scope) {
+  if (scope === 'local') return 'exact';
+  if (scope === 'localOnly') return "local disk only: this server's data lives in postgres";
+  return 'not measured yet';
 }
 
 function usageFormatMb(mb) {
@@ -86,7 +93,7 @@ function GuildUsageDetail({ api, guildId }) {
     <div className="usage-guild-detail">
       <div className="usage-guild-detail-cols">
         <div>
-          <h4>Disk by module (exact) - {usageFormatMb(detail.disk.totalMb)}</h4>
+          <h4>Disk by module ({usageDiskScopeLabel(detail.disk.scope)}) - {usageFormatMb(detail.disk.totalMb)}</h4>
           {detail.disk.byModule.length === 0 ? (
             <div className="usage-empty">No data on disk yet</div>
           ) : (
@@ -161,7 +168,12 @@ function UsagePanel({ api, wsClient }) {
   const [moduleSort, setModuleSort] = React.useState({ key: 'calls', dir: 'desc' });
   const [commandSort, setCommandSort] = React.useState({ key: 'calls', dir: 'desc' });
   const [expandedGuild, setExpandedGuild] = React.useState(null);
+  const [loadError, setLoadError] = React.useState(null);
+  const [guildError, setGuildError] = React.useState(null);
+  const [guildDiskScope, setGuildDiskScope] = React.useState(null);
   const metricsEnabledRef = React.useRef(true);
+  const errorRef = React.useRef(false);
+  errorRef.current = loadError != null || guildError != null;
 
   const loadData = React.useCallback(async (isRefresh) => {
     if (isRefresh) setRefreshing(true);
@@ -174,9 +186,16 @@ function UsagePanel({ api, wsClient }) {
         setData(globalRes);
         setSeries(globalRes.series);
         metricsEnabledRef.current = globalRes.metricsEnabled === true;
+        setLoadError(null);
+      } else {
+        setLoadError(globalRes.error || 'Could not read metrics from the bot: no reason given');
       }
       if (guildsRes.success) {
         setGuildRows(guildsRes.guilds || []);
+        setGuildDiskScope(guildsRes.diskScope ?? null);
+        setGuildError(null);
+      } else {
+        setGuildError(guildsRes.error || 'Could not read metrics from the bot: no reason given');
       }
     } catch (err) {
       console.error('[Usage] Failed to load usage data:', err);
@@ -198,7 +217,7 @@ function UsagePanel({ api, wsClient }) {
         if (metricsEnabledRef.current) loadData(false);
         return;
       }
-      if (!metricsEnabledRef.current) loadData(false);
+      if (!metricsEnabledRef.current || errorRef.current) loadData(false);
       setLive(sample);
       setSeries((prev) => ({
         cpu: [...prev.cpu, { t: sample.t, v: sample.cpuPct }].slice(-USAGE_SERIES_CAP),
@@ -224,6 +243,21 @@ function UsagePanel({ api, wsClient }) {
 
   if (firstLoad) {
     return <FirstLoadPlaceholder label="Loading usage data..." />;
+  }
+
+  if (loadError) {
+    return (
+      <div className="usage-panel">
+        <div className="usage-offline">
+          <h3>Usage unavailable</h3>
+          <p>{loadError}</p>
+          <button onClick={() => loadData(true)} disabled={refreshing} style={disabledButtonStyle(refreshing)}>
+            {refreshing ? 'Refreshing...' : 'Retry'}
+          </button>
+        </div>
+        <FleetView api={api} wsClient={wsClient} guildNames={{}} />
+      </div>
+    );
   }
 
   if (!data || !data.running) {
@@ -301,7 +335,7 @@ function UsagePanel({ api, wsClient }) {
           <UsageStatCard
             title="Disk (bot data)"
             value={usageFormatMb(sys.diskTotalMb)}
-            sub="exact"
+            sub={usageDiskScopeLabel(data.system.diskScope)}
             series={[]}
             stroke="#eb459e"
           />
@@ -370,9 +404,11 @@ function UsagePanel({ api, wsClient }) {
         <div className="usage-board">
           <h3>Guilds</h3>
           <div className="usage-honesty">
-            Disk is exact. CPU is <em>~ share of bot work (approx)</em>. RAM is a <em>cache estimate</em>.
+            Disk is {usageDiskScopeLabel(guildDiskScope)}. CPU is <em>~ share of bot work (approx)</em>. RAM is a <em>cache estimate</em>.
           </div>
-          {guildRows.length === 0 ? (
+          {guildError ? (
+            <div className="usage-empty">{guildError}</div>
+          ) : guildRows.length === 0 ? (
             <div className="usage-empty">No guild data yet</div>
           ) : (
             <table className="usage-table">
@@ -382,7 +418,7 @@ function UsagePanel({ api, wsClient }) {
                   <th>Calls</th>
                   <th>CPU ~ share</th>
                   <th>RAM (cache estimate)</th>
-                  <th>Disk (exact)</th>
+                  <th>Disk ({usageDiskScopeLabel(guildDiskScope)})</th>
                   <th>Top module</th>
                 </tr>
               </thead>
