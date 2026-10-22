@@ -1,8 +1,75 @@
+// The build the server serves now, read from build-info.js; null when the file names none. Throws while the server is down.
+async function readServedBuild() {
+  const res = await fetch('/build-info.js?_=' + Date.now(), { cache: 'no-store' });
+  if (!res.ok) throw new Error('build-info.js HTTP ' + res.status);
+  const text = await res.text();
+  const start = text.indexOf('{');
+  if (start < 0) return null;
+  try {
+    const build = JSON.parse(text.slice(start, text.lastIndexOf('}') + 1));
+    return build && build.buildId ? build : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+// After an update request: a different build id reloads the page; the same id back after 3 failed polls in a row means
+// it restarted on the same build (polling goes on, a later new build still reloads); the safety timeout says so.
+function pollForNewBuild(baselineBuildId, { onSameBuild, onTimeout, intervalMs = 3000, timeoutMs = 10 * 60 * 1000 }) {
+  let failures = 0;
+  let wentDown = false;
+  let reportedSame = false;
+  const stop = () => { clearInterval(poll); clearTimeout(safety); };
+  const poll = setInterval(async () => {
+    let build;
+    try {
+      build = await readServedBuild();
+    } catch (_) {
+      if (++failures >= 3) wentDown = true;
+      return;
+    }
+    failures = 0;
+    if (!build) return;
+    if (build.buildId !== baselineBuildId) {
+      stop();
+      window.location.reload();
+    } else if (wentDown && !reportedSame) {
+      reportedSame = true;
+      onSameBuild();
+    }
+  }, intervalMs);
+  const safety = setTimeout(() => { clearInterval(poll); if (!reportedSame) onTimeout(); }, timeoutMs);
+  return stop;
+}
+
+// The Update tab's message and running poll live here, so a tab switch (unmount) does not lose the outcome.
+const updateWatch = { message: null, stop: null, listeners: new Set() };
+
+function publishUpdateMessage(message) {
+  updateWatch.message = message;
+  updateWatch.listeners.forEach(listener => listener(message));
+}
+
+function watchRebuild(baselineBuildId) {
+  if (updateWatch.stop) updateWatch.stop();
+  updateWatch.stop = pollForNewBuild(baselineBuildId, {
+    onSameBuild: () => publishUpdateMessage({ type: 'info', text: 'The bot restarted on the same build: no new system code was applied.' }),
+    onTimeout: () => publishUpdateMessage({ type: 'error', reload: true, text: 'No new build was seen within 10 minutes, so the update outcome could not be confirmed. Reload to see the build now serving, or check the Bot Manager.' }),
+  });
+}
+
 // Update Status Component: Three-button layout (System / Modules / Everything)
 function UpdateStatus({ api, status, onRefresh }) {
   const [loading, setLoading] = React.useState(false);
   const [checkResult, setCheckResult] = React.useState(null);
-  const [actionMessage, setActionMessage] = React.useState(null);
+  const [actionMessage, setShownMessage] = React.useState(() => updateWatch.message);
+  const setActionMessage = publishUpdateMessage;
+
+  React.useEffect(() => {
+    updateWatch.listeners.add(setShownMessage);
+    setShownMessage(updateWatch.message);
+    return () => { updateWatch.listeners.delete(setShownMessage); };
+  }, []);
 
   const clearCrashHistory = async () => {
     if (!confirm('Are you sure you want to clear crash history? This will also disable safe mode.')) {
@@ -39,23 +106,12 @@ function UpdateStatus({ api, status, onRefresh }) {
     }
   };
 
-  const pollForNewBuild = () => {
-    const currentBuildId = window.BOT_BUILD?.buildId;
-    const poll = setInterval(async () => {
-      try {
-        const res = await fetch('/build-info.js?_=' + Date.now(), { cache: 'no-store' });
-        if (!res.ok) return;
-        const text = await res.text();
-        const match = text.match(/"buildId"\s*:\s*"([^"]+)"/);
-        const newBuildId = match ? match[1] : null;
-        if (newBuildId && newBuildId !== currentBuildId) {
-          clearInterval(poll);
-          clearTimeout(safety);
-          window.location.reload();
-        }
-      } catch (_) { /* server down during rebuild, keep polling */ }
-    }, 3000);
-    const safety = setTimeout(() => clearInterval(poll), 10 * 60 * 1000);
+  const servedBuildId = async () => {
+    try {
+      const build = await readServedBuild();
+      if (build) return build.buildId;
+    } catch (_) { /* fall back to the build this page loaded */ }
+    return window.BOT_BUILD?.buildId;
   };
 
   const triggerSystemUpdate = async () => {
@@ -63,10 +119,11 @@ function UpdateStatus({ api, status, onRefresh }) {
     setLoading(true);
     setActionMessage(null);
     try {
+      const baseline = await servedBuildId();
       const result = await api.post('/update/trigger');
       if (result.success) {
-        setActionMessage({ type: 'success', text: 'System update started. This page will reload automatically when the new build is live.' });
-        pollForNewBuild();
+        setActionMessage({ type: 'success', text: 'System update requested from the Bot Manager. This page reloads if a new build starts serving.' });
+        watchRebuild(baseline);
       } else {
         setActionMessage({ type: 'error', text: result.error || 'Failed to trigger system update' });
       }
@@ -108,10 +165,11 @@ function UpdateStatus({ api, status, onRefresh }) {
       // Update modules first (download only; no hot-reload since we're restarting anyway)
       await api.post('/update/modules');
       // Then trigger system update (restart; modules will load fresh on boot)
+      const baseline = await servedBuildId();
       const result = await api.post('/update/trigger');
       if (result.success) {
-        setActionMessage({ type: 'success', text: 'Modules updated. System update started; this page will reload when the new build is live.' });
-        pollForNewBuild();
+        setActionMessage({ type: 'success', text: 'Modules updated. System update requested from the Bot Manager; this page reloads if a new build starts serving.' });
+        watchRebuild(baseline);
       } else {
         setActionMessage({ type: 'error', text: result.error || 'Module update succeeded but system update failed' });
       }
@@ -139,6 +197,9 @@ function UpdateStatus({ api, status, onRefresh }) {
       {actionMessage && (
         <div className={`action-message action-message-${actionMessage.type}`}>
           {actionMessage.text}
+          {actionMessage.reload && (
+            <button className="btn btn-secondary" style={{ marginLeft: '10px' }} onClick={() => window.location.reload()}>Reload</button>
+          )}
         </div>
       )}
 
