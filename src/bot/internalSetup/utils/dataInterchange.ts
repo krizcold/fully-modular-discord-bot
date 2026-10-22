@@ -10,6 +10,9 @@ import * as path from 'path';
 import * as crypto from 'crypto';
 import { DATA_ROOT } from '../../../utils/dataRoot';
 import { flushGuild } from './dataManager';
+import { routeFor } from './dataBackends/routeResolver';
+import { readFileMarker } from './dataBackends/recognitionGuard';
+import type { DataBackendKind } from '../../../utils/envLoader';
 
 export interface FileRecord {
   guildId: string;
@@ -87,8 +90,9 @@ async function* walkFiles(base: string, rel: string = ''): AsyncGenerator<string
 }
 
 /**
- * Stream a guild's namespace as verified file records. Flushes the guild first
- * so the queue is on disk before enumeration.
+ * Stream a guild's namespace as verified file records. Flushes this process's
+ * write queue for the guild first; another process's queue (a running bot seen
+ * from the CLI) is not reached, which is why the bundle verbs refuse a live bot.
  */
 export async function* exportNamespace(guildId: string): AsyncGenerator<FileRecord> {
   await flushGuild(guildId);
@@ -219,52 +223,112 @@ interface BundleSummary {
   namespaceHash: string;
 }
 
+const GUILD_ID = /^\d+$/;
+
 /**
- * Write a guild's namespace to an on-disk DBEX1 bundle.
+ * Why a bundle export or import of this guild must not run, or null. The bundle
+ * reads and writes /data/<guild> directly, so it is only true to its word for a
+ * file-routed guild with no bot process beside it.
  */
-export async function writeBundle(guildId: string, filePath: string): Promise<BundleSummary> {
-  await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
-  const out = fs.createWriteStream(filePath);
-  const write = (chunk: Buffer | string): Promise<void> =>
-    new Promise((resolve, reject) => {
-      out.write(chunk, err => (err ? reject(err) : resolve()));
-    });
-
-  await write(BUNDLE_MAGIC);
-
-  const files: { relPath: string; size: number; sha256: string }[] = [];
-  let totalBytes = 0;
-  for await (const record of exportNamespace(guildId)) {
-    const header: BundleRecordHeader = { g: record.guildId, p: record.relPath, s: record.size, h: record.sha256 };
-    const headerJson = Buffer.from(JSON.stringify(header), 'utf-8');
-    const len = Buffer.alloc(4);
-    len.writeUInt32BE(headerJson.length, 0);
-    await write(len);
-    await write(headerJson);
-    await write(record.bytes);
-    files.push({ relPath: record.relPath, size: record.size, sha256: record.sha256 });
-    totalBytes += record.size;
+export function bundleRefusal(guildId: string, botRunning: 'yes' | 'no' | 'unknown'): string | null {
+  if (!GUILD_ID.test(guildId)) return `"${guildId}" is not a guild id`;
+  const marker = readFileMarker();
+  if (marker?.transformationId) {
+    return `a backend transformation window is open (${marker.transformationId}); finish or cancel it first`;
   }
+  let route: DataBackendKind;
+  try {
+    route = marker ? marker.live : routeFor(guildId);
+  } catch (error) {
+    return `could not confirm which backend serves guild ${guildId}: ${error instanceof Error ? error.message : String(error)}`;
+  }
+  if (route === 'postgres') {
+    return `guild ${guildId} is served from postgres; its files under ${DATA_ROOT} are not its data, so a bundle would read or write the wrong copy`;
+  }
+  if (botRunning === 'yes') return 'the bot is running; stop it first, a bundle beside it would miss its queued writes or be overwritten by them';
+  if (botRunning === 'unknown') return 'could not confirm the bot is stopped (the panel did not answer or gave no clear reply); start the panel (/webui start) or stop the bot first';
+  return null;
+}
 
-  files.sort((a, b) => Buffer.compare(Buffer.from(a.relPath, 'utf-8'), Buffer.from(b.relPath, 'utf-8')));
-  const nsHash = crypto.createHash('sha256');
-  for (const f of files) nsHash.update(`${f.relPath}\n${f.size}\n${f.sha256}\n`);
-
-  const summary: BundleSummary = { t: 'summary', fileCount: files.length, totalBytes, namespaceHash: nsHash.digest('hex') };
-  const summaryJson = Buffer.from(JSON.stringify(summary), 'utf-8');
-  const terminator = Buffer.alloc(4);
-  terminator.writeUInt32BE(0, 0);
-  await write(terminator);
-  await write(summaryJson);
-
-  await new Promise<void>((resolve, reject) => out.end((err?: Error | null) => (err ? reject(err) : resolve())));
-  return summary;
+function encodeSummary(files: { relPath: string; size: number; sha256: string }[]): BundleSummary {
+  const { namespaceHash, fileCount, totalBytes } = namespaceHashOf(files);
+  return { t: 'summary', fileCount, totalBytes, namespaceHash };
 }
 
 /**
- * Read a DBEX1 bundle as a stream of file records. Stops at the terminator.
+ * Write a guild's namespace to an on-disk DBEX1 bundle. The bundle is written
+ * beside the target as '<file>.partial', synced, read back against its summary
+ * and only then renamed over the target, so a failure leaves any previous file
+ * there untouched. A guild with no data dir is refused, never exported empty.
  */
-export async function* readBundle(filePath: string): AsyncGenerator<FileRecord> {
+export async function writeBundle(guildId: string, filePath: string): Promise<BundleSummary> {
+  const guildDir = path.join(DATA_ROOT, guildId);
+  const stat = await fs.promises.stat(guildDir).catch(() => null);
+  if (!stat || !stat.isDirectory()) throw new Error(`[DataInterchange] Guild ${guildId} has no data dir at ${guildDir}; nothing exported`);
+
+  await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
+  const partial = `${filePath}.partial`;
+  try {
+    const out = fs.createWriteStream(partial);
+    const write = (chunk: Buffer | string): Promise<void> =>
+      new Promise((resolve, reject) => {
+        out.write(chunk, err => (err ? reject(err) : resolve()));
+      });
+    const opened = new Promise<void>((resolve, reject) => {
+      out.once('open', () => resolve());
+      out.once('error', reject);
+    });
+    await opened;
+
+    await write(BUNDLE_MAGIC);
+    const files: { relPath: string; size: number; sha256: string }[] = [];
+    for await (const record of exportNamespace(guildId)) {
+      const header: BundleRecordHeader = { g: record.guildId, p: record.relPath, s: record.size, h: record.sha256 };
+      const headerJson = Buffer.from(JSON.stringify(header), 'utf-8');
+      const len = Buffer.alloc(4);
+      len.writeUInt32BE(headerJson.length, 0);
+      await write(len);
+      await write(headerJson);
+      await write(record.bytes);
+      files.push({ relPath: record.relPath, size: record.size, sha256: record.sha256 });
+    }
+
+    const summary = encodeSummary(files);
+    const terminator = Buffer.alloc(4);
+    terminator.writeUInt32BE(0, 0);
+    await write(terminator);
+    await write(Buffer.from(JSON.stringify(summary), 'utf-8'));
+    await new Promise<void>((resolve, reject) => out.end((err?: Error | null) => (err ? reject(err) : resolve())));
+
+    const fh = await fs.promises.open(partial, 'r+');
+    try {
+      await fh.sync();
+    } finally {
+      await fh.close();
+    }
+
+    let readBack: BundleSummary | null = null;
+    for await (const record of readBundle(partial, s => { readBack = s; })) {
+      if (record.guildId !== guildId) throw new Error(`[DataInterchange] Bundle read back names guild ${record.guildId}, not ${guildId}`);
+    }
+    const back = readBack as BundleSummary | null;
+    if (!back || back.fileCount !== summary.fileCount || back.totalBytes !== summary.totalBytes || back.namespaceHash !== summary.namespaceHash) {
+      throw new Error('[DataInterchange] Bundle read back does not match what was written');
+    }
+    await fs.promises.rename(partial, filePath);
+    return summary;
+  } catch (error) {
+    await fs.promises.rm(partial, { force: true }).catch(() => undefined);
+    throw error;
+  }
+}
+
+/**
+ * Read a DBEX1 bundle as a stream of file records. After the last record it
+ * reads the summary and throws unless it is present and matches the records
+ * read, so a truncated or altered bundle never ends as a clean stream.
+ */
+export async function* readBundle(filePath: string, onSummary?: (summary: BundleSummary) => void): AsyncGenerator<FileRecord> {
   const fh = await fs.promises.open(filePath, 'r');
   try {
     let pos = 0;
@@ -274,12 +338,13 @@ export async function* readBundle(filePath: string): AsyncGenerator<FileRecord> 
     if (magic.toString('utf-8') !== BUNDLE_MAGIC) {
       throw new Error('[DataInterchange] Not a DBEX1 bundle');
     }
+    const files: { relPath: string; size: number; sha256: string }[] = [];
     for (;;) {
       const lenBuf = Buffer.alloc(4);
       await readExact(fh, lenBuf, pos);
       pos += 4;
       const headerLen = lenBuf.readUInt32BE(0);
-      if (headerLen === 0) break; // terminator; summary follows but the stream ends here
+      if (headerLen === 0) break;
       const headerBuf = Buffer.alloc(headerLen);
       await readExact(fh, headerBuf, pos);
       pos += headerLen;
@@ -291,10 +356,113 @@ export async function* readBundle(filePath: string): AsyncGenerator<FileRecord> 
       if (actual !== header.h) {
         throw new Error(`[DataInterchange] Bundle hash mismatch for ${header.g}/${header.p}`);
       }
+      files.push({ relPath: header.p, size: header.s, sha256: header.h });
       yield { guildId: header.g, relPath: header.p, size: header.s, sha256: header.h, bytes: payload };
     }
+    const { size } = await fh.stat();
+    if (size <= pos) throw new Error('[DataInterchange] Bundle has no summary; it is incomplete');
+    const summaryBuf = Buffer.alloc(size - pos);
+    await readExact(fh, summaryBuf, pos);
+    let summary: BundleSummary;
+    try {
+      summary = JSON.parse(summaryBuf.toString('utf-8')) as BundleSummary;
+    } catch {
+      throw new Error('[DataInterchange] Bundle summary is unreadable; it is incomplete');
+    }
+    const expected = encodeSummary(files);
+    if (summary?.t !== 'summary' || summary.fileCount !== expected.fileCount || summary.totalBytes !== expected.totalBytes
+      || summary.namespaceHash !== expected.namespaceHash) {
+      throw new Error('[DataInterchange] Bundle summary does not match its records');
+    }
+    onSummary?.(summary);
   } finally {
     await fh.close();
+  }
+}
+
+export interface BundleImportResult {
+  guildId: string;
+  destDir: string;
+  fileCount: number;
+  totalBytes: number;
+  namespaceHash: string;
+  replaced: string | null; // where the guild dir it replaced now lies, or null when there was none
+}
+
+/**
+ * Restore a bundle into its guild's dir. The records land in a staging dir,
+ * which is hashed against the bundle's summary; only then is the current guild
+ * dir moved to _graveyard (its node-local sidecars carried over) and the
+ * staging dir renamed into its place. Any failure before the swap leaves the
+ * live dir as it was; a failed swap puts the old dir back.
+ */
+export async function importBundle(filePath: string): Promise<BundleImportResult> {
+  let summary: BundleSummary | null = null;
+  const gen = readBundle(filePath, s => { summary = s; });
+  const first = await gen.next();
+  if (first.done) throw new Error('[DataInterchange] Bundle is empty; nothing to import');
+  const firstRecord = first.value;
+  const guildId = firstRecord.guildId;
+  if (!GUILD_ID.test(guildId)) {
+    await gen.return(undefined);
+    throw new Error(`[DataInterchange] Bundle names "${guildId}", which is not a guild id`);
+  }
+  async function* records(): AsyncGenerator<FileRecord> {
+    yield firstRecord;
+    for await (const record of gen) {
+      if (record.guildId !== guildId) throw new Error(`[DataInterchange] Bundle mixes guilds ${guildId} and ${record.guildId}`);
+      yield record;
+    }
+  }
+
+  const liveDir = path.join(DATA_ROOT, guildId);
+  const staging = path.join(DATA_ROOT, `.bundle-import-${guildId}-${Date.now()}`);
+  let moved: string | null = null;
+  let swapping = false;
+  try {
+    const written = await importNamespace(guildId, records(), staging);
+    const bundled = summary as BundleSummary | null;
+    const staged = await hashNamespaceAt(staging);
+    if (!bundled || staged.fileCount !== written.fileCount || staged.fileCount !== bundled.fileCount
+      || staged.namespaceHash !== bundled.namespaceHash) {
+      throw new Error('[DataInterchange] Staged import does not match the bundle summary');
+    }
+
+    const live = await fs.promises.stat(liveDir).catch(() => null);
+    if (live) {
+      for (const name of EXCLUDED_NAMES) {
+        await fs.promises.copyFile(path.join(liveDir, name), path.join(staging, name)).catch((error: NodeJS.ErrnoException) => {
+          if (error.code !== 'ENOENT') throw error;
+        });
+      }
+      const graveyardRoot = path.join(DATA_ROOT, '_graveyard');
+      await fs.promises.mkdir(graveyardRoot, { recursive: true });
+      const dest = path.join(graveyardRoot, `${guildId}-${Date.now()}`);
+      await fs.promises.rename(liveDir, dest);
+      swapping = true;
+      moved = dest;
+      try {
+        await fs.promises.rename(staging, liveDir);
+      } catch (error) {
+        try {
+          await fs.promises.rename(dest, liveDir);
+        } catch (restoreError) {
+          throw new Error(`[DataInterchange] Swap failed (${error instanceof Error ? error.message : String(error)}) and the old guild dir could not be put back; it lies at ${dest}: ${restoreError instanceof Error ? restoreError.message : String(restoreError)}`);
+        }
+        throw new Error(`[DataInterchange] Swap failed; the old guild dir was put back: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      await fs.promises.writeFile(path.join(dest, '.graveyard.json'), JSON.stringify({ guildId, reason: 'replaced by bundle import', ts: Date.now() }, null, 2), 'utf-8')
+        .catch(() => undefined);
+    } else {
+      swapping = true;
+      await fs.promises.rename(staging, liveDir);
+    }
+    return { guildId, destDir: liveDir, fileCount: staged.fileCount, totalBytes: staged.totalBytes, namespaceHash: staged.namespaceHash, replaced: moved };
+  } catch (error) {
+    if (swapping) throw error;
+    throw new Error(`${error instanceof Error ? error.message : String(error)}; the live guild dir was not touched`);
+  } finally {
+    await fs.promises.rm(staging, { recursive: true, force: true }).catch(() => undefined);
   }
 }
 

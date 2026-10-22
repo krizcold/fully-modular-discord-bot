@@ -11,7 +11,7 @@ import { emit, printJson, fail, table, jsonMode, EXIT_OK, EXIT_ERR, EXIT_TIMEOUT
 import { flagStr, flagInt } from './args';
 import { waitForEvent, pollUntil } from './waiter';
 import { DATA_ROOT } from '../utils/dataRoot';
-import { importNamespace, readBundle, writeBundle } from '../bot/internalSetup/utils/dataInterchange';
+import { bundleRefusal, importBundle, readBundle, writeBundle } from '../bot/internalSetup/utils/dataInterchange';
 
 interface Ctx {
   client: Client;
@@ -333,25 +333,40 @@ async function cmdInvoke(ctx: Ctx): Promise<void> {
 async function bundleExport(ctx: Ctx): Promise<void> {
   const guildId = need(ctx, 0, 'guildId');
   const file = need(ctx, 1, 'file');
-  const summary = await writeBundle(guildId, file);
-  printJson({ guildId, file, ...summary });
+  const refusal = bundleRefusal(guildId, await ctx.client.botAnswers());
+  if (refusal) fail(`bundle export refused: ${refusal}`, EXIT_ERR);
+  let summary;
+  try {
+    summary = await writeBundle(guildId, file);
+  } catch (error) {
+    fail(`bundle export failed, nothing written to ${file}: ${error instanceof Error ? error.message : String(error)}`, EXIT_ERR);
+  }
+  printJson({ guildId, file, source: path.join(DATA_ROOT, guildId), ...summary });
   process.exit(EXIT_OK);
 }
 
 async function bundleImport(ctx: Ctx): Promise<void> {
   const file = need(ctx, 0, 'file');
+  let guildId: string;
   const gen = readBundle(file);
-  const first = await gen.next();
-  if (first.done) fail('bundle is empty; nothing to import', EXIT_ERR);
-  const firstRecord = first.value;
-  const guildId = firstRecord.guildId;
-  async function* full() {
-    yield firstRecord;
-    yield* gen;
+  try {
+    const first = await gen.next();
+    if (first.done) fail('bundle is empty; nothing to import', EXIT_ERR);
+    guildId = (first.value as { guildId: string }).guildId;
+  } catch (error) {
+    fail(`bundle import refused: ${error instanceof Error ? error.message : String(error)}`, EXIT_ERR);
+  } finally {
+    await gen.return(undefined);
   }
-  const destDir = path.join(DATA_ROOT, guildId);
-  const result = await importNamespace(guildId, full(), destDir);
-  printJson({ guildId, destDir, ...result });
+  const refusal = bundleRefusal(guildId!, await ctx.client.botAnswers());
+  if (refusal) fail(`bundle import refused: ${refusal}`, EXIT_ERR);
+  let result;
+  try {
+    result = await importBundle(file);
+  } catch (error) {
+    fail(`bundle import failed: ${error instanceof Error ? error.message : String(error)}`, EXIT_ERR);
+  }
+  printJson(result);
   process.exit(EXIT_OK);
 }
 

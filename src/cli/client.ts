@@ -48,6 +48,35 @@ export class Client {
     return this.target.port;
   }
 
+  /** Whether the bot child runs, from the panel's /api/bot/status: running true is yes, running false is no, anything else (no answer, an error status, a timeout, an unreadable body) is unknown. */
+  botAnswers(timeoutMs = 3000): Promise<'yes' | 'no' | 'unknown'> {
+    return new Promise((resolve) => {
+      const req = http.request(
+        { host: this.target.host, port: this.target.port, method: 'GET', path: '/api/bot/status', headers: { Accept: 'application/json' } },
+        (res) => {
+          const chunks: Buffer[] = [];
+          res.on('data', (c: Buffer) => chunks.push(c));
+          res.on('error', () => resolve('unknown'));
+          res.on('end', () => {
+            if (res.statusCode !== 200) return resolve('unknown');
+            try {
+              const running = (JSON.parse(Buffer.concat(chunks).toString('utf8')) as { status?: { running?: unknown } })?.status?.running;
+              resolve(running === true ? 'yes' : running === false ? 'no' : 'unknown');
+            } catch {
+              resolve('unknown');
+            }
+          });
+        },
+      );
+      req.setTimeout(timeoutMs, () => {
+        req.destroy();
+        resolve('unknown');
+      });
+      req.on('error', () => resolve('unknown'));
+      req.end();
+    });
+  }
+
   request(
     method: string,
     path: string,
