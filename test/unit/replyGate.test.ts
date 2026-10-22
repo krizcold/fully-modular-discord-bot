@@ -677,6 +677,27 @@ describe('the answer over several writes', () => {
     expect(wire.map(textOf)).toEqual([truthText('frozen', false)]);
   });
 
+  it.each([
+    ['a lower-ranked refusal (not-ready)', false, 'database-backlog'],
+    ['a higher-ranked refusal (read-only)', true, 'database-read-only'],
+  ] as const)('a backlog refusal beside %s names the worse of the two', async (_name, readOnlyAfter, worst) => {
+    const { wire, emit } = rig();
+    const { guildId, store, options } = await storeGuild();
+    store.mode = 'unavailable';
+    saveData('big.json', options, 'x'.repeat(65 * 1024 * 1024));
+    await emit(rawCommand('c19b'), async i => {
+      saveDataOutcome('y.json', notReadyGuild(), { v: 1 });
+      try { saveData('x.json', options, { v: 1 }); } catch { /* refused: database-backlog */ }
+      if (readOnlyAfter) {
+        store.isReadOnly = () => true;
+        try { saveData('z.json', options, { v: 1 }); } catch { /* refused: database-read-only */ }
+      }
+      await i.reply({ content: 'Saved!' });
+    });
+    expect(wire.map(textOf)).toEqual([truthText(worst, false)]);
+    expect(getWorkingSet()?.stateOf(guildId)).toBe('ready');
+  });
+
   it('a refusal is made unconfirmable only by a rewrite of the same document, in the same guild and folder', async () => {
     const { wire, emit } = rig();
     const { guildId, options } = await storeGuild();

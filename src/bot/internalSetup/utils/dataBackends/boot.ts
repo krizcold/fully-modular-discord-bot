@@ -1106,6 +1106,7 @@ function noticeText(property: string, fallback: string): string {
 export function dataUnavailableMessage(causeKey: DataUnavailableCause): string {
   if (causeKey === 'node-stopping') return 'The bot is restarting, so your change was not saved. Please try again in a moment.';
   if (causeKey === 'database-read-only') return "The bot's database is read-only while a backup covers an outage, so your change was not saved. Please try again in a few minutes.";
+  if (causeKey === 'database-backlog') return "The bot's database is behind on saving changes, so your change was not saved. Please try again in a moment.";
   return causeKey === 'guild-fenced'
     ? "This server's data just moved to another bot node; please try again in a moment."
     : noticeText('outageNotice.databaseUnreachable', "The bot's database is currently unreachable, so your change was not saved. Please try again later or contact support.");

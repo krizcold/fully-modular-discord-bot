@@ -20,7 +20,7 @@ export type TruthAnswer = 'pending' | 'held' | 'deposed' | 'unavailable' | Ledge
 
 // Worst first.
 const RANK: TruthAnswer[] = [
-  'node-stopping', 'database-read-only', 'guild-fenced', 'deposed', 'database-unreachable',
+  'node-stopping', 'database-read-only', 'guild-fenced', 'deposed', 'database-unreachable', 'database-backlog',
   'frozen', 'not-ready', 'io', 'unavailable', 'held', 'pending',
 ];
 const worst = (answers: TruthAnswer[]): TruthAnswer => answers.reduce((a, b) => (RANK.indexOf(b) < RANK.indexOf(a) ? b : a));
@@ -44,6 +44,8 @@ export function truthText(answer: TruthAnswer, partial: boolean): string {
         ? notice
         : "The bot's database is currently unreachable, so your change was not saved. Please try again later or contact support.";
     }
+    case 'database-backlog':
+      return `The bot's database is behind on saving changes, so your change was ${notSaved}. Please try again in a moment.`;
     case 'frozen':
       return `This server's data is being moved, so your change was ${notSaved}. Please try again in a moment.`;
     case 'not-ready':

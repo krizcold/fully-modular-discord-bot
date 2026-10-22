@@ -762,7 +762,9 @@ function acceptSave<T>(filename: string, options: DataOptions, data: T): SaveTra
       }
       if (result === 'frozen-window') { frozenWriteRejections += 1; return { outcome: 'frozen' }; }
       if (result === 'not-ready') return { outcome: 'refused', cause: 'not-ready' };
-      throw new DataBackendUnavailableError(result === 'fenced' ? 'guild-fenced' : result === 'read-only' ? 'database-read-only' : 'database-unreachable');
+      throw result === 'fenced' ? new DataBackendUnavailableError('guild-fenced')
+        : result === 'read-only' ? new DataBackendUnavailableError('database-read-only')
+          : ws.refusal();
     }
     const dir = getDataDirectory(options);
     const filePath = getDataFilePath(filename, options);
@@ -822,7 +824,9 @@ function acceptAppend(filename: string, options: DataOptions, line: string): App
       }
       if (result === 'frozen-window') { frozenWriteRejections += 1; return { outcome: 'frozen' }; }
       if (result === 'not-ready') return { outcome: 'refused', cause: 'not-ready' };
-      throw new DataBackendUnavailableError(result === 'fenced' ? 'guild-fenced' : result === 'read-only' ? 'database-read-only' : 'database-unreachable');
+      throw result === 'fenced' ? new DataBackendUnavailableError('guild-fenced')
+        : result === 'read-only' ? new DataBackendUnavailableError('database-read-only')
+          : ws.refusal();
     }
     const dir = getDataDirectory(options);
     const filePath = getDataFilePath(filename, options);
@@ -902,7 +906,9 @@ function acceptDelete(filename: string, options: DataOptions): DeleteTracked {
       }
       if (result === 'frozen-window') { frozenWriteRejections += 1; return { outcome: 'frozen' }; }
       if (result === 'not-ready') return { outcome: 'refused', cause: 'not-ready' };
-      throw new DataBackendUnavailableError(result === 'fenced' ? 'guild-fenced' : result === 'read-only' ? 'database-read-only' : 'database-unreachable');
+      throw result === 'fenced' ? new DataBackendUnavailableError('guild-fenced')
+        : result === 'read-only' ? new DataBackendUnavailableError('database-read-only')
+          : ws.refusal();
     }
     const filePath = getDataFilePath(filename, options);
 

@@ -39,17 +39,19 @@ export interface WsTicket {
  * drain). Module code never catches it by contract; the dispatch wrappers do
  * and surface the cause.
  */
-export type DataUnavailableCause = 'database-unreachable' | 'guild-fenced' | 'database-read-only' | 'node-stopping';
+export type DataUnavailableCause = 'database-unreachable' | 'database-backlog' | 'guild-fenced' | 'database-read-only' | 'node-stopping';
 
 export class DataBackendUnavailableError extends Error {
-  constructor(readonly causeKey: DataUnavailableCause) {
-    super(causeKey === 'guild-fenced'
+  constructor(readonly causeKey: DataUnavailableCause, detail?: string) {
+    super(detail ?? (causeKey === 'guild-fenced'
       ? '[Data] This guild was taken over by another node; the write was not saved'
       : causeKey === 'database-read-only'
         ? '[Data] The database serving this node is a copy in recovery and accepts no writes (SQLSTATE 25006); the write was not saved'
         : causeKey === 'node-stopping'
           ? '[Data] This process is stopping and its exit drain has closed; the write was not saved'
-          : '[Data] The data backend is unreachable and the write buffer is full; the write was not saved');
+          : causeKey === 'database-backlog'
+            ? '[Data] The data backend is behind on storing writes; the write was not saved'
+            : '[Data] The data backend is unreachable; the write was not saved'));
     this.name = 'DataBackendUnavailableError';
   }
 }
@@ -59,19 +61,28 @@ interface WorkingDoc {
   parsed?: unknown;
   tombstone: boolean;
   dirty: boolean;
-  /** Accepted-at of the oldest unflushed change to this doc (window accounting). */
+  /** Accepted-at of its oldest write no landed flush holds, 0 when none (window accounting). */
   dirtySince: number;
+  /** Accepted-at of its oldest write since its last batch was built, 0 when none. */
+  sinceBatch: number;
   /** The seq of its latest write here, 0 when hydrated: a tombstone's is its delete's. */
   seq: number;
+  /** Its content's UTF-8 size, measured once: a doc's content never changes in place. */
+  bytes?: number;
 }
 
 type WsState = 'hydrating' | 'ready' | 'frozen-retained' | 'fenced' | 'failed';
 
 interface AppendBuffer {
   chunk: string;
+  /** As a doc's: its oldest line no landed flush holds, 0 when none. */
   dirtySince: number;
+  /** Its oldest line since its chunk was last sent, 0 when none. */
+  sinceBatch: number;
   /** The length of its start in the batch on the wire, 0 while none is: that batch's commit slices it off. */
   sent: number;
+  /** The chunk's UTF-8 size. */
+  bytes: number;
 }
 
 class GuildWorkingSet {
@@ -80,6 +91,8 @@ class GuildWorkingSet {
   readonly appendKeys = new Set<string>();
   readonly appendBuf = new Map<string, AppendBuffer>();
   dirtyKeys = new Set<string>();
+  // The keys of the batch on the wire: the window's age reads them until it lands or fails.
+  flightKeys = new Set<string>();
   windowOpenedAt: number | null = null;
   debounceTimer: NodeJS.Timeout | null = null;
   flushInFlight = false;
@@ -190,7 +203,6 @@ export class WorkingSetManager {
   private readonly sets = new Map<string, GuildWorkingSet>();
   private health: BackendHealth['state'] = 'healthy';
   private lastError: string | null = null;
-  private dirtyBytes = 0;
   private retryTimer: NodeJS.Timeout | null = null;
   private quiesced = false;
   private retryAttempt = 0;
@@ -340,17 +352,19 @@ export class WorkingSetManager {
         this.markDirty(ws, doc.key, now);
         continue;
       }
-      ws.docs.set(doc.key, { content: doc.content, tombstone: doc.tombstone, dirty: true, dirtySince: now, seq: ws.writeSeq });
-      this.dirtyBytes += doc.content.length;
+      ws.docs.set(doc.key, { content: doc.content, tombstone: doc.tombstone, dirty: true, dirtySince: now, sinceBatch: now, seq: ws.writeSeq });
       this.markDirty(ws, doc.key, now);
     }
     for (const append of carry.appends) {
       const buf = ws.appendBuf.get(append.key);
       // Ahead of the appends taken here since, but behind the start a batch on the wire holds, which its commit slices.
-      if (buf) buf.chunk = buf.chunk.slice(0, buf.sent) + append.chunk + buf.chunk.slice(buf.sent);
-      else ws.appendBuf.set(append.key, { chunk: append.chunk, dirtySince: now, sent: 0 });
+      if (buf) {
+        buf.chunk = buf.chunk.slice(0, buf.sent) + append.chunk + buf.chunk.slice(buf.sent);
+        buf.bytes += Buffer.byteLength(append.chunk);
+        buf.dirtySince ||= now;
+        buf.sinceBatch ||= now;
+      } else ws.appendBuf.set(append.key, { chunk: append.chunk, dirtySince: now, sinceBatch: now, sent: 0, bytes: Buffer.byteLength(append.chunk) });
       ws.appendKeys.add(append.key);
-      this.dirtyBytes += append.chunk.length;
       this.markDirty(ws, append.key, now);
     }
   }
@@ -449,7 +463,7 @@ export class WorkingSetManager {
     }
     // A no-rows guild becomes ready empty; docs land as raw text, parsed lazily.
     for (const { key, doc } of outcome.docs) {
-      ws.docs.set(docKeyOf(key.module, key.filename), { content: doc, tombstone: false, dirty: false, dirtySince: 0, seq: 0 });
+      ws.docs.set(docKeyOf(key.module, key.filename), { content: doc, tombstone: false, dirty: false, dirtySince: 0, sinceBatch: 0, seq: 0 });
     }
     for (const key of outcome.appendKeys) {
       ws.appendKeys.add(docKeyOf(key.module, key.filename));
@@ -565,10 +579,8 @@ export class WorkingSetManager {
     const key = docKeyOf(module, filename);
     const now = Date.now();
     const prev = ws.docs.get(key);
-    if (prev) this.dirtyBytes -= prev.dirty ? prev.content.length : 0;
     ws.writeSeq += 1;
-    ws.docs.set(key, { content, tombstone: false, dirty: true, dirtySince: prev?.dirty ? prev.dirtySince : now, seq: ws.writeSeq });
-    this.dirtyBytes += content.length;
+    ws.docs.set(key, { content, tombstone: false, dirty: true, dirtySince: prev?.dirtySince || now, sinceBatch: prev?.sinceBatch || now, seq: ws.writeSeq });
     this.markDirty(ws, key, now);
     return 'accepted';
   }
@@ -580,10 +592,13 @@ export class WorkingSetManager {
     const key = docKeyOf(module, filename);
     const now = Date.now();
     const buf = ws.appendBuf.get(key);
-    if (buf) buf.chunk += line;
-    else ws.appendBuf.set(key, { chunk: line, dirtySince: now, sent: 0 });
+    if (buf) {
+      buf.chunk += line;
+      buf.bytes += Buffer.byteLength(line);
+      buf.dirtySince ||= now;
+      buf.sinceBatch ||= now;
+    } else ws.appendBuf.set(key, { chunk: line, dirtySince: now, sinceBatch: now, sent: 0, bytes: Buffer.byteLength(line) });
     ws.appendKeys.add(key);
-    this.dirtyBytes += line.length;
     ws.writeSeq += 1;
     this.markDirty(ws, key, now);
     return 'accepted';
@@ -599,18 +614,22 @@ export class WorkingSetManager {
     if ((!doc || doc.tombstone) && !hasStream) return 'absent';
     const now = Date.now();
     ws.writeSeq += 1;
+    // The lines it drops wait on it: it takes their age, and lands for them.
+    const buf = ws.appendBuf.get(key);
+    const earliest = (...at: number[]) => Math.min(...at.filter(t => t > 0));
+    const dirtySince = earliest(doc?.dirtySince ?? 0, buf?.dirtySince ?? 0, now);
+    const sinceBatch = earliest(doc?.sinceBatch ?? 0, buf?.sinceBatch ?? 0, now);
     if (doc) {
-      if (doc.dirty) this.dirtyBytes -= doc.content.length;
       doc.tombstone = true;
       doc.parsed = undefined;
       doc.dirty = true;
-      doc.dirtySince = doc.dirtySince || now;
+      doc.dirtySince = dirtySince;
+      doc.sinceBatch = sinceBatch;
       doc.seq = ws.writeSeq;
     } else {
-      ws.docs.set(key, { content: '', tombstone: true, dirty: true, dirtySince: now, seq: ws.writeSeq });
+      ws.docs.set(key, { content: '', tombstone: true, dirty: true, dirtySince, sinceBatch, seq: ws.writeSeq });
     }
-    const buf = ws.appendBuf.get(key);
-    if (buf) { this.dirtyBytes -= buf.chunk.length; ws.appendBuf.delete(key); }
+    ws.appendBuf.delete(key);
     ws.appendKeys.delete(key);
     this.markDirty(ws, key, now);
     return 'accepted';
@@ -682,6 +701,8 @@ export class WorkingSetManager {
     if (ws.state === 'frozen-retained') return 'frozen-window';
     if (ws.state === 'fenced') return 'fenced';
     if (this.backend.isReadOnly()) return 'read-only';
+    // What held it closed may have left with no flush landing (a deposed or evicted set).
+    this.reopenIfDrained();
     if (this.health === 'refusing') return 'refusing';
     return 'ok';
   }
@@ -690,6 +711,7 @@ export class WorkingSetManager {
     ws.dirtyKeys.add(key);
     if (ws.flushInFlight) {
       ws.requeue = true;
+      this.checkBounds(now);
       return;
     }
     if (ws.windowOpenedAt === null) ws.windowOpenedAt = now;
@@ -700,10 +722,9 @@ export class WorkingSetManager {
     this.checkBounds(now);
   }
 
-  private buildBatch(ws: GuildWorkingSet): { batch: GuildFlushBatch; flushedKeys: string[]; sentBufs: Map<string, AppendBuffer>; bytes: number; seq: number } {
+  private buildBatch(ws: GuildWorkingSet): { batch: GuildFlushBatch; flushedKeys: string[]; sentBufs: Map<string, AppendBuffer>; seq: number } {
     const batch: GuildFlushBatch = { upserts: [], deletes: [], appends: [] };
     const sentBufs = new Map<string, AppendBuffer>();
-    let bytes = 0;
     const flushedKeys = [...ws.dirtyKeys];
     for (const key of flushedKeys) {
       const dk = splitDocKey(key);
@@ -711,18 +732,19 @@ export class WorkingSetManager {
       const buf = ws.appendBuf.get(key);
       if (doc?.tombstone) {
         batch.deletes.push(dk);
+        doc.sinceBatch = 0;
       } else if (doc?.dirty) {
         batch.upserts.push({ key: dk, doc: doc.content });
-        bytes += doc.content.length;
+        doc.sinceBatch = 0;
       }
       if (buf && buf.chunk.length > 0) {
         batch.appends.push({ key: dk, chunk: buf.chunk });
         buf.sent = buf.chunk.length;
+        buf.sinceBatch = 0;
         sentBufs.set(key, buf);
-        bytes += buf.chunk.length;
       }
     }
-    return { batch, flushedKeys, sentBufs, bytes, seq: ws.writeSeq };
+    return { batch, flushedKeys, sentBufs, seq: ws.writeSeq };
   }
 
   /** True once this call's batch committed. */
@@ -732,13 +754,15 @@ export class WorkingSetManager {
     if (ws.debounceTimer) { clearTimeout(ws.debounceTimer); ws.debounceTimer = null; }
     if (ws.dirtyKeys.size === 0) { ws.windowOpenedAt = null; return false; }
 
-    const { batch, flushedKeys, sentBufs, bytes, seq } = this.buildBatch(ws);
+    const { batch, flushedKeys, sentBufs, seq } = this.buildBatch(ws);
     ws.dirtyKeys = new Set();
+    ws.flightKeys = new Set(flushedKeys);
     ws.windowOpenedAt = null;
     ws.flushInFlight = true;
     ws.wireSeq = seq;
     const outcome = await this.backend.flushGuild(ws.guildId, batch, ws.fence);
     ws.flushInFlight = false;
+    ws.flightKeys = new Set();
     ws.wireSeq = 0;
     // A refused batch holds no buffer's start any more: the next one sends each whole.
     if (!outcome.ok) for (const buf of sentBufs.values()) buf.sent = 0;
@@ -753,8 +777,10 @@ export class WorkingSetManager {
         ws.carried = ws.carried.filter(applied => applied.seq > seq);
       }
       for (const key of flushedKeys) {
-        if (ws.dirtyKeys.has(key)) continue; // re-dirtied mid-flight; next window owns it
         const doc = ws.docs.get(key);
+        // What it holds unstored now is what was written since the build.
+        if (doc) doc.dirtySince = doc.sinceBatch;
+        if (ws.dirtyKeys.has(key)) continue; // re-dirtied mid-flight; next window owns it
         if (doc?.tombstone) ws.docs.delete(key);
         else if (doc) doc.dirty = false;
       }
@@ -762,10 +788,11 @@ export class WorkingSetManager {
         // A delete dropped the flushed buffer meanwhile: one there now holds only newer appends.
         if (ws.appendBuf.get(key) !== buf) continue;
         buf.chunk = buf.chunk.slice(buf.sent);
+        buf.bytes = Buffer.byteLength(buf.chunk);
         buf.sent = 0;
+        buf.dirtySince = buf.sinceBatch;
         if (buf.chunk.length === 0 && !ws.dirtyKeys.has(key)) ws.appendBuf.delete(key);
       }
-      this.dirtyBytes = Math.max(0, this.dirtyBytes - bytes);
       this.landed += 1;
       this.noteFlushSuccess();
       if (ws.requeue || ws.dirtyKeys.size > 0) {
@@ -817,12 +844,6 @@ export class WorkingSetManager {
   }
 
   private forgetDirty(ws: GuildWorkingSet): void {
-    for (const key of ws.dirtyKeys) {
-      const doc = ws.docs.get(key);
-      if (doc?.dirty) this.dirtyBytes -= doc.content.length;
-    }
-    for (const buf of ws.appendBuf.values()) this.dirtyBytes -= buf.chunk.length;
-    if (this.dirtyBytes < 0) this.dirtyBytes = 0;
     ws.dirtyKeys.clear();
     ws.appendBuf.clear();
     ws.windowOpenedAt = null;
@@ -980,13 +1001,16 @@ export class WorkingSetManager {
   private noteFlushSuccess(): void {
     this.retryAttempt = 0;
     this.lastError = null;
+    this.reopenIfDrained();
+  }
+
+  // Hysteresis: acceptance reopens only once the backlog is under half its bound and no write has waited the window.
+  private reopenIfDrained(): void {
     if (this.health === 'healthy') return;
-    // Hysteresis: reopen only when the backlog has genuinely drained.
-    const oldest = this.oldestDirtyMs();
-    if (this.dirtyBytes < ACCEPT_BYTES / 2 && oldest < ACCEPT_WINDOW_MS) {
-      if (this.health === 'refusing') console.warn('[Data] Write acceptance reopened (backlog drained)');
-      this.health = 'healthy';
-    }
+    const { bytes, oldest } = this.backlog();
+    if (bytes >= ACCEPT_BYTES / 2 || oldest >= ACCEPT_WINDOW_MS) return;
+    if (this.health === 'refusing') console.warn(`[Data] Write acceptance reopened: unsaved writes hold ${Math.round(bytes / 1024)} KiB, the oldest waiting ${Math.round(oldest / 1000)} s`);
+    this.health = this.lastError === null ? 'healthy' : 'degraded';
   }
 
   private noteFlushFailure(error: string): void {
@@ -997,25 +1021,46 @@ export class WorkingSetManager {
 
   private checkBounds(_now: number): void {
     if (this.health === 'refusing') return;
-    if (this.dirtyBytes > ACCEPT_BYTES || this.oldestDirtyMs() > ACCEPT_WINDOW_MS) {
+    const { bytes, oldest } = this.backlog();
+    if (bytes > ACCEPT_BYTES || oldest > ACCEPT_WINDOW_MS) {
       this.health = 'refusing';
-      console.error(`[Data] Write acceptance CLOSED (backlog ${Math.round(this.dirtyBytes / 1024)} KiB, oldest ${Math.round(this.oldestDirtyMs() / 1000)}s); guild writes now fail loudly until the backend recovers`);
+      console.error(`[Data] Write acceptance CLOSED (backlog ${Math.round(bytes / 1024)} KiB, oldest ${Math.round(oldest / 1000)}s); guild writes are refused until unsaved writes are under ${ACCEPT_BYTES / 2 / 1024 / 1024} MiB and none has waited ${ACCEPT_WINDOW_MS / 1000} s`);
     }
   }
 
-  private oldestDirtyMs(): number {
+  /**
+   * The facade's refusal while acceptance is closed, from what holds it closed now: the backlog's bytes, the oldest
+   * write's wait, or both, each with where it reopens. Its cause is the backlog's either way: a store that answers yet
+   * holds every flush is not unreachable.
+   */
+  refusal(): DataBackendUnavailableError {
+    const { bytes, oldest } = this.backlog();
+    const age = oldest >= ACCEPT_WINDOW_MS;
+    const held: string[] = [];
+    if (bytes >= ACCEPT_BYTES / 2 || !age) held.push(`unsaved writes hold ${Math.round(bytes / 1024)} KiB (acceptance reopens below ${ACCEPT_BYTES / 2 / 1024 / 1024} MiB)`);
+    if (age) held.push(`the oldest unsaved write has waited ${Math.round(oldest / 1000)} s (acceptance reopens below ${ACCEPT_WINDOW_MS / 1000} s)`);
+    return new DataBackendUnavailableError('database-backlog', `[Data] Write acceptance is closed: ${held.join(' and ')}; the write was not saved`);
+  }
+
+  /** What waits unsaved on this node: the bytes and the age of its oldest write, dirty or on the wire. */
+  private backlog(): { bytes: number; oldest: number } {
+    let bytes = 0;
     let oldest = 0;
     const now = Date.now();
     for (const ws of this.sets.values()) {
-      for (const key of ws.dirtyKeys) {
+      for (const key of new Set([...ws.dirtyKeys, ...ws.flightKeys])) {
         const doc = ws.docs.get(key);
-        if (doc?.dirty && doc.dirtySince > 0) oldest = Math.max(oldest, now - doc.dirtySince);
+        if (!doc?.dirty) continue;
+        if (!doc.tombstone) bytes += doc.bytes ??= Buffer.byteLength(doc.content);
+        if (doc.dirtySince > 0) oldest = Math.max(oldest, now - doc.dirtySince);
       }
       for (const buf of ws.appendBuf.values()) {
-        if (buf.chunk.length > 0) oldest = Math.max(oldest, now - buf.dirtySince);
+        if (buf.chunk.length === 0) continue;
+        bytes += buf.bytes;
+        oldest = Math.max(oldest, now - buf.dirtySince);
       }
     }
-    return oldest;
+    return { bytes, oldest };
   }
 
   private scheduleRetry(): void {
@@ -1036,12 +1081,9 @@ export class WorkingSetManager {
   }
 
   getBackendHealth(): BackendHealth {
-    return {
-      state: this.health,
-      oldestDirtyMs: this.oldestDirtyMs(),
-      dirtyBytes: this.dirtyBytes,
-      lastError: this.lastError,
-    };
+    this.reopenIfDrained();
+    const { bytes, oldest } = this.backlog();
+    return { state: this.health, oldestDirtyMs: oldest, dirtyBytes: bytes, lastError: this.lastError };
   }
 
   getCounters(): { wsBypassReads: number; wsBypassWrites: number; fencedFlushRejections: number } {
