@@ -8,7 +8,7 @@ const manager = vi.hoisted(() => ({ current: null as unknown }));
 
 vi.mock('../../src/bot/internalSetup/utils/dataBackends/boot', async importOriginal => {
   const real = await importOriginal<typeof import('../../src/bot/internalSetup/utils/dataBackends/boot')>();
-  return { ...real, awaitGuildDataReady: async (guildId: string) => !loading.has(guildId) };
+  return { ...real, admitGuildAction: async (guildId: string) => ({ cause: loading.has(guildId) ? 'loading' : 'admit', mark: null }) };
 });
 vi.mock('../../src/bot/internalSetup/utils/panelManager', async importOriginal => {
   const real = await importOriginal<typeof import('../../src/bot/internalSetup/utils/panelManager')>();
@@ -354,9 +354,9 @@ describe('answers before any write', () => {
     expect(await runPanelAction('panel:dropdown', { panelId: 'v', values: 'a', userId: OWNER }, pm)).toEqual({ success: false, error: 'Invalid field: values must be an array' });
   });
 
-  it('a guild still loading answers unchanged', async () => {
+  it('a guild still loading answers the loading notice (R5-J3: one text on Discord and panels)', async () => {
     loading.add('777');
-    expect(await run('panel:execute', async () => VIEW, '777')).toEqual({ success: false, error: "This server's data is still loading; try again in a moment" });
+    expect(await run('panel:execute', async () => VIEW, '777')).toEqual({ success: false, error: "This server's data is still loading, try again in a moment." });
   });
 });
 

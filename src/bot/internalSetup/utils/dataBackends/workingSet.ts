@@ -501,6 +501,12 @@ export class WorkingSetManager {
     else if (ws?.state === 'hydrating') ws.freezeWhenReady = true;
   }
 
+  /** A hydrating set that freezeRetained marked: it becomes frozen-retained, not ready, when its hydration ends. */
+  freezesWhenReady(guildId: string): boolean {
+    const ws = this.sets.get(guildId);
+    return ws?.state === 'hydrating' && ws.freezeWhenReady;
+  }
+
   evict(guildId: string): void {
     const ws = this.sets.get(guildId);
     if (!ws) return;

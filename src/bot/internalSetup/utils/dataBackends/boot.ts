@@ -3,7 +3,7 @@
 // driver stays HELD until the store-identity verdict clears, so no ownership
 // claim can touch a database that turns out to be the wrong one.
 
-import { MessageFlags } from 'discord.js';
+import { Guild, MessageFlags } from 'discord.js';
 import { connect } from 'net';
 import { DataBackendKind, loadCredentials, setFleetDataBackend, upsertCredentials } from '../../../../utils/envLoader';
 import { PostgresBackend, readControlTerm, releaseControlTerm, requireControlTerm } from './postgresBackend';
@@ -13,8 +13,11 @@ import { initDataReadiness, getDataReadiness, DataReadinessDriver } from './data
 import { forceRouteDefault, routeFor, applyRouteOverrides } from './routeResolver';
 import { evaluateRecognitionGuard, verifyStoreIdentity, readFileMarker, writeFileMarker, GuardVerdict } from './recognitionGuard';
 import { listGuilds } from './fileBackend';
-import { setGuildDataBackend, getGuildDataBackend } from '../dataManager';
+import { setGuildDataBackend, getGuildDataBackend, isClosedForExit, isGuildWriteFrozen } from '../dataManager';
 import { getConfigProperty } from '../configManager';
+import { ACK_MS, sweepLateWrites } from './replyGate';
+import { saveMark, type SaveMark } from './scopeRecord';
+import { ledgerOf, runAdmitted } from './writeLedger';
 
 function hasLocalGuildData(): boolean {
   return listGuilds().length > 0;
@@ -42,15 +45,36 @@ export function getDataBootStatus(): DataBootStatus {
  * Best-effort guildId extraction from a Discord.js event payload. Null when
  * the event has no guild context (DMs, clientReady, etc.) - those pass gates
  * unchanged. Covers {guildId} on Message/Channel/Interaction, {guild:{id}} on
- * GuildMember/Role/GuildBan, and voiceStateUpdate's first arg.
+ * GuildMember/Role/GuildBan, voiceStateUpdate's first arg, a MessageReaction's
+ * message, a ThreadMember's thread, a PollAnswer's poll, and a Guild itself;
+ * no other id is read. The tier gate reads it; the data gate and the metrics
+ * read eventGuildId.
  */
 export function extractGuildId(args: any[]): string | null {
+  return findGuildId(args)?.id ?? null;
+}
+
+/**
+ * The guild the data gate and the event metrics read: a Guild payload's id is
+ * none (guildCreate, guildDelete and the like pass the data gate, and a
+ * guildDelete must not record the departed guild again after metricsCleanup).
+ */
+export function eventGuildId(args: any[]): string | null {
+  const found = findGuildId(args);
+  return found && !found.fromGuild ? found.id : null;
+}
+
+function findGuildId(args: any[]): { id: string; fromGuild: boolean } | null {
   for (const arg of args) {
     if (!arg || typeof arg !== 'object') continue;
     const direct = (arg as any).guildId;
-    if (typeof direct === 'string' && direct) return direct;
+    if (typeof direct === 'string' && direct) return { id: direct, fromGuild: false };
     const nested = (arg as any).guild?.id;
-    if (typeof nested === 'string' && nested) return nested;
+    if (typeof nested === 'string' && nested) return { id: nested, fromGuild: false };
+    const carried = (arg as any).message?.guildId ?? (arg as any).thread?.guildId
+      ?? (arg as any).poll?.message?.guildId ?? (arg as any).poll?.channel?.guildId;
+    if (typeof carried === 'string' && carried) return { id: carried, fromGuild: false };
+    if (arg instanceof Guild && typeof arg.id === 'string' && arg.id) return { id: arg.id, fromGuild: true };
   }
   return null;
 }
@@ -937,41 +961,133 @@ export async function awaitDataStartupBarrier(): Promise<void> {
   }
 }
 
+/** The dispatch gate's answer for a guild action (R1-J2): admit, or the cause that holds it. */
+export type GateCause = 'admit' | HoldCause;
+export type HoldCause = 'stopping' | 'refused' | 'moving' | 'moved' | 'not-served' | 'loading';
+const FINAL_CAUSES = new Set<GateCause>(['stopping', 'refused', 'moved']);
+const HOLD_POLL_MS = 50;
+/** A panel action's or a console invoke's hold, which no Discord deadline bounds: 2.5 s, as the data route waits. */
+export const ENTRY_WAIT_MS = 2500;
+
 /**
- * Shared dispatch gate (file-routed guilds: passthrough). True = dispatch now.
- * Interactions wait briefly then get one polite ephemeral reply and drop -
- * the gate NEVER acks/defers on a handler's behalf. Non-interaction events
- * buffer for replay (or drop when the shard is not leased here).
+ * One reading of the gate for a guild action (notes/BT.md, "R1-J2 design sheet (L0): final"). Every hold reads it
+ * afresh at each poll, as a recycle or a hold for delivery replaces or stops the driver and the working set mid-wait.
+ * since is the hold's start.
+ */
+export function gateCauseNow(guildId: string, since: number): GateCause {
+  if (isClosedForExit()) return 'stopping';
+  if (bootStatus.state === 'refused') return 'refused';
+  // Either route: a migration file leg or a transformation source freezes the facade itself.
+  if (isGuildWriteFrozen(guildId)) return 'moving';
+  const readiness = getDataReadiness();
+  if (!readiness || routeFor(guildId) === 'file') return 'admit';
+  return readiness.causeOf(guildId, since);
+}
+
+/**
+ * Holds a guild action until the guild takes writes, a final cause, or deadlineAt (a performance.now() time), where
+ * one more reading decides. Admitted, it carries the mark its handler's confirmSaved counts from.
+ */
+export async function admitGuildAction(guildId: string, deadlineAt: number): Promise<{ cause: 'admit'; mark: SaveMark } | { cause: HoldCause; mark: null }> {
+  const since = performance.now();
+  for (;;) {
+    const cause = gateCauseNow(guildId, since);
+    if (cause === 'admit') return { cause, mark: saveMark() };
+    const left = deadlineAt - performance.now();
+    if (FINAL_CAUSES.has(cause) || left <= 0) return { cause, mark: null };
+    await new Promise<void>(resolve => setTimeout(resolve, Math.min(HOLD_POLL_MS, left)));
+  }
+}
+
+const LOADING_TEXT = "This server's data is still loading, try again in a moment.";
+const CAUSE_TEXTS: Record<Exclude<HoldCause, 'loading'>, string> = {
+  stopping: 'The bot is stopping; please try again in a moment.',
+  refused: "This bot's data storage is currently unavailable; please contact the server operator.",
+  moving: "This server's data is being moved; please try again in a moment.",
+  moved: "This server's data moved to another bot node; please try again in a moment.",
+  'not-served': "This server's data is not served by this bot node right now; please try again in a moment.",
+};
+
+/** The member's and the web panel's text for a held action; the loading notice is operator-editable in config.json. */
+export function gateCauseText(cause: HoldCause): string {
+  return cause === 'loading' ? noticeText('outageNotice.dataLoading', LOADING_TEXT) : CAUSE_TEXTS[cause];
+}
+
+/** The console invoke's text for a held action, in its own style. */
+export function gateConsoleText(cause: HoldCause, guildId: string): string {
+  switch (cause) {
+    case 'stopping': return 'the bot is stopping; try again in a moment';
+    case 'refused': return "the bot's data storage is unavailable; contact the server operator";
+    case 'moving': return `guild ${guildId}'s data is being moved; try again in a moment`;
+    case 'moved': return `guild ${guildId}'s data moved to another bot node; try again in a moment`;
+    case 'not-served': return `guild ${guildId}'s data is not served by this bot node right now; try again in a moment`;
+    default: return `guild ${guildId}'s data is still loading; try again in a moment`;
+  }
+}
+
+// One hold per interaction: the internal dispatcher and every module listener await the same one, which sends its
+// one refusal. An admitted interaction keeps its admission mark for runAsAdmitted.
+const interactionHolds = new WeakMap<object, Promise<GateCause>>();
+const admissions = new WeakMap<object, SaveMark>();
+
+function holdInteraction(interaction: any, guildId: string): Promise<GateCause> {
+  let hold = interactionHolds.get(interaction);
+  if (!hold) {
+    hold = (async () => {
+      // Counted from the emit, the deadline the reply gate acknowledges by; with no ledger, from now.
+      const openedAt = ledgerOf(interaction)?.openedAt ?? performance.now();
+      const held = await admitGuildAction(guildId, openedAt + ACK_MS);
+      if (held.cause === 'admit') admissions.set(interaction, held.mark);
+      else await politeReject(interaction, gateCauseText(held.cause));
+      return held.cause;
+    })();
+    interactionHolds.set(interaction, hold);
+  }
+  return hold;
+}
+
+/** Runs a gated listener's handler from its interaction's admission, so its confirmSaved counts from there. */
+export function runAsAdmitted<T>(args: any[], fn: () => T): T {
+  const mark = admissions.get(args[0] as object);
+  return mark ? runAdmitted(mark, fn) : fn();
+}
+
+/**
+ * The internal dispatcher's listener (clientInitializer.ts): the gate, the dispatch from the admission, then the reply
+ * gate's sweep of the interaction, which the listener does not wait on.
+ */
+export async function dispatchGated(eventName: string, args: any[], dispatch: (...args: any[]) => Promise<void>): Promise<void> {
+  if (!(await gateEventDispatch(eventName, args, () => void dispatch(...args)))) return;
+  await runAsAdmitted(args, () => dispatch(...args));
+  if (eventName === 'interactionCreate') void sweepLateWrites(args[0]);
+}
+
+/**
+ * Shared dispatch gate. True = dispatch now. An interaction meets its one hold and, refused, one polite ephemeral
+ * reply with the cause - the gate NEVER acks/defers on a handler's behalf. Non-interaction events buffer for replay
+ * (or drop when the shard is not leased here and no set is held for the guild; a held frozen or fenced set dispatches
+ * them); file-routed guilds pass them through, and so do events whose guild comes
+ * from a Guild payload (guildCreate, guildDelete and the like), which only the tier gate reads.
  */
 export async function gateEventDispatch(eventName: string, args: any[], replay: () => void): Promise<boolean> {
   if (eventName === 'clientReady') {
     await awaitDataStartupBarrier();
     return true;
   }
-  const guildId = extractGuildId(args);
+  const guildId = eventGuildId(args);
   if (!guildId) return true;
-  if (bootStatus.state === 'refused') {
-    // Unresolvable backend configuration: guild-scoped dispatch stays closed.
-    const first = args[0];
-    if (first && typeof first.isRepliable === 'function') {
-      await politeReject(first, "This bot's data storage is currently unavailable; please contact the server operator.");
-    }
-    return false;
-  }
+  const first = args[0];
+  if (first && typeof first.isRepliable === 'function') return (await holdInteraction(first, guildId)) === 'admit';
+  // Unresolvable backend configuration: guild-scoped dispatch stays closed.
+  if (bootStatus.state === 'refused') return false;
   const readiness = getDataReadiness();
   if (!readiness || routeFor(guildId) === 'file') return true;
-  const first = args[0];
-  if (first && typeof first.isRepliable === 'function') {
-    if (await readiness.admitInteraction(guildId)) return true;
-    await politeReject(first);
-    return false;
-  }
   return readiness.admitEvent(guildId, replay);
 }
 
 /**
- * Synthetic-entry gate (console cmd invoke, webui panel IPC): same wait as an
- * interaction, but the caller renders its own error instead of a Discord reply.
+ * The operator data route's gate (ipcDataHandler): the interaction wait, with the route's own texts. Panel actions
+ * and the console invoke hold through admitGuildAction.
  */
 export async function awaitGuildDataReady(guildId: string): Promise<boolean> {
   if (bootStatus.state === 'refused') return false;
@@ -995,15 +1111,14 @@ export function dataUnavailableMessage(causeKey: DataUnavailableCause): string {
     : noticeText('outageNotice.databaseUnreachable', "The bot's database is currently unreachable, so your change was not saved. Please try again later or contact support.");
 }
 
-async function politeReject(interaction: any, content?: string): Promise<void> {
+async function politeReject(interaction: any, content: string): Promise<void> {
   try {
     if (typeof interaction.isAutocomplete === 'function' && interaction.isAutocomplete()) {
       if (typeof interaction.respond === 'function') await interaction.respond([]).catch(() => { /* expired */ });
       return;
     }
     if (interaction.isRepliable() && !interaction.replied && !interaction.deferred) {
-      const text = content ?? noticeText('outageNotice.dataLoading', "This server's data is still loading, try again in a moment.");
-      await interaction.reply({ content: text, flags: MessageFlags.Ephemeral }).catch(() => { /* expired or already handled */ });
+      await interaction.reply({ content, flags: MessageFlags.Ephemeral }).catch(() => { /* expired or already handled */ });
     }
   } catch { /* the gate must never throw into dispatch */ }
 }

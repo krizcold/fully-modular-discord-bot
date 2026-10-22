@@ -54,7 +54,7 @@ import type { FileTicket } from './dataBackends/fileBackend';
 import { sweepGraveyardRows, PostgresBackend } from './dataBackends/postgresBackend';
 import type { DataBackend, FenceToken } from './dataBackends/backend';
 import { loadCredentials } from '../../../utils/envLoader';
-import { currentLedger, recordRefusal, recordTicket } from './dataBackends/writeLedger';
+import { currentSince, recordRefusal, recordTicket } from './dataBackends/writeLedger';
 import { firstSeqOf, noteScopeRefusal, noteScopeTicket, pendingFor, saveMark, stampOf, type SaveMark } from './dataBackends/scopeRecord';
 
 export { listGlobalDataFiles, saveMark };
@@ -195,6 +195,11 @@ export function drainForExit(boundMs: number): Promise<void> {
   return exitDrain;
 }
 
+/** Whether the exit drain has closed the facade: every write from now on is refused as node-stopping. */
+export function isClosedForExit(): boolean {
+  return closedForExit;
+}
+
 /**
  * Flush every queued op for one guild (migration drain primitive).
  */
@@ -300,9 +305,10 @@ const worstSave = (answers: SaveOutcome[]): SaveOutcome =>
  * For a module that handles its own save outcomes (dataContract 2 in module.json): 'ok' only once every write the
  * facade accepted for this scope (a guild id, or 'global') after since is held by the store and none was refused;
  * otherwise the worst true answer: 'refused' for a refused write (or 'unavailable' once its document was rewritten
- * whole, which may carry the change), then confirmWrite's answers. since defaults to the opening of the interaction,
- * panel action or console invoke in scope, and outside every one of them to 0 (every write since the process
- * started): a timer takes saveMark() before its writes and passes it. A since that is not a mark of this run (a
+ * whole, which may carry the change), then confirmWrite's answers. since defaults to the start of the handler's run
+ * for the interaction, panel action or console invoke in scope (for an interaction the dispatch gate held, its
+ * admission; for a listener it never held, the interaction's opening), and outside every one of them to 0 (every
+ * write since the process started): a timer takes saveMark() before its writes and passes it. A since that is not a mark of this run (a
  * number, or a mark kept from before a restart) answers 'unavailable'. It answers for every writer of the scope, not
  * the caller alone. category narrows file writes and refusals to that module's folder; a guild served from the
  * database answers for its whole working set, so another module's slower write can make it 'pending'. Raw atomic
@@ -311,7 +317,7 @@ const worstSave = (answers: SaveOutcome[]): SaveOutcome =>
  * whose later writes the successor keeps (a cautious answer, as for a carry that landed).
  */
 export async function confirmSaved(scope: string, options: { since?: SaveMark; deadlineMs?: number; category?: string } = {}): Promise<SaveOutcome> {
-  const mark = options.since ?? currentLedger()?.openedMark;
+  const mark = options.since ?? currentSince();
   const since = mark === undefined ? 0 : stampOf(mark);
   if (since === null) return 'unavailable';
   const deadlineMs = options.deadlineMs ?? CONFIRM_SAVED_MS;

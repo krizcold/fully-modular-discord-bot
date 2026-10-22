@@ -14,7 +14,7 @@ import { setupFleetIPCHandlers } from './utils/ipcFleetHandler';
 import { getMetricsCollector } from './utils/metrics/metricsCollector';
 import { startSamplers, stopSamplers } from './utils/metrics/samplers';
 import { drainForExit, sweepGraveyard, DataBackendUnavailableError } from './utils/dataManager';
-import { initDataBackendLayer, awaitDataStartupBarrier, gateEventDispatch, dataUnavailableMessage } from './utils/dataBackends/boot';
+import { initDataBackendLayer, awaitDataStartupBarrier, dispatchGated, dataUnavailableMessage } from './utils/dataBackends/boot';
 import { getWorkingSet } from './utils/dataBackends/workingSet';
 import { setupReloadIPCHandlers } from './utils/ipcReloadHandler';
 import { setupToggleIPCHandlers, applyAllDisabledStatesOnBoot } from './utils/ipcToggleHandler';
@@ -25,7 +25,7 @@ import { startModuleAutoUpdater } from './utils/moduleAutoUpdater';
 import { loadCredentials } from '../../utils/envLoader';
 import { initFleet, relaxFleetSyncPosture } from './fleet/bootstrap';
 import { getIngestService } from './ingest/ingestService';
-import { installReplyGate, sweepLateWrites } from './utils/dataBackends/replyGate';
+import { installReplyGate } from './utils/dataBackends/replyGate';
 import { ModuleLoader } from './utils/moduleLoader';
 import { getModuleRegistry } from './utils/moduleRegistry';
 import { getModuleEventManager } from './utils/moduleEventManager';
@@ -365,14 +365,15 @@ async function loadEventHandlers(client: Client) {
       }
     };
 
-    client.on(eventName, async (...args) => {
-      // Data-ready gate: file-routed guilds pass through; clientReady holds
-      // behind the startup barrier; unready postgres-routed guilds get a
-      // polite ephemeral reject (interactions) or ordered replay (events).
-      if (!(await gateEventDispatch(eventName, args, () => void dispatchOrdered(...args)))) return;
-      await dispatchOrdered(...args);
-      if (eventName === 'interactionCreate') void sweepLateWrites(args[0]);
-    });
+    // The dispatch gate (boot.ts dispatchGated): clientReady waits for the
+    // startup barrier; an interaction is held and, refused, told why in one
+    // ephemeral reply (an autocomplete gets an empty list); an event for a
+    // guild still loading here replays in order; one for a guild this node
+    // neither leases nor still holds a set for, or on a refused data layer,
+    // is dropped; one whose set is still held here (frozen or fenced) runs,
+    // its writes refused; an event that carries only a Guild passes; an
+    // interaction is swept once its dispatch ends.
+    client.on(eventName, (...args) => dispatchGated(eventName, args, dispatchOrdered));
   }
 }
 

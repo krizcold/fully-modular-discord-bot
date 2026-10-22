@@ -507,9 +507,11 @@ describe('the limits', () => {
 });
 
 describe('the dispatcher', () => {
-  it('sweeps each interaction once its internal dispatch ends, without waiting on the sweep', () => {
+  // clientInitializer.ts runs main() at import, so its one listener line is pinned by text; the mutation gate's sandbox
+  // instruments the file, so the pin is skipped there. dispatchGated's rows (r1j2DispatchGated.test.ts) hold the
+  // behaviour: the gate, the dispatch from the admission, and the sweep the listener does not wait on.
+  it.skipIf(process.env.__STRYKER_ACTIVE_MUTANT__ !== undefined)('hands every internal event to dispatchGated', () => {
     const source = fs.readFileSync(path.resolve(__dirname, '../../src/bot/internalSetup/clientInitializer.ts'), 'utf-8');
-    expect(source).toContain("      await dispatchOrdered(...args);\n      if (eventName === 'interactionCreate') void sweepLateWrites(args[0]);\n");
-    expect(source).toMatch(/import \{ installReplyGate, sweepLateWrites \} from '\.\/utils\/dataBackends\/replyGate';/);
+    expect(source).toContain('    client.on(eventName, (...args) => dispatchGated(eventName, args, dispatchOrdered));\n');
   });
 });

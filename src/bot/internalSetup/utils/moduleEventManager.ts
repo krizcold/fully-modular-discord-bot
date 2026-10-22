@@ -19,7 +19,7 @@
 import { Client } from 'discord.js';
 import { getMetricsCollector } from './metrics/metricsCollector';
 import { instrument } from './metrics/instrument';
-import { gateEventDispatch, extractGuildId } from './dataBackends/boot';
+import { gateEventDispatch, eventGuildId, extractGuildId, runAsAdmitted } from './dataBackends/boot';
 
 interface TrackedListener {
   eventName: string;
@@ -67,11 +67,16 @@ class ModuleEventManager {
         // self-gate inside the handler.
         if (this.shouldSkipEvent(moduleName, args)) return;
 
-        // Data-ready gate (postgres-routed guilds only): clientReady holds
-        // behind the startup barrier, unready-guild events buffer for replay.
+        // The dispatch gate (boot.ts): clientReady waits for the startup
+        // barrier; an interaction is held and, refused, told why; an event
+        // for a guild still loading here replays in order; one for a guild
+        // this node neither leases nor still holds a set for, or on a
+        // refused data layer, is dropped; one whose set is still held here
+        // (frozen or fenced) runs, its writes refused; an event that carries
+        // only a Guild passes.
         if (!(await gateEventDispatch(eventName, args, () => void wrappedHandler(...args)))) return;
 
-        await instrument('event', extractGuildId(args), moduleName, eventName, () => handler(this.client!, ...args));
+        await runAsAdmitted(args, () => instrument('event', eventGuildId(args), moduleName, eventName, () => handler(this.client!, ...args)));
       } catch (error) {
         console.error(`[ModuleLoader] Error in ${moduleName} ${eventName} handler:`, error);
       }
@@ -202,6 +207,7 @@ class ModuleEventManager {
     const hasFeatureGate = Array.isArray(tr.gatedFeatures) && tr.gatedFeatures.length > 0;
     if (hasCommandGate || hasFeatureGate) return false;
 
+    // extractGuildId on purpose: a Guild payload counts for the tier.
     const guildId = extractGuildId(args);
     if (!guildId) return false;
 

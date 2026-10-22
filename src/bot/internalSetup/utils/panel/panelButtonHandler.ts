@@ -9,6 +9,7 @@ import {
 import { getPersistentPanel, updatePersistentPanelState, isActiveInstance } from './persistentPanelStorage';
 import { createTitledContainer, createText, V2Colors } from './v2';
 import { parseButtonCustomId } from './panelCustomIds';
+import { tellLateForm, withAutoDefer } from './panelAutoDefer';
 
 /**
  * Navigation context storage
@@ -248,32 +249,11 @@ async function handleButtonFromButtonHandler(
   };
 
   try {
-    // Race between handler and auto-defer timer
-    // We can't defer immediately because modals must be shown as initial response
-    // But we also can't wait too long or the interaction expires (3s limit)
-    let handlerCompleted = false;
-    let response: PanelResponse | null = null;
-
-    const handlerPromise = handleButtonInteraction(context, buttonId).then(r => {
-      handlerCompleted = true;
-      response = r;
-      return r;
-    });
-
-    // Auto-defer after 2.5 seconds if handler hasn't completed
-    const autoDeferPromise = new Promise<'timeout'>((resolve) => {
-      setTimeout(() => resolve('timeout'), 2500);
-    });
-
-    const raceResult = await Promise.race([handlerPromise, autoDeferPromise]);
-
-    if (raceResult === 'timeout' && !handlerCompleted) {
-      // Handler is still running, defer now to prevent timeout
-      if (!interaction.deferred && !interaction.replied) {
-        await interaction.deferUpdate();
-      }
-      // Wait for handler to complete
-      response = await handlerPromise;
+    // A modal must be the first response, so the handler races the auto-defer instead of deferring at once.
+    const { response, expired } = await withAutoDefer<PanelResponse | null>(interaction, handleButtonInteraction(context, buttonId));
+    if (expired) {
+      console.warn(`[PanelButtonHandler] ${customId} acknowledged too late; the action ran`);
+      return;
     }
 
     // Check if response is a modal (has modal property)
@@ -282,11 +262,10 @@ async function handleButtonFromButtonHandler(
       if (!interaction.deferred && !interaction.replied) {
         await interaction.showModal(response.modal as any);
         console.log(`[PanelButtonHandler] Modal shown for button: ${customId}`);
-        return;
       } else {
-        // Already deferred, can't show modal - log warning and continue
-        console.warn(`[PanelButtonHandler] Cannot show modal after deferring for: ${customId}`);
+        await tellLateForm(interaction, 'PanelButtonHandler');
       }
+      return;
     }
 
     // For non-modal responses, defer if not already done

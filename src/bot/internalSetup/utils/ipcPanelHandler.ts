@@ -2,7 +2,7 @@
 
 import { extractModuleNameFromPanel, getPanelManager } from './panelManager';
 import { getConfigProperty } from './configManager';
-import { awaitGuildDataReady } from './dataBackends/boot';
+import { admitGuildAction, ENTRY_WAIT_MS, gateCauseText } from './dataBackends/boot';
 import { runSealed } from './dataBackends/writeLedger';
 import { truthText, verdictOf } from './dataBackends/replyGate';
 import { broadcastWebUIPanelUpdate } from './panel/panelWebUIAdapter';
@@ -151,9 +151,15 @@ function panelModule(panelManager: any, panelId: unknown): string | null {
 /**
  * A panel action from the web UI or the CLI (BT-4). Its writes are recorded in its own ledger, sealed once it answers,
  * and the verdict over them is taken first, on every exit: the answer claims success, and the live update goes out,
- * only when every write landed and none was refused; otherwise the answer is the truth.
+ * only when every write landed and none was refused; otherwise the answer is the truth. A guild that cannot take
+ * writes holds the action first (R1-J2), before its ledger opens, so its writes and its confirmSaved start at
+ * admission.
  */
-export function runPanelAction(type: string, data: any, panelManager: any): Promise<any> {
+export async function runPanelAction(type: string, data: any, panelManager: any): Promise<any> {
+  if (PANEL_ACTIONS.has(type) && data?.guildId) {
+    const held = await admitGuildAction(String(data.guildId), performance.now() + ENTRY_WAIT_MS);
+    if (held.cause !== 'admit') return { success: false, error: gateCauseText(held.cause) };
+  }
   return runSealed('panel', null, panelModule(panelManager, data?.panelId), async ledger => {
     let response: any;
     try {
@@ -176,11 +182,6 @@ export function runPanelAction(type: string, data: any, panelManager: any): Prom
  * Handle IPC message and return response
  */
 async function handleIPCMessage(type: string, data: any, panelManager: any): Promise<any> {
-  // Synthetic-entry data gate: webui-driven panel actions read/write guild
-  // data without passing the Discord dispatch gate, so wait here the same way.
-  if (PANEL_ACTIONS.has(type) && data?.guildId && !(await awaitGuildDataReady(String(data.guildId)))) {
-    return { success: false, error: "This server's data is still loading; try again in a moment" };
-  }
   switch (type) {
     case 'panel:list':
       return {

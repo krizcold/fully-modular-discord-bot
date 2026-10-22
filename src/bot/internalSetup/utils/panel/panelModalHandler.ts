@@ -6,6 +6,7 @@ import { PanelContext, PanelResponse } from '../../../types/panelTypes';
 import { DISCORD_EPHEMERAL_FLAG } from '../../../constants';
 import { getNavigationContext, storeNavigationContext, detectAccessMethodFromMessage } from './panelButtonHandler';
 import { parseModalCustomId } from './panelCustomIds';
+import { withAutoDefer } from './panelAutoDefer';
 
 /**
  * Register the panel modal handler with the Discord bot
@@ -80,7 +81,11 @@ async function handleModalFromModalHandler(
   };
 
   try {
-    const response = await handleModalInteraction(context, modalId);
+    const { response, expired } = await withAutoDefer(interaction, handleModalInteraction(context, modalId));
+    if (expired) {
+      console.warn(`[PanelModalHandler] ${interaction.customId} acknowledged too late; the action ran`);
+      return;
+    }
 
     if (response) {
       // If modal came from a button (has message), update the original message

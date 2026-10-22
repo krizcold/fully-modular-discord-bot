@@ -11,7 +11,7 @@ import { getPanelManager } from './panelManager';
 import { buildConsoleInteraction } from './consoleInteraction';
 import { getFleetState } from '../fleet/state';
 import { guildIdToShardId } from '../fleet/placement';
-import { awaitGuildDataReady } from './dataBackends/boot';
+import { admitGuildAction, ENTRY_WAIT_MS, gateConsoleText } from './dataBackends/boot';
 import { runSealed } from './dataBackends/writeLedger';
 import { truthText, verdictOf } from './dataBackends/replyGate';
 
@@ -60,8 +60,10 @@ export async function handleInvoke(data: InvokePayload): Promise<Record<string, 
     }
   }
 
-  if (guildId && !(await awaitGuildDataReady(guildId))) {
-    return { success: false, error: `guild ${guildId}'s data is still loading; try again in a moment` };
+  if (guildId) {
+    // Held before its ledger opens (R1-J2), so the command's writes and its confirmSaved start at admission.
+    const held = await admitGuildAction(guildId, performance.now() + ENTRY_WAIT_MS);
+    if (held.cause !== 'admit') return { success: false, error: gateConsoleText(held.cause, guildId) };
   }
 
   const userId = data.userId ? String(data.userId) : null;

@@ -532,6 +532,11 @@ stored), not once it is stored. A reply from a command, button or modal handler 
 are stored, or is replaced with a short message saying a write was refused or is not confirmed stored. A module that
 words these outcomes itself declares `"dataContract": 2` in its module.json and awaits `confirmSaved(guildId)` (or
 `confirmSaved('global')`) before it says "saved"; a refused write still replaces its reply with the bot's own message.
+The bot does not acknowledge such a module's command, button or modal interactions (only a module panel's button, menu
+or form is acknowledged, by 2.5 s after it was sent if nothing has answered it), and one can reach its handler up to about
+2 s after it was sent (held while the server's data loads or moves, or while this bot node does not serve it), so the
+module defers (`deferReply` or `deferUpdate`) before it awaits `confirmSaved`, or Discord shows "This interaction
+failed" after 3 s.
 From a timer or event, take `saveMark()` before the writes and pass it as `{ since }`.
 
 ### Creating Commands

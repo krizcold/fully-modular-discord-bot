@@ -7,6 +7,7 @@ import { DISCORD_EPHEMERAL_FLAG } from '../../../constants';
 import { getNavigationContext, storeNavigationContext, detectAccessMethodFromMessage } from './panelButtonHandler';
 import { isActiveInstance } from './persistentPanelStorage';
 import { parseDropdownCustomId } from './panelCustomIds';
+import { tellLateForm, withAutoDefer } from './panelAutoDefer';
 
 /**
  * Register the panel dropdown handler with the Discord bot
@@ -115,13 +116,21 @@ async function handleDropdownFromDropdownHandler(
   const values = extractSelectValues(interaction);
 
   try {
-    const response = await handleDropdownInteraction(context, values, dropdownId);
+    const { response, expired } = await withAutoDefer(interaction, handleDropdownInteraction(context, values, dropdownId));
+    if (expired) {
+      console.warn(`[PanelDropdownHandler] ${customId} acknowledged too late; the action ran`);
+      return;
+    }
 
     // Check if response is a modal (has modal property)
     if (response && 'modal' in response && response.modal) {
-      // Show modal directly - no update needed
-      await interaction.showModal(response.modal as any);
-      console.log(`[PanelDropdownHandler] Modal shown for dropdown: ${customId}`);
+      // Show modal directly - only works if we haven't deferred yet
+      if (!interaction.deferred && !interaction.replied) {
+        await interaction.showModal(response.modal as any);
+        console.log(`[PanelDropdownHandler] Modal shown for dropdown: ${customId}`);
+      } else {
+        await tellLateForm(interaction, 'PanelDropdownHandler');
+      }
       return;
     }
 

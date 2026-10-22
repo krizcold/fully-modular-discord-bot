@@ -11,7 +11,7 @@ const HYDRATION_FANOUT = 4;
 const CATALOG_REFRESH_MS = 60_000;
 const HYDRATE_RETRY_BASE_MS = 1000;
 const HYDRATE_RETRY_CAP_MS = 30_000;
-// Interactions wait inline inside Discord's 3 s ack window, then fail politely.
+// The operator data route's wait for a guild's set (Discord interactions hold in boot.ts).
 const INTERACTION_WAIT_MS = 2500;
 const EVENT_BUFFER_CAP = 256;
 // Decline-lease deadline: unhydrated guilds + unhealthy backend past this
@@ -58,6 +58,8 @@ export class DataReadinessDriver {
   private catalogTimer: NodeJS.Timeout;
   private readonly buffers = new Map<string, Array<() => void>>();
   private bufferDrops = 0;
+  // When each guild's last claim here was deposed (performance.now()); a hold counts only one made since it began.
+  private readonly deposedAt = new Map<string, number>();
   private initialResolved = false;
   private resolveInitial: (() => void) | null = null;
   private readonly initialHydration = new Promise<void>(resolve => { this.resolveInitial = resolve; });
@@ -147,8 +149,8 @@ export class DataReadinessDriver {
   }
 
   /**
-   * Gate for interactions: wait briefly for the guild's working set, never
-   * acknowledge on the handler's behalf. False = caller must politely reject.
+   * The operator data route's gate (boot.ts awaitGuildDataReady): wait briefly
+   * for the guild's working set. False = the route refuses.
    */
   async admitInteraction(guildId: string): Promise<boolean> {
     if (this.isReadyNow(guildId)) return true;
@@ -179,6 +181,27 @@ export class DataReadinessDriver {
     }
     queue.push(replay);
     return false;
+  }
+
+  /**
+   * The dispatch gate's reading of a guild on this driver (R1-J2; boot.ts reads the exit drain, a refused layer and
+   * the freeze first). since is the hold's start: 'moved' only for a claim deposed since then. A leased guild with no
+   * set gets one claim, as admitInteraction kicks today; a hold that finds it hydrating kicks none.
+   */
+  causeOf(guildId: string, since: number): 'admit' | 'moving' | 'moved' | 'not-served' | 'loading' {
+    const state = this.ws.stateOf(guildId);
+    if (state === 'ready') return 'admit';
+    if (state === 'fenced') return 'moved';
+    // Only the lease-only drain freezes a set while its shard is still leased here; one frozen as its shard left is
+    // not being moved.
+    if (state === 'frozen-retained') return this.isLeasedHere(guildId) ? 'moving' : 'not-served';
+    if (!this.isLeasedHere(guildId)) return 'not-served';
+    if (state === 'hydrating') return this.ws.freezesWhenReady(guildId) ? 'moving' : 'loading';
+    if (state === null) {
+      if ((this.deposedAt.get(guildId) ?? -Infinity) >= since) return 'moved';
+      this.hydrateOnDemand(guildId);
+    }
+    return 'loading';
   }
 
   getCounters(): { bufferDrops: number } {
@@ -263,6 +286,7 @@ export class DataReadinessDriver {
         // A 0-row claim: a newer owner holds this guild. A healthy node must
         // not sit on a lease it can never serve - decline immediately (fleet
         // wiring; masters and standalone log only).
+        this.deposedAt.set(guildId, performance.now());
         console.error(`[Data] Hydration claim for guild ${guildId} lost to a newer owner; not serving it`);
         declineHandler?.('deposed-at-hydration', [guildIdToShardId(guildId, this.shardCount || 1)]);
         return;

@@ -147,6 +147,8 @@ export function landed(ticket: LedgerTicket): boolean {
 interface Frame {
   ledger: WriteLedger;
   module: string | null;
+  /** confirmSaved's default since for a handler the dispatch gate held: its admission (R1-J2). */
+  since?: SaveMark;
 }
 
 const frames = new AsyncLocalStorage<Frame>();
@@ -209,6 +211,18 @@ export function currentLedger(): WriteLedger | undefined {
   return frames.getStore()?.ledger;
 }
 
+/** Runs fn as a handler the dispatch gate admitted at mark: its confirmSaved counts the writes after it. */
+export function runAdmitted<T>(mark: SaveMark, fn: () => T): T {
+  const frame = frames.getStore();
+  return frame ? frames.run({ ...frame, since: mark }, fn) : fn();
+}
+
+/** confirmSaved's default since here: the gate's admission of this handler, else its ledger's opening. */
+export function currentSince(): SaveMark | undefined {
+  const frame = frames.getStore();
+  return frame ? frame.since ?? frame.ledger.openedMark : undefined;
+}
+
 /** The module a write made here would be recorded under. */
 export function currentModule(): string | undefined {
   const frame = frames.getStore();
@@ -218,7 +232,7 @@ export function currentModule(): string | undefined {
 /** Runs fn with its writes tagged with this module, inside the ledger in scope; with none, just runs fn. */
 export function withModule<T>(module: string | null | undefined, fn: () => T): T {
   const frame = frames.getStore();
-  return frame ? frames.run({ ledger: frame.ledger, module: module ?? frame.module }, fn) : fn();
+  return frame ? frames.run({ ...frame, module: module ?? frame.module }, fn) : fn();
 }
 
 export function recordTicket(ticket: LedgerTicket, rewrites?: string): void {

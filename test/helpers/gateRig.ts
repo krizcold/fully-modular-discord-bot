@@ -57,7 +57,7 @@ export function rig() {
   const client = new Client({ intents: [] });
   installGatedInteractions(client);
   const wire: WireCall[] = [];
-  const control = { failNext: null as Error | null, onSend: null as ((call: WireCall) => void) | null };
+  const control = { failNext: null as Error | null, onSend: null as ((call: WireCall) => void) | null, delayMs: 0 };
   const rest = client.rest as unknown as Record<string, (route: string, options?: { body?: unknown }) => Promise<unknown>>;
   for (const method of ['post', 'patch', 'delete', 'get'] as const) {
     rest[method] = async (route, options = {}) => {
@@ -69,6 +69,8 @@ export function rig() {
       const call = { method, route, body: options.body };
       control.onSend?.(call);
       wire.push(call);
+      // A call on the wire for a while: discord.js sets its flags only once it returns.
+      if (control.delayMs > 0) await new Promise(resolve => setTimeout(resolve, control.delayMs));
       return route.includes('/callback') ? undefined : fakeMessage;
     };
   }

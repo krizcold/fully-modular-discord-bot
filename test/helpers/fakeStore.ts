@@ -10,6 +10,7 @@ import type {
 
 // BT-1's scripted DataBackend, shared by the write-ticket and write-ledger tests.
 export type FlushMode = 'commit' | 'unavailable' | 'read-only' | 'deposed';
+export type HydrateMode = 'ok' | 'deposed' | 'unavailable' | 'held';
 
 export interface FlushCall {
   token: FenceToken;
@@ -43,7 +44,11 @@ export class FakeStore implements DataBackend {
   readonly commits: FlushCall[] = [];
   flushesSent = 0;
   buildIndex: (token: FenceToken) => number = () => 0;
+  /** How a hydration answers (R1-J2): it reads the store, is deposed, is unavailable, or waits for releaseHydrations. */
+  hydrateMode: HydrateMode = 'ok';
+  hydrationsSent = 0;
   private readonly wire: Array<() => void> = [];
+  private readonly hydrations: Array<() => void> = [];
 
   start(): void { /* nothing to connect */ }
   async stop(): Promise<void> { /* nothing to close */ }
@@ -52,6 +57,10 @@ export class FakeStore implements DataBackend {
   }
 
   async hydrateGuild(guildId: string): Promise<HydrationOutcome> {
+    this.hydrationsSent += 1;
+    if (this.hydrateMode === 'held') await new Promise<void>(resolve => { this.hydrations.push(resolve); });
+    if (this.hydrateMode === 'deposed') return { ok: false, reason: 'deposed' };
+    if (this.hydrateMode === 'unavailable') return { ok: false, reason: 'unavailable' };
     const own = (row: string) => row.startsWith(`${guildId}|`);
     return {
       ok: true,
@@ -81,6 +90,12 @@ export class FakeStore implements DataBackend {
     }
     this.commits.push(call);
     return { ok: true };
+  }
+
+  /** Every held hydration answers by mode from now on. */
+  releaseHydrations(mode: Exclude<HydrateMode, 'held'> = 'ok'): void {
+    this.hydrateMode = mode;
+    for (const resume of this.hydrations.splice(0)) resume();
   }
 
   /** Every flush held on the wire comes off it. */
