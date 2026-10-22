@@ -253,6 +253,16 @@ const configEditorGlobalPanel: PanelOptions = {
   },
 };
 
+const MODAL_VALUE_LIMIT = 4000;
+
+function editableJson(mergedConfig: { properties: Record<string, any> }): string {
+  const editableConfig: Record<string, any> = {};
+  for (const [key, prop] of Object.entries(mergedConfig.properties)) {
+    editableConfig[key] = prop.value;
+  }
+  return JSON.stringify(editableConfig, null, 2);
+}
+
 function showError(message: string): PanelResponse {
   const container = new ContainerBuilder()
     .setAccentColor(V2Colors.danger)
@@ -394,7 +404,8 @@ async function showConfigView(
     }).join('\n');
 
     if (propList.length > 1500) {
-      propList = propList.substring(0, 1500) + '\n\n*... truncated - use Edit to see all*';
+      const hint = editableJson(mergedConfig).length > MODAL_VALUE_LIMIT ? 'use Download to see all' : 'use Edit to see all';
+      propList = propList.substring(0, 1500) + `\n\n*... truncated - ${hint}*`;
     }
 
     container.addTextDisplayComponents(
@@ -455,13 +466,10 @@ async function showEditModal(context: PanelContext, fileId: string): Promise<Pan
   const configFiles = discoverConfigFiles().filter(f => f.category === 'config');
   const metadata = configFiles.find(f => f.id === fileId);
   const mergedConfig = getMergedConfig(fileId, null);
-  const editableConfig: Record<string, any> = {};
-
-  for (const [key, prop] of Object.entries(mergedConfig.properties)) {
-    editableConfig[key] = (prop as any).value;
+  const formattedJson = editableJson(mergedConfig);
+  if (formattedJson.length > MODAL_VALUE_LIMIT) {
+    return showError(`This config is too large to edit here (${formattedJson.length} characters, the limit is ${MODAL_VALUE_LIMIT}); use Download and Upload JSON instead.`);
   }
-
-  const formattedJson = JSON.stringify(editableConfig, null, 2);
 
   const modal = new ModalBuilder()
     .setCustomId(`panel_config_editor_global_modal_edit_${fileId}`)
@@ -474,7 +482,7 @@ async function showEditModal(context: PanelContext, fileId: string): Promise<Pan
     .setValue(formattedJson)
     .setPlaceholder('{\n  "property": "value"\n}')
     .setRequired(true)
-    .setMaxLength(4000);
+    .setMaxLength(MODAL_VALUE_LIMIT);
 
   modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(jsonInput));
 
