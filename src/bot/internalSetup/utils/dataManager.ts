@@ -43,6 +43,8 @@ import {
   flushGuild as flushGuildFiles,
   pendingGuildFiles,
   filesPending,
+  flushFailing as flushFailingFiles,
+  readRawStrict,
   sweepGraveyard as sweepFileGraveyard,
   listGuilds as listGuildDirs,
   sizeOfGuildData as sizeOfGuildDir,
@@ -61,8 +63,10 @@ export { listGlobalDataFiles, saveMark };
 export type { SaveMark };
 export { DataBackendUnavailableError } from './dataBackends/workingSet';
 export {
+  flushFailing,
   getFlushFailures,
   readRaw,
+  readRawStrict,
   sizeOfGlobalData,
   listGraveyardEntries,
 } from './dataBackends/fileBackend';
@@ -362,15 +366,30 @@ export async function confirmSaved(scope: string, options: { since?: SaveMark; d
 
 /**
  * Raw JSON text of one guild doc from whichever backend routes the guild;
- * null = absent (or the working set is not ready).
+ * null = absent (or the working set is not ready). A file that exists but
+ * cannot be read throws.
  */
 export function readGuildDocRaw(guildId: string, module: string, filename: string): string | null {
   const ws = getWorkingSet();
   if (ws && routeFor(guildId) === 'postgres') {
     return ws.readDocRaw(guildId, module, filename);
   }
-  const filePath = getDataFilePath(filename, module ? { guildId, category: module } : { guildId });
-  return readRaw(filePath);
+  return readRawStrict(guildDocFilePath(guildId, module, filename));
+}
+
+function guildDocFilePath(guildId: string, module: string, filename: string): string {
+  return getDataFilePath(filename, module ? { guildId, category: module } : { guildId });
+}
+
+/**
+ * For a file-routed guild doc, whether this process still holds a queued
+ * write of it and whether that write's flush is failing; null when the
+ * working set serves the guild.
+ */
+export function guildDocFileQueue(guildId: string, module: string, filename: string): { pending: boolean; failing: boolean } | null {
+  if (getWorkingSet() && routeFor(guildId) === 'postgres') return null;
+  const filePath = guildDocFilePath(guildId, module, filename);
+  return { pending: filesPending([filePath]), failing: flushFailingFiles([filePath]) };
 }
 
 /**

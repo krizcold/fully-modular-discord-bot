@@ -281,6 +281,11 @@ export function filesPending(paths: string[]): boolean {
   return paths.some(p => pendingOps.has(p));
 }
 
+/** Some path's last flush failed and it waits for a retry. */
+export function flushFailing(paths: string[]): boolean {
+  return paths.some(p => retryAttempts.has(p));
+}
+
 /** Count of paths whose flush is currently failing (surfaced in diagnostics). */
 export function getFlushFailures(): number {
   return flushFailures;
@@ -440,6 +445,22 @@ export function readRaw(absPath: string): string | null {
     return fs.readFileSync(absPath, 'utf-8');
   } catch {
     return null;
+  }
+}
+
+/**
+ * readRaw for a caller that writes over what it read: null only for a file that
+ * is absent or whose delete is queued; one that exists but cannot be read throws.
+ */
+export function readRawStrict(absPath: string): string | null {
+  const pending = pendingOps.get(absPath);
+  if (pending?.op === 'delete') return null;
+  if (pending?.op === 'write') return pending.content;
+  try {
+    return fs.readFileSync(absPath, 'utf-8');
+  } catch (error: any) {
+    if (error?.code === 'ENOENT') return null;
+    throw error;
   }
 }
 

@@ -242,10 +242,12 @@ Guardrails: the secret filter on every read; `ssh <host> ...` with no flag befor
 - **The module route** (`smdb cmd invoke --repeat`) [A18]. It needs a command that saves through module saveData; none
   ships in the repo.
 - **What modules read.**
-  - For a Postgres guild, the app read path (`GET /api/config/data/get`) is the web UI's own SQL read of the store the
-    bot child reported. It is not the child's working set, which modules read through loadData, so stale data that a
-    node serves to modules from memory goes unseen.
-  - A read through the bot child exists only for file-routed guilds.
+  - The app read path (`GET /api/config/data/get`) reads through the serving bot child, queue first: for a Postgres
+    guild that is the child's working set, the one modules read through loadData. Only while the bot is down does it
+    fall back to the web UI's own SQL read of the store, and the answer then carries a notice; a copy taken then is
+    the database's, not what a node serves to modules.
+  - Reads that modules make through loadData are not taken one by one, so a value a module saw but never saved goes
+    unseen.
 - **File mode** [A19]. The operator route cannot create a new file in a file-routed guild (it needs the file to exist
   already), and the database listing does not apply there. A file-mode reader comes before B2 deploys.
 - **The control store's own rows.** `fleet` reads each node's in-memory view, not smdb_control.

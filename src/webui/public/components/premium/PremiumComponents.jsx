@@ -220,6 +220,11 @@ function TierEditorPanel({ tierId, tier, freeTier, onSave, onClose }) {
   // ── Free-tier baseline (capabilities offered on Free are the floor) ──
   const isFreeTier = tierId === 'free';
   const freeOverrides = (freeTier?.overrides) || {};
+  // Modules whose Free baseline the server could not read: a Free save writes
+  // whole modules over what this editor was never shown, and any other tier's
+  // save drops each override that matches the Free it was shown instead.
+  const baselineUnavailable = freeTier?.baselineUnavailable || {};
+  const unreadableModules = Object.keys(baselineUnavailable);
   function getFreeModOverrides(moduleName) { return freeOverrides[moduleName] || {}; }
   /** True iff Free disables this module entirely; its per-command/per-setting state is then moot. */
   function freeModuleIsDisabled(moduleName) {
@@ -451,6 +456,10 @@ function TierEditorPanel({ tierId, tier, freeTier, onSave, onClose }) {
 
   async function handleSave() {
     if (!isDirty) return;
+    if (unreadableModules.length > 0) {
+      showToast(`Nothing was saved: the Free baseline of ${unreadableModules.join(', ')} could not be read. Reload the page, then save.`, 'error');
+      return;
+    }
     setSaving(true);
     // Pre-prune: the dirty check treats per-key redundancies (a value that
     // matches Free's value or the schema default) as no-ops. Persist the same
@@ -1124,6 +1133,8 @@ function TierEditorPanel({ tierId, tier, freeTier, onSave, onClose }) {
 
   if (loading) return <div className="loading">Loading module data...</div>;
 
+  const saveBlocked = saving || !isDirty || unreadableModules.length > 0;
+
   return (
     <div>
       {/* Header */}
@@ -1132,11 +1143,11 @@ function TierEditorPanel({ tierId, tier, freeTier, onSave, onClose }) {
           background: '#40444b', color: '#ddd', border: 'none', padding: '6px 12px',
           borderRadius: '6px', cursor: 'pointer', fontSize: '0.85rem',
         }}>&larr; Back</button>
-        <button onClick={handleSave} disabled={saving || !isDirty} title={!isDirty && !saving ? 'No unsaved changes' : undefined} style={{
-          background: (saving || !isDirty) ? '#555' : 'linear-gradient(135deg, #3ba55d, #2d8049)',
+        <button onClick={handleSave} disabled={saveBlocked} title={unreadableModules.length > 0 ? 'Part of the Free baseline could not be read' : !isDirty && !saving ? 'No unsaved changes' : undefined} style={{
+          background: saveBlocked ? '#555' : 'linear-gradient(135deg, #3ba55d, #2d8049)',
           color: '#fff', border: 'none', padding: '8px 14px', borderRadius: '6px',
-          cursor: (saving || !isDirty) ? 'not-allowed' : 'pointer',
-          opacity: (saving || !isDirty) ? 0.55 : 1,
+          cursor: saveBlocked ? 'not-allowed' : 'pointer',
+          opacity: saveBlocked ? 0.55 : 1,
           fontWeight: 600, fontSize: '0.85rem',
           display: 'inline-flex', alignItems: 'center', gap: '8px',
         }}>
@@ -1158,6 +1169,25 @@ function TierEditorPanel({ tierId, tier, freeTier, onSave, onClose }) {
             </span>
           </div>
       </div>
+
+      {unreadableModules.length > 0 && (
+        <div style={{
+          background: 'rgba(237, 66, 69, 0.12)', border: '1px solid #ed4245', borderRadius: '8px',
+          padding: '10px 14px', marginBottom: '16px', fontSize: '0.8rem', color: '#f0a0a0', lineHeight: 1.5,
+        }}>
+          The Free baseline of {unreadableModules.join(', ')} could not be read
+          ({unreadableModules.map(name => `${name}: ${baselineUnavailable[name]}`).join('; ')}), so this view lacks it
+          and saving is off. Reload the page to try again.
+        </div>
+      )}
+      {isFreeTier && freeTier?.baselineNotice && (
+        <div style={{
+          background: 'rgba(250, 166, 26, 0.12)', border: '1px solid #FAA61A', borderRadius: '8px',
+          padding: '10px 14px', marginBottom: '16px', fontSize: '0.8rem', color: '#f5d08a', lineHeight: 1.5,
+        }}>
+          {freeTier.baselineNotice}
+        </div>
+      )}
 
       {/* Info */}
       <div style={{

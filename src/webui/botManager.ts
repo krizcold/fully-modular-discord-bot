@@ -22,6 +22,17 @@ const CRASH_STABLE_UPTIME_MS = 10 * 60_000;
 const CHILD_STOP_WAIT_MS = 40_000;
 const CHILD_KILL_WAIT_MS = 5_000;
 
+/**
+ * A read hop the child never answered (a timeout, its exit). A read changes
+ * nothing, so its answer never carries the write hops' 'may still complete'.
+ */
+function readNoAnswer(error: unknown): { ok: false; code: 'no-answer'; cause: 'timeout' | 'stopped' | 'failed'; error: string } {
+  const reason = error instanceof Error ? error.message : String(error);
+  const cause = reason.startsWith('IPC request timed out') ? 'timeout' : /^bot process (exited|was stopped) before replying$/.test(reason) ? 'stopped' : 'failed';
+  console.warn(`[BotManager] A data read got no answer from the bot (${cause === 'timeout' ? 'timed out' : reason})`);
+  return { ok: false, code: 'no-answer', cause, error: cause === 'failed' ? reason : 'the bot did not answer the read' };
+}
+
 export interface BotStartResult {
   success: boolean;
   reason?: string;
@@ -764,6 +775,18 @@ export class BotManager {
     }
   }
 
+  /** Queue-first read of one global file in the bot child (the root config, or 'module/file.json' under /data/global). */
+  async readGlobalData(payload: { root?: 'config'; rel?: string }): Promise<any> {
+    if (!this.isRunning() || !this.botProcess) {
+      return { ok: false, code: 'bot-down', error: 'bot process is not running' };
+    }
+    try {
+      return await this.sendIPCMessage('data:global-read', payload, 15000);
+    } catch (error) {
+      return readNoAnswer(error);
+    }
+  }
+
   /** Symmetric read hop; no filename = list the module's files. */
   async readGuildData(payload: { guildId: string; module: string; filename?: string; scope?: 'all' }): Promise<any> {
     if (!this.isRunning() || !this.botProcess) {
@@ -772,7 +795,7 @@ export class BotManager {
     try {
       return await this.sendIPCMessage('data:guild-read', payload, 15000);
     } catch (error) {
-      return { ok: false, code: 'io-error', error: error instanceof Error ? error.message : 'IPC failure' };
+      return readNoAnswer(error);
     }
   }
 

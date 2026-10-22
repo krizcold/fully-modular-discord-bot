@@ -354,9 +354,18 @@ export interface GlobalModuleConfig {
   disabledCommands: string[];
 }
 
+/** Where a module's global settings live, as 'module/settings.json' under /data/global. */
+export function globalSettingsRel(moduleName: string): string {
+  return `${moduleName}/${SETTINGS_FILENAME}`;
+}
+
 /** Load the full global config for a module. */
 export function loadGlobalModuleConfig(moduleName: string): GlobalModuleConfig {
-  const data = loadRawSettings(moduleName, null) as Record<string, any>;
+  return globalModuleConfigFrom(loadRawSettings(moduleName, null) as Record<string, any>);
+}
+
+/** A module's global config from the raw settings.json body (another process's read of it). */
+export function globalModuleConfigFrom(data: Record<string, any>): GlobalModuleConfig {
   const {
     [HARD_LIMITS_KEY]: hl,
     [MODULE_ENABLED_KEY]: me,
@@ -393,9 +402,11 @@ export function loadGlobalModuleConfig(moduleName: string): GlobalModuleConfig {
 export function saveGlobalModuleConfig(
   moduleName: string,
   partial: Partial<GlobalModuleConfig>,
+  base?: Record<string, any>,
 ): boolean {
   try {
-    const data = loadRawSettings(moduleName, null) as Record<string, any>;
+    // base: the raw body the caller read from the process that serves the file.
+    const data = base ? { ...base } : loadRawSettings(moduleName, null) as Record<string, any>;
 
     if (partial.values !== undefined) {
       for (const k of Object.keys(data)) {

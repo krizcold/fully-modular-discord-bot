@@ -1,5 +1,6 @@
 import * as path from 'path';
 import { getConfigFileMetadata } from './configDiscovery';
+import type { ConfigFileMetadata } from './configDiscovery';
 import { dataPath } from '../../../utils/dataRoot';
 import { loadData, readRaw, saveData, saveDataOutcome, writeRawAtomic } from './dataManager';
 import type { ModuleConfigSchema, ConfigFieldSchema } from '../../types/moduleTypes';
@@ -370,9 +371,25 @@ function buildDefaultsFromSchema(schema: ModuleConfigSchema): Record<string, any
  * @returns Merged config with all properties and their sources
  */
 export function getMergedConfig(fileId: string, guildId?: string | null): MergedConfig {
-  // Get file metadata (includes schema if available)
   const metadata = getConfigFileMetadata(fileId);
+  if (guildId) {
+    return mergeConfigValues(fileId, metadata, loadGuildConfig(fileId, guildId), loadGlobalConfig(fileId), true);
+  }
+  return mergeConfigValues(fileId, metadata, loadGlobalConfig(fileId), {}, false);
+}
 
+/**
+ * The merge half of getMergedConfig, over bodies the caller read (the web UI
+ * reads them from the process that serves them): savedValues are the target
+ * file's own, globalValues the global file's (guild-scoped merges only).
+ */
+export function mergeConfigValues(
+  fileId: string,
+  metadata: ConfigFileMetadata | null,
+  savedValues: Record<string, any>,
+  globalValues: Record<string, any>,
+  guildScoped: boolean
+): MergedConfig {
   const result: MergedConfig = {
     properties: {},
     metadata: {
@@ -394,20 +411,7 @@ export function getMergedConfig(fileId: string, guildId?: string | null): Merged
     }
   }
 
-  // 2. Load actual saved values
-  let savedValues: Record<string, any> = {};
-  let globalValues: Record<string, any> = {};
-
-  if (guildId) {
-    // Guild config: load both guild and global
-    savedValues = loadGuildConfig(fileId, guildId);
-    globalValues = loadGlobalConfig(fileId);
-  } else {
-    // Global config: just load global
-    savedValues = loadGlobalConfig(fileId);
-  }
-
-  // 3. Collect all unique keys from all sources
+  // 2. Collect all unique keys from all sources
   const allKeys = new Set<string>();
 
   // Add keys from schema
@@ -417,14 +421,14 @@ export function getMergedConfig(fileId: string, guildId?: string | null): Merged
   Object.keys(savedValues).forEach(k => allKeys.add(k));
 
   // Add keys from global values (for guild configs)
-  if (guildId) {
+  if (guildScoped) {
     Object.keys(globalValues).forEach(k => allKeys.add(k));
   }
 
-  // 4. Merge all values with source tracking
+  // 3. Merge all values with source tracking
   for (const key of allKeys) {
     const hasInFile = savedValues.hasOwnProperty(key);
-    const hasInGlobal = guildId && globalValues.hasOwnProperty(key);
+    const hasInGlobal = guildScoped && globalValues.hasOwnProperty(key);
     const hasInSchema = schemaDefaults.hasOwnProperty(key);
 
     let value: any;
