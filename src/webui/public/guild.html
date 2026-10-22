@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Discord Bot - Guild Management</title>
-  <link rel="stylesheet" href="/styles.css">
+  <link rel="stylesheet" href="/assets/styles.css">
   <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
   <!-- Pinned to Babel 7: Babel 8 defaults preset-react to the automatic runtime,
@@ -15,20 +15,20 @@
 <body>
   <div id="root"></div>
   <!-- Guild-specific utilities -->
-  <script src="/utils/guildApi.js"></script>
+  <script src="/assets/utils/guildApi.js"></script>
   <!-- Shared UI helpers (loaded before any component that uses them) -->
-  <script type="text/babel" src="/utils/uiHelpers.jsx"></script>
+  <script type="text/babel" src="/assets/utils/uiHelpers.jsx"></script>
   <!-- Shared Panel System Components -->
-  <script type="text/babel" src="/components/panels/PanelComponents.jsx"></script>
-  <script type="text/babel" src="/components/panels/PanelRenderer.jsx"></script>
-  <script type="text/babel" src="/components/panels/PanelViewer.jsx"></script>
-  <script type="text/babel" src="/components/panels/PanelList.jsx"></script>
+  <script type="text/babel" src="/assets/components/panels/PanelComponents.jsx"></script>
+  <script type="text/babel" src="/assets/components/panels/PanelRenderer.jsx"></script>
+  <script type="text/babel" src="/assets/components/panels/PanelViewer.jsx"></script>
+  <script type="text/babel" src="/assets/components/panels/PanelList.jsx"></script>
   <!-- Guild-specific components -->
-  <script type="text/babel" src="/components/guild/OAuthLogin.jsx"></script>
-  <script type="text/babel" src="/components/guild/GuildSelector.jsx"></script>
-  <script type="text/babel" src="/components/guild/GuildPanelsPanel.jsx"></script>
-  <script type="text/babel" src="/components/guild/GuildSubscriptionPanel.jsx"></script>
+  <script type="text/babel" src="/assets/components/guild/OAuthLogin.jsx"></script>
+  <script type="text/babel" src="/assets/components/guild/GuildSelector.jsx"></script>
+  <script type="text/babel" src="/assets/components/guild/GuildPanelsPanel.jsx"></script>
+  <script type="text/babel" src="/assets/components/guild/GuildSubscriptionPanel.jsx"></script>
   <!-- Guild App -->
-  <script type="text/babel" src="/guildApp.jsx"></script>
+  <script type="text/babel" src="/assets/guildApp.jsx"></script>
 </body>
 </html>

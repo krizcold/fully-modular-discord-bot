@@ -25,8 +25,11 @@ services:
       BACKEND_HOST: "fullymodulardiscordbotapp"
       BACKEND_PORT: "8080"
       LISTEN_PORT: "80"
-      ALLOWED_EXTENSIONS: "js,jsx,css,png,ico,svg,jpg,jpeg,gif,woff,woff2,ttf,eot"
-      ALLOWED_PATHS: "/guild,/auth"  # Discord OAuth + Guild member Web-UI stay public (their own auth)
+      # Without the admin login: the member page (/guild, with its own Discord login at /auth) and its files
+      # under /assets/. The bot refuses a raw path holding an encoded slash, backslash, "?", "#", unreserved or
+      # control character, a literal backslash or "#", a doubled slash or a dot segment, and its admin catch-all
+      # serves the admin page only at a plain path.
+      ALLOWED_PATHS: "/guild,/auth,/assets"
       TZ: $TZ
     volumes:
       # Persists AppShield sessions across restarts/updates (SESSIONS_FILE default
