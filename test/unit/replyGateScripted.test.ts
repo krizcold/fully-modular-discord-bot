@@ -26,6 +26,7 @@ vi.mock('../../src/bot/internalSetup/utils/dataBackends/fileBackend', async impo
 });
 
 import { deleteRawAtomic, saveData, writeRawAtomic } from '../../src/bot/internalSetup/utils/dataManager';
+import { flushAll as flushFiles } from '../../src/bot/internalSetup/utils/dataBackends/fileBackend';
 import { setRouteOverride } from '../../src/bot/internalSetup/utils/dataBackends/routeResolver';
 import { getWorkingSet } from '../../src/bot/internalSetup/utils/dataBackends/workingSet';
 import { ACK_MS, answerWrites, truthText } from '../../src/bot/internalSetup/utils/dataBackends/replyGate';
@@ -137,27 +138,32 @@ describe('answerWrites on a command past the deadline', () => {
 describe('the raw paths name their documents by file', () => {
   it('a refused raw write is not answered for by another file, and is made unconfirmable by a rewrite or delete of its own', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-raw-'));
-    const [a, b, c] = ['a.json', 'b.json', 'c.json'].map(name => path.join(dir, name));
-    fs.writeFileSync(c, '{}');
-    const { wire, emit } = rig();
-    await emit(rawCommand('s4'), async i => {
-      script.refuseOnce.add(a);
-      expect(writeRawAtomic(a, '{}')).toBe(false);
-      expect(writeRawAtomic(b, '{}')).toBe(true);
-      await i.reply({ content: 'Saved!' });
-    });
-    await emit(rawCommand('s5'), async i => {
-      script.refuseOnce.add(a);
-      expect(writeRawAtomic(a, '{}')).toBe(false);
-      expect(writeRawAtomic(a, '{"v":2}')).toBe(true);
-      await i.reply({ content: 'Saved!' });
-    });
-    await emit(rawCommand('s6'), async i => {
-      script.refuseOnce.add(c);
-      expect(writeRawAtomic(c, '{"v":2}')).toBe(false);
-      expect(deleteRawAtomic(c)).toBe(true);
-      await i.reply({ content: 'Deleted!' });
-    });
-    expect(wire.map(textOf)).toEqual([truthText('io', true), truthText('unavailable', true), truthText('unavailable', true)]);
+    try {
+      const [a, b, c] = ['a.json', 'b.json', 'c.json'].map(name => path.join(dir, name));
+      fs.writeFileSync(c, '{}');
+      const { wire, emit } = rig();
+      await emit(rawCommand('s4'), async i => {
+        script.refuseOnce.add(a);
+        expect(writeRawAtomic(a, '{}')).toBe(false);
+        expect(writeRawAtomic(b, '{}')).toBe(true);
+        await i.reply({ content: 'Saved!' });
+      });
+      await emit(rawCommand('s5'), async i => {
+        script.refuseOnce.add(a);
+        expect(writeRawAtomic(a, '{}')).toBe(false);
+        expect(writeRawAtomic(a, '{"v":2}')).toBe(true);
+        await i.reply({ content: 'Saved!' });
+      });
+      await emit(rawCommand('s6'), async i => {
+        script.refuseOnce.add(c);
+        expect(writeRawAtomic(c, '{"v":2}')).toBe(false);
+        expect(deleteRawAtomic(c)).toBe(true);
+        await i.reply({ content: 'Deleted!' });
+      });
+      expect(wire.map(textOf)).toEqual([truthText('io', true), truthText('unavailable', true), truthText('unavailable', true)]);
+    } finally {
+      await flushFiles();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
