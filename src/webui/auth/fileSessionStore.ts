@@ -6,7 +6,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { Store, SessionData } from 'express-session';
 import { dataPath } from '../../utils/dataRoot';
-import { writeRawAtomic, readRaw, deleteRawAtomic, DataBackendUnavailableError } from '../../bot/internalSetup/utils/dataManager';
+import { writeRawAtomic, readRaw, deleteRawAtomic, rawTicket, confirmWrite, DataBackendUnavailableError } from '../../bot/internalSetup/utils/dataManager';
 
 // Path-traversal guard: a sid that fails this never touches the filesystem.
 const SID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
@@ -18,6 +18,19 @@ const DEFAULT_SWEEP_INTERVAL_MS = 10 * 60 * 1000;
 // window so a concurrent request's save cannot replace the pending tombstone
 // (pendingOps is last-op-wins by path).
 const DESTROYED_GRACE_MS = 30 * 1000;
+const DEFAULT_CONFIRM_MS = 8000;
+
+export type SessionSaveOutcome = 'ok' | 'pending' | 'refused';
+const SAVE_OUTCOME = Symbol('sessionSaveOutcome');
+
+/** What the store knows of the last save of this session object: undefined when another store saved it. */
+export function sessionSaveOutcome(session: object): SessionSaveOutcome | undefined {
+  return (session as { [SAVE_OUTCOME]?: SessionSaveOutcome })[SAVE_OUTCOME];
+}
+
+function markSave(session: object, outcome: SessionSaveOutcome): void {
+  (session as { [SAVE_OUTCOME]?: SessionSaveOutcome })[SAVE_OUTCOME] = outcome;
+}
 
 interface SessionFileRecord {
   v: 1;
@@ -32,6 +45,7 @@ export interface FileSessionStoreOptions {
   touchWriteThresholdMs?: number;
   sweepIntervalMs?: number;
   defaultTtlMs?: number;
+  confirmMs?: number;
 }
 
 export class FileSessionStore extends Store {
@@ -41,6 +55,7 @@ export class FileSessionStore extends Store {
   private readonly dir: string;
   private readonly touchWriteThresholdMs: number;
   private readonly defaultTtlMs: number;
+  private readonly confirmMs: number;
   private readonly destroyed = new Set<string>();
   private sweepTimer: NodeJS.Timeout | null = null;
 
@@ -49,6 +64,7 @@ export class FileSessionStore extends Store {
     this.dir = options.dir ?? dataPath('_sessions');
     this.touchWriteThresholdMs = options.touchWriteThresholdMs ?? DEFAULT_TOUCH_WRITE_THRESHOLD_MS;
     this.defaultTtlMs = options.defaultTtlMs ?? DEFAULT_TTL_MS;
+    this.confirmMs = options.confirmMs ?? DEFAULT_CONFIRM_MS;
     this.probeOk = this.probe();
     if (this.probeOk) {
       this.sweepTimer = setInterval(() => this.sweep(), options.sweepIntervalMs ?? DEFAULT_SWEEP_INTERVAL_MS);
@@ -103,9 +119,10 @@ export class FileSessionStore extends Store {
     try {
       writeRawAtomic(file, JSON.stringify(record));
     } catch (error) {
+      markSave(session, 'refused');
       return void callback?.(error);
     }
-    callback?.();
+    this.afterLanding(file, callback, outcome => markSave(session, outcome));
   }
 
   destroy(sid: string, callback?: (err?: any) => void): void {
@@ -119,7 +136,7 @@ export class FileSessionStore extends Store {
     this.destroyed.add(sid);
     const timer = setTimeout(() => this.destroyed.delete(sid), DESTROYED_GRACE_MS);
     timer.unref();
-    callback?.();
+    this.afterLanding(file, callback);
   }
 
   touch(sid: string, session: SessionData, callback?: (err?: any) => void): void {
@@ -147,12 +164,40 @@ export class FileSessionStore extends Store {
   }
 
   clear(callback?: (err?: any) => void): void {
-    for (const sid of this.listSids()) {
-      let refused: unknown;
-      this.destroy(sid, error => { refused = error; });
-      if (refused) return void callback?.(refused);
+    const sids = this.listSids();
+    let left = sids.length;
+    let failed: unknown;
+    if (left === 0) return void callback?.();
+    for (const sid of sids) {
+      this.destroy(sid, error => {
+        if (error && !failed) failed = error;
+        if (--left === 0) callback?.(failed);
+      });
     }
-    callback?.();
+  }
+
+  // Answers once the queued op is on disk, or still queued at the bound (served from the queue in this process;
+  // a restart before it lands only costs a fresh login). Only a dropped or refused op is an error.
+  private afterLanding(file: string, callback?: (err?: any) => void, note?: (outcome: SessionSaveOutcome) => void): void {
+    const ticket = rawTicket(file);
+    if (!ticket) {
+      note?.('ok');
+      return void callback?.();
+    }
+    confirmWrite(ticket, this.confirmMs).then(
+      outcome => {
+        if (outcome === 'ok' || outcome === 'pending' || outcome === 'held') {
+          note?.(outcome === 'ok' ? 'ok' : 'pending');
+          return void callback?.();
+        }
+        note?.('refused');
+        callback?.(new Error(`[FileSessionStore] Session file op not kept (${outcome})`));
+      },
+      error => {
+        note?.('refused');
+        callback?.(error);
+      },
+    );
   }
 
   private fileFor(sid: string): string | null {

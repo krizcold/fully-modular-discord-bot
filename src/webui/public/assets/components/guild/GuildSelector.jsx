@@ -6,6 +6,7 @@ function GuildSelector({ user, onGuildSelected, onLogout }) {
   const [guilds, setGuilds] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+  const [logoutError, setLogoutError] = useState(null);
 
   useEffect(() => {
     loadGuilds();
@@ -50,10 +51,16 @@ function GuildSelector({ user, onGuildSelected, onLogout }) {
 
   const handleLogout = async () => {
     try {
-      await guildApi.logout();
-      window.location.reload();
+      setLogoutError(null);
+      const result = await guildApi.logout();
+      if (result && result.success) {
+        window.location.reload();
+        return;
+      }
+      setLogoutError((result && result.error) || 'Logout could not be confirmed');
     } catch (err) {
       console.error('Logout error:', err);
+      setLogoutError('Logout could not be confirmed');
     }
   };
 
@@ -93,6 +100,7 @@ function GuildSelector({ user, onGuildSelected, onLogout }) {
         <p>{error}</p>
         <button onClick={loadGuilds}>Retry</button>
         <button onClick={handleLogout}>Logout</button>
+        {logoutError && <p className="error-message">{logoutError}</p>}
       </div>
     );
   }
@@ -108,6 +116,7 @@ function GuildSelector({ user, onGuildSelected, onLogout }) {
           <li>Ensure the bot is added to that server</li>
         </ul>
         <button onClick={handleLogout}>Logout</button>
+        {logoutError && <p className="error-message">{logoutError}</p>}
       </div>
     );
   }
@@ -133,6 +142,7 @@ function GuildSelector({ user, onGuildSelected, onLogout }) {
           </div>
         </div>
         <button onClick={handleLogout} className="logout-button">Logout</button>
+        {logoutError && <p className="error-message">{logoutError}</p>}
       </div>
 
       <div className="guild-selector-content">

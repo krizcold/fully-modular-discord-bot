@@ -635,6 +635,11 @@ export function deleteRawAtomic(absPath: string): boolean {
   return accepted;
 }
 
+/** The ticket for the raw op still queued on this path, taken right after writeRawAtomic or deleteRawAtomic; none once it landed. */
+export function rawTicket(absPath: string): FileTicket | undefined {
+  return getPending(absPath) ? fileTicket(absPath) : undefined;
+}
+
 // ============================================================================
 // LOAD / SAVE
 // ============================================================================
