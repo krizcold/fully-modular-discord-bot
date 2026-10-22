@@ -42,7 +42,7 @@ function BotCredentialsSection({ credentials, onChange, instructions, setupStatu
             type="password"
             value={credentials.DISCORD_TOKEN || ''}
             onChange={e => onChange('DISCORD_TOKEN', e.target.value)}
-            placeholder={isManaged ? 'Owned by the Bot Manager' : 'MTIzNDU2Nzg5MDEyMzQ1Njc4OQ.XXXXXX.XXX...'}
+            placeholder={isManaged ? 'Owned by the Bot Manager' : secretPlaceholder(credStatus.DISCORD_TOKEN?.set, 'MTIzNDU2Nzg5MDEyMzQ1Njc4OQ.XXXXXX.XXX...')}
             disabled={isManaged}
           />
         </div>

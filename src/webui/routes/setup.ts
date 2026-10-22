@@ -7,40 +7,72 @@
 // editable here. Guild Web-UI credentials are editable in both modes and
 // trigger a hot-reload of the OAuth strategy without a restart.
 
+import * as fs from 'fs';
+import * as dotenv from 'dotenv';
 import { Router, Request, Response } from 'express';
 import {
   loadCredentials,
   saveCredentials,
   getCredentialStatus,
   BotCredentials,
-  getDeploymentMode
+  getDeploymentMode,
+  isContainerPinned
 } from '../../utils/envLoader';
+import { dataPath } from '../../utils/dataRoot';
 import { reconfigureOAuth } from '../auth/oauthConfig';
-import { isBackupMaster, isStandalone as isStandaloneFleet, resolveNodeRole } from '../../bot/internalSetup/fleet/nodeIdentity';
+import { isBackupMaster, isStandalone as isStandaloneFleet, readRoleOverride, resolveEnvRole, resolveNodeRole } from '../../bot/internalSetup/fleet/nodeIdentity';
 import { isCoWorkerNode } from '../middleware/fleetGate';
 
 /** The only fields a co-worker edits locally; everything else mirrors the master via sync. */
 const CONNECTION_FIELDS = ['DISCORD_TOKEN', 'MASTER_URLS', 'CONTROL_SECRET', 'NODE_NAME', 'FLEET_SHARD_CAPACITY'] as const;
 
 /**
- * Non-secret standby fields where a blanked form field is an EXPLICIT clear
- * (a designation must be revocable from the UI). Every other connection
- * field keeps the historical blank-keeps-existing semantics.
+ * Non-secret connection fields where a blanked form field is an EXPLICIT
+ * clear: the key is removed and the node uses its default. A blank secret
+ * keeps the stored value.
  */
-const CLEARABLE_CONNECTION_FIELDS = new Set<string>(['MASTER_URLS']);
+const CLEARABLE_CONNECTION_FIELDS = new Set<string>(['MASTER_URLS', 'NODE_NAME', 'FLEET_SHARD_CAPACITY']);
+
+/** Keys whose value an answer never repeats (the secrets, and the IDs /status masks). */
+const MASKED_KEYS = new Set<string>([
+  'DISCORD_TOKEN', 'CONTROL_SECRET', 'DISCORD_CLIENT_SECRET', 'SESSION_SECRET', 'DATA_BACKEND_URL', 'CONTROL_STORE_URL',
+  'CLIENT_ID', 'GUILD_ID', 'DISCORD_CLIENT_ID',
+]);
+
+/** The keys stored in /data/.env itself, with their stored values; the container env is not in it. */
+function readStoredEnv(): Record<string, string> {
+  const file = dataPath('.env');
+  return fs.existsSync(file) ? dotenv.parse(fs.readFileSync(file)) : {};
+}
 
 /**
- * Fleet wiring the master-branch credentials save must PRESERVE verbatim: it
- * has no fleet form fields, but a promoted ex-co-worker's /data/.env carries
- * them, and the branch's rebuild-from-scratch save would otherwise silently
- * wipe CONTROL_SECRET/MASTER_URLS - leaving the node to boot as a STANDALONE
- * master claiming every shard on the shared token after its next restart.
+ * What a save writes: the file's own keys, plus every key whose value the
+ * save changed (removed when it cleared it). A value that only the container
+ * env supplied is never copied into the file.
  */
-const PRESERVED_FLEET_FIELDS = [
-  'BOT_NODE_ROLE', 'MASTER_URLS', 'CONTROL_SECRET', 'CONTROL_PORT', 'FLEET_PUBLIC_URL',
-  'NODE_NAME', 'PIN_TEST_GUILD_SHARD', 'FLEET_SHARD_COUNT', 'FLEET_SHARD_CAPACITY',
-  'TRANSFER_URL', 'TRANSFER_PORT',
-] as const;
+function fileAfterSave(stored: Record<string, string>, before: BotCredentials, after: BotCredentials): BotCredentials {
+  const out: BotCredentials = { ...stored };
+  for (const key of new Set([...Object.keys(before), ...Object.keys(after)])) {
+    if (before[key] === after[key]) continue;
+    if (after[key] === undefined) delete out[key]; else out[key] = after[key];
+  }
+  return out;
+}
+
+/**
+ * Changed or cleared keys the container env pins: the env wins over the
+ * file, so each keeps its env value whatever the file now says. Call after
+ * loadCredentials().
+ */
+function containerSetChanges(before: BotCredentials, after: BotCredentials): Array<{ field: string; message: string }> {
+  const out: Array<{ field: string; message: string }> = [];
+  for (const key of new Set([...Object.keys(before), ...Object.keys(after)])) {
+    if (before[key] === after[key] || !isContainerPinned(key)) continue;
+    const kept = MASKED_KEYS.has(key) ? 'its value' : process.env[key];
+    out.push({ field: key, message: `${key} is set by the container environment, so it keeps ${kept}` });
+  }
+  return out;
+}
 
 const OAUTH_FIELDS = ['ENABLE_GUILD_WEBUI', 'DISCORD_CLIENT_ID', 'DISCORD_CLIENT_SECRET', 'OAUTH_CALLBACK_URL'] as const;
 
@@ -106,6 +138,7 @@ export function createSetupRoutes(): Router {
       };
 
       const nodeRole = resolveNodeRole();
+      const roleOverride = readRoleOverride();
       res.json({
         success: true,
         // Main credentials are managed by Bot Manager
@@ -129,6 +162,14 @@ export function createSetupRoutes(): Router {
             // Effective designation: BOT_NODE_ROLE=backup-master. The page
             // edits the ROLE.
             BACKUP_MASTER: isBackupMaster() ? '1' : '',
+            // The role env alone gives, the raw setting and the override that
+            // wins over both: a demoted master runs as a co-worker by the
+            // override while its env still says master.
+            ENV_ROLE: resolveEnvRole(),
+            BOT_NODE_ROLE: credentials.BOT_NODE_ROLE || '',
+            ROLE_OVERRIDE: roleOverride
+              ? { role: roleOverride.role, setBy: roleOverride.setBy, setAt: roleOverride.setAt }
+              : null,
             // This node's own advertised endpoint (empty when the platform
             // never injected one): a backup master shows it so its URL can be
             // added to every worker's candidates.
@@ -161,6 +202,7 @@ export function createSetupRoutes(): Router {
       // preserved (mirrors the managed-mode ignore precedent below).
       if (isCoWorkerNode()) {
         const existingCredentials = loadCredentials();
+        const stored = readStoredEnv();
         const credentials: BotCredentials = { ...existingCredentials };
         for (const field of CONNECTION_FIELDS) {
           const value = req.body?.[field];
@@ -180,26 +222,33 @@ export function createSetupRoutes(): Router {
         // worker roles only (promotion to master goes through the Fleet tab's
         // Promote button).
         const requestedRole = String(req.body?.BOT_NODE_ROLE ?? '').trim().toLowerCase();
-        if (requestedRole === 'co-worker' || requestedRole === 'backup-master') {
+        if ((requestedRole === 'co-worker' || requestedRole === 'backup-master')
+            && requestedRole !== (existingCredentials.BOT_NODE_ROLE || '').trim().toLowerCase()) {
           credentials.BOT_NODE_ROLE = requestedRole;
         }
         // MASTER_URLS never implies a role (it is carried by masters too), so
         // pin the explicit role this page exclusively serves: without it, a
         // MASTER_URLS-only node would silently boot as a master (absent
-        // means master).
+        // means master). Not when the role override, not the env, is what
+        // makes this node a co-worker: its env role stays master.
+        const overrideMakesCoWorker = readRoleOverride() !== null && resolveEnvRole() === 'master';
         if ((credentials.MASTER_URLS || '').trim() !== ''
-            && (credentials.BOT_NODE_ROLE || '').trim() === '') {
+            && (credentials.BOT_NODE_ROLE || '').trim() === ''
+            && !overrideMakesCoWorker) {
           credentials.BOT_NODE_ROLE = 'co-worker';
         }
-        const saveResult = saveCredentials(credentials);
+        const saveResult = saveCredentials(fileAfterSave(stored, existingCredentials, credentials));
         if (!saveResult.success) {
           res.status(500).json({ success: false, error: saveResult.error || 'Failed to save credentials' });
           return;
         }
-        const reloadActions = computeReloadActions(existingCredentials, credentials);
+        const containerSet = containerSetChanges(existingCredentials, credentials);
+        const reloadActions = computeReloadActions(existingCredentials, credentials)
+          .filter(c => !containerSet.some(p => p.field === c.field));
         res.json({
           success: true,
           message: 'Connection settings saved successfully',
+          containerSet,
           credentials: getCredentialStatus(credentials),
           reload: {
             changes: reloadActions,
@@ -231,6 +280,7 @@ export function createSetupRoutes(): Router {
 
       // Load existing credentials (includes Bot Manager-set values)
       const existingCredentials = loadCredentials();
+      const stored = readStoredEnv();
 
       // Validate MAIN_GUILD_ID if provided (optional)
       if (MAIN_GUILD_ID && MAIN_GUILD_ID.trim() !== '') {
@@ -334,10 +384,12 @@ export function createSetupRoutes(): Router {
         }
       }
 
-      // Build credentials object. Managed mode: main credentials are preserved
-      // (owned by Bot Manager). Standalone: provided non-empty values replace
-      // existing ones; blank fields keep the stored value.
+      // The merged view after the save; only the keys it changed reach the
+      // file (fileAfterSave). Managed mode: main credentials are preserved (owned by Bot Manager).
+      // Standalone: provided non-empty values replace existing ones; blank
+      // fields keep the stored value.
       const credentials: BotCredentials = {
+        ...existingCredentials,
         DISCORD_TOKEN: isStandalone && DISCORD_TOKEN && DISCORD_TOKEN.trim() !== ''
           ? DISCORD_TOKEN.trim()
           : existingCredentials.DISCORD_TOKEN,
@@ -378,31 +430,10 @@ export function createSetupRoutes(): Router {
         ...(isStandalone && CONTROL_STORE_URL && CONTROL_STORE_URL.trim() !== ''
           ? { CONTROL_STORE_URL: CONTROL_STORE_URL.trim() }
           : existingCredentials.CONTROL_STORE_URL && { CONTROL_STORE_URL: existingCredentials.CONTROL_STORE_URL }),
-        // Fleet wiring: never edited here, always preserved (see
-        // PRESERVED_FLEET_FIELDS - a promoted ex-co-worker's file holds it).
-        ...Object.fromEntries(
-          PRESERVED_FLEET_FIELDS
-            .filter(k => existingCredentials[k] !== undefined && existingCredentials[k] !== '')
-            .map(k => [k, existingCredentials[k]])),
-        // Payment provider credentials (Stripe/PayPal/LS/Patreon/Discord/...)
-        // are persisted via the per-provider modal route in appstore.ts,
-        // not here. Existing values are preserved naturally because we
-        // don't touch them.
-        ...Object.fromEntries(
-          Object.entries(existingCredentials)
-            .filter(([k, v]) => v !== undefined
-              && (k.startsWith('STRIPE_')
-                || k.startsWith('LEMONSQUEEZY_')
-                || k.startsWith('PAYPAL_')
-                || k.startsWith('PATREON_')
-                || k === 'DISCORD_APPLICATION_ID'
-                || k === 'BOOST_TARGET_GUILD_ID'
-                || k === 'WEBUI_BASE_URL'))
-        ),
       };
 
       // Save credentials
-      const saveResult = saveCredentials(credentials);
+      const saveResult = saveCredentials(fileAfterSave(stored, existingCredentials, credentials));
 
       if (!saveResult.success) {
         res.status(500).json({
@@ -412,8 +443,11 @@ export function createSetupRoutes(): Router {
         return;
       }
 
-      // Classify what changed so the client can surface per-field feedback.
-      const reloadActions = computeReloadActions(existingCredentials, credentials);
+      // Classify what changed so the client can surface per-field feedback; a
+      // container-pinned key keeps its env value, so it changed nothing.
+      const containerSet = containerSetChanges(existingCredentials, credentials);
+      const reloadActions = computeReloadActions(existingCredentials, credentials)
+        .filter(c => !containerSet.some(p => p.field === c.field));
 
       // Hot-reload Guild Web-UI OAuth when any OAuth-related field changed.
       const oauthChanged = reloadActions.some(c => c.action === 'web-ui-remount');
@@ -431,6 +465,7 @@ export function createSetupRoutes(): Router {
       res.json({
         success: true,
         message: 'Settings saved successfully',
+        containerSet,
         credentials: status,
         // Per-field reload actions so the UI can show what happened:
         //   hot-inplace       : applied live, no further action needed

@@ -1,6 +1,6 @@
 // Credentials Panel Component (Refactored)
 function CredentialsPanel({ setupStatus, isBotRunning, onUpdate, onUpdateAndRestart }) {
-  const { useState, useEffect, useMemo } = React;
+  const { useState, useEffect, useMemo, useRef } = React;
 
   const EMPTY_CREDS = {
     DISCORD_TOKEN: '',
@@ -20,6 +20,10 @@ function CredentialsPanel({ setupStatus, isBotRunning, onUpdate, onUpdateAndRest
   const [credentials, setCredentials] = useState({ ...EMPTY_CREDS });
   // Baseline = values that are currently persisted, used to detect dirty state.
   const [baseline, setBaseline] = useState({ ...EMPTY_CREDS });
+  // A write-only field is posted only while typed since the last successful save.
+  const [typed, setTyped] = useState({});
+  const latest = useRef(credentials);
+  latest.current = credentials;
 
   const [loading, setLoading] = useState(false);
 
@@ -176,22 +180,23 @@ function CredentialsPanel({ setupStatus, isBotRunning, onUpdate, onUpdateAndRest
         MAIN_GUILD_ID: mainGuildId,
         DATA_BACKEND: creds.DATA_BACKEND?.value || 'file',
       };
-      setCredentials(prev => ({ ...loaded, ...dirtyOverlay(prev, baseline) }));
+      setCredentials(prev => ({ ...loaded, ...dirtyOverlay(prev, baseline, typed) }));
       setBaseline(loaded);
     }
   }, [setupStatus]);
 
   /** Keep any user-typed edits when a new baseline arrives (avoid wiping in-flight edits). */
-  function dirtyOverlay(current, previousBaseline) {
+  function dirtyOverlay(current, previousBaseline, typedSecrets) {
     const out = {};
     for (const key of Object.keys(current)) {
-      if (current[key] !== previousBaseline[key]) out[key] = current[key];
+      if (WRITE_ONLY_FIELDS.includes(key) ? typedSecrets[key] : current[key] !== previousBaseline[key]) out[key] = current[key];
     }
     return out;
   }
 
   // Handle field changes
   const handleFieldChange = (field, value) => {
+    if (WRITE_ONLY_FIELDS.includes(field)) setTyped(prev => ({ ...prev, [field]: true }));
     setCredentials(prev => ({
       ...prev,
       [field]: value
@@ -205,7 +210,7 @@ function CredentialsPanel({ setupStatus, isBotRunning, onUpdate, onUpdateAndRest
     for (let i = 0; i < 32; i++) {
       secret += chars.charAt(Math.floor(Math.random() * chars.length));
     }
-    setCredentials({...credentials, SESSION_SECRET: secret});
+    handleFieldChange('SESSION_SECRET', secret);
     showToast('Session secret generated! Remember to save it.', 'success');
   }
 
@@ -218,13 +223,21 @@ function CredentialsPanel({ setupStatus, isBotRunning, onUpdate, onUpdateAndRest
     const wasGuildWebUIEnabled = baseline.ENABLE_GUILD_WEBUI === true;
 
     try {
-      const res = await api.post('/setup/credentials', credentials);
+      const body = Object.fromEntries(dirtyFields.map(key => [key, credentials[key]]));
+      const res = await api.post('/setup/credentials', body);
       if (res.success) {
+        // Only what this save sent is spent: a value typed during the request stays.
+        const spent = Object.keys(body).filter(key => WRITE_ONLY_FIELDS.includes(key) && latest.current[key] === body[key]);
+        setTyped(prev => Object.fromEntries(Object.entries(prev).filter(([key]) => !spent.includes(key))));
+        setCredentials(prev => ({ ...prev, ...Object.fromEntries(spent.filter(key => prev[key] === body[key]).map(key => [key, ''])) }));
         const reload = res.reload || {};
-        const changes = Array.isArray(reload.changes) ? reload.changes : [];
+        const containerSet = Array.isArray(res.containerSet) ? res.containerSet : [];
+        const changes = (Array.isArray(reload.changes) ? reload.changes : [])
+          .filter(c => !containerSet.some(p => p.field === c.field));
+        for (const item of containerSet) showToast(item.message, 'warning', { sticky: true });
 
         if (!changes.length) {
-          showToast('No changes to save.', 'info');
+          if (!containerSet.length) showToast('No changes to save.', 'info');
         } else {
           showToast('Settings saved.', 'success');
           if (reload.oauthReconfigured) {
@@ -265,25 +278,24 @@ function CredentialsPanel({ setupStatus, isBotRunning, onUpdate, onUpdateAndRest
   const isManaged = setupStatus?.deploymentMode === 'managed';
 
   // ── Dirty-state tracking ──
-  // Secrets (DISCORD_CLIENT_SECRET, SESSION_SECRET, DISCORD_TOKEN) never come
-  // back from the server for security, so we treat any non-empty value as an
-  // intended change. Non-secret fields diff against the baseline.
-  const SECRET_FIELDS = ['DISCORD_TOKEN', 'DISCORD_CLIENT_SECRET', 'SESSION_SECRET', 'DATA_BACKEND_URL', 'CONTROL_STORE_URL'];
+  // Write-only fields (secrets, and IDs /status never returns) load blank, so
+  // one is a change only while typed since the last save and not blank. The
+  // other fields diff against the baseline.
+  const WRITE_ONLY_FIELDS = ['DISCORD_TOKEN', 'CLIENT_ID', 'GUILD_ID', 'DISCORD_CLIENT_ID', 'DISCORD_CLIENT_SECRET', 'SESSION_SECRET', 'DATA_BACKEND_URL', 'CONTROL_STORE_URL'];
   const DATA_STORAGE_FIELDS = ['DATA_BACKEND', 'DATA_BACKEND_URL', 'CONTROL_STORE_URL'];
   const BOT_RESTART_FIELDS = ['DISCORD_TOKEN', 'CLIENT_ID', 'GUILD_ID', ...DATA_STORAGE_FIELDS];
   const GUILD_WEBUI_FIELDS = ['ENABLE_GUILD_WEBUI', 'DISCORD_CLIENT_ID', 'DISCORD_CLIENT_SECRET', 'OAUTH_CALLBACK_URL', 'SESSION_SECRET'];
 
   function fieldDirty(key) {
-    if (SECRET_FIELDS.includes(key)) {
-      // Secret is dirty only when user typed something
-      return !!credentials[key] && credentials[key].trim() !== '';
+    if (WRITE_ONLY_FIELDS.includes(key)) {
+      return !!typed[key] && !!credentials[key] && credentials[key].trim() !== '';
     }
     return credentials[key] !== baseline[key];
   }
 
   const dirtyFields = useMemo(
     () => Object.keys(credentials).filter(fieldDirty),
-    [credentials, baseline]
+    [credentials, baseline, typed]
   );
   const hasAnyChanges = dirtyFields.length > 0;
   const botCredsDirty = dirtyFields.some(f => BOT_RESTART_FIELDS.includes(f));
@@ -384,7 +396,7 @@ function CredentialsPanel({ setupStatus, isBotRunning, onUpdate, onUpdateAndRest
                       type="password"
                       value={credentials.DATA_BACKEND_URL || ''}
                       onChange={e => handleFieldChange('DATA_BACKEND_URL', e.target.value)}
-                      placeholder="postgresql://user:password@host:5432/db"
+                      placeholder={secretPlaceholder(setupStatus?.credentials?.DATA_BACKEND_URL?.set, 'postgresql://user:password@host:5432/db')}
                     />
                     <small>Leave blank to keep the saved value (it is never shown here)</small>
                   </div>
@@ -399,7 +411,7 @@ function CredentialsPanel({ setupStatus, isBotRunning, onUpdate, onUpdateAndRest
                     type="password"
                     value={credentials.CONTROL_STORE_URL || ''}
                     onChange={e => handleFieldChange('CONTROL_STORE_URL', e.target.value)}
-                    placeholder="postgresql://user:password@host:5432/control"
+                    placeholder={secretPlaceholder(setupStatus?.credentials?.CONTROL_STORE_URL?.set, 'postgresql://user:password@host:5432/control')}
                   />
                   <small>
                     Optional separate Postgres for the fleet control plane; blank = same database.
