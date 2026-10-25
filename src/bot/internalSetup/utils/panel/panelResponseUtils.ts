@@ -122,6 +122,10 @@ export function injectReturnButtonIfNeeded(response: PanelResponse, context: Pan
   // Only inject return button if accessed via panel systems (not direct commands)
   const shouldInjectButton = ['system_panel', 'guild_panel', 'web_ui'].includes(context.accessMethod);
   if (!shouldInjectButton) {
+    if (isV2Response(response)) {
+      const total = countV2Components(response.components || []);
+      if (total > DISCORD_MAX_V2_COMPONENTS) return overBudgetNotice(total, context, response);
+    }
     return response;
   }
 
@@ -132,7 +136,9 @@ export function injectReturnButtonIfNeeded(response: PanelResponse, context: Pan
 
   // Check for V2 response
   if (isV2Response(response)) {
-    return injectReturnButtonV2(response, context);
+    const injected = injectReturnButtonV2(response, context);
+    const total = countV2Components(injected.components || []);
+    return total > DISCORD_MAX_V2_COMPONENTS ? overBudgetNotice(total, context, response) : injected;
   }
 
   // V1 logic (traditional embeds + ActionRows)
@@ -171,6 +177,37 @@ export function injectReturnButtonIfNeeded(response: PanelResponse, context: Pan
   }
 
   return response;
+}
+
+export const DISCORD_MAX_V2_COMPONENTS = 40;
+
+export function countV2Components(components: any[]): number {
+  const walk = (c: any): number => {
+    if (!c || typeof c !== 'object') return 0;
+    let n = typeof c.type === 'number' ? 1 : 0;
+    if (Array.isArray(c.components)) for (const x of c.components) n += walk(x);
+    if (c.accessory) n += walk(c.accessory);
+    return n;
+  };
+  return components.reduce((n, c) => n + walk(typeof c?.toJSON === 'function' ? c.toJSON() : c), 0);
+}
+
+function overBudgetNotice(total: number, context: PanelContext, original: PanelResponse): PanelResponse {
+  console.warn(`[PanelResponseUtils] Panel not shown: ${total} components, Discord allows ${DISCORD_MAX_V2_COMPONENTS}`);
+  const container = createTitledContainer('Panel too large', undefined, V2Colors.danger);
+  container.addTextDisplayComponents(createText(
+    `This panel has too many components to show (${total} of ${DISCORD_MAX_V2_COMPONENTS}). Any action you took still stands. Report this to the module's author.`
+  ));
+  const returnButton = createReturnButton(context);
+  const closeButton = createInjectedCloseButton(context);
+  if (returnButton || closeButton) {
+    container.addSeparatorComponents(createSeparator());
+    const navRow = new ActionRowBuilder<ButtonBuilder>();
+    if (returnButton) navRow.addComponents(returnButton);
+    if (closeButton) navRow.addComponents(closeButton);
+    container.addActionRowComponents(navRow);
+  }
+  return { ...original, ...createV2Response([container]) };
 }
 
 /**

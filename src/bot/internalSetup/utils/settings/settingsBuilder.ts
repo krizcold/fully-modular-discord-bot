@@ -36,12 +36,13 @@ import { buildSettingComponent, SettingComponentOptions } from './settingCompone
 import { evaluateConditions } from './settingsValidation';
 import { paginate, PAGINATION_DEFAULTS, PaginatedResult } from '../panel/paginationUtils';
 
-/** Max settings per page to stay under 40 component limit
- * Each setting = 3 components (Section + 1 TextDisplay + Button)
- * Fixed overhead = ~19 components
- * Budget: 40 - 19 = 21 / 3 = 7 settings max, use 6 for safety
+/** Max settings per page under Discord's 40 component limit.
+ * Each setting = 3 components (Section + TextDisplay + Button). The worst page
+ * (section select, dirty line, injected return row) has 22 fixed components on
+ * the guild panel and 23 on the System panel, whose action row has a 5th button.
  */
 const SETTINGS_PER_PAGE = 6;
+const SYSTEM_SETTINGS_PER_PAGE = 5;
 
 export interface SettingsPanelOptions {
   schema: SettingsSchema;
@@ -155,7 +156,7 @@ export function buildSettingsPanel(options: SettingsPanelOptions): ContainerBuil
   // Button format: panel_{panelId}_btn_nav_{moduleName}_{category}_{prev|next}_{page}
   const navPrefix = `panel_${panelId}_btn_nav_${moduleName}_${category}`;
   const paginated = paginate(visibleSettings, currentPage, {
-    itemsPerPage: SETTINGS_PER_PAGE,
+    itemsPerPage: isSystemPanel ? SYSTEM_SETTINGS_PER_PAGE : SETTINGS_PER_PAGE,
     buttonPrefix: navPrefix,
   });
 
