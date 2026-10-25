@@ -35,7 +35,7 @@ export interface DataBootStatus {
 let bootStatus: DataBootStatus = { mode: 'file', state: 'file', banner: null, refusalReason: null };
 
 export function getDataBootStatus(): DataBootStatus {
-  return bootStatus;
+  return bootStatus.state === 'refused' ? bootStatus : { ...bootStatus, refusalReason: null };
 }
 
 /**
@@ -55,8 +55,8 @@ export function extractGuildId(args: any[]): string | null {
   return null;
 }
 
-function refuse(reason: string): void {
-  bootStatus = { ...bootStatus, state: 'refused', refusalReason: reason };
+function refuse(reason: string, mode: DataBackendKind = bootStatus.mode): void {
+  bootStatus = { ...bootStatus, mode, state: 'refused', refusalReason: reason };
   console.error(`[Data] REFUSING to serve: ${reason}`);
   console.error('[Data] Gates stay closed; fix DATA_BACKEND/DATA_BACKEND_URL in the web UI env editor or run the backend transformation');
 }
@@ -89,7 +89,7 @@ export function initDataBackendLayer(): void {
   }
   const url = (loadCredentials().DATA_BACKEND_URL || '').trim();
   if (!url) {
-    refuse('the live data backend is postgres but DATA_BACKEND_URL is not set');
+    refuse('the live data backend is postgres but DATA_BACKEND_URL is not set', 'postgres');
     return;
   }
   startPostgresRuntime(url);
@@ -475,10 +475,14 @@ export async function applyDeliveredBackend(
     writeFileMarker({ live: backend, storeId: null, flippedAt: Date.now(), transformationId: null });
     forceRouteDefault(null);
   }
+  if (bootStatus.banner && readFileMarker()?.live === backend) {
+    bootStatus = { ...bootStatus, banner: null };
+    console.log(`[Data] Transformation no longer required: the marker and the master's delivery both name ${backend}`);
+  }
 
   if (backend === 'postgres') {
     if (!url) {
-      refuse('the master delivered a postgres backend without a URL');
+      refuse('the master delivered a postgres backend without a URL', 'postgres');
       return { changed, recycled: false };
     }
     if (activeUrl === url && staleServing !== null) {
@@ -875,7 +879,7 @@ async function verifyIdentityLoop(url: string, driver: DataReadinessDriver): Pro
         // has not replayed the row, a store mid-restore): waited on like an
         // unreachable one, never refused.
         if (!verdict.pending) {
-          refuse(verdict.reason);
+          refuse(verdict.reason, 'postgres');
           return;
         }
       } else if (readFileMarker()?.storeId) {
