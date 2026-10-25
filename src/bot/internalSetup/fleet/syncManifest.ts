@@ -48,14 +48,32 @@ function toRelPosix(root: string, file: string): string {
   return path.relative(root, file).split(path.sep).join('/');
 }
 
+function isNotFound(error: unknown): boolean {
+  return (error as NodeJS.ErrnoException)?.code === 'ENOENT';
+}
+
+// A listing feeds the co-workers' deletions: only ENOENT is absence, any other read error throws.
+function readDirStrict(dir: string): fs.Dirent[] {
+  try {
+    return fs.readdirSync(dir, { withFileTypes: true });
+  } catch (error) {
+    if (isNotFound(error)) return [];
+    throw error;
+  }
+}
+
+function isFileStrict(file: string): boolean {
+  try {
+    return fs.statSync(file).isFile();
+  } catch (error) {
+    if (isNotFound(error)) return false;
+    throw error;
+  }
+}
+
 function walkFiles(dir: string, out: string[], skipDir?: (rel: string) => boolean, root?: string): void {
   const base = root ?? dir;
-  let entries: fs.Dirent[];
-  try {
-    entries = fs.readdirSync(dir, { withFileTypes: true });
-  } catch {
-    return;
-  }
+  const entries = readDirStrict(dir);
   for (const entry of entries) {
     const full = path.join(dir, entry.name);
     if (entry.isDirectory()) {
@@ -84,7 +102,7 @@ function scopeRelFiles(scope: SyncFileScope): string[] {
       // Development's root config lives outside DATA_ROOT (shared checkout): rel escapes and the scope stays empty.
       const rel = toRelPosix(DATA_ROOT, ROOT_CONFIG_PATH);
       if (rel.startsWith('..') || path.isAbsolute(rel)) return [];
-      return fs.existsSync(ROOT_CONFIG_PATH) ? [rel] : [];
+      return isFileStrict(ROOT_CONFIG_PATH) ? [rel] : [];
     }
     case 'appstore': {
       const files: string[] = [];
@@ -93,13 +111,10 @@ function scopeRelFiles(scope: SyncFileScope): string[] {
     }
     case 'settings': {
       const rels: string[] = [];
-      let dirs: fs.Dirent[] = [];
-      try {
-        dirs = fs.readdirSync(root, { withFileTypes: true });
-      } catch { /* no global dir yet */ }
+      const dirs = readDirStrict(root);
       for (const dir of dirs) {
         if (!dir.isDirectory() || dir.name === FLEET_DIR || dir.name === 'appstore') continue;
-        if (fs.existsSync(path.join(root, dir.name, SETTINGS_FILENAME))) {
+        if (isFileStrict(path.join(root, dir.name, SETTINGS_FILENAME))) {
           rels.push(`${dir.name}/${SETTINGS_FILENAME}`);
         }
       }
@@ -162,11 +177,15 @@ export function listScopeFiles(scope: SyncFileScope): SyncFileEntry[] {
     // deadlocking the boot gate. Filtering here keeps every site symmetric.
     if (!isPathInScope(scope, rel)) continue;
     const full = path.join(root, ...rel.split('/'));
+    let stat: fs.Stats;
     try {
-      const stat = fs.statSync(full);
-      if (!stat.isFile()) continue;
-      entries.push({ path: rel, size: stat.size, sha256: sha256File(full) });
-    } catch { /* raced deletion; the next reconcile pass converges */ }
+      stat = fs.statSync(full);
+    } catch (error) {
+      if (isNotFound(error)) continue;
+      throw error;
+    }
+    if (!stat.isFile()) continue;
+    entries.push({ path: rel, size: stat.size, sha256: sha256File(full) });
   }
   return entries.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
 }
@@ -197,15 +216,10 @@ export function resolveScopeFile(scope: 'module' | SyncFileScope, relPath: strin
 }
 
 export function listModuleDirs(): string[] {
-  const dir = getSourceModulesDir();
-  try {
-    return fs.readdirSync(dir, { withFileTypes: true })
-      .filter(d => d.isDirectory() && !d.name.endsWith('.sync-old'))
-      .map(d => d.name)
-      .sort();
-  } catch {
-    return [];
-  }
+  return readDirStrict(getSourceModulesDir())
+    .filter(d => d.isDirectory() && !d.name.endsWith('.sync-old'))
+    .map(d => d.name)
+    .sort();
 }
 
 /** File-set (relPath + size + sha256) of an arbitrary dir; empty when absent. */
