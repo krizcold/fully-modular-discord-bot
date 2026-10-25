@@ -186,6 +186,249 @@ const DEFAULT_INSTALLED_CONFIG: InstalledConfig = {
   modules: {}
 };
 
+// The web UI process and the bot child each hold an AppStoreManager over the same
+// files. Every write re-reads the file under this lock and changes only its own
+// record. The lock sits under cache/ so fleet sync never ships it.
+const LOCK_PATH = path.join(CACHE_DIR, '.store.lock');
+const TAKEOVER_PATH = `${LOCK_PATH}.takeover`;
+const UNREADABLE_DIR = path.join(CACHE_DIR, 'unreadable');
+const LOCK_WAIT_MS = 60_000;
+const LOCK_POLL_MS = 50;
+const LOCK_UNREADABLE_STALE_MS = 10_000;
+const TAKEOVER_STALE_MS = 5_000;
+const GIT_TIMEOUT_MS = 45_000;
+
+type FileState = 'read' | 'missing' | 'unreadable';
+
+let lockDepth = 0;
+
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+let bootId: string | null | undefined;
+
+/** Identifies one run of a process, so a pid reused after a restart is not taken for the old holder. */
+export const storeLockHolder = {
+  startOf(pid: number): string | null {
+    try {
+      if (bootId === undefined) {
+        try { bootId = fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf-8').trim(); } catch { bootId = null; }
+      }
+      const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf-8');
+      const starttime = stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19];
+      return starttime ? `${bootId ?? ''}:${starttime}` : null;
+    } catch {
+      return null;
+    }
+  }
+};
+
+function lockBusyError(): Error {
+  return new Error('Another App Store change is still running, so nothing was changed. Try again in a minute.');
+}
+
+/** The lock file's text when its holder is gone, 'missing' when there is no lock, or null when it is held. */
+function staleLockContent(): string | 'missing' | null {
+  let raw: string;
+  let mtimeMs: number;
+  try {
+    raw = fs.readFileSync(LOCK_PATH, 'utf-8');
+    mtimeMs = fs.statSync(LOCK_PATH).mtimeMs;
+  } catch (error: any) {
+    return error?.code === 'ENOENT' ? 'missing' : null;
+  }
+  let holder: any;
+  try {
+    holder = JSON.parse(raw);
+  } catch {
+    holder = undefined;
+  }
+  const pid = holder?.pid;
+  if (typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 0) {
+    return Date.now() - mtimeMs > LOCK_UNREADABLE_STALE_MS ? raw : null;
+  }
+  if (pid === process.pid) return raw;
+  try {
+    process.kill(pid, 0);
+  } catch (error: any) {
+    return error?.code === 'ESRCH' ? raw : null;
+  }
+  if (typeof holder.start === 'string') {
+    const start = storeLockHolder.startOf(pid);
+    if (start !== null && start !== holder.start) return raw;
+  }
+  return null;
+}
+
+/** Removes a stale lock only under a takeover guard, and only if it still holds the stale text seen. */
+function takeOverStaleLock(seen: string): void {
+  try {
+    fs.closeSync(fs.openSync(TAKEOVER_PATH, 'wx'));
+  } catch (error: any) {
+    if (error?.code !== 'EEXIST') throw error;
+    try {
+      if (Date.now() - fs.statSync(TAKEOVER_PATH).mtimeMs > TAKEOVER_STALE_MS) fs.unlinkSync(TAKEOVER_PATH);
+    } catch { /* its holder removed it */ }
+    return;
+  }
+  try {
+    if (staleLockContent() === seen) fs.unlinkSync(LOCK_PATH);
+  } catch { /* another process took it over first */ } finally {
+    try { fs.unlinkSync(TAKEOVER_PATH); } catch { /* already gone */ }
+  }
+}
+
+function tryAcquireStoreLock(): boolean {
+  if (lockDepth > 0) {
+    lockDepth++;
+    return true;
+  }
+  ensureDir(CACHE_DIR);
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const fd = fs.openSync(LOCK_PATH, 'wx');
+      try {
+        fs.writeSync(fd, JSON.stringify({ pid: process.pid, start: storeLockHolder.startOf(process.pid), at: Date.now() }));
+      } finally {
+        fs.closeSync(fd);
+      }
+      lockDepth = 1;
+      return true;
+    } catch (error: any) {
+      if (error?.code !== 'EEXIST') throw error;
+    }
+    const stale = staleLockContent();
+    if (stale === null) return false;
+    if (stale !== 'missing') takeOverStaleLock(stale);
+  }
+  return false;
+}
+
+/** For synchronous callers only; it blocks the event loop while it waits. */
+function acquireStoreLock(): void {
+  const deadline = Date.now() + LOCK_WAIT_MS;
+  while (!tryAcquireStoreLock()) {
+    if (Date.now() >= deadline) throw lockBusyError();
+    sleepSync(LOCK_POLL_MS);
+  }
+}
+
+/** Waits without blocking the event loop; the caller tries the lock again right after it resolves. */
+async function waitBeforeLockRetry(deadline: number): Promise<void> {
+  if (Date.now() >= deadline) throw lockBusyError();
+  await new Promise(resolve => setTimeout(resolve, LOCK_POLL_MS));
+}
+
+function releaseStoreLock(): void {
+  if (lockDepth === 0) return;
+  lockDepth--;
+  if (lockDepth > 0) return;
+  try {
+    const holder = JSON.parse(fs.readFileSync(LOCK_PATH, 'utf-8'));
+    if (holder?.pid === process.pid) fs.unlinkSync(LOCK_PATH);
+  } catch { /* already gone */ }
+}
+
+function fileStamp(file: string): string {
+  try {
+    const st = fs.statSync(file);
+    return `${st.mtimeMs}:${st.size}:${st.ino}`;
+  } catch (error: any) {
+    return error?.code === 'ENOENT' ? 'missing' : 'error';
+  }
+}
+
+function writeJsonAtomic(file: string, value: unknown): void {
+  ensureDir(path.dirname(file));
+  const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    const fd = fs.openSync(tmp, 'wx');
+    try {
+      fs.writeSync(fd, JSON.stringify(value, null, 2));
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    for (let attempt = 0; ; attempt++) {
+      try {
+        fs.renameSync(tmp, file);
+        break;
+      } catch (error) {
+        if (attempt >= 3) throw error;
+        sleepSync(25 * (attempt + 1));
+      }
+    }
+  } catch (error) {
+    try { fs.unlinkSync(tmp); } catch { /* never created */ }
+    throw error;
+  }
+  try {
+    const dirFd = fs.openSync(path.dirname(file), 'r');
+    try { fs.fsyncSync(dirFd); } finally { fs.closeSync(dirFd); }
+  } catch { /* directories cannot be fsynced on Windows */ }
+}
+
+function isReposConfig(value: any): value is ReposConfig {
+  return !!value && typeof value === 'object' && Array.isArray(value.repositories)
+    && value.repositories.every((r: any) => !!r && typeof r === 'object' && typeof r.id === 'string');
+}
+
+function isInstalledConfig(value: any): value is InstalledConfig {
+  return !!value && typeof value === 'object' && !!value.modules
+    && typeof value.modules === 'object' && !Array.isArray(value.modules);
+}
+
+function readJsonStrict<T>(file: string, valid: (value: any) => value is T): { state: FileState; value?: T; error?: string } {
+  let raw: string;
+  try {
+    raw = fs.readFileSync(file, 'utf-8');
+  } catch (error: any) {
+    if (error?.code === 'ENOENT') return { state: 'missing' };
+    return { state: 'unreadable', error: error?.message ?? String(error) };
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    if (!valid(parsed)) return { state: 'unreadable', error: 'unexpected shape' };
+    return { state: 'read', value: parsed };
+  } catch (error: any) {
+    return { state: 'unreadable', error: error?.message ?? String(error) };
+  }
+}
+
+function hashDirectory(dir: string): string | null {
+  const hash = crypto.createHash('sha256');
+  const walk = (current: string, rel: string): void => {
+    const entries = fs.readdirSync(current, { withFileTypes: true })
+      .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    for (const entry of entries) {
+      const relPath = rel ? `${rel}/${entry.name}` : entry.name;
+      const full = path.join(current, entry.name);
+      if (entry.isDirectory()) {
+        walk(full, relPath);
+      } else {
+        hash.update(`${relPath}\0`);
+        hash.update(fs.readFileSync(full));
+        hash.update('\0');
+      }
+    }
+  };
+  try {
+    walk(dir, '');
+    return hash.digest('hex');
+  } catch {
+    return null;
+  }
+}
+
+function readManifestVersion(moduleDir: string): string {
+  const manifest = JSON.parse(fs.readFileSync(path.join(moduleDir, 'module.json'), 'utf-8'));
+  if (typeof manifest?.version !== 'string' || !manifest.version) {
+    throw new Error(`module.json in ${path.basename(moduleDir)} has no version`);
+  }
+  return manifest.version;
+}
+
 // ============================================================================
 // VALIDATION HELPERS (prevent command injection)
 // ============================================================================
@@ -296,44 +539,141 @@ export class AppStoreManager {
   /** Tracks modules currently being updated to prevent concurrent updates */
   private updatesInProgress: Set<string> = new Set();
 
+  private reposState: FileState = 'missing';
+  private installedState: FileState = 'missing';
+  private reposStamp = '';
+  private installedStamp = '';
+  /** True while this instance holds the store lock and read the file under it. */
+  private reposFresh = false;
+  private installedFresh = false;
+  private asideStamps: Set<string> = new Set();
+
   constructor() {
-    this.reposConfig = { ...DEFAULT_REPOS_CONFIG };
-    this.installedConfig = { ...DEFAULT_INSTALLED_CONFIG };
+    this.reposConfig = structuredClone(DEFAULT_REPOS_CONFIG);
+    this.installedConfig = structuredClone(DEFAULT_INSTALLED_CONFIG);
     this.load();
   }
 
   /**
-   * Load configuration from disk
+   * Load configuration from disk. Only a missing file counts as empty; an
+   * unreadable one is copied aside and blocks every write until it reads again.
    */
   load(): void {
     try {
       ensureDir(APPSTORE_DIR);
       ensureDir(CREDENTIALS_DIR);
       ensureDir(CACHE_DIR);
-
-      // Load repos config
-      if (fs.existsSync(REPOS_CONFIG_PATH)) {
-        const content = fs.readFileSync(REPOS_CONFIG_PATH, 'utf-8');
-        this.reposConfig = JSON.parse(content);
-      } else {
-        this.saveRepos();
-      }
-
-      // Load installed config
-      if (fs.existsSync(INSTALLED_CONFIG_PATH)) {
-        const content = fs.readFileSync(INSTALLED_CONFIG_PATH, 'utf-8');
-        this.installedConfig = JSON.parse(content);
-      } else {
-        this.saveInstalled();
-      }
-
-      this.reconcileInstalledModules();
+      this.readRepos();
+      this.readInstalled();
+      this.locked(() => {
+        this.readRepos();
+        this.readInstalled();
+        if (this.reposState === 'missing') this.saveRepos();
+        this.reconcileInstalledModules();
+      });
     } catch (error) {
       console.error('[AppStoreManager] Failed to load config:', error);
     }
   }
 
+  /** Run a synchronous section under the cross-process store lock. */
+  private locked<T>(fn: () => T): T {
+    const outer = lockDepth === 0;
+    acquireStoreLock();
+    return this.runHeld(outer, fn);
+  }
+
+  /** Like locked, but waits for the lock without blocking the event loop. */
+  private async lockedAsync<T>(fn: () => T): Promise<T> {
+    const outer = lockDepth === 0;
+    const deadline = Date.now() + LOCK_WAIT_MS;
+    while (!tryAcquireStoreLock()) await waitBeforeLockRetry(deadline);
+    return this.runHeld(outer, fn);
+  }
+
+  private runHeld<T>(outer: boolean, fn: () => T): T {
+    try {
+      return fn();
+    } finally {
+      releaseStoreLock();
+      if (outer) {
+        this.reposFresh = false;
+        this.installedFresh = false;
+      }
+    }
+  }
+
+  private setAside(file: string, stamp: string, error: string | undefined): void {
+    const key = `${file}|${stamp}`;
+    if (this.asideStamps.has(key)) return;
+    this.asideStamps.add(key);
+    console.error(`[AppStoreManager] ${path.basename(file)} could not be read (${error}); App Store changes are blocked until it reads again`);
+    try {
+      ensureDir(UNREADABLE_DIR);
+      const copy = path.join(UNREADABLE_DIR, `${path.basename(file)}.${Date.now()}`);
+      fs.copyFileSync(file, copy);
+      console.error(`[AppStoreManager] Kept a copy of the unreadable file at ${copy}`);
+    } catch (copyError) {
+      console.error(`[AppStoreManager] Could not copy the unreadable ${path.basename(file)} aside:`, copyError);
+    }
+  }
+
+  private readRepos(): void {
+    const stamp = fileStamp(REPOS_CONFIG_PATH);
+    const result = readJsonStrict(REPOS_CONFIG_PATH, isReposConfig);
+    this.reposState = result.state;
+    this.reposStamp = stamp;
+    if (result.state === 'read') {
+      this.reposConfig = result.value!;
+    } else if (result.state === 'missing') {
+      this.reposConfig = structuredClone(DEFAULT_REPOS_CONFIG);
+    } else {
+      this.reposConfig = { repositories: [] };
+      this.setAside(REPOS_CONFIG_PATH, stamp, result.error);
+    }
+    this.reposFresh = lockDepth > 0 && result.state !== 'unreadable';
+  }
+
+  private readInstalled(): void {
+    const stamp = fileStamp(INSTALLED_CONFIG_PATH);
+    const result = readJsonStrict(INSTALLED_CONFIG_PATH, isInstalledConfig);
+    this.installedState = result.state;
+    this.installedStamp = stamp;
+    if (result.state === 'read') {
+      this.installedConfig = result.value!;
+    } else if (result.state === 'missing') {
+      this.installedConfig = structuredClone(DEFAULT_INSTALLED_CONFIG);
+    } else {
+      this.installedConfig = { modules: {} };
+      this.setAside(INSTALLED_CONFIG_PATH, stamp, result.error);
+    }
+    this.installedFresh = lockDepth > 0 && result.state !== 'unreadable';
+  }
+
+  /** Pick up a write the other process made since this one last read. */
+  private refreshFromDisk(): void {
+    if (lockDepth > 0) return;
+    if (fileStamp(REPOS_CONFIG_PATH) !== this.reposStamp) this.readRepos();
+    if (fileStamp(INSTALLED_CONFIG_PATH) !== this.installedStamp) this.readInstalled();
+  }
+
+  private requireInstalledReadable(): void {
+    if (this.installedState === 'unreadable') {
+      throw new Error('The installed modules list (installed.json) could not be read, so nothing was changed.');
+    }
+  }
+
+  private requireReposReadable(): void {
+    if (this.reposState === 'unreadable') {
+      throw new Error('The repository list (repos.json) could not be read, so nothing was changed.');
+    }
+  }
+
   private reconcileInstalledModules(): void {
+    // Deleting folders needs a list this process read from an existing file
+    // under the lock; a missing or unreadable list would delete every module.
+    if (this.installedState !== 'read' || !this.installedFresh) return;
+
     const sourceDir = getSourceModulesDir();
     if (!fs.existsSync(sourceDir)) return;
 
@@ -385,29 +725,42 @@ export class AppStoreManager {
   }
 
   /**
-   * Save repos configuration
+   * Save repos configuration. Refused unless this instance holds the store
+   * lock and read repos.json under it, so a stale copy never overwrites the file.
    */
   private saveRepos(): boolean {
+    if (lockDepth === 0 || !this.reposFresh) {
+      console.error('[AppStoreManager] Refused to save repos config: it was not read under the store lock');
+      return false;
+    }
     try {
-      ensureDir(APPSTORE_DIR);
-      fs.writeFileSync(REPOS_CONFIG_PATH, JSON.stringify(this.reposConfig, null, 2));
+      writeJsonAtomic(REPOS_CONFIG_PATH, this.reposConfig);
+      this.reposState = 'read';
+      this.reposStamp = fileStamp(REPOS_CONFIG_PATH);
       return true;
     } catch (error) {
       console.error('[AppStoreManager] Failed to save repos config:', error);
+      this.readRepos();
       return false;
     }
   }
 
   /**
-   * Save installed configuration
+   * Save installed configuration, under the same rule as saveRepos.
    */
   private saveInstalled(): boolean {
+    if (lockDepth === 0 || !this.installedFresh) {
+      console.error('[AppStoreManager] Refused to save installed config: it was not read under the store lock');
+      return false;
+    }
     try {
-      ensureDir(APPSTORE_DIR);
-      fs.writeFileSync(INSTALLED_CONFIG_PATH, JSON.stringify(this.installedConfig, null, 2));
+      writeJsonAtomic(INSTALLED_CONFIG_PATH, this.installedConfig);
+      this.installedState = 'read';
+      this.installedStamp = fileStamp(INSTALLED_CONFIG_PATH);
       return true;
     } catch (error) {
       console.error('[AppStoreManager] Failed to save installed config:', error);
+      this.readInstalled();
       return false;
     }
   }
@@ -420,6 +773,7 @@ export class AppStoreManager {
    * Get all repositories
    */
   getRepositories(): AppStoreRepository[] {
+    this.refreshFromDisk();
     return [...this.reposConfig.repositories];
   }
 
@@ -427,6 +781,7 @@ export class AppStoreManager {
    * Get a repository by ID
    */
   getRepository(id: string): AppStoreRepository | null {
+    this.refreshFromDisk();
     return this.reposConfig.repositories.find(r => r.id === id) || null;
   }
 
@@ -466,19 +821,22 @@ export class AppStoreManager {
       lastRefreshed: null
     };
 
-    this.reposConfig.repositories.push(repo);
-    this.saveRepos();
-
-    return repo;
+    return this.locked(() => {
+      this.readRepos();
+      this.requireReposReadable();
+      this.reposConfig.repositories.push(repo);
+      if (!this.saveRepos()) {
+        throw new Error('The repository list could not be saved, so the repository was not added.');
+      }
+      return repo;
+    });
   }
 
   /**
-   * Update a repository
+   * Update a repository. Returns false when the repository is not in repos.json
+   * or the file could not be read or written.
    */
   updateRepository(id: string, updates: Partial<AppStoreRepository>): boolean {
-    const index = this.reposConfig.repositories.findIndex(r => r.id === id);
-    if (index === -1) return false;
-
     // Validate URL if being updated
     if (updates.url) {
       const urlValidation = validateRepoUrl(updates.url);
@@ -495,34 +853,47 @@ export class AppStoreManager {
       }
     }
 
-    this.reposConfig.repositories[index] = {
-      ...this.reposConfig.repositories[index],
-      ...updates,
-      id // Ensure ID cannot be changed
-    };
+    return this.locked(() => {
+      this.readRepos();
+      if (this.reposState === 'unreadable') return false;
+      const index = this.reposConfig.repositories.findIndex(r => r.id === id);
+      if (index === -1) return false;
 
-    return this.saveRepos();
+      this.reposConfig.repositories[index] = {
+        ...this.reposConfig.repositories[index],
+        ...updates,
+        id // Ensure ID cannot be changed
+      };
+
+      return this.saveRepos();
+    });
   }
 
   /**
    * Remove a repository
    */
   removeRepository(id: string): boolean {
-    const index = this.reposConfig.repositories.findIndex(r => r.id === id);
-    if (index === -1) return false;
+    return this.locked(() => {
+      this.readRepos();
+      if (this.reposState === 'unreadable') return false;
+      const index = this.reposConfig.repositories.findIndex(r => r.id === id);
+      if (index === -1) return false;
 
-    this.reposConfig.repositories.splice(index, 1);
+      this.reposConfig.repositories.splice(index, 1);
+      if (!this.saveRepos()) return false;
 
-    // Clear cache for this repo
-    this.moduleCache.delete(id);
+      // Clear cache for this repo
+      this.moduleCache.delete(id);
 
-    // Clean up cached repo files
-    const cacheDir = path.join(CACHE_DIR, id);
-    if (fs.existsSync(cacheDir)) {
-      fs.rmSync(cacheDir, { recursive: true, force: true });
-    }
-
-    return this.saveRepos();
+      // Clean up cached repo files
+      const cacheDir = path.join(CACHE_DIR, id);
+      try {
+        fs.rmSync(cacheDir, { recursive: true, force: true });
+      } catch (error) {
+        console.error(`[AppStoreManager] Removed repository ${id} but could not delete its cached clone:`, error);
+      }
+      return true;
+    });
   }
 
   /**
@@ -566,6 +937,13 @@ export class AppStoreManager {
    * Clones/pulls the repo and scans for module.json files
    */
   async refreshRepository(repoId: string): Promise<StoreModuleInfo[]> {
+    return this.lockedAsync(() => this.refreshRepositoryLocked(repoId));
+  }
+
+  /** The clone is only pulled, reset or copied from while the store lock is held. */
+  private refreshRepositoryLocked(repoId: string): StoreModuleInfo[] {
+    this.readRepos();
+    this.readInstalled();
     const repo = this.getRepository(repoId);
     if (!repo) {
       throw new Error(`Repository ${repoId} not found`);
@@ -658,7 +1036,8 @@ export class AppStoreManager {
 
     const cloneUrl = this.buildAuthUrl(repo);
     execSync(`git clone --depth 1 --branch "${repo.branch}" "${cloneUrl}" "${targetDir}"`, {
-      stdio: 'pipe'
+      stdio: 'pipe',
+      timeout: GIT_TIMEOUT_MS
     });
   }
 
@@ -674,12 +1053,14 @@ export class AppStoreManager {
     const authUrl = this.buildAuthUrl(repo);
     execSync(`git remote set-url origin "${authUrl}"`, {
       cwd: repoDir,
-      stdio: 'pipe'
+      stdio: 'pipe',
+      timeout: GIT_TIMEOUT_MS
     });
 
     execSync(`git fetch origin "${repo.branch}" && git reset --hard "origin/${repo.branch}"`, {
       cwd: repoDir,
-      stdio: 'pipe'
+      stdio: 'pipe',
+      timeout: GIT_TIMEOUT_MS
     });
   }
 
@@ -690,7 +1071,7 @@ export class AppStoreManager {
     const cacheDir = path.join(CACHE_DIR, repoId);
     try {
       if (!fs.existsSync(path.join(cacheDir, '.git'))) return null;
-      const hash = execSync('git rev-parse HEAD', { cwd: cacheDir, stdio: 'pipe' }).toString().trim();
+      const hash = execSync('git rev-parse HEAD', { cwd: cacheDir, stdio: 'pipe', timeout: GIT_TIMEOUT_MS }).toString().trim();
       return hash || null;
     } catch {
       return null;
@@ -759,6 +1140,7 @@ export class AppStoreManager {
    * If not cached, triggers a git clone/pull (slow on first call).
    */
   async getAvailableModules(): Promise<StoreModuleInfo[]> {
+    this.refreshFromDisk();
     const allModules: StoreModuleInfo[] = [];
 
     for (const repo of this.reposConfig.repositories) {
@@ -780,7 +1162,7 @@ export class AppStoreManager {
       allModules.push(...modules);
     }
 
-    return allModules;
+    return this.withInstalledFlags(allModules);
   }
 
   /**
@@ -789,6 +1171,7 @@ export class AppStoreManager {
    * Returns instantly; never triggers network requests.
    */
   getCachedModules(): StoreModuleInfo[] {
+    this.refreshFromDisk();
     const allModules: StoreModuleInfo[] = [];
 
     for (const repo of this.reposConfig.repositories) {
@@ -810,7 +1193,16 @@ export class AppStoreManager {
       }
     }
 
-    return allModules;
+    return this.withInstalledFlags(allModules);
+  }
+
+  private withInstalledFlags(modules: StoreModuleInfo[]): StoreModuleInfo[] {
+    for (const info of modules) {
+      const installed = this.installedConfig.modules[info.manifest.name];
+      info.installed = !!installed;
+      info.installedVersion = installed?.version;
+    }
+    return modules;
   }
 
   /**
@@ -829,104 +1221,131 @@ export class AppStoreManager {
   // ============================================================================
 
   /**
-   * Install a module from the store
+   * Install a module from the store. The clone is rescanned, copied and its
+   * HEAD read under the store lock, and the record keeps the copied version.
    */
   async installModule(moduleName: string, repoId: string): Promise<boolean> {
-    const repo = this.getRepository(repoId);
-    if (!repo) {
-      throw new Error(`Repository ${repoId} not found`);
-    }
+    return this.lockedAsync(() => {
+      this.readRepos();
+      this.readInstalled();
+      this.requireInstalledReadable();
 
-    // Get module info from cache
-    let modules = this.moduleCache.get(repoId);
-    let moduleInfo = modules?.find(m => m.manifest.name === moduleName);
+      const repo = this.getRepository(repoId);
+      if (!repo) {
+        throw new Error(`Repository ${repoId} not found`);
+      }
 
-    // If not found in cache, try refreshing the repository
-    if (!moduleInfo) {
-      console.log(`[AppStoreManager] Module ${moduleName} not in cache, refreshing repository...`);
+      const cacheDir = path.join(CACHE_DIR, repoId);
+      let moduleInfo: StoreModuleInfo | undefined;
+      if (fs.existsSync(path.join(cacheDir, '.git'))) {
+        const scanned = this.scanForModules(cacheDir, repo);
+        this.moduleCache.set(repoId, scanned);
+        moduleInfo = scanned.find(m => m.manifest.name === moduleName);
+      }
+
+      if (!moduleInfo) {
+        console.log(`[AppStoreManager] Module ${moduleName} not in cache, refreshing repository...`);
+        try {
+          moduleInfo = this.refreshRepositoryLocked(repoId).find(m => m.manifest.name === moduleName);
+        } catch (refreshError) {
+          console.error(`[AppStoreManager] Failed to refresh repository:`, refreshError);
+        }
+      }
+
+      if (!moduleInfo) {
+        throw new Error(`Module ${moduleName} not found in repository ${repo.name}`);
+      }
+
+      const sourceTargetDir = path.join(getSourceModulesDir(), moduleName);
+      const buildTargetDir = path.join(getBuildModulesDir(), moduleName);
+      const runtimeTargetDir = path.join(getModulesDir(), moduleName);
+
+      if (this.installedConfig.modules[moduleName] || fs.existsSync(sourceTargetDir) || fs.existsSync(runtimeTargetDir)) {
+        throw new Error(`Module ${moduleName} is already installed`);
+      }
+
+      if (findDevModuleWithName(moduleName)) {
+        throw new Error(`Module ${moduleName} conflicts with a Dev module of the same name. Remove or rename the Dev module first.`);
+      }
+
+      takeAutoSnapshot(`install ${moduleName}`);
+
+      const commitHash = this.getRepoCacheCommit(repoId) || undefined;
       try {
-        await this.refreshRepository(repoId);
-        modules = this.moduleCache.get(repoId);
-        moduleInfo = modules?.find(m => m.manifest.name === moduleName);
-      } catch (refreshError) {
-        console.error(`[AppStoreManager] Failed to refresh repository:`, refreshError);
+        this.copyDirectory(moduleInfo.repoPath, sourceTargetDir);
+
+        if (sourceTargetDir !== buildTargetDir) {
+          ensureDir(path.dirname(buildTargetDir));
+          this.copyDirectory(moduleInfo.repoPath, buildTargetDir);
+        }
+
+        const copiedVersion = readManifestVersion(sourceTargetDir);
+        this.installedConfig.modules[moduleName] = {
+          name: moduleName,
+          version: copiedVersion,
+          installedFrom: repoId,
+          installedAt: new Date().toISOString(),
+          commitHash
+        };
+
+        if (!this.saveInstalled()) {
+          throw new Error(`Module ${moduleName} was not installed: the installed modules list could not be saved.`);
+        }
+
+        moduleInfo.installed = true;
+        moduleInfo.installedVersion = copiedVersion;
+
+        console.log(`[AppStoreManager] Installed module: ${moduleName} v${copiedVersion}`);
+        return true;
+      } catch (error) {
+        delete this.installedConfig.modules[moduleName];
+        if (fs.existsSync(sourceTargetDir)) {
+          fs.rmSync(sourceTargetDir, { recursive: true, force: true });
+        }
+        if (sourceTargetDir !== buildTargetDir && fs.existsSync(buildTargetDir)) {
+          fs.rmSync(buildTargetDir, { recursive: true, force: true });
+        }
+        throw error;
       }
-    }
-
-    if (!moduleInfo) {
-      throw new Error(`Module ${moduleName} not found in repository ${repo.name}`);
-    }
-
-    const sourceTargetDir = path.join(getSourceModulesDir(), moduleName);
-    const buildTargetDir = path.join(getBuildModulesDir(), moduleName);
-    const runtimeTargetDir = path.join(getModulesDir(), moduleName);
-
-    if (fs.existsSync(sourceTargetDir) || fs.existsSync(runtimeTargetDir)) {
-      throw new Error(`Module ${moduleName} is already installed`);
-    }
-
-    if (findDevModuleWithName(moduleName)) {
-      throw new Error(`Module ${moduleName} conflicts with a Dev module of the same name. Remove or rename the Dev module first.`);
-    }
-
-    takeAutoSnapshot(`install ${moduleName}`);
-
-    try {
-      this.copyDirectory(moduleInfo.repoPath, sourceTargetDir);
-
-      if (sourceTargetDir !== buildTargetDir) {
-        ensureDir(path.dirname(buildTargetDir));
-        this.copyDirectory(moduleInfo.repoPath, buildTargetDir);
-      }
-
-      this.installedConfig.modules[moduleName] = {
-        name: moduleName,
-        version: moduleInfo.manifest.version,
-        installedFrom: repoId,
-        installedAt: new Date().toISOString(),
-        commitHash: this.getRepoCacheCommit(repoId) || undefined
-      };
-
-      this.saveInstalled();
-
-      moduleInfo.installed = true;
-      moduleInfo.installedVersion = moduleInfo.manifest.version;
-
-      console.log(`[AppStoreManager] Installed module: ${moduleName} v${moduleInfo.manifest.version}`);
-      return true;
-    } catch (error) {
-      if (fs.existsSync(sourceTargetDir)) {
-        fs.rmSync(sourceTargetDir, { recursive: true, force: true });
-      }
-      if (sourceTargetDir !== buildTargetDir && fs.existsSync(buildTargetDir)) {
-        fs.rmSync(buildTargetDir, { recursive: true, force: true });
-      }
-      throw error;
-    }
+    });
   }
 
   /**
-   * Uninstall a module
+   * Uninstall a module. The record goes first, so a failed save changes
+   * nothing and a failed delete leaves folders the next reconcile removes.
    */
   async uninstallModule(moduleName: string): Promise<boolean> {
-    const installed = this.installedConfig.modules[moduleName];
-    if (!installed) {
-      throw new Error(`Module ${moduleName} is not installed`);
-    }
+    return this.lockedAsync(() => {
+      this.readInstalled();
+      this.requireInstalledReadable();
 
-    const sourceDir = path.join(getSourceModulesDir(), moduleName);
-    const buildDir = path.join(getBuildModulesDir(), moduleName);
-    const runtimeDir = path.join(getModulesDir(), moduleName);
+      const installed = this.installedConfig.modules[moduleName];
+      if (!installed) {
+        throw new Error(`Module ${moduleName} is not installed`);
+      }
 
-    if (!fs.existsSync(sourceDir) && !fs.existsSync(buildDir) && !fs.existsSync(runtimeDir)) {
+      const sourceDir = path.join(getSourceModulesDir(), moduleName);
+      const buildDir = path.join(getBuildModulesDir(), moduleName);
+      const runtimeDir = path.join(getModulesDir(), moduleName);
+      const hasFiles = fs.existsSync(sourceDir) || fs.existsSync(buildDir) || fs.existsSync(runtimeDir);
+
+      if (hasFiles) takeAutoSnapshot(`uninstall ${moduleName}`);
+
       delete this.installedConfig.modules[moduleName];
-      this.saveInstalled();
-      return true;
-    }
+      if (!this.saveInstalled()) {
+        throw new Error(`Module ${moduleName} was not uninstalled: the installed modules list could not be saved.`);
+      }
 
-    takeAutoSnapshot(`uninstall ${moduleName}`);
+      for (const [_, modules] of this.moduleCache) {
+        const moduleInfo = modules.find(m => m.manifest.name === moduleName);
+        if (moduleInfo) {
+          moduleInfo.installed = false;
+          moduleInfo.installedVersion = undefined;
+        }
+      }
 
-    try {
+      if (!hasFiles) return true;
+
       if (fs.existsSync(sourceDir)) {
         fs.rmSync(sourceDir, { recursive: true, force: true });
       }
@@ -937,26 +1356,12 @@ export class AppStoreManager {
         fs.rmSync(runtimeDir, { recursive: true, force: true });
       }
 
-      delete this.installedConfig.modules[moduleName];
-      this.saveInstalled();
-
-      // Update cache
-      for (const [_, modules] of this.moduleCache) {
-        const moduleInfo = modules.find(m => m.manifest.name === moduleName);
-        if (moduleInfo) {
-          moduleInfo.installed = false;
-          moduleInfo.installedVersion = undefined;
-        }
-      }
-
       // Remove credentials if any
       this.deleteCredentials(moduleName);
 
       console.log(`[AppStoreManager] Uninstalled module: ${moduleName}`);
       return true;
-    } catch (error) {
-      throw error;
-    }
+    });
   }
 
   /**
@@ -1014,6 +1419,7 @@ export class AppStoreManager {
    * Get all installed modules
    */
   getInstalledModules(): InstalledModule[] {
+    this.refreshFromDisk();
     return Object.values(this.installedConfig.modules);
   }
 
@@ -1021,6 +1427,7 @@ export class AppStoreManager {
    * Check if a module is installed
    */
   isModuleInstalled(moduleName: string): boolean {
+    this.refreshFromDisk();
     return !!this.installedConfig.modules[moduleName];
   }
 
@@ -1129,6 +1536,7 @@ export class AppStoreManager {
    * Check a single installed module for available updates
    */
   async checkModuleForUpdate(moduleName: string): Promise<ModuleUpdateCheck | null> {
+    this.refreshFromDisk();
     const installed = this.installedConfig.modules[moduleName];
     if (!installed) {
       return null;
@@ -1156,7 +1564,7 @@ export class AppStoreManager {
       const currentRepoCommit = this.getRepoCacheCommit(repo.id);
       const versionChanged = this.compareVersions(installed.version, moduleInfo.manifest.version) < 0;
       const commitChanged = !!(currentRepoCommit && installed.commitHash && currentRepoCommit !== installed.commitHash);
-      const hasUpdate = commitChanged || versionChanged;
+      const hasUpdate = versionChanged || (commitChanged && !this.installedMatchesRepo(moduleName, moduleInfo.repoPath));
 
       return {
         moduleName,
@@ -1247,7 +1655,7 @@ export class AppStoreManager {
         // Detect update: commit mismatch (primary) OR version bump (secondary)
         const versionChanged = this.compareVersions(installed.version, moduleInfo.manifest.version) < 0;
         const commitChanged = !!(currentRepoCommit && installed.commitHash && currentRepoCommit !== installed.commitHash);
-        const hasUpdate = commitChanged || versionChanged;
+        const hasUpdate = versionChanged || (commitChanged && !this.installedMatchesRepo(installed.name, moduleInfo.repoPath));
 
         const updateCheck: ModuleUpdateCheck = {
           moduleName: installed.name,
@@ -1274,6 +1682,12 @@ export class AppStoreManager {
     return result;
   }
 
+  /** True when the installed source has the same files as the repository's module folder. */
+  private installedMatchesRepo(moduleName: string, repoPath: string): boolean {
+    const installedHash = hashDirectory(path.join(getSourceModulesDir(), moduleName));
+    return installedHash !== null && installedHash === hashDirectory(repoPath);
+  }
+
   /**
    * Check if a module update is currently in progress
    */
@@ -1290,22 +1704,14 @@ export class AppStoreManager {
 
   /**
    * Update an installed module to the latest version
-   * Backs up current module, uninstalls, reinstalls, and rolls back on failure
+   * Backs up current module, uninstalls, reinstalls, and rolls back on failure.
+   * Runs under the store lock against the record on disk, so a module the
+   * other process uninstalled is never copied back.
    */
   async updateModule(moduleName: string): Promise<{ success: boolean; newVersion?: string; error?: string }> {
     // Prevent concurrent updates to the same module
     if (this.updatesInProgress.has(moduleName)) {
       return { success: false, error: `Update already in progress for ${moduleName}` };
-    }
-
-    const installed = this.installedConfig.modules[moduleName];
-    if (!installed) {
-      return { success: false, error: `Module ${moduleName} is not installed` };
-    }
-
-    const repo = this.getRepository(installed.installedFrom);
-    if (!repo) {
-      return { success: false, error: `Repository ${installed.installedFrom} not found` };
     }
 
     // Mark update as in progress
@@ -1316,11 +1722,31 @@ export class AppStoreManager {
     const runtimeDir = path.join(getModulesDir(), moduleName);
     const backupDir = path.join(CACHE_DIR, 'backups', `${moduleName}-${Date.now()}`);
 
+    let lockHeld = false;
     try {
-      await this.refreshRepository(repo.id);
+      const deadline = Date.now() + LOCK_WAIT_MS;
+      while (!tryAcquireStoreLock()) await waitBeforeLockRetry(deadline);
+      lockHeld = true;
+      this.readRepos();
+      this.readInstalled();
+      this.requireInstalledReadable();
 
-      const modules = this.moduleCache.get(repo.id);
-      const moduleInfo = modules?.find(m => m.manifest.name === moduleName);
+      const installed = this.installedConfig.modules[moduleName];
+      if (!installed) {
+        return { success: false, error: `Module ${moduleName} is not installed` };
+      }
+
+      const repo = this.getRepository(installed.installedFrom);
+      if (!repo) {
+        return { success: false, error: `Repository ${installed.installedFrom} not found` };
+      }
+
+      if (!fs.existsSync(sourceDir)) {
+        return { success: false, error: `Module ${moduleName} has no files where it was installed, so it was not updated. Reinstall it from the App Store.` };
+      }
+
+      const modules = this.refreshRepositoryLocked(repo.id);
+      const moduleInfo = modules.find(m => m.manifest.name === moduleName);
 
       if (!moduleInfo) {
         return { success: false, error: `Module ${moduleName} no longer exists in repository` };
@@ -1334,18 +1760,17 @@ export class AppStoreManager {
 
       console.log(`[AppStoreManager] Backing up ${moduleName} to ${backupDir}`);
       ensureDir(path.dirname(backupDir));
-      if (fs.existsSync(sourceDir)) {
-        this.copyDirectory(sourceDir, backupDir);
-      }
+      this.copyDirectory(sourceDir, backupDir);
 
       const previousInstalled = { ...installed };
+      const commitHash = this.getRepoCacheCommit(repo.id) || undefined;
       try {
         if (fs.existsSync(sourceDir)) fs.rmSync(sourceDir, { recursive: true, force: true });
         if (sourceDir !== buildDir && fs.existsSync(buildDir)) fs.rmSync(buildDir, { recursive: true, force: true });
         if (fs.existsSync(runtimeDir)) fs.rmSync(runtimeDir, { recursive: true, force: true });
       } catch (error) {
         console.error(`[AppStoreManager] Failed to remove old module:`, error);
-        return { success: false, error: 'Failed to remove current version' };
+        return { success: false, error: `Failed to remove the current version of ${moduleName}; its backup is at ${backupDir}` };
       }
 
       try {
@@ -1355,55 +1780,75 @@ export class AppStoreManager {
           this.copyDirectory(moduleInfo.repoPath, buildDir);
         }
 
+        const copiedVersion = readManifestVersion(sourceDir);
         this.installedConfig.modules[moduleName] = {
           name: moduleName,
-          version: moduleInfo.manifest.version,
+          version: copiedVersion,
           installedFrom: repo.id,
           installedAt: new Date().toISOString(),
-          commitHash: this.getRepoCacheCommit(repo.id) || undefined
+          commitHash
         };
-        this.saveInstalled();
+        if (!this.saveInstalled()) {
+          throw new Error('the installed modules list could not be saved');
+        }
 
         moduleInfo.installed = true;
-        moduleInfo.installedVersion = moduleInfo.manifest.version;
+        moduleInfo.installedVersion = copiedVersion;
 
-        fs.rmSync(backupDir, { recursive: true, force: true });
+        try {
+          fs.rmSync(backupDir, { recursive: true, force: true });
+        } catch (cleanupError) {
+          console.error(`[AppStoreManager] Updated ${moduleName} but could not delete its backup at ${backupDir}:`, cleanupError);
+        }
 
-        console.log(`[AppStoreManager] Updated ${moduleName} from ${previousInstalled.version} to ${moduleInfo.manifest.version}`);
-        return { success: true, newVersion: moduleInfo.manifest.version };
+        console.log(`[AppStoreManager] Updated ${moduleName} from ${previousInstalled.version} to ${copiedVersion}`);
+        return { success: true, newVersion: copiedVersion };
       } catch (installError) {
         console.error(`[AppStoreManager] Install failed, rolling back:`, installError);
 
+        let restored = false;
         try {
-          if (fs.existsSync(backupDir)) {
-            if (fs.existsSync(sourceDir)) fs.rmSync(sourceDir, { recursive: true, force: true });
-            this.copyDirectory(backupDir, sourceDir);
-            if (sourceDir !== buildDir) {
-              if (fs.existsSync(buildDir)) fs.rmSync(buildDir, { recursive: true, force: true });
-              ensureDir(path.dirname(buildDir));
-              this.copyDirectory(backupDir, buildDir);
-            }
+          if (fs.existsSync(sourceDir)) fs.rmSync(sourceDir, { recursive: true, force: true });
+          this.copyDirectory(backupDir, sourceDir);
+          if (sourceDir !== buildDir) {
+            if (fs.existsSync(buildDir)) fs.rmSync(buildDir, { recursive: true, force: true });
+            ensureDir(path.dirname(buildDir));
+            this.copyDirectory(backupDir, buildDir);
           }
-          this.installedConfig.modules[moduleName] = previousInstalled;
-          this.saveInstalled();
+          this.readInstalled();
+          if (this.installedConfig.modules[moduleName]?.version !== previousInstalled.version) {
+            this.installedConfig.modules[moduleName] = previousInstalled;
+            if (!this.saveInstalled()) throw new Error('the installed modules list could not be saved');
+          }
+          restored = true;
         } catch (rollbackError) {
           console.error(`[AppStoreManager] Rollback failed:`, rollbackError);
         }
 
-        // Clean up backup directory after rollback attempt
+        const reason = installError instanceof Error ? installError.message : String(installError);
+        if (!restored) {
+          return { success: false, error: `Install failed: ${reason}. The previous version could not be restored; its backup is at ${backupDir}` };
+        }
+
+        // The backup is only removed once the previous version is back in place
         try {
-          if (fs.existsSync(backupDir)) {
-            fs.rmSync(backupDir, { recursive: true, force: true });
-          }
+          fs.rmSync(backupDir, { recursive: true, force: true });
         } catch {
           // Ignore cleanup errors
         }
 
-        return { success: false, error: `Install failed: ${installError instanceof Error ? installError.message : String(installError)}` };
+        return { success: false, error: `Install failed: ${reason}` };
       }
     } catch (error) {
       return { success: false, error: error instanceof Error ? error.message : String(error) };
     } finally {
+      if (lockHeld) {
+        releaseStoreLock();
+        if (lockDepth === 0) {
+          this.reposFresh = false;
+          this.installedFresh = false;
+        }
+      }
       // Always release the update lock
       this.updatesInProgress.delete(moduleName);
     }
