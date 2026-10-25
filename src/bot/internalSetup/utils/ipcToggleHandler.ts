@@ -14,6 +14,7 @@ import { getModuleEventManager } from './moduleEventManager';
 import { getPanelManager } from './panelManager';
 import getLocalCommands from './getLocalCommands';
 import { buildCommandPayload } from './commandUtils';
+import { resolveClientApplication } from './clientApplication';
 import { LoadedModule } from '../../types/moduleTypes';
 import { componentConfigPath, getLastAppliedDisabledCommands, readConfigFile, setLastAppliedDisabledCommands } from './appStoreConfigFile';
 
@@ -68,7 +69,7 @@ function findCommandDef(commandName: string): any | null {
 
 // ─── Toggle Handlers ───
 
-async function toggleCommand(
+export async function toggleCommand(
   client: Client,
   commandName: string,
   enabled: boolean
@@ -80,7 +81,7 @@ async function toggleCommand(
     // guildId, NOT a cached Guild object: in a fleet the test guild may live on
     // another node's shard, so a cache lookup here would silently fall back to
     // the GLOBAL registry (see registerCommands.ts).
-    const appCommands = client.application?.commands;
+    const appCommands = (await resolveClientApplication(client))?.commands;
     if (!appCommands) return { success: false, error: 'Command manager not available' };
 
     if (enabled) {

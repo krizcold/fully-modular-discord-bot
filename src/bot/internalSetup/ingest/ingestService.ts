@@ -30,8 +30,16 @@ export class IngestService {
       (opts as any).shardCount = plan.shardCount;
     }
     this.client = new Client(opts);
+    this.restoreRestToken();
     this.client.once('clientReady', () => { this.hasBeenReady = true; });
     return this.client;
+  }
+
+  // REST (command registration, notices, access-log posts) works without a
+  // gateway session; Client.destroy() nulls the token, so it is set again.
+  private restoreRestToken(): void {
+    const token = (process.env.DISCORD_TOKEN || '').trim();
+    if (token && this.client) this.client.rest.setToken(token);
   }
 
   setShardPlan(shards: number[], shardCount: number): void {
@@ -166,6 +174,7 @@ export class IngestService {
     // re-run that work and queue packets.
     ws.status = this.hasBeenReady ? Status.Ready : Status.Idle;
     try { ws.shards.clear(); } catch { /* collection always present in v14 */ }
+    this.restoreRestToken();
   }
 }
 

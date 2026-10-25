@@ -24,13 +24,22 @@ function isDev(userId: string): boolean {
   return Array.isArray(devs) && devs.some((d) => String(d) === String(userId));
 }
 
-async function postAccessLog(client: Client, info: AccessLogInfo): Promise<void> {
+export async function postAccessLog(client: Client, info: AccessLogInfo): Promise<void> {
   if (getConfigProperty<boolean>('security.accessLog.enabled') !== true) return;
   const channelId = (getConfigProperty<string>('security.accessLog.channelId') || '').trim();
   if (!channelId) return;
 
-  const channel = await client.channels.fetch(channelId).catch(() => null);
-  if (!channel || !channel.isTextBased() || !('send' in channel)) return;
+  let channel;
+  try {
+    channel = await client.channels.fetch(channelId, { allowUnknownGuild: true });
+  } catch (err) {
+    console.warn(`[AccessLog] Access-log message not posted: channel ${channelId} could not be fetched:`, err instanceof Error ? err.message : err);
+    return;
+  }
+  if (!channel || !channel.isTextBased() || !('send' in channel)) {
+    console.warn(`[AccessLog] Access-log message not posted: channel ${channelId} is not a text channel the bot can send to`);
+    return;
+  }
 
   const embed = new EmbedBuilder()
     .setTitle('New web-UI access')
@@ -49,7 +58,7 @@ async function postAccessLog(client: Client, info: AccessLogInfo): Promise<void>
   );
 
   await (channel as { send: (opts: unknown) => Promise<unknown> }).send({ embeds: [embed], components: [row] }).catch((err: unknown) => {
-    console.warn('[AccessLog] Failed to post access-log message:', err instanceof Error ? err.message : err);
+    console.warn(`[AccessLog] Access-log message not posted in channel ${channelId}:`, err instanceof Error ? err.message : err);
   });
 }
 

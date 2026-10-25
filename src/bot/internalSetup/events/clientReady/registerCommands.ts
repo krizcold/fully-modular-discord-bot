@@ -14,6 +14,7 @@ import { loadGlobalData, saveGlobalData } from '../../utils/dataManager';
 import { dataPath } from '../../../../utils/dataRoot';
 import * as fs from 'fs';
 import { componentConfigPath, getLastAppliedDisabledCommands, readConfigFile, setLastAppliedDisabledCommands } from '../../utils/appStoreConfigFile';
+import { resolveClientApplication } from '../../utils/clientApplication';
 
 /** Check if auto-cleanup is enabled in AppStore config (default: false) */
 export function isAutoCleanupEnabled(): boolean {
@@ -68,42 +69,54 @@ function saveLastTestGuild(newGuildId: string): void {
   saveGlobalData<LastTestGuildData>(TRACKING_FILE, { guildId: newGuildId }, TRACKING_CATEGORY);
 }
 
+// Discord codes meaning the bot left the guild or the command is already gone.
+const GUILD_GONE_CODES = new Set([10004, 50001]);
+const COMMAND_GONE_CODE = 10063;
+
 /**
- * Clean ALL guild commands from a specific guild
- * Guild commands should only exist on the current test guild, so any on other guilds are stale
+ * Clean ALL guild commands from a specific guild through REST (the guild may be
+ * on another node's shard or absent from the cache). done is false when any
+ * fetch or delete failed, so the guild stays tracked and the next run retries.
  */
 async function cleanStaleTestCommands(
   client: Client,
   targetGuildId: string
-): Promise<number> {
-  const guild = client.guilds.cache.get(targetGuildId);
-  if (!guild) {
-    console.log(`[Cleanup] Guild ${targetGuildId} not accessible (bot may have been removed)`);
-    return 0;
+): Promise<{ deleted: number; done: boolean }> {
+  const application = await resolveClientApplication(client);
+  if (!application) {
+    console.error(`[Cleanup] Stale commands in guild ${targetGuildId} not cleaned: the bot application could not be resolved`);
+    return { deleted: 0, done: false };
   }
 
-  let deletedCount = 0;
+  let guildCommands;
   try {
-    const guildCommands = await guild.commands.fetch();
-
-    if (guildCommands.size === 0) return 0;
-
-    console.log(`[Cleanup] Found ${guildCommands.size} stale command(s) in ${guild.name} (${targetGuildId})`);
-
-    for (const guildCmd of guildCommands.values()) {
-      try {
-        await guild.commands.delete(guildCmd.id);
-        console.log(`[Cleanup] Deleted "${guildCmd.name}" from ${guild.name}`);
-        deletedCount++;
-      } catch (err) {
-        console.error(`[Cleanup] Failed to delete "${guildCmd.name}" from ${guild.name}:`, err);
-      }
+    guildCommands = await application.commands.fetch({ guildId: targetGuildId });
+  } catch (err: any) {
+    if (GUILD_GONE_CODES.has(err?.code)) {
+      console.log(`[Cleanup] Guild ${targetGuildId} not accessible (bot may have been removed)`);
+      return { deleted: 0, done: true };
     }
-  } catch (err) {
-    console.error(`[Cleanup] Failed to fetch commands from guild ${targetGuildId}:`, err);
+    console.error(`[Cleanup] Failed to fetch commands from guild ${targetGuildId}; will retry on the next registration:`, err);
+    return { deleted: 0, done: false };
   }
 
-  return deletedCount;
+  if (guildCommands.size === 0) return { deleted: 0, done: true };
+  console.log(`[Cleanup] Found ${guildCommands.size} stale command(s) in guild ${targetGuildId}`);
+
+  let deleted = 0;
+  let done = true;
+  for (const guildCmd of guildCommands.values()) {
+    try {
+      await application.commands.delete(guildCmd.id, targetGuildId);
+      console.log(`[Cleanup] Deleted "${guildCmd.name}" from guild ${targetGuildId}`);
+      deleted++;
+    } catch (err: any) {
+      if (err?.code === COMMAND_GONE_CODE) continue;
+      done = false;
+      console.error(`[Cleanup] Failed to delete "${guildCmd.name}" from guild ${targetGuildId}; will retry on the next registration:`, err);
+    }
+  }
+  return { deleted, done };
 }
 
 /**
@@ -115,40 +128,59 @@ async function cleanStaleTestCommands(
 async function handleStaleTestGuildCleanup(
   client: Client,
   currentGuildId: string
-): Promise<void> {
+): Promise<boolean> {
   const lastGuildId = getLastTestGuild();
 
   // Case C: Same guild - no cleanup needed
   if (lastGuildId === currentGuildId) {
-    return;
+    return true;
   }
 
   // Case B: Different guild - clean only that one
   if (lastGuildId !== null) {
     console.log(`[i] Test guild changed from ${lastGuildId} to ${currentGuildId}, cleaning stale commands...`);
-    const deleted = await cleanStaleTestCommands(client, lastGuildId);
+    const { deleted, done } = await cleanStaleTestCommands(client, lastGuildId);
     if (deleted > 0) {
       console.log(`[i] Cleaned ${deleted} stale command(s) from previous test guild`);
     }
-    return;
+    return done;
   }
 
-  // Case A: No tracked guild - full scan
+  // Case A: No tracked guild - full scan of every guild the bot is in, read
+  // through REST so a node holding no shard still sees them.
   console.log('[i] No previous test guild tracked, scanning all guilds for stale commands...');
+  let guildIds: string[];
+  try {
+    guildIds = [];
+    for (let after: string | undefined; ;) {
+      const page = await client.guilds.fetch({ limit: 200, after });
+      guildIds.push(...page.keys());
+      if (page.size < 200) break;
+      after = page.lastKey();
+    }
+  } catch (err) {
+    console.error('[Cleanup] Could not list the bot\'s guilds; the stale command scan will retry on the next registration:', err);
+    return false;
+  }
   let totalDeleted = 0;
+  let allDone = true;
 
-  for (const [scanGuildId] of client.guilds.cache) {
+  for (const scanGuildId of guildIds) {
     if (scanGuildId === currentGuildId) continue;
 
-    const deleted = await cleanStaleTestCommands(client, scanGuildId);
+    const { deleted, done } = await cleanStaleTestCommands(client, scanGuildId);
     totalDeleted += deleted;
+    if (!done) allDone = false;
   }
 
-  if (totalDeleted > 0) {
+  if (!allDone) {
+    console.warn(`[i] Full scan incomplete: cleaned ${totalDeleted} stale command(s); the rest retry on the next registration`);
+  } else if (totalDeleted > 0) {
     console.log(`[i] Full scan complete: cleaned ${totalDeleted} stale command(s) across all guilds`);
   } else {
     console.log('[i] Full scan complete: no stale commands found');
   }
+  return allDone;
 }
 
 const typeChat = ApplicationCommandType.ChatInput
@@ -194,7 +226,7 @@ export default async function registerCommands(
 
   try {
     // Clean up stale guild commands from previous test guilds
-    await handleStaleTestGuildCleanup(client, guildId);
+    const staleCleanupDone = await handleStaleTestGuildCleanup(client, guildId);
 
     // Load all local commands (each file exports a command object or an array of commands)
     const localCommands = getLocalCommands();
@@ -209,12 +241,14 @@ export default async function registerCommands(
       console.log(`[i] ${disabledCommands.size} command(s) disabled via component config: ${[...disabledCommands].join(', ')}`);
     }
 
-    // Fetch existing commands from Discord
-    const globalCommands = await client.application?.commands.fetch();
-    if (!client.application) {
-      console.error('[registerCommands] client.application not available; cannot register commands.');
+    // Fetch existing commands from Discord. On a node whose gateway never
+    // became ready, the application is resolved through REST.
+    const application = await resolveClientApplication(client);
+    if (!application) {
+      console.error('[registerCommands] Commands were not registered: the bot application could not be resolved.');
       return;
     }
+    const globalCommands = await application.commands.fetch();
     // Test (guild) commands go through the application-commands REST API scoped
     // to guildId, NOT a cached Guild object. In a fleet the test guild usually
     // lives on ANOTHER node's shard, so it is legitimately absent from this
@@ -222,7 +256,7 @@ export default async function registerCommands(
     // master. This REST manager works regardless of which shard holds the guild,
     // and never adds it to this client's cache (which would corrupt the fleet
     // guild map / this node's guild count).
-    const appCommands = client.application.commands;
+    const appCommands = application.commands;
     const guildCmds = {
       fetch: () => appCommands.fetch({ guildId }),
       create: (data: any) => appCommands.create(data, guildId),
@@ -348,8 +382,9 @@ export default async function registerCommands(
       }
     }
 
-    // Save current test guild for future cleanup tracking
-    saveLastTestGuild(guildId);
+    // Save current test guild for future cleanup tracking; an unfinished
+    // stale cleanup keeps the old guild tracked so the next run retries it.
+    if (staleCleanupDone) saveLastTestGuild(guildId);
   } catch (error) {
     console.error(`There was an error while registering commands:\n${error}`);
   }

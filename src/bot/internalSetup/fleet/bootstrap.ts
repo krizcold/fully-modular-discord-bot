@@ -4190,6 +4190,9 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     const graceMs = rec.recovered || paused ? RECOVERY_HOLDDOWN_MS : REGISTER_GRACE_MS;
     if ((rec.recovered || paused) && recoverySource) recoverySource.holdDownUntil = Date.now() + graceMs;
     console.log(`[Fleet] Role: master node=${nodeName} (${nodeId.slice(0, 8)}) term=${term} shardCount=${registry.shardCount} capacity=${capabilities.shardCapacity} controlPort=${port}${pinnedShardId !== null ? ` pinnedShard=${pinnedShardId}` : ''}`);
+    if (!standalone && capabilities.shardCapacity === 0 && pinnedShardId === null) {
+      console.warn('[Fleet] This master has shard capacity 0 and no pinned shard, so it holds no shard: boot does not register slash commands (a module install or reload still does) and module auto-update does not start on this node');
+    }
     if (paused && rec.reshardPaused) {
       console.warn(`[Fleet] RESHARD PAUSE active (${rec.reshardPaused.from ?? '?'} -> ${rec.reshardPaused.to ?? '?'} shards): no shards will be assigned until resumed from the Usage tab`);
     }

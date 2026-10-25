@@ -2778,6 +2778,11 @@ function MigrationsPanel({ tiers, providers, sectionStyle, showSuccess, setError
                       Decisions: pending {counts.pending || 0} · accepted {counts.accepted || 0} · declined {counts.declined || 0}
                       {counts['silent-applied'] ? ` · silent-applied ${counts['silent-applied']}` : ''}
                     </div>
+                    {m.status === 'pending' && (m.decisions || []).some(d => d.decision === 'pending' && !d.notifiedAt) && (
+                      <div style={{ color: '#f5af19', fontSize: '0.78rem', marginTop: '4px' }}>
+                        Delivery not confirmed for: {(m.decisions || []).filter(d => d.decision === 'pending' && !d.notifiedAt).map(d => d.guildId).join(', ')}. A server that does not decide keeps its current plan.
+                      </div>
+                    )}
                     {m.message && (
                       <div style={{ color: '#888', fontSize: '0.78rem', marginTop: '4px', fontStyle: 'italic' }}>
                         "{m.message}"

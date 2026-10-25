@@ -48,6 +48,11 @@ export interface NotificationPayload {
   details?: string;
 }
 
+export type NotifyOutcome =
+  | { delivered: true; via: 'dm' }
+  | { delivered: true; via: 'channel'; channelId: string }
+  | { delivered: false; cause: string };
+
 let instance: SubscriptionNotifier | null = null;
 
 export class SubscriptionNotifier {
@@ -61,40 +66,44 @@ export class SubscriptionNotifier {
     return !!this.client;
   }
 
-  async notify(guildId: string, type: NotificationType, payload: NotificationPayload): Promise<void> {
+  async notify(guildId: string, type: NotificationType, payload: NotificationPayload): Promise<NotifyOutcome> {
     if (!this.client) {
       console.warn(`[SubscriptionNotifier] notify(${type}, ${guildId}) called before client was set`);
-      return;
+      return { delivered: false, cause: 'the Discord client is not set up yet' };
     }
     const message = this.formatMessage(type, payload);
-    if (!message) return;
+    if (!message) return { delivered: false, cause: `no message text for ${type}` };
 
     let guild;
+    let guildError: unknown = null;
     try {
-      guild = await this.client.guilds.fetch(guildId).catch(() => null);
-    } catch {
+      guild = await this.client.guilds.fetch({ guild: guildId, cache: false }).catch((err) => { guildError = err; return null; });
+    } catch (err) {
+      guildError = err;
       guild = null;
     }
     if (!guild) {
-      console.warn(`[SubscriptionNotifier] guild ${guildId} not reachable; cannot deliver ${type}`);
-      return;
+      const cause = `guild not reachable (${guildError instanceof Error ? guildError.message : 'not found'})`;
+      console.warn(`[SubscriptionNotifier] guild ${guildId} not reachable; cannot deliver ${type}: ${cause}`);
+      return { delivered: false, cause };
     }
 
-    if (await this.tryDmOwner(guild, message)) return;
+    if (await this.tryDmOwner(guild, message)) return { delivered: true, via: 'dm' };
 
     const subs = getPremiumManager().getGuildSubscriptions(guildId);
     if (subs?.notificationsChannelId) {
-      const ch = await this.client.channels.fetch(subs.notificationsChannelId).catch(() => null);
+      const ch = await this.client.channels.fetch(subs.notificationsChannelId, { allowUnknownGuild: true }).catch(() => null);
       if (ch && this.isWritableTextChannel(ch)) {
-        if (await this.trySendChannel(ch, message)) return;
+        if (await this.trySendChannel(ch, message)) return { delivered: true, via: 'channel', channelId: subs.notificationsChannelId };
       }
     }
 
     if (guild.systemChannel && this.isWritableTextChannel(guild.systemChannel)) {
-      if (await this.trySendChannel(guild.systemChannel, message)) return;
+      if (await this.trySendChannel(guild.systemChannel, message)) return { delivered: true, via: 'channel', channelId: guild.systemChannel.id };
     }
 
     console.warn(`[SubscriptionNotifier] no delivery path for ${type} on guild ${guildId}; notification dropped`);
+    return { delivered: false, cause: 'the owner DM, the notifications channel and the system channel all failed' };
   }
 
   private async tryDmOwner(guild: any, message: string): Promise<boolean> {

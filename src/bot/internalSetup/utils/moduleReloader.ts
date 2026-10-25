@@ -29,6 +29,7 @@ import { isAutoCleanupEnabled } from '../events/clientReady/registerCommands';
 import { clearSchemaCache, getModulesWithSettings } from './settings/settingsDiscovery';
 import { createAllSettingsPanels } from './settings/settingsPanelFactory';
 import { getMetricsCollector } from './metrics/metricsCollector';
+import { resolveClientApplication } from './clientApplication';
 
 interface CapturedCommand {
   name: string;
@@ -36,7 +37,7 @@ interface CapturedCommand {
   testOnly: boolean;
 }
 
-async function deleteModuleCommandsFromDiscord(
+export async function deleteModuleCommandsFromDiscord(
   client: Client,
   commands: CapturedCommand[]
 ): Promise<void> {
@@ -45,20 +46,27 @@ async function deleteModuleCommandsFromDiscord(
 
   try {
     const guildId = process.env.GUILD_ID;
-    const guild = guildId ? client.guilds.cache.get(guildId) : undefined;
-    const globalCommands = await client.application?.commands.fetch();
-    const guildCommands = guild ? await guild.commands.fetch() : undefined;
+    const application = await resolveClientApplication(client);
+    if (!application) {
+      console.error(`[Reloader] Commands not deleted from Discord (${commands.map(c => c.name).join(', ')}): the bot application could not be resolved`);
+      return;
+    }
+    const globalCommands = await application.commands.fetch();
+    const hasTestOnly = commands.some(c => c.testOnly);
+    if (hasTestOnly && !guildId) {
+      console.error('[Reloader] Test-only commands not deleted from Discord: GUILD_ID is not set');
+    }
+    const guildCommands = hasTestOnly && guildId ? await application.commands.fetch({ guildId }) : undefined;
 
     for (const cmd of commands) {
       const list = cmd.testOnly ? guildCommands : globalCommands;
-      const mgr = cmd.testOnly ? guild?.commands : client.application?.commands;
-      if (!list || !mgr) continue;
+      if (!list) continue;
 
       const match = list.find(c => c.name === cmd.name && c.type === cmd.type);
       if (!match) continue;
 
       try {
-        await mgr.delete(match.id);
+        await application.commands.delete(match.id, cmd.testOnly ? guildId : undefined);
         console.log(`[Reloader] Deleted ${cmd.testOnly ? 'local' : 'global'} command "${cmd.name}" from Discord`);
       } catch (err: any) {
         if (err?.code === 10063) {
