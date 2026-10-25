@@ -29,7 +29,7 @@ export type FlushNowOutcome = 'ok' | 'pending' | 'held' | 'deposed' | 'unavailab
  * drain). Module code never catches it by contract; the dispatch wrappers do
  * and surface the cause.
  */
-export type DataUnavailableCause = 'database-unreachable' | 'guild-fenced' | 'database-read-only' | 'database-stale-copy' | 'node-stopping';
+export type DataUnavailableCause = 'database-unreachable' | 'guild-fenced' | 'database-read-only' | 'database-stale-copy' | 'node-stopping' | 'storage-failing';
 
 export class DataBackendUnavailableError extends Error {
   constructor(readonly causeKey: DataUnavailableCause) {
@@ -41,6 +41,8 @@ export class DataBackendUnavailableError extends Error {
         ? '[Data] The database serving this node is a copy in recovery and accepts no writes (SQLSTATE 25006); the write was not saved'
         : causeKey === 'node-stopping'
           ? '[Data] This process is stopping and its exit drain has closed; the write was not saved'
+        : causeKey === 'storage-failing'
+          ? '[Data] Disk writes have been failing too long or too much is held in memory; the write was not saved'
           : '[Data] The data backend is unreachable and the write buffer is full; the write was not saved');
     this.name = 'DataBackendUnavailableError';
   }

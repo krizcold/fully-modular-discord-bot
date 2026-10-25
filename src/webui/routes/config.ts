@@ -406,7 +406,10 @@ export function createConfigRoutes(botManager: BotManager): Router {
       // Restore backup through the facade so it is ordered by the single
       // per-path write queue (an in-flight update flush cannot clobber it).
       const backupContents = fs.readFileSync(backupPath, 'utf-8');
-      writeRawAtomic(configInfo.path, backupContents);
+      if (!writeRawAtomic(configInfo.path, backupContents)) {
+        res.status(503).json({ success: false, error: 'The config was not restored because disk writes are failing' });
+        return;
+      }
       console.log(`[Config] Restored ${fileId} from backup: ${filename}`);
       nudgeSync('config');
 
@@ -636,7 +639,10 @@ export function createConfigRoutes(botManager: BotManager): Router {
       // Save through the facade so this write is ordered by the single per-path
       // queue (no race with a queued global/guild write to the same file) and
       // lands atomically via temp+fsync+rename.
-      writeRawAtomic(savePath, JSON.stringify(newData, null, 2));
+      if (!writeRawAtomic(savePath, JSON.stringify(newData, null, 2))) {
+        res.status(503).json({ success: false, error: 'The data file was not saved because disk writes are failing' });
+        return;
+      }
       console.log(`[Data] ${fileId} saved successfully${guildId ? ` for guild ${guildId}` : ' (global)'}`);
       if (!guildId) nudgeSync('globaldata');
 

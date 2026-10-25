@@ -994,6 +994,7 @@ function noticeText(property: string, fallback: string): string {
 export function dataUnavailableMessage(causeKey: DataUnavailableCause): string {
   if (causeKey === 'node-stopping') return 'The bot is restarting, so your change was not saved. Please try again in a moment.';
   if (causeKey === 'database-stale-copy') return "The bot is connected to an outdated copy of its database, so your change was not saved. Changes can be saved again once the bot is moved to the current database.";
+  if (causeKey === 'storage-failing') return "The bot cannot write to its disk right now, so your change was not saved. Please try again later or contact support.";
   if (causeKey === 'database-read-only') return "The bot's database is read-only while a backup covers an outage, so your change was not saved. Please try again in a few minutes.";
   return causeKey === 'guild-fenced'
     ? "This server's data just moved to another bot node; please try again in a moment."

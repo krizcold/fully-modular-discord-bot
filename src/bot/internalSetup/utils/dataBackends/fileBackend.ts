@@ -11,6 +11,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { DATA_ROOT } from '../../../../utils/dataRoot';
+import { DataBackendUnavailableError } from './workingSet';
 
 const BASE_DATA_DIR = DATA_ROOT;
 
@@ -43,6 +44,14 @@ let opSeq = 0;
 // write held through a disk fault lands once the disk takes it.
 const retryAttempts = new Map<string, number>();
 const retryTimers = new Map<string, NodeJS.Timeout>();
+
+// Writes held only in memory are bounded: past either bound new writes are
+// refused until the disk takes writes again and the held bytes fall below half.
+const STORAGE_FAILING_AGE_MS = 30_000;
+const STORAGE_HELD_BYTES = 32 * 1024 * 1024;
+const failingSince = new Map<string, number>();
+let storageRefusing = false;
+let lastLandedAt = -Infinity;
 
 let flushFailures = 0;
 let flushesLanded = 0;
@@ -80,6 +89,7 @@ function clearRetry(absPath: string): void {
   if (timer) clearTimeout(timer);
   retryTimers.delete(absPath);
   retryAttempts.delete(absPath);
+  failingSince.delete(absPath);
 }
 
 const IS_WINDOWS = process.platform === 'win32';
@@ -124,7 +134,10 @@ function delay(ms: number): Promise<void> {
 async function flushPath(absPath: string): Promise<void> {
   if (flushing.has(absPath)) return;
   const entry = pendingOps.get(absPath);
-  if (!entry) return;
+  if (!entry) {
+    failingSince.delete(absPath);
+    return;
+  }
   flushing.add(absPath);
   try {
     const seqAtStart = entry.seq;
@@ -152,17 +165,22 @@ async function flushPath(absPath: string): Promise<void> {
           else scheduleFlush(absPath); // flush only the remaining tail
         }
         flushesLanded += 1;
+        lastLandedAt = performance.now();
         retryAttempts.delete(absPath);
+        failingSince.delete(absPath);
         return; // bypass the generic seq-drop below (only correct for write/delete)
       }
     } catch (error) {
       flushFailures += 1;
+      if (!failingSince.has(absPath)) failingSince.set(absPath, performance.now());
       console.error(`[DataManager] Flush failed for ${absPath} (will retry):`, error);
       scheduleRetry(absPath);
       return; // keep the pending entry + tmp file; the retry, the next write or flushAll tries again
     }
     flushesLanded += 1;
+    lastLandedAt = performance.now();
     retryAttempts.delete(absPath);
+    failingSince.delete(absPath);
     // Drop the entry only if no newer op arrived while we were flushing.
     const current = pendingOps.get(absPath);
     if (current && current.seq === seqAtStart) {
@@ -261,12 +279,51 @@ export function getPending(absPath: string): PendingOp | undefined {
   return pendingOps.get(absPath);
 }
 
+function heldBytes(): number {
+  let total = 0;
+  for (const op of pendingOps.values()) if (op.op !== 'delete') total += op.content.length;
+  return total;
+}
+
+// One failing path refuses writes only to its own directory; the whole queue
+// stalls when paths in two or more folders fail and nothing landed since the first.
+function diskStalled(now: number): boolean {
+  let oldest = Infinity;
+  for (const since of failingSince.values()) if (since >= lastLandedAt) oldest = Math.min(oldest, since);
+  return new Set([...failingSince.keys()].map(p => path.dirname(p))).size >= 2 && oldest !== Infinity && now - oldest >= STORAGE_FAILING_AGE_MS;
+}
+
+function sameDirFailing(absPath: string, now: number): boolean {
+  const dir = path.dirname(absPath);
+  for (const [p, since] of failingSince) {
+    if (path.dirname(p) === dir && now - since >= STORAGE_FAILING_AGE_MS) return true;
+  }
+  return false;
+}
+
+function refuseWhileStorageFails(absPath: string): void {
+  const bytes = heldBytes();
+  const now = performance.now();
+  if (storageRefusing) {
+    if (!diskStalled(now) && bytes <= STORAGE_HELD_BYTES / 2) {
+      storageRefusing = false;
+      console.log('[DataManager] Disk writes are landing again; file writes are accepted');
+    }
+  } else if (diskStalled(now) || bytes >= STORAGE_HELD_BYTES) {
+    storageRefusing = true;
+    console.error(`[DataManager] Refusing file writes: ${failingSince.size} file(s) failing to flush, ${bytes} bytes held in memory`);
+  }
+  if (storageRefusing || sameDirFailing(absPath, now)) throw new DataBackendUnavailableError('storage-failing');
+}
+
 export function enqueueWrite(absPath: string, content: string): void {
+  refuseWhileStorageFails(absPath);
   pendingOps.set(absPath, { op: 'write', content, seq: ++opSeq });
   scheduleFlush(absPath);
 }
 
 export function enqueueAppend(absPath: string, line: string): void {
+  refuseWhileStorageFails(absPath);
   const existing = pendingOps.get(absPath);
   // Coalesce consecutive appends waiting on the same flush into one op.
   if (existing && existing.op === 'append') {
@@ -279,6 +336,7 @@ export function enqueueAppend(absPath: string, line: string): void {
 }
 
 export function enqueueDelete(absPath: string): void {
+  refuseWhileStorageFails(absPath);
   pendingOps.set(absPath, { op: 'delete', seq: ++opSeq });
   scheduleFlush(absPath);
 }
@@ -320,6 +378,7 @@ export async function removeFreezeSentinel(guildId: string): Promise<void> {
 /** Enqueue an atomic write to an arbitrary absolute path. */
 export function writeRawAtomic(absPath: string, contents: string): boolean {
   try {
+    refuseWhileStorageFails(absPath);
     pendingOps.set(absPath, { op: 'write', content: contents, seq: ++opSeq });
     scheduleFlush(absPath);
     return true;
@@ -347,6 +406,7 @@ export function readRaw(absPath: string): string | null {
 /** Enqueue an atomic delete of an arbitrary absolute path. */
 export function deleteRawAtomic(absPath: string): boolean {
   try {
+    refuseWhileStorageFails(absPath);
     const pending = pendingOps.get(absPath);
     if (!fs.existsSync(absPath) && (!pending || pending.op === 'delete')) return false;
     pendingOps.set(absPath, { op: 'delete', seq: ++opSeq });

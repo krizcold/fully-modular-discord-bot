@@ -21,6 +21,7 @@ import { PanelOptions, PanelContext, PanelResponse } from '../../types/panelType
 import { discoverConfigFiles, ConfigFileMetadata } from '../utils/configDiscovery';
 import { loadGlobalConfig, saveGlobalConfig, getMergedConfig } from '../utils/configManager';
 import { deleteRawAtomic } from '../utils/dataManager';
+import * as fs from 'fs';
 import { createV2Response, V2Colors } from '../utils/panel/v2';
 import { validateAndSanitizeJson } from '../utils/json';
 
@@ -141,7 +142,11 @@ const configEditorGlobalPanel: PanelOptions = {
       const metadata = configFiles.find(f => f.id === fileId);
 
       if (metadata?.path) {
-        deleteRawAtomic(metadata.path);
+        try {
+          resetGlobalFile(metadata.path);
+        } catch (error) {
+          return showError(`Reset failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+        }
       }
 
       // Return to config view with fresh data
@@ -199,7 +204,7 @@ const configEditorGlobalPanel: PanelOptions = {
         }
 
         if (Object.keys(overridesOnly).length === 0 && metadata?.path) {
-          deleteRawAtomic(metadata.path);
+          resetGlobalFile(metadata.path);
         } else {
           saveGlobalConfig(fileId, overridesOnly);
         }
@@ -238,7 +243,7 @@ const configEditorGlobalPanel: PanelOptions = {
 
     try {
       if (Object.keys(overridesOnly).length === 0 && metadata?.path) {
-        deleteRawAtomic(metadata.path);
+        resetGlobalFile(metadata.path);
       } else {
         saveGlobalConfig(fileId, overridesOnly);
       }
@@ -561,6 +566,10 @@ async function showUploadModal(context: PanelContext, fileId: string): Promise<P
   modal.addLabelComponents(fileLabel);
 
   return { modal: modal } as any;
+}
+
+function resetGlobalFile(filePath: string): void {
+  if (!deleteRawAtomic(filePath) && fs.existsSync(filePath)) throw new Error('the reset was not saved because disk writes are failing');
 }
 
 export default configEditorGlobalPanel;

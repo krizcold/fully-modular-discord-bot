@@ -482,7 +482,6 @@ export function stampOwner(guildId: string): void {
   if (ownerStamped.has(guildId)) return;
   const info = ownerInfoProvider?.();
   if (!info) return;
-  ownerStamped.add(guildId);
   const manifest = {
     guildId,
     shardId: guildIdToShardId(guildId, info.shardCount),
@@ -492,7 +491,7 @@ export function stampOwner(guildId: string): void {
     updatedAt: Date.now(),
   };
   const target = path.join(BASE_DATA_DIR, guildId, '.owner');
-  writeRawAtomic(target, JSON.stringify(manifest, null, 2));
+  if (writeRawAtomic(target, JSON.stringify(manifest, null, 2))) ownerStamped.add(guildId);
 }
 
 // ============================================================================
