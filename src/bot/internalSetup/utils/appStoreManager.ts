@@ -1861,15 +1861,20 @@ export class AppStoreManager {
     success: boolean;
     updated: Array<{ moduleName: string; oldVersion: string; newVersion: string }>;
     failed: Array<{ moduleName: string; error: string }>;
+    checkErrors: Array<{ moduleName: string; error: string }>;
+    skipped: Array<{ moduleName: string; reason: string }>;
   }> {
     const result = {
       success: true,
       updated: [] as Array<{ moduleName: string; oldVersion: string; newVersion: string }>,
-      failed: [] as Array<{ moduleName: string; error: string }>
+      failed: [] as Array<{ moduleName: string; error: string }>,
+      checkErrors: [] as Array<{ moduleName: string; error: string }>,
+      skipped: [] as Array<{ moduleName: string; reason: string }>
     };
 
     // First, check for all updates
     const updateCheck = await this.checkAllModulesForUpdates();
+    result.checkErrors = [...(updateCheck.errors || [])];
     const modulesWithUpdates = updateCheck.updates.filter(u => u.hasUpdate);
 
     if (modulesWithUpdates.length === 0) {
@@ -1893,6 +1898,11 @@ export class AppStoreManager {
           error: updateResult.error || 'Unknown error'
         });
         result.success = false;
+      } else {
+        result.skipped.push({
+          moduleName: moduleUpdate.moduleName,
+          reason: `The repository changed but the version stayed ${oldVersion}, so the files were not replaced`
+        });
       }
     }
 

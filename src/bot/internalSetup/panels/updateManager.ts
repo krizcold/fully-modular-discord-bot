@@ -572,7 +572,7 @@ async function handleUpdateAllModules(context: PanelContext): Promise<PanelRespo
       // Step 1: Download module updates via AppStoreManager
       const result = await triggerAllModuleUpdates();
 
-      if (result.success && result.totalUpdated > 0) {
+      if (result.totalUpdated > 0) {
         console.log(`[UpdateManagerPanel] Downloaded ${result.totalUpdated} module update(s), hot-reloading...`);
 
         // Step 2: Hot-reload the updated modules
@@ -595,7 +595,7 @@ async function handleUpdateAllModules(context: PanelContext): Promise<PanelRespo
       if (newCheck) {
         await updatePersistentPanelState('update_manager', 'modules_updated', context.guildId || undefined, undefined, {
           lastCheckResult: newCheck,
-          lastModuleUpdate: { updated: result.updated, failed: result.failed }
+          lastModuleUpdate: { updated: result.updated, failed: result.failed, skipped: result.skipped, checkErrors: result.checkErrors }
         });
       }
     } catch (error) {

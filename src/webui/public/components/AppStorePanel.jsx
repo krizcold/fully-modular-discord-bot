@@ -362,9 +362,18 @@ function ModulesView({ modules, installed, installJobs, categories, categoryFilt
     setUpdating(true);
     try {
       const res = await api.post('/update/modules-and-reload');
-      if (res.success) {
-        setModuleUpdates({});
+      const updatedNames = (res.download?.updated || []).map(u => u.moduleName);
+      if (updatedNames.length > 0) {
+        setModuleUpdates(prev => {
+          if (!prev) return prev;
+          const next = { ...prev };
+          for (const name of updatedNames) delete next[name];
+          return next;
+        });
         onModuleChanged();
+      }
+      if (!res.success) {
+        showToast(res.message || res.error || 'Module update failed', 'warning', { sticky: true });
       }
     } catch (err) {
       console.error('Failed to update modules:', err);

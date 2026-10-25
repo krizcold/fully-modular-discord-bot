@@ -70,6 +70,25 @@ export interface BulkModuleUpdateResult {
   totalUpdated: number;
   updated: Array<{ moduleName: string; oldVersion: string; newVersion: string }>;
   failed: Array<{ moduleName: string; error: string }>;
+  checkErrors: Array<{ moduleName: string; error: string }>;
+  skipped: Array<{ moduleName: string; reason: string }>;
+}
+
+/**
+ * Operator-facing sentence for a bulk module update; names every module that was not updated.
+ */
+export function describeBulkModuleUpdate(result: BulkModuleUpdateResult): string {
+  const parts = [`Updated ${result.totalUpdated} module(s)`];
+  if (result.failed.length > 0) {
+    parts.push(`failed: ${result.failed.map(f => `${f.moduleName} (${f.error})`).join(', ')}`);
+  }
+  if (result.skipped.length > 0) {
+    parts.push(`not updated: ${result.skipped.map(s => `${s.moduleName} (${s.reason})`).join(', ')}`);
+  }
+  if (result.checkErrors.length > 0) {
+    parts.push(`could not check: ${result.checkErrors.map(e => `${e.moduleName} (${e.error})`).join(', ')}`);
+  }
+  return parts.join('; ');
 }
 
 // Re-export module types for convenience
@@ -428,11 +447,13 @@ export async function triggerAllModuleUpdates(): Promise<BulkModuleUpdateResult>
     const result = await appStoreManager.updateAllModules();
 
     return {
-      success: result.success,
-      totalAttempted: result.updated.length + result.failed.length,
+      success: result.failed.length === 0 && result.skipped.length === 0 && result.checkErrors.length === 0,
+      totalAttempted: result.updated.length + result.failed.length + result.skipped.length,
       totalUpdated: result.updated.length,
       updated: result.updated,
-      failed: result.failed
+      failed: result.failed,
+      checkErrors: result.checkErrors,
+      skipped: result.skipped
     };
   } catch (error) {
     return {
@@ -443,7 +464,9 @@ export async function triggerAllModuleUpdates(): Promise<BulkModuleUpdateResult>
       failed: [{
         moduleName: '*',
         error: error instanceof Error ? error.message : String(error)
-      }]
+      }],
+      checkErrors: [],
+      skipped: []
     };
   }
 }

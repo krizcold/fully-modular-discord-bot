@@ -87,11 +87,12 @@ function UpdateStatus({ api, status, onRefresh }) {
         const downloaded = result.download?.totalUpdated || 0;
         const reloaded = result.reload?.reloaded?.length || 0;
         setActionMessage({ type: 'success', text: `Updated ${downloaded} module(s), hot-reloaded ${reloaded}. No restart needed.` });
-        // Re-check to refresh state
+      } else {
+        setActionMessage({ type: 'error', text: result.message || result.error || 'Failed to update modules' });
+      }
+      if (result.download) {
         const recheck = await api.post('/update/check-all');
         if (recheck.success) setCheckResult(recheck);
-      } else {
-        setActionMessage({ type: 'error', text: result.error || result.message || 'Failed to update modules' });
       }
     } catch (error) {
       setActionMessage({ type: 'error', text: 'Failed to update modules: ' + error.message });
