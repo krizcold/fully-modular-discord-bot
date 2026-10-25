@@ -52,7 +52,7 @@ import { clearStandInStaging, landStandInStagingOrWarn, reconcileStandInStaging,
 import { closeStandInLane, rememberLineageVerdict, seizedEpisode, standInEnding, writeEpisodeRecordOrWarn } from './episodeRecord';
 import { backupModeEnabled, leverRank, readModeOverride } from './modeOverride';
 import { clearOwnSyncPosture } from './syncPosture';
-import { Registry, RegistryNode } from './registry';
+import { Registry, RegistryNode, persistedNodeOf } from './registry';
 import { ControlServer } from './controlServer';
 import { ControlClient } from './controlClient';
 import { LeaseRuntime } from './leaseRuntime';
@@ -3193,13 +3193,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     });
     persistedPlanKey = key;
     await store.saveRegistry({
-      nodes: [...registry.nodes.values()].map(n => ({
-        nodeId: n.nodeId,
-        nodeName: n.nodeName,
-        appVersion: n.appVersion,
-        capabilities: n.capabilities,
-        lastSeenAt: Date.now(),
-      })),
+      nodes: [...registry.nodes.values()].map(n => persistedNodeOf(n, Date.now())),
       lostNodes: healthMonitor?.getLossEvents(),
       updatedAt: Date.now(),
     });

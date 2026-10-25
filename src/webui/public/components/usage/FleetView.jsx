@@ -209,18 +209,29 @@ function migrationWarning(dataBackend) {
 }
 
 // Master-only Move action for an OWNED shard: pick a target node, run a
-// precheck (est size, target free space, direction), confirm, then submit.
+// precheck (eligibility and direction; size and free space are measured when the move starts), confirm, then submit.
 function FleetMoveControl({ shardId, fromNodeId, nodes, dataBackend, onStarted }) {
   const targets = nodes.filter((n) => n.nodeId !== fromNodeId && n.connected !== false && !n.draining);
   const [toNodeId, setToNodeId] = React.useState((targets[0] && targets[0].nodeId) || '');
   const [busy, setBusy] = React.useState(false);
+  const targetKey = targets.map((n) => n.nodeId).join(',');
+  React.useEffect(() => {
+    if (!toNodeId || targets.some((n) => n.nodeId === toNodeId)) {
+      if (!toNodeId && targets[0]) setToNodeId(targets[0].nodeId);
+      return;
+    }
+    const gone = nodes.find((n) => n.nodeId === toNodeId);
+    showToast(`${gone ? gone.nodeName : toNodeId} is no longer eligible; pick a target again`, 'error');
+    setToNodeId((targets[0] && targets[0].nodeId) || '');
+  }, [targetKey]);
 
   if (targets.length === 0) {
     return <span style={{ color: '#777', fontSize: '0.78rem' }}>no eligible target</span>;
   }
 
   const move = () => {
-    if (!toNodeId || busy) return;
+    const target = targets.find((n) => n.nodeId === toNodeId);
+    if (!target || busy) return;
     setBusy(true);
     api.post('/fleet/migrate/precheck', { kind: 'move', shardId, toNodeId })
       .then((res) => {
@@ -234,12 +245,14 @@ function FleetMoveControl({ shardId, fromNodeId, nodes, dataBackend, onStarted }
         const sizeLine = dataBackend === 'postgres'
           ? `${guildN} guild(s) hand off through the database (no file copy).\n\n`
           : (() => {
-            const estMb = p.estBytes != null ? Math.round(p.estBytes / 1048576) : '?';
+            if (p.estBytes == null) {
+              return `${guildN} guild(s), direction ${p.direction || '?'}. Size and target free space are measured when the move starts.\n\n`;
+            }
             const freeMb = p.targetFreeBytes != null ? Math.round(p.targetFreeBytes / 1048576) : 'unknown';
-            return `~${estMb} MB across ${guildN} guild(s), target free ~${freeMb} MB, direction ${p.direction || '?'}.\n\n`;
+            return `~${Math.round(p.estBytes / 1048576)} MB across ${guildN} guild(s), target free ~${freeMb} MB, direction ${p.direction || '?'}.\n\n`;
           })();
         if (!confirm(
-          `Move shard ${shardId} to the selected node?\n`
+          `Move shard ${shardId} to ${target.nodeName}?\n`
           + sizeLine
           + warnText
           + migrationWarning(dataBackend)
@@ -278,6 +291,20 @@ function FleetRetireControl({ node, nodes, shardTable, dataBackend, onStarted })
   const owned = (node.shardIds || []).slice();
   const targets = nodes.filter((n) => n.nodeId !== node.nodeId && n.connected !== false && !n.draining);
   const [targetByShard, setTargetByShard] = React.useState({});
+  const targetKey = targets.map((n) => n.nodeId).join(',');
+  React.useEffect(() => {
+    const stale = Object.keys(targetByShard).filter((shardId) => !targets.some((n) => n.nodeId === targetByShard[shardId]));
+    if (stale.length === 0) return;
+    for (const shardId of stale) {
+      const gone = nodes.find((n) => n.nodeId === targetByShard[shardId]);
+      showToast(`${gone ? gone.nodeName : targetByShard[shardId]} is no longer eligible; pick a target for shard ${shardId} again`, 'error');
+    }
+    setTargetByShard((prev) => {
+      const next = Object.assign({}, prev);
+      for (const shardId of stale) delete next[shardId];
+      return next;
+    });
+  }, [targetKey]);
 
   if (owned.length === 0 || targets.length === 0) return null;
 
@@ -286,10 +313,13 @@ function FleetRetireControl({ node, nodes, shardTable, dataBackend, onStarted })
   const submit = () => {
     if (busy) return;
     const targetsMap = {};
+    const lines = [];
     for (const shardId of owned) {
       const t = targetByShard[shardId] || (targets[0] && targets[0].nodeId);
-      if (!t) { showToast(`Choose a target for shard ${shardId}`, 'error'); return; }
+      const target = targets.find((n) => n.nodeId === t);
+      if (!target) { showToast(`Choose a target for shard ${shardId}`, 'error'); return; }
       targetsMap[String(shardId)] = t;
+      lines.push(`shard ${shardId} to ${target.nodeName}`);
     }
     setBusy(true);
     api.post('/fleet/migrate/precheck', { kind: 'retire', nodeId: node.nodeId, targets: targetsMap })
@@ -298,7 +328,7 @@ function FleetRetireControl({ node, nodes, shardTable, dataBackend, onStarted })
         if (pre && pre.success === false) { showToast(pre.error || 'Precheck failed', 'error'); return null; }
         const warnText = (p.warnings || []).length ? `WARNING: ${p.warnings.join('; ')}\n\n` : '';
         if (!confirm(
-          `Retire ${node.nodeName}? Its ${owned.length} shard(s) will be moved one at a time to the chosen targets.\n\n`
+          `Retire ${node.nodeName}? Its ${owned.length} shard(s) will be moved one at a time: ${lines.join(', ')}.\n\n`
           + warnText
           + migrationWarning(dataBackend)
         )) return null;

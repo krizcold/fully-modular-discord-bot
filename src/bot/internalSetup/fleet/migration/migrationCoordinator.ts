@@ -40,6 +40,7 @@ import {
   XferVerifyPayload,
 } from '../protocol';
 import { routeFor } from '../../utils/dataBackends/routeResolver';
+import { declaredCapacityOf } from '../placement';
 import type { Registry } from '../registry';
 import type { HeldShardView, MigrationActiveView, MigrationLegView, MigrationView } from '../state';
 
@@ -57,7 +58,8 @@ type OwedLeg = { rec: MigrationRecord; leg: MigrationLeg; nodeId: string };
 export interface PrecheckResult {
   ok: boolean;
   error?: string;
-  estBytes?: number;
+  /** Null when the precheck did not measure it (a move measures size and free space when it starts). */
+  estBytes?: number | null;
   targetFreeBytes?: number | null;
   direction?: TransferDirection;
   guilds?: string[];
@@ -865,7 +867,10 @@ export class MigrationCoordinator {
     if (direction === 'none' && !this.hooks.dataBackendHealthy()) {
       return { ok: false, error: 'database unreachable from the master; cannot start a lease-only migration' };
     }
-    let estBytes = 0;
+    for (const leg of legs.legs) {
+      const gate = this.precheckLeg(leg);
+      if (!gate.ok) return { ok: false, error: gate.error };
+    }
     const guilds: string[] = [];
     for (const leg of legs.legs) { for (const g of leg.guilds) guilds.push(g); }
     const warnings: string[] = [];
@@ -882,7 +887,7 @@ export class MigrationCoordinator {
       if (d <= 0) continue;
       const node = this.hooks.registry.nodes.get(nodeId);
       if (!node) continue;
-      const cap = Math.max(1, node.capabilities?.shardCapacity ?? 1);
+      const cap = declaredCapacityOf(node);
       // Pending-confirmation grants book capacity like held leases do in the
       // placement headroom math.
       let pending = 0;
@@ -890,11 +895,13 @@ export class MigrationCoordinator {
         if (p.nodeId === nodeId) pending += 1;
       }
       const projected = this.hooks.registry.shardIdsOf(nodeId).length + pending + d;
-      if (projected > cap) {
+      if (cap === 0) {
+        warnings.push(`target ${node.nodeName} declares a shard capacity of 0 (a standby) and will hold ${projected}`);
+      } else if (projected > cap) {
         warnings.push(`target ${node.nodeName} will exceed its declared capacity (${projected}/${cap})`);
       }
     }
-    return { ok: true, estBytes, direction, guilds, warnings };
+    return { ok: true, estBytes: null, targetFreeBytes: null, direction, guilds, warnings };
   }
 
   private validateCommon(payload: StartPayload): PrecheckResult {
@@ -1278,7 +1285,7 @@ export class MigrationCoordinator {
   private keepOwingKnown(nodeId: string, leg: MigrationLeg | undefined): void {
     const registry = this.hooks.registry;
     if (!leg || leg.sourceLostAt !== undefined || nodeId === this.hooks.selfNodeId || registry.nodes.has(nodeId)) return;
-    registry.restoreNode({ nodeId, nodeName: leg.committed?.sourceName ?? nodeId, appVersion: '', capabilities: { shardCapacity: 1, dataBackend: 'unknown' } });
+    registry.restoreNode({ nodeId, nodeName: leg.committed?.sourceName ?? nodeId, appVersion: '', capabilities: { shardCapacity: 1, dataBackend: 'unknown' }, capacityUnknown: true });
   }
 
   private clearPendingSourceLeg(rec: MigrationRecord, nodeId: string, legId: string): void {
@@ -2316,7 +2323,7 @@ export class MigrationCoordinator {
     const candidates = connected;
     const capOf = (nodeId: string) => {
       const n = this.hooks.registry.nodes.get(nodeId);
-      return Math.max(1, n?.capabilities?.shardCapacity ?? 1);
+      return n ? declaredCapacityOf(n) : 1;
     };
     const held = new Map<string, number>();
     for (const n of connected) held.set(n.nodeId, 0);
@@ -2330,12 +2337,17 @@ export class MigrationCoordinator {
       // Least-loaded candidate by held/capacity ratio (capacity-balanced).
       let best: string | null = null;
       let bestScore = Infinity;
-      for (const n of candidates) {
-        if (owing.get(shardId)?.has(n.nodeId)) continue;
-        const has = held.get(n.nodeId) ?? 0;
-        const cap = capOf(n.nodeId);
-        const score = has / cap;
-        if (score < bestScore) { bestScore = score; best = n.nodeId; }
+      // A node declaring 0 is a candidate only when no other one can take the shard.
+      for (const standby of [false, true]) {
+        for (const n of candidates) {
+          if (owing.get(shardId)?.has(n.nodeId)) continue;
+          const cap = capOf(n.nodeId);
+          if ((cap === 0) !== standby) continue;
+          const has = held.get(n.nodeId) ?? 0;
+          const score = standby ? has : has / cap;
+          if (score < bestScore) { bestScore = score; best = n.nodeId; }
+        }
+        if (best) break;
       }
       if (best) {
         this.proposal.set(shardId, best);
@@ -2372,7 +2384,7 @@ export class MigrationCoordinator {
     for (const [nodeId, count] of load) {
       const node = this.hooks.registry.nodes.get(nodeId);
       if (!node) continue;
-      const cap = Math.max(1, node.capabilities?.shardCapacity ?? 1);
+      const cap = declaredCapacityOf(node);
       if (count > cap) warnings.push(`${node.nodeName} will exceed its declared capacity (${count}/${cap})`);
     }
     if (unreachable.length > 0) {
@@ -2461,6 +2473,7 @@ export class MigrationCoordinator {
     if (!target) return { ok: false, error: `target ${targetNodeId} unknown` };
     if (!source.connected && !source.isSelf) return { ok: false, error: `source ${source.nodeName} not connected` };
     if (!target.connected && !target.isSelf) return { ok: false, error: `target ${target.nodeName} not connected` };
+    if (target.draining) return { ok: false, error: `target ${target.nodeName} is draining; restart it to rejoin placement` };
     if (reg.healthOf(source) !== 'up') return { ok: false, error: `source ${source.nodeName} is not healthy` };
     if (reg.healthOf(target) !== 'up') return { ok: false, error: `target ${target.nodeName} is not healthy` };
     const held = reg.shardTable.get(shardId);

@@ -284,10 +284,12 @@ export function planPinRestoreLegs(
 
   const legs: PinRestoreLeg[] = [{ shardId: pinnedShardId, fromNodeId: held.nodeId, toNodeId: masterNodeId }];
 
-  const masterCapacity = Math.max(1, master.capabilities?.shardCapacity ?? 1);
+  const masterCapacity = declaredCapacityOf(master);
   const masterHeld = registry.shardIdsOf(masterNodeId).length;
-  // After receiving the pinned shard the master would hold masterHeld + 1.
-  if (masterHeld + 1 <= masterCapacity) {
+  // After receiving the pinned shard the master would hold masterHeld + 1; the
+  // pinned shard is the master's whatever its capacity, so with nothing else
+  // held there is nothing to displace.
+  if (masterHeld + 1 <= masterCapacity || masterHeld === 0) {
     return { proposedLegs: legs };
   }
 
@@ -302,17 +304,19 @@ export function planPinRestoreLegs(
 
   // Prefer the pinned shard's current holder if it will have capacity after
   // giving up the pinned shard; else any connected node with free capacity.
-  const holderCapacity = Math.max(1, holder.capabilities?.shardCapacity ?? 1);
+  // A holder declaring 0 takes it back only when no other node has room.
+  const holderCapacity = declaredCapacityOf(holder);
   const holderHeldAfter = registry.shardIdsOf(held.nodeId).length - 1; // it releases the pinned shard
   let target: string | null = holderHeldAfter < holderCapacity ? held.nodeId : null;
   if (!target) {
     for (const node of registry.nodes.values()) {
       if (node.nodeId === masterNodeId || node.nodeId === held.nodeId) continue;
       if (!node.connected || node.draining) continue;
-      const cap = Math.max(1, node.capabilities?.shardCapacity ?? 1);
+      const cap = declaredCapacityOf(node);
       if (registry.shardIdsOf(node.nodeId).length < cap) { target = node.nodeId; break; }
     }
   }
+  if (!target && holderCapacity === 0 && !holder.draining) target = held.nodeId;
   if (!target) return { proposedLegs: null, reason: 'no-capacity' };
   legs.push({ shardId: displaced, fromNodeId: masterNodeId, toNodeId: target });
   return { proposedLegs: legs };

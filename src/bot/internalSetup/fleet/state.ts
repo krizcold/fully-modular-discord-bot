@@ -40,7 +40,7 @@ export interface FleetStateNode {
   health: 'up' | 'late' | 'down';
   appVersion: string;
   capabilities: { shardCapacity: number; dataBackend: string; backupMaster?: boolean; activeCapable?: boolean };
-  capacity: number;
+  capacity: number | null;
   onHold: boolean;
   shardIds: number[];
   guildCount: number;
@@ -783,7 +783,7 @@ export function getFleetState(): FleetState {
       health: registry.healthOf(node),
       appVersion: node.appVersion,
       capabilities: node.capabilities,
-      capacity: node.capabilities?.shardCapacity ?? 1,
+      capacity: node.capacityUnknown ? null : (node.capabilities?.shardCapacity ?? 1),
       onHold: !node.isSelf && node.connected && registry.shardIdsOf(node.nodeId).length === 0,
       shardIds: registry.shardIdsOf(node.nodeId),
       guildCount: node.guildCount,

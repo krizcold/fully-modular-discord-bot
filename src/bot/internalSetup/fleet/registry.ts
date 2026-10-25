@@ -19,8 +19,21 @@ import { guildIdToShardId } from './placement';
 
 export type NodeHealth = 'up' | 'late' | 'down';
 
+export function persistedNodeOf(n: RegistryNode, lastSeenAt: number) {
+  return {
+    nodeId: n.nodeId,
+    nodeName: n.nodeName,
+    appVersion: n.appVersion,
+    capabilities: n.capabilities,
+    lastSeenAt,
+    ...(n.capacityUnknown ? { capacityUnknown: true } : {}),
+  };
+}
+
 export interface RegistryNode {
   nodeId: string;
+  /** Restored without a registration: its declared capacity is not known. */
+  capacityUnknown?: boolean;
   nodeName: string;
   appVersion: string;
   capabilities: NodeCapabilities;
@@ -154,6 +167,7 @@ export class Registry {
     nodeName: string;
     appVersion: string;
     capabilities: NodeCapabilities;
+    capacityUnknown?: boolean;
   }): RegistryNode {
     const node: RegistryNode = {
       nodeId: input.nodeId,
@@ -163,6 +177,7 @@ export class Registry {
       isSelf: false,
       connected: false,
       needsGrant: true,
+      capacityUnknown: input.capacityUnknown === true,
       heldLeases: null,
       downSince: null,
       draining: false,
