@@ -1562,7 +1562,7 @@ function FleetEpisodeCard({ fleet }) {
     <div className="usage-stat-card" style={{ marginTop: '10px' }}>
       <div className="usage-stat-title">{title}</div>
       <div className="usage-stat-sub">
-        {`${standIn} stood in for ${covering} from ${at(e.standInSince)}${e.writesFrom ? `, taking writes from ${at(e.writesFrom)}` : ''}, until ${at(e.endedAt)}: ${ENDING[e.ending] || e.ending}${e.detail ? ` (${e.detail})` : ''}.`}
+        {`${e.side === 'master' ? `${covering} first saw ${standIn} standing in for it at ${at(e.standInSince)}, and ${standIn} stood in` : `${standIn} stood in for ${covering} from ${at(e.standInSince)}`}${e.writesFrom ? `, taking writes from ${at(e.writesFrom)}` : ''}, until ${at(e.endedAt)}: ${ENDING[e.ending] || e.ending}${e.detail ? ` (${e.detail})` : ''}.`}
       </div>
       <div className="usage-stat-sub" style={{ marginTop: '4px', color: e.writesSurvived === 'no' ? '#e5534b' : e.writesSurvived === 'held' || e.writesSurvived === 'partial' || (e.writesSurvived === 'yes' && heldForGood) ? '#e0a030' : undefined }}>
         {(WRITES[e.writesSurvived] || '') + lineage}

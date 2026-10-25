@@ -35,7 +35,7 @@ export interface EpisodeRecord {
   standInName: string | null;
   coveringNodeId: string;
   coveringName: string | null;
-  /** When the stand-in armed (its own record), or when the master first saw it holding. */
+  /** Stand-in side: when it armed. Master side: when this node first saw it holding (it may have begun earlier). */
   standInSince: number;
   /** When the stand-in's copy took writes; null when it never did, or when this side cannot know. */
   writesFrom: number | null;
