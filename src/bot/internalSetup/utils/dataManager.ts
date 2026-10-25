@@ -801,7 +801,7 @@ export async function restoreGuildFromGraveyard(guildId: string, retiredAt?: num
       return { ok: true, moved: res.moved };
     }
     if (res.reason === 'live-rows') return { ok: false, error: 'live guild data exists; delete it before restoring' };
-    throw new DataBackendUnavailableError('database-unreachable');
+    throw new DataBackendUnavailableError(pgBackend.isReadOnly() ? 'database-read-only' : 'database-unreachable');
   }
   return restoreGuildDirFromGraveyard(guildId, retiredAt);
 }
