@@ -580,7 +580,7 @@ export function saveDataOutcome<T = any>(filename: string, options: DataOptions,
       }
       if (result === 'frozen-window') { frozenWriteRejections += 1; return 'frozen'; }
       if (result === 'not-ready') return 'refused';
-      throw new DataBackendUnavailableError(result === 'fenced' ? 'guild-fenced' : result === 'read-only' ? 'database-read-only' : 'database-unreachable');
+      throw new DataBackendUnavailableError(result === 'fenced' ? 'guild-fenced' : result === 'stale-copy' ? 'database-stale-copy' : result === 'read-only' ? 'database-read-only' : 'database-unreachable');
     }
     const dir = getDataDirectory(options);
     const filePath = getDataFilePath(filename, options);
@@ -629,7 +629,7 @@ export function appendData(filename: string, options: DataOptions, line: string)
       }
       if (result === 'frozen-window') { frozenWriteRejections += 1; return false; }
       if (result === 'not-ready') return false;
-      throw new DataBackendUnavailableError(result === 'fenced' ? 'guild-fenced' : result === 'read-only' ? 'database-read-only' : 'database-unreachable');
+      throw new DataBackendUnavailableError(result === 'fenced' ? 'guild-fenced' : result === 'stale-copy' ? 'database-stale-copy' : result === 'read-only' ? 'database-read-only' : 'database-unreachable');
     }
     const dir = getDataDirectory(options);
     const filePath = getDataFilePath(filename, options);
@@ -697,7 +697,7 @@ export function deleteDataOutcome(filename: string, options: DataOptions): 'dele
       }
       if (result === 'frozen-window') { frozenWriteRejections += 1; return 'frozen'; }
       if (result === 'not-ready') return 'refused';
-      throw new DataBackendUnavailableError(result === 'fenced' ? 'guild-fenced' : result === 'read-only' ? 'database-read-only' : 'database-unreachable');
+      throw new DataBackendUnavailableError(result === 'fenced' ? 'guild-fenced' : result === 'stale-copy' ? 'database-stale-copy' : result === 'read-only' ? 'database-read-only' : 'database-unreachable');
     }
     const filePath = getDataFilePath(filename, options);
 
@@ -801,7 +801,7 @@ export async function restoreGuildFromGraveyard(guildId: string, retiredAt?: num
       return { ok: true, moved: res.moved };
     }
     if (res.reason === 'live-rows') return { ok: false, error: 'live guild data exists; delete it before restoring' };
-    throw new DataBackendUnavailableError(pgBackend.isReadOnly() ? 'database-read-only' : 'database-unreachable');
+    throw new DataBackendUnavailableError(pgBackend.isStaleCopy?.() ? 'database-stale-copy' : pgBackend.isReadOnly() ? 'database-read-only' : 'database-unreachable');
   }
   return restoreGuildDirFromGraveyard(guildId, retiredAt);
 }

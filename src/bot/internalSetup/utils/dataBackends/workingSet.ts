@@ -17,7 +17,7 @@ const FENCED_DRAIN_MS = 30_000;
 const RETRY_BASE_MS = 1000;
 const RETRY_CAP_MS = 30_000;
 
-export type WsWriteResult = 'accepted' | 'frozen-window' | 'refusing' | 'fenced' | 'not-ready' | 'read-only';
+export type WsWriteResult = 'accepted' | 'frozen-window' | 'refusing' | 'fenced' | 'not-ready' | 'read-only' | 'stale-copy';
 export type WsReadResult =
   | { status: 'ready'; value: unknown | undefined }   // undefined = absent or tombstoned
   | { status: 'not-ready' };
@@ -29,12 +29,14 @@ export type FlushNowOutcome = 'ok' | 'pending' | 'held' | 'deposed' | 'unavailab
  * drain). Module code never catches it by contract; the dispatch wrappers do
  * and surface the cause.
  */
-export type DataUnavailableCause = 'database-unreachable' | 'guild-fenced' | 'database-read-only' | 'node-stopping';
+export type DataUnavailableCause = 'database-unreachable' | 'guild-fenced' | 'database-read-only' | 'database-stale-copy' | 'node-stopping';
 
 export class DataBackendUnavailableError extends Error {
   constructor(readonly causeKey: DataUnavailableCause) {
     super(causeKey === 'guild-fenced'
       ? '[Data] This guild was taken over by another node; the write was not saved'
+      : causeKey === 'database-stale-copy'
+        ? '[Data] The database serving this node is an outdated copy of the fleet database (its control row holds an older term); the write was not saved'
       : causeKey === 'database-read-only'
         ? '[Data] The database serving this node is a copy in recovery and accepts no writes (SQLSTATE 25006); the write was not saved'
         : causeKey === 'node-stopping'
@@ -519,6 +521,7 @@ export class WorkingSetManager {
     }
     if (ws.state === 'frozen-retained') return 'frozen-window';
     if (ws.state === 'fenced') return 'fenced';
+    if (this.backend.isStaleCopy?.()) return 'stale-copy';
     if (this.backend.isReadOnly()) return 'read-only';
     if (this.health === 'refusing') return 'refusing';
     return 'ok';

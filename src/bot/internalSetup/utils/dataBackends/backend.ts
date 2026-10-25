@@ -65,5 +65,7 @@ export interface DataBackend {
   healthy(): boolean;
   /** The store refuses writes (a copy in recovery, SQLSTATE 25006) while reads keep serving. */
   isReadOnly(): boolean;
+  /** The store is an older copy of the fleet database: it refuses every write for good. */
+  isStaleCopy?(): boolean;
   onAlert(cb: (event: 'outage' | 'recovered' | 'deposed', detail: string) => void): void;
 }
