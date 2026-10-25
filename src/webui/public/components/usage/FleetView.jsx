@@ -1671,7 +1671,8 @@ function FleetStandInBanner({ fleet }) {
     const n = (fleet.nodes || []).find(x => x.nodeId === id);
     return n ? n.nodeName : id.slice(0, 8);
   };
-  const at = (ms) => new Date(ms).toISOString().slice(11, 16) + ' UTC';
+  const at = (ms) => new Date(ms).toISOString().slice(0, 16).replace('T', ' ') + ' UTC';
+  const soon = (ms) => new Date(ms).toISOString().slice(11, 16) + ' UTC';
   if (!s.live) {
     if (s.phase !== 'disarmed' || !s.disarmedAt) return null;
     // The lane's own episode record says how it ended (it is this lane's when
@@ -1681,7 +1682,7 @@ function FleetStandInBanner({ fleet }) {
     const lane = e && e.side === 'stand-in' && e.standInNodeId === fleet.nodeId && e.standInSince === s.armedAt ? e : null;
     return (
       <div className="usage-stat-sub" style={{ marginTop: '6px' }}>
-        {`Last stand-in attempt for ${nameOf(s.coveringNodeId)} ended at ${at(lane ? lane.endedAt : s.disarmedAt)}: ${lane ? lane.detail : (s.disarmReason || 'no reason recorded')}.${s.rearmAfter && Date.now() < s.rearmAfter ? ` The lane may arm again after ${at(s.rearmAfter)}.` : ''}`}
+        {`Last stand-in attempt for ${nameOf(s.coveringNodeId)} ended at ${at(lane ? lane.endedAt : s.disarmedAt)}: ${lane ? lane.detail : (s.disarmReason || 'no reason recorded')}.${s.rearmAfter && Date.now() < s.rearmAfter ? ` The lane may arm again after ${soon(s.rearmAfter)}.` : ''}`}
       </div>
     );
   }
@@ -1834,7 +1835,8 @@ function FleetSeedHoldBanner({ api, hold, reload }) {
   };
   const confirmFresh = () => {
     if (busy) return;
-    if (!confirm('Confirm this is a BRAND-NEW fleet?\n\nOnly do this when no backup anywhere holds real data for this bot. This machine mints a term above every beacon on an empty data directory and serves. If a backup with real data exists, cancel and seed this machine from its copy instead.')) return;
+    const refusedText = refused.length > 0 ? `\n\nThis hold refused ${refused.length === 1 ? 'a node' : `${refused.length} nodes`} that may hold data: ${refused.map((r) => `${r.nodeName} (${r.reason})`).join('; ')}.` : '';
+    if (!confirm(`Confirm this is a BRAND-NEW fleet?\n\nOnly do this when no backup anywhere holds real data for this bot. This machine mints a term above every beacon on an empty data directory and serves. If a backup with real data exists, cancel and seed this machine from its copy instead.${refusedText}`)) return;
     setBusy(true);
     api.post('/fleet/confirm-fresh', {})
       .then((res) => {
@@ -1844,6 +1846,7 @@ function FleetSeedHoldBanner({ api, hold, reload }) {
       .catch((err) => showToast((err && err.message) || 'Confirm failed', 'error'))
       .finally(() => setBusy(false));
   };
+  const refused = hold.refused || [];
   const where = hold.controlUrl ? hold.controlUrl : `ws://<this machine>:${hold.controlPort} (its FLEET_PUBLIC_URL when it has one)`;
   const push = hold.push;
   const pushText = push
@@ -1853,14 +1856,16 @@ function FleetSeedHoldBanner({ api, hold, reload }) {
     <div className="usage-notice" style={{ borderColor: '#e0a030', color: '#e0a030' }}>
       {`SEED HOLD: this master holds no guild data while the witness shows the fleet at term ${hold.holdTerm}${hold.beaconedBy ? ` (beaconed by ${hold.beaconedBy})` : ''} and no live master. It will not mint a term and serve empty while a backup may hold the real data. Point the designated backup at this machine (${where}): reuse the old master's address for it, or edit the master list on the backup's own Fleet tab; it registers here and offers the copy it holds, and the seed is confirmed below. Or demote this node to rejoin the fleet as a co-worker. Only confirm a brand-new fleet when no backup anywhere holds data for this bot.${hold.transferUrl ? '' : ' TRANSFER_URL is not set on this node: the backup pushes the copy to that address, so set it and restart this bot before confirming a seed.'}${hold.interrupted ? ` ${hold.interrupted}` : ''}${hold.lastError ? ` Last seed attempt failed: ${hold.lastError}.` : ''}${pushText}`}
       {hold.backups.length === 0 ? (
-        <div className="usage-stat-sub" style={{ marginTop: '6px' }}>No backup has registered here yet.</div>
+        <div className="usage-stat-sub" style={{ marginTop: '6px' }}>{refused.length > 0 ? `No backup has registered here; ${refused.length} refused (below).` : 'No backup has registered here yet.'}</div>
       ) : hold.backups.map((b) => {
         const o = b.offer;
         const text = o
           ? (o.kind === 'mirror'
             ? `${b.nodeName}: offers its copy of ${o.sourceNodeName}'s guild data (term ${o.sourceTerm}), last complete ${fleetFormatAge(o.ageMs)} (${plural(o.guildCount, 'guild')}, ${mb(o.totalBytes)} MB${o.partialCount > 0 ? `; ${o.partialCount} partial since then` : ''})`
             : `${b.nodeName}: offers its own guild data from its mastership at term ${o.sourceTerm} (live, ${plural(o.guildCount, 'guild')}, ${mb(o.totalBytes)} MB)`)
-          : `${b.nodeName}: registered, no copy to offer${b.offerReason ? `: ${b.offerReason}` : (b.offerAt == null ? ' (asking)' : '')}`;
+          : b.offerAt == null ? `${b.nodeName}: registered, asking what copy it holds`
+          : b.offerFault ? `${b.nodeName}: registered, but ${b.offerReason}; its copy is not known, and it is asked again while it stays connected`
+          : `${b.nodeName}: registered, no copy to offer${b.offerReason ? `: ${b.offerReason}` : ''}`;
         return (
           <div key={b.nodeId} className="usage-stat-sub" style={{ marginTop: '6px', color: b.connected ? undefined : '#777' }}>
             {`${text}${b.connected ? '' : ' (disconnected now)'}`}
@@ -1872,6 +1877,11 @@ function FleetSeedHoldBanner({ api, hold, reload }) {
           </div>
         );
       })}
+      {refused.map((r) => (
+        <div key={`refused-${r.nodeId}`} className="usage-stat-sub" style={{ marginTop: '6px', color: '#ed4245' }}>
+          {`${r.nodeName}: refused at ${new Date(r.at).toISOString().slice(0, 19).replace('T', ' ')} UTC (${r.attempts === 1 ? '1 attempt' : `${r.attempts} attempts`}): ${r.reason}`}
+        </div>
+      ))}
       <div><FleetDemoteButton api={api} /></div>
       {push ? null : (
         <div>

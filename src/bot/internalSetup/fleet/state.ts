@@ -481,7 +481,18 @@ export interface SeedHoldBackupView {
   connected: boolean;
   offer: SeedHoldOfferView | null;
   offerReason: string | null;
+  /** The offer request timed out ('unanswered') or its answer could not be read ('unreadable'): the copy is unknown, not absent. */
+  offerFault: 'unanswered' | 'unreadable' | null;
   offerAt: number | null;
+}
+
+/** A node the seed hold refused to register: its latest reason, when, and how many tries. */
+export interface SeedHoldRefusalView {
+  nodeId: string;
+  nodeName: string;
+  reason: string;
+  at: number;
+  attempts: number;
 }
 
 export interface SeedPushProgressView {
@@ -507,6 +518,7 @@ export interface SeedHoldView {
   controlUrl: string | null;
   controlPort: number;
   backups: SeedHoldBackupView[];
+  refused: SeedHoldRefusalView[];
   push: SeedPushProgressView | null;
   lastError: string | null;
   interrupted: string | null;
