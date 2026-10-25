@@ -208,7 +208,7 @@ export function discoverConfigFiles(): ConfigFileMetadata[] {
  * Loads module schemas first, then checks for guild-specific override files
  *
  * @param guildId - Guild ID to scan
- * @returns Array of discovered configs (includes schemas even if no override file exists)
+ * @returns Array of discovered configs: only files with a config schema (includes schemas even if no override file exists)
  */
 export function discoverGuildConfigFiles(guildId: string): ConfigFileMetadata[] {
   const discovered = new Map<string, ConfigFileMetadata>();
@@ -232,50 +232,6 @@ export function discoverGuildConfigFiles(guildId: string): ConfigFileMetadata[] 
       schema: schema.schema,
       moduleName: schema.moduleName
     });
-  }
-
-  // 3. Scan for any existing files that might not have schemas
-  // Load data schemas to exclude them from config discovery
-  // Need to include BOTH global AND guild-scoped data files in exclusion
-  const globalDataSchemas = discoverModuleDataSchemasFromDisk();
-  const guildDataSchemas = discoverGuildDataFiles(guildId);
-  const dataFileIds = new Set([
-    ...globalDataSchemas.map(d => `${d.moduleName}/${d.id.split('/').pop()}`),
-    ...guildDataSchemas.map(d => `${d.moduleName}/${d.id.split('/').pop()}`)
-  ]);
-
-  const guildDir = dataPath(guildId);
-  if (fs.existsSync(guildDir)) {
-    const existingFiles = scanDirectoryRecursive(guildDir, 'data', '', undefined, true);
-
-    for (const file of existingFiles) {
-      // Extract module name and filename for comparison
-      const pathParts = file.id.split('/');
-      const fileKey = pathParts.length >= 2 ? `${pathParts[0]}/${pathParts[pathParts.length - 1]}` : file.id;
-
-      // Skip if this file is a data file (defined in dataSchema)
-      if (dataFileIds.has(fileKey)) {
-        continue;
-      }
-
-      // Check if a schema already exists for this file
-      let foundSchema = false;
-      for (const [key, existing] of discovered.entries()) {
-        const existingFilename = key.split('/').pop();
-        const scannedFilename = file.id.split('/').pop();
-
-        if (existingFilename === scannedFilename && existing.moduleName) {
-          // This file has a schema entry - skip it (don't add duplicate)
-          foundSchema = true;
-          break;
-        }
-      }
-
-      if (!foundSchema && !discovered.has(file.id)) {
-        // File exists but has no schema - add it
-        discovered.set(file.id, file);
-      }
-    }
   }
 
   return Array.from(discovered.values());

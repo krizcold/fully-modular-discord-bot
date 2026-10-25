@@ -3,57 +3,35 @@
  */
 
 import { Client, TextChannel } from 'discord.js';
-import * as fs from 'fs/promises';
-import * as path from 'path';
-import { dataPath } from '../../../../utils/dataRoot';
+import { loadGlobalModuleData, loadModuleData, saveGlobalModuleData, saveModuleData } from '../dataManager';
 import { PersistentPanelInstance, PersistentPanelStorage } from '@bot/types/panelTypes';
 
-// Storage paths
-const GLOBAL_STORAGE_PATH = dataPath('global', 'persistent-panels.json');
+const STORAGE_FILE = 'persistent-panels.json';
+const STORAGE_NAMESPACE = '_panels';
 
 /**
- * Get the storage path for a specific guild or global
- */
-function getStoragePath(guildId?: string): string {
-  if (!guildId) {
-    return GLOBAL_STORAGE_PATH;
-  }
-  return dataPath(guildId, 'persistent-panels.json');
-}
-
-/**
- * Load persistent panel data from storage
+ * Load persistent panel data from the guild's data (global when no guild)
  */
 export async function loadPersistentPanels(guildId?: string): Promise<any> {
-  const storagePath = getStoragePath(guildId);
-
-  try {
-    const data = await fs.readFile(storagePath, 'utf-8');
-    return JSON.parse(data);
-  } catch (error: any) {
-    if (error.code === 'ENOENT') {
-      return {};
-    }
-    console.error(`Error loading persistent panels from ${storagePath}:`, error);
-    return {};
-  }
+  const data = guildId
+    ? loadModuleData<any>(STORAGE_FILE, guildId, STORAGE_NAMESPACE, {})
+    : loadGlobalModuleData<any>(STORAGE_FILE, STORAGE_NAMESPACE, {});
+  return data && typeof data === 'object' ? data : {};
 }
 
 /**
- * Save persistent panel data to storage
+ * Save persistent panel data: false when the write did not land
  */
-export async function savePersistentPanels(storage: any, guildId?: string): Promise<void> {
-  const storagePath = getStoragePath(guildId);
-
+export async function savePersistentPanels(storage: any, guildId?: string): Promise<boolean> {
   try {
-    // Ensure directory exists
-    const dir = path.dirname(storagePath);
-    await fs.mkdir(dir, { recursive: true });
-
-    // Save data
-    await fs.writeFile(storagePath, JSON.stringify(storage, null, 2));
+    const saved = guildId
+      ? saveModuleData(STORAGE_FILE, guildId, STORAGE_NAMESPACE, storage)
+      : saveGlobalModuleData(STORAGE_FILE, STORAGE_NAMESPACE, storage);
+    if (!saved) console.error(`[PersistentPanels] Panel records for ${guildId ?? 'global'} were not saved`);
+    return saved;
   } catch (error) {
-    console.error(`Error saving persistent panels to ${storagePath}:`, error);
+    console.error(`[PersistentPanels] Panel records for ${guildId ?? 'global'} were not saved:`, error);
+    return false;
   }
 }
 
@@ -121,7 +99,9 @@ export async function storePersistentPanel(
     };
   }
 
-  await savePersistentPanels(storage, guildId);
+  if (!(await savePersistentPanels(storage, guildId))) {
+    return { success: false };
+  }
 
   return { success: true, replacedInstance };
 }
@@ -149,8 +129,8 @@ export async function updatePersistentPanelState(
     instance.sessionData = { ...instance.sessionData, ...additionalData };
   }
 
-  await storePersistentPanel(panelId, instance, guildId, sessionId);
-  return true;
+  const result = await storePersistentPanel(panelId, instance, guildId, sessionId);
+  return result.success;
 }
 
 /**
@@ -174,16 +154,14 @@ export async function removePersistentPanel(
           delete storage[panelId];
         }
 
-        await savePersistentPanels(storage, guildId);
-        return true;
+        return savePersistentPanels(storage, guildId);
       }
     }
   } else {
     // Remove single-instance panel
     if (storage[panelId]) {
       delete storage[panelId];
-      await savePersistentPanels(storage, guildId);
-      return true;
+      return savePersistentPanels(storage, guildId);
     }
   }
 
@@ -292,22 +270,22 @@ export async function cleanupInvalidPanels(client: Client, guildId?: string): Pr
 }
 
 /**
- * Check if a message ID is the current active instance for a unique panel
- * Returns true if the message is the active instance, false otherwise
+ * Whether a message is the active instance of a unique panel: 'missing' when this
+ * node holds no record for the panel, which says nothing about a newer instance
  */
 export async function isActiveInstance(
   panelId: string,
   messageId: string,
   guildId?: string,
   sessionId?: string
-): Promise<boolean> {
+): Promise<'active' | 'replaced' | 'missing'> {
   const instance = await getPersistentPanel(panelId, guildId, sessionId);
 
   if (!instance) {
-    return false;
+    return 'missing';
   }
 
-  return instance.messageId === messageId;
+  return instance.messageId === messageId ? 'active' : 'replaced';
 }
 
 /**

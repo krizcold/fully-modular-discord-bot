@@ -247,12 +247,12 @@ export function loadGuildConfig(filename: string, guildId: string): any {
 }
 
 /**
- * Save entire guild-specific config file: 'frozen' or 'refused' when the
- * write did not land.
+ * Save entire guild-specific config file: 'frozen', 'refused' or 'no-schema'
+ * when the write did not land.
  * Guild configs are stored in /data/{guildId}/_guildConfig/config.json
  * Module configs are stored in /data/{guildId}/{moduleName}/{filename}
  */
-export function saveGuildConfig(filename: string, guildId: string, data: any): 'saved' | 'frozen' | 'refused' {
+export function saveGuildConfig(filename: string, guildId: string, data: any): 'saved' | 'frozen' | 'refused' | 'no-schema' {
   // Guild-specific config now lives inside the guild namespace.
   if (filename === 'config.json') {
     return saveDataOutcome('config.json', { guildId, category: '_guildConfig' }, data);
@@ -260,7 +260,11 @@ export function saveGuildConfig(filename: string, guildId: string, data: any): '
 
   // For module config files, use metadata to get correct path
   const metadata = getConfigFileMetadata(filename);
-  if (!metadata || !metadata.moduleName) {
+  if (!metadata || !metadata.schema) {
+    console.warn(`[ConfigManager] saveGuildConfig called for "${filename}", which has no config schema; skipping`);
+    return 'no-schema';
+  }
+  if (!metadata.moduleName) {
     console.warn(`[ConfigManager] saveGuildConfig called with undiscovered filename "${filename}"; skipping`);
     return 'refused';
   }

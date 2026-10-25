@@ -16,6 +16,7 @@ import {
 import { PanelContext, PanelOptions, PanelResponse, PanelInteraction } from '@bot/types/panelTypes';
 import { getPanelManager } from '../panelManager';
 import { storePersistentPanel } from './persistentPanelStorage';
+import { PanelNotRecordedError } from './persistentPanelResponse';
 import { storeNavigationContext } from './panelButtonHandler';
 import { injectReturnButtonIfNeeded } from './panelResponseUtils';
 import {
@@ -116,7 +117,7 @@ export async function handlePersistentWarningButton(
     });
 
     if (message instanceof Message) {
-      await storePersistentPanel(
+      const stored = await storePersistentPanel(
         panelId,
         {
           messageId: message.id,
@@ -132,6 +133,11 @@ export async function handlePersistentWarningButton(
         undefined,
         panel.maxActiveInstances
       );
+      if (!stored.success) {
+        let removed = true;
+        try { await message.delete(); } catch { removed = false; }
+        throw new PanelNotRecordedError(removed);
+      }
 
       storeNavigationContext(message.id, [], accessMethod);
 

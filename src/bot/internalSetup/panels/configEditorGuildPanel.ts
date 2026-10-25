@@ -173,6 +173,7 @@ const configEditorGuildPanel: PanelOptions = {
 
       // Perform the reset
       try {
+        requireSchema(discoverGuildConfigFiles(context.guildId).find(f => f.id === fileId));
         saveConfigFile(fileId, context.guildId, {});
       } catch (error) {
         return showError(`Reset failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
@@ -249,6 +250,7 @@ const configEditorGuildPanel: PanelOptions = {
           overridesOnly = parsedConfig;
         }
 
+        requireSchema(schemaMetadata);
         if (Object.keys(overridesOnly).length === 0) {
           if (schemaMetadata && schemaMetadata.moduleName) {
             deleteConfigFile(fileId, { guildId: context.guildId!, category: schemaMetadata.moduleName });
@@ -300,6 +302,7 @@ const configEditorGuildPanel: PanelOptions = {
 
     // Save config (or delete if no overrides)
     try {
+      requireSchema(schemaMetadata);
       if (Object.keys(overridesOnly).length === 0) {
         // No overrides - delete the config file through the facade.
         if (schemaMetadata && schemaMetadata.moduleName) {
@@ -336,6 +339,13 @@ const configEditorGuildPanel: PanelOptions = {
 function raiseRefusal(outcome: string): void {
   if (outcome === 'frozen') throw new Error('the guild\'s data is frozen for a shard migration; nothing was changed, try again after it completes');
   if (outcome === 'refused') throw new Error('the guild\'s data could not be changed now; nothing was changed, try again shortly');
+  if (outcome === 'no-schema') throw new Error(NO_SCHEMA_TEXT);
+}
+
+const NO_SCHEMA_TEXT = 'this file has no config schema; it cannot be edited here, and nothing was changed';
+
+function requireSchema(metadata: { schema?: unknown } | undefined): void {
+  if (!metadata?.schema) throw new Error(NO_SCHEMA_TEXT);
 }
 
 function deleteConfigFile(fileId: string, options: DataOptions): void {
