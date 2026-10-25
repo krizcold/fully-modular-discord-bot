@@ -12,6 +12,7 @@ import { buildConsoleInteraction } from './consoleInteraction';
 import { getFleetState } from '../fleet/state';
 import { guildIdToShardId } from '../fleet/placement';
 import { awaitGuildDataReady } from './dataBackends/boot';
+import { isCommandRunnable } from './commandGate';
 
 interface InvokePayload {
   command?: string;
@@ -40,6 +41,13 @@ async function handleInvoke(data: InvokePayload): Promise<Record<string, unknown
   if (!client || !client.isReady()) return { success: false, error: 'bot client not ready' };
 
   if (!commandExists(command)) return { success: false, error: `no such command: ${command}` };
+
+  const gate = isCommandRunnable(command);
+  if (!gate.runnable) {
+    return gate.reason === 'disabled'
+      ? { success: false, error: `${command} is disabled in Components` }
+      : { success: false, error: `can't confirm whether ${command} is enabled: component-config.json cannot be read (${gate.error})` };
+  }
 
   const guildId = data.guildId ? String(data.guildId) : null;
   const guild = guildId ? client.guilds.cache.get(guildId) || null : null;

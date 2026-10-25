@@ -6,6 +6,7 @@
  * of the final state after a silence period.
  *
  * Example: off→on→off→on→off in quick succession → single "off" after 1.5s
+ * One key's actions run one at a time, in the order they fired.
  */
 
 interface PendingToggle {
@@ -15,6 +16,7 @@ interface PendingToggle {
 
 export class ComponentToggleDebouncer {
   private pending: Map<string, PendingToggle> = new Map();
+  private running: Map<string, Promise<void>> = new Map();
   private delayMs: number;
 
   constructor(delayMs: number = 1500) {
@@ -36,13 +38,19 @@ export class ComponentToggleDebouncer {
       clearTimeout(existing.timer);
     }
 
-    const timer = setTimeout(async () => {
+    const timer = setTimeout(() => {
       this.pending.delete(key);
-      try {
-        await action(enabled);
-      } catch (err) {
-        console.error(`[ToggleDebouncer] Action failed for ${key}:`, err);
-      }
+      const run = (this.running.get(key) || Promise.resolve()).then(async () => {
+        try {
+          await action(enabled);
+        } catch (err) {
+          console.error(`[ToggleDebouncer] Action failed for ${key}:`, err);
+        }
+      });
+      this.running.set(key, run);
+      void run.then(() => {
+        if (this.running.get(key) === run) this.running.delete(key);
+      });
     }, this.delayMs);
 
     this.pending.set(key, { timer, finalEnabled: enabled });

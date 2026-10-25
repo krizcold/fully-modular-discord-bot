@@ -150,6 +150,10 @@ class ModuleEventManager {
     return total;
   }
 
+  hasEventListeners(moduleName: string, eventName: string): boolean {
+    return (this.listeners.get(moduleName) || []).some(t => t.eventName === eventName);
+  }
+
   /**
    * Check if a module has any registered listeners.
    */

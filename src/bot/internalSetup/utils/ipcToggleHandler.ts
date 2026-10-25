@@ -139,6 +139,11 @@ async function toggleEvent(
     const module = registry.getModule(moduleName);
     if (!module) return { success: false, error: `Module ${moduleName} not loaded` };
 
+    if (eventManager.hasEventListeners(moduleName, eventName)) {
+      console.log(`[Toggle] ${moduleName}:${eventName} is already attached`);
+      return { success: true };
+    }
+
     const handlers = module.events.get(eventName);
     if (!handlers || handlers.length === 0) {
       return { success: false, error: `No handlers for event ${eventName} in ${moduleName}` };
@@ -217,13 +222,24 @@ export function setupToggleIPCHandlers(client: Client): void {
   clientRef = client;
   console.log('[IPCToggleHandler] Setting up IPC handlers for component toggle');
 
-  process.on('message', async (message: any) => {
+  const toggleChains = new Map<string, Promise<void>>();
+
+  process.on('message', (message: any) => {
     if (!message || typeof message !== 'object') return;
     if (!clientRef) return;
 
     const { type, requestId, data } = message;
     if (type !== 'component:toggle' || !requestId) return;
 
+    const key = `${data?.module}:${data?.componentType}:${data?.name}`;
+    const run = (toggleChains.get(key) ?? Promise.resolve()).then(() => applyToggle(requestId, data));
+    toggleChains.set(key, run);
+    run.finally(() => { if (toggleChains.get(key) === run) toggleChains.delete(key); });
+  });
+}
+
+async function applyToggle(requestId: string, data: any): Promise<void> {
+    if (!clientRef) return;
     try {
       const { module: moduleName, componentType, name, enabled } = data;
       let response: any;
@@ -250,7 +266,6 @@ export function setupToggleIPCHandlers(client: Client): void {
         data: { success: false, error: error.message || String(error) }
       });
     }
-  });
 }
 
 // ─── Hot-Reload Compatibility ───

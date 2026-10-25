@@ -2017,15 +2017,17 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
 
       const key = `${moduleName}:${type}:${name}`;
       const config = loadComponentConfig();
+      const changed = (config[key] !== false) !== enabled;
 
-      if (enabled) {
-        delete config[key]; // Default is enabled, so just remove the override
-      } else {
-        config[key] = false;
+      if (changed) {
+        if (enabled) {
+          delete config[key]; // Default is enabled, so just remove the override
+        } else {
+          config[key] = false;
+        }
+        saveComponentConfig(config);
+        nudgeSync('appstore');
       }
-
-      saveComponentConfig(config);
-      nudgeSync('appstore');
 
       // Fire debounced runtime toggle (async, doesn't block response)
       if (botManager.isRunning()) {
@@ -2038,7 +2040,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
         });
       }
 
-      res.json({ success: true, key, enabled });
+      res.json({ success: true, key, enabled, changed, ...(changed ? {} : { message: enabled ? 'already enabled' : 'already disabled' }) });
     } catch (error) {
       const msg = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({ success: false, error: msg });
