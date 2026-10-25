@@ -31,6 +31,7 @@ export interface UpdateCheckResult {
 /** Combined update check result for base code + modules */
 export interface CombinedUpdateCheckResult {
   success: boolean;
+  partial?: boolean;
   lastChecked: string;
   baseCode: {
     checked: boolean;
@@ -43,6 +44,7 @@ export interface CombinedUpdateCheckResult {
     hasUpdates: boolean;
     totalInstalled: number;
     updatesAvailable: number;
+    unchecked?: number;
     updates: ModuleUpdateCheck[];
     errors: Array<{ moduleName: string; error: string }>;
   };
@@ -185,15 +187,29 @@ export async function checkForUpdates(): Promise<UpdateCheckResult> {
     const response = await botManagerRequest(`/api/bots/${BOT_ID}/updates`);
 
     if (!response.ok) {
+      updateStatus.lastError = response.error || `Bot Manager returned ${response.status}`;
       return {
         success: false,
         hasUpdates: false,
-        error: response.error || `Bot Manager returned ${response.status}`
+        error: updateStatus.lastError
       };
     }
 
-    const data = response.data as { hasUpdates?: boolean; behindBy?: number };
+    const data = response.data as { success?: boolean; checked?: boolean; hasUpdates?: boolean; behindBy?: number; message?: string; error?: string } | undefined;
+    if (!data || typeof data !== 'object' || data.success === false || data.checked === false) {
+      const detail = data && typeof data === 'object' ? (data.error || data.message) : undefined;
+      updateStatus.lastError = detail
+        ? `Bot Manager could not check for updates: ${detail}`
+        : 'Bot Manager gave no update check result';
+      return {
+        success: false,
+        hasUpdates: false,
+        error: updateStatus.lastError
+      };
+    }
+
     updateStatus.lastCheck = Date.now();
+    updateStatus.lastError = undefined;
 
     return {
       success: true,
@@ -247,6 +263,7 @@ export async function triggerUpdate(): Promise<UpdateTriggerResult> {
       };
     }
 
+    updateStatus.lastError = undefined;
     console.log('[Updater] Update request accepted by Bot Manager');
     console.log('[Updater] Bot Manager will pull latest code and restart the container');
 
@@ -298,6 +315,7 @@ export async function checkForAllUpdates(): Promise<CombinedUpdateCheckResult> {
       hasUpdates: false,
       totalInstalled: 0,
       updatesAvailable: 0,
+      unchecked: 0,
       updates: [],
       errors: []
     },
@@ -311,7 +329,7 @@ export async function checkForAllUpdates(): Promise<CombinedUpdateCheckResult> {
   try {
     const baseCodeResult = await checkForUpdates();
     result.baseCode = {
-      checked: true,
+      checked: baseCodeResult.success,
       hasUpdates: baseCodeResult.hasUpdates,
       commitsBehind: baseCodeResult.commitsBehind,
       error: baseCodeResult.error
@@ -337,6 +355,7 @@ export async function checkForAllUpdates(): Promise<CombinedUpdateCheckResult> {
         hasUpdates: moduleResult.updatesAvailable > 0,
         totalInstalled: installedModules.length,
         updatesAvailable: moduleResult.updatesAvailable,
+        unchecked: moduleResult.errors.length,
         updates: moduleResult.updates,
         errors: moduleResult.errors
       };
@@ -358,8 +377,8 @@ export async function checkForAllUpdates(): Promise<CombinedUpdateCheckResult> {
     hasAnyUpdates: result.baseCode.hasUpdates || result.modules.hasUpdates
   };
 
-  // Overall success if both checks completed
-  result.success = result.baseCode.checked && result.modules.checked;
+  result.partial = !result.baseCode.checked || !result.modules.checked || (result.modules.unchecked || 0) > 0;
+  result.success = !result.partial;
 
   return result;
 }

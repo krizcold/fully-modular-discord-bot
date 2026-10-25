@@ -24,9 +24,12 @@ import { updatePersistentPanelState, removePersistentPanel } from '../utils/pane
 import { DISCORD_EPHEMERAL_FLAG } from '../../constants';
 import { createV2Response, V2Colors } from '../utils/panel/v2';
 import { reloadModule, reloadModules } from '../utils/moduleReloader';
+import { getUpdaterType } from '@/updater';
 
 // Store panel owners for security
 const panelOwners = new Map<string, string>(); // messageId -> userId
+
+let lastCheckResult: CombinedUpdateCheckResult | null = null;
 
 const updateManagerPanel: PanelOptions = {
   id: 'update_manager',
@@ -48,8 +51,16 @@ const updateManagerPanel: PanelOptions = {
   requiredIntents: [GatewayIntentBits.Guilds],
 
   callback: async (context: PanelContext): Promise<PanelResponse> => {
-    // Return "checking" view immediately
-    // Actual update check happens in onPersistentCreated (after panel is stored)
+    // The web UI never calls onPersistentCreated, so it checks here
+    if (context.accessMethod === 'web_ui') {
+      return buildPanelView(context, 'main', (await checkForAllBotUpdates()) || {
+        success: false,
+        lastChecked: new Date().toISOString(),
+        baseCode: { checked: false, hasUpdates: false, error: 'Failed to check for updates' },
+        modules: { checked: false, hasUpdates: false, totalInstalled: 0, updatesAvailable: 0, updates: [], errors: [] },
+        summary: { totalUpdatesAvailable: 0, hasAnyUpdates: false }
+      });
+    }
     return buildPanelView(context, 'checking');
   },
 
@@ -156,18 +167,16 @@ function getStatusDisplay(status: any, isChecking: boolean = false, isUpdating: 
   if (status.inProgress) return '🟡 Update in progress';
 
   if (combinedCheck) {
-    if (!combinedCheck.success) return '🔴 Error';
     if (combinedCheck.summary.hasAnyUpdates) {
       const total = combinedCheck.summary.totalUpdatesAvailable;
-      return `🟠 ${total} Update${total > 1 ? 's' : ''} Available`;
+      const suffix = combinedCheck.success ? '' : ' (check incomplete)';
+      return `🟠 ${total} Update${total > 1 ? 's' : ''} Available${suffix}`;
     }
+    if (!combinedCheck.success) return '🔴 Could not check';
     return '🟢 Up to Date';
   }
 
-  if (status.lastError) return '🔴 Error';
-  if (status.hasUpdates) return '🟠 Updates Available';
-  if (status.lastCheck) return '🟢 Up to Date';
-  return '🟢 Ready';
+  return '⚪ Not checked yet';
 }
 
 /**
@@ -287,6 +296,12 @@ export function buildPanelView(
   combinedCheck?: CombinedUpdateCheckResult | null
 ): PanelResponse {
   const status = getBotUpdateStatus();
+  const managed = getUpdaterType() === 'managed';
+  if (combinedCheck) {
+    lastCheckResult = combinedCheck;
+  } else if (view === 'main') {
+    combinedCheck = lastCheckResult;
+  }
 
   // Store panel owner
   if (context.interaction && 'message' in context.interaction && context.interaction.message) {
@@ -311,7 +326,7 @@ export function buildPanelView(
   );
 
   // Status line
-  const lastChecked = combinedCheck?.lastChecked ? formatDate(combinedCheck.lastChecked) : (status.lastCheck ? formatDate(status.lastCheck) : 'Never');
+  const lastChecked = combinedCheck?.lastChecked ? formatDate(combinedCheck.lastChecked) : 'Not checked since the bot started';
   container.addTextDisplayComponents(
     new TextDisplayBuilder().setContent(
       `**Status:** ${statusDisplay}\n` +
@@ -329,54 +344,52 @@ export function buildPanelView(
   if (isChecking) {
     detailsContent = 'Connecting to update server...\nChecking base code updates...\nChecking module updates...';
   } else if (view === 'updating_system') {
-    detailsContent = 'Requesting system update from Bot Manager...\nThe bot will restart with updated code.';
+    detailsContent = managed
+      ? 'Requesting system update from Bot Manager...\nThe bot will restart with updated code.'
+      : 'This bot is self-hosted: the system update is applied by hand.';
   } else if (view === 'updating_modules') {
     detailsContent = 'Updating modules via hot-reload...\nNo restart required.';
   } else if (combinedCheck) {
-    if (!combinedCheck.success) {
-      const baseError = combinedCheck.baseCode.error;
-      const moduleErrors = combinedCheck.modules.errors.map(e => e.error).join(', ');
-      detailsContent = `Errors occurred:\n${baseError ? `- Base: ${baseError}\n` : ''}${moduleErrors ? `- Modules: ${moduleErrors}` : ''}`;
+    detailsContent = '=== System (Base Code) ===\n';
+    if (!combinedCheck.baseCode.checked) {
+      detailsContent += `Could not check: ${combinedCheck.baseCode.error || 'no reason given'}\n`;
+    } else if (combinedCheck.baseCode.hasUpdates) {
+      detailsContent += combinedCheck.baseCode.commitsBehind
+        ? `Update available (${combinedCheck.baseCode.commitsBehind} commits behind)\n`
+        : 'Update available\n';
+      detailsContent += managed ? 'Requires restart\n' : 'Apply it by hand: press Update System for the steps\n';
     } else {
-      // Base code section
-      detailsContent = '=== System (Base Code) ===\n';
-      if (combinedCheck.baseCode.hasUpdates) {
-        detailsContent += `Update available (${combinedCheck.baseCode.commitsBehind || '?'} commits behind)\n`;
-        detailsContent += 'Requires restart\n';
-      } else {
-        detailsContent += 'Up to date\n';
-      }
-
-      // Modules section
-      detailsContent += '\n=== Modules ===\n';
-      detailsContent += `Installed: ${combinedCheck.modules.totalInstalled}\n`;
-
-      if (combinedCheck.modules.updatesAvailable > 0) {
-        detailsContent += `Updates available: ${combinedCheck.modules.updatesAvailable}\n`;
-        const modulesWithUpdates = combinedCheck.modules.updates.filter(u => u.hasUpdate);
-        for (const mod of modulesWithUpdates) {
-          detailsContent += `  • ${mod.moduleName}: ${mod.installedVersion} → ${mod.availableVersion}\n`;
-        }
-        detailsContent += 'Hot-reload (no restart needed)\n';
-      } else if (combinedCheck.modules.totalInstalled === 0) {
-        detailsContent += 'No modules installed\n';
-      } else {
-        detailsContent += 'All modules up to date\n';
-      }
-
-      // Errors if any
-      if (combinedCheck.modules.errors.length > 0) {
-        detailsContent += '\nModule errors:\n';
-        for (const err of combinedCheck.modules.errors) {
-          detailsContent += `  • ${err.moduleName}: ${err.error}\n`;
-        }
-      }
-
-      // Custom modules note
-      detailsContent += '\nCustom modules (modulesDev/) are never affected.';
+      detailsContent += 'Up to date\n';
     }
-  } else if (status.lastError) {
-    detailsContent = `Error: ${status.lastError}\n\nPlease check:\n- API configuration\n- Network connectivity`;
+
+    detailsContent += '\n=== Modules ===\n';
+    detailsContent += `Installed: ${combinedCheck.modules.totalInstalled}\n`;
+    const moduleErrors = combinedCheck.modules.errors;
+    if (!combinedCheck.modules.checked && moduleErrors.length === 0) {
+      detailsContent += 'Could not check modules\n';
+    }
+    for (const err of moduleErrors) {
+      detailsContent += err.moduleName === '*'
+        ? `Could not check modules: ${err.error}\n`
+        : `Could not check ${err.moduleName}: ${err.error}\n`;
+    }
+
+    if (combinedCheck.modules.updatesAvailable > 0) {
+      detailsContent += `Updates available: ${combinedCheck.modules.updatesAvailable}\n`;
+      const modulesWithUpdates = combinedCheck.modules.updates.filter(u => u.hasUpdate);
+      for (const mod of modulesWithUpdates) {
+        detailsContent += `  • ${mod.moduleName}: ${mod.installedVersion} → ${mod.availableVersion}\n`;
+      }
+      detailsContent += 'Hot-reload (no restart needed)\n';
+    } else if (combinedCheck.modules.checked && combinedCheck.modules.totalInstalled === 0) {
+      detailsContent += 'No modules installed\n';
+    } else if (combinedCheck.modules.checked && moduleErrors.length === 0) {
+      detailsContent += 'All modules up to date\n';
+    }
+
+    detailsContent += '\nCustom modules (modulesDev/) are never affected.';
+  } else if (view === 'main') {
+    detailsContent = 'Not checked yet. Click "Check Updates" to scan.';
   }
 
   container.addTextDisplayComponents(
