@@ -74,6 +74,8 @@ export interface RegistryNode {
   syncOk: boolean | null;
   /** When this node last had a write's synchronous wait cancelled, in ITS clock; null when never (B6 map F24). */
   syncWaitCancelledAt: number | null;
+  /** Wall-clock lastSeenAt from the persisted registry; set only on a node restored at recovery boot. */
+  restoredLastSeenAt?: number;
   send: ((message: object) => void) | null;
 }
 
@@ -155,6 +157,7 @@ export class Registry {
       mirror: existing?.mirror ?? null,
       syncWaitCancelledAt: existing?.syncWaitCancelledAt ?? null,
       freeDiskBytes: existing?.freeDiskBytes ?? null,
+      restoredLastSeenAt: existing?.restoredLastSeenAt,
       send: input.send,
     };
     this.nodes.set(input.nodeId, node);
@@ -168,6 +171,7 @@ export class Registry {
     appVersion: string;
     capabilities: NodeCapabilities;
     capacityUnknown?: boolean;
+    lastSeenAt?: number;
   }): RegistryNode {
     const node: RegistryNode = {
       nodeId: input.nodeId,
@@ -197,6 +201,7 @@ export class Registry {
       mirror: null,
       syncWaitCancelledAt: null,
       freeDiskBytes: null,
+      restoredLastSeenAt: input.lastSeenAt,
       send: null,
     };
     this.nodes.set(input.nodeId, node);
@@ -476,6 +481,28 @@ export class Registry {
       };
     }
     return strays;
+  }
+
+  /** Guilds on a node's shards from the shard table's sources (REST totals, else guildMap); its last report when neither has one. */
+  frozenGuildCountOf(node: RegistryNode): number {
+    const gm = new Map<number, number>();
+    for (const shardId of this.guildMap.values()) gm.set(shardId, (gm.get(shardId) ?? 0) + 1);
+    let known = false;
+    let sum = 0;
+    for (const id of this.shardIdsOf(node.nodeId)) {
+      const count = this.shardGuildTotals.get(id) ?? gm.get(id);
+      if (count === undefined) continue;
+      known = true;
+      sum += count;
+    }
+    return known ? sum : node.guildCount;
+  }
+
+  /** Wall-clock time this master last heard the node, else the persisted sighting; 0 when never known. */
+  lastSeenAt(node: RegistryNode): number {
+    if (node.isSelf) return Date.now();
+    if (node.lastHeartbeatAt !== null) return Math.round(Date.now() - (performance.now() - node.lastHeartbeatAt));
+    return node.restoredLastSeenAt ?? 0;
   }
 
   healthOf(node: RegistryNode): NodeHealth {

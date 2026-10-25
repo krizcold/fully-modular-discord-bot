@@ -786,7 +786,9 @@ export function getFleetState(): FleetState {
       capacity: node.capacityUnknown ? null : (node.capabilities?.shardCapacity ?? 1),
       onHold: !node.isSelf && node.connected && registry.shardIdsOf(node.nodeId).length === 0,
       shardIds: registry.shardIdsOf(node.nodeId),
-      guildCount: node.guildCount,
+      guildCount: node.connected || node.isSelf
+        ? node.guildCount
+        : registry.frozenGuildCountOf(node),
       load: node.load,
       lastHeartbeatAgoMs: node.lastHeartbeatAt === null ? null : Math.round(performance.now() - node.lastHeartbeatAt),
       downSinceMs: node.downSince === null ? null : Math.round(performance.now() - node.downSince),

@@ -20,6 +20,11 @@ export interface HealthMonitorOptions {
   onTransition: (nodeId: string, from: NodeHealth, to: NodeHealth) => void;
 }
 
+/** A down persists the loss; a recovery persists so the saved lastSeenAt moves past that loss. */
+export function persistsAfterTransition(from: NodeHealth, to: NodeHealth): boolean {
+  return to === 'down' || from === 'down';
+}
+
 export class HealthMonitor {
   private readonly lastHealth = new Map<string, NodeHealth>();
   private lossEvents: LossEvent[] = [];
@@ -52,8 +57,14 @@ export class HealthMonitor {
       if (prev === undefined) {
         // First observation is a baseline, not a transition: a node restored
         // down at recovery boot must not bump the epoch or log a fresh loss.
+        // Its down time comes from a loss event newer than its last sighting,
+        // or stays unknown.
         this.lastHealth.set(node.nodeId, health);
-        if (health === 'down' && node.downSince === null) node.downSince = performance.now();
+        if (health === 'down' && node.downSince === null) {
+          const lastSeen = registry.lastSeenAt(node);
+          const loss = this.lossEvents.filter(e => e.nodeId === node.nodeId && e.at >= lastSeen).pop();
+          if (loss) node.downSince = performance.now() - Math.max(0, Date.now() - loss.at);
+        }
         continue;
       }
       if (health === prev) continue;

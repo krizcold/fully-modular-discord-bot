@@ -56,7 +56,7 @@ import { Registry, RegistryNode, persistedNodeOf } from './registry';
 import { ControlServer } from './controlServer';
 import { ControlClient } from './controlClient';
 import { LeaseRuntime } from './leaseRuntime';
-import { HealthMonitor } from './healthMonitor';
+import { HealthMonitor, persistsAfterTransition } from './healthMonitor';
 import { IdentifyLedger } from './identifyLedger';
 import {
   assignIdentifyDelays,
@@ -1841,8 +1841,11 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   // persist the bumped epoch + loss ring. Never moves a lease.
   const healthMonitor = standalone ? null : new HealthMonitor({
     registry,
-    onTransition: (transNodeId, _from, to) => {
-      if (to !== 'down') return;
+    onTransition: (transNodeId, from, to) => {
+      if (to !== 'down') {
+        if (persistsAfterTransition(from, to)) persist().catch(error => console.warn('[Fleet] Persist after recovery failed:', error instanceof Error ? error.message : error));
+        return;
+      }
       server?.dropNode(transNodeId);
       // A confirmed-down node that is a migration participant is a node-down
       // event for the coordinator (pre-commit -> abort; post-commit -> retries).
@@ -3193,7 +3196,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     });
     persistedPlanKey = key;
     await store.saveRegistry({
-      nodes: [...registry.nodes.values()].map(n => persistedNodeOf(n, Date.now())),
+      nodes: [...registry.nodes.values()].map(n => persistedNodeOf(n, registry.lastSeenAt(n))),
       lostNodes: healthMonitor?.getLossEvents(),
       updatedAt: Date.now(),
     });

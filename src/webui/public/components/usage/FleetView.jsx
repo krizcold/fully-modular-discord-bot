@@ -920,7 +920,9 @@ function FleetNodeCard({ node, isMasterView, onAction, masterSyncRevision, retir
         {node.draining ? <FleetBadge text="DRAINING" background="#4a3a1a" color="#fee75c" /> : null}
         {node.backoff ? <FleetBadge text="BACKOFF" background="#4a2a1a" color="#f0a0a0" /> : null}
       </div>
-      <div className="usage-stat-value">{node.guildCount} guilds</div>
+      <div className="usage-stat-value">
+        {!node.isSelf && node.connected === false ? `${node.guildCount} guilds on frozen shards; serving can't be confirmed (not connected to this master)` : `${node.guildCount} guilds`}
+      </div>
       <div className="usage-stat-sub">
         {capacity != null ? `holds ${held} / ${capacity} shards` : `holds ${held} shards`}
         {node.shardIds && node.shardIds.length > 0 ? ` [${node.shardIds.join(', ')}]` : ''}
@@ -937,7 +939,7 @@ function FleetNodeCard({ node, isMasterView, onAction, masterSyncRevision, retir
       ) : null}
       {isDown ? (
         <div className="usage-stat-sub" style={{ color: '#ed4245' }}>
-          {`down since ${fleetFormatAge(node.downSinceMs)}, ${held} shard${held === 1 ? '' : 's'} frozen`}
+          {`${node.downSinceMs == null ? 'not reconnected since this master restarted' : `down since ${fleetFormatAge(node.downSinceMs)}`}, ${held} shard${held === 1 ? '' : 's'} frozen`}
         </div>
       ) : null}
       {isDown && isMasterView ? (
@@ -985,7 +987,9 @@ function FleetNodeCard({ node, isMasterView, onAction, masterSyncRevision, retir
           ? `cpu ${node.load.cpuPct}% · rss ${node.load.rssMb} MB · loop ${node.load.loopLagMs} ms`
           : 'no load sample yet'}
       </div>
-      <div className="usage-stat-sub">heartbeat {fleetFormatAge(node.lastHeartbeatAgoMs)}</div>
+      <div className="usage-stat-sub">
+        {!node.isSelf && node.connected !== false && node.lastHeartbeatAgoMs == null ? 'awaiting first heartbeat' : `heartbeat ${fleetFormatAge(node.lastHeartbeatAgoMs)}`}
+      </div>
       {isMasterView && !node.isMaster && masterSyncRevision != null ? (
         <div className="usage-stat-sub">
           {node.syncAppliedRevision == null
@@ -1289,6 +1293,8 @@ function FleetWitnessCard({ fleet }) {
       <div className="usage-stat-sub">{`Beacon home: ${home}`}</div>
       {w.lastRenewOk ? (
         <div className="usage-stat-sub">{`Beacon renewed ${fleetFormatAge(Date.now() - w.lastRenewAt)}`}</div>
+      ) : w.lastRenewAt == null && !w.lastError ? (
+        <div className="usage-stat-sub">Witness pending: this process has not renewed the beacon yet</div>
       ) : (
         <div className="usage-stat-sub" style={{ color: '#e5534b' }}>
           {`Witness dark${w.lastError ? `: ${w.lastError}` : ''}`}
