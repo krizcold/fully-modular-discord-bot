@@ -54,6 +54,7 @@ import { backupModeEnabled, leverRank, readModeOverride } from './modeOverride';
 import { clearOwnSyncPosture } from './syncPosture';
 import { Registry, RegistryNode, persistedNodeOf } from './registry';
 import { ControlServer } from './controlServer';
+import { forwardDataOp } from './dataOpForward';
 import { ControlClient } from './controlClient';
 import { LeaseRuntime } from './leaseRuntime';
 import { HealthMonitor, persistsAfterTransition } from './healthMonitor';
@@ -3581,27 +3582,15 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     // Webui write-through-owner hop (6.3): the master routes an operator data
     // op to the guild's owning node over the control channel; a self-owned
     // guild applies through the local facade directly.
-    setDataOpForwarder(async (kind, req) => {
-      const shardId = guildIdToShardId(req.guildId, registry.shardCount);
-      const owner = registry.shardTable.get(shardId);
-      if (!owner) return { ok: false, code: 'not-owner', error: `shard ${shardId} is unassigned` };
-      const node = registry.nodes.get(owner.nodeId);
-      if (!node || (!node.connected && !node.isSelf)) {
-        return { ok: false, code: 'owner-unreachable', error: 'owning instance is not connected' };
-      }
-      if (node.isSelf) {
-        return kind === 'write'
-          ? applyOperatorDataWrite(req as GuildDataWriteRequest)
-          : applyOperatorDataRead(req as GuildDataReadRequest);
-      }
-      const type = kind === 'write' ? MSG.DATA_WRITE : MSG.DATA_READ;
-      try {
-        const reply = await server!.request(owner.nodeId, type, { term: registry.term, ...req, ...(kind === 'write' ? { origin: 'webui-operator' } : {}) });
-        return reply ?? { ok: false, code: 'owner-unreachable', error: 'empty reply from the owning instance' };
-      } catch (error) {
-        return { ok: false, code: 'owner-unreachable', error: error instanceof Error ? error.message : String(error) };
-      }
-    });
+    setDataOpForwarder((kind, req) => forwardDataOp({
+      shardCount: registry.shardCount,
+      term: registry.term,
+      ownerOf: shardId => registry.shardTable.get(shardId),
+      nodeOf: id => registry.nodes.get(id),
+      request: (id, type, data) => server!.request(id, type, data),
+      applyWrite: applyOperatorDataWrite,
+      applyRead: applyOperatorDataRead,
+    }, kind, req));
 
     // Supersession (PLAN_REPLICATION 20.3 Case 2, 20.13; B4). A higher term
     // elsewhere means this node is no longer the master: it stops granting at

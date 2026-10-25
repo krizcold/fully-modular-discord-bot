@@ -7,6 +7,7 @@ import { BotManager } from '../botManager';
 import { routeFor } from '../../bot/internalSetup/utils/dataBackends/routeResolver';
 import { listGraveyardEntries } from '../../bot/internalSetup/utils/dataManager';
 import { getWebuiDataReader, isDataBackendUnreachable } from '../utils/webuiDataReader';
+import { hopFailure } from './hopFailure';
 
 interface GraveyardEntry {
   guildId: string;
@@ -73,12 +74,11 @@ export function createGraveyardRoutes(botManager: BotManager): Router {
       }
       const code = reply?.code;
       const error = reply?.error || 'restore failed';
+      const failure = code === 'invalid' ? null : hopFailure(code, reply?.error);
       if (code === 'invalid') {
         res.status(409).json({ success: false, error });
-      } else if (code === 'frozen' || code === 'not-owner' || code === 'owner-unreachable' || code === 'stale-term') {
-        res.status(503).json({ success: false, error: 'guild temporarily unavailable' });
-      } else if (code === 'backend-unavailable' || code === 'bot-down') {
-        res.status(503).json({ success: false, error });
+      } else if (failure) {
+        res.status(failure.status).json({ success: false, error: failure.error });
       } else {
         res.status(500).json({ success: false, error });
       }
