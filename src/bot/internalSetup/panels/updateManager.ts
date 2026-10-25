@@ -25,6 +25,7 @@ import { DISCORD_EPHEMERAL_FLAG } from '../../constants';
 import { createV2Response, V2Colors } from '../utils/panel/v2';
 import { reloadModule, reloadModules } from '../utils/moduleReloader';
 import { getUpdaterType } from '@/updater';
+import { discordTimestamp } from '../utils/discordTimestamp';
 
 // Store panel owners for security
 const panelOwners = new Map<string, string>(); // messageId -> userId
@@ -188,18 +189,6 @@ function truncateModuleName(name: string, maxLength: number = 12): string {
 }
 
 /**
- * Format date as "day month, year"
- */
-function formatDate(dateInput: string | number | undefined): string {
-  if (!dateInput) return 'Unknown';
-  const date = new Date(dateInput);
-  if (isNaN(date.getTime())) return 'Unknown';
-  const months = ['January', 'February', 'March', 'April', 'May', 'June',
-                  'July', 'August', 'September', 'October', 'November', 'December'];
-  return `${date.getDate()} ${months[date.getMonth()]}, ${date.getFullYear()}`;
-}
-
-/**
  * Get accent color based on status string
  */
 function getAccentColor(statusDisplay: string): number {
@@ -326,7 +315,7 @@ export function buildPanelView(
   );
 
   // Status line
-  const lastChecked = combinedCheck?.lastChecked ? formatDate(combinedCheck.lastChecked) : 'Not checked since the bot started';
+  const lastChecked = combinedCheck?.lastChecked ? (discordTimestamp(combinedCheck.lastChecked) || 'Unknown') : 'Not checked since the bot started';
   container.addTextDisplayComponents(
     new TextDisplayBuilder().setContent(
       `**Status:** ${statusDisplay}\n` +

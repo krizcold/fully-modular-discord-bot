@@ -18,6 +18,7 @@
 
 import { Client, TextBasedChannel } from 'discord.js';
 import { getPremiumManager } from './premiumManager';
+import { discordTimestamp } from './discordTimestamp';
 
 export type NotificationType =
   | 'manual.grant.added'
@@ -137,7 +138,8 @@ export class SubscriptionNotifier {
     const tier = p.tierName || 'a tier';
     const provider = p.providerName ? ` (${p.providerName})` : '';
     const remaining = p.remainingDays != null ? ` ${p.remainingDays} day${p.remainingDays === 1 ? '' : 's'} remaining.` : '';
-    const ends = p.endDate ? ` Ends ${new Date(p.endDate).toLocaleDateString()}.` : '';
+    const endStamp = discordTimestamp(p.endDate);
+    const ends = endStamp ? ` Ends ${endStamp}.` : '';
     const notes = p.notes ? `\n> ${p.notes}` : '';
     const reason = p.reason ? `\nReason: ${p.reason}` : '';
     const details = p.details ? `\n${p.details}` : '';
@@ -166,9 +168,9 @@ export class SubscriptionNotifier {
       case 'tier.config-change-affecting-subscriber':
         return `**Subscription update:** The contents of your **${tier}** plan changed.${details}`;
       case 'migration.scheduled':
-        return `**Plan change scheduled:** Your subscription will move to **${tier}** on ${p.endDate ? new Date(p.endDate).toLocaleDateString() : 'a future date'}. Open the subscription panel to **accept** or **decline**.${details}`;
+        return `**Plan change scheduled:** Your subscription will move to **${tier}** on ${endStamp || 'a future date'}. Open the subscription panel to **accept** or **decline**.${details}`;
       case 'migration.accepted':
-        return `**Plan change accepted:** Confirmed - your subscription will move to **${tier}** on ${p.endDate ? new Date(p.endDate).toLocaleDateString() : 'the effective date'}.`;
+        return `**Plan change accepted:** Confirmed - your subscription will move to **${tier}** on ${endStamp || 'the effective date'}.`;
       case 'migration.declined':
         return `**Plan change declined:** Your current subscription will not migrate. It will end at the next billing date and won't renew.`;
       case 'migration.silence-applied':
