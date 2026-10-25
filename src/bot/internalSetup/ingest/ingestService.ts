@@ -5,7 +5,7 @@
 // per process (modules, panels and handlers hold references to it); lease
 // changes bounce its gateway sessions, never the object.
 
-import { Client, ClientOptions } from 'discord.js';
+import { Client, ClientOptions, Status } from 'discord.js';
 
 export class IngestService {
   private client: Client | null = null;
@@ -16,6 +16,7 @@ export class IngestService {
   private unwinding: Promise<unknown> | null = null;
   private shardPlan: { shards: number[]; shardCount: number } | null = null;
   private closed = false;
+  private hasBeenReady = false;
 
   buildClient(options: ClientOptions): Client {
     if (this.client) throw new Error('[Ingest] buildClient() called twice');
@@ -29,6 +30,7 @@ export class IngestService {
       (opts as any).shardCount = plan.shardCount;
     }
     this.client = new Client(opts);
+    this.client.once('clientReady', () => { this.hasBeenReady = true; });
     return this.client;
   }
 
@@ -159,7 +161,10 @@ export class IngestService {
     const ws = this.client!.ws as any;
     ws.destroyed = false;
     ws._ws = null;
-    ws.status = 0;
+    // Before the first ready, Ready would make checkShardsReady skip the
+    // clientReady that runs the once-only boot work; after it, Idle would
+    // re-run that work and queue packets.
+    ws.status = this.hasBeenReady ? Status.Ready : Status.Idle;
     try { ws.shards.clear(); } catch { /* collection always present in v14 */ }
   }
 }
