@@ -319,7 +319,7 @@ function ModulesView({ modules, installed, installJobs, categories, categoryFilt
   }, [cleanupStatus?.running]);
 
   useEffect(() => {
-    if (cleanupStatus && !cleanupStatus.running && cleanupStatus.success) {
+    if (cleanupStatus && !cleanupStatus.running && cleanupStatus.success && !cleanupStatus.note) {
       const t = setTimeout(() => setCleanupStatus(null), 4000);
       return () => clearTimeout(t);
     }
@@ -422,7 +422,13 @@ function ModulesView({ modules, installed, installJobs, categories, categoryFilt
                     cleanup running...
                   </span>
                 )}
-                {cleanupStatus && !cleanupStatus.running && cleanupStatus.success && (
+                {cleanupStatus?.running && !autoCleanup && (
+                  <span style={{ color: '#faa61a', fontSize: '0.75rem' }}>stops before its next deletion</span>
+                )}
+                {cleanupStatus && !cleanupStatus.running && cleanupStatus.success && cleanupStatus.note && (
+                  <span style={{ color: '#faa61a', fontSize: '0.75rem' }} title={cleanupStatus.note}>{cleanupStatus.note}</span>
+                )}
+                {cleanupStatus && !cleanupStatus.running && cleanupStatus.success && !cleanupStatus.note && (
                   <span style={{ color: '#43b581', fontSize: '0.75rem' }}>cleanup done</span>
                 )}
                 {cleanupStatus && !cleanupStatus.running && cleanupStatus.error && (

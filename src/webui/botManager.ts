@@ -64,7 +64,7 @@ export class BotManager {
   private operationInProgress: boolean = false; // Prevents race conditions
   private safeMode: boolean = false;
   private safetyManager = getSafetyManager();
-  private cleanupRun: { running: boolean; startedAt: number; finishedAt?: number; success?: boolean; error?: string } | null = null;
+  private cleanupRun: { running: boolean; startedAt: number; finishedAt?: number; success?: boolean; error?: string; note?: string } | null = null;
   // Reject callbacks of in-flight IPC requests, so a child exit settles them
   // immediately instead of leaving callers hanging until their timeout.
   private pendingIpcRejects = new Set<(err: Error) => void>();
@@ -1304,6 +1304,7 @@ export class BotManager {
         const result = await this.sendIPCMessage('commands:reregister', {}, IPC_TIMEOUT_MODULE_OP_MS);
         run.success = result?.success === true;
         if (!run.success) run.error = result?.error || 're-registration failed';
+        if (typeof result?.note === 'string') run.note = result.note;
       } catch (error) {
         run.success = false;
         run.error = error instanceof Error ? error.message : String(error);
@@ -1316,7 +1317,7 @@ export class BotManager {
     return { alreadyRunning: false };
   }
 
-  getCommandCleanupStatus(): { running: boolean; startedAt?: number; finishedAt?: number; success?: boolean; error?: string } {
+  getCommandCleanupStatus(): { running: boolean; startedAt?: number; finishedAt?: number; success?: boolean; error?: string; note?: string } {
     return this.cleanupRun ? { ...this.cleanupRun } : { running: false };
   }
 

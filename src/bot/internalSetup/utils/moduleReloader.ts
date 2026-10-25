@@ -30,6 +30,7 @@ import { clearSchemaCache, getModulesWithSettings } from './settings/settingsDis
 import { createAllSettingsPanels } from './settings/settingsPanelFactory';
 import { getMetricsCollector } from './metrics/metricsCollector';
 import { resolveClientApplication } from './clientApplication';
+import { recordLoadFailure } from './loadFailures';
 
 interface CapturedCommand {
   name: string;
@@ -325,11 +326,13 @@ export async function reloadModule(client: Client, moduleName: string): Promise<
     // failure leaves the old module registered.
     const compile = await recompileTypeScript();
     if (!compile.success) {
+      recordLoadFailure(moduleName);
       return { success: false, moduleName, error: `Compilation failed: ${compile.error}`, duration: Date.now() - start };
     }
 
     const manifestPath = findModuleManifestPath(moduleName);
     if (!manifestPath) {
+      recordLoadFailure(moduleName);
       return { success: false, moduleName, error: 'Module manifest not found after recompile', duration: Date.now() - start };
     }
 
@@ -351,6 +354,7 @@ export async function reloadModule(client: Client, moduleName: string): Promise<
     console.log(`[Reloader] ${action}: ${moduleName} (${Date.now() - start}ms)`);
     return { success: true, moduleName, duration: Date.now() - start };
   } catch (error: any) {
+    recordLoadFailure(moduleName);
     return { success: false, moduleName, error: error.message || String(error), duration: Date.now() - start };
   } finally {
     reloadingModules.delete(moduleName);
@@ -432,6 +436,7 @@ export async function reloadModules(client: Client, moduleNames: string[]): Prom
     if (!compile.success) {
       result.success = false;
       for (const name of available) {
+        recordLoadFailure(name);
         result.failed.push({ moduleName: name, error: `Compilation failed: ${compile.error}` });
       }
       result.totalDuration = Date.now() - start;
@@ -444,6 +449,7 @@ export async function reloadModules(client: Client, moduleNames: string[]): Prom
       try {
         const manifestPath = findModuleManifestPath(name);
         if (!manifestPath) {
+          recordLoadFailure(name);
           result.failed.push({ moduleName: name, error: 'Module manifest not found' });
           continue;
         }
@@ -455,6 +461,7 @@ export async function reloadModules(client: Client, moduleNames: string[]): Prom
         await registerReloadedModule(client, module);
         result.reloaded.push(name);
       } catch (error: any) {
+        recordLoadFailure(name);
         result.failed.push({ moduleName: name, error: error.message || String(error) });
       }
     }

@@ -155,19 +155,30 @@ export function resolveModuleExport(modulePath: string, exportPath: string): {
  * Dev structure: modulesDev/{repoName}/Modules/{moduleName}/module.json
  * @returns Array of absolute paths to module.json files
  */
+/** True when the path exists, false only on ENOENT; any other error throws. */
+function pathPresent(p: string): boolean {
+  try {
+    fs.statSync(p);
+    return true;
+  } catch (error: any) {
+    if (error?.code === 'ENOENT') return false;
+    throw error;
+  }
+}
+
 export function findModuleManifests(): string[] {
   const manifests: string[] = [];
 
   // Scan main modules directory (flat structure)
   const modulesDir = getModulesDir();
-  if (fs.existsSync(modulesDir)) {
+  if (pathPresent(modulesDir)) {
     const modules = fs.readdirSync(modulesDir, { withFileTypes: true })
       .filter(dirent => dirent.isDirectory() && !dirent.name.endsWith('.disabled'))
       .map(dirent => dirent.name);
 
     for (const moduleName of modules) {
       const manifestPath = path.join(modulesDir, moduleName, 'module.json');
-      if (fs.existsSync(manifestPath)) {
+      if (pathPresent(manifestPath)) {
         manifests.push(manifestPath);
       }
     }
@@ -178,21 +189,21 @@ export function findModuleManifests(): string[] {
   // Dev modules are strictly master-only: a co-worker never scans them even
   // when present on disk (co-workers mirror the master via sync).
   const modulesDevDir = getModulesDevDir();
-  if (resolveNodeRole() !== 'co-worker' && fs.existsSync(modulesDevDir)) {
+  if (resolveNodeRole() !== 'co-worker' && pathPresent(modulesDevDir)) {
     const repos = fs.readdirSync(modulesDevDir, { withFileTypes: true })
       .filter(dirent => dirent.isDirectory() && !dirent.name.startsWith('.'))
       .map(dirent => dirent.name);
 
     for (const repoName of repos) {
       const repoModulesDir = path.join(modulesDevDir, repoName, 'Modules');
-      if (fs.existsSync(repoModulesDir)) {
+      if (pathPresent(repoModulesDir)) {
         const devModules = fs.readdirSync(repoModulesDir, { withFileTypes: true })
           .filter(dirent => dirent.isDirectory() && !dirent.name.endsWith('.disabled'))
           .map(dirent => dirent.name);
 
         for (const moduleName of devModules) {
           const manifestPath = path.join(repoModulesDir, moduleName, 'module.json');
-          if (fs.existsSync(manifestPath)) {
+          if (pathPresent(manifestPath)) {
             manifests.push(manifestPath);
           }
         }

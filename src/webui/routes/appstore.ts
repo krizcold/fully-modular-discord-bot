@@ -2095,12 +2095,14 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
         botManager.startCommandCleanup();
         cleanupStarted = true;
       }
+      const cleanupStopping = req.body.autoCleanup === false && botManager.getCommandCleanupStatus().running;
 
       res.json({
         success: true,
         autoCleanup: config.autoCleanup === true,
         autoUpdate: config.autoUpdate === true,
         ...(cleanupStarted ? { cleanupStarted: true } : {}),
+        ...(cleanupStopping ? { cleanupStopping: true } : {}),
       });
     } catch (error) {
       const msg = error instanceof Error ? error.message : 'Unknown error';

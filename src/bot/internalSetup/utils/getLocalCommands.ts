@@ -1,4 +1,5 @@
 import { getModuleRegistry } from './moduleRegistry';
+import { recordLoadFailure } from './loadFailures';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -37,6 +38,7 @@ export default function getLocalCommands(exceptions: string[] = []): any[] {
           }
         } catch (error) {
           console.error(`[getLocalCommands] Error loading internal command ${file}:`, error);
+          recordLoadFailure(file);
         }
       }
 
@@ -46,6 +48,7 @@ export default function getLocalCommands(exceptions: string[] = []): any[] {
     }
   } catch (error) {
     console.error('[getLocalCommands] Error loading internal commands:', error);
+    recordLoadFailure('the internal command listing');
   }
 
   // Load module commands
@@ -79,6 +82,7 @@ export default function getLocalCommands(exceptions: string[] = []): any[] {
     }
   } catch (error) {
     console.error('[getLocalCommands] Error loading commands from modules:', error);
+    recordLoadFailure('the module command listing');
   }
 
   return localCommands;

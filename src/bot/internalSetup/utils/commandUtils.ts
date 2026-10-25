@@ -45,7 +45,7 @@ export function buildCommandPayload(commandDef: any): any {
 export async function reRegisterSlashCommands(
   client: Client,
   options: { runOrphanCleanup?: boolean } = {}
-): Promise<void> {
+): Promise<{ sweep: string; deleted: number; note?: string } | null> {
   try {
     const isProd = process.env.NODE_ENV !== 'development';
     const registerPath = isProd
@@ -54,7 +54,7 @@ export async function reRegisterSlashCommands(
 
     if (!fs.existsSync(registerPath)) {
       console.warn('[CommandUtils] registerCommands not found, skipping slash command sync');
-      return;
+      return null;
     }
 
     const resolved = require.resolve(registerPath);
@@ -63,11 +63,12 @@ export async function reRegisterSlashCommands(
     const registerModule = require(registerPath);
     const registerFn = registerModule.default || registerModule;
 
-    if (typeof registerFn === 'function') {
-      await registerFn(client, options);
-      console.log('[CommandUtils] Slash commands re-registered with Discord');
-    }
+    if (typeof registerFn !== 'function') return null;
+    const result = await registerFn(client, options);
+    if (result) console.log('[CommandUtils] Slash commands re-registered with Discord');
+    return result ?? null;
   } catch (error) {
     console.error('[CommandUtils] Failed to re-register slash commands:', error);
+    return null;
   }
 }

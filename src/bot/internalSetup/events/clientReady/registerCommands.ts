@@ -15,17 +15,64 @@ import { dataPath } from '../../../../utils/dataRoot';
 import * as fs from 'fs';
 import { componentConfigPath, getLastAppliedDisabledCommands, readConfigFile, setLastAppliedDisabledCommands } from '../../utils/appStoreConfigFile';
 import { resolveClientApplication } from '../../utils/clientApplication';
+import { getLoadFailures } from '../../utils/loadFailures';
 
 /** Check if auto-cleanup is enabled in AppStore config (default: false) */
 export function isAutoCleanupEnabled(): boolean {
+  return readAutoCleanup() === true;
+}
+
+/** The Auto Cleanup switch, or null when config.json cannot be read or parsed. */
+function readAutoCleanup(): boolean | null {
   try {
     const configPath = dataPath('global', 'appstore', 'config.json');
-    if (fs.existsSync(configPath)) {
-      const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
-      return config.autoCleanup === true;
+    if (!fs.existsSync(configPath)) return false;
+    const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+    return config.autoCleanup === true;
+  } catch {
+    return null;
+  }
+}
+
+/** Module names in installed.json, read fresh (the web UI process writes it); null when it cannot be read or parsed. */
+function readInstalledNames(): string[] | null {
+  const file = dataPath('global', 'appstore', 'installed.json');
+  let raw: string;
+  try {
+    raw = fs.readFileSync(file, 'utf-8');
+  } catch (error: any) {
+    if (error?.code === 'ENOENT') return [];
+    console.error('[Cleanup] Cannot read installed.json:', error);
+    return null;
+  }
+  try {
+    const modules = JSON.parse(raw)?.modules;
+    if (!modules || typeof modules !== 'object' || Array.isArray(modules)) {
+      console.error('[Cleanup] installed.json has no module list');
+      return null;
     }
-  } catch { /* ignore */ }
-  return false;
+    return Object.keys(modules);
+  } catch (error) {
+    console.error('[Cleanup] Cannot parse installed.json:', error);
+    return null;
+  }
+}
+
+/** Installed modules with neither a loaded module nor a manifest at this boot; null when that cannot be read. */
+async function installedButAbsent(): Promise<string[] | null> {
+  try {
+    // Imported here: a static import of these closes a cycle through moduleReloader.
+    const { getModuleRegistry } = await import('../../utils/moduleRegistry');
+    const { findModuleManifests, getModuleInfo } = await import('../../utils/pathHelpers');
+    const installed = readInstalledNames();
+    if (installed === null) return null;
+    const present = new Set(getModuleRegistry().getAllModules().map(m => m.manifest.name));
+    for (const manifestPath of findModuleManifests()) present.add(getModuleInfo(manifestPath).moduleName);
+    return installed.filter(n => !present.has(n));
+  } catch (error) {
+    console.error('[Cleanup] Cannot list installed or loaded modules:', error);
+    return null;
+  }
 }
 
 /** Disabled command names; on a read error, the last applied set, or null when none was applied yet. */
@@ -205,15 +252,22 @@ const internalOrHandledKeys = [
   'initialize',
 ];
 
+/** What the orphan sweep did; registerCommands returns null when registration itself did not run to the end. */
+export interface OrphanSweepResult {
+  sweep: 'done' | 'off' | 'skipped' | 'stopped';
+  deleted: number;
+  note?: string;
+}
+
 export default async function registerCommands(
   client: Client,
   options: { runOrphanCleanup?: boolean } = {}
-) {
+): Promise<OrphanSweepResult | null> {
   // Slash-command registration is a bot-identity-wide operation; only the
   // master node performs it (co-workers would race the same Discord state).
   if (resolveNodeRole() === 'co-worker') {
     console.log('[i] Skipping command registration (co-worker node; the master owns it)');
-    return;
+    return null;
   }
   const runOrphanCleanup = options.runOrphanCleanup !== false;
   console.log('[i] Registering commands...');
@@ -221,7 +275,7 @@ export default async function registerCommands(
   if (!guildId) {
     console.error('GUILD_ID environment variable is not set.');
     console.warn('Commands will not be registered.');
-    return;
+    return null;
   }
 
   try {
@@ -235,7 +289,7 @@ export default async function registerCommands(
     const disabledCommands = getDisabledCommands();
     if (!disabledCommands) {
       console.error('[registerCommands] Commands were not registered: the disabled set cannot be read and none was applied before.');
-      return;
+      return null;
     }
     if (disabledCommands.size > 0) {
       console.log(`[i] ${disabledCommands.size} command(s) disabled via component config: ${[...disabledCommands].join(', ')}`);
@@ -246,7 +300,7 @@ export default async function registerCommands(
     const application = await resolveClientApplication(client);
     if (!application) {
       console.error('[registerCommands] Commands were not registered: the bot application could not be resolved.');
-      return;
+      return null;
     }
     const globalCommands = await application.commands.fetch();
     // Test (guild) commands go through the application-commands REST API scoped
@@ -304,7 +358,35 @@ export default async function registerCommands(
 
     // Remove orphan commands only if auto-cleanup is enabled (default: OFF)
     // AND the caller allows the full sweep (startup: yes; hot-reload: no).
-    const cleanupEnabled = isAutoCleanupEnabled() && runOrphanCleanup;
+    const switchAtStart = runOrphanCleanup ? readAutoCleanup() : false;
+    let cleanupEnabled = switchAtStart === true;
+    const result: OrphanSweepResult = { sweep: cleanupEnabled ? 'done' : 'off', deleted: 0 };
+    if (runOrphanCleanup && switchAtStart !== true) {
+      result.note = switchAtStart === null
+        ? 'orphan sweep not run: the Auto Cleanup setting could not be read'
+        : 'orphan sweep not run: Auto Cleanup was turned off';
+    }
+    const loadFailures = getLoadFailures();
+    if (cleanupEnabled && loadFailures.length === 0) {
+      const absent = await installedButAbsent();
+      if (absent === null) loadFailures.push('the installed module list');
+      else loadFailures.push(...absent);
+    }
+    if (cleanupEnabled && loadFailures.length > 0) {
+      cleanupEnabled = false;
+      result.sweep = 'skipped';
+      result.note = `orphan sweep skipped: these failed to load at this boot: ${loadFailures.join(', ')}`;
+      console.warn(`[Cleanup] Orphan command sweep skipped; their commands would be deleted. Failed to load: ${loadFailures.join(', ')}`);
+    }
+    const switchStillOn = (): boolean => {
+      const on = readAutoCleanup();
+      if (on === true) return true;
+      const why = on === null ? 'the Auto Cleanup setting could not be read' : 'Auto Cleanup was turned off';
+      result.sweep = 'stopped';
+      result.note = `orphan sweep stopped after ${result.deleted} deletion(s): ${why}`;
+      console.log(`[Cleanup] Orphan sweep stopped after ${result.deleted} deletion(s): ${why}`);
+      return false;
+    };
 
     // Remove global commands that are no longer present locally
     if (cleanupEnabled && globalCommands) {
@@ -325,8 +407,10 @@ export default async function registerCommands(
             console.log(`[Test Mode] Skipping deletion of global command: ${appCommand.name} (Type: ${ApplicationCommandType[appCommand.type]})`);
             continue;
           }
+          if (!switchStillOn()) break;
           try {
             await client.application?.commands.delete(appCommand.id);
+            result.deleted++;
             console.log(`Deleted global command "${appCommand.name}" (Type: ${ApplicationCommandType[appCommand.type]}) as it is no longer found locally or test mode active.`);
           } catch(deleteError: any){
             if (deleteError?.code === 10063) {
@@ -337,7 +421,7 @@ export default async function registerCommands(
           }
         }
       }
-    } else if (!cleanupEnabled && globalCommands) {
+    } else if (result.sweep === 'off' && globalCommands) {
       if (!runOrphanCleanup) {
         console.log('[i] Skipping orphan global command sweep (hot-reload context, targeted cleanup handled per module)');
       } else {
@@ -346,7 +430,7 @@ export default async function registerCommands(
     }
 
     // Remove local (guild) commands that are no longer present locally or shouldn't be local
-    if (cleanupEnabled) {
+    if (cleanupEnabled && result.sweep !== 'stopped') {
       for (const guildCommand of guildCommands.values()) {
         // Find local command matching name AND type
         const foundLocal = localCommands.some(localCmd =>
@@ -362,8 +446,10 @@ export default async function registerCommands(
           if (testMode && correspondingLocal && !correspondingLocal.testOnly) {
             continue;
           }
+          if (!switchStillOn()) break;
           try {
             await guildCmds.delete(guildCommand.id);
+            result.deleted++;
             console.log(`Deleted local command "${guildCommand.name}" (Type: ${ApplicationCommandType[guildCommand.type]}) as it is no longer found locally or not marked testOnly.`);
           } catch(deleteError: any){
             if (deleteError?.code === 10063) {
@@ -374,7 +460,7 @@ export default async function registerCommands(
           }
         }
       }
-    } else {
+    } else if (result.sweep === 'off') {
       if (!runOrphanCleanup) {
         console.log('[i] Skipping orphan guild command sweep (hot-reload context, targeted cleanup handled per module)');
       } else {
@@ -385,8 +471,10 @@ export default async function registerCommands(
     // Save current test guild for future cleanup tracking; an unfinished
     // stale cleanup keeps the old guild tracked so the next run retries it.
     if (staleCleanupDone) saveLastTestGuild(guildId);
+    return result;
   } catch (error) {
     console.error(`There was an error while registering commands:\n${error}`);
+    return null;
   }
 }
 
