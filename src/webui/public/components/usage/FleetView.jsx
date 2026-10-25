@@ -61,9 +61,13 @@ function FleetCapacityCard({ cap }) {
       : '#57f287';
   const barPct = Math.max(0, Math.min(100, (cap.busiest / FLEET_HARD_MAX) * 100));
 
+  const readAt = cap.recommendedAt != null ? `, read ${new Date(cap.recommendedAt).toLocaleString()}` : '';
   let shardsLabel;
-  if (cap.shardSource === 'override') shardsLabel = `${cap.shardCount} (manual override)`;
-  else if (cap.shardSource === 'discord') shardsLabel = `${cap.shardCount} (Discord-recommended)`;
+  if (cap.shardSource === 'plan') shardsLabel = `${cap.shardCount} (kept from the fleet's saved plan)`;
+  else if (cap.shardSource === 'override') shardsLabel = `${cap.shardCount} (FLEET_SHARD_COUNT override)`;
+  else if (cap.shardSource === 'discord') shardsLabel = `${cap.shardCount} (Discord's recommendation at boot)`;
+  else if (cap.shardSource === 'fallback') shardsLabel = `${cap.shardCount} (fallback: Discord's recommendation could not be read at boot)`;
+  else if (cap.shardSource === 'master') shardsLabel = `${cap.shardCount} (set by the master)`;
   else shardsLabel = String(cap.shardCount);
 
   return (
@@ -72,8 +76,8 @@ function FleetCapacityCard({ cap }) {
       <div className="usage-stat-sub" style={{ marginBottom: '10px' }}>
         {`${cap.totalGuilds} guild${cap.totalGuilds === 1 ? '' : 's'} across the fleet`}
         {` · Shards: ${shardsLabel}`}
-        {cap.shardSource === 'override' && cap.recommendedShards != null && cap.recommendedShards !== cap.shardCount
-          ? ` (Discord recommends ${cap.recommendedShards})`
+        {cap.recommendedShards != null && cap.recommendedShards !== cap.shardCount
+          ? ` (Discord recommends ${cap.recommendedShards}${readAt})`
           : ''}
       </div>
 
@@ -2310,6 +2314,7 @@ function FleetView({ api, wsClient, guildNames }) {
     shardCount,
     shardSource: fleet.shardSource,
     recommendedShards: fleet.recommendedShards != null ? fleet.recommendedShards : null,
+    recommendedAt: fleet.recommendedAt != null ? fleet.recommendedAt : null,
     unassigned: unassignedCount,
     onHoldNodes: onHoldNodeCount,
     busiest,
@@ -2404,7 +2409,7 @@ function FleetView({ api, wsClient, guildNames }) {
 
       {fleet.recovery && fleet.recovery.reshardAdvised && (
         <div className="usage-notice">
-          {`Discord now recommends ${fleet.recovery.reshardAdvised.recommended} shard${fleet.recovery.reshardAdvised.recommended === 1 ? '' : 's'}; fleet runs ${fleet.recovery.reshardAdvised.running}; resharding requires setting FLEET_SHARD_COUNT.`}
+          {`Discord recommends ${fleet.recovery.reshardAdvised.recommended} shard${fleet.recovery.reshardAdvised.recommended === 1 ? '' : 's'} (${fleet.recovery.reshardAdvised.readAt != null ? `read ${new Date(fleet.recovery.reshardAdvised.readAt).toLocaleString()}` : 'read at boot; no later reading'}); fleet runs ${fleet.recovery.reshardAdvised.running}; resharding requires setting FLEET_SHARD_COUNT.`}
         </div>
       )}
 

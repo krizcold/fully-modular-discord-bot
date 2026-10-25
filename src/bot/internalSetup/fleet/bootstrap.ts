@@ -62,7 +62,8 @@ import {
   assignIdentifyDelays,
   declaredCapacityOf,
   fetchAllGuilds,
-  fetchGatewayInfo,
+  decideShardSource,
+  fetchGatewayInfoResult,
   getShardCountOverride,
   guildIdToShardId,
   otherNodeCanHoldShards,
@@ -1612,12 +1613,13 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   });
   if (fleetConfig) writeFleetConfigCache(fleetConfigPayload());
 
-  const gateway = await fetchGatewayInfo(process.env.DISCORD_TOKEN);
+  const { info: gateway, error: gatewayError } = await fetchGatewayInfoResult(process.env.DISCORD_TOKEN);
   if (!gateway && process.env.DISCORD_TOKEN) {
-    console.warn('[Fleet] /gateway/bot unreachable; assuming 1 recommended shard');
+    console.warn(`[Fleet] /gateway/bot failed (${gatewayError}); assuming 1 recommended shard`);
   }
   const maxConcurrency = gateway?.maxConcurrency ?? 1;
   const recommendedShards = gateway?.recommendedShards ?? null;
+  const recommendedAt = gateway ? Date.now() : null;
   const shardCount = resolveShardCount(gateway?.recommendedShards ?? 1);
 
   const registry = new Registry();
@@ -1629,7 +1631,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   // constructed after the recovery sources exist.
   let transformer: TransformationCoordinator | null = null;
 
-  const ledger = standalone ? null : new IdentifyLedger(process.env.DISCORD_TOKEN, registry, gateway?.sessionStartLimit ?? null);
+  const ledger = standalone ? null : new IdentifyLedger(process.env.DISCORD_TOKEN, registry, gateway?.sessionStartLimit ?? null, recommendedShards);
 
   // One pending ledger-retry timer: every refusal in a window coalesces into
   // a single deferred distribute() (the 5s tick re-evaluates anyway).
@@ -1890,10 +1892,12 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     if (node.isSelf && (standalone || (alone && declaredCapacityOf(node) > 0))) return registry.shardCount;
     return declaredCapacityOf(node);
   };
-  const reshardHint = (): string =>
-    recommendedShards !== null && recommendedShards < registry.shardCount
-      ? `, or reshard: Discord recommends ${recommendedShards} shard(s), set FLEET_SHARD_COUNT`
+  const reshardHint = (): string => {
+    const live = ledger?.getRecommendation()?.shards ?? recommendedShards;
+    return live !== null && live < registry.shardCount
+      ? `, or reshard: Discord recommends ${live} shard(s), set FLEET_SHARD_COUNT`
       : '';
+  };
 
   // Master-side mirror of the worker's same-shape adopt: a grant identifies
   // NOTHING when it matches what the node currently holds (its heldLeases when
@@ -4472,6 +4476,8 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     pinnedShardId,
     capacity: capabilities.shardCapacity,
     recommendedShards,
+    recommendedAt,
+    shardSource: decideShardSource({ adoptedPlan: rec.plan !== undefined, overrideApplied: rec.reshardApplied !== undefined, gatewayAnswered: gateway !== null }),
     runtime,
     ingest,
     registry,

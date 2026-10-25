@@ -6,8 +6,8 @@ import { ARM_MAX_ATTEMPTS, ARM_SPACING_MS, CONTROL_PORT_DEFAULT, LEASE_TTL_MS, P
 import type { WitnessDarkView } from './witnessDark';
 import { ArmPhase, readArmRecord } from './armRecord';
 import { EpisodeRecord, readEpisodeRecord } from './episodeRecord';
-import { getShardSource, isPinEnabled, overCapacityOf, resolveShardCapacity } from './placement';
-import type { OverCapacityView } from './placement';
+import { getShardCountOverride, getShardSource, isPinEnabled, overCapacityOf, resolveShardCapacity } from './placement';
+import type { OverCapacityView, ShardSource } from './placement';
 import type { BudgetInfo, NodeRole } from './protocol';
 import { consentsToActiveMode, isBackupMaster, isStandInBoot, readRoleOverride } from './nodeIdentity';
 import { readModeOverride } from './modeOverride';
@@ -193,7 +193,9 @@ export interface FleetState {
   term: number;
   epoch: number;
   shardCount: number;
-  shardSource: 'discord' | 'override';
+  shardSource: ShardSource;
+  /** Epoch ms when recommendedShards was read from Discord; null when it never was. */
+  recommendedAt: number | null;
   /** Deployment-default data backend (resolveDataBackend()). */
   dataBackend: 'file' | 'postgres';
   /** Per-guild routing overrides while a backend transformation is active (this process's live resolver). */
@@ -247,7 +249,7 @@ export interface FleetState {
   recovery: {
     adopted: boolean;
     holdDownRemainingMs: number;
-    reshardAdvised: { running: number; recommended: number } | null;
+    reshardAdvised: { running: number; recommended: number; readAt: number | null } | null;
     reshardApplied: { from: number; to: number } | null;
     reshardNeedsConfirm: { from: number; to: number } | null;
     reshardDeferred: { from: number; to: number; reason: string } | null;
@@ -614,6 +616,10 @@ export interface FleetStateSources {
   pinnedShardId: number | null;
   capacity: number;
   recommendedShards: number | null;
+  /** What decided the running shard count (master only). */
+  shardSource?: ShardSource;
+  /** Epoch ms of the boot read of recommendedShards; null when it failed. */
+  recommendedAt?: number | null;
   runtime: LeaseRuntime;
   ingest: IngestService;
   registry: Registry | null;
@@ -683,6 +689,23 @@ function buildConnect(): FleetState['connect'] {
   };
 }
 
+/**
+ * Reshard advice from Discord's latest reading: present while the adopted plan
+ * runs unchanged and the reading differs from the running count. Without any
+ * reading it keeps the boot advice, marked unread (readAt null).
+ */
+export function liveReshardAdvised(
+  recovery: FleetRecoverySource,
+  running: number,
+  live: { shards: number; readAt: number } | null,
+): { running: number; recommended: number; readAt: number | null } | null {
+  if (!recovery.adopted || recovery.reshardApplied || recovery.reshardNeedsConfirm || recovery.reshardDeferred) return null;
+  const override = getShardCountOverride();
+  if (override !== null && override !== running) return null;
+  if (!live) return recovery.reshardAdvised ? { ...recovery.reshardAdvised, readAt: null } : null;
+  return live.shards !== running ? { running, recommended: live.shards, readAt: live.readAt } : null;
+}
+
 export function getFleetState(): FleetState {
   // A master builds no heartbeats, so this is where its own sampler starts.
   startReplicaHealthSampler();
@@ -729,6 +752,7 @@ export function getFleetState(): FleetState {
       dataRouting: getRouteOverrides(),
       dataBoot: getDataBootStatus(),
       recommendedShards: null,
+      recommendedAt: null,
       capacity: resolveShardCapacity(),
       onHold: false,
       pinTestGuildShard: isPinEnabled(),
@@ -861,11 +885,12 @@ export function getFleetState(): FleetState {
       term: registry.term,
       epoch: registry.epoch,
       shardCount: registry.shardCount,
-      shardSource: getShardSource(),
+      shardSource: sources.shardSource ?? getShardSource(),
       dataBackend: resolveDataBackend(),
       dataRouting: getRouteOverrides(),
       dataBoot: getDataBootStatus(),
-      recommendedShards,
+      recommendedShards: ledger?.getRecommendation()?.shards ?? recommendedShards,
+      recommendedAt: ledger?.getRecommendation()?.readAt ?? sources.recommendedAt ?? null,
       capacity,
       onHold: false,
       pinTestGuildShard: isPinEnabled(),
@@ -883,7 +908,7 @@ export function getFleetState(): FleetState {
         ? {
             adopted: sources.recovery.adopted,
             holdDownRemainingMs: Math.max(0, sources.recovery.holdDownUntil - Date.now()),
-            reshardAdvised: sources.recovery.reshardAdvised,
+            reshardAdvised: liveReshardAdvised(sources.recovery, registry.shardCount, ledger?.getRecommendation() ?? null),
             reshardApplied: sources.recovery.reshardApplied,
             reshardNeedsConfirm: sources.recovery.reshardNeedsConfirm,
             reshardDeferred: sources.recovery.reshardDeferred,
@@ -988,11 +1013,12 @@ export function getFleetState(): FleetState {
     term,
     epoch: lease?.epoch ?? 0,
     shardCount,
-    shardSource: getShardSource(),
+    shardSource: 'master',
     dataBackend: resolveDataBackend(),
     dataRouting: getRouteOverrides(),
     dataBoot: getDataBootStatus(),
     recommendedShards,
+    recommendedAt: null,
     capacity,
     onHold,
     pinTestGuildShard: isPinEnabled(),

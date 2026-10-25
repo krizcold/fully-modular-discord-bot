@@ -14,7 +14,7 @@ import {
   IDENTIFY_SPACING_MS,
 } from './constants';
 import type { BudgetInfo } from './protocol';
-import { fetchGatewayInfo, SessionStartLimit } from './placement';
+import { fetchGatewayInfoResult, SessionStartLimit } from './placement';
 import type { Registry } from './registry';
 
 export type PermitResult = { ok: true } | { ok: false; retryInMs: number; reason: string };
@@ -33,12 +33,15 @@ export class IdentifyLedger {
   private readonly history = new Map<string, NodeIdentifyHistory>();
   private refreshQueued = false;
   private refreshInFlight: Promise<void> | null = null;
+  private recommendation: { shards: number; readAt: number } | null;
 
   constructor(
     private readonly token: string | undefined,
     private readonly registry: Registry,
     seed: SessionStartLimit | null,
+    seedRecommendation: number | null = null,
   ) {
+    this.recommendation = seedRecommendation !== null ? { shards: seedRecommendation, readAt: Date.now() } : null;
     this.lastFetch = seed ? { ...seed, fetchedAt: Date.now() } : null;
     this.stale = seed === null;
     setInterval(() => void this.refresh(), BUDGET_REFRESH_MS).unref();
@@ -162,6 +165,11 @@ export class IdentifyLedger {
     }, HEARTBEAT_MS).unref();
   }
 
+  /** Discord's shard recommendation from the last successful /gateway/bot read, and when it was read; null before any. */
+  getRecommendation(): { shards: number; readAt: number } | null {
+    return this.recommendation;
+  }
+
   /** Coalesce concurrent callers into the running fetch: overlapping refreshes would forgive the same consumption twice. */
   private refresh(): Promise<void> {
     if (this.refreshInFlight) return this.refreshInFlight;
@@ -171,7 +179,8 @@ export class IdentifyLedger {
 
   private async doRefresh(): Promise<void> {
     const prev = this.lastFetch;
-    const info = await fetchGatewayInfo(this.token);
+    const { info, error } = await fetchGatewayInfoResult(this.token);
+    if (info) this.recommendation = { shards: info.recommendedShards, readAt: Date.now() };
     if (info?.sessionStartLimit) {
       const live = info.sessionStartLimit;
       const now = Date.now();
@@ -202,7 +211,7 @@ export class IdentifyLedger {
       this.stale = false;
     } else {
       this.stale = true;
-      console.warn('[Fleet] Identify-budget refresh FAILED (/gateway/bot); budget gauge is stale');
+      console.warn(`[Fleet] Identify-budget refresh failed (/gateway/bot: ${error}); budget gauge is stale`);
     }
   }
 }
