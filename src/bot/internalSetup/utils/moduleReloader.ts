@@ -30,7 +30,7 @@ import { clearSchemaCache, getModulesWithSettings } from './settings/settingsDis
 import { createAllSettingsPanels } from './settings/settingsPanelFactory';
 import { getMetricsCollector } from './metrics/metricsCollector';
 import { resolveClientApplication } from './clientApplication';
-import { recordLoadFailure } from './loadFailures';
+import { beginReload, endReload, recordLoadFailure } from './loadFailures';
 
 interface CapturedCommand {
   name: string;
@@ -311,6 +311,15 @@ async function registerReloadedModule(client: Client, module: LoadedModule): Pro
  * Works for both existing modules (unload → reload) and fresh installs (just load).
  */
 export async function reloadModule(client: Client, moduleName: string): Promise<ReloadResult> {
+  beginReload();
+  try {
+    return await reloadModuleBody(client, moduleName);
+  } finally {
+    endReload();
+  }
+}
+
+async function reloadModuleBody(client: Client, moduleName: string): Promise<ReloadResult> {
   if (reloadingModules.has(moduleName)) {
     return { success: false, moduleName, error: 'Module is already being reloaded' };
   }
@@ -403,6 +412,15 @@ export async function unloadModuleFromMemory(client: Client, moduleName: string)
  * Reload multiple modules. Recompiles once, then reloads each module.
  */
 export async function reloadModules(client: Client, moduleNames: string[]): Promise<BulkReloadResult> {
+  beginReload();
+  try {
+    return await reloadModulesBody(client, moduleNames);
+  } finally {
+    endReload();
+  }
+}
+
+async function reloadModulesBody(client: Client, moduleNames: string[]): Promise<BulkReloadResult> {
   // Filter out modules that are already being reloaded
   const available = moduleNames.filter(n => !reloadingModules.has(n));
   const skipped = moduleNames.filter(n => reloadingModules.has(n));

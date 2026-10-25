@@ -12,3 +12,20 @@ export function getLoadFailures(): string[] {
 export function clearLoadFailures(): void {
   failures.clear();
 }
+
+let reloadsInFlight = 0;
+let reloadsStarted = 0;
+
+/** Marks a module reload as running; the orphan sweep refuses to delete while one runs or after one started. */
+export function beginReload(): void {
+  reloadsInFlight++;
+  reloadsStarted++;
+}
+
+export function endReload(): void {
+  if (reloadsInFlight > 0) reloadsInFlight--;
+}
+
+export function getReloadState(): { inFlight: number; started: number } {
+  return { inFlight: reloadsInFlight, started: reloadsStarted };
+}

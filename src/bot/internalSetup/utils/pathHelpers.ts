@@ -2,6 +2,7 @@ import path from 'path';
 import fs from 'fs';
 import { DATA_ROOT, dataPath } from '../../../utils/dataRoot';
 import { resolveNodeRole } from '../fleet/nodeIdentity';
+import { recordLoadFailure } from './loadFailures';
 
 /**
  * Get the root directory of the bot.
@@ -149,12 +150,6 @@ export function resolveModuleExport(modulePath: string, exportPath: string): {
   };
 }
 
-/**
- * Find all module.json files in the modules directory and modulesDev directory
- * Flat structure: modules/{moduleName}/module.json
- * Dev structure: modulesDev/{repoName}/Modules/{moduleName}/module.json
- * @returns Array of absolute paths to module.json files
- */
 /** True when the path exists, false only on ENOENT; any other error throws. */
 function pathPresent(p: string): boolean {
   try {
@@ -166,6 +161,23 @@ function pathPresent(p: string): boolean {
   }
 }
 
+/** Like pathPresent, but an error on one entry records it as a load failure and skips it instead of failing the listing. */
+function entryPresent(p: string, what: string): boolean {
+  try {
+    return pathPresent(p);
+  } catch (error) {
+    console.error(`[ModuleLoader] Cannot check ${p}; skipping ${what}:`, error);
+    recordLoadFailure(what);
+    return false;
+  }
+}
+
+/**
+ * Find all module.json files in the modules directory and modulesDev directory
+ * Flat structure: modules/{moduleName}/module.json
+ * Dev structure: modulesDev/{repoName}/Modules/{moduleName}/module.json
+ * @returns Array of absolute paths to module.json files
+ */
 export function findModuleManifests(): string[] {
   const manifests: string[] = [];
 
@@ -178,7 +190,7 @@ export function findModuleManifests(): string[] {
 
     for (const moduleName of modules) {
       const manifestPath = path.join(modulesDir, moduleName, 'module.json');
-      if (pathPresent(manifestPath)) {
+      if (entryPresent(manifestPath, moduleName)) {
         manifests.push(manifestPath);
       }
     }
@@ -196,16 +208,23 @@ export function findModuleManifests(): string[] {
 
     for (const repoName of repos) {
       const repoModulesDir = path.join(modulesDevDir, repoName, 'Modules');
-      if (pathPresent(repoModulesDir)) {
-        const devModules = fs.readdirSync(repoModulesDir, { withFileTypes: true })
+      const repoWhat = `the modulesDev repo ${repoName}`;
+      if (!entryPresent(repoModulesDir, repoWhat)) continue;
+      let devModules: string[];
+      try {
+        devModules = fs.readdirSync(repoModulesDir, { withFileTypes: true })
           .filter(dirent => dirent.isDirectory() && !dirent.name.endsWith('.disabled'))
           .map(dirent => dirent.name);
+      } catch (error) {
+        console.error(`[ModuleLoader] Cannot list ${repoModulesDir}; skipping ${repoWhat}:`, error);
+        recordLoadFailure(repoWhat);
+        continue;
+      }
 
-        for (const moduleName of devModules) {
-          const manifestPath = path.join(repoModulesDir, moduleName, 'module.json');
-          if (pathPresent(manifestPath)) {
-            manifests.push(manifestPath);
-          }
+      for (const moduleName of devModules) {
+        const manifestPath = path.join(repoModulesDir, moduleName, 'module.json');
+        if (entryPresent(manifestPath, moduleName)) {
+          manifests.push(manifestPath);
         }
       }
     }

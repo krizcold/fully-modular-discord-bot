@@ -9,6 +9,10 @@ vi.mock('../../src/bot/internalSetup/utils/dataManager', async (orig) => ({
   loadGlobalData: () => ({ guildId: 'g-test' }),
   saveGlobalData: () => true,
 }));
+vi.mock('child_process', async (orig) => ({
+  ...(await orig<any>()),
+  exec: (_cmd: string, _opts: any, cb: (err: any) => void) => cb(Object.assign(new Error('tsc failed'), { stderr: 'tsc failed' })),
+}));
 
 
 import fs from 'fs';
@@ -17,6 +21,7 @@ import { dataPath } from '../../src/utils/dataRoot';
 import registerCommands from '../../src/bot/internalSetup/events/clientReady/registerCommands';
 import { clearLoadFailures, recordLoadFailure } from '../../src/bot/internalSetup/utils/loadFailures';
 import { findModuleManifests } from '../../src/bot/internalSetup/utils/pathHelpers';
+import { reloadModules } from '../../src/bot/internalSetup/utils/moduleReloader';
 
 function setAutoCleanup(on: boolean): void {
   const file = dataPath('global', 'appstore', 'config.json');
@@ -63,7 +68,7 @@ describe('Auto Cleanup deletes only commands of uninstalled modules (R7-J12)', (
     const { client, deleted } = fakeClient(['gone-cmd']);
     const result = await registerCommands(client);
     expect(deleted).toEqual(['gone-cmd']);
-    expect(result).toEqual({ sweep: 'done', deleted: 1 });
+    expect(result).toEqual({ sweep: 'done', deleted: 1, failed: 0 });
   });
 
   it('refuses to list modules when a manifest check fails for a reason other than absence', () => {
@@ -137,7 +142,11 @@ describe('review fixes (C09-3)', () => {
   });
 
   it('records a module the bulk reload leaves unloaded', async () => {
-    const src = fs.readFileSync(path.join(__dirname, '../../src/bot/internalSetup/utils/moduleReloader.ts'), 'utf8');
-    expect(src.match(/recordLoadFailure[(](name|moduleName)[)]/g)?.length).toBe(6);
+    await reloadModules({} as any, ['bulk-mod']);
+    const { client, deleted } = fakeClient(['its-cmd']);
+    const result = await registerCommands(client);
+    expect(deleted).toEqual([]);
+    expect(result?.sweep).toBe('skipped');
+    expect(result?.note).toMatch(/bulk-mod/);
   });
 });

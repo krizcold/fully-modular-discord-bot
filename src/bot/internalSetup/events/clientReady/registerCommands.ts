@@ -15,7 +15,7 @@ import { dataPath } from '../../../../utils/dataRoot';
 import * as fs from 'fs';
 import { componentConfigPath, getLastAppliedDisabledCommands, readConfigFile, setLastAppliedDisabledCommands } from '../../utils/appStoreConfigFile';
 import { resolveClientApplication } from '../../utils/clientApplication';
-import { getLoadFailures } from '../../utils/loadFailures';
+import { getLoadFailures, getReloadState } from '../../utils/loadFailures';
 
 /** Check if auto-cleanup is enabled in AppStore config (default: false) */
 export function isAutoCleanupEnabled(): boolean {
@@ -256,6 +256,7 @@ const internalOrHandledKeys = [
 export interface OrphanSweepResult {
   sweep: 'done' | 'off' | 'skipped' | 'stopped';
   deleted: number;
+  failed: number;
   note?: string;
 }
 
@@ -281,6 +282,13 @@ export default async function registerCommands(
   try {
     // Clean up stale guild commands from previous test guilds
     const staleCleanupDone = await handleStaleTestGuildCleanup(client, guildId);
+
+    // A reload in flight, or one started after this point, makes the local list incomplete for the sweep.
+    const reloadAtRead = getReloadState();
+    const noReloadSinceRead = (): boolean => {
+      const now = getReloadState();
+      return now.inFlight === 0 && now.started === reloadAtRead.started;
+    };
 
     // Load all local commands (each file exports a command object or an array of commands)
     const localCommands = getLocalCommands();
@@ -319,6 +327,9 @@ export default async function registerCommands(
     };
     const guildCommands = await guildCmds.fetch(); // Test commands!
 
+    const result: OrphanSweepResult = { sweep: 'off', deleted: 0, failed: 0 };
+    let disabledFailed = 0;
+
     // Process each local command
     for (const localCommand of localCommands) {
       // https://discord.com/developers/docs/interactions/application-commands#application-command-object-application-command-structure
@@ -335,10 +346,17 @@ export default async function registerCommands(
         const existing = (testOnly ? guildCommands : globalCommands)?.find(cmd => cmd.name === name && cmd.type === (type ?? typeChat));
         if (existing) {
           try {
-            const mgr = testOnly ? guildCmds : client.application?.commands;
-            await mgr?.delete(existing.id);
+            await (testOnly ? guildCmds : appCommands).delete(existing.id);
+            result.deleted++;
             console.log(`[i] Unregistered disabled command: ${name}`);
-          } catch (e) { console.error(`[i] Failed to unregister disabled command ${name}:`, e); }
+          } catch (e: any) {
+            if (e?.code === COMMAND_GONE_CODE) {
+              console.debug(`[i] Disabled command ${name} already gone on Discord (10063)`);
+            } else {
+              disabledFailed++;
+              console.error(`[i] Failed to unregister disabled command ${name}:`, e);
+            }
+          }
         }
         continue;
       }
@@ -354,38 +372,88 @@ export default async function registerCommands(
 
       await commandRegistration(commandData, localCommand, existingCommand, guildCmds, client);
     }
+    result.failed = disabledFailed;
+    if (result.deleted > 0 || disabledFailed > 0) {
+      console.log(`[i] Disabled commands: ${result.deleted} unregistered, ${disabledFailed} could not be unregistered`);
+    }
 
 
     // Remove orphan commands only if auto-cleanup is enabled (default: OFF)
     // AND the caller allows the full sweep (startup: yes; hot-reload: no).
     const switchAtStart = runOrphanCleanup ? readAutoCleanup() : false;
     let cleanupEnabled = switchAtStart === true;
-    const result: OrphanSweepResult = { sweep: cleanupEnabled ? 'done' : 'off', deleted: 0 };
+    if (cleanupEnabled) result.sweep = 'done';
+    let sweepDeleted = 0;
+    let sweepFailed = 0;
+    let sweepNote: string | undefined;
     if (runOrphanCleanup && switchAtStart !== true) {
-      result.note = switchAtStart === null
+      sweepNote = switchAtStart === null
         ? 'orphan sweep not run: the Auto Cleanup setting could not be read'
         : 'orphan sweep not run: Auto Cleanup was turned off';
     }
-    const loadFailures = getLoadFailures();
-    if (cleanupEnabled && loadFailures.length === 0) {
-      const absent = await installedButAbsent();
-      if (absent === null) loadFailures.push('the installed module list');
-      else loadFailures.push(...absent);
-    }
-    if (cleanupEnabled && loadFailures.length > 0) {
+    const skipSweep = (note: string, why: string): void => {
       cleanupEnabled = false;
       result.sweep = 'skipped';
-      result.note = `orphan sweep skipped: these failed to load at this boot: ${loadFailures.join(', ')}`;
-      console.warn(`[Cleanup] Orphan command sweep skipped; their commands would be deleted. Failed to load: ${loadFailures.join(', ')}`);
+      sweepNote = note;
+      console.warn(`[Cleanup] Orphan command sweep skipped; their commands would be deleted. ${why}`);
+    };
+    if (cleanupEnabled && !noReloadSinceRead()) {
+      skipSweep('orphan sweep skipped: a module reload was running', 'A module reload was running.');
     }
-    const switchStillOn = (): boolean => {
+    if (cleanupEnabled) {
+      const recorded = getLoadFailures();
+      const absent = recorded.length === 0 ? await installedButAbsent() : [];
+      // Listing the modules can record a module.json it could not read.
+      const recordedNow = getLoadFailures();
+      if (recordedNow.length > 0) {
+        skipSweep(
+          `orphan sweep skipped until the bot restarts: these modules did not load, lack a dependency or could not be read: ${recordedNow.join(', ')}`,
+          `Did not load, lack a dependency or could not be read: ${recordedNow.join(', ')}`
+        );
+      } else if (absent === null) {
+        skipSweep('orphan sweep skipped: the installed module list could not be read', 'The installed module list could not be read.');
+      } else if (absent.length > 0) {
+        skipSweep(
+          `orphan sweep skipped: these installed modules are missing: ${absent.join(', ')}`,
+          `Installed but missing: ${absent.join(', ')}`
+        );
+      }
+    }
+    let halted = false;
+    const sweepCounts = (): string =>
+      `${sweepDeleted} deletion(s)${sweepFailed > 0 ? `, ${sweepFailed} failed (see the bot log)` : ''}`;
+    const mayDelete = (): boolean => {
+      if (!noReloadSinceRead()) {
+        result.sweep = 'skipped';
+        sweepNote = `orphan sweep skipped after ${sweepCounts()}: a module reload was running`;
+        console.log(`[Cleanup] Orphan sweep skipped after ${sweepCounts()}: a module reload was running`);
+        halted = true;
+        return false;
+      }
       const on = readAutoCleanup();
       if (on === true) return true;
       const why = on === null ? 'the Auto Cleanup setting could not be read' : 'Auto Cleanup was turned off';
       result.sweep = 'stopped';
-      result.note = `orphan sweep stopped after ${result.deleted} deletion(s): ${why}`;
-      console.log(`[Cleanup] Orphan sweep stopped after ${result.deleted} deletion(s): ${why}`);
+      sweepNote = `orphan sweep stopped after ${sweepCounts()}: ${why}`;
+      console.log(`[Cleanup] Orphan sweep stopped after ${sweepCounts()}: ${why}`);
+      halted = true;
       return false;
+    };
+    const sweepDelete = async (label: string, remove: () => Promise<unknown>): Promise<void> => {
+      try {
+        await remove();
+        sweepDeleted++;
+        result.deleted++;
+        console.log(`Deleted ${label} as it is no longer found locally or test mode active.`);
+      } catch (deleteError: any) {
+        if (deleteError?.code === COMMAND_GONE_CODE) {
+          console.debug(`${label} already gone on Discord (10063)`);
+        } else {
+          sweepFailed++;
+          result.failed++;
+          console.error(`Error deleting ${label}:`, deleteError);
+        }
+      }
     };
 
     // Remove global commands that are no longer present locally
@@ -407,18 +475,8 @@ export default async function registerCommands(
             console.log(`[Test Mode] Skipping deletion of global command: ${appCommand.name} (Type: ${ApplicationCommandType[appCommand.type]})`);
             continue;
           }
-          if (!switchStillOn()) break;
-          try {
-            await client.application?.commands.delete(appCommand.id);
-            result.deleted++;
-            console.log(`Deleted global command "${appCommand.name}" (Type: ${ApplicationCommandType[appCommand.type]}) as it is no longer found locally or test mode active.`);
-          } catch(deleteError: any){
-            if (deleteError?.code === 10063) {
-              console.debug(`Global command "${appCommand.name}" already gone on Discord (10063)`);
-            } else {
-              console.error(`Error deleting global command "${appCommand.name}":`, deleteError);
-            }
-          }
+          if (!mayDelete()) break;
+          await sweepDelete(`global command "${appCommand.name}" (Type: ${ApplicationCommandType[appCommand.type]})`, () => appCommands.delete(appCommand.id));
         }
       }
     } else if (result.sweep === 'off' && globalCommands) {
@@ -430,7 +488,7 @@ export default async function registerCommands(
     }
 
     // Remove local (guild) commands that are no longer present locally or shouldn't be local
-    if (cleanupEnabled && result.sweep !== 'stopped') {
+    if (cleanupEnabled && !halted) {
       for (const guildCommand of guildCommands.values()) {
         // Find local command matching name AND type
         const foundLocal = localCommands.some(localCmd =>
@@ -446,18 +504,8 @@ export default async function registerCommands(
           if (testMode && correspondingLocal && !correspondingLocal.testOnly) {
             continue;
           }
-          if (!switchStillOn()) break;
-          try {
-            await guildCmds.delete(guildCommand.id);
-            result.deleted++;
-            console.log(`Deleted local command "${guildCommand.name}" (Type: ${ApplicationCommandType[guildCommand.type]}) as it is no longer found locally or not marked testOnly.`);
-          } catch(deleteError: any){
-            if (deleteError?.code === 10063) {
-              console.debug(`Local command "${guildCommand.name}" already gone on Discord (10063)`);
-            } else {
-              console.error(`Error deleting local command "${guildCommand.name}":`, deleteError);
-            }
-          }
+          if (!mayDelete()) break;
+          await sweepDelete(`local command "${guildCommand.name}" (Type: ${ApplicationCommandType[guildCommand.type]})`, () => guildCmds.delete(guildCommand.id));
         }
       }
     } else if (result.sweep === 'off') {
@@ -467,6 +515,15 @@ export default async function registerCommands(
         console.log('[i] Auto-cleanup disabled, skipping orphan guild command removal');
       }
     }
+
+    if (!sweepNote && sweepFailed > 0) {
+      sweepNote = `orphan sweep done: ${sweepFailed} command(s) could not be deleted (see the bot log)`;
+    }
+    const disabledNote = disabledFailed > 0
+      ? `${disabledFailed} disabled command(s) could not be unregistered (see the bot log)`
+      : undefined;
+    const notes = [sweepNote, disabledNote].filter((n): n is string => !!n);
+    if (notes.length > 0) result.note = notes.join('; ');
 
     // Save current test guild for future cleanup tracking; an unfinished
     // stale cleanup keeps the old guild tracked so the next run retries it.
