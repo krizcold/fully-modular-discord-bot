@@ -13,6 +13,7 @@ import { resolveNodeRole } from '../../fleet/nodeIdentity';
 import { loadGlobalData, saveGlobalData } from '../../utils/dataManager';
 import { dataPath } from '../../../../utils/dataRoot';
 import * as fs from 'fs';
+import { componentConfigPath, getLastAppliedDisabledCommands, readConfigFile, setLastAppliedDisabledCommands } from '../../utils/appStoreConfigFile';
 
 /** Check if auto-cleanup is enabled in AppStore config (default: false) */
 export function isAutoCleanupEnabled(): boolean {
@@ -26,24 +27,24 @@ export function isAutoCleanupEnabled(): boolean {
   return false;
 }
 
-/** Load component toggle config; returns set of disabled command keys */
-function getDisabledCommands(): Set<string> {
+/** Disabled command names; on a read error, the last applied set, or null when none was applied yet. */
+function getDisabledCommands(): Set<string> | null {
+  const read = readConfigFile(componentConfigPath());
+  if (!read.ok) {
+    console.error(`[registerCommands] component-config.json cannot be read: ${read.error}`);
+    return getLastAppliedDisabledCommands();
+  }
   const disabled = new Set<string>();
-  try {
-    const configPath = dataPath('global', 'appstore', 'component-config.json');
-    if (fs.existsSync(configPath)) {
-      const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
-      for (const [key, value] of Object.entries(config)) {
-        if (value === false && key.includes(':command:')) {
-          // key format: "moduleName:command:commandName"; extract commandName
-          const parts = key.split(':');
-          if (parts.length >= 3) {
-            disabled.add(parts[parts.length - 1]);
-          }
-        }
+  for (const [key, value] of Object.entries(read.config)) {
+    if (value === false && key.includes(':command:')) {
+      // key format: "moduleName:command:commandName"; extract commandName
+      const parts = key.split(':');
+      if (parts.length >= 3) {
+        disabled.add(parts[parts.length - 1]);
       }
     }
-  } catch { /* ignore */ }
+  }
+  setLastAppliedDisabledCommands(disabled);
   return disabled;
 }
 
@@ -200,6 +201,10 @@ export default async function registerCommands(
 
     // Load disabled commands from component config
     const disabledCommands = getDisabledCommands();
+    if (!disabledCommands) {
+      console.error('[registerCommands] Commands were not registered: the disabled set cannot be read and none was applied before.');
+      return;
+    }
     if (disabledCommands.size > 0) {
       console.log(`[i] ${disabledCommands.size} command(s) disabled via component config: ${[...disabledCommands].join(', ')}`);
     }

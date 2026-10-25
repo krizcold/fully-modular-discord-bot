@@ -1,8 +1,6 @@
 import { EventEmitter } from 'events';
-import * as fs from 'fs';
-import * as path from 'path';
-import { dataPath } from '../../utils/dataRoot';
 import { getAppStoreManager } from '../../bot/internalSetup/utils/appStoreManager';
+import { componentConfigPath, readConfigFile, writeConfigFile } from '../../bot/internalSetup/utils/appStoreConfigFile';
 import type { BotManager } from '../botManager';
 
 export type JobKind = 'install' | 'uninstall';
@@ -34,13 +32,14 @@ export type CancelResult =
   | { ok: true; job: InstallJob }
   | { ok: false; reason: 'not-found' | 'already-running' };
 
-const APPSTORE_CONFIG_DIR = dataPath('global', 'appstore');
-const COMPONENT_CONFIG_PATH = path.join(APPSTORE_CONFIG_DIR, 'component-config.json');
-
 function cleanupComponentConfig(moduleName: string): void {
   try {
-    if (!fs.existsSync(COMPONENT_CONFIG_PATH)) return;
-    const config = JSON.parse(fs.readFileSync(COMPONENT_CONFIG_PATH, 'utf-8'));
+    const read = readConfigFile(componentConfigPath());
+    if (!read.ok) {
+      console.error(`[AppStore] Kept the component toggles of ${moduleName}: component-config.json cannot be read: ${read.error}`);
+      return;
+    }
+    const config = read.config;
     const prefix = `${moduleName}:`;
     let cleaned = false;
     for (const key of Object.keys(config)) {
@@ -49,9 +48,9 @@ function cleanupComponentConfig(moduleName: string): void {
         cleaned = true;
       }
     }
-    if (cleaned) fs.writeFileSync(COMPONENT_CONFIG_PATH, JSON.stringify(config, null, 2));
-  } catch {
-    /* non-fatal */
+    if (cleaned) writeConfigFile(componentConfigPath(), config);
+  } catch (error) {
+    console.error(`[AppStore] Kept the component toggles of ${moduleName}: the cleanup write failed:`, error);
   }
 }
 

@@ -8,34 +8,54 @@
  * to re-disable components that should stay off.
  */
 
-import * as fs from 'fs';
 import { Client } from 'discord.js';
-import { dataPath } from '../../../utils/dataRoot';
 import { getModuleRegistry } from './moduleRegistry';
 import { getModuleEventManager } from './moduleEventManager';
 import { getPanelManager } from './panelManager';
 import getLocalCommands from './getLocalCommands';
 import { buildCommandPayload } from './commandUtils';
 import { LoadedModule } from '../../types/moduleTypes';
+import { componentConfigPath, getLastAppliedDisabledCommands, readConfigFile, setLastAppliedDisabledCommands } from './appStoreConfigFile';
 
 let clientRef: Client | null = null;
 
+let lastAppliedDisabled: Record<string, false> | null = null;
+
 /**
- * Read component-config.json and return disabled entries.
+ * Read component-config.json and return disabled entries; on a read error, the last applied entries.
  */
 function loadDisabledComponents(): Record<string, false> {
-  try {
-    const configPath = dataPath('global', 'appstore', 'component-config.json');
-    if (fs.existsSync(configPath)) {
-      const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
-      const disabled: Record<string, false> = {};
-      for (const [key, value] of Object.entries(config)) {
-        if (value === false) disabled[key] = false;
-      }
-      return disabled;
+  const read = readConfigFile(componentConfigPath());
+  if (!read.ok) {
+    if (lastAppliedDisabled) {
+      console.error(`[Toggle] component-config.json cannot be read, keeping the last applied disabled set: ${read.error}`);
+      return lastAppliedDisabled;
     }
-  } catch { /* ignore */ }
-  return {};
+    console.error(`[Toggle] component-config.json cannot be read and no disabled set was applied yet: disabled events and panels stay on until it is fixed: ${read.error}`);
+    return {};
+  }
+  const disabled: Record<string, false> = {};
+  for (const [key, value] of Object.entries(read.config)) {
+    if (value === false) disabled[key] = false;
+  }
+  lastAppliedDisabled = disabled;
+  return disabled;
+}
+
+function recordAppliedToggle(moduleName: string, componentType: string, name: string, enabled: boolean): void {
+  if (componentType === 'command') {
+    const current = getLastAppliedDisabledCommands();
+    if (!current) return;
+    const next = new Set(current);
+    if (enabled) next.delete(name); else next.add(name);
+    setLastAppliedDisabledCommands(next);
+    return;
+  }
+  if (!lastAppliedDisabled) return;
+  const key = `${moduleName}:${componentType}:${name}`;
+  const next = { ...lastAppliedDisabled };
+  if (enabled) delete next[key]; else next[key] = false;
+  lastAppliedDisabled = next;
 }
 
 /**
@@ -222,6 +242,7 @@ export function setupToggleIPCHandlers(client: Client): void {
           response = { success: false, error: `Unknown component type: ${componentType}` };
       }
 
+      if (response?.success) recordAppliedToggle(moduleName, componentType, name, enabled);
       process.send!({ requestId, data: response });
     } catch (error: any) {
       process.send!({

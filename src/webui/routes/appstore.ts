@@ -29,6 +29,7 @@ import { BotManager } from '../botManager';
 import { ComponentToggleDebouncer } from '../utils/componentToggleDebouncer';
 import { getInstallQueue } from '../utils/installQueue';
 import { nudgeSync } from '../utils/syncNudge';
+import { readConfigFile, writeConfigFile } from '../../bot/internalSetup/utils/appStoreConfigFile';
 
 /**
  * Refresh each enabled ProviderLink's variant cache from its provider at
@@ -1815,31 +1816,23 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
   const APPSTORE_CONFIG_PATH = path.join(APPSTORE_CONFIG_DIR, 'config.json');
 
   function loadComponentConfig(): Record<string, boolean> {
-    try {
-      if (fs.existsSync(COMPONENT_CONFIG_PATH)) {
-        return JSON.parse(fs.readFileSync(COMPONENT_CONFIG_PATH, 'utf-8'));
-      }
-    } catch { /* ignore */ }
-    return {};
+    const read = readConfigFile(COMPONENT_CONFIG_PATH);
+    if (!read.ok) throw new Error(`component-config.json cannot be read: ${read.error}`);
+    return read.config;
   }
 
   function saveComponentConfig(config: Record<string, boolean>): void {
-    if (!fs.existsSync(APPSTORE_CONFIG_DIR)) fs.mkdirSync(APPSTORE_CONFIG_DIR, { recursive: true });
-    fs.writeFileSync(COMPONENT_CONFIG_PATH, JSON.stringify(config, null, 2));
+    writeConfigFile(COMPONENT_CONFIG_PATH, config);
   }
 
   function loadAppStoreConfig(): Record<string, any> {
-    try {
-      if (fs.existsSync(APPSTORE_CONFIG_PATH)) {
-        return JSON.parse(fs.readFileSync(APPSTORE_CONFIG_PATH, 'utf-8'));
-      }
-    } catch { /* ignore */ }
-    return {};
+    const read = readConfigFile(APPSTORE_CONFIG_PATH);
+    if (!read.ok) throw new Error(`config.json cannot be read: ${read.error}`);
+    return read.config;
   }
 
   function saveAppStoreConfig(config: Record<string, any>): void {
-    if (!fs.existsSync(APPSTORE_CONFIG_DIR)) fs.mkdirSync(APPSTORE_CONFIG_DIR, { recursive: true });
-    fs.writeFileSync(APPSTORE_CONFIG_PATH, JSON.stringify(config, null, 2));
+    writeConfigFile(APPSTORE_CONFIG_PATH, config);
   }
 
   /** Map Discord ApplicationCommandOptionType numbers to readable strings */
