@@ -11,8 +11,10 @@ import { getPanelManager } from './panelManager';
 import { buildConsoleInteraction } from './consoleInteraction';
 import { getFleetState } from '../fleet/state';
 import { guildIdToShardId } from '../fleet/placement';
-import { awaitGuildDataReady } from './dataBackends/boot';
+import { admitGuildAction, ENTRY_WAIT_MS, gateConsoleText } from './dataBackends/boot';
 import { isCommandRunnable } from './commandGate';
+import { runSealed } from './dataBackends/writeLedger';
+import { truthText, verdictOf } from './dataBackends/replyGate';
 
 interface InvokePayload {
   command?: string;
@@ -33,7 +35,7 @@ function commandExists(name: string): boolean {
   return flat.some((c) => c && c.name === name);
 }
 
-async function handleInvoke(data: InvokePayload): Promise<Record<string, unknown>> {
+export async function handleInvoke(data: InvokePayload): Promise<Record<string, unknown>> {
   const command = (data.command || '').trim();
   if (!command) return { success: false, error: 'command is required' };
 
@@ -66,8 +68,10 @@ async function handleInvoke(data: InvokePayload): Promise<Record<string, unknown
     }
   }
 
-  if (guildId && !(await awaitGuildDataReady(guildId))) {
-    return { success: false, error: `guild ${guildId}'s data is still loading; try again in a moment` };
+  if (guildId) {
+    // Held before its ledger opens (R1-J2), so the command's writes and its confirmSaved start at admission.
+    const held = await admitGuildAction(guildId, performance.now() + ENTRY_WAIT_MS);
+    if (held.cause !== 'admit') return { success: false, error: gateConsoleText(held.cause, guildId) };
   }
 
   const userId = data.userId ? String(data.userId) : null;
@@ -87,17 +91,32 @@ async function handleInvoke(data: InvokePayload): Promise<Record<string, unknown
 
   const startedAt = Date.now();
   // handleCommands owns its own try/catch: a command-internal throw is logged
-  // there (visible via `smdb logs`), not surfaced inline. Pre-dispatch failures
-  // (bad command, unserved guild) are returned as errors above.
-  await handleCommands(client, interaction as never);
-  return {
-    success: true,
+  // there (visible via `smdb logs`) and recorded as the invoke's outcome, as is
+  // a gate's refusal. Its writes are recorded in a ledger keyed to the
+  // interaction, judged before it seals: success only when every one landed.
+  const verdict = await runSealed('console', interaction as object, null, async ledger => {
+    await handleCommands(client, interaction as never);
+    return verdictOf([ledger]);
+  });
+  const outcome = result.outcome;
+  const answer: Record<string, unknown> = {
+    success: verdict.ok && !outcome,
     command,
     captured: result.captured,
     replied: result.replied,
     deferred: result.deferred,
     durationMs: Date.now() - startedAt,
   };
+  if (!verdict.ok) {
+    // The truth leads; the command's own error is kept beside it.
+    answer.error = truthText(verdict.answer, verdict.partial);
+    answer.truth = verdict.answer;
+    if (verdict.answer === 'pending' || verdict.answer === 'held') answer.pending = true;
+    if (outcome && 'error' in outcome) answer.handlerError = outcome.error;
+  } else if (outcome) {
+    answer.error = 'refusal' in outcome ? outcome.refusal : outcome.error;
+  }
+  return answer;
 }
 
 export function setupCommandIPCHandlers(): void {

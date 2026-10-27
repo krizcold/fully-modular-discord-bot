@@ -26,6 +26,7 @@ import {
 } from '../constants';
 import type { ControlStore, MigrationLeg, MigrationRecord, MigrationState, PersistedMigrations } from '../controlStore';
 import { migrationsHoldTogether, STUCK_WAY_ON } from '../controlStore';
+import { unconfirmed } from '../controlWrites';
 import {
   MSG,
   MigrationKind,
@@ -123,6 +124,13 @@ export interface CoordinatorHooks {
   transformationActive?: () => boolean;
 }
 
+interface LossMarks {
+  changed: boolean;
+  released: MigrationLeg[];
+  kept: OwedLeg[];
+  held: number[];
+}
+
 interface LegLive {
   leg: MigrationLeg;
   guildsTotal: number;
@@ -140,6 +148,8 @@ interface LegLive {
 export class MigrationCoordinator {
   private record: MigrationRecord | null = null;
   private history: MigrationRecord[] = [];
+  // A Declare Lost's marks are being made on a copy: nothing outside the records changes.
+  private markingCopy = false;
   private recovered = false;
   // The persisted records exist but could not be read: never written over
   // (their repair and a restart bring them back) and no migration starts.
@@ -368,16 +378,26 @@ export class MigrationCoordinator {
 
   /**
    * A Declare Lost of nodeId: the shards an abort under way would hand back
-   * to it (its drain took them off the table) are freed with it, its legs
-   * marked so the rollback, after a restart too, gives it none.
+   * to it (its drain took them off the table) are freed with it; its
+   * onNodeDeclaredLost marks those legs so the rollback, after a restart
+   * too, gives it none.
    */
-  releaseRollbackOf(nodeId: string): number[] {
+  rollbackShardsOf(nodeId: string): number[] {
+    return this.rollbackLegsOf(nodeId).map(l => l.shardId);
+  }
+
+  private rollbackLegsOf(nodeId: string): MigrationLeg[] {
     const rec = this.record;
     if (!rec || !this.abortInProgress || !this.drainRan) return [];
-    const at = Date.now();
-    const legs = rec.legs.filter(l => l.legState !== 'DONE' && l.sourceNodeId === nodeId);
-    for (const l of legs) if (l.sourceLostAt === undefined) l.sourceLostAt = at;
-    return legs.map(l => l.shardId);
+    return rec.legs.filter(l => l.legState !== 'DONE' && l.sourceNodeId === nodeId);
+  }
+
+  /** The shards the stored redistribute proposal places on nodeId. */
+  proposalShardsOf(nodeId: string): Promise<number[]> {
+    return this.serialProposal(async () => {
+      const stored: Record<number, string> = await this.hooks.loadRedistributeProposal().catch(() => null) ?? {};
+      return Object.entries(stored).filter(([, owner]) => owner === nodeId).map(([shardKey]) => Number(shardKey)).filter(shardId => Number.isInteger(shardId));
+    });
   }
 
   // Only a running slice of a retire commits or grants; its parent waits
@@ -464,11 +484,57 @@ export class MigrationCoordinator {
    * one left unplaced, by a drain or the reshard pause, whose newest
    * committed move went there) with an older copy surviving on a node
    * owing that move's cleanup (maybe its last copy) has that cleanup held
-   * for the operator's choice. Returns the shards now held.
+   * for the operator's choice. Returns the shards now held. The marks are
+   * made on a copy of the records and written first: a refused write
+   * leaves the records held as they were.
    */
   async onNodeDeclaredLost(lostNodeId: string, lostNodeName: string, freedShardIds: number[]): Promise<number[]> {
     const at = Date.now();
+    let marks: LossMarks | null = null;
+    await this.persist({
+      stage: () => {
+        const held = { record: this.record, parentRecord: this.parentRecord, history: this.history };
+        const copy = structuredClone(held);
+        let planned: LossMarks;
+        this.record = copy.record;
+        this.parentRecord = copy.parentRecord;
+        this.history = copy.history;
+        this.markingCopy = true;
+        try {
+          planned = this.markLost(lostNodeId, lostNodeName, freedShardIds, at);
+        } finally {
+          this.record = held.record;
+          this.parentRecord = held.parentRecord;
+          this.history = held.history;
+          this.markingCopy = false;
+        }
+        if (!planned.changed) return null;
+        const active = copy.parentRecord ?? copy.record;
+        return { active: active && !isTerminal(active.state) ? active : null, history: copy.history, updatedAt: Date.now() };
+      },
+      apply: () => { marks = this.markLost(lostNodeId, lostNodeName, freedShardIds, at); },
+    });
+    const { released, kept, held: heldIds } = marks!;
+    // A commit round waiting on this node goes on without it.
+    if (this.record?.state === 'COMMITTING') this.runCommitRound();
+    for (const leg of released) {
+      const holder = this.hooks.registry.nodes?.get(leg.sourceNodeId)?.nodeName ?? leg.sourceNodeId;
+      console.warn(`[Migration] Shard ${leg.shardId}: the guilds the redistribute was placing on ${lostNodeName} stay on ${holder}, released as it ends; ${this.hooks.isPaused() ? 'run Redistribute again before Resume to place them' : `the shard is placed as any free shard once released (Declare ${holder} Lost if it never returns), those guilds starting fresh unless it lands on ${holder}`}`);
+    }
+    for (const { leg, nodeId } of kept) {
+      console.warn(`[Migration] Shard ${leg.shardId}: ${this.hooks.registry.nodes?.get(nodeId)?.nodeName ?? nodeId} keeps its copy of guilds the redistribute moved, as new as the one lost with ${lostNodeName} (nothing has served in the reshard pause), released; run Redistribute again before Resume to place them`);
+    }
+    return heldIds;
+  }
+
+  // The marks a Declare Lost makes on the records this coordinator holds.
+  private markLost(lostNodeId: string, lostNodeName: string, freedShardIds: number[], at: number): LossMarks {
     let changed = false;
+    for (const leg of this.rollbackLegsOf(lostNodeId)) {
+      if (leg.sourceLostAt !== undefined) continue;
+      leg.sourceLostAt = at;
+      changed = true;
+    }
     // Its stuck guilds are named again only if it returns and still cannot move them.
     for (const rec of this.cleanupRecords()) {
       const entry = rec.pendingSourceCleanup?.find(e => e.nodeId === lostNodeId);
@@ -510,8 +576,6 @@ export class MigrationCoordinator {
         changed = true;
       }
     }
-    // The legs releaseRollbackOf marked are written with the record.
-    if (this.record?.legs.some(l => l.sourceNodeId === lostNodeId && !l.committed && l.sourceLostAt !== undefined)) changed = true;
     for (const rec of this.cleanupRecords()) {
       for (const legId of rec.pendingSourceCleanup?.find(e => e.nodeId === lostNodeId)?.legIds ?? []) {
         const leg = rec.legs.find(l => l.legId === legId);
@@ -552,17 +616,7 @@ export class MigrationCoordinator {
         changed = true;
       }
     }
-    if (changed) await this.persist();
-    // A commit round waiting on this node goes on without it.
-    if (this.record?.state === 'COMMITTING') this.runCommitRound();
-    for (const leg of released) {
-      const holder = this.hooks.registry.nodes?.get(leg.sourceNodeId)?.nodeName ?? leg.sourceNodeId;
-      console.warn(`[Migration] Shard ${leg.shardId}: the guilds the redistribute was placing on ${lostNodeName} stay on ${holder}, released as it ends; ${paused ? 'run Redistribute again before Resume to place them' : `the shard is placed as any free shard once released (Declare ${holder} Lost if it never returns), those guilds starting fresh unless it lands on ${holder}`}`);
-    }
-    for (const { leg, nodeId } of kept) {
-      console.warn(`[Migration] Shard ${leg.shardId}: ${this.hooks.registry.nodes?.get(nodeId)?.nodeName ?? nodeId} keeps its copy of guilds the redistribute moved, as new as the one lost with ${lostNodeName} (nothing has served in the reshard pause), released; run Redistribute again before Resume to place them`);
-    }
-    return [...held].sort((a, b) => a - b);
+    return { changed, released, kept, held: [...held].sort((a, b) => a - b) };
   }
 
   /** The owed redistribute copies holding a guild whose newest commit went to the lost node. */
@@ -733,15 +787,25 @@ export class MigrationCoordinator {
     return null;
   }
 
-  /** The operator chose for a held shard: its copies' cleanups run again. Returns the nodes owing them. */
+  /** The nodes owing a cleanup of the shard's moves. */
+  cleanupOwersOf(shardId: number): string[] {
+    return [...new Set(this.owedLegsOf(shardId).map(owed => owed.nodeId))];
+  }
+
+  /** The operator chose for a held shard: its copies' cleanups run again. Returns the nodes owing them. Written first: a refused write leaves the shard waiting on the choice. */
   async releaseHeld(shardId: number): Promise<string[]> {
-    const owing = new Set<string>();
-    for (const { leg, nodeId } of this.owedLegsOf(shardId)) {
-      delete leg.heldForChoice;
-      owing.add(nodeId);
-    }
-    await this.persist();
-    return [...owing];
+    await this.persist({
+      stage: () => {
+        const legIds = new Set(this.owedLegsOf(shardId).map(({ leg }) => leg.legId));
+        const state = structuredClone(this.snapshot());
+        for (const rec of [state.active, ...state.history]) {
+          for (const leg of rec?.legs ?? []) if (leg.shardId === shardId && legIds.has(leg.legId)) delete leg.heldForChoice;
+        }
+        return state;
+      },
+      apply: () => { for (const { leg } of this.owedLegsOf(shardId)) delete leg.heldForChoice; },
+    });
+    return this.cleanupOwersOf(shardId);
   }
 
   /** The records a deferred source cleanup lives on: a retire's parent and its running slice, or the active one, and the history. */
@@ -1284,7 +1348,7 @@ export class MigrationCoordinator {
   // Lost can settle it and the planned transfer's refusal finds it.
   private keepOwingKnown(nodeId: string, leg: MigrationLeg | undefined): void {
     const registry = this.hooks.registry;
-    if (!leg || leg.sourceLostAt !== undefined || nodeId === this.hooks.selfNodeId || registry.nodes.has(nodeId)) return;
+    if (this.markingCopy || !leg || leg.sourceLostAt !== undefined || nodeId === this.hooks.selfNodeId || registry.nodes.has(nodeId)) return;
     registry.restoreNode({ nodeId, nodeName: leg.committed?.sourceName ?? nodeId, appVersion: '', capabilities: { shardCapacity: 1, dataBackend: 'unknown' }, capacityUnknown: true });
   }
 
@@ -1403,7 +1467,8 @@ export class MigrationCoordinator {
       const name = node?.nodeName ?? nodeId;
       const stuck = this.stuckCleanupText(nodeId, shardId);
       if (stuck) return `${name} cannot finish it: ${stuck}`;
-      return node?.connected ? `${name} has not finished it yet` : `${name} is down (bring it back so it runs, or Declare it Lost)`;
+      if (!node?.connected) return `${name} is down (bring it back so it runs, or Declare it Lost)`;
+      return this.cleanupRuns.has(nodeId) || this.cleanupTimers.has(nodeId) ? `${name} has not finished it yet` : `${name} has not been asked to run it yet`;
     });
     return `held back until the cleanup of an earlier move has run: ${each.join('; ')}`;
   }
@@ -1590,7 +1655,9 @@ export class MigrationCoordinator {
     } catch (error) {
       if (this.record !== rec || this.abortInProgress) return;
       for (const leg of rec.legs) delete leg.committed;
-      await this.enterAborting(`the commit decision could not be written: ${error instanceof Error ? error.message : error}`, true);
+      await this.enterAborting(unconfirmed(error)
+        ? `the commit decision could not be confirmed (${error instanceof Error ? error.message : error}; it can still land); the abort follows it`
+        : `the commit decision could not be written: ${error instanceof Error ? error.message : error}`, true);
     }
   }
 
@@ -2628,17 +2695,32 @@ export class MigrationCoordinator {
     this.hooks.pushStatus();
   }
 
-  private async persist(): Promise<void> {
-    // During a retire leg the parent record (all legs + currentLegIndex + per-leg
-    // legState) is the crash-recovery unit, not the running one-leg slice.
-    if (this.recordsUnreadable) return;
+  // One write at a time, each from the records as they stand when its turn
+  // starts. A change is staged on a copy (null: nothing to write), written,
+  // and only then applied to the records held, before the next write starts.
+  private writes: Promise<void> = Promise.resolve();
+
+  private persist(change?: { stage: () => PersistedMigrations | null; apply: () => void }): Promise<void> {
+    const turn = this.writes.then(async () => {
+      if (!this.recordsUnreadable) {
+        const state = change ? change.stage() : this.snapshot();
+        if (state) await this.hooks.store.saveMigrations(state);
+      }
+      change?.apply();
+    });
+    this.writes = turn.catch(() => undefined);
+    return turn;
+  }
+
+  // During a retire leg the parent record (all legs + currentLegIndex + per-leg
+  // legState) is the crash-recovery unit, not the running one-leg slice.
+  private snapshot(): PersistedMigrations {
     const active = this.parentRecord ?? this.record;
-    const state: PersistedMigrations = {
+    return {
       active: active && !isTerminal(active.state) ? active : null,
       history: this.history,
       updatedAt: Date.now(),
     };
-    await this.hooks.store.saveMigrations(state);
   }
 }
 

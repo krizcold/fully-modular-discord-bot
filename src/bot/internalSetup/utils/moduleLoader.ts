@@ -232,6 +232,11 @@ export class ModuleLoader {
       );
     }
 
+    const dataContract: unknown = manifest.dataContract;
+    if (dataContract !== undefined && dataContract !== 1 && dataContract !== 2) {
+      warnings.push(`dataContract ${JSON.stringify(dataContract)} is not 1 or 2; the module is treated as dataContract 1`);
+    }
+
     return {
       valid: errors.length === 0,
       errors,

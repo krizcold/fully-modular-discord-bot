@@ -14,6 +14,7 @@ import {
   ModalBuilder,
   TextInputBuilder,
   TextInputStyle,
+  version as discordJsVersion,
 } from 'discord.js';
 import { PanelOptions, PanelContext, PanelResponse } from '../../types/panelTypes';
 import { createV2Response, V2Colors } from '../utils/panel/v2';
@@ -192,7 +193,7 @@ const systemInfoPanel: PanelOptions = {
         `**⏱️ Uptime:** ${uptimeHours}h ${uptimeMinutes}m ${uptimeSeconds}s\n` +
         `**💾 Memory:** ${memoryMB} MB\n` +
         `**🟢 Node.js:** ${process.version}\n` +
-        `**📦 Discord.js:** v14.21\n` +
+        `**📦 Discord.js:** v${discordJsVersion}\n` +
         `**⚡ Platform:** ${process.platform}\n` +
         `**🔄 PID:** ${process.pid}`
       )

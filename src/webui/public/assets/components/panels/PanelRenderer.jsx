@@ -336,7 +336,28 @@ function ModalRenderer({ modal, onSubmit, onCancel, executing, guildId }) {
   const [validationError, setValidationError] = useState(null);
   const [availableRoles, setAvailableRoles] = useState([]);
   const [loadingRoles, setLoadingRoles] = useState(false);
+  const [availableChannels, setAvailableChannels] = useState([]);
   const fileInputRefs = useRef({});
+
+  const hasChannelSelect = modal.components?.some(row =>
+    row.components?.some(c => c.type === 'channel_select')
+  );
+
+  useEffect(() => {
+    if (hasChannelSelect && guildId) {
+      const fetchChannels = typeof api !== 'undefined'
+        ? api.get(`/panels/channels?guildId=${guildId}`)
+        : guildApi.getChannels(guildId);
+
+      fetchChannels
+        .then(res => {
+          if (res.success) {
+            setAvailableChannels(res.channels || []);
+          }
+        })
+        .catch(err => console.error('Failed to fetch channels:', err));
+    }
+  }, [modal.customId, guildId, hasChannelSelect]);
 
   // Check if modal has role_select components
   const hasRoleSelect = modal.components?.some(row =>
@@ -371,6 +392,10 @@ function ModalRenderer({ modal, onSubmit, onCancel, executing, guildId }) {
         row.components?.forEach(component => {
           if (component.type === 'text_input') {
             initialValues[component.customId] = component.value || '';
+          }
+          if (component.type === 'role_select') {
+            const defaults = component.defaultValues || [];
+            initialValues[component.customId] = component.maxValues > 1 ? defaults : (defaults[0] || '');
           }
         });
       });
@@ -729,7 +754,38 @@ function ModalRenderer({ modal, onSubmit, onCancel, executing, guildId }) {
                     <div style={{ color: '#ed4245', padding: '10px' }}>
                       No roles available. Make sure a guild context is selected.
                     </div>
-                  ) : (
+                  ) : component.maxValues > 1 ? (() => {
+                    const picked = formValues[component.customId] || [];
+                    const listed = [
+                      ...(component.defaultValues || [])
+                        .filter(id => !availableRoles.some(role => role.id === id))
+                        .map(id => ({ id, label: `Role ${id}`, color: '#fff' })),
+                      ...availableRoles.map(role => ({ id: role.id, label: `@${role.name}`, color: role.color ? `#${role.color.toString(16).padStart(6, '0')}` : '#fff' })),
+                    ];
+                    const toggle = (id) => handleInputChange(
+                      component.customId,
+                      picked.includes(id) ? picked.filter(p => p !== id) : [...picked, id]
+                    );
+                    return (
+                      <div style={{
+                        backgroundColor: '#40444b', border: '1px solid #202225', borderRadius: '4px',
+                        padding: '8px 10px', display: 'flex', flexWrap: 'wrap', gap: '6px 14px',
+                        maxHeight: '220px', overflowY: 'auto',
+                      }}>
+                        {listed.map(item => (
+                          <label key={item.id} style={{
+                            display: 'flex', alignItems: 'center', gap: '6px',
+                            color: item.color, fontSize: '0.9em', cursor: executing ? 'not-allowed' : 'pointer',
+                          }}>
+                            <input type="checkbox" checked={picked.includes(item.id)}
+                              disabled={executing || (!picked.includes(item.id) && picked.length >= component.maxValues)}
+                              onChange={() => toggle(item.id)} />
+                            <span>{item.label}</span>
+                          </label>
+                        ))}
+                      </div>
+                    );
+                  })() : (
                     <select
                       value={formValues[component.customId] || ''}
                       onChange={(e) => handleInputChange(component.customId, e.target.value)}
@@ -747,6 +803,11 @@ function ModalRenderer({ modal, onSubmit, onCancel, executing, guildId }) {
                       }}
                     >
                       <option value="">{component.placeholder || '-- Select a Role --'}</option>
+                      {(component.defaultValues || [])
+                        .filter(id => !availableRoles.some(role => role.id === id))
+                        .map(id => (
+                          <option key={id} value={id}>Role {id}</option>
+                        ))}
                       {availableRoles.map((role) => (
                         <option key={role.id} value={role.id} style={{
                           color: role.color ? `#${role.color.toString(16).padStart(6, '0')}` : '#fff'
@@ -756,6 +817,36 @@ function ModalRenderer({ modal, onSubmit, onCancel, executing, guildId }) {
                       ))}
                     </select>
                   )}
+                </div>
+              );
+            }
+            // Channel Select: shown read-only; it is not submitted, so a submit records no change to it
+            if (component.type === 'channel_select') {
+              const stored = component.defaultValues || [];
+              return (
+                <div key={compIdx} style={{ marginBottom: '15px' }}>
+                  <label style={{
+                    display: 'block',
+                    marginBottom: '5px',
+                    color: '#dcddde',
+                    fontWeight: '500'
+                  }}>
+                    {component.label || 'Select Channel'}
+                  </label>
+                  {component.description && (
+                    <p style={{ color: '#72767d', fontSize: '0.85em', marginBottom: '8px' }}>
+                      {component.description}
+                    </p>
+                  )}
+                  <div style={{ color: '#dcddde', padding: '10px', backgroundColor: '#2f3136', borderRadius: '4px' }}>
+                    {stored.length === 0 ? 'None' : stored.map(id => {
+                      const channel = availableChannels.find(c => c.id === id);
+                      return channel ? `#${channel.name}` : `Channel ${id}`;
+                    }).join(', ')}
+                  </div>
+                  <p style={{ color: '#72767d', fontSize: '0.85em', marginTop: '6px' }}>
+                    Channels are changed from Discord or with Upload.
+                  </p>
                 </div>
               );
             }

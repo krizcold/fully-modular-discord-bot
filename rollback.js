@@ -21,11 +21,12 @@ const fs = require('fs');
 const path = require('path');
 
 const CUSTOM_PATH = '/app/custom';
-const APPSTORE_MODULES_PATH = '/data/appstore-modules';
+const DATA_ROOT = process.env.DATA_DIR || '/data';
+const APPSTORE_MODULES_PATH = path.join(DATA_ROOT, 'appstore-modules');
 const BUILD_PATH = '/app/build';
 const DIST_PATH = '/app/dist';
-const APPLIED_VERSION_PATH = '/data/applied-version.json';
-const BACKUPS_PATH = '/data/backups';
+const APPLIED_VERSION_PATH = path.join(DATA_ROOT, 'applied-version.json');
+const BACKUPS_PATH = path.join(DATA_ROOT, 'backups');
 
 /**
  * Copy directory recursively
@@ -105,6 +106,18 @@ function performRollback(snapshot) {
     throw new Error(`Backup not found: ${backupPath}`);
   }
 
+  for (const subdir of [backupCustom, backupAppstore]) {
+    let stat = null;
+    try {
+      stat = fs.lstatSync(subdir);
+    } catch {
+      continue;
+    }
+    if (!stat.isDirectory()) {
+      throw new Error(`Backup is corrupted (${path.basename(subdir)} is not a plain folder): ${backupPath}`);
+    }
+  }
+
   if (!fs.existsSync(backupCustom) && !fs.existsSync(backupAppstore)) {
     throw new Error(`Backup is corrupted (missing custom and appstore-modules): ${backupPath}`);
   }
@@ -179,9 +192,9 @@ function listBackups() {
     }
 
     backups.push({
+      ...metadata,
       name: entry.name,
-      path: backupPath,
-      ...metadata
+      path: backupPath
     });
   }
 
@@ -276,70 +289,111 @@ function cleanupOldBackups(keepCount = 5) {
   }
 }
 
-// Export functions
-module.exports = {
-  performRollback,
-  listBackups,
-  getLatestBackup,
-  createSnapshot,
-  cleanupOldBackups
-};
+function describeBackup(backup) {
+  return `${backup.name} - v${backup.version} (${new Date(backup.timestamp).toISOString()})`;
+}
 
-// CLI usage
-if (require.main === module) {
-  const args = process.argv.slice(2);
+function main(args) {
   const command = args[0];
 
   switch (command) {
-    case 'list':
+    case 'list': {
       const backups = listBackups();
       if (backups.length === 0) {
         console.log('No backups available');
       } else {
         console.log('Available backups:');
         for (const backup of backups) {
-          const date = new Date(backup.timestamp).toISOString();
-          console.log(`  ${backup.name} - v${backup.version} (${date})`);
+          console.log(`  ${describeBackup(backup)}`);
         }
       }
-      break;
+      return 0;
+    }
 
-    case 'create':
+    case 'create': {
       const description = args.slice(1).join(' ') || 'Manual snapshot';
       createSnapshot(description);
-      break;
+      return 0;
+    }
 
-    case 'rollback':
+    case 'rollback': {
       const backupName = args[1];
-      if (!backupName) {
-        const latest = getLatestBackup();
-        if (!latest) {
+      let chosen;
+      if (backupName === undefined) {
+        chosen = getLatestBackup();
+        if (!chosen) {
           console.error('No backups available for rollback');
-          process.exit(1);
+          return 1;
         }
-        performRollback(latest);
       } else {
-        const backupPath = path.join(BACKUPS_PATH, backupName);
-        if (!fs.existsSync(backupPath)) {
-          console.error(`Backup not found: ${backupName}`);
-          process.exit(1);
+        if (backupName.trim() === '') {
+          console.error(`Refused: '${backupName}' is not a backup name (see: node rollback.js list)`);
+          return 2;
         }
-        performRollback({ path: backupPath });
+        chosen = listBackups().find(backup => backup.name === backupName);
+        if (!chosen) {
+          console.error(`Backup not found: ${backupName} (see: node rollback.js list)`);
+          return 1;
+        }
       }
-      break;
+      console.log(`[Rollback] Chosen backup: ${describeBackup(chosen)}`);
+      try {
+        performRollback(chosen);
+      } catch (error) {
+        console.error(`[Rollback] Refused: ${error.message}`);
+        return 1;
+      }
+      return 0;
+    }
 
-    case 'cleanup':
-      const keepCount = parseInt(args[1]) || 5;
+    case 'cleanup': {
+      const confirmed = args.includes('--yes');
+      const keepText = args.slice(1).find(arg => arg !== '--yes');
+      let keepCount = 5;
+      if (keepText !== undefined) {
+        if (!/^\d+$/.test(keepText) || Number(keepText) < 1) {
+          console.error(`Refused: '${keepText}' is not a whole number of at least 1`);
+          return 2;
+        }
+        keepCount = Number(keepText);
+      }
+      const toDelete = listBackups().slice(keepCount);
+      if (toDelete.length === 0) {
+        console.log(`Nothing to remove: ${keepCount} or fewer backups exist`);
+        return 0;
+      }
+      console.log(`Keeping the newest ${keepCount}; these backups ${confirmed ? 'will be' : 'would be'} removed:`);
+      for (const backup of toDelete) {
+        console.log(`  ${describeBackup(backup)}`);
+      }
+      if (!confirmed) {
+        console.log('Nothing removed. Run again with --yes to remove them.');
+        return 0;
+      }
       cleanupOldBackups(keepCount);
-      break;
+      return 0;
+    }
 
     default:
       console.log('Usage: node rollback.js <command> [args]');
       console.log('Commands:');
-      console.log('  list              - List available backups');
-      console.log('  create [desc]     - Create a new snapshot');
-      console.log('  rollback [name]   - Rollback to backup (latest if no name)');
-      console.log('  cleanup [keep]    - Remove old backups (default: keep 5)');
-      break;
+      console.log('  list                   - List available backups');
+      console.log('  create [desc]          - Create a new snapshot');
+      console.log('  rollback [name]        - Rollback to backup (latest if no name)');
+      console.log('  cleanup [keep] [--yes] - List old backups beyond the newest keep (default 5); --yes removes them');
+      return 0;
   }
+}
+
+module.exports = {
+  performRollback,
+  listBackups,
+  getLatestBackup,
+  createSnapshot,
+  cleanupOldBackups,
+  main
+};
+
+if (require.main === module) {
+  process.exitCode = main(process.argv.slice(2));
 }

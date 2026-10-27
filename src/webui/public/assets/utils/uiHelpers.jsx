@@ -31,6 +31,11 @@ window.disabledButtonStyle = function disabledButtonStyle(isDisabled) {
   };
 };
 
+/** Placeholder of a secret input: a saved secret never comes back, so say a blank keeps it. */
+window.secretPlaceholder = function secretPlaceholder(isSet, example) {
+  return isSet ? 'Set (leave blank to keep)' : example;
+};
+
 /**
  * Wraps a panel section so that, while `loading` is true, the existing
  * content stays rendered but is dimmed and overlaid with a centered

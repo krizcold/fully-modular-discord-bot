@@ -157,6 +157,7 @@ export async function recompileTypeScript(): Promise<{ success: boolean; error?:
       timeout: 60000
     });
     copyBuildAssetsToDist();
+    if (process.platform !== 'win32') await execAsync('sync', { timeout: 60000 });
     return { success: true, duration: Date.now() - start };
   } catch (error: any) {
     const stderr = error.stderr?.toString() || error.message || 'Unknown compilation error';

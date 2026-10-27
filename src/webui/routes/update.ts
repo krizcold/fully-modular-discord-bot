@@ -4,8 +4,6 @@ import * as fs from 'fs';
 import { BotManager } from '../botManager';
 import { getSafetyManager } from '../../utils/updateSafety';
 import { dataPath } from '../../utils/dataRoot';
-import { exec } from 'child_process';
-import { promisify } from 'util';
 import { requireMasterNode } from '../middleware/fleetGate';
 import { nudgeSync } from '../utils/syncNudge';
 
@@ -20,7 +18,38 @@ import {
   describeBulkModuleUpdate
 } from '@/updater';
 
-const execAsync = promisify(exec);
+const COPY_OPTIONS = { recursive: true, force: true, preserveTimestamps: true, verbatimSymlinks: true } as const;
+
+type BackupLookup = { status: 400 | 404; error: string } | { dir: string };
+
+// Only a listed backup: a whole-number id naming a folder directly under the
+// backups folder that holds its metadata.json.
+function lookUpBackup(timestamp: string): BackupLookup {
+  if (!/^\d+$/.test(timestamp)) return { status: 400, error: 'Invalid backup id' };
+  const backupsDir = dataPath('backups');
+  const dir = path.join(backupsDir, `backup-${timestamp}`);
+  if (path.dirname(dir) !== backupsDir || !fs.existsSync(path.join(dir, 'metadata.json'))) {
+    return { status: 404, error: 'Backup not found' };
+  }
+  return { dir };
+}
+
+async function emptyDir(dir: string): Promise<void> {
+  await fs.promises.mkdir(dir, { recursive: true });
+  for (const name of await fs.promises.readdir(dir)) {
+    await fs.promises.rm(path.join(dir, name), { recursive: true, force: true });
+  }
+}
+
+async function dirSize(dir: string): Promise<number> {
+  let total = 0;
+  for (const entry of await fs.promises.readdir(dir, { withFileTypes: true })) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) total += await dirSize(full);
+    else total += (await fs.promises.lstat(full)).size;
+  }
+  return total;
+}
 
 export function createUpdateRouter(botManager: BotManager): Router {
   const router = Router();
@@ -358,10 +387,10 @@ export function createUpdateRouter(botManager: BotManager): Router {
       fs.mkdirSync(backupPath, { recursive: true });
 
       if (fs.existsSync('/app/custom')) {
-        await execAsync(`cp -a /app/custom ${path.join(backupPath, 'custom')}`);
+        await fs.promises.cp('/app/custom', path.join(backupPath, 'custom'), COPY_OPTIONS);
       }
       if (fs.existsSync(dataPath('appstore-modules'))) {
-        await execAsync(`cp -a ${dataPath('appstore-modules')} ${path.join(backupPath, 'appstore-modules')}`);
+        await fs.promises.cp(dataPath('appstore-modules'), path.join(backupPath, 'appstore-modules'), COPY_OPTIONS);
       }
 
       let version = 'unknown';
@@ -381,13 +410,8 @@ export function createUpdateRouter(botManager: BotManager): Router {
         size: 0  // Will be calculated
       };
 
-      // Calculate size
       try {
-        const { stdout } = await execAsync(`du -sb ${backupPath}`);
-        const sizeMatch = stdout.match(/^(\d+)/);
-        if (sizeMatch) {
-          metadata.size = parseInt(sizeMatch[1], 10);
-        }
+        metadata.size = await dirSize(backupPath);
       } catch (e) {
         // Ignore
       }
@@ -417,21 +441,30 @@ export function createUpdateRouter(botManager: BotManager): Router {
    */
   router.post('/rollback/:timestamp', requireMasterNode, async (req: Request, res: Response) => {
     try {
-      const { timestamp } = req.params;
-      const backupName = `backup-${timestamp}`;
-      const backupPath = path.join(dataPath('backups'), backupName);
-
-      if (!fs.existsSync(backupPath)) {
-        res.status(404).json({
-          success: false,
-          error: 'Backup not found'
-        });
+      const found = lookUpBackup(req.params.timestamp);
+      if (!('dir' in found)) {
+        res.status(found.status).json({ success: false, error: found.error });
         return;
       }
+      const backupPath = found.dir;
 
       const backupCustom = path.join(backupPath, 'custom');
       const backupAppstore = path.join(backupPath, 'appstore-modules');
-      if (!fs.existsSync(backupCustom) && !fs.existsSync(backupAppstore)) {
+      const kinds = [backupCustom, backupAppstore].map(subdir => {
+        try {
+          return fs.lstatSync(subdir).isDirectory() ? 'dir' : 'other';
+        } catch {
+          return 'missing';
+        }
+      });
+      if (kinds.includes('other')) {
+        res.status(400).json({
+          success: false,
+          error: 'Backup is corrupted (custom or appstore-modules is not a plain folder)'
+        });
+        return;
+      }
+      if (!kinds.includes('dir')) {
         res.status(400).json({
           success: false,
           error: 'Backup is corrupted (missing custom and appstore-modules)'
@@ -445,19 +478,20 @@ export function createUpdateRouter(botManager: BotManager): Router {
       await botManager.shutdown(false);
       if (wasRunning) await new Promise(resolve => setTimeout(resolve, 2000));
 
-      if (fs.existsSync(backupCustom)) {
-        await execAsync('rm -rf /app/custom/*');
-        await execAsync(`cp -a ${backupCustom}/. /app/custom/`);
+      if (kinds[0] === 'dir') {
+        await emptyDir('/app/custom');
+        await fs.promises.cp(backupCustom, '/app/custom', COPY_OPTIONS);
       }
-      if (fs.existsSync(backupAppstore)) {
-        await execAsync(`rm -rf ${dataPath('appstore-modules')}/*`);
-        await execAsync(`cp -a ${backupAppstore}/. ${dataPath('appstore-modules')}/`);
+      if (kinds[1] === 'dir') {
+        await emptyDir(dataPath('appstore-modules'));
+        await fs.promises.cp(backupAppstore, dataPath('appstore-modules'), COPY_OPTIONS);
       }
 
       // Wipe ephemeral build outputs + the applied-version marker so the next
       // boot's buildId compare rebuilds /app/build and /app/dist from the
       // restored sources. Mirrors performRollback in rollback.js.
-      await execAsync('rm -rf /app/build /app/dist');
+      await fs.promises.rm('/app/build', { recursive: true, force: true });
+      await fs.promises.rm('/app/dist', { recursive: true, force: true });
       try {
         if (fs.existsSync(dataPath('applied-version.json'))) {
           fs.unlinkSync(dataPath('applied-version.json'));
@@ -485,21 +519,13 @@ export function createUpdateRouter(botManager: BotManager): Router {
    */
   router.delete('/backup/:timestamp', requireMasterNode, async (req: Request, res: Response) => {
     try {
-      const { timestamp } = req.params;
-      const backupName = `backup-${timestamp}`;
-      const backupPath = path.join(dataPath('backups'), backupName);
-
-      // Check if backup exists
-      if (!fs.existsSync(backupPath)) {
-        res.status(404).json({
-          success: false,
-          error: 'Backup not found'
-        });
+      const found = lookUpBackup(req.params.timestamp);
+      if (!('dir' in found)) {
+        res.status(found.status).json({ success: false, error: found.error });
         return;
       }
 
-      // Remove backup directory
-      await execAsync(`rm -rf ${backupPath}`);
+      await fs.promises.rm(found.dir, { recursive: true, force: true });
 
       res.json({
         success: true,

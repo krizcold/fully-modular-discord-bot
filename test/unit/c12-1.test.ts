@@ -276,6 +276,7 @@ function renderUpdateStatus(checkResult: any): any {
   let i = 0;
   const React = {
     useState: () => [states[i++], () => {}],
+    useEffect: () => {},
     createElement: (type: any, props: any, ...children: any[]) => ({ type, props: props || {}, children: children.flat(Infinity) }),
   };
   const fn = new Function('React', 'disabledButtonStyle', src + '\nreturn UpdateStatus;')(React, () => ({}));

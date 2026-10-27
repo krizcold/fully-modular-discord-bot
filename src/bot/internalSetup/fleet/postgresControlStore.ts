@@ -16,6 +16,7 @@ import { FLEET_DIR } from './constants';
 import type { StagedDocName, StagingHooks } from './standInStaging';
 import { watchPoolForSyncWaitCancel } from '../utils/syncWaitCancel';
 import type { SyncPosturePayload } from './protocol';
+import { CONTROL_WRITE_DEADLINE_MS, ControlWriteUnconfirmedError } from './controlWrites';
 import type {
   ControlStore,
   PersistedFleetConfig,
@@ -438,6 +439,34 @@ export class PostgresControlStore implements ControlStore {
     if (this.fenced) throw new Error('[Fleet] Control store is fenced (another master holds the term); write refused');
     if (this.mintedTerm === null) throw new Error('[Fleet] Control store write before term acquisition');
     const client = await this.pool.connect();
+    let released = false;
+    const release = (destroy: boolean): void => {
+      if (released) return;
+      released = true;
+      client.release(destroy ? true : undefined);
+    };
+    // A write never answered (an armed synchronous COMMIT waiting on a dead
+    // standby has no bound of its own) gives up at the deadline: the client
+    // is discarded so the backend's transaction ends, and the outcome is
+    // unknown, since a COMMIT already sent can still land.
+    let timer: NodeJS.Timeout | undefined;
+    const deadline = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        release(true);
+        reject(new ControlWriteUnconfirmedError('the control-store write'));
+      }, CONTROL_WRITE_DEADLINE_MS);
+      timer.unref?.();
+    });
+    const work = this.fencedTxn(client, fn, release);
+    work.catch(() => undefined);
+    try {
+      await Promise.race([work, deadline]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private async fencedTxn(client: PoolClient, fn: (client: PoolClient) => Promise<void>, release: (destroy: boolean) => void): Promise<void> {
     let inTxn = false;
     let broken = false;
     try {
@@ -463,7 +492,7 @@ export class PostgresControlStore implements ControlStore {
       }
       throw error;
     } finally {
-      client.release(broken ? true : undefined);
+      release(broken);
     }
   }
 

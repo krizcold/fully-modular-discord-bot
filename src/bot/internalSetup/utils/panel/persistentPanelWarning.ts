@@ -18,7 +18,9 @@ import { getPanelManager } from '../panelManager';
 import { storePersistentPanel } from './persistentPanelStorage';
 import { PanelNotRecordedError } from './persistentPanelResponse';
 import { storeNavigationContext } from './panelButtonHandler';
+import { answerWrites } from '../dataBackends/replyGate';
 import { injectReturnButtonIfNeeded } from './panelResponseUtils';
+import { retireReplacedPanel } from './persistentPanelResponse';
 import {
   createTitledContainer,
   createText,
@@ -111,6 +113,9 @@ export async function handlePersistentWarningButton(
       return;
     }
 
+    // Not posted until the callback's writes are confirmed; otherwise the member has the truth.
+    if (!(await answerWrites(interaction))) return;
+
     const message = await channel.send({
       ...response,
       flags: MessageFlags.IsComponentsV2 as number
@@ -137,6 +142,10 @@ export async function handlePersistentWarningButton(
         let removed = true;
         try { await message.delete(); } catch { removed = false; }
         throw new PanelNotRecordedError(removed);
+      }
+
+      if (stored.replacedInstance && stored.replacedInstance.messageId !== message.id) {
+        await retireReplacedPanel(interaction.client, panel, stored.replacedInstance);
       }
 
       storeNavigationContext(message.id, [], accessMethod);

@@ -5,31 +5,8 @@ import { registerModalHandler } from '../../events/interactionCreate/modalSubmit
 import { PanelContext, PanelResponse } from '../../../types/panelTypes';
 import { DISCORD_EPHEMERAL_FLAG } from '../../../constants';
 import { getNavigationContext, storeNavigationContext, detectAccessMethodFromMessage } from './panelButtonHandler';
-
-/**
- * Parse panel modal customId: panel_{panelId}_modal_{modalId}
- */
-export function parseModalCustomId(customId: string): { panelId: string; modalId: string } | null {
-  const parts = customId.split('_');
-  if (parts.length < 4 || parts[0] !== 'panel') {
-    console.log(`[PanelModalHandler] Invalid panel modal format: ${customId}`);
-    return null;
-  }
-
-  // Find the 'modal' part in the array
-  const modalIndex = parts.indexOf('modal');
-  if (modalIndex === -1 || modalIndex === parts.length - 1) {
-    console.log(`[PanelModalHandler] No 'modal' found or no modal ID after 'modal': ${customId}`);
-    return null;
-  }
-
-  // Everything between 'panel' and 'modal' is the panel ID
-  const panelId = parts.slice(1, modalIndex).join('_');
-  // Everything after 'modal' is the modal ID
-  const modalId = parts.slice(modalIndex + 1).join('_');
-
-  return { panelId, modalId };
-}
+import { parseModalCustomId } from './panelCustomIds';
+import { withAutoDefer } from './panelAutoDefer';
 
 /**
  * Register the panel modal handler with the Discord bot
@@ -104,7 +81,11 @@ async function handleModalFromModalHandler(
   };
 
   try {
-    const response = await handleModalInteraction(context, modalId);
+    const { response, expired } = await withAutoDefer(interaction, handleModalInteraction(context, modalId));
+    if (expired) {
+      console.warn(`[PanelModalHandler] ${interaction.customId} acknowledged too late; the action ran`);
+      return;
+    }
 
     if (response) {
       // If modal came from a button (has message), update the original message

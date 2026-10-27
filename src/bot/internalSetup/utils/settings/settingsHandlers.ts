@@ -113,19 +113,38 @@ function getModalSelectValues(context: PanelContext, fieldId: string): string[] 
 /**
  * Get modal entity select values from context (channel/role select menus)
  */
-function getModalEntityValues(context: PanelContext, fieldId: string): string[] {
+function getModalEntityValues(context: PanelContext, fieldId: string): string[] | null {
   const interaction = context.interaction as ModalSubmitInteraction | null;
-  if (!interaction || !('fields' in interaction)) return [];
+  if (!interaction || !('fields' in interaction)) return null;
   try {
     const field = interaction.fields.getField(fieldId);
-    if (field && 'values' in field) {
-      const values = (field as any).values;
-      return Array.isArray(values) ? values : (values ? [values] : []);
-    }
-    return [];
+    if (!field) return null;
+    const values = (field as any).values;
+    return Array.isArray(values) ? values : (values ? [values] : []);
   } catch {
-    return [];
+    return null;
   }
+}
+
+/** Discord's limit on the entries one select menu can hold or show as defaults. */
+const DISCORD_SELECT_MAX = 25;
+
+const isEntityList = (type: string) => type === 'multiRole' || type === 'multiChannel';
+
+function sameEntityValue(a: SettingValue | undefined, b: SettingValue | undefined): boolean {
+  const ids = (v: SettingValue | undefined) => (Array.isArray(v) ? v : (v === null || v === undefined || v === '' ? [] : [v])).map(String);
+  const left = ids(a);
+  const right = ids(b);
+  return left.length === right.length && left.every(id => right.includes(id));
+}
+
+/** The stored guild ids of an entity list that the read-time clamp hid from the editor. */
+function clampHiddenIds(settings: ReturnType<typeof loadModuleSettings>, key: string): string[] {
+  const clamped = settings?.clamped?.[key];
+  if (!clamped || settings?.sources[key] !== 'guild') return [];
+  if (!Array.isArray(clamped.stored) || !Array.isArray(clamped.effective)) return [];
+  const shown = clamped.effective.map(String);
+  return clamped.stored.map(String).filter(id => !shown.includes(id));
 }
 
 export interface HandlerContext {
@@ -214,11 +233,14 @@ export async function handleSettingsButton(
           break;
         case 'channel':
         case 'multiChannel':
-          modal = buildChannelEditModal(panelId, settingKey, moduleName, category, definition);
-          break;
         case 'role':
         case 'multiRole':
-          modal = buildRoleEditModal(panelId, settingKey, moduleName, category, definition);
+          if (Array.isArray(currentValue) && currentValue.length > DISCORD_SELECT_MAX) {
+            return createV2Response(buildErrorPanel(`**${definition.label}** holds more entries than Discord can edit (at most ${DISCORD_SELECT_MAX}). Change it with Upload.`));
+          }
+          modal = definition.type === 'channel' || definition.type === 'multiChannel'
+            ? buildChannelEditModal(panelId, settingKey, moduleName, category, definition, currentValue)
+            : buildRoleEditModal(panelId, settingKey, moduleName, category, definition, currentValue);
           break;
         case 'color':
           modal = buildColorEditModal(panelId, settingKey, moduleName, category, definition, currentValue);
@@ -279,8 +301,15 @@ export async function handleSettingsButton(
       // system-panel hard limits + tier-supplied hard limits). Without this
       // a guild user could save a value above the cap they see in the UI.
       const mergedLimits = getMergedHardLimits(moduleName, context.guildId);
+      const stored = loadModuleSettings(moduleName, context.guildId);
+      const updates: Record<string, SettingValue> = { ...state.pendingChanges };
       const errorMessages: string[] = [];
       for (const [key, value] of Object.entries(state.pendingChanges)) {
+        const listed = schema.settings[key];
+        if (listed && isEntityList(listed.type) && Array.isArray(value) && value.length > 0) {
+          const kept = clampHiddenIds(stored, key).filter(id => !value.includes(id));
+          if (kept.length > 0) updates[key] = [...value, ...kept];
+        }
         const definition = schema.settings[key];
         if (definition) {
           const result = validateValueWithEffectiveLimits(value, definition, mergedLimits[key]);
@@ -296,7 +325,7 @@ export async function handleSettingsButton(
         return render(state);
       }
 
-      if (Object.keys(state.pendingChanges).length > 0 && !saveModuleSettings(moduleName, state.pendingChanges, context.guildId)) {
+      if (Object.keys(updates).length > 0 && !saveModuleSettings(moduleName, updates, context.guildId)) {
         await sendEphemeralError(context, 'Save not applied: the settings could not be written now (a shard migration, data not ready, or the database unavailable); your changes are kept, try again shortly.');
         return render(state);
       }
@@ -604,6 +633,13 @@ export async function handleSettingsModal(
 
         // Validate each imported value against effective limits so a JSON
         // upload cannot bypass the caps the user sees in the panel UI.
+        for (const [key, value] of Object.entries(parsedSettings)) {
+          const definition = schema.settings[key];
+          if (definition && isEntityList(definition.type) && Array.isArray(value) && value.length > DISCORD_SELECT_MAX) {
+            return createV2Response(buildErrorPanel(`Upload refused: **${definition.label}** lists ${value.length} entries; Discord allows at most ${DISCORD_SELECT_MAX}. Nothing was changed.`));
+          }
+        }
+
         const mergedLimits = getMergedHardLimits(moduleName, context.guildId);
         const accepted: Record<string, any> = {};
         for (const [key, value] of Object.entries(parsedSettings)) {
@@ -639,8 +675,14 @@ export async function handleSettingsModal(
     case 'multirole': {
       const settingKey = parts[1];
       const values = getModalEntityValues(context, 'value');
+      if (values === null) return render(state);
       const isSingle = action === 'channel' || action === 'role';
-      state.pendingChanges[settingKey] = isSingle ? (values[0] || null) : values;
+      const submitted = isSingle ? (values[0] || null) : values;
+      if (sameEntityValue(submitted, loadModuleSettings(moduleName, context.guildId)?.values[settingKey])) {
+        delete state.pendingChanges[settingKey];
+      } else {
+        state.pendingChanges[settingKey] = submitted;
+      }
       setState(state);
       return render(state);
     }

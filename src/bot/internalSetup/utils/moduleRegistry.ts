@@ -4,6 +4,7 @@ import { getModuleEventManager } from './moduleEventManager';
 import { getModuleDataPath, toImportPath } from './pathHelpers';
 import { getPanelManager } from './panelManager';
 import { clearSchemaCache } from './settings/settingsDiscovery';
+import { setManifestReader } from './dataBackends/dataContract';
 
 /**
  * ModuleRegistry - Central registry for all loaded modules
@@ -349,6 +350,9 @@ export class ModuleRegistry {
 
 // Singleton instance
 let registryInstance: ModuleRegistry | null = null;
+
+// The reply gate reads module manifests (dataContract) through this, from whichever registry is current.
+setManifestReader(name => registryInstance?.getModule(name)?.manifest);
 
 /**
  * Get the global module registry instance

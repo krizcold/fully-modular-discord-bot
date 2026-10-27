@@ -6,6 +6,13 @@ import { instrument } from '../../utils/metrics/instrument';
 import { DataBackendUnavailableError } from '../../utils/dataManager';
 import { dataUnavailableMessage } from '../../utils/dataBackends/boot';
 import { isCommandRunnable } from '../../utils/commandGate';
+import { noteConsoleOutcome } from '../../utils/consoleInteraction';
+
+/** A gate's ephemeral refusal, unawaited as before; on the console it is also the invoke's outcome. */
+function refuse(interaction: CommandInteraction, payload: { content: string; components?: any[] }): void {
+  interaction.reply({ ...payload, flags: MessageFlags.Ephemeral });
+  noteConsoleOutcome(interaction, { refusal: payload.content });
+}
 
 /**
  * Build the components array attached to a tier-blocked reply. When the host
@@ -48,15 +55,17 @@ export default async function handleCommands(client: Client, interaction: Intera
       (cmd) => cmd.name === interaction.commandName
     );
 
-    if (!commandObject) return;
+    if (!commandObject) {
+      noteConsoleOutcome(interaction, { refusal: `no such command: ${interaction.commandName}` });
+      return;
+    }
 
     const gate = isCommandRunnable(commandObject.name);
     if (!gate.runnable) {
-      interaction.reply({
+      refuse(interaction, {
         content: gate.reason === 'disabled'
           ? 'This command is switched off.'
           : 'This command cannot run right now: its on/off setting cannot be read.',
-        flags: MessageFlags.Ephemeral,
       });
       return;
     }
@@ -71,10 +80,7 @@ export default async function handleCommands(client: Client, interaction: Intera
       const isDevUser = devs.some(dev => String(dev) === userId);
 
       if (!isDevUser) {
-        interaction.reply({
-          content: 'Only developers are allowed to run this command.',
-          flags: MessageFlags.Ephemeral,
-        });
+        refuse(interaction, { content: 'Only developers are allowed to run this command.' });
         return;
       }
     }
@@ -82,10 +88,7 @@ export default async function handleCommands(client: Client, interaction: Intera
     // Check test-only condition
     if (commandObject.testOnly) {
       if (interaction.guildId !== testServer) {
-        interaction.reply({
-          content: 'This command cannot be run here.',
-          flags: MessageFlags.Ephemeral,
-        });
+        refuse(interaction, { content: 'This command cannot be run here.' });
         return;
       }
     }
@@ -98,10 +101,7 @@ export default async function handleCommands(client: Client, interaction: Intera
         for (const permission of commandObject.botPermissions) {
           const permKey = permission as keyof typeof PermissionsBitField.Flags;
           if (!bot.permissions.has(PermissionsBitField.Flags[permKey])) {
-            interaction.reply({
-              content: "I don't have enough permissions.",
-              flags: MessageFlags.Ephemeral,
-            });
+            refuse(interaction, { content: "I don't have enough permissions." });
             return;
           }
         }
@@ -117,20 +117,12 @@ export default async function handleCommands(client: Client, interaction: Intera
         const upgradeComponents = buildBlockedReplyComponents(interaction.guildId);
 
         if (tierOverrides._moduleEnabled === false) {
-          interaction.reply({
-            content: pm.getMessages().moduleBlocked,
-            components: upgradeComponents,
-            flags: MessageFlags.Ephemeral,
-          });
+          refuse(interaction, { content: pm.getMessages().moduleBlocked, components: upgradeComponents });
           return;
         }
 
         if (Array.isArray(tierOverrides._disabledCommands) && tierOverrides._disabledCommands.includes(commandObject.name)) {
-          interaction.reply({
-            content: pm.getMessages().commandBlocked,
-            components: upgradeComponents,
-            flags: MessageFlags.Ephemeral,
-          });
+          refuse(interaction, { content: pm.getMessages().commandBlocked, components: upgradeComponents });
           return;
         }
 
@@ -140,10 +132,9 @@ export default async function handleCommands(client: Client, interaction: Intera
           const gatedByCommands = Array.isArray(tr.gatedCommands) && tr.gatedCommands.length > 0;
           const commandIsGated = !gatedByCommands || tr.gatedCommands.includes(commandObject.name);
           if (commandIsGated && !pm.hasFeatureAccess(interaction.guildId, tr.minPriority)) {
-            interaction.reply({
+            refuse(interaction, {
               content: gatedByCommands ? pm.getMessages().commandBlocked : pm.getMessages().moduleBlocked,
               components: upgradeComponents,
-              flags: MessageFlags.Ephemeral,
             });
             return;
           }
@@ -156,6 +147,7 @@ export default async function handleCommands(client: Client, interaction: Intera
     );
   } catch (error) {
     console.error(`There was an error running this command:`, error);
+    noteConsoleOutcome(interaction, { error: error instanceof Error ? error.message : String(error) });
     // A refused data write must reach the user with its cause, not a silent log.
     if (error instanceof DataBackendUnavailableError) {
       const content = dataUnavailableMessage(error.causeKey);

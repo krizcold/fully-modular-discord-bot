@@ -389,10 +389,14 @@ export class Registry {
   }
 
   /** A shard the master places on a node holding its copy; the next re-grant sends it. */
-  placeOnHolder(nodeId: string, shardId: number): void {
-    const node = this.nodes.get(nodeId);
+  holderLease(nodeId: string, shardId: number, epoch: number): ShardLease {
+    return { shardId, nodeId, leaseId: randomUUID(), term: this.term, epoch };
+  }
+
+  placeOnHolder(lease: ShardLease): void {
+    const node = this.nodes.get(lease.nodeId);
     if (!node) return;
-    this.shardTable.set(shardId, { shardId, nodeId, leaseId: randomUUID(), term: this.term, epoch: this.epoch });
+    this.shardTable.set(lease.shardId, lease);
     node.needsGrant = true;
   }
 

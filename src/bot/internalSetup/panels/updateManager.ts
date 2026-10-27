@@ -95,9 +95,9 @@ const updateManagerPanel: PanelOptions = {
         });
 
         // Update the panel message with results
-        await updatePanelDynamic(updateContext, 'update_manager', resultResponse);
+        const shown = await updatePanelDynamic(updateContext, 'update_manager', resultResponse, undefined, messageId);
 
-        if (combinedCheck) {
+        if (shown && combinedCheck) {
           await updatePersistentPanelState('update_manager', 'checked', guildId, undefined, {
             lastCheckResult: combinedCheck
           });
@@ -491,9 +491,9 @@ async function handleCheckUpdates(context: PanelContext): Promise<PanelResponse>
         summary: { totalUpdatesAvailable: 0, hasAnyUpdates: false }
       });
 
-      await updatePanelDynamic(context, 'update_manager', resultResponse);
+      const shown = await updatePanelDynamic(context, 'update_manager', resultResponse);
 
-      if (combinedCheck) {
+      if (shown && combinedCheck) {
         await updatePersistentPanelState('update_manager', 'checked', context.guildId || undefined, undefined, {
           lastCheckResult: combinedCheck
         });
@@ -590,9 +590,9 @@ async function handleUpdateAllModules(context: PanelContext): Promise<PanelRespo
       // Re-check for updates after updating
       const newCheck = await checkForAllBotUpdates();
       const resultResponse = buildPanelView(context, 'main', newCheck);
-      await updatePanelDynamic(context, 'update_manager', resultResponse);
+      const shown = await updatePanelDynamic(context, 'update_manager', resultResponse);
 
-      if (newCheck) {
+      if (shown && newCheck) {
         await updatePersistentPanelState('update_manager', 'modules_updated', context.guildId || undefined, undefined, {
           lastCheckResult: newCheck,
           lastModuleUpdate: { updated: result.updated, failed: result.failed, skipped: result.skipped, checkErrors: result.checkErrors }
@@ -692,9 +692,9 @@ async function handleUpdateSingleModule(context: PanelContext, moduleName: strin
       // Re-check for updates
       const newCheck = await checkForAllBotUpdates();
       const resultResponse = buildPanelView(context, 'main', newCheck);
-      await updatePanelDynamic(context, 'update_manager', resultResponse);
+      const shown = await updatePanelDynamic(context, 'update_manager', resultResponse);
 
-      if (newCheck) {
+      if (shown && newCheck) {
         await updatePersistentPanelState('update_manager', 'module_updated', context.guildId || undefined, undefined, {
           lastCheckResult: newCheck,
           lastSingleModuleUpdate: result

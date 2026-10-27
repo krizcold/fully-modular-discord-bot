@@ -293,10 +293,46 @@ export class SyncEngine {
   }
 
   private finishOk(manifest: SyncManifest, appliedRevision: number): void {
+    const pristine = this.pristineBuildReason();
+    if (pristine === null) this.markModulesMissingFromDist(manifest);
+    if (pristine !== null) {
+      this.lastError = `this node runs pristine sources: ${pristine}`;
+      this.status = 'degraded';
+      this.report(false, appliedRevision);
+      this.resolveReady();
+      return;
+    }
     this.lastError = this.degradedModules.size > 0 ? this.lastError : undefined;
     this.status = this.degradedModules.size > 0 ? 'degraded' : 'in-sync';
     this.report(this.degradedModules.size === 0, appliedRevision);
     this.resolveReady();
+  }
+
+  private pristineBuildReason(): string | null {
+    let raw: string;
+    try {
+      raw = fs.readFileSync(dataPath('build-safe-mode.json'), 'utf8');
+    } catch {
+      return null;
+    }
+    try {
+      const reason = JSON.parse(raw)?.reason;
+      return typeof reason === 'string' && reason ? reason : 'the merged build did not compile';
+    } catch {
+      return 'the merged build did not compile';
+    }
+  }
+
+  // Prod split: an enabled module whose module.json is absent from dist is not
+  // loadable whatever the source hashes say; mark it so the retry path heals it.
+  private markModulesMissingFromDist(manifest: SyncManifest): void {
+    if (path.resolve(getBuildModulesDir()) === path.resolve(getModulesDir())) return;
+    if (!Array.isArray(manifest.modules)) return;
+    for (const m of manifest.modules) {
+      if (m.enabled === false) continue;
+      if (!fs.existsSync(path.join(getSourceModulesDir(), m.name, 'module.json'))) continue;
+      if (!fs.existsSync(path.join(getModulesDir(), m.name, 'module.json'))) this.degradedModules.add(m.name);
+    }
   }
 
   private resolveReady(): void {

@@ -5,7 +5,7 @@
 import { BotManager } from './botManager';
 import { clearRoleOverride, consentsToActiveMode, getNodeId, getNodeName, invalidateRoleOverrideCache, isBackupMaster, isStandalone, readRoleOverride, resolveEnvRole, resolveNodeRole, writeRoleOverride } from '../bot/internalSetup/fleet/nodeIdentity';
 import { effectiveMasterUrls } from '../bot/internalSetup/fleet/fleetConfig';
-import { isContainerPinned, loadCredentials, removeCredentials } from '../utils/envLoader';
+import { credentialsReadError, isContainerPinned, loadCredentials, removeCredentials } from '../utils/envLoader';
 import { WITNESS_FRESH_WINDOW_MS } from '../bot/internalSetup/fleet/constants';
 import { clearFreshFleetConfirm, freshMasterClaim, readSuperseded } from '../bot/internalSetup/fleet/stepDown';
 import { readArmRecord } from '../bot/internalSetup/fleet/armRecord';
@@ -250,8 +250,10 @@ export async function runRoleReset(botManager: BotManager, restart: boolean): Pr
     // Seeds process.env from the file for keys compose left unset, which is
     // exactly what isContainerPinned tells apart from a genuine pin.
     loadCredentials();
+    const readError = credentialsReadError();
     clearRoleOverride();
     invalidateRoleOverrideCache();
+    if (readError) return { success: false, error: `the role override is cleared but the persisted store forms are not: could not read /data/.env: ${readError}` };
     // A container that pins no database URL has the persisted forms as its
     // only store configuration: they stay, and the next delivery replaces
     // them once the node follows a master again.

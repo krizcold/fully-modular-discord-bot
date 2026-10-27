@@ -12,6 +12,8 @@ import { writeRawAtomic, deleteRawAtomic, dropPendingForGuild } from '../../src/
 import { DATA_ROOT } from '../../src/utils/dataRoot';
 import { FileSessionStore } from '../../src/webui/auth/fileSessionStore';
 import { dataUnavailableMessage } from '../../src/bot/internalSetup/utils/dataBackends/boot';
+import { deleteRawAtomic as managerDeleteRaw } from '../../src/bot/internalSetup/utils/dataManager';
+import { openLedger, runInLedger } from '../../src/bot/internalSetup/utils/dataBackends/writeLedger';
 
 const realOpen = fs.promises.open.bind(fs.promises);
 let clock = 1_000_000;
@@ -103,6 +105,26 @@ describe('A08-3 the file queue refuses writes while the disk keeps failing', () 
     expect(deleteRawAtomic(raw)).toBe(true);
     await flushAll();
     expect(deleteRawAtomic(path.join(DATA_ROOT, 'global', 'a083other.json'))).toBe(true);
+  });
+
+  it('answers a raw delete of an absent path with nothing queued as nothing to delete during the refusal, and records no refusal', async () => {
+    vi.spyOn(performance, 'now').mockImplementation(() => clock);
+    const guild = 'a083absentguild';
+    failDisk();
+    expect(writeRawAtomic(path.join(DATA_ROOT, guild, 'x.json'), '{}')).toBe(true);
+    expect(writeRawAtomic(path.join(DATA_ROOT, guild, 'a083mod', 'y.json'), '{}')).toBe(true);
+    await settle();
+    clock += 31_000;
+    const queued = path.join(DATA_ROOT, guild, 'x.json');
+    expect(writeRawAtomic(path.join(DATA_ROOT, 'global', 'a083absentother.json'), '{}')).toBe(false);
+    const ledger = openLedger('panel');
+    runInLedger(ledger, 'modA', () => expect(managerDeleteRaw(path.join(DATA_ROOT, 'global', 'a083absent.json'))).toBe(false));
+    expect(ledger.refusals()).toEqual([]);
+    runInLedger(ledger, 'modA', () => expect(managerDeleteRaw(queued)).toBe(false));
+    expect(ledger.refusals().length).toBe(1);
+    vi.mocked(fs.promises.open).mockRestore();
+    dropPendingForGuild(guild);
+    await flushAll();
   });
 
   it('does not refuse by age when one path keeps failing but other flushes land', async () => {

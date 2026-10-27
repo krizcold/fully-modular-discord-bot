@@ -154,6 +154,12 @@ export interface ModuleManifest {
   /** Marks the module as expensive under load; shed first by the future load-limiter, badged in the Usage tab */
   heavyLoad?: boolean;
 
+  /**
+   * 2: the module handles its own save outcomes (confirmSaved), so the reply gate sends its replies without waiting
+   * on its writes, but never past a refused write. Absent or 1: the gate waits, as for every module.
+   */
+  dataContract?: 1 | 2;
+
   /** Exported functions/classes for cross-module communication */
   exports?: Record<string, string>;
 

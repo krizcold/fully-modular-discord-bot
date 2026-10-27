@@ -1344,7 +1344,10 @@ export class AppStoreManager {
         }
       }
 
-      if (!hasFiles) return true;
+      if (!hasFiles) {
+        this.deleteCredentials(moduleName);
+        return true;
+      }
 
       if (fs.existsSync(sourceDir)) {
         fs.rmSync(sourceDir, { recursive: true, force: true });

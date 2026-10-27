@@ -15,14 +15,16 @@ import {
 } from '../../bot/internalSetup/utils/appStoreManager';
 import { getPremiumManager, DEFAULT_MESSAGES, PremiumMessages } from '../../bot/internalSetup/utils/premiumManager';
 import {
+  globalModuleConfigFrom,
+  globalSettingsRel,
   loadGlobalModuleConfig,
   type GlobalModuleConfig,
 } from '../../bot/internalSetup/utils/settings/settingsStorage';
-import { getSettingsSchema } from '../../bot/internalSetup/utils/settings/settingsDiscovery';
+import { getModulesWithSettings, getSettingsSchema } from '../../bot/internalSetup/utils/settings/settingsDiscovery';
 import type { HardLimitOverride, SettingValue } from '../../bot/types/settingsTypes';
 import { getPaymentRegistry } from '../../bot/internalSetup/utils/payment/paymentRegistry';
 import type { OfferingVariant } from '../../bot/internalSetup/utils/payment/paymentTypes';
-import { loadCredentials, saveCredentials, BotCredentials } from '../../utils/envLoader';
+import { credentialsReadError, loadCredentials, saveCredentials, BotCredentials } from '../../utils/envLoader';
 import { dataPath } from '../../utils/dataRoot';
 import { getModulesDir, getModulesDevDir } from '../../bot/internalSetup/utils/pathHelpers';
 import { BotManager } from '../botManager';
@@ -30,6 +32,43 @@ import { ComponentToggleDebouncer } from '../utils/componentToggleDebouncer';
 import { getInstallQueue } from '../utils/installQueue';
 import { nudgeSync } from '../utils/syncNudge';
 import { readConfigFile, writeConfigFile } from '../../bot/internalSetup/utils/appStoreConfigFile';
+import { childQueuedError, readServedGlobal, withTargetLock } from '../utils/servedRead';
+import { coWorkerReadonlyResponse, isCoWorkerNode } from '../middleware/fleetGate';
+
+/**
+ * A module's Free baseline (its global settings.json) as the process that
+ * serves it holds it, queue first: the raw body, for a save to build on, and
+ * the config view of it.
+ */
+const baselinePath = (moduleName: string) => dataPath('global', ...globalSettingsRel(moduleName).split('/'));
+
+async function servedBaseline(botManager: BotManager, moduleName: string): Promise<
+  | { ok: true; raw: Record<string, any>; config: GlobalModuleConfig; childQueued: boolean; childFailing: boolean; notice?: string }
+  | { ok: false; status: number; error: string }
+> {
+  if (!/^[A-Za-z0-9_-]+$/.test(moduleName)) return { ok: false, status: 400, error: 'invalid moduleName' };
+  const read = await readServedGlobal(botManager, { rel: globalSettingsRel(moduleName), path: baselinePath(moduleName) });
+  if (!read.ok) return read;
+  let raw: Record<string, any> = {};
+  if (read.content !== null) {
+    try {
+      raw = JSON.parse(read.content);
+    } catch {
+      return { ok: false, status: 500, error: `the global settings of ${moduleName} are not valid JSON` };
+    }
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      return { ok: false, status: 500, error: `the global settings of ${moduleName} are not an object` };
+    }
+  }
+  return {
+    ok: true,
+    raw,
+    config: globalModuleConfigFrom(raw),
+    childQueued: read.childQueued === true,
+    childFailing: read.childFailing === true,
+    ...(read.notice ? { notice: read.notice } : {}),
+  };
+}
 
 /**
  * Refresh each enabled ProviderLink's variant cache from its provider at
@@ -169,6 +208,30 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
       const installedRaw = manager.getInstalledModules();
       const repos = manager.getRepositories();
 
+      // The Free tier view reads each baseline from the process that serves it.
+      // A refused read is named, never filled from this process's older view,
+      // since the Free editor saves whole modules over what it was shown.
+      const freeBaselines = new Map<string, GlobalModuleConfig>();
+      const baselineUnavailable: Record<string, string> = {};
+      let baselineNotice: string | undefined;
+      await Promise.all(getModulesWithSettings().map(async ({ name }) => {
+        const served = await servedBaseline(botManager, name);
+        if (served.ok) {
+          freeBaselines.set(name, served.config);
+          baselineNotice = baselineNotice ?? served.notice;
+        } else {
+          baselineUnavailable[name] = served.error;
+        }
+      }));
+      const tiers = premiumMgr.getAllTiersWithEffectiveFree(name => freeBaselines.get(name)
+        ?? (name in baselineUnavailable ? globalModuleConfigFrom({}) : loadGlobalModuleConfig(name)));
+      if (tiers.free && (baselineNotice || Object.keys(baselineUnavailable).length > 0)) {
+        tiers.free = {
+          ...tiers.free,
+          ...(baselineNotice ? { baselineNotice } : {}),
+          ...(Object.keys(baselineUnavailable).length > 0 ? { baselineUnavailable } : {}),
+        } as typeof tiers.free;
+      }
       const loadedNames = await botManager.listLoadedModules();
       const loadedSet = loadedNames ? new Set(loadedNames) : null;
       const installed = installedRaw.map(m => ({
@@ -184,7 +247,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
           ...repo,
           githubToken: repo.githubToken ? '***' : null
         })),
-        tiers: premiumMgr.getAllTiersWithEffectiveFree(),
+        tiers,
         subscriptions: premiumMgr.getAllSubscriptions(),
         messages: premiumMgr.getMessages(),
         messageDefaults: DEFAULT_MESSAGES,
@@ -916,19 +979,23 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
    * System Panel and the Web Premium Tiers > Free tier view both read
    * from this endpoint.
    */
-  router.get('/global-config/:moduleName', (req: Request, res: Response) => {
+  router.get('/global-config/:moduleName', async (req: Request, res: Response) => {
     try {
       const { moduleName } = req.params;
       if (!moduleName || typeof moduleName !== 'string') {
         return res.status(400).json({ success: false, error: 'moduleName required' });
       }
+      const served = await servedBaseline(botManager, moduleName);
+      if (!served.ok) {
+        return res.status(served.status).json({ success: false, error: served.error });
+      }
       const schema = getSettingsSchema(moduleName);
-      const config = loadGlobalModuleConfig(moduleName);
       res.json({
         success: true,
         moduleName,
-        config,
+        config: served.config,
         schema: schema || null,
+        ...(served.notice ? { notice: served.notice } : {}),
       });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
@@ -945,7 +1012,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
    * deltas are re-sanitized/pruned against the new baseline so they don't
    * carry "worse than Free" remnants.
    */
-  router.put('/global-config/:moduleName', (req: Request, res: Response) => {
+  router.put('/global-config/:moduleName', async (req: Request, res: Response) => {
     try {
       const { moduleName } = req.params;
       if (!moduleName || typeof moduleName !== 'string') {
@@ -984,13 +1051,36 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
         return res.status(400).json({ success: false, error: 'No valid fields provided' });
       }
 
-      const manager = getPremiumManager();
-      const ok = manager.setGlobalModuleConfig(moduleName, partial);
-      if (ok) nudgeSync('settings');
-      res.json({
-        success: ok,
-        moduleName,
-        config: loadGlobalModuleConfig(moduleName),
+      if (!/^[A-Za-z0-9_-]+$/.test(moduleName)) {
+        return res.status(400).json({ success: false, error: 'invalid moduleName' });
+      }
+      // One save of a module's baseline at a time, so each builds on the last.
+      await withTargetLock(baselinePath(moduleName), async () => {
+        // The save builds on the serving process's body; a write the child still
+        // holds queued would land over this one, so it waits for that to land.
+        const served = await servedBaseline(botManager, moduleName);
+        if (!served.ok) {
+          res.status(served.status).json({ success: false, error: served.error });
+          return;
+        }
+        if (served.childQueued) {
+          res.status(409).json({ success: false, error: childQueuedError(served) });
+          return;
+        }
+        // The read is awaited: a demotion to co-worker may have begun meanwhile.
+        if (isCoWorkerNode()) {
+          coWorkerReadonlyResponse(res);
+          return;
+        }
+
+        const manager = getPremiumManager();
+        const ok = manager.setGlobalModuleConfig(moduleName, partial, served.raw);
+        if (ok) nudgeSync('settings');
+        res.json({
+          success: ok,
+          moduleName,
+          config: loadGlobalModuleConfig(moduleName),
+        });
       });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
@@ -1758,6 +1848,10 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
       const RESERVED = new Set(['DISCORD_TOKEN', 'CLIENT_ID', 'GUILD_ID']);
       const allowed = new Set(fields.map(f => f.key));
       const existing = loadCredentials();
+      const readError = credentialsReadError();
+      if (readError) {
+        return res.status(500).json({ success: false, error: `Could not read /data/.env, so nothing was saved: ${readError}` });
+      }
       const next: BotCredentials = { ...existing };
 
       for (const f of fields) {

@@ -1,8 +1,11 @@
 // IPC Panel Handler - Handles IPC messages from Web-UI for panel operations
 
-import { getPanelManager } from './panelManager';
+import { extractModuleNameFromPanel, getPanelManager } from './panelManager';
 import { getConfigProperty } from './configManager';
-import { awaitGuildDataReady } from './dataBackends/boot';
+import { admitGuildAction, ENTRY_WAIT_MS, gateCauseText } from './dataBackends/boot';
+import { runSealed } from './dataBackends/writeLedger';
+import { truthText, verdictOf } from './dataBackends/replyGate';
+import { broadcastWebUIPanelUpdate } from './panel/panelWebUIAdapter';
 
 /**
  * Set up IPC message handlers for Web-UI panel integration
@@ -91,7 +94,9 @@ export function setupPanelIPCHandlers(): void {
     }
 
     try {
-      const response = await handleIPCMessage(type, data, panelManager);
+      const response = PANEL_ACTIONS.has(type)
+        ? await runPanelAction(type, data, panelManager)
+        : await handleIPCMessage(type, data, panelManager);
       process.send!({ requestId, data: response });
     } catch (error) {
       console.error(`[IPCPanelHandler] Error handling IPC message ${type}:`, error);
@@ -136,16 +141,47 @@ function validateMessage(message: any): boolean {
 }
 
 
+const PANEL_ACTIONS = new Set(['panel:execute', 'panel:button', 'panel:dropdown', 'panel:modal']);
+
+function panelModule(panelManager: any, panelId: unknown): string | null {
+  const panel = typeof panelId === 'string' ? panelManager.getPanel?.(panelId) : undefined;
+  return panel ? extractModuleNameFromPanel(panel) : null;
+}
+
+/**
+ * A panel action from the web UI or the CLI (BT-4). Its writes are recorded in its own ledger, sealed once it answers,
+ * and the verdict over them is taken first, on every exit: the answer claims success, and the live update goes out,
+ * only when every write landed and none was refused; otherwise the answer is the truth. A guild that cannot take
+ * writes holds the action first (R1-J2), before its ledger opens, so its writes and its confirmSaved start at
+ * admission.
+ */
+export async function runPanelAction(type: string, data: any, panelManager: any): Promise<any> {
+  if (PANEL_ACTIONS.has(type) && data?.guildId) {
+    const held = await admitGuildAction(String(data.guildId), performance.now() + ENTRY_WAIT_MS);
+    if (held.cause !== 'admit') return { success: false, error: gateCauseText(held.cause) };
+  }
+  return runSealed('panel', null, panelModule(panelManager, data?.panelId), async ledger => {
+    let response: any;
+    try {
+      response = await handleIPCMessage(type, data, panelManager);
+    } catch (error) {
+      response = { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+    const { liveUpdate, ...answer } = response;
+    const verdict = await verdictOf([ledger]);
+    if (!verdict.ok) {
+      if (answer.success === false) console.warn(`[IPCPanelHandler] ${type} failed with its writes not confirmed: ${answer.error}`);
+      return { success: false, error: truthText(verdict.answer, verdict.partial) };
+    }
+    if (liveUpdate) broadcastWebUIPanelUpdate(liveUpdate.panelId, liveUpdate.response, liveUpdate.guildId);
+    return answer;
+  });
+}
+
 /**
  * Handle IPC message and return response
  */
 async function handleIPCMessage(type: string, data: any, panelManager: any): Promise<any> {
-  // Synthetic-entry data gate: webui-driven panel actions read/write guild
-  // data without passing the Discord dispatch gate, so wait here the same way.
-  const panelActions = new Set(['panel:execute', 'panel:button', 'panel:dropdown', 'panel:modal']);
-  if (panelActions.has(type) && data?.guildId && !(await awaitGuildDataReady(String(data.guildId)))) {
-    return { success: false, error: "This server's data is still loading; try again in a moment" };
-  }
   switch (type) {
     case 'panel:list':
       return {

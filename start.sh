@@ -25,6 +25,8 @@ fi
 echo "Image buildId:   $IMAGE_BUILD_ID"
 echo "Applied buildId: ${APPLIED_BUILD_ID:-<none>}"
 
+BUILD_COMPLETE_ID=$(cat /app/dist/.build-complete 2>/dev/null || echo "")
+
 SAFE_MODE_MARKER=/data/build-safe-mode.json
 SAFE_MODE_BUILD=0
 COMPILE_FAIL_REASON=""
@@ -80,8 +82,12 @@ compile_ts() {
     return 0
 }
 
-if [ "$IMAGE_BUILD_ID" != "$APPLIED_BUILD_ID" ] || [ ! -f /app/dist/index.js ]; then
-    echo "[Build] buildId mismatch or /app/dist missing - rebuilding /app/build and /app/dist"
+if [ "$IMAGE_BUILD_ID" != "$APPLIED_BUILD_ID" ] || [ "$BUILD_COMPLETE_ID" != "$IMAGE_BUILD_ID" ] || [ ! -s /app/dist/index.js ]; then
+    if [ "$IMAGE_BUILD_ID" = "$APPLIED_BUILD_ID" ]; then
+        echo "[Build] the previous build is not on disk whole; rebuilding"
+    fi
+    echo "[Build] buildId mismatch or /app/dist incomplete - rebuilding /app/build and /app/dist"
+    rm -f /data/applied-version.json
 
     stage_sources
     apply_overlays
@@ -136,10 +142,17 @@ if [ "$IMAGE_BUILD_ID" != "$APPLIED_BUILD_ID" ] || [ ! -f /app/dist/index.js ]; 
     mkdir -p /app/dist/webui/public
     node -e "const fs=require('fs');const v=JSON.parse(fs.readFileSync('/app/image-version.json','utf8'));fs.writeFileSync('/app/dist/webui/public/build-info.js','window.BOT_BUILD = '+JSON.stringify(v)+';\n');"
 
+    sync
+
     if [ "$SAFE_MODE_BUILD" -eq 0 ]; then
         echo "[Build] Writing /data/applied-version.json"
-        cp /app/image-version.json /data/applied-version.json
+        cp /app/image-version.json /data/applied-version.json.tmp
+        sync
+        mv /data/applied-version.json.tmp /data/applied-version.json
     fi
+
+    printf '%s' "$IMAGE_BUILD_ID" > /app/dist/.build-complete
+    sync
 
     echo "[Build] Refresh complete"
 else

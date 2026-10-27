@@ -40,6 +40,7 @@ function App() {
   const [logs, setLogs] = useState([]);
   const [loading, setLoading] = useState(true);
   const [containerRestarting, setContainerRestarting] = useState(false);
+  const [newerBuild, setNewerBuild] = useState(null);
 
   // Wrapper so every tab change (button clicks, programmatic switches)
   // updates the URL alongside the React state.
@@ -98,6 +99,9 @@ function App() {
       if (data.connected) {
         // Clear stale messages and reload data when WebSocket reconnects
         loadData();
+        readServedBuild()
+          .then(build => setNewerBuild(build && build.buildId !== window.BOT_BUILD?.buildId ? build : null))
+          .catch(() => {});
       }
     });
 
@@ -235,6 +239,12 @@ function App() {
           title={window.BOT_BUILD ? `branch: ${window.BOT_BUILD.branch}\nbuild: ${window.BOT_BUILD.buildDate}\ncommit: ${window.BOT_BUILD.commit}` : 'running in dev mode'}
         >
           {window.BOT_BUILD ? `v${window.BOT_BUILD.version} · ${window.BOT_BUILD.commitShort}` : 'Development'}
+          {newerBuild && (
+            <span style={{ display: 'block', color: '#e0a040' }}>
+              {`Now serving v${newerBuild.version} · ${newerBuild.commitShort}`}{' '}
+              <button className="btn btn-secondary" style={{ padding: '2px 8px', fontSize: '0.75rem' }} onClick={() => window.location.reload()}>Reload</button>
+            </span>
+          )}
         </span>
         <h1 style={{ margin: '0', padding: '20px 0', color: '#a0a0a0', flex: 1, textAlign: 'center' }}>Discord Bot System Settings</h1>
         <span style={{ minWidth: '140px', paddingRight: '20px', textAlign: 'right' }}>

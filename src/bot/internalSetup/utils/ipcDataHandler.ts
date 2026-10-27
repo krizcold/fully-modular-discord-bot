@@ -3,23 +3,33 @@
  * (spec 6.3). The parent never writes a postgres-routed guild itself: every
  * guild data op lands here, is applied locally when this node owns the guild,
  * and is otherwise forwarded by the master to the owning worker over the
- * control channel. Operator writes are durability-immediate (flushed before
- * the ok), so 'ok' means committed and 'pending' means accepted-but-retrying.
+ * control channel. Operator writes are durability-immediate (confirmed before
+ * the ok), so 'ok' means committed and 'pending' means accepted-but-retrying;
+ * a delete that finds nothing, with no earlier delete of it still to land, is
+ * done at once.
  */
 
 import * as fs from 'fs';
+import * as path from 'path';
 import { dataPath } from '../../../utils/dataRoot';
 import {
-  deleteDataOutcome,
+  confirmWrite,
+  deleteDataTracked,
   deleteGuildNamespace,
-  flushGuildOutcome,
   isGuildWriteFrozen,
   listGuildDataFiles,
   listGuildDataKeys,
+  flushFailing,
+  guildDocFileQueue,
   readGuildDocRaw,
+  readRawStrict,
   restoreGuildFromGraveyard,
-  saveDataOutcome,
+  saveDataTracked,
 } from './dataManager';
+import type { WriteTicket } from './dataManager';
+import { filesPending } from './dataBackends/fileBackend';
+import { ROOT_CONFIG_PATH } from './configManager';
+import { isInternalGlobalRel } from './configDiscovery';
 import { DataBackendUnavailableError, getWorkingSet } from './dataBackends/workingSet';
 import { awaitGuildDataReady } from './dataBackends/boot';
 import { getFleetState } from '../fleet/state';
@@ -35,6 +45,15 @@ export interface GuildDataWriteRequest {
   /** Raw JSON text, 2-space pretty like the facade writes. For restore-graveyard it carries {retiredAt}. */
   contentJson?: string;
 }
+
+/** One global file the Config tab reads: the root config, or a .json path under /data/global as 'module/file.json'. */
+export interface GlobalDataReadRequest {
+  root?: 'config';
+  rel?: string;
+}
+
+/** pending: this process still holds a queued write or delete of the file; failing: that write's last flush failed. */
+export type GlobalDataReadReply = DataReadReply & { pending?: boolean; failing?: boolean };
 
 export interface GuildDataReadRequest {
   guildId: string;
@@ -97,6 +116,7 @@ export async function applyOperatorDataWrite(req: GuildDataWriteRequest): Promis
   if (!(await awaitGuildDataReady(guildId))) {
     return { ok: false, code: 'backend-unavailable', error: 'guild data is not ready' };
   }
+  let ticket: WriteTicket;
   try {
     if (op === 'restore-graveyard') {
       let retiredAt: number | undefined;
@@ -137,10 +157,14 @@ export async function applyOperatorDataWrite(req: GuildDataWriteRequest): Promis
     }
     const options = module ? { guildId, category: module } : { guildId };
     if (op === 'delete') {
-      // Nothing to delete is done; a frozen guild or a refusal is not.
-      const deleted = deleteDataOutcome(filename, options);
-      if (deleted === 'frozen') return { ok: false, code: 'frozen' };
-      if (deleted === 'refused') return { ok: false, code: 'backend-unavailable', error: 'delete not accepted' };
+      // Nothing to delete is done, with nothing to confirm; an earlier delete
+      // of it not landed yet is confirmed as this one. A frozen guild or a
+      // refusal is not done.
+      const deleted = deleteDataTracked(filename, options);
+      if (deleted.outcome === 'frozen') return { ok: false, code: 'frozen' };
+      if (deleted.outcome === 'refused') return { ok: false, code: 'backend-unavailable', error: 'delete not accepted' };
+      if (!deleted.ticket) return { ok: true };
+      ticket = deleted.ticket;
     } else {
       let parsed: unknown;
       try {
@@ -148,9 +172,10 @@ export async function applyOperatorDataWrite(req: GuildDataWriteRequest): Promis
       } catch {
         return { ok: false, code: 'invalid', error: 'contentJson is not valid JSON' };
       }
-      const saved = saveDataOutcome(filename, options, parsed);
-      if (saved === 'frozen') return { ok: false, code: 'frozen' };
-      if (saved === 'refused') return { ok: false, code: 'backend-unavailable', error: 'write not accepted' };
+      const saved = saveDataTracked(filename, options, parsed);
+      if (saved.outcome === 'frozen') return { ok: false, code: 'frozen' };
+      if (saved.outcome === 'refused') return { ok: false, code: 'backend-unavailable', error: 'write not accepted' };
+      ticket = saved.ticket;
     }
   } catch (error) {
     if (error instanceof DataBackendUnavailableError) {
@@ -158,14 +183,15 @@ export async function applyOperatorDataWrite(req: GuildDataWriteRequest): Promis
     }
     return { ok: false, code: 'io-error', error: error instanceof Error ? error.message : String(error) };
   }
-  const outcome = await flushGuildOutcome(guildId, 8000);
+  // This write's own confirmation: other writers' queued writes to the guild are theirs.
+  const outcome = await confirmWrite(ticket, 8000);
   if (outcome === 'ok') return { ok: true };
   if (outcome === 'pending') return { ok: true, pending: true };
   if (outcome === 'deposed') return { ok: false, code: 'not-owner', error: 'guild ownership moved mid-write' };
   // Refused by the store, the write is kept and retried: no failure, and the
   // operator learns it is not durable yet.
   if (outcome === 'held') return { ok: true, pending: true, note: 'it is not saved yet; this node retries while it serves this guild, and loses it if the bot stops, the guild moves or the node loses its database first' };
-  return { ok: false, code: 'backend-unavailable', error: 'this node switched databases while saving; whether the write was carried over is unknown, so reload the data to check' };
+  return { ok: false, code: 'backend-unavailable', error: 'this write left this node before it was confirmed saved (the guild moved or was unloaded, its data was deleted or restored from the graveyard, or the node switched databases), so whether it was saved is unknown; reload the data to check' };
 }
 
 /**
@@ -211,13 +237,51 @@ export async function applyOperatorDataRead(req: GuildDataReadRequest): Promise<
       return { ok: true, files: listGuildDataFiles(req.guildId, req.module || undefined) };
     }
     const raw = readGuildDocRaw(req.guildId, req.module, req.filename);
-    return raw === null ? { ok: true } : { ok: true, contentJson: raw };
+    // A file-routed doc: whether this process's own queued write of it could still land.
+    const queue = guildDocFileQueue(req.guildId, req.module, req.filename);
+    return { ok: true, ...(raw === null ? {} : { contentJson: raw }), ...(queue ?? {}) };
   } catch (error) {
     if (error instanceof DataBackendUnavailableError) {
       return { ok: false, code: 'backend-unavailable', error: error.message };
     }
+    const unreadable = unreadableReply(error);
+    if (unreadable) return unreadable;
     return { ok: false, code: 'io-error', error: error instanceof Error ? error.message : String(error) };
   }
+}
+
+/** A file that exists and could not be read: never answered as absent. */
+function unreadableReply(error: unknown): DataReadReply | null {
+  const code = (error as NodeJS.ErrnoException)?.code;
+  return typeof code === 'string' ? { ok: false, code: 'unreadable', error: code } : null;
+}
+
+/**
+ * The web UI's queue-first read of a global file: the body this process last
+ * accepted for it (queued or on disk), so the editor and a backup never start
+ * from a body older than a write the bot accepted.
+ */
+export function applyOperatorGlobalRead(req: GlobalDataReadRequest): GlobalDataReadReply {
+  let absPath: string;
+  if (req.root === 'config') {
+    absPath = ROOT_CONFIG_PATH;
+  } else {
+    const rel = req.rel;
+    if (typeof rel !== 'string' || !validSegment(rel, true) || !rel.endsWith('.json') || isInternalGlobalRel(rel)) {
+      return { ok: false, code: 'invalid', error: 'invalid global file' };
+    }
+    const globalDir = dataPath('global');
+    absPath = path.join(globalDir, ...rel.split('/'));
+    if (!absPath.startsWith(globalDir + path.sep)) return { ok: false, code: 'invalid', error: 'invalid global file' };
+  }
+  let raw: string | null;
+  try {
+    raw = readRawStrict(absPath);
+  } catch (error) {
+    return unreadableReply(error) ?? { ok: false, code: 'io-error', error: error instanceof Error ? error.message : String(error) };
+  }
+  const state = { pending: filesPending([absPath]), failing: flushFailing([absPath]) };
+  return raw === null ? { ok: true, ...state } : { ok: true, contentJson: raw, ...state };
 }
 
 async function handleGuildWrite(req: GuildDataWriteRequest): Promise<DataWriteReply> {
@@ -251,11 +315,13 @@ export function setupDataIPCHandlers(): void {
   process.on('message', async (message: unknown) => {
     if (!message || typeof message !== 'object') return;
     const { type, requestId, data } = message as { type?: string; requestId?: string; data?: any };
-    if ((type !== 'data:guild-write' && type !== 'data:guild-read') || !requestId) return;
+    if ((type !== 'data:guild-write' && type !== 'data:guild-read' && type !== 'data:global-read') || !requestId) return;
     try {
       const response = type === 'data:guild-write'
         ? await handleGuildWrite((data || {}) as GuildDataWriteRequest)
-        : await handleGuildRead((data || {}) as GuildDataReadRequest);
+        : type === 'data:guild-read'
+          ? await handleGuildRead((data || {}) as GuildDataReadRequest)
+          : applyOperatorGlobalRead((data || {}) as GlobalDataReadRequest);
       process.send!({ requestId, data: response });
     } catch (error) {
       process.send!({ requestId, data: { ok: false, code: 'io-error', error: error instanceof Error ? error.message : 'Unknown error' } });

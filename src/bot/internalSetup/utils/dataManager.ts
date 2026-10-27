@@ -19,6 +19,8 @@ import {
   enqueueWrite,
   enqueueAppend,
   enqueueDelete,
+  fileTicket,
+  confirmFile,
   existsOnDisk,
   readFileUtf8,
   readRaw,
@@ -27,7 +29,9 @@ import {
   dropPendingForGuild,
   graveyardGuildDir,
   restoreGuildDirFromGraveyard,
-  writeRawAtomic,
+  writeRawAtomic as writeRawAtomicFile,
+  deleteRawAtomic as deleteRawAtomicFile,
+  lastRawRefusal,
   listGuildDataFiles as listGuildDataFilesFs,
   listGlobalDataFiles,
 } from './dataBackends/fileBackend';
@@ -40,23 +44,30 @@ import {
   flushGuild as flushGuildFiles,
   pendingGuildFiles,
   filesPending,
+  flushFailing as flushFailingFiles,
+  readRawStrict,
   sweepGraveyard as sweepFileGraveyard,
   listGuilds as listGuildDirs,
   sizeOfGuildData as sizeOfGuildDir,
 } from './dataBackends/fileBackend';
 import { routeFor } from './dataBackends/routeResolver';
-import { getWorkingSet, DataBackendUnavailableError } from './dataBackends/workingSet';
+import { carryOf, getWorkingSet, DataBackendUnavailableError } from './dataBackends/workingSet';
+import type { WsTicket } from './dataBackends/workingSet';
+import type { FileTicket } from './dataBackends/fileBackend';
 import { sweepGraveyardRows, PostgresBackend } from './dataBackends/postgresBackend';
 import type { DataBackend, FenceToken } from './dataBackends/backend';
 import { loadCredentials } from '../../../utils/envLoader';
+import { currentSince, recordRefusal, recordTicket } from './dataBackends/writeLedger';
+import { firstSeqOf, noteScopeRefusal, noteScopeTicket, pendingFor, saveMark, stampOf, type SaveMark } from './dataBackends/scopeRecord';
 
-export { listGlobalDataFiles };
+export { listGlobalDataFiles, saveMark };
+export type { SaveMark };
 export { DataBackendUnavailableError } from './dataBackends/workingSet';
 export {
+  flushFailing,
   getFlushFailures,
-  writeRawAtomic,
   readRaw,
-  deleteRawAtomic,
+  readRawStrict,
   sizeOfGlobalData,
   listGraveyardEntries,
 } from './dataBackends/fileBackend';
@@ -189,6 +200,27 @@ export function drainForExit(boundMs: number): Promise<void> {
   return exitDrain;
 }
 
+/** Whether the exit drain has closed the facade: every write from now on is refused as node-stopping. */
+export function isClosedForExit(): boolean {
+  return closedForExit;
+}
+
+let stopBegun = false;
+
+/** The process's shutdown handler: runs its steps once, the stop marked begun before the first of them. */
+export function stopHandler(steps: () => Promise<void>): () => Promise<void> {
+  return async () => {
+    if (stopBegun) return;
+    stopBegun = true;
+    await steps();
+  };
+}
+
+/** A stop has begun or the exit drain runs: a write not saved by now may never be retried, and may be lost. */
+export function isStopping(): boolean {
+  return stopBegun || exitDrain !== null;
+}
+
 /**
  * Flush every queued op for one guild (migration drain primitive).
  */
@@ -227,8 +259,17 @@ export function listGuildDataFiles(guildId: string, category?: string): string[]
 /**
  * Deadline-bounded durability confirmation for one guild (operator writes:
  * 'ok' = committed, 'pending' = accepted but still retrying, 'held' = the store
- * refused it, kept and retried, 'unavailable' = the node moved stores under it
- * and whether it was carried is unknown).
+ * refused it, kept and retried, 'deposed' = the store refused a batch for a
+ * newer owner, so the set's unlanded writes were dropped and none was carried,
+ * 'unavailable' = the writes left this manager's hold before they landed (a
+ * recycle, an evict or a replacement), so whether they are stored is unknown).
+ * It answers for the writes this node's current manager holds for the guild
+ * when it is called: one not quiesced that holds no unlanded write of the
+ * guild, carried or its own, and no set of it fenced within its drain, answers
+ * 'ok', also while a predecessor's batch of the guild is still on the wire
+ * (open_items.md, "A recycle's batch on the wire") or after a prune dropped a
+ * carry of its writes (R8-J10); confirmSaved answers for those, by its lost
+ * marks.
  */
 export async function flushGuildOutcome(guildId: string, deadlineMs: number): Promise<'ok' | 'pending' | 'held' | 'deposed' | 'unavailable'> {
   // Only the files queued when this call began are its to answer for: a write
@@ -238,27 +279,118 @@ export async function flushGuildOutcome(guildId: string, deadlineMs: number): Pr
   if (filesPending(queued)) return 'held';
   const ws = getWorkingSet();
   if (ws && routeFor(guildId) === 'postgres') {
+    // The set the flush answers for: one read here later (a replacement) holds
+    // none of its writes.
+    const set = ws.setOf(guildId);
     const outcome = await ws.flushGuildNow(guildId, deadlineMs);
     if (outcome !== 'unavailable') return outcome;
-    // Its successor still holds the writes, or they landed there or were
-    // dropped, which this side cannot tell apart.
-    const now = getWorkingSet();
-    return now && now !== ws && now.holdsWritesFor(guildId) ? 'pending' : 'unavailable';
+    // Recycled: pending while carries a later manager keeps hold every write
+    // that set had not landed; a write in none, or a carry landed or dropped,
+    // leaves this side unable to tell.
+    return set && ws.setCarries(set)?.every(fate => fate.outcome() === 'kept') ? 'pending' : 'unavailable';
   }
   return 'ok';
 }
 
 /**
+ * flushGuildOutcome for one accepted write: a later write of the same
+ * document landing counts for it, and other writes of the guild still
+ * queued do not.
+ */
+export async function confirmWrite(ticket: WriteTicket, deadlineMs: number): Promise<'ok' | 'pending' | 'held' | 'deposed' | 'unavailable'> {
+  return confirmFrom(ticket, deadlineMs, ticket.seq);
+}
+
+/** confirmWrite for a ticket that answers for its key's writes from the seq from on (a scope or ledger entry's). */
+export async function confirmFrom(ticket: WriteTicket, deadlineMs: number, from: number): Promise<'ok' | 'pending' | 'held' | 'deposed' | 'unavailable'> {
+  if (ticket.kind === 'file') return confirmFile(ticket, deadlineMs);
+  const outcome = await ticket.manager.confirm(ticket, deadlineMs);
+  if (outcome !== 'unavailable') return outcome;
+  // Recycled: pending while a later manager keeps the carry that took the write
+  // off. One that landed answers unavailable too, as one dropped does: a write
+  // the successor took before applying it may have replaced it unseen.
+  return carryOf(ticket, from)?.outcome() === 'kept' ? 'pending' : 'unavailable';
+}
+
+export type SaveOutcome = 'ok' | 'pending' | 'held' | 'deposed' | 'unavailable' | 'refused';
+
+/** confirmSaved's default bound, the reply gate's CONFIRM_MS (BT-1's bound). */
+const CONFIRM_SAVED_MS = 8000;
+
+// Worst first.
+const SAVE_RANK: SaveOutcome[] = ['refused', 'deposed', 'unavailable', 'held', 'pending', 'ok'];
+const worstSave = (answers: SaveOutcome[]): SaveOutcome =>
+  answers.reduce((a, b) => (SAVE_RANK.indexOf(b) < SAVE_RANK.indexOf(a) ? b : a), 'ok');
+
+/**
+ * For a module that handles its own save outcomes (dataContract 2 in module.json): 'ok' only once every write the
+ * facade accepted for this scope (a guild id, or 'global') after since is held by the store and none was refused;
+ * otherwise the worst true answer: 'refused' for a refused write (or 'unavailable' once its document was rewritten
+ * whole, which may carry the change), then confirmWrite's answers. since defaults to the start of the handler's run
+ * for the interaction, panel action or console invoke in scope (for an interaction the dispatch gate held, its
+ * admission; for a listener it never held, the interaction's opening), and outside every one of them to 0 (every
+ * write since the process started): a timer takes saveMark() before its writes and passes it. A since that is not a mark of this run (a
+ * number, or a mark kept from before a restart) answers 'unavailable'. It answers for every writer of the scope, not
+ * the caller alone. category narrows file writes and refusals to that module's folder; a guild served from the
+ * database answers for its whole working set, so another module's slower write can make it 'pending'. Raw atomic
+ * writes are not counted. A working set's writes in the scope are answered together from the first of them: when
+ * that one was on the wire as a recycle carried the set off, the answer is 'unavailable', even for a since after it
+ * whose later writes the successor keeps (a cautious answer, as for a carry that landed).
+ */
+export async function confirmSaved(scope: string, options: { since?: SaveMark; deadlineMs?: number; category?: string } = {}): Promise<SaveOutcome> {
+  const mark = options.since ?? currentSince();
+  const since = mark === undefined ? 0 : stampOf(mark);
+  if (since === null) return 'unavailable';
+  const deadlineMs = options.deadlineMs ?? CONFIRM_SAVED_MS;
+  const { tickets, lost, refused, pruned } = pendingFor(scope, since);
+  const answers: SaveOutcome[] = pruned ? ['unavailable'] : [];
+  for (const mark of lost) {
+    answers.push(mark.deposed ? 'deposed' : mark.carry?.outcome() === 'kept' ? 'pending' : 'unavailable');
+  }
+  const docPrefix = options.category === undefined ? null : `${scope === 'global' ? 'global' : `guild:${scope}`}:${options.category}/`;
+  for (const refusal of refused) {
+    if (docPrefix === null || refusal.doc.startsWith(docPrefix)) answers.push(refusal.rewritten ? 'unavailable' : 'refused');
+  }
+  const folder = options.category === undefined
+    ? null
+    : getDataDirectory(scope === 'global' ? { scope: 'global', category: options.category } : { guildId: scope, category: options.category }) + path.sep;
+  const judged = tickets.filter(ticket => ticket.kind === 'ws' || folder === null || ticket.path.startsWith(folder));
+  // Each ticket answers for its entry's writes from the first, which a recycle may have left out of its carry.
+  const froms = judged.map(ticket => firstSeqOf(scope, ticket));
+  const first = await Promise.all(judged.map((ticket, i) => confirmFrom(ticket, deadlineMs, froms[i]).catch(() => 'unavailable' as const)));
+  // A held write is retried while slower confirms finish, so it is read again when the answer is taken.
+  const now = await Promise.all(first.map((answer, i) => answer !== 'held'
+    ? answer
+    : confirmFrom(judged[i], 0, froms[i]).then(again => (again === 'pending' ? 'held' as const : again), () => 'unavailable' as const)));
+  return worstSave([...answers, ...now]);
+}
+
+/**
  * Raw JSON text of one guild doc from whichever backend routes the guild;
- * null = absent (or the working set is not ready).
+ * null = absent (or the working set is not ready). A file that exists but
+ * cannot be read throws.
  */
 export function readGuildDocRaw(guildId: string, module: string, filename: string): string | null {
   const ws = getWorkingSet();
   if (ws && routeFor(guildId) === 'postgres') {
     return ws.readDocRaw(guildId, module, filename);
   }
-  const filePath = getDataFilePath(filename, module ? { guildId, category: module } : { guildId });
-  return readRaw(filePath);
+  return readRawStrict(guildDocFilePath(guildId, module, filename));
+}
+
+function guildDocFilePath(guildId: string, module: string, filename: string): string {
+  return getDataFilePath(filename, module ? { guildId, category: module } : { guildId });
+}
+
+/**
+ * For a file-routed guild doc, whether this process still holds a queued
+ * write of it and whether that write's flush is failing; null when the
+ * working set serves the guild.
+ */
+export function guildDocFileQueue(guildId: string, module: string, filename: string): { pending: boolean; failing: boolean } | null {
+  if (getWorkingSet() && routeFor(guildId) === 'postgres') return null;
+  const filePath = guildDocFilePath(guildId, module, filename);
+  return { pending: filesPending([filePath]), failing: flushFailingFiles([filePath]) };
 }
 
 /**
@@ -491,7 +623,44 @@ export function stampOwner(guildId: string): void {
     updatedAt: Date.now(),
   };
   const target = path.join(BASE_DATA_DIR, guildId, '.owner');
-  if (writeRawAtomic(target, JSON.stringify(manifest, null, 2))) ownerStamped.add(guildId);
+  if (writeRawAtomicFile(target, JSON.stringify(manifest, null, 2))) ownerStamped.add(guildId);
+}
+
+// ============================================================================
+// RAW PATHS (root config, session files and other files outside the namespaces)
+// ============================================================================
+
+/** Queue an atomic write to an absolute path; refused once the exit drain has closed. */
+export function writeRawAtomic(absPath: string, contents: string): boolean {
+  if (closedForExit) {
+    recordRefusal('node-stopping', `file:${absPath}`);
+    throw new DataBackendUnavailableError('node-stopping');
+  }
+  const accepted = writeRawAtomicFile(absPath, contents);
+  if (accepted) recordTicket(fileTicket(absPath), `file:${absPath}`);
+  else recordRefusal(lastRawRefusal() ?? 'io', `file:${absPath}`);
+  return accepted;
+}
+
+/** Queue an atomic delete of an absolute path (false: nothing to delete); refused once the exit drain has closed. */
+export function deleteRawAtomic(absPath: string): boolean {
+  if (closedForExit) {
+    recordRefusal('node-stopping', `file:${absPath}`);
+    throw new DataBackendUnavailableError('node-stopping');
+  }
+  const accepted = deleteRawAtomicFile(absPath);
+  // A delete still queued for the path has not landed: it answers for this one.
+  if (accepted || getPending(absPath)?.op === 'delete') recordTicket(fileTicket(absPath), `file:${absPath}`);
+  else {
+    const cause = lastRawRefusal();
+    if (cause) recordRefusal(cause, `file:${absPath}`);
+  }
+  return accepted;
+}
+
+/** The ticket for the raw op still queued on this path, taken right after writeRawAtomic or deleteRawAtomic; none once it landed. */
+export function rawTicket(absPath: string): FileTicket | undefined {
+  return getPending(absPath) ? fileTicket(absPath) : undefined;
 }
 
 // ============================================================================
@@ -544,6 +713,54 @@ export function loadData<T = any>(
   }
 }
 
+/** One accepted write, as confirmWrite answers for it. */
+export type WriteTicket = WsTicket | FileTicket;
+
+/** Why a write was refused without a throw: its guild's working set is not ready (or not in this process), or storage failed. */
+export type WriteRefusal = 'not-ready' | 'io';
+
+export type SaveTracked = { outcome: 'saved'; ticket: WriteTicket } | { outcome: 'frozen' } | { outcome: 'refused'; cause: WriteRefusal };
+export type AppendTracked = { outcome: 'appended'; ticket: WriteTicket } | { outcome: 'frozen' } | { outcome: 'refused'; cause: WriteRefusal };
+/** An absent delete carries a ticket while an earlier delete of the same document has not landed. */
+export type DeleteTracked = { outcome: 'deleted'; ticket: WriteTicket } | { outcome: 'absent'; ticket?: WriteTicket } | { outcome: 'frozen' } | { outcome: 'refused'; cause: WriteRefusal };
+
+/** The document a facade write names, for the ledger's refusals. */
+function docOf(filename: string, options: DataOptions): string {
+  const owner = options.scope === 'global' ? 'global' : `guild:${options.guildId ?? ''}`;
+  return `${owner}:${options.category ?? ''}/${filename}`;
+}
+
+/** The scope confirmSaved answers a facade write under: 'global', or its guild id. */
+const scopeOf = (options: DataOptions): string => (options.scope === 'global' ? 'global' : options.guildId ?? '');
+
+/**
+ * Records a tracked write's outcome in the entry's ledger (writeLedger.ts), and a refusal's cause before its throw;
+ * the write, accepted or refused, is also noted in its scope's record (scopeRecord.ts) for confirmSaved.
+ * whole: the write replaces the whole document (a save or a delete); an earlier refusal of that document then cannot
+ * be confirmed either way, since the rewrite may or may not carry the refused change.
+ */
+function recorded<R extends SaveTracked | AppendTracked | DeleteTracked>(doc: string, scope: string, whole: boolean, accept: () => R): R {
+  let result: R;
+  try {
+    result = accept();
+  } catch (error) {
+    if (error instanceof DataBackendUnavailableError) {
+      recordRefusal(error.causeKey, doc);
+      noteScopeRefusal(scope, doc);
+    }
+    throw error;
+  }
+  const outcome: SaveTracked | AppendTracked | DeleteTracked = result;
+  if ('ticket' in outcome && outcome.ticket) {
+    recordTicket(outcome.ticket, whole ? doc : undefined);
+    noteScopeTicket(scope, outcome.ticket, whole ? doc : undefined);
+  } else if (outcome.outcome === 'frozen' || outcome.outcome === 'refused') {
+    recordRefusal(outcome.outcome === 'frozen' ? 'frozen' : outcome.cause, doc);
+    noteScopeRefusal(scope, doc);
+  }
+  return result;
+}
+
 /**
  * Save JSON data to file
  * Automatically creates directory if needed
@@ -558,28 +775,41 @@ export function saveData<T = any>(
 
 /** A save that says whether it was accepted, met a frozen guild, or was refused (a set not ready, an I/O error). */
 export function saveDataOutcome<T = any>(filename: string, options: DataOptions, data: T): 'saved' | 'frozen' | 'refused' {
+  return saveDataTracked(filename, options, data).outcome;
+}
+
+/** saveDataOutcome with the ticket of an accepted write, or the cause of a refusal. */
+export function saveDataTracked<T = any>(filename: string, options: DataOptions, data: T): SaveTracked {
+  return recorded(docOf(filename, options), scopeOf(options), true, () => acceptSave(filename, options, data));
+}
+
+function acceptSave<T>(filename: string, options: DataOptions, data: T): SaveTracked {
   if (closedForExit) throw new DataBackendUnavailableError('node-stopping');
   try {
     if (isGuildFrozen(options)) {
       frozenWriteRejections += 1;
-      return 'frozen';
+      return { outcome: 'frozen' };
     }
     const wsGuild = wsRouted(options);
     if (wsGuild !== null) {
       const ws = getWorkingSet();
       if (!ws) {
         console.warn(`[Data] Write for postgres-routed guild ${wsGuild} outside the bot process; refused`);
-        return 'refused';
+        return { outcome: 'refused', cause: 'not-ready' };
       }
       const content = JSON.stringify(data, null, 2);
       const result = ws.save(wsGuild, options.category ?? '', filename, content);
       if (result === 'accepted') {
+        const ticket = ws.ticketFor(wsGuild);
         getMetricsCollector().recordIO('write', options.guildId ?? null, options.category ?? null);
-        return 'saved';
+        return { outcome: 'saved', ticket };
       }
-      if (result === 'frozen-window') { frozenWriteRejections += 1; return 'frozen'; }
-      if (result === 'not-ready') return 'refused';
-      throw new DataBackendUnavailableError(result === 'fenced' ? 'guild-fenced' : result === 'stale-copy' ? 'database-stale-copy' : result === 'read-only' ? 'database-read-only' : 'database-unreachable');
+      if (result === 'frozen-window') { frozenWriteRejections += 1; return { outcome: 'frozen' }; }
+      if (result === 'not-ready') return { outcome: 'refused', cause: 'not-ready' };
+      throw result === 'fenced' ? new DataBackendUnavailableError('guild-fenced')
+        : result === 'stale-copy' ? new DataBackendUnavailableError('database-stale-copy')
+          : result === 'read-only' ? new DataBackendUnavailableError('database-read-only')
+            : ws.refusal();
     }
     const dir = getDataDirectory(options);
     const filePath = getDataFilePath(filename, options);
@@ -592,14 +822,15 @@ export function saveDataOutcome<T = any>(filename: string, options: DataOptions,
 
     const content = JSON.stringify(data, null, 2);
     enqueueWrite(filePath, content);
+    const ticket = fileTicket(filePath);
     getMetricsCollector().recordIO('write', scope === 'global' ? null : options.guildId ?? null, options.category ?? null);
 
     console.log(`[DataManager] Saved ${filename} to ${filePath}`);
-    return 'saved';
+    return { outcome: 'saved', ticket };
   } catch (error) {
     if (error instanceof DataBackendUnavailableError) throw error;
     console.error(`[DataManager] Error saving ${filename}:`, error);
-    return 'refused';
+    return { outcome: 'refused', cause: 'io' };
   }
 }
 
@@ -608,27 +839,40 @@ export function saveDataOutcome<T = any>(filename: string, options: DataOptions,
  * line on crash is tolerated by callers (they skip bad lines on read).
  */
 export function appendData(filename: string, options: DataOptions, line: string): boolean {
+  return appendDataTracked(filename, options, line).outcome === 'appended';
+}
+
+/** appendData with the ticket of an accepted append, or the cause of a refusal. */
+export function appendDataTracked(filename: string, options: DataOptions, line: string): AppendTracked {
+  return recorded(docOf(filename, options), scopeOf(options), false, () => acceptAppend(filename, options, line));
+}
+
+function acceptAppend(filename: string, options: DataOptions, line: string): AppendTracked {
   if (closedForExit) throw new DataBackendUnavailableError('node-stopping');
   try {
     if (isGuildFrozen(options)) {
       frozenWriteRejections += 1;
-      return false;
+      return { outcome: 'frozen' };
     }
     const wsGuild = wsRouted(options);
     if (wsGuild !== null) {
       const ws = getWorkingSet();
       if (!ws) {
         console.warn(`[Data] Append for postgres-routed guild ${wsGuild} outside the bot process; refused`);
-        return false;
+        return { outcome: 'refused', cause: 'not-ready' };
       }
       const result = ws.append(wsGuild, options.category ?? '', filename, line);
       if (result === 'accepted') {
+        const ticket = ws.ticketFor(wsGuild);
         getMetricsCollector().recordIO('write', options.guildId ?? null, options.category ?? null);
-        return true;
+        return { outcome: 'appended', ticket };
       }
-      if (result === 'frozen-window') { frozenWriteRejections += 1; return false; }
-      if (result === 'not-ready') return false;
-      throw new DataBackendUnavailableError(result === 'fenced' ? 'guild-fenced' : result === 'stale-copy' ? 'database-stale-copy' : result === 'read-only' ? 'database-read-only' : 'database-unreachable');
+      if (result === 'frozen-window') { frozenWriteRejections += 1; return { outcome: 'frozen' }; }
+      if (result === 'not-ready') return { outcome: 'refused', cause: 'not-ready' };
+      throw result === 'fenced' ? new DataBackendUnavailableError('guild-fenced')
+        : result === 'stale-copy' ? new DataBackendUnavailableError('database-stale-copy')
+          : result === 'read-only' ? new DataBackendUnavailableError('database-read-only')
+            : ws.refusal();
     }
     const dir = getDataDirectory(options);
     const filePath = getDataFilePath(filename, options);
@@ -637,12 +881,13 @@ export function appendData(filename: string, options: DataOptions, line: string)
     if (scope === 'guild' && options.guildId) stampOwner(options.guildId);
 
     enqueueAppend(filePath, line);
+    const ticket = fileTicket(filePath);
     getMetricsCollector().recordIO('write', scope === 'global' ? null : options.guildId ?? null, options.category ?? null);
-    return true;
+    return { outcome: 'appended', ticket };
   } catch (error) {
     if (error instanceof DataBackendUnavailableError) throw error;
     console.error(`[DataManager] Error appending ${filename}:`, error);
-    return false;
+    return { outcome: 'refused', cause: 'io' };
   }
 }
 
@@ -672,51 +917,67 @@ export function deleteData(filename: string, options: DataOptions): boolean {
 
 /** A delete that says whether it was done, found nothing to delete, met a frozen guild, or was refused (a set not ready, an I/O error). */
 export function deleteDataOutcome(filename: string, options: DataOptions): 'deleted' | 'absent' | 'frozen' | 'refused' {
+  return deleteDataTracked(filename, options).outcome;
+}
+
+/** deleteDataOutcome with the ticket of an accepted delete, or the cause of a refusal. */
+export function deleteDataTracked(filename: string, options: DataOptions): DeleteTracked {
+  return recorded(docOf(filename, options), scopeOf(options), true, () => acceptDelete(filename, options));
+}
+
+function acceptDelete(filename: string, options: DataOptions): DeleteTracked {
   if (closedForExit) throw new DataBackendUnavailableError('node-stopping');
   try {
     if (isGuildFrozen(options)) {
       frozenWriteRejections += 1;
-      return 'frozen';
+      return { outcome: 'frozen' };
     }
     const wsGuild = wsRouted(options);
     if (wsGuild !== null) {
       const ws = getWorkingSet();
       if (!ws) {
         console.warn(`[Data] Delete for postgres-routed guild ${wsGuild} outside the bot process; refused`);
-        return 'refused';
+        return { outcome: 'refused', cause: 'not-ready' };
       }
       const result = ws.delete(wsGuild, options.category ?? '', filename);
       if (result === 'absent') {
         console.log(`[DataManager] File not found for deletion: ${wsGuild}/${options.category ?? ''}/${filename}`);
-        return 'absent';
+        const earlier = ws.unlandedDeleteTicket(wsGuild, options.category ?? '', filename);
+        return earlier ? { outcome: 'absent', ticket: earlier } : { outcome: 'absent' };
       }
       if (result === 'accepted') {
+        const ticket = ws.ticketFor(wsGuild);
         console.log(`[DataManager] Deleted ${wsGuild}/${options.category ?? ''}/${filename}`);
-        return 'deleted';
+        return { outcome: 'deleted', ticket };
       }
-      if (result === 'frozen-window') { frozenWriteRejections += 1; return 'frozen'; }
-      if (result === 'not-ready') return 'refused';
-      throw new DataBackendUnavailableError(result === 'fenced' ? 'guild-fenced' : result === 'stale-copy' ? 'database-stale-copy' : result === 'read-only' ? 'database-read-only' : 'database-unreachable');
+      if (result === 'frozen-window') { frozenWriteRejections += 1; return { outcome: 'frozen' }; }
+      if (result === 'not-ready') return { outcome: 'refused', cause: 'not-ready' };
+      throw result === 'fenced' ? new DataBackendUnavailableError('guild-fenced')
+        : result === 'stale-copy' ? new DataBackendUnavailableError('database-stale-copy')
+          : result === 'read-only' ? new DataBackendUnavailableError('database-read-only')
+            : ws.refusal();
     }
     const filePath = getDataFilePath(filename, options);
 
     const pending = getPending(filePath);
     const existsNow = existsOnDisk(filePath);
-    // Nothing to delete: neither a queued write nor a file on disk.
+    // Nothing to delete: neither a queued write nor a file on disk. A queued
+    // delete has not landed, and an op on the wire ahead of it may create the file.
     if (!existsNow && (!pending || pending.op === 'delete')) {
       console.log(`[DataManager] File not found for deletion: ${filePath}`);
-      return 'absent';
+      return pending ? { outcome: 'absent', ticket: fileTicket(filePath) } : { outcome: 'absent' };
     }
 
     // Enqueue a delete tombstone (serialized with in-flight writes so a queued
     // write cannot resurrect the file).
     enqueueDelete(filePath);
+    const ticket = fileTicket(filePath);
     console.log(`[DataManager] Deleted ${filePath}`);
-    return 'deleted';
+    return { outcome: 'deleted', ticket };
   } catch (error) {
     if (error instanceof DataBackendUnavailableError) throw error;
     console.error(`[DataManager] Error deleting ${filename}:`, error);
-    return 'refused';
+    return { outcome: 'refused', cause: 'io' };
   }
 }
 
@@ -889,7 +1150,9 @@ export function loadModuleData<T = any>(
  * @param guildId - Guild ID
  * @param moduleName - Module name (used as namespace)
  * @param data - Data to save
- * @returns True if saved successfully
+ * @returns True once the write is accepted: queued to be stored, not stored yet (confirmSaved(guildId) says when it
+ * is). False for a frozen guild, a set not ready or a storage error. A stopping bot or a database refusal
+ * (unreachable, read-only, fenced) throws DataBackendUnavailableError.
  *
  * @example
  * // Saves to: /data/{guildId}/giveaway/data.json
@@ -932,7 +1195,8 @@ export function loadGlobalModuleData<T = any>(
  * @param filename - Data filename (supports subfolders)
  * @param moduleName - Module name (used as namespace)
  * @param data - Data to save
- * @returns True if saved successfully
+ * @returns True once the write is accepted: queued to be stored, not stored yet (confirmSaved('global') says when it
+ * is). False for a storage error. A stopping bot throws DataBackendUnavailableError.
  *
  * @example
  * // Saves to: /data/global/analytics/stats.json
@@ -1008,7 +1272,9 @@ export function globalModuleDataExists(filename: string, moduleName: string): bo
  * @param filename - Data filename
  * @param guildId - Guild ID
  * @param moduleName - Module name
- * @returns True if deleted successfully
+ * @returns True once the delete is accepted: queued, not stored yet (confirmSaved(guildId) says when it is). False
+ * when the file was absent, for a frozen guild, a set not ready or a storage error. A stopping bot or a database
+ * refusal (unreachable, read-only, fenced) throws DataBackendUnavailableError.
  */
 export function deleteModuleData(
   filename: string,
@@ -1023,7 +1289,8 @@ export function deleteModuleData(
  *
  * @param filename - Data filename
  * @param moduleName - Module name
- * @returns True if deleted successfully
+ * @returns True once the delete is accepted: queued, not stored yet (confirmSaved('global') says when it is). False
+ * when the file was absent or for a storage error. A stopping bot throws DataBackendUnavailableError.
  */
 export function deleteGlobalModuleData(filename: string, moduleName: string): boolean {
   return deleteData(filename, { scope: 'global', category: moduleName });

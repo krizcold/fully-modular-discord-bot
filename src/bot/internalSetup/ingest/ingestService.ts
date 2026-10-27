@@ -6,6 +6,7 @@
 // changes bounce its gateway sessions, never the object.
 
 import { Client, ClientOptions, Status } from 'discord.js';
+import { installInteractionLedgers, type WriteLedger } from '../utils/dataBackends/writeLedger';
 
 export class IngestService {
   private client: Client | null = null;
@@ -18,7 +19,8 @@ export class IngestService {
   private closed = false;
   private hasBeenReady = false;
 
-  buildClient(options: ClientOptions): Client {
+  /** onInteraction: given each interaction and its ledger before any listener (the bot passes BT-3's reply gate). */
+  buildClient(options: ClientOptions, onInteraction?: (interaction: object, ledger: WriteLedger) => void): Client {
     if (this.client) throw new Error('[Ingest] buildClient() called twice');
     const opts: ClientOptions = { ...options };
     const plan = this.shardPlan;
@@ -30,6 +32,7 @@ export class IngestService {
       (opts as any).shardCount = plan.shardCount;
     }
     this.client = new Client(opts);
+    installInteractionLedgers(this.client, onInteraction);
     this.restoreRestToken();
     this.client.once('clientReady', () => { this.hasBeenReady = true; });
     return this.client;

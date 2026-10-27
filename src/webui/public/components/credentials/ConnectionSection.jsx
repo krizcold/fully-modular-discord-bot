@@ -2,7 +2,7 @@
 // co-worker (everything else mirrors the master via sync). Posts to
 // /api/setup/credentials; the server accepts connection fields only.
 function ConnectionSection({ setupStatus, isBotRunning, onUpdate, onUpdateAndRestart }) {
-  const { useState, useEffect, useMemo } = React;
+  const { useState, useEffect, useMemo, useRef } = React;
 
   const EMPTY_FIELDS = {
     DISCORD_TOKEN: '',
@@ -16,10 +16,16 @@ function ConnectionSection({ setupStatus, isBotRunning, onUpdate, onUpdateAndRes
 
   const [fields, setFields] = useState({ ...EMPTY_FIELDS });
   const [baseline, setBaseline] = useState({ ...EMPTY_FIELDS });
+  // A secret is posted only while typed since the last successful save.
+  const [typed, setTyped] = useState({});
+  const latest = useRef(fields);
+  latest.current = fields;
   const [loading, setLoading] = useState(false);
   const [selfUrlCopied, setSelfUrlCopied] = useState(false);
 
   const connection = setupStatus?.connection || {};
+  // The env says master; the role override written by a demote runs it as a co-worker.
+  const overrideDemoted = connection.ENV_ROLE === 'master' && !!connection.ROLE_OVERRIDE;
 
   useEffect(() => {
     const loaded = {
@@ -28,28 +34,31 @@ function ConnectionSection({ setupStatus, isBotRunning, onUpdate, onUpdateAndRes
       MASTER_URLS: connection.MASTER_URLS || '',
       NODE_NAME: connection.NODE_NAME || '',
       FLEET_SHARD_CAPACITY: connection.FLEET_SHARD_CAPACITY || '',
-      BOT_NODE_ROLE: connection.BACKUP_MASTER === '1' ? 'backup-master' : 'co-worker',
+      BOT_NODE_ROLE: overrideDemoted ? 'master' : connection.BACKUP_MASTER === '1' ? 'backup-master' : 'co-worker',
     };
     setFields(prev => {
       const overlay = {};
       for (const key of Object.keys(prev)) {
-        if (prev[key] !== baseline[key]) overlay[key] = prev[key];
+        if (SECRET_FIELDS.includes(key) ? typed[key] : prev[key] !== baseline[key]) overlay[key] = prev[key];
       }
       return { ...loaded, ...overlay };
     });
     setBaseline(loaded);
   }, [setupStatus]);
 
-  const handleChange = (key, value) => setFields(prev => ({ ...prev, [key]: value }));
+  const handleChange = (key, value) => {
+    if (SECRET_FIELDS.includes(key)) setTyped(prev => ({ ...prev, [key]: true }));
+    setFields(prev => ({ ...prev, [key]: value }));
+  };
 
   function fieldDirty(key) {
-    if (SECRET_FIELDS.includes(key)) return !!fields[key] && fields[key].trim() !== '';
+    if (SECRET_FIELDS.includes(key)) return !!typed[key] && !!fields[key] && fields[key].trim() !== '';
     return fields[key] !== baseline[key];
   }
 
   const dirtyFields = useMemo(
     () => Object.keys(fields).filter(fieldDirty),
-    [fields, baseline]
+    [fields, baseline, typed]
   );
   const hasAnyChanges = dirtyFields.length > 0;
   const saveDisabled = loading || !hasAnyChanges;
@@ -57,9 +66,21 @@ function ConnectionSection({ setupStatus, isBotRunning, onUpdate, onUpdateAndRes
   async function handleSave(andRestart = false) {
     setLoading(true);
     try {
-      const res = await api.post('/setup/credentials', fields);
+      const body = Object.fromEntries(dirtyFields.map(key => [key, fields[key]]));
+      const res = await api.post('/setup/credentials', body);
       if (res.success) {
-        showToast('Connection settings saved. Restart the bot to apply.', 'success');
+        // Only what this save sent is spent: a value typed during the request stays.
+        const spent = Object.keys(body).filter(key => SECRET_FIELDS.includes(key) && latest.current[key] === body[key]);
+        setTyped(prev => Object.fromEntries(Object.entries(prev).filter(([key]) => !spent.includes(key))));
+        setFields(prev => ({ ...prev, ...Object.fromEntries(spent.filter(key => prev[key] === body[key]).map(key => [key, ''])) }));
+        const containerSet = Array.isArray(res.containerSet) ? res.containerSet : [];
+        const changes = Array.isArray(res.reload?.changes) ? res.reload.changes : [];
+        if (changes.some(c => !containerSet.some(p => p.field === c.field))) {
+          showToast('Connection settings saved. Restart the bot to apply.', 'success');
+        } else if (!containerSet.length) {
+          showToast('No changes to save.', 'info');
+        }
+        for (const item of containerSet) showToast(item.message, 'warning');
         if (andRestart) {
           await onUpdateAndRestart();
         } else {
@@ -116,6 +137,11 @@ function ConnectionSection({ setupStatus, isBotRunning, onUpdate, onUpdateAndRes
                 value={fields.BOT_NODE_ROLE || 'co-worker'}
                 onChange={e => handleChange('BOT_NODE_ROLE', e.target.value)}
               >
+                {overrideDemoted && (
+                  <option value="master">
+                    {`Master (env; running as co-worker by the role override written by ${connection.ROLE_OVERRIDE.setBy})`}
+                  </option>
+                )}
                 <option value="co-worker">Co-worker</option>
                 <option value="backup-master">Backup Master</option>
               </select>

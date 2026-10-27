@@ -89,6 +89,7 @@ function createEditorConfig(
     getData: () => loadGuildData(fileKey, guildId, null),
     saveData: (data) => { saveGuildData(fileKey, guildId, data); },
     template: metadata?.template,
+    reload: () => createEditorConfig(fileKey, guildId, metadata && { ...metadata, exists: loadGuildData(fileKey, guildId, null) !== null }),
     fileExists: metadata?.exists ?? (loadGuildData(fileKey, guildId, null) !== null),
     accentColor: 0x3498DB,
     backButtonId: `panel_${PANEL_ID}_btn_backtomodule_${moduleName}`,

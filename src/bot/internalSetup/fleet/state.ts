@@ -662,6 +662,12 @@ export interface FleetStateSources {
   seedOffer?: (() => SeedOfferView | null) | null;
 }
 
+/** A held row's status, read only from its holder's own report under the current shard count. */
+export function holderShardStatus(holder: { shards: { shardId: number; status: string }[]; lastShardCount: number | null }, shardId: number, shardCount: number): string {
+  if (holder.lastShardCount !== null && holder.lastShardCount !== shardCount) return 'Unknown';
+  return holder.shards.find(entry => entry.shardId === shardId)?.status ?? 'Unknown';
+}
+
 let sources: FleetStateSources | null = null;
 
 /** Wired once by fleet bootstrap. */
@@ -794,10 +800,6 @@ export function getFleetState(): FleetState {
   const leases = lease ? lease.leases.map(l => ({ ...l })) : [];
 
   if (role === 'master' && registry) {
-    const statusByShard = new Map<number, string>();
-    for (const node of registry.nodes.values()) {
-      for (const entry of node.shards) statusByShard.set(entry.shardId, entry.status);
-    }
     const nodes: FleetStateNode[] = [...registry.nodes.values()].map(node => ({
       nodeId: node.nodeId,
       nodeName: node.nodeName,
@@ -841,7 +843,7 @@ export function getFleetState(): FleetState {
         // row is frozen (Wait mode) until the node returns or is declared lost.
         const holder = registry.nodes.get(held.nodeId);
         const frozen = !holder || (!holder.connected && !holder.isSelf);
-        shardTable.push({ shardId, nodeId: held.nodeId, leaseId: held.leaseId, term: held.term, epoch: held.epoch, status: frozen ? 'frozen' : statusByShard.get(shardId) ?? 'Unknown', guildCount });
+        shardTable.push({ shardId, nodeId: held.nodeId, leaseId: held.leaseId, term: held.term, epoch: held.epoch, status: frozen ? 'frozen' : holderShardStatus(holder, shardId, registry.shardCount), guildCount });
         continue;
       }
       const pending = registry.pendingConfirmation.get(shardId);

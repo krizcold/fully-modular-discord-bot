@@ -1,8 +1,14 @@
 // Config Panel Component. On a co-worker node the system/global context is
 // read-only (synced from the master); guild contexts list this node's owned
 // guilds and stay editable.
+// A file's row key: data files are module-qualified, since two modules may
+// each hold an x.json; config ids are unique.
+function configFileKey(file) {
+  return file.category === 'data' && file.moduleName ? `${file.moduleName}/${file.id}` : file.id;
+}
+
 function ConfigPanel({ isCoWorker }) {
-  const { useState, useEffect } = React;
+  const { useState, useEffect, useRef } = React;
 
   const [configFiles, setConfigFiles] = useState([]);
   const [selectedFile, setSelectedFile] = useState('config.json');
@@ -10,7 +16,7 @@ function ConfigPanel({ isCoWorker }) {
   const [config, setConfig] = useState(null);
   const [configText, setConfigText] = useState('');
   const [backups, setBackups] = useState([]);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   function setError(msg) { if (msg) showToast(msg, 'error'); }
   function setSuccess(msg) { if (msg) showToast(msg, 'success'); }
@@ -19,6 +25,25 @@ function ConfigPanel({ isCoWorker }) {
   const [initMessage, setInitMessage] = useState('');
   const [guildContext, setGuildContext] = useState('system');
   const [guildContextOptions, setGuildContextOptions] = useState([]);
+  const [booting, setBooting] = useState(true);
+  const [listing, setListing] = useState(false);
+  // The list load the file list came from ({ ctx, seq }), and the load the
+  // editor content came from ({ fileKey, guildId, ctx, seq }): a Save or
+  // Restore writes only to the file and guild its content was loaded from.
+  const [filesStamp, setFilesStamp] = useState(null);
+  const [loaded, setLoaded] = useState(null);
+  const [loadFailed, setLoadFailed] = useState(false);
+  const [listFailed, setListFailed] = useState(false);
+  const seqRef = useRef(0);
+  const latestList = useRef(null);
+  const latestLoad = useRef(null);
+  const latestBackups = useRef(null);
+  // The selection as of the last render, for answers that arrive later.
+  const selRef = useRef({});
+  selRef.current = { file: selectedFile, ctx: guildContext, type: selectedFileType };
+
+  const guildIdOf = ctx => guildContextOptions.find(o => o.value === ctx)?.guildId || null;
+  const findFile = (files, key) => files.find(f => configFileKey(f) === key);
 
   useEffect(() => {
     loadGuildContextOptions();
@@ -26,16 +51,34 @@ function ConfigPanel({ isCoWorker }) {
 
   useEffect(() => {
     if (guildContextOptions.length > 0) {
-      loadConfigFiles();
+      // The previous context's list says nothing about this one.
+      clearEditor();
+      setConfigFiles([]);
+      loadConfigFiles(guildContext);
     }
   }, [guildContext, guildContextOptions]);
 
+  // A new file list (a context switch, or the re-read after a save) or a new
+  // selection reloads the selected file and its backups.
   useEffect(() => {
+    if (!filesStamp || filesStamp.ctx !== guildContext) return;
     if (selectedFile) {
       loadConfig(selectedFile);
       loadBackups(selectedFile);
     }
-  }, [selectedFile]);
+  }, [selectedFile, filesStamp]);
+
+  function clearEditor() {
+    latestLoad.current = null;
+    latestBackups.current = null;
+    setLoaded(null);
+    setConfig(null);
+    setConfigText('');
+    setJsonError(null);
+    setBackups([]);
+    setLoading(false);
+    setLoadFailed(false);
+  }
 
   async function loadGuildContextOptions() {
     if (isCoWorker) {
@@ -53,6 +96,7 @@ function ConfigPanel({ isCoWorker }) {
       }
       setGuildContextOptions(options);
       setGuildContext('system');
+      setBooting(false);
       return;
     }
     try {
@@ -92,78 +136,108 @@ function ConfigPanel({ isCoWorker }) {
 
         // Default to system context
         setGuildContext('system');
+        setBooting(false);
+        return;
       }
     } catch (err) {
       console.error('Failed to load guild context options:', err);
     }
+    // The guild ids are unknown: the system context still works.
+    setGuildContextOptions([{ value: 'system', label: 'System Config', guildId: null }]);
+    setGuildContext('system');
+    setBooting(false);
   }
 
-  async function loadConfigFiles() {
+  // Each load takes a stamp and lands only while it is the latest of its kind,
+  // so a late answer never replaces a newer one or lands under another file.
+  async function loadConfigFiles(ctx) {
+    const stamp = { ctx, seq: ++seqRef.current };
+    latestList.current = stamp;
+    setListing(true);
+    setListFailed(false);
+    // A failed list shows no file at all, so nothing stale stays on screen to save or delete.
+    const failed = message => {
+      setConfigFiles([]);
+      clearEditor();
+      setListFailed(true);
+      setError(message);
+    };
     try {
-      const currentContext = guildContextOptions.find(o => o.value === guildContext);
-      const guildId = currentContext?.guildId || null;
-
+      const guildId = guildIdOf(ctx);
       const res = await api.get(`/config/list${guildId ? `?guildId=${guildId}` : ''}`);
+      if (latestList.current !== stamp) return null;
       if (res.success) {
         setConfigFiles(res.files);
-        setError(null);
+        const selected = selRef.current.file;
+        if (!selected || !findFile(res.files, selected)) {
+          const first = res.files.find(f => f.category === selRef.current.type);
+          setSelectedFile(first ? configFileKey(first) : null);
+          if (!first) clearEditor();
+        }
+        setFilesStamp(stamp);
         return res.files;
-      } else {
-        setError(res.error || 'Failed to load config files');
       }
+      failed(res.error || 'Failed to load config files');
     } catch (err) {
-      setError(err.message);
+      if (latestList.current === stamp) failed(err.message);
+    } finally {
+      if (latestList.current === stamp) setListing(false);
     }
-    return [];
+    return null;
   }
 
-  async function loadConfig(fileId) {
-    // Guard against null/undefined fileId
-    if (!fileId) {
-      setConfig(null);
-      setConfigText('');
-      setLoading(false);
-      return;
-    }
-
+  async function loadConfig(fileKey) {
+    const guildId = guildIdOf(guildContext);
+    const stamp = { fileKey, guildId, ctx: guildContext, seq: ++seqRef.current };
+    latestLoad.current = stamp;
+    setLoaded(null);
+    setConfig(null);
+    setConfigText('');
+    setJsonError(null);
+    setLoadFailed(false);
+    setLoading(true);
     try {
-      setLoading(true);
-      const currentContext = guildContextOptions.find(o => o.value === guildContext);
-      const guildId = currentContext?.guildId || null;
-
-      const selectedInfo = configFiles.find(f => f.id === fileId);
+      const selectedInfo = findFile(configFiles, fileKey);
       const isDataFile = selectedInfo?.category === 'data';
 
       // Use different endpoint based on file type
       const endpoint = isDataFile
-        ? `/config/data/get?file=${encodeURIComponent(fileId)}${guildId ? `&guildId=${guildId}` : ''}`
-        : `/config/get?file=${encodeURIComponent(fileId)}${guildId ? `&guildId=${guildId}` : ''}`;
+        ? `/config/data/get?file=${encodeURIComponent(fileKey)}${guildId ? `&guildId=${guildId}` : ''}`
+        : `/config/get?file=${encodeURIComponent(fileKey)}${guildId ? `&guildId=${guildId}` : ''}`;
 
       const res = await api.get(endpoint);
+      if (latestLoad.current !== stamp) return;
 
       if (res.success) {
         const content = isDataFile ? res.data : res.config;
         setConfig(content);
         setConfigText(JSON.stringify(content, null, 2));
-        setInitialized(res.initialized !== false || res.exists !== false);
+        setInitialized(isDataFile ? res.exists !== false : res.initialized !== false);
         setInitMessage(res.message || '');
-        setError(null);
+        if (res.notice) showToast(res.notice, 'warning');
+        setLoaded(stamp);
       } else {
+        setLoadFailed(true);
         setError(res.error || 'Failed to load file');
       }
     } catch (err) {
+      if (latestLoad.current !== stamp) return;
+      setLoadFailed(true);
       setError(err.message);
     } finally {
-      setLoading(false);
+      if (latestLoad.current === stamp) setLoading(false);
     }
   }
 
-  async function loadBackups(fileId) {
+  async function loadBackups(fileKey) {
+    const guildId = guildIdOf(guildContext);
+    const stamp = { fileKey, guildId, seq: ++seqRef.current };
+    latestBackups.current = stamp;
+    setBackups([]);
     try {
-      const currentContext = guildContextOptions.find(o => o.value === guildContext);
-      const guildId = currentContext?.guildId || null;
-
-      const res = await api.get(`/config/backups?file=${encodeURIComponent(fileId)}${guildId ? `&guildId=${guildId}` : ''}`);
+      const category = findFile(configFiles, fileKey)?.category === 'data' ? 'data' : 'config';
+      const res = await api.get(`/config/backups?file=${encodeURIComponent(fileKey)}${guildId ? `&guildId=${guildId}` : ''}&category=${category}`);
+      if (latestBackups.current !== stamp) return;
       if (res.success) {
         setBackups(res.backups);
       }
@@ -184,9 +258,21 @@ function ConfigPanel({ isCoWorker }) {
     }
   }
 
+  // The loaded content's stamp when it belongs to the current selection, else null.
+  function stampForSelection() {
+    if (!loaded || loading || saving || listing) return null;
+    if (loaded.fileKey !== selectedFile || loaded.ctx !== guildContext || loaded.guildId !== guildIdOf(guildContext)) return null;
+    return loaded;
+  }
+
   async function handleSave() {
     if (jsonError) {
       setError('Cannot save: JSON is invalid');
+      return;
+    }
+    const stamp = stampForSelection();
+    if (!stamp) {
+      setError('Nothing was saved: the editor does not hold content loaded for this file and guild yet; wait for it to load, then save.');
       return;
     }
 
@@ -196,9 +282,8 @@ function ConfigPanel({ isCoWorker }) {
       setSuccess(null);
 
       const parsedConfig = JSON.parse(configText);
-      const selectedInfo = configFiles.find(f => f.id === selectedFile);
-      const currentContext = guildContextOptions.find(o => o.value === guildContext);
-      const guildId = currentContext?.guildId || null;
+      const selectedInfo = findFile(configFiles, stamp.fileKey);
+      const guildId = stamp.guildId;
       const isDataFile = selectedInfo?.category === 'data';
 
       // For config files with schemas, filter out defaults
@@ -224,8 +309,8 @@ function ConfigPanel({ isCoWorker }) {
       // Use different endpoint and payload based on file type
       const endpoint = isDataFile ? '/config/data/update' : '/config/update';
       const payload = isDataFile
-        ? { file: selectedFile, data: dataToSave, guildId }
-        : { file: selectedFile, config: dataToSave, guildId };
+        ? { file: stamp.fileKey, data: dataToSave, guildId }
+        : { file: stamp.fileKey, config: dataToSave, guildId };
 
       const res = await api.post(endpoint, payload);
 
@@ -238,16 +323,12 @@ function ConfigPanel({ isCoWorker }) {
         } else {
           message = 'Config saved successfully.';
         }
-        setSuccess(res.pending ? `${isDataFile ? 'Data file' : 'Config'} accepted: ${res.message}` : message + ' Backup created.');
-        setConfig(parsedConfig); // Keep full config in state
+        const backupNote = res.backupCreated ? ' Backup created.' : '';
+        setSuccess(res.pending ? `${isDataFile ? 'Data file' : 'Config'} accepted: ${res.message}${backupNote}` : message + backupNote);
         setInitialized(true);
         setInitMessage('');
-        await loadBackups(selectedFile);
-
-        // For module configs, reload to get merged config
-        if (!isDataFile && selectedInfo?.moduleName) {
-          await loadConfig(selectedFile);
-        }
+        // The list re-read reloads the file and its backups as the server now holds them.
+        await loadConfigFiles(stamp.ctx);
       } else {
         setError(res.error || 'Failed to save file');
       }
@@ -259,65 +340,59 @@ function ConfigPanel({ isCoWorker }) {
   }
 
   async function handleRestore(filename) {
+    const stamp = stampForSelection();
+    if (!stamp) {
+      setError('Nothing was restored: the file is not loaded for this guild yet; wait for it to load, then restore.');
+      return;
+    }
     if (!confirm(`Restore config from backup "${filename}"?`)) return;
 
     try {
-      setLoading(true);
+      setSaving(true);
       setError(null);
       setSuccess(null);
 
-      const currentContext = guildContextOptions.find(o => o.value === guildContext);
-      const guildId = currentContext?.guildId || null;
-
       const res = await api.post('/config/restore', {
-        file: selectedFile,
+        file: stamp.fileKey,
         filename,
-        guildId: guildId
+        guildId: stamp.guildId,
+        category: findFile(configFiles, stamp.fileKey)?.category === 'data' ? 'data' : 'config'
       });
 
       if (res.success) {
-        setSuccess('Config restored successfully');
-        await loadConfig(selectedFile);
-        await loadBackups(selectedFile);
+        const backupNote = res.backupCreated ? ' The replaced version was backed up.' : '';
+        setSuccess(res.pending ? `Restore accepted: ${res.message}${backupNote}` : `Config restored successfully.${backupNote}`);
+        await loadConfigFiles(stamp.ctx);
       } else {
         setError(res.error || 'Failed to restore config');
       }
     } catch (err) {
       setError(err.message);
     } finally {
-      setLoading(false);
+      setSaving(false);
     }
   }
 
   async function refreshAfterDelete() {
-    const files = await loadConfigFiles();
-    const stillListed = (files || []).some(f => f.id === selectedFile);
-    if (stillListed) {
-      await loadConfig(selectedFile);
-      await loadBackups(selectedFile);
-    } else {
-      const nextData = (files || []).find(f => f.category === 'data');
-      if (nextData) {
-        setSelectedFile(nextData.id);
-      } else {
-        setSelectedFile(null);
-        setConfig(null);
-        setConfigText('');
-      }
-    }
+    // A file no longer listed gives way to the first of its kind.
+    await loadConfigFiles(guildContext);
   }
 
   async function handleDeleteFile() {
-    const currentContext = guildContextOptions.find(o => o.value === guildContext);
-    const guildId = currentContext?.guildId || null;
-    if (!guildId || !selectedFile) return;
+    // Only the file and guild the editor loaded, as for a Save.
+    const stamp = stampForSelection();
+    if (!stamp || !stamp.guildId) {
+      setError('Nothing was deleted: the file is not loaded for this guild yet; wait for it to load, then delete.');
+      return;
+    }
+    const guildId = stamp.guildId;
 
-    const selectedInfo = configFiles.find(f => f.id === selectedFile);
-    if (!confirm(`Delete data file "${selectedInfo?.name || selectedFile}" for guild ${guildId}?`)) return;
+    const selectedInfo = findFile(configFiles, stamp.fileKey);
+    if (!confirm(`Delete data file "${selectedInfo?.name || stamp.fileKey}" for guild ${guildId}?`)) return;
 
     try {
       setSaving(true);
-      const res = await api.post('/config/data/delete', { file: selectedFile, guildId });
+      const res = await api.post('/config/data/delete', { file: stamp.fileKey, guildId });
       if (res.success) {
         setSuccess(res.pending ? `Delete accepted: ${res.message}` : 'Data file deleted');
         await refreshAfterDelete();
@@ -354,11 +429,14 @@ function ConfigPanel({ isCoWorker }) {
     }
   }
 
-  if (loading && !config) {
+  if (booting) {
     return <FirstLoadPlaceholder label="Loading config…" />;
   }
 
-  const selectedFileInfo = configFiles.find(f => f.id === selectedFile);
+  const busy = loading || saving || listing;
+  const selectedFileInfo = findFile(configFiles, selectedFile);
+  // Backups and Restore only for a file whose content loaded for this selection.
+  const showBackups = !loadFailed && !!loaded && loaded.fileKey === selectedFile && loaded.ctx === guildContext;
   const readOnlyContext = !!isCoWorker && guildContext === 'system';
   const currentGuildId = guildContextOptions.find(o => o.value === guildContext)?.guildId || null;
 
@@ -409,6 +487,7 @@ function ConfigPanel({ isCoWorker }) {
             <select
               value={guildContext}
               onChange={e => setGuildContext(e.target.value)}
+              disabled={busy}
               style={{
                 width: '100%',
                 padding: '10px',
@@ -433,16 +512,17 @@ function ConfigPanel({ isCoWorker }) {
         <div className="tabs" style={{ marginBottom: '10px' }}>
           <button
             className={`tab ${selectedFileType === 'config' ? 'active' : ''}`}
+            disabled={busy}
             onClick={() => {
               setSelectedFileType('config');
               const configFile = configFiles.find(f => f.category === 'config');
               if (configFile) {
-                setSelectedFile(configFile.id);
+                setSelectedFile(configFileKey(configFile));
               } else {
                 setSelectedFile(null);
-                setConfig(null);
-                setConfigText('');
-                setError('No config files available for this context');
+                clearEditor();
+                // A list that failed to load says so below; it never says the context has no files.
+                if (!listFailed) setError('No config files available for this context');
               }
             }}
           >
@@ -450,16 +530,16 @@ function ConfigPanel({ isCoWorker }) {
           </button>
           <button
             className={`tab ${selectedFileType === 'data' ? 'active' : ''}`}
+            disabled={busy}
             onClick={() => {
               setSelectedFileType('data');
               const dataFile = configFiles.find(f => f.category === 'data');
               if (dataFile) {
-                setSelectedFile(dataFile.id);
+                setSelectedFile(configFileKey(dataFile));
               } else {
                 setSelectedFile(null);
-                setConfig(null);
-                setConfigText('');
-                setError('No data files available for this context');
+                clearEditor();
+                if (!listFailed) setError('No data files available for this context');
               }
             }}
           >
@@ -471,8 +551,9 @@ function ConfigPanel({ isCoWorker }) {
         <div className="form-group" style={{marginBottom: '20px'}}>
           <label>{selectedFileType === 'config' ? 'Config Files' : 'Data Files'}</label>
           <select
-            value={selectedFile}
+            value={selectedFile || ''}
             onChange={e => setSelectedFile(e.target.value)}
+            disabled={busy}
             style={{
               width: '100%',
               padding: '10px',
@@ -485,11 +566,26 @@ function ConfigPanel({ isCoWorker }) {
             }}
           >
             {configFiles.filter(f => f.category === selectedFileType).map(file => (
-              <option key={file.id} value={file.id}>
+              <option key={configFileKey(file)} value={configFileKey(file)}>
                 {file.name} {file.exists ? '✓' : '✗'}
               </option>
             ))}
           </select>
+          {listFailed && (
+            <small style={{color: '#F04747', display: 'block', marginTop: '5px'}}>
+              The file list for this context could not be loaded, so no file is shown for it.
+            </small>
+          )}
+          {listFailed && (
+            <button
+              onClick={() => loadConfigFiles(guildContext)}
+              className="btn btn-primary"
+              style={{marginTop: '8px'}}
+              disabled={busy}
+            >
+              Load the file list again
+            </button>
+          )}
         </div>
 
         {selectedFileInfo && (
@@ -591,17 +687,17 @@ function ConfigPanel({ isCoWorker }) {
             <button
               onClick={handleSave}
               className="btn btn-primary"
-              disabled={saving || !!jsonError}
-              style={disabledButtonStyle(saving || !!jsonError)}
+              disabled={busy || !!jsonError || !showBackups}
+              style={disabledButtonStyle(busy || !!jsonError || !showBackups)}
             >
               {saving ? 'Saving…' : '💾 Save Config'}
             </button>
-            {currentGuildId && selectedFileInfo?.category === 'data' && selectedFileInfo?.exists && (
+            {currentGuildId && showBackups && selectedFileInfo?.category === 'data' && selectedFileInfo?.exists && (
               <button
                 onClick={handleDeleteFile}
                 className="btn btn-danger"
-                disabled={saving}
-                style={disabledButtonStyle(saving)}
+                disabled={busy}
+                style={disabledButtonStyle(busy)}
               >
                 🗑️ Delete File
               </button>
@@ -614,8 +710,8 @@ function ConfigPanel({ isCoWorker }) {
             <button
               onClick={handleDeleteGuildData}
               className="btn btn-danger"
-              disabled={saving}
-              style={disabledButtonStyle(saving)}
+              disabled={busy}
+              style={disabledButtonStyle(busy)}
             >
               🗑️ Delete all data for this guild
             </button>
@@ -633,7 +729,9 @@ function ConfigPanel({ isCoWorker }) {
           Backups are created automatically when saving. Last 10 backups are kept.
         </p>
 
-        {backups.length === 0 ? (
+        {!showBackups ? (
+          <div style={{color: '#999', fontSize: '0.9rem'}}>{busy ? 'Loading…' : 'Backups show once the file has loaded.'}</div>
+        ) : backups.length === 0 ? (
           <div style={{color: '#999', fontSize: '0.9rem'}}>No backups available</div>
         ) : (
           <div style={{display: 'flex', flexDirection: 'column', gap: '8px'}}>
@@ -651,16 +749,25 @@ function ConfigPanel({ isCoWorker }) {
                   <div style={{color: '#e0e0e0', fontSize: '0.9rem'}}>{backup.filename}</div>
                   <div style={{color: '#999', fontSize: '0.8rem'}}>
                     {new Date(backup.timestamp).toLocaleString()} • {(backup.size / 1024).toFixed(1)} KB
+                    {backup.beforeRestore ? ' • saved before a restore' : ''}
+                    {backup.damaged ? ' • damaged (not valid JSON), cannot be restored' : ''}
+                    {backup.unreadable ? ' • could not be read just now, so it was not checked' : ''}
+                    {backup.legacy ? ' • older backup, kept outside the last-10 rotation' : ''}
+                    {backup.shared ? (backup.unchecked
+                      ? ' • named by the file name alone, and which file it belongs to cannot be checked here, so it cannot be restored here'
+                      : ' • named by the file name alone, which another file also has, so it cannot be restored here') : ''}
                   </div>
                 </div>
-                <button
-                  onClick={() => handleRestore(backup.filename)}
-                  className="btn btn-warning"
-                  style={{marginRight: 0}}
-                  disabled={loading}
-                >
-                  Restore
-                </button>
+                {!backup.damaged && !backup.shared && (
+                  <button
+                    onClick={() => handleRestore(backup.filename)}
+                    className="btn btn-warning"
+                    style={{marginRight: 0}}
+                    disabled={busy}
+                  >
+                    Restore
+                  </button>
+                )}
               </div>
             ))}
           </div>

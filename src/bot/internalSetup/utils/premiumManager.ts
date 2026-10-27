@@ -883,14 +883,14 @@ export class PremiumManager {
    * the new model. Used by the Premium Tiers Web UI so the Free tier
    * editor sees the host's baseline values + caps + flags.
    */
-  getAllTiersWithEffectiveFree(): Record<string, PremiumTier> {
+  getAllTiersWithEffectiveFree(load?: (moduleName: string) => GlobalModuleConfig): Record<string, PremiumTier> {
     this.ensureLoaded();
     const tiers: Record<string, PremiumTier> = {};
     for (const [id, t] of Object.entries(this.config.tiers)) {
       tiers[id] = { ...t, overrides: { ...t.overrides } };
     }
     if (tiers.free) {
-      tiers.free = { ...tiers.free, overrides: this.getEffectiveFreeOverrides() };
+      tiers.free = { ...tiers.free, overrides: this.getEffectiveFreeOverrides(load) };
     }
     return tiers;
   }
@@ -903,7 +903,7 @@ export class PremiumManager {
    * matches what `tiers.free.overrides` looked like in the pre-unification
    * model, so the Web Tier UI can keep treating it uniformly.
    */
-  getEffectiveFreeOverrides(): Record<string, Record<string, any>> {
+  getEffectiveFreeOverrides(load: (moduleName: string) => GlobalModuleConfig = loadGlobalModuleConfig): Record<string, Record<string, any>> {
     let modules: Array<{ name: string }> = [];
     try {
       const { getModulesWithSettings } = require('./settings/settingsDiscovery') as typeof import('./settings/settingsDiscovery');
@@ -913,7 +913,7 @@ export class PremiumManager {
     }
     const result: Record<string, Record<string, any>> = {};
     for (const { name } of modules) {
-      const cfg = loadGlobalModuleConfig(name);
+      const cfg = load(name);
       const overrides = freeBaselineFromGlobal(cfg);
       if (Object.keys(overrides).length > 0) {
         result[name] = overrides;
@@ -984,9 +984,9 @@ export class PremiumManager {
    * and re-pruned against the new baseline (mirrors what the old
    * Free-tier path of setTier did, but scoped to the touched module).
    */
-  setGlobalModuleConfig(moduleName: string, partial: Partial<GlobalModuleConfig>): boolean {
+  setGlobalModuleConfig(moduleName: string, partial: Partial<GlobalModuleConfig>, base?: Record<string, any>): boolean {
     this.ensureLoaded();
-    const ok = saveGlobalModuleConfig(moduleName, partial);
+    const ok = saveGlobalModuleConfig(moduleName, partial, base);
     if (!ok) return false;
 
     // Re-sanitize + re-prune every paid tier's entry for this module against

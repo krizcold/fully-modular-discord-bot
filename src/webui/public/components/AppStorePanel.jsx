@@ -44,7 +44,8 @@ function AppStorePanel() {
   const [selectedModule, setSelectedModule] = useState(null);
   const [loading, setLoading] = useState(true);
   const [categoryFilter, setCategoryFilter] = useState('all');
-  const [installJobs, setInstallJobs] = useState({}); // moduleName -> job
+  const [installJobs, setInstallJobs] = useState({}); // job id -> job
+  const [, setOwnJobTick] = useState(0);
   const hasLoadedOnce = useRef(false);
 
   useEffect(() => {
@@ -79,10 +80,10 @@ function AppStorePanel() {
   }, []);
 
   useEffect(() => {
-    const onPending = job => setInstallJobs(prev => ({ ...prev, [job.moduleName]: job }));
-    const onRemove = job => setInstallJobs(prev => { const n = { ...prev }; delete n[job.moduleName]; return n; });
+    const onPending = job => setInstallJobs(prev => appStoreApplyJobEvent(prev, 'pending', job));
+    const onRemove = job => setInstallJobs(prev => appStoreApplyJobEvent(prev, 'remove', job));
     const onCompleted = job => {
-      setInstallJobs(prev => { const n = { ...prev }; delete n[job.moduleName]; return n; });
+      setInstallJobs(prev => appStoreApplyJobEvent(prev, 'completed', job));
       loadData();
       if (job.kind === 'install') {
         if (job.skipped) return;
@@ -98,7 +99,7 @@ function AppStorePanel() {
       }
     };
     const onFailed = job => {
-      setInstallJobs(prev => ({ ...prev, [job.moduleName]: job }));
+      setInstallJobs(prev => appStoreApplyJobEvent(prev, 'failed', job));
       const label = job.kind === 'install' ? 'Install' : 'Uninstall';
       showToast(`${label} failed for ${job.moduleName}: ${job.error || 'unknown error'}`, 'error');
     };
@@ -136,14 +137,7 @@ function AppStorePanel() {
       // Hydrate queue only on first load. WS events are authoritative after that;
       // overwriting with a stale HTTP snapshot would race-flip job states.
       if (!hasLoadedOnce.current) {
-        const queue = Array.isArray(res.installQueue) ? res.installQueue : [];
-        const jobMap = {};
-        for (const j of queue) {
-          if (j.status === 'queued' || j.status === 'running' || j.status === 'failed') {
-            jobMap[j.moduleName] = j;
-          }
-        }
-        setInstallJobs(jobMap);
+        setInstallJobs(appStoreJobsFromQueue(Array.isArray(res.installQueue) ? res.installQueue : []));
       }
     } catch (err) {
       setError(err.message);
@@ -155,6 +149,10 @@ function AppStorePanel() {
 
   function showSuccess(message) {
     showToast(message, 'success');
+  }
+  function noteOwnJob(id) {
+    appStoreOwnJobIds.add(id);
+    setOwnJobTick(t => t + 1);
   }
   function setError(message) {
     if (message) showToast(message, 'error');
@@ -223,7 +221,9 @@ function AppStorePanel() {
         <ModuleDetailView
           module={selectedModule}
           installed={installed[selectedModule.name]}
-          installJob={installJobs[selectedModule.name]}
+          jobs={appStoreModuleJobs(installJobs, selectedModule.name)}
+          ownJobIds={appStoreOwnJobIds}
+          onJobQueued={noteOwnJob}
           onBack={() => { setView('modules'); setSelectedModule(null); }}
           onInstall={() => { loadData(); }}
           onUninstall={loadData}
@@ -239,6 +239,8 @@ function AppStorePanel() {
           modules={filteredModules}
           installed={installed}
           installJobs={installJobs}
+          ownJobIds={appStoreOwnJobIds}
+          onJobQueued={noteOwnJob}
           categories={categories}
           categoryFilter={categoryFilter}
           onCategoryChange={setCategoryFilter}
@@ -282,7 +284,7 @@ function AppStorePanel() {
 }
 
 // Modules View Component
-function ModulesView({ modules, installed, installJobs, categories, categoryFilter, onCategoryChange, onSelectModule, onModuleChanged, repositories, tiers }) {
+function ModulesView({ modules, installed, installJobs, ownJobIds, onJobQueued, categories, categoryFilter, onCategoryChange, onSelectModule, onModuleChanged, repositories, tiers }) {
   const installedCount = Object.keys(installed).length;
   const [autoCleanup, setAutoCleanup] = useState(false);
   const [autoUpdate, setAutoUpdate] = useState(false);
@@ -520,7 +522,9 @@ function ModulesView({ modules, installed, installJobs, categories, categoryFilt
               module={module}
               installed={!!installed[module.name]}
               installedEntry={installed[module.name] || null}
-              installJob={installJobs?.[module.name] || null}
+              jobs={appStoreModuleJobs(installJobs, module.name)}
+              ownJobIds={ownJobIds}
+              onJobQueued={onJobQueued}
               updateInfo={moduleUpdates?.[module.name] || null}
               onClick={() => onSelectModule(module)}
               onInstall={onModuleChanged}
@@ -700,10 +704,63 @@ function CommandsView({ showSuccess, setError }) {
   );
 }
 
-function ModuleCard({ module, installed, installedEntry, installJob, updateInfo, onClick, onInstall, onUninstall, onUpdate, updating, tiers }) {
+// Install and uninstall jobs this page queued; a failed uninstall started anywhere else gets no one-click Retry.
+const appStoreOwnJobIds = new Set();
+
+// A module can hold several jobs at once (an install running, an uninstall queued behind it), so jobs are keyed by
+// id and an event touches only its own job. A newly queued job supersedes the module's failed ones.
+function appStoreApplyJobEvent(jobs, event, job) {
+  const next = { ...jobs };
+  if (event === 'pending') {
+    for (const [id, j] of Object.entries(next)) {
+      if (j.moduleName === job.moduleName && j.status === 'failed') delete next[id];
+    }
+    next[job.id] = job;
+  } else if (event === 'failed') {
+    next[job.id] = job;
+  } else {
+    delete next[job.id];
+  }
+  return next;
+}
+
+function appStoreJobsFromQueue(queue) {
+  let jobs = {};
+  for (const j of queue) {
+    jobs = appStoreApplyJobEvent(jobs, 'pending', j);
+    if (j.status !== 'queued' && j.status !== 'running' && j.status !== 'failed') jobs = appStoreApplyJobEvent(jobs, 'remove', j);
+  }
+  return jobs;
+}
+
+function appStoreModuleJobs(jobs, moduleName) {
+  return Object.values(jobs || {}).filter(j => j.moduleName === moduleName).sort((a, b) => a.enqueuedAt - b.enqueuedAt);
+}
+
+function appStoreCurrentJob(moduleJobs) {
+  return moduleJobs.find(j => j.status === 'running')
+    || moduleJobs.find(j => j.status === 'queued')
+    || moduleJobs.filter(j => j.status === 'failed').pop()
+    || null;
+}
+
+// The server cancels the newest queued job of a kind, so only that job can offer Cancel.
+function appStoreCancellable(moduleJobs, job) {
+  if (job?.status !== 'queued') return false;
+  return !moduleJobs.some(j => j.status === 'queued' && j.kind === job.kind && j.enqueuedAt > job.enqueuedAt);
+}
+
+function confirmModuleUninstall(module) {
+  return confirm(`Uninstall ${module.displayName || module.name}? This removes the module's files, its saved credentials and its component settings.`);
+}
+
+function ModuleCard({ module, installed, installedEntry, jobs = [], ownJobIds, onJobQueued, updateInfo, onClick, onInstall, onUninstall, onUpdate, updating, tiers }) {
   const hasUpdate = !!updateInfo;
+  const installJob = appStoreCurrentJob(jobs);
+  const waitingJobs = jobs.filter(j => j !== installJob && j.status === 'queued');
   const jobKind = installJob?.kind || null;
   const jobStatus = installJob?.status || null;
+  const failedElsewhere = jobStatus === 'failed' && jobKind === 'uninstall' && !ownJobIds?.has(installJob.id);
   const needsRestart = installed && installedEntry && installedEntry.loaded === false;
   const borderColor = hasUpdate ? '#e67e22' : needsRestart ? '#f5af19' : installed ? '#3ba55d' : jobStatus === 'running' ? '#5865F2' : jobStatus === 'queued' ? '#888' : jobStatus === 'failed' ? '#ed4245' : '#444';
 
@@ -725,7 +782,8 @@ function ModuleCard({ module, installed, installedEntry, installJob, updateInfo,
   async function handleInstall(e) {
     e.stopPropagation();
     try {
-      await api.post(`/appstore/modules/${module.name}/install`, { repoId: module.repoId });
+      const res = await api.post(`/appstore/modules/${module.name}/install`, { repoId: module.repoId });
+      if (res?.jobId) onJobQueued?.(res.jobId);
     } catch (err) {
       showToast(err.message || 'Install request failed', 'error');
     }
@@ -733,16 +791,17 @@ function ModuleCard({ module, installed, installedEntry, installJob, updateInfo,
 
   async function handleUninstall(e) {
     e.stopPropagation();
+    if (!confirmModuleUninstall(module)) return;
     try {
-      await api.delete(`/appstore/modules/${module.name}`);
+      const res = await api.delete(`/appstore/modules/${module.name}`);
+      if (res?.jobId) onJobQueued?.(res.jobId);
     } catch (err) {
       showToast(err.message || 'Uninstall request failed', 'error');
     }
   }
 
-  async function handleCancel(e) {
+  async function handleCancel(e, kind = jobKind || 'install') {
     e.stopPropagation();
-    const kind = jobKind || 'install';
     try {
       await api.delete(`/appstore/modules/${module.name}/${kind}`);
     } catch (err) {
@@ -797,7 +856,20 @@ function ModuleCard({ module, installed, installedEntry, installJob, updateInfo,
             )}
           </div>
         </div>
-        <div style={{ display: 'flex', gap: '5px', alignItems: 'center' }}>
+        <div style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'flex-end', gap: '5px', alignItems: 'center' }}>
+          {failedElsewhere && (
+            <span
+              title={installJob?.error || 'Uninstall failed'}
+              style={{
+                background: 'rgba(237, 66, 69, 0.15)',
+                color: '#ed4245',
+                border: '1px solid rgba(237, 66, 69, 0.3)',
+                padding: '3px 8px',
+                borderRadius: '4px',
+                fontSize: '0.7rem'
+              }}
+            >Uninstall failed (started elsewhere)</span>
+          )}
           {installJob && jobStatus === 'queued' ? (
             <>
               <span style={{
@@ -808,7 +880,7 @@ function ModuleCard({ module, installed, installedEntry, installJob, updateInfo,
                 borderRadius: '4px',
                 fontSize: '0.7rem'
               }}>Queued</span>
-              <button
+              {appStoreCancellable(jobs, installJob) && <button
                 onClick={handleCancel}
                 style={{
                   background: 'rgba(248, 113, 113, 0.15)',
@@ -819,7 +891,7 @@ function ModuleCard({ module, installed, installedEntry, installJob, updateInfo,
                   fontSize: '0.7rem',
                   cursor: 'pointer'
                 }}
-              >Cancel</button>
+              >Cancel</button>}
             </>
           ) : installJob && jobStatus === 'running' ? (
             <span style={{
@@ -830,7 +902,7 @@ function ModuleCard({ module, installed, installedEntry, installJob, updateInfo,
               borderRadius: '4px',
               fontSize: '0.7rem'
             }}>{jobKind === 'uninstall' ? 'Uninstalling...' : 'Installing...'}</span>
-          ) : installJob && jobStatus === 'failed' ? (
+          ) : installJob && jobStatus === 'failed' && !failedElsewhere ? (
             <button
               onClick={jobKind === 'uninstall' ? handleUninstall : handleInstall}
               title={installJob?.error || (jobKind === 'uninstall' ? 'Uninstall failed' : 'Install failed')}
@@ -843,7 +915,7 @@ function ModuleCard({ module, installed, installedEntry, installJob, updateInfo,
                 fontSize: '0.7rem',
                 cursor: 'pointer'
               }}
-            >Retry</button>
+            >{jobKind === 'uninstall' ? 'Retry uninstall' : 'Retry install'}</button>
           ) : installed ? (
             <>
               {hasUpdate ? (
@@ -918,6 +990,30 @@ function ModuleCard({ module, installed, installedEntry, installJob, updateInfo,
               }}
             >Install</button>
           )}
+          {waitingJobs.map(j => (
+            <React.Fragment key={j.id}>
+              <span style={{
+                background: 'rgba(136, 136, 136, 0.15)',
+                color: '#aaa',
+                border: '1px solid rgba(136, 136, 136, 0.3)',
+                padding: '3px 8px',
+                borderRadius: '4px',
+                fontSize: '0.7rem'
+              }}>{`then ${j.kind} queued`}</span>
+              {appStoreCancellable(jobs, j) && <button
+                onClick={(e) => handleCancel(e, j.kind)}
+                style={{
+                  background: 'rgba(248, 113, 113, 0.15)',
+                  color: '#f87171',
+                  border: '1px solid rgba(248, 113, 113, 0.3)',
+                  padding: '3px 8px',
+                  borderRadius: '4px',
+                  fontSize: '0.7rem',
+                  cursor: 'pointer'
+                }}
+              >Cancel</button>}
+            </React.Fragment>
+          ))}
         </div>
       </div>
 
@@ -941,13 +1037,16 @@ function ModuleCard({ module, installed, installedEntry, installJob, updateInfo,
 }
 
 // Module Detail View Component
-function ModuleDetailView({ module, installed, installJob, onBack, onInstall, onUninstall, onSaveCredentials, showSuccess, setError }) {
+function ModuleDetailView({ module, installed, jobs = [], ownJobIds, onJobQueued, onBack, onInstall, onUninstall, onSaveCredentials, showSuccess, setError }) {
   const [installing, setInstalling] = useState(false);
   const [showCredentialsForm, setShowCredentialsForm] = useState(false);
   const [credentials, setCredentials] = useState({});
   const [components, setComponents] = useState(null);
+  const installJob = appStoreCurrentJob(jobs);
+  const waitingJobs = jobs.filter(j => j !== installJob && j.status === 'queued');
   const jobKind = installJob?.kind || null;
   const jobStatus = installJob?.status || null;
+  const failedElsewhere = jobStatus === 'failed' && jobKind === 'uninstall' && !ownJobIds?.has(installJob.id);
 
   // Fetch detailed module info (with components) on mount
   useEffect(() => {
@@ -964,6 +1063,7 @@ function ModuleDetailView({ module, installed, installJob, onBack, onInstall, on
     try {
       setError(null);
       const res = await api.post(`/appstore/modules/${module.name}/install`, { repoId: module.repoId });
+      if (res?.jobId) onJobQueued?.(res.jobId);
       if (res.success) {
         showSuccess(`${module.displayName || module.name} queued for install.`);
       }
@@ -972,8 +1072,7 @@ function ModuleDetailView({ module, installed, installJob, onBack, onInstall, on
     }
   }
 
-  async function handleCancel() {
-    const kind = jobKind || 'install';
+  async function handleCancel(kind = jobKind || 'install') {
     try {
       setError(null);
       await api.delete(`/appstore/modules/${module.name}/${kind}`);
@@ -983,10 +1082,11 @@ function ModuleDetailView({ module, installed, installJob, onBack, onInstall, on
   }
 
   async function handleUninstall() {
-    if (!confirm(`Uninstall ${module.displayName || module.name}? This will remove all module files.`)) return;
+    if (!confirmModuleUninstall(module)) return;
     try {
       setError(null);
       const res = await api.delete(`/appstore/modules/${module.name}`);
+      if (res?.jobId) onJobQueued?.(res.jobId);
       if (res.success) {
         showSuccess(`${module.displayName || module.name} queued for uninstall.`);
       }
@@ -1102,24 +1202,31 @@ function ModuleDetailView({ module, installed, installJob, onBack, onInstall, on
 
         {/* Action Buttons */}
         <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
+          {failedElsewhere && (
+            <span className="button" title={installJob?.error || 'Uninstall failed'} style={{ background: '#555', border: 'none', padding: '12px 25px', cursor: 'default' }}>
+              Uninstall failed (started elsewhere)
+            </span>
+          )}
           {installJob && jobStatus === 'queued' ? (
             <>
               <span className="button" style={{ background: '#555', border: 'none', padding: '12px 25px', cursor: 'default' }}>
                 Queued
               </span>
-              <button
-                className="button"
-                onClick={handleCancel}
-                style={{ background: '#ed4245', border: 'none', padding: '12px 25px' }}
-              >
-                Cancel
-              </button>
+              {appStoreCancellable(jobs, installJob) && (
+                <button
+                  className="button"
+                  onClick={() => handleCancel()}
+                  style={{ background: '#ed4245', border: 'none', padding: '12px 25px' }}
+                >
+                  Cancel
+                </button>
+              )}
             </>
           ) : installJob && jobStatus === 'running' ? (
             <span className="button" style={{ background: jobKind === 'uninstall' ? '#ed4245' : '#5865F2', border: 'none', padding: '12px 25px', cursor: 'default' }}>
               {jobKind === 'uninstall' ? 'Uninstalling...' : 'Installing...'}
             </span>
-          ) : installJob && jobStatus === 'failed' ? (
+          ) : installJob && jobStatus === 'failed' && !failedElsewhere ? (
             <button
               className="button primary"
               onClick={jobKind === 'uninstall' ? handleUninstall : handleInstall}
@@ -1164,6 +1271,22 @@ function ModuleDetailView({ module, installed, installJob, onBack, onInstall, on
               Install Module
             </button>
           )}
+          {waitingJobs.map(j => (
+            <React.Fragment key={j.id}>
+              <span className="button" style={{ background: '#555', border: 'none', padding: '12px 25px', cursor: 'default' }}>
+                {`then ${j.kind} queued`}
+              </span>
+              {appStoreCancellable(jobs, j) && (
+                <button
+                  className="button"
+                  onClick={() => handleCancel(j.kind)}
+                  style={{ background: '#ed4245', border: 'none', padding: '12px 25px' }}
+                >
+                  Cancel
+                </button>
+              )}
+            </React.Fragment>
+          ))}
         </div>
 
         {/* Credentials Form */}

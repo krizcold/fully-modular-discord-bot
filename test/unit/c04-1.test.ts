@@ -19,6 +19,7 @@ vi.mock('../../src/bot/internalSetup/utils/dataBackends/workingSet', async (orig
     },
     exists: (g: string, m: string, f: string) => h.docs.has(key(g, m, f)),
     save: (g: string, m: string, f: string, c: string) => { h.docs.set(key(g, m, f), c); return 'accepted'; },
+    ticketFor: (g: string): any => ({ kind: 'ws', manager: fake, set: {}, guildId: g, seq: 0 }),
   };
   return { ...real, getWorkingSet: () => (h.pgGuilds.size ? fake : real.getWorkingSet()) };
 });
@@ -135,7 +136,7 @@ describe('C04-1 an open whose record was not saved is not left posted', () => {
     const channel = {
       send: async () => sent,
       isTextBased: () => true,
-      messages: { fetch: async (id: string) => ({ delete: async () => { deleted.push(id); } }) },
+      messages: { delete: async (id: string) => { deleted.push(id); } },
     };
     const context: any = {
       guildId: 'g-open', userId: 'u1',
@@ -163,7 +164,7 @@ describe('C04-1 an open whose record was not saved is not left posted', () => {
     const channel = {
       send: async () => sent,
       isTextBased: () => true,
-      messages: { fetch: async () => ({ delete: async () => { throw Object.assign(new Error('rate limited'), { code: 0 }); } }) },
+      messages: { delete: async () => { throw Object.assign(new Error('rate limited'), { code: 0 }); } },
     };
     const context: any = {
       guildId: 'g-open2', userId: 'u1',

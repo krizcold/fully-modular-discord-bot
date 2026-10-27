@@ -132,7 +132,7 @@ function OAuthCredentialsSection({ credentials, onChange, instructions, onGenera
                 type="password"
                 value={credentials.DISCORD_CLIENT_SECRET || ''}
                 onChange={e => onChange('DISCORD_CLIENT_SECRET', e.target.value)}
-                placeholder="AbCdEf123456_XXXXXXXXXXXXX"
+                placeholder={secretPlaceholder(credStatus.DISCORD_CLIENT_SECRET?.set, 'AbCdEf123456_XXXXXXXXXXXXX')}
               />
               <small>OAuth application secret (keep this secure!)</small>
             </div>
@@ -172,7 +172,7 @@ function OAuthCredentialsSection({ credentials, onChange, instructions, onGenera
                   type="text"
                   value={credentials.SESSION_SECRET || ''}
                   onChange={e => onChange('SESSION_SECRET', e.target.value)}
-                  placeholder="Generate or enter a secure random string"
+                  placeholder={secretPlaceholder(credStatus.SESSION_SECRET?.set, 'Generate or enter a secure random string')}
                     style={{flex: 1}}
                 />
                 <button

@@ -6,6 +6,7 @@ import { DiscordUser } from './oauthConfig';
 import { getUserAdminGuilds, hasSystemAccess } from './permissionChecker';
 import { clearUserCache } from './guildPermissionRefresher';
 import { fireAccessLog } from '../utils/accessLog';
+import { sessionSaveOutcome } from './fileSessionStore';
 
 const router = Router();
 
@@ -60,29 +61,33 @@ router.get('/logout', (req: Request, res: Response) => {
   // Get user ID before logout
   const userId = req.user ? (req.user as DiscordUser).id : null;
 
+  const oldSession = req.session;
+
+  // passport saves the session without the user, then regenerates (deleting the old file): the save decides.
   req.logout((err) => {
-    if (err) {
-      console.error('[OAuth] Logout error:', err);
+    const saved = oldSession ? sessionSaveOutcome(oldSession) : undefined;
+    if (err) console.error('[OAuth] Logout error:', err);
+
+    if (saved === 'refused' || (saved === undefined && err)) {
       return res.status(500).json({
         success: false,
         error: 'Failed to logout'
       });
     }
+    if (saved === 'pending') {
+      return res.status(202).json({
+        success: false,
+        error: 'Logout could not be confirmed'
+      });
+    }
 
-    // Clear permission cache for this user
     if (userId) {
       clearUserCache(userId);
     }
-
-    req.session.destroy((err) => {
-      if (err) {
-        console.error('[OAuth] Session destroy error:', err);
-      }
-
-      res.json({
-        success: true,
-        message: 'Logged out successfully'
-      });
+    res.clearCookie('smdb.sid');
+    res.json({
+      success: true,
+      message: 'Logged out successfully'
     });
   });
 });

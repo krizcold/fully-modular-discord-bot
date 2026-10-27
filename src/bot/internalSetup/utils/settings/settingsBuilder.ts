@@ -360,12 +360,17 @@ export function buildSelectEditModal(
   return modal;
 }
 
+function storedIds(value: any): string[] {
+  const ids = Array.isArray(value) ? value : [value];
+  return ids.filter((id): id is string => typeof id === 'string' && id !== '');
+}
+
 /**
  * Build a channel edit modal for channel/multiChannel types
  */
 export function buildChannelEditModal(
   panelId: string, settingKey: string, moduleName: string, category: string,
-  definition: SettingDefinition
+  definition: SettingDefinition, currentValue: any
 ): ModalBuilder {
   const isMulti = definition.type === 'multiChannel';
   const channelTypes = definition.channelTypes || [ChannelType.GuildText];
@@ -382,6 +387,8 @@ export function buildChannelEditModal(
   if (isMulti) {
     selectMenu.setMinValues(0).setMaxValues(25);
   }
+  const stored = storedIds(currentValue);
+  if (stored.length > 0) selectMenu.setDefaultChannels(stored);
 
   const selectLabel = new LabelBuilder()
     .setLabel(definition.label)
@@ -398,7 +405,7 @@ export function buildChannelEditModal(
  */
 export function buildRoleEditModal(
   panelId: string, settingKey: string, moduleName: string, category: string,
-  definition: SettingDefinition
+  definition: SettingDefinition, currentValue: any
 ): ModalBuilder {
   const isMulti = definition.type === 'multiRole';
 
@@ -413,6 +420,8 @@ export function buildRoleEditModal(
   if (isMulti) {
     selectMenu.setMinValues(0).setMaxValues(25);
   }
+  const stored = storedIds(currentValue);
+  if (stored.length > 0) selectMenu.setDefaultRoles(stored);
 
   const selectLabel = new LabelBuilder()
     .setLabel(definition.label)

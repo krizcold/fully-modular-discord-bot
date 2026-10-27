@@ -549,8 +549,12 @@ export interface MirrorReport {
   sourceNodeId: string | null;
   sourceNodeName: string | null;
   sourceTerm: number | null;
+  /** Guilds the copy holds now whose last pass completed, and their bytes. */
   guildCount: number;
   totalBytes: number;
+  /** Guilds the copy holds now mid-pass, their files mixing two points in time. */
+  partialCount?: number;
+  partialBytes?: number;
   frozenCount: number;
   error?: string;
 }
@@ -901,7 +905,13 @@ export interface DataReadReply {
   contentJson?: string;
   /** Listing when no filename was requested. */
   files?: string[];
-  code?: 'frozen' | 'not-owner' | 'shard-unassigned' | 'owner-disconnected' | 'owner-no-answer' | 'owner-unreachable' | 'stale-term' | 'backend-unavailable' | 'bot-down' | 'invalid' | 'io-error';
+  /** A file-routed doc: the answering process still holds a queued write of it; failing: that write's last flush failed. */
+  pending?: boolean;
+  failing?: boolean;
+  /** unreadable: the file exists and could not be read (error holds the errno code). no-answer (web UI side): the child never answered. */
+  code?: 'frozen' | 'not-owner' | 'shard-unassigned' | 'owner-disconnected' | 'owner-no-answer' | 'owner-unreachable' | 'stale-term' | 'backend-unavailable' | 'bot-down' | 'invalid' | 'io-error' | 'unreadable' | 'no-answer';
+  /** no-answer only: the read timed out, the child stopped before answering, or the message could not be sent. */
+  cause?: 'timeout' | 'stopped' | 'failed';
   error?: string;
 }
 

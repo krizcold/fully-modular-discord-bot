@@ -2,6 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { dataPath } from '../../../utils/dataRoot';
 import { dataExists, listGuildDataKeys } from './dataManager';
+import { getPending } from './dataBackends/fileBackend';
 import type { ModuleConfigSchema, DataFileMetadata, DataFileSchema } from '../../types/moduleTypes';
 
 // Detect production environment
@@ -30,6 +31,31 @@ export interface ConfigFileMetadata {
 const GLOBAL_SCAN_EXCLUDES = new Set(['appstore', 'payment-providers']);
 
 /**
+ * Core-owned top-level files under /data/global: the premium store and its
+ * audit log, and the persistent panel registry. Their owners keep invariants
+ * a raw JSON edit would break, so the Config surfaces neither list nor write
+ * them (routes/config.ts refuses them by this list).
+ */
+export const CORE_OWNED_GLOBAL_FILES: ReadonlySet<string> = new Set(['premium-tiers.json', 'premium-tiers.audit.jsonl', 'persistent-panels.json']);
+
+export function isCoreOwnedGlobalFile(fileId: string): boolean {
+  return CORE_OWNED_GLOBAL_FILES.has(fileId);
+}
+
+/** A path under /data/global (as 'a/b.json') inside an internal namespace or a core-owned file. */
+export function isInternalGlobalRel(rel: string): boolean {
+  const parts = rel.split('/');
+  return (parts.length > 1 && GLOBAL_SCAN_EXCLUDES.has(parts[0])) || (parts.length === 1 && CORE_OWNED_GLOBAL_FILES.has(parts[0]));
+}
+
+/** Whether a file exists, this process's write queue first: a queued write exists, a queued delete does not. */
+export function existsQueueFirst(absPath: string): boolean {
+  const pending = getPending(absPath);
+  if (pending) return pending.op !== 'delete';
+  return fs.existsSync(absPath);
+}
+
+/**
  * Recursively scan a directory for JSON files
  */
 function scanDirectoryRecursive(
@@ -37,7 +63,8 @@ function scanDirectoryRecursive(
   category: 'config' | 'data',
   prefix: string = '',
   excludeTop?: Set<string>,
-  excludeUnderscoreTop = false
+  excludeUnderscoreTop = false,
+  excludeTopFiles?: ReadonlySet<string>
 ): ConfigFileMetadata[] {
   const results: ConfigFileMetadata[] = [];
 
@@ -69,7 +96,13 @@ function scanDirectoryRecursive(
         );
         results.push(...subResults);
       } else if (stat.isFile() && item.endsWith('.json')) {
-        // Found a JSON file
+        if (prefix === '' && excludeTopFiles?.has(item)) {
+          continue;
+        }
+        // A delete still queued in this process: the file is already gone.
+        if (getPending(fullPath)?.op === 'delete') {
+          continue;
+        }
         const id = prefix ? `${prefix}/${item}` : item;
         results.push({
           id,
@@ -164,7 +197,7 @@ export function discoverConfigFiles(): ConfigFileMetadata[] {
     name: 'Main Bot Config',
     description: 'Main bot configuration',
     category: 'config',
-    exists: fs.existsSync(mainConfigPath),
+    exists: existsQueueFirst(mainConfigPath),
     default: getDefaultValue('config.json')
   });
 
@@ -176,7 +209,7 @@ export function discoverConfigFiles(): ConfigFileMetadata[] {
 
   // 3. Scan for any existing files that might not have schemas
   if (fs.existsSync(dataPath('global'))) {
-    const globalResults = scanDirectoryRecursive(dataPath('global'), 'data', '', GLOBAL_SCAN_EXCLUDES);
+    const globalResults = scanDirectoryRecursive(dataPath('global'), 'data', '', GLOBAL_SCAN_EXCLUDES, false, CORE_OWNED_GLOBAL_FILES);
     for (const file of globalResults) {
       // Check if a schema already exists for this file (by checking if any entry has the same filename)
       let foundSchema = false;
@@ -281,7 +314,7 @@ export function discoverModuleConfigSchemas(modules: any[]): ConfigFileMetadata[
         name: schema.name,
         description: schema.description,
         category: 'config',
-        exists: fs.existsSync(configPath),
+        exists: existsQueueFirst(configPath),
         default: defaultValues,
         schema: schema,
         moduleName: moduleName
@@ -373,7 +406,7 @@ export function discoverModuleConfigSchemasFromDisk(): ConfigFileMetadata[] {
             name: schema.name,
             description: schema.description,
             category: 'config',
-            exists: fs.existsSync(configPath),
+            exists: existsQueueFirst(configPath),
             default: defaultValues,
             schema: schema,
             moduleName: moduleName
@@ -481,7 +514,7 @@ export function discoverModuleDataSchemasFromDisk(): DataFileMetadata[] {
                 name: dataFile.name,
                 description: dataFile.description,
                 category: 'data',
-                exists: fs.existsSync(globalPath),
+                exists: existsQueueFirst(globalPath),
                 required: dataFile.required,
                 template: dataFile.template,
                 scope: dataFile.scope,
@@ -710,7 +743,7 @@ export function discoverGlobalDataFiles(): DataFileMetadata[] {
   // 2. Scan for any existing files that might not have schemas
   const globalDir = dataPath('global');
   if (fs.existsSync(globalDir)) {
-    const existingFiles = scanDirectoryRecursive(globalDir, 'data', '', GLOBAL_SCAN_EXCLUDES);
+    const existingFiles = scanDirectoryRecursive(globalDir, 'data', '', GLOBAL_SCAN_EXCLUDES, false, CORE_OWNED_GLOBAL_FILES);
 
     for (const file of existingFiles) {
       // Extract module name from path
@@ -759,23 +792,24 @@ export function discoverGlobalDataFiles(): DataFileMetadata[] {
  * @returns DataFileMetadata or null if not found
  */
 export function getDataFileMetadata(fileId: string, guildId?: string): DataFileMetadata | null {
-  // Search in global data files
-  const globalFiles = discoverGlobalDataFiles();
+  const found = findDataFileMetadata(fileId, guildId);
+  return found === 'ambiguous' ? null : found;
+}
 
-  // Try exact match on id or module/id format
-  let match = globalFiles.find(f => f.id === fileId || `${f.moduleName}/${f.id}` === fileId);
-  if (match && !guildId) {
-    return match;
+/**
+ * The data file a key names: 'moduleName/file.json' exactly, or a bare id that
+ * only one module holds ('ambiguous' when several do). Guild-scoped when
+ * guildId is given, else global.
+ */
+export function findDataFileMetadata(fileId: string, guildId?: string): DataFileMetadata | 'ambiguous' | null {
+  const files = guildId ? discoverGuildDataFiles(guildId) : discoverGlobalDataFiles();
+  const qualified = files.find(f => `${f.moduleName}/${f.id}` === fileId);
+  if (qualified) {
+    return qualified;
   }
-
-  // Search in guild data files if guildId provided
-  if (guildId) {
-    const guildFiles = discoverGuildDataFiles(guildId);
-    match = guildFiles.find(f => f.id === fileId || `${f.moduleName}/${f.id}` === fileId);
-    if (match) {
-      return match;
-    }
+  const bare = files.filter(f => f.id === fileId);
+  if (bare.length > 1) {
+    return 'ambiguous';
   }
-
-  return null;
+  return bare[0] ?? null;
 }
