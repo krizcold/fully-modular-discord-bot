@@ -14,7 +14,6 @@ function CredentialsPanel({ setupStatus, isBotRunning, onUpdate, onUpdateAndRest
     SESSION_SECRET: '',
     DATA_BACKEND: 'file',
     DATA_BACKEND_URL: '',
-    CONTROL_STORE_URL: '',
   };
 
   const [credentials, setCredentials] = useState({ ...EMPTY_CREDS });
@@ -132,7 +131,7 @@ function CredentialsPanel({ setupStatus, isBotRunning, onUpdate, onUpdateAndRest
         steps: [
           'File (default) stores data as files under /data',
           'PostgreSQL stores data in a Postgres database',
-          '⚠️ Switching the backend does NOT move existing data - use the backend transformation to migrate',
+          '⚠️ Switching the backend does NOT move existing data',
           'A bot restart is required for the change to take effect'
         ],
         example: 'File (default)'
@@ -146,17 +145,6 @@ function CredentialsPanel({ setupStatus, isBotRunning, onUpdate, onUpdateAndRest
           'A bot restart is required for changes to take effect'
         ],
         example: 'postgresql://user:password@host:5432/db'
-      },
-      CONTROL_STORE_URL: {
-        title: 'Control Store URL (Optional)',
-        steps: [
-          '⚠️ This field is OPTIONAL and advanced',
-          'Optional separate Postgres for the fleet control plane',
-          'Leave blank to use the same database as the data backend',
-          'Leave blank to keep the saved value (it is never shown here)',
-          'A bot restart is required for changes to take effect'
-        ],
-        example: 'postgresql://user:password@host:5432/control (or leave empty)'
       },
     };
   });
@@ -281,8 +269,8 @@ function CredentialsPanel({ setupStatus, isBotRunning, onUpdate, onUpdateAndRest
   // Write-only fields (secrets, and IDs /status never returns) load blank, so
   // one is a change only while typed since the last save and not blank. The
   // other fields diff against the baseline.
-  const WRITE_ONLY_FIELDS = ['DISCORD_TOKEN', 'CLIENT_ID', 'GUILD_ID', 'DISCORD_CLIENT_ID', 'DISCORD_CLIENT_SECRET', 'SESSION_SECRET', 'DATA_BACKEND_URL', 'CONTROL_STORE_URL'];
-  const DATA_STORAGE_FIELDS = ['DATA_BACKEND', 'DATA_BACKEND_URL', 'CONTROL_STORE_URL'];
+  const WRITE_ONLY_FIELDS = ['DISCORD_TOKEN', 'CLIENT_ID', 'GUILD_ID', 'DISCORD_CLIENT_ID', 'DISCORD_CLIENT_SECRET', 'SESSION_SECRET', 'DATA_BACKEND_URL'];
+  const DATA_STORAGE_FIELDS = ['DATA_BACKEND', 'DATA_BACKEND_URL'];
   const BOT_RESTART_FIELDS = ['DISCORD_TOKEN', 'CLIENT_ID', 'GUILD_ID', ...DATA_STORAGE_FIELDS];
   const GUILD_WEBUI_FIELDS = ['ENABLE_GUILD_WEBUI', 'DISCORD_CLIENT_ID', 'DISCORD_CLIENT_SECRET', 'OAUTH_CALLBACK_URL', 'SESSION_SECRET'];
 
@@ -382,7 +370,7 @@ function CredentialsPanel({ setupStatus, isBotRunning, onUpdate, onUpdateAndRest
                   </select>
                   <small>
                     Changing these settings requires a bot restart. Switching the backend does NOT
-                    move existing data - the backend transformation does.
+                    move existing data.
                   </small>
                 </div>
 
@@ -401,23 +389,6 @@ function CredentialsPanel({ setupStatus, isBotRunning, onUpdate, onUpdateAndRest
                     <small>Leave blank to keep the saved value (it is never shown here)</small>
                   </div>
                 )}
-
-                <div className="form-group">
-                  <label>
-                    <StatusIndicator isSet={setupStatus?.credentials?.CONTROL_STORE_URL?.set} optional />
-                    Control Store URL (Advanced, Optional)
-                  </label>
-                  <input
-                    type="password"
-                    value={credentials.CONTROL_STORE_URL || ''}
-                    onChange={e => handleFieldChange('CONTROL_STORE_URL', e.target.value)}
-                    placeholder={secretPlaceholder(setupStatus?.credentials?.CONTROL_STORE_URL?.set, 'postgresql://user:password@host:5432/control')}
-                  />
-                  <small>
-                    Optional separate Postgres for the fleet control plane; blank = same database.
-                    Leave blank to keep the saved value (it is never shown here).
-                  </small>
-                </div>
               </div>
 
               <div className="credentials-instructions">
@@ -445,14 +416,6 @@ function CredentialsPanel({ setupStatus, isBotRunning, onUpdate, onUpdateAndRest
                         title={instructions.DATA_BACKEND_URL.title}
                         steps={instructions.DATA_BACKEND_URL.steps}
                         example={instructions.DATA_BACKEND_URL.example}
-                      />
-                    )}
-                    {instructions.CONTROL_STORE_URL && (
-                      <InstructionCard
-                        key="CONTROL_STORE_URL"
-                        title={instructions.CONTROL_STORE_URL.title}
-                        steps={instructions.CONTROL_STORE_URL.steps}
-                        example={instructions.CONTROL_STORE_URL.example}
                       />
                     )}
                   </>

@@ -1,13 +1,10 @@
-// Config Panel Component. On a co-worker node the system/global context is
-// read-only (synced from the master); guild contexts list this node's owned
-// guilds and stay editable.
 // A file's row key: data files are module-qualified, since two modules may
 // each hold an x.json; config ids are unique.
 function configFileKey(file) {
   return file.category === 'data' && file.moduleName ? `${file.moduleName}/${file.id}` : file.id;
 }
 
-function ConfigPanel({ isCoWorker }) {
+function ConfigPanel() {
   const { useState, useEffect, useRef } = React;
 
   const [configFiles, setConfigFiles] = useState([]);
@@ -81,24 +78,6 @@ function ConfigPanel({ isCoWorker }) {
   }
 
   async function loadGuildContextOptions() {
-    if (isCoWorker) {
-      // Owned guilds from this node's fleet state: that is the co-worker's
-      // own-guilds data browser (config routes take arbitrary guildIds).
-      const options = [{ value: 'system', label: 'System Config (synced from master)', guildId: null }];
-      try {
-        const fleetRes = await api.get('/fleet/state');
-        const guildMap = (fleetRes && fleetRes.guildMap) || {};
-        for (const guildId of Object.keys(guildMap).sort()) {
-          options.push({ value: `guild:${guildId}`, label: `Guild [${guildId}]`, guildId });
-        }
-      } catch (err) {
-        console.error('Failed to load owned guilds:', err);
-      }
-      setGuildContextOptions(options);
-      setGuildContext('system');
-      setBooting(false);
-      return;
-    }
     try {
       const res = await api.get('/setup/status');
       if (res.success && res.guildIds) {
@@ -440,7 +419,6 @@ function ConfigPanel({ isCoWorker }) {
   const selectedFileInfo = findFile(configFiles, selectedFile);
   // Backups and Restore only for a file whose content loaded for this selection.
   const showBackups = !loadFailed && !!loaded && loaded.fileKey === selectedFile && loaded.ctx === guildContext;
-  const readOnlyContext = !!isCoWorker && guildContext === 'system';
   const currentGuildId = guildContextOptions.find(o => o.value === guildContext)?.guildId || null;
 
   return (
@@ -448,27 +426,8 @@ function ConfigPanel({ isCoWorker }) {
       <div className="card">
         <h2>⚙️ Config Editor</h2>
         <p style={{marginBottom: '15px', color: '#999'}}>
-          {readOnlyContext
-            ? 'Browse this node\'s configuration. Global config is read-only here.'
-            : 'Edit bot configuration files. Changes are automatically backed up.'}
+          Edit bot configuration files. Changes are automatically backed up.
         </p>
-
-        {readOnlyContext && (
-          <div style={{
-            background: 'rgba(88, 101, 242, 0.12)',
-            border: '1px solid #5865F2',
-            color: '#a0c0f0',
-            padding: '10px 14px',
-            borderRadius: '6px',
-            marginBottom: '15px',
-            fontSize: '0.9rem'
-          }}>
-            Synced from master - global configuration mirrors the master node
-            and is edited on its Web-UI. Guild contexts for guilds this node
-            serves remain editable below.
-          </div>
-        )}
-
 
         {!initialized && initMessage && (
           <div style={{
@@ -660,11 +619,10 @@ function ConfigPanel({ isCoWorker }) {
         )}
 
         <div className="form-group">
-          <label>{readOnlyContext ? 'Configuration (JSON, read-only)' : 'Configuration (JSON)'}</label>
+          <label>Configuration (JSON)</label>
           <textarea
             value={configText}
             onChange={e => handleConfigChange(e.target.value)}
-            readOnly={readOnlyContext}
             style={{
               width: '100%',
               minHeight: '400px',
@@ -685,30 +643,28 @@ function ConfigPanel({ isCoWorker }) {
           )}
         </div>
 
-        {!readOnlyContext && (
-          <div style={{display: 'flex', gap: '10px', flexWrap: 'wrap'}}>
+        <div style={{display: 'flex', gap: '10px', flexWrap: 'wrap'}}>
+          <button
+            onClick={handleSave}
+            className="btn btn-primary"
+            disabled={busy || !!jsonError || !showBackups}
+            style={disabledButtonStyle(busy || !!jsonError || !showBackups)}
+          >
+            {saving ? 'Saving…' : '💾 Save Config'}
+          </button>
+          {currentGuildId && showBackups && selectedFileInfo?.category === 'data' && selectedFileInfo?.exists && (
             <button
-              onClick={handleSave}
-              className="btn btn-primary"
-              disabled={busy || !!jsonError || !showBackups}
-              style={disabledButtonStyle(busy || !!jsonError || !showBackups)}
+              onClick={handleDeleteFile}
+              className="btn btn-danger"
+              disabled={busy}
+              style={disabledButtonStyle(busy)}
             >
-              {saving ? 'Saving…' : '💾 Save Config'}
+              🗑️ Delete File
             </button>
-            {currentGuildId && showBackups && selectedFileInfo?.category === 'data' && selectedFileInfo?.exists && (
-              <button
-                onClick={handleDeleteFile}
-                className="btn btn-danger"
-                disabled={busy}
-                style={disabledButtonStyle(busy)}
-              >
-                🗑️ Delete File
-              </button>
-            )}
-          </div>
-        )}
+          )}
+        </div>
 
-        {!readOnlyContext && currentGuildId && selectedFileType === 'data' && (
+        {currentGuildId && selectedFileType === 'data' && (
           <div style={{marginTop: '20px', paddingTop: '15px', borderTop: '1px solid #333'}}>
             <button
               onClick={handleDeleteGuildData}
@@ -725,7 +681,6 @@ function ConfigPanel({ isCoWorker }) {
         )}
       </div>
 
-      {!isCoWorker && (
       <div className="card">
         <h3>📦 Backups</h3>
         <p style={{marginBottom: '15px', color: '#999', fontSize: '0.9rem'}}>
@@ -776,7 +731,6 @@ function ConfigPanel({ isCoWorker }) {
           </div>
         )}
       </div>
-      )}
     </div>
   );
 }

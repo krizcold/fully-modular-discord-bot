@@ -90,7 +90,7 @@ describe('the web Config editor posts its loaded version and effective values fo
   it('sends the version from the load, marks the values effective, and words the toast from the keys stored', async () => {
     const { calls, api } = heldApi();
     const toasts: string[] = [];
-    const panel = mount(PANEL, 'ConfigPanel', { isCoWorker: false }, {
+    const panel = mount(PANEL, 'ConfigPanel', {}, {
       api,
       showToast: (message: string) => toasts.push(message),
       confirm: () => true,

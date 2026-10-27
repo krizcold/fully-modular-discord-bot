@@ -87,14 +87,12 @@ function mount(component: (props: any) => any, initialProps: Record<string, unkn
     start() { render(); },
     setProps(next: Record<string, unknown>) { props = { ...props, ...next }; render(); },
     find: (match: (e: Element) => boolean) => all(tree).filter(match),
-    text: (node: any): string => Array.isArray(node) ? node.map(n => (typeof n === 'object' && n ? '' : String(n ?? ''))).join('') : String(node ?? ''),
   };
 }
 
 const flush = async () => { for (let i = 0; i < 5; i++) await new Promise(resolve => setTimeout(resolve, 0)); };
 
-function rig(file: string, name: string, initialProps: Record<string, unknown>, gate?: () => Promise<void>,
-  opts: { response?: Record<string, unknown>; showToast?: (...args: any[]) => void } = {}) {
+function rig(file: string, name: string, initialProps: Record<string, unknown>, gate?: () => Promise<void>) {
   const posts: Array<Record<string, unknown>> = [];
   let m: ReturnType<typeof mount>;
   const component = (props: any) => compiled(props);
@@ -102,8 +100,8 @@ function rig(file: string, name: string, initialProps: Record<string, unknown>, 
   const stub = () => null;
   const compiled = loadComponent(file, name, {
     React: m.React,
-    api: { post: async (_url: string, body: Record<string, unknown>) => { posts.push(JSON.parse(JSON.stringify(body))); if (gate) await gate(); return opts.response ?? { success: true, reload: { changes: [{ field: 'x', action: 'hot-inplace' }] } }; } },
-    showToast: opts.showToast ?? (() => {}),
+    api: { post: async (_url: string, body: Record<string, unknown>) => { posts.push(JSON.parse(JSON.stringify(body))); if (gate) await gate(); return { success: true, reload: { changes: [{ field: 'x', action: 'hot-inplace' }] } }; } },
+    showToast: () => {},
     StatusIndicator: stub,
     disabledButtonStyle: () => null,
     secretPlaceholder: (isSet: boolean, example: string) => (isSet ? 'Set (leave blank to keep)' : example),
@@ -111,81 +109,10 @@ function rig(file: string, name: string, initialProps: Record<string, unknown>, 
     OAuthCredentialsSection: stub,
     InstructionCard: stub,
     window: { location: { origin: 'http://localhost:3000' } },
-    navigator: { clipboard: { writeText: () => {} } },
   });
   m.start();
   return { m, posts };
 }
-
-const change = (input: Element | undefined, value: string) => input!.props.onChange({ target: { value } });
-
-describe('Connection page saves (R44-J3, R50-J3)', () => {
-  const demotedStatus = (extra: Record<string, unknown> = {}) => ({
-    connection: {
-      MASTER_URLS: 'wss://m.example,wss://b.example', NODE_NAME: 'n1', FLEET_SHARD_CAPACITY: '', BACKUP_MASTER: '',
-      ENV_ROLE: 'master', BOT_NODE_ROLE: 'master', ROLE_OVERRIDE: { role: 'co-worker', setBy: 'webui-demote', setAt: 1 },
-      CONTROL_SECRET_SET: true, DISCORD_TOKEN_SET: true, ...extra,
-    },
-  });
-  const props = (setupStatus: unknown) => ({ setupStatus, isBotRunning: true, onUpdate: async () => {}, onUpdateAndRestart: async () => {} });
-  const save = (m: ReturnType<typeof mount>) => m.find(e => e.type === 'form')[0].props.onSubmit({ preventDefault() {} });
-  const byPlaceholder = (m: ReturnType<typeof mount>, text: string) => m.find(e => e.type === 'input' && e.props.placeholder === text);
-
-  it('shows a demoted master as master by env, running as co-worker by the override and who wrote it', () => {
-    const { m } = rig('components/credentials/ConnectionSection.jsx', 'ConnectionSection', props(demotedStatus()));
-    const select = m.find(e => e.type === 'select')[0];
-    expect(select.props.value).toBe('master');
-    const options = m.find(e => e.type === 'option');
-    const master = options.find(o => o.props.value === 'master');
-    expect(master && m.text(master.props.children)).toBe('Master (env; running as co-worker by the role override written by webui-demote)');
-  });
-
-  it('posts only the fields the operator changed, so an unchanged role is never written', async () => {
-    const { m, posts } = rig('components/credentials/ConnectionSection.jsx', 'ConnectionSection', props(demotedStatus()));
-    change(byPlaceholder(m, 'Defaults to the hostname')[0], 'n2');
-    save(m);
-    await flush();
-    expect(posts).toEqual([{ NODE_NAME: 'n2' }]);
-  });
-
-  it('a typed secret is posted once; a later save after a reload does not post it again', async () => {
-    const { m, posts } = rig('components/credentials/ConnectionSection.jsx', 'ConnectionSection', props(demotedStatus({ BOT_NODE_ROLE: '', ENV_ROLE: 'co-worker', ROLE_OVERRIDE: null })));
-    change(byPlaceholder(m, 'Set (leave blank to keep)')[1], 'fake-secret-1');
-    save(m);
-    await flush();
-    m.setProps({ setupStatus: demotedStatus({ BOT_NODE_ROLE: '', ENV_ROLE: 'co-worker', ROLE_OVERRIDE: null }) });
-    expect(byPlaceholder(m, 'Set (leave blank to keep)')[1].props.value).toBe('');
-    change(byPlaceholder(m, 'Defaults to the hostname')[0], 'n3');
-    save(m);
-    await flush();
-    expect(posts).toEqual([{ CONTROL_SECRET: 'fake-secret-1' }, { NODE_NAME: 'n3' }]);
-  });
-});
-
-describe('Connection page in-flight typing', () => {
-  it('a secret typed while a save is in flight is kept and posted by the next save', async () => {
-    let release = () => {};
-    const gate = () => new Promise<void>(resolve => { release = resolve; });
-    const status = { connection: { MASTER_URLS: 'wss://m.example', NODE_NAME: '', FLEET_SHARD_CAPACITY: '', BACKUP_MASTER: '', ENV_ROLE: 'co-worker', BOT_NODE_ROLE: 'co-worker', ROLE_OVERRIDE: null, CONTROL_SECRET_SET: true, DISCORD_TOKEN_SET: true } };
-    const { m, posts } = rig('components/credentials/ConnectionSection.jsx', 'ConnectionSection',
-      { setupStatus: status, isBotRunning: true, onUpdate: async () => {}, onUpdateAndRestart: async () => {} }, gate);
-    const secret = () => m.find(e => e.type === 'input' && e.props.placeholder === 'Set (leave blank to keep)')[1];
-    const save = () => m.find(e => e.type === 'form')[0].props.onSubmit({ preventDefault() {} });
-    change(secret(), 'fake-secret-a');
-    save();
-    await flush();
-    change(secret(), 'fake-secret-b');
-    release();
-    await flush();
-    m.setProps({ setupStatus: { ...status } });
-    expect(secret().props.value).toBe('fake-secret-b');
-    save();
-    await flush();
-    release();
-    await flush();
-    expect(posts).toEqual([{ CONTROL_SECRET: 'fake-secret-a' }, { CONTROL_SECRET: 'fake-secret-b' }]);
-  });
-});
 
 describe('Credentials page saves (R50-J3)', () => {
   const status = () => ({
@@ -193,8 +120,8 @@ describe('Credentials page saves (R50-J3)', () => {
     deploymentMode: 'standalone',
     credentials: {
       ENABLE_GUILD_WEBUI: { set: true, value: 'true' }, OAUTH_CALLBACK_URL: { set: true, value: 'http://localhost:3000/auth/discord/callback' },
-      MAIN_GUILD_ID: { set: false }, DATA_BACKEND: { set: true, value: 'file' },
-      DISCORD_CLIENT_SECRET: { set: true }, SESSION_SECRET: { set: true }, CONTROL_STORE_URL: { set: true },
+      MAIN_GUILD_ID: { set: false }, DATA_BACKEND: { set: true, value: 'postgres' },
+      DISCORD_CLIENT_SECRET: { set: true }, SESSION_SECRET: { set: true }, DATA_BACKEND_URL: { set: true },
     },
     guildIds: {},
   });
@@ -258,7 +185,7 @@ describe('Credentials page saves (R50-J3)', () => {
   it('a saved secret input says a blank keeps it', () => {
     const { m } = rig('components/CredentialsPanel.jsx', 'CredentialsPanel', props());
     const input = m.find(e => e.type === 'input' && e.props.type === 'password')
-      .find(e => String(e.props.onChange).includes('CONTROL_STORE_URL'));
+      .find(e => String(e.props.onChange).includes('DATA_BACKEND_URL'));
     expect(input!.props.placeholder).toBe('Set (leave blank to keep)');
   });
 });
@@ -383,37 +310,6 @@ describe('container-set keys in the answer, fresh env loader', () => {
       'CLIENT_ID is set by the container environment, so it keeps its value',
       'GUILD_ID is set by the container environment, so it keeps its value',
     ]);
-  });
-});
-
-describe('Connection page with nothing changed', () => {
-  it('says there was nothing to save', async () => {
-    const toasts: Array<[string, string]> = [];
-    const status = { connection: { MASTER_URLS: 'wss://m.example', NODE_NAME: 'n1', FLEET_SHARD_CAPACITY: '', BACKUP_MASTER: '', ENV_ROLE: 'co-worker', BOT_NODE_ROLE: 'co-worker', ROLE_OVERRIDE: null, CONTROL_SECRET_SET: true, DISCORD_TOKEN_SET: true } };
-    const { m } = rig('components/credentials/ConnectionSection.jsx', 'ConnectionSection',
-      { setupStatus: status, isBotRunning: true, onUpdate: async () => {}, onUpdateAndRestart: async () => {} }, undefined,
-      { response: { success: true, reload: { changes: [] }, containerSet: [] }, showToast: (text: string, kind: string) => { toasts.push([text, kind]); } });
-    change(m.find(e => e.type === 'input' && e.props.placeholder === 'Defaults to the hostname')[0], 'n2');
-    m.find(e => e.type === 'form')[0].props.onSubmit({ preventDefault() {} });
-    await flush();
-    expect(toasts).toEqual([['No changes to save.', 'info']]);
-  });
-});
-
-describe('Connection page names container-set keys', () => {
-  it('shows each container-set key and no saved toast when nothing else changed', async () => {
-    const toasts: Array<[string, string]> = [];
-    const status = { connection: { MASTER_URLS: 'wss://m.example', NODE_NAME: 'compose-name', FLEET_SHARD_CAPACITY: '', BACKUP_MASTER: '', ENV_ROLE: 'co-worker', BOT_NODE_ROLE: 'co-worker', ROLE_OVERRIDE: null, CONTROL_SECRET_SET: true, DISCORD_TOKEN_SET: true } };
-    const { m } = rig('components/credentials/ConnectionSection.jsx', 'ConnectionSection',
-      { setupStatus: status, isBotRunning: true, onUpdate: async () => {}, onUpdateAndRestart: async () => {} }, undefined,
-      {
-        response: { success: true, reload: { changes: [{ field: 'NODE_NAME', action: 'hot-inplace' }] }, containerSet: [{ field: 'NODE_NAME', message: 'NODE_NAME is set by the container environment, so it keeps compose-name' }] },
-        showToast: (text: string, kind: string) => { toasts.push([text, kind]); },
-      });
-    change(m.find(e => e.type === 'input' && e.props.placeholder === 'Defaults to the hostname')[0], '');
-    m.find(e => e.type === 'form')[0].props.onSubmit({ preventDefault() {} });
-    await flush();
-    expect(toasts).toEqual([['NODE_NAME is set by the container environment, so it keeps compose-name', 'warning']]);
   });
 });
 

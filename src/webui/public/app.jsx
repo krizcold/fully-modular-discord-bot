@@ -1,7 +1,6 @@
 const { useState, useEffect } = React;
 
-// Top-level tabs that map 1:1 to a URL path. Order drives the tab strip;
-// co-worker nodes drop the master-owned tabs (App Store, Dev Modules).
+// Top-level tabs that map 1:1 to a URL path. Order drives the tab strip.
 const APP_TABS = ['dashboard', 'panels', 'credentials', 'config', 'logs', 'usage', 'update', 'appstore', 'devmodules'];
 const APP_TAB_LABELS = {
   dashboard: 'Dashboard',
@@ -223,13 +222,7 @@ function App() {
     return <div className="loading">Loading...</div>;
   }
 
-  // Co-worker nodes mirror the master: App Store and Dev Modules are managed
-  // there, so their tabs are hidden here.
-  const isCoWorker = setupStatus?.nodeRole === 'co-worker';
-  const visibleTabs = isCoWorker
-    ? APP_TABS.filter(tab => tab !== 'appstore' && tab !== 'devmodules')
-    : APP_TABS;
-  const currentTab = visibleTabs.includes(activeTab) ? activeTab : 'dashboard';
+  const currentTab = APP_TABS.includes(activeTab) ? activeTab : 'dashboard';
 
   return (
     <div>
@@ -257,7 +250,7 @@ function App() {
       </div>
 
       <div className="tabs">
-        {visibleTabs.map(tab => (
+        {APP_TABS.map(tab => (
           <button
             key={tab}
             className={`tab ${currentTab === tab ? 'active' : ''}`}
@@ -283,22 +276,7 @@ function App() {
 
         {currentTab === 'panels' && <PanelsPanel />}
 
-        {currentTab === 'credentials' && (isCoWorker ? (
-          <ConnectionSection
-            setupStatus={setupStatus}
-            isBotRunning={!!status?.running}
-            onUpdate={loadData}
-            onUpdateAndRestart={async () => {
-              await loadData();
-              try {
-                await api.post('/bot/restart-server');
-              } catch (err) {
-                console.warn('Server restart failed, falling back to bot restart:', err);
-                await startOrRestartBot();
-              }
-            }}
-          />
-        ) : (
+        {currentTab === 'credentials' && (
           <CredentialsPanel
             setupStatus={setupStatus}
             isBotRunning={!!status?.running}
@@ -316,9 +294,9 @@ function App() {
               }
             }}
           />
-        ))}
+        )}
 
-        {currentTab === 'config' && <ConfigPanel isCoWorker={isCoWorker} />}
+        {currentTab === 'config' && <ConfigPanel />}
 
         {currentTab === 'logs' && <LogsPanel api={api} wsClient={wsClient} />}
 
@@ -326,9 +304,9 @@ function App() {
 
         {currentTab === 'update' && <UpdatePanel api={api} wsClient={wsClient} />}
 
-        {currentTab === 'appstore' && !isCoWorker && <AppStorePanel />}
+        {currentTab === 'appstore' && <AppStorePanel />}
 
-        {currentTab === 'devmodules' && !isCoWorker && <DevModulesPanel />}
+        {currentTab === 'devmodules' && <DevModulesPanel />}
       </div>
     </div>
   );

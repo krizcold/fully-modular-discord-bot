@@ -18,7 +18,7 @@ const FILES = [
 async function open() {
   const { calls, api } = heldApi();
   const toasts: Array<{ message: string; type: string }> = [];
-  const panel = mount(PANEL, 'ConfigPanel', { isCoWorker: false }, {
+  const panel = mount(PANEL, 'ConfigPanel', {}, {
     api,
     showToast: (message: string, type: string) => toasts.push({ message, type }),
     confirm: () => true,
@@ -273,7 +273,7 @@ describe('review round 3', () => {
   async function openSystemOnly() {
     const { calls, api } = heldApi();
     const toasts: Array<{ message: string; type: string }> = [];
-    const panel = mount(PANEL, 'ConfigPanel', { isCoWorker: false }, {
+    const panel = mount(PANEL, 'ConfigPanel', {}, {
       api,
       showToast: (message: string, type: string) => toasts.push({ message, type }),
       confirm: () => true,
