@@ -151,6 +151,15 @@ describe('the Discord Guild Config Editor carries a version and stores only over
     expect(readJson(guildConfig())).toEqual({ b: 3, c: 4 });
   });
 
+  it('an Edit submit that reverts every override empties the stored guild config', async () => {
+    put(ROOT_CONFIG_PATH, { a: 1, b: 2 });
+    put(guildConfig(), { b: 3 });
+    const modalId = await openEdit();
+    await configEditorGuildPanel.handleModal!(modalContext({ config_json: JSON.stringify({ a: 1, b: 2 }) }), modalId);
+    await flushAll();
+    expect(readJson(guildConfig())).toEqual({});
+  });
+
   it('refuses an Edit submit when the config changed since the modal opened, writing nothing', async () => {
     put(ROOT_CONFIG_PATH, { a: 1 });
     put(guildConfig(), { b: 3 });

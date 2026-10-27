@@ -93,6 +93,11 @@ function premiumWith(config: any): PremiumManager {
   return pm;
 }
 
+const link = (providerId: string, ...variantIds: string[]) => ({
+  providerId, enabled: true, mode: 'price',
+  cache: { syncedAt: '2026-01-01T00:00:00Z', variants: variantIds.map(variantId => ({ variantId, label: variantId })) },
+});
+
 function paidSub(id: string): any {
   return { id, source: 'paid', providerId: 'p', providerSubId: `ps-${id}`, variantId: 'v1', tierId: 'a', offeringId: 'o1' };
 }
@@ -111,8 +116,8 @@ describe('migration requests are stamped only on delivery (R35-J2)', () => {
       (guildId === 'g1' ? { delivered: true, via: 'dm' } : { delivered: false, cause: 'guild not reachable' }) as any);
     const pm = premiumWith({
       tiers: {
-        a: { displayName: 'A', offerings: [{ id: 'o1' }] },
-        b: { displayName: 'B', offerings: [{ id: 'o2' }] },
+        a: { displayName: 'A', offerings: [{ id: 'o1', providerLinks: [link('p', 'v1')] }] },
+        b: { displayName: 'B', offerings: [{ id: 'o2', providerLinks: [link('p', 'v2')] }] },
       },
       subscriptions: { g1: { active: paidSub('s1'), paused: [] }, g2: { active: paidSub('s2'), paused: [] } },
       migrations: [],
@@ -222,7 +227,7 @@ describe('review round rows (C09-2)', () => {
     h.provider = { capabilities: { supportsPriceMigration: true, supportsCancel: true }, migrateSubscriptionPrice: vi.fn(), cancelSubscription: vi.fn() };
     vi.spyOn(notifications, 'dispatchPremiumNotification').mockResolvedValue({ delivered: true, via: 'dm' } as any);
     const pm = premiumWith({
-      tiers: { a: { displayName: 'A', offerings: [{ id: 'o1' }] }, b: { displayName: 'B', offerings: [{ id: 'o2' }] } },
+      tiers: { a: { displayName: 'A', offerings: [{ id: 'o1', providerLinks: [link('p', 'v1')] }] }, b: { displayName: 'B', offerings: [{ id: 'o2', providerLinks: [link('p', 'v2')] }] } },
       subscriptions: { g1: { active: paidSub('s1'), paused: [paidSub('s2')] } },
       migrations: [],
       migrationSilencePolicy: 'continue',

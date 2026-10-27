@@ -173,7 +173,7 @@ const configEditorGuildPanel: PanelOptions = {
 
       // Perform the reset
       try {
-        requireSchema(discoverGuildConfigFiles(context.guildId).find(f => f.id === fileId));
+        requireSchema(fileId, discoverGuildConfigFiles(context.guildId).find(f => f.id === fileId));
         saveConfigFile(fileId, context.guildId, {});
       } catch (error) {
         return showError(`Reset failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
@@ -237,9 +237,11 @@ const configEditorGuildPanel: PanelOptions = {
         const schemaMetadata = guildConfigs.find(f => f.id === fileId);
         const overridesOnly = guildOverridesFrom(parsedConfig, loadGuildConfig(fileId, context.guildId!), loadGlobalConfig(fileId), schemaMetadata);
 
-        requireSchema(schemaMetadata);
+        requireSchema(fileId, schemaMetadata);
         if (Object.keys(overridesOnly).length === 0) {
-          if (schemaMetadata && schemaMetadata.moduleName) {
+          if (fileId === 'config.json') {
+            saveConfigFile(fileId, context.guildId!, {});
+          } else if (schemaMetadata && schemaMetadata.moduleName) {
             deleteConfigFile(fileId, { guildId: context.guildId!, category: schemaMetadata.moduleName });
           } else {
             deleteConfigFile(fileId, { guildId: context.guildId! });
@@ -260,10 +262,15 @@ const configEditorGuildPanel: PanelOptions = {
     const versionEnd = fileId.indexOf('_');
     const openedVersion = versionEnd > -1 ? fileId.substring(0, versionEnd) : '';
     fileId = fileId.substring(versionEnd + 1);
+    const formFileId = fileId;
+    const formMetadata = discoverGuildConfigFiles(context.guildId).find(f => f.id === formFileId);
+    if (versionEnd < 0 && fileId !== 'config.json' && !formMetadata?.schema) {
+      return showError(NO_SCHEMA_TEXT);
+    }
     if (!openedVersion || versionEnd < 0) {
       return showError('This edit form is not valid any more; nothing was saved. Reopen Edit.');
     }
-    if (configVersionOf(loadGuildConfig(fileId, context.guildId), loadGlobalConfig(fileId), discoverGuildConfigFiles(context.guildId).find(f => f.id === fileId)) !== openedVersion) {
+    if (configVersionOf(loadGuildConfig(fileId, context.guildId), loadGlobalConfig(fileId), formMetadata) !== openedVersion) {
       return showError('This config changed since you opened it; nothing was saved. Reopen Edit to see the current values.');
     }
 
@@ -282,10 +289,12 @@ const configEditorGuildPanel: PanelOptions = {
 
     // Save config (or delete if no overrides)
     try {
-      requireSchema(schemaMetadata);
+      requireSchema(fileId, schemaMetadata);
       if (Object.keys(overridesOnly).length === 0) {
         // No overrides - delete the config file through the facade.
-        if (schemaMetadata && schemaMetadata.moduleName) {
+        if (fileId === 'config.json') {
+          saveConfigFile(fileId, context.guildId, {});
+        } else if (schemaMetadata && schemaMetadata.moduleName) {
           deleteConfigFile(fileId, { guildId: context.guildId, category: schemaMetadata.moduleName });
         } else {
           deleteConfigFile(fileId, { guildId: context.guildId });
@@ -324,8 +333,8 @@ function raiseRefusal(outcome: string): void {
 
 const NO_SCHEMA_TEXT = 'this file has no config schema; it cannot be edited here, and nothing was changed';
 
-function requireSchema(metadata: { schema?: unknown } | undefined): void {
-  if (!metadata?.schema) throw new Error(NO_SCHEMA_TEXT);
+function requireSchema(fileId: string, metadata: { schema?: unknown } | undefined): void {
+  if (fileId !== 'config.json' && !metadata?.schema) throw new Error(NO_SCHEMA_TEXT);
 }
 
 function deleteConfigFile(fileId: string, options: DataOptions): void {
