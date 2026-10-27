@@ -118,7 +118,7 @@ describe('the retry loop', () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(r.store.hydrationsSent).toBe(1);
     r.store.listOwnedGuilds = async () => [g];
-    r.driver.onLeaseLost();
+    r.driver.onLeaseChanged(NOT_LEASED);
     r.driver.onLeaseChanged(LEASED);
     await vi.advanceTimersByTimeAsync(0);
     r.store.releaseHydrations('unavailable');
@@ -157,7 +157,7 @@ describe('the retry loop', () => {
     await vi.advanceTimersByTimeAsync(100);
     expect(r.store.hydrationsSent).toBe(2);
     r.store.listOwnedGuilds = async () => [g];
-    r.driver.onLeaseLost();
+    r.driver.onLeaseChanged(NOT_LEASED);
     r.driver.onLeaseChanged(LEASED);
     await vi.advanceTimersByTimeAsync(450);
     // Woken at 300 ms, the one loop claims then and next at 800.

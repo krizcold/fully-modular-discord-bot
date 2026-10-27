@@ -1,16 +1,12 @@
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
 // C05-2 (R4-J17, R6-J25, R36-J5): the Usage and Fleet routes answer a failed child read as a failure, the disk
-// figures say what they measure, the metrics IPC answers 'not ready' before the bot finishes booting, and the
-// takeover guard says when the control store does not answer instead of naming a live incumbent.
+// figures say what they measure, and the metrics IPC answers 'not ready' before the bot finishes booting.
 
 import { createUsageRoutes } from '../../src/webui/routes/usage';
 import { createFleetRoutes } from '../../src/webui/routes/fleet';
 import { answerMetricsRequest, markMetricsReady } from '../../src/bot/internalSetup/utils/ipcMetricsHandler';
 import { getMetricsCollector } from '../../src/bot/internalSetup/utils/metrics/metricsCollector';
-import { _runTakeoverGuard } from '../../src/bot/internalSetup/fleet/bootstrap';
-import { _getTakeoverGuardView } from '../../src/bot/internalSetup/fleet/state';
-import { TERM_GUARD_POLL_MS } from '../../src/bot/internalSetup/fleet/constants';
 import { call, startApp } from '../helpers/configRig';
 
 const REASON = 'IPC request timed out; the operation may still complete in the background - check bot logs before retrying';
@@ -23,7 +19,6 @@ const bot: any = {
   getBotGuilds: async () => ({ success: true, guilds: [] }),
   getGuildMetrics: failing,
   getFleetState: failing,
-  listFleetMigrations: failing,
 };
 
 let base = '';
@@ -49,17 +44,10 @@ describe('a child that does not answer is a failure, never zeros (R4-26)', () =>
     expect(body.error).toBe(`Could not read metrics from the bot: ${REASON}`);
   });
 
-  it('/fleet/state answers reachable:false with the reason, keeping the parent-side facts', async () => {
+  it('/fleet/state answers reachable:false with the reason', async () => {
     const { body } = await call(base, 'GET', '/api/fleet/state');
     expect(body.reachable).toBe(false);
     expect(body.initialized).toBe(false);
-    expect(body.error).toBe(`Fleet state unavailable: ${REASON}`);
-    expect('modeOverride' in body).toBe(true);
-  });
-
-  it('/fleet/migrations names the IPC error instead of an empty history', async () => {
-    const { body } = await call(base, 'GET', '/api/fleet/migrations');
-    expect(body.success).toBe(false);
     expect(body.error).toBe(`Fleet state unavailable: ${REASON}`);
   });
 
@@ -117,55 +105,6 @@ describe('the metrics IPC answers before the bot finishes booting', () => {
   });
 });
 
-describe('the takeover guard says when the control store does not answer (R36-6)', () => {
-  afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
-
-  it('before the first read, during the hold, and once per outage in the log', async () => {
-    vi.useFakeTimers();
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    let mode: 'down' | 'up' = 'down';
-    let stamp = 1;
-    const store: any = {
-      getTerm: async () => {
-        if (mode === 'down') throw new Error('connect ECONNREFUSED');
-        return { term: 7, nodeId: 'other-node-aaaaaaaa', updatedAt: stamp };
-      },
-    };
-    const done = _runTakeoverGuard(store, 'self-node', false);
-    await vi.advanceTimersByTimeAsync(0);
-    const before = _getTakeoverGuardView();
-    expect(before.takeoverHold).toBeNull();
-    expect(typeof before.takeoverGuardUnreadableSince).toBe('number');
-    await vi.advanceTimersByTimeAsync(TERM_GUARD_POLL_MS * 2);
-
-    mode = 'up';
-    await vi.advanceTimersByTimeAsync(TERM_GUARD_POLL_MS);
-    const holding = _getTakeoverGuardView();
-    expect(holding.takeoverGuardUnreadableSince).toBeNull();
-    expect(holding.takeoverHold?.observedTerm).toBe(7);
-    expect(holding.takeoverHold?.storeUnreachableSince).toBeNull();
-
-    mode = 'down';
-    await vi.advanceTimersByTimeAsync(TERM_GUARD_POLL_MS * 3);
-    const blind = _getTakeoverGuardView();
-    expect(typeof blind.takeoverHold?.storeUnreachableSince).toBe('number');
-
-    mode = 'up';
-    stamp = 2;
-    await vi.advanceTimersByTimeAsync(TERM_GUARD_POLL_MS);
-    expect(_getTakeoverGuardView().takeoverHold?.storeUnreachableSince).toBeNull();
-
-    const outages = warn.mock.calls.filter(args => String(args[0]).includes('control store did not answer'));
-    expect(outages.length).toBe(2);
-
-    mode = 'down';
-    store.getTerm = async () => null;
-    await vi.advanceTimersByTimeAsync(TERM_GUARD_POLL_MS);
-    expect(await done).toBeNull();
-    expect(_getTakeoverGuardView().takeoverHold).toBeNull();
-  });
-});
-
 describe('review fixes: disk scope by data mode, CLI fleet state failure', () => {
   it('a postgres-mode node without a live backend is never exact', async () => {
     const { diskScopeFor } = await import('../../src/bot/internalSetup/utils/metrics/samplers');
@@ -173,14 +112,6 @@ describe('review fixes: disk scope by data mode, CLI fleet state failure', () =>
     expect(diskScopeFor('postgres', true)).toBe('localOnly');
     expect(diskScopeFor('file', true)).toBe('localOnly');
     expect(diskScopeFor('file', false)).toBe('local');
-  });
-
-  it("'transform status' treats reachable:false as a failure carrying the error", async () => {
-    const { asFleetStateFailure } = await import('../../src/cli/commands');
-    const down: any = { ok: true, status: 200, body: { success: true, reachable: false, error: 'Fleet state unavailable: x', transformation: null } };
-    expect((asFleetStateFailure(down).body as any).success).toBe(false);
-    const up: any = { ok: true, status: 200, body: { success: true, reachable: true, transformation: null } };
-    expect(asFleetStateFailure(up)).toBe(up);
   });
 
   it("'fleet state' exits with an error when the child does not answer", async () => {

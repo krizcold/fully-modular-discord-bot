@@ -4,7 +4,7 @@
 // never the reverse).
 
 import { DataBackend, FenceToken } from './backend';
-import { routeFor } from './routeResolver';
+import { resolveDataBackend } from '../../../../utils/envLoader';
 import { WorkingSetManager } from './workingSet';
 import { setOwnedGuildCatalog } from '../dataManager';
 
@@ -15,22 +15,8 @@ const HYDRATE_RETRY_CAP_MS = 30_000;
 // The operator data route's wait for a guild's set (Discord interactions hold in boot.ts).
 const INTERACTION_WAIT_MS = 2500;
 const EVENT_BUFFER_CAP = 256;
-// Decline-lease deadline: unhydrated guilds + unhealthy backend past this
-// hands the lease back rather than sitting on shards it cannot serve.
-const HYDRATION_DECLINE_MS = 30_000;
 
-export type LeaseDeclineReason = 'hydration-timeout' | 'deposed-at-hydration';
-
-// Module-level (not per-driver): the fleet wiring registers once and the
-// handler survives a runtime recycle (URL rotation reconstructs the driver).
-// Never wired on masters or standalone - their self-grants never decline.
-let declineHandler: ((reason: LeaseDeclineReason, shardIds: number[]) => void) | null = null;
-
-export function setLeaseDeclineHandler(cb: (reason: LeaseDeclineReason, shardIds: number[]) => void): void {
-  declineHandler = cb;
-}
-
-// Local copy of the guild->shard formula (placement.ts) to avoid a fleet import.
+// Discord's guild->shard formula; dataManager.ts holds the same copy.
 function guildIdToShardId(guildId: string, shardCount: number): number {
   try {
     return Number((BigInt(guildId) >> 22n) % BigInt(Math.max(1, shardCount)));
@@ -77,12 +63,6 @@ export class DataReadinessDriver {
     clearInterval(this.catalogTimer);
   }
 
-  /** Hand every lease back now, as a hydration timeout would: the database this driver fronts can no longer serve them. */
-  declineAll(reason: LeaseDeclineReason): void {
-    if (!declineHandler || this.shardIds.length === 0) return;
-    declineHandler(reason, [...this.shardIds]);
-  }
-
   /** Boot hook: store identity verified; hydrate whatever leases arrived while held. */
   release(): void {
     if (!this.held) return;
@@ -91,19 +71,6 @@ export class DataReadinessDriver {
       void this.hydrateShards([...this.shardIds]);
       void this.refreshCatalog();
     }
-  }
-
-  /**
-   * Delivery hook (B7-F7): back to held, so nothing more hydrates from a
-   * database not yet proven against its master's term. idleOnly holds only a
-   * driver no lease or hydrated guild has reached yet; the result says whether
-   * the driver is held.
-   */
-  hold(idleOnly = false): boolean {
-    if (this.held) return true;
-    if (this.stopped || (idleOnly && (this.shardIds.length > 0 || this.ws.readyGuilds().length > 0))) return false;
-    this.held = true;
-    return true;
   }
 
   /** Fleet hook: the node's lease set changed (grant adoption). */
@@ -127,14 +94,6 @@ export class DataReadinessDriver {
       this.settleInitialIfReady();
     }
     void this.refreshCatalog();
-  }
-
-  /** Fleet hook: every lease is gone (revoke-all or TTL expiry). */
-  onLeaseLost(): void {
-    const shards = this.shardIds;
-    this.shardIds = [];
-    this.lease = null;
-    if (shards.length > 0) void this.unloadShards(shards);
   }
 
   /**
@@ -161,8 +120,8 @@ export class DataReadinessDriver {
       this.hydrateOnDemand(guildId);
       const waited = await this.ws.awaitReady(guildId, Math.max(0, until - performance.now()));
       if (waited !== 'gone') return waited === 'ready';
-      // The set it waited on was evicted with none hydrating in its place: the route that serves the guild now decides.
-      if (routeFor(guildId) === 'file') return true;
+      // The set it waited on was evicted with none hydrating in its place: the backend that serves the guild now decides.
+      if (resolveDataBackend() === 'file') return true;
     }
   }
 
@@ -192,19 +151,16 @@ export class DataReadinessDriver {
   }
 
   /**
-   * The dispatch gate's reading of a guild on this driver (R1-J2; boot.ts reads the exit drain, a refused layer and
-   * the freeze first). since is the hold's start: 'moved' only for a claim deposed since then. A leased guild with no
-   * set gets one claim, as admitInteraction kicks today; a hold that finds it hydrating kicks none.
+   * The dispatch gate's reading of a guild on this driver (R1-J2; boot.ts reads the exit drain and a refused layer
+   * first). since is the hold's start: 'moved' only for a claim deposed since then. A leased guild with no set gets
+   * one claim, as admitInteraction kicks today; a hold that finds it hydrating kicks none. A set frozen as its shard
+   * left, with the shard leased here again, waits for the re-grant's hydrate.
    */
-  causeOf(guildId: string, since: number): 'admit' | 'moving' | 'moved' | 'not-served' | 'loading' {
+  causeOf(guildId: string, since: number): 'admit' | 'moved' | 'not-served' | 'loading' {
     const state = this.ws.stateOf(guildId);
     if (state === 'ready') return 'admit';
     if (state === 'fenced') return 'moved';
-    // Only the lease-only drain freezes a set while its shard is still leased here; one frozen as its shard left is
-    // not being moved.
-    if (state === 'frozen-retained') return this.isLeasedHere(guildId) ? 'moving' : 'not-served';
     if (!this.isLeasedHere(guildId)) return 'not-served';
-    if (state === 'hydrating') return this.ws.freezesWhenReady(guildId) ? 'moving' : 'loading';
     if (state === null) {
       if ((this.deposedAt.get(guildId) ?? -Infinity) >= since) return 'moved';
       this.hydrateOnDemand(guildId);
@@ -244,35 +200,22 @@ export class DataReadinessDriver {
   }
 
   private async hydrateShards(shards: number[]): Promise<void> {
-    // Decline deadline: still-unhydrated shards on an unhealthy backend get
-    // handed back instead of held unservable. Healthy-but-slow keeps working.
-    const declineTimer = setTimeout(() => {
-      if (this.stopped || !declineHandler || this.backend.healthy()) return;
-      const affected = shards.filter(s => this.shardIds.includes(s));
-      if (affected.length === 0) return;
-      declineHandler('hydration-timeout', affected);
-    }, HYDRATION_DECLINE_MS);
-    declineTimer.unref();
-    try {
-      let guilds: string[] = [];
-      for (let attempt = 0; !this.stopped; attempt++) {
-        try {
-          guilds = await this.backend.listOwnedGuilds(shards, this.shardCount);
-          break;
-        } catch {
-          await sleep(backoff(attempt));
-          // Shards may have been revoked while we waited.
-          const still = shards.filter(s => this.shardIds.includes(s));
-          if (still.length === 0) return;
-        }
+    let guilds: string[] = [];
+    for (let attempt = 0; !this.stopped; attempt++) {
+      try {
+        guilds = await this.backend.listOwnedGuilds(shards, this.shardCount);
+        break;
+      } catch {
+        await sleep(backoff(attempt));
+        // Shards may have been revoked while we waited.
+        const still = shards.filter(s => this.shardIds.includes(s));
+        if (still.length === 0) return;
       }
-      for (let i = 0; i < guilds.length; i += HYDRATION_FANOUT) {
-        await Promise.all(guilds.slice(i, i + HYDRATION_FANOUT).map(g => this.hydrateWithRetry(g)));
-      }
-      this.settleInitialIfReady();
-    } finally {
-      clearTimeout(declineTimer);
     }
+    for (let i = 0; i < guilds.length; i += HYDRATION_FANOUT) {
+      await Promise.all(guilds.slice(i, i + HYDRATION_FANOUT).map(g => this.hydrateWithRetry(g)));
+    }
+    this.settleInitialIfReady();
   }
 
   /**
@@ -309,27 +252,24 @@ export class DataReadinessDriver {
         // Its lease moved while it hydrated: a re-grant renews the fence, a
         // revoke keeps it frozen, never served unleased.
         if (this.isLeasedHere(guildId)) {
-          // A drain froze it under the grant before (its move aborted and
-          // the shard is granted here again): hydrated again, it serves.
+          // Frozen under an older grant meanwhile (its shard left and came
+          // back): hydrated again, it serves.
           if (this.ws.frozenBefore(guildId, this.fenceFor(guildId))) continue;
           this.ws.refreshFence(guildId, this.fenceFor(guildId));
         } else await this.ws.unloadToFrozenRetained(guildId, () => !this.isLeasedHere(guildId));
         return;
       }
       // A caller joined while this attempt was on the wire, under a fresh grant or the same one: it claims again at
-      // once, from the first backoff, under the grant held now; a deposed answer declines only when no caller joined while it was on the wire.
+      // once, from the first backoff, under the grant held now; a deposed answer stops it only when no caller joined while it was on the wire.
       if (loop.woken) {
         attempt = -1;
         continue;
       }
       if (outcome === 'deposed') {
-        // A 0-row claim: a newer owner holds this guild. A healthy node must
-        // not sit on a lease it can never serve - decline immediately (fleet
-        // wiring; masters and standalone log only).
+        // A 0-row claim: a newer owner holds this guild.
         this.deposedAt.set(guildId, performance.now());
         console.error(`[Data] Hydration claim for guild ${guildId} lost to a newer owner; not serving it`);
         this.ws.dropWaiters(guildId);
-        declineHandler?.('deposed-at-hydration', [guildIdToShardId(guildId, this.shardCount || 1)]);
         return;
       }
       await Promise.race([sleep(backoff(attempt)), new Promise<void>(resolve => { loop.resume = resolve; })]);
@@ -356,7 +296,7 @@ export class DataReadinessDriver {
     if (waited !== 'not-ready') {
       for (const replay of queue) {
         // 'gone': the set they waited on was evicted with none hydrating in its place, so each goes back through the gate.
-        if (waited === 'ready' || routeFor(guildId) === 'file' || this.isReadyNow(guildId)) this.replay(guildId, replay);
+        if (waited === 'ready' || resolveDataBackend() === 'file' || this.isReadyNow(guildId)) this.replay(guildId, replay);
         else if (this.isLeasedHere(guildId)) this.admitEvent(guildId, replay);
         else dropped += 1;
       }

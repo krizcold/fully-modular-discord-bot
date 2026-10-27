@@ -1,7 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { setRouteOverride } from '../../src/bot/internalSetup/utils/dataBackends/routeResolver';
-import { CarryFate } from '../../src/bot/internalSetup/utils/dataBackends/workingSet';
+import { setBackendKind } from '../helpers/backendKind';
 import { tokenFor } from '../helpers/fakeStore';
 import { fakeClock, LEASED, NOT_LEASED, readinessRig, stopDrivers, watch } from '../helpers/readinessRig';
 
@@ -32,16 +31,6 @@ const between = {
     act: (r: Rig, g: string) => expect(r.ws.delete(g, 'm', 'a.json')).toBe('accepted'),
     read: undefined,
     stored: undefined,
-  },
-  'a carry': {
-    act: (r: Rig, g: string) => r.ws.adoptDirty([{
-      guildId: g,
-      docs: [{ key: 'm/a.json', content: '{"v":3}', tombstone: false, dirtySince: Date.now() }],
-      appends: [],
-      fate: new CarryFate(),
-    }]),
-    read: { v: 3 },
-    stored: '{"v":3}',
   },
 };
 
@@ -79,30 +68,6 @@ describe('a second hydrate of a guild while the first is in flight', () => {
       expect(await r.ws.confirm(ticket, 2000)).toBe('ok');
       expect(r.store.docs.get(row(g))).toBe(between[made].stored);
     });
-
-  it('keeps a freeze taken after the first ended, under the same grant', async () => {
-    const { r, g, second } = await overlapped('the same grant');
-    r.ws.freezeRetained(g);
-    r.store.releaseHydrations();
-    expect(await second).toBe('ready');
-    expect(r.ws.stateOf(g)).toBe('frozen-retained');
-    expect(r.ws.save(g, 'm', 'a.json', '{"v":9}')).toBe('frozen-window');
-  });
-
-  it('keeps a freeze taken while both wait, under the same grant', async () => {
-    const r = readinessRig();
-    const g = r.guild();
-    r.store.hydrateMode = 'held';
-    const token = tokenFor();
-    const first = r.ws.hydrate(g, token);
-    const second = r.ws.hydrate(g, token);
-    r.ws.freezeRetained(g);
-    await tick();
-    r.store.releaseHydrations();
-    expect(await first).toBe('ready');
-    expect(await second).toBe('ready');
-    expect(r.ws.stateOf(g)).toBe('frozen-retained');
-  });
 
   it('joins a reclaim of a kept set on the wire instead of answering unavailable', async () => {
     const r = readinessRig();
@@ -241,7 +206,7 @@ describe('the readiness driver runs one retry loop per guild', () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(r.store.hydrationsSent).toBe(1);
     r.store.listOwnedGuilds = async () => [g];
-    r.driver.onLeaseLost();
+    r.driver.onLeaseChanged(NOT_LEASED);
     r.driver.onLeaseChanged(LEASED);
     await vi.advanceTimersByTimeAsync(0);
     expect(r.store.hydrationsSent).toBe(2);
@@ -270,7 +235,7 @@ describe('the readiness driver runs one retry loop per guild', () => {
       await vi.advanceTimersByTimeAsync(15_000);
       expect(r.store.hydrationsSent).toBe(7);
       r.store.listOwnedGuilds = async () => [g];
-      r.driver.onLeaseLost();
+      r.driver.onLeaseChanged(NOT_LEASED);
       r.driver.onLeaseChanged({ ...LEASED, epoch: 2 });
       await vi.advanceTimersByTimeAsync(0);
       r.store.releaseHydrations(answer);
@@ -351,7 +316,7 @@ describe('the readiness driver runs one retry loop per guild', () => {
     expect(r.driver.admitEvent(g, () => { seen.push(1); })).toBe(false);
     const admitted = r.driver.admitInteraction(g);
     await vi.advanceTimersByTimeAsync(0);
-    setRouteOverride(g, 'file');
+    setBackendKind('file');
     r.ws.evict(g);
     r.store.releaseHydrations();
     await vi.advanceTimersByTimeAsync(0);
@@ -501,7 +466,7 @@ describe('the readiness driver runs one retry loop per guild', () => {
     expect(r.driver.admitEvent(g, () => { seen.push(1); })).toBe(false);
     await vi.advanceTimersByTimeAsync(0);
     r.store.listOwnedGuilds = async () => [g];
-    r.driver.onLeaseLost();
+    r.driver.onLeaseChanged(NOT_LEASED);
     r.driver.onLeaseChanged({ ...LEASED, epoch: 2 });
     await vi.advanceTimersByTimeAsync(0);
     r.store.releaseHydrations('deposed');

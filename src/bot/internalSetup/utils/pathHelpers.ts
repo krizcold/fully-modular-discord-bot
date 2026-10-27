@@ -1,7 +1,6 @@
 import path from 'path';
 import fs from 'fs';
 import { DATA_ROOT, dataPath } from '../../../utils/dataRoot';
-import { resolveNodeRole } from '../fleet/nodeIdentity';
 import { recordLoadFailure } from './loadFailures';
 
 /**
@@ -198,10 +197,8 @@ export function findModuleManifests(): string[] {
 
   // Scan modulesDev directory (App Store repos in development)
   // Structure: modulesDev/{repoName}/Modules/{moduleName}/module.json
-  // Dev modules are strictly master-only: a co-worker never scans them even
-  // when present on disk (co-workers mirror the master via sync).
   const modulesDevDir = getModulesDevDir();
-  if (resolveNodeRole() !== 'co-worker' && pathPresent(modulesDevDir)) {
+  if (pathPresent(modulesDevDir)) {
     const repos = fs.readdirSync(modulesDevDir, { withFileTypes: true })
       .filter(dirent => dirent.isDirectory() && !dirent.name.startsWith('.'))
       .map(dirent => dirent.name);

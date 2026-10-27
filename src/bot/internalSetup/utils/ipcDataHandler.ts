@@ -1,24 +1,19 @@
 /**
- * IPC Data Handler - the webui parent's write-through-owner and read hops
- * (spec 6.3). The parent never writes a postgres-routed guild itself: every
- * guild data op lands here, is applied locally when this node owns the guild,
- * and is otherwise forwarded by the master to the owning worker over the
- * control channel. Operator writes are durability-immediate (confirmed before
+ * IPC Data Handler - the webui parent's guild data writes and reads. The
+ * parent never writes a postgres-routed guild itself: every guild data op
+ * lands here and is applied by this process. Operator writes are durability-immediate (confirmed before
  * the ok), so 'ok' means committed and 'pending' means accepted-but-retrying;
  * a delete that finds nothing, with no earlier delete of it still to land, is
  * done at once.
  */
 
-import * as fs from 'fs';
 import * as path from 'path';
 import { dataPath } from '../../../utils/dataRoot';
 import {
   confirmWrite,
   deleteDataTracked,
   deleteGuildNamespace,
-  isGuildWriteFrozen,
   listGuildDataFiles,
-  listGuildDataKeys,
   flushFailing,
   guildDocFileQueue,
   readGuildDocRaw,
@@ -32,9 +27,34 @@ import { ROOT_CONFIG_PATH } from './configManager';
 import { isInternalGlobalRel } from './configDiscovery';
 import { DataBackendUnavailableError, getWorkingSet } from './dataBackends/workingSet';
 import { awaitGuildDataReady } from './dataBackends/boot';
-import { getFleetState } from '../fleet/state';
-import { guildIdToShardId } from '../fleet/placement';
-import type { DataReadReply, DataWriteReply } from '../fleet/protocol';
+
+type DataOpCode = 'frozen' | 'not-owner' | 'backend-unavailable' | 'bot-down' | 'invalid' | 'io-error';
+
+export interface DataWriteReply {
+  ok: boolean;
+  code?: DataOpCode;
+  error?: string;
+  /** Accepted, flush still retrying. */
+  pending?: boolean;
+  /** Why an accepted write is not durable yet. */
+  note?: string;
+}
+
+export interface DataReadReply {
+  ok: boolean;
+  /** Raw JSON text of the requested file; absent for a listing. */
+  contentJson?: string;
+  /** Listing when no filename was requested. */
+  files?: string[];
+  /** A file-routed doc: the answering process still holds a queued write of it; failing: that write's last flush failed. */
+  pending?: boolean;
+  failing?: boolean;
+  /** unreadable: the file exists and could not be read (error holds the errno code). no-answer (web UI side): the child never answered. */
+  code?: DataOpCode | 'unreadable' | 'no-answer';
+  /** no-answer only: the read timed out, the child stopped before answering, or the message could not be sent. */
+  cause?: 'timeout' | 'stopped' | 'failed';
+  error?: string;
+}
 
 export interface GuildDataWriteRequest {
   guildId: string;
@@ -60,19 +80,6 @@ export interface GuildDataReadRequest {
   module: string;
   /** No filename = list the module's files. */
   filename?: string;
-  /** With no filename: list every guild data key as 'module/filename' (guild-root files are bare filenames); ignores module. */
-  scope?: 'all';
-}
-
-/**
- * Master-only forwarder to the owning worker (registered by fleet bootstrap,
- * which stamps the wire term; module-level so a fleet re-init keeps the
- * latest hop).
- */
-export type DataOpForwarder = (kind: 'write' | 'read', request: GuildDataWriteRequest | GuildDataReadRequest) => Promise<DataWriteReply | DataReadReply>;
-let forwarder: DataOpForwarder | null = null;
-export function setDataOpForwarder(cb: DataOpForwarder | null): void {
-  forwarder = cb;
 }
 
 function validSegment(value: string, allowSubpath: boolean): boolean {
@@ -92,27 +99,17 @@ function validateWrite(req: GuildDataWriteRequest): string | null {
   return null;
 }
 
-/** True when this node serves the guild itself (standalone counts as local). */
-function servedLocally(guildId: string): boolean {
-  const fleet = getFleetState();
-  if (!fleet.initialized || fleet.standalone || fleet.shardCount <= 0) return true;
-  const shardId = guildIdToShardId(guildId, fleet.shardCount);
-  return fleet.leases.some(l => l.shardId === shardId);
-}
-
 /**
- * Owner-side apply (identical on master and worker): freeze check, facade
- * write so coalescing/metrics/fencing engage, then a bounded durability flush.
+ * Facade write so coalescing/metrics/fencing engage, then a
+ * bounded durability flush.
  */
-// Inside the master's 10 s hop to the owner (and the web UI's 15 s wait),
-// so the delete's answer is the one the operator sees.
+// Inside the web UI's 15 s wait, so the delete's answer is the one the operator sees.
 const OPERATOR_FLUSH_MS = 5000;
 
 export async function applyOperatorDataWrite(req: GuildDataWriteRequest): Promise<DataWriteReply> {
   const invalid = validateWrite(req);
   if (invalid) return { ok: false, code: 'invalid', error: invalid };
   const { guildId, module, filename, op } = req;
-  if (isGuildWriteFrozen(guildId)) return { ok: false, code: 'frozen' };
   if (!(await awaitGuildDataReady(guildId))) {
     return { ok: false, code: 'backend-unavailable', error: 'guild data is not ready' };
   }
@@ -135,21 +132,13 @@ export async function applyOperatorDataWrite(req: GuildDataWriteRequest): Promis
           retiredAt = value;
         }
       }
-      let restored: Awaited<ReturnType<typeof restoreGuildFromGraveyard>>;
-      try {
-        restored = await restoreGuildFromGraveyard(guildId, retiredAt);
-      } catch (error) {
-        if (error instanceof DataBackendUnavailableError && error.causeKey === 'database-read-only') {
-          return { ok: false, code: 'backend-unavailable', error: 'the database is read-only (a copy in recovery, SQLSTATE 25006); the guild was not restored' };
-        }
-        throw error;
-      }
+      const restored = await restoreGuildFromGraveyard(guildId, retiredAt);
       if (!restored.ok) return { ok: false, code: 'invalid', error: restored.error || 'restore refused' };
       return { ok: true };
     }
     if (op === 'delete-namespace') {
-      // Its working set frozen (a move's drain, a lease leaving): deleting
-      // it now would drop that freeze and the data mid-move.
+      // Its working set frozen (its lease left): deleting it now would drop
+      // that freeze and the data still being flushed.
       if (getWorkingSet()?.stateOf(guildId) === 'frozen-retained') return { ok: false, code: 'frozen' };
       const moved = await deleteGuildNamespace(guildId, 'webui-operator-delete', OPERATOR_FLUSH_MS);
       if (!moved) return { ok: false, code: 'io-error', error: 'guild data delete failed; nothing was removed' };
@@ -187,39 +176,11 @@ export async function applyOperatorDataWrite(req: GuildDataWriteRequest): Promis
   const outcome = await confirmWrite(ticket, 8000);
   if (outcome === 'ok') return { ok: true };
   if (outcome === 'pending') return { ok: true, pending: true };
-  if (outcome === 'deposed') return { ok: false, code: 'not-owner', error: 'guild ownership moved mid-write' };
+  if (outcome === 'deposed') return { ok: false, code: 'not-owner', error: 'another bot process took ownership of this guild mid-write; it was not saved' };
   // Refused by the store, the write is kept and retried: no failure, and the
   // operator learns it is not durable yet.
-  if (outcome === 'held') return { ok: true, pending: true, note: 'it is not saved yet; this node retries while it serves this guild, and loses it if the bot stops, the guild moves or the node loses its database first' };
-  return { ok: false, code: 'backend-unavailable', error: 'this write left this node before it was confirmed saved (the guild moved or was unloaded, its data was deleted or restored from the graveyard, or the node switched databases), so whether it was saved is unknown; reload the data to check' };
-}
-
-/**
- * Every data key of the guild namespace as 'module/filename' strings (guild-
- * root files are bare filenames). A file-routed guild is answered by a disk
- * scan mirroring configDiscovery's orphan rules: top-level *.json plus each
- * non-underscore subdirectory's *.json, non-recursive.
- */
-function listAllGuildDataKeys(guildId: string): string[] {
-  const backendKeys = listGuildDataKeys(guildId);
-  if (backendKeys !== null) {
-    return backendKeys.map(key => (key.module ? `${key.module}/${key.filename}` : key.filename));
-  }
-  const keys: string[] = [];
-  const guildDir = dataPath(guildId);
-  if (!fs.existsSync(guildDir)) return keys;
-  for (const entry of fs.readdirSync(guildDir, { withFileTypes: true })) {
-    if (entry.isFile() && entry.name.endsWith('.json')) {
-      keys.push(entry.name);
-    } else if (entry.isDirectory() && !entry.name.startsWith('_')) {
-      for (const inner of fs.readdirSync(dataPath(guildId, entry.name), { withFileTypes: true })) {
-        if (inner.isFile() && inner.name.endsWith('.json')) {
-          keys.push(`${entry.name}/${inner.name}`);
-        }
-      }
-    }
-  }
-  return keys;
+  if (outcome === 'held') return { ok: true, pending: true, note: 'it is not saved yet; this node retries while it serves this guild, and loses it if the bot stops or loses its database first' };
+  return { ok: false, code: 'backend-unavailable', error: 'this write left this node before it was confirmed saved (the guild was unloaded, its data was deleted or restored from the graveyard), so whether it was saved is unknown; reload the data to check' };
 }
 
 export async function applyOperatorDataRead(req: GuildDataReadRequest): Promise<DataReadReply> {
@@ -231,9 +192,6 @@ export async function applyOperatorDataRead(req: GuildDataReadRequest): Promise<
   }
   try {
     if (req.filename === undefined) {
-      if (req.scope === 'all') {
-        return { ok: true, files: listAllGuildDataKeys(req.guildId) };
-      }
       return { ok: true, files: listGuildDataFiles(req.guildId, req.module || undefined) };
     }
     const raw = readGuildDocRaw(req.guildId, req.module, req.filename);
@@ -284,27 +242,6 @@ export function applyOperatorGlobalRead(req: GlobalDataReadRequest): GlobalDataR
   return raw === null ? { ok: true, ...state } : { ok: true, contentJson: raw, ...state };
 }
 
-async function handleGuildWrite(req: GuildDataWriteRequest): Promise<DataWriteReply> {
-  const invalid = validateWrite(req);
-  if (invalid) return { ok: false, code: 'invalid', error: invalid };
-  if (servedLocally(req.guildId)) return applyOperatorDataWrite(req);
-  const fleet = getFleetState();
-  if (fleet.role === 'master' && forwarder) {
-    return forwarder('write', req) as Promise<DataWriteReply>;
-  }
-  return { ok: false, code: 'not-owner', error: 'this node does not serve this guild' };
-}
-
-async function handleGuildRead(req: GuildDataReadRequest): Promise<DataReadReply> {
-  if (!/^\d+$/.test(req.guildId ?? '')) return { ok: false, code: 'invalid', error: 'invalid guildId' };
-  if (servedLocally(req.guildId)) return applyOperatorDataRead(req);
-  const fleet = getFleetState();
-  if (fleet.role === 'master' && forwarder) {
-    return forwarder('read', req) as Promise<DataReadReply>;
-  }
-  return { ok: false, code: 'not-owner', error: 'this node does not serve this guild' };
-}
-
 export function setupDataIPCHandlers(): void {
   if (!process.send) {
     console.warn('[IPCDataHandler] process.send not available - guild data IPC not registered');
@@ -318,9 +255,9 @@ export function setupDataIPCHandlers(): void {
     if ((type !== 'data:guild-write' && type !== 'data:guild-read' && type !== 'data:global-read') || !requestId) return;
     try {
       const response = type === 'data:guild-write'
-        ? await handleGuildWrite((data || {}) as GuildDataWriteRequest)
+        ? await applyOperatorDataWrite((data || {}) as GuildDataWriteRequest)
         : type === 'data:guild-read'
-          ? await handleGuildRead((data || {}) as GuildDataReadRequest)
+          ? await applyOperatorDataRead((data || {}) as GuildDataReadRequest)
           : applyOperatorGlobalRead((data || {}) as GlobalDataReadRequest);
       process.send!({ requestId, data: response });
     } catch (error) {

@@ -4,24 +4,17 @@
 // claim can touch a database that turns out to be the wrong one.
 
 import { Guild, MessageFlags } from 'discord.js';
-import { connect } from 'net';
-import { credentialsReadError, DataBackendKind, loadCredentials, setFleetDataBackend, upsertCredentials } from '../../../../utils/envLoader';
-import { PostgresBackend, readControlTerm, releaseControlTerm, requireControlTerm } from './postgresBackend';
-import { initWorkingSet, getWorkingSet } from './workingSet';
-import type { DirtyCarry, DataUnavailableCause } from './workingSet';
+import { DataBackendKind, loadCredentials, resolveDataBackend } from '../../../../utils/envLoader';
+import { PostgresBackend } from './postgresBackend';
+import { initWorkingSet } from './workingSet';
+import type { DataUnavailableCause } from './workingSet';
 import { initDataReadiness, getDataReadiness, DataReadinessDriver } from './dataReadiness';
-import { forceRouteDefault, routeFor, applyRouteOverrides } from './routeResolver';
-import { evaluateRecognitionGuard, verifyStoreIdentity, readFileMarker, writeFileMarker, GuardVerdict } from './recognitionGuard';
-import { listGuilds } from './fileBackend';
-import { setGuildDataBackend, getGuildDataBackend, isClosedForExit, isGuildWriteFrozen } from '../dataManager';
+import { evaluateRecognitionGuard, verifyStoreIdentity, readFileMarker, GuardVerdict } from './recognitionGuard';
+import { setGuildDataBackend, isClosedForExit, closeGuildWrites } from '../dataManager';
 import { getConfigProperty } from '../configManager';
 import { ACK_MS, sweepLateWrites } from './replyGate';
 import { saveMark, type SaveMark } from './scopeRecord';
 import { ledgerOf, runAdmitted } from './writeLedger';
-
-function hasLocalGuildData(): boolean {
-  return listGuilds().length > 0;
-}
 
 // Startup barrier bound = the acceptance window: past it something is wrong
 // enough that holding clientReady longer helps nobody.
@@ -31,11 +24,10 @@ const IDENTITY_RETRY_MS = 5_000;
 export interface DataBootStatus {
   mode: DataBackendKind;
   state: 'file' | 'starting' | 'serving' | 'refused';
-  banner: string | null;
   refusalReason: string | null;
 }
 
-let bootStatus: DataBootStatus = { mode: 'file', state: 'file', banner: null, refusalReason: null };
+let bootStatus: DataBootStatus = { mode: 'file', state: 'file', refusalReason: null };
 
 export function getDataBootStatus(): DataBootStatus {
   return bootStatus.state === 'refused' ? bootStatus : { ...bootStatus, refusalReason: null };
@@ -81,8 +73,9 @@ function findGuildId(args: any[]): { id: string; fromGuild: boolean } | null {
 
 function refuse(reason: string, mode: DataBackendKind = bootStatus.mode): void {
   bootStatus = { ...bootStatus, mode, state: 'refused', refusalReason: reason };
+  closeGuildWrites();
   console.error(`[Data] REFUSING to serve: ${reason}`);
-  console.error('[Data] Gates stay closed; fix DATA_BACKEND/DATA_BACKEND_URL in the web UI env editor or run the backend transformation');
+  console.error('[Data] Gates stay closed; fix DATA_BACKEND/DATA_BACKEND_URL in the web UI env editor');
 }
 
 /** Called once at boot, before fleet init. Never throws; file mode is a no-op. */
@@ -100,14 +93,7 @@ export function initDataBackendLayer(): void {
     refuse(verdict.reason);
     return;
   }
-  const live = verdict.live;
-  if (verdict.state === 'transformation-required') {
-    forceRouteDefault(live);
-    const banner = `data lives in ${live}; run the backend transformation from the Fleet tab, or set DATA_BACKEND back to ${live}`;
-    bootStatus = { ...bootStatus, banner };
-    console.warn(`[Data] Transformation required: ${banner}`);
-  }
-  if (live === 'file') {
+  if (verdict.live === 'file') {
     bootStatus = { ...bootStatus, mode: 'file', state: 'file' };
     return;
   }
@@ -119,803 +105,32 @@ export function initDataBackendLayer(): void {
   startPostgresRuntime(url);
 }
 
-let activeUrl: string | null = null;
-// The endpoints of the last delivery this process applied. loadCredentials is
-// a fork-time snapshot in the bot child (upsertCredentials writes the file,
-// and a key the fork already carried is never re-read from it), so a delivery
-// that lands while the child runs reaches only here.
-let deliveredUrls: string[] | null = null;
-// The term a delivering master holds in its own database's control row
-// (B7-F7). A byte copy of the fleet database carries the same store id, so
-// the id alone cannot tell an older copy from the database itself, while the
-// copy's row stops at the term it was taken under. The highest one delivered
-// to this process; 0 until a delivery names one (a master's own runtime never
-// gets one).
-let requiredFloor = 0;
-// The url the active runtime was proven on, and the floor it held there.
-let provenFloor: { url: string; floor: number } | null = null;
-// A runtime a delivery sent back behind its gates while its own check runs.
-let regatedUrl: string | null = null;
-
-type FloorVerdict = { verdict: 'ok' } | { verdict: 'stale'; term: number } | { verdict: 'unknown' };
-
-/** Whether the database at url holds at least floor in its control row; one that never held a control store gives no verdict against it. */
-async function floorVerdict(url: string, floor: number): Promise<FloorVerdict> {
-  if (floor <= 0 || (provenFloor?.url === url && provenFloor.floor >= floor)) return { verdict: 'ok' };
-  try {
-    const term = await readControlTerm(url);
-    return term > 0 && term < floor ? { verdict: 'stale', term } : { verdict: 'ok' };
-  } catch {
-    return { verdict: 'unknown' };
-  }
-}
-
-type RecycleNotice = { recycled: boolean; unreachable: boolean; reason?: string };
-// Told when the data layer rebuilt or gave up its runtime outside a delivery's
-// own apply, so the fleet re-mirrors the held lease, or restarts, as it does
-// for a delivery.
-let recycledHandler: ((outcome: RecycleNotice) => void) | null = null;
-export function setRuntimeRecycledHandler(cb: (outcome: RecycleNotice) => void): void {
-  recycledHandler = cb;
-}
-// How the last delivery asked to be applied, for a move the data layer makes on its own.
-let deliveryPersists = true;
-let deliveryKeepsPrevious = false;
-
-/**
- * Whether a delivery writes /data/.env: never while the last read of it failed,
- * so no write of this delivery (its own, or a recycle's re-picked form) can
- * land beside keys it never saw.
- */
-export function deliveryPersistsFor(persist: boolean | undefined): boolean {
-  return persist !== false && credentialsReadError() === null;
-}
-// The backends a proof loop runs for: one loop each, however many deliveries find one unproven.
-const proving = new WeakSet<PostgresBackend>();
-
-/**
- * A serving runtime a delivery could not prove (its control row unreadable)
- * stays gated until a read proves it, or shows it an older copy (B7-F7): then
- * it is fenced for good and the node moves to a delivered form that holds the
- * term, carrying the writes the gate kept; while none answers, they wait.
- */
-async function proveServingFloor(url: string, own: PostgresBackend): Promise<void> {
-  if (proving.has(own)) return;
-  proving.add(own);
-  try {
-    await proveLoop(url, own);
-  } finally {
-    proving.delete(own);
-  }
-}
-
-async function proveLoop(url: string, own: PostgresBackend): Promise<void> {
-  let stale = false;
-  for (let attempt = 0; ; attempt++) {
-    await sleep(IDENTITY_RETRY_MS);
-    if (activeUrl !== url || getGuildDataBackend() !== own) return;
-    if (!stale) {
-      if (!own.isUnproven()) return;
-      const floor = requiredFloor;
-      const proof = await floorVerdict(url, floor);
-      if (activeUrl !== url || getGuildDataBackend() !== own) return;
-      if (proof.verdict === 'ok') {
-        provenFloor = { url, floor };
-        own.markProven(floor);
-        continue;
-      }
-      if (proof.verdict === 'unknown') {
-        if (attempt % 12 === 0) console.warn('[Data] The control row of the database this node serves from cannot be read, so nothing lands on it until it proves it holds its master\'s term; the writes wait in memory');
-        continue;
-      }
-      stale = true;
-      console.error(`[Data] The database this node serves from holds term ${proof.term} in its control row, below term ${floor} its master holds there: an older copy of the fleet database; no further write lands on it`);
-      getDataReadiness()?.hold();
-      own.fenceAsStale();
-      bootStatus = { ...bootStatus, state: 'starting' };
-    }
-    const alt = await reachableAlternative(url, getDeliveredBackendUrls());
-    if (activeUrl !== url || getGuildDataBackend() !== own) return;
-    if (alt === null) {
-      if (attempt % 12 === 0) console.error('[Data] No other delivered form of the fleet database answers from here, so the writes this node holds wait in memory for one');
-      continue;
-    }
-    const outcome = await recyclePostgresRuntime(alt, deliveryKeepsPrevious, { forms: getDeliveredBackendUrls(), persist: deliveryPersists });
-    if (outcome.recycled || outcome.unreachable) {
-      recycledHandler?.(outcome);
-      return;
-    }
-  }
-}
-
-// The floor before a witness-staged step-down raised it; null while none did.
-let witnessFloorFrom: number | null = null;
-// Released for the restart's flush: the heartbeat's later raises must not close it again.
-let witnessReleased = false;
-
-/**
- * A successor seen only on the witness raises the floor to its beacon's term:
- * the database this node serves from takes no further write until its control
- * row proves that term, so an older copy the fleet moved off takes none while a
- * notice may still carry the writes into the successor's. It proves once and
- * fences nothing: a delivery fences an older copy, and without one
- * releaseServingTerm hands the writes back to this database.
- */
-export function requireServingTerm(term: number): void {
-  if (witnessReleased || !Number.isSafeInteger(term) || term <= requiredFloor) return;
-  if (witnessFloorFrom === null) witnessFloorFrom = requiredFloor;
-  requiredFloor = term;
-  requireControlTerm(term);
-  const own = getGuildDataBackend();
-  const url = activeUrl;
-  if (url === null || !(own instanceof PostgresBackend) || !own.isUnproven()) return;
-  void floorVerdict(url, term).then(proof => {
-    if (proof.verdict !== 'ok' || activeUrl !== url || getGuildDataBackend() !== own || requiredFloor !== term) return;
-    provenFloor = { url, floor: term };
-    own.markProven(term);
-  });
-}
-
-/**
- * No notice came to carry the held writes into the successor's database: the
- * floor goes back to where the witness found it, so the shutdown flush lands
- * them on this node's own database, recoverable there if it is an older copy,
- * instead of the exit dropping them. False when no witness floor was raised.
- */
-export function releaseServingTerm(): boolean {
-  if (witnessFloorFrom === null) return false;
-  const from = witnessFloorFrom;
-  witnessFloorFrom = null;
-  requiredFloor = from;
-  releaseControlTerm(from);
-  witnessReleased = true;
-  return true;
-}
-
-/** Another of the given forms of one database that answers a TCP connect now and is no older copy of it, if any. */
-async function reachableAlternative(url: string, forms: string[]): Promise<string | null> {
-  for (const candidate of forms) {
-    if (candidate === url) continue;
-    try {
-      const parsed = new URL(candidate);
-      if (await tcpReachable(parsed.hostname, Number(parsed.port) || 5432)
-        && (await floorVerdict(candidate, requiredFloor)).verdict !== 'stale') return candidate;
-    } catch { /* not a URL this node can dial */ }
-  }
-  return null;
-}
-
-/** Every form of the database endpoint the fleet's master last delivered. */
-export function getDeliveredBackendUrls(): string[] {
-  if (deliveredUrls) return deliveredUrls;
-  const creds = loadCredentials();
-  return [creds.DATA_BACKEND_URL, creds.DATA_BACKEND_PUBLIC_URL, creds.DATA_BACKEND_LOCAL_URL]
-    .map(url => (url || '').trim())
-    .filter(url => url !== '');
-}
-
-/** True once a master delivered a database this process applied. */
-export function hasDelivery(): boolean {
-  return deliveredUrls !== null;
-}
-
-/** Make a prepared backend the live runtime; the caller owns identity verification. */
-function installRuntime(url: string, backend: PostgresBackend): DataReadinessDriver {
-  activeUrl = url;
-  provenFloor = null;
-  regatedUrl = null;
-  reportStore(url);
-  bootStatus = { ...bootStatus, mode: 'postgres', state: 'starting' };
-  const ws = initWorkingSet(backend);
-  setGuildDataBackend(backend);
-  return initDataReadiness(backend, ws, { held: true });
-}
-
-/** The parent's web UI reader follows the store this child serves, in-process deliveries included; null while it serves none. */
-function reportStore(url: string | null): void {
+/** The parent's web UI reader follows the store this child serves. */
+function reportStore(url: string): void {
   if (!process.send) return;
   try {
     process.send({ type: 'data:store', data: { url } }, () => { /* a closed channel is the parent gone */ });
-  } catch { /* the parent reads the node's own database until the next install */ }
+  } catch { /* the parent reads the database /data/.env names */ }
 }
 
 function startPostgresRuntime(url: string): void {
   const backend = new PostgresBackend({ url });
   backend.start();
-  void verifyIdentityLoop(url, installRuntime(url, backend));
-}
-
-const PICK_CONNECT_TIMEOUT_MS = 4_000;
-
-function tcpReachable(host: string, port: number): Promise<boolean> {
-  return new Promise(resolve => {
-    const socket = connect({ host, port });
-    const done = (ok: boolean): void => { socket.destroy(); resolve(ok); };
-    socket.setTimeout(PICK_CONNECT_TIMEOUT_MS, () => done(false));
-    socket.once('connect', () => done(true));
-    socket.once('error', () => done(false));
-  });
-}
-
-/**
- * Pick which delivered form this node can actually DIAL (F1): the container
- * form connects only from the sidecar's own host, and the public form cannot
- * hairpin from there. A TCP connect, not a DNS lookup, is the test - wildcard
- * resolvers (ISP NXDOMAIN redirection behind docker's embedded DNS) make bare
- * names "resolve" everywhere, which would strand a remote worker on an
- * undialable pick. When BOTH forms are dark the database itself is down and
- * the probe proves nothing about vantage: the form a SERVING runtime dials is
- * proven for this vantage and stays, anything else is the public one. A wrong
- * pick is never served: identity verification gates it, the recycle re-picks
- * among the delivered forms while it verifies, and the next delivery picks
- * again. A form that answers but holds an older term than the master
- * delivering it is an older copy of the database (a same-named one on this
- * host), never the fleet's: it counts as dark (B7-F7).
- */
-export async function pickDeliveredUrl(url: string, publicUrl: string): Promise<string> {
-  if (!publicUrl || publicUrl === url) return url;
-  try {
-    const local = new URL(url);
-    let localStale = false;
-    if (await tcpReachable(local.hostname, Number(local.port) || 5432)) {
-      localStale = (await floorVerdict(url, requiredFloor)).verdict === 'stale';
-      if (!localStale) return url;
-    }
-    const pub = new URL(publicUrl);
-    if (await tcpReachable(pub.hostname, Number(pub.port) || 5432)) return publicUrl;
-    // Both dark. History is not evidence: an unverified runtime may sit on
-    // exactly the form this node cannot dial (B7-F5). A node with no proven
-    // form is the remote one in every fleet shape but the sidecar's own host,
-    // where a live database would have answered the first probe. A runtime a
-    // delivery sent back behind its gates was proven dialable the same way, and
-    // its own check keeps them closed until it holds the master's term (B7-F7).
-    if (activeUrl !== null && (bootStatus.state === 'serving' || regatedUrl === activeUrl) && ((activeUrl === url && !localStale) || activeUrl === publicUrl)) return activeUrl;
-    return publicUrl;
-  } catch {
-    return publicUrl;
-  }
-}
-
-/**
- * Co-worker apply of the master-delivered backend (register reply, re-sent on
- * every reconnect). Reports `changed` when the effective backend or URL changed
- * (the caller refreshes and re-sends its capabilities) and `recycled` when the
- * postgres runtime was actually rebuilt (the caller must re-mirror its lease
- * into the fresh readiness driver; the two are NOT the same condition, because
- * an unchanged delivery can still resolve to a different reachable form).
- * Ordering per the spec: adopt -> persist env -> marker -> (re)start runtime,
- * gates stay closed until the new runtime's identity verifies.
- * keepPrevious leaves the outgoing pool open for a caller that shares it with
- * its control store and is about to restart anyway.
- * persist:false applies the delivery in this process only. A follower hold
- * (B6 map F28) runs the co-worker runtime under a master identity whose next
- * boot opens the store /data/.env names: a persisted foreign URL would wedge
- * that boot in the takeover guard, and where /data/.env is where the node's
- * own URL lives it would overwrite the only record of it.
- */
-export async function applyDeliveredBackend(
-  info: { backend: DataBackendKind; url?: string; publicUrl?: string; controlTerm?: number; transformationId?: string; routes?: { guildId: string; backend: DataBackendKind }[] } | undefined,
-  opts?: { keepPrevious?: boolean; persist?: boolean },
-): Promise<{ changed: boolean; recycled: boolean; unreachable?: boolean; reason?: string }> {
-  const backend = info?.backend ?? 'file';
-  // Raised before the first await, so a grant landing while this delivery is
-  // applied cannot hydrate on a database not yet proven against it (B7-F7).
-  const delivered = info?.controlTerm;
-  if (backend === 'postgres' && !info?.transformationId && typeof delivered === 'number' && Number.isSafeInteger(delivered) && delivered > requiredFloor) {
-    requiredFloor = delivered;
-    requireControlTerm(delivered);
-  }
-  deliveryPersists = deliveryPersistsFor(opts?.persist);
-  deliveryKeepsPrevious = opts?.keepPrevious === true;
-  // A runtime that opened its gates before any master was heard (the boot's,
-  // on the url /data/.env names) and serves no lease yet goes back behind them
-  // until it is proven: it may be an older copy of the database.
-  const driver = getDataReadiness();
-  if (activeUrl !== null && driver && requiredFloor > 0 && bootStatus.state === 'serving'
-    && !(provenFloor?.url === activeUrl && provenFloor.floor >= requiredFloor) && driver.hold(true)) {
-    bootStatus = { ...bootStatus, state: 'starting' };
-    regatedUrl = activeUrl;
-    void verifyIdentityLoop(activeUrl, driver);
-  }
-  const publicUrl = (info?.publicUrl || '').trim();
-  const localUrl = (info?.url || '').trim();
-  // Checked before the pick's probes, whether or not this delivery names it:
-  // a serving runtime on an older copy of the database (the fleet moved off
-  // it, or a same-named one on this host answered for it) stops writing there
-  // at once, its accepted writes kept for the database the recycle below moves
-  // it to (B7-F7).
-  let staleServing: number | null = null;
-  let keepServing: string | null = null;
-  if (activeUrl !== null && bootStatus.state === 'serving') {
-    const serving = activeUrl;
-    const own = getGuildDataBackend();
-    const floor = requiredFloor;
-    const proof = await floorVerdict(serving, floor);
-    if (activeUrl === serving && proof.verdict === 'stale') {
-      staleServing = proof.term;
-      console.error(`[Data] The database this node serves from holds term ${proof.term} in its control row, below term ${floor} its master holds there: an older copy of the fleet database; no further write lands on it`);
-      getDataReadiness()?.hold();
-      if (own instanceof PostgresBackend) own.fenceAsStale();
-      bootStatus = { ...bootStatus, state: 'starting' };
-    } else if (activeUrl === serving) {
-      if (proof.verdict === 'ok' && floor > 0) {
-        provenFloor = { url: serving, floor };
-        if (own instanceof PostgresBackend) own.markProven(floor);
-      }
-      // Still gated (its row could not be read, or a later delivery raised the
-      // floor meanwhile): nothing lands on it until its own loop proves it.
-      if (own instanceof PostgresBackend && own.isUnproven()) void proveServingFloor(serving, own);
-      keepServing = serving;
-    }
-  }
-  // Mid-transformation deliveries carry the url with backend 'file' too, so
-  // the pick keys on the url's presence, not on the backend.
-  let url = localUrl ? await pickDeliveredUrl(localUrl, publicUrl) : localUrl;
-  // A delivery naming no endpoint at all leaves what is known standing: it
-  // cannot show that a copy's source was left behind, and a verdict from it
-  // would be one drawn from silence.
-  const named = [url, publicUrl, localUrl].map(u => u.trim()).filter(u => u !== '');
-  if (named.length > 0) deliveredUrls = Array.from(new Set(named));
-  // A SERVING runtime already on one of these forms stays on it: a pick taken
-  // during a blip must not recycle the node off the right database onto
-  // another form of the same one (B7-F5). A runtime the gates never opened for
-  // is not kept, since it may sit on a form this node cannot dial, and the pick
-  // just taken is what heals it.
-  if (keepServing !== null && activeUrl === keepServing && bootStatus.state === 'serving' && named.includes(activeUrl)) url = activeUrl;
-  const creds = loadCredentials();
-  const envBackend = (creds.DATA_BACKEND || 'file').trim() || 'file';
-  const envUrl = (creds.DATA_BACKEND_URL || '').trim();
-  const envPublicUrl = (creds.DATA_BACKEND_PUBLIC_URL || '').trim();
-  const envLocalUrl = (creds.DATA_BACKEND_LOCAL_URL || '').trim();
-  const changed = backend !== envBackend
-    || (backend === 'postgres' && (url !== envUrl || publicUrl !== envPublicUrl || localUrl !== envLocalUrl));
-
-  setFleetDataBackend(backend === 'postgres' ? { backend, url } : { backend });
-
-  const persists = deliveryPersistsFor(opts?.persist);
-  deliveryPersists = persists;
-  const readError = credentialsReadError();
-  if (readError && opts?.persist !== false) {
-    console.warn('[Data] Could not read /data/.env, so the delivered backend is applied in-memory only and nothing is written there:', readError);
-  } else if (changed && persists) {
-    const patch: Record<string, string> = { DATA_BACKEND: backend };
-    if (backend === 'postgres') {
-      patch.DATA_BACKEND_URL = url;
-      // Both delivered forms verbatim, so this node can re-deliver the pair if
-      // it ever becomes master (the picked url alone loses the container form
-      // on remote nodes). Always written: an empty value clears a stale form
-      // left from a primary whose replication was since disabled (upsert
-      // cannot delete).
-      patch.DATA_BACKEND_LOCAL_URL = localUrl;
-      patch.DATA_BACKEND_PUBLIC_URL = publicUrl;
-    }
-    const result = upsertCredentials(patch);
-    if (!result.success) {
-      console.warn('[Data] Could not persist the delivered backend to /data/.env; applied in-memory only:', result.error);
-    }
-  }
-
-  const marker = readFileMarker();
-  if (info?.transformationId) {
-    // Mid-window delivery: adopt the routing map, and make sure the postgres
-    // runtime exists even while the serving default is file (converted or
-    // converting guilds need it). A delivered backend that differs from the
-    // local marker is the flip instruction this node missed while offline.
-    applyRouteOverrides(info.routes ?? []);
-    if (marker && marker.live !== backend) {
-      applyBackendFlip(backend);
-    } else if (url && activeUrl === null) {
-      startPostgresRuntime(url);
-    }
-  } else if (marker && marker.live !== backend && !hasLocalGuildData()) {
-    // Stale local marker with no local guild data: the master's delivered
-    // backend wins and the node rewrites its own marker (guard step 5).
-    writeFileMarker({ live: backend, storeId: null, flippedAt: Date.now(), transformationId: null });
-    forceRouteDefault(null);
-  }
-  if (bootStatus.banner && readFileMarker()?.live === backend) {
-    bootStatus = { ...bootStatus, banner: null };
-    console.log(`[Data] Transformation no longer required: the marker and the master's delivery both name ${backend}`);
-  }
-
-  if (backend === 'postgres') {
-    if (!url) {
-      refuse('the master delivered a postgres backend without a URL', 'postgres');
-      return { changed, recycled: false };
-    }
-    if (activeUrl === url && staleServing !== null) {
-      // The pick landed on the older copy itself. Another delivered form gets
-      // the recycle's whole budget to answer, so the writes the fence kept are
-      // carried; with none, nothing is left this node may serve from.
-      const other = named.find(u => u !== url);
-      if (other) {
-        const outcome = await recyclePostgresRuntime(other, opts?.keepPrevious === true, { forms: named, persist: persists });
-        return { changed, recycled: outcome.recycled, unreachable: outcome.unreachable, reason: outcome.reason };
-      }
-      const outcome = giveUpDelivery(getDataReadiness(), getWorkingSet(), opts?.keepPrevious !== true, `the database this node serves from holds term ${staleServing}, below term ${requiredFloor} its master holds, and no other form of the delivered one is named`);
-      return { changed, recycled: false, unreachable: true, reason: outcome.reason };
-    }
-    if (activeUrl === url) return { changed, recycled: false };
-    if (activeUrl !== null) {
-      console.warn('[Data] Delivered backend URL changed; recycling the postgres runtime and carrying unflushed writes to the new database');
-      const outcome = await recyclePostgresRuntime(url, opts?.keepPrevious === true, { forms: named, persist: persists });
-      return { changed, recycled: outcome.recycled, unreachable: outcome.unreachable, reason: outcome.reason };
-    }
-    startPostgresRuntime(url);
-  }
-  return { changed, recycled: false };
-}
-
-/**
- * Point the guild data layer at a different database for THIS PROCESS ONLY,
- * writing nothing to /data/.env.
- *
- * The delivered-backend lane persists on purpose: a worker must still know its
- * endpoint after a restart. A serve-only stand-in is the opposite case. It
- * re-derives its copy's endpoint from FLEET_DB_REPLICA_URL on every boot, and a
- * persisted value would outlive the stand-in that wrote it and need unwinding
- * later, on a node whose exits are several different code paths. Letting the
- * repoint die with the process is what keeps the step reversible at no cost,
- * which is the property 20.5 asks of serve-only.
- */
-export async function repointRuntimeForThisProcess(url: string): Promise<boolean> {
-  if (!url) return false;
-  setFleetDataBackend({ backend: 'postgres', url });
-  if (activeUrl === url) return true;
-  if (activeUrl !== null) return (await runRecycle(url, false)).recycled;
-  startPostgresRuntime(url);
-  return true;
-}
-
-/** True once the serving backend holds no unproven gate; false at the deadline (B7-F7). */
-export async function awaitServingProven(deadlineMs: number): Promise<boolean> {
-  const deadline = Date.now() + deadlineMs;
-  for (;;) {
-    const own = getGuildDataBackend();
-    if (!(own instanceof PostgresBackend) || !own.isUnproven()) return true;
-    if (Date.now() >= deadline) return false;
-    await sleep(500);
-  }
-}
-
-export function getActiveBackendUrl(): string | null {
-  return activeUrl;
-}
-
-/**
- * A follower hold's own database is behind the fleet's, or is the copy the
- * failback promotes (B6 map F28): the runtime booted on it must not serve, or
- * the shards the node it follows grants would write into a database the
- * failback wipes or promotes over. The runtime is stopped and the gates latch
- * closed until a delivery installs a database; one that cannot be dialed or
- * fails its identity check leaves them closed.
- */
-export function holdOwnRuntimeForDelivery(reason: string, stopBackend = true): void {
-  const own = activeUrl !== null && stopBackend ? getGuildDataBackend() : null;
-  // Unwound the way a recycle unwinds it: a driver left behind would take the
-  // lease a delivery's fresh driver then never learns of.
-  getDataReadiness()?.stop();
-  getWorkingSet()?.quiesce();
-  activeUrl = null;
-  provenFloor = null;
-  regatedUrl = null;
-  reportStore(null);
-  setGuildDataBackend(null);
-  bootStatus = { ...bootStatus, state: 'refused', refusalReason: reason };
-  console.error(`[Data] HOLDING the data layer: ${reason}`);
-  if (own) void own.stop().catch(() => { /* best effort */ });
-}
-
-/** Worker-side lazy runtime construction from a control-channel-delivered URL (C5). */
-export function ensureRuntimeWith(url: string): void {
-  if (activeUrl === null && url) startPostgresRuntime(url);
-}
-
-/**
- * Master-side pre-transformation ensure: the destination (or source) postgres
- * runtime must be up before any guild converts or any route flips postgres.
- */
-export function ensureTransformationRuntime(): { ok: boolean; error?: string } {
-  if (bootStatus.state === 'refused') return { ok: false, error: bootStatus.refusalReason || 'data layer refused' };
-  if (activeUrl !== null) return { ok: true };
-  const url = (loadCredentials().DATA_BACKEND_URL || '').trim();
-  if (!url) return { ok: false, error: 'DATA_BACKEND_URL is not set' };
-  startPostgresRuntime(url);
-  return { ok: true };
-}
-
-/**
- * The node's BACKEND_FLIP duty: swap the resolver default, clear the routing
- * map, write our own marker naming the destination. The postgres runtime is
- * left running either way (a file flip still retires postgres rows next).
- */
-export function applyBackendFlip(dest: DataBackendKind): void {
-  const marker = readFileMarker();
-  setFleetDataBackend(dest === 'postgres'
-    ? { backend: dest, url: activeUrl ?? (loadCredentials().DATA_BACKEND_URL || '').trim() }
-    : { backend: dest });
-  forceRouteDefault(null);
-  applyRouteOverrides(null);
-  writeFileMarker({
-    live: dest,
-    storeId: dest === 'postgres' ? (marker?.storeId ?? null) : null,
-    flippedAt: Date.now(),
-    transformationId: null,
-  });
-  bootStatus = { mode: dest, state: dest === 'postgres' ? 'serving' : 'file', banner: null, refusalReason: null };
-  console.log(`[Data] Backend flipped: every guild now routes to ${dest}`);
-}
-
-/** Bounded identity retries for a drain: a just-promoted database can be seconds late to answer. */
-const DRAIN_VERIFY_ATTEMPTS = 10;
-const DRAIN_VERIFY_RETRY_MS = 3000;
-// Failed identity checks between two looks for another delivered form.
-const REPICK_EVERY_FAILURES = 3;
-
-/** A master-delivered database: every form it was delivered in, and whether the pick is written to /data/.env. */
-interface DeliveryRecycle { forms: string[]; persist: boolean }
-
-/**
- * unreachable: a delivery this node could not install (it never answered, or
- * refused the identity check; reason names which) while this process holds
- * nothing it may serve from (B7-F5).
- */
-interface RecycleOutcome { recycled: boolean; unreachable: boolean; reason?: string }
-const NO_RECYCLE: RecycleOutcome = { recycled: false, unreachable: false };
-
-/** The form that verified is the one to boot on next time, whatever the pick persisted before the recycle ran. */
-function persistPickedForm(delivery: DeliveryRecycle, url: string): void {
-  if (!delivery.persist || url === (loadCredentials().DATA_BACKEND_URL || '').trim()) return;
-  const result = upsertCredentials({ DATA_BACKEND_URL: url });
-  if (!result.success) console.warn('[Data] Could not persist the re-picked backend form to /data/.env; applied in-memory only:', result.error);
-}
-
-/**
- * A delivery this node cannot install while the master has moved the fleet
- * off the database it served from: one more write there would fork the data
- * (B7-F5). The leases go back the way a hydration timeout hands them back, so
- * the master can place the shards elsewhere, the gates latch closed, and the
- * caller restarts the process: a fresh one picks the form again on its
- * register. Writes still buffered are dropped rather than flushed to the
- * abandoned store, and named. A superseded master keeps its pool (its control
- * store shares it) and restarts on its own step-down.
- */
-function giveUpDelivery(
-  oldReadiness: ReturnType<typeof getDataReadiness>,
-  oldWs: ReturnType<typeof getWorkingSet>,
-  stopBackend: boolean,
-  reason: string,
-): RecycleOutcome {
-  const dropped = oldWs?.dirtyGuildIds() ?? [];
-  if (dropped.length > 0) {
-    console.error(`[Data] ${dropped.length} guild(s) hold unflushed writes that are DROPPED at the hold (the fleet moved off this database): ${dropped.join(', ')}`);
-  }
-  oldReadiness?.declineAll('hydration-timeout');
-  holdOwnRuntimeForDelivery(reason, stopBackend);
-  return { recycled: false, unreachable: true, reason };
-}
-/** Bounded wait for flushes already on the wire, so their keys are visible to the drain again. */
-const DRAIN_SETTLE_MS = 15_000;
-
-const sleep = (ms: number) => new Promise<void>(resolve => { setTimeout(resolve, ms).unref?.(); });
-
-/**
- * URL change while serving. The outgoing runtime KEEPS SERVING until the new
- * database has proven its identity and taken every buffered write: installing
- * the cold runtime first would leave the node dropping guild events and
- * rejecting interactions for the whole verification window while its data sat
- * intact in memory. Only when the drain is done does the swap happen, and the
- * outgoing working set is silenced in the same breath - it carries a fence
- * token identical to its successor's, so a surviving retry from it would
- * overwrite live rows with no fence able to tell the two apart.
- * A transfer fences the old primary read-only before all this, so writes
- * accepted meanwhile exist only in that working set; flushing them at the old
- * database would lose every one. Writes that cannot be carried are named.
- * Returns whether the runtime actually changed.
- */
-let recycleTarget: string | null = null;
-let recycleQueue: Promise<RecycleOutcome> = Promise.resolve(NO_RECYCLE);
-
-/**
- * Single-flight per target. The master re-delivers the same backend on EVERY
- * register and the window below is long, so a flapping control socket would
- * otherwise start a second swap over the first one's fresh working set and
- * discard its writes with nothing left to name them. A genuinely different
- * target queues behind the one in flight rather than racing it.
- */
-function recyclePostgresRuntime(url: string, keepPrevious: boolean, delivery?: DeliveryRecycle): Promise<RecycleOutcome> {
-  if (recycleTarget === url) return recycleQueue;
-  recycleTarget = url;
-  recycleQueue = recycleQueue
-    .catch(() => NO_RECYCLE)
-    .then(() => runRecycle(url, keepPrevious, delivery))
-    .finally(() => { if (recycleTarget === url) recycleTarget = null; });
-  return recycleQueue;
-}
-
-async function runRecycle(url: string, keepPrevious: boolean, delivery?: DeliveryRecycle): Promise<RecycleOutcome> {
-  // A queued recycle can find the node already on its form (an earlier one
-  // re-picked it): nothing to do.
-  if (activeUrl === url) return NO_RECYCLE;
-  const oldReadiness = getDataReadiness();
-  const oldWs = getWorkingSet();
-  const oldBackend = getGuildDataBackend();
-  // Started only once the store verifies: a start provisions a store that
-  // lacks the schema and would mint an identity in one this node then refuses.
-  let incoming = new PostgresBackend({ url });
-  let carried: string[] = [];
-  let carryOver: DirtyCarry[] = [];
-  let repicked = false;
-  let staleTerm: number | null = null;
-  try {
-    let verified = false;
-    for (let attempt = 0; attempt < DRAIN_VERIFY_ATTEMPTS && !verified; attempt++) {
-      try {
-        staleTerm = null;
-        const identity = await verifyStoreIdentity(url);
-        if (!identity.ok) {
-          // A store still provisioning carries no identity yet and is asked
-          // again within the budget. Any other refusal is final, and under a
-          // delivery it ends the way a form that never answered does (B7-F5):
-          // whatever this database is, the previous one is no longer the fleet's.
-          if (identity.pending && attempt + 1 < DRAIN_VERIFY_ATTEMPTS) {
-            await sleep(DRAIN_VERIFY_RETRY_MS);
-            continue;
-          }
-          void incoming.stop().catch(() => { /* best effort */ });
-          if (!delivery) {
-            console.error(`[Data] The database this process was repointed at refused identity verification (${identity.reason}); staying on the current database`);
-            return NO_RECYCLE;
-          }
-          return giveUpDelivery(oldReadiness, oldWs, !keepPrevious, `the delivered database refused identity verification (${identity.reason}), and the previous one is no longer the fleet database`);
-        }
-        // An older copy of the fleet database, or one whose control row cannot
-        // be read yet, is asked again like a form that never answered, so a
-        // delivery re-picks among its forms (B7-F7).
-        const floor = requiredFloor;
-        const proof = await floorVerdict(url, floor);
-        if (proof.verdict !== 'ok') {
-          if (proof.verdict === 'stale') staleTerm = proof.term;
-          throw new Error('the control row does not hold the master\'s term');
-        }
-        incoming.markProven(floor);
-        verified = true;
-      } catch {
-        // A form this node cannot dial is re-picked, not waited on: the master
-        // delivers every form of its database, and the one that answers a TCP
-        // connect from here is the one to verify (B7-F5). Once, with a fresh
-        // budget; only the candidate backend moves, and nothing is installed
-        // or written until it verifies. The form this node already dials
-        // answering means the delivery names the database it is on: it stays.
-        if (delivery && !repicked && (attempt + 1) % REPICK_EVERY_FAILURES === 0) {
-          const alt = await reachableAlternative(url, delivery.forms);
-          if (alt !== null && alt === activeUrl) {
-            console.warn('[Data] The delivered database answers on the form this node already dials; staying on it');
-            void incoming.stop().catch(() => { /* best effort */ });
-            setFleetDataBackend({ backend: 'postgres', url: alt });
-            persistPickedForm(delivery, alt);
-            return NO_RECYCLE;
-          }
-          if (alt) {
-            console.warn('[Data] The delivered database answers on another of its forms; dialing that one instead');
-            void incoming.stop().catch(() => { /* best effort */ });
-            url = alt;
-            incoming = new PostgresBackend({ url });
-            repicked = true;
-            attempt = -1;
-          }
-        }
-        if (attempt + 1 < DRAIN_VERIFY_ATTEMPTS) await sleep(DRAIN_VERIFY_RETRY_MS);
-      }
-    }
-    if (!verified) {
-      void incoming.stop().catch(() => { /* best effort */ });
-      const why = staleTerm !== null
-        ? `holds term ${staleTerm} in its control row, below term ${requiredFloor} its master holds: an older copy of the fleet database`
-        : 'never answered the identity check';
-      if (!delivery) {
-        console.error(`[Data] The database this process was repointed at ${why}; staying on the current database`);
-        return NO_RECYCLE;
-      }
-      return giveUpDelivery(oldReadiness, oldWs, !keepPrevious, `the delivered database ${why}, and the previous one is no longer the fleet database`);
-    }
-    incoming.start();
-    if (delivery) {
-      setFleetDataBackend({ backend: 'postgres', url });
-      persistPickedForm(delivery, url);
-    }
-    if (oldWs) {
-      // A flush already on the wire has emptied its dirty set, so it is
-      // invisible to the drain until it comes back and re-dirties; waiting for
-      // it is what keeps those writes from vanishing between the two runtimes.
-      await oldWs.settleInFlight(DRAIN_SETTLE_MS);
-      const pending = oldWs.dirtyGuildIds();
-      if (pending.length > 0) {
-        const fencedBefore = oldWs.fencedRejectionCount();
-        oldWs.retargetBackend(incoming);
-        let leftover = await oldWs.flushAllDirty();
-        // A delivery that raised the floor during the verify, the settle or the
-        // flush gates the target, so nothing more landed on it: proven at the
-        // new floor it drains again. An older copy at it, or a row unread for
-        // the whole budget, ends the move with the current runtime and its
-        // writes kept, for its own loop to prove or leave (B7-F7).
-        for (let tries = 0; leftover.length > 0 && incoming.isUnproven(); tries++) {
-          const floor = requiredFloor;
-          const proof = await floorVerdict(url, floor);
-          if (proof.verdict === 'ok') {
-            incoming.markProven(floor);
-            leftover = await oldWs.flushAllDirty();
-            continue;
-          }
-          if (proof.verdict === 'stale' || tries + 1 >= DRAIN_VERIFY_ATTEMPTS) {
-            if (oldBackend) oldWs.retargetBackend(oldBackend);
-            void incoming.stop().catch(() => { /* best effort */ });
-            if (delivery && activeUrl !== null) setFleetDataBackend({ backend: 'postgres', url: activeUrl });
-            console.error(`[Data] The database this node was moving to does not prove term ${floor} its master holds; the move is abandoned and its writes stay with the current runtime`);
-            if (oldBackend instanceof PostgresBackend && oldBackend.isUnproven() && activeUrl !== null) void proveServingFloor(activeUrl, oldBackend);
-            return NO_RECYCLE;
-          }
-          await sleep(DRAIN_VERIFY_RETRY_MS);
-        }
-        carried = leftover;
-        const discarded = oldWs.fencedRejectionCount() - fencedBefore;
-        if (discarded > 0) {
-          console.error(`[Data] ${discarded} of ${pending.length} draining guild(s) had their unflushed writes DISCARDED as fenced during the recycle (candidates: ${pending.join(', ')})`);
-        }
-        if (leftover.length > 0 && incoming.isReadOnly()) {
-          // A stand-in's copy takes no writes yet: the outage's accepted writes
-          // ride into the new working set and flush when it does (the write
-          // step) or at the next recycle (the hand-back) (B7-F26).
-          carryOver = oldWs.exportDirty(leftover);
-          console.warn(`[Data] ${leftover.length} guild(s) hold writes the read-only copy cannot take yet; carried in memory until it does: ${leftover.join(', ')}`);
-        } else if (leftover.length > 0) {
-          console.error(`[Data] ${leftover.length} guild(s) could not drain into the new database and their writes are DROPPED: ${leftover.join(', ')}`);
-        }
-      }
-    }
-  } catch (error) {
-    console.warn('[Data] Error while recycling the postgres runtime:', error);
-    await incoming.stop().catch(() => { /* best effort */ });
-    return NO_RECYCLE;
-  }
-  // Named once: anything flushAllDirty already reported is not repeated here.
-  const stranded = (oldWs?.dirtyGuildIds() ?? []).filter(g => !carried.includes(g));
-  if (stranded.length > 0) {
-    console.error(`[Data] ${stranded.length} guild(s) still hold writes the old runtime could not place and they are DROPPED at the swap: ${stranded.join(', ')}`);
-  }
-  oldReadiness?.stop();
-  oldWs?.quiesce();
-  void verifyIdentityLoop(url, installRuntime(url, incoming));
-  if (carryOver.length > 0) getWorkingSet()?.adoptDirty(carryOver);
-  // NEVER awaited: pool.end() waits for checked-out clients, and a connection
-  // hung against a partitioned host would hold this result back for as long as
-  // the OS takes to give up - with the swap already complete, that would strand
-  // the caller before it re-mirrors the lease and leave the node serving
-  // nothing. A superseded master keeps its pool either way: its control store
-  // shares it and it restarts in seconds.
-  if (!keepPrevious && oldBackend) void oldBackend.stop().catch(() => { /* best effort */ });
-  return { recycled: true, unreachable: false };
+  reportStore(url);
+  bootStatus = { ...bootStatus, mode: 'postgres', state: 'starting' };
+  const ws = initWorkingSet(backend);
+  setGuildDataBackend(backend);
+  void verifyIdentityLoop(url, initDataReadiness(backend, ws, { held: true }));
 }
 
 async function verifyIdentityLoop(url: string, driver: DataReadinessDriver): Promise<void> {
   let logged = false;
-  let staleLogged = false;
   for (;;) {
-    // This loop outlives a runtime swap: it dials through its own one-shot
-    // client rather than the pool that was stopped, and an unreachable endpoint
-    // keeps it retrying indefinitely. installRuntime sets activeUrl before the
-    // incoming loop starts, so a mismatch means this loop belongs to a database
-    // the node has already moved off. Leaving it running lets it refuse() the
-    // whole data layer over a verdict about the WRONG database, and refuse() is
-    // a module-level latch nothing on the new runtime's path resets.
-    if (activeUrl !== url) return;
     try {
       const verdict = await verifyStoreIdentity(url);
-      if (activeUrl !== url) return;
       if (!verdict.ok) {
-        // A store still provisioning carries no identity yet (a standby that
-        // has not replayed the row, a store mid-restore): waited on like an
-        // unreachable one, never refused.
+        // A store still provisioning carries no identity yet (a store
+        // mid-restore): waited on like an unreachable one, never refused.
         if (!verdict.pending) {
           refuse(verdict.reason, 'postgres');
           return;
@@ -924,31 +139,13 @@ async function verifyIdentityLoop(url: string, driver: DataReadinessDriver): Pro
         // Release only once the marker holds the store id (minted by the
         // backend's own provisioning): hydration cannot proceed any earlier
         // anyway, and adopting it now makes a later URL swap detectable from
-        // the very next boot. Under a delivery the database must also hold
-        // its master's term: an older copy carries the same store id (B7-F7).
-        const floor = requiredFloor;
-        const proof = await floorVerdict(url, floor);
-        if (activeUrl !== url) return;
-        if (proof.verdict === 'ok' && requiredFloor === floor) {
-          if (floor > 0) provenFloor = { url, floor };
-          const own = getGuildDataBackend();
-          if (floor > 0 && own instanceof PostgresBackend) own.markProven(floor);
-          if (regatedUrl === url) regatedUrl = null;
-          driver.release();
-          bootStatus = { ...bootStatus, state: 'serving' };
-          console.log('[Data] Postgres store identity verified; serving');
-          return;
-        }
-        if (proof.verdict === 'stale' && !staleLogged) {
-          console.error(`[Data] The delivered database holds term ${proof.term} in its control row, below term ${floor} its master holds there: an older copy of the fleet database (a same-named one on this host, or this node's own former one); gates stay closed until the master's database answers`);
-          staleLogged = true;
-        }
-        if (requiredFloor !== floor) continue;
+        // the very next boot.
+        driver.release();
+        bootStatus = { ...bootStatus, state: 'serving' };
+        console.log('[Data] Postgres store identity verified; serving');
+        return;
       }
     } catch { /* unreachable; fall through to the retry sleep */ }
-    // Re-checked after the attempt too: a swap mid-attempt retired this loop,
-    // and its warning would describe a database the node has moved off (B7-F24).
-    if (activeUrl !== url) return;
     if (!logged) {
       console.warn('[Data] Waiting on the data backend to verify store identity; gates stay closed');
       logged = true;
@@ -981,7 +178,7 @@ export async function awaitDataStartupBarrier(): Promise<void> {
 
 /** The dispatch gate's answer for a guild action (R1-J2): admit, or the cause that holds it. */
 export type GateCause = 'admit' | HoldCause;
-export type HoldCause = 'stopping' | 'refused' | 'moving' | 'moved' | 'not-served' | 'loading';
+export type HoldCause = 'stopping' | 'refused' | 'moved' | 'not-served' | 'loading';
 const FINAL_CAUSES = new Set<GateCause>(['stopping', 'refused', 'moved']);
 const HOLD_POLL_MS = 50;
 /** A panel action's or a console invoke's hold, which no Discord deadline bounds: 2.5 s, as the data route waits. */
@@ -989,16 +186,13 @@ export const ENTRY_WAIT_MS = 2500;
 
 /**
  * One reading of the gate for a guild action (notes/BT.md, "R1-J2 design sheet (L0): final"). Every hold reads it
- * afresh at each poll, as a recycle or a hold for delivery replaces or stops the driver and the working set mid-wait.
- * since is the hold's start.
+ * afresh at each poll. since is the hold's start.
  */
 export function gateCauseNow(guildId: string, since: number): GateCause {
   if (isClosedForExit()) return 'stopping';
   if (bootStatus.state === 'refused') return 'refused';
-  // Either route: a migration file leg or a transformation source freezes the facade itself.
-  if (isGuildWriteFrozen(guildId)) return 'moving';
   const readiness = getDataReadiness();
-  if (!readiness || routeFor(guildId) === 'file') return 'admit';
+  if (!readiness || resolveDataBackend() === 'file') return 'admit';
   return readiness.causeOf(guildId, since);
 }
 
@@ -1021,9 +215,8 @@ const LOADING_TEXT = "This server's data is still loading, try again in a moment
 const CAUSE_TEXTS: Record<Exclude<HoldCause, 'loading'>, string> = {
   stopping: 'The bot is stopping; please try again in a moment.',
   refused: "This bot's data storage is currently unavailable; please contact the server operator.",
-  moving: "This server's data is being moved; please try again in a moment.",
-  moved: "This server's data moved to another bot node; please try again in a moment.",
-  'not-served': "This server's data is not served by this bot node right now; please try again in a moment.",
+  moved: "Another bot process took over this server's data; please try again in a moment.",
+  'not-served': "This server's data is not served by this bot process right now; please try again in a moment.",
 };
 
 /** The member's and the web panel's text for a held action; the loading notice is operator-editable in config.json. */
@@ -1036,9 +229,8 @@ export function gateConsoleText(cause: HoldCause, guildId: string): string {
   switch (cause) {
     case 'stopping': return 'the bot is stopping; try again in a moment';
     case 'refused': return "the bot's data storage is unavailable; contact the server operator";
-    case 'moving': return `guild ${guildId}'s data is being moved; try again in a moment`;
-    case 'moved': return `guild ${guildId}'s data moved to another bot node; try again in a moment`;
-    case 'not-served': return `guild ${guildId}'s data is not served by this bot node right now; try again in a moment`;
+    case 'moved': return `another bot process took over guild ${guildId}'s data; try again in a moment`;
+    case 'not-served': return `guild ${guildId}'s data is not served by this bot process right now; try again in a moment`;
     default: return `guild ${guildId}'s data is still loading; try again in a moment`;
   }
 }
@@ -1084,7 +276,7 @@ export async function dispatchGated(eventName: string, args: any[], dispatch: (.
  * Shared dispatch gate. True = dispatch now. An interaction meets its one hold and, refused, one polite ephemeral
  * reply with the cause - the gate NEVER acks/defers on a handler's behalf. Non-interaction events buffer for replay
  * (or drop when the shard is not leased here and no set is held for the guild; a held frozen or fenced set dispatches
- * them); file-routed guilds pass them through, and so do events whose guild comes
+ * them); file-mode guilds pass them through, and so do events whose guild comes
  * from a Guild payload (guildCreate, guildDelete and the like), which only the tier gate reads.
  */
 export async function gateEventDispatch(eventName: string, args: any[], replay: () => void): Promise<boolean> {
@@ -1099,7 +291,7 @@ export async function gateEventDispatch(eventName: string, args: any[], replay: 
   // Unresolvable backend configuration: guild-scoped dispatch stays closed.
   if (bootStatus.state === 'refused') return false;
   const readiness = getDataReadiness();
-  if (!readiness || routeFor(guildId) === 'file') return true;
+  if (!readiness || resolveDataBackend() === 'file') return true;
   return readiness.admitEvent(guildId, replay);
 }
 
@@ -1110,7 +302,7 @@ export async function gateEventDispatch(eventName: string, args: any[], replay: 
 export async function awaitGuildDataReady(guildId: string): Promise<boolean> {
   if (bootStatus.state === 'refused') return false;
   const readiness = getDataReadiness();
-  if (!readiness || routeFor(guildId) === 'file') return true;
+  if (!readiness || resolveDataBackend() === 'file') return true;
   return readiness.admitInteraction(guildId);
 }
 
@@ -1123,12 +315,10 @@ function noticeText(property: string, fallback: string): string {
 /** User-visible text for a refused write; the database-unreachable notice is operator-editable in config.json. */
 export function dataUnavailableMessage(causeKey: DataUnavailableCause): string {
   if (causeKey === 'node-stopping') return 'The bot is restarting, so your change was not saved. Please try again in a moment.';
-  if (causeKey === 'database-stale-copy') return "The bot is connected to an outdated copy of its database, so your change was not saved. Changes can be saved again once the bot is moved to the current database.";
   if (causeKey === 'storage-failing') return "The bot cannot write to its disk right now, so your change was not saved. Please try again later or contact support.";
-  if (causeKey === 'database-read-only') return "The bot's database is read-only while a backup covers an outage, so your change was not saved. Please try again in a few minutes.";
   if (causeKey === 'database-backlog') return "The bot's database is behind on saving changes, so your change was not saved. Please try again in a moment.";
   return causeKey === 'guild-fenced'
-    ? "This server's data just moved to another bot node; please try again in a moment."
+    ? "Another bot process took over this server's data; please try again in a moment."
     : noticeText('outageNotice.databaseUnreachable', "The bot's database is currently unreachable, so your change was not saved. Please try again later or contact support.");
 }
 

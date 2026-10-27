@@ -8,14 +8,14 @@ import { pastBudget } from '../mutation/control.mjs';
 import { PASSES } from '../mutation/passes.mjs';
 
 // The L5 bite (VERIFY.md L5 and [A2]): one run of the gate on two lines of
-// nodeIdentity.ts. consentsToActiveMode's return is in-process code, so the
-// fast tier kills its mutants in pass A. The stand-in carry in
-// consumeTakeoverFlags only shows across a restart, which no in-process test
-// makes, so its mutants survive pass A and must die in pass B through the
-// child scenario: proof that the active mutant reaches a child process and
-// that the child loads the sandbox's own build. One mutant of the first line is
-// equivalent ('' and the replacement both read as "not active"), so the run
-// also shows the failing verdict and how a survivor is reported.
+// nodeIdentity.ts. getAppVersion's read is in-process code, so the fast tier
+// kills its mutants in pass A. What getNodeId writes to node.json only shows
+// across a restart, which no in-process test makes, so its mutants survive
+// pass A and must die in pass B through the child scenario: proof that the
+// active mutant reaches a child process and that the child loads the sandbox's
+// own build. One mutant of the first line is equivalent (package.json has a
+// version, so the '0.0.0' fallback is never read), so the run also shows the
+// failing verdict and how a survivor is reported.
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const TARGET = 'src/bot/internalSetup/fleet/nodeIdentity.ts';
@@ -92,8 +92,8 @@ describe('the touched-line mutation gate', () => {
   });
 
   it('kills in-process code in pass A and restart-only code in pass B through a child', { timeout: 900_000 }, () => {
-    const fast = lineOf("return (process.env.FLEET_BACKUP_MODE || '').trim().toLowerCase() === 'active';");
-    const child = lineOf('...(override.standIn === true ? { standIn: true } : {}),');
+    const fast = lineOf("cachedAppVersion = String(JSON.parse(fs.readFileSync(pkgPath, 'utf-8')).version || '0.0.0');");
+    const child = lineOf('atomicWriteFileSync(file, JSON.stringify({ nodeId, createdAt: Date.now() }, null, 2));');
     const run = spawnSync(process.execPath, [
       path.join(root, 'test', 'mutation', 'touched.mjs'),
       '--mutate', `${TARGET}:${fast}-${fast}`,
@@ -105,16 +105,16 @@ describe('the touched-line mutation gate', () => {
     const { mutants } = JSON.parse(fs.readFileSync(path.join(root, reportDir!, 'mutants.json'), 'utf8')) as { mutants: Mutant[] };
     const on = (line: number) => mutants.filter(m => m.location.start.line === line && m.passes.a.status !== 'CompileError');
 
-    const equivalent = (m: Mutant) => m.mutator === 'StringLiteral' && m.original === "''";
+    const equivalent = (m: Mutant) => m.mutator === 'StringLiteral' && m.original === "'0.0.0'";
     expect(on(fast).filter(equivalent)).toHaveLength(1);
     for (const m of on(fast).filter(m => !equivalent(m))) {
-      expect(m.passes.a, `${m.mutator} ${m.original}`).toMatchObject({ status: 'Killed', killedBy: expect.stringMatching(/^unit\/backupMode\.test\.ts > /) });
+      expect(m.passes.a, `${m.mutator} ${m.original}`).toMatchObject({ status: 'Killed', killedBy: expect.stringMatching(/^unit\/nodeIdentity\.test\.ts > /) });
     }
-    expect(on(fast).filter(equivalent)[0]).toMatchObject({ passes: { a: { status: 'Survived' }, b: { status: 'Survived' } } });
+    for (const m of on(fast).filter(equivalent)) expect(m).toMatchObject({ passes: { a: { status: 'Survived' }, b: { status: 'Survived' } } });
 
     expect(on(child).length).toBeGreaterThan(0);
     for (const m of on(child)) {
-      const byChild = { status: 'Killed', killedBy: expect.stringMatching(/^child\/fleetIdentity\.test\.ts > /) };
+      const byChild = { status: 'Killed', killedBy: expect.stringMatching(/^child\/nodeIdentity\.test\.ts > /) };
       expect(m.passes.a.status, `${m.mutator} ${m.original}`).toBe('Survived');
       expect(m.passes.b, `${m.mutator} ${m.original}`).toMatchObject(byChild);
       expect(m.passes.b2, `${m.mutator} ${m.original}: pass B's kill rerun alone`).toMatchObject(byChild);
@@ -123,7 +123,7 @@ describe('the touched-line mutation gate', () => {
     expect(run.status).toBe(1);
     // One fast-check seed for the whole run, named in the report.
     expect(run.stdout).toMatch(/^Scope: the patterns .*; fast-check seed \d+$/m);
-    expect(run.stdout).toMatch(/^Survivors .*\n {2}src\/bot\/internalSetup\/fleet\/nodeIdentity\.ts:\d+:\d+ StringLiteral: `''`/m);
+    expect(run.stdout).toMatch(/^Survivors .*\n {2}src\/bot\/internalSetup\/fleet\/nodeIdentity\.ts:\d+:\d+ StringLiteral: `'0\.0\.0'`/m);
     expect(run.stdout).not.toContain(`nodeIdentity.ts:${child}:`);
     const killedInA = on(fast).filter(m => !equivalent(m)).length;
     expect(run.stdout).toContain(`\n  killed in pass A: ${killedInA}; run in pass B: ${on(child).length + 1}, killed there: ${on(child).length}\n`);
@@ -159,7 +159,7 @@ describe('the touched-line mutation gate', () => {
    * bite's target.
    */
   function standInRun(code: string, patterns?: string[]) {
-    const line = lineOf("return (process.env.FLEET_BACKUP_MODE || '').trim().toLowerCase() === 'active';");
+    const line = lineOf("cachedAppVersion = String(JSON.parse(fs.readFileSync(pkgPath, 'utf-8')).version || '0.0.0');");
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-control-'));
     const fake = path.join(dir, 'vitest.cjs');
     // Git-ignored files in the checkout (*.log), which no sandbox may hold: one
@@ -437,7 +437,7 @@ describe('the touched-line mutation gate', () => {
         expect(refused.status, file).toBe(2);
         expect(refused.stderr).toContain(`--mutate cannot take ${file}: git neither tracks it nor would add it`);
       }
-      for (const pattern of ['src/**/*.ts', 'src/bot/internalSetup/fleet/+(nodeIdentity|takeover).ts', 'src/no/such/file.ts:1-5', `${TARGET}:3:0-3:10`, outside]) {
+      for (const pattern of ['src/**/*.ts', 'src/bot/internalSetup/fleet/+(nodeIdentity|placement).ts', 'src/no/such/file.ts:1-5', `${TARGET}:3:0-3:10`, outside]) {
         const refused = refuse('--mutate', pattern);
         expect(refused.status, pattern).toBe(2);
         expect(refused.stderr).toContain(`--mutate takes a file in the bot root that exists, or such a file and lines, never a glob: ${pattern}`);
@@ -484,11 +484,11 @@ describe('the touched-line mutation gate', () => {
     // Spelled the way a shell may complete it (on Windows, in another case too),
     // it is taken under the name it has on disk.
     const spelled = process.platform === 'win32' ? `.\\${TARGET.replace(/^src/, 'SRC').split('/').join('\\')}` : `./${TARGET}`;
-    const nothing = gate('--mutate', `${spelled}:1-5`, '--concurrency', '1');
+    const nothing = gate('--mutate', `${spelled}:1-4`, '--concurrency', '1');
     clean(nothing.stdout);
     expect(nothing.status, nothing.stderr).toBe(2);
-    expect(nothing.stdout).toMatch(/^Patterns that made no mutant:\n {2}src\/bot\/internalSetup\/fleet\/nodeIdentity\.ts:1-5$/m);
-    expect(nothing.stdout).toMatch(/^Changed lines of code no mutant lies wholly on .*\n {2}src\/bot\/internalSetup\/fleet\/nodeIdentity\.ts: 5$/m);
+    expect(nothing.stdout).toMatch(/^Patterns that made no mutant:\n {2}src\/bot\/internalSetup\/fleet\/nodeIdentity\.ts:1-4$/m);
+    expect(nothing.stdout).toMatch(/^Changed lines of code no mutant lies wholly on .*\n {2}src\/bot\/internalSetup\/fleet\/nodeIdentity\.ts: 4$/m);
     expect(nothing.stdout).toMatch(/^Verdict: NO RESULT \(no gating mutant was made/m);
 
     // dataRoot.ts is never mutated.

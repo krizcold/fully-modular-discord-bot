@@ -3,7 +3,6 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 vi.hoisted(() => { process.env.GUILD_ID = 'g-test'; });
 
 vi.mock('../../src/bot/internalSetup/utils/getLocalCommands', () => ({ default: () => [] }));
-vi.mock('../../src/bot/internalSetup/fleet/nodeIdentity', () => ({ resolveNodeRole: () => 'master' }));
 vi.mock('../../src/bot/internalSetup/utils/dataManager', async (orig) => ({
   ...(await orig<any>()),
   loadGlobalData: () => ({ guildId: 'g-test' }),

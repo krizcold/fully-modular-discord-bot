@@ -14,7 +14,8 @@ import {
 } from '../../bot/internalSetup/utils/configDiscovery';
 import type { ConfigFileMetadata } from '../../bot/internalSetup/utils/configDiscovery';
 import type { DataFileMetadata } from '../../bot/types/moduleTypes';
-import { routeFor } from '../../bot/internalSetup/utils/dataBackends/routeResolver';
+import { resolveDataBackend } from '../../utils/envLoader';
+import { recognitionRefusal } from '../../bot/internalSetup/utils/dataBackends/recognitionGuard';
 import { getWebuiDataReader, isDataBackendUnreachable } from '../utils/webuiDataReader';
 import {
   configVersionOf,
@@ -24,10 +25,8 @@ import {
   saveGlobalConfig,
   saveGuildConfig
 } from '../../bot/internalSetup/utils/configManager';
-import { isGuildWriteFrozen, writeRawAtomic } from '../../bot/internalSetup/utils/dataManager';
+import { writeRawAtomic } from '../../bot/internalSetup/utils/dataManager';
 import { dataPath } from '../../utils/dataRoot';
-import { coWorkerReadonlyResponse, isCoWorkerNode } from '../middleware/fleetGate';
-import { nudgeSync } from '../utils/syncNudge';
 import { backupMatch, isBackupFilename, listBackups, stampDate, writeBackup, type LegacyNames } from '../utils/configBackups';
 import { childQueuedError, readServedGlobal, readServedGuild, withTargetLock, type ServedRead } from '../utils/servedRead';
 import type { BotManager } from '../botManager';
@@ -39,7 +38,7 @@ const CONFIG_NOT_FOUND = 'Config file not found. It may not exist in any scanned
  * One Config tab target, resolved once for get, update, backups and restore:
  * key is the module-qualified row key (the backup stem); guild holds the
  * child's (module, filename) for a guild document, global the child's address
- * of a global file; path is where it lives on this node's disk.
+ * of a global file; path is where it lives on this disk.
  */
 interface ConfigTarget {
   kind: 'config' | 'data';
@@ -55,8 +54,6 @@ interface ConfigTarget {
   /** A module data file's older backups, named by its bare id. */
   legacy?: LegacyNames;
 }
-
-const FROZEN = 'Guild data is frozen for a shard migration; retry after it completes';
 
 type Resolved = { ok: true; target: ConfigTarget } | { ok: false; status: number; error: string };
 
@@ -101,13 +98,15 @@ function configNamed(id: string): boolean {
   return !!info && (id === 'config.json' || !!info.schema || !!info.moduleName);
 }
 
+const postgresServed = (): boolean => resolveDataBackend() === 'postgres';
+
 /**
  * Whether this process's discovery cannot see the guild's files: a postgres
- * guild's are in the database, and a file-routed guild with no local dir
- * keeps them on the owning node's disk.
+ * guild's are in the database, and a file-routed guild with no local dir has
+ * none it can check.
  */
 function guildFilesUnseen(guildId: string | null): boolean {
-  return !!guildId && (routeFor(guildId) === 'postgres' || !fs.existsSync(dataPath(guildId)));
+  return !!guildId && (postgresServed() || !fs.existsSync(dataPath(guildId)));
 }
 
 /** Whether a file named id other than ownPath sits anywhere under dir (discovery keeps one per 'module/id'). */
@@ -178,7 +177,7 @@ function resolveDataTarget(fileId: string, guildId: string | null, allowUnlisted
   if (found) {
     const module = found.moduleName || '';
     const key = module ? `${module}/${found.id}` : found.id;
-    if (routeFor(guildId) === 'postgres') {
+    if (postgresServed()) {
       // The panel lists a postgres guild's top-level docs from the database,
       // while this process's discovery scans its disk, where a leftover in a
       // subfolder may sit under the same key: the doc is the listed one.
@@ -223,9 +222,9 @@ export function createConfigRoutes(botManager: BotManager): Router {
   const router = Router();
 
   // A guild id must be a plain Discord snowflake. Anything else ('global',
-  // 'guildConfigs', a '..'-bearing value) either targets master-owned global
-  // state through the guild-scoped path or escapes the guild dir via path.join,
-  // so it is rejected for ALL nodes before it reaches dataPath()/saveGuildConfig.
+  // 'guildConfigs', a '..'-bearing value) either targets global state through
+  // the guild-scoped path or escapes the guild dir via path.join, so it is
+  // rejected before it reaches dataPath()/saveGuildConfig.
   const isValidGuildId = (id: unknown): id is string => typeof id === 'string' && /^\d{5,20}$/.test(id);
 
   const BACKUP_DIR = dataPath('configBackups');
@@ -253,22 +252,15 @@ export function createConfigRoutes(botManager: BotManager): Router {
   };
 
   /** Only the bot child writes a postgres-routed guild: with it down, nothing is read or backed up for a write. */
-  const hopWriteWithoutBot = (t: ConfigTarget): boolean => !!t.guildId && routeFor(t.guildId) === 'postgres' && !botManager.isRunning();
+  const hopWriteWithoutBot = (t: ConfigTarget): boolean => !!t.guildId && postgresServed() && !botManager.isRunning();
 
-  /**
-   * The write gates again after the serving read, which is awaited: a shard
-   * migration's freeze or a demotion to co-worker may have begun meanwhile.
-   */
-  const refusedAfterRead = (res: Response, t: ConfigTarget, coWorkerAnyScope = false): boolean => {
-    if ((coWorkerAnyScope || !t.guildId) && isCoWorkerNode()) {
-      coWorkerReadonlyResponse(res);
-      return true;
-    }
-    if (t.guildId && routeFor(t.guildId) !== 'postgres' && isGuildWriteFrozen(t.guildId)) {
-      res.status(503).json({ success: false, error: FROZEN });
-      return true;
-    }
-    return false;
+  /** The bot refuses to serve guild data while DATA_BACKEND names the store the data does not live in: say why instead of listing or writing the wrong one. */
+  const refuseGuildOffStore = (guildId: string | null | undefined, res: Response, write: boolean): boolean => {
+    if (!guildId) return false;
+    const reason = recognitionRefusal();
+    if (!reason) return false;
+    res.status(503).json({ success: false, error: `${write ? 'Nothing was saved' : 'Guild data is not served'}: ${reason}.` });
+    return true;
   };
 
   /**
@@ -279,10 +271,11 @@ export function createConfigRoutes(botManager: BotManager): Router {
   router.get('/list', async (req: Request, res: Response) => {
     try {
       const guildId = req.query.guildId as string | undefined;
+      if (refuseGuildOffStore(guildId, res, false)) return;
 
       // If guild ID provided, return guild-specific configs + data files
       let files;
-      if (guildId && routeFor(guildId) === 'postgres') {
+      if (guildId && postgresServed()) {
         try {
           files = await discoverGuildFilesPostgres(guildId);
         } catch (error) {
@@ -295,11 +288,6 @@ export function createConfigRoutes(botManager: BotManager): Router {
           });
           return;
         }
-      } else if (guildId && isValidGuildId(guildId) && !fs.existsSync(dataPath(guildId))) {
-        // File-routed guild with no local dir: during a mixed-backend window
-        // its files live on the owning node's disk, so ask the owner. A failed
-        // hop leaves files unset and the local branch below answers as today.
-        files = await discoverGuildFilesViaHop(botManager, guildId);
       }
       if (files === undefined) {
         if (guildId) {
@@ -363,6 +351,7 @@ export function createConfigRoutes(botManager: BotManager): Router {
         return;
       }
       const t = resolved.target;
+      if (refuseGuildOffStore(t.guildId, res, false)) return;
 
       // Both bodies from the process that serves them: a postgres-routed
       // guild's lives in the child's working set, never on this process's disk.
@@ -428,25 +417,12 @@ export function createConfigRoutes(botManager: BotManager): Router {
       const fileId = req.body.file || 'config.json';
       const newConfig = req.body.config;
       const guildId = req.body.guildId as string | undefined;
-      // Any guild-scoped write must carry a genuine snowflake (all nodes): a
+      // Any guild-scoped write must carry a genuine snowflake: a
       // reserved sentinel like 'global' would otherwise hit the same file as a
       // global write and escape the guild-scoped allowance. A null/absent
       // guildId is a legitimate global write and routes below.
       if (guildId != null && !isValidGuildId(guildId)) {
         res.status(400).json({ success: false, error: 'Invalid guildId format' });
-        return;
-      }
-      // Co-worker: global config is synced from the master; only genuine
-      // node-owned guild writes stay allowed (guild data is node-owned).
-      if (!guildId && isCoWorkerNode()) {
-        coWorkerReadonlyResponse(res);
-        return;
-      }
-      // The facade would silently drop a frozen-guild write (correct for
-      // background writers); an operator save must be told instead.
-      if (guildId && isGuildWriteFrozen(guildId)) {
-        console.warn(`[Config] Rejected config write to frozen guild ${guildId} (shard migration in progress)`);
-        res.status(503).json({ success: false, error: FROZEN });
         return;
       }
       const resolved = resolveConfigTarget(fileId, guildId ?? null);
@@ -475,6 +451,7 @@ export function createConfigRoutes(botManager: BotManager): Router {
         return;
       }
 
+      if (refuseGuildOffStore(t.guildId, res, true)) return;
       if (hopWriteWithoutBot(t)) {
         sendHopReply(res, { ok: false, code: 'bot-down' });
         return;
@@ -493,7 +470,6 @@ export function createConfigRoutes(botManager: BotManager): Router {
           res.status(409).json({ success: false, error: childQueuedError(current) });
           return;
         }
-        if (refusedAfterRead(res, t)) return;
         let toStore: Record<string, any> = newConfig;
         if (req.body.version !== undefined || req.body.effective === true) {
           let globalBody: string | null = null;
@@ -521,7 +497,6 @@ export function createConfigRoutes(botManager: BotManager): Router {
           if (req.body.effective === true && t.guildId) {
             toStore = guildOverridesFrom(newConfig, savedValues, globalValues, t.configInfo);
           }
-          if (refusedAfterRead(res, t)) return;
         }
         let backupCreated: boolean;
         try {
@@ -532,9 +507,9 @@ export function createConfigRoutes(botManager: BotManager): Router {
           return;
         }
 
-        // Database-routed guild: the owning bot process applies the write
-        // (mapping mirrors saveGuildConfig); the parent never writes postgres.
-        if (guildId && routeFor(guildId) === 'postgres') {
+        // Database-routed guild: the bot process applies the write (mapping
+        // mirrors saveGuildConfig); the parent never writes postgres.
+        if (guildId && postgresServed()) {
           const reply = await botManager.writeGuildData({
             guildId,
             module: t.guild!.module,
@@ -549,16 +524,11 @@ export function createConfigRoutes(botManager: BotManager): Router {
         // Use appropriate save function based on context
         if (guildId) {
           const outcome = saveGuildConfig(fileId, guildId, toStore);
-          if (outcome === 'frozen') {
-            res.status(503).json({ success: false, error: FROZEN });
-            return;
-          }
           if (outcome !== 'saved') throw new Error(`the guild config was not written (${outcome})`);
           console.log(`[Config] ${fileId} updated successfully for guild ${guildId}`);
         } else {
           saveGlobalConfig(fileId, toStore);
           console.log(`[Config] ${fileId} updated successfully (global)`);
-          nudgeSync('config');
         }
 
         res.json({
@@ -632,11 +602,6 @@ export function createConfigRoutes(botManager: BotManager): Router {
    */
   router.post('/restore', async (req: Request, res: Response) => {
     try {
-      // Restore writes the master-authoritative global path; co-workers never restore.
-      if (isCoWorkerNode()) {
-        coWorkerReadonlyResponse(res);
-        return;
-      }
       const { filename, file, category } = req.body;
       const fileId = file || 'config.json';
       const scope = guildOf(req.body.guildId);
@@ -712,10 +677,7 @@ export function createConfigRoutes(botManager: BotManager): Router {
         return;
       }
 
-      if (guildId && routeFor(guildId) !== 'postgres' && isGuildWriteFrozen(guildId)) {
-        res.status(503).json({ success: false, error: FROZEN });
-        return;
-      }
+      if (refuseGuildOffStore(t.guildId, res, true)) return;
       if (hopWriteWithoutBot(t)) {
         sendHopReply(res, { ok: false, code: 'bot-down' });
         return;
@@ -734,7 +696,6 @@ export function createConfigRoutes(botManager: BotManager): Router {
           res.status(409).json({ success: false, error: childQueuedError(current) });
           return;
         }
-        if (refusedAfterRead(res, t, true)) return;
         let backupCreated: boolean;
         try {
           backupCreated = backupCurrent(t, current.content, true);
@@ -744,7 +705,7 @@ export function createConfigRoutes(botManager: BotManager): Router {
           return;
         }
 
-        if (guildId && routeFor(guildId) === 'postgres') {
+        if (guildId && postgresServed()) {
           const reply = await botManager.writeGuildData({ guildId, module: t.guild!.module, filename: t.guild!.filename, op: 'write', contentJson: backupContents });
           sendHopReply(res, reply ?? { ok: false, code: 'bot-down' }, { backupCreated });
           return;
@@ -754,20 +715,14 @@ export function createConfigRoutes(botManager: BotManager): Router {
         // the single per-path write queue.
         if (t.kind === 'config' && guildId) {
           const outcome = saveGuildConfig(fileId, guildId, restoredValue);
-          if (outcome === 'frozen') {
-            res.status(503).json({ success: false, error: FROZEN });
-            return;
-          }
           if (outcome !== 'saved') throw new Error(`the guild config was not written (${outcome})`);
         } else if (t.kind === 'config') {
           saveGlobalConfig(fileId, restoredValue);
-          nudgeSync('config');
         } else {
           if (!writeRawAtomic(t.path, backupContents)) {
             res.status(503).json({ success: false, error: 'The config was not restored because disk writes are failing' });
             return;
           }
-          if (!guildId) nudgeSync('globaldata');
         }
         console.log(`[Config] Restored ${t.key}${guildId ? ` for guild ${guildId}` : ''} from backup: ${filename}`);
 
@@ -814,6 +769,7 @@ export function createConfigRoutes(botManager: BotManager): Router {
         return;
       }
       const t = resolved.target;
+      if (refuseGuildOffStore(t.guildId, res, false)) return;
       const metadata = t.metadata ?? null;
 
       // Queue first, from the process that serves it: the child's working set
@@ -890,33 +846,16 @@ export function createConfigRoutes(botManager: BotManager): Router {
       const newData = req.body.data;
       const guildId = req.body.guildId as string | undefined;
 
-      // A guild-scoped data write must be a genuine snowflake (all nodes), or a
-      // sentinel/traversal value would reach master-owned global data. A
-      // null/absent guildId is a legitimate global write and routes below.
+      // A guild-scoped data write must be a genuine snowflake, or a
+      // sentinel/traversal value would reach global data. A null/absent
+      // guildId is a legitimate global write and routes below.
       if (guildId != null && !isValidGuildId(guildId)) {
         res.status(400).json({ success: false, error: 'Invalid guildId format' });
         return;
       }
       // The webui parent never writes postgres; database-routed guild writes
-      // go through the owning bot process.
-      const postgres = !!guildId && routeFor(guildId) === 'postgres';
-      if (!postgres) {
-        // Co-worker: global data files are synced from the master; only genuine
-        // node-owned guild writes stay allowed.
-        if (!guildId && isCoWorkerNode()) {
-          coWorkerReadonlyResponse(res);
-          return;
-        }
-        // This route writes via writeRawAtomic, which has no guild context and
-        // therefore no facade freeze gate: without this check a drain-window
-        // write would land after the final-round hash and then be graveyarded
-        // (or resurrect a zombie guild dir if it races the rename).
-        if (guildId && isGuildWriteFrozen(guildId)) {
-          console.warn(`[Config] Rejected data write to frozen guild ${guildId} (shard migration in progress)`);
-          res.status(503).json({ success: false, error: FROZEN });
-          return;
-        }
-      }
+      // go through the bot process.
+      const postgres = !!guildId && postgresServed();
 
       if (!fileId) {
         res.status(400).json({
@@ -956,6 +895,7 @@ export function createConfigRoutes(botManager: BotManager): Router {
         return;
       }
 
+      if (refuseGuildOffStore(t.guildId, res, true)) return;
       if (hopWriteWithoutBot(t)) {
         sendHopReply(res, { ok: false, code: 'bot-down' });
         return;
@@ -974,7 +914,6 @@ export function createConfigRoutes(botManager: BotManager): Router {
           res.status(409).json({ success: false, error: childQueuedError(current) });
           return;
         }
-        if (refusedAfterRead(res, t)) return;
         let backupCreated: boolean;
         try {
           backupCreated = backupCurrent(t, current.content);
@@ -1004,7 +943,6 @@ export function createConfigRoutes(botManager: BotManager): Router {
           return;
         }
         console.log(`[Data] ${t.key} saved successfully${guildId ? ` for guild ${guildId}` : ' (global)'}`);
-        if (!guildId) nudgeSync('globaldata');
 
         res.json({
           success: true,
@@ -1023,7 +961,7 @@ export function createConfigRoutes(botManager: BotManager): Router {
 
   /**
    * POST /api/config/data/delete
-   * Delete a guild data file; the bot child applies it on the owning node.
+   * Delete a guild data file; the bot child applies it.
    */
   router.post('/data/delete', async (req: Request, res: Response) => {
     try {
@@ -1044,6 +982,7 @@ export function createConfigRoutes(botManager: BotManager): Router {
         res.status(resolved.status).json({ success: false, error: resolved.error });
         return;
       }
+      if (refuseGuildOffStore(guildId, res, true)) return;
       const reply = await botManager.writeGuildData({
         guildId,
         module: resolved.target.guild!.module,
@@ -1062,7 +1001,7 @@ export function createConfigRoutes(botManager: BotManager): Router {
 
   /**
    * POST /api/config/data/delete-guild
-   * Delete every data file for a guild (namespace removal on the owning node).
+   * Delete every data file for a guild (namespace removal in the bot process).
    */
   router.post('/data/delete-guild', async (req: Request, res: Response) => {
     try {
@@ -1072,6 +1011,7 @@ export function createConfigRoutes(botManager: BotManager): Router {
         res.status(400).json({ success: false, error: 'A valid guildId is required' });
         return;
       }
+      if (refuseGuildOffStore(guildId, res, true)) return;
 
       const reply = await botManager.writeGuildData({
         guildId,
@@ -1198,74 +1138,6 @@ async function discoverGuildFilesPostgres(guildId: string): Promise<Array<Config
   }
 
   // Same dedup-by-path as the file-routed branch: schema entries win.
-  const pathMap = new Map<string, ConfigFileMetadata | DataFileMetadata>();
-  [...schemaFiles, ...orphans].forEach(file => {
-    const existing = pathMap.get(file.path);
-    if (!existing || (file.schema && !existing.schema)) {
-      pathMap.set(file.path, file);
-    }
-  });
-  return Array.from(pathMap.values());
-}
-
-/**
- * Guild file listing for a file-routed guild whose files live on another
- * node's disk (mixed-backend window): the owner's read hop answers with every
- * 'module/filename' key (guild-root files are bare filenames) and the same
- * response shape as discoverGuildFilesPostgres is built against that key set.
- * undefined = hop failed; the caller falls back to the local scan.
- */
-async function discoverGuildFilesViaHop(botManager: BotManager, guildId: string): Promise<Array<ConfigFileMetadata | DataFileMetadata> | undefined> {
-  const reply = await botManager.readGuildData({ guildId, module: '', scope: 'all' });
-  if (!reply || !reply.ok || !Array.isArray(reply.files)) {
-    return undefined;
-  }
-  const keys = new Set<string>(reply.files.filter((key: unknown): key is string => typeof key === 'string' && !key.startsWith('_')));
-
-  const configFiles = discoverGuildConfigFiles(guildId).filter(file => file.schema);
-  const dataFiles = discoverGuildDataFiles(guildId).filter(file => file.schema);
-  const schemaFiles: Array<ConfigFileMetadata | DataFileMetadata> = [...configFiles, ...dataFiles];
-
-  for (const file of schemaFiles) {
-    file.exists = keys.has(file.moduleName ? `${file.moduleName}/${file.id}` : file.id);
-  }
-
-  const covered = new Set(schemaFiles.map(file => `${file.moduleName || ''}/${file.id}`));
-  const orphans: Array<ConfigFileMetadata | DataFileMetadata> = [];
-  for (const key of keys) {
-    const slash = key.indexOf('/');
-    if (slash > 0) {
-      if (covered.has(key)) {
-        continue;
-      }
-      const moduleName = key.slice(0, slash);
-      const filename = key.slice(slash + 1);
-      orphans.push({
-        id: filename,
-        path: dataPath(guildId, moduleName, filename),
-        name: displayNameFor(filename),
-        description: 'Orphaned data file (no schema defined)',
-        category: 'data',
-        exists: true,
-        required: false,
-        template: undefined,
-        scope: 'guild',
-        moduleName
-      });
-    } else {
-      orphans.push({
-        id: key,
-        path: dataPath(guildId, key),
-        name: displayNameFor(key),
-        description: `${displayNameFor(key)} runtime data`,
-        category: 'data',
-        exists: true,
-        default: {}
-      });
-    }
-  }
-
-  // Same dedup-by-path as the other branches: schema entries win.
   const pathMap = new Map<string, ConfigFileMetadata | DataFileMetadata>();
   [...schemaFiles, ...orphans].forEach(file => {
     const existing = pathMap.get(file.path);

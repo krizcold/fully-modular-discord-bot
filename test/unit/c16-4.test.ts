@@ -6,8 +6,6 @@ vi.mock('../../src/bot/internalSetup/utils/appStoreManager', async (orig) => {
   const real = await orig<any>();
   return { ...real, getAppStoreManager: () => ({ updateAllModules: async () => h.bulk }) };
 });
-vi.mock('../../src/webui/utils/syncNudge', () => ({ nudgeSync: () => {} }));
-vi.mock('../../src/webui/middleware/fleetGate', () => ({ requireMasterNode: (_q: any, _s: any, n: any) => n() }));
 
 import { AppStoreManager } from '../../src/bot/internalSetup/utils/appStoreManager';
 import { createUpdateRouter } from '../../src/webui/routes/update';

@@ -14,11 +14,10 @@ import {
   appendData,
   confirmWrite,
   deleteDataOutcome,
-  freezeGuildWrites,
   saveData,
   saveDataOutcome,
-  unfreezeGuildWrites,
 } from '../../src/bot/internalSetup/utils/dataManager';
+import { freezeGuildWrites, unfreezeGuildWrites } from '../helpers/freezeGuild';
 import {
   INTERACTION_LEDGER_LIFE_MS,
   ledgerOf,
@@ -47,12 +46,11 @@ describe('the truth texts', () => {
   it('names each answer, in the "not saved" form or, when another write landed, the "in full" form', () => {
     expect(truthText('node-stopping', false)).toBe('The bot is restarting, so your change was not saved. Please try again in a moment.');
     expect(truthText('node-stopping', true)).toBe('The bot is restarting, so your change was not saved in full. Please try again in a moment.');
-    expect(truthText('database-read-only', false)).toBe("The bot's database is read-only while a backup covers an outage, so your change was not saved. Please try again in a few minutes.");
-    expect(truthText('guild-fenced', false)).toBe("This server's data just moved to another bot node, so your change was not saved. Please try again in a moment.");
-    expect(truthText('deposed', true)).toBe("This server's data just moved to another bot node, so your change was not saved in full. Please try again in a moment.");
+    expect(truthText('guild-fenced', false)).toBe("Another bot process took over this server's data, so your change was not saved. Please try again in a moment.");
+    expect(truthText('deposed', true)).toBe("Another bot process took over this server's data, so your change was not saved in full. Please try again in a moment.");
     expect(truthText('database-unreachable', false)).toBe("The bot's database is currently unreachable, so your change was not saved. Please try again later or contact support.");
     expect(truthText('database-unreachable', true)).toBe("The bot's database is unreachable, so your change was not saved in full. Please try again later.");
-    expect(truthText('frozen', false)).toBe("This server's data is being moved, so your change was not saved. Please try again in a moment.");
+    expect(truthText('frozen', false)).toBe("This server's data is not served by this bot process right now, so your change was not saved. Please try again in a moment.");
     expect(truthText('not-ready', true)).toBe("This server's data is still loading, so your change was not saved in full. Please try again in a moment.");
     expect(truthText('io', false)).toBe('The bot could not write to storage, so your change was not saved. Please try again.');
     expect(truthText('unavailable', false)).toBe('The bot cannot confirm whether your change was saved. Please check before you try again.');
@@ -80,7 +78,7 @@ describe('the truth texts while the bot stops', () => {
   it('a gated reply over a held write tells the stopping text', async () => {
     const { wire, emit } = rig();
     const { store, options } = await storeGuild();
-    store.mode = 'read-only';
+    store.mode = 'unavailable';
     await emit(rawCommand('s1'), async i => {
       saveData('x.json', options, { v: 1 });
       stop.on = true;
@@ -322,7 +320,7 @@ describe('answers that are not ok', () => {
   it('a commit the store refuses: held', async () => {
     const { wire, emit } = rig();
     const { store, options } = await storeGuild();
-    store.mode = 'read-only';
+    store.mode = 'unavailable';
     await emit(rawCommand('c8'), async i => {
       saveData('x.json', options, { v: 1 });
       await i.reply({ content: 'Saved!' });
@@ -358,7 +356,7 @@ describe('answers that are not ok', () => {
   it('a V2 component message gets the truth as a V2 text display, with no content', async () => {
     const { wire, emit } = rig();
     const { store, options } = await storeGuild();
-    store.mode = 'read-only';
+    store.mode = 'unavailable';
     await emit(rawButton('b2', V2 | EPHEMERAL), async i => {
       saveData('x.json', options, { v: 1 });
       await i.update({ components: [], flags: V2 });
@@ -374,7 +372,7 @@ describe('answers that are not ok', () => {
   it('a plain message edited to the truth has its earlier embeds, components and attachments cleared', async () => {
     const { wire, emit } = rig();
     const { store, options } = await storeGuild();
-    store.mode = 'read-only';
+    store.mode = 'unavailable';
     await emit(rawCommand('c11'), async i => {
       await i.deferReply({ flags: EPHEMERAL });
       saveData('x.json', options, { v: 1 });
@@ -386,7 +384,7 @@ describe('answers that are not ok', () => {
   it('a reply that makes a new plain message ends the V2 shape for later truth edits', async () => {
     const { wire, emit } = rig();
     const { store, options } = await storeGuild();
-    store.mode = 'read-only';
+    store.mode = 'unavailable';
     await emit(rawButton('b6', V2), async i => {
       await i.reply({ content: 'Working...', flags: EPHEMERAL });
       saveData('x.json', options, { v: 1 });
@@ -416,7 +414,7 @@ describe('answers that are not ok', () => {
       const ws = getWorkingSet()!;
       ws.evict(guildId);
       expect(await ws.hydrate(guildId, tokenFor())).toBe('ready');
-      store.mode = 'read-only';
+      store.mode = 'unavailable';
       saveData('y.json', options, { v: 2 });
       expect(ledgerOf(i)!.tickets()).toHaveLength(1);
       await i.reply({ content: 'Saved!' });
@@ -442,7 +440,7 @@ describe('answers that are not ok', () => {
     await emit(rawCommand('c25'), async i => {
       saveData('x.json', options, { v: 1 });
       expect(await confirmWrite(ledgerOf(i)!.tickets()[0].ticket, 5000)).toBe('ok');
-      store.mode = 'read-only';
+      store.mode = 'unavailable';
       saveData('y.json', options, { v: 2 });
       await i.reply({ content: 'Saved!' });
     });
@@ -469,7 +467,7 @@ describe('a component message others can see (BT1C-2)', () => {
   it('a V2 public message is left as it is too', async () => {
     const { wire, emit } = rig();
     const { store, options } = await storeGuild();
-    store.mode = 'read-only';
+    store.mode = 'unavailable';
     await emit(rawButton('p2', V2), async i => {
       saveData('x.json', options, { v: 1 });
       await i.update({ components: [], flags: V2 });
@@ -1557,7 +1555,7 @@ describe('the ledgers read', () => {
   it('a write recorded only in the frame\'s ledger at the call is waited on', async () => {
     const { wire, emit } = rig();
     const { store, options } = await storeGuild();
-    store.mode = 'read-only';
+    store.mode = 'unavailable';
     await emit(rawCommand('c16'), async i => {
       const other = openLedger('panel');
       await runInLedger(other, 'modX', async () => {
@@ -1587,10 +1585,10 @@ describe('the answer over several writes', () => {
   it('a write that landed beside a held one gives the "in full" form', async () => {
     const { wire, emit } = rig();
     const { store, options } = await storeGuild();
-    store.mode = 'read-only';
-    const fileGuild = { guildId: `${Number(options.guildId) + 500}`, category: 'm' };
+    store.mode = 'unavailable';
+    const global = { scope: 'global' as const, category: 'rg-in-full' };
     await emit(rawCommand('c18'), async i => {
-      saveData('f.json', fileGuild, { v: 1 });
+      saveData('f.json', global, { v: 1 });
       saveData('x.json', options, { v: 1 });
       await i.reply({ content: 'Saved!' });
     });
@@ -1610,10 +1608,7 @@ describe('the answer over several writes', () => {
     expect(wire.map(textOf)).toEqual([truthText('frozen', false)]);
   });
 
-  it.each([
-    ['a lower-ranked refusal (not-ready)', false, 'database-backlog'],
-    ['a higher-ranked refusal (read-only)', true, 'database-read-only'],
-  ] as const)('a backlog refusal beside %s names the worse of the two', async (_name, readOnlyAfter, worst) => {
+  it('a backlog refusal beside a lower-ranked refusal (not-ready) names the backlog', async () => {
     const { wire, emit } = rig();
     const { guildId, store, options } = await storeGuild();
     store.mode = 'unavailable';
@@ -1621,13 +1616,9 @@ describe('the answer over several writes', () => {
     await emit(rawCommand('c19b'), async i => {
       saveDataOutcome('y.json', notReadyGuild(), { v: 1 });
       try { saveData('x.json', options, { v: 1 }); } catch { /* refused: database-backlog */ }
-      if (readOnlyAfter) {
-        store.isReadOnly = () => true;
-        try { saveData('z.json', options, { v: 1 }); } catch { /* refused: database-read-only */ }
-      }
       await i.reply({ content: 'Saved!' });
     });
-    expect(wire.map(textOf)).toEqual([truthText(worst, false)]);
+    expect(wire.map(textOf)).toEqual([truthText('database-backlog', false)]);
     expect(getWorkingSet()?.stateOf(guildId)).toBe('ready');
   });
 

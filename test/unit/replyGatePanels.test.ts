@@ -32,7 +32,7 @@ describe('answerWrites', () => {
   it('answers false and tells the member when a write is held', async () => {
     const { wire, emit } = rig();
     const { store, options } = await storeGuild();
-    store.mode = 'read-only';
+    store.mode = 'unavailable';
     let answered: boolean | undefined;
     await emit(rawButton('p2'), async i => {
       saveData('x.json', options, { v: 1 });

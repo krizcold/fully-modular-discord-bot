@@ -1,8 +1,5 @@
-// Boot-time recognition guard (single-node paths). Decides, from the local
-// file marker and the configured default, whether this node may serve, must
-// serve from the OTHER backend (transformation-required), or must refuse.
-// The fleet-delivered paths (active transformation record, master-delivered
-// backend) layer on top of this in the fleet stage.
+// Boot-time recognition guard. Decides, from the local file marker and the
+// configured default, whether this bot may serve or must refuse.
 //
 // The marker exists so a flip of DATA_BACKEND against a store that still holds
 // the deployment's data is recognized instead of booting "empty": never boot
@@ -12,16 +9,19 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { DATA_ROOT } from '../../../../utils/dataRoot';
 import { DataBackendKind, resolveDataBackend } from '../../../../utils/envLoader';
-import { forceRouteDefault } from './routeResolver';
 import { listGuilds } from './fileBackend';
-import { readStoreId, PostgresUnreachableError } from './postgresBackend';
-import type { BackendStateMarker } from './postgresBackend';
+import { readStoreId, PostgresUnreachableError, PostgresInRecoveryError } from './postgresBackend';
 
 const MARKER_FILE = path.join(DATA_ROOT, '.backend.json');
 
+export interface BackendStateMarker {
+  live: DataBackendKind;
+  storeId: string | null;
+  flippedAt: number;
+}
+
 export type GuardVerdict =
   | { state: 'boot'; live: DataBackendKind }
-  | { state: 'transformation-required'; live: DataBackendKind; configured: DataBackendKind }
   | { state: 'refused'; reason: string };
 
 export function readFileMarker(): BackendStateMarker | null {
@@ -32,7 +32,6 @@ export function readFileMarker(): BackendStateMarker | null {
         live: parsed.live,
         storeId: typeof parsed.storeId === 'string' ? parsed.storeId : null,
         flippedAt: typeof parsed.flippedAt === 'number' ? parsed.flippedAt : 0,
-        transformationId: typeof parsed.transformationId === 'string' ? parsed.transformationId : null,
       };
     }
   } catch { /* absent or unreadable = no marker */ }
@@ -59,42 +58,30 @@ export function evaluateRecognitionGuard(): GuardVerdict {
   const configured = resolveDataBackend();
   const marker = readFileMarker();
 
-  if (!marker) {
-    // Lazy init. No marker means pre-milestone data (or a fresh install):
-    // anything that exists lives in files.
-    if (configured === 'file' || listGuilds().length === 0) {
-      writeFileMarker({ live: configured, storeId: null, flippedAt: Date.now(), transformationId: null });
-      return { state: 'boot', live: configured };
-    }
-    // Configured postgres with guild data on disk: the live backend is file.
-    writeFileMarker({ live: 'file', storeId: null, flippedAt: Date.now(), transformationId: null });
-    return { state: 'transformation-required', live: 'file', configured };
-  }
-
-  if (marker.live === configured) {
+  if (marker?.live === configured) {
     return { state: 'boot', live: configured };
   }
 
-  if (marker.live === 'file') {
-    return { state: 'transformation-required', live: 'file', configured };
+  const reason = recognitionRefusal();
+  if (reason) {
+    if (!marker) writeFileMarker({ live: 'file', storeId: null, flippedAt: Date.now() });
+    return { state: 'refused', reason };
   }
-
-  // Marker says the data lives in postgres while DATA_BACKEND says file: keep
-  // serving from postgres (needs the URL still configured; boot checks that).
-  return { state: 'transformation-required', live: 'postgres', configured };
+  writeFileMarker({ live: configured, storeId: null, flippedAt: Date.now() });
+  return { state: 'boot', live: configured };
 }
 
-/**
- * Webui-parent counterpart of the bot child's transformation-required route
- * override: the parent evaluates the same marker so both processes route a
- * guild to the same live backend. Read-only - never writes the marker, never
- * refuses (the child owns serving posture).
- */
-export function applyRouteDefaultFromMarker(): void {
-  try {
-    const marker = readFileMarker();
-    if (marker && marker.live !== resolveDataBackend()) forceRouteDefault(marker.live);
-  } catch { /* invalid DATA_BACKEND surfaces per-route in the child's refusal */ }
+/** Why the bot refuses to serve with this marker and DATA_BACKEND, or null; reads only, so the web UI can ask too. */
+export function recognitionRefusal(): string | null {
+  const configured = resolveDataBackend();
+  const live = readFileMarker()?.live;
+  if (live === configured) return null;
+  if (live === 'postgres') {
+    return `this deployment's data lives in postgres but DATA_BACKEND is ${configured}; set DATA_BACKEND back to postgres`;
+  }
+  // No marker, or one naming files: anything that exists lives in files.
+  if (configured === 'file' || listGuilds().length === 0) return null;
+  return `guild data lives in files under ${DATA_ROOT} but DATA_BACKEND is postgres, which would start without it; set DATA_BACKEND back to file`;
 }
 
 /**
@@ -104,20 +91,19 @@ export function applyRouteDefaultFromMarker(): void {
  * On first contact with a provisioned store the marker adopts its store_id.
  */
 export async function verifyStoreIdentity(url: string): Promise<{ ok: true } | { ok: false; reason: string; pending?: true }> {
-  const dbStoreId = await readStoreId(url);
+  let dbStoreId: string | null;
+  try {
+    dbStoreId = await readStoreId(url);
+  } catch (error) {
+    if (error instanceof PostgresInRecoveryError) return { ok: false, reason: error.message, pending: true };
+    throw error;
+  }
   const marker = readFileMarker();
   if (marker?.storeId && dbStoreId && marker.storeId !== dbStoreId) {
-    // The binding only protects data that actually lives (or is mid-window
-    // converting) in postgres. On a quiet live:file marker it is residue from
-    // an aborted or abandoned window: rebind instead of refusing.
-    if (marker.live === 'postgres' || marker.transformationId !== null) {
-      return { ok: false, reason: `the configured database is not the one this deployment's data lives in (store ${dbStoreId} vs recorded ${marker.storeId})` };
-    }
-    writeFileMarker({ ...marker, storeId: dbStoreId });
-    return { ok: true };
+    return { ok: false, reason: `the configured database is not the one this deployment's data lives in (store ${dbStoreId} vs recorded ${marker.storeId})` };
   }
   if (marker?.live === 'postgres' && marker.storeId && dbStoreId === null) {
-    // A store still provisioning carries none yet: a caller with a budget may ask again.
+    // A store still provisioning carries none yet: the caller asks again.
     return { ok: false, reason: 'the marker records data living in postgres but the configured database carries no store identity', pending: true };
   }
   if (dbStoreId && (!marker || marker.storeId === null)) {
@@ -125,7 +111,6 @@ export async function verifyStoreIdentity(url: string): Promise<{ ok: true } | {
       live: marker?.live ?? 'postgres',
       storeId: dbStoreId,
       flippedAt: marker?.flippedAt ?? Date.now(),
-      transformationId: marker?.transformationId ?? null,
     });
   }
   return { ok: true };

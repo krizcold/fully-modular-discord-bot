@@ -98,26 +98,3 @@ describe('review round 1', () => {
     expect(got.body.tiers.free.baselineNotice).toMatch(/not running/);
   });
 });
-
-// Review round 2 on C01 (lanes/C01/sheet.md, finding C01-R2-2).
-describe('review round 2', () => {
-  it('C01-R2-2: a Free save refuses when this node becomes a co-worker during the serving read', async () => {
-    const { clearRoleOverride, writeRoleOverride } = await import('../../src/bot/internalSetup/fleet/nodeIdentity');
-    put(settings(), { pingCustomMessage: 'disk' });
-    child.global = req => {
-      if (req.rel !== 'examples/settings.json') return undefined;
-      writeRoleOverride({ role: 'co-worker', setAt: Date.now(), setBy: 'webui-demote' });
-      return { ok: true, contentJson: fs.readFileSync(settings(), 'utf-8'), pending: false };
-    };
-    let saved: Awaited<ReturnType<typeof call>>;
-    try {
-      saved = await call(base, 'PUT', '/api/appstore/global-config/examples', { values: { pingCustomMessage: 'mine' } });
-      await flushAll();
-    } finally {
-      clearRoleOverride();
-    }
-    expect(saved.status).toBe(403);
-    expect(saved.body.code).toBe('co-worker-readonly');
-    expect(readJson(settings())).toEqual({ pingCustomMessage: 'disk' });
-  });
-});

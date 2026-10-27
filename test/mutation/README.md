@@ -516,11 +516,12 @@ removed source file.
 
 ## Proven locally
 
-- The bite, integration/mutationBite.test.ts: one gate run on two lines of nodeIdentity.ts. consentsToActiveMode's
-  return dies in pass A to unit/backupMode.test.ts; the stand-in carry in consumeTakeoverFlags, which only a restart
-  shows, survives pass A and dies in pass B to child/fleetIdentity.test.ts, again when rerun alone, and the run with no
-  mutant after that rerun passes. One mutant of the first line is equivalent (`''` and the replacement both read as "not
-  active"), so the run also shows the FAIL verdict and how a survivor is listed. Each of its real passes leaves
+- The bite, integration/mutationBite.test.ts: one gate run on two lines of nodeIdentity.ts. getAppVersion's read
+  dies in pass A to unit/nodeIdentity.test.ts; what getNodeId writes to node.json, which only a restart shows, survives
+  pass A and dies in pass B to child/nodeIdentity.test.ts, again when rerun alone, and the run with no mutant after that
+  rerun passes. One mutant of the first line is equivalent (package.json has a version, so the `'0.0.0'` fallback is
+  never read), so the run also shows the FAIL verdict and how
+  a survivor is listed. Each of its real passes leaves
   Stryker's own time for its run with no mutant and runner.mjs's monotonic one, and the two agree, so a sound run is
   never taken for a clock step. The same file checks that an unknown
   base and a pattern that makes no mutant both end NO RESULT, exit 2, and that a glob, a missing file, a pattern with

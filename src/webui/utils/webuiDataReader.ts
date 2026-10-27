@@ -12,9 +12,9 @@ let reportedUrl: string | null = null;
 let generation = 0;
 
 /**
- * The store the running bot child serves, reported over IPC at every install
- * of its postgres runtime (a delivered database, a stand-in's copy). Null
- * while no child serves one: the reader then opens the node's own database.
+ * The store the running bot child serves (its DATA_BACKEND_URL), reported over
+ * IPC at every install of its postgres runtime. Null while no child serves one:
+ * the reader then opens the node's own database.
  */
 export function setWebuiDataStoreUrl(url: string | null): void {
   const next = url && url.trim() ? url.trim() : null;

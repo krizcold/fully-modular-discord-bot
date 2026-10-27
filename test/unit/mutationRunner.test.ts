@@ -90,7 +90,7 @@ describe('a mutant run', () => {
   });
 
   it('reruns only the test files given, each in its tier, stopping at the first failure', () => {
-    const only = ['integration/store.test.ts', 'child/fleetIdentity.test.ts', 'child/takeover.test.ts'];
+    const only = ['integration/store.test.ts', 'child/nodeIdentity.test.ts', 'child/takeover.test.ts'];
     const failing = fakeVitest(['integration']);
     expect(runner(failing, 'b', '1', only).status).toBe(1);
     expect(failing.read().map(call => call.project)).toEqual(['integration']);
@@ -100,7 +100,7 @@ describe('a mutant run', () => {
     const calls = passing.read();
     expect(calls.map(call => [call.project, call.scale])).toEqual([['integration', '4'], ['child', '4']]);
     expect(calls[0].args.slice(0, 2)).toEqual(['run', 'integration/store.test.ts']);
-    expect(calls[1].args.slice(0, 3)).toEqual(['run', 'child/fleetIdentity.test.ts', 'child/takeover.test.ts']);
+    expect(calls[1].args.slice(0, 3)).toEqual(['run', 'child/nodeIdentity.test.ts', 'child/takeover.test.ts']);
     for (const call of calls) expect(call.args).toContain('--bail=1');
   });
 

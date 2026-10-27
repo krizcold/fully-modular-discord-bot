@@ -1,11 +1,12 @@
 // Graveyard API - list retired guild namespaces and restore them. Listing is
 // parent-local (file _graveyard scan plus the read-only postgres reader);
-// restore hops to the guild's owning bot node via the guild data write IPC.
+// restore runs in the bot process via the guild data write IPC.
 
 import { Router, Request, Response } from 'express';
 import { BotManager } from '../botManager';
-import { routeFor } from '../../bot/internalSetup/utils/dataBackends/routeResolver';
+import { resolveDataBackend } from '../../utils/envLoader';
 import { listGraveyardEntries } from '../../bot/internalSetup/utils/dataManager';
+import { recognitionRefusal } from '../../bot/internalSetup/utils/dataBackends/recognitionGuard';
 import { getWebuiDataReader, isDataBackendUnreachable } from '../utils/webuiDataReader';
 import { hopFailure } from './hopFailure';
 
@@ -27,8 +28,13 @@ export function createGraveyardRoutes(botManager: BotManager): Router {
    */
   router.get('/', async (req: Request, res: Response) => {
     try {
+      const refusal = recognitionRefusal();
+      if (refusal) {
+        res.status(503).json({ success: false, error: `The graveyard is not served: ${refusal}.` });
+        return;
+      }
       const entries: GraveyardEntry[] = (await listGraveyardEntries()).map(e => ({ ...e, backend: 'file' as const }));
-      if (routeFor('0') === 'postgres') {
+      if (resolveDataBackend() === 'postgres') {
         try {
           for (const batch of await getWebuiDataReader().listGraveyard()) {
             entries.push({ ...batch, backend: 'postgres' });
@@ -48,7 +54,7 @@ export function createGraveyardRoutes(botManager: BotManager): Router {
 
   /**
    * POST /api/data/graveyard/restore {guildId, retiredAt?}
-   * Applied on the owning node; refusals (live data exists, no entry) map to 409.
+   * Applied in the bot process; refusals (live data exists, no entry) map to 409.
    */
   router.post('/restore', async (req: Request, res: Response) => {
     try {
@@ -59,6 +65,11 @@ export function createGraveyardRoutes(botManager: BotManager): Router {
       }
       if (retiredAt !== undefined && (typeof retiredAt !== 'number' || !Number.isFinite(retiredAt))) {
         res.status(400).json({ success: false, error: 'retiredAt must be a number (ms)' });
+        return;
+      }
+      const refusal = recognitionRefusal();
+      if (refusal) {
+        res.status(503).json({ success: false, error: `Nothing was restored: ${refusal}.` });
         return;
       }
       const reply = await botManager.writeGuildData({

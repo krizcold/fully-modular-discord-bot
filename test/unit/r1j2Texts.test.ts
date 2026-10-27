@@ -30,9 +30,8 @@ describe('the texts', () => {
   it.each([
     ['stopping', 'The bot is stopping; please try again in a moment.'],
     ['refused', "This bot's data storage is currently unavailable; please contact the server operator."],
-    ['moving', "This server's data is being moved; please try again in a moment."],
-    ['moved', "This server's data moved to another bot node; please try again in a moment."],
-    ['not-served', "This server's data is not served by this bot node right now; please try again in a moment."],
+    ['moved', "Another bot process took over this server's data; please try again in a moment."],
+    ['not-served', "This server's data is not served by this bot process right now; please try again in a moment."],
     ['loading', "This server's data is still loading, try again in a moment."],
   ] as const)('the member and panel text for %s', (cause, text) => {
     expect(gateCauseText(cause)).toBe(text);
@@ -48,9 +47,8 @@ describe('the texts', () => {
   it.each([
     ['stopping', 'the bot is stopping; try again in a moment'],
     ['refused', "the bot's data storage is unavailable; contact the server operator"],
-    ['moving', "guild 4242's data is being moved; try again in a moment"],
-    ['moved', "guild 4242's data moved to another bot node; try again in a moment"],
-    ['not-served', "guild 4242's data is not served by this bot node right now; try again in a moment"],
+    ['moved', "another bot process took over guild 4242's data; try again in a moment"],
+    ['not-served', "guild 4242's data is not served by this bot process right now; try again in a moment"],
     ['loading', "guild 4242's data is still loading; try again in a moment"],
   ] as const)('the console text for %s', (cause, text) => {
     expect(gateConsoleText(cause, '4242')).toBe(text);

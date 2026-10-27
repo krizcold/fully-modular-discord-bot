@@ -18,7 +18,7 @@ import { storeGuild } from '../helpers/gateRig';
 describe('the bot stops with a write held', () => {
   it('the console answers that the change may be lost, not that the bot keeps retrying', async () => {
     const { guildId, store, options } = await storeGuild();
-    store.mode = 'read-only';
+    store.mode = 'unavailable';
     local.commands = [{
       name: 'holder',
       callback: async () => {

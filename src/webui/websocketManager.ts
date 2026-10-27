@@ -14,7 +14,6 @@ export type WSEvent =
   | 'bot:crash'
   | 'bot:metrics:snapshot'
   | 'bot:fleet:status'
-  | 'bot:sync:status'
   | 'connection:established'
   | 'panel:updated'
   | 'appstore:install:queued'
@@ -399,7 +398,7 @@ export class WebSocketManager {
     });
 
     // Only log non-log events to reduce noise (metrics/fleet snapshots tick every 5s)
-    if (type !== 'bot:log' && type !== 'bot:metrics:snapshot' && type !== 'bot:fleet:status' && type !== 'bot:sync:status') {
+    if (type !== 'bot:log' && type !== 'bot:metrics:snapshot' && type !== 'bot:fleet:status') {
       console.log(`[WebSocket] Broadcasted ${type} to ${sentCount} clients (seq: ${message.sequence})`);
     }
   }

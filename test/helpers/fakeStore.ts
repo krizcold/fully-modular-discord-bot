@@ -9,7 +9,7 @@ import type {
 } from '../../src/bot/internalSetup/utils/dataBackends/backend';
 
 // BT-1's scripted DataBackend, shared by the write-ticket and write-ledger tests.
-export type FlushMode = 'commit' | 'unavailable' | 'read-only' | 'deposed';
+export type FlushMode = 'commit' | 'unavailable' | 'deposed';
 export type HydrateMode = 'ok' | 'deposed' | 'unavailable' | 'held';
 
 export interface FlushCall {
@@ -29,15 +29,13 @@ export function keyOfRow(row: string): DocKey {
 
 /**
  * The DataBackend contract over a scripted store. A flush answers by the mode
- * it finds when it comes off the wire: it commits, fails as unavailable,
- * refuses as read-only or answers deposed. While holding, every flush stays
- * on the wire until release.
+ * it finds when it comes off the wire: it commits, fails as unavailable or
+ * answers deposed. While holding, every flush stays on the wire until release.
  */
 export class FakeStore implements DataBackend {
   readonly kind = 'postgres' as const;
   mode: FlushMode = 'commit';
   holding = false;
-  unproven = false;
   reclaim: 'kept' | 'lost' | null = 'kept';
   readonly docs = new Map<string, string>();
   readonly streams = new Map<string, string>();
@@ -79,7 +77,6 @@ export class FakeStore implements DataBackend {
     this.flushesSent += 1;
     if (this.holding) await new Promise<void>(resolve => { this.wire.push(resolve); });
     if (this.mode === 'unavailable') return { ok: false, reason: 'unavailable' };
-    if (this.mode === 'read-only') return { ok: false, reason: 'read-only' };
     if (this.mode === 'deposed') return { ok: false, reason: 'deposed', currentOwner: { nodeId: 'newer-owner', term: 9, epoch: 9 } };
     for (const { key, doc } of batch.upserts) this.docs.set(rowKey(guildId, key), doc);
     for (const key of batch.deletes) {
@@ -113,10 +110,6 @@ export class FakeStore implements DataBackend {
     return this.docs.get(`${guildId}|m/${filename}`);
   }
 
-  isUnproven(): boolean {
-    return this.unproven;
-  }
-
   async retireGuild(): Promise<RetireOutcome> {
     return { ok: false, reason: 'unavailable' };
   }
@@ -142,18 +135,6 @@ export class FakeStore implements DataBackend {
   }
 
   async guildFileExists(): Promise<boolean> {
-    return false;
-  }
-
-  async sizeOfGuildData(): Promise<number> {
-    return 0;
-  }
-
-  healthy(): boolean {
-    return true;
-  }
-
-  isReadOnly(): boolean {
     return false;
   }
 

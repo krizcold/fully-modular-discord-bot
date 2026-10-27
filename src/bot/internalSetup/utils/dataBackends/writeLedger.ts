@@ -19,9 +19,6 @@ export const INTERACTION_LEDGER_LIFE_MS = 15 * 60 * 1000;
 
 interface Entry {
   ticket: LedgerTicket;
-  // The lowest unlanded seq noted on it (a lower write of the set, or an absent delete): a successor's carry must
-  // hold the entry's writes from there to its ticket's.
-  from: number;
   modules: Set<string>;
 }
 
@@ -73,13 +70,9 @@ export class WriteLedger {
     if (entry) {
       if (ticket.seq > entry.ticket.seq) {
         // Every write the entry held landed: it answers from the new one.
-        if (landed(entry.ticket)) {
-          this.droppedLanded = true;
-          entry.from = ticket.seq;
-        }
+        if (landed(entry.ticket)) this.droppedLanded = true;
         entry.ticket = ticket;
       }
-      if (!landed(ticket)) entry.from = Math.min(entry.from, ticket.seq);
       entry.modules.add(module);
       return;
     }
@@ -96,7 +89,7 @@ export class WriteLedger {
         this.droppedLanded = true;
       }
     }
-    this.entries.set(key, { ticket, from: ticket.seq, modules: new Set([module]) });
+    this.entries.set(key, { ticket, modules: new Set([module]) });
     keys.add(key);
   }
 
@@ -111,10 +104,10 @@ export class WriteLedger {
     }
   }
 
-  /** The tickets every recorded write is confirmed by, each from its entry's lowest seq, with the modules it covers. */
-  tickets(): Array<{ ticket: LedgerTicket; from: number; modules: string[] }> {
+  /** The tickets every recorded write is confirmed by, with the modules each covers. */
+  tickets(): Array<{ ticket: LedgerTicket; modules: string[] }> {
     if (this.sealed) return [];
-    return [...this.entries.values()].map(({ ticket, from, modules }) => ({ ticket, from, modules: [...modules].sort() }));
+    return [...this.entries.values()].map(({ ticket, modules }) => ({ ticket, modules: [...modules].sort() }));
   }
 
   refusals(): Array<{ cause: LedgerCause; modules: string[] }> {

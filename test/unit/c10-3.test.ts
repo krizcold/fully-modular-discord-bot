@@ -6,7 +6,6 @@ import { fileURLToPath } from 'url';
 import { transformSync } from '@babel/core';
 import express from 'express';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { clearRoleOverride, writeRoleOverride } from '@internal/fleet/nodeIdentity';
 import { createSetupRoutes } from '@webui/routes/setup';
 
 const publicDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'src', 'webui', 'public');
@@ -264,10 +263,9 @@ describe('Credentials page saves (R50-J3)', () => {
   });
 });
 
-describe('setup route role writes (R44-J3)', () => {
+describe('setup route credential writes (R44-J3)', () => {
   const saved = { ...process.env };
   afterEach(() => {
-    clearRoleOverride();
     for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key];
     Object.assign(process.env, saved);
     fs.rmSync(path.join(process.env.DATA_DIR!, '.env'), { force: true });
@@ -290,91 +288,42 @@ describe('setup route role writes (R44-J3)', () => {
     }
   }
 
-  const demoted = () => {
-    fs.writeFileSync(path.join(process.env.DATA_DIR!, '.env'), 'MASTER_URLS=wss://m.example\nCONTROL_SECRET=fake-control-secret\n');
-    writeRoleOverride({ role: 'co-worker', setAt: 1700000000000, setBy: 'webui-demote' });
-  };
-
-  it('/status relays the env role, the raw role and the override', async () => {
-    demoted();
-    const body = await call('GET', '/api/setup/status');
-    expect(body.nodeRole).toBe('co-worker');
-    expect(body.connection.ENV_ROLE).toBe('master');
-    expect(body.connection.BOT_NODE_ROLE).toBe('');
-    expect(body.connection.ROLE_OVERRIDE).toEqual({ role: 'co-worker', setBy: 'webui-demote', setAt: 1700000000000 });
-  });
-
-  it('a save on a node the override demoted does not pin a co-worker role into the env file', async () => {
-    demoted();
-    const body = await call('POST', '/api/setup/credentials', { NODE_NAME: 'n2' });
-    expect(body.success).toBe(true);
-    const file = fs.readFileSync(path.join(process.env.DATA_DIR!, '.env'), 'utf-8');
-    expect(file).toContain('NODE_NAME=n2');
-    expect(file).not.toContain('BOT_NODE_ROLE');
-  });
-
-  it('an operator-chosen role is still written', async () => {
-    demoted();
-    const body = await call('POST', '/api/setup/credentials', { BOT_NODE_ROLE: 'backup-master' });
-    expect(body.success).toBe(true);
-    expect(fs.readFileSync(path.join(process.env.DATA_DIR!, '.env'), 'utf-8')).toContain('BOT_NODE_ROLE=backup-master');
-  });
-
-  it('a cleared node name or shard capacity removes the key, so the node uses its default', async () => {
-    process.env.BOT_NODE_ROLE = 'co-worker';
-    fs.writeFileSync(path.join(process.env.DATA_DIR!, '.env'), ['BOT_NODE_ROLE=co-worker', 'MASTER_URLS=wss://m.example', 'NODE_NAME=n1', 'FLEET_SHARD_CAPACITY=3', ''].join(String.fromCharCode(10)));
-    const body = await call('POST', '/api/setup/credentials', { NODE_NAME: '', FLEET_SHARD_CAPACITY: '' });
-    expect(body.success).toBe(true);
-    const file = fs.readFileSync(path.join(process.env.DATA_DIR!, '.env'), 'utf-8');
-    expect(file).not.toContain('NODE_NAME');
-    expect(file).not.toContain('FLEET_SHARD_CAPACITY');
-    expect(file).toContain('MASTER_URLS=wss://m.example');
-  });
-
-  it('a master credentials save keeps every env file key it was not sent', async () => {
+  it('a credentials save keeps every env file key it was not sent', async () => {
     fs.writeFileSync(path.join(process.env.DATA_DIR!, '.env'),
-      ['GUILD_ID=123456789012345678', 'FLEET_BACKUP_MODE=active', 'DATA_BACKEND_LOCAL_URL=postgresql://fake:fake@local:5432/db',
-        'DATA_BACKEND_PUBLIC_URL=postgresql://fake:fake@public:5432/db', 'SOME_OTHER_KEY=kept', ''].join(String.fromCharCode(10)));
+      ['GUILD_ID=123456789012345678', 'DATA_BACKEND_URL=postgresql://fake:fake@local:5432/db', 'SOME_OTHER_KEY=kept', ''].join(String.fromCharCode(10)));
     const body = await call('POST', '/api/setup/credentials', { MAIN_GUILD_ID: '223456789012345678' });
     expect(body.success).toBe(true);
     const file = fs.readFileSync(path.join(process.env.DATA_DIR!, '.env'), 'utf-8');
-    for (const line of ['MAIN_GUILD_ID=223456789012345678', 'GUILD_ID=123456789012345678', 'FLEET_BACKUP_MODE=active',
-      'DATA_BACKEND_LOCAL_URL=postgresql://fake:fake@local:5432/db', 'DATA_BACKEND_PUBLIC_URL=postgresql://fake:fake@public:5432/db', 'SOME_OTHER_KEY=kept']) {
+    for (const line of ['MAIN_GUILD_ID=223456789012345678', 'GUILD_ID=123456789012345678', 'DATA_BACKEND_URL=postgresql://fake:fake@local:5432/db', 'SOME_OTHER_KEY=kept']) {
       expect(file.split(String.fromCharCode(10))).toContain(line);
     }
   });
 
-  it('a master save never copies a container-pinned value into the env file', async () => {
-    process.env.TRANSFER_URL = 'wss://pinned.example';
+  it('a save never copies a container-pinned value into the env file', async () => {
     process.env.CLIENT_ID = '323456789012345678';
     fs.writeFileSync(path.join(process.env.DATA_DIR!, '.env'), ['SOME_OTHER_KEY=kept', ''].join(String.fromCharCode(10)));
     const body = await call('POST', '/api/setup/credentials', { MAIN_GUILD_ID: '223456789012345678' });
     expect(body.success).toBe(true);
     const file = fs.readFileSync(path.join(process.env.DATA_DIR!, '.env'), 'utf-8');
-    expect(file).not.toContain('TRANSFER_URL');
     expect(file).not.toContain('CLIENT_ID');
     expect(file.split(String.fromCharCode(10))).toContain('SOME_OTHER_KEY=kept');
     expect(file.split(String.fromCharCode(10))).toContain('MAIN_GUILD_ID=223456789012345678');
   });
 
-  it('a cleared or changed connection key the container env sets is named in the answer', async () => {
-    process.env.BOT_NODE_ROLE = 'co-worker';
-    process.env.NODE_NAME = 'compose-name';
-    process.env.CONTROL_SECRET = 'fake-pinned-secret';
-    fs.writeFileSync(path.join(process.env.DATA_DIR!, '.env'), ['MASTER_URLS=wss://m.example', 'FLEET_SHARD_CAPACITY=2', ''].join(String.fromCharCode(10)));
+  it('a changed key the container env sets is named in the answer', async () => {
+    process.env.SESSION_SECRET = 'fake-pinned-secret-0000000000';
+    fs.writeFileSync(path.join(process.env.DATA_DIR!, '.env'), ['SOME_OTHER_KEY=kept', ''].join(String.fromCharCode(10)));
     // A fresh env loader: an earlier row's file-seeded keys would otherwise be unset as cleared.
     vi.resetModules();
     const fresh = (await import('@webui/routes/setup')).createSetupRoutes;
-    const body = await call('POST', '/api/setup/credentials', { NODE_NAME: '', CONTROL_SECRET: 'fake-new-secret', FLEET_SHARD_CAPACITY: '4' }, fresh);
+    const body = await call('POST', '/api/setup/credentials', { SESSION_SECRET: 'fake-new-secret-00000000000000' }, fresh);
     expect(body.success).toBe(true);
-    expect([...body.containerSet].sort((a: any, b: any) => a.field.localeCompare(b.field))).toEqual([
-      { field: 'CONTROL_SECRET', message: 'CONTROL_SECRET is set by the container environment, so it keeps its value' },
-      { field: 'NODE_NAME', message: 'NODE_NAME is set by the container environment, so it keeps compose-name' },
+    expect(body.containerSet).toEqual([
+      { field: 'SESSION_SECRET', message: 'SESSION_SECRET is set by the container environment, so it keeps its value' },
     ]);
     expect(JSON.stringify(body)).not.toContain('fake-pinned-secret');
     const file = fs.readFileSync(path.join(process.env.DATA_DIR!, '.env'), 'utf-8');
-    expect(file.split(String.fromCharCode(10))).toContain('FLEET_SHARD_CAPACITY=4');
-    expect(file).not.toContain('NODE_NAME');
+    expect(file.split(String.fromCharCode(10))).toContain('SOME_OTHER_KEY=kept');
   });
 });
 
@@ -403,11 +352,10 @@ describe('container-set keys in the answer, fresh env loader', () => {
   }
 
   it('names a pinned key even when an older save copied the same value into the file', async () => {
-    process.env.BOT_NODE_ROLE = 'co-worker';
-    process.env.NODE_NAME = 'compose-name';
-    fs.writeFileSync(path.join(process.env.DATA_DIR!, '.env'), ['MASTER_URLS=wss://m.example', 'NODE_NAME=compose-name', ''].join(String.fromCharCode(10)));
-    const body = await post({ NODE_NAME: 'new-name' });
-    expect(body.containerSet).toEqual([{ field: 'NODE_NAME', message: 'NODE_NAME is set by the container environment, so it keeps compose-name' }]);
+    process.env.MAIN_GUILD_ID = '323456789012345678';
+    fs.writeFileSync(path.join(process.env.DATA_DIR!, '.env'), ['MAIN_GUILD_ID=323456789012345678', ''].join(String.fromCharCode(10)));
+    const body = await post({ MAIN_GUILD_ID: '423456789012345678' });
+    expect(body.containerSet).toEqual([{ field: 'MAIN_GUILD_ID', message: 'MAIN_GUILD_ID is set by the container environment, so it keeps 323456789012345678' }]);
   });
 
   it('a pinned session secret changed beside another field claims no session logout and leaves the changes', async () => {

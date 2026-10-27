@@ -1,7 +1,7 @@
 import { Client, ComponentType, DiscordAPIError, Events, InteractionResponseType, InteractionType, MessageFlags, type BaseInteraction } from 'discord.js';
 import { expect } from 'vitest';
 
-import { setRouteOverride } from '../../src/bot/internalSetup/utils/dataBackends/routeResolver';
+import { setBackendKind } from './backendKind';
 import { initWorkingSet } from '../../src/bot/internalSetup/utils/dataBackends/workingSet';
 import { installGatedInteractions } from '../../src/bot/internalSetup/utils/dataBackends/replyGate';
 import { FakeStore, tokenFor } from './fakeStore';
@@ -157,7 +157,7 @@ export function rig() {
 /** A postgres-routed guild on a scripted store, hydrated and ready. */
 export async function storeGuild() {
   const guildId = freshGuild();
-  setRouteOverride(guildId, 'postgres');
+  setBackendKind('postgres');
   const store = new FakeStore();
   const ws = initWorkingSet(store);
   expect(await ws.hydrate(guildId, tokenFor())).toBe('ready');
@@ -167,7 +167,7 @@ export async function storeGuild() {
 /** A postgres-routed guild whose working set is not ready: a save is refused as not-ready. */
 export function notReadyGuild() {
   const guildId = freshGuild();
-  setRouteOverride(guildId, 'postgres');
+  setBackendKind('postgres');
   return { guildId, category: 'm' };
 }
 

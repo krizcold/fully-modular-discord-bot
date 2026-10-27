@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { dataUnavailableMessage } from '../../src/bot/internalSetup/utils/dataBackends/boot';
 import { truthText } from '../../src/bot/internalSetup/utils/dataBackends/replyGate';
-import { CarryFate, DataBackendUnavailableError } from '../../src/bot/internalSetup/utils/dataBackends/workingSet';
+import { DataBackendUnavailableError } from '../../src/bot/internalSetup/utils/dataBackends/workingSet';
 import { appendData, deleteData, saveData } from '../../src/bot/internalSetup/utils/dataManager';
 import { tokenFor } from '../helpers/fakeStore';
 import { fakeClock, readinessRig, stopDrivers } from '../helpers/readinessRig';
@@ -277,9 +277,8 @@ describe('a closure and what it says', () => {
 
   it.each([
     ['node-stopping', 'The bot is restarting, so your change was not saved. Please try again in a moment.'],
-    ['database-read-only', "The bot's database is read-only while a backup covers an outage, so your change was not saved. Please try again in a few minutes."],
     ['database-backlog', "The bot's database is behind on saving changes, so your change was not saved. Please try again in a moment."],
-    ['guild-fenced', "This server's data just moved to another bot node; please try again in a moment."],
+    ['guild-fenced', "Another bot process took over this server's data; please try again in a moment."],
     ['database-unreachable', "The bot's database is currently unreachable, so your change was not saved. Please try again later or contact support."],
   ] as const)('a handler\'s refusal for %s tells the member its own cause', (cause, text) => {
     expect(dataUnavailableMessage(cause)).toBe(text);
@@ -462,7 +461,7 @@ describe('the backlog is what waits unsaved', () => {
     fakeClock();
     const r = readinessRig();
     const g = await r.ready();
-    r.store.mode = 'read-only';
+    r.store.holding = true;
     expect(r.ws.save(g, 'm', 'a.json', '{}')).toBe('accepted');
     await vi.advanceTimersByTimeAsync(331_000);
     // A held flush degrades nothing: the write that finds the oldest past 300 s is taken, and closes acceptance.
@@ -503,8 +502,7 @@ describe('the backlog is what waits unsaved', () => {
 
 describe('the default texts', () => {
   it.each([
-    ['guild-fenced', '[Data] This guild was taken over by another node; the write was not saved'],
-    ['database-read-only', '[Data] The database serving this node is a copy in recovery and accepts no writes (SQLSTATE 25006); the write was not saved'],
+    ['guild-fenced', '[Data] Another bot process took over this guild; the write was not saved'],
     ['node-stopping', '[Data] This process is stopping and its exit drain has closed; the write was not saved'],
     ['database-unreachable', '[Data] The data backend is unreachable; the write was not saved'],
     ['database-backlog', '[Data] The data backend is behind on storing writes; the write was not saved'],
@@ -591,38 +589,6 @@ describe('the write paths, each', () => {
     expect(r.store.commits.length).toBeGreaterThan(0);
   });
 
-  it('a carry adopted into a buffer a landing left empty reads its own age', async () => {
-    fakeClock();
-    const r = readinessRig();
-    const g = await r.ready();
-    r.store.holding = true;
-    expect(r.ws.append(g, 'm', 'mixed.log', 'line 1\n')).toBe('accepted');
-    await debounce();
-    expect(r.ws.save(g, 'm', 'mixed.log', '{}')).toBe('accepted');
-    await release(r);
-    await debounce();
-    await release(r);
-    expect(health(r).oldestDirtyMs).toBe(0);
-    r.ws.adoptDirty([{ guildId: g, docs: [], appends: [{ key: 'm/mixed.log', chunk: 'carried\n', dirtySince: 0 }], fate: new CarryFate() }]);
-    await vi.advanceTimersByTimeAsync(100);
-    expect(health(r).oldestDirtyMs).toBe(100);
-  });
-
-  it('a carry adopted into a buffer whose start is on the wire reads its own age once the flight lands', async () => {
-    fakeClock();
-    const r = readinessRig();
-    const g = await r.ready();
-    r.store.holding = true;
-    expect(r.ws.append(g, 'm', 'wire.log', 'line 1\n')).toBe('accepted');
-    await debounce();
-    r.ws.adoptDirty([{ guildId: g, docs: [], appends: [{ key: 'm/wire.log', chunk: 'carried\n', dirtySince: 0 }], fate: new CarryFate() }]);
-    expect(health(r).dirtyBytes).toBe('line 1\n'.length + 'carried\n'.length);
-    await vi.advanceTimersByTimeAsync(50_000);
-    await release(r);
-    expect(health(r).oldestDirtyMs).toBe(50_000);
-    expect(health(r).dirtyBytes).toBe('carried\n'.length);
-  });
-
   it('a doc read from the store is clean: a save over it counts only its own bytes', async () => {
     const r = readinessRig();
     const g = await r.ready();
@@ -646,15 +612,6 @@ describe('the write paths, each', () => {
 });
 
 describe('the facade\'s refusals, per verb', () => {
-  it.each(Object.keys(verbs) as (keyof typeof verbs)[])('%s on a read-only store throws database-read-only', async verb => {
-    const r = readinessRig();
-    const g = await r.ready();
-    r.store.isReadOnly = () => true;
-    const error = thrown(() => verbs[verb](g));
-    expect(error).toBeInstanceOf(DataBackendUnavailableError);
-    expect(error.causeKey).toBe('database-read-only');
-  });
-
   it.each(Object.keys(verbs) as (keyof typeof verbs)[])('%s on a fenced set throws guild-fenced', async verb => {
     const r = readinessRig();
     const g = await r.ready();

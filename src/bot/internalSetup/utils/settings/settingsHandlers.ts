@@ -355,7 +355,7 @@ export async function handleSettingsButton(
       }
 
       if (Object.keys(updates).length > 0 && !saveModuleSettings(moduleName, updates, context.guildId)) {
-        await sendEphemeralError(context, 'Save not applied: the settings could not be written now (a shard migration, data not ready, or the database unavailable); your changes are kept, try again shortly.');
+        await sendEphemeralError(context, 'Save not applied: the settings could not be written now (the data is not ready or the database is unavailable); your changes are kept, try again shortly.');
         return render(state);
       }
 
@@ -570,7 +570,7 @@ export async function handleSettingsModal(
         ? resetAllModuleSettings(moduleName, context.guildId)
         : getPremiumManager().setGlobalModuleConfig(moduleName, { values: {} });
       if (!reset) {
-        await sendEphemeralError(context, 'Reset not applied: the settings could not be deleted now (a shard migration, data not ready, or the database unavailable); nothing was changed, try again shortly.');
+        await sendEphemeralError(context, 'Reset not applied: the settings could not be deleted now (the data is not ready or the database is unavailable); nothing was changed, try again shortly.');
         return render(state);
       }
       state.pendingChanges = {};
@@ -621,7 +621,7 @@ export async function handleSettingsModal(
           else notRestored.push(key);
         }
         if (Object.keys(accepted).length > 0 && !saveModuleSettings(moduleName, accepted, context.guildId)) {
-          return createV2Response(buildErrorPanel('Upload failed: the settings could not be written now (a shard migration, data not ready, or the database unavailable); nothing was changed, try again shortly.'));
+          return createV2Response(buildErrorPanel('Upload failed: the settings could not be written now (the data is not ready or the database is unavailable); nothing was changed, try again shortly.'));
         }
 
         if (Object.keys(parsedSettings).length === 0) {

@@ -530,13 +530,12 @@ async function main() {
   // discord.js silently drops those events. Every internal and module
   // reaction handler already fetches partials before use.
   // Construction goes through IngestService: {shards, shardCount} come from
-  // this node's lease (standalone lease = the whole shard set). Every
+  // this process's lease (the whole shard set). Every
   // interaction gets its write ledger and its reply gate (BT-3).
   const client = getIngestService().buildClient({
     intents: finalIntents,
     partials: [Partials.Message, Partials.Reaction, Partials.User],
   }, installReplyGate);
-  fleet.attachClient(client);
 
   client.buttonHandlers = new Map<string, RegisteredButtonInfo>();
   client.dropdownHandlers = new Map<string, RegisteredDropdownInfo>();
@@ -653,7 +652,7 @@ async function main() {
   // Set up IPC handler for console `cmd invoke` (synthetic slash-command dispatch)
   setupCommandIPCHandlers();
 
-  // Set up IPC handlers for the webui's guild data write/read hops (6.3)
+  // Set up IPC handlers for the webui's guild data writes and reads
   setupDataIPCHandlers();
 
   // Set up the optional access-log channel (embed + dev-only shutdown buttons)
@@ -731,8 +730,7 @@ async function main() {
   process.on('SIGTERM', () => void shutdownHandler());
   process.on('SIGINT', () => void shutdownHandler());
 
-  // Login is gated by the lease runtime: no identify without a current-term
-  // lease, honoring the grant's identify delay. Standalone starts immediately.
+  // Login is gated by the lease runtime: no identify without a current-term lease.
   fleet.startIngest(process.env.DISCORD_TOKEN);
 }
 

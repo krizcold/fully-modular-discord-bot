@@ -13,7 +13,8 @@ vi.mock('../../src/bot/internalSetup/utils/panelManager', async importOriginal =
 
 import { gateCauseText } from '../../src/bot/internalSetup/utils/dataBackends/boot';
 import { setManifestReader } from '../../src/bot/internalSetup/utils/dataBackends/dataContract';
-import { confirmSaved, freezeGuildWrites, saveData, saveDataOutcome, unfreezeGuildWrites } from '../../src/bot/internalSetup/utils/dataManager';
+import { confirmSaved, saveData, saveDataOutcome } from '../../src/bot/internalSetup/utils/dataManager';
+import { freezeGuildWrites, unfreezeGuildWrites } from '../helpers/freezeGuild';
 import { handleInvoke } from '../../src/bot/internalSetup/utils/ipcCommandHandler';
 import { runPanelAction } from '../../src/bot/internalSetup/utils/ipcPanelHandler';
 import { fakeClock, NOT_LEASED, readinessRig, stopDrivers, watch } from '../helpers/readinessRig';
@@ -31,24 +32,6 @@ const manager = (fn: () => Promise<unknown>) => ({
 });
 
 describe('a panel action', () => {
-  it('a frozen guild answers moving at 2.5 s, before its handler or its ledger', async () => {
-    fakeClock();
-    const r = readinessRig();
-    const guildId = await r.ready();
-    const pm = manager(async () => ({ success: true }));
-    freezeGuildWrites(guildId);
-    try {
-      const answer = watch(runPanelAction('panel:execute', { panelId: 'p', userId: 'u', guildId }, pm));
-      await vi.advanceTimersByTimeAsync(2490);
-      expect(answer.settled()).toBe(false);
-      await vi.advanceTimersByTimeAsync(30);
-      expect(answer.value()).toEqual({ success: false, error: gateCauseText('moving') });
-    } finally {
-      unfreezeGuildWrites(guildId);
-    }
-    expect(pm.executePanelForWebUI).not.toHaveBeenCalled();
-  });
-
   it.each([
     ['not-served', 'a guild not leased here'],
     ['loading', 'a guild still loading'],
@@ -90,29 +73,18 @@ describe('a console invoke', () => {
   const invoke = (guildId: string) => handleInvoke({ command: 'probe', guildId, force: true });
 
   it.each([
-    ['moving', (id: string) => `guild ${id}'s data is being moved; try again in a moment`],
-    ['not-served', (id: string) => `guild ${id}'s data is not served by this bot node right now; try again in a moment`],
+    ['not-served', (id: string) => `guild ${id}'s data is not served by this bot process right now; try again in a moment`],
     ['loading', (id: string) => `guild ${id}'s data is still loading; try again in a moment`],
   ] as const)('%s answers its own text and never runs the command', async (cause, text) => {
     fakeClock();
     const ran = vi.fn();
     local.commands = [{ name: 'probe', callback: ran }];
     const r = readinessRig(cause === 'not-served' ? NOT_LEASED : undefined);
-    let guildId: string;
-    if (cause === 'moving') {
-      guildId = await r.ready();
-      freezeGuildWrites(guildId);
-    } else {
-      if (cause === 'loading') r.store.hydrateMode = 'held';
-      guildId = r.guild();
-    }
-    try {
-      const answer = watch(invoke(guildId));
-      await vi.advanceTimersByTimeAsync(2600);
-      expect(answer.value()).toEqual({ success: false, error: text(guildId) });
-    } finally {
-      unfreezeGuildWrites(guildId);
-    }
+    if (cause === 'loading') r.store.hydrateMode = 'held';
+    const guildId = r.guild();
+    const answer = watch(invoke(guildId));
+    await vi.advanceTimersByTimeAsync(2600);
+    expect(answer.value()).toEqual({ success: false, error: text(guildId) });
     expect(ran).not.toHaveBeenCalled();
   });
 

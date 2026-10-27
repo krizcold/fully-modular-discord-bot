@@ -1,7 +1,8 @@
 import { MessageFlags, MessageFlagsBitField } from 'discord.js';
 import { describe, expect, it, vi } from 'vitest';
 
-import { freezeGuildWrites, saveData, unfreezeGuildWrites } from '../../src/bot/internalSetup/utils/dataManager';
+import { saveData } from '../../src/bot/internalSetup/utils/dataManager';
+import { freezeGuildWrites, unfreezeGuildWrites } from '../helpers/freezeGuild';
 import { truthText } from '../../src/bot/internalSetup/utils/dataBackends/replyGate';
 import getLocalCommands from '../../src/bot/internalSetup/utils/getLocalCommands';
 import { notReadyGuild, rawCommand, rig, storeGuild, textOf } from '../helpers/gateRig';

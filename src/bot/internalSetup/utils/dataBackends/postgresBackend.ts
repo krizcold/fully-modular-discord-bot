@@ -8,7 +8,6 @@ import { randomUUID } from 'crypto';
 import { Client, Pool } from 'pg';
 import { guardPoolClients, shortLivedClient } from '../pgClient';
 import type { PoolClient, QueryResult } from 'pg';
-import { watchForSyncWaitCancel, watchPoolForSyncWaitCancel } from '../syncWaitCancel';
 import type {
   DataBackend,
   DocKey,
@@ -82,29 +81,7 @@ const PROVISION_DDL: string[] = [
   `CREATE INDEX IF NOT EXISTS guild_graveyard_ttl_idx ON smdb_data.guild_data_graveyard (retired_at)`,
 ];
 
-// Equal (term, epoch) across two different nodes is possible by construction
-// (grant rounds hand the bumped epoch to the target), so equality only orders
-// within one node_id; across nodes the fence is strict <.
-const READ_ONLY_PROBE_MS = 5_000;
-
-// The term a delivered database must hold in its control row (B7-F7), raised
-// by the data boot on each delivery; 0 while none was delivered.
-let requiredControlTerm = 0;
-
-/** Raise the term every backend must be proven to hold before anything lands on it or hydrates from it. */
-export function requireControlTerm(term: number): void {
-  if (Number.isSafeInteger(term) && term > requiredControlTerm) requiredControlTerm = term;
-}
-
-/** Back down to term, for the witness floor alone when no notice came (the data boot's releaseServingTerm). */
-export function releaseControlTerm(term: number): void {
-  if (Number.isSafeInteger(term) && term >= 0 && term < requiredControlTerm) requiredControlTerm = term;
-}
-
-function isReadOnlyError(error: unknown): boolean {
-  return (error as { code?: unknown } | null)?.code === '25006';
-}
-
+// Equality only orders within one node_id; across nodes the fence is strict <.
 const FENCED_OWNERSHIP_UPDATE = `
   UPDATE smdb_data.guild_ownership
      SET node_id = $2, shard_id = $3, term = $4, epoch = $5, shard_count = $6, updated_at = now()
@@ -128,7 +105,6 @@ type AlertListener = (event: AlertEvent, detail: string) => void;
 export class PostgresBackend implements DataBackend {
   readonly kind = 'postgres' as const;
 
-  /** Shared with the PostgresControlStore when no CONTROL_STORE_URL redirects it. */
   getPool(): Pool {
     return this.pool;
   }
@@ -143,10 +119,6 @@ export class PostgresBackend implements DataBackend {
   private started = false;
   private stopped = false;
   private probing = false;
-  private readOnly = false;
-  private readOnlyProbing = false;
-  private staleCopy = false;
-  private provenTerm = 0;
   private readonly listeners: AlertListener[] = [];
   private readonly pendingSleeps = new Set<{ timer: NodeJS.Timeout; resolve: () => void }>();
 
@@ -167,11 +139,6 @@ export class PostgresBackend implements DataBackend {
       // Unhandled idle-client errors would crash the process.
       console.error('[PostgresBackend] Idle client error:', error);
     });
-    // Guild-data writes are fleet writes: they go through the master's primary
-    // from every node, so a promote's fence sweep can terminate one mid-wait,
-    // which postgres reports as a WARNING on an otherwise successful commit
-    // (B6 map F24).
-    watchPoolForSyncWaitCancel(this.pool, 'the guild-data pool');
     guardPoolClients(this.pool, 'the guild-data pool');
   }
 
@@ -203,44 +170,6 @@ export class PostgresBackend implements DataBackend {
     return { state: this.state };
   }
 
-  healthy(): boolean {
-    return this.state === 'ready';
-  }
-
-  isReadOnly(): boolean {
-    return this.readOnly;
-  }
-
-  isStaleCopy(): boolean {
-    return this.staleCopy;
-  }
-
-  /**
-   * The database turned out to be an older copy of the fleet's (B7-F7): every
-   * write is refused from now on, as on a copy in recovery, and nothing lifts
-   * it, so the working set keeps what it accepted for the database the node
-   * moves to.
-   */
-  fenceAsStale(): void {
-    this.staleCopy = true;
-    this.readOnly = true;
-  }
-
-  /** This database was read holding at least term in its control row. */
-  markProven(term: number): void {
-    if (term > this.provenTerm) this.provenTerm = term;
-  }
-
-  /**
-   * Not yet proven to hold the term its delivering master holds: nothing
-   * lands here and nothing hydrates from here until it is, the writes
-   * staying dirty in the working set, so an older copy of the fleet database
-   * takes none (B7-F7).
-   */
-  isUnproven(): boolean {
-    return requiredControlTerm > 0 && this.provenTerm < requiredControlTerm;
-  }
-
   onAlert(cb: AlertListener): void {
     this.listeners.push(cb);
   }
@@ -250,18 +179,9 @@ export class PostgresBackend implements DataBackend {
     while (!this.stopped) {
       try {
         await this.pool.query('SELECT 1');
-        // A cluster IN RECOVERY refuses DDL outright (25006), including
-        // CREATE ... IF NOT EXISTS, so provisioning would fail here forever and
-        // the backend would never become ready. A replica's schema arrives by
-        // replication instead, so there is nothing to provision: this is asked
-        // of the cluster rather than passed in, because any backend pointed at a
-        // standby needs it, not only the stand-in lane that first hit it.
         const recovery = await this.pool.query('SELECT pg_is_in_recovery() AS in_recovery');
         if (recovery.rows[0]?.in_recovery === true) {
-          this.markReadOnly();
-          this.becomeReady();
-          console.log('[PostgresBackend] Connected to a database in recovery; backend ready READ-ONLY (no provisioning)');
-          return;
+          throw new Error('the database is in recovery (read-only); the bot serves only from a database that takes writes');
         }
         await this.provision();
         if (this.schemaMismatch) return;
@@ -311,65 +231,6 @@ export class PostgresBackend implements DataBackend {
   private noteSuccess(): void {
     if (this.schemaMismatch || this.stopped) return;
     if (this.state === 'outage') this.becomeReady();
-  }
-
-  // A copy in recovery answers every write with SQLSTATE 25006 while it serves
-  // every read: a read-only state, distinct from an outage, that lifts when the
-  // copy leaves recovery (a stand-in's write step, a promote) (B7-F25).
-  private markReadOnly(): void {
-    if (this.readOnly) return;
-    this.readOnly = true;
-    console.warn('[PostgresBackend] The database is READ-ONLY (a copy in recovery): reads are served, writes are refused with SQLSTATE 25006 until it leaves recovery');
-    void this.readOnlyProbeLoop();
-  }
-
-  private async stillInRecovery(client: PoolClient): Promise<boolean> {
-    if (this.staleCopy) return true;
-    try {
-      const res = await client.query('SELECT pg_is_in_recovery() AS in_recovery');
-      if (res.rows[0]?.in_recovery === false) {
-        this.readOnly = false;
-        console.log('[PostgresBackend] The database accepts writes again (it left recovery)');
-      }
-      return this.readOnly;
-    } catch {
-      return true;
-    }
-  }
-
-  private async readOnlyProbeLoop(): Promise<void> {
-    if (this.readOnlyProbing) return;
-    this.readOnlyProbing = true;
-    try {
-      while (!this.stopped && this.readOnly) {
-        await this.sleep(READ_ONLY_PROBE_MS);
-        if (this.stopped || !this.readOnly || this.staleCopy) return;
-        try {
-          const res = await this.pool.query('SELECT pg_is_in_recovery() AS in_recovery');
-          if (!this.readOnly) return;
-          if (res.rows[0]?.in_recovery === false) {
-            this.readOnly = false;
-            console.log('[PostgresBackend] The database accepts writes again (it left recovery)');
-            return;
-          }
-        } catch { /* connectivity belongs to the outage machinery */ }
-      }
-    } finally {
-      this.readOnlyProbing = false;
-    }
-  }
-
-  // A 25006 alone is not a copy in recovery: a promote fences the old primary
-  // with default_transaction_read_only, and that store stays on the outage
-  // path so the writes it refuses are carried to the new database.
-  private async recoveryAfterError(client: PoolClient): Promise<boolean> {
-    await this.rollbackQuiet(client);
-    try {
-      const res = await client.query('SELECT pg_is_in_recovery() AS in_recovery');
-      return res.rows[0]?.in_recovery === true;
-    } catch {
-      return false;
-    }
   }
 
   private noteFailure(error: unknown): void {
@@ -489,7 +350,6 @@ export class PostgresBackend implements DataBackend {
   // ==========================================================================
 
   async hydrateGuild(guildId: string, token: FenceToken): Promise<HydrationOutcome> {
-    if (this.isUnproven()) return { ok: false, reason: 'unavailable' };
     let client: PoolClient;
     try {
       client = await this.pool.connect();
@@ -499,16 +359,6 @@ export class PostgresBackend implements DataBackend {
     }
     let destroy = false;
     try {
-      // A copy in recovery refuses the claim (SQLSTATE 25006) but serves the
-      // read: the ownership stamp waits for the first flush, which claims it
-      // once the copy leaves recovery (B7-F25). Asked of the store on this very
-      // client, not of the flag the probe refreshes every 5 s: a carry applied
-      // after this hydrate must not land over rows written since the promote.
-      if (this.readOnly && await this.stillInRecovery(client)) {
-        const read = await this.readGuildDocs(client, guildId);
-        this.noteSuccess();
-        return { ok: true, ...read };
-      }
       await client.query('BEGIN');
       const claim = await client.query(FENCED_OWNERSHIP_UPDATE, this.fenceParams(guildId, token));
       let claimed = (claim.rowCount ?? 0) === 1;
@@ -527,21 +377,10 @@ export class PostgresBackend implements DataBackend {
       this.noteSuccess();
       return { ok: true, ...read };
     } catch (error) {
-      let failure: unknown = error;
-      if (isReadOnlyError(error) && await this.recoveryAfterError(client)) {
-        this.markReadOnly();
-        try {
-          const read = await this.readGuildDocs(client, guildId);
-          this.noteSuccess();
-          return { ok: true, ...read };
-        } catch (again) {
-          failure = again;
-        }
-      }
       destroy = true;
       await this.rollbackQuiet(client);
-      this.noteFailure(failure);
-      console.error(`[PostgresBackend] hydrateGuild failed for ${guildId}:`, failure);
+      this.noteFailure(error);
+      console.error(`[PostgresBackend] hydrateGuild failed for ${guildId}:`, error);
       return { ok: false, reason: 'unavailable' };
     } finally {
       client.release(destroy ? true : undefined);
@@ -550,13 +389,11 @@ export class PostgresBackend implements DataBackend {
 
   /**
    * A working set kept since its lease left, asked for again: the stamp
-   * moves to the new token only while it still names this node (or the
-   * guild has none), so a claim another node made since is never passed
-   * over. A copy in recovery takes no claim: its stamp is read instead (the
-   * first flush claims it).
+   * moves to the new token only while it still names this process (or the
+   * guild has none), so a claim another bot process made since is never passed
+   * over.
    */
   async reclaimGuild(guildId: string, token: FenceToken): Promise<'kept' | 'lost' | null> {
-    if (this.isUnproven()) return null;
     let client: PoolClient;
     try {
       client = await this.pool.connect();
@@ -564,36 +401,16 @@ export class PostgresBackend implements DataBackend {
       this.noteFailure(error);
       return null;
     }
-    const byStamp = async (): Promise<'kept' | 'lost'> => {
-      const nodeId = (await client.query(OWNER_SELECT, [guildId])).rows[0]?.node_id;
-      return nodeId === undefined || nodeId === token.nodeId ? 'kept' : 'lost';
-    };
     let destroy = false;
     try {
-      if (this.readOnly && await this.stillInRecovery(client)) {
-        const kept = await byStamp();
-        this.noteSuccess();
-        return kept;
-      }
       const params = this.fenceParams(guildId, token);
       let kept = ((await client.query(OWNERSHIP_RECLAIM, params)).rowCount ?? 0) === 1;
       if (!kept) kept = ((await client.query(OWNERSHIP_INSERT, params)).rowCount ?? 0) === 1;
       this.noteSuccess();
       return kept ? 'kept' : 'lost';
     } catch (error) {
-      let failure: unknown = error;
-      if (isReadOnlyError(error) && await this.recoveryAfterError(client)) {
-        this.markReadOnly();
-        try {
-          const kept = await byStamp();
-          this.noteSuccess();
-          return kept;
-        } catch (again) {
-          failure = again;
-        }
-      }
       destroy = true;
-      this.noteFailure(failure);
+      this.noteFailure(error);
       return null;
     } finally {
       client.release(destroy ? true : undefined);
@@ -612,7 +429,6 @@ export class PostgresBackend implements DataBackend {
   }
 
   async flushGuild(guildId: string, batch: GuildFlushBatch, token: FenceToken): Promise<FlushOutcome> {
-    if (this.readOnly || this.isUnproven()) return { ok: false, reason: 'read-only' };
     let client: PoolClient;
     try {
       client = await this.pool.connect();
@@ -626,8 +442,7 @@ export class PostgresBackend implements DataBackend {
       const claim = await client.query(FENCED_OWNERSHIP_UPDATE, this.fenceParams(guildId, token));
       let claimed = (claim.rowCount ?? 0) === 1;
       if (!claimed) {
-        // A guild first hydrated on a read-only copy has no ownership row yet;
-        // absent is not deposed (B7-F25).
+        // A guild whose row was swept or never written has none; absent is not deposed.
         const inserted = await client.query(OWNERSHIP_INSERT, this.fenceParams(guildId, token));
         claimed = (inserted.rowCount ?? 0) === 1;
       }
@@ -665,10 +480,6 @@ export class PostgresBackend implements DataBackend {
       this.noteSuccess();
       return { ok: true };
     } catch (error) {
-      if (isReadOnlyError(error) && await this.recoveryAfterError(client)) {
-        this.markReadOnly();
-        return { ok: false, reason: 'read-only' };
-      }
       destroy = true;
       await this.rollbackQuiet(client);
       this.noteFailure(error);
@@ -680,7 +491,6 @@ export class PostgresBackend implements DataBackend {
   }
 
   async retireGuild(guildId: string, reason: string, token: FenceToken): Promise<RetireOutcome> {
-    if (this.isUnproven()) return { ok: false, reason: 'unavailable' };
     let client: PoolClient;
     try {
       client = await this.pool.connect();
@@ -693,8 +503,8 @@ export class PostgresBackend implements DataBackend {
       await client.query('BEGIN');
       const claim = await client.query(FENCED_OWNERSHIP_UPDATE, this.fenceParams(guildId, token));
       if ((claim.rowCount ?? 0) !== 1) {
-        // No row is not a competitor: a guild that joined mid-window and never
-        // wrote has no ownership row; claim it so the retire can tombstone it.
+        // No row is not a competitor: a guild that never wrote has no
+        // ownership row; claim it so the retire can tombstone it.
         const inserted = await client.query(OWNERSHIP_INSERT, this.fenceParams(guildId, token));
         if ((inserted.rowCount ?? 0) !== 1) {
           await client.query('ROLLBACK');
@@ -723,10 +533,6 @@ export class PostgresBackend implements DataBackend {
       console.log(`[PostgresBackend] Guild ${guildId} retired to graveyard (${reason}); ${moved} row(s) moved`);
       return { ok: true, moved };
     } catch (error) {
-      if (isReadOnlyError(error) && await this.recoveryAfterError(client)) {
-        this.markReadOnly();
-        return { ok: false, reason: 'unavailable' };
-      }
       destroy = true;
       await this.rollbackQuiet(client);
       this.noteFailure(error);
@@ -778,10 +584,6 @@ export class PostgresBackend implements DataBackend {
       console.log(`[PostgresBackend] Guild ${guildId} restored from graveyard batch ${retiredAt}; ${moved} row(s) moved back`);
       return { ok: true, moved };
     } catch (error) {
-      if (isReadOnlyError(error) && await this.recoveryAfterError(client)) {
-        this.markReadOnly();
-        return { ok: false, reason: 'unavailable' };
-      }
       destroy = true;
       await this.rollbackQuiet(client);
       this.noteFailure(error);
@@ -860,55 +662,6 @@ export class PostgresBackend implements DataBackend {
     return res.rows[0]?.present === true;
   }
 
-  async sizeOfGuildData(guildId: string): Promise<number> {
-    const res = await this.read(
-      `SELECT COALESCE((SELECT SUM(octet_length(doc)) FROM smdb_data.guild_data WHERE guild_id = $1), 0)
-            + COALESCE((SELECT SUM(octet_length(chunk)) FROM smdb_data.guild_append WHERE guild_id = $1), 0) AS total`,
-      [guildId]);
-    return Number(res.rows[0]?.total ?? 0);
-  }
-
-  /**
-   * Full guild content for the transformation export: docs plus compacted
-   * append streams (string_agg is byte-identical to the file). A path present
-   * in both tables yields the doc (dual rows are a pre-existing pathology).
-   */
-  async readGuildRecords(guildId: string): Promise<{ module: string; filename: string; content: string; kind: 'doc' | 'append' }[]> {
-    const docs = await this.read(
-      `SELECT module, filename, doc FROM smdb_data.guild_data WHERE guild_id = $1`, [guildId]);
-    const appends = await this.read(
-      `SELECT module, filename, string_agg(chunk, '' ORDER BY seq) AS content
-         FROM smdb_data.guild_append WHERE guild_id = $1 GROUP BY module, filename`,
-      [guildId]);
-    const out: { module: string; filename: string; content: string; kind: 'doc' | 'append' }[] = [];
-    const seen = new Set<string>();
-    for (const row of docs.rows) {
-      seen.add(`${row.module}/${row.filename}`);
-      out.push({ module: row.module, filename: row.filename, content: row.doc, kind: 'doc' });
-    }
-    for (const row of appends.rows) {
-      if (seen.has(`${row.module}/${row.filename}`)) {
-        console.warn(`[DataBackend] Guild ${guildId} path ${row.module}/${row.filename} exists as doc AND append; exporting the doc`);
-        continue;
-      }
-      out.push({ module: row.module, filename: row.filename, content: row.content, kind: 'append' });
-    }
-    return out;
-  }
-
-  /** Stored bytes per guild (transformation space precheck), one grouped query pass. */
-  async sizeOfAllGuilds(): Promise<Map<string, number>> {
-    const out = new Map<string, number>();
-    const docs = await this.read(
-      `SELECT guild_id, SUM(octet_length(doc)) AS total FROM smdb_data.guild_data GROUP BY guild_id`, []);
-    const appends = await this.read(
-      `SELECT guild_id, SUM(octet_length(chunk)) AS total FROM smdb_data.guild_append GROUP BY guild_id`, []);
-    for (const row of [...docs.rows, ...appends.rows]) {
-      out.set(row.guild_id, (out.get(row.guild_id) ?? 0) + Number(row.total ?? 0));
-    }
-    return out;
-  }
-
   /** Newest graveyard batch (retired_at ms) for a guild; null when none exist. */
   async latestGraveyardBatch(guildId: string): Promise<number | null> {
     const res = await this.read(
@@ -974,13 +727,6 @@ function backoffDelay(attempt: number): number {
 // BOOT-TIME RECOGNITION HELPERS + TTL SWEEP (one-shot connections)
 // ============================================================================
 
-export interface BackendStateMarker {
-  live: 'file' | 'postgres';
-  storeId: string | null;
-  flippedAt: number;
-  transformationId: string | null;
-}
-
 /** Thrown when the database cannot be reached, so the recognition guard can
  * tell "no marker" apart from "cannot ask". */
 export class PostgresUnreachableError extends Error {
@@ -988,6 +734,14 @@ export class PostgresUnreachableError extends Error {
     super(message);
     this.name = 'PostgresUnreachableError';
     this.cause = cause;
+  }
+}
+
+/** Thrown when the database answers but is a read-only standby in recovery. */
+export class PostgresInRecoveryError extends Error {
+  constructor() {
+    super('the configured database is in recovery (a read-only standby); point DATA_BACKEND_URL at the primary');
+    this.name = 'PostgresInRecoveryError';
   }
 }
 
@@ -1003,7 +757,6 @@ async function metaClient(url: string): Promise<Client> {
     statement_timeout: STATEMENT_TIMEOUT_MS,
     keepAlive: true,
   });
-  watchForSyncWaitCancel(client, 'a data-backend meta connection');
   try {
     await client.connect();
   } catch (error) {
@@ -1013,72 +766,24 @@ async function metaClient(url: string): Promise<Client> {
   return client;
 }
 
-/** Meta 'backend_state' marker; null when reachable but absent (incl. an
- * unprovisioned database), PostgresUnreachableError when the DB cannot be asked. */
-export async function readBackendState(url: string): Promise<BackendStateMarker | null> {
-  const client = await metaClient(url);
-  try {
-    let res: QueryResult;
-    try {
-      res = await client.query(`SELECT value FROM smdb_data.meta WHERE key = 'backend_state'`);
-    } catch (error) {
-      if (isMissingRelation(error)) return null;
-      throw new PostgresUnreachableError('backend_state read failed', error);
-    }
-    if (res.rows.length === 0) return null;
-    return JSON.parse(res.rows[0].value) as BackendStateMarker;
-  } finally {
-    await client.end().catch(() => { /* best effort */ });
-  }
-}
-
-export async function writeBackendState(url: string, state: BackendStateMarker): Promise<void> {
-  const client = await metaClient(url);
-  try {
-    await client.query(
-      `INSERT INTO smdb_data.meta (key, value, updated_at) VALUES ('backend_state', $1, now())
-       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
-      [JSON.stringify(state)]);
-  } finally {
-    await client.end().catch(() => { /* best effort */ });
-  }
-}
-
 /** Meta 'store_id'; null when reachable but absent, PostgresUnreachableError
- * when the DB cannot be asked. */
+ * when the DB cannot be asked, PostgresInRecoveryError from a standby. */
 export async function readStoreId(url: string): Promise<string | null> {
   const client = await metaClient(url);
   try {
     let res: QueryResult;
     try {
+      const recovery = await client.query('SELECT pg_is_in_recovery() AS in_recovery');
+      if (recovery.rows[0]?.in_recovery === true) throw new PostgresInRecoveryError();
       res = await client.query(`SELECT value FROM smdb_data.meta WHERE key = 'store_id'`);
     } catch (error) {
+      if (error instanceof PostgresInRecoveryError) throw error;
       if (isMissingRelation(error)) return null;
       throw new PostgresUnreachableError('store_id read failed', error);
     }
     if (res.rows.length === 0) return null;
     const parsed: unknown = JSON.parse(res.rows[0].value);
     return typeof parsed === 'string' ? parsed : null;
-  } finally {
-    await client.end().catch(() => { /* best effort */ });
-  }
-}
-
-/** The fleet term this database's control row holds; 0 when it holds no control store. Throws PostgresUnreachableError while it cannot be read. */
-export async function readControlTerm(url: string): Promise<number> {
-  const client = await metaClient(url);
-  try {
-    let res: QueryResult;
-    try {
-      res = await client.query('SELECT term FROM smdb_control.term WHERE id = 1');
-    } catch (error) {
-      if (isMissingRelation(error)) return 0;
-      throw new PostgresUnreachableError('control term read failed', error);
-    }
-    if (res.rows.length === 0) return 0;
-    const term = Number(res.rows[0].term);
-    if (!Number.isSafeInteger(term) || term < 0) throw new PostgresUnreachableError('control term read failed', new Error(`unusable term ${String(res.rows[0].term)}`));
-    return term;
   } finally {
     await client.end().catch(() => { /* best effort */ });
   }

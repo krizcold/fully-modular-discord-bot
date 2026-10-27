@@ -4,11 +4,7 @@ import { loadCredentials, validateCredentials, BotCredentials } from '../utils/e
 import { IPC_TIMEOUT_MS, IPC_TIMEOUT_MODULE_OP_MS } from './constants';
 import type { WebSocketManager, WSEvent, WSEventData } from './websocketManager';
 import { getSafetyManager } from '../utils/updateSafety';
-import { resetAppStoreManager } from '../bot/internalSetup/utils/appStoreManager';
-import { applyRouteOverrides } from '../bot/internalSetup/utils/dataBackends/routeResolver';
 import { setWebuiDataStoreUrl } from './utils/webuiDataReader';
-import { invalidateRoleOverrideCache } from '../bot/internalSetup/fleet/nodeIdentity';
-import { startStandInWrites } from './promoteEngine';
 import type { NotifyOutcome } from '../bot/internalSetup/utils/subscriptionNotifier';
 
 // A crashed child is started again after this pause. The safety manager's
@@ -209,10 +205,6 @@ export class BotManager {
     if (!this.startingAfterCrash) this.crashRestarts = 0;
     this.stopRequested = false;
 
-    // The child consumes one-shot takeover flags from role-override.json; the
-    // parent's role must stay in lockstep with whatever role this child boots.
-    invalidateRoleOverrideCache();
-
     // Load and validate credentials
     const credentials = loadCredentials();
     const validation = validateCredentials(credentials);
@@ -289,7 +281,7 @@ export class BotManager {
           this.safetyManager.recordCrash(code, signal, this.crashLogs);
 
           this.emitEvent('bot:crash', { code, signal, logs: this.crashLogs });
-          // A child that stays down is a dead fleet node behind a container
+          // A child that stays down is a dead bot behind a container
           // that still reads running.
           if (this.botStartTime > 0 && Date.now() - this.botStartTime >= CRASH_STABLE_UPTIME_MS) this.crashRestarts = 0;
           if (this.stopRequested) {
@@ -346,61 +338,13 @@ export class BotManager {
             this.wsManager.broadcast('bot:metrics:snapshot', message.data);
           }
         } else if (message.type === 'fleet:status') {
-          // The parent's route resolver follows the bot's routing map so
-          // /list and /data/get branch per guild during a transformation
-          // window (absent or empty clears any overrides).
-          try {
-            applyRouteOverrides(Array.isArray(message.data?.dataRouting) ? message.data.dataRouting : null);
-          } catch { /* status push must never fail */ }
           if (this.wsManager) {
             this.wsManager.broadcast('bot:fleet:status', message.data);
           }
         } else if (message.type === 'data:store') {
-          // The parent's reader follows the store the child serves (a delivered
-          // database, a stand-in's copy), never only the node's own /data/.env.
+          // The parent's reader follows the store the child serves, never only
+          // the node's own /data/.env.
           setWebuiDataStoreUrl(typeof message.data?.url === 'string' ? message.data.url : null);
-        } else if (message.type === 'sync:applied') {
-          // Co-worker applied a master sync: this process's AppStore caches
-          // are stale (installed.json/repos.json were overwritten on disk).
-          try {
-            resetAppStoreManager();
-          } catch (error) {
-            console.warn('[BotManager] AppStore reset after sync failed:', error instanceof Error ? error.message : error);
-          }
-          if (this.wsManager) {
-            this.wsManager.broadcast('bot:sync:status', message.data);
-          }
-        } else if (message.type === 'fleet:stepdown') {
-          // A superseded master staged its co-worker override (B4); it comes
-          // back as a co-worker of the new master. A concurrent operation only
-          // delays the restart, never loses it.
-          console.warn('[BotManager] fleet:stepdown received; restarting the bot child as co-worker');
-          const retry = (): void => {
-            void this.restart().then(result => {
-              if (!result.success && result.reason === 'operation_in_progress') setTimeout(retry, 5000).unref();
-            });
-          };
-          retry();
-        } else if (message.type === 'fleet:seeded') {
-          // A master seeded from a backup's copy staged its takeover override
-          // (B4f-3); it comes back as the master serving that copy.
-          console.warn('[BotManager] fleet:seeded received; restarting the bot child as the seeded master');
-          const retrySeeded = (): void => {
-            void this.restart().then(result => {
-              if (!result.success && result.reason === 'operation_in_progress') setTimeout(retrySeeded, 5000).unref();
-            });
-          };
-          retrySeeded();
-        } else if (message.type === 'fleet:standin:writes') {
-          // A serving stand-in asks for the write step (B6-f2). It runs here
-          // because the pinned-URL verdict is only correct in this process;
-          // the answer goes back through the arm record, never the socket.
-          const data = message.data ?? {};
-          void startStandInWrites(this, {
-            coveringNodeId: String(data.coveringNodeId ?? ''),
-            inheritedTerm: Number.isFinite(data.inheritedTerm) ? Number(data.inheritedTerm) : null,
-            heldToLsn: typeof data.heldToLsn === 'string' ? data.heldToLsn : null,
-          });
         } else if (message.type === 'control:shutdown-bot') {
           // Access-log channel "Shut down bot" button: stop the Discord bot child.
           console.warn('[BotManager] control:shutdown-bot received from access-log action');
@@ -761,9 +705,9 @@ export class BotManager {
   }
 
   /**
-   * Guild data write hop (6.3): the bot child applies the write on the owning
-   * node; the parent never writes a postgres-routed guild itself. 15s outer
-   * timeout so the inner 10s control hop surfaces its own error first.
+   * Guild data write hop: the bot child applies the write; the parent never
+   * writes a postgres-routed guild itself. The child's 5s operator flush fits
+   * inside the 15s wait.
    */
   async writeGuildData(payload: { guildId: string; module: string; filename: string; op: 'write' | 'delete' | 'delete-namespace' | 'restore-graveyard'; contentJson?: string }): Promise<any> {
     if (!this.isRunning() || !this.botProcess) {
@@ -789,7 +733,7 @@ export class BotManager {
   }
 
   /** Symmetric read hop; no filename = list the module's files. */
-  async readGuildData(payload: { guildId: string; module: string; filename?: string; scope?: 'all' }): Promise<any> {
+  async readGuildData(payload: { guildId: string; module: string; filename?: string }): Promise<any> {
     if (!this.isRunning() || !this.botProcess) {
       return { ok: false, code: 'bot-down', error: 'bot process is not running' };
     }
@@ -868,250 +812,6 @@ export class BotManager {
       return await this.sendIPCMessage('fleet:state', {});
     } catch (error) {
       console.error('[BotManager] Error getting fleet state:', error);
-      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
-    }
-  }
-
-  /**
-   * Force a witness read in the child and return its status (B4). Its own
-   * ceiling, well above the ordinary IPC deadline: a cold paginated read is
-   * seven sequential Discord calls, and the promote verdict that asks for it
-   * prefers waiting to deciding on stale evidence. An overrun is not fatal -
-   * it lands in the catch below and the caller falls back to the cached
-   * reading, which the freshness windows reject on their own if it is old.
-   */
-  async readFleetWitness(): Promise<any> {
-    try {
-      return await this.sendIPCMessage('fleet:witness:read', {}, 75000);
-    } catch (error) {
-      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
-    }
-  }
-
-  /** The database a follower hold serves from, with credentials, for the failback promote (B6 map F28). */
-  async readFollowedBackend(): Promise<any> {
-    try {
-      return await this.sendIPCMessage('fleet:followed:read', {}, 10000);
-    } catch (error) {
-      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
-    }
-  }
-
-  /**
-   * Runtime fleet-config edit (B2); master-only, validated in the bot child.
-   */
-  async setFleetConfig(masterCandidates: string[], witnessChannelId?: string, backupDesignations?: unknown): Promise<any> {
-    try {
-      return await this.sendIPCMessage('fleet:config:set', { masterCandidates, witnessChannelId, backupDesignations });
-    } catch (error) {
-      console.error('[BotManager] Error setting fleet config:', error);
-      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
-    }
-  }
-
-  /**
-   * Manually assign a FREE shard to a node (master-only; validated in the bot child).
-   */
-  async assignFleetShard(shardId: number, nodeId: string): Promise<any> {
-    try {
-      return await this.sendIPCMessage('fleet:assign', { shardId, nodeId });
-    } catch (error) {
-      console.error('[BotManager] Error assigning fleet shard:', error);
-      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
-    }
-  }
-
-  /**
-   * End the reshard pause and let shard distribution proceed (master-only; validated in the bot child).
-   */
-  async resumeFleetAssignments(): Promise<any> {
-    try {
-      return await this.sendIPCMessage('fleet:resumeAssignments', {});
-    } catch (error) {
-      console.error('[BotManager] Error resuming fleet assignments:', error);
-      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
-    }
-  }
-
-  /**
-   * Declare a down node lost: free its shards for redistribution (master-only; validated in the bot child).
-   */
-  async declareFleetNodeLost(nodeId: string): Promise<any> {
-    try {
-      return await this.sendIPCMessage('fleet:declareLost', { nodeId });
-    } catch (error) {
-      console.error('[BotManager] Error declaring fleet node lost:', error);
-      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
-    }
-  }
-
-  /** The choice for a shard a Declare Lost held: restore the copy on restoreOn, or (null) start it empty (master-only; validated in the bot child). */
-  async resolveFleetHeldShard(shardId: number, restoreOn: string | null): Promise<any> {
-    try {
-      return await this.sendIPCMessage('fleet:heldShard', { shardId, restoreOn });
-    } catch (error) {
-      console.error('[BotManager] Error resolving the held shard:', error);
-      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
-    }
-  }
-
-  /** Retire the stale guild copies of a superseded co-worker in file mode (B4f-2; validated in the bot child). */
-  /** The Retire reading of a held mirror copy (B4f-3): drop it so the mirror copies the master this node is registered with. */
-  async dropHeldMirrorCopy(): Promise<any> {
-    try {
-      return await this.sendIPCMessage('fleet:mirror:drop', {});
-    } catch (error) {
-      console.error('[BotManager] Error dropping the held copy:', error);
-      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
-    }
-  }
-
-  /** The seed hold's confirm (B4f-3): seed this master from the named backup's copy; without confirm the child answers needsConfirm with the text. */
-  async seedFleet(nodeId: string, confirm: boolean): Promise<any> {
-    try {
-      return await this.sendIPCMessage('fleet:seed', { nodeId, confirm });
-    } catch (error) {
-      console.error('[BotManager] Error confirming the seed:', error);
-      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
-    }
-  }
-
-  /**
-   * The planned transfer's steps on the designated backup (B4f-4): the
-   * master's retire (start, status, abort) and the handover. The handover's
-   * ceiling stands above the child's own wait for the master's answer.
-   */
-  async fleetTransfer(op: 'start' | 'status' | 'abort' | 'handover', data: Record<string, unknown> = {}): Promise<any> {
-    try {
-      return await this.sendIPCMessage('fleet:transfer', { op, data }, op === 'handover' ? 45000 : 20000);
-    } catch (error) {
-      return { success: false, error: error instanceof Error ? error.message : 'Unknown error', notReady: true };
-    }
-  }
-
-  async retireFleetStaleCopies(confirm: boolean): Promise<any> {
-    try {
-      return await this.sendIPCMessage('fleet:retireCopies', { confirm });
-    } catch (error) {
-      console.error('[BotManager] Error retiring stale copies:', error);
-      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
-    }
-  }
-
-  /**
-   * Fire-and-forget sync bump after a webui write (master bot child bumps
-   * the sync revision; no-op on co-workers/standalone or with the bot down).
-   */
-  notifySyncMutation(scope: string): void {
-    if (!this.isRunning() || !this.botProcess) return;
-    try {
-      this.botProcess.send({ type: 'fleet:sync:bump', data: { scope } });
-    } catch { /* backstop rehash covers a lost nudge */ }
-  }
-
-  /**
-   * Drain a live worker's leases (master-only; validated in the bot child).
-   */
-  async drainFleetNode(nodeId: string): Promise<any> {
-    try {
-      return await this.sendIPCMessage('fleet:drain', { nodeId });
-    } catch (error) {
-      console.error('[BotManager] Error draining fleet node:', error);
-      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
-    }
-  }
-
-  /** Start a migration (move/swap/retire/redistribute; master-only, validated in the bot child). */
-  async startFleetMigration(payload: any): Promise<any> {
-    try {
-      return await this.sendIPCMessage('fleet:migrate:start', payload);
-    } catch (error) {
-      console.error('[BotManager] Error starting migration:', error);
-      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
-    }
-  }
-
-  /** Dry-run precheck for a migration (master-only). */
-  async precheckFleetMigration(payload: any): Promise<any> {
-    try {
-      return await this.sendIPCMessage('fleet:migrate:precheck', payload);
-    } catch (error) {
-      console.error('[BotManager] Error prechecking migration:', error);
-      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
-    }
-  }
-
-  /** Abort the active migration (master-only). */
-  async abortFleetMigration(migrationId: string): Promise<any> {
-    try {
-      return await this.sendIPCMessage('fleet:migrate:abort', { migrationId });
-    } catch (error) {
-      console.error('[BotManager] Error aborting migration:', error);
-      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
-    }
-  }
-
-  /** Resume a paused retire (master-only). */
-  async resumeFleetMigration(migrationId: string): Promise<any> {
-    try {
-      return await this.sendIPCMessage('fleet:migrate:resume', { migrationId });
-    } catch (error) {
-      console.error('[BotManager] Error resuming migration:', error);
-      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
-    }
-  }
-
-  /** Start the backend transformation (any master incl. standalone; validated in the bot child). */
-  async startFleetTransformation(payload: any): Promise<any> {
-    try {
-      return await this.sendIPCMessage('fleet:transform:start', payload ?? {});
-    } catch (error) {
-      console.error('[BotManager] Error starting transformation:', error);
-      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
-    }
-  }
-
-  /** Pause the active transformation after the in-flight guild finishes. */
-  async pauseFleetTransformation(): Promise<any> {
-    try {
-      return await this.sendIPCMessage('fleet:transform:pause', {});
-    } catch (error) {
-      console.error('[BotManager] Error pausing transformation:', error);
-      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
-    }
-  }
-
-  /** Resume a paused transformation at its cursors. */
-  async resumeFleetTransformation(): Promise<any> {
-    try {
-      return await this.sendIPCMessage('fleet:transform:resume', {});
-    } catch (error) {
-      console.error('[BotManager] Error resuming transformation:', error);
-      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
-    }
-  }
-
-  /** Abort: reverses the converted prefix (allowed until the flip persists). */
-  async abortFleetTransformation(): Promise<any> {
-    try {
-      return await this.sendIPCMessage('fleet:transform:abort', {});
-    } catch (error) {
-      console.error('[BotManager] Error aborting transformation:', error);
-      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
-    }
-  }
-
-  /** Dev fault hook: corrupt a held lease id on this node (drill P2.8). */
-  async corruptFleetLease(shardId: number): Promise<any> {
-    return await this.sendIPCMessage('fleet:dev:corruptLease', { shardId });
-  }
-
-  /** List the active + recent migrations (master-only). */
-  async listFleetMigrations(): Promise<any> {
-    try {
-      return await this.sendIPCMessage('fleet:migrations', {});
-    } catch (error) {
-      console.error('[BotManager] Error listing migrations:', error);
       return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
     }
   }

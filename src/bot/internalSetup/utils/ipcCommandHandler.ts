@@ -9,8 +9,6 @@ import handleCommands from '../events/interactionCreate/handleCommands';
 import getLocalCommands from './getLocalCommands';
 import { getPanelManager } from './panelManager';
 import { buildConsoleInteraction } from './consoleInteraction';
-import { getFleetState } from '../fleet/state';
-import { guildIdToShardId } from '../fleet/placement';
 import { admitGuildAction, ENTRY_WAIT_MS, gateConsoleText } from './dataBackends/boot';
 import { isCommandRunnable } from './commandGate';
 import { runSealed } from './dataBackends/writeLedger';
@@ -54,17 +52,8 @@ export async function handleInvoke(data: InvokePayload): Promise<Record<string, 
   const guildId = data.guildId ? String(data.guildId) : null;
   const guild = guildId ? client.guilds.cache.get(guildId) || null : null;
   if (guildId && !data.force) {
-    // Ownership gate: the lease table is authoritative (the discord.js cache
-    // lags it right after a shard migration). Standalone has no lease table, so
-    // it keeps the cache check, which covers every guild there.
-    const fleet = getFleetState();
-    if (fleet.initialized && !fleet.standalone && fleet.shardCount > 0) {
-      const shardId = guildIdToShardId(guildId, fleet.shardCount);
-      if (!fleet.leases.some(l => l.shardId === shardId)) {
-        return { success: false, error: `this node does not serve guild ${guildId} (shard ${shardId} not leased); pass force to attempt anyway` };
-      }
-    } else if (!guild) {
-      return { success: false, error: `this node does not serve guild ${guildId} (not in cache); pass force to attempt anyway` };
+    if (!guild) {
+      return { success: false, error: `this bot does not serve guild ${guildId} (not in cache); pass force to attempt anyway` };
     }
   }
 

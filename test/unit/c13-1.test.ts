@@ -17,7 +17,6 @@ vi.mock('../../src/bot/internalSetup/utils/moduleRegistry', () => ({
 vi.mock('../../src/bot/internalSetup/utils/panelManager', () => ({
   getPanelManager: () => ({ getClient: () => h.client, getPanel: () => null, unregisterPanel: () => undefined }),
 }));
-vi.mock('../../src/webui/utils/syncNudge', () => ({ nudgeSync: () => undefined }));
 
 import { dataPath } from '../../src/utils/dataRoot';
 import { getModuleEventManager } from '../../src/bot/internalSetup/utils/moduleEventManager';

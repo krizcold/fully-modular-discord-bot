@@ -326,7 +326,7 @@ const configEditorGuildPanel: PanelOptions = {
 
 // A refused write or delete leaves the old config in place: raised, never shown as saved.
 function raiseRefusal(outcome: string): void {
-  if (outcome === 'frozen') throw new Error('the guild\'s data is frozen for a shard migration; nothing was changed, try again after it completes');
+  if (outcome === 'frozen') throw new Error('the guild\'s data is frozen on this node; nothing was changed, try again shortly');
   if (outcome === 'refused') throw new Error('the guild\'s data could not be changed now; nothing was changed, try again shortly');
   if (outcome === 'no-schema') throw new Error(NO_SCHEMA_TEXT);
 }

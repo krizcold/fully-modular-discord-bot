@@ -4,32 +4,6 @@
 // block or crash the bot child.
 
 import { getFleetState } from '../fleet/state';
-import {
-  fleetAssignShard,
-  fleetDeclareLost,
-  fleetDrainNode,
-  fleetResolveHeldShard,
-  fleetMigrateAbort,
-  fleetMigratePrecheck,
-  fleetMigrateResume,
-  fleetMigrateStart,
-  fleetMigrationsList,
-  fleetReadWitness,
-  fleetResumeAssignments,
-  fleetRetireStaleCopies,
-  fleetSeedConfirm,
-  fleetDropHeldCopy,
-  fleetTransfer,
-  fleetSetConfig,
-  fleetSyncBump,
-  fleetDevCorruptLease,
-  fleetFollowedBackend,
-  fleetTransformStart,
-  fleetTransformPause,
-  fleetTransformResume,
-  fleetTransformAbort,
-} from '../fleet/bootstrap';
-import type { StartPayload } from '../fleet/migration/migrationCoordinator';
 
 /** Unsolicited push, carried by the metrics 5s sample tick (no own timer). */
 export function pushFleetStatus(): void {
@@ -47,139 +21,15 @@ export function setupFleetIPCHandlers(): void {
 
   console.log('[IPCFleetHandler] Setting up IPC handlers for fleet');
 
-  process.on('message', async (message: any) => {
+  process.on('message', (message: any) => {
     if (!message || typeof message !== 'object') return;
     const { type, requestId } = message;
-    if (typeof type !== 'string' || !type.startsWith('fleet:')) return;
-    // Fire-and-forget nudge from webui write sites; no reply expected.
-    if (type === 'fleet:sync:bump') {
-      fleetSyncBump(String(message.data?.scope ?? ''));
-      return;
-    }
-    if (!requestId) return;
+    if (typeof type !== 'string' || !type.startsWith('fleet:') || !requestId) return;
 
     try {
-      let response: any;
-      switch (type) {
-        case 'fleet:state': {
-          response = { success: true, state: getFleetState() };
-          break;
-        }
-        case 'fleet:witness:read': {
-          response = { success: true, witness: await fleetReadWitness() };
-          break;
-        }
-        case 'fleet:followed:read': {
-          response = { success: true, followed: fleetFollowedBackend() };
-          break;
-        }
-        case 'fleet:config:set': {
-          const result = await fleetSetConfig(message.data?.masterCandidates, message.data?.witnessChannelId, message.data?.backupDesignations);
-          response = result.ok ? { success: true, revision: result.revision } : { success: false, error: result.error };
-          break;
-        }
-        case 'fleet:assign': {
-          const shardId = Number(message.data?.shardId);
-          const nodeId = String(message.data?.nodeId ?? '');
-          const result = await fleetAssignShard(shardId, nodeId);
-          response = result.success ? { success: true } : { success: false, error: result.error };
-          break;
-        }
-        case 'fleet:resumeAssignments': {
-          const result = await fleetResumeAssignments();
-          response = result.success ? { success: true } : { success: false, error: result.error };
-          break;
-        }
-        case 'fleet:declareLost': {
-          const nodeId = String(message.data?.nodeId ?? '');
-          const result = await fleetDeclareLost(nodeId);
-          response = result.success ? { success: true } : { success: false, error: result.error };
-          break;
-        }
-        case 'fleet:heldShard': {
-          const shardId = Number(message.data?.shardId);
-          const restoreOn = typeof message.data?.restoreOn === 'string' ? message.data.restoreOn : null;
-          const result = await fleetResolveHeldShard(shardId, restoreOn);
-          response = result.success ? { success: true } : { success: false, error: result.error };
-          break;
-        }
-        case 'fleet:drain': {
-          const nodeId = String(message.data?.nodeId ?? '');
-          const result = await fleetDrainNode(nodeId);
-          response = result.success ? { success: true } : { success: false, error: result.error };
-          break;
-        }
-        case 'fleet:migrate:start': {
-          const result = await fleetMigrateStart(message.data as StartPayload);
-          response = result.ok ? { success: true, migrationId: result.migrationId } : { success: false, error: result.error };
-          break;
-        }
-        case 'fleet:migrate:abort': {
-          const result = await fleetMigrateAbort(String(message.data?.migrationId ?? ''));
-          response = result.ok ? { success: true } : { success: false, error: result.error };
-          break;
-        }
-        case 'fleet:migrate:resume': {
-          const result = await fleetMigrateResume(String(message.data?.migrationId ?? ''));
-          response = result.ok ? { success: true } : { success: false, error: result.error };
-          break;
-        }
-        case 'fleet:migrate:precheck': {
-          const result = await fleetMigratePrecheck(message.data as StartPayload);
-          response = result.ok ? { success: true, precheck: result } : { success: false, error: result.error };
-          break;
-        }
-        case 'fleet:migrations': {
-          response = { success: true, migrations: fleetMigrationsList() };
-          break;
-        }
-        case 'fleet:transform:start': {
-          const direction = message.data?.direction;
-          const payload = direction === 'file-to-postgres' || direction === 'postgres-to-file' ? { direction } : {};
-          const result = await fleetTransformStart(payload);
-          response = result.ok ? { success: true, transformationId: result.transformationId } : { success: false, error: result.error };
-          break;
-        }
-        case 'fleet:transform:pause': {
-          const result = fleetTransformPause();
-          response = result.ok ? { success: true } : { success: false, error: result.error };
-          break;
-        }
-        case 'fleet:transform:resume': {
-          const result = await fleetTransformResume();
-          response = result.ok ? { success: true } : { success: false, error: result.error };
-          break;
-        }
-        case 'fleet:transform:abort': {
-          const result = await fleetTransformAbort();
-          response = result.ok ? { success: true } : { success: false, error: result.error };
-          break;
-        }
-        case 'fleet:dev:corruptLease': {
-          const shardId = Number(message.data?.shardId);
-          const result = fleetDevCorruptLease(shardId);
-          response = result.ok ? { success: true } : { success: false, error: result.error };
-          break;
-        }
-        case 'fleet:retireCopies': {
-          response = await fleetRetireStaleCopies(message.data?.confirm === true);
-          break;
-        }
-        case 'fleet:mirror:drop': {
-          response = fleetDropHeldCopy();
-          break;
-        }
-        case 'fleet:transfer': {
-          response = await fleetTransfer(String(message.data?.op ?? ''), message.data?.data ?? {});
-          break;
-        }
-        case 'fleet:seed': {
-          response = fleetSeedConfirm(String(message.data?.nodeId ?? ''), message.data?.confirm === true);
-          break;
-        }
-        default:
-          response = { success: false, error: `Unknown fleet IPC type: ${type}` };
-      }
+      const response = type === 'fleet:state'
+        ? { success: true, state: getFleetState() }
+        : { success: false, error: `Unknown fleet IPC type: ${type}` };
       process.send!({ requestId, data: response });
     } catch (error) {
       console.error(`[IPCFleetHandler] Error handling ${type}:`, error);

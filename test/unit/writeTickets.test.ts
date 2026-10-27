@@ -18,7 +18,7 @@ import {
   writeRawAtomic,
   type FileTicket,
 } from '../../src/bot/internalSetup/utils/dataBackends/fileBackend';
-import { setRouteOverride } from '../../src/bot/internalSetup/utils/dataBackends/routeResolver';
+import { setBackendKind } from '../helpers/backendKind';
 import {
   DataBackendUnavailableError,
   initWorkingSet,
@@ -32,13 +32,11 @@ import {
   deleteData,
   deleteDataOutcome,
   deleteDataTracked,
-  flushGuildOutcome,
-  freezeGuildWrites,
   saveData,
   saveDataOutcome,
   saveDataTracked,
-  unfreezeGuildWrites,
 } from '../../src/bot/internalSetup/utils/dataManager';
+import { freezeGuildWrites, servedGuilds, unfreezeGuildWrites } from '../helpers/freezeGuild';
 import { applyOperatorDataWrite } from '../../src/bot/internalSetup/utils/ipcDataHandler';
 import { FakeStore, tokenFor, type FlushCall, type FlushMode } from '../helpers/fakeStore';
 
@@ -75,12 +73,12 @@ async function answer<T>(pending: Promise<T>, deadlineMs: number): Promise<T> {
 const HELD = {
   ok: true,
   pending: true,
-  note: 'it is not saved yet; this node retries while it serves this guild, and loses it if the bot stops, the guild moves or the node loses its database first',
+  note: 'it is not saved yet; this node retries while it serves this guild, and loses it if the bot stops or loses its database first',
 };
 const LEFT_UNCONFIRMED = {
   ok: false,
   code: 'backend-unavailable',
-  error: 'this write left this node before it was confirmed saved (the guild moved or was unloaded, its data was deleted or restored from the graveyard, or the node switched databases), so whether it was saved is unknown; reload the data to check',
+  error: 'this write left this node before it was confirmed saved (the guild was unloaded, its data was deleted or restored from the graveyard), so whether it was saved is unknown; reload the data to check',
 };
 
 /** Holds every call of the fs function on the target until open; reached resolves once the first is held. */
@@ -166,16 +164,16 @@ type WsOp =
   | { op: 'save' | 'append' | 'delete'; key: number }
   | { op: 'mode'; mode: FlushMode }
   | { op: 'tick'; ms: number }
-  | { op: 'hold' | 'release' | 'evict' | 'rehydrate' | 'recycle' }
+  | { op: 'hold' | 'release' | 'evict' | 'rehydrate' }
   | { op: 'confirm'; pick: number; deadline: number; wait: boolean };
 
 const wsOp: fc.Arbitrary<WsOp> = fc.oneof(
   { weight: 24, arbitrary: fc.record({ op: fc.constantFrom('save' as const, 'append' as const, 'delete' as const), key: fc.integer({ min: 0, max: 2 }) }) },
-  { weight: 8, arbitrary: fc.record({ op: fc.constant('mode' as const), mode: fc.constantFrom<FlushMode>('commit', 'unavailable', 'read-only', 'deposed') }) },
+  { weight: 8, arbitrary: fc.record({ op: fc.constant('mode' as const), mode: fc.constantFrom<FlushMode>('commit', 'unavailable', 'deposed') }) },
   { weight: 12, arbitrary: fc.record({ op: fc.constant('tick' as const), ms: fc.constantFrom(0, 20, 600, 1600) }) },
   { weight: 6, arbitrary: fc.constant<WsOp>({ op: 'hold' }) },
   { weight: 6, arbitrary: fc.constant<WsOp>({ op: 'release' }) },
-  { weight: 9, arbitrary: fc.constantFrom<WsOp>({ op: 'evict' }, { op: 'rehydrate' }, { op: 'recycle' }) },
+  { weight: 9, arbitrary: fc.constantFrom<WsOp>({ op: 'evict' }, { op: 'rehydrate' }) },
   { weight: 16, arbitrary: fc.record({ op: fc.constant('confirm' as const), pick: fc.nat(), deadline: fc.constantFrom(0, 30, 8000), wait: fc.boolean() }) },
 );
 
@@ -289,15 +287,6 @@ async function runWorkingSet(ops: WsOp[]): Promise<void> {
           if (manager.stateOf(GUILD) !== 'fenced') manager.evict(GUILD);
           await readNewSet();
           break;
-        case 'recycle': {
-          const carry = manager.exportDirty([GUILD]);
-          manager.quiesce();
-          manager = new WorkingSetManager(store);
-          managers.push(manager);
-          await readNewSet();
-          manager.adoptDirty(carry);
-          break;
-        }
         case 'confirm': {
           if (accepted.length === 0) break;
           // Mostly one of the last few writes, the ones a flush on the wire or a requeue still holds.
@@ -327,7 +316,7 @@ async function runWorkingSet(ops: WsOp[]): Promise<void> {
       }
     }
   } finally {
-    for (const m of managers) m.quiesce();
+    for (const m of managers) m.evict(GUILD);
     store.release();
     vi.useRealTimers();
   }
@@ -403,28 +392,22 @@ const workingSetRows: Row[] = [
       return outcomes;
     },
   },
-  ...([
-    ['unreachable', 'unavailable', false],
-    ['read-only', 'read-only', false],
-    ['not proven to hold its master\'s term', 'read-only', true],
-  ] as const).map(([why, mode, unproven]): Row => ({
-    row: `the store refuses the commit (${why}), and the write is kept dirty and retried`,
+  {
+    row: 'the store refuses the commit (unreachable), and the write is kept dirty and retried',
     expected: ['held', 'ok'],
     run: async () => {
       const { store, ws } = await servedSet();
-      store.mode = mode;
-      store.unproven = unproven;
+      store.mode = 'unavailable';
       const ticket = save(ws, 'a.json', { a: 1 });
       const refused = await answer(ws.confirm(ticket, 1000), 1000);
       expect(ws.writesSettled()).toBe(false);
       expect(store.doc(GUILD, 'a.json')).toBeUndefined();
       store.mode = 'commit';
-      store.unproven = false;
       const healed = await answer(ws.confirm(ticket, 1000), 1000);
       expect(store.doc(GUILD, 'a.json')).toBe(JSON.stringify({ a: 1 }));
       return [refused, healed];
     },
-  })),
+  },
   {
     row: 'the deadline passes with the flush still on the wire',
     expected: ['pending', 'pending'],
@@ -518,23 +501,19 @@ const workingSetRows: Row[] = [
   },
   {
     // The refusal comes back to the confirm that sent it: nothing is left to hold the write for a retry.
-    row: 'evicted or recycled away while its own forced flush is on the wire, which the store then refuses',
-    expected: ['unavailable', 'unavailable'],
+    row: 'evicted while its own forced flush is on the wire, which the store then refuses',
+    expected: ['unavailable'],
     run: async () => {
-      const outcomes: string[] = [];
-      for (const leave of [(ws: WorkingSetManager) => ws.evict(GUILD), (ws: WorkingSetManager) => ws.quiesce()]) {
-        const { store, ws } = await servedSet();
-        const ticket = save(ws, 'a.json', { a: 1 });
-        store.holding = true;
-        store.mode = 'unavailable';
-        const forced = ws.confirm(ticket, 8000);
-        expect(store.flushesSent).toBe(1);
-        leave(ws);
-        store.holding = false;
-        store.release();
-        outcomes.push(await answer(forced, 8000));
-      }
-      return outcomes;
+      const { store, ws } = await servedSet();
+      const ticket = save(ws, 'a.json', { a: 1 });
+      store.holding = true;
+      store.mode = 'unavailable';
+      const forced = ws.confirm(ticket, 8000);
+      expect(store.flushesSent).toBe(1);
+      ws.evict(GUILD);
+      store.holding = false;
+      store.release();
+      return [await answer(forced, 8000)];
     },
   },
   {
@@ -543,7 +522,7 @@ const workingSetRows: Row[] = [
     run: async () => {
       const { store, ws } = await servedSet();
       const ticket = save(ws, 'a.json', { a: 1 });
-      ws.freezeRetained(GUILD);
+      freezeGuildWrites(GUILD, ws);
       store.reclaim = 'lost';
       expect(await ws.hydrate(GUILD, tokenFor())).toBe('ready');
       expect(store.doc(GUILD, 'a.json')).toBeUndefined();
@@ -591,80 +570,6 @@ const workingSetRows: Row[] = [
       store.mode = 'commit';
       expect(await ws.hydrate(GUILD, tokenFor())).toBe('ready');
       return [await answer(ws.confirm(ticket, 1000), 1000)];
-    },
-  },
-  {
-    // boot.ts quiesces in the same run as the export; the set's exported mark
-    // keeps the rule without it (the next row).
-    row: 'exported off its set at a recycle, asked before the quiesce',
-    expected: ['unavailable'],
-    run: async () => {
-      const { ws } = await servedSet();
-      const ticket = save(ws, 'a.json', { a: 1 });
-      expect(ws.exportDirty([GUILD])).toHaveLength(1);
-      return [await answer(ws.confirm(ticket, 1000), 1000)];
-    },
-  },
-  {
-    row: 'exported off its set at a recycle, and a later write on the unquiesced set commits; a write landed before the export stays ok',
-    expected: ['ok', 'unavailable'],
-    run: async () => {
-      const { store, ws } = await servedSet();
-      const landed = save(ws, 'c.json', { c: 1 });
-      expect(await answer(ws.confirm(landed, 1000), 1000)).toBe('ok');
-      const exported = save(ws, 'a.json', { a: 1 });
-      expect(ws.exportDirty([GUILD])).toHaveLength(1);
-      save(ws, 'b.json', { b: 1 });
-      await vi.advanceTimersByTimeAsync(600);
-      expect(store.doc(GUILD, 'b.json')).toBe(JSON.stringify({ b: 1 }));
-      expect(store.doc(GUILD, 'a.json')).toBeUndefined();
-      return [await answer(ws.confirm(landed, 1000), 1000), await answer(ws.confirm(exported, 1000), 1000)];
-    },
-  },
-  {
-    row: 'exported off its set at a recycle, asked while a later write\'s flush on the unquiesced set stays on the wire',
-    expected: ['unavailable'],
-    run: async () => {
-      const { store, ws } = await servedSet();
-      const exported = save(ws, 'a.json', { a: 1 });
-      expect(ws.exportDirty([GUILD])).toHaveLength(1);
-      store.holding = true;
-      const sent = store.flushesSent;
-      save(ws, 'b.json', { b: 1 });
-      await vi.advanceTimersByTimeAsync(600);
-      expect(store.flushesSent).toBe(sent + 1);
-      const outcome = await answer(ws.confirm(exported, 100), 100);
-      store.holding = false;
-      store.release();
-      return [outcome];
-    },
-  },
-  {
-    row: 'recycled: the manager answers unavailable; the facade says pending while the successor keeps the carry, and unavailable once it landed',
-    expected: ['unavailable', 'pending', 'unavailable'],
-    run: async () => {
-      const guildId = '9100';
-      setRouteOverride(guildId, 'postgres');
-      const before = new FakeStore();
-      before.mode = 'unavailable';
-      const old = initWorkingSet(before);
-      expect(await old.hydrate(guildId, tokenFor())).toBe('ready');
-      const saved = saveDataTracked('a.json', { guildId, category: 'm' }, { a: 1 });
-      if (saved.outcome !== 'saved') throw new Error(`the write was not accepted: ${saved.outcome}`);
-      const ticket = saved.ticket;
-      if (ticket.kind !== 'ws') throw new Error('a postgres-routed write took a file ticket');
-      const carry = old.exportDirty([guildId]);
-      old.quiesce();
-      const after = new FakeStore();
-      after.mode = 'unavailable';
-      const successor = initWorkingSet(after);
-      expect(await successor.hydrate(guildId, tokenFor())).toBe('ready');
-      successor.adoptDirty(carry);
-      const own = await answer(old.confirm(ticket, 100), 100);
-      const carried = await answer(confirmWrite(ticket, 100), 100);
-      after.mode = 'commit';
-      expect(await answer(successor.flushGuildNow(guildId, 1000), 1000)).toBe('ok');
-      return [own, carried, await answer(confirmWrite(ticket, 100), 100)];
     },
   },
   {
@@ -1094,8 +999,9 @@ describe('the facade keeps its answers, and issues a ticket for each accepted wr
     expect(deleteData('a.json', options)).toBe(false);
   });
 
-  it('answers a frozen guild as before, with no ticket', () => {
+  it('answers a frozen guild as before, with no ticket', async () => {
     const options = { guildId: '9401', category: 'm' };
+    await servedGuilds('9401');
     freezeGuildWrites('9401');
     try {
       expect(saveDataTracked('a.json', options, { a: 1 })).toEqual({ outcome: 'frozen' });
@@ -1113,7 +1019,7 @@ describe('the facade keeps its answers, and issues a ticket for each accepted wr
 
   it('answers a postgres-routed guild whose set is not ready as refused, naming why', () => {
     const guildId = '9402';
-    setRouteOverride(guildId, 'postgres');
+    setBackendKind('postgres');
     initWorkingSet(new FakeStore());
     const options = { guildId, category: 'm' };
     expect(saveDataTracked('a.json', options, { a: 1 })).toEqual({ outcome: 'refused', cause: 'not-ready' });
@@ -1127,7 +1033,7 @@ describe('the facade keeps its answers, and issues a ticket for each accepted wr
   it('still throws for a fenced guild', async () => {
     vi.useFakeTimers();
     const guildId = '9403';
-    setRouteOverride(guildId, 'postgres');
+    setBackendKind('postgres');
     const store = new FakeStore();
     const ws = initWorkingSet(store);
     expect(await ws.hydrate(guildId, tokenFor())).toBe('ready');
@@ -1150,7 +1056,7 @@ describe('the facade keeps its answers, and issues a ticket for each accepted wr
     vi.useFakeTimers();
     vi.spyOn(Math, 'random').mockReturnValue(0.5);
     const guildId = '9404';
-    setRouteOverride(guildId, 'postgres');
+    setBackendKind('postgres');
     const store = new FakeStore();
     store.docs.set(`${guildId}|m/x.json`, '{"x":1}');
     const ws = initWorkingSet(store);
@@ -1182,7 +1088,7 @@ describe('the facade keeps its answers, and issues a ticket for each accepted wr
 
   it('answers a file-mode delete that finds an earlier delete still queued as absent, with a ticket for that delete', async () => {
     const guildId = '9405';
-    setRouteOverride(guildId, 'file');
+    setBackendKind('file');
     const options = { guildId, category: 'm' };
     const file = path.join(process.env.DATA_DIR!, guildId, 'm', 'x.json');
     const rename = holdFs('rename', file);
@@ -1208,7 +1114,7 @@ describe('a write that landed is confirmed while a second writer keeps its guild
 
   it('through the facade, while the second writer\'s flush stays on the wire', async () => {
     const guildId = '9200';
-    setRouteOverride(guildId, 'postgres');
+    setBackendKind('postgres');
     const store = new FakeStore();
     const ws = initWorkingSet(store);
     expect(await ws.hydrate(guildId, tokenFor())).toBe('ready');
@@ -1223,15 +1129,13 @@ describe('a write that landed is confirmed while a second writer keeps its guild
     expect(store.doc(guildId, 'a.json')).toBe(JSON.stringify({ a: 1 }, null, 2));
     expect(ws.writesSettled()).toBe(false);
     expect(await answer(confirmWrite(first.ticket, 8000), 8000)).toBe('ok');
-    // The guild-wide answer waits on the second writer's flush instead.
-    expect(await answer(flushGuildOutcome(guildId, 100), 100)).toBe('pending');
     store.holding = false;
     store.release();
   });
 
   it('through the operator route, while the second writer writes on through its flush', async () => {
     const guildId = '9201';
-    setRouteOverride(guildId, 'postgres');
+    setBackendKind('postgres');
     const store = new FakeStore();
     const ws = initWorkingSet(store);
     expect(await ws.hydrate(guildId, tokenFor())).toBe('ready');
@@ -1254,7 +1158,7 @@ describe('a write that landed is confirmed while a second writer keeps its guild
 
   it('answers a delete of a document that never existed on the operator route at once, whatever the guild has on the wire', async () => {
     const guildId = '9202';
-    setRouteOverride(guildId, 'postgres');
+    setBackendKind('postgres');
     const store = new FakeStore();
     const ws = initWorkingSet(store);
     expect(await ws.hydrate(guildId, tokenFor())).toBe('ready');
@@ -1270,7 +1174,7 @@ describe('a write that landed is confirmed while a second writer keeps its guild
   it('through the operator route in file mode, while another file of the guild fails its flush', async () => {
     vi.useRealTimers();
     const guildId = '9203';
-    setRouteOverride(guildId, 'file');
+    setBackendKind('file');
     const blocked = path.join(process.env.DATA_DIR!, guildId, 'm', 'blocked.json');
     fs.mkdirSync(blocked, { recursive: true });
     enqueueWrite(blocked, '{"b":1}');
@@ -1291,7 +1195,7 @@ describe('the operator route answers through the real confirmWrite', () => {
   });
 
   async function routedGuild(guildId: string): Promise<{ store: FakeStore; ws: WorkingSetManager }> {
-    setRouteOverride(guildId, 'postgres');
+    setBackendKind('postgres');
     const store = new FakeStore();
     const ws = initWorkingSet(store);
     expect(await ws.hydrate(guildId, tokenFor())).toBe('ready');
@@ -1310,7 +1214,7 @@ describe('the operator route answers through the real confirmWrite', () => {
   it('deposed: a newer owner fenced the guild', async () => {
     const { store } = await routedGuild('9601');
     store.mode = 'deposed';
-    expect(await answer(applyOperatorDataWrite(write('9601')), 8000)).toEqual({ ok: false, code: 'not-owner', error: 'guild ownership moved mid-write' });
+    expect(await answer(applyOperatorDataWrite(write('9601')), 8000)).toEqual({ ok: false, code: 'not-owner', error: 'another bot process took ownership of this guild mid-write; it was not saved' });
   });
 
   it('pending: the deadline passes with its flush still on the wire', async () => {
@@ -1336,7 +1240,7 @@ describe('the operator route answers through the real confirmWrite', () => {
   it('unavailable in file mode: its op is dropped from the queue while an earlier op of the path is on the wire', async () => {
     vi.useRealTimers();
     const guildId = '9604';
-    setRouteOverride(guildId, 'file');
+    setBackendKind('file');
     const file = path.join(process.env.DATA_DIR!, guildId, 'm', 'a.json');
     fs.mkdirSync(path.dirname(file), { recursive: true });
     const rename = holdFs('rename', file);
@@ -1353,7 +1257,7 @@ describe('the operator route answers through the real confirmWrite', () => {
   it('file mode: a fault that clears after one failed attempt is tried again in line and answers ok', async () => {
     vi.useRealTimers();
     const guildId = '9605';
-    setRouteOverride(guildId, 'file');
+    setBackendKind('file');
     const file = path.join(process.env.DATA_DIR!, guildId, 'm', 'a.json');
     const renames = failRenames(file, 10);
     expect(await applyOperatorDataWrite(write(guildId))).toEqual({ ok: true });
@@ -1364,7 +1268,7 @@ describe('the operator route answers through the real confirmWrite', () => {
   it('file mode: a fault that never clears answers held after three attempts', async () => {
     vi.useRealTimers();
     const guildId = '9606';
-    setRouteOverride(guildId, 'file');
+    setBackendKind('file');
     const file = path.join(process.env.DATA_DIR!, guildId, 'm', 'a.json');
     const renames = failRenames(file, Infinity);
     expect(await applyOperatorDataWrite(write(guildId))).toEqual(HELD);
@@ -1384,7 +1288,7 @@ describe('the operator route confirms a delete that finds an earlier delete of t
   });
 
   async function guildHolding(guildId: string): Promise<FakeStore> {
-    setRouteOverride(guildId, 'postgres');
+    setBackendKind('postgres');
     const store = new FakeStore();
     store.docs.set(`${guildId}|m/x.json`, '{"x":1}');
     const ws = initWorkingSet(store);
@@ -1436,7 +1340,7 @@ describe('the operator route confirms a delete that finds an earlier delete of t
   it('file mode: a delete queued behind a write on the wire, which the disk then refuses, answers held', async () => {
     vi.useRealTimers();
     const guildId = '9503';
-    setRouteOverride(guildId, 'file');
+    setBackendKind('file');
     const file = path.join(process.env.DATA_DIR!, guildId, 'm', 'x.json');
     const rename = holdFs('rename', file);
     const unlink = failUnlinks(file);
@@ -1456,7 +1360,7 @@ describe('the operator route confirms a delete that finds an earlier delete of t
   it('file mode: a delete queued behind an append on the wire that creates the file, which the disk then refuses, answers held', async () => {
     vi.useRealTimers();
     const guildId = '9504';
-    setRouteOverride(guildId, 'file');
+    setBackendKind('file');
     const file = path.join(process.env.DATA_DIR!, guildId, 'm', 'x.jsonl');
     const appending = holdFs('appendFile', file);
     const unlink = failUnlinks(file);

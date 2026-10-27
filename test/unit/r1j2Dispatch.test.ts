@@ -5,7 +5,8 @@ import { extractGuildId, gateCauseText, gateEventDispatch, runAsAdmitted } from 
 import { setManifestReader } from '../../src/bot/internalSetup/utils/dataBackends/dataContract';
 import { truthText } from '../../src/bot/internalSetup/utils/dataBackends/replyGate';
 import { withModule } from '../../src/bot/internalSetup/utils/dataBackends/writeLedger';
-import { confirmSaved, freezeGuildWrites, saveData, saveDataOutcome, unfreezeGuildWrites } from '../../src/bot/internalSetup/utils/dataManager';
+import { confirmSaved, saveData, saveDataOutcome } from '../../src/bot/internalSetup/utils/dataManager';
+import { freezeGuildWrites, unfreezeGuildWrites } from '../helpers/freezeGuild';
 import { callbackType, EPHEMERAL, rawButton, rawCommand, rig, textOf, tick } from '../helpers/gateRig';
 import { fakeClock, NOT_LEASED, readinessRig, stopDrivers } from '../helpers/readinessRig';
 
@@ -51,7 +52,7 @@ describe('one hold per interaction', () => {
       unfreezeGuildWrites(guildId);
     }
     expect(ran).toEqual([]);
-    expect(wire.map(c => [callbackType(c), textOf(c)])).toEqual([[InteractionResponseType.ChannelMessageWithSource, gateCauseText('moving')]]);
+    expect(wire.map(c => [callbackType(c), textOf(c)])).toEqual([[InteractionResponseType.ChannelMessageWithSource, gateCauseText('loading')]]);
     expect(wire[0].body.data.flags & EPHEMERAL).toBe(EPHEMERAL);
   });
 
@@ -102,7 +103,7 @@ describe('one hold per interaction', () => {
     emitRaw(client, command(guildId));
     await vi.advanceTimersByTimeAsync(2300);
     expect(ran).toEqual([]);
-    expect(wire.map(textOf)).toEqual([gateCauseText('moving')]);
+    expect(wire.map(textOf)).toEqual([gateCauseText('loading')]);
   });
 
   it('a gate entered after the emit still ends at the emit plus ACK_MS', async () => {
@@ -258,7 +259,7 @@ describe('the event gate for the payloads extractGuildId now reads', () => {
   it('an event on a frozen-retained set dispatches, as today', async () => {
     const r = readinessRig();
     const guildId = await r.ready();
-    r.ws.freezeRetained(guildId);
+    freezeGuildWrites(guildId);
     expect(await gateEventDispatch('messageReactionAdd', [{ message: { guildId } }, { id: '13' }], () => undefined)).toBe(true);
   });
 

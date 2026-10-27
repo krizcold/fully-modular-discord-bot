@@ -5,7 +5,7 @@ import { Client, Events, InteractionCollector, InteractionType, type BaseInterac
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { dropPendingForGuild, flushAll } from '../../src/bot/internalSetup/utils/dataBackends/fileBackend';
-import { setRouteOverride } from '../../src/bot/internalSetup/utils/dataBackends/routeResolver';
+import { setBackendKind } from '../helpers/backendKind';
 import { DataBackendUnavailableError, initWorkingSet } from '../../src/bot/internalSetup/utils/dataBackends/workingSet';
 import {
   appendData,
@@ -15,14 +15,13 @@ import {
   deleteDataOutcome,
   deleteDataTracked,
   deleteRawAtomic,
-  freezeGuildWrites,
   saveData,
   saveDataOutcome,
   saveDataTracked,
-  unfreezeGuildWrites,
   writeRawAtomic,
   type WriteTicket,
 } from '../../src/bot/internalSetup/utils/dataManager';
+import { freezeGuildWrites, servedGuilds, unfreezeGuildWrites } from '../helpers/freezeGuild';
 import {
   currentLedger,
   INTERACTION_LEDGER_LIFE_MS,
@@ -100,27 +99,6 @@ describe('a ledger records the facade writes made inside its entry: file mode', 
     expect(ledger.tickets().map(e => e.ticket)).toEqual([last.ticket]);
   });
 
-  it('records a frozen guild as the cause frozen, and an I/O refusal as io, with their modules', () => {
-    const guildId = freshGuild();
-    const options = { guildId, category: 'm' };
-    const ledger = openLedger('interaction');
-    freezeGuildWrites(guildId);
-    try {
-      runInLedger(ledger, 'modA', () => {
-        expect(saveData('a.json', options, { v: 1 })).toBe(false);
-        expect(appendData('log.jsonl', options, 'x\n')).toBe(false);
-        expect(withModule('modB', () => deleteData('a.json', options))).toBe(false);
-      });
-    } finally {
-      unfreezeGuildWrites(guildId);
-    }
-    const circular: Record<string, unknown> = {};
-    circular.self = circular;
-    runInLedger(ledger, 'modC', () => expect(saveDataOutcome('c.json', options, circular)).toBe('refused'));
-    expect(ledger.tickets()).toEqual([]);
-    expect(causes(ledger)).toEqual([['frozen', ['modA', 'modB']], ['io', ['modC']]]);
-  });
-
   it('records nothing for a delete that finds nothing, and the earlier delete\'s ticket for one still queued', async () => {
     const guildId = freshGuild();
     const options = { guildId, category: 'm' };
@@ -193,12 +171,33 @@ describe('a ledger records the facade writes made inside its entry: file mode', 
 });
 
 describe('a ledger records the facade writes made inside its entry: the working set', () => {
+  it('records a frozen guild as the cause frozen, and an I/O refusal as io, with their modules', async () => {
+    const guildId = freshGuild();
+    const options = { guildId, category: 'm' };
+    await servedGuilds(guildId);
+    const ledger = openLedger('interaction');
+    freezeGuildWrites(guildId);
+    try {
+      runInLedger(ledger, 'modA', () => {
+        expect(saveData('a.json', options, { v: 1 })).toBe(false);
+        expect(appendData('log.jsonl', options, 'x\n')).toBe(false);
+        expect(withModule('modB', () => deleteData('a.json', options))).toBe(false);
+      });
+    } finally {
+      unfreezeGuildWrites(guildId);
+    }
+    const circular: Record<string, unknown> = {};
+    circular.self = circular;
+    runInLedger(ledger, 'modC', () => expect(saveDataOutcome('c.json', options, circular)).toBe('refused'));
+    expect(ledger.tickets()).toEqual([]);
+    expect(causes(ledger)).toEqual([['frozen', ['modA', 'modB']], ['io', ['modC']]]);
+  });
+
   it('records saves, appends and deletes as one ticket per set, a set not ready as not-ready, and a throw\'s cause before it is thrown', async () => {
     vi.useFakeTimers();
     const guildId = freshGuild();
     const notReady = freshGuild();
-    setRouteOverride(guildId, 'postgres');
-    setRouteOverride(notReady, 'postgres');
+    setBackendKind('postgres');
     const store = new FakeStore();
     const ws = initWorkingSet(store);
     expect(await ws.hydrate(guildId, tokenFor())).toBe('ready');
@@ -222,7 +221,7 @@ describe('a ledger records the facade writes made inside its entry: the working 
   it('keeps a replaced set\'s unlanded entry beside the new set\'s: the lost write answers unavailable', async () => {
     vi.useFakeTimers();
     const guildId = freshGuild();
-    setRouteOverride(guildId, 'postgres');
+    setBackendKind('postgres');
     const store = new FakeStore();
     const ws = initWorkingSet(store);
     expect(await ws.hydrate(guildId, tokenFor())).toBe('ready');
@@ -242,7 +241,7 @@ describe('a ledger records the facade writes made inside its entry: the working 
   it('keeps one entry per set: a replaced set\'s landed entry gives way to the new set\'s', async () => {
     vi.useFakeTimers();
     const guildId = freshGuild();
-    setRouteOverride(guildId, 'postgres');
+    setBackendKind('postgres');
     const store = new FakeStore();
     const ws = initWorkingSet(store);
     expect(await ws.hydrate(guildId, tokenFor())).toBe('ready');
@@ -262,7 +261,7 @@ describe('a ledger records the facade writes made inside its entry: the working 
   it('records a delete that finds an earlier delete unlanded with that ticket', async () => {
     vi.useFakeTimers();
     const guildId = freshGuild();
-    setRouteOverride(guildId, 'postgres');
+    setBackendKind('postgres');
     const store = new FakeStore();
     store.docs.set(`${guildId}|m/x.json`, '{"x":1}');
     const ws = initWorkingSet(store);
@@ -295,9 +294,10 @@ describe('where a ledger records', () => {
     expect(shape(inner)).toEqual([['b.json', ['i']]]);
   });
 
-  it('tags a write or a refusal with no module in scope with the entry\'s kind', () => {
+  it('tags a write or a refusal with no module in scope with the entry\'s kind', async () => {
     const guildId = freshGuild();
     const frozen = freshGuild();
+    await servedGuilds(guildId, frozen);
     const ledger = openLedger('console');
     freezeGuildWrites(frozen);
     try {
@@ -308,7 +308,7 @@ describe('where a ledger records', () => {
     } finally {
       unfreezeGuildWrites(frozen);
     }
-    expect(shape(ledger)).toEqual([['a.json', ['console']]]);
+    expect(shape(ledger)).toEqual([[`ws:${guildId}`, ['console']]]);
     expect(causes(ledger)).toEqual([['frozen', ['console']]]);
   });
 });
@@ -320,13 +320,15 @@ describe('sealing', () => {
     expect(INTERACTION_LEDGER_LIFE_MS).toBe(15 * 60 * 1000);
     const guildId = freshGuild();
     const frozen = freshGuild();
+    const timerGuild = freshGuild();
+    await servedGuilds(guildId, frozen, timerGuild);
     const options = { guildId, category: 'm' };
     const ledger = openLedger('interaction');
     let fire: () => void = () => undefined;
     const armed = new Promise<void>(resolve => { fire = resolve; });
     const timerWrites = runInLedger(ledger, 'modA', () => {
       saveData('a.json', options, { v: 1 });
-      const early = new Promise<void>(resolve => setTimeout(() => { saveData('b.json', options, { v: 1 }); resolve(); }, 5));
+      const early = new Promise<void>(resolve => setTimeout(() => { saveData('b.json', { guildId: timerGuild, category: 'm' }, { v: 1 }); resolve(); }, 5));
       const late = armed.then(() => new Promise<void>(resolve => setTimeout(() => {
         saveData('c.json', options, { v: 1 });
         saveData('d.json', { guildId: frozen, category: 'm' }, { v: 1 });
@@ -335,7 +337,7 @@ describe('sealing', () => {
       return { early, late };
     });
     await timerWrites.early;
-    expect(shape(ledger).map(([where]) => where)).toEqual(['a.json', 'b.json']);
+    expect(shape(ledger).map(([where]) => where)).toEqual([`ws:${guildId}`, `ws:${timerGuild}`]);
     vi.advanceTimersByTime(INTERACTION_LEDGER_LIFE_MS - 1);
     expect(ledger.sealed).toBe(false);
     vi.advanceTimersByTime(1);

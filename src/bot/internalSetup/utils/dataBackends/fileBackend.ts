@@ -1,12 +1,12 @@
-// FileBackend - per-node disk storage carved out of the dataManager facade.
+// FileBackend - disk storage carved out of the dataManager facade.
 //
 // Writes go through an async atomic queue: the facade stringifies
 // synchronously, enqueues, and returns immediately; a per-path flusher writes
 // to a temp file, fsyncs, and renames over the target so a crash never leaves
 // a torn JSON file. Reads consult the queue first so a caller reading right
 // after a write still sees its own bytes. The facade (dataManager.ts) owns
-// freeze checks, metrics hooks, and .owner stamping; this module owns the
-// queue, the filesystem, enumeration, sizing, and the graveyard.
+// metrics hooks and the write records; this module owns the queue, the
+// filesystem, enumeration, sizing, and the graveyard.
 
 import * as fs from 'fs';
 import * as path from 'path';
@@ -287,13 +287,6 @@ export async function flushGuild(guildId: string): Promise<void> {
   await flushPaths(paths);
 }
 
-/** The guild's files with a write still queued (a failed flush keeps it for the next try). */
-export function pendingGuildFiles(guildId: string): string[] {
-  const prefix = path.join(BASE_DATA_DIR, guildId) + path.sep;
-  const guildDir = path.join(BASE_DATA_DIR, guildId);
-  return [...pendingOps.keys()].filter(p => p === guildDir || p.startsWith(prefix));
-}
-
 /** Whether any of these files still has a write queued. */
 export function filesPending(paths: string[]): boolean {
   return paths.some(p => pendingOps.has(p));
@@ -451,28 +444,6 @@ export function existsOnDisk(absPath: string): boolean {
 
 export function readFileUtf8(absPath: string): string {
   return fs.readFileSync(absPath, 'utf-8');
-}
-
-/** Cross-process migration freeze sentinel for a guild. */
-export function freezeSentinelExists(guildId: string): boolean {
-  return fs.existsSync(path.join(BASE_DATA_DIR, guildId, '.freeze'));
-}
-
-/** Best-effort: the in-memory freeze set is the primary gate; the sentinel adds cross-process visibility. */
-export async function writeFreezeSentinel(guildId: string): Promise<void> {
-  try {
-    const dir = path.join(BASE_DATA_DIR, guildId);
-    await fs.promises.mkdir(dir, { recursive: true });
-    await fs.promises.writeFile(path.join(dir, '.freeze'), String(Date.now()), 'utf-8');
-  } catch (error) {
-    console.warn(`[DataManager] Could not write freeze sentinel for ${guildId}:`, error);
-  }
-}
-
-export async function removeFreezeSentinel(guildId: string): Promise<void> {
-  try {
-    await fs.promises.unlink(path.join(BASE_DATA_DIR, guildId, '.freeze'));
-  } catch { /* absent */ }
 }
 
 // ============================================================================
@@ -718,7 +689,7 @@ export async function sweepGraveyard(): Promise<void> {
 export function listGuilds(): string[] {
   try {
     const items = fs.readdirSync(BASE_DATA_DIR);
-    // The numeric-only filter also excludes _graveyard, _incoming, global, dist.
+    // The numeric-only filter also excludes _graveyard, global, dist.
     return items.filter(item => {
       const fullPath = path.join(BASE_DATA_DIR, item);
       return fs.statSync(fullPath).isDirectory() &&
@@ -803,15 +774,8 @@ async function sizeDirectoryRecursive(dir: string, exclude?: string[]): Promise<
 }
 
 /**
- * Total size in bytes of a guild's data directory.
- */
-export function sizeOfGuildData(guildId: string): Promise<number> {
-  return sizeDirectoryRecursive(path.join(BASE_DATA_DIR, guildId));
-}
-
-/**
  * Total size in bytes of the global data directory. Excludes the fleet subdir
- * (control-plane state, not user data).
+ * (the node identity, not user data).
  */
 export function sizeOfGlobalData(): Promise<number> {
   return sizeDirectoryRecursive(path.join(BASE_DATA_DIR, 'global'), ['fleet']);

@@ -78,8 +78,8 @@ export async function toggleCommand(
     const guildId = process.env.GUILD_ID;
     const commandDef = findCommandDef(commandName);
     // Test commands go through the application-commands REST API scoped to
-    // guildId, NOT a cached Guild object: in a fleet the test guild may live on
-    // another node's shard, so a cache lookup here would silently fall back to
+    // guildId, NOT a cached Guild object: the test guild may be absent from the
+    // cache, and a cache lookup here would silently fall back to
     // the GLOBAL registry (see registerCommands.ts).
     const appCommands = (await resolveClientApplication(client))?.commands;
     if (!appCommands) return { success: false, error: 'Command manager not available' };

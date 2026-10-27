@@ -3,7 +3,8 @@ import path from 'path';
 import { ComponentType } from 'discord.js';
 import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from 'vitest';
 
-import { freezeGuildWrites, saveData, saveDataOutcome } from '../../src/bot/internalSetup/utils/dataManager';
+import { saveData, saveDataOutcome } from '../../src/bot/internalSetup/utils/dataManager';
+import { freezeGuildWrites } from '../helpers/freezeGuild';
 import { INTERACTION_LEDGER_LIFE_MS, ledgerOf, openLedger, runInLedger, withModule } from '../../src/bot/internalSetup/utils/dataBackends/writeLedger';
 import { ACK_MS, answerWrites, sweepLateWrites, writesConfirmed } from '../../src/bot/internalSetup/utils/dataBackends/replyGate';
 import { notReadyGuild, rawButton, rawCommand, rawModal, rig, storeGuild, textOf, tick } from '../helpers/gateRig';

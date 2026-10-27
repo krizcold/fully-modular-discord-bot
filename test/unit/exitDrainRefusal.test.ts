@@ -14,7 +14,6 @@ import {
   deleteDataTracked,
   deleteRawAtomic,
   drainForExit,
-  freezeGuildWrites,
   saveData,
   saveDataOutcome,
   saveDataTracked,
@@ -29,9 +28,8 @@ const refusedForExit = (error: unknown) => error instanceof DataBackendUnavailab
 
 // Its own file: the drain closes writes for good in this process.
 describe('writes once the exit drain has closed', () => {
-  it('refuse first, before the frozen check, with node-stopping, on every facade save, append and delete path', async () => {
+  it('refuse with node-stopping on every facade save, append and delete path', async () => {
     const guildId = '123456789012345678';
-    freezeGuildWrites(guildId);
     await drainForExit(200);
     const guild = { guildId, category: 'm' };
     const global = { scope: 'global' as const, category: 'm' };

@@ -1,7 +1,6 @@
 import fs from 'fs';
-import os from 'os';
 import path from 'path';
-import { describe, expect, it, onTestFinished, vi } from 'vitest';
+import { describe, expect, it } from 'vitest';
 
 const repo = path.resolve(__dirname, '..', '..');
 const startSh = fs.readFileSync(path.join(repo, 'start.sh'), 'utf8');
@@ -41,79 +40,5 @@ describe('the compose overlay description', () => {
   it('says when /app/custom is applied', () => {
     const compose = fs.readFileSync(path.join(repo, 'docker-compose.yml'), 'utf8');
     expect(compose).toContain('Applied when the container is rebuilt: a new image or a recreate; a plain restart keeps the previous build');
-  });
-});
-
-describe('sync engine on a pristine-source fallback build', () => {
-  it('reports degraded with the reason, never in sync', async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-c062-'));
-    onTestFinished(() => fs.rmSync(root, { recursive: true, force: true }));
-    fs.writeFileSync(path.join(root, 'build-safe-mode.json'), JSON.stringify({ reason: 'TypeScript compilation failed' }));
-    const prev = process.env.DATA_DIR;
-    process.env.DATA_DIR = root;
-    onTestFinished(() => { if (prev === undefined) delete process.env.DATA_DIR; else process.env.DATA_DIR = prev; });
-    vi.resetModules();
-    const { SyncEngine } = await import('../../src/bot/internalSetup/fleet/syncEngine');
-    const reports: any[] = [];
-    const engine = new SyncEngine({ request: async () => null, getTerm: () => 1, sendReport: r => reports.push(r) });
-    (engine as any).finishOk({ revision: 1, modules: [] }, 1);
-    const state = engine.getSyncState();
-    expect(state.status).toBe('degraded');
-    expect(state.lastError).toBe('this node runs pristine sources: TypeScript compilation failed');
-    expect(reports.at(-1).ok).toBe(false);
-  });
-});
-
-describe('modules missing from dist', () => {
-  async function rig(split: boolean, safeMode: boolean) {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-c062b-'));
-    onTestFinished(() => fs.rmSync(root, { recursive: true, force: true }));
-    const source = path.join(root, 'source');
-    const dist = path.join(root, 'dist');
-    const build = split ? path.join(root, 'build') : dist;
-    for (const d of [source, dist, build]) fs.mkdirSync(d, { recursive: true });
-    if (safeMode) fs.writeFileSync(path.join(root, 'build-safe-mode.json'), JSON.stringify({ reason: 'TypeScript compilation failed' }));
-    const mod = (name: string, withManifest: boolean) => {
-      fs.mkdirSync(path.join(source, name), { recursive: true });
-      if (withManifest) fs.writeFileSync(path.join(source, name, 'module.json'), '{}');
-    };
-    vi.resetModules();
-    vi.doMock('../../src/utils/dataRoot', () => ({ DATA_ROOT: root, dataPath: (...s: string[]) => path.join(root, ...s) }));
-    vi.doMock('../../src/bot/internalSetup/utils/pathHelpers', async (orig) => ({
-      ...(await orig() as object),
-      getModulesDir: () => dist,
-      getBuildModulesDir: () => build,
-      getSourceModulesDir: () => source,
-    }));
-    onTestFinished(() => { vi.doUnmock('../../src/utils/dataRoot'); vi.doUnmock('../../src/bot/internalSetup/utils/pathHelpers'); });
-    const { SyncEngine } = await import('../../src/bot/internalSetup/fleet/syncEngine');
-    const reports: any[] = [];
-    const engine = new SyncEngine({ request: async () => null, getTerm: () => 1, sendReport: r => reports.push(r) });
-    return { engine, mod, reports, degraded: () => [...(engine as any).degradedModules] };
-  }
-
-  it('marks an enabled module whose source has module.json and dist does not; skips disabled and non-modules', async () => {
-    const r = await rig(true, false);
-    r.mod('alpha', true);
-    r.mod('beta', true);
-    r.mod('notes', false);
-    (r.engine as any).finishOk({ revision: 1, modules: [{ name: 'alpha' }, { name: 'beta', enabled: false }, { name: 'notes' }] }, 1);
-    expect(r.degraded()).toEqual(['alpha']);
-  });
-
-  it('marks nothing on the dev layout', async () => {
-    const r = await rig(false, false);
-    r.mod('alpha', true);
-    (r.engine as any).finishOk({ revision: 1, modules: [{ name: 'alpha' }] }, 1);
-    expect(r.degraded()).toEqual([]);
-  });
-
-  it('leaves the degraded set alone on a pristine build and reports the pristine reason', async () => {
-    const r = await rig(true, true);
-    r.mod('alpha', true);
-    (r.engine as any).finishOk({ revision: 1, modules: [{ name: 'alpha' }] }, 1);
-    expect(r.degraded()).toEqual([]);
-    expect(r.engine.getSyncState().lastError).toBe('this node runs pristine sources: TypeScript compilation failed');
-    expect(r.reports.at(-1).ok).toBe(false);
   });
 });

@@ -76,7 +76,7 @@ function qs(pairs: Record<string, string | undefined>): string {
   return parts.length ? '?' + parts.join('&') : '';
 }
 
-/** A fleet state the child could not answer is a failure, never a 'null' transformation. */
+/** A fleet state the child could not answer is a failure. */
 export function asFleetStateFailure(res: CliResponse): CliResponse {
   const b = res.body as { reachable?: unknown } | null;
   if (b && typeof b === 'object' && b.reachable === false) return { ...res, body: { ...b, success: false } };
@@ -160,7 +160,7 @@ const HANDLERS: Record<string, Handler> = {
   // --- command invocation (console-exclusive synthetic dispatch) ---
   'cmd invoke': (c) => cmdInvoke(c),
 
-  // --- devmodules (master-only) ---
+  // --- devmodules ---
   'devmodules list': (c) => simple(c, 'GET', '/api/devmodules/list'),
   'devmodules reload': (c) => simple(c, 'POST', `/api/devmodules/${encodeURIComponent(need(c, 0, 'name'))}/reload`),
   'devmodules reload-all': (c) => simple(c, 'POST', '/api/devmodules/reload-all'),
@@ -180,39 +180,10 @@ const HANDLERS: Record<string, Handler> = {
   'usage guilds': (c) => simple(c, 'GET', '/api/usage/guilds'),
   'usage guild': (c) => simple(c, 'GET', `/api/usage/guild/${encodeURIComponent(need(c, 0, 'guildId'))}`),
 
-  // --- fleet control plane ---
+  // --- fleet ---
   'fleet state': async (c) => {
     const res = await c.client.request('GET', '/api/fleet/state', {});
     emit(asFleetStateFailure(res), c.flags);
-  },
-  'fleet assign': (c) => simple(c, 'POST', '/api/fleet/assign', { shardId: flagInt(c.flags, 'shard', -1), nodeId: flagStr(c.flags, 'node') || '' }),
-  'fleet resume-assignments': (c) => simple(c, 'POST', '/api/fleet/resume-assignments'),
-  'fleet declare-lost': (c) => simple(c, 'POST', '/api/fleet/declare-lost', { nodeId: flagStr(c.flags, 'node') || '' }),
-  'fleet drain': (c) => simple(c, 'POST', '/api/fleet/drain', { nodeId: flagStr(c.flags, 'node') || '' }),
-  'fleet held-shard': (c) => simple(c, 'POST', '/api/fleet/held-shard', { shardId: flagInt(c.flags, 'shard', -1), restoreOn: flagStr(c.flags, 'restore') ?? null, empty: c.flags.empty === true }),
-  'fleet migrate': (c) => simple(c, 'POST', '/api/fleet/migrate', { kind: flagStr(c.flags, 'kind'), ...(parseBody(c, false) as object || {}) }),
-  'fleet precheck': (c) => simple(c, 'POST', '/api/fleet/migrate/precheck', { kind: flagStr(c.flags, 'kind'), ...(parseBody(c, false) as object || {}) }),
-  'fleet abort': (c) => simple(c, 'POST', '/api/fleet/migrate/abort', { migrationId: flagStr(c.flags, 'migration') || '' }),
-  'fleet resume': (c) => simple(c, 'POST', '/api/fleet/migrate/resume', { migrationId: flagStr(c.flags, 'migration') || '' }),
-  'fleet migrations': (c) => simple(c, 'GET', '/api/fleet/migrations'),
-  // Dev-only fault hook (route is inert unless FLEET_DEV_HOOKS=1 on the bot).
-  'fleet corrupt-lease': (c) => simple(c, 'POST', '/api/fleet/dev/corrupt-lease', { shardId: flagInt(c.flags, 'shard', -1) }),
-
-  // --- backend transformation (spec 3.2) ---
-  'transform start': (c) => {
-    const direction = flagStr(c.flags, 'direction');
-    return simple(c, 'POST', '/api/fleet/transform', direction ? { direction } : {});
-  },
-  'transform pause': (c) => simple(c, 'POST', '/api/fleet/transform/pause'),
-  'transform resume': (c) => simple(c, 'POST', '/api/fleet/transform/resume'),
-  'transform abort': (c) => simple(c, 'POST', '/api/fleet/transform/abort'),
-  'transform status': async (c) => {
-    const res = await c.client.request('GET', '/api/fleet/state', {});
-    emit(asFleetStateFailure(res), c.flags, (b) => {
-      if ((b as { reachable?: unknown }).reachable === false) return;
-      const t = (b as { transformation?: unknown }).transformation;
-      console.log(JSON.stringify(t ?? null, null, 2));
-    });
   },
 
   // --- data bundle round-trip (local disk, same primitives as tools/dataBundle) ---

@@ -188,7 +188,7 @@ const DEFAULT_INSTALLED_CONFIG: InstalledConfig = {
 
 // The web UI process and the bot child each hold an AppStoreManager over the same
 // files. Every write re-reads the file under this lock and changes only its own
-// record. The lock sits under cache/ so fleet sync never ships it.
+// record.
 const LOCK_PATH = path.join(CACHE_DIR, '.store.lock');
 const TAKEOVER_PATH = `${LOCK_PATH}.takeover`;
 const UNREADABLE_DIR = path.join(CACHE_DIR, 'unreadable');
@@ -1921,11 +1921,4 @@ export function getAppStoreManager(): AppStoreManager {
     instance = new AppStoreManager();
   }
   return instance;
-}
-
-/**
- * Reset the singleton (for testing)
- */
-export function resetAppStoreManager(): void {
-  instance = null;
 }

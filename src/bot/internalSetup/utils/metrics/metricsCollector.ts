@@ -451,13 +451,6 @@ export class MetricsCollector {
     };
   }
 
-  // Forward-compat: shape consumed by the future control plane's heartbeats; nothing reads it yet
-  getHeartbeatSnapshot(): any {
-    const board = this.getLeaderboard();
-    const snap = this.getGlobalSnapshot();
-    return { totals: snap.totals, topKGuilds: board.guilds.slice(0, 10) };
-  }
-
   // --- persistence (lightweight: counter totals + last disk sizes) ---
 
   seedTotals(): void {

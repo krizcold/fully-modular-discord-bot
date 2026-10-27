@@ -7,7 +7,7 @@ import { Client } from '../../src/cli/client';
 // B03-1 (R1-J23, R9-J8): smdb bundle refuses a postgres-routed guild or a running bot, the export lands whole or not
 // at all, and the import stages, verifies and swaps so a bad bundle never touches the live guild dir.
 import * as di from '../../src/bot/internalSetup/utils/dataInterchange';
-import { clearRouteOverride, setRouteOverride } from '../../src/bot/internalSetup/utils/dataBackends/routeResolver';
+import { setBackendKind } from '../helpers/backendKind';
 
 const root = process.env.DATA_DIR as string;
 const G = '111222333';
@@ -37,14 +37,14 @@ function tree(dir: string): Record<string, string> {
 }
 
 afterEach(() => {
-  clearRouteOverride(G);
+  setBackendKind(null);
   fs.rmSync(path.join(root, 'out'), { recursive: true, force: true });
   fs.rmSync(path.join(root, '_graveyard'), { recursive: true, force: true });
 });
 
 describe('the bundle refusal', () => {
   it('refuses a postgres-routed guild and names why', () => {
-    setRouteOverride(G, 'postgres');
+    setBackendKind('postgres');
     expect(api.bundleRefusal(G, 'no')).toMatch(/postgres/);
   });
 
@@ -59,13 +59,11 @@ describe('the bundle refusal', () => {
 
   it('serves by the marker when one exists, not by DATA_BACKEND', () => {
     const marker = path.join(root, '.backend.json');
-    setRouteOverride(G, 'postgres');
-    fs.writeFileSync(marker, JSON.stringify({ live: 'file', storeId: null, flippedAt: 1, transformationId: null }));
+    setBackendKind('postgres');
+    fs.writeFileSync(marker, JSON.stringify({ live: 'file', storeId: null, flippedAt: 1}));
     try {
       expect(api.bundleRefusal(G, 'no')).toBeNull();
-      fs.writeFileSync(marker, JSON.stringify({ live: 'file', storeId: null, flippedAt: 1, transformationId: 't1' }));
-      expect(api.bundleRefusal(G, 'no')).toMatch(/transformation window is open/);
-      fs.writeFileSync(marker, JSON.stringify({ live: 'postgres', storeId: 's', flippedAt: 1, transformationId: null }));
+      fs.writeFileSync(marker, JSON.stringify({ live: 'postgres', storeId: 's', flippedAt: 1}));
       expect(api.bundleRefusal(G, 'no')).toMatch(/postgres/);
     } finally {
       fs.rmSync(marker, { force: true });
@@ -112,13 +110,13 @@ describe('the export', () => {
 });
 
 describe('the import', () => {
-  it('replaces the live dir with exactly the bundle, keeps node sidecars and graveyards the old copy', async () => {
+  it('replaces the live dir with exactly the bundle and graveyards the old copy', async () => {
     seed({ 'a.json': 'new-a', 'sub/b.json': 'new-b' });
     await di.writeBundle(G, out);
-    seed({ 'a.json': 'old-a', 'stale.json': 'old', '.owner': 'me' });
+    seed({ 'a.json': 'old-a', 'stale.json': 'old' });
     const res = await api.importBundle(out);
     expect(res).toMatchObject({ guildId: G, fileCount: 2 });
-    expect(tree(guildDir)).toEqual({ 'a.json': 'new-a', 'sub/b.json': 'new-b', '.owner': 'me' });
+    expect(tree(guildDir)).toEqual({ 'a.json': 'new-a', 'sub/b.json': 'new-b' });
     const graves = fs.readdirSync(path.join(root, '_graveyard'));
     expect(graves).toHaveLength(1);
     expect(fs.readFileSync(path.join(root, '_graveyard', graves[0], 'stale.json'), 'utf-8')).toBe('old');

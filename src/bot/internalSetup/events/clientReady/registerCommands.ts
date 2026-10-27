@@ -9,7 +9,6 @@ import getLocalCommands from '../../utils/getLocalCommands';
 import areCommandsDifferent from '../../utils/areCommandsDifferent';
 import 'dotenv/config';
 import { getConfigProperty } from '../../utils/configManager';
-import { resolveNodeRole } from '../../fleet/nodeIdentity';
 import { loadGlobalData, saveGlobalData } from '../../utils/dataManager';
 import { dataPath } from '../../../../utils/dataRoot';
 import * as fs from 'fs';
@@ -122,7 +121,7 @@ const COMMAND_GONE_CODE = 10063;
 
 /**
  * Clean ALL guild commands from a specific guild through REST (the guild may be
- * on another node's shard or absent from the cache). done is false when any
+ * absent from the cache). done is false when any
  * fetch or delete failed, so the guild stays tracked and the next run retries.
  */
 async function cleanStaleTestCommands(
@@ -194,7 +193,7 @@ async function handleStaleTestGuildCleanup(
   }
 
   // Case A: No tracked guild - full scan of every guild the bot is in, read
-  // through REST so a node holding no shard still sees them.
+  // through REST.
   console.log('[i] No previous test guild tracked, scanning all guilds for stale commands...');
   let guildIds: string[];
   try {
@@ -264,12 +263,6 @@ export default async function registerCommands(
   client: Client,
   options: { runOrphanCleanup?: boolean } = {}
 ): Promise<OrphanSweepResult | null> {
-  // Slash-command registration is a bot-identity-wide operation; only the
-  // master node performs it (co-workers would race the same Discord state).
-  if (resolveNodeRole() === 'co-worker') {
-    console.log('[i] Skipping command registration (co-worker node; the master owns it)');
-    return null;
-  }
   const runOrphanCleanup = options.runOrphanCleanup !== false;
   console.log('[i] Registering commands...');
 
@@ -303,7 +296,7 @@ export default async function registerCommands(
       console.log(`[i] ${disabledCommands.size} command(s) disabled via component config: ${[...disabledCommands].join(', ')}`);
     }
 
-    // Fetch existing commands from Discord. On a node whose gateway never
+    // Fetch existing commands from Discord. If the gateway never
     // became ready, the application is resolved through REST.
     const application = await resolveClientApplication(client);
     if (!application) {
@@ -312,12 +305,9 @@ export default async function registerCommands(
     }
     const globalCommands = await application.commands.fetch();
     // Test (guild) commands go through the application-commands REST API scoped
-    // to guildId, NOT a cached Guild object. In a fleet the test guild usually
-    // lives on ANOTHER node's shard, so it is legitimately absent from this
-    // client's cache; the old cache lookup aborted all registration on the
-    // master. This REST manager works regardless of which shard holds the guild,
-    // and never adds it to this client's cache (which would corrupt the fleet
-    // guild map / this node's guild count).
+    // to guildId, NOT a cached Guild object: the test guild may be absent from
+    // the cache, and this REST manager never adds it there (which would skew
+    // the guild count).
     const appCommands = application.commands;
     const guildCmds = {
       fetch: () => appCommands.fetch({ guildId }),

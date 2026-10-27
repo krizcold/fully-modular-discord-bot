@@ -1,117 +1,52 @@
-// LeaseRuntime - holds this node's shard leases and enforces the one
-// invariant that keeps a shared token safe: NO IDENTIFY WITHOUT A
-// CURRENT-TERM LEASE. The master's self-granted leases run through the same
-// runtime as a co-worker's remote grants.
+// LeaseRuntime - holds this process's shard leases and enforces the one
+// invariant that keeps a shared token safe: NO IDENTIFY WITHOUT A CURRENT
+// LEASE.
 
-import * as fs from 'fs';
-import { monitorEventLoopDelay, IntervalHistogram } from 'perf_hooks';
 import { Status } from 'discord.js';
-import type { Client } from 'discord.js';
-import { DATA_ROOT } from '../../../utils/dataRoot';
-import { getMetricsCollector } from '../utils/metrics/metricsCollector';
 import { getDataReadiness } from '../utils/dataBackends/dataReadiness';
-import { getGuildDataBackend } from '../utils/dataManager';
 import { getNodeId } from './nodeIdentity';
-import { getLocalReplicaIdentity, getReplicaHealth, startReplicaHealthSampler } from './replicaHealth';
-import { getSyncWaitCancel } from '../utils/syncWaitCancel';
 import type { IngestService } from '../ingest/ingestService';
-import type {
-  HeartbeatPayload,
-  LeaseAckPayload,
-  LeaseGrantPayload,
-  LeaseInfo,
-  LoadSample,
-  RegisterPayload,
-  ShardStatusEntry,
-} from './protocol';
+
+export interface LeaseInfo {
+  leaseId: string;
+  shardId: number;
+}
+
+export interface LeaseGrant {
+  term: number;
+  epoch: number;
+  shardCount: number;
+  leases: LeaseInfo[];
+}
+
+export interface ShardStatusEntry {
+  shardId: number;
+  status: string;
+  guildCount: number;
+}
 
 export interface CurrentLease {
   term: number;
   epoch: number;
   shardCount: number;
   leases: LeaseInfo[];
-  receivedAt: number;
 }
 
 // discord.js cannot hot-change a Client's shard set, so a plan change means a
-// destroy + re-login. Coalesce rapid changes (e.g. assigning several free
-// shards one click at a time) into ONE rebuild, and never rebuild in the
-// caller's await path (client.destroy() stalls while a shard is mid-connect,
-// which would time out the assign request and leave the gateway thrashing).
+// destroy + re-login. Coalesce rapid changes into ONE rebuild, and never
+// rebuild in the caller's await path (client.destroy() stalls while a shard is
+// mid-connect, which would leave the gateway thrashing).
 const GATEWAY_SYNC_DEBOUNCE_MS = 1500;
-
-// Sampled off the heartbeat path (statfs is async); feeds the postgres-to-file
-// transformation space precheck. undefined until the first sample lands or
-// when the platform lacks statfs.
-const FREE_DISK_SAMPLE_MS = 60_000;
-let cachedFreeDiskBytes: number | undefined;
-let freeDiskSamplerStarted = false;
-
-function startFreeDiskSampler(): void {
-  if (freeDiskSamplerStarted) return;
-  freeDiskSamplerStarted = true;
-  const sample = async (): Promise<void> => {
-    try {
-      const st = await (fs.promises as any).statfs(DATA_ROOT);
-      if (st && Number.isFinite(st.bavail) && Number.isFinite(st.bsize)) {
-        cachedFreeDiskBytes = st.bavail * st.bsize;
-      }
-    } catch { /* unsupported platform; stays undefined */ }
-  };
-  void sample();
-  setInterval(() => void sample(), FREE_DISK_SAMPLE_MS).unref();
-}
 
 export class LeaseRuntime {
   private current: CurrentLease | null = null;
   private token: string | undefined;
-  private startTimer: NodeJS.Timeout | null = null;
   private syncTimer: NodeJS.Timeout | null = null;
-  private seq = 0;
-  private lastHeartbeat: HeartbeatPayload | null = null;
-  private histogram: IntervalHistogram | null = null;
-  private lastCpu: NodeJS.CpuUsage | null = null;
-  private lastHr: bigint | null = null;
 
   constructor(private readonly ingest: IngestService) {}
 
-  hasCurrentLease(): boolean {
-    return this.current !== null;
-  }
-
   getCurrent(): CurrentLease | null {
     return this.current;
-  }
-
-  /**
-   * Dev fault hook (drill P2.8): corrupt a held lease id so the next renew carries
-   * a stale id, the master reports lease-mismatch, and Phase R re-grants within a
-   * tick. Double-gated by FLEET_DEV_HOOKS; self-heals on the next grant.
-   */
-  corruptLeaseForTest(shardId: number): { ok: boolean; error?: string } {
-    if (process.env.FLEET_DEV_HOOKS !== '1') return { ok: false, error: 'dev hooks disabled (set FLEET_DEV_HOOKS=1)' };
-    if (!this.current) return { ok: false, error: 'no current lease on this node' };
-    const lease = this.current.leases.find(l => l.shardId === shardId);
-    if (!lease) return { ok: false, error: `no held lease for shard ${shardId}` };
-    const original = lease.leaseId;
-    lease.leaseId = `corrupt-${original}`;
-    console.warn(`[Fleet][DEV] Corrupted lease id for shard ${shardId} (${original} -> ${lease.leaseId}); next renew reports lease-mismatch`);
-    return { ok: true };
-  }
-
-  getLastHeartbeat(): HeartbeatPayload | null {
-    return this.lastHeartbeat;
-  }
-
-  /** Cached lease summary carried in the register payload so the master can reconcile; null when no lease is held. */
-  getHeldSummary(): RegisterPayload['heldLeases'] {
-    if (!this.current) return null;
-    return {
-      term: this.current.term,
-      epoch: this.current.epoch,
-      shardCount: this.current.shardCount,
-      leases: this.current.leases.map(l => ({ leaseId: l.leaseId, shardId: l.shardId })),
-    };
   }
 
   /** Called once with the login token; starts (or arms) the gated login. */
@@ -120,50 +55,22 @@ export class LeaseRuntime {
     this.maybeStart();
   }
 
-  async applyGrant(grant: LeaseGrantPayload): Promise<LeaseAckPayload> {
-    // Term fencing: a lower-term grant is a deposed master talking.
-    if (this.current && grant.term < this.current.term) {
-      return { ok: false, term: this.current.term, reason: 'stale-term' };
-    }
-    // Reconcile by highest (term, epoch): a same-term lower-epoch grant is an
-    // older placement round arriving late.
-    if (this.current && grant.term === this.current.term && grant.epoch < this.current.epoch) {
-      return { ok: false, term: this.current.term, reason: 'stale-epoch' };
-    }
+  async applyGrant(grant: LeaseGrant): Promise<void> {
     const shardIds = grant.leases.map(l => l.shardId).sort((a, b) => a - b);
     const sameShape =
       this.current !== null &&
       this.current.shardCount === grant.shardCount &&
       sameNumberSet(this.current.leases.map(l => l.shardId), shardIds);
 
-    if (sameShape) {
-      // Same shard set under an equal-or-higher term: a re-grant is a
-      // permission refresh (master restart, epoch bump), not an order to
-      // re-identify. Adopt without bouncing live sessions.
-      this.current = { term: grant.term, epoch: grant.epoch, shardCount: grant.shardCount, leases: grant.leases, receivedAt: Date.now() };
-      this.ingest.setShardPlan(shardIds, grant.shardCount);
-      this.notifyDataLayer();
-      this.maybeStart();
-      return { ok: true, term: grant.term };
-    }
-
-    // Shard set changed. Adopt the plan synchronously (fencing stays exact),
-    // but do the physical gateway rebuild off the caller's path so the grant
-    // returns immediately. The added shards are FREE (manual assign and
-    // free-shard distribution never take an owned shard), so there is no
-    // dual-identify window to close synchronously; moving an owned shard is a
-    // migration (Phase 4), not this path.
-    this.current = { term: grant.term, epoch: grant.epoch, shardCount: grant.shardCount, leases: grant.leases, receivedAt: Date.now() };
+    this.current = { term: grant.term, epoch: grant.epoch, shardCount: grant.shardCount, leases: grant.leases };
     this.ingest.setShardPlan(shardIds, grant.shardCount);
-    this.notifyDataLayer();
-    if (this.ingest.isStarted()) {
+    this.notifyDataLayer(this.current);
+    if (!sameShape && this.ingest.isStarted()) {
       // A gateway is already running the old set: coalesce into one rebuild.
       this.scheduleGatewaySync();
     } else {
-      // Nothing running yet (first lease / currently down): log in now.
       this.maybeStart();
     }
-    return { ok: true, term: grant.term };
   }
 
   /** Debounced destroy + re-login so rapid plan changes rebuild the gateway once. */
@@ -176,86 +83,23 @@ export class LeaseRuntime {
   }
 
   private async syncGateway(): Promise<void> {
-    if (!this.current) return;
-    await this.stopSessions('lease changed');
+    await this.ingest.stop('lease changed');
     this.maybeStart();
   }
 
-  /** Sessions are destroyed FIRST: an acked revoke means the token is free to re-grant. */
-  async revoke(term: number, leaseIds: string[], reason: string): Promise<LeaseAckPayload> {
-    if (!this.current) return { ok: true, term };
-    if (term < this.current.term) {
-      return { ok: false, term: this.current.term, reason: 'stale-term' };
-    }
-    const held = new Set(this.current.leases.map(l => l.leaseId));
-    const revoked = leaseIds.filter(id => held.has(id));
-    if (revoked.length === 0) return { ok: true, term: this.current.term };
-
-    const remaining = this.current.leases.filter(l => !leaseIds.includes(l.leaseId));
-    await this.stopSessions(`revoked: ${reason}`);
-    if (remaining.length === 0) {
-      this.current = null;
-    } else {
-      this.current = { ...this.current, term, leases: remaining, receivedAt: Date.now() };
-      this.ingest.setShardPlan(remaining.map(l => l.shardId), this.current.shardCount);
-      this.maybeStart();
-    }
-    this.notifyDataLayer();
-    return { ok: true, term };
-  }
-
-  /** TTL expiry (no master contact): drop the lease and destroy sessions. */
-  async expire(reason: string): Promise<void> {
-    if (!this.current) return;
-    console.warn(`[Fleet] Lease expired (${reason}); destroying gateway sessions`);
-    this.current = null;
-    this.notifyDataLayer();
-    await this.stopSessions('lease expired');
-  }
-
-  /**
-   * A recycled data runtime starts with a fresh readiness driver that knows no
-   * shards; re-mirroring the held lease is what lets it hydrate again without
-   * waiting for the next grant.
-   */
-  renotifyDataLayer(): void {
-    this.notifyDataLayer();
-  }
-
   /** Mirror the held lease into the data layer (constructed only in postgres mode). */
-  private notifyDataLayer(): void {
-    const readiness = getDataReadiness();
-    if (!readiness) return;
-    if (!this.current) {
-      readiness.onLeaseLost();
-      return;
-    }
-    readiness.onLeaseChanged({
+  private notifyDataLayer(current: CurrentLease): void {
+    getDataReadiness()?.onLeaseChanged({
       nodeId: getNodeId(),
-      term: this.current.term,
-      epoch: this.current.epoch,
-      shardCount: this.current.shardCount,
-      shardIds: this.current.leases.map(l => l.shardId),
+      term: current.term,
+      epoch: current.epoch,
+      shardCount: current.shardCount,
+      shardIds: current.leases.map(l => l.shardId),
     });
   }
 
-  /**
-   * Watchdog: discord.js auto re-identifies after session invalidation (op 9
-   * with d=false destroys with recover=Reconnect in @discordjs/ws). While a
-   * current-term lease is held that is fine; without one it must be killed
-   * actively rather than trusted not to reconnect.
-   */
-  attachClient(client: Client): void {
-    const guard = (what: string) => {
-      if (this.hasCurrentLease()) return;
-      console.warn(`[Fleet] ${what} without a current-term lease; destroying sessions (fencing)`);
-      void this.ingest.stop('no current-term lease');
-    };
-    client.on('shardReconnecting', () => guard('Shard reconnect attempt'));
-    client.on('shardReady', () => guard('Shard became ready'));
-  }
-
-  buildHeartbeat(term: number): HeartbeatPayload {
+  /** Gateway status and guild count of every held shard. */
+  shardStatuses(): ShardStatusEntry[] {
     const client = this.ingest.getClient();
     const shards: ShardStatusEntry[] = [];
     if (this.current) {
@@ -274,96 +118,15 @@ export class LeaseRuntime {
         });
       }
     }
-    let metrics: { totals: any; topKGuilds: any[] } = { totals: null, topKGuilds: [] };
-    try {
-      metrics = getMetricsCollector().getHeartbeatSnapshot();
-    } catch { /* metrics must never take the control channel down */ }
-    const backend = getGuildDataBackend();
-    startFreeDiskSampler();
-    startReplicaHealthSampler();
-    const dbReplica = getReplicaHealth();
-    const dbReplicaSlot = getLocalReplicaIdentity()?.slotName;
-    const syncWaitCancelledAt = getSyncWaitCancel()?.at;
-    const hb: HeartbeatPayload = {
-      term,
-      seq: ++this.seq,
-      shardCount: this.current?.shardCount,
-      shards,
-      guilds: client ? [...client.guilds.cache.keys()] : [],
-      metrics,
-      load: this.sampleLoad(),
-      ...(backend ? { dataBackendHealthy: backend.healthy() } : {}),
-      ...(cachedFreeDiskBytes !== undefined ? { freeDiskBytes: cachedFreeDiskBytes } : {}),
-      ...(dbReplica ? { dbReplica } : {}),
-      // Always sent, empty when this node cannot name a standby slot right now.
-      // Empty is read as "no claim", which costs one heartbeat of silence after
-      // a restart while the sampler warms; the alternative, omitting it to mean
-      // "unknown", would keep a REMOVED standby's claim alive, because the
-      // identity above deliberately survives a standby outage. Silence loses an
-      // advisory; a stale claim states a falsehood about a copy that is gone.
-      dbReplicaSlot: dbReplicaSlot ?? '',
-      ...(syncWaitCancelledAt !== undefined ? { syncWaitCancelledAt } : {}),
-    };
-    this.lastHeartbeat = hb;
-    return hb;
+    return shards;
   }
 
-  private async stopSessions(reason: string): Promise<void> {
-    if (this.startTimer) {
-      clearTimeout(this.startTimer);
-      this.startTimer = null;
-    }
-    if (this.syncTimer) {
-      clearTimeout(this.syncTimer);
-      this.syncTimer = null;
-    }
-    await this.ingest.stop(reason);
-  }
-
-  /**
-   * Gated login. Identify pacing: the master serialized this node's slot via
-   * identifyDelayMs; the wait is relative to grant receipt (clock-skew rule).
-   * Within one Client, @discordjs/ws spaces the node's own shards per bucket.
-   */
+  /** Gated login; @discordjs/ws spaces the identifies of this process's shards per bucket. */
   private maybeStart(): void {
-    if (!this.current || this.token === undefined || this.ingest.isStarted() || this.startTimer) return;
-    const minDelay = Math.min(...this.current.leases.map(l => l.identifyDelayMs), 0x7fffffff);
-    const remaining = this.current.receivedAt + (Number.isFinite(minDelay) ? minDelay : 0) - Date.now();
-    if (remaining <= 0) {
-      // Login failures are deliberately NOT swallowed: an invalid token must
-      // surface exactly like today's boot (unhandled rejection -> crash).
-      void this.ingest.start(this.token);
-      return;
-    }
-    this.startTimer = setTimeout(() => {
-      this.startTimer = null;
-      if (!this.current || this.token === undefined || this.ingest.isStarted()) return;
-      void this.ingest.start(this.token);
-    }, remaining);
-  }
-
-  private sampleLoad(): LoadSample {
-    const rssMb = Math.round((process.memoryUsage().rss / 1048576) * 10) / 10;
-    if (!this.histogram) {
-      this.histogram = monitorEventLoopDelay({ resolution: 20 });
-      this.histogram.enable();
-      this.lastCpu = process.cpuUsage();
-      this.lastHr = process.hrtime.bigint();
-      return { cpuPct: 0, rssMb, loopLagMs: 0 };
-    }
-    const cpu = process.cpuUsage(this.lastCpu!);
-    this.lastCpu = process.cpuUsage();
-    const now = process.hrtime.bigint();
-    const elapsedMicros = Number((now - this.lastHr!) / 1000n);
-    this.lastHr = now;
-    const cpuPct = elapsedMicros > 0 ? Math.round(((cpu.user + cpu.system) / elapsedMicros) * 10000) / 100 : 0;
-    const p95 = this.histogram.percentile(95);
-    this.histogram.reset();
-    return {
-      cpuPct,
-      rssMb,
-      loopLagMs: Number.isFinite(p95) ? Math.round((p95 / 1e6) * 100) / 100 : 0,
-    };
+    if (!this.current || this.token === undefined || this.ingest.isStarted()) return;
+    // Login failures are deliberately NOT swallowed: an invalid token must
+    // surface exactly like today's boot (unhandled rejection -> crash).
+    void this.ingest.start(this.token);
   }
 }
 

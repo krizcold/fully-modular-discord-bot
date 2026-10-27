@@ -21,7 +21,8 @@ vi.mock('../../src/bot/internalSetup/utils/panelManager', async importOriginal =
   return { ...real, getPanelManager: () => manager.current };
 });
 
-import { confirmWrite, freezeGuildWrites, saveData, saveDataOutcome, unfreezeGuildWrites } from '../../src/bot/internalSetup/utils/dataManager';
+import { confirmWrite, saveData, saveDataOutcome } from '../../src/bot/internalSetup/utils/dataManager';
+import { freezeGuildWrites, unfreezeGuildWrites } from '../helpers/freezeGuild';
 import { currentLedger } from '../../src/bot/internalSetup/utils/dataBackends/writeLedger';
 import { CONFIRM_MS, truthText } from '../../src/bot/internalSetup/utils/dataBackends/replyGate';
 import { runPanelAction, setupPanelIPCHandlers } from '../../src/bot/internalSetup/utils/ipcPanelHandler';
@@ -169,7 +170,7 @@ describe('a panel run whose writes are not confirmed', () => {
 
   it('a commit the store refuses answers held', async () => {
     const { guildId, store, options } = await storeGuild();
-    store.mode = 'read-only';
+    store.mode = 'unavailable';
     const answer = await run('panel:modal', async () => {
       saveData('x.json', options, { v: 1 });
       return VIEW;
@@ -180,7 +181,7 @@ describe('a panel run whose writes are not confirmed', () => {
 
   it('a held write while the bot stops says the change may be lost', async () => {
     const { guildId, store, options } = await storeGuild();
-    store.mode = 'read-only';
+    store.mode = 'unavailable';
     const answer = await run('panel:modal', async () => {
       saveData('x.json', options, { v: 1 });
       stop.on = true;

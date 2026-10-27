@@ -13,8 +13,8 @@ vi.mock('../../src/webui/utils/webuiDataReader', async importOriginal => {
   return { ...real, getWebuiDataReader: () => reader.current };
 });
 
-import { clearRouteOverride, setRouteOverride } from '../../src/bot/internalSetup/utils/dataBackends/routeResolver';
-import { deleteRawAtomic, flushAll, freezeGuildWrites, unfreezeGuildWrites, writeRawAtomic } from '../../src/bot/internalSetup/utils/dataManager';
+import { setBackendKind } from '../helpers/backendKind';
+import { deleteRawAtomic, flushAll, writeRawAtomic } from '../../src/bot/internalSetup/utils/dataManager';
 import { applyOperatorDataRead } from '../../src/bot/internalSetup/utils/ipcDataHandler';
 import { ROOT_CONFIG_PATH } from '../../src/bot/internalSetup/utils/configManager';
 import { discoverConfigFiles, discoverGlobalDataFiles } from '../../src/bot/internalSetup/utils/configDiscovery';
@@ -40,8 +40,7 @@ afterAll(async () => { await close(); });
 beforeEach(async () => {
   child.reset();
   reader.current = null;
-  clearRouteOverride(G1);
-  clearRouteOverride(G2);
+  setBackendKind(null);
   await resetData();
 });
 
@@ -244,7 +243,7 @@ describe('one backup helper: queue-first source, durable write, parse before res
 
 describe('config and data reads come from the serving process, queue first (R34-J1, R49-J3, R52-J1, R53-J1)', () => {
   it('reads a postgres-routed guild\'s config from the child, never an empty merge', async () => {
-    setRouteOverride(G1, 'postgres');
+    setBackendKind('postgres');
     child.guild = req => (req.module === '_guildConfig' && req.filename === 'config.json' ? { ok: true, contentJson: JSON.stringify({ who: 'child' }) } : undefined);
     const got = await call(base, 'GET', `/api/config/get?file=config.json&guildId=${G1}`);
     expect(got.status).toBe(200);
@@ -276,14 +275,14 @@ describe('config and data reads come from the serving process, queue first (R34-
   });
 
   it('answers 503 when the serving process refuses the read, never an empty editor', async () => {
-    setRouteOverride(G1, 'postgres');
+    setBackendKind('postgres');
     child.guild = () => ({ ok: false, code: 'backend-unavailable', error: 'guild data is not ready' });
     const got = await call(base, 'GET', `/api/config/get?file=config.json&guildId=${G1}`);
     expect(got.status).toBe(503);
   });
 
   it('reads a postgres-routed guild\'s data file through the child, not the database reader', async () => {
-    setRouteOverride(G1, 'postgres');
+    setBackendKind('postgres');
     reader.current = { exists: async () => true, readDoc: async () => JSON.stringify({ v: 'database-old' }) };
     child.guild = req => (req.module === 'mod' && req.filename === 'x.json' ? { ok: true, contentJson: JSON.stringify({ v: 'child-new' }) } : undefined);
     const got = await call(base, 'GET', `/api/config/data/get?file=${encodeURIComponent('mod/x.json')}&guildId=${G1}`);
@@ -293,7 +292,7 @@ describe('config and data reads come from the serving process, queue first (R34-
   });
 
   it('falls back to the database reader only while the bot is down, and says so', async () => {
-    setRouteOverride(G1, 'postgres');
+    setBackendKind('postgres');
     child.running = false;
     reader.current = { exists: async () => true, readDoc: async () => JSON.stringify({ v: 'database' }) };
     const got = await call(base, 'GET', `/api/config/data/get?file=${encodeURIComponent('mod/x.json')}&guildId=${G1}`);
@@ -323,7 +322,7 @@ describe('config and data reads come from the serving process, queue first (R34-
   });
 
   it('leaves underscore (internal) modules out of a postgres-routed guild\'s listing', async () => {
-    setRouteOverride(G1, 'postgres');
+    setBackendKind('postgres');
     reader.current = {
       exists: async () => false,
       listModules: async () => ['_hardLimits', 'mod'],
@@ -435,51 +434,6 @@ describe('review round 1', () => {
     const landed = readJson(ROOT_CONFIG_PATH);
     // The save that landed last backed up the one before it.
     expect(bodies).toContainEqual(landed.v === 'Z' ? { v: 'Y' } : { v: 'Z' });
-  });
-
-  it.each([
-    ['a data save', 'save'],
-    ['a data restore', 'restore'],
-  ])('C01-R1-3: %s refuses when a freeze begins during the serving read', async (_label, kind) => {
-    const target = dataPath(G1, 'mod', 'x.json');
-    put(target, { v: 'v0' });
-    const dataSave = (v: string) => call(base, 'POST', '/api/config/data/update', { file: 'mod/x.json', data: { v }, guildId: G1 });
-    expect((await dataSave('v1')).status).toBe(200);
-    await flushAll();
-    const listed = await call(base, 'GET', `/api/config/backups?file=${encodeURIComponent('mod/x.json')}&guildId=${G1}&category=data`);
-    const backup = listed.body.backups[0]?.filename;
-    expect(backup).toBeDefined();
-    child.guild = req => {
-      freezeGuildWrites(G1);
-      return applyOperatorDataRead({ guildId: req.guildId, module: req.module, filename: req.filename });
-    };
-    let answer: Answer;
-    try {
-      answer = kind === 'save'
-        ? await dataSave('v2')
-        : await call(base, 'POST', '/api/config/restore', { file: 'mod/x.json', filename: backup, guildId: G1, category: 'data' });
-      await flushAll();
-    } finally {
-      unfreezeGuildWrites(G1);
-    }
-    expect(answer.status).toBe(503);
-    expect(answer.body.error).toMatch(/frozen/);
-    expect(readJson(target)).toEqual({ v: 'v1' });
-  });
-
-  it('C01-R1-3: a guild config save the facade refuses as frozen says frozen', async () => {
-    child.guild = req => {
-      freezeGuildWrites(G1);
-      return applyOperatorDataRead({ guildId: req.guildId, module: req.module, filename: req.filename });
-    };
-    let answer: Answer;
-    try {
-      answer = await save({ who: 'g1' }, G1);
-    } finally {
-      unfreezeGuildWrites(G1);
-    }
-    expect(answer.status).toBe(503);
-    expect(answer.body.error).toMatch(/frozen/);
   });
 
   it('C01-R1-4: a file-routed guild read shows this process\'s own queued write, and a save backs it up', async () => {
@@ -739,7 +693,8 @@ describe('review round 3', () => {
   // A postgres-routed guild whose database holds both a top-level and a nested doc, and whose disk holds only a
   // leftover in a subfolder: the panel lists the top-level doc, so every route names that doc to the child.
   function postgresWithNestedLeftover() {
-    setRouteOverride(G1, 'postgres');
+    setBackendKind('postgres');
+    put(dataPath('.backend.json'), { live: 'postgres', storeId: null, flippedAt: 0 });
     put(dataPath(G1, 'mod', 'sub', 'x.json'), { disk: 1 });
     const docs: Record<string, unknown> = { 'mod|x.json': { db: 'top' }, 'mod|sub/x.json': { db: 'nested' } };
     child.guild = req => {
@@ -811,7 +766,7 @@ describe('review round 3', () => {
 
   it.each([
     ['file', () => undefined],
-    ['postgres', () => setRouteOverride(G1, 'postgres')],
+    ['postgres', () => setBackendKind('postgres')],
   ])('C01-R3-3: an older backup of a data file no discovery lists is not said to share its name with another file (%s route)', async (_label, route) => {
     route();
     const older = OLDER(`x_${G1}`);
@@ -888,7 +843,7 @@ describe('review round 4', () => {
     ['a guild-root doc (M-R4-A)', 'x.json', 'data', 'x', () => undefined],
     ['a module config file', 'examples-config.json', 'config', 'examples-config', () => undefined],
   ])('C01-R4-1: an older backup of a postgres guild\'s %s cannot be checked against the database, so it is not restored', async (_label, file, category, stem, disk) => {
-    setRouteOverride(G1, 'postgres');
+    setBackendKind('postgres');
     disk();
     child.guild = () => ({ ok: true, contentJson: JSON.stringify({ current: 1 }) });
     const older = OLDER(`${stem}_${G1}`);
@@ -946,7 +901,8 @@ describe('review round 4', () => {
   // A postgres guild whose database holds a guild-root doc and a module doc of one name, and whose disk keeps a
   // leftover of the module doc: a key without '/' names the root doc.
   function postgresRootAndModuleDoc() {
-    setRouteOverride(G1, 'postgres');
+    setBackendKind('postgres');
+    put(dataPath('.backend.json'), { live: 'postgres', storeId: null, flippedAt: 0 });
     put(dataPath(G1, 'm', 'x.json'), { leftover: 1 });
     const docs: Record<string, unknown> = { '|x.json': { root: 1 }, 'm|x.json': { mod: 1 } };
     child.guild = req => {

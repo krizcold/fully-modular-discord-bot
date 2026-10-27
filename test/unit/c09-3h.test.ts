@@ -13,7 +13,6 @@ vi.mock('../../src/bot/internalSetup/utils/getLocalCommands', async (orig) => {
   const real = await orig<any>();
   return { default: (...a: any[]) => (h.realLocal ? real.default(...a) : h.local) };
 });
-vi.mock('../../src/bot/internalSetup/fleet/nodeIdentity', () => ({ resolveNodeRole: () => 'master' }));
 vi.mock('../../src/bot/internalSetup/utils/dataManager', async (orig) => ({
   ...(await orig<any>()),
   loadGlobalData: () => ({ guildId: 'g-test' }),

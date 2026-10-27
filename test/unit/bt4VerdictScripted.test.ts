@@ -8,11 +8,11 @@ vi.mock('../../src/bot/internalSetup/utils/dataManager', async importOriginal =>
   const real = await importOriginal<typeof import('../../src/bot/internalSetup/utils/dataManager')>();
   return {
     ...real,
-    confirmFrom: async (...args: Parameters<typeof real.confirmFrom>) => {
+    confirmWrite: async (...args: Parameters<typeof real.confirmWrite>) => {
       script.calls += 1;
       // A timer turn, so a verdict that kept judging could not starve the test's own timers.
       await new Promise(resolve => setTimeout(resolve, 1));
-      return script.okWithoutLanding ? 'ok' : real.confirmFrom(...args);
+      return script.okWithoutLanding ? 'ok' : real.confirmWrite(...args);
     },
   };
 });

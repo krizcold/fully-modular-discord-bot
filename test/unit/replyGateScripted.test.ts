@@ -13,9 +13,9 @@ vi.mock('../../src/bot/internalSetup/utils/dataManager', async importOriginal =>
   const real = await importOriginal<typeof import('../../src/bot/internalSetup/utils/dataManager')>();
   return {
     ...real,
-    confirmFrom: async (...args: Parameters<typeof real.confirmFrom>) => {
+    confirmWrite: async (...args: Parameters<typeof real.confirmWrite>) => {
       const rule = script.rules.find(r => r.match(args[0] as never));
-      return rule ? (rule.answer(args[1]) as never) : real.confirmFrom(...args);
+      return rule ? (rule.answer(args[1]) as never) : real.confirmWrite(...args);
     },
   };
 });
@@ -27,7 +27,7 @@ vi.mock('../../src/bot/internalSetup/utils/dataBackends/fileBackend', async impo
 
 import { deleteRawAtomic, saveData, writeRawAtomic } from '../../src/bot/internalSetup/utils/dataManager';
 import { flushAll as flushFiles } from '../../src/bot/internalSetup/utils/dataBackends/fileBackend';
-import { setRouteOverride } from '../../src/bot/internalSetup/utils/dataBackends/routeResolver';
+import { setBackendKind } from '../helpers/backendKind';
 import { getWorkingSet } from '../../src/bot/internalSetup/utils/dataBackends/workingSet';
 import { ACK_MS, answerWrites, truthText } from '../../src/bot/internalSetup/utils/dataBackends/replyGate';
 import { tokenFor } from '../helpers/fakeStore';
@@ -36,7 +36,7 @@ import { callbackType, EPHEMERAL, freshGuild, rawCommand, rig, storeGuild, textO
 /** A second postgres-routed guild on the same working set and store as the last storeGuild(). */
 async function secondGuild() {
   const guildId = freshGuild();
-  setRouteOverride(guildId, 'postgres');
+  setBackendKind('postgres');
   expect(await getWorkingSet()!.hydrate(guildId, tokenFor())).toBe('ready');
   return { guildId, category: 'm' };
 }

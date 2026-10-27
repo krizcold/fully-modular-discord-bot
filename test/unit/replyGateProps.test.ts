@@ -21,7 +21,7 @@ describe('the reply gate, over random interactions', () => {
     await fc.assert(
       fc.asyncProperty(
         fc.array(fc.constantFrom<Op>('save', 'append', 'refuse'), { maxLength: 4 }),
-        fc.constantFrom<'commit' | 'read-only'>('commit', 'read-only'),
+        fc.constantFrom<'commit' | 'unavailable'>('commit', 'unavailable'),
         fc.constantFrom<Shape>('reply', 'deferThenEdit', 'replyThenFollowUp'),
         async (ops, mode, shape) => {
           const { wire, control, emit } = rig();

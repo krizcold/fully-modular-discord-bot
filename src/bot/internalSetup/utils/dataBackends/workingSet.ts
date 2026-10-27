@@ -5,7 +5,7 @@
 // refuse loudly (never silently) when that window cannot be honored.
 
 import { DataBackend, DocKey, FenceToken, GuildFlushBatch } from './backend';
-import { setLeft, type CarryOutcome } from './scopeRecord';
+import { setLeft } from './scopeRecord';
 
 const DEBOUNCE_MS = 500;
 const MAX_DELAY_MS = 5000;
@@ -18,7 +18,7 @@ const FENCED_DRAIN_MS = 30_000;
 const RETRY_BASE_MS = 1000;
 const RETRY_CAP_MS = 30_000;
 
-export type WsWriteResult = 'accepted' | 'frozen-window' | 'refusing' | 'fenced' | 'not-ready' | 'read-only' | 'stale-copy';
+export type WsWriteResult = 'accepted' | 'frozen-window' | 'refusing' | 'fenced' | 'not-ready';
 export type WsReadResult =
   | { status: 'ready'; value: unknown | undefined }   // undefined = absent or tombstoned
   | { status: 'not-ready' };
@@ -39,18 +39,14 @@ export interface WsTicket {
  * drain). Module code never catches it by contract; the dispatch wrappers do
  * and surface the cause.
  */
-export type DataUnavailableCause = 'database-unreachable' | 'database-backlog' | 'guild-fenced' | 'database-read-only' | 'database-stale-copy' | 'node-stopping' | 'storage-failing';
+export type DataUnavailableCause = 'database-unreachable' | 'database-backlog' | 'guild-fenced' | 'node-stopping' | 'storage-failing';
 
 export class DataBackendUnavailableError extends Error {
   constructor(readonly causeKey: DataUnavailableCause, detail?: string) {
     super(detail ?? (causeKey === 'guild-fenced'
-      ? '[Data] This guild was taken over by another node; the write was not saved'
-      : causeKey === 'database-stale-copy'
-        ? '[Data] The database serving this node is an outdated copy of the fleet database (its control row holds an older term); the write was not saved'
-      : causeKey === 'database-read-only'
-        ? '[Data] The database serving this node is a copy in recovery and accepts no writes (SQLSTATE 25006); the write was not saved'
-        : causeKey === 'node-stopping'
-          ? '[Data] This process is stopping and its exit drain has closed; the write was not saved'
+      ? '[Data] Another bot process took over this guild; the write was not saved'
+      : causeKey === 'node-stopping'
+        ? '[Data] This process is stopping and its exit drain has closed; the write was not saved'
         : causeKey === 'storage-failing'
           ? '[Data] Disk writes have been failing too long or too much is held in memory; the write was not saved'
           : causeKey === 'database-backlog'
@@ -103,22 +99,11 @@ class GuildWorkingSet {
   requeue = false;
   fencedDrainTimer: NodeJS.Timeout | null = null;
   readyWaiters: ReadyWaiter[] = [];
-  // A drain froze it while it hydrated: it comes up frozen-retained.
-  freezeWhenReady = false;
   // Stamped at every accepted save, append and delete. landedSeq is the stamp
   // a committed batch was built at: every write at or below it landed, or a
   // later write of its document did.
   writeSeq = 0;
   landedSeq = 0;
-  // exportDirty carried its unflushed writes off: its later commits and its fence vouch for none of them.
-  exported = false;
-  // The seq the batch on the wire was built at, 0 while none is (a reclaim holds flushInFlight with no batch): an
-  // export carries none of its documents.
-  wireSeq = 0;
-  // Carries a recycle applied here, each stamped as a write: one lands once a batch built after its stamp commits.
-  carried: { fate: CarryFate; seq: number }[] = [];
-  // What each export took off: the carry holding this set's writes from one seq to another.
-  carriedOut: { fate: CarryFate; from: number; to: number }[] = [];
 
   constructor(readonly guildId: string, public fence: FenceToken) {}
 
@@ -135,65 +120,6 @@ function docKeyOf(module: string, filename: string): string {
 function splitDocKey(key: string): DocKey {
   const idx = key.indexOf('/');
   return { module: key.slice(0, idx), filename: key.slice(idx + 1) };
-}
-
-/**
- * Where one recycle's carry of a guild's unflushed writes went: carried (exported, and no successor holds it yet),
- * kept (a successor holds it and may still land it), landed (a batch built after it committed on the live set
- * holding it) or dropped (no one keeps it any more, so whether it landed is unknown). One kept for a copy that takes
- * no writes yet reads dropped while the copy takes writes; a prune in that time drops it for good. A later recycle
- * that carries it on forwards it: its outcome is then the outcome of the carry it went into.
- */
-export class CarryFate implements CarryOutcome {
-  private state: 'carried' | 'kept' | 'landed' | 'dropped' = 'carried';
-  private next: CarryFate | null = null;
-  private stale: (() => boolean) | null = null;
-
-  outcome(): 'carried' | 'kept' | 'landed' | 'dropped' {
-    let fate: CarryFate = this;
-    while (fate.next) fate = fate.next;
-    return fate.stale?.() ? 'dropped' : fate.state;
-  }
-
-  /**
-   * Kept by a successor; stale, while it waits for the guild to hydrate there, says when its copy took writes. The
-   * apply holds it again without one, before it can land.
-   */
-  hold(stale: (() => boolean) | null = null): void {
-    if (!this.open()) return;
-    this.state = 'kept';
-    this.stale = stale;
-  }
-
-  settle(state: 'landed' | 'dropped'): void {
-    if (this.open()) this.state = state;
-  }
-
-  forward(to: CarryFate): void {
-    if (this.open()) this.next = to;
-  }
-
-  private open(): boolean {
-    return this.next === null && (this.state === 'carried' || this.state === 'kept');
-  }
-}
-
-/** The carry an export took the set's writes from one seq to another off in, or null when none holds them all. */
-function carriedIn(ws: GuildWorkingSet, from: number, to: number): CarryFate | null {
-  return ws.carriedOut.find(out => out.from <= from && to <= out.to)?.fate ?? null;
-}
-
-/** The carry a recycle took a write off in (with its set's writes from from on), or null: confirmWrite's successor check. */
-export function carryOf(ticket: WsTicket, from = ticket.seq): CarryFate | null {
-  return carriedIn(ticket.set, from, ticket.seq);
-}
-
-/** Unflushed writes leaving one manager for another at a recycle (exportDirty / adoptDirty). */
-export interface DirtyCarry {
-  guildId: string;
-  docs: { key: string; content: string; tombstone: boolean; dirtySince: number }[];
-  appends: { key: string; chunk: string; dirtySince: number }[];
-  fate: CarryFate;
 }
 
 export interface BackendHealth {
@@ -222,12 +148,7 @@ export class WorkingSetManager {
   private health: BackendHealth['state'] = 'healthy';
   private lastError: string | null = null;
   private retryTimer: NodeJS.Timeout | null = null;
-  private quiesced = false;
   private retryAttempt = 0;
-  // A carry is bound to the read-only store it was adopted for: once that store
-  // has taken writes, another node may have written newer data, so a carry not
-  // yet applied is dropped rather than flushed over it.
-  private readonly adoptions = new Map<string, { carry: DirtyCarry; store: DataBackend }>();
   private readonly hydrations = new Map<string, HydrationInFlight>();
   // Those waiting on a set evicted before it went ready, until the next set read for the guild takes them on.
   private readonly parkedWaiters = new Map<string, ReadyWaiter[]>();
@@ -238,169 +159,15 @@ export class WorkingSetManager {
   private fencedFlushRejections = 0;
   private landed = 0;
 
-  constructor(private backend: DataBackend) {}
+  constructor(private readonly backend: DataBackend) {}
 
   /**
-   * Runtime recycle on a delivered URL change: dirty guilds are re-flushed into
-   * the NEW database (a transfer fences the old primary read-only, so writes
-   * accepted during the switch exist only in this working set).
-   */
-  retargetBackend(backend: DataBackend): void {
-    this.backend = backend;
-  }
-
-  /**
-   * Recycle handover: this manager has been replaced and must never write
-   * again. Its successor holds the SAME fence token (same node, same lease), so
-   * the database physically cannot arbitrate between the two - a surviving
-   * debounce or retry timer here would commit stale content over the live
-   * working set's rows and no fence would report it. Every timer is cleared and
-   * every later flush is a no-op.
-   */
-  quiesce(): void {
-    this.quiesced = true;
-    if (this.retryTimer) { clearTimeout(this.retryTimer); this.retryTimer = null; }
-    // Nothing here hydrates or flushes again, so no one keeps a carry held here any more: one applied may still land
-    // with a batch on the wire, which no one can tell.
-    for (const { carry } of this.adoptions.values()) carry.fate.settle('dropped');
-    for (const ws of this.sets.values()) {
-      ws.clearTimers();
-      for (const applied of ws.carried) applied.fate.settle('dropped');
-      ws.carried = [];
-      setLeft(ws, (from, to) => carriedIn(ws, from, to));
-    }
-  }
-
-  /**
-   * Guilds holding unflushed writes right now (recycle drain accounting). A
-   * flush already on the wire counts: it emptied its dirty set before awaiting,
-   * so it would otherwise read as clean and be dropped on the floor.
+   * Guilds holding unflushed writes right now (exit drain accounting). A flush
+   * already on the wire counts: it emptied its dirty set before awaiting, so it
+   * would otherwise read as clean.
    */
   dirtyGuildIds(): string[] {
-    this.pruneAdoptions();
-    const ids = new Set([...this.sets.values()].filter(ws => ws.dirtyKeys.size > 0 || ws.flushInFlight).map(ws => ws.guildId));
-    for (const id of this.adoptions.keys()) ids.add(id);
-    return [...ids];
-  }
-
-  private pruneAdoptions(): void {
-    const stale = [...this.adoptions].filter(([, a]) => !a.store.isReadOnly()).map(([id]) => id);
-    if (stale.length === 0) return;
-    for (const id of stale) {
-      this.adoptions.get(id)!.carry.fate.settle('dropped');
-      this.adoptions.delete(id);
-    }
-    console.error(`[Data] Carried writes for ${stale.length} guild(s) DROPPED: the copy took writes before this node hydrated them, so they could overwrite newer data: ${stale.join(', ')}`);
-  }
-
-  /**
-   * Recycle onto a store that takes no writes yet (a stand-in's copy in
-   * recovery): the writes this manager could not drain leave with the caller
-   * instead of being dropped, and its accounting forgets them (B7-F26).
-   */
-  exportDirty(guildIds: string[]): DirtyCarry[] {
-    this.pruneAdoptions();
-    const out: DirtyCarry[] = [];
-    for (const guildId of guildIds) {
-      const fate = new CarryFate();
-      const pending = this.adoptions.get(guildId)?.carry;
-      const docs = pending ? [...pending.docs] : [];
-      const appends = pending ? [...pending.appends] : [];
-      const forwarded = pending ? [pending.fate] : [];
-      const ws = this.sets.get(guildId);
-      if (ws) {
-        for (const key of ws.dirtyKeys) {
-          const doc = ws.docs.get(key);
-          if (doc?.dirty) docs.push({ key, content: doc.content, tombstone: doc.tombstone, dirtySince: doc.dirtySince });
-        }
-        // A buffer leaves whole, the start a batch on the wire holds too: once if that batch fails, twice if it
-        // commits (open_items.md, "A recycle's batch on the wire").
-        for (const [key, buf] of ws.appendBuf) {
-          if (buf.chunk.length > 0) appends.push({ key, chunk: buf.chunk, dirtySince: buf.dirtySince });
-        }
-        // The batch on the wire may land from here or not at all, so no carry answers for its writes or for a carry
-        // applied here before it was built, and none holds its documents. Every write after it is dirty (an absent
-        // delete answers by the delete it found), and leaves in this one.
-        const wire = ws.flushInFlight ? ws.wireSeq : 0;
-        for (const applied of ws.carried) {
-          if (applied.seq > wire) forwarded.push(applied.fate);
-          else applied.fate.settle('dropped');
-        }
-        ws.carried = [];
-        const from = Math.max(wire, ws.carriedOut[ws.carriedOut.length - 1]?.to ?? 0) + 1;
-        if (from <= ws.writeSeq) ws.carriedOut.push({ fate, from, to: ws.writeSeq });
-        this.forgetDirty(ws);
-        ws.exported = true;
-      }
-      this.adoptions.delete(guildId);
-      if (docs.length > 0 || appends.length > 0) {
-        for (const earlier of forwarded) earlier.forward(fate);
-        out.push({ guildId, docs, appends, fate });
-      } else {
-        for (const earlier of forwarded) earlier.settle('dropped');
-        fate.settle('dropped');
-      }
-    }
-    return out;
-  }
-
-  /** The other side of exportDirty: applied over the store's older content once the guild hydrates here. */
-  adoptDirty(carries: DirtyCarry[]): void {
-    const store = this.backend;
-    for (const carry of carries) {
-      // A quiesced manager never hydrates or flushes again, so a carry cannot land here. One waiting for the guild
-      // to hydrate reads dropped while this copy takes writes; a prune in that time drops it for good.
-      if (this.quiesced) carry.fate.settle('dropped');
-      else carry.fate.hold(() => !store.isReadOnly());
-      const ws = this.sets.get(carry.guildId);
-      if (ws && ws.state === 'ready') this.applyCarry(ws, carry);
-      else this.adoptions.set(carry.guildId, { carry, store: this.backend });
-    }
-  }
-
-  // The acceptance window restarts at the adoption: it measures how long writes
-  // have waited on THIS runtime, and the carried age would close the window the
-  // moment the copy takes writes.
-  private applyCarry(ws: GuildWorkingSet, carry: DirtyCarry): void {
-    const now = Date.now();
-    // Applied, it lands with a batch built after its stamp, whatever the copy does from now on.
-    carry.fate.hold();
-    ws.writeSeq += 1;
-    ws.carried.push({ fate: carry.fate, seq: ws.writeSeq });
-    for (const doc of carry.docs) {
-      // A write accepted here since is newer: marked dirty again, so a batch built after the stamp holds it.
-      if (ws.docs.get(doc.key)?.dirty) {
-        this.markDirty(ws, doc.key, now);
-        continue;
-      }
-      ws.docs.set(doc.key, { content: doc.content, tombstone: doc.tombstone, dirty: true, dirtySince: now, sinceBatch: now, seq: ws.writeSeq });
-      this.markDirty(ws, doc.key, now);
-    }
-    for (const append of carry.appends) {
-      const buf = ws.appendBuf.get(append.key);
-      // Ahead of the appends taken here since, but behind the start a batch on the wire holds, which its commit slices.
-      if (buf) {
-        buf.chunk = buf.chunk.slice(0, buf.sent) + append.chunk + buf.chunk.slice(buf.sent);
-        buf.bytes += Buffer.byteLength(append.chunk);
-        buf.dirtySince ||= now;
-        buf.sinceBatch ||= now;
-      } else ws.appendBuf.set(append.key, { chunk: append.chunk, dirtySince: now, sinceBatch: now, sent: 0, bytes: Buffer.byteLength(append.chunk) });
-      ws.appendKeys.add(append.key);
-      this.markDirty(ws, append.key, now);
-    }
-  }
-
-  /** Bounded wait for in-flight flushes to come back, so their keys are visible again. */
-  async settleInFlight(deadlineMs: number): Promise<void> {
-    const deadline = Date.now() + deadlineMs;
-    while (Date.now() < deadline && [...this.sets.values()].some(ws => ws.flushInFlight)) {
-      await new Promise<void>(resolve => { setTimeout(resolve, 100).unref?.(); });
-    }
-  }
-
-  /** Fenced-flush rejections so far; a drain that raises this DISCARDED writes. */
-  fencedRejectionCount(): number {
-    return this.fencedFlushRejections;
+    return [...this.sets.values()].filter(ws => ws.dirtyKeys.size > 0 || ws.flushInFlight).map(ws => ws.guildId);
   }
 
   // --------------------------------------------------------------------------
@@ -413,11 +180,6 @@ export class WorkingSetManager {
 
   stateOf(guildId: string): WsState | null {
     return this.sets.get(guildId)?.state ?? null;
-  }
-
-  /** Every guild with a working set here, in any state. */
-  guildIds(): string[] {
-    return [...this.sets.keys()];
   }
 
   readyGuilds(): string[] {
@@ -437,7 +199,7 @@ export class WorkingSetManager {
    */
   hydrate(guildId: string, token: FenceToken): Promise<HydrateOutcome> {
     // One store hydration per set: a second call joins it, or under another grant runs once it ends, so no read of
-    // the store lands over the writes, carries and freezes made since the first one ended. A set that replaced the
+    // the store lands over the writes and freezes made since the first one ended. A set that replaced the
     // one on the wire is hydrated by its own call; the call on the wire leaves it alone.
     const running = this.hydrations.get(guildId);
     if (running && running.set === this.sets.get(guildId)) {
@@ -453,10 +215,9 @@ export class WorkingSetManager {
 
   private async hydrateSet(guildId: string, token: FenceToken, sending: (ws: GuildWorkingSet) => void): Promise<HydrateOutcome> {
     let ws = this.sets.get(guildId);
-    // A set kept since its lease left is current only while no other node
-    // has claimed the guild since (an aborted move hands the shard straight
-    // back): re-stamped for the new grant, or dropped and read again. No
-    // flush of its old writes starts meanwhile.
+    // A set kept since its lease left is current only while no other bot
+    // process has claimed the guild since: re-stamped for the new grant, or dropped
+    // and read again. No flush of its old writes starts meanwhile.
     if (ws?.state === 'frozen-retained') {
       if (ws.flushInFlight) return 'unavailable';
       const retained = ws;
@@ -475,7 +236,7 @@ export class WorkingSetManager {
       if (reclaim === null || ws !== retained) return 'unavailable';
       if (reclaim === 'lost' && ws === retained) {
         if (retained.dirtyKeys.size > 0) {
-          console.warn(`[Data] Guild ${guildId}: ${retained.dirtyKeys.size} unflushed write(s) kept since its lease left are dropped, as another node has owned it since; it is read again from the store`);
+          console.warn(`[Data] Guild ${guildId}: ${retained.dirtyKeys.size} unflushed write(s) kept since its lease left are dropped: another bot process took over the guild since; it is read again from the store`);
         }
         this.evict(guildId);
         ws = undefined;
@@ -496,8 +257,6 @@ export class WorkingSetManager {
       this.sets.set(guildId, ws);
       ws.readyWaiters.push(...this.takeParked(guildId));
     }
-    // A new grant serves it, whatever froze it under the one before.
-    if (ws.fence.term !== token.term || ws.fence.epoch !== token.epoch) ws.freezeWhenReady = false;
     ws.fence = token;
     sending(ws);
     const outcome = await this.backend.hydrateGuild(guildId, token);
@@ -525,13 +284,7 @@ export class WorkingSetManager {
     for (const key of outcome.appendKeys) {
       ws.appendKeys.add(docKeyOf(key.module, key.filename));
     }
-    ws.state = ws.freezeWhenReady ? 'frozen-retained' : 'ready';
-    this.pruneAdoptions();
-    const adoption = this.adoptions.get(guildId);
-    if (adoption) {
-      this.adoptions.delete(guildId);
-      this.applyCarry(ws, adoption.carry);
-    }
+    ws.state = 'ready';
     for (const wake of ws.readyWaiters.splice(0)) wake('ready');
     return 'ready';
   }
@@ -574,7 +327,7 @@ export class WorkingSetManager {
   /**
    * Lease removed: one final immediate flush under the OLD fence, then the set
    * enters frozen-retained (reads keep serving, writes get the frozen
-   * rejection). Eviction happens at migration source-cleanup or drain end.
+   * rejection).
    */
   async unloadToFrozenRetained(guildId: string, stillGone: () => boolean = () => true): Promise<void> {
     const ws = this.sets.get(guildId);
@@ -590,31 +343,16 @@ export class WorkingSetManager {
     return ws?.state === 'frozen-retained' && (ws.fence.term !== token.term || ws.fence.epoch !== token.epoch);
   }
 
-  /** Refuse the guild's writes from now on, as its lease's unload leaves it; a re-grant serves it again. */
-  freezeRetained(guildId: string): void {
-    const ws = this.sets.get(guildId);
-    if (ws?.state === 'ready') ws.state = 'frozen-retained';
-    else if (ws?.state === 'hydrating') ws.freezeWhenReady = true;
-  }
-
-  /** A hydrating set that freezeRetained marked: it becomes frozen-retained, not ready, when its hydration ends. */
-  freezesWhenReady(guildId: string): boolean {
-    const ws = this.sets.get(guildId);
-    return ws?.state === 'hydrating' && ws.freezeWhenReady;
-  }
-
   evict(guildId: string): void {
     const ws = this.sets.get(guildId);
     if (!ws) return;
     ws.clearTimers();
     this.forgetDirty(ws);
-    for (const applied of ws.carried) applied.fate.settle('dropped');
-    ws.carried = [];
     this.sets.delete(guildId);
     // Its waiters wait on the next set read for the guild; until then its read's answer, a declined claim or their
     // timer answers them.
     if (ws.readyWaiters.length > 0) this.parkedWaiters.set(guildId, [...this.takeParked(guildId), ...ws.readyWaiters.splice(0)]);
-    setLeft(ws, (from, to) => carriedIn(ws, from, to));
+    setLeft(ws);
   }
 
   /**
@@ -739,8 +477,8 @@ export class WorkingSetManager {
   /**
    * For a delete that found the document already deleted: a ticket at that
    * earlier delete, else null. A served set drops a tombstone once it commits,
-   * unless its key was marked dirty again during that flight (a carry applied
-   * over it): that ticket is then landed, and answers 'ok'.
+   * unless the document was written and deleted again during that flight: the
+   * ticket then names that later delete.
    */
   unlandedDeleteTicket(guildId: string, module: string, filename: string): WsTicket | null {
     const doc = this.sets.get(guildId)?.docs.get(docKeyOf(module, filename));
@@ -795,8 +533,6 @@ export class WorkingSetManager {
     }
     if (ws.state === 'frozen-retained') return 'frozen-window';
     if (ws.state === 'fenced') return 'fenced';
-    if (this.backend.isStaleCopy?.()) return 'stale-copy';
-    if (this.backend.isReadOnly()) return 'read-only';
     // What held it closed may have left with no flush landing (a deposed or evicted set).
     this.reopenIfDrained();
     if (this.health === 'refusing') return 'refusing';
@@ -845,7 +581,6 @@ export class WorkingSetManager {
 
   /** True once this call's batch committed. */
   private async flush(ws: GuildWorkingSet): Promise<boolean> {
-    if (this.quiesced) return false;
     if (ws.flushInFlight) { ws.requeue = true; return false; }
     if (ws.debounceTimer) { clearTimeout(ws.debounceTimer); ws.debounceTimer = null; }
     if (ws.dirtyKeys.size === 0) { ws.windowOpenedAt = null; return false; }
@@ -855,23 +590,16 @@ export class WorkingSetManager {
     ws.flightKeys = new Set(flushedKeys);
     ws.windowOpenedAt = null;
     ws.flushInFlight = true;
-    ws.wireSeq = seq;
     const outcome = await this.backend.flushGuild(ws.guildId, batch, ws.fence);
     ws.flushInFlight = false;
     ws.flightKeys = new Set();
-    ws.wireSeq = 0;
     // A refused batch holds no buffer's start any more: the next one sends each whole.
     if (!outcome.ok) for (const buf of sentBufs.values()) buf.sent = 0;
 
     if (outcome.ok) {
-      // An evicted, replaced, exported or recycled set dropped or carried off
-      // its unflushed writes, so what it commits after that vouches for none.
-      if (!this.leftHere(ws)) {
-        ws.landedSeq = seq;
-        // A carry applied before this batch was built rode in it.
-        for (const applied of ws.carried) if (applied.seq <= seq) applied.fate.settle('landed');
-        ws.carried = ws.carried.filter(applied => applied.seq > seq);
-      }
+      // An evicted or replaced set dropped its unflushed writes, so what it
+      // commits after that vouches for none.
+      if (!this.leftHere(ws)) ws.landedSeq = seq;
       for (const key of flushedKeys) {
         const doc = ws.docs.get(key);
         // What it holds unstored now is what was written since the build.
@@ -903,17 +631,6 @@ export class WorkingSetManager {
       this.onDeposed(ws, outcome.currentOwner);
       return false;
     }
-    if (outcome.reason === 'read-only') {
-      // Accepted before the copy showed itself read-only: kept dirty for the
-      // retry without degrading acceptance (the gate refuses new writes).
-      for (const key of flushedKeys) ws.dirtyKeys.add(key);
-      ws.requeue = false;
-      this.lastError = (this.backend as { isUnproven?: () => boolean }).isUnproven?.() === true
-        ? 'flush held: the database is not yet proven to hold its master\'s term'
-        : 'flush refused: the database is read-only (SQLSTATE 25006)';
-      this.scheduleRetry();
-      return false;
-    }
     // unavailable: everything stays dirty; merge back and retry under backoff.
     for (const key of flushedKeys) ws.dirtyKeys.add(key);
     ws.requeue = false;
@@ -929,8 +646,6 @@ export class WorkingSetManager {
     // Drop dirty accounting; the flush is never retried (a deposed node's
     // leftover writes are never merged later - that would be a second writer).
     this.forgetDirty(ws);
-    for (const applied of ws.carried) applied.fate.settle('dropped');
-    ws.carried = [];
     ws.state = 'fenced';
     ws.clearTimers();
     ws.fencedDrainTimer = setTimeout(() => {
@@ -945,9 +660,9 @@ export class WorkingSetManager {
     ws.windowOpenedAt = null;
   }
 
-  /** The set answers for its writes here no more: its manager quiesced, it was evicted or replaced, or a recycle exported it. */
+  /** The set answers for its writes here no more: it was evicted or replaced. */
   private leftHere(ws: GuildWorkingSet): boolean {
-    return this.quiesced || this.sets.get(ws.guildId) !== ws || ws.exported;
+    return this.sets.get(ws.guildId) !== ws;
   }
 
   /**
@@ -957,23 +672,11 @@ export class WorkingSetManager {
    * waited for: its writes are durable only once it settles.
    */
   async flushGuildNow(guildId: string, deadlineMs: number): Promise<FlushNowOutcome> {
-    // A quiesced manager flushes nothing again; what it held may have left in a recycle's carry.
-    if (this.quiesced) return 'unavailable';
-    // Writes carried in from a recycle wait here for the guild to hydrate, while the copy takes no writes. Once it
-    // takes writes they are dropped (pruneAdoptions), and whether they were stored is unknown.
-    const adoption = this.adoptions.get(guildId);
-    if (adoption) {
-      if (adoption.store.isReadOnly()) return 'pending';
-      this.pruneAdoptions();
-      return 'unavailable';
-    }
     const ws = this.sets.get(guildId);
     if (!ws) return 'ok';
     const deadline = Date.now() + deadlineMs;
     for (;;) {
-      // Fenced after an export, the set answers for none of its writes: they left in a carry or on the wire.
-      if (ws.state === 'fenced' && !ws.exported) return 'deposed';
-      // A recycle may have carried the writes off to its read-only copy.
+      if (ws.state === 'fenced') return 'deposed';
       if (this.leftHere(ws)) return 'unavailable';
       const left = deadline - Date.now();
       if (ws.flushInFlight) {
@@ -988,12 +691,12 @@ export class WorkingSetManager {
         t.unref();
       });
       const committed = await Promise.race([this.flush(ws), timeout]);
-      // Once the set left here, its flush's commit, timeout or refusal vouches for none of its writes; fenced with no
-      // export, it still answers deposed, as no carry holds them.
+      // Once the set left here, its flush's commit, timeout or refusal vouches for none of its writes; fenced, it
+      // still answers deposed.
       if (committed === 'timeout') return this.leftHere(ws) ? 'unavailable' : 'pending';
       if (committed) return this.leftHere(ws) ? 'unavailable' : 'ok';
-      if ((ws.state as WsState) === 'fenced' && !ws.exported) return 'deposed';
-      // Refused by the store (unreachable, read-only): kept dirty and retried.
+      if ((ws.state as WsState) === 'fenced') return 'deposed';
+      // Refused by the store (unreachable): kept dirty and retried.
       return this.leftHere(ws) ? 'unavailable' : 'held';
     }
   }
@@ -1002,20 +705,16 @@ export class WorkingSetManager {
    * flushGuildNow for one accepted write: 'ok' once a batch its set built at
    * or after it committed (so a later write of the same document landing
    * counts), 'held' when the store refused the commit, 'pending' at the
-   * deadline, 'deposed' once its set is fenced with no export. Only the set
-   * that took the write answers for it: evicted, replaced, exported or
-   * recycled away before it landed, it is 'unavailable' (exported, whatever
-   * its batch on the wire answers later; not exported, 'deposed' once that
-   * batch comes back deposed, since no carry holds its writes).
+   * deadline, 'deposed' once its set is fenced. Only the set that took the
+   * write answers for it: evicted or replaced before it landed, it is
+   * 'unavailable' ('deposed' once its batch on the wire comes back deposed).
    */
   async confirm(ticket: WsTicket, deadlineMs: number): Promise<FlushNowOutcome> {
     const ws = ticket.set;
     const deadline = performance.now() + deadlineMs;
     for (;;) {
       if (ws.landedSeq >= ticket.seq) return 'ok';
-      // Fenced after an export, the set answers for no write: a carry may hold it (an append's whole buffer, a
-      // document's later version), so confirmFrom asks the carry.
-      if (ws.state === 'fenced' && !ws.exported) return 'deposed';
+      if (ws.state === 'fenced') return 'deposed';
       if (this.leftHere(ws)) return 'unavailable';
       // Neither dirty nor on the wire: it left the set without landing.
       if (!ws.flushInFlight && ws.dirtyKeys.size === 0) return 'unavailable';
@@ -1033,47 +732,22 @@ export class WorkingSetManager {
       });
       const committed = await Promise.race([this.flush(ws), timeout]);
       clearTimeout(timer);
-      // Once the set left here, its flush's commit, timeout or refusal vouches for none of its writes; fenced with no
-      // export, it still answers deposed, as no carry holds them.
+      // Once the set left here, its flush's commit, timeout or refusal vouches for none of its writes; fenced, it
+      // still answers deposed.
       if (committed === 'timeout') return this.leftHere(ws) ? 'unavailable' : 'pending';
       // Its batch was built after the write, so it carried it, unless the set left meanwhile.
       if (committed) return ws.landedSeq >= ticket.seq ? 'ok' : 'unavailable';
-      if ((ws.state as WsState) === 'fenced' && !ws.exported) return 'deposed';
-      // Refused by the store (unreachable, read-only): kept dirty and retried.
+      if ((ws.state as WsState) === 'fenced') return 'deposed';
+      // Refused by the store (unreachable): kept dirty and retried.
       return this.leftHere(ws) ? 'unavailable' : 'held';
     }
-  }
-
-  /** The guild's set here, or null: the set flushGuildNow answers for, which it reads before its first await. */
-  setOf(guildId: string): GuildWorkingSet | null {
-    return this.sets.get(guildId) ?? null;
-  }
-
-  /**
-   * The carries holding every write a set has not landed, or null when one is in none (in the batch on the wire at an
-   * export, or made after the last): flushGuildOutcome's successor check, asked of the set its flush answered for, as
-   * a set that replaced it holds none of its writes.
-   */
-  setCarries(ws: GuildWorkingSet): CarryFate[] | null {
-    let next = ws.landedSeq + 1;
-    const fates: CarryFate[] = [];
-    for (const out of ws.carriedOut) {
-      if (out.to < next) continue;
-      if (out.from > next) return null;
-      fates.push(out.fate);
-      next = out.to + 1;
-    }
-    return fates.length > 0 && next > ws.writeSeq ? fates : null;
   }
 
   /** Flush every dirty guild (shutdown drain; the caller bounds it). */
   async flushAllDirty(): Promise<string[]> {
     const dirty = [...this.sets.values()].filter(ws => ws.dirtyKeys.size > 0);
     await Promise.all(dirty.map(ws => this.flush(ws)));
-    const left = [...this.sets.values()].filter(ws => ws.dirtyKeys.size > 0).map(ws => ws.guildId);
-    this.pruneAdoptions();
-    for (const id of this.adoptions.keys()) if (!left.includes(id)) left.push(id);
-    return left;
+    return [...this.sets.values()].filter(ws => ws.dirtyKeys.size > 0).map(ws => ws.guildId);
   }
 
   /** No guild holds a dirty write or a flush on the wire (the exit drain's test). */
@@ -1160,7 +834,7 @@ export class WorkingSetManager {
   }
 
   private scheduleRetry(): void {
-    if (this.quiesced || this.retryTimer) return;
+    if (this.retryTimer) return;
     const wait = Math.min(RETRY_CAP_MS, RETRY_BASE_MS * 2 ** this.retryAttempt) * (0.5 + Math.random() * 0.5);
     this.retryAttempt += 1;
     this.retryTimer = setTimeout(() => {

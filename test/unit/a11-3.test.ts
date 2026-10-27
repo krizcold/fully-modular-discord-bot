@@ -10,8 +10,6 @@ const h = vi.hoisted(() => ({
 vi.mock('../../src/utils/envLoader', async importOriginal => ({
   ...(await importOriginal<object>()),
   loadCredentials: () => h.creds,
-  upsertCredentials: () => ({ success: true }),
-  setFleetDataBackend: () => {},
 }));
 
 vi.mock('../../src/bot/internalSetup/utils/dataBackends/recognitionGuard', async importOriginal => ({
@@ -34,13 +32,13 @@ vi.mock('../../src/bot/internalSetup/utils/dataBackends/postgresBackend', async 
 
 vi.mock('../../src/bot/internalSetup/utils/dataBackends/workingSet', async importOriginal => ({
   ...(await importOriginal<object>()),
-  initWorkingSet: () => ({ quiesce() {} }),
+  initWorkingSet: () => ({}),
   getWorkingSet: () => null,
 }));
 
 vi.mock('../../src/bot/internalSetup/utils/dataBackends/dataReadiness', async importOriginal => ({
   ...(await importOriginal<object>()),
-  initDataReadiness: () => ({ hold: () => true, release() {}, stop() {} }),
+  initDataReadiness: () => ({ release() {}, stop() {} }),
   getDataReadiness: () => null,
 }));
 
@@ -63,38 +61,5 @@ describe('data boot status texts', () => {
     const s = boot.getDataBootStatus();
     expect(s.state).toBe('refused');
     expect(s.mode).toBe('postgres');
-  });
-
-  it('drops the refusal reason once the data layer leaves refused', async () => {
-    h.verdict = { state: 'boot', live: 'postgres' };
-    const boot = await load();
-    boot.initDataBackendLayer();
-    expect(boot.getDataBootStatus().refusalReason).toMatch(/DATA_BACKEND_URL/);
-    boot.ensureRuntimeWith('postgres://db.invalid:5432/x');
-    const s = boot.getDataBootStatus();
-    expect(s.state).toBe('starting');
-    expect(s.refusalReason).toBeNull();
-  });
-
-  it('clears the transformation banner when a delivery rewrites the stale marker', async () => {
-    h.verdict = { state: 'transformation-required', live: 'file', configured: 'postgres' };
-    h.marker = { live: 'file', storeId: null, flippedAt: 1, transformationId: null };
-    const boot = await load();
-    boot.initDataBackendLayer();
-    expect(boot.getDataBootStatus().banner).toMatch(/transformation/);
-    await boot.applyDeliveredBackend({ backend: 'postgres', url: 'postgres://db.invalid:5432/x' }, { persist: false });
-    expect(h.written.some(m => m.live === 'postgres')).toBe(true);
-    expect(boot.getDataBootStatus().banner).toBeNull();
-  });
-
-  it('clears the banner when the delivery names the backend the marker already holds', async () => {
-    h.verdict = { state: 'transformation-required', live: 'postgres', configured: 'file' };
-    h.marker = { live: 'postgres', storeId: null, flippedAt: 1, transformationId: null };
-    const boot = await load();
-    boot.initDataBackendLayer();
-    expect(boot.getDataBootStatus().banner).toMatch(/transformation/);
-    await boot.applyDeliveredBackend({ backend: 'postgres', url: 'postgres://db.invalid:5432/x' }, { persist: false });
-    expect(h.written).toEqual([]);
-    expect(boot.getDataBootStatus().banner).toBeNull();
   });
 });

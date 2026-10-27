@@ -19,7 +19,6 @@ vi.mock('../../src/bot/internalSetup/utils/configManager', async (orig) => {
 });
 
 vi.mock('../../src/bot/internalSetup/utils/getLocalCommands', () => ({ default: () => [] }));
-vi.mock('../../src/bot/internalSetup/fleet/nodeIdentity', () => ({ resolveNodeRole: () => 'master' }));
 vi.mock('../../src/bot/internalSetup/utils/dataManager', async (orig) => ({
   ...(await orig<any>()),
   loadGlobalData: () => ({ guildId: h.lastTestGuild }),
@@ -174,7 +173,7 @@ function restCommands() {
   return { commands, deleted };
 }
 
-describe('registration works on a master that holds no shard (R34-J6)', () => {
+describe('registration works on a bot that holds no shard (R34-J6)', () => {
   beforeEach(() => { h.savedTestGuild.length = 0; h.lastTestGuild = 'g-old'; });
 
   it('cleans the old test guild through REST when it is not in the cache', async () => {

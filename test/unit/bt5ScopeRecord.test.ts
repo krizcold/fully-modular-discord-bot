@@ -9,7 +9,6 @@ import {
   saveMark,
   stampOf,
   setLeft,
-  firstSeqOf,
 } from '../../src/bot/internalSetup/utils/dataBackends/scopeRecord';
 import type { LedgerTicket } from '../../src/bot/internalSetup/utils/dataBackends/writeLedger';
 
@@ -25,8 +24,6 @@ const freshGuild = () => String(++guilds);
 
 const record = (): LandingRecord => ({ landed: 0 });
 const workingSet = (): WorkingSet => ({ landedSeq: 0 });
-/** A carry a later manager keeps: the fate a lost mark answers pending by. */
-const KEPT = { outcome: () => 'kept' as const };
 
 const fileTicket = (rec: LandingRecord, seq: number, guildId = '0', name = 'a.json') =>
   ({ kind: 'file', path: `/data/${guildId}/m/${name}`, seq, record: rec }) as unknown as LedgerTicket;
@@ -40,12 +37,12 @@ function note(scope: string, ticket: LedgerTicket): number {
 }
 
 /** A scope with one set noted and left unlanded, n times over; returns the lost marks' stamps in order. */
-function loseSets(scope: string, n: number, carried = false): number[] {
+function loseSets(scope: string, n: number): number[] {
   const stamps: number[] = [];
   for (let i = 0; i < n; i++) {
     const set = workingSet();
     stamps.push(note(scope, wsTicket(set, scope, 1)));
-    setLeft(set, carried ? () => KEPT : undefined);
+    setLeft(set);
   }
   return stamps;
 }
@@ -79,7 +76,7 @@ describe('the counter and its stamps', () => {
     const mark = saveMark().stamp;
     pendingFor(guildId, 0);
     setLeft(set);
-    setLeft(workingSet(), () => KEPT);
+    setLeft(workingSet());
     expect(saveMark().stamp).toBe(mark);
   });
 });
@@ -243,22 +240,14 @@ describe('an entry leaves once its write landed', () => {
 });
 
 describe('a set that leaves (setLeft)', () => {
-  it('turns an unlanded entry into a lost mark with its stamp, not carried, for an evict', () => {
+  it('turns an unlanded entry into a lost mark with its stamp, for an evict', () => {
     const guildId = freshGuild();
     const set = workingSet();
     const stamp = note(guildId, wsTicket(set, guildId, 1));
     setLeft(set);
-    expect(pendingFor(guildId, 0)).toEqual({ tickets: [], lost: [{ stamp, carry: null, deposed: false }], refused: [], pruned: false });
-    expect(pendingFor(guildId, stamp - 1).lost).toEqual([{ stamp, carry: null, deposed: false }]);
+    expect(pendingFor(guildId, 0)).toEqual({ tickets: [], lost: [{ stamp, deposed: false }], refused: [], pruned: false });
+    expect(pendingFor(guildId, stamp - 1).lost).toEqual([{ stamp, deposed: false }]);
     expect(pendingFor(guildId, stamp).lost).toEqual([]);
-  });
-
-  it('turns an unlanded entry into a carried lost mark for a quiesced manager', () => {
-    const guildId = freshGuild();
-    const set = workingSet();
-    const stamp = note(guildId, wsTicket(set, guildId, 1));
-    setLeft(set, () => KEPT);
-    expect(pendingFor(guildId, 0)).toEqual({ tickets: [], lost: [{ stamp, carry: KEPT, deposed: false }], refused: [], pruned: false });
   });
 
   it('marks the lost writes of a fenced set as deposed', () => {
@@ -266,7 +255,7 @@ describe('a set that leaves (setLeft)', () => {
     const set: WorkingSet = { landedSeq: 0, state: 'fenced' };
     const stamp = note(guildId, wsTicket(set, guildId, 1));
     setLeft(set);
-    expect(pendingFor(guildId, 0).lost).toEqual([{ stamp, carry: null, deposed: true }]);
+    expect(pendingFor(guildId, 0).lost).toEqual([{ stamp, deposed: true }]);
   });
 
   it('gives the lost mark the stamp of the latest write on the set', () => {
@@ -275,7 +264,7 @@ describe('a set that leaves (setLeft)', () => {
     note(guildId, wsTicket(set, guildId, 1));
     const latest = note(guildId, wsTicket(set, guildId, 2));
     setLeft(set);
-    expect(pendingFor(guildId, 0).lost).toEqual([{ stamp: latest, carry: null, deposed: false }]);
+    expect(pendingFor(guildId, 0).lost).toEqual([{ stamp: latest, deposed: false }]);
   });
 
   it('drops a landed entry and leaves no mark', () => {
@@ -285,10 +274,10 @@ describe('a set that leaves (setLeft)', () => {
     set.landedSeq = 2;
     setLeft(set);
     expect(pendingFor(guildId, 0)).toEqual({ tickets: [], lost: [], refused: [], pruned: false });
-    const quiesced = workingSet();
-    note(guildId, wsTicket(quiesced, guildId, 1));
-    quiesced.landedSeq = 1;
-    setLeft(quiesced, () => KEPT);
+    const second = workingSet();
+    note(guildId, wsTicket(second, guildId, 1));
+    second.landedSeq = 1;
+    setLeft(second);
     expect(pendingFor(guildId, 0)).toEqual({ tickets: [], lost: [], refused: [], pruned: false });
   });
 
@@ -298,60 +287,18 @@ describe('a set that leaves (setLeft)', () => {
     note(guildId, ticket);
     const before = pendingFor(guildId, 0);
     expect(() => setLeft(workingSet())).not.toThrow();
-    expect(() => setLeft({}, () => KEPT)).not.toThrow();
+    expect(() => setLeft({})).not.toThrow();
     expect(pendingFor(guildId, 0)).toEqual(before);
     expect(before.tickets).toEqual([ticket]);
-  });
-
-  it('asks the carry for every write of its entry, from the first to the latest (delta round 4)', () => {
-    const guildId = freshGuild();
-    const set = workingSet();
-    const first = wsTicket(set, guildId, 3);
-    note(guildId, first);
-    const latest = wsTicket(set, guildId, 5);
-    const stamp = note(guildId, latest);
-    expect(firstSeqOf(guildId, latest)).toBe(3);
-    expect(firstSeqOf(guildId, first)).toBe(3);
-    expect(firstSeqOf(freshGuild(), latest)).toBe(5);
-    const asked: Array<[number, number]> = [];
-    setLeft(set, (from, to) => { asked.push([from, to]); return KEPT; });
-    expect(asked).toEqual([[3, 5]]);
-    expect(pendingFor(guildId, 0).lost).toEqual([{ stamp, carry: KEPT, deposed: false }]);
-  });
-
-  it('notes no landed ticket: it neither lowers an entry\'s first seq nor stamps it again (delta round 6)', () => {
-    const guildId = freshGuild();
-    const set = workingSet();
-    set.landedSeq = 3;
-    const unlanded = wsTicket(set, guildId, 5);
-    const stamp = note(guildId, unlanded);
-    note(guildId, wsTicket(set, guildId, 2));
-    expect(firstSeqOf(guildId, unlanded)).toBe(5);
-    expect(pendingFor(guildId, stamp).tickets).toEqual([]);
-  });
-
-  it('asks the carry from the lowest seq noted: an absent delete takes its tombstone\'s own (delta round 5)', () => {
-    const guildId = freshGuild();
-    const set = workingSet();
-    const latest = wsTicket(set, guildId, 5);
-    note(guildId, latest);
-    const absent = wsTicket(set, guildId, 2);
-    const stamp = note(guildId, absent);
-    expect(firstSeqOf(guildId, absent)).toBe(2);
-    expect(pendingFor(guildId, 0).tickets).toEqual([latest]);
-    const asked: Array<[number, number]> = [];
-    setLeft(set, (from, to) => { asked.push([from, to]); return KEPT; });
-    expect(asked).toEqual([[2, 5]]);
-    expect(pendingFor(guildId, 0).lost).toEqual([{ stamp, carry: KEPT, deposed: false }]);
   });
 
   it('leaves one mark when the same set is reported twice', () => {
     const guildId = freshGuild();
     const set = workingSet();
     const stamp = note(guildId, wsTicket(set, guildId, 1));
-    setLeft(set, () => KEPT);
     setLeft(set);
-    expect(pendingFor(guildId, 0).lost).toEqual([{ stamp, carry: KEPT, deposed: false }]);
+    setLeft(set);
+    expect(pendingFor(guildId, 0).lost).toEqual([{ stamp, deposed: false }]);
   });
 
   it('keeps reporting a lost mark: reading it does not consume it', () => {
@@ -359,9 +306,9 @@ describe('a set that leaves (setLeft)', () => {
     const set = workingSet();
     const stamp = note(guildId, wsTicket(set, guildId, 1));
     setLeft(set);
-    expect(pendingFor(guildId, 0).lost).toEqual([{ stamp, carry: null, deposed: false }]);
+    expect(pendingFor(guildId, 0).lost).toEqual([{ stamp, deposed: false }]);
     note(guildId, fileTicket(record(), 1, guildId));
-    expect(pendingFor(guildId, 0).lost).toEqual([{ stamp, carry: null, deposed: false }]);
+    expect(pendingFor(guildId, 0).lost).toEqual([{ stamp, deposed: false }]);
   });
 
   it('a new set of the guild noted after the old one left is its own entry beside the lost mark', () => {
@@ -371,7 +318,7 @@ describe('a set that leaves (setLeft)', () => {
     setLeft(old);
     const fresh = wsTicket(workingSet(), guildId, 1);
     note(guildId, fresh);
-    expect(pendingFor(guildId, 0)).toEqual({ tickets: [fresh], lost: [{ stamp, carry: null, deposed: false }], refused: [], pruned: false });
+    expect(pendingFor(guildId, 0)).toEqual({ tickets: [fresh], lost: [{ stamp, deposed: false }], refused: [], pruned: false });
     expect(pendingFor(guildId, stamp)).toEqual({ tickets: [fresh], lost: [], refused: [], pruned: false });
   });
 });
@@ -460,10 +407,10 @@ describe('scopes are kept apart', () => {
     note('global', inGlobal);
     const set = workingSet();
     const lostStamp = note(b, wsTicket(set, b, 1));
-    setLeft(set, () => KEPT);
+    setLeft(set);
     expect(pendingFor(a, since)).toEqual({ tickets: [inA], lost: [], refused: [], pruned: false });
     expect(pendingFor('global', since)).toEqual({ tickets: [inGlobal], lost: [], refused: [], pruned: false });
-    expect(pendingFor(b, since)).toEqual({ tickets: [], lost: [{ stamp: lostStamp, carry: KEPT, deposed: false }], refused: [], pruned: false });
+    expect(pendingFor(b, since)).toEqual({ tickets: [], lost: [{ stamp: lostStamp, deposed: false }], refused: [], pruned: false });
   });
 
   it('a set that leaves turns only its own scope\'s entry into a lost mark', () => {
@@ -474,7 +421,7 @@ describe('scopes are kept apart', () => {
     const inB = wsTicket(workingSet(), b, 1);
     note(b, inB);
     setLeft(set);
-    expect(pendingFor(a, 0).lost).toEqual([{ stamp, carry: null, deposed: false }]);
+    expect(pendingFor(a, 0).lost).toEqual([{ stamp, deposed: false }]);
     expect(pendingFor(b, 0)).toEqual({ tickets: [inB], lost: [], refused: [], pruned: false });
   });
 });
@@ -482,7 +429,7 @@ describe('scopes are kept apart', () => {
 type Op =
   | { t: 'note'; scope: number; slot: number; step: number }
   | { t: 'land'; scope: number; slot: number; behind: number }
-  | { t: 'leave'; scope: number; slot: number; carried: boolean }
+  | { t: 'leave'; scope: number; slot: number }
   | { t: 'mark' }
   | { t: 'check'; scope: number; mark: number };
 
@@ -491,7 +438,7 @@ const slotIx = fc.integer({ min: 0, max: 3 });
 const op: fc.Arbitrary<Op> = fc.oneof(
   { arbitrary: fc.record({ t: fc.constant('note' as const), scope: scopeIx, slot: slotIx, step: fc.integer({ min: -1, max: 2 }) }), weight: 4 },
   { arbitrary: fc.record({ t: fc.constant('land' as const), scope: scopeIx, slot: slotIx, behind: fc.integer({ min: 0, max: 1 }) }), weight: 2 },
-  { arbitrary: fc.record({ t: fc.constant('leave' as const), scope: scopeIx, slot: slotIx, carried: fc.boolean() }), weight: 2 },
+  { arbitrary: fc.record({ t: fc.constant('leave' as const), scope: scopeIx, slot: slotIx }), weight: 2 },
   { arbitrary: fc.record({ t: fc.constant('mark' as const) }), weight: 1 },
   { arbitrary: fc.record({ t: fc.constant('check' as const), scope: scopeIx, mark: fc.nat() }), weight: 2 },
 );
@@ -509,7 +456,7 @@ describe('the scope record, over random runs', () => {
         const scopes = [freshGuild(), freshGuild()];
         const slots: Slot[][] = scopes.map(() => [0, 1, 2, 3].map(i => ({ key: i < 2 ? record() : workingSet(), ws: i >= 2, top: 0 })));
         const entries = scopes.map(() => new Map<object, { ticket: LedgerTicket; stamp: number }>());
-        const lost: Array<Array<{ stamp: number; carry: typeof KEPT | null; deposed: boolean }>> = scopes.map(() => []);
+        const lost: Array<Array<{ stamp: number; deposed: boolean }>> = scopes.map(() => []);
         const marks = [0, saveMark().stamp];
         const ids = new Map<LedgerTicket, number>();
         const isLanded = (ticket: LedgerTicket) =>
@@ -550,9 +497,9 @@ describe('the scope record, over random runs', () => {
           } else {
             const slot = slots[step.scope][2 + (step.slot % 2)];
             const entry = entries[step.scope].get(slot.key);
-            setLeft(slot.key, step.carried ? () => KEPT : undefined);
+            setLeft(slot.key);
             if (entry) {
-              if (!isLanded(entry.ticket)) lost[step.scope].push({ stamp: entry.stamp, carry: step.carried ? KEPT : null, deposed: false });
+              if (!isLanded(entry.ticket)) lost[step.scope].push({ stamp: entry.stamp, deposed: false });
               entries[step.scope].delete(slot.key);
             }
             slot.key = workingSet();

@@ -10,7 +10,6 @@ const h = vi.hoisted(() => (process.env.GUILD_ID = 'g1', {
 }));
 
 vi.mock('../../src/bot/internalSetup/utils/getLocalCommands', () => ({ default: () => h.local }));
-vi.mock('../../src/bot/internalSetup/fleet/nodeIdentity', () => ({ resolveNodeRole: () => 'master' }));
 vi.mock('../../src/bot/internalSetup/utils/dataManager', async (orig) => ({
   ...(await orig<any>()),
   loadGlobalData: () => ({ guildId: process.env.GUILD_ID }),
@@ -22,7 +21,6 @@ vi.mock('../../src/bot/internalSetup/utils/moduleEventManager', () => ({
 vi.mock('../../src/bot/internalSetup/utils/panelManager', () => ({
   getPanelManager: () => ({ getPanel: () => null, unregisterPanel: () => undefined }),
 }));
-vi.mock('../../src/webui/utils/syncNudge', () => ({ nudgeSync: () => undefined }));
 
 import { dataPath } from '../../src/utils/dataRoot';
 import registerCommands from '../../src/bot/internalSetup/events/clientReady/registerCommands';

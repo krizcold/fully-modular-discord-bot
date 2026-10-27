@@ -1,6 +1,5 @@
-// Node identity and role resolution. The nodeId is generated once and
-// persisted to /data/global/fleet/node.json so a node keeps its identity
-// across restarts (the registry keys on it).
+// Node identity. The nodeId is generated once and persisted to
+// /data/global/fleet/node.json so a node keeps its identity across restarts.
 
 import * as fs from 'fs';
 import * as path from 'path';
@@ -9,222 +8,12 @@ import { randomUUID } from 'crypto';
 import { dataPath } from '../../../utils/dataRoot';
 import { FLEET_DIR } from './constants';
 import { atomicWriteFileSync } from '../utils/atomicWrite';
-import type { NodeRole } from './protocol';
-
-/**
- * Role override (PLAN_STANDBY 3.3): written only by the promote/demote paths,
- * survives container recreate (data volume), wins over every env signal. The
- * takeover/chainTakeover flags are ONE-SHOT: consumed right after a successful
- * term acquisition so a later unrelated restart never re-triggers them.
- */
-export interface RoleOverride {
-  role: NodeRole;
-  /** Skip the boot takeover guard (explicit operator/policy intent). */
-  takeover?: boolean;
-  /** Promotion over a dead master: auto-Declare-Lost it after the hold-down. */
-  chainTakeover?: boolean;
-  /**
-   * The master this promote superseded with its DATABASE reported dead while
-   * its bot stayed up (20.12 c3): the one peer the boot fence lets answer at
-   * this node's own term under the staged takeover, because this node's
-   * higher beacon is what steps it down. One-shot like the flags above.
-   */
-  supersededStoreDead?: string;
-  /**
-   * The master a planned transfer moved the fleet off (B4f-4, file mode): it
-   * handed over and waits, deposed, for this boot's beacon, so it is the one
-   * peer the boot fence lets answer as live below this node's term. One-shot.
-   */
-  transferFrom?: string;
-  /**
-   * Boot as a TEMPORARY stand-in (20.5): serve from a database still in
-   * recovery, at the term already in the replayed row, and keep the backup
-   * identity throughout. Unlike the takeover flags this is NOT one-shot: it
-   * describes the role the node is currently holding, so it is cleared by the
-   * failback or a disarm rather than consumed at term acquisition.
-   */
-  standIn?: boolean;
-  setAt: number;
-  setBy: RoleOverrideSetBy;
-}
-
-// The union is DERIVED from this list, so a value the reader accepts and a value
-// the type allows cannot drift apart.
-const SET_BY_VALUES = [
-  'webui-promote', 'manager-promote', 'webui-demote', 'manager-demote', 'stepdown', 'stand-in', 'webui-seed',
-] as const;
-
-export type RoleOverrideSetBy = typeof SET_BY_VALUES[number];
-
-function toSetBy(value: unknown): RoleOverrideSetBy {
-  return (SET_BY_VALUES as readonly string[]).includes(value as string)
-    ? value as RoleOverrideSetBy
-    : 'webui-promote';
-}
-
-const ROLE_OVERRIDE_BASENAME = 'role-override.json';
-
-function roleOverrideFile(): string {
-  return dataPath('global', FLEET_DIR, ROLE_OVERRIDE_BASENAME);
-}
-
-let cachedOverride: RoleOverride | null | undefined;
-
-/** Cached per process: a role change always goes through a bot restart. */
-export function readRoleOverride(): RoleOverride | null {
-  if (cachedOverride !== undefined) return cachedOverride;
-  try {
-    const parsed = JSON.parse(fs.readFileSync(roleOverrideFile(), 'utf-8'));
-    if (parsed && (parsed.role === 'master' || parsed.role === 'co-worker')) {
-      cachedOverride = {
-        role: parsed.role,
-        ...(parsed.takeover === true ? { takeover: true } : {}),
-        ...(parsed.chainTakeover === true ? { chainTakeover: true } : {}),
-        ...(typeof parsed.supersededStoreDead === 'string' && parsed.supersededStoreDead !== '' ? { supersededStoreDead: parsed.supersededStoreDead } : {}),
-        ...(typeof parsed.transferFrom === 'string' && parsed.transferFrom !== '' ? { transferFrom: parsed.transferFrom } : {}),
-        ...(parsed.standIn === true ? { standIn: true } : {}),
-        setAt: Number(parsed.setAt) || 0,
-        setBy: toSetBy(parsed.setBy),
-      };
-      return cachedOverride;
-    }
-  } catch { /* absent or unreadable = no override */ }
-  cachedOverride = null;
-  return null;
-}
-
-/** Written by the webui parent (promote/demote). */
-export function writeRoleOverride(override: RoleOverride): void {
-  atomicWriteFileSync(roleOverrideFile(), JSON.stringify(override, null, 2));
-  cachedOverride = undefined;
-}
-
-export function clearRoleOverride(): void {
-  try { fs.unlinkSync(roleOverrideFile()); } catch { /* already absent */ }
-  cachedOverride = undefined;
-}
-
-/** One-shot consumption of the takeover flags after a successful term acquire; the role itself stays. */
-export function consumeTakeoverFlags(): void {
-  const override = readRoleOverride();
-  if (!override || (!override.takeover && !override.chainTakeover)) return;
-  // standIn is carried across deliberately: it is not a one-shot instruction but
-  // the description of the role this node is holding right now, and dropping it
-  // here would leave a serving stand-in indistinguishable from a true master on
-  // its very next boot.
-  writeRoleOverride({
-    role: override.role,
-    ...(override.standIn === true ? { standIn: true } : {}),
-    setAt: override.setAt,
-    setBy: override.setBy,
-  });
-}
-
-/** Whether this boot is a temporary stand-in rather than a master in its own right (20.5). */
-export function isStandInBoot(): boolean {
-  return readRoleOverride()?.standIn === true;
-}
-
-/**
- * Role resolution: the override file wins; else explicit BOT_NODE_ROLE; else a
- * configured master candidate list means co-worker; else master (standalone
- * when no control channel is configured).
- */
-export function resolveNodeRole(): NodeRole {
-  const override = readRoleOverride();
-  if (override) return override.role;
-  return resolveEnvRole();
-}
-
-/** The role env alone would resolve to (override ignored); demotion of an env co-worker just clears the override. */
-export function resolveEnvRole(): NodeRole {
-  const explicit = (process.env.BOT_NODE_ROLE || '').trim().toLowerCase();
-  if (explicit === 'master') return 'master';
-  // backup-master is a designated co-worker: protocol role co-worker, backup
-  // designation carried separately (isBackupMaster).
-  if (explicit === 'co-worker' || explicit === 'backup-master') return 'co-worker';
-  // Absent means master. Nothing else ever implies a role: MASTER_URLS is the
-  // fleet-wide candidate list carried by EVERY node, the master included.
-  return 'master';
-}
-
-/** Cross-process staleness fix: the webui PARENT must re-read after the bot CHILD rewrote the override (takeover-flag consumption). */
-export function invalidateRoleOverrideCache(): void {
-  cachedOverride = undefined;
-}
-
-/** Standalone = today's single box: a master with no control channel configured. */
-export function isStandalone(): boolean {
-  return resolveNodeRole() === 'master' && (process.env.CONTROL_SECRET || '').trim() === '';
-}
-
-/**
- * Master candidate list (PLAN_STANDBY 3.4): MASTER_URLS, ordered and
- * comma-separated. A candidate equal to this node's own advertised control
- * route is skipped so a promoted or demoted node never dials itself.
- */
-export function resolveMasterUrls(): string[] {
-  return stripSelfUrl(rawMasterUrls());
-}
-
-/**
- * The env candidate list UNFILTERED: the fleet-wide list carried by every
- * node, the master included. This is what seeds the runtime fleet config
- * (B2) - persisting the per-node dial form would strip the master's own URL
- * from every worker's list. Self-filtering belongs at dial time.
- */
-export function rawMasterUrls(): string[] {
-  const raw = (process.env.MASTER_URLS || '').trim();
-  const list = raw !== ''
-    ? raw.split(',').map(s => s.trim()).filter(s => s !== '')
-    : [];
-  const seen = new Set<string>();
-  const urls: string[] = [];
-  for (const url of list) {
-    const key = normalizeUrl(url);
-    if (key === '' || seen.has(key)) continue;
-    seen.add(key);
-    urls.push(url);
-  }
-  return urls;
-}
-
-/** Dial-time self-filter: drop this node's own advertised control route. */
-export function stripSelfUrl(urls: string[]): string[] {
-  const self = normalizeUrl((process.env.FLEET_PUBLIC_URL || '').trim());
-  if (self === '') return urls;
-  return urls.filter(url => normalizeUrl(url) !== self);
-}
-
-export function normalizeUrl(url: string): string {
-  return url.replace(/\/+$/, '').toLowerCase();
-}
-
-/** True when this co-worker is the designated backup master (BOT_NODE_ROLE=backup-master). */
-export function isBackupMaster(): boolean {
-  return (process.env.BOT_NODE_ROLE || '').trim().toLowerCase() === 'backup-master';
-}
-
-/**
- * This node's CONSENT to standing in as an active backup (20.5, B6 map F7). It is
- * only half the key: the master's stored designation entry carries the enable, and
- * either side saying passive means passive. Absent or unreadable means passive,
- * because standing in takes writes and silence must never buy that.
- */
-export function consentsToActiveMode(): boolean {
-  return (process.env.FLEET_BACKUP_MODE || '').trim().toLowerCase() === 'active';
-}
 
 export function getNodeName(): string {
   return (process.env.NODE_NAME || '').trim() || os.hostname();
 }
 
 let cachedNodeId: string | null = null;
-// True once getNodeId minted a fresh id this boot (node.json was missing or
-// unparseable), false once a valid id was loaded from disk. Consumed by the
-// residue sweep to tell "this node forgot who it was" apart from a genuine
-// foreign/cloned volume, so a regenerated id never mass-graveyards owned data.
-let nodeIdWasGenerated = false;
 
 export function getNodeId(): string {
   if (cachedNodeId) return cachedNodeId;
@@ -233,20 +22,13 @@ export function getNodeId(): string {
     const parsed = JSON.parse(fs.readFileSync(file, 'utf-8'));
     if (parsed && typeof parsed.nodeId === 'string' && parsed.nodeId.length > 0) {
       cachedNodeId = parsed.nodeId;
-      nodeIdWasGenerated = false;
       return cachedNodeId!;
     }
   } catch { /* first boot */ }
   const nodeId = randomUUID();
-  nodeIdWasGenerated = true;
   atomicWriteFileSync(file, JSON.stringify({ nodeId, createdAt: Date.now() }, null, 2));
   cachedNodeId = nodeId;
   return nodeId;
-}
-
-/** True when getNodeId minted a fresh id this boot (node.json was missing/unparseable). */
-export function wasNodeIdFreshlyGenerated(): boolean {
-  return nodeIdWasGenerated;
 }
 
 let cachedAppVersion: string | null = null;

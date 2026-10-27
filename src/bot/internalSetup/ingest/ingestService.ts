@@ -1,5 +1,5 @@
 // IngestService wraps Client construction and gateway login. {shards,
-// shardCount} arrive as a LEASE from the control plane; login only ever
+// shardCount} arrive as this process's LEASE (every shard); login only ever
 // happens through LeaseRuntime, which owns the no-identify-without-a-
 // current-term-lease invariant. The Client instance is created exactly once
 // per process (modules, panels and handlers hold references to it); lease
@@ -24,9 +24,7 @@ export class IngestService {
     if (this.client) throw new Error('[Ingest] buildClient() called twice');
     const opts: ClientOptions = { ...options };
     const plan = this.shardPlan;
-    // {shards:[0], shardCount:1} is exactly discord.js's default (verified in
-    // @discordjs/ws getShardIds); omitting the options keeps the standalone
-    // Client byte-identical to the pre-fleet construction.
+    // {shards:[0], shardCount:1} is discord.js's default (@discordjs/ws getShardIds), so it is omitted.
     if (plan && !(plan.shardCount === 1 && plan.shards.length === 1 && plan.shards[0] === 0)) {
       (opts as any).shards = plan.shards;
       (opts as any).shardCount = plan.shardCount;
@@ -164,7 +162,7 @@ export class IngestService {
 
   // client.destroy() latches ws.destroyed and keeps the internal
   // @discordjs/ws manager that was built with the old shard set; a shard
-  // set frozen at first login would defeat lease moves, and a latched
+  // set frozen at first login would defeat a re-grant, and a latched
   // destroyed flag would no-op the NEXT destroy (breaking revoke fencing).
   // Reset both so a future grant re-logins this same Client instance with
   // fresh shard options.

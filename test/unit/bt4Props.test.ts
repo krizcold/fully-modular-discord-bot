@@ -30,7 +30,7 @@ describe('the synthetic entries, over random runs', () => {
       fc.asyncProperty(
         fc.constantFrom<Entry>('panel', 'console'),
         fc.array(fc.constantFrom<Op>('save', 'refuse'), { maxLength: 3 }),
-        fc.constantFrom<'commit' | 'read-only' | 'deposed'>('commit', 'read-only', 'deposed'),
+        fc.constantFrom<'commit' | 'unavailable' | 'deposed'>('commit', 'unavailable', 'deposed'),
         fc.boolean(),
         async (entry, ops, mode, throws) => {
           const { guildId, store, options } = await storeGuild();

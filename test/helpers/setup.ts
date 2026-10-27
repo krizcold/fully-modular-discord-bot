@@ -3,8 +3,12 @@ import { createRequire } from 'module';
 import os from 'os';
 import path from 'path';
 import fc from 'fast-check';
-import { afterAll } from 'vitest';
+import { afterAll, beforeEach, vi } from 'vitest';
+import { setBackendKind } from './backendKind';
 import { DEAD_ENDS, scrubEnv } from './env';
+
+vi.mock('../../src/utils/envLoader', async orig => (await import('./backendKind')).withBackendKind(await orig<any>()));
+beforeEach(() => setBackendKind(null));
 
 // Every test file runs in its own fork: before any source module is imported,
 // keep only the variables helpers/env.ts lets through, point pg and git at

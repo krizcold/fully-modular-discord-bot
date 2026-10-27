@@ -20,10 +20,8 @@ vi.mock('../../src/bot/internalSetup/utils/payment/paymentRegistry', () => ({
   getPaymentRegistry: () => ({ get: (id: string) => (id === fakeProvider.id ? fakeProvider : undefined), getAll: () => [fakeProvider] }),
 }));
 
-import { credentialsReadError, loadCredentials, removeCredentials, upsertCredentials } from '../../src/utils/envLoader';
+import { credentialsReadError, loadCredentials } from '../../src/utils/envLoader';
 import { dataPath } from '../../src/utils/dataRoot';
-import { persistPromotedUrls } from '../../src/bot/internalSetup/fleet/replicaPromotion';
-import { runRoleReset } from '../../src/webui/lifecycleActions';
 import type { BotManager } from '../../src/webui/botManager';
 
 const envPath = dataPath('.env');
@@ -38,42 +36,6 @@ beforeEach(() => {
 afterEach(() => {
   fault.on = false;
   fs.rmSync(envPath, { force: true });
-});
-
-describe('an unreadable /data/.env is never rewritten', () => {
-  for (const code of ['EACCES', 'EIO']) {
-    it(`upsertCredentials refuses on ${code} and leaves every stored key`, () => {
-      Object.assign(fault, { on: true, code });
-      const result = upsertCredentials({ DATA_BACKEND: 'file' });
-      fault.on = false;
-      expect(result.success).toBe(false);
-      expect(result.error).toContain(code);
-      expect(onDisk()).toBe(stored);
-    });
-
-    it(`removeCredentials refuses on ${code} and leaves every stored key`, () => {
-      Object.assign(fault, { on: true, code });
-      const result = removeCredentials(['DATA_BACKEND_URL']);
-      fault.on = false;
-      expect(result.success).toBe(false);
-      expect(result.error).toContain(code);
-      expect(onDisk()).toBe(stored);
-    });
-  }
-
-  it('upsertCredentials still creates a missing file, and removeCredentials on a missing file is no error', () => {
-    fs.rmSync(envPath);
-    expect(removeCredentials(['X'])).toEqual({ success: true });
-    expect(fs.existsSync(envPath)).toBe(false);
-    expect(upsertCredentials({ DATA_BACKEND: 'file' })).toEqual({ success: true });
-    expect(onDisk()).toBe('DATA_BACKEND=file\n');
-  });
-
-  it('upsertCredentials and removeCredentials keep the other lines of a readable file', () => {
-    expect(upsertCredentials({ DATA_BACKEND: 'file' }).success).toBe(true);
-    expect(removeCredentials(['DATA_BACKEND_URL']).success).toBe(true);
-    expect(onDisk()).toBe('DISCORD_TOKEN=fake-token-value-for-tests\nDATA_BACKEND=file\n');
-  });
 });
 
 describe('loadCredentials tells a failed read apart from a missing file', () => {
@@ -100,25 +62,6 @@ describe('loadCredentials tells a failed read apart from a missing file', () => 
   });
 });
 
-describe('the callers refuse on a failed read', () => {
-  it('persistPromotedUrls refuses and writes nothing', () => {
-    fault.on = true;
-    const result = persistPromotedUrls('postgres://fake@db-b/x', 'postgres://fake@public-b/x');
-    fault.on = false;
-    expect(result.success).toBe(false);
-    expect(onDisk()).toBe(stored);
-  });
-
-  it('runRoleReset answers that the store forms are not cleared', async () => {
-    fault.on = true;
-    const result = await runRoleReset({} as BotManager, false);
-    fault.on = false;
-    expect(result.success).toBe(false);
-    expect(result.error).toContain('the persisted store forms are not');
-    expect(onDisk()).toBe(stored);
-  });
-});
-
 describe('a payment provider credentials save on an unreadable /data/.env', () => {
   it('answers that nothing was saved and why, and writes nothing', async () => {
     const { createAppStoreRoutes } = await import('../../src/webui/routes/appstore');
@@ -138,21 +81,5 @@ describe('a payment provider credentials save on an unreadable /data/.env', () =
     expect(body.error).toContain('nothing was saved');
     expect(body.error).toContain('EACCES');
     expect(onDisk()).toBe(stored);
-  });
-});
-
-describe('a delivery applied after a failed /data/.env read', () => {
-  it('writes nothing for that delivery, its recycles included, until a read succeeds', async () => {
-    const { deliveryPersistsFor } = await import('../../src/bot/internalSetup/utils/dataBackends/boot');
-    loadCredentials();
-    expect(deliveryPersistsFor(undefined)).toBe(true);
-    expect(deliveryPersistsFor(false)).toBe(false);
-    fault.on = true;
-    loadCredentials();
-    fault.on = false;
-    expect(deliveryPersistsFor(undefined)).toBe(false);
-    expect(deliveryPersistsFor(true)).toBe(false);
-    loadCredentials();
-    expect(deliveryPersistsFor(undefined)).toBe(true);
   });
 });

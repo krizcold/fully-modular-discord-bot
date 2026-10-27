@@ -29,8 +29,4 @@ describe('A23-4 episode card window start', () => {
     expect(cardSource()).toMatch(/\$\{standIn\} stood in for \$\{covering\} from \$\{at\(e\.standInSince\)\}/);
   });
 
-  it('the record field says the master side is a first-seen time', () => {
-    const rec = read('bot/internalSetup/fleet/episodeRecord.ts');
-    expect(rec).toMatch(/Master side: when this node first saw/);
-  });
 });

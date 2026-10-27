@@ -20,22 +20,10 @@ import {
 } from '../../utils/envLoader';
 import { dataPath } from '../../utils/dataRoot';
 import { reconfigureOAuth } from '../auth/oauthConfig';
-import { isBackupMaster, isStandalone as isStandaloneFleet, readRoleOverride, resolveEnvRole, resolveNodeRole } from '../../bot/internalSetup/fleet/nodeIdentity';
-import { isCoWorkerNode } from '../middleware/fleetGate';
-
-/** The only fields a co-worker edits locally; everything else mirrors the master via sync. */
-const CONNECTION_FIELDS = ['DISCORD_TOKEN', 'MASTER_URLS', 'CONTROL_SECRET', 'NODE_NAME', 'FLEET_SHARD_CAPACITY'] as const;
-
-/**
- * Non-secret connection fields where a blanked form field is an EXPLICIT
- * clear: the key is removed and the node uses its default. A blank secret
- * keeps the stored value.
- */
-const CLEARABLE_CONNECTION_FIELDS = new Set<string>(['MASTER_URLS', 'NODE_NAME', 'FLEET_SHARD_CAPACITY']);
 
 /** Keys whose value an answer never repeats (the secrets, and the IDs /status masks). */
 const MASKED_KEYS = new Set<string>([
-  'DISCORD_TOKEN', 'CONTROL_SECRET', 'DISCORD_CLIENT_SECRET', 'SESSION_SECRET', 'DATA_BACKEND_URL', 'CONTROL_STORE_URL',
+  'DISCORD_TOKEN', 'DISCORD_CLIENT_SECRET', 'SESSION_SECRET', 'DATA_BACKEND_URL',
   'CLIENT_ID', 'GUILD_ID', 'DISCORD_CLIENT_ID',
 ]);
 
@@ -77,7 +65,7 @@ function containerSetChanges(before: BotCredentials, after: BotCredentials): Arr
 const OAUTH_FIELDS = ['ENABLE_GUILD_WEBUI', 'DISCORD_CLIENT_ID', 'DISCORD_CLIENT_SECRET', 'OAUTH_CALLBACK_URL'] as const;
 
 /** Data backend settings; changes only take effect after a bot restart. */
-const DATA_BACKEND_FIELDS = ['DATA_BACKEND', 'DATA_BACKEND_URL', 'CONTROL_STORE_URL'] as const;
+const DATA_BACKEND_FIELDS = ['DATA_BACKEND', 'DATA_BACKEND_URL'] as const;
 
 /**
  * Classify credential changes by their reload semantics. Returns a per-field
@@ -137,8 +125,6 @@ export function createSetupRoutes(): Router {
         MAIN_GUILD_ID: credentials.MAIN_GUILD_ID || null
       };
 
-      const nodeRole = resolveNodeRole();
-      const roleOverride = readRoleOverride();
       res.json({
         success: true,
         // Main credentials are managed by Bot Manager
@@ -146,38 +132,9 @@ export function createSetupRoutes(): Router {
         managedByBotManager: ['DISCORD_TOKEN', 'CLIENT_ID', 'GUILD_ID'],
         // Deployment mode: UI uses this to hide / disable bot credential fields when managed
         deploymentMode: getDeploymentMode(),
-        // Fleet role: co-worker UIs hide master-owned tabs and show the Connection page
-        nodeRole,
-        standalone: isStandaloneFleet(),
         // Optional settings status
         credentials: status,
         guildIds: guildIds,
-        // Co-worker Connection page values (MASTER_URLS/NODE_NAME/capacity are
-        // not secrets; token and secret report set/unset only)
-        ...(nodeRole === 'co-worker' ? {
-          connection: {
-            MASTER_URLS: credentials.MASTER_URLS || '',
-            NODE_NAME: credentials.NODE_NAME || '',
-            FLEET_SHARD_CAPACITY: credentials.FLEET_SHARD_CAPACITY || '',
-            // Effective designation: BOT_NODE_ROLE=backup-master. The page
-            // edits the ROLE.
-            BACKUP_MASTER: isBackupMaster() ? '1' : '',
-            // The role env alone gives, the raw setting and the override that
-            // wins over both: a demoted master runs as a co-worker by the
-            // override while its env still says master.
-            ENV_ROLE: resolveEnvRole(),
-            BOT_NODE_ROLE: credentials.BOT_NODE_ROLE || '',
-            ROLE_OVERRIDE: roleOverride
-              ? { role: roleOverride.role, setBy: roleOverride.setBy, setAt: roleOverride.setAt }
-              : null,
-            // This node's own advertised endpoint (empty when the platform
-            // never injected one): a backup master shows it so its URL can be
-            // added to every worker's candidates.
-            SELF_URL: credentials.FLEET_PUBLIC_URL || '',
-            CONTROL_SECRET_SET: !!(credentials.CONTROL_SECRET && credentials.CONTROL_SECRET.trim() !== ''),
-            DISCORD_TOKEN_SET: !!(credentials.DISCORD_TOKEN && credentials.DISCORD_TOKEN.trim() !== ''),
-          },
-        } : {}),
       });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
@@ -198,68 +155,6 @@ export function createSetupRoutes(): Router {
    */
   router.post('/credentials', async (req: Request, res: Response) => {
     try {
-      // Co-worker: accept only connection fields; every other field is
-      // preserved (mirrors the managed-mode ignore precedent below).
-      if (isCoWorkerNode()) {
-        const existingCredentials = loadCredentials();
-        const stored = readStoredEnv();
-        const credentials: BotCredentials = { ...existingCredentials };
-        for (const field of CONNECTION_FIELDS) {
-          const value = req.body?.[field];
-          if (typeof value !== 'string') continue;
-          if (value.trim() !== '') {
-            credentials[field] = value.trim();
-          } else if (CLEARABLE_CONNECTION_FIELDS.has(field)) {
-            delete credentials[field];
-          }
-        }
-        if (credentials.FLEET_SHARD_CAPACITY !== undefined && credentials.FLEET_SHARD_CAPACITY !== ''
-            && !/^\d+$/.test(credentials.FLEET_SHARD_CAPACITY)) {
-          res.status(400).json({ success: false, error: 'FLEET_SHARD_CAPACITY must be a positive integer' });
-          return;
-        }
-        // The backup designation IS the role here: this page offers the two
-        // worker roles only (promotion to master goes through the Fleet tab's
-        // Promote button).
-        const requestedRole = String(req.body?.BOT_NODE_ROLE ?? '').trim().toLowerCase();
-        if ((requestedRole === 'co-worker' || requestedRole === 'backup-master')
-            && requestedRole !== (existingCredentials.BOT_NODE_ROLE || '').trim().toLowerCase()) {
-          credentials.BOT_NODE_ROLE = requestedRole;
-        }
-        // MASTER_URLS never implies a role (it is carried by masters too), so
-        // pin the explicit role this page exclusively serves: without it, a
-        // MASTER_URLS-only node would silently boot as a master (absent
-        // means master). Not when the role override, not the env, is what
-        // makes this node a co-worker: its env role stays master.
-        const overrideMakesCoWorker = readRoleOverride() !== null && resolveEnvRole() === 'master';
-        if ((credentials.MASTER_URLS || '').trim() !== ''
-            && (credentials.BOT_NODE_ROLE || '').trim() === ''
-            && !overrideMakesCoWorker) {
-          credentials.BOT_NODE_ROLE = 'co-worker';
-        }
-        const saveResult = saveCredentials(fileAfterSave(stored, existingCredentials, credentials));
-        if (!saveResult.success) {
-          res.status(500).json({ success: false, error: saveResult.error || 'Failed to save credentials' });
-          return;
-        }
-        const containerSet = containerSetChanges(existingCredentials, credentials);
-        const reloadActions = computeReloadActions(existingCredentials, credentials)
-          .filter(c => !containerSet.some(p => p.field === c.field));
-        res.json({
-          success: true,
-          message: 'Connection settings saved successfully',
-          containerSet,
-          credentials: getCredentialStatus(credentials),
-          reload: {
-            changes: reloadActions,
-            oauthReconfigured: false,
-            sessionSecretChanged: false,
-            botCredentialsChanged: reloadActions.length > 0,
-          },
-        });
-        return;
-      }
-
       const isStandalone = getDeploymentMode() === 'standalone';
       const {
         // Main credentials: only honored when isStandalone (ignored when managed)
@@ -270,7 +165,7 @@ export function createSetupRoutes(): Router {
         ENABLE_GUILD_WEBUI, DISCORD_CLIENT_ID, DISCORD_CLIENT_SECRET,
         OAUTH_CALLBACK_URL, SESSION_SECRET,
         // Data backend settings: only honored when isStandalone (ignored when managed)
-        DATA_BACKEND, DATA_BACKEND_URL, CONTROL_STORE_URL,
+        DATA_BACKEND, DATA_BACKEND_URL,
         // Payment provider credentials are NOT accepted here - each provider
         // owns its own credential modal accessible from the Premium panel.
         // The PUT /api/appstore/premium/providers/:id/credentials route
@@ -322,14 +217,6 @@ export function createSetupRoutes(): Router {
           res.status(400).json({
             success: false,
             error: 'DATA_BACKEND_URL must start with postgresql:// or postgres://'
-          });
-          return;
-        }
-        if (CONTROL_STORE_URL && CONTROL_STORE_URL.trim() !== ''
-            && !/^postgres(ql)?:\/\//.test(CONTROL_STORE_URL.trim())) {
-          res.status(400).json({
-            success: false,
-            error: 'CONTROL_STORE_URL must start with postgresql:// or postgres://'
           });
           return;
         }
@@ -427,9 +314,6 @@ export function createSetupRoutes(): Router {
         ...(isStandalone && DATA_BACKEND_URL && DATA_BACKEND_URL.trim() !== ''
           ? { DATA_BACKEND_URL: DATA_BACKEND_URL.trim() }
           : existingCredentials.DATA_BACKEND_URL && { DATA_BACKEND_URL: existingCredentials.DATA_BACKEND_URL }),
-        ...(isStandalone && CONTROL_STORE_URL && CONTROL_STORE_URL.trim() !== ''
-          ? { CONTROL_STORE_URL: CONTROL_STORE_URL.trim() }
-          : existingCredentials.CONTROL_STORE_URL && { CONTROL_STORE_URL: existingCredentials.CONTROL_STORE_URL }),
       };
 
       // Save credentials
@@ -590,7 +474,7 @@ export function createSetupRoutes(): Router {
           title: 'Data Backend (Optional, standalone only)',
           steps: [
             'Choose where the bot stores its data: file (default) or postgres',
-            'Switching the backend does NOT move existing data; use the backend transformation to migrate',
+            'Switching the backend does NOT move existing data: the bot refuses to start against an empty database while its data is in files',
             'A bot restart is required for the change to take effect'
           ],
           example: 'file or postgres'
@@ -604,15 +488,6 @@ export function createSetupRoutes(): Router {
             'A bot restart is required for changes to take effect'
           ],
           example: 'postgresql://user:password@host:5432/db'
-        },
-        CONTROL_STORE_URL: {
-          title: 'Control Store URL (Optional)',
-          steps: [
-            'Optional separate Postgres for the fleet control plane; blank = same database',
-            'Leave blank to keep the saved value (it is never shown here)',
-            'A bot restart is required for changes to take effect'
-          ],
-          example: 'postgresql://user:password@host:5432/control (or leave empty)'
         }
       }
     });

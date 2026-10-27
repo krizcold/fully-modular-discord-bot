@@ -27,7 +27,7 @@ const FIXTURES: Record<string, string> = {
   'notQueryable.test.mjs': "it('queries', () => { throw new Error('Client has encountered a connection error and is not queryable'); });",
   'childFault.test.mjs': "it('survives a full disk', () => { throw new Error('scenario diskFull.cjs step2 exited 1 with no RESULT line\\nError: ENOSPC: no space left on device'); });",
   'assertsOnError.test.mjs': "it('classifies a refusal', () => { expect('connect ECONNREFUSED 10.0.0.2:5432').toBe('unreachable'); });",
-  'stepBound.test.mjs': "it('restarts', () => { throw new Error('scenario fleetIdentity.cjs read did not finish in 20000 ms\\nwaiting for the lease'); });",
+  'stepBound.test.mjs': "it('restarts', () => { throw new Error('scenario nodeIdentity.cjs boot did not finish in 20000 ms\\nwaiting for the lease'); });",
   'eachHook.test.mjs': "beforeEach(() => { throw new Error('the hook failed'); });\nit('reads', () => {});",
   'lockedDir.test.mjs': "afterEach(() => { throw new Error(\"EBUSY: resource busy or locked, rmdir 'smdb-x'\"); });\nit('reads', () => {});",
   'ownFileError.test.mjs': "it('saves', () => { const error = new Error(\"EPERM: operation not permitted, rename 'a.tmp' -> 'a'\"); error.code = 'EPERM'; throw error; });",
@@ -177,8 +177,8 @@ describe('the passes a mutant goes through', () => {
 
   it('reruns each pass B kill with the test file that killed it', () => {
     const by = (file: string) => mutant(1, true, { a: pass('Survived'), b: pass('Killed', { killedBy: `${file} > the role override > keeps it` }) });
-    const [one, two, three] = [by('child/fleetIdentity.test.ts'), by('integration/store.test.ts'), by('child/fleetIdentity.test.ts')];
-    expect([...byKiller([one, two, three])]).toEqual([['child/fleetIdentity.test.ts', [one, three]], ['integration/store.test.ts', [two]]]);
+    const [one, two, three] = [by('child/nodeIdentity.test.ts'), by('integration/store.test.ts'), by('child/nodeIdentity.test.ts')];
+    expect([...byKiller([one, two, three])]).toEqual([['child/nodeIdentity.test.ts', [one, three]], ['integration/store.test.ts', [two]]]);
   });
 
   it('counts nothing a rerun found when the run with no mutant after it failed', () => {

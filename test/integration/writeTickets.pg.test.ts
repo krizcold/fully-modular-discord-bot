@@ -4,7 +4,7 @@ import type { Pool } from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { FenceToken } from '../../src/bot/internalSetup/utils/dataBackends/backend';
 import { PostgresBackend } from '../../src/bot/internalSetup/utils/dataBackends/postgresBackend';
-import { setRouteOverride } from '../../src/bot/internalSetup/utils/dataBackends/routeResolver';
+import { setBackendKind } from '../helpers/backendKind';
 import { initWorkingSet, WorkingSetManager } from '../../src/bot/internalSetup/utils/dataBackends/workingSet';
 import { confirmWrite, saveDataTracked } from '../../src/bot/internalSetup/utils/dataManager';
 import { applyOperatorDataWrite } from '../../src/bot/internalSetup/utils/ipcDataHandler';
@@ -84,8 +84,8 @@ beforeAll(async () => {
   backend = new PostgresBackend({ url: `postgres://${user}:${password}@127.0.0.1:${port}/${container.getDatabase()}` });
   backend.start();
   const until = Date.now() + 60_000;
-  while (!backend.healthy() && Date.now() < until) await new Promise(resolve => { setTimeout(resolve, 100); });
-  expect(backend.healthy()).toBe(true);
+  while (backend.connectionState().state !== 'ready' && Date.now() < until) await new Promise(resolve => { setTimeout(resolve, 100); });
+  expect(backend.connectionState().state).toBe('ready');
 });
 
 afterAll(async () => {
@@ -123,7 +123,7 @@ describe('a write ticket against a real Postgres', () => {
       expect(await ws.confirm(ticket, 15_000)).toBe('ok');
       expect(await stored(guildId, 'a.json')).toBe('{"a":1}');
     } finally {
-      ws.quiesce();
+      ws.evict(guildId);
     }
   }, 60_000);
 
@@ -133,10 +133,10 @@ describe('a write ticket against a real Postgres', () => {
     const held = {
       ok: true,
       pending: true,
-      note: 'it is not saved yet; this node retries while it serves this guild, and loses it if the bot stops, the guild moves or the node loses its database first',
+      note: 'it is not saved yet; this node retries while it serves this guild, and loses it if the bot stops or loses its database first',
     };
     const options = { guildId, category: 'm' };
-    setRouteOverride(guildId, 'postgres');
+    setBackendKind('postgres');
     const ws = initWorkingSet(backend);
     try {
       expect(await ws.hydrate(guildId, token)).toBe('ready');
@@ -165,7 +165,7 @@ describe('a write ticket against a real Postgres', () => {
       expect(await stored(guildId, 'a.json')).toBe(JSON.stringify({ a: 1 }, null, 2));
       expect(await stored(guildId, 'b.json')).toBeNull();
     } finally {
-      ws.quiesce();
+      ws.evict(guildId);
     }
   }, 90_000);
 });

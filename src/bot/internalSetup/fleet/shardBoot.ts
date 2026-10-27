@@ -1,16 +1,15 @@
-import type { Client } from 'discord.js';
 import { getIngestService } from '../ingest/ingestService';
 import { getGuildDataBackend, setOwnerInfoProvider } from '../utils/dataManager';
-import { getDataBootStatus, setRuntimeRecycledHandler } from '../utils/dataBackends/boot';
+import { getDataBootStatus } from '../utils/dataBackends/boot';
 import { PostgresBackend, readMaxOwnershipTerm } from '../utils/dataBackends/postgresBackend';
 import { cleanOrphanTmpFiles } from '../utils/dataBackends/fileBackend';
+import { IdentifyLedger } from './identifyLedger';
 import { LeaseRuntime } from './leaseRuntime';
 import { getAppVersion, getNodeId, getNodeName } from './nodeIdentity';
-import { assignIdentifyDelays, decideShardSource, fetchGatewayInfoResult, resolveShardCapacity, resolveShardCount } from './placement';
+import { decideShardSource, fetchGatewayInfoResult, leasesFor, resolveShardCount } from './placement';
 import { _setFleetStateSources } from './state';
 
-// The lowest fence term a boot takes; it sits above any term the old control
-// plane could have minted. On Postgres each boot claims above every stored row.
+// The lowest fence term a boot takes; on Postgres each boot claims above every stored row.
 export const SHARD_BOOT_TERM = 1_000_000_000;
 export const SHARD_BOOT_EPOCH = 1;
 const TERM_READ_RETRY_MS = 5_000;
@@ -48,7 +47,6 @@ export interface ShardBootContext {
   nodeId: string;
   nodeName: string;
   shardCount: number;
-  attachClient(client: Client): void;
   startIngest(token: string | undefined): void;
 }
 
@@ -70,9 +68,6 @@ async function runBoot(): Promise<ShardBootContext> {
   const nodeName = getNodeName();
   const ingest = getIngestService();
   const runtime = new LeaseRuntime(ingest);
-  setRuntimeRecycledHandler(outcome => {
-    if (outcome.recycled) runtime.renotifyDataLayer();
-  });
 
   try {
     await cleanOrphanTmpFiles();
@@ -86,40 +81,23 @@ async function runBoot(): Promise<ShardBootContext> {
   }
   const shardCount = resolveShardCount(gateway?.recommendedShards ?? 1);
   const shardIds = Array.from({ length: shardCount }, (_, i) => i);
-  const leases = assignIdentifyDelays(new Map([[nodeId, shardIds]]), gateway?.maxConcurrency ?? 1).get(nodeId) ?? [];
+  const leases = leasesFor(shardIds);
   const term = await resolveBootTerm();
-  const ack = await runtime.applyGrant({ term, epoch: SHARD_BOOT_EPOCH, shardCount, leases });
-  if (!ack.ok) throw new Error(`[Shards] Could not take shards 0..${shardCount - 1}: ${ack.reason ?? 'refused'}`);
+  const ledger = new IdentifyLedger(process.env.DISCORD_TOKEN, shardCount, gateway?.sessionStartLimit ?? null, gateway?.recommendedShards ?? null);
+  ledger.charge(shardCount);
+  await runtime.applyGrant({ term, epoch: SHARD_BOOT_EPOCH, shardCount, leases });
   console.log(`[Shards] Running all ${shardCount} shard(s) in this process`);
 
   _setFleetStateSources({
-    role: 'master',
-    standalone: true,
     nodeId,
     nodeName,
     appVersion: getAppVersion(),
-    pinnedShardId: null,
-    capacity: resolveShardCapacity(),
+    shardSource: decideShardSource(gateway !== null),
     recommendedShards: gateway?.recommendedShards ?? null,
     recommendedAt: gateway ? Date.now() : null,
-    shardSource: decideShardSource({ adoptedPlan: false, overrideApplied: false, gatewayAnswered: gateway !== null }),
     runtime,
     ingest,
-    registry: null,
-    controlClient: null,
-    recovery: null,
-    ledger: null,
-    healthMonitor: null,
-    refusedRegistrations: null,
-    sync: null,
-    migration: null,
-    transformation: null,
-    pinViolation: null,
-    unassigned: null,
-    termStamp: null,
-    fleetConfig: null,
-    witness: null,
-    migrationActive: null,
+    ledger,
   });
 
   setOwnerInfoProvider(() => ({ nodeId, term, epoch: SHARD_BOOT_EPOCH, shardCount }));
@@ -128,9 +106,6 @@ async function runBoot(): Promise<ShardBootContext> {
     nodeId,
     nodeName,
     shardCount,
-    attachClient(client: Client): void {
-      runtime.attachClient(client);
-    },
     startIngest(token: string | undefined): void {
       runtime.setToken(token);
     },

@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { confirmWrite, freezeGuildWrites, saveData, saveDataOutcome, unfreezeGuildWrites } from '../../src/bot/internalSetup/utils/dataManager';
+import { confirmWrite, saveData, saveDataOutcome } from '../../src/bot/internalSetup/utils/dataManager';
+import { freezeGuildWrites, unfreezeGuildWrites } from '../helpers/freezeGuild';
 import { openLedger, runInLedger } from '../../src/bot/internalSetup/utils/dataBackends/writeLedger';
 import { CONFIRM_MS, verdictOf, writesConfirmed } from '../../src/bot/internalSetup/utils/dataBackends/replyGate';
 import { notReadyGuild, storeGuild, tick } from '../helpers/gateRig';

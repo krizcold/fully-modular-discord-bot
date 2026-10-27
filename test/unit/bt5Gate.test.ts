@@ -162,7 +162,7 @@ describe('a flagged module\'s payload', () => {
   it('a commit the store refuses after accepting the write is the flagged module\'s to report: its payload goes out', async () => {
     const { wire, emit } = rig();
     const { store, options } = await storeGuild();
-    store.mode = 'read-only';
+    store.mode = 'unavailable';
     const { error } = await emit(rawCommand(nextId()), i => withModule('flagmod', async () => {
       expect(saveDataOutcome('x.json', options, { v: 1 })).toBe('saved');
       await i.reply({ content: 'Saved!' });

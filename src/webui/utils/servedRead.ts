@@ -7,7 +7,7 @@
 import * as path from 'path';
 import { readRawStrict } from '../../bot/internalSetup/utils/dataManager';
 import { filesPending } from '../../bot/internalSetup/utils/dataBackends/fileBackend';
-import { routeFor } from '../../bot/internalSetup/utils/dataBackends/routeResolver';
+import { resolveDataBackend } from '../../utils/envLoader';
 import { getWebuiDataReader } from './webuiDataReader';
 import { hopFailure } from '../routes/hopFailure';
 import type { BotManager } from '../botManager';
@@ -45,9 +45,6 @@ function noAnswerText(cause: unknown, detail: string | undefined): string {
 
 function refused(reply: any, fallback: string): ServedRead {
   const detail = reply && typeof reply.error === 'string' ? reply.error : undefined;
-  if (reply?.code === 'owner-no-answer') {
-    return { ok: false, status: 504, error: `The instance that serves this guild did not answer the read within 10 s; nothing was changed. Retry in a moment${detail ? ` (${detail})` : ''}` };
-  }
   if (reply?.code !== 'bot-down') {
     const hop = hopFailure(reply?.code, detail);
     if (hop) return { ok: false, status: hop.status, error: hop.error };
@@ -105,12 +102,12 @@ export async function readServedGlobal(botManager: BotManager, target: GlobalRea
 }
 
 /**
- * A guild document, through the child's read hop (queue first on the owning
- * node). A file-routed guild's files are also written by this process (its
+ * A guild document, through the child's read (its queue first). A file-routed
+ * guild's files are also written by this process (its
  * saves and restores queue here), so its own queue counts as for a global file.
  */
 export async function readServedGuild(botManager: BotManager, target: GuildReadTarget): Promise<ServedRead> {
-  const fileRouted = routeFor(target.guildId) !== 'postgres';
+  const fileRouted = resolveDataBackend() !== 'postgres';
   const queuedBefore = fileRouted && filesPending([target.path]);
   const reply = await botManager.readGuildData({ guildId: target.guildId, module: target.module, filename: target.filename });
   if (reply?.ok) return fileRouted ? combine(target, queuedBefore, reply) : { ok: true, content: bodyOf(reply) };

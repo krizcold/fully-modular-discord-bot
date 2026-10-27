@@ -1,6 +1,5 @@
-// Namespace interchange (Phase 3 / P4): export/import a guild's data as a
-// stream of verified file records, plus the content hash used by the migration
-// verify step and an on-disk bundle format (backup + interim manual bridge).
+// Namespace interchange: export/import a guild's data as a stream of verified
+// file records, the namespace content hash, and an on-disk bundle format.
 //
 // Bytes, not parsed JSON, are hashed: both sides hold identical bytes after a
 // copy, so no canonical-JSON normalization is needed.
@@ -10,9 +9,8 @@ import * as path from 'path';
 import * as crypto from 'crypto';
 import { DATA_ROOT } from '../../../utils/dataRoot';
 import { flushGuild } from './dataManager';
-import { routeFor } from './dataBackends/routeResolver';
 import { readFileMarker } from './dataBackends/recognitionGuard';
-import type { DataBackendKind } from '../../../utils/envLoader';
+import { resolveDataBackend, type DataBackendKind } from '../../../utils/envLoader';
 
 export interface FileRecord {
   guildId: string;
@@ -22,10 +20,9 @@ export interface FileRecord {
   bytes: Buffer;
 }
 
-// Files that are node-local sidecars, never part of the transferable namespace.
-const EXCLUDED_NAMES = new Set(['.owner', '.freeze']);
+// Interrupted atomic writes, never part of the namespace.
 export function isExcludedNamespaceName(name: string): boolean {
-  return EXCLUDED_NAMES.has(name) || name.endsWith('.tmp');
+  return name.endsWith('.tmp');
 }
 
 function sha256Hex(bytes: Buffer): string {
@@ -33,10 +30,9 @@ function sha256Hex(bytes: Buffer): string {
 }
 
 /**
- * Streamed file hash for verify walks: bounded memory and the event loop
- * yields between chunks, so hashing a large file cannot starve the control
- * channel (heartbeats, drain acks) the way a whole-file read + single-shot
- * update does.
+ * Streamed file hash for verify walks: bounded memory, and the event loop
+ * yields between chunks, so hashing a large file cannot starve the process
+ * the way a whole-file read + single-shot update does.
  */
 export function hashFileStreamed(filePath: string): Promise<{ size: number; sha256: string }> {
   return new Promise((resolve, reject) => {
@@ -55,7 +51,6 @@ export function hashFileStreamed(filePath: string): Promise<{ size: number; sha2
 
 // Resolve a record's relPath under destRoot, or null when it fails the guard
 // (absolute / drive-letter / backslash / empty or '..' segment / escapes root).
-// Mirrors the Stage 3/4 resolveScopeFile traversal idiom.
 export function safeImportTarget(destResolved: string, relPath: unknown): string | null {
   if (typeof relPath !== 'string' || relPath.length === 0) return null;
   if (path.isAbsolute(relPath) || relPath.includes('\\') || /^[a-zA-Z]:/.test(relPath)) return null;
@@ -96,11 +91,7 @@ async function* walkFiles(base: string, rel: string = ''): AsyncGenerator<string
  */
 export async function* exportNamespace(guildId: string): AsyncGenerator<FileRecord> {
   await flushGuild(guildId);
-  yield* exportNamespaceFrom(path.join(DATA_ROOT, guildId), guildId);
-}
-
-/** The records of a guild dir at any root (B4f-3: a backup ships its mirror copy); no flush, the caller owns the dir's quiet. */
-export async function* exportNamespaceFrom(base: string, guildId: string): AsyncGenerator<FileRecord> {
+  const base = path.join(DATA_ROOT, guildId);
   for await (const relPath of walkFiles(base)) {
     let bytes: Buffer;
     try {
@@ -113,9 +104,9 @@ export async function* exportNamespaceFrom(base: string, guildId: string): Async
 }
 
 /**
- * Write records into an arbitrary destination root (the live guild dir for the
- * manual bridge, or _incoming staging for a migration), verifying each
- * record's sha256 while streaming to disk. Throws on a hash mismatch.
+ * Write records into a destination dir (a bundle import's staging dir),
+ * verifying each record's sha256 while streaming to disk. Throws on a hash
+ * mismatch.
  */
 export async function importNamespace(
   guildId: string,
@@ -150,19 +141,9 @@ export interface NamespaceHashResult {
 }
 
 /**
- * Content hash of a guild namespace. Canonical order: relPath sorted by raw
- * UTF-8 byte order. Hash = sha256(concat over sorted files of:
- * relPath + '\n' + decimalSize + '\n' + fileSha256Hex + '\n').
+ * Content hash of a guild dir at any root; a missing dir hashes as empty. A
+ * verify-only walk: streamed per-file hashes, never whole-file buffers.
  */
-export async function hashNamespace(guildId: string): Promise<NamespaceHashResult> {
-  // Verify-only walk: streamed per-file hashes, never whole-file buffers
-  // (exportNamespace buffers each file because its records SHIP the bytes;
-  // a verify pass only needs the digests).
-  await flushGuild(guildId);
-  return hashNamespaceAt(path.join(DATA_ROOT, guildId));
-}
-
-/** The same formula over a guild dir at any root (a mirror copy, a transfer's staging); a missing dir hashes as empty. */
 export async function hashNamespaceAt(base: string): Promise<NamespaceHashResult> {
   const files: { relPath: string; size: number; sha256: string }[] = [];
   for await (const relPath of walkFiles(base)) {
@@ -174,7 +155,11 @@ export async function hashNamespaceAt(base: string): Promise<NamespaceHashResult
   return namespaceHashOf(files);
 }
 
-/** The namespace hash of a listed file set (the formula above), shared with the guild-data mirror. */
+/**
+ * The namespace hash of a listed file set. Canonical order: relPath sorted by
+ * raw UTF-8 byte order. Hash = sha256(concat over sorted files of:
+ * relPath + '\n' + decimalSize + '\n' + fileSha256Hex + '\n').
+ */
 export function namespaceHashOf(files: { relPath: string; size: number; sha256: string }[]): NamespaceHashResult {
   const sorted = [...files].sort((a, b) => Buffer.compare(Buffer.from(a.relPath, 'utf-8'), Buffer.from(b.relPath, 'utf-8')));
   const hash = crypto.createHash('sha256');
@@ -184,22 +169,6 @@ export function namespaceHashOf(files: { relPath: string; size: number; sha256: 
     totalBytes += f.size;
   }
   return { namespaceHash: hash.digest('hex'), fileCount: sorted.length, totalBytes };
-}
-
-/**
- * Per-guild content hashes plus a single migration-leg hash =
- * sha256 of guild hashes concatenated in guildId order.
- */
-export async function hashLeg(guildIds: string[]): Promise<{ guildHashes: Record<string, string>; legHash: string }> {
-  const guildHashes: Record<string, string> = {};
-  for (const guildId of guildIds) {
-    guildHashes[guildId] = (await hashNamespace(guildId)).namespaceHash;
-  }
-  const legHash = crypto.createHash('sha256');
-  for (const guildId of [...guildIds].sort()) {
-    legHash.update(guildHashes[guildId]);
-  }
-  return { guildHashes, legHash: legHash.digest('hex') };
 }
 
 // ============================================================================
@@ -233,12 +202,9 @@ const GUILD_ID = /^\d+$/;
 export function bundleRefusal(guildId: string, botRunning: 'yes' | 'no' | 'unknown'): string | null {
   if (!GUILD_ID.test(guildId)) return `"${guildId}" is not a guild id`;
   const marker = readFileMarker();
-  if (marker?.transformationId) {
-    return `a backend transformation window is open (${marker.transformationId}); finish or cancel it first`;
-  }
   let route: DataBackendKind;
   try {
-    route = marker ? marker.live : routeFor(guildId);
+    route = marker ? marker.live : resolveDataBackend();
   } catch (error) {
     return `could not confirm which backend serves guild ${guildId}: ${error instanceof Error ? error.message : String(error)}`;
   }
@@ -392,8 +358,7 @@ export interface BundleImportResult {
 /**
  * Restore a bundle into its guild's dir. The records land in a staging dir,
  * which is hashed against the bundle's summary; only then is the current guild
- * dir moved to _graveyard (its node-local sidecars carried over) and the
- * staging dir renamed into its place. Any failure before the swap leaves the
+ * dir moved to _graveyard and the staging dir renamed into its place. Any failure before the swap leaves the
  * live dir as it was; a failed swap puts the old dir back.
  */
 export async function importBundle(filePath: string): Promise<BundleImportResult> {
@@ -430,11 +395,6 @@ export async function importBundle(filePath: string): Promise<BundleImportResult
 
     const live = await fs.promises.stat(liveDir).catch(() => null);
     if (live) {
-      for (const name of EXCLUDED_NAMES) {
-        await fs.promises.copyFile(path.join(liveDir, name), path.join(staging, name)).catch((error: NodeJS.ErrnoException) => {
-          if (error.code !== 'ENOENT') throw error;
-        });
-      }
       const graveyardRoot = path.join(DATA_ROOT, '_graveyard');
       await fs.promises.mkdir(graveyardRoot, { recursive: true });
       const dest = path.join(graveyardRoot, `${guildId}-${Date.now()}`);

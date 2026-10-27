@@ -12,7 +12,7 @@ vi.mock('../../src/bot/internalSetup/fleet/placement', async importOriginal => {
     ...real,
     fetchGatewayInfoResult: vi.fn(async () => {
       h.gatewayCalls++;
-      return { info: { url: 'wss://x', recommendedShards: 4, maxConcurrency: 1, sessionStartLimit: null }, error: null };
+      return { info: { recommendedShards: 4, sessionStartLimit: null }, error: null };
     }),
   };
 });
@@ -23,7 +23,6 @@ vi.mock('../../src/bot/internalSetup/utils/dataBackends/dataReadiness', async im
     ...real,
     getDataReadiness: () => ({
       onLeaseChanged: (s: any) => h.snapshots.push(s),
-      onLeaseLost: () => {},
     }),
   };
 });
@@ -70,15 +69,6 @@ describe('shardBoot runs every shard in this process', () => {
     });
   });
 
-  it('applies identify delays in shard order', async () => {
-    await bootShards();
-    const state = getFleetState();
-    const delays = [...state.leases].sort((a, b) => a.shardId - b.shardId).map(l => l.identifyDelayMs);
-    expect(delays).toHaveLength(4);
-    expect(delays[0]).toBe(0);
-    for (let i = 1; i < delays.length; i++) expect(delays[i]).toBeGreaterThan(delays[i - 1]);
-  });
-
   it('returns the same context when called twice and getFleetContext returns it', async () => {
     const first = await bootShards();
     const [again, parallel] = await Promise.all([bootShards(), bootShards()]);
@@ -93,14 +83,10 @@ describe('shardBoot runs every shard in this process', () => {
     await bootShards();
     const state = getFleetState();
     expect(state.initialized).toBe(true);
-    expect(state.standalone).toBe(true);
     expect(state.nodeId).toBe('node-a');
-    expect(state.term).toBe(SHARD_BOOT_TERM);
-    expect(state.epoch).toBe(SHARD_BOOT_EPOCH);
+    expect(state.nodeName).toBe('Node A');
     expect(state.shardCount).toBe(4);
-    expect(state.servingOnCachedLease).toBe(false);
-    expect(state.nodes).toHaveLength(1);
-    expect(state.nodes[0]).toMatchObject({ nodeId: 'node-a', isSelf: true, isMaster: true, shardIds: [0, 1, 2, 3] });
+    expect(state.leases.map(l => l.shardId).sort()).toEqual([0, 1, 2, 3]);
     expect(state.shardTable.map(s => s.nodeId)).toEqual(['node-a', 'node-a', 'node-a', 'node-a']);
   });
 });

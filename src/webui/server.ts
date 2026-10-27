@@ -24,7 +24,6 @@ import { createManagedRoutes } from './routes/managed';
 import { createGraveyardRoutes } from './routes/graveyard';
 import { requireAuth } from './middleware/auth';
 import { adminPageFallback, pathGuard, pathMiss } from './middleware/pathGuard';
-import { blockWritesOnCoWorker, isCoWorkerNode, requireMasterNode } from './middleware/fleetGate';
 import { configureOAuth, isGuildWebUIEnabled } from './auth/oauthConfig';
 import { requireGuildWebUIEnabled } from './auth/oauthMiddleware';
 import { getSessionMiddleware } from './auth/sessionManager';
@@ -120,12 +119,6 @@ export async function createServer(botManager: BotManager): Promise<Express> {
     async (req: Request, res: Response) => {
       const providerId = req.params.providerId;
       try {
-        // Premium state lives in the synced (master-authoritative) globaldata
-        // scope; a co-worker applying an entitlement would be silently reverted
-        // by the next reconcile. 503 so the provider retries against the master.
-        if (isCoWorkerNode()) {
-          return res.status(503).json({ error: 'This node is a fleet co-worker; premium is managed by the master' });
-        }
         const provider = getPaymentRegistry().get(providerId);
         if (!provider || !provider.handleWebhook) {
           return res.status(404).json({ error: `Unknown provider or no webhook handler: ${providerId}` });
@@ -188,10 +181,7 @@ export async function createServer(botManager: BotManager): Promise<Express> {
   // requiring a bot restart.
   app.use('/auth', requireGuildWebUIEnabled, oauthRoutes);
   app.use('/guild/api/panels', requireGuildWebUIEnabled, createGuildPanelRoutes(botManager));
-  // Subscription state is master-authoritative (synced globaldata). GET/HEAD
-  // stay readable on the owning node; mutating verbs 403 on a co-worker so a
-  // premium write is never applied only to be reverted by the next reconcile.
-  app.use('/guild/api/subscriptions', requireGuildWebUIEnabled, blockWritesOnCoWorker, createGuildSubscriptionRoutes());
+  app.use('/guild/api/subscriptions', requireGuildWebUIEnabled, createGuildSubscriptionRoutes());
   console.log('[Server] Auth + Guild API routes mounted (request-time gated by ENABLE_GUILD_WEBUI)');
 
   // Owner API Routes. Auth is enforced at the deployment boundary (AppShield /
@@ -199,20 +189,20 @@ export async function createServer(botManager: BotManager): Promise<Express> {
   app.use('/api/bot', requireAuth, createControlRoutes(botManager));
   app.use('/api/setup', requireAuth, createSetupRoutes());
   app.use('/api/config', requireAuth, createConfigRoutes(botManager));
-  app.use('/api/appstore', requireAuth, blockWritesOnCoWorker, createAppStoreRoutes(botManager));
+  app.use('/api/appstore', requireAuth, createAppStoreRoutes(botManager));
   app.use('/api/panels', requireAuth, createPanelRoutes(botManager));
   app.use('/api/commands', requireAuth, createCommandRoutes(botManager));
   app.use('/api/update', requireAuth, createUpdateRouter(botManager));
-  app.use('/api/devmodules', requireAuth, requireMasterNode, createDevModulesRoutes(botManager));
+  app.use('/api/devmodules', requireAuth, createDevModulesRoutes(botManager));
   app.use('/api/usage', requireAuth, createUsageRoutes(botManager));
   app.use('/api/fleet', requireAuth, createFleetRoutes(botManager));
   app.use('/api/data/graveyard', requireAuth, createGraveyardRoutes(botManager));
 
-  // Manager-facing lifecycle surface (PLAN_REPLICATION 20.16). NOT requireAuth:
+  // Manager-facing surface. NOT requireAuth:
   // this one carries its own per-instance token check, because it is reached
   // container-to-container over the shared docker network and so never passes
   // the boundary gateway that authenticates every route above.
-  app.use('/api/managed', createManagedRoutes(botManager));
+  app.use('/api/managed', createManagedRoutes());
 
   // Serve static frontend files. The admin page's files need the gateway's login; the member page's own files
   // under /assets/ are reachable without it (requireAuth passes; auth lives at the deployment boundary).

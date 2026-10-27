@@ -17,15 +17,9 @@ type Ticket = WsTicket | FileTicket;
 /** Lost marks, and refused documents, kept per scope; dropping the oldest raises the scope's prunedThrough. */
 export const LOST_MARKS_PER_SCOPE = 32;
 
-/** Where a recycle's carry of a set's writes went (workingSet.ts, CarryFate): only a kept one may still land. */
-export interface CarryOutcome {
-  outcome(): 'carried' | 'kept' | 'landed' | 'dropped';
-}
-
-/** A working set that left the record's view before its writes landed: deposed when it was fenced; carry, the carry holding them all, if one does. */
+/** A working set that left the record's view before its writes landed: deposed when it was fenced. */
 export interface LostMark {
   stamp: number;
-  carry: CarryOutcome | null;
   deposed: boolean;
 }
 
@@ -39,9 +33,6 @@ export interface Refusal {
 interface Entry {
   ticket: Ticket;
   stamp: number;
-  // The lowest seq noted on it (an absent delete is noted at the delete it found, below the key's latest write): it
-  // answers for its key's writes from there to its ticket's.
-  from: number;
 }
 
 interface Scope {
@@ -105,18 +96,11 @@ export function noteScopeTicket(scopeId: string, ticket: Ticket, rewrites?: stri
   const entry = scope.entries.get(key);
   if (entry) {
     if (ticket.seq > entry.ticket.seq) entry.ticket = ticket;
-    entry.from = Math.min(entry.from, ticket.seq);
     entry.stamp = stamp;
   } else {
-    scope.entries.set(key, { ticket, stamp, from: ticket.seq });
+    scope.entries.set(key, { ticket, stamp });
   }
   if (ticket.kind === 'ws') scopeOfSet.set(ticket.set, scopeId);
-}
-
-/** The first write a scope's entry answers for with this ticket: the entry's lowest, or the ticket's own without one. */
-export function firstSeqOf(scopeId: string, ticket: Ticket): number {
-  const entry = scopes.get(scopeId)?.entries.get(keyOf(ticket));
-  return entry ? entry.from : ticket.seq;
 }
 
 /**
@@ -136,12 +120,8 @@ export function noteScopeRefusal(scopeId: string, doc: string): void {
   scope.prunedThrough = Math.max(scope.prunedThrough, oldest!.stamp);
 }
 
-/**
- * A working set left its manager's view (evicted, or its manager quiesced). An unlanded entry becomes a lost mark, so
- * the record holds the set no longer. carryOf names the carry a recycle took the entry's writes off in (from its
- * lowest to its latest), which a later manager may still land, or null when none holds them all.
- */
-export function setLeft(set: object, carryOf: (from: number, to: number) => CarryOutcome | null = () => null): void {
+/** A working set left its manager's view (evicted). An unlanded entry becomes a lost mark, so the record holds the set no longer. */
+export function setLeft(set: object): void {
   const scopeId = scopeOfSet.get(set);
   const scope = scopeId === undefined ? undefined : scopes.get(scopeId);
   const entry = scope?.entries.get(set);
@@ -149,7 +129,7 @@ export function setLeft(set: object, carryOf: (from: number, to: number) => Carr
   scope.entries.delete(set);
   if (landed(entry.ticket)) return;
   const deposed = entry.ticket.kind === 'ws' && entry.ticket.set.state === 'fenced';
-  scope.lost.push({ stamp: entry.stamp, carry: carryOf(entry.from, entry.ticket.seq), deposed });
+  scope.lost.push({ stamp: entry.stamp, deposed });
   if (scope.lost.length <= LOST_MARKS_PER_SCOPE) return;
   let oldest = 0;
   for (let i = 1; i < scope.lost.length; i += 1) {

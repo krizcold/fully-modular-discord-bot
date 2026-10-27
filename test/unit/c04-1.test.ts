@@ -1,13 +1,9 @@
 import fs from 'fs';
 import path from 'path';
 import { describe, expect, it, vi } from 'vitest';
+import { setBackendKind } from '../helpers/backendKind';
 
 const h = vi.hoisted(() => ({ failSave: false, docs: new Map<string, string>(), pgGuilds: new Set<string>() }));
-
-vi.mock('../../src/bot/internalSetup/utils/dataBackends/routeResolver', async (orig) => {
-  const real = await orig<any>();
-  return { ...real, routeFor: (g: string) => (h.pgGuilds.has(g) ? 'postgres' : real.routeFor(g)) };
-});
 
 vi.mock('../../src/bot/internalSetup/utils/dataBackends/workingSet', async (orig) => {
   const real = await orig<any>();
@@ -64,8 +60,9 @@ describe('C04-1 persistent panel records live in the guild data', () => {
     expect(fs.existsSync(dataPath('g-move', 'persistent-panels.json'))).toBe(false);
   });
 
-  it('a press on the recorded message after a master transfer is active on the new holder', async () => {
+  it('a press on the recorded message of a postgres guild is active', async () => {
     h.pgGuilds.add('g-press');
+    setBackendKind('postgres');
     try {
       expect((await storePersistentPanel('p_press', instance('m2'), 'g-press')).success).toBe(true);
       expect(h.docs.has('g-press|_panels|persistent-panels.json')).toBe(true);
@@ -74,6 +71,7 @@ describe('C04-1 persistent panel records live in the guild data', () => {
       expect(await isActiveInstance('p_press', 'other', 'g-press')).toBe('replaced');
     } finally {
       h.pgGuilds.delete('g-press');
+      setBackendKind(null);
     }
   });
 

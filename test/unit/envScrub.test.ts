@@ -25,7 +25,7 @@ describe('the env scrub', () => {
   // A key the scrub keeps (a platform one) that src reads fails this: such a read is a decision, made here.
   it('takes out every key src reads from process.env', () => {
     const keys = found(/process\.env(?:\.([A-Za-z_][A-Za-z0-9_]*)|\[\s*['"]([A-Za-z_][A-Za-z0-9_]*)['"]\s*\])/g);
-    expect(keys.length).toBeGreaterThan(30);
+    expect(keys.length).toBeGreaterThan(20);
     expect(keys.filter(kept)).toEqual([]);
   });
 

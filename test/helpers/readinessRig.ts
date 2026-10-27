@@ -1,7 +1,7 @@
 import { expect, vi } from 'vitest';
 
 import { initDataReadiness, type DataReadinessDriver, type LeaseSnapshot } from '../../src/bot/internalSetup/utils/dataBackends/dataReadiness';
-import { setRouteOverride } from '../../src/bot/internalSetup/utils/dataBackends/routeResolver';
+import { setBackendKind } from './backendKind';
 import { initWorkingSet } from '../../src/bot/internalSetup/utils/dataBackends/workingSet';
 import { FakeStore, tokenFor } from './fakeStore';
 import { freshGuild } from './gateRig';
@@ -24,7 +24,7 @@ export function readinessRig(lease: LeaseSnapshot | null = LEASED) {
   /** A postgres-routed guild with no working set. */
   const guild = () => {
     const guildId = freshGuild();
-    setRouteOverride(guildId, 'postgres');
+    setBackendKind('postgres');
     return guildId;
   };
   /** A postgres-routed guild whose set is ready. */

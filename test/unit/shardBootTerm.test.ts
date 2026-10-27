@@ -13,13 +13,13 @@ vi.mock('../../src/bot/internalSetup/fleet/placement', async importOriginal => {
   const real: any = await importOriginal();
   return {
     ...real,
-    fetchGatewayInfoResult: vi.fn(async () => ({ info: { url: 'wss://x', recommendedShards: 2, maxConcurrency: 1, sessionStartLimit: null }, error: null })),
+    fetchGatewayInfoResult: vi.fn(async () => ({ info: { recommendedShards: 2, sessionStartLimit: null }, error: null })),
   };
 });
 
 vi.mock('../../src/bot/internalSetup/utils/dataBackends/dataReadiness', async importOriginal => {
   const real: any = await importOriginal();
-  return { ...real, getDataReadiness: () => ({ onLeaseChanged: (s: any) => h.snapshots.push(s), onLeaseLost: () => {} }) };
+  return { ...real, getDataReadiness: () => ({ onLeaseChanged: (s: any) => h.snapshots.push(s) }) };
 });
 
 vi.mock('../../src/bot/internalSetup/utils/dataBackends/fileBackend', async importOriginal => {

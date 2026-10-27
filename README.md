@@ -16,7 +16,7 @@ A Discord bot framework designed with modularity at its core. Features are organ
 - 🏢 **Multi-Server Support** - Per-guild configuration with fallback to global defaults
 - 🔒 **Security First** - Permission-based access control and guild-restricted admin panels
 - 📦 **Production Ready** - Docker deployment with persistent data management
-- 🗄️ **Pluggable Data Backend** - JSON files by default, or central PostgreSQL for fleets (see [DATABASE.md](DATABASE.md))
+- 🗄️ **Pluggable Data Backend** - JSON files by default, or PostgreSQL for large bots (see [DATABASE.md](DATABASE.md))
 
 ---
 
@@ -530,9 +530,8 @@ words these outcomes itself declares `"dataContract": 2` in its module.json and 
 `confirmSaved('global')`) before it says "saved"; a refused write still replaces its reply with the bot's own message.
 The bot does not acknowledge such a module's command, button or modal interactions (only a module panel's button, menu
 or form is acknowledged, by 2.5 s after it was sent if nothing has answered it), and one can reach its handler up to about
-2 s after it was sent (held while the server's data loads or moves, or while this bot node does not serve it), so the
-module defers (`deferReply` or `deferUpdate`) before it awaits `confirmSaved`, or Discord shows "This interaction
-failed" after 3 s.
+2 s after it was sent (held while the server's data loads), so the module defers (`deferReply` or
+`deferUpdate`) before it awaits `confirmSaved`, or Discord shows "This interaction failed" after 3 s.
 From a timer or event, take `saveMark()` before the writes and pass it as `{ since }`.
 
 ### Creating Commands

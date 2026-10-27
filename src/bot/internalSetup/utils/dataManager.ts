@@ -3,7 +3,7 @@
 //
 // This is the module-facing facade: loadData/saveData/dataExists/deleteData
 // and every helper keep their exact signatures and return values. The facade
-// owns freeze checks, IO metrics, and .owner stamping; physical storage lives
+// owns IO metrics and the write records; physical storage lives
 // behind it (dataBackends/fileBackend.ts today: an async atomic queue where
 // saveData stringifies synchronously, enqueues, and returns immediately, and
 // a per-path flusher writes temp+fsync+rename so a crash never leaves a torn
@@ -24,7 +24,6 @@ import {
   existsOnDisk,
   readFileUtf8,
   readRaw,
-  freezeSentinelExists,
   guildDirExists,
   dropPendingForGuild,
   graveyardGuildDir,
@@ -42,23 +41,20 @@ import {
   fileFlushOnTheWire,
   fileFlushesLanded,
   flushGuild as flushGuildFiles,
-  pendingGuildFiles,
   filesPending,
   flushFailing as flushFailingFiles,
   readRawStrict,
   sweepGraveyard as sweepFileGraveyard,
   listGuilds as listGuildDirs,
-  sizeOfGuildData as sizeOfGuildDir,
 } from './dataBackends/fileBackend';
-import { routeFor } from './dataBackends/routeResolver';
-import { carryOf, getWorkingSet, DataBackendUnavailableError } from './dataBackends/workingSet';
+import { getWorkingSet, DataBackendUnavailableError } from './dataBackends/workingSet';
 import type { WsTicket } from './dataBackends/workingSet';
 import type { FileTicket } from './dataBackends/fileBackend';
 import { sweepGraveyardRows, PostgresBackend } from './dataBackends/postgresBackend';
 import type { DataBackend, FenceToken } from './dataBackends/backend';
-import { loadCredentials } from '../../../utils/envLoader';
+import { loadCredentials, resolveDataBackend } from '../../../utils/envLoader';
 import { currentSince, recordRefusal, recordTicket } from './dataBackends/writeLedger';
-import { firstSeqOf, noteScopeRefusal, noteScopeTicket, pendingFor, saveMark, stampOf, type SaveMark } from './dataBackends/scopeRecord';
+import { noteScopeRefusal, noteScopeTicket, pendingFor, saveMark, stampOf, type SaveMark } from './dataBackends/scopeRecord';
 
 export { listGlobalDataFiles, saveMark };
 export type { SaveMark };
@@ -94,6 +90,8 @@ export function setOwnedGuildCatalog(guilds: string[]): void {
   ownedCatalog = guilds;
 }
 
+const servedByPostgres = (): boolean => resolveDataBackend() === 'postgres';
+
 // Postgres-routed guild-scope calls answer from the Working Set; a missing
 // manager (the webui parent process, or a not-yet-wired boot) REFUSES rather
 // than falling through to files - a file write for a postgres-routed guild is
@@ -102,7 +100,7 @@ function wsRouted(options: DataOptions): string | null {
   if ((options.scope || 'guild') !== 'guild') return null;
   const guildId = options.guildId;
   if (!guildId) return null;
-  return routeFor(guildId) === 'postgres' ? guildId : null;
+  return servedByPostgres() ? guildId : null;
 }
 
 export function fenceFromOwnerInfo(guildId: string): FenceToken | null {
@@ -155,7 +153,7 @@ const flushOnTheWire = () => fileFlushOnTheWire() || (getWorkingSet()?.flushOnTh
 
 // A pass flushes what is queued when it starts: a write accepted during it and
 // a flush already on the wire are the next pass's, and the pause hands a flush
-// on the wire the event loop. A store that refuses (down, read-only, a failing
+// on the wire the event loop. A store that refuses (down, a failing
 // disk) is retried until nothing has landed for EXIT_DRAIN_GIVEUP_MS and
 // nothing is on the wire, so a blip drains and a dead store costs that window,
 // not the bound.
@@ -200,6 +198,19 @@ export function drainForExit(boundMs: number): Promise<void> {
   return exitDrain;
 }
 
+let guildWritesClosed = false;
+
+/** The data layer refused to serve: every guild-scope write from now on is refused, so none lands in a store the deployment's data does not live in. */
+export function closeGuildWrites(): void {
+  guildWritesClosed = true;
+}
+
+function guildWriteClosed(options: DataOptions, what: string): boolean {
+  if (!guildWritesClosed || (options.scope || 'guild') !== 'guild') return false;
+  console.warn(`[Data] ${what} for guild ${options.guildId ?? ''} while the data layer refuses to serve; refused`);
+  return true;
+}
+
 /** Whether the exit drain has closed the facade: every write from now on is refused as node-stopping. */
 export function isClosedForExit(): boolean {
   return closedForExit;
@@ -222,12 +233,12 @@ export function isStopping(): boolean {
 }
 
 /**
- * Flush every queued op for one guild (migration drain primitive).
+ * Flush every queued op for one guild.
  */
 export async function flushGuild(guildId: string): Promise<void> {
   await flushGuildFiles(guildId);
   const ws = getWorkingSet();
-  if (ws && routeFor(guildId) === 'postgres') {
+  if (ws && servedByPostgres()) {
     await ws.flushGuildNow(guildId, 30000);
   }
 }
@@ -238,7 +249,7 @@ export async function flushGuild(guildId: string): Promise<void> {
  */
 export function listGuilds(): string[] {
   const ws = getWorkingSet();
-  if (!ws || routeFor('0') !== 'postgres') return listGuildDirs();
+  if (!ws || !servedByPostgres()) return listGuildDirs();
   const ids = new Set<string>(ws.readyGuilds());
   for (const id of ownedCatalog) ids.add(id);
   return [...ids].filter(id => /^\d+$/.test(id));
@@ -250,66 +261,25 @@ export function listGuilds(): string[] {
  */
 export function listGuildDataFiles(guildId: string, category?: string): string[] {
   const ws = getWorkingSet();
-  if (ws && routeFor(guildId) === 'postgres') {
+  if (ws && servedByPostgres()) {
     return ws.listFiles(guildId, category ?? '') ?? [];
   }
   return listGuildDataFilesFs(guildId, category);
 }
 
 /**
- * Deadline-bounded durability confirmation for one guild (operator writes:
- * 'ok' = committed, 'pending' = accepted but still retrying, 'held' = the store
+ * Deadline-bounded durability confirmation for one accepted write: 'ok' =
+ * committed, 'pending' = accepted but still retrying, 'held' = the store
  * refused it, kept and retried, 'deposed' = the store refused a batch for a
- * newer owner, so the set's unlanded writes were dropped and none was carried,
- * 'unavailable' = the writes left this manager's hold before they landed (a
- * recycle, an evict or a replacement), so whether they are stored is unknown).
- * It answers for the writes this node's current manager holds for the guild
- * when it is called: one not quiesced that holds no unlanded write of the
- * guild, carried or its own, and no set of it fenced within its drain, answers
- * 'ok', also while a predecessor's batch of the guild is still on the wire
- * (open_items.md, "A recycle's batch on the wire") or after a prune dropped a
- * carry of its writes (R8-J10); confirmSaved answers for those, by its lost
- * marks.
- */
-export async function flushGuildOutcome(guildId: string, deadlineMs: number): Promise<'ok' | 'pending' | 'held' | 'deposed' | 'unavailable'> {
-  // Only the files queued when this call began are its to answer for: a write
-  // to another file meanwhile is its writer's, one to the same file carries this.
-  const queued = pendingGuildFiles(guildId);
-  await flushGuildFiles(guildId);
-  if (filesPending(queued)) return 'held';
-  const ws = getWorkingSet();
-  if (ws && routeFor(guildId) === 'postgres') {
-    // The set the flush answers for: one read here later (a replacement) holds
-    // none of its writes.
-    const set = ws.setOf(guildId);
-    const outcome = await ws.flushGuildNow(guildId, deadlineMs);
-    if (outcome !== 'unavailable') return outcome;
-    // Recycled: pending while carries a later manager keeps hold every write
-    // that set had not landed; a write in none, or a carry landed or dropped,
-    // leaves this side unable to tell.
-    return set && ws.setCarries(set)?.every(fate => fate.outcome() === 'kept') ? 'pending' : 'unavailable';
-  }
-  return 'ok';
-}
-
-/**
- * flushGuildOutcome for one accepted write: a later write of the same
- * document landing counts for it, and other writes of the guild still
- * queued do not.
+ * newer owner, so the set's unlanded writes were dropped, 'unavailable' = the
+ * write left this manager's hold before it landed (an evict or a
+ * replacement), so whether it is stored is unknown. A later write of the same
+ * document landing counts for it, and other writes of the guild still queued
+ * do not.
  */
 export async function confirmWrite(ticket: WriteTicket, deadlineMs: number): Promise<'ok' | 'pending' | 'held' | 'deposed' | 'unavailable'> {
-  return confirmFrom(ticket, deadlineMs, ticket.seq);
-}
-
-/** confirmWrite for a ticket that answers for its key's writes from the seq from on (a scope or ledger entry's). */
-export async function confirmFrom(ticket: WriteTicket, deadlineMs: number, from: number): Promise<'ok' | 'pending' | 'held' | 'deposed' | 'unavailable'> {
   if (ticket.kind === 'file') return confirmFile(ticket, deadlineMs);
-  const outcome = await ticket.manager.confirm(ticket, deadlineMs);
-  if (outcome !== 'unavailable') return outcome;
-  // Recycled: pending while a later manager keeps the carry that took the write
-  // off. One that landed answers unavailable too, as one dropped does: a write
-  // the successor took before applying it may have replaced it unseen.
-  return carryOf(ticket, from)?.outcome() === 'kept' ? 'pending' : 'unavailable';
+  return ticket.manager.confirm(ticket, deadlineMs);
 }
 
 export type SaveOutcome = 'ok' | 'pending' | 'held' | 'deposed' | 'unavailable' | 'refused';
@@ -333,9 +303,7 @@ const worstSave = (answers: SaveOutcome[]): SaveOutcome =>
  * number, or a mark kept from before a restart) answers 'unavailable'. It answers for every writer of the scope, not
  * the caller alone. category narrows file writes and refusals to that module's folder; a guild served from the
  * database answers for its whole working set, so another module's slower write can make it 'pending'. Raw atomic
- * writes are not counted. A working set's writes in the scope are answered together from the first of them: when
- * that one was on the wire as a recycle carried the set off, the answer is 'unavailable', even for a since after it
- * whose later writes the successor keeps (a cautious answer, as for a carry that landed).
+ * writes are not counted.
  */
 export async function confirmSaved(scope: string, options: { since?: SaveMark; deadlineMs?: number; category?: string } = {}): Promise<SaveOutcome> {
   const mark = options.since ?? currentSince();
@@ -344,9 +312,7 @@ export async function confirmSaved(scope: string, options: { since?: SaveMark; d
   const deadlineMs = options.deadlineMs ?? CONFIRM_SAVED_MS;
   const { tickets, lost, refused, pruned } = pendingFor(scope, since);
   const answers: SaveOutcome[] = pruned ? ['unavailable'] : [];
-  for (const mark of lost) {
-    answers.push(mark.deposed ? 'deposed' : mark.carry?.outcome() === 'kept' ? 'pending' : 'unavailable');
-  }
+  for (const mark of lost) answers.push(mark.deposed ? 'deposed' : 'unavailable');
   const docPrefix = options.category === undefined ? null : `${scope === 'global' ? 'global' : `guild:${scope}`}:${options.category}/`;
   for (const refusal of refused) {
     if (docPrefix === null || refusal.doc.startsWith(docPrefix)) answers.push(refusal.rewritten ? 'unavailable' : 'refused');
@@ -355,13 +321,11 @@ export async function confirmSaved(scope: string, options: { since?: SaveMark; d
     ? null
     : getDataDirectory(scope === 'global' ? { scope: 'global', category: options.category } : { guildId: scope, category: options.category }) + path.sep;
   const judged = tickets.filter(ticket => ticket.kind === 'ws' || folder === null || ticket.path.startsWith(folder));
-  // Each ticket answers for its entry's writes from the first, which a recycle may have left out of its carry.
-  const froms = judged.map(ticket => firstSeqOf(scope, ticket));
-  const first = await Promise.all(judged.map((ticket, i) => confirmFrom(ticket, deadlineMs, froms[i]).catch(() => 'unavailable' as const)));
+  const first = await Promise.all(judged.map(ticket => confirmWrite(ticket, deadlineMs).catch(() => 'unavailable' as const)));
   // A held write is retried while slower confirms finish, so it is read again when the answer is taken.
   const now = await Promise.all(first.map((answer, i) => answer !== 'held'
     ? answer
-    : confirmFrom(judged[i], 0, froms[i]).then(again => (again === 'pending' ? 'held' as const : again), () => 'unavailable' as const)));
+    : confirmWrite(judged[i], 0).then(again => (again === 'pending' ? 'held' as const : again), () => 'unavailable' as const)));
   return worstSave([...answers, ...now]);
 }
 
@@ -372,7 +336,7 @@ export async function confirmSaved(scope: string, options: { since?: SaveMark; d
  */
 export function readGuildDocRaw(guildId: string, module: string, filename: string): string | null {
   const ws = getWorkingSet();
-  if (ws && routeFor(guildId) === 'postgres') {
+  if (ws && servedByPostgres()) {
     return ws.readDocRaw(guildId, module, filename);
   }
   return readRawStrict(guildDocFilePath(guildId, module, filename));
@@ -388,7 +352,7 @@ function guildDocFilePath(guildId: string, module: string, filename: string): st
  * working set serves the guild.
  */
 export function guildDocFileQueue(guildId: string, module: string, filename: string): { pending: boolean; failing: boolean } | null {
-  if (getWorkingSet() && routeFor(guildId) === 'postgres') return null;
+  if (getWorkingSet() && servedByPostgres()) return null;
   const filePath = guildDocFilePath(guildId, module, filename);
   return { pending: filesPending([filePath]), failing: flushFailingFiles([filePath]) };
 }
@@ -399,33 +363,19 @@ export function guildDocFileQueue(guildId: string, module: string, filename: str
  */
 export function listGuildDataKeys(guildId: string): { module: string; filename: string }[] | null {
   const ws = getWorkingSet();
-  if (ws && routeFor(guildId) === 'postgres') {
+  if (ws && servedByPostgres()) {
     return ws.listAllKeys(guildId);
   }
   return null;
 }
 
 /**
- * Total size in bytes of a guild's data in its routing backend.
- */
-export function sizeOfGuildData(guildId: string): Promise<number> {
-  if (pgBackend && routeFor(guildId) === 'postgres') {
-    return pgBackend.sizeOfGuildData(guildId);
-  }
-  return sizeOfGuildDir(guildId);
-}
-
-/**
- * Graveyard TTL sweep: always sweeps the file _graveyard (transformation-
- * retired file copies keep their TTL); in postgres mode the single janitor
- * (any non-co-worker role) additionally sweeps tombstoned rows.
+ * Graveyard TTL sweep: always sweeps the file _graveyard; in postgres mode it
+ * also sweeps tombstoned rows.
  */
 export async function sweepGraveyard(): Promise<void> {
   await sweepFileGraveyard();
-  if (!pgBackend || routeFor('0') !== 'postgres') return;
-  const explicitRole = (process.env.BOT_NODE_ROLE || '').trim().toLowerCase();
-  const isCoWorker = explicitRole === 'co-worker' || explicitRole === 'backup-master';
-  if (isCoWorker) return;
+  if (!pgBackend || !servedByPostgres()) return;
   const url = loadCredentials().DATA_BACKEND_URL;
   if (!url) return;
   const ttlDays = Number(process.env.GRAVEYARD_TTL_DAYS);
@@ -505,72 +455,7 @@ function getDataFilePath(filename: string, options: DataOptions): string {
 }
 
 // ============================================================================
-// FREEZE (migration drain choke point)
-// ============================================================================
-
-// Cached: the write path only consults the .freeze sentinel when NOT standalone,
-// so a standalone box (incl. a master with BOT_NODE_ROLE=master and no
-// CONTROL_SECRET) pays zero extra per-write syscalls. This mirrors
-// nodeIdentity.isStandalone (master role + no CONTROL_SECRET); the role
-// resolution is duplicated locally to keep dataManager free of a fleet import.
-let cachedFleetEnv: boolean | null = null;
-function hasFleetEnv(): boolean {
-  if (cachedFleetEnv === null) {
-    const explicitRole = (process.env.BOT_NODE_ROLE || '').trim().toLowerCase();
-    const isCoWorker = explicitRole === 'co-worker' || explicitRole === 'backup-master';
-    const isStandalone = !isCoWorker && (process.env.CONTROL_SECRET || '').trim() === '';
-    cachedFleetEnv = !isStandalone;
-  }
-  return cachedFleetEnv;
-}
-
-const frozenGuilds = new Set<string>();
-let frozenWriteRejections = 0;
-const rejectionsAtFreeze = new Map<string, number>();
-
-export function freezeGuildWrites(guildId: string): void {
-  frozenGuilds.add(guildId);
-  rejectionsAtFreeze.set(guildId, frozenWriteRejections);
-}
-
-export function unfreezeGuildWrites(guildId: string): void {
-  const atFreeze = rejectionsAtFreeze.get(guildId);
-  rejectionsAtFreeze.delete(guildId);
-  if (frozenGuilds.delete(guildId) && atFreeze !== undefined) {
-    // Counter is facade-global, so with several guilds frozen at once the
-    // delta attributes all rejections in the window to each; observability
-    // only, exact counts live with the rejecting writer's own handling.
-    const dropped = frozenWriteRejections - atFreeze;
-    if (dropped > 0) console.log(`[Data] Guild ${guildId} unfrozen; ${dropped} frozen-write rejection(s) during the freeze window`);
-  }
-}
-
-export function getFrozenStats(): { frozenGuilds: string[]; frozenWriteRejections: number } {
-  return { frozenGuilds: [...frozenGuilds], frozenWriteRejections };
-}
-
-// Returns true when writes to this guild must be rejected (in-memory freeze set,
-// or the cross-process .freeze sentinel when fleet env is present).
-function isGuildFrozen(options: DataOptions): boolean {
-  if ((options.scope || 'guild') !== 'guild') return false;
-  const guildId = options.guildId;
-  if (!guildId) return false;
-  if (frozenGuilds.has(guildId)) return true;
-  if (hasFleetEnv() && freezeSentinelExists(guildId)) return true;
-  return false;
-}
-
-/**
- * Route-visible freeze check: the same gate the facade rejects writes with,
- * including the cross-process .freeze sentinel, so the webui process can refuse
- * an operator save instead of silently dropping it.
- */
-export function isGuildWriteFrozen(guildId: string): boolean {
-  return isGuildFrozen({ guildId });
-}
-
-// ============================================================================
-// .owner MANIFESTS
+// OWNER INFO (the fence token source)
 // ============================================================================
 
 export interface OwnerInfo {
@@ -581,49 +466,22 @@ export interface OwnerInfo {
 }
 
 let ownerInfoProvider: (() => OwnerInfo | null) | null = null;
-// Guilds whose .owner has been stamped this process lifetime (no per-write cost).
-const ownerStamped = new Set<string>();
 
 /**
- * Wire the owner-info source (fleet/bootstrap after init). dataManager cannot
+ * Wire the owner-info source (the shard boot after init). dataManager cannot
  * import fleet, so ownership is injected. Provider null (early boot) -> skip.
  */
 export function setOwnerInfoProvider(fn: () => OwnerInfo | null): void {
   ownerInfoProvider = fn;
 }
 
-// Local copy of the guild->shard formula (placement.ts) to avoid an import
-// cycle (fleet imports the facade, not vice versa).
+// Discord's guild->shard formula; dataReadiness.ts holds the same copy.
 function guildIdToShardId(guildId: string, shardCount: number): number {
   try {
     return Number((BigInt(guildId) >> 22n) % BigInt(Math.max(1, shardCount)));
   } catch {
     return 0;
   }
-}
-
-/**
- * Stamp /data/{guildId}/.owner if not yet done this process lifetime. Enqueued
- * through the same atomic queue. No-op when no provider is wired.
- */
-export function stampOwner(guildId: string): void {
-  // Postgres-routed guilds are stamped by the hydration claim (the ownership
-  // row IS the manifest); a lazy write-time stamp would let a non-owner mint
-  // a row and out-fence the real owner.
-  if (routeFor(guildId) === 'postgres') return;
-  if (ownerStamped.has(guildId)) return;
-  const info = ownerInfoProvider?.();
-  if (!info) return;
-  const manifest = {
-    guildId,
-    shardId: guildIdToShardId(guildId, info.shardCount),
-    nodeId: info.nodeId,
-    term: info.term,
-    epoch: info.epoch,
-    updatedAt: Date.now(),
-  };
-  const target = path.join(BASE_DATA_DIR, guildId, '.owner');
-  if (writeRawAtomicFile(target, JSON.stringify(manifest, null, 2))) ownerStamped.add(guildId);
 }
 
 // ============================================================================
@@ -785,11 +643,8 @@ export function saveDataTracked<T = any>(filename: string, options: DataOptions,
 
 function acceptSave<T>(filename: string, options: DataOptions, data: T): SaveTracked {
   if (closedForExit) throw new DataBackendUnavailableError('node-stopping');
+  if (guildWriteClosed(options, 'Write')) return { outcome: 'refused', cause: 'not-ready' };
   try {
-    if (isGuildFrozen(options)) {
-      frozenWriteRejections += 1;
-      return { outcome: 'frozen' };
-    }
     const wsGuild = wsRouted(options);
     if (wsGuild !== null) {
       const ws = getWorkingSet();
@@ -804,21 +659,17 @@ function acceptSave<T>(filename: string, options: DataOptions, data: T): SaveTra
         getMetricsCollector().recordIO('write', options.guildId ?? null, options.category ?? null);
         return { outcome: 'saved', ticket };
       }
-      if (result === 'frozen-window') { frozenWriteRejections += 1; return { outcome: 'frozen' }; }
+      if (result === 'frozen-window') return { outcome: 'frozen' };
       if (result === 'not-ready') return { outcome: 'refused', cause: 'not-ready' };
-      throw result === 'fenced' ? new DataBackendUnavailableError('guild-fenced')
-        : result === 'stale-copy' ? new DataBackendUnavailableError('database-stale-copy')
-          : result === 'read-only' ? new DataBackendUnavailableError('database-read-only')
-            : ws.refusal();
+      throw result === 'fenced' ? new DataBackendUnavailableError('guild-fenced') : ws.refusal();
     }
     const dir = getDataDirectory(options);
     const filePath = getDataFilePath(filename, options);
     const scope = options.scope || 'guild';
 
-    // Ensure the dir synchronously so the guild dir exists (and .owner can be
-    // stamped) the moment the save is accepted, matching today's create timing.
+    // Ensure the dir synchronously so the guild dir exists the moment the save
+    // is accepted.
     ensureDirectory(dir);
-    if (scope === 'guild' && options.guildId) stampOwner(options.guildId);
 
     const content = JSON.stringify(data, null, 2);
     enqueueWrite(filePath, content);
@@ -849,11 +700,8 @@ export function appendDataTracked(filename: string, options: DataOptions, line: 
 
 function acceptAppend(filename: string, options: DataOptions, line: string): AppendTracked {
   if (closedForExit) throw new DataBackendUnavailableError('node-stopping');
+  if (guildWriteClosed(options, 'Append')) return { outcome: 'refused', cause: 'not-ready' };
   try {
-    if (isGuildFrozen(options)) {
-      frozenWriteRejections += 1;
-      return { outcome: 'frozen' };
-    }
     const wsGuild = wsRouted(options);
     if (wsGuild !== null) {
       const ws = getWorkingSet();
@@ -867,18 +715,14 @@ function acceptAppend(filename: string, options: DataOptions, line: string): App
         getMetricsCollector().recordIO('write', options.guildId ?? null, options.category ?? null);
         return { outcome: 'appended', ticket };
       }
-      if (result === 'frozen-window') { frozenWriteRejections += 1; return { outcome: 'frozen' }; }
+      if (result === 'frozen-window') return { outcome: 'frozen' };
       if (result === 'not-ready') return { outcome: 'refused', cause: 'not-ready' };
-      throw result === 'fenced' ? new DataBackendUnavailableError('guild-fenced')
-        : result === 'stale-copy' ? new DataBackendUnavailableError('database-stale-copy')
-          : result === 'read-only' ? new DataBackendUnavailableError('database-read-only')
-            : ws.refusal();
+      throw result === 'fenced' ? new DataBackendUnavailableError('guild-fenced') : ws.refusal();
     }
     const dir = getDataDirectory(options);
     const filePath = getDataFilePath(filename, options);
     const scope = options.scope || 'guild';
     ensureDirectory(dir);
-    if (scope === 'guild' && options.guildId) stampOwner(options.guildId);
 
     enqueueAppend(filePath, line);
     const ticket = fileTicket(filePath);
@@ -927,11 +771,8 @@ export function deleteDataTracked(filename: string, options: DataOptions): Delet
 
 function acceptDelete(filename: string, options: DataOptions): DeleteTracked {
   if (closedForExit) throw new DataBackendUnavailableError('node-stopping');
+  if (guildWriteClosed(options, 'Delete')) return { outcome: 'refused', cause: 'not-ready' };
   try {
-    if (isGuildFrozen(options)) {
-      frozenWriteRejections += 1;
-      return { outcome: 'frozen' };
-    }
     const wsGuild = wsRouted(options);
     if (wsGuild !== null) {
       const ws = getWorkingSet();
@@ -950,12 +791,9 @@ function acceptDelete(filename: string, options: DataOptions): DeleteTracked {
         console.log(`[DataManager] Deleted ${wsGuild}/${options.category ?? ''}/${filename}`);
         return { outcome: 'deleted', ticket };
       }
-      if (result === 'frozen-window') { frozenWriteRejections += 1; return { outcome: 'frozen' }; }
+      if (result === 'frozen-window') return { outcome: 'frozen' };
       if (result === 'not-ready') return { outcome: 'refused', cause: 'not-ready' };
-      throw result === 'fenced' ? new DataBackendUnavailableError('guild-fenced')
-        : result === 'stale-copy' ? new DataBackendUnavailableError('database-stale-copy')
-          : result === 'read-only' ? new DataBackendUnavailableError('database-read-only')
-            : ws.refusal();
+      throw result === 'fenced' ? new DataBackendUnavailableError('guild-fenced') : ws.refusal();
     }
     const filePath = getDataFilePath(filename, options);
 
@@ -991,7 +829,7 @@ function acceptDelete(filename: string, options: DataOptions): DeleteTracked {
  * writes a .graveyard.json reason marker inside.
  */
 export async function deleteGuildNamespace(guildId: string, reason: string, flushMs = 30000): Promise<boolean> {
-  if (routeFor(guildId) === 'postgres') {
+  if (servedByPostgres()) {
     if (!pgBackend) return false;
     const ws = getWorkingSet();
     if (ws) {
@@ -1003,8 +841,6 @@ export async function deleteGuildNamespace(guildId: string, reason: string, flus
       }
       ws.evict(guildId);
     }
-    frozenGuilds.delete(guildId);
-    ownerStamped.delete(guildId);
     const token = fenceFromOwnerInfo(guildId);
     if (!token) {
       console.warn(`[DataManager] Cannot retire guild ${guildId}: no owner info wired`);
@@ -1021,10 +857,7 @@ export async function deleteGuildNamespace(guildId: string, reason: string, flus
   if (!guildDirExists(guildId)) return false;
 
   await flushGuild(guildId);
-  // Drop pending entries + freeze/stamp state for this guild.
   dropPendingForGuild(guildId);
-  frozenGuilds.delete(guildId);
-  ownerStamped.delete(guildId);
 
   return graveyardGuildDir(guildId, reason);
 }
@@ -1036,7 +869,7 @@ export async function deleteGuildNamespace(guildId: string, reason: string, flus
  * retiredAt absent = the guild's newest graveyard batch/entry.
  */
 export async function restoreGuildFromGraveyard(guildId: string, retiredAt?: number): Promise<{ ok: boolean; error?: string; moved?: number }> {
-  if (routeFor(guildId) === 'postgres') {
+  if (servedByPostgres()) {
     if (!pgBackend) throw new DataBackendUnavailableError('database-unreachable');
     let batch = retiredAt;
     if (batch === undefined) {
@@ -1061,7 +894,7 @@ export async function restoreGuildFromGraveyard(guildId: string, retiredAt?: num
       return { ok: true, moved: res.moved };
     }
     if (res.reason === 'live-rows') return { ok: false, error: 'live guild data exists; delete it before restoring' };
-    throw new DataBackendUnavailableError(pgBackend.isStaleCopy?.() ? 'database-stale-copy' : pgBackend.isReadOnly() ? 'database-read-only' : 'database-unreachable');
+    throw new DataBackendUnavailableError('database-unreachable');
   }
   return restoreGuildDirFromGraveyard(guildId, retiredAt);
 }
@@ -1152,7 +985,7 @@ export function loadModuleData<T = any>(
  * @param data - Data to save
  * @returns True once the write is accepted: queued to be stored, not stored yet (confirmSaved(guildId) says when it
  * is). False for a frozen guild, a set not ready or a storage error. A stopping bot or a database refusal
- * (unreachable, read-only, fenced) throws DataBackendUnavailableError.
+ * (unreachable, fenced) throws DataBackendUnavailableError.
  *
  * @example
  * // Saves to: /data/{guildId}/giveaway/data.json
@@ -1274,7 +1107,7 @@ export function globalModuleDataExists(filename: string, moduleName: string): bo
  * @param moduleName - Module name
  * @returns True once the delete is accepted: queued, not stored yet (confirmSaved(guildId) says when it is). False
  * when the file was absent, for a frozen guild, a set not ready or a storage error. A stopping bot or a database
- * refusal (unreachable, read-only, fenced) throws DataBackendUnavailableError.
+ * refusal (unreachable, fenced) throws DataBackendUnavailableError.
  */
 export function deleteModuleData(
   filename: string,

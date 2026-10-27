@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { admitGuildAction, gateCauseNow } from '../../src/bot/internalSetup/utils/dataBackends/boot';
-import { drainForExit, freezeGuildWrites, isClosedForExit, unfreezeGuildWrites } from '../../src/bot/internalSetup/utils/dataManager';
+import { drainForExit, isClosedForExit } from '../../src/bot/internalSetup/utils/dataManager';
+import { freezeGuildWrites, unfreezeGuildWrites } from '../helpers/freezeGuild';
 import { readinessRig, stopDrivers, watch } from '../helpers/readinessRig';
 
 // R1-J2's stopping row (notes/BT.md, "R1-J2 design sheet (L0): final, after the re-read"). Its own file: the exit

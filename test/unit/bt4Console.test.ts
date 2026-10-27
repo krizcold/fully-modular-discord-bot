@@ -33,7 +33,8 @@ vi.mock('../../src/bot/internalSetup/utils/premiumManager', async importOriginal
   };
 });
 
-import { confirmWrite, freezeGuildWrites, saveData, saveDataOutcome, unfreezeGuildWrites } from '../../src/bot/internalSetup/utils/dataManager';
+import { confirmWrite, saveData, saveDataOutcome } from '../../src/bot/internalSetup/utils/dataManager';
+import { freezeGuildWrites, unfreezeGuildWrites } from '../helpers/freezeGuild';
 import { ledgerOf } from '../../src/bot/internalSetup/utils/dataBackends/writeLedger';
 import { CONFIRM_MS, truthText } from '../../src/bot/internalSetup/utils/dataBackends/replyGate';
 import { handleInvoke } from '../../src/bot/internalSetup/utils/ipcCommandHandler';
@@ -100,7 +101,7 @@ describe('a console run whose writes are not confirmed', () => {
 
   it('a held write answers held, marked pending', async () => {
     const { guildId, store, options } = await storeGuild();
-    store.mode = 'read-only';
+    store.mode = 'unavailable';
     const { answer } = await invoke(async () => {
       saveData('x.json', options, { v: 1 });
     }, {}, guildId);
@@ -109,7 +110,7 @@ describe('a console run whose writes are not confirmed', () => {
 
   it('a held write while the bot stops says the change may be lost, still marked pending', async () => {
     const { guildId, store, options } = await storeGuild();
-    store.mode = 'read-only';
+    store.mode = 'unavailable';
     const { answer } = await invoke(async () => {
       saveData('x.json', options, { v: 1 });
       stop.on = true;
@@ -217,7 +218,7 @@ describe('the dispatcher refuses the command (R1-J22)', () => {
 describe('a persistent panel the console run did not post', () => {
   it('answers that it was not posted, even when its writes land afterwards', async () => {
     const { guildId, store, options } = await storeGuild();
-    store.mode = 'read-only';
+    store.mode = 'unavailable';
     const sent: unknown[] = [];
     const { answer } = await invoke(async i => {
       saveData('x.json', options, { v: 1 });
@@ -234,7 +235,7 @@ describe('a persistent panel the console run did not post', () => {
 
   it('the first outcome is the one answered', async () => {
     const { guildId, store, options } = await storeGuild();
-    store.mode = 'read-only';
+    store.mode = 'unavailable';
     const { answer } = await invoke(async i => {
       saveData('x.json', options, { v: 1 });
       i.channel = { send: async () => ({}) };

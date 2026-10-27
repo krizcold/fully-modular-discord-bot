@@ -18,7 +18,7 @@ import type { BotManager } from '../../src/webui/botManager';
 
 export type Reply = Record<string, unknown>;
 type Scripted = object | Promise<object> | undefined;
-export interface GuildRead { guildId: string; module: string; filename?: string; scope?: 'all' }
+export interface GuildRead { guildId: string; module: string; filename?: string }
 export interface GlobalRead { root?: 'config'; rel?: string }
 
 export class FakeChild {
@@ -51,7 +51,6 @@ export function botFor(child: FakeChild): BotManager {
   return {
     isRunning: () => child.running,
     listLoadedModules: async () => null,
-    notifySyncMutation: () => undefined,
     readGuildData: async (req: GuildRead) => {
       child.guildReads.push(req);
       if (!child.running) return down;

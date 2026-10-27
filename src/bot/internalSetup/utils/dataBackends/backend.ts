@@ -1,6 +1,6 @@
 // Backend contract for guild data storage. Two permanent implementations sit
-// behind it: FileBackend (per-node disk, shared-nothing) and PostgresBackend
-// (central database, stateless workers). The module-facing dataManager facade
+// behind it: FileBackend (the bot's own disk) and PostgresBackend (a
+// database). The module-facing dataManager facade
 // stays synchronous; these async surfaces are driven by the Working Set /
 // coalescing layer and by interchange tooling, never by modules directly.
 
@@ -29,8 +29,7 @@ export interface FenceToken {
 export type FlushOutcome =
   | { ok: true }
   | { ok: false; reason: 'deposed'; currentOwner?: { nodeId: string; term: number; epoch: number } }
-  | { ok: false; reason: 'unavailable' }
-  | { ok: false; reason: 'read-only' };
+  | { ok: false; reason: 'unavailable' };
 
 export type HydrationOutcome =
   | { ok: true; docs: { key: DocKey; doc: string }[]; appendKeys: DocKey[] }
@@ -61,11 +60,5 @@ export interface DataBackend {
   /** Top-level .json names only, non-recursive (file-mode listing parity). */
   listGuildFiles(guildId: string, module?: string): Promise<string[]>;
   guildFileExists(guildId: string, key: DocKey): Promise<boolean>;
-  sizeOfGuildData(guildId: string): Promise<number>;
-  healthy(): boolean;
-  /** The store refuses writes (a copy in recovery, SQLSTATE 25006) while reads keep serving. */
-  isReadOnly(): boolean;
-  /** The store is an older copy of the fleet database: it refuses every write for good. */
-  isStaleCopy?(): boolean;
   onAlert(cb: (event: 'outage' | 'recovered' | 'deposed', detail: string) => void): void;
 }

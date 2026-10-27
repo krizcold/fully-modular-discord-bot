@@ -23,35 +23,18 @@ export interface BotCredentials {
   CLIENT_ID?: string;
   GUILD_ID?: string;
   MAIN_GUILD_ID?: string;
-  // Fleet / sharding control plane (Phase 1). Resolved in the bot child:
-  // explicit BOT_NODE_ROLE wins; absent means master.
-  BOT_NODE_ROLE?: string;
-  /** Ordered comma-separated master candidate list (PLAN_STANDBY 3.4). */
-  MASTER_URLS?: string;
-  CONTROL_SECRET?: string;
-  CONTROL_PORT?: string;
-  FLEET_PUBLIC_URL?: string;
+  // Sharding, read in the bot child.
   NODE_NAME?: string;
-  PIN_TEST_GUILD_SHARD?: string;
   FLEET_SHARD_COUNT?: string;
-  FLEET_SHARD_CAPACITY?: string;
-  TRANSFER_URL?: string;
-  TRANSFER_PORT?: string;
   // OAuth Configuration (Optional - for Guild Web-UI)
   ENABLE_GUILD_WEBUI?: string;
   DISCORD_CLIENT_ID?: string;
   DISCORD_CLIENT_SECRET?: string;
   OAUTH_CALLBACK_URL?: string;
   SESSION_SECRET?: string;
-  // Data backend: file (default) | postgres, the Postgres connection string,
-  // and the optional control-store location override.
+  // Data backend: file (default) | postgres, and the Postgres connection string.
   DATA_BACKEND?: string;
   DATA_BACKEND_URL?: string;
-  /** Host-reachable form of DATA_BACKEND_URL, delivered to remote workers (same-host consumers cannot hairpin it). */
-  DATA_BACKEND_PUBLIC_URL?: string;
-  /** Container-name form as delivered, kept verbatim so this node can re-deliver the pair if it becomes master. */
-  DATA_BACKEND_LOCAL_URL?: string;
-  CONTROL_STORE_URL?: string;
   // Payment provider credentials are arbitrary env-var keys the providers
   // declare via getCredentialFields(); they're addressable through the
   // [string]: string | undefined index signature below. The per-provider
@@ -82,15 +65,6 @@ let envReadError: string | null = null;
  */
 export function credentialsReadError(): string | null {
   return envReadError;
-}
-
-function readEnvLines(dataEnvPath: string): string[] | null {
-  try {
-    return fs.readFileSync(dataEnvPath, 'utf-8').split(/\r?\n/);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return null;
-    throw error;
-  }
 }
 
 function isPlaceholderValue(value?: string): boolean {
@@ -131,18 +105,9 @@ export function loadCredentials(): BotCredentials {
     CLIENT_ID: process.env.CLIENT_ID,
     GUILD_ID: process.env.GUILD_ID,
     MAIN_GUILD_ID: process.env.MAIN_GUILD_ID,
-    // Fleet fields (flow to the bot child via the botManager env spread)
-    BOT_NODE_ROLE: process.env.BOT_NODE_ROLE,
-    MASTER_URLS: process.env.MASTER_URLS,
-    CONTROL_SECRET: process.env.CONTROL_SECRET,
-    CONTROL_PORT: process.env.CONTROL_PORT,
-    FLEET_PUBLIC_URL: process.env.FLEET_PUBLIC_URL,
+    // Sharding fields (flow to the bot child via the botManager env spread)
     NODE_NAME: process.env.NODE_NAME,
-    PIN_TEST_GUILD_SHARD: process.env.PIN_TEST_GUILD_SHARD,
     FLEET_SHARD_COUNT: process.env.FLEET_SHARD_COUNT,
-    FLEET_SHARD_CAPACITY: process.env.FLEET_SHARD_CAPACITY,
-    TRANSFER_URL: process.env.TRANSFER_URL,
-    TRANSFER_PORT: process.env.TRANSFER_PORT,
     // OAuth fields
     ENABLE_GUILD_WEBUI: process.env.ENABLE_GUILD_WEBUI,
     DISCORD_CLIENT_ID: process.env.DISCORD_CLIENT_ID,
@@ -151,9 +116,6 @@ export function loadCredentials(): BotCredentials {
     SESSION_SECRET: process.env.SESSION_SECRET,
     DATA_BACKEND: process.env.DATA_BACKEND,
     DATA_BACKEND_URL: process.env.DATA_BACKEND_URL,
-    DATA_BACKEND_PUBLIC_URL: process.env.DATA_BACKEND_PUBLIC_URL,
-    DATA_BACKEND_LOCAL_URL: process.env.DATA_BACKEND_LOCAL_URL,
-    CONTROL_STORE_URL: process.env.CONTROL_STORE_URL,
   };
 
   // Payment provider env vars are dynamic per provider; copy through any
@@ -206,7 +168,7 @@ export function loadCredentials(): BotCredentials {
         }
       }
       // A seeded key deleted from the file was explicitly cleared: unset it
-      // everywhere so e.g. a cleared MASTER_URLS stays cleared.
+      // everywhere so e.g. a cleared NODE_NAME stays cleared.
       for (const key of [...fileSeededEnvKeys]) {
         if (!(key in dataEnv)) {
           delete process.env[key];
@@ -272,21 +234,13 @@ export function ensureDurableSessionSecret(): void {
 
 export type DataBackendKind = 'file' | 'postgres';
 
-// Fleet-delivered backend decision (register reply; workers follow the master).
-// Takes precedence over process env and /data/.env when set.
-let fleetDataBackend: { backend: DataBackendKind; url?: string } | null = null;
 let cachedEnvBackend: DataBackendKind | null = null;
-
-export function setFleetDataBackend(info: { backend: DataBackendKind; url?: string } | null): void {
-  fleetDataBackend = info;
-}
 
 /**
  * The deployment's data backend. Absent/empty DATA_BACKEND means file; any
  * value other than file/postgres refuses boot.
  */
 export function resolveDataBackend(): DataBackendKind {
-  if (fleetDataBackend) return fleetDataBackend.backend;
   if (cachedEnvBackend === null) {
     const raw = (loadCredentials().DATA_BACKEND || '').trim().toLowerCase();
     if (raw === '' || raw === 'file') cachedEnvBackend = 'file';
@@ -353,61 +307,6 @@ export function saveCredentials(credentials: BotCredentials): { success: boolean
 }
 
 /**
- * Upsert exactly the given keys into /data/.env, preserving every other line
- * verbatim (saveCredentials would freeze compose-provided values into the
- * file). Atomic temp + rename. Used by the master-delivered backend apply.
- */
-export function upsertCredentials(patch: Record<string, string>): { success: boolean; error?: string } {
-  const dataEnvPath = dataPath('.env');
-  try {
-    fs.mkdirSync(path.dirname(dataEnvPath), { recursive: true });
-    const lines = readEnvLines(dataEnvPath) ?? [];
-    const remaining = new Set(Object.keys(patch));
-    const updated = lines.map(line => {
-      const match = line.match(/^([A-Za-z_][A-Za-z0-9_]*)=/);
-      if (match && remaining.has(match[1])) {
-        remaining.delete(match[1]);
-        return `${match[1]}=${patch[match[1]]}`;
-      }
-      return line;
-    });
-    while (updated.length > 0 && updated[updated.length - 1] === '') updated.pop();
-    for (const key of remaining) updated.push(`${key}=${patch[key]}`);
-    const tmp = `${dataEnvPath}.tmp`;
-    fs.writeFileSync(tmp, updated.join('\n') + '\n', { encoding: 'utf-8' });
-    fs.renameSync(tmp, dataEnvPath);
-    return { success: true };
-  } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-    console.error('[EnvLoader] Error upserting credentials:', errorMessage);
-    return { success: false, error: errorMessage };
-  }
-}
-
-/** Drop exactly the given keys from /data/.env, every other line kept verbatim; a key already absent is not an error. */
-export function removeCredentials(keys: string[]): { success: boolean; error?: string } {
-  const dataEnvPath = dataPath('.env');
-  try {
-    const lines = readEnvLines(dataEnvPath);
-    if (lines === null) return { success: true };
-    const drop = new Set(keys);
-    const kept = lines.filter(line => {
-      const match = line.match(/^([A-Za-z_][A-Za-z0-9_]*)=/);
-      return !(match && drop.has(match[1]));
-    });
-    while (kept.length > 0 && kept[kept.length - 1] === '') kept.pop();
-    const tmp = `${dataEnvPath}.tmp`;
-    fs.writeFileSync(tmp, kept.join('\n') + '\n', { encoding: 'utf-8' });
-    fs.renameSync(tmp, dataEnvPath);
-    return { success: true };
-  } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-    console.error('[EnvLoader] Error removing credentials:', errorMessage);
-    return { success: false, error: errorMessage };
-  }
-}
-
-/**
  * Gets masked credential status (for Web-UI display)
  * Never returns actual credential values for security
  */
@@ -465,10 +364,6 @@ export function getCredentialStatus(credentials: BotCredentials): Record<string,
     DATA_BACKEND_URL: {
       set: !!(credentials.DATA_BACKEND_URL && credentials.DATA_BACKEND_URL.length > 10),
       value: credentials.DATA_BACKEND_URL && credentials.DATA_BACKEND_URL.length > 10 ? '[••••••••] (Set)' : '[Empty] (Not Set)'
-    },
-    CONTROL_STORE_URL: {
-      set: !!(credentials.CONTROL_STORE_URL && credentials.CONTROL_STORE_URL.length > 10),
-      value: credentials.CONTROL_STORE_URL && credentials.CONTROL_STORE_URL.length > 10 ? '[••••••••] (Set)' : '[Empty] (Not Set)'
     },
     // Payment provider credentials are surfaced through the per-provider
     // /api/appstore/premium/providers/:id/credentials endpoint instead of

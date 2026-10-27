@@ -4,8 +4,6 @@ import * as fs from 'fs';
 import { BotManager } from '../botManager';
 import { getSafetyManager } from '../../utils/updateSafety';
 import { dataPath } from '../../utils/dataRoot';
-import { requireMasterNode } from '../middleware/fleetGate';
-import { nudgeSync } from '../utils/syncNudge';
 
 import {
   checkForUpdates,
@@ -147,10 +145,9 @@ export function createUpdateRouter(botManager: BotManager): Router {
 
   /**
    * POST /api/update/modules/:name
-   * Update a specific module. Module updates are master-only; co-workers
-   * receive them via sync (base-code updates stay per-node).
+   * Update a specific module.
    */
-  router.post('/modules/:name', requireMasterNode, async (req: Request, res: Response) => {
+  router.post('/modules/:name', async (req: Request, res: Response) => {
     try {
       const { name } = req.params;
 
@@ -164,7 +161,6 @@ export function createUpdateRouter(botManager: BotManager): Router {
       const result = await triggerModuleUpdate(name);
 
       if (result.success) {
-        nudgeSync('modules');
         res.json({
           success: true,
           moduleName: result.moduleName,
@@ -190,12 +186,11 @@ export function createUpdateRouter(botManager: BotManager): Router {
 
   /**
    * POST /api/update/modules
-   * Update all modules with available updates (master-only; synced to co-workers)
+   * Update all modules with available updates
    */
-  router.post('/modules', requireMasterNode, async (req: Request, res: Response) => {
+  router.post('/modules', async (req: Request, res: Response) => {
     try {
       const result = await triggerAllModuleUpdates();
-      if (result.totalUpdated > 0) nudgeSync('modules');
 
       res.json({
         success: result.success,
@@ -225,11 +220,10 @@ export function createUpdateRouter(botManager: BotManager): Router {
    * Download module updates AND hot-reload them in one step.
    * Returns both the download results and the reload results.
    */
-  router.post('/modules-and-reload', requireMasterNode, async (req: Request, res: Response) => {
+  router.post('/modules-and-reload', async (req: Request, res: Response) => {
     try {
       // Step 1: Download module updates via AppStoreManager
       const updateResult = await triggerAllModuleUpdates();
-      if (updateResult.totalUpdated > 0) nudgeSync('modules');
 
       if (updateResult.totalUpdated === 0) {
         res.json({
@@ -265,13 +259,12 @@ export function createUpdateRouter(botManager: BotManager): Router {
    * POST /api/update/module-and-reload/:name
    * Download a single module update AND hot-reload it.
    */
-  router.post('/module-and-reload/:name', requireMasterNode, async (req: Request, res: Response) => {
+  router.post('/module-and-reload/:name', async (req: Request, res: Response) => {
     try {
       const { name } = req.params;
 
       // Step 1: Download module update
       const updateResult = await triggerModuleUpdate(name);
-      if (updateResult.success) nudgeSync('modules');
 
       if (!updateResult.success) {
         res.json({
@@ -308,7 +301,7 @@ export function createUpdateRouter(botManager: BotManager): Router {
    * POST /api/update/reload/:name
    * Hot-reload a single module (no restart needed)
    */
-  router.post('/reload/:name', requireMasterNode, async (req: Request, res: Response) => {
+  router.post('/reload/:name', async (req: Request, res: Response) => {
     try {
       const result = await botManager.reloadModule(req.params.name);
       res.json(result);
@@ -323,7 +316,7 @@ export function createUpdateRouter(botManager: BotManager): Router {
    * Hot-reload multiple modules (no restart needed)
    * Body: { moduleNames: string[] }
    */
-  router.post('/reload', requireMasterNode, async (req: Request, res: Response) => {
+  router.post('/reload', async (req: Request, res: Response) => {
     try {
       const { moduleNames } = req.body as { moduleNames?: string[] };
       if (!moduleNames || !Array.isArray(moduleNames) || moduleNames.length === 0) {
@@ -377,7 +370,7 @@ export function createUpdateRouter(botManager: BotManager): Router {
    * POST /api/update/backup
    * Create a manual backup
    */
-  router.post('/backup', requireMasterNode, async (req: Request, res: Response) => {
+  router.post('/backup', async (req: Request, res: Response) => {
     try {
       const { description } = req.body;
       const timestamp = Date.now();
@@ -439,7 +432,7 @@ export function createUpdateRouter(botManager: BotManager): Router {
    * POST /api/update/rollback/:timestamp
    * Restore from backup
    */
-  router.post('/rollback/:timestamp', requireMasterNode, async (req: Request, res: Response) => {
+  router.post('/rollback/:timestamp', async (req: Request, res: Response) => {
     try {
       const found = lookUpBackup(req.params.timestamp);
       if (!('dir' in found)) {
@@ -517,7 +510,7 @@ export function createUpdateRouter(botManager: BotManager): Router {
    * DELETE /api/update/backup/:timestamp
    * Delete a backup
    */
-  router.delete('/backup/:timestamp', requireMasterNode, async (req: Request, res: Response) => {
+  router.delete('/backup/:timestamp', async (req: Request, res: Response) => {
     try {
       const found = lookUpBackup(req.params.timestamp);
       if (!('dir' in found)) {

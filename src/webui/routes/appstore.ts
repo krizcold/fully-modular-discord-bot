@@ -31,10 +31,8 @@ import { getModulesDir, getModulesDevDir } from '../../bot/internalSetup/utils/p
 import { BotManager } from '../botManager';
 import { ComponentToggleDebouncer } from '../utils/componentToggleDebouncer';
 import { getInstallQueue } from '../utils/installQueue';
-import { nudgeSync } from '../utils/syncNudge';
 import { readConfigFile, writeConfigFile } from '../../bot/internalSetup/utils/appStoreConfigFile';
 import { childQueuedError, readServedGlobal, withTargetLock } from '../utils/servedRead';
-import { coWorkerReadonlyResponse, isCoWorkerNode } from '../middleware/fleetGate';
 
 /**
  * A module's Free baseline (its global settings.json) as the process that
@@ -353,7 +351,6 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
         console.error('[AppStore] Auto-refresh after add failed:', refreshErr);
       }
 
-      nudgeSync('appstore');
       res.json({
         success: !refreshWarning,
         repository: {
@@ -403,7 +400,6 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
       }
 
       const repo = manager.getRepository(id);
-      nudgeSync('appstore');
       res.json({
         success: true,
         repository: {
@@ -437,7 +433,6 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
       }
 
       const success = manager.removeRepository(id);
-      if (success) nudgeSync('appstore');
 
       res.json({
         success,
@@ -469,7 +464,6 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
       }
 
       const modules = await manager.refreshRepository(id);
-      nudgeSync('appstore');
 
       res.json({
         success: true,
@@ -724,7 +718,6 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
 
       const manager = getAppStoreManager();
       const success = manager.saveCredentials(name, credentials);
-      if (success) nudgeSync('appstore');
 
       res.json({
         success,
@@ -748,7 +741,6 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
       const { name } = req.params;
       const manager = getAppStoreManager();
       const success = manager.deleteCredentials(name);
-      if (success) nudgeSync('appstore');
 
       res.json({
         success,
@@ -878,7 +870,6 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
         overrides: overrides || {},
         offerings: refreshedOfferings,
       });
-      if (success) nudgeSync('globaldata');
 
       res.json({
         success,
@@ -911,7 +902,6 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
 
       const manager = getPremiumManager();
       const success = manager.deleteTier(id);
-      if (success) nudgeSync('globaldata');
 
       res.json({
         success,
@@ -963,7 +953,6 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
 
       const manager = getPremiumManager();
       const success = manager.setMessages(partial);
-      if (success) nudgeSync('globaldata');
       res.json({
         success,
         messages: manager.getMessages(),
@@ -983,7 +972,6 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
     try {
       const manager = getPremiumManager();
       const success = manager.resetMessages();
-      if (success) nudgeSync('globaldata');
       res.json({
         success,
         messages: manager.getMessages(),
@@ -1092,11 +1080,6 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
           res.status(409).json({ success: false, error: childQueuedError(served) });
           return;
         }
-        // The read is awaited: a demotion to co-worker may have begun meanwhile.
-        if (isCoWorkerNode()) {
-          coWorkerReadonlyResponse(res);
-          return;
-        }
 
         const storedLimits = served.raw?._hardLimits && typeof served.raw._hardLimits === 'object' ? served.raw._hardLimits : {};
         const configErrors = moduleConfigErrors(
@@ -1113,7 +1096,6 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
 
         const manager = getPremiumManager();
         const ok = manager.setGlobalModuleConfig(moduleName, partial, served.raw);
-        if (ok) nudgeSync('settings');
         res.json({
           success: ok,
           moduleName,
@@ -1483,7 +1465,6 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
       }
       const manager = getPremiumManager();
       const success = await manager.grantManual(guildId, tierId, durationDays, typeof notes === 'string' ? notes : undefined);
-      if (success) nudgeSync('globaldata');
       res.json({ success, subscriptions: manager.getSubscriptions(guildId) });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
@@ -1505,7 +1486,6 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
       }
       const manager = getPremiumManager();
       const success = manager.extendManual(guildId, addDays);
-      if (success) nudgeSync('globaldata');
       res.json({ success, subscriptions: manager.getSubscriptions(guildId) });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
@@ -1522,7 +1502,6 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
       const { guildId } = req.params;
       const manager = getPremiumManager();
       const success = manager.revokeManual(guildId);
-      if (success) nudgeSync('globaldata');
       res.json({ success, subscriptions: manager.getSubscriptions(guildId) });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
@@ -1558,7 +1537,6 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
       }
       const manager = getPremiumManager();
       const result = await manager.initiatePaidSubscription(guildId, tierId, offeringId, { providerId, variantId, couponCode, userId });
-      nudgeSync('globaldata');
       res.json({
         success: true,
         result,
@@ -1579,7 +1557,6 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
       const { guildId } = req.params;
       const manager = getPremiumManager();
       const success = await manager.cancelPaidSubscription(guildId);
-      if (success) nudgeSync('globaldata');
       res.json({ success, subscriptions: manager.getSubscriptions(guildId) });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
@@ -1596,7 +1573,6 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
       const { guildId } = req.params;
       const manager = getPremiumManager();
       const success = await manager.reactivatePaidSubscription(guildId);
-      if (success) nudgeSync('globaldata');
       res.json({ success, subscriptions: manager.getSubscriptions(guildId) });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
@@ -1788,7 +1764,6 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
         message: typeof body.message === 'string' ? body.message : '',
         scheduledBy: typeof body.scheduledBy === 'string' ? body.scheduledBy : 'admin',
       });
-      nudgeSync('globaldata');
       res.json({ success: true, migration });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
@@ -1801,7 +1776,6 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
       const mgr = getPremiumManager();
       const ok = mgr.cancelMigration(req.params.migrationId);
       if (!ok) return res.status(404).json({ success: false, error: 'Migration not found or not pending' });
-      nudgeSync('globaldata');
       res.json({ success: true });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
@@ -1826,7 +1800,6 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
       }
       const ok = getPremiumManager().setMigrationSilencePolicy(policy);
       if (!ok) return res.status(500).json({ success: false, error: 'Failed to set policy' });
-      nudgeSync('globaldata');
       res.json({ success: true, policy });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
@@ -2158,7 +2131,6 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
           config[key] = false;
         }
         saveComponentConfig(config);
-        nudgeSync('appstore');
       }
 
       // Fire debounced runtime toggle (async, doesn't block response)
@@ -2215,7 +2187,6 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
         config.autoUpdate = req.body.autoUpdate;
       }
       saveAppStoreConfig(config);
-      nudgeSync('appstore');
 
       // Turning autoCleanup ON kicks off the orphan sweep as tracked background
       // work: rate-limited global-command sweeps can run for minutes, so the
