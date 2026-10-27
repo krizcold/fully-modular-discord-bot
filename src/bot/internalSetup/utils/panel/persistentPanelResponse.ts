@@ -82,6 +82,12 @@ export async function createPersistentPanel(
         panel.maxActiveInstances
       );
 
+      if (!result.success) {
+        console.error(`[PersistentPanels] The record for panel ${panel.id} was not saved; removing the new message and keeping the previous instance`);
+        const removed = await deletePanelMessage(context.client, instance);
+        throw new PanelNotRecordedError(removed);
+      }
+
       if (result.replacedInstance) {
         if (panel.unique) {
           // For unique panels, delete the old message entirely
@@ -101,8 +107,17 @@ export async function createPersistentPanel(
 
     return null;
   } catch (error) {
+    if (error instanceof PanelNotRecordedError) throw error;
     console.error('Error creating persistent panel:', error);
     return null;
+  }
+}
+
+export class PanelNotRecordedError extends Error {
+  constructor(messageRemoved = true) {
+    super(messageRemoved
+      ? "The panel's record could not be saved, so the panel was not opened. Try again shortly."
+      : "The panel's record could not be saved, and its new message could not be removed; that message will not work. Delete it and try again shortly.");
   }
 }
 

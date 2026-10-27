@@ -9,6 +9,7 @@ import { applyRouteOverrides } from '../bot/internalSetup/utils/dataBackends/rou
 import { setWebuiDataStoreUrl } from './utils/webuiDataReader';
 import { invalidateRoleOverrideCache } from '../bot/internalSetup/fleet/nodeIdentity';
 import { startStandInWrites } from './promoteEngine';
+import type { NotifyOutcome } from '../bot/internalSetup/utils/subscriptionNotifier';
 
 // A crashed child is started again after this pause. The safety manager's
 // crash threshold (safe mode) bounds fast loops; a child that dies slower than
@@ -63,7 +64,7 @@ export class BotManager {
   private operationInProgress: boolean = false; // Prevents race conditions
   private safeMode: boolean = false;
   private safetyManager = getSafetyManager();
-  private cleanupRun: { running: boolean; startedAt: number; finishedAt?: number; success?: boolean; error?: string } | null = null;
+  private cleanupRun: { running: boolean; startedAt: number; finishedAt?: number; success?: boolean; error?: string; note?: string } | null = null;
   // Reject callbacks of in-flight IPC requests, so a child exit settles them
   // immediately instead of leaving callers hanging until their timeout.
   private pendingIpcRejects = new Set<(err: Error) => void>();
@@ -1239,12 +1240,17 @@ export class BotManager {
    * webhook installs) reach the user this way. Best-effort - failures log
    * but never block the originating action.
    */
-  async dispatchNotification(guildId: string, kind: string, payload: Record<string, any>): Promise<void> {
-    if (!this.isRunning()) return;
+  async dispatchNotification(guildId: string, kind: string, payload: Record<string, any>): Promise<NotifyOutcome> {
+    if (!this.isRunning()) return { delivered: false, cause: 'the bot is not running' };
     try {
-      await this.sendIPCMessage('notification:dispatch', { guildId, kind, payload });
+      const reply = await this.sendIPCMessage('notification:dispatch', { guildId, kind, payload });
+      const outcome = reply?.outcome;
+      if (outcome && typeof outcome.delivered === 'boolean') return outcome as NotifyOutcome;
+      return { delivered: false, cause: reply?.error || 'the bot gave no delivery outcome' };
     } catch (error) {
-      console.warn('[BotManager] Notification dispatch failed:', error instanceof Error ? error.message : error);
+      const cause = error instanceof Error ? error.message : String(error);
+      console.warn('[BotManager] Notification dispatch failed:', cause);
+      return { delivered: false, cause: `can't confirm delivery: ${cause}` };
     }
   }
 
@@ -1298,6 +1304,7 @@ export class BotManager {
         const result = await this.sendIPCMessage('commands:reregister', {}, IPC_TIMEOUT_MODULE_OP_MS);
         run.success = result?.success === true;
         if (!run.success) run.error = result?.error || 're-registration failed';
+        if (typeof result?.note === 'string') run.note = result.note;
       } catch (error) {
         run.success = false;
         run.error = error instanceof Error ? error.message : String(error);
@@ -1310,7 +1317,7 @@ export class BotManager {
     return { alreadyRunning: false };
   }
 
-  getCommandCleanupStatus(): { running: boolean; startedAt?: number; finishedAt?: number; success?: boolean; error?: string } {
+  getCommandCleanupStatus(): { running: boolean; startedAt?: number; finishedAt?: number; success?: boolean; error?: string; note?: string } {
     return this.cleanupRun ? { ...this.cleanupRun } : { running: false };
   }
 

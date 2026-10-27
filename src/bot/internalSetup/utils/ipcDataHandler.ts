@@ -115,7 +115,15 @@ export async function applyOperatorDataWrite(req: GuildDataWriteRequest): Promis
           retiredAt = value;
         }
       }
-      const restored = await restoreGuildFromGraveyard(guildId, retiredAt);
+      let restored: Awaited<ReturnType<typeof restoreGuildFromGraveyard>>;
+      try {
+        restored = await restoreGuildFromGraveyard(guildId, retiredAt);
+      } catch (error) {
+        if (error instanceof DataBackendUnavailableError && error.causeKey === 'database-read-only') {
+          return { ok: false, code: 'backend-unavailable', error: 'the database is read-only (a copy in recovery, SQLSTATE 25006); the guild was not restored' };
+        }
+        throw error;
+      }
       if (!restored.ok) return { ok: false, code: 'invalid', error: restored.error || 'restore refused' };
       return { ok: true };
     }

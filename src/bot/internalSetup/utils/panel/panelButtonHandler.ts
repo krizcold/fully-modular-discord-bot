@@ -225,9 +225,17 @@ async function handleButtonFromButtonHandler(
   if (isPersistent && isUnique) {
     const messageId = interaction.message.id;
     const guildId = interaction.guildId || undefined;
-    const isActive = await isActiveInstance(panelId, messageId, guildId);
+    const activeState = await isActiveInstance(panelId, messageId, guildId);
 
-    if (!isActive) {
+    if (activeState === 'missing') {
+      await interaction.reply({
+        content: 'This panel\'s record is missing on this node, so it cannot act on this message. Open the panel again with its command.',
+        flags: DISCORD_EPHEMERAL_FLAG
+      });
+      return;
+    }
+
+    if (activeState === 'replaced') {
       // This is an old/deactivated panel - reject the interaction
       await interaction.reply({
         content: '⚠️ This panel is no longer active. A newer instance has been opened.',

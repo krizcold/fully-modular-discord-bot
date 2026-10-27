@@ -41,6 +41,8 @@ jobs:
       - name: Type-check the source and the tests
         run: |
           npx tsc --noEmit
+          npx tsc -p tsconfig.updaters.json
+          npx tsc -p tsconfig.updater-local.json
           npm --prefix test run typecheck
 
       - name: Run the test suite

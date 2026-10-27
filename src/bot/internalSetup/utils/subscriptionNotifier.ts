@@ -18,6 +18,7 @@
 
 import { Client, TextBasedChannel } from 'discord.js';
 import { getPremiumManager } from './premiumManager';
+import { discordTimestamp } from './discordTimestamp';
 
 export type NotificationType =
   | 'manual.grant.added'
@@ -48,6 +49,11 @@ export interface NotificationPayload {
   details?: string;
 }
 
+export type NotifyOutcome =
+  | { delivered: true; via: 'dm' }
+  | { delivered: true; via: 'channel'; channelId: string }
+  | { delivered: false; cause: string };
+
 let instance: SubscriptionNotifier | null = null;
 
 export class SubscriptionNotifier {
@@ -61,40 +67,44 @@ export class SubscriptionNotifier {
     return !!this.client;
   }
 
-  async notify(guildId: string, type: NotificationType, payload: NotificationPayload): Promise<void> {
+  async notify(guildId: string, type: NotificationType, payload: NotificationPayload): Promise<NotifyOutcome> {
     if (!this.client) {
       console.warn(`[SubscriptionNotifier] notify(${type}, ${guildId}) called before client was set`);
-      return;
+      return { delivered: false, cause: 'the Discord client is not set up yet' };
     }
     const message = this.formatMessage(type, payload);
-    if (!message) return;
+    if (!message) return { delivered: false, cause: `no message text for ${type}` };
 
     let guild;
+    let guildError: unknown = null;
     try {
-      guild = await this.client.guilds.fetch(guildId).catch(() => null);
-    } catch {
+      guild = await this.client.guilds.fetch({ guild: guildId, cache: false }).catch((err) => { guildError = err; return null; });
+    } catch (err) {
+      guildError = err;
       guild = null;
     }
     if (!guild) {
-      console.warn(`[SubscriptionNotifier] guild ${guildId} not reachable; cannot deliver ${type}`);
-      return;
+      const cause = `guild not reachable (${guildError instanceof Error ? guildError.message : 'not found'})`;
+      console.warn(`[SubscriptionNotifier] guild ${guildId} not reachable; cannot deliver ${type}: ${cause}`);
+      return { delivered: false, cause };
     }
 
-    if (await this.tryDmOwner(guild, message)) return;
+    if (await this.tryDmOwner(guild, message)) return { delivered: true, via: 'dm' };
 
     const subs = getPremiumManager().getGuildSubscriptions(guildId);
     if (subs?.notificationsChannelId) {
-      const ch = await this.client.channels.fetch(subs.notificationsChannelId).catch(() => null);
+      const ch = await this.client.channels.fetch(subs.notificationsChannelId, { allowUnknownGuild: true }).catch(() => null);
       if (ch && this.isWritableTextChannel(ch)) {
-        if (await this.trySendChannel(ch, message)) return;
+        if (await this.trySendChannel(ch, message)) return { delivered: true, via: 'channel', channelId: subs.notificationsChannelId };
       }
     }
 
     if (guild.systemChannel && this.isWritableTextChannel(guild.systemChannel)) {
-      if (await this.trySendChannel(guild.systemChannel, message)) return;
+      if (await this.trySendChannel(guild.systemChannel, message)) return { delivered: true, via: 'channel', channelId: guild.systemChannel.id };
     }
 
     console.warn(`[SubscriptionNotifier] no delivery path for ${type} on guild ${guildId}; notification dropped`);
+    return { delivered: false, cause: 'the owner DM, the notifications channel and the system channel all failed' };
   }
 
   private async tryDmOwner(guild: any, message: string): Promise<boolean> {
@@ -128,7 +138,8 @@ export class SubscriptionNotifier {
     const tier = p.tierName || 'a tier';
     const provider = p.providerName ? ` (${p.providerName})` : '';
     const remaining = p.remainingDays != null ? ` ${p.remainingDays} day${p.remainingDays === 1 ? '' : 's'} remaining.` : '';
-    const ends = p.endDate ? ` Ends ${new Date(p.endDate).toLocaleDateString()}.` : '';
+    const endStamp = discordTimestamp(p.endDate);
+    const ends = endStamp ? ` Ends ${endStamp}.` : '';
     const notes = p.notes ? `\n> ${p.notes}` : '';
     const reason = p.reason ? `\nReason: ${p.reason}` : '';
     const details = p.details ? `\n${p.details}` : '';
@@ -157,9 +168,9 @@ export class SubscriptionNotifier {
       case 'tier.config-change-affecting-subscriber':
         return `**Subscription update:** The contents of your **${tier}** plan changed.${details}`;
       case 'migration.scheduled':
-        return `**Plan change scheduled:** Your subscription will move to **${tier}** on ${p.endDate ? new Date(p.endDate).toLocaleDateString() : 'a future date'}. Open the subscription panel to **accept** or **decline**.${details}`;
+        return `**Plan change scheduled:** Your subscription will move to **${tier}** on ${endStamp || 'a future date'}. Open the subscription panel to **accept** or **decline**.${details}`;
       case 'migration.accepted':
-        return `**Plan change accepted:** Confirmed - your subscription will move to **${tier}** on ${p.endDate ? new Date(p.endDate).toLocaleDateString() : 'the effective date'}.`;
+        return `**Plan change accepted:** Confirmed - your subscription will move to **${tier}** on ${endStamp || 'the effective date'}.`;
       case 'migration.declined':
         return `**Plan change declined:** Your current subscription will not migrate. It will end at the next billing date and won't renew.`;
       case 'migration.silence-applied':

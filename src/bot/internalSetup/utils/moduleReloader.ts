@@ -29,6 +29,8 @@ import { isAutoCleanupEnabled } from '../events/clientReady/registerCommands';
 import { clearSchemaCache, getModulesWithSettings } from './settings/settingsDiscovery';
 import { createAllSettingsPanels } from './settings/settingsPanelFactory';
 import { getMetricsCollector } from './metrics/metricsCollector';
+import { resolveClientApplication } from './clientApplication';
+import { beginReload, endReload, recordLoadFailure } from './loadFailures';
 
 interface CapturedCommand {
   name: string;
@@ -36,7 +38,7 @@ interface CapturedCommand {
   testOnly: boolean;
 }
 
-async function deleteModuleCommandsFromDiscord(
+export async function deleteModuleCommandsFromDiscord(
   client: Client,
   commands: CapturedCommand[]
 ): Promise<void> {
@@ -45,20 +47,27 @@ async function deleteModuleCommandsFromDiscord(
 
   try {
     const guildId = process.env.GUILD_ID;
-    const guild = guildId ? client.guilds.cache.get(guildId) : undefined;
-    const globalCommands = await client.application?.commands.fetch();
-    const guildCommands = guild ? await guild.commands.fetch() : undefined;
+    const application = await resolveClientApplication(client);
+    if (!application) {
+      console.error(`[Reloader] Commands not deleted from Discord (${commands.map(c => c.name).join(', ')}): the bot application could not be resolved`);
+      return;
+    }
+    const globalCommands = await application.commands.fetch();
+    const hasTestOnly = commands.some(c => c.testOnly);
+    if (hasTestOnly && !guildId) {
+      console.error('[Reloader] Test-only commands not deleted from Discord: GUILD_ID is not set');
+    }
+    const guildCommands = hasTestOnly && guildId ? await application.commands.fetch({ guildId }) : undefined;
 
     for (const cmd of commands) {
       const list = cmd.testOnly ? guildCommands : globalCommands;
-      const mgr = cmd.testOnly ? guild?.commands : client.application?.commands;
-      if (!list || !mgr) continue;
+      if (!list) continue;
 
       const match = list.find(c => c.name === cmd.name && c.type === cmd.type);
       if (!match) continue;
 
       try {
-        await mgr.delete(match.id);
+        await application.commands.delete(match.id, cmd.testOnly ? guildId : undefined);
         console.log(`[Reloader] Deleted ${cmd.testOnly ? 'local' : 'global'} command "${cmd.name}" from Discord`);
       } catch (err: any) {
         if (err?.code === 10063) {
@@ -302,6 +311,15 @@ async function registerReloadedModule(client: Client, module: LoadedModule): Pro
  * Works for both existing modules (unload → reload) and fresh installs (just load).
  */
 export async function reloadModule(client: Client, moduleName: string): Promise<ReloadResult> {
+  beginReload();
+  try {
+    return await reloadModuleBody(client, moduleName);
+  } finally {
+    endReload();
+  }
+}
+
+async function reloadModuleBody(client: Client, moduleName: string): Promise<ReloadResult> {
   if (reloadingModules.has(moduleName)) {
     return { success: false, moduleName, error: 'Module is already being reloaded' };
   }
@@ -317,11 +335,13 @@ export async function reloadModule(client: Client, moduleName: string): Promise<
     // failure leaves the old module registered.
     const compile = await recompileTypeScript();
     if (!compile.success) {
+      recordLoadFailure(moduleName);
       return { success: false, moduleName, error: `Compilation failed: ${compile.error}`, duration: Date.now() - start };
     }
 
     const manifestPath = findModuleManifestPath(moduleName);
     if (!manifestPath) {
+      recordLoadFailure(moduleName);
       return { success: false, moduleName, error: 'Module manifest not found after recompile', duration: Date.now() - start };
     }
 
@@ -343,6 +363,7 @@ export async function reloadModule(client: Client, moduleName: string): Promise<
     console.log(`[Reloader] ${action}: ${moduleName} (${Date.now() - start}ms)`);
     return { success: true, moduleName, duration: Date.now() - start };
   } catch (error: any) {
+    recordLoadFailure(moduleName);
     return { success: false, moduleName, error: error.message || String(error), duration: Date.now() - start };
   } finally {
     reloadingModules.delete(moduleName);
@@ -391,6 +412,15 @@ export async function unloadModuleFromMemory(client: Client, moduleName: string)
  * Reload multiple modules. Recompiles once, then reloads each module.
  */
 export async function reloadModules(client: Client, moduleNames: string[]): Promise<BulkReloadResult> {
+  beginReload();
+  try {
+    return await reloadModulesBody(client, moduleNames);
+  } finally {
+    endReload();
+  }
+}
+
+async function reloadModulesBody(client: Client, moduleNames: string[]): Promise<BulkReloadResult> {
   // Filter out modules that are already being reloaded
   const available = moduleNames.filter(n => !reloadingModules.has(n));
   const skipped = moduleNames.filter(n => reloadingModules.has(n));
@@ -424,6 +454,7 @@ export async function reloadModules(client: Client, moduleNames: string[]): Prom
     if (!compile.success) {
       result.success = false;
       for (const name of available) {
+        recordLoadFailure(name);
         result.failed.push({ moduleName: name, error: `Compilation failed: ${compile.error}` });
       }
       result.totalDuration = Date.now() - start;
@@ -436,6 +467,7 @@ export async function reloadModules(client: Client, moduleNames: string[]): Prom
       try {
         const manifestPath = findModuleManifestPath(name);
         if (!manifestPath) {
+          recordLoadFailure(name);
           result.failed.push({ moduleName: name, error: 'Module manifest not found' });
           continue;
         }
@@ -447,6 +479,7 @@ export async function reloadModules(client: Client, moduleNames: string[]): Prom
         await registerReloadedModule(client, module);
         result.reloaded.push(name);
       } catch (error: any) {
+        recordLoadFailure(name);
         result.failed.push({ moduleName: name, error: error.message || String(error) });
       }
     }

@@ -108,7 +108,8 @@ export async function serveSyncRequest(authority: SyncAuthority, type: string, d
 }
 
 export class SyncAuthority {
-  private manifest: SyncManifest;
+  private manifest: SyncManifest | null = null;
+  private revision: number;
   private bumpTimer: NodeJS.Timeout | null = null;
   private backstopTimer: NodeJS.Timeout | null = null;
   private recomputing = false;
@@ -116,24 +117,33 @@ export class SyncAuthority {
   constructor(private readonly hooks: SyncAuthorityHooks) {
     const stored = this.load();
     // Boot recompute: offline edits bump the revision even with no live worker.
-    const computed = buildSyncManifest(stored?.revision ?? 1);
-    if (stored && this.sameHashes(stored, computed)) {
-      this.manifest = computed;
-    } else {
-      this.manifest = { ...computed, revision: (stored?.revision ?? 0) + 1 };
-      this.persist();
+    this.revision = stored?.revision ?? 0;
+    let computed: SyncManifest | null = null;
+    try {
+      computed = buildSyncManifest(stored?.revision ?? 1);
+    } catch (error) {
+      console.warn('[Fleet] Sync manifest build failed at boot; serving no sync state until a listing succeeds:', error instanceof Error ? error.message : error);
     }
-    console.log(`[Fleet] Sync authority ready (revision ${this.manifest.revision}, ${this.manifest.modules.length} module(s))`);
+    if (computed) {
+      if (stored && this.sameHashes(stored, computed)) {
+        this.manifest = computed;
+      } else {
+        this.manifest = { ...computed, revision: this.revision + 1 };
+        this.persist();
+      }
+      this.revision = this.manifest.revision;
+      console.log(`[Fleet] Sync authority ready (revision ${this.manifest.revision}, ${this.manifest.modules.length} module(s))`);
+    }
     this.backstopTimer = setInterval(() => this.backstop(), SYNC_RECONCILE_MS);
     this.backstopTimer.unref();
   }
 
-  getManifest(): SyncManifest {
+  getManifest(): SyncManifest | null {
     return this.manifest;
   }
 
   getRevision(): number {
-    return this.manifest.revision;
+    return this.revision;
   }
 
   /** Debounced recompute-and-publish; rapid mutations converge on the final bytes. */
@@ -147,6 +157,7 @@ export class SyncAuthority {
   }
 
   async pushTo(nodeId: string): Promise<void> {
+    if (!this.manifest) return;
     try {
       await this.hooks.pushToNode(nodeId, { term: this.hooks.getTerm(), manifest: this.manifest });
     } catch (error) {
@@ -158,9 +169,10 @@ export class SyncAuthority {
     if (this.recomputing) return;
     this.recomputing = true;
     try {
-      const computed = buildSyncManifest(this.manifest.revision);
-      if (manifestHashesEqual(computed, this.manifest)) return;
-      this.manifest = { ...computed, revision: this.manifest.revision + 1 };
+      const computed = buildSyncManifest(this.revision);
+      if (this.manifest && manifestHashesEqual(computed, this.manifest)) return;
+      this.manifest = { ...computed, revision: this.revision + 1 };
+      this.revision = this.manifest.revision;
       this.persist();
       console.log(`[Fleet] Sync revision ${this.manifest.revision}${scope ? ` (${scope})` : ''}; pushing to workers`);
       for (const worker of this.hooks.listWorkers()) {
@@ -179,7 +191,7 @@ export class SyncAuthority {
   private backstop(): void {
     this.recomputeAndPush();
     for (const worker of this.hooks.listWorkers()) {
-      const behind = (worker.syncAppliedRevision ?? -1) < this.manifest.revision;
+      const behind = (worker.syncAppliedRevision ?? -1) < this.revision;
       if (behind || worker.syncOk === false) void this.pushTo(worker.nodeId);
     }
   }
@@ -210,6 +222,7 @@ export class SyncAuthority {
   }
 
   private persist(): void {
+    if (!this.manifest) return;
     const record: PersistedSync = {
       revision: this.manifest.revision,
       hashes: {

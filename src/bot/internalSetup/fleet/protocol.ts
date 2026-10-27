@@ -877,7 +877,7 @@ export interface DataWriteRequest {
 
 export interface DataWriteReply {
   ok: boolean;
-  code?: 'frozen' | 'not-owner' | 'owner-unreachable' | 'stale-term' | 'backend-unavailable' | 'bot-down' | 'invalid' | 'io-error';
+  code?: 'frozen' | 'not-owner' | 'shard-unassigned' | 'owner-disconnected' | 'owner-no-answer' | 'owner-unreachable' | 'stale-term' | 'backend-unavailable' | 'bot-down' | 'invalid' | 'io-error';
   error?: string;
   /** Accepted, flush still retrying. */
   pending?: boolean;
@@ -901,7 +901,7 @@ export interface DataReadReply {
   contentJson?: string;
   /** Listing when no filename was requested. */
   files?: string[];
-  code?: 'frozen' | 'not-owner' | 'owner-unreachable' | 'stale-term' | 'backend-unavailable' | 'bot-down' | 'invalid' | 'io-error';
+  code?: 'frozen' | 'not-owner' | 'shard-unassigned' | 'owner-disconnected' | 'owner-no-answer' | 'owner-unreachable' | 'stale-term' | 'backend-unavailable' | 'bot-down' | 'invalid' | 'io-error';
   error?: string;
 }
 

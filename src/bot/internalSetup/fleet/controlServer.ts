@@ -71,6 +71,9 @@ interface ConnState {
   alive: boolean;
 }
 
+/** A control request that never left this node: no open socket, or the send itself failed. */
+export class ControlNotSentError extends Error {}
+
 export class ControlServer {
   private httpServer: http.Server | null = null;
   private wss: WebSocketServer | null = null;
@@ -145,7 +148,7 @@ export class ControlServer {
   request(nodeId: string, type: string, data: any, timeoutMs: number = CONTROL_ACK_TIMEOUT_MS): Promise<any> {
     const socket = this.conns.get(nodeId);
     if (!socket || socket.readyState !== WebSocket.OPEN) {
-      return Promise.reject(new Error(`Node ${nodeId} is not connected`));
+      return Promise.reject(new ControlNotSentError(`Node ${nodeId} is not connected`));
     }
     return new Promise((resolve, reject) => {
       const requestId = `${type}_${Date.now()}_${Math.random()}`;
@@ -159,7 +162,7 @@ export class ControlServer {
       } catch (error) {
         clearTimeout(timer);
         this.pending.delete(requestId);
-        reject(error instanceof Error ? error : new Error(String(error)));
+        reject(new ControlNotSentError(error instanceof Error ? error.message : String(error)));
       }
     });
   }

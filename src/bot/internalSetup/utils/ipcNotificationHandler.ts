@@ -40,8 +40,8 @@ export function setupIPCNotificationHandler(): void {
             process.send!({ requestId, data: { success: false, error: 'guildId and kind are required' } });
             return;
           }
-          await getSubscriptionNotifier().notify(guildId, kind, payload);
-          process.send!({ requestId, data: { success: true } });
+          const outcome = await getSubscriptionNotifier().notify(guildId, kind, payload);
+          process.send!({ requestId, data: { success: outcome.delivered, outcome } });
           return;
         }
         default:

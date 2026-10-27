@@ -2554,20 +2554,28 @@ export class PremiumManager {
       },
     });
 
-    // DM each affected guild owner. notifiedAt isn't tracked at delivery
-    // time (DM is best-effort and async); we record "we attempted at X".
-    const stamped = new Date().toISOString();
+    const notice = {
+      tierName: targetTier.displayName,
+      endDate: opts.effectiveDate,
+      details: opts.message || `Your subscription will move from "${sourceTier.displayName}" to "${targetTier.displayName}". Open the subscription panel to accept or decline.`,
+    };
     for (const d of migration.decisions) {
-      d.notifiedAt = stamped;
-      void dispatchPremiumNotification(d.guildId, 'migration.scheduled', {
-        tierName: targetTier.displayName,
-        endDate: opts.effectiveDate,
-        details: opts.message || `Your subscription will move from "${sourceTier.displayName}" to "${targetTier.displayName}". Open the subscription panel to accept or decline.`,
+      void dispatchPremiumNotification(d.guildId, 'migration.scheduled', notice).then((outcome) => {
+        if (outcome.delivered) this.markMigrationNotified(migration.id, d.subscriptionId, new Date().toISOString());
+        else console.warn(`[PremiumManager] Migration ${migration.id} request not delivered to guild ${d.guildId}: ${outcome.cause}`);
       });
     }
-    this.save();
 
     return JSON.parse(JSON.stringify(migration));
+  }
+
+  private markMigrationNotified(migrationId: string, subscriptionId: string, stamp: string): void {
+    this.ensureLoaded();
+    const migration = this.config.migrations.find(m => m.id === migrationId);
+    const entry = migration?.decisions.find(d => d.subscriptionId === subscriptionId);
+    if (!entry || entry.notifiedAt) return;
+    entry.notifiedAt = stamp;
+    if (!this.save()) console.warn(`[PremiumManager] Migration ${migrationId}: delivery to guild ${entry.guildId} not recorded (save failed)`);
   }
 
   /**
@@ -2698,6 +2706,13 @@ export class PremiumManager {
       if (sub.variantId !== migration.sourceVariantId) {
         decision.outcome = 'skipped';
         decision.outcomeNote = 'variant changed since scheduling';
+        decision.appliedAt = stamp;
+        continue;
+      }
+
+      if (decision.decision === 'pending' && !decision.notifiedAt) {
+        decision.outcome = 'skipped';
+        decision.outcomeNote = 'the migration request never reached the owner, so no silent decision was applied';
         decision.appliedAt = stamp;
         continue;
       }

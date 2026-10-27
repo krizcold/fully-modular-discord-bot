@@ -25,6 +25,7 @@ import { dataPath } from '../../utils/dataRoot';
 import { coWorkerReadonlyResponse, isCoWorkerNode } from '../middleware/fleetGate';
 import { nudgeSync } from '../utils/syncNudge';
 import type { BotManager } from '../botManager';
+import { hopFailure } from './hopFailure';
 
 export function createConfigRoutes(botManager: BotManager): Router {
   const router = Router();
@@ -405,7 +406,10 @@ export function createConfigRoutes(botManager: BotManager): Router {
       // Restore backup through the facade so it is ordered by the single
       // per-path write queue (an in-flight update flush cannot clobber it).
       const backupContents = fs.readFileSync(backupPath, 'utf-8');
-      writeRawAtomic(configInfo.path, backupContents);
+      if (!writeRawAtomic(configInfo.path, backupContents)) {
+        res.status(503).json({ success: false, error: 'The config was not restored because disk writes are failing' });
+        return;
+      }
       console.log(`[Config] Restored ${fileId} from backup: ${filename}`);
       nudgeSync('config');
 
@@ -635,7 +639,10 @@ export function createConfigRoutes(botManager: BotManager): Router {
       // Save through the facade so this write is ordered by the single per-path
       // queue (no race with a queued global/guild write to the same file) and
       // lands atomically via temp+fsync+rename.
-      writeRawAtomic(savePath, JSON.stringify(newData, null, 2));
+      if (!writeRawAtomic(savePath, JSON.stringify(newData, null, 2))) {
+        res.status(503).json({ success: false, error: 'The data file was not saved because disk writes are failing' });
+        return;
+      }
       console.log(`[Data] ${fileId} saved successfully${guildId ? ` for guild ${guildId}` : ' (global)'}`);
       if (!guildId) nudgeSync('globaldata');
 
@@ -745,21 +752,12 @@ function sendHopReply(res: Response, reply: any): void {
     return;
   }
   const detail = reply && typeof reply.error === 'string' ? reply.error : undefined;
+  const failure = hopFailure(reply?.code, detail);
+  if (failure) {
+    res.status(failure.status).json({ success: false, error: failure.error });
+    return;
+  }
   switch (reply?.code) {
-    case 'frozen':
-      res.status(503).json({ success: false, error: 'Guild data is frozen for a shard migration; retry after it completes' });
-      return;
-    case 'not-owner':
-    case 'owner-unreachable':
-    case 'stale-term':
-      res.status(503).json({ success: false, error: 'guild temporarily unavailable' });
-      return;
-    case 'backend-unavailable':
-      res.status(503).json({ success: false, error: detail || 'the database backend is unavailable' });
-      return;
-    case 'bot-down':
-      res.status(503).json({ success: false, error: 'the bot process is not running' });
-      return;
     case 'invalid':
       res.status(400).json({ success: false, error: detail || 'Invalid request' });
       return;

@@ -99,7 +99,7 @@ export class FileSessionStore extends Store {
       updatedAt: Date.now(),
       session,
     };
-    writeRawAtomic(file, JSON.stringify(record));
+    if (!writeRawAtomic(file, JSON.stringify(record))) return void callback?.(new Error('[FileSessionStore] The session was not saved'));
     callback?.();
   }
 
@@ -107,13 +107,16 @@ export class FileSessionStore extends Store {
     const file = this.fileFor(sid);
     if (!file) return void callback?.();
     this.destroyed.add(sid);
-    deleteRawAtomic(file);
+    if (!deleteRawAtomic(file) && readRaw(file) !== null) {
+      this.destroyed.delete(sid);
+      return void callback?.(new Error('[FileSessionStore] The session was not deleted'));
+    }
     const timer = setTimeout(() => this.destroyed.delete(sid), DESTROYED_GRACE_MS);
     timer.unref();
     callback?.();
   }
 
-  touch(sid: string, session: SessionData, callback?: () => void): void {
+  touch(sid: string, session: SessionData, callback?: (err?: any) => void): void {
     const file = this.fileFor(sid);
     if (!file || this.destroyed.has(sid)) return void callback?.();
     const raw = readRaw(file);
@@ -125,7 +128,7 @@ export class FileSessionStore extends Store {
     record.expiresAt = nextExpiresAt;
     record.updatedAt = Date.now();
     if (session.cookie) record.session.cookie = session.cookie;
-    writeRawAtomic(file, JSON.stringify(record));
+    if (!writeRawAtomic(file, JSON.stringify(record))) return void callback?.(new Error('[FileSessionStore] The session was not saved'));
     callback?.();
   }
 

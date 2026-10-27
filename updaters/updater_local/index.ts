@@ -33,6 +33,7 @@ export interface UpdateCheckResult {
 /** Combined update check result for base code + modules */
 export interface CombinedUpdateCheckResult {
   success: boolean;
+  partial?: boolean;
   lastChecked: string;
   baseCode: {
     checked: boolean;
@@ -45,6 +46,7 @@ export interface CombinedUpdateCheckResult {
     hasUpdates: boolean;
     totalInstalled: number;
     updatesAvailable: number;
+    unchecked?: number;
     updates: ModuleUpdateCheck[];
     errors: Array<{ moduleName: string; error: string }>;
   };
@@ -70,6 +72,25 @@ export interface BulkModuleUpdateResult {
   totalUpdated: number;
   updated: Array<{ moduleName: string; oldVersion: string; newVersion: string }>;
   failed: Array<{ moduleName: string; error: string }>;
+  checkErrors: Array<{ moduleName: string; error: string }>;
+  skipped: Array<{ moduleName: string; reason: string }>;
+}
+
+/**
+ * Operator-facing sentence for a bulk module update; names every module that was not updated.
+ */
+export function describeBulkModuleUpdate(result: BulkModuleUpdateResult): string {
+  const parts = [`Updated ${result.totalUpdated} module(s)`];
+  if (result.failed.length > 0) {
+    parts.push(`failed: ${result.failed.map(f => `${f.moduleName} (${f.error})`).join(', ')}`);
+  }
+  if (result.skipped.length > 0) {
+    parts.push(`not updated: ${result.skipped.map(s => `${s.moduleName} (${s.reason})`).join(', ')}`);
+  }
+  if (result.checkErrors.length > 0) {
+    parts.push(`could not check: ${result.checkErrors.map(e => `${e.moduleName} (${e.error})`).join(', ')}`);
+  }
+  return parts.join('; ');
 }
 
 // Re-export module types for convenience
@@ -129,8 +150,7 @@ async function checkGitHubForUpdates(): Promise<{ hasUpdates: boolean; latestVer
       res.on('end', () => {
         try {
           if (res.statusCode === 404) {
-            // No releases, try comparing commits
-            resolve({ hasUpdates: false });
+            resolve({ hasUpdates: false, error: `No release is published for ${GITHUB_REPO}; cannot compare` });
             return;
           }
 
@@ -189,9 +209,8 @@ export async function checkForUpdates(): Promise<UpdateCheckResult> {
     const currentVersion = getCurrentVersion();
     const githubResult = await checkGitHubForUpdates();
 
-    updateStatus.lastCheck = Date.now();
-
     if (githubResult.error) {
+      updateStatus.lastError = githubResult.error;
       return {
         success: false,
         hasUpdates: false,
@@ -200,6 +219,9 @@ export async function checkForUpdates(): Promise<UpdateCheckResult> {
       };
     }
 
+    updateStatus.lastCheck = Date.now();
+    updateStatus.lastError = undefined;
+
     return {
       success: true,
       hasUpdates: githubResult.hasUpdates,
@@ -207,7 +229,7 @@ export async function checkForUpdates(): Promise<UpdateCheckResult> {
       latestVersion: githubResult.latestVersion,
       message: githubResult.hasUpdates
         ? `Update available: ${currentVersion} -> ${githubResult.latestVersion}`
-        : 'Up to date'
+        : `No newer release than ${currentVersion}`
     };
   } catch (error) {
     updateStatus.lastError = String(error);
@@ -220,13 +242,12 @@ export async function checkForUpdates(): Promise<UpdateCheckResult> {
 }
 
 /**
- * Self-hosted updates are applied by hand: on the public Linux stack, git pull and rerun setup.sh (it rebuilds the bot
- * and restarts Authelia); otherwise pull a new image (or git pull) and restart.
+ * Self-hosted updates are applied by hand; a plain restart keeps the old image and the old code.
  */
 export async function triggerUpdate(): Promise<UpdateTriggerResult> {
   return {
     success: false,
-    error: 'Self-hosted mode: update by hand. On the public Linux stack, git pull and rerun sudo ./setup.sh; otherwise pull the latest image (or git pull) and restart the bot.'
+    error: 'Self-hosted mode: update by hand. Remote stack: git pull, then sudo ./setup.sh. Standalone stack: git pull, then docker compose -f docker-compose.standalone.yml up -d --build. Published image: pull the new image and recreate the container.'
   };
 }
 
@@ -264,6 +285,7 @@ export async function checkForAllUpdates(): Promise<CombinedUpdateCheckResult> {
       hasUpdates: false,
       totalInstalled: 0,
       updatesAvailable: 0,
+      unchecked: 0,
       updates: [],
       errors: []
     },
@@ -277,7 +299,7 @@ export async function checkForAllUpdates(): Promise<CombinedUpdateCheckResult> {
   try {
     const baseCodeResult = await checkForUpdates();
     result.baseCode = {
-      checked: true,
+      checked: baseCodeResult.success,
       hasUpdates: baseCodeResult.hasUpdates,
       error: baseCodeResult.error
     };
@@ -302,6 +324,7 @@ export async function checkForAllUpdates(): Promise<CombinedUpdateCheckResult> {
         hasUpdates: moduleResult.updatesAvailable > 0,
         totalInstalled: installedModules.length,
         updatesAvailable: moduleResult.updatesAvailable,
+        unchecked: moduleResult.errors.length,
         updates: moduleResult.updates,
         errors: moduleResult.errors
       };
@@ -323,8 +346,8 @@ export async function checkForAllUpdates(): Promise<CombinedUpdateCheckResult> {
     hasAnyUpdates: result.baseCode.hasUpdates || result.modules.hasUpdates
   };
 
-  // Overall success if both checks completed
-  result.success = result.baseCode.checked && result.modules.checked;
+  result.partial = !result.baseCode.checked || !result.modules.checked || (result.modules.unchecked || 0) > 0;
+  result.success = !result.partial;
 
   return result;
 }
@@ -374,11 +397,13 @@ export async function triggerAllModuleUpdates(): Promise<BulkModuleUpdateResult>
     const result = await appStoreManager.updateAllModules();
 
     return {
-      success: result.success,
-      totalAttempted: result.updated.length + result.failed.length,
+      success: result.failed.length === 0 && result.skipped.length === 0 && result.checkErrors.length === 0,
+      totalAttempted: result.updated.length + result.failed.length + result.skipped.length,
       totalUpdated: result.updated.length,
       updated: result.updated,
-      failed: result.failed
+      failed: result.failed,
+      checkErrors: result.checkErrors,
+      skipped: result.skipped
     };
   } catch (error) {
     return {
@@ -389,7 +414,9 @@ export async function triggerAllModuleUpdates(): Promise<BulkModuleUpdateResult>
       failed: [{
         moduleName: '*',
         error: error instanceof Error ? error.message : String(error)
-      }]
+      }],
+      checkErrors: [],
+      skipped: []
     };
   }
 }

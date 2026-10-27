@@ -52,17 +52,19 @@ import { clearStandInStaging, landStandInStagingOrWarn, reconcileStandInStaging,
 import { closeStandInLane, rememberLineageVerdict, seizedEpisode, standInEnding, writeEpisodeRecordOrWarn } from './episodeRecord';
 import { backupModeEnabled, leverRank, readModeOverride } from './modeOverride';
 import { clearOwnSyncPosture } from './syncPosture';
-import { Registry, RegistryNode } from './registry';
+import { Registry, RegistryNode, persistedNodeOf } from './registry';
 import { ControlServer } from './controlServer';
+import { forwardDataOp } from './dataOpForward';
 import { ControlClient } from './controlClient';
 import { LeaseRuntime } from './leaseRuntime';
-import { HealthMonitor } from './healthMonitor';
+import { HealthMonitor, persistsAfterTransition } from './healthMonitor';
 import { IdentifyLedger } from './identifyLedger';
 import {
   assignIdentifyDelays,
   declaredCapacityOf,
   fetchAllGuilds,
-  fetchGatewayInfo,
+  decideShardSource,
+  fetchGatewayInfoResult,
   getShardCountOverride,
   guildIdToShardId,
   otherNodeCanHoldShards,
@@ -1612,12 +1614,13 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   });
   if (fleetConfig) writeFleetConfigCache(fleetConfigPayload());
 
-  const gateway = await fetchGatewayInfo(process.env.DISCORD_TOKEN);
+  const { info: gateway, error: gatewayError } = await fetchGatewayInfoResult(process.env.DISCORD_TOKEN);
   if (!gateway && process.env.DISCORD_TOKEN) {
-    console.warn('[Fleet] /gateway/bot unreachable; assuming 1 recommended shard');
+    console.warn(`[Fleet] /gateway/bot failed (${gatewayError}); assuming 1 recommended shard`);
   }
   const maxConcurrency = gateway?.maxConcurrency ?? 1;
   const recommendedShards = gateway?.recommendedShards ?? null;
+  const recommendedAt = gateway ? Date.now() : null;
   const shardCount = resolveShardCount(gateway?.recommendedShards ?? 1);
 
   const registry = new Registry();
@@ -1629,7 +1632,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   // constructed after the recovery sources exist.
   let transformer: TransformationCoordinator | null = null;
 
-  const ledger = standalone ? null : new IdentifyLedger(process.env.DISCORD_TOKEN, registry, gateway?.sessionStartLimit ?? null);
+  const ledger = standalone ? null : new IdentifyLedger(process.env.DISCORD_TOKEN, registry, gateway?.sessionStartLimit ?? null, recommendedShards);
 
   // One pending ledger-retry timer: every refusal in a window coalesces into
   // a single deferred distribute() (the 5s tick re-evaluates anyway).
@@ -1841,8 +1844,11 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
   // persist the bumped epoch + loss ring. Never moves a lease.
   const healthMonitor = standalone ? null : new HealthMonitor({
     registry,
-    onTransition: (transNodeId, _from, to) => {
-      if (to !== 'down') return;
+    onTransition: (transNodeId, from, to) => {
+      if (to !== 'down') {
+        if (persistsAfterTransition(from, to)) persist().catch(error => console.warn('[Fleet] Persist after recovery failed:', error instanceof Error ? error.message : error));
+        return;
+      }
       server?.dropNode(transNodeId);
       // A confirmed-down node that is a migration participant is a node-down
       // event for the coordinator (pre-commit -> abort; post-commit -> retries).
@@ -1887,10 +1893,12 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     if (node.isSelf && (standalone || (alone && declaredCapacityOf(node) > 0))) return registry.shardCount;
     return declaredCapacityOf(node);
   };
-  const reshardHint = (): string =>
-    recommendedShards !== null && recommendedShards < registry.shardCount
-      ? `, or reshard: Discord recommends ${recommendedShards} shard(s), set FLEET_SHARD_COUNT`
+  const reshardHint = (): string => {
+    const live = ledger?.getRecommendation()?.shards ?? recommendedShards;
+    return live !== null && live < registry.shardCount
+      ? `, or reshard: Discord recommends ${live} shard(s), set FLEET_SHARD_COUNT`
       : '';
+  };
 
   // Master-side mirror of the worker's same-shape adopt: a grant identifies
   // NOTHING when it matches what the node currently holds (its heldLeases when
@@ -3193,13 +3201,7 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     });
     persistedPlanKey = key;
     await store.saveRegistry({
-      nodes: [...registry.nodes.values()].map(n => ({
-        nodeId: n.nodeId,
-        nodeName: n.nodeName,
-        appVersion: n.appVersion,
-        capabilities: n.capabilities,
-        lastSeenAt: Date.now(),
-      })),
+      nodes: [...registry.nodes.values()].map(n => persistedNodeOf(n, registry.lastSeenAt(n))),
       lostNodes: healthMonitor?.getLossEvents(),
       updatedAt: Date.now(),
     });
@@ -3580,27 +3582,15 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     // Webui write-through-owner hop (6.3): the master routes an operator data
     // op to the guild's owning node over the control channel; a self-owned
     // guild applies through the local facade directly.
-    setDataOpForwarder(async (kind, req) => {
-      const shardId = guildIdToShardId(req.guildId, registry.shardCount);
-      const owner = registry.shardTable.get(shardId);
-      if (!owner) return { ok: false, code: 'not-owner', error: `shard ${shardId} is unassigned` };
-      const node = registry.nodes.get(owner.nodeId);
-      if (!node || (!node.connected && !node.isSelf)) {
-        return { ok: false, code: 'owner-unreachable', error: 'owning instance is not connected' };
-      }
-      if (node.isSelf) {
-        return kind === 'write'
-          ? applyOperatorDataWrite(req as GuildDataWriteRequest)
-          : applyOperatorDataRead(req as GuildDataReadRequest);
-      }
-      const type = kind === 'write' ? MSG.DATA_WRITE : MSG.DATA_READ;
-      try {
-        const reply = await server!.request(owner.nodeId, type, { term: registry.term, ...req, ...(kind === 'write' ? { origin: 'webui-operator' } : {}) });
-        return reply ?? { ok: false, code: 'owner-unreachable', error: 'empty reply from the owning instance' };
-      } catch (error) {
-        return { ok: false, code: 'owner-unreachable', error: error instanceof Error ? error.message : String(error) };
-      }
-    });
+    setDataOpForwarder((kind, req) => forwardDataOp({
+      shardCount: registry.shardCount,
+      term: registry.term,
+      ownerOf: shardId => registry.shardTable.get(shardId),
+      nodeOf: id => registry.nodes.get(id),
+      request: (id, type, data) => server!.request(id, type, data),
+      applyWrite: applyOperatorDataWrite,
+      applyRead: applyOperatorDataRead,
+    }, kind, req));
 
     // Supersession (PLAN_REPLICATION 20.3 Case 2, 20.13; B4). A higher term
     // elsewhere means this node is no longer the master: it stops granting at
@@ -4190,6 +4180,9 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     const graceMs = rec.recovered || paused ? RECOVERY_HOLDDOWN_MS : REGISTER_GRACE_MS;
     if ((rec.recovered || paused) && recoverySource) recoverySource.holdDownUntil = Date.now() + graceMs;
     console.log(`[Fleet] Role: master node=${nodeName} (${nodeId.slice(0, 8)}) term=${term} shardCount=${registry.shardCount} capacity=${capabilities.shardCapacity} controlPort=${port}${pinnedShardId !== null ? ` pinnedShard=${pinnedShardId}` : ''}`);
+    if (!standalone && capabilities.shardCapacity === 0 && pinnedShardId === null) {
+      console.warn('[Fleet] This master has shard capacity 0 and no pinned shard, so it holds no shard: boot does not register slash commands (a module install or reload still does) and module auto-update does not start on this node');
+    }
     if (paused && rec.reshardPaused) {
       console.warn(`[Fleet] RESHARD PAUSE active (${rec.reshardPaused.from ?? '?'} -> ${rec.reshardPaused.to ?? '?'} shards): no shards will be assigned until resumed from the Usage tab`);
     }
@@ -4472,6 +4465,8 @@ async function initMaster(init: CommonInit & { standalone: boolean }): Promise<F
     pinnedShardId,
     capacity: capabilities.shardCapacity,
     recommendedShards,
+    recommendedAt,
+    shardSource: decideShardSource({ adoptedPlan: rec.plan !== undefined, overrideApplied: rec.reshardApplied !== undefined, gatewayAnswered: gateway !== null }),
     runtime,
     ingest,
     registry,

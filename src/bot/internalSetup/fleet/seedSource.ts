@@ -320,7 +320,7 @@ export class SeedSource {
     }
     const offered = new Set(outcome.offer.guilds.map(g => g.guildId));
     const missing = payload.guilds.filter(g => !offered.has(g));
-    if (missing.length > 0) return { ok: false, reason: `the copy no longer holds guild(s) ${missing.slice(0, 5).join(', ')}; ask for the offer again` };
+    if (missing.length > 0) return { ok: false, reason: `the copy no longer holds ${missing.length} guild(s) (${missing.slice(0, 5).join(', ')}${missing.length > 5 ? ', ...' : ''}); ask for the offer again` };
     this.push = { seedId: payload.seedId, phase: 'dialing', round: 0, filesSent: 0, bytesSent: 0, startedAt: Date.now(), sentAt: null, masterNodeId: this.hooks.masterNodeId(), landedAt: null, error: null };
     this.hooks.onChanged();
     void this.runPush(payload);

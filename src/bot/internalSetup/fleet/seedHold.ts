@@ -296,6 +296,11 @@ export function floorTermAbove(selfNodeId: string, term: number): void {
 
 let interruptedNote: string | null = null;
 
+/** A wall-clock time with its date, as the seed hold's texts print it. */
+export function utcStamp(ms: number): string {
+  return `${new Date(ms).toISOString().slice(0, 19).replace('T', ' ')} UTC`;
+}
+
 /**
  * At a master boot, before the fence: a seed that got past its verify is
  * finished (the boot then runs as the staged takeover it wrote); one caught
@@ -308,7 +313,7 @@ export async function resumeSeed(selfNodeId: string, seize = false): Promise<voi
     fs.rmSync(path.join(DATA_ROOT, '_incoming', record.seedId), { recursive: true, force: true });
     fs.rmSync(mirrorRoot(), { recursive: true, force: true });
     clearSeedRecord();
-    interruptedNote = `A seed from ${record.backupNodeName}'s copy was interrupted by a restart before it verified; nothing was adopted. Confirm it again.`;
+    interruptedNote = `A seed from ${record.backupNodeName}'s copy was interrupted by a restart before it verified (found at ${utcStamp(Date.now())}); nothing was adopted. Confirm it again.`;
     console.warn(`[Fleet] Seed ${record.seedId} from ${record.backupNodeName} was interrupted before its verify; its staging is discarded`);
     return;
   }
@@ -357,8 +362,18 @@ interface BackupEntry {
   connected: boolean;
   offer: SeedOffer | null;
   offerReason: string | null;
+  /** Set when the offer request timed out or its answer could not be read: the copy is unknown, not absent. */
+  offerFault: 'unanswered' | 'unreadable' | null;
   offerAt: number | null;
   offerPending: boolean;
+}
+
+interface RefusalEntry {
+  nodeId: string;
+  nodeName: string;
+  reason: string;
+  at: number;
+  attempts: number;
 }
 
 interface SeedLane {
@@ -447,7 +462,7 @@ export interface SeedConfirmResult {
   error?: string;
 }
 
-class SeedHoldRuntime {
+export class SeedHoldRuntime {
   private readonly backups = new Map<string, BackupEntry>();
   private server: ControlServer | null = null;
   /** The term the hold's channel answers with, fixed for the hold: every registered backup's term fence rests on it. */
@@ -457,6 +472,7 @@ class SeedHoldRuntime {
   private beaconedBy: string | null = null;
   private lane: SeedLane | null = null;
   private lastError: string | null = null;
+  private readonly refused = new Map<string, RefusalEntry>();
   private lastPublished: string | null = null;
   private readonly since = Date.now();
   private stopped = false;
@@ -568,6 +584,11 @@ class SeedHoldRuntime {
   private onRegister(payload: RegisterPayload): RegisterResult {
     const refuse = (reason: string): RegisterResult => {
       console.warn(`[Fleet] Seed hold refused registration of ${payload?.nodeName ?? payload?.nodeId ?? '?'}: ${reason}`);
+      if (payload && typeof payload.nodeId === 'string' && payload.nodeId.length > 0) {
+        const prior = this.refused.get(payload.nodeId);
+        this.refused.set(payload.nodeId, { nodeId: payload.nodeId, nodeName: payload.nodeName || payload.nodeId, reason, at: Date.now(), attempts: (prior?.attempts ?? 0) + 1 });
+        this.publish();
+      }
       return { accepted: false, term: this.serverTerm, reason };
     };
     if (!payload || typeof payload.nodeId !== 'string' || payload.nodeId.length === 0) return refuse('invalid-register-payload');
@@ -577,16 +598,18 @@ class SeedHoldRuntime {
     if (payload.capabilities?.backupMaster !== true) return refuse('seed-hold: this master holds to be seeded from a designated backup and registers designated backups only (BOT_NODE_ROLE=backup-master)');
     // The reply carries no backend, which a co-worker reads as file mode and
     // persists; a postgres fleet's backup has nothing this hold could adopt.
+    if (payload.capabilities?.dataBackend === 'postgres') return refuse('seed-hold: this backup keeps guild data in postgres, which a file-mode master cannot adopt; start this master on the fleet\'s postgres first, where it reads that data and needs no seed');
     if (payload.capabilities?.dataBackend !== 'file') return refuse('seed-hold: this master seeds file-mode guild data and registers file-mode backups only');
     // Every build reports the same app and protocol versions, so the seed's
     // own flag is what tells a backup that can answer from one that cannot.
     if (payload.capabilities?.seedSource !== true) return refuse('seed-hold: this backup runs a build without the seed of a new master; update it to the master\'s build, then it offers its copy here');
-    const entry: BackupEntry = this.backups.get(payload.nodeId) ?? { nodeId: payload.nodeId, nodeName: payload.nodeName || payload.nodeId, connected: true, offer: null, offerReason: null, offerAt: null, offerPending: false };
+    const entry: BackupEntry = this.backups.get(payload.nodeId) ?? { nodeId: payload.nodeId, nodeName: payload.nodeName || payload.nodeId, connected: true, offer: null, offerReason: null, offerFault: null, offerAt: null, offerPending: false };
     entry.nodeName = payload.nodeName || payload.nodeId;
     entry.connected = true;
     // Asked again on every registration: the copy may have changed meanwhile.
     entry.offerAt = null;
     this.backups.set(payload.nodeId, entry);
+    this.refused.delete(payload.nodeId);
     console.log(`[Fleet] Seed hold: backup ${entry.nodeName} (${payload.nodeId}) registered; asking what copy it holds`);
     this.publish();
     return { accepted: true, term: this.serverTerm, seedHold: true };
@@ -598,13 +621,19 @@ class SeedHoldRuntime {
     entry.offerPending = true;
     try {
       const reply = await this.server.request(nodeId, MSG.SEED_OFFER, { term: this.serverTerm }, SEED_OFFER_TIMEOUT_MS) as SeedOfferReply;
-      const offer = reply && reply.ok !== false ? sanitizeOffer(reply.offer) : null;
+      if (reply && reply.ok === false) throw new Error(typeof reply.reason === 'string' ? reply.reason : 'the backup refused');
+      const offer = reply ? sanitizeOffer(reply.offer) : null;
       const unfit = offer ? offerRecordsRefusal(offer) : null;
       entry.offer = unfit === null ? offer : null;
       entry.offerReason = unfit ?? (offer ? null : typeof reply?.reason === 'string' ? reply.reason : reply?.offer ? 'its offer was malformed' : 'no copy offered');
+      entry.offerFault = null;
     } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
       entry.offer = null;
-      entry.offerReason = `its offer could not be read: ${error instanceof Error ? error.message : error}`;
+      entry.offerFault = /timed out/.test(message) ? 'unanswered' : 'unreadable';
+      entry.offerReason = entry.offerFault === 'unanswered'
+        ? `it did not answer its offer within ${Math.round(SEED_OFFER_TIMEOUT_MS / 1000)} s`
+        : `its offer could not be read: ${message}`;
     }
     entry.offerAt = Date.now();
     entry.offerPending = false;
@@ -615,10 +644,12 @@ class SeedHoldRuntime {
   confirm(nodeId: string, confirmed: boolean): SeedConfirmResult {
     if (this.stopped) return { success: false, error: 'the seed is done; this node is restarting as master' };
     if (this.closed) return { success: false, error: 'the hold has ended (this node parked on a live master, or the brand-new fleet was confirmed)' };
+    if (this.lane && !this.lane.failed && this.lane.stalled !== null) return { success: false, error: `the seed from ${this.lane.record.backupNodeName} is stalled, not running: ${this.lane.stalled}` };
     if (this.lane && !this.lane.failed) return { success: false, error: `a seed from ${this.lane.record.backupNodeName} is already running (${this.lane.phase})` };
     const entry = this.backups.get(nodeId);
     if (!entry) return { success: false, error: 'that backup has not registered here' };
     if (!entry.connected) return { success: false, error: `${entry.nodeName} is not connected to this node now` };
+    if (!entry.offer && entry.offerFault !== null) return { success: false, error: `${entry.nodeName}: ${entry.offerReason}, so the copy it holds is not known; it is asked again while it stays connected` };
     if (!entry.offer) return { success: false, error: `${entry.nodeName} offers no copy${entry.offerReason ? `: ${entry.offerReason}` : ''}` };
     if (this.opts.transferUrl === null) return { success: false, error: 'TRANSFER_URL is not set on this node; the backup pushes the copy to that address, so set it and restart this bot before confirming a seed' };
     const offer = entry.offer;
@@ -634,6 +665,7 @@ class SeedHoldRuntime {
         error: `Seed this master from ${entry.nodeName}'s ${what} (${offer.guilds.length} guild(s), ${mb} MB${partial})?${offer.kind === 'mirror' ? ' Everything the old master wrote after that point is LOST.' : ''}${offer.sourceTerm < this.beaconMax ? ` ${this.beaconedBy ?? 'Another node'} beaconed term ${this.beaconMax}, above ${offer.kind === 'mirror' ? 'the copy\'s' : 'this mastership\'s'} term ${offer.sourceTerm}: anything written under that term is not in this data and is LOST.` : ''} This machine adopts the copy as the fleet's guild data, pins the shard plan to itself, mints a term above every beacon and restarts as master; ${entry.nodeName} then ${offer.kind === 'mirror' ? 'drops the copy and mirrors this master' : 'retires its old copies from its Fleet tab and, if the pinned fleet config (its own, carried with the copy) designates it as a backup, mirrors this master; otherwise designate it from this master\'s Fleet tab first'}.`,
       };
     }
+    interruptedNote = null;
     void this.startLane(entry, offer);
     return { success: true };
   }
@@ -891,7 +923,7 @@ class SeedHoldRuntime {
     fs.rmSync(mirrorRoot(), { recursive: true, force: true });
     const onDisk = readSeedRecord();
     if (onDisk && onDisk.seedId === lane.record.seedId && onDisk.phase === 'push') clearSeedRecord();
-    this.lastError = `${reason} (${new Date().toISOString().slice(11, 19)} UTC)`;
+    this.lastError = `${reason} (${utcStamp(Date.now())})`;
     if (this.lane === lane) this.lane = null;
     console.error(`[Fleet] SEED FAILED: ${reason}`);
     this.publish(true);
@@ -982,6 +1014,7 @@ class SeedHoldRuntime {
           }
         : null,
       offerReason: entry.offerReason,
+      offerFault: entry.offerFault,
       offerAt: entry.offerAt,
     }));
     const lane = this.lane;
@@ -996,6 +1029,7 @@ class SeedHoldRuntime {
       controlUrl: this.opts.controlUrl,
       controlPort: this.opts.controlPort,
       backups,
+      refused: [...this.refused.values()].map(r => ({ ...r })),
       push,
       lastError: this.lastError,
       interrupted: interruptedNote,

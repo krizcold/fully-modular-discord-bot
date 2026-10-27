@@ -16,7 +16,8 @@ import {
   getUpdaterType,
   checkForAllUpdates,
   triggerModuleUpdate,
-  triggerAllModuleUpdates
+  triggerAllModuleUpdates,
+  describeBulkModuleUpdate
 } from '@/updater';
 
 const execAsync = promisify(exec);
@@ -173,9 +174,9 @@ export function createUpdateRouter(botManager: BotManager): Router {
         totalUpdated: result.totalUpdated,
         updated: result.updated,
         failed: result.failed,
-        message: result.success
-          ? `Successfully updated ${result.totalUpdated} module(s)`
-          : `Updated ${result.totalUpdated} module(s), ${result.failed.length} failed`
+        checkErrors: result.checkErrors,
+        skipped: result.skipped,
+        message: describeBulkModuleUpdate(result)
       });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
@@ -203,10 +204,12 @@ export function createUpdateRouter(botManager: BotManager): Router {
 
       if (updateResult.totalUpdated === 0) {
         res.json({
-          success: true,
+          success: updateResult.success,
           download: updateResult,
           reload: null,
-          message: 'No modules were updated; nothing to reload'
+          message: updateResult.success
+            ? 'No modules were updated; nothing to reload'
+            : describeBulkModuleUpdate(updateResult)
         });
         return;
       }
@@ -220,8 +223,8 @@ export function createUpdateRouter(botManager: BotManager): Router {
         download: updateResult,
         reload: reloadResult,
         message: reloadResult?.success
-          ? `Updated and reloaded ${updateResult.totalUpdated} module(s)`
-          : `Updated ${updateResult.totalUpdated} module(s), reload had issues`
+          ? `${describeBulkModuleUpdate(updateResult)}; reloaded the updated module(s)`
+          : `${describeBulkModuleUpdate(updateResult)}; reload had issues`
       });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';

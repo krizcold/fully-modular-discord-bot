@@ -24,8 +24,14 @@ export interface GatewayInfo {
 
 /** GET /gateway/bot for the recommended shard count, identify concurrency and identify budget. Null on any failure. */
 export function fetchGatewayInfo(token: string | undefined): Promise<GatewayInfo | null> {
-  if (!token || token.trim() === '') return Promise.resolve(null);
-  return new Promise(resolve => {
+  return fetchGatewayInfoResult(token).then(r => r.info);
+}
+
+/** fetchGatewayInfo with the failure cause: error is null exactly when info is set. */
+export function fetchGatewayInfoResult(token: string | undefined): Promise<{ info: GatewayInfo | null; error: string | null }> {
+  if (!token || token.trim() === '') return Promise.resolve({ info: null, error: 'no bot token is set' });
+  return new Promise(outcome => {
+    const resolve = (info: GatewayInfo | null, error?: string) => outcome({ info, error: info ? null : (error ?? 'unknown failure') });
     const req = https.get(
       'https://discord.com/api/v10/gateway/bot',
       { headers: { authorization: `Bot ${token}` }, timeout: GATEWAY_INFO_TIMEOUT_MS },
@@ -34,7 +40,7 @@ export function fetchGatewayInfo(token: string | undefined): Promise<GatewayInfo
         res.on('data', chunk => { body += chunk; });
         res.on('end', () => {
           try {
-            if (res.statusCode !== 200) return resolve(null);
+            if (res.statusCode !== 200) return resolve(null, `HTTP ${res.statusCode}`);
             const parsed = JSON.parse(body);
             const ssl = parsed?.session_start_limit;
             resolve({
@@ -49,13 +55,13 @@ export function fetchGatewayInfo(token: string | undefined): Promise<GatewayInfo
                 : null,
             });
           } catch {
-            resolve(null);
+            resolve(null, 'the reply was not valid JSON');
           }
         });
       },
     );
-    req.on('timeout', () => { req.destroy(); resolve(null); });
-    req.on('error', () => resolve(null));
+    req.on('timeout', () => { req.destroy(); resolve(null, `no reply within ${GATEWAY_INFO_TIMEOUT_MS}ms`); });
+    req.on('error', (error: Error) => resolve(null, error.message));
   });
 }
 
@@ -136,7 +142,20 @@ export function resolveShardCount(recommended: number): number {
   return getShardCountOverride() ?? Math.max(1, recommended);
 }
 
-/** Where shardCount came from, for display. */
+export type ShardSource = 'plan' | 'override' | 'discord' | 'fallback' | 'master';
+
+/**
+ * What decided the running shard count: the persisted plan adopted at boot,
+ * the FLEET_SHARD_COUNT override applied, Discord's recommendation, or the
+ * 1-shard fallback when /gateway/bot failed.
+ */
+export function decideShardSource(opts: { adoptedPlan: boolean; overrideApplied: boolean; gatewayAnswered: boolean }): ShardSource {
+  if (opts.adoptedPlan && !opts.overrideApplied) return 'plan';
+  if (getShardCountOverride() !== null) return 'override';
+  return opts.gatewayAnswered ? 'discord' : 'fallback';
+}
+
+/** Where shardCount would come from on a node that holds no plan, for display. */
 export function getShardSource(): 'discord' | 'override' {
   return getShardCountOverride() !== null ? 'override' : 'discord';
 }
@@ -284,10 +303,12 @@ export function planPinRestoreLegs(
 
   const legs: PinRestoreLeg[] = [{ shardId: pinnedShardId, fromNodeId: held.nodeId, toNodeId: masterNodeId }];
 
-  const masterCapacity = Math.max(1, master.capabilities?.shardCapacity ?? 1);
+  const masterCapacity = declaredCapacityOf(master);
   const masterHeld = registry.shardIdsOf(masterNodeId).length;
-  // After receiving the pinned shard the master would hold masterHeld + 1.
-  if (masterHeld + 1 <= masterCapacity) {
+  // After receiving the pinned shard the master would hold masterHeld + 1; the
+  // pinned shard is the master's whatever its capacity, so with nothing else
+  // held there is nothing to displace.
+  if (masterHeld + 1 <= masterCapacity || masterHeld === 0) {
     return { proposedLegs: legs };
   }
 
@@ -302,17 +323,19 @@ export function planPinRestoreLegs(
 
   // Prefer the pinned shard's current holder if it will have capacity after
   // giving up the pinned shard; else any connected node with free capacity.
-  const holderCapacity = Math.max(1, holder.capabilities?.shardCapacity ?? 1);
+  // A holder declaring 0 takes it back only when no other node has room.
+  const holderCapacity = declaredCapacityOf(holder);
   const holderHeldAfter = registry.shardIdsOf(held.nodeId).length - 1; // it releases the pinned shard
   let target: string | null = holderHeldAfter < holderCapacity ? held.nodeId : null;
   if (!target) {
     for (const node of registry.nodes.values()) {
       if (node.nodeId === masterNodeId || node.nodeId === held.nodeId) continue;
       if (!node.connected || node.draining) continue;
-      const cap = Math.max(1, node.capabilities?.shardCapacity ?? 1);
+      const cap = declaredCapacityOf(node);
       if (registry.shardIdsOf(node.nodeId).length < cap) { target = node.nodeId; break; }
     }
   }
+  if (!target && holderCapacity === 0 && !holder.draining) target = held.nodeId;
   if (!target) return { proposedLegs: null, reason: 'no-capacity' };
   legs.push({ shardId: displaced, fromNodeId: masterNodeId, toNodeId: target });
   return { proposedLegs: legs };

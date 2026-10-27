@@ -1,0 +1,17 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": ".",
+    "noEmit": true,
+    "paths": {
+      "@/updater": ["updaters/updater_local/index.ts"],
+      "@/*": ["src/*"],
+      "@bot/*": ["src/bot/*"],
+      "@modules/*": ["src/bot/modules/*"],
+      "@internal/*": ["src/bot/internalSetup/*"],
+      "@bot/types": ["src/bot/types"],
+      "@webui/*": ["src/webui/*"]
+    }
+  },
+  "include": ["src", "updaters/updater_local"]
+}

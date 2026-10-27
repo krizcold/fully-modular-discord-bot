@@ -13,37 +13,86 @@ import { resolveNodeRole } from '../../fleet/nodeIdentity';
 import { loadGlobalData, saveGlobalData } from '../../utils/dataManager';
 import { dataPath } from '../../../../utils/dataRoot';
 import * as fs from 'fs';
+import { componentConfigPath, getLastAppliedDisabledCommands, readConfigFile, setLastAppliedDisabledCommands } from '../../utils/appStoreConfigFile';
+import { resolveClientApplication } from '../../utils/clientApplication';
+import { getLoadFailures, getReloadState } from '../../utils/loadFailures';
 
 /** Check if auto-cleanup is enabled in AppStore config (default: false) */
 export function isAutoCleanupEnabled(): boolean {
-  try {
-    const configPath = dataPath('global', 'appstore', 'config.json');
-    if (fs.existsSync(configPath)) {
-      const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
-      return config.autoCleanup === true;
-    }
-  } catch { /* ignore */ }
-  return false;
+  return readAutoCleanup() === true;
 }
 
-/** Load component toggle config; returns set of disabled command keys */
-function getDisabledCommands(): Set<string> {
-  const disabled = new Set<string>();
+/** The Auto Cleanup switch, or null when config.json cannot be read or parsed. */
+function readAutoCleanup(): boolean | null {
   try {
-    const configPath = dataPath('global', 'appstore', 'component-config.json');
-    if (fs.existsSync(configPath)) {
-      const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
-      for (const [key, value] of Object.entries(config)) {
-        if (value === false && key.includes(':command:')) {
-          // key format: "moduleName:command:commandName"; extract commandName
-          const parts = key.split(':');
-          if (parts.length >= 3) {
-            disabled.add(parts[parts.length - 1]);
-          }
-        }
+    const configPath = dataPath('global', 'appstore', 'config.json');
+    if (!fs.existsSync(configPath)) return false;
+    const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+    return config.autoCleanup === true;
+  } catch {
+    return null;
+  }
+}
+
+/** Module names in installed.json, read fresh (the web UI process writes it); null when it cannot be read or parsed. */
+function readInstalledNames(): string[] | null {
+  const file = dataPath('global', 'appstore', 'installed.json');
+  let raw: string;
+  try {
+    raw = fs.readFileSync(file, 'utf-8');
+  } catch (error: any) {
+    if (error?.code === 'ENOENT') return [];
+    console.error('[Cleanup] Cannot read installed.json:', error);
+    return null;
+  }
+  try {
+    const modules = JSON.parse(raw)?.modules;
+    if (!modules || typeof modules !== 'object' || Array.isArray(modules)) {
+      console.error('[Cleanup] installed.json has no module list');
+      return null;
+    }
+    return Object.keys(modules);
+  } catch (error) {
+    console.error('[Cleanup] Cannot parse installed.json:', error);
+    return null;
+  }
+}
+
+/** Installed modules with neither a loaded module nor a manifest at this boot; null when that cannot be read. */
+async function installedButAbsent(): Promise<string[] | null> {
+  try {
+    // Imported here: a static import of these closes a cycle through moduleReloader.
+    const { getModuleRegistry } = await import('../../utils/moduleRegistry');
+    const { findModuleManifests, getModuleInfo } = await import('../../utils/pathHelpers');
+    const installed = readInstalledNames();
+    if (installed === null) return null;
+    const present = new Set(getModuleRegistry().getAllModules().map(m => m.manifest.name));
+    for (const manifestPath of findModuleManifests()) present.add(getModuleInfo(manifestPath).moduleName);
+    return installed.filter(n => !present.has(n));
+  } catch (error) {
+    console.error('[Cleanup] Cannot list installed or loaded modules:', error);
+    return null;
+  }
+}
+
+/** Disabled command names; on a read error, the last applied set, or null when none was applied yet. */
+function getDisabledCommands(): Set<string> | null {
+  const read = readConfigFile(componentConfigPath());
+  if (!read.ok) {
+    console.error(`[registerCommands] component-config.json cannot be read: ${read.error}`);
+    return getLastAppliedDisabledCommands();
+  }
+  const disabled = new Set<string>();
+  for (const [key, value] of Object.entries(read.config)) {
+    if (value === false && key.includes(':command:')) {
+      // key format: "moduleName:command:commandName"; extract commandName
+      const parts = key.split(':');
+      if (parts.length >= 3) {
+        disabled.add(parts[parts.length - 1]);
       }
     }
-  } catch { /* ignore */ }
+  }
+  setLastAppliedDisabledCommands(disabled);
   return disabled;
 }
 
@@ -67,42 +116,54 @@ function saveLastTestGuild(newGuildId: string): void {
   saveGlobalData<LastTestGuildData>(TRACKING_FILE, { guildId: newGuildId }, TRACKING_CATEGORY);
 }
 
+// Discord codes meaning the bot left the guild or the command is already gone.
+const GUILD_GONE_CODES = new Set([10004, 50001]);
+const COMMAND_GONE_CODE = 10063;
+
 /**
- * Clean ALL guild commands from a specific guild
- * Guild commands should only exist on the current test guild, so any on other guilds are stale
+ * Clean ALL guild commands from a specific guild through REST (the guild may be
+ * on another node's shard or absent from the cache). done is false when any
+ * fetch or delete failed, so the guild stays tracked and the next run retries.
  */
 async function cleanStaleTestCommands(
   client: Client,
   targetGuildId: string
-): Promise<number> {
-  const guild = client.guilds.cache.get(targetGuildId);
-  if (!guild) {
-    console.log(`[Cleanup] Guild ${targetGuildId} not accessible (bot may have been removed)`);
-    return 0;
+): Promise<{ deleted: number; done: boolean }> {
+  const application = await resolveClientApplication(client);
+  if (!application) {
+    console.error(`[Cleanup] Stale commands in guild ${targetGuildId} not cleaned: the bot application could not be resolved`);
+    return { deleted: 0, done: false };
   }
 
-  let deletedCount = 0;
+  let guildCommands;
   try {
-    const guildCommands = await guild.commands.fetch();
-
-    if (guildCommands.size === 0) return 0;
-
-    console.log(`[Cleanup] Found ${guildCommands.size} stale command(s) in ${guild.name} (${targetGuildId})`);
-
-    for (const guildCmd of guildCommands.values()) {
-      try {
-        await guild.commands.delete(guildCmd.id);
-        console.log(`[Cleanup] Deleted "${guildCmd.name}" from ${guild.name}`);
-        deletedCount++;
-      } catch (err) {
-        console.error(`[Cleanup] Failed to delete "${guildCmd.name}" from ${guild.name}:`, err);
-      }
+    guildCommands = await application.commands.fetch({ guildId: targetGuildId });
+  } catch (err: any) {
+    if (GUILD_GONE_CODES.has(err?.code)) {
+      console.log(`[Cleanup] Guild ${targetGuildId} not accessible (bot may have been removed)`);
+      return { deleted: 0, done: true };
     }
-  } catch (err) {
-    console.error(`[Cleanup] Failed to fetch commands from guild ${targetGuildId}:`, err);
+    console.error(`[Cleanup] Failed to fetch commands from guild ${targetGuildId}; will retry on the next registration:`, err);
+    return { deleted: 0, done: false };
   }
 
-  return deletedCount;
+  if (guildCommands.size === 0) return { deleted: 0, done: true };
+  console.log(`[Cleanup] Found ${guildCommands.size} stale command(s) in guild ${targetGuildId}`);
+
+  let deleted = 0;
+  let done = true;
+  for (const guildCmd of guildCommands.values()) {
+    try {
+      await application.commands.delete(guildCmd.id, targetGuildId);
+      console.log(`[Cleanup] Deleted "${guildCmd.name}" from guild ${targetGuildId}`);
+      deleted++;
+    } catch (err: any) {
+      if (err?.code === COMMAND_GONE_CODE) continue;
+      done = false;
+      console.error(`[Cleanup] Failed to delete "${guildCmd.name}" from guild ${targetGuildId}; will retry on the next registration:`, err);
+    }
+  }
+  return { deleted, done };
 }
 
 /**
@@ -114,40 +175,59 @@ async function cleanStaleTestCommands(
 async function handleStaleTestGuildCleanup(
   client: Client,
   currentGuildId: string
-): Promise<void> {
+): Promise<boolean> {
   const lastGuildId = getLastTestGuild();
 
   // Case C: Same guild - no cleanup needed
   if (lastGuildId === currentGuildId) {
-    return;
+    return true;
   }
 
   // Case B: Different guild - clean only that one
   if (lastGuildId !== null) {
     console.log(`[i] Test guild changed from ${lastGuildId} to ${currentGuildId}, cleaning stale commands...`);
-    const deleted = await cleanStaleTestCommands(client, lastGuildId);
+    const { deleted, done } = await cleanStaleTestCommands(client, lastGuildId);
     if (deleted > 0) {
       console.log(`[i] Cleaned ${deleted} stale command(s) from previous test guild`);
     }
-    return;
+    return done;
   }
 
-  // Case A: No tracked guild - full scan
+  // Case A: No tracked guild - full scan of every guild the bot is in, read
+  // through REST so a node holding no shard still sees them.
   console.log('[i] No previous test guild tracked, scanning all guilds for stale commands...');
+  let guildIds: string[];
+  try {
+    guildIds = [];
+    for (let after: string | undefined; ;) {
+      const page = await client.guilds.fetch({ limit: 200, after });
+      guildIds.push(...page.keys());
+      if (page.size < 200) break;
+      after = page.lastKey();
+    }
+  } catch (err) {
+    console.error('[Cleanup] Could not list the bot\'s guilds; the stale command scan will retry on the next registration:', err);
+    return false;
+  }
   let totalDeleted = 0;
+  let allDone = true;
 
-  for (const [scanGuildId] of client.guilds.cache) {
+  for (const scanGuildId of guildIds) {
     if (scanGuildId === currentGuildId) continue;
 
-    const deleted = await cleanStaleTestCommands(client, scanGuildId);
+    const { deleted, done } = await cleanStaleTestCommands(client, scanGuildId);
     totalDeleted += deleted;
+    if (!done) allDone = false;
   }
 
-  if (totalDeleted > 0) {
+  if (!allDone) {
+    console.warn(`[i] Full scan incomplete: cleaned ${totalDeleted} stale command(s); the rest retry on the next registration`);
+  } else if (totalDeleted > 0) {
     console.log(`[i] Full scan complete: cleaned ${totalDeleted} stale command(s) across all guilds`);
   } else {
     console.log('[i] Full scan complete: no stale commands found');
   }
+  return allDone;
 }
 
 const typeChat = ApplicationCommandType.ChatInput
@@ -172,15 +252,23 @@ const internalOrHandledKeys = [
   'initialize',
 ];
 
+/** What the orphan sweep did; registerCommands returns null when registration itself did not run to the end. */
+export interface OrphanSweepResult {
+  sweep: 'done' | 'off' | 'skipped' | 'stopped';
+  deleted: number;
+  failed: number;
+  note?: string;
+}
+
 export default async function registerCommands(
   client: Client,
   options: { runOrphanCleanup?: boolean } = {}
-) {
+): Promise<OrphanSweepResult | null> {
   // Slash-command registration is a bot-identity-wide operation; only the
   // master node performs it (co-workers would race the same Discord state).
   if (resolveNodeRole() === 'co-worker') {
     console.log('[i] Skipping command registration (co-worker node; the master owns it)');
-    return;
+    return null;
   }
   const runOrphanCleanup = options.runOrphanCleanup !== false;
   console.log('[i] Registering commands...');
@@ -188,28 +276,41 @@ export default async function registerCommands(
   if (!guildId) {
     console.error('GUILD_ID environment variable is not set.');
     console.warn('Commands will not be registered.');
-    return;
+    return null;
   }
 
   try {
     // Clean up stale guild commands from previous test guilds
-    await handleStaleTestGuildCleanup(client, guildId);
+    const staleCleanupDone = await handleStaleTestGuildCleanup(client, guildId);
+
+    // A reload in flight, or one started after this point, makes the local list incomplete for the sweep.
+    const reloadAtRead = getReloadState();
+    const noReloadSinceRead = (): boolean => {
+      const now = getReloadState();
+      return now.inFlight === 0 && now.started === reloadAtRead.started;
+    };
 
     // Load all local commands (each file exports a command object or an array of commands)
     const localCommands = getLocalCommands();
 
     // Load disabled commands from component config
     const disabledCommands = getDisabledCommands();
+    if (!disabledCommands) {
+      console.error('[registerCommands] Commands were not registered: the disabled set cannot be read and none was applied before.');
+      return null;
+    }
     if (disabledCommands.size > 0) {
       console.log(`[i] ${disabledCommands.size} command(s) disabled via component config: ${[...disabledCommands].join(', ')}`);
     }
 
-    // Fetch existing commands from Discord
-    const globalCommands = await client.application?.commands.fetch();
-    if (!client.application) {
-      console.error('[registerCommands] client.application not available; cannot register commands.');
-      return;
+    // Fetch existing commands from Discord. On a node whose gateway never
+    // became ready, the application is resolved through REST.
+    const application = await resolveClientApplication(client);
+    if (!application) {
+      console.error('[registerCommands] Commands were not registered: the bot application could not be resolved.');
+      return null;
     }
+    const globalCommands = await application.commands.fetch();
     // Test (guild) commands go through the application-commands REST API scoped
     // to guildId, NOT a cached Guild object. In a fleet the test guild usually
     // lives on ANOTHER node's shard, so it is legitimately absent from this
@@ -217,7 +318,7 @@ export default async function registerCommands(
     // master. This REST manager works regardless of which shard holds the guild,
     // and never adds it to this client's cache (which would corrupt the fleet
     // guild map / this node's guild count).
-    const appCommands = client.application.commands;
+    const appCommands = application.commands;
     const guildCmds = {
       fetch: () => appCommands.fetch({ guildId }),
       create: (data: any) => appCommands.create(data, guildId),
@@ -225,6 +326,9 @@ export default async function registerCommands(
       delete: (id: string) => appCommands.delete(id, guildId),
     };
     const guildCommands = await guildCmds.fetch(); // Test commands!
+
+    const result: OrphanSweepResult = { sweep: 'off', deleted: 0, failed: 0 };
+    let disabledFailed = 0;
 
     // Process each local command
     for (const localCommand of localCommands) {
@@ -242,10 +346,17 @@ export default async function registerCommands(
         const existing = (testOnly ? guildCommands : globalCommands)?.find(cmd => cmd.name === name && cmd.type === (type ?? typeChat));
         if (existing) {
           try {
-            const mgr = testOnly ? guildCmds : client.application?.commands;
-            await mgr?.delete(existing.id);
+            await (testOnly ? guildCmds : appCommands).delete(existing.id);
+            result.deleted++;
             console.log(`[i] Unregistered disabled command: ${name}`);
-          } catch (e) { console.error(`[i] Failed to unregister disabled command ${name}:`, e); }
+          } catch (e: any) {
+            if (e?.code === COMMAND_GONE_CODE) {
+              console.debug(`[i] Disabled command ${name} already gone on Discord (10063)`);
+            } else {
+              disabledFailed++;
+              console.error(`[i] Failed to unregister disabled command ${name}:`, e);
+            }
+          }
         }
         continue;
       }
@@ -261,11 +372,89 @@ export default async function registerCommands(
 
       await commandRegistration(commandData, localCommand, existingCommand, guildCmds, client);
     }
+    result.failed = disabledFailed;
+    if (result.deleted > 0 || disabledFailed > 0) {
+      console.log(`[i] Disabled commands: ${result.deleted} unregistered, ${disabledFailed} could not be unregistered`);
+    }
 
 
     // Remove orphan commands only if auto-cleanup is enabled (default: OFF)
     // AND the caller allows the full sweep (startup: yes; hot-reload: no).
-    const cleanupEnabled = isAutoCleanupEnabled() && runOrphanCleanup;
+    const switchAtStart = runOrphanCleanup ? readAutoCleanup() : false;
+    let cleanupEnabled = switchAtStart === true;
+    if (cleanupEnabled) result.sweep = 'done';
+    let sweepDeleted = 0;
+    let sweepFailed = 0;
+    let sweepNote: string | undefined;
+    if (runOrphanCleanup && switchAtStart !== true) {
+      sweepNote = switchAtStart === null
+        ? 'orphan sweep not run: the Auto Cleanup setting could not be read'
+        : 'orphan sweep not run: Auto Cleanup was turned off';
+    }
+    const skipSweep = (note: string, why: string): void => {
+      cleanupEnabled = false;
+      result.sweep = 'skipped';
+      sweepNote = note;
+      console.warn(`[Cleanup] Orphan command sweep skipped; their commands would be deleted. ${why}`);
+    };
+    if (cleanupEnabled && !noReloadSinceRead()) {
+      skipSweep('orphan sweep skipped: a module reload was running', 'A module reload was running.');
+    }
+    if (cleanupEnabled) {
+      const recorded = getLoadFailures();
+      const absent = recorded.length === 0 ? await installedButAbsent() : [];
+      // Listing the modules can record a module.json it could not read.
+      const recordedNow = getLoadFailures();
+      if (recordedNow.length > 0) {
+        skipSweep(
+          `orphan sweep skipped until the bot restarts: these modules did not load, lack a dependency or could not be read: ${recordedNow.join(', ')}`,
+          `Did not load, lack a dependency or could not be read: ${recordedNow.join(', ')}`
+        );
+      } else if (absent === null) {
+        skipSweep('orphan sweep skipped: the installed module list could not be read', 'The installed module list could not be read.');
+      } else if (absent.length > 0) {
+        skipSweep(
+          `orphan sweep skipped: these installed modules are missing: ${absent.join(', ')}`,
+          `Installed but missing: ${absent.join(', ')}`
+        );
+      }
+    }
+    let halted = false;
+    const sweepCounts = (): string =>
+      `${sweepDeleted} deletion(s)${sweepFailed > 0 ? `, ${sweepFailed} failed (see the bot log)` : ''}`;
+    const mayDelete = (): boolean => {
+      if (!noReloadSinceRead()) {
+        result.sweep = 'skipped';
+        sweepNote = `orphan sweep skipped after ${sweepCounts()}: a module reload was running`;
+        console.log(`[Cleanup] Orphan sweep skipped after ${sweepCounts()}: a module reload was running`);
+        halted = true;
+        return false;
+      }
+      const on = readAutoCleanup();
+      if (on === true) return true;
+      const why = on === null ? 'the Auto Cleanup setting could not be read' : 'Auto Cleanup was turned off';
+      result.sweep = 'stopped';
+      sweepNote = `orphan sweep stopped after ${sweepCounts()}: ${why}`;
+      console.log(`[Cleanup] Orphan sweep stopped after ${sweepCounts()}: ${why}`);
+      halted = true;
+      return false;
+    };
+    const sweepDelete = async (label: string, remove: () => Promise<unknown>): Promise<void> => {
+      try {
+        await remove();
+        sweepDeleted++;
+        result.deleted++;
+        console.log(`Deleted ${label} as it is no longer found locally or test mode active.`);
+      } catch (deleteError: any) {
+        if (deleteError?.code === COMMAND_GONE_CODE) {
+          console.debug(`${label} already gone on Discord (10063)`);
+        } else {
+          sweepFailed++;
+          result.failed++;
+          console.error(`Error deleting ${label}:`, deleteError);
+        }
+      }
+    };
 
     // Remove global commands that are no longer present locally
     if (cleanupEnabled && globalCommands) {
@@ -286,19 +475,11 @@ export default async function registerCommands(
             console.log(`[Test Mode] Skipping deletion of global command: ${appCommand.name} (Type: ${ApplicationCommandType[appCommand.type]})`);
             continue;
           }
-          try {
-            await client.application?.commands.delete(appCommand.id);
-            console.log(`Deleted global command "${appCommand.name}" (Type: ${ApplicationCommandType[appCommand.type]}) as it is no longer found locally or test mode active.`);
-          } catch(deleteError: any){
-            if (deleteError?.code === 10063) {
-              console.debug(`Global command "${appCommand.name}" already gone on Discord (10063)`);
-            } else {
-              console.error(`Error deleting global command "${appCommand.name}":`, deleteError);
-            }
-          }
+          if (!mayDelete()) break;
+          await sweepDelete(`global command "${appCommand.name}" (Type: ${ApplicationCommandType[appCommand.type]})`, () => appCommands.delete(appCommand.id));
         }
       }
-    } else if (!cleanupEnabled && globalCommands) {
+    } else if (result.sweep === 'off' && globalCommands) {
       if (!runOrphanCleanup) {
         console.log('[i] Skipping orphan global command sweep (hot-reload context, targeted cleanup handled per module)');
       } else {
@@ -307,7 +488,7 @@ export default async function registerCommands(
     }
 
     // Remove local (guild) commands that are no longer present locally or shouldn't be local
-    if (cleanupEnabled) {
+    if (cleanupEnabled && !halted) {
       for (const guildCommand of guildCommands.values()) {
         // Find local command matching name AND type
         const foundLocal = localCommands.some(localCmd =>
@@ -323,19 +504,11 @@ export default async function registerCommands(
           if (testMode && correspondingLocal && !correspondingLocal.testOnly) {
             continue;
           }
-          try {
-            await guildCmds.delete(guildCommand.id);
-            console.log(`Deleted local command "${guildCommand.name}" (Type: ${ApplicationCommandType[guildCommand.type]}) as it is no longer found locally or not marked testOnly.`);
-          } catch(deleteError: any){
-            if (deleteError?.code === 10063) {
-              console.debug(`Local command "${guildCommand.name}" already gone on Discord (10063)`);
-            } else {
-              console.error(`Error deleting local command "${guildCommand.name}":`, deleteError);
-            }
-          }
+          if (!mayDelete()) break;
+          await sweepDelete(`local command "${guildCommand.name}" (Type: ${ApplicationCommandType[guildCommand.type]})`, () => guildCmds.delete(guildCommand.id));
         }
       }
-    } else {
+    } else if (result.sweep === 'off') {
       if (!runOrphanCleanup) {
         console.log('[i] Skipping orphan guild command sweep (hot-reload context, targeted cleanup handled per module)');
       } else {
@@ -343,10 +516,22 @@ export default async function registerCommands(
       }
     }
 
-    // Save current test guild for future cleanup tracking
-    saveLastTestGuild(guildId);
+    if (!sweepNote && sweepFailed > 0) {
+      sweepNote = `orphan sweep done: ${sweepFailed} command(s) could not be deleted (see the bot log)`;
+    }
+    const disabledNote = disabledFailed > 0
+      ? `${disabledFailed} disabled command(s) could not be unregistered (see the bot log)`
+      : undefined;
+    const notes = [sweepNote, disabledNote].filter((n): n is string => !!n);
+    if (notes.length > 0) result.note = notes.join('; ');
+
+    // Save current test guild for future cleanup tracking; an unfinished
+    // stale cleanup keeps the old guild tracked so the next run retries it.
+    if (staleCleanupDone) saveLastTestGuild(guildId);
+    return result;
   } catch (error) {
     console.error(`There was an error while registering commands:\n${error}`);
+    return null;
   }
 }
 

@@ -27,7 +27,7 @@ function UpdateStatus({ api, status, onRefresh }) {
     setActionMessage(null);
     try {
       const result = await api.post('/update/check-all');
-      if (result.success) {
+      if (result.baseCode && result.modules) {
         setCheckResult(result);
       } else {
         setActionMessage({ type: 'error', text: result.error || 'Failed to check for updates' });
@@ -87,11 +87,12 @@ function UpdateStatus({ api, status, onRefresh }) {
         const downloaded = result.download?.totalUpdated || 0;
         const reloaded = result.reload?.reloaded?.length || 0;
         setActionMessage({ type: 'success', text: `Updated ${downloaded} module(s), hot-reloaded ${reloaded}. No restart needed.` });
-        // Re-check to refresh state
+      } else {
+        setActionMessage({ type: 'error', text: result.message || result.error || 'Failed to update modules' });
+      }
+      if (result.download) {
         const recheck = await api.post('/update/check-all');
         if (recheck.success) setCheckResult(recheck);
-      } else {
-        setActionMessage({ type: 'error', text: result.error || result.message || 'Failed to update modules' });
       }
     } catch (error) {
       setActionMessage({ type: 'error', text: 'Failed to update modules: ' + error.message });
@@ -132,6 +133,20 @@ function UpdateStatus({ api, status, onRefresh }) {
   const hasSystemUpdate = checkResult?.baseCode?.hasUpdates === true;
   const hasModuleUpdates = (checkResult?.modules?.updatesAvailable || 0) > 0;
   const modulesWithUpdates = checkResult?.modules?.updates?.filter(u => u.hasUpdate) || [];
+  const baseChecked = checkResult?.baseCode?.checked === true;
+  const moduleErrors = checkResult?.modules?.errors || [];
+  const modulesChecked = checkResult?.modules?.checked === true && moduleErrors.length === 0;
+  const managed = checkResult?.updaterType === 'managed';
+  const systemBadge = !baseChecked
+    ? 'Could not check'
+    : hasSystemUpdate
+      ? (checkResult.baseCode.commitsBehind ? `${checkResult.baseCode.commitsBehind} commits behind` : 'Update available')
+      : 'Up to date';
+  const moduleBadge = hasModuleUpdates
+    ? `${checkResult.modules.updatesAvailable} update(s)`
+    : !modulesChecked
+      ? 'Could not check'
+      : checkResult?.modules?.totalInstalled === 0 ? 'None installed' : 'Up to date';
 
   return (
     <div className="status-section">
@@ -180,24 +195,31 @@ function UpdateStatus({ api, status, onRefresh }) {
           <h3>Update Status</h3>
 
           {/* System section */}
-          <div className={`update-section ${hasSystemUpdate ? 'has-updates' : 'up-to-date'}`}>
+          <div className={`update-section ${hasSystemUpdate || !baseChecked ? 'has-updates' : 'up-to-date'}`}>
             <div className="update-section-header">
               <strong>System (Base Code)</strong>
-              <span className={`update-badge ${hasSystemUpdate ? 'badge-warning' : 'badge-ok'}`}>
-                {hasSystemUpdate ? `${checkResult.baseCode.commitsBehind || '?'} commits behind` : 'Up to date'}
+              <span className={`update-badge ${hasSystemUpdate || !baseChecked ? 'badge-warning' : 'badge-ok'}`}>
+                {systemBadge}
               </span>
             </div>
-            {hasSystemUpdate && <p className="update-note">Requires restart</p>}
+            {!baseChecked && <p className="update-note">Could not check: {checkResult.baseCode.error || 'no reason given'}</p>}
+            {hasSystemUpdate && <p className="update-note">{managed ? 'Requires restart' : 'Applied by hand on a self-hosted bot: press Update System for the steps'}</p>}
           </div>
 
           {/* Modules section */}
-          <div className={`update-section ${hasModuleUpdates ? 'has-updates' : 'up-to-date'}`}>
+          <div className={`update-section ${hasModuleUpdates || !modulesChecked ? 'has-updates' : 'up-to-date'}`}>
             <div className="update-section-header">
               <strong>Modules</strong>
-              <span className={`update-badge ${hasModuleUpdates ? 'badge-warning' : 'badge-ok'}`}>
-                {hasModuleUpdates ? `${checkResult.modules.updatesAvailable} update(s)` : checkResult.modules.totalInstalled === 0 ? 'None installed' : 'Up to date'}
+              <span className={`update-badge ${hasModuleUpdates || !modulesChecked ? 'badge-warning' : 'badge-ok'}`}>
+                {moduleBadge}
               </span>
             </div>
+            {!checkResult.modules.checked && moduleErrors.length === 0 && <p className="update-note">Could not check modules</p>}
+            {moduleErrors.map(e => (
+              <p key={e.moduleName} className="update-note">
+                {e.moduleName === '*' ? `Could not check modules: ${e.error}` : `Could not check ${e.moduleName}: ${e.error}`}
+              </p>
+            ))}
             {modulesWithUpdates.length > 0 && (
               <ul className="module-update-list">
                 {modulesWithUpdates.map(mod => (
@@ -219,7 +241,7 @@ function UpdateStatus({ api, status, onRefresh }) {
               className="btn btn-primary"
               onClick={triggerSystemUpdate}
               disabled={loading || !hasSystemUpdate}
-              title={hasSystemUpdate ? 'Pull latest code and restart' : 'No system update available'}
+              title={hasSystemUpdate ? (managed ? 'Ask the Bot Manager to rebuild and restart the bot' : 'Show the steps that apply the update by hand') : 'No system update available'}
             >
               Update System
             </button>
@@ -235,7 +257,7 @@ function UpdateStatus({ api, status, onRefresh }) {
               className="btn btn-secondary"
               onClick={triggerUpdateEverything}
               disabled={loading || !(hasSystemUpdate && hasModuleUpdates)}
-              title={hasSystemUpdate && hasModuleUpdates ? 'Update modules then restart with new system code' : 'Both system and module updates required'}
+              title={hasSystemUpdate && hasModuleUpdates ? (managed ? 'Update modules then restart with new system code' : 'Update modules now; the system update is applied by hand (press Update System for the steps)') : 'Both system and module updates required'}
             >
               Update Everything
             </button>

@@ -16,9 +16,9 @@
  * must never block the state change that triggered it.
  */
 
-import { getSubscriptionNotifier, NotificationType, NotificationPayload } from './subscriptionNotifier';
+import { getSubscriptionNotifier, NotificationType, NotificationPayload, NotifyOutcome } from './subscriptionNotifier';
 
-type IPCDispatcher = (guildId: string, kind: NotificationType, payload: NotificationPayload) => Promise<void>;
+type IPCDispatcher = (guildId: string, kind: NotificationType, payload: NotificationPayload) => Promise<NotifyOutcome>;
 
 let ipcDispatcher: IPCDispatcher | null = null;
 
@@ -31,28 +31,25 @@ export function setNotificationIPCDispatcher(fn: IPCDispatcher): void {
 }
 
 /**
- * Send a notification. Returns immediately; delivery is fire-and-forget.
- * Wraps both the direct call (bot side) and the IPC call (web-UI side) in
- * try/catch so PremiumManager never sees a notification error.
+ * Send a notification and resolve with what really happened to it. Never
+ * throws, so PremiumManager never sees a notification error.
  */
 export async function dispatchPremiumNotification(
   guildId: string,
   kind: NotificationType,
   payload: NotificationPayload,
-): Promise<void> {
+): Promise<NotifyOutcome> {
   try {
     if (process.env.BOT_PROCESS_ROLE === 'bot') {
-      await getSubscriptionNotifier().notify(guildId, kind, payload);
-      return;
+      return await getSubscriptionNotifier().notify(guildId, kind, payload);
     }
     if (ipcDispatcher) {
-      await ipcDispatcher(guildId, kind, payload);
-      return;
+      return await ipcDispatcher(guildId, kind, payload);
     }
-    // No bot process available (e.g. web-UI started before bot, or bot
-    // crashed). Drop silently; admin will see the state change in the UI
-    // and the user just doesn't get a DM.
+    console.warn(`[PremiumNotifications] ${kind} for guild ${guildId} dropped: no bot process to deliver it`);
+    return { delivered: false, cause: 'no bot process to deliver it' };
   } catch (err) {
     console.warn(`[PremiumNotifications] dispatch failed for ${kind}:`, err);
+    return { delivered: false, cause: err instanceof Error ? err.message : String(err) };
   }
 }

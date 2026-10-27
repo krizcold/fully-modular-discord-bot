@@ -396,6 +396,10 @@ export function createFleetRoutes(botManager: BotManager): Router {
         res.json({ success: false, error: 'no empty-store hold or seed hold stands on this node now, so there is nothing to confirm; reload the Fleet tab' });
         return;
       }
+      if (state.seedHold?.push?.stalled) {
+        res.json({ success: false, error: `the seed from ${state.seedHold.push.backupNodeName} is stalled, not running: ${state.seedHold.push.stalled.replace(/\.$/, '')}; a brand-new confirm answers nothing now; reload the Fleet tab` });
+        return;
+      }
       if (state.seedHold?.push) {
         res.json({ success: false, error: 'a seed is running on this node (the hold adopts the copy and restarts as master), so a brand-new confirm answers nothing now; reload the Fleet tab' });
         return;

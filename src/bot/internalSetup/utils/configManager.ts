@@ -247,12 +247,12 @@ export function loadGuildConfig(filename: string, guildId: string): any {
 }
 
 /**
- * Save entire guild-specific config file: 'frozen' or 'refused' when the
- * write did not land.
+ * Save entire guild-specific config file: 'frozen', 'refused' or 'no-schema'
+ * when the write did not land.
  * Guild configs are stored in /data/{guildId}/_guildConfig/config.json
  * Module configs are stored in /data/{guildId}/{moduleName}/{filename}
  */
-export function saveGuildConfig(filename: string, guildId: string, data: any): 'saved' | 'frozen' | 'refused' {
+export function saveGuildConfig(filename: string, guildId: string, data: any): 'saved' | 'frozen' | 'refused' | 'no-schema' {
   // Guild-specific config now lives inside the guild namespace.
   if (filename === 'config.json') {
     return saveDataOutcome('config.json', { guildId, category: '_guildConfig' }, data);
@@ -260,7 +260,11 @@ export function saveGuildConfig(filename: string, guildId: string, data: any): '
 
   // For module config files, use metadata to get correct path
   const metadata = getConfigFileMetadata(filename);
-  if (!metadata || !metadata.moduleName) {
+  if (!metadata || !metadata.schema) {
+    console.warn(`[ConfigManager] saveGuildConfig called for "${filename}", which has no config schema; skipping`);
+    return 'no-schema';
+  }
+  if (!metadata.moduleName) {
     console.warn(`[ConfigManager] saveGuildConfig called with undiscovered filename "${filename}"; skipping`);
     return 'refused';
   }
@@ -296,7 +300,7 @@ export function loadGlobalConfig(filename: string): any {
 export function saveGlobalConfig(filename: string, data: any): void {
   if (filename === 'config.json') {
     // Root config lives outside the guild/global namespaces.
-    writeRawAtomic(rootConfigPath, JSON.stringify(data, null, 2));
+    if (!writeRawAtomic(rootConfigPath, JSON.stringify(data, null, 2))) throw new Error('the config was not saved because disk writes are failing');
     console.log(`[ConfigManager] Saved global config: ${rootConfigPath}`);
     return;
   }
@@ -304,12 +308,12 @@ export function saveGlobalConfig(filename: string, data: any): void {
   // For discovered module data files
   const metadata = getConfigFileMetadata(filename);
   if (metadata && metadata.moduleName) {
-    saveData(filename, { scope: 'global', category: metadata.moduleName }, data);
+    if (!saveData(filename, { scope: 'global', category: metadata.moduleName }, data)) throw new Error('the config was not saved');
     console.log(`[ConfigManager] Saved config: ${dataPath('global', metadata.moduleName, filename)}`);
     return;
   }
   if (metadata && metadata.path) {
-    writeRawAtomic(metadata.path, JSON.stringify(data, null, 2));
+    if (!writeRawAtomic(metadata.path, JSON.stringify(data, null, 2))) throw new Error('the config was not saved because disk writes are failing');
     console.log(`[ConfigManager] Saved config: ${metadata.path}`);
     return;
   }

@@ -31,6 +31,7 @@ export interface PersistedNode {
   appVersion: string;
   capabilities: NodeCapabilities;
   lastSeenAt: number;
+  capacityUnknown?: boolean;
 }
 
 export interface PersistedRegistry {

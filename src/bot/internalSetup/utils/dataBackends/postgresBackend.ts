@@ -211,6 +211,10 @@ export class PostgresBackend implements DataBackend {
     return this.readOnly;
   }
 
+  isStaleCopy(): boolean {
+    return this.staleCopy;
+  }
+
   /**
    * The database turned out to be an older copy of the fleet's (B7-F7): every
    * write is refused from now on, as on a copy in recovery, and nothing lifts

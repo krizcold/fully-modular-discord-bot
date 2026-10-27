@@ -9,6 +9,7 @@ import {
   ModuleContext
 } from '../../types/moduleTypes';
 import { getModuleRegistry } from './moduleRegistry';
+import { clearLoadFailures, recordLoadFailure } from './loadFailures';
 import {
   findModuleManifests,
   getModuleInfo,
@@ -39,7 +40,14 @@ export class ModuleLoader {
     console.log('[ModuleLoader] Starting module discovery...');
 
     // Step 1: Discover all module manifests
-    const manifestPaths = findModuleManifests();
+    clearLoadFailures();
+    let manifestPaths: string[];
+    try {
+      manifestPaths = findModuleManifests();
+    } catch (error) {
+      recordLoadFailure('the module listing');
+      throw error;
+    }
     console.log(`[ModuleLoader] Found ${manifestPaths.length} module manifests`);
 
     if (manifestPaths.length === 0) {
@@ -60,6 +68,7 @@ export class ModuleLoader {
             `[ModuleLoader] Module "${manifest.name}" validation failed:`,
             validation.errors
           );
+          recordLoadFailure(manifest.name || manifestPath);
           continue;
         }
 
@@ -82,6 +91,7 @@ export class ModuleLoader {
         manifests.push({ manifest, path: modulePath });
       } catch (error) {
         console.error(`[ModuleLoader] Failed to load manifest ${manifestPath}:`, error);
+        recordLoadFailure(manifestPath);
       }
     }
 
@@ -114,6 +124,7 @@ export class ModuleLoader {
         '[ModuleLoader] Missing required dependencies:',
         dependencyGraph.missingDependencies
       );
+      recordLoadFailure('modules with missing dependencies');
     }
 
     // Step 4: Load modules in dependency order
@@ -144,6 +155,7 @@ export class ModuleLoader {
         );
       } catch (error) {
         console.error(`[ModuleLoader] Failed to load module ${moduleName}:`, error);
+        recordLoadFailure(moduleName);
       }
     }
 
@@ -396,6 +408,7 @@ export class ModuleLoader {
         }
       } catch (error) {
         console.error(`[ModuleLoader] Failed to load command ${file}:`, error);
+        recordLoadFailure(file);
       }
     }
 

@@ -319,7 +319,7 @@ function ModulesView({ modules, installed, installJobs, categories, categoryFilt
   }, [cleanupStatus?.running]);
 
   useEffect(() => {
-    if (cleanupStatus && !cleanupStatus.running && cleanupStatus.success) {
+    if (cleanupStatus && !cleanupStatus.running && cleanupStatus.success && !cleanupStatus.note) {
       const t = setTimeout(() => setCleanupStatus(null), 4000);
       return () => clearTimeout(t);
     }
@@ -362,9 +362,18 @@ function ModulesView({ modules, installed, installJobs, categories, categoryFilt
     setUpdating(true);
     try {
       const res = await api.post('/update/modules-and-reload');
-      if (res.success) {
-        setModuleUpdates({});
+      const updatedNames = (res.download?.updated || []).map(u => u.moduleName);
+      if (updatedNames.length > 0) {
+        setModuleUpdates(prev => {
+          if (!prev) return prev;
+          const next = { ...prev };
+          for (const name of updatedNames) delete next[name];
+          return next;
+        });
         onModuleChanged();
+      }
+      if (!res.success) {
+        showToast(res.message || res.error || 'Module update failed', 'warning', { sticky: true });
       }
     } catch (err) {
       console.error('Failed to update modules:', err);
@@ -422,7 +431,13 @@ function ModulesView({ modules, installed, installJobs, categories, categoryFilt
                     cleanup running...
                   </span>
                 )}
-                {cleanupStatus && !cleanupStatus.running && cleanupStatus.success && (
+                {cleanupStatus?.running && !autoCleanup && (
+                  <span style={{ color: '#faa61a', fontSize: '0.75rem' }}>stops before its next deletion</span>
+                )}
+                {cleanupStatus && !cleanupStatus.running && cleanupStatus.success && cleanupStatus.note && (
+                  <span style={{ color: '#faa61a', fontSize: '0.75rem' }} title={cleanupStatus.note}>{cleanupStatus.note}</span>
+                )}
+                {cleanupStatus && !cleanupStatus.running && cleanupStatus.success && !cleanupStatus.note && (
                   <span style={{ color: '#43b581', fontSize: '0.75rem' }}>cleanup done</span>
                 )}
                 {cleanupStatus && !cleanupStatus.running && cleanupStatus.error && (
@@ -2778,6 +2793,11 @@ function MigrationsPanel({ tiers, providers, sectionStyle, showSuccess, setError
                       Decisions: pending {counts.pending || 0} · accepted {counts.accepted || 0} · declined {counts.declined || 0}
                       {counts['silent-applied'] ? ` · silent-applied ${counts['silent-applied']}` : ''}
                     </div>
+                    {m.status === 'pending' && (m.decisions || []).some(d => d.decision === 'pending' && !d.notifiedAt) && (
+                      <div style={{ color: '#f5af19', fontSize: '0.78rem', marginTop: '4px' }}>
+                        Delivery not confirmed for: {(m.decisions || []).filter(d => d.decision === 'pending' && !d.notifiedAt).map(d => d.guildId).join(', ')}. A server that does not decide keeps its current plan.
+                      </div>
+                    )}
                     {m.message && (
                       <div style={{ color: '#888', fontSize: '0.78rem', marginTop: '4px', fontStyle: 'italic' }}>
                         "{m.message}"

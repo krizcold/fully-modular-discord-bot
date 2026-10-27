@@ -61,9 +61,13 @@ function FleetCapacityCard({ cap }) {
       : '#57f287';
   const barPct = Math.max(0, Math.min(100, (cap.busiest / FLEET_HARD_MAX) * 100));
 
+  const readAt = cap.recommendedAt != null ? `, read ${new Date(cap.recommendedAt).toLocaleString()}` : '';
   let shardsLabel;
-  if (cap.shardSource === 'override') shardsLabel = `${cap.shardCount} (manual override)`;
-  else if (cap.shardSource === 'discord') shardsLabel = `${cap.shardCount} (Discord-recommended)`;
+  if (cap.shardSource === 'plan') shardsLabel = `${cap.shardCount} (kept from the fleet's saved plan)`;
+  else if (cap.shardSource === 'override') shardsLabel = `${cap.shardCount} (FLEET_SHARD_COUNT override)`;
+  else if (cap.shardSource === 'discord') shardsLabel = `${cap.shardCount} (Discord's recommendation at boot)`;
+  else if (cap.shardSource === 'fallback') shardsLabel = `${cap.shardCount} (fallback: Discord's recommendation could not be read at boot)`;
+  else if (cap.shardSource === 'master') shardsLabel = `${cap.shardCount} (set by the master)`;
   else shardsLabel = String(cap.shardCount);
 
   return (
@@ -72,8 +76,8 @@ function FleetCapacityCard({ cap }) {
       <div className="usage-stat-sub" style={{ marginBottom: '10px' }}>
         {`${cap.totalGuilds} guild${cap.totalGuilds === 1 ? '' : 's'} across the fleet`}
         {` · Shards: ${shardsLabel}`}
-        {cap.shardSource === 'override' && cap.recommendedShards != null && cap.recommendedShards !== cap.shardCount
-          ? ` (Discord recommends ${cap.recommendedShards})`
+        {cap.recommendedShards != null && cap.recommendedShards !== cap.shardCount
+          ? ` (Discord recommends ${cap.recommendedShards}${readAt})`
           : ''}
       </div>
 
@@ -209,18 +213,29 @@ function migrationWarning(dataBackend) {
 }
 
 // Master-only Move action for an OWNED shard: pick a target node, run a
-// precheck (est size, target free space, direction), confirm, then submit.
+// precheck (eligibility and direction; size and free space are measured when the move starts), confirm, then submit.
 function FleetMoveControl({ shardId, fromNodeId, nodes, dataBackend, onStarted }) {
   const targets = nodes.filter((n) => n.nodeId !== fromNodeId && n.connected !== false && !n.draining);
   const [toNodeId, setToNodeId] = React.useState((targets[0] && targets[0].nodeId) || '');
   const [busy, setBusy] = React.useState(false);
+  const targetKey = targets.map((n) => n.nodeId).join(',');
+  React.useEffect(() => {
+    if (!toNodeId || targets.some((n) => n.nodeId === toNodeId)) {
+      if (!toNodeId && targets[0]) setToNodeId(targets[0].nodeId);
+      return;
+    }
+    const gone = nodes.find((n) => n.nodeId === toNodeId);
+    showToast(`${gone ? gone.nodeName : toNodeId} is no longer eligible; pick a target again`, 'error');
+    setToNodeId((targets[0] && targets[0].nodeId) || '');
+  }, [targetKey]);
 
   if (targets.length === 0) {
     return <span style={{ color: '#777', fontSize: '0.78rem' }}>no eligible target</span>;
   }
 
   const move = () => {
-    if (!toNodeId || busy) return;
+    const target = targets.find((n) => n.nodeId === toNodeId);
+    if (!target || busy) return;
     setBusy(true);
     api.post('/fleet/migrate/precheck', { kind: 'move', shardId, toNodeId })
       .then((res) => {
@@ -234,12 +249,14 @@ function FleetMoveControl({ shardId, fromNodeId, nodes, dataBackend, onStarted }
         const sizeLine = dataBackend === 'postgres'
           ? `${guildN} guild(s) hand off through the database (no file copy).\n\n`
           : (() => {
-            const estMb = p.estBytes != null ? Math.round(p.estBytes / 1048576) : '?';
+            if (p.estBytes == null) {
+              return `${guildN} guild(s), direction ${p.direction || '?'}. Size and target free space are measured when the move starts.\n\n`;
+            }
             const freeMb = p.targetFreeBytes != null ? Math.round(p.targetFreeBytes / 1048576) : 'unknown';
-            return `~${estMb} MB across ${guildN} guild(s), target free ~${freeMb} MB, direction ${p.direction || '?'}.\n\n`;
+            return `~${Math.round(p.estBytes / 1048576)} MB across ${guildN} guild(s), target free ~${freeMb} MB, direction ${p.direction || '?'}.\n\n`;
           })();
         if (!confirm(
-          `Move shard ${shardId} to the selected node?\n`
+          `Move shard ${shardId} to ${target.nodeName}?\n`
           + sizeLine
           + warnText
           + migrationWarning(dataBackend)
@@ -278,6 +295,20 @@ function FleetRetireControl({ node, nodes, shardTable, dataBackend, onStarted })
   const owned = (node.shardIds || []).slice();
   const targets = nodes.filter((n) => n.nodeId !== node.nodeId && n.connected !== false && !n.draining);
   const [targetByShard, setTargetByShard] = React.useState({});
+  const targetKey = targets.map((n) => n.nodeId).join(',');
+  React.useEffect(() => {
+    const stale = Object.keys(targetByShard).filter((shardId) => !targets.some((n) => n.nodeId === targetByShard[shardId]));
+    if (stale.length === 0) return;
+    for (const shardId of stale) {
+      const gone = nodes.find((n) => n.nodeId === targetByShard[shardId]);
+      showToast(`${gone ? gone.nodeName : targetByShard[shardId]} is no longer eligible; pick a target for shard ${shardId} again`, 'error');
+    }
+    setTargetByShard((prev) => {
+      const next = Object.assign({}, prev);
+      for (const shardId of stale) delete next[shardId];
+      return next;
+    });
+  }, [targetKey]);
 
   if (owned.length === 0 || targets.length === 0) return null;
 
@@ -286,10 +317,13 @@ function FleetRetireControl({ node, nodes, shardTable, dataBackend, onStarted })
   const submit = () => {
     if (busy) return;
     const targetsMap = {};
+    const lines = [];
     for (const shardId of owned) {
       const t = targetByShard[shardId] || (targets[0] && targets[0].nodeId);
-      if (!t) { showToast(`Choose a target for shard ${shardId}`, 'error'); return; }
+      const target = targets.find((n) => n.nodeId === t);
+      if (!target) { showToast(`Choose a target for shard ${shardId}`, 'error'); return; }
       targetsMap[String(shardId)] = t;
+      lines.push(`shard ${shardId} to ${target.nodeName}`);
     }
     setBusy(true);
     api.post('/fleet/migrate/precheck', { kind: 'retire', nodeId: node.nodeId, targets: targetsMap })
@@ -298,7 +332,7 @@ function FleetRetireControl({ node, nodes, shardTable, dataBackend, onStarted })
         if (pre && pre.success === false) { showToast(pre.error || 'Precheck failed', 'error'); return null; }
         const warnText = (p.warnings || []).length ? `WARNING: ${p.warnings.join('; ')}\n\n` : '';
         if (!confirm(
-          `Retire ${node.nodeName}? Its ${owned.length} shard(s) will be moved one at a time to the chosen targets.\n\n`
+          `Retire ${node.nodeName}? Its ${owned.length} shard(s) will be moved one at a time: ${lines.join(', ')}.\n\n`
           + warnText
           + migrationWarning(dataBackend)
         )) return null;
@@ -890,7 +924,9 @@ function FleetNodeCard({ node, isMasterView, onAction, masterSyncRevision, retir
         {node.draining ? <FleetBadge text="DRAINING" background="#4a3a1a" color="#fee75c" /> : null}
         {node.backoff ? <FleetBadge text="BACKOFF" background="#4a2a1a" color="#f0a0a0" /> : null}
       </div>
-      <div className="usage-stat-value">{node.guildCount} guilds</div>
+      <div className="usage-stat-value">
+        {!node.isSelf && node.connected === false ? `${node.guildCount} guilds on frozen shards; serving can't be confirmed (not connected to this master)` : `${node.guildCount} guilds`}
+      </div>
       <div className="usage-stat-sub">
         {capacity != null ? `holds ${held} / ${capacity} shards` : `holds ${held} shards`}
         {node.shardIds && node.shardIds.length > 0 ? ` [${node.shardIds.join(', ')}]` : ''}
@@ -907,7 +943,7 @@ function FleetNodeCard({ node, isMasterView, onAction, masterSyncRevision, retir
       ) : null}
       {isDown ? (
         <div className="usage-stat-sub" style={{ color: '#ed4245' }}>
-          {`down since ${fleetFormatAge(node.downSinceMs)}, ${held} shard${held === 1 ? '' : 's'} frozen`}
+          {`${node.downSinceMs == null ? 'not reconnected since this master restarted' : `down since ${fleetFormatAge(node.downSinceMs)}`}, ${held} shard${held === 1 ? '' : 's'} frozen`}
         </div>
       ) : null}
       {isDown && isMasterView ? (
@@ -955,7 +991,9 @@ function FleetNodeCard({ node, isMasterView, onAction, masterSyncRevision, retir
           ? `cpu ${node.load.cpuPct}% · rss ${node.load.rssMb} MB · loop ${node.load.loopLagMs} ms`
           : 'no load sample yet'}
       </div>
-      <div className="usage-stat-sub">heartbeat {fleetFormatAge(node.lastHeartbeatAgoMs)}</div>
+      <div className="usage-stat-sub">
+        {!node.isSelf && node.connected !== false && node.lastHeartbeatAgoMs == null ? 'awaiting first heartbeat' : `heartbeat ${fleetFormatAge(node.lastHeartbeatAgoMs)}`}
+      </div>
       {isMasterView && !node.isMaster && masterSyncRevision != null ? (
         <div className="usage-stat-sub">
           {node.syncAppliedRevision == null
@@ -1259,6 +1297,8 @@ function FleetWitnessCard({ fleet }) {
       <div className="usage-stat-sub">{`Beacon home: ${home}`}</div>
       {w.lastRenewOk ? (
         <div className="usage-stat-sub">{`Beacon renewed ${fleetFormatAge(Date.now() - w.lastRenewAt)}`}</div>
+      ) : w.lastRenewAt == null && !w.lastError ? (
+        <div className="usage-stat-sub">Witness pending: this process has not renewed the beacon yet</div>
       ) : (
         <div className="usage-stat-sub" style={{ color: '#e5534b' }}>
           {`Witness dark${w.lastError ? `: ${w.lastError}` : ''}`}
@@ -1562,7 +1602,7 @@ function FleetEpisodeCard({ fleet }) {
     <div className="usage-stat-card" style={{ marginTop: '10px' }}>
       <div className="usage-stat-title">{title}</div>
       <div className="usage-stat-sub">
-        {`${standIn} stood in for ${covering} from ${at(e.standInSince)}${e.writesFrom ? `, taking writes from ${at(e.writesFrom)}` : ''}, until ${at(e.endedAt)}: ${ENDING[e.ending] || e.ending}${e.detail ? ` (${e.detail})` : ''}.`}
+        {`${e.side === 'master' ? `${covering} first saw ${standIn} standing in for it at ${at(e.standInSince)}, and ${standIn} stood in` : `${standIn} stood in for ${covering} from ${at(e.standInSince)}`}${e.writesFrom ? `, taking writes from ${at(e.writesFrom)}` : ''}, until ${at(e.endedAt)}: ${ENDING[e.ending] || e.ending}${e.detail ? ` (${e.detail})` : ''}.`}
       </div>
       <div className="usage-stat-sub" style={{ marginTop: '4px', color: e.writesSurvived === 'no' ? '#e5534b' : e.writesSurvived === 'held' || e.writesSurvived === 'partial' || (e.writesSurvived === 'yes' && heldForGood) ? '#e0a030' : undefined }}>
         {(WRITES[e.writesSurvived] || '') + lineage}
@@ -1671,7 +1711,8 @@ function FleetStandInBanner({ fleet }) {
     const n = (fleet.nodes || []).find(x => x.nodeId === id);
     return n ? n.nodeName : id.slice(0, 8);
   };
-  const at = (ms) => new Date(ms).toISOString().slice(11, 16) + ' UTC';
+  const at = (ms) => new Date(ms).toISOString().slice(0, 16).replace('T', ' ') + ' UTC';
+  const soon = (ms) => new Date(ms).toISOString().slice(11, 16) + ' UTC';
   if (!s.live) {
     if (s.phase !== 'disarmed' || !s.disarmedAt) return null;
     // The lane's own episode record says how it ended (it is this lane's when
@@ -1681,7 +1722,7 @@ function FleetStandInBanner({ fleet }) {
     const lane = e && e.side === 'stand-in' && e.standInNodeId === fleet.nodeId && e.standInSince === s.armedAt ? e : null;
     return (
       <div className="usage-stat-sub" style={{ marginTop: '6px' }}>
-        {`Last stand-in attempt for ${nameOf(s.coveringNodeId)} ended at ${at(lane ? lane.endedAt : s.disarmedAt)}: ${lane ? lane.detail : (s.disarmReason || 'no reason recorded')}.${s.rearmAfter && Date.now() < s.rearmAfter ? ` The lane may arm again after ${at(s.rearmAfter)}.` : ''}`}
+        {`Last stand-in attempt for ${nameOf(s.coveringNodeId)} ended at ${at(lane ? lane.endedAt : s.disarmedAt)}: ${lane ? lane.detail : (s.disarmReason || 'no reason recorded')}.${s.rearmAfter && Date.now() < s.rearmAfter ? ` The lane may arm again after ${soon(s.rearmAfter)}.` : ''}`}
       </div>
     );
   }
@@ -1834,7 +1875,8 @@ function FleetSeedHoldBanner({ api, hold, reload }) {
   };
   const confirmFresh = () => {
     if (busy) return;
-    if (!confirm('Confirm this is a BRAND-NEW fleet?\n\nOnly do this when no backup anywhere holds real data for this bot. This machine mints a term above every beacon on an empty data directory and serves. If a backup with real data exists, cancel and seed this machine from its copy instead.')) return;
+    const refusedText = refused.length > 0 ? `\n\nThis hold refused ${refused.length === 1 ? 'a node' : `${refused.length} nodes`} that may hold data: ${refused.map((r) => `${r.nodeName} (${r.reason})`).join('; ')}.` : '';
+    if (!confirm(`Confirm this is a BRAND-NEW fleet?\n\nOnly do this when no backup anywhere holds real data for this bot. This machine mints a term above every beacon on an empty data directory and serves. If a backup with real data exists, cancel and seed this machine from its copy instead.${refusedText}`)) return;
     setBusy(true);
     api.post('/fleet/confirm-fresh', {})
       .then((res) => {
@@ -1844,6 +1886,7 @@ function FleetSeedHoldBanner({ api, hold, reload }) {
       .catch((err) => showToast((err && err.message) || 'Confirm failed', 'error'))
       .finally(() => setBusy(false));
   };
+  const refused = hold.refused || [];
   const where = hold.controlUrl ? hold.controlUrl : `ws://<this machine>:${hold.controlPort} (its FLEET_PUBLIC_URL when it has one)`;
   const push = hold.push;
   const pushText = push
@@ -1853,14 +1896,16 @@ function FleetSeedHoldBanner({ api, hold, reload }) {
     <div className="usage-notice" style={{ borderColor: '#e0a030', color: '#e0a030' }}>
       {`SEED HOLD: this master holds no guild data while the witness shows the fleet at term ${hold.holdTerm}${hold.beaconedBy ? ` (beaconed by ${hold.beaconedBy})` : ''} and no live master. It will not mint a term and serve empty while a backup may hold the real data. Point the designated backup at this machine (${where}): reuse the old master's address for it, or edit the master list on the backup's own Fleet tab; it registers here and offers the copy it holds, and the seed is confirmed below. Or demote this node to rejoin the fleet as a co-worker. Only confirm a brand-new fleet when no backup anywhere holds data for this bot.${hold.transferUrl ? '' : ' TRANSFER_URL is not set on this node: the backup pushes the copy to that address, so set it and restart this bot before confirming a seed.'}${hold.interrupted ? ` ${hold.interrupted}` : ''}${hold.lastError ? ` Last seed attempt failed: ${hold.lastError}.` : ''}${pushText}`}
       {hold.backups.length === 0 ? (
-        <div className="usage-stat-sub" style={{ marginTop: '6px' }}>No backup has registered here yet.</div>
+        <div className="usage-stat-sub" style={{ marginTop: '6px' }}>{refused.length > 0 ? `No backup has registered here; ${refused.length} refused (below).` : 'No backup has registered here yet.'}</div>
       ) : hold.backups.map((b) => {
         const o = b.offer;
         const text = o
           ? (o.kind === 'mirror'
             ? `${b.nodeName}: offers its copy of ${o.sourceNodeName}'s guild data (term ${o.sourceTerm}), last complete ${fleetFormatAge(o.ageMs)} (${plural(o.guildCount, 'guild')}, ${mb(o.totalBytes)} MB${o.partialCount > 0 ? `; ${o.partialCount} partial since then` : ''})`
             : `${b.nodeName}: offers its own guild data from its mastership at term ${o.sourceTerm} (live, ${plural(o.guildCount, 'guild')}, ${mb(o.totalBytes)} MB)`)
-          : `${b.nodeName}: registered, no copy to offer${b.offerReason ? `: ${b.offerReason}` : (b.offerAt == null ? ' (asking)' : '')}`;
+          : b.offerAt == null ? `${b.nodeName}: registered, asking what copy it holds`
+          : b.offerFault ? `${b.nodeName}: registered, but ${b.offerReason}; its copy is not known, and it is asked again while it stays connected`
+          : `${b.nodeName}: registered, no copy to offer${b.offerReason ? `: ${b.offerReason}` : ''}`;
         return (
           <div key={b.nodeId} className="usage-stat-sub" style={{ marginTop: '6px', color: b.connected ? undefined : '#777' }}>
             {`${text}${b.connected ? '' : ' (disconnected now)'}`}
@@ -1872,6 +1917,11 @@ function FleetSeedHoldBanner({ api, hold, reload }) {
           </div>
         );
       })}
+      {refused.map((r) => (
+        <div key={`refused-${r.nodeId}`} className="usage-stat-sub" style={{ marginTop: '6px', color: '#ed4245' }}>
+          {`${r.nodeName}: refused at ${new Date(r.at).toISOString().slice(0, 19).replace('T', ' ')} UTC (${r.attempts === 1 ? '1 attempt' : `${r.attempts} attempts`}): ${r.reason}`}
+        </div>
+      ))}
       <div><FleetDemoteButton api={api} /></div>
       {push ? null : (
         <div>
@@ -2264,6 +2314,7 @@ function FleetView({ api, wsClient, guildNames }) {
     shardCount,
     shardSource: fleet.shardSource,
     recommendedShards: fleet.recommendedShards != null ? fleet.recommendedShards : null,
+    recommendedAt: fleet.recommendedAt != null ? fleet.recommendedAt : null,
     unassigned: unassignedCount,
     onHoldNodes: onHoldNodeCount,
     busiest,
@@ -2358,7 +2409,7 @@ function FleetView({ api, wsClient, guildNames }) {
 
       {fleet.recovery && fleet.recovery.reshardAdvised && (
         <div className="usage-notice">
-          {`Discord now recommends ${fleet.recovery.reshardAdvised.recommended} shard${fleet.recovery.reshardAdvised.recommended === 1 ? '' : 's'}; fleet runs ${fleet.recovery.reshardAdvised.running}; resharding requires setting FLEET_SHARD_COUNT.`}
+          {`Discord recommends ${fleet.recovery.reshardAdvised.recommended} shard${fleet.recovery.reshardAdvised.recommended === 1 ? '' : 's'} (${fleet.recovery.reshardAdvised.readAt != null ? `read ${new Date(fleet.recovery.reshardAdvised.readAt).toLocaleString()}` : 'read at boot; no later reading'}); fleet runs ${fleet.recovery.reshardAdvised.running}; resharding requires setting FLEET_SHARD_COUNT.`}
         </div>
       )}
 

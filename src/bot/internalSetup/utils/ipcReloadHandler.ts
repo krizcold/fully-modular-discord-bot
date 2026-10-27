@@ -86,8 +86,10 @@ export function setupReloadIPCHandlers(client: Client): void {
 
         case 'commands:reregister': {
           try {
-            await reRegisterSlashCommands(clientRef);
-            response = { success: true };
+            const result = await reRegisterSlashCommands(clientRef);
+            response = result
+              ? { success: true, ...(result.note ? { note: result.note } : {}) }
+              : { success: false, error: 'commands were not registered; see the bot log' };
           } catch (err: any) {
             response = { success: false, error: err.message || String(err) };
           }

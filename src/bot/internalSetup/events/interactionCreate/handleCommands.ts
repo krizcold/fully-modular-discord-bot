@@ -5,6 +5,7 @@ import { getPremiumManager } from '../../utils/premiumManager';
 import { instrument } from '../../utils/metrics/instrument';
 import { DataBackendUnavailableError } from '../../utils/dataManager';
 import { dataUnavailableMessage } from '../../utils/dataBackends/boot';
+import { isCommandRunnable } from '../../utils/commandGate';
 
 /**
  * Build the components array attached to a tier-blocked reply. When the host
@@ -48,6 +49,17 @@ export default async function handleCommands(client: Client, interaction: Intera
     );
 
     if (!commandObject) return;
+
+    const gate = isCommandRunnable(commandObject.name);
+    if (!gate.runnable) {
+      interaction.reply({
+        content: gate.reason === 'disabled'
+          ? 'This command is switched off.'
+          : 'This command cannot run right now: its on/off setting cannot be read.',
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
 
     // Check developer-only condition
     if (commandObject.devOnly) {
