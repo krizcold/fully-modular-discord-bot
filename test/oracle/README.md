@@ -75,7 +75,7 @@ answering 500 "An error occurred" from its error handler.
 | HELD-MISSING | A held (202) effect never arrived. |
 | RESURRECTED | A doc is back after its delete was acknowledged. |
 | WRONG-CONTENT | A doc holds bytes that no one wrote to it. |
-| CONTROL | A shard is leased to two nodes, a node leases a shard that a master's shard table gives to another node (a grant still pending is skipped), nodes disagree on the shard count, or a guild maps to two shards or out of range. With two sets of control facts, only a CONTROL that both sets show counts. |
+| CONTROL | A shard is leased to two nodes, a shard in a node's shard table is not leased by that node or is leased by another node, nodes disagree on the shard count, or a guild maps to two shards or out of range. With two sets of control facts, only a CONTROL that both sets show counts. |
 
 `(during)` marks a verdict from a read made during the run, judged against what was acknowledged before that read was
 sent.
@@ -154,9 +154,8 @@ fleet.
 
 Guardrails: the secret filter on every read; `ssh <host> ...` with no flag before the host; docker by exact name only.
 
-1. **Pick the guild and the lanes.** Use a test guild served from Postgres. Point lane `m` at the master, which forwards
-   to the guild's owner, and lane `o` at the owner itself, so two nodes contend on the hot docs. A node answers only for
-   guilds it serves.
+1. **Pick the guild and the lanes.** Use a test guild served from Postgres. Point two lanes (`m` and `o`) at the bot,
+   so two writers contend on the hot docs.
 2. **Start the writer where the scenario cannot kill it.**
    - **When the scenario kills only containers,** run it on a host in its own container. That reaches the web UI's
      loopback port, and a bot Update does not stop the writer. Its complete log goes to a file on the host
@@ -178,9 +177,9 @@ Guardrails: the secret filter on every read; `ssh <host> ...` with no flag befor
      there (`--log <run>.jsonl --marks marks-<run>.txt`), through an ssh tunnel to each node's loopback port (`ssh -N -L
      <local>:127.0.0.1:<port> <host>`, flags before the host, so it needs the owner's approval once).
    - On the Windows node, run oracle.mjs on the dev box the same way, with its own log and marks files.
-   - Mark a window in the marks file the writer polls: `ssh contabo-dbot "echo 'begin kill-master' >>
-     /root/smdb-oracle/marks-<run>.txt"` for a container writer, `echo 'begin kill-master' >> marks-<run>.txt` for one
-     on the dev box. Write the `end` line the same way afterwards. Pass `--window kill-master` to the checker so that a
+   - Mark a window in the marks file the writer polls: `ssh contabo-dbot "echo 'begin kill-bot' >>
+     /root/smdb-oracle/marks-<run>.txt"` for a container writer, `echo 'begin kill-bot' >> marks-<run>.txt` for one
+     on the dev box. Write the `end` line the same way afterwards. Pass `--window kill-bot` to the checker so that a
      missing mark cannot pass.
    - Stop early: write every `end` mark, then a `stop` line, to the same marks file (`echo stop >> ...` as above). It
      needs no signal, so it works the same for a container writer and for one on the dev box, where Windows cannot
@@ -223,7 +222,7 @@ Guardrails: the secret filter on every read; `ssh <host> ...` with no flag befor
        bot child gave none.
 4. **Judge:**
 
-       node test/oracle/check.mjs --log <run>.jsonl --db primary=<p>.jsonl --lag standby=<s>.jsonl --app <node>-app.jsonl --fleet <node>-fleet-1.json --fleet-again <node>-fleet-2.json --window kill-master
+       node test/oracle/check.mjs --log <run>.jsonl --db primary=<p>.jsonl --lag standby=<s>.jsonl --app <node>-app.jsonl --fleet <node>-fleet-1.json --fleet-again <node>-fleet-2.json --window kill-bot
 
    - Use `--db` for a copy that must hold everything acknowledged (the serving primary, and a sync standby).
    - Use `--lag` for an async standby.
@@ -235,7 +234,7 @@ Guardrails: the secret filter on every read; `ssh <host> ...` with no flag befor
    `<run>.host.jsonl`, or a host the log was copied to with `<run>.copy.jsonl` (the dev-box writer's case). It takes about
    as long as `read`:
 
-       ssh contabo-dbot "docker run --rm --network host -v /root/smdb-oracle:/o node:24-alpine node /o/oracle.mjs cleanup --log /o/<run>.host.jsonl --target http://127.0.0.1:<master port>"
+       ssh contabo-dbot "docker run --rm --network host -v /root/smdb-oracle:/o node:24-alpine node /o/oracle.mjs cleanup --log /o/<run>.host.jsonl --target http://127.0.0.1:<port>"
 
 ## Not yet covered
 
@@ -250,6 +249,5 @@ Guardrails: the secret filter on every read; `ssh <host> ...` with no flag befor
     unseen.
 - **File mode** [A19]. The operator route cannot create a new file in a file-routed guild (it needs the file to exist
   already), and the database listing does not apply there. A file-mode reader comes before B2 deploys.
-- **The control store's own rows.** `fleet` reads each node's in-memory view, not smdb_control.
 - **Step 1 of VERIFY.md section 5,** the set difference on the existing kill-drill logs. It reads live hosts, so it
   belongs to the main session.

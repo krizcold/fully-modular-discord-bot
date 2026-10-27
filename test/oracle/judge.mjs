@@ -408,28 +408,29 @@ export function judgeForks(history, copies, agree) {
 
 /**
  * @typedef {{ holders: Map<string, Set<string>>, owners: Map<string, Set<string>>, counts: Map<string, Set<string>>,
- *   guildShards: Map<string, Set<string>>, outOfRange: Map<string, Set<string>> }} ControlFacts
+ *   guildShards: Map<string, Set<string>>, outOfRange: Map<string, Set<string>>,
+ *   unleased: Map<string, Set<string>> }} ControlFacts
  */
 
 /**
  * Control facts after the scenario [A20], as each node reports them (its
- * in-memory view, not the control store's rows), keyed by node id so that
+ * in-memory view), keyed by node id so that
  * the order and names of the files do not matter.
  * @param {{ name: string, state: FleetFacts }[]} nodes
  * @returns {ControlFacts}
  */
 export function controlFacts(nodes) {
   /** @type {ControlFacts} */
-  const f = { holders: new Map(), owners: new Map(), counts: new Map(), guildShards: new Map(), outOfRange: new Map() };
+  const f = { holders: new Map(), owners: new Map(), counts: new Map(), guildShards: new Map(), outOfRange: new Map(), unleased: new Map() };
   const put = (/** @type {Map<string, Set<string>>} */ map, /** @type {string} */ key, /** @type {string} */ value) => {
     map.set(key, (map.get(key) ?? new Set()).add(value));
   };
-  for (const n of nodes.filter(x => x.state.initialized && x.state.running)) {
+  for (const n of nodes.filter(x => x.state.initialized)) {
     const id = n.state.nodeId ?? n.name;
     for (const l of n.state.leases) put(f.holders, String(l.shardId), id);
     for (const row of n.state.shardTable) {
-      // A grant not yet confirmed names its target while the old holder may still let go.
-      if (row.nodeId !== null && row.status !== 'pending') put(f.owners, String(row.shardId), row.nodeId);
+      put(f.owners, String(row.shardId), id);
+      if (!n.state.leases.some(l => l.shardId === row.shardId)) put(f.unleased, String(row.shardId), id);
     }
     const count = n.state.shardCount;
     if (typeof count === 'number' && count > 0) put(f.counts, 'all', String(count));
@@ -464,12 +465,13 @@ export function commonFacts(a, b) {
   return {
     holders: meet(a.holders, b.holders), owners: meet(a.owners, b.owners), counts: meet(a.counts, b.counts),
     guildShards: meet(a.guildShards, b.guildShards), outOfRange: meet(a.outOfRange, b.outOfRange),
+    unleased: meet(a.unleased, b.unleased),
   };
 }
 
 /**
- * No shard leased to two nodes, no lease held against a master's shard
- * table, one shard count, and every guild mapped to one shard in range.
+ * No shard leased to two nodes, every shard table row leased by the node
+ * reporting it, one shard count, and every guild mapped to one shard in range.
  * @param {ControlFacts} f
  * @returns {Verdict[]}
  */
@@ -480,11 +482,17 @@ export function controlVerdicts(f) {
   const sorted = (/** @type {Set<string>} */ s) => [...s].sort();
   for (const [shard, set] of f.holders) {
     if (set.size > 1) add(`shard ${shard} is leased to ${set.size} nodes at once: ${sorted(set).join(', ')}`);
-    for (const owner of sorted(f.owners.get(shard) ?? new Set())) {
+  }
+  for (const [shard, owners] of f.owners) {
+    const set = f.holders.get(shard) ?? new Set();
+    for (const owner of sorted(owners)) {
       for (const holder of sorted(set)) {
-        if (holder !== owner) add(`shard ${shard} is leased by ${holder}, but a shard table gives it to ${owner}`);
+        if (holder !== owner) add(`shard ${shard} is leased by ${holder}, but it is in the shard table of ${owner}`);
       }
     }
+  }
+  for (const [shard, owners] of f.unleased) {
+    for (const owner of sorted(owners)) add(`shard ${shard} is in the shard table of ${owner}, which does not lease it`);
   }
   const counts = f.counts.get('all');
   if (counts && counts.size > 1) add(`nodes disagree on the shard count: ${sorted(counts).join(', ')}`);
@@ -629,7 +637,7 @@ export function judge(input) {
   const again = input.fleetAgain ?? [];
   if (fleet.length === 0 && !input.noFleet) inconclusive.push('no control facts were given (--fleet) [A20]');
   for (const n of [...fleet, ...again]) {
-    if (!n.state.initialized || !n.state.running) inconclusive.push(`${n.name} gave no control facts: its bot child was down or did not answer`);
+    if (!n.state.initialized) inconclusive.push(`${n.name} gave no control facts: its bot child was down or did not answer`);
   }
   if (fleet.length > 0 && again.length === 0) verdicts.push(...judgeFleet(fleet));
   if (fleet.length > 0 && again.length > 0) {

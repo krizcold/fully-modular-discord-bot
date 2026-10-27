@@ -181,13 +181,13 @@ const hot = (k: number) => `${RUN}-h${k}.json`;
 const sixAcked = () => [1, 2, 3, 4, 5, 6].flatMap(n => [send(n, 'a', u('a', n), n, `x${n}`, n * 10), ans(n, n * 10 + 1)]);
 const sixDocs = () => new Map([1, 2, 3, 4, 5, 6].map(n => [u('a', n), `x${n}`]));
 const fleetNode = (nodeId: string, leases: number[], over: Partial<{
-  name: string; initialized: boolean; table: ([number, string] | [number, string, string])[]; guildMap: Record<string, number>; shardCount: number;
+  name: string; initialized: boolean; table: [number, string][]; guildMap: Record<string, number>; shardCount: number;
 }> = {}) => ({
   name: over.name ?? nodeId,
   state: {
-    initialized: over.initialized ?? true, running: true, role: 'co-worker', standalone: false, nodeId, shardCount: over.shardCount ?? 2, followerHold: false,
+    initialized: over.initialized ?? true, nodeId, shardCount: over.shardCount ?? 2,
     leases: leases.map(shardId => ({ shardId })),
-    shardTable: (over.table ?? []).map(([shardId, owner, status]) => ({ shardId, nodeId: owner, status: status ?? 'Ready' })),
+    shardTable: (over.table ?? []).map(([shardId, owner]) => ({ shardId, nodeId: owner, status: 'Ready' })),
     guildMap: over.guildMap ?? {},
   },
 });
@@ -552,11 +552,13 @@ export function checks(): Check[] {
     { name: 'a shard leased twice, or against the shard table, is CONTROL', run: J => {
       const twice = J.judgeFleet([fleetNode('m', [0, 1]), fleetNode('w', [1])]).map(v => v.detail);
       expect(twice.some(d => /shard 1 is leased to 2 nodes/.test(d))).toBe(true);
-      const table = J.judgeFleet([fleetNode('m', [0], { table: [[0, 'm'], [1, 'w']] }), fleetNode('x', [1])]).map(v => v.detail);
-      expect(table.some(d => /shard 1 is leased by x, but a shard table gives it to w/.test(d))).toBe(true);
-      expect(J.judgeFleet([fleetNode('m', [0], { table: [[0, 'm'], [1, 'w']] }), fleetNode('w', [1])])).toEqual([]);
-      // A grant not yet confirmed names its target before the old holder lets go.
-      expect(J.judgeFleet([fleetNode('m', [0], { table: [[0, 'm'], [1, 'w', 'pending']] }), fleetNode('x', [1])])).toEqual([]);
+      const table = J.judgeFleet([fleetNode('m', [0], { table: [[0, 'm'], [1, 'm']] }), fleetNode('x', [1])]).map(v => v.detail);
+      expect(table.some(d => /shard 1 is in the shard table of m, which does not lease it/.test(d))).toBe(true);
+      expect(table.some(d => /shard 1 is leased by x, but it is in the shard table of m/.test(d))).toBe(true);
+      expect(J.judgeFleet([fleetNode('m', [0], { table: [[0, 'm']] }), fleetNode('w', [1], { table: [[1, 'w']] })])).toEqual([]);
+      // A row is held by the node reporting it, whatever node id the row names.
+      const named = J.judgeFleet([fleetNode('m', [0], { table: [[1, 'w']] }), fleetNode('w', [1])]).map(v => v.detail);
+      expect(named.some(d => /shard 1 is in the shard table of m, which does not lease it/.test(d))).toBe(true);
       // judge() counts them from one set of facts.
       const history = J.buildHistory([[start(['a']), ...sixAcked(), { t: 'end' }]]);
       const one = J.judge({ history, copies: [copyOf('db', sixDocs())], k: 0, fleet: [fleetNode('m', [0, 1]), fleetNode('w', [1])] });
@@ -584,7 +586,7 @@ export function checks(): Check[] {
       const controls = (fleet: any[], fleetAgain: any[]) => J.judge({ history, copies, k: 0, fleet, fleetAgain }).verdicts.map(v => v.v);
       expect(controls(handoff, [fleetNode('w', [1]), fleetNode('x', [1])])).toEqual(['CONTROL']);
       expect(controls([...handoff, fleetNode('y', [])], [...handoff, fleetNode('y', [1])])).toEqual(['CONTROL']);
-      const tableSet = (tag: string) => [fleetNode('m', [0], { name: `m-${tag}`, table: [[0, 'm'], [1, 'w']] }), fleetNode('x', [1], { name: `x-${tag}` })];
+      const tableSet = (tag: string) => [fleetNode('m', [0], { name: `m-${tag}`, table: [[0, 'm'], [1, 'm']] })];
       expect(controls(tableSet('1'), tableSet('2'))).toEqual(['CONTROL']);
       // A node in one set only leaves the comparison unjudged.
       const missing = J.judge({ history, copies, k: 0, fleet: handoff, fleetAgain: [fleetNode('x', [1])] });
@@ -593,9 +595,10 @@ export function checks(): Check[] {
       expect(J.judge({ history, copies, k: 0, fleet: [fleetNode('x', [1])], fleetAgain: handoff }).inconclusive.join('\n')).toMatch(/node w is in the second set/);
       // Nodes are matched by id, so per-set file names leave nothing unmatched.
       expect(J.judge({ history, copies, k: 0, fleet: tableSet('1'), fleetAgain: tableSet('2') }).inconclusive).toEqual([]);
-      // Each rule counts only what both sets show, in either order: a table conflict, two shard counts, a guild split, an out-of-range map.
+      // Each rule counts only what both sets show, in either order: a table conflict, an unleased row, two shard counts, a guild split, an out-of-range map.
       const seenOnce: [any[], any[]][] = [
-        [[fleetNode('m', [0], { table: [[1, 'w']] }), fleetNode('x', [1])], [fleetNode('m', [0], { table: [[1, 'x']] }), fleetNode('x', [1])]],
+        [[fleetNode('m', [0], { table: [[1, 'm']] })], [fleetNode('m', [0], { table: [[0, 'm']] })]],
+        [[fleetNode('m', [0], { table: [[1, 'm']] })], [fleetNode('m', [0, 1], { table: [[1, 'm']] })]],
         [[fleetNode('m', [0]), fleetNode('w', [1], { shardCount: 3 })], [fleetNode('m', [0]), fleetNode('w', [1])]],
         [[fleetNode('m', [0], { guildMap: { 10: 0 } }), fleetNode('w', [1], { guildMap: { 10: 1 } })], [fleetNode('m', [0], { guildMap: { 10: 1 } }), fleetNode('w', [1], { guildMap: { 10: 1 } })]],
         [[fleetNode('m', [0, 1], { guildMap: { 10: 5 } })], [fleetNode('m', [0, 1], { guildMap: { 10: 1 } })]],
@@ -605,6 +608,12 @@ export function checks(): Check[] {
         expect(controls(gone, seen)).toEqual([]);
         expect(controls(seen, seen)).toEqual(['CONTROL']);
       }
+      const tableOnce = [fleetNode('m', [], { table: [[1, 'm']] }), fleetNode('w', [1])];
+      expect(controls(tableOnce, [fleetNode('m', []), fleetNode('w', [1])])).toEqual([]);
+      expect(controls(tableOnce, tableOnce)).toEqual(['CONTROL', 'CONTROL']);
+      // A table row belongs to the node that reports it, whatever node id the row carries.
+      const named = [fleetNode('m', [1], { table: [[1, 'x']] })];
+      expect(controls(named, named)).toEqual([]);
       // An out-of-range map is one node's state at one instant: a shard count that changed between the sets does not hide it.
       const outOfRange = (count: number) => [fleetNode('m', Array.from({ length: count }, (_, i) => i), { shardCount: count, guildMap: { 10: 5 } })];
       expect(controls(outOfRange(2), outOfRange(4))).toEqual(['CONTROL']);

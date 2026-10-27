@@ -51,8 +51,8 @@ describe('root config reads with the exit drain open', () => {
   it('never replaces a config.json that another writer lands after a read found it missing', async () => {
     expect(fs.existsSync(ROOT_CONFIG_PATH)).toBe(false);
     getConfigProperty('DEVS');
-    // A writer outside this process's queue (the web UI parent's saveGlobalConfig, the co-worker sync's rename, an
-    // operator restoring a backup) lands the file.
+    // A writer outside this process's queue (the web UI parent's saveGlobalConfig, an operator restoring a
+    // backup) lands the file.
     fs.writeFileSync(ROOT_CONFIG_PATH, JSON.stringify({ DEVS: ['222'] }));
     await flushAll();
     expect(JSON.parse(fs.readFileSync(ROOT_CONFIG_PATH, 'utf8'))).toEqual({ DEVS: ['222'] });

@@ -150,7 +150,7 @@ export async function startFakeApp(options: FakeAppOptions): Promise<{ url: stri
         return send(200, { success: true, data: JSON.parse(doc), exists: true });
       }
       if (req.method === 'GET' && url.pathname === '/api/fleet/state') {
-        return send(200, { success: true, running: true, ...(options.fleetState?.() as object ?? {}) });
+        return send(200, { success: true, ...(options.fleetState?.() as object ?? {}) });
       }
       send(404, { success: false, error: 'no route' });
     } catch (error) {

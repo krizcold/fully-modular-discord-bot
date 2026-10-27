@@ -719,8 +719,7 @@ async function read(argv) {
 const URL_SECRET = /\b[a-z][a-z0-9+.-]*:\/\/[^\s"'@/]*@/gi;
 
 /**
- * @typedef {{ initialized: boolean, running: boolean, role: string | null, standalone: boolean, nodeId: string | null,
- *   shardCount: number | null, followerHold: boolean, leases: { shardId: number }[],
+ * @typedef {{ initialized: boolean, nodeId: string | null, shardCount: number | null, leases: { shardId: number }[],
  *   shardTable: { shardId: number, nodeId: string | null, status: string | null }[], guildMap: Record<string, number> }} FleetFacts
  */
 
@@ -734,12 +733,8 @@ export function reduceFleetState(state) {
   const s = state && typeof state === 'object' ? state : {};
   return {
     initialized: s.initialized === true,
-    running: s.running !== false,
-    role: typeof s.role === 'string' ? s.role : null,
-    standalone: s.standalone === true,
     nodeId: typeof s.nodeId === 'string' ? s.nodeId : null,
     shardCount: typeof s.shardCount === 'number' ? s.shardCount : null,
-    followerHold: s.followerHold ? true : false,
     leases: Array.isArray(s.leases) ? s.leases.map((/** @type {any} */ l) => ({ shardId: l.shardId })) : [],
     shardTable: Array.isArray(s.shardTable)
       ? s.shardTable.map((/** @type {any} */ r) => ({ shardId: r.shardId, nodeId: r.nodeId ?? null, status: r.status ?? null }))
@@ -768,7 +763,7 @@ async function fleet(argv) {
 /** @param {string[]} argv */
 async function cleanup(argv) {
   const a = parseArgs(argv, { log: 'many', target: 'one', limiter: 'one', timeout: 'one' });
-  if (!a.target) throw new Error('cleanup needs --log and --target (the master)');
+  if (!a.target) throw new Error('cleanup needs --log and --target (the bot)');
   const base = checkBase(a.target);
   const { keys, guild } = keysFromLogs(a.log);
   const timeoutMs = num(a.timeout, 'timeout', 20000);

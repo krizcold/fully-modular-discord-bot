@@ -14,7 +14,7 @@ import { dbCopy } from '../oracle/judge.mjs';
 import { biteStatements, dumpSql, hashOf, parseLog } from '../oracle/oracle.mjs';
 
 // The oracle end to end: the writer, the app-path reader, the fleet reader and
-// the checker run as child processes against stand-in nodes on real
+// the checker run as child processes against fake nodes on real
 // Postgres, and the database copy is taken with the exact psql query the live
 // runs use. The bite test (VERIFY.md 5.5) tampers with that database.
 
@@ -114,9 +114,9 @@ describe('the data-loss oracle end to end', () => {
       return 'normal';
     };
     const fleetState = (nodeId: string, leases: number[]) => () => ({
-      initialized: true, role: nodeId === 'm' ? 'master' : 'co-worker', standalone: false, nodeId, shardCount: 2,
+      initialized: true, nodeId, shardCount: 2,
       leases: leases.map(shardId => ({ shardId, leaseId: `lease-${shardId}` })),
-      shardTable: nodeId === 'm' ? [{ shardId: 0, nodeId: 'm', status: 'Ready' }, { shardId: 1, nodeId: 'w', status: 'Ready' }] : [],
+      shardTable: leases.map(shardId => ({ shardId, nodeId, status: 'Ready' })),
       guildMap: { [GUILD]: 1 },
       // Fields the reduction must drop before anything is written.
       dataBackendUrl: 'postgres://smdb:hunter2@10.0.0.9:5432/smdb',
