@@ -10,7 +10,7 @@
 import * as fs from 'fs';
 import { dataPath } from '../../../utils/dataRoot';
 import { FLEET_DIR } from './constants';
-import { atomicWriteFileSync } from './fileControlStore';
+import { atomicWriteFileSync } from '../utils/atomicWrite';
 
 /**
  * claimed: the override is written and the serve-only boot is next.

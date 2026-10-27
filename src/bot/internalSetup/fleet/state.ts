@@ -2,6 +2,7 @@
 // fork IPC (a follow-up ipcFleetHandler answers 'fleet:state' with it).
 
 import { performance } from 'perf_hooks';
+import { Status } from 'discord.js';
 import { ARM_MAX_ATTEMPTS, ARM_SPACING_MS, CONTROL_PORT_DEFAULT, LEASE_TTL_MS, PROTOCOL_VERSION, WITNESS_FRESH_WINDOW_MS } from './constants';
 import type { WitnessDarkView } from './witnessDark';
 import { ArmPhase, readArmRecord } from './armRecord';
@@ -959,7 +960,8 @@ export function getFleetState(): FleetState {
     };
   }
 
-  // Co-worker view: this node only; the master owns the fleet-wide picture.
+  // This node only: a co-worker's master owns the fleet-wide picture, and a
+  // standalone node holds every shard itself.
   const hb = runtime.getLastHeartbeat();
   const client = ingest.getClient();
   const guildMap: Record<string, number> = {};
@@ -969,12 +971,18 @@ export function getFleetState(): FleetState {
     }
   }
   const statusByShard = new Map<number, string>((hb?.shards ?? []).map(s => [s.shardId, s.status]));
+  if (!hb && client) {
+    for (const l of leases) {
+      const shard = client.ws.shards.get(l.shardId);
+      if (shard) statusByShard.set(l.shardId, Status[shard.status] ?? String(shard.status));
+    }
+  }
   const term = controlClient?.getTerm() ?? lease?.term ?? 0;
   const registered = controlClient?.masterKnown() ?? false;
   const onHold = registered && leases.length === 0;
   const shardCount = lease?.shardCount ?? 0;
   const draining = controlClient?.isDraining() ?? false;
-  const servingOnCachedLease = !registered && runtime.hasCurrentLease();
+  const servingOnCachedLease = controlClient !== null && !registered && runtime.hasCurrentLease();
   const lastContactAgoMs = controlClient?.getLastContactAgoMs() ?? null;
   const cachedLeaseTtlRemainingMs = servingOnCachedLease
     ? Math.max(0, LEASE_TTL_MS - (lastContactAgoMs ?? LEASE_TTL_MS))
@@ -999,7 +1007,7 @@ export function getFleetState(): FleetState {
   return {
     initialized: true,
     role,
-    standalone: false,
+    standalone,
     nodeId,
     nodeName,
     appVersion,
@@ -1031,17 +1039,17 @@ export function getFleetState(): FleetState {
     term,
     epoch: lease?.epoch ?? 0,
     shardCount,
-    shardSource: 'master',
+    shardSource: sources.shardSource ?? 'master',
     dataBackend: resolveDataBackend(),
     dataRouting: getRouteOverrides(),
     dataBoot: getDataBootStatus(),
     recommendedShards,
-    recommendedAt: null,
+    recommendedAt: sources.recommendedAt ?? null,
     capacity,
     onHold,
     pinTestGuildShard: isPinEnabled(),
     pinnedShardId: null,
-    masterKnown: registered,
+    masterKnown: registered || standalone,
     dialing: controlClient !== null,
     masterUrl: controlClient?.getCurrentMasterUrl() ?? effectiveMasterUrls().urls[0] ?? null,
     masterStandingInFor: controlClient?.getMasterStandingInFor() ?? null,
@@ -1069,7 +1077,7 @@ export function getFleetState(): FleetState {
         nodeId,
         nodeName,
         isSelf: true,
-        isMaster: false,
+        isMaster: role === 'master',
         connected: true,
         health: 'up',
         appVersion,

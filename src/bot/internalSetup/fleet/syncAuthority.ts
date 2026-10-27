@@ -7,7 +7,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { FLEET_DIR, SYNC_BUMP_DEBOUNCE_MS, SYNC_CHUNK_BYTES, SYNC_RECONCILE_MS } from './constants';
-import { atomicWriteFileSync } from './fileControlStore';
+import { atomicWriteFileSync } from '../utils/atomicWrite';
 import { dataPath } from '../../../utils/dataRoot';
 import { getSourceModulesDir } from '../utils/pathHelpers';
 import { assertSyncableSize, buildModuleEntries, isPathInScope, isValidModuleName, listModuleFiles, listScopeFiles, manifestHashesEqual, buildSyncManifest, resolveScopeFile } from './syncManifest';

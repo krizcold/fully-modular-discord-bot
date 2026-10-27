@@ -10,7 +10,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { WebSocket } from 'ws';
 import { DATA_ROOT } from '../../../../utils/dataRoot';
-import { atomicWriteFileSync } from '../fileControlStore';
+import { atomicWriteFileSync } from '../../utils/atomicWrite';
 import { getNodeId } from '../nodeIdentity';
 import { readSuperseded } from '../stepDown';
 import { noteGuildsCommittedHere } from '../mirrorEngine';

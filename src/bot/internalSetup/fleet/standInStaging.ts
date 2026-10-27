@@ -23,7 +23,7 @@
 import * as fs from 'fs';
 import { dataPath } from '../../../utils/dataRoot';
 import { FLEET_DIR } from './constants';
-import { atomicWriteFileSync } from './fileControlStore';
+import { atomicWriteFileSync } from '../utils/atomicWrite';
 import { PROMOTED_BY_HAND, readArmRecord } from './armRecord';
 import type { ControlStore, PersistedFleetConfig, PersistedPlan, PersistedRegistry } from './controlStore';
 

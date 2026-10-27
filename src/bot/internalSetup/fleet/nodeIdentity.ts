@@ -8,7 +8,7 @@ import * as os from 'os';
 import { randomUUID } from 'crypto';
 import { dataPath } from '../../../utils/dataRoot';
 import { FLEET_DIR } from './constants';
-import { atomicWriteFileSync } from './fileControlStore';
+import { atomicWriteFileSync } from '../utils/atomicWrite';
 import type { NodeRole } from './protocol';
 
 /**

@@ -5,30 +5,9 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { dataPath } from '../../../utils/dataRoot';
 import { FLEET_DIR } from './constants';
+import { atomicWriteFileSync } from '../utils/atomicWrite';
 import type { SyncPosturePayload } from './protocol';
 import type { ControlStore, PersistedFleetConfig, PersistedMigrations, PersistedPlan, PersistedRegistry, PersistedTerm, RedistributeProposal, ReshardArchive, ReshardMarker, TransformationRecord } from './controlStore';
-
-export function atomicWriteFileSync(file: string, contents: string): void {
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
-  fs.writeFileSync(tmp, contents, 'utf-8');
-  // Windows can throw EPERM on rename-over-existing while a reader holds the
-  // target open; a short bounded retry keeps the write atomic instead of
-  // degrading to a torn direct write.
-  for (let attempt = 0; ; attempt++) {
-    try {
-      fs.renameSync(tmp, file);
-      return;
-    } catch (error) {
-      if (attempt >= 3) {
-        try { fs.unlinkSync(tmp); } catch { /* best effort */ }
-        throw error;
-      }
-      const waitUntil = Date.now() + 25 * (attempt + 1);
-      while (Date.now() < waitUntil) { /* store writes are rare and tiny */ }
-    }
-  }
-}
 
 /** Rename with the same bounded retry: Windows EPERM on rename-over-open. */
 export function renameWithRetry(from: string, to: string): void {

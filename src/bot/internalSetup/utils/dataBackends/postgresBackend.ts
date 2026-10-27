@@ -1084,6 +1084,16 @@ export async function readControlTerm(url: string): Promise<number> {
   }
 }
 
+/** The highest term any guild_ownership row holds; 0 when the table is empty. Throws while it cannot be read. */
+export async function readMaxOwnershipTerm(backend: PostgresBackend): Promise<number> {
+  const res = await backend.getPool().query('SELECT max(term) AS term FROM smdb_data.guild_ownership');
+  const raw = res.rows[0]?.term;
+  if (raw === null || raw === undefined) return 0;
+  const term = Number(raw);
+  if (!Number.isSafeInteger(term) || term < 0) throw new Error(`unusable ownership term ${String(raw)}`);
+  return term;
+}
+
 /** TTL sweep: graveyard rows plus retired ownership rows older than the cutoff.
  * Returns the number of rows deleted; idempotent, safe to misfire. */
 export async function sweepGraveyardRows(url: string, cutoffMs: number): Promise<number> {

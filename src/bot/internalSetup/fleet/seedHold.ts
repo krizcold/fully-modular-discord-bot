@@ -31,7 +31,8 @@ import {
 import { ControlServer } from './controlServer';
 import type { PersistedFleetConfig, PersistedTerm } from './controlStore';
 import { adoptMirror, clearAdoptMarker, finishAdopt, pinPlacement, pinRecordsText, recordsFault, seedTerm } from './fileFailover';
-import { atomicWriteFileSync, renameWithRetry } from './fileControlStore';
+import { renameWithRetry } from './fileControlStore';
+import { atomicWriteFileSync } from '../utils/atomicWrite';
 import { readHolderSighting } from './holderSighting';
 import { incomingLegDir, TransferReceiver, TransferServer } from './migration/transferChannel';
 import { MirrorManifest, mirrorDocsDir, mirrorGuildDir, mirrorManifestFile, mirrorRoot, readMirrorManifest } from './mirrorEngine';

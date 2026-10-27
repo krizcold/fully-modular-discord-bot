@@ -7,7 +7,7 @@ import * as fs from 'fs';
 import { WebSocket } from 'ws';
 import { dataPath } from '../../../utils/dataRoot';
 import { FLEET_DIR, WITNESS_CURRENT_WINDOW_MS, WITNESS_FRESH_WINDOW_MS } from './constants';
-import { atomicWriteFileSync } from './fileControlStore';
+import { atomicWriteFileSync } from '../utils/atomicWrite';
 import { ControlEnvelope, CopyBlock, MSG, StepDownPayload, SupersededInfo } from './protocol';
 import type { WitnessClaim, WitnessStatus } from './witness';
 

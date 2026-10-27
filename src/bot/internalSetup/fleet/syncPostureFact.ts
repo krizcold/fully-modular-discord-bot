@@ -53,7 +53,7 @@ import { Client } from 'pg';
 import { shortLivedClient } from '../utils/pgClient';
 import { dataPath } from '../../../utils/dataRoot';
 import { FLEET_DIR } from './constants';
-import { atomicWriteFileSync } from './fileControlStore';
+import { atomicWriteFileSync } from '../utils/atomicWrite';
 import type { SyncPosturePayload } from './protocol';
 
 /**

@@ -15,7 +15,8 @@ import { getModuleRegistry } from '../utils/moduleRegistry';
 import { resetAppStoreManager } from '../utils/appStoreManager';
 import { clearSchemaCache } from '../utils/settings/settingsDiscovery';
 import { FLEET_DIR, SYNC_MAX_FILE_BYTES, SYNC_STAGING_DIRNAME } from './constants';
-import { atomicWriteFileSync, renameWithRetry } from './fileControlStore';
+import { renameWithRetry } from './fileControlStore';
+import { atomicWriteFileSync } from '../utils/atomicWrite';
 import {
   MSG,
   SyncFileEntry,

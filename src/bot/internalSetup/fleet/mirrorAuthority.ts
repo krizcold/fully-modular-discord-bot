@@ -13,7 +13,7 @@ import { flushGuild } from '../utils/dataManager';
 import { freezeSentinelExists } from '../utils/dataBackends/fileBackend';
 import { hashFileStreamed, isExcludedNamespaceName, namespaceHashOf, safeImportTarget } from '../utils/dataInterchange';
 import { FLEET_DIR, MIRROR_DOC_NAMES, MIRROR_REVISION_FILENAME, SYNC_CHUNK_BYTES } from './constants';
-import { atomicWriteFileSync } from './fileControlStore';
+import { atomicWriteFileSync } from '../utils/atomicWrite';
 import { assertSyncableSize } from './syncManifest';
 import { MSG, MirrorGuildEntry, MirrorListReply, MirrorReadReply, MirrorReadRequest, SyncFileEntry } from './protocol';
 

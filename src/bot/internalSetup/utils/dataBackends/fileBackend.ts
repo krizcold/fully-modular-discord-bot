@@ -77,7 +77,7 @@ let flushFailures = 0;
 let flushesLanded = 0;
 
 // Monotonic tmp-name suffix so two saves to the same path in the same ms never
-// collide on the temp file. Pattern mirrors fleet/fileControlStore.ts.
+// collide on the temp file. Pattern mirrors utils/atomicWrite.ts.
 let tmpCounter = 0;
 function tmpNameFor(target: string): string {
   return `${target}.${process.pid}.${Date.now()}.${tmpCounter++}.tmp`;
@@ -815,4 +815,32 @@ export function sizeOfGuildData(guildId: string): Promise<number> {
  */
 export function sizeOfGlobalData(): Promise<number> {
   return sizeDirectoryRecursive(path.join(BASE_DATA_DIR, 'global'), ['fleet']);
+}
+
+const ORPHAN_TMP_MAX_AGE_MS = 60 * 60 * 1000;
+
+// Delete *.tmp files (from an interrupted atomic write) older than 1h. Recurses
+// the whole data tree; a young tmp may be an in-flight write and is left alone.
+export async function cleanOrphanTmpFiles(dir: string = BASE_DATA_DIR): Promise<void> {
+  let entries: fs.Dirent[];
+  try {
+    entries = await fs.promises.readdir(dir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  const cutoff = Date.now() - ORPHAN_TMP_MAX_AGE_MS;
+  for (const entry of entries) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      await cleanOrphanTmpFiles(full);
+    } else if (entry.isFile() && entry.name.endsWith('.tmp')) {
+      try {
+        const stat = await fs.promises.stat(full);
+        if (stat.mtimeMs < cutoff) {
+          await fs.promises.unlink(full);
+          console.log(`[DataManager] Removed orphaned temp file: ${full}`);
+        }
+      } catch { /* vanished mid-sweep */ }
+    }
+  }
 }

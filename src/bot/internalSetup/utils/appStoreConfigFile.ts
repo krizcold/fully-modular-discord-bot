@@ -1,6 +1,6 @@
 import * as fs from 'fs';
 import { dataPath } from '../../../utils/dataRoot';
-import { atomicWriteFileSync } from '../fleet/fileControlStore';
+import { atomicWriteFileSync } from './atomicWrite';
 
 export const componentConfigPath = (): string => dataPath('global', 'appstore', 'component-config.json');
 export const appStoreConfigPath = (): string => dataPath('global', 'appstore', 'config.json');

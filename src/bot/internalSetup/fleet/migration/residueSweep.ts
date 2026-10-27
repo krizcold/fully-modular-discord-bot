@@ -8,7 +8,7 @@ import * as path from 'path';
 import { DATA_ROOT } from '../../../../utils/dataRoot';
 import { graveyardGuildDir } from '../../utils/dataBackends/fileBackend';
 import { deleteGuildNamespace, listGuilds, stampOwner } from '../../utils/dataManager';
-import { atomicWriteFileSync } from '../fileControlStore';
+import { atomicWriteFileSync } from '../../utils/atomicWrite';
 import { graveyardLiveDir } from '../fileFailover';
 import { getNodeId } from '../nodeIdentity';
 import { commitFromStaging } from './migrationExecutor';

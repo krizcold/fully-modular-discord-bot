@@ -8,7 +8,7 @@
 import * as fs from 'fs';
 import { dataPath } from '../../../utils/dataRoot';
 import { FLEET_DIR } from './constants';
-import { atomicWriteFileSync } from './fileControlStore';
+import { atomicWriteFileSync } from '../utils/atomicWrite';
 
 export type HolderSightingVia = 'fence-park' | 'fence-hold' | 'step-down' | 'register';
 

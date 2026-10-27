@@ -23,7 +23,7 @@ import { getSubscriptionNotifier } from './utils/subscriptionNotifier';
 import { getPaymentRegistry } from './utils/payment/paymentRegistry';
 import { startModuleAutoUpdater } from './utils/moduleAutoUpdater';
 import { loadCredentials } from '../../utils/envLoader';
-import { initFleet, relaxFleetSyncPosture } from './fleet/bootstrap';
+import { bootShards } from './fleet/shardBoot';
 import { getIngestService } from './ingest/ingestService';
 import { installReplyGate } from './utils/dataBackends/replyGate';
 import { ModuleLoader } from './utils/moduleLoader';
@@ -471,26 +471,16 @@ function runInitializers(client: Client) {
  */
 async function main() {
   // Data backend boot runs FIRST so the readiness driver exists when the
-  // first lease lands (the master self-grants during initFleet). File mode is
+  // shards are granted (bootShards). File mode is
   // a no-op; postgres mode constructs the backend held until its store
   // identity verifies.
   initDataBackendLayer();
 
-  // Fleet IPC needs no client and must answer BEFORE initFleet returns: the
-  // boot takeover guard can hold a master boot for its whole observation
-  // window, and the webui must render that hold (pre-init fleet state) live.
   setupFleetIPCHandlers();
   setupMetricsIPCHandlers();
 
-  // Fleet boot: role resolution, term acquisition, shard leases. Standalone
-  // resolves to a master with self-granted leases; a co-worker holds here
-  // until its master grants a lease.
-  const fleet = await initFleet();
-
-  // Sync boot gate: a co-worker blocks until its files/modules mirror the
-  // master (instant on master + standalone). Runs BEFORE ensureConfigPopulated
-  // so the master's config.json lands first.
-  await fleet.awaitSyncReady();
+  // Every shard runs in this process.
+  const fleet = await bootShards();
 
   // PHASE 0: Ensure config.json is fully populated with schema
   console.log('[Bot] Synchronizing config.json with schema...');
@@ -654,10 +644,7 @@ async function main() {
     }
 
     // Start module auto-update scheduler (checks every 30min if enabled).
-    // Co-workers receive module updates only via master sync.
-    if (fleet.role !== 'co-worker') {
-      startModuleAutoUpdater(client);
-    }
+    startModuleAutoUpdater(client);
   });
 
   // Set up IPC message handlers for Web-UI panel integration
@@ -732,14 +719,6 @@ async function main() {
     await Promise.race([
       getIngestService().close('shutting down').catch(err => console.warn('[clientInitializer] Could not close the gateway on shutdown:', err)),
       new Promise(resolve => setTimeout(resolve, 2000)),
-    ]);
-    // Before anything writes: an armed synchronous posture stalls every write
-    // below for its whole bound, and nothing would be watching it after exit.
-    // Bounded, because the drain is the part that must not be lost and the
-    // next master boot clears a posture this did not reach in time.
-    await Promise.race([
-      relaxFleetSyncPosture().catch(err => console.warn('[clientInitializer] Could not relax the synchronous posture on shutdown:', err)),
-      new Promise(resolve => setTimeout(resolve, 1500)),
     ]);
     metrics.flushTotals(); // writes via saveData, so it must precede the drain
     // Postgres mode gets a wider bound: a coalesced Working Set can hold more

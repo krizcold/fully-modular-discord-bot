@@ -7,7 +7,7 @@
 import * as fs from 'fs';
 import { dataPath } from '../../../utils/dataRoot';
 import { FLEET_DIR } from './constants';
-import { atomicWriteFileSync } from './fileControlStore';
+import { atomicWriteFileSync } from '../utils/atomicWrite';
 import { rawMasterUrls, resolveMasterUrls, stripSelfUrl } from './nodeIdentity';
 import type { BackupDesignation, FleetConfigPayload } from './protocol';
 

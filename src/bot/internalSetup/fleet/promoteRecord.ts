@@ -6,7 +6,7 @@
 import * as fs from 'fs';
 import { dataPath } from '../../../utils/dataRoot';
 import { FLEET_DIR } from './constants';
-import { atomicWriteFileSync } from './fileControlStore';
+import { atomicWriteFileSync } from '../utils/atomicWrite';
 
 export type PromotePhase = 'verdict' | 'claim' | 'fence' | 'catchup' | 'promote' | 'retire' | 'handover' | 'adopt' | 'pin' | 'seed' | 'restart' | 'done';
 /** The store the phases work on: postgres (claim, fence, catch-up, promote) or file (adopt, pin, seed; B4f-2; a transfer's retire and handover, B4f-4). */

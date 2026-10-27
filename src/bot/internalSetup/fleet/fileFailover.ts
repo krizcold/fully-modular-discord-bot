@@ -12,7 +12,8 @@ import { DATA_ROOT, dataPath } from '../../../utils/dataRoot';
 import { FLEET_DIR, MIRROR_DOC_NAMES, PLACEMENT_DOC_NAMES } from './constants';
 import type { MigrationRecord, PersistedAssignment, PersistedFleetConfig, PersistedMigrations, PersistedPlan, PersistedRegistry, PersistedTerm, RedistributeProposal } from './controlStore';
 import { migrationsHoldTogether } from './controlStore';
-import { atomicWriteFileSync, renameWithRetry } from './fileControlStore';
+import { renameWithRetry } from './fileControlStore';
+import { atomicWriteFileSync } from '../utils/atomicWrite';
 import { adoptMarkerFile, mirrorDocsDir, mirrorGuildDir, mirrorRoot, readMirrorManifest } from './mirrorEngine';
 import { guildIdToShardId } from './placement';
 

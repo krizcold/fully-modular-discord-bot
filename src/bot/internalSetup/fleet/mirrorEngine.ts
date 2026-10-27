@@ -13,7 +13,8 @@ import { DATA_ROOT } from '../../../utils/dataRoot';
 import { resolveDataBackend } from '../../../utils/envLoader';
 import { hashFileStreamed, namespaceHashOf, safeImportTarget } from '../utils/dataInterchange';
 import { MIRROR_DIRNAME, MIRROR_DOC_NAMES, MIRROR_FETCH_CONCURRENCY, MIRROR_LIST_TIMEOUT_MS, MIRROR_POOL_MAX_FILE_BYTES, MIRROR_TICK_MS, SYNC_MAX_FILE_BYTES } from './constants';
-import { atomicWriteFileSync, renameWithRetry } from './fileControlStore';
+import { renameWithRetry } from './fileControlStore';
+import { atomicWriteFileSync } from '../utils/atomicWrite';
 import { readHolderSighting } from './holderSighting';
 import { MSG, MirrorListReply, MirrorReadKind, MirrorReport, MirrorStatus, SyncFileEntry } from './protocol';
 
