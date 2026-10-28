@@ -16,6 +16,7 @@ vi.mock('../../src/bot/internalSetup/utils/dataBackends/workingSet', async (orig
     exists: (g: string, m: string, f: string) => h.docs.has(key(g, m, f)),
     save: (g: string, m: string, f: string, c: string) => { h.docs.set(key(g, m, f), c); return 'accepted'; },
     ticketFor: (g: string): any => ({ kind: 'ws', manager: fake, set: {}, guildId: g, seq: 0 }),
+    readForUpdate: (g: string, m: string, f: string) => fake.read(g, m, f),
   };
   return { ...real, getWorkingSet: () => (h.pgGuilds.size ? fake : real.getWorkingSet()) };
 });
@@ -25,6 +26,7 @@ vi.mock('../../src/bot/internalSetup/utils/dataManager', async (orig) => {
   return {
     ...real,
     saveModuleData: (...args: any[]) => (h.failSave ? false : real.saveModuleData(...args)),
+    updateModuleData: (...args: any[]) => (h.failSave ? { outcome: 'refused', cause: 'io' } : real.updateModuleData(...args)),
   };
 });
 

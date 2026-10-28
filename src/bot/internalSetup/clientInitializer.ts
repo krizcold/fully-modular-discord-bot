@@ -730,7 +730,7 @@ async function main() {
   process.on('SIGTERM', () => void shutdownHandler());
   process.on('SIGINT', () => void shutdownHandler());
 
-  // Login is gated by the lease runtime: no identify without a current-term lease.
+  // No identify before the boot has its claim; a refused data layer logs in with no claim and its gates closed.
   fleet.startIngest(process.env.DISCORD_TOKEN);
 }
 

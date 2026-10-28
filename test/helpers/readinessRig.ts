@@ -9,8 +9,8 @@ import { freshGuild } from './gateRig';
 // R1-J2's rig: a real readiness driver over a scripted store and its working set, the lease set by the test. One
 // shard, so every guild is on shard 0.
 
-export const LEASED: LeaseSnapshot = { nodeId: 'node-a', term: 1, epoch: 1, shardCount: 1, shardIds: [0] };
-export const NOT_LEASED: LeaseSnapshot = { nodeId: 'node-a', term: 1, epoch: 2, shardCount: 1, shardIds: [] };
+export const LEASED: LeaseSnapshot = { nodeId: 'node-a', claim: 1, shardCount: 1, shardIds: [0] };
+export const NOT_LEASED: LeaseSnapshot = { nodeId: 'node-a', claim: 2, shardCount: 1, shardIds: [] };
 
 const drivers: DataReadinessDriver[] = [];
 

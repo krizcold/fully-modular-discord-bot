@@ -2,17 +2,26 @@
  * Persistent Panel Storage System
  */
 
+import * as fs from 'fs';
+import * as path from 'path';
 import { Client, TextChannel } from 'discord.js';
-import { loadGlobalModuleData, loadModuleData, saveGlobalModuleData, saveModuleData } from '../dataManager';
-import { PersistentPanelInstance, PersistentPanelStorage } from '@bot/types/panelTypes';
+import {
+  areGuildWritesClosed,
+  isClosedForExit,
+  loadGlobalModuleData,
+  loadModuleData,
+  updateGlobalModuleData,
+  updateModuleData,
+} from '../dataManager';
+import { getPending } from '../dataBackends/fileBackend';
+import { PersistentPanelInstance } from '@bot/types/panelTypes';
+import { DATA_ROOT } from '../../../../utils/dataRoot';
+import { resolveDataBackend } from '../../../../utils/envLoader';
 
 const STORAGE_FILE = 'persistent-panels.json';
 const STORAGE_NAMESPACE = '_panels';
 
-/**
- * Load persistent panel data from the guild's data (global when no guild)
- */
-export async function loadPersistentPanels(guildId?: string): Promise<any> {
+function readPanels(guildId?: string): any {
   const data = guildId
     ? loadModuleData<any>(STORAGE_FILE, guildId, STORAGE_NAMESPACE, {})
     : loadGlobalModuleData<any>(STORAGE_FILE, STORAGE_NAMESPACE, {});
@@ -20,19 +29,90 @@ export async function loadPersistentPanels(guildId?: string): Promise<any> {
 }
 
 /**
- * Save persistent panel data: false when the write did not land
+ * Load persistent panel data from the guild's data (global when no guild)
  */
-export async function savePersistentPanels(storage: any, guildId?: string): Promise<boolean> {
+export async function loadPersistentPanels(guildId?: string): Promise<any> {
+  return readPanels(guildId);
+}
+
+/**
+ * Moves a panel registry file that exists on disk, has no queued write and does not parse (an empty file included)
+ * aside, so the update that follows starts from no records instead of being refused. A file that cannot be read stays
+ * where it is. A guild served by Postgres has no file here, so its unparsable document stays refused. Nothing moves
+ * once the exit drain has closed writes, or, for a guild, while guild writes are closed.
+ */
+function moveUnparsableAside(guildId: string | undefined): void {
+  if (isClosedForExit() || (guildId && areGuildWritesClosed())) return;
+  if (guildId && resolveDataBackend() === 'postgres') return;
+  const file = path.join(DATA_ROOT, guildId ?? 'global', STORAGE_NAMESPACE, STORAGE_FILE);
+  if (getPending(file)) return;
+  let bytes: string;
   try {
-    const saved = guildId
-      ? saveModuleData(STORAGE_FILE, guildId, STORAGE_NAMESPACE, storage)
-      : saveGlobalModuleData(STORAGE_FILE, STORAGE_NAMESPACE, storage);
-    if (!saved) console.error(`[PersistentPanels] Panel records for ${guildId ?? 'global'} were not saved`);
-    return saved;
+    bytes = fs.readFileSync(file, 'utf-8');
+  } catch {
+    return;
+  }
+  try {
+    JSON.parse(bytes);
+    return;
+  } catch {}
+  const aside = `${file}.corrupt-${Date.now()}`;
+  try {
+    fs.renameSync(file, aside);
+  } catch (error) {
+    console.error(`[Panels] The panel registry ${file} does not parse and could not be moved aside:`, error);
+    return;
+  }
+  console.error(`[Panels] The panel registry ${file} did not parse; it was moved to ${aside} and panels start from no records`);
+}
+
+/**
+ * Change the stored panel records in one update: change edits the records it is handed, which are the stored ones
+ * at that moment. False when the write was not accepted.
+ */
+function updatePanels(guildId: string | undefined, change: (storage: any) => void): boolean {
+  const apply = (current: any) => {
+    const storage = current && typeof current === 'object' ? current : {};
+    change(storage);
+    return storage;
+  };
+  try {
+    moveUnparsableAside(guildId);
+    const result = guildId
+      ? updateModuleData(STORAGE_FILE, guildId, STORAGE_NAMESPACE, {}, apply)
+      : updateGlobalModuleData(STORAGE_FILE, STORAGE_NAMESPACE, {}, apply);
+    if (result.outcome !== 'saved') console.error(`[PersistentPanels] Panel records for ${guildId ?? 'global'} were not saved`);
+    return result.outcome === 'saved';
   } catch (error) {
     console.error(`[PersistentPanels] Panel records for ${guildId ?? 'global'} were not saved:`, error);
     return false;
   }
+}
+
+function findInstance(storage: any, panelId: string, sessionId?: string): PersistentPanelInstance | null {
+  const panelData = storage[panelId];
+  if (!panelData) return null;
+  if (sessionId && typeof panelData === 'object' && 'sessions' in panelData) return panelData.sessions[sessionId] || null;
+  if (typeof panelData === 'object' && 'messageId' in panelData) return panelData;
+  return null;
+}
+
+/** Removes one panel instance (only while it is still messageId, when given); true when it removed one. */
+function removeFrom(storage: any, panelId: string, sessionId?: string, messageId?: string): boolean {
+  const panelData = storage[panelId];
+  if (!panelData) return false;
+  if (sessionId) {
+    if (typeof panelData !== 'object' || !('sessions' in panelData)) return false;
+    const sessions = panelData.sessions;
+    const session = sessions[sessionId];
+    if (!session || (messageId !== undefined && session.messageId !== messageId)) return false;
+    delete sessions[sessionId];
+    if (Object.keys(sessions).length === 0) delete storage[panelId];
+    return true;
+  }
+  if (messageId !== undefined && panelData.messageId !== messageId) return false;
+  delete storage[panelId];
+  return true;
 }
 
 /**
@@ -43,22 +123,7 @@ export async function getPersistentPanel(
   guildId?: string,
   sessionId?: string
 ): Promise<PersistentPanelInstance | null> {
-  const storage = await loadPersistentPanels(guildId);
-  const panelData = storage[panelId];
-
-  if (!panelData) {
-    return null;
-  }
-
-  if (sessionId && typeof panelData === 'object' && 'sessions' in panelData) {
-    return panelData.sessions[sessionId] || null;
-  }
-
-  if (typeof panelData === 'object' && 'messageId' in panelData) {
-    return panelData;
-  }
-
-  return null;
+  return findInstance(readPanels(guildId), panelId, sessionId);
 }
 
 /**
@@ -71,35 +136,32 @@ export async function storePersistentPanel(
   sessionId?: string,
   maxInstances: number = 1
 ): Promise<{ success: boolean; replacedInstance?: PersistentPanelInstance }> {
-  const storage = await loadPersistentPanels(guildId);
   let replacedInstance: PersistentPanelInstance | undefined;
 
-  if (sessionId) {
-    if (!storage[panelId] || typeof storage[panelId] !== 'object' || !('sessions' in storage[panelId])) {
-      storage[panelId] = { sessions: {} };
+  const saved = updatePanels(guildId, storage => {
+    if (sessionId) {
+      if (!storage[panelId] || typeof storage[panelId] !== 'object' || !('sessions' in storage[panelId])) {
+        storage[panelId] = { sessions: {} };
+      }
+      storage[panelId].sessions[sessionId] = {
+        ...instance,
+        lastUpdated: Date.now()
+      };
+      return;
     }
-
-    const sessions = (storage[panelId] as any).sessions;
-    sessions[sessionId] = {
-      ...instance,
-      lastUpdated: Date.now()
-    };
-  }
-  else {
     if (maxInstances === 1) {
       const existing = storage[panelId] as PersistentPanelInstance;
       if (existing && existing.messageId) {
         replacedInstance = existing;
       }
     }
-
     storage[panelId] = {
       ...instance,
       lastUpdated: Date.now()
     };
-  }
+  });
 
-  if (!(await savePersistentPanels(storage, guildId))) {
+  if (!saved) {
     return { success: false };
   }
 
@@ -107,102 +169,112 @@ export async function storePersistentPanel(
 }
 
 /**
- * Update a persistent panel's state
+ * Update a persistent panel's state, only while its stored instance is still the given message
  */
 export async function updatePersistentPanelState(
   panelId: string,
   state: string,
+  messageId: string,
   guildId?: string,
   sessionId?: string,
   additionalData?: any
 ): Promise<boolean> {
-  const instance = await getPersistentPanel(panelId, guildId, sessionId);
-
-  if (!instance) {
+  const current = (storage: any) => {
+    const instance = findInstance(storage, panelId, sessionId);
+    return instance?.messageId === messageId ? instance : null;
+  };
+  if (!current(readPanels(guildId))) {
     return false;
   }
 
-  instance.state = state;
-  instance.lastUpdated = Date.now();
-
-  if (additionalData) {
-    instance.sessionData = { ...instance.sessionData, ...additionalData };
-  }
-
-  const result = await storePersistentPanel(panelId, instance, guildId, sessionId);
-  return result.success;
+  return updatePanels(guildId, storage => {
+    const instance = current(storage);
+    if (!instance) return;
+    instance.state = state;
+    instance.lastUpdated = Date.now();
+    if (additionalData) {
+      instance.sessionData = { ...instance.sessionData, ...additionalData };
+    }
+  });
 }
 
 /**
- * Remove a persistent panel instance
+ * Record a panel's latest response on its stored instance, only while that instance is still the given message
+ */
+export async function recordPersistentPanelResponse(
+  panelId: string,
+  sessionData: any,
+  messageId: string,
+  guildId?: string,
+  sessionId?: string
+): Promise<boolean> {
+  const current = (storage: any) => {
+    const instance = findInstance(storage, panelId, sessionId);
+    return instance?.messageId === messageId ? instance : null;
+  };
+  if (!current(readPanels(guildId))) {
+    return false;
+  }
+
+  return updatePanels(guildId, storage => {
+    const instance = current(storage);
+    if (!instance) return;
+    instance.sessionData = sessionData;
+    instance.lastUpdated = Date.now();
+  });
+}
+
+/**
+ * Remove a persistent panel instance; with messageId, only while the stored instance is still that message
  */
 export async function removePersistentPanel(
   panelId: string,
   guildId?: string,
-  sessionId?: string
+  sessionId?: string,
+  messageId?: string
 ): Promise<boolean> {
-  const storage = await loadPersistentPanels(guildId);
-
-  if (sessionId) {
-    // Remove session-based panel
-    if (storage[panelId] && typeof storage[panelId] === 'object' && 'sessions' in storage[panelId]) {
-      const sessions = (storage[panelId] as any).sessions;
-      if (sessions[sessionId]) {
-        delete sessions[sessionId];
-
-          if (Object.keys(sessions).length === 0) {
-          delete storage[panelId];
-        }
-
-        return savePersistentPanels(storage, guildId);
-      }
-    }
-  } else {
-    // Remove single-instance panel
-    if (storage[panelId]) {
-      delete storage[panelId];
-      return savePersistentPanels(storage, guildId);
-    }
+  if (!removeFrom(readPanels(guildId), panelId, sessionId, messageId)) {
+    return false;
   }
 
-  return false;
+  return updatePanels(guildId, storage => { removeFrom(storage, panelId, sessionId, messageId); });
+}
+
+const PANEL_EXPIRY_MS = 24 * 60 * 60 * 1000;
+
+/** Removes the sessions not updated for a day, and panels left with none; returns how many sessions it removed. */
+function removeExpired(storage: any, now: number): number {
+  let cleanedCount = 0;
+  for (const panelId in storage) {
+    const panelData = storage[panelId];
+    if (typeof panelData === 'object' && 'sessions' in panelData) {
+      const sessions = panelData.sessions;
+      for (const sessionId in sessions) {
+        if (now - sessions[sessionId].lastUpdated > PANEL_EXPIRY_MS) {
+          delete sessions[sessionId];
+          cleanedCount++;
+        }
+      }
+      if (Object.keys(sessions).length === 0) {
+        delete storage[panelId];
+      }
+    }
+  }
+  return cleanedCount;
 }
 
 /**
  * Clean up expired persistent panels
  */
 export async function cleanupExpiredPanels(client: Client, guildId?: string): Promise<number> {
-  const storage = await loadPersistentPanels(guildId);
   const now = Date.now();
-  const expiryTime = 24 * 60 * 60 * 1000;
+  if (removeExpired(readPanels(guildId), now) === 0) {
+    return 0;
+  }
+
   let cleanedCount = 0;
-
-  for (const panelId in storage) {
-    const panelData = storage[panelId];
-
-      if (typeof panelData === 'object' && 'sessions' in panelData) {
-      const sessions = panelData.sessions;
-      for (const sessionId in sessions) {
-        const session = sessions[sessionId];
-        if (now - session.lastUpdated > expiryTime) {
-          delete sessions[sessionId];
-          cleanedCount++;
-        }
-      }
-
-      if (Object.keys(sessions).length === 0) {
-        delete storage[panelId];
-      }
-    }
-      else if (typeof panelData === 'object' && 'messageId' in panelData) {
-    }
-  }
-
-  if (cleanedCount > 0) {
-    await savePersistentPanels(storage, guildId);
-  }
-
-  return cleanedCount;
+  const saved = updatePanels(guildId, storage => { cleanedCount = removeExpired(storage, now); });
+  return saved ? cleanedCount : 0;
 }
 
 /**
@@ -229,44 +301,31 @@ export async function validatePersistentPanel(
  * Clean up invalid persistent panels
  */
 export async function cleanupInvalidPanels(client: Client, guildId?: string): Promise<number> {
-  const storage = await loadPersistentPanels(guildId);
-  let cleanedCount = 0;
-  let modified = false;
+  const storage = readPanels(guildId);
+  const invalid: { panelId: string; sessionId?: string; messageId: string }[] = [];
 
   for (const panelId in storage) {
     const panelData = storage[panelId];
-
-      if (typeof panelData === 'object' && 'sessions' in panelData) {
-      const sessions = panelData.sessions;
-      for (const sessionId in sessions) {
-        const session = sessions[sessionId];
-        const isValid = await validatePersistentPanel(client, session);
-        if (!isValid) {
-          delete sessions[sessionId];
-          cleanedCount++;
-          modified = true;
-        }
+    if (typeof panelData === 'object' && 'sessions' in panelData) {
+      for (const sessionId in panelData.sessions) {
+        const session = panelData.sessions[sessionId];
+        if (!(await validatePersistentPanel(client, session))) invalid.push({ panelId, sessionId, messageId: session.messageId });
       }
-
-      if (Object.keys(sessions).length === 0) {
-        delete storage[panelId];
-      }
-    }
-      else if (typeof panelData === 'object' && 'messageId' in panelData) {
-      const isValid = await validatePersistentPanel(client, panelData);
-      if (!isValid) {
-        delete storage[panelId];
-        cleanedCount++;
-        modified = true;
-      }
+    } else if (typeof panelData === 'object' && 'messageId' in panelData) {
+      if (!(await validatePersistentPanel(client, panelData))) invalid.push({ panelId, messageId: panelData.messageId });
     }
   }
 
-  if (modified) {
-    await savePersistentPanels(storage, guildId);
+  if (invalid.length === 0) {
+    return 0;
   }
 
-  return cleanedCount;
+  // A panel stored again on a new message while its old one was checked is kept.
+  let cleanedCount = 0;
+  const saved = updatePanels(guildId, current => {
+    cleanedCount = invalid.filter(entry => removeFrom(current, entry.panelId, entry.sessionId, entry.messageId)).length;
+  });
+  return saved ? cleanedCount : 0;
 }
 
 /**

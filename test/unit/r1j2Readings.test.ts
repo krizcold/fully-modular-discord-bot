@@ -233,7 +233,7 @@ describe('the hold', () => {
     const hold = watch(admitGuildAction(guildId, now() + 2000));
     await vi.advanceTimersByTimeAsync(500);
     expect(hold.settled()).toBe(false);
-    r.driver.onLeaseChanged({ ...LEASED, epoch: 3 });
+    r.driver.onLeaseChanged({ ...LEASED, claim: 3 });
     await vi.advanceTimersByTimeAsync(200);
     expect(hold.value()!.cause).toBe('admit');
   });

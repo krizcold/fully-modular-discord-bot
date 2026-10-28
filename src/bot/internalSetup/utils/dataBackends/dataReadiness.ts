@@ -27,8 +27,7 @@ function guildIdToShardId(guildId: string, shardCount: number): number {
 
 export interface LeaseSnapshot {
   nodeId: string;
-  term: number;
-  epoch: number;
+  claim: number | null;
   shardCount: number;
   shardIds: number[];
 }
@@ -186,8 +185,7 @@ export class DataReadinessDriver {
     const lease = this.lease;
     return {
       nodeId: lease?.nodeId ?? 'unknown',
-      term: lease?.term ?? 0,
-      epoch: lease?.epoch ?? 0,
+      claim: lease?.claim ?? null,
       shardId: guildIdToShardId(guildId, this.shardCount || 1),
       shardCount: this.shardCount || 1,
     };

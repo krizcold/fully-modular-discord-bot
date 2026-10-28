@@ -14,11 +14,14 @@ import type {
   FenceToken,
   FlushOutcome,
   GuildFlushBatch,
+  GuildOwner,
   HydrationOutcome,
   RetireOutcome,
 } from './backend';
 
-const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
+const CLAIM_PROVISION_POLL_MS = 5000;
+const PROVISION_VERDICT_POLL_MS = 250;
 const PARTITION_COUNT = 32;
 const MAX_ROWS_PER_STATEMENT = 200;
 const BACKOFF_BASE_MS = 1000;
@@ -41,13 +44,13 @@ const PROVISION_DDL: string[] = [
     guild_id     text PRIMARY KEY,
     node_id      text NOT NULL,
     shard_id     integer NOT NULL,
-    term         bigint NOT NULL,
-    epoch        bigint NOT NULL,
+    claim        bigint NOT NULL,
     shard_count  integer NOT NULL,
     retired_at   timestamptz,
     updated_at   timestamptz NOT NULL DEFAULT now()
   )`,
   `CREATE INDEX IF NOT EXISTS guild_ownership_node_idx ON smdb_data.guild_ownership (node_id)`,
+  `CREATE SEQUENCE IF NOT EXISTS smdb_data.claim_seq`,
   `CREATE TABLE IF NOT EXISTS smdb_data.guild_data (
     guild_id   text NOT NULL,
     module     text NOT NULL,
@@ -81,23 +84,47 @@ const PROVISION_DDL: string[] = [
   `CREATE INDEX IF NOT EXISTS guild_graveyard_ttl_idx ON smdb_data.guild_data_graveyard (retired_at)`,
 ];
 
-// Equality only orders within one node_id; across nodes the fence is strict <.
+// One process holds one claim and claims never repeat, so an equal claim is the same process. A guild served again
+// after a retire is listed again.
 const FENCED_OWNERSHIP_UPDATE = `
   UPDATE smdb_data.guild_ownership
-     SET node_id = $2, shard_id = $3, term = $4, epoch = $5, shard_count = $6, updated_at = now()
-   WHERE guild_id = $1
-     AND ((term, epoch) < ($4, $5) OR ((term, epoch) = ($4, $5) AND node_id = $2))`;
+     SET node_id = $2, shard_id = $3, claim = $4, shard_count = $5, retired_at = NULL, updated_at = now()
+   WHERE guild_id = $1 AND claim <= $4`;
 
-const OWNER_SELECT = `SELECT node_id, term, epoch FROM smdb_data.guild_ownership WHERE guild_id = $1`;
+const OWNER_SELECT = `SELECT node_id, claim FROM smdb_data.guild_ownership WHERE guild_id = $1`;
 
 const OWNERSHIP_RECLAIM = `
   UPDATE smdb_data.guild_ownership
-     SET shard_id = $3, term = $4, epoch = $5, shard_count = $6, updated_at = now()
-   WHERE guild_id = $1 AND node_id = $2 AND (term, epoch) <= ($4, $5)`;
+     SET shard_id = $3, claim = $4, shard_count = $5, updated_at = now()
+   WHERE guild_id = $1 AND node_id = $2 AND claim <= $4`;
 
 const OWNERSHIP_INSERT = `
-  INSERT INTO smdb_data.guild_ownership (guild_id, node_id, shard_id, term, epoch, shard_count)
-  VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (guild_id) DO NOTHING`;
+  INSERT INTO smdb_data.guild_ownership (guild_id, node_id, shard_id, claim, shard_count)
+  VALUES ($1, $2, $3, $4, $5) ON CONFLICT (guild_id) DO NOTHING`;
+
+/** A claim the database can hold and a fence can compare: a positive safe integer. */
+function usableClaim(claim: unknown): claim is number {
+  return typeof claim === 'number' && Number.isSafeInteger(claim) && claim > 0;
+}
+
+function matchesSchemaVersion(raw: string): boolean {
+  try {
+    return (JSON.parse(raw) as { v?: number } | null)?.v === SCHEMA_VERSION;
+  } catch {
+    return false;
+  }
+}
+
+function parseStoredClaim(raw: unknown): number {
+  const claim = Number(raw);
+  if (!Number.isSafeInteger(claim) || claim < 0) throw new Error(`unusable claim number ${String(raw)}`);
+  return claim;
+}
+
+export type ClaimAnswer = { outcome: 'claimed'; claim: number } | { outcome: 'mismatch' } | { outcome: 'stopped' };
+
+/** How provisioning ended: the schema is this bot's, the database holds another version (found), or the backend stopped. */
+export type ProvisionVerdict = { state: 'provisioned' } | { state: 'mismatch'; found: string } | { state: 'stopped' };
 
 type AlertEvent = 'outage' | 'recovered' | 'deposed';
 type AlertListener = (event: AlertEvent, detail: string) => void;
@@ -115,6 +142,7 @@ export class PostgresBackend implements DataBackend {
   private outageAlertFired = false;
   private outageAlertTimer: NodeJS.Timeout | null = null;
   private schemaMismatch = false;
+  private mismatchFound = 'unreadable';
   private provisioned = false;
   private started = false;
   private stopped = false;
@@ -163,6 +191,29 @@ export class PostgresBackend implements DataBackend {
     try {
       await this.pool.end();
     } catch { /* already ended */ }
+  }
+
+  /** Waits until provisioning has passed, has found another schema version, or the backend stopped. */
+  async provisionVerdict(): Promise<ProvisionVerdict> {
+    for (;;) {
+      if (this.stopped) return { state: 'stopped' };
+      if (this.schemaMismatch) return { state: 'mismatch', found: this.mismatchFound };
+      if (this.provisioned) return { state: 'provisioned' };
+      await this.sleep(PROVISION_VERDICT_POLL_MS);
+    }
+  }
+
+  /** TTL sweep of graveyard rows older than the cutoff; guild_ownership rows are the claim fence and are never deleted.
+   * Returns the number of rows deleted; idempotent, safe to misfire. */
+  async sweepGraveyard(cutoffMs: number): Promise<number> {
+    const tombstones = await this.pool.query(
+      `DELETE FROM smdb_data.guild_data_graveyard WHERE retired_at < $1`, [cutoffMs]);
+    return tombstones.rowCount ?? 0;
+  }
+
+  /** True while the backend may write: provisioned at this bot's schema version and not stopped. */
+  servesData(): boolean {
+    return this.provisioned && !this.schemaMismatch && !this.stopped;
   }
 
   connectionState(): { state: 'connecting' | 'ready' | 'outage'; outageSinceMs?: number } {
@@ -295,6 +346,11 @@ export class PostgresBackend implements DataBackend {
     try {
       await client.query(`SELECT pg_advisory_lock(hashtext('smdb_data_bootstrap'))`);
       try {
+        const existing = await this.readSchemaVersion(client);
+        if (existing !== undefined && !matchesSchemaVersion(existing)) {
+          this.latchSchemaMismatch(existing);
+          return;
+        }
         for (const stmt of PROVISION_DDL) await client.query(stmt);
         for (let i = 0; i < PARTITION_COUNT; i++) {
           const suffix = `p${String(i).padStart(2, '0')}`;
@@ -306,17 +362,8 @@ export class PostgresBackend implements DataBackend {
         await client.query(
           `INSERT INTO smdb_data.meta (key, value) VALUES ('schema_version', $1) ON CONFLICT (key) DO NOTHING`,
           [JSON.stringify({ v: SCHEMA_VERSION })]);
-        const versionRes = await client.query(`SELECT value FROM smdb_data.meta WHERE key = 'schema_version'`);
-        const rawVersion: string | undefined = versionRes.rows[0]?.value;
-        let versionOk = false;
-        if (rawVersion !== undefined) {
-          try {
-            versionOk = (JSON.parse(rawVersion) as { v?: number })?.v === SCHEMA_VERSION;
-          } catch {
-            versionOk = false;
-          }
-        }
-        if (!versionOk) {
+        const rawVersion = await this.readSchemaVersion(client);
+        if (rawVersion === undefined || !matchesSchemaVersion(rawVersion)) {
           this.latchSchemaMismatch(rawVersion);
           return;
         }
@@ -334,8 +381,20 @@ export class PostgresBackend implements DataBackend {
     }
   }
 
+  /** The stored schema_version value; undefined when the meta table or its row does not exist yet. */
+  private async readSchemaVersion(client: PoolClient): Promise<string | undefined> {
+    try {
+      const res = await client.query(`SELECT value FROM smdb_data.meta WHERE key = 'schema_version'`);
+      return res.rows[0]?.value;
+    } catch (error) {
+      if (isMissingRelation(error)) return undefined;
+      throw error;
+    }
+  }
+
   private latchSchemaMismatch(found: string | undefined): void {
     this.schemaMismatch = true;
+    this.mismatchFound = found ?? 'unreadable';
     this.state = 'outage';
     if (this.outageSince === undefined) this.outageSince = Date.now();
     this.clearOutageAlertTimer();
@@ -346,10 +405,60 @@ export class PostgresBackend implements DataBackend {
   }
 
   // ==========================================================================
+  // CLAIM NUMBERS
+  // ==========================================================================
+
+  /**
+   * This process's claim number, once provisioning has passed: the next value of smdb_data.claim_seq, raised above
+   * every claim a guild_ownership row holds (a restore can bring rows back without the sequence's value). Answers
+   * 'mismatch' when the database's schema version is not this bot's and 'stopped' once the backend stopped. Throws
+   * while the database cannot answer.
+   */
+  async takeClaim(): Promise<ClaimAnswer> {
+    for (;;) {
+      if (this.stopped) return { outcome: 'stopped' };
+      if (this.provisioned) break;
+      if (this.schemaMismatch) return { outcome: 'mismatch' };
+      await this.sleep(CLAIM_PROVISION_POLL_MS);
+    }
+    const client = await this.pool.connect();
+    let destroy = false;
+    try {
+      await client.query('BEGIN');
+      // Every taker holds this lock, so a setval never moves the sequence back under another taker.
+      await client.query(`SELECT pg_advisory_xact_lock(hashtext('smdb_data_claim'))`);
+      let claim = parseStoredClaim((await client.query(`SELECT nextval('smdb_data.claim_seq') AS claim`)).rows[0]?.claim);
+      const highest = (await client.query(`SELECT max(claim) AS claim FROM smdb_data.guild_ownership`)).rows[0]?.claim;
+      const floor = highest === null || highest === undefined ? 0 : parseStoredClaim(highest);
+      if (claim <= floor) {
+        claim = floor + 1;
+        await client.query(`SELECT setval('smdb_data.claim_seq', $1)`, [claim]);
+      }
+      if (!usableClaim(claim)) throw new Error(`unusable claim number ${claim}`);
+      await client.query('COMMIT');
+      return { outcome: 'claimed', claim };
+    } catch (error) {
+      destroy = true;
+      await this.rollbackQuiet(client);
+      throw error;
+    } finally {
+      client.release(destroy ? true : undefined);
+    }
+  }
+
+  /** A fenced call with no usable claim touches no row and leaves the outage state alone. */
+  private refusedWithoutClaim(op: 'hydrate' | 'flush' | 'retire' | 'reclaim', guildId: string, token: FenceToken): boolean {
+    if (usableClaim(token.claim)) return false;
+    console.error(`[PostgresBackend] Refused ${op} for guild ${guildId}: this process holds no shard claim`);
+    return true;
+  }
+
+  // ==========================================================================
   // FENCED TRANSACTIONS
   // ==========================================================================
 
   async hydrateGuild(guildId: string, token: FenceToken): Promise<HydrationOutcome> {
+    if (this.refusedWithoutClaim('hydrate', guildId, token)) return { ok: false, reason: 'unavailable' };
     let client: PoolClient;
     try {
       client = await this.pool.connect();
@@ -394,6 +503,7 @@ export class PostgresBackend implements DataBackend {
    * over.
    */
   async reclaimGuild(guildId: string, token: FenceToken): Promise<'kept' | 'lost' | null> {
+    if (this.refusedWithoutClaim('reclaim', guildId, token)) return null;
     let client: PoolClient;
     try {
       client = await this.pool.connect();
@@ -429,6 +539,7 @@ export class PostgresBackend implements DataBackend {
   }
 
   async flushGuild(guildId: string, batch: GuildFlushBatch, token: FenceToken): Promise<FlushOutcome> {
+    if (this.refusedWithoutClaim('flush', guildId, token)) return { ok: false, reason: 'unavailable' };
     let client: PoolClient;
     try {
       client = await this.pool.connect();
@@ -450,10 +561,8 @@ export class PostgresBackend implements DataBackend {
         await client.query('ROLLBACK');
         const currentOwner = await this.readOwner(client, guildId);
         this.noteSuccess();
-        const ownerText = currentOwner
-          ? `${currentOwner.nodeId} (term ${currentOwner.term}, epoch ${currentOwner.epoch})`
-          : 'unknown';
-        const detail = `deposed: guild ${guildId} owned by ${ownerText}; local token ${token.nodeId} (term ${token.term}, epoch ${token.epoch})`;
+        const ownerText = currentOwner ? `${currentOwner.nodeId} (claim ${currentOwner.claim})` : 'unknown';
+        const detail = `deposed: guild ${guildId} owned by ${ownerText}; local token ${token.nodeId} (claim ${token.claim})`;
         console.error(`[PostgresBackend] Flush rejected: ${detail}`);
         this.fireAlert('deposed', detail);
         return { ok: false, reason: 'deposed', currentOwner };
@@ -491,6 +600,7 @@ export class PostgresBackend implements DataBackend {
   }
 
   async retireGuild(guildId: string, reason: string, token: FenceToken): Promise<RetireOutcome> {
+    if (this.refusedWithoutClaim('retire', guildId, token)) return { ok: false, reason: 'unavailable' };
     let client: PoolClient;
     try {
       client = await this.pool.connect();
@@ -544,6 +654,13 @@ export class PostgresBackend implements DataBackend {
   }
 
   async restoreGuild(guildId: string, retiredAt: number, _token: FenceToken): Promise<{ ok: true; moved: number } | { ok: false; reason: string }> {
+    if (this.schemaMismatch || !this.provisioned) {
+      const reason = this.schemaMismatch ? 'schema-mismatch' : 'not-provisioned';
+      console.error(`[PostgresBackend] Refused restore for guild ${guildId}: ${this.schemaMismatch
+        ? `the database holds schema version ${this.mismatchFound}`
+        : 'the database is not provisioned yet'}`);
+      return { ok: false, reason };
+    }
     let client: PoolClient;
     try {
       client = await this.pool.connect();
@@ -595,15 +712,15 @@ export class PostgresBackend implements DataBackend {
   }
 
   private fenceParams(guildId: string, token: FenceToken): unknown[] {
-    return [guildId, token.nodeId, token.shardId, token.term, token.epoch, token.shardCount];
+    return [guildId, token.nodeId, token.shardId, token.claim, token.shardCount];
   }
 
-  private async readOwner(client: PoolClient, guildId: string): Promise<{ nodeId: string; term: number; epoch: number } | undefined> {
+  private async readOwner(client: PoolClient, guildId: string): Promise<GuildOwner | undefined> {
     try {
       const res = await client.query(OWNER_SELECT, [guildId]);
       const row = res.rows[0];
       if (!row) return undefined;
-      return { nodeId: row.node_id, term: Number(row.term), epoch: Number(row.epoch) };
+      return { nodeId: row.node_id, claim: Number(row.claim) };
     } catch {
       return undefined;
     }
@@ -789,29 +906,3 @@ export async function readStoreId(url: string): Promise<string | null> {
   }
 }
 
-/** The highest term any guild_ownership row holds; 0 when the table is empty. Throws while it cannot be read. */
-export async function readMaxOwnershipTerm(backend: PostgresBackend): Promise<number> {
-  const res = await backend.getPool().query('SELECT max(term) AS term FROM smdb_data.guild_ownership');
-  const raw = res.rows[0]?.term;
-  if (raw === null || raw === undefined) return 0;
-  const term = Number(raw);
-  if (!Number.isSafeInteger(term) || term < 0) throw new Error(`unusable ownership term ${String(raw)}`);
-  return term;
-}
-
-/** TTL sweep: graveyard rows plus retired ownership rows older than the cutoff.
- * Returns the number of rows deleted; idempotent, safe to misfire. */
-export async function sweepGraveyardRows(url: string, cutoffMs: number): Promise<number> {
-  const client = await metaClient(url);
-  try {
-    const tombstones = await client.query(
-      `DELETE FROM smdb_data.guild_data_graveyard WHERE retired_at < $1`, [cutoffMs]);
-    const ownership = await client.query(
-      `DELETE FROM smdb_data.guild_ownership
-        WHERE retired_at IS NOT NULL AND retired_at < to_timestamp($1::double precision / 1000.0)`,
-      [cutoffMs]);
-    return (tombstones.rowCount ?? 0) + (ownership.rowCount ?? 0);
-  } finally {
-    await client.end().catch(() => { /* best effort */ });
-  }
-}

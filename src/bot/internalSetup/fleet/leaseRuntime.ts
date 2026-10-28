@@ -13,8 +13,7 @@ export interface LeaseInfo {
 }
 
 export interface LeaseGrant {
-  term: number;
-  epoch: number;
+  claim: number | null;
   shardCount: number;
   leases: LeaseInfo[];
 }
@@ -26,8 +25,7 @@ export interface ShardStatusEntry {
 }
 
 export interface CurrentLease {
-  term: number;
-  epoch: number;
+  claim: number | null;
   shardCount: number;
   leases: LeaseInfo[];
 }
@@ -62,7 +60,7 @@ export class LeaseRuntime {
       this.current.shardCount === grant.shardCount &&
       sameNumberSet(this.current.leases.map(l => l.shardId), shardIds);
 
-    this.current = { term: grant.term, epoch: grant.epoch, shardCount: grant.shardCount, leases: grant.leases };
+    this.current = { claim: grant.claim, shardCount: grant.shardCount, leases: grant.leases };
     this.ingest.setShardPlan(shardIds, grant.shardCount);
     this.notifyDataLayer(this.current);
     if (!sameShape && this.ingest.isStarted()) {
@@ -91,8 +89,7 @@ export class LeaseRuntime {
   private notifyDataLayer(current: CurrentLease): void {
     getDataReadiness()?.onLeaseChanged({
       nodeId: getNodeId(),
-      term: current.term,
-      epoch: current.epoch,
+      claim: current.claim,
       shardCount: current.shardCount,
       shardIds: current.leases.map(l => l.shardId),
     });

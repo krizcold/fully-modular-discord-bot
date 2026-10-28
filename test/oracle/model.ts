@@ -181,11 +181,11 @@ const hot = (k: number) => `${RUN}-h${k}.json`;
 const sixAcked = () => [1, 2, 3, 4, 5, 6].flatMap(n => [send(n, 'a', u('a', n), n, `x${n}`, n * 10), ans(n, n * 10 + 1)]);
 const sixDocs = () => new Map([1, 2, 3, 4, 5, 6].map(n => [u('a', n), `x${n}`]));
 const fleetNode = (nodeId: string, leases: number[], over: Partial<{
-  name: string; initialized: boolean; table: [number, string][]; guildMap: Record<string, number>; shardCount: number;
+  name: string; initialized: boolean; table: [number, string][]; guildMap: Record<string, number>; shardCount: number; claim: number | null;
 }> = {}) => ({
   name: over.name ?? nodeId,
   state: {
-    initialized: over.initialized ?? true, nodeId, shardCount: over.shardCount ?? 2,
+    initialized: over.initialized ?? true, nodeId, shardCount: over.shardCount ?? 2, claim: over.claim ?? null,
     leases: leases.map(shardId => ({ shardId })),
     shardTable: (over.table ?? []).map(([shardId, owner]) => ({ shardId, nodeId: owner, status: 'Ready' })),
     guildMap: over.guildMap ?? {},
@@ -570,6 +570,55 @@ export function checks(): Check[] {
       expect(guilds.some(d => /guild 12 to shard 5, outside the shard count/.test(d))).toBe(true);
       const counts = J.judgeFleet([fleetNode('m', [0]), fleetNode('w', [1], { shardCount: 3 })]).map(v => v.detail);
       expect(counts.some(d => /disagree on the shard count/.test(d))).toBe(true);
+    } },
+    { name: 'two live nodes with one claim is CONTROL', run: J => {
+      const same = J.judgeFleet([fleetNode('m', [0], { claim: 7 }), fleetNode('w', [1], { claim: 7 })]).map(v => v.detail);
+      expect(same).toEqual(['nodes m, w report the same claim 7']);
+      expect(J.judgeFleet([fleetNode('m', [0], { claim: 7 }), fleetNode('w', [1], { claim: 8 })])).toEqual([]);
+      // A JSON bot takes no claim, and a node that did not answer reports none.
+      expect(J.judgeFleet([fleetNode('m', [0]), fleetNode('w', [1])])).toEqual([]);
+      expect(J.judgeFleet([fleetNode('m', [0], { claim: 7 }), fleetNode('w', [1], { claim: 7, initialized: false })])).toEqual([]);
+      const history = J.buildHistory([[start(['a']), ...sixAcked(), { t: 'end' }]]);
+      const copies = [copyOf('db', sixDocs())];
+      // Two sets: a shared claim counts only when both show it.
+      const twice = [fleetNode('m', [0], { claim: 7 }), fleetNode('w', [1], { claim: 7 })];
+      const apart = [fleetNode('m', [0], { claim: 7 }), fleetNode('w', [1], { claim: 9 })];
+      expect(J.judge({ history, copies, k: 0, fleet: twice, fleetAgain: apart }).verdicts).toEqual([]);
+      expect(J.judge({ history, copies, k: 0, fleet: twice, fleetAgain: twice }).verdicts.map(v => v.v)).toEqual(['CONTROL']);
+    } },
+    { name: 'a live claim at or above the next claim a boot would draw is CONTROL', run: J => {
+      const history = J.buildHistory([[start(['a']), ...sixAcked(), { t: 'end' }]]);
+      const copies = [copyOf('db', sixDocs())];
+      const listing = (last: number, called: boolean, highest: number | null) => JSON.stringify({ last, called, highest });
+      const live = [fleetNode('m', [0], { claim: 7 }), fleetNode('w', [1], { claim: 10 })];
+      const run = (ownership: string, fleet = live) => J.judge({ history, copies, k: 0, fleet, ownership });
+      // A later boot that took claim 12 and stopped leaves rows and the sequence above every live claim: normal.
+      expect(run(listing(12, true, 12)).verdicts).toEqual([]);
+      expect(run(listing(10, true, 10)).verdicts).toEqual([]);
+      // A restore put the sequence and the rows back to 4 while w holds 10: the next boot draws 5.
+      expect(run(listing(4, true, 4)).verdicts.map(v => v.detail)).toEqual([
+        'a live node holds claim 10, and the next boot would draw claim 5 (claim_seq at 4, called; highest guild_ownership claim 4): the claim sequence went back',
+      ]);
+      // Rows that hold a high claim raise the next draw over an old sequence.
+      expect(run(listing(4, true, 11)).verdicts).toEqual([]);
+      // A sequence reset with is_called false hands out last_value itself.
+      expect(run(listing(10, false, null)).verdicts.map(v => v.v)).toEqual(['CONTROL']);
+      expect(run(listing(11, false, null)).verdicts).toEqual([]);
+      expect(run(listing(10, true, null)).verdicts).toEqual([]);
+      // A node that did not answer is not live, so its claim is not compared.
+      const dead = [fleetNode('m', [0], { claim: 3 }), fleetNode('w', [1], { claim: 20, initialized: false })];
+      expect(run(listing(4, true, 4), dead).verdicts).toEqual([]);
+      // With no live claim to compare, nothing is judged, and a note says so.
+      const none = run(listing(4, true, 4), [fleetNode('m', [0]), fleetNode('w', [1])]);
+      expect(none.verdicts).toEqual([]);
+      expect(none.notes.join('\n')).toMatch(/no live node reports a claim/);
+      // An empty or unparsable listing judges nothing and writes a note.
+      for (const bad of ['', '\n', 'not json', '{"g":"10","c":4}', `${listing(4, true, 4)}\n${listing(4, true, 4)}`]) {
+        const r = run(bad);
+        expect(r.verdicts).toEqual([]);
+        expect(r.notes.join('\n')).toMatch(/the ownership listing was not judged: (it has \d+ lines|its line is not)/);
+      }
+      expect(J.parseOwnership(`${listing(4, false, null)}\n`)).toEqual({ last: 4, called: false, highest: null });
     } },
     { name: 'with two sets of control facts, only a CONTROL seen in both counts', run: J => {
       const log = [start(['a']), ...sixAcked(), { t: 'end' }];

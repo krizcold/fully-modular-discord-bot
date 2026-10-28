@@ -1,7 +1,7 @@
 // IngestService wraps Client construction and gateway login. {shards,
 // shardCount} arrive as this process's LEASE (every shard); login only ever
 // happens through LeaseRuntime, which owns the no-identify-without-a-
-// current-term-lease invariant. The Client instance is created exactly once
+// claimed-lease invariant. The Client instance is created exactly once
 // per process (modules, panels and handlers hold references to it); lease
 // changes bounce its gateway sessions, never the object.
 

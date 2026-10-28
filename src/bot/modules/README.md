@@ -78,3 +78,5 @@ import { loadModuleData, saveModuleData } from '@internal/utils/dataManager';
 // Automatically stored in: /data/{guildId}/{moduleName}/filename.json
 const data = loadModuleData('filename.json', guildId, 'moduleName', defaultValue);
 ```
+
+To change stored data from what it holds now (a counter, a list), use `updateModuleData('filename.json', guildId, 'moduleName', defaultValue, current => next)`: it reads, changes and saves in one step, so a write made while your handler awaited something is not lost. The function must not save other data: that throws a TypeError and the update writes nothing. An async function is refused the same way, but whatever it does after its first await runs later, outside the update, so do every await before the update. The web UI is a separate process, and a global file it writes can still land between the read and the save. A `.jsonl` file written by `appendData` is never updated whole.

@@ -77,7 +77,7 @@ async function recoverUpdatePanel(
   } catch (error: any) {
     if (error.code === 10003) {
       console.log('[PersistentPanelRecovery] UPDATE panel channel no longer exists, removing from storage');
-      await removePersistentPanel('update_manager', guildId);
+      await removePersistentPanel('update_manager', guildId, undefined, instance.messageId);
       return;
     }
     if (error.code === 50001) {
@@ -89,7 +89,7 @@ async function recoverUpdatePanel(
 
   if (!channel || !channel.isTextBased()) {
     console.log('[PersistentPanelRecovery] UPDATE panel channel invalid, removing from storage');
-    await removePersistentPanel('update_manager', guildId);
+    await removePersistentPanel('update_manager', guildId, undefined, instance.messageId);
     return;
   }
 
@@ -122,7 +122,7 @@ async function recoverUpdatePanel(
 
       if (!(await updatePanelDynamic(context, 'update_manager', response, undefined, messageId))) return;
 
-      await updatePersistentPanelState('update_manager', 'recovered', guildId, undefined, {
+      await updatePersistentPanelState('update_manager', 'recovered', messageId, guildId, undefined, {
         lastCheckResult: combinedCheck
       });
 
@@ -169,14 +169,14 @@ async function recoverPanelInstance(
   } catch (error: any) {
     if (error.code === 10003) {
       // Unknown Channel - remove stored panel
-      await removePersistentPanel(panelId, guildId, sessionId);
+      await removePersistentPanel(panelId, guildId, sessionId, instance.messageId);
       return;
     }
     throw error;
   }
 
   if (!channel || !channel.isTextBased()) {
-    await removePersistentPanel(panelId, guildId, sessionId);
+    await removePersistentPanel(panelId, guildId, sessionId, instance.messageId);
     return;
   }
 
@@ -187,14 +187,14 @@ async function recoverPanelInstance(
   } catch (error: any) {
     if (error.code === 10008) {
       // Unknown Message - remove stored panel
-      await removePersistentPanel(panelId, guildId, sessionId);
+      await removePersistentPanel(panelId, guildId, sessionId, instance.messageId);
       return;
     }
     throw error;
   }
 
   if (!message) {
-    await removePersistentPanel(panelId, guildId, sessionId);
+    await removePersistentPanel(panelId, guildId, sessionId, instance.messageId);
     return;
   }
 

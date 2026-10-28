@@ -88,9 +88,10 @@ export function recognitionRefusal(): string | null {
  * Store-identity verdict (the mistyped-or-swapped-URL case that otherwise
  * looks exactly like a fresh install). Call once the database answers; throws
  * PostgresUnreachableError while it cannot be asked so the caller retries.
- * On first contact with a provisioned store the marker adopts its store_id.
+ * A marker with no store id adopts the store's only when adopt is set (provisioning passed); until then the verdict
+ * is pending, so a database refused for its schema version never leaves its id in the marker.
  */
-export async function verifyStoreIdentity(url: string): Promise<{ ok: true } | { ok: false; reason: string; pending?: true }> {
+export async function verifyStoreIdentity(url: string, adopt: boolean): Promise<{ ok: true } | { ok: false; reason: string; pending?: true }> {
   let dbStoreId: string | null;
   try {
     dbStoreId = await readStoreId(url);
@@ -107,6 +108,7 @@ export async function verifyStoreIdentity(url: string): Promise<{ ok: true } | {
     return { ok: false, reason: 'the marker records data living in postgres but the configured database carries no store identity', pending: true };
   }
   if (dbStoreId && (!marker || marker.storeId === null)) {
+    if (!adopt) return { ok: false, reason: 'the store id is adopted once provisioning passes', pending: true };
     writeFileMarker({
       live: marker?.live ?? 'postgres',
       storeId: dbStoreId,

@@ -98,7 +98,7 @@ const updateManagerPanel: PanelOptions = {
         const shown = await updatePanelDynamic(updateContext, 'update_manager', resultResponse, undefined, messageId);
 
         if (shown && combinedCheck) {
-          await updatePersistentPanelState('update_manager', 'checked', guildId, undefined, {
+          await updatePersistentPanelState('update_manager', 'checked', messageId, guildId, undefined, {
             lastCheckResult: combinedCheck
           });
         }
@@ -474,6 +474,13 @@ function buildInformationView(context: PanelContext): PanelResponse {
 
 // ─── Button Handlers ───
 
+/** Stamps the stored panel's state only while it is still the message the button was pressed on. */
+async function stampPanelState(context: PanelContext, state: string, data?: any): Promise<void> {
+  const messageId: string | undefined = (context.interaction as any)?.message?.id;
+  if (!messageId) return;
+  await updatePersistentPanelState('update_manager', state, messageId, context.guildId || undefined, undefined, data);
+}
+
 /**
  * Handle check updates button
  */
@@ -494,7 +501,7 @@ async function handleCheckUpdates(context: PanelContext): Promise<PanelResponse>
       const shown = await updatePanelDynamic(context, 'update_manager', resultResponse);
 
       if (shown && combinedCheck) {
-        await updatePersistentPanelState('update_manager', 'checked', context.guildId || undefined, undefined, {
+        await stampPanelState(context, 'checked', {
           lastCheckResult: combinedCheck
         });
       }
@@ -518,14 +525,14 @@ async function handleCheckUpdates(context: PanelContext): Promise<PanelResponse>
  * Handle system update button: requests pull + rebuild from Bot Manager
  */
 async function handleSystemUpdate(context: PanelContext): Promise<PanelResponse> {
-  await updatePersistentPanelState('update_manager', 'updating', context.guildId || undefined);
+  await stampPanelState(context, 'updating');
   const updatingResponse = buildPanelView(context, 'updating_system');
 
   setImmediate(async () => {
     try {
       const result = await requestSystemUpdate();
       if (result.success) {
-        await updatePersistentPanelState('update_manager', 'update_triggered', context.guildId || undefined);
+        await stampPanelState(context, 'update_triggered');
 
         const successContainer = new ContainerBuilder()
           .setAccentColor(0x2ECC71)
@@ -544,14 +551,14 @@ async function handleSystemUpdate(context: PanelContext): Promise<PanelResponse>
         const successResponse = createV2Response([successContainer]);
         await updatePanelDynamic(context, 'update_manager', successResponse);
       } else {
-        await updatePersistentPanelState('update_manager', 'update_error', context.guildId || undefined);
+        await stampPanelState(context, 'update_error');
         const newCheck = await checkForAllBotUpdates();
         const errorResponse = buildPanelView(context, 'main', newCheck);
         await updatePanelDynamic(context, 'update_manager', errorResponse);
       }
     } catch (error) {
       console.error('[UpdateManagerPanel] Error during system update:', error);
-      await updatePersistentPanelState('update_manager', 'update_error', context.guildId || undefined);
+      await stampPanelState(context, 'update_error');
       const newCheck = await checkForAllBotUpdates();
       const errorResponse = buildPanelView(context, 'main', newCheck);
       await updatePanelDynamic(context, 'update_manager', errorResponse);
@@ -593,7 +600,7 @@ async function handleUpdateAllModules(context: PanelContext): Promise<PanelRespo
       const shown = await updatePanelDynamic(context, 'update_manager', resultResponse);
 
       if (shown && newCheck) {
-        await updatePersistentPanelState('update_manager', 'modules_updated', context.guildId || undefined, undefined, {
+        await stampPanelState(context, 'modules_updated', {
           lastCheckResult: newCheck,
           lastModuleUpdate: { updated: result.updated, failed: result.failed, skipped: result.skipped, checkErrors: result.checkErrors }
         });
@@ -613,7 +620,7 @@ async function handleUpdateAllModules(context: PanelContext): Promise<PanelRespo
  * Handle update everything: system update first (modules sync on boot via "Update on Reboot")
  */
 async function handleUpdateEverything(context: PanelContext): Promise<PanelResponse> {
-  await updatePersistentPanelState('update_manager', 'updating', context.guildId || undefined);
+  await stampPanelState(context, 'updating');
   const updatingResponse = buildPanelView(context, 'updating_system');
 
   setImmediate(async () => {
@@ -625,7 +632,7 @@ async function handleUpdateEverything(context: PanelContext): Promise<PanelRespo
 
       const result = await requestSystemUpdate();
       if (result.success) {
-        await updatePersistentPanelState('update_manager', 'update_triggered', context.guildId || undefined);
+        await stampPanelState(context, 'update_triggered');
 
         const successContainer = new ContainerBuilder()
           .setAccentColor(0x2ECC71)
@@ -645,14 +652,14 @@ async function handleUpdateEverything(context: PanelContext): Promise<PanelRespo
         const successResponse = createV2Response([successContainer]);
         await updatePanelDynamic(context, 'update_manager', successResponse);
       } else {
-        await updatePersistentPanelState('update_manager', 'update_error', context.guildId || undefined);
+        await stampPanelState(context, 'update_error');
         const newCheck = await checkForAllBotUpdates();
         const errorResponse = buildPanelView(context, 'main', newCheck);
         await updatePanelDynamic(context, 'update_manager', errorResponse);
       }
     } catch (error) {
       console.error('[UpdateManagerPanel] Error during combined update:', error);
-      await updatePersistentPanelState('update_manager', 'update_error', context.guildId || undefined);
+      await stampPanelState(context, 'update_error');
       const newCheck = await checkForAllBotUpdates();
       const errorResponse = buildPanelView(context, 'main', newCheck);
       await updatePanelDynamic(context, 'update_manager', errorResponse);
@@ -695,7 +702,7 @@ async function handleUpdateSingleModule(context: PanelContext, moduleName: strin
       const shown = await updatePanelDynamic(context, 'update_manager', resultResponse);
 
       if (shown && newCheck) {
-        await updatePersistentPanelState('update_manager', 'module_updated', context.guildId || undefined, undefined, {
+        await stampPanelState(context, 'module_updated', {
           lastCheckResult: newCheck,
           lastSingleModuleUpdate: result
         });
@@ -717,7 +724,7 @@ async function handleUpdateSingleModule(context: PanelContext, moduleName: strin
 async function handleClosePanel(context: PanelContext): Promise<PanelResponse> {
   if (context.interaction && 'message' in context.interaction && context.interaction.message) {
     try {
-      await removePersistentPanel('update_manager', context.guildId || undefined);
+      await removePersistentPanel('update_manager', context.guildId || undefined, undefined, context.interaction.message.id);
       await context.interaction.message.delete();
       console.log('[UpdateManagerPanel] Panel closed and deleted');
     } catch (error) {

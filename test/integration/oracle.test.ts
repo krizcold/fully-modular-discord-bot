@@ -404,6 +404,41 @@ describe('the data-loss oracle end to end', () => {
     expect((await runNode([CHECK, '--log', cleanLog, '--db', `db=${db}`, '--fleet-again', file('twice-m.json')])).code).toBe(64);
   });
 
+  it('names two nodes with one claim, and a claim sequence that went back below a live claim', async () => {
+    const state = (nodeId: string, shardId: number, claim: number) => () => ({ initialized: true, nodeId, shardCount: 2, claim, leases: [{ shardId }], shardTable: [], guildMap: {} });
+    const m = await startFakeApp({ pools: [pool], fleetState: state('m', 0, 7) });
+    const w = await startFakeApp({ pools: [pool], fleetState: state('w', 1, 7) });
+    try {
+      for (const [name, app] of [['m', m], ['w', w]] as const) {
+        expect((await runNode([ORACLE, 'fleet', '--target', app.url, '--name', name, '--out', file(`claim-${name}.json`)])).code).toBe(0);
+      }
+    } finally {
+      await m.close();
+      await w.close();
+    }
+    expect(JSON.parse(fs.readFileSync(file('claim-m.json'), 'utf8')).state.claim).toBe(7);
+    await psql('test', 'CREATE TABLE IF NOT EXISTS smdb_data.guild_ownership (guild_id text PRIMARY KEY, claim bigint NOT NULL)');
+    await psql('test', 'CREATE SEQUENCE IF NOT EXISTS smdb_data.claim_seq');
+    await psql('test', "INSERT INTO smdb_data.guild_ownership (guild_id, claim) VALUES ('10', 4), ('11', 5)");
+    await psql('test', "SELECT setval('smdb_data.claim_seq', 3)");
+    const listing = await runNode([ORACLE, 'sql', 'ownership']);
+    expect(listing.code).toBe(0);
+    fs.writeFileSync(file('ownership.jsonl'), await psql('test', listing.stdout.trim()));
+    const db = await dump('test', 'clean', 'claim-db.jsonl');
+    const r = await check(['--log', cleanLog, '--db', `db=${db}`, '--fleet', file('claim-m.json'), '--fleet', file('claim-w.json'), '--ownership', file('ownership.jsonl'), '--k', '3']);
+    expect(r.result.verdicts.filter((v: any) => v.v === 'CONTROL').map((v: any) => v.detail)).toEqual([
+      'nodes m, w report the same claim 7',
+      'a live node holds claim 7, and the next boot would draw claim 6 (claim_seq at 3, called; highest guild_ownership claim 5): the claim sequence went back',
+    ]);
+    // A later boot that took claim 9 and stopped is normal.
+    await psql('test', "INSERT INTO smdb_data.guild_ownership (guild_id, claim) VALUES ('12', 9)");
+    await psql('test', "SELECT setval('smdb_data.claim_seq', 9)");
+    fs.writeFileSync(file('ownership-later.jsonl'), await psql('test', listing.stdout.trim()));
+    const later = await check(['--log', cleanLog, '--db', `db=${db}`, '--fleet', file('claim-m.json'), '--fleet', file('claim-w.json'), '--ownership', file('ownership-later.jsonl'), '--k', '3']);
+    expect(later.result.verdicts.filter((v: any) => v.v === 'CONTROL').map((v: any) => v.detail)).toEqual(['nodes m, w report the same claim 7']);
+    expect(r.code).toBe(1);
+  });
+
   it('refuses a streamed copy cut short, and judges the writer\'s own file', async () => {
     const app = await startFakeApp({ pools: [pool] });
     let r;

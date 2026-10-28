@@ -4,7 +4,7 @@
 // database; writes are accepted into RAM with a bounded durability window and
 // refuse loudly (never silently) when that window cannot be honored.
 
-import { DataBackend, DocKey, FenceToken, GuildFlushBatch } from './backend';
+import { DataBackend, DocKey, FenceToken, GuildFlushBatch, GuildOwner } from './backend';
 import { setLeft } from './scopeRecord';
 
 const DEBOUNCE_MS = 500;
@@ -140,7 +140,7 @@ interface HydrationInFlight {
 }
 
 function sameGrant(a: FenceToken, b: FenceToken): boolean {
-  return a.term === b.term && a.epoch === b.epoch;
+  return a.claim === b.claim;
 }
 
 export class WorkingSetManager {
@@ -340,7 +340,7 @@ export class WorkingSetManager {
   /** Frozen under an older grant than the token's: a hydrate under the token serves it again. */
   frozenBefore(guildId: string, token: FenceToken): boolean {
     const ws = this.sets.get(guildId);
-    return ws?.state === 'frozen-retained' && (ws.fence.term !== token.term || ws.fence.epoch !== token.epoch);
+    return ws?.state === 'frozen-retained' && ws.fence.claim !== token.claim;
   }
 
   evict(guildId: string): void {
@@ -394,6 +394,17 @@ export class WorkingSetManager {
     if (doc.parsed === undefined) doc.parsed = JSON.parse(doc.content);
     // Clone preserves today's read isolation (a fresh parse per disk read).
     return { status: 'ready', value: structuredClone(doc.parsed) };
+  }
+
+  /**
+   * update(fn)'s read: not-ready with no bypass counted, 'stream' for a document written by appends (a whole write
+   * would replace its lines). Throws for a stored document that does not parse.
+   */
+  readForUpdate(guildId: string, module: string, filename: string): WsReadResult | { status: 'stream' } {
+    const ws = this.sets.get(guildId);
+    if (!ws || ws.state === 'hydrating' || ws.state === 'failed') return { status: 'not-ready' };
+    if (ws.appendKeys.has(docKeyOf(module, filename))) return { status: 'stream' };
+    return this.read(guildId, module, filename);
   }
 
   exists(guildId: string, module: string, filename: string): boolean | null {
@@ -639,9 +650,9 @@ export class WorkingSetManager {
     return false;
   }
 
-  private onDeposed(ws: GuildWorkingSet, owner?: { nodeId: string; term: number; epoch: number }): void {
+  private onDeposed(ws: GuildWorkingSet, owner?: GuildOwner): void {
     this.fencedFlushRejections += 1;
-    this.lastError = `guild ${ws.guildId} fenced by ${owner?.nodeId ?? 'unknown'} (term ${owner?.term ?? '?'}, epoch ${owner?.epoch ?? '?'})`;
+    this.lastError = `guild ${ws.guildId} fenced by ${owner?.nodeId ?? 'unknown'} (claim ${owner?.claim ?? '?'})`;
     console.error(`[Data] Deposed writer: ${this.lastError}; dropping the guild's working set without flushing`);
     // Drop dirty accounting; the flush is never retried (a deposed node's
     // leftover writes are never merged later - that would be a second writer).

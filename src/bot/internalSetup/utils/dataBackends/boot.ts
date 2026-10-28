@@ -5,12 +5,12 @@
 
 import { Guild, MessageFlags } from 'discord.js';
 import { DataBackendKind, loadCredentials, resolveDataBackend } from '../../../../utils/envLoader';
-import { PostgresBackend } from './postgresBackend';
+import { PostgresBackend, SCHEMA_VERSION } from './postgresBackend';
 import { initWorkingSet } from './workingSet';
 import type { DataUnavailableCause } from './workingSet';
 import { initDataReadiness, getDataReadiness, DataReadinessDriver } from './dataReadiness';
 import { evaluateRecognitionGuard, verifyStoreIdentity, readFileMarker, GuardVerdict } from './recognitionGuard';
-import { setGuildDataBackend, isClosedForExit, closeGuildWrites } from '../dataManager';
+import { setGuildDataBackend, isClosedForExit, closeGuildWrites, noteGuildDataServing } from '../dataManager';
 import { getConfigProperty } from '../configManager';
 import { ACK_MS, sweepLateWrites } from './replyGate';
 import { saveMark, type SaveMark } from './scopeRecord';
@@ -71,11 +71,13 @@ function findGuildId(args: any[]): { id: string; fromGuild: boolean } | null {
   return null;
 }
 
-function refuse(reason: string, mode: DataBackendKind = bootStatus.mode): void {
+const SETTING_FIX = 'Gates stay closed; fix DATA_BACKEND/DATA_BACKEND_URL in the web UI env editor';
+
+function refuse(reason: string, mode: DataBackendKind = bootStatus.mode, fix = SETTING_FIX): void {
   bootStatus = { ...bootStatus, mode, state: 'refused', refusalReason: reason };
   closeGuildWrites();
   console.error(`[Data] REFUSING to serve: ${reason}`);
-  console.error('[Data] Gates stay closed; fix DATA_BACKEND/DATA_BACKEND_URL in the web UI env editor');
+  console.error(`[Data] ${fix}`);
 }
 
 /** Called once at boot, before fleet init. Never throws; file mode is a no-op. */
@@ -120,40 +122,70 @@ function startPostgresRuntime(url: string): void {
   bootStatus = { ...bootStatus, mode: 'postgres', state: 'starting' };
   const ws = initWorkingSet(backend);
   setGuildDataBackend(backend);
-  void verifyIdentityLoop(url, initDataReadiness(backend, ws, { held: true }));
+  void verifyIdentityLoop(url, backend, initDataReadiness(backend, ws, { held: true }));
 }
 
-async function verifyIdentityLoop(url: string, driver: DataReadinessDriver): Promise<void> {
+async function verifyIdentityLoop(url: string, backend: PostgresBackend, driver: DataReadinessDriver): Promise<void> {
+  // A database of another schema version still carries its store id, so the identity check alone would pass it; a
+  // wrong store whose provisioning keeps failing is refused by the identity check, so the two run side by side.
+  const run = { schema: 'pending' as 'pending' | 'provisioned' | 'stopped', done: false };
+  const provisioning = backend.provisionVerdict().then(verdict => {
+    if (verdict.state === 'mismatch') {
+      if (run.done) return;
+      run.done = true;
+      refuse(`the database holds schema version ${verdict.found}, and this bot reads only version ${SCHEMA_VERSION}`, 'postgres',
+        'Gates stay closed; point DATA_BACKEND_URL at a database of this bot\'s schema version in the web UI env editor');
+      return;
+    }
+    run.schema = verdict.state;
+  });
+  const ended = () => run.done || run.schema === 'stopped';
+  let identityOk = false;
   let logged = false;
   for (;;) {
-    try {
-      const verdict = await verifyStoreIdentity(url);
-      if (!verdict.ok) {
-        // A store still provisioning carries no identity yet (a store
-        // mid-restore): waited on like an unreachable one, never refused.
-        if (!verdict.pending) {
-          refuse(verdict.reason, 'postgres');
-          return;
+    if (ended()) return;
+    let askedWhilePending = false;
+    if (!identityOk) {
+      askedWhilePending = run.schema === 'pending';
+      try {
+        const verdict = await verifyStoreIdentity(url, run.schema === 'provisioned');
+        if (!verdict.ok) {
+          // A store still provisioning carries no identity yet (a store
+          // mid-restore): waited on like an unreachable one, never refused.
+          if (!verdict.pending && !run.done) {
+            run.done = true;
+            refuse(verdict.reason, 'postgres');
+            return;
+          }
+        } else if (readFileMarker()?.storeId) {
+          // Only once the marker holds the store id (minted by the backend's
+          // own provisioning): hydration cannot proceed any earlier anyway, and
+          // adopting it now makes a later URL swap detectable from the very
+          // next boot.
+          identityOk = true;
         }
-      } else if (readFileMarker()?.storeId) {
-        // Release only once the marker holds the store id (minted by the
-        // backend's own provisioning): hydration cannot proceed any earlier
-        // anyway, and adopting it now makes a later URL swap detectable from
-        // the very next boot.
-        driver.release();
-        bootStatus = { ...bootStatus, state: 'serving' };
-        console.log('[Data] Postgres store identity verified; serving');
-        return;
-      }
-    } catch { /* unreachable; fall through to the retry sleep */ }
+      } catch { /* unreachable; fall through to the retry sleep */ }
+      if (ended()) return;
+    }
+    if (identityOk && run.schema === 'provisioned') {
+      run.done = true;
+      driver.release();
+      bootStatus = { ...bootStatus, state: 'serving' };
+      noteGuildDataServing();
+      console.log('[Data] Postgres store identity verified; serving');
+      return;
+    }
     if (!logged) {
       console.warn('[Data] Waiting on the data backend to verify store identity; gates stay closed');
       logged = true;
     }
-    await new Promise<void>(resolve => {
+    // Provisioning passed during that check, so the store id can be adopted now.
+    if (!identityOk && askedWhilePending && run.schema === 'provisioned') continue;
+    const retry = new Promise<void>(resolve => {
       const t = setTimeout(resolve, IDENTITY_RETRY_MS);
       t.unref();
     });
+    await (run.schema === 'pending' ? Promise.race([retry, provisioning]) : retry);
   }
 }
 

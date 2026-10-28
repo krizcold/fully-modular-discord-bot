@@ -719,8 +719,9 @@ async function read(argv) {
 const URL_SECRET = /\b[a-z][a-z0-9+.-]*:\/\/[^\s"'@/]*@/gi;
 
 /**
- * @typedef {{ initialized: boolean, nodeId: string | null, shardCount: number | null, leases: { shardId: number }[],
- *   shardTable: { shardId: number, nodeId: string | null, status: string | null }[], guildMap: Record<string, number> }} FleetFacts
+ * @typedef {{ initialized: boolean, nodeId: string | null, shardCount: number | null, claim: number | null,
+ *   leases: { shardId: number }[], shardTable: { shardId: number, nodeId: string | null, status: string | null }[],
+ *   guildMap: Record<string, number> }} FleetFacts
  */
 
 /**
@@ -735,6 +736,7 @@ export function reduceFleetState(state) {
     initialized: s.initialized === true,
     nodeId: typeof s.nodeId === 'string' ? s.nodeId : null,
     shardCount: typeof s.shardCount === 'number' ? s.shardCount : null,
+    claim: typeof s.claim === 'number' ? s.claim : null,
     leases: Array.isArray(s.leases) ? s.leases.map((/** @type {any} */ l) => ({ shardId: l.shardId })) : [],
     shardTable: Array.isArray(s.shardTable)
       ? s.shardTable.map((/** @type {any} */ r) => ({ shardId: r.shardId, nodeId: r.nodeId ?? null, status: r.status ?? null }))
@@ -780,8 +782,21 @@ async function cleanup(argv) {
   if (Object.keys(tally).some(cls => cls !== 'ACKED')) process.exitCode = 1;
 }
 
+/**
+ * The claim sequence listing, one line under `psql -At`: claim_seq's
+ * last_value and is_called, and the highest guild_ownership claim (null when
+ * none). The input check.mjs takes as --ownership.
+ */
+export function ownershipSql() {
+  return `SELECT json_build_object('last', s.last_value, 'called', s.is_called, 'highest', (SELECT max(claim) FROM smdb_data.guild_ownership)) FROM smdb_data.claim_seq s`;
+}
+
 /** @param {string[]} argv */
 async function sql(argv) {
+  if (argv.length === 1 && argv[0] === 'ownership') {
+    process.stdout.write(`${ownershipSql()}\n`);
+    return;
+  }
   const a = parseArgs(argv, { log: 'many' });
   const { run, guild } = keysFromLogs(a.log);
   process.stdout.write(`${dumpSql(guild, run)}\n`);
@@ -848,6 +863,7 @@ const USAGE = `${WRITE_USAGE}
 oracle.mjs read --log FILE [--log FILE ...] --target URL --name COPY --out FILE [--limit N] [--limiter SPEC] [--timeout MS]
 oracle.mjs fleet --target URL --name NODE --out FILE [--limiter SPEC] [--timeout MS]
 oracle.mjs sql --log FILE      the psql query that lists the run's docs
+oracle.mjs sql ownership       the psql query that lists guild_ownership's claims
 oracle.mjs bite --log FILE     the bite test's two tamperings, as SQL
 oracle.mjs cleanup --log FILE [--log FILE ...] --target URL [--limiter SPEC]`;
 

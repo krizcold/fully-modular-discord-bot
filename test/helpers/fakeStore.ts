@@ -77,7 +77,7 @@ export class FakeStore implements DataBackend {
     this.flushesSent += 1;
     if (this.holding) await new Promise<void>(resolve => { this.wire.push(resolve); });
     if (this.mode === 'unavailable') return { ok: false, reason: 'unavailable' };
-    if (this.mode === 'deposed') return { ok: false, reason: 'deposed', currentOwner: { nodeId: 'newer-owner', term: 9, epoch: 9 } };
+    if (this.mode === 'deposed') return { ok: false, reason: 'deposed', currentOwner: { nodeId: 'newer-owner', claim: 9 } };
     for (const { key, doc } of batch.upserts) this.docs.set(rowKey(guildId, key), doc);
     for (const key of batch.deletes) {
       this.docs.delete(rowKey(guildId, key));
@@ -141,5 +141,5 @@ export class FakeStore implements DataBackend {
   onAlert(): void { /* no alerts */ }
 }
 
-let epochs = 0;
-export const tokenFor = (): FenceToken => ({ nodeId: 'node-a', term: 1, epoch: ++epochs, shardId: 0, shardCount: 1 });
+let claims = 0;
+export const tokenFor = (): FenceToken => ({ nodeId: 'node-a', claim: ++claims, shardId: 0, shardCount: 1 });

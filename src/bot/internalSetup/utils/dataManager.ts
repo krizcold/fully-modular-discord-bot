@@ -50,9 +50,9 @@ import {
 import { getWorkingSet, DataBackendUnavailableError } from './dataBackends/workingSet';
 import type { WsTicket } from './dataBackends/workingSet';
 import type { FileTicket } from './dataBackends/fileBackend';
-import { sweepGraveyardRows, PostgresBackend } from './dataBackends/postgresBackend';
+import { PostgresBackend } from './dataBackends/postgresBackend';
 import type { DataBackend, FenceToken } from './dataBackends/backend';
-import { loadCredentials, resolveDataBackend } from '../../../utils/envLoader';
+import { resolveDataBackend } from '../../../utils/envLoader';
 import { currentSince, recordRefusal, recordTicket } from './dataBackends/writeLedger';
 import { noteScopeRefusal, noteScopeTicket, pendingFor, saveMark, stampOf, type SaveMark } from './dataBackends/scopeRecord';
 
@@ -108,8 +108,7 @@ export function fenceFromOwnerInfo(guildId: string): FenceToken | null {
   if (!info) return null;
   return {
     nodeId: info.nodeId,
-    term: info.term,
-    epoch: info.epoch,
+    claim: info.claim,
     shardId: guildIdToShardId(guildId, info.shardCount),
     shardCount: info.shardCount,
   };
@@ -203,6 +202,18 @@ let guildWritesClosed = false;
 /** The data layer refused to serve: every guild-scope write from now on is refused, so none lands in a store the deployment's data does not live in. */
 export function closeGuildWrites(): void {
   guildWritesClosed = true;
+}
+
+/** Whether closeGuildWrites ran: every guild-scope write is refused. */
+export function areGuildWritesClosed(): boolean {
+  return guildWritesClosed;
+}
+
+let guildDataServing = false;
+
+/** The data boot verified the database and its schema: the graveyard sweep may touch it from now on. */
+export function noteGuildDataServing(): void {
+  guildDataServing = true;
 }
 
 function guildWriteClosed(options: DataOptions, what: string): boolean {
@@ -371,17 +382,18 @@ export function listGuildDataKeys(guildId: string): { module: string; filename: 
 
 /**
  * Graveyard TTL sweep: always sweeps the file _graveyard; in postgres mode it
- * also sweeps tombstoned rows.
+ * also sweeps graveyard rows, through the served backend's own pool.
  */
 export async function sweepGraveyard(): Promise<void> {
   await sweepFileGraveyard();
   if (!pgBackend || !servedByPostgres()) return;
-  const url = loadCredentials().DATA_BACKEND_URL;
-  if (!url) return;
+  if (!guildDataServing || guildWritesClosed) return;
+  const served = pgBackend as { servesData?: () => boolean; sweepGraveyard?: (cutoffMs: number) => Promise<number> };
+  if (!served.servesData?.() || !served.sweepGraveyard) return;
   const ttlDays = Number(process.env.GRAVEYARD_TTL_DAYS);
   const ttlMs = (Number.isFinite(ttlDays) && ttlDays > 0 ? ttlDays : 14) * 24 * 60 * 60 * 1000;
   try {
-    const swept = await sweepGraveyardRows(url, Date.now() - ttlMs);
+    const swept = await served.sweepGraveyard(Date.now() - ttlMs);
     if (swept > 0) console.log(`[Data] Swept ${swept} expired graveyard row(s)`);
   } catch (error) {
     console.warn('[Data] Graveyard row sweep failed:', error instanceof Error ? error.message : error);
@@ -460,8 +472,7 @@ function getDataFilePath(filename: string, options: DataOptions): string {
 
 export interface OwnerInfo {
   nodeId: string;
-  term: number;
-  epoch: number;
+  claim: number | null;
   shardCount: number;
 }
 
@@ -642,6 +653,7 @@ export function saveDataTracked<T = any>(filename: string, options: DataOptions,
 }
 
 function acceptSave<T>(filename: string, options: DataOptions, data: T): SaveTracked {
+  refuseInsideUpdate();
   if (closedForExit) throw new DataBackendUnavailableError('node-stopping');
   if (guildWriteClosed(options, 'Write')) return { outcome: 'refused', cause: 'not-ready' };
   try {
@@ -685,6 +697,117 @@ function acceptSave<T>(filename: string, options: DataOptions, data: T): SaveTra
   }
 }
 
+// ============================================================================
+// UPDATE (read, change and save one document in one synchronous run)
+// ============================================================================
+
+// Set while an update's fn runs: a write it makes would be overwritten by the update's own save.
+let insideUpdate: { nested: boolean } | null = null;
+
+function refuseInsideUpdate(): void {
+  if (!insideUpdate) return;
+  insideUpdate.nested = true;
+  throw new TypeError('[Data] A data write was made inside an update function; neither it nor the update was saved');
+}
+
+/** A throw from an update's fn, carried past recorded() so it is recorded nowhere and reaches the caller as it was. */
+class UpdateFnError {
+  constructor(readonly error: unknown) {}
+}
+
+type UpdateRead = { status: 'absent' } | { status: 'present'; value: unknown } | { status: 'refused'; cause: WriteRefusal };
+
+/** The stored document read whole, or why it cannot be: a default stands in only for a document that is absent. */
+function readForUpdate(filename: string, options: DataOptions): UpdateRead {
+  try {
+    const wsGuild = wsRouted(options);
+    if (wsGuild !== null) {
+      const ws = getWorkingSet();
+      if (!ws) {
+        console.warn(`[Data] Update for postgres-routed guild ${wsGuild} outside the bot process; refused`);
+        return { status: 'refused', cause: 'not-ready' };
+      }
+      getMetricsCollector().recordIO('read', wsGuild, options.category ?? null);
+      const res = ws.readForUpdate(wsGuild, options.category ?? '', filename);
+      if (res.status === 'not-ready') return { status: 'refused', cause: 'not-ready' };
+      if (res.status === 'stream') {
+        console.error(`[DataManager] Update of ${filename} refused: it is written by appends, and a whole write would replace its lines`);
+        return { status: 'refused', cause: 'io' };
+      }
+      return res.value === undefined ? { status: 'absent' } : { status: 'present', value: res.value };
+    }
+    const filePath = getDataFilePath(filename, options);
+    getMetricsCollector().recordIO('read', options.scope === 'global' ? null : options.guildId ?? null, options.category ?? null);
+    const pending = getPending(filePath);
+    if (pending?.op === 'delete') return { status: 'absent' };
+    if (pending?.op === 'write') return { status: 'present', value: JSON.parse(pending.content) };
+    if (pending?.op === 'append') {
+      console.error(`[DataManager] Update of ${filename} refused: appended lines are still queued for it, and a whole write would replace them`);
+      return { status: 'refused', cause: 'io' };
+    }
+    if (!existsOnDisk(filePath)) return { status: 'absent' };
+    return { status: 'present', value: JSON.parse(readFileUtf8(filePath)) };
+  } catch (error) {
+    console.error(`[DataManager] Update of ${filename} refused: the stored document could not be read whole:`, error);
+    return { status: 'refused', cause: 'io' };
+  }
+}
+
+function acceptUpdate<T>(filename: string, options: DataOptions, defaultValue: T, fn: (current: T) => T): SaveTracked {
+  refuseInsideUpdate();
+  if (filename.endsWith('.jsonl')) {
+    throw new TypeError(`[Data] ${filename} is an append-only file; it is never updated whole. The update was not saved`);
+  }
+  if (closedForExit) throw new DataBackendUnavailableError('node-stopping');
+  if (guildWriteClosed(options, 'Update')) return { outcome: 'refused', cause: 'not-ready' };
+  const read = readForUpdate(filename, options);
+  if (read.status === 'refused') return { outcome: 'refused', cause: read.cause };
+  const current = (read.status === 'present' ? read.value : structuredClone(defaultValue)) as T;
+  const frame = { nested: false };
+  insideUpdate = frame;
+  let next: unknown;
+  try {
+    next = fn(current);
+  } catch (error) {
+    throw new UpdateFnError(error);
+  } finally {
+    insideUpdate = null;
+  }
+  const thenable = typeof (next as { then?: unknown } | null)?.then === 'function';
+  if (thenable) {
+    try {
+      (next as PromiseLike<unknown>).then(undefined, error => {
+        console.error(`[Data] An async update function for ${filename} failed after it was refused:`, error);
+      });
+    } catch { /* a then that throws leaves nothing pending */ }
+  }
+  if (frame.nested) throw new TypeError('[Data] The update function made a data write of its own; the update was not saved');
+  if (next === undefined) throw new TypeError('[Data] The update function returned undefined; it must return the new value. The update was not saved');
+  if (thenable) {
+    throw new TypeError('[Data] The update function returned a promise; it must return the new value without awaiting. The update was not saved');
+  }
+  return acceptSave(filename, options, next);
+}
+
+/**
+ * Read a document, change it with fn and save the result in one synchronous run, so no other write of it by this
+ * process lands in between. fn gets a private copy of the stored value (of defaultValue when absent) and returns the
+ * new value; it must not be async and must not write data. An async fn is refused with a TypeError and the update
+ * writes nothing; anything that function does after its first await is outside the update. A filename ending in
+ * .jsonl is append-only and throws a TypeError without running fn. A document that cannot be read whole (unparsable,
+ * unreadable, or written by appends) is refused 'io' and a guild whose working set is not ready, or a data layer that
+ * refused to serve, 'not-ready', in both cases without running fn. Otherwise the answer is the save's, with its
+ * throws; a throw from fn reaches the caller as it was and nothing is written.
+ */
+export function updateData<T = any>(filename: string, options: DataOptions, defaultValue: T, fn: (current: T) => T): SaveTracked {
+  try {
+    return recorded(docOf(filename, options), scopeOf(options), true, () => acceptUpdate(filename, options, defaultValue, fn));
+  } catch (error) {
+    if (error instanceof UpdateFnError) throw error.error;
+    throw error;
+  }
+}
+
 /**
  * Append a line to a data file (serialized through the same queue). A torn tail
  * line on crash is tolerated by callers (they skip bad lines on read).
@@ -699,6 +822,7 @@ export function appendDataTracked(filename: string, options: DataOptions, line: 
 }
 
 function acceptAppend(filename: string, options: DataOptions, line: string): AppendTracked {
+  refuseInsideUpdate();
   if (closedForExit) throw new DataBackendUnavailableError('node-stopping');
   if (guildWriteClosed(options, 'Append')) return { outcome: 'refused', cause: 'not-ready' };
   try {
@@ -770,6 +894,7 @@ export function deleteDataTracked(filename: string, options: DataOptions): Delet
 }
 
 function acceptDelete(filename: string, options: DataOptions): DeleteTracked {
+  refuseInsideUpdate();
   if (closedForExit) throw new DataBackendUnavailableError('node-stopping');
   if (guildWriteClosed(options, 'Delete')) return { outcome: 'refused', cause: 'not-ready' };
   try {
@@ -884,7 +1009,7 @@ export async function restoreGuildFromGraveyard(guildId: string, retiredAt?: num
       batch = newest;
     }
     const token = fenceFromOwnerInfo(guildId)
-      ?? { nodeId: '', term: 0, epoch: 0, shardId: 0, shardCount: 1 };
+      ?? { nodeId: '', claim: null, shardId: 0, shardCount: 1 };
     const res = await pgBackend.restoreGuild(guildId, batch, token);
     if (res.ok) {
       // The pre-restore ready gate hydrated the guild EMPTY (claim-then-read
@@ -894,6 +1019,7 @@ export async function restoreGuildFromGraveyard(guildId: string, retiredAt?: num
       return { ok: true, moved: res.moved };
     }
     if (res.reason === 'live-rows') return { ok: false, error: 'live guild data exists; delete it before restoring' };
+    if (res.reason === 'schema-mismatch') return { ok: false, error: 'the database holds another schema version than this bot reads; nothing was restored' };
     throw new DataBackendUnavailableError('database-unreachable');
   }
   return restoreGuildDirFromGraveyard(guildId, retiredAt);
@@ -924,6 +1050,19 @@ export function saveGuildData<T = any>(
 }
 
 /**
+ * Helper: Update guild-scoped data in one step (updateData)
+ */
+export function updateGuildData<T = any>(
+  filename: string,
+  guildId: string,
+  defaultValue: T,
+  fn: (current: T) => T,
+  category?: string
+): SaveTracked {
+  return updateData(filename, { guildId, scope: 'guild', category }, defaultValue, fn);
+}
+
+/**
  * Helper: Load global data
  */
 export function loadGlobalData<T = any>(
@@ -943,6 +1082,18 @@ export function saveGlobalData<T = any>(
   category?: string
 ): boolean {
   return saveData(filename, { scope: 'global', category }, data);
+}
+
+/**
+ * Helper: Update global data in one step (updateData)
+ */
+export function updateGlobalData<T = any>(
+  filename: string,
+  defaultValue: T,
+  fn: (current: T) => T,
+  category?: string
+): SaveTracked {
+  return updateData(filename, { scope: 'global', category }, defaultValue, fn);
 }
 
 // ============================================================================
@@ -1001,6 +1152,36 @@ export function saveModuleData<T = any>(
 }
 
 /**
+ * Update module-scoped data (guild-specific) in one step: fn gets a copy of the stored value (of defaultValue when
+ * absent) and returns the new value, and no other write of the document by this process lands in between.
+ *
+ * @param filename - Data filename (supports subfolders: 'archive/2024.json')
+ * @param guildId - Guild ID
+ * @param moduleName - Module name (used as namespace)
+ * @param defaultValue - What fn gets when the file does not exist
+ * @param fn - Returns the new value; must not be async and must not save, append or delete data
+ * @returns 'saved' with its ticket once the write is accepted (confirmSaved(guildId) says when it is stored), 'frozen'
+ * for a frozen guild, 'refused' with cause 'not-ready' (fn did not run) or 'io' (the document could not be read whole
+ * and fn did not run, or the save failed); 'not-ready' also answers while the data layer refuses to serve. A stopping
+ * bot, a failing disk (storage-failing) or a database refusal (unreachable, backlog, fenced) throws
+ * DataBackendUnavailableError; fn returning a promise or undefined, fn writing data, or a filename ending in .jsonl
+ * throws a TypeError. Anything an async fn does after its first await is outside the update.
+ *
+ * @example
+ * // Counts one more entry in /data/{guildId}/giveaway/stats.json
+ * updateModuleData('stats.json', '123456', 'giveaway', { entries: 0 }, s => ({ ...s, entries: s.entries + 1 }))
+ */
+export function updateModuleData<T = any>(
+  filename: string,
+  guildId: string,
+  moduleName: string,
+  defaultValue: T,
+  fn: (current: T) => T
+): SaveTracked {
+  return updateGuildData(filename, guildId, defaultValue, fn, moduleName);
+}
+
+/**
  * Load global module data
  * Automatically namespaces data by module name
  *
@@ -1041,6 +1222,31 @@ export function saveGlobalModuleData<T = any>(
   data: T
 ): boolean {
   return saveGlobalData(filename, data, moduleName);
+}
+
+/**
+ * Update global module data in one step, as updateModuleData does for a guild.
+ *
+ * @param filename - Data filename (supports subfolders)
+ * @param moduleName - Module name (used as namespace)
+ * @param defaultValue - What fn gets when the file does not exist
+ * @param fn - Returns the new value; must not be async and must not save, append or delete data
+ * @returns 'saved' with its ticket once the write is accepted (confirmSaved('global') says when it is stored), or
+ * 'refused' with cause 'io'. A stopping bot or a failing disk (storage-failing) throws DataBackendUnavailableError;
+ * fn returning a promise or undefined, fn writing data, or a filename ending in .jsonl throws a TypeError. Anything
+ * an async fn does after its first await is outside the update.
+ *
+ * @example
+ * // Adds a user to /data/global/analytics/stats.json
+ * updateGlobalModuleData('stats.json', 'analytics', { totalUsers: 0 }, s => ({ ...s, totalUsers: s.totalUsers + 1 }))
+ */
+export function updateGlobalModuleData<T = any>(
+  filename: string,
+  moduleName: string,
+  defaultValue: T,
+  fn: (current: T) => T
+): SaveTracked {
+  return updateGlobalData(filename, defaultValue, fn, moduleName);
 }
 
 /**

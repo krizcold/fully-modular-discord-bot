@@ -409,7 +409,7 @@ export function judgeForks(history, copies, agree) {
 /**
  * @typedef {{ holders: Map<string, Set<string>>, owners: Map<string, Set<string>>, counts: Map<string, Set<string>>,
  *   guildShards: Map<string, Set<string>>, outOfRange: Map<string, Set<string>>,
- *   unleased: Map<string, Set<string>> }} ControlFacts
+ *   unleased: Map<string, Set<string>>, claims: Map<string, Set<string>> }} ControlFacts
  */
 
 /**
@@ -421,12 +421,13 @@ export function judgeForks(history, copies, agree) {
  */
 export function controlFacts(nodes) {
   /** @type {ControlFacts} */
-  const f = { holders: new Map(), owners: new Map(), counts: new Map(), guildShards: new Map(), outOfRange: new Map(), unleased: new Map() };
+  const f = { holders: new Map(), owners: new Map(), counts: new Map(), guildShards: new Map(), outOfRange: new Map(), unleased: new Map(), claims: new Map() };
   const put = (/** @type {Map<string, Set<string>>} */ map, /** @type {string} */ key, /** @type {string} */ value) => {
     map.set(key, (map.get(key) ?? new Set()).add(value));
   };
   for (const n of nodes.filter(x => x.state.initialized)) {
     const id = n.state.nodeId ?? n.name;
+    if (typeof n.state.claim === 'number') put(f.claims, String(n.state.claim), id);
     for (const l of n.state.leases) put(f.holders, String(l.shardId), id);
     for (const row of n.state.shardTable) {
       put(f.owners, String(row.shardId), id);
@@ -465,7 +466,7 @@ export function commonFacts(a, b) {
   return {
     holders: meet(a.holders, b.holders), owners: meet(a.owners, b.owners), counts: meet(a.counts, b.counts),
     guildShards: meet(a.guildShards, b.guildShards), outOfRange: meet(a.outOfRange, b.outOfRange),
-    unleased: meet(a.unleased, b.unleased),
+    unleased: meet(a.unleased, b.unleased), claims: meet(a.claims, b.claims),
   };
 }
 
@@ -503,7 +504,58 @@ export function controlVerdicts(f) {
     const [guild, shard] = guildShard.split(' ');
     add(`a node maps guild ${guild} to shard ${shard}, outside the shard count it reports`);
   }
+  for (const [claim, set] of f.claims) {
+    if (set.size > 1) add(`nodes ${sorted(set).join(', ')} report the same claim ${claim}`);
+  }
   return verdicts;
+}
+
+/** @typedef {{ last: number, called: boolean, highest: number | null }} OwnershipListing */
+
+/**
+ * The claim the next boot would draw, as takeClaim draws it: the sequence's
+ * next value, raised above the highest guild_ownership claim. A live node
+ * that holds that claim or a higher one means the sequence went back (a
+ * restore that did not raise it), so a new boot can take a live node's claim.
+ * @param {{ name: string, state: FleetFacts }[]} nodes
+ * @param {OwnershipListing} listing
+ * @returns {Verdict[] | null} null when no live node reports a claim
+ */
+export function ownershipVerdicts(nodes, listing) {
+  const live = nodes.filter(n => n.state.initialized && typeof n.state.claim === 'number').map(n => /** @type {number} */ (n.state.claim));
+  if (live.length === 0) return null;
+  const highestLive = Math.max(...live);
+  const fromSeq = listing.called ? listing.last + 1 : listing.last;
+  const next = Math.max(fromSeq, (listing.highest ?? 0) + 1);
+  if (highestLive < next) return [];
+  return [{
+    v: 'CONTROL',
+    detail: `a live node holds claim ${highestLive}, and the next boot would draw claim ${next} (claim_seq at ${listing.last}, ${listing.called ? 'called' : 'not called'}; highest guild_ownership claim ${listing.highest ?? 'none'}): the claim sequence went back`,
+  }];
+}
+
+/**
+ * The ownership listing (oracle.mjs sql ownership under psql -At): one line,
+ * {"last": claim_seq.last_value, "called": claim_seq.is_called, "highest": max guild_ownership claim or null}.
+ * @param {string} text
+ * @returns {OwnershipListing}
+ */
+export function parseOwnership(text) {
+  const lines = text.split('\n').filter(line => line.trim() !== '');
+  if (lines.length !== 1) throw new Error(`it has ${lines.length} lines, not one`);
+  /** @type {any} */
+  let row;
+  try {
+    row = JSON.parse(lines[0]);
+  } catch {
+    throw new Error(`its line is not JSON: ${lines[0].slice(0, 80)}`);
+  }
+  const last = Number(row?.last);
+  const highest = row?.highest === null ? null : Number(row?.highest);
+  if (!Number.isSafeInteger(last) || typeof row.called !== 'boolean' || (highest !== null && !Number.isSafeInteger(highest))) {
+    throw new Error(`its line is not {"last": n, "called": bool, "highest": n or null}: ${lines[0].slice(0, 80)}`);
+  }
+  return { last, called: row.called, highest };
 }
 
 /**
@@ -594,7 +646,8 @@ export function appCopy(text) {
 /**
  * Everything at once: the result the checker prints.
  * @param {{ history: History, copies: Copy[], agree?: string[], fleet?: { name: string, state: FleetFacts }[],
- *   fleetAgain?: { name: string, state: FleetFacts }[], noFleet?: boolean, windows?: string[], k?: number }} input
+ *   fleetAgain?: { name: string, state: FleetFacts }[], noFleet?: boolean, windows?: string[], k?: number,
+ *   ownership?: string }} input
  */
 export function judge(input) {
   const { history, copies } = input;
@@ -655,6 +708,18 @@ export function judge(input) {
     for (const detail of new Set([...controlVerdicts(first), ...controlVerdicts(second)].map(v => v.detail))) {
       if (!counted.has(detail)) notes.push(`CONTROL seen in one set of control facts only: ${detail}`);
     }
+  }
+  if (input.ownership !== undefined) {
+    /** @type {OwnershipListing | null} */
+    let listing = null;
+    try {
+      listing = parseOwnership(input.ownership);
+    } catch (error) {
+      notes.push(`the ownership listing was not judged: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    const found = listing ? ownershipVerdicts([...fleet, ...again], listing) : undefined;
+    if (found === null) notes.push('the ownership listing was not judged: no live node reports a claim');
+    else if (found) verdicts.push(...found);
   }
 
   inconclusive.push(...coverage(history, k, input.windows ?? []));

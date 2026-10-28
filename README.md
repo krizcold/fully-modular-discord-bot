@@ -508,7 +508,10 @@ Available aliases:
 All module data should use the `dataManager` abstraction:
 
 ```typescript
-import { loadModuleData, saveModuleData } from '@internal/utils/dataManager';
+import {
+  loadModuleData, saveModuleData, updateModuleData,
+  loadGlobalModuleData, saveGlobalModuleData, updateGlobalModuleData,
+} from '@internal/utils/dataManager';
 
 // Guild-specific data (isolated per server)
 const data = loadModuleData('mydata.json', guildId, 'my-module', {});
@@ -517,7 +520,17 @@ saveModuleData('mydata.json', guildId, 'my-module', data);
 // Global data (shared across all servers)
 const globalData = loadGlobalModuleData('settings.json', 'my-module', {});
 saveGlobalModuleData('settings.json', 'my-module', globalData);
+
+// Read, change and save in one step: no other write of the file by the bot lands in between
+updateModuleData('counts.json', guildId, 'my-module', { n: 0 }, current => ({ n: current.n + 1 }));
+updateGlobalModuleData('counts.json', 'my-module', { n: 0 }, current => ({ n: current.n + 1 }));
 ```
+
+The function given to `updateModuleData` and `updateGlobalModuleData` gets a copy of the stored value and returns the
+new one. If it saves other data, it is refused with a TypeError and the update writes nothing. An async function is
+refused the same way, but whatever it does after its first await runs later, outside the update, so do every await
+before the update. The web UI is a separate process: a global file it writes can still land between the read and the
+save. Files written with `appendData` (`.jsonl`) are never updated whole.
 
 **Data Storage Paths:**
 - Guild data: `/data/{guildId}/{moduleName}/filename.json`

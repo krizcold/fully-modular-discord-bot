@@ -37,6 +37,12 @@ docker run -d --name smdb-pg -p 5432:5432 -e POSTGRES_USER=smdb -e POSTGRES_PASS
 then `DATA_BACKEND=postgres` and `DATA_BACKEND_URL=postgresql://smdb:dev@localhost:5432/smdb`.
 A wrong or absent database shows as a visible "waiting on data backend" status, not a stack trace.
 The database provisions its own schema on first contact; there is nothing to create by hand.
+A database provisioned by another schema version of the bot is refused the way a wrong database is:
+the bot stays online with its data layer refused, members are told the data storage is unavailable,
+no guild data is saved or restored, nothing is created in that database, and the log names the
+version it found. Point `DATA_BACKEND_URL` at a database of this version to serve again.
+The graveyard sweep deletes retired guild data after `GRAVEYARD_TTL_DAYS` (14 by default); it keeps
+each guild's ownership row, which stops an older bot process from writing over a newer one.
 
 ## Availability: read this before you rely on it
 
@@ -44,7 +50,10 @@ The database provisions its own schema on first contact; there is nothing to cre
    degrades at once: the bot keeps running, accepts writes for a bounded window (about 5 minutes
    or 64 MiB of buffered writes, whichever trips first; the window covers the whole bot, not
    one guild), then refuses writes with a clear user-facing message until the database
-   returns.
+   returns. A hard crash loses the writes accepted and not yet stored: with the database
+   healthy, a write reaches it at most 5 seconds after it was accepted plus the time of two
+   flush transactions; during an outage, every write accepted since the outage began, at most
+   about 5 minutes or 64 MiB of them.
 2. **The managed sidecar shares its host's fate.** The manager-provisioned Postgres runs on the
    same server as the bot; your recovery point is the last nightly dump unless you snapshot the
    volume yourself. It is never published on a host port.

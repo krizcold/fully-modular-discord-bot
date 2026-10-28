@@ -236,7 +236,7 @@ describe('the readiness driver runs one retry loop per guild', () => {
       expect(r.store.hydrationsSent).toBe(7);
       r.store.listOwnedGuilds = async () => [g];
       r.driver.onLeaseChanged(NOT_LEASED);
-      r.driver.onLeaseChanged({ ...LEASED, epoch: 2 });
+      r.driver.onLeaseChanged({ ...LEASED, claim: 2 });
       await vi.advanceTimersByTimeAsync(0);
       r.store.releaseHydrations(answer);
       r.store.hydrateMode = 'ok';
@@ -467,7 +467,7 @@ describe('the readiness driver runs one retry loop per guild', () => {
     await vi.advanceTimersByTimeAsync(0);
     r.store.listOwnedGuilds = async () => [g];
     r.driver.onLeaseChanged(NOT_LEASED);
-    r.driver.onLeaseChanged({ ...LEASED, epoch: 2 });
+    r.driver.onLeaseChanged({ ...LEASED, claim: 2 });
     await vi.advanceTimersByTimeAsync(0);
     r.store.releaseHydrations('deposed');
     r.store.hydrateMode = 'ok';

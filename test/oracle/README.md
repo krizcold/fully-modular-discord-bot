@@ -5,7 +5,7 @@ every answer. Copies of the run's docs are taken afterwards, and the checker jud
 
 | File | Runs where | What it does |
 |---|---|---|
-| oracle.mjs | the dev box, or a node image on a host | `write`, `read` (a copy through one node's app read path), `fleet` (the control facts), `sql` (the database listing query), `bite`, `cleanup` |
+| oracle.mjs | the dev box, or a node image on a host | `write`, `read` (a copy through one node's app read path), `fleet` (the control facts), `sql` (the database listing query; `sql ownership` lists the claim sequence and the highest guild_ownership claim for check.mjs `--ownership`), `bite`, `cleanup` |
 | check.mjs | the dev box | judges logs and copies; exit 0 PASS, 1 FAIL, 2 INCONCLUSIVE, 64 usage |
 | judge.mjs | (library) | the verdict rules |
 | model.ts, fakeApp.ts | tests only | the model of a correct store with every check, and a stand-in node on real Postgres with injectable faults |
@@ -148,6 +148,8 @@ fleet.
   - piped mode works;
   - a streamed copy cut short is refused, and the writer's own file from the same run passes;
   - a shard leased twice is named, with one set of control facts or two (`--fleet-again`, which needs `--fleet`);
+  - two nodes reporting one claim are named, and so is a claim sequence whose next draw is at or below a live node's
+    claim (`--ownership`); a later boot that took a higher claim and stopped is not;
   - the test's own database copy fails when psql fails.
 
 ## On the live fleet (the main session's runs)
@@ -220,9 +222,18 @@ Guardrails: the secret filter on every read; `ssh <host> ...` with no flag befor
        CONTROL that both sets show; a node in one set only makes the run inconclusive. The facts are reduced to shard
        and guild facts, and URL credentials are redacted before they leave the host. `fleet` exits 1 when the node's
        bot child gave none.
+     - **The claim sequence, from the serving primary, after both sets of control facts.** A node that restarts after
+       its facts were read then takes a claim above the one they show, so it cannot raise a false CONTROL:
+
+           node test/oracle/oracle.mjs sql ownership | ssh contabo-dbot docker exec -i <postgres container> psql -U smdb -d smdb -At > ownership.jsonl
+
+       The listing is one line: the sequence's value and whether it was called, and the highest guild_ownership claim.
+       The checker works out the claim the next boot would draw (as the bot draws it) and calls CONTROL when a live
+       node already holds that claim or a higher one: the sequence went back, as after a restore that did not raise
+       it. An empty or unreadable listing is not judged, and the checker writes a note saying so.
 4. **Judge:**
 
-       node test/oracle/check.mjs --log <run>.jsonl --db primary=<p>.jsonl --lag standby=<s>.jsonl --app <node>-app.jsonl --fleet <node>-fleet-1.json --fleet-again <node>-fleet-2.json --window kill-bot
+       node test/oracle/check.mjs --log <run>.jsonl --db primary=<p>.jsonl --lag standby=<s>.jsonl --app <node>-app.jsonl --fleet <node>-fleet-1.json --fleet-again <node>-fleet-2.json --ownership ownership.jsonl --window kill-bot
 
    - Use `--db` for a copy that must hold everything acknowledged (the serving primary, and a sync standby).
    - Use `--lag` for an async standby.

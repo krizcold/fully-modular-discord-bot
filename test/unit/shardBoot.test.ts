@@ -48,11 +48,11 @@ vi.mock('../../src/bot/internalSetup/ingest/ingestService', () => {
   return { getIngestService: () => fake };
 });
 
-import { bootShards, getFleetContext, SHARD_BOOT_EPOCH, SHARD_BOOT_TERM } from '../../src/bot/internalSetup/fleet/shardBoot';
+import { bootShards, getFleetContext } from '../../src/bot/internalSetup/fleet/shardBoot';
 import { getFleetState } from '../../src/bot/internalSetup/fleet/state';
 
 describe('shardBoot runs every shard in this process', () => {
-  it('holds shards 0..n-1 with the fixed fence and hands them to the data readiness driver', async () => {
+  it('holds shards 0..n-1 with no claim on a JSON bot and hands them to the data readiness driver', async () => {
     expect(getFleetContext()).toBeNull();
     const ctx = await bootShards();
     expect(ctx.nodeId).toBe('node-a');
@@ -62,8 +62,7 @@ describe('shardBoot runs every shard in this process', () => {
     expect(h.snapshots).toHaveLength(1);
     expect(h.snapshots[0]).toEqual({
       nodeId: 'node-a',
-      term: SHARD_BOOT_TERM,
-      epoch: SHARD_BOOT_EPOCH,
+      claim: null,
       shardCount: 4,
       shardIds: [0, 1, 2, 3],
     });
@@ -88,5 +87,6 @@ describe('shardBoot runs every shard in this process', () => {
     expect(state.shardCount).toBe(4);
     expect(state.leases.map(l => l.shardId).sort()).toEqual([0, 1, 2, 3]);
     expect(state.shardTable.map(s => s.nodeId)).toEqual(['node-a', 'node-a', 'node-a', 'node-a']);
+    expect(state.claim).toBeNull();
   });
 });

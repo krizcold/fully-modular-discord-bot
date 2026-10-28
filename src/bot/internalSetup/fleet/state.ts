@@ -21,6 +21,8 @@ export interface FleetState {
   recommendedAt: number | null;
   dataBackend: 'file' | 'postgres';
   dataBoot: DataBootStatus;
+  /** The claim number this process saves under; null on a JSON bot, before the boot took one, or when it holds none. */
+  claim: number | null;
   leases: LeaseInfo[];
   shardTable: { shardId: number; nodeId: string; leaseId: string; status: string; guildCount: number }[];
   guildMap: Record<string, number>;
@@ -60,6 +62,7 @@ export function getFleetState(): FleetState {
       recommendedAt: null,
       dataBackend: resolveDataBackend(),
       dataBoot: getDataBootStatus(),
+      claim: null,
       leases: [],
       shardTable: [],
       guildMap: {},
@@ -96,6 +99,7 @@ export function getFleetState(): FleetState {
     recommendedAt: recommendation?.readAt ?? sources.recommendedAt,
     dataBackend: resolveDataBackend(),
     dataBoot: getDataBootStatus(),
+    claim: lease?.claim ?? null,
     leases,
     shardTable,
     guildMap,

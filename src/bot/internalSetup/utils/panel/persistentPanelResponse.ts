@@ -21,6 +21,7 @@ import {
   getPersistentPanel,
   storePersistentPanel,
   removePersistentPanel,
+  recordPersistentPanelResponse,
   updatePersistentPanelState
 } from './persistentPanelStorage';
 import { injectReturnButtonIfNeeded } from './panelResponseUtils';
@@ -217,8 +218,7 @@ export async function updatePersistentPanel(
     const outcome = await editPanelMessageById(client, instance, cleanedResponse);
     if (outcome === 'gone') {
       console.error(`Panel message not found: ${instance.messageId}`);
-      const current = await getPersistentPanel(panelId, guildId, sessionId);
-      if (current?.messageId === instance.messageId) await removePersistentPanel(panelId, guildId, sessionId);
+      await removePersistentPanel(panelId, guildId, sessionId, instance.messageId);
       return false;
     }
     if (outcome === 'refused') return false;
@@ -241,18 +241,13 @@ export async function updatePersistentPanel(
       }
     }
 
-    if (newState) {
-      await updatePersistentPanelState(panelId, newState, guildId, sessionId);
-    }
+    const stamped = newState
+      ? await updatePersistentPanelState(panelId, newState, instance.messageId, guildId, sessionId)
+      : true;
 
-    const current = await getPersistentPanel(panelId, guildId, sessionId);
-    if (current?.messageId === instance.messageId) {
-      instance.sessionData = response;
-      instance.lastUpdated = Date.now();
-      await storePersistentPanel(panelId, instance, guildId, sessionId);
-    }
+    const recorded = await recordPersistentPanelResponse(panelId, response, instance.messageId, guildId, sessionId);
 
-    return true;
+    return stamped && recorded;
   } catch (error: any) {
     console.error('Error updating persistent panel:', error);
     return false;
@@ -380,7 +375,7 @@ export async function handlePersistentPanelButton(
     );
 
     if (!updated) {
-      console.error(`Failed to update persistent panel ${panel.id}`);
+      console.error(`[PersistentPanel] Panel ${panel.id} does not hold this result: its message was not edited, or its record was not saved or now belongs to another message`);
     }
   }
 
@@ -417,7 +412,7 @@ export async function handlePersistentPanelModal(
     );
 
     if (!updated) {
-      console.error(`Failed to update persistent panel ${panel.id} after modal`);
+      console.error(`[PersistentPanel] Panel ${panel.id} does not hold this modal's result: its message was not edited, or its record was not saved or now belongs to another message`);
     }
   }
 
@@ -437,7 +432,7 @@ export async function cleanupPersistentPanel(
   const instance = await getPersistentPanel(panelId, guildId, sessionId);
   if (instance) {
     await convertPanelToError(client, instance, reason);
-    await removePersistentPanel(panelId, guildId, sessionId);
+    await removePersistentPanel(panelId, guildId, sessionId, instance.messageId);
   }
 }
 

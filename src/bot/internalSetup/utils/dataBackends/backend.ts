@@ -20,20 +20,25 @@ export interface GuildFlushBatch {
 
 export interface FenceToken {
   nodeId: string;
-  term: number;
-  epoch: number;
+  /** The process's claim number from smdb_data.claim_seq; null when it holds none (a JSON bot, a refused data layer). */
+  claim: number | null;
   shardId: number;
   shardCount: number;
 }
 
+export interface GuildOwner {
+  nodeId: string;
+  claim: number;
+}
+
 export type FlushOutcome =
   | { ok: true }
-  | { ok: false; reason: 'deposed'; currentOwner?: { nodeId: string; term: number; epoch: number } }
+  | { ok: false; reason: 'deposed'; currentOwner?: GuildOwner }
   | { ok: false; reason: 'unavailable' };
 
 export type HydrationOutcome =
   | { ok: true; docs: { key: DocKey; doc: string }[]; appendKeys: DocKey[] }
-  | { ok: false; reason: 'deposed'; currentOwner?: { nodeId: string; term: number; epoch: number } }
+  | { ok: false; reason: 'deposed'; currentOwner?: GuildOwner }
   | { ok: false; reason: 'unavailable' };
 
 export type RetireOutcome =

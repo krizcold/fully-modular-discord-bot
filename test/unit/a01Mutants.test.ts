@@ -239,8 +239,8 @@ describe('the retry loop', () => {
 
 describe('the working set hydration', () => {
   it.each([
-    ['a newer epoch', (t: ReturnType<typeof tokenFor>) => ({ ...t, epoch: t.epoch + 1000 })],
-    ['a newer term', (t: ReturnType<typeof tokenFor>) => ({ ...t, term: t.term + 1 })],
+    ['a newer claim', (t: ReturnType<typeof tokenFor>) => ({ ...t, claim: (t.claim ?? 0) + 1000 })],
+    ['the same claim', (t: ReturnType<typeof tokenFor>) => ({ ...t })],
   ])('a second hydrate under %s joining the first leaves its grant on the set', async (_name, next) => {
     const r = readinessRig();
     const g = r.guild();
@@ -256,7 +256,7 @@ describe('the working set hydration', () => {
     expect(r.ws.save(g, 'm', 'a.json', '{"v":1}')).toBe('accepted');
     expect(await r.ws.flushGuildNow(g, 2000)).toBe('ok');
     const sent = r.store.commits[r.store.commits.length - 1].token;
-    expect([sent.term, sent.epoch]).toEqual([newer.term, newer.epoch]);
+    expect(sent.claim).toBe(newer.claim);
   });
 
   it('a third hydrate joins the set in place, not the evicted one\'s ended read', async () => {

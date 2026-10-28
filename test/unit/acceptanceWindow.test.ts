@@ -710,3 +710,83 @@ describe('the age against a model', () => {
     }), { numRuns: 60 });
   });
 });
+
+describe('how long a change waits before the store has it', () => {
+  /** The instants the store was asked to flush. */
+  function sendTimes(r: Rig): number[] {
+    const at: number[] = [];
+    const flush = r.store.flushGuild.bind(r.store);
+    r.store.flushGuild = (...args) => { at.push(Date.now()); return flush(...args); };
+    return at;
+  }
+
+  it('one save reaches the store 500 ms after it, not 499', async () => {
+    fakeClock();
+    const r = readinessRig();
+    const g = await r.ready();
+    const at = sendTimes(r);
+    const start = Date.now();
+    expect(saveData('one.json', { guildId: g, category: 'm' }, { v: 1 })).toBe(true);
+    await vi.advanceTimersByTimeAsync(499);
+    expect(at).toEqual([]);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(at).toEqual([start + 500]);
+  });
+
+  it('a save every 400 ms for 20 s: each window flushes 5000 ms after it opened, and no save waits longer', async () => {
+    fakeClock();
+    const r = readinessRig();
+    const g = await r.ready();
+    const at = sendTimes(r);
+    const saves: number[] = [];
+    for (let t = 0; t < 20_000; t += 400) {
+      saves.push(Date.now());
+      expect(saveData('stream.json', { guildId: g, category: 'm' }, { t })).toBe(true);
+      await vi.advanceTimersByTimeAsync(400);
+    }
+    await vi.advanceTimersByTimeAsync(5_000);
+    const opened = at.map((_, i) => saves.find(s => i === 0 || s > at[i - 1])!);
+    const waits = at.map((flushAt, i) => flushAt - opened[i]);
+    expect(waits.slice(0, -1)).toEqual(waits.slice(0, -1).map(() => 5000));
+    expect(waits.at(-1)).toBeLessThanOrEqual(5000);
+    expect(waits.length).toBe(4);
+    for (const s of saves) expect(at.find(f => f >= s)! - s).toBeLessThanOrEqual(5000);
+  });
+
+  it('a save during a 3 s flight reaches the store 500 ms after that flight lands', async () => {
+    fakeClock();
+    const r = readinessRig();
+    const g = await r.ready();
+    const at = sendTimes(r);
+    r.store.holding = true;
+    expect(saveData('flight.json', { guildId: g, category: 'm' }, { v: 1 })).toBe(true);
+    await debounce();
+    expect(at).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(saveData('flight.json', { guildId: g, category: 'm' }, { v: 2 })).toBe(true);
+    await vi.advanceTimersByTimeAsync(at[0] + 3000 - Date.now());
+    r.store.holding = false;
+    const landedAt = Date.now();
+    await release(r);
+    await vi.advanceTimersByTimeAsync(499);
+    expect(at).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(at).toEqual([at[0], landedAt + 500]);
+  });
+
+  it('in an outage, the write that crosses 300 s is accepted and the next one is refused', async () => {
+    fakeClock();
+    vi.spyOn(Math, 'random').mockReturnValue(0.5);
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const r = readinessRig();
+    const g = await r.ready();
+    r.store.mode = 'unavailable';
+    expect(saveData('first.json', { guildId: g, category: 'm' }, { v: 1 })).toBe(true);
+    await vi.advanceTimersByTimeAsync(300_001);
+    expect(health(r).state).not.toBe('refusing');
+    expect(saveData('crossing.json', { guildId: g, category: 'm' }, { v: 2 })).toBe(true);
+    expect(health(r).state).toBe('refusing');
+    expect(thrown(() => saveData('next.json', { guildId: g, category: 'm' }, { v: 3 })).causeKey).toBe('database-backlog');
+    r.store.mode = 'commit';
+  });
+});

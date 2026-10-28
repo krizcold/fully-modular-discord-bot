@@ -18,7 +18,7 @@ export function shortLivedClient(config: ClientConfig): Client {
 /**
  * Every client a pool hands out keeps a listener for its whole life. pg-pool
  * removes its own idle listener while a client is checked out, so a socket
- * ending under a held client (a transaction, a term stamp) would otherwise
+ * ending under a held client (a transaction, a claim stamp) would otherwise
  * emit an unlistened 'error' and end the process; the pool's own error event
  * covers idle clients only.
  */
