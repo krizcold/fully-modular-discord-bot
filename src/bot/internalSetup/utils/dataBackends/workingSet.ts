@@ -39,11 +39,13 @@ export interface WsTicket {
  * drain). Module code never catches it by contract; the dispatch wrappers do
  * and surface the cause.
  */
-export type DataUnavailableCause = 'database-unreachable' | 'database-backlog' | 'guild-fenced' | 'node-stopping' | 'storage-failing';
+export type DataUnavailableCause = 'database-unreachable' | 'database-backlog' | 'guild-fenced' | 'node-stopping' | 'storage-failing' | 'maintenance';
 
 export class DataBackendUnavailableError extends Error {
   constructor(readonly causeKey: DataUnavailableCause, detail?: string) {
-    super(detail ?? (causeKey === 'guild-fenced'
+    super(detail ?? (causeKey === 'maintenance'
+      ? '[Data] The bot is in maintenance; the write was not saved'
+      : causeKey === 'guild-fenced'
       ? '[Data] Another bot process took over this guild; the write was not saved'
       : causeKey === 'node-stopping'
         ? '[Data] This process is stopping and its exit drain has closed; the write was not saved'
@@ -104,6 +106,7 @@ class GuildWorkingSet {
   // later write of its document did.
   writeSeq = 0;
   landedSeq = 0;
+  flushError: { text: string; code?: string } | null = null;
 
   constructor(readonly guildId: string, public fence: FenceToken) {}
 
@@ -168,6 +171,12 @@ export class WorkingSetManager {
    */
   dirtyGuildIds(): string[] {
     return [...this.sets.values()].filter(ws => ws.dirtyKeys.size > 0 || ws.flushInFlight).map(ws => ws.guildId);
+  }
+
+  /** The guilds of dirtyGuildIds, each with why its last flush failed (null when none failed yet). */
+  heldGuilds(): Array<{ guildId: string; reason: string | null; code: string | null }> {
+    return [...this.sets.values()].filter(ws => ws.dirtyKeys.size > 0 || ws.flushInFlight)
+      .map(ws => ({ guildId: ws.guildId, reason: ws.flushError?.text ?? null, code: ws.flushError?.code ?? null }));
   }
 
   // --------------------------------------------------------------------------
@@ -629,6 +638,7 @@ export class WorkingSetManager {
         if (buf.chunk.length === 0 && !ws.dirtyKeys.has(key)) ws.appendBuf.delete(key);
       }
       this.landed += 1;
+      ws.flushError = null;
       this.noteFlushSuccess();
       if (ws.requeue || ws.dirtyKeys.size > 0) {
         ws.requeue = false;
@@ -645,6 +655,7 @@ export class WorkingSetManager {
     // unavailable: everything stays dirty; merge back and retry under backoff.
     for (const key of flushedKeys) ws.dirtyKeys.add(key);
     ws.requeue = false;
+    ws.flushError = { text: outcome.detail ?? 'the store did not take the flush', code: outcome.code };
     this.noteFlushFailure('flush unavailable');
     this.scheduleRetry();
     return false;

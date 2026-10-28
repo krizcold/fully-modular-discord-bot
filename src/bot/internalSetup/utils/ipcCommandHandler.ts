@@ -13,6 +13,8 @@ import { admitGuildAction, ENTRY_WAIT_MS, gateConsoleText } from './dataBackends
 import { isCommandRunnable } from './commandGate';
 import { runSealed } from './dataBackends/writeLedger';
 import { truthText, verdictOf } from './dataBackends/replyGate';
+import { maintenanceIpcRefusal } from './maintenance';
+import { runTracked } from './maintenanceGate';
 
 interface InvokePayload {
   command?: string;
@@ -119,8 +121,13 @@ export function setupCommandIPCHandlers(): void {
     if (!message || typeof message !== 'object') return;
     const { type, requestId, data } = message as { type?: string; requestId?: string; data?: InvokePayload };
     if (type !== 'command:invoke' || !requestId) return;
+    const refusal = maintenanceIpcRefusal(type);
+    if (refusal) {
+      process.send!({ requestId, data: refusal });
+      return;
+    }
     try {
-      const response = await handleInvoke(data || {});
+      const response = await runTracked(() => handleInvoke(data || {}));
       process.send!({ requestId, data: response });
     } catch (error) {
       process.send!({ requestId, data: { success: false, error: error instanceof Error ? error.message : 'Unknown error' } });

@@ -497,7 +497,8 @@ export class MetricsCollector {
   }
 
   flushTotals(): void {
-    if (!this.enabled) return;
+    // Before seeding the totals in memory are empty; writing them would erase the persisted ones.
+    if (!this.enabled || !this.seeded) return;
     try {
       const active = Array.from(this.activeSinceFlush);
       this.activeSinceFlush.clear();

@@ -10,6 +10,7 @@ import { Client } from 'discord.js';
 import { reloadModule, reloadModules, unloadModuleFromMemory } from './moduleReloader';
 import { getModuleRegistry } from './moduleRegistry';
 import { reRegisterSlashCommands } from './commandUtils';
+import { maintenanceIpcRefusal } from './maintenance';
 
 let clientRef: Client | null = null;
 
@@ -35,6 +36,11 @@ export function setupReloadIPCHandlers(client: Client): void {
 
     // Only handle module/commands-related messages
     if (!type.startsWith('module:') && type !== 'commands:reregister') return;
+    const refusal = maintenanceIpcRefusal(type);
+    if (refusal) {
+      process.send!({ requestId, data: refusal });
+      return;
+    }
 
     try {
       let response: any;

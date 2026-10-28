@@ -23,12 +23,14 @@ import {
 } from './dataManager';
 import type { WriteTicket } from './dataManager';
 import { filesPending } from './dataBackends/fileBackend';
+import { maintenanceIpcRefusal } from './maintenance';
+import { maintenanceText, runTracked } from './maintenanceGate';
 import { ROOT_CONFIG_PATH } from './configManager';
 import { isInternalGlobalRel } from './configDiscovery';
 import { DataBackendUnavailableError, getWorkingSet } from './dataBackends/workingSet';
 import { awaitGuildDataReady } from './dataBackends/boot';
 
-type DataOpCode = 'frozen' | 'not-owner' | 'backend-unavailable' | 'bot-down' | 'invalid' | 'io-error';
+type DataOpCode = 'frozen' | 'not-owner' | 'backend-unavailable' | 'bot-down' | 'invalid' | 'io-error' | 'maintenance';
 
 export interface DataWriteReply {
   ok: boolean;
@@ -167,6 +169,9 @@ export async function applyOperatorDataWrite(req: GuildDataWriteRequest): Promis
       ticket = saved.ticket;
     }
   } catch (error) {
+    if (error instanceof DataBackendUnavailableError && error.causeKey === 'maintenance') {
+      return { ok: false, code: 'maintenance', error: maintenanceText() };
+    }
     if (error instanceof DataBackendUnavailableError) {
       return { ok: false, code: 'backend-unavailable', error: error.message };
     }
@@ -253,9 +258,14 @@ export function setupDataIPCHandlers(): void {
     if (!message || typeof message !== 'object') return;
     const { type, requestId, data } = message as { type?: string; requestId?: string; data?: any };
     if ((type !== 'data:guild-write' && type !== 'data:guild-read' && type !== 'data:global-read') || !requestId) return;
+    const refusal = maintenanceIpcRefusal(type);
+    if (refusal) {
+      process.send!({ requestId, data: refusal });
+      return;
+    }
     try {
       const response = type === 'data:guild-write'
-        ? await applyOperatorDataWrite((data || {}) as GuildDataWriteRequest)
+        ? await runTracked(() => applyOperatorDataWrite((data || {}) as GuildDataWriteRequest))
         : type === 'data:guild-read'
           ? await applyOperatorDataRead((data || {}) as GuildDataReadRequest)
           : applyOperatorGlobalRead((data || {}) as GlobalDataReadRequest);

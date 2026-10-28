@@ -20,6 +20,7 @@ import { Client } from 'discord.js';
 import { getMetricsCollector } from './metrics/metricsCollector';
 import { instrument } from './metrics/instrument';
 import { gateEventDispatch, eventGuildId, extractGuildId, runAsAdmitted } from './dataBackends/boot';
+import { runTracked } from './maintenanceGate';
 
 interface TrackedListener {
   eventName: string;
@@ -76,7 +77,7 @@ class ModuleEventManager {
         // only a Guild passes.
         if (!(await gateEventDispatch(eventName, args, () => void wrappedHandler(...args)))) return;
 
-        await runAsAdmitted(args, () => instrument('event', eventGuildId(args), moduleName, eventName, () => handler(this.client!, ...args)));
+        await runTracked(() => runAsAdmitted(args, () => instrument('event', eventGuildId(args), moduleName, eventName, () => handler(this.client!, ...args))));
       } catch (error) {
         console.error(`[ModuleLoader] Error in ${moduleName} ${eventName} handler:`, error);
       }

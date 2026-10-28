@@ -29,7 +29,7 @@ export type TruthAnswer = 'pending' | 'held' | 'deposed' | 'unavailable' | Ledge
 
 // Worst first.
 const RANK: TruthAnswer[] = [
-  'node-stopping', 'guild-fenced', 'deposed', 'database-unreachable', 'database-backlog',
+  'node-stopping', 'maintenance', 'guild-fenced', 'deposed', 'database-unreachable', 'database-backlog',
   'frozen', 'not-ready', 'storage-failing', 'io', 'unavailable', 'held', 'pending',
 ];
 const worst = (answers: TruthAnswer[]): TruthAnswer => answers.reduce((a, b) => (RANK.indexOf(b) < RANK.indexOf(a) ? b : a));
@@ -45,6 +45,8 @@ export function truthText(answer: TruthAnswer, partial: boolean): string {
   switch (answer) {
     case 'node-stopping':
       return `The bot is restarting, so your change was ${notSaved}. Please try again in a moment.`;
+    case 'maintenance':
+      return `The bot is in maintenance, so your change was ${notSaved}. Please try again later.`;
     case 'guild-fenced':
     case 'deposed':
       return `Another bot process took over this server's data, so your change was ${notSaved}. Please try again in a moment.`;

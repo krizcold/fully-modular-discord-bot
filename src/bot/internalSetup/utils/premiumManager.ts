@@ -41,6 +41,7 @@ import {
 } from './settings/settingsStorage';
 import { getPaymentRegistry } from './payment/paymentRegistry';
 import { dispatchPremiumNotification } from './premiumNotifications';
+import { isMaintenanceBoot, isMaintenanceGateClosed } from './maintenanceGate';
 import type {
   ProviderEvent,
   InitiateResult,
@@ -2252,6 +2253,7 @@ export class PremiumManager {
   startExpiryChecker(intervalMs = 60_000): void {
     if (this.expiryTimer) return;
     this.expiryTimer = setInterval(() => {
+      if (isMaintenanceGateClosed()) return;
       this.checkExpiry();
       void this.processDueMigrations().catch(err => {
         console.error('[PremiumManager] processDueMigrations failed:', err);
@@ -2843,7 +2845,7 @@ export function getPremiumManager(): PremiumManager {
     // processes would write the same expiry to disk every minute and DM
     // the user twice for the same `manual.grant.ended` event. Web-UI
     // picks up the bot's writes via mtime reload on each operation.
-    if (process.env.BOT_PROCESS_ROLE === 'bot') {
+    if (process.env.BOT_PROCESS_ROLE === 'bot' && !isMaintenanceBoot()) {
       instance.startExpiryChecker();
     }
   }

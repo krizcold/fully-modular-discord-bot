@@ -55,6 +55,7 @@ import type { DataBackend, FenceToken } from './dataBackends/backend';
 import { resolveDataBackend } from '../../../utils/envLoader';
 import { currentSince, recordRefusal, recordTicket } from './dataBackends/writeLedger';
 import { noteScopeRefusal, noteScopeTicket, pendingFor, saveMark, stampOf, type SaveMark } from './dataBackends/scopeRecord';
+import { isMaintenanceGateClosed } from './maintenanceGate';
 
 export { listGlobalDataFiles, saveMark };
 export type { SaveMark };
@@ -197,6 +198,20 @@ export function drainForExit(boundMs: number): Promise<void> {
   return exitDrain;
 }
 
+/** The exit drain has started: it owns the process from here to its exit. */
+export function isExitDraining(): boolean {
+  return exitDrain !== null;
+}
+
+/**
+ * Maintenance's save: flushes the working set and the queued file writes until nothing is held, nothing lands for the
+ * drain's give-up window, or boundMs passes. Unlike the exit drain it closes nothing. Answers what is still held.
+ */
+export async function saveHeldWrites(boundMs: number): Promise<{ unsavedGuilds: number; unsavedFiles: number }> {
+  await drainUntilSettled(Date.now() + boundMs, { at: Date.now(), landed: landedFlushes() });
+  return { unsavedGuilds: getWorkingSet()?.dirtyGuildIds().length ?? 0, unsavedFiles: queuedFileWrites() };
+}
+
 let guildWritesClosed = false;
 
 /** The data layer refused to serve: every guild-scope write from now on is refused, so none lands in a store the deployment's data does not live in. */
@@ -214,6 +229,16 @@ let guildDataServing = false;
 /** The data boot verified the database and its schema: the graveyard sweep may touch it from now on. */
 export function noteGuildDataServing(): void {
   guildDataServing = true;
+}
+
+/** A guild write while the maintenance gate is closed: the data may be moving, so nothing is accepted. */
+function refuseInMaintenance(options: DataOptions): void {
+  if ((options.scope || 'guild') === 'guild') refuseGuildChangeInMaintenance();
+}
+
+/** A guild change (a write, a move to or from the graveyard) while the gate is closed would land after the confirmed save. */
+function refuseGuildChangeInMaintenance(): void {
+  if (isMaintenanceGateClosed()) throw new DataBackendUnavailableError('maintenance');
 }
 
 function guildWriteClosed(options: DataOptions, what: string): boolean {
@@ -385,6 +410,7 @@ export function listGuildDataKeys(guildId: string): { module: string; filename: 
  * also sweeps graveyard rows, through the served backend's own pool.
  */
 export async function sweepGraveyard(): Promise<void> {
+  if (isMaintenanceGateClosed()) return;
   await sweepFileGraveyard();
   if (!pgBackend || !servedByPostgres()) return;
   if (!guildDataServing || guildWritesClosed) return;
@@ -655,6 +681,7 @@ export function saveDataTracked<T = any>(filename: string, options: DataOptions,
 function acceptSave<T>(filename: string, options: DataOptions, data: T): SaveTracked {
   refuseInsideUpdate();
   if (closedForExit) throw new DataBackendUnavailableError('node-stopping');
+  refuseInMaintenance(options);
   if (guildWriteClosed(options, 'Write')) return { outcome: 'refused', cause: 'not-ready' };
   try {
     const wsGuild = wsRouted(options);
@@ -759,6 +786,7 @@ function acceptUpdate<T>(filename: string, options: DataOptions, defaultValue: T
     throw new TypeError(`[Data] ${filename} is an append-only file; it is never updated whole. The update was not saved`);
   }
   if (closedForExit) throw new DataBackendUnavailableError('node-stopping');
+  refuseInMaintenance(options);
   if (guildWriteClosed(options, 'Update')) return { outcome: 'refused', cause: 'not-ready' };
   const read = readForUpdate(filename, options);
   if (read.status === 'refused') return { outcome: 'refused', cause: read.cause };
@@ -824,6 +852,7 @@ export function appendDataTracked(filename: string, options: DataOptions, line: 
 function acceptAppend(filename: string, options: DataOptions, line: string): AppendTracked {
   refuseInsideUpdate();
   if (closedForExit) throw new DataBackendUnavailableError('node-stopping');
+  refuseInMaintenance(options);
   if (guildWriteClosed(options, 'Append')) return { outcome: 'refused', cause: 'not-ready' };
   try {
     const wsGuild = wsRouted(options);
@@ -896,6 +925,7 @@ export function deleteDataTracked(filename: string, options: DataOptions): Delet
 function acceptDelete(filename: string, options: DataOptions): DeleteTracked {
   refuseInsideUpdate();
   if (closedForExit) throw new DataBackendUnavailableError('node-stopping');
+  refuseInMaintenance(options);
   if (guildWriteClosed(options, 'Delete')) return { outcome: 'refused', cause: 'not-ready' };
   try {
     const wsGuild = wsRouted(options);
@@ -954,6 +984,7 @@ function acceptDelete(filename: string, options: DataOptions): DeleteTracked {
  * writes a .graveyard.json reason marker inside.
  */
 export async function deleteGuildNamespace(guildId: string, reason: string, flushMs = 30000): Promise<boolean> {
+  refuseGuildChangeInMaintenance();
   if (servedByPostgres()) {
     if (!pgBackend) return false;
     const ws = getWorkingSet();
@@ -964,6 +995,7 @@ export async function deleteGuildNamespace(guildId: string, reason: string, flus
         console.error(`[DataManager] Cannot retire guild ${guildId}: its unflushed writes did not reach the store (${flushed}); nothing was removed`);
         return false;
       }
+      refuseGuildChangeInMaintenance();
       ws.evict(guildId);
     }
     const token = fenceFromOwnerInfo(guildId);
@@ -982,6 +1014,7 @@ export async function deleteGuildNamespace(guildId: string, reason: string, flus
   if (!guildDirExists(guildId)) return false;
 
   await flushGuild(guildId);
+  refuseGuildChangeInMaintenance();
   dropPendingForGuild(guildId);
 
   return graveyardGuildDir(guildId, reason);
@@ -994,6 +1027,7 @@ export async function deleteGuildNamespace(guildId: string, reason: string, flus
  * retiredAt absent = the guild's newest graveyard batch/entry.
  */
 export async function restoreGuildFromGraveyard(guildId: string, retiredAt?: number): Promise<{ ok: boolean; error?: string; moved?: number }> {
+  refuseGuildChangeInMaintenance();
   if (servedByPostgres()) {
     if (!pgBackend) throw new DataBackendUnavailableError('database-unreachable');
     let batch = retiredAt;
@@ -1010,6 +1044,7 @@ export async function restoreGuildFromGraveyard(guildId: string, retiredAt?: num
     }
     const token = fenceFromOwnerInfo(guildId)
       ?? { nodeId: '', claim: null, shardId: 0, shardCount: 1 };
+    refuseGuildChangeInMaintenance();
     const res = await pgBackend.restoreGuild(guildId, batch, token);
     if (res.ok) {
       // The pre-restore ready gate hydrated the guild EMPTY (claim-then-read

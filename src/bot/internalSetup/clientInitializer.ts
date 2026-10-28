@@ -13,7 +13,7 @@ import { markMetricsReady, setupMetricsIPCHandlers } from './utils/ipcMetricsHan
 import { setupFleetIPCHandlers } from './utils/ipcFleetHandler';
 import { getMetricsCollector } from './utils/metrics/metricsCollector';
 import { startSamplers, stopSamplers } from './utils/metrics/samplers';
-import { drainForExit, stopHandler, sweepGraveyard, DataBackendUnavailableError } from './utils/dataManager';
+import { drainForExit, getGuildDataBackend, stopHandler, sweepGraveyard, DataBackendUnavailableError } from './utils/dataManager';
 import { initDataBackendLayer, awaitDataStartupBarrier, dispatchGated, dataUnavailableMessage } from './utils/dataBackends/boot';
 import { getWorkingSet } from './utils/dataBackends/workingSet';
 import { setupReloadIPCHandlers } from './utils/ipcReloadHandler';
@@ -31,6 +31,9 @@ import { getModuleRegistry } from './utils/moduleRegistry';
 import { getModuleEventManager } from './utils/moduleEventManager';
 import { LoadedModule } from '../types/moduleTypes';
 import { ensureConfigPopulated } from './utils/configManager';
+import { decideBoot, installMaintenanceGate, markDiscordStarted, runMaintenanceBoot, setupMaintenanceIPCAtBoot, watchDataBackend } from './utils/maintenance';
+import { isMaintenanceGateClosed } from './utils/maintenanceGate';
+import { PostgresBackend } from './utils/dataBackends/postgresBackend';
 
 // Load credentials from /data/.env (Web-UI managed) or environment variables
 const credentials = loadCredentials();
@@ -470,11 +473,21 @@ function runInitializers(client: Client) {
  * Main function that initializes the client.
  */
 async function main() {
+  // The saved maintenance state (and a refused database login) is read before the data backend opens.
+  const boot = await decideBoot();
+  if (boot.mode === 'maintenance') {
+    await runMaintenanceBoot(boot);
+    return;
+  }
+  setupMaintenanceIPCAtBoot();
+
   // Data backend boot runs FIRST so the readiness driver exists when the
   // shards are granted (bootShards). File mode is
   // a no-op; postgres mode constructs the backend held until its store
   // identity verifies.
   initDataBackendLayer();
+  const backend = getGuildDataBackend();
+  watchDataBackend(backend instanceof PostgresBackend ? backend : null);
 
   setupFleetIPCHandlers();
   setupMetricsIPCHandlers();
@@ -536,6 +549,7 @@ async function main() {
     intents: finalIntents,
     partials: [Partials.Message, Partials.Reaction, Partials.User],
   }, installReplyGate);
+  installMaintenanceGate(client);
 
   client.buttonHandlers = new Map<string, RegisteredButtonInfo>();
   client.dropdownHandlers = new Map<string, RegisteredDropdownInfo>();
@@ -619,10 +633,18 @@ async function main() {
 
   client.once('clientReady', async () => {
     console.log(`Logged in as ${client.user?.tag}!`);
+    if (isMaintenanceGateClosed()) {
+      console.log('[Maintenance] Module initializers, panel recovery and the module auto-updater start with the restart that ends maintenance');
+      return;
+    }
 
     // Module initializers bulk-read guild data; hold them behind the same
     // startup barrier as the clientReady event fan-out (no-op in file mode).
     await awaitDataStartupBarrier();
+    if (isMaintenanceGateClosed()) {
+      console.log('[Maintenance] Module initializers, panel recovery and the module auto-updater start with the restart that ends maintenance');
+      return;
+    }
 
     // Run all module initializers (after client is ready)
     runInitializers(client);
@@ -719,7 +741,7 @@ async function main() {
       getIngestService().close('shutting down').catch(err => console.warn('[clientInitializer] Could not close the gateway on shutdown:', err)),
       new Promise(resolve => setTimeout(resolve, 2000)),
     ]);
-    metrics.flushTotals(); // writes via saveData, so it must precede the drain
+    if (!isMaintenanceGateClosed()) metrics.flushTotals(); // writes via saveData, so it must precede the drain
     // Postgres mode gets a wider bound: a coalesced Working Set can hold more
     // dirty state than the file queue, and losing a fenced flush window costs
     // real writes.
@@ -731,6 +753,7 @@ async function main() {
   process.on('SIGINT', () => void shutdownHandler());
 
   // No identify before the boot has its claim; a refused data layer logs in with no claim and its gates closed.
+  markDiscordStarted();
   fleet.startIngest(process.env.DISCORD_TOKEN);
 }
 

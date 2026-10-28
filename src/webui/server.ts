@@ -202,7 +202,7 @@ export async function createServer(botManager: BotManager): Promise<Express> {
   // this one carries its own per-instance token check, because it is reached
   // container-to-container over the shared docker network and so never passes
   // the boundary gateway that authenticates every route above.
-  app.use('/api/managed', createManagedRoutes());
+  app.use('/api/managed', createManagedRoutes(botManager));
 
   // Serve static frontend files. The admin page's files need the gateway's login; the member page's own files
   // under /assets/ are reachable without it (requireAuth passes; auth lives at the deployment boundary).

@@ -14,6 +14,7 @@ import { EventEmitter } from 'events';
 import * as fs from 'fs';
 import * as path from 'path';
 import type { PaymentProvider, ProviderEvent } from './paymentTypes';
+import { isMaintenanceBoot } from '../maintenanceGate';
 
 // The web-UI (parent) forks the bot (child) and sets BOT_PROCESS_ROLE=bot on
 // the child's env. Both processes import this registry and auto-register
@@ -21,7 +22,7 @@ import type { PaymentProvider, ProviderEvent } from './paymentTypes';
 // both do, we get duplicate 'subscription.expired' events for the same sub.
 // The bot is the natural owner since it's the Discord-facing worker.
 function isTickerOwner(): boolean {
-  return process.env.BOT_PROCESS_ROLE === 'bot';
+  return process.env.BOT_PROCESS_ROLE === 'bot' && !isMaintenanceBoot();
 }
 
 export class PaymentProviderRegistry extends EventEmitter {

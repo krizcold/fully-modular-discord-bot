@@ -11,6 +11,7 @@ import { getGuildDataBackend, listGuilds, sizeOfGlobalData } from '../dataManage
 import { SAMPLE_MS, DISK_WALK_MS, FLUSH_MS, BYTES_PER_CACHE_OBJECT } from './constants';
 import { getDataBootStatus } from '../dataBackends/boot';
 import { DATA_ROOT } from '../../../../utils/dataRoot';
+import { isMaintenanceGateClosed } from '../maintenanceGate';
 
 const BASE_DATA_DIR = DATA_ROOT;
 
@@ -116,6 +117,7 @@ export function startSamplers(client: Client): void {
   void runDiskWalk();
 
   flushTimer = setInterval(() => {
+    if (isMaintenanceGateClosed()) return;
     collector.flushTotals();
   }, FLUSH_MS);
   flushTimer.unref();

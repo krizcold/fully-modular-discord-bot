@@ -34,7 +34,7 @@ export interface GuildOwner {
 export type FlushOutcome =
   | { ok: true }
   | { ok: false; reason: 'deposed'; currentOwner?: GuildOwner }
-  | { ok: false; reason: 'unavailable' };
+  | { ok: false; reason: 'unavailable'; detail?: string; code?: string };
 
 export type HydrationOutcome =
   | { ok: true; docs: { key: DocKey; doc: string }[]; appendKeys: DocKey[] }

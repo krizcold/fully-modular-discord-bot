@@ -18,6 +18,11 @@ const CRASH_STABLE_UPTIME_MS = 10 * 60_000;
 // and its accepted writes drained (30 s), with a margin.
 const CHILD_STOP_WAIT_MS = 40_000;
 const CHILD_KILL_WAIT_MS = 5_000;
+// The manager's hook call gives up after 30 s; the child bounds its own step to 18 s.
+const MAINTENANCE_IPC_TIMEOUT_MS = 20_000;
+// The child answers maintenance:leave at once and saves behind its closed gate.
+const LEAVE_IPC_TIMEOUT_MS = 5_000;
+const RESTART_QUEUE_POLL_MS = 100;
 
 /**
  * A read hop the child never answered (a timeout, its exit). A read changes
@@ -28,6 +33,20 @@ function readNoAnswer(error: unknown): { ok: false; code: 'no-answer'; cause: 't
   const cause = reason.startsWith('IPC request timed out') ? 'timeout' : /^bot process (exited|was stopped) before replying$/.test(reason) ? 'stopped' : 'failed';
   console.warn(`[BotManager] A data read got no answer from the bot (${cause === 'timeout' ? 'timed out' : reason})`);
   return { ok: false, code: 'no-answer', cause, error: cause === 'failed' ? reason : 'the bot did not answer the read' };
+}
+
+/** What the maintenance hook answers about the changes the bot process held: saved, not saved, or unknown (null). */
+export interface MaintenanceSaveResult {
+  saved: boolean | null;
+  unsavedGuilds?: number;
+  unsavedFiles?: number;
+  note?: string;
+}
+
+/** What the hook 'running' answers about the restart: asked for, not needed, or unknown (null). */
+export interface MaintenanceLeaveResult {
+  restarting: boolean | null;
+  note: string;
 }
 
 export interface BotStartResult {
@@ -41,6 +60,9 @@ export interface BotStatus {
   uptime: number;
   processId?: number;
   crashed: boolean;
+  // What the bot process reported: running, maintenance, login-refused, outage, or held (changes it cannot save keep it from restarting).
+  mode?: string;
+  held?: { unsavedGuilds: number; unsavedFiles: number };
 }
 
 export interface LogsResponse {
@@ -78,6 +100,12 @@ export class BotManager {
   // Web-UI listener control, wired by startWebUI; lets the access-log channel's
   // Discord buttons / the /webui command stop and restart the HTTP listener.
   private webuiControl: { stop: () => void; start: () => void } | null = null;
+  // What the current child reported: serving, in maintenance, refused by its database, or off Discord for an outage.
+  private childMode: string = 'running';
+  // A restart the child or the maintenance hook asked for while another operation held the lock.
+  private queuedRestart: Promise<BotStartResult> | null = null;
+  private queuedRestartChild: ChildProcess | null = null;
+  private childHeld: { unsavedGuilds: number; unsavedFiles: number } | null = null;
 
   /** Wire the web-UI listener stop/start hooks (owned by startWebUI). */
   setWebUiControl(control: { stop: () => void; start: () => void }): void {
@@ -238,6 +266,8 @@ export class BotManager {
       });
 
       const child = this.botProcess;
+      this.childMode = 'running';
+      this.childHeld = null;
       // A new child serves no store until it reports one.
       setWebuiDataStoreUrl(null);
       this.botStartTime = Date.now();
@@ -345,6 +375,20 @@ export class BotManager {
           // The parent's reader follows the store the child serves, never only
           // the node's own /data/.env.
           setWebuiDataStoreUrl(typeof message.data?.url === 'string' ? message.data.url : null);
+        } else if (message.type === 'maintenance:mode') {
+          if (typeof message.data?.mode === 'string') {
+            this.childMode = message.data.mode;
+            const held = message.data.held;
+            this.childHeld = this.childMode === 'held' && held && typeof held.unsavedGuilds === 'number' && typeof held.unsavedFiles === 'number'
+              ? { unsavedGuilds: held.unsavedGuilds, unsavedFiles: held.unsavedFiles }
+              : null;
+            this.emitEvent('bot:status', this.getStatus());
+          }
+        } else if (message.type === 'control:restart-bot') {
+          console.warn(`[BotManager] The bot process asked for a restart: ${typeof message.data?.reason === 'string' ? message.data.reason : 'no reason given'}`);
+          void this.requestRestart().then(result => {
+            if (!result.success) console.error(`[BotManager] The restart the bot process asked for did not happen: ${result.error ?? result.reason ?? 'unknown'}`);
+          });
         } else if (message.type === 'control:shutdown-bot') {
           // Access-log channel "Shut down bot" button: stop the Discord bot child.
           console.warn('[BotManager] control:shutdown-bot received from access-log action');
@@ -442,6 +486,38 @@ export class BotManager {
   }
 
   /**
+   * A restart asked for by the bot process: one that lands while another operation holds the lock runs once that
+   * operation ends, and a request made meanwhile joins it. It is called off when the asking child was stopped or
+   * replaced meanwhile.
+   */
+  requestRestart(): Promise<BotStartResult> {
+    const child = this.botProcess;
+    if (this.queuedRestart && this.queuedRestartChild === child) return this.queuedRestart;
+    const before = this.queuedRestart;
+    const stops = this.stopsRequested;
+    let run: Promise<BotStartResult> | null = null;
+    run = (async (): Promise<BotStartResult> => {
+      try {
+        await before?.catch(() => undefined);
+        while (this.operationInProgress) await new Promise(resolve => setTimeout(resolve, RESTART_QUEUE_POLL_MS));
+        if (!child || this.botProcess !== child || child.killed || this.stopsRequested !== stops) {
+          console.log('[BotManager] The restart the bot process asked for was called off: that bot process was stopped or replaced meanwhile');
+          return { success: false, reason: 'stopped', error: 'The bot process that asked for the restart was stopped or replaced' };
+        }
+        return await this.restart();
+      } finally {
+        if (this.queuedRestart === run) {
+          this.queuedRestart = null;
+          this.queuedRestartChild = null;
+        }
+      }
+    })();
+    this.queuedRestart = run;
+    this.queuedRestartChild = child;
+    return run;
+  }
+
+  /**
    * Shutdown the bot process
    * @param emergency If true, use SIGKILL, otherwise SIGTERM
    */
@@ -508,6 +584,51 @@ export class BotManager {
     return this.botProcess !== null && this.botProcess.exitCode === null && this.botProcess.signalCode === null;
   }
 
+  /** The bot process runs and serves: not in maintenance, not refused by its database, not off Discord. */
+  isServingNormally(): boolean {
+    return this.isRunning() && this.childMode === 'running';
+  }
+
+  /**
+   * The maintenance hook's step in the bot process: it closes its gate and saves what it holds. A child that does not
+   * answer (a timeout, its exit) leaves the save unknown.
+   */
+  async enterMaintenance(message: string): Promise<MaintenanceSaveResult> {
+    if (!this.isRunning() || !this.botProcess) return { saved: true, note: 'No bot process runs, so it holds no changes.' };
+    try {
+      const reply = await this.sendIPCMessage('maintenance:enter', { message }, MAINTENANCE_IPC_TIMEOUT_MS);
+      if (reply?.saved === true) return { saved: true };
+      if (reply?.saved === false) {
+        const unsavedGuilds = Number(reply.unsavedGuilds) || 0;
+        const unsavedFiles = Number(reply.unsavedFiles) || 0;
+        return { saved: false, unsavedGuilds, unsavedFiles, note: `${unsavedGuilds} guild(s) and ${unsavedFiles} file(s) hold changes that could not be saved` };
+      }
+      console.warn('[BotManager] The bot process answered the maintenance request without a save result');
+    } catch (error) {
+      console.warn(`[BotManager] The maintenance request got no answer from the bot: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    return { saved: null, note: "can't confirm whether the held changes were saved" };
+  }
+
+  /**
+   * The hook 'running' in the bot process: it answers at once, saves what it holds behind its closed gate and asks for
+   * its restart once nothing is held, or once the database answers and refuses guilds for their content. With no bot
+   * process nothing is started.
+   */
+  async leaveMaintenance(): Promise<MaintenanceLeaveResult> {
+    if (!this.isRunning() || !this.botProcess) {
+      return { restarting: false, note: 'No bot process runs, so nothing restarts; the bot stays stopped until it is started.' };
+    }
+    try {
+      const reply = await this.sendIPCMessage('maintenance:leave', {}, LEAVE_IPC_TIMEOUT_MS);
+      if (reply?.leaving === true) return { restarting: true, note: 'The bot restarts once it has saved what it holds; a change the database refuses for its content is dropped at that restart.' };
+      console.warn('[BotManager] The bot process answered the request to leave maintenance without accepting it');
+    } catch (error) {
+      console.warn(`[BotManager] The request to leave maintenance got no answer from the bot: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    return { restarting: null, note: "can't confirm whether the bot restarts: it did not answer the request to leave maintenance" };
+  }
+
   /**
    * Get bot status
    */
@@ -520,7 +641,9 @@ export class BotManager {
       running: this.isRunning(),
       uptime,
       processId: this.botProcess?.pid,
-      crashed: this.crashed
+      crashed: this.crashed,
+      mode: this.isRunning() ? this.childMode : undefined,
+      ...(this.isRunning() && this.childHeld ? { held: this.childHeld } : {})
     };
   }
 

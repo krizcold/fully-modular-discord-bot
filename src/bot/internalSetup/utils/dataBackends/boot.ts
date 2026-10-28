@@ -15,6 +15,7 @@ import { getConfigProperty } from '../configManager';
 import { ACK_MS, sweepLateWrites } from './replyGate';
 import { saveMark, type SaveMark } from './scopeRecord';
 import { ledgerOf, runAdmitted } from './writeLedger';
+import { isMaintenanceGateClosed, maintenanceText, runTracked } from '../maintenanceGate';
 
 // Startup barrier bound = the acceptance window: past it something is wrong
 // enough that holding clientReady longer helps nobody.
@@ -210,8 +211,8 @@ export async function awaitDataStartupBarrier(): Promise<void> {
 
 /** The dispatch gate's answer for a guild action (R1-J2): admit, or the cause that holds it. */
 export type GateCause = 'admit' | HoldCause;
-export type HoldCause = 'stopping' | 'refused' | 'moved' | 'not-served' | 'loading';
-const FINAL_CAUSES = new Set<GateCause>(['stopping', 'refused', 'moved']);
+export type HoldCause = 'stopping' | 'maintenance' | 'refused' | 'moved' | 'not-served' | 'loading';
+const FINAL_CAUSES = new Set<GateCause>(['stopping', 'maintenance', 'refused', 'moved']);
 const HOLD_POLL_MS = 50;
 /** A panel action's or a console invoke's hold, which no Discord deadline bounds: 2.5 s, as the data route waits. */
 export const ENTRY_WAIT_MS = 2500;
@@ -222,6 +223,7 @@ export const ENTRY_WAIT_MS = 2500;
  */
 export function gateCauseNow(guildId: string, since: number): GateCause {
   if (isClosedForExit()) return 'stopping';
+  if (isMaintenanceGateClosed()) return 'maintenance';
   if (bootStatus.state === 'refused') return 'refused';
   const readiness = getDataReadiness();
   if (!readiness || resolveDataBackend() === 'file') return 'admit';
@@ -244,7 +246,7 @@ export async function admitGuildAction(guildId: string, deadlineAt: number): Pro
 }
 
 const LOADING_TEXT = "This server's data is still loading, try again in a moment.";
-const CAUSE_TEXTS: Record<Exclude<HoldCause, 'loading'>, string> = {
+const CAUSE_TEXTS: Record<Exclude<HoldCause, 'loading' | 'maintenance'>, string> = {
   stopping: 'The bot is stopping; please try again in a moment.',
   refused: "This bot's data storage is currently unavailable; please contact the server operator.",
   moved: "Another bot process took over this server's data; please try again in a moment.",
@@ -253,6 +255,7 @@ const CAUSE_TEXTS: Record<Exclude<HoldCause, 'loading'>, string> = {
 
 /** The member's and the web panel's text for a held action; the loading notice is operator-editable in config.json. */
 export function gateCauseText(cause: HoldCause): string {
+  if (cause === 'maintenance') return maintenanceText();
   return cause === 'loading' ? noticeText('outageNotice.dataLoading', LOADING_TEXT) : CAUSE_TEXTS[cause];
 }
 
@@ -260,6 +263,7 @@ export function gateCauseText(cause: HoldCause): string {
 export function gateConsoleText(cause: HoldCause, guildId: string): string {
   switch (cause) {
     case 'stopping': return 'the bot is stopping; try again in a moment';
+    case 'maintenance': return maintenanceText();
     case 'refused': return "the bot's data storage is unavailable; contact the server operator";
     case 'moved': return `another bot process took over guild ${guildId}'s data; try again in a moment`;
     case 'not-served': return `guild ${guildId}'s data is not served by this bot process right now; try again in a moment`;
@@ -299,8 +303,8 @@ export function runAsAdmitted<T>(args: any[], fn: () => T): T {
  * gate's sweep of the interaction, which the listener does not wait on.
  */
 export async function dispatchGated(eventName: string, args: any[], dispatch: (...args: any[]) => Promise<void>): Promise<void> {
-  if (!(await gateEventDispatch(eventName, args, () => void dispatch(...args)))) return;
-  await runAsAdmitted(args, () => dispatch(...args));
+  if (!(await gateEventDispatch(eventName, args, () => { if (!isMaintenanceGateClosed()) void dispatch(...args); }))) return;
+  await runTracked(() => runAsAdmitted(args, () => dispatch(...args)));
   if (eventName === 'interactionCreate') void sweepLateWrites(args[0]);
 }
 
@@ -312,6 +316,11 @@ export async function dispatchGated(eventName: string, args: any[], dispatch: (.
  * from a Guild payload (guildCreate, guildDelete and the like), which only the tier gate reads.
  */
 export async function gateEventDispatch(eventName: string, args: any[], replay: () => void): Promise<boolean> {
+  if (isMaintenanceGateClosed()) {
+    const first = args[0];
+    if (first && typeof first.isRepliable === 'function') await holdInteraction(first, eventGuildId(args) ?? '');
+    return false;
+  }
   if (eventName === 'clientReady') {
     await awaitDataStartupBarrier();
     return true;
@@ -346,6 +355,7 @@ function noticeText(property: string, fallback: string): string {
 
 /** User-visible text for a refused write; the database-unreachable notice is operator-editable in config.json. */
 export function dataUnavailableMessage(causeKey: DataUnavailableCause): string {
+  if (causeKey === 'maintenance') return 'The bot is in maintenance, so your change was not saved. Please try again later.';
   if (causeKey === 'node-stopping') return 'The bot is restarting, so your change was not saved. Please try again in a moment.';
   if (causeKey === 'storage-failing') return "The bot cannot write to its disk right now, so your change was not saved. Please try again later or contact support.";
   if (causeKey === 'database-backlog') return "The bot's database is behind on saving changes, so your change was not saved. Please try again in a moment.";

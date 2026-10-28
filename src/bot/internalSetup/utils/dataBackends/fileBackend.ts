@@ -268,6 +268,11 @@ export function queuedFileWrites(): number {
   return pendingOps.size;
 }
 
+/** The paths of queuedFileWrites. */
+export function queuedFilePaths(): string[] {
+  return [...pendingOps.keys()];
+}
+
 export function fileFlushOnTheWire(): boolean {
   return flushing.size > 0;
 }

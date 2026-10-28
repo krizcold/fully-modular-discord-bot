@@ -6,6 +6,8 @@ import { admitGuildAction, ENTRY_WAIT_MS, gateCauseText } from './dataBackends/b
 import { runSealed } from './dataBackends/writeLedger';
 import { truthText, verdictOf } from './dataBackends/replyGate';
 import { broadcastWebUIPanelUpdate } from './panel/panelWebUIAdapter';
+import { maintenanceIpcRefusal } from './maintenance';
+import { runTracked } from './maintenanceGate';
 
 /**
  * Set up IPC message handlers for Web-UI panel integration
@@ -73,6 +75,12 @@ export function setupPanelIPCHandlers(): void {
     const ownedPrefixes = ['panel:', 'dev:', 'bot:', 'guild:'];
     if (!ownedPrefixes.some(p => type.startsWith(p))) return;
 
+    const refusal = maintenanceIpcRefusal(type);
+    if (refusal) {
+      process.send!({ requestId, data: refusal });
+      return;
+    }
+
     const panelManager = getPanelManager();
 
     // Rate limiting check (skip for read-only operations that don't modify state)
@@ -95,7 +103,7 @@ export function setupPanelIPCHandlers(): void {
 
     try {
       const response = PANEL_ACTIONS.has(type)
-        ? await runPanelAction(type, data, panelManager)
+        ? await runTracked(() => runPanelAction(type, data, panelManager))
         : await handleIPCMessage(type, data, panelManager);
       process.send!({ requestId, data: response });
     } catch (error) {

@@ -16,6 +16,7 @@ import getLocalCommands from './getLocalCommands';
 import { buildCommandPayload } from './commandUtils';
 import { resolveClientApplication } from './clientApplication';
 import { LoadedModule } from '../../types/moduleTypes';
+import { maintenanceIpcRefusal } from './maintenance';
 import { componentConfigPath, getLastAppliedDisabledCommands, readConfigFile, setLastAppliedDisabledCommands } from './appStoreConfigFile';
 
 let clientRef: Client | null = null;
@@ -231,6 +232,11 @@ export function setupToggleIPCHandlers(client: Client): void {
 
     const { type, requestId, data } = message;
     if (type !== 'component:toggle' || !requestId) return;
+    const refusal = maintenanceIpcRefusal(type);
+    if (refusal) {
+      process.send!({ requestId, data: refusal });
+      return;
+    }
 
     const key = `${data?.module}:${data?.componentType}:${data?.name}`;
     const run = (toggleChains.get(key) ?? Promise.resolve()).then(() => applyToggle(requestId, data));

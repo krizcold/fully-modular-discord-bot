@@ -7,7 +7,7 @@
 import { randomUUID } from 'crypto';
 import { Client, Pool } from 'pg';
 import { guardPoolClients, shortLivedClient } from '../pgClient';
-import type { PoolClient, QueryResult } from 'pg';
+import type { PoolClient, QueryConfig, QueryResult } from 'pg';
 import type {
   DataBackend,
   DocKey,
@@ -127,6 +127,24 @@ export type ClaimAnswer = { outcome: 'claimed'; claim: number } | { outcome: 'mi
 export type ProvisionVerdict = { state: 'provisioned' } | { state: 'mismatch'; found: string } | { state: 'stopped' };
 
 type AlertEvent = 'outage' | 'recovered' | 'deposed';
+const ASK_DATABASE_TIMEOUT_MS = 5_000;
+
+/** An error as the held log names it: its SQLSTATE when it has one, then its message. */
+function describeFailure(error: unknown): { detail: string; code?: string } {
+  const code = error && typeof error === 'object' ? (error as { code?: unknown }).code : undefined;
+  const message = error instanceof Error ? error.message : String(error);
+  return typeof code === 'string' && /^[0-9A-Z]{5}$/.test(code) ? { detail: `SQLSTATE ${code}: ${message}`, code } : { detail: message };
+}
+
+/** The database refused the login itself (SQLSTATE 28000, a role blocked from logging in); 28P01, a wrong password, is not this. */
+export function isLoginRefused(error: unknown): boolean {
+  let current: unknown = error;
+  for (let depth = 0; depth < 3 && current && typeof current === 'object'; depth++) {
+    if ((current as { code?: unknown }).code === '28000') return true;
+    current = (current as { cause?: unknown }).cause;
+  }
+  return false;
+}
 type AlertListener = (event: AlertEvent, detail: string) => void;
 
 export class PostgresBackend implements DataBackend {
@@ -148,6 +166,7 @@ export class PostgresBackend implements DataBackend {
   private stopped = false;
   private probing = false;
   private readonly listeners: AlertListener[] = [];
+  private readonly loginRefusedListeners: Array<() => void> = [];
   private readonly pendingSleeps = new Set<{ timer: NodeJS.Timeout; resolve: () => void }>();
 
   constructor(opts: { url: string }) {
@@ -225,6 +244,29 @@ export class PostgresBackend implements DataBackend {
     this.listeners.push(cb);
   }
 
+  /** Called each time an operation fails because the database refused the login (isLoginRefused). */
+  onLoginRefused(cb: () => void): void {
+    this.loginRefusedListeners.push(cb);
+  }
+
+  private noteLoginRefused(error: unknown): void {
+    if (!isLoginRefused(error)) return;
+    for (const listener of this.loginRefusedListeners) {
+      try { listener(); } catch (listenerError) { console.error('[PostgresBackend] A login-refused listener threw:', listenerError); }
+    }
+  }
+
+  /** SELECT 1 through the guild-data pool: the database answers, refuses the login (isLoginRefused), or neither. */
+  async askDatabase(): Promise<'answers' | 'refused' | 'unreachable'> {
+    try {
+      await this.pool.query({ text: 'SELECT 1', query_timeout: ASK_DATABASE_TIMEOUT_MS } as QueryConfig);
+      this.noteSuccess();
+      return 'answers';
+    } catch (error) {
+      return isLoginRefused(error) ? 'refused' : 'unreachable';
+    }
+  }
+
   private async bootstrapLoop(): Promise<void> {
     let attempt = 0;
     while (!this.stopped) {
@@ -241,6 +283,7 @@ export class PostgresBackend implements DataBackend {
         return;
       } catch (error) {
         if (this.stopped) return;
+        this.noteLoginRefused(error);
         console.warn(`[PostgresBackend] Bootstrap attempt ${attempt + 1} failed (retrying):`, error);
         await this.sleep(backoffDelay(attempt++));
       }
@@ -260,7 +303,9 @@ export class PostgresBackend implements DataBackend {
           this.becomeReady();
           console.log('[PostgresBackend] Probe succeeded; backend ready');
           return;
-        } catch { /* still down; keep probing */ }
+        } catch (error) {
+          this.noteLoginRefused(error);
+        }
       }
     } finally {
       this.probing = false;
@@ -286,6 +331,7 @@ export class PostgresBackend implements DataBackend {
 
   private noteFailure(error: unknown): void {
     if (this.schemaMismatch || this.stopped) return;
+    this.noteLoginRefused(error);
     if (this.state !== 'ready') return; // connecting: bootstrap loop owns retries; outage: probe loop running
     this.state = 'outage';
     this.outageSince = Date.now();
@@ -545,7 +591,7 @@ export class PostgresBackend implements DataBackend {
       client = await this.pool.connect();
     } catch (error) {
       this.noteFailure(error);
-      return { ok: false, reason: 'unavailable' };
+      return { ok: false, reason: 'unavailable', ...describeFailure(error) };
     }
     let destroy = false;
     try {
@@ -593,7 +639,7 @@ export class PostgresBackend implements DataBackend {
       await this.rollbackQuiet(client);
       this.noteFailure(error);
       console.error(`[PostgresBackend] flushGuild failed for ${guildId} (caller retries):`, error);
-      return { ok: false, reason: 'unavailable' };
+      return { ok: false, reason: 'unavailable', ...describeFailure(error) };
     } finally {
       client.release(destroy ? true : undefined);
     }

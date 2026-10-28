@@ -17,6 +17,8 @@ export function hopFailure(code: unknown, detail?: string): HopFailure | null {
       return { status: 503, error: detail || 'the database backend is unavailable' };
     case 'bot-down':
       return { status: 503, error: 'the bot process is not running' };
+    case 'maintenance':
+      return { status: 503, error: detail || 'the bot is in maintenance, so nothing was changed' };
     default:
       return null;
   }

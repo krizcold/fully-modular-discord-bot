@@ -42,6 +42,7 @@
 import type { Client } from 'discord.js';
 import { loadCredentials } from '@/utils/envLoader';
 import { getPaymentRegistry } from './paymentRegistry';
+import { isMaintenanceGateClosed } from '../maintenanceGate';
 import type {
   PaymentProvider,
   ProviderCapabilities,
@@ -185,7 +186,7 @@ export class ServerBoostingProvider implements PaymentProvider {
    * boost variant on each guild those boosters own.
    */
   private async tick(): Promise<void> {
-    if (!this.client) return;
+    if (!this.client || isMaintenanceGateClosed()) return;
     const c = loadCredentials();
     const targetId = c.BOOST_TARGET_GUILD_ID;
     if (!targetId) return;

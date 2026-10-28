@@ -19,6 +19,7 @@ import { ensureDir } from '../pathHelpers';
 import { dataPath } from '../../../../utils/dataRoot';
 import { saveData } from '../dataManager';
 import { getPaymentRegistry } from './paymentRegistry';
+import { isMaintenanceGateClosed } from '../maintenanceGate';
 import type {
   PaymentProvider,
   ProviderCapabilities,
@@ -518,7 +519,9 @@ export class DummyProvider implements PaymentProvider {
   start(): void {
     this.ensureLoaded();
     if (this.tickTimer) return;
-    this.tickTimer = setInterval(() => this.tick(), 60_000);
+    this.tickTimer = setInterval(() => {
+      if (!isMaintenanceGateClosed()) this.tick();
+    }, 60_000);
   }
 
   stop(): void {
