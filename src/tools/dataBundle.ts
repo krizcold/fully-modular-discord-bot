@@ -9,7 +9,8 @@ import { Client, resolveTarget } from '../cli/client';
 import { bundleRefusal, importBundle, readBundle, writeBundle } from '../bot/internalSetup/utils/dataInterchange';
 
 async function refuseIfUnsafe(guildId: string): Promise<void> {
-  const refusal = bundleRefusal(guildId, await new Client(resolveTarget({})).botAnswers());
+  const panel = await new Client(resolveTarget({})).panelAnswers();
+  const refusal = bundleRefusal(guildId, panel.bot, panel.migration);
   if (refusal) {
     console.error(`Refused: ${refusal}`);
     process.exit(1);

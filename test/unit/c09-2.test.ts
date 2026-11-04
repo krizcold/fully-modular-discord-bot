@@ -127,7 +127,9 @@ describe('migration requests are stamped only on delivery (R35-J2)', () => {
       targetTierId: 'b', targetOfferingId: 'o2', targetVariantId: 'v2',
       effectiveDate: new Date(Date.now() + 86400000).toISOString(), message: '',
     });
-    await new Promise((r) => setTimeout(r, 20));
+    const stamped = (guildId: string) => !!(pm as any).config.migrations[0].decisions.find((d: any) => d.guildId === guildId).notifiedAt;
+    const deadline = Date.now() + 5_000;
+    while (!stamped('g1') && Date.now() < deadline) await new Promise(r => setTimeout(r, 2));
     const decisions = (pm as any).config.migrations[0].decisions;
     expect(decisions.find((d: any) => d.guildId === 'g1').notifiedAt).toBeTruthy();
     expect(decisions.find((d: any) => d.guildId === 'g2').notifiedAt).toBeUndefined();
@@ -236,7 +238,8 @@ describe('review round rows (C09-2)', () => {
       targetTierId: 'b', targetOfferingId: 'o2', targetVariantId: 'v2',
       effectiveDate: new Date(Date.now() + 86400000).toISOString(), message: '',
     });
-    await new Promise((r) => setTimeout(r, 20));
+    const deadline = Date.now() + 5_000;
+    while (!(pm as any).config.migrations[0].decisions.every((d: any) => !!d.notifiedAt) && Date.now() < deadline) await new Promise(r => setTimeout(r, 2));
     const decisions = (pm as any).config.migrations[0].decisions;
     expect(decisions.length).toBe(2);
     expect(decisions.every((d: any) => !!d.notifiedAt)).toBe(true);

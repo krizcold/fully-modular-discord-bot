@@ -20,6 +20,7 @@ import {
 } from '../../utils/envLoader';
 import { dataPath } from '../../utils/dataRoot';
 import { reconfigureOAuth } from '../auth/oauthConfig';
+import type { BotManager } from '../botManager';
 
 /** Keys whose value an answer never repeats (the secrets, and the IDs /status masks). */
 const MASKED_KEYS = new Set<string>([
@@ -97,7 +98,7 @@ function computeReloadActions(
   return changes;
 }
 
-export function createSetupRoutes(): Router {
+export function createSetupRoutes(botManager?: Pick<BotManager, 'migrationRunning'>): Router {
   const router = Router();
 
   // Auth is applied in server.ts via requireAuth middleware
@@ -155,6 +156,11 @@ export function createSetupRoutes(): Router {
    */
   router.post('/credentials', async (req: Request, res: Response) => {
     try {
+      const running = botManager?.migrationRunning();
+      if (running) {
+        res.status(409).json({ success: false, error: `A data migration is running (migration ${running.jobId}); nothing was saved` });
+        return;
+      }
       const isStandalone = getDeploymentMode() === 'standalone';
       const {
         // Main credentials: only honored when isStandalone (ignored when managed)

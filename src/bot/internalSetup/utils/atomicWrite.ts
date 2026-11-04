@@ -1,11 +1,20 @@
 import * as fs from 'fs';
 import * as path from 'path';
 
-export function atomicWriteFileSync(file: string, contents: string): void {
+/** Writes through a temp file and a rename; `keep` gives the new file that mode, and that owner where the process may set it. */
+export function atomicWriteFileSync(file: string, contents: string, keep?: { mode: number; uid: number; gid: number }): void {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
-  const fd = fs.openSync(tmp, 'w');
+  const fd = fs.openSync(tmp, 'w', keep ? keep.mode & 0o777 : 0o666);
   try {
+    if (keep) {
+      fs.fchmodSync(fd, keep.mode & 0o7777);
+      try {
+        fs.fchownSync(fd, keep.uid, keep.gid);
+      } catch {
+        try { fs.fchownSync(fd, -1, keep.gid); } catch { /* the process is not in that group */ }
+      }
+    }
     fs.writeFileSync(fd, contents, 'utf-8');
     fs.fsyncSync(fd);
   } catch (error) {

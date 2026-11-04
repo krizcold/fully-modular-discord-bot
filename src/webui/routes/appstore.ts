@@ -1845,6 +1845,10 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
    */
   router.put('/premium/providers/:providerId/credentials', (req: Request, res: Response) => {
     try {
+      const running = botManager.migrationRunning?.();
+      if (running) {
+        return res.status(409).json({ success: false, error: `A data migration is running (migration ${running.jobId}); nothing was saved` });
+      }
       const provider = getPaymentRegistry().get(req.params.providerId);
       if (!provider) return res.status(404).json({ success: false, error: `Provider '${req.params.providerId}' not registered` });
       const fields = provider.getCredentialFields ? provider.getCredentialFields() : [];

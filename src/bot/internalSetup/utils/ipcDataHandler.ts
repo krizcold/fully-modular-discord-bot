@@ -29,6 +29,7 @@ import { ROOT_CONFIG_PATH } from './configManager';
 import { isInternalGlobalRel } from './configDiscovery';
 import { DataBackendUnavailableError, getWorkingSet } from './dataBackends/workingSet';
 import { awaitGuildDataReady } from './dataBackends/boot';
+import { canonicalGuildKey } from './dataKeys';
 
 type DataOpCode = 'frozen' | 'not-owner' | 'backend-unavailable' | 'bot-down' | 'invalid' | 'io-error' | 'maintenance';
 
@@ -88,6 +89,11 @@ function validSegment(value: string, allowSubpath: boolean): boolean {
   if (typeof value !== 'string' || value.length === 0 || value.length > 256) return false;
   if (value.includes('\\') || value.includes('..') || value.startsWith('/')) return false;
   if (!allowSubpath && value.includes('/')) return false;
+  try {
+    canonicalGuildKey('', value);
+  } catch {
+    return false;
+  }
   return true;
 }
 

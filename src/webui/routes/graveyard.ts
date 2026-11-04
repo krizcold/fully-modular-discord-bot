@@ -6,7 +6,7 @@ import { Router, Request, Response } from 'express';
 import { BotManager } from '../botManager';
 import { resolveDataBackend } from '../../utils/envLoader';
 import { listGraveyardEntries } from '../../bot/internalSetup/utils/dataManager';
-import { recognitionRefusal } from '../../bot/internalSetup/utils/dataBackends/recognitionGuard';
+import { readFileMarker, recognitionRefusal } from '../../bot/internalSetup/utils/dataBackends/recognitionGuard';
 import { getWebuiDataReader, isDataBackendUnreachable } from '../utils/webuiDataReader';
 import { hopFailure } from './hopFailure';
 
@@ -23,8 +23,8 @@ export function createGraveyardRoutes(botManager: BotManager): Router {
 
   /**
    * GET /api/data/graveyard
-   * All restorable entries: file-mode _graveyard dirs plus, when the
-   * deployment routes postgres, the tombstone batches.
+   * All restorable entries: the _graveyard dirs when files are the live
+   * store, and the tombstone batches when the deployment routes postgres.
    */
   router.get('/', async (req: Request, res: Response) => {
     try {
@@ -33,7 +33,9 @@ export function createGraveyardRoutes(botManager: BotManager): Router {
         res.status(503).json({ success: false, error: `The graveyard is not served: ${refusal}.` });
         return;
       }
-      const entries: GraveyardEntry[] = (await listGraveyardEntries()).map(e => ({ ...e, backend: 'file' as const }));
+      // A move to Postgres leaves /data/_graveyard in place; it is listed only while files are the live store.
+      const live = readFileMarker()?.live ?? resolveDataBackend();
+      const entries: GraveyardEntry[] = live === 'file' ? (await listGraveyardEntries()).map(e => ({ ...e, backend: 'file' as const })) : [];
       if (resolveDataBackend() === 'postgres') {
         try {
           for (const batch of await getWebuiDataReader().listGraveyard()) {

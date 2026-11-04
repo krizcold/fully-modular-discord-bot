@@ -9,7 +9,7 @@ import * as path from 'path';
 import * as crypto from 'crypto';
 import { DATA_ROOT } from '../../../utils/dataRoot';
 import { flushGuild } from './dataManager';
-import { readFileMarker } from './dataBackends/recognitionGuard';
+import { MIGRATION_FILE, readDataFacts } from './dataBackends/recognitionGuard';
 import { resolveDataBackend, type DataBackendKind } from '../../../utils/envLoader';
 
 export interface FileRecord {
@@ -199,9 +199,12 @@ const GUILD_ID = /^\d+$/;
  * reads and writes /data/<guild> directly, so it is only true to its word for a
  * file-routed guild with no bot process beside it.
  */
-export function bundleRefusal(guildId: string, botRunning: 'yes' | 'no' | 'unknown'): string | null {
+export function bundleRefusal(guildId: string, botRunning: 'yes' | 'no' | 'unknown', migrating: 'yes' | 'no' | 'unknown' = 'no'): string | null {
   if (!GUILD_ID.test(guildId)) return `"${guildId}" is not a guild id`;
-  const marker = readFileMarker();
+  const facts = readDataFacts();
+  if (!facts.ok) return facts.reason;
+  if (migrating === 'yes') return 'a data migration is running; run the bundle once it ends';
+  const marker = facts.marker;
   let route: DataBackendKind;
   try {
     route = marker ? marker.live : resolveDataBackend();
@@ -213,7 +216,20 @@ export function bundleRefusal(guildId: string, botRunning: 'yes' | 'no' | 'unkno
   }
   if (botRunning === 'yes') return 'the bot is running; stop it first, a bundle beside it would miss its queued writes or be overwritten by them';
   if (botRunning === 'unknown') return 'could not confirm the bot is stopped (the panel did not answer or gave no clear reply); start the panel (/webui start) or stop the bot first';
+  if (migrating === 'unknown') return 'could not confirm that no data migration is running (the panel gave no clear reply)';
   return null;
+}
+
+/** The marker and the journal as they are on disk, to tell whether a migration touched them during an import. */
+function storeRecords(): string {
+  const read = (file: string) => {
+    try {
+      return fs.readFileSync(file, 'utf-8');
+    } catch (error) {
+      return `[${(error as NodeJS.ErrnoException)?.code ?? 'unreadable'}]`;
+    }
+  };
+  return `${read(path.join(DATA_ROOT, '.backend.json'))}\n${read(MIGRATION_FILE)}`;
 }
 
 function encodeSummary(files: { relPath: string; size: number; sha256: string }[]): BundleSummary {
@@ -381,6 +397,7 @@ export async function importBundle(filePath: string): Promise<BundleImportResult
   }
 
   const liveDir = path.join(DATA_ROOT, guildId);
+  const recordsAtCheck = storeRecords();
   const staging = path.join(DATA_ROOT, `.bundle-import-${guildId}-${Date.now()}`);
   let moved: string | null = null;
   let swapping = false;
@@ -391,6 +408,9 @@ export async function importBundle(filePath: string): Promise<BundleImportResult
     if (!bundled || staged.fileCount !== written.fileCount || staged.fileCount !== bundled.fileCount
       || staged.namespaceHash !== bundled.namespaceHash) {
       throw new Error('[DataInterchange] Staged import does not match the bundle summary');
+    }
+    if (storeRecords() !== recordsAtCheck) {
+      throw new Error('[DataInterchange] /data/.backend.json or /data/.migration.json changed while the import ran, so a data migration may have started');
     }
 
     const live = await fs.promises.stat(liveDir).catch(() => null);

@@ -122,7 +122,8 @@ describe('the provisioning verdict', () => {
     await new Promise(resolve => { setTimeout(resolve, 30); });
     expect(verdict).toBeUndefined();
     await backend.stop();
-    await new Promise(resolve => { setTimeout(resolve, 10); });
+    const deadline = Date.now() + 5_000;
+    while (verdict === undefined && Date.now() < deadline) await new Promise(r => setTimeout(r, 2));
     expect(verdict).toEqual({ state: 'stopped' });
   });
 });

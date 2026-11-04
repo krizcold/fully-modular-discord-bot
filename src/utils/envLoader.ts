@@ -5,6 +5,7 @@ import * as path from 'path';
 import * as crypto from 'crypto';
 import * as dotenv from 'dotenv';
 import { dataPath } from './dataRoot';
+import { atomicWriteFileSync } from '../bot/internalSetup/utils/atomicWrite';
 
 /**
  * Deployment mode.
@@ -248,6 +249,51 @@ export function resolveDataBackend(): DataBackendKind {
     else throw new Error(`[EnvLoader] Invalid DATA_BACKEND value "${raw}" (expected "file" or "postgres")`);
   }
   return cachedEnvBackend;
+}
+
+/** A migration switched DATA_BACKEND: the next resolveDataBackend reads it again. */
+export function resetDataBackendCache(): void {
+  cachedEnvBackend = null;
+}
+
+/** DATA_BACKEND as /data/.env holds it now (lowercased), or null when the file or the key is absent or unreadable. */
+export function readEnvFileDataBackend(): string | null {
+  try {
+    const value = dotenv.parse(fs.readFileSync(dataPath('.env'))).DATA_BACKEND;
+    return typeof value === 'string' ? value.trim().toLowerCase() : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Rewrites the DATA_BACKEND line of /data/.env and nothing else (temp file, fsync, rename, fsync of /data), then reads
+ * it back; throws when the write or the read back fails.
+ */
+export function writeEnvDataBackend(value: DataBackendKind): void {
+  const envPath = dataPath('.env');
+  let text = '';
+  let keep: { mode: number; uid: number; gid: number } | undefined;
+  try {
+    text = fs.readFileSync(envPath, 'utf-8');
+    const st = fs.statSync(envPath);
+    keep = { mode: st.mode, uid: st.uid, gid: st.gid };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') throw error;
+  }
+  const lines = text === '' ? [] : text.split('\n');
+  if (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
+  let found = false;
+  const next = lines.map(line => {
+    if (/^\s*(export\s+)?DATA_BACKEND\s*=/.test(line)) {
+      found = true;
+      return `DATA_BACKEND=${value}`;
+    }
+    return line;
+  });
+  if (!found) next.push(`DATA_BACKEND=${value}`);
+  atomicWriteFileSync(envPath, `${next.join('\n')}\n`, keep);
+  if (readEnvFileDataBackend() !== value) throw new Error(`${envPath} does not read back DATA_BACKEND=${value}`);
 }
 
 /**

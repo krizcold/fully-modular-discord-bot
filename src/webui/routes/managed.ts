@@ -6,6 +6,7 @@ import { Router, Request, Response, NextFunction } from 'express';
 import type { BotManager } from '../botManager';
 import { DEFAULT_MAINTENANCE_MESSAGE } from '../../bot/internalSetup/utils/maintenanceGate';
 import { MAINTENANCE_MESSAGE_MAX, readMaintenanceFile, writeMaintenanceFile } from '../../utils/maintenanceFile';
+import { MigrationService } from '../../bot/internalSetup/utils/dataMigration';
 
 function tokensMatch(given: string, expected: string): boolean {
   const a = Buffer.from(given);
@@ -35,9 +36,20 @@ function requireManagerToken(req: Request, res: Response, next: NextFunction): v
   next();
 }
 
-export function createManagedRoutes(botManager: BotManager): Router {
+export function createManagedRoutes(botManager: BotManager, migration: MigrationService = new MigrationService(botManager)): Router {
   const router = Router();
   router.use(requireManagerToken);
+
+  // Contract 9: the data migration. The POST answers within 5 seconds; the job runs on behind it.
+  router.post('/migrate', async (req: Request, res: Response) => {
+    const answer = await migration.post(req.body);
+    res.status(answer.status).json(answer.body);
+  });
+
+  router.get('/migrate', (_req: Request, res: Response) => {
+    const answer = migration.status();
+    res.status(answer.status).json(answer.body);
+  });
 
   // Contract 1: the state is saved first; entering, the bot process then saves what it holds; leaving, the bot process
   // saves what it holds and asks for its restart once nothing is held.
@@ -54,6 +66,11 @@ export function createManagedRoutes(botManager: BotManager): Router {
     }
     if (typeof message === 'string' && message.length > MAINTENANCE_MESSAGE_MAX) {
       res.status(400).json({ success: false, error: `message must be at most ${MAINTENANCE_MESSAGE_MAX} characters` });
+      return;
+    }
+    const running = botManager.migrationRunning?.();
+    if (state === 'running' && running) {
+      res.status(409).json({ success: false, error: `A data migration is running (migration ${running.jobId}); the bot stays in maintenance until it ends` });
       return;
     }
     const before = readMaintenanceFile();

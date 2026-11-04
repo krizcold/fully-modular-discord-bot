@@ -798,9 +798,12 @@ export async function cleanOrphanTmpFiles(dir: string = BASE_DATA_DIR): Promise<
     return;
   }
   const cutoff = Date.now() - ORPHAN_TMP_MAX_AGE_MS;
+  const atRoot = path.resolve(dir) === path.resolve(BASE_DATA_DIR);
   for (const entry of entries) {
     const full = path.join(dir, entry.name);
     if (entry.isDirectory()) {
+      // A data migration's staging and superseded folders keep every file as it was.
+      if (atRoot && (entry.name === '_superseded' || entry.name.startsWith('.migrate-'))) continue;
       await cleanOrphanTmpFiles(full);
     } else if (entry.isFile() && entry.name.endsWith('.tmp')) {
       try {

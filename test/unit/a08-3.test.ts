@@ -8,7 +8,7 @@ import {
   DataBackendUnavailableError,
 } from '../../src/bot/internalSetup/utils/dataManager';
 import path from 'path';
-import { writeRawAtomic, deleteRawAtomic, dropPendingForGuild } from '../../src/bot/internalSetup/utils/dataBackends/fileBackend';
+import { writeRawAtomic, deleteRawAtomic, dropPendingForGuild, fileFlushOnTheWire } from '../../src/bot/internalSetup/utils/dataBackends/fileBackend';
 import { DATA_ROOT } from '../../src/utils/dataRoot';
 import { FileSessionStore } from '../../src/webui/auth/fileSessionStore';
 import { dataUnavailableMessage } from '../../src/bot/internalSetup/utils/dataBackends/boot';
@@ -27,7 +27,8 @@ function failDisk(match: (p: string) => boolean = () => true): void {
 
 async function settle(): Promise<void> {
   await new Promise(r => setImmediate(r));
-  await new Promise(r => setTimeout(r, 20));
+  const deadline = Date.now() + 5_000;
+  while (fileFlushOnTheWire() && Date.now() < deadline) await new Promise(r => setTimeout(r, 2));
 }
 
 afterEach(async () => {

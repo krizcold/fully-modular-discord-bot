@@ -55,6 +55,7 @@ import type { DataBackend, FenceToken } from './dataBackends/backend';
 import { resolveDataBackend } from '../../../utils/envLoader';
 import { currentSince, recordRefusal, recordTicket } from './dataBackends/writeLedger';
 import { noteScopeRefusal, noteScopeTicket, pendingFor, saveMark, stampOf, type SaveMark } from './dataBackends/scopeRecord';
+import { canonicalGuildKey, GuildKeyError, type GuildKey } from './dataKeys';
 import { isMaintenanceGateClosed } from './maintenanceGate';
 
 export { listGlobalDataFiles, saveMark };
@@ -373,7 +374,8 @@ export async function confirmSaved(scope: string, options: { since?: SaveMark; d
 export function readGuildDocRaw(guildId: string, module: string, filename: string): string | null {
   const ws = getWorkingSet();
   if (ws && servedByPostgres()) {
-    return ws.readDocRaw(guildId, module, filename);
+    const key = canonicalGuildKey(module, filename);
+    return ws.readDocRaw(guildId, key.module, key.filename);
   }
   return readRawStrict(guildDocFilePath(guildId, module, filename));
 }
@@ -488,8 +490,39 @@ function getDataDirectory(options: DataOptions): string {
  * Get the full file path for a data file
  */
 function getDataFilePath(filename: string, options: DataOptions): string {
+  if ((options.scope || 'guild') === 'guild') canonicalGuildKey(options.category, filename);
   const dir = getDataDirectory(options);
   return path.join(dir, filename);
+}
+
+/** The canonical key of a guild-scope call; throws GuildKeyError for a key that leaves the guild folder or ends in '/'. */
+function guildKeyOf(filename: string, options: DataOptions): GuildKey {
+  return canonicalGuildKey(options.category, filename);
+}
+
+// Installed by the web UI process (none in the bot process): while it answers a reason, every guild write of that
+// process is refused, checked in the same turn as the write's enqueue.
+let guildWriteGate: (() => string | null) | null = null;
+
+export function setGuildWriteGate(gate: (() => string | null) | null): void {
+  guildWriteGate = gate;
+}
+
+/** A path under a guild folder or the graveyard of the data root. */
+export function isGuildDataPath(absPath: string): boolean {
+  const rel = path.relative(BASE_DATA_DIR, path.resolve(absPath));
+  if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) return false;
+  const first = rel.split(path.sep)[0];
+  return /^\d+$/.test(first) || first === '_graveyard';
+}
+
+function refuseWhileGated(): void {
+  const reason = guildWriteGate?.();
+  if (reason) throw new DataBackendUnavailableError('maintenance', `[Data] ${reason}; the write was not saved`);
+}
+
+function refuseGuildWhileGated(options: DataOptions): void {
+  if ((options.scope || 'guild') === 'guild') refuseWhileGated();
 }
 
 // ============================================================================
@@ -531,6 +564,7 @@ export function writeRawAtomic(absPath: string, contents: string): boolean {
     recordRefusal('node-stopping', `file:${absPath}`);
     throw new DataBackendUnavailableError('node-stopping');
   }
+  if (isGuildDataPath(absPath)) refuseWhileGated();
   const accepted = writeRawAtomicFile(absPath, contents);
   if (accepted) recordTicket(fileTicket(absPath), `file:${absPath}`);
   else recordRefusal(lastRawRefusal() ?? 'io', `file:${absPath}`);
@@ -543,6 +577,7 @@ export function deleteRawAtomic(absPath: string): boolean {
     recordRefusal('node-stopping', `file:${absPath}`);
     throw new DataBackendUnavailableError('node-stopping');
   }
+  if (isGuildDataPath(absPath)) refuseWhileGated();
   const accepted = deleteRawAtomicFile(absPath);
   // A delete still queued for the path has not landed: it answers for this one.
   if (accepted || getPending(absPath)?.op === 'delete') recordTicket(fileTicket(absPath), `file:${absPath}`);
@@ -580,7 +615,8 @@ export function loadData<T = any>(
         console.warn(`[Data] Read for postgres-routed guild ${wsGuild} outside the bot process; serving default`);
         return defaultValue;
       }
-      const res = ws.read(wsGuild, options.category ?? '', filename);
+      const key = guildKeyOf(filename, options);
+      const res = ws.read(wsGuild, key.module, key.filename);
       if (res.status === 'not-ready' || res.value === undefined) return defaultValue;
       return res.value as T;
     }
@@ -682,6 +718,7 @@ function acceptSave<T>(filename: string, options: DataOptions, data: T): SaveTra
   refuseInsideUpdate();
   if (closedForExit) throw new DataBackendUnavailableError('node-stopping');
   refuseInMaintenance(options);
+  refuseGuildWhileGated(options);
   if (guildWriteClosed(options, 'Write')) return { outcome: 'refused', cause: 'not-ready' };
   try {
     const wsGuild = wsRouted(options);
@@ -692,7 +729,8 @@ function acceptSave<T>(filename: string, options: DataOptions, data: T): SaveTra
         return { outcome: 'refused', cause: 'not-ready' };
       }
       const content = JSON.stringify(data, null, 2);
-      const result = ws.save(wsGuild, options.category ?? '', filename, content);
+      const key = guildKeyOf(filename, options);
+      const result = ws.save(wsGuild, key.module, key.filename, content);
       if (result === 'accepted') {
         const ticket = ws.ticketFor(wsGuild);
         getMetricsCollector().recordIO('write', options.guildId ?? null, options.category ?? null);
@@ -755,7 +793,8 @@ function readForUpdate(filename: string, options: DataOptions): UpdateRead {
         return { status: 'refused', cause: 'not-ready' };
       }
       getMetricsCollector().recordIO('read', wsGuild, options.category ?? null);
-      const res = ws.readForUpdate(wsGuild, options.category ?? '', filename);
+      const key = guildKeyOf(filename, options);
+      const res = ws.readForUpdate(wsGuild, key.module, key.filename);
       if (res.status === 'not-ready') return { status: 'refused', cause: 'not-ready' };
       if (res.status === 'stream') {
         console.error(`[DataManager] Update of ${filename} refused: it is written by appends, and a whole write would replace its lines`);
@@ -853,6 +892,7 @@ function acceptAppend(filename: string, options: DataOptions, line: string): App
   refuseInsideUpdate();
   if (closedForExit) throw new DataBackendUnavailableError('node-stopping');
   refuseInMaintenance(options);
+  refuseGuildWhileGated(options);
   if (guildWriteClosed(options, 'Append')) return { outcome: 'refused', cause: 'not-ready' };
   try {
     const wsGuild = wsRouted(options);
@@ -862,7 +902,8 @@ function acceptAppend(filename: string, options: DataOptions, line: string): App
         console.warn(`[Data] Append for postgres-routed guild ${wsGuild} outside the bot process; refused`);
         return { outcome: 'refused', cause: 'not-ready' };
       }
-      const result = ws.append(wsGuild, options.category ?? '', filename, line);
+      const key = guildKeyOf(filename, options);
+      const result = ws.append(wsGuild, key.module, key.filename, line);
       if (result === 'accepted') {
         const ticket = ws.ticketFor(wsGuild);
         getMetricsCollector().recordIO('write', options.guildId ?? null, options.category ?? null);
@@ -892,9 +933,16 @@ function acceptAppend(filename: string, options: DataOptions, line: string): App
  * Check if data file exists
  */
 export function dataExists(filename: string, options: DataOptions): boolean {
+  let key: GuildKey | null = null;
+  try {
+    if ((options.scope || 'guild') === 'guild') key = guildKeyOf(filename, options);
+  } catch (error) {
+    if (error instanceof GuildKeyError) return false;
+    throw error;
+  }
   const wsGuild = wsRouted(options);
-  if (wsGuild !== null) {
-    return getWorkingSet()?.exists(wsGuild, options.category ?? '', filename) ?? false;
+  if (wsGuild !== null && key) {
+    return getWorkingSet()?.exists(wsGuild, key.module, key.filename) ?? false;
   }
   const filePath = getDataFilePath(filename, options);
   const pending = getPending(filePath);
@@ -926,6 +974,7 @@ function acceptDelete(filename: string, options: DataOptions): DeleteTracked {
   refuseInsideUpdate();
   if (closedForExit) throw new DataBackendUnavailableError('node-stopping');
   refuseInMaintenance(options);
+  refuseGuildWhileGated(options);
   if (guildWriteClosed(options, 'Delete')) return { outcome: 'refused', cause: 'not-ready' };
   try {
     const wsGuild = wsRouted(options);
@@ -935,10 +984,11 @@ function acceptDelete(filename: string, options: DataOptions): DeleteTracked {
         console.warn(`[Data] Delete for postgres-routed guild ${wsGuild} outside the bot process; refused`);
         return { outcome: 'refused', cause: 'not-ready' };
       }
-      const result = ws.delete(wsGuild, options.category ?? '', filename);
+      const key = guildKeyOf(filename, options);
+      const result = ws.delete(wsGuild, key.module, key.filename);
       if (result === 'absent') {
         console.log(`[DataManager] File not found for deletion: ${wsGuild}/${options.category ?? ''}/${filename}`);
-        const earlier = ws.unlandedDeleteTicket(wsGuild, options.category ?? '', filename);
+        const earlier = ws.unlandedDeleteTicket(wsGuild, key.module, key.filename);
         return earlier ? { outcome: 'absent', ticket: earlier } : { outcome: 'absent' };
       }
       if (result === 'accepted') {

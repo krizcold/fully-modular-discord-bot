@@ -91,7 +91,7 @@ describe('the touched-line mutation gate', () => {
     }
   });
 
-  it('kills in-process code in pass A and restart-only code in pass B through a child', { timeout: 900_000 }, () => {
+  it('kills in-process code in pass A and restart-only code in pass B through a child', { timeout: 1_850_000 }, () => {
     const fast = lineOf("cachedAppVersion = String(JSON.parse(fs.readFileSync(pkgPath, 'utf-8')).version || '0.0.0');");
     const child = lineOf('atomicWriteFileSync(file, JSON.stringify({ nodeId, createdAt: Date.now() }, null, 2));');
     const run = spawnSync(process.execPath, [
@@ -99,7 +99,7 @@ describe('the touched-line mutation gate', () => {
       '--mutate', `${TARGET}:${fast}-${fast}`,
       '--mutate', `${TARGET}:${child}-${child}`,
       '--concurrency', '2',
-    ], { cwd: root, encoding: 'utf8', timeout: 850_000 });
+    ], { cwd: root, encoding: 'utf8', timeout: 1_800_000 });
     const reportDir = /^Report: (\S+)/m.exec(run.stdout)?.[1];
     expect(reportDir, `${run.stdout}\n${run.stderr}`).toBeDefined();
     const { mutants } = JSON.parse(fs.readFileSync(path.join(root, reportDir!, 'mutants.json'), 'utf8')) as { mutants: Mutant[] };

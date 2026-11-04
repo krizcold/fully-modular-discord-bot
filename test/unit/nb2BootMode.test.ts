@@ -74,7 +74,7 @@ describe('ruling 6: booting in maintenance mode', () => {
     expect(client.options.presence).toMatchObject(MAINTENANCE_PRESENCE);
     expect(client.options.shards).toEqual([0, 1, 2]);
     expect(client.options.shardCount).toBe(3);
-    expect(sent).toContainEqual({ type: 'maintenance:mode', data: { mode: 'maintenance' } });
+    expect(sent).toContainEqual({ type: 'maintenance:mode', data: { mode: 'maintenance', boot: true } });
   });
 
   it('a payment provider registered in maintenance mode is not started', () => {
@@ -149,7 +149,7 @@ describe('ruling 6: booting in maintenance mode', () => {
       loginProbe: async () => answers.shift() ?? 'accepted',
       retryMs: 20,
     });
-    expect(sent).toContainEqual({ type: 'maintenance:mode', data: { mode: 'login-refused' } });
+    expect(sent).toContainEqual({ type: 'maintenance:mode', data: { mode: 'login-refused', boot: true } });
     await tick(150);
     expect(sent.filter(m => m.type === 'control:restart-bot')).toHaveLength(1);
   });

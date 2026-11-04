@@ -915,15 +915,16 @@ let fileRuns = 0;
 // On Windows a file whose unlink is still under way refuses to open (EPERM) until the unlink completes, so a read made
 // while a queued delete is on the wire waits for it (the facade's readers consult the queue and never meet this).
 async function onDisk(file: string): Promise<string | null> {
-  for (let tries = 0; ; tries++) {
+  const deadline = Date.now() + 5_000;
+  for (;;) {
     try {
       return fs.readFileSync(file, 'utf8');
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
       if (code === 'ENOENT') return null;
-      if (code !== 'EPERM' || tries >= 50) throw error;
+      if (code !== 'EPERM' || Date.now() >= deadline) throw error;
     }
-    await new Promise<void>(resolve => { setTimeout(resolve, 20); });
+    await new Promise<void>(resolve => { setTimeout(resolve, 5); });
   }
 }
 
@@ -1246,8 +1247,10 @@ describe('the operator route answers through the real confirmWrite', () => {
     const rename = holdFs('rename', file);
     enqueueWrite(file, '{"first":1}');
     await rename.reached;
+    const first = fileTicket(file).seq;
     const reply = applyOperatorDataWrite(write(guildId));
-    await new Promise(resolve => { setTimeout(resolve, 30); });
+    const deadline = Date.now() + 5_000;
+    while (fileTicket(file).seq === first && Date.now() < deadline) await new Promise(r => setTimeout(r, 2));
     dropPendingForGuild(guildId);
     rename.open();
     expect(await reply).toEqual(LEFT_UNCONFIRMED);

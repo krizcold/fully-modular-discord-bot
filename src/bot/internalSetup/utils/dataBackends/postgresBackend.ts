@@ -84,6 +84,27 @@ const PROVISION_DDL: string[] = [
   `CREATE INDEX IF NOT EXISTS guild_graveyard_ttl_idx ON smdb_data.guild_data_graveyard (retired_at)`,
 ];
 
+/**
+ * Provisions a new store on a client inside its open transaction and answers its store id. The caller holds the
+ * bootstrap advisory lock as a transaction lock; CREATE SCHEMA has no IF NOT EXISTS here, so a schema made since the
+ * caller looked fails the transaction (42P06).
+ */
+export async function provisionStoreInTransaction(client: { query(text: string, params?: unknown[]): Promise<unknown> }): Promise<string> {
+  await client.query('CREATE SCHEMA smdb_data');
+  for (const stmt of PROVISION_DDL.slice(1)) await client.query(stmt);
+  for (let i = 0; i < PARTITION_COUNT; i++) {
+    const suffix = `p${String(i).padStart(2, '0')}`;
+    await client.query(
+      `CREATE TABLE smdb_data.guild_data_${suffix} PARTITION OF smdb_data.guild_data FOR VALUES WITH (MODULUS ${PARTITION_COUNT}, REMAINDER ${i})`);
+    await client.query(
+      `CREATE TABLE smdb_data.guild_append_${suffix} PARTITION OF smdb_data.guild_append FOR VALUES WITH (MODULUS ${PARTITION_COUNT}, REMAINDER ${i})`);
+  }
+  await client.query(`INSERT INTO smdb_data.meta (key, value) VALUES ('schema_version', $1)`, [JSON.stringify({ v: SCHEMA_VERSION })]);
+  const storeId = randomUUID();
+  await client.query(`INSERT INTO smdb_data.meta (key, value) VALUES ('store_id', $1)`, [JSON.stringify(storeId)]);
+  return storeId;
+}
+
 // One process holds one claim and claims never repeat, so an equal claim is the same process. A guild served again
 // after a retire is listed again.
 const FENCED_OWNERSHIP_UPDATE = `

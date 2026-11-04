@@ -49,30 +49,41 @@ export class Client {
   }
 
   /** Whether the bot child runs, from the panel's /api/bot/status: running true is yes, running false is no, anything else (no answer, an error status, a timeout, an unreadable body) is unknown. */
-  botAnswers(timeoutMs = 3000): Promise<'yes' | 'no' | 'unknown'> {
+  async botAnswers(timeoutMs = 3000): Promise<'yes' | 'no' | 'unknown'> {
+    return (await this.panelAnswers(timeoutMs)).bot;
+  }
+
+  /** botAnswers, and whether the panel runs a data migration: its status's migration (null is no, a job is yes, anything else unknown). */
+  panelAnswers(timeoutMs = 3000): Promise<{ bot: 'yes' | 'no' | 'unknown'; migration: 'yes' | 'no' | 'unknown' }> {
+    const unknown = { bot: 'unknown' as const, migration: 'unknown' as const };
     return new Promise((resolve) => {
       const req = http.request(
         { host: this.target.host, port: this.target.port, method: 'GET', path: '/api/bot/status', headers: { Accept: 'application/json' } },
         (res) => {
           const chunks: Buffer[] = [];
           res.on('data', (c: Buffer) => chunks.push(c));
-          res.on('error', () => resolve('unknown'));
+          res.on('error', () => resolve(unknown));
           res.on('end', () => {
-            if (res.statusCode !== 200) return resolve('unknown');
+            if (res.statusCode !== 200) return resolve(unknown);
             try {
-              const running = (JSON.parse(Buffer.concat(chunks).toString('utf8')) as { status?: { running?: unknown } })?.status?.running;
-              resolve(running === true ? 'yes' : running === false ? 'no' : 'unknown');
+              const status = (JSON.parse(Buffer.concat(chunks).toString('utf8')) as { status?: { running?: unknown; migration?: unknown } })?.status;
+              const running = status?.running;
+              const migration = status?.migration;
+              resolve({
+                bot: running === true ? 'yes' : running === false ? 'no' : 'unknown',
+                migration: migration === null ? 'no' : migration && typeof migration === 'object' ? 'yes' : 'unknown',
+              });
             } catch {
-              resolve('unknown');
+              resolve(unknown);
             }
           });
         },
       );
       req.setTimeout(timeoutMs, () => {
         req.destroy();
-        resolve('unknown');
+        resolve(unknown);
       });
-      req.on('error', () => resolve('unknown'));
+      req.on('error', () => resolve(unknown));
       req.end();
     });
   }
@@ -80,7 +91,7 @@ export class Client {
   request(
     method: string,
     path: string,
-    opts: { body?: unknown; headers?: Record<string, string> } = {},
+    opts: { body?: unknown; headers?: Record<string, string>; timeoutMs?: number } = {},
   ): Promise<CliResponse> {
     return new Promise((resolve, reject) => {
       const payload = opts.body === undefined ? undefined : JSON.stringify(opts.body);
@@ -98,7 +109,11 @@ export class Client {
         },
         (res) => {
           const chunks: Buffer[] = [];
+          const cut = (error?: Error) => reject(error ?? new Error('the answer was cut off'));
           res.on('data', (c: Buffer) => chunks.push(c));
+          res.on('aborted', () => cut());
+          res.on('error', cut);
+          res.on('close', () => { if (!res.complete) cut(); });
           res.on('end', () => {
             const text = Buffer.concat(chunks).toString('utf8');
             let body: unknown = text;
@@ -115,6 +130,7 @@ export class Client {
         },
       );
       req.on('error', reject);
+      if (opts.timeoutMs) req.setTimeout(opts.timeoutMs, () => req.destroy(new Error(`no answer within ${Math.round(opts.timeoutMs! / 1000)}s`)));
       if (payload) req.write(payload);
       req.end();
     });

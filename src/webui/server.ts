@@ -21,6 +21,8 @@ import { createDevModulesRoutes } from './routes/devmodules';
 import { createUsageRoutes } from './routes/usage';
 import { createFleetRoutes } from './routes/fleet';
 import { createManagedRoutes } from './routes/managed';
+import { createMigrateRoutes } from './routes/migrate';
+import { MigrationService } from '../bot/internalSetup/utils/dataMigration';
 import { createGraveyardRoutes } from './routes/graveyard';
 import { requireAuth } from './middleware/auth';
 import { adminPageFallback, pathGuard, pathMiss } from './middleware/pathGuard';
@@ -186,8 +188,10 @@ export async function createServer(botManager: BotManager): Promise<Express> {
 
   // Owner API Routes. Auth is enforced at the deployment boundary (AppShield /
   // Authelia when managed, or the localhost bind when standalone); requireAuth passes.
+  // One migration service serves the manager's hook and the panel route, so a POST of either sees the running job.
+  const migration = new MigrationService(botManager);
   app.use('/api/bot', requireAuth, createControlRoutes(botManager));
-  app.use('/api/setup', requireAuth, createSetupRoutes());
+  app.use('/api/setup', requireAuth, createSetupRoutes(botManager));
   app.use('/api/config', requireAuth, createConfigRoutes(botManager));
   app.use('/api/appstore', requireAuth, createAppStoreRoutes(botManager));
   app.use('/api/panels', requireAuth, createPanelRoutes(botManager));
@@ -197,12 +201,13 @@ export async function createServer(botManager: BotManager): Promise<Express> {
   app.use('/api/usage', requireAuth, createUsageRoutes(botManager));
   app.use('/api/fleet', requireAuth, createFleetRoutes(botManager));
   app.use('/api/data/graveyard', requireAuth, createGraveyardRoutes(botManager));
+  app.use('/api/data/migrate', requireAuth, createMigrateRoutes(botManager, migration));
 
   // Manager-facing surface. NOT requireAuth:
   // this one carries its own per-instance token check, because it is reached
   // container-to-container over the shared docker network and so never passes
   // the boundary gateway that authenticates every route above.
-  app.use('/api/managed', createManagedRoutes(botManager));
+  app.use('/api/managed', createManagedRoutes(botManager, migration));
 
   // Serve static frontend files. The admin page's files need the gateway's login; the member page's own files
   // under /assets/ are reachable without it (requireAuth passes; auth lives at the deployment boundary).

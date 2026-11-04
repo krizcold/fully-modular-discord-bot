@@ -26,6 +26,7 @@ import {
   saveGuildConfig
 } from '../../bot/internalSetup/utils/configManager';
 import { writeRawAtomic } from '../../bot/internalSetup/utils/dataManager';
+import { readMaintenanceFile } from '../../utils/maintenanceFile';
 import { dataPath } from '../../utils/dataRoot';
 import { backupMatch, isBackupFilename, listBackups, stampDate, writeBackup, type LegacyNames } from '../utils/configBackups';
 import { childQueuedError, readServedGlobal, readServedGuild, withTargetLock, type ServedRead } from '../utils/servedRead';
@@ -263,6 +264,21 @@ export function createConfigRoutes(botManager: BotManager): Router {
     return true;
   };
 
+  /** A guild write waits out a data migration, and on a JSON bot a maintenance the manager set (the data may be moving). */
+  const refuseGuildWrite = (guildId: string | null | undefined, res: Response): boolean => {
+    if (!guildId) return false;
+    const running = botManager.migrationRunning?.();
+    if (running) {
+      res.status(503).json({ success: false, error: `Nothing was saved: a data migration is running (migration ${running.jobId}).` });
+      return true;
+    }
+    if (!postgresServed() && readMaintenanceFile().state === 'maintenance') {
+      res.status(503).json({ success: false, error: 'Nothing was saved: the bot is in maintenance.' });
+      return true;
+    }
+    return false;
+  };
+
   /**
    * GET /api/config/list?guildId=<guildId>
    * List all available config files (includes module schemas)
@@ -425,6 +441,7 @@ export function createConfigRoutes(botManager: BotManager): Router {
         res.status(400).json({ success: false, error: 'Invalid guildId format' });
         return;
       }
+      if (refuseGuildWrite(guildId, res)) return;
       const resolved = resolveConfigTarget(fileId, guildId ?? null);
       if (!resolved.ok) {
         fail(res, resolved);
@@ -610,6 +627,7 @@ export function createConfigRoutes(botManager: BotManager): Router {
         return;
       }
       const guildId = scope.guildId;
+      if (refuseGuildWrite(guildId, res)) return;
       const resolved = category === 'data' ? resolveDataTarget(fileId, guildId, true) : resolveConfigTarget(fileId, guildId);
       if (!resolved.ok) {
         fail(res, resolved);
@@ -853,6 +871,7 @@ export function createConfigRoutes(botManager: BotManager): Router {
         res.status(400).json({ success: false, error: 'Invalid guildId format' });
         return;
       }
+      if (refuseGuildWrite(guildId, res)) return;
       // The webui parent never writes postgres; database-routed guild writes
       // go through the bot process.
       const postgres = !!guildId && postgresServed();
@@ -976,6 +995,7 @@ export function createConfigRoutes(botManager: BotManager): Router {
         res.status(400).json({ success: false, error: 'File ID is required' });
         return;
       }
+      if (refuseGuildWrite(guildId, res)) return;
 
       const resolved = resolveDataTarget(fileId, guildId, true);
       if (!resolved.ok) {
@@ -1011,6 +1031,7 @@ export function createConfigRoutes(botManager: BotManager): Router {
         res.status(400).json({ success: false, error: 'A valid guildId is required' });
         return;
       }
+      if (refuseGuildWrite(guildId, res)) return;
       if (refuseGuildOffStore(guildId, res, true)) return;
 
       const reply = await botManager.writeGuildData({

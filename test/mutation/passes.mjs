@@ -22,8 +22,9 @@ export const COMMON = {
 const BUILD = { buildCommand: 'node test/helpers/build.cjs', checkers: [], dryRunTimeoutMinutes: 15 };
 
 export const PASSES = {
-  a: { checkers: ['typescript'], timeoutMS: 10_000, timeoutFactor: 2 },
-  a2: { checkers: [], concurrency: 1, timeoutMS: 60_000, timeoutFactor: 4 },
+  // Its run with no mutant runs every fast test importing a mutated file: can pass 5 min.
+  a: { checkers: ['typescript'], timeoutMS: 10_000, timeoutFactor: 2, dryRunTimeoutMinutes: 30 },
+  a2: { checkers: [], concurrency: 1, timeoutMS: 60_000, timeoutFactor: 4, dryRunTimeoutMinutes: 30 },
   // One at a time, as its run with no mutant is made: Stryker builds each run's
   // budget from that run, and a hang in pass B stands with no rerun to clear it.
   b: { ...BUILD, concurrency: 1, timeoutMS: 60_000, timeoutFactor: 2 },

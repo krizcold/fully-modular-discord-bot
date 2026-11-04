@@ -6,6 +6,10 @@ import type { WebSocketManager, WSEvent, WSEventData } from './websocketManager'
 import { getSafetyManager } from '../utils/updateSafety';
 import { setWebuiDataStoreUrl } from './utils/webuiDataReader';
 import type { NotifyOutcome } from '../bot/internalSetup/utils/subscriptionNotifier';
+import { readMaintenanceFile } from '../utils/maintenanceFile';
+import type { RunningMigration } from '../bot/internalSetup/utils/dataMigration';
+
+const MIGRATION_RUNNING = 'A data migration is running';
 
 // A crashed child is started again after this pause. The safety manager's
 // crash threshold (safe mode) bounds fast loops; a child that dies slower than
@@ -63,6 +67,8 @@ export interface BotStatus {
   // What the bot process reported: running, maintenance, login-refused, outage, or held (changes it cannot save keep it from restarting).
   mode?: string;
   held?: { unsavedGuilds: number; unsavedFiles: number };
+  // The data migration running in the web UI process, or null.
+  migration: RunningMigration | null;
 }
 
 export interface LogsResponse {
@@ -102,6 +108,21 @@ export class BotManager {
   private webuiControl: { stop: () => void; start: () => void } | null = null;
   // What the current child reported: serving, in maintenance, refused by its database, or off Discord for an outage.
   private childMode: string = 'running';
+  // The data migration in this process (NB3): while it runs, a start that would serve data is refused.
+  private migrationLock: RunningMigration | null = null;
+  // A crash restart refused under the migration lock, run once when the lock is released.
+  private crashRestartDeferred = false;
+  private restartStartDeferred: { stops: number } | null = null;
+  // The current child booted in maintenance mode (its boot flag), kept for that child's life.
+  private childMaintenanceBoot = false;
+  // The current child has said what it booted as: a maintenance:mode message, its first data:store, or its own login line.
+  private childModeReported = false;
+  private childLoggedIn = false;
+  // The current child's answer to the last maintenance:enter, or null when none was asked of it.
+  private childEnterAnswer: MaintenanceSaveResult | null = null;
+  // The last child forked and whether its exit was seen; shutdown drops the handle of a child that outlives SIGKILL.
+  private lastChild: ChildProcess | null = null;
+  private lastChildExited = true;
   // A restart the child or the maintenance hook asked for while another operation held the lock.
   private queuedRestart: Promise<BotStartResult> | null = null;
   private queuedRestartChild: ChildProcess | null = null;
@@ -209,6 +230,10 @@ export class BotManager {
       return { success: false, reason: 'exiting', error: 'The process is exiting' };
     }
 
+    if (this.migrationBlocksStart()) {
+      return { success: false, reason: 'migration_running', error: MIGRATION_RUNNING };
+    }
+
     // Check if another operation is in progress
     if (this.operationInProgress) {
       return {
@@ -268,6 +293,12 @@ export class BotManager {
       const child = this.botProcess;
       this.childMode = 'running';
       this.childHeld = null;
+      this.childMaintenanceBoot = false;
+      this.childModeReported = false;
+      this.childLoggedIn = false;
+      this.childEnterAnswer = null;
+      this.lastChild = child;
+      this.lastChildExited = false;
       // A new child serves no store until it reports one.
       setWebuiDataStoreUrl(null);
       this.botStartTime = Date.now();
@@ -278,6 +309,10 @@ export class BotManager {
         this.botProcess.stdout.on('data', (data: Buffer) => {
           const logLine = data.toString();
           this.addLog(logLine);
+          if (this.botProcess === child && logLine.includes('Logged in as')) {
+            this.childLoggedIn = true;
+            this.childModeReported = true;
+          }
           process.stdout.write(`[Bot] ${logLine}`); // Also write to parent stdout for Docker logs
         });
       }
@@ -293,6 +328,7 @@ export class BotManager {
 
       // Handle process exit
       this.botProcess.on('exit', (code, signal) => {
+        if (this.lastChild === child) this.lastChildExited = true;
         // A child still draining when its shutdown moved the handle on exits
         // later; that exit is not its successor's.
         if (this.botProcess !== child) {
@@ -325,16 +361,7 @@ export class BotManager {
             console.warn(`[BotManager] Starting the bot again in ${CRASH_RESTART_DELAY_MS / 1000}s (automatic start ${this.crashRestarts} of ${CRASH_RESTARTS_MAX})`);
             this.crashRestartTimer = setTimeout(() => {
               this.crashRestartTimer = null;
-              if (this.stopRequested || this.isInSafeMode()) {
-                console.log(`[BotManager] The automatic start was called off: ${this.stopRequested ? 'a stop was requested' : 'safe mode is on'}`);
-                return;
-              }
-              this.startingAfterCrash = true;
-              void this.start().then(result => {
-                if (!result.success && result.reason !== 'already_running') {
-                  console.error(`[BotManager] The bot did not start again after its crash: ${result.error ?? result.reason ?? 'unknown'}`);
-                }
-              }).finally(() => { this.startingAfterCrash = false; });
+              this.runCrashRestart();
             }, CRASH_RESTART_DELAY_MS).unref();
           }
         } else {
@@ -375,8 +402,11 @@ export class BotManager {
           // The parent's reader follows the store the child serves, never only
           // the node's own /data/.env.
           setWebuiDataStoreUrl(typeof message.data?.url === 'string' ? message.data.url : null);
+          this.childModeReported = true;
         } else if (message.type === 'maintenance:mode') {
           if (typeof message.data?.mode === 'string') {
+            if (message.data.boot === true) this.childMaintenanceBoot = true;
+            this.childModeReported = true;
             this.childMode = message.data.mode;
             const held = message.data.held;
             this.childHeld = this.childMode === 'held' && held && typeof held.unsavedGuilds === 'number' && typeof held.unsavedFiles === 'number'
@@ -436,6 +466,105 @@ export class BotManager {
     this.exiting = true;
   }
 
+  /** The automatic start after a crash; under the migration lock it is recorded and run once at the release. */
+  private runCrashRestart(): void {
+    if (this.stopRequested || this.isInSafeMode()) {
+      console.log(`[BotManager] The automatic start was called off: ${this.stopRequested ? 'a stop was requested' : 'safe mode is on'}`);
+      return;
+    }
+    if (this.migrationBlocksStart()) {
+      this.crashRestartDeferred = true;
+      console.warn('[BotManager] The automatic start waits: a data migration is running; it runs once the migration ends');
+      return;
+    }
+    this.startingAfterCrash = true;
+    void this.start().then(result => {
+      if (!result.success && result.reason !== 'already_running') {
+        console.error(`[BotManager] The bot did not start again after its crash: ${result.error ?? result.reason ?? 'unknown'}`);
+      }
+    }).finally(() => { this.startingAfterCrash = false; });
+  }
+
+  /** Under the migration lock a start would serve data unless maintenance.json says maintenance (a boot that holds no store). */
+  private migrationBlocksStart(): boolean {
+    return this.migrationLock !== null && readMaintenanceFile().state !== 'maintenance';
+  }
+
+  /** Takes the migration lock in one synchronous turn; false when it is held. */
+  takeMigrationLock(job: RunningMigration): boolean {
+    if (this.migrationLock) return false;
+    this.migrationLock = { jobId: job.jobId, to: job.to };
+    return true;
+  }
+
+  releaseMigrationLock(): void {
+    this.migrationLock = null;
+    const restart = this.restartStartDeferred;
+    this.restartStartDeferred = null;
+    if (restart) {
+      this.crashRestartDeferred = false;
+      if (this.isRunning() || this.exiting) return;
+      if (this.stopsRequested !== restart.stops) {
+        console.log('[BotManager] The start a restart left for after the migration was called off: a stop was requested meanwhile');
+        return;
+      }
+      void this.start().then(result => {
+        if (!result.success && result.reason !== 'already_running') {
+          console.error(`[BotManager] The bot did not start after the migration: ${result.error ?? result.reason ?? 'unknown'}`);
+        }
+      });
+      return;
+    }
+    if (!this.crashRestartDeferred) return;
+    this.crashRestartDeferred = false;
+    if (this.isRunning()) return;
+    this.runCrashRestart();
+  }
+
+  migrationRunning(): RunningMigration | null {
+    return this.migrationLock ? { ...this.migrationLock } : null;
+  }
+
+  /**
+   * Whether a data migration may run beside the bot process: stopped with its exit seen, or booted in maintenance mode.
+   * Every other state answers the refusal the operator sees.
+   */
+  migrationBotState(): { ok: true } | { ok: false; error: string } {
+    if (this.operationInProgress || this.stoppingRestart || this.queuedRestart) {
+      return { ok: false, error: 'A start or restart of the bot is in progress; try again once it ends' };
+    }
+    if (!this.isRunning()) {
+      if (this.lastChild && !this.lastChildExited && this.lastChild.exitCode === null && this.lastChild.signalCode === null) {
+        return { ok: false, error: 'The last bot process has not exited yet; a migration beside it could miss its writes' };
+      }
+      return { ok: true };
+    }
+    if (this.childMaintenanceBoot) return { ok: true };
+    if (!this.childModeReported) {
+      return { ok: false, error: "The bot process is still starting; can't confirm whether it boots in maintenance; try again once it has started" };
+    }
+    const unsaved = (guilds: number, files: number) => `The bot holds unsaved changes (${guilds} guilds, ${files} files); a stop or restart drops them`;
+    const cantConfirm = "can't confirm whether the bot holds unsaved changes; a stop or restart could drop them";
+    const answer = this.childEnterAnswer;
+    switch (this.childMode) {
+      case 'running':
+        return { ok: false, error: 'Stop the bot first' };
+      case 'maintenance':
+        if (answer?.saved === true) return { ok: false, error: 'Restart the bot into maintenance first' };
+        if (answer?.saved === false) return { ok: false, error: unsaved(answer.unsavedGuilds ?? 0, answer.unsavedFiles ?? 0) };
+        return { ok: false, error: cantConfirm };
+      case 'held':
+        if (this.childHeld) return { ok: false, error: unsaved(this.childHeld.unsavedGuilds, this.childHeld.unsavedFiles) };
+        if (answer?.saved === false) return { ok: false, error: unsaved(answer.unsavedGuilds ?? 0, answer.unsavedFiles ?? 0) };
+        return { ok: false, error: cantConfirm };
+      case 'login-refused':
+      case 'outage':
+        return { ok: false, error: cantConfirm };
+      default:
+        return { ok: false, error: `The bot process is in state ${this.childMode}; stop it first` };
+    }
+  }
+
   /**
    * Restart the bot process
    */
@@ -444,6 +573,10 @@ export class BotManager {
     // after this call, so the child it boots reads what this caller staged.
     const inFlight = this.stoppingRestart;
     if (inFlight?.stopping()) return inFlight.result;
+
+    if (this.migrationBlocksStart()) {
+      return { success: false, reason: 'migration_running', error: MIGRATION_RUNNING };
+    }
 
     // Check if another operation is in progress
     if (this.operationInProgress) {
@@ -459,10 +592,12 @@ export class BotManager {
     let stopping = true;
     const result = (async (): Promise<BotStartResult> => {
       let stoppedMeanwhile = false;
+      let stopped = false;
       try {
         if (this.isRunning()) {
           const own = this.stopsRequested + 1;
           await this.shutdown(false);
+          stopped = !this.isRunning();
           // A stop asked for while this one drained (an operator's, the
           // container's) wins over the start.
           stoppedMeanwhile = this.stopsRequested !== own;
@@ -474,7 +609,16 @@ export class BotManager {
         console.log('[BotManager] The restart was called off by a stop requested while the bot drained');
         return { success: false, reason: 'stopped', error: 'A stop was requested while the restart waited for the bot to exit' };
       }
-      return await this.start();
+      const started = await this.start();
+      if (stopped && !started.success && started.reason === 'migration_running') {
+        this.restartStartDeferred = { stops: this.stopsRequested };
+        if (!this.migrationLock) this.releaseMigrationLock();
+        return {
+          ...started,
+          error: 'The bot was stopped, but a data migration started meanwhile; it is started again once the migration ends',
+        };
+      }
+      return started;
     })();
     const flight = { result, stopping: () => stopping };
     this.stoppingRestart = flight;
@@ -491,6 +635,10 @@ export class BotManager {
    * replaced meanwhile.
    */
   requestRestart(): Promise<BotStartResult> {
+    if (this.migrationBlocksStart()) {
+      console.warn('[BotManager] The restart the bot process asked for was refused: a data migration is running');
+      return Promise.resolve({ success: false, reason: 'migration_running', error: MIGRATION_RUNNING });
+    }
     const child = this.botProcess;
     if (this.queuedRestart && this.queuedRestartChild === child) return this.queuedRestart;
     const before = this.queuedRestart;
@@ -595,19 +743,25 @@ export class BotManager {
    */
   async enterMaintenance(message: string): Promise<MaintenanceSaveResult> {
     if (!this.isRunning() || !this.botProcess) return { saved: true, note: 'No bot process runs, so it holds no changes.' };
+    const child = this.botProcess;
+    // The last answer of this child is what a data migration's first check reads.
+    const answered = (answer: MaintenanceSaveResult): MaintenanceSaveResult => {
+      if (this.botProcess === child) this.childEnterAnswer = answer;
+      return answer;
+    };
     try {
       const reply = await this.sendIPCMessage('maintenance:enter', { message }, MAINTENANCE_IPC_TIMEOUT_MS);
-      if (reply?.saved === true) return { saved: true };
+      if (reply?.saved === true) return answered({ saved: true });
       if (reply?.saved === false) {
         const unsavedGuilds = Number(reply.unsavedGuilds) || 0;
         const unsavedFiles = Number(reply.unsavedFiles) || 0;
-        return { saved: false, unsavedGuilds, unsavedFiles, note: `${unsavedGuilds} guild(s) and ${unsavedFiles} file(s) hold changes that could not be saved` };
+        return answered({ saved: false, unsavedGuilds, unsavedFiles, note: `${unsavedGuilds} guild(s) and ${unsavedFiles} file(s) hold changes that could not be saved` });
       }
       console.warn('[BotManager] The bot process answered the maintenance request without a save result');
     } catch (error) {
       console.warn(`[BotManager] The maintenance request got no answer from the bot: ${error instanceof Error ? error.message : String(error)}`);
     }
-    return { saved: null, note: "can't confirm whether the held changes were saved" };
+    return answered({ saved: null, note: "can't confirm whether the held changes were saved" });
   }
 
   /**
@@ -643,7 +797,8 @@ export class BotManager {
       processId: this.botProcess?.pid,
       crashed: this.crashed,
       mode: this.isRunning() ? this.childMode : undefined,
-      ...(this.isRunning() && this.childHeld ? { held: this.childHeld } : {})
+      ...(this.isRunning() && this.childHeld ? { held: this.childHeld } : {}),
+      migration: this.migrationRunning()
     };
   }
 
@@ -735,9 +890,7 @@ export class BotManager {
         return false;
       }
 
-      // Check if bot logged "Logged in as" message (indicates success)
-      const hasLoggedIn = this.logs.some(log => log.includes('Logged in as'));
-      if (hasLoggedIn) {
+      if (this.childLoggedIn) {
         return true;
       }
 

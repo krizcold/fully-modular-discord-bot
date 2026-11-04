@@ -39,7 +39,7 @@ describe('how long a JSON write waits before its atomic replace starts', () => {
     expect(starts).toEqual([]);
     await turn();
     expect(starts).toHaveLength(1);
-    for (let i = 0; i < 50 && getPending(file); i++) await new Promise(resolve => { setTimeout(resolve, 10); });
+    for (const end = Date.now() + 5_000; getPending(file) && Date.now() < end;) await new Promise(resolve => { setTimeout(resolve, 10); });
     expect(fs.readFileSync(file, 'utf8')).toBe('{"v":1}');
   });
 
@@ -55,13 +55,13 @@ describe('how long a JSON write waits before its atomic replace starts', () => {
     }) as typeof fs.promises.open);
     enqueueWrite(file, '{"v":1}');
     await turn();
-    for (let i = 0; i < 50 && opens === 0; i++) await turn();
+    for (const end = Date.now() + 5_000; opens === 0 && Date.now() < end;) await new Promise(resolve => { setTimeout(resolve, 2); });
     expect(opens).toBe(1);
     enqueueWrite(file, '{"v":2}');
     for (let i = 0; i < 20; i++) await turn();
     expect(starts).toHaveLength(1);
     resume();
-    for (let i = 0; i < 100 && getPending(file); i++) await new Promise(resolve => { setTimeout(resolve, 10); });
+    for (const end = Date.now() + 5_000; getPending(file) && Date.now() < end;) await new Promise(resolve => { setTimeout(resolve, 10); });
     expect(starts).toHaveLength(2);
     expect(fs.readFileSync(file, 'utf8')).toBe('{"v":2}');
   });

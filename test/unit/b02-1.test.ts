@@ -12,6 +12,7 @@ vi.mock('@webui/auth/guildPermissionRefresher', () => ({
   clearUserCache: () => {},
 }));
 
+import { fileFlushOnTheWire, queuedFileWrites } from '@internal/utils/dataBackends/fileBackend';
 import { FileSessionStore } from '@webui/auth/fileSessionStore';
 import { requireOAuth } from '@webui/auth/oauthMiddleware';
 import { createGuildPanelRoutes } from '@webui/routes/guildPanels';
@@ -56,7 +57,11 @@ function appWith(dir: string, mount: (app: express.Express) => void): express.Ex
   return app;
 }
 
-const settle = () => new Promise(resolve => setTimeout(resolve, 100));
+async function settle(): Promise<void> {
+  await new Promise(resolve => setImmediate(resolve));
+  const deadline = Date.now() + 5_000;
+  while ((queuedFileWrites() > 0 || fileFlushOnTheWire()) && Date.now() < deadline) await new Promise(r => setTimeout(r, 2));
+}
 
 describe('an anonymous Guild Web-UI request never mints a session file', () => {
   it('a 401 from /guild/api writes no session and sets no cookie', async () => {

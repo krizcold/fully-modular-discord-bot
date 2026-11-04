@@ -111,6 +111,7 @@ const HANDLERS: Record<string, Handler> = {
   'config backups': (c) => simple(c, 'GET', `/api/config/backups${qs({ file: flagStr(c.flags, 'file'), guildId: flagStr(c.flags, 'guild'), category: flagStr(c.flags, 'category') })}`),
   'config restore': (c) => simple(c, 'POST', '/api/config/restore', parseBody(c, true)),
   'data get': (c) => simple(c, 'GET', `/api/config/data/get${qs({ file: need(c, 0, 'file'), guildId: flagStr(c.flags, 'guild') })}`),
+  'data migrate': (c) => dataMigrate(c),
   'data update': (c) => simple(c, 'POST', '/api/config/data/update', parseBody(c, true)),
 
   // --- appstore ---
@@ -317,7 +318,8 @@ async function cmdInvoke(ctx: Ctx): Promise<void> {
 async function bundleExport(ctx: Ctx): Promise<void> {
   const guildId = need(ctx, 0, 'guildId');
   const file = need(ctx, 1, 'file');
-  const refusal = bundleRefusal(guildId, await ctx.client.botAnswers());
+  const panel = await ctx.client.panelAnswers();
+  const refusal = bundleRefusal(guildId, panel.bot, panel.migration);
   if (refusal) fail(`bundle export refused: ${refusal}`, EXIT_ERR);
   let summary;
   try {
@@ -342,7 +344,8 @@ async function bundleImport(ctx: Ctx): Promise<void> {
   } finally {
     await gen.return(undefined);
   }
-  const refusal = bundleRefusal(guildId!, await ctx.client.botAnswers());
+  const panel = await ctx.client.panelAnswers();
+  const refusal = bundleRefusal(guildId!, panel.bot, panel.migration);
   if (refusal) fail(`bundle import refused: ${refusal}`, EXIT_ERR);
   let result;
   try {
@@ -352,6 +355,101 @@ async function bundleImport(ctx: Ctx): Promise<void> {
   }
   printJson(result);
   process.exit(EXIT_OK);
+}
+
+type MigrateClient = Pick<Client, 'request'>;
+
+const MIGRATE_STATUS_CMD = 'smdb api GET /api/data/migrate';
+const MIGRATE_REQUEST_MS = 30_000;
+
+async function migrateBotRuns(client: MigrateClient): Promise<'yes' | 'no' | 'unknown'> {
+  try {
+    const res = await client.request('GET', '/api/bot/status', { timeoutMs: 5000 });
+    const running = res.status === 200 && res.body && typeof res.body === 'object' ? (res.body as { status?: { running?: unknown } }).status?.running : undefined;
+    return running === true ? 'yes' : running === false ? 'no' : 'unknown';
+  } catch {
+    return 'unknown';
+  }
+}
+
+export function migrateNextStep(bot: 'yes' | 'no' | 'unknown'): string {
+  if (bot === 'no') return 'the bot is stopped: start it (smdb start)';
+  if (bot === 'yes') return 'the bot runs; restart it if it runs in maintenance';
+  return "can't confirm whether the bot runs: start the bot if it is stopped (smdb start)";
+}
+
+/**
+ * `data migrate --to postgres|file`: asks the panel to migrate to DATA_BACKEND_URL (no URL is sent) and follows the
+ * job the answer names until it ends. Exits 0 only when the migration is done.
+ */
+export async function runMigrate(client: MigrateClient, to: 'postgres' | 'file', opts: { intervalMs: number; timeoutMs: number }): Promise<{ code: number; message: string; body?: unknown }> {
+  const cantConfirmStart = `can't confirm whether the migration started; check with: ${MIGRATE_STATUS_CMD}`;
+  let posted: CliResponse;
+  try {
+    posted = await client.request('POST', '/api/data/migrate', { body: { to }, timeoutMs: MIGRATE_REQUEST_MS });
+  } catch (error) {
+    return { code: EXIT_ERR, message: `${cantConfirmStart} (${error instanceof Error ? error.message : String(error)})` };
+  }
+  if (posted.status >= 500 && !(posted.body && typeof posted.body === 'object' && (posted.body as { success?: unknown }).success === false)) {
+    return { code: EXIT_ERR, message: `${cantConfirmStart} (HTTP ${posted.status})`, body: posted.body };
+  }
+  const answer = (posted.body && typeof posted.body === 'object' ? posted.body : {}) as Record<string, unknown>;
+  const jobId = typeof answer.jobId === 'string' ? answer.jobId : null;
+  if (jobId && answer.to !== undefined && answer.to !== to) {
+    return { code: EXIT_ERR, message: `migration ${jobId} (--to ${String(answer.to)}) is not a migration to ${to}; not following it${answer.error ? `: ${String(answer.error)}` : ''}`, body: answer };
+  }
+  if (answer.success !== true || !jobId) {
+    return { code: EXIT_ERR, message: `migration refused: ${String(answer.error ?? `HTTP ${posted.status}`)}`, body: answer };
+  }
+  const done = async () => `migration ${jobId} is done; ${migrateNextStep(await migrateBotRuns(client))}`;
+  if (answer.state === 'done') return { code: EXIT_OK, message: await done(), body: answer };
+  if (answer.state === 'failed' || answer.state === 'interrupted') {
+    return { code: EXIT_ERR, message: `migration ${jobId} ${String(answer.state)} at ${String(answer.stage ?? 'an unknown stage')}: ${String(answer.error ?? '')}`, body: answer };
+  }
+  const cantConfirm = `can't confirm the outcome of migration ${jobId}`;
+  const deadline = Date.now() + opts.timeoutMs;
+  for (;;) {
+    await new Promise(resolve => setTimeout(resolve, opts.intervalMs));
+    let res: CliResponse;
+    try {
+      res = await client.request('GET', '/api/data/migrate', { timeoutMs: MIGRATE_REQUEST_MS });
+    } catch (error) {
+      if (Date.now() >= deadline) {
+        return { code: EXIT_TIMEOUT, message: `${cantConfirm}; the last status request failed (${error instanceof Error ? error.message : String(error)}); check with: ${MIGRATE_STATUS_CMD}` };
+      }
+      continue;
+    }
+    if (res.status === 429 || res.status >= 500) {
+      if (Date.now() >= deadline) return { code: EXIT_TIMEOUT, message: `${cantConfirm}; the last status request failed (HTTP ${res.status}); check with: ${MIGRATE_STATUS_CMD}`, body: res.body };
+      continue;
+    }
+    const body = (res.body && typeof res.body === 'object' ? res.body : {}) as { success?: unknown; error?: unknown; job?: Record<string, unknown> | null };
+    if (body.success !== true) return { code: EXIT_ERR, message: `${cantConfirm}: ${String(body.error ?? `HTTP ${res.status}`)}`, body };
+    const job = body.job;
+    if (job && job.jobId !== jobId && job.state !== 'running') {
+      return { code: EXIT_ERR, message: `${cantConfirm}; the status names migration ${String(job.jobId)} instead; check with: ${MIGRATE_STATUS_CMD}`, body };
+    }
+    if (!job || job.jobId !== jobId) {
+      if (Date.now() >= deadline) return { code: EXIT_TIMEOUT, message: `${cantConfirm}; no status of it came back in time`, body };
+      continue;
+    }
+    if (job.to !== to) return { code: EXIT_ERR, message: `migration ${jobId} is a migration to ${String(job.to)}, not ${to}`, body };
+    if (job.state === 'done') return { code: EXIT_OK, message: await done(), body };
+    if (job.state === 'failed' || job.state === 'interrupted') {
+      return { code: EXIT_ERR, message: `migration ${jobId} ${String(job.state)} at ${String(job.stage)}: ${String(job.error ?? '')}`, body };
+    }
+    if (Date.now() >= deadline) return { code: EXIT_TIMEOUT, message: `migration ${jobId} still runs; follow it with: smdb api GET /api/data/migrate`, body };
+  }
+}
+
+async function dataMigrate(ctx: Ctx): Promise<void> {
+  const to = flagStr(ctx.flags, 'to');
+  if (to !== 'postgres' && to !== 'file') fail('data migrate needs --to postgres or --to file', EXIT_USAGE);
+  process.exitCode = EXIT_ERR;
+  const result = await runMigrate(ctx.client, to as 'postgres' | 'file', { intervalMs: 2000, timeoutMs: timeoutMs(ctx, 6 * 60 * 60_000) });
+  printJson(result.body ?? {});
+  process.stderr.write(`smdb: ${result.message}\n`);
+  process.exit(result.code);
 }
 
 export async function dispatch(client: Client, positionals: string[], flags: Record<string, string | boolean>): Promise<void> {

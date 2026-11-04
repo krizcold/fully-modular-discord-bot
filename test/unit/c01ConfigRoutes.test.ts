@@ -14,7 +14,8 @@ vi.mock('../../src/webui/utils/webuiDataReader', async importOriginal => {
 });
 
 import { setBackendKind } from '../helpers/backendKind';
-import { deleteRawAtomic, flushAll, writeRawAtomic } from '../../src/bot/internalSetup/utils/dataManager';
+import { deleteRawAtomic, flushAll, flushFailing, writeRawAtomic } from '../../src/bot/internalSetup/utils/dataManager';
+import { fileFlushOnTheWire } from '../../src/bot/internalSetup/utils/dataBackends/fileBackend';
 import { applyOperatorDataRead } from '../../src/bot/internalSetup/utils/ipcDataHandler';
 import { ROOT_CONFIG_PATH } from '../../src/bot/internalSetup/utils/configManager';
 import { discoverConfigFiles, discoverGlobalDataFiles } from '../../src/bot/internalSetup/utils/configDiscovery';
@@ -366,7 +367,10 @@ describe("the child's queue-first global read (data:global-read)", () => {
 // Review round 1 on C01 (lanes/C01/sheet.md, findings C01-R1-1 to C01-R1-8).
 describe('review round 1', () => {
   const STAMP_NAME = (stem: string) => `${stem}_2026-01-01T00-00-00-000Z.json`;
-  const settle = () => new Promise(resolve => setTimeout(resolve, 20));
+  const settle = async (file: string) => {
+    const deadline = Date.now() + 5_000;
+    while ((!flushFailing([file]) || fileFlushOnTheWire()) && Date.now() < deadline) await new Promise(r => setTimeout(r, 2));
+  };
   type Answer = Awaited<ReturnType<typeof call>>;
 
   it.each([
@@ -441,7 +445,7 @@ describe('review round 1', () => {
     const undo = failFlushes(guildConfig(G1));
     try {
       writeRawAtomic(guildConfig(G1), JSON.stringify({ who: 'queued' }));
-      await settle();
+      await settle(guildConfig(G1));
       // The child is another process: it reads the disk, and holds no write of this file.
       child.guild = req => (req.module === '_guildConfig'
         ? { ok: true, contentJson: fs.readFileSync(guildConfig(G1), 'utf-8'), pending: false }
@@ -463,7 +467,7 @@ describe('review round 1', () => {
     const undo = failFlushes(guildConfig(G1));
     try {
       writeRawAtomic(guildConfig(G1), JSON.stringify({ who: 'queued-here' }));
-      await settle();
+      await settle(guildConfig(G1));
       child.guild = req => (req.module === '_guildConfig'
         ? { ok: true, contentJson: JSON.stringify({ who: 'queued-in-child' }), pending: true }
         : undefined);

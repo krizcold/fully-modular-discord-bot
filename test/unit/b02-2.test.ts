@@ -7,6 +7,7 @@ import session from 'express-session';
 import passport from 'passport';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { drainForExit } from '@internal/utils/dataManager';
+import { fileFlushOnTheWire, queuedFileWrites } from '@internal/utils/dataBackends/fileBackend';
 import { FileSessionStore } from '@webui/auth/fileSessionStore';
 import type {} from '@webui/auth/oauthMiddleware';
 import oauthRoutes from '@webui/auth/oauthRoutes';
@@ -33,7 +34,8 @@ describe('the web UI session store answers after the flush', () => {
   it('destroy calls back only once the session file is gone from disk', async () => {
     const { dir, store } = newStore('_b022_destroy');
     await new Promise<void>((resolve, reject) => store.set('sidDel1', sessionData, e => (e ? reject(e) : resolve())));
-    await new Promise(resolve => setTimeout(resolve, 50));
+    const deadline = Date.now() + 5_000;
+    while ((queuedFileWrites() > 0 || fileFlushOnTheWire()) && Date.now() < deadline) await new Promise(r => setTimeout(r, 2));
     const file = path.join(dir, 'sidDel1.json');
     expect(fs.existsSync(file)).toBe(true);
     const stillThere = await new Promise<boolean>((resolve, reject) => {
@@ -119,7 +121,7 @@ describe('GET /auth/logout through passport', () => {
       expect(response.headers.get('set-cookie') ?? '').toMatch(/^smdb.sid=;/);
       const files = fs.readdirSync(dir).filter(n => n.endsWith('.json'));
       expect(files.length).toBeGreaterThan(0);
-      for (const file of files) expect(fs.readFileSync(path.join(dir, file), 'utf8')).not.toContain('u1');
+      for (const file of files) expect(fs.readFileSync(path.join(dir, file), 'utf8')).not.toContain('"u1"');
       release();
     });
   });

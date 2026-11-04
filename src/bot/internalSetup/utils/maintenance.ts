@@ -121,9 +121,9 @@ export function maintenanceMode(): MaintenanceMode {
   return mode;
 }
 
-function reportMode(next: MaintenanceMode, held?: Held): void {
+function reportMode(next: MaintenanceMode, held?: Held, boot = false): void {
   mode = next;
-  send({ type: 'maintenance:mode', data: held ? { mode: next, held } : { mode: next } });
+  send({ type: 'maintenance:mode', data: { mode: next, ...(held ? { held } : {}), ...(boot ? { boot: true } : {}) } });
 }
 
 function applyPresence(): void {
@@ -595,7 +595,7 @@ export async function runMaintenanceBoot(
     ? '[Maintenance] Booting in maintenance mode: the saved state says maintenance'
     : '[Maintenance] Booting in maintenance mode: the database refused the login');
   setupMaintenanceIPC();
-  reportMode(decision.cause === 'hook' ? 'maintenance' : 'login-refused');
+  reportMode(decision.cause === 'hook' ? 'maintenance' : 'login-refused', undefined, true);
   if (decision.cause === 'hook') startFilePoll();
   const retry = discordRetry(deps.sleep ?? (ms => new Promise<void>(resolve => { setTimeout(resolve, ms); })));
 

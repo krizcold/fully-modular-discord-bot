@@ -16,7 +16,7 @@ A Discord bot framework designed with modularity at its core. Features are organ
 - 🏢 **Multi-Server Support** - Per-guild configuration with fallback to global defaults
 - 🔒 **Security First** - Permission-based access control and guild-restricted admin panels
 - 📦 **Production Ready** - Docker deployment with persistent data management
-- 🗄️ **Pluggable Data Backend** - JSON files by default, or PostgreSQL for large bots (see [DATABASE.md](DATABASE.md))
+- 🗄️ **Pluggable Data Backend** - JSON files by default, or PostgreSQL for large bots, with a migration that moves the data either way (see [DATABASE.md](DATABASE.md))
 
 ---
 

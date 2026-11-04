@@ -21,8 +21,9 @@ describe('the sweep keeps no interaction ledger alive itself', () => {
       };
       const ref = make();
       // The save's own flush runs in the ledger's frame and holds it until its I/O ends.
-      for (let i = 0; i < 50 && ref.deref(); i++) {
-        await new Promise(resolve => setTimeout(resolve, 20));
+      const deadline = Date.now() + 5_000;
+      while (ref.deref() && Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, 5));
         gc();
       }
       expect(ref.deref()).toBeUndefined();

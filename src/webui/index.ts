@@ -8,7 +8,7 @@ import { WebSocketManager } from './websocketManager';
 import { getInstallQueue } from './utils/installQueue';
 import { setNotificationIPCDispatcher } from '../bot/internalSetup/utils/premiumNotifications';
 import { ensureDurableSessionSecret } from '../utils/envLoader';
-import { drainForExit } from '../bot/internalSetup/utils/dataManager';
+import { drainForExit, setGuildWriteGate } from '../bot/internalSetup/utils/dataManager';
 import { stopSessionStore } from './auth/sessionManager';
 
 /**
@@ -69,6 +69,9 @@ export async function startWebUI(botManager: BotManager): Promise<void> {
   // Durable SESSION_SECRET before the session middleware is built, so
   // sessions survive restarts.
   ensureDurableSessionSecret();
+
+  // This process's own guild writes wait out a data migration (the bot process installs no gate).
+  setGuildWriteGate(() => (botManager.migrationRunning() ? 'A data migration is running' : null));
 
   const app = await createServer(botManager);
   const PORT = parseInt(process.env.WEBUI_PORT || '8080', 10);

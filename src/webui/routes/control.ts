@@ -12,6 +12,14 @@ async function flushBeforeExit(): Promise<void> {
 export function createControlRoutes(botManager: BotManager): Router {
   const router = Router();
 
+  // A restart of this process would end a running data migration midway.
+  const refuseWhileMigrating = (res: Response, what: string): boolean => {
+    const running = botManager.migrationRunning?.();
+    if (!running) return false;
+    res.status(409).json({ success: false, error: `A data migration is running (migration ${running.jobId}); ${what}` });
+    return true;
+  };
+
   // Auth is applied in server.ts via requireAuth middleware
 
   /**
@@ -77,6 +85,7 @@ export function createControlRoutes(botManager: BotManager): Router {
       const emergency = req.body.emergency === true;
 
       if (emergency) {
+        if (refuseWhileMigrating(res, 'The container was not restarted')) return;
         // Restart container - gracefully exit and let Docker restart policy handle it
         console.log('[Control] Container restart requested');
 
@@ -124,6 +133,7 @@ export function createControlRoutes(botManager: BotManager): Router {
    */
   router.post('/restart-server', async (req: Request, res: Response) => {
     try {
+      if (refuseWhileMigrating(res, 'The server was not restarted')) return;
       console.log('[Control] Full server restart requested');
 
       res.json({

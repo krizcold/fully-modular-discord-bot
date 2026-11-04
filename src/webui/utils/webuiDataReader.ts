@@ -42,7 +42,9 @@ export class WebuiDataReader {
         connectionString: url,
         max: 2,
         connectionTimeoutMillis: 5000,
-        idleTimeoutMillis: 30000
+        idleTimeoutMillis: 30000,
+        // A data migration leaves this reader's sessions out of its count of other sessions: they only read.
+        application_name: 'smdb-webui-reader'
       });
       // An idle client error would otherwise crash the parent process.
       this.pool.on('error', () => {});
