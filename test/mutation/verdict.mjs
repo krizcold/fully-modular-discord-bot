@@ -5,10 +5,13 @@
  * @typedef {import('./ranges.mjs').Location} Location
  * @typedef {'a' | 'a2' | 'b' | 'b2'} PassName
  * @typedef {{ id: string | null, dir?: string, status: string, statusReason?: string, killedBy?: string, timeout?: string,
- *   inconclusive?: string, recheck?: string, voided?: string }} PassResult dir: the report dir the id's runs are in
- *   (Stryker numbers each run's mutants anew); recheck: the test that failed only on the machine's texts, so the
- *   mutant reruns alone; voided: why a rerun's kill or timeout no longer counts; a CompileError with an inconclusive
- *   is one only of an unused `@ts-expect-error` (TS2578), which no test met
+ *   inconclusive?: string, recheck?: string, voided?: string, unreached?: boolean, pending?: 'alone-a' | 'alone-a2' }}
+ *   PassResult dir: the report dir the
+ *   id's runs are in (Stryker numbers each run's mutants anew); recheck: the test that failed only on the machine's
+ *   texts, so the mutant reruns alone; voided: why a rerun's kill or timeout no longer counts; unreached: no fast test
+ *   reached the mutant in the pass's run with no mutant, so its run in a pass of pass A's tests ran none; a
+ *   CompileError with an inconclusive is one only of an unused `@ts-expect-error` (TS2578), which no test met; pending:
+ *   the check with no mutant (touched.mjs aloneCheck or setCheck) that covers the result and has not finished
  * @typedef {{ file: string, location: Location, mutator: string, original: string, replacement: string, gating: boolean,
  *   passes: Partial<Record<PassName, PassResult>> }} MutantRecord
  * @typedef {{ name: string, status?: string, message?: string,
@@ -114,6 +117,15 @@ export function outcomeOf(result) {
 /** @param {MutantRecord} m */
 export const latest = m => /** @type {PassResult} */ (m.passes.b2 ?? m.passes.b ?? m.passes.a2 ?? m.passes.a);
 
+export const UNREACHED = 'no fast test reached it';
+
+/**
+ * Whether no fast test reached the mutant in the run with no mutant of its
+ * last pass of pass A's tests, so that pass ran no test on it.
+ * @param {MutantRecord} m
+ */
+export const unreached = m => Boolean((m.passes.a2 ?? m.passes.a)?.unreached);
+
 /** @param {PassResult | undefined} b what pass B found, which sent the mutant to a rerun alone */
 const failedInB = b => (b?.killedBy ? `killed in pass B by ${b.killedBy}` : `failed in pass B only on the machine's texts (${b?.recheck})`);
 
@@ -129,10 +141,13 @@ const failedInB = b => (b?.killedBy ? `killed in pass B by ${b.killedBy}` : `fai
  * pass B never ran on the mutant, so it is no survivor either. One the gate
  * never reran, or whose rerun was voided (the run with no mutant after it
  * failed) or never checked by that run (the gate stopped first), is
- * inconclusive.
+ * inconclusive. So is an a2 result whose set of files, run with no mutant
+ * (alone-a2/, voidFailedSets), failed, ran past its bound, left no result or,
+ * for a timeout, was too slow, and, when the gate stopped, a pass A or a2
+ * result whose run with no mutant (alone-a or alone-a2) never finished.
  * @param {MutantRecord} m
  * @param {boolean} [stopped] the gate stopped before it finished: a survivor pass B never ran on is no survivor, and
- *   a b2 kill no run with no mutant checked is no kill
+ *   a b2 kill, pass A kill or a2 result no run with no mutant checked is no kill
  * @returns {{ outcome: string, why?: string }}
  */
 export function confirmed(m, stopped = false) {
@@ -151,6 +166,11 @@ export function confirmed(m, stopped = false) {
   if (!m.gating || (last !== 'Killed' && last !== 'Timeout')) return { outcome: last };
   const { voided } = latest(m);
   if (voided) return { outcome: 'Inconclusive', why: voided };
+  const { pending, killedBy } = latest(m);
+  if (stopped && pending === 'alone-a') return { outcome: 'Inconclusive', why: `killed in pass A by ${killedBy}, but the gate stopped before its file ran with no mutant` };
+  if (stopped && pending === 'alone-a2') {
+    return { outcome: 'Inconclusive', why: `${last === 'Timeout' ? 'timed out' : `killed by ${killedBy}`} in a2, but the gate stopped before its set ran with no mutant` };
+  }
   if (b && outcomeOf(b) === 'Timeout') return { outcome: 'Inconclusive', why: 'hung in pass B, where a hang is not counted' };
   if (b2 && last === 'Timeout') return { outcome: 'Inconclusive', why: `${failedInB(b)}, but hung instead of failing when run alone` };
   // The run with no mutant after b2 comes after every b2 run, and the gate only
@@ -206,6 +226,121 @@ export function byKiller(mutants) {
 }
 
 /**
+ * Pass A's kills (with no checker included), by the test file that failed in
+ * each, in order: each such file runs alone with no mutant (touched.mjs
+ * aloneCheck), since a mutant's run there took only some of the fast files.
+ * @param {MutantRecord[]} mutants
+ */
+export function killedInA(mutants) {
+  /** @type {Map<string, MutantRecord[]>} */
+  const groups = new Map();
+  for (const m of mutants) {
+    const a = m.passes.a;
+    if (!a || outcomeOf(a) !== 'Killed') continue;
+    const file = (a.killedBy ?? '').split(' > ')[0];
+    groups.set(file, [...(groups.get(file) ?? []), m]);
+  }
+  return groups;
+}
+
+/**
+ * Takes back each pass A kill whose test file failed when run alone with no
+ * mutant, or left no exit there (`codes`: per file, the exit of its run alone,
+ * as dry-alone.json holds them): the kill becomes a run that failed only on the
+ * machine, so a gating one reruns alone in a2, and one that is not stays
+ * inconclusive. Returns, per such file, why.
+ * @param {Map<string, MutantRecord[]>} killed killedInA's groups
+ * @param {Record<string, unknown>} codes
+ * @param {string} dir the dir of the runs alone
+ * @returns {Map<string, string>}
+ */
+export function uncreditFailedAlone(killed, codes, dir) {
+  /** @type {Map<string, string>} */
+  const taken = new Map();
+  for (const [file, on] of killed) {
+    const code = Object.hasOwn(codes, file) ? codes[file] : undefined;
+    if (code === 0) continue;
+    const why = code === undefined ? `its run alone with no mutant (${dir}/) left no result` : `it failed alone with no mutant (${dir}/)`;
+    taken.set(file, why);
+    for (const m of on) {
+      const a = /** @type {PassResult} */ (m.passes.a);
+      const { killedBy, ...rest } = a;
+      m.passes.a = { ...rest, recheck: killedBy, inconclusive: `killed in pass A by ${killedBy}, but ${file}: ${why}, so the kill proves nothing` };
+    }
+  }
+  return taken;
+}
+
+/**
+ * The a2 kills and timeouts whose run took only some of the fast test files,
+ * by that set, in order: each set runs once with no mutant (touched.mjs
+ * setCheck), since the run with no mutant after the reruns took every related
+ * file. `taken` gives the files a mutant's a2 run took: 'related' for every
+ * related file, or null when that could not be read, which groups as a set of
+ * its own with no files.
+ * @param {MutantRecord[]} mutants
+ * @param {(m: MutantRecord) => string[] | 'related' | null} taken
+ * @returns {{ files: string[] | null, on: MutantRecord[] }[]}
+ */
+export function bySet(mutants, taken) {
+  /** @type {Map<string | null, { files: string[] | null, on: MutantRecord[] }>} */
+  const groups = new Map();
+  for (const m of mutants) {
+    const a2 = m.passes.a2;
+    if (!a2 || a2.voided || !['Killed', 'Timeout'].includes(outcomeOf(a2))) continue;
+    const files = taken(m);
+    if (files === 'related') continue;
+    const key = files === null ? null : JSON.stringify(files);
+    const group = groups.get(key) ?? { files, on: [] };
+    group.on.push(m);
+    groups.set(key, group);
+  }
+  return [...groups.values()];
+}
+
+/**
+ * Voids each a2 kill or timeout of bySet's groups whose set of files failed
+ * together with no mutant, left no result there, or could not be read, and
+ * each a2 timeout whose set took longer with no mutant than `budget`, the ms
+ * Stryker gave each a2 run (NaN when unknown). `runs` is what dry-alone.json
+ * holds: per set, its files, exit and time. Returns a report line per set
+ * whose results were voided.
+ * @param {{ files: string[] | null, on: MutantRecord[] }[]} sets
+ * @param {unknown} runs
+ * @param {string} dir the dir of the runs with no mutant
+ * @param {number} budget
+ * @returns {string[]}
+ */
+export function voidFailedSets(sets, runs, dir, budget) {
+  /** @type {string[]} */
+  const lines = [];
+  /** @type {{ files?: unknown, code?: unknown, ms?: unknown }[]} */
+  const list = Array.isArray(runs) ? runs.filter(r => r !== null && typeof r === 'object') : [];
+  for (const { files, on } of sets) {
+    const run = files ? list.find(r => JSON.stringify(r.files) === JSON.stringify(files)) : undefined;
+    const named = files ? files.join(', ') : '';
+    const ms = typeof run?.ms === 'number' && Number.isFinite(run.ms) ? run.ms : NaN;
+    const failed = !files
+      ? 'the files its a2 run took could not be read'
+      : run?.code === undefined || typeof run.code !== 'number' ? `${named}, run together with no mutant (${dir}/), left no result`
+        : run.code !== 0 ? `${named} failed together with no mutant (${dir}/)` : '';
+    const slow = ms <= budget ? ''
+      : `${named} took ${Number.isFinite(ms) ? `${Math.round(ms / 1000)} s` : 'a time that could not be read'} together with no mutant (${dir}/), not within the ${Number.isFinite(budget) ? `${Math.round(budget / 1000)} s` : 'unknown budget'} Stryker gave each a2 run`;
+    let voided = 0;
+    for (const m of on) {
+      const a2 = /** @type {PassResult} */ (m.passes.a2);
+      const timeout = outcomeOf(a2) === 'Timeout';
+      const why = failed || (timeout ? slow : '');
+      if (!why) continue;
+      voided += 1;
+      m.passes.a2 = { ...a2, voided: `${timeout ? 'timed out' : `killed by ${a2.killedBy}`} in a2, but ${why}, so it proves nothing` };
+    }
+    if (voided > 0) lines.push(`${failed || slow}, so ${voided} a2 result(s) that ran on it do not count`);
+  }
+  return lines;
+}
+
+/**
  * The gating mutants pass B takes: the ones no in-process test killed.
  * @param {MutantRecord[]} mutants
  */
@@ -216,7 +351,9 @@ export const toPassB = mutants => mutants.filter(m => m.gating && ['Survived', '
  * `stopped` names why the gate stopped before it finished (a pass that could
  * not run); the passes it did finish are still reported. `treeChanged` names
  * the files that changed during the run (tree.mjs), so no one tree was tested.
- * `controls` names the runs with no mutant made after the reruns, each passed.
+ * `controls` names the runs with no mutant made to check a pass: each file
+ * that killed in pass A run alone, each set of files an a2 result ran on, and
+ * the run after the reruns, each entry with what failed there, if anything.
  * `standIn` is set when a test replaced vitest (runner.mjs's
  * SMDB_MUTATION_VITEST): such a run proves nothing about the code.
  * @param {{ stamp: string, scope: string, emptyScope: boolean, skipped: { file: string, why: string }[], mutants: MutantRecord[],
@@ -254,9 +391,12 @@ export function judge(run) {
   /** @param {MutantRecord} m */
   const note = m => {
     const last = latest(m);
-    return confirmedIn(m).why ?? last.inconclusive ?? last.statusReason
+    const why = confirmedIn(m).why ?? last.inconclusive ?? last.statusReason
       ?? (outcomeIn(m) === 'Timeout' ? (last.timeout ? `timed out alone: ${last.timeout}` : "ran past Stryker's budget alone") : '');
+    return unreachedSurvivor(m) ? [UNREACHED, why].filter(Boolean).join('; ') : why;
   };
+  /** @param {MutantRecord} m */
+  const unreachedSurvivor = m => unreached(m) && ['Survived', 'NoCoverage'].includes(outcomeIn(m));
   /** @param {MutantRecord} m */
   const show = m => `  ${where(m)} ${m.mutator}: \`${m.original}\` -> \`${m.replacement}\`${note(m) ? ` (${note(m)})` : ''}`;
   /** @param {MutantRecord[]} list */
@@ -284,13 +424,14 @@ export function judge(run) {
       ...(run.deleted ?? []).map(n => `  ${n.file}: after ${n.lines.join(', ')}`)] : []),
     `Gating mutants (they touch a changed line that holds code, not one blank or a comment only): ${gating.length}: ${tally(gating)}`,
     `  killed in pass A: ${gating.filter(m => !m.passes.b && outcomeIn(m) === 'Killed').length}; run in pass B: ${gating.filter(m => m.passes.b).length}, killed there: ${gating.filter(m => m.passes.b && outcomeIn(m) === 'Killed').length}`,
+    ...(gating.some(unreachedSurvivor) ? [`  survivors no fast test reached (none ran their code in the run with no mutant, so pass A ran no test on them): ${gating.filter(unreachedSurvivor).length}`] : []),
     ...section('Survivors (each needs a test that kills it, or a justification in the notes):', [...gatingAt('Survived'), ...gatingAt('NoCoverage')]),
     ...section('Silenced by a Stryker disable comment (each needs a justification in the notes):', gatingAt('Ignored')),
     ...section("Inconclusive (no test failed for the mutant itself; rerun, or add a test that fails on it: a failure the mutant itself causes only at load, in a beforeAll or afterAll, or as an unhandled error repeats on every rerun, so that test must fail inside its own body, where no static import or failing hook stops it first; mutation/README.md says where):", [...gatingAt('Inconclusive'), ...gatingAt('RuntimeError')]),
     ...section("Timeouts (each timed out when run alone with four times the config's limit, or past the limit a test or hook sets itself: a test or its beforeEach or afterEach hook, or the whole run past its budget; counted as killed, so check each replacement):", gatingAt('Timeout')),
     `Context mutants (in the widened statements, not gating: they touch no changed line that holds code): ${context.length}: ${tally(context)}`,
     ...section('Context survivors:', context.filter(m => outcomeIn(m) === 'Survived')),
-    ...(run.controls?.length ? ['Runs with no mutant after the reruns:', ...run.controls.map(line => `  ${line}`)] : []),
+    ...(run.controls?.length ? ['Runs with no mutant that checked what a pass counted:',...run.controls.map(line => `  ${line}`)] : []),
     ...(run.stopped ? ['Stopped:', ...run.stopped.map(line => `  ${line}`)] : []),
     ...(run.treeChanged?.length ? ['Changed during the run (so no one tree was tested):',
       `  ${run.treeChanged.slice(0, 10).join(', ')}${run.treeChanged.length > 10 ? ` and ${run.treeChanged.length - 10} more` : ''}`] : []),

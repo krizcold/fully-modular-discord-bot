@@ -11,9 +11,10 @@ import { pastBudget, strykerClock } from '../mutation/control.mjs';
 
 const root = path.resolve(__dirname, '..', '..');
 
-interface Call { project: string; args: string[]; scale: string | null; mutant: string | null }
+interface Call { project: string; args: string[]; scale: string | null; mutant: string | null; include: string[] | null; coverage: string | null }
 
-function fakeVitest(fail: string[]) {
+// fail: the tiers, or the test files, whose runs fail; hang: the test files whose runs never end.
+function fakeVitest(fail: string[], hang: string[] = []) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-runner-'));
   onTestFinished(() => fs.rmSync(dir, { recursive: true, force: true }));
   const calls = path.join(dir, 'calls.jsonl');
@@ -22,8 +23,13 @@ function fakeVitest(fail: string[]) {
     "const fs = require('fs');",
     'const args = process.argv.slice(2);',
     "const project = args[args.indexOf('--project') + 1];",
-    `fs.appendFileSync(${JSON.stringify(calls)}, JSON.stringify({ project, args, scale: process.env.SMDB_TEST_TIME_SCALE ?? null, mutant: process.env.__STRYKER_ACTIVE_MUTANT__ ?? null }) + '\\n');`,
-    `process.exit(${JSON.stringify(fail)}.includes(project) ? 1 : 0);`,
+    'const listed = process.env.SMDB_MUTATION_INCLUDE;',
+    "const include = listed ? JSON.parse(fs.readFileSync(listed, 'utf8')) : null;",
+    'const coverage = process.env.SMDB_MUTATION_COVERAGE ?? null;',
+    `fs.appendFileSync(${JSON.stringify(calls)}, JSON.stringify({ project, args, scale: process.env.SMDB_TEST_TIME_SCALE ?? null, mutant: process.env.__STRYKER_ACTIVE_MUTANT__ ?? null, include, coverage }) + '\\n');`,
+    `const fail = ${JSON.stringify(fail)};`,
+    `if ((include ?? []).some(file => ${JSON.stringify(hang)}.includes(file))) setInterval(() => {}, 1000);`,
+    'else process.exit(fail.includes(project) || (include ?? []).some(file => fail.includes(file)) ? 1 : 0);',
     '',
   ].join('\n'));
   const out = path.join(dir, 'out');
@@ -99,9 +105,48 @@ describe('a mutant run', () => {
     expect(runner(passing, 'b', '1', only).status).toBe(0);
     const calls = passing.read();
     expect(calls.map(call => [call.project, call.scale])).toEqual([['integration', '4'], ['child', '4']]);
-    expect(calls[0].args.slice(0, 2)).toEqual(['run', 'integration/store.test.ts']);
-    expect(calls[1].args.slice(0, 3)).toEqual(['run', 'child/nodeIdentity.test.ts', 'child/takeover.test.ts']);
+    // The names reach vitest.config.ts in a file, never on the command line, where vitest takes every path holding one.
+    expect(calls.map(call => [call.args[0], call.include])).toEqual([['run', ['integration/store.test.ts']], ['run', ['child/nodeIdentity.test.ts', 'child/takeover.test.ts']]]);
+    for (const call of calls) expect(call.args.filter(arg => arg.endsWith('.test.ts'))).toEqual([]);
     for (const call of calls) expect(call.args).toContain('--bail=1');
+  });
+
+  it('runs, to check what a pass counted, each set given in a vitest run of its own, and passes whatever they do', () => {
+    const sets = [['unit/a.test.ts'], ['unit/b.test.ts', 'unit/c.test.ts'], ['unit/c.test.ts']];
+    const fake = fakeVitest(['unit/b.test.ts']);
+    const run = runner(fake, 'a', '1', [], {
+      __STRYKER_ACTIVE_MUTANT__: 'none', SMDB_MUTATION_SETS: JSON.stringify(sets.map(files => ({ files, ms: 60_000 }))), SMDB_MUTATION_FILES: '["test/mutation/control.mjs"]',
+    });
+    expect(run.status).toBe(0);
+    const calls = fake.read();
+    expect(calls.map(call => [call.project, call.scale, call.include, call.coverage, call.args[0]])).toEqual(sets.map(files => ['fast', '4', files, null, 'run']));
+    const runs = JSON.parse(fs.readFileSync(path.join(fake.out, 'dry-alone.json'), 'utf8')) as { files: string[]; code: number; ms: number }[];
+    expect(runs.map(({ files, code }) => [files, code])).toEqual([[sets[0], 0], [sets[1], 1], [sets[2], 0]]);
+    for (const { ms } of runs) expect(ms).toBeGreaterThanOrEqual(0);
+    expect(fs.existsSync(path.join(fake.out, 'dry-alone-1.log'))).toBe(true);
+    expect(fs.existsSync(path.join(fake.out, 'dry-alone-1.include.json'))).toBe(true);
+    expect(fs.existsSync(path.join(fake.out, 'dry-ms.txt'))).toBe(true);
+  });
+
+  it('ends a set\'s run past its bound, with what it started, and counts it as failed', () => {
+    const fake = fakeVitest([], ['unit/hang.test.ts']);
+    const sets = [{ files: ['unit/hang.test.ts'], ms: 1500 }, { files: ['unit/a.test.ts'], ms: 60_000 }];
+    const begun = Date.now();
+    const run = runner(fake, 'a', '', [], { __STRYKER_ACTIVE_MUTANT__: 'none', SMDB_MUTATION_SETS: JSON.stringify(sets), SMDB_MUTATION_FILES: '["test/mutation/control.mjs"]' });
+    expect(run.status).toBe(0);
+    expect(Date.now() - begun).toBeLessThan(30_000);
+    const runs = JSON.parse(fs.readFileSync(path.join(fake.out, 'dry-alone.json'), 'utf8')) as { files: string[]; code: number; ms: number }[];
+    expect(runs.map(({ files, code }) => [files, code])).toEqual([[['unit/hang.test.ts'], 1], [['unit/a.test.ts'], 0]]);
+    expect(runs[0].ms).toBeGreaterThanOrEqual(1400);
+    expect(fs.readFileSync(path.join(fake.out, 'dry-alone-0.log'), 'utf8')).toMatch(/runner\.mjs ended vitest after 1500 ms, the bound on this run with no mutant/);
+  });
+
+  it('gives no run the coverage dir the caller\'s shell set', () => {
+    const fake = fakeVitest([]);
+    for (const [pass, confirm] of [['a', ''], ['a', '1'], ['b', '']]) {
+      expect(runner(fake, pass, confirm, [], { SMDB_MUTATION_COVERAGE: path.join(fake.out, 'shell'), SMDB_MUTATION_INCLUDE: path.join(fake.out, 'shell.json') }).status).toBe(0);
+    }
+    expect(fake.read().map(call => [call.coverage, call.include])).toEqual([[null, null], [null, null], [null, null], [null, null]]);
   });
 
   it('leaves the time of a run with no mutant, which the run after the reruns is held to, and only of one', () => {
@@ -158,6 +203,8 @@ describe('a pass on some of the mutants Stryker made', () => {
       ({ plan: 'Run', mutant: { id, fileName: path.join(root, 'src', 'a.ts'), mutatorName: 'EqualityOperator', replacement, location: { start: { line, column: 2 }, end: { line, column: 8 } } } });
     new Reporter().onMutationTestingPlanReady({ mutantPlans: [planned('1', 'a >= 0', 9), planned('2', 'a <= 0', 9), planned('3', 'a >= 0', 10)] });
     expect(JSON.parse(fs.readFileSync(run, 'utf8'))).toEqual(['1']);
+    // a2 finds by the key the files its mutant's run in pass A took.
+    expect(JSON.parse(fs.readFileSync(path.join(dir, 'run-keys.json'), 'utf8'))).toEqual({ 1: 'src/a.ts|EqualityOperator|a >= 0|10:3-10:9' });
   });
 
   it("leaves, in every pass, Stryker's own time for the run with no mutant, which each rerun's budget is built from", async () => {
@@ -406,7 +453,8 @@ describe('the tree fingerprint', () => {
     expect(gate).toContain('const changedFiles = () => [...new Set(mutated().map(target => target.file))];');
     expect(gate).toContain('mutate: mutatePatterns(mutated())');
     // The run with no mutant after the reruns makes their spans, with their time limits, bound above their budget.
-    expect(gate).toContain("await stryker({ dir, tier, mutate: [...new Set(on.map(spanOf))], only, alone: true, extra: { ...(tier === 'a' ? PASSES.a2 : PASSES.b2), dryRunOnly: true, dryRunTimeoutMinutes: 60 } });");
+    expect(gate).toContain("const rerun = tier === 'a' ? PASSES.a2 : PASSES.b2;");
+    expect(gate).toContain('await stryker({ dir, tier, mutate: [...new Set(on.map(spanOf))], only, alone: true, extra: { ...rerun, dryRunOnly: true, dryRunTimeoutMinutes: controlBoundMinutes(rerun, only.length) } });');
     expect(gate).toContain('const results = await pass({ dir, tier, mutate: [...new Set(on.map(spanOf))],');
     // ... handed the very mutants the reruns ran on.
     expect(gate).toContain("await passOn('a2', 'a2', 'a', confirmA, PASSES.a2);");
@@ -433,6 +481,50 @@ describe('the gate under an old node', () => {
       { encoding: 'utf8', timeout: 30_000, env: { ...process.env, SMDB_TEST_NODE: 'node', SMDB_MUTATION_RELAUNCHED: '' } });
     expect(run.status).toBe(2);
     expect(run.stderr).toContain(`SMDB_TEST_NODE (node) runs v${version}`);
+  });
+});
+
+describe('the test files a run names', () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.resetModules();
+  });
+
+  it('are taken exactly, each in its tier, and leave no list for a vitest a test starts, each in its tier, and leave no list for a vitest a test starts', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-include-'));
+    const listed = Symbol.for('smdb.mutationInclude');
+    onTestFinished(() => {
+      fs.rmSync(dir, { recursive: true, force: true });
+      delete (globalThis as Record<PropertyKey, unknown>)[listed];
+    });
+    const list = path.join(dir, 'files.json');
+    fs.writeFileSync(list, JSON.stringify(['unit/a.test.ts', 'unit/(x).test.ts', 'integration/s.test.ts', 'child/c.test.ts']));
+    vi.stubEnv('SMDB_MUTATION_INCLUDE', list);
+    vi.resetModules();
+    type Projects = { test: { projects: { test: { name: string; include: string[] } }[] } };
+    const includes = async () => Object.fromEntries(((await import('../vitest.config')).default as Projects).test.projects.map(p => [p.test.name, p.test.include]));
+    expect(await includes()).toEqual({ fast: ['unit/a.test.ts', 'unit/\\(x\\).test.ts'], integration: ['integration/s.test.ts'], child: ['child/c.test.ts'] });
+    expect(process.env.SMDB_MUTATION_INCLUDE).toBeUndefined();
+    // vitest may load the config again for a project, in the same process.
+    vi.resetModules();
+    expect((await includes()).fast).toEqual(['unit/a.test.ts', 'unit/\\(x\\).test.ts']);
+    delete (globalThis as Record<PropertyKey, unknown>)[listed];
+    vi.resetModules();
+    expect((await includes()).fast).toEqual(['**/*.test.ts']);
+  });
+
+  it('let vitest take only the listed file', { timeout: 180_000 }, () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'smdb-include-'));
+    onTestFinished(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const list = path.join(dir, 'files.json');
+    fs.writeFileSync(list, JSON.stringify(['unit/mutationVerdict.test.ts']));
+    const vitest = path.join(root, 'test', 'node_modules', 'vitest', 'vitest.mjs');
+    const env: NodeJS.ProcessEnv = { ...process.env, SMDB_MUTATION_INCLUDE: list };
+    delete env.SMDB_MUTATION_COVERAGE;
+    const run = spawnSync(process.execPath, [vitest, 'list', '--filesOnly', '--json', '--project', 'fast'], { cwd: path.join(root, 'test'), env, encoding: 'utf8', timeout: 150_000 });
+    expect(run.status, `${run.stdout}${run.stderr}`).toBe(0);
+    const files = (JSON.parse(run.stdout.slice(run.stdout.indexOf('['))) as { file: string }[]).map(entry => path.relative(path.join(root, 'test'), entry.file).split(path.sep).join('/'));
+    expect(files).toEqual(['unit/mutationVerdict.test.ts']);
   });
 });
 
@@ -487,9 +579,37 @@ describe('the time limits', () => {
     const { PASSES } = await import('../mutation/passes.mjs');
     expect((config.test.hookTimeout - PASSES.b.timeoutMS) / PASSES.b.timeoutFactor).toBe(60_000);
   });
+
+  it('bound a run of a set with no mutant above a beforeAll, an afterAll and a test of each file at their limits, and Stryker above every set', async () => {
+    for (const scale of [1, 4]) {
+      vi.stubEnv('SMDB_TEST_TIME_SCALE', String(scale));
+      vi.resetModules();
+      const config = (await import('../vitest.config')).default as { test: { testTimeout: number; hookTimeout: number } };
+      const { setBoundMs } = await import('../mutation/passes.mjs');
+      expect(setBoundMs(1, scale), String(scale)).toBe(2 * config.test.hookTimeout + config.test.testTimeout + 60_000);
+      expect(setBoundMs(3, scale) - 60_000, String(scale)).toBe(3 * (setBoundMs(1, scale) - 60_000));
+    }
+    const { setsBoundMinutes } = await import('../mutation/passes.mjs');
+    expect(setsBoundMinutes([{ ms: 90_000 }, { ms: 60_000 }])).toBe(8);
+  });
 });
 
 describe('the Stryker options', () => {
+  it('bound the run with no mutant after the reruns above the largest budget a rerun can have', async () => {
+    const { controlBoundMinutes, PASSES } = await import('../mutation/passes.mjs');
+    for (const name of ['a2', 'b2'] as const) {
+      const rerun = PASSES[name];
+      // Stryker's budget: timeoutFactor times a run with no mutant up to its bound, plus timeoutMS, plus its overhead.
+      const largest = rerun.timeoutFactor * rerun.dryRunTimeoutMinutes * 60_000 + rerun.timeoutMS;
+      expect(controlBoundMinutes(rerun) * 60_000 - largest, name).toBeGreaterThanOrEqual(5 * 60_000);
+    }
+    expect(controlBoundMinutes(PASSES.a2)).toBe(126);
+    expect(controlBoundMinutes(PASSES.b2)).toBe(125);
+    // control-b2 runs every file that failed in pass B, each of which could take a whole b2 budget.
+    expect(controlBoundMinutes(PASSES.b2, 3)).toBe(365);
+    expect(controlBoundMinutes(PASSES.a2, 0)).toBe(126);
+  });
+
   it('take nothing from a Stryker config file in the bot root, and never mutate in place', async () => {
     const { ConfigReader } = await import('../node_modules/@stryker-mutator/core/dist/src/config/config-reader.js');
     const { COMMON, PASSES } = await import('../mutation/passes.mjs');

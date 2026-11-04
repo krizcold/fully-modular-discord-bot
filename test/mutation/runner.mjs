@@ -1,17 +1,21 @@
 // The command both Stryker passes run (touched.mjs sets the pass, the files and
 // the report dir in the env; Stryker adds the active mutant). It runs vitest on
 // this tree's own tests: pass a, the fast tier's tests that import the mutated
-// files (every file the gate mutates, in every run); pass b, the integration
+// files (every file the gate mutates, in every run), of which a mutant's run
+// takes those that reached it in the run with no mutant (a rerun alone, those
+// its run in pass A took); pass b, the integration
 // tests that import them, then the whole child tier; or only the test files
 // SMDB_MUTATION_ONLY names (the rerun of a pass B failure with the file that
-// failed), each in its tier. Every run stops at its
+// failed), each in its tier; or, with no mutant, each set of files
+// SMDB_MUTATION_SETS names, in a vitest run of its own (touched.mjs aloneCheck
+// and setCheck). Every run stops at its
 // first failed test, or after a tier that fails. A rerun alone (SMDB_MUTATION_CONFIRM=1) gives the config's
 // test and hook limits and a step's default bound four times their time
 // (SMDB_TEST_TIME_SCALE, read by vitest.config.ts and helpers/child.ts); a limit
 // a test sets itself is not scaled. Vitest's output goes to files, one JSON report and one log
 // per run, because Stryker buffers what a command prints with Node's 1 MB exec
 // limit and an overflow would end the run and count as a kill.
-import { spawnSync } from 'child_process';
+import { spawn, spawnSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -33,25 +37,83 @@ const active = process.env.__STRYKER_ACTIVE_MUTANT__ ?? 'none';
 const mutant = active === 'none' ? 'dry' : active;
 
 /**
+ * Runs one tier on `take`: the test files given (relative to test/), the
+ * tests related to the mutated files, or every test of the tier. `coverage` is
+ * the dir pass A's run with no mutant records reach in; no other run is given
+ * one, whatever the caller's shell set.
  * @param {string} project
- * @param {string[]} args
+ * @param {string[] | 'related' | 'all'} take
+ * @param {{ coverage?: string, name?: string }} [run] name: the report's and the log's, in `out`
  */
-function tier(project, args) {
-  const base = path.join(out, `${mutant}-${project}`);
-  const log = fs.openSync(`${base}.log`, 'w');
+function launch(project, take, { coverage, name = `${mutant}-${project}` } = {}) {
+  const files = Array.isArray(take) ? take : null;
+  const base = path.join(out, name);
+  /** @type {NodeJS.ProcessEnv} */
+  const env = { ...process.env, SMDB_TEST_TIME_SCALE: confirm ? '4' : '1' };
+  delete env.SMDB_MUTATION_COVERAGE;
+  delete env.SMDB_MUTATION_INCLUDE;
+  delete env.SMDB_MUTATION_SETS;
+  if (coverage) env.SMDB_MUTATION_COVERAGE = coverage;
+  // vitest.config.ts takes exactly these files, from a file: vitest run <files> takes every path that holds a
+  // name, and a long list can pass Windows' limit on a command line.
+  if (files) {
+    env.SMDB_MUTATION_INCLUDE = `${base}.include.json`;
+    fs.writeFileSync(env.SMDB_MUTATION_INCLUDE, JSON.stringify(files));
+  }
+  // One worker per run: Stryker already runs several at once, and a run's
+  // time must match the run with no mutant it is timed against. No results
+  // cache: every sandbox links the one in test/node_modules, so earlier runs
+  // would choose which file a run takes first.
+  const args = [vitest, ...(take === 'related' ? related : ['run']), '--bail=1', '--no-cache', '--maxWorkers=1', '--project', project, '--reporter=json', `--outputFile=${base}.json`];
+  return { args, env, log: fs.openSync(`${base}.log`, 'w') };
+}
+
+/**
+ * @param {string} project
+ * @param {string[] | 'related' | 'all'} take
+ * @param {{ coverage?: string, name?: string }} [run]
+ */
+function tier(project, take, run = {}) {
+  const { args, env, log } = launch(project, take, run);
   try {
-    // One worker per run: Stryker already runs several at once, and a run's
-    // time must match the run with no mutant it is timed against. No results
-    // cache: every sandbox links the one in test/node_modules, so earlier runs
-    // would choose which file a run takes first.
-    const run = spawnSync(process.execPath, [vitest, ...args, '--bail=1', '--no-cache', '--maxWorkers=1', '--project', project, '--reporter=json', `--outputFile=${base}.json`], {
-      cwd: testDir,
-      stdio: ['ignore', log, log],
-      env: { ...process.env, SMDB_TEST_TIME_SCALE: confirm ? '4' : '1' },
-    });
+    const result = spawnSync(process.execPath, args, { cwd: testDir, stdio: ['ignore', log, log], env });
     // A command line past the platform's limit, for one, starts nothing: say so where the report points.
-    if (run.error) fs.writeSync(log, `runner.mjs could not start vitest: ${run.error.message}\n`);
-    return run.status === 0 ? 0 : 1;
+    if (result.error) fs.writeSync(log, `runner.mjs could not start vitest: ${result.error.message}\n`);
+    return result.status === 0 ? 0 : 1;
+  } finally {
+    fs.closeSync(log);
+  }
+}
+
+/**
+ * Runs `files` as tier() does, and ends it with every process it started
+ * once it passes `ms`; resolves to its exit (1 when it was ended or could not
+ * start) and the time it took.
+ * @param {string[]} files
+ * @param {string} name
+ * @param {number} ms
+ * @returns {Promise<{ code: number, ms: number }>}
+ */
+async function bounded(files, name, ms) {
+  const { endTree } = await import('../helpers/endTree.mjs');
+  const { args, env, log } = launch(projectOf(files[0]), files, { name });
+  const begun = performance.now();
+  try {
+    const child = spawn(process.execPath, args, { cwd: testDir, stdio: ['ignore', log, log], env });
+    let ended = false;
+    const timer = setTimeout(() => {
+      ended = true;
+      if (child.pid !== undefined) endTree(child.pid);
+      child.kill('SIGKILL');
+    }, ms);
+    /** @type {number | null} */
+    const code = await new Promise(resolve => {
+      child.once('error', error => { fs.writeSync(log, `runner.mjs could not start vitest: ${error.message}\n`); resolve(null); });
+      child.once('exit', status => resolve(status));
+    });
+    clearTimeout(timer);
+    if (ended) fs.writeSync(log, `runner.mjs ended vitest after ${ms} ms, the bound on this run with no mutant\n`);
+    return { code: !ended && code === 0 ? 0 : 1, ms: Math.round(performance.now() - begun) };
   } finally {
     fs.closeSync(log);
   }
@@ -104,13 +166,54 @@ const end = code => {
   if (mutant === 'dry') fs.writeFileSync(path.join(out, 'dry-ms.txt'), String(Math.round(performance.now() - started)));
   process.exit(code);
 };
-if (only.length > 0) {
-  for (const project of ['fast', 'integration', 'child']) {
-    const these = only.filter(file => projectOf(file) === project);
-    if (these.length > 0 && tier(project, ['run', ...these])) end(1);
+// Relative to test/: more files fit on a command line than with the sandbox's absolute paths.
+const related = ['related', ...files.map(file => path.relative(testDir, file).split(path.sep).join('/')), '--run'];
+// The run with no mutant that checks what a pass counted (touched.mjs
+// aloneCheck and setCheck): each set of test files SMDB_MUTATION_SETS names
+// in a vitest run of its own, as a mutant run takes files, within the set's
+// own bound, and the exit and time of each in dry-alone.json; the run itself
+// passes, so Stryker reads no failure into it.
+/** @type {{ files: string[], ms: number }[]} */
+const sets = JSON.parse(process.env.SMDB_MUTATION_SETS || '[]');
+if (mutant === 'dry' && sets.length > 0) {
+  /** @type {{ files: string[], code: number, ms: number }[]} */
+  const runs = [];
+  for (const [index, set] of sets.entries()) {
+    runs.push({ files: set.files, ...await bounded(set.files, `dry-alone-${index}`, set.ms) });
+    fs.writeFileSync(path.join(out, 'dry-alone.json'), JSON.stringify(runs));
   }
   end(0);
 }
-// Relative to test/: more files fit on a command line than with the sandbox's absolute paths.
-const related = ['related', ...files.map(file => path.relative(testDir, file).split(path.sep).join('/')), '--run'];
-end(pass === 'a' ? tier('fast', related) : tier('integration', related) || tier('child', ['run']));
+if (only.length > 0) {
+  for (const project of ['fast', 'integration', 'child']) {
+    const these = only.filter(file => projectOf(file) === project);
+    if (these.length > 0 && tier(project, these)) end(1);
+  }
+  end(0);
+}
+if (pass === 'b') end(tier('integration', 'related') || tier('child', 'all'));
+// A rerun alone (a2) is of mutants a file already failed or timed out on in
+// pass A, so it takes the files that run took: a fresh run with no mutant that
+// missed the mutant would drop the file that showed it. Its run with no mutant
+// takes every related file, which its budget is built from.
+if (confirm) {
+  const { takenBefore } = await import('./reach.mjs');
+  const take = mutant === 'dry' ? null : takenBefore(out, mutant);
+  if (mutant !== 'dry') try { fs.writeFileSync(path.join(out, `${mutant}-reach.json`), JSON.stringify({ files: take ?? 'related' })); } catch {}
+  end(tier('fast', take ?? 'related'));
+}
+// Pass A: the run with no mutant records what each test file reached, and each
+// mutant run takes only the files that reached its mutant (reach.mjs).
+const { COVERAGE_DIR, REACH_FILE, readReach, selectFor, writeReach } = await import('./reach.mjs');
+if (mutant === 'dry') {
+  const coverage = path.join(out, COVERAGE_DIR);
+  fs.rmSync(coverage, { recursive: true, force: true });
+  const code = tier('fast', 'related', { coverage });
+  // With no reach left, every mutant run takes every related file.
+  try { writeReach(out, testDir); } catch { try { fs.rmSync(path.join(out, REACH_FILE), { force: true }); } catch {} }
+  end(code);
+}
+const take = selectFor(readReach(out), mutant);
+// One that cannot be written only leaves the report without "no fast test reached it".
+try { fs.writeFileSync(path.join(out, `${mutant}-reach.json`), JSON.stringify({ files: take ?? 'related' })); } catch {}
+end(take === null ? tier('fast', 'related') : take.length === 0 ? 0 : tier('fast', take));

@@ -13,7 +13,8 @@ import { fileURLToPath } from 'url';
 import { pastBudget, strykerClock } from './control.mjs';
 import { PACKAGE_LOCKS, treeChanges, treePrint } from './tree.mjs';
 import { canonicalName, fileOf as nameOf, keyOf } from './keys.mjs';
-import { COMMON, PASSES } from './passes.mjs';
+import { COMMON, controlBoundMinutes, PASSES, setBoundMs, setsBoundMinutes } from './passes.mjs';
+import { TAKEN_FILE } from './reach.mjs';
 
 /**
  * @typedef {import('./ranges.mjs').Location} Location
@@ -67,7 +68,7 @@ const {
   structureLines, DATA_ROUTE_WHY, EXTRA_BREAK_WHY, GLOB_NAME_WHY, beyondTree, checkerDiffers, gatesIn, holdsDataRoute, holdsExtraBreak, linesOfTarget, mutatePatterns,
   notMutated, ownNames, planFromGit, rootGlobFree, rootRelatable, sandboxPatterns, strykerTakes, treeTsconfig, unmatchedPatterns, untouched,
 } = ranges;
-const { byKiller, classifyKill, judge, onlyUnusedDirective, outcome, toConfirm, toPassB, toUncheck } = verdicts;
+const { byKiller, bySet, classifyKill, judge, killedInA, onlyUnusedDirective, outcome, toConfirm, toPassB, toUncheck, uncreditFailedAlone, voidFailedSets } = verdicts;
 
 const USAGE = 'usage: node test/mutation/touched.mjs [--base REF] [--mutate PATTERN]... [--concurrency N] [--keep]';
 /** @type {{ base: string, mutate: string[], concurrency: number, keep: boolean }} */
@@ -133,6 +134,8 @@ const sandbox = sandboxPatterns([...planned.keys()]);
 // too; it also overrides an id set in the shell, which Stryker passes on to the
 // command it runs.
 process.env.__STRYKER_ACTIVE_MUTANT__ = 'none';
+// Only pass A's run with no mutant records reach (runner.mjs gives it the dir); one set in the shell would reach every run.
+delete process.env.SMDB_MUTATION_COVERAGE;
 // A pattern is a file, or a file and lines; one with columns names no file, so it is refused.
 /** @param {string} pattern */
 const fileOfPattern = pattern => pattern.replace(/:\d+-\d+$/, '');
@@ -273,7 +276,42 @@ function resultOf(dir, r, alone = false) {
   if (r.status === 'CompileError' && onlyUnusedDirective(r.statusReason ?? '')) {
     return { ...result, inconclusive: 'a type error only because a @ts-expect-error went unused (TS2578), so no test ran on it' };
   }
+  if (r.status === 'Survived' && ranNone(dir, r.id)) return { ...result, unreached: true };
   return r.status === 'Killed' ? { ...result, ...classifyKill(reportsOf(dir, r.id), alone) } : result;
+}
+
+/**
+ * Whether a mutant's run in a pass of pass A's tests took no test file, as no
+ * file reached it in the pass's run with no mutant (runner.mjs, reach.mjs).
+ * @param {string} dir
+ * @param {string} id
+ */
+function ranNone(dir, id) {
+  try {
+    const { files } = JSON.parse(fs.readFileSync(path.join(reportDir, dir, `${id}-reach.json`), 'utf8'));
+    return Array.isArray(files) && files.length === 0;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The fast test files a mutant's run in pass A took (its `<id>-reach.json`),
+ * which its rerun alone takes again: a file failed or timed out among them.
+ * 'related' for every related file, when that run took them all or its record
+ * cannot be read.
+ * @param {MutantRecord} m
+ * @returns {string[] | 'related'}
+ */
+function takenInA(m) {
+  const a = m.passes.a;
+  if (!a?.id || !a.dir) return 'related';
+  try {
+    const { files } = JSON.parse(fs.readFileSync(path.join(reportDir, a.dir, `${a.id}-reach.json`), 'utf8'));
+    return Array.isArray(files) && files.length > 0 && files.every(file => typeof file === 'string') ? files : 'related';
+  } catch {
+    return 'related';
+  }
 }
 
 class PassError extends Error {}
@@ -289,20 +327,26 @@ const common = {
 
 /**
  * Runs Stryker once. `tier` picks the tests (runner.mjs): a for the fast
- * tier's tests related to every file the gate mutates, b for the integration
+ * tier's tests related to every file the gate mutates (each mutant's run takes
+ * those that reached it in the pass's run with no mutant, and in a2 those its
+ * run in pass A took), b for the integration
  * tier's related tests and then the whole child tier; `only`, when given,
  * names the test files to run instead. A run `alone` (the reruns, a2 and b2,
  * and the runs with no mutant after them) gets four times the config's time
  * limits. `keys`, when given, are the mutants the pass is for: Stryker makes
  * every mutant its spans hold, and the others run no test (targets.mjs).
- * @param {{ dir: string, tier: 'a' | 'b', mutate: string[], only?: string[], keys?: string[], alone?: boolean, extra: Options }} run
+ * `sets`, when given, are sets of test files the run with no mutant runs each
+ * in a vitest run of its own, within the set's bound in ms (aloneCheck,
+ * setCheck).
+ * @param {{ dir: string, tier: 'a' | 'b', mutate: string[], only?: string[], keys?: string[], alone?: boolean, sets?: { files: string[], ms: number }[], extra: Options }} run
  * @returns {Promise<StrykerResult[]>}
  */
-async function stryker({ dir, tier, mutate, only = [], keys, alone = false, extra }) {
+async function stryker({ dir, tier, mutate, only = [], keys, alone = false, sets = [], extra }) {
   const out = path.join(reportDir, dir);
   fs.mkdirSync(out, { recursive: true });
   process.env.SMDB_MUTATION_PASS = tier;
   process.env.SMDB_MUTATION_CONFIRM = alone ? '1' : '';
+  process.env.SMDB_MUTATION_SETS = sets.length > 0 ? JSON.stringify(sets) : '';
   process.env.SMDB_MUTATION_FILES = JSON.stringify(changedFiles());
   process.env.SMDB_MUTATION_ONLY = JSON.stringify(only);
   process.env.SMDB_MUTATION_OUT = out;
@@ -356,9 +400,8 @@ async function control(after, tier, on, only, timed = false) {
   console.log(`L5: the same tests once with no mutant, to check the machine after pass ${after}`);
   let failed = '';
   try {
-    // Bound by an hour, above the budget any rerun of pass A had (four times its own run with no mutant, which ran
-    // under Stryker's five minutes, plus a minute), so the budget, not the bound, judges the time.
-    await stryker({ dir, tier, mutate: [...new Set(on.map(spanOf))], only, alone: true, extra: { ...(tier === 'a' ? PASSES.a2 : PASSES.b2), dryRunOnly: true, dryRunTimeoutMinutes: 60 } });
+    const rerun = tier === 'a' ? PASSES.a2 : PASSES.b2;
+    await stryker({ dir, tier, mutate: [...new Set(on.map(spanOf))], only, alone: true, extra: { ...rerun, dryRunOnly: true, dryRunTimeoutMinutes: controlBoundMinutes(rerun, only.length) } });
     if (timed) failed = pastBudget(path.join(reportDir, after), out, PASSES.a2);
   } catch (error) {
     if (error instanceof PassError) throw error;
@@ -378,6 +421,111 @@ async function control(after, tier, on, only, timed = false) {
     ].join('\n'));
   }
   controls.push(`after pass ${after}: passed (${logs})`);
+}
+
+/**
+ * Runs `sets` with no mutant, each in a vitest run of its own within its
+ * bound, as a Stryker run of its own over `on`'s spans (a fresh sandbox, the
+ * same code made and none of it active), and returns what dry-alone.json then
+ * holds; one that cannot run stops the gate.
+ * @param {string} dir
+ * @param {MutantRecord[]} on
+ * @param {{ files: string[], ms: number }[]} sets
+ * @param {boolean} alone four times the config's time limits, as a2 ran
+ * @param {string} what
+ * @returns {Promise<unknown>}
+ */
+async function runSets(dir, on, sets, alone, what) {
+  const out = path.join(reportDir, dir);
+  try {
+    await stryker({
+      dir, tier: 'a', mutate: [...new Set(on.map(spanOf))], sets, alone,
+      extra: { ...(alone ? PASSES.a2 : PASSES.a), checkers: [], concurrency: 1, dryRunOnly: true, dryRunTimeoutMinutes: setsBoundMinutes(sets) },
+    });
+  } catch (error) {
+    if (error instanceof PassError) throw error;
+    throw new PassError([`${what} could not run: ${firstLine(error)}`, ...refusalIn(out)].join('\n'));
+  }
+  try { return JSON.parse(fs.readFileSync(path.join(out, 'dry-alone.json'), 'utf8')); } catch { return []; }
+}
+
+/**
+ * Runs each test file that killed a mutant in pass A (or in its run with no
+ * checker) alone, once, with no mutant: a mutant's run there took only the
+ * files that reached it, so a file that fails on its own (for one, without
+ * state a dropped file leaves behind) would count as a kill. runSets runs
+ * each file as such a run takes files, at pass A's time limits. A kill whose
+ * file failed there, or ran past its bound, is taken back (verdict.mjs
+ * uncreditFailedAlone), and its mutant reruns alone in a2.
+ * @param {MutantRecord[]} all
+ */
+async function aloneCheck(all) {
+  const killed = killedInA(all);
+  if (killed.size === 0) return;
+  const dir = 'alone-a';
+  const out = path.join(reportDir, dir);
+  const files = [...killed.keys()];
+  const on = [...killed.values()].flat();
+  for (const m of on) /** @type {PassResult} */ (m.passes.a).pending = dir;
+  console.log(`L5: each of the ${files.length} test file(s) that killed a mutant in pass A, alone with no mutant, so a kill counts only from a file that passes on its own`);
+  const runs = await runSets(dir, on, files.map(file => ({ files: [file], ms: setBoundMs(1, 1) })), false, 'the run of each file that killed a mutant in pass A, alone with no mutant,');
+  /** @type {Record<string, unknown>} */
+  const codes = {};
+  if (Array.isArray(runs)) {
+    for (const run of runs) if (Array.isArray(run?.files) && run.files.length === 1) codes[run.files[0]] = run.code;
+  }
+  const taken = uncreditFailedAlone(killed, codes, dir);
+  for (const m of on) delete /** @type {PassResult} */ (m.passes.a).pending;
+  const logs = `${posix(path.relative(root, out))}/dry-alone-*.log`;
+  controls.push(`after pass A, each file that killed a mutant there, alone: ${files.length - taken.size} of ${files.length} passed (${logs})`);
+  for (const [file, why] of taken) controls.push(`  ${file}: ${why}, so its ${killed.get(file)?.length} kill(s) in pass A do not count and rerun alone in a2`);
+}
+
+/**
+ * The fast test files a mutant's a2 run took, from its `<id>-reach.json`
+ * there: 'related' for every related file, null when it cannot be read.
+ * @param {MutantRecord} m
+ * @returns {string[] | 'related' | null}
+ */
+function takenInA2(m) {
+  const a2 = m.passes.a2;
+  if (!a2?.id || !a2.dir) return null;
+  try {
+    const { files } = JSON.parse(fs.readFileSync(path.join(reportDir, a2.dir, `${a2.id}-reach.json`), 'utf8'));
+    if (files === 'related') return 'related';
+    return Array.isArray(files) && files.length > 0 && files.every(file => typeof file === 'string') ? files : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Runs, with no mutant, each set of fast test files an a2 kill or timeout ran
+ * on when that was fewer than every related file, which the run with no mutant
+ * after the reruns took: a file of the set can fail or hang there without
+ * state a dropped file leaves behind, and a2 would count it. Each set runs once
+ * in a vitest run of its own, as a2 ran it (runSets, a2's time limits). A
+ * result whose set failed there, left no result, ran past its bound, or (for a
+ * timeout) took longer than the budget Stryker gave each a2 run, is voided
+ * (verdict.mjs voidFailedSets), and its mutant is inconclusive.
+ * @param {MutantRecord[]} on
+ */
+async function setCheck(on) {
+  const sets = bySet(on, takenInA2);
+  if (sets.length === 0) return;
+  const dir = 'alone-a2';
+  const out = path.join(reportDir, dir);
+  for (const m of sets.flatMap(set => set.on)) /** @type {PassResult} */ (m.passes.a2).pending = dir;
+  const runnable = /** @type {{ files: string[], on: MutantRecord[] }[]} */ (sets.filter(set => set.files !== null));
+  console.log(`L5: each of the ${sets.length} set(s) of fast test files an a2 kill or timeout ran on, once with no mutant, so a result counts only from a set that passes without it`);
+  const runs = runnable.length === 0 ? [] : await runSets(dir, runnable.flatMap(set => set.on), runnable.map(set => ({ files: set.files, ms: setBoundMs(set.files.length, 4) })), true,
+    'the run of each set of files an a2 result ran on, with no mutant,');
+  const { clock, net, overhead } = strykerClock(path.join(reportDir, 'a2'));
+  const budget = clock ? NaN : PASSES.a2.timeoutFactor * net + PASSES.a2.timeoutMS + overhead;
+  const lines = voidFailedSets(sets, runs, dir, budget);
+  for (const m of sets.flatMap(set => set.on)) delete /** @type {PassResult} */ (m.passes.a2).pending;
+  controls.push(`after pass a2, each set of files an a2 result ran on, with no mutant: ${sets.length - lines.length} of ${sets.length} held (${posix(path.relative(root, out))}/dry-alone-*.log)`);
+  for (const line of lines) controls.push(`  ${line}`);
 }
 
 /**
@@ -404,6 +552,10 @@ const credited = m => ['Killed', 'Timeout'].includes(outcome(m));
  * @param {string[]} [only]
  */
 async function passOn(name, dir, tier, on, extra, only) {
+  if (name === 'a2') {
+    fs.mkdirSync(path.join(reportDir, dir), { recursive: true });
+    fs.writeFileSync(path.join(reportDir, dir, TAKEN_FILE), JSON.stringify(Object.fromEntries(on.map(m => [recordKey(m), takenInA(m)]))));
+  }
   const results = await pass({ dir, tier, mutate: [...new Set(on.map(spanOf))], only, keys: on.map(recordKey), alone: name === 'a2' || name === 'b2', extra });
   const byKey = new Map(results.map(r => [resultKey(r), r]));
   for (const m of on) {
@@ -532,12 +684,14 @@ try {
     console.log(`L5: pass A again, with no type checker, on ${unchecked.length} mutant(s) whose only type error is an unused @ts-expect-error`);
     await passOn('a', 'a-unchecked', 'a', unchecked, { ...PASSES.a, checkers: [], concurrency: opts.concurrency });
   }
+  await aloneCheck(mutants);
 
   const confirmA = toConfirm(mutants, 'a');
   if (confirmA.length > 0) {
     console.log(`L5: pass A again, one at a time, on ${confirmA.length} mutant(s) to confirm alone: timeouts, and runs that failed only on the machine's texts`);
     await passOn('a2', 'a2', 'a', confirmA, PASSES.a2);
     if (confirmA.some(credited)) await control('a2', 'a', confirmA, [], confirmA.some(m => outcome(m) === 'Timeout'));
+    await setCheck(confirmA);
   }
 
   const forB = toPassB(mutants);

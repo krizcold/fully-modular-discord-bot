@@ -127,11 +127,11 @@ describe('the touched-line mutation gate', () => {
     expect(run.stdout).not.toContain(`nodeIdentity.ts:${child}:`);
     const killedInA = on(fast).filter(m => !equivalent(m)).length;
     expect(run.stdout).toContain(`\n  killed in pass A: ${killedInA}; run in pass B: ${on(child).length + 1}, killed there: ${on(child).length}\n`);
-    expect(run.stdout).toMatch(/^Runs with no mutant after the reruns:\n {2}after pass b2: passed /m);
+    expect(run.stdout).toMatch(/^Runs with no mutant that checked what a pass counted:\n {2}after pass A, each file that killed a mutant there, alone: \d+ of \d+ passed .*\n {2}after pass b2: passed /m);
     expect(run.stdout).toMatch(/^Verdict: FAIL$/m);
     // Pass B's kills reran with the one file that killed them, and so did the run with no mutant after them.
     for (const dir of ['b2-1', 'control-b2']) {
-      const written = fs.readdirSync(path.join(root, reportDir!, dir)).filter(file => !['targets.json', 'run-ids.json', 'dry-ms.txt', 'dry-timing.json'].includes(file));
+      const written = fs.readdirSync(path.join(root, reportDir!, dir)).filter(file => !['targets.json', 'run-ids.json', 'run-keys.json', 'dry-ms.txt', 'dry-timing.json'].includes(file));
       expect(written.some(file => file.endsWith('-child.json')), dir).toBe(true);
       expect(written.filter(file => !file.includes('-child.')), dir).toEqual([]);
     }
@@ -241,7 +241,7 @@ describe('the touched-line mutation gate', () => {
     expect(run.stdout).toContain(`\nChanged during the run (so no one tree was tested):\n  ${added}, ${lock}\n`);
     expect(run.stdout).toMatch(/^Inconclusive .*\n {2}src\/bot\/internalSetup\/fleet\/nodeIdentity\.ts:\d+:\d+ .*\(the run with no mutant after pass a2 failed\)$/m);
     expect(run.stdout).not.toMatch(/^Timeouts /m);
-    expect(run.stdout).not.toMatch(/^Runs with no mutant after the reruns:/m);
+    expect(run.stdout).not.toMatch(/^Runs with no mutant that checked what a pass counted:/m);
   });
 
   it('counts no timeout its reruns confirmed when the run with no mutant after them passes past their budget', { timeout: 600_000 }, () => {
@@ -289,7 +289,7 @@ describe('the touched-line mutation gate', () => {
       expect(m.passes.a2).toMatchObject({ killedBy: 'unit/x.test.ts > reads' });
     }
     expect(run.stdout).toMatch(new RegExp(`^L5: pass A again, one at a time, on ${ran.length} mutant\\(s\\) to confirm alone: `, 'm'));
-    expect(run.stdout).toMatch(/^Runs with no mutant after the reruns:\n {2}after pass a2: passed/m);
+    expect(run.stdout).toMatch(/^Runs with no mutant that checked what a pass counted:\n {2}after pass a2: passed/m);
     expect(run.stdout).not.toMatch(/^Inconclusive /m);
   });
 
@@ -321,7 +321,7 @@ describe('the touched-line mutation gate', () => {
         "if (!process.argv.some(arg => arg.includes('smdb-bite-other-'))) message = \"Error: the run lacks the change's files\";",
       ].join('\n'), [probe, other]);
       expect(run.stdout).toContain(`\nPatterns that made no mutant:\n  ${other}`);
-      expect(run.stdout).toMatch(/^Runs with no mutant after the reruns:\n {2}after pass a2: passed/m);
+      expect(run.stdout).toMatch(/^Runs with no mutant that checked what a pass counted:\n {2}after pass a2: passed/m);
       expect(run.stdout).not.toMatch(/^Stopped:/m);
       // Emptying the object is a type error only in the ignored file, so it meets the tests (the stand-in times them
       // out), and its rerun alone counts the failure, whatever it says.

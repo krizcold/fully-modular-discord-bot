@@ -3,8 +3,9 @@
 // span brings in mutants nested inside it that the pass is not for. When
 // Stryker has made its plan, before any mutant runs, this writes the ids of the
 // mutants the pass is for (their keys are in the file SMDB_MUTATION_TARGETS
-// names; the ids go to the one SMDB_MUTATION_RUN names), and runner.mjs runs no
-// test for the others, whose results touched.mjs drops. In every pass it also
+// names; the ids go to the one SMDB_MUTATION_RUN names, and each id's key to
+// run-keys.json beside it), and runner.mjs runs no test for the others, whose
+// results touched.mjs drops. In every pass it also
 // leaves Stryker's own time for the run with no mutant (dry-timing.json in the
 // pass's dir), which each rerun's budget is built from (control.mjs).
 import fs from 'fs';
@@ -12,6 +13,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { declareClassPlugin, PluginKind, tokens } from '@stryker-mutator/api/plugin';
 import { fileOf, keyOf } from './keys.mjs';
+import { RUN_KEYS_FILE } from './reach.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 
@@ -30,11 +32,13 @@ class TargetsReporter {
     const run = process.env.SMDB_MUTATION_RUN;
     if (!targets || !run) return;
     const keys = new Set(JSON.parse(fs.readFileSync(targets, 'utf8')));
-    const ids = mutantPlans
+    const planned = mutantPlans
       .map(plan => plan.mutant)
-      .filter(m => keys.has(keyOf(fileOf(root, m.fileName), m.mutatorName, m.replacement ?? '', { start: fromOne(m.location.start), end: fromOne(m.location.end) })))
-      .map(m => m.id);
-    fs.writeFileSync(run, JSON.stringify(ids));
+      .map(m => [m.id, keyOf(fileOf(root, m.fileName), m.mutatorName, m.replacement ?? '', { start: fromOne(m.location.start), end: fromOne(m.location.end) })])
+      .filter(([, key]) => keys.has(key));
+    fs.writeFileSync(run, JSON.stringify(planned.map(([id]) => id)));
+    // a2 finds by the key the files each mutant's run in pass A took (runner.mjs).
+    fs.writeFileSync(path.join(path.dirname(run), RUN_KEYS_FILE), JSON.stringify(Object.fromEntries(planned)));
   }
 
   /**
