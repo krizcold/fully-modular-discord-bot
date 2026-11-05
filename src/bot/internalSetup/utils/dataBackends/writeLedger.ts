@@ -12,7 +12,7 @@ import type { DataUnavailableCause, WsTicket } from './workingSet';
 export type LedgerKind = 'interaction' | 'panel' | 'console' | 'message';
 export type LedgerTicket = WsTicket | FileTicket;
 /** Why a write was refused: the facade's own refusals, or the cause of a DataBackendUnavailableError. */
-export type LedgerCause = 'frozen' | 'not-ready' | 'io' | DataUnavailableCause;
+export type LedgerCause = 'frozen' | 'not-ready' | 'io' | 'writer-lost' | DataUnavailableCause;
 
 /** An interaction token's life; no reply can be sent after it. */
 export const INTERACTION_LEDGER_LIFE_MS = 15 * 60 * 1000;
@@ -36,6 +36,8 @@ export class WriteLedger {
   private readonly keysByTarget = new Map<string, Set<object>>();
   /** Per cause, the modules, and the documents whose writes were refused, each with its latest refusal's stamp. */
   private readonly refused = new Map<LedgerCause, { modules: Set<string>; docs: Map<string, number> }>();
+  /** Refusals whose writer keeps the change and retries it, by cause and document. */
+  private readonly retried = new Set<string>();
   /** The documents rewritten whole (a save or a delete), each with its latest rewrite's stamp. */
   private readonly rewritten = new Map<string, number>();
   /** Compaction dropped an entry whose write had landed, so the ledger no longer lists that confirmed write. */
@@ -54,6 +56,7 @@ export class WriteLedger {
     this.entries.clear();
     this.keysByTarget.clear();
     this.refused.clear();
+    this.retried.clear();
     this.rewritten.clear();
   }
 
@@ -115,10 +118,18 @@ export class WriteLedger {
     return [...this.refused].map(([cause, { modules }]) => ({ cause, modules: [...modules].sort() }));
   }
 
-  /** Each refused document with its cause and its latest refusal's stamp. */
-  refusedDocs(): Array<{ cause: LedgerCause; doc: string; seq: number }> {
+  /** Marks every refusal of this document as one its writer keeps and retries (never one of the stop or a deposition). */
+  noteRetried(doc: string): void {
+    if (this.sealed) return;
+    for (const [cause, { docs }] of this.refused) {
+      if (docs.has(doc) && cause !== 'node-stopping' && cause !== 'writer-lost') this.retried.add(`${cause}|${doc}`);
+    }
+  }
+
+  /** Each refused document with its cause, its latest refusal's stamp, and whether its writer retries it. */
+  refusedDocs(): Array<{ cause: LedgerCause; doc: string; seq: number; retried: boolean }> {
     if (this.sealed) return [];
-    return [...this.refused].flatMap(([cause, { docs }]) => [...docs].map(([doc, seq]) => ({ cause, doc, seq })));
+    return [...this.refused].flatMap(([cause, { docs }]) => [...docs].map(([doc, seq]) => ({ cause, doc, seq, retried: this.retried.has(`${cause}|${doc}`) })));
   }
 
   /** The stamp of this document's latest whole rewrite in this ledger, or 0. */
@@ -135,6 +146,43 @@ export class WriteLedger {
 
 export function landed(ticket: LedgerTicket): boolean {
   return ticket.kind === 'file' ? ticket.record.landed >= ticket.seq : ticket.set.landedSeq >= ticket.seq;
+}
+
+/** An op's own writes, which its reply carries to the web UI's local chain (never over IPC). */
+export interface OpWrites {
+  tickets: LedgerTicket[];
+  /** A write was refused and no later whole rewrite of its document followed. */
+  refused: boolean;
+  /** A refused write was rewritten whole later, or its writer retries it: whether it is saved cannot be known. */
+  unknowable: boolean;
+  /** Compaction dropped an entry whose write had landed. */
+  landedBefore: boolean;
+}
+
+export const NO_WRITES: OpWrites = Object.freeze({ tickets: [], refused: false, unknowable: false, landedBefore: false }) as OpWrites;
+
+const OP_WRITES = Symbol('opWrites');
+
+/** The ledger's writes now; read before it seals. */
+export function writesOf(ledger: WriteLedger): OpWrites {
+  const refusals = ledger.refusedDocs();
+  const open = (r: { doc: string; seq: number; retried: boolean }) => r.retried || ledger.rewriteSeq(r.doc) > r.seq;
+  return {
+    tickets: ledger.tickets().map(entry => entry.ticket),
+    refused: refusals.some(r => !open(r)),
+    unknowable: refusals.some(open),
+    landedBefore: ledger.landedDropped,
+  };
+}
+
+/** Puts the op's writes on its reply under a non-enumerable symbol key, which no IPC serialization carries. */
+export function carryWrites<T>(reply: T, writes: OpWrites | undefined): T {
+  if (writes && reply && typeof reply === 'object') Object.defineProperty(reply, OP_WRITES, { value: writes, enumerable: false, configurable: true });
+  return reply;
+}
+
+export function carriedWrites(reply: unknown): OpWrites | undefined {
+  return reply && typeof reply === 'object' ? (reply as Record<symbol, OpWrites | undefined>)[OP_WRITES] : undefined;
 }
 
 interface Frame {
@@ -236,6 +284,31 @@ export function recordTicket(ticket: LedgerTicket, rewrites?: string): void {
 export function recordRefusal(cause: LedgerCause, doc: string): void {
   const frame = frames.getStore();
   frame?.ledger.noteRefusal(cause, frame.module ?? frame.ledger.kind, doc);
+}
+
+/** The refusal of this document in the current ledger is kept by its writer and retried: it answers held. */
+export function markRetried(doc: string): void {
+  frames.getStore()?.ledger.noteRetried(doc);
+}
+
+/** Runs fn outside every ledger frame, so no caller's ledger records what it writes. */
+export function outsideLedgers<T>(fn: () => T): T {
+  return frames.exit(fn);
+}
+
+const paymentOps = new WeakMap<WriteLedger, string>();
+
+/** Names the payment op (payment.webhook, payment.oauthCallback) this ledger runs. */
+export function markPaymentLedger(ledger: WriteLedger, op: string): void {
+  paymentOps.set(ledger, op);
+}
+
+export function paymentOpOf(ledger: WriteLedger | undefined): string | undefined {
+  return ledger ? paymentOps.get(ledger) : undefined;
+}
+
+export function isPaymentLedger(ledger: WriteLedger | undefined): boolean {
+  return paymentOpOf(ledger) !== undefined;
 }
 
 /**

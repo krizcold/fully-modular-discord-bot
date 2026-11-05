@@ -194,7 +194,7 @@ function ConfigPanel() {
         setInitialized(isDataFile ? res.exists !== false : res.initialized !== false);
         setInitMessage(res.message || '');
         if (res.notice) showToast(res.notice, 'warning');
-        setLoaded(isDataFile ? stamp : { ...stamp, version: res.version });
+        setLoaded(isDataFile ? { ...stamp, sha: res.sha } : { ...stamp, version: res.version });
       } else {
         setLoadFailed(true);
         setError(res.error || 'Failed to load file');
@@ -287,7 +287,7 @@ function ConfigPanel() {
       // Use different endpoint and payload based on file type
       const endpoint = isDataFile ? '/config/data/update' : '/config/update';
       const payload = isDataFile
-        ? { file: stamp.fileKey, data: dataToSave, guildId }
+        ? { file: stamp.fileKey, data: dataToSave, guildId, loadedSha: stamp.sha }
         : { file: stamp.fileKey, config: dataToSave, guildId, version: stamp.version, effective: !!guildId };
 
       const res = await api.post(endpoint, payload);

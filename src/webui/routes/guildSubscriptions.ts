@@ -4,8 +4,11 @@ import { Router, Request, Response } from 'express';
 import { requireOAuth, requireGuildAccess } from '../auth/oauthMiddleware';
 import { getPremiumManager } from '../../bot/internalSetup/utils/premiumManager';
 import { getPaymentRegistry } from '../../bot/internalSetup/utils/payment/paymentRegistry';
+import type { BotManager } from '../botManager';
+import { SharedOpAnswered, sharedOpFailure, sharedOpRunner } from './hopFailure';
 
-export function createGuildSubscriptionRoutes(): Router {
+export function createGuildSubscriptionRoutes(botManager: BotManager): Router {
+  const shared = sharedOpRunner(botManager);
   const router = Router();
 
   function validateGuildId(guildId: string): boolean {
@@ -41,25 +44,24 @@ export function createGuildSubscriptionRoutes(): Router {
         '<h2>Patreon is not configured on this bot.</h2><p>Ask the host to set Patreon credentials.</p>'
       );
     }
-    let result;
-    try {
-      result = await provider.handleOAuthCallback(req.query as Record<string, string>);
-    } catch (err: any) {
-      const msg = err?.message || 'Patreon callback failed';
-      return res.status(400).type('html').send(
-        `<h2>Patreon link failed</h2><p>${escapeHtml(msg)}</p>` +
+    // The whole callback (the provider exchange, the anti-duplicate check, the link and its install event) runs in the
+    // process that writes premium: the bot while it runs, the web UI's local chain while none does.
+    const reply = await botManager.runSharedOp('payment.oauthCallback', { providerId: 'patreon', query: req.query });
+    if (!reply?.ok) {
+      const failure = sharedOpFailure(reply) ?? { status: 500, error: 'Patreon callback failed' };
+      return res.status(reply?.code === 'invalid' ? 400 : failure.status).type('html').send(
+        `<h2>Patreon link failed</h2><p>${escapeHtml(failure.error)}</p>` +
         `<p><a href="javascript:history.back()">Go back</a></p>`
       );
     }
-
-    const mgr = getPremiumManager();
+    const existing: string | undefined = reply.result?.linkedElsewhere;
+    const result = { guildId: reply.result?.linked as string };
 
     // Anti-duplicate: one Patreon account can't link to multiple guilds.
     // If a previous link exists on a different guild, surface the conflicting
     // guildId so the user knows where to take action, and link to the unlink
     // endpoint they can hit while signed in to the OTHER server's Web UI.
-    const existing = mgr.getAccountLink(provider.id, result.externalAccountId);
-    if (existing && existing !== result.guildId) {
+    if (existing) {
       const unlinkPath = `/guild/${encodeURIComponent(existing)}/subscription`;
       return res.status(409).type('html').send(
         `<h2>Patreon account already linked elsewhere</h2>` +
@@ -69,21 +71,6 @@ export function createGuildSubscriptionRoutes(): Router {
         `<p><a href="${unlinkPath}">Open the other server's subscription page</a></p>`
       );
     }
-    mgr.linkAccount(provider.id, result.externalAccountId, result.guildId);
-
-    // Install via the standard async-create event so stacking + audit
-    // run through the same path as Stripe / LS webhook installs.
-    getPaymentRegistry().emitEvent({
-      type: 'subscription.created',
-      providerId: provider.id,
-      providerSubId: `patreon:${result.externalAccountId}:${result.guildId}`,
-      guildId: result.guildId,
-      tierId: result.tierId,
-      offeringId: result.offeringId,
-      variantId: result.variantId,
-      state: result.state,
-    });
-
     // Redirect back to the guild's subscription page; the ?subscribe=success
     // query triggers the neutral-processing-page poll from Stage 3 polish.
     res.redirect(`/guild/${encodeURIComponent(result.guildId)}/subscription?subscribe=success`);
@@ -122,6 +109,7 @@ export function createGuildSubscriptionRoutes(): Router {
         providers,
       });
     } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({ success: false, error: errorMessage });
     }
@@ -162,6 +150,7 @@ export function createGuildSubscriptionRoutes(): Router {
         reason: v.reason,
       });
     } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({ success: false, error: errorMessage });
     }
@@ -193,19 +182,20 @@ export function createGuildSubscriptionRoutes(): Router {
       }
       const mgr = getPremiumManager();
       const userId = (req.user as any)?.id;
-      const result = await mgr.initiatePaidSubscription(guildId, tierId, offeringId, {
+      const result = await shared(res, 'premium.initiatePaidSubscription', [guildId, tierId, offeringId, {
         providerId,
         variantId,
         couponCode,
         userId,
         autoRenewOptOut: !!autoRenewOptOut,
-      });
+      }]);
       res.json({
         success: true,
         result,
         subscriptions: mgr.getSubscriptions(guildId),
       });
     } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({ success: false, error: errorMessage });
     }
@@ -222,9 +212,10 @@ export function createGuildSubscriptionRoutes(): Router {
         return res.status(400).json({ success: false, error: 'Invalid guild ID' });
       }
       const mgr = getPremiumManager();
-      const success = await mgr.cancelPaidSubscription(guildId);
+      const success = await shared(res, 'premium.cancelPaidSubscription', [guildId]);
       res.json({ success, subscriptions: mgr.getSubscriptions(guildId) });
     } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({ success: false, error: errorMessage });
     }
@@ -241,9 +232,10 @@ export function createGuildSubscriptionRoutes(): Router {
         return res.status(400).json({ success: false, error: 'Invalid guild ID' });
       }
       const mgr = getPremiumManager();
-      const success = await mgr.reactivatePaidSubscription(guildId);
+      const success = await shared(res, 'premium.reactivatePaidSubscription', [guildId]);
       res.json({ success, subscriptions: mgr.getSubscriptions(guildId) });
     } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({ success: false, error: errorMessage });
     }
@@ -262,12 +254,13 @@ export function createGuildSubscriptionRoutes(): Router {
         return res.status(400).json({ success: false, error: 'Invalid guild ID' });
       }
       const mgr = getPremiumManager();
-      const success = await mgr.cancelPaidSubscriptionImmediately(guildId);
+      const success = await shared(res, 'premium.cancelPaidSubscriptionImmediately', [guildId]);
       if (!success) {
         return res.status(404).json({ success: false, error: 'No active paid subscription to expire' });
       }
       res.json({ success, subscriptions: mgr.getSubscriptions(guildId) });
     } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({ success: false, error: errorMessage });
     }
@@ -288,6 +281,7 @@ export function createGuildSubscriptionRoutes(): Router {
       const orphans = await mgr.findOrphansForGuild(guildId);
       res.json({ success: true, orphans });
     } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({ success: false, error: errorMessage });
     }
@@ -305,9 +299,10 @@ export function createGuildSubscriptionRoutes(): Router {
         return res.status(400).json({ success: false, error: 'Invalid guild ID' });
       }
       const mgr = getPremiumManager();
-      await mgr.adoptOrphan(guildId, providerId, providerSubId);
+      await shared(res, 'premium.adoptOrphan', [guildId, providerId, providerSubId]);
       res.json({ success: true, subscriptions: mgr.getSubscriptions(guildId) });
     } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(400).json({ success: false, error: errorMessage });
     }
@@ -324,9 +319,10 @@ export function createGuildSubscriptionRoutes(): Router {
         return res.status(400).json({ success: false, error: 'Invalid guild ID' });
       }
       const mgr = getPremiumManager();
-      await mgr.cancelOrphan(providerId, providerSubId);
+      await shared(res, 'premium.cancelOrphan', [providerId, providerSubId]);
       res.json({ success: true });
     } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(400).json({ success: false, error: errorMessage });
     }
@@ -360,6 +356,7 @@ export function createGuildSubscriptionRoutes(): Router {
       const result = await provider.createBillingPortalSession(active.providerSubId, returnUrl);
       res.json({ success: true, portalUrl: result.portalUrl });
     } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(400).json({ success: false, error: errorMessage });
     }
@@ -381,12 +378,13 @@ export function createGuildSubscriptionRoutes(): Router {
         return res.status(400).json({ success: false, error: 'subscriptionId is required' });
       }
       const mgr = getPremiumManager();
-      const success = await mgr.cancelAndRemovePausedSubscription(guildId, subscriptionId);
+      const success = await shared(res, 'premium.cancelAndRemovePausedSubscription', [guildId, subscriptionId]);
       if (!success) {
         return res.status(404).json({ success: false, error: 'No paused subscription matched that id' });
       }
       res.json({ success, subscriptions: mgr.getSubscriptions(guildId) });
     } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({ success: false, error: errorMessage });
     }
@@ -407,32 +405,13 @@ export function createGuildSubscriptionRoutes(): Router {
       if (!validateGuildId(guildId)) {
         return res.status(400).json({ success: false, error: 'Invalid guild ID' });
       }
-      const mgr = getPremiumManager();
-      // Find the externalAccountId by reverse-lookup over providerAccountLinks.
-      const all = mgr.getFullConfig().providerAccountLinks?.[providerId] || {};
-      const externalAccountId = Object.entries(all).find(([, gid]) => gid === guildId)?.[0];
-      if (!externalAccountId) {
+      const unlinked = await shared(res, 'premium.unlinkProviderAccount', [guildId, providerId]);
+      if (!unlinked) {
         return res.status(404).json({ success: false, error: `No ${providerId} link on this guild` });
-      }
-      mgr.unlinkAccount(providerId, externalAccountId);
-      // Revoke any paid subs from this provider on this guild. Walk active
-      // and paused; cancel-and-remove each.
-      const subs = mgr.getSubscriptions(guildId);
-      const targets: string[] = [];
-      if (subs.active && subs.active.source === 'paid' && subs.active.providerId === providerId) {
-        // Hard-cancel via the standard route so stacking + audit are uniform.
-        await mgr.cancelPaidSubscriptionImmediately(guildId);
-      }
-      for (const p of (subs.paused || [])) {
-        if (p.source === 'paid' && p.providerId === providerId && p.id) {
-          targets.push(p.id);
-        }
-      }
-      for (const subscriptionId of targets) {
-        await mgr.cancelAndRemovePausedSubscription(guildId, subscriptionId);
       }
       res.json({ success: true });
     } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({ success: false, error: errorMessage });
     }
@@ -459,6 +438,7 @@ export function createGuildSubscriptionRoutes(): Router {
       }));
       res.json({ success: true, migrations: filtered });
     } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({ success: false, error: errorMessage });
     }
@@ -468,7 +448,7 @@ export function createGuildSubscriptionRoutes(): Router {
    * PUT /guild/api/subscriptions/:guildId/migrations/:migrationId
    * Body: { decision: 'accepted' | 'declined' }
    */
-  router.put('/:guildId/migrations/:migrationId', requireOAuth, requireGuildAccess, (req: Request, res: Response) => {
+  router.put('/:guildId/migrations/:migrationId', requireOAuth, requireGuildAccess, async (req: Request, res: Response) => {
     try {
       const { guildId, migrationId } = req.params;
       if (!validateGuildId(guildId)) {
@@ -479,10 +459,11 @@ export function createGuildSubscriptionRoutes(): Router {
         return res.status(400).json({ success: false, error: 'decision must be "accepted" or "declined"' });
       }
       const mgr = getPremiumManager();
-      const ok = mgr.recordMigrationDecision(migrationId, guildId, decision);
+      const ok = await shared(res, 'premium.recordMigrationDecision', [migrationId, guildId, decision]);
       if (!ok) return res.status(404).json({ success: false, error: 'No matching pending migration for this guild' });
       res.json({ success: true });
     } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({ success: false, error: errorMessage });
     }
@@ -495,7 +476,7 @@ export function createGuildSubscriptionRoutes(): Router {
    * or null means "use the guild's system channel". Validation of channel
    * existence is the bot's job at delivery time; we just persist the id.
    */
-  router.put('/:guildId/notifications-channel', requireOAuth, requireGuildAccess, (req: Request, res: Response) => {
+  router.put('/:guildId/notifications-channel', requireOAuth, requireGuildAccess, async (req: Request, res: Response) => {
     try {
       const { guildId } = req.params;
       if (!validateGuildId(guildId)) {
@@ -509,9 +490,10 @@ export function createGuildSubscriptionRoutes(): Router {
         return res.status(400).json({ success: false, error: 'channelId must be a Discord channel id (17-20 digits) or null/empty to clear' });
       }
       const mgr = getPremiumManager();
-      mgr.setNotificationsChannelId(guildId, channelId);
+      await shared(res, 'premium.setNotificationsChannelId', [guildId, channelId]);
       res.json({ success: true, subscriptions: mgr.getSubscriptions(guildId) });
     } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({ success: false, error: errorMessage });
     }

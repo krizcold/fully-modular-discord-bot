@@ -15,8 +15,10 @@ import {
 } from './maintenanceGate';
 import { readMaintenanceFile } from '../../../utils/maintenanceFile';
 import { loadCredentials, resolveDataBackend } from '../../../utils/envLoader';
-import { drainForExit, isExitDraining, saveHeldWrites, stopHandler, stopProcess } from './dataManager';
+import { addStopStep, isExitDraining, saveHeldWrites, stopProcess } from './dataManager';
 import { STOPPED_SERVING_TEXT, stoppedServing } from './servingGate';
+import { setupSharedOpsIPC } from './sharedOps';
+import { reportWriterStage } from './writerLock';
 import { getWorkingSet } from './dataBackends/workingSet';
 import { queuedFilePaths } from './dataBackends/fileBackend';
 import { isLoginRefused } from './dataBackends/postgresBackend';
@@ -315,6 +317,8 @@ export async function handleMaintenanceIpc(message: unknown): Promise<{ requestI
     return { requestId, data: { leaving: true } };
   }
   if (!isMaintenanceBoot()) return null;
+  // The shared handler answers these itself, in maintenance too.
+  if (type === 'shared:op' || type === 'data:global-read') return null;
   return { requestId, data: maintenanceIpcRefusal(type) ?? { success: false, error: 'the bot is in maintenance' } };
 }
 
@@ -655,23 +659,19 @@ export async function runMaintenanceBoot(
   markMaintenanceBoot();
   setMaintenanceGate({ cause: decision.cause, message: decision.message });
   installRefusalGuard();
-  // NB4 decision 16: the stop handler exists before anything that can start a leave; its destroy step acts only on a
-  // Client that exists by then.
+  // NB4 decision 16: this boot's step of the one stop (dataManager.ts, which drains and exits) is added before anything
+  // that can start a leave; it destroys only a Client that exists by then.
   let client: Client | null = null;
-  const shutdown = stopHandler(async () => {
-    try {
-      if (client) await Promise.race([client.destroy().catch(() => undefined), new Promise(resolve => setTimeout(resolve, 2000))]);
-      await drainForExit(5000);
-    } finally {
-      process.exit(0);
-    }
+  addStopStep(async () => {
+    if (client) await Promise.race([client.destroy().catch(() => undefined), new Promise(resolve => setTimeout(resolve, 2000))]);
   });
-  process.on('SIGTERM', () => void shutdown());
-  process.on('SIGINT', () => void shutdown());
   console.log(decision.cause === 'hook'
     ? '[Maintenance] Booting in maintenance mode: the saved state says maintenance'
     : '[Maintenance] Booting in maintenance mode: the database refused the login');
   setupMaintenanceIPC();
+  setupSharedOpsIPC();
+  reportWriterStage('shared');
+  reportWriterStage('guild');
   reportMode(decision.cause === 'hook' ? 'maintenance' : 'login-refused', undefined, true);
   if (decision.cause === 'hook') startFilePoll();
   if (decision.cause === 'login-refused') watchLogin(deps.loginProbe ?? probeLoginAtBoot, deps.retryMs ?? LOGIN_RETRY_MS);

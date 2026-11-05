@@ -529,9 +529,16 @@ describe('the truth payloads and responses', () => {
 describe('the shutdown handler in the bot', () => {
   it.skipIf(process.env.__STRYKER_ACTIVE_MUTANT__ !== undefined)('its steps close the gateway, flush the totals, drain the writes, release the shard claims and exit (clientInitializer.ts)', () => {
     const source = readSourceText(__dirname, '../../src/bot/internalSetup/clientInitializer.ts');
-    const steps = /const shutdownHandler = stopHandler\(\(\) => runStopSteps\(\{([\s\S]*?)\n {2}\}\)\);/.exec(source)?.[1] ?? '';
-    for (const step of ['beginStop: () => getShardClaims()?.beginStop()', 'stopSamplers();', "closeGateway: () => getIngestService().close('shutting down')", 'getMetricsCollector().flushTotals();', 'drain: () => drainForExit(', 'await getShardClaims()?.finishStop();', 'exit: code => process.exit(code)']) {
+    // NB10: clientInitializer registers its steps with addStopStep and addReleaseStep; the one stop handler (dataManager.ts) drains and exits.
+    const steps = /addStopStep\(async \(\) => \{([\s\S]*?)\n {2}\}\);/.exec(source)?.[1] ?? '';
+    for (const step of ['getShardClaims()?.beginStop();', 'stopSamplers();', "getIngestService().close('shutting down')", 'getMetricsCollector().flushTotals();']) {
       expect(steps).toContain(step);
+    }
+    expect(source).toContain('addReleaseStep(async () => { await getShardClaims()?.finishStop(); });');
+    const facade = readSourceText(__dirname, '../../src/bot/internalSetup/utils/dataManager.ts');
+    const stop = /export function installStopHandler\(\): void \{([\s\S]*?)\n\}/.exec(facade)?.[1] ?? '';
+    for (const step of ['await runSteps(stopSteps);', 'await runSteps(finalStopSteps.splice(0));', 'await drainForExit(getWorkingSet() ? 30000 : 5000);', 'await runSteps(releaseSteps);', 'process.exit(stopExitCode);']) {
+      expect(stop).toContain(step);
     }
   });
 });

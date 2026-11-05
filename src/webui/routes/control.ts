@@ -103,6 +103,7 @@ export function createControlRoutes(botManager: BotManager): Router {
           } catch (err) {
             console.error('[Control] Error during bot shutdown:', err);
           }
+          await botManager.endLocalChain();
           await flushBeforeExit();
           console.log('[Control] Exiting process - Docker will restart container');
           process.exit(0);
@@ -150,6 +151,7 @@ export function createControlRoutes(botManager: BotManager): Router {
         } catch (err) {
           console.error('[Control] Error during bot shutdown:', err);
         }
+        await botManager.endLocalChain();
         await flushBeforeExit();
         console.log('[Control] Exiting process for full restart');
         process.exit(0);

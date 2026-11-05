@@ -32,6 +32,7 @@ import { getSessionMiddleware } from './auth/sessionManager';
 import oauthRoutes from './auth/oauthRoutes';
 import { getPaymentRegistry } from '../bot/internalSetup/utils/payment/paymentRegistry';
 import { setAccessLogDispatcher, fireAccessLog } from './utils/accessLog';
+import { webhookAnswer } from './routes/hopFailure';
 
 export async function createServer(botManager: BotManager): Promise<Express> {
   const app = express();
@@ -137,8 +138,17 @@ export async function createServer(botManager: BotManager): Promise<Express> {
           || headerMap['x-signature']
           || headerMap['paypal-transmission-sig']
           || '';
-        await provider.handleWebhook(req.body as Buffer, signature, headerMap);
-        res.json({ received: true });
+        // Handled in the process that writes premium and answered once the change it made was judged. A refusal, or
+        // no route within 5 s, answers 503, so the provider delivers it again.
+        const reply = await botManager.runSharedOp('payment.webhook', {
+          providerId,
+          body: Buffer.isBuffer(req.body) ? (req.body as Buffer).toString('base64') : '',
+          signature,
+          headers: headerMap,
+        }, { routeWaitMs: 5000 });
+        const answer = webhookAnswer(reply);
+        if (answer.log) console.error(`[Webhook] ${providerId} ${answer.log}`);
+        res.status(answer.status).json(answer.body);
       } catch (err: any) {
         // Return 400 so the provider retries (their delivery system handles
         // backoff). Log full context server-side.
@@ -183,7 +193,7 @@ export async function createServer(botManager: BotManager): Promise<Express> {
   // requiring a bot restart.
   app.use('/auth', requireGuildWebUIEnabled, oauthRoutes);
   app.use('/guild/api/panels', requireGuildWebUIEnabled, createGuildPanelRoutes(botManager));
-  app.use('/guild/api/subscriptions', requireGuildWebUIEnabled, createGuildSubscriptionRoutes());
+  app.use('/guild/api/subscriptions', requireGuildWebUIEnabled, createGuildSubscriptionRoutes(botManager));
   console.log('[Server] Auth + Guild API routes mounted (request-time gated by ENABLE_GUILD_WEBUI)');
 
   // Owner API Routes. Auth is enforced at the deployment boundary (AppShield /

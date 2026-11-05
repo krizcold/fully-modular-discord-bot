@@ -27,6 +27,7 @@
  * effective date and treat un-approved as "declined".
  */
 
+import { PROVIDER_FETCH_MS } from './paymentTypes';
 import { loadCredentials } from '@/utils/envLoader';
 import { getPaymentRegistry } from './paymentRegistry';
 import type {
@@ -334,6 +335,7 @@ export class PayPalProvider implements PaymentProvider {
     if (!c.PAYPAL_CLIENT_ID || !c.PAYPAL_CLIENT_SECRET) throw new Error('PayPal not configured');
     const auth = Buffer.from(`${c.PAYPAL_CLIENT_ID}:${c.PAYPAL_CLIENT_SECRET}`).toString('base64');
     const res = await fetch(`${paypalApiBase()}/v1/oauth2/token`, {
+      signal: AbortSignal.timeout(PROVIDER_FETCH_MS),
       method: 'POST',
       headers: {
         'Authorization': `Basic ${auth}`,
@@ -361,7 +363,7 @@ export class PayPalProvider implements PaymentProvider {
       },
     };
     if (body !== undefined) init.body = JSON.stringify(body);
-    const res = await fetch(`${paypalApiBase()}${path}`, init);
+    const res = await fetch(`${paypalApiBase()}${path}`, { ...init, signal: AbortSignal.timeout(PROVIDER_FETCH_MS) });
     if (res.status === 204) return null;
     const text = await res.text();
     let parsed: any = null;

@@ -33,6 +33,8 @@ import { ComponentToggleDebouncer } from '../utils/componentToggleDebouncer';
 import { getInstallQueue } from '../utils/installQueue';
 import { readConfigFile, writeConfigFile } from '../../bot/internalSetup/utils/appStoreConfigFile';
 import { childQueuedError, readServedGlobal, withTargetLock } from '../utils/servedRead';
+import { SharedOpAnswered, sharedOpFailure, sharedOpRunner } from './hopFailure';
+import { shaOfRaw } from '../../bot/internalSetup/utils/ipcDataHandler';
 
 /**
  * A module's Free baseline (its global settings.json) as the process that
@@ -42,7 +44,7 @@ import { childQueuedError, readServedGlobal, withTargetLock } from '../utils/ser
 const baselinePath = (moduleName: string) => dataPath('global', ...globalSettingsRel(moduleName).split('/'));
 
 async function servedBaseline(botManager: BotManager, moduleName: string): Promise<
-  | { ok: true; raw: Record<string, any>; config: GlobalModuleConfig; childQueued: boolean; childFailing: boolean; notice?: string }
+  | { ok: true; raw: Record<string, any>; text: string | null; config: GlobalModuleConfig; childQueued: boolean; childFailing: boolean; notice?: string }
   | { ok: false; status: number; error: string }
 > {
   if (!/^[A-Za-z0-9_-]+$/.test(moduleName)) return { ok: false, status: 400, error: 'invalid moduleName' };
@@ -62,6 +64,7 @@ async function servedBaseline(botManager: BotManager, moduleName: string): Promi
   return {
     ok: true,
     raw,
+    text: read.content,
     config: globalModuleConfigFrom(raw),
     childQueued: read.childQueued === true,
     childFailing: read.childFailing === true,
@@ -181,6 +184,7 @@ async function refreshOfferingProviderLinks(offering: any, warnings: string[]): 
 }
 
 export function createAppStoreRoutes(botManager: BotManager): Router {
+  const shared = sharedOpRunner(botManager);
   const toggleDebouncer = new ComponentToggleDebouncer(1500);
   const installQueue = getInstallQueue();
   installQueue.setBotManager(botManager);
@@ -253,6 +257,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
         installQueue: installQueue.getSnapshot()
       });
     } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({ success: false, error: errorMessage });
     }
@@ -282,6 +287,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
         repositories: safeRepos
       });
     } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({
         success: false,
@@ -363,6 +369,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
           : {}),
       });
     } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({
         success: false,
@@ -408,6 +415,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
         }
       });
     } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({
         success: false,
@@ -439,6 +447,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
         message: success ? 'Repository removed' : 'Failed to remove repository'
       });
     } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({
         success: false,
@@ -470,6 +479,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
         modules: modules.map(m => formatModuleInfo(m))
       });
     } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({
         success: false,
@@ -496,6 +506,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
         modules: modules.map(m => formatModuleInfo(m))
       });
     } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({
         success: false,
@@ -526,6 +537,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
         module: formatModuleInfo(moduleInfo, true)
       });
     } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({
         success: false,
@@ -649,6 +661,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
         modules: installed
       });
     } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({
         success: false,
@@ -691,6 +704,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
         credentials: maskedCredentials
       });
     } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({
         success: false,
@@ -724,6 +738,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
         message: success ? 'Credentials saved' : 'Failed to save credentials'
       });
     } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({
         success: false,
@@ -747,6 +762,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
         message: success ? 'Credentials deleted' : 'Failed to delete credentials'
       });
     } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({
         success: false,
@@ -773,6 +789,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
         tiers
       });
     } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({
         success: false,
@@ -864,12 +881,12 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
       }
 
       const manager = getPremiumManager();
-      const success = manager.setTier(id, {
+      const success = await shared(res, 'premium.setTier', [id, {
         displayName,
         priority,
         overrides: overrides || {},
         offerings: refreshedOfferings,
-      });
+      }]);
 
       res.json({
         success,
@@ -877,6 +894,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
         warnings: warnings.length > 0 ? warnings : undefined,
       });
     } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({
         success: false,
@@ -889,7 +907,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
    * DELETE /api/appstore/premium/tiers/:id
    * Delete a tier (cannot delete 'free')
    */
-  router.delete('/premium/tiers/:id', (req: Request, res: Response) => {
+  router.delete('/premium/tiers/:id', async (req: Request, res: Response) => {
     try {
       const { id } = req.params;
 
@@ -901,13 +919,14 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
       }
 
       const manager = getPremiumManager();
-      const success = manager.deleteTier(id);
+      const success = await shared(res, 'premium.deleteTier', [id]);
 
       res.json({
         success,
         message: success ? 'Tier deleted' : 'Tier not found'
       });
     } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({
         success: false,
@@ -929,6 +948,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
         defaults: DEFAULT_MESSAGES
       });
     } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({ success: false, error: errorMessage });
     }
@@ -938,7 +958,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
    * PUT /api/appstore/premium/messages
    * Body: { moduleBlocked?, commandBlocked?, panelBlocked?, upgradeButtonLabel? }
    */
-  router.put('/premium/messages', (req: Request, res: Response) => {
+  router.put('/premium/messages', async (req: Request, res: Response) => {
     try {
       const { moduleBlocked, commandBlocked, panelBlocked, upgradeButtonLabel } = req.body || {};
       const partial: Partial<PremiumMessages> = {};
@@ -952,13 +972,14 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
       }
 
       const manager = getPremiumManager();
-      const success = manager.setMessages(partial);
+      const success = await shared(res, 'premium.setMessages', [partial]);
       res.json({
         success,
         messages: manager.getMessages(),
         defaults: DEFAULT_MESSAGES
       });
     } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({ success: false, error: errorMessage });
     }
@@ -968,16 +989,17 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
    * POST /api/appstore/premium/messages/reset
    * Reset all restriction messages to defaults.
    */
-  router.post('/premium/messages/reset', (_req: Request, res: Response) => {
+  router.post('/premium/messages/reset', async (_req: Request, res: Response) => {
     try {
       const manager = getPremiumManager();
-      const success = manager.resetMessages();
+      const success = await shared(res, 'premium.resetMessages', []);
       res.json({
         success,
         messages: manager.getMessages(),
         defaults: DEFAULT_MESSAGES
       });
     } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({ success: false, error: errorMessage });
     }
@@ -1011,6 +1033,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
         ...(served.notice ? { notice: served.notice } : {}),
       });
     } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({ success: false, error: errorMessage });
     }
@@ -1094,8 +1117,16 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
           return;
         }
 
-        const manager = getPremiumManager();
-        const ok = manager.setGlobalModuleConfig(moduleName, partial, served.raw);
+        // Applied by the process that writes settings.json, only if the file still holds the body read here.
+        const reply = await botManager.runSharedOp('premium.setGlobalModuleConfig', {
+          moduleName, partial, rel: globalSettingsRel(moduleName), expectSha: shaOfRaw(served.text),
+        });
+        const failure = sharedOpFailure(reply);
+        if (failure) {
+          res.status(failure.status).json({ success: false, error: failure.error });
+          return;
+        }
+        const ok = reply.result === true;
         res.json({
           success: ok,
           moduleName,
@@ -1103,6 +1134,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
         });
       });
     } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({ success: false, error: errorMessage });
     }
@@ -1196,6 +1228,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
 
       res.json({ success: true, modules: Array.from(moduleMap.values()) });
     } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({ success: false, error: errorMessage });
     }
@@ -1218,6 +1251,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
         res.json({ success: true, guilds: [], botRunning: true, error: result.error });
       }
     } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({ success: false, error: errorMessage });
     }
@@ -1261,12 +1295,13 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
       if (!dummy) return res.status(404).json({ success: false, error: 'Dummy provider not available' });
       res.json({ success: true, variants: dummy.adminListVariants() });
     } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({ success: false, error: errorMessage });
     }
   });
 
-  router.put('/premium/providers/dummy/variants/:variantId', (req: Request, res: Response) => {
+  router.put('/premium/providers/dummy/variants/:variantId', async (req: Request, res: Response) => {
     try {
       const dummy = getDummyProvider();
       if (!dummy) return res.status(404).json({ success: false, error: 'Dummy provider not available' });
@@ -1275,7 +1310,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
       if (!variantId || !label || typeof amount !== 'number' || !currency) {
         return res.status(400).json({ success: false, error: 'variantId, label, amount, currency are required' });
       }
-      dummy.adminSetVariant({
+      await shared(res, 'dummy.adminSetVariant', [{
         variantId,
         label,
         amount,
@@ -1284,21 +1319,23 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
         ...(typeof trialDays === 'number' ? { trialDays } : {}),
         recurring: !!recurring,
         active: active !== false,
-      });
+      }]);
       res.json({ success: true });
     } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({ success: false, error: errorMessage });
     }
   });
 
-  router.delete('/premium/providers/dummy/variants/:variantId', (req: Request, res: Response) => {
+  router.delete('/premium/providers/dummy/variants/:variantId', async (req: Request, res: Response) => {
     try {
       const dummy = getDummyProvider();
       if (!dummy) return res.status(404).json({ success: false, error: 'Dummy provider not available' });
-      const ok = dummy.adminDeleteVariant(req.params.variantId);
+      const ok = await shared(res, 'dummy.adminDeleteVariant', [req.params.variantId]);
       res.json({ success: ok });
     } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({ success: false, error: errorMessage });
     }
@@ -1310,12 +1347,13 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
       if (!dummy) return res.status(404).json({ success: false, error: 'Dummy provider not available' });
       res.json({ success: true, products: dummy.adminListProducts() });
     } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({ success: false, error: errorMessage });
     }
   });
 
-  router.put('/premium/providers/dummy/products/:productId', (req: Request, res: Response) => {
+  router.put('/premium/providers/dummy/products/:productId', async (req: Request, res: Response) => {
     try {
       const dummy = getDummyProvider();
       if (!dummy) return res.status(404).json({ success: false, error: 'Dummy provider not available' });
@@ -1324,26 +1362,28 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
       if (!productId || !label) {
         return res.status(400).json({ success: false, error: 'productId and label are required' });
       }
-      dummy.adminSetProduct({
+      await shared(res, 'dummy.adminSetProduct', [{
         productId,
         label,
         description,
         variantIds: Array.isArray(variantIds) ? variantIds : [],
-      });
+      }]);
       res.json({ success: true });
     } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({ success: false, error: errorMessage });
     }
   });
 
-  router.delete('/premium/providers/dummy/products/:productId', (req: Request, res: Response) => {
+  router.delete('/premium/providers/dummy/products/:productId', async (req: Request, res: Response) => {
     try {
       const dummy = getDummyProvider();
       if (!dummy) return res.status(404).json({ success: false, error: 'Dummy provider not available' });
-      const ok = dummy.adminDeleteProduct(req.params.productId);
+      const ok = await shared(res, 'dummy.adminDeleteProduct', [req.params.productId]);
       res.json({ success: ok });
     } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({ success: false, error: errorMessage });
     }
@@ -1355,12 +1395,13 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
       if (!dummy) return res.status(404).json({ success: false, error: 'Dummy provider not available' });
       res.json({ success: true, coupons: dummy.adminListCoupons() });
     } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({ success: false, error: errorMessage });
     }
   });
 
-  router.put('/premium/providers/dummy/coupons/:code', (req: Request, res: Response) => {
+  router.put('/premium/providers/dummy/coupons/:code', async (req: Request, res: Response) => {
     try {
       const dummy = getDummyProvider();
       if (!dummy) return res.status(404).json({ success: false, error: 'Dummy provider not available' });
@@ -1369,7 +1410,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
         return res.status(400).json({ success: false, error: 'Coupon code is required' });
       }
       const { description, percentOff, extraDays, maxUses, expiresAt } = req.body || {};
-      const ok = dummy.adminSetCoupon({
+      const ok = await shared(res, 'dummy.adminSetCoupon', [{
         code,
         description,
         percentOff,
@@ -1378,7 +1419,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
         expiresAt,
         usedCount: 0,
         createdAt: new Date().toISOString(),
-      });
+      }]);
       if (!ok) {
         return res.status(400).json({
           success: false,
@@ -1387,19 +1428,21 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
       }
       res.json({ success: true });
     } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({ success: false, error: errorMessage });
     }
   });
 
-  router.delete('/premium/providers/dummy/coupons/:code', (req: Request, res: Response) => {
+  router.delete('/premium/providers/dummy/coupons/:code', async (req: Request, res: Response) => {
     try {
       const dummy = getDummyProvider();
       if (!dummy) return res.status(404).json({ success: false, error: 'Dummy provider not available' });
-      const ok = dummy.adminDeleteCoupon(req.params.code);
+      const ok = await shared(res, 'dummy.adminDeleteCoupon', [req.params.code]);
       if (!ok) return res.status(404).json({ success: false, error: 'Coupon not found' });
       res.json({ success: true });
     } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({ success: false, error: errorMessage });
     }
@@ -1418,6 +1461,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
       const manager = getPremiumManager();
       res.json({ success: true, subscriptions: manager.getAllSubscriptions() });
     } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({ success: false, error: errorMessage });
     }
@@ -1439,6 +1483,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
         effective: { tierId: resolved.tierId, tier: resolved.tier, source: resolved.source }
       });
     } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({ success: false, error: errorMessage });
     }
@@ -1464,9 +1509,10 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
         return res.status(400).json({ success: false, error: 'durationDays must be a positive number or null (for Lifetime)' });
       }
       const manager = getPremiumManager();
-      const success = await manager.grantManual(guildId, tierId, durationDays, typeof notes === 'string' ? notes : undefined);
+      const success = await shared(res, 'premium.grantManual', [guildId, tierId, durationDays, typeof notes === 'string' ? notes : undefined]);
       res.json({ success, subscriptions: manager.getSubscriptions(guildId) });
     } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({ success: false, error: errorMessage });
     }
@@ -1477,7 +1523,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
    * Extend the manual subscription.
    * Body: { addDays }
    */
-  router.post('/premium/subscriptions/:guildId/manual/extend', (req: Request, res: Response) => {
+  router.post('/premium/subscriptions/:guildId/manual/extend', async (req: Request, res: Response) => {
     try {
       const { guildId } = req.params;
       const { addDays } = req.body || {};
@@ -1485,9 +1531,10 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
         return res.status(400).json({ success: false, error: 'addDays must be a positive number' });
       }
       const manager = getPremiumManager();
-      const success = manager.extendManual(guildId, addDays);
+      const success = await shared(res, 'premium.extendManual', [guildId, addDays]);
       res.json({ success, subscriptions: manager.getSubscriptions(guildId) });
     } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({ success: false, error: errorMessage });
     }
@@ -1497,13 +1544,14 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
    * DELETE /api/appstore/premium/subscriptions/:guildId/manual
    * Revoke the manual subscription.
    */
-  router.delete('/premium/subscriptions/:guildId/manual', (req: Request, res: Response) => {
+  router.delete('/premium/subscriptions/:guildId/manual', async (req: Request, res: Response) => {
     try {
       const { guildId } = req.params;
       const manager = getPremiumManager();
-      const success = manager.revokeManual(guildId);
+      const success = await shared(res, 'premium.revokeManual', [guildId]);
       res.json({ success, subscriptions: manager.getSubscriptions(guildId) });
     } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({ success: false, error: errorMessage });
     }
@@ -1536,13 +1584,14 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
         return res.status(400).json({ success: false, error: 'variantId is required' });
       }
       const manager = getPremiumManager();
-      const result = await manager.initiatePaidSubscription(guildId, tierId, offeringId, { providerId, variantId, couponCode, userId });
+      const result = await shared(res, 'premium.initiatePaidSubscription', [guildId, tierId, offeringId, { providerId, variantId, couponCode, userId }]);
       res.json({
         success: true,
         result,
         subscriptions: manager.getSubscriptions(guildId),
       });
     } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({ success: false, error: errorMessage });
     }
@@ -1556,9 +1605,10 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
     try {
       const { guildId } = req.params;
       const manager = getPremiumManager();
-      const success = await manager.cancelPaidSubscription(guildId);
+      const success = await shared(res, 'premium.cancelPaidSubscription', [guildId]);
       res.json({ success, subscriptions: manager.getSubscriptions(guildId) });
     } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({ success: false, error: errorMessage });
     }
@@ -1572,9 +1622,10 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
     try {
       const { guildId } = req.params;
       const manager = getPremiumManager();
-      const success = await manager.reactivatePaidSubscription(guildId);
+      const success = await shared(res, 'premium.reactivatePaidSubscription', [guildId]);
       res.json({ success, subscriptions: manager.getSubscriptions(guildId) });
     } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({ success: false, error: errorMessage });
     }
@@ -1606,6 +1657,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
       });
       res.json({ success: true, providers });
     } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({ success: false, error: errorMessage });
     }
@@ -1648,6 +1700,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
         return res.status(400).json({ success: false, error: message });
       }
     } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({ success: false, error: errorMessage });
     }
@@ -1685,6 +1738,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
         return res.status(400).json({ success: false, error: message });
       }
     } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({ success: false, error: errorMessage });
     }
@@ -1718,6 +1772,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
       });
       res.json({ success: true, ...result });
     } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({ success: false, error: errorMessage });
     }
@@ -1736,6 +1791,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
       const mgr = getPremiumManager();
       res.json({ success: true, migrations: mgr.listMigrations(), silencePolicy: mgr.getMigrationSilencePolicy() });
     } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({ success: false, error: errorMessage });
     }
@@ -1752,7 +1808,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
         }
       }
       const mgr = getPremiumManager();
-      const migration = await mgr.scheduleMigration({
+      const migration = await shared(res, 'premium.scheduleMigration', [{
         providerId: body.providerId,
         sourceTierId: body.sourceTierId,
         sourceOfferingId: body.sourceOfferingId,
@@ -1763,21 +1819,23 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
         effectiveDate: body.effectiveDate,
         message: typeof body.message === 'string' ? body.message : '',
         scheduledBy: typeof body.scheduledBy === 'string' ? body.scheduledBy : 'admin',
-      });
+      }]);
       res.json({ success: true, migration });
     } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(400).json({ success: false, error: errorMessage });
     }
   });
 
-  router.delete('/premium/migrations/:migrationId', (req: Request, res: Response) => {
+  router.delete('/premium/migrations/:migrationId', async (req: Request, res: Response) => {
     try {
       const mgr = getPremiumManager();
-      const ok = mgr.cancelMigration(req.params.migrationId);
+      const ok = await shared(res, 'premium.cancelMigration', [req.params.migrationId]);
       if (!ok) return res.status(404).json({ success: false, error: 'Migration not found or not pending' });
       res.json({ success: true });
     } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({ success: false, error: errorMessage });
     }
@@ -1787,21 +1845,23 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
     try {
       res.json({ success: true, policy: getPremiumManager().getMigrationSilencePolicy() });
     } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({ success: false, error: errorMessage });
     }
   });
 
-  router.put('/premium/migration-silence-policy', (req: Request, res: Response) => {
+  router.put('/premium/migration-silence-policy', async (req: Request, res: Response) => {
     try {
       const policy = req.body?.policy;
       if (policy !== 'cancel' && policy !== 'continue') {
         return res.status(400).json({ success: false, error: 'policy must be "cancel" or "continue"' });
       }
-      const ok = getPremiumManager().setMigrationSilencePolicy(policy);
+      const ok = await shared(res, 'premium.setMigrationSilencePolicy', [policy]);
       if (!ok) return res.status(500).json({ success: false, error: 'Failed to set policy' });
       res.json({ success: true, policy });
     } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({ success: false, error: errorMessage });
     }
@@ -1828,6 +1888,7 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
       }
       res.json({ success: true, fields, status, isConfigured: provider.isConfigured() });
     } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({ success: false, error: errorMessage });
     }
@@ -1893,12 +1954,13 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
       for (const f of fields) status[f.key] = { set: !!(c[f.key] && c[f.key]!.trim() && !c[f.key]!.startsWith('REPLACE')) };
       res.json({ success: true, status, isConfigured: provider.isConfigured() });
     } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({ success: false, error: errorMessage });
     }
   });
 
-  router.put('/premium/providers/:providerId/activation', (req: Request, res: Response) => {
+  router.put('/premium/providers/:providerId/activation', async (req: Request, res: Response) => {
     try {
       const { providerId } = req.params;
       const { activated, defaultEnabled } = req.body || {};
@@ -1910,9 +1972,10 @@ export function createAppStoreRoutes(botManager: BotManager): Router {
         return res.status(404).json({ success: false, error: `Provider '${providerId}' is not registered` });
       }
       const manager = getPremiumManager();
-      const success = manager.setProviderActivation(providerId, activated, !!defaultEnabled);
+      const success = await shared(res, 'premium.setProviderActivation', [providerId, activated, !!defaultEnabled]);
       res.json({ success, activated: manager.getActivatedProviders() });
     } catch (error) {
+      if (error instanceof SharedOpAnswered) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({ success: false, error: errorMessage });
     }

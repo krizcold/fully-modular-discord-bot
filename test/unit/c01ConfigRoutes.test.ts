@@ -453,7 +453,9 @@ describe('review round 1', () => {
       const got = await call(base, 'GET', `/api/config/get?file=config.json&guildId=${G1}`);
       expect(got.status).toBe(200);
       expect(got.body.config.who).toBe('queued');
-      expect((await save({ who: 'next' }, G1)).status).toBe(200);
+      // NB10: the save goes to the bot process; the in-process child here shares this queue, whose flush keeps failing,
+      // so the save is accepted and not confirmed as saved (202).
+      expect((await save({ who: 'next' }, G1)).status).toBe(202);
       const bodies = backupNames().map(name => readJson(path.join(BACKUPS(), name)));
       expect(bodies).toContainEqual({ who: 'queued' });
     } finally {
@@ -603,6 +605,7 @@ describe('review round 2', () => {
     const proto = BotManager.prototype as any;
     const silent: any = {
       isRunning: () => true,
+      stageReached: () => true,
       botProcess: { on: () => undefined, removeListener: () => undefined, send: () => undefined },
       pendingIpcRejects: new Set(),
     };
@@ -805,6 +808,7 @@ describe('review round 3', () => {
     const proto = BotManager.prototype as any;
     const silent: any = {
       isRunning: () => true,
+      stageReached: () => true,
       botProcess: { on: () => undefined, removeListener: () => undefined, send: () => undefined },
       pendingIpcRejects: new Set(),
     };

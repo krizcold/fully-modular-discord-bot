@@ -2,16 +2,17 @@ import { EventEmitter } from 'events';
 import { afterAll, describe, expect, it, vi } from 'vitest';
 
 // NB4 decisions 12, 16 and 19, run through the real clientInitializer.ts: main() runs at import over faked
-// collaborators. The one stop handler is on both signals; its steps stop the samplers and flush the totals only once
-// the metrics are ready (the flush never while the maintenance gate is closed), release the claims and exit; the
-// clientReady once-handler starts no module code once the process stopped serving its shards.
+// collaborators. main() adds its steps to the one stop (dataManager.ts, which drains and exits): its stop step begins
+// the claims' stop, closes the gateway, and stops the samplers and flushes the totals only once the metrics are ready
+// (the flush never while the maintenance gate is closed); its release step releases the claims. The clientReady
+// once-handler starts no module code once the process stopped serving its shards.
 
 const h = vi.hoisted(() => {
   const state = {
     lines: [] as string[],
     signals: new Map<string, Array<() => unknown>>(),
-    stopRuns: 0,
-    steps: null as null | Record<string, (...a: any[]) => any>,
+    stopSteps: [] as Array<() => Promise<void>>,
+    releaseSteps: [] as Array<() => Promise<void>>,
     releaseBoot: (() => undefined) as () => void,
     ingestStarted: false,
     gateClosed: false,
@@ -64,12 +65,15 @@ vi.mock('../../src/bot/internalSetup/utils/metrics/samplers', () => ({
   stopSamplers: () => { h.calls.stopSamplers += 1; },
 }));
 vi.mock('../../src/bot/internalSetup/utils/dataManager', () => ({
-  drainForExit: async () => undefined,
+  addStopStep: (step: () => Promise<void>) => { h.stopSteps.push(step); },
+  addReleaseStep: (step: () => Promise<void>) => { h.releaseSteps.push(step); },
   getGuildDataBackend: () => null,
-  stopHandler: (body: () => Promise<void>) => () => { h.stopRuns += 1; return body(); },
   sweepGraveyard: async () => undefined,
   DataBackendUnavailableError: class extends Error {},
 }));
+vi.mock('../../src/bot/internalSetup/utils/sharedOps', () => ({ setupSharedOpsIPC: () => undefined }));
+vi.mock('../../src/bot/internalSetup/utils/writerLock', () => ({ reportWriterStage: () => undefined }));
+vi.mock('../../src/bot/internalSetup/utils/premiumManager', () => ({ startPremiumTickers: () => undefined }));
 vi.mock('../../src/bot/internalSetup/utils/dataBackends/boot', () => ({
   initDataBackendLayer: () => undefined,
   awaitDataStartupBarrier: () => { h.barrierCalls += 1; return h.barrier ?? Promise.resolve('ready'); },
@@ -93,9 +97,6 @@ vi.mock('../../src/bot/internalSetup/fleet/shardBoot', () => ({
   }),
 }));
 vi.mock('../../src/bot/internalSetup/utils/servingGate', () => ({ stoppedServing: () => h.stopped }));
-vi.mock('../../src/bot/internalSetup/utils/stopSteps', () => ({
-  runStopSteps: async (steps: Record<string, (...a: any[]) => any>) => { h.steps = steps; },
-}));
 vi.mock('../../src/bot/internalSetup/ingest/ingestService', () => ({
   getIngestService: () => ({
     close: async (reason: string) => { h.closes.push(reason); },
@@ -136,61 +137,45 @@ afterAll(() => { vi.restoreAllMocks(); });
 function resetCalls() {
   for (const key of Object.keys(h.calls) as Array<keyof typeof h.calls>) h.calls[key] = 0;
   h.closes = [];
-  h.steps = null;
   h.lines = [];
 }
 
-/** Sends the signal as the OS would: every listener main() installed for it. */
-function signal(name: 'SIGTERM' | 'SIGINT') {
-  for (const listener of h.signals.get(name) ?? []) listener();
-}
+describe('the stop steps main() adds (tests run in order: during the boot, then after it)', () => {
+  it('during the boot, before the metrics start: one stop step and one release step, added with no signal listener of its own', async () => {
+    await vi.waitFor(() => expect(h.stopSteps).toHaveLength(1));
+    expect(h.ingestStarted).toBe(false);
+    expect(h.releaseSteps).toHaveLength(1);
+    expect(h.signals.get('SIGTERM') ?? []).toHaveLength(0);
+    expect(h.signals.get('SIGINT') ?? []).toHaveLength(0);
+  });
 
-describe('the stop handler main() installs (tests run in order: during the boot, then after it)', () => {
-  it.each(['SIGTERM', 'SIGINT'] as const)('%s during the boot, before the metrics start: the claims stop, the gateway closes, nothing is sampled or flushed, the claims release and the process exits 0', async name => {
-    await vi.waitFor(() => expect(h.signals.get(name)?.length).toBe(1));
+  it('during the boot, before the metrics start: the claims stop, the gateway closes, nothing is sampled or flushed, and the release step releases the claims', async () => {
     expect(h.ingestStarted).toBe(false);
     resetCalls();
-    const exit = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
-    try {
-      const runsBefore = h.stopRuns;
-      signal(name);
-      expect(h.stopRuns).toBe(runsBefore + 1);
-      await vi.waitFor(() => expect(h.steps).not.toBeNull());
-      const steps = h.steps!;
-      steps.beginStop();
-      steps.stopSamplers();
-      await steps.closeGateway();
-      h.gateClosed = false;
-      steps.flushTotals();
-      await steps.finishStop();
-      steps.exit(0);
-      expect(h.calls).toMatchObject({ beginStop: 1, stopSamplers: 0, flushTotals: 0, finishStop: 1 });
-      expect(h.closes).toEqual(['shutting down']);
-      expect(exit).toHaveBeenCalledTimes(1);
-      expect(exit).toHaveBeenCalledWith(0);
-    } finally {
-      exit.mockRestore();
-    }
+    h.gateClosed = false;
+    await h.stopSteps[0]();
+    expect(h.calls).toMatchObject({ beginStop: 1, stopSamplers: 0, flushTotals: 0, finishStop: 0 });
+    expect(h.closes).toEqual(['shutting down']);
+    await h.releaseSteps[0]();
+    expect(h.calls).toMatchObject({ beginStop: 1, stopSamplers: 0, flushTotals: 0, finishStop: 1 });
   });
 
   it('after the boot: the samplers stop, the totals flush while the maintenance gate is open and not while it is closed', async () => {
     h.releaseBoot();
     await vi.waitFor(() => expect(h.ingestStarted).toBe(true));
+    expect(h.stopSteps).toHaveLength(1);
     resetCalls();
-    signal('SIGTERM');
-    await vi.waitFor(() => expect(h.steps).not.toBeNull());
-    const steps = h.steps!;
-    steps.stopSamplers();
-    expect(h.calls.stopSamplers).toBe(1);
     h.gateClosed = false;
-    steps.flushTotals();
+    await h.stopSteps[0]();
+    expect(h.calls.stopSamplers).toBe(1);
     expect(h.calls.flushTotals).toBe(1);
     h.gateClosed = true;
     try {
-      steps.flushTotals();
+      await h.stopSteps[0]();
     } finally {
       h.gateClosed = false;
     }
+    expect(h.calls.stopSamplers).toBe(2);
     expect(h.calls.flushTotals).toBe(1);
   });
 });

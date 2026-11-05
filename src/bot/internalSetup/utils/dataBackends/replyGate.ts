@@ -18,6 +18,7 @@ import { getConfigProperty } from '../configManager';
 import { confirmWrite, isStopping } from '../dataManager';
 import { parseButtonCustomId, parseDropdownCustomId, parseModalCustomId } from '../panel/panelCustomIds';
 import { declaresOwnOutcomes } from './dataContract';
+import { droppedByDeposition } from './fileBackend';
 import { currentLedger, currentModule, installInteractionLedgers, landed, ledgerOf, openLedger, runInLedger, type LedgerCause, type LedgerTicket, type WriteLedger } from './writeLedger';
 
 /** From the interaction's emit to the gate's own defer. Discord's 3 s also pays the gateway's delivery and the callback. */
@@ -29,7 +30,7 @@ export type TruthAnswer = 'pending' | 'held' | 'deposed' | 'unavailable' | Ledge
 
 // Worst first.
 const RANK: TruthAnswer[] = [
-  'node-stopping', 'maintenance', 'guild-fenced', 'deposed', 'database-unreachable', 'database-backlog',
+  'node-stopping', 'maintenance', 'guild-fenced', 'deposed', 'writer-lost', 'database-unreachable', 'database-backlog',
   'frozen', 'not-ready', 'storage-failing', 'io', 'unavailable', 'held', 'pending',
 ];
 const worst = (answers: TruthAnswer[]): TruthAnswer => answers.reduce((a, b) => (RANK.indexOf(b) < RANK.indexOf(a) ? b : a));
@@ -50,6 +51,8 @@ export function truthText(answer: TruthAnswer, partial: boolean): string {
     case 'guild-fenced':
     case 'deposed':
       return `Another bot process took over this server's data, so your change was ${notSaved}. Please try again in a moment.`;
+    case 'writer-lost':
+      return `Another process took over the bot's data files, so your change was ${notSaved}. Please try again in a moment.`;
     case 'database-unreachable': {
       if (partial) return "The bot's database is unreachable, so your change was not saved in full. Please try again later.";
       const notice = getConfigProperty<string>('outageNotice.databaseUnreachable');
@@ -85,6 +88,8 @@ interface Refused {
   doc: string;
   seq: number;
   rewritten: boolean;
+  /** Its writer keeps the change and retries it. */
+  retried: boolean;
 }
 
 interface Pending {
@@ -99,8 +104,8 @@ const keyOf = (ticket: LedgerTicket): object => (ticket.kind === 'file' ? ticket
 
 function pendingIn(ledgers: WriteLedger[]): Pending {
   const tickets = ledgers.flatMap(ledger => ledger.tickets()).map(entry => entry.ticket);
-  const refused = ledgers.flatMap(ledger => ledger.refusedDocs()).map(({ cause, doc, seq }) => ({
-    cause, doc, seq, rewritten: ledgers.some(ledger => ledger.rewriteSeq(doc) > seq),
+  const refused = ledgers.flatMap(ledger => ledger.refusedDocs()).map(({ cause, doc, seq, retried }) => ({
+    cause, doc, seq, retried, rewritten: ledgers.some(ledger => ledger.rewriteSeq(doc) > seq),
   }));
   return { tickets, unlanded: tickets.filter(ticket => !landed(ticket)), refused, landedBefore: ledgers.some(ledger => ledger.landedDropped) };
 }
@@ -108,7 +113,7 @@ function pendingIn(ledgers: WriteLedger[]): Pending {
 // A refused write later rewritten whole cannot be confirmed either way: the rewrite may or may not carry the refused
 // change. It answers unavailable. The told-once key names the answer and the refusal's stamp, so a refusal told before
 // the rewrite is told again, a newer refusal is told, and a further rewrite tells nothing new.
-const refusalAnswer = (r: Refused): TruthAnswer => (r.rewritten ? 'unavailable' : r.cause);
+const refusalAnswer = (r: Refused): TruthAnswer => (r.rewritten ? 'unavailable' : r.retried ? 'held' : r.cause);
 const refusalKey = (r: Refused): string => `${refusalAnswer(r)}|${r.doc}|${r.seq}`;
 
 async function judge(pending: Pending, waitMs = CONFIRM_MS): Promise<Verdict> {
@@ -116,15 +121,19 @@ async function judge(pending: Pending, waitMs = CONFIRM_MS): Promise<Verdict> {
     return {
       ok: false,
       answer: worst(pending.refused.map(refusalAnswer)),
-      partial: pending.tickets.length > 0,
+      partial: pending.tickets.some(ticket => landed(ticket) || !(ticket.kind === 'file' && droppedByDeposition(ticket.record))),
       failed: pending.refused.map(r => ({ refusal: refusalKey(r) })),
     };
   }
   const first = await Promise.all(pending.unlanded.map(ticket => confirmWrite(ticket, waitMs).catch(() => 'unavailable' as const)));
   // A held write is retried while slower confirms finish, so it is read again when the verdict is taken.
-  const answers = await Promise.all(first.map((answer, i) => answer !== 'held'
+  const confirmed = await Promise.all(first.map((answer, i) => answer !== 'held'
     ? answer
     : confirmWrite(pending.unlanded[i], 0).then(now => (now === 'pending' ? 'held' as const : now), () => 'unavailable' as const)));
+  const answers = confirmed.map((answer, i): TruthAnswer | 'ok' => {
+    const ticket = pending.unlanded[i];
+    return answer === 'unavailable' && ticket.kind === 'file' && droppedByDeposition(ticket.record) ? 'writer-lost' : answer;
+  });
   const failed = pending.unlanded.filter((_, i) => answers[i] !== 'ok');
   if (failed.length === 0) return { ok: true };
   const partial = answers.some(answer => answer === 'ok') || pending.tickets.length > pending.unlanded.length || pending.landedBefore;

@@ -1,3 +1,15 @@
+// What the bot process waits for before it opens the data files, or why it stops; null when it does neither.
+function botDataFilesText(info) {
+  if (!info) return null;
+  const words = h => (h && h.role === 'webui' ? 'the web UI' : h && h.role === 'import' ? 'a data bundle import' : h && h.role === 'bot' ? 'a bot process' : 'another process');
+  if (info.mode === 'deposed') return 'Stopping: another process took the data files';
+  const files = info.dataFiles || info;
+  if (files.cannotLock) return `Waiting for the data disk to take writes (/data/.writer.lock: ${files.cannotLock}); check the disk`;
+  if (files.cannotRead) return `Cannot read /data/.writer.lock (${files.cannotRead}); check that the bot can read that file`;
+  if (files.waitingFor) return `Waiting for ${words(files.waitingFor)} (pid ${files.waitingFor.pid}) to release the data files`;
+  if (info.mode === 'waiting-for-data-files' || info.waiting === true) return 'Waiting for another process to release the data files';
+  return null;
+}
 // Bot Control Panel Component
 function BotControlPanel({ status, onStart, onRestart, onShutdown, loading, configured, containerRestarting }) {
   const [restarting, setRestarting] = React.useState(false);
@@ -24,6 +36,7 @@ function BotControlPanel({ status, onStart, onRestart, onShutdown, loading, conf
   }
 
   const isBusy = loading || restarting;
+  const dataFilesText = status.running ? botDataFilesText(status) : null;
 
   return (
     <div className="card">
@@ -52,7 +65,7 @@ function BotControlPanel({ status, onStart, onRestart, onShutdown, loading, conf
       <div className="grid">
         <div className="info-item">
           <span className="info-label">Status</span>
-          <span className="info-value">{containerRestarting ? 'Container restarting...' : restarting ? 'Restarting...' : status.running ? 'Running' : 'Stopped'}</span>
+          <span className="info-value">{containerRestarting ? 'Container restarting...' : restarting ? 'Restarting...' : dataFilesText ? dataFilesText : status.running ? 'Running' : 'Stopped'}</span>
         </div>
         <div className="info-item">
           <span className="info-label">Uptime</span>

@@ -9,17 +9,18 @@
  *
  * State file: /data/global/payment-providers/dummy/state.json
  *
- * Reads use mtime-based reload so the bot process and the forked web-UI
- * process stay in sync without IPC.
+ * The cache follows premium-tiers.json's rule (decision 12 of NB10): the bot
+ * process holds the writer lock and never reloads; the web UI reloads when the
+ * file, read through the queue, differs from the text it last loaded or saved.
  */
 
-import fs from 'fs';
-import path from 'path';
-import { ensureDir } from '../pathHelpers';
 import { dataPath } from '../../../../utils/dataRoot';
-import { saveData } from '../dataManager';
+import { DataBackendUnavailableError, onWriterTake, readRawStrict, saveDataTracked } from '../dataManager';
+import { markRetried, outsideLedgers, recordRefusal, type LedgerCause } from '../dataBackends/writeLedger';
+import { errnoOf, isBotProcess, isPremiumReplaying, registerCacheStop, stopCause, stopWords, unregisterCacheStop, type StopKind } from '../premiumManager';
 import { getPaymentRegistry } from './paymentRegistry';
 import { isMaintenanceGateClosed } from '../maintenanceGate';
+import { writerLockDepth } from '../writerLock';
 import type {
   PaymentProvider,
   ProviderCapabilities,
@@ -99,7 +100,23 @@ interface DummyState {
 }
 
 const STATE_PATH = dataPath('global', 'payment-providers', 'dummy', 'state.json');
+const STATE_FILE = 'payment-providers/dummy/state.json';
+/** The document the facade names state.json by in a ledger's refusals. */
+const STATE_DOC = 'global:payment-providers/dummy/state.json';
 const DAY_MS = 24 * 60 * 60 * 1000;
+const LOAD_RETRY_MS = 5_000;
+const RETRY_FIRST_MS = 1_000;
+const RETRY_MAX_MS = 60_000;
+
+const liveProviders = new Set<DummyProvider>();
+
+/** Drops every Dummy cache of this process (at a take of the writer lock, and after a local op that was not ok). */
+export function invalidateDummyCaches(): void {
+  for (const provider of liveProviders) provider.invalidate();
+}
+
+// What this process knew of state.json may be stale after another holder of the writer lock.
+onWriterTake(invalidateDummyCaches);
 
 /**
  * Seed state on first run so testing has something to click on out of the box.
@@ -160,9 +177,25 @@ export class DummyProvider implements PaymentProvider {
   readonly capabilities = CAPABILITIES;
 
   private state: DummyState = buildSeedState();
+  /** The cache holds a loaded state; lastRaw is the text it was loaded from or last saved as (undefined: not known). */
   private loaded = false;
-  private stateMtimeMs = 0;
+  private lastRaw: string | null | undefined = undefined;
+  private unreadable: string | null = null;
+  private loggedCause: string | null = null;
+  private loggedRecheck: string | null = null;
+  private lastLoadTry = -Infinity;
   private tickTimer: NodeJS.Timeout | null = null;
+  /** Set by the final stop step or a deposition: from then on nothing is written. */
+  private stopped: StopKind | null = null;
+  private saveHeld = false;
+  private retryTimer: NodeJS.Timeout | null = null;
+  private retryDelay = RETRY_FIRST_MS;
+  private disposed = false;
+
+  constructor() {
+    liveProviders.add(this);
+    if (isBotProcess()) registerCacheStop(this);
+  }
 
   isConfigured(): boolean {
     return true; // Dummy is always usable
@@ -172,42 +205,187 @@ export class DummyProvider implements PaymentProvider {
   // STATE I/O
   // ============================================================================
 
-  private ensureLoaded(): void {
+  /** Reads state.json and records nothing in the caller's ledger: absent gives the seed in memory, written by the first save. */
+  private load(): void {
+    this.lastLoadTry = Date.now();
+    let raw: string | null;
+    let loaded: Partial<DummyState> | null = null;
     try {
-      ensureDir(path.dirname(STATE_PATH));
-      if (!fs.existsSync(STATE_PATH)) {
-        if (!this.loaded) {
-          this.state = buildSeedState();
-          this.save();
-          this.loaded = true;
+      raw = readRawStrict(STATE_PATH);
+      if (raw !== null) {
+        try {
+          loaded = JSON.parse(raw) as Partial<DummyState>;
+          if (!loaded || typeof loaded !== 'object' || Array.isArray(loaded)) throw new Error('not a JSON object');
+        } catch (error) {
+          throw new Error(`invalid JSON: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+    } catch (error) {
+      this.becomeUnreadable(errnoOf(error));
+      return;
+    }
+    this.state = loaded
+      ? {
+          variants: loaded.variants && typeof loaded.variants === 'object' ? loaded.variants : buildSeedState().variants,
+          products: loaded.products && typeof loaded.products === 'object' ? loaded.products : buildSeedState().products,
+          coupons: loaded.coupons && typeof loaded.coupons === 'object' ? loaded.coupons : buildSeedState().coupons,
+          subscriptions: loaded.subscriptions || {},
+          nextId: loaded.nextId || 1,
+        }
+      : buildSeedState();
+    this.lastRaw = raw;
+    this.loaded = true;
+    if (this.unreadable) console.log(`[DummyProvider] ${STATE_FILE} can be read again`);
+    this.unreadable = null;
+    this.loggedCause = null;
+  }
+
+  private becomeUnreadable(cause: string): void {
+    this.unreadable = cause;
+    this.loaded = false;
+    this.lastRaw = undefined;
+    this.state = buildSeedState();
+    if (this.loggedCause === cause) return;
+    this.loggedCause = cause;
+    console.error(`[DummyProvider] ${STATE_FILE} cannot be read (${cause}); the Dummy provider answers from its seed and its changes are refused until it can be read`);
+  }
+
+  private ensureLoaded(): void {
+    if (this.loaded) {
+      if (isBotProcess() || this.lastRaw === undefined || writerLockDepth() > 0) return;
+      let raw: string | null;
+      try {
+        raw = readRawStrict(STATE_PATH);
+      } catch (error) {
+        const cause = errnoOf(error);
+        if (this.loggedRecheck !== cause) {
+          this.loggedRecheck = cause;
+          console.error(`[DummyProvider] ${STATE_FILE} could not be read to check for changes (${cause}); kept the loaded copy`);
         }
         return;
       }
-      const stat = fs.statSync(STATE_PATH);
-      if (this.loaded && stat.mtimeMs === this.stateMtimeMs) return;
-      const raw = fs.readFileSync(STATE_PATH, 'utf-8');
-      const loaded = JSON.parse(raw) as Partial<DummyState>;
-      this.state = {
-        variants: loaded.variants && typeof loaded.variants === 'object' ? loaded.variants : buildSeedState().variants,
-        products: loaded.products && typeof loaded.products === 'object' ? loaded.products : buildSeedState().products,
-        coupons: loaded.coupons && typeof loaded.coupons === 'object' ? loaded.coupons : buildSeedState().coupons,
-        subscriptions: loaded.subscriptions || {},
-        nextId: loaded.nextId || 1,
-      };
-      this.stateMtimeMs = stat.mtimeMs;
-      this.loaded = true;
-    } catch (err) {
-      console.error('[DummyProvider] Failed to load state:', err);
-      this.loaded = true;
+      this.loggedRecheck = null;
+      if (raw === this.lastRaw) return;
+    } else if (this.unreadable !== null && Date.now() - this.lastLoadTry < LOAD_RETRY_MS) {
+      return;
     }
+    this.load();
   }
 
-  private save(): void {
+  /** Drops the cache (the web UI, at each take of the writer lock and after a local op that was not ok). */
+  invalidate(): void {
+    this.loaded = false;
+    this.lastRaw = undefined;
+    this.lastLoadTry = -Infinity;
+  }
+
+  /** The refusal text of a dummy.* op while state.json cannot be read; null when it can. */
+  cannotReadText(): string | null {
+    this.ensureLoaded();
+    return this.unreadable === null ? null : `${STATE_FILE} cannot be read (${this.unreadable}); nothing was saved. Fix or restore the file, then try again.`;
+  }
+
+  /** A mutating method's entry check: true when it must refuse, recorded in the current ledger, before it changes the state. */
+  private refusedAtEntry(): boolean {
+    this.ensureLoaded();
+    const cause: LedgerCause | null = this.stopped ? stopCause(this.stopped) : this.unreadable !== null ? 'io' : null;
+    if (!cause) return false;
+    recordRefusal(cause, STATE_DOC);
+    return true;
+  }
+
+  /** A provider call the PremiumManager makes: it fails, with nothing changed, while the state cannot be written. */
+  private refuseCall(): void {
+    if (!this.refusedAtEntry()) return;
+    throw new Error(this.stopped
+      ? `The Dummy provider changed nothing: ${stopWords(this.stopped)}.`
+      : `The Dummy provider changed nothing: ${STATE_FILE} cannot be read (${this.unreadable}).`);
+  }
+
+  /**
+   * Saves the whole state. In the bot a save the disk refuses stays in the cache and is retried (it answers held); a
+   * refusal of the stop or a deposition, and every save while the state cannot be read, is not.
+   */
+  private save(): boolean {
+    if (this.stopped) {
+      recordRefusal(stopCause(this.stopped), STATE_DOC);
+      return false;
+    }
+    if (this.unreadable !== null) {
+      recordRefusal('io', STATE_DOC);
+      return false;
+    }
+    return this.writeState();
+  }
+
+  private writeState(): boolean {
+    const content = JSON.stringify(this.state, null, 2);
+    let cause: LedgerCause;
     try {
-      saveData('state.json', { scope: 'global', category: 'payment-providers/dummy' }, this.state);
-      try { this.stateMtimeMs = fs.statSync(STATE_PATH).mtimeMs; } catch { /* ignore */ }
-    } catch (err) {
-      console.error('[DummyProvider] Failed to save state:', err);
+      const tracked = saveDataTracked('state.json', { scope: 'global', category: 'payment-providers/dummy' }, this.state);
+      if (tracked.outcome === 'saved') {
+        this.lastRaw = content;
+        this.saveHeld = false;
+        return true;
+      }
+      cause = tracked.outcome === 'frozen' ? 'frozen' : tracked.cause;
+    } catch (error) {
+      if (error instanceof DataBackendUnavailableError) {
+        cause = error.causeKey;
+      } else {
+        console.error('[DummyProvider] Failed to save state:', error);
+        recordRefusal('io', STATE_DOC);
+        cause = 'io';
+      }
+    }
+    if (cause === 'node-stopping' || cause === 'writer-lost' || !isBotProcess()) return false;
+    this.saveHeld = true;
+    markRetried(STATE_DOC);
+    this.armRetry();
+    return true;
+  }
+
+  private armRetry(): void {
+    if (this.retryTimer || this.stopped || this.disposed) return;
+    this.retryTimer = outsideLedgers(() => setTimeout(() => {
+      this.retryTimer = null;
+      if (this.stopped || !this.saveHeld) return;
+      outsideLedgers(() => this.writeState());
+      if (this.saveHeld) {
+        this.retryDelay = Math.min(this.retryDelay * 2, RETRY_MAX_MS);
+        this.armRetry();
+      } else {
+        this.retryDelay = RETRY_FIRST_MS;
+      }
+    }, this.retryDelay));
+    this.retryTimer.unref?.();
+  }
+
+  private clearRetry(): void {
+    if (this.retryTimer) clearTimeout(this.retryTimer);
+    this.retryTimer = null;
+  }
+
+  /** A deposition: nothing more is written. */
+  markStopped(kind: StopKind): void {
+    if (this.stopped) return;
+    this.stopped = kind;
+    this.clearRetry();
+  }
+
+  /** The final stop step: stops the retry and the tick, makes one last save of a held change, sets stopped and logs what is held. */
+  finalStop(): void {
+    if (this.disposed) return;
+    this.clearRetry();
+    if (this.tickTimer) clearInterval(this.tickTimer);
+    this.tickTimer = null;
+    if (!this.stopped) {
+      if (this.saveHeld) outsideLedgers(() => this.writeState());
+      this.clearRetry();
+      this.stopped = 'stopping';
+    }
+    if (this.saveHeld) {
+      console.error(`[DummyProvider] ${STATE_FILE} holds changes the disk refused; they are ${this.stopped === 'deposed' ? 'lost: another process took the data files' : 'lost with this stop'}`);
     }
   }
 
@@ -285,7 +463,7 @@ export class DummyProvider implements PaymentProvider {
   // ============================================================================
 
   async initiatePurchase(opts: InitiateOpts): Promise<InitiateResult> {
-    this.ensureLoaded();
+    this.refuseCall();
     const variant = this.state.variants[opts.variantId];
     if (!variant || !variant.active) {
       throw new Error(`Dummy variant '${opts.variantId}' does not exist or is inactive.`);
@@ -352,7 +530,7 @@ export class DummyProvider implements PaymentProvider {
   // ============================================================================
 
   async cancelSubscription(providerSubId: string, immediately?: boolean): Promise<void> {
-    this.ensureLoaded();
+    this.refuseCall();
     const r = this.state.subscriptions[providerSubId];
     if (!r) return;
     const registry = getPaymentRegistry();
@@ -384,7 +562,7 @@ export class DummyProvider implements PaymentProvider {
   }
 
   async reactivateSubscription(providerSubId: string): Promise<void> {
-    this.ensureLoaded();
+    this.refuseCall();
     const r = this.state.subscriptions[providerSubId];
     if (!r) return;
     if (r.status !== 'active') return;
@@ -402,7 +580,7 @@ export class DummyProvider implements PaymentProvider {
   }
 
   async pauseSubscription(providerSubId: string, resumesAt: string | null): Promise<void> {
-    this.ensureLoaded();
+    this.refuseCall();
     const r = this.state.subscriptions[providerSubId];
     if (!r) return;
     if (r.status !== 'active' || r.paused) return;
@@ -422,7 +600,7 @@ export class DummyProvider implements PaymentProvider {
   }
 
   async resumeSubscription(providerSubId: string, newEndDate: string | null): Promise<void> {
-    this.ensureLoaded();
+    this.refuseCall();
     const r = this.state.subscriptions[providerSubId];
     if (!r) return;
     if (!r.paused) return;
@@ -449,7 +627,7 @@ export class DummyProvider implements PaymentProvider {
     newVariantId: string,
     _prorationBehavior: 'none' | 'create_prorations',
   ): Promise<void> {
-    this.ensureLoaded();
+    this.refuseCall();
     const r = this.state.subscriptions[providerSubId];
     if (!r) throw new Error(`Dummy subscription '${providerSubId}' not found.`);
     const variant = this.state.variants[newVariantId];
@@ -516,9 +694,9 @@ export class DummyProvider implements PaymentProvider {
   // TICK
   // ============================================================================
 
+  /** Arms the tick before any load: each tick loads first, so a state that cannot be read now still ticks once it can. */
   start(): void {
-    this.ensureLoaded();
-    if (this.tickTimer) return;
+    if (this.tickTimer || this.stopped) return;
     this.tickTimer = setInterval(() => {
       if (!isMaintenanceGateClosed()) this.tick();
     }, 60_000);
@@ -531,6 +709,15 @@ export class DummyProvider implements PaymentProvider {
     }
   }
 
+  /** The registry replaced or dropped this provider: it takes no more writer-lock takes, stop steps or retries. */
+  dispose(): void {
+    this.disposed = true;
+    this.stop();
+    this.clearRetry();
+    liveProviders.delete(this);
+    unregisterCacheStop(this);
+  }
+
   /**
    * Periodic simulation: walk every active subscription whose endDate has
    * passed and either roll it forward (autoRenew=true) or expire it. Paused
@@ -538,6 +725,11 @@ export class DummyProvider implements PaymentProvider {
    */
   private tick(): void {
     this.ensureLoaded();
+    if (this.unreadable !== null) {
+      console.warn(`[DummyProvider] Skipped the tick: ${STATE_FILE} cannot be read (${this.unreadable})`);
+      return;
+    }
+    if (this.stopped || isPremiumReplaying()) return;
     const now = Date.now();
     const nowIso = new Date().toISOString();
     let changed = false;
@@ -589,13 +781,13 @@ export class DummyProvider implements PaymentProvider {
 
   /** Create or replace a variant. */
   adminSetVariant(variant: DummyVariant): void {
-    this.ensureLoaded();
+    if (this.refusedAtEntry()) return;
     this.state.variants[variant.variantId] = variant;
     this.save();
   }
 
   adminDeleteVariant(variantId: string): boolean {
-    this.ensureLoaded();
+    if (this.refusedAtEntry()) return false;
     if (!this.state.variants[variantId]) return false;
     delete this.state.variants[variantId];
     // Also strip from any product membership.
@@ -612,13 +804,13 @@ export class DummyProvider implements PaymentProvider {
   }
 
   adminSetProduct(product: DummyProduct): void {
-    this.ensureLoaded();
+    if (this.refusedAtEntry()) return;
     this.state.products[product.productId] = product;
     this.save();
   }
 
   adminDeleteProduct(productId: string): boolean {
-    this.ensureLoaded();
+    if (this.refusedAtEntry()) return false;
     if (!this.state.products[productId]) return false;
     delete this.state.products[productId];
     this.save();
@@ -631,7 +823,7 @@ export class DummyProvider implements PaymentProvider {
   }
 
   adminSetCoupon(coupon: DummyCoupon): boolean {
-    this.ensureLoaded();
+    if (this.refusedAtEntry()) return false;
     if (!coupon.code || coupon.code.trim() === '') return false;
     const hasPercent = typeof coupon.percentOff === 'number' && coupon.percentOff > 0;
     const hasDays = typeof coupon.extraDays === 'number' && coupon.extraDays > 0;
@@ -652,7 +844,7 @@ export class DummyProvider implements PaymentProvider {
   }
 
   adminDeleteCoupon(code: string): boolean {
-    this.ensureLoaded();
+    if (this.refusedAtEntry()) return false;
     if (!this.state.coupons[code]) return false;
     delete this.state.coupons[code];
     this.save();

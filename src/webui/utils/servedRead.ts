@@ -45,6 +45,7 @@ function noAnswerText(cause: unknown, detail: string | undefined): string {
 
 function refused(reply: any, fallback: string): ServedRead {
   const detail = reply && typeof reply.error === 'string' ? reply.error : undefined;
+  if (reply?.code === 'no-answer') return { ok: false, status: 503, error: noAnswerText(reply.cause, detail) };
   if (reply?.code !== 'bot-down') {
     const hop = hopFailure(reply?.code, detail);
     if (hop) return { ok: false, status: hop.status, error: hop.error };

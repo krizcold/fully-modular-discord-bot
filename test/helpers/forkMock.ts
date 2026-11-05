@@ -7,6 +7,8 @@ import { vi } from 'vitest';
 export const forks = { children: [] as any[], exitCode: 0 as number | null, holdExit: false, onFork: null as null | ((child: any) => void) };
 // Off: a new child prints no login line, as one booting slowly or into maintenance.
 export const forkLogin = { on: true };
+// The data:writer stages a new child reports (NB10): by default it opens its data files at once; [] reports none.
+export const forkStage = { stages: ['shared', 'guild'] as string[] };
 
 export function fakeFork(): any {
   const child: any = new EventEmitter();
@@ -29,6 +31,8 @@ export function fakeFork(): any {
   });
   forks.children.push(child);
   forks.onFork?.(child);
+  const stages = [...forkStage.stages];
+  if (stages.length > 0) setTimeout(() => { for (const stage of stages) child.emit('message', { type: 'data:writer', data: { stage } }); }, 1);
   if (forkLogin.on) setTimeout(() => child.stdout.emit('data', Buffer.from('Logged in as test#0001!\n')), 5);
   return child;
 }

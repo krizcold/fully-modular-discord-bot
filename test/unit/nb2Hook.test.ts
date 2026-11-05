@@ -175,7 +175,7 @@ describe('ruling 3: the hook answers what was saved', () => {
 
 describe('ruling 3: BotManager.enterMaintenance', () => {
   const call = (self: object, message = 'm') => (BotManager.prototype as any).enterMaintenance.call(self, message);
-  const child = (reply: () => Promise<unknown>) => ({ isRunning: () => true, botProcess: {}, sendIPCMessage: vi.fn(reply) });
+  const child = (reply: () => Promise<unknown>) => ({ isRunning: () => true, botProcess: {}, stageReached: () => true, sendIPCMessage: vi.fn(reply) });
 
   it('no bot process: saved, with a note', async () => {
     expect(await call({ isRunning: () => false, botProcess: null })).toEqual({ saved: true, note: 'No bot process runs, so it holds no changes.' });
@@ -264,7 +264,7 @@ describe('ruling B: leaving', () => {
 
 describe('ruling B: BotManager.leaveMaintenance', () => {
   const call = (self: object) => (BotManager.prototype as any).leaveMaintenance.call(self);
-  const child = (reply: () => Promise<unknown>) => ({ isRunning: () => true, botProcess: {}, sendIPCMessage: vi.fn(reply) });
+  const child = (reply: () => Promise<unknown>) => ({ isRunning: () => true, botProcess: {}, stageReached: () => true, sendIPCMessage: vi.fn(reply) });
 
   it('no bot process: restarting false, and nothing is started', async () => {
     const self = { isRunning: () => false, botProcess: null, start: vi.fn(), restart: vi.fn() };

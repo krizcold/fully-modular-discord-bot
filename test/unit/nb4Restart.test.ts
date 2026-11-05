@@ -302,7 +302,8 @@ describe('with no web UI process, every leave ends in the stop handler', () => {
   });
 });
 
-describe('the maintenance boot with no web UI process ends through its own stop handler', () => {
+// The bot entry (index.ts) installs the one stop handler before the boot runs; each case does the same.
+describe('the maintenance boot with no web UI process ends through the one stop handler', () => {
   const listeners = () => ({ term: new Set(process.listeners('SIGTERM')), int: new Set(process.listeners('SIGINT')) });
   function added(before: ReturnType<typeof listeners>) {
     return {
@@ -320,7 +321,9 @@ describe('the maintenance boot with no web UI process ends through its own stop 
     const kind = await import('../helpers/backendKind');
     kind.setBackendKind('postgres');
     const m = await import('../../src/bot/internalSetup/utils/maintenance');
+    const dm = await import('../../src/bot/internalSetup/utils/dataManager');
     const before = listeners();
+    dm.installStopHandler();
     let probe: 'refused' | 'accepted' = 'refused';
     let atLogin: number[] = [];
     const login = vi.fn(async () => { const a = added(before); atLogin = [a.term.length, a.int.length]; });
@@ -350,7 +353,9 @@ describe('the maintenance boot with no web UI process ends through its own stop 
     kind.setBackendKind('file');
     const m = await import('../../src/bot/internalSetup/utils/maintenance');
     const mf = await import('../../src/utils/maintenanceFile');
+    const dm = await import('../../src/bot/internalSetup/utils/dataManager');
     const before = listeners();
+    dm.installStopHandler();
     const shards = vi.fn(async (): Promise<number> => { throw new Error('connect ECONNRESET'); });
     try {
       m._setMaintenanceTiming({ filePollMs: 1000 });

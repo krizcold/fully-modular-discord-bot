@@ -743,18 +743,19 @@ describe('file-queue tickets, the state x exit table', () => {
       await gate;
       return appendFile(...args);
     });
-    enqueueAppend(file, 'a;');
+    // The lines end with a newline, as JSON-lines appends do (a line that does not is started on its own line).
+    enqueueAppend(file, 'a;\n');
     const first = confirmFile(fileTicket(file), 5000);
     for (let turns = 0; turns < 400 && writing.mock.calls.length === 0; turns++) await new Promise(resolve => { setTimeout(resolve, 5); });
     expect(writing).toHaveBeenCalledTimes(1);
-    enqueueAppend(file, 'b;');
+    enqueueAppend(file, 'b;\n');
     const second = fileTicket(file);
     open();
     expect(await first).toBe('ok');
     expect(await confirmFile(second, 0)).toBe('pending');
-    expect(fs.readFileSync(file, 'utf8')).toBe('a;');
+    expect(fs.readFileSync(file, 'utf8')).toBe('a;\n');
     expect(await confirmFile(second, 5000)).toBe('ok');
-    expect(fs.readFileSync(file, 'utf8')).toBe('a;b;');
+    expect(fs.readFileSync(file, 'utf8')).toBe('a;\nb;\n');
   });
 
   it('keeps a queued write or delete that an append follows, as one whole-file write', async () => {
@@ -786,14 +787,14 @@ describe('file-queue tickets, the state x exit table', () => {
 
     const guildId = '9301';
     const dropped = path.join(process.env.DATA_DIR!, guildId, 'm', 'dropped.jsonl');
-    enqueueAppend(dropped, 'a;');
+    enqueueAppend(dropped, 'a;\n');
     const flushing = confirmFile(fileTicket(dropped), 5000);
     dropPendingForGuild(guildId);
-    enqueueAppend(dropped, 'bb;');
+    enqueueAppend(dropped, 'bb;\n');
     const after = fileTicket(dropped);
     expect(await flushing).toBe('ok');
     expect(await confirmFile(after, 5000)).toBe('ok');
-    expect(fs.readFileSync(dropped, 'utf8')).toBe('a;bb;');
+    expect(fs.readFileSync(dropped, 'utf8')).toBe('a;\nbb;\n');
   });
 
   it('answers unavailable for an op dropped from the queue without landing', async () => {
@@ -956,11 +957,11 @@ async function runFileQueue(ops: FileOp[]): Promise<void> {
     const file = path.join(dir, `f${step.file}.txt`);
     const before = (states.get(file) ?? [null]).at(-1) ?? null;
     if (step.op === 'write') {
-      enqueueWrite(file, `w${step.value};`);
-      queued(file, `w${step.value};`);
+      enqueueWrite(file, `w${step.value};\n`);
+      queued(file, `w${step.value};\n`);
     } else if (step.op === 'append') {
-      enqueueAppend(file, `a${step.value};`);
-      queued(file, `${before ?? ''}a${step.value};`);
+      enqueueAppend(file, `a${step.value};\n`);
+      queued(file, `${before ?? ''}a${step.value};\n`);
     } else {
       enqueueDelete(file);
       queued(file, null);

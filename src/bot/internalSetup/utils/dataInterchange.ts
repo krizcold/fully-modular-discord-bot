@@ -9,6 +9,8 @@ import * as path from 'path';
 import * as crypto from 'crypto';
 import { DATA_ROOT } from '../../../utils/dataRoot';
 import { flushGuild } from './dataManager';
+import { checkWriterLock, configureWriterLock, deposedHolder, holderWords, releaseWriterLock, takeWriterLock, writerLockDepth, writerLockPath } from './writerLock';
+import type { TakeResult } from './processLock';
 import { MIGRATION_FILE, readDataFacts } from './dataBackends/recognitionGuard';
 import { resolveDataBackend, type DataBackendKind } from '../../../utils/envLoader';
 
@@ -377,7 +379,44 @@ export interface BundleImportResult {
  * dir moved to _graveyard and the staging dir renamed into its place. Any failure before the swap leaves the
  * live dir as it was; a failed swap puts the old dir back.
  */
+/**
+ * Imports a bundle holding the data files' writer lock (role import) for the whole import, so a bot started meanwhile
+ * waits for it; refused at once while another live process holds the lock.
+ */
 export async function importBundle(filePath: string): Promise<BundleImportResult> {
+  if (writerLockDepth() === 0) configureWriterLock('import');
+  const taken = takeWriterLock();
+  if (taken.kind !== 'taken') throw new Error(`[DataInterchange] ${importLockRefusal(taken)}`);
+  try {
+    return await importBundleHeld(filePath);
+  } finally {
+    releaseWriterLock();
+  }
+}
+
+function importLockRefusal(taken: Exclude<TakeResult, { kind: 'taken' }>): string {
+  switch (taken.kind) {
+    case 'held':
+      return taken.holder
+        ? `the data files are held by ${holderWords(taken.holder)} (pid ${taken.holder.pid}); run the import once it has stopped`
+        : 'another process is taking the data files at this moment; run the import once it has stopped';
+    case 'contended':
+      return 'another process is taking over the data files at this moment; run the import again in a moment';
+    case 'unreadable':
+      return `can't confirm which process holds the data files (${writerLockPath()}: ${taken.errno}); nothing was imported`;
+    case 'unwritable':
+      return `the data disk does not take writes (${writerLockPath()}: ${taken.errno}); nothing was imported`;
+  }
+}
+
+/** Throws when another process took the data files from this import: no guild dir is moved after that. */
+function refuseIfDeposed(): void {
+  const check = checkWriterLock();
+  const holder = check.kind === 'deposed' ? check.holder : deposedHolder();
+  if (holder) throw new Error(`[DataInterchange] Another process (${holderWords(holder)}, pid ${holder.pid}) took the data files during the import`);
+}
+
+async function importBundleHeld(filePath: string): Promise<BundleImportResult> {
   let summary: BundleSummary | null = null;
   const gen = readBundle(filePath, s => { summary = s; });
   const first = await gen.next();
@@ -418,6 +457,7 @@ export async function importBundle(filePath: string): Promise<BundleImportResult
       const graveyardRoot = path.join(DATA_ROOT, '_graveyard');
       await fs.promises.mkdir(graveyardRoot, { recursive: true });
       const dest = path.join(graveyardRoot, `${guildId}-${Date.now()}`);
+      refuseIfDeposed();
       await fs.promises.rename(liveDir, dest);
       swapping = true;
       moved = dest;
@@ -434,6 +474,7 @@ export async function importBundle(filePath: string): Promise<BundleImportResult
       await fs.promises.writeFile(path.join(dest, '.graveyard.json'), JSON.stringify({ guildId, reason: 'replaced by bundle import', ts: Date.now() }, null, 2), 'utf-8')
         .catch(() => undefined);
     } else {
+      refuseIfDeposed();
       swapping = true;
       await fs.promises.rename(staging, liveDir);
     }

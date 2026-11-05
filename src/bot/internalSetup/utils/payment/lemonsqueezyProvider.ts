@@ -19,6 +19,7 @@
  */
 
 import * as crypto from 'crypto';
+import { PROVIDER_FETCH_MS } from './paymentTypes';
 import { loadCredentials } from '@/utils/envLoader';
 import { getPaymentRegistry } from './paymentRegistry';
 import type {
@@ -416,6 +417,6 @@ export class LemonSqueezyProvider implements PaymentProvider {
       },
     };
     if (body !== undefined) init.body = JSON.stringify(body);
-    return await fetch(`${LS_API_BASE}${path}`, init);
+    return await fetch(`${LS_API_BASE}${path}`, { ...init, signal: AbortSignal.timeout(PROVIDER_FETCH_MS) });
   }
 }

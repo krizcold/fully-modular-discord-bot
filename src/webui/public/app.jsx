@@ -137,7 +137,11 @@ function App() {
     try {
       setLoading(true);
       const res = await api.post('/bot/start');
-      if (res.success) {
+      const waiting = res.success ? botDataFilesText(res) : null;
+      if (waiting) {
+        showToast(`The bot process started and is not running yet. ${waiting}.`, 'warning', { sticky: true });
+        await loadData();
+      } else if (res.success) {
         showToast('Bot started successfully!', 'success');
         await loadData();
       } else {

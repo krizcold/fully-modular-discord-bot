@@ -8,6 +8,7 @@
  */
 
 import * as path from 'path';
+import { createHash } from 'crypto';
 import { dataPath } from '../../../utils/dataRoot';
 import {
   confirmWrite,
@@ -24,6 +25,7 @@ import {
 } from './dataManager';
 import type { WriteTicket } from './dataManager';
 import { filesPending } from './dataBackends/fileBackend';
+import { carryWrites, NO_WRITES, type LedgerCause } from './dataBackends/writeLedger';
 import { maintenanceIpcRefusal } from './maintenance';
 import { maintenanceText, runTracked } from './maintenanceGate';
 import { ROOT_CONFIG_PATH } from './configManager';
@@ -32,8 +34,20 @@ import { DataBackendUnavailableError, getWorkingSet } from './dataBackends/worki
 import { awaitGuildDataReady } from './dataBackends/boot';
 import { canonicalGuildKey } from './dataKeys';
 import { stoppedServing } from './servingGate';
+import { truthText } from './dataBackends/replyGate';
+import { checkWriterLock, deposedHolder, deposedText } from './writerLock';
 
-type DataOpCode = 'frozen' | 'not-owner' | 'backend-unavailable' | 'bot-down' | 'invalid' | 'io-error' | 'maintenance';
+type DataOpCode = 'frozen' | 'not-owner' | 'backend-unavailable' | 'bot-down' | 'invalid' | 'io-error' | 'maintenance' | 'changed' | 'changed-since-open' | 'held-elsewhere';
+
+/** A read a write was built on: the sha256 hex of the raw text read, or 'absent'. */
+export type ExpectSha = string;
+
+export const CHANGED_TEXT = 'This file changed while the save was being made; nothing was saved. Reload it to see the current values.';
+export const CHANGED_SINCE_OPEN_TEXT = 'This file changed since you opened it; nothing was saved. Reload it to see the current values.';
+
+export function shaOfRaw(raw: string | null): ExpectSha {
+  return raw === null ? 'absent' : createHash('sha256').update(raw, 'utf8').digest('hex');
+}
 
 export interface DataWriteReply {
   ok: boolean;
@@ -69,6 +83,12 @@ export interface GuildDataWriteRequest {
   op: 'write' | 'delete' | 'delete-namespace' | 'restore-graveyard';
   /** Raw JSON text, 2-space pretty like the facade writes. For restore-graveyard it carries {retiredAt}. */
   contentJson?: string;
+  /** write: the sha of the stored text the body was built on; compared in the write's own turn. */
+  expectSha?: ExpectSha;
+  /** write: the global twin the body was built on ('module/file.json' under /data/global, or the root config). */
+  twin?: { rel?: string; root?: 'config'; expectSha: ExpectSha };
+  /** write: the expectSha is the data editor's loaded body, answered as changed-since-open. */
+  sinceOpen?: boolean;
 }
 
 /** One global file the Config tab reads: the root config, or a .json path under /data/global as 'module/file.json'. */
@@ -103,7 +123,7 @@ function validateWrite(req: GuildDataWriteRequest): string | null {
   if (!/^\d+$/.test(req.guildId ?? '')) return 'invalid guildId';
   if (req.op !== 'write' && req.op !== 'delete' && req.op !== 'delete-namespace' && req.op !== 'restore-graveyard') return 'invalid op';
   if (req.op === 'delete-namespace' || req.op === 'restore-graveyard') return null;
-  if (!validSegment(req.module, false)) return 'invalid module';
+  if (req.module !== '' && !validSegment(req.module, false)) return 'invalid module';
   if (!validSegment(req.filename, true)) return 'invalid filename';
   if (req.op === 'write' && typeof req.contentJson !== 'string') return 'contentJson is required';
   return null;
@@ -117,11 +137,24 @@ function validateWrite(req: GuildDataWriteRequest): string | null {
 const OPERATOR_FLUSH_MS = 5000;
 
 export async function applyOperatorDataWrite(req: GuildDataWriteRequest): Promise<DataWriteReply> {
+  const own: { ticket?: WriteTicket; threw?: boolean } = {};
+  const reply = await operatorDataWrite(req, own);
+  return own.threw ? reply : carryWrites(reply, { ...NO_WRITES, tickets: own.ticket ? [own.ticket] : [] });
+}
+
+async function operatorDataWrite(req: GuildDataWriteRequest, own: { ticket?: WriteTicket; threw?: boolean }): Promise<DataWriteReply> {
   const invalid = validateWrite(req);
   if (invalid) return { ok: false, code: 'invalid', error: invalid };
   const { guildId, module, filename, op } = req;
+  const check = checkWriterLock();
+  if (check.kind === 'deposed') return { ok: false, code: 'held-elsewhere', error: deposedText(check.holder) };
   if (!(await awaitGuildDataReady(guildId))) {
     return { ok: false, code: 'backend-unavailable', error: 'guild data is not ready' };
+  }
+  // From here to the facade write is one synchronous turn: the compare reads what the write replaces.
+  if (op === 'write') {
+    const changed = compareRead(req);
+    if (changed) return changed;
   }
   let ticket: WriteTicket;
   try {
@@ -145,6 +178,7 @@ export async function applyOperatorDataWrite(req: GuildDataWriteRequest): Promis
       // NB4 decision 6: no write after the claims lapsed or a shard was lost, and a frozen set keeps its writes.
       if (stoppedServing() || getWorkingSet()?.stateOf(guildId) === 'frozen-retained') return { ok: false, code: 'frozen' };
       const restored = await restoreGuildFromGraveyard(guildId, retiredAt);
+      if (!restored.ok && deposedHolder()) return { ok: false, code: 'held-elsewhere', error: deposedText(deposedHolder()!) };
       if (!restored.ok) return { ok: false, code: 'invalid', error: restored.error || 'restore refused' };
       return { ok: true };
     }
@@ -153,6 +187,7 @@ export async function applyOperatorDataWrite(req: GuildDataWriteRequest): Promis
       // that freeze and the data still being flushed.
       if (stoppedServing() || getWorkingSet()?.stateOf(guildId) === 'frozen-retained') return { ok: false, code: 'frozen' };
       const moved = await deleteGuildNamespace(guildId, 'webui-operator-delete', OPERATOR_FLUSH_MS);
+      if (!moved && deposedHolder()) return { ok: false, code: 'held-elsewhere', error: deposedText(deposedHolder()!) };
       if (!moved) return { ok: false, code: 'io-error', error: 'guild data delete failed; nothing was removed' };
       return { ok: true };
     }
@@ -163,7 +198,7 @@ export async function applyOperatorDataWrite(req: GuildDataWriteRequest): Promis
       // refusal is not done.
       const deleted = deleteDataTracked(filename, options);
       if (deleted.outcome === 'frozen') return { ok: false, code: 'frozen' };
-      if (deleted.outcome === 'refused') return { ok: false, code: 'backend-unavailable', error: 'delete not accepted' };
+      if (deleted.outcome === 'refused') return { ok: false, code: 'backend-unavailable', error: truthText(deleted.cause as LedgerCause, false) };
       if (!deleted.ticket) return { ok: true };
       ticket = deleted.ticket;
     } else {
@@ -175,7 +210,7 @@ export async function applyOperatorDataWrite(req: GuildDataWriteRequest): Promis
       }
       const saved = saveDataTracked(filename, options, parsed);
       if (saved.outcome === 'frozen') return { ok: false, code: 'frozen' };
-      if (saved.outcome === 'refused') return { ok: false, code: 'backend-unavailable', error: 'write not accepted' };
+      if (saved.outcome === 'refused') return { ok: false, code: 'backend-unavailable', error: truthText(saved.cause as LedgerCause, false) };
       ticket = saved.ticket;
     }
   } catch (error) {
@@ -186,8 +221,10 @@ export async function applyOperatorDataWrite(req: GuildDataWriteRequest): Promis
     if (error instanceof DataBackendUnavailableError) {
       return { ok: false, code: 'backend-unavailable', error: error.message };
     }
+    own.threw = true;
     return { ok: false, code: 'io-error', error: error instanceof Error ? error.message : String(error) };
   }
+  own.ticket = ticket;
   // This write's own confirmation: other writers' queued writes to the guild are theirs.
   const outcome = await confirmWrite(ticket, 8000);
   if (outcome === 'ok') return { ok: true };
@@ -196,7 +233,27 @@ export async function applyOperatorDataWrite(req: GuildDataWriteRequest): Promis
   // Refused by the store, the write is kept and retried: no failure, and the
   // operator learns it is not durable yet.
   if (outcome === 'held') return { ok: true, pending: true, note: 'it is not saved yet; this node retries while it serves this guild, and loses it if the bot stops or loses its database first' };
+  if (outcome === 'unavailable' && deposedHolder()) return { ok: false, code: 'held-elsewhere', error: deposedText(deposedHolder()!) };
   return { ok: false, code: 'backend-unavailable', error: 'this write left this node before it was confirmed saved (the guild was unloaded, its data was deleted or restored from the graveyard), so whether it was saved is unknown; reload the data to check' };
+}
+
+/** The stored text of the target and its twin against the reads the body was built on; a reply when either changed. */
+function compareRead(req: GuildDataWriteRequest): DataWriteReply | null {
+  const changed = (): DataWriteReply => req.sinceOpen
+    ? { ok: false, code: 'changed-since-open', error: CHANGED_SINCE_OPEN_TEXT }
+    : { ok: false, code: 'changed', error: CHANGED_TEXT };
+  try {
+    if (req.expectSha !== undefined && shaOfRaw(readGuildDocRaw(req.guildId, req.module, req.filename)) !== req.expectSha) return changed();
+    if (req.twin) {
+      const twin = applyOperatorGlobalRead({ root: req.twin.root, rel: req.twin.rel });
+      if (!twin.ok) return { ok: false, code: 'invalid', error: twin.error ?? 'the global twin cannot be read' };
+      if (shaOfRaw(twin.contentJson ?? null) !== req.twin.expectSha) return { ok: false, code: 'changed', error: CHANGED_TEXT };
+    }
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException)?.code;
+    return { ok: false, code: 'io-error', error: `the stored file cannot be read (${typeof code === 'string' ? code : 'unknown error'}); nothing was saved` };
+  }
+  return null;
 }
 
 export async function applyOperatorDataRead(req: GuildDataReadRequest): Promise<DataReadReply> {
@@ -268,7 +325,7 @@ export function setupDataIPCHandlers(): void {
   process.on('message', async (message: unknown) => {
     if (!message || typeof message !== 'object') return;
     const { type, requestId, data } = message as { type?: string; requestId?: string; data?: any };
-    if ((type !== 'data:guild-write' && type !== 'data:guild-read' && type !== 'data:global-read') || !requestId) return;
+    if ((type !== 'data:guild-write' && type !== 'data:guild-read') || !requestId) return;
     const refusal = maintenanceIpcRefusal(type);
     if (refusal) {
       process.send!({ requestId, data: refusal });
@@ -277,9 +334,7 @@ export function setupDataIPCHandlers(): void {
     try {
       const response = type === 'data:guild-write'
         ? await runTracked(() => applyOperatorDataWrite((data || {}) as GuildDataWriteRequest))
-        : type === 'data:guild-read'
-          ? await applyOperatorDataRead((data || {}) as GuildDataReadRequest)
-          : applyOperatorGlobalRead((data || {}) as GlobalDataReadRequest);
+        : await applyOperatorDataRead((data || {}) as GuildDataReadRequest);
       process.send!({ requestId, data: response });
     } catch (error) {
       process.send!({ requestId, data: { ok: false, code: 'io-error', error: error instanceof Error ? error.message : 'Unknown error' } });

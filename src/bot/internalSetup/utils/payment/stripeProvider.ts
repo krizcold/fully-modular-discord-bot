@@ -12,6 +12,7 @@
  */
 
 import * as crypto from 'crypto';
+import { PROVIDER_FETCH_MS } from './paymentTypes';
 import { loadCredentials } from '@/utils/envLoader';
 import { getPaymentRegistry } from './paymentRegistry';
 import type {
@@ -779,7 +780,7 @@ export class StripeProvider implements PaymentProvider {
       body = formBody ? new URLSearchParams(formBody).toString() : '';
     }
 
-    const res = await fetch(`${STRIPE_API_BASE}${path}`, { method, headers, body });
+    const res = await fetch(`${STRIPE_API_BASE}${path}`, { method, headers, body, signal: AbortSignal.timeout(PROVIDER_FETCH_MS) });
     const text = await res.text();
     if (!res.ok) {
       let userMessage = `Stripe API ${res.status}`;

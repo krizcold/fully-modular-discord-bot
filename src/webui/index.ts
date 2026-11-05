@@ -139,6 +139,7 @@ export async function startWebUI(botManager: BotManager): Promise<void> {
     // Shutdown bot; when the child is already gone this calls off a pending
     // automatic start.
     await botManager.shutdown(false);
+    await botManager.endLocalChain();
 
     stopSessionStore();
 

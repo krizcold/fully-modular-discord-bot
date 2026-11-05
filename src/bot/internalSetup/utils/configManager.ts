@@ -3,7 +3,7 @@ import { createHash } from 'crypto';
 import { getConfigFileMetadata } from './configDiscovery';
 import type { ConfigFileMetadata } from './configDiscovery';
 import { dataPath } from '../../../utils/dataRoot';
-import { loadData, readRaw, saveData, saveDataOutcome, writeRawAtomic } from './dataManager';
+import { loadData, readRaw, readRawStrict, saveData, saveDataOutcome, writeRawAtomic } from './dataManager';
 import type { ModuleConfigSchema, ConfigFieldSchema } from '../../types/moduleTypes';
 
 // Use dist/bot/config.json in production, src/bot/config.json in development
@@ -50,16 +50,26 @@ const MAIN_CONFIG_SCHEMA: Record<string, any> = {
  * - Removes orphaned properties not in schema
  * - Works for both development and production environments
  */
-export function ensureConfigPopulated(): void {
+export function ensureConfigPopulated(): 'written' | 'left' | 'refused' {
   // Read existing config (if exists)
   let existingConfig: Record<string, any> = {};
-  const rawContent = readRaw(rootConfigPath);
+  // A file that exists but cannot be read or parsed holds the operator's values: it is left as it is.
+  let rawContent: string | null;
+  try {
+    rawContent = readRawStrict(rootConfigPath);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException)?.code;
+    console.error(`[ConfigManager] config.json cannot be read (${typeof code === 'string' ? code : String(error)}); left it as it is`);
+    return 'left';
+  }
   if (rawContent !== null) {
     try {
-      existingConfig = JSON.parse(rawContent || '{}');
+      const parsed = JSON.parse(rawContent);
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('not a JSON object');
+      existingConfig = parsed;
     } catch (e) {
-      console.warn(`[ConfigManager] Error reading existing config, will regenerate:`, e);
-      existingConfig = {};
+      console.error(`[ConfigManager] config.json cannot be read (${e instanceof Error ? e.message : String(e)}); left it as it is`);
+      return 'left';
     }
   }
 
@@ -91,8 +101,9 @@ export function ensureConfigPopulated(): void {
   }
 
   // Write fully populated config
-  writeRawAtomic(rootConfigPath, JSON.stringify(populatedConfig, null, 2));
+  if (!writeRawAtomic(rootConfigPath, JSON.stringify(populatedConfig, null, 2))) return 'refused';
   console.log(`[ConfigManager] Config synchronized with schema (${addedCount} added, ${preservedCount} preserved, ${orphanedKeys.length} removed)`);
+  return 'written';
 }
 
 /**

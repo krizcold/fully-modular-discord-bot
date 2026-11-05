@@ -1,21 +1,20 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // Ruling 6 and NB4 decisions 16 and 22: the maintenance boot. This file marks its process as booted in maintenance,
-// so it holds only these cases. The stop handler is captured so its steps run here without ending the process.
+// so it holds only these cases. Its step of the one stop (dataManager.ts, which drains and exits) is captured so it
+// runs here without ending the process.
 
 const h = vi.hoisted(() => ({
-  steps: null as null | (() => Promise<void>),
-  handlerCalls: 0,
-  drains: [] as number[],
+  steps: null as null | (() => void | Promise<void>),
+  added: 0,
 }));
 vi.mock('../../src/bot/internalSetup/utils/dataManager', async orig => ({
   ...(await orig<object>()),
   stopProcess: () => undefined,
-  stopHandler: (steps: () => Promise<void>) => {
-    h.steps = steps;
-    return async () => { h.handlerCalls += 1; };
+  addStopStep: (step: () => void | Promise<void>) => {
+    h.steps = step;
+    h.added += 1;
   },
-  drainForExit: async (ms: number) => { h.drains.push(ms); },
 }));
 
 import type { Client } from 'discord.js';
@@ -38,8 +37,7 @@ beforeEach(() => {
   _setMaintenanceSender(() => undefined);
   _setMaintenanceTiming({ filePollMs: 600_000 });
   h.steps = null;
-  h.handlerCalls = 0;
-  h.drains.length = 0;
+  h.added = 0;
   logs = [];
   const capture = (...args: unknown[]) => { logs.push(String(args[0])); };
   vi.spyOn(console, 'log').mockImplementation(capture);
@@ -69,40 +67,33 @@ async function jsonBoot(over: Parameters<typeof runMaintenanceBoot>[1] = {}, cau
   return client;
 }
 
-describe('the stop handler of a maintenance boot', () => {
-  it('destroys the Client, drains for 5 s and exits with 0', async () => {
+describe('the stop step of a maintenance boot', () => {
+  it('destroys the Client', async () => {
     const client = (await jsonBoot())!;
     const destroy = vi.spyOn(client, 'destroy').mockResolvedValue(undefined);
-    const exit = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
     await h.steps!();
     expect(destroy).toHaveBeenCalledTimes(1);
-    expect(h.drains).toEqual([5000]);
-    expect(exit).toHaveBeenCalledWith(0);
   });
 
-  it('a destroy that never settles is left after 2 s, then the drain and the exit run', async () => {
+  it('a destroy that never settles is left after 2 s, so the drain and the exit of the one stop run', async () => {
     const client = (await jsonBoot())!;
     vi.spyOn(client, 'destroy').mockReturnValue(new Promise<void>(() => undefined));
-    const exit = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
-    const done = h.steps!();
+    let ended = false;
+    const done = Promise.resolve(h.steps!()).then(() => { ended = true; });
     await vi.advanceTimersByTimeAsync(1999);
-    expect(h.drains).toEqual([]);
+    expect(ended).toBe(false);
     await vi.advanceTimersByTimeAsync(1);
-    expect(h.drains).toEqual([5000]);
-    expect(exit).toHaveBeenCalledWith(0);
+    expect(ended).toBe(true);
     await done;
   });
 
-  it('SIGINT and SIGTERM each run the stop handler', async () => {
+  it('is added once, and the boot adds no signal listener of its own (the one stop handler is on both signals)', async () => {
     await jsonBoot();
     const added = (signal: 'SIGTERM' | 'SIGINT') => process.listeners(signal).filter(l => !signalsBefore[signal].includes(l));
-    expect(added('SIGINT')).toHaveLength(1);
-    expect(added('SIGTERM')).toHaveLength(1);
-    (added('SIGINT')[0] as (s: string) => void)('SIGINT');
-    expect(h.handlerCalls).toBe(1);
-    (added('SIGTERM')[0] as (s: string) => void)('SIGTERM');
-    expect(h.handlerCalls).toBe(2);
+    expect(h.added).toBe(1);
+    expect(added('SIGINT')).toHaveLength(0);
+    expect(added('SIGTERM')).toHaveLength(0);
   });
 });
 

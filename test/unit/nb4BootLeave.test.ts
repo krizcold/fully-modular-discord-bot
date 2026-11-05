@@ -141,15 +141,22 @@ describe('a leave that ends before the boot take, with no web UI process', () =>
   });
 });
 
-describe("where main() builds the normal boot's stop handler (NB4-R9-T2)", () => {
-  it('after decideBoot answers, and before the maintenance listener, the data watcher and the boot take, with both signals on it', () => {
+describe("where main() adds the normal boot's stop steps (NB4-R9-T2)", () => {
+  it('after decideBoot answers, and before the maintenance listener, the data watcher and the boot take; the one stop handler is on both signals before main() runs', () => {
+    const entry = readSourceText(__dirname, '../../src/bot/index.ts');
+    const boot = entry.slice(entry.indexOf('async function boot()'));
+    expect(boot.indexOf('installStopHandler()')).toBeGreaterThan(-1);
+    expect(boot.indexOf('installStopHandler()')).toBeLessThan(boot.indexOf("await import('./internalSetup/clientInitializer')"));
+    const facade = readSourceText(__dirname, '../../src/bot/internalSetup/utils/dataManager.ts');
+    const install = facade.slice(facade.indexOf('export function installStopHandler()'));
+    expect(install).toContain("process.on('SIGTERM', () => void stopRunner?.())");
+    expect(install).toContain("process.on('SIGINT', () => void stopRunner?.())");
     const source = readSourceText(__dirname, '../../src/bot/internalSetup/clientInitializer.ts');
     const main = source.slice(source.indexOf('async function main()'));
     const order = [
       'await decideBoot()',
-      'const shutdownHandler = stopHandler(',
-      "process.on('SIGTERM', () => void shutdownHandler())",
-      "process.on('SIGINT', () => void shutdownHandler())",
+      'addStopStep(',
+      'addReleaseStep(',
       'setupMaintenanceIPCAtBoot()',
       'watchDataBackend(',
       'await bootShards()',

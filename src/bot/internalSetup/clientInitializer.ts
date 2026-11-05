@@ -13,7 +13,9 @@ import { markMetricsReady, setupMetricsIPCHandlers } from './utils/ipcMetricsHan
 import { setupFleetIPCHandlers } from './utils/ipcFleetHandler';
 import { getMetricsCollector } from './utils/metrics/metricsCollector';
 import { startSamplers, stopSamplers } from './utils/metrics/samplers';
-import { drainForExit, getGuildDataBackend, stopHandler, sweepGraveyard, DataBackendUnavailableError } from './utils/dataManager';
+import { addReleaseStep, addStopStep, getGuildDataBackend,sweepGraveyard, DataBackendUnavailableError } from './utils/dataManager';
+import { setupSharedOpsIPC } from './utils/sharedOps';
+import { reportWriterStage } from './utils/writerLock';
 import { initDataBackendLayer, awaitDataStartupBarrier, dispatchGated, dataUnavailableMessage } from './utils/dataBackends/boot';
 import { getWorkingSet } from './utils/dataBackends/workingSet';
 import { setupReloadIPCHandlers } from './utils/ipcReloadHandler';
@@ -21,11 +23,11 @@ import { setupToggleIPCHandlers, applyAllDisabledStatesOnBoot } from './utils/ip
 import { setupIPCNotificationHandler } from './utils/ipcNotificationHandler';
 import { getSubscriptionNotifier } from './utils/subscriptionNotifier';
 import { getPaymentRegistry } from './utils/payment/paymentRegistry';
+import { startPremiumTickers } from './utils/premiumManager';
 import { startModuleAutoUpdater } from './utils/moduleAutoUpdater';
 import { loadCredentials } from '../../utils/envLoader';
 import { bootShards, getShardClaims } from './fleet/shardBoot';
 import { stoppedServing } from './utils/servingGate';
-import { runStopSteps } from './utils/stopSteps';
 import { getIngestService } from './ingest/ingestService';
 import { installReplyGate } from './utils/dataBackends/replyGate';
 import { ModuleLoader } from './utils/moduleLoader';
@@ -482,22 +484,23 @@ async function main() {
     return;
   }
 
-  // NB4 decisions 12 and 19: the one way this process ends on purpose, installed before anything that can start a
-  // leave; each step runs once what it acts on exists. The claims lane renews through the gateway close and the
-  // drain, then releases.
+  // NB4 decisions 12 and 19: this boot's steps of the one stop (dataManager.ts, which drains between them), added
+  // before anything that can start a leave; each runs once what it acts on exists. The claims lane renews through the
+  // gateway close and the drain, then releases.
   let stopSteps: { client: Client | null; metricsReady: boolean } = { client: null, metricsReady: false };
-  const shutdownHandler = stopHandler(() => runStopSteps({
-    beginStop: () => getShardClaims()?.beginStop(),
-    stopSamplers: () => { if (stopSteps.metricsReady) stopSamplers(); },
-    closeGateway: () => getIngestService().close('shutting down'),
-    flushTotals: () => { if (stopSteps.metricsReady && !isMaintenanceGateClosed()) getMetricsCollector().flushTotals(); },
-    // Postgres mode gets a wider bound: a coalesced Working Set can hold more dirty state than the file queue.
-    drain: () => drainForExit(getWorkingSet() ? 30000 : 5000),
-    finishStop: async () => { await getShardClaims()?.finishStop(); },
-    exit: code => process.exit(code),
-  }));
-  process.on('SIGTERM', () => void shutdownHandler());
-  process.on('SIGINT', () => void shutdownHandler());
+  addStopStep(async () => {
+    getShardClaims()?.beginStop();
+    if (stopSteps.metricsReady) stopSamplers();
+    // No event is handled while the writes drain: a gateway left up keeps
+    // taking writes the drain may never reach. Bounded, since a destroy
+    // stalls on a shard caught mid-connect.
+    await Promise.race([
+      getIngestService().close('shutting down').catch(err => console.warn('[clientInitializer] Could not close the gateway on shutdown:', err)),
+      new Promise(resolve => setTimeout(resolve, 2000)),
+    ]);
+    if (stopSteps.metricsReady && !isMaintenanceGateClosed()) getMetricsCollector().flushTotals(); // writes via saveData, so it must precede the drain
+  });
+  addReleaseStep(async () => { await getShardClaims()?.finishStop(); });
 
   setupMaintenanceIPCAtBoot();
 
@@ -511,6 +514,8 @@ async function main() {
 
   setupFleetIPCHandlers();
   setupMetricsIPCHandlers();
+  setupSharedOpsIPC();
+  reportWriterStage('shared');
 
   // Every shard runs in this process.
   const fleet = await bootShards();
@@ -725,7 +730,9 @@ async function main() {
   // process because it needs the Discord client. The web-UI process drives
   // most state changes and forwards notification requests via IPC.
   getSubscriptionNotifier().setClient(client);
+  startPremiumTickers();
   setupIPCNotificationHandler();
+  reportWriterStage('guild');
 
   // Discord App Monetization: bridge gateway entitlement events into our
   // payment-registry event stream. Only the bot process has the client;

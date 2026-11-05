@@ -37,6 +37,7 @@ import {
 
 import {
   flushAll as flushAllFiles,
+  forgetAppendTails,
   queuedFileWrites,
   fileFlushOnTheWire,
   fileFlushesLanded,
@@ -142,18 +143,20 @@ export async function flushAll(): Promise<void> {
 
 const EXIT_DRAIN_POLL_MS = 100;
 const EXIT_DRAIN_GIVEUP_MS = 3000;
+// The working set had the exit drain's bound; the pass after it waits only on the file lines it queued, inside BotManager's 40 s.
+const AFTER_DRAIN_BOUND_MS = 5000;
 let exitDrain: Promise<void> | null = null;
 let closedForExit = false;
 
 const pause = (ms: number) => new Promise<void>(resolve => { setTimeout(resolve, Math.max(0, ms)); });
 
-function writesSettled(): boolean {
-  const ws = getWorkingSet();
+function writesSettled(filesOnly = false): boolean {
+  const ws = filesOnly ? null : getWorkingSet();
   return queuedFileWrites() === 0 && (!ws || ws.writesSettled());
 }
 
 const landedFlushes = () => fileFlushesLanded() + (getWorkingSet()?.landedFlushes() ?? 0);
-const flushOnTheWire = () => fileFlushOnTheWire() || (getWorkingSet()?.flushOnTheWire() ?? false);
+const flushOnTheWire = (filesOnly = false) => fileFlushOnTheWire() || (!filesOnly && (getWorkingSet()?.flushOnTheWire() ?? false));
 
 // A pass flushes what is queued when it starts: a write accepted during it and
 // a flush already on the wire are the next pass's, and the pause hands a flush
@@ -161,18 +164,18 @@ const flushOnTheWire = () => fileFlushOnTheWire() || (getWorkingSet()?.flushOnTh
 // disk) is retried until nothing has landed for EXIT_DRAIN_GIVEUP_MS and
 // nothing is on the wire, so a blip drains and a dead store costs that window,
 // not the bound.
-async function drainUntilSettled(deadline: number, progress: { at: number; landed: number }): Promise<void> {
-  while (!writesSettled() && Date.now() < deadline) {
-    const ws = getWorkingSet();
+async function drainUntilSettled(deadline: number, progress: { at: number; landed: number }, filesOnly = false): Promise<void> {
+  while (!writesSettled(filesOnly) && Date.now() < deadline) {
+    const ws = filesOnly ? null : getWorkingSet();
     await Promise.race([
       Promise.all([flushAllFiles(), ws ? ws.flushAllDirty() : null]).catch(() => undefined),
       pause(deadline - Date.now()),
     ]);
-    if (writesSettled()) return;
+    if (writesSettled(filesOnly)) return;
     if (landedFlushes() !== progress.landed) {
       progress.landed = landedFlushes();
       progress.at = Date.now();
-    } else if (!flushOnTheWire() && Date.now() - progress.at >= EXIT_DRAIN_GIVEUP_MS) return;
+    } else if (!flushOnTheWire(filesOnly) && Date.now() - progress.at >= EXIT_DRAIN_GIVEUP_MS) return;
     await pause(Math.min(EXIT_DRAIN_POLL_MS, deadline - Date.now()));
   }
 }
@@ -290,6 +293,163 @@ export function stopProcess(): void {
 /** A stop has begun or the exit drain runs: a write not saved by now may never be retried, and may be lost. */
 export function isStopping(): boolean {
   return stopBegun || exitDrain !== null;
+}
+
+/** The bot process's exit code when another process took the data files' lock (decision 20 of NB10). */
+export const EXIT_DEPOSED = 75;
+
+type StopStep = () => void | Promise<void>;
+const stopSteps: StopStep[] = [];
+const finalStopSteps: StopStep[] = [];
+let finalStepsRan = false;
+let stopExitCode = 0;
+let stopRunner: (() => Promise<void>) | null = null;
+
+/** A step the stop runs before the final steps, in registration order (the samplers, the gateway close). */
+export function addStopStep(step: StopStep): void {
+  stopSteps.push(step);
+}
+
+/** A step the stop runs after every other step; one added once the final steps ran runs at once. */
+export function addFinalStopStep(step: StopStep): void {
+  if (finalStepsRan) {
+    void Promise.resolve().then(step).catch(error => console.error('[Data] A stop step failed:', error));
+    return;
+  }
+  finalStopSteps.push(step);
+}
+
+const afterDrainSteps: Array<() => boolean> = [];
+
+/** A step run once the exit drain ended; one that queued a write answers true, and the stop runs one more drain pass. */
+export function addAfterDrainStep(step: () => boolean): void {
+  afterDrainSteps.push(step);
+}
+
+export function runAfterDrainSteps(): boolean {
+  let queued = false;
+  for (const step of afterDrainSteps) {
+    try {
+      if (step()) queued = true;
+    } catch (error) {
+      console.error('[Data] A step after the exit drain failed:', error);
+    }
+  }
+  return queued;
+}
+
+async function runSteps(steps: StopStep[]): Promise<void> {
+  for (const step of steps) {
+    try {
+      await step();
+    } catch (error) {
+      console.error('[Data] A stop step failed:', error);
+    }
+  }
+}
+
+const releaseSteps: StopStep[] = [];
+
+/** A step the stop runs after the exit drain and the pass after it, right before the exit (the shard claims' release). */
+export function addReleaseStep(step: StopStep): void {
+  releaseSteps.push(step);
+}
+
+/**
+ * The bot process's one stop: SIGTERM and SIGINT run the stop steps, the final steps, the exit drain, the release
+ * steps, then exit; a step that throws still exits.
+ */
+export function installStopHandler(): void {
+  if (stopRunner) return;
+  stopRunner = stopHandler(async () => {
+    try {
+      await runSteps(stopSteps);
+      finalStepsRan = true;
+      await runSteps(finalStopSteps.splice(0));
+      await drainForExit(getWorkingSet() ? 30000 : 5000);
+      if (runAfterDrainSteps()) await drainUntilSettled(Date.now() + AFTER_DRAIN_BOUND_MS, { at: Date.now(), landed: landedFlushes() }, true);
+      await runSteps(releaseSteps);
+    } catch (error) {
+      console.error('[Data] A stop step failed; the bot process exits:', error);
+    } finally {
+      process.exit(stopExitCode);
+    }
+  });
+  process.on('SIGTERM', () => void stopRunner?.());
+  process.on('SIGINT', () => void stopRunner?.());
+}
+
+/** Starts the stop as a signal would; deposed: another process took the lock, so the exit code is EXIT_DEPOSED. */
+export function beginStop(deposed = false): Promise<void> {
+  if (deposed && !stopBegun) stopExitCode = EXIT_DEPOSED;
+  return stopRunner ? stopRunner() : Promise.resolve();
+}
+
+// The web UI process installs the shared gate (none in the bot process): outside a change it applies itself, every
+// file write of that process is refused, sessions excepted. A process another one deposed closes every shared write.
+let sharedWriteGate: (() => boolean) | null = null;
+let sharedWritesLost = false;
+const SESSIONS_DIR = path.resolve(DATA_ROOT, '_sessions') + path.sep;
+
+export function setSharedWriteGate(gate: (() => boolean) | null): void {
+  sharedWriteGate = gate;
+}
+
+/** The web UI's gate is installed and closed here: this context is outside a change the web UI applies itself. */
+export function sharedWritesGatedHere(): boolean {
+  return sharedWriteGate !== null && !sharedWriteGate();
+}
+
+/** Another process took the data files' lock: every shared write of this process is refused from now on. */
+export function closeSharedWritesLost(): void {
+  sharedWritesLost = true;
+}
+
+/** The deposed web UI took the lock again. */
+export function reopenSharedWrites(): void {
+  sharedWritesLost = false;
+}
+
+export function sharedWritesClosedLost(): boolean {
+  return sharedWritesLost;
+}
+
+/** Whether a write of this path is a shared-file write (every file write but a session's). */
+export function isSharedPath(absPath: string): boolean {
+  return !path.resolve(absPath).startsWith(SESSIONS_DIR);
+}
+
+/** The cause the shared gate refuses this path with, or null when it passes. */
+function sharedRefusal(absPath: string): 'writer-lost' | 'not-ready' | null {
+  if (!isSharedPath(absPath)) return null;
+  if (sharedWritesLost) {
+    console.error(`[Data] Write of ${absPath} refused: another process took the data files`);
+    return 'writer-lost';
+  }
+  if (sharedWriteGate && !sharedWriteGate()) {
+    console.error(`[Data] Write of ${absPath} refused: the web UI process writes data files only inside a change it applies itself (the bot process applies writes while it runs)`);
+    return 'not-ready';
+  }
+  return null;
+}
+
+const writerTakeSteps: Array<() => void> = [];
+
+/** A step run at every take of the writer lock from depth 0: what this process knew of a shared file may be stale. */
+export function onWriterTake(step: () => void): void {
+  writerTakeSteps.push(step);
+}
+
+/** Clears what this process knows of the shared files' contents; run by the writer lock at each take. */
+export function forgetSharedFileKnowledge(): void {
+  forgetAppendTails();
+  for (const step of writerTakeSteps) {
+    try {
+      step();
+    } catch (error) {
+      console.error('[Data] A writer-take step failed:', error);
+    }
+  }
 }
 
 /**
@@ -591,6 +751,11 @@ export function writeRawAtomic(absPath: string, contents: string): boolean {
     throw new DataBackendUnavailableError('node-stopping');
   }
   if (isGuildDataPath(absPath)) refuseWhileGated();
+  const shared = sharedRefusal(absPath);
+  if (shared) {
+    recordRefusal(shared, `file:${absPath}`);
+    return false;
+  }
   const accepted = writeRawAtomicFile(absPath, contents);
   if (accepted) recordTicket(fileTicket(absPath), `file:${absPath}`);
   else recordRefusal(lastRawRefusal() ?? 'io', `file:${absPath}`);
@@ -604,6 +769,11 @@ export function deleteRawAtomic(absPath: string): boolean {
     throw new DataBackendUnavailableError('node-stopping');
   }
   if (isGuildDataPath(absPath)) refuseWhileGated();
+  const shared = sharedRefusal(absPath);
+  if (shared) {
+    recordRefusal(shared, `file:${absPath}`);
+    return false;
+  }
   const accepted = deleteRawAtomicFile(absPath);
   // A delete still queued for the path has not landed: it answers for this one.
   if (accepted || getPending(absPath)?.op === 'delete') recordTicket(fileTicket(absPath), `file:${absPath}`);
@@ -674,7 +844,7 @@ export function loadData<T = any>(
 export type WriteTicket = WsTicket | FileTicket;
 
 /** Why a write was refused without a throw: its guild's working set is not ready (or not in this process), or storage failed. */
-export type WriteRefusal = 'not-ready' | 'io';
+export type WriteRefusal = 'not-ready' | 'io' | 'writer-lost';
 
 export type SaveTracked = { outcome: 'saved'; ticket: WriteTicket } | { outcome: 'frozen' } | { outcome: 'refused'; cause: WriteRefusal };
 export type AppendTracked = { outcome: 'appended'; ticket: WriteTicket } | { outcome: 'frozen' } | { outcome: 'refused'; cause: WriteRefusal };
@@ -769,6 +939,8 @@ function acceptSave<T>(filename: string, options: DataOptions, data: T): SaveTra
     const dir = getDataDirectory(options);
     const filePath = getDataFilePath(filename, options);
     const scope = options.scope || 'guild';
+    const shared = sharedRefusal(filePath);
+    if (shared) return { outcome: 'refused', cause: shared };
 
     // Ensure the dir synchronously so the guild dir exists the moment the save
     // is accepted.
@@ -942,6 +1114,8 @@ function acceptAppend(filename: string, options: DataOptions, line: string): App
     const dir = getDataDirectory(options);
     const filePath = getDataFilePath(filename, options);
     const scope = options.scope || 'guild';
+    const shared = sharedRefusal(filePath);
+    if (shared) return { outcome: 'refused', cause: shared };
     ensureDirectory(dir);
 
     enqueueAppend(filePath, line);
@@ -1027,6 +1201,8 @@ function acceptDelete(filename: string, options: DataOptions): DeleteTracked {
       throw result === 'fenced' ? new DataBackendUnavailableError('guild-fenced') : ws.refusal();
     }
     const filePath = getDataFilePath(filename, options);
+    const shared = sharedRefusal(filePath);
+    if (shared) return { outcome: 'refused', cause: shared };
 
     const pending = getPending(filePath);
     const existsNow = existsOnDisk(filePath);
@@ -1105,9 +1281,14 @@ export async function deleteGuildNamespace(guildId: string, reason: string, flus
 
   await flushGuild(guildId);
   refuseGuildChangeInMaintenance();
+  if (sharedWritesLost) {
+    recordRefusal('writer-lost', guildId);
+    console.error(`[DataManager] Cannot retire guild ${guildId}: another process took the data files; nothing was removed`);
+    return false;
+  }
   dropPendingForGuild(guildId);
 
-  return graveyardGuildDir(guildId, reason);
+  return graveyardGuildDir(guildId, reason, sharedWritesClosedLost);
 }
 
 /**
@@ -1150,8 +1331,12 @@ export async function restoreGuildFromGraveyard(guildId: string, retiredAt?: num
     if (res.reason === 'schema-mismatch') return { ok: false, error: 'the database holds another schema version than this bot reads; nothing was restored' };
     throw new DataBackendUnavailableError('database-unreachable');
   }
-  return restoreGuildDirFromGraveyard(guildId, retiredAt);
+  const restored = await restoreGuildDirFromGraveyard(guildId, retiredAt, sharedWritesClosedLost, WRITER_LOST_RESTORE_TEXT);
+  if (!restored.ok && restored.error === WRITER_LOST_RESTORE_TEXT) recordRefusal('writer-lost', guildId);
+  return restored;
 }
+
+const WRITER_LOST_RESTORE_TEXT = "Another process took over the bot's data files, so nothing was restored. Please try again in a moment.";
 
 /**
  * Helper: Load guild-scoped data

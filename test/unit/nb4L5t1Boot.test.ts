@@ -87,15 +87,16 @@ describe('what the boot installs', () => {
     expect(process.listeners('unhandledRejection')).toContain(guardRejection);
   });
 
-  it('an IPC listener that answers a data read with the maintenance refusal', async () => {
+  it('an IPC listener that answers a data read with the maintenance refusal (beside the shared-op listener)', async () => {
     (process as { send?: unknown }).send = () => true;
     const before = process.listeners('message');
     try {
       await bootNoShard('hook');
       const added = process.listeners('message').filter(listener => !before.includes(listener));
-      expect(added).toHaveLength(1);
-      (added[0] as (message: unknown) => void)({ type: 'data:guild-read', requestId: 'r1' });
+      expect(added).toHaveLength(2);
+      for (const listener of added) (listener as (message: unknown) => void)({ type: 'data:guild-read', requestId: 'r1' });
       await vi.waitFor(() => expect(sent.some(m => m.requestId === 'r1')).toBe(true));
+      expect(sent.filter(m => m.requestId === 'r1')).toHaveLength(1);
       expect(sent.find(m => m.requestId === 'r1')).toStrictEqual({
         requestId: 'r1',
         data: { ok: false, code: 'maintenance', error: 'the bot is in maintenance' },
@@ -109,10 +110,15 @@ describe('what the boot installs', () => {
 });
 
 describe('IPC answers in a maintenance boot', () => {
-  it.each(['data:guild-read', 'data:global-read'])('%s is refused as a data read, with no success field', async type => {
+  it('data:guild-read is refused as a data read, with no success field', async () => {
     await bootNoShard('hook');
-    const reply = await handleMaintenanceIpc({ type, requestId: 'q' });
+    const reply = await handleMaintenanceIpc({ type: 'data:guild-read', requestId: 'q' });
     expect(reply).toStrictEqual({ requestId: 'q', data: { ok: false, code: 'maintenance', error: 'the bot is in maintenance' } });
+  });
+
+  it('data:global-read is left to the shared handler, which answers it with the same refusal (NB10)', async () => {
+    await bootNoShard('hook');
+    expect(await handleMaintenanceIpc({ type: 'data:global-read', requestId: 'q' })).toBeNull();
   });
 });
 

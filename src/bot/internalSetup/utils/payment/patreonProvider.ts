@@ -25,6 +25,7 @@
  */
 
 import * as crypto from 'crypto';
+import { PROVIDER_FETCH_MS } from './paymentTypes';
 import { loadCredentials } from '@/utils/envLoader';
 import type {
   PaymentProvider,
@@ -229,6 +230,7 @@ export class PatreonProvider implements PaymentProvider {
     const redirectUri = `${c.WEBUI_BASE_URL}/guild/api/subscriptions/patreon/callback`;
 
     const tokenRes = await fetch(PATREON_TOKEN, {
+      signal: AbortSignal.timeout(PROVIDER_FETCH_MS),
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({
@@ -247,6 +249,7 @@ export class PatreonProvider implements PaymentProvider {
     // happens to support multiple creators would match against any tier
     // id, ignoring which creator is being checked.
     const identityRes = await fetch(`${PATREON_API}/identity?include=memberships,memberships.currently_entitled_tiers,memberships.campaign&fields[member]=patron_status,currently_entitled_amount_cents`, {
+      signal: AbortSignal.timeout(PROVIDER_FETCH_MS),
       headers: { 'Authorization': `Bearer ${tokenJson.access_token}` },
     });
     if (!identityRes.ok) throw new Error(`Patreon identity fetch failed: ${identityRes.status}`);
@@ -317,6 +320,7 @@ export class PatreonProvider implements PaymentProvider {
     const c = loadCredentials();
     if (!c.PATREON_CREATOR_ACCESS_TOKEN) return null;
     const res = await fetch(`${PATREON_API}${path}`, {
+      signal: AbortSignal.timeout(PROVIDER_FETCH_MS),
       method,
       headers: { 'Authorization': `Bearer ${c.PATREON_CREATOR_ACCESS_TOKEN}` },
     });

@@ -15,6 +15,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import type { PaymentProvider, ProviderEvent } from './paymentTypes';
 import { isMaintenanceBoot } from '../maintenanceGate';
+import { sharedWritesGatedHere } from '../dataManager';
 
 // The web-UI (parent) forks the bot (child) and sets BOT_PROCESS_ROLE=bot on
 // the child's env. Both processes import this registry and auto-register
@@ -27,6 +28,8 @@ function isTickerOwner(): boolean {
 
 export class PaymentProviderRegistry extends EventEmitter {
   private providers = new Map<string, PaymentProvider>();
+  /** startTickers() ran: a provider registered from now on starts at once. */
+  private tickersStarted = false;
 
   register(provider: PaymentProvider): void {
     const existing = this.providers.get(provider.id);
@@ -37,9 +40,19 @@ export class PaymentProviderRegistry extends EventEmitter {
       }
     }
     this.providers.set(provider.id, provider);
-    if (provider.start && isTickerOwner()) {
-      try { provider.start(); } catch (err) { console.error(`[PaymentRegistry] start() failed for '${provider.id}':`, err); }
-    }
+    if (this.tickersStarted) this.startOne(provider);
+  }
+
+  /** Starts every registered provider's tick, and every one registered later; the bot calls it once it has its Discord client. */
+  startTickers(): void {
+    if (!isTickerOwner()) return;
+    this.tickersStarted = true;
+    for (const provider of this.providers.values()) this.startOne(provider);
+  }
+
+  private startOne(provider: PaymentProvider): void {
+    if (!provider.start || !isTickerOwner()) return;
+    try { provider.start(); } catch (err) { console.error(`[PaymentRegistry] start() failed for '${provider.id}':`, err); }
   }
 
   unregister(providerId: string): boolean {
@@ -65,6 +78,9 @@ export class PaymentProviderRegistry extends EventEmitter {
 
   /** Providers call this to push lifecycle events into the bus. */
   emitEvent(event: ProviderEvent): void {
+    if (sharedWritesGatedHere()) {
+      throw new Error(`[Data] A payment event (${event.type}) was raised in the web UI process outside a change it applies; the bot process handles payment events while it runs`);
+    }
     this.emit('provider.event', event);
   }
 

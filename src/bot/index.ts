@@ -45,6 +45,24 @@ if (isProd) {
 // Load environment variables
 import 'dotenv/config';
 
-// Import the client initializer to start the bot.
-// This will scan for events and commands, create the Discord client with required intents, and log in.
-import './internalSetup/clientInitializer';
+import { beginStop, installStopHandler } from './internalSetup/utils/dataManager';
+import { configureWriterLock, onDeposed, releaseWriterLockAtExit, reportWriterStage, takeWriterLockForBoot } from './internalSetup/utils/writerLock';
+
+// Every writer of the data files runs after the writer lock is taken: clientInitializer loads only then.
+async function boot(): Promise<void> {
+  configureWriterLock('bot');
+  await takeWriterLockForBoot();
+  installStopHandler();
+  process.on('exit', () => releaseWriterLockAtExit());
+  onDeposed(holder => {
+    reportWriterStage('deposed', { holder: { role: holder.role ?? null, pid: holder.pid } });
+    // After every deposition listener of this synchronous run.
+    void Promise.resolve().then(() => beginStop(true));
+  });
+  await import('./internalSetup/clientInitializer');
+}
+
+boot().catch(error => {
+  console.error('[Main] The bot process could not start:', error);
+  process.exit(1);
+});

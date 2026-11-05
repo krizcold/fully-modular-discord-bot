@@ -2,7 +2,7 @@
  * Premium notifications dispatch wrapper.
  *
  * PremiumManager runs in both the bot process and the forked web-UI process
- * (each has its own in-memory state, synced via mtime-checked file reload).
+ * (each has its own in-memory cache of premium-tiers.json).
  * Notifications need the Discord client which only the bot has, so this
  * thin wrapper routes by process role:
  *

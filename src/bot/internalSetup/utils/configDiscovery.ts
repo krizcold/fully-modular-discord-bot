@@ -36,7 +36,7 @@ const GLOBAL_SCAN_EXCLUDES = new Set(['appstore', 'payment-providers']);
  * a raw JSON edit would break, so the Config surfaces neither list nor write
  * them (routes/config.ts refuses them by this list).
  */
-export const CORE_OWNED_GLOBAL_FILES: ReadonlySet<string> = new Set(['premium-tiers.json', 'premium-tiers.audit.jsonl', 'persistent-panels.json']);
+export const CORE_OWNED_GLOBAL_FILES: ReadonlySet<string> = new Set(['premium-tiers.json', 'premium-tiers.audit.jsonl', 'premium-tiers.events.jsonl', 'persistent-panels.json']);
 
 export function isCoreOwnedGlobalFile(fileId: string): boolean {
   return CORE_OWNED_GLOBAL_FILES.has(fileId);

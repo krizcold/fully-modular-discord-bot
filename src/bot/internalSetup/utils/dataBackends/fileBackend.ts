@@ -39,6 +39,8 @@ export type PendingOp =
 const pendingOps = new Map<string, PendingOp>();
 const flushing = new Set<string>();
 const scheduled = new Set<string>();
+/** Paths a deposition's cancel holds: no flush of them starts. */
+const frozen = new Set<string>();
 let opSeq = 0;
 // Per path a ticket was issued for, while an op is queued for it: the seq of
 // the last op that landed, so an op at or below it landed itself or was
@@ -48,6 +50,12 @@ export interface LandingRecord {
   landed: number;
 }
 const landingRecords = new Map<string, LandingRecord>();
+/** Landing records whose queued op a deposition cancelled: their tickets are known not saved. */
+const droppedAtDeposition = new WeakSet<LandingRecord>();
+
+export function droppedByDeposition(record: LandingRecord): boolean {
+  return droppedAtDeposition.has(record);
+}
 
 // The landed op's tickets hold the record its path had when the flush began,
 // which a drop may have retired since, or else one a ticket made meanwhile.
@@ -64,6 +72,35 @@ export function fileLandingRecords(): number {
 // write held through a disk fault lands once the disk takes it.
 const retryAttempts = new Map<string, number>();
 const retryTimers = new Map<string, NodeJS.Timeout>();
+/** The errno of each path's last failed flush, until one lands. */
+const lastFlushErrno = new Map<string, string>();
+/** Paths this process knows end with a newline: an append of its own landed there since its last writer lock take. */
+const newlineTails = new Set<string>();
+const NEWLINE = String.fromCharCode(10);
+
+/** Forgets every path's known tail (another writer may have cut a line since). */
+export function forgetAppendTails(): void {
+  newlineTails.clear();
+}
+
+async function lastByteIsNewline(absPath: string): Promise<boolean> {
+  let fh: fs.promises.FileHandle;
+  try {
+    fh = await fs.promises.open(absPath, 'r');
+  } catch (error: any) {
+    if (error?.code === 'ENOENT') return true;
+    throw error;
+  }
+  try {
+    const { size } = await fh.stat();
+    if (size === 0) return true;
+    const buf = Buffer.alloc(1);
+    await fh.read(buf, 0, 1, size - 1);
+    return buf[0] === 0x0a;
+  } finally {
+    await fh.close();
+  }
+}
 
 // Writes held only in memory are bounded: past either bound new writes are
 // refused until the disk takes writes again and the held bytes fall below half.
@@ -153,7 +190,7 @@ function delay(ms: number): Promise<void> {
 
 /** True once this call's op landed. */
 async function flushPath(absPath: string): Promise<boolean> {
-  if (flushing.has(absPath)) return false;
+  if (flushing.has(absPath) || frozen.has(absPath)) return false;
   const entry = pendingOps.get(absPath);
   if (!entry) {
     failingSince.delete(absPath);
@@ -179,7 +216,11 @@ async function flushPath(absPath: string): Promise<boolean> {
         await fs.promises.mkdir(path.dirname(absPath), { recursive: true });
         const flushed = entry.content; // snapshot before the await
         const flushedSeq = entry.seq;
-        await fs.promises.appendFile(absPath, flushed, 'utf-8');
+        const lead = newlineTails.has(absPath) || await lastByteIsNewline(absPath) ? '' : NEWLINE;
+        newlineTails.delete(absPath);
+        await fs.promises.appendFile(absPath, lead + flushed, 'utf-8');
+        if (flushed.endsWith(NEWLINE)) newlineTails.add(absPath);
+        lastFlushErrno.delete(absPath);
         noteLanded(absPath, record, flushedSeq);
         // A concurrent append may have grown the entry mid-flush; keep the tail.
         // An op that replaced the entry meanwhile is flushed next, untrimmed.
@@ -202,6 +243,8 @@ async function flushPath(absPath: string): Promise<boolean> {
         return true; // bypass the generic seq-drop below (only correct for write/delete)
       }
     } catch (error) {
+      newlineTails.delete(absPath);
+      lastFlushErrno.set(absPath, String((error as { code?: unknown } | null)?.code ?? 'EIO'));
       flushFailures += 1;
       if (!failingSince.has(absPath)) failingSince.set(absPath, performance.now());
       console.error(`[DataManager] Flush failed for ${absPath} (will retry):`, error);
@@ -212,6 +255,8 @@ async function flushPath(absPath: string): Promise<boolean> {
     lastLandedAt = performance.now();
     retryAttempts.delete(absPath);
     failingSince.delete(absPath);
+    lastFlushErrno.delete(absPath);
+    newlineTails.delete(absPath);
     noteLanded(absPath, record, seqAtStart);
     // Drop the entry only if no newer op arrived while we were flushing.
     const current = pendingOps.get(absPath);
@@ -261,6 +306,55 @@ async function flushPaths(paths: string[]): Promise<void> {
  */
 export async function flushAll(): Promise<void> {
   await flushPaths([...pendingOps.keys()]);
+}
+
+export type CancelOutcome = { path: string; outcome: 'landed' } | { path: string; outcome: 'cancelled'; errno: string | null };
+
+/**
+ * Drops these paths' queued ops: waits until no flush of them is on the wire, then answers per path 'landed' when its
+ * last op landed meanwhile, or 'cancelled' once it deleted the pending entry and cleared its retry, with the errno of
+ * the path's last failed flush. With freeze (a deposition), no new flush of these paths starts from the call on: a
+ * path not on the wire is cancelled at once, and one on the wire is awaited and then cancelled or answered landed.
+ */
+export async function cancelQueued(paths: string[], sleep: (ms: number) => Promise<void> = delay, options: { freeze?: boolean } = {}): Promise<CancelOutcome[]> {
+  const targets = new Map(paths.map(p => [p, pendingOps.get(p)?.seq]));
+  // Each target's landing record from the start: an entry gone at the cancel landed only if the record reached its seq.
+  const records = new Map<string, LandingRecord>();
+  for (const p of paths) {
+    if (!pendingOps.has(p)) continue;
+    let record = landingRecords.get(p);
+    if (!record) {
+      record = { landed: 0 };
+      landingRecords.set(p, record);
+    }
+    records.set(p, record);
+  }
+  const cancel = (p: string): CancelOutcome => {
+    const entry = pendingOps.get(p);
+    const seq = targets.get(p);
+    if (seq === undefined) return { path: p, outcome: 'landed' };
+    if (!entry) return (records.get(p)?.landed ?? 0) >= seq ? { path: p, outcome: 'landed' } : { path: p, outcome: 'cancelled', errno: null };
+    const errno = lastFlushErrno.get(p) ?? null;
+    pendingOps.delete(p);
+    const record = landingRecords.get(p);
+    if (options.freeze && record) droppedAtDeposition.add(record);
+    landingRecords.delete(p);
+    clearRetry(p);
+    lastFlushErrno.delete(p);
+    return { path: p, outcome: 'cancelled', errno };
+  };
+  const early = new Map<string, CancelOutcome>();
+  const held = options.freeze ? paths.filter(p => !frozen.has(p)) : [];
+  if (options.freeze) {
+    for (const p of held) frozen.add(p);
+    for (const p of paths) if (!flushing.has(p)) early.set(p, cancel(p));
+  }
+  try {
+    while (paths.some(p => flushing.has(p))) await sleep(5);
+    return paths.map(p => early.get(p) ?? cancel(p));
+  } finally {
+    for (const p of held) frozen.delete(p);
+  }
 }
 
 /** Files with a write, delete or append still queued; an entry stays until its flush lands. */
@@ -355,6 +449,7 @@ function refuseWhileStorageFails(absPath: string): void {
 
 export function enqueueWrite(absPath: string, content: string): void {
   refuseWhileStorageFails(absPath);
+  newlineTails.delete(absPath);
   pendingOps.set(absPath, { op: 'write', content, seq: ++opSeq });
   scheduleFlush(absPath);
 }
@@ -378,6 +473,7 @@ export function enqueueAppend(absPath: string, line: string): void {
 
 export function enqueueDelete(absPath: string): void {
   refuseWhileStorageFails(absPath);
+  newlineTails.delete(absPath);
   pendingOps.set(absPath, { op: 'delete', seq: ++opSeq });
   scheduleFlush(absPath);
 }
@@ -556,7 +652,7 @@ export function dropPendingForGuild(guildId: string): void {
  * Rename /data/{guildId} under _graveyard and write a .graveyard.json reason
  * marker inside. The facade drains and drops pending state first.
  */
-export async function graveyardGuildDir(guildId: string, reason: string): Promise<boolean> {
+export async function graveyardGuildDir(guildId: string, reason: string, writerLost: () => boolean = () => false): Promise<boolean> {
   const src = path.join(BASE_DATA_DIR, guildId);
   // A retry on the wire when the guild's writes were dropped would re-create
   // the dir beside its graveyard copy: it settles first (bounded).
@@ -567,6 +663,10 @@ export async function graveyardGuildDir(guildId: string, reason: string): Promis
   const dest = path.join(graveyardRoot, `${guildId}-${Date.now()}`);
 
   for (let attempt = 0; ; attempt++) {
+    if (writerLost()) {
+      console.error(`[DataManager] Cannot move ${guildId} to graveyard: another process took the data files; nothing was removed`);
+      return false;
+    }
     try {
       await fs.promises.rename(src, dest);
       break;
@@ -629,7 +729,7 @@ export async function listGraveyardEntries(): Promise<FileGraveyardEntry[]> {
  * dir exists or no matching entry is found (returned as {ok:false}); an actual
  * rename failure throws so callers can tell refusal from IO error.
  */
-export async function restoreGuildDirFromGraveyard(guildId: string, retiredAt?: number): Promise<{ ok: boolean; error?: string }> {
+export async function restoreGuildDirFromGraveyard(guildId: string, retiredAt?: number, writerLost: () => boolean = () => false, lostText = 'another process took the data files; nothing was restored'): Promise<{ ok: boolean; error?: string }> {
   if (guildDirExists(guildId)) {
     return { ok: false, error: 'live guild data exists; delete it before restoring' };
   }
@@ -644,6 +744,10 @@ export async function restoreGuildDirFromGraveyard(guildId: string, retiredAt?: 
   }
   if (!entryName) return { ok: false, error: 'no graveyard entry for this guild' };
   const dest = path.join(BASE_DATA_DIR, guildId);
+  if (writerLost()) {
+    console.error(`[DataManager] Cannot restore guild ${guildId} from the graveyard: another process took the data files`);
+    return { ok: false, error: lostText };
+  }
   await fs.promises.rename(path.join(graveyardRoot, entryName), dest);
   await fs.promises.rm(path.join(dest, '.graveyard.json'), { force: true }).catch(() => { /* marker cleanup is best-effort */ });
   console.warn(`[DataManager] Guild ${guildId} restored from graveyard entry ${entryName}`);

@@ -23,6 +23,7 @@
  * and is not exposed.
  */
 
+import { PROVIDER_FETCH_MS } from './paymentTypes';
 import { loadCredentials } from '@/utils/envLoader';
 import { getPaymentRegistry } from './paymentRegistry';
 import type {
@@ -358,7 +359,7 @@ export class DiscordProvider implements PaymentProvider {
     };
     if (body) init.body = JSON.stringify(body);
 
-    const res = await fetch(url, init);
+    const res = await fetch(url, { ...init, signal: AbortSignal.timeout(PROVIDER_FETCH_MS) });
     if (res.status === 204) return null;
     const text = await res.text();
     let parsed: any = null;

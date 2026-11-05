@@ -489,3 +489,6 @@ export interface PaymentProvider {
   /** Called when the provider is unregistered / process shutting down. */
   stop?(): void;
 }
+
+/** Every provider API call ends within this bound, so a premium change waits on no call for ever. */
+export const PROVIDER_FETCH_MS = 30_000;

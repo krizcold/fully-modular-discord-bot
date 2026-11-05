@@ -27,12 +27,40 @@
  * Files:
  *   /data/global/premium-tiers.json        - PremiumConfig
  *   /data/global/premium-tiers.audit.jsonl - append-only audit log
+ *   /data/global/premium-tiers.events.jsonl - provider events the bot kept while premium-tiers.json
+ *                                           could not be read, until eventsApplied covers them
  */
 
 import fs from 'fs';
 import * as crypto from 'crypto';
 import { dataPath } from '../../../utils/dataRoot';
-import { appendData, flushAll, readRaw, saveGlobalData } from './dataManager';
+import {
+  addAfterDrainStep,
+  addFinalStopStep,
+  appendDataTracked,
+  DataBackendUnavailableError,
+  deleteDataTracked,
+  onWriterTake,
+  readRawStrict,
+  saveDataTracked,
+  sharedWritesClosedLost,
+} from './dataManager';
+import { confirmFile, enqueueAppend, fileTicket, type FileTicket } from './dataBackends/fileBackend';
+import {
+  currentLedger,
+  isPaymentLedger,
+  landed,
+  markRetried,
+  outsideLedgers,
+  paymentOpOf,
+  recordRefusal,
+  recordTicket,
+  runSealed,
+  type LedgerCause,
+  type WriteLedger,
+} from './dataBackends/writeLedger';
+import { deposedHolder, onDeposed, writerLockDepth } from './writerLock';
+import type { NotificationPayload, NotificationType, NotifyOutcome } from './subscriptionNotifier';
 import type { HardLimitOverride } from '../../types/settingsTypes';
 import {
   loadGlobalModuleConfig,
@@ -263,6 +291,8 @@ export interface PremiumConfig {
    * compliance burden. Toggleable in the admin UI with a confirmation.
    */
   migrationSilencePolicy: 'cancel' | 'continue';
+  /** Per writer of premium-tiers.events.jsonl, the highest line number whose event this file holds. */
+  eventsApplied?: Record<string, number>;
 }
 
 // ============================================================================
@@ -524,6 +554,200 @@ function moduleOverrideRedundantVsFree(
 // MANAGER
 // ============================================================================
 
+const JOURNAL_FILE = 'premium-tiers.events.jsonl';
+const JOURNAL_PATH = dataPath('global', JOURNAL_FILE);
+/** The documents the facade names these files by in a ledger's refusals. */
+const PREMIUM_DOC = 'global:/premium-tiers.json';
+const AUDIT_DOC = 'global:/premium-tiers.audit.jsonl';
+const LOAD_RETRY_MS = 5_000;
+const RETRY_FIRST_MS = 1_000;
+const RETRY_MAX_MS = 60_000;
+const WATCH_IDLE_MS = 1_000;
+const CONFIRM_MS = 8_000;
+/** This process's writer id in the event journal, and the count of the events it journaled. */
+let writerId = crypto.randomUUID();
+let journalSeq = 0;
+let tickersStarted = false;
+
+function defaultConfig(): PremiumConfig {
+  return JSON.parse(JSON.stringify(DEFAULT_CONFIG));
+}
+
+function normalizeConfig(loaded: Partial<PremiumConfig>): PremiumConfig {
+  const mergedTiers: Record<string, PremiumTier> = {};
+  for (const [id, t] of Object.entries(loaded.tiers || {})) {
+    const tier = t as any;
+    mergedTiers[id] = {
+      displayName: tier.displayName,
+      priority: tier.priority,
+      overrides: tier.overrides || {},
+      offerings: (Array.isArray(tier.offerings) ? tier.offerings : []).map(normalizeOffering),
+    };
+  }
+  // Force the free tier to exist with correct invariants.
+  mergedTiers.free = {
+    displayName: mergedTiers.free?.displayName || 'Free',
+    priority: 0,
+    overrides: mergedTiers.free?.overrides || {},
+    offerings: [],
+  };
+
+  // Normalize each guild's subscription record into the new shape.
+  const subscriptions: Record<string, GuildSubscriptions> = {};
+  for (const [guildId, raw] of Object.entries(loaded.subscriptions || {})) {
+    const r = raw as any;
+    const active = r?.active ? normalizeSubscription(r.active) : null;
+    const pausedRaw = Array.isArray(r?.paused) ? r.paused : [];
+    const paused = pausedRaw
+      .map(normalizeSubscription)
+      .filter((s: Subscription | null): s is Subscription => !!s);
+    const notificationsChannelId = typeof r?.notificationsChannelId === 'string' && r.notificationsChannelId.length > 0
+      ? r.notificationsChannelId
+      : undefined;
+    if (active || paused.length > 0 || notificationsChannelId) {
+      subscriptions[guildId] = {
+        ...(active ? { active } : {}),
+        paused,
+        ...(notificationsChannelId ? { notificationsChannelId } : {}),
+      };
+    }
+  }
+
+  const eventsApplied: Record<string, number> = {};
+  if (loaded.eventsApplied && typeof loaded.eventsApplied === 'object') {
+    for (const [writer, n] of Object.entries(loaded.eventsApplied)) {
+      if (typeof n === 'number' && Number.isFinite(n)) eventsApplied[writer] = n;
+    }
+  }
+
+  return {
+    tiers: mergedTiers,
+    subscriptions,
+    messages: { ...DEFAULT_MESSAGES, ...(loaded.messages || {}) },
+    providerAccountLinks: loaded.providerAccountLinks || {},
+    activatedProviders: loaded.activatedProviders || {},
+    migrations: Array.isArray(loaded.migrations) ? loaded.migrations : [],
+    migrationSilencePolicy: (loaded.migrationSilencePolicy === 'continue' ? 'continue' : 'cancel'),
+    ...(Object.keys(eventsApplied).length > 0 ? { eventsApplied } : {}),
+  };
+}
+
+export type StopKind = 'stopping' | 'deposed';
+
+export const stopCause = (kind: StopKind): LedgerCause => (kind === 'deposed' ? 'writer-lost' : 'node-stopping');
+export const stopWords = (kind: StopKind): string => (kind === 'deposed' ? 'another process took the data files' : 'the bot is stopping');
+const lostWords = (kind: StopKind): string => (kind === 'deposed' ? 'lost: another process took the data files' : 'lost with this stop');
+const beforeWords = (kind: StopKind): string => (kind === 'deposed' ? 'before another process took the data files' : 'before this stop');
+export const isBotProcess = (): boolean => process.env.BOT_PROCESS_ROLE === 'bot';
+
+export function errnoOf(error: unknown): string {
+  const code = (error as { code?: unknown } | null)?.code;
+  if (typeof code === 'string') return code;
+  return error instanceof Error ? error.message : String(error);
+}
+
+/** A cache the bot process stops at its final stop step and at a deposition (decisions 12 and 20 of NB10). */
+export interface StoppableCache {
+  finalStop(): void;
+  markStopped(kind: StopKind): void;
+  logLossesAtExit?(): void;
+}
+
+const stopTargets = new Set<StoppableCache>();
+let processHooksInstalled = false;
+
+export function registerCacheStop(target: StoppableCache): void {
+  stopTargets.add(target);
+  addFinalStopStep(() => target.finalStop());
+  if (deposedHolder()) target.markStopped('deposed');
+  if (processHooksInstalled) return;
+  processHooksInstalled = true;
+  onDeposed(() => {
+    for (const t of stopTargets) t.markStopped('deposed');
+  });
+  process.on('exit', () => {
+    for (const t of stopTargets) {
+      try {
+        t.logLossesAtExit?.();
+      } catch (error) {
+        console.error('[PremiumManager] Could not log what this stop loses:', error);
+      }
+    }
+  });
+}
+
+export function unregisterCacheStop(target: StoppableCache): void {
+  stopTargets.delete(target);
+}
+
+/** Where a subscription's subscription.install.paid line stands (decision 13 of NB10). */
+interface InstallLine {
+  state: 'buffered' | 'held' | 'queued' | 'landed';
+  ticket?: FileTicket;
+  /** Taken once, when the line was first built: a payment.webhook op's provider delivers it again after a 503. */
+  webhook: boolean;
+  line: string;
+  entry: AuditEntry;
+  providerSubId?: string;
+}
+
+interface PendingLine {
+  line: string;
+  entry: AuditEntry;
+  install?: InstallLine;
+  ticket?: FileTicket;
+}
+
+interface JournalEntry {
+  writer: string;
+  n: number;
+  event: ProviderEvent;
+  /** The file that could not be read when the event arrived. */
+  file: string;
+  ticket?: FileTicket;
+}
+
+type JournalLine = { writer: string; n: number; event: ProviderEvent };
+type CancelStep = 'done' | 'gone' | 'not saved';
+
+/** A change to a migration refused while that migration is being applied. */
+export class MigrationBusy extends Error {
+  constructor() {
+    super('This migration is being applied right now, so nothing was changed. Its outcome shows here when the run ends; reload later to see it.');
+  }
+}
+
+/** The journal's lines in file order; a line that does not parse (cut short or damaged) is returned apart. */
+function parseJournal(raw: string): { lines: JournalLine[]; bad: string[] } {
+  const lines: JournalLine[] = [];
+  const bad: string[] = [];
+  for (const text of raw.split('\n')) {
+    if (!text.trim()) continue;
+    let parsed: any;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      bad.push(text);
+      continue;
+    }
+    if (!parsed || typeof parsed.writer !== 'string' || typeof parsed.n !== 'number' || !parsed.event || typeof parsed.event.type !== 'string') {
+      bad.push(text);
+      continue;
+    }
+    lines.push({ writer: parsed.writer, n: parsed.n, event: parsed.event });
+  }
+  return { lines, bad };
+}
+
+function eventWords(event: ProviderEvent): string {
+  return `${event.type} event from ${event.providerId} (subscription ${event.providerSubId}, guild ${event.guildId})`;
+}
+
+const sleepOutside = (ms: number): Promise<void> => new Promise(resolve => {
+  const timer = setTimeout(resolve, ms);
+  timer.unref?.();
+});
+
 export class PremiumManager {
   private config: PremiumConfig;
   /**
@@ -534,17 +758,76 @@ export class PremiumManager {
    * but cheap insurance) gets a fresh notification window.
    */
   private endingSoonNotified: Set<string> = new Set();
+  /** The cache holds a loaded config; lastRaw is the text it was loaded from or last saved as (undefined: not known). */
   private configLoaded = false;
-  private configMtimeMs = 0;
+  private lastRaw: string | null | undefined = undefined;
+  private unreadable: { file: string; cause: string } | null = null;
+  private loggedUnreadable: string | null = null;
+  private loggedRecheck: string | null = null;
+  private lastLoadTry = -Infinity;
+  private episodeFile = 'premium-tiers.json';
   private expiryTimer: NodeJS.Timeout | null = null;
+  private disposed = false;
+  /** Set by the final stop step or a deposition: from then on nothing is written. */
+  private stopped: StopKind | null = null;
+  private saveHeld = false;
+  /** The ticket of the last premium-tiers.json save this cache handed to the disk. */
+  private lastSaveTicket: FileTicket | null = null;
+  /** Migrations being applied: changes to them are refused until the run settles. */
+  private migrating = new Set<string>();
+  private migrationsRunning = false;
+  private heldLines: PendingLine[] = [];
+  private heldCause: LedgerCause = 'io';
+  private retryTimer: NodeJS.Timeout | null = null;
+  private retryDelay = RETRY_FIRST_MS;
+  private passing = false;
+  /** Provider events kept while the cache could not take them, until a landed save's eventsApplied covers them. */
+  private journal: JournalEntry[] = [];
+  private replay: 'waiting' | 'running' | null = null;
+  private replayLedgers = new WeakSet<WriteLedger>();
+  /** Ended replays: whether each raised its marks, and whether it handed an entry kept in memory. */
+  private endedReplays = new WeakMap<WriteLedger, { left: boolean; fromMemory: boolean }>();
+  private replayBuffer: PendingLine[] = [];
+  private replayDropped = false;
+  private replayStarted = false;
+  private replayHanded = 0;
+  private raisedMarks: Record<string, number> | null = null;
+  /** The first premium-tiers.json ticket issued at or after the replay raised its marks. */
+  private marksTicket: FileTicket | null = null;
+  private afterDrainLines: PendingLine[] = [];
+  private installLines = new Map<string, InstallLine>();
+  private installLinesFilled = false;
+  private inFlight = new Map<string, { promise: Promise<void>; ledger: WriteLedger | undefined }>();
 
   /** Listener: mirror provider events into the cache. */
   private paidEventHandler = (event: ProviderEvent): void => {
+    const inReplay = this.inReplay();
+    if (this.stopped && !inReplay) {
+      this.refuseEvent(event, this.stopped);
+      return;
+    }
     this.ensureLoaded();
+    if (!inReplay && isBotProcess() && (this.unreadable || this.replay)) {
+      this.journalEvent(event);
+      return;
+    }
+    this.handleEvent(event);
+  };
 
+  private handleEvent(event: ProviderEvent): void {
     if (event.type === 'subscription.created') {
-      void this.installAsyncSubscription(event).catch(err => {
+      const providerSubId = event.providerSubId;
+      const before = this.inFlight.get(providerSubId);
+      const promise = (async () => {
+        if (before) await before.promise;
+        await this.installAsyncSubscription(event);
+      })().catch(err => {
         console.error('[PremiumManager] installAsyncSubscription failed:', err);
+      });
+      const tracked = { promise, ledger: currentLedger() };
+      this.inFlight.set(providerSubId, tracked);
+      void promise.finally(() => {
+        if (this.inFlight.get(providerSubId) === tracked) this.inFlight.delete(providerSubId);
       });
       return;
     }
@@ -562,7 +845,7 @@ export class PremiumManager {
     // Provider owns the dunning timeline; if it gives up, a separate
     // subscription.expired event fires and triggers the standard expiry path.
     if (event.type === 'subscription.renewal-failed') {
-      void dispatchPremiumNotification(event.guildId, 'paid.sub.renewal-failed', {
+      void this.notify(event.guildId, 'paid.sub.renewal-failed', {
         tierName: this.config.tiers[sub.tierId]?.displayName || sub.tierId,
         providerName: this.providerDisplayName(event.providerId),
         details: event.reason,
@@ -603,7 +886,7 @@ export class PremiumManager {
         subscriptionId: sub.id,
         providerId: event.providerId,
       });
-      void dispatchPremiumNotification(event.guildId, 'paid.sub.expired', {
+      void this.notify(event.guildId, 'paid.sub.expired', {
         tierName: this.config.tiers[sub.tierId]?.displayName || sub.tierId,
         providerName: this.providerDisplayName(event.providerId),
       });
@@ -612,7 +895,16 @@ export class PremiumManager {
     }
 
     this.save();
-  };
+  }
+
+  /** Resolves once no install started under this ledger is in flight (decision 13 of NB10). */
+  async settled(ledger: WriteLedger | undefined): Promise<void> {
+    for (;;) {
+      const open = [...this.inFlight.values()].filter(entry => entry.ledger === ledger).map(entry => entry.promise);
+      if (open.length === 0) return;
+      await Promise.all(open);
+    }
+  }
 
   /**
    * Async install: webhook-driven providers fire `subscription.created` after
@@ -623,7 +915,11 @@ export class PremiumManager {
     event: Extract<ProviderEvent, { type: 'subscription.created' }>,
   ): Promise<void> {
     // Idempotency: webhook deliveries are at-least-once.
-    if (this.findGuildSubscriptionByProviderSubId(event.guildId, event.providerSubId)) return;
+    const existing = this.findGuildSubscriptionByProviderSubId(event.guildId, event.providerSubId);
+    if (existing) {
+      if (isPaymentLedger(currentLedger())) this.confirmRedelivery(event.guildId, existing);
+      return;
+    }
 
     const tier = this.config.tiers[event.tierId];
     if (!tier) {
@@ -679,21 +975,91 @@ export class PremiumManager {
       providerId: event.providerId,
       subscriptionId: sub.id,
       metadata: { variantId: event.variantId },
-    });
-    void dispatchPremiumNotification(event.guildId, 'paid.sub.started', {
+    }, event.providerSubId);
+    void this.notify(event.guildId, 'paid.sub.started', {
       tierName: tier.displayName,
       providerName: this.providerDisplayName(event.providerId),
       endDate: sub.endDate,
     });
   }
 
+  /**
+   * A delivery of a subscription already in the cache, in a payment op: its ledger judges a save of the file that holds
+   * the subscription and the subscription's install line, which it writes when the audit file has none.
+   */
+  private confirmRedelivery(guildId: string, sub: Subscription): void {
+    this.save();
+    let line = this.installLines.get(sub.id);
+    if (!line && !this.installLinesFilled) {
+      if (!this.fillInstallLines()) {
+        recordRefusal('io', AUDIT_DOC);
+        return;
+      }
+      line = this.installLines.get(sub.id);
+    }
+    if (!line) {
+      this.writeAudit({
+        timestamp: new Date().toISOString(),
+        actor: 'admin',
+        action: 'subscription.install.paid',
+        guildId,
+        tierId: sub.tierId,
+        offeringId: sub.offeringId,
+        providerId: sub.providerId,
+        subscriptionId: sub.id,
+        metadata: { variantId: sub.variantId, redelivered: true },
+      }, sub.providerSubId);
+      return;
+    }
+    if (line.state === 'buffered' || line.state === 'held') {
+      recordRefusal(line.state === 'held' ? this.heldCause : 'io', AUDIT_DOC);
+      markRetried(AUDIT_DOC);
+      return;
+    }
+    if (line.state === 'queued' && line.ticket && !landed(line.ticket)) recordTicket(line.ticket);
+  }
+
+  /** Fills installLines from the whole audit file, once per hold of the lock; false when the file cannot be read. */
+  private fillInstallLines(): boolean {
+    let raw: string | null;
+    try {
+      raw = readRawStrict(AUDIT_PATH);
+    } catch (error) {
+      console.error(`[PremiumManager] Cannot read premium-tiers.audit.jsonl (${errnoOf(error)}); the delivery is answered 503 and the next one reads it again`);
+      return false;
+    }
+    for (const text of (raw ?? '').split('\n')) {
+      const trimmed = text.trim();
+      if (!trimmed) continue;
+      let entry: AuditEntry;
+      try {
+        entry = JSON.parse(trimmed);
+      } catch {
+        continue;
+      }
+      if (entry?.action !== 'subscription.install.paid' || typeof entry.subscriptionId !== 'string') continue;
+      if (!this.installLines.has(entry.subscriptionId)) {
+        this.installLines.set(entry.subscriptionId, { state: 'landed', webhook: false, line: `${trimmed}\n`, entry });
+      }
+    }
+    this.installLinesFilled = true;
+    return true;
+  }
+
   constructor() {
-    this.config = JSON.parse(JSON.stringify(DEFAULT_CONFIG));
+    this.config = defaultConfig();
     getPaymentRegistry().on('provider.event', this.paidEventHandler);
+    if (isBotProcess()) {
+      registerCacheStop(this);
+      addAfterDrainStep(() => this.afterDrain());
+    }
   }
 
   dispose(): void {
+    this.disposed = true;
     this.stopExpiryChecker();
+    this.clearRetry();
+    unregisterCacheStop(this);
     getPaymentRegistry().off('provider.event', this.paidEventHandler);
   }
 
@@ -701,101 +1067,209 @@ export class PremiumManager {
   // CONFIG I/O
   // ============================================================================
 
+  /**
+   * Reads premium-tiers.json (and, in the bot, its event journal) and records nothing in the caller's ledger. An
+   * absent file gives the defaults in memory; a file that cannot be read or parsed leaves the cache unreadable.
+   */
   load(): void {
+    this.lastLoadTry = Date.now();
+    let raw: string | null;
     try {
-      const content = readRaw(CONFIG_PATH);
-      if (content !== null) {
-        const loaded = JSON.parse(content) as Partial<PremiumConfig>;
-
-        const mergedTiers: Record<string, PremiumTier> = {};
-        for (const [id, t] of Object.entries(loaded.tiers || {})) {
-          const tier = t as any;
-          mergedTiers[id] = {
-            displayName: tier.displayName,
-            priority: tier.priority,
-            overrides: tier.overrides || {},
-            offerings: (Array.isArray(tier.offerings) ? tier.offerings : []).map(normalizeOffering),
-          };
-        }
-        // Force the free tier to exist with correct invariants.
-        mergedTiers.free = {
-          displayName: mergedTiers.free?.displayName || 'Free',
-          priority: 0,
-          overrides: mergedTiers.free?.overrides || {},
-          offerings: [],
-        };
-
-        // Normalize each guild's subscription record into the new shape.
-        const subscriptions: Record<string, GuildSubscriptions> = {};
-        for (const [guildId, raw] of Object.entries(loaded.subscriptions || {})) {
-          const r = raw as any;
-          const active = r?.active ? normalizeSubscription(r.active) : null;
-          const pausedRaw = Array.isArray(r?.paused) ? r.paused : [];
-          const paused = pausedRaw
-            .map(normalizeSubscription)
-            .filter((s: Subscription | null): s is Subscription => !!s);
-          const notificationsChannelId = typeof r?.notificationsChannelId === 'string' && r.notificationsChannelId.length > 0
-            ? r.notificationsChannelId
-            : undefined;
-          if (active || paused.length > 0 || notificationsChannelId) {
-            subscriptions[guildId] = {
-              ...(active ? { active } : {}),
-              paused,
-              ...(notificationsChannelId ? { notificationsChannelId } : {}),
-            };
-          }
-        }
-
-        this.config = {
-          tiers: mergedTiers,
-          subscriptions,
-          messages: { ...DEFAULT_MESSAGES, ...(loaded.messages || {}) },
-          providerAccountLinks: loaded.providerAccountLinks || {},
-          activatedProviders: loaded.activatedProviders || {},
-          migrations: Array.isArray(loaded.migrations) ? loaded.migrations : [],
-          migrationSilencePolicy: (loaded.migrationSilencePolicy === 'continue' ? 'continue' : 'cancel'),
-        };
-        try { this.configMtimeMs = fs.statSync(CONFIG_PATH).mtimeMs; } catch { /* ignore */ }
-      } else {
-        this.save();
-      }
-      this.configLoaded = true;
+      raw = readRawStrict(CONFIG_PATH);
     } catch (error) {
-      console.error('[PremiumManager] Failed to load config:', error);
-      this.config = JSON.parse(JSON.stringify(DEFAULT_CONFIG));
+      this.becomeUnreadable('premium-tiers.json', errnoOf(error));
+      return;
     }
+    let loaded: Partial<PremiumConfig> | null = null;
+    if (raw !== null) {
+      try {
+        loaded = JSON.parse(raw) as Partial<PremiumConfig>;
+        if (!loaded || typeof loaded !== 'object' || Array.isArray(loaded)) throw new Error('not a JSON object');
+      } catch (error) {
+        this.becomeUnreadable('premium-tiers.json', `invalid JSON: ${error instanceof Error ? error.message : String(error)}`);
+        return;
+      }
+    }
+    let journalRaw: string | null = null;
+    if (isBotProcess()) {
+      try {
+        journalRaw = readRawStrict(JOURNAL_PATH);
+      } catch (error) {
+        this.becomeUnreadable(JOURNAL_FILE, errnoOf(error));
+        return;
+      }
+    }
+    this.config = loaded ? normalizeConfig(loaded) : defaultConfig();
+    this.lastRaw = raw;
+    this.configLoaded = true;
+    if (this.unreadable) console.log(`[PremiumManager] ${this.unreadable.file} can be read again`);
+    this.unreadable = null;
+    this.loggedUnreadable = null;
+    if (!isBotProcess()) return;
+    const marks = this.config.eventsApplied ?? {};
+    const above = (writer: string, n: number) => n > (marks[writer] ?? 0);
+    const pending = (journalRaw !== null && parseJournal(journalRaw).lines.some(l => above(l.writer, l.n)))
+      || this.journal.some(e => above(e.writer, e.n));
+    if (pending) {
+      this.replay = 'waiting';
+      this.startReplayIfReady();
+      return;
+    }
+    if (journalRaw !== null) this.queueJournalDelete();
   }
 
-  save(): boolean {
-    try {
-      const ok = saveGlobalData('premium-tiers.json', this.config);
-      if (!ok) return false;
-      // Fire-and-forget flush so the on-disk mtime advances; record it after so
-      // ensureLoaded()'s cross-process mtime check does not needlessly reload
-      // this process's own write. A one-cycle stale window is tolerated.
-      void flushAll()
-        .then(() => { try { this.configMtimeMs = fs.statSync(CONFIG_PATH).mtimeMs; } catch { /* ignore */ } })
-        .catch(() => { /* flush retried by the queue */ });
-      return true;
-    } catch (error) {
-      console.error('[PremiumManager] Failed to save config:', error);
-      return false;
-    }
+  private becomeUnreadable(file: string, cause: string): void {
+    this.unreadable = { file, cause };
+    this.episodeFile = file;
+    this.configLoaded = false;
+    this.lastRaw = undefined;
+    this.config = defaultConfig();
+    const key = `${file}|${cause}`;
+    if (this.loggedUnreadable === key) return;
+    this.loggedUnreadable = key;
+    console.error(`[PremiumManager] ${file} cannot be read (${cause}); premium answers Free and premium changes are refused until it can be read`);
   }
 
   /**
-   * Ensure config is loaded and up-to-date with disk. Bot and forked web-UI
-   * processes share the file; mtime check picks up cross-process writes.
+   * The bot holds the lock, so its cache is current once loaded (a failed load is tried again at most every 5 s). So
+   * does the web UI while it holds the lock. Otherwise it reloads when the file, read through the queue, differs from
+   * the text it last loaded or saved; a failed read keeps the cache.
    */
   private ensureLoaded(): void {
-    if (!this.configLoaded) {
-      this.load();
+    if (this.configLoaded) {
+      if (isBotProcess() || this.lastRaw === undefined || writerLockDepth() > 0) return;
+      let raw: string | null;
+      try {
+        raw = readRawStrict(CONFIG_PATH);
+      } catch (error) {
+        const cause = errnoOf(error);
+        if (this.loggedRecheck !== cause) {
+          this.loggedRecheck = cause;
+          console.error(`[PremiumManager] premium-tiers.json could not be read to check for changes (${cause}); kept the loaded copy`);
+        }
+        return;
+      }
+      this.loggedRecheck = null;
+      if (raw === this.lastRaw) return;
+    } else if (this.unreadable && Date.now() - this.lastLoadTry < LOAD_RETRY_MS) {
       return;
     }
+    this.load();
+  }
+
+  /** Drops the cache (the web UI, at each take of the writer lock and after a local op that was not ok). */
+  invalidate(): void {
+    this.configLoaded = false;
+    this.lastRaw = undefined;
+    this.lastLoadTry = -Infinity;
+    this.installLines.clear();
+    this.installLinesFilled = false;
+  }
+
+  /** The refusal text of an op while premium-tiers.json or its journal cannot be read; null when both can. */
+  unreadableText(): string | null {
+    this.ensureLoaded();
+    if (!this.unreadable) return null;
+    return this.unreadable.file === JOURNAL_FILE
+      ? `premium-tiers.events.jsonl cannot be read (${this.unreadable.cause}); nothing was saved. Make that file readable (premium-tiers.json itself is fine), then try again.`
+      : `premium-tiers.json cannot be read (${this.unreadable.cause}); nothing was saved. Fix or restore the file, then try again.`;
+  }
+
+  /** The refusal text while kept provider events wait to be applied; null when none wait. */
+  heldEventsText(): string | null {
+    this.ensureLoaded();
+    if (this.replay === 'waiting') {
+      return `Premium holds provider events received while ${this.episodeFile} could not be read; the bot applies them once it runs normally and is connected to Discord. Nothing was saved. Try again then.`;
+    }
+    if (this.replay === 'running') {
+      return `Premium is applying provider events received while ${this.episodeFile} could not be read; nothing was saved. Try again in a moment.`;
+    }
+    if (isBotProcess()) return null;
+    let raw: string | null;
     try {
-      const mtime = fs.statSync(CONFIG_PATH).mtimeMs;
-      if (mtime > this.configMtimeMs) this.load();
-    } catch { /* file missing; next read will recreate via load() */ }
+      raw = readRawStrict(JOURNAL_PATH);
+    } catch (error) {
+      return `premium-tiers.events.jsonl cannot be read (${errnoOf(error)}); nothing was saved. Make that file readable (premium-tiers.json itself is fine), then try again.`;
+    }
+    if (raw === null) return null;
+    const marks = this.config.eventsApplied ?? {};
+    return parseJournal(raw).lines.some(l => l.n > (marks[l.writer] ?? 0))
+      ? 'Premium holds provider events the bot has not applied yet (premium-tiers.events.jsonl); nothing was saved. Start the bot to apply them, then try again.'
+      : null;
+  }
+
+  private refusalText(): string {
+    if (this.stopped) return `Nothing was saved: ${stopWords(this.stopped)}.`;
+    return this.unreadableText() ?? this.heldEventsText() ?? 'Premium cannot take changes right now; nothing was saved.';
+  }
+
+  /** A mutating method's entry check: true when it must refuse, recorded in the current ledger, before it changes the cache. */
+  private refusedAtEntry(): boolean {
+    this.ensureLoaded();
+    const cause: LedgerCause | null = this.stopped ? stopCause(this.stopped) : this.unreadable ? 'io' : this.replay ? 'not-ready' : null;
+    if (!cause) return false;
+    recordRefusal(cause, PREMIUM_DOC);
+    return true;
+  }
+
+  /** A tick (expiry, due migrations, a migration notice's stamp) does nothing while the cache cannot be written. */
+  private cannotWrite(): boolean {
+    return !!this.stopped || !!this.unreadable || !!this.replay;
+  }
+
+  private inReplay(): boolean {
+    const ledger = currentLedger();
+    return !!ledger && !!this.replayLedgers && this.replayLedgers.has(ledger);
+  }
+
+  /**
+   * Saves the whole cache. In the bot a save the disk refuses stays in the cache and is retried (it answers held); a
+   * refusal of the stop or a deposition, and every save while the cache is unreadable or replaying, is not.
+   */
+  private save(): boolean {
+    if (this.inReplay()) return true;
+    if (this.stopped) {
+      recordRefusal(stopCause(this.stopped), PREMIUM_DOC);
+      return false;
+    }
+    if (this.unreadable) {
+      recordRefusal('io', PREMIUM_DOC);
+      return false;
+    }
+    if (this.replay) {
+      recordRefusal('not-ready', PREMIUM_DOC);
+      return false;
+    }
+    return this.writeCache();
+  }
+
+  private writeCache(): boolean {
+    const content = JSON.stringify(this.config, null, 2);
+    let cause: LedgerCause;
+    try {
+      const tracked = saveDataTracked('premium-tiers.json', { scope: 'global' }, this.config);
+      if (tracked.outcome === 'saved') {
+        this.lastRaw = content;
+        this.saveHeld = false;
+        if (tracked.ticket.kind === 'file') this.lastSaveTicket = tracked.ticket;
+        if (this.raisedMarks && !this.marksTicket && tracked.ticket.kind === 'file') this.marksTicket = tracked.ticket;
+        return true;
+      }
+      cause = tracked.outcome === 'frozen' ? 'frozen' : tracked.cause;
+    } catch (error) {
+      if (error instanceof DataBackendUnavailableError) {
+        cause = error.causeKey;
+      } else {
+        console.error('[PremiumManager] Failed to save config:', error);
+        recordRefusal('io', PREMIUM_DOC);
+        cause = 'io';
+      }
+    }
+    if (cause === 'node-stopping' || cause === 'writer-lost' || !isBotProcess()) return false;
+    this.saveHeld = true;
+    markRetried(PREMIUM_DOC);
+    this.armRetry();
+    return true;
   }
 
   // ============================================================================
@@ -803,15 +1277,452 @@ export class PremiumManager {
   // ============================================================================
 
   /**
-   * Append a single audit entry. Best-effort: failures log but don't throw,
-   * so a failing audit write doesn't block the operation that produced it.
+   * Append a single audit entry. In the bot a line the disk refuses is held in order and appended by the retry; the
+   * replay's lines wait until a save carrying its marks has landed. providerSubId names an install line's subscription.
    */
-  private writeAudit(entry: AuditEntry): void {
-    try {
-      appendData('premium-tiers.audit.jsonl', { scope: 'global' }, JSON.stringify(entry) + '\n');
-    } catch (err) {
-      console.error('[PremiumManager] writeAudit failed:', err);
+  private writeAudit(entry: AuditEntry, providerSubId?: string): void {
+    const line = JSON.stringify(entry) + '\n';
+    let install: InstallLine | undefined;
+    if (entry.action === 'subscription.install.paid' && typeof entry.subscriptionId === 'string') {
+      install = { state: 'queued', webhook: paymentOpOf(currentLedger()) === 'payment.webhook', line, entry, providerSubId };
+      this.installLines.set(entry.subscriptionId, install);
     }
+    if (this.inReplay()) {
+      if (this.replayDropped) {
+        if (install) this.installLines.delete(entry.subscriptionId!);
+        return;
+      }
+      if (install) install.state = 'buffered';
+      this.replayBuffer.push({ line, entry, install });
+      return;
+    }
+    this.placeLine({ line, entry, install });
+  }
+
+  /** The audit bullet's rules for one line outside the replay: append, or hold it behind the lines held before it. */
+  private placeLine(pending: PendingLine): void {
+    const { entry, install } = pending;
+    if (this.stopped) {
+      recordRefusal(stopCause(this.stopped), AUDIT_DOC);
+      if (install) {
+        this.installLines.delete(entry.subscriptionId!);
+        console.error(this.installLineLost(install, 'was not written', this.stopped));
+      } else {
+        console.error(`[PremiumManager] The audit line ${entry.action} (guild ${entry.guildId ?? 'none'}, ${entry.timestamp}) was not written: ${stopWords(this.stopped)}; it is lost`);
+      }
+      return;
+    }
+    if (isBotProcess() && this.heldLines.length > 0) {
+      recordRefusal(this.heldCause, AUDIT_DOC);
+      markRetried(AUDIT_DOC);
+      if (install) install.state = 'held';
+      this.heldLines.push(pending);
+      return;
+    }
+    const result = this.appendLine(pending.line);
+    if (result.kind === 'appended') {
+      if (install) {
+        install.state = 'queued';
+        install.ticket = result.ticket;
+      }
+      return;
+    }
+    if (!isBotProcess()) {
+      if (install) this.installLines.delete(entry.subscriptionId!);
+      return;
+    }
+    if (result.cause === 'node-stopping' || result.cause === 'writer-lost') {
+      if (install) this.installLines.delete(entry.subscriptionId!);
+      const kind: StopKind = result.cause === 'writer-lost' ? 'deposed' : 'stopping';
+      console.error(`[PremiumManager] The audit line ${entry.action} (guild ${entry.guildId ?? 'none'}, ${entry.timestamp}) was not written: ${stopWords(kind)}; it is lost`);
+      return;
+    }
+    markRetried(AUDIT_DOC);
+    this.heldCause = result.cause;
+    if (install) install.state = 'held';
+    this.heldLines.push(pending);
+    this.armRetry();
+  }
+
+  private appendLine(line: string): { kind: 'appended'; ticket: FileTicket } | { kind: 'refused'; cause: LedgerCause } {
+    try {
+      const result = appendDataTracked('premium-tiers.audit.jsonl', { scope: 'global' }, line);
+      if (result.outcome === 'appended' && result.ticket.kind === 'file') return { kind: 'appended', ticket: result.ticket };
+      return { kind: 'refused', cause: result.outcome === 'refused' ? result.cause : 'frozen' };
+    } catch (error) {
+      if (error instanceof DataBackendUnavailableError) return { kind: 'refused', cause: error.causeKey };
+      console.error('[PremiumManager] writeAudit failed:', error);
+      return { kind: 'refused', cause: 'io' };
+    }
+  }
+
+  // ============================================================================
+  // SAVE RETRY AND STOP (bot process)
+  // ============================================================================
+
+  private armRetry(): void {
+    if (this.retryTimer || this.stopped || this.passing || this.disposed) return;
+    this.retryTimer = outsideLedgers(() => setTimeout(() => {
+      this.retryTimer = null;
+      this.retryPass();
+    }, this.retryDelay));
+    this.retryTimer.unref?.();
+  }
+
+  private clearRetry(): void {
+    if (this.retryTimer) clearTimeout(this.retryTimer);
+    this.retryTimer = null;
+  }
+
+  private retryPass(): void {
+    if (this.stopped || this.disposed) return;
+    this.runPass();
+    if (this.saveHeld || this.heldLines.length > 0) {
+      this.retryDelay = Math.min(this.retryDelay * 2, RETRY_MAX_MS);
+      this.armRetry();
+    } else {
+      this.retryDelay = RETRY_FIRST_MS;
+    }
+  }
+
+  /** One pass outside any ledger: the held save, then the held audit lines in order until one is refused. */
+  private runPass(): void {
+    this.passing = true;
+    try {
+      outsideLedgers(() => {
+        if (this.saveHeld) {
+          this.writeCache();
+          if (this.saveHeld) return;
+        }
+        while (this.heldLines.length > 0) {
+          const held = this.heldLines[0];
+          const result = this.appendLine(held.line);
+          if (result.kind !== 'appended') {
+            if (result.cause !== 'node-stopping' && result.cause !== 'writer-lost') this.heldCause = result.cause;
+            return;
+          }
+          this.heldLines.shift();
+          if (held.install) {
+            held.install.state = 'queued';
+            held.install.ticket = result.ticket;
+          }
+        }
+      });
+    } finally {
+      this.passing = false;
+    }
+  }
+
+  /** A deposition: nothing more is written, and every later save, line, event and notice is refused or logged. */
+  markStopped(kind: StopKind): void {
+    if (this.stopped) return;
+    this.stopped = kind;
+    this.clearRetry();
+  }
+
+  /** The final stop step: stops the timers, runs one last pass, sets stopped and logs what is still held. */
+  finalStop(): void {
+    if (this.disposed) return;
+    this.clearRetry();
+    this.stopExpiryChecker();
+    if (!this.stopped) {
+      this.runPass();
+      this.stopped = 'stopping';
+    }
+    const kind = this.stopped;
+    if (this.saveHeld) {
+      console.error(this.raisedMarks && !this.marksLanded()
+        ? `[PremiumManager] premium-tiers.json holds changes the disk refused. The kept provider events stay in premium-tiers.events.jsonl, and the next normal start of the bot applies them again; any change made after them is ${lostWords(kind)}`
+        : `[PremiumManager] premium-tiers.json holds changes the disk refused; they are ${lostWords(kind)}`);
+    }
+    for (const held of this.heldLines) {
+      if (held.install) {
+        console.error(this.installLineLost(held.install, 'was refused by the disk', kind));
+      } else {
+        console.error(`[PremiumManager] The audit line ${held.entry.action} (guild ${held.entry.guildId ?? 'none'}, ${held.entry.timestamp}) was refused by the disk and is ${lostWords(kind)}`);
+      }
+    }
+  }
+
+  private installLineLost(install: InstallLine, what: string, kind: StopKind): string {
+    const head = `[PremiumManager] The audit line subscription.install.paid (guild ${install.entry.guildId ?? 'none'}, subscription ${install.providerSubId ?? install.entry.subscriptionId}) ${what} ${beforeWords(kind)}`;
+    const json = install.line.trimEnd();
+    return install.webhook
+      ? `${head}; the webhook was answered 503, and the provider's next delivery of it writes this line, or, when the subscription's own save was lost too, installs the subscription again under a new id with its own line: ${json}`
+      : `${head} and is lost: ${json}`;
+  }
+
+  private marksLanded(): boolean {
+    return !!this.marksTicket && landed(this.marksTicket);
+  }
+
+  /**
+   * After the exit drain: when a save carrying the replay's marks landed in the drain, its buffered audit lines are
+   * queued for one more drain pass (true); otherwise nothing is appended and the journal keeps the events.
+   */
+  afterDrain(): boolean {
+    if (this.disposed || this.replayDropped || this.replayBuffer.length === 0 || !this.marksLanded()) return false;
+    if (sharedWritesClosedLost()) return false;
+    const lines = this.replayBuffer.splice(0);
+    try {
+      enqueueAppend(AUDIT_PATH, lines.map(l => l.line).join(''));
+    } catch (error) {
+      this.replayBuffer.unshift(...lines);
+      console.error(`[PremiumManager] The replay's audit lines could not be queued after the exit drain (${errnoOf(error)})`);
+      return false;
+    }
+    const ticket = fileTicket(AUDIT_PATH);
+    for (const pending of lines) {
+      if (pending.install) {
+        pending.install.state = 'queued';
+        pending.install.ticket = ticket;
+      } else {
+        this.afterDrainLines.push({ ...pending, ticket });
+      }
+    }
+    return true;
+  }
+
+  /** The exit handler's lines: events, the replay and install lines that did not reach the disk (synchronous). */
+  logLossesAtExit(): void {
+    if (this.disposed) return;
+    const kind = this.stopped ?? 'stopping';
+    const marksLanded = this.marksLanded();
+    const covered = (e: JournalEntry) => marksLanded && !!this.raisedMarks && e.n <= (this.raisedMarks[e.writer] ?? 0);
+    for (const e of this.journal) {
+      if ((e.ticket && landed(e.ticket)) || covered(e)) continue;
+      console.error(`[PremiumManager] A ${eventWords(e.event)} was received while ${e.file} could not be read and is ${lostWords(kind)}: ${JSON.stringify(e.event)}`);
+    }
+    if (this.replayStarted && !marksLanded) {
+      const handed = this.replayHanded > 0 ? ` (member notices of the ${this.replayHanded} already handed may go out twice)` : '';
+      console.error(`[PremiumManager] The stop came before the kept provider events were saved; they stay in premium-tiers.events.jsonl, and the next normal start of the bot applies them${handed}`);
+    }
+    for (const install of this.installLines.values()) {
+      if (install.state === 'queued' && install.ticket && !landed(install.ticket)) {
+        console.error(this.installLineLost(install, 'did not reach the disk', kind));
+      }
+    }
+    if (!marksLanded) return;
+    for (const pending of [...this.replayBuffer, ...this.afterDrainLines]) {
+      if (pending.install || (pending.ticket && landed(pending.ticket))) {
+        if (pending.install && pending.install.state === 'buffered') console.error(this.installLineLost(pending.install, 'did not reach the disk', kind));
+        continue;
+      }
+      console.error(`[PremiumManager] The audit line ${pending.entry.action} (guild ${pending.entry.guildId ?? 'none'}, ${pending.entry.timestamp}) did not reach the disk ${beforeWords(kind)} and is lost: ${pending.line.trimEnd()}`);
+    }
+  }
+
+  // ============================================================================
+  // EVENT JOURNAL AND REPLAY (bot process)
+  // ============================================================================
+
+  private refuseEvent(event: ProviderEvent, kind: StopKind): void {
+    recordRefusal(stopCause(kind), PREMIUM_DOC);
+    const ledger = currentLedger();
+    const ended = ledger ? this.endedReplays.get(ledger) : undefined;
+    if (ended && !(ended.left && this.marksLanded())) {
+      const again = `the next normal start of the bot applies that provider event again${ended.fromMemory ? ' unless an exit line names it as lost' : ''}`;
+      const fate = ended.left
+        ? `. If an exit line says the kept provider events stay in premium-tiers.events.jsonl, ${again}; otherwise this event is lost`
+        : `; the kept provider events were not saved, so ${again}`;
+      console.error(`[PremiumManager] A ${eventWords(event)}, caused by applying a kept provider event, was not applied: ${stopWords(kind)}${fate}: ${JSON.stringify(event)}`);
+      return;
+    }
+    const ending = isPaymentLedger(ledger)
+      ? "the request that raised it is answered as not saved, and a webhook's provider sends it again"
+      : 'it is lost';
+    console.error(`[PremiumManager] A ${eventWords(event)} was not applied: ${stopWords(kind)}; ${ending}: ${JSON.stringify(event)}`);
+  }
+
+  private journalEvent(event: ProviderEvent): void {
+    const entry: JournalEntry = { writer: writerId, n: ++journalSeq, event, file: this.unreadable?.file ?? this.episodeFile };
+    const line = JSON.stringify({ writer: entry.writer, n: entry.n, event }) + '\n';
+    let refused: string | null = null;
+    try {
+      const result = appendDataTracked(JOURNAL_FILE, { scope: 'global' }, line);
+      if (result.outcome === 'appended' && result.ticket.kind === 'file') entry.ticket = result.ticket;
+      else refused = result.outcome === 'refused' ? result.cause : result.outcome;
+    } catch (error) {
+      refused = error instanceof DataBackendUnavailableError ? error.causeKey : errnoOf(error);
+    }
+    this.journal.push(entry);
+    const why = this.unreadable ? `${this.unreadable.file} cannot be read` : 'premium applies the provider events it kept';
+    console.warn(refused
+      ? `[PremiumManager] A ${eventWords(event)} arrived while ${why}; its line in premium-tiers.events.jsonl was refused (${refused}), so it is kept in memory only and applied once premium runs normally`
+      : `[PremiumManager] A ${eventWords(event)} arrived while ${why}; it is kept in premium-tiers.events.jsonl and applied once premium runs normally`);
+  }
+
+  private queueJournalDelete(): void {
+    const failed = (why: string) => console.error(`[PremiumManager] premium-tiers.events.jsonl could not be deleted (${why}); eventsApplied covers its lines, and the next start deletes it`);
+    outsideLedgers(() => {
+      try {
+        const result = deleteDataTracked(JOURNAL_FILE, { scope: 'global' });
+        if (result.outcome === 'refused') failed(result.cause);
+        else if (result.outcome === 'frozen') failed('frozen');
+      } catch (error) {
+        failed(error instanceof DataBackendUnavailableError ? error.causeKey : errnoOf(error));
+      }
+    });
+  }
+
+  /** Starts the replay once a load left it waiting and startPremiumTickers() ran in this process. */
+  startReplayIfReady(): void {
+    if (this.replay !== 'waiting' || !tickersStarted || this.stopped || this.disposed) return;
+    this.replay = 'running';
+    this.replayStarted = true;
+    this.replayDropped = false;
+    this.replayBuffer = [];
+    this.replayHanded = 0;
+    outsideLedgers(() => {
+      void Promise.resolve().then(() => runSealed('console', null, 'premium', ledger => this.runReplay(ledger)));
+    });
+  }
+
+  private journalFromDisk(): JournalLine[] {
+    const raw = readRawStrict(JOURNAL_PATH);
+    if (raw === null) return [];
+    const { lines, bad } = parseJournal(raw);
+    for (const text of bad) console.warn(`[PremiumManager] Skipped a line of premium-tiers.events.jsonl that cannot be read (cut short or damaged): ${text}`);
+    const seen = new Set<string>();
+    const out: JournalLine[] = [];
+    for (const line of lines) {
+      if (line.writer === writerId) continue;
+      const key = `${line.writer}|${line.n}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(line);
+    }
+    return out;
+  }
+
+  private dropReplay(): void {
+    this.replayDropped = true;
+    for (const pending of this.replayBuffer) {
+      if (pending.install) this.installLines.delete(pending.entry.subscriptionId!);
+    }
+    this.replayBuffer = [];
+  }
+
+  private async runReplay(ledger: WriteLedger): Promise<void> {
+    this.replayLedgers.add(ledger);
+    const base = { ...(this.config.eventsApplied ?? {}) };
+    const reached: Record<string, number> = {};
+    let left = false;
+    let fromMemory = false;
+    try {
+      const disk = this.journalFromDisk();
+      let d = 0;
+      let m = 0;
+      for (;;) {
+        if (this.stopped) {
+          this.dropReplay();
+          return;
+        }
+        const onDisk = d < disk.length;
+        const next: JournalLine | undefined = onDisk ? disk[d++] : m < this.journal.length ? this.journal[m++] : undefined;
+        if (!next) break;
+        reached[next.writer] = Math.max(reached[next.writer] ?? 0, next.n);
+        if (next.n <= (base[next.writer] ?? 0)) continue;
+        if (!onDisk) fromMemory = true;
+        this.replayHanded += 1;
+        try {
+          this.handleEvent(next.event);
+        } catch (error) {
+          console.error(`[PremiumManager] The journaled ${eventWords(next.event)} could not be applied (${error instanceof Error ? error.message : String(error)}) and is skipped: ${JSON.stringify(next.event)}`);
+        }
+        await this.settled(ledger);
+      }
+      await this.settled(ledger);
+      if (this.stopped) {
+        this.dropReplay();
+        return;
+      }
+      const marks = { ...(this.config.eventsApplied ?? {}) };
+      if (this.replayHanded > 0) {
+        for (const [writer, n] of Object.entries(reached)) {
+          if (n > (marks[writer] ?? 0)) marks[writer] = n;
+        }
+      }
+      this.config.eventsApplied = marks;
+      this.raisedMarks = marks;
+      this.marksTicket = null;
+      this.replay = null;
+      left = true;
+      this.writeCache();
+      this.watchMarks();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!left) {
+        console.error(`[PremiumManager] The replay of premium-tiers.events.jsonl failed (${message}); the journal stays and is replayed at the next load`);
+        this.dropReplay();
+        this.replay = null;
+        this.raisedMarks = null;
+        this.becomeUnreadable(JOURNAL_FILE, message);
+      } else {
+        console.error(`[PremiumManager] The replay's save step failed (${message})`);
+      }
+    } finally {
+      this.replayLedgers.delete(ledger);
+      this.endedReplays.set(ledger, { left, fromMemory });
+    }
+  }
+
+  /** Waits, outside any ledger, for a save carrying the replay's marks to land; then appends its lines and deletes the journal. */
+  private watchMarks(): void {
+    outsideLedgers(() => {
+      void (async () => {
+        while (!this.stopped && !this.disposed) {
+          const ticket = this.marksTicket;
+          if (ticket && landed(ticket)) {
+            this.onMarksLanded();
+            return;
+          }
+          if (!ticket) {
+            await sleepOutside(WATCH_IDLE_MS);
+            continue;
+          }
+          const answer = await confirmFile(ticket, CONFIRM_MS);
+          if (answer === 'ok') continue;
+          if (answer === 'unavailable' && !landed(ticket) && this.marksTicket === ticket) this.marksTicket = null;
+          await sleepOutside(WATCH_IDLE_MS);
+        }
+      })().catch(error => {
+        console.error(`[PremiumManager] The watch for the replay's save failed (${error instanceof Error ? error.message : String(error)})`);
+      });
+    });
+  }
+
+  private onMarksLanded(): void {
+    const marks = this.raisedMarks ?? {};
+    this.journal = this.journal.filter(e => e.n > (marks[e.writer] ?? 0));
+    if (this.stopped) return;
+    try {
+      const lines = this.replayBuffer.splice(0);
+      outsideLedgers(() => {
+        for (const pending of lines) this.placeLine(pending);
+        if (this.journal.length === 0) this.queueJournalDelete();
+      });
+    } catch (error) {
+      console.error(`[PremiumManager] The append of the replay's audit lines failed (${error instanceof Error ? error.message : String(error)})`);
+    }
+  }
+
+  /** Whether the final stop step or a deposition stopped this cache. */
+  isStopped(): boolean {
+    return this.stopped !== null;
+  }
+
+  cacheState(): 'normal' | 'unreadable' | 'replaying' {
+    return this.unreadable ? 'unreadable' : this.replay ? 'replaying' : 'normal';
+  }
+
+  /** Every member notice goes through here: after the stop or a deposition none is sent, and each is logged. */
+  private notify(guildId: string, kind: NotificationType, payload: NotificationPayload): Promise<NotifyOutcome> {
+    if (this.stopped) {
+      console.warn(`[PremiumManager] The ${kind} notice for guild ${guildId} was not sent: ${stopWords(this.stopped)}`);
+      return Promise.resolve({ delivered: false, cause: stopWords(this.stopped) });
+    }
+    return dispatchPremiumNotification(guildId, kind, payload);
   }
 
   /**
@@ -928,7 +1839,7 @@ export class PremiumManager {
   }
 
   setTier(tierId: string, tier: PremiumTier): boolean {
-    this.ensureLoaded();
+    if (this.refusedAtEntry()) return false;
     // Free is the deployment baseline; its data lives in
     // `/data/global/{module}/settings.json` and is edited via
     // `setGlobalModuleConfig` (Web global-config route) or the Discord
@@ -964,7 +1875,7 @@ export class PremiumManager {
           const onThisTier = subs.active?.tierId === tierId
             || subs.paused.some(p => p.tierId === tierId);
           if (!onThisTier) continue;
-          void dispatchPremiumNotification(guildId, 'tier.config-change-affecting-subscriber', {
+          void this.notify(guildId, 'tier.config-change-affecting-subscriber', {
             tierName: after.displayName,
             details: 'Some perks or limits were reduced. Open the subscription panel to see the latest tier contents.',
           });
@@ -987,8 +1898,17 @@ export class PremiumManager {
    */
   setGlobalModuleConfig(moduleName: string, partial: Partial<GlobalModuleConfig>, base?: Record<string, any>): boolean {
     this.ensureLoaded();
+    if (this.stopped || this.replay) {
+      recordRefusal(this.stopped ? stopCause(this.stopped) : 'not-ready', PREMIUM_DOC);
+      return false;
+    }
     const ok = saveGlobalModuleConfig(moduleName, partial, base);
     if (!ok) return false;
+    // The cache holds only the defaults; the next successful load replaces them.
+    if (this.unreadable) {
+      console.error(`[PremiumManager] Global config for ${moduleName} saved, but the paid tier cleanup did not save`);
+      return true;
+    }
 
     let changed = false;
     for (const [tierId, tier] of Object.entries(this.config.tiers)) {
@@ -1054,7 +1974,7 @@ export class PremiumManager {
    * active slot if active was on the deleted tier.
    */
   deleteTier(tierId: string): boolean {
-    this.ensureLoaded();
+    if (this.refusedAtEntry()) return false;
 
     if (tierId === 'free') {
       console.error('[PremiumManager] Cannot delete the free tier');
@@ -1180,7 +2100,7 @@ export class PremiumManager {
   }
 
   setProviderActivation(providerId: string, activated: boolean, defaultEnabled = false): boolean {
-    this.ensureLoaded();
+    if (this.refusedAtEntry()) return false;
     const before = this.config.activatedProviders[providerId];
     if (!activated) {
       delete this.config.activatedProviders[providerId];
@@ -1298,6 +2218,12 @@ export class PremiumManager {
     return null;
   }
 
+  private subscriptionById(guildId: string, subscriptionId: string): Subscription | undefined {
+    const subs = this.config.subscriptions[guildId];
+    if (!subs) return undefined;
+    return subs.active?.id === subscriptionId ? subs.active : subs.paused.find(p => p.id === subscriptionId);
+  }
+
   /** Cross-guild lookup helper for orphan dedup. */
   private findGuildSubscriptionByProviderSubId(guildId: string, providerSubId: string): Subscription | null {
     const subs = this.config.subscriptions[guildId];
@@ -1333,18 +2259,14 @@ export class PremiumManager {
     const activePriority = this.config.tiers[active!.tierId]?.priority ?? 0;
 
     if (incomingPriority > activePriority) {
-      await this.pauseActiveIntoQueue(guildId);
-      subs.active = incoming;
-      this.save();
+      await this.pauseActiveIntoQueue(guildId, incoming);
       return;
     }
 
     if (incomingPriority === activePriority) {
       if (incoming.source === 'manual') {
         // Manual replaces (manual wins ties at equal priority).
-        await this.pauseActiveIntoQueue(guildId);
-        subs.active = incoming;
-        this.save();
+        await this.pauseActiveIntoQueue(guildId, incoming);
         return;
       }
       // Same-priority paid: caller is expected to reject upstream.
@@ -1368,6 +2290,7 @@ export class PremiumManager {
     };
     subs.paused.push(paused);
     this.sortPausedQueue(subs);
+    this.save();
 
     // Best-effort provider pause for paid: the sub was just created as
     // active at the provider; we want it frozen until our resume gives
@@ -1381,17 +2304,20 @@ export class PremiumManager {
         }
       }
     }
-    this.save();
   }
 
   /**
-   * Move the currently-active subscription to the paused queue. Snapshots
-   * remaining days, calls provider.pauseSubscription for paid subs, sorts the
-   * queue priority-desc.
+   * Move the currently-active subscription to the paused queue and install the replacement, saved before the
+   * provider's pause is awaited. Snapshots remaining days, sorts the queue priority-desc.
    */
-  private async pauseActiveIntoQueue(guildId: string): Promise<void> {
+  private async pauseActiveIntoQueue(guildId: string, replacement: Subscription): Promise<void> {
     const subs = this.config.subscriptions[guildId];
-    if (!subs?.active) return;
+    if (!subs) return;
+    if (!subs.active) {
+      subs.active = replacement;
+      this.save();
+      return;
+    }
     const cur = subs.active;
     const nowIso = new Date().toISOString();
     const now = Date.now();
@@ -1404,7 +2330,8 @@ export class PremiumManager {
     }
     if (remaining === 0) {
       // Nothing left: drop outright instead of queueing.
-      delete subs.active;
+      subs.active = replacement;
+      this.save();
       return;
     }
 
@@ -1417,7 +2344,16 @@ export class PremiumManager {
     };
     subs.paused.push(paused);
     this.sortPausedQueue(subs);
-    delete subs.active;
+    subs.active = replacement;
+    this.save();
+    this.writeAudit({
+      timestamp: nowIso,
+      actor: 'admin',
+      action: 'subscription.pause',
+      guildId,
+      subscriptionId: paused.id,
+      providerId: paused.providerId,
+    });
 
     // Best-effort provider pause for paid subs.
     if (paused.source === 'paid' && paused.providerId && paused.providerSubId) {
@@ -1429,16 +2365,8 @@ export class PremiumManager {
         }
       }
     }
-    this.writeAudit({
-      timestamp: nowIso,
-      actor: 'admin',
-      action: 'subscription.pause',
-      guildId,
-      subscriptionId: paused.id,
-      providerId: paused.providerId,
-    });
     if (paused.source === 'paid') {
-      void dispatchPremiumNotification(guildId, 'paid.sub.paused-by-stacking', {
+      void this.notify(guildId, 'paid.sub.paused-by-stacking', {
         tierName: this.config.tiers[paused.tierId]?.displayName || paused.tierId,
         providerName: this.providerDisplayName(paused.providerId),
         remainingDays: paused.remainingDaysAtPause ?? null,
@@ -1509,11 +2437,11 @@ export class PremiumManager {
         // entry went into the queue; it never resumes, so close the loop with
         // an "ended" notification matching its source.
         if (resumed.source === 'manual') {
-          void dispatchPremiumNotification(guildId, 'manual.grant.ended', {
+          void this.notify(guildId, 'manual.grant.ended', {
             tierName: this.config.tiers[resumed.tierId]?.displayName || resumed.tierId,
           });
         } else {
-          void dispatchPremiumNotification(guildId, 'paid.sub.expired', {
+          void this.notify(guildId, 'paid.sub.expired', {
             tierName: this.config.tiers[resumed.tierId]?.displayName || resumed.tierId,
             providerName: this.providerDisplayName(resumed.providerId),
           });
@@ -1540,7 +2468,7 @@ export class PremiumManager {
         providerId: resumed.providerId,
       });
       if (resumed.source === 'paid') {
-        void dispatchPremiumNotification(guildId, 'paid.sub.resumed-from-queue', {
+        void this.notify(guildId, 'paid.sub.resumed-from-queue', {
           tierName: this.config.tiers[resumed.tierId]?.displayName || resumed.tierId,
           providerName: this.providerDisplayName(resumed.providerId),
           endDate: resumed.endDate,
@@ -1566,7 +2494,7 @@ export class PremiumManager {
     notes?: string,
     grantedBy?: string,
   ): Promise<boolean> {
-    this.ensureLoaded();
+    if (this.refusedAtEntry()) return false;
     if (tierId === 'free' || !this.config.tiers[tierId]) return false;
     const tier = this.config.tiers[tierId];
 
@@ -1607,7 +2535,7 @@ export class PremiumManager {
       subscriptionId: sub.id,
       metadata: { durationDays, notes, grantedBy },
     });
-    void dispatchPremiumNotification(guildId, 'manual.grant.added', {
+    void this.notify(guildId, 'manual.grant.added', {
       tierName: tier.displayName,
       endDate,
       notes,
@@ -1620,7 +2548,7 @@ export class PremiumManager {
    * Doesn't touch paused-queue manuals (those don't tick yet).
    */
   extendManual(guildId: string, addDays: number): boolean {
-    this.ensureLoaded();
+    if (this.refusedAtEntry()) return false;
     const subs = this.config.subscriptions[guildId];
     const active = subs?.active;
     if (!active || active.source !== 'manual') return false;
@@ -1652,7 +2580,7 @@ export class PremiumManager {
    * next paused entry into the active slot if active was the manual.
    */
   revokeManual(guildId: string): boolean {
-    this.ensureLoaded();
+    if (this.refusedAtEntry()) return false;
     const subs = this.config.subscriptions[guildId];
     if (!subs) return true;
 
@@ -1680,7 +2608,7 @@ export class PremiumManager {
         tierId: removed.tierId,
         subscriptionId: removed.id,
       });
-      void dispatchPremiumNotification(guildId, 'manual.grant.revoked', {
+      void this.notify(guildId, 'manual.grant.revoked', {
         tierName: this.config.tiers[removed.tierId]?.displayName || removed.tierId,
       });
     }
@@ -1702,7 +2630,7 @@ export class PremiumManager {
     offeringId: string,
     opts: { providerId: string; variantId: string; couponCode?: string; userId?: string; autoRenewOptOut?: boolean },
   ): Promise<InitiateResult> {
-    this.ensureLoaded();
+    if (this.refusedAtEntry()) throw new Error(this.refusalText());
     const tier = this.config.tiers[tierId];
     if (!tier) throw new Error(`Tier '${tierId}' does not exist`);
     if (tierId === 'free') throw new Error('Cannot subscribe to the free tier');
@@ -1852,8 +2780,8 @@ export class PremiumManager {
         providerId,
         subscriptionId: sub.id,
         metadata: { variantId: opts.variantId, couponCode: opts.couponCode },
-      });
-      void dispatchPremiumNotification(guildId, 'paid.sub.started', {
+      }, result.providerSubId);
+      void this.notify(guildId, 'paid.sub.started', {
         tierName: tier.displayName,
         providerName: this.providerDisplayName(providerId),
         endDate: sub.endDate,
@@ -1870,7 +2798,7 @@ export class PremiumManager {
    * actual cause instead of a false-positive success.
    */
   async cancelPaidSubscription(guildId: string): Promise<boolean> {
-    this.ensureLoaded();
+    if (this.refusedAtEntry()) return false;
     const active = this.config.subscriptions[guildId]?.active;
     if (!active || active.source !== 'paid') return false;
     if (!active.providerId || !active.providerSubId) return false;
@@ -1886,7 +2814,7 @@ export class PremiumManager {
       providerId: active.providerId,
       metadata: { immediately: false },
     });
-    void dispatchPremiumNotification(guildId, 'paid.sub.cancelled-by-user', {
+    void this.notify(guildId, 'paid.sub.cancelled-by-user', {
       tierName: this.config.tiers[active.tierId]?.displayName || active.tierId,
       providerName: this.providerDisplayName(active.providerId),
       endDate: active.endDate,
@@ -1896,7 +2824,7 @@ export class PremiumManager {
 
   /** Reactivate a cancelled paid sub while still inside its active window. */
   async reactivatePaidSubscription(guildId: string): Promise<boolean> {
-    this.ensureLoaded();
+    if (this.refusedAtEntry()) return false;
     const active = this.config.subscriptions[guildId]?.active;
     if (!active || active.source !== 'paid') return false;
     if (!active.providerId || !active.providerSubId) return false;
@@ -1922,10 +2850,13 @@ export class PremiumManager {
    * we wipe local state.
    */
   async cancelPaidSubscriptionImmediately(guildId: string): Promise<boolean> {
-    this.ensureLoaded();
-    const subs = this.config.subscriptions[guildId];
-    const active = subs?.active;
-    if (!active || active.source !== 'paid') return false;
+    return (await this.cancelActiveImmediately(guildId)) === 'done';
+  }
+
+  private async cancelActiveImmediately(guildId: string): Promise<CancelStep> {
+    if (this.refusedAtEntry()) return 'not saved';
+    const active = this.config.subscriptions[guildId]?.active;
+    if (!active || active.source !== 'paid') return 'gone';
 
     if (active.providerId && active.providerSubId) {
       const provider = getPaymentRegistry().get(active.providerId);
@@ -1933,23 +2864,76 @@ export class PremiumManager {
         await provider.cancelSubscription(active.providerSubId, true);
       }
     }
+    return this.dropCancelledSubscription(guildId, active, { immediately: true }, true);
+  }
+
+  /**
+   * Removes a subscription the provider has just cancelled from wherever it sits now (the active slot or the paused
+   * queue), found again by id because other changes may have moved or removed it during the provider call. Gone from
+   * both, the cancel took effect and another change removed it: that removal is saved again here, so its landing is
+   * judged in this op's ledger; after a stop it is judged by the last save handed to the disk.
+   */
+  private dropCancelledSubscription(
+    guildId: string,
+    cancelled: Subscription,
+    metadata: Record<string, unknown>,
+    notifyOwner: boolean,
+  ): CancelStep {
+    const subs = this.config.subscriptions[guildId];
+    if (!subs) return this.saveRemovedMeanwhile(guildId, cancelled.id);
+    const inActive = subs.active?.id === cancelled.id;
+    const at = inActive ? -1 : subs.paused.findIndex(p => p.id === cancelled.id);
+    if (!inActive && at < 0) return this.saveRemovedMeanwhile(guildId, cancelled.id);
     this.writeAudit({
       timestamp: new Date().toISOString(),
       actor: 'admin',
-      action: 'subscription.cancel.paid',
+      action: cancelled.source === 'manual' ? 'subscription.revoke.manual' : 'subscription.cancel.paid',
       guildId,
-      subscriptionId: active.id,
-      providerId: active.providerId,
-      metadata: { immediately: true },
+      subscriptionId: cancelled.id,
+      providerId: cancelled.providerId,
+      metadata,
     });
-    void dispatchPremiumNotification(guildId, 'paid.sub.cancelled-by-user', {
-      tierName: this.config.tiers[active.tierId]?.displayName || active.tierId,
-      providerName: this.providerDisplayName(active.providerId),
-    });
-    delete subs!.active;
-    if (subs!.paused.length > 0) this.resumeNext(guildId);
-    if (this.guildSubsEmpty(subs!)) delete this.config.subscriptions[guildId];
-    return this.save();
+    if (notifyOwner) {
+      void this.notify(guildId, 'paid.sub.cancelled-by-user', {
+        tierName: this.config.tiers[cancelled.tierId]?.displayName || cancelled.tierId,
+        providerName: this.providerDisplayName(cancelled.providerId),
+      });
+    }
+    if (inActive) {
+      delete subs.active;
+      if (subs.paused.length > 0) this.resumeNext(guildId);
+    } else {
+      subs.paused.splice(at, 1);
+    }
+    if (this.guildSubsEmpty(subs)) delete this.config.subscriptions[guildId];
+    return this.save() ? 'done' : 'not saved';
+  }
+
+  /**
+   * After the stop the other op's removal is judged by the last save this cache handed to the disk: an unlanded one is
+   * waited on (a deposition's drop answers writer-lost). lastRaw changes only on an accepted save, so a removal held or
+   * made only in memory still shows the subscription there and is not saved.
+   */
+  private saveRemovedMeanwhile(guildId: string, subscriptionId: string): CancelStep {
+    if (!this.stopped) return this.save() ? 'done' : 'not saved';
+    if (this.savedStillHolds(guildId, subscriptionId)) {
+      recordRefusal(stopCause(this.stopped), PREMIUM_DOC);
+      return 'not saved';
+    }
+    if (this.lastSaveTicket && !landed(this.lastSaveTicket)) recordTicket(this.lastSaveTicket);
+    return 'done';
+  }
+
+  /** True when the last saved or loaded text still holds the subscription, or that text is not known. */
+  private savedStillHolds(guildId: string, subscriptionId: string): boolean {
+    if (typeof this.lastRaw !== 'string') return true;
+    try {
+      const subs = (JSON.parse(this.lastRaw) as PremiumConfig).subscriptions?.[guildId];
+      if (!subs) return false;
+      return subs.active?.id === subscriptionId || (subs.paused ?? []).some(p => p.id === subscriptionId);
+    } catch {
+      return true;
+    }
   }
 
   /**
@@ -1957,12 +2941,13 @@ export class PremiumManager {
    * queue. Provider call must succeed before we drop the queue entry.
    */
   async cancelAndRemovePausedSubscription(guildId: string, subscriptionId: string): Promise<boolean> {
-    this.ensureLoaded();
-    const subs = this.config.subscriptions[guildId];
-    if (!subs?.paused || subs.paused.length === 0) return false;
-    const idx = subs.paused.findIndex(p => p.id === subscriptionId);
-    if (idx < 0) return false;
-    const removed = subs.paused[idx];
+    return (await this.cancelPausedStep(guildId, subscriptionId)) === 'done';
+  }
+
+  private async cancelPausedStep(guildId: string, subscriptionId: string): Promise<CancelStep> {
+    if (this.refusedAtEntry()) return 'not saved';
+    const removed = this.config.subscriptions[guildId]?.paused.find(p => p.id === subscriptionId);
+    if (!removed) return 'gone';
 
     if (removed.source === 'paid' && removed.providerId && removed.providerSubId) {
       const provider = getPaymentRegistry().get(removed.providerId);
@@ -1970,19 +2955,7 @@ export class PremiumManager {
         await provider.cancelSubscription(removed.providerSubId, true);
       }
     }
-
-    subs.paused.splice(idx, 1);
-    if (this.guildSubsEmpty(subs)) delete this.config.subscriptions[guildId];
-    this.writeAudit({
-      timestamp: new Date().toISOString(),
-      actor: 'admin',
-      action: removed.source === 'manual' ? 'subscription.revoke.manual' : 'subscription.cancel.paid',
-      guildId,
-      subscriptionId: removed.id,
-      providerId: removed.providerId,
-      metadata: { fromPausedQueue: true },
-    });
-    return this.save();
+    return this.dropCancelledSubscription(guildId, removed, { fromPausedQueue: true }, false);
   }
 
   // ============================================================================
@@ -2025,7 +2998,7 @@ export class PremiumManager {
   }
 
   async adoptOrphan(guildId: string, providerId: string, providerSubId: string): Promise<boolean> {
-    this.ensureLoaded();
+    if (this.refusedAtEntry()) return false;
     const provider = getPaymentRegistry().get(providerId);
     if (!provider?.listSubscriptionsForGuild) {
       throw new Error(`Provider '${providerId}' does not support orphan listing.`);
@@ -2068,6 +3041,7 @@ export class PremiumManager {
   }
 
   async cancelOrphan(providerId: string, providerSubId: string): Promise<boolean> {
+    if (this.refusedAtEntry()) return false;
     const provider = getPaymentRegistry().get(providerId);
     if (!provider) throw new Error(`Provider '${providerId}' is not registered.`);
     if (!provider.cancelSubscription || !provider.capabilities.supportsCancel) {
@@ -2114,7 +3088,7 @@ export class PremiumManager {
    * is empty (no point creating an empty record).
    */
   setNotificationsChannelId(guildId: string, channelId: string | null): boolean {
-    this.ensureLoaded();
+    if (this.refusedAtEntry()) return false;
     const next = (channelId && channelId.trim()) ? channelId.trim() : undefined;
     const subs = this.config.subscriptions[guildId];
     if (!subs && !next) return false;
@@ -2227,7 +3201,7 @@ export class PremiumManager {
   }
 
   linkAccount(providerId: string, externalAccountId: string, guildId: string): boolean {
-    this.ensureLoaded();
+    if (this.refusedAtEntry()) return false;
     if (!this.config.providerAccountLinks[providerId]) {
       this.config.providerAccountLinks[providerId] = {};
     }
@@ -2238,12 +3212,41 @@ export class PremiumManager {
   }
 
   unlinkAccount(providerId: string, externalAccountId: string): boolean {
-    this.ensureLoaded();
+    if (this.refusedAtEntry()) return false;
     const links = this.config.providerAccountLinks[providerId];
     if (!links) return true;
     delete links[externalAccountId];
     if (Object.keys(links).length === 0) delete this.config.providerAccountLinks[providerId];
     return this.save();
+  }
+
+  /**
+   * Cancels the paid subscriptions a provider backs on this guild (paused first, then the active one) and then clears
+   * the guild's link for that provider, as one change. False when the guild has no link for it. A step that did not
+   * save stops it with the link kept, so the same request can finish the change; the op's verdict answers the failure.
+   * The subscriptions are read again before each step, since other changes may move or remove them meanwhile.
+   */
+  async unlinkProviderAccount(guildId: string, providerId: string): Promise<boolean> {
+    if (this.refusedAtEntry()) return false;
+    const links = this.config.providerAccountLinks[providerId] || {};
+    const externalAccountId = Object.entries(links).find(([, gid]) => gid === guildId)?.[0];
+    if (!externalAccountId) return false;
+    const tried = new Set<string>();
+    for (;;) {
+      const subs = this.config.subscriptions[guildId];
+      const next = [...(subs?.paused || []), ...(subs?.active ? [subs.active] : [])]
+        .find(s => s.source === 'paid' && s.providerId === providerId && s.id && !tried.has(s.id));
+      if (!next) break;
+      tried.add(next.id);
+      const step = subs!.active?.id === next.id
+        ? await this.cancelActiveImmediately(guildId)
+        : await this.cancelPausedStep(guildId, next.id);
+      if (step === 'not saved') return true;
+    }
+    if (this.config.providerAccountLinks[providerId]?.[externalAccountId] === guildId) {
+      this.unlinkAccount(providerId, externalAccountId);
+    }
+    return true;
   }
 
   // ============================================================================
@@ -2254,6 +3257,12 @@ export class PremiumManager {
     if (this.expiryTimer) return;
     this.expiryTimer = setInterval(() => {
       if (isMaintenanceGateClosed()) return;
+      this.ensureLoaded();
+      if (this.unreadable) {
+        console.warn(`[PremiumManager] Skipped the expiry check: ${this.unreadable.file} cannot be read (${this.unreadable.cause})`);
+        return;
+      }
+      if (this.replay || this.stopped) return;
       this.checkExpiry();
       void this.processDueMigrations().catch(err => {
         console.error('[PremiumManager] processDueMigrations failed:', err);
@@ -2286,6 +3295,7 @@ export class PremiumManager {
    */
   private checkExpiry(): void {
     this.ensureLoaded();
+    if (this.cannotWrite()) return;
     let changed = false;
     const now = Date.now();
     const nowIso = new Date().toISOString();
@@ -2315,7 +3325,7 @@ export class PremiumManager {
           subscriptionId: active.id,
           metadata: { reason: 'expired' },
         });
-        void dispatchPremiumNotification(guildId, 'manual.grant.ended', {
+        void this.notify(guildId, 'manual.grant.ended', {
           tierName,
           notes: expiredNotes,
         });
@@ -2334,7 +3344,7 @@ export class PremiumManager {
       if (endMs - now > ENDING_SOON_WINDOW_MS) continue;
       if (this.endingSoonNotified.has(active.id)) continue;
       this.endingSoonNotified.add(active.id);
-      void dispatchPremiumNotification(guildId, 'manual.grant.ending-soon', {
+      void this.notify(guildId, 'manual.grant.ending-soon', {
         tierName: this.config.tiers[active.tierId]?.displayName || active.tierId,
         endDate: active.endDate,
       });
@@ -2357,7 +3367,7 @@ export class PremiumManager {
   }
 
   setMessages(partial: Partial<PremiumMessages>): boolean {
-    this.ensureLoaded();
+    if (this.refusedAtEntry()) return false;
     const before = { ...this.config.messages };
     this.config.messages = { ...this.config.messages, ...partial };
     const ok = this.save();
@@ -2374,7 +3384,7 @@ export class PremiumManager {
   }
 
   resetMessages(): boolean {
-    this.ensureLoaded();
+    if (this.refusedAtEntry()) return false;
     const before = { ...this.config.messages };
     this.config.messages = { ...DEFAULT_MESSAGES };
     const ok = this.save();
@@ -2438,7 +3448,7 @@ export class PremiumManager {
   }
 
   setMigrationSilencePolicy(policy: 'cancel' | 'continue'): boolean {
-    this.ensureLoaded();
+    if (this.refusedAtEntry()) return false;
     if (policy !== 'cancel' && policy !== 'continue') return false;
     const before = this.config.migrationSilencePolicy;
     if (before === policy) return true;
@@ -2481,7 +3491,7 @@ export class PremiumManager {
     message: string;
     scheduledBy?: string;
   }): Promise<Migration> {
-    this.ensureLoaded();
+    if (this.refusedAtEntry()) throw new Error(this.refusalText());
     if (opts.sourceVariantId === opts.targetVariantId
       && opts.sourceOfferingId === opts.targetOfferingId
       && opts.sourceTierId === opts.targetTierId) {
@@ -2573,7 +3583,7 @@ export class PremiumManager {
       details: opts.message || `Your subscription will move from "${sourceTier.displayName}" to "${targetTier.displayName}". Open the subscription panel to accept or decline.`,
     };
     for (const d of migration.decisions) {
-      void dispatchPremiumNotification(d.guildId, 'migration.scheduled', notice).then((outcome) => {
+      void this.notify(d.guildId, 'migration.scheduled', notice).then((outcome) => {
         if (outcome.delivered) this.markMigrationNotified(migration.id, d.subscriptionId, new Date().toISOString());
         else console.warn(`[PremiumManager] Migration ${migration.id} request not delivered to guild ${d.guildId}: ${outcome.cause}`);
       });
@@ -2584,6 +3594,7 @@ export class PremiumManager {
 
   private markMigrationNotified(migrationId: string, subscriptionId: string, stamp: string): void {
     this.ensureLoaded();
+    if (this.cannotWrite()) return;
     const migration = this.config.migrations.find(m => m.id === migrationId);
     const entry = migration?.decisions.find(d => d.subscriptionId === subscriptionId);
     if (!entry || entry.notifiedAt) return;
@@ -2597,11 +3608,12 @@ export class PremiumManager {
    * is applied.
    */
   recordMigrationDecision(migrationId: string, guildId: string, decision: 'accepted' | 'declined'): boolean {
-    this.ensureLoaded();
+    if (this.refusedAtEntry()) return false;
     if (decision !== 'accepted' && decision !== 'declined') return false;
     const migration = this.config.migrations.find(m => m.id === migrationId);
     if (!migration) return false;
     if (migration.status !== 'pending') return false;
+    if (this.migrating.has(migrationId)) throw new MigrationBusy();
     const entry = migration.decisions.find(d => d.guildId === guildId);
     if (!entry) return false;
     if (entry.decision === decision) return true;
@@ -2618,7 +3630,7 @@ export class PremiumManager {
         metadata: { decision },
       });
       const targetTier = this.config.tiers[migration.targetTierId];
-      void dispatchPremiumNotification(guildId, decision === 'accepted' ? 'migration.accepted' : 'migration.declined', {
+      void this.notify(guildId, decision === 'accepted' ? 'migration.accepted' : 'migration.declined', {
         tierName: targetTier?.displayName || migration.targetTierId,
         endDate: migration.effectiveDate,
       });
@@ -2630,10 +3642,11 @@ export class PremiumManager {
    * migration record itself are kept (status -> 'cancelled') so the audit
    * trail and any in-flight subscriber UI can still resolve the id. */
   cancelMigration(migrationId: string): boolean {
-    this.ensureLoaded();
+    if (this.refusedAtEntry()) return false;
     const migration = this.config.migrations.find(m => m.id === migrationId);
     if (!migration) return false;
     if (migration.status !== 'pending') return false;
+    if (this.migrating.has(migrationId)) throw new MigrationBusy();
     migration.status = 'cancelled';
     const ok = this.save();
     if (ok) {
@@ -2662,15 +3675,36 @@ export class PremiumManager {
    */
   async processDueMigrations(): Promise<void> {
     this.ensureLoaded();
+    if (this.cannotWrite() || this.migrationsRunning) return;
     const now = Date.now();
-    const due = this.config.migrations.filter(m => m.status === 'pending' && Date.parse(m.effectiveDate) <= now);
-    if (due.length === 0) return;
-    for (const migration of due) {
-      await this.applyMigration(migration);
+    const tried = new Set<string>();
+    // Read again before each one: a migration cancelled or applied while an earlier one ran is left alone.
+    const nextDue = () => this.config.migrations.find(m =>
+      m.status === 'pending' && Date.parse(m.effectiveDate) <= now && !this.migrating.has(m.id) && !tried.has(m.id));
+    if (!nextDue()) return;
+    this.migrationsRunning = true;
+    try {
+      for (let migration = nextDue(); migration && !this.cannotWrite(); migration = nextDue()) {
+        tried.add(migration.id);
+        await this.applyMigration(migration);
+      }
+    } finally {
+      this.migrationsRunning = false;
     }
   }
 
   private async applyMigration(migration: Migration): Promise<void> {
+    if (this.migrating.has(migration.id) || migration.status !== 'pending' || this.cannotWrite()) return;
+    if (!this.config.migrations.includes(migration)) return;
+    this.migrating.add(migration.id);
+    try {
+      await this.applyMigrationMarked(migration);
+    } finally {
+      this.migrating.delete(migration.id);
+    }
+  }
+
+  private async applyMigrationMarked(migration: Migration): Promise<void> {
     const provider = getPaymentRegistry().get(migration.providerId);
     if (!provider || !provider.migrateSubscriptionPrice) {
       // Provider gone since scheduling; mark cancelled rather than apply.
@@ -2692,6 +3726,8 @@ export class PremiumManager {
     const stamp = new Date().toISOString();
 
     for (const decision of migration.decisions) {
+      if (this.cannotWrite()) return;
+      if (decision.appliedAt) continue;
       // Skip if guild lost their sub (cancelled before effective date).
       const subs = this.config.subscriptions[decision.guildId];
       if (!subs) {
@@ -2730,10 +3766,10 @@ export class PremiumManager {
         continue;
       }
 
-      const effective = decision.decision === 'pending'
+      const wasSilent = decision.decision === 'pending' || decision.decision === 'silent-applied';
+      const effective = wasSilent
         ? (policy === 'continue' ? 'accepted' : 'declined')
         : decision.decision;
-      const wasSilent = decision.decision === 'pending';
       if (wasSilent) decision.decision = 'silent-applied';
 
       try {
@@ -2741,18 +3777,24 @@ export class PremiumManager {
           await provider.migrateSubscriptionPrice(sub.providerSubId, migration.targetVariantId, 'none');
           // Update local cache to match the new variant. Provider webhooks
           // may also fire and we'll reconcile on top.
-          sub.tierId = migration.targetTierId;
-          sub.offeringId = migration.targetOfferingId;
-          sub.variantId = migration.targetVariantId;
-          sub.updatedAt = stamp;
+          const current = this.subscriptionById(decision.guildId, sub.id);
+          if (current) {
+            current.tierId = migration.targetTierId;
+            current.offeringId = migration.targetOfferingId;
+            current.variantId = migration.targetVariantId;
+            current.updatedAt = stamp;
+          }
           decision.outcome = 'migrated';
         } else {
           // declined OR silent + 'cancel' policy
           if (provider.cancelSubscription && provider.capabilities.supportsCancel) {
             await provider.cancelSubscription(sub.providerSubId, false);
           }
-          sub.autoRenew = false;
-          sub.updatedAt = stamp;
+          const current = this.subscriptionById(decision.guildId, sub.id);
+          if (current) {
+            current.autoRenew = false;
+            current.updatedAt = stamp;
+          }
           decision.outcome = 'cancelled';
         }
       } catch (err: any) {
@@ -2763,17 +3805,18 @@ export class PremiumManager {
 
       // Per-decision notification.
       if (wasSilent) {
-        void dispatchPremiumNotification(decision.guildId, 'migration.silence-applied', {
+        void this.notify(decision.guildId, 'migration.silence-applied', {
           tierName: targetTier?.displayName || migration.targetTierId,
           details: policy === 'continue' ? 'Migrated to the new plan automatically.' : 'Set to cancel at period end.',
         });
       } else if (decision.outcome === 'migrated') {
-        void dispatchPremiumNotification(decision.guildId, 'migration.applied', {
+        void this.notify(decision.guildId, 'migration.applied', {
           tierName: targetTier?.displayName || migration.targetTierId,
           providerName: this.providerDisplayName(migration.providerId),
         });
       }
     }
+    if (this.cannotWrite()) return;
 
     migration.status = 'applied';
     migration.appliedAt = stamp;
@@ -2810,6 +3853,7 @@ export class PremiumManager {
   }
 
   setFullConfig(config: PremiumConfig): boolean {
+    if (this.refusedAtEntry()) return false;
     if (!config.tiers || typeof config.tiers !== 'object') return false;
     for (const [id, t] of Object.entries(config.tiers)) {
       if (!t.overrides) t.overrides = {};
@@ -2830,6 +3874,7 @@ export class PremiumManager {
       activatedProviders: config.activatedProviders || {},
       migrations: Array.isArray(config.migrations) ? config.migrations : [],
       migrationSilencePolicy: config.migrationSilencePolicy === 'continue' ? 'continue' : 'cancel',
+      ...(this.config.eventsApplied ? { eventsApplied: this.config.eventsApplied } : {}),
     };
     return this.save();
   }
@@ -2840,20 +3885,47 @@ export function getPremiumManager(): PremiumManager {
   if (!instance) {
     instance = new PremiumManager();
     instance.load();
-    // Both bot and forked web-UI process import this singleton, but only
-    // the bot should own the expiry ticker. Without this gate, both
-    // processes would write the same expiry to disk every minute and DM
-    // the user twice for the same `manual.grant.ended` event. Web-UI
-    // picks up the bot's writes via mtime reload on each operation.
-    if (process.env.BOT_PROCESS_ROLE === 'bot' && !isMaintenanceBoot()) {
-      instance.startExpiryChecker();
-    }
   }
   return instance;
 }
+
+/**
+ * Starts the expiry checker and the payment providers' ticks once the bot has its Discord client (decision 23 of NB10),
+ * and the replay of kept provider events that waits for it. Only the bot process outside maintenance owns them.
+ */
+export function startPremiumTickers(): void {
+  if (!isBotProcess() || isMaintenanceBoot()) return;
+  tickersStarted = true;
+  const manager = getPremiumManager();
+  manager.startExpiryChecker();
+  getPaymentRegistry().startTickers();
+  manager.startReplayIfReady();
+}
+
+/** The bot holds provider events it has not applied yet, or applies them now: the ticks skip. */
+export function isPremiumReplaying(): boolean {
+  return instance?.cacheState() === 'replaying';
+}
+
+/** Waits for the installs an op's events started under its ledger; nothing to wait for before PremiumManager exists. */
+export function settlePremiumInstalls(ledger: WriteLedger): Promise<void> {
+  return instance ? instance.settled(ledger) : Promise.resolve();
+}
+
+/** Drops this process's premium cache, when one exists (the local chain, after an op that was not ok). */
+export function invalidatePremiumCache(): void {
+  instance?.invalidate();
+}
+
+// What this process knew of premium-tiers.json may be stale after another holder of the writer lock.
+onWriterTake(invalidatePremiumCache);
 
 /** Reset the singleton (for tests). */
 export function resetPremiumManager(): void {
   if (instance) instance.dispose();
   instance = null;
+  tickersStarted = false;
+  // A new manager stands for a new bot process: it journals under its own writer id.
+  writerId = crypto.randomUUID();
+  journalSeq = 0;
 }

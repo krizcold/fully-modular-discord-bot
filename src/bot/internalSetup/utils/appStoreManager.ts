@@ -19,6 +19,7 @@ import { ModuleManifest } from '../../types/moduleTypes';
 import { ensureDir, getModulesDir, getSourceModulesDir, getBuildModulesDir, getModulesDevDir } from './pathHelpers';
 import { dataPath } from '../../../utils/dataRoot';
 import { takeAutoSnapshot } from '@/utils/autoSnapshot';
+import { ProcessLock, processStart } from './processLock';
 
 /**
  * Find a Dev module whose manifest name matches. Installing a store module
@@ -200,109 +201,29 @@ const GIT_TIMEOUT_MS = 45_000;
 
 type FileState = 'read' | 'missing' | 'unreadable';
 
-let lockDepth = 0;
-
 function sleepSync(ms: number): void {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
-let bootId: string | null | undefined;
-
 /** Identifies one run of a process, so a pid reused after a restart is not taken for the old holder. */
-export const storeLockHolder = {
-  startOf(pid: number): string | null {
-    try {
-      if (bootId === undefined) {
-        try { bootId = fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf-8').trim(); } catch { bootId = null; }
-      }
-      const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf-8');
-      const starttime = stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19];
-      return starttime ? `${bootId ?? ''}:${starttime}` : null;
-    } catch {
-      return null;
-    }
-  }
-};
+export const storeLockHolder = processStart;
+
+const storeLock = new ProcessLock({
+  lockPath: LOCK_PATH,
+  takeoverPath: TAKEOVER_PATH,
+  unparsableStaleMs: LOCK_UNREADABLE_STALE_MS,
+  takeoverStaleMs: TAKEOVER_STALE_MS,
+});
 
 function lockBusyError(): Error {
   return new Error('Another App Store change is still running, so nothing was changed. Try again in a minute.');
 }
 
-/** The lock file's text when its holder is gone, 'missing' when there is no lock, or null when it is held. */
-function staleLockContent(): string | 'missing' | null {
-  let raw: string;
-  let mtimeMs: number;
-  try {
-    raw = fs.readFileSync(LOCK_PATH, 'utf-8');
-    mtimeMs = fs.statSync(LOCK_PATH).mtimeMs;
-  } catch (error: any) {
-    return error?.code === 'ENOENT' ? 'missing' : null;
-  }
-  let holder: any;
-  try {
-    holder = JSON.parse(raw);
-  } catch {
-    holder = undefined;
-  }
-  const pid = holder?.pid;
-  if (typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 0) {
-    return Date.now() - mtimeMs > LOCK_UNREADABLE_STALE_MS ? raw : null;
-  }
-  if (pid === process.pid) return raw;
-  try {
-    process.kill(pid, 0);
-  } catch (error: any) {
-    return error?.code === 'ESRCH' ? raw : null;
-  }
-  if (typeof holder.start === 'string') {
-    const start = storeLockHolder.startOf(pid);
-    if (start !== null && start !== holder.start) return raw;
-  }
-  return null;
-}
-
-/** Removes a stale lock only under a takeover guard, and only if it still holds the stale text seen. */
-function takeOverStaleLock(seen: string): void {
-  try {
-    fs.closeSync(fs.openSync(TAKEOVER_PATH, 'wx'));
-  } catch (error: any) {
-    if (error?.code !== 'EEXIST') throw error;
-    try {
-      if (Date.now() - fs.statSync(TAKEOVER_PATH).mtimeMs > TAKEOVER_STALE_MS) fs.unlinkSync(TAKEOVER_PATH);
-    } catch { /* its holder removed it */ }
-    return;
-  }
-  try {
-    if (staleLockContent() === seen) fs.unlinkSync(LOCK_PATH);
-  } catch { /* another process took it over first */ } finally {
-    try { fs.unlinkSync(TAKEOVER_PATH); } catch { /* already gone */ }
-  }
-}
-
 function tryAcquireStoreLock(): boolean {
-  if (lockDepth > 0) {
-    lockDepth++;
-    return true;
-  }
-  ensureDir(CACHE_DIR);
-  for (let attempt = 0; attempt < 3; attempt++) {
-    try {
-      const fd = fs.openSync(LOCK_PATH, 'wx');
-      try {
-        fs.writeSync(fd, JSON.stringify({ pid: process.pid, start: storeLockHolder.startOf(process.pid), at: Date.now() }));
-      } finally {
-        fs.closeSync(fd);
-      }
-      lockDepth = 1;
-      return true;
-    } catch (error: any) {
-      if (error?.code !== 'EEXIST') throw error;
-    }
-    const stale = staleLockContent();
-    if (stale === null) return false;
-    if (stale !== 'missing') takeOverStaleLock(stale);
-  }
-  return false;
+  if (storeLock.depth === 0) ensureDir(CACHE_DIR);
+  const taken = storeLock.tryTake();
+  if (taken.kind === 'unwritable') throw taken.error;
+  return taken.kind === 'taken';
 }
 
 /** For synchronous callers only; it blocks the event loop while it waits. */
@@ -321,13 +242,7 @@ async function waitBeforeLockRetry(deadline: number): Promise<void> {
 }
 
 function releaseStoreLock(): void {
-  if (lockDepth === 0) return;
-  lockDepth--;
-  if (lockDepth > 0) return;
-  try {
-    const holder = JSON.parse(fs.readFileSync(LOCK_PATH, 'utf-8'));
-    if (holder?.pid === process.pid) fs.unlinkSync(LOCK_PATH);
-  } catch { /* already gone */ }
+  storeLock.release();
 }
 
 function fileStamp(file: string): string {
@@ -578,14 +493,14 @@ export class AppStoreManager {
 
   /** Run a synchronous section under the cross-process store lock. */
   private locked<T>(fn: () => T): T {
-    const outer = lockDepth === 0;
+    const outer = storeLock.depth === 0;
     acquireStoreLock();
     return this.runHeld(outer, fn);
   }
 
   /** Like locked, but waits for the lock without blocking the event loop. */
   private async lockedAsync<T>(fn: () => T): Promise<T> {
-    const outer = lockDepth === 0;
+    const outer = storeLock.depth === 0;
     const deadline = Date.now() + LOCK_WAIT_MS;
     while (!tryAcquireStoreLock()) await waitBeforeLockRetry(deadline);
     return this.runHeld(outer, fn);
@@ -631,7 +546,7 @@ export class AppStoreManager {
       this.reposConfig = { repositories: [] };
       this.setAside(REPOS_CONFIG_PATH, stamp, result.error);
     }
-    this.reposFresh = lockDepth > 0 && result.state !== 'unreadable';
+    this.reposFresh = storeLock.depth > 0 && result.state !== 'unreadable';
   }
 
   private readInstalled(): void {
@@ -647,12 +562,12 @@ export class AppStoreManager {
       this.installedConfig = { modules: {} };
       this.setAside(INSTALLED_CONFIG_PATH, stamp, result.error);
     }
-    this.installedFresh = lockDepth > 0 && result.state !== 'unreadable';
+    this.installedFresh = storeLock.depth > 0 && result.state !== 'unreadable';
   }
 
   /** Pick up a write the other process made since this one last read. */
   private refreshFromDisk(): void {
-    if (lockDepth > 0) return;
+    if (storeLock.depth > 0) return;
     if (fileStamp(REPOS_CONFIG_PATH) !== this.reposStamp) this.readRepos();
     if (fileStamp(INSTALLED_CONFIG_PATH) !== this.installedStamp) this.readInstalled();
   }
@@ -729,7 +644,7 @@ export class AppStoreManager {
    * lock and read repos.json under it, so a stale copy never overwrites the file.
    */
   private saveRepos(): boolean {
-    if (lockDepth === 0 || !this.reposFresh) {
+    if (storeLock.depth === 0 || !this.reposFresh) {
       console.error('[AppStoreManager] Refused to save repos config: it was not read under the store lock');
       return false;
     }
@@ -749,7 +664,7 @@ export class AppStoreManager {
    * Save installed configuration, under the same rule as saveRepos.
    */
   private saveInstalled(): boolean {
-    if (lockDepth === 0 || !this.installedFresh) {
+    if (storeLock.depth === 0 || !this.installedFresh) {
       console.error('[AppStoreManager] Refused to save installed config: it was not read under the store lock');
       return false;
     }
@@ -1847,7 +1762,7 @@ export class AppStoreManager {
     } finally {
       if (lockHeld) {
         releaseStoreLock();
-        if (lockDepth === 0) {
+        if (storeLock.depth === 0) {
           this.reposFresh = false;
           this.installedFresh = false;
         }
