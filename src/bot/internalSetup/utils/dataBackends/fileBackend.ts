@@ -13,6 +13,7 @@ import * as path from 'path';
 import { DATA_ROOT } from '../../../../utils/dataRoot';
 import { DataBackendUnavailableError } from './workingSet';
 import type { RestoreStop } from './backend';
+import { fold, keyRefusal, KeyTree } from '../storableData';
 
 const BASE_DATA_DIR = DATA_ROOT;
 
@@ -37,7 +38,46 @@ export type PendingOp =
 
 // Keyed by absolute target path. One in-flight flush per path (serialized), so
 // a queued delete can never be overtaken by an earlier write and vice versa.
-const pendingOps = new Map<string, PendingOp>();
+const pendingOps = new (class extends Map<string, PendingOp> {
+  // Per guild folder, its queued paths by key (path form), so a guild write reads only its own guild's queue.
+  readonly byGuild = new Map<string, Map<string, string>>();
+
+  private guildKey(absPath: string): [string, string] | undefined {
+    const rel = path.relative(BASE_DATA_DIR, path.resolve(absPath));
+    if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) return undefined;
+    const parts = rel.split(path.sep);
+    if (parts.length < 2) return undefined;
+    return [parts[0], parts.slice(1).join('/')];
+  }
+
+  set(absPath: string, op: PendingOp): this {
+    super.set(absPath, op);
+    const at = this.guildKey(absPath);
+    if (at) {
+      let keys = this.byGuild.get(at[0]);
+      if (!keys) {
+        keys = new Map();
+        this.byGuild.set(at[0], keys);
+      }
+      keys.set(at[1], absPath);
+    }
+    return this;
+  }
+
+  delete(absPath: string): boolean {
+    const at = this.guildKey(absPath);
+    if (at) {
+      const keys = this.byGuild.get(at[0]);
+      if (keys?.delete(at[1]) && keys.size === 0) this.byGuild.delete(at[0]);
+    }
+    return super.delete(absPath);
+  }
+
+  clear(): void {
+    this.byGuild.clear();
+    super.clear();
+  }
+})();
 const flushing = new Set<string>();
 const scheduled = new Set<string>();
 /** Paths a deposition's cancel holds: no flush of them starts. */
@@ -155,29 +195,40 @@ function clearRetry(absPath: string): void {
 
 const IS_WINDOWS = process.platform === 'win32';
 
+// The temp files this process has open, from the open to the rename or the unlink.
+const openTemps = new Set<string>();
+
 async function atomicReplace(target: string, content: string): Promise<void> {
   await fs.promises.mkdir(path.dirname(target), { recursive: true });
   const tmp = tmpNameFor(target);
   const fh = await fs.promises.open(tmp, 'w');
+  openTemps.add(tmp);
   try {
-    await fh.writeFile(content, 'utf-8');
-    await fh.sync();
-  } finally {
-    await fh.close();
-  }
-  // Windows can throw EPERM on rename-over-existing while a reader (e.g. the
-  // webui parent) holds the target open; retry with a short backoff. NEVER
-  // fall back to a direct overwrite - that reintroduces the torn-file window
-  // the temp+fsync+rename exists to eliminate. On exhaustion the tmp file is
-  // left in place and the caller keeps the pending entry to retry later.
-  for (let attempt = 0; ; attempt++) {
     try {
-      await fs.promises.rename(tmp, target);
-      break;
-    } catch (error) {
-      if (attempt >= 9) throw error;
-      await delay(25 * (attempt + 1));
+      await fh.writeFile(content, 'utf-8');
+      await fh.sync();
+    } finally {
+      await fh.close();
     }
+    // Windows can throw EPERM on rename-over-existing while a reader (e.g. the
+    // webui parent) holds the target open; retry with a short backoff. NEVER
+    // fall back to a direct overwrite - that reintroduces the torn-file window
+    // the temp+fsync+rename exists to eliminate. On exhaustion the caller keeps
+    // the pending entry to retry later.
+    for (let attempt = 0; ; attempt++) {
+      try {
+        await fs.promises.rename(tmp, target);
+        break;
+      } catch (error) {
+        if (attempt >= 9) throw error;
+        await delay(25 * (attempt + 1));
+      }
+    }
+  } catch (error) {
+    await fs.promises.unlink(tmp).catch(() => undefined);
+    throw error;
+  } finally {
+    openTemps.delete(tmp);
   }
   // POSIX best-effort parent-dir fsync so the rename itself is durable.
   if (!IS_WINDOWS) {
@@ -214,6 +265,7 @@ async function flushPath(absPath: string): Promise<boolean> {
         } catch (error: any) {
           if (error?.code !== 'ENOENT') throw error;
         }
+        await removeEmptiedFolders(absPath);
       } else {
         // append: a torn tail line on crash is tolerated (readers skip bad lines).
         // appendFile is cumulative (unlike an idempotent write overwrite), so we
@@ -635,6 +687,8 @@ export function readRaw(absPath: string): string | null {
 /**
  * readRaw for a caller that writes over what it read: null only for a file that
  * is absent or whose delete is queued; one that exists but cannot be read throws.
+ * A folder in its place, or a file at one of its folders, is absent only under a guild
+ * folder, where the write's placement check removes or refuses it; elsewhere it throws.
  */
 export function readRawStrict(absPath: string): string | null {
   const pending = pendingOps.get(absPath);
@@ -644,8 +698,16 @@ export function readRawStrict(absPath: string): string | null {
     return fs.readFileSync(absPath, 'utf-8');
   } catch (error: any) {
     if (error?.code === 'ENOENT') return null;
+    if ((error?.code === 'EISDIR' || error?.code === 'ENOTDIR') && underGuildFolder(absPath)) return null;
     throw error;
   }
+}
+
+function underGuildFolder(absPath: string): boolean {
+  const rel = path.relative(BASE_DATA_DIR, path.resolve(absPath));
+  if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) return false;
+  const parts = rel.split(path.sep);
+  return parts.length >= 2 && /^\d+$/.test(parts[0]);
 }
 
 /** Enqueue an atomic delete of an arbitrary absolute path. */
@@ -677,6 +739,7 @@ export function guildDirExists(guildId: string): boolean {
 
 /** Drop queued entries for every path under /data/{guildId}. */
 export function dropPendingForGuild(guildId: string): void {
+  dropGuildView(guildId);
   const src = path.join(BASE_DATA_DIR, guildId);
   const prefix = src + path.sep;
   for (const key of [...pendingOps.keys()]) {
@@ -693,6 +756,14 @@ export function dropPendingForGuild(guildId: string): void {
  * marker inside. The facade drains and drops pending state first.
  */
 export async function graveyardGuildDir(guildId: string, reason: string, writerLost: () => boolean = () => false, stopBeforeTry: () => boolean = () => false): Promise<boolean> {
+  try {
+    return await moveGuildDirToGraveyard(guildId, reason, writerLost, stopBeforeTry);
+  } finally {
+    dropGuildView(guildId);
+  }
+}
+
+async function moveGuildDirToGraveyard(guildId: string, reason: string, writerLost: () => boolean, stopBeforeTry: () => boolean): Promise<boolean> {
   const src = path.join(BASE_DATA_DIR, guildId);
   // A flush on the wire would re-create the dir beside its graveyard copy: it settles first (bounded).
   const deadline = performance.now() + 5000;
@@ -709,8 +780,10 @@ export async function graveyardGuildDir(guildId: string, reason: string, writerL
     if (stopBeforeTry()) return false;
     try {
       await fs.promises.rename(src, dest);
+      dropGuildView(guildId);
       break;
     } catch (error) {
+      dropGuildView(guildId);
       if (attempt >= 9) {
         console.error(`[DataManager] Failed to move ${guildId} to graveyard:`, error);
         return false;
@@ -791,6 +864,14 @@ const errnoOf = (error: unknown): string => String((error as { code?: unknown } 
  * it in a live folder; every refusal after its removal writes it back, except when the entry is gone.
  */
 export async function restoreGuildDirFromGraveyard(guildId: string, retiredAt: number | undefined, hooks: FileRestoreHooks): Promise<FileRestoreOutcome> {
+  try {
+    return await restoreGuildDir(guildId, retiredAt, hooks);
+  } finally {
+    dropGuildView(guildId);
+  }
+}
+
+async function restoreGuildDir(guildId: string, retiredAt: number | undefined, hooks: FileRestoreHooks): Promise<FileRestoreOutcome> {
   const graveyardRoot = path.join(BASE_DATA_DIR, GRAVEYARD_DIR);
   let entry: { name: string; retiredAt: number } | null = null;
   if (retiredAt !== undefined) {
@@ -858,8 +939,10 @@ export async function restoreGuildDirFromGraveyard(guildId: string, retiredAt: n
     }
     try {
       await fs.promises.rename(entryPath, dest);
+      dropGuildView(guildId);
       break;
     } catch (error) {
+      dropGuildView(guildId);
       const code = errnoOf(error);
       if (code === 'ENOENT') return { ok: false, why: 'no-entry' };
       if (attempt >= 9) {
@@ -1057,5 +1140,369 @@ export async function cleanOrphanTmpFiles(dir: string = BASE_DATA_DIR): Promise<
         }
       } catch { /* vanished mid-sweep */ }
     }
+  }
+}
+
+// ============================================================================
+// PLACEMENT (NB12 rule P on the file route)
+// ============================================================================
+
+/** A folder a listing showed: its exact name, and whether every folder below it has been listed. */
+interface SubFolder {
+  walked: boolean;
+}
+
+/** What one process knows of a guild folder: its keys, and per listed folder the sub-folders its listing showed. */
+interface GuildView {
+  tree: KeyTree;
+  listed: Map<string, Map<string, Map<string, SubFolder>>>;
+}
+
+// On in the bot process (its shard boot): the one process that deletes, retires and restores guild files keeps a view
+// per guild across calls. Off elsewhere: every guild write reads its key's path afresh.
+let viewCache = false;
+const views = new Map<string, GuildView>();
+
+export function setGuildViewCache(on: boolean): void {
+  viewCache = on;
+  views.clear();
+}
+
+export function dropGuildView(guildId: string): void {
+  views.delete(guildId);
+}
+
+export type Placement = { ok: true } | { ok: false; cause: 'unstorable' | 'io'; reason: string };
+
+const guildRoot = (guildId: string): string => path.join(BASE_DATA_DIR, guildId);
+const relJoin = (a: string, b: string): string => (a ? `${a}/${b}` : b);
+const absOf = (guildId: string, rel: string): string => (rel ? path.join(guildRoot(guildId), ...rel.split('/')) : guildRoot(guildId));
+const parentOf = (rel: string): string => (rel.includes('/') ? rel.slice(0, rel.lastIndexOf('/')) : '');
+const nameOf = (rel: string): string => rel.slice(rel.lastIndexOf('/') + 1);
+
+function foldersOfKey(key: string): string[] {
+  const segs = key.split('/');
+  return segs.slice(0, -1).map((_, i) => segs.slice(0, i + 1).join('/'));
+}
+
+/** The guild's paths with an op queued in this process, as keys, by the op. */
+function queuedOf(guildId: string): Map<string, PendingOp['op']> {
+  const out = new Map<string, PendingOp['op']>();
+  for (const [key, p] of pendingOps.byGuild.get(guildId) ?? []) out.set(key, pendingOps.get(p)!.op);
+  return out;
+}
+
+function viewOf(guildId: string): GuildView {
+  if (!viewCache) return freshView(guildId);
+  let view = views.get(guildId);
+  if (!view) {
+    view = freshView(guildId);
+    views.set(guildId, view);
+  }
+  return view;
+}
+
+function freshView(guildId: string): GuildView {
+  const view: GuildView = { tree: new KeyTree(), listed: new Map() };
+  for (const [key, op] of queuedOf(guildId)) if (op !== 'delete') view.tree.add(key);
+  return view;
+}
+
+/** One listing of a folder: its files (no .tmp, none with a delete queued here) into the tree, its folders recorded. */
+function listFolder(guildId: string, view: GuildView, rel: string): void {
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(absOf(guildId, rel), { withFileTypes: true });
+  } catch (error: any) {
+    if (error?.code !== 'ENOENT' && error?.code !== 'ENOTDIR') throw error;
+    entries = [];
+  }
+  const subs = new Map<string, Map<string, SubFolder>>();
+  const refused: string[] = [];
+  let collided = 0;
+  const firsts: string[] = [];
+  for (const entry of entries) {
+    if (entry.isDirectory()) {
+      const f = fold(entry.name);
+      let spellings = subs.get(f);
+      if (!spellings) {
+        spellings = new Map();
+        subs.set(f, spellings);
+      }
+      spellings.set(entry.name, { walked: false });
+      continue;
+    }
+    if (entry.name.endsWith('.tmp')) continue;
+    const key = relJoin(rel, entry.name);
+    if (pendingOps.get(absOf(guildId, key))?.op === 'delete') continue;
+    if (view.tree.has(key)) continue;
+    const collision = view.tree.add(key);
+    const refusal = keyRefusal(key);
+    if (refusal) {
+      refused.push(key);
+      if (firsts.length < 3) firsts.push(`${key}: ${refusal}`);
+    } else if (collision) {
+      collided += 1;
+      if (firsts.length < 3) firsts.push(`${key}: ${collision.reason}`);
+    }
+  }
+  view.listed.set(rel, subs);
+  if (refused.length > 0 || collided > 0) {
+    console.error(`[Data] Guild ${guildId} holds, in ${rel || 'its folder'}, ${refused.length} key(s) a write is refused for and ${collided} key(s) whose name collides with another stored key (first: ${firsts.join(', ')}). They read and delete as stored; a write to a refused key is refused, and a colliding key takes writes under its own spelling; tell the module's author`);
+  }
+}
+
+/** Lists a folder and every folder below it; a walked folder that holds no key is removed when it can be. */
+function walkFolder(guildId: string, view: GuildView, rel: string, remove = true): void {
+  listFolder(guildId, view, rel);
+  const subs = view.listed.get(rel)!;
+  for (const spellings of [...subs.values()]) {
+    for (const [name, sub] of [...spellings]) {
+      walkFolder(guildId, view, relJoin(rel, name), remove);
+      sub.walked = true;
+    }
+  }
+  if (remove && rel && !view.tree.hasFolder(rel)) removeKeylessFolder(guildId, view, rel);
+}
+
+/** Reads what P's answer for key depends on: the folders along its path, and the folders that match one of its parts under the fold. */
+function readPath(guildId: string, view: GuildView, key: string, remove = true): void {
+  const segs = key.split('/');
+  let cur = '';
+  for (let i = 0; i < segs.length; i++) {
+    if (!view.listed.has(cur)) listFolder(guildId, view, cur);
+    const subs = view.listed.get(cur);
+    if (!subs) return;
+    const next = segs[i];
+    const last = i === segs.length - 1;
+    const matching = subs.get(fold(next));
+    if (matching) {
+      for (const [name, sub] of [...matching]) {
+        if (sub.walked || (!last && name === next)) continue;
+        walkFolder(guildId, view, relJoin(cur, name), remove);
+        sub.walked = true;
+      }
+    }
+    if (last || !view.listed.get(cur)?.get(fold(next))?.has(next)) return;
+    cur = relJoin(cur, next);
+  }
+}
+
+/** A key the tree lacks along key's path, as lstat shows it: something written by another process since the read. */
+function lacksEntry(guildId: string, view: GuildView, key: string): boolean {
+  for (const rel of [...foldersOfKey(key), key]) {
+    let stat: fs.Stats;
+    try {
+      stat = fs.lstatSync(absOf(guildId, rel));
+    } catch {
+      return false;
+    }
+    if (stat.isDirectory()) {
+      const recorded = view.listed.get(parentOf(rel))?.has(fold(nameOf(rel))) ?? false;
+      if (!recorded && !view.tree.hasFoldedFolder(rel)) return true;
+    } else if (!view.tree.hasFoldedKey(rel)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** Reads key's path again with the folders along it taken as not listed yet. */
+function rereadPath(guildId: string, view: GuildView, key: string): void {
+  view.listed.delete('');
+  for (const folder of foldersOfKey(key)) view.listed.delete(folder);
+  readPath(guildId, view, key);
+}
+
+/** Whether the colliding entry is on disk under its stored spelling (or queued as a write here). */
+function onDisk(guildId: string, entry: string, kind: 'file' | 'folder'): boolean {
+  const op = pendingOps.get(absOf(guildId, entry))?.op;
+  if (kind === 'file' && op !== undefined && op !== 'delete') return true;
+  if (kind === 'file' && op === 'delete') return false;
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(absOf(guildId, parentOf(entry)), { withFileTypes: true });
+  } catch {
+    return false;
+  }
+  const found = entries.find(e => e.name === nameOf(entry));
+  if (!found) return false;
+  return kind === 'folder' ? found.isDirectory() : !found.isDirectory();
+}
+
+const TMP_PID = /\.(\d+)\.\d+(?:\.\d+)?\.tmp$/;
+
+/** A temp file no write in progress can own: this process's and not open here, or older than an hour. */
+function tempFileRemovable(abs: string): boolean {
+  const pid = TMP_PID.exec(path.basename(abs))?.[1];
+  if (pid !== undefined && Number(pid) === process.pid && !openTemps.has(abs)) return true;
+  try {
+    return fs.statSync(abs).mtimeMs < Date.now() - ORPHAN_TMP_MAX_AGE_MS;
+  } catch {
+    return true;
+  }
+}
+
+function removeFolderTree(abs: string): void {
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(abs, { withFileTypes: true });
+  } catch (error: any) {
+    if (error?.code === 'ENOENT') return;
+    throw error;
+  }
+  for (const entry of entries) {
+    const child = path.join(abs, entry.name);
+    if (entry.isDirectory()) removeFolderTree(child);
+    else if (entry.name.endsWith('.tmp') && tempFileRemovable(child)) fs.unlinkSync(child);
+    else throw Object.assign(new Error(`${child} is in the way`), { code: 'ENOTEMPTY' });
+  }
+  fs.rmdirSync(abs);
+}
+
+function forgetFolder(view: GuildView | undefined, rel: string): void {
+  if (!view) return;
+  for (const listed of [...view.listed.keys()]) if (listed === rel || listed.startsWith(`${rel}/`)) view.listed.delete(listed);
+  const spellings = view.listed.get(parentOf(rel))?.get(fold(nameOf(rel)));
+  spellings?.delete(nameOf(rel));
+  if (spellings?.size === 0) view.listed.get(parentOf(rel))?.delete(fold(nameOf(rel)));
+}
+
+/** Removes a folder that holds no key, with the temp files in it no write in progress owns; false when it stays. */
+function removeKeylessFolder(guildId: string, view: GuildView, rel: string): boolean {
+  try {
+    removeFolderTree(absOf(guildId, rel));
+  } catch {
+    return false;
+  }
+  forgetFolder(view, rel);
+  return true;
+}
+
+/** Whether a queued delete of d stands in the way of a write of key. */
+function deleteInTheWay(d: string, key: string): boolean {
+  if (d === key) return false;
+  const fd = fold(d);
+  const fk = fold(key);
+  if (fd === fk || fd.startsWith(`${fk}/`)) return true;
+  for (const folder of foldersOfKey(key)) {
+    const ff = fold(folder);
+    if (fd === ff) return true;
+    if (fd.startsWith(`${ff}/`) && d.slice(0, folder.length) !== folder) return true;
+  }
+  return false;
+}
+
+/** The recorded folders in key's way: k itself, or a case alias of k or of one of its folders. */
+function foldersInTheWay(view: GuildView, key: string): string[] {
+  const segs = key.split('/');
+  const out: string[] = [];
+  let cur = '';
+  for (let i = 0; i < segs.length; i++) {
+    const last = i === segs.length - 1;
+    const matching = view.listed.get(cur)?.get(fold(segs[i]));
+    if (matching && (last || !matching.has(segs[i]))) {
+      for (const name of matching.keys()) {
+        const folder = relJoin(cur, name);
+        if (!view.tree.hasFolder(folder)) out.push(folder);
+      }
+    }
+    if (last || !matching?.has(segs[i])) break;
+    cur = relJoin(cur, segs[i]);
+  }
+  return out;
+}
+
+/**
+ * Rule P for a save or append of key (path form, relative to the guild folder) on the file route: refused
+ * 'unstorable' for a collision on disk or in this process's queue, 'io' while a delete in its way is queued or a
+ * folder in its way that holds no key cannot be removed.
+ */
+export function placeGuildWrite(guildId: string, key: string): Placement {
+  let view = viewOf(guildId);
+  readPath(guildId, view, key);
+  if (viewCache && !view.tree.has(key) && lacksEntry(guildId, view, key)) rereadPath(guildId, view, key);
+  let collision = view.tree.check(key);
+  if (collision && viewCache && !onDisk(guildId, collision.entry, collision.entryKind)) {
+    views.delete(guildId);
+    view = viewOf(guildId);
+    readPath(guildId, view, key);
+    collision = view.tree.check(key);
+  }
+  if (collision) return { ok: false, cause: 'unstorable', reason: collision.reason };
+  for (const [d, op] of queuedOf(guildId)) {
+    if (op === 'delete' && deleteInTheWay(d, key)) return { ok: false, cause: 'io', reason: `a delete of ${d} is still being written` };
+  }
+  let blocked = foldersInTheWay(view, key).find(folder => !removeKeylessFolder(guildId, view, folder));
+  if (blocked === undefined) return { ok: true };
+  // Another process may have written into the folder since this view listed it.
+  views.delete(guildId);
+  const fresh = viewOf(guildId);
+  readPath(guildId, fresh, key);
+  const found = fresh.tree.check(key);
+  if (found) return { ok: false, cause: 'unstorable', reason: found.reason };
+  blocked = foldersInTheWay(fresh, key).find(folder => !removeKeylessFolder(guildId, fresh, folder));
+  if (blocked === undefined) return { ok: true };
+  return { ok: false, cause: 'io', reason: `the folder ${blocked} holds no data but could not be removed` };
+}
+
+/** Rule P without touching the disk, for a check outside the writer: a keyless folder in the way passes. */
+export function guildWriteCollision(guildId: string, key: string): string | null {
+  const view = freshView(guildId);
+  readPath(guildId, view, key, false);
+  return view.tree.check(key)?.reason ?? null;
+}
+
+/** An accepted write of key: the bot's view holds it from now on. */
+export function noteGuildWrite(guildId: string, key: string): void {
+  const view = viewCache ? views.get(guildId) : undefined;
+  if (!view) return;
+  view.tree.add(key);
+  for (const folder of foldersOfKey(key)) {
+    const subs = view.listed.get(parentOf(folder));
+    if (!subs) continue;
+    const f = fold(nameOf(folder));
+    let spellings = subs.get(f);
+    if (!spellings) {
+      spellings = new Map();
+      subs.set(f, spellings);
+    }
+    if (!spellings.has(nameOf(folder))) spellings.set(nameOf(folder), { walked: true });
+  }
+}
+
+/** Whether key is stored under this exact spelling, every part included (a delete's test on the file route). */
+export function guildKeyStored(guildId: string, key: string): boolean {
+  const view = viewOf(guildId);
+  readPath(guildId, view, key);
+  if (view.tree.has(key)) return true;
+  if (viewCache && lacksEntry(guildId, view, key)) rereadPath(guildId, view, key);
+  return view.tree.has(key);
+}
+
+/** An accepted delete of key: the bot's view drops it at once. */
+export function noteGuildDelete(guildId: string, key: string): void {
+  views.get(guildId)?.tree.remove(key);
+}
+
+/** After a delete landed on a guild path: each folder it emptied is removed, up to the guild folder. */
+async function removeEmptiedFolders(absPath: string): Promise<void> {
+  const rel = path.relative(BASE_DATA_DIR, absPath);
+  const parts = rel.split(path.sep);
+  if (parts.length < 3 || !/^\d+$/.test(parts[0])) return;
+  const guildId = parts[0];
+  const root = guildRoot(guildId);
+  let dir = path.dirname(absPath);
+  while (dir !== root && dir.startsWith(root + path.sep)) {
+    try {
+      await fs.promises.rmdir(dir);
+    } catch (error: any) {
+      if (error?.code !== 'ENOTEMPTY' && error?.code !== 'ENOENT' && error?.code !== 'EEXIST') {
+        console.error(`[DataManager] Could not remove the emptied folder ${dir}; it stays empty:`, error?.code ?? error);
+      }
+      return;
+    }
+    forgetFolder(views.get(guildId), path.relative(root, dir).split(path.sep).join('/'));
+    dir = path.dirname(dir);
   }
 }

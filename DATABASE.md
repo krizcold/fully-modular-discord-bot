@@ -42,6 +42,13 @@ Going back is a migration back, `--to file` after a move to Postgres and `--to p
 migration `/data/.backend.json` names it, and a bot whose `DATA_BACKEND` no longer matches that marker refuses to
 start, so switching the setting back alone does not work.
 
+The migration refuses, while it reads and before it writes anything, data that a module write would be refused for:
+a file that is not UTF-8 text or holds U+0000, a key with a name the data layer refuses (a part ending in `.tmp`, a
+Windows device name or reserved character, a part over 200 bytes, a key starting with `.graveyard.json`), and two keys
+or folders that differ only in letter case. The refusal names the file or row. The web UI checks a guild write
+against these rules before it takes its backup and changes nothing on disk while checking; the process that writes the
+file (the bot process, or the web UI while no bot process runs) removes an empty folder in its way.
+
 Before a move to JSON moves the copy in, every guild folder and every `/data/_graveyard` entry already in `/data` goes
 to `/data/_superseded/<UTC time>-<job id>/` (a name such as `20261029T012345678Z-<job id>`; graveyard entries go under
 its `_graveyard/`), whether or not the database holds that guild. In either direction an earlier run's `.migrate-*`

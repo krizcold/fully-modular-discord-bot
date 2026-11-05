@@ -4,7 +4,7 @@ import { getBackendHealth, getGuildDataBackend, isStopping, setOwnerInfoProvider
 import { getDataBootStatus } from '../utils/dataBackends/boot';
 import { PostgresBackend } from '../utils/dataBackends/postgresBackend';
 import { getWorkingSet } from '../utils/dataBackends/workingSet';
-import { cleanOrphanTmpFiles } from '../utils/dataBackends/fileBackend';
+import { cleanOrphanTmpFiles, setGuildViewCache } from '../utils/dataBackends/fileBackend';
 import { isMaintenanceGateClosed } from '../utils/maintenanceGate';
 import { canRestart, leaveRestartAsked, maintenanceUnfit, noteClaimsLapsed, restartForShards, startLeave } from '../utils/maintenance';
 import { setStoppedServingHook } from '../utils/servingGate';
@@ -88,6 +88,7 @@ async function runBoot(): Promise<ShardBootContext> {
   const nodeName = getNodeName();
   const ingest = getIngestService();
   const runtime = new LeaseRuntime(ingest);
+  setGuildViewCache(true);
 
   try {
     await cleanOrphanTmpFiles();

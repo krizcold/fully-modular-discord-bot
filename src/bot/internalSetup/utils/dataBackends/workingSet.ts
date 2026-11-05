@@ -7,6 +7,7 @@
 import { DataBackend, DocKey, FenceToken, GuildFlushBatch, GuildOwner } from './backend';
 import { setLeft } from './scopeRecord';
 import { stoppedServing } from '../servingGate';
+import { keyRefusal, KeyTree, pathKeyOf, STORE_MAX_BYTES } from '../storableData';
 
 const DEBOUNCE_MS = 500;
 const MAX_DELAY_MS = 5000;
@@ -20,6 +21,10 @@ const RETRY_BASE_MS = 1000;
 const RETRY_CAP_MS = 30_000;
 
 export type WsWriteResult = 'accepted' | 'frozen-window' | 'refusing' | 'fenced' | 'not-ready';
+/** A save or append rule P refuses against the set's other keys. */
+export interface WsCollision {
+  collision: string;
+}
 export type WsReadResult =
   | { status: 'ready'; value: unknown | undefined }   // undefined = absent or tombstoned
   | { status: 'not-ready' };
@@ -94,6 +99,8 @@ class GuildWorkingSet {
   readonly docs = new Map<string, WorkingDoc>();
   readonly appendKeys = new Set<string>();
   readonly appendBuf = new Map<string, AppendBuffer>();
+  /** The guild's live keys in path form (rule P). */
+  readonly keys = new KeyTree();
   dirtyKeys = new Set<string>();
   // The keys of the batch on the wire: the window's age reads them until it lands or fails.
   flightKeys = new Set<string>();
@@ -122,6 +129,36 @@ class GuildWorkingSet {
 
 function docKeyOf(module: string, filename: string): string {
   return `${module}/${filename}`;
+}
+
+/** The set's key tree, built from what it hydrated; one line names the stored keys a write rule refuses. */
+function buildKeys(ws: GuildWorkingSet): void {
+  const keys = [...ws.docs].filter(([, doc]) => !doc.tombstone).map(([key]) => key);
+  for (const key of ws.appendKeys) if (!ws.docs.has(key)) keys.push(key);
+  let refused = 0;
+  let collided = 0;
+  let oversized = 0;
+  const firsts: string[] = [];
+  for (const docKey of keys) {
+    const { module, filename } = splitDocKey(docKey);
+    const key = pathKeyOf(module, filename);
+    const collision = ws.keys.add(key);
+    const refusal = keyRefusal(key);
+    const doc = ws.docs.get(docKey);
+    if (refusal) {
+      refused += 1;
+      if (firsts.length < 3) firsts.push(`${key}: ${refusal}`);
+    } else if (collision) {
+      collided += 1;
+      if (firsts.length < 3) firsts.push(`${key}: ${collision.reason}`);
+    }
+    if (doc && !doc.tombstone && Buffer.byteLength(doc.content) > STORE_MAX_BYTES) {
+      oversized += 1;
+      if (firsts.length < 3 && !refusal && !collision) firsts.push(`${key}: it is over 4 MiB`);
+    }
+  }
+  if (refused + collided + oversized === 0) return;
+  console.error(`[Data] Guild ${ws.guildId} holds ${refused} key(s) a write is refused for, ${collided} key(s) whose name collides with another stored key and ${oversized} document(s) over 4 MiB (first: ${firsts.join(', ')}). All of them read and delete as stored; a write to a refused key is refused, a colliding key takes writes under its own spelling, and an oversized document takes a new value of up to 4 MiB; tell the module's author`);
 }
 
 function splitDocKey(key: string): DocKey {
@@ -298,6 +335,7 @@ export class WorkingSetManager {
     for (const key of outcome.appendKeys) {
       ws.appendKeys.add(docKeyOf(key.module, key.filename));
     }
+    buildKeys(ws);
     ws.state = 'ready';
     for (const wake of ws.readyWaiters.splice(0)) wake('ready');
     return 'ready';
@@ -472,10 +510,20 @@ export class WorkingSetManager {
     return ws.appendKeys.has(key);
   }
 
-  save(guildId: string, module: string, filename: string, content: string): WsWriteResult {
+  /** Rule P for a write of the key against the set's keys, writing nothing: the collision's reason, null when it fits or the set is not loaded. */
+  placementOf(guildId: string, module: string, filename: string): string | null {
+    const ws = this.sets.get(guildId);
+    if (!ws || ws.state === 'hydrating' || ws.state === 'failed') return null;
+    return ws.keys.check(pathKeyOf(module, filename))?.reason ?? null;
+  }
+
+  save(guildId: string, module: string, filename: string, content: string): WsWriteResult | WsCollision {
     const gate = this.writeGate(guildId);
     if (gate !== 'ok') return gate;
     const ws = this.sets.get(guildId)!;
+    const collision = ws.keys.check(pathKeyOf(module, filename));
+    if (collision) return { collision: collision.reason };
+    ws.keys.add(pathKeyOf(module, filename));
     const key = docKeyOf(module, filename);
     const now = Date.now();
     const prev = ws.docs.get(key);
@@ -485,10 +533,13 @@ export class WorkingSetManager {
     return 'accepted';
   }
 
-  append(guildId: string, module: string, filename: string, line: string): WsWriteResult {
+  append(guildId: string, module: string, filename: string, line: string): WsWriteResult | WsCollision {
     const gate = this.writeGate(guildId);
     if (gate !== 'ok') return gate;
     const ws = this.sets.get(guildId)!;
+    const collision = ws.keys.check(pathKeyOf(module, filename));
+    if (collision) return { collision: collision.reason };
+    ws.keys.add(pathKeyOf(module, filename));
     const key = docKeyOf(module, filename);
     const now = Date.now();
     const buf = ws.appendBuf.get(key);
@@ -531,6 +582,7 @@ export class WorkingSetManager {
     }
     ws.appendBuf.delete(key);
     ws.appendKeys.delete(key);
+    ws.keys.remove(pathKeyOf(module, filename));
     this.markDirty(ws, key, now);
     return 'accepted';
   }

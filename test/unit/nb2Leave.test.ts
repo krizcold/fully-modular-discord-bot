@@ -155,17 +155,21 @@ function watchedDatabase(first: 'answers' | 'refused' | 'unreachable') {
 const retryWarnings = () => (console.warn as any).mock.calls.filter((c: unknown[]) => String(c[0]).includes('tries again')).length;
 const errorsWith = (text: string) => (console.error as any).mock.calls.filter((c: unknown[]) => String(c[0]).includes(text));
 
-/** A JSON guild whose file write cannot land: a directory stands where the file goes. */
+/** A JSON guild whose file write cannot land: the disk refuses its rename, as onto a folder. */
 function stuckFile() {
   setBackendKind('file');
   initWorkingSet(new FakeStore());
   const guildId = freshGuild();
   const file = dataPath(guildId, 'm', 'stuck.json');
-  fs.mkdirSync(file, { recursive: true });
+  const rename = fs.promises.rename.bind(fs.promises);
+  const refusing = vi.spyOn(fs.promises, 'rename').mockImplementation((async (...args: any[]) => {
+    if (String(args[1]) === file) throw Object.assign(new Error('EISDIR: illegal operation on a directory'), { code: 'EISDIR' });
+    return (rename as any)(...args);
+  }) as any);
   saveData('stuck.json', { guildId, category: 'm' }, { v: 1 });
   return {
     file,
-    cleanup: () => { dropPendingForGuild(guildId); fs.rmSync(dataPath(guildId), { recursive: true, force: true }); },
+    cleanup: () => { refusing.mockRestore(); dropPendingForGuild(guildId); fs.rmSync(dataPath(guildId), { recursive: true, force: true }); },
   };
 }
 
@@ -187,7 +191,7 @@ describe('ruling L: a change the database refuses for its content', () => {
   it('the database answers and three passes leave a guild held: the guild is logged with its reason, reported as held, and the restart is asked', async () => {
     const { store, options, guildId } = await storeGuild();
     vi.spyOn(store, 'flushGuild').mockResolvedValue({ ok: false, reason: 'unavailable', detail: 'SQLSTATE 22P05: unsupported Unicode escape sequence', code: '22P05' });
-    saveData('nul.json', options, { v: 1 });
+    saveData('refused.json', options, { v: 1 });
     const { at } = watchedDatabase('answers');
     await at(0);
     closeMaintenanceGate('hook', 'm');
@@ -314,7 +318,7 @@ describe('ruling L: a change the database refuses for its content', () => {
   it('R6-2: a guild refused for its content together with a file that cannot be written asks no restart', async () => {
     const { store, options, guildId } = await storeGuild();
     vi.spyOn(store, 'flushGuild').mockResolvedValue(contentRefusal);
-    saveData('nul.json', options, { v: 1 });
+    saveData('refused.json', options, { v: 1 });
     const file = dataPath('global', 'm', 'r6stuck.json');
     fs.mkdirSync(file, { recursive: true });
     try {

@@ -190,7 +190,7 @@ describe('a ledger records the facade writes made inside its entry: the working 
     circular.self = circular;
     runInLedger(ledger, 'modC', () => expect(saveDataOutcome('c.json', options, circular)).toBe('refused'));
     expect(ledger.tickets()).toEqual([]);
-    expect(causes(ledger)).toEqual([['frozen', ['modA', 'modB']], ['io', ['modC']]]);
+    expect(causes(ledger)).toEqual([['frozen', ['modA', 'modB']], ['unstorable', ['modC']]]);
   });
 
   it('records saves, appends and deletes as one ticket per set, a set not ready as not-ready, and a throw\'s cause before it is thrown', async () => {

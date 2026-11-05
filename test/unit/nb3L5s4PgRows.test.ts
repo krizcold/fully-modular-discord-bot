@@ -92,10 +92,9 @@ describe('NB3 L5 s4: keys that cannot be copied', () => {
 });
 
 describe('NB3 L5 s4: .graveyard.json', () => {
-  it('a live guild keeps a document named .graveyard.json at its root', () => {
-    expect(items(snapshotFromPgRows([doc('', '.graveyard.json', '{"k":1}')], [], []))).toEqual([
-      { guildId: G1, grave: false, retiredAt: undefined, module: '', filename: '.graveyard.json', kind: 'doc', text: '{"k":1}' },
-    ]);
+  it('a live guild refuses a document named .graveyard.json at its root (NB12 rule K: the retire would write its note there)', () => {
+    expect(refusal(() => snapshotFromPgRows([doc('', '.graveyard.json', '{"k":1}')], [], [])))
+      .toBe(`The key .graveyard.json of guild ${G1}: it starts with ".graveyard.json", the name of the note a guild's retire writes; nothing was written`);
   });
 
   it('a graveyard entry refuses a root document named .graveyard.json, saying it would take the note\'s place', () => {

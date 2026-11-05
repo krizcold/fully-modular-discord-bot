@@ -4,7 +4,7 @@ import { extractModuleNameFromPanel, getPanelManager } from './panelManager';
 import { getConfigProperty } from './configManager';
 import { admitGuildAction, ENTRY_WAIT_MS, gateCauseText } from './dataBackends/boot';
 import { runSealed } from './dataBackends/writeLedger';
-import { truthText, verdictOf } from './dataBackends/replyGate';
+import { operatorRefusalText, truthText, verdictOf } from './dataBackends/replyGate';
 import { broadcastWebUIPanelUpdate } from './panel/panelWebUIAdapter';
 import { maintenanceIpcRefusal } from './maintenance';
 import { runTracked } from './maintenanceGate';
@@ -179,7 +179,7 @@ export async function runPanelAction(type: string, data: any, panelManager: any)
     const verdict = await verdictOf([ledger]);
     if (!verdict.ok) {
       if (answer.success === false) console.warn(`[IPCPanelHandler] ${type} failed with its writes not confirmed: ${answer.error}`);
-      return { success: false, error: truthText(verdict.answer, verdict.partial) };
+      return { success: false, error: verdict.answer === 'unstorable' ? operatorRefusalText(verdict) : truthText(verdict.answer, verdict.partial) };
     }
     if (liveUpdate) broadcastWebUIPanelUpdate(liveUpdate.panelId, liveUpdate.response, liveUpdate.guildId);
     return answer;

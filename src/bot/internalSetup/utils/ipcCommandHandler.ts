@@ -12,7 +12,7 @@ import { buildConsoleInteraction } from './consoleInteraction';
 import { admitGuildAction, ENTRY_WAIT_MS, gateConsoleText } from './dataBackends/boot';
 import { isCommandRunnable } from './commandGate';
 import { runSealed } from './dataBackends/writeLedger';
-import { truthText, verdictOf } from './dataBackends/replyGate';
+import { operatorRefusalText, truthText, verdictOf } from './dataBackends/replyGate';
 import { maintenanceIpcRefusal } from './maintenance';
 import { runTracked } from './maintenanceGate';
 
@@ -100,7 +100,7 @@ export async function handleInvoke(data: InvokePayload): Promise<Record<string, 
   };
   if (!verdict.ok) {
     // The truth leads; the command's own error is kept beside it.
-    answer.error = truthText(verdict.answer, verdict.partial);
+    answer.error = verdict.answer === 'unstorable' ? operatorRefusalText(verdict) : truthText(verdict.answer, verdict.partial);
     answer.truth = verdict.answer;
     if (verdict.answer === 'pending' || verdict.answer === 'held') answer.pending = true;
     if (outcome && 'error' in outcome) answer.handlerError = outcome.error;

@@ -1,4 +1,5 @@
 import fs from 'fs';
+import { syncBuiltinESMExports } from 'module';
 import path from 'path';
 import fc from 'fast-check';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -11,7 +12,7 @@ vi.mock('../../src/bot/internalSetup/utils/dataBackends/workingSet', async orig 
 });
 
 import { dataPath } from '../../src/utils/dataRoot';
-import { getPending } from '../../src/bot/internalSetup/utils/dataBackends/fileBackend';
+import { enqueueAppend, getPending } from '../../src/bot/internalSetup/utils/dataBackends/fileBackend';
 import { DataBackendUnavailableError, initWorkingSet, type WorkingSetManager } from '../../src/bot/internalSetup/utils/dataBackends/workingSet';
 import { openLedger, runInLedger } from '../../src/bot/internalSetup/utils/dataBackends/writeLedger';
 import { pendingFor, saveMark, stampOf } from '../../src/bot/internalSetup/utils/dataBackends/scopeRecord';
@@ -139,7 +140,10 @@ describe('update(fn) on each route and state', () => {
 
   it.each(ROUTES)('%s, an append still queued: refused io and fn never runs', async name => {
     const r = await routeOf(name);
-    expect(dm.appendData('doc.json', r.options, '{"line":1}\n')).toBe(true);
+    const line = '{"line":1}\n';
+    if (r.ws) expect(r.ws.append(r.guildId, 'm', 'doc.json', line)).toBe('accepted');
+    else if (r.name === 'file guild') enqueueAppend(r.file, line);
+    else expect(dm.appendData('doc.json', r.options, line)).toBe(true);
     const { fn } = spyFn();
     expect(update(r, fn)).toEqual({ outcome: 'refused', cause: 'io' });
     expect(fn).not.toHaveBeenCalled();
@@ -157,7 +161,30 @@ describe('update(fn) on each route and state', () => {
 
   it.each(FILE_ROUTES)('%s, a file that cannot be read: refused io and fn never runs', async name => {
     vi.spyOn(console, 'error').mockImplementation(() => {});
-    const r = await routeOf(name);
+    const r = await routeOf(name, '{"n":1}');
+    const real = fs.readFileSync;
+    vi.spyOn(fs, 'readFileSync').mockImplementation(((p: any, ...rest: any[]) => {
+      if (typeof p === 'string' && path.resolve(p) === path.resolve(r.file)) {
+        throw Object.assign(new Error(`EACCES: permission denied, open '${p}'`), { code: 'EACCES' });
+      }
+      return (real as any)(p, ...rest);
+    }) as typeof fs.readFileSync);
+    syncBuiltinESMExports();
+    const { fn } = spyFn();
+    try {
+      expect(update(r, fn)).toEqual({ outcome: 'refused', cause: 'io' });
+    } finally {
+      vi.mocked(fs.readFileSync).mockRestore();
+      syncBuiltinESMExports();
+    }
+    expect(fn).not.toHaveBeenCalled();
+    expect(r.stored()).toBe('{"n":1}');
+    nothingQueued(r);
+  });
+
+  it('file global, a folder at the file\'s name: refused io and fn never runs', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const r = await routeOf('file global');
     fs.mkdirSync(r.file, { recursive: true });
     const { fn } = spyFn();
     expect(update(r, fn)).toEqual({ outcome: 'refused', cause: 'io' });

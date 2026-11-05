@@ -11,6 +11,7 @@ vi.mock('../../src/bot/internalSetup/utils/dataBackends/workingSet', async orig 
 
 import { dataPath } from '../../src/utils/dataRoot';
 import { initWorkingSet } from '../../src/bot/internalSetup/utils/dataBackends/workingSet';
+import { enqueueAppend } from '../../src/bot/internalSetup/utils/dataBackends/fileBackend';
 import { pendingFor, saveMark, stampOf } from '../../src/bot/internalSetup/utils/dataBackends/scopeRecord';
 import { getMetricsCollector } from '../../src/bot/internalSetup/utils/metrics/metricsCollector';
 import * as dm from '../../src/bot/internalSetup/utils/dataManager';
@@ -81,7 +82,7 @@ describe('what an update tells the operator and the caller', () => {
   it('a working-set document written by appends is refused with an error naming the file', async () => {
     const error = vi.spyOn(console, 'error').mockImplementation(() => {});
     const r = await wsGuild();
-    expect(dm.appendData('doc.json', { guildId: r.guildId, category: 'm' }, '{"a":1}\n')).toBe(true);
+    expect(r.ws.append(r.guildId, 'm', 'doc.json', '{"a":1}\n')).toBe('accepted');
     expect(dm.updateData('doc.json', { guildId: r.guildId, category: 'm' }, {}, d => d)).toEqual({ outcome: 'refused', cause: 'io' });
     expect(messages(error).some(m => m.includes('doc.json') && m.includes('written by appends'))).toBe(true);
   });
@@ -89,7 +90,7 @@ describe('what an update tells the operator and the caller', () => {
   it('a file with appends still queued is refused with an error naming the file', () => {
     const error = vi.spyOn(console, 'error').mockImplementation(() => {});
     const r = fileGuild();
-    expect(dm.appendData('doc.json', r.options, '{"a":1}\n')).toBe(true);
+    enqueueAppend(dataPath(r.options.guildId!, r.options.category!, 'doc.json'), '{"a":1}\n');
     expect(dm.updateData('doc.json', r.options, {}, d => d)).toEqual({ outcome: 'refused', cause: 'io' });
     expect(messages(error).some(m => m.includes('doc.json') && m.includes('appended lines are still queued'))).toBe(true);
   });

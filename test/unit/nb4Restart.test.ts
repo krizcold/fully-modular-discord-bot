@@ -432,7 +432,7 @@ describe('a restart for shards with a web UI process', () => {
     const guildId = String(11n << 22n);
     expect(await r.ws.hydrate(guildId, tokenFor())).toBe('ready');
     let n = 0;
-    const answers: string[] = [];
+    const answers: unknown[] = [];
     const writer = setInterval(() => { answers.push(r.ws.save(guildId, 'm', 'w.json', JSON.stringify({ n: ++n }))); void r.ws.flushAllDirty(); }, 100);
     await vi.advanceTimersByTimeAsync(1000);
     expect(r.m.restartForShards('take shard 3', r.fitness)).toBe(true);

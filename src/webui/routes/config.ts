@@ -21,11 +21,10 @@ import {
   configVersionOf,
   guildOverridesFrom,
   mergeConfigValues,
-  ROOT_CONFIG_PATH,
-  saveGlobalConfig,
-  saveGuildConfig
+  ROOT_CONFIG_PATH
 } from '../../bot/internalSetup/utils/configManager';
-import { writeRawAtomic } from '../../bot/internalSetup/utils/dataManager';
+import { rawCheckRefusal } from '../../bot/internalSetup/utils/dataManager';
+import { keyRefusal, pathKeyOf, sizeRefusal } from '../../bot/internalSetup/utils/storableData';
 import { readMaintenanceFile } from '../../utils/maintenanceFile';
 import { dataPath } from '../../utils/dataRoot';
 import { backupMatch, isBackupFilename, listBackups, stampDate, writeBackup, type LegacyNames } from '../utils/configBackups';
@@ -91,6 +90,17 @@ function resolveConfigTarget(fileId: string, guildId: string | null): Resolved {
 
 const SEGMENT = /^[A-Za-z0-9_.-]+$/;
 
+/** Whether a guild data key ('file.json' or 'module/file.json') names a folder on this disk. */
+function folderAtKey(guildId: string, fileId: string): boolean {
+  const parts = fileId.split('/');
+  if (parts.length > 2 || !fileId.endsWith('.json') || !parts.every(part => SEGMENT.test(part) && part !== '..' && part !== '.')) return false;
+  try {
+    return fs.statSync(dataPath(guildId, ...parts)).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
 // Older backups carry only a bare file id, and config files and data files
 // were named alike, so an older name belongs to a target only when no other
 // file of that id exists.
@@ -102,6 +112,22 @@ function configNamed(id: string): boolean {
 }
 
 const postgresServed = (): boolean => resolveDataBackend() === 'postgres';
+
+/**
+ * Answers a write the data layer refused for a cause the operator can act on: 'unstorable' 422 with the reason, 'io'
+ * 503 with or without one; false for any other answer.
+ */
+function sendWriteRefusal(res: Response, refusal: { cause: string; reason?: string }): boolean {
+  if (refusal.cause === 'unstorable') {
+    res.status(422).json({ success: false, error: `The data was not saved: ${refusal.reason}` });
+    return true;
+  }
+  if (refusal.cause === 'io') {
+    res.status(503).json({ success: false, error: refusal.reason ? `The data was not saved: ${refusal.reason}. Please try again.` : 'The data was not saved. Please try again.' });
+    return true;
+  }
+  return false;
+}
 
 /**
  * Whether this process's discovery cannot see the guild's files: a postgres
@@ -248,6 +274,21 @@ export function createConfigRoutes(botManager: BotManager): Router {
     const written = writeBackup(BACKUP_DIR, backupKeyOf(t), t.guildId, body, beforeRestore);
     console.log(`[Config] Backup ${written.created ? 'created' : 'NOT kept'}: ${path.join(BACKUP_DIR, written.filename)}`);
     return written.created;
+  };
+
+  /**
+   * The write rules the target's write of text meets, run before its backup so that a refused write writes and
+   * prunes no backup: for a file target its rules with P read only, and for a postgres-routed guild K and S here and P
+   * from the bot's read. The process that makes the write checks them again.
+   */
+  const refusalBeforeBackup = (t: ConfigTarget, text: string, current: { unstorable?: string }): { cause: string; reason?: string } | null => {
+    if (t.guildId && postgresServed()) {
+      const reason = keyRefusal(pathKeyOf(t.guild!.module, t.guild!.filename), 'save') ?? sizeRefusal(text) ?? current.unstorable ?? null;
+      if (reason === null) return null;
+      console.error(`[Config] Refused a write of ${t.key} for guild ${t.guildId}: ${reason}; nothing was saved`);
+      return { cause: 'unstorable', reason };
+    }
+    return rawCheckRefusal(t.path, text);
   };
 
   const fail = (res: Response, failure: { status: number; error: string }) => {
@@ -533,6 +574,8 @@ export function createConfigRoutes(botManager: BotManager): Router {
             toStore = guildOverridesFrom(newConfig, savedValues, globalValues, t.configInfo);
           }
         }
+        const refusal = refusalBeforeBackup(t, JSON.stringify(toStore, null, 2), current);
+        if (refusal && sendWriteRefusal(res, refusal)) return;
         let backupCreated: boolean;
         try {
           backupCreated = backupCurrent(t, current.content);
@@ -709,6 +752,10 @@ export function createConfigRoutes(botManager: BotManager): Router {
           res.status(409).json({ success: false, error: childQueuedError(current) });
           return;
         }
+        // A config file is written as its own save writes it; a data file as the backup holds it.
+        const body = t.kind === 'config' ? JSON.stringify(restoredValue, null, 2) : backupContents;
+        const refusal = refusalBeforeBackup(t, body, current);
+        if (refusal && sendWriteRefusal(res, refusal)) return;
         let backupCreated: boolean;
         try {
           backupCreated = backupCurrent(t, current.content, true);
@@ -718,8 +765,6 @@ export function createConfigRoutes(botManager: BotManager): Router {
           return;
         }
 
-        // A config file is written as its own save writes it; a data file as the backup holds it.
-        const body = t.kind === 'config' ? JSON.stringify(restoredValue, null, 2) : backupContents;
         const reply = await writeTarget(t, body, shaOfRaw(current.content));
         if (reply?.ok && !reply.pending) console.log(`[Config] Restored ${t.key}${guildId ? ` for guild ${guildId}` : ''} from backup: ${filename}`);
         sendHopReply(res, reply, { backupCreated });
@@ -861,10 +906,12 @@ export function createConfigRoutes(botManager: BotManager): Router {
       }
 
       // A postgres doc no discovery lists still resolves by its module/file key,
-      // and so does the guild-root file the listing shows from this disk.
+      // and so does the guild-root file the listing shows from this disk, and a
+      // key with a folder in its place, which the write then removes or refuses.
       const rootOnDisk = !postgres && !!guildId && typeof fileId === 'string' && SEGMENT.test(fileId)
         && fileId.endsWith('.json') && existsQueueFirst(dataPath(guildId, fileId));
-      const resolved = resolveDataTarget(fileId, guildId ?? null, postgres || rootOnDisk);
+      const folderInPlace = !postgres && !!guildId && typeof fileId === 'string' && folderAtKey(guildId, fileId);
+      const resolved = resolveDataTarget(fileId, guildId ?? null, postgres || rootOnDisk || folderInPlace);
       if (!resolved.ok) {
         fail(res, resolved);
         return;
@@ -920,6 +967,8 @@ export function createConfigRoutes(botManager: BotManager): Router {
           res.status(409).json({ success: false, error: CHANGED_SINCE_OPEN_TEXT });
           return;
         }
+        const refusal = refusalBeforeBackup(t, JSON.stringify(newData, null, 2), current);
+        if (refusal && sendWriteRefusal(res, refusal)) return;
         let backupCreated: boolean;
         try {
           backupCreated = backupCurrent(t, current.content);

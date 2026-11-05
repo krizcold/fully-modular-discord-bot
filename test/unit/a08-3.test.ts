@@ -59,23 +59,20 @@ describe('A08-3 the file queue refuses writes while the disk keeps failing', () 
   it('refuses a write once the bytes held in memory pass the byte bound', async () => {
     vi.spyOn(performance, 'now').mockImplementation(() => clock);
     failDisk();
-    const big = 'x'.repeat(20 * 1024 * 1024);
-    expect(saveData('big1.json', { scope: 'global' }, big)).toBe(true);
-    expect(saveData('big2.json', { scope: 'global' }, big)).toBe(true);
+    const big = 'x'.repeat(4 * 1024 * 1024 - 2);
+    for (let i = 1; i <= 8; i++) expect(saveData(`big${i}.json`, { scope: 'global' }, big)).toBe(true);
     expect(() => saveData('small.json', { scope: 'global' }, 1)).toThrow(DataBackendUnavailableError);
     vi.mocked(fs.promises.open).mockRestore();
     await flushAll();
     expect(saveData('small.json', { scope: 'global' }, 1)).toBe(true);
-    expect(deleteData('big1.json', { scope: 'global' })).toBe(true);
-    expect(deleteData('big2.json', { scope: 'global' })).toBe(true);
+    for (let i = 1; i <= 8; i++) expect(deleteData(`big${i}.json`, { scope: 'global' })).toBe(true);
   });
 
   it('stays refusing while the held bytes are above half the bound, and accepts once they drain below it', async () => {
     vi.spyOn(performance, 'now').mockImplementation(() => clock);
-    failDisk(p => p.includes('big2'));
-    const big = 'x'.repeat(20 * 1024 * 1024);
-    expect(saveData('big1.json', { scope: 'global' }, big)).toBe(true);
-    expect(saveData('big2.json', { scope: 'global' }, big)).toBe(true);
+    failDisk(p => /big[4-8]/.test(p));
+    const big = 'x'.repeat(4 * 1024 * 1024 - 2);
+    for (let i = 1; i <= 8; i++) expect(saveData(`big${i}.json`, { scope: 'global' }, big)).toBe(true);
     expect(() => saveData('small.json', { scope: 'global' }, 1)).toThrow(DataBackendUnavailableError);
     await flushAll();
     expect(() => saveData('small.json', { scope: 'global' }, 1)).toThrow(DataBackendUnavailableError);

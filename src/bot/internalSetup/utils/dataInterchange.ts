@@ -13,6 +13,8 @@ import { checkWriterLock, configureWriterLock, deposedHolder, holderWords, relea
 import type { TakeResult } from './processLock';
 import { MIGRATION_FILE, readDataFacts } from './dataBackends/recognitionGuard';
 import { resolveDataBackend, type DataBackendKind } from '../../../utils/envLoader';
+import { canonicalGuildKey, GuildKeyError } from './dataKeys';
+import { decodeStorable, keyRefusal, KeyTree, pathKeyOf } from './storableData';
 
 export interface FileRecord {
   guildId: string;
@@ -25,6 +27,29 @@ export interface FileRecord {
 // Interrupted atomic writes, never part of the namespace.
 export function isExcludedNamespaceName(name: string): boolean {
   return name.endsWith('.tmp');
+}
+
+/**
+ * Why a bundle cannot carry this record, or null: its key breaks a write rule, its bytes are not storable text, or
+ * it collides with a record before it (tree holds those, and takes this one when it passes).
+ */
+function bundleRecordRefusal(relPath: string, bytes: Buffer, tree: KeyTree): string | null {
+  let key: string;
+  try {
+    const canonical = canonicalGuildKey('', relPath);
+    key = pathKeyOf(canonical.module, canonical.filename);
+  } catch (error) {
+    if (error instanceof GuildKeyError) return error.message.replace(/^\[Data\] /, '');
+    throw error;
+  }
+  const refusal = keyRefusal(key);
+  if (refusal) return refusal;
+  const decoded = decodeStorable(bytes);
+  if (!decoded.ok) return decoded.reason;
+  const collision = tree.check(key);
+  if (collision) return collision.reason;
+  tree.add(key);
+  return null;
 }
 
 function sha256Hex(bytes: Buffer): string {
@@ -76,11 +101,10 @@ async function* walkFiles(base: string, rel: string = ''): AsyncGenerator<string
     return;
   }
   for (const entry of entries) {
-    if (isExcludedNamespaceName(entry.name)) continue;
     const childRel = rel ? `${rel}/${entry.name}` : entry.name;
     if (entry.isDirectory()) {
       yield* walkFiles(base, childRel);
-    } else if (entry.isFile()) {
+    } else if (entry.isFile() && !isExcludedNamespaceName(entry.name)) {
       yield childRel;
     }
   }
@@ -119,6 +143,7 @@ export async function importNamespace(
   const destResolved = path.resolve(destDir);
   let fileCount = 0;
   let totalBytes = 0;
+  const tree = new KeyTree();
   for await (const record of records as AsyncGenerator<FileRecord>) {
     const actual = sha256Hex(record.bytes);
     if (actual !== record.sha256) {
@@ -128,6 +153,8 @@ export async function importNamespace(
     if (!target) {
       throw new Error(`[DataInterchange] Rejected out-of-scope relPath for ${guildId}: ${record.relPath}`);
     }
+    const refusal = bundleRecordRefusal(record.relPath, record.bytes, tree);
+    if (refusal) throw new Error(`[DataInterchange] ${guildId}/${record.relPath}: ${refusal}`);
     await fs.promises.mkdir(path.dirname(target), { recursive: true });
     await fs.promises.writeFile(target, record.bytes);
     fileCount += 1;
@@ -266,7 +293,12 @@ export async function writeBundle(guildId: string, filePath: string): Promise<Bu
 
     await write(BUNDLE_MAGIC);
     const files: { relPath: string; size: number; sha256: string }[] = [];
+    const tree = new KeyTree();
+    const refused: string[] = [];
     for await (const record of exportNamespace(guildId)) {
+      const refusal = bundleRecordRefusal(record.relPath, record.bytes, tree);
+      if (refusal) refused.push(`${record.relPath}: ${refusal}`);
+      if (refused.length > 0) continue;
       const header: BundleRecordHeader = { g: record.guildId, p: record.relPath, s: record.size, h: record.sha256 };
       const headerJson = Buffer.from(JSON.stringify(header), 'utf-8');
       const len = Buffer.alloc(4);
@@ -275,6 +307,9 @@ export async function writeBundle(guildId: string, filePath: string): Promise<Bu
       await write(headerJson);
       await write(record.bytes);
       files.push({ relPath: record.relPath, size: record.size, sha256: record.sha256 });
+    }
+    if (refused.length > 0) {
+      throw new Error(`[DataInterchange] Guild ${guildId} holds ${refused.length} file(s) a bundle cannot carry: ${refused.slice(0, 10).join('; ')}; move their content to an allowed name or delete them, then export again`);
     }
 
     const summary = encodeSummary(files);

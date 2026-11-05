@@ -22,6 +22,7 @@ import {
   flushFailing,
   GuildFrozenError,
   guildDocFileQueue,
+  guildWritePlacement,
   readGuildDocRaw,
   readRawStrict,
   restoreGuildFromGraveyard,
@@ -83,6 +84,8 @@ export interface DataReadReply {
   /** no-answer only: the read timed out, the child stopped before answering, or the message could not be sent. */
   cause?: 'timeout' | 'stopped' | 'failed';
   error?: string;
+  /** A postgres-routed doc: why a write of it would be refused against the guild's other keys (rule P). */
+  unstorable?: string;
 }
 
 export interface GuildDataWriteRequest {
@@ -208,6 +211,7 @@ async function operatorDataWrite(req: GuildDataWriteRequest, own: { ticket?: Wri
       // refusal is not done.
       const deleted = deleteDataTracked(filename, options);
       if (deleted.outcome === 'frozen') return { ok: false, code: 'frozen' };
+      if (deleted.outcome === 'refused' && deleted.cause === 'unstorable') return { ok: false, code: 'invalid', error: `The data was not saved: ${deleted.reason}` };
       if (deleted.outcome === 'refused') return { ok: false, code: 'backend-unavailable', error: truthText(deleted.cause as LedgerCause, false) };
       if (!deleted.ticket) return { ok: true };
       ticket = deleted.ticket;
@@ -220,6 +224,8 @@ async function operatorDataWrite(req: GuildDataWriteRequest, own: { ticket?: Wri
       }
       const saved = saveDataTracked(filename, options, parsed);
       if (saved.outcome === 'frozen') return { ok: false, code: 'frozen' };
+      if (saved.outcome === 'refused' && saved.cause === 'unstorable') return { ok: false, code: 'invalid', error: `The data was not saved: ${saved.reason}` };
+      if (saved.outcome === 'refused' && saved.cause === 'io' && saved.reason) return { ok: false, code: 'backend-unavailable', error: `The data was not saved: ${saved.reason}. Please try again.` };
       if (saved.outcome === 'refused') return { ok: false, code: 'backend-unavailable', error: truthText(saved.cause as LedgerCause, false) };
       ticket = saved.ticket;
     }
@@ -325,7 +331,8 @@ export async function applyOperatorDataRead(req: GuildDataReadRequest): Promise<
     const raw = readGuildDocRaw(req.guildId, req.module, req.filename);
     // A file-routed doc: whether this process's own queued write of it could still land.
     const queue = guildDocFileQueue(req.guildId, req.module, req.filename);
-    return { ok: true, ...(raw === null ? {} : { contentJson: raw }), ...(queue ?? {}) };
+    const unstorable = guildWritePlacement(req.guildId, req.module, req.filename);
+    return { ok: true, ...(raw === null ? {} : { contentJson: raw }), ...(queue ?? {}), ...(unstorable === null ? {} : { unstorable }) };
   } catch (error) {
     if (error instanceof DataBackendUnavailableError) {
       return { ok: false, code: 'backend-unavailable', error: error.message };

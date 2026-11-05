@@ -12,9 +12,12 @@ import { getWebuiDataReader } from './webuiDataReader';
 import { hopFailure } from '../routes/hopFailure';
 import type { BotManager } from '../botManager';
 
-/** childQueued: the child still holds a queued write of the file, so a write from this process now could land under it. */
+/**
+ * childQueued: the child still holds a queued write of the file, so a write from this process now could land under it.
+ * unstorable: a postgres-routed doc the bot would refuse to write against the guild's other keys, with the reason.
+ */
 export type ServedRead =
-  | { ok: true; content: string | null; notice?: string; childQueued?: boolean; childFailing?: boolean }
+  | { ok: true; content: string | null; notice?: string; childQueued?: boolean; childFailing?: boolean; unstorable?: string }
   | { ok: false; status: number; error: string };
 
 export const BOT_DOWN_DISK_NOTICE = "The bot is not running: this was read from this node's disk, and a change the bot had not saved yet is not in it.";
@@ -111,7 +114,10 @@ export async function readServedGuild(botManager: BotManager, target: GuildReadT
   const fileRouted = resolveDataBackend() !== 'postgres';
   const queuedBefore = fileRouted && filesPending([target.path]);
   const reply = await botManager.readGuildData({ guildId: target.guildId, module: target.module, filename: target.filename });
-  if (reply?.ok) return fileRouted ? combine(target, queuedBefore, reply) : { ok: true, content: bodyOf(reply) };
+  if (reply?.ok) {
+    if (fileRouted) return combine(target, queuedBefore, reply);
+    return typeof reply.unstorable === 'string' ? { ok: true, content: bodyOf(reply), unstorable: reply.unstorable } : { ok: true, content: bodyOf(reply) };
+  }
   if (reply?.code !== 'bot-down') return refused(reply, 'Guild data operation failed');
   if (!fileRouted) {
     try {

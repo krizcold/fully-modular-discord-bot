@@ -532,6 +532,13 @@ refused the same way, but whatever it does after its first await runs later, out
 before the update. The web UI is a separate process: a global file it writes can still land between the read and the
 save. Files written with `appendData` (`.jsonl`) are never updated whole.
 
+**What the bot refuses to store:** on both backends a write is refused with a reason (`false`, or `'refused'` with
+cause `'unstorable'`) when its value has no JSON form, when one document or appended line is over 4 MiB, when an
+appended line holds U+0000 or an unpaired surrogate, and, for server data, when a part of its name is a Windows
+device name, holds a control or reserved character, ends in `.`, a space or `.tmp`, or is over 200 bytes, when a
+saved file ends in `.jsonl` or an appended one does not, and when the name would make a file and a folder of one name
+or differ from a stored name only in letter case.
+
 **Data Storage Paths:**
 - Guild data: `/data/{guildId}/{moduleName}/filename.json`
 - Global data: `/data/global/{moduleName}/filename.json`

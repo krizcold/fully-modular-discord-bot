@@ -3,7 +3,7 @@ import { createHash } from 'crypto';
 import { getConfigFileMetadata } from './configDiscovery';
 import type { ConfigFileMetadata } from './configDiscovery';
 import { dataPath } from '../../../utils/dataRoot';
-import { loadData, readRaw, readRawStrict, saveData, saveDataOutcome, writeRawAtomic } from './dataManager';
+import { loadData, readRaw, readRawStrict, saveDataTracked, writeRawAtomicTracked, type SaveTracked } from './dataManager';
 import type { ModuleConfigSchema, ConfigFieldSchema } from '../../types/moduleTypes';
 
 // Use dist/bot/config.json in production, src/bot/config.json in development
@@ -101,7 +101,11 @@ export function ensureConfigPopulated(): 'written' | 'left' | 'refused' {
   }
 
   // Write fully populated config
-  if (!writeRawAtomic(rootConfigPath, JSON.stringify(populatedConfig, null, 2))) return 'refused';
+  const synced = writeRawAtomicTracked(rootConfigPath, JSON.stringify(populatedConfig, null, 2));
+  if (!synced.accepted) {
+    console.error(`[ConfigManager] config.json was not synchronized with the schema (${synced.reason ?? synced.cause}); it was left as it was`);
+    return 'refused';
+  }
   console.log(`[ConfigManager] Config synchronized with schema (${addedCount} added, ${preservedCount} preserved, ${orphanedKeys.length} removed)`);
   return 'written';
 }
@@ -254,23 +258,29 @@ export function loadGuildConfig(filename: string, guildId: string): any {
  * Module configs are stored in /data/{guildId}/{moduleName}/{filename}
  */
 export function saveGuildConfig(filename: string, guildId: string, data: any): 'saved' | 'frozen' | 'refused' | 'no-schema' {
+  const outcome = saveGuildConfigTracked(filename, guildId, data).outcome;
+  return outcome === 'undiscovered' ? 'refused' : outcome;
+}
+
+/** saveGuildConfig with the facade's answer for a write it makes, and the name it does not write. */
+export function saveGuildConfigTracked(filename: string, guildId: string, data: any): SaveTracked | { outcome: 'no-schema' } | { outcome: 'undiscovered' } {
   // Guild-specific config now lives inside the guild namespace.
   if (filename === 'config.json') {
-    return saveDataOutcome('config.json', { guildId, category: '_guildConfig' }, data);
+    return saveDataTracked('config.json', { guildId, category: '_guildConfig' }, data);
   }
 
   // For module config files, use metadata to get correct path
   const metadata = getConfigFileMetadata(filename);
   if (!metadata || !metadata.schema) {
     console.warn(`[ConfigManager] saveGuildConfig called for "${filename}", which has no config schema; skipping`);
-    return 'no-schema';
+    return { outcome: 'no-schema' };
   }
   if (!metadata.moduleName) {
     console.warn(`[ConfigManager] saveGuildConfig called with undiscovered filename "${filename}"; skipping`);
-    return 'refused';
+    return { outcome: 'undiscovered' };
   }
 
-  return saveDataOutcome(filename, { guildId, category: metadata.moduleName }, data);
+  return saveDataTracked(filename, { guildId, category: metadata.moduleName }, data);
 }
 
 /**
@@ -295,13 +305,28 @@ export function loadGlobalConfig(filename: string): any {
   return {};
 }
 
+/** A global config write the data layer refused, with its cause and reason. */
+export class ConfigWriteRefused extends Error {
+  constructor(readonly refusal: { cause: string; reason?: string }) {
+    super(refusal.cause === 'storage-failing'
+      ? 'the config was not saved because disk writes are failing'
+      : refusal.reason ? `the config was not saved: ${refusal.reason}` : 'the config was not saved');
+  }
+}
+
+function writeConfigText(absPath: string, data: any): void {
+  const written = writeRawAtomicTracked(absPath, JSON.stringify(data, null, 2));
+  if (!written.accepted) throw new ConfigWriteRefused(written);
+}
+
 /**
- * Save global config file (main config.json or discovered module data files)
+ * Save global config file (main config.json or discovered module data files); throws ConfigWriteRefused when the
+ * write was refused.
  */
 export function saveGlobalConfig(filename: string, data: any): void {
   if (filename === 'config.json') {
     // Root config lives outside the guild/global namespaces.
-    if (!writeRawAtomic(rootConfigPath, JSON.stringify(data, null, 2))) throw new Error('the config was not saved because disk writes are failing');
+    writeConfigText(rootConfigPath, data);
     console.log(`[ConfigManager] Saved global config: ${rootConfigPath}`);
     return;
   }
@@ -309,12 +334,14 @@ export function saveGlobalConfig(filename: string, data: any): void {
   // For discovered module data files
   const metadata = getConfigFileMetadata(filename);
   if (metadata && metadata.moduleName) {
-    if (!saveData(filename, { scope: 'global', category: metadata.moduleName }, data)) throw new Error('the config was not saved');
+    const saved = saveDataTracked(filename, { scope: 'global', category: metadata.moduleName }, data);
+    if (saved.outcome === 'refused') throw new ConfigWriteRefused(saved);
+    if (saved.outcome !== 'saved') throw new ConfigWriteRefused({ cause: saved.outcome });
     console.log(`[ConfigManager] Saved config: ${dataPath('global', metadata.moduleName, filename)}`);
     return;
   }
   if (metadata && metadata.path) {
-    if (!writeRawAtomic(metadata.path, JSON.stringify(data, null, 2))) throw new Error('the config was not saved because disk writes are failing');
+    writeConfigText(metadata.path, data);
     console.log(`[ConfigManager] Saved config: ${metadata.path}`);
     return;
   }

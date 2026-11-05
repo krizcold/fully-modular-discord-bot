@@ -771,6 +771,7 @@ export class PremiumManager {
   /** Set by the final stop step or a deposition: from then on nothing is written. */
   private stopped: StopKind | null = null;
   private saveHeld = false;
+  private unstorableSave = false;
   /** The ticket of the last premium-tiers.json save this cache handed to the disk. */
   private lastSaveTicket: FileTicket | null = null;
   /** Migrations being applied: changes to them are refused until the run settles. */
@@ -1251,6 +1252,7 @@ export class PremiumManager {
       if (tracked.outcome === 'saved') {
         this.lastRaw = content;
         this.saveHeld = false;
+        this.unstorableSave = false;
         if (tracked.ticket.kind === 'file') this.lastSaveTicket = tracked.ticket;
         if (this.raisedMarks && !this.marksTicket && tracked.ticket.kind === 'file') this.marksTicket = tracked.ticket;
         return true;
@@ -1264,6 +1266,11 @@ export class PremiumManager {
         recordRefusal('io', PREMIUM_DOC);
         cause = 'io';
       }
+    }
+    if (cause === 'unstorable') {
+      this.saveHeld = false;
+      this.unstorableSave = true;
+      return false;
     }
     if (cause === 'node-stopping' || cause === 'writer-lost' || !isBotProcess()) return false;
     this.saveHeld = true;
@@ -1434,6 +1441,10 @@ export class PremiumManager {
       console.error(this.raisedMarks && !this.marksLanded()
         ? `[PremiumManager] premium-tiers.json holds changes the disk refused. The kept provider events stay in premium-tiers.events.jsonl, and the next normal start of the bot applies them again; any change made after them is ${lostWords(kind)}`
         : `[PremiumManager] premium-tiers.json holds changes the disk refused; they are ${lostWords(kind)}`);
+    } else if (this.unstorableSave) {
+      console.error(this.raisedMarks && !this.marksLanded()
+        ? `[PremiumManager] premium-tiers.json holds changes too large to store (one write holds at most 4 MiB). The kept provider events stay in premium-tiers.events.jsonl, and the next normal start of the bot applies them again; any change made after them is ${lostWords(kind)}`
+        : `[PremiumManager] premium-tiers.json holds changes too large to store (one write holds at most 4 MiB); they are ${lostWords(kind)}`);
     }
     for (const held of this.heldLines) {
       if (held.install) {

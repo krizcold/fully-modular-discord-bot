@@ -35,7 +35,13 @@ import {
   lastRawRefusal,
   listGuildDataFiles as listGuildDataFilesFs,
   listGlobalDataFiles,
+  placeGuildWrite,
+  guildWriteCollision,
+  noteGuildWrite,
+  guildKeyStored,
+  noteGuildDelete,
 } from './dataBackends/fileBackend';
+import { keyRefusal, pathKeyOf, sizeRefusal, textRefusal, valueText } from './storableData';
 
 import {
   flushAll as flushAllFiles,
@@ -593,6 +599,17 @@ export function listGuildDataKeys(guildId: string): { module: string; filename: 
 }
 
 /**
+ * Rule P for a write of a postgres-routed guild's doc against its working set's other keys, writing nothing: the
+ * collision's reason, or null when the key fits, the set is not loaded or the guild is file-routed.
+ */
+export function guildWritePlacement(guildId: string, module: string, filename: string): string | null {
+  const ws = getWorkingSet();
+  if (!ws || !servedByPostgres()) return null;
+  const key = canonicalGuildKey(module, filename);
+  return ws.placementOf(guildId, key.module, key.filename);
+}
+
+/**
  * Graveyard TTL sweep: always sweeps the file _graveyard; in postgres mode it
  * also sweeps graveyard rows, through the served backend's own pool.
  */
@@ -746,23 +763,95 @@ function guildIdToShardId(guildId: string, shardCount: number): number {
 // RAW PATHS (root config, session files and other files outside the namespaces)
 // ============================================================================
 
-/** Queue an atomic write to an absolute path; refused once the exit drain has closed. */
-export function writeRawAtomic(absPath: string, contents: string): boolean {
+export type RawWriteTracked =
+  | { accepted: true }
+  | { accepted: false; cause: 'unstorable' | 'storage-failing' | 'io' | 'not-ready' | 'writer-lost'; reason?: string };
+
+/** A path under a numeric guild folder: the guild and the key in path form, relative to that folder. */
+function guildRawKey(absPath: string): { guildId: string; key: string } | null {
+  const rel = path.relative(BASE_DATA_DIR, path.resolve(absPath));
+  if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) return null;
+  const parts = rel.split(path.sep);
+  if (parts.length < 2 || !/^\d+$/.test(parts[0])) return null;
+  return { guildId: parts[0], key: parts.slice(1).join('/') };
+}
+
+type RawRefused = { accepted: false; cause: 'unstorable' | 'io'; reason: string };
+
+function refuseRaw(absPath: string, cause: 'unstorable' | 'io', reason: string): RawRefused {
+  console.error(`[Data] Refused a write of file:${absPath}: ${reason}; nothing was saved`);
+  recordRefusal(cause, `file:${absPath}`, reason);
+  return { accepted: false, cause, reason };
+}
+
+function storableRawRefusal(absPath: string, contents: string): RawRefused | null {
+  if (typeof contents !== 'string') return refuseRaw(absPath, 'unstorable', 'the text is not a string');
+  const tooLarge = sizeRefusal(contents);
+  if (tooLarge) return refuseRaw(absPath, 'unstorable', tooLarge);
+  const guild = guildRawKey(absPath);
+  if (!guild) return null;
+  const refusal = textRefusal(contents, 'text') ?? keyRefusal(guild.key, 'save');
+  return refusal ? refuseRaw(absPath, 'unstorable', refusal) : null;
+}
+
+/**
+ * The rules a write of contents to an absolute path meets, for a process that is not the file's writer: S, and under
+ * a guild folder T, K and P read only. It changes nothing on disk; the writer checks again under its lock.
+ */
+export function rawCheckRefusal(absPath: string, contents: string): RawRefused | null {
+  const refused = storableRawRefusal(absPath, contents);
+  if (refused) return refused;
+  const guild = guildRawKey(absPath);
+  if (!guild) return null;
+  const collision = guildWriteCollision(guild.guildId, guild.key);
+  return collision ? refuseRaw(absPath, 'unstorable', collision) : null;
+}
+
+/**
+ * The rules a write of contents to an absolute path meets (S, and under a guild folder T, K and P), queuing nothing:
+ * the refusal, recorded and logged as the write's would be, or null when the write may go ahead. Rule P removes a
+ * keyless folder in the way, so only the writer calls this.
+ */
+export function rawWriteRefusal(absPath: string, contents: string): RawRefused | null {
+  const refused = storableRawRefusal(absPath, contents);
+  if (refused) return refused;
+  const guild = guildRawKey(absPath);
+  if (!guild) return null;
+  const placement = placeGuildWrite(guild.guildId, guild.key);
+  if (!placement.ok) return refuseRaw(absPath, placement.cause, placement.reason);
+  return null;
+}
+
+/** Queue an atomic write to an absolute path, answering why it was refused; throws once the exit drain has closed. */
+export function writeRawAtomicTracked(absPath: string, contents: string): RawWriteTracked {
   if (closedForExit) {
     recordRefusal('node-stopping', `file:${absPath}`);
     throw new DataBackendUnavailableError('node-stopping');
   }
   if (isGuildDataPath(absPath)) refuseWhileGated();
-  if (rawRefusedWhileHeld(absPath)) return false;
+  if (rawRefusedWhileHeld(absPath)) return { accepted: false, cause: 'not-ready' };
   const shared = sharedRefusal(absPath);
   if (shared) {
     recordRefusal(shared, `file:${absPath}`);
-    return false;
+    return { accepted: false, cause: shared };
   }
+  const refused = rawWriteRefusal(absPath, contents);
+  if (refused) return refused;
+  const guild = guildRawKey(absPath);
   const accepted = writeRawAtomicFile(absPath, contents);
-  if (accepted) recordTicket(fileTicket(absPath), `file:${absPath}`);
-  else recordRefusal(lastRawRefusal() ?? 'io', `file:${absPath}`);
-  return accepted;
+  if (accepted) {
+    if (guild) noteGuildWrite(guild.guildId, guild.key);
+    recordTicket(fileTicket(absPath), `file:${absPath}`);
+    return { accepted: true };
+  }
+  const cause = lastRawRefusal() ?? 'io';
+  recordRefusal(cause, `file:${absPath}`);
+  return { accepted: false, cause };
+}
+
+/** Queue an atomic write to an absolute path; refused once the exit drain has closed. */
+export function writeRawAtomic(absPath: string, contents: string): boolean {
+  return writeRawAtomicTracked(absPath, contents).accepted;
 }
 
 /** Queue an atomic delete of an absolute path (false: nothing to delete); refused once the exit drain has closed. */
@@ -847,13 +936,51 @@ export function loadData<T = any>(
 /** One accepted write, as confirmWrite answers for it. */
 export type WriteTicket = WsTicket | FileTicket;
 
-/** Why a write was refused without a throw: its guild's working set is not ready (or not in this process), or storage failed. */
-export type WriteRefusal = 'not-ready' | 'io' | 'writer-lost';
+/**
+ * Why a write was refused without a throw: its guild's working set is not ready (or not in this process), storage
+ * failed, another process took the data files ('writer-lost'), or neither store can keep the value or key
+ * ('unstorable', with the reason; a retry gives the same answer).
+ */
+export type WriteRefusal = 'not-ready' | 'io' | 'writer-lost' | 'unstorable';
 
-export type SaveTracked = { outcome: 'saved'; ticket: WriteTicket } | { outcome: 'frozen' } | { outcome: 'refused'; cause: WriteRefusal };
-export type AppendTracked = { outcome: 'appended'; ticket: WriteTicket } | { outcome: 'frozen' } | { outcome: 'refused'; cause: WriteRefusal };
+export type Refused =
+  | { outcome: 'refused'; cause: 'not-ready' | 'io' | 'writer-lost'; reason?: string }
+  | { outcome: 'refused'; cause: 'unstorable'; reason: string };
+export type SaveTracked = { outcome: 'saved'; ticket: WriteTicket } | { outcome: 'frozen' } | Refused;
+export type AppendTracked = { outcome: 'appended'; ticket: WriteTicket } | { outcome: 'frozen' } | Refused;
 /** An absent delete carries a ticket while an earlier delete of the same document has not landed. */
-export type DeleteTracked = { outcome: 'deleted'; ticket: WriteTicket } | { outcome: 'absent'; ticket?: WriteTicket } | { outcome: 'frozen' } | { outcome: 'refused'; cause: WriteRefusal };
+export type DeleteTracked = { outcome: 'deleted'; ticket: WriteTicket } | { outcome: 'absent'; ticket?: WriteTicket } | { outcome: 'frozen' } | Refused;
+
+/** A write neither store can keep: logged without its content, and answered with the reason. */
+function unstorable(filename: string, options: DataOptions, reason: string): Refused {
+  console.error(`[Data] Refused a write of ${docOf(filename, options)}: ${reason}; nothing was saved`);
+  return { outcome: 'refused', cause: 'unstorable', reason };
+}
+
+/** The key of a guild-scope write after rule K, or its refusal. */
+function storableKey(filename: string, options: DataOptions, kind?: 'save' | 'append'): GuildKey | Refused {
+  let key: GuildKey;
+  try {
+    key = guildKeyOf(filename, options);
+  } catch (error) {
+    if (!(error instanceof GuildKeyError)) throw error;
+    const reason = error.message.replace(/^\[Data\] /, '').replace(/; refused$/, '');
+    return unstorable(filename, options, reason.charAt(0).toLowerCase() + reason.slice(1));
+  }
+  const refusal = keyRefusal(pathKeyOf(key.module, key.filename), kind);
+  return refusal ? unstorable(filename, options, refusal) : key;
+}
+
+const isRefused = (value: GuildKey | Refused): value is Refused => 'outcome' in value;
+
+/** Rule P on the file route, before anything is queued or a folder made; null when the write may go ahead. */
+function placeOnFiles(filename: string, options: DataOptions, key: GuildKey): Refused | null {
+  const placement = placeGuildWrite(options.guildId ?? '', pathKeyOf(key.module, key.filename));
+  if (placement.ok) return null;
+  if (placement.cause === 'unstorable') return unstorable(filename, options, placement.reason);
+  console.error(`[Data] A write of ${docOf(filename, options)} was not taken: ${placement.reason}; nothing was saved`);
+  return { outcome: 'refused', cause: 'io', reason: placement.reason };
+}
 
 /** The document a facade write names, for the ledger's refusals. */
 function docOf(filename: string, options: DataOptions): string {
@@ -886,7 +1013,8 @@ function recorded<R extends SaveTracked | AppendTracked | DeleteTracked>(doc: st
     recordTicket(outcome.ticket, whole ? doc : undefined);
     noteScopeTicket(scope, outcome.ticket, whole ? doc : undefined);
   } else if (outcome.outcome === 'frozen' || outcome.outcome === 'refused') {
-    recordRefusal(outcome.outcome === 'frozen' ? 'frozen' : outcome.cause, doc);
+    if (outcome.outcome === 'frozen') recordRefusal('frozen', doc);
+    else recordRefusal(outcome.cause, doc, outcome.reason);
     noteScopeRefusal(scope, doc);
   }
   return result;
@@ -921,6 +1049,14 @@ function acceptSave<T>(filename: string, options: DataOptions, data: T): SaveTra
   refuseGuildWhileGated(options);
   if (guildWriteClosed(options, 'Write')) return { outcome: 'refused', cause: 'not-ready' };
   if (refusedWhileHeld(options, 'Write') || refusedBeforeRestore(options, 'Write')) return { outcome: 'refused', cause: 'not-ready' };
+  const guildScope = (options.scope || 'guild') === 'guild';
+  const checked = guildScope ? storableKey(filename, options, 'save') : null;
+  if (checked && isRefused(checked)) return checked;
+  const value = valueText(data);
+  if (!value.ok) return unstorable(filename, options, value.reason);
+  const tooLarge = sizeRefusal(value.text);
+  if (tooLarge) return unstorable(filename, options, tooLarge);
+  const content = value.text;
   try {
     const wsGuild = wsRouted(options);
     if (wsGuild !== null) {
@@ -929,9 +1065,9 @@ function acceptSave<T>(filename: string, options: DataOptions, data: T): SaveTra
         console.warn(`[Data] Write for postgres-routed guild ${wsGuild} outside the bot process; refused`);
         return { outcome: 'refused', cause: 'not-ready' };
       }
-      const content = JSON.stringify(data, null, 2);
-      const key = guildKeyOf(filename, options);
+      const key = checked as GuildKey;
       const result = ws.save(wsGuild, key.module, key.filename, content);
+      if (typeof result === 'object') return unstorable(filename, options, result.collision);
       if (result === 'accepted') {
         const ticket = ws.ticketFor(wsGuild);
         getMetricsCollector().recordIO('write', options.guildId ?? null, options.category ?? null);
@@ -946,13 +1082,15 @@ function acceptSave<T>(filename: string, options: DataOptions, data: T): SaveTra
     const scope = options.scope || 'guild';
     const shared = sharedRefusal(filePath);
     if (shared) return { outcome: 'refused', cause: shared };
+    const placed = checked ? placeOnFiles(filename, options, checked as GuildKey) : null;
+    if (placed) return placed;
 
     // Ensure the dir synchronously so the guild dir exists the moment the save
     // is accepted.
     ensureDirectory(dir);
 
-    const content = JSON.stringify(data, null, 2);
     enqueueWrite(filePath, content);
+    if (checked) noteGuildWrite(options.guildId ?? '', pathKeyOf((checked as GuildKey).module, (checked as GuildKey).filename));
     const ticket = fileTicket(filePath);
     getMetricsCollector().recordIO('write', scope === 'global' ? null : options.guildId ?? null, options.category ?? null);
 
@@ -983,7 +1121,7 @@ class UpdateFnError {
   constructor(readonly error: unknown) {}
 }
 
-type UpdateRead = { status: 'absent' } | { status: 'present'; value: unknown } | { status: 'refused'; cause: WriteRefusal };
+type UpdateRead = { status: 'absent' } | { status: 'present'; value: unknown } | { status: 'refused'; cause: 'not-ready' | 'io' };
 
 /** The stored document read whole, or why it cannot be: a default stands in only for a document that is absent. */
 function readForUpdate(filename: string, options: DataOptions): UpdateRead {
@@ -1014,8 +1152,10 @@ function readForUpdate(filename: string, options: DataOptions): UpdateRead {
       console.error(`[DataManager] Update of ${filename} refused: appended lines are still queued for it, and a whole write would replace them`);
       return { status: 'refused', cause: 'io' };
     }
-    if (!existsOnDisk(filePath)) return { status: 'absent' };
-    return { status: 'present', value: JSON.parse(readFileUtf8(filePath)) };
+    // A folder at the key's name, or a file at one of its folders, under a guild folder is no document: the save's rule P removes or refuses it.
+    const stored = readRawStrict(filePath);
+    if (stored === null) return { status: 'absent' };
+    return { status: 'present', value: JSON.parse(stored) };
   } catch (error) {
     console.error(`[DataManager] Update of ${filename} refused: the stored document could not be read whole:`, error);
     return { status: 'refused', cause: 'io' };
@@ -1031,6 +1171,10 @@ function acceptUpdate<T>(filename: string, options: DataOptions, defaultValue: T
   refuseInMaintenance(options);
   if (guildWriteClosed(options, 'Update')) return { outcome: 'refused', cause: 'not-ready' };
   if (refusedWhileHeld(options, 'Update') || refusedBeforeRestore(options, 'Update')) return { outcome: 'refused', cause: 'not-ready' };
+  if ((options.scope || 'guild') === 'guild') {
+    const checked = storableKey(filename, options, 'save');
+    if (isRefused(checked)) return checked;
+  }
   const read = readForUpdate(filename, options);
   if (read.status === 'refused') return { outcome: 'refused', cause: read.cause };
   const current = (read.status === 'present' ? read.value : structuredClone(defaultValue)) as T;
@@ -1099,6 +1243,10 @@ function acceptAppend(filename: string, options: DataOptions, line: string): App
   refuseGuildWhileGated(options);
   if (guildWriteClosed(options, 'Append')) return { outcome: 'refused', cause: 'not-ready' };
   if (refusedWhileHeld(options, 'Append')) return { outcome: 'refused', cause: 'not-ready' };
+  const checked = (options.scope || 'guild') === 'guild' ? storableKey(filename, options, 'append') : null;
+  if (checked && isRefused(checked)) return checked;
+  const textRefused = textRefusal(line) ?? sizeRefusal(line);
+  if (textRefused) return unstorable(filename, options, textRefused);
   try {
     const wsGuild = wsRouted(options);
     if (wsGuild !== null) {
@@ -1107,8 +1255,9 @@ function acceptAppend(filename: string, options: DataOptions, line: string): App
         console.warn(`[Data] Append for postgres-routed guild ${wsGuild} outside the bot process; refused`);
         return { outcome: 'refused', cause: 'not-ready' };
       }
-      const key = guildKeyOf(filename, options);
+      const key = checked as GuildKey;
       const result = ws.append(wsGuild, key.module, key.filename, line);
+      if (typeof result === 'object') return unstorable(filename, options, result.collision);
       if (result === 'accepted') {
         const ticket = ws.ticketFor(wsGuild);
         getMetricsCollector().recordIO('write', options.guildId ?? null, options.category ?? null);
@@ -1123,9 +1272,12 @@ function acceptAppend(filename: string, options: DataOptions, line: string): App
     const scope = options.scope || 'guild';
     const shared = sharedRefusal(filePath);
     if (shared) return { outcome: 'refused', cause: shared };
+    const placed = checked ? placeOnFiles(filename, options, checked as GuildKey) : null;
+    if (placed) return placed;
     ensureDirectory(dir);
 
     enqueueAppend(filePath, line);
+    if (checked) noteGuildWrite(options.guildId ?? '', pathKeyOf((checked as GuildKey).module, (checked as GuildKey).filename));
     const ticket = fileTicket(filePath);
     getMetricsCollector().recordIO('write', scope === 'global' ? null : options.guildId ?? null, options.category ?? null);
     return { outcome: 'appended', ticket };
@@ -1213,22 +1365,31 @@ function acceptDelete(filename: string, options: DataOptions): DeleteTracked {
     if (shared) return { outcome: 'refused', cause: shared };
 
     const pending = getPending(filePath);
-    const existsNow = existsOnDisk(filePath);
+    const guildKey = (options.scope || 'guild') === 'guild' ? guildKeyOf(filename, options) : null;
+    // A guild key is deleted only when stored under the exact name given, every part included.
+    const existsNow = guildKey
+      ? guildKeyStored(options.guildId ?? '', pathKeyOf(guildKey.module, guildKey.filename))
+      : existsOnDisk(filePath);
     // Nothing to delete: neither a queued write nor a file on disk. A queued
     // delete has not landed, and an op on the wire ahead of it may create the file.
-    if (!existsNow && (!pending || pending.op === 'delete')) {
+    if (!existsNow && (guildKey || !pending || pending.op === 'delete')) {
       console.log(`[DataManager] File not found for deletion: ${filePath}`);
-      return pending ? { outcome: 'absent', ticket: fileTicket(filePath) } : { outcome: 'absent' };
+      return pending?.op === 'delete' ? { outcome: 'absent', ticket: fileTicket(filePath) } : { outcome: 'absent' };
     }
 
     // Enqueue a delete tombstone (serialized with in-flight writes so a queued
     // write cannot resurrect the file).
     enqueueDelete(filePath);
+    if (guildKey) noteGuildDelete(options.guildId ?? '', pathKeyOf(guildKey.module, guildKey.filename));
     const ticket = fileTicket(filePath);
     console.log(`[DataManager] Deleted ${filePath}`);
     return { outcome: 'deleted', ticket };
   } catch (error) {
     if (error instanceof DataBackendUnavailableError) throw error;
+    if (error instanceof GuildKeyError) {
+      const reason = error.message.replace(/^\[Data\] /, '').replace(/; refused$/, '');
+      return unstorable(filename, options, reason.charAt(0).toLowerCase() + reason.slice(1));
+    }
     console.error(`[DataManager] Error deleting ${filename}:`, error);
     return { outcome: 'refused', cause: 'io' };
   }

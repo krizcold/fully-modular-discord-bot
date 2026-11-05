@@ -214,9 +214,9 @@ describe('NB3-R2-4: a graveyard key under .graveyard.json refuses at reading', (
     expect(() => snapshotFromPgRows([], [], [graveRow('1700000000000', '', '.Graveyard.Json')])).toThrow(/would take the place of its note/);
   });
 
-  it('a live guild may hold a folder of that name', () => {
-    const snap = snapshotFromPgRows([{ guild_id: G1, module: '.graveyard.json', filename: 'x', doc: '{}' }], [], []);
-    expect(snap.items).toHaveLength(1);
+  it('a live guild holding a folder of that name refuses too (NB12 rule K: the retire would write its note there)', () => {
+    expect(() => snapshotFromPgRows([{ guild_id: G1, module: '.graveyard.json', filename: 'x', doc: '{}' }], [], []))
+      .toThrow(`The key .graveyard.json/x of guild ${G1}: it starts with ".graveyard.json"`);
   });
 
   it('the job fails at reading with no staging folder and the source unchanged', async () => {

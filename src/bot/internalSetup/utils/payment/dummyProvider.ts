@@ -188,6 +188,7 @@ export class DummyProvider implements PaymentProvider {
   /** Set by the final stop step or a deposition: from then on nothing is written. */
   private stopped: StopKind | null = null;
   private saveHeld = false;
+  private unstorableSave = false;
   private retryTimer: NodeJS.Timeout | null = null;
   private retryDelay = RETRY_FIRST_MS;
   private disposed = false;
@@ -326,6 +327,7 @@ export class DummyProvider implements PaymentProvider {
       if (tracked.outcome === 'saved') {
         this.lastRaw = content;
         this.saveHeld = false;
+        this.unstorableSave = false;
         return true;
       }
       cause = tracked.outcome === 'frozen' ? 'frozen' : tracked.cause;
@@ -337,6 +339,11 @@ export class DummyProvider implements PaymentProvider {
         recordRefusal('io', STATE_DOC);
         cause = 'io';
       }
+    }
+    if (cause === 'unstorable') {
+      this.saveHeld = false;
+      this.unstorableSave = true;
+      return false;
     }
     if (cause === 'node-stopping' || cause === 'writer-lost' || !isBotProcess()) return false;
     this.saveHeld = true;
@@ -384,8 +391,11 @@ export class DummyProvider implements PaymentProvider {
       this.clearRetry();
       this.stopped = 'stopping';
     }
+    const lost = this.stopped === 'deposed' ? 'lost: another process took the data files' : 'lost with this stop';
     if (this.saveHeld) {
-      console.error(`[DummyProvider] ${STATE_FILE} holds changes the disk refused; they are ${this.stopped === 'deposed' ? 'lost: another process took the data files' : 'lost with this stop'}`);
+      console.error(`[DummyProvider] ${STATE_FILE} holds changes the disk refused; they are ${lost}`);
+    } else if (this.unstorableSave) {
+      console.error(`[DummyProvider] ${STATE_FILE} holds changes too large to store (one write holds at most 4 MiB); they are ${lost}`);
     }
   }
 

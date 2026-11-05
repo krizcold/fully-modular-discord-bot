@@ -1613,7 +1613,7 @@ describe('the answer over several writes', () => {
     const { wire, emit } = rig();
     const { guildId, store, options } = await storeGuild();
     store.mode = 'unavailable';
-    saveData('big.json', options, 'x'.repeat(65 * 1024 * 1024));
+    for (let n = 0; n < 17; n++) saveData(`big${n}.json`, options, 'x'.repeat(4 * 1024 * 1024 - 2));
     await emit(rawCommand('c19b'), async i => {
       saveDataOutcome('y.json', notReadyGuild(), { v: 1 });
       try { saveData('x.json', options, { v: 1 }); } catch { /* refused: database-backlog */ }

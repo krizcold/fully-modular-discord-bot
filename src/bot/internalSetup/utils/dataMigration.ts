@@ -9,6 +9,7 @@ import { createHash } from 'crypto';
 import { DATA_ROOT, dataPath } from '../../../utils/dataRoot';
 import { atomicWriteFileSync } from './atomicWrite';
 import { canonicalGuildKey, isCanonicalGuildKey } from './dataKeys';
+import { decodeStorable, fold, keyRefusal, KeyTree, pathKeyOf } from './storableData';
 import {
   MARKER_FILE, MIGRATION_FILE, STORES_FILE, readDataFacts, writeMarkerStrict,
   type BackendStateMarker, type DataFacts, type JournalAddress, type MigrationCounts, type MigrationJournal, type MigrationStage,
@@ -308,14 +309,10 @@ function compareGraves(expected: SnapGrave[], actual: SnapGrave[], what: string)
 }
 
 function decodeStrict(bytes: Buffer, where: string): string {
-  let text: string;
-  try {
-    text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
-  } catch {
-    throw new Refusal(`${where} is not valid UTF-8 text`);
-  }
-  if (text.includes('\u0000')) throw new Refusal(`${where} holds U+0000, which Postgres cannot store`);
-  return text;
+  const decoded = decodeStorable(bytes);
+  if (decoded.ok) return decoded.text;
+  if (decoded.reason.includes('U+0000')) throw new Refusal(`${where} holds U+0000, which Postgres cannot store`);
+  throw new Refusal(`${where} is not valid UTF-8 text`);
 }
 
 function fitsBigint(id: string): boolean {
@@ -377,7 +374,14 @@ async function walkFolder(dir: string, rel: string, leftOut: string[], onFile: (
 
 function itemFrom(guildId: string, rel: string, bytes: Buffer, full: string, grave?: number): SnapItem {
   decodeStrict(bytes, full);
-  const key = canonicalGuildKey('', rel);
+  let key;
+  try {
+    key = canonicalGuildKey('', rel);
+  } catch (error) {
+    throw new Refusal(`The key ${rel} of ${full} has no file form (${message(error)}); nothing was written`);
+  }
+  const refusal = keyRefusal(pathKeyOf(key.module, key.filename));
+  if (refusal) throw new Refusal(`The key ${rel} of ${full}: ${refusal}; nothing was written`);
   return {
     guildId, module: key.module, filename: key.filename, bytes,
     kind: key.filename.endsWith('.jsonl') ? 'append' : 'doc',
@@ -1032,28 +1036,40 @@ export function snapshotFromPgRows(dataRows: any[], appendRows: any[], graveRows
       }
     }
     const exact = new Set(paths);
-    const folded = new Map(paths.map(p => [p.toLowerCase(), p]));
+    const folded = new Map(paths.map(p => [fold(p), p]));
     if (scope.retiredAt !== undefined) {
       for (const p of paths) {
-        if (p.split('/')[0].toLowerCase() === '.graveyard.json') {
+        if (fold(p.split('/')[0]) === '.graveyard.json') {
           throw new Refusal(`The key ${p} of ${where} would take the place of its note; nothing was written`);
         }
       }
+    }
+    for (const p of paths) {
+      const refusal = keyRefusal(p);
+      if (refusal) throw new Refusal(`The key ${p} of ${where}: ${refusal}; nothing was written`);
     }
     for (const p of paths) {
       const segments = p.split('/');
       for (let i = 1; i < segments.length; i++) {
         const prefix = segments.slice(0, i).join('/');
         if (exact.has(prefix)) throw new Refusal(`${prefix} of ${where} is both a file and a folder; nothing was written`);
-        const file = folded.get(prefix.toLowerCase());
+        const file = folded.get(fold(prefix));
         if (file !== undefined) throw new Refusal(`The file ${file} and the folder of ${p} of ${where} differ only in letter case; nothing was written`);
       }
     }
     const lower = new Map<string, string>();
     for (const p of paths) {
-      const seen = lower.get(p.toLowerCase());
+      const seen = lower.get(fold(p));
       if (seen && seen !== p) throw new Refusal(`The keys ${seen} and ${p} of ${where} differ only in letter case; nothing was written`);
-      lower.set(p.toLowerCase(), p);
+      lower.set(fold(p), p);
+    }
+    const tree = new KeyTree();
+    for (const p of paths) {
+      const collision = tree.add(p);
+      if (!collision) continue;
+      const depth = collision.entry.split('/').length;
+      const mine = p.split('/').slice(0, depth).join('/');
+      throw new Refusal(`The folders ${collision.entry} and ${mine} of ${where} differ only in letter case; nothing was written`);
     }
     if (scope.retiredAt !== undefined) snap.graves.push({ guildId: scope.guildId, retiredAt: scope.retiredAt, reason: scope.reason ?? '' });
     else if (scope.rows.length > 0) snap.guilds.push(scope.guildId);

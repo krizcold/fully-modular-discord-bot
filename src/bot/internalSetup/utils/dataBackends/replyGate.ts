@@ -30,8 +30,8 @@ export type TruthAnswer = 'pending' | 'held' | 'deposed' | 'unavailable' | Ledge
 
 // Worst first.
 const RANK: TruthAnswer[] = [
-  'node-stopping', 'maintenance', 'guild-fenced', 'deposed', 'writer-lost', 'database-unreachable', 'database-backlog',
-  'frozen', 'not-ready', 'storage-failing', 'io', 'unavailable', 'held', 'pending',
+  'unstorable', 'node-stopping', 'maintenance', 'guild-fenced', 'deposed', 'writer-lost', 'database-unreachable',
+  'database-backlog', 'frozen', 'not-ready', 'storage-failing', 'io', 'unavailable', 'held', 'pending',
 ];
 const worst = (answers: TruthAnswer[]): TruthAnswer => answers.reduce((a, b) => (RANK.indexOf(b) < RANK.indexOf(a) ? b : a));
 
@@ -44,6 +44,8 @@ export function truthText(answer: TruthAnswer, partial: boolean): string {
     return `The bot is restarting and could not confirm your change was saved${inFull}; it may be lost. Please check once it is back.`;
   }
   switch (answer) {
+    case 'unstorable':
+      return `Your change holds content the bot cannot store, so it was ${notSaved}. Trying again gives the same result; please report it to the bot's operator.`;
     case 'node-stopping':
       return `The bot is restarting, so your change was ${notSaved}. Please try again in a moment.`;
     case 'maintenance':
@@ -80,7 +82,38 @@ export function truthText(answer: TruthAnswer, partial: boolean): string {
 }
 
 type Failure = { refusal: string } | { key: object; seq: number };
-type Verdict = { ok: true } | { ok: false; answer: TruthAnswer; partial: boolean; failed: Failure[] };
+
+/**
+ * The operator's answer for a verdict led by a write the bot cannot store (a console invoke, a panel action): every
+ * refused document with its reason or cause, then whether the action's accepted writes had all landed.
+ */
+export function operatorRefusalText(verdict: { refused?: RefusedDoc[]; accepted?: AcceptedWrites }): string {
+  const refused = verdict.refused ?? [];
+  const first = refused.find(r => r.answer === 'unstorable');
+  const parts: string[] = [];
+  if (first) parts.push(`The module's write of ${first.doc} was refused: ${first.reason ?? 'the bot cannot store it'}. That write was not saved, and trying again gives the same result; the module's author can change what it stores.`);
+  for (const r of refused) {
+    if (r === first) continue;
+    const what = r.answer === 'unstorable' ? r.reason ?? 'the bot cannot store it'
+      : r.answer === 'unavailable' ? 'the action rewrote it later, so the bot cannot confirm it was saved'
+        : r.answer;
+    parts.push(`The write of ${r.doc} was also refused: ${what}.`);
+  }
+  if (verdict.accepted === 'saved') parts.push("The action's accepted writes were saved.");
+  else if (verdict.accepted === 'unconfirmed') parts.push("The bot answered before all of the action's accepted writes were saved, so it cannot confirm they were.");
+  return parts.join(' ');
+}
+/** A refused document of the verdict, with its answer and, for 'unstorable', its reason. */
+export interface RefusedDoc {
+  doc: string;
+  answer: TruthAnswer;
+  reason?: string;
+}
+
+/** The verdict's accepted writes when it was taken: none, all landed, or some not yet. */
+export type AcceptedWrites = 'none' | 'saved' | 'unconfirmed';
+
+type Verdict = { ok: true } | { ok: false; answer: TruthAnswer; partial: boolean; failed: Failure[]; refused?: RefusedDoc[]; accepted?: AcceptedWrites };
 
 /** A refused document, by its refusal's stamp; rewritten: a whole rewrite of it was recorded later in the union. */
 interface Refused {
@@ -90,6 +123,7 @@ interface Refused {
   rewritten: boolean;
   /** Its writer keeps the change and retries it. */
   retried: boolean;
+  reason?: string;
 }
 
 interface Pending {
@@ -104,8 +138,8 @@ const keyOf = (ticket: LedgerTicket): object => (ticket.kind === 'file' ? ticket
 
 function pendingIn(ledgers: WriteLedger[]): Pending {
   const tickets = ledgers.flatMap(ledger => ledger.tickets()).map(entry => entry.ticket);
-  const refused = ledgers.flatMap(ledger => ledger.refusedDocs()).map(({ cause, doc, seq, retried }) => ({
-    cause, doc, seq, retried, rewritten: ledgers.some(ledger => ledger.rewriteSeq(doc) > seq),
+  const refused = ledgers.flatMap(ledger => ledger.refusedDocs()).map(({ cause, doc, seq, retried, reason }) => ({
+    cause, doc, seq, retried, rewritten: ledgers.some(ledger => ledger.rewriteSeq(doc) > seq), ...(reason !== undefined ? { reason } : {}),
   }));
   return { tickets, unlanded: tickets.filter(ticket => !landed(ticket)), refused, landedBefore: ledgers.some(ledger => ledger.landedDropped) };
 }
@@ -118,11 +152,19 @@ const refusalKey = (r: Refused): string => `${refusalAnswer(r)}|${r.doc}|${r.seq
 
 async function judge(pending: Pending, waitMs = CONFIRM_MS): Promise<Verdict> {
   if (pending.refused.length > 0) {
-    return {
+    const answer = worst(pending.refused.map(refusalAnswer));
+    const verdict: Verdict = {
       ok: false,
-      answer: worst(pending.refused.map(refusalAnswer)),
+      answer,
       partial: pending.tickets.some(ticket => landed(ticket) || !(ticket.kind === 'file' && droppedByDeposition(ticket.record))),
       failed: pending.refused.map(r => ({ refusal: refusalKey(r) })),
+    };
+    // The operator's answer to a write the bot cannot store names every refused document and the accepted writes' state.
+    if (answer !== 'unstorable') return verdict;
+    return {
+      ...verdict,
+      refused: [...pending.refused].sort((a, b) => a.seq - b.seq).map(r => ({ doc: r.doc, answer: refusalAnswer(r), ...(r.reason !== undefined ? { reason: r.reason } : {}) })),
+      accepted: pending.tickets.length === 0 && !pending.landedBefore ? 'none' : pending.unlanded.length === 0 ? 'saved' : 'unconfirmed',
     };
   }
   const first = await Promise.all(pending.unlanded.map(ticket => confirmWrite(ticket, waitMs).catch(() => 'unavailable' as const)));
@@ -146,7 +188,7 @@ async function judge(pending: Pending, waitMs = CONFIRM_MS): Promise<Verdict> {
 }
 
 /** A synthetic entry's verdict (BT-4): ok only when every write in its ledgers landed and none was refused. */
-export type WritesVerdict = { ok: true } | { ok: false; answer: TruthAnswer; partial: boolean };
+export type WritesVerdict = { ok: true } | { ok: false; answer: TruthAnswer; partial: boolean; refused?: RefusedDoc[]; accepted?: AcceptedWrites };
 
 /**
  * The verdict over these ledgers within CONFIRM_MS. After each ok judgement they are read again, so a write recorded
@@ -154,7 +196,9 @@ export type WritesVerdict = { ok: true } | { ok: false; answer: TruthAnswer; par
  */
 export async function verdictOf(ledgers: WriteLedger[]): Promise<WritesVerdict> {
   const verdict = await failuresOf(ledgers);
-  return verdict.ok ? verdict : { ok: false, answer: verdict.answer, partial: verdict.partial };
+  if (verdict.ok) return verdict;
+  const { failed: _failed, ...answer } = verdict;
+  return answer;
 }
 
 async function failuresOf(ledgers: WriteLedger[]): Promise<Verdict> {

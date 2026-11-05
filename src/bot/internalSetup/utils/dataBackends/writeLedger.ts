@@ -12,7 +12,7 @@ import type { DataUnavailableCause, WsTicket } from './workingSet';
 export type LedgerKind = 'interaction' | 'panel' | 'console' | 'message';
 export type LedgerTicket = WsTicket | FileTicket;
 /** Why a write was refused: the facade's own refusals, or the cause of a DataBackendUnavailableError. */
-export type LedgerCause = 'frozen' | 'not-ready' | 'io' | 'writer-lost' | DataUnavailableCause;
+export type LedgerCause = 'frozen' | 'not-ready' | 'io' | 'writer-lost' | 'unstorable' | DataUnavailableCause;
 
 /** An interaction token's life; no reply can be sent after it. */
 export const INTERACTION_LEDGER_LIFE_MS = 15 * 60 * 1000;
@@ -38,6 +38,8 @@ export class WriteLedger {
   private readonly refused = new Map<LedgerCause, { modules: Set<string>; docs: Map<string, number> }>();
   /** Refusals whose writer keeps the change and retries it, by cause and document. */
   private readonly retried = new Set<string>();
+  /** The reason of each document's latest 'unstorable' refusal. */
+  private readonly reasons = new Map<string, string>();
   /** The documents rewritten whole (a save or a delete), each with its latest rewrite's stamp. */
   private readonly rewritten = new Map<string, number>();
   /** Compaction dropped an entry whose write had landed, so the ledger no longer lists that confirmed write. */
@@ -57,6 +59,7 @@ export class WriteLedger {
     this.keysByTarget.clear();
     this.refused.clear();
     this.retried.clear();
+    this.reasons.clear();
     this.rewritten.clear();
   }
 
@@ -96,8 +99,9 @@ export class WriteLedger {
     keys.add(key);
   }
 
-  noteRefusal(cause: LedgerCause, module: string, doc: string): void {
+  noteRefusal(cause: LedgerCause, module: string, doc: string, reason?: string): void {
     if (this.sealed) return;
+    if (cause === 'unstorable' && reason !== undefined) this.reasons.set(doc, reason);
     const record = this.refused.get(cause);
     if (record) {
       record.modules.add(module);
@@ -118,18 +122,21 @@ export class WriteLedger {
     return [...this.refused].map(([cause, { modules }]) => ({ cause, modules: [...modules].sort() }));
   }
 
-  /** Marks every refusal of this document as one its writer keeps and retries (never one of the stop or a deposition). */
+  /** Marks every refusal of this document as one its writer keeps and retries (never one of the stop, a deposition or content no store takes). */
   noteRetried(doc: string): void {
     if (this.sealed) return;
     for (const [cause, { docs }] of this.refused) {
-      if (docs.has(doc) && cause !== 'node-stopping' && cause !== 'writer-lost') this.retried.add(`${cause}|${doc}`);
+      if (docs.has(doc) && cause !== 'node-stopping' && cause !== 'writer-lost' && cause !== 'unstorable') this.retried.add(`${cause}|${doc}`);
     }
   }
 
-  /** Each refused document with its cause, its latest refusal's stamp, and whether its writer retries it. */
-  refusedDocs(): Array<{ cause: LedgerCause; doc: string; seq: number; retried: boolean }> {
+  /** Each refused document with its cause, its latest refusal's stamp, whether its writer retries it and, for 'unstorable', its reason. */
+  refusedDocs(): Array<{ cause: LedgerCause; doc: string; seq: number; retried: boolean; reason?: string }> {
     if (this.sealed) return [];
-    return [...this.refused].flatMap(([cause, { docs }]) => [...docs].map(([doc, seq]) => ({ cause, doc, seq, retried: this.retried.has(`${cause}|${doc}`) })));
+    return [...this.refused].flatMap(([cause, { docs }]) => [...docs].map(([doc, seq]) => {
+      const retried = this.retried.has(`${cause}|${doc}`);
+      return cause === 'unstorable' && this.reasons.has(doc) ? { cause, doc, seq, retried, reason: this.reasons.get(doc)! } : { cause, doc, seq, retried };
+    }));
   }
 
   /** The stamp of this document's latest whole rewrite in this ledger, or 0. */
@@ -281,9 +288,9 @@ export function recordTicket(ticket: LedgerTicket, rewrites?: string): void {
   frame?.ledger.noteTicket(ticket, frame.module ?? frame.ledger.kind, rewrites);
 }
 
-export function recordRefusal(cause: LedgerCause, doc: string): void {
+export function recordRefusal(cause: LedgerCause, doc: string, reason?: string): void {
   const frame = frames.getStore();
-  frame?.ledger.noteRefusal(cause, frame.module ?? frame.ledger.kind, doc);
+  frame?.ledger.noteRefusal(cause, frame.module ?? frame.ledger.kind, doc, reason);
 }
 
 /** The refusal of this document in the current ledger is kept by its writer and retried: it answers held. */

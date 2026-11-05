@@ -7,6 +7,7 @@
 import { randomUUID } from 'crypto';
 import { Client, Pool } from 'pg';
 import { guardPoolClients, shortLivedClient } from '../pgClient';
+import { FLUSH_STATEMENT_BYTES, FLUSH_WIRE_MAX, flushBoundMs, utf8Pieces } from '../storableData';
 import type { PoolClient, QueryConfig, QueryResult } from 'pg';
 import type {
   DataBackend,
@@ -350,6 +351,9 @@ export class PostgresBackend implements DataBackend {
   private readonly listeners: AlertListener[] = [];
   private readonly loginRefusedListeners: Array<() => void> = [];
   private readonly pendingSleeps = new Set<{ timer: NodeJS.Timeout; resolve: () => void }>();
+  // The flush gate: at most FLUSH_WIRE_MAX flushes hold a client at once, the rest wait first in, first out.
+  private flushesOnWire = 0;
+  private readonly flushWaiters: Array<() => void> = [];
 
   constructor(opts: { url: string }) {
     this.pool = new Pool({
@@ -725,6 +729,43 @@ export class PostgresBackend implements DataBackend {
 
   async flushGuild(guildId: string, batch: GuildFlushBatch, token: FenceToken): Promise<FlushOutcome> {
     if (this.refusedWithoutClaim('flush', guildId, token)) return { ok: false, reason: 'unavailable' };
+    await this.takeFlushPlace();
+    try {
+      return await this.flushOnWire(guildId, batch, token);
+    } finally {
+      this.giveFlushPlace();
+    }
+  }
+
+  /** A flush waits here, holding no client, while FLUSH_WIRE_MAX flushes are on the wire; first in, first out. */
+  private takeFlushPlace(): Promise<void> {
+    if (this.flushesOnWire < FLUSH_WIRE_MAX && this.flushWaiters.length === 0) {
+      this.flushesOnWire += 1;
+      return Promise.resolve();
+    }
+    return new Promise<void>(resolve => { this.flushWaiters.push(resolve); });
+  }
+
+  private giveFlushPlace(): void {
+    const next = this.flushWaiters.shift();
+    if (next) next();
+    else this.flushesOnWire -= 1;
+  }
+
+  private async flushOnWire(guildId: string, batch: GuildFlushBatch, token: FenceToken): Promise<FlushOutcome> {
+    let fence: unknown[];
+    let statements: Statement[];
+    let boundMs: number;
+    try {
+      fence = this.fenceParams(guildId, token);
+      statements = flushStatements(guildId, batch);
+      let largest = statementBytes(FENCED_OWNERSHIP_UPSERT, fence);
+      for (const st of statements) if (st.bytes > largest) largest = st.bytes;
+      boundMs = flushBoundMs(largest);
+    } catch (error) {
+      console.error(`[PostgresBackend] flushGuild for ${guildId} could not build its statements; nothing was sent (caller retries):`, error);
+      return { ok: false, reason: 'unavailable' };
+    }
     let client: PoolClient;
     try {
       client = await this.pool.connect();
@@ -734,9 +775,15 @@ export class PostgresBackend implements DataBackend {
     }
     let destroy = false;
     let commitSent = false;
+    // The query on the wire: when it was sent, its size and the server bound in force for it.
+    let sent = { at: performance.now(), bytes: 0, bound: STATEMENT_TIMEOUT_MS };
+    const send = (text: string, values?: unknown[], bound = boundMs) => {
+      sent = { at: performance.now(), bytes: statementBytes(text, values ?? []), bound };
+      return values ? client.query(text, values) : client.query(text);
+    };
     try {
-      await client.query('BEGIN');
-      const claim = await client.query(FENCED_OWNERSHIP_UPSERT, this.fenceParams(guildId, token));
+      await send(`BEGIN; SET LOCAL statement_timeout = ${boundMs}`, undefined, STATEMENT_TIMEOUT_MS);
+      const claim = await send(FENCED_OWNERSHIP_UPSERT, fence);
       if ((claim.rowCount ?? 0) !== 1) {
         await client.query('ROLLBACK');
         const currentOwner = await this.readOwner(client, guildId);
@@ -749,33 +796,26 @@ export class PostgresBackend implements DataBackend {
         this.fireAlert('deposed', detail);
         return { ok: false, reason: 'deposed', currentOwner };
       }
-      for (const rows of chunk(batch.upserts, MAX_ROWS_PER_STATEMENT)) {
-        const upsert = buildUpsert(guildId, rows);
-        await client.query(upsert.text, upsert.values);
-      }
-      for (const keys of chunk(batch.deletes, MAX_ROWS_PER_STATEMENT)) {
-        const tuples = buildKeyTuples(guildId, keys);
-        await client.query(
-          `DELETE FROM smdb_data.guild_data WHERE guild_id = $1 AND (module, filename) IN (${tuples.list})`,
-          tuples.values);
-        await client.query(
-          `DELETE FROM smdb_data.guild_append WHERE guild_id = $1 AND (module, filename) IN (${tuples.list})`,
-          tuples.values);
-      }
-      for (const append of batch.appends) {
-        await client.query(
-          `INSERT INTO smdb_data.guild_append (guild_id, module, filename, chunk) VALUES ($1, $2, $3, $4)`,
-          [guildId, append.key.module, append.key.filename, append.chunk]);
-      }
+      for (const st of statements) await send(st.text, st.values);
       commitSent = true;
-      await client.query('COMMIT');
+      await send('COMMIT');
       this.noteSuccess();
       return { ok: true };
     } catch (error) {
+      const failedAt = performance.now();
       destroy = true;
       await this.rollbackQuiet(client);
       this.noteFailure(error);
-      console.error(`[PostgresBackend] flushGuild failed for ${guildId} (caller retries):`, error);
+      if ((error as { code?: unknown } | null)?.code === '57014') {
+        const kib = Math.ceil(sent.bytes / 1024);
+        const elapsed = failedAt - sent.at;
+        const boundS = Math.round(sent.bound / 1000);
+        console.error(elapsed >= sent.bound
+          ? `[PostgresBackend] flushGuild for ${guildId}: a statement of ${kib} KiB did not finish within the flush's ${boundS} s bound (SQLSTATE 57014); a slow link to the database, a slow database or a lock held by another transaction can cause this (caller retries)`
+          : `[PostgresBackend] flushGuild for ${guildId}: a statement of ${kib} KiB was cancelled after ${Math.floor(elapsed / 1000)} s, before the flush's ${boundS} s bound (SQLSTATE 57014); a cancel request from outside the bot, such as pg_cancel_backend, ends a statement this way (caller retries)`);
+      } else {
+        console.error(`[PostgresBackend] flushGuild failed for ${guildId} (caller retries):`, error);
+      }
       const failure = describeFailure(error);
       const severity = error && typeof error === 'object' ? (error as { severity?: unknown }).severity : undefined;
       // A COMMIT with no answer, or one ended by a FATAL or PANIC, may have landed; an ERROR answer did not.
@@ -1033,6 +1073,56 @@ export class PostgresBackend implements DataBackend {
 // ============================================================================
 // MODULE-PRIVATE SQL BUILDERS
 // ============================================================================
+
+/** The UTF-8 size of a statement's text and values, as it goes over the wire. */
+function statementBytes(text: string, values: unknown[]): number {
+  let bytes = Buffer.byteLength(text);
+  for (const v of values) if (v !== null && v !== undefined) bytes += Buffer.byteLength(String(v));
+  return bytes;
+}
+
+interface Statement {
+  text: string;
+  values: unknown[];
+  bytes: number;
+}
+
+/**
+ * The flush's statements after its fenced claim: upserts of at most MAX_ROWS_PER_STATEMENT rows and
+ * FLUSH_STATEMENT_BYTES of document and key text (a larger row alone), the deletes, and each append buffer as rows of
+ * at most FLUSH_STATEMENT_BYTES, in order.
+ */
+function flushStatements(guildId: string, batch: GuildFlushBatch): Statement[] {
+  const out: Statement[] = [];
+  const add = (st: { text: string; values: unknown[] }) => out.push({ ...st, bytes: statementBytes(st.text, st.values) });
+  let rows: { key: DocKey; doc: string }[] = [];
+  let rowBytes = 0;
+  for (const row of batch.upserts) {
+    const size = Buffer.byteLength(row.doc) + Buffer.byteLength(row.key.module) + Buffer.byteLength(row.key.filename);
+    if (rows.length > 0 && (rows.length >= MAX_ROWS_PER_STATEMENT || rowBytes + size > FLUSH_STATEMENT_BYTES)) {
+      add(buildUpsert(guildId, rows));
+      rows = [];
+      rowBytes = 0;
+    }
+    rows.push(row);
+    rowBytes += size;
+  }
+  if (rows.length > 0) add(buildUpsert(guildId, rows));
+  for (const keys of chunk(batch.deletes, MAX_ROWS_PER_STATEMENT)) {
+    const tuples = buildKeyTuples(guildId, keys);
+    add({ text: `DELETE FROM smdb_data.guild_data WHERE guild_id = $1 AND (module, filename) IN (${tuples.list})`, values: tuples.values });
+    add({ text: `DELETE FROM smdb_data.guild_append WHERE guild_id = $1 AND (module, filename) IN (${tuples.list})`, values: tuples.values });
+  }
+  for (const append of batch.appends) {
+    for (const piece of utf8Pieces(append.chunk, FLUSH_STATEMENT_BYTES)) {
+      add({
+        text: 'INSERT INTO smdb_data.guild_append (guild_id, module, filename, chunk) VALUES ($1, $2, $3, $4)',
+        values: [guildId, append.key.module, append.key.filename, piece],
+      });
+    }
+  }
+  return out;
+}
 
 function chunk<T>(items: T[], size: number): T[][] {
   const out: T[][] = [];
