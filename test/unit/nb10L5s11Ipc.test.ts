@@ -97,7 +97,7 @@ describe('restore from the graveyard', () => {
   });
 
   it('a refused restore answers invalid with its reason', async () => {
-    h.restore = async () => ({ ok: false, error: 'nothing in the graveyard' });
+    h.restore = async () => ({ ok: false, code: 'invalid', error: 'nothing in the graveyard' });
     expect(await applyOperatorDataWrite({ guildId: G, module: '', filename: '', op: 'restore-graveyard' })).toEqual({ ok: false, code: 'invalid', error: 'nothing in the graveyard' });
   });
 
@@ -116,19 +116,19 @@ describe('restore from the graveyard', () => {
 
 describe('deleting a guild namespace', () => {
   it('a delete that moved the data answers ok', async () => {
-    h.nsDelete = async () => true;
+    h.nsDelete = async () => ({ ok: true });
     expect(await applyOperatorDataWrite({ guildId: G, module: '', filename: '', op: 'delete-namespace' })).toEqual({ ok: true });
   });
 
   it('a failed delete with no other writer answers io-error: nothing was removed', async () => {
-    h.nsDelete = async () => false;
+    h.nsDelete = async () => ({ ok: false, code: 'io-error', error: 'guild data delete failed; nothing was removed' });
     expect(await applyOperatorDataWrite({ guildId: G, module: '', filename: '', op: 'delete-namespace' })).toEqual({ ok: false, code: 'io-error', error: 'guild data delete failed; nothing was removed' });
   });
 
   it('a failed delete after another process took the data files answers held-elsewhere', async () => {
     h.nsDelete = async () => {
       h.holder = HOLDER;
-      return false;
+      return { ok: false, code: 'io-error', error: 'guild data delete failed; nothing was removed' };
     };
     const reply = await applyOperatorDataWrite({ guildId: G, module: '', filename: '', op: 'delete-namespace' });
     expect(reply).toMatchObject({ ok: false, code: 'held-elsewhere' });

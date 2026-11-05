@@ -79,7 +79,7 @@ describe('retiring and restoring a guild in file mode', () => {
     const dir = guildDir('810000000000000001');
     closeSharedWritesLost();
     const ledger = openLedger('panel');
-    expect(await runInLedger(ledger, 'mod', () => deleteGuildNamespace('810000000000000001', 'test'))).toBe(false);
+    expect(await runInLedger(ledger, 'mod', () => deleteGuildNamespace('810000000000000001', 'test'))).toEqual({ ok: false, code: 'io-error', error: 'guild data delete failed; nothing was removed' });
     expect(fs.readFileSync(`${dir}/data.json`, 'utf8')).toBe('{"kept":true}');
     expect(errors()).toContain('[DataManager] Cannot retire guild 810000000000000001: another process took the data files; nothing was removed');
     expect(ledger.refusedDocs()).toEqual([{ cause: 'writer-lost', doc: '810000000000000001', seq: expect.any(Number), retried: false }]);
@@ -88,18 +88,18 @@ describe('retiring and restoring a guild in file mode', () => {
   it('a retirement, a refused restore while lost, then a restore once the files are back', async () => {
     const id = '810000000000000002';
     const dir = guildDir(id);
-    expect(await deleteGuildNamespace(id, 'test')).toBe(true);
+    expect(await deleteGuildNamespace(id, 'test')).toEqual({ ok: true });
     expect(fs.existsSync(dir)).toBe(false);
 
     closeSharedWritesLost();
     const lost = openLedger('panel');
-    expect(await runInLedger(lost, 'mod', () => restoreGuildFromGraveyard(id))).toEqual({ ok: false, error: LOST_RESTORE });
+    expect(await runInLedger(lost, 'mod', () => restoreGuildFromGraveyard(id))).toEqual({ ok: false, code: 'invalid', error: LOST_RESTORE });
     expect(fs.existsSync(dir)).toBe(false);
     expect(lost.refusedDocs()).toEqual([{ cause: 'writer-lost', doc: id, seq: expect.any(Number), retried: false }]);
 
     reopenSharedWrites();
     const back = openLedger('panel');
-    expect(await runInLedger(back, 'mod', () => restoreGuildFromGraveyard(id))).toEqual({ ok: true });
+    expect(await runInLedger(back, 'mod', () => restoreGuildFromGraveyard(id))).toMatchObject({ ok: true, reason: 'test' });
     expect(fs.readFileSync(`${dir}/data.json`, 'utf8')).toBe('{"kept":true}');
     expect(back.refusedDocs()).toEqual([]);
   });
@@ -107,7 +107,7 @@ describe('retiring and restoring a guild in file mode', () => {
   it('a restore with no graveyard entry records no refusal', async () => {
     const ledger = openLedger('panel');
     expect(await runInLedger(ledger, 'mod', () => restoreGuildFromGraveyard('810000000000000003')))
-      .toEqual({ ok: false, error: 'no graveyard entry for this guild' });
+      .toEqual({ ok: false, code: 'invalid', error: 'no graveyard entry for this guild' });
     expect(ledger.refusedDocs()).toEqual([]);
   });
 });

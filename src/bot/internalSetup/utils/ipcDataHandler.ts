@@ -14,7 +14,11 @@ import {
   confirmWrite,
   deleteDataTracked,
   deleteGuildNamespace,
+  DELETE_TEXTS,
+  guildDataOpOf,
   listGuildDataFiles,
+  RESTORE_TEXTS,
+  isUnconfirmedReply,
   flushFailing,
   GuildFrozenError,
   guildDocFileQueue,
@@ -36,6 +40,8 @@ import { canonicalGuildKey } from './dataKeys';
 import { stoppedServing } from './servingGate';
 import { truthText } from './dataBackends/replyGate';
 import { checkWriterLock, deposedHolder, deposedText } from './writerLock';
+import { monoNow } from './dataBackends/postgresBackend';
+import { resolveDataBackend } from '../../../utils/envLoader';
 
 type DataOpCode = 'frozen' | 'not-owner' | 'backend-unavailable' | 'bot-down' | 'invalid' | 'io-error' | 'maintenance' | 'changed' | 'changed-since-open' | 'held-elsewhere';
 
@@ -57,6 +63,10 @@ export interface DataWriteReply {
   pending?: boolean;
   /** Why an accepted write is not durable yet. */
   note?: string;
+  /** A graveyard restore's entry, its reason and, on a database, the rows it moved. */
+  retiredAt?: number;
+  reason?: string;
+  moved?: number;
 }
 
 export interface DataReadReply {
@@ -89,6 +99,8 @@ export interface GuildDataWriteRequest {
   twin?: { rel?: string; root?: 'config'; expectSha: ExpectSha };
   /** write: the expectSha is the data editor's loaded body, answered as changed-since-open. */
   sinceOpen?: boolean;
+  /** restore-graveyard and delete-namespace: the web UI's process.hrtime.bigint() at the send plus 45 s, in nanoseconds. */
+  answerByMono?: string;
 }
 
 /** One global file the Config tab reads: the root config, or a .json path under /data/global as 'module/file.json'. */
@@ -133,21 +145,52 @@ function validateWrite(req: GuildDataWriteRequest): string | null {
  * Facade write so coalescing/metrics/fencing engage, then a
  * bounded durability flush.
  */
-// Inside the web UI's 15 s wait, so the delete's answer is the one the operator sees.
+// The delete's flush, inside its deadline.
 const OPERATOR_FLUSH_MS = 5000;
+const OPERATION_BOUND_NS = 40_000_000_000n;
+const ANSWER_MARGIN_NS = 5_000_000_000n;
+const WHOLE_MS_TEXT = 'retiredAt must be a whole number of milliseconds';
+
+/**
+ * A restore's or a delete's deadline on the monotonic clock: the earlier of the web UI's answerByMono less 5 s (40 s
+ * after its send) and this process's receipt plus 40 s.
+ */
+export function operationDeadline(answerByMono: unknown, receivedAt: bigint): bigint {
+  const byReceipt = receivedAt + OPERATION_BOUND_NS;
+  if (typeof answerByMono !== 'string' || !/^\d{1,30}$/.test(answerByMono)) return byReceipt;
+  const bySend = BigInt(answerByMono) - ANSWER_MARGIN_NS;
+  return bySend < byReceipt ? bySend : byReceipt;
+}
 
 export async function applyOperatorDataWrite(req: GuildDataWriteRequest): Promise<DataWriteReply> {
+  const receivedAt = monoNow();
   const own: { ticket?: WriteTicket; threw?: boolean } = {};
-  const reply = await operatorDataWrite(req, own);
+  const reply = await operatorDataWrite(req, own, receivedAt);
   return own.threw ? reply : carryWrites(reply, { ...NO_WRITES, tickets: own.ticket ? [own.ticket] : [] });
 }
 
-async function operatorDataWrite(req: GuildDataWriteRequest, own: { ticket?: WriteTicket; threw?: boolean }): Promise<DataWriteReply> {
+/** restore-graveyard's retiredAt from its body: undefined for the newest entry, or the reply that refuses it. */
+function retiredAtOf(req: GuildDataWriteRequest): { retiredAt?: number } | DataWriteReply {
+  if (req.contentJson === undefined) return {};
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(req.contentJson);
+  } catch {
+    return { ok: false, code: 'invalid', error: 'contentJson is not valid JSON' };
+  }
+  const value = (parsed as { retiredAt?: unknown } | null)?.retiredAt;
+  if (value === undefined) return {};
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) return { ok: false, code: 'invalid', error: WHOLE_MS_TEXT };
+  return { retiredAt: value };
+}
+
+async function operatorDataWrite(req: GuildDataWriteRequest, own: { ticket?: WriteTicket; threw?: boolean }, receivedAt: bigint): Promise<DataWriteReply> {
   const invalid = validateWrite(req);
   if (invalid) return { ok: false, code: 'invalid', error: invalid };
   const { guildId, module, filename, op } = req;
   const check = checkWriterLock();
   if (check.kind === 'deposed') return { ok: false, code: 'held-elsewhere', error: deposedText(check.holder) };
+  if (op === 'restore-graveyard' || op === 'delete-namespace') return graveyardOp(req, receivedAt);
   if (!(await awaitGuildDataReady(guildId))) {
     return { ok: false, code: 'backend-unavailable', error: 'guild data is not ready' };
   }
@@ -158,39 +201,6 @@ async function operatorDataWrite(req: GuildDataWriteRequest, own: { ticket?: Wri
   }
   let ticket: WriteTicket;
   try {
-    if (op === 'restore-graveyard') {
-      let retiredAt: number | undefined;
-      if (req.contentJson !== undefined) {
-        let parsed: unknown;
-        try {
-          parsed = JSON.parse(req.contentJson);
-        } catch {
-          return { ok: false, code: 'invalid', error: 'contentJson is not valid JSON' };
-        }
-        const value = (parsed as { retiredAt?: unknown } | null)?.retiredAt;
-        if (value !== undefined) {
-          if (typeof value !== 'number' || !Number.isFinite(value)) {
-            return { ok: false, code: 'invalid', error: 'retiredAt must be a number (ms)' };
-          }
-          retiredAt = value;
-        }
-      }
-      // NB4 decision 6: no write after the claims lapsed or a shard was lost, and a frozen set keeps its writes.
-      if (stoppedServing() || getWorkingSet()?.stateOf(guildId) === 'frozen-retained') return { ok: false, code: 'frozen' };
-      const restored = await restoreGuildFromGraveyard(guildId, retiredAt);
-      if (!restored.ok && deposedHolder()) return { ok: false, code: 'held-elsewhere', error: deposedText(deposedHolder()!) };
-      if (!restored.ok) return { ok: false, code: 'invalid', error: restored.error || 'restore refused' };
-      return { ok: true };
-    }
-    if (op === 'delete-namespace') {
-      // Its working set frozen (its lease left): deleting it now would drop
-      // that freeze and the data still being flushed.
-      if (stoppedServing() || getWorkingSet()?.stateOf(guildId) === 'frozen-retained') return { ok: false, code: 'frozen' };
-      const moved = await deleteGuildNamespace(guildId, 'webui-operator-delete', OPERATOR_FLUSH_MS);
-      if (!moved && deposedHolder()) return { ok: false, code: 'held-elsewhere', error: deposedText(deposedHolder()!) };
-      if (!moved) return { ok: false, code: 'io-error', error: 'guild data delete failed; nothing was removed' };
-      return { ok: true };
-    }
     const options = module ? { guildId, category: module } : { guildId };
     if (op === 'delete') {
       // Nothing to delete is done, with nothing to confirm; an earlier delete
@@ -235,6 +245,51 @@ async function operatorDataWrite(req: GuildDataWriteRequest, own: { ticket?: Wri
   if (outcome === 'held') return { ok: true, pending: true, note: 'it is not saved yet; this node retries while it serves this guild, and loses it if the bot stops or loses its database first' };
   if (outcome === 'unavailable' && deposedHolder()) return { ok: false, code: 'held-elsewhere', error: deposedText(deposedHolder()!) };
   return { ok: false, code: 'backend-unavailable', error: 'this write left this node before it was confirmed saved (the guild was unloaded, its data was deleted or restored from the graveyard), so whether it was saved is unknown; reload the data to check' };
+}
+
+/**
+ * A graveyard restore or a namespace delete: refused before the ready wait while either holds the guild or once its
+ * deadline passed, since the ready wait would read a guild a delete is moving.
+ */
+async function graveyardOp(req: GuildDataWriteRequest, receivedAt: bigint): Promise<DataWriteReply> {
+  const { guildId, op } = req;
+  const restore = op === 'restore-graveyard';
+  const deadline = operationDeadline(req.answerByMono, receivedAt);
+  const running = guildDataOpOf(guildId);
+  if (running) {
+    const text = restore
+      ? (running === 'restore' ? RESTORE_TEXTS.alreadyRunning : RESTORE_TEXTS.deleteRunning)
+      : (running === 'restore' ? DELETE_TEXTS.restoreRunning : DELETE_TEXTS.alreadyRunning);
+    return { ok: false, code: 'invalid', error: text };
+  }
+  if (monoNow() >= deadline) return { ok: false, code: 'backend-unavailable', error: restore ? RESTORE_TEXTS.outOfTime : DELETE_TEXTS.outOfTime };
+  const parsed: { retiredAt?: number } | DataWriteReply = restore ? retiredAtOf(req) : {};
+  if ('ok' in parsed) return parsed as DataWriteReply;
+  if (!(await awaitGuildDataReady(guildId))) {
+    return { ok: false, code: 'backend-unavailable', error: restore ? RESTORE_TEXTS.notLoaded : DELETE_TEXTS.notLoaded };
+  }
+  // NB4 decision 6: no write after the claims lapsed or a shard was lost, and a frozen set keeps its writes.
+  if (stoppedServing() || getWorkingSet()?.stateOf(guildId) === 'frozen-retained') return { ok: false, code: 'frozen' };
+  try {
+    if (restore) {
+      const restored = await restoreGuildFromGraveyard(guildId, parsed.retiredAt, deadline);
+      // An evicted set: its read starts now, so the events it holds replay on the restored data; the answer does not wait on it.
+      if (resolveDataBackend() === 'postgres' && getWorkingSet() && !getWorkingSet()!.has(guildId)) await awaitGuildDataReady(guildId);
+      if (!restored.ok && deposedHolder() && !isUnconfirmedReply(restored)) return { ok: false, code: 'held-elsewhere', error: deposedText(deposedHolder()!) };
+      return restored.ok ? { ok: true, retiredAt: restored.retiredAt, reason: restored.reason, ...(restored.moved === undefined ? {} : { moved: restored.moved }) } : restored;
+    }
+    const deleted = await deleteGuildNamespace(guildId, 'webui-operator-delete', OPERATOR_FLUSH_MS, deadline);
+    if (!deleted.ok && deposedHolder() && !isUnconfirmedReply(deleted)) return { ok: false, code: 'held-elsewhere', error: deposedText(deposedHolder()!) };
+    return deleted;
+  } catch (error) {
+    if (error instanceof GuildFrozenError) return { ok: false, code: 'frozen' };
+    if (error instanceof DataBackendUnavailableError && error.causeKey === 'maintenance') {
+      return { ok: false, code: 'maintenance', error: maintenanceText() };
+    }
+    if (error instanceof DataBackendUnavailableError) return { ok: false, code: 'backend-unavailable', error: error.message };
+    const message = error instanceof Error ? error.message : String(error);
+    return { ok: false, code: 'io-error', error: restore ? RESTORE_TEXTS.error(message) : DELETE_TEXTS.error(message) };
+  }
 }
 
 /** The stored text of the target and its twin against the reads the body was built on; a reply when either changed. */

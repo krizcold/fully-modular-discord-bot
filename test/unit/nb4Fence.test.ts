@@ -21,7 +21,9 @@ function scripted(answer: (sql: string) => unknown) {
   (backend as unknown as { state: string }).state = 'ready';
   const sent: Array<{ sql: string; params?: unknown[] }> = [];
   const client = {
-    query: async (sql: string, params?: unknown[]) => {
+    query: async (q: string | { text: string; values?: unknown[] }, values?: unknown[]) => {
+      const sql = typeof q === 'string' ? q : q.text;
+      const params = typeof q === 'string' ? values : q.values;
       sent.push({ sql: sql.trim(), params });
       const res = answer(sql);
       if (res instanceof Error) throw res;

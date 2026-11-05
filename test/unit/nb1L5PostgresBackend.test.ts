@@ -18,7 +18,9 @@ function scripted(answer: Answer) {
   const sent: string[] = [];
   const releases: unknown[] = [];
   const client = {
-    query: async (sql: string, params?: unknown[]) => {
+    query: async (statement: string | { text: string; values?: unknown[] }, values?: unknown[]) => {
+      const sql = typeof statement === 'string' ? statement : statement.text;
+      const params = typeof statement === 'string' ? values : statement.values;
       sent.push(sql.trim());
       const res = answer(sql, params);
       if (res instanceof Error) throw res;
@@ -150,18 +152,20 @@ describe('flushing a guild', () => {
   });
 });
 
+const RESTORE_ARGS = () => [() => null, process.hrtime.bigint() + 40_000_000_000n] as const;
+
 describe('restoring a guild', () => {
   it('a provisioned backend opens a connection and checks for live rows', async () => {
-    const { backend, connect } = scripted(sql => (/AS present/.test(sql) ? { rows: [{ present: true }], rowCount: 1 } : undefined));
+    const { backend, connect } = scripted(sql => (/AS present/.test(sql) ? { rows: [{ present: true }], rowCount: 1 } : /SET node_id|AND retired_at = \$2 LIMIT 1/.test(sql) ? { rows: [], rowCount: 1 } : undefined));
     internals(backend).provisioned = true;
-    expect(await backend.restoreGuild('1', 5, token)).toEqual({ ok: false, reason: 'live-rows' });
+    expect(await backend.restoreGuild('1', 5, token, ...RESTORE_ARGS())).toEqual({ ok: false, reason: 'live-rows', retiredAt: 5 });
     expect(connect).toHaveBeenCalledTimes(1);
   });
 
   it('logs why a restore is refused before provisioning', async () => {
     const error = quiet();
     const { backend } = scripted(() => undefined);
-    await backend.restoreGuild('1', 5, token);
+    await backend.restoreGuild('1', 5, token, ...RESTORE_ARGS());
     expect(error.mock.calls.map(c => String(c[0]))).toEqual([
       '[PostgresBackend] Refused restore for guild 1: the database is not provisioned yet',
     ]);
@@ -172,7 +176,7 @@ describe('restoring a guild', () => {
     const { backend } = scripted(sql => (VERSION_READ.test(sql) ? { rows: [{ value: '{"v":1}' }], rowCount: 1 } : undefined));
     await internals(backend).provision();
     error.mockClear();
-    expect(await backend.restoreGuild('1', 5, token)).toEqual({ ok: false, reason: 'schema-mismatch' });
+    expect(await backend.restoreGuild('1', 5, token, ...RESTORE_ARGS())).toEqual({ ok: false, reason: 'schema-mismatch' });
     expect(error.mock.calls.map(c => String(c[0]))).toEqual([
       '[PostgresBackend] Refused restore for guild 1: the database holds schema version {"v":1}',
     ]);

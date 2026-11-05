@@ -15,7 +15,7 @@ vi.mock('../../src/bot/internalSetup/utils/dataBackends/workingSet', async orig 
 }));
 vi.mock('../../src/bot/internalSetup/utils/dataManager', async orig => ({
   ...(await orig<object>()),
-  deleteGuildNamespace: async () => { h.deletes += 1; return true; },
+  deleteGuildNamespace: async () => { h.deletes += 1; return { ok: true }; },
 }));
 vi.mock('../../src/bot/internalSetup/utils/panel/persistentPanelStorage', async orig => ({
   ...(await orig<object>()),

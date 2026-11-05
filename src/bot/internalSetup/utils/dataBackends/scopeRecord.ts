@@ -56,6 +56,11 @@ export function saveMark(): SaveMark {
   return { run: RUN, stamp: counter };
 }
 
+/** A mark above every mark given out before it; every later mark is at or above it. */
+export function markBarrier(): SaveMark {
+  return { run: RUN, stamp: ++counter };
+}
+
 /** The stamp of a mark this run gave out, or null for anything else: another run's mark, a number, a stamp out of range. */
 export function stampOf(mark: unknown): number | null {
   if (typeof mark !== 'object' || mark === null) return null;

@@ -5,11 +5,12 @@ import type {
   FlushOutcome,
   GuildFlushBatch,
   HydrationOutcome,
+  RestoreOutcome,
   RetireOutcome,
 } from '../../src/bot/internalSetup/utils/dataBackends/backend';
 
 // BT-1's scripted DataBackend, shared by the write-ticket and write-ledger tests.
-export type FlushMode = 'commit' | 'unavailable' | 'deposed';
+export type FlushMode = 'commit' | 'unavailable' | 'deposed' | 'landed-unavailable';
 export type HydrateMode = 'ok' | 'deposed' | 'unavailable' | 'held';
 
 export interface FlushCall {
@@ -29,8 +30,9 @@ export function keyOfRow(row: string): DocKey {
 
 /**
  * The DataBackend contract over a scripted store. A flush answers by the mode
- * it finds when it comes off the wire: it commits, fails as unavailable or
- * answers deposed. While holding, every flush stays on the wire until release.
+ * it finds when it comes off the wire: it commits, fails as unavailable,
+ * answers deposed, or commits and answers unavailable (a COMMIT whose answer
+ * was lost). While holding, every flush stays on the wire until release.
  */
 export class FakeStore implements DataBackend {
   readonly kind = 'postgres' as const;
@@ -86,6 +88,7 @@ export class FakeStore implements DataBackend {
     for (const { key, chunk } of batch.appends) {
       this.streams.set(rowKey(guildId, key), (this.streams.get(rowKey(guildId, key)) ?? '') + chunk);
     }
+    if (this.mode === 'landed-unavailable') return { ok: false, reason: 'unavailable' };
     this.commits.push(call);
     return { ok: true };
   }
@@ -110,11 +113,11 @@ export class FakeStore implements DataBackend {
     return this.docs.get(`${guildId}|m/${filename}`);
   }
 
-  async retireGuild(): Promise<RetireOutcome> {
+  async retireGuild(..._args: unknown[]): Promise<RetireOutcome> {
     return { ok: false, reason: 'unavailable' };
   }
 
-  async restoreGuild(): Promise<{ ok: false; reason: string }> {
+  async restoreGuild(..._args: unknown[]): Promise<RestoreOutcome> {
     return { ok: false, reason: 'unavailable' };
   }
 

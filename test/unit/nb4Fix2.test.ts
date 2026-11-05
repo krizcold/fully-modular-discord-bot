@@ -45,7 +45,7 @@ vi.mock('../../src/bot/internalSetup/utils/dataManager', async importOriginal =>
   return {
     ...real,
     restoreGuildFromGraveyard: vi.fn(async () => { h.restores += 1; return { ok: true }; }),
-    deleteGuildNamespace: vi.fn(async () => { h.deletes += 1; return true; }),
+    deleteGuildNamespace: vi.fn(async () => { h.deletes += 1; return { ok: true }; }),
   };
 });
 

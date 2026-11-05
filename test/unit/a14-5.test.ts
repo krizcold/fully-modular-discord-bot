@@ -7,13 +7,21 @@ vi.mock('../../src/bot/internalSetup/utils/dataBackends/boot', async importOrigi
 
 import { restoreGuildFromGraveyard, setGuildDataBackend } from '../../src/bot/internalSetup/utils/dataManager';
 import { applyOperatorDataWrite } from '../../src/bot/internalSetup/utils/ipcDataHandler';
-import { DataBackendUnavailableError } from '../../src/bot/internalSetup/utils/dataBackends/workingSet';
+import { DataBackendUnavailableError, initWorkingSet } from '../../src/bot/internalSetup/utils/dataBackends/workingSet';
 import { setBackendKind } from '../helpers/backendKind';
+import { FakeStore } from '../helpers/fakeStore';
 
 const GUILD = '900000000000000014';
+const TEXT = '[Data] The database did not answer or ended the connection (Connection terminated); nothing was restored; try again in a moment';
 
-function fakeBackend(): any {
-  return { restoreGuild: async () => ({ ok: false, reason: 'unavailable' }) };
+/** A ready set over a store whose restore did not get an answer from the database. */
+async function unanswered(): Promise<void> {
+  setBackendKind('postgres');
+  const store = new FakeStore();
+  store.restoreGuild = async () => ({ ok: false, reason: 'unavailable', detail: 'Connection terminated' });
+  const ws = initWorkingSet(store);
+  setGuildDataBackend(store);
+  expect(await ws.hydrate(GUILD, { nodeId: 'node-a', claim: 7, processId: 'process-a', shardId: 0, shardCount: 1 })).toBe('ready');
 }
 
 afterEach(() => {
@@ -21,20 +29,20 @@ afterEach(() => {
   setBackendKind(null);
 });
 
-describe('a graveyard restore refused by the database', () => {
-  it('reads unreachable when the database did not answer', async () => {
-    setBackendKind('postgres');
-    setGuildDataBackend(fakeBackend());
+describe('a graveyard restore the database did not answer', () => {
+  it('reads unreachable, says what happened and that nothing was restored', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    await unanswered();
     const error = await restoreGuildFromGraveyard(GUILD, 1000).catch(e => e);
     expect(error).toBeInstanceOf(DataBackendUnavailableError);
     expect(error.causeKey).toBe('database-unreachable');
+    expect(error.message).toBe(TEXT);
   });
 
   it('tells the operator the backend was unavailable, not that the restore was done', async () => {
-    setBackendKind('postgres');
-    setGuildDataBackend(fakeBackend());
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    await unanswered();
     const reply: any = await applyOperatorDataWrite({ guildId: GUILD, module: '', filename: '', op: 'restore-graveyard', contentJson: '{"retiredAt":1000}' });
-    expect(reply.ok).toBe(false);
-    expect(reply.code).toBe('backend-unavailable');
+    expect(reply).toEqual({ ok: false, code: 'backend-unavailable', error: TEXT });
   });
 });

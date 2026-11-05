@@ -20,6 +20,7 @@ interface Ctx {
 }
 
 const DEFAULT_WAIT_MS = 120_000;
+const RESTORE_MINUTE = "Within a minute, if it was restored, the server's data is back and its entry is gone from `smdb graveyard list`; if not, the entry is still listed, unless it had passed the graveyard's keep time and the graveyard sweep removed it, data and all.";
 
 function need(ctx: Ctx, idx: number, label: string): string {
   const v = ctx.args[idx];
@@ -196,16 +197,28 @@ const HANDLERS: Record<string, Handler> = {
     simple(c, 'GET', '/api/data/graveyard', undefined, (b) =>
       table(((b as { entries?: Record<string, unknown>[] }).entries) || [], ['guildId', 'retiredAt', 'reason', 'rows', 'backend']),
     ),
-  'graveyard restore': (c) => {
+  'graveyard restore': async (c) => {
     const guildId = need(c, 0, 'guildId');
     const raw = flagStr(c.flags, 'retired-at') ?? c.args[1];
     const body: Record<string, unknown> = { guildId };
     if (raw !== undefined) {
-      const retiredAt = Number(raw);
-      if (!Number.isFinite(retiredAt)) fail('retiredAt must be a number (ms)', EXIT_USAGE);
+      const retiredAt = /^\d+$/.test(raw) ? Number(raw) : NaN;
+      if (!Number.isSafeInteger(retiredAt)) fail('retiredAt must be a whole number of milliseconds', EXIT_USAGE);
       body.retiredAt = retiredAt;
     }
-    return simple(c, 'POST', '/api/data/graveyard/restore', body);
+    let res: CliResponse;
+    try {
+      res = await c.client.request('POST', '/api/data/graveyard/restore', { body });
+    } catch {
+      // No whole answer: the restore may have run.
+      fail(`can't confirm whether server ${guildId} was restored: the web UI did not answer. ${RESTORE_MINUTE}`, EXIT_ERR);
+    }
+    emit(res, c.flags, (b) => {
+      const answer = b as { success?: unknown; retiredAt?: unknown; reason?: unknown; moved?: unknown };
+      if (answer?.success !== true || typeof answer.retiredAt !== 'number') return;
+      process.stdout.write(`restored server ${guildId} from the entry deleted at ${new Date(answer.retiredAt).toISOString()} (retiredAt ${answer.retiredAt}, reason ${String(answer.reason ?? '')})\n`);
+      if (typeof answer.moved === 'number') process.stdout.write(`${answer.moved} row(s) moved\n`);
+    });
   },
 
   // --- misc + cross-cutting ---

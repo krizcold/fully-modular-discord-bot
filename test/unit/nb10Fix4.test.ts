@@ -153,7 +153,7 @@ describe("a deposed JSON bot moves no guild's whole directory (D1)", () => {
     deposeBy('bot');
     const restored = await restoreGuildFromGraveyard(G, 1000);
     expect(restored.ok).toBe(false);
-    expect(restored.error).toContain('nothing was restored');
+    expect((restored as { error?: string }).error).toContain('nothing was restored');
     expect(fs.existsSync(dataPath(G))).toBe(false);
     expect(fs.readFileSync(path.join(entry, 'm', 'a.json'), 'utf8')).toBe('{"old":1}');
     const reply = await applyOperatorDataWrite({ guildId: G, module: '', filename: '', op: 'restore-graveyard', contentJson: '{"retiredAt":1000}' } as any);

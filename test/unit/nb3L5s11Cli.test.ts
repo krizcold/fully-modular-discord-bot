@@ -133,7 +133,7 @@ describe('graveyard restore', () => {
   it('refuses a retiredAt that is not a number and sends nothing', async () => {
     const r = await run(['graveyard', 'restore', 'g1', 'abc']);
     expect(r.code).toBe(2);
-    expect(r.stderr).toBe('smdb: retiredAt must be a number (ms)\n');
+    expect(r.stderr).toBe('smdb: retiredAt must be a whole number of milliseconds\n');
     expect(r.calls).toEqual([]);
   });
 

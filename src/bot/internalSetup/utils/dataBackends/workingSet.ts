@@ -74,7 +74,8 @@ interface WorkingDoc {
   bytes?: number;
 }
 
-type WsState = 'hydrating' | 'ready' | 'frozen-retained' | 'fenced' | 'failed';
+// 'restoring': a graveyard restore holds the guild; reads serve it as ready, writes and waiters wait for its end.
+type WsState = 'hydrating' | 'ready' | 'restoring' | 'frozen-retained' | 'fenced' | 'failed';
 
 interface AppendBuffer {
   chunk: string;
@@ -227,6 +228,7 @@ export class WorkingSetManager {
 
   private async hydrateSet(guildId: string, token: FenceToken, sending: (ws: GuildWorkingSet) => void): Promise<HydrateOutcome> {
     let ws = this.sets.get(guildId);
+    if (ws?.state === 'restoring') return 'unavailable';
     // A set kept since its lease left is current only while no other bot
     // process has claimed the guild since: re-stamped for the new grant, or dropped
     // and read again. No flush of its old writes starts meanwhile.
@@ -355,6 +357,42 @@ export class WorkingSetManager {
     if (ws.state === 'frozen-retained' && !stillGone() && this.sets.get(guildId) === ws) ws.state = 'ready';
   }
 
+  /** A graveyard restore takes a ready set: true once it holds it ('restoring'). */
+  beginRestore(guildId: string): boolean {
+    const ws = this.sets.get(guildId);
+    if (ws?.state !== 'ready') return false;
+    ws.state = 'restoring';
+    return true;
+  }
+
+  /**
+   * The restore's end: 'reopen' serves the same set again (frozen when its shard is no longer held here) and wakes its
+   * waiters ready; 'evict' drops it, so the next access reads the store.
+   */
+  endRestore(guildId: string, how: 'reopen' | 'evict', stillHeld: () => boolean = () => true): void {
+    const ws = this.sets.get(guildId);
+    if (!ws || ws.state !== 'restoring') return;
+    if (how === 'evict') {
+      this.evict(guildId);
+      return;
+    }
+    ws.state = stillHeld() ? 'ready' : 'frozen-retained';
+    for (const wake of ws.readyWaiters.splice(0)) wake('ready');
+  }
+
+  /** Another process took the guild over: the deposed path, once, and its waiters answered not ready at once. */
+  depose(guildId: string, owner?: GuildOwner): void {
+    const ws = this.sets.get(guildId);
+    if (!ws) return;
+    if (ws.state !== 'fenced') this.onDeposed(ws, owner);
+    for (const wake of ws.readyWaiters.splice(0)) wake('not-ready');
+    this.dropWaiters(guildId);
+  }
+
+  fenceOf(guildId: string): FenceToken | null {
+    return this.sets.get(guildId)?.fence ?? null;
+  }
+
   /** Frozen under an older grant than the token's: a hydrate under the token serves it again. */
   frozenBefore(guildId: string, token: FenceToken): boolean {
     const ws = this.sets.get(guildId);
@@ -382,7 +420,7 @@ export class WorkingSetManager {
     const ws = this.sets.get(guildId);
     if (!ws) return Promise.resolve('not-ready');
     if (ws.state === 'ready' || ws.state === 'frozen-retained') return Promise.resolve('ready');
-    if (ws.state !== 'hydrating') return Promise.resolve('not-ready');
+    if (ws.state !== 'hydrating' && ws.state !== 'restoring') return Promise.resolve('not-ready');
     return new Promise(resolve => {
       const waiter: ReadyWaiter = result => { clearTimeout(timer); resolve(result); };
       const timer = setTimeout(() => {
@@ -556,6 +594,7 @@ export class WorkingSetManager {
 
   private writeGate(guildId: string): 'ok' | Exclude<WsWriteResult, 'accepted'> {
     const ws = this.sets.get(guildId);
+    if (ws?.state === 'restoring') return 'not-ready';
     if (!ws || ws.state === 'hydrating' || ws.state === 'failed') {
       this.wsBypassWrites += 1;
       return 'not-ready';
@@ -734,11 +773,11 @@ export class WorkingSetManager {
   async flushGuildNow(guildId: string, deadlineMs: number): Promise<FlushNowOutcome> {
     const ws = this.sets.get(guildId);
     if (!ws) return 'ok';
-    const deadline = Date.now() + deadlineMs;
+    const deadline = performance.now() + deadlineMs;
     for (;;) {
       if (ws.state === 'fenced') return 'deposed';
       if (this.leftHere(ws)) return 'unavailable';
-      const left = deadline - Date.now();
+      const left = deadline - performance.now();
       if (ws.flushInFlight) {
         if (left <= 0) return 'pending';
         await new Promise<void>(resolve => { setTimeout(resolve, Math.min(20, left)); });

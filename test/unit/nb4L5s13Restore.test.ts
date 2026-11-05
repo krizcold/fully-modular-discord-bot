@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { GuildFrozenError, restoreGuildFromGraveyard, setGuildDataBackend } from '../../src/bot/internalSetup/utils/dataManager';
+import { restoreGuildFromGraveyard, setGuildDataBackend } from '../../src/bot/internalSetup/utils/dataManager';
 import { PostgresBackend } from '../../src/bot/internalSetup/utils/dataBackends/postgresBackend';
 import { getWorkingSet } from '../../src/bot/internalSetup/utils/dataBackends/workingSet';
 import { setBackendKind } from '../helpers/backendKind';
@@ -26,8 +26,7 @@ describe('an operator restore', () => {
     ws.freeze(guildId);
     const restoreGuild = vi.fn(async () => ({ ok: true, moved: 1 }));
     backendWith(restoreGuild);
-    const error = await restoreGuildFromGraveyard(guildId, 5).then(() => null, (e: unknown) => e);
-    expect(error).toBeInstanceOf(GuildFrozenError);
+    expect(await restoreGuildFromGraveyard(guildId, 5)).toEqual({ ok: false, code: 'frozen' });
     expect(restoreGuild).not.toHaveBeenCalled();
     expect(ws.stateOf(guildId)).toBe('frozen-retained');
   });
@@ -35,8 +34,8 @@ describe('an operator restore', () => {
   it('that lands drops the served set, so the next access reads the restored rows', async () => {
     const { guildId } = await storeGuild();
     const ws = getWorkingSet()!;
-    backendWith(async () => ({ ok: true, moved: 3 }));
-    expect(await restoreGuildFromGraveyard(guildId, 5)).toEqual({ ok: true, moved: 3 });
+    backendWith(async () => ({ ok: true, moved: 3, retiredAt: 5, reason: 'r' }));
+    expect(await restoreGuildFromGraveyard(guildId, 5)).toEqual({ ok: true, moved: 3, retiredAt: 5, reason: 'r' });
     expect(ws.has(guildId)).toBe(false);
   });
 });

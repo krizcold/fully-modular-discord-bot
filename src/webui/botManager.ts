@@ -38,6 +38,9 @@ const RESTART_QUEUE_POLL_MS = 100;
 /** A shared op sent to the child: its provider calls (30 s each) and its 8 s confirm fit inside. */
 const SHARED_OP_IPC_MS = 60_000;
 const GUILD_WRITE_IPC_MS = 15_000;
+/** A graveyard restore or a guild data delete: the bot answers by 45 s after the send (answerByMono), inside this wait. */
+const GRAVEYARD_OP_IPC_MS = 50_000;
+const ANSWER_BY_NS = 45_000_000_000n;
 /** The op in progress gets this long to land or cancel when the web UI exits. */
 const LOCAL_CHAIN_EXIT_MS = 10_000;
 const ROUTE_POLL_MS = 250;
@@ -1223,8 +1226,12 @@ export class BotManager {
       const label = `${payload.op} of ${payload.module ? `${payload.module}/` : ''}${payload.filename}`;
       return this.enqueueLocal({ label, provider: false, run: () => applyOperatorDataWrite(payload), again: () => this.writeGuildData(payload) });
     }
+    const graveyardOp = payload.op === 'restore-graveyard' || payload.op === 'delete-namespace';
     try {
-      return await this.sendIPCMessage('data:guild-write', payload, GUILD_WRITE_IPC_MS);
+      // The stamp is read on the host's monotonic clock, which the bot child reads too.
+      return graveyardOp
+        ? await this.sendIPCMessage('data:guild-write', { ...payload, answerByMono: (process.hrtime.bigint() + ANSWER_BY_NS).toString() }, GRAVEYARD_OP_IPC_MS)
+        : await this.sendIPCMessage('data:guild-write', payload, GUILD_WRITE_IPC_MS);
     } catch (error) {
       return { ok: false, code: 'io-error', noAnswer: noAnswerOf(error), error: error instanceof Error ? error.message : 'IPC failure' };
     }

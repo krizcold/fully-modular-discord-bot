@@ -128,7 +128,7 @@ describe('an append and the last byte of its file', () => {
     await new Promise(resolve => setTimeout(resolve, 5));
     expect(await graveyardGuildDir(G, 'second')).toBe(true);
     expect(fs.existsSync(dataPath(G))).toBe(false);
-    expect(await restoreGuildDirFromGraveyard(G, entry.retiredAt)).toEqual({ ok: true });
+    expect(await restoreGuildDirFromGraveyard(G, entry.retiredAt, { stop: () => null, writerLost: () => false, progress: { renamed: false } })).toMatchObject({ ok: true, retiredAt: entry.retiredAt });
     expect(read(p)).toBe('old');
     enqueueAppend(p, 'b\n');
     await flushAll();
@@ -253,16 +253,16 @@ describe('the graveyard moves', () => {
     expect(entry.reason).toBe('nb10');
   });
 
-  it('restores by default, and refuses with the default text and its log line when another process took the data files', async () => {
+  it('restores, and refuses with its log line when another process took the data files', async () => {
     const G = '424242000000001203';
     fs.mkdirSync(dataPath(G), { recursive: true });
     fs.writeFileSync(dataPath(G, 'a.json'), '{"a":2}');
     expect(await graveyardGuildDir(G, 'nb10')).toBe(true);
     const errors = vi.mocked(console.error);
-    expect(await restoreGuildDirFromGraveyard(G, undefined, () => true)).toEqual({ ok: false, error: 'another process took the data files; nothing was restored' });
+    expect(await restoreGuildDirFromGraveyard(G, undefined, { stop: () => null, writerLost: () => true, progress: { renamed: false } })).toEqual({ ok: false, why: 'writer-lost' });
     expect(errors).toHaveBeenCalledWith(`[DataManager] Cannot restore guild ${G} from the graveyard: another process took the data files`);
     expect(fs.existsSync(dataPath(G))).toBe(false);
-    expect(await restoreGuildDirFromGraveyard(G)).toEqual({ ok: true });
+    expect(await restoreGuildDirFromGraveyard(G, undefined, { stop: () => null, writerLost: () => false, progress: { renamed: false } })).toMatchObject({ ok: true, reason: 'nb10' });
     expect(read(dataPath(G, 'a.json'))).toBe('{"a":2}');
   });
 });

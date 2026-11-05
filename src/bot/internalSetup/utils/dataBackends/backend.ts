@@ -43,9 +43,23 @@ export type HydrationOutcome =
   | { ok: false; reason: 'deposed'; currentOwner?: GuildOwner }
   | { ok: false; reason: 'unavailable' };
 
+/** A refusal read just before COMMIT: the maintenance gate, the exit drain, or less than 2 s left. */
+export type RestoreStop = 'maintenance' | 'node-stopping' | 'out-of-time';
+
+/**
+ * 'refused': the database answered with an error, so nothing changed. 'unavailable': it did not answer or ended the
+ * connection before COMMIT was sent (timedOut: the call's own bound passed). 'unknown': COMMIT got no answer.
+ */
 export type RetireOutcome =
   | { ok: true; moved: number }
-  | { ok: false; reason: 'deposed' | 'unavailable' };
+  | { ok: false; reason: 'deposed' | 'unavailable' | 'out-of-time' | 'unknown' | 'refused' | 'no-claim'; detail?: string; timedOut?: boolean };
+
+export type RestoreOutcome =
+  | { ok: true; moved: number; retiredAt: number; reason: string }
+  | { ok: false; reason: 'deposed'; currentOwner?: GuildOwner }
+  | { ok: false; reason: 'refused'; detail: string; code?: string }
+  | { ok: false; reason: 'live-rows'; retiredAt: number }
+  | { ok: false; reason: 'no-entry' | 'schema-mismatch' | 'not-provisioned' | 'no-claim' | 'maintenance' | 'node-stopping' | 'out-of-time' | 'unavailable' | 'unknown'; detail?: string; retiredAt?: number; timedOut?: boolean };
 
 export interface DataBackend {
   readonly kind: 'file' | 'postgres';
@@ -58,8 +72,10 @@ export interface DataBackend {
   /** A kept working set asked for again: its guild re-stamped for the token only while the stamp still names this node ('kept'), else 'lost'; null when the store cannot be read. */
   reclaimGuild(guildId: string, token: FenceToken): Promise<'kept' | 'lost' | null>;
   flushGuild(guildId: string, batch: GuildFlushBatch, token: FenceToken): Promise<FlushOutcome>;
-  retireGuild(guildId: string, reason: string, token: FenceToken): Promise<RetireOutcome>;
-  restoreGuild(guildId: string, retiredAt: number, token: FenceToken): Promise<{ ok: true; moved: number } | { ok: false; reason: string }>;
+  /** deadline: a process.hrtime.bigint() reading; no statement is sent past it. */
+  retireGuild(guildId: string, reason: string, token: FenceToken, deadline?: bigint | null): Promise<RetireOutcome>;
+  /** retiredAt null: the guild's newest batch. beforeCommit is read after the move, just before COMMIT. */
+  restoreGuild(guildId: string, retiredAt: number | null, token: FenceToken, beforeCommit: () => RestoreStop | null, deadline: bigint): Promise<RestoreOutcome>;
   loadDoc(guildId: string, key: DocKey): Promise<string | null>;
   /** Catalog-wide listing; tooling/webui only (the sync facade answers the owned set). */
   listGuilds(): Promise<string[]>;

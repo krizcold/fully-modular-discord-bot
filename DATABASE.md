@@ -129,6 +129,10 @@ no guild data is saved or restored, nothing is created in that database, and the
 version it found. Point `DATA_BACKEND_URL` at a database of this version to serve again.
 The graveyard sweep deletes retired guild data after `GRAVEYARD_TTL_DAYS` (14 by default); it keeps
 each guild's ownership row, which stops an older bot process from writing over a newer one.
+A restore moves one deleted server's data back in one transaction, only while that server has no data in the
+database, fenced by its claim like any save; on JSON it renames the entry back into `/data`. The entry leaves the
+graveyard in the same step. The file sweep renames an expired entry to `.sweep-<name>` before it removes it, and
+removes leftover `.sweep-` folders at each run.
 
 ## Availability: read this before you rely on it
 

@@ -125,16 +125,19 @@ describe('ruling H: operator data writes', () => {
     expect(retireGuild).not.toHaveBeenCalled();
   });
 
-  it('on Postgres, a gate closed while the newest graveyard batch is read stops the restore', async () => {
-    setBackendKind('postgres');
-    const restoreGuild = vi.fn(async () => ({ ok: true, moved: 1 }));
-    const backend = Object.assign(Object.create(PostgresBackend.prototype), {
-      latestGraveyardBatch: async () => { closeMaintenanceGate('hook', MESSAGE); return 5; },
-      restoreGuild,
-    });
-    setGuildDataBackend(backend);
-    await expect(restoreGuildFromGraveyard(freshGuild())).rejects.toMatchObject({ causeKey: 'maintenance' });
-    expect(restoreGuild).not.toHaveBeenCalled();
+  it('on Postgres, a gate closed while the restore runs stops it before COMMIT (NB11: read by beforeCommit)', async () => {
+    const { guildId, store } = await storeGuild();
+    let committed = false;
+    store.restoreGuild = async (...args: unknown[]) => {
+      closeMaintenanceGate('hook', MESSAGE);
+      const stop = (args[3] as () => string | null)();
+      if (stop) return { ok: false, reason: stop as 'maintenance' };
+      committed = true;
+      return { ok: true, moved: 1, retiredAt: 5, reason: 'r' };
+    };
+    setGuildDataBackend(store);
+    await expect(restoreGuildFromGraveyard(guildId)).rejects.toMatchObject({ causeKey: 'maintenance' });
+    expect(committed).toBe(false);
   });
 
   it('a graveyard restore is refused while the gate is closed', async () => {

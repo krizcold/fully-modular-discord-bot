@@ -230,29 +230,32 @@ describe('an operator delete or restore asks the serving gate after its last awa
     expect(retireGuild).not.toHaveBeenCalled();
   });
 
-  it('a restore whose batch read outlasts D sends no restore', async () => {
+  it('a restore whose flush outlasts D sends no restore, and the set it held stays frozen', async () => {
     let stopped = false;
     setStoppedServingHook(() => stopped);
     const { guildId } = await storeGuild();
-    const restoreGuild = vi.fn(async () => ({ ok: true, moved: 1 }));
-    setGuildDataBackend(Object.assign(Object.create(PostgresBackend.prototype), {
-      latestGraveyardBatch: async () => { stopped = true; return 5; },
-      restoreGuild,
-    }));
+    const restoreGuild = vi.fn(async () => ({ ok: true, moved: 1, retiredAt: 5, reason: 'r' }));
+    setGuildDataBackend(Object.assign(Object.create(PostgresBackend.prototype), { restoreGuild }));
+    const ws = getWorkingSet()!;
+    vi.spyOn(ws, 'flushGuildNow').mockImplementation(async () => { stopped = true; return 'ok' as never; });
     expect(await applyOperatorDataWrite({ guildId, module: '', filename: '', op: 'restore-graveyard' })).toEqual({ ok: false, code: 'frozen' });
     expect(restoreGuild).not.toHaveBeenCalled();
+    expect(ws.stateOf(guildId)).toBe('frozen-retained');
   });
 
-  it('a set frozen while the restore runs is kept, not evicted', async () => {
+  it('a set the restore holds takes no freeze and no write, so the landed restore drops nothing unsaved', async () => {
     const { guildId } = await storeGuild();
     const ws = getWorkingSet()!;
-    const evict = vi.spyOn(ws, 'evict');
     setGuildDataBackend(Object.assign(Object.create(PostgresBackend.prototype), {
-      restoreGuild: async () => { ws.freeze(guildId); return { ok: true, moved: 1 }; },
+      restoreGuild: async () => {
+        ws.freeze(guildId);
+        expect(ws.stateOf(guildId)).toBe('restoring');
+        expect(ws.dirtyGuildIds()).not.toContain(guildId);
+        return { ok: true, moved: 1, retiredAt: 5, reason: 'r' };
+      },
     }));
-    expect(await restoreGuildFromGraveyard(guildId, 5)).toEqual({ ok: true, moved: 1 });
-    expect(evict).not.toHaveBeenCalled();
-    expect(ws.stateOf(guildId)).toBe('frozen-retained');
+    expect(await restoreGuildFromGraveyard(guildId, 5)).toEqual({ ok: true, moved: 1, retiredAt: 5, reason: 'r' });
+    expect(ws.has(guildId)).toBe(false);
   });
 });
 

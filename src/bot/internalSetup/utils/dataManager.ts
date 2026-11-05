@@ -25,7 +25,9 @@ import {
   readFileUtf8,
   readRaw,
   guildDirExists,
-  dropPendingForGuild,
+  guildHasQueuedOps,
+  guildFailingWrite,
+  fsyncDataDirs,
   graveyardGuildDir,
   restoreGuildDirFromGraveyard,
   writeRawAtomic as writeRawAtomicFile,
@@ -50,12 +52,12 @@ import {
 } from './dataBackends/fileBackend';
 import { getWorkingSet, DataBackendUnavailableError } from './dataBackends/workingSet';
 import type { WsTicket } from './dataBackends/workingSet';
-import type { FileTicket } from './dataBackends/fileBackend';
-import { PostgresBackend } from './dataBackends/postgresBackend';
-import type { DataBackend, FenceToken } from './dataBackends/backend';
+import type { FileRestoreOutcome, FileTicket } from './dataBackends/fileBackend';
+import { deadlineIn, msLeft } from './dataBackends/postgresBackend';
+import type { DataBackend, FenceToken, RestoreOutcome, RestoreStop, RetireOutcome } from './dataBackends/backend';
 import { resolveDataBackend } from '../../../utils/envLoader';
-import { currentSince, recordRefusal, recordTicket } from './dataBackends/writeLedger';
-import { noteScopeRefusal, noteScopeTicket, pendingFor, saveMark, stampOf, type SaveMark } from './dataBackends/scopeRecord';
+import { currentLedger, currentSince, recordRefusal, recordTicket } from './dataBackends/writeLedger';
+import { markBarrier, noteScopeRefusal, noteScopeTicket, pendingFor, saveMark, stampOf, type SaveMark } from './dataBackends/scopeRecord';
 import { canonicalGuildKey, GuildKeyError, type GuildKey } from './dataKeys';
 import { isMaintenanceGateClosed } from './maintenanceGate';
 import { stoppedServing } from './servingGate';
@@ -596,7 +598,7 @@ export function listGuildDataKeys(guildId: string): { module: string; filename: 
  */
 export async function sweepGraveyard(): Promise<void> {
   if (isMaintenanceGateClosed()) return;
-  await sweepFileGraveyard();
+  await sweepFileGraveyard(guildId => guildDataOps.get(guildId) === 'restore');
   if (!pgBackend || !servedByPostgres()) return;
   if (!guildDataServing || guildWritesClosed) return;
   const served = pgBackend as { servesData?: () => boolean; sweepGraveyard?: (cutoffMs: number) => Promise<number> };
@@ -751,6 +753,7 @@ export function writeRawAtomic(absPath: string, contents: string): boolean {
     throw new DataBackendUnavailableError('node-stopping');
   }
   if (isGuildDataPath(absPath)) refuseWhileGated();
+  if (rawRefusedWhileHeld(absPath)) return false;
   const shared = sharedRefusal(absPath);
   if (shared) {
     recordRefusal(shared, `file:${absPath}`);
@@ -769,6 +772,7 @@ export function deleteRawAtomic(absPath: string): boolean {
     throw new DataBackendUnavailableError('node-stopping');
   }
   if (isGuildDataPath(absPath)) refuseWhileGated();
+  if (rawRefusedWhileHeld(absPath)) return false;
   const shared = sharedRefusal(absPath);
   if (shared) {
     recordRefusal(shared, `file:${absPath}`);
@@ -916,6 +920,7 @@ function acceptSave<T>(filename: string, options: DataOptions, data: T): SaveTra
   refuseInMaintenance(options);
   refuseGuildWhileGated(options);
   if (guildWriteClosed(options, 'Write')) return { outcome: 'refused', cause: 'not-ready' };
+  if (refusedWhileHeld(options, 'Write') || refusedBeforeRestore(options, 'Write')) return { outcome: 'refused', cause: 'not-ready' };
   try {
     const wsGuild = wsRouted(options);
     if (wsGuild !== null) {
@@ -1025,6 +1030,7 @@ function acceptUpdate<T>(filename: string, options: DataOptions, defaultValue: T
   if (closedForExit) throw new DataBackendUnavailableError('node-stopping');
   refuseInMaintenance(options);
   if (guildWriteClosed(options, 'Update')) return { outcome: 'refused', cause: 'not-ready' };
+  if (refusedWhileHeld(options, 'Update') || refusedBeforeRestore(options, 'Update')) return { outcome: 'refused', cause: 'not-ready' };
   const read = readForUpdate(filename, options);
   if (read.status === 'refused') return { outcome: 'refused', cause: read.cause };
   const current = (read.status === 'present' ? read.value : structuredClone(defaultValue)) as T;
@@ -1092,6 +1098,7 @@ function acceptAppend(filename: string, options: DataOptions, line: string): App
   refuseInMaintenance(options);
   refuseGuildWhileGated(options);
   if (guildWriteClosed(options, 'Append')) return { outcome: 'refused', cause: 'not-ready' };
+  if (refusedWhileHeld(options, 'Append')) return { outcome: 'refused', cause: 'not-ready' };
   try {
     const wsGuild = wsRouted(options);
     if (wsGuild !== null) {
@@ -1176,6 +1183,7 @@ function acceptDelete(filename: string, options: DataOptions): DeleteTracked {
   refuseInMaintenance(options);
   refuseGuildWhileGated(options);
   if (guildWriteClosed(options, 'Delete')) return { outcome: 'refused', cause: 'not-ready' };
+  if (refusedWhileHeld(options, 'Delete') || refusedBeforeRestore(options, 'Delete')) return { outcome: 'refused', cause: 'not-ready' };
   try {
     const wsGuild = wsRouted(options);
     if (wsGuild !== null) {
@@ -1243,97 +1251,388 @@ function refuseFrozenGuild(guildId: string): void {
   if (stoppedServing() || getWorkingSet()?.stateOf(guildId) === 'frozen-retained') throw new GuildFrozenError(guildId);
 }
 
-/**
- * Retire a guild namespace to the graveyard (same volume). Flushes and drops
- * any pending state for the guild, then renames the dir under _graveyard and
- * writes a .graveyard.json reason marker inside.
- */
-export async function deleteGuildNamespace(guildId: string, reason: string, flushMs = 30000): Promise<boolean> {
-  refuseGuildChangeInMaintenance();
-  if (servedByPostgres()) {
-    if (!pgBackend) return false;
-    const ws = getWorkingSet();
-    if (ws) {
-      // Writes that did not reach the store are kept, and nothing removed.
-      const flushed = await ws.flushGuildNow(guildId, flushMs);
-      if (flushed !== 'ok') {
-        console.error(`[DataManager] Cannot retire guild ${guildId}: its unflushed writes did not reach the store (${flushed}); nothing was removed`);
-        return false;
-      }
-      refuseGuildChangeInMaintenance();
-      refuseFrozenGuild(guildId);
-      ws.evict(guildId);
-    }
-    const token = fenceFromOwnerInfo(guildId);
-    if (!token) {
-      console.warn(`[DataManager] Cannot retire guild ${guildId}: no owner info wired`);
-      return false;
-    }
-    const res = await pgBackend.retireGuild(guildId, reason, token);
-    if (!res.ok) {
-      console.error(`[DataManager] Failed to retire guild ${guildId} (${res.reason})`);
-      return false;
-    }
-    if (res.moved > 0) console.log(`[DataManager] Guild ${guildId} moved to graveyard (${reason})`);
-    return res.moved > 0;
-  }
-  if (!guildDirExists(guildId)) return false;
+// A guild a graveyard restore or a namespace delete holds: its writes are refused and its actions held until the
+// operation ends, and the other operation is refused meanwhile.
+export type GuildDataOp = 'restore' | 'delete';
+const guildDataOps = new Map<string, GuildDataOp>();
 
+export function guildDataOpOf(guildId: string): GuildDataOp | undefined {
+  return guildDataOps.get(guildId);
+}
+
+// Per guild, the barrier taken when a restore changed or may have changed its store; kept for the process's life.
+const restoredAt = new Map<string, number>();
+
+/** A guild write while an operation holds its guild: logged, and refused as not ready. */
+function refusedWhileHeld(options: DataOptions, what: string): boolean {
+  if ((options.scope || 'guild') !== 'guild' || !options.guildId) return false;
+  const op = guildDataOps.get(options.guildId);
+  if (!op) return false;
+  console.warn(`[Data] ${what} for guild ${options.guildId} refused: ${op === 'restore' ? 'its data is being restored from the graveyard' : 'its data is being deleted'}`);
+  return true;
+}
+
+/** A whole-document write from a run whose ledger is still open and began before the guild's restore ended. */
+function refusedBeforeRestore(options: DataOptions, what: string): boolean {
+  if ((options.scope || 'guild') !== 'guild' || !options.guildId) return false;
+  const barrier = restoredAt.get(options.guildId);
+  if (barrier === undefined) return false;
+  const ledger = currentLedger();
+  if (!ledger || ledger.sealed) return false;
+  const since = stampOf(currentSince());
+  if (since === null || since >= barrier) return false;
+  console.warn(`[Data] ${what} for guild ${options.guildId} refused: it comes from a command that started before the server's data was restored from the graveyard`);
+  return true;
+}
+
+/** The guild whose folder holds this path, or null. */
+function guildOfPath(absPath: string): string | null {
+  const rel = path.relative(BASE_DATA_DIR, path.resolve(absPath));
+  if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) return null;
+  const first = rel.split(path.sep)[0];
+  return /^\d+$/.test(first) ? first : null;
+}
+
+/** A raw write under a guild folder while an operation holds the guild: refused, as the facade's writes are. */
+function rawRefusedWhileHeld(absPath: string): boolean {
+  const guildId = guildOfPath(absPath);
+  const op = guildId === null ? undefined : guildDataOps.get(guildId);
+  if (!op) return false;
+  recordRefusal('not-ready', `file:${absPath}`);
+  console.warn(`[Data] Write of ${absPath} refused: ${op === 'restore' ? 'its guild\'s data is being restored from the graveyard' : 'its guild\'s data is being deleted'}`);
+  return true;
+}
+
+// The events of a file-routed guild under restore, replayed in order when the restore ends.
+const EVENT_BUFFER_CAP = 256;
+const restoreEvents = new Map<string, Array<() => void>>();
+let restoreEventDrops = 0;
+
+/** Holds an event of a guild a restore holds (true); false when no restore holds it. */
+export function bufferRestoreEvent(guildId: string, replay: () => void): boolean {
+  if (guildDataOps.get(guildId) !== 'restore') return false;
+  let queue = restoreEvents.get(guildId);
+  if (!queue) {
+    queue = [];
+    restoreEvents.set(guildId, queue);
+  }
+  if (queue.length >= EVENT_BUFFER_CAP) {
+    queue.shift();
+    restoreEventDrops += 1;
+    if (restoreEventDrops % 50 === 1) {
+      console.warn(`[Data] Event buffer overflow for guild ${guildId} (${restoreEventDrops} drop(s) total); oldest dropped`);
+    }
+  }
+  queue.push(replay);
+  return true;
+}
+
+function replayRestoreEvents(guildId: string): void {
+  const queue = restoreEvents.get(guildId);
+  restoreEvents.delete(guildId);
+  for (const replay of queue ?? []) {
+    try {
+      replay();
+    } catch (error) {
+      console.error(`[Data] Buffered event replay failed for guild ${guildId}:`, error);
+    }
+  }
+}
+
+/** A restore's and a delete's bound when the request names none: 40 s from now on the monotonic clock. */
+const OPERATION_BOUND_MS = 40_000;
+const RESTORE_FLUSH_MS = 5000;
+const COMMIT_FLOOR_MS = 2000;
+
+/** What stops a restore or a delete before its change: the maintenance gate, the exit drain, or the deadline. */
+function operationStop(deadline: bigint, floorMs: number): RestoreStop | null {
+  if (isMaintenanceGateClosed()) return 'maintenance';
+  if (closedForExit) return 'node-stopping';
+  if (msLeft(deadline) < floorMs) return 'out-of-time';
+  return null;
+}
+
+export const RESTORE_TEXTS = {
+  noEntry: 'no graveyard entry for this guild',
+  alreadyRunning: 'a restore of this server is already running; nothing was restored; its answer comes within a minute',
+  deleteRunning: "a delete of this server's data is running; nothing was restored; try again once it ends",
+  notLoaded: "this server's data is not loaded in this bot process; nothing was restored; try again in a moment",
+  flush: "the server's unsaved changes are not confirmed saved yet; nothing was restored; try again in a moment",
+  schemaMismatch: 'the database holds another schema version than this bot reads; nothing was restored',
+  noClaim: 'this bot process holds no usable claim on the database; nothing was restored; restart the bot',
+  notProvisioned: 'the database is not provisioned yet; nothing was restored; try again once the bot has started',
+  outOfTime: 'the restore ran out of its 40 s before it could commit; nothing was restored; try again in a moment',
+  deposed: "another bot process now serves this server's data; nothing was restored",
+  nodeStopping: '[Data] This process is stopping; nothing was restored',
+  live: (retiredAt: number) => `live guild data exists; nothing was restored. To restore entry ${retiredAt}, delete this server's data, then restore with retiredAt ${retiredAt} before the bot saves anything new for the server; data it saves in between blocks the restore again. While the server's members are active, remove the bot from the server first and add it back after the restore.`,
+  unavailable: (detail: string) => `[Data] The database did not answer or ended the connection (${detail}); nothing was restored; try again in a moment`,
+  refused: (detail: string, code?: string) => `the database refused the restore (${detail}); nothing was restored; ${code === '40P01' || code === '57014' ? 'try again in a moment' : 'see the bot log'}`,
+  unknown: (guildId: string, retiredAt?: number) => `can't confirm whether server ${guildId} was restored: the database did not confirm the commit. Within a minute, if it was restored, the server's data is back and ${retiredAt === undefined ? 'its entry' : `entry ${retiredAt}`} is gone from \`smdb graveyard list\`; if not, the entry is still listed, unless it had passed the graveyard's keep time (GRAVEYARD_TTL_DAYS, 14 days by default) and the graveyard sweep removed it, data and all.`,
+  error: (message: string) => `the restore stopped on an error in the bot (${message}); nothing was restored; see the bot log`,
+  rename: (code: string) => `the graveyard entry could not be moved back (${code}); nothing was restored; try again in a moment`,
+  note: (code: string, step: 'read' | 'remove' = 'remove') => `the graveyard entry's note could not be ${step === 'read' ? 'read' : 'removed'} (${code}); nothing was restored; try again in a moment`,
+};
+
+export const DELETE_TEXTS = {
+  failed: 'guild data delete failed; nothing was removed',
+  alreadyRunning: "a delete of this server's data is already running; nothing was removed",
+  restoreRunning: 'a restore of this server from the graveyard is running; nothing was removed; try again once it ends',
+  flush: "the server's unsaved changes are not confirmed saved yet; nothing was removed; try again in a moment",
+  deposed: "another bot process now serves this server's data; nothing was removed",
+  notLoaded: "this server's data is not loaded in this bot process; nothing was removed; try again in a moment",
+  error: (message: string) => `the delete stopped on an error in the bot (${message}); nothing was removed; see the bot log`,
+  timeout: 'the database did not finish the delete within its 40 s; nothing was removed; try again in a moment',
+  outOfTime: 'the delete ran out of its 40 s before it could commit; nothing was removed; try again in a moment',
+  nodeStopping: '[Data] This process is stopping; nothing was removed',
+  unknown: "can't confirm whether this server's data was deleted: the database did not confirm the commit. Within a minute, `smdb graveyard list` lists a new entry for this server if it was deleted; if no new entry is listed by then, it was not.",
+  noClaim: 'this bot process holds no usable claim on the database; nothing was removed; restart the bot',
+  unavailable: (detail: string) => `the database did not answer or ended the connection (${detail}); nothing was removed; try again in a moment`,
+  failing: (file: string, code: string) => `a file of this server keeps failing to save (${file}: ${code}); nothing was removed; free disk space or fix the file's permissions, then try again`,
+};
+
+export type GraveyardReply =
+  | { ok: true; retiredAt: number; reason: string; moved?: number }
+  | { ok: false; code: 'invalid' | 'backend-unavailable' | 'not-owner' | 'frozen' | 'io-error'; error?: string };
+
+export type DeleteReply = { ok: true } | { ok: false; code: 'invalid' | 'backend-unavailable' | 'not-owner' | 'io-error'; error: string };
+
+const errorMessage = (error: unknown): string => (error instanceof Error ? error.message : String(error));
+
+const unconfirmedReplies = new WeakSet<object>();
+
+/** A can't confirm answer: the change may have landed, so no later refusal text may replace it. */
+function unconfirmed<T extends object>(reply: T): T {
+  unconfirmedReplies.add(reply);
+  return reply;
+}
+
+export function isUnconfirmedReply(reply: object): boolean {
+  return unconfirmedReplies.has(reply);
+}
+
+/** A stop read before the change: maintenance and the exit drain throw as every refused guild change does. */
+function stopAnswer(stop: RestoreStop, what: 'restore' | 'delete'): { ok: false; code: 'backend-unavailable'; error: string } {
+  if (stop === 'maintenance') throw new DataBackendUnavailableError('maintenance');
+  if (stop === 'node-stopping') throw new DataBackendUnavailableError('node-stopping', what === 'restore' ? RESTORE_TEXTS.nodeStopping : DELETE_TEXTS.nodeStopping);
+  return { ok: false, code: 'backend-unavailable', error: what === 'restore' ? RESTORE_TEXTS.outOfTime : DELETE_TEXTS.outOfTime };
+}
+
+/**
+ * Retire a guild namespace to the graveyard. The guild is held from the first await to the end, so no write of it is
+ * accepted meanwhile, and it goes on only once every write accepted before is saved: on Postgres the set's flush
+ * answered ok (the set is evicted once the retire returned), on JSON no op under its folder is queued or on the wire.
+ * deadline: a process.hrtime.bigint() reading; nothing is retired or renamed after it.
+ */
+export async function deleteGuildNamespace(guildId: string, reason: string, flushMs = 30000, deadline: bigint = deadlineIn(OPERATION_BOUND_MS)): Promise<DeleteReply> {
+  refuseGuildChangeInMaintenance();
+  const running = guildDataOps.get(guildId);
+  if (running === 'delete') return { ok: false, code: 'invalid', error: DELETE_TEXTS.alreadyRunning };
+  if (running === 'restore') return { ok: false, code: 'invalid', error: DELETE_TEXTS.restoreRunning };
+  const postgres = servedByPostgres();
+  if (postgres ? !pgBackend : !guildDirExists(guildId)) return { ok: false, code: 'io-error', error: DELETE_TEXTS.failed };
+  guildDataOps.set(guildId, 'delete');
+  try {
+    return postgres ? await retireRows(guildId, reason, flushMs, deadline, pgBackend!) : await retireFiles(guildId, reason, deadline);
+  } finally {
+    guildDataOps.delete(guildId);
+  }
+}
+
+async function retireRows(guildId: string, reason: string, flushMs: number, deadline: bigint, backend: DataBackend): Promise<DeleteReply> {
+  const ws = getWorkingSet();
+  if (ws) {
+    const flushed = await ws.flushGuildNow(guildId, Math.min(flushMs, Math.max(0, msLeft(deadline))));
+    if (flushed === 'deposed') {
+      console.error(`[DataManager] Cannot retire guild ${guildId}: another bot process now serves its data; nothing was removed`);
+      return { ok: false, code: 'not-owner', error: DELETE_TEXTS.deposed };
+    }
+    if (flushed !== 'ok') {
+      console.error(`[DataManager] Cannot retire guild ${guildId}: its unflushed writes are not confirmed saved (${flushed}); nothing was removed`);
+      return { ok: false, code: 'backend-unavailable', error: DELETE_TEXTS.flush };
+    }
+    refuseGuildChangeInMaintenance();
+    refuseFrozenGuild(guildId);
+  }
+  const token = fenceFromOwnerInfo(guildId);
+  if (!token) {
+    console.warn(`[DataManager] Cannot retire guild ${guildId}: no owner info wired`);
+    return { ok: false, code: 'io-error', error: DELETE_TEXTS.failed };
+  }
+  let res: RetireOutcome;
+  try {
+    res = await backend.retireGuild(guildId, reason, token, deadline);
+  } finally {
+    // Whatever the retire answered: the set holds nothing unsaved, and the next access reads the store.
+    ws?.evict(guildId);
+  }
+  if (res.ok) {
+    if (res.moved > 0) {
+      console.log(`[DataManager] Guild ${guildId} moved to graveyard (${reason})`);
+      return { ok: true };
+    }
+    return { ok: false, code: 'io-error', error: DELETE_TEXTS.failed };
+  }
+  if (res.reason === 'unknown') {
+    console.error(`[DataManager] Can't confirm whether guild ${guildId} was retired: the database did not confirm the commit`);
+  } else {
+    console.error(`[DataManager] Failed to retire guild ${guildId} (${res.reason})`);
+  }
+  switch (res.reason) {
+    case 'unknown': return unconfirmed({ ok: false, code: 'backend-unavailable', error: DELETE_TEXTS.unknown });
+    case 'no-claim': return { ok: false, code: 'backend-unavailable', error: DELETE_TEXTS.noClaim };
+    case 'deposed': return { ok: false, code: 'not-owner', error: DELETE_TEXTS.deposed };
+    case 'out-of-time': return { ok: false, code: 'backend-unavailable', error: DELETE_TEXTS.outOfTime };
+    case 'unavailable':
+      return { ok: false, code: 'backend-unavailable', error: res.timedOut ? DELETE_TEXTS.timeout : DELETE_TEXTS.unavailable(res.detail ?? 'no detail') };
+    default: return { ok: false, code: 'io-error', error: DELETE_TEXTS.failed };
+  }
+}
+
+async function retireFiles(guildId: string, reason: string, deadline: bigint): Promise<DeleteReply> {
   await flushGuild(guildId);
   refuseGuildChangeInMaintenance();
   if (sharedWritesLost) {
     recordRefusal('writer-lost', guildId);
     console.error(`[DataManager] Cannot retire guild ${guildId}: another process took the data files; nothing was removed`);
-    return false;
+    return { ok: false, code: 'io-error', error: DELETE_TEXTS.failed };
   }
-  dropPendingForGuild(guildId);
-
-  return graveyardGuildDir(guildId, reason, sharedWritesClosedLost);
+  const early = operationStop(deadline, 0);
+  if (early) return stopAnswer(early, 'delete');
+  // With the guild held, an op still queued is one whose flush keeps failing: it stays queued and retried.
+  if (guildHasQueuedOps(guildId)) {
+    const failing = guildFailingWrite(guildId);
+    console.error(`[DataManager] Cannot retire guild ${guildId}: ${failing ? `${failing.file} keeps failing to save (${failing.code})` : 'a write of it is not saved yet'}; nothing was removed`);
+    return { ok: false, code: 'backend-unavailable', error: failing ? DELETE_TEXTS.failing(failing.file, failing.code) : DELETE_TEXTS.flush };
+  }
+  let stop: RestoreStop | null = null;
+  const moved = await graveyardGuildDir(guildId, reason, sharedWritesClosedLost, () => (stop = operationStop(deadline, 0)) !== null);
+  if (!moved) {
+    if (stop) return stopAnswer(stop, 'delete');
+    return { ok: false, code: 'io-error', error: DELETE_TEXTS.failed };
+  }
+  await fsyncDataDirs();
+  return { ok: true };
 }
 
 /**
- * Restore a retired guild namespace from the graveyard. Refusals (live data
- * exists, no matching entry) come back as {ok:false, error}; backend outages
- * throw DataBackendUnavailableError and IO failures throw plain errors.
- * retiredAt absent = the guild's newest graveyard batch/entry.
+ * Restore a retired guild namespace from the graveyard (retiredAt absent: the guild's newest entry). The guild is held
+ * from the admission to the end: its writes are refused, its interactions held and its events wait. Refusals and
+ * outcomes come back as a reply with its code; maintenance, the exit drain and a database that did not answer throw
+ * DataBackendUnavailableError. deadline: a process.hrtime.bigint() reading; nothing commits or is renamed after it.
  */
-export async function restoreGuildFromGraveyard(guildId: string, retiredAt?: number): Promise<{ ok: boolean; error?: string; moved?: number }> {
+export async function restoreGuildFromGraveyard(guildId: string, retiredAt?: number, deadline: bigint = deadlineIn(OPERATION_BOUND_MS)): Promise<GraveyardReply> {
   refuseGuildChangeInMaintenance();
-  if (servedByPostgres()) {
-    if (!pgBackend) throw new DataBackendUnavailableError('database-unreachable');
-    let batch = retiredAt;
-    if (batch === undefined) {
-      if (!(pgBackend instanceof PostgresBackend)) throw new DataBackendUnavailableError('database-unreachable');
-      let newest: number | null;
-      try {
-        newest = await pgBackend.latestGraveyardBatch(guildId);
-      } catch {
-        throw new DataBackendUnavailableError('database-unreachable');
-      }
-      if (newest === null) return { ok: false, error: 'no graveyard entry for this guild' };
-      batch = newest;
+  if (closedForExit) throw new DataBackendUnavailableError('node-stopping', RESTORE_TEXTS.nodeStopping);
+  const running = guildDataOps.get(guildId);
+  if (running) return { ok: false, code: 'invalid', error: running === 'restore' ? RESTORE_TEXTS.alreadyRunning : RESTORE_TEXTS.deleteRunning };
+  return servedByPostgres() ? restoreRows(guildId, retiredAt, deadline) : restoreFiles(guildId, retiredAt, deadline);
+}
+
+async function restoreRows(guildId: string, retiredAt: number | undefined, deadline: bigint): Promise<GraveyardReply> {
+  const backend = pgBackend;
+  if (!backend) throw new DataBackendUnavailableError('database-unreachable', RESTORE_TEXTS.unavailable('no database backend in this process'));
+  const ws = getWorkingSet();
+  const state = ws?.stateOf(guildId) ?? null;
+  if (stoppedServing() || state === 'frozen-retained') return { ok: false, code: 'frozen' };
+  if (state === 'fenced') return { ok: false, code: 'not-owner', error: RESTORE_TEXTS.deposed };
+  if (!ws || !ws.beginRestore(guildId)) return { ok: false, code: 'backend-unavailable', error: RESTORE_TEXTS.notLoaded };
+  guildDataOps.set(guildId, 'restore');
+  let flushed: string | undefined;
+  let outcome: RestoreOutcome | undefined;
+  let called = false;
+  let stopped = false;
+  let failure: { error: unknown } | null = null;
+  const fence = ws.fenceOf(guildId);
+  // A set whose shard left this process while it was held is not served again: it is frozen.
+  const stillHeld = (): boolean => {
+    if (stoppedServing()) return false;
+    const now = fenceFromOwnerInfo(guildId);
+    return !now || !fence || now.claim === fence.claim;
+  };
+  try {
+    flushed = await ws.flushGuildNow(guildId, Math.min(RESTORE_FLUSH_MS, Math.max(0, msLeft(deadline))));
+    stopped = stoppedServing();
+    if (flushed === 'ok' && fence && !stopped) {
+      called = true;
+      outcome = await backend.restoreGuild(guildId, retiredAt ?? null, fence, () => operationStop(deadline, COMMIT_FLOOR_MS), deadline);
     }
-    const token = fenceFromOwnerInfo(guildId)
-      ?? { nodeId: '', claim: null, processId: null, shardId: 0, shardCount: 1 };
-    refuseGuildChangeInMaintenance();
-    refuseFrozenGuild(guildId);
-    const res = await pgBackend.restoreGuild(guildId, batch, token);
-    if (res.ok) {
-      // The pre-restore ready gate hydrated the guild EMPTY (claim-then-read
-      // saw no rows); evict that set so the next access rehydrates with the
-      // restored docs instead of serving the stale emptiness. A set frozen
-      // meanwhile keeps its writes for the leave.
-      const ws = getWorkingSet();
-      if (ws?.stateOf(guildId) !== 'frozen-retained') ws?.evict(guildId);
-      return { ok: true, moved: res.moved };
-    }
-    if (res.reason === 'live-rows') return { ok: false, error: 'live guild data exists; delete it before restoring' };
-    if (res.reason === 'schema-mismatch') return { ok: false, error: 'the database holds another schema version than this bot reads; nothing was restored' };
-    throw new DataBackendUnavailableError('database-unreachable');
+  } catch (error) {
+    failure = { error };
+    if (called) console.error(`[DataManager] Can't confirm whether guild ${guildId} was restored: the restore stopped on an error once it was sent to the database:`, error);
+    else console.error(`[Data] The restore of guild ${guildId} stopped on an error:`, error);
   }
-  const restored = await restoreGuildDirFromGraveyard(guildId, retiredAt, sharedWritesClosedLost, WRITER_LOST_RESTORE_TEXT);
-  if (!restored.ok && restored.error === WRITER_LOST_RESTORE_TEXT) recordRefusal('writer-lost', guildId);
-  return restored;
+  if (outcome && !outcome.ok && outcome.reason === 'unknown') {
+    const batch = outcome.retiredAt ?? retiredAt;
+    console.error(`[DataManager] Can't confirm whether guild ${guildId} was restored${batch === undefined ? '' : ` from graveyard batch ${batch}`}: the database did not confirm the commit`);
+  }
+  // One synchronous run, whatever the exit: the set ends, the barrier is taken, the guild is released.
+  const deposedOwner = outcome && !outcome.ok && outcome.reason === 'deposed' ? { owner: outcome.currentOwner } : null;
+  if (flushed === 'deposed' || deposedOwner) {
+    ws.depose(guildId, deposedOwner?.owner);
+  } else if (called && (failure || outcome?.ok || (outcome && !outcome.ok && outcome.reason === 'unknown'))) {
+    ws.endRestore(guildId, 'evict');
+    restoredAt.set(guildId, markBarrier().stamp);
+  } else {
+    ws.endRestore(guildId, 'reopen', stillHeld);
+  }
+  guildDataOps.delete(guildId);
+
+  if (failure) {
+    return called
+      ? unconfirmed({ ok: false, code: 'backend-unavailable', error: RESTORE_TEXTS.unknown(guildId, retiredAt) })
+      : { ok: false, code: 'io-error', error: RESTORE_TEXTS.error(errorMessage(failure.error)) };
+  }
+  if (flushed === 'deposed') return { ok: false, code: 'not-owner', error: RESTORE_TEXTS.deposed };
+  if (flushed !== 'ok') return { ok: false, code: 'backend-unavailable', error: RESTORE_TEXTS.flush };
+  if (stopped) return { ok: false, code: 'frozen' };
+  if (!outcome) return { ok: false, code: 'backend-unavailable', error: RESTORE_TEXTS.notLoaded };
+  if (outcome.ok) return { ok: true, retiredAt: outcome.retiredAt, reason: outcome.reason, moved: outcome.moved };
+  switch (outcome.reason) {
+    case 'deposed': return { ok: false, code: 'not-owner', error: RESTORE_TEXTS.deposed };
+    case 'live-rows': return { ok: false, code: 'invalid', error: RESTORE_TEXTS.live(outcome.retiredAt) };
+    case 'no-entry': return { ok: false, code: 'invalid', error: RESTORE_TEXTS.noEntry };
+    case 'schema-mismatch': return { ok: false, code: 'invalid', error: RESTORE_TEXTS.schemaMismatch };
+    case 'refused': return { ok: false, code: 'backend-unavailable', error: RESTORE_TEXTS.refused(outcome.detail, outcome.code) };
+    case 'no-claim': return { ok: false, code: 'backend-unavailable', error: RESTORE_TEXTS.noClaim };
+    case 'not-provisioned': return { ok: false, code: 'backend-unavailable', error: RESTORE_TEXTS.notProvisioned };
+    case 'unknown': return unconfirmed({ ok: false, code: 'backend-unavailable', error: RESTORE_TEXTS.unknown(guildId, outcome.retiredAt ?? retiredAt) });
+    case 'maintenance':
+    case 'node-stopping':
+    case 'out-of-time':
+      return stopAnswer(outcome.reason, 'restore');
+    default:
+      throw new DataBackendUnavailableError('database-unreachable', RESTORE_TEXTS.unavailable(outcome.detail ?? 'no detail'));
+  }
+}
+
+async function restoreFiles(guildId: string, retiredAt: number | undefined, deadline: bigint): Promise<GraveyardReply> {
+  guildDataOps.set(guildId, 'restore');
+  const progress = { renamed: false };
+  let outcome: FileRestoreOutcome | undefined;
+  let failure: { error: unknown } | null = null;
+  try {
+    outcome = await restoreGuildDirFromGraveyard(guildId, retiredAt, { stop: () => operationStop(deadline, 0), writerLost: sharedWritesClosedLost, progress });
+  } catch (error) {
+    failure = { error };
+    console.error(`[Data] The restore of guild ${guildId} stopped on an error:`, error);
+  }
+  // One synchronous run, whatever the exit: the barrier, the guild released, its events replayed in order.
+  if (progress.renamed) restoredAt.set(guildId, markBarrier().stamp);
+  guildDataOps.delete(guildId);
+  replayRestoreEvents(guildId);
+
+  if (failure || !outcome) return { ok: false, code: 'io-error', error: RESTORE_TEXTS.error(errorMessage(failure?.error)) };
+  if (outcome.ok) return { ok: true, retiredAt: outcome.retiredAt, reason: outcome.reason };
+  switch (outcome.why) {
+    case 'no-entry': return { ok: false, code: 'invalid', error: RESTORE_TEXTS.noEntry };
+    case 'live': return { ok: false, code: 'invalid', error: RESTORE_TEXTS.live(outcome.retiredAt) };
+    case 'stopped': return stopAnswer(outcome.stop, 'restore');
+    case 'writer-lost':
+      recordRefusal('writer-lost', guildId);
+      return { ok: false, code: 'invalid', error: WRITER_LOST_RESTORE_TEXT };
+    case 'note': return { ok: false, code: 'io-error', error: RESTORE_TEXTS.note(outcome.code, outcome.step) };
+    default: return { ok: false, code: 'io-error', error: RESTORE_TEXTS.rename(outcome.code) };
+  }
 }
 
 const WRITER_LOST_RESTORE_TEXT = "Another process took over the bot's data files, so nothing was restored. Please try again in a moment.";

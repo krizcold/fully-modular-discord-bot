@@ -32,6 +32,7 @@ import { backupMatch, isBackupFilename, listBackups, stampDate, writeBackup, typ
 import { childQueuedError, readServedGlobal, readServedGuild, withTargetLock, type ServedRead } from '../utils/servedRead';
 import type { BotManager } from '../botManager';
 import { hopFailure, noAnswerText } from './hopFailure';
+import { graveyardRouteRefusal } from './graveyard';
 import { shaOfRaw, CHANGED_SINCE_OPEN_TEXT } from '../../bot/internalSetup/utils/ipcDataHandler';
 
 const CONFIG_NOT_FOUND = 'Config file not found. It may not exist in any scanned directories.';
@@ -1018,6 +1019,14 @@ export function createConfigRoutes(botManager: BotManager): Router {
 
 const PENDING_TEXT = 'not confirmed as saved yet; reload in a moment to check';
 
+// The bot commits or renames nothing past 40 s after the send, so a reload at once could show data a late delete removes.
+const GUILD_DELETE_MINUTE = 'Within a minute, `smdb graveyard list` lists a new entry for this server if it was deleted; if no new entry is listed by then, it was not.';
+
+function noAnswerReplyText(cause: unknown, what: 'write' | 'delete' | 'guild-delete'): string {
+  const text = noAnswerText(cause, what);
+  return what === 'guild-delete' ? text.replace(/ Reload to check\.$/, ` ${GUILD_DELETE_MINUTE}`) : text;
+}
+
 /**
  * Map a guild-write/read hop reply (bot child IPC) onto the HTTP response;
  * extra (a backup's outcome) rides on a success answer.
@@ -1025,7 +1034,7 @@ const PENDING_TEXT = 'not confirmed as saved yet; reload in a moment to check';
 export function sendHopReply(res: Response, reply: any, extra: Record<string, unknown> = {}, what: 'write' | 'delete' | 'guild-delete' = 'write'): void {
   // A change the bot never answered: nobody knows whether it was saved.
   if (reply && reply.noAnswer) {
-    res.status(503).json({ success: false, code: 'no-answer', error: noAnswerText(reply.noAnswer, what) });
+    res.status(503).json({ success: false, code: 'no-answer', error: noAnswerReplyText(reply.noAnswer, what) });
     return;
   }
   if (reply && reply.ok) {
@@ -1042,6 +1051,11 @@ export function sendHopReply(res: Response, reply: any, extra: Record<string, un
     return;
   }
   const detail = reply && typeof reply.error === 'string' ? reply.error : undefined;
+  const refused = what === 'guild-delete' ? graveyardRouteRefusal(reply?.code, detail, 'guild-delete') : null;
+  if (refused) {
+    res.status(503).json({ success: false, error: refused });
+    return;
+  }
   const failure = hopFailure(reply?.code, detail);
   if (failure) {
     res.status(failure.status).json({ success: false, error: failure.error });

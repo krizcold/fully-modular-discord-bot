@@ -76,7 +76,7 @@ describe('a child that exits before answering a change', () => {
   it.each([
     ['a guild data write', 'POST', '/api/config/data/update', { file: 'mod/x.json', guildId: G, data: { a: 2 } }, "can't confirm whether the change was saved. Reload to check."],
     ['a data file delete', 'POST', '/api/config/data/delete', { file: 'mod/x.json', guildId: G }, "can't confirm whether the file was deleted. Reload to check."],
-    ['a guild data delete', 'POST', '/api/config/data/delete-guild', { guildId: G }, "can't confirm whether this server's data was deleted. Reload to check."],
+    ['a guild data delete', 'POST', '/api/config/data/delete-guild', { guildId: G }, "can't confirm whether this server's data was deleted. Within a minute, `smdb graveyard list` lists a new entry for this server if it was deleted; if no new entry is listed by then, it was not."],
     ['a premium op', 'PUT', '/premium/tiers/gold', {}, `can't confirm whether the change was saved. Reload to check. ${PROVIDER_SENTENCE}`],
     ['a global file write', 'PUT', '/global/y.json', {}, "can't confirm whether the change was saved. Reload to check."],
   ] as const)('%s answers 503 no-answer with the can\'t-confirm text', async (_name, method, route, body, ending) => {

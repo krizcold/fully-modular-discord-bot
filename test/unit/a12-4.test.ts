@@ -21,10 +21,10 @@ describe('A12-4 data op failures name their state', () => {
     expect(r.body.error).toBe('live data exists');
   });
 
-  it('not-owner is a refusal that says the change was not saved, not a retry hint', async () => {
+  it('not-owner is a refusal that says nothing was restored, not a retry hint (NB11 decision 11)', async () => {
     const r = await restore({ ok: false, code: 'not-owner', error: 'guild ownership moved mid-write' });
     expect(r.status).toBe(503);
-    expect(r.body.error).toMatch(/took over this guild's data, so the change was not saved/);
+    expect(r.body.error).toBe("another bot process now serves this server's data; nothing was restored");
     expect(r.body.error).not.toMatch(/retry/);
   });
 

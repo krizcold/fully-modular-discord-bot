@@ -10,7 +10,7 @@ import { initWorkingSet } from './workingSet';
 import type { DataUnavailableCause } from './workingSet';
 import { initDataReadiness, getDataReadiness, DataReadinessDriver } from './dataReadiness';
 import { evaluateRecognitionGuard, verifyStoreIdentity, readFileMarker, GuardVerdict } from './recognitionGuard';
-import { setGuildDataBackend, isClosedForExit, closeGuildWrites, noteGuildDataServing } from '../dataManager';
+import { setGuildDataBackend, isClosedForExit, closeGuildWrites, noteGuildDataServing, guildDataOpOf, bufferRestoreEvent } from '../dataManager';
 import { getConfigProperty } from '../configManager';
 import { ACK_MS, sweepLateWrites } from './replyGate';
 import { saveMark, type SaveMark } from './scopeRecord';
@@ -226,6 +226,8 @@ export function gateCauseNow(guildId: string, since: number): GateCause {
   if (isClosedForExit()) return 'stopping';
   if (isMaintenanceGateClosed()) return 'maintenance';
   if (bootStatus.state === 'refused') return 'refused';
+  // A graveyard restore or a namespace delete of the guild runs: held until it ends.
+  if (guildDataOpOf(guildId)) return 'loading';
   const readiness = getDataReadiness();
   if (!readiness || resolveDataBackend() === 'file') return 'admit';
   return readiness.causeOf(guildId, since);
@@ -339,7 +341,7 @@ export async function gateEventDispatch(eventName: string, args: any[], replay: 
   // Unresolvable backend configuration: guild-scoped dispatch stays closed.
   if (bootStatus.state === 'refused') return false;
   const readiness = getDataReadiness();
-  if (!readiness || resolveDataBackend() === 'file') return true;
+  if (!readiness || resolveDataBackend() === 'file') return !bufferRestoreEvent(guildId, replay);
   return readiness.admitEvent(guildId, replay);
 }
 

@@ -3,12 +3,36 @@
 // restore runs in the bot process via the guild data write IPC.
 
 import { Router, Request, Response } from 'express';
-import { BotManager } from '../botManager';
+import { BotManager, ROUTE_TEXT } from '../botManager';
 import { resolveDataBackend } from '../../utils/envLoader';
 import { listGraveyardEntries } from '../../bot/internalSetup/utils/dataManager';
 import { readFileMarker, recognitionRefusal } from '../../bot/internalSetup/utils/dataBackends/recognitionGuard';
 import { getWebuiDataReader, isDataBackendUnreachable } from '../utils/webuiDataReader';
 import { hopFailure } from './hopFailure';
+
+const NO_ANSWER_CAUSE: Record<string, string> = {
+  timeout: 'the bot did not answer within 50 s',
+  stopped: 'the bot process stopped before answering',
+  failed: 'the request could not be handed to the bot',
+};
+
+export const RESTORE_MINUTE = "Within a minute, if it was restored, the server's data is back and its entry is gone from `smdb graveyard list`; if not, the entry is still listed, unless it had passed the graveyard's keep time and the graveyard sweep removed it, data and all.";
+
+/** The web UI's own refusal of a restore or a server's data delete while the bot starts or stops: hopFailure's words are a save's. */
+export function graveyardRouteRefusal(code: unknown, detail: string | undefined, what: 'restore' | 'guild-delete'): string | null {
+  const nothing = what === 'restore' ? 'nothing was restored' : 'nothing was removed';
+  const again = what === 'restore' ? 'restore again' : 'delete again';
+  if (code === 'stopping') {
+    if (detail === ROUTE_TEXT.exiting) return `the web panel is shutting down; ${nothing}; try again once it is back`;
+    if (detail === ROUTE_TEXT.restarting) return `the bot is restarting; ${nothing}; try again once the bot has started`;
+    return `the bot is stopping; ${nothing}; ${again} once the bot is started`;
+  }
+  if (code === 'starting') {
+    if (!detail || detail === ROUTE_TEXT.starting) return `the bot is starting; ${nothing}; try again once the bot has started`;
+    return detail.replace('nothing was saved', nothing);
+  }
+  return null;
+}
 
 interface GraveyardEntry {
   guildId: string;
@@ -65,8 +89,8 @@ export function createGraveyardRoutes(botManager: BotManager): Router {
         res.status(400).json({ success: false, error: 'Invalid guild ID format' });
         return;
       }
-      if (retiredAt !== undefined && (typeof retiredAt !== 'number' || !Number.isFinite(retiredAt))) {
-        res.status(400).json({ success: false, error: 'retiredAt must be a number (ms)' });
+      if (retiredAt !== undefined && (typeof retiredAt !== 'number' || !Number.isSafeInteger(retiredAt) || retiredAt < 0)) {
+        res.status(400).json({ success: false, error: 'retiredAt must be a whole number of milliseconds' });
         return;
       }
       const refusal = recognitionRefusal();
@@ -81,16 +105,42 @@ export function createGraveyardRoutes(botManager: BotManager): Router {
         op: 'restore-graveyard',
         contentJson: JSON.stringify({ retiredAt }),
       });
+      // No answer from the bot: whatever the code, the restore may have landed.
+      if (reply?.noAnswer) {
+        res.status(503).json({ success: false, error: `can't confirm whether server ${guildId} was restored: ${NO_ANSWER_CAUSE[reply.noAnswer as string] ?? NO_ANSWER_CAUSE.failed}. ${RESTORE_MINUTE}` });
+        return;
+      }
       if (reply?.ok) {
-        res.json({ success: true });
+        res.json({
+          success: true,
+          retiredAt: reply.retiredAt,
+          reason: reply.reason,
+          ...(typeof reply.moved === 'number' ? { moved: reply.moved } : {}),
+        });
         return;
       }
       const code = reply?.code;
       const error = reply?.error || 'restore failed';
-      const failure = code === 'invalid' ? null : hopFailure(code, reply?.error);
       if (code === 'invalid') {
         res.status(409).json({ success: false, error });
-      } else if (failure) {
+        return;
+      }
+      // The restore's own words: hopFailure's speak of a change.
+      if (code === 'not-owner') {
+        res.status(503).json({ success: false, error: "another bot process now serves this server's data; nothing was restored" });
+        return;
+      }
+      if (code === 'io-error') {
+        res.status(500).json({ success: false, error });
+        return;
+      }
+      const refused = graveyardRouteRefusal(code, reply?.error, 'restore');
+      if (refused) {
+        res.status(503).json({ success: false, error: refused });
+        return;
+      }
+      const failure = hopFailure(code, reply?.error);
+      if (failure) {
         res.status(failure.status).json({ success: false, error: failure.error });
       } else {
         res.status(500).json({ success: false, error });

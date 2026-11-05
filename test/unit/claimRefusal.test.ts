@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { FenceToken } from '../../src/bot/internalSetup/utils/dataBackends/backend';
 import { PostgresBackend } from '../../src/bot/internalSetup/utils/dataBackends/postgresBackend';
-import { WorkingSetManager } from '../../src/bot/internalSetup/utils/dataBackends/workingSet';
+import { initWorkingSet, WorkingSetManager } from '../../src/bot/internalSetup/utils/dataBackends/workingSet';
 import { FakeStore, tokenFor } from '../helpers/fakeStore';
 import { restoreGuildFromGraveyard, setGuildDataBackend } from '../../src/bot/internalSetup/utils/dataManager';
 import { setBackendKind } from '../helpers/backendKind';
@@ -34,7 +34,7 @@ const calls = {
 const answers: Record<keyof typeof calls, unknown> = {
   hydrate: { ok: false, reason: 'unavailable' },
   flush: { ok: false, reason: 'unavailable' },
-  retire: { ok: false, reason: 'unavailable' },
+  retire: { ok: false, reason: 'no-claim' },
   reclaim: null,
 };
 const claims: [string, number | null][] = [
@@ -121,16 +121,21 @@ describe('a database of another schema version', () => {
     vi.spyOn(console, 'error').mockImplementation(() => {});
     const { backend, connect } = scriptedBackend(() => undefined);
     Object.assign(backend as unknown as object, flags);
-    expect(await backend.restoreGuild('1', 5, { nodeId: '', claim: null, processId: null, shardId: 0, shardCount: 1 })).toEqual({ ok: false, reason });
+    expect(await backend.restoreGuild('1', 5, { nodeId: '', claim: null, processId: null, shardId: 0, shardCount: 1 }, () => null, process.hrtime.bigint() + 40_000_000_000n)).toEqual({ ok: false, reason });
     expect(connect).not.toHaveBeenCalled();
   });
 
   it('the operator restore answers that the database holds another schema version', async () => {
     setBackendKind('postgres');
-    setGuildDataBackend({ restoreGuild: async () => ({ ok: false, reason: 'schema-mismatch' }) } as never);
+    const store = new FakeStore();
+    store.restoreGuild = async () => ({ ok: false, reason: 'schema-mismatch' });
+    const ws = initWorkingSet(store);
+    setGuildDataBackend(store);
     try {
+      expect(await ws.hydrate('1', tokenFor())).toBe('ready');
       expect(await restoreGuildFromGraveyard('1', 5)).toEqual({
         ok: false,
+        code: 'invalid',
         error: 'the database holds another schema version than this bot reads; nothing was restored',
       });
     } finally {

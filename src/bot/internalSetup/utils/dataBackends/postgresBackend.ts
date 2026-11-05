@@ -16,6 +16,8 @@ import type {
   GuildFlushBatch,
   GuildOwner,
   HydrationOutcome,
+  RestoreOutcome,
+  RestoreStop,
   RetireOutcome,
 } from './backend';
 
@@ -215,6 +217,118 @@ export function isLoginRefused(error: unknown): boolean {
 }
 type AlertListener = (event: AlertEvent, detail: string) => void;
 
+/** The host's monotonic clock (process.hrtime), which a wall-clock step does not move. */
+export function monoNow(): bigint {
+  return process.hrtime.bigint();
+}
+
+export function deadlineIn(ms: number): bigint {
+  return monoNow() + BigInt(Math.round(ms)) * 1_000_000n;
+}
+
+/** Milliseconds left to a deadline read on monoNow; negative once it passed. */
+export function msLeft(deadline: bigint): number {
+  return Number(deadline - monoNow()) / 1e6;
+}
+
+const STATEMENT_FLOOR_MS = 1000;
+const COMMIT_FLOOR_MS = 2000;
+// pg's own error for a statement that outlived its query_timeout.
+const QUERY_TIMEOUT_MESSAGE = 'Query read timeout';
+
+class OutOfTime extends Error {}
+
+type TxFailure = { kind: 'timeout' } | { kind: 'connection'; detail: string } | { kind: 'answered'; detail: string; code: string };
+
+/** How the outage line names an error: a server error on a live session by its SQLSTATE, even in a connection class. */
+function outageLine(error: unknown): string {
+  if (error instanceof Error && error.message === QUERY_TIMEOUT_MESSAGE) return '[PostgresBackend] Database did not answer in time; entering outage:';
+  const severity = error && typeof error === 'object' ? (error as { severity?: unknown }).severity : undefined;
+  const code = describeFailure(error).code;
+  const sessionLost = severity === 'FATAL' || severity === 'PANIC' || (!!code && /^(08|57P0[123])/.test(code));
+  if (typeof severity === 'string' && code && !sessionLost) return `[PostgresBackend] Database operation failed (SQLSTATE ${code}); entering outage:`;
+  return '[PostgresBackend] Database connection failed; entering outage:';
+}
+
+/**
+ * Where an error came from: the call's own timeout, no answer (no server error, a FATAL or PANIC that ended the session,
+ * class 08, or class 53, 58 or XX under a severity other than ERROR, which a FATAL or PANIC carries when
+ * the server localizes it), or an answer. Only a server error (pg's DatabaseError, which carries a severity) has a
+ * SQLSTATE; a socket errno such as EPIPE has the same shape and is no answer.
+ */
+function classifyFailure(error: unknown): TxFailure {
+  if (error instanceof Error && error.message === QUERY_TIMEOUT_MESSAGE) return { kind: 'timeout' };
+  const fromServer = !!error && typeof error === 'object' && typeof (error as { severity?: unknown }).severity === 'string';
+  if (!fromServer) return { kind: 'connection', detail: error instanceof Error ? error.message : String(error) };
+  const described = describeFailure(error);
+  const code = described.code;
+  const severity = (error as { severity: string }).severity;
+  const sessionEnded = severity === 'FATAL' || severity === 'PANIC';
+  const english = severity === 'ERROR' || sessionEnded;
+  const lostSession = sessionEnded || (!english && !!code && /^(53|58|XX)/.test(code));
+  if (code && !lostSession && !/^08/.test(code) && code !== '57P01' && code !== '57P02' && code !== '57P03') {
+    return { kind: 'answered', detail: described.detail, code };
+  }
+  return { kind: 'connection', detail: described.detail };
+}
+
+/**
+ * One client's statements bounded by a deadline (none when null): each carries the time left as its query_timeout; a
+ * forward statement is not sent below its floor; after an error nothing more is sent and the client is destroyed.
+ */
+class BoundedClient {
+  destroy = false;
+
+  constructor(private readonly client: PoolClient, private readonly deadline: bigint | null) {}
+
+  left(): number {
+    return this.deadline === null ? Infinity : msLeft(this.deadline);
+  }
+
+  async send(text: string, values: unknown[] = [], floorMs = STATEMENT_FLOOR_MS): Promise<QueryResult> {
+    const left = this.left();
+    if (left < floorMs) throw new OutOfTime();
+    try {
+      return await this.client.query(this.config(text, values, left));
+    } catch (error) {
+      this.destroy = true;
+      throw error;
+    }
+  }
+
+  /** A closing statement (a ROLLBACK, the owner read), sent only with the statement floor left; null when skipped or failed. */
+  async close(text: string, values: unknown[] = []): Promise<QueryResult | null> {
+    const left = this.left();
+    if (this.destroy || left < STATEMENT_FLOOR_MS) {
+      this.destroy = true;
+      return null;
+    }
+    try {
+      return await this.client.query(this.config(text, values, left));
+    } catch {
+      this.destroy = true;
+      return null;
+    }
+  }
+
+  private config(text: string, values: unknown[], left: number): QueryConfig {
+    return { text, values, ...(Number.isFinite(left) ? { query_timeout: Math.max(1, Math.floor(left)) } : {}) } as QueryConfig;
+  }
+}
+
+const LIVE_CHECK = `SELECT EXISTS (SELECT 1 FROM smdb_data.guild_data WHERE guild_id = $1) OR EXISTS (SELECT 1 FROM smdb_data.guild_append WHERE guild_id = $1) AS present`;
+
+// The rows put back are exactly the rows the DELETE took out: a row a concurrent sweep removed is skipped by both.
+const RESTORE_MOVE = `WITH moved AS (
+    DELETE FROM smdb_data.guild_data_graveyard WHERE guild_id = $1 AND retired_at = $2
+    RETURNING guild_id, module, filename, kind, doc, reason),
+  d AS (INSERT INTO smdb_data.guild_data (guild_id, module, filename, doc)
+        SELECT guild_id, module, filename, doc FROM moved WHERE kind = 'doc' RETURNING 1),
+  a AS (INSERT INTO smdb_data.guild_append (guild_id, module, filename, chunk)
+        SELECT guild_id, module, filename, doc FROM moved WHERE kind = 'append' RETURNING 1)
+  SELECT (SELECT count(*) FROM moved) AS taken, (SELECT count(*) FROM d) + (SELECT count(*) FROM a) AS put,
+         (SELECT min(reason) FROM moved) AS reason`;
+
 export class PostgresBackend implements DataBackend {
   readonly kind = 'postgres' as const;
 
@@ -407,7 +521,7 @@ export class PostgresBackend implements DataBackend {
     if (this.state !== 'ready') return; // connecting: bootstrap loop owns retries; outage: probe loop running
     this.state = 'outage';
     this.outageSince = Date.now();
-    console.error('[PostgresBackend] Operation failed; entering outage:', error);
+    console.error(outageLine(error), error);
     this.armOutageAlert();
     void this.outageProbeLoop();
   }
@@ -523,7 +637,7 @@ export class PostgresBackend implements DataBackend {
   }
 
   /** A fenced call with no usable claim touches no row and leaves the outage state alone. */
-  private refusedWithoutClaim(op: 'hydrate' | 'flush' | 'retire' | 'reclaim', guildId: string, token: FenceToken): boolean {
+  private refusedWithoutClaim(op: 'hydrate' | 'flush' | 'retire' | 'reclaim' | 'restore', guildId: string, token: FenceToken): boolean {
     if (usableClaim(token.claim) && typeof token.processId === 'string' && token.processId) return false;
     console.error(`[PostgresBackend] Refused ${op} for guild ${guildId}: this process holds no shard claim`);
     return true;
@@ -672,56 +786,71 @@ export class PostgresBackend implements DataBackend {
     }
   }
 
-  async retireGuild(guildId: string, reason: string, token: FenceToken): Promise<RetireOutcome> {
-    if (this.refusedWithoutClaim('retire', guildId, token)) return { ok: false, reason: 'unavailable' };
+  async retireGuild(guildId: string, reason: string, token: FenceToken, deadline: bigint | null = null): Promise<RetireOutcome> {
+    if (this.refusedWithoutClaim('retire', guildId, token)) return { ok: false, reason: 'no-claim' };
+    if (deadline !== null && msLeft(deadline) < STATEMENT_FLOOR_MS) return { ok: false, reason: 'out-of-time' };
     let client: PoolClient;
     try {
       client = await this.pool.connect();
     } catch (error) {
       this.noteFailure(error);
-      return { ok: false, reason: 'unavailable' };
+      return { ok: false, reason: 'unavailable', detail: describeFailure(error).detail };
     }
-    let destroy = false;
+    const tx = new BoundedClient(client, deadline);
+    let began = false;
+    let commitSent = false;
     try {
-      await client.query('BEGIN');
-      const claim = await client.query(FENCED_OWNERSHIP_UPSERT, this.fenceParams(guildId, token));
+      await tx.send('BEGIN');
+      began = true;
+      const claim = await tx.send(FENCED_OWNERSHIP_UPSERT, this.fenceParams(guildId, token));
       if ((claim.rowCount ?? 0) !== 1) {
-        await client.query('ROLLBACK');
+        await tx.close('ROLLBACK');
         this.noteSuccess();
         return { ok: false, reason: 'deposed' };
       }
       const retiredAt = Date.now();
-      const docsMoved = await client.query(
+      const docsMoved = await tx.send(
         `INSERT INTO smdb_data.guild_data_graveyard (guild_id, module, filename, kind, doc, retired_at, reason)
          SELECT guild_id, module, filename, 'doc', doc, $2, $3
            FROM smdb_data.guild_data WHERE guild_id = $1`,
         [guildId, retiredAt, reason]);
-      const streamsMoved = await client.query(
+      const streamsMoved = await tx.send(
         `INSERT INTO smdb_data.guild_data_graveyard (guild_id, module, filename, kind, doc, retired_at, reason)
          SELECT guild_id, module, filename, 'append', string_agg(chunk, '' ORDER BY seq), $2, $3
            FROM smdb_data.guild_append WHERE guild_id = $1
           GROUP BY guild_id, module, filename`,
         [guildId, retiredAt, reason]);
-      await client.query(`DELETE FROM smdb_data.guild_data WHERE guild_id = $1`, [guildId]);
-      await client.query(`DELETE FROM smdb_data.guild_append WHERE guild_id = $1`, [guildId]);
-      await client.query(`UPDATE smdb_data.guild_ownership SET retired_at = now() WHERE guild_id = $1`, [guildId]);
-      await client.query('COMMIT');
+      await tx.send(`DELETE FROM smdb_data.guild_data WHERE guild_id = $1`, [guildId]);
+      await tx.send(`DELETE FROM smdb_data.guild_append WHERE guild_id = $1`, [guildId]);
+      await tx.send(`UPDATE smdb_data.guild_ownership SET retired_at = now() WHERE guild_id = $1`, [guildId]);
+      if (tx.left() < COMMIT_FLOOR_MS) {
+        await tx.close('ROLLBACK');
+        return { ok: false, reason: 'out-of-time' };
+      }
+      commitSent = true;
+      await tx.send('COMMIT', [], COMMIT_FLOOR_MS);
       this.noteSuccess();
       const moved = (docsMoved.rowCount ?? 0) + (streamsMoved.rowCount ?? 0);
       console.log(`[PostgresBackend] Guild ${guildId} retired to graveyard (${reason}); ${moved} row(s) moved`);
       return { ok: true, moved };
     } catch (error) {
-      destroy = true;
-      await this.rollbackQuiet(client);
-      this.noteFailure(error);
-      console.error(`[PostgresBackend] retireGuild failed for ${guildId}:`, error);
-      return { ok: false, reason: 'unavailable' };
+      if (began) tx.destroy = true;
+      if (error instanceof OutOfTime) return { ok: false, reason: 'out-of-time' };
+      const failure = this.noteTxFailure('retireGuild', guildId, error, commitSent);
+      if (failure.kind === 'answered') return { ok: false, reason: 'refused', detail: failure.detail };
+      if (commitSent) return { ok: false, reason: 'unknown' };
+      return failure.kind === 'timeout' ? { ok: false, reason: 'unavailable', timedOut: true } : { ok: false, reason: 'unavailable', detail: failure.detail };
     } finally {
-      client.release(destroy ? true : undefined);
+      client.release(tx.destroy ? true : undefined);
     }
   }
 
-  async restoreGuild(guildId: string, retiredAt: number, _token: FenceToken): Promise<{ ok: true; moved: number } | { ok: false; reason: string }> {
+  /**
+   * Moves one graveyard batch back (the given retiredAt, else the newest) in one transaction fenced like a flush: the
+   * fenced update locks the guild's ownership row, the restore is refused while the guild has any live row, and the
+   * batch leaves the graveyard in the statement that puts it back. Every statement is bounded by deadline.
+   */
+  async restoreGuild(guildId: string, retiredAt: number | null, token: FenceToken, beforeCommit: () => RestoreStop | null, deadline: bigint): Promise<RestoreOutcome> {
     if (this.schemaMismatch || !this.provisioned) {
       const reason = this.schemaMismatch ? 'schema-mismatch' : 'not-provisioned';
       console.error(`[PostgresBackend] Refused restore for guild ${guildId}: ${this.schemaMismatch
@@ -729,54 +858,83 @@ export class PostgresBackend implements DataBackend {
         : 'the database is not provisioned yet'}`);
       return { ok: false, reason };
     }
+    if (this.refusedWithoutClaim('restore', guildId, token)) return { ok: false, reason: 'no-claim' };
+    if (msLeft(deadline) < STATEMENT_FLOOR_MS) return { ok: false, reason: 'out-of-time' };
     let client: PoolClient;
     try {
       client = await this.pool.connect();
     } catch (error) {
       this.noteFailure(error);
-      return { ok: false, reason: 'unavailable' };
+      return { ok: false, reason: 'unavailable', detail: describeFailure(error).detail };
     }
-    let destroy = false;
-    try {
-      await client.query('BEGIN');
-      const live = await client.query(
-        `SELECT EXISTS (SELECT 1 FROM smdb_data.guild_data WHERE guild_id = $1) AS present`, [guildId]);
-      if (live.rows[0]?.present === true) {
-        await client.query('ROLLBACK');
-        this.noteSuccess();
-        return { ok: false, reason: 'live-rows' };
-      }
-      const docs = await client.query(
-        `INSERT INTO smdb_data.guild_data (guild_id, module, filename, doc)
-         SELECT guild_id, module, filename, doc
-           FROM smdb_data.guild_data_graveyard
-          WHERE guild_id = $1 AND retired_at = $2 AND kind = 'doc'
-         ON CONFLICT (guild_id, module, filename) DO UPDATE SET doc = EXCLUDED.doc, updated_at = now()`,
-        [guildId, retiredAt]);
-      const appends = await client.query(
-        `INSERT INTO smdb_data.guild_append (guild_id, module, filename, chunk)
-         SELECT guild_id, module, filename, doc
-           FROM smdb_data.guild_data_graveyard
-          WHERE guild_id = $1 AND retired_at = $2 AND kind = 'append'`,
-        [guildId, retiredAt]);
-      await client.query(
-        `DELETE FROM smdb_data.guild_data_graveyard WHERE guild_id = $1 AND retired_at = $2`,
-        [guildId, retiredAt]);
-      await client.query(`UPDATE smdb_data.guild_ownership SET retired_at = NULL WHERE guild_id = $1`, [guildId]);
-      await client.query('COMMIT');
+    const tx = new BoundedClient(client, deadline);
+    let began = false;
+    let commitSent = false;
+    let batch = retiredAt;
+    const decided = async (answer: RestoreOutcome): Promise<RestoreOutcome> => {
+      await tx.close('ROLLBACK');
       this.noteSuccess();
-      const moved = (docs.rowCount ?? 0) + (appends.rowCount ?? 0);
-      console.log(`[PostgresBackend] Guild ${guildId} restored from graveyard batch ${retiredAt}; ${moved} row(s) moved back`);
-      return { ok: true, moved };
+      return answer;
+    };
+    try {
+      await tx.send('BEGIN');
+      began = true;
+      const params = this.fenceParams(guildId, token);
+      const claimed = ((await tx.send(FENCED_OWNERSHIP_UPSERT, params)).rowCount ?? 0) === 1;
+      if (!claimed) {
+        const rolledBack = await tx.close('ROLLBACK');
+        const row = rolledBack ? (await tx.close(OWNER_SELECT, [guildId]))?.rows[0] : undefined;
+        this.noteSuccess();
+        return row ? { ok: false, reason: 'deposed', currentOwner: { nodeId: row.node_id, claim: Number(row.claim) } } : { ok: false, reason: 'deposed' };
+      }
+      if (batch === null) {
+        const newest = (await tx.send(`SELECT max(retired_at) AS retired_at FROM smdb_data.guild_data_graveyard WHERE guild_id = $1`, [guildId])).rows[0]?.retired_at;
+        if (newest === null || newest === undefined) return await decided({ ok: false, reason: 'no-entry' });
+        batch = Number(newest);
+      } else {
+        const found = (await tx.send(`SELECT 1 FROM smdb_data.guild_data_graveyard WHERE guild_id = $1 AND retired_at = $2 LIMIT 1`, [guildId, batch])).rowCount ?? 0;
+        if (found === 0) return await decided({ ok: false, reason: 'no-entry' });
+      }
+      const live = await tx.send(LIVE_CHECK, [guildId]);
+      if (live.rows[0]?.present === true) return await decided({ ok: false, reason: 'live-rows', retiredAt: batch });
+      const moved = (await tx.send(RESTORE_MOVE, [guildId, batch])).rows[0] ?? {};
+      const taken = Number(moved.taken ?? 0);
+      const put = Number(moved.put ?? 0);
+      if (taken === 0) return await decided({ ok: false, reason: 'no-entry', retiredAt: batch });
+      if (taken !== put) return await decided({ ok: false, reason: 'refused', detail: `the batch holds ${taken - put} row(s) of an unknown kind` });
+      const stop = beforeCommit() ?? (tx.left() < COMMIT_FLOOR_MS ? 'out-of-time' : null);
+      if (stop) return await decided({ ok: false, reason: stop });
+      commitSent = true;
+      await tx.send('COMMIT', [], COMMIT_FLOOR_MS);
+      this.noteSuccess();
+      console.log(`[PostgresBackend] Guild ${guildId} restored from graveyard batch ${batch}; ${taken} row(s) moved back`);
+      return { ok: true, moved: taken, retiredAt: batch, reason: typeof moved.reason === 'string' ? moved.reason : '' };
     } catch (error) {
-      destroy = true;
-      await this.rollbackQuiet(client);
-      this.noteFailure(error);
-      console.error(`[PostgresBackend] restoreGuild failed for ${guildId}:`, error);
-      return { ok: false, reason: 'unavailable' };
+      if (began) tx.destroy = true;
+      if (error instanceof OutOfTime) return { ok: false, reason: 'out-of-time' };
+      const failure = this.noteTxFailure('restoreGuild', guildId, error, commitSent);
+      if (failure.kind === 'answered') return { ok: false, reason: 'refused', detail: failure.detail, code: failure.code };
+      const at = batch === null ? {} : { retiredAt: batch };
+      if (commitSent) return { ok: false, reason: 'unknown', ...at };
+      return failure.kind === 'timeout'
+        ? { ok: false, reason: 'unavailable', detail: "the database did not answer within the restore's 40 s", timedOut: true }
+        : { ok: false, reason: 'unavailable', detail: failure.detail };
     } finally {
-      client.release(destroy ? true : undefined);
+      client.release(tx.destroy ? true : undefined);
     }
+  }
+
+  /** Logs a failed bounded transaction; an error with no answer notes an outage, the call's own timeout does not. */
+  private noteTxFailure(op: string, guildId: string, error: unknown, commitSent: boolean): TxFailure {
+    const failure = classifyFailure(error);
+    if (failure.kind === 'connection') this.noteFailure(error);
+    else if (failure.kind === 'answered') this.noteSuccess();
+    if (commitSent && failure.kind !== 'answered') {
+      console.error(`[PostgresBackend] ${op} of guild ${guildId}: COMMIT got no answer (${error instanceof Error ? error.message : String(error)}); can't confirm whether it committed`);
+    } else {
+      console.error(`[PostgresBackend] ${op} failed for ${guildId}:`, error);
+    }
+    return failure;
   }
 
   private fenceParams(guildId: string, token: FenceToken): unknown[] {
@@ -858,15 +1016,6 @@ export class PostgresBackend implements DataBackend {
            OR EXISTS (SELECT 1 FROM smdb_data.guild_append WHERE guild_id = $1 AND module = $2 AND filename = $3) AS present`,
       [guildId, key.module, key.filename]);
     return res.rows[0]?.present === true;
-  }
-
-  /** Newest graveyard batch (retired_at ms) for a guild; null when none exist. */
-  async latestGraveyardBatch(guildId: string): Promise<number | null> {
-    const res = await this.read(
-      `SELECT MAX(retired_at) AS retired_at FROM smdb_data.guild_data_graveyard WHERE guild_id = $1`,
-      [guildId]);
-    const value = res.rows[0]?.retired_at;
-    return value == null ? null : Number(value);
   }
 
   private async read(text: string, values: unknown[]): Promise<QueryResult> {

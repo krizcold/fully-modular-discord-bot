@@ -22,6 +22,8 @@ vi.mock('../../src/bot/internalSetup/utils/dataBackends/boot', async importOrigi
 import { verifyStoreIdentity } from '../../src/bot/internalSetup/utils/dataBackends/recognitionGuard';
 import { restoreGuildFromGraveyard, setGuildDataBackend } from '../../src/bot/internalSetup/utils/dataManager';
 import { setBackendKind } from '../helpers/backendKind';
+import { FakeStore } from '../helpers/fakeStore';
+import { initWorkingSet } from '../../src/bot/internalSetup/utils/dataBackends/workingSet';
 
 afterEach(() => {
   setGuildDataBackend(null);
@@ -39,14 +41,18 @@ describe('store id adoption before provisioning passes', () => {
   });
 });
 
-describe('graveyard restore with no owner info', () => {
-  it('passes the fallback fence token', async () => {
+describe('graveyard restore with no owner info (NB11)', () => {
+  it('carries the claim of the set that serves the guild, and with no ready set calls no restore', async () => {
     const tokens: any[] = [];
     setBackendKind('postgres');
-    setGuildDataBackend({
-      restoreGuild: async (_g: string, _b: number, token: any) => { tokens.push(token); return { ok: true, moved: 0 }; },
-    } as any);
-    expect(await restoreGuildFromGraveyard('g', 5)).toEqual({ ok: true, moved: 0 });
-    expect(tokens).toEqual([{ nodeId: '', claim: null, processId: null, shardId: 0, shardCount: 1 }]);
+    const store = new FakeStore();
+    store.restoreGuild = async (...args: unknown[]) => { tokens.push(args[2]); return { ok: true, moved: 0, retiredAt: 5, reason: 'r' }; };
+    const ws = initWorkingSet(store);
+    setGuildDataBackend(store);
+    expect(await ws.hydrate('1', { nodeId: 'node-a', claim: 7, processId: 'process-a', shardId: 0, shardCount: 1 })).toBe('ready');
+    expect(await restoreGuildFromGraveyard('1', 5)).toEqual({ ok: true, moved: 0, retiredAt: 5, reason: 'r' });
+    expect(tokens).toEqual([{ nodeId: 'node-a', claim: 7, processId: 'process-a', shardId: 0, shardCount: 1 }]);
+    expect(await restoreGuildFromGraveyard('2', 5)).toMatchObject({ ok: false, code: 'backend-unavailable' });
+    expect(tokens).toHaveLength(1);
   });
 });

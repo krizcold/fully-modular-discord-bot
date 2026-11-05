@@ -290,7 +290,7 @@ describe('the claim fence on a real Postgres', () => {
         while (refused.connectionState().state !== 'outage' && Date.now() < until) await new Promise(resolve => { setTimeout(resolve, 100); });
         expect(refused.connectionState().state).toBe('outage');
         expect(await refused.provisionVerdict()).toEqual({ state: 'mismatch', found: '{"v":1}' });
-        expect(await refused.restoreGuild('8', 5, { nodeId: '', claim: null, processId: null, shardId: 0, shardCount: 1 })).toEqual({ ok: false, reason: 'schema-mismatch' });
+        expect(await refused.restoreGuild('8', 5, { nodeId: '', claim: null, processId: null, shardId: 0, shardCount: 1 }, () => null, process.hrtime.bigint() + 40_000_000_000n)).toEqual({ ok: false, reason: 'schema-mismatch' });
         expect((await old.query(`SELECT doc, updated_at FROM smdb_data.guild_data WHERE guild_id = '7'`)).rows).toEqual(before);
         expect((await old.query(`SELECT 1 FROM smdb_data.guild_data WHERE guild_id = '8'`)).rowCount).toBe(0);
         expect((await old.query(`SELECT 1 FROM smdb_data.guild_data_graveyard WHERE guild_id = '8'`)).rowCount).toBe(1);
