@@ -95,13 +95,13 @@ describe('a cancel reports the errno of the last failed flush only while it is t
   });
 });
 
-describe('a failed read of the last byte', () => {
+describe('a failed append open', () => {
   it('logs the error the disk gave', async () => {
     const f = fresh();
     fs.writeFileSync(f, 'a\n');
     let rejected = false;
     vi.spyOn(fs.promises, 'open').mockImplementation(((p: fs.PathLike, flags?: any, ...rest: any[]) => {
-      if (String(p) === f && flags === 'r' && !rejected) {
+      if (String(p) === f && flags === 'a+' && !rejected) {
         rejected = true;
         return Promise.reject(undefined);
       }

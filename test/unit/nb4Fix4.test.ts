@@ -24,7 +24,8 @@ function scripted(answer: (sql: string) => unknown) {
   backends.push(backend);
   (backend as unknown as { state: string }).state = 'ready';
   const client = {
-    query: async (sql: string) => {
+    query: async (q: string | { text: string }) => {
+      const sql = typeof q === 'string' ? q : q.text;
       const res = answer(sql.trim());
       if (res instanceof Error) throw res;
       return res ?? { rows: [], rowCount: 0 };
@@ -75,8 +76,8 @@ describe('NB4-R3-DL-1: a COMMIT ended by FATAL or PANIC may have landed', () => 
     let answer: FlushOutcome = fatal;
     store.flushGuild = (async (...args: Parameters<typeof real>) => { await real(...args); return answer; }) as typeof store.flushGuild;
     await ws.flushGuildNow(g, 50);
-    answer = { ok: false, reason: 'deposed' };
-    await ws.flushGuildNow(g, 50);
+    store.takeOver(g, true);
+    expect(await ws.flushGuildNow(g, 50)).toBe('unavailable');
     expect(ws.takeDropLines()).toEqual([dropLine(g)]);
     ws.evict(g);
   });
@@ -95,7 +96,7 @@ describe('NB4-R4-DL-1: a stop before the leave ends still logs the drop lines', 
     let answer: FlushOutcome = { ok: false, reason: 'unavailable', commitUnanswered: true };
     store.flushGuild = (async (...args: Parameters<typeof real>) => { await real(...args); return answer; }) as typeof store.flushGuild;
     await ws.flushGuildNow(g, 50);
-    answer = { ok: false, reason: 'deposed' };
+    store.takeOver(g, true);
 
     const order: string[] = [];
     error.mockImplementation((line: unknown) => { if (String(line).startsWith('[Shards]')) order.push(String(line)); });

@@ -34,7 +34,7 @@ function thrown(fn: () => unknown): DataBackendUnavailableError {
 }
 const verbs = {
   save: (guildId: string) => saveData('v.json', { guildId, category: 'm' }, { v: 1 }),
-  append: (guildId: string) => appendData('v.log', { guildId, category: 'm' }, 'line\n'),
+  append: (guildId: string) => appendData('v.jsonl', { guildId, category: 'm' }, 'line\n'),
   delete: (guildId: string) => deleteData('v.json', { guildId, category: 'm' }),
 };
 const BACKLOG = (kib: number) => `[Data] Write acceptance is closed: unsaved writes hold ${kib} KiB (acceptance reopens below 32 MiB); the write was not saved`;

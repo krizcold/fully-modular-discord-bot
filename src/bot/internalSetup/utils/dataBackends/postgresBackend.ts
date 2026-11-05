@@ -12,6 +12,7 @@ import type {
   DataBackend,
   DocKey,
   FenceToken,
+  FlushFate,
   FlushOutcome,
   GuildFlushBatch,
   GuildOwner,
@@ -19,7 +20,7 @@ import type {
   RetireOutcome,
 } from './backend';
 
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 4;
 const PROVISION_VERDICT_POLL_MS = 250;
 const PARTITION_COUNT = 32;
 const MAX_ROWS_PER_STATEMENT = 200;
@@ -31,6 +32,9 @@ const CONNECT_TIMEOUT_MS = 5000;
 const IDLE_TIMEOUT_MS = 30000;
 const STATEMENT_TIMEOUT_MS = 30000;
 const IDLE_IN_TX_TIMEOUT_MS = 10000;
+/** NB13 decision 3: a client bound above the server's idle and statement timeouts together. */
+export const ANSWER_BOUND_MS = 40_000;
+const KEEPALIVE_DELAY_MS = 30_000;
 
 const PROVISION_DDL: string[] = [
   `CREATE SCHEMA IF NOT EXISTS smdb_data`,
@@ -46,7 +50,8 @@ const PROVISION_DDL: string[] = [
     claim        bigint NOT NULL,
     shard_count  integer NOT NULL,
     retired_at   timestamptz,
-    updated_at   timestamptz NOT NULL DEFAULT now()
+    updated_at   timestamptz NOT NULL DEFAULT now(),
+    last_flush   uuid
   )`,
   `CREATE INDEX IF NOT EXISTS guild_ownership_node_idx ON smdb_data.guild_ownership (node_id)`,
   `CREATE INDEX IF NOT EXISTS guild_ownership_claim_idx ON smdb_data.guild_ownership (claim)`,
@@ -157,6 +162,22 @@ export const FENCED_OWNERSHIP_UPSERT = `
          shard_count = EXCLUDED.shard_count, retired_at = NULL, updated_at = now()
    WHERE o.claim <= EXCLUDED.claim`;
 
+/** The flush's own fence: FENCED_OWNERSHIP_UPSERT that also writes the batch's id as the guild's last flush. */
+export const FENCED_FLUSH_UPSERT = `
+  INSERT INTO smdb_data.guild_ownership AS o (guild_id, node_id, shard_id, claim, shard_count, last_flush)
+  SELECT $1::text, $2::text, $3::int, $4::bigint, $5::int, $7::uuid
+   WHERE ${SHARD_CLAIM_HELD}
+  ON CONFLICT (guild_id) DO UPDATE
+     SET node_id = EXCLUDED.node_id, shard_id = EXCLUDED.shard_id, claim = EXCLUDED.claim,
+         shard_count = EXCLUDED.shard_count, retired_at = NULL, updated_at = now(), last_flush = EXCLUDED.last_flush
+   WHERE o.claim <= EXCLUDED.claim`;
+
+const FLUSH_MARK_SELECT = `SELECT claim, last_flush, node_id FROM smdb_data.guild_ownership WHERE guild_id = $1 FOR SHARE`;
+
+// No claims test: the insert must wait on a concurrent insert of the key, and the check's rollback removes its row.
+const CHECK_OWNERSHIP_INSERT = `INSERT INTO smdb_data.guild_ownership (guild_id, node_id, shard_id, claim, shard_count)
+  VALUES ($1::text, $2::text, $3::int, $4::bigint, $5::int) ON CONFLICT (guild_id) DO NOTHING`;
+
 const OWNER_SELECT = `SELECT node_id, claim FROM smdb_data.guild_ownership WHERE guild_id = $1`;
 
 export const OWNERSHIP_RECLAIM = `
@@ -204,6 +225,18 @@ function describeFailure(error: unknown): { detail: string; code?: string } {
   return typeof code === 'string' && /^[0-9A-Z]{5}$/.test(code) ? { detail: `SQLSTATE ${code}: ${message}`, code } : { detail: message };
 }
 
+/**
+ * Whether a failed COMMIT may have landed: no SQLSTATE answered it, or the answer ended the session. The severity word
+ * is localized by the server's lc_messages, so the code's class counts too: 57 (operator intervention), 08 (connection
+ * exception) and XX (internal error). Counting an answered failure here costs one check; missing an unanswered one
+ * sends its batch twice.
+ */
+export function commitMayHaveLanded(error: unknown): boolean {
+  const { code, severity } = (error && typeof error === 'object' ? error : {}) as { code?: unknown; severity?: unknown };
+  if (typeof code !== 'string' || !/^[0-9A-Z]{5}$/.test(code)) return true;
+  return severity === 'FATAL' || severity === 'PANIC' || /^(57|08|XX)/.test(code);
+}
+
 /** The database refused the login itself (SQLSTATE 28000, a role blocked from logging in); 28P01, a wrong password, is not this. */
 export function isLoginRefused(error: unknown): boolean {
   let current: unknown = error;
@@ -245,6 +278,7 @@ export class PostgresBackend implements DataBackend {
       connectionTimeoutMillis: CONNECT_TIMEOUT_MS,
       idleTimeoutMillis: IDLE_TIMEOUT_MS,
       keepAlive: true,
+      keepAliveInitialDelayMillis: KEEPALIVE_DELAY_MS,
       // Applied in the startup packet: a connect-event SET would race the
       // caller's first query on the same session (deprecated queueing, pg@9 throws).
       statement_timeout: STATEMENT_TIMEOUT_MS,
@@ -523,7 +557,7 @@ export class PostgresBackend implements DataBackend {
   }
 
   /** A fenced call with no usable claim touches no row and leaves the outage state alone. */
-  private refusedWithoutClaim(op: 'hydrate' | 'flush' | 'retire' | 'reclaim', guildId: string, token: FenceToken): boolean {
+  private refusedWithoutClaim(op: 'hydrate' | 'flush' | 'retire' | 'reclaim' | 'save check', guildId: string, token: FenceToken): boolean {
     if (usableClaim(token.claim) && typeof token.processId === 'string' && token.processId) return false;
     console.error(`[PostgresBackend] Refused ${op} for guild ${guildId}: this process holds no shard claim`);
     return true;
@@ -619,10 +653,10 @@ export class PostgresBackend implements DataBackend {
       return { ok: false, reason: 'unavailable', ...describeFailure(error) };
     }
     let destroy = false;
-    let commitSent = false;
+    batch.commitSent = false;
     try {
       await client.query('BEGIN');
-      const claim = await client.query(FENCED_OWNERSHIP_UPSERT, this.fenceParams(guildId, token));
+      const claim = await client.query(FENCED_FLUSH_UPSERT, [...this.fenceParams(guildId, token), batch.flushId ?? null]);
       if ((claim.rowCount ?? 0) !== 1) {
         await client.query('ROLLBACK');
         const currentOwner = await this.readOwner(client, guildId);
@@ -653,23 +687,77 @@ export class PostgresBackend implements DataBackend {
           `INSERT INTO smdb_data.guild_append (guild_id, module, filename, chunk) VALUES ($1, $2, $3, $4)`,
           [guildId, append.key.module, append.key.filename, append.chunk]);
       }
-      commitSent = true;
-      await client.query('COMMIT');
+      batch.commitSent = true;
+      await client.query({ text: 'COMMIT', query_timeout: ANSWER_BOUND_MS } as QueryConfig);
       this.noteSuccess();
       return { ok: true };
     } catch (error) {
       destroy = true;
-      await this.rollbackQuiet(client);
+      const failure = describeFailure(error);
+      // A ROLLBACK after a sent COMMIT changes nothing, and after the client bound node-pg would queue it behind the COMMIT.
+      const unanswered = batch.commitSent === true && commitMayHaveLanded(error);
+      if (!unanswered) await this.rollbackQuiet(client);
       this.noteFailure(error);
       console.error(`[PostgresBackend] flushGuild failed for ${guildId} (caller retries):`, error);
-      const failure = describeFailure(error);
-      const severity = error && typeof error === 'object' ? (error as { severity?: unknown }).severity : undefined;
-      // A COMMIT with no answer, or one ended by a FATAL or PANIC, may have landed; an ERROR answer did not.
-      const unanswered = commitSent && (!failure.code || severity === 'FATAL' || severity === 'PANIC');
       return { ok: false, reason: 'unavailable', ...failure, ...(unanswered ? { commitUnanswered: true } : {}) };
     } finally {
       client.release(destroy ? true : undefined);
     }
+  }
+
+  /**
+   * NB13 decision 4: whether the flush with this id landed. FOR SHARE waits on the row lock the unanswered
+   * transaction took at its fence, so the row is read only once that transaction ended. The answer is taken from the
+   * row as soon as it is read; the check changes nothing, so its ROLLBACK is not awaited.
+   */
+  async resolveFlush(guildId: string, flushId: string, sentClaim: number, token: FenceToken): Promise<FlushFate> {
+    if (this.refusedWithoutClaim('save check', guildId, token)) return { fate: 'unknown', detail: 'this process holds no shard claim' };
+    let client: PoolClient;
+    try {
+      client = await this.pool.connect();
+    } catch (error) {
+      this.noteFailure(error);
+      return { fate: 'unknown', ...describeFailure(error) };
+    }
+    const ask = (text: string, values?: unknown[]) => client.query({ text, values, query_timeout: ANSWER_BOUND_MS } as QueryConfig);
+    let row: { claim: string | number; last_flush: string | null; node_id?: string } | undefined;
+    try {
+      await ask('BEGIN');
+      row = (await ask(FLUSH_MARK_SELECT, [guildId])).rows[0];
+      if (!row) {
+        const inserted = await ask(CHECK_OWNERSHIP_INSERT, [guildId, token.nodeId, token.shardId, token.claim, token.shardCount]);
+        if ((inserted.rowCount ?? 0) === 1) {
+          this.endCheck(client, ask);
+          this.noteSuccess();
+          return { fate: 'not-landed' };
+        }
+        row = (await ask(FLUSH_MARK_SELECT, [guildId])).rows[0];
+      }
+    } catch (error) {
+      client.release(true);
+      this.noteFailure(error);
+      return { fate: 'unknown', ...describeFailure(error) };
+    }
+    this.endCheck(client, ask);
+    this.noteSuccess();
+    if (!row) return { fate: 'unknown', detail: "the guild's ownership row was not found after an insert conflicted on it" };
+    const claim = Number(row.claim);
+    const marked = row.last_flush === flushId;
+    if (claim > (token.claim ?? 0)) {
+      const currentOwner = typeof row.node_id === 'string' ? { nodeId: row.node_id, claim } : undefined;
+      this.fireAlert('deposed', `deposed: guild ${guildId} is held by claim ${claim}; local claim ${token.claim}`);
+      return { fate: 'deposed', landed: marked ? true : null, ...(currentOwner ? { currentOwner } : {}) };
+    }
+    if (marked) return { fate: 'landed' };
+    if (claim > sentClaim) {
+      console.warn(`[Data] Guild ${guildId}: a save sent under claim ${sentClaim} got no answer, and the guild's ownership row now holds claim ${claim}; can't confirm whether it landed, so it is sent again, and lines it appended may be stored twice`);
+    }
+    return { fate: 'not-landed' };
+  }
+
+  /** Ends a check's read-only transaction without awaiting it: the client goes back on success, else is destroyed. */
+  private endCheck(client: PoolClient, ask: (text: string) => Promise<unknown>): void {
+    ask('ROLLBACK').then(() => client.release(), () => client.release(true));
   }
 
   async retireGuild(guildId: string, reason: string, token: FenceToken): Promise<RetireOutcome> {

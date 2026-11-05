@@ -14,6 +14,7 @@ vi.mock('../../src/bot/internalSetup/utils/dataBackends/workingSet', async orig 
     flushAllDirty: () => (ws.phase2 ? new Promise<string[]>(() => undefined) : Promise.resolve([] as string[])),
     landedFlushes: () => 0,
     dirtyGuildIds: () => [] as string[],
+    unansweredGuilds: () => ({ all: [] as string[], only: [] as string[] }),
     takeDropLines: () => [] as string[],
   };
   return { ...real, getWorkingSet: () => stub };

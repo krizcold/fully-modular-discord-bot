@@ -18,7 +18,9 @@ function scripted(answer: Answer) {
   const sent: string[] = [];
   const releases: unknown[] = [];
   const client = {
-    query: async (sql: string, params?: unknown[]) => {
+    query: async (q: string | { text: string; values?: unknown[] }, params?: unknown[]) => {
+      const sql = typeof q === 'string' ? q : q.text;
+      params = params ?? (typeof q === 'string' ? undefined : q.values);
       sent.push(sql.trim());
       const res = answer(sql, params);
       if (res instanceof Error) throw res;
@@ -46,7 +48,7 @@ describe('provisioning', () => {
     let created = false;
     const { backend, sent } = scripted(sql => {
       if (/CREATE TABLE IF NOT EXISTS smdb_data\.meta/.test(sql)) created = true;
-      if (VERSION_READ.test(sql)) return created ? { rows: [{ value: '{"v":3}' }], rowCount: 1 } : missing();
+      if (VERSION_READ.test(sql)) return created ? { rows: [{ value: '{"v":4}' }], rowCount: 1 } : missing();
       return undefined;
     });
     await internals(backend).provision();
@@ -78,7 +80,7 @@ describe('provisioning', () => {
     let inserted = false;
     const { backend } = scripted(sql => {
       if (/INSERT INTO smdb_data\.meta \(key, value\) VALUES \('schema_version'/.test(sql)) inserted = true;
-      if (VERSION_READ.test(sql)) return inserted ? { rows: [{ value: '{"v":3}' }], rowCount: 1 } : { rows: [], rowCount: 0 };
+      if (VERSION_READ.test(sql)) return inserted ? { rows: [{ value: '{"v":4}' }], rowCount: 1 } : { rows: [], rowCount: 0 };
       return undefined;
     });
     await internals(backend).provision();

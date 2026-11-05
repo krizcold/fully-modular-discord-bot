@@ -3,7 +3,7 @@
 
 import { Pool } from 'pg';
 import type { PoolClient, QueryConfig } from 'pg';
-import { isLoginRefused } from '../utils/dataBackends/postgresBackend';
+import { commitMayHaveLanded, isLoginRefused } from '../utils/dataBackends/postgresBackend';
 import {
   CLOCK_GAP_CAP_MS,
   decideShardCount,
@@ -90,7 +90,8 @@ export type FailureClass =
   | { kind: 'refused' }
   | { kind: 'timeout' }
   | { kind: 'unreachable'; detail: string }
-  | { kind: 'error'; code: string; message: string; severity?: 'FATAL' | 'PANIC' };
+  /** severity is the server's own word, kept only when the answer may have followed a landed COMMIT. */
+  | { kind: 'error'; code: string; message: string; severity?: string };
 
 export class ClaimTimeoutError extends Error {
   constructor(what: string) {
@@ -116,9 +117,8 @@ export function classifyFailure(error: unknown): FailureClass {
   if (/timeout/i.test(message) && /query|connection/i.test(message)) return { kind: 'timeout' };
   const code = error && typeof error === 'object' ? (error as { code?: unknown }).code : undefined;
   if (typeof code === 'string' && /^[0-9A-Z]{5}$/.test(code)) {
-    // A FATAL or PANIC answer ends the connection, so a COMMIT it answered may have landed.
     const severity = (error as { severity?: unknown }).severity;
-    if (severity === 'FATAL' || severity === 'PANIC') return { kind: 'error', code, message, severity };
+    if (commitMayHaveLanded(error)) return { kind: 'error', code, message, severity: typeof severity === 'string' ? severity : 'none' };
     return { kind: 'error', code, message };
   }
   return { kind: 'unreachable', detail: message };

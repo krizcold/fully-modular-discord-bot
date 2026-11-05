@@ -44,6 +44,7 @@ import { runSealed } from '../../src/bot/internalSetup/utils/dataBackends/writeL
 import { verdictOf } from '../../src/bot/internalSetup/utils/dataBackends/replyGate';
 import { cancelQueued, queuedFilePaths } from '../../src/bot/internalSetup/utils/dataBackends/fileBackend';
 import { AUDIT, clearGlobal, gate, JOURNAL, jsonOf, linesOf, logged, paidSub, PREMIUM, quiet, rawOf, settleQueue, state, tick, writePremium } from './nb10PremiumRig';
+import { stubAppendHandles } from '../helpers/fileHandleStub';
 
 const role = process.env.BOT_PROCESS_ROLE;
 const later = new Date(Date.now() + 90 * 86_400_000).toISOString();
@@ -84,14 +85,10 @@ async function dies(pm: ReturnType<typeof getPremiumManager>, ...files: string[]
 /** Appends to the journal fail with EIO while `on`; returns the switch. */
 function failingAppend(): { on: boolean; calls: number } {
   const sw = { on: true, calls: 0 };
-  const real = fs.promises.appendFile.bind(fs.promises);
-  vi.spyOn(fs.promises, 'appendFile').mockImplementation((async (p: any, data: any, options?: any) => {
-    if (String(p) === JOURNAL) {
-      sw.calls += 1;
-      if (sw.on) throw Object.assign(new Error('EIO: i/o error, write'), { code: 'EIO' });
-    }
-    return real(p, data, options);
-  }) as typeof fs.promises.appendFile);
+  stubAppendHandles().onWrite(JOURNAL, () => {
+    sw.calls += 1;
+    return sw.on ? 'EIO' : undefined;
+  });
   return sw;
 }
 
@@ -173,7 +170,7 @@ describe('NB10 test 41, the remaining cases', () => {
     expect(lost).toHaveLength(1);
     expect(lost[0]).toContain('subscription.expired event from discord (subscription d1, guild g1)');
     expect(lost[0]).toContain(JSON.stringify(expired('d1', 'g1')).slice(0, 40));
-    expect(rawOf(JOURNAL)).toBeNull();
+    expect(rawOf(JOURNAL) ?? '').toBe('');
   });
 
   it('(c) the file fixed while the line is queued: the replay applies it once from memory, the mark covers it, and the line landing after a crash applies nothing twice', async () => {

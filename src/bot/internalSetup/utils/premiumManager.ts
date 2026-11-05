@@ -45,7 +45,7 @@ import {
   saveDataTracked,
   sharedWritesClosedLost,
 } from './dataManager';
-import { confirmFile, enqueueAppend, fileTicket, type FileTicket } from './dataBackends/fileBackend';
+import { confirmFile, enqueueAppend, fileTicket, fileTicketFailure, fileTicketState, type FileTicket } from './dataBackends/fileBackend';
 import {
   currentLedger,
   isPaymentLedger,
@@ -78,6 +78,16 @@ import type {
   OfferingVariant,
   ProviderCouponValidation,
 } from './payment/paymentTypes';
+
+/**
+ * How the exit names a line's fate (NB13 C7, D3): 'unconfirmed' only when its bytes are whole in the file and the
+ * disk did not confirm their sync; a range a cut try left reads as 'written', which says the line was being written.
+ */
+function exitFate(ticket: FileTicket | undefined): 'landed' | 'unconfirmed' | 'written' | 'open' {
+  if (!ticket) return 'open';
+  const state = fileTicketState(ticket);
+  return state === 'unconfirmed' && fileTicketFailure(ticket)?.cut ? 'written' : state;
+}
 
 // ============================================================================
 // TYPES
@@ -1452,6 +1462,18 @@ export class PremiumManager {
       : `${head} and is lost: ${json}`;
   }
 
+  /** An install line whose bytes may be in the file: the disk did not confirm them, or a write of them was cut. */
+  private installLineUnsure(install: InstallLine, fate: 'unconfirmed' | 'written', kind: StopKind): string {
+    const head = `[PremiumManager] The audit line subscription.install.paid (guild ${install.entry.guildId ?? 'none'}, subscription ${install.providerSubId ?? install.entry.subscriptionId})`;
+    const what = fate === 'unconfirmed'
+      ? 'is in the file, but the disk did not confirm its sync; can\'t confirm whether it is stored'
+      : `was being written ${beforeWords(kind)}; can't confirm whether it is stored`;
+    const webhook = install.webhook
+      ? '; the webhook was answered 503, and if the line is not stored, the provider\'s next delivery of it writes it, or, when the subscription\'s own save was lost too, installs the subscription again under a new id with its own line'
+      : '';
+    return `${head} ${what}${webhook}: ${install.line.trimEnd()}`;
+  }
+
   private marksLanded(): boolean {
     return !!this.marksTicket && landed(this.marksTicket);
   }
@@ -1491,7 +1513,11 @@ export class PremiumManager {
     const covered = (e: JournalEntry) => marksLanded && !!this.raisedMarks && e.n <= (this.raisedMarks[e.writer] ?? 0);
     for (const e of this.journal) {
       if ((e.ticket && landed(e.ticket)) || covered(e)) continue;
-      console.error(`[PremiumManager] A ${eventWords(e.event)} was received while ${e.file} could not be read and is ${lostWords(kind)}: ${JSON.stringify(e.event)}`);
+      const fate = exitFate(e.ticket);
+      const head = `[PremiumManager] A ${eventWords(e.event)} was received while ${e.file} could not be read`;
+      if (fate === 'unconfirmed') console.error(`${head}; the disk did not confirm the sync of its journal line, so can't confirm whether it is stored: ${JSON.stringify(e.event)}`);
+      else if (fate === 'written') console.error(`${head}; its journal line was being written ${beforeWords(kind)}, so can't confirm whether it is stored: ${JSON.stringify(e.event)}`);
+      else console.error(`${head} and is ${lostWords(kind)}: ${JSON.stringify(e.event)}`);
     }
     if (this.replayStarted && !marksLanded) {
       const handed = this.replayHanded > 0 ? ` (member notices of the ${this.replayHanded} already handed may go out twice)` : '';
@@ -1499,7 +1525,8 @@ export class PremiumManager {
     }
     for (const install of this.installLines.values()) {
       if (install.state === 'queued' && install.ticket && !landed(install.ticket)) {
-        console.error(this.installLineLost(install, 'did not reach the disk', kind));
+        const fate = exitFate(install.ticket);
+        console.error(fate === 'unconfirmed' || fate === 'written' ? this.installLineUnsure(install, fate, kind) : this.installLineLost(install, 'did not reach the disk', kind));
       }
     }
     if (!marksLanded) return;
@@ -1508,7 +1535,11 @@ export class PremiumManager {
         if (pending.install && pending.install.state === 'buffered') console.error(this.installLineLost(pending.install, 'did not reach the disk', kind));
         continue;
       }
-      console.error(`[PremiumManager] The audit line ${pending.entry.action} (guild ${pending.entry.guildId ?? 'none'}, ${pending.entry.timestamp}) did not reach the disk ${beforeWords(kind)} and is lost: ${pending.line.trimEnd()}`);
+      const fate = exitFate(pending.ticket);
+      const head = `[PremiumManager] The audit line ${pending.entry.action} (guild ${pending.entry.guildId ?? 'none'}, ${pending.entry.timestamp})`;
+      if (fate === 'unconfirmed') console.error(`${head} is in the file, but the disk did not confirm its sync; can't confirm whether it is stored: ${pending.line.trimEnd()}`);
+      else if (fate === 'written') console.error(`${head} was being written ${beforeWords(kind)}; can't confirm whether it is stored: ${pending.line.trimEnd()}`);
+      else console.error(`${head} did not reach the disk ${beforeWords(kind)} and is lost: ${pending.line.trimEnd()}`);
     }
   }
 

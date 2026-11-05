@@ -145,7 +145,7 @@ describe('ruling 3: the gate', () => {
     store.mode = 'unavailable';
     saveData('held.json', options, { v: 1 });
     const answer = await enterMaintenance('m', { saveBoundMs: 8000 });
-    expect(answer).toEqual({ saved: false, unsavedGuilds: 1, unsavedFiles: 0 });
+    expect(answer).toEqual({ saved: false, unsavedGuilds: 1, unsavedFiles: 0, unansweredGuilds: 0, unconfirmedFiles: 0 });
     store.mode = 'commit';
     await flushAll();
   }, 20_000);

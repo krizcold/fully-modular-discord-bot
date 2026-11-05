@@ -81,6 +81,14 @@ export function deposedHolder(): LockHolder | null {
   return deposedBy;
 }
 
+/** A cancelled path whose lines may be in the file (NB13 C9, D3), in the words of the deposition and the web UI logs. */
+export function unconfirmedWords(result: { path: string; errno: string | null; cut: boolean }): string {
+  const what = result.cut
+    ? 'a write of its lines was cut short, so some of them may be in the file, whole or in part, and the disk did not confirm them'
+    : 'some of its lines are in the file, but the disk did not confirm them';
+  return `[Data] Can't confirm whether ${result.path} is saved (${result.errno ?? 'no error code'}): ${what}`;
+}
+
 /** Runs at a deposition, after the shared gate closed and the queue was cancelled. */
 export function onDeposed(fn: (holder: LockHolder) => void): void {
   deposedListeners.push(fn);
@@ -228,6 +236,7 @@ function depose(holder: LockHolder): void {
   void cancelQueued(paths, undefined, { freeze: true }).then(results => {
     for (const result of results) {
       if (result.outcome === 'cancelled') console.error(`[Data] Not saved: ${result.path}; another process (${words}) took the data files' lock`);
+      if (result.outcome === 'unconfirmed') console.error(`${unconfirmedWords(result)}; another process (${words}) took the data files' lock`);
     }
   });
   console.error(`[Data] Another process (${words}) took the data files' lock; this process writes no data file from now on`);

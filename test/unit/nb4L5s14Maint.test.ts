@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const h = vi.hoisted(() => ({
   stops: 0,
   ws: null as null | { takeDropLines(): string[]; heldGuilds(): unknown[] },
-  save: null as null | (() => Promise<{ unsavedGuilds: number; unsavedFiles: number }>),
+  save: null as null | (() => Promise<{ unsavedGuilds: number; unsavedFiles: number; unansweredGuilds: number; unconfirmedFiles: number }>),
 }));
 vi.mock('../../src/bot/internalSetup/utils/dataManager', async orig => {
   const real = await orig<any>();
@@ -154,7 +154,7 @@ describe("the leave's dropped-change lines", () => {
   it("logs each line the working set gives before it asks for the restart", async () => {
     withIpc();
     h.ws = { takeDropLines: () => ['[Maintenance] Dropped the changes of guild 1 (22P02)'], heldGuilds: () => [] };
-    h.save = async () => ({ unsavedGuilds: 0, unsavedFiles: 0 });
+    h.save = async () => ({ unsavedGuilds: 0, unsavedFiles: 0, unansweredGuilds: 0, unconfirmedFiles: 0 });
     startLeave('The hook says running');
     await vi.waitFor(() => expect(restarts()).toHaveLength(1));
     expect(errors).toEqual(['[Maintenance] Dropped the changes of guild 1 (22P02)']);

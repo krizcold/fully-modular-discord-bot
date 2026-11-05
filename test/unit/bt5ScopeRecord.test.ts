@@ -408,8 +408,8 @@ describe('scopes are kept apart', () => {
     const set = workingSet();
     const lostStamp = note(b, wsTicket(set, b, 1));
     setLeft(set);
-    expect(pendingFor(a, since)).toEqual({ tickets: [inA], lost: [], refused: [], pruned: false });
-    expect(pendingFor('global', since)).toEqual({ tickets: [inGlobal], lost: [], refused: [], pruned: false });
+    expect(pendingFor(a, since)).toEqual({ tickets: [inA], files: [{ path: expect.any(String), tickets: [inA], failed: false }], lost: [], refused: [], pruned: false });
+    expect(pendingFor('global', since)).toEqual({ tickets: [inGlobal], files: [{ path: expect.any(String), tickets: [inGlobal], failed: false }], lost: [], refused: [], pruned: false });
     expect(pendingFor(b, since)).toEqual({ tickets: [], lost: [{ stamp: lostStamp, deposed: false }], refused: [], pruned: false });
   });
 

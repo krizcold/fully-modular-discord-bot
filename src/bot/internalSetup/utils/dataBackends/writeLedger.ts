@@ -5,7 +5,7 @@
 
 import { AsyncLocalStorage } from 'async_hooks';
 import type { Client } from 'discord.js';
-import type { FileTicket } from './fileBackend';
+import { fileTicketState, type FileTicket } from './fileBackend';
 import { saveMark, type SaveMark } from './scopeRecord';
 import type { DataUnavailableCause, WsTicket } from './workingSet';
 
@@ -20,6 +20,11 @@ export const INTERACTION_LEDGER_LIFE_MS = 15 * 60 * 1000;
 interface Entry {
   ticket: LedgerTicket;
   modules: Set<string>;
+  /**
+   * NB13 C6: the tickets the entry's ticket replaced, or that were recorded below it, while not landed. A later
+   * ticket no longer covers them: a file line in a failed range, or a set's batch of unknown fate, answers apart.
+   */
+  earlier: LedgerTicket[];
 }
 
 /** Orders refusals and whole-document rewrites across every ledger, so a reader of two ledgers can tell which came last. */
@@ -30,7 +35,7 @@ export class WriteLedger {
   /** confirmSaved's default since inside this ledger's frame: the writes accepted after it opened. */
   readonly openedMark: SaveMark = saveMark();
   private closed = false;
-  /** Keyed by the ticket's working set or landing record: a later ticket on it covers every earlier one. */
+  /** Keyed by the ticket's working set or landing record; earlier tickets not landed are kept beside the latest. */
   private readonly entries = new Map<object, Entry>();
   /** The keys holding entries for one guild's sets or one path's records. */
   private readonly keysByTarget = new Map<string, Set<object>>();
@@ -71,10 +76,14 @@ export class WriteLedger {
     const target = ticket.kind === 'file' ? `file:${ticket.path}` : `ws:${ticket.guildId}`;
     const entry = this.entries.get(key);
     if (entry) {
+      entry.earlier = entry.earlier.filter(earlier => !landed(earlier));
       if (ticket.seq > entry.ticket.seq) {
-        // Every write the entry held landed: it answers from the new one.
         if (landed(entry.ticket)) this.droppedLanded = true;
+        else entry.earlier.push(entry.ticket);
         entry.ticket = ticket;
+      } else if (ticket.seq < entry.ticket.seq && !landed(ticket) && !entry.earlier.some(earlier => earlier.seq === ticket.seq)) {
+        // D8: a lower ticket recorded late (a redelivery's queued line) is not covered by the higher one.
+        entry.earlier.push(ticket);
       }
       entry.modules.add(module);
       return;
@@ -86,13 +95,15 @@ export class WriteLedger {
       this.keysByTarget.set(target, keys);
     }
     for (const other of keys) {
-      if (landed(this.entries.get(other)!.ticket)) {
+      const held = this.entries.get(other)!;
+      // D1: an entry gives way only once its ticket and every earlier one landed.
+      if (landed(held.ticket) && held.earlier.every(landed)) {
         this.entries.delete(other);
         keys.delete(other);
         this.droppedLanded = true;
       }
     }
-    this.entries.set(key, { ticket, modules: new Set([module]) });
+    this.entries.set(key, { ticket, modules: new Set([module]), earlier: [] });
     keys.add(key);
   }
 
@@ -107,10 +118,16 @@ export class WriteLedger {
     }
   }
 
-  /** The tickets every recorded write is confirmed by, with the modules each covers. */
+  /**
+   * The tickets every recorded write is confirmed by, with the modules each covers: each entry's ticket, then its
+   * earlier tickets not landed now, in the order they were replaced.
+   */
   tickets(): Array<{ ticket: LedgerTicket; modules: string[] }> {
     if (this.sealed) return [];
-    return [...this.entries.values()].map(({ ticket, modules }) => ({ ticket, modules: [...modules].sort() }));
+    return [...this.entries.values()].flatMap(({ ticket, modules, earlier }) => {
+      const sorted = [...modules].sort();
+      return [ticket, ...earlier.filter(t => !landed(t))].map(t => ({ ticket: t, modules: sorted }));
+    });
   }
 
   refusals(): Array<{ cause: LedgerCause; modules: string[] }> {
@@ -145,7 +162,7 @@ export class WriteLedger {
 }
 
 export function landed(ticket: LedgerTicket): boolean {
-  return ticket.kind === 'file' ? ticket.record.landed >= ticket.seq : ticket.set.landedSeq >= ticket.seq;
+  return ticket.kind === 'file' ? fileTicketState(ticket) === 'landed' : ticket.set.landedSeq >= ticket.seq;
 }
 
 /** An op's own writes, which its reply carries to the web UI's local chain (never over IPC). */

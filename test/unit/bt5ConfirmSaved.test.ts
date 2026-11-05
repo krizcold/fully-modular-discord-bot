@@ -661,7 +661,7 @@ async function runScope(ops: ScopeOp[]): Promise<void> {
           write(() => saveDataTracked(`k${step.key}.json`, options, { w: ++unique }));
           break;
         case 'append':
-          write(() => appendDataTracked(`k${step.key}.json`, options, `l${++unique};`));
+          write(() => appendDataTracked(`k${step.key}.jsonl`, options, `l${++unique};`));
           break;
         case 'delete':
           write(() => deleteDataTracked(`k${step.key}.json`, options));

@@ -2,10 +2,10 @@ import { ChildProcess, fork } from 'child_process';
 import { AsyncLocalStorage } from 'async_hooks';
 import * as path from 'path';
 import { loadCredentials, validateCredentials, BotCredentials, resolveDataBackend } from '../utils/envLoader';
-import { cancelQueued, droppedByDeposition, filesPending, queuedFilePaths } from '../bot/internalSetup/utils/dataBackends/fileBackend';
-import { carriedWrites, landed } from '../bot/internalSetup/utils/dataBackends/writeLedger';
+import { cancelQueued, droppedByDeposition, fileTicketFailure, fileTicketState, filesPending, queuedFilePaths } from '../bot/internalSetup/utils/dataBackends/fileBackend';
+import { carriedWrites, landed, type LedgerTicket } from '../bot/internalSetup/utils/dataBackends/writeLedger';
 import { EXIT_DEPOSED, isSharedPath } from '../bot/internalSetup/utils/dataManager';
-import { holderWords, onDeposed, readWriterHolder, releaseWriterLock, takeWriterLock, writerLockPath } from '../bot/internalSetup/utils/writerLock';
+import { holderWords, onDeposed, readWriterHolder, releaseWriterLock, takeWriterLock, unconfirmedWords, writerLockPath } from '../bot/internalSetup/utils/writerLock';
 import type { LockHolder } from '../bot/internalSetup/utils/processLock';
 import { applySharedOp, callsProvider, invalidateSharedCaches, partialEnding, partialEndingIn, PROVIDER_SENTENCE } from '../bot/internalSetup/utils/sharedOps';
 import { applyOperatorDataWrite, type GuildDataWriteRequest } from '../bot/internalSetup/utils/ipcDataHandler';
@@ -15,6 +15,7 @@ import { getSafetyManager } from '../utils/updateSafety';
 import { setWebuiDataStoreUrl } from './utils/webuiDataReader';
 import type { NotifyOutcome } from '../bot/internalSetup/utils/subscriptionNotifier';
 import { readMaintenanceFile } from '../utils/maintenanceFile';
+import { heldClauses } from '../bot/internalSetup/utils/heldWords';
 import type { RunningMigration } from '../bot/internalSetup/utils/dataMigration';
 
 const MIGRATION_RUNNING = 'A data migration is running';
@@ -149,8 +150,22 @@ export interface MaintenanceSaveResult {
   saved: boolean | null;
   unsavedGuilds?: number;
   unsavedFiles?: number;
+  /** Guilds holding a save the database did not answer, which may have landed (NB13 decision 6). */
+  unansweredGuilds?: number;
+  /** Files holding appended lines the disk did not confirm. */
+  unconfirmedFiles?: number;
   note?: string;
 }
+
+type ChildHeld = { unsavedGuilds: number; unsavedFiles: number; unansweredGuilds: number };
+
+/** The held counts of a maintenance:mode report, kept while the mode is 'held'; unansweredGuilds is 0 when absent. */
+export function childHeldOf(mode: unknown, held: any): ChildHeld | null {
+  if (mode !== 'held' || !held || typeof held.unsavedGuilds !== 'number' || typeof held.unsavedFiles !== 'number') return null;
+  return { unsavedGuilds: held.unsavedGuilds, unsavedFiles: held.unsavedFiles, unansweredGuilds: typeof held.unansweredGuilds === 'number' ? held.unansweredGuilds : 0 };
+}
+
+const countOf = (value: unknown): number => Number(value) || 0;
 
 /** What the hook 'running' answers about the restart: asked for, not needed, or unknown (null). */
 export interface MaintenanceLeaveResult {
@@ -241,7 +256,7 @@ export class BotManager {
   // A restart the child or the maintenance hook asked for while another operation held the lock.
   private queuedRestart: Promise<BotStartResult> | null = null;
   private queuedRestartChild: ChildProcess | null = null;
-  private childHeld: { unsavedGuilds: number; unsavedFiles: number } | null = null;
+  private childHeld: ChildHeld | null = null;
   // Where the current child stands with the data files (its data:writer reports).
   private childStage: ChildStage = 'none';
   private childWaitHolder: { role: string | null; pid: number } | null = null;
@@ -572,10 +587,7 @@ export class BotManager {
             if (message.data.boot === true) this.childMaintenanceBoot = true;
             this.childModeReported = true;
             this.childMode = message.data.mode;
-            const held = message.data.held;
-            this.childHeld = this.childMode === 'held' && held && typeof held.unsavedGuilds === 'number' && typeof held.unsavedFiles === 'number'
-              ? { unsavedGuilds: held.unsavedGuilds, unsavedFiles: held.unsavedFiles }
-              : null;
+            this.childHeld = childHeldOf(this.childMode, message.data.held);
             this.emitEvent('bot:status', this.getStatus());
           }
         } else if (message.type === 'control:restart-bot') {
@@ -732,17 +744,26 @@ export class BotManager {
     }
     const unsaved = (guilds: number, files: number) => `The bot holds unsaved changes (${guilds} guilds, ${files} files); a stop or restart drops them`;
     const cantConfirm = "can't confirm whether the bot holds unsaved changes; a stop or restart could drop them";
+    // NB13 decision 6: unanswered saves and unconfirmed lines are named in clauses of their own, never as unsaved.
+    const held = (counts: MaintenanceSaveResult | ChildHeld): string | null => {
+      const guilds = countOf(counts.unsavedGuilds);
+      const files = countOf(counts.unsavedFiles);
+      const apart = heldClauses({ unansweredGuilds: countOf(counts.unansweredGuilds), unconfirmedFiles: countOf((counts as MaintenanceSaveResult).unconfirmedFiles) });
+      if (guilds > 0 || files > 0) return apart ? `${unsaved(guilds, files)}; ${apart}` : unsaved(guilds, files);
+      return apart ? `can't confirm whether every change the bot held is saved: ${apart}` : null;
+    };
     const answer = this.childEnterAnswer;
     switch (this.childMode) {
       case 'running':
         return { ok: false, error: 'Stop the bot first' };
       case 'maintenance':
         if (answer?.saved === true) return { ok: false, error: 'Restart the bot into maintenance first' };
-        if (answer?.saved === false) return { ok: false, error: unsaved(answer.unsavedGuilds ?? 0, answer.unsavedFiles ?? 0) };
+        if (answer?.saved === false) return { ok: false, error: held(answer) ?? unsaved(0, 0) };
+        if (answer?.saved === null) return { ok: false, error: held(answer) ?? cantConfirm };
         return { ok: false, error: cantConfirm };
       case 'held':
-        if (this.childHeld) return { ok: false, error: unsaved(this.childHeld.unsavedGuilds, this.childHeld.unsavedFiles) };
-        if (answer?.saved === false) return { ok: false, error: unsaved(answer.unsavedGuilds ?? 0, answer.unsavedFiles ?? 0) };
+        if (this.childHeld) return { ok: false, error: held(this.childHeld) ?? unsaved(0, 0) };
+        if (answer?.saved === false) return { ok: false, error: held(answer) ?? unsaved(0, 0) };
         return { ok: false, error: cantConfirm };
       case 'login-refused':
       case 'outage':
@@ -963,10 +984,24 @@ export class BotManager {
     try {
       const reply = await this.sendIPCMessage('maintenance:enter', { message }, MAINTENANCE_IPC_TIMEOUT_MS);
       if (reply?.saved === true) return answered({ saved: true });
+      const counts = {
+        unsavedGuilds: countOf(reply?.unsavedGuilds),
+        unsavedFiles: countOf(reply?.unsavedFiles),
+        unansweredGuilds: countOf(reply?.unansweredGuilds),
+        unconfirmedFiles: countOf(reply?.unconfirmedFiles),
+      };
+      const apart = {
+        ...(counts.unansweredGuilds > 0 ? { unansweredGuilds: counts.unansweredGuilds } : {}),
+        ...(counts.unconfirmedFiles > 0 ? { unconfirmedFiles: counts.unconfirmedFiles } : {}),
+      };
       if (reply?.saved === false) {
-        const unsavedGuilds = Number(reply.unsavedGuilds) || 0;
-        const unsavedFiles = Number(reply.unsavedFiles) || 0;
-        return answered({ saved: false, unsavedGuilds, unsavedFiles, note: `${unsavedGuilds} guild(s) and ${unsavedFiles} file(s) hold changes that could not be saved` });
+        return answered({ saved: false, unsavedGuilds: counts.unsavedGuilds, unsavedFiles: counts.unsavedFiles, ...apart, note: heldClauses(counts) });
+      }
+      if (reply?.saved === null && (typeof reply.unansweredGuilds === 'number' || typeof reply.unconfirmedFiles === 'number')) {
+        return answered({
+          saved: null, unansweredGuilds: counts.unansweredGuilds, unconfirmedFiles: counts.unconfirmedFiles,
+          note: `${heldClauses(counts)}; can't confirm whether the held changes were saved`,
+        });
       }
       console.warn('[BotManager] The bot process answered the maintenance request without a save result');
     } catch (error) {
@@ -1386,6 +1421,8 @@ export class BotManager {
     for (const r of cancelled) {
       console.error(`[Data] Not saved: ${r.path} (${r.errno ?? 'not on disk within 8 s'}); the web UI dropped its write before releasing the data files' lock`);
     }
+    const unconfirmedResults = results.flatMap(r => (r.outcome === 'unconfirmed' ? [r] : []));
+    for (const r of unconfirmedResults) console.error(`${unconfirmedWords(r)}; the web UI writes no more of it before releasing the data files' lock`);
     const sentence = entry.provider ? ` ${PROVIDER_SENTENCE}` : '';
     const saved = () => {
       if (reply?.ok === true) {
@@ -1400,9 +1437,13 @@ export class BotManager {
       const lead = `Another process took the data files (${routeHolderWords({ role: holder.role ?? null })}, pid ${holder.pid}) while your change was being saved;`;
       const writes = carriedWrites(reply);
       const landedTickets = writes?.tickets.filter(landed) ?? [];
-      const names = [...new Set(landedTickets.flatMap(t => (t.kind === 'file' ? [path.basename(t.path)] : [])))];
+      // D4: a path is named saved only when none of its listed tickets is unlanded.
+      const unlandedPaths = new Set((writes?.tickets ?? []).flatMap(t => (t.kind === 'file' && !landed(t) ? [t.path] : [])));
+      const names = [...new Set(landedTickets.flatMap(t => (t.kind === 'file' && !unlandedPaths.has(t.path) ? [path.basename(t.path)] : [])))];
       const someLanded = landedTickets.length > 0 || writes?.landedBefore === true;
-      const open = writes?.tickets.some(t => !landed(t) && (t.kind !== 'file' || (!droppedByDeposition(t.record) && filesPending([t.path])))) ?? true;
+      // A line the disk did not confirm, or one being written, may be stored: it counts as open.
+      const mayBeStored = (t: LedgerTicket) => t.kind === 'file' && (fileTicketState(t) === 'unconfirmed' || fileTicketState(t) === 'written');
+      const open = writes?.tickets.some(t => !landed(t) && (t.kind !== 'file' || mayBeStored(t) || (!droppedByDeposition(t.record) && filesPending([t.path])))) ?? true;
       let error: string;
       if (!writes || open || writes.unknowable) {
         error = someLanded
@@ -1421,12 +1462,29 @@ export class BotManager {
       ? reply.pending === true
       : reply?.code === 'unconfirmed' && (reply.answer === 'pending' || reply.answer === 'held' || reply.answer === 'unavailable');
     if (reply?.ok !== true && !unconfirmed) return reply;
-    if (cancelled.length === 0) return saved();
+    // D2: a carried line the disk did not confirm, or one a cut try left, may be stored: the op can't confirm.
+    const writes = carriedWrites(reply);
+    const unsure = (writes?.tickets ?? []).flatMap(t => (t.kind === 'file' && (fileTicketState(t) === 'unconfirmed' || fileTicketState(t) === 'written') ? [t] : []));
+    if (unconfirmedResults.length > 0 || unsure.length > 0) {
+      const named = results.filter(r => r.outcome === 'cancelled' || r.outcome === 'unconfirmed');
+      const names = [...new Set([...named.map(r => path.basename(r.path)), ...unsure.map(t => path.basename(t.path))])];
+      const errnos = [...new Set([
+        ...named.map(r => (r as { errno: string | null }).errno),
+        ...unsure.map(t => fileTicketFailure(t)?.errno ?? null),
+      ].filter((e): e is string => !!e))];
+      return {
+        ok: false, status: 503, code: 'disk',
+        error: `The disk did not confirm the write of ${names.join(', ')} (${errnos.length > 0 ? errnos.join(', ') : 'no error code'}), so can't confirm whether your change was saved. Check the disk, then reload to check before you try again.${sentence}`,
+      };
+    }
+    // D10: a refused change rewritten whole or retried may not be stored: with nothing cancelled the op's own answer stands.
+    if (cancelled.length === 0) return writes?.unknowable ? reply : saved();
     const files = cancelled.map(r => path.basename(r.path)).join(', ');
     const errnos = [...new Set(cancelled.map(r => r.errno).filter((e): e is string => !!e))];
+    const inPart = partial || writes?.unknowable === true;
     return {
       ok: false, status: 503, code: 'disk',
-      error: `The disk did not take the write of ${files} (${errnos.length > 0 ? errnos.join(', ') : 'within 8 s'}), so your change was ${partial ? `not saved in full. Check the disk. ${partialEnding(landedHere)}` : 'not saved. Check the disk, then try again.'}${sentence}`,
+      error: `The disk did not take the write of ${files} (${errnos.length > 0 ? errnos.join(', ') : 'within 8 s'}), so your change was ${inPart ? `not saved in full. Check the disk. ${partialEnding(landedHere)}` : 'not saved. Check the disk, then try again.'}${sentence}`,
     };
   }
 

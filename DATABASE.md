@@ -129,6 +129,10 @@ no guild data is saved or restored, nothing is created in that database, and the
 version it found. Point `DATA_BACKEND_URL` at a database of this version to serve again.
 The graveyard sweep deletes retired guild data after `GRAVEYARD_TTL_DAYS` (14 by default); it keeps
 each guild's ownership row, which stops an older bot process from writing over a newer one.
+Each save also writes its own id on the guild's ownership row. When the answer to a save is lost (the connection
+drops after the commit was sent, or no answer comes within 40 seconds), the bot reads that row, after any unfinished
+save of the guild has ended, to learn whether the save was stored before it sends anything again, so no appended line
+is stored twice.
 
 ## Availability: read this before you rely on it
 

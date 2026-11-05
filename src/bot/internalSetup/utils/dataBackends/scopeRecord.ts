@@ -4,7 +4,7 @@
 
 import { randomUUID } from 'crypto';
 
-import type { FileTicket } from './fileBackend';
+import { fileTicketState, type FileTicket } from './fileBackend';
 import type { WsTicket } from './workingSet';
 
 /** A point in this run's acceptance order. The run is new at every start, so a mark kept from before a restart is refused. */
@@ -16,6 +16,13 @@ type Ticket = WsTicket | FileTicket;
 
 /** Lost marks, and refused documents, kept per scope; dropping the oldest raises the scope's prunedThrough. */
 export const LOST_MARKS_PER_SCOPE = 32;
+
+/** A file entry's tickets stamped after a mark, and whether a ticket of it stamped after the mark was found unconfirmed. */
+export interface FilePending {
+  path: string;
+  tickets: FileTicket[];
+  failed: boolean;
+}
 
 /** A working set that left the record's view before its writes landed: deposed when it was fenced. */
 export interface LostMark {
@@ -33,6 +40,10 @@ export interface Refusal {
 interface Entry {
   ticket: Ticket;
   stamp: number;
+  /** A file entry's tickets not landed yet, each with its own stamp (NB13 decision 8). */
+  open?: Array<{ stamp: number; ticket: FileTicket }>;
+  /** The highest stamp of a file ticket found 'unconfirmed': the entry then stays for the process's life. */
+  failedStamp?: number;
 }
 
 interface Scope {
@@ -48,7 +59,7 @@ const scopes = new Map<string, Scope>();
 const scopeOfSet = new WeakMap<object, string>();
 
 const landed = (ticket: Ticket): boolean =>
-  ticket.kind === 'file' ? ticket.record.landed >= ticket.seq : ticket.set.landedSeq >= ticket.seq;
+  ticket.kind === 'file' ? fileTicketState(ticket) === 'landed' : ticket.set.landedSeq >= ticket.seq;
 const keyOf = (ticket: Ticket): object => (ticket.kind === 'file' ? ticket.record : ticket.set);
 
 /** A mark at the latest write noted so far: a write noted later is stamped above it. */
@@ -75,7 +86,15 @@ function scopeFor(scopeId: string): Scope {
 
 function dropLanded(scope: Scope): void {
   for (const [key, entry] of scope.entries) {
-    if (landed(entry.ticket)) scope.entries.delete(key);
+    if (entry.open) {
+      // A landed ticket leaves; an 'unconfirmed' one leaves and raises failedStamp.
+      entry.open = entry.open.filter(kept => {
+        const state = fileTicketState(kept.ticket);
+        if (state === 'unconfirmed') entry.failedStamp = Math.max(entry.failedStamp ?? 0, kept.stamp);
+        return state !== 'landed' && state !== 'unconfirmed';
+      });
+      if (entry.open.length === 0 && !entry.failedStamp) scope.entries.delete(key);
+    } else if (landed(entry.ticket)) scope.entries.delete(key);
   }
 }
 
@@ -97,8 +116,9 @@ export function noteScopeTicket(scopeId: string, ticket: Ticket, rewrites?: stri
   if (entry) {
     if (ticket.seq > entry.ticket.seq) entry.ticket = ticket;
     entry.stamp = stamp;
+    if (ticket.kind === 'file') (entry.open ??= []).push({ stamp, ticket });
   } else {
-    scope.entries.set(key, { ticket, stamp });
+    scope.entries.set(key, { ticket, stamp, ...(ticket.kind === 'file' ? { open: [{ stamp, ticket }] } : {}) });
   }
   if (ticket.kind === 'ws') scopeOfSet.set(ticket.set, scopeId);
 }
@@ -128,7 +148,8 @@ export function setLeft(set: object): void {
   if (!scope || !entry) return;
   scope.entries.delete(set);
   if (landed(entry.ticket)) return;
-  const deposed = entry.ticket.kind === 'ws' && entry.ticket.set.state === 'fenced';
+  // A fenced set's batch that may have landed is lost as 'unavailable', not deposed (NB13 decision 6).
+  const deposed = entry.ticket.kind === 'ws' && entry.ticket.set.state === 'fenced' && entry.ticket.seq > (entry.ticket.set.unknownThrough ?? 0);
   scope.lost.push({ stamp: entry.stamp, deposed });
   if (scope.lost.length <= LOST_MARKS_PER_SCOPE) return;
   let oldest = 0;
@@ -143,12 +164,25 @@ export function setLeft(set: object): void {
  * What a scope still owes after since: unlanded tickets, lost marks and refusals stamped after it; pruned when a lost
  * mark or a refusal it would count was dropped.
  */
-export function pendingFor(scopeId: string, since: number): { tickets: Ticket[]; lost: LostMark[]; refused: Refusal[]; pruned: boolean } {
+export function pendingFor(scopeId: string, since: number): { tickets: Ticket[]; files?: FilePending[]; lost: LostMark[]; refused: Refusal[]; pruned: boolean } {
   const scope = scopes.get(scopeId);
   if (!scope) return { tickets: [], lost: [], refused: [], pruned: false };
   dropLanded(scope);
+  const files: FilePending[] = [];
+  for (const entry of scope.entries.values()) {
+    if (!entry.open) continue;
+    const tickets = entry.open.filter(kept => kept.stamp > since).map(kept => kept.ticket);
+    const failed = (entry.failedStamp ?? 0) > since;
+    if (tickets.length > 0 || failed) files.push({ path: (entry.ticket as FileTicket).path, tickets, failed });
+  }
   return {
-    tickets: [...scope.entries.values()].filter(entry => entry.stamp > since).map(entry => entry.ticket),
+    // A file entry noted after since answers through its highest kept ticket; files names each ticket after since.
+    tickets: [...scope.entries.values()].flatMap(entry => {
+      if (!entry.open) return entry.stamp > since ? [entry.ticket] : [];
+      const after = entry.open.filter(kept => kept.stamp > since);
+      return after.length > 0 ? [entry.open.reduce((a, b) => (b.ticket.seq > a.ticket.seq ? b : a)).ticket] : [];
+    }),
+    ...(files.length > 0 ? { files } : {}),
     lost: scope.lost.filter(mark => mark.stamp > since),
     refused: [...scope.refused.values()].filter(refusal => refusal.stamp > since),
     pruned: since < scope.prunedThrough,

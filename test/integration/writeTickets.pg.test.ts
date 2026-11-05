@@ -1,4 +1,3 @@
-import net from 'net';
 import type { StartedPostgreSqlContainer } from '@testcontainers/postgresql';
 import type { Pool } from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -8,66 +7,12 @@ import { setBackendKind } from '../helpers/backendKind';
 import { initWorkingSet, WorkingSetManager } from '../../src/bot/internalSetup/utils/dataBackends/workingSet';
 import { confirmWrite, saveDataTracked } from '../../src/bot/internalSetup/utils/dataManager';
 import { applyOperatorDataWrite } from '../../src/bot/internalSetup/utils/ipcDataHandler';
+import { Hop } from '../helpers/hop';
 import { poolFor, startPostgres } from '../helpers/postgres';
 
 // BT-1 against a real store (notes/BT.md, "BT-1 design sheet", Tests first):
 // the connection is cut while a write's flush is on the wire, and its ticket
 // answers held; once the store is reachable again, the same ticket answers ok.
-
-/** A TCP hop in front of the container that can drop the traffic of every connection, and cut them all. */
-class Hop {
-  private readonly sockets = new Set<net.Socket>();
-  private stalled = false;
-  private cut = false;
-  private readonly server = net.createServer(client => this.accept(client));
-
-  constructor(private readonly target: { host: string; port: number }) {}
-
-  listen(): Promise<number> {
-    return new Promise((resolve, reject) => {
-      this.server.once('error', reject);
-      this.server.listen(0, '127.0.0.1', () => resolve((this.server.address() as net.AddressInfo).port));
-    });
-  }
-
-  /** Bytes in both directions are dropped, so a query sent now never reaches the store. */
-  stall(): void {
-    this.stalled = true;
-  }
-
-  /** Every open connection is destroyed, and new ones are refused until restore. */
-  cutAll(): void {
-    this.cut = true;
-    for (const socket of this.sockets) socket.destroy();
-  }
-
-  restore(): void {
-    this.stalled = false;
-    this.cut = false;
-  }
-
-  close(): Promise<void> {
-    this.cutAll();
-    return new Promise(resolve => { this.server.close(() => resolve()); });
-  }
-
-  private accept(client: net.Socket): void {
-    if (this.cut) {
-      client.destroy();
-      return;
-    }
-    const upstream = net.connect(this.target.port, this.target.host);
-    for (const [from, to] of [[client, upstream], [upstream, client]] as const) {
-      this.sockets.add(from);
-      from.on('data', chunk => { if (!this.stalled) to.write(chunk); });
-      from.on('close', () => {
-        this.sockets.delete(from);
-        to.destroy();
-      });
-      from.on('error', () => { /* the close that follows ends the other side */ });
-    }
-  }
-}
 
 let container: StartedPostgreSqlContainer;
 let direct: Pool;
@@ -197,9 +142,9 @@ describe('the claim fence on a real Postgres', () => {
     'SELECT node_id, claim FROM smdb_data.guild_ownership WHERE guild_id = $1', [guildId])).rows[0];
   let guilds = 525000;
 
-  it('a fresh database is provisioned at version 3, with claim_seq and a claim column in place of term and epoch', async () => {
+  it('a fresh database is provisioned at version 4, with claim_seq and a claim column in place of term and epoch', async () => {
     const version = await direct.query(`SELECT value FROM smdb_data.meta WHERE key = 'schema_version'`);
-    expect(version.rows[0].value).toBe('{"v":3}');
+    expect(version.rows[0].value).toBe('{"v":4}');
     const seq = await direct.query(`SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'smdb_data' AND c.relname = 'claim_seq' AND c.relkind = 'S'`);
     expect(seq.rowCount).toBe(1);
     const columns = await direct.query(`SELECT column_name FROM information_schema.columns WHERE table_schema = 'smdb_data' AND table_name = 'guild_ownership'`);

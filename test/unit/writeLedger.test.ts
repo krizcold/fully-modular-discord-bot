@@ -71,7 +71,7 @@ afterEach(() => {
 });
 
 describe('a ledger records the facade writes made inside its entry: file mode', () => {
-  it('records accepted saves, appends and deletes as tickets, one per landing record, with every module that wrote', async () => {
+  it('records accepted saves, appends and deletes as tickets, one entry per landing record, listing its earlier tickets until they land', async () => {
     const guildId = freshGuild();
     const options = { guildId, category: 'm' };
     const ledger = openLedger('interaction');
@@ -83,20 +83,25 @@ describe('a ledger records the facade writes made inside its entry: file mode', 
       deleteDataOutcome('b.json', options),
     ]);
     expect(answers).toEqual(['saved', 'saved', true, 'saved', 'deleted']);
-    expect(shape(ledger)).toEqual([['a.json', ['modA', 'modB']], ['b.json', ['modA']], ['log.jsonl', ['modA']]]);
+    expect(shape(ledger)).toEqual([['a.json', ['modA', 'modB']], ['a.json', ['modA', 'modB']], ['b.json', ['modA']], ['b.json', ['modA']], ['log.jsonl', ['modA']]]);
     for (const { ticket } of ledger.tickets()) expect(await confirmWrite(ticket, 5000)).toBe('ok');
     expect(JSON.parse(fs.readFileSync(file(guildId, 'a.json'), 'utf8'))).toEqual({ v: 2 });
     expect(fs.existsSync(file(guildId, 'b.json'))).toBe(false);
   });
 
-  it('keeps the latest ticket of a landing record', () => {
+  it('lists the latest ticket of a landing record first, and earlier ones until they land', async () => {
     const guildId = freshGuild();
     const options = { guildId, category: 'm' };
     const ledger = openLedger('interaction');
     const tickets = runInLedger(ledger, 'modA', () => [1, 2, 3].map(v => saveDataTracked('a.json', options, { v })));
-    const last = tickets[2];
-    if (last.outcome !== 'saved') throw new Error(`not accepted: ${last.outcome}`);
-    expect(ledger.tickets().map(e => e.ticket)).toEqual([last.ticket]);
+    const ticketOf = (t: (typeof tickets)[number]) => {
+      if (t.outcome !== 'saved') throw new Error(`not accepted: ${t.outcome}`);
+      return t.ticket;
+    };
+    const last = ticketOf(tickets[2]);
+    expect(ledger.tickets().map(e => e.ticket)).toEqual([last, ticketOf(tickets[0]), ticketOf(tickets[1])]);
+    await flushAll();
+    expect(ledger.tickets().map(e => e.ticket)).toEqual([last]);
   });
 
   it('records nothing for a delete that finds nothing, and the earlier delete\'s ticket for one still queued', async () => {
@@ -209,7 +214,7 @@ describe('a ledger records the facade writes made inside its entry: the working 
       expect(deleteData('x.json', options)).toBe(true);
       expect(saveDataOutcome('y.json', { guildId: notReady, category: 'm' }, { v: 1 })).toBe('refused');
     });
-    expect(shape(ledger)).toEqual([[`ws:${guildId}`, ['modA', 'modB']]]);
+    expect(shape(ledger)).toEqual([[`ws:${guildId}`, ['modA', 'modB']], [`ws:${guildId}`, ['modA', 'modB']], [`ws:${guildId}`, ['modA', 'modB']]]);
     expect(causes(ledger)).toEqual([['not-ready', ['modA']]]);
     store.mode = 'deposed';
     await vi.advanceTimersByTimeAsync(600);

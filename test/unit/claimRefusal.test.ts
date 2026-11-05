@@ -70,7 +70,8 @@ function scriptedBackend(answer: (sql: string) => unknown): { backend: PostgresB
   (backend as unknown as { state: string }).state = 'ready';
   const sent: string[] = [];
   const client = {
-    query: async (sql: string) => {
+    query: async (q: string | { text: string }) => {
+      const sql = typeof q === 'string' ? q : q.text;
       sent.push(sql.trim());
       const res = answer(sql);
       if (res instanceof Error) throw res;
@@ -104,7 +105,7 @@ describe('a database of another schema version', () => {
     const { backend, sent } = scriptedBackend(sql => {
       if (/CREATE TABLE IF NOT EXISTS smdb_data\.meta/.test(sql)) created = true;
       if (/SELECT value FROM smdb_data\.meta WHERE key = 'schema_version'/.test(sql)) {
-        return created ? { rows: [{ value: '{"v":3}' }], rowCount: 1 } : missing;
+        return created ? { rows: [{ value: '{"v":4}' }], rowCount: 1 } : missing;
       }
       return undefined;
     });

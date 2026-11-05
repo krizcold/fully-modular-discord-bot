@@ -4,6 +4,8 @@
 // database; writes are accepted into RAM with a bounded durability window and
 // refuse loudly (never silently) when that window cannot be honored.
 
+import { randomUUID } from 'crypto';
+
 import { DataBackend, DocKey, FenceToken, GuildFlushBatch, GuildOwner } from './backend';
 import { setLeft } from './scopeRecord';
 import { stoppedServing } from '../servingGate';
@@ -76,6 +78,24 @@ interface WorkingDoc {
 
 type WsState = 'hydrating' | 'ready' | 'frozen-retained' | 'fenced' | 'failed';
 
+/** What flush did: its last step stored a batch, stored nothing, or had nothing it could send. */
+type FlushAnswer = 'stored' | 'failed' | 'idle';
+
+interface BuiltBatch {
+  flushedKeys: string[];
+  sentBufs: Map<string, AppendBuffer>;
+  seq: number;
+}
+
+interface HeldBatch extends BuiltBatch {
+  flushId: string;
+  /** The claim the batch was sent under. */
+  claim: number;
+}
+
+const UNANSWERED_TEXT = "the database did not answer this save's COMMIT; whether it landed is checked before anything is sent again";
+const UNANSWERED_NOTE = "a save's COMMIT got no answer; checking whether it landed";
+
 interface AppendBuffer {
   chunk: string;
   /** As a doc's: its oldest line no landed flush holds, 0 when none. */
@@ -108,8 +128,12 @@ class GuildWorkingSet {
   writeSeq = 0;
   landedSeq = 0;
   flushError: { text: string; code?: string } | null = null;
-  // A save whose COMMIT got no answer since the last landed flush: some of the writes it carried may have landed.
-  commitUnanswered = false;
+  // NB13 decision 5: a batch whose COMMIT got no answer, held until a check finds whether it landed.
+  unanswered: HeldBatch | null = null;
+  // The batch on the wire, null when none is: its commitSent says a COMMIT is awaiting its answer.
+  flight: GuildFlushBatch | null = null;
+  // A check found the guild taken and could not tell whether the held batch landed: tickets at or below this seq.
+  unknownThrough = 0;
 
   constructor(readonly guildId: string, public fence: FenceToken) {}
 
@@ -145,6 +169,17 @@ interface HydrationInFlight {
   outcome: Promise<HydrateOutcome>;
 }
 
+/** A set still owing writes to the store: dirty, on the wire, or holding an unanswered batch. */
+function holds(ws: GuildWorkingSet): boolean {
+  return ws.dirtyKeys.size > 0 || ws.flushInFlight || ws.unanswered !== null;
+}
+
+/** NB13 decision 6: the ticket's set holds an unanswered batch at or after it, or a flight whose COMMIT was sent. */
+export function commitAnswerOwed(ticket: WsTicket): boolean {
+  const ws = ticket.set;
+  return (ws.unanswered !== null && ws.unanswered.seq >= ticket.seq) || ws.flight?.commitSent === true;
+}
+
 function sameGrant(a: FenceToken, b: FenceToken): boolean {
   return a.claim === b.claim;
 }
@@ -173,12 +208,21 @@ export class WorkingSetManager {
    * would otherwise read as clean.
    */
   dirtyGuildIds(): string[] {
-    return [...this.sets.values()].filter(ws => ws.dirtyKeys.size > 0 || ws.flushInFlight).map(ws => ws.guildId);
+    return [...this.sets.values()].filter(holds).map(ws => ws.guildId);
+  }
+
+  /**
+   * NB13 decision 5: the guilds holding a save the database did not answer (a held batch, or a flight whose COMMIT
+   * was sent), and those of them holding nothing else.
+   */
+  unansweredGuilds(): { all: string[]; only: string[] } {
+    const all = [...this.sets.values()].filter(ws => ws.unanswered !== null || ws.flight?.commitSent === true);
+    return { all: all.map(ws => ws.guildId), only: all.filter(ws => ws.dirtyKeys.size === 0).map(ws => ws.guildId) };
   }
 
   /** The guilds of dirtyGuildIds, each with why its last flush failed (null when none failed yet). */
   heldGuilds(): Array<{ guildId: string; reason: string | null; code: string | null }> {
-    return [...this.sets.values()].filter(ws => ws.dirtyKeys.size > 0 || ws.flushInFlight)
+    return [...this.sets.values()].filter(holds)
       .map(ws => ({ guildId: ws.guildId, reason: ws.flushError?.text ?? null, code: ws.flushError?.code ?? null }));
   }
 
@@ -231,7 +275,7 @@ export class WorkingSetManager {
     // process has claimed the guild since: re-stamped for the new grant, or dropped
     // and read again. No flush of its old writes starts meanwhile.
     if (ws?.state === 'frozen-retained') {
-      if (ws.flushInFlight) return 'unavailable';
+      if (ws.flushInFlight || ws.unanswered) return 'unavailable';
       const retained = ws;
       retained.flushInFlight = true;
       sending(retained);
@@ -585,8 +629,8 @@ export class WorkingSetManager {
     this.checkBounds(now);
   }
 
-  private buildBatch(ws: GuildWorkingSet): { batch: GuildFlushBatch; flushedKeys: string[]; sentBufs: Map<string, AppendBuffer>; seq: number } {
-    const batch: GuildFlushBatch = { upserts: [], deletes: [], appends: [] };
+  private buildBatch(ws: GuildWorkingSet): BuiltBatch & { batch: GuildFlushBatch } {
+    const batch: GuildFlushBatch = { upserts: [], deletes: [], appends: [], flushId: randomUUID() };
     const sentBufs = new Map<string, AppendBuffer>();
     const flushedKeys = [...ws.dirtyKeys];
     for (const key of flushedKeys) {
@@ -610,69 +654,129 @@ export class WorkingSetManager {
     return { batch, flushedKeys, sentBufs, seq: ws.writeSeq };
   }
 
-  /** True once this call's batch committed. */
-  private async flush(ws: GuildWorkingSet): Promise<boolean> {
-    if (ws.flushInFlight) { ws.requeue = true; return false; }
+  /**
+   * NB13 decision 5: a set holding an unanswered batch first asks the store whether it landed; with its fate known, or
+   * with none held, it sends what is dirty.
+   */
+  private async flush(ws: GuildWorkingSet): Promise<FlushAnswer> {
+    if (ws.flushInFlight) { ws.requeue = true; return 'idle'; }
     if (ws.debounceTimer) { clearTimeout(ws.debounceTimer); ws.debounceTimer = null; }
-    if (ws.dirtyKeys.size === 0) { ws.windowOpenedAt = null; return false; }
+    const held = ws.unanswered;
+    if (!held) return this.send(ws);
+    ws.flushInFlight = true;
+    const fate = await this.backend.resolveFlush(ws.guildId, held.flushId, held.claim, ws.fence);
+    ws.flushInFlight = false;
+    // Left meanwhile, or forgotten by a deposition: the answer applies to nothing.
+    if (this.leftHere(ws) || ws.unanswered !== held) return 'idle';
+    if (fate.fate === 'unknown') {
+      ws.flushError = { text: `${UNANSWERED_TEXT}; the last check failed: ${fate.detail}` };
+      this.noteFlushFailure(UNANSWERED_NOTE);
+      this.scheduleRetry();
+      return 'failed';
+    }
+    ws.unanswered = null;
+    ws.flightKeys = new Set();
+    ws.requeue = false;
+    if (fate.fate === 'deposed') {
+      if (fate.landed) {
+        this.applyLanded(ws, held);
+        this.noteDropped(ws, ws.dirtyKeys.size);
+      } else {
+        ws.unknownThrough = held.seq;
+        this.noteDropped(ws, new Set([...held.flushedKeys, ...ws.dirtyKeys]).size);
+      }
+      this.onDeposed(ws, fate.currentOwner, fate.landed === null);
+      return 'failed';
+    }
+    if (fate.fate === 'landed') {
+      this.applyLanded(ws, held);
+      const next = await this.send(ws);
+      return next === 'idle' ? 'stored' : next;
+    }
+    for (const buf of held.sentBufs.values()) buf.sent = 0;
+    for (const key of held.flushedKeys) ws.dirtyKeys.add(key);
+    return this.send(ws);
+  }
 
-    const { batch, flushedKeys, sentBufs, seq } = this.buildBatch(ws);
+  /** Builds and sends one batch of what is dirty: 'stored' once its COMMIT was answered. */
+  private async send(ws: GuildWorkingSet): Promise<FlushAnswer> {
+    if (ws.dirtyKeys.size === 0) { ws.windowOpenedAt = null; return 'idle'; }
+
+    const built = this.buildBatch(ws);
+    const { batch, flushedKeys, sentBufs, seq } = built;
+    const sentClaim = ws.fence.claim ?? 0;
     ws.dirtyKeys = new Set();
     ws.flightKeys = new Set(flushedKeys);
     ws.windowOpenedAt = null;
     ws.flushInFlight = true;
+    ws.flight = batch;
     const outcome = await this.backend.flushGuild(ws.guildId, batch, ws.fence);
     ws.flushInFlight = false;
+    ws.flight = null;
+
+    if (!outcome.ok && outcome.reason === 'unavailable' && outcome.commitUnanswered) {
+      // Its keys stay in flightKeys, so the acceptance window counts them, and each buffer keeps its sent start.
+      ws.unanswered = { flushId: batch.flushId!, claim: sentClaim, flushedKeys, sentBufs, seq };
+      ws.requeue = false;
+      ws.flushError = { text: UNANSWERED_TEXT };
+      this.noteFlushFailure(UNANSWERED_NOTE);
+      this.scheduleRetry();
+      return 'failed';
+    }
     ws.flightKeys = new Set();
     // A refused batch holds no buffer's start any more: the next one sends each whole.
     if (!outcome.ok) for (const buf of sentBufs.values()) buf.sent = 0;
 
     if (outcome.ok) {
-      // An evicted or replaced set dropped its unflushed writes, so what it
-      // commits after that vouches for none.
-      if (!this.leftHere(ws)) ws.landedSeq = seq;
-      for (const key of flushedKeys) {
-        const doc = ws.docs.get(key);
-        // What it holds unstored now is what was written since the build.
-        if (doc) doc.dirtySince = doc.sinceBatch;
-        if (ws.dirtyKeys.has(key)) continue; // re-dirtied mid-flight; next window owns it
-        if (doc?.tombstone) ws.docs.delete(key);
-        else if (doc) doc.dirty = false;
-      }
-      for (const [key, buf] of sentBufs) {
-        // A delete dropped the flushed buffer meanwhile: one there now holds only newer appends.
-        if (ws.appendBuf.get(key) !== buf) continue;
-        buf.chunk = buf.chunk.slice(buf.sent);
-        buf.bytes = Buffer.byteLength(buf.chunk);
-        buf.sent = 0;
-        buf.dirtySince = buf.sinceBatch;
-        if (buf.chunk.length === 0 && !ws.dirtyKeys.has(key)) ws.appendBuf.delete(key);
-      }
-      this.landed += 1;
-      ws.flushError = null;
-      ws.commitUnanswered = false;
-      this.noteFlushSuccess();
+      this.applyLanded(ws, built);
       if (ws.requeue || ws.dirtyKeys.size > 0) {
         ws.requeue = false;
         this.markDirty(ws, [...ws.dirtyKeys][0] ?? '', Date.now());
         if (ws.dirtyKeys.size === 0) { ws.windowOpenedAt = null; if (ws.debounceTimer) { clearTimeout(ws.debounceTimer); ws.debounceTimer = null; } }
       }
-      return true;
+      return 'stored';
     }
 
     if (outcome.reason === 'deposed') {
       this.noteDropped(ws, new Set([...flushedKeys, ...ws.dirtyKeys]).size);
       this.onDeposed(ws, outcome.currentOwner);
-      return false;
+      return 'failed';
     }
     // unavailable: everything stays dirty; merge back and retry under backoff.
     for (const key of flushedKeys) ws.dirtyKeys.add(key);
     ws.requeue = false;
     ws.flushError = { text: outcome.detail ?? 'the store did not take the flush', code: outcome.code };
-    if (outcome.commitUnanswered) ws.commitUnanswered = true;
     this.noteFlushFailure('flush unavailable');
     this.scheduleRetry();
-    return false;
+    return 'failed';
+  }
+
+  /** A batch known stored: its writes land, the documents not written since become clean, each buffer loses its sent start. */
+  private applyLanded(ws: GuildWorkingSet, batch: BuiltBatch): void {
+    const { flushedKeys, sentBufs, seq } = batch;
+    // An evicted or replaced set dropped its unflushed writes, so what it
+    // commits after that vouches for none.
+    if (!this.leftHere(ws)) ws.landedSeq = seq;
+    for (const key of flushedKeys) {
+      const doc = ws.docs.get(key);
+      // What it holds unstored now is what was written since the build.
+      if (doc) doc.dirtySince = doc.sinceBatch;
+      if (ws.dirtyKeys.has(key)) continue; // re-dirtied mid-flight; next window owns it
+      if (doc?.tombstone) ws.docs.delete(key);
+      else if (doc) doc.dirty = false;
+    }
+    for (const [key, buf] of sentBufs) {
+      // A delete dropped the flushed buffer meanwhile: one there now holds only newer appends.
+      if (ws.appendBuf.get(key) !== buf) continue;
+      buf.chunk = buf.chunk.slice(buf.sent);
+      buf.bytes = Buffer.byteLength(buf.chunk);
+      buf.sent = 0;
+      buf.dirtySince = buf.sinceBatch;
+      if (buf.chunk.length === 0 && !ws.dirtyKeys.has(key)) ws.appendBuf.delete(key);
+    }
+    this.landed += 1;
+    ws.flushError = null;
+    this.noteFlushSuccess();
   }
 
   private readonly dropped = new Map<number, { changes: number; guilds: Set<string>; unanswered: Set<string> }>();
@@ -682,7 +786,7 @@ export class WorkingSetManager {
     const entry = this.dropped.get(ws.fence.shardId) ?? { changes: 0, guilds: new Set<string>(), unanswered: new Set<string>() };
     entry.changes += changes;
     entry.guilds.add(ws.guildId);
-    if (ws.commitUnanswered) entry.unanswered.add(ws.guildId);
+    if (ws.unanswered !== null || ws.flight?.commitSent === true || ws.unknownThrough > ws.landedSeq) entry.unanswered.add(ws.guildId);
     this.dropped.set(ws.fence.shardId, entry);
   }
 
@@ -699,10 +803,10 @@ export class WorkingSetManager {
     return lines;
   }
 
-  private onDeposed(ws: GuildWorkingSet, owner?: GuildOwner): void {
+  private onDeposed(ws: GuildWorkingSet, owner?: GuildOwner, mayHaveLanded = false): void {
     this.fencedFlushRejections += 1;
     this.lastError = `guild ${ws.guildId} fenced by ${owner?.nodeId ?? 'unknown'} (claim ${owner?.claim ?? '?'})`;
-    console.error(`[Data] Deposed writer: ${this.lastError}; dropping the guild's working set without flushing`);
+    console.error(`[Data] Deposed writer: ${this.lastError}; dropping the guild's working set without flushing${mayHaveLanded ? '; a save whose COMMIT got no answer may have landed' : ''}`);
     // Drop dirty accounting; the flush is never retried (a deposed node's
     // leftover writes are never merged later - that would be a second writer).
     this.forgetDirty(ws);
@@ -715,6 +819,8 @@ export class WorkingSetManager {
   }
 
   private forgetDirty(ws: GuildWorkingSet): void {
+    ws.unanswered = null;
+    ws.flightKeys = new Set();
     ws.dirtyKeys.clear();
     ws.appendBuf.clear();
     ws.windowOpenedAt = null;
@@ -726,93 +832,88 @@ export class WorkingSetManager {
   }
 
   /**
-   * Deadline-bounded immediate flush ('ok' = committed, 'pending' = accepted
-   * and still retrying - callers report "queued, not yet durable"). A flush
-   * already on the wire emptied the dirty set before awaiting, so it is
-   * waited for: its writes are durable only once it settles.
+   * Deadline-bounded immediate flush (NB13 decision 6). 'ok' only when nothing is dirty and nothing is unanswered;
+   * 'pending' at the deadline or after a failed flush while a batch's fate is unknown; 'held' when the store refused;
+   * 'deposed' once fenced, or 'unavailable' when the fenced set may hold a stored batch. After each flush it reads
+   * the set again; a flush or check on the wire is waited for.
    */
   async flushGuildNow(guildId: string, deadlineMs: number): Promise<FlushNowOutcome> {
     const ws = this.sets.get(guildId);
     if (!ws) return 'ok';
     const deadline = Date.now() + deadlineMs;
+    let failed = false;
     for (;;) {
-      if (ws.state === 'fenced') return 'deposed';
+      if (ws.state === 'fenced') return ws.unknownThrough > ws.landedSeq ? 'unavailable' : 'deposed';
       if (this.leftHere(ws)) return 'unavailable';
+      if (!ws.flushInFlight && ws.dirtyKeys.size === 0 && !ws.unanswered) return 'ok';
+      if (failed) return ws.unanswered ? 'pending' : 'held';
       const left = deadline - Date.now();
-      if (ws.flushInFlight) {
-        if (left <= 0) return 'pending';
-        await new Promise<void>(resolve => { setTimeout(resolve, Math.min(20, left)); });
-        continue;
-      }
-      if (ws.dirtyKeys.size === 0) return 'ok';
       if (left <= 0) return 'pending';
-      const timeout = new Promise<'timeout'>(resolve => {
-        const t = setTimeout(() => resolve('timeout'), left);
-        t.unref();
-      });
-      const committed = await Promise.race([this.flush(ws), timeout]);
-      // Once the set left here, its flush's commit, timeout or refusal vouches for none of its writes; fenced, it
-      // still answers deposed.
-      if (committed === 'timeout') return this.leftHere(ws) ? 'unavailable' : 'pending';
-      if (committed) return this.leftHere(ws) ? 'unavailable' : 'ok';
-      if ((ws.state as WsState) === 'fenced') return 'deposed';
-      // Refused by the store (unreachable): kept dirty and retried.
-      return this.leftHere(ws) ? 'unavailable' : 'held';
+      const answer = await this.flushOnce(ws, left);
+      if (answer === 'timeout') return this.leftHere(ws) ? 'unavailable' : 'pending';
+      if (answer === 'failed') failed = true;
     }
   }
 
   /**
    * flushGuildNow for one accepted write: 'ok' once a batch its set built at
-   * or after it committed (so a later write of the same document landing
+   * or after it is stored (so a later write of the same document landing
    * counts), 'held' when the store refused the commit, 'pending' at the
-   * deadline, 'deposed' once its set is fenced. Only the set that took the
-   * write answers for it: evicted or replaced before it landed, it is
-   * 'unavailable' ('deposed' once its batch on the wire comes back deposed).
+   * deadline or while its batch's fate is unknown, 'deposed' once its set is
+   * fenced, and 'unavailable' when the set left, or was fenced while its batch
+   * may have landed.
    */
   async confirm(ticket: WsTicket, deadlineMs: number): Promise<FlushNowOutcome> {
     const ws = ticket.set;
     const deadline = performance.now() + deadlineMs;
+    let failed = false;
     for (;;) {
       if (ws.landedSeq >= ticket.seq) return 'ok';
-      if (ws.state === 'fenced') return 'deposed';
+      if (ws.state === 'fenced') return ticket.seq <= ws.unknownThrough ? 'unavailable' : 'deposed';
       if (this.leftHere(ws)) return 'unavailable';
-      // Neither dirty nor on the wire: it left the set without landing.
-      if (!ws.flushInFlight && ws.dirtyKeys.size === 0) return 'unavailable';
+      // Neither dirty, on the wire nor unanswered: it left the set without landing.
+      if (!ws.flushInFlight && ws.dirtyKeys.size === 0 && !ws.unanswered) return 'unavailable';
+      if (failed) return ws.unanswered && ticket.seq <= ws.unanswered.seq ? 'pending' : 'held';
       const left = deadline - performance.now();
       if (left <= 0) return 'pending';
-      if (ws.flushInFlight) {
-        // Referenced: the flush can end first and leave nothing else holding the process open.
-        await new Promise<void>(resolve => { setTimeout(resolve, Math.min(20, left)); });
-        continue;
-      }
-      let timer: NodeJS.Timeout | undefined;
-      const timeout = new Promise<'timeout'>(resolve => {
-        timer = setTimeout(() => resolve('timeout'), left);
-        timer.unref();
-      });
-      const committed = await Promise.race([this.flush(ws), timeout]);
-      clearTimeout(timer);
-      // Once the set left here, its flush's commit, timeout or refusal vouches for none of its writes; fenced, it
-      // still answers deposed.
-      if (committed === 'timeout') return this.leftHere(ws) ? 'unavailable' : 'pending';
-      // Its batch was built after the write, so it carried it, unless the set left meanwhile.
-      if (committed) return ws.landedSeq >= ticket.seq ? 'ok' : 'unavailable';
-      if ((ws.state as WsState) === 'fenced') return 'deposed';
-      // Refused by the store (unreachable): kept dirty and retried.
-      return this.leftHere(ws) ? 'unavailable' : 'held';
+      const answer = await this.flushOnce(ws, left);
+      if (answer === 'timeout') return this.leftHere(ws) ? 'unavailable' : 'pending';
+      if (answer === 'failed') failed = true;
     }
+  }
+
+  /**
+   * One step of a confirm loop: a 20 ms poll while a flush or check is on the wire, else a flush raced against the
+   * deadline. After a flush that sent nothing, one poll, so a check a timer started never turns the loop into a spin.
+   */
+  private async flushOnce(ws: GuildWorkingSet, left: number): Promise<FlushAnswer | 'timeout'> {
+    // Referenced: the flush can end first and leave nothing else holding the process open.
+    const poll = () => new Promise<void>(resolve => { setTimeout(resolve, Math.min(20, left)); });
+    if (ws.flushInFlight) {
+      await poll();
+      return 'idle';
+    }
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<'timeout'>(resolve => {
+      timer = setTimeout(() => resolve('timeout'), left);
+      timer.unref();
+    });
+    const answer = await Promise.race([this.flush(ws), timeout]);
+    clearTimeout(timer);
+    if (answer === 'idle') await poll();
+    return answer;
   }
 
   /** Flush every dirty guild (shutdown drain; the caller bounds it). */
   async flushAllDirty(): Promise<string[]> {
-    const dirty = [...this.sets.values()].filter(ws => ws.dirtyKeys.size > 0);
-    await Promise.all(dirty.map(ws => this.flush(ws)));
-    return [...this.sets.values()].filter(ws => ws.dirtyKeys.size > 0).map(ws => ws.guildId);
+    const owing = (ws: GuildWorkingSet) => ws.dirtyKeys.size > 0 || ws.unanswered !== null;
+    await Promise.all([...this.sets.values()].filter(owing).map(ws => this.flush(ws)));
+    return [...this.sets.values()].filter(owing).map(ws => ws.guildId);
   }
 
   /** No guild holds a dirty write or a flush on the wire (the exit drain's test). */
   writesSettled(): boolean {
-    return ![...this.sets.values()].some(ws => ws.dirtyKeys.size > 0 || ws.flushInFlight);
+    return ![...this.sets.values()].some(holds);
   }
 
   flushOnTheWire(): boolean {
@@ -899,7 +1000,7 @@ export class WorkingSetManager {
     this.retryAttempt += 1;
     this.retryTimer = setTimeout(() => {
       this.retryTimer = null;
-      const dirty = [...this.sets.values()].filter(ws => ws.dirtyKeys.size > 0 && !ws.flushInFlight && ws.state !== 'fenced');
+      const dirty = [...this.sets.values()].filter(ws => (ws.dirtyKeys.size > 0 || ws.unanswered !== null) && !ws.flushInFlight && ws.state !== 'fenced');
       // Paced recovery: a few guild transactions at a time.
       void (async () => {
         for (let i = 0; i < dirty.length; i += 4) {

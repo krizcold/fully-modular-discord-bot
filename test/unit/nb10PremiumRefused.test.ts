@@ -129,6 +129,7 @@ describe('a refused save in the bot is held and retried', () => {
     recover();
     await vi.waitFor(() => expect(linesOf(AUDIT)).toHaveLength(3), { timeout: 5000, interval: 50 });
     expect(linesOf(AUDIT).map(l => l.action)).toEqual(['subscription.grant.manual', 'subscription.cancel.paid', 'tier.update']);
+    await vi.waitFor(() => expect(jsonOf(PREMIUM).subscriptions.g1?.active?.tierId).toBe('high'), { timeout: 5000, interval: 50 });
     const saved = jsonOf(PREMIUM);
     expect(saved.subscriptions.g1.active.tierId).toBe('high');
     expect(saved.subscriptions.g2).toBeUndefined();

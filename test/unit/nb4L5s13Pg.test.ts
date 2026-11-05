@@ -29,7 +29,9 @@ function rig(script: Script, state: 'ready' | 'outage' | 'connecting' = 'connect
   (backend as unknown as { state: string }).state = state;
   const queries: string[] = [];
   const client = {
-    query: async (sql: string, params?: unknown[]) => {
+    query: async (q: string | { text: string; values?: unknown[] }, params?: unknown[]) => {
+      const sql = typeof q === 'string' ? q : q.text;
+      params = params ?? (typeof q === 'string' ? undefined : q.values);
       queries.push(sql.trim());
       return script(sql.trim(), params);
     },

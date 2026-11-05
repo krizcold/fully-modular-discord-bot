@@ -151,6 +151,27 @@ describe('NB3-R3-1 and NB3-R4-T3/T4: a DatabaseError at COMMIT is a refusal only
     expect(db.schemas.has('smdb_data')).toBe(false);
   });
 
+  it.each([
+    ['57P01 with a localized severity', 'ВАЖНО', '57P01'],
+    ['XX000 at ERROR', 'ERROR', 'XX000'],
+  ])('a COMMIT failing with %s is interrupted at committing, even when SELECT 1 answers', async (_name, severity, code) => {
+    jsonSource();
+    const db = new FakeDb();
+    const rec = recording(db, sql => (sql === 'COMMIT' ? Promise.reject(dbError(code, severity, 'the COMMIT ended')) : undefined));
+    const { job, host } = await runJob(db, `job-nb13-f1-${code}`, 'postgres', { connect: rec.connect });
+    expect(job, why(job)).toMatchObject({ state: 'interrupted', stage: 'committing' });
+    expect(readJson(JOURNAL).error).toBe("can't confirm whether the COMMIT landed: the COMMIT ended");
+    expect(host.lock).toBeNull();
+  });
+
+  it('a COMMIT answered 23505 at ERROR on a session that answers SELECT 1 is the refusal: failed at rereading', async () => {
+    jsonSource();
+    const db = new FakeDb();
+    const rec = recording(db, sql => (sql === 'COMMIT' ? Promise.reject(dbError('23505', 'ERROR', 'duplicate key value')) : undefined));
+    const { job } = await runJob(db, 'job-nb13-f1-23505', 'postgres', { connect: rec.connect });
+    expect(job, why(job)).toMatchObject({ state: 'failed', stage: 'rereading', error: 'The database refused the COMMIT: duplicate key value' });
+  });
+
   it('an ERROR on a session that does not answer SELECT 1 within the close bound is interrupted, and the socket is destroyed', async () => {
     jsonSource();
     const db = new FakeDb();

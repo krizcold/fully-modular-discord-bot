@@ -194,7 +194,7 @@ describe('ruling L: a change the database refuses for its content', () => {
     await handleMaintenanceIpc({ type: 'maintenance:leave', requestId: 'c1', data: {} });
     await vi.waitFor(() => expect(restarts()).toHaveLength(1), { timeout: 10_000 });
     const held = sent.findIndex(m => m.type === 'maintenance:mode' && m.data.mode === 'held');
-    expect(sent[held]).toEqual({ type: 'maintenance:mode', data: { mode: 'held', held: { unsavedGuilds: 1, unsavedFiles: 0 } } });
+    expect(sent[held]).toEqual({ type: 'maintenance:mode', data: { mode: 'held', held: { unsavedGuilds: 1, unsavedFiles: 0, unansweredGuilds: 0 } } });
     expect(held).toBeLessThan(sent.findIndex(m => m.type === 'control:restart-bot'));
     const logged = errorsWith(`guild ${guildId} (`);
     expect(logged).toHaveLength(1);
@@ -214,7 +214,7 @@ describe('ruling L: a change the database refuses for its content', () => {
     await handleMaintenanceIpc({ type: 'maintenance:leave', requestId: 'd1', data: {} });
     await vi.waitFor(() => expect(retryWarnings()).toBeGreaterThanOrEqual(6), { timeout: 10_000 });
     expect(restarts()).toHaveLength(0);
-    expect(sent).toContainEqual({ type: 'maintenance:mode', data: { mode: 'held', held: { unsavedGuilds: 1, unsavedFiles: 0 } } });
+    expect(sent).toContainEqual({ type: 'maintenance:mode', data: { mode: 'held', held: { unsavedGuilds: 1, unsavedFiles: 0, unansweredGuilds: 0 } } });
     expect(errorsWith('drops these changes')).toHaveLength(0);
     expect(getWorkingSet()!.dirtyGuildIds()).toContain(guildId);
   }, 20_000);
@@ -291,7 +291,7 @@ describe('ruling L: a change the database refuses for its content', () => {
     await handleMaintenanceIpc({ type: 'maintenance:leave', requestId: 'g1', data: {} });
     await vi.waitFor(() => expect(retryWarnings()).toBeGreaterThanOrEqual(6), { timeout: 10_000 });
     expect(restarts()).toHaveLength(0);
-    expect(sent).toContainEqual({ type: 'maintenance:mode', data: { mode: 'held', held: { unsavedGuilds: 2, unsavedFiles: 0 } } });
+    expect(sent).toContainEqual({ type: 'maintenance:mode', data: { mode: 'held', held: { unsavedGuilds: 2, unsavedFiles: 0, unansweredGuilds: 0 } } });
     expect(getWorkingSet()!.dirtyGuildIds()).toEqual(expect.arrayContaining([a, b]));
   }, 20_000);
 
@@ -325,7 +325,7 @@ describe('ruling L: a change the database refuses for its content', () => {
       await handleMaintenanceIpc({ type: 'maintenance:leave', requestId: 'g3', data: {} });
       await vi.waitFor(() => expect(retryWarnings()).toBeGreaterThanOrEqual(6), { timeout: 10_000 });
       expect(restarts()).toHaveLength(0);
-      expect(sent).toContainEqual({ type: 'maintenance:mode', data: { mode: 'held', held: { unsavedGuilds: 1, unsavedFiles: 1 } } });
+      expect(sent).toContainEqual({ type: 'maintenance:mode', data: { mode: 'held', held: { unsavedGuilds: 1, unsavedFiles: 1, unansweredGuilds: 0 } } });
       expect(getWorkingSet()!.dirtyGuildIds()).toContain(guildId);
     } finally {
       dropPendingForGuild('global');
@@ -360,7 +360,7 @@ describe('ruling L: a change the database refuses for its content', () => {
     try {
       closeMaintenanceGate('hook', 'm');
       await handleMaintenanceIpc({ type: 'maintenance:leave', requestId: 'f1', data: {} });
-      await vi.waitFor(() => expect(sent).toContainEqual({ type: 'maintenance:mode', data: { mode: 'held', held: { unsavedGuilds: 0, unsavedFiles: 1 } } }), { timeout: 10_000 });
+      await vi.waitFor(() => expect(sent).toContainEqual({ type: 'maintenance:mode', data: { mode: 'held', held: { unsavedGuilds: 0, unsavedFiles: 1, unansweredGuilds: 0 } } }), { timeout: 10_000 });
       const logged = errorsWith(file);
       expect(logged).toHaveLength(1);
       expect(String(logged[0][0])).toContain('stays in maintenance');
@@ -382,7 +382,7 @@ describe('ruling M: the held report', () => {
       await vi.waitFor(() => expect(maintenanceMode()).toBe('held'), { timeout: 10_000 });
       await handleMaintenanceIpc({ type: 'maintenance:enter', requestId: 'r2', data: { message: 'again' } });
       expect(maintenanceMode()).toBe('held');
-      expect(sent.filter(m => m.type === 'maintenance:mode').at(-1)).toEqual({ type: 'maintenance:mode', data: { mode: 'held', held: { unsavedGuilds: 0, unsavedFiles: 1 } } });
+      expect(sent.filter(m => m.type === 'maintenance:mode').at(-1)).toEqual({ type: 'maintenance:mode', data: { mode: 'held', held: { unsavedGuilds: 0, unsavedFiles: 1, unansweredGuilds: 0 } } });
       expect(maintenanceText()).toBe('again');
     } finally {
       cleanup();

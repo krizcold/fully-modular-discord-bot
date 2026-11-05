@@ -58,11 +58,11 @@ afterEach(async () => {
 });
 
 describe('an append and the last byte of its file', () => {
-  it('a last-byte read refused with EACCES appends nothing and keeps the append queued with that errno', async () => {
+  it('an append open refused with EACCES appends nothing and keeps the append queued with that errno', async () => {
     const p = fresh('jsonl');
     fs.writeFileSync(p, 'a');
     vi.spyOn(fs.promises, 'open').mockImplementation(((pp: fs.PathLike, flags?: any, ...rest: any[]) => {
-      if (String(pp) === p && flags === 'r') return Promise.reject(Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' }));
+      if (String(pp) === p && flags === 'a+') return Promise.reject(Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' }));
       return (realOpen as any)(pp, flags, ...rest);
     }) as typeof fs.promises.open);
     enqueueAppend(p, 'b\n');
@@ -71,13 +71,13 @@ describe('an append and the last byte of its file', () => {
     expect(await cancelQueued([p])).toEqual([{ path: p, outcome: 'cancelled', errno: 'EACCES' }]);
   });
 
-  it('closes the handle it read the last byte through', async () => {
+  it('closes the handle it appended through', async () => {
     const p = fresh('jsonl');
     fs.writeFileSync(p, 'a\n');
     const handles: fs.promises.FileHandle[] = [];
     vi.spyOn(fs.promises, 'open').mockImplementation((async (pp: fs.PathLike, flags?: any, ...rest: any[]) => {
       const h = await (realOpen as any)(pp, flags, ...rest);
-      if (String(pp) === p && flags === 'r') handles.push(h);
+      if (String(pp) === p && flags === 'a+') handles.push(h);
       return h;
     }) as typeof fs.promises.open);
     enqueueAppend(p, 'b\n');

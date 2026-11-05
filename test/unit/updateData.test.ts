@@ -11,7 +11,7 @@ vi.mock('../../src/bot/internalSetup/utils/dataBackends/workingSet', async orig 
 });
 
 import { dataPath } from '../../src/utils/dataRoot';
-import { getPending } from '../../src/bot/internalSetup/utils/dataBackends/fileBackend';
+import { enqueueAppend, getPending } from '../../src/bot/internalSetup/utils/dataBackends/fileBackend';
 import { DataBackendUnavailableError, initWorkingSet, type WorkingSetManager } from '../../src/bot/internalSetup/utils/dataBackends/workingSet';
 import { openLedger, runInLedger } from '../../src/bot/internalSetup/utils/dataBackends/writeLedger';
 import { pendingFor, saveMark, stampOf } from '../../src/bot/internalSetup/utils/dataBackends/scopeRecord';
@@ -139,7 +139,8 @@ describe('update(fn) on each route and state', () => {
 
   it.each(ROUTES)('%s, an append still queued: refused io and fn never runs', async name => {
     const r = await routeOf(name);
-    expect(dm.appendData('doc.json', r.options, '{"line":1}\n')).toBe(true);
+    if (r.ws) expect(r.ws.append(r.guildId, 'm', 'doc.json', '{"line":1}\n')).toBe('accepted');
+    else enqueueAppend(r.file, '{"line":1}\n');
     const { fn } = spyFn();
     expect(update(r, fn)).toEqual({ outcome: 'refused', cause: 'io' });
     expect(fn).not.toHaveBeenCalled();

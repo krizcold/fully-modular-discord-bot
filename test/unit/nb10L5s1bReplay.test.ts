@@ -128,6 +128,8 @@ describe('a replay dropped at the stop', () => {
     await normal(pm);
     // The first replay's marks landed: its journal is gone.
     await vi.waitFor(() => expect(rawOf(JOURNAL)).toBeNull(), { timeout: 5000, interval: 10 });
+    // The journal's delete leaves the queue after its unlink's callback; a load before that reads the new journal as deleted.
+    await settleQueue();
     fs.writeFileSync(JOURNAL, journalLine('w2', 1, expired('ps0', 'g1')));
     const calls = stopAtWait(pm, at);
     invalidatePremiumCache();

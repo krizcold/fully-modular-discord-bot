@@ -48,8 +48,46 @@ let opSeq = 0;
 // once nothing is queued for the path, and a later record starts afresh.
 export interface LandingRecord {
   landed: number;
+  /** Seq ranges whose lines are in the file but whose sync the disk did not confirm, or that a cut try left (NB13). */
+  failed?: FailedRange[];
+  /** The snapshot seq of the try whose write call is on the wire, 0 outside it. */
+  writing?: number;
+  /** The highest snapshot seq of a try whose write accepted at least one byte. */
+  wrote?: number;
+  /** Whole writes in the file whose directory sync failed after a newer op replaced them: that op's landing answers for them, a cancel or the exit fails them. */
+  replaced?: ReplacedTry[];
+  /** The seq of the last whole write or delete that landed: the file it left holds no byte of a try before it. */
+  wholeLanded?: number;
 }
+
+interface ReplacedTry {
+  from: number;
+  through: number;
+  errno: string;
+  lines: number;
+}
+
+export interface FailedRange {
+  from: number;
+  through: number;
+  errno: string | null;
+  /** A cancel added it for a try cut short: its lines may be in the file whole, in part or not at all. */
+  cut: boolean;
+}
+
+const newRecord = (): LandingRecord => ({ landed: 0, failed: [], writing: 0, wrote: 0 });
 const landingRecords = new Map<string, LandingRecord>();
+/** Per path, the sets of records that started during a waiting cancel (NB13): its answer reads them too. */
+const cancelWatches = new Map<string, Set<Set<LandingRecord>>>();
+/** Per path, the record of the try on the wire. */
+const tryRecords = new Map<string, LandingRecord>();
+
+function startRecord(absPath: string): LandingRecord {
+  const record = newRecord();
+  landingRecords.set(absPath, record);
+  for (const seen of cancelWatches.get(absPath) ?? []) seen.add(record);
+  return record;
+}
 /** Landing records whose queued op a deposition cancelled: their tickets are known not saved. */
 const droppedAtDeposition = new WeakSet<LandingRecord>();
 
@@ -59,9 +97,21 @@ export function droppedByDeposition(record: LandingRecord): boolean {
 
 // The landed op's tickets hold the record its path had when the flush began,
 // which a drop may have retired since, or else one a ticket made meanwhile.
-function noteLanded(absPath: string, atStart: LandingRecord | undefined, seq: number): void {
+function noteLanded(absPath: string, atStart: LandingRecord | undefined, seq: number, whole = false): void {
   const record = atStart ?? landingRecords.get(absPath);
   if (record && seq > record.landed) record.landed = seq;
+  if (record && whole) record.wholeLanded = Math.max(record.wholeLanded ?? 0, seq);
+  if (record) dropReplacedTries(record, seq);
+}
+
+/** Records holding replaced tries, with their paths. */
+const replacedTries = new Map<LandingRecord, string>();
+
+/** Forgets the replaced tries an op at seq answers for. */
+function dropReplacedTries(record: LandingRecord, seq: number): void {
+  if (!record.replaced?.length) return;
+  record.replaced = record.replaced.filter(t => t.through > seq);
+  if (record.replaced.length === 0) replacedTries.delete(record);
 }
 
 /** Landing records held for ticketed paths with an op still queued. */
@@ -72,34 +122,137 @@ export function fileLandingRecords(): number {
 // write held through a disk fault lands once the disk takes it.
 const retryAttempts = new Map<string, number>();
 const retryTimers = new Map<string, NodeJS.Timeout>();
-/** The errno of each path's last failed flush, until one lands. */
-const lastFlushErrno = new Map<string, string>();
-/** Paths this process knows end with a newline: an append of its own landed there since its last writer lock take. */
-const newlineTails = new Set<string>();
-const NEWLINE = String.fromCharCode(10);
+/** Paths with appended lines whose sync the disk did not confirm, until a delete or whole write of the path lands. */
+const unconfirmedPaths = new Set<string>();
 
-/** Forgets every path's known tail (another writer may have cut a line since). */
-export function forgetAppendTails(): void {
-  newlineTails.clear();
+/**
+ * Files holding appended lines the disk did not confirm (NB13 decision 8), and appends queued empty: a short write
+ * left a line in the file without its newline, which the next try's guard closes, so it is not unsaved.
+ */
+export function unconfirmedFiles(): number {
+  const paths = new Set(unconfirmedPaths);
+  for (const [p, op] of pendingOps) if (op.op === 'append' && op.content === '') paths.add(p);
+  return paths.size;
 }
 
-async function lastByteIsNewline(absPath: string): Promise<boolean> {
-  let fh: fs.promises.FileHandle;
-  try {
-    fh = await fs.promises.open(absPath, 'r');
-  } catch (error: any) {
-    if (error?.code === 'ENOENT') return true;
-    throw error;
+/** Files with a write, delete or append still queued, less appends queued empty (counted by unconfirmedFiles). */
+export function unsavedFileWrites(): number {
+  return unsavedFilePaths().length;
+}
+
+/** The paths unsavedFileWrites counts. */
+export function unsavedFilePaths(): string[] {
+  return [...pendingOps].filter(([, op]) => !(op.op === 'append' && op.content === '')).map(([p]) => p);
+}
+/** The errno of each path's last failed flush, until one lands. */
+const lastFlushErrno = new Map<string, string>();
+/** Per path, the identity of a file whose name this process made durable in this hold of the writer lock. */
+const durableFiles = new Map<string, { dev: bigint; ino: bigint; birth: bigint }>();
+
+/** Forgets every durable name: another holder of the writer lock may have replaced any file since. */
+export function forgetDurableFiles(): void {
+  durableFiles.clear();
+}
+
+const failedRangeOf = (ticket: FileTicket): FailedRange | undefined =>
+  (ticket.record.failed ?? []).find(range => ticket.seq >= range.from && ticket.seq <= range.through);
+
+/**
+ * The one reader of a file ticket (NB13 decision 8, C8): 'unconfirmed' when a failed range of its record holds it,
+ * 'landed' when the record's landed reaches it, 'written' while a try that carried it has bytes in the file or a
+ * write on the wire, else 'open'.
+ */
+export function fileTicketState(ticket: FileTicket): 'landed' | 'unconfirmed' | 'written' | 'open' {
+  if (failedRangeOf(ticket)) return 'unconfirmed';
+  if (ticket.record.landed >= ticket.seq) return 'landed';
+  if (ticket.seq <= Math.max(ticket.record.writing ?? 0, ticket.record.wrote ?? 0)) return 'written';
+  return 'open';
+}
+
+/** Why a ticket is 'unconfirmed': the errno and whether a cut try left it; null when no failed range holds it. */
+export function fileTicketFailure(ticket: FileTicket): { errno: string | null; cut: boolean } | null {
+  const range = failedRangeOf(ticket);
+  return range ? { errno: range.errno, cut: range.cut } : null;
+}
+
+/** Adds the parts of from..through no failed range of the record covers yet; answers whether it added any. */
+function addFailedRange(record: LandingRecord, from: number, through: number, errno: string | null, cut: boolean): boolean {
+  const ranges = (record.failed ??= []);
+  let added = false;
+  let start = from;
+  for (const range of [...ranges].sort((a, b) => a.from - b.from)) {
+    if (range.through < start) continue;
+    if (range.from > through) break;
+    if (range.from > start) { ranges.push({ from: start, through: range.from - 1, errno, cut }); added = true; }
+    start = Math.max(start, range.through + 1);
   }
-  try {
-    const { size } = await fh.stat();
-    if (size === 0) return true;
-    const buf = Buffer.alloc(1);
-    await fh.read(buf, 0, 1, size - 1);
-    return buf[0] === 0x0a;
-  } finally {
-    await fh.close();
+  if (start <= through) { ranges.push({ from: start, through, errno, cut }); added = true; }
+  return added;
+}
+
+const errnoOf = (error: unknown): string => String((error as { code?: unknown } | null)?.code ?? 'EIO');
+const closeCodeOf = (error: unknown): string => {
+  const code = (error as { code?: unknown } | null)?.code;
+  return code === undefined || code === null ? 'no error code' : String(code);
+};
+const SKIPPED_DIR_OPEN = new Set(['EISDIR', 'EPERM', 'EACCES']);
+const SKIPPED_DIR_SYNC = new Set(['EINVAL', 'ENOTSUP', 'EOPNOTSUPP']);
+
+/**
+ * fsyncs each directory from the file's own up to DATA_ROOT (POSIX; Windows skips directories, as atomicReplace
+ * does), so the file's name and every directory made for it are durable. Only an unsupported operation is skipped;
+ * the first other error is answered. Each handle is closed in its own finally, and a close error changes no answer.
+ */
+async function syncDirectoryChain(absPath: string): Promise<{ failed: false } | { failed: true; error: unknown }> {
+  if (IS_WINDOWS) return { failed: false };
+  const root = path.resolve(BASE_DATA_DIR);
+  for (let dir = path.dirname(path.resolve(absPath)); ; dir = path.dirname(dir)) {
+    let failure: { failed: true; error: unknown } | null = null;
+    let dh: fs.promises.FileHandle | null = null;
+    try {
+      dh = await fs.promises.open(dir, 'r');
+    } catch (error) {
+      if (!SKIPPED_DIR_OPEN.has(errnoOf(error))) return { failed: true, error };
+    }
+    if (dh) {
+      try {
+        await dh.sync();
+      } catch (error) {
+        if (!SKIPPED_DIR_SYNC.has(errnoOf(error))) failure = { failed: true, error };
+      } finally {
+        try { await dh.close(); } catch (error) { console.error(`[Data] ${dir}: the directory could not be closed after its sync (${closeCodeOf(error)}); this changes nothing about the lines already reported for the files in it`); }
+      }
+    }
+    if (failure) return failure;
+    const rel = path.relative(root, dir);
+    if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel) || dir === path.dirname(dir)) return { failed: false };
   }
+}
+
+/** Lines of text, counted by their newlines (a last line with none counts too). */
+const lineCount = (text: string): number => text.split('\n').filter((line, i, all) => line !== '' || i < all.length - 1).length;
+
+function logUnconfirmed(absPath: string, lines: number, errno: string): void {
+  console.error(`[Data] ${absPath}: the disk did not confirm the sync of ${lines} appended line(s) (${errno}); they are in the file and are not written again; can't confirm they are stored`);
+}
+
+/** Turns the record's replaced tries into failed ranges; answers the last one's errno, or null when it held none. */
+function failReplacedTries(record: LandingRecord, absPath: string): string | null {
+  const tries = record.replaced ?? [];
+  record.replaced = [];
+  replacedTries.delete(record);
+  if (tries.length === 0) return null;
+  for (const t of tries) {
+    addFailedRange(record, t.from, t.through, t.errno, false);
+    logUnconfirmed(absPath, t.lines, t.errno);
+  }
+  unconfirmedPaths.add(absPath);
+  return tries[tries.length - 1].errno;
+}
+
+/** The exit: a replaced whole write whose newer op never landed is in the file, unconfirmed. */
+export function failReplacedTriesAtExit(): void {
+  for (const [record, absPath] of [...replacedTries]) failReplacedTries(record, absPath);
 }
 
 // Writes held only in memory are bounded: past either bound new writes are
@@ -151,7 +304,7 @@ function clearRetry(absPath: string): void {
 
 const IS_WINDOWS = process.platform === 'win32';
 
-async function atomicReplace(target: string, content: string): Promise<void> {
+async function atomicReplace(target: string, content: string, options: { parentSync?: boolean } = {}): Promise<void> {
   await fs.promises.mkdir(path.dirname(target), { recursive: true });
   const tmp = tmpNameFor(target);
   const fh = await fs.promises.open(tmp, 'w');
@@ -176,7 +329,7 @@ async function atomicReplace(target: string, content: string): Promise<void> {
     }
   }
   // POSIX best-effort parent-dir fsync so the rename itself is durable.
-  if (!IS_WINDOWS) {
+  if (!IS_WINDOWS && options.parentSync !== false) {
     try {
       const dh = await fs.promises.open(path.dirname(target), 'r');
       try { await dh.sync(); } finally { await dh.close(); }
@@ -197,78 +350,210 @@ async function flushPath(absPath: string): Promise<boolean> {
     return false;
   }
   flushing.add(absPath);
-  const record = landingRecords.get(absPath);
+  let record = landingRecords.get(absPath);
+  // Every try of a stream has a record, so a cancel can read what it left in the file.
+  if (!record && (entry.op === 'append' || absPath.endsWith('.jsonl'))) record = startRecord(absPath);
+  if (record) tryRecords.set(absPath, record);
   try {
     const seqAtStart = entry.seq;
+    if (entry.op === 'append') return await flushAppend(absPath, entry, record!);
+    const wholeStream = entry.op === 'write' && absPath.endsWith('.jsonl');
+    let chain: Awaited<ReturnType<typeof syncDirectoryChain>> = { failed: false };
     try {
       if (entry.op === 'write') {
-        await atomicReplace(absPath, entry.content);
-      } else if (entry.op === 'delete') {
+        await atomicReplace(absPath, entry.content, wholeStream ? { parentSync: false } : {});
+        if (wholeStream) {
+          durableFiles.delete(absPath);
+          chain = await syncDirectoryChain(absPath);
+        }
+      } else {
         try {
           await fs.promises.unlink(absPath);
         } catch (error: any) {
           if (error?.code !== 'ENOENT') throw error;
         }
-      } else {
-        // append: a torn tail line on crash is tolerated (readers skip bad lines).
-        // appendFile is cumulative (unlike an idempotent write overwrite), so we
-        // must trim ONLY the bytes we persisted, never re-append them.
-        await fs.promises.mkdir(path.dirname(absPath), { recursive: true });
-        const flushed = entry.content; // snapshot before the await
-        const flushedSeq = entry.seq;
-        const lead = newlineTails.has(absPath) || await lastByteIsNewline(absPath) ? '' : NEWLINE;
-        newlineTails.delete(absPath);
-        await fs.promises.appendFile(absPath, lead + flushed, 'utf-8');
-        if (flushed.endsWith(NEWLINE)) newlineTails.add(absPath);
-        lastFlushErrno.delete(absPath);
-        noteLanded(absPath, record, flushedSeq);
-        // A concurrent append may have grown the entry mid-flush; keep the tail.
-        // An op that replaced the entry meanwhile is flushed next, untrimmed.
-        const cur = pendingOps.get(absPath);
-        if (cur === entry) {
-          entry.content = entry.content.slice(flushed.length);
-          if (entry.content.length === 0) {
-            pendingOps.delete(absPath);
-            landingRecords.delete(absPath);
-          } else {
-            scheduleFlush(absPath); // flush only the remaining tail
-          }
-        } else if (cur) {
-          scheduleFlush(absPath);
-        }
-        flushesLanded += 1;
-        lastLandedAt = performance.now();
-        retryAttempts.delete(absPath);
-        failingSince.delete(absPath);
-        return true; // bypass the generic seq-drop below (only correct for write/delete)
       }
     } catch (error) {
-      newlineTails.delete(absPath);
-      lastFlushErrno.set(absPath, String((error as { code?: unknown } | null)?.code ?? 'EIO'));
+      lastFlushErrno.set(absPath, errnoOf(error));
       flushFailures += 1;
       if (!failingSince.has(absPath)) failingSince.set(absPath, performance.now());
       console.error(`[DataManager] Flush failed for ${absPath} (will retry):`, error);
       scheduleRetry(absPath);
       return false; // keep the pending entry + tmp file; the retry, the next write or flushAll tries again
     }
-    flushesLanded += 1;
-    lastLandedAt = performance.now();
     retryAttempts.delete(absPath);
     failingSince.delete(absPath);
-    lastFlushErrno.delete(absPath);
-    newlineTails.delete(absPath);
-    noteLanded(absPath, record, seqAtStart);
-    // Drop the entry only if no newer op arrived while we were flushing.
+    // A newer op replaced the entry during the try: it holds every line of this write, or deletes them, and answers for them.
     const current = pendingOps.get(absPath);
+    const replaced = current !== undefined && current.seq !== seqAtStart;
+    if (chain.failed) {
+      // The whole write of a stream is in the file, but its name's sync failed: never written again, can't confirm.
+      const errno = errnoOf(chain.error);
+      lastFlushErrno.set(absPath, errno);
+      const lines = entry.op === 'write' ? lineCount(entry.content) : 0;
+      if (!replaced) {
+        if (record) {
+          addFailedRange(record, record.landed + 1, seqAtStart, errno, false);
+          dropReplacedTries(record, seqAtStart);
+        }
+        unconfirmedPaths.add(absPath);
+        logUnconfirmed(absPath, lines, errno);
+      } else if (record) {
+        (record.replaced ??= []).push({ from: record.landed + 1, through: seqAtStart, errno, lines });
+        replacedTries.set(record, absPath);
+      }
+    } else {
+      flushesLanded += 1;
+      lastLandedAt = performance.now();
+      lastFlushErrno.delete(absPath);
+      noteLanded(absPath, record, seqAtStart, true);
+      if (entry.op === 'delete' || wholeStream) unconfirmedPaths.delete(absPath);
+    }
+    // Drop the entry only if no newer op arrived while we were flushing.
     if (current && current.seq === seqAtStart) {
       pendingOps.delete(absPath);
       landingRecords.delete(absPath);
     } else if (current) {
       scheduleFlush(absPath);
     }
-    return true;
+    return !chain.failed;
   } finally {
     flushing.delete(absPath);
+    tryRecords.delete(absPath);
+  }
+}
+
+/**
+ * NB13 decision 8: the standard append. O_APPEND puts each write at the file's end; a newline goes first when the
+ * file's last byte is not one, so a cut or old tail stays a line of its own; bytes the kernel accepted are never
+ * written again; the lines land only once the file's fsync, and the directory chain unless its skip holds, succeeded.
+ * A failed fsync leaves its lines in the file, never written again, and 'unconfirmed' for good.
+ */
+async function flushAppend(absPath: string, entry: PendingOp & { op: 'append' }, record: LandingRecord): Promise<boolean> {
+  const flushed = entry.content; // snapshot before the await
+  const flushedSeq = entry.seq;
+  const landedAtStart = record.landed;
+  let fh: fs.promises.FileHandle | null = null;
+  // A rejection may carry no error at all: whether a step failed is kept apart from what it threw.
+  let failed = false;
+  let failure: unknown = null;
+  let syncFailed = false;
+  let syncFailure: unknown = null;
+  let accepted = -1;
+  let guardBytes = 0;
+  try {
+    await fs.promises.mkdir(path.dirname(absPath), { recursive: true });
+    fh = await fs.promises.open(absPath, 'a+');
+    const stat = await fh.stat({ bigint: true });
+    const identity = { dev: stat.dev, ino: stat.ino, birth: stat.birthtimeNs };
+    const known = durableFiles.get(absPath);
+    const skipChain = !!known && known.dev === identity.dev && known.ino === identity.ino && known.birth === identity.birth
+      && identity.birth > 0n && stat.size > 0n;
+    if (!skipChain) durableFiles.delete(absPath);
+    if (stat.size > 0n) {
+      const last = Buffer.alloc(1);
+      await fh.read(last, 0, 1, Number(stat.size - 1n));
+      if (last[0] !== 0x0a) guardBytes = 1;
+    }
+    const bytes = Buffer.from((guardBytes ? '\n' : '') + flushed, 'utf8');
+    record.writing = flushedSeq;
+    try {
+      accepted = (await fh.write(bytes, 0, bytes.length)).bytesWritten;
+    } catch (error) {
+      accepted = 0;
+      failed = true;
+      failure = error;
+    } finally {
+      record.writing = 0;
+    }
+    if (accepted > 0) record.wrote = Math.max(record.wrote ?? 0, flushedSeq);
+    if (!failed && accepted < bytes.length) {
+      failed = true;
+      failure = Object.assign(new Error(`short write: ${accepted} of ${bytes.length} bytes`), { code: 'short write' });
+    }
+    if (!failed) {
+      try {
+        await fh.sync();
+        if (!skipChain) {
+          const chain = await syncDirectoryChain(absPath);
+          if (chain.failed) {
+            syncFailed = true;
+            syncFailure = chain.error;
+          } else durableFiles.set(absPath, identity);
+        }
+      } catch (error) {
+        syncFailed = true;
+        syncFailure = error;
+      }
+    }
+  } catch (error) {
+    failed = true;
+    failure = error;
+  } finally {
+    if (fh) {
+      try { await fh.close(); } catch (error) { console.error(`[Data] ${absPath}: the file could not be closed after an append (${closeCodeOf(error)}); this changes nothing about the lines already reported for it`); }
+    }
+  }
+
+  if (failed) {
+    // Each line the kernel accepted up to its newline is in the file whole: it leaves the entry, which stays queued
+    // even when empty, so the next try's guard closes a line accepted without its newline.
+    if (accepted > guardBytes && pendingOps.get(absPath) === entry) {
+      entry.content = entry.content.slice(acceptedLineChars(flushed, accepted - guardBytes));
+    }
+    if (accepted > 0) durableFiles.delete(absPath);
+    lastFlushErrno.set(absPath, errnoOf(failure));
+    flushFailures += 1;
+    if (!failingSince.has(absPath)) failingSince.set(absPath, performance.now());
+    console.error(`[DataManager] Flush failed for ${absPath} (will retry):`, failure);
+    scheduleRetry(absPath);
+    return false;
+  }
+
+  retryAttempts.delete(absPath);
+  failingSince.delete(absPath);
+  if (syncFailed) {
+    const errno = errnoOf(syncFailure);
+    durableFiles.delete(absPath);
+    lastFlushErrno.set(absPath, errno);
+    addFailedRange(record, landedAtStart + 1, flushedSeq, errno, false);
+    dropReplacedTries(record, flushedSeq);
+    unconfirmedPaths.add(absPath);
+    logUnconfirmed(absPath, lineCount(flushed), errno);
+  } else {
+    lastFlushErrno.delete(absPath);
+    noteLanded(absPath, record, flushedSeq);
+    flushesLanded += 1;
+    lastLandedAt = performance.now();
+  }
+  // A concurrent append may have grown the entry mid-flush; keep the tail.
+  // An op that replaced the entry meanwhile is flushed next, untrimmed.
+  const cur = pendingOps.get(absPath);
+  if (cur === entry) {
+    entry.content = entry.content.slice(flushed.length);
+    if (entry.content.length === 0) {
+      pendingOps.delete(absPath);
+      landingRecords.delete(absPath);
+    } else {
+      scheduleFlush(absPath); // flush only the remaining tail
+    }
+  } else if (cur) {
+    scheduleFlush(absPath);
+  }
+  return !syncFailed;
+}
+
+/** The characters of text whose lines lie whole in its first acceptedBytes UTF-8 bytes, each up to its newline. */
+function acceptedLineChars(text: string, acceptedBytes: number): number {
+  let chars = 0;
+  let bytes = 0;
+  for (;;) {
+    const newline = text.indexOf('\n', chars);
+    if (newline < 0) return chars;
+    const lineBytes = Buffer.byteLength(text.slice(chars, newline));
+    if (bytes + lineBytes > acceptedBytes) return chars;
+    bytes += lineBytes + 1;
+    chars = newline + 1;
   }
 }
 
@@ -308,52 +593,100 @@ export async function flushAll(): Promise<void> {
   await flushPaths([...pendingOps.keys()]);
 }
 
-export type CancelOutcome = { path: string; outcome: 'landed' } | { path: string; outcome: 'cancelled'; errno: string | null };
+export type CancelOutcome =
+  | { path: string; outcome: 'landed' }
+  | { path: string; outcome: 'cancelled'; errno: string | null }
+  | { path: string; outcome: 'unconfirmed'; errno: string | null; cut: boolean };
+
+/**
+ * cancelQueued's one answer for a path, read from the records its cancel reads, the one it started with first:
+ * 'unconfirmed' when a failed range holds a seq up to seq in the first, or any seq in another, and no whole write or
+ * delete landed after the range's end (the range nearest seq gives the errno and cut); 'landed' when the first
+ * record's landing reaches seq and no entry was dropped, or when nothing was queued at the cancel; else 'cancelled'
+ * with errno.
+ */
+function cancelAnswer(p: string, records: LandingRecord[], seq: number, dropped: boolean, errno: string | null, wholeLanded = 0): CancelOutcome {
+  const [first, ...others] = records;
+  if (!first) return { path: p, outcome: 'landed' };
+  const inFile = (record: LandingRecord) => (record.failed ?? []).filter(range => range.through > wholeLanded);
+  const held = [...inFile(first).filter(range => range.from <= seq), ...others.flatMap(inFile)];
+  if (held.length > 0) {
+    const range = held.reduce((a, b) => (b.through > a.through ? b : a));
+    return { path: p, outcome: 'unconfirmed', errno: range.errno, cut: range.cut };
+  }
+  if (!dropped && first.landed >= seq) return { path: p, outcome: 'landed' };
+  return { path: p, outcome: 'cancelled', errno };
+}
 
 /**
  * Drops these paths' queued ops: waits until no flush of them is on the wire, then answers per path 'landed' when its
- * last op landed meanwhile, or 'cancelled' once it deleted the pending entry and cleared its retry, with the errno of
- * the path's last failed flush. With freeze (a deposition), no new flush of these paths starts from the call on: a
+ * last op landed meanwhile, 'unconfirmed' when lines of it are in the file but the disk did not confirm them (cut
+ * when a try ended inside a line), or 'cancelled' once it deleted the pending entry and cleared its retry, with the
+ * errno of the path's last failed flush. With freeze (a deposition), no new flush of these paths starts from the call on: a
  * path not on the wire is cancelled at once, and one on the wire is awaited and then cancelled or answered landed.
  */
 export async function cancelQueued(paths: string[], sleep: (ms: number) => Promise<void> = delay, options: { freeze?: boolean } = {}): Promise<CancelOutcome[]> {
   const targets = new Map(paths.map(p => [p, pendingOps.get(p)?.seq]));
   // Each target's landing record from the start: an entry gone at the cancel landed only if the record reached its seq.
   const records = new Map<string, LandingRecord>();
+  // A try on the wire at the start under a record a guild drop retired, and the records that start during the wait.
+  const earlier = new Map<string, LandingRecord>();
+  const later = new Map<string, Set<LandingRecord>>();
   for (const p of paths) {
-    if (!pendingOps.has(p)) continue;
-    let record = landingRecords.get(p);
-    if (!record) {
-      record = { landed: 0 };
-      landingRecords.set(p, record);
-    }
+    if (!pendingOps.has(p) || records.has(p)) continue;
+    const record = landingRecords.get(p) ?? startRecord(p);
     records.set(p, record);
+    const onWire = tryRecords.get(p);
+    if (onWire && onWire !== record) earlier.set(p, onWire);
+    const seen = new Set<LandingRecord>();
+    later.set(p, seen);
+    const watches = cancelWatches.get(p) ?? new Set<Set<LandingRecord>>();
+    watches.add(seen);
+    cancelWatches.set(p, watches);
   }
   const cancel = (p: string): CancelOutcome => {
-    const entry = pendingOps.get(p);
     const seq = targets.get(p);
-    if (seq === undefined) return { path: p, outcome: 'landed' };
-    if (!entry) return (records.get(p)?.landed ?? 0) >= seq ? { path: p, outcome: 'landed' } : { path: p, outcome: 'cancelled', errno: null };
-    const errno = lastFlushErrno.get(p) ?? null;
-    pendingOps.delete(p);
-    const record = landingRecords.get(p);
-    if (options.freeze && record) droppedAtDeposition.add(record);
-    landingRecords.delete(p);
+    const started = records.get(p);
+    if (seq === undefined || !started) return cancelAnswer(p, [], 0, false, null);
+    const entry = pendingOps.get(p);
+    const flushErrno = lastFlushErrno.get(p) ?? null;
+    const before = earlier.has(p) ? [earlier.get(p)!] : [];
+    const after = [...later.get(p)!];
+    // A record that started during the wait holds only seqs above the target's: it counts once an entry is dropped.
+    const read = [started, ...before, ...(entry ? after : [])];
+    for (const record of read) {
+      // NB13 C9: a replaced whole write is in the file, and a try that wrote bytes and never landed left them there.
+      failReplacedTries(record, p);
+      if ((record.wrote ?? 0) > record.landed) addFailedRange(record, record.landed + 1, record.wrote ?? 0, flushErrno, true);
+    }
+    const wholeLanded = Math.max(0, ...[started, ...before, ...after].map(record => record.wholeLanded ?? 0));
+    const answer = cancelAnswer(p, read, entry ? Math.max(seq, entry.seq) : seq, !!entry, entry ? flushErrno : null, wholeLanded);
+    const current = landingRecords.get(p);
+    if (answer.outcome === 'unconfirmed') unconfirmedPaths.add(p);
+    if (options.freeze && answer.outcome === 'unconfirmed') droppedAtDeposition.add(started);
+    if (options.freeze && entry && current) droppedAtDeposition.add(current);
+    if (entry) pendingOps.delete(p);
+    if (entry || current === started) landingRecords.delete(p);
     clearRetry(p);
     lastFlushErrno.delete(p);
-    return { path: p, outcome: 'cancelled', errno };
+    return answer;
   };
   const early = new Map<string, CancelOutcome>();
   const held = options.freeze ? paths.filter(p => !frozen.has(p)) : [];
-  if (options.freeze) {
-    for (const p of held) frozen.add(p);
-    for (const p of paths) if (!flushing.has(p)) early.set(p, cancel(p));
-  }
   try {
+    if (options.freeze) {
+      for (const p of held) frozen.add(p);
+      for (const p of paths) if (!flushing.has(p)) early.set(p, cancel(p));
+    }
     while (paths.some(p => flushing.has(p))) await sleep(5);
     return paths.map(p => early.get(p) ?? cancel(p));
   } finally {
     for (const p of held) frozen.delete(p);
+    for (const [p, seen] of later) {
+      const watches = cancelWatches.get(p);
+      watches?.delete(seen);
+      if (watches?.size === 0) cancelWatches.delete(p);
+    }
   }
 }
 
@@ -449,7 +782,6 @@ function refuseWhileStorageFails(absPath: string): void {
 
 export function enqueueWrite(absPath: string, content: string): void {
   refuseWhileStorageFails(absPath);
-  newlineTails.delete(absPath);
   pendingOps.set(absPath, { op: 'write', content, seq: ++opSeq });
   scheduleFlush(absPath);
 }
@@ -473,7 +805,6 @@ export function enqueueAppend(absPath: string, line: string): void {
 
 export function enqueueDelete(absPath: string): void {
   refuseWhileStorageFails(absPath);
-  newlineTails.delete(absPath);
   pendingOps.set(absPath, { op: 'delete', seq: ++opSeq });
   scheduleFlush(absPath);
 }
@@ -488,11 +819,7 @@ export interface FileTicket {
 
 /** The ticket for the op queued on this path now: taken in the enqueue's own synchronous run, or for a delete still queued that an absent delete finds. */
 export function fileTicket(absPath: string): FileTicket {
-  let record = landingRecords.get(absPath);
-  if (!record) {
-    record = { landed: 0 };
-    landingRecords.set(absPath, record);
-  }
+  const record = landingRecords.get(absPath) ?? startRecord(absPath);
   return { kind: 'file', path: absPath, seq: pendingOps.get(absPath)!.seq, record };
 }
 
@@ -508,7 +835,9 @@ export async function confirmFile(ticket: FileTicket, deadlineMs: number): Promi
   const deadline = performance.now() + deadlineMs;
   let stuckAttempts = 0;
   for (;;) {
-    if (ticket.record.landed >= ticket.seq) return 'ok';
+    const state = fileTicketState(ticket);
+    if (state === 'unconfirmed') return 'unavailable';
+    if (state === 'landed') return 'ok';
     // Its record retired without reaching it, or nothing queued: it was dropped.
     if (landingRecords.get(ticket.path) !== ticket.record || !pendingOps.has(ticket.path)) return 'unavailable';
     const left = deadline - performance.now();
@@ -641,6 +970,9 @@ export function dropPendingForGuild(guildId: string): void {
   const prefix = src + path.sep;
   for (const key of [...pendingOps.keys()]) {
     if (key === src || key.startsWith(prefix)) {
+      const record = landingRecords.get(key);
+      // Logged now, while the path still holds the file a graveyard move may take next.
+      if (record) failReplacedTries(record, key);
       pendingOps.delete(key);
       landingRecords.delete(key);
       clearRetry(key);

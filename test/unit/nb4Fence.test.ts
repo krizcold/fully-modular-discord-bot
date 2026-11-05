@@ -13,7 +13,7 @@ afterEach(async () => {
 });
 
 const token: FenceToken = { nodeId: 'node-a', claim: 7, processId: 'p-a', shardId: 2, shardCount: 4 };
-const batch = { upserts: [{ key: { module: 'm', filename: 'a.json' }, doc: '{}' }], deletes: [], appends: [] };
+const batch = { upserts: [{ key: { module: 'm', filename: 'a.json' }, doc: '{}' }], deletes: [], appends: [], flushId: 'f-1' };
 
 function scripted(answer: (sql: string) => unknown) {
   const backend = new PostgresBackend({ url: 'postgres://nobody@127.0.0.1:9/none' });
@@ -21,7 +21,9 @@ function scripted(answer: (sql: string) => unknown) {
   (backend as unknown as { state: string }).state = 'ready';
   const sent: Array<{ sql: string; params?: unknown[] }> = [];
   const client = {
-    query: async (sql: string, params?: unknown[]) => {
+    query: async (q: string | { text: string; values?: unknown[] }, params?: unknown[]) => {
+      const sql = typeof q === 'string' ? q : q.text;
+      params = params ?? (typeof q === 'string' ? undefined : q.values);
       sent.push({ sql: sql.trim(), params });
       const res = answer(sql);
       if (res instanceof Error) throw res;
@@ -48,7 +50,8 @@ describe('the fenced stamp', () => {
     expect(stamps).toHaveLength(1);
     expect(stamps[0].sql).toMatch(/EXISTS \(SELECT 1 FROM smdb_data\.shard_claims c\s+WHERE c\.shard_count = \$5 AND c\.shard_id = \$3 AND c\.claim = \$4 AND c\.holder_process = \$6 AND NOT c\.released\)/);
     expect(stamps[0].sql).toMatch(/ON CONFLICT \(guild_id\) DO UPDATE[\s\S]*WHERE o\.claim <= EXCLUDED\.claim/);
-    expect(stamps[0].params).toEqual(['g1', 'node-a', 2, 7, 4, 'p-a']);
+    expect(stamps[0].params).toEqual(_name === 'flush' ? ['g1', 'node-a', 2, 7, 4, 'p-a', 'f-1'] : ['g1', 'node-a', 2, 7, 4, 'p-a']);
+    if (_name === 'flush') expect(stamps[0].sql).toContain('last_flush = EXCLUDED.last_flush');
   });
 
   it('reclaim carries the claims check on its update and its insert', async () => {

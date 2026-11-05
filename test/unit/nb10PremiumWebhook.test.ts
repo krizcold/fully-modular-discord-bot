@@ -49,6 +49,7 @@ import { failFlushes } from '../helpers/configRig';
 import { webhookAnswer } from '../../src/webui/routes/hopFailure';
 import { cancelQueued, queuedFilePaths } from '../../src/bot/internalSetup/utils/dataBackends/fileBackend';
 import { AUDIT, clearGlobal, gate, jsonOf, linesOf, logged, paidSub, PREMIUM, quiet, rawOf, settleQueue, state, tick, writePremium } from './nb10PremiumRig';
+import { stubAppendHandles } from '../helpers/fileHandleStub';
 
 const role = process.env.BOT_PROCESS_ROLE;
 const asBot = (bot: boolean) => {
@@ -74,17 +75,13 @@ function registerFake(): void {
   getPaymentRegistry().register({ id: 'boost', displayName: 'Boost', capabilities: {}, isConfigured: () => true } as any);
 }
 
-/** Appends to the audit file fail with EIO while `on`, as a disk that accepted the write and failed its flush. */
+/** Writes to the audit file fail with EIO before any byte while `on`. */
 function failingAudit(): { on: boolean; calls: number } {
   const sw = { on: true, calls: 0 };
-  const real = fs.promises.appendFile.bind(fs.promises);
-  vi.spyOn(fs.promises, 'appendFile').mockImplementation((async (p: any, data: any, options?: any) => {
-    if (String(p) === AUDIT) {
-      sw.calls += 1;
-      if (sw.on) throw Object.assign(new Error('EIO: i/o error, write'), { code: 'EIO' });
-    }
-    return real(p, data, options);
-  }) as typeof fs.promises.appendFile);
+  stubAppendHandles().onWrite(AUDIT, () => {
+    sw.calls += 1;
+    return sw.on ? 'EIO' : undefined;
+  });
   return sw;
 }
 
@@ -445,7 +442,7 @@ describe.each([['in the bot', true], ['in the local chain', false]])('test 35, t
     expect(audit.calls).toBeGreaterThan(0);
     expect(jsonOf(PREMIUM).subscriptions.g5.active.providerSubId).toBe('ps5');
     answers503(await send(created('ps5', 'g5')));
-    expect(rawOf(AUDIT)).toBeNull();
+    expect(rawOf(AUDIT) ?? '').toBe('');
     audit.on = false;
     expect(await send(created('ps5', 'g5'))).toMatchObject({ ok: true });
     const lines = installLines();
@@ -503,7 +500,7 @@ describe('test 35 round 4 and round 8 (d): the retry appends the held install li
     spies.error.mockClear();
 
     newProcess();
-    expect(rawOf(AUDIT)).toBeNull();
+    expect(rawOf(AUDIT) ?? '').toBe('');
     expect(await deliver(created('ps1'))).toMatchObject({ ok: true });
     const lines = installLines();
     expect(lines).toHaveLength(1);
