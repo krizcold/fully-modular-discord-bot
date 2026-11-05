@@ -23,7 +23,9 @@ import { getSubscriptionNotifier } from './utils/subscriptionNotifier';
 import { getPaymentRegistry } from './utils/payment/paymentRegistry';
 import { startModuleAutoUpdater } from './utils/moduleAutoUpdater';
 import { loadCredentials } from '../../utils/envLoader';
-import { bootShards } from './fleet/shardBoot';
+import { bootShards, getShardClaims } from './fleet/shardBoot';
+import { stoppedServing } from './utils/servingGate';
+import { runStopSteps } from './utils/stopSteps';
 import { getIngestService } from './ingest/ingestService';
 import { installReplyGate } from './utils/dataBackends/replyGate';
 import { ModuleLoader } from './utils/moduleLoader';
@@ -479,6 +481,24 @@ async function main() {
     await runMaintenanceBoot(boot);
     return;
   }
+
+  // NB4 decisions 12 and 19: the one way this process ends on purpose, installed before anything that can start a
+  // leave; each step runs once what it acts on exists. The claims lane renews through the gateway close and the
+  // drain, then releases.
+  let stopSteps: { client: Client | null; metricsReady: boolean } = { client: null, metricsReady: false };
+  const shutdownHandler = stopHandler(() => runStopSteps({
+    beginStop: () => getShardClaims()?.beginStop(),
+    stopSamplers: () => { if (stopSteps.metricsReady) stopSamplers(); },
+    closeGateway: () => getIngestService().close('shutting down'),
+    flushTotals: () => { if (stopSteps.metricsReady && !isMaintenanceGateClosed()) getMetricsCollector().flushTotals(); },
+    // Postgres mode gets a wider bound: a coalesced Working Set can hold more dirty state than the file queue.
+    drain: () => drainForExit(getWorkingSet() ? 30000 : 5000),
+    finishStop: async () => { await getShardClaims()?.finishStop(); },
+    exit: code => process.exit(code),
+  }));
+  process.on('SIGTERM', () => void shutdownHandler());
+  process.on('SIGINT', () => void shutdownHandler());
+
   setupMaintenanceIPCAtBoot();
 
   // Data backend boot runs FIRST so the readiness driver exists when the
@@ -631,8 +651,13 @@ async function main() {
     console.error('[Bot] Error during panel manager initialization:', error);
   }
 
+  const NOT_STARTED = '[Shards] Module initializers, panel recovery and the module auto-updater do not start: this process stopped serving its shards';
   client.once('clientReady', async () => {
     console.log(`Logged in as ${client.user?.tag}!`);
+    if (stoppedServing()) {
+      console.log(NOT_STARTED);
+      return;
+    }
     if (isMaintenanceGateClosed()) {
       console.log('[Maintenance] Module initializers, panel recovery and the module auto-updater start with the restart that ends maintenance');
       return;
@@ -641,6 +666,10 @@ async function main() {
     // Module initializers bulk-read guild data; hold them behind the same
     // startup barrier as the clientReady event fan-out (no-op in file mode).
     await awaitDataStartupBarrier();
+    if (stoppedServing()) {
+      console.log(NOT_STARTED);
+      return;
+    }
     if (isMaintenanceGateClosed()) {
       console.log('[Maintenance] Module initializers, panel recovery and the module auto-updater start with the restart that ends maintenance');
       return;
@@ -664,6 +693,10 @@ async function main() {
       console.error('[Bot] Error recovering persistent panels:', error);
     }
 
+    if (stoppedServing()) {
+      console.log('[Shards] Panel recovery and the module auto-updater stopped: this process stopped serving its shards');
+      return;
+    }
     // Start module auto-update scheduler (checks every 30min if enabled).
     startModuleAutoUpdater(client);
   });
@@ -723,6 +756,7 @@ async function main() {
   const metrics = getMetricsCollector();
   metrics.seedTotals();
   startSamplers(client);
+  stopSteps = { client, metricsReady: true };
 
   // Graveyard TTL sweep: at boot and every 24h. unref() so it never keeps the
   // process alive.
@@ -732,27 +766,7 @@ async function main() {
   }, 24 * 60 * 60 * 1000);
   graveyardTimer.unref();
 
-  const shutdownHandler = stopHandler(async () => {
-    stopSamplers();
-    // No event is handled while the writes drain: a gateway left up keeps
-    // taking writes the drain may never reach. Bounded, since a destroy
-    // stalls on a shard caught mid-connect.
-    await Promise.race([
-      getIngestService().close('shutting down').catch(err => console.warn('[clientInitializer] Could not close the gateway on shutdown:', err)),
-      new Promise(resolve => setTimeout(resolve, 2000)),
-    ]);
-    if (!isMaintenanceGateClosed()) metrics.flushTotals(); // writes via saveData, so it must precede the drain
-    // Postgres mode gets a wider bound: a coalesced Working Set can hold more
-    // dirty state than the file queue, and losing a fenced flush window costs
-    // real writes.
-    const drainMs = getWorkingSet() ? 30000 : 5000;
-    await drainForExit(drainMs);
-    process.exit(0);
-  });
-  process.on('SIGTERM', () => void shutdownHandler());
-  process.on('SIGINT', () => void shutdownHandler());
-
-  // No identify before the boot has its claim; a refused data layer logs in with no claim and its gates closed.
+  // No identify without a held claim; a Postgres process holding none logs in nothing.
   markDiscordStarted();
   fleet.startIngest(process.env.DISCORD_TOKEN);
 }

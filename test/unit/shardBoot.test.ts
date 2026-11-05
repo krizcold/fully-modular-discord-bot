@@ -62,7 +62,8 @@ describe('shardBoot runs every shard in this process', () => {
     expect(h.snapshots).toHaveLength(1);
     expect(h.snapshots[0]).toEqual({
       nodeId: 'node-a',
-      claim: null,
+      processId: null,
+      claims: { 0: null, 1: null, 2: null, 3: null },
       shardCount: 4,
       shardIds: [0, 1, 2, 3],
     });
@@ -87,6 +88,7 @@ describe('shardBoot runs every shard in this process', () => {
     expect(state.shardCount).toBe(4);
     expect(state.leases.map(l => l.shardId).sort()).toEqual([0, 1, 2, 3]);
     expect(state.shardTable.map(s => s.nodeId)).toEqual(['node-a', 'node-a', 'node-a', 'node-a']);
-    expect(state.claim).toBeNull();
+    expect(state.processId).toBeNull();
+    expect(state.claims).toEqual([]);
   });
 });

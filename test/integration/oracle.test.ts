@@ -22,18 +22,23 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const ORACLE = path.join(here, '../oracle/oracle.mjs');
 const CHECK = path.join(here, '../oracle/check.mjs');
 const GUILD = '123456789012345678';
+const SHARD_CLAIMS_DDL = `CREATE TABLE IF NOT EXISTS smdb_data.shard_claims (shard_count integer NOT NULL, shard_id integer NOT NULL,
+  claim bigint NOT NULL, holder_process text NOT NULL, holder_node text, released boolean NOT NULL DEFAULT false, PRIMARY KEY (shard_count, shard_id))`;
 
 let container: StartedPostgreSqlContainer;
 let pool: Pool;
 let forkPool: Pool;
 let dir: string;
 
-function runNode(args: string[], input?: string): Promise<{ code: number | null; stdout: string; stderr: string }> {
+function runNode(args: string[], input?: string, tap?: { stdout: string }): Promise<{ code: number | null; stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, args, { stdio: ['pipe', 'pipe', 'pipe'] });
     let stdout = '';
     let stderr = '';
-    child.stdout.on('data', chunk => { stdout += chunk; });
+    child.stdout.on('data', chunk => {
+      stdout += chunk;
+      if (tap) tap.stdout = stdout;
+    });
     child.stderr.on('data', chunk => { stderr += chunk; });
     child.on('error', reject);
     child.on('close', code => resolve({ code, stdout, stderr }));
@@ -43,6 +48,33 @@ function runNode(args: string[], input?: string): Promise<{ code: number | null;
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 const file = (name: string) => path.join(dir, name);
+
+// A writer the test stops runs until its log holds what the test needs, so a
+// loaded machine makes a run longer, never thinner; this duration only ends a
+// writer whose test failed before stopping it.
+const BACKSTOP_S = '60';
+// Past this wait the writer is stopped anyway and the test's own checks fail.
+const UNTIL_MS = 20_000;
+const logOf = (log: string) => () => (fs.existsSync(log) ? fs.readFileSync(log, 'utf8') : '');
+
+async function until(logs: (() => string)[], enough: (events: any[][]) => boolean): Promise<void> {
+  const began = Date.now();
+  while (!enough(logs.map(text => parseLog(text()))) && Date.now() - began < UNTIL_MS) await sleep(50);
+}
+
+const started = (events: any[]) => events.some(e => e.t === 'start');
+const ackedIn = (events: any[]) => events.filter(e => e.t === 'ans' && e.cls === 'ACKED');
+const marked = (events: any[], label: string) => events.find(e => e.t === 'mark' && e.label === label);
+// Acknowledged answers after a begin mark, the ones the checker counts in that window.
+const ackedSince = (events: any[], label: string) => {
+  const begin = marked(events, label);
+  return begin ? ackedIn(events).filter(e => e.at >= begin.at).length : 0;
+};
+// Sends whose answer is in the log.
+const answeredSends = (events: any[]) => {
+  const answers = new Map(events.filter(e => e.t === 'ans').map(e => [e.id, e]));
+  return events.filter(e => e.t === 'send' && answers.has(e.id)).map(e => ({ ...e, ans: answers.get(e.id) }));
+};
 
 async function psql(db: string, sql: string): Promise<string> {
   const r = await container.exec(['psql', '-U', container.getUsername(), '-d', db, '-v', 'ON_ERROR_STOP=1', '-At', '-c', sql]);
@@ -62,11 +94,18 @@ async function dump(db: string, run: string, name: string): Promise<string> {
   return file(name);
 }
 
-async function write(run: string, lanes: string[], extra: string[], marks?: () => Promise<void>): Promise<string> {
+// With stopFile (the writer's --marks), a stop line follows the marks callback however it ends.
+async function write(run: string, lanes: string[], extra: string[], marks?: (log: () => string) => Promise<void>, stopFile?: string): Promise<string> {
   const log = file(`${run}.jsonl`);
   const [r] = await Promise.all([
     runNode([ORACLE, 'write', '--run', run, '--guild', GUILD, ...lanes.flatMap(l => ['--lane', l]), '--log', log, ...extra]),
-    marks ? marks() : Promise.resolve(),
+    (async () => {
+      try {
+        if (marks) await marks(logOf(log));
+      } finally {
+        if (stopFile) fs.appendFileSync(stopFile, 'stop\n');
+      }
+    })(),
   ]);
   expect(r.stderr).toBe('');
   expect(r.code).toBe(0);
@@ -128,13 +167,15 @@ describe('the data-loss oracle end to end', () => {
     fs.writeFileSync(marks, '');
     try {
       cleanLog = await write('clean', [`a=${master.url}`, `b=${worker.url}`],
-        ['--duration', '4', '--rate', '25', '--limiter', 'off', '--hot', '2', '--read-every', '3', '--max-size', '2048', '--timeout', '400', '--seed', '7', '--marks', marks],
-        async () => {
-          await sleep(1000);
+        ['--duration', BACKSTOP_S, '--rate', '25', '--limiter', 'off', '--hot', '2', '--read-every', '3', '--max-size', '2048', '--timeout', '400', '--seed', '7', '--marks', marks],
+        async log => {
+          await until([log], ([e]) => ackedIn(e).length > 0);
           fs.appendFileSync(marks, 'begin burst\n');
-          await sleep(1500);
+          await until([log], ([e]) => ackedSince(e, 'begin burst') >= 3);
           fs.appendFileSync(marks, 'end burst\n');
-        });
+          await until([log], ([e]) => marked(e, 'end burst') && e.some(x => x.t === 'read')
+            && new Set(e.filter(x => x.t === 'ans').map(x => x.cls)).size === 4);
+        }, marks);
       for (const [name, app] of [['app-a', master], ['app-b', worker]] as const) {
         const r = await runNode([ORACLE, 'read', '--log', cleanLog, '--target', app.url, '--name', name, '--limiter', 'off', '--out', file(`clean-${name}.jsonl`)]);
         expect(r.code).toBe(0);
@@ -148,7 +189,7 @@ describe('the data-loss oracle end to end', () => {
     expect(classes(cleanLog)).toEqual(new Set(['ACKED', 'HELD', 'REFUSED', 'UNKNOWN']));
     const fleetText = fs.readFileSync(file('clean-fleet-app-a.json'), 'utf8');
     expect(fleetText).not.toContain('hunter2');
-    expect(JSON.parse(fleetText).state.leases).toEqual([{ shardId: 0 }]);
+    expect(JSON.parse(fleetText).state.leases).toEqual([{ shardId: 0, claim: null }]);
 
     const db = await dump('test', 'clean', 'clean-db.jsonl');
     const r = await check(['--log', cleanLog, '--db', `db=${db}`, '--app', file('clean-app-a.jsonl'), '--app', file('clean-app-b.jsonl'),
@@ -196,10 +237,17 @@ describe('the data-loss oracle end to end', () => {
     };
     const staleKey = 'faults-h0.json';
     const app = await startFakeApp({ pools: [pool], writeFault, deleteFault, staleRead: key => key === staleKey });
+    const marks = file('faults-marks.txt');
+    fs.writeFileSync(marks, '');
+    // A read of the hot doc served an older version than one acknowledged before it.
+    const staleSeen = (e: any[]) => e.some(r => r.t === 'read' && r.key === staleKey && r.s === 'present'
+      && answeredSends(e).some(w => w.key === staleKey && w.ans.cls === 'ACKED' && w.ans.at < r.at0 && w.c > r.c));
     let log = '';
     try {
       log = await write('faults', [`a=${app.url}`, `b=${app.url}`],
-        ['--duration', '3', '--rate', '25', '--limiter', 'off', '--hot', '1', '--delete-ratio', '0.2', '--read-every', '2', '--max-size', '1024', '--seed', '11']);
+        ['--duration', BACKSTOP_S, '--rate', '25', '--limiter', 'off', '--hot', '1', '--delete-ratio', '0.2', '--read-every', '2', '--max-size', '1024', '--seed', '11', '--marks', marks],
+        log => until([log], ([e]) => expected.size === 5 && staleSeen(e)
+          && [...expected].every(([k, v]) => answeredSends(e).some(s => s.key === k && s.op === (v === 'RESURRECTED' ? 'delete' : 'write')))), marks);
     } finally {
       await app.close();
     }
@@ -220,9 +268,15 @@ describe('the data-loss oracle end to end', () => {
     // Odd unique docs go to the second database, everything else to the first.
     const route = (key: string) => Number(/-u(\d+)\.json$/.exec(key)?.[1] ?? 0) % 2;
     const app = await startFakeApp({ pools: [pool, forkPool], route });
+    const marks = file('fork-marks.txt');
+    fs.writeFileSync(marks, '');
     let log = '';
     try {
-      log = await write('fork', [`a=${app.url}`], ['--duration', '2', '--rate', '25', '--limiter', 'off', '--hot', '0', '--delete-ratio', '0', '--seed', '3']);
+      log = await write('fork', [`a=${app.url}`], ['--duration', BACKSTOP_S, '--rate', '25', '--limiter', 'off', '--hot', '0', '--delete-ratio', '0', '--seed', '3', '--marks', marks],
+        log => until([log], ([e]) => {
+          const sides = new Set(answeredSends(e).filter(s => s.ans.cls === 'ACKED').map(s => route(s.key)));
+          return sides.size === 2 && ackedIn(e).length >= 3;
+        }), marks);
     } finally {
       await app.close();
     }
@@ -243,12 +297,14 @@ describe('the data-loss oracle end to end', () => {
     try {
       // Payloads up to ten times the body limit, each cut to fit before it is
       // sent, and a window that bursts until the limiter's reserve is spent.
-      log = await write('limits', [`a=${app.url}`], ['--duration', '8', '--max-size', '100000', '--seed', '5', '--marks', marks], async () => {
-        await sleep(1000);
+      log = await write('limits', [`a=${app.url}`], ['--duration', BACKSTOP_S, '--max-size', '100000', '--seed', '5', '--marks', marks], async log => {
+        await until([log], ([e]) => started(e));
         fs.appendFileSync(marks, 'begin burst\n');
-        await sleep(5000);
+        const began = Date.now();
+        await until([log], ([e]) => Date.now() - began >= 5000 && ackedSince(e, 'begin burst') >= 3);
         fs.appendFileSync(marks, 'end burst\n');
-      });
+        await until([log], ([e]) => marked(e, 'end burst') && e.some(x => x.t === 'send' && x.size > 5000));
+      }, marks);
     } finally {
       await app.close();
     }
@@ -264,9 +320,12 @@ describe('the data-loss oracle end to end', () => {
 
   it('reads and cleans up at the web UI rate limit, past its burst of 10', async () => {
     const open = await startFakeApp({ pools: [pool] });
+    const marks = file('pace-marks.txt');
+    fs.writeFileSync(marks, '');
     let log = '';
     try {
-      log = await write('pace', [`a=${open.url}`], ['--duration', '3', '--rate', '10', '--limiter', 'off', '--hot', '0', '--delete-ratio', '0', '--read-every', '0', '--seed', '9']);
+      log = await write('pace', [`a=${open.url}`], ['--duration', BACKSTOP_S, '--rate', '10', '--limiter', 'off', '--hot', '0', '--delete-ratio', '0', '--read-every', '0', '--seed', '9', '--marks', marks],
+        log => until([log], ([e]) => e.filter(x => x.t === 'send').length > 15), marks);
     } finally {
       await open.close();
     }
@@ -324,15 +383,17 @@ describe('the data-loss oracle end to end', () => {
 
   it('judges two writers on one run, each with its own log', async () => {
     const app = await startFakeApp({ pools: [pool] });
-    let logs: string[] = [];
+    const marks = file('two-marks.txt');
+    fs.writeFileSync(marks, '');
+    const logs = ['a', 'b'].map(lane => file(`two-${lane}.jsonl`));
     try {
-      logs = await Promise.all(['a', 'b'].map(async lane => {
-        const out = file(`two-${lane}.jsonl`);
-        const r = await runNode([ORACLE, 'write', '--run', 'two', '--guild', GUILD, '--lane', `${lane}=${app.url}`, '--log', out,
-          '--duration', '3', '--rate', '20', '--limiter', 'off', '--hot', '1', '--seed', lane === 'a' ? '1' : '2']);
-        expect(r.code).toBe(0);
-        return out;
-      }));
+      // Both writers poll one marks file; each runs until both logs hold a read that found its doc.
+      const [results] = await Promise.all([
+        Promise.all(['a', 'b'].map((lane, i) => runNode([ORACLE, 'write', '--run', 'two', '--guild', GUILD, '--lane', `${lane}=${app.url}`, '--log', logs[i],
+          '--duration', BACKSTOP_S, '--rate', '20', '--limiter', 'off', '--hot', '1', '--seed', lane === 'a' ? '1' : '2', '--marks', marks]))),
+        until(logs.map(logOf), each => each.every(e => e.some(x => x.t === 'read' && x.s === 'present'))).finally(() => fs.appendFileSync(marks, 'stop\n')),
+      ]);
+      for (const r of results) expect(r.code).toBe(0);
       // A read line names its own lane; the lane the served content names goes under `by`.
       const reads = logs.map((l, i) => parseLog(fs.readFileSync(l, 'utf8')).filter(e => e.t === 'read').map(e => ({ ...e, own: ['a', 'b'][i] })));
       expect(reads.flat().every(e => e.lane === e.own)).toBe(true);
@@ -361,10 +422,16 @@ describe('the data-loss oracle end to end', () => {
 
   it('runs piped into node with no checkout, its log on stdout', async () => {
     const app = await startFakeApp({ pools: [pool] });
+    const marks = file('piped-marks.txt');
+    fs.writeFileSync(marks, '');
+    const tap = { stdout: '' };
     let r;
     try {
-      r = await runNode(['--input-type=module', '-', 'write', '--run', 'piped', '--guild', GUILD, '--lane', `a=${app.url}`, '--duration', '1', '--rate', '20'],
-        fs.readFileSync(ORACLE, 'utf8'));
+      [r] = await Promise.all([
+        runNode(['--input-type=module', '-', 'write', '--run', 'piped', '--guild', GUILD, '--lane', `a=${app.url}`, '--duration', BACKSTOP_S, '--rate', '20', '--marks', marks],
+          fs.readFileSync(ORACLE, 'utf8'), tap),
+        until([() => tap.stdout], ([e]) => ackedIn(e).length >= 3).finally(() => fs.appendFileSync(marks, 'stop\n')),
+      ]);
     } finally {
       await app.close();
     }
@@ -396,18 +463,19 @@ describe('the data-loss oracle end to end', () => {
     const db = await dump('test', 'clean', 'twice-db.jsonl');
     const fleets = ['--fleet', file('twice-m.json'), '--fleet', file('twice-w.json')];
     const r = await check(['--log', cleanLog, '--db', `db=${db}`, ...fleets, '--k', '3']);
-    expect(r.result.verdicts.some((v: any) => v.v === 'CONTROL' && /shard 1 is leased to 2 nodes/.test(v.detail))).toBe(true);
+    expect(r.result.verdicts.some((v: any) => v.v === 'CONTROL' && /shard 1 is leased to 2 processes/.test(v.detail))).toBe(true);
     // Seen again in a second set, listed the other way round, it still counts.
     const again = await check(['--log', cleanLog, '--db', `db=${db}`, ...fleets, '--fleet-again', file('twice-w.json'), '--fleet-again', file('twice-m.json'), '--k', '3']);
-    expect(again.result.verdicts.filter((v: any) => v.v === 'CONTROL').map((v: any) => v.detail)).toEqual(['shard 1 is leased to 2 nodes at once: m, w']);
+    expect(again.result.verdicts.filter((v: any) => v.v === 'CONTROL').map((v: any) => v.detail)).toEqual(['shard 1 is leased to 2 processes at once: m, w']);
     expect(again.code).toBe(1);
     expect((await runNode([CHECK, '--log', cleanLog, '--db', `db=${db}`, '--fleet-again', file('twice-m.json')])).code).toBe(64);
   });
 
-  it('names two nodes with one claim, and a claim sequence that went back below a live claim', async () => {
-    const state = (nodeId: string, shardId: number, claim: number) => () => ({ initialized: true, nodeId, shardCount: 2, claim, leases: [{ shardId }], shardTable: [], guildMap: {} });
-    const m = await startFakeApp({ pools: [pool], fleetState: state('m', 0, 7) });
-    const w = await startFakeApp({ pools: [pool], fleetState: state('w', 1, 7) });
+  it('names one claim reported by two processes, and a claim sequence that went back below a live claim', async () => {
+    const state = (nodeId: string, processId: string, shardId: number, claim: number) => () =>
+      ({ initialized: true, nodeId, processId, shardCount: 2, leases: [{ shardId, leaseId: `lease-${shardId}`, claim }], shardTable: [], guildMap: {} });
+    const m = await startFakeApp({ pools: [pool], fleetState: state('m', 'p1', 0, 7) });
+    const w = await startFakeApp({ pools: [pool], fleetState: state('w', 'q1', 1, 7) });
     try {
       for (const [name, app] of [['m', m], ['w', w]] as const) {
         expect((await runNode([ORACLE, 'fleet', '--target', app.url, '--name', name, '--out', file(`claim-${name}.json`)])).code).toBe(0);
@@ -416,35 +484,140 @@ describe('the data-loss oracle end to end', () => {
       await m.close();
       await w.close();
     }
-    expect(JSON.parse(fs.readFileSync(file('claim-m.json'), 'utf8')).state.claim).toBe(7);
+    const reduced = JSON.parse(fs.readFileSync(file('claim-m.json'), 'utf8')).state;
+    expect(reduced.processId).toBe('p1');
+    expect(reduced.leases).toEqual([{ shardId: 0, claim: 7 }]);
     await psql('test', 'CREATE TABLE IF NOT EXISTS smdb_data.guild_ownership (guild_id text PRIMARY KEY, claim bigint NOT NULL)');
     await psql('test', 'CREATE SEQUENCE IF NOT EXISTS smdb_data.claim_seq');
+    await psql('test', SHARD_CLAIMS_DDL);
     await psql('test', "INSERT INTO smdb_data.guild_ownership (guild_id, claim) VALUES ('10', 4), ('11', 5)");
     await psql('test', "SELECT setval('smdb_data.claim_seq', 3)");
     const listing = await runNode([ORACLE, 'sql', 'ownership']);
     expect(listing.code).toBe(0);
     fs.writeFileSync(file('ownership.jsonl'), await psql('test', listing.stdout.trim()));
-    const db = await dump('test', 'clean', 'claim-db.jsonl');
-    const r = await check(['--log', cleanLog, '--db', `db=${db}`, '--fleet', file('claim-m.json'), '--fleet', file('claim-w.json'), '--ownership', file('ownership.jsonl'), '--k', '3']);
+    // The copy taken before the bite test lowered and deleted clean docs: these checks judge the control facts.
+    const db = file('clean-db.jsonl');
+    const judged = (ownership: string) => check(['--log', cleanLog, '--db', `db=${db}`, '--fleet', file('claim-m.json'), '--fleet', file('claim-w.json'), '--ownership', ownership, '--k', '3']);
+    const r = await judged(file('ownership.jsonl'));
     expect(r.result.verdicts.filter((v: any) => v.v === 'CONTROL').map((v: any) => v.detail)).toEqual([
-      'nodes m, w report the same claim 7',
-      'a live node holds claim 7, and the next boot would draw claim 6 (claim_seq at 3, called; highest guild_ownership claim 5): the claim sequence went back',
+      'claim 7 is reported 2 times: shard 0 by m (process p1), shard 1 by w (process q1)',
+      'a live process holds claim 7, and the next take would draw claim 6 (claim_seq at 3, called; highest guild_ownership claim 5; highest shard_claims claim none): the claim sequence went back',
     ]);
-    // A later boot that took claim 9 and stopped is normal.
+    expect(r.result.notes).toContain('leases were not compared with shard_claims: no claims listing was given (--claims)');
+    expect(r.code).toBe(1);
+    // A later take of claim 9 that stopped is normal, whether its claim is left in guild_ownership or in shard_claims.
     await psql('test', "INSERT INTO smdb_data.guild_ownership (guild_id, claim) VALUES ('12', 9)");
     await psql('test', "SELECT setval('smdb_data.claim_seq', 9)");
     fs.writeFileSync(file('ownership-later.jsonl'), await psql('test', listing.stdout.trim()));
-    const later = await check(['--log', cleanLog, '--db', `db=${db}`, '--fleet', file('claim-m.json'), '--fleet', file('claim-w.json'), '--ownership', file('ownership-later.jsonl'), '--k', '3']);
-    expect(later.result.verdicts.filter((v: any) => v.v === 'CONTROL').map((v: any) => v.detail)).toEqual(['nodes m, w report the same claim 7']);
-    expect(r.code).toBe(1);
+    const only = ['claim 7 is reported 2 times: shard 0 by m (process p1), shard 1 by w (process q1)'];
+    expect((await judged(file('ownership-later.jsonl'))).result.verdicts.map((v: any) => v.detail)).toEqual(only);
+    await psql('test', "DELETE FROM smdb_data.guild_ownership WHERE guild_id = '12'");
+    await psql('test', "SELECT setval('smdb_data.claim_seq', 3)");
+    await psql('test', "INSERT INTO smdb_data.shard_claims (shard_count, shard_id, claim, holder_process, released) VALUES (2, 1, 9, 'z1', true)");
+    fs.writeFileSync(file('ownership-claims.jsonl'), await psql('test', listing.stdout.trim()));
+    expect(JSON.parse(fs.readFileSync(file('ownership-claims.jsonl'), 'utf8'))).toEqual({ last: 3, called: true, highest: 5, claims: 9 });
+    expect((await judged(file('ownership-claims.jsonl'))).result.verdicts.map((v: any) => v.detail)).toEqual(only);
+    await psql('test', 'DELETE FROM smdb_data.shard_claims');
+  });
+
+  it('compares each lease with the shard claims listing, and counts only what both reads show', async () => {
+    await psql('test', SHARD_CLAIMS_DDL);
+    await psql('test', 'DELETE FROM smdb_data.shard_claims');
+    const listingSql = await runNode([ORACLE, 'sql', 'claims']);
+    expect(listingSql.code).toBe(0);
+    let leases: Record<string, { processId: string; held: Record<number, number> }> = {};
+    const state = (nodeId: string) => () => {
+      const { processId, held } = leases[nodeId];
+      const shards = Object.keys(held).map(Number);
+      return { initialized: true, nodeId, processId, shardCount: 2, leases: shards.map(shardId => ({ shardId, leaseId: `lease-${shardId}`, claim: held[shardId] })), shardTable: [], guildMap: {} };
+    };
+    const rows = async (...list: [number, number, string, boolean?, string?][]) => {
+      await psql('test', 'DELETE FROM smdb_data.shard_claims');
+      for (const [shard, claim, process, released, node] of list) {
+        await psql('test', `INSERT INTO smdb_data.shard_claims (shard_count, shard_id, claim, holder_process, holder_node, released) VALUES (2, ${shard}, ${claim}, '${process}', ${node ? `'${node}'` : 'NULL'}, ${released === true})`);
+      }
+    };
+    const m = await startFakeApp({ pools: [pool], fleetState: state('m') });
+    const w = await startFakeApp({ pools: [pool], fleetState: state('w') });
+    // One read: each node's control facts, then the listing.
+    const read = async (tag: string) => {
+      for (const [name, app] of [['m', m], ['w', w]] as const) {
+        expect((await runNode([ORACLE, 'fleet', '--target', app.url, '--name', name, '--out', file(`${tag}-${name}.json`)])).code).toBe(0);
+      }
+      fs.writeFileSync(file(`${tag}-claims.jsonl`), await psql('test', listingSql.stdout.trim()));
+    };
+    try {
+      leases = { m: { processId: 'p1', held: { 0: 11 } }, w: { processId: 'q1', held: { 1: 12 } } };
+      await rows([0, 11, 'p1'], [1, 12, 'q1']);
+      await read('r1');
+      // A legal takeover between the reads: p1 lapsed and stopped serving, q1 took shard 0.
+      leases = { m: { processId: 'p1', held: {} }, w: { processId: 'q1', held: { 0: 13, 1: 12 } } };
+      await rows([0, 13, 'q1'], [1, 12, 'q1']);
+      await read('r2');
+      // q1's clean stop released its rows while its last fleet read still showed them.
+      await rows([0, 13, 'q1', true], [1, 12, 'q1', true]);
+      await read('r2b');
+      // w's next process q2 took both shards.
+      leases = { m: { processId: 'p1', held: {} }, w: { processId: 'q2', held: { 0: 14, 1: 15 } } };
+      await rows([0, 14, 'q2'], [1, 15, 'q2']);
+      await read('r3');
+      // p1 serves shard 0 under a claim the table does not hold, and q2 no longer reports it.
+      leases = { m: { processId: 'p1', held: { 0: 16 } }, w: { processId: 'q2', held: { 1: 15 } } };
+      await read('r4');
+      await read('r5');
+      // Both serve shard 0.
+      leases = { m: { processId: 'p1', held: { 0: 16 } }, w: { processId: 'q2', held: { 0: 14, 1: 15 } } };
+      await read('r6');
+      leases = { m: { processId: 'p1', held: {} }, w: { processId: 'q2', held: { 1: 15 } } };
+      await rows([1, 15, 'q2', false, 'w']);
+      await read('h1');
+      // q2's release hands shard 1 to m while w's last fleet read still shows the lease.
+      await rows([1, 15, 'q2', true, 'm']);
+      await read('h2');
+      // m's next process p2 took the row kept for its node.
+      leases = { m: { processId: 'p2', held: { 1: 17 } }, w: { processId: 'q2', held: {} } };
+      await rows([1, 17, 'p2', false, 'm']);
+      await read('h3');
+    } finally {
+      await m.close();
+      await w.close();
+      await psql('test', 'DELETE FROM smdb_data.shard_claims');
+    }
+    expect(JSON.parse(fs.readFileSync(file('r1-claims.jsonl'), 'utf8'))).toEqual({
+      rows: [{ count: 2, shard: 0, claim: 11, process: 'p1', released: false }, { count: 2, shard: 1, claim: 12, process: 'q1', released: false }],
+    });
+    const db = file('clean-db.jsonl');
+    const judged = (a: string, b: string) => check(['--log', cleanLog, '--db', `db=${db}`, '--fleet', file(`${a}-m.json`), '--fleet', file(`${a}-w.json`),
+      '--fleet-again', file(`${b}-m.json`), '--fleet-again', file(`${b}-w.json`), '--claims', file(`${a}-claims.jsonl`), '--claims', file(`${b}-claims.jsonl`), '--k', '3']);
+    const stale = 'm (process p1) holds a lease on shard 0 under claim 16, which shard_claims does not hold for it';
+    for (const [a, b] of [['r1', 'r2'], ['r2', 'r3'], ['r2b', 'r3'], ['r3', 'r4'], ['h1', 'h2'], ['h2', 'h3']]) {
+      const r = await judged(a, b);
+      expect(r.result.verdicts).toEqual([]);
+      expect(r.code).toBe(0);
+    }
+    expect((await judged('r2b', 'r3')).result.notes.some((n: string) => /w \(process q1\) holds a lease on shard 0 under claim 13, which shard_claims does not hold for it/.test(n))).toBe(true);
+    const lasting = await judged('r4', 'r5');
+    expect(lasting.result.verdicts.map((v: any) => v.detail)).toEqual([stale]);
+    expect(lasting.code).toBe(1);
+    const both = await judged('r6', 'r6');
+    expect(both.result.verdicts.map((v: any) => v.detail)).toEqual(['shard 0 is leased to 2 processes at once: m (process p1), w (process q2)', stale]);
+    // One listing for one set of facts.
+    const one = await check(['--log', cleanLog, '--db', `db=${db}`, '--fleet', file('r4-m.json'), '--fleet', file('r4-w.json'), '--claims', file('r4-claims.jsonl'), '--k', '3']);
+    expect(one.result.verdicts.map((v: any) => v.detail)).toEqual([stale]);
+    expect((await runNode([CHECK, '--log', cleanLog, '--db', `db=${db}`, '--fleet', file('r4-m.json'), '--claims', file('r4-claims.jsonl'), '--claims', file('r5-claims.jsonl')])).code).toBe(64);
   });
 
   it('refuses a streamed copy cut short, and judges the writer\'s own file', async () => {
     const app = await startFakeApp({ pools: [pool] });
+    const marks = file('sinks-marks.txt');
+    fs.writeFileSync(marks, '');
     let r;
     try {
-      r = await runNode([ORACLE, 'write', '--run', 'sinks', '--guild', GUILD, '--lane', `a=${app.url}`, '--log', file('sinks.jsonl'), '--log', '-',
-        '--duration', '1', '--rate', '20', '--limiter', 'off']);
+      [r] = await Promise.all([
+        runNode([ORACLE, 'write', '--run', 'sinks', '--guild', GUILD, '--lane', `a=${app.url}`, '--log', file('sinks.jsonl'), '--log', '-',
+          '--duration', BACKSTOP_S, '--rate', '20', '--limiter', 'off', '--marks', marks]),
+        until([logOf(file('sinks.jsonl'))], ([e]) => ackedIn(e).length >= 3).finally(() => fs.appendFileSync(marks, 'stop\n')),
+      ]);
     } finally {
       await app.close();
     }
@@ -473,8 +646,9 @@ describe('the data-loss oracle end to end', () => {
     let log = '';
     try {
       // The marks file is polled once a minute here, so only the poll at the stop can see these lines.
-      log = await write('last', [`a=${app.url}`], ['--duration', '2', '--limiter', 'off', '--marks', marks, '--marks-every', '60000'], async () => {
-        await sleep(500);
+      // A writer takes its marks file's size at its start, so lines written before its start line are never read.
+      log = await write('last', [`a=${app.url}`], ['--duration', '2', '--limiter', 'off', '--marks', marks, '--marks-every', '60000'], async log => {
+        await until([log], ([e]) => started(e));
         fs.appendFileSync(marks, 'begin x\nend x\n');
       });
     } finally {
@@ -492,8 +666,8 @@ describe('the data-loss oracle end to end', () => {
     const began = Date.now();
     let log = '';
     try {
-      log = await write('stopline', [`a=${app.url}`], ['--duration', '60', '--rate', '20', '--limiter', 'off', '--marks', marks], async () => {
-        await sleep(500);
+      log = await write('stopline', [`a=${app.url}`], ['--duration', '60', '--rate', '20', '--limiter', 'off', '--marks', marks], async log => {
+        await until([log], ([e]) => started(e));
         fs.appendFileSync(marks, 'begin x\nend x\nstop\n');
       });
     } finally {

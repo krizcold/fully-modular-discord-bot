@@ -20,6 +20,7 @@ const USAGE = `check.mjs --log FILE [--log FILE ...]
   [--fleet-again FILE ...] a second set taken after the first: only a CONTROL in both sets counts
   [--no-fleet]           only where the run has no fleet to check (a single local node)
   [--ownership FILE]     the claim sequence listing (oracle.mjs sql ownership), taken after the fleet reads: a live claim at or above the next draw is CONTROL
+  [--claims FILE]        the shard claims listing (oracle.mjs sql claims), taken after --fleet; a second one, taken after --fleet-again, goes with that set: a lease whose claim shard_claims does not hold for its process is CONTROL
   [--window NAME ...]    a window the scenario must have marked
   [--k N (5)]            acknowledged operations needed in each marked window
   [--out FILE]           the full result as JSON`;
@@ -35,7 +36,7 @@ function named(spec) {
 export function check(argv) {
   const a = parseArgs(argv, {
     log: 'many', db: 'many', lag: 'many', app: 'many', agree: 'one', fleet: 'many', 'fleet-again': 'many', 'no-fleet': 'flag', window: 'many',
-    k: 'one', out: 'one', ownership: 'one',
+    k: 'one', out: 'one', ownership: 'one', claims: 'many',
   });
   if (a.log.length === 0) throw new Error('at least one --log is needed');
   const history = buildHistory(a.log.map((/** @type {string} */ f) => parseLog(fs.readFileSync(f, 'utf8'))));
@@ -56,9 +57,12 @@ export function check(argv) {
   if (!Number.isInteger(k) || k < 0) throw new Error('--k must be a whole number');
   if (a['no-fleet'] && fleet.length + fleetAgain.length > 0) throw new Error('--no-fleet and --fleet exclude each other');
   if (fleetAgain.length > 0 && fleet.length === 0) throw new Error('--fleet-again needs a first set (--fleet)');
+  if (a.claims.length > 2) throw new Error('--claims is given once, or twice with --fleet-again');
+  if (a.claims.length === 2 && fleetAgain.length === 0) throw new Error('a second --claims needs --fleet-again');
   const result = judge({
     history, copies, agree: a.agree ? a.agree.split(',') : [], fleet, fleetAgain, noFleet: a['no-fleet'] === true, windows: a.window, k,
     ownership: a.ownership ? fs.readFileSync(a.ownership, 'utf8') : undefined,
+    claims: a.claims.map((/** @type {string} */ f) => fs.readFileSync(f, 'utf8')),
   });
   if (a.out) fs.writeFileSync(a.out, `${JSON.stringify(result, null, 2)}\n`);
   return { result, run: history.run, guild: history.guild };

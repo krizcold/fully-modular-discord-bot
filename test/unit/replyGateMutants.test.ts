@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import { ComponentType, ContainerBuilder, InteractionCallbackResponse, ModalBuilder, TextDisplayBuilder } from 'discord.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { readSourceText } from '../helpers/sourceText';
 
 import { confirmWrite, saveData, saveDataOutcome } from '../../src/bot/internalSetup/utils/dataManager';
 import { ledgerOf, openLedger } from '../../src/bot/internalSetup/utils/dataBackends/writeLedger';
@@ -526,10 +527,10 @@ describe('the truth payloads and responses', () => {
 });
 
 describe('the shutdown handler in the bot', () => {
-  it.skipIf(process.env.__STRYKER_ACTIVE_MUTANT__ !== undefined)('its steps close the gateway, flush the totals, drain the writes and exit (clientInitializer.ts)', () => {
-    const source = fs.readFileSync(path.join(__dirname, '../../src/bot/internalSetup/clientInitializer.ts'), 'utf8');
-    const steps = /const shutdownHandler = stopHandler\(async \(\) => \{([\s\S]*?)\n {2}\}\);/.exec(source)?.[1] ?? '';
-    for (const step of ['stopSamplers();', "getIngestService().close('shutting down')", 'metrics.flushTotals();', 'await drainForExit(drainMs);', 'process.exit(0);']) {
+  it.skipIf(process.env.__STRYKER_ACTIVE_MUTANT__ !== undefined)('its steps close the gateway, flush the totals, drain the writes, release the shard claims and exit (clientInitializer.ts)', () => {
+    const source = readSourceText(__dirname, '../../src/bot/internalSetup/clientInitializer.ts');
+    const steps = /const shutdownHandler = stopHandler\(\(\) => runStopSteps\(\{([\s\S]*?)\n {2}\}\)\);/.exec(source)?.[1] ?? '';
+    for (const step of ['beginStop: () => getShardClaims()?.beginStop()', 'stopSamplers();', "closeGateway: () => getIngestService().close('shutting down')", 'getMetricsCollector().flushTotals();', 'drain: () => drainForExit(', 'await getShardClaims()?.finishStop();', 'exit: code => process.exit(code)']) {
       expect(steps).toContain(step);
     }
   });

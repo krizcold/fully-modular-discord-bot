@@ -27,6 +27,9 @@ export interface BotCredentials {
   // Sharding, read in the bot child.
   NODE_NAME?: string;
   FLEET_SHARD_COUNT?: string;
+  FLEET_SHARD_CAPACITY?: string;
+  FLEET_TAKEOVER_SECONDS?: string;
+  FLEET_SHARD_RETURN?: string;
   // OAuth Configuration (Optional - for Guild Web-UI)
   ENABLE_GUILD_WEBUI?: string;
   DISCORD_CLIENT_ID?: string;
@@ -109,6 +112,9 @@ export function loadCredentials(): BotCredentials {
     // Sharding fields (flow to the bot child via the botManager env spread)
     NODE_NAME: process.env.NODE_NAME,
     FLEET_SHARD_COUNT: process.env.FLEET_SHARD_COUNT,
+    FLEET_SHARD_CAPACITY: process.env.FLEET_SHARD_CAPACITY,
+    FLEET_TAKEOVER_SECONDS: process.env.FLEET_TAKEOVER_SECONDS,
+    FLEET_SHARD_RETURN: process.env.FLEET_SHARD_RETURN,
     // OAuth fields
     ENABLE_GUILD_WEBUI: process.env.ENABLE_GUILD_WEBUI,
     DISCORD_CLIENT_ID: process.env.DISCORD_CLIENT_ID,
@@ -249,6 +255,48 @@ export function resolveDataBackend(): DataBackendKind {
     else throw new Error(`[EnvLoader] Invalid DATA_BACKEND value "${raw}" (expected "file" or "postgres")`);
   }
   return cachedEnvBackend;
+}
+
+/** FLEET_SHARD_CAPACITY when blank or unset: shards spread one per machine. */
+export const DEFAULT_SHARD_CAPACITY = 1;
+export const DEFAULT_TAKEOVER_SECONDS = 30;
+const MIN_TAKEOVER_SECONDS = 15;
+const MAX_TAKEOVER_SECONDS = 3600;
+
+const loggedSettings = new Set<string>();
+
+function rejectSetting(key: string, raw: string, used: string): void {
+  if (loggedSettings.has(`${key}=${raw}`)) return;
+  loggedSettings.add(`${key}=${raw}`);
+  console.warn(`[EnvLoader] ${key}="${raw}" is not valid (${used})`);
+}
+
+/** This machine's shard target on a database bot: how many shards it takes before any other machine does. */
+export function shardCapacity(): number {
+  const raw = (process.env.FLEET_SHARD_CAPACITY ?? '').trim();
+  if (raw === '') return DEFAULT_SHARD_CAPACITY;
+  if (/^[0-9]+$/.test(raw) && Number.isSafeInteger(Number(raw))) return Number(raw);
+  rejectSetting('FLEET_SHARD_CAPACITY', raw, `expected 0 or a positive whole number; using ${DEFAULT_SHARD_CAPACITY}`);
+  return DEFAULT_SHARD_CAPACITY;
+}
+
+/** The takeover delay of the claims this machine holds, in seconds. */
+export function takeoverSeconds(): number {
+  const raw = (process.env.FLEET_TAKEOVER_SECONDS ?? '').trim();
+  if (raw === '') return DEFAULT_TAKEOVER_SECONDS;
+  const value = Number(raw);
+  if (/^[0-9]+$/.test(raw) && value >= MIN_TAKEOVER_SECONDS && value <= MAX_TAKEOVER_SECONDS) return value;
+  rejectSetting('FLEET_TAKEOVER_SECONDS', raw, `expected a whole number from ${MIN_TAKEOVER_SECONDS} to ${MAX_TAKEOVER_SECONDS}; using ${DEFAULT_TAKEOVER_SECONDS}`);
+  return DEFAULT_TAKEOVER_SECONDS;
+}
+
+/** Whether this machine gives shards back to their home machine and moves shards above its target. */
+export function shardReturnEnabled(): boolean {
+  const raw = (process.env.FLEET_SHARD_RETURN ?? '').trim();
+  if (raw === '' || raw === 'true') return true;
+  if (raw === 'false') return false;
+  rejectSetting('FLEET_SHARD_RETURN', raw, 'expected true or false; using true');
+  return true;
 }
 
 /** A migration switched DATA_BACKEND: the next resolveDataBackend reads it again. */

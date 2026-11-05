@@ -156,15 +156,15 @@ describe('S5 to Postgres: the store renamed aside', () => {
     expect(job.error, why(job)).toBe("The database's store changed from old-s8 to none since the first check; it was not renamed");
   });
 
-  it('refuses, with the count, when another bot owns guilds of the store', async () => {
+  it('renames a store aside whose unretired ownership rows name another node when no claim is live', async () => {
     const db = new FakeDb();
     servedStore(db, [{ guild: G1, node: 'other-node' }, { guild: G2, node: 'node-test' }]);
     const job = await runJob(db, 'job-s8-ren-03', 'postgres');
-    expect(job, why(job)).toMatchObject({ state: 'failed', stage: 'copying' });
-    expect(job.error).toBe('Store old-s8 has 1 guild(s) owned by another bot; it was not renamed');
-    expect([...db.schemas.keys()]).toEqual(['smdb_data']);
-    expect(db.schemas.get('smdb_data')!.storeId).toBe('old-s8');
-    expect(readJson(MARKER).live).toBe('file');
+    expect(job, why(job)).toMatchObject({ state: 'done' });
+    const aside = [...db.schemas.keys()].filter(n => n.startsWith('smdb_superseded_'));
+    expect(aside).toHaveLength(1);
+    expect(db.schemas.get(aside[0])!.storeId).toBe('old-s8');
+    expect(db.schemas.get(aside[0])!.owners.map(o => o.node_id).sort()).toEqual(['node-test', 'other-node']);
   });
 
   it('renames a store whose guilds this bot alone owns', async () => {
@@ -175,15 +175,6 @@ describe('S5 to Postgres: the store renamed aside', () => {
     const aside = [...db.schemas.keys()].filter(n => n.startsWith('smdb_superseded_'));
     expect(aside).toHaveLength(1);
     expect(db.schemas.get(aside[0])!.storeId).toBe('old-s8');
-  });
-
-  it('an owner count read with no row counts as no other owner', async () => {
-    const db = new FakeDb();
-    servedStore(db);
-    const job = await runJob(db, 'job-s8-ren-05', 'postgres', {
-      override: sql => (/count\(\*\)::int AS n FROM smdb_data\.guild_ownership WHERE retired_at IS NULL AND node_id <> \$1/.test(sql) ? Promise.resolve({ rows: [] }) : undefined),
-    });
-    expect(job, why(job)).toMatchObject({ state: 'done' });
   });
 
   it('a failure after the copy transaction began rolls it back', async () => {

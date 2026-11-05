@@ -4,6 +4,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { FenceToken } from '../../src/bot/internalSetup/utils/dataBackends/backend';
 import { PostgresBackend } from '../../src/bot/internalSetup/utils/dataBackends/postgresBackend';
 import { poolFor, startPostgres } from '../helpers/postgres';
+import { takeShard } from '../helpers/pgClaims';
 
 let container: StartedPostgreSqlContainer;
 let direct: Pool;
@@ -21,10 +22,9 @@ async function readyBackend(): Promise<PostgresBackend> {
   return b;
 }
 
-async function claimOf(b: PostgresBackend): Promise<number> {
-  const answer = await b.takeClaim();
-  if (answer.outcome !== 'claimed') throw new Error(`no claim taken: ${answer.outcome}`);
-  return answer.claim;
+async function claimOf(b: PostgresBackend, shard: { shardId: number; shardCount: number } = { shardId: 0, shardCount: 1 }): Promise<number> {
+  const node = b === nodeA ? 'node-a' : 'node-b';
+  return (await takeShard(direct, { processId: `p-${node}`, nodeId: node, ...shard })).claim!;
 }
 
 beforeAll(async () => {
@@ -41,7 +41,7 @@ afterAll(async () => {
   await container?.stop();
 });
 
-const tokenOf = (nodeId: string, claim: number): FenceToken => ({ nodeId, claim, shardId: 0, shardCount: 1 });
+const tokenOf = (nodeId: string, claim: number): FenceToken => ({ nodeId, claim, processId: `p-${nodeId}`, shardId: 0, shardCount: 1 });
 const batchOf = (doc: string) => ({ upserts: [{ key: { module: 'm', filename: 'x.json' }, doc }], deletes: [], appends: [] });
 
 async function stored(guildId: string): Promise<string | null> {
@@ -114,7 +114,7 @@ describe('fenced calls on a guild whose ownership row already exists', () => {
     expect((await nodeA.hydrateGuild(guildId, c1)).ok).toBe(true);
     expect(await ownerRow(guildId)).toEqual({ node_id: 'node-a', claim: String(c1.claim), retired: false });
 
-    const c2: FenceToken = { nodeId: 'node-a', claim: await claimOf(nodeA), shardId: 2, shardCount: 4 };
+    const c2: FenceToken = { nodeId: 'node-a', claim: await claimOf(nodeA, { shardId: 2, shardCount: 4 }), processId: 'p-node-a', shardId: 2, shardCount: 4 };
     expect(c2.claim).toBeGreaterThan(c1.claim!);
     expect(await nodeA.reclaimGuild(guildId, c2)).toBe('kept');
     expect(await ownerRow(guildId)).toEqual({ node_id: 'node-a', claim: String(c2.claim), retired: false });

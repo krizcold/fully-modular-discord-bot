@@ -231,6 +231,9 @@ export class FakeClient {
       return { rows: [] };
     }
     if (/^CREATE /.test(sql)) return { rows: [] };
+    if (/^INSERT INTO smdb_data\.claim_clock/.test(sql)) return { rows: [] };
+    // No shard claims are modelled: the rename aside (NB4 decision 25) finds none.
+    if (/to_regclass\('smdb_data\.shard_claims'\)/.test(sql)) return { rows: [{ present: false }] };
     if (/INSERT INTO smdb_data\.meta/.test(sql)) {
       if (/'store_id'/.test(sql)) this.store().storeId ??= JSON.parse(params[0]);
       return { rows: [] };
@@ -257,9 +260,6 @@ export class FakeClient {
       const [g, n, sh, c, sc] = params;
       for (let i = 0; i < g.length; i++) this.store().owners.push({ guild_id: g[i], node_id: n[i], shard_id: sh[i], claim: String(c[i]), shard_count: sc[i], retired_at: null });
       return { rows: [] };
-    }
-    if (/FROM smdb_data\.guild_ownership WHERE retired_at IS NULL AND node_id <> \$1/.test(sql)) {
-      return { rows: [{ n: this.store().owners.filter(o => o.retired_at === null && o.node_id !== params[0]).length }] };
     }
     if (/FROM smdb_data\.guild_ownership/.test(sql)) return { rows: this.store().owners.map(o => ({ ...o })) };
     if (/sha256\(convert_to\(doc, 'UTF8'\)\).*FROM smdb_data\.guild_data_graveyard/.test(sql)) {

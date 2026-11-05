@@ -929,6 +929,23 @@ async function refuseOtherSessions(session: PgSession, jobId: string, known: Ses
   if (parts.length > 0) throw new Refusal(parts.map(p => p.charAt(0).toUpperCase() + p.slice(1)).join('. '));
 }
 
+/**
+ * NB4 decision 25: the claims of a bot process that may still save into the store, an unreleased row whose holder's
+ * node row names that process and was seen within its takeover delay. A store with no claims tables has none.
+ */
+async function liveShardClaims(session: PgSession): Promise<Array<{ shardId: number; name: string; seenAgoS: number; takeoverSeconds: number }>> {
+  const tables = (await session.query(`SELECT to_regclass('smdb_data.shard_claims') IS NOT NULL AND to_regclass('smdb_data.shard_nodes') IS NOT NULL AS present`)).rows[0];
+  if (tables?.present !== true) return [];
+  const rows = (await session.query(`
+    SELECT c.shard_id, n.node_name, n.takeover_seconds,
+           floor(extract(epoch FROM (now() - n.seen_at)))::int AS seen_ago_s
+      FROM smdb_data.shard_claims c
+      JOIN smdb_data.shard_nodes n ON n.node_id = c.holder_node AND n.process_id = c.holder_process
+     WHERE NOT c.released AND n.seen_at > now() - make_interval(secs => n.takeover_seconds)
+     ORDER BY c.shard_count, c.shard_id`)).rows;
+  return rows.map((r: any) => ({ shardId: Number(r.shard_id), name: String(r.node_name), seenAgoS: Number(r.seen_ago_s), takeoverSeconds: Number(r.takeover_seconds) }));
+}
+
 function sessionOpenText(jobId: string, lastJobId: string | null): string {
   if (jobId !== lastJobId) {
     return `migration ${jobId}, which is not this bot's last one, holds a session on this database; run this migration once it no longer shows`;
@@ -1842,9 +1859,12 @@ export class MigrationService {
         const again = await readMetaStoreId(main, 'smdb_data');
         if (again !== renameDest) throw new Refusal(`The database's store changed from ${renameDest} to ${again ?? 'none'} since the first check; it was not renamed`);
         await refuseOtherSessions(main, jobId, ctx.sessions);
-        const nodeId = this.opts.nodeId?.() ?? getNodeId();
-        const others = Number((await main.query('SELECT count(*)::int AS n FROM smdb_data.guild_ownership WHERE retired_at IS NULL AND node_id <> $1', [nodeId])).rows[0]?.n ?? 0);
-        if (others > 0) throw new Refusal(`Store ${renameDest} has ${others} guild(s) owned by another bot; it was not renamed`);
+        const live = await liveShardClaims(main);
+        if (live.length > 0) {
+          const window = Math.max(...live.map(c => c.takeoverSeconds));
+          const list = live.map(c => `shard ${c.shardId} held by ${c.name} (seen ${c.seenAgoS} s ago)`).join(', ');
+          throw new Refusal(`Store ${renameDest} has shard claims of bot processes seen in the last ${window} s: ${list}; stop the bot on those machines (a clean stop releases its claims), then retry; it was not renamed`);
+        }
         await main.query(`ALTER SCHEMA smdb_data RENAME TO smdb_superseded_${Date.now()}`);
       }
       await provisionStoreInTransaction(main);

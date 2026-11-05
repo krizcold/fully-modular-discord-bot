@@ -19,8 +19,7 @@ import type {
   RetireOutcome,
 } from './backend';
 
-export const SCHEMA_VERSION = 2;
-const CLAIM_PROVISION_POLL_MS = 5000;
+export const SCHEMA_VERSION = 3;
 const PROVISION_VERDICT_POLL_MS = 250;
 const PARTITION_COUNT = 32;
 const MAX_ROWS_PER_STATEMENT = 200;
@@ -50,7 +49,45 @@ const PROVISION_DDL: string[] = [
     updated_at   timestamptz NOT NULL DEFAULT now()
   )`,
   `CREATE INDEX IF NOT EXISTS guild_ownership_node_idx ON smdb_data.guild_ownership (node_id)`,
+  `CREATE INDEX IF NOT EXISTS guild_ownership_claim_idx ON smdb_data.guild_ownership (claim)`,
   `CREATE SEQUENCE IF NOT EXISTS smdb_data.claim_seq`,
+  `CREATE TABLE IF NOT EXISTS smdb_data.shard_claims (
+    shard_count     integer     NOT NULL,
+    shard_id        integer     NOT NULL,
+    claim           bigint      NOT NULL,
+    holder_process  text        NOT NULL,
+    holder_node     text        NOT NULL,
+    holder_name     text        NOT NULL,
+    home_node       text        NOT NULL,
+    released        boolean     NOT NULL DEFAULT false,
+    reserved        boolean     NOT NULL DEFAULT false,
+    taken_at        timestamptz NOT NULL DEFAULT now(),
+    renewed_at      timestamptz NOT NULL DEFAULT now(),
+    ttl_ms          bigint      NOT NULL,
+    expires_up_ms   bigint      NOT NULL,
+    extended        boolean     NOT NULL DEFAULT false,
+    PRIMARY KEY (shard_count, shard_id)
+  )`,
+  `CREATE TABLE IF NOT EXISTS smdb_data.claim_clock (
+    id          integer     PRIMARY KEY CHECK (id = 1),
+    up_ms       bigint      NOT NULL,
+    ticked_at   timestamptz NOT NULL,
+    last_gap_ms bigint      NOT NULL DEFAULT 0
+  )`,
+  `INSERT INTO smdb_data.claim_clock (id, up_ms, ticked_at) VALUES (1, 0, now()) ON CONFLICT (id) DO NOTHING`,
+  `CREATE TABLE IF NOT EXISTS smdb_data.shard_nodes (
+    node_id          text PRIMARY KEY,
+    node_name        text        NOT NULL,
+    process_id       text        NOT NULL,
+    capacity         integer     NOT NULL,
+    takeover_seconds integer     NOT NULL,
+    fit              boolean     NOT NULL,
+    restartable      boolean     NOT NULL,
+    returns          boolean     NOT NULL,
+    started_at       timestamptz NOT NULL,
+    healthy_since    timestamptz,
+    seen_at          timestamptz NOT NULL
+  )`,
   `CREATE TABLE IF NOT EXISTS smdb_data.guild_data (
     guild_id   text NOT NULL,
     module     text NOT NULL,
@@ -105,23 +142,41 @@ export async function provisionStoreInTransaction(client: { query(text: string, 
   return storeId;
 }
 
-// One process holds one claim and claims never repeat, so an equal claim is the same process. A guild served again
-// after a retire is listed again.
-const FENCED_OWNERSHIP_UPDATE = `
-  UPDATE smdb_data.guild_ownership
-     SET node_id = $2, shard_id = $3, claim = $4, shard_count = $5, retired_at = NULL, updated_at = now()
-   WHERE guild_id = $1 AND claim <= $4`;
+// NB4 decision 8: a stamp lands only while the shard's claim row holds this claim for this process, unreleased. One
+// upsert, so a new holder's stamp waits for an old holder's uncommitted insert and then checks the committed row. A
+// guild served again after a retire is listed again.
+const SHARD_CLAIM_HELD = `EXISTS (SELECT 1 FROM smdb_data.shard_claims c
+   WHERE c.shard_count = $5 AND c.shard_id = $3 AND c.claim = $4 AND c.holder_process = $6 AND NOT c.released)`;
+
+export const FENCED_OWNERSHIP_UPSERT = `
+  INSERT INTO smdb_data.guild_ownership AS o (guild_id, node_id, shard_id, claim, shard_count)
+  SELECT $1::text, $2::text, $3::int, $4::bigint, $5::int
+   WHERE ${SHARD_CLAIM_HELD}
+  ON CONFLICT (guild_id) DO UPDATE
+     SET node_id = EXCLUDED.node_id, shard_id = EXCLUDED.shard_id, claim = EXCLUDED.claim,
+         shard_count = EXCLUDED.shard_count, retired_at = NULL, updated_at = now()
+   WHERE o.claim <= EXCLUDED.claim`;
 
 const OWNER_SELECT = `SELECT node_id, claim FROM smdb_data.guild_ownership WHERE guild_id = $1`;
 
-const OWNERSHIP_RECLAIM = `
+export const OWNERSHIP_RECLAIM = `
   UPDATE smdb_data.guild_ownership
-     SET shard_id = $3, claim = $4, shard_count = $5, updated_at = now()
-   WHERE guild_id = $1 AND node_id = $2 AND claim <= $4`;
+     SET shard_id = $3::int, claim = $4::bigint, shard_count = $5::int, updated_at = now()
+   WHERE guild_id = $1::text AND node_id = $2::text AND claim <= $4::bigint AND ${SHARD_CLAIM_HELD}`;
 
-const OWNERSHIP_INSERT = `
+const OWNERSHIP_RECLAIM_INSERT = `
   INSERT INTO smdb_data.guild_ownership (guild_id, node_id, shard_id, claim, shard_count)
-  VALUES ($1, $2, $3, $4, $5) ON CONFLICT (guild_id) DO NOTHING`;
+  SELECT $1::text, $2::text, $3::int, $4::bigint, $5::int
+   WHERE ${SHARD_CLAIM_HELD}
+  ON CONFLICT (guild_id) DO NOTHING`;
+
+/** Decision 9: the shard part of a refusal line, worded by the claim row's state. */
+export function describeShardRow(shardId: number, shardCount: number, row: { claim: number; holder_name: string; released: boolean; reserved: boolean } | undefined): string {
+  if (!row) return `shard ${shardId} of ${shardCount} has no claim row`;
+  if (!row.released) return `shard ${shardId} of ${shardCount} is held by claim ${row.claim} (${row.holder_name})`;
+  if (row.reserved) return `shard ${shardId} of ${shardCount} is reserved by claim ${row.claim} (${row.holder_name}) for its restart`;
+  return `shard ${shardId} of ${shardCount} was released by claim ${row.claim} (kept for ${row.holder_name})`;
+}
 
 /** A claim the database can hold and a fence can compare: a positive safe integer. */
 function usableClaim(claim: unknown): claim is number {
@@ -135,14 +190,6 @@ function matchesSchemaVersion(raw: string): boolean {
     return false;
   }
 }
-
-function parseStoredClaim(raw: unknown): number {
-  const claim = Number(raw);
-  if (!Number.isSafeInteger(claim) || claim < 0) throw new Error(`unusable claim number ${String(raw)}`);
-  return claim;
-}
-
-export type ClaimAnswer = { outcome: 'claimed'; claim: number } | { outcome: 'mismatch' } | { outcome: 'stopped' };
 
 /** How provisioning ended: the schema is this bot's, the database holds another version (found), or the backend stopped. */
 export type ProvisionVerdict = { state: 'provisioned' } | { state: 'mismatch'; found: string } | { state: 'stopped' };
@@ -271,7 +318,11 @@ export class PostgresBackend implements DataBackend {
   }
 
   private noteLoginRefused(error: unknown): void {
-    if (!isLoginRefused(error)) return;
+    if (isLoginRefused(error)) this.notifyLoginRefused();
+  }
+
+  /** Another pool of this bot (the shard claims) was refused the login: the same listeners hear it. */
+  notifyLoginRefused(): void {
     for (const listener of this.loginRefusedListeners) {
       try { listener(); } catch (listenerError) { console.error('[PostgresBackend] A login-refused listener threw:', listenerError); }
     }
@@ -471,51 +522,9 @@ export class PostgresBackend implements DataBackend {
     this.fireAlert('outage', detail);
   }
 
-  // ==========================================================================
-  // CLAIM NUMBERS
-  // ==========================================================================
-
-  /**
-   * This process's claim number, once provisioning has passed: the next value of smdb_data.claim_seq, raised above
-   * every claim a guild_ownership row holds (a restore can bring rows back without the sequence's value). Answers
-   * 'mismatch' when the database's schema version is not this bot's and 'stopped' once the backend stopped. Throws
-   * while the database cannot answer.
-   */
-  async takeClaim(): Promise<ClaimAnswer> {
-    for (;;) {
-      if (this.stopped) return { outcome: 'stopped' };
-      if (this.provisioned) break;
-      if (this.schemaMismatch) return { outcome: 'mismatch' };
-      await this.sleep(CLAIM_PROVISION_POLL_MS);
-    }
-    const client = await this.pool.connect();
-    let destroy = false;
-    try {
-      await client.query('BEGIN');
-      // Every taker holds this lock, so a setval never moves the sequence back under another taker.
-      await client.query(`SELECT pg_advisory_xact_lock(hashtext('smdb_data_claim'))`);
-      let claim = parseStoredClaim((await client.query(`SELECT nextval('smdb_data.claim_seq') AS claim`)).rows[0]?.claim);
-      const highest = (await client.query(`SELECT max(claim) AS claim FROM smdb_data.guild_ownership`)).rows[0]?.claim;
-      const floor = highest === null || highest === undefined ? 0 : parseStoredClaim(highest);
-      if (claim <= floor) {
-        claim = floor + 1;
-        await client.query(`SELECT setval('smdb_data.claim_seq', $1)`, [claim]);
-      }
-      if (!usableClaim(claim)) throw new Error(`unusable claim number ${claim}`);
-      await client.query('COMMIT');
-      return { outcome: 'claimed', claim };
-    } catch (error) {
-      destroy = true;
-      await this.rollbackQuiet(client);
-      throw error;
-    } finally {
-      client.release(destroy ? true : undefined);
-    }
-  }
-
   /** A fenced call with no usable claim touches no row and leaves the outage state alone. */
   private refusedWithoutClaim(op: 'hydrate' | 'flush' | 'retire' | 'reclaim', guildId: string, token: FenceToken): boolean {
-    if (usableClaim(token.claim)) return false;
+    if (usableClaim(token.claim) && typeof token.processId === 'string' && token.processId) return false;
     console.error(`[PostgresBackend] Refused ${op} for guild ${guildId}: this process holds no shard claim`);
     return true;
   }
@@ -536,13 +545,8 @@ export class PostgresBackend implements DataBackend {
     let destroy = false;
     try {
       await client.query('BEGIN');
-      const claim = await client.query(FENCED_OWNERSHIP_UPDATE, this.fenceParams(guildId, token));
-      let claimed = (claim.rowCount ?? 0) === 1;
-      if (!claimed) {
-        const inserted = await client.query(OWNERSHIP_INSERT, this.fenceParams(guildId, token));
-        claimed = (inserted.rowCount ?? 0) === 1;
-      }
-      if (!claimed) {
+      const claim = await client.query(FENCED_OWNERSHIP_UPSERT, this.fenceParams(guildId, token));
+      if ((claim.rowCount ?? 0) !== 1) {
         await client.query('ROLLBACK');
         const currentOwner = await this.readOwner(client, guildId);
         this.noteSuccess();
@@ -582,7 +586,7 @@ export class PostgresBackend implements DataBackend {
     try {
       const params = this.fenceParams(guildId, token);
       let kept = ((await client.query(OWNERSHIP_RECLAIM, params)).rowCount ?? 0) === 1;
-      if (!kept) kept = ((await client.query(OWNERSHIP_INSERT, params)).rowCount ?? 0) === 1;
+      if (!kept) kept = ((await client.query(OWNERSHIP_RECLAIM_INSERT, params)).rowCount ?? 0) === 1;
       this.noteSuccess();
       return kept ? 'kept' : 'lost';
     } catch (error) {
@@ -615,21 +619,18 @@ export class PostgresBackend implements DataBackend {
       return { ok: false, reason: 'unavailable', ...describeFailure(error) };
     }
     let destroy = false;
+    let commitSent = false;
     try {
       await client.query('BEGIN');
-      const claim = await client.query(FENCED_OWNERSHIP_UPDATE, this.fenceParams(guildId, token));
-      let claimed = (claim.rowCount ?? 0) === 1;
-      if (!claimed) {
-        // A guild whose row was swept or never written has none; absent is not deposed.
-        const inserted = await client.query(OWNERSHIP_INSERT, this.fenceParams(guildId, token));
-        claimed = (inserted.rowCount ?? 0) === 1;
-      }
-      if (!claimed) {
+      const claim = await client.query(FENCED_OWNERSHIP_UPSERT, this.fenceParams(guildId, token));
+      if ((claim.rowCount ?? 0) !== 1) {
         await client.query('ROLLBACK');
         const currentOwner = await this.readOwner(client, guildId);
+        const shardRow = await this.readShardRow(client, token);
         this.noteSuccess();
-        const ownerText = currentOwner ? `${currentOwner.nodeId} (claim ${currentOwner.claim})` : 'unknown';
-        const detail = `deposed: guild ${guildId} owned by ${ownerText}; local token ${token.nodeId} (claim ${token.claim})`;
+        const guildPart = currentOwner ? `guild ${guildId} is held by claim ${currentOwner.claim} (${currentOwner.nodeId})` : `guild ${guildId} has no ownership row`;
+        const shardPart = shardRow === null ? `shard ${token.shardId} of ${token.shardCount}'s claim row could not be read` : describeShardRow(token.shardId, token.shardCount, shardRow);
+        const detail = `deposed: ${guildPart}; ${shardPart}; local claim ${token.claim}`;
         console.error(`[PostgresBackend] Flush rejected: ${detail}`);
         this.fireAlert('deposed', detail);
         return { ok: false, reason: 'deposed', currentOwner };
@@ -652,6 +653,7 @@ export class PostgresBackend implements DataBackend {
           `INSERT INTO smdb_data.guild_append (guild_id, module, filename, chunk) VALUES ($1, $2, $3, $4)`,
           [guildId, append.key.module, append.key.filename, append.chunk]);
       }
+      commitSent = true;
       await client.query('COMMIT');
       this.noteSuccess();
       return { ok: true };
@@ -660,7 +662,11 @@ export class PostgresBackend implements DataBackend {
       await this.rollbackQuiet(client);
       this.noteFailure(error);
       console.error(`[PostgresBackend] flushGuild failed for ${guildId} (caller retries):`, error);
-      return { ok: false, reason: 'unavailable', ...describeFailure(error) };
+      const failure = describeFailure(error);
+      const severity = error && typeof error === 'object' ? (error as { severity?: unknown }).severity : undefined;
+      // A COMMIT with no answer, or one ended by a FATAL or PANIC, may have landed; an ERROR answer did not.
+      const unanswered = commitSent && (!failure.code || severity === 'FATAL' || severity === 'PANIC');
+      return { ok: false, reason: 'unavailable', ...failure, ...(unanswered ? { commitUnanswered: true } : {}) };
     } finally {
       client.release(destroy ? true : undefined);
     }
@@ -678,16 +684,11 @@ export class PostgresBackend implements DataBackend {
     let destroy = false;
     try {
       await client.query('BEGIN');
-      const claim = await client.query(FENCED_OWNERSHIP_UPDATE, this.fenceParams(guildId, token));
+      const claim = await client.query(FENCED_OWNERSHIP_UPSERT, this.fenceParams(guildId, token));
       if ((claim.rowCount ?? 0) !== 1) {
-        // No row is not a competitor: a guild that never wrote has no
-        // ownership row; claim it so the retire can tombstone it.
-        const inserted = await client.query(OWNERSHIP_INSERT, this.fenceParams(guildId, token));
-        if ((inserted.rowCount ?? 0) !== 1) {
-          await client.query('ROLLBACK');
-          this.noteSuccess();
-          return { ok: false, reason: 'deposed' };
-        }
+        await client.query('ROLLBACK');
+        this.noteSuccess();
+        return { ok: false, reason: 'deposed' };
       }
       const retiredAt = Date.now();
       const docsMoved = await client.query(
@@ -779,7 +780,20 @@ export class PostgresBackend implements DataBackend {
   }
 
   private fenceParams(guildId: string, token: FenceToken): unknown[] {
-    return [guildId, token.nodeId, token.shardId, token.claim, token.shardCount];
+    return [guildId, token.nodeId, token.shardId, token.claim, token.shardCount, token.processId];
+  }
+
+  /** The claim row of the token's shard for the refusal line; undefined for no row, null when it could not be read. */
+  private async readShardRow(client: PoolClient, token: FenceToken): Promise<{ claim: number; holder_name: string; released: boolean; reserved: boolean } | undefined | null> {
+    try {
+      const res = await client.query(
+        `SELECT claim::text AS claim, holder_name, released, reserved FROM smdb_data.shard_claims WHERE shard_count = $1 AND shard_id = $2`,
+        [token.shardCount, token.shardId]);
+      const row = res.rows[0];
+      return row ? { claim: Number(row.claim), holder_name: row.holder_name, released: row.released === true, reserved: row.reserved === true } : undefined;
+    } catch {
+      return null;
+    }
   }
 
   private async readOwner(client: PoolClient, guildId: string): Promise<GuildOwner | undefined> {

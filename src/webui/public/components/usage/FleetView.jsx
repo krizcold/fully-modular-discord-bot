@@ -129,6 +129,121 @@ function FleetDataCard({ dataBackend, dataBoot }) {
   );
 }
 
+// NB4 decision 21: the claim rows and the machines, as this process last read them from the database.
+function fleetClaimExpires(row) {
+  const name = row.holderName || '-';
+  switch (row.state) {
+    case 'never-taken': return 'never taken';
+    case 'held': return `in ${fleetFormatDuration(row.expiresInMs)}`;
+    case 'reserved': return `reserved by ${name} for its restart; not served meanwhile`;
+    case 'kept': return `released: kept for ${name}, or free to any machine in ${fleetFormatDuration(row.expiresInMs)}`;
+    case 'expired-deferred': return `expired ${fleetFormatDuration(row.expiredAgoMs)} ago: kept for ${name}'s restart for ${fleetFormatDuration(row.deferredMs)} more, then any machine with room may take it`;
+    default: return `expired ${fleetFormatDuration(row.expiredAgoMs)} ago: any machine with room may take it`;
+  }
+}
+
+function fleetAboveText(node) {
+  const above = node.held - node.target;
+  const r = node.aboveReason;
+  if (!r || above <= 0) return '';
+  if (r.kind === 'no-web-ui') return ` (${above} above target: it gives no shard away while it runs, having no web UI)`;
+  if (r.kind === 'returns-off') return ` (${above} above target: moves are off on this machine, FLEET_SHARD_RETURN=false)`;
+  if (r.kind === 'moving') return ` (${above} above target: moves to ${r.to} when this machine restarts for it)`;
+  if (r.kind === 'waiting-healthy') return ` (${above} above target: moves to ${r.name} once ${r.name} has been healthy for 5 minutes, in ${fleetFormatDuration(r.leftMs)})`;
+  return ` (${above} above target: no other machine has room)`;
+}
+
+function fleetRenewalError(e) {
+  if (!e) return '';
+  if (e.kind === 'refused') return 'the database refused the login';
+  if (e.kind === 'timeout') return 'the renewal timed out';
+  if (e.kind === 'unreachable') return 'the database did not answer';
+  return `the database refused the renewal: SQLSTATE ${e.code} ${e.message}`;
+}
+
+function fleetReadError(e) {
+  if (!e) return '';
+  if (e.kind === 'refused') return 'the database refused the login';
+  if (e.kind === 'timeout') return 'the claims read timed out';
+  if (e.kind === 'unreachable') return 'the database did not answer';
+  return `the database refused the claims read: SQLSTATE ${e.code} ${e.message}`;
+}
+
+function fleetClaimsAge(fleet) {
+  if (!fleet.renewalError && !fleet.claimsReadError && !fleet.claimsStale) return '';
+  const age = fleet.claimsReadAgoMs == null ? 'Claims not read yet' : `Claims as last read ${fleetFormatDuration(fleet.claimsReadAgoMs)} ago`;
+  const cause = fleet.renewalError ? fleetRenewalError(fleet.renewalError) : fleetReadError(fleet.claimsReadError);
+  return cause ? `${age}; ${cause}` : age;
+}
+
+function fleetPendingRestart(fleet) {
+  if (!fleet.pendingRestart) return '';
+  return `Restarting to ${fleet.pendingRestart}${fleet.restartWaiting ? ` (waiting: ${fleet.restartWaiting})` : ''}`;
+}
+
+function FleetClaimsCard({ fleet }) {
+  if (fleet.dataBackend !== 'postgres') {
+    return <div className="usage-stat-sub" style={{ marginTop: '14px' }}>This bot keeps its data in files: one process runs every shard and takes no claims.</div>;
+  }
+  const claims = fleet.claims || [];
+  const nodes = fleet.nodes || [];
+  return (
+    <div>
+      {fleetClaimsAge(fleet) ? <div className="usage-stat-sub">{fleetClaimsAge(fleet)}</div> : null}
+      {(fleet.stillConnected || []).map((s) => (
+        <div key={`still-${s}`} className="usage-stat-sub">{`Shard ${s} may still be connected to Discord`}</div>
+      ))}
+      {fleet.pendingRestart ? <div className="usage-stat-sub">{fleetPendingRestart(fleet)}</div> : null}
+
+      <div className="usage-stat-title" style={{ marginTop: '14px' }}>Claims</div>
+      {claims.length === 0 ? (
+        <div className="usage-empty">No claims read yet</div>
+      ) : (
+        <table className="usage-table usage-table-compact fleet-table">
+          <thead>
+            <tr><th>Shard</th><th>Machine</th><th>Claim</th><th>Expires</th><th>Home</th></tr>
+          </thead>
+          <tbody>
+            {claims.map((c) => (
+              <tr key={c.shardId}>
+                <td>{c.shardId}</td>
+                <td>{c.holderName ? `${c.holderName}${c.mine ? ' (this process)' : ''}` : '-'}</td>
+                <td>{c.claim != null ? c.claim : '-'}</td>
+                <td>{fleetClaimExpires(c)}</td>
+                <td>{c.homeName || '-'}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+
+      <div className="usage-stat-title" style={{ marginTop: '14px' }}>Machines</div>
+      {nodes.length === 0 ? (
+        <div className="usage-empty">No machine has written its row yet</div>
+      ) : (
+        <table className="usage-table usage-table-compact fleet-table">
+          <thead>
+            <tr><th>Machine</th><th>Shards</th><th>Healthy for</th><th>Last seen</th></tr>
+          </thead>
+          <tbody>
+            {nodes.map((n) => {
+              const gone = n.seenAgoMs >= n.takeoverSeconds * 1000;
+              return (
+                <tr key={n.nodeId}>
+                  <td>{n.name}</td>
+                  <td>{`${n.held} of target ${n.target}${fleetAboveText(n)}${n.restartable ? '' : '; takes shards only when it starts: no web UI'}`}</td>
+                  <td>{n.healthyForMs == null ? 'not healthy now' : fleetFormatDuration(n.healthyForMs)}</td>
+                  <td>{gone ? `gone: not seen for ${fleetFormatDuration(n.seenAgoMs)}` : fleetFormatAge(n.seenAgoMs)}</td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      )}
+    </div>
+  );
+}
+
 function FleetView({ api, wsClient, guildNames }) {
   const [fleet, setFleet] = React.useState(null);
   // No WS pushes arrive while the shard layer is mid-init, so poll until initialized.
@@ -232,6 +347,8 @@ function FleetView({ api, wsClient, guildNames }) {
       <FleetCapacityCard cap={capacitySummary} />
 
       {fleet.budget ? <FleetBudgetCard budget={fleet.budget} /> : null}
+
+      <FleetClaimsCard fleet={fleet} />
 
       <div className="usage-stat-title" style={{ marginTop: '14px' }}>Shard table</div>
       {shardTable.length === 0 ? (

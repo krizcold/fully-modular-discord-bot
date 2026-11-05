@@ -57,6 +57,7 @@ import { currentSince, recordRefusal, recordTicket } from './dataBackends/writeL
 import { noteScopeRefusal, noteScopeTicket, pendingFor, saveMark, stampOf, type SaveMark } from './dataBackends/scopeRecord';
 import { canonicalGuildKey, GuildKeyError, type GuildKey } from './dataKeys';
 import { isMaintenanceGateClosed } from './maintenanceGate';
+import { stoppedServing } from './servingGate';
 
 export { listGlobalDataFiles, saveMark };
 export type { SaveMark };
@@ -108,10 +109,12 @@ function wsRouted(options: DataOptions): string | null {
 export function fenceFromOwnerInfo(guildId: string): FenceToken | null {
   const info = ownerInfoProvider?.();
   if (!info) return null;
+  const shardId = guildIdToShardId(guildId, info.shardCount);
   return {
     nodeId: info.nodeId,
-    claim: info.claim,
-    shardId: guildIdToShardId(guildId, info.shardCount),
+    claim: info.claimOf(shardId),
+    processId: info.processId,
+    shardId,
     shardCount: info.shardCount,
   };
 }
@@ -187,13 +190,18 @@ export function drainForExit(boundMs: number): Promise<void> {
       // A refused write in code that does not catch it must not end the
       // process before the drain does.
       process.on('uncaughtException', error => console.error('[Data] Error during the exit drain (the drain goes on):', error));
-      await drainUntilSettled(deadline - Math.floor(boundMs / 5), progress);
-      closedForExit = true;
-      await drainUntilSettled(deadline, progress);
-      const left = getWorkingSet()?.dirtyGuildIds() ?? [];
-      if (left.length > 0) console.warn(`[Data] Shutdown drain left ${left.length} guild(s) with unflushed writes: ${left.join(', ')}`);
-      const files = queuedFileWrites();
-      if (files > 0) console.warn(`[Data] Shutdown drain left ${files} file(s) with queued writes`);
+      try {
+        await drainUntilSettled(deadline - Math.floor(boundMs / 5), progress);
+        closedForExit = true;
+        await drainUntilSettled(deadline, progress);
+        const left = getWorkingSet()?.dirtyGuildIds() ?? [];
+        if (left.length > 0) console.warn(`[Data] Shutdown drain left ${left.length} guild(s) with unflushed writes: ${left.join(', ')}`);
+        const files = queuedFileWrites();
+        if (files > 0) console.warn(`[Data] Shutdown drain left ${files} file(s) with queued writes`);
+      } finally {
+        // A loss whose leave never ended logs what it dropped here.
+        for (const line of getWorkingSet()?.takeDropLines() ?? []) console.error(line);
+      }
     })();
   }
   return exitDrain;
@@ -254,14 +262,29 @@ export function isClosedForExit(): boolean {
 }
 
 let stopBegun = false;
+let processStop: (() => Promise<void>) | null = null;
 
-/** The process's shutdown handler: runs its steps once, the stop marked begun before the first of them. */
+/**
+ * The process's shutdown handler: runs its steps once, the stop marked begun before the first of them. The one built
+ * last is the process's stop, which stopProcess runs.
+ */
 export function stopHandler(steps: () => Promise<void>): () => Promise<void> {
-  return async () => {
+  const handler = async () => {
     if (stopBegun) return;
     stopBegun = true;
     await steps();
   };
+  processStop = handler;
+  return handler;
+}
+
+/** NB4 decision 16: a process that nothing can restart ends through its own stop handler. */
+export function stopProcess(): void {
+  if (!processStop) {
+    console.error('[Data] No stop handler is built yet; the bot process exits');
+    process.exit(0);
+  }
+  void processStop();
 }
 
 /** A stop has begun or the exit drain runs: a write not saved by now may never be retried, and may be lost. */
@@ -531,8 +554,11 @@ function refuseGuildWhileGated(options: DataOptions): void {
 
 export interface OwnerInfo {
   nodeId: string;
-  claim: number | null;
+  /** This boot's process id; null on a JSON bot. */
+  processId: string | null;
   shardCount: number;
+  /** The claim this process holds on a shard; null for a shard it does not hold. */
+  claimOf(shardId: number): number | null;
 }
 
 let ownerInfoProvider: (() => OwnerInfo | null) | null = null;
@@ -1028,6 +1054,19 @@ function acceptDelete(filename: string, options: DataOptions): DeleteTracked {
 // GUILD NAMESPACE DELETION (graveyard)
 // ============================================================================
 
+/** The process stopped serving, or the guild's set is frozen with kept writes: an operator delete or restore is refused. */
+export class GuildFrozenError extends Error {
+  constructor(guildId: string) {
+    super(`guild ${guildId} is frozen: this process stopped serving it`);
+    this.name = 'GuildFrozenError';
+  }
+}
+
+// NB4 decision 6: asked after the last await before the write.
+function refuseFrozenGuild(guildId: string): void {
+  if (stoppedServing() || getWorkingSet()?.stateOf(guildId) === 'frozen-retained') throw new GuildFrozenError(guildId);
+}
+
 /**
  * Retire a guild namespace to the graveyard (same volume). Flushes and drops
  * any pending state for the guild, then renames the dir under _graveyard and
@@ -1046,6 +1085,7 @@ export async function deleteGuildNamespace(guildId: string, reason: string, flus
         return false;
       }
       refuseGuildChangeInMaintenance();
+      refuseFrozenGuild(guildId);
       ws.evict(guildId);
     }
     const token = fenceFromOwnerInfo(guildId);
@@ -1093,14 +1133,17 @@ export async function restoreGuildFromGraveyard(guildId: string, retiredAt?: num
       batch = newest;
     }
     const token = fenceFromOwnerInfo(guildId)
-      ?? { nodeId: '', claim: null, shardId: 0, shardCount: 1 };
+      ?? { nodeId: '', claim: null, processId: null, shardId: 0, shardCount: 1 };
     refuseGuildChangeInMaintenance();
+    refuseFrozenGuild(guildId);
     const res = await pgBackend.restoreGuild(guildId, batch, token);
     if (res.ok) {
       // The pre-restore ready gate hydrated the guild EMPTY (claim-then-read
       // saw no rows); evict that set so the next access rehydrates with the
-      // restored docs instead of serving the stale emptiness.
-      getWorkingSet()?.evict(guildId);
+      // restored docs instead of serving the stale emptiness. A set frozen
+      // meanwhile keeps its writes for the leave.
+      const ws = getWorkingSet();
+      if (ws?.stateOf(guildId) !== 'frozen-retained') ws?.evict(guildId);
       return { ok: true, moved: res.moved };
     }
     if (res.reason === 'live-rows') return { ok: false, error: 'live guild data exists; delete it before restoring' };

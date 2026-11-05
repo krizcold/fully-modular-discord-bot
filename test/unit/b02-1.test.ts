@@ -6,6 +6,7 @@ import express from 'express';
 import session from 'express-session';
 import passport from 'passport';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { readSourceText } from '../helpers/sourceText';
 
 vi.mock('@webui/auth/guildPermissionRefresher', () => ({
   refreshUserGuilds: async (user: any) => ({ ...user, guilds: [{ id: '123456789012345678', permissions: '8', owner: false }] }),
@@ -205,7 +206,7 @@ describe('the server mounts its rate limits', () => {
   });
 
   it('createServer mounts them', () => {
-    const src = fs.readFileSync(path.join(__dirname, '../../src/webui/server.ts'), 'utf8');
+    const src = readSourceText(__dirname, '../../src/webui/server.ts');
     expect(src).toMatch(/^\s*mountRateLimits\(app\);/m);
   });
 });
@@ -248,7 +249,7 @@ describe('each client behind the proxies has its own bucket', () => {
   });
 
   it('createServer trusts only the private hops', () => {
-    const src = fs.readFileSync(path.join(__dirname, '../../src/webui/server.ts'), 'utf8');
+    const src = readSourceText(__dirname, '../../src/webui/server.ts');
     expect(src).toMatch(/app\.set\('trust proxy', TRUST_PROXY\)/);
   });
 });

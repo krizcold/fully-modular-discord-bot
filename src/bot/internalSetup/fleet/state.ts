@@ -4,10 +4,40 @@
 import { resolveDataBackend } from '../../../utils/envLoader';
 import { getDataBootStatus, DataBootStatus } from '../utils/dataBackends/boot';
 import { getShardCountOverride } from './placement';
+import { aboveReason, claimState, isExpired, rowsFor, type AboveReason, type ClaimState } from './claimRules';
 import type { ShardSource } from './placement';
 import type { BudgetInfo, IdentifyLedger } from './identifyLedger';
 import type { LeaseInfo, LeaseRuntime } from './leaseRuntime';
 import type { IngestService } from '../ingest/ingestService';
+import type { ShardClaims } from './shardClaims';
+import type { FailureClass } from './claimStore';
+
+export interface FleetClaimRow {
+  shardId: number;
+  claim: number | null;
+  holderName: string | null;
+  holderNode: string | null;
+  mine: boolean;
+  homeName: string | null;
+  state: ClaimState | 'never-taken';
+  expiresInMs: number | null;
+  expiredAgoMs: number | null;
+  deferredMs: number | null;
+}
+
+export interface FleetNodeRow {
+  nodeId: string;
+  name: string;
+  target: number;
+  held: number;
+  fit: boolean;
+  restartable: boolean;
+  returns: boolean;
+  healthyForMs: number | null;
+  seenAgoMs: number;
+  takeoverSeconds: number;
+  aboveReason: AboveReason | null;
+}
 
 export interface FleetState {
   initialized: boolean;
@@ -21,12 +51,28 @@ export interface FleetState {
   recommendedAt: number | null;
   dataBackend: 'file' | 'postgres';
   dataBoot: DataBootStatus;
-  /** The claim number this process saves under; null on a JSON bot, before the boot took one, or when it holds none. */
-  claim: number | null;
+  /** This boot's process id; null on a JSON bot. */
+  processId: string | null;
   leases: LeaseInfo[];
   shardTable: { shardId: number; nodeId: string; leaseId: string; status: string; guildCount: number }[];
   guildMap: Record<string, number>;
   budget: BudgetInfo | null;
+  /** Every claim row of the active count, as last read; empty on a JSON bot. */
+  claims: FleetClaimRow[];
+  nodes: FleetNodeRow[];
+  /** Ms since this process last read the claims; null before the first read. */
+  claimsReadAgoMs: number | null;
+  /** The last read is older than 2R: the page says "as last read". */
+  claimsStale: boolean;
+  renewalError: FailureClass | null;
+  /** The class of the last failed claims read, or null once a read completes. */
+  claimsReadError: FailureClass | null;
+  stillConnected: number[];
+  pendingRestart: string | null;
+  /** Why the restart request waits (a fitness key); null when it was sent. */
+  restartWaiting: string | null;
+  returning: number[];
+  aboveTarget: number[];
   updatedAt: number;
 }
 
@@ -40,6 +86,7 @@ export interface FleetStateSources {
   runtime: LeaseRuntime;
   ingest: IngestService;
   ledger: IdentifyLedger;
+  claims: ShardClaims | null;
 }
 
 let sources: FleetStateSources | null = null;
@@ -47,6 +94,75 @@ let sources: FleetStateSources | null = null;
 /** Wired once by the shard boot. */
 export function _setFleetStateSources(s: FleetStateSources): void {
   sources = s;
+}
+
+const EMPTY_CLAIMS = {
+  claims: [] as FleetClaimRow[],
+  nodes: [] as FleetNodeRow[],
+  claimsReadAgoMs: null,
+  claimsStale: false,
+  renewalError: null,
+  claimsReadError: null,
+  stillConnected: [] as number[],
+  pendingRestart: null,
+  restartWaiting: null,
+  returning: [] as number[],
+  aboveTarget: [] as number[],
+};
+
+/**
+ * Decision 21's tables from the last page read: every time is a database delta at the read, moved on by ageMs (this
+ * process's clock since that read), so an old read does not show its times as current.
+ */
+function claimTables(claims: ShardClaims, shardCount: number, ageMs: number): Pick<FleetState, 'claims' | 'nodes' | 'aboveTarget'> {
+  const snap = claims.snapshot();
+  const page = snap.page;
+  if (!page) return { claims: [], nodes: [], aboveTarget: [] };
+  const less = (ms: number) => Math.max(ms - ageMs, 0);
+  const nodesById = new Map(page.nodes.map(n => [n.nodeId, n]));
+  const count = page.shardCount ?? shardCount;
+  const byShard = new Map(page.rows.map(r => [r.shardId, r]));
+  const rows: FleetClaimRow[] = [];
+  for (let shardId = 0; shardId < count; shardId++) {
+    const row = byShard.get(shardId);
+    if (!row) {
+      rows.push({ shardId, claim: null, holderName: null, holderNode: null, mine: false, homeName: null, state: 'never-taken', expiresInMs: null, expiredAgoMs: null, deferredMs: null });
+      continue;
+    }
+    const { state, deferredMs } = claimState(row, row.renewedAgoMs, nodesById.get(row.holderNode), page.upMs, page.uPrimeMs);
+    rows.push({
+      shardId,
+      claim: row.claim,
+      holderName: row.holderName,
+      holderNode: row.holderNode,
+      mine: row.holderProcess === snap.processId,
+      homeName: nodesById.get(row.homeNode)?.nodeName ?? row.homeNode,
+      state,
+      expiresInMs: isExpired(row, page.upMs) ? null : less(Math.max(row.expiresUpMs - page.uPrimeMs, 0)),
+      expiredAgoMs: isExpired(row, page.upMs) ? Math.max(page.uPrimeMs - row.expiresUpMs, 0) + ageMs : null,
+      deferredMs: deferredMs === undefined || deferredMs === null ? null : less(deferredMs),
+    });
+  }
+  const nodes: FleetNodeRow[] = page.nodes.map(n => {
+    const held = rowsFor(n.nodeId, page.rows, page.upMs);
+    const reason = held > n.capacity ? aboveReason(n, page.nodes, page.rows, page.upMs) : null;
+    return {
+      nodeId: n.nodeId,
+      name: n.nodeName,
+      target: n.capacity,
+      held,
+      fit: n.fit,
+      restartable: n.restartable,
+      returns: n.returns,
+      healthyForMs: n.healthyForMs === null ? null : n.healthyForMs + ageMs,
+      seenAgoMs: n.seenAgoMs + ageMs,
+      takeoverSeconds: n.takeoverSeconds,
+      aboveReason: reason?.kind === 'waiting-healthy' ? { ...reason, leftMs: less(reason.leftMs) } : reason,
+    };
+  });
+  const me = nodesById.get(page.nodes.find(n => n.processId === snap.processId)?.nodeId ?? '');
+  const aboveTarget = me && snap.held.length > me.capacity ? snap.held.map(p => p.shardId).sort((a, b) => a - b).slice(me.capacity) : [];
+  return { claims: rows, nodes, aboveTarget };
 }
 
 export function getFleetState(): FleetState {
@@ -62,16 +178,17 @@ export function getFleetState(): FleetState {
       recommendedAt: null,
       dataBackend: resolveDataBackend(),
       dataBoot: getDataBootStatus(),
-      claim: null,
+      processId: null,
       leases: [],
       shardTable: [],
       guildMap: {},
       budget: null,
+      ...EMPTY_CLAIMS,
       updatedAt: Date.now(),
     };
   }
 
-  const { nodeId, nodeName, appVersion, runtime, ingest, ledger } = sources;
+  const { nodeId, nodeName, appVersion, runtime, ingest, ledger, claims } = sources;
   const lease = runtime.getCurrent();
   const leases = lease ? lease.leases.map(l => ({ ...l })) : [];
   const shardCount = lease?.shardCount ?? 0;
@@ -88,6 +205,22 @@ export function getFleetState(): FleetState {
       return { shardId: held.shardId, nodeId, leaseId: held.leaseId, status: entry?.status ?? 'Unknown', guildCount: entry?.guildCount ?? 0 };
     });
   const recommendation = ledger.getRecommendation();
+  let claimFields = { ...EMPTY_CLAIMS } as Pick<FleetState, keyof typeof EMPTY_CLAIMS>;
+  if (claims) {
+    const snap = claims.snapshot();
+    const readAgoMs = snap.pageReadAt === null ? null : Math.max(Math.round(performance.now() - snap.pageReadAt), 0);
+    claimFields = {
+      ...claimTables(claims, shardCount, readAgoMs ?? 0),
+      claimsReadAgoMs: readAgoMs,
+      claimsStale: readAgoMs !== null && readAgoMs > 2 * snap.renewMs,
+      renewalError: snap.renewalError,
+      claimsReadError: snap.pageReadError,
+      stillConnected: runtime.getStillConnected(),
+      pendingRestart: snap.pendingRestart,
+      restartWaiting: snap.restartWaiting,
+      returning: snap.returning,
+    };
+  }
   return {
     initialized: true,
     nodeId,
@@ -99,11 +232,12 @@ export function getFleetState(): FleetState {
     recommendedAt: recommendation?.readAt ?? sources.recommendedAt,
     dataBackend: resolveDataBackend(),
     dataBoot: getDataBootStatus(),
-    claim: lease?.claim ?? null,
+    processId: lease?.processId ?? null,
     leases,
     shardTable,
     guildMap,
     budget: ledger.getBudgetInfo(),
+    ...claimFields,
     updatedAt: Date.now(),
   };
 }

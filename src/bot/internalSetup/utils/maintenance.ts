@@ -1,5 +1,5 @@
 // Maintenance in the bot process: the manager's hook (maintenance:enter over IPC), booting in maintenance mode, a
-// database login refused with SQLSTATE 28000, and a database that does not answer for 300 seconds.
+// database login refused with SQLSTATE 28000, and the leave after the shard claims lapsed.
 
 import { ActivityType, Client, GatewayIntentBits, MessageFlags, type PresenceData } from 'discord.js';
 import {
@@ -15,7 +15,8 @@ import {
 } from './maintenanceGate';
 import { readMaintenanceFile } from '../../../utils/maintenanceFile';
 import { loadCredentials, resolveDataBackend } from '../../../utils/envLoader';
-import { drainForExit, isExitDraining, saveHeldWrites, stopHandler } from './dataManager';
+import { drainForExit, isExitDraining, saveHeldWrites, stopHandler, stopProcess } from './dataManager';
+import { STOPPED_SERVING_TEXT, stoppedServing } from './servingGate';
 import { getWorkingSet } from './dataBackends/workingSet';
 import { queuedFilePaths } from './dataBackends/fileBackend';
 import { isLoginRefused } from './dataBackends/postgresBackend';
@@ -24,6 +25,7 @@ import { getPaymentRegistry } from './payment/paymentRegistry';
 import { getPremiumManager } from './premiumManager';
 import { getSubscriptionNotifier } from './subscriptionNotifier';
 import { getMetricsCollector } from './metrics/metricsCollector';
+import { readShardRecord, type ShardRecord } from '../fleet/shardRecord';
 
 /** The web UI waits 20 seconds for the answer to maintenance:enter; both bounds together stay inside it. */
 export const ENTER_BOUNDS = { handlerWaitMs: 5_000, saveBoundMs: 13_000 };
@@ -32,7 +34,6 @@ const BOOT_PROBE_TIMEOUT_MS = 5_000;
 const DISCORD_RETRY_FIRST_MS = 5_000;
 const DISCORD_RETRY_MAX_MS = 60_000;
 const WATCH_PROBE_BOUND_MS = 5_000;
-const OUTAGE_DISCONNECT_MS = 300_000;
 
 const DEFAULT_TIMING = { leaveRetryMs: 5_000, filePollMs: 5_000, restartResendMs: 60_000, heldAfterPasses: 3, leaveSaveBoundMs: ENTER_BOUNDS.saveBoundMs };
 let timing = { ...DEFAULT_TIMING };
@@ -58,7 +59,11 @@ let clientRef: Client | null = null;
 let mode: MaintenanceMode = 'running';
 let discordStarted = false;
 let outageDisconnected = false;
+let lapsedSeconds = 0;
 let restartRequested = false;
+let restartResend: NodeJS.Timeout | null = null;
+let shardRestart = false;
+let restartAskedEarlier = false;
 let leaving = false;
 let heldReport: Held | null = null;
 // The watcher's last answer; null on a JSON bot or in maintenance mode, where no watcher runs, and before its first probe.
@@ -89,7 +94,11 @@ export function _resetMaintenance(): void {
   mode = 'running';
   discordStarted = false;
   outageDisconnected = false;
+  lapsedSeconds = 0;
   restartRequested = false;
+  restartResend = null;
+  shardRestart = false;
+  restartAskedEarlier = false;
   leaving = false;
   heldReport = null;
   databaseAnswer = null;
@@ -204,6 +213,7 @@ function startFilePoll(): void {
 
 /** Closes the gate: interactions get the message, module code stops, guild writes are refused, the status shows it. */
 export function closeMaintenanceGate(cause: MaintenanceCause, message: string): void {
+  withdrawRestart();
   setMaintenanceGate({ cause, message });
   installRefusalGuard();
   applyPresence();
@@ -241,6 +251,8 @@ export function installMaintenanceGate(client: Client): void {
   clientRef = client;
   const emit = client.emit;
   client.emit = function emitGated(this: Client, event: string | symbol, ...args: unknown[]): boolean {
+    // NB4 decision 6: after the claims lapsed or a shard was lost, no listener runs; an interaction gets no reply.
+    if (typeof event === 'string' && !PASSING_EVENTS.has(event) && stoppedServing()) return false;
     if (!isMaintenanceGateClosed() || typeof event !== 'string' || PASSING_EVENTS.has(event)) {
       return (emit as (event: string | symbol, ...args: unknown[]) => boolean).call(this, event, ...args);
     }
@@ -281,6 +293,7 @@ export async function enterMaintenance(message: string, opts: { handlerWaitMs?: 
 const MODULE_CODE_REQUESTS = new Set(['command:invoke', 'module:reload', 'module:reload-all', 'module:load', 'module:unload', 'component:toggle']);
 
 export function maintenanceIpcRefusal(type: string): object | null {
+  if ((MODULE_CODE_REQUESTS.has(type) || type.startsWith('panel:')) && stoppedServing()) return { success: false, error: STOPPED_SERVING_TEXT };
   if (!isMaintenanceGateClosed()) return null;
   if (MODULE_CODE_REQUESTS.has(type) || type.startsWith('panel:')) return { success: false, maintenance: true, error: maintenanceText() };
   if (type === 'data:guild-write') return { ok: false, code: 'maintenance', error: maintenanceText() };
@@ -327,19 +340,75 @@ export function setupMaintenanceIPCAtBoot(): void {
   closeMaintenanceGate('hook', saved.message);
 }
 
-function requestRestart(reason: string): void {
+/** A web UI process runs that can restart this bot process: an IPC channel to it exists. */
+export function canRestart(): boolean {
+  return !!process.send || send !== processSender;
+}
+
+function requestRestart(reason: string, forShards = false): void {
   if (restartRequested) return;
   restartRequested = true;
-  if (!process.send && send === processSender) {
-    console.error(`[Maintenance] ${reason}, but no web UI process runs to restart this bot process; restart it by hand`);
+  if (!canRestart()) {
+    // NB4 decision 16: a process that nothing can restart ends through its stop handler, which releases its shards.
+    console.error(`[Maintenance] ${reason}, but no web UI process runs to restart this bot process, so it stops; start it again by hand`);
+    stopProcess();
     return;
   }
-  console.log(`[Maintenance] ${reason}; asking the web UI process to restart the bot process`);
+  if (forShards) console.log(`[Shards] Restarting this bot process to ${reason}`);
+  else console.log(`[Maintenance] ${reason}; asking the web UI process to restart the bot process`);
   send({ type: 'control:restart-bot', data: { reason } });
-  every(timing.restartResendMs, () => {
+  shardRestart = forShards;
+  restartResend = every(timing.restartResendMs, () => {
     console.warn(`[Maintenance] The bot process still runs ${Math.round(timing.restartResendMs / 1000)} s after asking for its restart; asking again`);
     send({ type: 'control:restart-bot', data: { reason } });
   });
+}
+
+/**
+ * NB4 decision 15: a restart for a gain, a return or a move, asked only while the process is fit (checked right before
+ * the request) and only with a web UI process to ask. True once the request is sent.
+ */
+export function restartForShards(reason: string, fitness: () => string | null): boolean {
+  if (restartRequested) return true;
+  if (!canRestart() || fitness() !== null) return false;
+  requestRestart(reason, true);
+  return true;
+}
+
+/**
+ * Once the process stops serving or the gate closes, only the leave asks for a restart, when nothing is held: a shard
+ * restart stops being re-sent, though a request already sent may still be queued. The leave's own request stays.
+ */
+function withdrawRestart(): void {
+  if (restartResend === null || !shardRestart) return;
+  stopTimer(restartResend);
+  restartResend = null;
+  shardRestart = false;
+  restartRequested = false;
+  restartAskedEarlier = true;
+}
+
+/** The leave asked for its own restart: the process waits on the web UI, not on maintenance. */
+export function leaveRestartAsked(): boolean {
+  return restartRequested && !shardRestart;
+}
+
+/** NB4 decision 16: the claims lapsed; every shard left Discord and the watcher's next answer starts the leave. */
+export function noteClaimsLapsed(seconds: number): void {
+  if (outageDisconnected) return;
+  withdrawRestart();
+  outageDisconnected = true;
+  lapsedSeconds = seconds;
+  reportMode('outage');
+}
+
+/** Decision 14's maintenance keys of fitness: null when they allow a take, else the key that failed. */
+export function maintenanceUnfit(): string | null {
+  if (mode !== 'running') return `maintenance mode ${mode}`;
+  if (isMaintenanceGateClosed()) return 'the maintenance gate is closed';
+  if (leaving) return 'leaving';
+  if (restartRequested) return 'restarting';
+  return null;
 }
 
 /** What is held, by name: each guild with why its last save failed, and each file path. */
@@ -375,7 +444,14 @@ export function startLeave(reason: string): void {
   stopTimer(filePoll);
   filePoll = null;
   const own = generation;
-  console.log(`[Maintenance] ${reason}; saving what this process holds before it restarts`);
+  const restarts = canRestart();
+  withdrawRestart();
+  const earlier = restartAskedEarlier ? '; a restart this process asked for earlier may still stop it, which drops them' : '';
+  console.log(`[Maintenance] ${reason}; saving what this process holds before it ${restarts ? 'restarts' : 'stops (no web UI process runs to restart it)'}`);
+  const restart = (): void => {
+    for (const line of getWorkingSet()?.takeDropLines() ?? []) console.error(line);
+    requestRestart(reason);
+  };
   void (async () => {
     let answeredPasses = 0;
     let refusedPasses = 0;
@@ -384,7 +460,7 @@ export function startLeave(reason: string): void {
       const left = isMaintenanceBoot() ? { unsavedGuilds: 0, unsavedFiles: 0 } : await saveHeldWrites(timing.leaveSaveBoundMs);
       if (own !== generation) return;
       if (left.unsavedGuilds === 0 && left.unsavedFiles === 0) {
-        requestRestart(reason);
+        restart();
         return;
       }
       const answers = !watching || databaseAnswer === 'answers';
@@ -394,10 +470,12 @@ export function startLeave(reason: string): void {
         const names = heldNames();
         const held = { unsavedGuilds: left.unsavedGuilds, unsavedFiles: left.unsavedFiles };
         if (refusedPasses >= timing.heldAfterPasses) {
-          console.error(`[Maintenance] ${refusedPasses} saves in a row left changes the database refuses for their content: ${names}; the bot process asks for its restart, which drops these changes`);
+          console.error(`[Maintenance] ${refusedPasses} saves in a row left changes the database refuses for their content: ${names}; ${restarts
+            ? 'the bot process asks for its restart, which drops these changes'
+            : 'the bot process stops, which drops these changes'}`);
           heldReport = held;
           reportMode('held', held);
-          requestRestart(reason);
+          restart();
           return;
         }
         const forContent = refusedPasses > 0;
@@ -405,8 +483,10 @@ export function startLeave(reason: string): void {
         if (key !== heldKey) {
           heldKey = key;
           console.error(`[Maintenance] ${answeredPasses} saves in a row left changes unsaved: ${names}; ${forContent
-            ? `the database refuses these for their content; ${standing()}, and after ${timing.heldAfterPasses} saves in a row that fail this way it restarts and drops them`
-            : `${standing()} and does not restart until they are saved or the operator restarts it, which drops them`}`);
+            ? `the database refuses these for their content; ${standing()}, and after ${timing.heldAfterPasses} saves in a row that fail this way it ${restarts ? 'restarts' : 'stops'} and drops them`
+            : restarts
+              ? `${standing()} and does not restart until they are saved or the operator restarts it, which drops them${earlier}`
+              : `${standing()} and does not stop until they are saved or the operator stops it, which drops them`}`);
           heldReport = held;
           reportMode('held', held);
         }
@@ -480,44 +560,37 @@ export interface WatchedBackend {
 /**
  * The run-time watcher of a Postgres bot (ruling K): SELECT 1 through the backend's pool every retryMs, bounded at 5
  * seconds. Refused (SQLSTATE 28000) is ruling 7: the gate closes with the saved message and the bot stays on Discord.
- * Every probe unreachable for 300 seconds in a row takes every shard off Discord and keeps what the process holds.
- * The first answer after that, or after a refused login while the file says running, starts the leave step.
+ * The first answer after the shard claims lapsed (NB4), or after a refused login while the file says running, starts
+ * the leave step.
  */
 export function watchDataBackend(
   backend: WatchedBackend | null,
-  deps: { retryMs?: number; probeTimeoutMs?: number; now?: () => number; disconnect?: () => Promise<void> } = {},
+  deps: { retryMs?: number; probeTimeoutMs?: number } = {},
 ): { probeNow(): Promise<void> } | null {
   if (!backend) return null;
   watching = true;
-  const now = deps.now ?? Date.now;
   const bound = deps.probeTimeoutMs ?? WATCH_PROBE_BOUND_MS;
-  let unreachableSince: number | null = null;
   let toldAnswers = false;
 
+  // NB4 decision 22: any 28000 closes an open gate, whatever leaving and discordStarted are; before the login it also
+  // starts the leave.
   const loginRefused = (): void => {
-    if (isMaintenanceBoot() || leaving || isMaintenanceGateClosed() || outageDisconnected) return;
-    if (!discordStarted) {
-      startLeave('The database refused the login (SQLSTATE 28000) while the bot process booted');
-      return;
+    if (isMaintenanceBoot()) return;
+    if (!isMaintenanceGateClosed()) {
+      withdrawRestart();
+      const earlier = restartAskedEarlier ? '; a restart this process asked for earlier may still stop it, which drops them' : '';
+      console.warn(`[Maintenance] The database refused the login (SQLSTATE 28000); answering with the maintenance message and keeping the unsaved changes until the login returns${earlier}`);
+      closeMaintenanceGate('login-refused', readMaintenanceFile().message);
+      toldAnswers = false;
     }
-    console.warn('[Maintenance] The database refused the login (SQLSTATE 28000); answering with the maintenance message and keeping the unsaved changes until the login returns');
-    closeMaintenanceGate('login-refused', readMaintenanceFile().message);
-    toldAnswers = false;
+    if (!discordStarted) startLeave('The database refused the login (SQLSTATE 28000) while the bot process booted');
   };
   backend.onLoginRefused(loginRefused);
-
-  const disconnectForOutage = (): void => {
-    if (isMaintenanceGateClosed() || outageDisconnected || !discordStarted) return;
-    outageDisconnected = true;
-    console.error(`[Maintenance] The database has not answered for ${Math.round(OUTAGE_DISCONNECT_MS / 1000)} s; disconnecting every shard from Discord and keeping the unsaved changes until it answers`);
-    reportMode('outage');
-    void (deps.disconnect ?? defaultDisconnect)().catch(error => console.error('[Maintenance] Could not disconnect from Discord:', error));
-  };
 
   const answered = (): void => {
     if (leaving) return;
     if (outageDisconnected) {
-      startLeave('The database answers again');
+      startLeave(`The shard claims lapsed (no renewal for ${lapsedSeconds} s) and the database answers`);
       return;
     }
     if (maintenanceCause() !== 'login-refused') return;
@@ -540,12 +613,7 @@ export function watchDataBackend(
         new Promise<DatabaseAnswer>(resolve => { timer = setTimeout(() => resolve('unreachable'), bound); timer.unref(); }),
       ]);
       databaseAnswer = answer;
-      if (answer === 'unreachable') {
-        unreachableSince ??= now();
-        if (now() - unreachableSince >= OUTAGE_DISCONNECT_MS) disconnectForOutage();
-        return;
-      }
-      unreachableSince = null;
+      if (answer === 'unreachable') return;
       if (answer === 'refused') loginRefused();
       else answered();
     } finally {
@@ -555,11 +623,6 @@ export function watchDataBackend(
   };
   every(deps.retryMs ?? LOGIN_RETRY_MS, () => { void probeNow(); });
   return { probeNow };
-}
-
-async function defaultDisconnect(): Promise<void> {
-  const { getIngestService } = await import('../ingest/ingestService');
-  await getIngestService().stop('the database does not answer');
 }
 
 /** Wires the Discord payment bridge without starting any provider ticker (ruling 10, maintenance mode). */
@@ -586,42 +649,75 @@ export async function runMaintenanceBoot(
     loginProbe?: LoginProbe;
     retryMs?: number;
     sleep?: (ms: number) => Promise<void>;
+    shardRecord?: () => ShardRecord | null;
   } = {},
-): Promise<Client> {
+): Promise<Client | null> {
   markMaintenanceBoot();
   setMaintenanceGate({ cause: decision.cause, message: decision.message });
   installRefusalGuard();
+  // NB4 decision 16: the stop handler exists before anything that can start a leave; its destroy step acts only on a
+  // Client that exists by then.
+  let client: Client | null = null;
+  const shutdown = stopHandler(async () => {
+    try {
+      if (client) await Promise.race([client.destroy().catch(() => undefined), new Promise(resolve => setTimeout(resolve, 2000))]);
+      await drainForExit(5000);
+    } finally {
+      process.exit(0);
+    }
+  });
+  process.on('SIGTERM', () => void shutdown());
+  process.on('SIGINT', () => void shutdown());
   console.log(decision.cause === 'hook'
     ? '[Maintenance] Booting in maintenance mode: the saved state says maintenance'
     : '[Maintenance] Booting in maintenance mode: the database refused the login');
   setupMaintenanceIPC();
   reportMode(decision.cause === 'hook' ? 'maintenance' : 'login-refused', undefined, true);
   if (decision.cause === 'hook') startFilePoll();
+  if (decision.cause === 'login-refused') watchLogin(deps.loginProbe ?? probeLoginAtBoot, deps.retryMs ?? LOGIN_RETRY_MS);
   const retry = discordRetry(deps.sleep ?? (ms => new Promise<void>(resolve => { setTimeout(resolve, ms); })));
 
-  const shardCount = await retry('Could not fetch the shard count from Discord', deps.shards ?? defaultShardCount);
+  let shardCount: number;
+  let shardIds: number[];
+  if (postgresBot()) {
+    // NB4 decision 22: the shards this machine served at its last start, under that start's count.
+    const record = (deps.shardRecord ?? readShardRecord)();
+    if (!record || record.shardIds.length === 0) {
+      console.log(record
+        ? '[Maintenance] Booting in maintenance mode with no shard: this machine served none at its last start'
+        : '[Maintenance] Booting in maintenance mode with no shard: this machine has no record of the shards it served');
+      return null;
+    }
+    shardCount = record.shardCount;
+    shardIds = [...new Set(record.shardIds)].sort((a, b) => a - b);
+    console.log(`[Maintenance] Booting in maintenance mode on shard(s) ${shardIds.join(', ')} of ${shardCount}, the shards this machine served at its last start`);
+  } else {
+    shardCount = await retry('Could not fetch the shard count from Discord', deps.shards ?? defaultShardCount);
+    shardIds = Array.from({ length: shardCount }, (_, i) => i);
+  }
   const options: ConstructorParameters<typeof Client>[0] = { intents: [GatewayIntentBits.Guilds], presence: MAINTENANCE_PRESENCE };
-  if (shardCount > 1) Object.assign(options, { shards: Array.from({ length: shardCount }, (_, i) => i), shardCount });
-  const client = new Client(options);
-  clientRef = client;
-  watchShards(client);
-  client.on('interactionCreate', interaction => void answerInMaintenance(interaction));
-  client.once('clientReady', () => console.log(`Logged in as ${client.user?.tag}! (maintenance mode, ${shardCount} shard(s))`));
-  attachPaymentBridge(client);
-
-  if (decision.cause === 'login-refused') watchLogin(deps.loginProbe ?? probeLoginAtBoot, deps.retryMs ?? LOGIN_RETRY_MS);
-
-  const shutdown = stopHandler(async () => {
-    await Promise.race([client.destroy().catch(() => undefined), new Promise(resolve => setTimeout(resolve, 2000))]);
-    await drainForExit(5000);
-    process.exit(0);
-  });
-  process.on('SIGTERM', () => void shutdown());
-  process.on('SIGINT', () => void shutdown());
+  Object.assign(options, { shards: shardIds, shardCount });
+  const built = new Client(options);
+  // The constructor copies SHARD_COUNT: a valid one is overwritten here, an invalid one throws before this.
+  Object.assign(built.options, { shards: shardIds, shardCount });
+  client = built;
+  clientRef = built;
+  watchShards(built);
+  built.on('interactionCreate', interaction => void answerInMaintenance(interaction));
+  built.once('clientReady', () => console.log(`Logged in as ${built.user?.tag}! (maintenance mode, ${shardIds.length} of ${shardCount} shard(s))`));
+  attachPaymentBridge(built);
 
   const login = deps.login ?? (c => c.login(process.env.DISCORD_TOKEN));
-  await retry('The Discord login failed', () => login(client));
-  return client;
+  await retry('The Discord login failed', () => login(built));
+  return built;
+}
+
+function postgresBot(): boolean {
+  try {
+    return resolveDataBackend() === 'postgres';
+  } catch {
+    return false;
+  }
 }
 
 /** Runs a Discord step until it succeeds, waiting 5 seconds after the first failure and doubling up to 60. */

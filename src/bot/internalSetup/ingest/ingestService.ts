@@ -24,12 +24,17 @@ export class IngestService {
     if (this.client) throw new Error('[Ingest] buildClient() called twice');
     const opts: ClientOptions = { ...options };
     const plan = this.shardPlan;
-    // {shards:[0], shardCount:1} is discord.js's default (@discordjs/ws getShardIds), so it is omitted.
-    if (plan && !(plan.shardCount === 1 && plan.shards.length === 1 && plan.shards[0] === 0)) {
+    // discord.js refuses shards: [], so an empty plan writes nothing and the process never logs in.
+    if (plan && plan.shards.length > 0) {
       (opts as any).shards = plan.shards;
       (opts as any).shardCount = plan.shardCount;
     }
     this.client = new Client(opts);
+    // The constructor copies SHARD_COUNT: a valid one is overwritten here, an invalid one throws before this.
+    if (plan && plan.shards.length > 0) {
+      (this.client.options as any).shards = plan.shards;
+      (this.client.options as any).shardCount = plan.shardCount;
+    }
     installInteractionLedgers(this.client, onInteraction);
     this.restoreRestToken();
     this.client.once('clientReady', () => { this.hasBeenReady = true; });
@@ -45,7 +50,7 @@ export class IngestService {
 
   setShardPlan(shards: number[], shardCount: number): void {
     this.shardPlan = { shards: [...shards].sort((a, b) => a - b), shardCount };
-    if (this.client) {
+    if (this.client && shards.length > 0) {
       (this.client.options as any).shards = this.shardPlan.shards;
       (this.client.options as any).shardCount = shardCount;
     }

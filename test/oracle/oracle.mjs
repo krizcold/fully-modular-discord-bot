@@ -719,8 +719,8 @@ async function read(argv) {
 const URL_SECRET = /\b[a-z][a-z0-9+.-]*:\/\/[^\s"'@/]*@/gi;
 
 /**
- * @typedef {{ initialized: boolean, nodeId: string | null, shardCount: number | null, claim: number | null,
- *   leases: { shardId: number }[], shardTable: { shardId: number, nodeId: string | null, status: string | null }[],
+ * @typedef {{ initialized: boolean, nodeId: string | null, processId: string | null, shardCount: number | null,
+ *   leases: { shardId: number, claim: number | null }[], shardTable: { shardId: number, nodeId: string | null, status: string | null }[],
  *   guildMap: Record<string, number> }} FleetFacts
  */
 
@@ -735,9 +735,11 @@ export function reduceFleetState(state) {
   return {
     initialized: s.initialized === true,
     nodeId: typeof s.nodeId === 'string' ? s.nodeId : null,
+    processId: typeof s.processId === 'string' && s.processId !== '' ? s.processId : null,
     shardCount: typeof s.shardCount === 'number' ? s.shardCount : null,
-    claim: typeof s.claim === 'number' ? s.claim : null,
-    leases: Array.isArray(s.leases) ? s.leases.map((/** @type {any} */ l) => ({ shardId: l.shardId })) : [],
+    leases: Array.isArray(s.leases)
+      ? s.leases.map((/** @type {any} */ l) => ({ shardId: l.shardId, claim: typeof l.claim === 'number' ? l.claim : null }))
+      : [],
     shardTable: Array.isArray(s.shardTable)
       ? s.shardTable.map((/** @type {any} */ r) => ({ shardId: r.shardId, nodeId: r.nodeId ?? null, status: r.status ?? null }))
       : [],
@@ -784,17 +786,31 @@ async function cleanup(argv) {
 
 /**
  * The claim sequence listing, one line under `psql -At`: claim_seq's
- * last_value and is_called, and the highest guild_ownership claim (null when
- * none). The input check.mjs takes as --ownership.
+ * last_value and is_called, the highest guild_ownership claim and the highest
+ * shard_claims claim (each null when none). The input check.mjs takes as
+ * --ownership.
  */
 export function ownershipSql() {
-  return `SELECT json_build_object('last', s.last_value, 'called', s.is_called, 'highest', (SELECT max(claim) FROM smdb_data.guild_ownership)) FROM smdb_data.claim_seq s`;
+  return `SELECT json_build_object('last', s.last_value, 'called', s.is_called, 'highest', (SELECT max(claim) FROM smdb_data.guild_ownership), 'claims', (SELECT max(claim) FROM smdb_data.shard_claims)) FROM smdb_data.claim_seq s`;
+}
+
+/**
+ * The shard claims listing, one line under `psql -At` (jsonb prints no line
+ * breaks): every shard_claims row of every count. The input check.mjs takes
+ * as --claims.
+ */
+export function claimsSql() {
+  return `SELECT jsonb_build_object('rows', COALESCE(jsonb_agg(jsonb_build_object('count', shard_count, 'shard', shard_id, 'claim', claim, 'process', holder_process, 'released', released) ORDER BY shard_count, shard_id), '[]'::jsonb)) FROM smdb_data.shard_claims`;
 }
 
 /** @param {string[]} argv */
 async function sql(argv) {
   if (argv.length === 1 && argv[0] === 'ownership') {
     process.stdout.write(`${ownershipSql()}\n`);
+    return;
+  }
+  if (argv.length === 1 && argv[0] === 'claims') {
+    process.stdout.write(`${claimsSql()}\n`);
     return;
   }
   const a = parseArgs(argv, { log: 'many' });
@@ -863,7 +879,8 @@ const USAGE = `${WRITE_USAGE}
 oracle.mjs read --log FILE [--log FILE ...] --target URL --name COPY --out FILE [--limit N] [--limiter SPEC] [--timeout MS]
 oracle.mjs fleet --target URL --name NODE --out FILE [--limiter SPEC] [--timeout MS]
 oracle.mjs sql --log FILE      the psql query that lists the run's docs
-oracle.mjs sql ownership       the psql query that lists guild_ownership's claims
+oracle.mjs sql ownership       the psql query that lists the claim sequence and the highest stored claims
+oracle.mjs sql claims          the psql query that lists shard_claims
 oracle.mjs bite --log FILE     the bite test's two tamperings, as SQL
 oracle.mjs cleanup --log FILE [--log FILE ...] --target URL [--limiter SPEC]`;
 

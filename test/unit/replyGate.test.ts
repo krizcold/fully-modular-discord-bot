@@ -18,6 +18,7 @@ import {
   saveDataOutcome,
 } from '../../src/bot/internalSetup/utils/dataManager';
 import { freezeGuildWrites, unfreezeGuildWrites } from '../helpers/freezeGuild';
+import { readSourceText } from '../helpers/sourceText';
 import {
   INTERACTION_LEDGER_LIFE_MS,
   ledgerOf,
@@ -1654,7 +1655,7 @@ describe('where the gate is installed', () => {
   });
 
   it.skipIf(process.env.__STRYKER_ACTIVE_MUTANT__ !== undefined)('the bot builds its gateway client with the reply gate (clientInitializer.ts)', () => {
-    const source = fs.readFileSync(path.join(__dirname, '../../src/bot/internalSetup/clientInitializer.ts'), 'utf8');
+    const source = readSourceText(__dirname, '../../src/bot/internalSetup/clientInitializer.ts');
     expect(source).toMatch(/getIngestService\(\)\.buildClient\(\{[^}]*\}, installReplyGate\)/);
   });
 });

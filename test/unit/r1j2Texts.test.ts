@@ -17,6 +17,7 @@ import { currentSince, ledgerOf } from '../../src/bot/internalSetup/utils/dataBa
 import { getMetricsCollector } from '../../src/bot/internalSetup/utils/metrics/metricsCollector';
 import { getModuleEventManager } from '../../src/bot/internalSetup/utils/moduleEventManager';
 import { rawCommand, rig, tick } from '../helpers/gateRig';
+import { readSourceText } from '../helpers/sourceText';
 import { readinessRig, stopDrivers } from '../helpers/readinessRig';
 
 afterEach(() => {
@@ -149,7 +150,7 @@ describe('the module event wrapper', () => {
   // under vitest, so in these tests it passes every event; its reader is pinned by text instead (skipped inside the
   // mutation gate's sandbox, which instruments the source).
   it.skipIf(process.env.__STRYKER_ACTIVE_MUTANT__ !== undefined)('the whole-module tier gate reads extractGuildId, so a Guild payload counts there', () => {
-    const source = fs.readFileSync(path.resolve(__dirname, '../../src/bot/internalSetup/utils/moduleEventManager.ts'), 'utf-8');
+    const source = readSourceText(__dirname, '../../src/bot/internalSetup/utils/moduleEventManager.ts');
     const gate = source.slice(source.indexOf('  private shouldSkipEvent('));
     expect(gate).toContain('    const guildId = extractGuildId(args);\n');
     expect(gate).not.toContain('eventGuildId');

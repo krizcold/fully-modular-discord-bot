@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { readSourceText } from '../helpers/sourceText';
 
 import { saveData } from '../../src/bot/internalSetup/utils/dataManager';
 import { dropPendingForGuild } from '../../src/bot/internalSetup/utils/dataBackends/fileBackend';
@@ -17,6 +18,7 @@ import {
   handleMaintenanceIpc,
   maintenanceMode,
   markDiscordStarted,
+  noteClaimsLapsed,
   setupMaintenanceIPCAtBoot,
   watchDataBackend,
 } from '../../src/bot/internalSetup/utils/maintenance';
@@ -140,7 +142,7 @@ function watchedDatabase(first: 'answers' | 'refused' | 'unreachable') {
   const watcher = watchDataBackend({
     onLoginRefused: () => undefined,
     askDatabase: async () => state.answer,
-  }, { retryMs: 3_600_000, now: () => state.now, disconnect })!;
+  }, { retryMs: 3_600_000 })!;
   markDiscordStarted();
   const at = async (ms: number, answer?: 'answers' | 'refused' | 'unreachable') => {
     state.now = ms;
@@ -387,13 +389,12 @@ describe('ruling M: the held report', () => {
     }
   }, 20_000);
 
-  it('R4-6: off Discord after an outage, the held log says the bot stays off Discord, not in maintenance', async () => {
+  it('R4-6: off Discord after the claims lapsed, the held log says the bot stays off Discord, not in maintenance', async () => {
     const { file, cleanup } = stuckFile();
     try {
-      const { at, disconnect } = watchedDatabase('unreachable');
+      const { at } = watchedDatabase('unreachable');
       await at(0);
-      await at(300_000);
-      expect(disconnect).toHaveBeenCalledTimes(1);
+      noteClaimsLapsed(20);
       await at(305_000, 'answers');
       await vi.waitFor(() => expect(errorsWith(file)).toHaveLength(1), { timeout: 10_000 });
       const line = String(errorsWith(file)[0][0]);
@@ -404,13 +405,12 @@ describe('ruling M: the held report', () => {
       cleanup();
     }
   }, 20_000);
-  it('R6-4: off Discord after an outage and then in maintenance, the held log says the bot stays off Discord (in maintenance)', async () => {
+  it('R6-4: off Discord after the claims lapsed and then in maintenance, the held log says the bot stays off Discord (in maintenance)', async () => {
     const { file, cleanup } = stuckFile();
     try {
-      const { at, disconnect } = watchedDatabase('unreachable');
+      const { at } = watchedDatabase('unreachable');
       await at(0);
-      await at(300_000);
-      expect(disconnect).toHaveBeenCalledTimes(1);
+      noteClaimsLapsed(20);
       closeMaintenanceGate('hook', 'm');
       await at(305_000, 'answers');
       await handleMaintenanceIpc({ type: 'maintenance:leave', requestId: 'o1', data: {} });
@@ -457,7 +457,7 @@ describe('ruling G: a hook during boot', () => {
   });
 
   it('main reads the file before the data layer, installs the listener and reads it again before the data layer opens, and the clientReady handler checks the gate after the startup barrier', () => {
-    const source = fs.readFileSync(path.resolve(__dirname, '../../src/bot/internalSetup/clientInitializer.ts'), 'utf-8');
+    const source = readSourceText(__dirname, '../../src/bot/internalSetup/clientInitializer.ts');
     const main = source.slice(source.indexOf('async function main()'));
     const decide = main.indexOf('await decideBoot()');
     const listen = main.indexOf('setupMaintenanceIPCAtBoot()');
@@ -473,8 +473,8 @@ describe('ruling G: a hook during boot', () => {
   });
 
   it('the shutdown skips the metric totals while the gate is closed', () => {
-    const source = fs.readFileSync(path.resolve(__dirname, '../../src/bot/internalSetup/clientInitializer.ts'), 'utf-8');
-    expect(source).toContain('if (!isMaintenanceGateClosed()) metrics.flushTotals();');
+    const source = readSourceText(__dirname, '../../src/bot/internalSetup/clientInitializer.ts');
+    expect(source).toContain('if (stopSteps.metricsReady && !isMaintenanceGateClosed()) getMetricsCollector().flushTotals();');
   });
 });
 

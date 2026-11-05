@@ -46,7 +46,9 @@ Before a move to JSON moves the copy in, every guild folder and every `/data/_gr
 to `/data/_superseded/<UTC time>-<job id>/` (a name such as `20261029T012345678Z-<job id>`; graveyard entries go under
 its `_graveyard/`), whether or not the database holds that guild. In either direction an earlier run's `.migrate-*`
 staging folder goes there too. A database store this deployment served before is renamed to
-`smdb_superseded_<ms>` the same way when a migration copies into that database again. A database that holds a store
+`smdb_superseded_<ms>` the same way when a migration copies into that database again, unless a bot process on another
+machine holds a shard claim in it and was seen within its takeover delay; the refusal names the shard and the machine,
+and a clean stop of the bot there releases the claim. A database that holds a store
 this deployment never served or minted is refused, and the refusal says when that store holds no guild rows, so it can
 be dropped.
 
@@ -79,6 +81,37 @@ digits and `-` and add it to the marker as `migration`):
 
 The commands, their answers and what each message asks for are in the console and web UI pages.
 
+## Shards on several machines
+
+A database bot keeps one claim per shard in its database (`smdb_data.shard_claims`, one row per shard: the machine
+holding it, a claim number and an expiry). Expiry is measured on a claim clock the database keeps
+(`smdb_data.claim_clock`), which runs only while some machine of the bot reaches the database; after a time when none
+did, every claim still live gets its whole takeover delay again, so a database restart or outage moves no shard. A
+machine renews its claims every takeover delay / 6, at most every 5 seconds, and leaves Discord when it has not renewed
+for two thirds of the delay (20 seconds at the default 30); another machine takes a shard only after its claim
+expired; every save checks that the claim it carries is the one the table holds for that machine's process, so a
+machine that was cut off and comes back cannot write over the new holder's data. A machine cut off from the database
+while the others reach it loses the changes it had not saved for the shards another machine takes: what it accepted
+in about two thirds of the takeover delay plus 5 seconds (25 seconds at the default 30), at most 5 minutes or 64 MiB
+of changes; the log names each guild and the count.
+
+FLEET_SHARD_CAPACITY is each machine's target (default 1; 0 for none): a machine takes shards up to its target first,
+takes more only when no other machine has room (it logs a warning per shard), and gives such a shard to a machine
+with room once that machine has been healthy for 5 minutes. So a bot on one machine serves every shard, and with the
+defaults the shards spread one per machine. FLEET_TAKEOVER_SECONDS is the takeover delay (15 to 3600, default 30), and
+FLEET_SHARD_RETURN (default true; false stops returns and moves). Machines read the shard count from the database: a
+changed FLEET_SHARD_COUNT takes effect when every machine has stopped and one starts again.
+
+A machine's set of shards is fixed while it runs: taking a shard, giving one away and losing one restart it, so its
+own shards are offline for its restart, and it restarts for a take or a give-away only while its saves succeed. A
+clean stop keeps its shards for its own next start, while a crash leaves them to any machine after the delay (a
+machine that restarts after the crash gets them first). Returns: a shard goes back to the machine that first held it
+once that machine has been healthy for 5 minutes and has room. A machine run without the web UI (`npm run dev:bot`)
+takes shards only when it starts, since nothing can restart it for a new one, so the other machines neither count it
+as room nor give it shards; when it would restart (after it could not renew, lost a shard, or after maintenance), it
+saves what it can, releases its shards and stops, so the other machines take them after the takeover delay; started
+again by hand, it takes back those still free. A JSON bot runs every shard in one process and takes no claims.
+
 ## Local development (Windows first-class)
 
 Any reachable Postgres works:
@@ -100,13 +133,14 @@ each guild's ownership row, which stops an older bot process from writing over a
 ## Availability: read this before you rely on it
 
 1. **The central database is the availability floor.** When it is down, every guild's data plane
-   degrades at once: the bot keeps running, accepts writes for a bounded window (about 5 minutes
-   or 64 MiB of buffered writes, whichever trips first; the window covers the whole bot, not
-   one guild), then refuses writes with a clear user-facing message until the database
-   returns. A hard crash loses the writes accepted and not yet stored: with the database
-   healthy, a write reaches it at most 5 seconds after it was accepted plus the time of two
-   flush transactions; during an outage, every write accepted since the outage began, at most
-   about 5 minutes or 64 MiB of them.
+   degrades at once. Unsaved changes keep waiting through an outage of the database as long as it
+   lasts (write acceptance closes after 300 seconds of unsaved changes or 64 MiB, whichever trips
+   first; the window covers the whole bot, not one guild), but the bot leaves Discord when it has
+   not renewed its shard claims for two thirds of the takeover delay (20 seconds at the default),
+   and restarts once the database answers and its changes are saved. A hard crash loses the
+   writes accepted and not yet stored: with the database healthy, a write reaches it at most 5
+   seconds after it was accepted plus the time of two flush transactions; during an outage, every
+   write accepted since the outage began.
 2. **The managed sidecar shares its host's fate.** The manager-provisioned Postgres runs on the
    same server as the bot; your recovery point is the last nightly dump unless you snapshot the
    volume yourself. It is never published on a host port.
@@ -123,8 +157,8 @@ each guild's ownership row, which stops an older bot process from writing over a
    cross-host database; and if you want at-rest protection, use full-disk encryption on the host.
 6. **Database HA is postgres-native.** Neither the bot nor the manager replicates the database:
    high availability of the data layer comes from the database world itself (a managed Postgres,
-   or streaming replication behind one stable URL). The bot coasts on the bounded
-   write-acceptance window while the URL fails over, a promoted replica keeps the store identity
+   or streaming replication behind one stable URL). The bot keeps its unsaved changes while the
+   URL fails over and leaves Discord if its claims cannot be renewed in time, a promoted replica keeps the store identity
    and is reattached to normally, and a wrong or empty database is refused outright instead of
    served. The sidecar tier's recovery point is the nightly `pg_dump`.
 

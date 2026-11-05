@@ -16,6 +16,7 @@ import { dataPath } from '../../../utils/dataRoot';
 import { getAppStoreManager } from './appStoreManager';
 import { reloadModules } from './moduleReloader';
 import { isMaintenanceGateClosed } from './maintenanceGate';
+import { stoppedServing } from './servingGate';
 
 const CHECK_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
 
@@ -88,7 +89,7 @@ export function startModuleAutoUpdater(client: Client): void {
   console.log(`[ModuleAutoUpdater] Started (interval: ${CHECK_INTERVAL_MS / 1000 / 60}min, enabled: ${isAutoUpdateEnabled()})`);
 
   intervalHandle = setInterval(() => {
-    if (isMaintenanceGateClosed()) return;
+    if (isMaintenanceGateClosed() || stoppedServing()) return;
     runModuleUpdateCheck().catch(err => {
       console.error('[ModuleAutoUpdater] Tick error:', err);
     });

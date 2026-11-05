@@ -6,6 +6,7 @@
 
 import { DataBackend, DocKey, FenceToken, GuildFlushBatch, GuildOwner } from './backend';
 import { setLeft } from './scopeRecord';
+import { stoppedServing } from '../servingGate';
 
 const DEBOUNCE_MS = 500;
 const MAX_DELAY_MS = 5000;
@@ -107,6 +108,8 @@ class GuildWorkingSet {
   writeSeq = 0;
   landedSeq = 0;
   flushError: { text: string; code?: string } | null = null;
+  // A save whose COMMIT got no answer since the last landed flush: some of the writes it carried may have landed.
+  commitUnanswered = false;
 
   constructor(readonly guildId: string, public fence: FenceToken) {}
 
@@ -333,17 +336,23 @@ export class WorkingSetManager {
     if (ws?.state === 'ready') ws.fence = token;
   }
 
+  /** A served set takes no write from now on (reads keep serving); NB4 decision 17 freezes before any flush. */
+  freeze(guildId: string): void {
+    const ws = this.sets.get(guildId);
+    if (ws?.state === 'ready') ws.state = 'frozen-retained';
+  }
+
   /**
-   * Lease removed: one final immediate flush under the OLD fence, then the set
-   * enters frozen-retained (reads keep serving, writes get the frozen
-   * rejection).
+   * Lease removed: the set enters frozen-retained (reads keep serving, writes
+   * get the frozen rejection), then one immediate flush under the OLD fence.
    */
   async unloadToFrozenRetained(guildId: string, stillGone: () => boolean = () => true): Promise<void> {
     const ws = this.sets.get(guildId);
     if (!ws || ws.state === 'fenced') return;
+    this.freeze(guildId);
     await this.flushGuildNow(guildId, MAX_DELAY_MS);
     // A lease back while the flush ran keeps the set served.
-    if (ws.state === 'ready' && stillGone()) ws.state = 'frozen-retained';
+    if (ws.state === 'frozen-retained' && !stillGone() && this.sets.get(guildId) === ws) ws.state = 'ready';
   }
 
   /** Frozen under an older grant than the token's: a hydrate under the token serves it again. */
@@ -556,6 +565,8 @@ export class WorkingSetManager {
     // What held it closed may have left with no flush landing (a deposed or evicted set).
     this.reopenIfDrained();
     if (this.health === 'refusing') return 'refusing';
+    // NB4 decision 6: asked at the moment the write is accepted, so a write queued across the deadline is refused.
+    if (stoppedServing()) return 'frozen-window';
     return 'ok';
   }
 
@@ -639,6 +650,7 @@ export class WorkingSetManager {
       }
       this.landed += 1;
       ws.flushError = null;
+      ws.commitUnanswered = false;
       this.noteFlushSuccess();
       if (ws.requeue || ws.dirtyKeys.size > 0) {
         ws.requeue = false;
@@ -649,6 +661,7 @@ export class WorkingSetManager {
     }
 
     if (outcome.reason === 'deposed') {
+      this.noteDropped(ws, new Set([...flushedKeys, ...ws.dirtyKeys]).size);
       this.onDeposed(ws, outcome.currentOwner);
       return false;
     }
@@ -656,9 +669,34 @@ export class WorkingSetManager {
     for (const key of flushedKeys) ws.dirtyKeys.add(key);
     ws.requeue = false;
     ws.flushError = { text: outcome.detail ?? 'the store did not take the flush', code: outcome.code };
+    if (outcome.commitUnanswered) ws.commitUnanswered = true;
     this.noteFlushFailure('flush unavailable');
     this.scheduleRetry();
     return false;
+  }
+
+  private readonly dropped = new Map<number, { changes: number; guilds: Set<string>; unanswered: Set<string> }>();
+
+  private noteDropped(ws: GuildWorkingSet, changes: number): void {
+    if (changes === 0) return;
+    const entry = this.dropped.get(ws.fence.shardId) ?? { changes: 0, guilds: new Set<string>(), unanswered: new Set<string>() };
+    entry.changes += changes;
+    entry.guilds.add(ws.guildId);
+    if (ws.commitUnanswered) entry.unanswered.add(ws.guildId);
+    this.dropped.set(ws.fence.shardId, entry);
+  }
+
+  /** NB4 decision 16's drop lines, one per shard, for writes refused 'deposed' since the last report. */
+  takeDropLines(): string[] {
+    const lines: string[] = [];
+    for (const [shardId, entry] of [...this.dropped].sort((a, b) => a[0] - b[0])) {
+      const guilds = [...entry.guilds].sort();
+      let line = `[Shards] ${entry.changes} unsaved change(s) of ${guilds.length} guild(s) of shard ${shardId} were dropped: ${guilds.join(', ')}`;
+      if (entry.unanswered.size > 0) line += `; guild(s) ${[...entry.unanswered].sort().join(', ')} had a save whose answer never came, so some of these changes may have landed`;
+      lines.push(line);
+    }
+    this.dropped.clear();
+    return lines;
   }
 
   private onDeposed(ws: GuildWorkingSet, owner?: GuildOwner): void {

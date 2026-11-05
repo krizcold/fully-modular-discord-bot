@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } fr
 
 import { saveData, saveDataOutcome } from '../../src/bot/internalSetup/utils/dataManager';
 import { freezeGuildWrites } from '../helpers/freezeGuild';
+import { readSourceText } from '../helpers/sourceText';
 import { INTERACTION_LEDGER_LIFE_MS, ledgerOf, openLedger, runInLedger, withModule } from '../../src/bot/internalSetup/utils/dataBackends/writeLedger';
 import { ACK_MS, answerWrites, sweepLateWrites, writesConfirmed } from '../../src/bot/internalSetup/utils/dataBackends/replyGate';
 import { notReadyGuild, rawButton, rawCommand, rawModal, rig, storeGuild, textOf, tick } from '../helpers/gateRig';
@@ -512,7 +513,7 @@ describe('the dispatcher', () => {
   // instruments the file, so the pin is skipped there. dispatchGated's rows (r1j2DispatchGated.test.ts) hold the
   // behaviour: the gate, the dispatch from the admission, and the sweep the listener does not wait on.
   it.skipIf(process.env.__STRYKER_ACTIVE_MUTANT__ !== undefined)('hands every internal event to dispatchGated', () => {
-    const source = fs.readFileSync(path.resolve(__dirname, '../../src/bot/internalSetup/clientInitializer.ts'), 'utf-8');
+    const source = readSourceText(__dirname, '../../src/bot/internalSetup/clientInitializer.ts');
     expect(source).toContain('    client.on(eventName, (...args) => dispatchGated(eventName, args, dispatchOrdered));\n');
   });
 });

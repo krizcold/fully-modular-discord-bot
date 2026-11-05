@@ -28,6 +28,7 @@ import { reRegisterSlashCommands } from './commandUtils';
 import { isAutoCleanupEnabled } from '../events/clientReady/registerCommands';
 import { clearSchemaCache, getModulesWithSettings } from './settings/settingsDiscovery';
 import { createAllSettingsPanels } from './settings/settingsPanelFactory';
+import { STOPPED_SERVING_TEXT, stoppedServing } from './servingGate';
 import { getMetricsCollector } from './metrics/metricsCollector';
 import { resolveClientApplication } from './clientApplication';
 import { beginReload, endReload, recordLoadFailure } from './loadFailures';
@@ -201,6 +202,8 @@ function resolveHotLoad(
  * ModuleLoader.loadModule() only creates the LoadedModule, it doesn't attach to the client.
  */
 async function registerReloadedModule(client: Client, module: LoadedModule): Promise<void> {
+  // NB4 decision 6: a compile or load that ran across the deadline or a loss registers nothing and calls no module code.
+  if (stoppedServing()) throw new Error(STOPPED_SERVING_TEXT);
   const registry = getModuleRegistry();
   registry.register(module);
 
@@ -273,6 +276,7 @@ async function registerReloadedModule(client: Client, module: LoadedModule): Pro
     }
   }
 
+  if (stoppedServing()) throw new Error(STOPPED_SERVING_TEXT);
   // Call onReady hook
   if (module.hooks?.onReady) {
     try {

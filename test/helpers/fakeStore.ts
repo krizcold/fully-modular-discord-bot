@@ -142,4 +142,4 @@ export class FakeStore implements DataBackend {
 }
 
 let claims = 0;
-export const tokenFor = (): FenceToken => ({ nodeId: 'node-a', claim: ++claims, shardId: 0, shardCount: 1 });
+export const tokenFor = (): FenceToken => ({ nodeId: 'node-a', claim: ++claims, processId: 'process-a', shardId: 0, shardCount: 1 });

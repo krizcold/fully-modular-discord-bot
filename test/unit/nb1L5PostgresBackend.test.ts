@@ -46,7 +46,7 @@ describe('provisioning', () => {
     let created = false;
     const { backend, sent } = scripted(sql => {
       if (/CREATE TABLE IF NOT EXISTS smdb_data\.meta/.test(sql)) created = true;
-      if (VERSION_READ.test(sql)) return created ? { rows: [{ value: '{"v":2}' }], rowCount: 1 } : missing();
+      if (VERSION_READ.test(sql)) return created ? { rows: [{ value: '{"v":3}' }], rowCount: 1 } : missing();
       return undefined;
     });
     await internals(backend).provision();
@@ -78,7 +78,7 @@ describe('provisioning', () => {
     let inserted = false;
     const { backend } = scripted(sql => {
       if (/INSERT INTO smdb_data\.meta \(key, value\) VALUES \('schema_version'/.test(sql)) inserted = true;
-      if (VERSION_READ.test(sql)) return inserted ? { rows: [{ value: '{"v":2}' }], rowCount: 1 } : { rows: [], rowCount: 0 };
+      if (VERSION_READ.test(sql)) return inserted ? { rows: [{ value: '{"v":3}' }], rowCount: 1 } : { rows: [], rowCount: 0 };
       return undefined;
     });
     await internals(backend).provision();
@@ -128,56 +128,7 @@ describe('the provisioning verdict', () => {
   });
 });
 
-function claimBackend(nextval: unknown[], max: unknown[]) {
-  const s = scripted(sql => {
-    if (/nextval\('smdb_data\.claim_seq'\)/.test(sql)) return { rows: nextval, rowCount: nextval.length };
-    if (/max\(claim\)/.test(sql)) return { rows: max, rowCount: max.length };
-    return undefined;
-  });
-  internals(s.backend).provisioned = true;
-  return s;
-}
-
-describe('taking a claim', () => {
-  it('a negative sequence value is refused', async () => {
-    const { backend, sent, releases } = claimBackend([{ claim: '-5' }], [{ claim: null }]);
-    await expect(backend.takeClaim()).rejects.toThrow('unusable claim number -5');
-    expect(sent).not.toContain('COMMIT');
-    expect(releases).toEqual([true]);
-  });
-
-  it('a sequence value that is not a number is refused, naming the value', async () => {
-    const { backend } = claimBackend([{ claim: 'abc' }], [{ claim: null }]);
-    await expect(backend.takeClaim()).rejects.toThrow(/^unusable claim number abc$/);
-  });
-
-  it('a sequence value of 0 is raised to 1', async () => {
-    const { backend, sent, releases } = claimBackend([{ claim: '0' }], [{ claim: null }]);
-    expect(await backend.takeClaim()).toEqual({ outcome: 'claimed', claim: 1 });
-    expect(sent).toContain('COMMIT');
-    expect(releases).toEqual([undefined]);
-  });
-
-  it('a sequence query that returns no row is refused, naming the missing value', async () => {
-    const { backend } = claimBackend([], [{ claim: null }]);
-    await expect(backend.takeClaim()).rejects.toThrow(/^unusable claim number undefined$/);
-  });
-
-  it('a max query that returns no row leaves the sequence value', async () => {
-    const { backend, releases } = claimBackend([{ claim: '7' }], []);
-    expect(await backend.takeClaim()).toEqual({ outcome: 'claimed', claim: 7 });
-    expect(releases).toEqual([undefined]);
-  });
-
-  it('a claim raised past the safe integers is refused and not committed', async () => {
-    const { backend, sent, releases } = claimBackend([{ claim: '5' }], [{ claim: String(Number.MAX_SAFE_INTEGER) }]);
-    await expect(backend.takeClaim()).rejects.toThrow(`unusable claim number ${Number.MAX_SAFE_INTEGER + 1}`);
-    expect(sent).not.toContain('COMMIT');
-    expect(releases).toEqual([true]);
-  });
-});
-
-const token: FenceToken = { nodeId: 'node-a', claim: 3, shardId: 0, shardCount: 1 };
+const token: FenceToken = { nodeId: 'node-a', claim: 3, processId: 'process-a', shardId: 0, shardCount: 1 };
 const emptyBatch = { upserts: [], deletes: [], appends: [] };
 
 describe('flushing a guild', () => {
@@ -189,13 +140,13 @@ describe('flushing a guild', () => {
     expect(sent).toContain('COMMIT');
   });
 
-  it('a deposed flush whose owner cannot be read names the owner unknown', async () => {
+  it('a deposed flush with no ownership row and no claim row names both', async () => {
     quiet();
     const { backend } = scripted(() => undefined);
     const alerts: [string, string][] = [];
     backend.onAlert((event, detail) => { alerts.push([event, detail]); });
     expect(await backend.flushGuild('1', emptyBatch, token)).toEqual({ ok: false, reason: 'deposed', currentOwner: undefined });
-    expect(alerts).toEqual([['deposed', 'deposed: guild 1 owned by unknown; local token node-a (claim 3)']]);
+    expect(alerts).toEqual([['deposed', 'deposed: guild 1 has no ownership row; shard 0 of 1 has no claim row; local claim 3']]);
   });
 });
 

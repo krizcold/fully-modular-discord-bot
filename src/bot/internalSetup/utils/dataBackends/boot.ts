@@ -16,6 +16,7 @@ import { ACK_MS, sweepLateWrites } from './replyGate';
 import { saveMark, type SaveMark } from './scopeRecord';
 import { ledgerOf, runAdmitted } from './writeLedger';
 import { isMaintenanceGateClosed, maintenanceText, runTracked } from '../maintenanceGate';
+import { stoppedServing } from '../servingGate';
 
 // Startup barrier bound = the acceptance window: past it something is wrong
 // enough that holding clientReady longer helps nobody.
@@ -238,7 +239,8 @@ export async function admitGuildAction(guildId: string, deadlineAt: number): Pro
   const since = performance.now();
   for (;;) {
     const cause = gateCauseNow(guildId, since);
-    if (cause === 'admit') return { cause, mark: saveMark() };
+    // NB4 decision 6: asked right before the admission, after every await of the hold.
+    if (cause === 'admit') return stoppedServing() ? { cause: 'not-served', mark: null } : { cause, mark: saveMark() };
     const left = deadlineAt - performance.now();
     if (FINAL_CAUSES.has(cause) || left <= 0) return { cause, mark: null };
     await new Promise<void>(resolve => setTimeout(resolve, Math.min(HOLD_POLL_MS, left)));
@@ -292,8 +294,12 @@ function holdInteraction(interaction: any, guildId: string): Promise<GateCause> 
   return hold;
 }
 
-/** Runs a gated listener's handler from its interaction's admission, so its confirmSaved counts from there. */
-export function runAsAdmitted<T>(args: any[], fn: () => T): T {
+/**
+ * Runs a gated listener's handler from its interaction's admission, so its confirmSaved counts from there. Once this
+ * process stopped serving its shards (NB4 decision 6) no handler is called, whatever the gate awaited before.
+ */
+export function runAsAdmitted<T>(args: any[], fn: () => T): T | undefined {
+  if (stoppedServing()) return undefined;
   const mark = admissions.get(args[0] as object);
   return mark ? runAdmitted(mark, fn) : fn();
 }
@@ -303,7 +309,8 @@ export function runAsAdmitted<T>(args: any[], fn: () => T): T {
  * gate's sweep of the interaction, which the listener does not wait on.
  */
 export async function dispatchGated(eventName: string, args: any[], dispatch: (...args: any[]) => Promise<void>): Promise<void> {
-  if (!(await gateEventDispatch(eventName, args, () => { if (!isMaintenanceGateClosed()) void dispatch(...args); }))) return;
+  // A buffered event's replay goes through this gate again, so it meets every check a new event meets.
+  if (!(await gateEventDispatch(eventName, args, () => { void dispatchGated(eventName, args, dispatch); }))) return;
   await runTracked(() => runAsAdmitted(args, () => dispatch(...args)));
   if (eventName === 'interactionCreate') void sweepLateWrites(args[0]);
 }

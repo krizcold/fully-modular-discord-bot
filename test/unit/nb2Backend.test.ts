@@ -2,7 +2,8 @@ import fs from 'fs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // NB2 rulings 6 and 7 (the boot decision, a refused login at boot and at run time, 28P01 kept apart) and K (the
-// watcher that asks the database every 5 seconds and takes the bot off Discord after 300 seconds without an answer).
+// watcher that asks the database every 5 seconds). Since NB4 the shard claims, not the watcher, take a bot off Discord:
+// the watcher starts the leave at the first answer after a lapse.
 
 const pg = vi.hoisted(() => ({ connect: null as null | (() => Promise<void>), connects: 0 }));
 vi.mock('../../src/bot/internalSetup/utils/pgClient', async orig => ({
@@ -23,6 +24,7 @@ import {
   decideBoot,
   markDiscordStarted,
   maintenanceMode,
+  noteClaimsLapsed,
   probeLoginAtBoot,
   watchDataBackend,
 } from '../../src/bot/internalSetup/utils/maintenance';
@@ -76,7 +78,7 @@ function fakeBackend(first: Answer | 'silent' = 'answers') {
 function watched(backend: ReturnType<typeof fakeBackend>, extra: { probeTimeoutMs?: number } = {}) {
   const clock = { now: 0 };
   const disconnect = vi.fn(async () => undefined);
-  const watcher = watchDataBackend(backend, { retryMs: NEVER, now: () => clock.now, disconnect, ...extra })!;
+  const watcher = watchDataBackend(backend, { retryMs: NEVER, ...extra })!;
   markDiscordStarted();
   const at = async (ms: number, answer?: Answer | 'silent') => {
     clock.now = ms;
@@ -227,22 +229,22 @@ describe('ruling 7 at run time', () => {
     expect(maintenanceText()).toBe('hook message');
   });
 
-  it('a refused login before the boot reached Discord asks for the restart (it holds nothing), which boots in maintenance mode', async () => {
+  it('a refused login before the boot reached Discord closes the gate and asks for the restart (it holds nothing), which boots in maintenance mode', async () => {
     const backend = fakeBackend('refused');
     watchDataBackend(backend, { retryMs: NEVER });
     backend.fire();
-    expect(isMaintenanceGateClosed()).toBe(false);
+    expect(isMaintenanceGateClosed()).toBe(true);
+    expect(maintenanceCause()).toBe('login-refused');
     await vi.waitFor(() => expect(restarts()).toHaveLength(1));
   });
 });
 
 describe('ruling K: the watcher decides when the bot leaves Discord', () => {
-  it('R5-4: with its defaults the watcher probes every 5 seconds, gives a silent probe up after 5 seconds and disconnects after 300 seconds', async () => {
+  it('R5-4: with its defaults the watcher probes every 5 seconds and gives a silent probe up after 5 seconds; no probe takes the bot off Discord', async () => {
     vi.useFakeTimers();
     try {
       const backend = fakeBackend('silent');
-      const disconnect = vi.fn(async () => undefined);
-      watchDataBackend(backend, { disconnect });
+      watchDataBackend(backend);
       markDiscordStarted();
       await vi.advanceTimersByTimeAsync(5 * SECOND - 1);
       expect(backend.state.probes).toBe(0);
@@ -250,12 +252,8 @@ describe('ruling K: the watcher decides when the bot leaves Discord', () => {
       expect(backend.state.probes).toBe(1);
       await vi.advanceTimersByTimeAsync(10 * SECOND);
       expect(backend.state.probes).toBeGreaterThanOrEqual(2);
-      await vi.advanceTimersByTimeAsync(290 * SECOND);
-      expect(disconnect).not.toHaveBeenCalled();
-      await vi.advanceTimersByTimeAsync(20 * SECOND);
-      expect(disconnect).toHaveBeenCalledTimes(1);
-      await vi.advanceTimersByTimeAsync(60 * SECOND);
-      expect(disconnect).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(400 * SECOND);
+      expect(maintenanceMode()).toBe('running');
     } finally {
       vi.useRealTimers();
     }
@@ -278,57 +276,37 @@ describe('ruling K: the watcher decides when the bot leaves Discord', () => {
     await backend.stop();
   });
 
-  it('every probe unreachable for 300 seconds in a row disconnects every shard once, keeps the gate open and reports the outage', async () => {
-    const backend = fakeBackend('unreachable');
-    const { at, disconnect } = watched(backend);
-    await at(0);
-    await at(100 * SECOND);
-    await at(299 * SECOND);
-    expect(disconnect).not.toHaveBeenCalled();
-    expect(maintenanceMode()).toBe('running');
-    await at(300 * SECOND);
-    expect(disconnect).toHaveBeenCalledTimes(1);
-    expect(maintenanceMode()).toBe('outage');
-    expect(isMaintenanceGateClosed()).toBe(false);
-    expect(sent).toContainEqual({ type: 'maintenance:mode', data: { mode: 'outage' } });
-    await at(400 * SECOND);
-    expect(disconnect).toHaveBeenCalledTimes(1);
-    expect(restarts()).toHaveLength(0);
-  });
-
-  it('any answer starts the count again', async () => {
-    const backend = fakeBackend('unreachable');
-    const { at, disconnect } = watched(backend);
-    await at(0);
-    await at(250 * SECOND);
-    await at(255 * SECOND, 'answers');
-    await at(260 * SECOND, 'unreachable');
-    await at(555 * SECOND);
-    expect(disconnect).not.toHaveBeenCalled();
-    await at(560 * SECOND);
-    expect(disconnect).toHaveBeenCalledTimes(1);
-  });
-
-  it('a probe with no answer within its bound counts as unreachable', async () => {
-    const backend = fakeBackend('silent');
-    const { at, disconnect } = watched(backend, { probeTimeoutMs: 10 });
-    await at(0);
-    await at(300 * SECOND);
-    expect(backend.state.probes).toBe(2);
-    expect(disconnect).toHaveBeenCalledTimes(1);
-  });
-
-  it('after the disconnect the first answer starts the leave step, which asks for the restart', async () => {
+  it('NB4: probes unreachable for any time keep the bot on Discord and report nothing; the claims decide', async () => {
     const backend = fakeBackend('unreachable');
     const { at } = watched(backend);
     await at(0);
     await at(300 * SECOND);
-    await at(305 * SECOND, 'refused');
-    expect(restarts()).toHaveLength(0);
+    await at(900 * SECOND);
+    expect(maintenanceMode()).toBe('running');
     expect(isMaintenanceGateClosed()).toBe(false);
-    await at(310 * SECOND, 'answers');
+    expect(sent).not.toContainEqual({ type: 'maintenance:mode', data: { mode: 'outage' } });
+    expect(restarts()).toHaveLength(0);
+  });
+
+  it('a probe with no answer within its bound counts as unreachable', async () => {
+    const backend = fakeBackend('silent');
+    const { at } = watched(backend, { probeTimeoutMs: 10 });
+    await at(0);
+    await at(300 * SECOND);
+    expect(backend.state.probes).toBe(2);
+    expect(maintenanceMode()).toBe('running');
+  });
+
+  it('NB4: after the claims lapsed the first answer starts the leave step with the lapse reason, which asks for the restart', async () => {
+    const backend = fakeBackend('unreachable');
+    const { at } = watched(backend);
+    noteClaimsLapsed(20);
+    expect(maintenanceMode()).toBe('outage');
+    await at(5 * SECOND);
+    expect(restarts()).toHaveLength(0);
+    await at(10 * SECOND, 'answers');
     await vi.waitFor(() => expect(restarts()).toHaveLength(1));
-    expect(restarts()[0]).toEqual({ type: 'control:restart-bot', data: { reason: 'The database answers again' } });
+    expect(restarts()[0]).toEqual({ type: 'control:restart-bot', data: { reason: 'The shard claims lapsed (no renewal for 20 s) and the database answers' } });
   });
 
   it('R4-1: write acceptance closed by a guild the database refuses, then one failed probe days later, keeps the bot on Discord', async () => {

@@ -1,19 +1,25 @@
 // LeaseRuntime - holds this process's shard leases and enforces the one
 // invariant that keeps a shared token safe: NO IDENTIFY WITHOUT A CURRENT
-// LEASE.
+// LEASE. A process grants its set once at boot (NB4 decision 7) and once more
+// with no lease when it stops serving.
 
 import { Status } from 'discord.js';
 import { getDataReadiness } from '../utils/dataBackends/dataReadiness';
+import { stoppedServing } from '../utils/servingGate';
+import { isStopping } from '../utils/dataManager';
 import { getNodeId } from './nodeIdentity';
 import type { IngestService } from '../ingest/ingestService';
 
 export interface LeaseInfo {
   leaseId: string;
   shardId: number;
+  /** The claim this process holds on the shard; null on a JSON bot. */
+  claim: number | null;
 }
 
 export interface LeaseGrant {
-  claim: number | null;
+  /** This boot's process id; null on a JSON bot. */
+  processId: string | null;
   shardCount: number;
   leases: LeaseInfo[];
 }
@@ -25,7 +31,7 @@ export interface ShardStatusEntry {
 }
 
 export interface CurrentLease {
-  claim: number | null;
+  processId: string | null;
   shardCount: number;
   leases: LeaseInfo[];
 }
@@ -40,11 +46,17 @@ export class LeaseRuntime {
   private current: CurrentLease | null = null;
   private token: string | undefined;
   private syncTimer: NodeJS.Timeout | null = null;
+  private stillConnected: number[] = [];
 
   constructor(private readonly ingest: IngestService) {}
 
   getCurrent(): CurrentLease | null {
     return this.current;
+  }
+
+  /** Shards whose gateway stop did not settle within its bound after the process stopped serving. */
+  getStillConnected(): number[] {
+    return [...this.stillConnected];
   }
 
   /** Called once with the login token; starts (or arms) the gated login. */
@@ -60,7 +72,7 @@ export class LeaseRuntime {
       this.current.shardCount === grant.shardCount &&
       sameNumberSet(this.current.leases.map(l => l.shardId), shardIds);
 
-    this.current = { claim: grant.claim, shardCount: grant.shardCount, leases: grant.leases };
+    this.current = { processId: grant.processId, shardCount: grant.shardCount, leases: grant.leases };
     this.ingest.setShardPlan(shardIds, grant.shardCount);
     this.notifyDataLayer(this.current);
     if (!sameShape && this.ingest.isStarted()) {
@@ -69,6 +81,32 @@ export class LeaseRuntime {
     } else {
       this.maybeStart();
     }
+  }
+
+  /**
+   * NB4 decision 16: the lease empties and the gateway stops at once, with no debounce; a stop that does not settle
+   * within boundMs leaves its shards reported as maybe still connected.
+   */
+  stopServing(boundMs: number): void {
+    const held = this.current?.leases.map(l => l.shardId) ?? [];
+    const shardCount = this.current?.shardCount ?? 0;
+    if (this.syncTimer) { clearTimeout(this.syncTimer); this.syncTimer = null; }
+    this.current = { processId: this.current?.processId ?? null, shardCount, leases: [] };
+    this.ingest.setShardPlan([], shardCount);
+    this.notifyDataLayer(this.current);
+    if (!this.ingest.isStarted()) return;
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      this.stillConnected = held;
+      for (const shardId of held) console.error(`[Shards] Shard ${shardId} may still be connected to Discord`);
+    }, boundMs);
+    timer.unref?.();
+    void this.ingest.stop('this process stopped serving its shards').catch(error => console.error('[Shards] Could not stop the gateway:', error)).finally(() => {
+      settled = true;
+      clearTimeout(timer);
+      this.stillConnected = [];
+    });
   }
 
   /** Debounced destroy + re-login so rapid plan changes rebuild the gateway once. */
@@ -87,9 +125,12 @@ export class LeaseRuntime {
 
   /** Mirror the held lease into the data layer (constructed only in postgres mode). */
   private notifyDataLayer(current: CurrentLease): void {
+    const claims: Record<number, number | null> = {};
+    for (const lease of current.leases) claims[lease.shardId] = lease.claim;
     getDataReadiness()?.onLeaseChanged({
       nodeId: getNodeId(),
-      claim: current.claim,
+      processId: current.processId,
+      claims,
       shardCount: current.shardCount,
       shardIds: current.leases.map(l => l.shardId),
     });
@@ -118,9 +159,10 @@ export class LeaseRuntime {
     return shards;
   }
 
-  /** Gated login; @discordjs/ws spaces the identifies of this process's shards per bucket. */
+  /** Gated login; @discordjs/ws spaces the identifies of this process's shards per bucket. No lease, no login. */
   private maybeStart(): void {
-    if (!this.current || this.token === undefined || this.ingest.isStarted()) return;
+    if (!this.current || this.current.leases.length === 0 || this.token === undefined || this.ingest.isStarted()) return;
+    if (stoppedServing() || isStopping()) return;
     // Login failures are deliberately NOT swallowed: an invalid token must
     // surface exactly like today's boot (unhandled rejection -> crash).
     void this.ingest.start(this.token);

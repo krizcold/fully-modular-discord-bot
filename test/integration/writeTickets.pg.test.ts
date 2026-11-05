@@ -86,6 +86,11 @@ beforeAll(async () => {
   const until = Date.now() + 60_000;
   while (backend.connectionState().state !== 'ready' && Date.now() < until) await new Promise(resolve => { setTimeout(resolve, 100); });
   expect(backend.connectionState().state).toBe('ready');
+  // NB4: a save lands only under its shard's claim row; claim n sits on shard 0 of count 100 + n, held by process p-n.
+  for (const claim of [1, 2]) {
+    await direct.query(`INSERT INTO smdb_data.shard_claims (shard_count, shard_id, claim, holder_process, holder_node, holder_name, home_node, ttl_ms, expires_up_ms)
+      VALUES ($1, 0, $2, $3, 'node', 'node', 'node', 30000, 30000) ON CONFLICT DO NOTHING`, [100 + claim, claim, `p-${claim}`]);
+  }
 });
 
 afterAll(async () => {
@@ -105,7 +110,7 @@ async function stored(guildId: string, filename: string): Promise<string | null>
 describe('a write ticket against a real Postgres', () => {
   it('answers held when the connection is cut mid-flush, and ok once the store is reachable again', async () => {
     const guildId = '424242';
-    const token: FenceToken = { nodeId: 'node-a', claim: 1, shardId: 0, shardCount: 1 };
+    const token: FenceToken = { nodeId: 'node-a', claim: 1, processId: 'p-1', shardId: 0, shardCount: 101 };
     const ws = new WorkingSetManager(backend);
     try {
       expect(await ws.hydrate(guildId, token)).toBe('ready');
@@ -129,7 +134,7 @@ describe('a write ticket against a real Postgres', () => {
 
   it('answers the operator route held when the connection is cut mid-flush, and a repeat delete held while it stays cut; confirmWrite answers ok once the store is reachable again', async () => {
     const guildId = '424243';
-    const token: FenceToken = { nodeId: 'node-a', claim: 1, shardId: 0, shardCount: 1 };
+    const token: FenceToken = { nodeId: 'node-a', claim: 1, processId: 'p-1', shardId: 0, shardCount: 101 };
     const held = {
       ok: true,
       pending: true,
@@ -186,15 +191,15 @@ describe('the claim fence on a real Postgres', () => {
     return b;
   }
 
-  const tokenOf = (claim: number, nodeId = 'node-a'): FenceToken => ({ nodeId, claim, shardId: 0, shardCount: 1 });
+  const tokenOf = (claim: number, nodeId = 'node-a'): FenceToken => ({ nodeId, claim, processId: `p-${claim}`, shardId: 0, shardCount: 100 + claim });
   const batchOf = (doc: string) => ({ upserts: [{ key: { module: 'm', filename: 'x.json' }, doc }], deletes: [], appends: [] });
   const ownerRow = async (guildId: string) => (await direct.query(
     'SELECT node_id, claim FROM smdb_data.guild_ownership WHERE guild_id = $1', [guildId])).rows[0];
   let guilds = 525000;
 
-  it('a fresh database is provisioned at version 2, with claim_seq and a claim column in place of term and epoch', async () => {
+  it('a fresh database is provisioned at version 3, with claim_seq and a claim column in place of term and epoch', async () => {
     const version = await direct.query(`SELECT value FROM smdb_data.meta WHERE key = 'schema_version'`);
-    expect(version.rows[0].value).toBe('{"v":2}');
+    expect(version.rows[0].value).toBe('{"v":3}');
     const seq = await direct.query(`SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'smdb_data' AND c.relname = 'claim_seq' AND c.relkind = 'S'`);
     expect(seq.rowCount).toBe(1);
     const columns = await direct.query(`SELECT column_name FROM information_schema.columns WHERE table_schema = 'smdb_data' AND table_name = 'guild_ownership'`);
@@ -262,26 +267,6 @@ describe('the claim fence on a real Postgres', () => {
     }
   });
 
-  it('claims taken at once are distinct, and a take is above every stored claim', async () => {
-    const other = await readyBackend();
-    const claimOf = async (b: PostgresBackend) => {
-      const answer = await b.takeClaim();
-      return answer.outcome === 'claimed' ? answer.claim : null;
-    };
-    try {
-      const taken = await Promise.all([claimOf(backend), claimOf(other), claimOf(backend), claimOf(other)]);
-      expect(taken.every(c => typeof c === 'number' && c > 0)).toBe(true);
-      expect(new Set(taken).size).toBe(taken.length);
-      await direct.query(
-        `INSERT INTO smdb_data.guild_ownership (guild_id, node_id, shard_id, claim, shard_count) VALUES ($1, 'node-stored', 0, 100, 1)`,
-        [String(++guilds)]);
-      expect(await claimOf(backend)).toBe(101);
-      expect(await claimOf(other)).toBe(102);
-    } finally {
-      await other.stop();
-    }
-  });
-
   it('a database provisioned at version 1 is refused: no claim, no DDL, no restore, and no guild row changes', async () => {
     await direct.query('CREATE DATABASE smdb_v1');
     const first = await readyBackend('smdb_v1');
@@ -304,9 +289,8 @@ describe('the claim fence on a real Postgres', () => {
         const until = Date.now() + 60_000;
         while (refused.connectionState().state !== 'outage' && Date.now() < until) await new Promise(resolve => { setTimeout(resolve, 100); });
         expect(refused.connectionState().state).toBe('outage');
-        expect(await refused.takeClaim()).toEqual({ outcome: 'mismatch' });
         expect(await refused.provisionVerdict()).toEqual({ state: 'mismatch', found: '{"v":1}' });
-        expect(await refused.restoreGuild('8', 5, { nodeId: '', claim: null, shardId: 0, shardCount: 1 })).toEqual({ ok: false, reason: 'schema-mismatch' });
+        expect(await refused.restoreGuild('8', 5, { nodeId: '', claim: null, processId: null, shardId: 0, shardCount: 1 })).toEqual({ ok: false, reason: 'schema-mismatch' });
         expect((await old.query(`SELECT doc, updated_at FROM smdb_data.guild_data WHERE guild_id = '7'`)).rows).toEqual(before);
         expect((await old.query(`SELECT 1 FROM smdb_data.guild_data WHERE guild_id = '8'`)).rowCount).toBe(0);
         expect((await old.query(`SELECT 1 FROM smdb_data.guild_data_graveyard WHERE guild_id = '8'`)).rowCount).toBe(1);

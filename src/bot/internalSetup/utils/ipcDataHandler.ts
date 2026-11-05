@@ -15,6 +15,7 @@ import {
   deleteGuildNamespace,
   listGuildDataFiles,
   flushFailing,
+  GuildFrozenError,
   guildDocFileQueue,
   readGuildDocRaw,
   readRawStrict,
@@ -30,6 +31,7 @@ import { isInternalGlobalRel } from './configDiscovery';
 import { DataBackendUnavailableError, getWorkingSet } from './dataBackends/workingSet';
 import { awaitGuildDataReady } from './dataBackends/boot';
 import { canonicalGuildKey } from './dataKeys';
+import { stoppedServing } from './servingGate';
 
 type DataOpCode = 'frozen' | 'not-owner' | 'backend-unavailable' | 'bot-down' | 'invalid' | 'io-error' | 'maintenance';
 
@@ -140,6 +142,8 @@ export async function applyOperatorDataWrite(req: GuildDataWriteRequest): Promis
           retiredAt = value;
         }
       }
+      // NB4 decision 6: no write after the claims lapsed or a shard was lost, and a frozen set keeps its writes.
+      if (stoppedServing() || getWorkingSet()?.stateOf(guildId) === 'frozen-retained') return { ok: false, code: 'frozen' };
       const restored = await restoreGuildFromGraveyard(guildId, retiredAt);
       if (!restored.ok) return { ok: false, code: 'invalid', error: restored.error || 'restore refused' };
       return { ok: true };
@@ -147,7 +151,7 @@ export async function applyOperatorDataWrite(req: GuildDataWriteRequest): Promis
     if (op === 'delete-namespace') {
       // Its working set frozen (its lease left): deleting it now would drop
       // that freeze and the data still being flushed.
-      if (getWorkingSet()?.stateOf(guildId) === 'frozen-retained') return { ok: false, code: 'frozen' };
+      if (stoppedServing() || getWorkingSet()?.stateOf(guildId) === 'frozen-retained') return { ok: false, code: 'frozen' };
       const moved = await deleteGuildNamespace(guildId, 'webui-operator-delete', OPERATOR_FLUSH_MS);
       if (!moved) return { ok: false, code: 'io-error', error: 'guild data delete failed; nothing was removed' };
       return { ok: true };
@@ -175,6 +179,7 @@ export async function applyOperatorDataWrite(req: GuildDataWriteRequest): Promis
       ticket = saved.ticket;
     }
   } catch (error) {
+    if (error instanceof GuildFrozenError) return { ok: false, code: 'frozen' };
     if (error instanceof DataBackendUnavailableError && error.causeKey === 'maintenance') {
       return { ok: false, code: 'maintenance', error: maintenanceText() };
     }

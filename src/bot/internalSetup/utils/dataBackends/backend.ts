@@ -20,8 +20,10 @@ export interface GuildFlushBatch {
 
 export interface FenceToken {
   nodeId: string;
-  /** The process's claim number from smdb_data.claim_seq; null when it holds none (a JSON bot, a refused data layer). */
+  /** The claim this process holds on the guild's shard (smdb_data.shard_claims); null when it holds none. */
   claim: number | null;
+  /** This boot's process id, which the shard's claim row names. */
+  processId: string | null;
   shardId: number;
   shardCount: number;
 }
@@ -34,7 +36,7 @@ export interface GuildOwner {
 export type FlushOutcome =
   | { ok: true }
   | { ok: false; reason: 'deposed'; currentOwner?: GuildOwner }
-  | { ok: false; reason: 'unavailable'; detail?: string; code?: string };
+  | { ok: false; reason: 'unavailable'; detail?: string; code?: string; commitUnanswered?: boolean };
 
 export type HydrationOutcome =
   | { ok: true; docs: { key: DocKey; doc: string }[]; appendKeys: DocKey[] }

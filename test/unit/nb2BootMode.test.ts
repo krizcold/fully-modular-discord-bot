@@ -71,9 +71,9 @@ describe('ruling 6: booting in maintenance mode', () => {
     expect(getDataBootStatus().state).toBe('file');
     expect(loadModules).not.toHaveBeenCalled();
     expect((getPremiumManager() as any).expiryTimer).toBeNull();
-    expect(client.options.presence).toMatchObject(MAINTENANCE_PRESENCE);
-    expect(client.options.shards).toEqual([0, 1, 2]);
-    expect(client.options.shardCount).toBe(3);
+    expect(client!.options.presence).toMatchObject(MAINTENANCE_PRESENCE);
+    expect(client!.options.shards).toEqual([0, 1, 2]);
+    expect(client!.options.shardCount).toBe(3);
     expect(sent).toContainEqual({ type: 'maintenance:mode', data: { mode: 'maintenance', boot: true } });
   });
 

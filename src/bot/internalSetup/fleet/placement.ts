@@ -72,7 +72,7 @@ export function decideShardSource(gatewayAnswered: boolean): ShardSource {
   return gatewayAnswered ? 'discord' : 'fallback';
 }
 
-/** One lease per shard this process runs. */
-export function leasesFor(shardIds: number[]): LeaseInfo[] {
-  return shardIds.map(shardId => ({ leaseId: randomUUID(), shardId }));
+/** One lease per shard this process runs, each with the claim it holds on it. */
+export function leasesFor(shards: Array<{ shardId: number; claim: number | null }>): LeaseInfo[] {
+  return shards.map(({ shardId, claim }) => ({ leaseId: randomUUID(), shardId, claim }));
 }

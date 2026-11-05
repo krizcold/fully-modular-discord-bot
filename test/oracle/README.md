@@ -5,7 +5,7 @@ every answer. Copies of the run's docs are taken afterwards, and the checker jud
 
 | File | Runs where | What it does |
 |---|---|---|
-| oracle.mjs | the dev box, or a node image on a host | `write`, `read` (a copy through one node's app read path), `fleet` (the control facts), `sql` (the database listing query; `sql ownership` lists the claim sequence and the highest guild_ownership claim for check.mjs `--ownership`), `bite`, `cleanup` |
+| oracle.mjs | the dev box, or a node image on a host | `write`, `read` (a copy through one node's app read path), `fleet` (the control facts), `sql` (the database listing query; `sql ownership` lists the claim sequence and the highest guild_ownership and shard_claims claims for check.mjs `--ownership`; `sql claims` lists the shard_claims rows for check.mjs `--claims`), `bite`, `cleanup` |
 | check.mjs | the dev box | judges logs and copies; exit 0 PASS, 1 FAIL, 2 INCONCLUSIVE, 64 usage |
 | judge.mjs | (library) | the verdict rules |
 | model.ts, fakeApp.ts | tests only | the model of a correct store with every check, and a stand-in node on real Postgres with injectable faults |
@@ -75,7 +75,7 @@ answering 500 "An error occurred" from its error handler.
 | HELD-MISSING | A held (202) effect never arrived. |
 | RESURRECTED | A doc is back after its delete was acknowledged. |
 | WRONG-CONTENT | A doc holds bytes that no one wrote to it. |
-| CONTROL | A shard is leased to two nodes, a shard in a node's shard table is not leased by that node or is leased by another node, nodes disagree on the shard count, or a guild maps to two shards or out of range. With two sets of control facts, only a CONTROL that both sets show counts. |
+| CONTROL | A shard is leased to two live processes at once, a shard in a process's shard table is not leased by that process or is leased by another one, nodes disagree on the shard count, a guild maps to two shards or out of range, one claim is reported on two shards or by two processes, a lease's claim is not the one the shard_claims row of its shard holds for that process (`--claims`), or a live claim is at or above the claim the next take would draw (`--ownership`). Facts are keyed by process id (a JSON bot's by node id). With two sets of control facts, only a CONTROL that both sets show counts. |
 
 `(during)` marks a verdict from a read made during the run, judged against what was acknowledged before that read was
 sent.
@@ -123,8 +123,13 @@ fleet.
     hot), RESURRECTED, PHANTOM, WRONG-CONTENT, FORK, and stale reads during the run.
   - **Hand-built cases** cover the ordering rules, the reads during the run, the CONTROL rules and two-set counting
     (each rule, in both orders), a killed writer's file and a cut stream, and each INCONCLUSIVE case above.
+  - **The shard claim rules** pass two reads with a legal takeover, a clean stop and the next process's take, or a
+    hand-over between them, also when the first listing already shows the change; they fail a lease whose claim the
+    listing does not hold for its process in both reads, and one shard leased to two live processes. No rule judges
+    when a take may happen: a release between two reads makes a legal take look early, so the take's timing is
+    tested where the take is visible (NB4's property and Postgres tests).
 - **test/unit/oracleJudge.test.ts** runs those checks against judge.mjs.
-- **test/unit/oracleMutants.test.ts** runs them against 53 mutants of judge.mjs, each breaking one rule. A hand-built
+- **test/unit/oracleMutants.test.ts** runs them against 76 mutants of judge.mjs, each breaking one rule. A hand-built
   check must kill each one, so the result does not depend on what the generator draws.
 - **test/integration/oracle.test.ts** runs the tools as child processes against stand-in nodes on real Postgres, and
   takes the database copy with the exact `sql` query:
@@ -148,8 +153,11 @@ fleet.
   - piped mode works;
   - a streamed copy cut short is refused, and the writer's own file from the same run passes;
   - a shard leased twice is named, with one set of control facts or two (`--fleet-again`, which needs `--fleet`);
-  - two nodes reporting one claim are named, and so is a claim sequence whose next draw is at or below a live node's
-    claim (`--ownership`); a later boot that took a higher claim and stopped is not;
+  - one claim reported by two processes is named, and so is a claim sequence whose next draw is at or below a live
+    claim (`--ownership`); a later take of a higher claim that stopped is not, whichever table keeps its claim;
+  - leases are compared with `sql claims` listings taken after each set of control facts: a legal takeover, a clean
+    stop and the next process's take, or a hand-over and the receiving node's take, between two reads pass, and a
+    lease whose claim the table does not hold in both reads, or a shard two processes lease, is named;
   - the test's own database copy fails when psql fails.
 
 ## On the live fleet (the main session's runs)
@@ -218,22 +226,31 @@ Guardrails: the secret filter on every read; `ssh <host> ...` with no flag befor
 
      - **The control facts from each node, twice,** using `fleet` the same way with `--out -`: one set, then a second
        set of the same nodes once the first is complete. Each set is read one node at a time, so a shard handoff can
-       fall between two reads. The checker compares the facts by node id, not file order or name, and counts only a
-       CONTROL that both sets show; a node in one set only makes the run inconclusive. The facts are reduced to shard
-       and guild facts, and URL credentials are redacted before they leave the host. `fleet` exits 1 when the node's
-       bot child gave none.
+       fall between two reads. The checker compares the facts by process id (a JSON bot's by node id), not file order
+       or name, and counts only a CONTROL that both sets show; a node in one set only makes the run inconclusive. The
+       facts are reduced to shard, claim and guild facts, and URL credentials are redacted before they leave the host.
+       `fleet` exits 1 when the node's bot child gave none.
+     - **The shard claims, from the serving primary, once after each set of control facts:**
+
+           node test/oracle/oracle.mjs sql claims | ssh contabo-dbot docker exec -i <postgres container> psql -U smdb -d smdb -At > claims-1.jsonl
+
+       and `claims-2.jsonl` after the second set. The listing is one line holding every shard_claims row. The checker
+       calls CONTROL when a process still reports a lease whose claim the row of its shard does not hold for it (another
+       claim, another process, a released row or no row), counting only what both reads show: a takeover, a clean
+       stop or a hand-over between the two reads changes the second read. Without `--claims` the leases are not
+       compared, and a note says so; an empty or unreadable listing is not judged, with a note.
      - **The claim sequence, from the serving primary, after both sets of control facts.** A node that restarts after
        its facts were read then takes a claim above the one they show, so it cannot raise a false CONTROL:
 
            node test/oracle/oracle.mjs sql ownership | ssh contabo-dbot docker exec -i <postgres container> psql -U smdb -d smdb -At > ownership.jsonl
 
-       The listing is one line: the sequence's value and whether it was called, and the highest guild_ownership claim.
-       The checker works out the claim the next boot would draw (as the bot draws it) and calls CONTROL when a live
-       node already holds that claim or a higher one: the sequence went back, as after a restore that did not raise
+       The listing is one line: the sequence's value and whether it was called, and the highest guild_ownership and
+       shard_claims claims. The checker works out the claim the next take would draw (as the bot draws it) and calls
+       CONTROL when a live process already holds that claim or a higher one on a lease: the sequence went back, as after a restore that did not raise
        it. An empty or unreadable listing is not judged, and the checker writes a note saying so.
 4. **Judge:**
 
-       node test/oracle/check.mjs --log <run>.jsonl --db primary=<p>.jsonl --lag standby=<s>.jsonl --app <node>-app.jsonl --fleet <node>-fleet-1.json --fleet-again <node>-fleet-2.json --ownership ownership.jsonl --window kill-bot
+       node test/oracle/check.mjs --log <run>.jsonl --db primary=<p>.jsonl --lag standby=<s>.jsonl --app <node>-app.jsonl --fleet <node>-fleet-1.json --fleet-again <node>-fleet-2.json --claims claims-1.jsonl --claims claims-2.jsonl --ownership ownership.jsonl --window kill-bot
 
    - Use `--db` for a copy that must hold everything acknowledged (the serving primary, and a sync standby).
    - Use `--lag` for an async standby.

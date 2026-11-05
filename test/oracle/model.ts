@@ -180,13 +180,15 @@ const hot = (k: number) => `${RUN}-h${k}.json`;
 /** Six acknowledged unique writes by lane a, at t = 10 to 60. */
 const sixAcked = () => [1, 2, 3, 4, 5, 6].flatMap(n => [send(n, 'a', u('a', n), n, `x${n}`, n * 10), ans(n, n * 10 + 1)]);
 const sixDocs = () => new Map([1, 2, 3, 4, 5, 6].map(n => [u('a', n), `x${n}`]));
+/** A process's fleet facts; `claims` maps a leased shard to its claim (a Postgres bot), none for a JSON bot. */
 const fleetNode = (nodeId: string, leases: number[], over: Partial<{
-  name: string; initialized: boolean; table: [number, string][]; guildMap: Record<string, number>; shardCount: number; claim: number | null;
+  name: string; initialized: boolean; table: [number, string][]; guildMap: Record<string, number>; shardCount: number;
+  processId: string; claims: Record<number, number>;
 }> = {}) => ({
   name: over.name ?? nodeId,
   state: {
-    initialized: over.initialized ?? true, nodeId, shardCount: over.shardCount ?? 2, claim: over.claim ?? null,
-    leases: leases.map(shardId => ({ shardId })),
+    initialized: over.initialized ?? true, nodeId, processId: over.processId ?? null, shardCount: over.shardCount ?? 2,
+    leases: leases.map(shardId => ({ shardId, claim: over.claims?.[shardId] ?? null })),
     shardTable: (over.table ?? []).map(([shardId, owner]) => ({ shardId, nodeId: owner, status: 'Ready' })),
     guildMap: over.guildMap ?? {},
   },
@@ -551,7 +553,7 @@ export function checks(): Check[] {
     } },
     { name: 'a shard leased twice, or against the shard table, is CONTROL', run: J => {
       const twice = J.judgeFleet([fleetNode('m', [0, 1]), fleetNode('w', [1])]).map(v => v.detail);
-      expect(twice.some(d => /shard 1 is leased to 2 nodes/.test(d))).toBe(true);
+      expect(twice.some(d => /shard 1 is leased to 2 processes/.test(d))).toBe(true);
       const table = J.judgeFleet([fleetNode('m', [0], { table: [[0, 'm'], [1, 'm']] }), fleetNode('x', [1])]).map(v => v.detail);
       expect(table.some(d => /shard 1 is in the shard table of m, which does not lease it/.test(d))).toBe(true);
       expect(table.some(d => /shard 1 is leased by x, but it is in the shard table of m/.test(d))).toBe(true);
@@ -571,54 +573,155 @@ export function checks(): Check[] {
       const counts = J.judgeFleet([fleetNode('m', [0]), fleetNode('w', [1], { shardCount: 3 })]).map(v => v.detail);
       expect(counts.some(d => /disagree on the shard count/.test(d))).toBe(true);
     } },
-    { name: 'two live nodes with one claim is CONTROL', run: J => {
-      const same = J.judgeFleet([fleetNode('m', [0], { claim: 7 }), fleetNode('w', [1], { claim: 7 })]).map(v => v.detail);
-      expect(same).toEqual(['nodes m, w report the same claim 7']);
-      expect(J.judgeFleet([fleetNode('m', [0], { claim: 7 }), fleetNode('w', [1], { claim: 8 })])).toEqual([]);
-      // A JSON bot takes no claim, and a node that did not answer reports none.
+    { name: 'one shard leased to two live processes is CONTROL, judged by process id', run: J => {
+      // Two processes of one node are two holders.
+      const one = J.judgeFleet([fleetNode('m', [0], { processId: 'p1', claims: { 0: 5 } }), fleetNode('m', [0], { name: 'm-2', processId: 'p2', claims: { 0: 6 } })]);
+      expect(one.map(v => v.detail)).toEqual(['shard 0 is leased to 2 processes at once: m (process p1), m (process p2)']);
+      expect(J.judgeFleet([fleetNode('m', [0], { processId: 'p1', claims: { 0: 5 } }), fleetNode('w', [0], { processId: 'q1', claims: { 0: 7 } })]).map(v => v.detail))
+        .toEqual(['shard 0 is leased to 2 processes at once: m (process p1), w (process q1)']);
+      const history = J.buildHistory([[start(['a']), ...sixAcked(), { t: 'end' }]]);
+      const copies = [copyOf('db', sixDocs())];
+      // A restart between the two sets: the node's old process held the shard, its new one holds it now.
+      const before = [fleetNode('m', [0], { processId: 'p1', claims: { 0: 5 } })];
+      const after = [fleetNode('m', [0], { processId: 'p2', claims: { 0: 6 } })];
+      expect(J.judge({ history, copies, k: 0, fleet: before, fleetAgain: after }).verdicts).toEqual([]);
+      expect(J.judge({ history, copies, k: 0, fleet: before, fleetAgain: after }).inconclusive).toEqual([]);
+      // A shard table row belongs to the process that reports it.
+      const table = J.judgeFleet([fleetNode('m', [], { processId: 'p1', table: [[0, 'm']] }), fleetNode('m', [0], { name: 'm-2', processId: 'p2' })]).map(v => v.detail);
+      expect(table).toEqual([
+        'shard 0 is leased by m (process p2), but it is in the shard table of m (process p1)',
+        'shard 0 is in the shard table of m (process p1), which does not lease it',
+      ]);
+    } },
+    { name: 'one claim on two shards or by two processes is CONTROL', run: J => {
+      const shards = J.judgeFleet([fleetNode('m', [0, 1], { processId: 'p1', claims: { 0: 7, 1: 7 } })]).map(v => v.detail);
+      expect(shards).toEqual(['claim 7 is reported 2 times: shard 0 by m (process p1), shard 1 by m (process p1)']);
+      const processes = J.judgeFleet([fleetNode('m', [0], { processId: 'p1', claims: { 0: 7 } }), fleetNode('w', [1], { processId: 'q1', claims: { 1: 7 } })]);
+      expect(processes.map(v => v.detail)).toEqual(['claim 7 is reported 2 times: shard 0 by m (process p1), shard 1 by w (process q1)']);
+      expect(J.judgeFleet([fleetNode('m', [0, 1], { processId: 'p1', claims: { 0: 7, 1: 8 } }), fleetNode('w', [], { processId: 'q1' })])).toEqual([]);
+      // A JSON bot takes no claim, and a process that did not answer reports none.
       expect(J.judgeFleet([fleetNode('m', [0]), fleetNode('w', [1])])).toEqual([]);
-      expect(J.judgeFleet([fleetNode('m', [0], { claim: 7 }), fleetNode('w', [1], { claim: 7, initialized: false })])).toEqual([]);
+      expect(J.judgeFleet([fleetNode('m', [0], { processId: 'p1', claims: { 0: 7 } }), fleetNode('w', [1], { processId: 'q1', claims: { 1: 7 }, initialized: false })])).toEqual([]);
       const history = J.buildHistory([[start(['a']), ...sixAcked(), { t: 'end' }]]);
       const copies = [copyOf('db', sixDocs())];
       // Two sets: a shared claim counts only when both show it.
-      const twice = [fleetNode('m', [0], { claim: 7 }), fleetNode('w', [1], { claim: 7 })];
-      const apart = [fleetNode('m', [0], { claim: 7 }), fleetNode('w', [1], { claim: 9 })];
-      expect(J.judge({ history, copies, k: 0, fleet: twice, fleetAgain: apart }).verdicts).toEqual([]);
-      expect(J.judge({ history, copies, k: 0, fleet: twice, fleetAgain: twice }).verdicts.map(v => v.v)).toEqual(['CONTROL']);
+      const twice = [fleetNode('m', [0], { processId: 'p1', claims: { 0: 7 } }), fleetNode('w', [1], { processId: 'q1', claims: { 1: 7 } })];
+      const apart = [fleetNode('m', [0], { processId: 'p1', claims: { 0: 7 } }), fleetNode('w', [1], { processId: 'q1', claims: { 1: 9 } })];
+      const claims = [JSON.stringify({ rows: [] })];
+      const controls = (fleet: any[], fleetAgain: any[]) => J.judge({ history, copies, k: 0, fleet, fleetAgain }).verdicts.map(v => v.detail);
+      expect(controls(twice, apart)).toEqual([]);
+      expect(controls(apart, twice)).toEqual([]);
+      expect(controls(twice, twice)).toEqual(['claim 7 is reported 2 times: shard 0 by m (process p1), shard 1 by w (process q1)']);
+      expect(J.judge({ history, copies, k: 0, fleet: twice, fleetAgain: twice, claims }).verdicts.filter(v => /^claim /.test(v.detail))).toHaveLength(1);
     } },
-    { name: 'a live claim at or above the next claim a boot would draw is CONTROL', run: J => {
+    { name: 'a lease whose claim shard_claims does not hold for its process in both reads is CONTROL', run: J => {
       const history = J.buildHistory([[start(['a']), ...sixAcked(), { t: 'end' }]]);
       const copies = [copyOf('db', sixDocs())];
-      const listing = (last: number, called: boolean, highest: number | null) => JSON.stringify({ last, called, highest });
-      const live = [fleetNode('m', [0], { claim: 7 }), fleetNode('w', [1], { claim: 10 })];
-      const run = (ownership: string, fleet = live) => J.judge({ history, copies, k: 0, fleet, ownership });
-      // A later boot that took claim 12 and stopped leaves rows and the sequence above every live claim: normal.
-      expect(run(listing(12, true, 12)).verdicts).toEqual([]);
-      expect(run(listing(10, true, 10)).verdicts).toEqual([]);
-      // A restore put the sequence and the rows back to 4 while w holds 10: the next boot draws 5.
-      expect(run(listing(4, true, 4)).verdicts.map(v => v.detail)).toEqual([
-        'a live node holds claim 10, and the next boot would draw claim 5 (claim_seq at 4, called; highest guild_ownership claim 4): the claim sequence went back',
-      ]);
-      // Rows that hold a high claim raise the next draw over an old sequence.
-      expect(run(listing(4, true, 11)).verdicts).toEqual([]);
-      // A sequence reset with is_called false hands out last_value itself.
-      expect(run(listing(10, false, null)).verdicts.map(v => v.v)).toEqual(['CONTROL']);
-      expect(run(listing(11, false, null)).verdicts).toEqual([]);
-      expect(run(listing(10, true, null)).verdicts).toEqual([]);
-      // A node that did not answer is not live, so its claim is not compared.
-      const dead = [fleetNode('m', [0], { claim: 3 }), fleetNode('w', [1], { claim: 20, initialized: false })];
-      expect(run(listing(4, true, 4), dead).verdicts).toEqual([]);
-      // With no live claim to compare, nothing is judged, and a note says so.
-      const none = run(listing(4, true, 4), [fleetNode('m', [0]), fleetNode('w', [1])]);
-      expect(none.verdicts).toEqual([]);
-      expect(none.notes.join('\n')).toMatch(/no live node reports a claim/);
-      // An empty or unparsable listing judges nothing and writes a note.
-      for (const bad of ['', '\n', 'not json', '{"g":"10","c":4}', `${listing(4, true, 4)}\n${listing(4, true, 4)}`]) {
-        const r = run(bad);
+      const listing = (...rows: [number, number, string, boolean?, number?][]) =>
+        JSON.stringify({ rows: rows.map(([shard, claim, process, released, count]) => ({ count: count ?? 2, shard, claim, process, released: released ?? false })) });
+      const p = (shards: Record<number, number>, processId = 'p1') => fleetNode('m', Object.keys(shards).map(Number), { processId, claims: shards });
+      const q = (shards: Record<number, number>) => fleetNode('w', Object.keys(shards).map(Number), { processId: 'q1', claims: shards });
+      const judged = (fleet: any[], fleetAgain: any[], claims: string[]) => J.judge({ history, copies, k: 0, fleet, fleetAgain, claims });
+      const passes = (fleet: any[], fleetAgain: any[], claims: string[]) => {
+        const r = judged(fleet, fleetAgain, claims);
         expect(r.verdicts).toEqual([]);
+        expect(r.result).toBe('PASS');
+        return r;
+      };
+      const stale = 'm (process p1) holds a lease on shard 0 under claim 5, which shard_claims does not hold for it';
+
+      // Two reads 30 s apart with a legal takeover between them: p1 lapsed and stopped serving, q1 took shard 0.
+      passes([p({ 0: 5 }), q({ 1: 6 })], [p({}), q({ 0: 7, 1: 6 })], [listing([0, 5, 'p1'], [1, 6, 'q1']), listing([0, 7, 'q1'], [1, 6, 'q1'])]);
+      // The take landed between the first fleet read and the first listing: seen in one read only.
+      const early = passes([p({ 0: 5 }), q({ 1: 6 })], [p({}), q({ 0: 7, 1: 6 })], [listing([0, 7, 'q1'], [1, 6, 'q1']), listing([0, 7, 'q1'], [1, 6, 'q1'])]);
+      expect(early.notes).toContain(`CONTROL seen in one set of control facts only: ${stale}`);
+      // A clean stop of p1 and its node's next process p2 taking the shard between the reads, also with p1's row released when first listed.
+      passes([p({ 0: 5 })], [p({ 0: 8 }, 'p2')], [listing([0, 5, 'p1']), listing([0, 8, 'p2'])]);
+      passes([p({ 0: 5 })], [p({ 0: 8 }, 'p2')], [listing([0, 5, 'p1', true]), listing([0, 8, 'p2'])]);
+      // A hand-over of shard 1 from p1 to q1 between the reads, also with the release already listed in the first read.
+      passes([p({ 0: 5, 1: 6 }), q({})], [p({ 0: 5 }), q({ 1: 9 })], [listing([0, 5, 'p1'], [1, 6, 'p1']), listing([0, 5, 'p1'], [1, 9, 'q1'])]);
+      passes([p({ 0: 5, 1: 6 }), q({})], [p({ 0: 5 }), q({ 1: 9 })], [listing([0, 5, 'p1'], [1, 6, 'p1', true]), listing([0, 5, 'p1'], [1, 9, 'q1'])]);
+
+      // p1 still serves shard 0 under claim 5 in both reads, while the table holds another claim (of another process or its own), another process, a released row or no row.
+      const held = [p({ 0: 5 }), q({ 1: 6 })];
+      for (const row of [listing([0, 7, 'q1'], [1, 6, 'q1']), listing([0, 7, 'p1'], [1, 6, 'q1']), listing([0, 5, 'q1'], [1, 6, 'q1']), listing([0, 5, 'p1', true], [1, 6, 'q1']), listing([1, 6, 'q1']), listing([0, 5, 'p1', false, 3], [1, 6, 'q1'])]) {
+        expect(judged(held, held, [row, row]).verdicts.map(v => v.detail)).toEqual([stale]);
+        // One listing serves both sets.
+        expect(judged(held, held, [row]).verdicts.map(v => v.detail)).toEqual([stale]);
+        // Seen in one read only, in either order, it does not count.
+        expect(judged(held, held, [row, listing([0, 5, 'p1'], [1, 6, 'q1'])]).verdicts).toEqual([]);
+        expect(judged(held, held, [listing([0, 5, 'p1'], [1, 6, 'q1']), row]).verdicts).toEqual([]);
+        // One set of facts judges from its one listing.
+        expect(J.judgeFleet(held, J.parseClaims(row)).map(v => v.detail)).toEqual([stale]);
+        expect(J.judge({ history, copies, k: 0, fleet: held, claims: [row] }).verdicts.map(v => v.detail)).toEqual([stale]);
+      }
+      expect(J.judgeFleet(held, J.parseClaims(listing([0, 5, 'p1'], [1, 6, 'q1'])))).toEqual([]);
+      // Two live holders of one shard, which the listing gives to one of them: both rules name it.
+      const two = [p({ 0: 5 }), q({ 0: 7 })];
+      expect(judged(two, two, [listing([0, 7, 'q1'])]).verdicts.map(v => v.detail)).toEqual([
+        'shard 0 is leased to 2 processes at once: m (process p1), w (process q1)',
+        stale,
+      ]);
+      // Leases with no claim (a JSON bot) and leases of a process that did not answer are not compared.
+      const empty = listing();
+      expect(J.judgeFleet([fleetNode('m', [0]), fleetNode('w', [1])], J.parseClaims(empty))).toEqual([]);
+      expect(J.judgeFleet([fleetNode('m', [0], { processId: 'p1', claims: { 0: 5 }, initialized: false })], J.parseClaims(empty))).toEqual([]);
+      // With no listing the rule is not judged, and a note says so.
+      const unlisted = J.judge({ history, copies, k: 0, fleet: held });
+      expect(unlisted.verdicts).toEqual([]);
+      expect(unlisted.notes).toContain('leases were not compared with shard_claims: no claims listing was given (--claims)');
+      expect(J.judge({ history, copies, k: 0, fleet: [fleetNode('m', [0])] }).notes).toEqual([]);
+      // An empty or unparsable listing judges nothing and writes a note.
+      const bad = ['', '\n', 'not json', '{"rows":5}', '{"rows":[{"count":2,"shard":0,"claim":5,"released":false}]}',
+        '{"rows":[{"count":2,"shard":0,"claim":"5","process":"p1","released":false}]}', `${empty}\n${empty}`];
+      for (const text of bad) {
+        const r = judged(held, held, [text]);
+        expect(r.verdicts).toEqual([]);
+        expect(r.notes.join('\n')).toMatch(/claims listing 1 was not judged: (it has \d+ lines|its line is not|a row is not)/);
+      }
+      const second = judged(held, held, [listing([0, 7, 'q1']), 'not json']);
+      expect(second.verdicts).toEqual([]);
+      expect(second.notes.join('\n')).toMatch(/claims listing 2 was not judged: its line is not JSON/);
+      expect([...J.parseClaims(`${listing([0, 5, 'p1', true], [1, 6, 'q1', false, 4])}\n`)]).toEqual([
+        ['2 0', { claim: 5, process: 'p1', released: true }],
+        ['4 1', { claim: 6, process: 'q1', released: false }],
+      ]);
+    } },
+    { name: 'a live claim at or above the next claim a take would draw is CONTROL', run: J => {
+      const history = J.buildHistory([[start(['a']), ...sixAcked(), { t: 'end' }]]);
+      const copies = [copyOf('db', sixDocs())];
+      const listing = (last: number, called: boolean, highest: number | null, claims: number | null = null) => JSON.stringify({ last, called, highest, claims });
+      const live = [fleetNode('m', [0], { processId: 'p1', claims: { 0: 7 } }), fleetNode('w', [1, 2], { processId: 'q1', shardCount: 3, claims: { 1: 10, 2: 9 } })];
+      const run = (ownership: string, fleet = live) => J.judge({ history, copies, k: 0, fleet, ownership }).verdicts.filter(v => /claim sequence/.test(v.detail));
+      // A later take of claim 12 that stopped leaves rows and the sequence above every live claim: normal.
+      expect(run(listing(12, true, 12, 12))).toEqual([]);
+      expect(run(listing(10, true, 10, 10))).toEqual([]);
+      // A restore put the sequence and the rows back to 4 while q1 holds 10: the next take draws 5.
+      expect(run(listing(4, true, 4, 4)).map(v => v.detail)).toEqual([
+        'a live process holds claim 10, and the next take would draw claim 5 (claim_seq at 4, called; highest guild_ownership claim 4; highest shard_claims claim 4): the claim sequence went back',
+      ]);
+      // Rows that hold a high claim, in either table, raise the next draw over an old sequence.
+      expect(run(listing(4, true, 11, null))).toEqual([]);
+      expect(run(listing(4, true, null, 11))).toEqual([]);
+      expect(run(listing(4, true, 4, 9)).map(v => v.v)).toEqual(['CONTROL']);
+      // A sequence reset with is_called false hands out last_value itself.
+      expect(run(listing(10, false, null)).map(v => v.v)).toEqual(['CONTROL']);
+      expect(run(listing(11, false, null))).toEqual([]);
+      expect(run(listing(10, true, null))).toEqual([]);
+      // A process that did not answer is not live, so its claims are not compared.
+      const dead = [fleetNode('m', [0], { processId: 'p1', claims: { 0: 3 } }), fleetNode('w', [1], { processId: 'q1', claims: { 1: 20 }, initialized: false })];
+      expect(run(listing(4, true, 4), dead)).toEqual([]);
+      // With no live claim to compare, nothing is judged, and a note says so.
+      const none = J.judge({ history, copies, k: 0, fleet: [fleetNode('m', [0]), fleetNode('w', [1])], ownership: listing(4, true, 4) });
+      expect(none.verdicts).toEqual([]);
+      expect(none.notes.join('\n')).toMatch(/no live process reports a claim/);
+      // An empty or unparsable listing judges nothing and writes a note.
+      for (const bad of ['', '\n', 'not json', '{"g":"10","c":4}', '{"last":4,"called":true,"highest":4,"claims":"x"}', `${listing(4, true, 4)}\n${listing(4, true, 4)}`]) {
+        const r = J.judge({ history, copies, k: 0, fleet: live, ownership: bad });
+        expect(r.verdicts.filter(v => /claim sequence/.test(v.detail))).toEqual([]);
         expect(r.notes.join('\n')).toMatch(/the ownership listing was not judged: (it has \d+ lines|its line is not)/);
       }
-      expect(J.parseOwnership(`${listing(4, false, null)}\n`)).toEqual({ last: 4, called: false, highest: null });
+      expect(J.parseOwnership(`${listing(4, false, null, 6)}\n`)).toEqual({ last: 4, called: false, highest: null, claims: 6 });
     } },
     { name: 'with two sets of control facts, only a CONTROL seen in both counts', run: J => {
       const log = [start(['a']), ...sixAcked(), { t: 'end' }];
@@ -628,7 +731,7 @@ export function checks(): Check[] {
       const settled = [fleetNode('x', []), fleetNode('w', [1])];
       const once = J.judge({ history, copies, k: 0, fleet: handoff, fleetAgain: settled });
       expect(once.verdicts).toEqual([]);
-      expect(once.notes.join('\n')).toMatch(/shard 1 is leased to 2 nodes/);
+      expect(once.notes.join('\n')).toMatch(/shard 1 is leased to 2 processes/);
       // Either order: a CONTROL only the later set shows does not count either.
       expect(J.judge({ history, copies, k: 0, fleet: settled, fleetAgain: handoff }).verdicts).toEqual([]);
       // Facts, not file order or names: the same double lease listed the other way round, or with a third holder, still counts.

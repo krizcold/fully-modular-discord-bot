@@ -47,6 +47,6 @@ describe('graveyard restore with no owner info', () => {
       restoreGuild: async (_g: string, _b: number, token: any) => { tokens.push(token); return { ok: true, moved: 0 }; },
     } as any);
     expect(await restoreGuildFromGraveyard('g', 5)).toEqual({ ok: true, moved: 0 });
-    expect(tokens).toEqual([{ nodeId: '', claim: null, shardId: 0, shardCount: 1 }]);
+    expect(tokens).toEqual([{ nodeId: '', claim: null, processId: null, shardId: 0, shardCount: 1 }]);
   });
 });

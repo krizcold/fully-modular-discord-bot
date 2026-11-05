@@ -4,6 +4,7 @@ import { MigrationService } from '../../src/bot/internalSetup/utils/dataMigratio
 import { getNodeId } from '../../src/bot/internalSetup/fleet/nodeIdentity';
 import { jsonBot, realService, resetDatabase, startRig, stopRig, type PgRig } from '../helpers/pgMigrationRig';
 import { FakeHost, seedFile, useDatabaseUrl, wipeRoot, why } from '../helpers/migrationRig';
+import { takeShard } from '../helpers/pgClaims';
 import fs from 'fs';
 import path from 'path';
 
@@ -60,11 +61,10 @@ describe('the ownership rows', () => {
     backend.start();
     const until = Date.now() + 60_000;
     while (backend.connectionState().state !== 'ready' && Date.now() < until) await new Promise(r => setTimeout(r, 100));
-    const claim = await backend.takeClaim();
-    if (claim.outcome !== 'claimed') throw new Error('no claim');
+    const claim = await takeShard(rig.admin, { processId: 'p-pg', nodeId: 'node-pg' });
     const owned = await backend.listOwnedGuilds([0], 1);
     expect(owned).toContain(G1);
-    const hydrated = await backend.hydrateGuild(G1, { nodeId: 'node-pg', claim: claim.claim, shardId: 0, shardCount: 1 });
+    const hydrated = await backend.hydrateGuild(G1, claim);
     expect(hydrated).toMatchObject({ ok: true, docs: [{ key: { module: 'm', filename: 'a.json' }, doc: '{"a":1}' }] });
     await backend.stop();
   });
@@ -87,9 +87,8 @@ describe('the node id', () => {
     try {
       const until = Date.now() + 60_000;
       while (backend.connectionState().state !== 'ready' && Date.now() < until) await new Promise(r => setTimeout(r, 100));
-      const claim = await backend.takeClaim();
-      if (claim.outcome !== 'claimed') throw new Error('no claim');
-      const hydrated = await backend.hydrateGuild(G1, { nodeId: getNodeId(), claim: claim.claim, shardId: 0, shardCount: 1 });
+      const claim = await takeShard(rig.admin, { processId: 'p-pg', nodeId: getNodeId() });
+      const hydrated = await backend.hydrateGuild(G1, claim);
       expect(hydrated).toMatchObject({ ok: true, docs: [{ key: { module: 'm', filename: 'a.json' }, doc: '{"a":1}' }] });
     } finally {
       await backend.stop();

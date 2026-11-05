@@ -16,6 +16,7 @@ import { storeNavigationContext } from './panelButtonHandler';
 import { PanelResponse, PanelContext } from '@bot/types/panelTypes';
 import { getBotUpdateStatus, checkForBotUpdates, checkForAllBotUpdates } from '../botManagerAPI';
 import { buildPanelView } from '../../panels/updateManager';
+import { stoppedServing } from '../servingGate';
 
 /**
  * Recover persistent panels after bot restart
@@ -26,7 +27,8 @@ export async function recoverPersistentPanels(client: Client): Promise<void> {
   try {
     await recoverPanelsForScope(client);
 
-    for (const [guildId, guild] of client.guilds.cache) {
+    for (const [guildId] of client.guilds.cache) {
+      if (stoppedServing()) return;
       await recoverPanelsForScope(client, guildId);
     }
 
@@ -40,9 +42,12 @@ export async function recoverPersistentPanels(client: Client): Promise<void> {
  * Recover panels for scope
  */
 async function recoverPanelsForScope(client: Client, guildId?: string): Promise<void> {
+  // NB4 decision 6: asked after each await, so a walk that crosses the deadline or a loss ends there.
+  if (stoppedServing()) return;
   const storage = await loadPersistentPanels(guildId);
 
   for (const [panelId, data] of Object.entries(storage)) {
+    if (stoppedServing()) return;
     try {
       if (panelId === 'update_manager') {
         await recoverUpdatePanel(client, data as any);
@@ -120,6 +125,7 @@ async function recoverUpdatePanel(
         summary: { totalUpdatesAvailable: 0, hasAnyUpdates: false }
       });
 
+      if (stoppedServing()) return;
       if (!(await updatePanelDynamic(context, 'update_manager', response, undefined, messageId))) return;
 
       await updatePersistentPanelState('update_manager', 'recovered', messageId, guildId, undefined, {

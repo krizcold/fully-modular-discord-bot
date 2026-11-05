@@ -29,6 +29,14 @@ async function run(fault?: (p: string) => void | Promise<void>, jobId = 'job-des
 }
 const seed = () => { jsonBot(); seedFile(`${G}/m/a.json`, '{"a":1}'); };
 
+/** NB4 decision 25: an unreleased claim of a process whose machine heartbeat within its takeover delay. */
+async function liveClaim(r: PgRig): Promise<void> {
+  await r.admin.query(`INSERT INTO smdb_data.shard_nodes (node_id, node_name, process_id, capacity, takeover_seconds, fit, restartable, returns, started_at, seen_at)
+    VALUES ('other-node', 'Other', 'p-other', 1, 30, true, true, true, now(), now())`);
+  await r.admin.query(`INSERT INTO smdb_data.shard_claims (shard_count, shard_id, claim, holder_process, holder_node, holder_name, home_node, ttl_ms, expires_up_ms)
+    VALUES (1, 0, 5, 'p-other', 'other-node', 'Other', 'other-node', 30000, 30000)`);
+}
+
 describe('the destination', () => {
   it('a database with no schema is provisioned; the journal holds its normalized address from S5', async () => {
     seed();
@@ -74,7 +82,7 @@ describe('the destination', () => {
     expect(readJson(STORES).storeIds).toEqual([old, job.storeId]);
   });
 
-  it('with another session, an unretired row of another node or a store id changed between S2 and S5 it is not renamed', async () => {
+  it('with another session, a live shard claim of another machine or a store id changed between S2 and S5 it is not renamed', async () => {
     for (const how of ['session', 'node', 'id'] as const) {
       wipeRoot();
       await resetDatabase(rig);
@@ -85,12 +93,12 @@ describe('the destination', () => {
       const job = await run(async p => {
         if (p !== 'S4') return;
         if (how === 'session') other = await otherSession(rig);
-        if (how === 'node') await rig.admin.query(`INSERT INTO smdb_data.guild_ownership (guild_id, node_id, shard_id, claim, shard_count) VALUES ('1', 'other-node', 0, 5, 1)`);
+        if (how === 'node') await liveClaim(rig);
         if (how === 'id') await rig.admin.query(`UPDATE smdb_data.meta SET value = '"changed"' WHERE key = 'store_id'`);
       }, `job-dest-${how}`);
       await (other as Client | null)?.end();
       expect(job, `${how} ${why(job)}`).toMatchObject({ state: 'failed', stage: 'copying' });
-      const said = { session: /1 other session\(s\) .*\(unnamed: 1\)/, node: /owned by another bot; it was not renamed/, id: /changed from .* to changed since the first check; it was not renamed/ }[how];
+      const said = { session: /1 other session\(s\) .*\(unnamed: 1\)/, node: /has shard claims of bot processes seen in the last 30 s: shard 0 held by Other \(seen \d+ s ago\); stop the bot on those machines \(a clean stop releases its claims\), then retry; it was not renamed/, id: /changed from .* to changed since the first check; it was not renamed/ }[how];
       expect(job.error, how).toMatch(said);
       expect(await schemas(rig), how).toEqual(['smdb_data']);
       const held = JSON.parse((await rig.admin.query(`SELECT value FROM smdb_data.meta WHERE key = 'store_id'`)).rows[0].value);

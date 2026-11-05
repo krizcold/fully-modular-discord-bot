@@ -10,6 +10,7 @@ import { pathToFileURL } from 'url';
 import { promisify } from 'util';
 import { describe, expect, it, onTestFinished } from 'vitest';
 import { runScenario } from '../helpers/child';
+import { readSourceText } from '../helpers/sourceText';
 import { canonicalName } from '../mutation/keys.mjs';
 import {
   changeTarget, codeLines, commonLines, gates, gatesIn, inPattern, lineDiff, linesOfTarget, mergeRanges, mutatePatterns, notMutated, parseNameStatus,
@@ -914,7 +915,7 @@ describe('the change', () => {
   const botRoot = path.resolve(__dirname, '..', '..');
 
   it('never mutates code on the way to /data, under any name, and names it', () => {
-    const dataRoot = fs.readFileSync(path.join(botRoot, 'src', 'utils', 'dataRoot.ts'), 'utf8');
+    const dataRoot = readSourceText(botRoot, path.join('src', 'utils', 'dataRoot.ts'));
     expect(holdsDataRoute('src/utils/dataRoot.ts', dataRoot)).toBe(true);
     expect(holdsDataRoute('src/a.ts', "export const root = process.env['DATA_DIR'] ?? 'here';\n")).toBe(true);
     expect(holdsDataRoute('src/a.js', 'module.exports = process.env.X || `/data/`;\n')).toBe(true);
@@ -934,7 +935,7 @@ describe('the change', () => {
     for (const text of ["export const at = '/database';\n", "export const at = '/data-x';\n"]) expect(holdsDataRoute('src/a.ts', text), text).toBe(false);
     // The image's /app root and every path under it are fixed roots too (D:\app on Windows): the file that picks
     // them when the image's marker exists is never mutated, nor is any that holds one.
-    const pathHelpers = fs.readFileSync(path.join(botRoot, 'src', 'bot', 'internalSetup', 'utils', 'pathHelpers.ts'), 'utf8');
+    const pathHelpers = readSourceText(botRoot, path.join('src', 'bot', 'internalSetup', 'utils', 'pathHelpers.ts'));
     expect(holdsDataRoute('src/bot/internalSetup/utils/pathHelpers.ts', pathHelpers)).toBe(true);
     for (const text of ["export const at = '/app';\n", "export const at = '/app/build';\n", 'export const at = (x: string) => `/app/${x}`;\n']) {
       expect(holdsDataRoute('src/a.ts', text), text).toBe(true);

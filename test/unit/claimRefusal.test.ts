@@ -104,7 +104,7 @@ describe('a database of another schema version', () => {
     const { backend, sent } = scriptedBackend(sql => {
       if (/CREATE TABLE IF NOT EXISTS smdb_data\.meta/.test(sql)) created = true;
       if (/SELECT value FROM smdb_data\.meta WHERE key = 'schema_version'/.test(sql)) {
-        return created ? { rows: [{ value: '{"v":2}' }], rowCount: 1 } : missing;
+        return created ? { rows: [{ value: '{"v":3}' }], rowCount: 1 } : missing;
       }
       return undefined;
     });
@@ -121,7 +121,7 @@ describe('a database of another schema version', () => {
     vi.spyOn(console, 'error').mockImplementation(() => {});
     const { backend, connect } = scriptedBackend(() => undefined);
     Object.assign(backend as unknown as object, flags);
-    expect(await backend.restoreGuild('1', 5, { nodeId: '', claim: null, shardId: 0, shardCount: 1 })).toEqual({ ok: false, reason });
+    expect(await backend.restoreGuild('1', 5, { nodeId: '', claim: null, processId: null, shardId: 0, shardCount: 1 })).toEqual({ ok: false, reason });
     expect(connect).not.toHaveBeenCalled();
   });
 
@@ -149,10 +149,10 @@ describe('a deposed flush', () => {
       return undefined;
     });
     (backend as unknown as { provisioned: boolean }).provisioned = true;
-    const outcome = await backend.flushGuild('1', { upserts: [], deletes: [], appends: [] }, { nodeId: 'node-a', claim: 3, shardId: 0, shardCount: 1 });
+    const outcome = await backend.flushGuild('1', { upserts: [], deletes: [], appends: [] }, { nodeId: 'node-a', claim: 3, processId: 'process-a', shardId: 0, shardCount: 1 });
     expect(outcome).toEqual({ ok: false, reason: 'deposed', currentOwner: { nodeId: 'node-b', claim: 7 } });
     expect(error.mock.calls.map(c => String(c[0]))).toContain(
-      '[PostgresBackend] Flush rejected: deposed: guild 1 owned by node-b (claim 7); local token node-a (claim 3)');
+      '[PostgresBackend] Flush rejected: deposed: guild 1 is held by claim 7 (node-b); shard 0 of 1 has no claim row; local claim 3');
   });
 
   it('leaves the working set\'s last error naming the newer owner\'s claim', async () => {

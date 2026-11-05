@@ -4,6 +4,7 @@ import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { beforeAll, describe, expect, it } from 'vitest';
+import { readSourceText } from '../helpers/sourceText';
 import { pastBudget } from '../mutation/control.mjs';
 import { PASSES } from '../mutation/passes.mjs';
 
@@ -27,7 +28,7 @@ const ranFor = (reportDir: string, dir: string) => (JSON.parse(fs.readFileSync(p
 interface Mutant { location: { start: { line: number } }; mutator: string; original: string; passes: { a: Pass; b?: Pass; b2?: Pass } }
 
 function lineOf(text: string): number {
-  const index = fs.readFileSync(path.join(root, TARGET), 'utf8').split('\n').findIndex(line => line.includes(text));
+  const index = readSourceText(root, TARGET).split('\n').findIndex(line => line.includes(text));
   if (index < 0) throw new Error(`the bite's target line "${text}" is gone from ${TARGET}; aim the bite at another line of the same kind`);
   return index + 1;
 }

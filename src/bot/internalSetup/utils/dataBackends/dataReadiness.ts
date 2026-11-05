@@ -27,7 +27,10 @@ function guildIdToShardId(guildId: string, shardCount: number): number {
 
 export interface LeaseSnapshot {
   nodeId: string;
-  claim: number | null;
+  /** This boot's process id; null on a JSON bot. */
+  processId: string | null;
+  /** The claim this process holds per shard id; a shard missing here holds none. */
+  claims: Record<number, number | null>;
   shardCount: number;
   shardIds: number[];
 }
@@ -86,10 +89,10 @@ export class DataReadinessDriver {
     for (const guildId of this.ws.readyGuilds()) {
       if (this.isLeasedHere(guildId)) this.ws.refreshFence(guildId, this.fenceFor(guildId));
     }
-    if (removed.length > 0) void this.unloadShards(removed);
+    if (removed.length > 0) this.unloadShards(removed);
     if (added.length > 0) void this.hydrateShards(added);
-    else if (!this.initialResolved && this.shardIds.length > 0) {
-      // A re-grant with nothing new still means the initial set is covered.
+    else if (!this.initialResolved) {
+      // A grant with nothing new (none held, NB4) still means the initial set is covered.
       this.settleInitialIfReady();
     }
     void this.refreshCatalog();
@@ -183,10 +186,12 @@ export class DataReadinessDriver {
 
   private fenceFor(guildId: string): FenceToken {
     const lease = this.lease;
+    const shardId = guildIdToShardId(guildId, this.shardCount || 1);
     return {
       nodeId: lease?.nodeId ?? 'unknown',
-      claim: lease?.claim ?? null,
-      shardId: guildIdToShardId(guildId, this.shardCount || 1),
+      claim: lease?.claims[shardId] ?? null,
+      processId: lease?.processId ?? null,
+      shardId,
       shardCount: this.shardCount || 1,
     };
   }
@@ -277,13 +282,12 @@ export class DataReadinessDriver {
     }
   }
 
-  private async unloadShards(shards: number[]): Promise<void> {
+  /** NB4 decision 17: every set of the removed shards is frozen in one synchronous pass, then flushed in the background. */
+  private unloadShards(shards: number[]): void {
     const removed = new Set(shards);
-    for (const guildId of this.ws.readyGuilds()) {
-      if (removed.has(guildIdToShardId(guildId, this.shardCount || 1))) {
-        await this.ws.unloadToFrozenRetained(guildId, () => !this.isLeasedHere(guildId));
-      }
-    }
+    const guilds = this.ws.readyGuilds().filter(guildId => removed.has(guildIdToShardId(guildId, this.shardCount || 1)));
+    for (const guildId of guilds) this.ws.freeze(guildId);
+    for (const guildId of guilds) void this.ws.unloadToFrozenRetained(guildId, () => !this.isLeasedHere(guildId));
   }
 
   private drainBuffer(guildId: string, waited: 'ready' | 'gone' | 'not-ready'): void {
