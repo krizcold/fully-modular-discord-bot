@@ -93,6 +93,13 @@ describe('a primary and its streaming standby', () => {
         expect(raised.chosen.entry).toBe(entryS);
         expect(raised.logs.some(l => l.includes('so it is a replaced main'))).toBe(true);
       }
+      // NB5F P4: the move's check of the promoted copy passes, and leaves no session and no scratch schema there.
+      await waitFor(() => bot.moved.length === 1, 60_000);
+      expect(bot.moved).toEqual([entryS]);
+      bot.chooser.stop();
+      await sleep(5_000);
+      expect((await directS.query(`SELECT count(*)::int AS n FROM pg_stat_activity WHERE application_name = 'smdb-move-check'`)).rows[0].n).toBe(0);
+      expect((await directS.query(`SELECT count(*)::int AS n FROM pg_namespace WHERE nspname LIKE 'smdb\\_shape\\_%'`)).rows[0].n).toBe(0);
     } finally {
       await bot.stop();
       vi.restoreAllMocks();

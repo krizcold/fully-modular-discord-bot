@@ -22,9 +22,9 @@ vi.mock('fs', async importOriginal => {
 const failGraveyardNote = vi.hoisted(() => ({ on: false }));
 
 import {
-  behindNoticeText, cantCheckText, decideMain, replacedText, tieText, usingLine, type AnsweredProbe, type Probe,
+  behindNoticeText, cantCheckText, decideMain, markerTexts, replacedText, tieText, usingLine, type AnsweredProbe, type Probe,
 } from '../../src/bot/internalSetup/utils/dataBackends/mainDatabase';
-import { latchWords } from '../../src/bot/internalSetup/utils/dataBackends/postgresBackend';
+import { latchWords, moveCheckTexts, notReadyLine } from '../../src/bot/internalSetup/utils/dataBackends/postgresBackend';
 import { heldClauses } from '../../src/bot/internalSetup/utils/heldWords';
 import { notReleasedLine, releaseFailureLine } from '../../src/bot/internalSetup/fleet/shardClaims';
 import type { Pair } from '../../src/bot/internalSetup/fleet/claimRules';
@@ -127,6 +127,45 @@ describe("decision 11's <why> for the three causes", () => {
     [{ kind: 'behind-notice', machine: 'node-b', generation: 3 } as const, "can't confirm that a:5432/bot is still the main (generation 3 was announced for node-b)"],
   ])('%j', (cause, text) => {
     expect(seen(latchWords(cause, 'a:5432/bot'))).toBe(text);
+  });
+});
+
+describe('NB5F: the texts of a marker that cannot be read, the move check and the bootstrap line', () => {
+  const why = "/data/.backend.json cannot be read (EACCES: permission denied, open '/data/.backend.json')";
+
+  it("T1, T3 to T5 and T7, the chooser's", () => {
+    expect(seen(markerTexts.bootWait(why))).toBe(`${why}, so the bot can't confirm which store this machine records; it chooses no database and reads that file again at every check`);
+    expect(seen(markerTexts.notMoving(why))).toBe(`[Database] Not moving yet: ${why}, so the bot can't confirm which store this machine records; this process keeps its unsaved changes and stays stopped`);
+    expect(seen(markerTexts.watchOwn(why, 'store-a', 'a:5432/bot'))).toBe(`[Database] ${why}, so the bot can't confirm which store this machine records; until it can, the watch counts only the databases of store store-a, the store at a:5432/bot, and a hold does not end`);
+    expect(seen(markerTexts.watchAll(why))).toBe(`[Database] ${why}, so the bot can't confirm which store this machine records; until it can, the watch counts every database that answers, and a hold does not end`);
+    expect(seen(markerTexts.step('a:5432/bot', 1, 'b:5432/bot', 'writable', 2, why))).toBe(`can't confirm that this bot process's database a:5432/bot (generation 1) is still the main: b:5432/bot accepts writes at generation 2, and ${why}, so the bot can't tell whether that database holds this bot's store`);
+    expect(seen(markerTexts.step('a:5432/bot', 1, 'b:5432/bot', 'live copy', 2, why))).toBe(`can't confirm that this bot process's database a:5432/bot (generation 1) is still the main: b:5432/bot is a live copy at generation 2, and ${why}, so the bot can't tell whether that database holds this bot's store`);
+    expect(seen(markerTexts.step('a:5432/bot', 1, 'b:5432/bot', 'read-only', 2, why))).toBe(`can't confirm that this bot process's database a:5432/bot (generation 1) is still the main: b:5432/bot is read-only at generation 2, and ${why}, so the bot can't tell whether that database holds this bot's store`);
+    expect(seen(markerTexts.confirming(why))).toBe(`${why}, so the bot can't confirm which store this machine records; checking again`);
+  });
+
+  it("T6, the latch's <why> for 'unknown-store', and its variants for a live copy and a read-only database", () => {
+    expect(seen(latchWords({ kind: 'unknown-store', other: 'b:5432/bot', generation: 2, standing: 'writable' }, 'a:5432/bot')))
+      .toBe("can't confirm that a:5432/bot is still the main (b:5432/bot accepts writes at generation 2, and the store this machine records is unknown)");
+    expect(seen(latchWords({ kind: 'unknown-store', other: 'b:5432/bot', generation: 2, standing: 'live copy' }, 'a:5432/bot')))
+      .toBe("can't confirm that a:5432/bot is still the main (b:5432/bot is a live copy at generation 2, and the store this machine records is unknown)");
+    expect(seen(latchWords({ kind: 'unknown-store', other: 'b:5432/bot', generation: 2, standing: 'read-only' }, 'a:5432/bot')))
+      .toBe("can't confirm that a:5432/bot is still the main (b:5432/bot is read-only at generation 2, and the store this machine records is unknown)");
+  });
+
+  it('T8 to T17, the move check and the bootstrap line', () => {
+    expect(seen(moveCheckTexts.markerUnknown(why))).toBe(`${why}, so the bot can't confirm which store this machine records`);
+    expect(seen(moveCheckTexts.version('{"v":5}'))).toBe('the database holds schema version {"v":5}, and this bot reads only version 6');
+    expect(seen(moveCheckTexts.empty)).toBe("the database holds no tables in smdb_data, so it holds no copy of this bot's store; a move does not provision a database");
+    expect(seen(moveCheckTexts.noStoreId)).toBe("the database's smdb_data matches this bot's schema (version 6) but smdb_data.meta holds no store_id row, and this machine records no store id, so this bot can't confirm whose store it is; a move writes no store id");
+    expect(seen(moveCheckTexts.unreadableStoreId)).toBe("its store id can't be read (the stored value is not a JSON string)");
+    expect(seen(moveCheckTexts.otherStore('store-x', 'store-a'))).toBe("the configured database is not the one this deployment's data lives in (store store-x vs recorded store-a)");
+    expect(seen(moveCheckTexts.incomplete('SQLSTATE 42501: permission denied for schema smdb_data'))).toBe('the check of its store could not be completed (SQLSTATE 42501: permission denied for schema smdb_data)');
+    expect(seen(moveCheckTexts.incomplete(moveCheckTexts.silent(40)))).toBe('the check of its store could not be completed (the database did not answer within 40 s)');
+    expect(seen(moveCheckTexts.overBound)).toBe('the check of its store did not finish within 60 s');
+    expect(seen(moveCheckTexts.notMoving('w:5432/bot', moveCheckTexts.empty))).toBe(`[Database] Not moving to w:5432/bot: the database holds no tables in smdb_data, so it holds no copy of this bot's store; a move does not provision a database; this process keeps its unsaved changes and stays stopped`);
+    expect(seen(notReadyLine('a:5432/bot was replaced by node-b (generation 2); this process does not write to it')))
+      .toBe('[PostgresBackend] Connected and provisioned; not ready: a:5432/bot was replaced by node-b (generation 2); this process does not write to it');
   });
 });
 

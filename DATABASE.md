@@ -56,6 +56,15 @@ that was being committed when the bot saw the switch. A guild retire or restore 
 "can't confirm"; when such a retire did not reach the new main, the bot saves the guild's data there and logs that the
 retire must be repeated. Repeat it, or the restore, once the bot runs on the new main.
 
+Before it moves, the bot checks the new main as it checks a database at boot (the server's version, the encoding,
+its role's privileges, the schema version and the relations of smdb_data) and that smdb_data.meta holds the store id
+this machine records in /data/.backend.json. The check runs in one transaction that the bot rolls back, within 60
+seconds, so it changes nothing there, and a move never provisions a database: one without smdb_data's tables is
+refused. A refusal is logged once per reason as `[Database] Not moving to <address>: <reason>; this process keeps
+its unsaved changes and stays stopped`, each difference on its own line. The bot checks again at its next pass,
+about every 5 seconds, so a grant or a correction made on the new main lets it move without a restart; a restart
+gives up the changes it holds.
+
 Until a main is found, the bot waits with its data closed and does not connect to Discord, and the web UI's Shards
 section says why. The web panel reads only the database the bot uses. An address whose host is an IP and whose
 `sslmode` is `verify-full` has its certificate checked against that IP.
@@ -211,7 +220,10 @@ it is refused, since the bot can't confirm that this database holds that store, 
 adds the recorded id (`INSERT INTO smdb_data.meta (key, value) VALUES ('store_id', '"<id>"')`) for the case that this
 is the database the deployment was set up with; otherwise point the bot at the deployment's database. When
 /data/.backend.json exists but can't be read or parsed, the bot writes no store id and refuses nothing: the boot
-logs that the marker could not be read and tries again.
+logs that the marker could not be read and tries again. While the bot runs it reads the same file to tell its own
+databases from another bot's. When the file can't be read or parsed, it chooses no database and moves to none,
+saying it can't confirm which store this machine records, and after its database stopped answering it saves nothing
+there until it can read the file again.
 When the server rejects a statement that builds the copy of the schema the bot compares with, the boot is refused,
 naming the server's SQLSTATE and message, and smdb_data is not changed; a privilege error gives the GRANT to run.
 A lost connection, a cancelled statement, a lack of resources or an error with no SQLSTATE is retried instead.

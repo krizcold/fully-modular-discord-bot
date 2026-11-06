@@ -135,7 +135,7 @@ export function mainChooserDeps(): ChooserDeps {
     probe: entries => probePass(entries, { session: config => new PgClient(config) }),
     readNotice: () => readNewestNotice(),
     sendWaitDm: text => sendOwnerDm(text, waitNonce(dataProcessId)),
-    markerStoreId: () => readFileMarker()?.storeId ?? null,
+    markerStoreId: readMarkerStoreId,
     noticeCheckOff: () => (loadCredentials().DATA_NOTICE_CHECK || '').trim().toLowerCase() === 'off',
     nodeName: () => getNodeName(),
     onWait: reason => {
@@ -173,7 +173,8 @@ function wireDatabaseSteps(backend: PostgresBackend, chooser: MainChooser, ws: W
     startLeave: reason => stepLayers.startLeave(reason),
   });
   backend.setMoveSteps({
-    checkTarget: entry => checkMoveTarget(entry, readFileMarker()?.storeId ?? null),
+    checkTarget: entry => checkMoveTarget(entry, readMarkerStoreId),
+    exitBegan: () => chooser.exitDrainBegan(),
     claims: entry => stepLayers.claims(entry),
     settleRetires: (epoch, entry) => settleRetires(backend, epoch, entry, {
       retiresToSettle,

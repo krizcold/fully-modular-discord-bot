@@ -14,7 +14,7 @@ import {
   type Notice, type OwnerPlace, type RequestFailureInfo,
 } from '../../utils/ownerMessages';
 import { noteChannelPosted, noteChannelRefusal, ownerMessagesFile, readOwnerChannelSetting } from '../utils/ownerChannel';
-import { webuiChoiceDeps } from '../utils/webuiDataReader';
+import { unknownStoreWords, webuiChoiceDeps } from '../utils/webuiDataReader';
 import { DEFAULT_MAINTENANCE_MESSAGE } from '../../bot/internalSetup/utils/maintenanceGate';
 import { MAINTENANCE_MESSAGE_MAX, readMaintenanceFile, writeMaintenanceFile } from '../../utils/maintenanceFile';
 import { MigrationService } from '../../bot/internalSetup/utils/dataMigration';
@@ -225,7 +225,13 @@ async function switchNotice(notice: Notice, deadline: number): Promise<Answer> {
   const deps = webuiChoiceDeps();
   const answers = await beforeDeadline(deps.probe(deps.entries()), deadline);
   if (answers === 'lapsed') return lapsedAnswer(SWITCH_LAPSED);
-  const decision = decideMain(answers, { kind: 'none' }, { markerStoreId: deps.markerStoreId(), noticeCheckOff: deps.noticeCheckOff() });
+  let markerStoreId: string | null;
+  try {
+    markerStoreId = deps.markerStoreId();
+  } catch (error) {
+    return { status: 409, body: { success: false, error: `can't confirm the main database: ${unknownStoreWords(error)}; no notice was posted` } };
+  }
+  const decision = decideMain(answers, { kind: 'none' }, { markerStoreId, noticeCheckOff: deps.noticeCheckOff() });
   if (decision.outcome !== 'chosen') {
     const reason = decision.outcome === 'needs-notice' ? 'the switch notices were not read' : decision.reason;
     return { status: 409, body: { success: false, error: `can't confirm the main database: ${reason}; no notice was posted` } };

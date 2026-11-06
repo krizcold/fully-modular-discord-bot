@@ -151,7 +151,7 @@ export async function startBot(list: string[], recordedStore: string, claims: (e
     startLeave: reason => { r.leaves.push(reason); },
   });
   backend.setMoveSteps({
-    checkTarget: entry => checkMoveTarget(entry, recordedStore),
+    checkTarget: entry => checkMoveTarget(entry, () => recordedStore),
     claims,
     settleRetires: (epoch, entry) => settleRetires(backend, epoch, entry, {
       retiresToSettle: () => [...r.retires],

@@ -414,7 +414,14 @@ export function isSilence(error: unknown): boolean {
 export type LatchCause =
   | { kind: 'replaced'; machine: string; generation: number }
   | { kind: 'tie'; generation: number }
-  | { kind: 'behind-notice'; machine: string; generation: number };
+  | { kind: 'behind-notice'; machine: string; generation: number }
+  | { kind: 'unknown-store'; other: string; generation: number; standing: Standing };
+
+/** How a database at a higher generation answered: accepting writes, a live copy (in recovery) or read-only. */
+export type Standing = 'writable' | 'live copy' | 'read-only';
+
+const standingAt = (other: string, standing: Standing, generation: number) =>
+  standing === 'writable' ? `${other} accepts writes at generation ${generation}` : `${other} is ${standing === 'live copy' ? 'a live copy' : 'read-only'} at generation ${generation}`;
 
 /** NB5 decision 11's `<why>` for a latch of the database at this address. */
 export function latchWords(cause: LatchCause, address: string): string {
@@ -422,6 +429,7 @@ export function latchWords(cause: LatchCause, address: string): string {
     case 'replaced': return `${address} was replaced by ${cause.machine} (generation ${cause.generation})`;
     case 'tie': return `can't confirm that ${address} is still the main (another database accepts writes at generation ${cause.generation})`;
     case 'behind-notice': return `can't confirm that ${address} is still the main (generation ${cause.generation} was announced for ${cause.machine})`;
+    case 'unknown-store': return `can't confirm that ${address} is still the main (${standingAt(cause.other, cause.standing, cause.generation)}, and the store this machine records is unknown)`;
   }
 }
 
@@ -474,10 +482,14 @@ export interface DatabaseChooser {
   stop(): void;
 }
 
+export type MoveRefusal = string | { reason: string; details: string[] };
+
 /** The steps of a move that other layers own (decision 12): (a)'s check, (c) and (d), (e) and (f)'s report. */
 export interface MoveSteps {
-  /** (a): null when the target may be written, else the reason it may not. */
-  checkTarget(entry: string): Promise<string | null>;
+  /** (a): null when the target may be written, else the reason it may not, with the differences a refusal lists. */
+  checkTarget(entry: string): Promise<MoveRefusal | null>;
+  /** The exit drain began: a check that ends after it starts no (b) (NB5F decision 4). */
+  exitBegan?(): boolean;
   /** (c) and (d): the renewal and the re-take on the claims pool (b) built; false ends this attempt. */
   claims(entry: string): Promise<boolean>;
   /** (e): the retires sent before the latch, settled against the target; false ends this attempt. */
@@ -551,8 +563,80 @@ const RESTORE_MOVE = `WITH moved AS (
 // Decision 12 (e) and J2: whether a retire's batch is on the target, as one row.
 const BATCH_PRESENT = `SELECT EXISTS (SELECT 1 FROM smdb_data.guild_data_graveyard WHERE guild_id = $1 AND retired_at = $2) AS present`;
 
+/** What NB16's check of a store found, before anything is written: a refusal, another version, no relations, or a match. */
+export type StoreVerdict =
+  | { kind: 'refused'; cause: 'server' | 'encoding' | 'privileges' | 'shape' | 'scratch'; refusal: Refusal; found?: string }
+  | { kind: 'version'; found: string }
+  | { kind: 'empty'; found: FoundList }
+  | { kind: 'matches' };
+
+/** The schema_version row of a meta that passed the gate: its value, none, or why it can't be read. */
+async function readVersion(client: Sender): Promise<{ value: string | undefined } | { cause: string }> {
+  const res = await client.query(`SELECT value::text FROM ONLY smdb_data.meta WHERE key = 'schema_version'`);
+  if (res.rows.length > 1) return { cause: `smdb_data.meta holds ${res.rows.length} schema_version rows` };
+  if (res.rows.length === 0) return { value: undefined };
+  const value = res.rows[0]?.value;
+  if (value === null || value === undefined) return { cause: 'smdb_data.meta holds a schema_version row with no value' };
+  return { value: String(value) };
+}
+
+/** checkShape, or the scratch's refusal when the scratch could not be built for a cause that repeats at every boot. */
+async function compareWithScratch(client: Sender, mode: ShapeMode, found: FoundList): Promise<ShapeCheck | Extract<StoreVerdict, { kind: 'refused' }>> {
+  try {
+    return await checkShape(client, mode);
+  } catch (error) {
+    if (!(error instanceof ScratchBuildFailed)) throw error;
+    return { kind: 'refused', cause: 'scratch', refusal: scratchRefusal(error.code, error.serverMessage, found.role, found.db) };
+  }
+}
+
+/**
+ * NB16 decision 7 steps 1 to 7 inside the caller's open transaction: the server version, the SET LOCALs, the encoding,
+ * the found list and its gate, the version, and the comparison with the scratch. Writes no row of smdb_data.
+ */
+export async function inspectStore(client: Sender): Promise<StoreVerdict> {
+  const versionNum = Number((await client.query('SHOW server_version_num')).rows[0]?.server_version_num);
+  if (Number.isInteger(versionNum) && versionNum > 0 && versionNum < MIN_SERVER_VERSION_NUM) {
+    const release = serverRelease(versionNum);
+    return { kind: 'refused', cause: 'server', refusal: serverVersionRefusal(release), found: release };
+  }
+  await client.query('SET LOCAL search_path = pg_catalog');
+  await client.query('SET LOCAL quote_all_identifiers = off');
+  await client.query('SET LOCAL default_table_access_method = heap');
+  const encoding = String((await client.query('SHOW server_encoding')).rows[0]?.server_encoding ?? '');
+  if (encoding !== 'UTF8') return { kind: 'refused', cause: 'encoding', refusal: encodingRefusal(encoding), found: encoding };
+  const found = await readFoundList(client);
+  const gate = gateRefusal(found);
+  if (gate) return { kind: 'refused', cause: 'privileges', refusal: gate };
+  let version: string | undefined;
+  let unreadable: string | undefined;
+  if (found.meta) {
+    unreadable = metaGateCause(found.meta) ?? undefined;
+    if (unreadable === undefined) {
+      const read = await readVersion(client);
+      if ('cause' in read) unreadable = read.cause;
+      else version = read.value;
+    }
+  }
+  if (version !== undefined && !matchesSchemaVersion(version)) return { kind: 'version', found: version };
+  if (found.relations.length === 0) return { kind: 'empty', found };
+  if (version === undefined) {
+    const result = await compareWithScratch(client, 'unversioned', found);
+    if ('kind' in result) return result;
+    return { kind: 'refused', cause: 'shape', refusal: unversionedRefusal(found, result, unreadable) };
+  }
+  const result = await compareWithScratch(client, 'provisioned', found);
+  if ('kind' in result) return result;
+  const privileges = relationPrivileges(found, result.reference);
+  if (result.differences.length || privileges.length) {
+    const refusal = shapeRefusal(sortDifferences([...result.differences, ...privileges]));
+    return { kind: 'refused', cause: result.differences.length ? 'shape' : 'privileges', refusal };
+  }
+  return { kind: 'matches' };
+}
+
 const NO_MOVE_STEPS: MoveSteps = {
-  checkTarget: entry => checkMoveTarget(entry, null),
+  checkTarget: entry => checkMoveTarget(entry, () => null),
   claims: async () => true,
   settleRetires: async () => true,
   moved: () => undefined,
@@ -844,7 +928,9 @@ export class PostgresBackend implements DataBackend {
         if (this.stopped || this.schemaMismatch) return;
         if (this.isHeld()) this.stateBeforeHold = 'ready';
         else if (this.latchWhy === null) this.state = 'ready';
-        console.log('[PostgresBackend] Connected and provisioned; backend ready');
+        const notReady = this.refusalDetail();
+        if (notReady === null) console.log('[PostgresBackend] Connected and provisioned; backend ready');
+        else console.warn(notReadyLine(notReady));
         return;
       } catch (error) {
         if (this.stopped) return;
@@ -979,14 +1065,16 @@ export class PostgresBackend implements DataBackend {
     const startedUnder = this.epoch;
     const refusal = await steps.checkTarget(entry);
     if (refusal !== null) {
-      const line = `[Database] Not moving to ${target}: ${refusal}; this process keeps its unsaved changes and stays stopped`;
+      const { reason, details } = typeof refusal === 'string' ? { reason: refusal, details: [] } : refusal;
+      const line = moveCheckTexts.notMoving(target, reason);
       if (!this.moveRefusalsLogged.has(line)) {
         this.moveRefusalsLogged.add(line);
         console.error(line);
+        for (const detail of refusalLogLines({ header: '', lines: details, reason, fix: '' }).slice(1)) console.error(detail);
       }
       return false;
     }
-    if (this.epoch !== startedUnder || this.latchWhy === null || this.stopped) return false;
+    if (this.epoch !== startedUnder || this.latchWhy === null || this.stopped || steps.exitBegan?.()) return false;
     const old = this.pool;
     this.useEntry(entry);
     const epoch = this.epoch;
@@ -1234,46 +1322,16 @@ export class PostgresBackend implements DataBackend {
 
   /** Steps 1 to 8 inside the open transaction: 'commit', or the latch to set after the ROLLBACK. */
   private async checkStore(client: Sender): Promise<'commit' | Latch> {
-    const versionNum = Number((await client.query('SHOW server_version_num')).rows[0]?.server_version_num);
-    if (Number.isInteger(versionNum) && versionNum > 0 && versionNum < MIN_SERVER_VERSION_NUM) {
-      const release = serverRelease(versionNum);
-      return () => this.latchRefusal('server', serverVersionRefusal(release), release);
+    const verdict = await inspectStore(client);
+    if (verdict.kind === 'refused') {
+      const { cause, refusal, found } = verdict;
+      return () => this.latchRefusal(cause, refusal, found);
     }
-    await client.query('SET LOCAL search_path = pg_catalog');
-    await client.query('SET LOCAL quote_all_identifiers = off');
-    await client.query('SET LOCAL default_table_access_method = heap');
-    const encoding = String((await client.query('SHOW server_encoding')).rows[0]?.server_encoding ?? '');
-    if (encoding !== 'UTF8') return () => this.latchRefusal('encoding', encodingRefusal(encoding), encoding);
-    const found = await readFoundList(client);
-    const gate = gateRefusal(found);
-    if (gate) return () => this.latchRefusal('privileges', gate);
-    let version: string | undefined;
-    let unreadable: string | undefined;
-    if (found.meta) {
-      unreadable = metaGateCause(found.meta) ?? undefined;
-      if (unreadable === undefined) {
-        const read = await this.readVersion(client);
-        if ('cause' in read) unreadable = read.cause;
-        else version = read.value;
-      }
-    }
-    if (version !== undefined && !matchesSchemaVersion(version)) {
-      const other = version;
+    if (verdict.kind === 'version') {
+      const other = verdict.found;
       return () => this.latchSchemaMismatch(other);
     }
-    if (found.relations.length === 0) return this.provisionFresh(client, found);
-    if (version === undefined) {
-      const result = await this.compare(client, 'unversioned', found);
-      if (typeof result === 'function') return result;
-      return () => this.latchRefusal('shape', unversionedRefusal(found, result, unreadable));
-    }
-    const result = await this.compare(client, 'provisioned', found);
-    if (typeof result === 'function') return result;
-    const privileges = relationPrivileges(found, result.reference);
-    if (result.differences.length || privileges.length) {
-      const refusal = shapeRefusal(sortDifferences([...result.differences, ...privileges]));
-      return () => this.latchRefusal(result.differences.length ? 'shape' : 'privileges', refusal);
-    }
+    if (verdict.kind === 'empty') return this.provisionFresh(client, verdict.found);
     const storeId = await client.query(`SELECT 1 FROM ONLY smdb_data.meta WHERE key = 'store_id'`);
     if (storeId.rows.length === 0) {
       // A new id would be refused by every machine whose marker records the old one, so with one recorded nothing is written.
@@ -1296,7 +1354,7 @@ export class PostgresBackend implements DataBackend {
     } catch (error) {
       if (ddlErrorRetries(error)) throw error;
       const e = error as { code: string; message?: unknown };
-      return this.ddlRefusal('provision', e.code, String(e.message ?? ''), found);
+      return this.ddlRefusal(e.code, String(e.message ?? ''), found);
     }
     const result = await this.compare(client, 'provisioned', found);
     if (typeof result === 'function') return result;
@@ -1311,7 +1369,7 @@ export class PostgresBackend implements DataBackend {
     await client.query(
       `INSERT INTO smdb_data.meta (key, value) VALUES ('schema_version', $1) ON CONFLICT (key) DO NOTHING`,
       [JSON.stringify({ v: SCHEMA_VERSION })]);
-    const reread = await this.readVersion(client);
+    const reread = await readVersion(client);
     if (!('value' in reread) || reread.value === undefined || !matchesSchemaVersion(reread.value)) {
       const cause = 'cause' in reread
         ? reread.cause
@@ -1324,32 +1382,15 @@ export class PostgresBackend implements DataBackend {
 
   /** checkShape, or the refusal's latch when the scratch could not be built for a cause that repeats at every boot. */
   private async compare(client: Sender, mode: ShapeMode, found: FoundList): Promise<ShapeCheck | Latch> {
-    try {
-      return await checkShape(client, mode);
-    } catch (error) {
-      if (!(error instanceof ScratchBuildFailed)) throw error;
-      return this.ddlRefusal('scratch', error.code, error.serverMessage, found);
-    }
+    const result = await compareWithScratch(client, mode, found);
+    if (!('kind' in result)) return result;
+    const { refusal } = result;
+    return () => this.latchRefusal('scratch', refusal);
   }
 
-  /** The latch for a server error from the bot's schema DDL. */
-  private ddlRefusal(cause: 'scratch' | 'provision', code: string, message: string, found: FoundList): Latch {
-    return async () => {
-      const refusal = cause === 'scratch'
-        ? scratchRefusal(code, message, found.role, found.db)
-        : schemaDdlRefusal(code, message, found.role, found.db);
-      this.latchRefusal(cause, refusal);
-    };
-  }
-
-  /** The schema_version row of a meta that passed the gate: its value, none, or why it can't be read. */
-  private async readVersion(client: Sender): Promise<{ value: string | undefined } | { cause: string }> {
-    const res = await client.query(`SELECT value::text FROM ONLY smdb_data.meta WHERE key = 'schema_version'`);
-    if (res.rows.length > 1) return { cause: `smdb_data.meta holds ${res.rows.length} schema_version rows` };
-    if (res.rows.length === 0) return { value: undefined };
-    const value = res.rows[0]?.value;
-    if (value === null || value === undefined) return { cause: 'smdb_data.meta holds a schema_version row with no value' };
-    return { value: String(value) };
+  /** The latch for a server error from the bot's schema DDL in an empty smdb_data. */
+  private ddlRefusal(code: string, message: string, found: FoundList): Latch {
+    return () => this.latchRefusal('provision', schemaDdlRefusal(code, message, found.role, found.db));
   }
 
   private latchSchemaMismatch(found: string | undefined): void {
@@ -2201,34 +2242,146 @@ export async function readStoreId(config: ClientConfig): Promise<string | null> 
   }
 }
 
-const MOVE_CHECK_MS = 5_000;
+/** NB5F decision 3: the whole move check, connect included; past it the next pass chooses again. */
+export const MOVE_CHECK_BOUND_MS = 60_000;
+
+/** NB5F: the reasons a move's check of its target gives, and the line a refusal logs. */
+export const moveCheckTexts = {
+  markerUnknown: (why: string) => `${why}, so the bot can't confirm which store this machine records`,
+  version: (found: string) => `the database holds schema version ${found}, and this bot reads only version ${SCHEMA_VERSION}`,
+  empty: "the database holds no tables in smdb_data, so it holds no copy of this bot's store; a move does not provision a database",
+  noStoreId: `the database's smdb_data matches this bot's schema (version ${SCHEMA_VERSION}) but smdb_data.meta holds no store_id row, and this machine records no store id, so this bot can't confirm whose store it is; a move writes no store id`,
+  unreadableStoreId: "its store id can't be read (the stored value is not a JSON string)",
+  otherStore: (found: string, recorded: string) =>
+    `the configured database is not the one this deployment's data lives in (store ${found} vs recorded ${recorded})`,
+  incomplete: (detail: string) => `the check of its store could not be completed (${detail})`,
+  silent: (seconds: number) => `the database did not answer within ${seconds} s`,
+  overBound: `the check of its store did not finish within ${MOVE_CHECK_BOUND_MS / 1000} s`,
+  notMoving: (target: string, reason: string) =>
+    `[Database] Not moving to ${target}: ${reason}; this process keeps its unsaved changes and stays stopped`,
+};
+
+/** NB5F decision 5: the bootstrap's line when the check passed while the backend is held or latched. */
+export function notReadyLine(detail: string): string {
+  return `[PostgresBackend] Connected and provisioned; not ready: ${detail}`;
+}
+
+export interface MoveCheckSession {
+  connect(): Promise<unknown>;
+  query(config: QueryConfig): Promise<QueryResult>;
+  end(): Promise<unknown>;
+}
+
+/** A wait the check gave up: `whole` when the check's own bound cut it, else the statement's answer bound. */
+class MoveCheckCut extends Error {
+  constructor(readonly whole: boolean, readonly boundMs: number) {
+    super('the move check gave up waiting');
+  }
+}
+
+function markerWhy(error: unknown): string {
+  const why = (error as { why?: unknown } | null)?.why;
+  return typeof why === 'string' ? why : error instanceof Error ? error.message : String(error);
+}
+
+function moveCheckFailure(error: unknown, lastBoundMs: number): string {
+  const timedOut = error instanceof Error && error.message === QUERY_TIMEOUT_MESSAGE;
+  const cut = error instanceof MoveCheckCut ? error : timedOut ? new MoveCheckCut(lastBoundMs < ANSWER_BOUND_MS, lastBoundMs) : null;
+  if (cut?.whole) return moveCheckTexts.overBound;
+  if (cut) return moveCheckTexts.incomplete(moveCheckTexts.silent(Math.round(cut.boundMs / 1000)));
+  return moveCheckTexts.incomplete(describeFailure(error).detail);
+}
+
+/** The store id step: the target must hold the store id this machine records, and a store id at all. */
+async function storeIdAnswer(send: Sender['query'], recorded: string | null): Promise<MoveRefusal | null> {
+  const rows = (await send(`SELECT value FROM ONLY smdb_data.meta WHERE key = 'store_id'`)).rows;
+  if (rows.length === 0) return recorded ? storeIdRefusal(recorded).reason : moveCheckTexts.noStoreId;
+  let stored: unknown;
+  try { stored = JSON.parse(String(rows[0]?.value)); } catch { stored = undefined; }
+  if (typeof stored !== 'string') return moveCheckTexts.unreadableStoreId;
+  if (recorded !== null && stored !== recorded) return moveCheckTexts.otherStore(stored, recorded);
+  return null;
+}
 
 /**
- * Decision 12 (a): on one short-lived session with the probe's bounds, the target's store id must equal the one this
- * machine records (when it records one) and its schema version this bot's. Null when it may be written, else why not.
+ * Decision 12 (a) as NB5F decision 3 gives it: the marker read strictly, then on one session NB16's check of the target
+ * (inspectStore) and its store id, in one transaction that is rolled back. It writes nothing and makes nothing outside
+ * the scratch, which the rollback removes. Null when the target may be written, else why not.
  */
-export async function checkMoveTarget(entry: string, recordedStoreId: string | null): Promise<string | null> {
-  let client: Client;
+export async function checkMoveTarget(
+  entry: string,
+  markerStoreId: () => string | null,
+  deps: { session(config: ClientConfig): MoveCheckSession } = { session: shortLivedClient },
+): Promise<MoveRefusal | null> {
+  let recorded: string | null;
   try {
-    client = await metaClient(pgConfig(entry), { connectMs: MOVE_CHECK_MS, statementMs: MOVE_CHECK_MS });
+    recorded = markerStoreId();
   } catch (error) {
-    return `its store id and schema version could not be read (${describeFailure((error as { cause?: unknown }).cause ?? error).detail})`;
+    return moveCheckTexts.markerUnknown(markerWhy(error));
   }
+  const deadline = deadlineIn(MOVE_CHECK_BOUND_MS);
+  let client: MoveCheckSession;
   try {
-    const ask = (text: string) => client.query({ text, query_timeout: MOVE_CHECK_MS } as QueryConfig);
-    const version = (await ask(`SELECT value FROM smdb_data.meta WHERE key = 'schema_version'`)).rows[0]?.value;
-    if (typeof version !== 'string' || !matchesSchemaVersion(version)) {
-      return `the database holds schema version ${version ?? 'unreadable'}, and this bot reads only version ${SCHEMA_VERSION}`;
-    }
-    const raw = (await ask(`SELECT value FROM smdb_data.meta WHERE key = 'store_id'`)).rows[0]?.value;
-    const storeId: unknown = typeof raw === 'string' ? JSON.parse(raw) : null;
-    if (recordedStoreId !== null && storeId !== recordedStoreId) {
-      return `the configured database is not the one this deployment's data lives in (store ${String(storeId)} vs recorded ${recordedStoreId})`;
-    }
-    return null;
+    client = deps.session({
+      application_name: 'smdb-move-check',
+      connectionTimeoutMillis: CONNECT_TIMEOUT_MS,
+      statement_timeout: STATEMENT_TIMEOUT_MS,
+      idle_in_transaction_session_timeout: IDLE_IN_TX_TIMEOUT_MS,
+      keepAlive: true,
+      ...pgConfig(entry),
+    } as ClientConfig);
   } catch (error) {
-    return `its store id and schema version could not be read (${describeFailure(error).detail})`;
+    return moveCheckTexts.incomplete(describeFailure(error).detail);
+  }
+  let answered = true;
+  let lastBoundMs = ANSWER_BOUND_MS;
+  const bounded = async <T>(work: Promise<T>, boundMs: number, whole: boolean): Promise<T> => {
+    let timer: NodeJS.Timeout | undefined;
+    const cut = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new MoveCheckCut(whole, boundMs)), boundMs); });
+    try {
+      return await Promise.race([work, cut]);
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+  const send = async (text: string, values: unknown[] = []): Promise<QueryResult> => {
+    const left = msLeft(deadline);
+    if (left < STATEMENT_FLOOR_MS) {
+      answered = false;
+      throw new MoveCheckCut(true, Math.max(0, left));
+    }
+    const boundMs = Math.max(1, Math.floor(Math.min(ANSWER_BOUND_MS, left)));
+    lastBoundMs = boundMs;
+    try {
+      return await bounded(client.query({ text, values, query_timeout: boundMs } as QueryConfig), boundMs, boundMs < ANSWER_BOUND_MS);
+    } catch (error) {
+      if (error instanceof MoveCheckCut || classifyFailure(error).kind !== 'answered') answered = false;
+      throw error;
+    }
+  };
+  const rollback = async () => {
+    try { await send('ROLLBACK'); } catch { /* the session is ended below */ }
+  };
+  try {
+    try {
+      await bounded(client.connect(), Math.max(1, msLeft(deadline)), true);
+    } catch (error) {
+      answered = false;
+      throw error;
+    }
+    await send('BEGIN');
+    const verdict = await inspectStore({ query: send });
+    let answer: MoveRefusal | null;
+    if (verdict.kind === 'refused') answer = { reason: verdict.refusal.reason, details: verdict.refusal.lines };
+    else if (verdict.kind === 'version') answer = moveCheckTexts.version(verdict.found);
+    else if (verdict.kind === 'empty') answer = moveCheckTexts.empty;
+    else answer = await storeIdAnswer(send, recorded);
+    await rollback();
+    return answer;
+  } catch (error) {
+    if (answered) await rollback();
+    return moveCheckFailure(error, lastBoundMs);
   } finally {
-    await client.end().catch(() => { /* best effort */ });
+    void client.end().catch(() => { /* the server ends a session it lost within its idle bound */ });
   }
 }

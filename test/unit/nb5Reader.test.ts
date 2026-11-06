@@ -36,6 +36,7 @@ import {
 import { _pgRequestDbForTests, _setGuildRequestDeps, runHolderCheck, switchOnNotHeld, type Plan } from '../../src/webui/utils/guildRequests';
 import { parseAddressList } from '../../src/utils/databaseAddress';
 import type { NoticeRead, ProbeAnswer } from '../../src/bot/internalSetup/utils/dataBackends/mainDatabase';
+import { MARKER_FILE, writeFileMarker } from '../../src/bot/internalSetup/utils/dataBackends/recognitionGuard';
 import { forks, forkLogin } from '../helpers/forkMock';
 
 const A = 'postgres://bot:pw@a.example:5432/bot';
@@ -347,5 +348,37 @@ describe('G8: the pools and the holder check', () => {
   it('a refusal reaches the reader as data backend unreachable with the reason added', async () => {
     setWebuiDataStoreUrl({ url: null, choosing: true, reason: 'R' });
     await expect(new WebuiDataReader().listGuilds()).rejects.toThrow('data backend unreachable (R)');
+  });
+});
+
+// NB5F F1-4: the marker as the real writer leaves it, then its path replaced by a directory (EISDIR).
+function markerAsDirectory(): string {
+  fs.rmSync(MARKER_FILE, { recursive: true, force: true });
+  writeFileMarker({ live: 'postgres', storeId: 'store-1', flippedAt: 1 });
+  expect(fs.readFileSync(MARKER_FILE, 'utf-8')).toContain('"storeId": "store-1"');
+  fs.rmSync(MARKER_FILE);
+  fs.mkdirSync(MARKER_FILE);
+  let message = '';
+  try { fs.readFileSync(MARKER_FILE, 'utf-8'); } catch (error) { message = (error as Error).message; }
+  expect(message).toMatch(/^EISDIR/);
+  return `${MARKER_FILE} cannot be read (${message})`;
+}
+
+describe("NB5F F1-4: the web UI's own choice reads this machine's marker strictly", () => {
+  it("with the marker a directory, the own choice and chooseNow() make no choice and give the marker's why", async () => {
+    _setWebuiChoiceDeps({
+      entries: () => parseAddressList(`${A},${W}`),
+      probe: async () => fake.answers,
+      readNotice: async () => fake.notice,
+      noticeCheckOff: () => false,
+    });
+    try {
+      const why = markerAsDirectory();
+      const refusal = { refusal: `${why}, so the bot can't confirm which store this machine records` };
+      expect(await settledOwnChoice()).toEqual(refusal);
+      expect((await chooseNow()).resolution).toEqual(refusal);
+    } finally {
+      fs.rmSync(MARKER_FILE, { recursive: true, force: true });
+    }
   });
 });

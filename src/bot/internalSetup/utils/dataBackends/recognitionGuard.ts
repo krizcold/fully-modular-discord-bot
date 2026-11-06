@@ -156,17 +156,23 @@ export function readFileMarker(): BackendStateMarker | null {
   return read.state === 'ok' ? markerFrom(read.value) : null;
 }
 
+/** The marker exists but can't be read or parsed, or names no backend; `why` names the file and the cause. */
+export class MarkerUnreadable extends Error {
+  constructor(readonly why: string) {
+    super(`this machine's marker ${why}, so the store id it records is unknown; no store id was written and nothing was refused`);
+  }
+}
+
 /**
- * The store id the marker records, for a store that lacks its store_id row: null when there is no marker or it records
- * none. Throws when the marker exists but can't be read or parsed, so no store id is written on a guess.
+ * The store id the marker records: null when there is no marker or it records none. Throws MarkerUnreadable when the
+ * marker exists but can't be read or parsed, so no store id is written and no database is chosen on a guess.
  */
 export function readMarkerStoreId(): string | null {
   const read = readJsonFile(MARKER_FILE);
   if (read.state === 'absent') return null;
-  const unknown = 'so the store id it records is unknown; no store id was written and nothing was refused';
-  if (read.state === 'bad') throw new Error(`this machine's marker ${read.why}, ${unknown}`);
+  if (read.state === 'bad') throw new MarkerUnreadable(read.why);
   const marker = markerFrom(read.value);
-  if (!marker) throw new Error(`this machine's marker ${MARKER_FILE} does not name file or postgres, ${unknown}`);
+  if (!marker) throw new MarkerUnreadable(`${MARKER_FILE} does not name file or postgres`);
   return marker.storeId;
 }
 

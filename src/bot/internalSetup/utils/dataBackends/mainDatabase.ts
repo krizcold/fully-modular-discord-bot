@@ -1,7 +1,7 @@
 import * as fs from 'fs';
 import type { ClientConfig, QueryConfig } from 'pg';
 import { parseAddressList, type ListEntry } from '../../../../utils/databaseAddress';
-import type { DatabaseChooser, LatchCause, PostgresBackend } from './postgresBackend';
+import type { DatabaseChooser, LatchCause, PostgresBackend, Standing } from './postgresBackend';
 import type { RetireOutcome } from './backend';
 
 /**
@@ -47,7 +47,8 @@ export type NoticeRead =
   | { kind: 'failed'; cause: string; status?: number; retryAfterMs?: number };
 
 export type WaitOutcome =
-  | 'unreachable' | 'login-refused' | 'mixed-stores' | 'tie' | 'replaced' | 'no-main' | 'behind-notice' | 'cant-check';
+  | 'unreachable' | 'login-refused' | 'mixed-stores' | 'tie' | 'replaced' | 'no-main' | 'behind-notice' | 'cant-check'
+  | 'unknown-store';
 
 export type Decision =
   | { outcome: 'chosen'; chosen: AnsweredProbe; generation: number; machine: string | null; logs: string[] }
@@ -432,6 +433,34 @@ export interface StepHooks {
 const ofStore = (p: ProbeAnswer, marker: string | null): p is AnsweredProbe & ProbeAnswer =>
   p.kind === 'answered' && (p.storeId === null || marker === null || p.storeId === marker);
 
+type MarkerRead = { ok: true; id: string | null } | { ok: false; why: string };
+
+/** MarkerUnreadable's `why`, or the message of any other error the marker read threw. */
+function unreadableWhy(error: unknown): string {
+  const why = (error as { why?: unknown } | null)?.why;
+  return typeof why === 'string' ? why : messageOf(error);
+}
+
+const standingOf = (p: AnsweredProbe): Standing => p.inRecovery ? 'live copy' : p.readOnly ? 'read-only' : 'writable';
+const standingAt = (other: string, standing: Standing, generation: number) =>
+  standing === 'writable' ? `${other} accepts writes at generation ${generation}` : `${other} is ${standing === 'live copy' ? 'a live copy' : 'read-only'} at generation ${generation}`;
+
+const cantConfirmStore = (why: string) => `${why}, so the bot can't confirm which store this machine records`;
+
+/** NB5F: what the chooser says while this machine's marker can't be read (`why` is MarkerUnreadable's). */
+export const markerTexts = {
+  bootWait: (why: string) => `${cantConfirmStore(why)}; it chooses no database and reads that file again at every check`,
+  notMoving: (why: string) =>
+    `[Database] Not moving yet: ${cantConfirmStore(why)}; this process keeps its unsaved changes and stays stopped`,
+  watchOwn: (why: string, storeId: string, address: string) =>
+    `[Database] ${cantConfirmStore(why)}; until it can, the watch counts only the databases of store ${storeId}, the store at ${address}, and a hold does not end`,
+  watchAll: (why: string) =>
+    `[Database] ${cantConfirmStore(why)}; until it can, the watch counts every database that answers, and a hold does not end`,
+  step: (address: string, generation: number, other: string, standing: Standing, otherGeneration: number, why: string) =>
+    `can't confirm that this bot process's database ${address} (generation ${generation}) is still the main: ${standingAt(other, standing, otherGeneration)}, and ${why}, so the bot can't tell whether that database holds this bot's store`,
+  confirming: (why: string) => `${cantConfirmStore(why)}; checking again`,
+};
+
 export class MainChooser implements DatabaseChooser {
   private choice: string | null = null;
   private readonly choiceWaiters: Array<(entry: string | null) => void> = [];
@@ -513,6 +542,11 @@ export class MainChooser implements DatabaseChooser {
     this.draining = true;
   }
 
+  /** Whether the exit drain began: a move whose target check ends after it goes no further (NB5F decision 4). */
+  exitDrainBegan(): boolean {
+    return this.draining;
+  }
+
   /** A shard reconnected to Discord: after notice reads failed for over 60 s, one starts at once (decision 10). */
   noteShardReconnect(): void {
     if (this.stopped || this.choice === null || this.noticeFailingSince === null) return;
@@ -555,8 +589,23 @@ export class MainChooser implements DatabaseChooser {
 
   // THE BOOT WAIT (decision 9)
 
-  private options(): DecideOptions {
-    return { markerStoreId: this.deps.markerStoreId(), noticeCheckOff: this.deps.noticeCheckOff() };
+  /** The marker's store id, read strictly: a marker that can't be read answers why, and nothing is decided on it. */
+  private readMarker(): MarkerRead {
+    try {
+      return { ok: true, id: this.deps.markerStoreId() };
+    } catch (error) {
+      return { ok: false, why: unreadableWhy(error) };
+    }
+  }
+
+  private options(markerStoreId: string | null): DecideOptions {
+    return { markerStoreId, noticeCheckOff: this.deps.noticeCheckOff() };
+  }
+
+  /** Decision 7: a pass in which any address took the login is never a refused login. */
+  private noteLogin(answers: ProbeAnswer[]): void {
+    const tookLogin = answers.some(p => p.kind === 'answered' || p.loggedIn);
+    this.lastLogin = !tookLogin && answers.some(p => p.kind === 'refused') ? 'refused' : 'unreachable';
   }
 
   private logOnce(lines: string[]): void {
@@ -574,8 +623,17 @@ export class MainChooser implements DatabaseChooser {
       const answers = await this.deps.probe(this.deps.entries());
       this.lastPass = { answers, at: Date.now() };
       if (this.stopped) break;
-      let decision = decideMain(answers, undefined, this.options());
-      if (decision.outcome === 'needs-notice') decision = decideMain(answers, await this.readNotice('boot'), this.options());
+      const marker = this.readMarker();
+      if (!marker.ok) {
+        this.noteLogin(answers);
+        const reason = markerTexts.bootWait(marker.why);
+        this.lastWait = { outcome: 'unknown-store', reason };
+        this.wait(reason);
+        await this.pause(started + BOOT_PASS_MS - Date.now());
+        continue;
+      }
+      let decision = decideMain(answers, undefined, this.options(marker.id));
+      if (decision.outcome === 'needs-notice') decision = decideMain(answers, await this.readNotice('boot'), this.options(marker.id));
       if (this.stopped) break;
       this.logOnce(decision.logs);
       if (decision.outcome === 'chosen') {
@@ -583,9 +641,7 @@ export class MainChooser implements DatabaseChooser {
         return;
       }
       if (decision.outcome !== 'needs-notice') {
-        // Decision 7: a pass in which any address took the login is never a refused login.
-        const tookLogin = answers.some(p => p.kind === 'answered' || p.loggedIn);
-        this.lastLogin = !tookLogin && answers.some(p => p.kind === 'refused') ? 'refused' : 'unreachable';
+        this.noteLogin(answers);
         this.lastWait = { outcome: decision.outcome, reason: decision.reason };
         this.wait(decision.reason);
         if (decision.outcome === 'cant-check' && !dmSent) {
@@ -746,7 +802,18 @@ export class MainChooser implements DatabaseChooser {
       this.passAgain = true;
       return;
     }
-    const marker = this.deps.markerStoreId();
+    // While the marker can't be read, the store compared with is the one the chosen database answered (it is written to).
+    const read = this.readMarker();
+    let marker: string | null = null;
+    let unknownWhy: string | null = null;
+    if (read.ok) marker = read.id;
+    else if (mine.kind === 'answered' && mine.storeId !== null) {
+      marker = mine.storeId;
+      this.logOnce([markerTexts.watchOwn(read.why, mine.storeId, address)]);
+    } else {
+      unknownWhy = read.why;
+      this.logOnce([markerTexts.watchAll(read.why)]);
+    }
     const mineOwn = ofStore(mine, marker);
     if (mineOwn) {
       this.generation = mine.generation;
@@ -755,7 +822,9 @@ export class MainChooser implements DatabaseChooser {
     if (this.generation >= 1 && this.noticeDue()) await this.readNotice('watch');
     if (!current()) return;
     const others = answers.filter((a): a is AnsweredProbe & ProbeAnswer => ofStore(a, marker) && a.entry !== chosenEntry);
-    const higher = others.filter(a => a.generation > this.generation).sort((x, y) => y.generation - x.generation)[0];
+    const higher = others
+      .filter(a => a.generation > this.generation)
+      .sort((x, y) => y.generation - x.generation)[0];
     const notice = this.highestNotice;
     const noticeAbove = notice && notice.generation > this.generation ? notice : null;
     if (higher || noticeAbove) {
@@ -765,6 +834,11 @@ export class MainChooser implements DatabaseChooser {
       if (again.kind === 'answered' && ofStore(again, marker) && again.generation >= target) {
         this.generation = again.generation;
         this.machine = again.machine;
+      } else if (higher && unknownWhy !== null) {
+        const standing = standingOf(higher);
+        this.step({ kind: 'unknown-store', other: higher.address, generation: higher.generation, standing },
+          markerTexts.step(address, this.generation, higher.address, standing, higher.generation, unknownWhy));
+        return;
       } else if (higher) {
         const machine = higher.machine ?? 'another machine';
         this.step({ kind: 'replaced', machine, generation: higher.generation },
@@ -782,6 +856,11 @@ export class MainChooser implements DatabaseChooser {
       rival = others.find(a => writable(a) && a.generation === this.generation && !sameServer(a, mine)) ?? null;
       if (rival && this.generation >= top) {
         this.tiedPasses += 1;
+        if (this.tiedPasses >= 2 && unknownWhy !== null) {
+          this.step({ kind: 'unknown-store', other: rival.address, generation: this.generation, standing: 'writable' },
+            markerTexts.step(address, this.generation, rival.address, 'writable', this.generation, unknownWhy));
+          return;
+        }
         if (this.tiedPasses >= 2) {
           this.step({ kind: 'tie', generation: this.generation },
             `Two databases accept writes at main generation ${this.generation} (${address}, ${rival.address}); can't confirm which is the main`);
@@ -814,12 +893,17 @@ export class MainChooser implements DatabaseChooser {
       cause = mine.error === undefined ? `${address} could not be checked (${mine.cause}); checking again` : `${address} answered, but ${mine.cause}; checking again`;
     } else if (mine.kind === 'refused') {
       return;
-    } else if (!ofStore(mine, this.deps.markerStoreId())) {
-      cause = `${address} answered, but another bot's store (${(mine as AnsweredProbe).storeId}); checking again`;
-    } else if (!writable(mine)) {
-      cause = `${address} answers but does not accept writes (${mine.inRecovery ? 'a live copy' : 'read-only'}); checking again`;
-    } else if (rival) {
-      cause = `two addresses answered as different servers at generation ${this.generation} in one check: ${address} and ${rival.address}; checking again`;
+    } else {
+      const marker = this.readMarker();
+      if (!marker.ok) {
+        cause = markerTexts.confirming(marker.why);
+      } else if (!ofStore(mine, marker.id)) {
+        cause = `${address} answered, but another bot's store (${(mine as AnsweredProbe).storeId}); checking again`;
+      } else if (!writable(mine)) {
+        cause = `${address} answers but does not accept writes (${mine.inRecovery ? 'a live copy' : 'read-only'}); checking again`;
+      } else if (rival) {
+        cause = `two addresses answered as different servers at generation ${this.generation} in one check: ${address} and ${rival.address}; checking again`;
+      }
     }
     if (cause !== null) {
       backend.noteConfirmingCause(cause, epoch);
@@ -869,8 +953,13 @@ export class MainChooser implements DatabaseChooser {
     const backend = this.backend!;
     if (this.generation >= 1 && this.noticeDue()) await this.readNotice('watch');
     if (this.stopped || this.draining) return;
+    const marker = this.readMarker();
+    if (!marker.ok) {
+      this.logOnce([markerTexts.notMoving(marker.why)]);
+      return;
+    }
     const notice: NoticeRead = this.highestNotice ? { kind: 'notice', ...this.highestNotice } : { kind: 'none' };
-    const decision = decideMain(answers, notice, this.options());
+    const decision = decideMain(answers, notice, this.options(marker.id));
     this.logOnce(decision.logs);
     if (decision.outcome !== 'chosen') return;
     this.moveGeneration = decision.generation;
@@ -892,7 +981,7 @@ export interface DatabaseView {
   generation: number | null;
   machine: string | null;
   state: 'choosing' | 'main' | 'replaced' | 'tie' | 'no-main' | 'unreachable' | 'login-refused' | 'behind-notice'
-    | 'cant-check' | 'mixed-stores' | 'confirming' | 'latched' | 'moving';
+    | 'cant-check' | 'mixed-stores' | 'unknown-store' | 'confirming' | 'latched' | 'moving';
   reason: string | null;
   held: { guilds: number; resave: number } | null;
   addresses: Array<{

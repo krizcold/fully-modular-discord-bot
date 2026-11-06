@@ -11,6 +11,8 @@ import { setBackendKind } from '../helpers/backendKind';
 import { startApp } from '../helpers/configRig';
 import { BOT, DM, FakeOwnerRest, discordError, httpError, networkError } from '../helpers/fakeOwnerRest';
 import { ownerChannelState } from '../../src/webui/utils/ownerChannel';
+import fs from 'fs';
+import { MARKER_FILE, writeFileMarker } from '../../src/bot/internalSetup/utils/dataBackends/recognitionGuard';
 
 // NB5 section 8 test 11 (decision 15 with decision 23's copy), over a fake prober and a fake REST.
 
@@ -271,5 +273,39 @@ describe("decision 15 with decision 23: the copy in the chosen channel", () => {
     const res = await post(ok);
     expect(res).toEqual({ status: 502, body: { success: false, error: `Discord refused the switch notice to the bot's owner (Discord returned a message in channel ${C} instead). A machine whose database was the main will not learn from Discord that it was replaced: keep it off, or rejoin it as a live copy, before it starts again.` } });
     expect(rest.creates(C)).toHaveLength(0);
+  });
+});
+
+// NB5F F1-4: the marker as the real writer leaves it, then its path replaced by a directory (EISDIR).
+function markerAsDirectory(): string {
+  fs.rmSync(MARKER_FILE, { recursive: true, force: true });
+  writeFileMarker({ live: 'postgres', storeId: 'store-1', flippedAt: 1 });
+  expect(fs.readFileSync(MARKER_FILE, 'utf-8')).toContain('"storeId": "store-1"');
+  fs.rmSync(MARKER_FILE);
+  fs.mkdirSync(MARKER_FILE);
+  let message = '';
+  try { fs.readFileSync(MARKER_FILE, 'utf-8'); } catch (error) { message = (error as Error).message; }
+  expect(message).toMatch(/^EISDIR/);
+  return `${MARKER_FILE} cannot be read (${message})`;
+}
+
+describe("NB5F F1-4: switch-notice reads this machine's marker strictly", () => {
+  it("with the marker a directory, a main at the generation and machine answers 409 with the marker's why and posts nothing", async () => {
+    _setWebuiChoiceDeps({
+      entries: () => parseAddressList(`${A},${W}`),
+      probe: async () => { probes++; return answers; },
+      readNotice: async () => ({ kind: 'none' }),
+      noticeCheckOff: () => false,
+    });
+    try {
+      const why = markerAsDirectory();
+      expect(await post(ok)).toEqual({
+        status: 409,
+        body: { success: false, error: `can't confirm the main database: ${why}, so the bot can't confirm which store this machine records; no notice was posted` },
+      });
+      expect(rest.calls).toHaveLength(0);
+    } finally {
+      fs.rmSync(MARKER_FILE, { recursive: true, force: true });
+    }
   });
 });

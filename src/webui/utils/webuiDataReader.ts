@@ -10,7 +10,7 @@ import { canonicalGuildKey } from '../../bot/internalSetup/utils/dataKeys';
 import { HOLDER_CHECK_SQL } from '../../bot/internalSetup/utils/dataBackends/guildRequestSql';
 import { addressListInUse, parseAddressList, pgConfig, type ListEntry } from '../../utils/databaseAddress';
 import { decideMain, probePass, type NoticeRead, type ProbeAnswer, type StoreReport } from '../../bot/internalSetup/utils/dataBackends/mainDatabase';
-import { readFileMarker } from '../../bot/internalSetup/utils/dataBackends/recognitionGuard';
+import { MarkerUnreadable, readMarkerStoreId } from '../../bot/internalSetup/utils/dataBackends/recognitionGuard';
 import { readNewestNotice } from '../../utils/ownerMessages';
 
 const READER_ERROR = 'data backend unreachable';
@@ -87,7 +87,7 @@ const realChoiceDeps: WebuiChoiceDeps = {
   entries: () => parseAddressList(addressListInUse()),
   probe: entries => probePass(entries, { session: config => new PgClient(config) }),
   readNotice: own => (own ? readNewestNotice({ own: true, budgetMs: OWN_READ_BUDGET_MS }) : readNewestNotice()),
-  markerStoreId: () => readFileMarker()?.storeId ?? null,
+  markerStoreId: () => readMarkerStoreId(),
   noticeCheckOff: () => (loadCredentials().DATA_NOTICE_CHECK || '').trim().toLowerCase() === 'off',
 };
 let choiceDeps: WebuiChoiceDeps = realChoiceDeps;
@@ -95,6 +95,12 @@ let choiceDeps: WebuiChoiceDeps = realChoiceDeps;
 /** Tests give a fake prober and notice read; null restores the real ones. */
 export function _setWebuiChoiceDeps(over: Partial<WebuiChoiceDeps> | null): void {
   choiceDeps = over ? { ...realChoiceDeps, ...over } : realChoiceDeps;
+}
+
+/** A marker that can't be read: no choice is made on a guess at the store this machine records. */
+export function unknownStoreWords(error: unknown): string {
+  const why = error instanceof MarkerUnreadable ? error.why : error instanceof Error ? error.message : String(error);
+  return `${why}, so the bot can't confirm which store this machine records`;
 }
 
 /** The deps of the verify pass of switch-notice, which takes the same list and prober. */
@@ -123,7 +129,13 @@ export function _resetWebuiChoice(): void {
 async function choose(ownRead: boolean): Promise<WebuiResolution> {
   const deps = choiceDeps;
   const answers = await deps.probe(deps.entries());
-  const options = { markerStoreId: deps.markerStoreId(), noticeCheckOff: deps.noticeCheckOff() };
+  let markerStoreId: string | null;
+  try {
+    markerStoreId = deps.markerStoreId();
+  } catch (error) {
+    return { refusal: unknownStoreWords(error) };
+  }
+  const options = { markerStoreId, noticeCheckOff: deps.noticeCheckOff() };
   let decision = decideMain(answers, undefined, options);
   if (decision.outcome === 'needs-notice') decision = decideMain(answers, await deps.readNotice(ownRead), options);
   if (decision.outcome === 'chosen') return { entry: decision.chosen.entry };

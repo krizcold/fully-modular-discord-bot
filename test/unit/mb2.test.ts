@@ -214,6 +214,54 @@ describe('MB2 (c): a check that passes while the backend is held', () => {
   });
 });
 
+describe("NB5F D5: the bootstrap's line after a check that passed", () => {
+  const said = () => [...vi.mocked(console.log).mock.calls, ...vi.mocked(console.warn).mock.calls].map(c => String(c[0]));
+
+  async function provisionWith(atCommit: (backend: PostgresBackend) => void) {
+    let backend!: PostgresBackend;
+    const chooser: DatabaseChooser = {
+      chosen: () => A,
+      awaitChoice: async () => A,
+      lastPassLogin: () => 'unreachable',
+      holdStarted: () => undefined,
+      confirmNow: () => undefined,
+      stop: () => undefined,
+    };
+    withPool({
+      reply: sql => {
+        if (sql === 'COMMIT') atCommit(backend);
+        return undefined;
+      },
+    });
+    backend = new PostgresBackend({ chooser });
+    backends.push(backend);
+    backend.start();
+    expect(await backend.provisionVerdict()).toEqual({ state: 'provisioned' });
+    await new Promise(resolve => { setImmediate(resolve); });
+    return backend;
+  }
+
+  it('L1: held at the COMMIT, the line says not ready with the hold words, and no line says backend ready', async () => {
+    const backend = await provisionWith(b => b.noteLapse());
+    expect(backend.connectionState().state).toBe('outage');
+    expect(said()).toContain(`[PostgresBackend] Connected and provisioned; not ready: ${backend.holdWords()}`);
+    expect(said().filter(l => l.includes('backend ready'))).toEqual([]);
+  });
+
+  it('L2: latched after the COMMIT was let through, the line says not ready with the latched detail', async () => {
+    const backend = await provisionWith(b => b.latch({ kind: 'tie', generation: 2 }));
+    expect(backend.latchReason()).not.toBeNull();
+    expect(said()).toContain(`[PostgresBackend] Connected and provisioned; not ready: ${backend.latchReason()}; this process does not write to it`);
+    expect(said().filter(l => l.includes('backend ready'))).toEqual([]);
+  });
+
+  it('L3 (guard): ready keeps the line it has today', async () => {
+    const backend = await provisionWith(() => undefined);
+    expect(backend.connectionState().state).toBe('ready');
+    expect(said()).toContain('[PostgresBackend] Connected and provisioned; backend ready');
+  });
+});
+
 describe('MB2 R1-1: the watch of a backend refused by its store check', () => {
   const markerFile = () => path.join(process.env.DATA_DIR as string, '.backend.json');
   afterEach(() => fs.rmSync(markerFile(), { force: true }));
