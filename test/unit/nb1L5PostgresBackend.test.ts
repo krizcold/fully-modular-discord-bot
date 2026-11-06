@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { FenceToken } from '../../src/bot/internalSetup/utils/dataBackends/backend';
 import { PostgresBackend, SCHEMA_VERSION } from '../../src/bot/internalSetup/utils/dataBackends/postgresBackend';
+import { freshVersionRefusal } from '../../src/bot/internalSetup/utils/dataBackends/storeShape';
 
 const backends: PostgresBackend[] = [];
 afterEach(async () => {
@@ -39,65 +40,66 @@ const quiet = () => {
   vi.spyOn(console, 'warn').mockImplementation(() => {});
   return vi.spyOn(console, 'error').mockImplementation(() => {});
 };
-const VERSION_READ = /SELECT value FROM smdb_data\.meta WHERE key = 'schema_version'/;
-const missing = () => Object.assign(new Error('relation "smdb_data.meta" does not exist'), { code: '42P01' });
+const VERSION_READ = /SELECT value::text FROM ONLY smdb_data\.meta WHERE key = 'schema_version'/;
+const META = { kind: 'r', key_text: true, value_text: true, value_not_null: true, rls: false, unique_key: true, select: true };
+const tableRow = (name: string) => ({ name, kind: 'r', is_partition: false, select: true, insert: true, update: true, delete: true, usage: null, update_seq: null });
+
+// NB16: the bootstrap lock is free, the encoding answers UTF8, and the found list holds either nothing (a fresh
+// database) or a meta that passes the gate (a store); the rest is the test's script.
+function onStore(withMeta: boolean, answer: Answer): Answer {
+  return (sql, params) => {
+    if (/pg_try_advisory_xact_lock/.test(sql)) return { rows: [{ locked: true }], rowCount: 1 };
+    if (sql === 'SHOW server_encoding') return { rows: [{ server_encoding: 'UTF8' }], rowCount: 1 };
+    if (/has_database_privilege/.test(sql)) {
+      return {
+        rows: [{
+          role: 'smdb_bot', db: 'smdb', db_create: true, schema_exists: withMeta, schema_usage: withMeta ? true : null,
+          schema_create: withMeta ? true : null, relations: withMeta ? [tableRow('meta')] : [], meta: withMeta ? META : null,
+        }],
+        rowCount: 1,
+      };
+    }
+    return answer(sql, params);
+  };
+}
 
 describe('provisioning', () => {
   it('creates the guild_ownership table', async () => {
     quiet();
-    let created = false;
-    const { backend, sent } = scripted(sql => {
-      if (/CREATE TABLE IF NOT EXISTS smdb_data\.meta/.test(sql)) created = true;
-      if (VERSION_READ.test(sql)) return created ? { rows: [{ value: JSON.stringify({ v: SCHEMA_VERSION }) }], rowCount: 1 } : missing();
-      return undefined;
-    });
+    const { backend, sent } = scripted(onStore(false, sql => (VERSION_READ.test(sql) ? { rows: [{ value: JSON.stringify({ v: SCHEMA_VERSION }) }], rowCount: 1 } : undefined)));
     await internals(backend).provision();
     expect(sent.some(s => /^CREATE TABLE IF NOT EXISTS smdb_data\.guild_ownership \(/.test(s))).toBe(true);
   });
 
   it('refuses a schema_version that is not JSON', async () => {
     quiet();
-    const { backend } = scripted(sql => (VERSION_READ.test(sql) ? { rows: [{ value: 'garbage' }], rowCount: 1 } : undefined));
+    const { backend } = scripted(onStore(true, sql => (VERSION_READ.test(sql) ? { rows: [{ value: 'garbage' }], rowCount: 1 } : undefined)));
     await internals(backend).provision();
     expect(await backend.provisionVerdict()).toEqual({ state: 'mismatch', found: 'garbage' });
   });
 
-  it('refuses when another version was written between the first read and the insert', async () => {
+  it('refuses the schema it made, rolled back, when another version reads back after the insert', async () => {
     quiet();
-    let created = false;
-    const { backend, sent } = scripted(sql => {
-      if (/CREATE TABLE IF NOT EXISTS smdb_data\.meta/.test(sql)) created = true;
-      if (VERSION_READ.test(sql)) return created ? { rows: [{ value: '{"v":1}' }], rowCount: 1 } : missing();
-      return undefined;
-    });
+    const { backend, sent } = scripted(onStore(false, sql => (VERSION_READ.test(sql) ? { rows: [{ value: '{"v":1}' }], rowCount: 1 } : undefined)));
     await internals(backend).provision();
-    expect(await backend.provisionVerdict()).toEqual({ state: 'mismatch', found: '{"v":1}' });
+    const refusal = freshVersionRefusal(`smdb_data.meta's schema_version reads {"v":1}`);
+    expect(await backend.provisionVerdict()).toEqual({ state: 'shape', reason: refusal.reason, fix: refusal.fix });
     expect(sent.some(s => s.includes("'store_id'"))).toBe(false);
+    expect(sent.filter(s => /^(COMMIT|ROLLBACK)$/.test(s))).toEqual(['ROLLBACK']);
   });
 
-  it('a meta table with no version row is provisioned', async () => {
+  it('refuses the schema it made, rolled back, when the version row is still missing after the insert', async () => {
     quiet();
-    let inserted = false;
-    const { backend } = scripted(sql => {
-      if (/INSERT INTO smdb_data\.meta \(key, value\) VALUES \('schema_version'/.test(sql)) inserted = true;
-      if (VERSION_READ.test(sql)) return inserted ? { rows: [{ value: JSON.stringify({ v: SCHEMA_VERSION }) }], rowCount: 1 } : { rows: [], rowCount: 0 };
-      return undefined;
-    });
+    const { backend, sent } = scripted(onStore(false, sql => (VERSION_READ.test(sql) ? { rows: [], rowCount: 0 } : undefined)));
     await internals(backend).provision();
-    expect(await backend.provisionVerdict()).toEqual({ state: 'provisioned' });
-  });
-
-  it('names an unreadable version when the row is still missing after the insert', async () => {
-    quiet();
-    const { backend } = scripted(sql => (VERSION_READ.test(sql) ? { rows: [], rowCount: 0 } : undefined));
-    await internals(backend).provision();
-    expect(await backend.provisionVerdict()).toEqual({ state: 'mismatch', found: 'unreadable' });
+    expect(await backend.provisionVerdict()).toEqual({ state: 'shape', reason: freshVersionRefusal('smdb_data.meta holds no schema_version row').reason, fix: freshVersionRefusal('').fix });
+    expect(sent.filter(s => /^(COMMIT|ROLLBACK)$/.test(s))).toEqual(['ROLLBACK']);
   });
 
   it('a version read that fails for another reason fails the provisioning and creates nothing', async () => {
     quiet();
-    const { backend, sent } = scripted(sql => (
-      VERSION_READ.test(sql) ? Object.assign(new Error('canceling statement'), { code: '57014' }) : undefined));
+    const { backend, sent } = scripted(onStore(true, sql => (
+      VERSION_READ.test(sql) ? Object.assign(new Error('canceling statement'), { code: '57014' }) : undefined)));
     await expect(internals(backend).provision()).rejects.toThrow('canceling statement');
     expect(sent.filter(s => /^(CREATE|INSERT)/i.test(s))).toEqual([]);
     expect(internals(backend).schemaMismatch).toBe(false);
@@ -173,7 +175,7 @@ describe('restoring a guild', () => {
 
   it('logs the found version when a restore is refused on a schema mismatch', async () => {
     const error = quiet();
-    const { backend } = scripted(sql => (VERSION_READ.test(sql) ? { rows: [{ value: '{"v":1}' }], rowCount: 1 } : undefined));
+    const { backend } = scripted(onStore(true, sql => (VERSION_READ.test(sql) ? { rows: [{ value: '{"v":1}' }], rowCount: 1 } : undefined)));
     await internals(backend).provision();
     error.mockClear();
     expect(await backend.restoreGuild('1', 5, token, ...RESTORE_ARGS())).toEqual({ ok: false, reason: 'schema-mismatch' });

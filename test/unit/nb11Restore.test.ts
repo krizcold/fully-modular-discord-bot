@@ -425,7 +425,7 @@ describe('the claim and the set', () => {
   it.each<[string, RestoreOutcome, { code?: string; error?: string; throws?: string; message?: string }]>([
     ['live-rows', { ok: false, reason: 'live-rows', retiredAt: 5 }, { code: 'invalid', error: liveText(5) }],
     ['no-entry', { ok: false, reason: 'no-entry' }, { code: 'invalid', error: NO_ENTRY }],
-    ['schema-mismatch', { ok: false, reason: 'schema-mismatch' }, { code: 'invalid', error: 'the database holds another schema version than this bot reads; nothing was restored' }],
+    ['schema-mismatch', { ok: false, reason: 'schema-mismatch' }, { code: 'invalid', error: 'this bot refused the database at boot (its log says why); nothing was restored' }],
     ['refused 40P01', { ok: false, reason: 'refused', detail: 'SQLSTATE 40P01: deadlock detected', code: '40P01' }, { code: 'backend-unavailable', error: 'the database refused the restore (SQLSTATE 40P01: deadlock detected); nothing was restored; try again in a moment' }],
     ['refused 57014', { ok: false, reason: 'refused', detail: 'SQLSTATE 57014: canceling statement due to statement timeout', code: '57014' }, { code: 'backend-unavailable', error: 'the database refused the restore (SQLSTATE 57014: canceling statement due to statement timeout); nothing was restored; try again in a moment' }],
     ['refused 23505', { ok: false, reason: 'refused', detail: 'SQLSTATE 23505: duplicate key', code: '23505' }, { code: 'backend-unavailable', error: 'the database refused the restore (SQLSTATE 23505: duplicate key); nothing was restored; see the bot log' }],

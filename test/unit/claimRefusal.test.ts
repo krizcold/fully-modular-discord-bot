@@ -63,6 +63,27 @@ describe('a token with no usable claim', () => {
   );
 });
 
+const META = { kind: 'r', key_text: true, value_text: true, value_not_null: true, rls: false, unique_key: true, select: true };
+
+/** NB16: the bootstrap lock is free, the encoding answers UTF8 and the found list holds a meta that passes the gate (a store) or nothing (fresh). */
+function onStore(withMeta: boolean, answer: (sql: string) => unknown): (sql: string) => unknown {
+  return sql => {
+    if (/pg_try_advisory_xact_lock/.test(sql)) return { rows: [{ locked: true }], rowCount: 1 };
+    if (sql === 'SHOW server_encoding') return { rows: [{ server_encoding: 'UTF8' }], rowCount: 1 };
+    if (/has_database_privilege/.test(sql)) {
+      const meta = { name: 'meta', kind: 'r', is_partition: false, select: true, insert: true, update: true, delete: true, usage: null, update_seq: null };
+      return {
+        rows: [{
+          role: 'smdb_bot', db: 'smdb', db_create: true, schema_exists: withMeta, schema_usage: withMeta ? true : null,
+          schema_create: withMeta ? true : null, relations: withMeta ? [meta] : [], meta: withMeta ? META : null,
+        }],
+        rowCount: 1,
+      };
+    }
+    return answer(sql);
+  };
+}
+
 /** A backend whose pool hands out one scripted client; every statement it is sent is recorded. */
 function scriptedBackend(answer: (sql: string) => unknown): { backend: PostgresBackend; sent: string[]; connect: ReturnType<typeof vi.fn> } {
   const backend = new PostgresBackend({ url: 'postgres://nobody@127.0.0.1:9/none' });
@@ -70,8 +91,8 @@ function scriptedBackend(answer: (sql: string) => unknown): { backend: PostgresB
   (backend as unknown as { state: string }).state = 'ready';
   const sent: string[] = [];
   const client = {
-    query: async (q: string | { text: string }) => {
-      const sql = typeof q === 'string' ? q : q.text;
+    query: async (statement: string | { text: string }) => {
+      const sql = typeof statement === 'string' ? statement : statement.text;
       sent.push(sql.trim());
       const res = answer(sql);
       if (res instanceof Error) throw res;
@@ -91,8 +112,8 @@ describe('a database of another schema version', () => {
 
   it('is refused before any statement creates or inserts anything', async () => {
     vi.spyOn(console, 'error').mockImplementation(() => {});
-    const { backend, sent } = scriptedBackend(sql => (
-      /FROM smdb_data\.meta WHERE key = 'schema_version'/.test(sql) ? { rows: [{ value: '{"v":1}' }], rowCount: 1 } : undefined));
+    const { backend, sent } = scriptedBackend(onStore(true, sql => (
+      /FROM ONLY smdb_data\.meta WHERE key = 'schema_version'/.test(sql) ? { rows: [{ value: '{"v":1}' }], rowCount: 1 } : undefined)));
     await provision(backend);
     expect(sent.filter(s => /^(CREATE|INSERT|ALTER)/i.test(s))).toEqual([]);
     expect(await backend.provisionVerdict()).toEqual({ state: 'mismatch', found: '{"v":1}' });
@@ -100,15 +121,8 @@ describe('a database of another schema version', () => {
   });
 
   it('a database with no meta table yet is provisioned', async () => {
-    const missing = Object.assign(new Error('relation "smdb_data.meta" does not exist'), { code: '42P01' });
-    let created = false;
-    const { backend, sent } = scriptedBackend(sql => {
-      if (/CREATE TABLE IF NOT EXISTS smdb_data\.meta/.test(sql)) created = true;
-      if (/SELECT value FROM smdb_data\.meta WHERE key = 'schema_version'/.test(sql)) {
-        return created ? { rows: [{ value: JSON.stringify({ v: SCHEMA_VERSION }) }], rowCount: 1 } : missing;
-      }
-      return undefined;
-    });
+    const { backend, sent } = scriptedBackend(onStore(false, sql => (
+      /FROM ONLY smdb_data\.meta WHERE key = 'schema_version'/.test(sql) ? { rows: [{ value: JSON.stringify({ v: SCHEMA_VERSION }) }], rowCount: 1 } : undefined)));
     await provision(backend);
     expect(sent.some(s => s.startsWith('CREATE SEQUENCE IF NOT EXISTS smdb_data.claim_seq'))).toBe(true);
     expect(await backend.provisionVerdict()).toEqual({ state: 'provisioned' });
@@ -126,7 +140,7 @@ describe('a database of another schema version', () => {
     expect(connect).not.toHaveBeenCalled();
   });
 
-  it('the operator restore answers that the database holds another schema version', async () => {
+  it('the operator restore answers that the bot refused the database at boot', async () => {
     setBackendKind('postgres');
     const store = new FakeStore();
     store.restoreGuild = async () => ({ ok: false, reason: 'schema-mismatch' });
@@ -137,7 +151,7 @@ describe('a database of another schema version', () => {
       expect(await restoreGuildFromGraveyard('1', 5)).toEqual({
         ok: false,
         code: 'invalid',
-        error: 'the database holds another schema version than this bot reads; nothing was restored',
+        error: 'this bot refused the database at boot (its log says why); nothing was restored',
       });
     } finally {
       setGuildDataBackend(null);

@@ -9,7 +9,7 @@ import { PostgresBackend, SCHEMA_VERSION } from './postgresBackend';
 import { initWorkingSet } from './workingSet';
 import type { DataUnavailableCause } from './workingSet';
 import { initDataReadiness, getDataReadiness, DataReadinessDriver } from './dataReadiness';
-import { evaluateRecognitionGuard, verifyStoreIdentity, readFileMarker, GuardVerdict } from './recognitionGuard';
+import { evaluateRecognitionGuard, verifyStoreIdentity, readFileMarker, readMarkerStoreId, GuardVerdict } from './recognitionGuard';
 import { setGuildDataBackend, isClosedForExit, closeGuildWrites, noteGuildDataServing, guildDataOpOf, bufferRestoreEvent } from '../dataManager';
 import { getConfigProperty } from '../configManager';
 import { ACK_MS, sweepLateWrites } from './replyGate';
@@ -118,7 +118,7 @@ function reportStore(url: string): void {
 }
 
 function startPostgresRuntime(url: string): void {
-  const backend = new PostgresBackend({ url });
+  const backend = new PostgresBackend({ url, markerStoreId: readMarkerStoreId });
   backend.start();
   reportStore(url);
   bootStatus = { ...bootStatus, mode: 'postgres', state: 'starting' };
@@ -137,6 +137,12 @@ async function verifyIdentityLoop(url: string, backend: PostgresBackend, driver:
       run.done = true;
       refuse(`the database holds schema version ${verdict.found}, and this bot reads only version ${SCHEMA_VERSION}`, 'postgres',
         'Gates stay closed; point DATA_BACKEND_URL at a database of this bot\'s schema version in the web UI env editor');
+      return;
+    }
+    if (verdict.state === 'shape') {
+      if (run.done) return;
+      run.done = true;
+      refuse(verdict.reason, 'postgres', verdict.fix);
       return;
     }
     run.schema = verdict.state;

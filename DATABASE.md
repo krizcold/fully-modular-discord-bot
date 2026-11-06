@@ -135,11 +135,52 @@ docker run -d --name smdb-pg -p 5432:5432 -e POSTGRES_USER=smdb -e POSTGRES_PASS
 
 then `DATA_BACKEND=postgres` and `DATA_BACKEND_URL=postgresql://smdb:dev@localhost:5432/smdb`.
 A wrong or absent database shows as a visible "waiting on data backend" status, not a stack trace.
-The database provisions its own schema on first contact; there is nothing to create by hand.
-A database provisioned by another schema version of the bot is refused the way a wrong database is:
-the bot stays online with its data layer refused, members are told the data storage is unavailable,
-no guild data is saved or restored, nothing is created in that database, and the log names the
-version it found. Point `DATA_BACKEND_URL` at a database of this version to serve again.
+The database provisions its own schema on first contact, in one transaction; there is nothing to create by hand.
+The server must be PostgreSQL 13 or later, and the database's encoding UTF8; at boot the bot refuses an older server
+(naming its version) and any other server_encoding, before it reads smdb_data.
+Bot processes that boot at the same time run this check one after another, under a bootstrap lock that a data
+migration to Postgres also holds while it copies; a process that waits for that lock logs that it is waiting.
+At every boot the bot compares the relations of smdb_data with the ones it makes: each relation's kind, whether it
+is logged or UNLOGGED, its table access method, partition keys and bounds, inheritance parents, row level security
+(enabled and forced) and policies; the columns (type, NOT NULL, default, identity, generated expression, collation,
+storage); constraints; indexes and whether each is valid; the sequences' increment, minimum, maximum, cache and
+cycle; triggers and rules. It refuses a database whose smdb_data differs in any of these, naming each difference.
+A store that a migration to Postgres made is checked the same way at the bot's first boot on it. Do not add tables,
+indexes, triggers or columns to smdb_data. Some changes are not checked and still break the bot later, at the
+statement they affect: a publication whose row filter uses a column outside a table's replica identity makes
+updates and deletes on that table fail (the graveyard's sweep among them), and the rows of a table in another
+schema that inherits from one of smdb_data's tables join its reads.
+It also refuses a smdb_data that holds tables or other relations but no schema version, since it can't confirm
+what made them or that they are complete; point the bot at another database or rename that schema aside. It
+refuses a smdb_data whose version table, smdb_data.meta, it can't read (a changed column type, row level security,
+a dropped primary key); correct meta to the shape the log gives, and do not rename the schema aside, since its
+tables hold this bot's data and the next boot would make and serve a new, empty store beside them. A database
+provisioned by another schema version of the bot is refused the same way. A store of this version and shape whose
+smdb_data.meta has no store_id row gets a new one, unless the machine's /data/.backend.json records a store id: then
+it is refused, since the bot can't confirm that this database holds that store, and the log prints the statement that
+adds the recorded id (`INSERT INTO smdb_data.meta (key, value) VALUES ('store_id', '"<id>"')`) for the case that this
+is the database the deployment was set up with; otherwise point the bot at the deployment's database. When
+/data/.backend.json exists but can't be read or parsed, the bot writes no store id and refuses nothing: the boot
+logs that the marker could not be read and tries again.
+When the server rejects a statement that builds the copy of the schema the bot compares with, the boot is refused,
+naming the server's SQLSTATE and message, and smdb_data is not changed; a privilege error gives the GRANT to run.
+A lost connection, a cancelled statement, a lack of resources or an error with no SQLSTATE is retried instead.
+The bot's database role needs CREATE on the database (at every boot the bot builds a copy of its schema to compare
+with, and rolls it back), USAGE on smdb_data (and CREATE on it when smdb_data was made beforehand and is still
+empty), SELECT, INSERT, UPDATE and DELETE on its tables, and USAGE and UPDATE on its sequences. A role that lacks
+any of them is refused with each one named; grant them as the owner of smdb_data (for the schema) and of its tables
+and sequences (for the others), or as a superuser (`GRANT USAGE ON SCHEMA smdb_data TO <role>`;
+`GRANT CREATE ON SCHEMA smdb_data TO <role>`, for an empty schema made beforehand;
+`GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA smdb_data TO <role>`;
+`GRANT USAGE, UPDATE ON ALL SEQUENCES IN SCHEMA smdb_data TO <role>`; `GRANT CREATE ON DATABASE <db> TO <role>`,
+the last as the database's owner), or connect as the login that owns smdb_data and its tables, and never rename the
+schema aside for this. On a new database the bot also refuses, and rolls back, a schema it made on which default
+privileges (ALTER DEFAULT PRIVILEGES) leave its role without one of these, or that an event trigger or rule changed
+(the schema_version row it wrote can't be read back, or the schema differs from its own).
+In each case the bot stays online with its data layer refused, members are told the data storage is unavailable, no
+guild data is saved or restored, nothing in that database is changed, and the log names what it found. A table or
+partition the log names as missing may have held data that is not in that database: restore a backup rather than
+creating it empty.
 The graveyard sweep deletes retired guild data after `GRAVEYARD_TTL_DAYS` (14 by default); it keeps
 each guild's ownership row, which stops an older bot process from writing over a newer one.
 A restore moves one deleted server's data back in one transaction, only while that server has no data in the

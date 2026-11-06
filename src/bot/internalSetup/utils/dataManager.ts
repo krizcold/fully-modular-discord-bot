@@ -1559,7 +1559,7 @@ export const RESTORE_TEXTS = {
   deleteRunning: "a delete of this server's data is running; nothing was restored; try again once it ends",
   notLoaded: "this server's data is not loaded in this bot process; nothing was restored; try again in a moment",
   flush: "the server's unsaved changes are not confirmed saved yet; nothing was restored; try again in a moment",
-  schemaMismatch: 'the database holds another schema version than this bot reads; nothing was restored',
+  schemaMismatch: 'this bot refused the database at boot (its log says why); nothing was restored',
   noClaim: 'this bot process holds no usable claim on the database; nothing was restored; restart the bot',
   notProvisioned: 'the database is not provisioned yet; nothing was restored; try again once the bot has started',
   outOfTime: 'the restore ran out of its 40 s before it could commit; nothing was restored; try again in a moment',
