@@ -203,6 +203,12 @@ function jobView(journal: MigrationJournal, state: string, stage: MigrationStage
   };
 }
 
+function markerNamesJob(marker: BackendStateMarker | null, journal: MigrationJournal): boolean {
+  return !!marker && marker.live === journal.to && marker.migration === journal.jobId;
+}
+
+const doneUnnamedText = (jobId: string) => `can't confirm; migration ${jobId} says done, but /data/.backend.json does not name it`;
+
 function markerMatches(marker: BackendStateMarker | null, journal: MigrationJournal): boolean {
   if (!marker || marker.live !== journal.to || marker.migration !== journal.jobId) return false;
   return (marker.storeId ?? null) === (journal.to === 'postgres' ? journal.storeId ?? null : null);
@@ -214,7 +220,10 @@ export function deriveStatus(facts: DataFacts, opts: { running: { jobId: string 
   const journal = facts.journal;
   if (!journal) return { status: 200, body: { success: true, job: null } };
   if (opts.running && opts.running.jobId === journal.jobId) return { status: 200, body: { success: true, job: jobView(journal, 'running', journal.stage) } };
-  if (journal.result === 'done') return { status: 200, body: { success: true, job: jobView(journal, 'done', journal.stage) } };
+  if (journal.result === 'done') {
+    if (markerNamesJob(facts.marker, journal)) return { status: 200, body: { success: true, job: jobView(journal, 'done', journal.stage) } };
+    return { status: 409, body: { success: false, error: doneUnnamedText(journal.jobId), jobId: journal.jobId, to: journal.to } };
+  }
   if (markerMatches(facts.marker, journal)) {
     if (!opts.managed && readEnvFileDataBackend() !== journal.to) {
       return { status: 200, body: { success: true, job: jobView(journal, 'interrupted', 'env', ENV_UNFINISHED) } };
@@ -1404,7 +1413,9 @@ export class MigrationService {
       return { start: { lastJobId: earlier.jobId } };
     }
     if (earlier && earlier.jobId === jobId) {
-      const st = deriveStatus(facts, { running: null, managed: isManaged() }).body.job;
+      const derived = deriveStatus(facts, { running: null, managed: isManaged() });
+      if (derived.body.success !== true) return derived;
+      const st = derived.body.job;
       return { status: 200, body: { success: true, jobId: st.jobId, to: st.to, state: st.state, stage: st.stage, ...(st.error ? { error: st.error } : {}) } };
     }
     const markerTo: DataBackendKind = marker ? marker.live : 'file';
@@ -1430,8 +1441,8 @@ export class MigrationService {
 
   private async classifyEarlier(earlier: MigrationJournal, marker: BackendStateMarker | null, jobId: string, url: string | undefined): Promise<Classification> {
     const unknown = (why: string): Classification => ({ kind: 'unknown', reason: `can't confirm; ${why}` });
-    if (marker && marker.live === earlier.to && marker.migration === earlier.jobId) return { kind: 'finish', from: 'env' };
-    if (earlier.result === 'done') return unknown(`migration ${earlier.jobId} says done, but /data/.backend.json does not name it`);
+    if (markerNamesJob(marker, earlier)) return { kind: 'finish', from: 'env' };
+    if (earlier.result === 'done') return { kind: 'unknown', reason: doneUnnamedText(earlier.jobId) };
     if (marker && marker.live === earlier.to) return unknown(`the marker /data/.backend.json names ${earlier.to} under ${marker.migration ? `migration ${marker.migration}` : 'no migration'}, not migration ${earlier.jobId}`);
     if (earlier.to === 'postgres') {
       if (marker && marker.live !== 'file') return unknown('the facts of the earlier migration match no known state');
