@@ -42,6 +42,11 @@ export class FakeHost implements MigrationHost {
   migrationBotState(): { ok: true } | { ok: false; error: string } {
     return this.state;
   }
+  /** An owner channel setting write in flight (NB5 decision 16). */
+  ownerChannelMark = false;
+  ownerChannelWriteSettled(): boolean {
+    return !this.ownerChannelMark;
+  }
 }
 
 export function seedFile(rel: string, content: string | Buffer): void {

@@ -20,6 +20,11 @@ export interface GuildFlushBatch {
   flushId?: string;
   /** Set by flushGuild just before it sends COMMIT. */
   commitSent?: boolean;
+  /**
+   * A set pending re-save (NB5 decision 12): the guild's live rows whose keys the set does not hold go to the graveyard
+   * under one batch of their own, then are deleted, in the batch's transaction.
+   */
+  replace?: { docKeys: DocKey[]; appendKeys: DocKey[]; reason: string };
 }
 
 export interface FenceToken {
@@ -40,7 +45,7 @@ export interface GuildOwner {
 export type FlushOutcome =
   | { ok: true }
   | { ok: false; reason: 'deposed'; currentOwner?: GuildOwner }
-  | { ok: false; reason: 'unavailable'; detail?: string; code?: string; commitUnanswered?: boolean };
+  | { ok: false; reason: 'unavailable'; detail?: string; code?: string; commitUnanswered?: boolean; landedOn?: string };
 
 /** What a check of a flush whose COMMIT got no answer found (NB13 decision 4). */
 export type FlushFate =
@@ -52,32 +57,58 @@ export type FlushFate =
 export type HydrationOutcome =
   | { ok: true; docs: { key: DocKey; doc: string }[]; appendKeys: DocKey[] }
   | { ok: false; reason: 'deposed'; currentOwner?: GuildOwner }
-  | { ok: false; reason: 'unavailable' };
+  | { ok: false; reason: 'unavailable'; detail?: string };
 
 /** A refusal read just before COMMIT: the maintenance gate, the exit drain, or less than 2 s left. */
 export type RestoreStop = 'maintenance' | 'node-stopping' | 'out-of-time';
 
 /**
+ * NB5 C7: a COMMIT answered after this process stopped writing to that database. committed: it answered ok (text A);
+ * false: it failed in a way that does not show a rollback, or got no answer (text B). old is that database's address,
+ * why the latch's words.
+ */
+export interface LateCommit {
+  committed: boolean;
+  old: string;
+  why: string;
+}
+
+/**
  * 'refused': the database answered with an error, so nothing changed. 'unavailable': it did not answer or ended the
- * connection before COMMIT was sent (timedOut: the call's own bound passed). 'unknown': COMMIT got no answer.
+ * connection before COMMIT was sent (timedOut: the call's own bound passed). 'unknown': COMMIT got no answer, or got one
+ * only after this process stopped writing to that database (afterLatch). 'latched' and 'held': the backend's own state
+ * stopped the retire before COMMIT. retiredAt is the batch the retire wrote; moved, the rows its transaction moved.
  */
 export type RetireOutcome =
-  | { ok: true; moved: number }
-  | { ok: false; reason: 'deposed' | 'unavailable' | 'out-of-time' | 'unknown' | 'refused' | 'no-claim'; detail?: string; timedOut?: boolean };
+  | { ok: true; moved: number; retiredAt: number }
+  | { ok: false; reason: 'unknown'; retiredAt: number; moved: number; afterLatch?: true; late?: LateCommit }
+  | { ok: false; reason: 'latched' | 'held'; detail: string }
+  | { ok: false; reason: 'deposed' | 'unavailable' | 'out-of-time' | 'refused' | 'no-claim'; detail?: string; timedOut?: boolean };
 
 export type RestoreOutcome =
   | { ok: true; moved: number; retiredAt: number; reason: string }
   | { ok: false; reason: 'deposed'; currentOwner?: GuildOwner }
   | { ok: false; reason: 'refused'; detail: string; code?: string }
   | { ok: false; reason: 'live-rows'; retiredAt: number }
-  | { ok: false; reason: 'no-entry' | 'schema-mismatch' | 'not-provisioned' | 'no-claim' | 'maintenance' | 'node-stopping' | 'out-of-time' | 'unavailable' | 'unknown'; detail?: string; retiredAt?: number; timedOut?: boolean };
+  | { ok: false; reason: 'latched' | 'held'; detail: string }
+  | { ok: false; reason: 'no-entry' | 'schema-mismatch' | 'not-provisioned' | 'no-claim' | 'maintenance' | 'node-stopping' | 'out-of-time' | 'unavailable' | 'unknown'; detail?: string; retiredAt?: number; timedOut?: boolean; afterLatch?: true; late?: LateCommit };
 
 export interface DataBackend {
   readonly kind: 'file' | 'postgres';
   /** Never throws; async connect + probe loop where applicable. */
   start(): void;
   stop(): Promise<void>;
-  connectionState(): { state: 'connecting' | 'ready' | 'outage'; outageSinceMs?: number };
+  connectionState(): { state: 'connecting' | 'ready' | 'outage' | 'confirming' | 'latched'; outageSinceMs?: number };
+  /** NB5 decision 13: raised at every latch and every move; absent on a backend with no database to switch. */
+  databaseEpoch?(): number;
+  /** NB5 decision 13: the hold's detail while held, else null. */
+  holdWords?(): string | null;
+  /** NB5 decision 13: a drain waits on the hold, so the next confirmation attempt starts without its wait. */
+  confirmNow?(): void;
+  /** NB5 decision 13: now while held, else when the last hold ended with a confirmation. */
+  heldUntil?(): number | null;
+  /** NB5 decision 11: the latch's why while latched, else null. */
+  latchReason?(): string | null;
   /** Claim-then-read in one transaction; the claim is the ownership stamp. */
   hydrateGuild(guildId: string, token: FenceToken): Promise<HydrationOutcome>;
   /** A kept working set asked for again: its guild re-stamped for the token only while the stamp still names this node ('kept'), else 'lost'; null when the store cannot be read. */

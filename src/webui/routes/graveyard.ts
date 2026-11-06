@@ -17,7 +17,7 @@ const NO_ANSWER_CAUSE: Record<string, string> = {
   failed: 'the request could not be handed to the bot',
 };
 
-export const RESTORE_MINUTE = "Within a minute, if it was restored, the server's data is back and its entry is gone from `smdb graveyard list`; if not, the entry is still listed, unless it had passed the graveyard's keep time and the graveyard sweep removed it, data and all.";
+export const RESTORE_MINUTE = "Within a minute, if it was restored, the server's data is back and its entry is gone from `smdb graveyard list`; if not, the entry is still listed, unless it had passed the graveyard's keep time and the graveyard sweep removed it, data and all. The list reads the data of the bot behind the web panel it asks; if the main database was replaced meanwhile, check once that bot runs on the new main.";
 
 /** The warning of a restore or a delete whose folder move the disk did not confirm. */
 export function moveUnconfirmedText(code: string, what: 'restore' | 'delete'): string {

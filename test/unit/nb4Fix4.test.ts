@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { FenceToken, FlushOutcome } from '../../src/bot/internalSetup/utils/dataBackends/backend';
 import { PostgresBackend } from '../../src/bot/internalSetup/utils/dataBackends/postgresBackend';
+import { fixedDatabase } from '../helpers/fixedDatabase';
 import { initWorkingSet, WorkingSetManager } from '../../src/bot/internalSetup/utils/dataBackends/workingSet';
 import { drainForExit } from '../../src/bot/internalSetup/utils/dataManager';
 import { runStopSteps } from '../../src/bot/internalSetup/utils/stopSteps';
@@ -20,7 +21,7 @@ const batch = { upserts: [{ key: { module: 'm', filename: 'a.json' }, doc: '{}' 
 const stamped = (sql: string) => /INSERT INTO smdb_data\.guild_ownership AS o/.test(sql) ? { rows: [], rowCount: 1 } : undefined;
 
 function scripted(answer: (sql: string) => unknown) {
-  const backend = new PostgresBackend({ url: 'postgres://nobody@127.0.0.1:9/none' });
+  const backend = new PostgresBackend(fixedDatabase('postgres://nobody@127.0.0.1:9/none'));
   backends.push(backend);
   (backend as unknown as { state: string }).state = 'ready';
   const client = {

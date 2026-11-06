@@ -1,7 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { BOT_DOWN_DATABASE_NOTICE, readServedGuild } from '../../src/webui/utils/servedRead';
-import { WebuiDataReader } from '../../src/webui/utils/webuiDataReader';
+import { WebuiDataReader, setWebuiDataStoreUrl } from '../../src/webui/utils/webuiDataReader';
+
+const READER_ENTRY = 'postgres://reader:pw@db.example:5432/smdb';
 import { ROUTE_TEXT } from '../../src/webui/botManager';
 import { fakeBot, GUILD, heldRow, nb7Rig, resetNb7, type Rig } from '../helpers/nb7Rig';
 
@@ -19,6 +21,7 @@ beforeEach(() => {
   rig.docs.set(`${GUILD}/m/a.json`, '{"a":1}');
 });
 afterEach(() => {
+  setWebuiDataStoreUrl(null);
   resetNb7();
   vi.restoreAllMocks();
 });
@@ -97,7 +100,8 @@ describe('the reader\'s readDoc', () => {
     };
     const pool = { connect: async () => client, query: async (text: string, values: any[]) => client.query(text, values), end: async () => undefined, on: () => undefined };
     (r as any).pool = pool;
-    (r as any).poolGeneration = (r as any).currentGeneration?.() ?? 0;
+    setWebuiDataStoreUrl({ url: READER_ENTRY });
+    (r as any).poolUrl = READER_ENTRY;
     return { r, sent };
   }
 
@@ -140,7 +144,8 @@ describe('the reader\'s readDoc', () => {
       vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
       const r = new WebuiDataReader();
       (r as any).pool = { connect: () => new Promise(() => undefined), totalCount: total, idleCount: idle, end: async () => undefined, on: () => undefined };
-      (r as any).poolGeneration = 0;
+      setWebuiDataStoreUrl({ url: READER_ENTRY });
+      (r as any).poolUrl = READER_ENTRY;
       let failure: unknown;
       let settled = false;
       void r.readDoc(GUILD, 'm', 'a.json').then(() => { settled = true; }, error => { settled = true; failure = error; });

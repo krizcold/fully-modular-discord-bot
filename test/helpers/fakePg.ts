@@ -12,6 +12,8 @@ export interface FakeStore {
   owners: Row[];
   /** A schema with no meta table: its store id read answers 42P01. */
   noMeta?: boolean;
+  /** The owner_channel row's value (NB5 decision 23); absent for no row. */
+  ownerChannel?: string;
 }
 
 const sha = (s: string) => createHash('sha256').update(Buffer.from(s, 'utf8')).digest('hex');
@@ -212,6 +214,15 @@ export class FakeClient {
       if (s.noMeta) throw pgError('42P01', `relation "${meta[1]}.meta" does not exist`);
       return { rows: s.storeId === null ? [] : [{ value: JSON.stringify(s.storeId) }] };
     }
+    const channelRead = /SELECT value FROM "?([a-z0-9_]+)"?\.meta WHERE key = 'owner_channel'/.exec(sql);
+    if (channelRead) {
+      const s = this.store(channelRead[1]);
+      return { rows: s.ownerChannel === undefined ? [] : [{ value: s.ownerChannel }] };
+    }
+    if (/^DELETE FROM smdb_data\.meta WHERE key = 'owner_channel'/.test(sql)) {
+      delete this.store().ownerChannel;
+      return { rows: [] };
+    }
     if (/AS docs/.test(sql)) {
       const s = this.store();
       return { rows: [{ docs: s.data.length, appends: s.append.length, graves: s.grave.length, owners: s.owners.length }] };
@@ -234,6 +245,10 @@ export class FakeClient {
     if (/^INSERT INTO smdb_data\.claim_clock/.test(sql)) return { rows: [] };
     // No shard claims are modelled: the rename aside (NB4 decision 25) finds none.
     if (/to_regclass\('smdb_data\.shard_claims'\)/.test(sql)) return { rows: [{ present: false }] };
+    if (/INSERT INTO smdb_data\.meta .*'owner_channel'/.test(sql)) {
+      this.store().ownerChannel = params[0];
+      return { rows: [] };
+    }
     if (/INSERT INTO smdb_data\.meta/.test(sql)) {
       if (/'store_id'/.test(sql)) this.store().storeId ??= JSON.parse(params[0]);
       return { rows: [] };

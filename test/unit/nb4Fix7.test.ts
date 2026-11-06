@@ -15,6 +15,7 @@ vi.mock('../../src/bot/internalSetup/utils/dataManager', async orig => ({
 vi.mock('../../src/bot/internalSetup/utils/dataBackends/workingSet', async orig => ({
   ...(await orig<object>()),
   getWorkingSet: () => ({
+    resaveGuilds: () => [],
     heldGuilds: () => (h.unsaved > 0 ? [{ guildId: '111', reason: 'connection refused', code: null }] : []),
     takeDropLines: () => [],
   }),

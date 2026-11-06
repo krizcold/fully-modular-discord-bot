@@ -39,6 +39,7 @@ import { ensureConfigPopulated } from './utils/configManager';
 import { decideBoot, installMaintenanceGate, markDiscordStarted, runMaintenanceBoot, setupMaintenanceIPCAtBoot, watchDataBackend } from './utils/maintenance';
 import { isMaintenanceGateClosed } from './utils/maintenanceGate';
 import { PostgresBackend } from './utils/dataBackends/postgresBackend';
+import { noteShardReconnect, stopMainWatch } from './utils/dataBackends/mainDatabase';
 
 // Load credentials from /data/.env (Web-UI managed) or environment variables
 const credentials = loadCredentials();
@@ -502,6 +503,8 @@ async function main() {
     if (stopSteps.metricsReady && !isMaintenanceGateClosed()) getMetricsCollector().flushTotals(); // writes via saveData, so it must precede the drain
   });
   // NB7 decision 16: the answers of the requests applied so far are written before the claims are released.
+  // NB5 C1 and G10: the watch stops after the exit drain, before any release step writes to the database.
+  addReleaseStep(() => stopMainWatch());
   addReleaseStep(guildRequestsStopStep);
   addReleaseStep(async () => { await getShardClaims()?.finishStop(); });
 
@@ -578,6 +581,8 @@ async function main() {
     partials: [Partials.Message, Partials.Reaction, Partials.User],
   }, installReplyGate);
   installMaintenanceGate(client);
+  client.on('shardReady', () => noteShardReconnect());
+  client.on('shardResume', () => noteShardReconnect());
 
   client.buttonHandlers = new Map<string, RegisteredButtonInfo>();
   client.dropdownHandlers = new Map<string, RegisteredDropdownInfo>();

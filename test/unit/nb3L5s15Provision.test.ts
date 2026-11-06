@@ -21,8 +21,8 @@ describe('provisionStoreInTransaction', () => {
     const { sent } = await provision();
     expect(sent[0]).toEqual({ text: 'CREATE SCHEMA smdb_data' });
     expect(sent.filter(s => /CREATE SCHEMA/.test(s.text)).map(s => s.text)).toEqual(['CREATE SCHEMA smdb_data']);
-    // NB7 added smdb_data.guild_requests and its two indexes.
-    expect(sent).toHaveLength(84);
+    // NB7 added smdb_data.guild_requests and its two indexes; NB5 the shard index of guild_ownership.
+    expect(sent).toHaveLength(85);
     const claims = sent.map(s => s.text).filter(t => /shard_claims|claim_clock|shard_nodes|guild_ownership_claim_idx/.test(t));
     expect(claims.map(t => t.split('(')[0].trim())).toEqual([
       'CREATE INDEX IF NOT EXISTS guild_ownership_claim_idx ON smdb_data.guild_ownership',

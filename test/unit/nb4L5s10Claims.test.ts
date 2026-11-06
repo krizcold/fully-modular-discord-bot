@@ -118,6 +118,9 @@ async function rig(o: RigOpts) {
       for (const id of ids) reservedKeys.add(pairKey({ shardCount: count, shardId: id, claim: 1 }));
       return done(ids);
     },
+    pause() { /* no NB4 path pauses */ },
+    resume() { /* no NB4 path resumes */ },
+    async retake() { throw new Error('NB4 never re-takes'); },
     async release(req, onSent, onConnected) {
       calls.releases.push(req);
       calls.order.push('release');

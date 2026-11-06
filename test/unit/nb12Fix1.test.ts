@@ -5,6 +5,7 @@ import { dataPath } from '../../src/utils/dataRoot';
 import type { FenceToken, GuildFlushBatch } from '../../src/bot/internalSetup/utils/dataBackends/backend';
 import { placeGuildWrite, setGuildViewCache } from '../../src/bot/internalSetup/utils/dataBackends/fileBackend';
 import { PostgresBackend } from '../../src/bot/internalSetup/utils/dataBackends/postgresBackend';
+import { fixedDatabase } from '../helpers/fixedDatabase';
 
 // NB12 code review round 1 fixes (wip-redesign/sheets/NB12.md): DL-4, OPS-1, OPS-4 with DL-5.
 
@@ -26,7 +27,7 @@ const quiet = () => {
 };
 
 function scripted(answer: (sql: string) => unknown = () => undefined) {
-  const backend = new PostgresBackend({ url: 'postgres://nobody@127.0.0.1:9/none' });
+  const backend = new PostgresBackend(fixedDatabase('postgres://nobody@127.0.0.1:9/none'));
   backends.push(backend);
   (backend as unknown as { state: string }).state = 'ready';
   let sent = 0;

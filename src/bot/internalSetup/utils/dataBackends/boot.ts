@@ -5,12 +5,18 @@
 
 import { Guild, MessageFlags } from 'discord.js';
 import { DataBackendKind, loadCredentials, resolveDataBackend } from '../../../../utils/envLoader';
-import { PostgresBackend, SCHEMA_VERSION } from './postgresBackend';
-import { initWorkingSet } from './workingSet';
+import { randomUUID } from 'crypto';
+import { Client as PgClient } from 'pg';
+import { PostgresBackend, SCHEMA_VERSION, checkMoveTarget } from './postgresBackend';
+import { MainChooser, probePass, setMainChooser, settleRetires, stepLayers, type ChooserDeps, type StoreReport } from './mainDatabase';
+import { addressListInUse, parseAddressList, pgConfig, showEntry } from '../../../../utils/databaseAddress';
+import { readNewestNotice, sendOwnerDm, waitNonce } from '../../../../utils/ownerMessages';
+import { getNodeName } from '../../fleet/nodeName';
+import { initWorkingSet, type WorkingSetManager } from './workingSet';
 import type { DataUnavailableCause } from './workingSet';
 import { initDataReadiness, getDataReadiness, DataReadinessDriver } from './dataReadiness';
 import { evaluateRecognitionGuard, verifyStoreIdentity, readFileMarker, GuardVerdict } from './recognitionGuard';
-import { setGuildDataBackend, isClosedForExit, closeGuildWrites, noteGuildDataServing, guildDataOpOf, bufferRestoreEvent } from '../dataManager';
+import { setGuildDataBackend, isClosedForExit, closeGuildWrites, noteGuildDataServing, guildDataOpOf, bufferRestoreEvent, retiresToSettle, settledRetire } from '../dataManager';
 import { getConfigProperty } from '../configManager';
 import { ACK_MS, sweepLateWrites } from './replyGate';
 import { saveMark, type SaveMark } from './scopeRecord';
@@ -27,12 +33,15 @@ export interface DataBootStatus {
   mode: DataBackendKind;
   state: 'file' | 'starting' | 'serving' | 'refused';
   refusalReason: string | null;
+  /** While 'starting': why the data layer waits for its database (NB5 decision 9). */
+  waitReason: string | null;
 }
 
-let bootStatus: DataBootStatus = { mode: 'file', state: 'file', refusalReason: null };
+let bootStatus: DataBootStatus = { mode: 'file', state: 'file', refusalReason: null, waitReason: null };
 
 export function getDataBootStatus(): DataBootStatus {
-  return bootStatus.state === 'refused' ? bootStatus : { ...bootStatus, refusalReason: null };
+  const status = bootStatus.state === 'starting' ? bootStatus : { ...bootStatus, waitReason: null };
+  return status.state === 'refused' ? status : { ...status, refusalReason: null };
 }
 
 /**
@@ -101,33 +110,90 @@ export function initDataBackendLayer(): void {
     bootStatus = { ...bootStatus, mode: 'file', state: 'file' };
     return;
   }
-  const url = (loadCredentials().DATA_BACKEND_URL || '').trim();
-  if (!url) {
+  if (!addressListInUse()) {
     refuse('the live data backend is postgres but DATA_BACKEND_URL is not set', 'postgres');
     return;
   }
-  startPostgresRuntime(url);
+  startPostgresRuntime();
 }
 
-/** The parent's web UI reader follows the store this child serves. */
-function reportStore(url: string): void {
+/** The parent's web UI reader follows the store this child serves (decisions 13 and 17). */
+function reportStore(report: StoreReport): void {
   if (!process.send) return;
   try {
-    process.send({ type: 'data:store', data: { url } }, () => { /* a closed channel is the parent gone */ });
+    process.send({ type: 'data:store', data: report }, () => { /* a closed channel is the parent gone */ });
   } catch { /* the parent reads the database /data/.env names */ }
 }
 
-function startPostgresRuntime(url: string): void {
-  const backend = new PostgresBackend({ url });
-  backend.start();
-  reportStore(url);
-  bootStatus = { ...bootStatus, mode: 'postgres', state: 'starting' };
-  const ws = initWorkingSet(backend);
-  setGuildDataBackend(backend);
-  void verifyIdentityLoop(url, backend, initDataReadiness(backend, ws, { held: true }));
+// The wait message's nonce names this process (decision 9).
+const dataProcessId = randomUUID();
+
+/** The chooser's real sides: the list in use, one probe session per entry, the notices in the owner's DM. */
+export function mainChooserDeps(): ChooserDeps {
+  return {
+    entries: () => parseAddressList(addressListInUse()),
+    probe: entries => probePass(entries, { session: config => new PgClient(config) }),
+    readNotice: () => readNewestNotice(),
+    sendWaitDm: text => sendOwnerDm(text, waitNonce(dataProcessId)),
+    markerStoreId: () => readFileMarker()?.storeId ?? null,
+    noticeCheckOff: () => (loadCredentials().DATA_NOTICE_CHECK || '').trim().toLowerCase() === 'off',
+    nodeName: () => getNodeName(),
+    onWait: reason => {
+      if (bootStatus.state === 'starting') bootStatus = { ...bootStatus, waitReason: reason };
+    },
+  };
 }
 
-async function verifyIdentityLoop(url: string, backend: PostgresBackend, driver: DataReadinessDriver): Promise<void> {
+function startPostgresRuntime(chooser: MainChooser = new MainChooser(mainChooserDeps())): PostgresBackend {
+  const backend = new PostgresBackend({ chooser });
+  setMainChooser(chooser);
+  reportStore({ url: null, choosing: true });
+  bootStatus = { ...bootStatus, mode: 'postgres', state: 'starting', waitReason: null };
+  const ws = initWorkingSet(backend);
+  setGuildDataBackend(backend);
+  wireDatabaseSteps(backend, chooser, ws);
+  backend.start();
+  void chooser.awaitChoice().then(entry => {
+    if (entry !== null) reportStore({ url: entry });
+  });
+  void verifyIdentityLoop(chooser, backend, initDataReadiness(backend, ws, { held: true }));
+  return backend;
+}
+
+/** Decisions 11 to 13: the step's hooks, the hold's reports and the move's steps owned outside the backend. */
+function wireDatabaseSteps(backend: PostgresBackend, chooser: MainChooser, ws: WorkingSetManager): void {
+  backend.onHoldChanged(words => {
+    const url = backend.chosenEntry();
+    reportStore(words === null ? { url } : { url, held: true, reason: words });
+  });
+  chooser.attach(backend, {
+    stopServing: reason => stepLayers.stopServing(reason),
+    report: reportStore,
+    markForResave: () => ws.markForResave(showEntry(backend.chosenEntry() ?? ''), (shardId, count) => stepLayers.holdsShard(shardId, count)),
+    startLeave: reason => stepLayers.startLeave(reason),
+  });
+  backend.setMoveSteps({
+    checkTarget: entry => checkMoveTarget(entry, readFileMarker()?.storeId ?? null),
+    claims: entry => stepLayers.claims(entry),
+    settleRetires: (epoch, entry) => settleRetires(backend, epoch, entry, {
+      retiresToSettle,
+      settled: settledRetire,
+      reached: guildId => ws.dropRetired(guildId),
+      flagEpoch: flagged => ws.flagEpoch(flagged),
+    }),
+    moved: entry => reportStore({ url: entry }),
+    attemptEnded: () => stepLayers.attemptEnded(),
+  });
+}
+
+/** Tests start the runtime with their own chooser. */
+export function _startPostgresRuntime(chooser: MainChooser): PostgresBackend {
+  return startPostgresRuntime(chooser);
+}
+
+async function verifyIdentityLoop(chooser: MainChooser, backend: PostgresBackend, driver: DataReadinessDriver): Promise<void> {
+  const url = await chooser.awaitChoice();
+  if (url === null) return;
   // A database of another schema version still carries its store id, so the identity check alone would pass it; a
   // wrong store whose provisioning keeps failing is refused by the identity check, so the two run side by side.
   const run = { schema: 'pending' as 'pending' | 'provisioned' | 'stopped', done: false };
@@ -150,7 +216,7 @@ async function verifyIdentityLoop(url: string, backend: PostgresBackend, driver:
     if (!identityOk) {
       askedWhilePending = run.schema === 'pending';
       try {
-        const verdict = await verifyStoreIdentity(url, run.schema === 'provisioned');
+        const verdict = await verifyStoreIdentity(pgConfig(backend.chosenEntry() ?? url), run.schema === 'provisioned');
         if (!verdict.ok) {
           // A store still provisioning carries no identity yet (a store
           // mid-restore): waited on like an unreachable one, never refused.
@@ -172,7 +238,7 @@ async function verifyIdentityLoop(url: string, backend: PostgresBackend, driver:
     if (identityOk && run.schema === 'provisioned') {
       run.done = true;
       driver.release();
-      bootStatus = { ...bootStatus, state: 'serving' };
+      bootStatus = { ...bootStatus, state: 'serving', waitReason: null };
       noteGuildDataServing();
       console.log('[Data] Postgres store identity verified; serving');
       return;

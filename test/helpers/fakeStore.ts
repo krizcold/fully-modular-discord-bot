@@ -176,7 +176,7 @@ export class FakeStore implements DataBackend {
         moved += 1;
       }
     }
-    return { ok: true, moved };
+    return { ok: true, moved, retiredAt: Date.now() };
   }
 
   async restoreGuild(..._args: unknown[]): Promise<RestoreOutcome> {

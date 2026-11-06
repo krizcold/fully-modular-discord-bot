@@ -90,12 +90,12 @@ describe('a PANIC or FATAL sent under a localized severity is no answer', () => 
 describe('the outage line names what failed', () => {
   const emptyBatch = { upserts: [], deletes: [], appends: [] } as any;
 
-  it('a flush the database answered with 57014 does not say the connection failed', async () => {
+  it('a flush the database answered with 57014 starts no hold and logs no outage line (NB5 decision 13)', async () => {
     const { backend } = scripted(sql => (isFenced(sql) ? serverError('57014', 'ERROR', 'canceling statement due to statement timeout') : undefined));
-    expect(await backend.flushGuild('1', emptyBatch, token)).toMatchObject({ ok: false, reason: 'unavailable' });
+    expect(await backend.flushGuild('1', emptyBatch, token)).toMatchObject({ ok: false, reason: 'unavailable', code: '57014' });
     const said = lines();
-    expect(said.some(line => line.startsWith('[PostgresBackend] Database operation failed (SQLSTATE 57014); entering outage:'))).toBe(true);
-    expect(said.some(line => line.includes('connection failed'))).toBe(false);
+    expect(said.some(line => line.includes('entering outage'))).toBe(false);
+    expect(backend.connectionState().state).toBe('ready');
   });
 
   it('a flush that lost its connection says the connection failed', async () => {

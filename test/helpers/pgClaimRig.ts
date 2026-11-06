@@ -3,6 +3,7 @@ import type { Pool } from 'pg';
 import { expect } from 'vitest';
 
 import { PostgresBackend } from '../../src/bot/internalSetup/utils/dataBackends/postgresBackend';
+import { fixedDatabase } from './fixedDatabase';
 import { ClaimStore, type Heartbeat } from '../../src/bot/internalSetup/fleet/claimStore';
 import { claimTimings, type Me } from '../../src/bot/internalSetup/fleet/claimRules';
 import { poolFor, startPostgres } from './postgres';
@@ -37,7 +38,7 @@ export async function startClaimRig(): Promise<ClaimRig> {
   const user = encodeURIComponent(container.getUsername());
   const password = encodeURIComponent(container.getPassword());
   const url = `postgres://${user}:${password}@${container.getHost()}:${container.getPort()}/${container.getDatabase()}`;
-  const backend = new PostgresBackend({ url });
+  const backend = new PostgresBackend(fixedDatabase(url));
   backend.start();
   const until = Date.now() + 60_000;
   while (backend.connectionState().state !== 'ready' && Date.now() < until) await new Promise(resolve => { setTimeout(resolve, 100); });

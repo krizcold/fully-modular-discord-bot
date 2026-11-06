@@ -1,3 +1,4 @@
+import { pgConfig } from '../../src/utils/databaseAddress';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 const h = vi.hoisted(() => ({ marker: '' }));
@@ -33,7 +34,7 @@ afterEach(() => {
 describe('store id adoption before provisioning passes', () => {
   it('answers pending with the operator reason', async () => {
     h.marker = JSON.stringify({ live: 'postgres', storeId: null, flippedAt: 1 });
-    expect(await verifyStoreIdentity('postgres://x', false)).toEqual({
+    expect(await verifyStoreIdentity(pgConfig('postgres://x'), false)).toEqual({
       ok: false,
       reason: 'the store id is adopted once provisioning passes',
       pending: true,

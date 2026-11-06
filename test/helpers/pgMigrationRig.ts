@@ -2,6 +2,7 @@ import type { StartedPostgreSqlContainer } from '@testcontainers/postgresql';
 import net from 'net';
 import { Client, Pool } from 'pg';
 import { PostgresBackend } from '../../src/bot/internalSetup/utils/dataBackends/postgresBackend';
+import { fixedDatabase } from './fixedDatabase';
 import { MigrationService, type ServiceOptions } from '../../src/bot/internalSetup/utils/dataMigration';
 import { FakeHost, JOURNAL, MARKER, STORES, freshJsonBot, writeJson } from './migrationRig';
 import { startPostgres } from './postgres';
@@ -37,7 +38,7 @@ export async function resetDatabase(rig: PgRig): Promise<void> {
 
 /** A store provisioned by the bot's own backend, its store id and the marker naming it. */
 export async function provisionedStore(rig: PgRig): Promise<string> {
-  const backend = new PostgresBackend({ url: rig.url });
+  const backend = new PostgresBackend(fixedDatabase(rig.url));
   backend.start();
   const until = Date.now() + 60_000;
   while (backend.connectionState().state !== 'ready' && Date.now() < until) await new Promise(r => setTimeout(r, 100));

@@ -3,6 +3,7 @@ import path from 'path';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { FenceToken } from '../../src/bot/internalSetup/utils/dataBackends/backend';
 import { PostgresBackend } from '../../src/bot/internalSetup/utils/dataBackends/postgresBackend';
+import { fixedDatabase } from '../helpers/fixedDatabase';
 import { WorkingSetManager } from '../../src/bot/internalSetup/utils/dataBackends/workingSet';
 import { insertAppend, jsonBot, provisionedStore, realService, resetDatabase, startRig, stopRig, type PgRig } from '../helpers/pgMigrationRig';
 import { FakeHost, root, seedFile, useDatabaseUrl, wipeRoot, why } from '../helpers/migrationRig';
@@ -64,7 +65,7 @@ describe('a stream with an open tail', () => {
     await rig.admin.query(`INSERT INTO smdb_data.shard_claims (shard_count, shard_id, claim, holder_process, holder_node, holder_name, home_node, ttl_ms, expires_up_ms)
       VALUES (1, 0, 1, 'p-tail', 'node-tail', 'node-tail', 'node-tail', 30000, 30000) ON CONFLICT DO NOTHING`);
     const token: FenceToken = { nodeId: 'node-tail', claim: 1, processId: 'p-tail', shardId: 0, shardCount: 1 };
-    const backend = new PostgresBackend({ url: rig.url });
+    const backend = new PostgresBackend(fixedDatabase(rig.url));
     backend.start();
     const ws = new WorkingSetManager(backend);
     try {

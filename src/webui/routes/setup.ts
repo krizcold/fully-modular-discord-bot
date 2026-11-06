@@ -19,8 +19,10 @@ import {
   isContainerPinned
 } from '../../utils/envLoader';
 import { dataPath } from '../../utils/dataRoot';
+import { checkAddressList } from '../../utils/databaseAddress';
 import { reconfigureOAuth } from '../auth/oauthConfig';
 import type { BotManager } from '../botManager';
+import { ownerChannelView, putOwnerChannel } from '../utils/ownerChannel';
 
 /** Keys whose value an answer never repeats (the secrets, and the IDs /status masks). */
 const MASKED_KEYS = new Set<string>([
@@ -98,7 +100,7 @@ function computeReloadActions(
   return changes;
 }
 
-export function createSetupRoutes(botManager?: Pick<BotManager, 'migrationRunning'>): Router {
+export function createSetupRoutes(botManager?: Pick<BotManager, 'migrationRunning' | 'ownerChannelWriteStart'>): Router {
   const router = Router();
 
   // Auth is applied in server.ts via requireAuth middleware
@@ -218,12 +220,9 @@ export function createSetupRoutes(botManager?: Pick<BotManager, 'migrationRunnin
           });
           return;
         }
-        if (DATA_BACKEND_URL && DATA_BACKEND_URL.trim() !== ''
-            && !/^postgres(ql)?:\/\//.test(DATA_BACKEND_URL.trim())) {
-          res.status(400).json({
-            success: false,
-            error: 'DATA_BACKEND_URL must start with postgresql:// or postgres://'
-          });
+        const addressError = DATA_BACKEND_URL && DATA_BACKEND_URL.trim() !== '' ? checkAddressList(DATA_BACKEND_URL) : null;
+        if (addressError) {
+          res.status(400).json({ success: false, error: addressError });
           return;
         }
       }
@@ -386,6 +385,20 @@ export function createSetupRoutes(botManager?: Pick<BotManager, 'migrationRunnin
   router.get('/deployment-mode', (_req: Request, res: Response) => {
     res.json({ success: true, mode: getDeploymentMode() });
   });
+
+  // NB5 decision 23: where the Bot Manager's owner messages go.
+  router.get('/owner-channel', async (_req: Request, res: Response) => {
+    res.json(await ownerChannelView());
+  });
+
+  const host = botManager;
+  if (host) {
+    router.put('/owner-channel', async (req: Request, res: Response) => {
+      const body = (req.body && typeof req.body === 'object' ? req.body : {}) as { channelId?: unknown };
+      const answer = await putOwnerChannel(host, body.channelId);
+      res.status(answer.status).json(answer.body);
+    });
+  }
 
   /**
    * GET /api/setup/instructions

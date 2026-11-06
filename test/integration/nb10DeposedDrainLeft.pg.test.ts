@@ -4,6 +4,7 @@ import type { Pool, PoolClient } from 'pg';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import type { FenceToken } from '../../src/bot/internalSetup/utils/dataBackends/backend';
 import { PostgresBackend } from '../../src/bot/internalSetup/utils/dataBackends/postgresBackend';
+import { fixedDatabase } from '../helpers/fixedDatabase';
 import { initWorkingSet } from '../../src/bot/internalSetup/utils/dataBackends/workingSet';
 import { beginStop, installStopHandler, saveDataTracked } from '../../src/bot/internalSetup/utils/dataManager';
 import { checkWriterLock, configureWriterLock, onDeposed, takeWriterLock, writerLockPath } from '../../src/bot/internalSetup/utils/writerLock';
@@ -24,7 +25,7 @@ beforeAll(async () => {
   direct = poolFor(container);
   const user = encodeURIComponent(container.getUsername());
   const password = encodeURIComponent(container.getPassword());
-  backend = new PostgresBackend({ url: `postgres://${user}:${password}@${container.getHost()}:${container.getPort()}/${container.getDatabase()}` });
+  backend = new PostgresBackend(fixedDatabase(`postgres://${user}:${password}@${container.getHost()}:${container.getPort()}/${container.getDatabase()}`));
   backend.start();
   const until = Date.now() + 60_000;
   while (backend.connectionState().state !== 'ready' && Date.now() < until) await new Promise(resolve => { setTimeout(resolve, 100); });

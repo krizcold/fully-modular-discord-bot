@@ -21,7 +21,7 @@ const h = vi.hoisted(() => {
     barrier: null as null | Promise<string>,
     recover: null as null | Promise<void>,
     client: null as any,
-    calls: { stopSamplers: 0, flushTotals: 0, beginStop: 0, finishStop: 0, recoverPanels: 0, autoUpdater: 0 },
+    calls: { stopSamplers: 0, flushTotals: 0, beginStop: 0, finishStop: 0, recoverPanels: 0, autoUpdater: 0, stopMainWatch: 0 },
     closes: [] as string[],
   };
   const realOn = process.on;
@@ -125,6 +125,10 @@ vi.mock('../../src/bot/internalSetup/utils/maintenance', () => ({
 }));
 vi.mock('../../src/bot/internalSetup/utils/maintenanceGate', () => ({ isMaintenanceGateClosed: () => h.gateClosed }));
 vi.mock('../../src/bot/internalSetup/utils/dataBackends/postgresBackend', () => ({ PostgresBackend: class {} }));
+vi.mock('../../src/bot/internalSetup/utils/dataBackends/mainDatabase', () => ({
+  stopMainWatch: () => { h.calls.stopMainWatch += 1; },
+  noteShardReconnect: () => undefined,
+}));
 
 import '../../src/bot/internalSetup/clientInitializer';
 
@@ -141,10 +145,10 @@ function resetCalls() {
 }
 
 describe('the stop steps main() adds (tests run in order: during the boot, then after it)', () => {
-  it('during the boot, before the metrics start: one stop step and two release steps (NB7\'s answer writes, then the claims), added with no signal listener of its own', async () => {
+  it('during the boot, before the metrics start: one stop step and three release steps (the watch\'s stop, NB7\'s answer writes, then the claims), added with no signal listener of its own', async () => {
     await vi.waitFor(() => expect(h.stopSteps).toHaveLength(1));
     expect(h.ingestStarted).toBe(false);
-    expect(h.releaseSteps).toHaveLength(2);
+    expect(h.releaseSteps).toHaveLength(3);
     expect(h.signals.get('SIGTERM') ?? []).toHaveLength(0);
     expect(h.signals.get('SIGINT') ?? []).toHaveLength(0);
   });
@@ -157,9 +161,11 @@ describe('the stop steps main() adds (tests run in order: during the boot, then 
     expect(h.calls).toMatchObject({ beginStop: 1, stopSamplers: 0, flushTotals: 0, finishStop: 0 });
     expect(h.closes).toEqual(['shutting down']);
     await h.releaseSteps[0]();
-    expect(h.calls).toMatchObject({ beginStop: 1, stopSamplers: 0, flushTotals: 0, finishStop: 0 });
+    expect(h.calls).toMatchObject({ stopMainWatch: 1, finishStop: 0 });
     await h.releaseSteps[1]();
-    expect(h.calls).toMatchObject({ beginStop: 1, stopSamplers: 0, flushTotals: 0, finishStop: 1 });
+    expect(h.calls).toMatchObject({ beginStop: 1, stopSamplers: 0, flushTotals: 0, finishStop: 0, stopMainWatch: 1 });
+    await h.releaseSteps[2]();
+    expect(h.calls).toMatchObject({ beginStop: 1, stopSamplers: 0, flushTotals: 0, finishStop: 1, stopMainWatch: 1 });
   });
 
   it('after the boot: the samplers stop, the totals flush while the maintenance gate is open and not while it is closed', async () => {

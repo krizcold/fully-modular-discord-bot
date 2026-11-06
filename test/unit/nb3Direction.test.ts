@@ -147,7 +147,7 @@ describe("S0's order", () => {
     const answer = await service.post({ jobId: 'job-dir-0006', to: 'postgres' });
     await service.idle();
     const error = answer.body.success === false ? answer.body.error : service.status().body.job.error;
-    expect(error).toMatch(/one address/);
+    expect(error).toMatch(/^DATA_BACKEND_URL lists 2 database addresses .*a migration needs one database address/);
   });
 });
 

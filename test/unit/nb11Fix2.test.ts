@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { FenceToken, RestoreOutcome, RetireOutcome } from '../../src/bot/internalSetup/utils/dataBackends/backend';
 import { initDataReadiness, type DataReadinessDriver } from '../../src/bot/internalSetup/utils/dataBackends/dataReadiness';
 import { PostgresBackend } from '../../src/bot/internalSetup/utils/dataBackends/postgresBackend';
+import { fixedDatabase } from '../helpers/fixedDatabase';
 import { initWorkingSet, type WorkingSetManager } from '../../src/bot/internalSetup/utils/dataBackends/workingSet';
 import { deleteGuildNamespace, restoreGuildFromGraveyard, setGuildDataBackend, setOwnerInfoProvider } from '../../src/bot/internalSetup/utils/dataManager';
 import { applyOperatorDataWrite } from '../../src/bot/internalSetup/utils/ipcDataHandler';
@@ -25,7 +26,7 @@ class ScriptedStore extends FakeStore {
   restoreCalls = 0;
   retireCalls = 0;
   override async restoreGuild(): Promise<RestoreOutcome> { this.restoreCalls++; return { ok: false, reason: 'no-entry' }; }
-  override async retireGuild(): Promise<RetireOutcome> { this.retireCalls++; return { ok: true, moved: 1 }; }
+  override async retireGuild(): Promise<RetireOutcome> { this.retireCalls++; return { ok: true, moved: 1, retiredAt: 5 }; }
 }
 
 let drivers: DataReadinessDriver[] = [];
@@ -52,7 +53,7 @@ async function readyGuild(ws: WorkingSetManager): Promise<string> {
 const deleteRequest = (guildId: string) => ({ guildId, module: '', filename: '', op: 'delete-namespace' as const });
 
 function realBackend(): { backend: PostgresBackend; connect: ReturnType<typeof vi.fn> } {
-  const backend = new PostgresBackend({ url: 'postgres://nobody@127.0.0.1:9/none' });
+  const backend = new PostgresBackend(fixedDatabase('postgres://nobody@127.0.0.1:9/none'));
   backends.push(backend);
   const internals = backend as unknown as { state: string; provisioned: boolean };
   internals.state = 'ready';
@@ -148,10 +149,13 @@ describe('the real restore and retire with less than the statement floor left', 
   });
 
   it('with time left, both connect', async () => {
-    const { backend, connect } = realBackend();
-    expect((await backend.restoreGuild('1', 5, token, () => null, monoIn(40 * SECOND))).ok).toBe(false);
-    expect((await backend.retireGuild('1', 'test', token, monoIn(40 * SECOND))).ok).toBe(false);
-    expect(connect).toHaveBeenCalledTimes(2);
+    // NB5 decision 13: the failed connect starts the hold, which refuses the next call, so each runs on its own backend.
+    const restoring = realBackend();
+    expect((await restoring.backend.restoreGuild('1', 5, token, () => null, monoIn(40 * SECOND))).ok).toBe(false);
+    expect(restoring.connect).toHaveBeenCalledTimes(1);
+    const retiring = realBackend();
+    expect((await retiring.backend.retireGuild('1', 'test', token, monoIn(40 * SECOND))).ok).toBe(false);
+    expect(retiring.connect).toHaveBeenCalledTimes(1);
   });
 });
 

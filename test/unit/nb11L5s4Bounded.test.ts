@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { FenceToken, RestoreOutcome } from '../../src/bot/internalSetup/utils/dataBackends/backend';
 import { PostgresBackend } from '../../src/bot/internalSetup/utils/dataBackends/postgresBackend';
+import { fixedDatabase } from '../helpers/fixedDatabase';
 
 // NB11 (wip-redesign/sheets/NB11.md): the bounded retire and restore transactions on Postgres, over a small in-memory
 // stand-in for the tables they touch and a clock the test moves, so each floor is hit to the millisecond.
@@ -39,7 +40,7 @@ const copy = (t: Tables): Tables => ({
  * or answer instead.
  */
 function rig(opts: { foreignOwner?: { nodeId: string; claim: number }; hook?: (sql: string) => Error | void; onConnect?: () => void } = {}) {
-  const backend = new PostgresBackend({ url: 'postgres://nobody@127.0.0.1:9/none' });
+  const backend = new PostgresBackend(fixedDatabase('postgres://nobody@127.0.0.1:9/none'));
   const internals = backend as unknown as { state: string; provisioned: boolean };
   internals.state = 'ready';
   internals.provisioned = true;
@@ -179,7 +180,7 @@ describe('retireGuild on Postgres', () => {
     const r = rig();
     r.seed(seedLive);
     const outcome = await r.backend.retireGuild(G, 'webui-operator-delete', token, deadlineIn(40_000));
-    expect(outcome).toEqual({ ok: true, moved: 3 });
+    expect(outcome).toEqual({ ok: true, moved: 3, retiredAt: expect.any(Number) });
     const t = r.tables();
     expect(t.data.filter(x => x.guild === G)).toEqual([]);
     expect(t.append.filter(x => x.guild === G)).toEqual([]);
@@ -221,7 +222,7 @@ describe('retireGuild on Postgres', () => {
     const r = rig({ hook: sql => { if (sql.startsWith('UPDATE smdb_data.guild_ownership SET retired_at')) advance(3_000); } });
     r.seed(seedLive);
     const outcome = await r.backend.retireGuild(G, 'webui-operator-delete', token, deadlineIn(5_000));
-    expect(outcome).toEqual({ ok: true, moved: 3 });
+    expect(outcome).toEqual({ ok: true, moved: 3, retiredAt: expect.any(Number) });
     expect(r.statements.at(-1)).toBe('COMMIT');
     expect(r.tables().data.filter(x => x.guild === G)).toEqual([]);
   });
@@ -275,15 +276,24 @@ describe('restoreGuild on Postgres', () => {
     expect(r.tables().grave.map(x => x.retiredAt)).toEqual([2_000]);
   });
 
-  it('a deposed restore names the current owner, rolls back before pooling the client, and counts as an answer', async () => {
+  it('a deposed restore names the current owner and rolls back before pooling the client', async () => {
     const r = rig({ foreignOwner: { nodeId: 'node-b', claim: 9 } });
     r.seed(t => seedGrave(t, 2_000, 'webui-operator-delete', { 'a.json': '{"a":1}' }));
-    r.internals.state = 'outage';
     const outcome = await r.backend.restoreGuild(G, null, token, never, deadlineIn(40_000));
     expect(outcome).toEqual({ ok: false, reason: 'deposed', currentOwner: { nodeId: 'node-b', claim: 9 } });
     expect(r.statements).toContain('ROLLBACK');
     expect(noOpenTransactionReturned(r.releases)).toBe(true);
     expect(r.backend.connectionState().state).toBe('ready');
+    expect(r.tables().grave).toHaveLength(1);
+  });
+
+  it('during the hold the restore is refused with nothing sent (NB5 decision 13, G12)', async () => {
+    const r = rig();
+    r.seed(t => seedGrave(t, 2_000, 'webui-operator-delete', { 'a.json': '{"a":1}' }));
+    r.internals.state = 'outage';
+    const outcome = await r.backend.restoreGuild(G, null, token, never, deadlineIn(40_000));
+    expect(outcome).toMatchObject({ ok: false, reason: 'held' });
+    expect(r.statements).toEqual([]);
     expect(r.tables().grave).toHaveLength(1);
   });
 
@@ -293,9 +303,8 @@ describe('restoreGuild on Postgres', () => {
     expect(outcome).toEqual({ ok: false, reason: 'no-entry' });
   });
 
-  it('a no-entry answer the database gave during an outage counts as an answer and ends the outage', async () => {
+  it('a no-entry answer the database gave rolls back', async () => {
     const r = rig();
-    r.internals.state = 'outage';
     const outcome = await r.backend.restoreGuild(G, null, token, never, deadlineIn(40_000));
     expect(outcome).toEqual({ ok: false, reason: 'no-entry' });
     expect(r.statements.at(-1)).toBe('ROLLBACK');
@@ -320,20 +329,18 @@ describe('restoreGuild on Postgres', () => {
     expect(r.releases).toEqual([{ destroy: undefined, openTransaction: false }]);
   });
 
-  it('a statement that timed out during an outage leaves the backend in outage', async () => {
+  it('a statement that timed out at the deadline starts no hold (NB5 I5)', async () => {
     const r = rig({ hook: sql => (/AS present$/.test(sql) ? new Error('Query read timeout') : undefined) });
     r.seed(t => seedGrave(t, 2_000, 'webui-operator-delete', { 'a.json': '{"a":1}' }));
-    r.internals.state = 'outage';
     const outcome: RestoreOutcome = await r.backend.restoreGuild(G, null, token, never, deadlineIn(40_000));
     expect(outcome).toMatchObject({ ok: false, reason: 'unavailable', timedOut: true });
-    expect(r.backend.connectionState().state).toBe('outage');
+    expect(r.backend.connectionState().state).toBe('ready');
     expect(r.tables().grave).toHaveLength(1);
   });
 
-  it('a statement the database refused during an outage counts as an answer and ends the outage', async () => {
+  it('a statement the database refused is an answer and starts no hold', async () => {
     const r = rig({ hook: sql => (sql.startsWith('WITH moved AS') ? pgError('23505', 'duplicate key value violates unique constraint') : undefined) });
     r.seed(t => seedGrave(t, 2_000, 'webui-operator-delete', { 'a.json': '{"a":1}' }));
-    r.internals.state = 'outage';
     const outcome = await r.backend.restoreGuild(G, null, token, never, deadlineIn(40_000));
     expect(outcome).toMatchObject({ ok: false, reason: 'refused', code: '23505' });
     expect(r.backend.connectionState().state).toBe('ready');

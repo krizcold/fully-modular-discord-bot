@@ -70,12 +70,14 @@ describe('an English ERROR in class 53, 58 or XX is an answer', () => {
     expect(lines().some(line => line.includes('connection failed'))).toBe(false);
   });
 
-  it.each(answered)('%s on COMMIT: the restore and the retire are refused, the backend stays ready', async (_name, make) => {
+  // NB5 D8 and G2: a COMMIT error is refused only when it shows a rollback, which class 53 and XX at ERROR do not.
+  const onCommit: Record<string, 'refused' | 'unknown'> = { XX000: 'unknown', 58030: 'refused', 53100: 'unknown', 53200: 'unknown' };
+  it.each(answered)('%s on COMMIT: the restore and the retire answer as D8 rules, the backend stays ready', async (_name, make) => {
     const restored = scripted(happy(sql => (isCommit(sql) ? make() : null)));
-    expect(await restore(restored.backend)).toMatchObject({ ok: false, reason: 'refused', code: make().code });
+    expect(await restore(restored.backend)).toMatchObject({ ok: false, reason: onCommit[make().code] });
     expect(restored.backend.connectionState().state).toBe('ready');
     const retired = scripted(retireAnswers(sql => (isCommit(sql) ? make() : null)));
-    expect(await retire(retired.backend)).toMatchObject({ ok: false, reason: 'refused' });
+    expect(await retire(retired.backend)).toMatchObject({ ok: false, reason: onCommit[make().code] });
     expect(retired.backend.connectionState().state).toBe('ready');
   });
 
@@ -99,12 +101,11 @@ describe('the outage line of a flush', () => {
     ['53100', 'ERROR', 'could not extend file'],
     ['XX001', 'ERROR', 'invalid page in block 12'],
     ['58030', 'ERROR', 'could not read block 12'],
-  ])('ERROR %s names the SQLSTATE and does not say the connection failed', async (code, severity, message) => {
+  ])('ERROR %s is an answer: no hold and no outage line (NB5 decision 13)', async (code, severity, message) => {
     const { backend } = scripted(sql => (isFenced(sql) ? serverError(code, severity, message) : undefined));
-    await backend.flushGuild('1', emptyBatch, token);
-    const said = lines();
-    expect(said.some(line => line.startsWith(`[PostgresBackend] Database operation failed (SQLSTATE ${code}); entering outage:`))).toBe(true);
-    expect(said.some(line => line.includes('connection failed'))).toBe(false);
+    expect(await backend.flushGuild('1', emptyBatch, token)).toMatchObject({ ok: false, reason: 'unavailable', code });
+    expect(lines().some(line => line.includes('entering outage'))).toBe(false);
+    expect(backend.connectionState().state).toBe('ready');
   });
 
   it.each([

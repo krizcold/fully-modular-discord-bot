@@ -20,8 +20,10 @@ import {
 } from '../../../utils/envLoader';
 import { flushAll, queuedFilePaths } from './dataBackends/fileBackend';
 import { commitMayHaveLanded, isLoginRefused, provisionStoreInTransaction } from './dataBackends/postgresBackend';
+import { ownerChannelFromFile, ownerChannelOf, type OwnerChannelValue } from './dataBackends/mainDatabase';
 import { isGuildDataPath } from './dataManager';
 import { shortLivedClient } from './pgClient';
+import { checkAddressList, normalizeAddress, parseAddressList, pgConfig, showAddress } from '../../../utils/databaseAddress';
 import { getNodeId } from '../fleet/nodeIdentity';
 
 const LOCK_TIMEOUT_MS = 15_000;
@@ -46,7 +48,34 @@ const GUILD_TABLES = 'smdb_data.guild_data, smdb_data.guild_append, smdb_data.gu
 const OLD_STORE_NOT_RETIRED = 'The old store was not retired; nothing was switched';
 const ENV_UNFINISHED = 'The switch is made; run the migration again to finish the env';
 const LOGIN_REFUSED = "The database refused the bot's login";
-const ADDRESS_LIST = 'DATA_BACKEND_URL must be one address; a list of addresses is refused until the address picker exists';
+const OWNER_CHANNEL_NAME = 'owner-channel.json';
+const OWNER_CHANNEL_WAIT_MS = 20_000;
+const OWNER_CHANNEL_SQL = "SELECT value FROM smdb_data.meta WHERE key = 'owner_channel'";
+const OWNER_CHANNEL_DELETE = "DELETE FROM smdb_data.meta WHERE key = 'owner_channel'";
+const OWNER_CHANNEL_UPSERT = "INSERT INTO smdb_data.meta (key, value) VALUES ('owner_channel', $1) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()";
+
+/** The owner channel row of a session's smdb_data (decision 23's rules); a missing meta table is none. */
+async function ownerChannelRow(session: PgSession): Promise<OwnerChannelValue> {
+  try {
+    const rows = (await session.query(OWNER_CHANNEL_SQL)).rows;
+    return rows.length === 0 ? { kind: 'none' } : ownerChannelOf(rows[0].value);
+  } catch (error) {
+    const code = (error as { code?: string })?.code;
+    if (code === '42P01' || code === '3F000') return { kind: 'none' };
+    throw error;
+  }
+}
+
+const sameChannel = (a: OwnerChannelValue, b: OwnerChannelValue) =>
+  a.kind === b.kind && (a.kind !== 'id' || a.id === (b as { id: string }).id);
+/** Decision 16's refusal of a list; an empty entry is named by decision 18's check, not counted as a live copy. */
+function addressListText(url: string): string {
+  if (parseAddressList(url).some(entry => entry.raw === '')) {
+    const named = checkAddressList(url);
+    if (named !== null) return named;
+  }
+  return `DATA_BACKEND_URL lists ${url.trim().split(/\s*,\s*|\s+/).length} database addresses (live copies on other machines); a migration needs one database address, so remove the live copies first`;
+}
 
 export const JOB_ID = /^[A-Za-z0-9-]{8,40}$/;
 
@@ -61,6 +90,8 @@ export interface MigrationHost {
   releaseMigrationLock(): void;
   migrationRunning(): RunningMigration | null;
   migrationBotState(): { ok: true } | { ok: false; error: string };
+  /** No owner channel setting write is in flight (NB5 decision 16): S3 waits for it before S4 reads. */
+  ownerChannelWriteSettled(): boolean;
 }
 
 export interface PgSession {
@@ -85,6 +116,8 @@ export interface ServiceOptions {
   secondLookMs?: number;
   /** How long the probe of a silent job session may take (default 2 s). */
   probeBoundMs?: number;
+  /** How long S3 waits for an owner channel setting write in flight (default 20 s). */
+  ownerChannelWaitMs?: number;
 }
 
 export interface MigrationAnswer {
@@ -126,23 +159,13 @@ export function isAddressList(url: string): boolean {
   return url.includes(',') || /\s/.test(url.trim());
 }
 
-/** host lowercased, port 5432 when absent, the database name without a trailing slash; no user, password or parameters. */
-export function normalizeAddress(url: string): JournalAddress {
-  const parsed = new URL(url);
-  return {
-    host: parsed.hostname.toLowerCase(),
-    port: parsed.port ? Number(parsed.port) : 5432,
-    database: decodeURIComponent(parsed.pathname.replace(/^\/+/, '').replace(/\/+$/, '')),
-  };
-}
+export { normalizeAddress };
 
 export function sameAddress(a: JournalAddress | null | undefined, b: JournalAddress | null | undefined): boolean {
   if (!a || !b) return false;
   return a.host.toLowerCase() === b.host.toLowerCase() && Number(a.port || 5432) === Number(b.port || 5432)
     && a.database.replace(/\/+$/, '') === b.database.replace(/\/+$/, '');
 }
-
-const showAddress = (a: JournalAddress | null | undefined) => (a ? `${a.host}:${a.port}/${a.database}` : 'an unknown address');
 
 /** `20261029T012345678Z-<jobId>`: the UTC time with ms and no colon. */
 export function supersededName(jobId: string, at: Date = new Date()): string {
@@ -197,6 +220,7 @@ function jobView(journal: MigrationJournal, state: string, stage: MigrationStage
     ...(journal.to === 'postgres' && journal.destination ? { destination: journal.destination } : {}),
     ...(journal.envSwitched !== undefined ? { envSwitched: journal.envSwitched } : {}),
     ...(journal.leftOut?.length ? { leftOut: journal.leftOut } : {}),
+    ...(journal.notes?.length ? { notes: journal.notes } : {}),
     ...(journal.shadow?.length ? { shadow: journal.shadow } : {}),
     ...(journal.closedTails?.length ? { closedTails: journal.closedTails } : {}),
     ...(error ? { error } : {}),
@@ -570,6 +594,7 @@ export async function placeStaged(root: string, staging: string, superseded: str
   for (const name of await fs.promises.readdir(root)) {
     const full = path.join(root, name);
     if (/^\d+$/.test(name) && (await fs.promises.lstat(full)).isDirectory()) stale.push([full, path.join(superseded, name)]);
+    if (name === OWNER_CHANNEL_NAME) stale.push([full, path.join(superseded, name)]);
   }
   const graveRoot = path.join(root, '_graveyard');
   if (fs.existsSync(graveRoot)) {
@@ -631,12 +656,12 @@ export async function openJobSession(url: string, application: string, kind: 'jo
     ? `-c statement_timeout=${PROBE_BOUND_MS} -c idle_in_transaction_session_timeout=${PROBE_BOUND_MS} -c lock_timeout=${PROBE_BOUND_MS}`
     : `-c statement_timeout=0 -c idle_in_transaction_session_timeout=0 -c lock_timeout=${lockTimeoutMs}`;
   const client = shortLivedClient({
-    connectionString: url,
     application_name: application,
     options: `${KEEPALIVES} ${timeouts}`,
     connectionTimeoutMillis: probe ? PROBE_BOUND_MS : CONNECT_TIMEOUT_MS,
     keepAlive: true,
     keepAliveInitialDelayMillis: CLIENT_KEEPALIVE_MS,
+    ...pgConfig(url),
   });
   try {
     await client.connect();
@@ -1386,7 +1411,7 @@ export class MigrationService {
     const refuse = (error: string, extra: Record<string, unknown> = {}): MigrationAnswer => ({ status: 409, body: { success: false, error, ...extra } });
     const facts = readDataFacts();
     if (!facts.ok) return refuse(facts.reason);
-    if (url !== undefined && isAddressList(url)) return refuse(ADDRESS_LIST);
+    if (url !== undefined && isAddressList(url)) return refuse(addressListText(url));
     const earlier = facts.journal;
     const marker = facts.marker;
     if (earlier && earlier.to === to) {
@@ -1802,7 +1827,7 @@ export class MigrationService {
     const fromRequest = to === 'postgres' && reqUrl !== undefined;
     const pgUrl = ((fromRequest ? reqUrl : undefined) ?? loadCredentials().DATA_BACKEND_URL ?? '').trim();
     if (!pgUrl) throw new Refusal('DATA_BACKEND_URL is not set, so the database is unknown');
-    if (isAddressList(pgUrl)) throw new Refusal(ADDRESS_LIST);
+    if (isAddressList(pgUrl)) throw new Refusal(addressListText(pgUrl));
     let address: JournalAddress;
     try {
       address = normalizeAddress(pgUrl);
@@ -1856,6 +1881,7 @@ export class MigrationService {
     // S3: the drain, and an earlier run's staging folder aside.
     stage('draining');
     await this.fault('S3');
+    await this.waitOwnerChannelWrite();
     const stuck = await drainGuildWrites();
     if (stuck.length > 0) throw new Refusal(`Guild writes of the web UI are still queued and could not be written: ${stuck.join(', ')}`);
     await moveEarlierStaging(DATA_ROOT, ctx.superseded);
@@ -1864,8 +1890,10 @@ export class MigrationService {
     stage('reading');
     await this.fault('S4');
     let tally: Tally;
+    let channel: OwnerChannelValue;
     if (from === 'file') {
       tally = await tallySource(jsonReader(DATA_ROOT));
+      channel = ownerChannelFromFile(path.join(DATA_ROOT, OWNER_CHANNEL_NAME));
     } else {
       await main.query('BEGIN ISOLATION LEVEL REPEATABLE READ');
       ctx.mainTx = true;
@@ -1874,11 +1902,16 @@ export class MigrationService {
       const again = await readMetaStoreId(main, 'smdb_data');
       if (again !== ctx.j.sourceStoreId) throw new Refusal(`The database's store changed to ${again ?? 'none'} since the first check (${ctx.j.sourceStoreId})`);
       tally = await tallySource(pgReader(main));
+      channel = await ownerChannelRow(main);
     }
     const counts = tally.counts;
+    const notes = channel.kind === 'unreadable'
+      ? [`The owner messages channel setting could not be read (${channel.cause}), so it was not copied; owner messages go to the owner's DMs until it is set again in the web panel`]
+      : [];
+    const copiedChannel: OwnerChannelValue = channel.kind === 'id' ? channel : { kind: 'none' };
 
     // S5: the copy, fed guild by guild.
-    stage('copying', { counts, ...(to === 'postgres' ? { destination: address } : {}), leftOut: tally.leftOut, closedTails: tally.closedTails });
+    stage('copying', { counts, ...(to === 'postgres' ? { destination: address } : {}), leftOut: tally.leftOut, closedTails: tally.closedTails, ...(notes.length > 0 ? { notes } : {}) });
     for (const tail of tally.closedTails) {
       console.warn(`[Migration] The stream ${tail} did not end in a newline; it was copied with one added, so its last line stays a line of its own`);
     }
@@ -1901,6 +1934,8 @@ export class MigrationService {
         await main.query(`ALTER SCHEMA smdb_data RENAME TO smdb_superseded_${Date.now()}`);
       }
       await provisionStoreInTransaction(main);
+      if (copiedChannel.kind === 'id') await main.query(OWNER_CHANNEL_UPSERT, [JSON.stringify(copiedChannel.id)]);
+      else await main.query(OWNER_CHANNEL_DELETE);
       const creds = loadCredentials();
       const shardCount = Number.parseInt(creds.FLEET_SHARD_COUNT ?? '', 10);
       await jsonReader(DATA_ROOT)(part => writePgItems(main, part));
@@ -1910,6 +1945,7 @@ export class MigrationService {
       ctx.staging = staging;
       await fs.promises.mkdir(staging, { recursive: true });
       await pgReader(main)(part => stageSnapshot(part, staging));
+      if (copiedChannel.kind === 'id') await writeSynced(path.join(staging, OWNER_CHANNEL_NAME), JSON.stringify({ channelId: copiedChannel.id }));
     }
 
     // S6: the read-back of the destination.
@@ -1920,25 +1956,35 @@ export class MigrationService {
       compareHashes(tally.copied, back.hashes, 'The copy in the database');
       compareGraves(tally.graves, back.graves, 'The copy in the database');
       if ([...back.owners].sort().join(',') !== [...tally.guilds].sort().join(',')) throw new Error('The copy in the database has other ownership rows than the guilds copied');
+      if (!sameChannel(await ownerChannelRow(main), copiedChannel)) throw new Error('The owner messages channel in the copy differs from the source');
     } else {
       const back = await tallySource(jsonReader(ctx.staging!));
       compareHashes(tally.copied, back.copied, 'The staged copy');
       compareGraves(tally.graves, back.graves, 'The staged copy');
+      if (!sameChannel(ownerChannelFromFile(path.join(ctx.staging!, OWNER_CHANNEL_NAME)), copiedChannel)) throw new Error('The owner messages channel in the copy differs from the source');
     }
 
     // S7: the source read again.
     stage('rereading');
     await this.fault('S7');
+    const channelAgainDiffers = (again: OwnerChannelValue) => {
+      if (!sameChannel(again, channel) || (again.kind === 'unreadable' && channel.kind === 'unreadable' && again.cause !== channel.cause)) {
+        throw new Error('The owner messages channel in the source read a second time differs from the source');
+      }
+    };
     if (from === 'file') {
       compareHashes(tally.all, (await tallySource(jsonReader(DATA_ROOT))).all, 'The source read a second time');
+      channelAgainDiffers(ownerChannelFromFile(path.join(DATA_ROOT, OWNER_CHANNEL_NAME)));
     } else {
       const second = await this.connect(pgUrl, app, 'job');
       try {
         await this.configure(second);
         await second.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
         const again = await tallySource(pgReader(second));
+        const channelAgain = await ownerChannelRow(second);
         await second.query('ROLLBACK');
         compareHashes(tally.all, again.all, 'The source read a second time');
+        channelAgainDiffers(channelAgain);
       } finally {
         await closeSession(second, this.closeBound());
       }
@@ -2000,7 +2046,17 @@ export class MigrationService {
       console.error(`[Migration] Migration ${jobId} is done, but its journal's done could not be written: ${message(error)}`);
     }
     console.log(`[Migration] Migration ${jobId} (--to ${to}) is done: ${counts.documents} documents, ${counts.appendFiles} streams, ${counts.graveyardEntries} graveyard entries`
-      + (tally.leftOut.length > 0 ? `; left out: ${tally.leftOut.join(', ')}` : ''));
+      + (tally.leftOut.length > 0 ? `; left out: ${tally.leftOut.join(', ')}` : '')
+      + (notes.length > 0 ? `; ${notes.join('; ')}` : ''));
+  }
+
+  /** S3 waits, at most 20 s, until no owner channel setting write is in flight (NB5 decision 16). */
+  private async waitOwnerChannelWrite(): Promise<void> {
+    const until = Date.now() + (this.opts.ownerChannelWaitMs ?? OWNER_CHANNEL_WAIT_MS);
+    while (!this.host.ownerChannelWriteSettled()) {
+      if (Date.now() >= until) throw new Refusal('An owner messages channel change is still being saved; run the migration once it ends');
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
   }
 }
 

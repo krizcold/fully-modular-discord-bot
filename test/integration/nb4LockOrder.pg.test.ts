@@ -3,6 +3,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vites
 import { startClaimRig, type ClaimRig } from '../helpers/pgClaimRig';
 import type { FenceToken } from '../../src/bot/internalSetup/utils/dataBackends/backend';
 import { PostgresBackend } from '../../src/bot/internalSetup/utils/dataBackends/postgresBackend';
+import { fixedDatabase } from '../helpers/fixedDatabase';
 
 // NB4 decision 8 and invariant 2 (R2-LOCKCOPY): the production flush's first statement orders an old holder's save and
 // a new holder's stamp on the guild's ownership row lock, in both orders, and through an insert not committed yet.
@@ -17,7 +18,7 @@ let letCommit: (() => void) | null = null;
 
 beforeAll(async () => {
   rig = await startClaimRig();
-  aBackend = new PostgresBackend({ url: rig.url });
+  aBackend = new PostgresBackend(fixedDatabase(rig.url));
   aBackend.start();
   const until = Date.now() + 60_000;
   while (aBackend.connectionState().state !== 'ready' && Date.now() < until) await new Promise(resolve => { setTimeout(resolve, 100); });

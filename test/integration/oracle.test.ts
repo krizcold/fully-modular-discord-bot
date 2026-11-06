@@ -12,6 +12,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { GuildRequestSweep } from '../../src/bot/internalSetup/fleet/guildRequests';
 import type { FenceToken, GuildFlushBatch } from '../../src/bot/internalSetup/utils/dataBackends/backend';
 import { PostgresBackend } from '../../src/bot/internalSetup/utils/dataBackends/postgresBackend';
+import { fixedDatabase } from '../helpers/fixedDatabase';
 import type { DataWriteReply, GuildDataWriteRequest } from '../../src/bot/internalSetup/utils/ipcDataHandler';
 import { setBackendKind } from '../helpers/backendKind';
 import { endPool } from '../helpers/endPool';
@@ -809,7 +810,7 @@ describe('NB7 test 12: changes sent to the machine that runs the guild, its hold
   beforeAll(async () => {
     await pool.query(`CREATE DATABASE ${L6}`);
     url = container.getConnectionUri().replace(/\/[^/]*$/, `/${L6}`);
-    backend = new PostgresBackend({ url });
+    backend = new PostgresBackend(fixedDatabase(url));
     backend.start();
     expect(await waitFor(() => backend.connectionState().state === 'ready', 60_000)).toBe(true);
     await poolOf(1).query(`INSERT INTO smdb_data.meta (key, value) VALUES ('shard_count', '{"count":2}') ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`);
@@ -884,7 +885,7 @@ describe('NB7 test 12: changes sent to the machine that runs the guild, its hold
     const requests: Requests = await import('../../src/webui/utils/guildRequests');
     // vi.resetModules keeps mocked modules, so envLoader's mock still reads the backendKind loaded before the reset.
     setBackendKind('postgres');
-    (await import('../../src/webui/utils/webuiDataReader')).setWebuiDataStoreUrl(url);
+    (await import('../../src/webui/utils/webuiDataReader')).setWebuiDataStoreUrl({ url });
     requests._setGuildRequestDeps({ nodeName: () => nodeName, nodeId: () => nodeId });
     const { sendHopReply } = await import('../../src/webui/routes/config');
     return { requests, sendHopReply };

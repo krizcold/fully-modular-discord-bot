@@ -1080,7 +1080,7 @@ export function createConfigRoutes(botManager: BotManager): Router {
 const PENDING_TEXT = 'not confirmed as saved yet; reload in a moment to check';
 
 // The bot commits or renames nothing past 40 s after the send, so a reload at once could show data a late delete removes.
-const GUILD_DELETE_MINUTE = 'Within a minute, `smdb graveyard list` lists a new entry for this server if it was deleted; if no new entry is listed by then, it was not.';
+const GUILD_DELETE_MINUTE = 'Within a minute, `smdb graveyard list` lists a new entry for this server if it was deleted (on a database, an entry with the reason webui-operator-delete); if no such entry is listed by then, it was not. The list reads the data of the bot behind the web panel it asks; if the main database was replaced meanwhile, check once that bot runs on the new main.';
 
 function noAnswerReplyText(cause: unknown, what: 'write' | 'delete' | 'guild-delete'): string {
   const text = noAnswerText(cause, what);

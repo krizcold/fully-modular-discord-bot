@@ -1,6 +1,7 @@
 import { vi } from 'vitest';
 
 import { PostgresBackend } from '../../src/bot/internalSetup/utils/dataBackends/postgresBackend';
+import { fixedDatabase } from './fixedDatabase';
 
 export type Answer = { rows?: unknown[]; rowCount?: number } | Error | 'hang' | undefined;
 type Late = Promise<Exclude<Answer, 'hang'>>;
@@ -32,7 +33,7 @@ export function batchExistsAnswer(sql: string, found: boolean): Answer {
  * passes and leaves the client busy. A statement queued behind a busy client is never sent.
  */
 export function scriptedPg(answer: (sql: string) => Answer | Late, onConnect?: () => void) {
-  const backend = new PostgresBackend({ url: 'postgres://nobody@127.0.0.1:9/none' });
+  const backend = new PostgresBackend(fixedDatabase('postgres://nobody@127.0.0.1:9/none'));
   const internals = backend as unknown as { state: string; provisioned: boolean };
   internals.state = 'ready';
   internals.provisioned = true;

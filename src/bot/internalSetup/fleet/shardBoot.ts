@@ -8,7 +8,9 @@ import { cleanOrphanTmpFiles, setGuildViewCache } from '../utils/dataBackends/fi
 import { isMaintenanceGateClosed } from '../utils/maintenanceGate';
 import { canRestart, leaveRestartAsked, maintenanceUnfit, noteClaimsLapsed, restartForShards, startLeave } from '../utils/maintenance';
 import { setStoppedServingHook } from '../utils/servingGate';
-import { loadCredentials, resolveDataBackend, shardCapacity, shardReturnEnabled, takeoverSeconds } from '../../../utils/envLoader';
+import { resolveDataBackend, shardCapacity, shardReturnEnabled, takeoverSeconds } from '../../../utils/envLoader';
+import { showEntry } from '../../../utils/databaseAddress';
+import { moveTargetGeneration, setStepLayers } from '../utils/dataBackends/mainDatabase';
 import { IdentifyLedger } from './identifyLedger';
 import { LeaseRuntime } from './leaseRuntime';
 import { getAppVersion, getNodeId, getNodeName } from './nodeIdentity';
@@ -165,9 +167,16 @@ async function runBoot(): Promise<ShardBootContext> {
   const timings = claimTimings(settings.takeoverSeconds);
   const processId = randomUUID();
   const backend = getGuildDataBackend();
-  const url = (loadCredentials().DATA_BACKEND_URL || '').trim();
-  const onRefused = () => { if (backend instanceof PostgresBackend) backend.notifyLoginRefused(); };
-  const store = storeFactory ? storeFactory(url, timings, onRefused) : new ClaimStore(url, timings, onRefused);
+  const pg = backend instanceof PostgresBackend ? backend : null;
+  // NB5 C5 (a): in the run after the verdict, the claims follow the chosen entry, or no store is built while latched.
+  if (pg && pg.connectionState().state === 'latched') {
+    console.error(`[Shards] This bot process stopped writing to its database before it took shards (${pg.latchReason() ?? 'no cause recorded'}), so it connects no shard to Discord`);
+    return noShards();
+  }
+  const entry = pg?.chosenEntry() ?? '';
+  const onRefused = () => { if (pg) pg.notifyLoginRefused(); };
+  const store = storeFactory ? storeFactory(entry, timings, onRefused) : new ClaimStore(entry, timings, onRefused);
+  pg?.onDatabaseChanged(next => store.retarget?.(next));
   const fitness = (): string | null => {
     if (getDataBootStatus().state !== 'serving') return 'the data layer does not serve';
     const maintenance = maintenanceUnfit();
@@ -207,7 +216,10 @@ async function runBoot(): Promise<ShardBootContext> {
     gateClosed: isMaintenanceGateClosed,
     isStopping,
     stopServingStep: () => runtime.stopServing(timings.ttlMs / 3),
-    noteLapsed: noteClaimsLapsed,
+    noteLapsed: seconds => {
+      pg?.noteLapse();
+      noteClaimsLapsed(seconds);
+    },
     noteLost: (lost: Pair[]) => {
       recordLoss(lost);
       startLeave(`Shard ${lost.map(p => p.shardId).join(', ')} ${lost.length > 1 ? 'are' : 'is'} no longer held by this process`);
@@ -232,11 +244,34 @@ async function runBoot(): Promise<ShardBootContext> {
       const shardIds = (servedIds ?? (record?.shardCount === count ? record.shardIds : [])).filter(id => !gone.has(id));
       writeShardRecord({ shardCount: count, shardIds, processId, at: new Date().toISOString(), keptAtStop: keptIds });
     },
+    releaseRefusal: () => pg?.latchReason() ?? null,
+    replaceShardClaim: (shardId, claim) => getWorkingSet()?.replaceShardClaim(shardId, claim),
+    guildsOfShard: shardId => getWorkingSet()?.guildsOfShard(shardId) ?? [],
   });
   claims = shardClaims;
   setStoppedServingHook(() => shardClaims.stoppedServing());
+  if (pg) {
+    setStepLayers({
+      stopServing: reason => shardClaims.stopServingForDatabase(pg.latchReason() ?? reason),
+      claims: async next => shardClaims.moveClaims({ address: showEntry(next), generation: moveTargetGeneration() }),
+      attemptEnded: () => shardClaims.moveAttemptEnded(),
+      holdsShard: (shardId, count) => shardClaims.heldPairs().some(p => p.shardId === shardId && p.shardCount === count),
+      databaseStopWhy: () => shardClaims.databaseStopWhy(),
+    });
+  }
   shardClaims.start();
-  if (!(await shardClaims.firstRenewal())) return never();
+  // NB5 E2: a latch while the boot takes shards ends it with nothing granted.
+  const stoppedByDatabase = (): boolean => {
+    const why = shardClaims.databaseStopWhy();
+    if (why === null) return false;
+    console.error(`[Shards] This bot process stopped writing to its database while it was taking shards (${why}), so it connects no shard to Discord`);
+    return true;
+  };
+  if (!(await shardClaims.firstRenewal())) {
+    if (isStopping()) return never();
+    if (stoppedByDatabase()) return noShards();
+    return never();
+  }
 
   let lastCountLog = -Infinity;
   let tokenRefused = false;
@@ -260,6 +295,7 @@ async function runBoot(): Promise<ShardBootContext> {
   };
   const taken = await shardClaims.bootTake(localCount, () => tokenRefused);
   if (isStopping()) return never();
+  if (stoppedByDatabase()) return noShards();
   if (!taken) {
     if (!tokenRefused) return never();
     await shardClaims.retire();

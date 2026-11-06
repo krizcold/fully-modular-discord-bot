@@ -12,6 +12,7 @@ import type { FenceToken, RestoreOutcome, RetireOutcome } from '../../src/bot/in
 import { initDataReadiness, type DataReadinessDriver } from '../../src/bot/internalSetup/utils/dataBackends/dataReadiness';
 import { restoreGuildDirFromGraveyard } from '../../src/bot/internalSetup/utils/dataBackends/fileBackend';
 import { PostgresBackend } from '../../src/bot/internalSetup/utils/dataBackends/postgresBackend';
+import { fixedDatabase } from '../helpers/fixedDatabase';
 import { initWorkingSet, type WorkingSetManager } from '../../src/bot/internalSetup/utils/dataBackends/workingSet';
 import { deleteGuildNamespace, setGuildDataBackend, setOwnerInfoProvider } from '../../src/bot/internalSetup/utils/dataManager';
 import { applyOperatorDataWrite } from '../../src/bot/internalSetup/utils/ipcDataHandler';
@@ -29,15 +30,15 @@ import { LEASED } from '../helpers/readinessRig';
 
 const SECOND = 1000;
 const token: FenceToken = { nodeId: 'node-a', claim: 7, processId: 'process-a', shardId: 0, shardCount: 1 };
-const unknownText = (g: string, r: number) => `can't confirm whether server ${g} was restored: the database did not confirm the commit. Within a minute, if it was restored, the server's data is back and entry ${r} is gone from \`smdb graveyard list\`; if not, the entry is still listed, unless it had passed the graveyard's keep time (GRAVEYARD_TTL_DAYS, 14 days by default) and the graveyard sweep removed it, data and all.`;
-const DELETE_UNKNOWN = "can't confirm whether this server's data was deleted: the database did not confirm the commit. Within a minute, `smdb graveyard list` lists a new entry for this server if it was deleted; if no new entry is listed by then, it was not.";
+const unknownText = (g: string, r: number) => `can't confirm whether server ${g} was restored: the database did not confirm the commit. Within a minute, if it was restored, the server's data is back and entry ${r} is gone from \`smdb graveyard list\`; if not, the entry is still listed, unless it had passed the graveyard's keep time (GRAVEYARD_TTL_DAYS, 14 days by default) and the graveyard sweep removed it, data and all. The list reads the data of the bot behind the web panel it asks; if the main database was replaced meanwhile, check once that bot runs on the new main.`;
+const DELETE_UNKNOWN = "can't confirm whether this server's data was deleted: the database did not confirm the commit. Within a minute, `smdb graveyard list` lists a new entry for this server with the reason webui-operator-delete if it was deleted; if no such entry is listed by then, it was not. The list reads the data of the bot behind the web panel it asks; if the main database was replaced meanwhile, check once that bot runs on the new main.";
 const DELETE_NO_CLAIM = 'this bot process holds no usable claim on the database; nothing was removed; restart the bot';
 const HOLDER = { role: 'import', pid: 4242 };
 const monoIn = (ms: number) => process.hrtime.bigint() + BigInt(Math.round(ms * 1e6));
 
 class ScriptedStore extends FakeStore {
   restoreImpl: () => Promise<RestoreOutcome> = async () => ({ ok: false, reason: 'no-entry' });
-  retireImpl: () => Promise<RetireOutcome> = async () => ({ ok: true, moved: 1 });
+  retireImpl: () => Promise<RetireOutcome> = async () => ({ ok: true, moved: 1, retiredAt: 5 });
   override async restoreGuild(): Promise<RestoreOutcome> { return this.restoreImpl(); }
   override async retireGuild(): Promise<RetireOutcome> { return this.retireImpl(); }
 }
@@ -110,7 +111,7 @@ describe('a lost writer lock keeps every answer whose outcome may have landed', 
     const g = await readyGuild(ws);
     store.retireImpl = async () => {
       lock.holder = HOLDER;
-      return { ok: false, reason: 'unknown' };
+      return { ok: false, reason: 'unknown', retiredAt: 5, moved: 1 };
     };
     expect(await applyOperatorDataWrite(deleteRequest(g))).toEqual({ ok: false, code: 'backend-unavailable', error: DELETE_UNKNOWN });
   });
@@ -138,7 +139,7 @@ describe('a delete with no usable claim', () => {
   });
 
   it('the real retire answers no-claim before any connection', async () => {
-    const backend = new PostgresBackend({ url: 'postgres://nobody@127.0.0.1:9/none' });
+    const backend = new PostgresBackend(fixedDatabase('postgres://nobody@127.0.0.1:9/none'));
     backends.push(backend);
     (backend as unknown as { state: string }).state = 'ready';
     const connect = vi.fn(async () => { throw new Error('no connection may be opened'); });
@@ -153,7 +154,7 @@ describe('a socket errno is not a SQLSTATE', () => {
   const serverError = (code: string) => Object.assign(new Error('scripted refusal'), { code, severity: 'ERROR' });
 
   function scripted(fail: (sql: string) => Error | null) {
-    const backend = new PostgresBackend({ url: 'postgres://nobody@127.0.0.1:9/none' });
+    const backend = new PostgresBackend(fixedDatabase('postgres://nobody@127.0.0.1:9/none'));
     backends.push(backend);
     const internals = backend as unknown as { state: string; provisioned: boolean };
     internals.state = 'ready';

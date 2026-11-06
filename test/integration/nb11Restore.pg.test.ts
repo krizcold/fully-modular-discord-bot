@@ -4,6 +4,7 @@ import type { Pool } from 'pg';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import type { FenceToken } from '../../src/bot/internalSetup/utils/dataBackends/backend';
 import { PostgresBackend } from '../../src/bot/internalSetup/utils/dataBackends/postgresBackend';
+import { fixedDatabase } from '../helpers/fixedDatabase';
 import { initDataReadiness, type DataReadinessDriver } from '../../src/bot/internalSetup/utils/dataBackends/dataReadiness';
 import { initWorkingSet, type WorkingSetManager } from '../../src/bot/internalSetup/utils/dataBackends/workingSet';
 import { deleteGuildNamespace, guildDataOpOf, saveDataTracked, setGuildDataBackend, setOwnerInfoProvider, loadData } from '../../src/bot/internalSetup/utils/dataManager';
@@ -81,7 +82,7 @@ class Hop {
 const LIVE = (r: number) => `live guild data exists; nothing was restored. To restore entry ${r}, delete this server's data, then restore with retiredAt ${r} before the bot saves anything new for the server; data it saves in between blocks the restore again. While the server's members are active, remove the bot from the server first and add it back after the restore.`;
 const DELETE_TIMEOUT = 'the database did not finish the delete within its 40 s; nothing was removed; try again in a moment';
 const RESTORE_TIMEOUT = "[Data] The database did not answer or ended the connection (the database did not answer within the restore's 40 s); nothing was restored; try again in a moment";
-const UNKNOWN = (g: string, r: number) => `can't confirm whether server ${g} was restored: the database did not confirm the commit. Within a minute, if it was restored, the server's data is back and entry ${r} is gone from \`smdb graveyard list\`; if not, the entry is still listed, unless it had passed the graveyard's keep time (GRAVEYARD_TTL_DAYS, 14 days by default) and the graveyard sweep removed it, data and all.`;
+const UNKNOWN = (g: string, r: number) => `can't confirm whether server ${g} was restored: the database did not confirm the commit. Within a minute, if it was restored, the server's data is back and entry ${r} is gone from \`smdb graveyard list\`; if not, the entry is still listed, unless it had passed the graveyard's keep time (GRAVEYARD_TTL_DAYS, 14 days by default) and the graveyard sweep removed it, data and all. The list reads the data of the bot behind the web panel it asks; if the main database was replaced meanwhile, check once that bot runs on the new main.`;
 const SECOND = 1000;
 
 let container: StartedPostgreSqlContainer;
@@ -104,7 +105,7 @@ beforeAll(async () => {
   const port = await hop.listen();
   const user = encodeURIComponent(container.getUsername());
   const password = encodeURIComponent(container.getPassword());
-  backend = new PostgresBackend({ url: `postgres://${user}:${password}@127.0.0.1:${port}/${container.getDatabase()}` });
+  backend = new PostgresBackend(fixedDatabase(`postgres://${user}:${password}@127.0.0.1:${port}/${container.getDatabase()}`));
   backend.start();
   const until = Date.now() + 60_000;
   while (backend.connectionState().state !== 'ready' && Date.now() < until) await sleep(100);
@@ -454,7 +455,10 @@ describe('through the real stack', () => {
     }
     const until = Date.now() + 45 * SECOND;
     let state: string | null = ws.stateOf(g);
-    while (Date.now() < until && state !== 'ready') state = await ws.hydrate(g, tokenOf(claim));
+    while (Date.now() < until && state !== 'ready') {
+      state = await ws.hydrate(g, tokenOf(claim));
+      if (state !== 'ready') await sleep(100);
+    }
     expect(state).toBe('ready');
     expect(loadData('a.json', { guildId: g, category: 'm' }, null)).toEqual({ a: 1 });
     expect(await liveDocs(g)).toEqual([{ filename: 'a.json', doc: '{"a":1}' }]);
@@ -517,7 +521,10 @@ describe('the delete through the real stack', () => {
     }
     const until = Date.now() + 45 * SECOND;
     let state: string = 'unavailable';
-    while (Date.now() < until && state !== 'ready') state = await ws.hydrate(g, tokenOf(claim));
+    while (Date.now() < until && state !== 'ready') {
+      state = await ws.hydrate(g, tokenOf(claim));
+      if (state !== 'ready') await sleep(100);
+    }
     expect(state).toBe('ready');
     expect(await liveDocs(g)).toEqual([{ filename: 'a.json', doc: JSON.stringify({ a: 1 }, null, 2) }]);
   }, 150_000);

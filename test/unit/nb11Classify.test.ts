@@ -279,7 +279,6 @@ describe('restore: errors the database answered', () => {
     ['40001 answered to COMMIT', (s: string) => s === 'COMMIT', '40001'],
     ['an English ERROR XX000 on the move', isMove, 'XX000'],
     ['an English ERROR 58030 on the live check', isLive, '58030'],
-    ['an English ERROR XX001 answered to COMMIT', (s: string) => s === 'COMMIT', 'XX001'],
   ] as const)('%s answers refused with the SQLSTATE and no outage', async (_name, match, code) => {
     const { backend, statements } = scripted(happy(sql => (match(sql) ? sqlState(code, 'scripted refusal') : null)));
     const answer: any = await restore(backend, monoIn(40 * SECOND));
@@ -289,6 +288,14 @@ describe('restore: errors the database answered', () => {
     if (!match('COMMIT')) expect(statements()).not.toContain('COMMIT');
     const logged = vi.mocked(console.error).mock.calls.map(call => String(call[0]));
     expect(logged.filter(line => line.includes('connection failed'))).toEqual([]);
+  });
+});
+
+describe('restore: a COMMIT answered with an error that does not show a rollback (NB5 D8, G2)', () => {
+  it('an English ERROR XX001 answered to COMMIT answers unknown with the batch, and no outage', async () => {
+    const { backend } = scripted(happy(sql => (sql === 'COMMIT' ? sqlState('XX001', 'scripted refusal') : null)));
+    expect(await restore(backend, monoIn(40 * SECOND))).toEqual({ ok: false, reason: 'unknown', retiredAt: 5 });
+    expect(backend.connectionState().state).toBe('ready');
   });
 });
 
@@ -406,8 +413,13 @@ describe('retire', () => {
     expect(before.releases).toEqual([true]);
   });
 
+  it('an English ERROR XX000 on COMMIT does not show a rollback: unknown, no outage (NB5 D8, G2)', async () => {
+    const { backend } = scripted(sql => (isFenced(sql) ? { rows: [], rowCount: 1 } : sql === 'COMMIT' ? sqlState('XX000', 'scripted refusal') : undefined));
+    expect(await backend.retireGuild('1', 'test', token, monoIn(40 * SECOND))).toMatchObject({ ok: false, reason: 'unknown', moved: 0 });
+    expect(backend.connectionState().state).toBe('ready');
+  });
+
   it.each([
-    ['XX000', 'COMMIT', (s: string) => s === 'COMMIT'],
     ['58030', 'a graveyard insert', isGraveInsert],
   ] as const)('an English ERROR %s on %s is an answer: refused with the SQLSTATE, no outage', async (code, _where, match) => {
     const { backend } = scripted(sql => (isFenced(sql) ? { rows: [], rowCount: 1 } : match(sql) ? sqlState(code, 'scripted refusal') : undefined));

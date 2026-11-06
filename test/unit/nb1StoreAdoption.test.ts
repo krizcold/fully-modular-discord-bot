@@ -21,6 +21,23 @@ vi.mock('../../src/bot/internalSetup/utils/dataBackends/postgresBackend', async 
     start() {}
     stop() { return Promise.resolve(); }
     provisionVerdict() { return h.verdict === 'never' ? new Promise(() => {}) : Promise.resolve(h.verdict); }
+    onHoldChanged() {}
+    setMoveSteps() {}
+    chosenEntry() { return 'postgresql://u:p@db:5432/bot'; }
+  },
+}));
+
+// NB5 decision 7: the data layer awaits the chooser's choice; here it chose one entry at once.
+vi.mock('../../src/bot/internalSetup/utils/dataBackends/mainDatabase', async importOriginal => ({
+  ...(await importOriginal<object>()),
+  MainChooser: class {
+    chosen() { return 'postgresql://u:p@db:5432/bot'; }
+    awaitChoice() { return Promise.resolve('postgresql://u:p@db:5432/bot'); }
+    lastPassLogin() { return 'unreachable'; }
+    holdStarted() {}
+    confirmNow() {}
+    stop() {}
+    attach() {}
   },
 }));
 

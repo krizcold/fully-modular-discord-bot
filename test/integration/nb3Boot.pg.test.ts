@@ -1,3 +1,4 @@
+import { pgConfig } from '../../src/utils/databaseAddress';
 import fs from 'fs';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { evaluateRecognitionGuard, verifyStoreIdentity } from '../../src/bot/internalSetup/utils/dataBackends/recognitionGuard';
@@ -38,7 +39,7 @@ describe('the next boot', () => {
     expect(job?.state, why(job)).toBe('done');
     setBackendKind('postgres');
     expect(evaluateRecognitionGuard()).toEqual({ state: 'boot', live: 'postgres' });
-    expect(await verifyStoreIdentity(rig.url, true)).toEqual({ ok: true });
+    expect(await verifyStoreIdentity(pgConfig(rig.url), true)).toEqual({ ok: true });
     setBackendKind('file');
     expect((evaluateRecognitionGuard() as any).reason).toBe('Migration job-boot-0001 moved the data to postgres; set DATA_BACKEND to postgres, or run a migration');
   });

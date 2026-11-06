@@ -12,14 +12,18 @@ import {
   type Pair,
 } from './claimRules';
 import {
+  ClaimFailure,
+  ClaimPausedError,
   classifyFailure,
   describeClass,
   type ClaimStoreApi,
   type FailureClass,
   type PageRead,
   type RenewAnswer,
+  type RetakeAnswer,
   type TakeAnswer,
 } from './claimStore';
+import { commitRolledBack } from '../utils/dataBackends/postgresBackend';
 
 export type Clocks = () => { perf: number; wall: number };
 const realClocks: Clocks = () => ({ perf: performance.now(), wall: Date.now() });
@@ -59,7 +63,19 @@ export interface ShardClaimsDeps {
   lastRecord?: () => { shardCount: number; keptAtStop?: number[] } | null;
   /** After a completed release: records the shards it kept for this machine, held and reserved. */
   noteKeptAtStop?: (shardCount: number, shardIds: number[], dropped: number[]) => void;
+  /** NB5 C5 (e): the latch's `<why>` while the process does not write to its database, else null; the release is then skipped. */
+  releaseRefusal?: () => string | null;
+  /** NB5 C4: the working set's sets of the shard save under the claim the move took again. */
+  replaceShardClaim?: (shardId: number, claim: number) => void;
+  /** NB5 D7: the guilds this process holds a set for in the shard. */
+  guildsOfShard?: (shardId: number) => string[];
   log?: Pick<Console, 'log' | 'warn' | 'error'>;
+}
+
+/** NB5 decision 12: the database a move writes next, for (c)'s and (d)'s lines and (d)'s generation rule. */
+export interface MoveTarget {
+  address: string;
+  generation: number;
 }
 
 export interface ClaimsSnapshot {
@@ -75,7 +91,7 @@ export interface ClaimsSnapshot {
   /** The fitness key that holds the restart request back; null when the request was sent or none is pending. */
   restartWaiting: string | null;
   returning: number[];
-  stopped: 'lapse' | 'loss' | null;
+  stopped: 'lapse' | 'loss' | 'database' | null;
   renewMs: number;
 }
 
@@ -87,12 +103,21 @@ export class ShardClaims {
   /** The database time of the last completed renewal that returned each pair. */
   private readonly lastReturnedAt = new Map<string, number>();
   private latestFailure: FailureClass | null = null;
-  private stopped: 'lapse' | 'loss' | null = null;
+  private stopped: 'lapse' | 'loss' | 'database' | null = null;
   private granted = false;
   private closing = false;
   private renewing: Promise<void> | null = null;
+  /** NB5 E1: a boot take's renewal, its wait for the lane included. */
+  private renewWithRun: Promise<void> | null = null;
   private workRun: Promise<void> | null = null;
   private lanesStopped = false;
+  /** NB5 C5 (c): from a latch to the end of the move's (d), and again after an attempt that ended past (d). */
+  private lanesPaused = false;
+  /** NB5 E2: the latest latch's `<why>`; once set, the boot takes and grants nothing for the rest of the process. */
+  private databaseStop: string | null = null;
+  /** Reserved pairs the move's renewal did not return, for the loss step at the end of (d). */
+  private moveLostReserved: Pair[] = [];
+  private lastNotMoving: string | null = null;
   private everSentTake = false;
   /** Pairs found lost during the exit drain: the release asks for them and names them as no longer held. */
   private lostAtStop: Pair[] = [];
@@ -272,6 +297,10 @@ export class ShardClaims {
         try {
           read = await this.deps.store.readRow(pair.shardCount, pair.shardId);
         } catch (error) {
+          if (error instanceof ClaimPausedError) {
+            cause = 'not read: the claims are paused since this process stopped writing to its database';
+            break;
+          }
           cause = this.lanesStopped ? 'not read: this process is stopping' : describeFailureClass(classifyFailure(error));
         }
       }
@@ -293,6 +322,7 @@ export class ShardClaims {
   /** One renewal; a second call while one is on the wire waits for it. */
   renewOnce(): Promise<void> {
     if (this.renewing) return this.renewing;
+    if (this.lanesPaused) return Promise.resolve();
     this.renewing = this.renewCycle().finally(() => { this.renewing = null; });
     return this.renewing;
   }
@@ -315,7 +345,7 @@ export class ShardClaims {
     try {
       answer = await this.deps.store.renew({ me: this.deps.me, pairs, ttlMs: this.deps.timings.ttlMs, heartbeat: this.heartbeat() });
     } catch (error) {
-      this.latestFailure = classifyFailure(error);
+      if (!(error instanceof ClaimPausedError)) this.latestFailure = classifyFailure(error);
       return;
     }
     this.latestFailure = null;
@@ -364,8 +394,9 @@ export class ShardClaims {
   async firstRenewal(): Promise<boolean> {
     let lastLog = -Infinity;
     for (;;) {
-      if (this.deps.isStopping()) return false;
+      if (this.deps.isStopping() || this.databaseStop !== null) return false;
       await this.renewOnce();
+      if (this.databaseStop !== null) return false;
       if (this.firstRenewalAt !== null) return true;
       const now = this.clocks().wall;
       if (this.latestFailure && now - lastLog >= FAILURE_LOG_MS) {
@@ -392,7 +423,7 @@ export class ShardClaims {
     const record = this.deps.lastRecord?.() ?? null;
     let count = await localCount();
     for (;;) {
-      if (this.deps.isStopping() || giveUp()) return null;
+      if (this.deps.isStopping() || giveUp() || this.databaseStop !== null) return null;
       let began: { perf: number; wall: number } | null = null;
       let answer: TakeAnswer;
       try {
@@ -402,7 +433,7 @@ export class ShardClaims {
           localCount: count, reserve: false, copied,
         }, () => { began = this.clocks(); });
       } catch (error) {
-        if (this.lanesStopped || this.deps.isStopping()) return null;
+        if (this.databaseStop !== null || this.lanesStopped || this.deps.isStopping()) return null;
         const now = this.clocks().wall;
         if (now - lastFailureLog >= FAILURE_LOG_MS) {
           lastFailureLog = now;
@@ -457,23 +488,28 @@ export class ShardClaims {
       const pairs = answer.taken.map(t => t.pair);
       this.held = pairs;
       for (const p of pairs) this.lastReturned.set(pairKey(p), at);
-      if (this.deps.isStopping()) return null;
+      if (this.deps.isStopping() || this.databaseStop !== null) return null;
       if (pairs.length > 0 && elapsedMs(at, this.clocks()) >= this.deps.timings.deadlineMs) {
         // Acknowledged after its deadline: renewed at once, and a pair the renewal does not return leaves the set.
         const held = this.held;
         this.held = [];
         await this.renewWith(held);
+        if (this.databaseStop !== null) return null;
       }
       return { shardCount: answer.shardCount, pairs: [...this.held], answer };
     }
   }
 
   /** On the renewal lane: waits for the renewal on the wire, then renews exactly these pairs, and interval ticks wait for it. */
-  private async renewWith(pairs: Pair[]): Promise<void> {
-    while (this.renewing) await this.renewing;
-    const run = this.renewWithCycle(pairs);
-    this.renewing = run;
-    try { await run; } finally { if (this.renewing === run) this.renewing = null; }
+  private renewWith(pairs: Pair[]): Promise<void> {
+    const run = (async () => {
+      while (this.renewing) await this.renewing;
+      const cycle = this.renewWithCycle(pairs);
+      this.renewing = cycle;
+      try { await cycle; } finally { if (this.renewing === cycle) this.renewing = null; }
+    })();
+    this.renewWithRun = run;
+    return run.finally(() => { if (this.renewWithRun === run) this.renewWithRun = null; });
   }
 
   private async renewWithCycle(pairs: Pair[]): Promise<void> {
@@ -488,9 +524,156 @@ export class ShardClaims {
         this.lastReturnedAt.set(pairKey(p), answer.at);
       }
     } catch (error) {
+      if (error instanceof ClaimPausedError) {
+        // NB5 E1: the pairs stay for the move's renewal and re-take; the database stop already ended serving.
+        this.held = pairs;
+        return;
+      }
       this.latestFailure = classifyFailure(error);
       this.held = [];
     }
+  }
+
+  // ---------------------------------------------------------------- the database stop and the move (NB5)
+
+  /** The latest latch's `<why>`, set by stopServingForDatabase and never cleared; null before any. */
+  databaseStopWhy(): string | null {
+    return this.databaseStop;
+  }
+
+  /**
+   * NB5 decision 11 and C5 (c): the process stopped writing to its database. In one synchronous run: the stop-serving
+   * step once, the lanes paused and the store's gate raised, so nothing begun before is sent or applied.
+   */
+  stopServingForDatabase(why: string): void {
+    this.databaseStop = why;
+    if (this.stopped === null) {
+      this.stopped = 'database';
+      this.runStopStep();
+    }
+    this.lanesPaused = true;
+    this.deps.store.pause();
+  }
+
+  /**
+   * Step (c): one renewal on the pool (b) built, sent while paused, after the renewal lane and a boot take's renewal
+   * settled (E1). Records the pairs returned; never runs the loss step. Rejects on a failure.
+   */
+  async moveRenewal(): Promise<{ returned: Pair[]; missing: Pair[] }> {
+    for (;;) {
+      if (this.renewWithRun) { await this.renewWithRun.catch(() => undefined); continue; }
+      if (this.renewing) { await this.renewing.catch(() => undefined); continue; }
+      break;
+    }
+    let done: () => void = () => undefined;
+    const run = new Promise<void>(resolve => { done = resolve; });
+    this.renewing = run;
+    try {
+      const sent = this.clocks();
+      const held = [...this.held];
+      const reserved = this.reserved.map(({ at: _at, ...p }) => p);
+      const answer = await this.deps.store.renew(
+        { me: this.deps.me, pairs: [...held, ...reserved], ttlMs: this.deps.timings.ttlMs, heartbeat: this.heartbeat() },
+        { move: true },
+      );
+      this.latestFailure = null;
+      const mine = new Map(answer.rows.filter(r => r.mine).map(r => [pairKey(r), r]));
+      const returned: Pair[] = [];
+      const missing: Pair[] = [];
+      for (const pair of held) {
+        const row = mine.get(pairKey(pair));
+        if (row && !row.released) {
+          returned.push(pair);
+          this.lastReturned.set(pairKey(pair), sent);
+          this.lastReturnedAt.set(pairKey(pair), answer.at);
+        } else missing.push(pair);
+      }
+      this.moveLostReserved = reserved.filter(pair => !mine.get(pairKey(pair))?.released);
+      return { returned, missing };
+    } finally {
+      done();
+      if (this.renewing === run) this.renewing = null;
+    }
+  }
+
+  /**
+   * Steps (c) and (d) of a move to the target, and the end of (d) in one synchronous run: the re-taken claims in the
+   * fence, the lanes resumed, then the loss step for the pairs neither returned nor taken. False ends this attempt with
+   * its line; the lanes stay paused and nothing is dropped.
+   */
+  async moveClaims(target: MoveTarget): Promise<boolean> {
+    let renewal: { returned: Pair[]; missing: Pair[] };
+    try {
+      renewal = await this.moveRenewal();
+    } catch (error) {
+      this.notMoving(`[Database] Not moving to ${target.address} yet: the claim renewal there failed (${this.moveCause(error)}); this process keeps its unsaved changes and stays stopped`);
+      return false;
+    }
+    const missing = renewal.missing;
+    let taken: RetakeAnswer['taken'] = [];
+    if (missing.length > 0) {
+      const ids = missing.map(p => p.shardId);
+      const guildIds = [...new Set(ids)].map(shardId => ({ shardId, guildIds: this.deps.guildsOfShard?.(shardId) ?? [] }));
+      let commitSent = false;
+      try {
+        taken = (await this.deps.store.retake({
+          me: this.deps.me, shardCount: missing[0].shardCount, pairs: missing, guildIds, generation: target.generation,
+          ttlMs: this.deps.timings.ttlMs,
+        }, () => { commitSent = true; })).taken;
+      } catch (error) {
+        const cause = error instanceof ClaimFailure ? error.cause : error;
+        const one = new Set(ids).size === 1;
+        const shards = one ? `shard ${ids[0]}` : `shards ${idList([...new Set(ids)])}`;
+        if (!commitSent || (!(error instanceof ClaimPausedError) && commitRolledBack(cause))) {
+          this.notMoving(`[Database] Not moving to ${target.address} yet: the re-take of ${shards} failed there (${this.moveCause(error)}); this process keeps its unsaved changes and stays stopped`);
+        } else {
+          const tail = one
+            ? `takes ${shards} again if its claim row there still names this process`
+            : `takes ${shards} again if their claim rows there still name this process`;
+          this.notMoving(`[Database] Not moving to ${target.address} yet: can't confirm whether the re-take of ${shards} reached it (${this.moveCause(error)}); this process keeps its unsaved changes and stays stopped, and the next attempt on ${target.address} ${tail}`);
+        }
+        return false;
+      }
+    }
+    for (const t of taken) this.replaceClaim(t.before, t.pair.claim);
+    this.lanesPaused = false;
+    this.deps.store.resume();
+    this.lastNotMoving = null;
+    const retaken = new Set(taken.map(t => pairKey(t.before)));
+    const lost = [...missing.filter(p => !retaken.has(pairKey(p))), ...this.moveLostReserved];
+    this.moveLostReserved = [];
+    if (lost.length > 0) this.loss(lost);
+    return true;
+  }
+
+  /** An attempt that ended after (d): the lanes pause again until the next attempt's (d). */
+  moveAttemptEnded(): void {
+    if (this.lanesPaused) return;
+    this.lanesPaused = true;
+    this.deps.store.pause();
+  }
+
+  /** C4: the pair taken again holds its new claim, and the shard's sets save under it. */
+  replaceClaim(before: Pair, claim: number): void {
+    const at = this.clocks();
+    this.held = this.held.map(p => {
+      if (pairKey(p) !== pairKey(before)) return p;
+      const next = { ...p, claim };
+      this.lastReturned.set(pairKey(next), at);
+      return next;
+    });
+    try { this.deps.replaceShardClaim?.(before.shardId, claim); } catch (error) { this.log.error('[Shards] Could not put the new claim in the fence:', error); }
+  }
+
+  private moveCause(error: unknown): string {
+    if (error instanceof ClaimPausedError) return `the move stopped while it waited: ${this.databaseStop ?? 'no cause recorded'}`;
+    return describeFailureClass(classifyFailure(error));
+  }
+
+  private notMoving(line: string): void {
+    if (line === this.lastNotMoving) return;
+    this.lastNotMoving = line;
+    this.log.error(line);
   }
 
   /** The boot granted its set: the deadline is armed and the work lane may run. */
@@ -505,7 +688,7 @@ export class ShardClaims {
   // The page read goes on after a lapse, a loss and the start of a stop (it takes no lock), so the fleet page stays
   // current; a reservation, a return and a restart request need a serving process outside a stop.
   private async work(): Promise<void> {
-    if (this.workRun || this.lanesStopped) return;
+    if (this.workRun || this.lanesStopped || this.lanesPaused) return;
     await this.onWorkLane(() => this.workCycle());
   }
 
@@ -518,6 +701,7 @@ export class ShardClaims {
     try {
       page = await this.deps.store.readPage(this.shardCount);
     } catch (error) {
+      if (error instanceof ClaimPausedError) return;
       this.pageReadError = classifyFailure(error);
       // Decision 15's TTL bound and the reservations' restart need no page; a return or move waits for a page read that decides it.
       if (this.mayRestart()) {
@@ -664,6 +848,13 @@ export class ShardClaims {
     const handOvers = this.returnList.filter(h => heldShards.has(h.shardId));
     let sent = false;
     let connected = false;
+    const refusal = this.deps.releaseRefusal?.() ?? null;
+    if (refusal !== null) {
+      this.log.warn(notReleasedLine(asked, refusal, this.deps.timings.ttlMs));
+      this.held = [];
+      this.reserved = [];
+      return;
+    }
     try {
       const rows = await this.deps.store.release(
         { me: this.deps.me, reserved, handOvers, ttlMs: this.deps.timings.ttlMs },
@@ -681,7 +872,8 @@ export class ShardClaims {
         }
       }
     } catch (error) {
-      this.log.error(releaseFailureLine(this.known(), classifyFailure(error), sent, connected));
+      if (error instanceof ClaimPausedError) this.log.error(releaseFailureLine(asked, classifyFailure(error), sent, connected, this.databaseStop));
+      else this.log.error(releaseFailureLine(this.known(), classifyFailure(error), sent, connected));
     }
     this.held = [];
     this.reserved = [];
@@ -733,7 +925,8 @@ export function releaseLines(asked: Pair[], reserved: Pair[], rows: Array<{ shar
  * Decision 12's failure lines: a COMMIT sent with no answer (or answered in a way that ends the session: commitMayHaveLanded),
  * a server error (a rolled-back transaction), no connection, or a connection that failed before its COMMIT was sent.
  */
-export function releaseFailureLine(asked: Pair[], failure: FailureClass, sent: boolean, connected = false): string {
+export function releaseFailureLine(asked: Pair[], failure: FailureClass, sent: boolean, connected = false, pausedWhy?: string | null): string {
+  if (pausedWhy !== undefined) return pausedReleaseLine(asked, sent, pausedWhy);
   if (asked.length === 0) return `[Shards] The release did not complete (${describeFailureClass(failure)}); any shard row still naming this process frees once its claim expires`;
   const ids = `shards ${idList(asked.map(p => p.shardId))}`;
   const tail = 'any machine with room may take them once their claims expire';
@@ -743,6 +936,30 @@ export function releaseFailureLine(asked: Pair[], failure: FailureClass, sent: b
   if (failure.kind === 'refused') return `[Shards] Could not release ${ids} (the database refused the login); ${tail}`;
   if (!sent && !connected) return `[Shards] Could not reach the database to release ${ids} (${describeFailureClass(failure)}); ${tail}`;
   return `[Shards] The release of ${ids} got no answer before its COMMIT was sent (${describeFailureClass(failure)}), so it did not apply; ${tail}`;
+}
+
+/** NB5 E3: a release the claims' pause met, chosen by whether COMMIT was sent; the failure class is not read. */
+function pausedReleaseLine(asked: Pair[], sent: boolean, why: string | null): string {
+  const cause = why === null ? '' : ` (${why})`;
+  const ids = asked.length === 0 ? null : `shards ${idList([...new Set(asked.map(p => p.shardId))])}`;
+  const freed = 'any shard row still naming this process frees once its claim expires';
+  if (sent) {
+    return ids === null
+      ? `[Shards] Can't confirm whether the release applied: this process stopped writing to its database while the release waited for its answer${cause}; ${freed}`
+      : `[Shards] Can't confirm whether the release of ${ids} applied: this process stopped writing to its database while the release waited for its answer${cause}; if it did not apply, any machine with room may take them once their claims expire`;
+  }
+  return ids === null
+    ? `[Shards] The release did not apply: this process stopped writing to its database before the release sent its COMMIT${cause}; ${freed}`
+    : `[Shards] The release of ${ids} did not apply: this process stopped writing to its database before the release sent its COMMIT${cause}; any machine with room may take them once their claims expire`;
+}
+
+/** NB5 decision 11 and D6: the release skipped because the process does not write to its database. */
+export function notReleasedLine(asked: Pair[], why: string, ttlMs: number): string {
+  const ids = [...new Set(asked.map(p => p.shardId))].sort((a, b) => a - b);
+  const ttl = Math.round(ttlMs / 1000);
+  if (ids.length === 0) return `[Shards] The release was not sent: ${why}; any shard row still naming this process frees once its claim expires`;
+  if (ids.length === 1) return `[Shards] Shard ${ids[0]} was not released: ${why}; its claim expires after ${ttl} s`;
+  return `[Shards] Shards ${idList(ids)} were not released: ${why}; their claims expire after ${ttl} s`;
 }
 
 /** Decision 16's loss line for one pair, from the row read after the leave started. */

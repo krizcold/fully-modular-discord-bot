@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { FenceToken } from '../../src/bot/internalSetup/utils/dataBackends/backend';
 import { PostgresBackend, SCHEMA_VERSION } from '../../src/bot/internalSetup/utils/dataBackends/postgresBackend';
+import { fixedDatabase } from '../helpers/fixedDatabase';
 import { initWorkingSet, WorkingSetManager } from '../../src/bot/internalSetup/utils/dataBackends/workingSet';
 import { FakeStore, tokenFor } from '../helpers/fakeStore';
 import { restoreGuildFromGraveyard, setGuildDataBackend } from '../../src/bot/internalSetup/utils/dataManager';
@@ -17,7 +18,7 @@ afterEach(async () => {
 });
 
 function readyBackend(): { backend: PostgresBackend; connect: ReturnType<typeof vi.fn> } {
-  const backend = new PostgresBackend({ url: 'postgres://nobody@127.0.0.1:9/none' });
+  const backend = new PostgresBackend(fixedDatabase('postgres://nobody@127.0.0.1:9/none'));
   backends.push(backend);
   (backend as unknown as { state: string }).state = 'ready';
   const connect = vi.fn(async () => { throw new Error('no connection may be opened'); });
@@ -65,7 +66,7 @@ describe('a token with no usable claim', () => {
 
 /** A backend whose pool hands out one scripted client; every statement it is sent is recorded. */
 function scriptedBackend(answer: (sql: string) => unknown): { backend: PostgresBackend; sent: string[]; connect: ReturnType<typeof vi.fn> } {
-  const backend = new PostgresBackend({ url: 'postgres://nobody@127.0.0.1:9/none' });
+  const backend = new PostgresBackend(fixedDatabase('postgres://nobody@127.0.0.1:9/none'));
   backends.push(backend);
   (backend as unknown as { state: string }).state = 'ready';
   const sent: string[] = [];
@@ -100,7 +101,7 @@ describe('a database of another schema version', () => {
   });
 
   it('a database with no meta table yet is provisioned', async () => {
-    const missing = Object.assign(new Error('relation "smdb_data.meta" does not exist'), { code: '42P01' });
+    const missing = Object.assign(new Error('relation "smdb_data.meta" does not exist'), { code: '42P01', severity: 'ERROR' });
     let created = false;
     const { backend, sent } = scriptedBackend(sql => {
       if (/CREATE TABLE IF NOT EXISTS smdb_data\.meta/.test(sql)) created = true;

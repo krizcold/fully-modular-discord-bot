@@ -20,7 +20,7 @@ import { LEASED } from '../helpers/readinessRig';
 
 const DELETE_FAILED = 'guild data delete failed; nothing was removed';
 const DELETE_ALREADY = "a delete of this server's data is already running; nothing was removed";
-const unknownTail = "is gone from `smdb graveyard list`; if not, the entry is still listed, unless it had passed the graveyard's keep time (GRAVEYARD_TTL_DAYS, 14 days by default) and the graveyard sweep removed it, data and all.";
+const unknownTail = "is gone from `smdb graveyard list`; if not, the entry is still listed, unless it had passed the graveyard's keep time (GRAVEYARD_TTL_DAYS, 14 days by default) and the graveyard sweep removed it, data and all. The list reads the data of the bot behind the web panel it asks; if the main database was replaced meanwhile, check once that bot runs on the new main.";
 const unknownHead = (g: string) => `can't confirm whether server ${g} was restored: the database did not confirm the commit. Within a minute, if it was restored, the server's data is back and`;
 
 class Scripted extends FakeStore {
@@ -34,7 +34,7 @@ class Scripted extends FakeStore {
   override async retireGuild(): Promise<RetireOutcome> {
     this.retireCalls += 1;
     if (this.retireImpl) return this.retireImpl();
-    return { ok: true, moved: 1 };
+    return { ok: true, moved: 1, retiredAt: 5 };
   }
 }
 
@@ -139,7 +139,7 @@ describe('the delete on Postgres', () => {
     const first = deleteGuildNamespace(g, 'test', 1000);
     await vi.waitFor(() => expect(store.retireCalls).toBe(1));
     const second = deleteGuildNamespace(g, 'test', 1000);
-    hold.resolve({ ok: true, moved: 1 });
+    hold.resolve({ ok: true, moved: 1, retiredAt: 5 });
     expect(await second).toEqual({ ok: false, code: 'invalid', error: DELETE_ALREADY });
     expect(await first).toEqual({ ok: true });
     expect(store.retireCalls).toBe(1);
@@ -181,7 +181,7 @@ describe('the delete on Postgres', () => {
   it('a retire that moved no row answers failed and logs no move', async () => {
     const { store, ws } = setup();
     const g = await readyGuild(ws);
-    store.retireImpl = async () => ({ ok: true, moved: 0 });
+    store.retireImpl = async () => ({ ok: true, moved: 0, retiredAt: 5 });
     expect(await deleteGuildNamespace(g, 'test', 1000)).toEqual({ ok: false, code: 'io-error', error: DELETE_FAILED });
     expect(lines(log).filter(l => l.includes('moved to graveyard'))).toEqual([]);
   });
@@ -189,7 +189,7 @@ describe('the delete on Postgres', () => {
   it('a retire that moved rows answers ok and logs the move with its reason', async () => {
     const { store, ws } = setup();
     const g = await readyGuild(ws);
-    store.retireImpl = async () => ({ ok: true, moved: 2 });
+    store.retireImpl = async () => ({ ok: true, moved: 2, retiredAt: 5 });
     expect(await deleteGuildNamespace(g, 'webui-operator-delete', 1000)).toEqual({ ok: true });
     expect(lines(log)).toContain(`[DataManager] Guild ${g} moved to graveyard (webui-operator-delete)`);
   });

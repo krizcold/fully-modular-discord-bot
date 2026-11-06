@@ -3,6 +3,7 @@ import { Client, Pool } from 'pg';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { PostgresBackend, provisionStoreInTransaction, SCHEMA_VERSION } from '../../src/bot/internalSetup/utils/dataBackends/postgresBackend';
+import { fixedDatabase } from '../helpers/fixedDatabase';
 import {
   ANSWER_SQL,
   CLEANUP_SQL,
@@ -64,7 +65,7 @@ beforeEach(async () => {
   setBackendKind('postgres');
   for (const s of sweeps.splice(0)) s.stop();
   _resetGuildRequests();
-  setWebuiDataStoreUrl(rig.url);
+  setWebuiDataStoreUrl({ url: rig.url });
   _setGuildRequestDeps({ nodeName: () => 'ALPHA', nodeId: () => 'n-alpha' });
   await rig.reset();
   await rig.direct.query(`DELETE FROM smdb_data.guild_requests`);
@@ -130,7 +131,7 @@ describe('provisioning', () => {
       await client.end();
     }
     const error = vi.spyOn(console, 'error').mockImplementation(() => undefined);
-    const backend = new PostgresBackend({ url });
+    const backend = new PostgresBackend(fixedDatabase(url));
     backend.start();
     try {
       const found = JSON.stringify({ v: SCHEMA_VERSION - 1 });

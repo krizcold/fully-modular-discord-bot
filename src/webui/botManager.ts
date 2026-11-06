@@ -12,7 +12,8 @@ import { applyOperatorDataWrite, type GuildDataWriteRequest } from '../bot/inter
 import { IPC_TIMEOUT_MS, IPC_TIMEOUT_MODULE_OP_MS } from './constants';
 import type { WebSocketManager, WSEvent, WSEventData } from './websocketManager';
 import { getSafetyManager } from '../utils/updateSafety';
-import { setWebuiDataStoreUrl } from './utils/webuiDataReader';
+import { noteWebuiChild, setWebuiDataStoreUrl } from './utils/webuiDataReader';
+import { acceptAddressList, hookListInUse } from '../utils/databaseAddress';
 import type { NotifyOutcome } from '../bot/internalSetup/utils/subscriptionNotifier';
 import { readMaintenanceFile } from '../utils/maintenanceFile';
 import { heldClauses } from '../bot/internalSetup/utils/heldWords';
@@ -157,16 +158,34 @@ export interface MaintenanceSaveResult {
   unansweredGuilds?: number;
   /** Files holding appended lines the disk did not confirm. */
   unconfirmedFiles?: number;
+  /** Guilds waiting to be re-saved on the bot's main database (NB5 decision 12); only above 0. */
+  resaveGuilds?: number;
   note?: string;
 }
 
-type ChildHeld = { unsavedGuilds: number; unsavedFiles: number; unansweredGuilds: number };
+type ChildHeld = { unsavedGuilds: number; unsavedFiles: number; unansweredGuilds: number; resaveGuilds?: number };
 
-/** The held counts of a maintenance:mode report, kept while the mode is 'held'; unansweredGuilds is 0 when absent. */
+/**
+ * The held counts of a maintenance:mode report, kept while the mode is 'held'; unansweredGuilds is 0 when absent, and
+ * resaveGuilds is kept only above 0 (NB5 C3).
+ */
 export function childHeldOf(mode: unknown, held: any): ChildHeld | null {
   if (mode !== 'held' || !held || typeof held.unsavedGuilds !== 'number' || typeof held.unsavedFiles !== 'number') return null;
-  return { unsavedGuilds: held.unsavedGuilds, unsavedFiles: held.unsavedFiles, unansweredGuilds: typeof held.unansweredGuilds === 'number' ? held.unansweredGuilds : 0 };
+  return {
+    unsavedGuilds: held.unsavedGuilds, unsavedFiles: held.unsavedFiles, unansweredGuilds: typeof held.unansweredGuilds === 'number' ? held.unansweredGuilds : 0,
+    ...(typeof held.resaveGuilds === 'number' && held.resaveGuilds > 0 ? { resaveGuilds: held.resaveGuilds } : {}),
+  };
 }
+
+/** The addresses hook's answer (NB5 decision 22). */
+export interface AddressesAnswer {
+  status: number;
+  body: Record<string, unknown>;
+}
+
+/** How long the addresses hook waits for the bot process's ack; tests shorten it. */
+export const addressesTiming = { ackMs: 5_000 };
+export const LATE_ADDRESSES_LINE = '[WebUI] The bot process took the address list after the hook answered; later bot processes start with it';
 
 const countOf = (value: unknown): number => Number(value) || 0;
 
@@ -250,7 +269,15 @@ export class BotManager {
   private childMaintenanceBoot = false;
   // The current child has said what it booted as: a maintenance:mode message, its first data:store, or its own login line.
   private childModeReported = false;
+  // The current child has sent data:store since it started (NB5 decision 17).
+  private childStoreReported = false;
   private childLoggedIn = false;
+  // NB5 decision 22: the newest data:addresses sent, and the hook calls waiting for their ack.
+  private addressesSeq = 0;
+  private newestAddresses: { id: string; url: string; answered: boolean } | null = null;
+  private addressesWaiters = new Map<string, (ack: { accepted: boolean; error?: string }) => void>();
+  // NB5 decisions 16 and 23: owner channel setting writes in flight, which a migration's S3 waits out.
+  private ownerChannelWrites = 0;
   // The current child's answer to the last maintenance:enter, or null when none was asked of it.
   private childEnterAnswer: MaintenanceSaveResult | null = null;
   // The last child forked and whether its exit was seen; shutdown drops the handle of a child that outlives SIGKILL.
@@ -435,7 +462,7 @@ export class BotManager {
       // so code that must run in exactly one process (e.g. payment-provider
       // tick loops) can tell which side it's on.
       this.botProcess = fork(botEntryPoint, [], {
-        env: { ...process.env, ...credentials, BOT_PROCESS_ROLE: 'bot' },
+        env: { ...process.env, ...credentials, BOT_PROCESS_ROLE: 'bot', ...(hookListInUse() !== null ? { DATA_BACKEND_URL: hookListInUse()! } : {}) },
         silent: true, // Capture stdout/stderr
         execArgv: isProd ? [] : ['-r', 'ts-node/register'] // Use ts-node in development
       });
@@ -445,6 +472,7 @@ export class BotManager {
       this.childHeld = null;
       this.childMaintenanceBoot = false;
       this.childModeReported = false;
+      this.childStoreReported = false;
       this.childLoggedIn = false;
       this.childEnterAnswer = null;
       this.childStage = 'none';
@@ -459,7 +487,7 @@ export class BotManager {
       // Ops queued in the local chain that have not started are routed again: the child waits for the one in progress.
       this.rerouteQueued();
       // A new child serves no store until it reports one.
-      setWebuiDataStoreUrl(null);
+      noteWebuiChild('started');
       this.botStartTime = Date.now();
       this.crashed = false;
 
@@ -551,7 +579,7 @@ export class BotManager {
         }
 
         this.botProcess = null;
-        setWebuiDataStoreUrl(null);
+        noteWebuiChild('gone');
         this.botStartTime = 0;
         this.failPendingIpc('bot process exited before replying');
         this.emitEvent('bot:status', this.getStatus());
@@ -583,11 +611,23 @@ export class BotManager {
         } else if (message.type === 'data:store') {
           // The parent's reader follows the store the child serves, never only
           // the node's own /data/.env.
-          setWebuiDataStoreUrl(typeof message.data?.url === 'string' ? message.data.url : null);
+          const data = message.data ?? {};
+          setWebuiDataStoreUrl({
+            url: typeof data.url === 'string' ? data.url : null,
+            ...(data.choosing === true ? { choosing: true as const } : {}),
+            ...(data.held === true ? { held: true as const } : {}),
+            ...(typeof data.reason === 'string' ? { reason: data.reason } : {}),
+          });
           this.childModeReported = true;
+          this.childStoreReported = true;
+        } else if (message.type === 'data:addresses-ack') {
+          this.noteAddressesAck(message.data);
         } else if (message.type === 'maintenance:mode') {
           if (typeof message.data?.mode === 'string') {
-            if (message.data.boot === true) this.childMaintenanceBoot = true;
+            if (message.data.boot === true) {
+              this.childMaintenanceBoot = true;
+              noteWebuiChild('maintenance-boot');
+            }
             this.childModeReported = true;
             this.childMode = message.data.mode;
             this.childHeld = childHeldOf(this.childMode, message.data.held);
@@ -728,6 +768,77 @@ export class BotManager {
   }
 
   /**
+   * NB5 decisions 16 and 23: in one synchronous step, refuses while a migration holds its lock, else marks an owner
+   * channel setting write in flight. The caller ends the mark once no statement of the write can still run.
+   */
+  ownerChannelWriteStart(): { ok: true; end: (afterMs?: number) => void } | { ok: false; running: RunningMigration } {
+    const running = this.migrationRunning();
+    if (running) return { ok: false, running };
+    this.ownerChannelWrites += 1;
+    let ended = false;
+    const end = (afterMs = 0) => {
+      if (ended) return;
+      ended = true;
+      const clear = () => { this.ownerChannelWrites -= 1; };
+      if (afterMs > 0) setTimeout(clear, afterMs).unref();
+      else clear();
+    };
+    return { ok: true, end };
+  }
+
+  /** No owner channel setting write is in flight: a migration's S3 waits for this. */
+  ownerChannelWriteSettled(): boolean {
+    return this.ownerChannelWrites === 0;
+  }
+
+  /**
+   * NB5 decision 22: the addresses hook. With no bot process the list is taken at once; otherwise it is sent to the
+   * bot process, whatever its stage, and taken once that process acknowledged it.
+   */
+  async applyAddressList(url: string): Promise<AddressesAnswer> {
+    const child = this.isRunning() ? this.botProcess : null;
+    if (!child) {
+      acceptAddressList(url);
+      return { status: 200, body: { success: true, applied: true, note: 'No bot process runs; the next one starts with these addresses.' } };
+    }
+    const id = `addresses-${++this.addressesSeq}`;
+    const sent = { id, url, answered: false };
+    this.newestAddresses = sent;
+    let timer: NodeJS.Timeout | undefined;
+    const ack = new Promise<{ accepted: boolean; error?: string } | null>(resolve => {
+      this.addressesWaiters.set(id, resolve);
+      timer = setTimeout(() => resolve(null), addressesTiming.ackMs);
+    });
+    try {
+      child.send({ type: 'data:addresses', data: { id, url } });
+    } catch (error) {
+      console.warn(`[WebUI] The address list could not be sent to the bot process: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    const answer = await ack;
+    clearTimeout(timer);
+    this.addressesWaiters.delete(id);
+    sent.answered = true;
+    if (answer === null) {
+      return { status: 502, body: { success: false, unknown: true, error: "can't confirm whether the bot process took the new addresses: it did not answer within 5 s; repeat the call" } };
+    }
+    if (!answer.accepted) return { status: 400, body: { success: false, error: answer.error ?? 'the bot process refused the address list' } };
+    return { status: 200, body: { success: true, applied: true } };
+  }
+
+  /** An ack of data:addresses: an accepted ack for the newest id makes its list the list in use, also after the answer. */
+  private noteAddressesAck(data: any): void {
+    const id = typeof data?.id === 'string' ? data.id : null;
+    if (id === null) return;
+    const accepted = data.accepted === true;
+    const newest = this.newestAddresses;
+    if (accepted && newest && newest.id === id) {
+      acceptAddressList(newest.url);
+      if (newest.answered) console.warn(LATE_ADDRESSES_LINE);
+    }
+    this.addressesWaiters.get(id)?.({ accepted, ...(typeof data.error === 'string' ? { error: data.error } : {}) });
+  }
+
+  /**
    * Whether a data migration may run beside the bot process: stopped with its exit seen, or booted in maintenance mode.
    * Every other state answers the refusal the operator sees.
    */
@@ -751,8 +862,11 @@ export class BotManager {
     const held = (counts: MaintenanceSaveResult | ChildHeld): string | null => {
       const guilds = countOf(counts.unsavedGuilds);
       const files = countOf(counts.unsavedFiles);
-      const apart = heldClauses({ unansweredGuilds: countOf(counts.unansweredGuilds), unconfirmedFiles: countOf((counts as MaintenanceSaveResult).unconfirmedFiles) });
+      const resave = countOf(counts.resaveGuilds);
+      const apart = heldClauses({ resaveGuilds: resave, unansweredGuilds: countOf(counts.unansweredGuilds), unconfirmedFiles: countOf((counts as MaintenanceSaveResult).unconfirmedFiles) });
       if (guilds > 0 || files > 0) return apart ? `${unsaved(guilds, files)}; ${apart}` : unsaved(guilds, files);
+      // NB5 C3: a guild waiting to be re-saved is a change the bot holds.
+      if (resave > 0) return `The bot holds changes a stop or restart can drop: ${apart}`;
       return apart ? `can't confirm whether every change the bot held is saved: ${apart}` : null;
     };
     const answer = this.childEnterAnswer;
@@ -923,7 +1037,7 @@ export class BotManager {
 
       if (this.botProcess === child) {
         this.botProcess = null;
-        setWebuiDataStoreUrl(null);
+        noteWebuiChild('gone');
         this.botStartTime = 0;
         // A child that outlived even its kill exits stale and settles
         // nothing, so requests still waiting on it fail here.
@@ -992,8 +1106,10 @@ export class BotManager {
         unsavedFiles: countOf(reply?.unsavedFiles),
         unansweredGuilds: countOf(reply?.unansweredGuilds),
         unconfirmedFiles: countOf(reply?.unconfirmedFiles),
+        resaveGuilds: countOf(reply?.resaveGuilds),
       };
       const apart = {
+        ...(counts.resaveGuilds > 0 ? { resaveGuilds: counts.resaveGuilds } : {}),
         ...(counts.unansweredGuilds > 0 ? { unansweredGuilds: counts.unansweredGuilds } : {}),
         ...(counts.unconfirmedFiles > 0 ? { unconfirmedFiles: counts.unconfirmedFiles } : {}),
       };

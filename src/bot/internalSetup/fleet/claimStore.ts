@@ -4,10 +4,12 @@
 import { Pool } from 'pg';
 import type { PoolClient, QueryConfig } from 'pg';
 import { commitMayHaveLanded, isLoginRefused } from '../utils/dataBackends/postgresBackend';
+import { pgConfig } from '../../../utils/databaseAddress';
 import {
   CLOCK_GAP_CAP_MS,
   claimState,
   decideShardCount,
+  planRetake,
   planTake,
   qualifiesAsReceiver,
   nodeRoom,
@@ -146,8 +148,17 @@ export class ClaimFailure extends Error {
   }
 }
 
+/** NB5 D1: the gate dropped a call begun before the latest pause, or one started while paused. */
+export class ClaimPausedError extends Error {
+  constructor() {
+    super('the claims are paused: this process stopped writing to its database');
+    this.name = 'ClaimPausedError';
+  }
+}
+
 /** Decision 5's classes: 28000 refused, a client timeout, a connection that failed or ended, or a server error. */
 export function classifyFailure(error: unknown): FailureClass {
+  if (error instanceof ClaimPausedError) return { kind: 'unreachable', detail: 'the claims are paused' };
   if (error instanceof ClaimFailure) return error.failure;
   if (isLoginRefused(error)) return { kind: 'refused' };
   if (error instanceof ClaimTimeoutError) return { kind: 'timeout' };
@@ -254,9 +265,33 @@ export interface PageRead {
   nodes: NodeRow[];
 }
 
+/** NB5 D7: the move's re-take of the held pairs its renewal did not return. */
+export interface RetakeRequest {
+  me: Me;
+  shardCount: number;
+  pairs: Pair[];
+  /** For each of the pairs' shard ids, the guilds this process holds a set for. */
+  guildIds: Array<{ shardId: number; guildIds: string[] }>;
+  /** The main generation the move targets. */
+  generation: number;
+  ttlMs: number;
+}
+
+export interface RetakeAnswer {
+  taken: Array<{ before: Pair; pair: Pair }>;
+}
+
 /** The whole claims surface the shard layer uses; tests swap in a fake. */
 export interface ClaimStoreApi {
-  renew(request: RenewRequest): Promise<RenewAnswer>;
+  /** `move`: the move's own renewal, which passes the pause (NB5 D1). */
+  renew(request: RenewRequest, opts?: { move?: boolean }): Promise<RenewAnswer>;
+  /** NB5 D7: one transaction on the work lane that passes the pause; onCommitSent runs right before COMMIT. */
+  retake(request: RetakeRequest, onCommitSent?: () => void): Promise<RetakeAnswer>;
+  /** NB5 D1: no call starts, and none begun before is sent or applied, until resume(). */
+  pause(): void;
+  resume(): void;
+  /** NB5 C5 (b): the claims pool rebuilt for the database the move writes next. */
+  retarget?(entry: string): void;
   take(request: TakeRequest, onBegin?: () => void): Promise<TakeAnswer>;
   release(request: ReleaseRequest, onSent?: () => void, onConnected?: () => void): Promise<ReleasedRow[]>;
   readPage(shardCount: number | null): Promise<PageRead>;
@@ -306,12 +341,20 @@ export function toNodeRow(r: any): NodeRow {
 type Lane = 'renewal' | 'work' | 'release';
 
 export class ClaimStore implements ClaimStoreApi {
-  private readonly pool: Pool;
+  private pool: Pool;
   private readonly onLane = new Map<Lane, PoolClient>();
+  private paused = false;
+  /** Rises at every pause and never falls, so an answer is matched to the pause count read when its call began. */
+  private pauseCount = 0;
 
-  constructor(url: string, private readonly timings: ClaimTimings, private readonly onLoginRefused: () => void = () => undefined) {
-    this.pool = new Pool({
-      connectionString: url,
+  /** entry: one DATA_BACKEND_URL entry, the database the process writes (NB5 C5). */
+  constructor(entry: string, private readonly timings: ClaimTimings, private readonly onLoginRefused: () => void = () => undefined) {
+    this.pool = this.makePool(entry);
+  }
+
+  private makePool(entry: string): Pool {
+    const timings = this.timings;
+    const pool = new Pool({
       max: 2,
       min: 0,
       connectionTimeoutMillis: timings.renewMs,
@@ -321,32 +364,75 @@ export class ClaimStore implements ClaimStoreApi {
       statement_timeout: timings.statementMs,
       lock_timeout: Math.floor(timings.lockMs),
       idle_in_transaction_session_timeout: timings.renewMs,
+      ...pgConfig(entry),
     } as ConstructorParameters<typeof Pool>[0]);
-    this.pool.on('error', error => console.error('[Shards] Idle claims connection error:', error.message));
+    pool.on('error', error => console.error('[Shards] Idle claims connection error:', error.message));
+    return pool;
   }
 
-  /** boundMs, when a function, is read after the connect, so a caller can bound the connect and the work together. */
-  private async withClient<T>(lane: Lane, boundMs: number | (() => number), connectMs: number, what: string, fn: (client: PoolClient) => Promise<T>): Promise<T> {
+  /**
+   * boundMs, when a function, is read after the connect, so a caller can bound the connect and the work together.
+   * NB5 D1's gate: a call is refused while paused unless it is the move's; after the connect and at the answer, a pause
+   * or a new pool since the call began destroys the client and drops the answer with ClaimPausedError.
+   */
+  private async withClient<T>(lane: Lane, boundMs: number | (() => number), connectMs: number, what: string, fn: (client: PoolClient) => Promise<T>, move = false): Promise<T> {
+    if (this.paused && !move) throw new ClaimPausedError();
+    const count = this.pauseCount;
+    const pool = this.pool;
+    const stale = () => this.pauseCount !== count || this.pool !== pool;
     let client: PoolClient;
     try {
-      client = await withBound(this.pool.connect(), connectMs, what, c => c.release(true));
+      client = await withBound(pool.connect(), connectMs, what, c => c.release(true));
     } catch (error) {
+      if (stale()) throw new ClaimPausedError();
       this.noteRefused(error);
       throw new ClaimFailure(classifyFailure(error), error);
+    }
+    if (stale()) {
+      try { client.release(true); } catch { /* already released */ }
+      throw new ClaimPausedError();
     }
     this.onLane.set(lane, client);
     let destroy = false;
     try {
       const bound = typeof boundMs === 'function' ? boundMs() : boundMs;
-      return await withBound(fn(client), bound, what, undefined, () => { destroy = true; client.release(true); });
-    } catch (error) {
-      destroy = true;
-      this.noteRefused(error);
-      throw new ClaimFailure(classifyFailure(error), error);
+      let answer: T;
+      try {
+        answer = await withBound(fn(client), bound, what, undefined, () => { destroy = true; client.release(true); });
+      } catch (error) {
+        destroy = true;
+        if (stale()) throw new ClaimPausedError();
+        this.noteRefused(error);
+        throw new ClaimFailure(classifyFailure(error), error);
+      }
+      if (stale()) {
+        destroy = true;
+        throw new ClaimPausedError();
+      }
+      return answer;
     } finally {
       if (this.onLane.get(lane) === client) this.onLane.delete(lane);
       try { client.release(destroy ? true : undefined); } catch { /* already released */ }
     }
+  }
+
+  pause(): void {
+    this.paused = true;
+    this.pauseCount += 1;
+    this.abandonRenewal();
+    this.abandonWork();
+  }
+
+  resume(): void {
+    this.paused = false;
+  }
+
+  retarget(entry: string): void {
+    this.abandonRenewal();
+    this.abandonWork();
+    const old = this.pool;
+    this.pool = this.makePool(entry);
+    void old.end().catch(error => console.error('[Shards] The claims pool of the database this process left did not end cleanly:', error instanceof Error ? error.message : error));
   }
 
   private noteRefused(error: unknown): void {
@@ -359,7 +445,7 @@ export class ClaimStore implements ClaimStoreApi {
     return client.query({ text, values, query_timeout: this.timings.renewMs } as QueryConfig);
   }
 
-  async renew(request: RenewRequest): Promise<RenewAnswer> {
+  async renew(request: RenewRequest, opts: { move?: boolean } = {}): Promise<RenewAnswer> {
     const { me, pairs, heartbeat } = request;
     return this.withClient('renewal', this.timings.renewMs, this.timings.renewMs, 'the claim renewal', async client => {
       const res = await this.q(client, RENEWAL_SQL, [
@@ -374,7 +460,69 @@ export class ClaimStore implements ClaimStoreApi {
         priorProcess: row.prior_process ?? null,
         rows: rows.map(r => ({ shardCount: Number(r.shardCount), shardId: Number(r.shardId), claim: Number(r.claim), released: r.released === true, mine: r.mine === true })),
       };
-    });
+    }, opts.move === true);
+  }
+
+  async retake(request: RetakeRequest, onCommitSent?: () => void): Promise<RetakeAnswer> {
+    return this.withClient('work', 2 * this.timings.renewMs, this.timings.renewMs, 'the re-take', async client => {
+      await this.q(client, 'BEGIN');
+      try {
+        const answer = await this.retakeIn(client, request);
+        onCommitSent?.();
+        await this.q(client, 'COMMIT');
+        return answer;
+      } catch (error) {
+        await client.query('ROLLBACK').catch(() => undefined);
+        throw error;
+      }
+    }, true);
+  }
+
+  private async retakeIn(client: PoolClient, request: RetakeRequest): Promise<RetakeAnswer> {
+    const { me } = request;
+    const shardIds = [...new Set(request.pairs.map(p => p.shardId))];
+    const guildIds = [...new Set(request.guildIds.flatMap(g => g.guildIds))];
+    await this.q(client, CLAIM_LOCK);
+    const clock = (await this.q(client, CLOCK_SELECT)).rows[0];
+    const upMs = Number(clock.up_ms);
+    const uPrimeMs = Number(clock.u_prime);
+    const table = (await this.q(client, `SELECT to_regclass('smdb_manager.generation') IS NOT NULL AS present`)).rows[0];
+    const generations = table?.present === true
+      ? (await this.q(client, 'SELECT generation::text AS generation FROM smdb_manager.generation')).rows.map((r: any) => Number(r.generation))
+      : [];
+    const rows = (await this.q(client, `SELECT ${ROW_COLUMNS} FROM smdb_data.shard_claims WHERE shard_id = ANY($1::int[])`, [shardIds])).rows.map(toClaimRow);
+    const counts = (await this.q(client, 'SELECT DISTINCT shard_count FROM smdb_data.shard_claims')).rows.map((r: any) => Number(r.shard_count));
+    const guildClaims = (await this.q(client, `SELECT guild_id, shard_count, shard_id, claim::text AS claim FROM smdb_data.guild_ownership
+      WHERE (shard_count = $1 AND shard_id = ANY($2::int[])) OR guild_id = ANY($3::text[])`, [request.shardCount, shardIds, guildIds]))
+      .rows.map((r: any) => ({ guildId: r.guild_id, shardCount: Number(r.shard_count), shardId: Number(r.shard_id), claim: Number(r.claim) }));
+    const picks = planRetake({ me, pairs: request.pairs, guildIds: request.guildIds, generation: request.generation, generations, rows, counts, guildClaims });
+    if (picks.length === 0) return { taken: [] };
+    const claims = await this.drawClaims(client, picks.length);
+    const drawn = picks.map((pick, i) => ({ pick, claim: claims[i] }));
+    const fresh = drawn.filter(t => t.pick.row === null);
+    const again = drawn.filter(t => t.pick.row !== null);
+    const written = new Map<number, number>();
+    if (fresh.length > 0) {
+      const res = await this.q(client, TAKE_INSERT_SQL, [
+        request.shardCount, fresh.map(t => t.pick.pair.shardId), fresh.map(t => t.claim), me.processId, me.nodeId, me.nodeName,
+        false, request.ttlMs, uPrimeMs + request.ttlMs,
+      ]);
+      for (const r of res.rows) written.set(Number(r.shard_id), Number(r.claim));
+    }
+    if (again.length > 0) {
+      const res = await this.q(client, TAKE_UPDATE_SQL, [
+        request.shardCount, again.map(t => t.pick.pair.shardId), again.map(t => t.claim), me.processId, me.nodeId, me.nodeName,
+        false, request.ttlMs, uPrimeMs + request.ttlMs, again.map(t => t.pick.row!.claim),
+        again.map(t => t.pick.row!.holderProcess), upMs,
+      ]);
+      for (const r of res.rows) written.set(Number(r.shard_id), Number(r.claim));
+    }
+    const taken: RetakeAnswer['taken'] = [];
+    for (const { pick } of drawn) {
+      const claim = written.get(pick.pair.shardId);
+      if (claim !== undefined) taken.push({ before: pick.pair, pair: { ...pick.pair, claim } });
+    }
+    return { taken };
   }
 
   async take(request: TakeRequest, onBegin?: () => void): Promise<TakeAnswer> {

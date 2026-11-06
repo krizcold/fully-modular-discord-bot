@@ -413,6 +413,15 @@ describe('NB7-RS-1: every client of the two new pools keeps an error listener', 
     vi.spyOn(console, 'warn').mockImplementation(() => undefined);
     const before = process.env.DATA_BACKEND_URL;
     process.env.DATA_BACKEND_URL = 'postgres://fake-sweep-database';
+    // NB5 G9: the sweep's pool is built from the entry the bot process chose.
+    const { PostgresBackend } = await import('../../src/bot/internalSetup/utils/dataBackends/postgresBackend');
+    const { setGuildDataBackend } = await import('../../src/bot/internalSetup/utils/dataManager');
+    setGuildDataBackend(Object.assign(Object.create(PostgresBackend.prototype), {
+      chosenEntry: () => 'postgres://fake-sweep-database',
+      onDatabaseChanged: () => undefined,
+      databaseEpoch: () => 1,
+      refusalDetail: () => null,
+    }));
     try {
       _setLookupDb(null);
       fakeServer.script = () => ({ rows: [] });
@@ -425,6 +434,7 @@ describe('NB7-RS-1: every client of the two new pools keeps an error listener', 
         expect(() => client.emit('error', new Error('read ECONNRESET'))).not.toThrow();
       }
     } finally {
+      setGuildDataBackend(null);
       if (before === undefined) delete process.env.DATA_BACKEND_URL;
       else process.env.DATA_BACKEND_URL = before;
     }

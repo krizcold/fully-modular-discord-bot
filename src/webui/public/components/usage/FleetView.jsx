@@ -112,7 +112,25 @@ const DATA_BOOT_TEXT = {
   refused: 'refused',
 };
 
-function FleetDataCard({ dataBackend, dataBoot }) {
+// NB5 decision 19: the main database, the held counts while the process holds guilds, and every address.
+function fleetDatabaseLines(database) {
+  if (!database) return [];
+  const lines = [];
+  if (database.state === 'main' && database.chosen) {
+    lines.push(`Database: ${database.chosen}, main generation ${database.generation}${database.machine ? ` (${database.machine})` : ''}`);
+  } else {
+    lines.push(`Database: ${database.reason || database.state}`);
+  }
+  if (database.held && database.held.guilds > 0) lines.push(`${database.held.guilds} guild(s) hold changes that could not be saved`);
+  if (database.held && database.held.resave > 0) lines.push(`${database.held.resave} guild(s) are not re-saved yet on the bot's main database`);
+  for (const a of database.addresses || []) {
+    const generation = a.generation === null || a.generation === undefined ? '' : `, generation ${a.generation}${a.machine ? ` (${a.machine})` : ''}`;
+    lines.push(`${a.address}: ${a.state}${generation}${a.cause ? ` (${a.cause})` : ''}`);
+  }
+  return lines;
+}
+
+function FleetDataCard({ dataBackend, dataBoot, database }) {
   const state = dataBoot ? dataBoot.state : null;
   return (
     <div className="usage-stat-card" style={{ marginTop: '10px' }}>
@@ -125,6 +143,9 @@ function FleetDataCard({ dataBackend, dataBoot }) {
           {dataBoot.refusalReason || 'No reason was reported.'}
         </div>
       ) : null}
+      {fleetDatabaseLines(database).map((line, i) => (
+        <div key={i} className="usage-stat-sub" style={{ marginTop: i === 0 ? '6px' : undefined }}>{line}</div>
+      ))}
     </div>
   );
 }
@@ -290,7 +311,7 @@ function FleetView({ api, wsClient, guildNames }) {
       <div className="usage-board">
         <h3>Shards</h3>
         {fleet.dataBoot && fleet.dataBoot.state === 'refused' ? (
-          <FleetDataCard dataBackend={fleet.dataBackend} dataBoot={fleet.dataBoot} />
+          <FleetDataCard dataBackend={fleet.dataBackend} dataBoot={fleet.dataBoot} database={fleet.database} />
         ) : null}
         <div className="usage-empty">
           {!fleet.running
@@ -342,7 +363,7 @@ function FleetView({ api, wsClient, guildNames }) {
         {` · ${shardCount} shard${shardCount === 1 ? '' : 's'}`}
       </div>
 
-      <FleetDataCard dataBackend={fleet.dataBackend} dataBoot={fleet.dataBoot} />
+      <FleetDataCard dataBackend={fleet.dataBackend} dataBoot={fleet.dataBoot} database={fleet.database} />
 
       <FleetCapacityCard cap={capacitySummary} />
 

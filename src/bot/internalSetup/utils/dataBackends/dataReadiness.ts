@@ -44,6 +44,7 @@ export class DataReadinessDriver {
   // land) until boot releases the driver after the store-identity verdict.
   private held = false;
   private lastCatalog: string[] = [];
+  private catalogReadsOnWire = 0;
   private catalogTimer: NodeJS.Timeout;
   private readonly buffers = new Map<string, Array<() => void>>();
   private bufferDrops = 0;
@@ -56,7 +57,10 @@ export class DataReadinessDriver {
 
   constructor(private readonly backend: DataBackend, private readonly ws: WorkingSetManager, opts?: { held?: boolean }) {
     this.held = opts?.held ?? false;
-    this.catalogTimer = setInterval(() => void this.refreshCatalog(), CATALOG_REFRESH_MS);
+    this.catalogTimer = setInterval(() => {
+      if (this.catalogReadsOnWire > 0) return;
+      void this.refreshCatalog();
+    }, CATALOG_REFRESH_MS);
     this.catalogTimer.unref();
   }
 
@@ -341,10 +345,13 @@ export class DataReadinessDriver {
       setOwnedGuildCatalog([]);
       return;
     }
+    this.catalogReadsOnWire += 1;
     try {
       this.lastCatalog = await this.backend.listOwnedGuilds(this.shardIds, this.shardCount);
       setOwnedGuildCatalog(this.lastCatalog);
-    } catch { /* catalog snapshot refresh is best-effort; the next tick retries */ }
+    } catch { /* catalog snapshot refresh is best-effort; the next tick retries */ } finally {
+      this.catalogReadsOnWire -= 1;
+    }
   }
 }
 

@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { PostgresBackend } from '../../src/bot/internalSetup/utils/dataBackends/postgresBackend';
+import { fixedDatabase } from '../helpers/fixedDatabase';
 import { MigrationService } from '../../src/bot/internalSetup/utils/dataMigration';
 import { getNodeId } from '../../src/bot/internalSetup/fleet/nodeIdentity';
 import { jsonBot, realService, resetDatabase, startRig, stopRig, type PgRig } from '../helpers/pgMigrationRig';
@@ -57,7 +58,7 @@ describe('the ownership rows', () => {
     await service.idle();
     const { rows } = await rig.admin.query('SELECT shard_count FROM smdb_data.guild_ownership');
     expect(rows).toEqual([{ shard_count: 1 }]);
-    const backend = new PostgresBackend({ url: rig.url });
+    const backend = new PostgresBackend(fixedDatabase(rig.url));
     backend.start();
     const until = Date.now() + 60_000;
     while (backend.connectionState().state !== 'ready' && Date.now() < until) await new Promise(r => setTimeout(r, 100));
@@ -82,7 +83,7 @@ describe('the node id', () => {
     const { rows } = await rig.admin.query('SELECT guild_id, node_id FROM smdb_data.guild_ownership');
     expect(rows).toEqual([{ guild_id: G1, node_id: 'node-from-file' }]);
     expect(getNodeId()).toBe('node-from-file');
-    const backend = new PostgresBackend({ url: rig.url });
+    const backend = new PostgresBackend(fixedDatabase(rig.url));
     backend.start();
     try {
       const until = Date.now() + 60_000;

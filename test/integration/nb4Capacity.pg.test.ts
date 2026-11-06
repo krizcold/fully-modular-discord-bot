@@ -192,6 +192,9 @@ describe('a node with no web UI', () => {
       readPage: shardCount => { reads.n += 1; return inner.readPage(shardCount); },
       readRow: (shardCount, shardId) => inner.readRow(shardCount, shardId),
       abandonWork: () => inner.abandonWork(),
+      pause: () => inner.pause(),
+      resume: () => inner.resume(),
+      retake: (request, onCommitSent) => inner.retake(request, onCommitSent),
       abandonRenewal: () => inner.abandonRenewal(),
       end: () => inner.end(),
     };
@@ -353,6 +356,9 @@ describe('a node with no web UI leaves through its own stop handler (NB4-R6-T2, 
       readPage: shardCount => inner.readPage(shardCount),
       readRow: (shardCount, shardId) => inner.readRow(shardCount, shardId),
       abandonWork: () => inner.abandonWork(),
+      pause: () => inner.pause(),
+      resume: () => inner.resume(),
+      retake: (request, onCommitSent) => inner.retake(request, onCommitSent),
       abandonRenewal: () => {
         inner.abandonRenewal();
         fail?.(new Error('Connection terminated'));

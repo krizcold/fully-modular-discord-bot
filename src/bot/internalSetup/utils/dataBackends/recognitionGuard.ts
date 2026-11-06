@@ -11,6 +11,7 @@ import { DATA_ROOT } from '../../../../utils/dataRoot';
 import { DataBackendKind, resolveDataBackend } from '../../../../utils/envLoader';
 import { listGuilds } from './fileBackend';
 import { readStoreId, PostgresUnreachableError, PostgresInRecoveryError } from './postgresBackend';
+import type { ClientConfig } from 'pg';
 import { atomicWriteFileSync } from '../atomicWrite';
 
 export const MARKER_FILE = path.join(DATA_ROOT, '.backend.json');
@@ -59,6 +60,8 @@ export interface MigrationJournal {
   counts?: MigrationCounts;
   envSwitched?: boolean;
   leftOut?: string[];
+  /** What the job did not copy and says so (NB5 decision 16: an unreadable owner channel setting). */
+  notes?: string[];
   shadow?: string[];
   /** Streams whose last line had no newline, copied with one added (NB13 decision 12). */
   closedTails?: string[];
@@ -245,10 +248,10 @@ function refusalFrom(facts: Extract<DataFacts, { ok: true }>, configured: DataBa
  * A marker with no store id adopts the store's only when adopt is set (provisioning passed); until then the verdict
  * is pending, so a database refused for its schema version never leaves its id in the marker.
  */
-export async function verifyStoreIdentity(url: string, adopt: boolean): Promise<{ ok: true } | { ok: false; reason: string; pending?: true }> {
+export async function verifyStoreIdentity(config: ClientConfig, adopt: boolean): Promise<{ ok: true } | { ok: false; reason: string; pending?: true }> {
   let dbStoreId: string | null;
   try {
-    dbStoreId = await readStoreId(url);
+    dbStoreId = await readStoreId(config);
   } catch (error) {
     if (error instanceof PostgresInRecoveryError) return { ok: false, reason: error.message, pending: true };
     throw error;

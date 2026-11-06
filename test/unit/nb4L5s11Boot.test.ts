@@ -22,6 +22,7 @@ const h = vi.hoisted(() => ({
   kind: 'postgres' as 'postgres' | 'file' | 'throw',
   creds: null as null | Record<string, string | undefined>,
   skew: { perf: 0, wall: 0 },
+  backend: null as any,
 }));
 
 vi.mock('../../src/bot/internalSetup/fleet/placement', async orig => ({
@@ -64,6 +65,7 @@ vi.mock('../../src/bot/internalSetup/utils/dataBackends/boot', async orig => ({
 vi.mock('../../src/bot/internalSetup/utils/dataBackends/workingSet', async orig => ({
   ...(await orig<any>()),
   getWorkingSet: () => ({
+    resaveGuilds: () => [],
     heldGuilds: () => [], writesSettled: () => true, landedFlushes: () => 0, flushOnTheWire: () => false,
     flushAllDirty: async () => undefined, dirtyGuildIds: () => [], unansweredGuilds: () => ({ all: [], only: [] }), takeDropLines: () => [],
   }),
@@ -71,7 +73,7 @@ vi.mock('../../src/bot/internalSetup/utils/dataBackends/workingSet', async orig 
 vi.mock('../../src/bot/internalSetup/utils/dataManager', async orig => ({
   ...(await orig<any>()),
   getBackendHealth: () => ({ state: 'healthy', oldestDirtyMs: 0, dirtyBytes: 0, lastError: null }),
-  getGuildDataBackend: () => null,
+  getGuildDataBackend: () => h.backend,
   isStopping: () => h.stopping,
 }));
 vi.mock('../../src/bot/internalSetup/utils/maintenance', async orig => ({
@@ -131,7 +133,7 @@ beforeEach(() => {
   Object.assign(h, {
     gateway: { info: { recommendedShards: 4, sessionStartLimit: null }, error: null }, gatewaySeq: [], onFetch: null,
     gatewayCalls: 0, plans: [], grantTakesMs: 0, dataState: 'serving', stopping: false, leaves: [], records: [],
-    recordThrows: false, readRecord: null, kind: 'postgres', creds: null, skew: { perf: 0, wall: 0 },
+    recordThrows: false, readRecord: null, kind: 'postgres', creds: null, skew: { perf: 0, wall: 0 }, backend: null,
   });
   delete process.env.FLEET_SHARD_CAPACITY;
   delete process.env.FLEET_TAKEOVER_SECONDS;
@@ -358,18 +360,21 @@ describe('the shard count while /gateway/bot fails', () => {
 });
 
 describe('the claims pool URL', () => {
-  it('is DATA_BACKEND_URL with its surrounding spaces trimmed', async () => {
-    h.creds = { DATA_BACKEND_URL: '  postgres://bot@db:5432/bot \n' };
+  it('is the chosen entry, never the list (NB5 C5 (a))', async () => {
+    const { PostgresBackend } = await import('../../src/bot/internalSetup/utils/dataBackends/postgresBackend');
+    h.creds = { DATA_BACKEND_URL: 'postgres://bot@db0:5432/bot, postgres://bot@db:5432/bot' };
+    const onDatabaseChanged = vi.fn();
+    h.backend = Object.assign(Object.create(PostgresBackend.prototype), {
+      chosenEntry: () => 'postgres://bot@db:5432/bot',
+      connectionState: () => ({ state: 'ready' }),
+      onDatabaseChanged,
+      notifyLoginRefused: vi.fn(),
+    });
     const { ready } = await boot();
     await ready;
     expect(factoryUrls).toEqual(['postgres://bot@db:5432/bot']);
-  });
-
-  it('is empty when DATA_BACKEND_URL is not set', async () => {
-    h.creds = { DATA_BACKEND_URL: undefined };
-    const { ready } = await boot();
-    await ready;
-    expect(factoryUrls).toEqual(['']);
+    expect(onDatabaseChanged).toHaveBeenCalledTimes(1);
+    expect(onDatabaseChanged.mock.calls[0][0]).toBeTypeOf('function');
   });
 });
 

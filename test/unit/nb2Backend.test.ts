@@ -15,6 +15,7 @@ vi.mock('../../src/bot/internalSetup/utils/pgClient', async orig => ({
 }));
 
 import { isLoginRefused, PostgresBackend, PostgresUnreachableError } from '../../src/bot/internalSetup/utils/dataBackends/postgresBackend';
+import { fixedDatabase } from '../helpers/fixedDatabase';
 import { getWorkingSet } from '../../src/bot/internalSetup/utils/dataBackends/workingSet';
 import { saveData, flushAll } from '../../src/bot/internalSetup/utils/dataManager';
 import {
@@ -99,7 +100,7 @@ describe('ruling 7: SQLSTATE 28000 only', () => {
   });
 
   it('the backend tells its listeners of a 28000 failure and never of a 28P01 one', async () => {
-    const backend = new PostgresBackend({ url: 'postgresql://u:p@127.0.0.1:1/none' });
+    const backend = new PostgresBackend(fixedDatabase('postgresql://u:p@127.0.0.1:1/none'));
     const listener = vi.fn();
     backend.onLoginRefused(listener);
     (backend as any).noteFailure(sqlError('28P01'));
@@ -109,19 +110,17 @@ describe('ruling 7: SQLSTATE 28000 only', () => {
     await backend.stop();
   });
 
-  it('F4c: the outage probe loop moving from 57P01 (sessions ended) to 28000 tells the listeners once', async () => {
-    const backend = new PostgresBackend({ url: 'postgresql://u:p@127.0.0.1:1/none' });
+  it('F4c: the watch moving from 57P01 (sessions ended) to 28000 tells the listeners once (NB5 decision 13)', async () => {
+    const backend = new PostgresBackend(fixedDatabase('postgresql://u:p@127.0.0.1:1/none'));
     const listener = vi.fn();
     backend.onLoginRefused(listener);
-    const answers = [sqlError('57P01'), sqlError('57P01'), sqlError('28000')];
-    (backend as any).pool = {
-      query: vi.fn(async () => { const next = answers.shift(); if (next) throw next; return { rows: [] }; }),
-      end: async () => undefined,
-    };
-    (backend as any).sleep = async () => undefined;
-    (backend as any).state = 'outage';
-    await (backend as any).outageProbeLoop();
+    (backend as any).state = 'ready';
+    const epoch = backend.databaseEpoch();
+    for (const error of [sqlError('57P01'), sqlError('57P01'), sqlError('28000')]) backend.noteObservation(error, epoch);
     expect(listener).toHaveBeenCalledTimes(1);
+    expect(backend.connectionState().state).toBe('outage');
+    backend.noteEntryAnswered(epoch);
+    backend.confirmHold(epoch);
     expect(backend.connectionState().state).toBe('ready');
     await backend.stop();
   });
@@ -264,10 +263,10 @@ describe('ruling K: the watcher decides when the bot leaves Discord', () => {
   });
 
   it('the Postgres backend asks SELECT 1 through its pool: an answer, 28000 as refused, anything else unreachable', async () => {
-    const backend = new PostgresBackend({ url: 'postgresql://u:p@127.0.0.1:1/none' });
+    const backend = new PostgresBackend(fixedDatabase('postgresql://u:p@127.0.0.1:1/none'));
     const replies: Array<Error | null> = [null, sqlError('28000'), sqlError('28P01'), new Error('connect ECONNREFUSED')];
     const query = vi.fn(async (_config: { text: string; query_timeout?: number }) => { const next = replies.shift(); if (next) throw next; return { rows: [] }; });
-    (backend as any).pool = { query, end: async () => undefined };
+    (backend as any).pool = { connect: async () => ({ query, release: () => undefined }), end: async () => undefined };
     expect(await backend.askDatabase()).toBe('answers');
     expect(await backend.askDatabase()).toBe('refused');
     expect(await backend.askDatabase()).toBe('unreachable');

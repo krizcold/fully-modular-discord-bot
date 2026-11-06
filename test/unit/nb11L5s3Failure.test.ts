@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { FenceToken } from '../../src/bot/internalSetup/utils/dataBackends/backend';
 import { PostgresBackend } from '../../src/bot/internalSetup/utils/dataBackends/postgresBackend';
+import { fixedDatabase } from '../helpers/fixedDatabase';
 import { batchExistsAnswer, isBatch, isBatchExists, isBegin, isFenced, isLive, isMove } from '../helpers/nb11ScriptedPg';
 
 // NB11 (wip-redesign/sheets/NB11.md): how a failed statement is named in the outage line and classified as an answer
@@ -15,7 +16,7 @@ let errorSpy: ReturnType<typeof vi.spyOn>;
 type Reply = { rows?: unknown[]; rowCount?: number } | { reject: unknown } | undefined;
 
 function rig(answer: (sql: string) => Reply) {
-  const backend = new PostgresBackend({ url: 'postgres://nobody@127.0.0.1:9/none' });
+  const backend = new PostgresBackend(fixedDatabase('postgres://nobody@127.0.0.1:9/none'));
   backends.push(backend);
   const internals = backend as unknown as { state: string; provisioned: boolean };
   internals.state = 'ready';
@@ -126,9 +127,10 @@ describe('real clock', () => {
       ['ERROR 22008 (08 not at the start)', '22008', 'ERROR'],
       ['ERROR 57P04', '57P04', 'ERROR'],
       ['ERROR 40001', '40001', 'ERROR'],
-    ] as const)('%s was answered: the line names its SQLSTATE', async (_name, code, severity) => {
-      const { said } = await flushFailingWith(serverError(code, severity));
-      expect(said).toEqual([operation(code)]);
+    ] as const)('%s was answered: no hold and no outage line (NB5 decision 13)', async (_name, code, severity) => {
+      const { said, state } = await flushFailingWith(serverError(code, severity));
+      expect(said).toEqual([]);
+      expect(state).toBe('ready');
     });
   });
 

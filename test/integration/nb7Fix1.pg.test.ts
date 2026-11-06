@@ -35,7 +35,7 @@ afterAll(async () => {
 
 describe('NB7-DL1 and NB7-M2 on real Postgres', () => {
   it('the reader\'s holder check returns the URL of the database it read', async () => {
-    setWebuiDataStoreUrl(rig.url);
+    setWebuiDataStoreUrl({ url: rig.url });
     const res = await getWebuiDataReader().holderOf(GUILD, 5000);
     expect(res.url).toBe(rig.url);
   }, 30_000);

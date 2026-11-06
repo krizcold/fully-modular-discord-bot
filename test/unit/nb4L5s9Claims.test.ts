@@ -70,6 +70,9 @@ function rig(over: Partial<ShardClaimsDeps> = {}) {
     readRow: vi.fn(async () => ({ row: null as ClaimRow | null, storedCount: 2 as number | null })),
     abandonWork: vi.fn(),
     abandonRenewal: vi.fn(),
+    pause: vi.fn(),
+    resume: vi.fn(),
+    retake: vi.fn(async (): Promise<never> => { throw new Error('NB4 never re-takes'); }),
     end: vi.fn(async () => undefined),
   };
   const log = { log: vi.fn(), warn: vi.fn(), error: vi.fn() };

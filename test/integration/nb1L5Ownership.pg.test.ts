@@ -3,6 +3,7 @@ import type { Pool } from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { FenceToken } from '../../src/bot/internalSetup/utils/dataBackends/backend';
 import { PostgresBackend } from '../../src/bot/internalSetup/utils/dataBackends/postgresBackend';
+import { fixedDatabase } from '../helpers/fixedDatabase';
 import { poolFor, startPostgres } from '../helpers/postgres';
 import { takeShard } from '../helpers/pgClaims';
 
@@ -14,7 +15,7 @@ let nodeB: PostgresBackend;
 async function readyBackend(): Promise<PostgresBackend> {
   const user = encodeURIComponent(container.getUsername());
   const password = encodeURIComponent(container.getPassword());
-  const b = new PostgresBackend({ url: `postgres://${user}:${password}@${container.getHost()}:${container.getPort()}/${container.getDatabase()}` });
+  const b = new PostgresBackend(fixedDatabase(`postgres://${user}:${password}@${container.getHost()}:${container.getPort()}/${container.getDatabase()}`));
   b.start();
   const until = Date.now() + 60_000;
   while (b.connectionState().state !== 'ready' && Date.now() < until) await new Promise(resolve => { setTimeout(resolve, 100); });
@@ -92,7 +93,7 @@ describe('fenced calls on a guild whose ownership row already exists', () => {
     const b = tokenOf('node-b', await claimOf(nodeB));
     expect((await nodeB.hydrateGuild(guildId, b)).ok).toBe(true);
     expect(await nodeB.flushGuild(guildId, batchOf('{"from":"b"}'), b)).toEqual({ ok: true });
-    expect(await nodeB.retireGuild(guildId, 'test', b)).toEqual({ ok: true, moved: 1 });
+    expect(await nodeB.retireGuild(guildId, 'test', b)).toEqual({ ok: true, moved: 1, retiredAt: expect.any(Number) });
     expect(await ownerRow(guildId)).toEqual({ node_id: 'node-b', claim: String(b.claim), retired: true });
     expect(await nodeB.listGuilds()).not.toContain(guildId);
 
@@ -100,7 +101,7 @@ describe('fenced calls on a guild whose ownership row already exists', () => {
     expect(await ownerRow(guildId)).toEqual({ node_id: 'node-b', claim: String(b.claim), retired: false });
     expect(await nodeB.listGuilds()).toContain(guildId);
 
-    expect(await nodeB.retireGuild(guildId, 'test', b)).toEqual({ ok: true, moved: 0 });
+    expect(await nodeB.retireGuild(guildId, 'test', b)).toEqual({ ok: true, moved: 0, retiredAt: expect.any(Number) });
     const newer = tokenOf('node-a', await claimOf(nodeA));
     expect(await nodeA.hydrateGuild(guildId, newer)).toEqual({ ok: true, docs: [], appendKeys: [] });
     expect(await ownerRow(guildId)).toEqual({ node_id: 'node-a', claim: String(newer.claim), retired: false });

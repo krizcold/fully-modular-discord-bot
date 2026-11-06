@@ -19,10 +19,10 @@ vi.mock('pg', async orig => {
 
 describe('WebuiDataReader', () => {
   it('opens its pool under the application name the migration skips', async () => {
-    setWebuiDataStoreUrl('postgres://reader:pw@db.example:5432/smdb');
+    setWebuiDataStoreUrl({ url: 'postgres://reader:pw@db.example:5432/smdb' });
     expect(await new WebuiDataReader().listGuilds()).toEqual([]);
     expect(seen.configs).toHaveLength(1);
-    expect(seen.configs[0]).toMatchObject({ connectionString: 'postgres://reader:pw@db.example:5432/smdb', application_name: 'smdb-webui-reader' });
+    expect(seen.configs[0]).toMatchObject({ host: 'db.example', database: 'smdb', user: 'reader', application_name: 'smdb-webui-reader' });
     setWebuiDataStoreUrl(null);
   });
 });

@@ -67,6 +67,7 @@ vi.mock('../../src/bot/internalSetup/utils/dataBackends/boot', async orig => ({
 vi.mock('../../src/bot/internalSetup/utils/dataBackends/workingSet', async orig => ({
   ...(await orig<any>()),
   getWorkingSet: () => ({
+    resaveGuilds: () => [],
     heldGuilds: () => h.held, writesSettled: () => true, landedFlushes: () => 0, flushOnTheWire: () => false,
     flushAllDirty: async () => undefined, dirtyGuildIds: () => [], unansweredGuilds: () => ({ all: [], only: [] }), takeDropLines: () => [],
   }),

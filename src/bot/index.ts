@@ -47,10 +47,12 @@ import 'dotenv/config';
 
 import { beginStop, installStopHandler } from './internalSetup/utils/dataManager';
 import { configureWriterLock, onDeposed, releaseWriterLockAtExit, reportWriterStage, takeWriterLockForBoot } from './internalSetup/utils/writerLock';
+import { setupAddressesIpc } from '../utils/databaseAddress';
 
 // Every writer of the data files runs after the writer lock is taken: clientInitializer loads only then.
 async function boot(): Promise<void> {
   configureWriterLock('bot');
+  setupAddressesIpc();
   await takeWriterLockForBoot();
   installStopHandler();
   process.on('exit', () => releaseWriterLockAtExit());

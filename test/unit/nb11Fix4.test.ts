@@ -33,7 +33,7 @@ const lines = (): string[] => error.mock.calls.map((c: unknown[]) => c.map(Strin
 const opLines = () => lines().filter(line => /restoreGuild|retireGuild/.test(line));
 
 class AnsweringStore extends FakeStore {
-  retireAnswer: RetireOutcome = { ok: false, reason: 'unknown' };
+  retireAnswer: RetireOutcome = { ok: false, reason: 'unknown', retiredAt: 5, moved: 1 };
   restoreAnswer: () => Promise<RestoreOutcome> = async () => ({ ok: false, reason: 'unknown', retiredAt: 5 });
   override async retireGuild(): Promise<RetireOutcome> { return this.retireAnswer; }
   override async restoreGuild(): Promise<RestoreOutcome> { return this.restoreAnswer(); }
@@ -94,7 +94,7 @@ describe('a COMMIT with no answer in the bot log', () => {
 
   it('the retire logs can\'t confirm, never failed', async () => {
     const backend = scripted(isCommit, commitLost);
-    expect(await backend.retireGuild('1', 'test', token, monoIn(40 * SECOND))).toEqual({ ok: false, reason: 'unknown' });
+    expect(await backend.retireGuild('1', 'test', token, monoIn(40 * SECOND))).toEqual({ ok: false, reason: 'unknown', retiredAt: expect.any(Number), moved: 0 });
     expect(opLines()).toEqual(["[PostgresBackend] retireGuild of guild 1: COMMIT got no answer (read ECONNRESET); can't confirm whether it committed"]);
   });
 

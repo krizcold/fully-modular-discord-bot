@@ -199,6 +199,7 @@ describe('post() answers', () => {
       releaseMigrationLock: () => undefined,
       migrationRunning: () => null,
       migrationBotState: () => ({ ok: true }),
+      ownerChannelWriteSettled: () => true,
     };
     const service = serviceFor(new FakeDb(), host);
     const answer = await service.post({ jobId: 'job-l5s5-held-02', to: 'postgres' });

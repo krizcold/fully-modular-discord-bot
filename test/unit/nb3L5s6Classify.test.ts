@@ -10,7 +10,7 @@ import {
 // NB3 S0: how a request is classified against the journal and marker an earlier job left, and the one database read
 // it makes for that. Each answer is checked by its exact text, and a refusal leaves every file under /data as it was.
 
-const ADDRESS_LIST = 'DATA_BACKEND_URL must be one address; a list of addresses is refused until the address picker exists';
+const ADDRESS_LIST = 'DATA_BACKEND_URL lists 2 database addresses (live copies on other machines); a migration needs one database address, so remove the live copies first';
 const SOURCE = { host: 'db.example', port: 5432, database: 'smdb' };
 const NEW = 'job-c6-new0001';
 
@@ -82,6 +82,16 @@ describe('S0 refusals before an earlier job is looked at', () => {
     const before = snapshotRoot();
     const answer = await serviceFor(new FakeDb()).post({ jobId: NEW, to: 'file', url: 'postgres://a.example/smdb,postgres://b.example/smdb' });
     expect(answer).toEqual({ status: 409, body: { success: false, error: ADDRESS_LIST } });
+    expect(snapshotRoot()).toEqual(before);
+  });
+
+  it('NB5 C6: a url with an empty entry names that entry and counts no live copy for it', async () => {
+    freshJsonBot();
+    const before = snapshotRoot();
+    const trailing = await serviceFor(new FakeDb()).post({ jobId: NEW, to: 'file', url: 'postgres://a.example/smdb,' });
+    expect(trailing).toEqual({ status: 409, body: { success: false, error: 'entry 2 of DATA_BACKEND_URL must start with postgresql:// or postgres://' } });
+    const middle = await serviceFor(new FakeDb()).post({ jobId: NEW, to: 'file', url: 'postgres://a.example/smdb,,postgres://b.example/smdb' });
+    expect(middle).toEqual({ status: 409, body: { success: false, error: 'entry 2 of DATA_BACKEND_URL must start with postgresql:// or postgres://' } });
     expect(snapshotRoot()).toEqual(before);
   });
 

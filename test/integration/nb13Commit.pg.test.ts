@@ -4,6 +4,7 @@ import type { Pool } from 'pg';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { FenceToken, GuildFlushBatch } from '../../src/bot/internalSetup/utils/dataBackends/backend';
 import { PostgresBackend, SCHEMA_VERSION } from '../../src/bot/internalSetup/utils/dataBackends/postgresBackend';
+import { fixedDatabase } from '../helpers/fixedDatabase';
 import { WorkingSetManager, type WsTicket } from '../../src/bot/internalSetup/utils/dataBackends/workingSet';
 import { Hop } from '../helpers/hop';
 import { poolFor, startPostgres } from '../helpers/postgres';
@@ -38,9 +39,9 @@ beforeAll(async () => {
   container = await startPostgres();
   direct = poolFor(container);
   hop = new Hop({ host: container.getHost(), port: container.getPort() });
-  backend = new PostgresBackend({ url: urlFor(await hop.listen()) });
+  backend = new PostgresBackend(fixedDatabase(urlFor(await hop.listen())));
   await ready(backend);
-  other = new PostgresBackend({ url: urlFor(container.getPort(), container.getHost()) });
+  other = new PostgresBackend(fixedDatabase(urlFor(container.getPort(), container.getHost())));
   await ready(other);
   for (const claim of [1, 2]) {
     await direct.query(`INSERT INTO smdb_data.shard_claims (shard_count, shard_id, claim, holder_process, holder_node, holder_name, home_node, ttl_ms, expires_up_ms)
@@ -62,6 +63,14 @@ beforeEach(() => {
   vi.spyOn(console, 'warn').mockImplementation(() => undefined);
   vi.spyOn(console, 'error').mockImplementation(() => undefined);
 });
+
+// The test chooser ends a hold on the next timer turn; a row yields one before it calls the backend again.
+async function unheld(): Promise<void> {
+  const until = Date.now() + 10_000;
+  do await new Promise(resolve => { setTimeout(resolve, 10); });
+  while (backend.holdWords() !== null && Date.now() < until);
+  expect(backend.holdWords()).toBeNull();
+}
 
 async function lines(guildId: string): Promise<WsTicket> {
   return (await direct.query('SELECT count(*)::int AS n FROM smdb_data.guild_append WHERE guild_id = $1', [guildId])).rows[0].n;
@@ -91,6 +100,7 @@ describe('a COMMIT whose answer is missing', () => {
       const answer = ws.confirm(ticket, 90_000);
       await seen;
       expect(await answer).toBe('pending');
+      await unheld();
       expect(await ws.confirm(ticket, 90_000)).toBe('ok');
       expect(await lines(guildId)).toBe(1);
       expect((await mark(guildId))?.last_flush).toMatch(/^[0-9a-f-]{36}$/);
@@ -108,6 +118,7 @@ describe('a COMMIT whose answer is missing', () => {
       const answer = ws.confirm(ticket, 90_000);
       await seen;
       expect(await answer).toBe('pending');
+      await unheld();
       expect(await ws.confirm(ticket, 90_000)).toBe('ok');
       expect(await lines(guildId)).toBe(1);
     } finally {
@@ -140,6 +151,7 @@ describe('a COMMIT whose answer is missing', () => {
       const answer = ws.confirm(ticket, 90_000);
       await seen;
       expect(await answer).toBe('pending');
+      await unheld();
       expect(await ws.confirm(ticket, 90_000)).toBe('ok');
       expect(Date.now() - started).toBeGreaterThanOrEqual(9_000);
       expect(await lines(guildId)).toBe(1);
@@ -157,6 +169,7 @@ describe('a COMMIT whose answer is missing', () => {
       await seen;
       expect(await flushing).toMatchObject({ ok: false, reason: 'unavailable', commitUnanswered: true });
       hop.restore();
+      await unheld();
       expect(await backend.resolveFlush(guildId, batch.flushId!, 1, A)).toEqual({ fate });
       expect(await lines(guildId)).toBe(rows);
       if (fate === 'not-landed') expect(await mark(guildId)).toBeUndefined();
@@ -190,6 +203,7 @@ describe('a COMMIT whose answer is missing', () => {
       expect(await other.flushGuild(guildId, { upserts: [{ key: { module: 'm', filename: 'b.json' }, doc: '{}' }], deletes: [], appends: [], flushId: randomUUID() }, B)).toEqual({ ok: true });
       hop.restore();
       expect(await answer).toBe('pending');
+      await unheld();
       expect(await ws.confirm(ticket, 90_000)).toBe('unavailable');
       expect(await lines(guildId)).toBe(1);
     } finally {
@@ -207,7 +221,7 @@ describe('a COMMIT whose answer is missing', () => {
   it('3.7 a store at version 3 is refused and no row changes', async () => {
     await direct.query(`UPDATE smdb_data.meta SET value = '{"v":3}' WHERE key = 'schema_version'`);
     const before = (await direct.query('SELECT count(*)::int AS n FROM smdb_data.guild_ownership')).rows[0].n;
-    const third = new PostgresBackend({ url: urlFor(container.getPort(), container.getHost()) });
+    const third = new PostgresBackend(fixedDatabase(urlFor(container.getPort(), container.getHost())));
     third.start();
     try {
       expect(await third.provisionVerdict()).toEqual({ state: 'mismatch', found: '{"v":3}' });

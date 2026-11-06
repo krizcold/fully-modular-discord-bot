@@ -15,7 +15,9 @@ import {
 } from './maintenanceGate';
 import { readMaintenanceFile } from '../../../utils/maintenanceFile';
 import { loadCredentials, resolveDataBackend } from '../../../utils/envLoader';
-import { addStopStep, isExitDraining, saveHeldWrites, stopProcess } from './dataManager';
+import { addStopStep, isExitDraining, resaveTarget, saveHeldWrites, stopProcess } from './dataManager';
+import { probePass, setStepLayers, stepLayers } from './dataBackends/mainDatabase';
+import { addressListInUse, parseAddressList, showEntry } from '../../../utils/databaseAddress';
 import { heldClauses, type HeldCounts } from './heldWords';
 import { STOPPED_SERVING_TEXT, stoppedServing } from './servingGate';
 import { setupSharedOpsIPC } from './sharedOps';
@@ -59,7 +61,7 @@ export type SaveAnswer =
   | { saved: null; unansweredGuilds: number; unconfirmedFiles: number }
   | ({ saved: false } & HeldCounts);
 export type DatabaseAnswer = 'answers' | 'refused' | 'unreachable';
-type Held = { unsavedGuilds: number; unsavedFiles: number; unansweredGuilds: number };
+type Held = { unsavedGuilds: number; unsavedFiles: number; unansweredGuilds: number; resaveGuilds?: number };
 
 let clientRef: Client | null = null;
 let mode: MaintenanceMode = 'running';
@@ -74,6 +76,7 @@ let leaving = false;
 let heldReport: Held | null = null;
 // The watcher's last answer; null on a JSON bot or in maintenance mode, where no watcher runs, and before its first probe.
 let databaseAnswer: DatabaseAnswer | null = null;
+let watchedBackend: WatchedBackend | null = null;
 let watching = false;
 // Bumped by _resetMaintenance, so a leave step a test started stops with it.
 let generation = 0;
@@ -108,6 +111,7 @@ export function _resetMaintenance(): void {
   leaving = false;
   heldReport = null;
   databaseAnswer = null;
+  watchedBackend = null;
   watching = false;
   generation += 1;
   for (const timer of timers) clearInterval(timer);
@@ -284,11 +288,12 @@ export async function enterMaintenance(message: string, opts: { handlerWaitMs?: 
   while (handlersInFlight() > 0 && Date.now() < waitUntil) await new Promise<void>(resolve => { setTimeout(resolve, 20); });
   if (handlersInFlight() > 0) console.warn(`[Maintenance] ${handlersInFlight()} handler(s) still run; any write they make from now on is refused`);
   const left = await saveHeldWrites(opts.saveBoundMs ?? ENTER_BOUNDS.saveBoundMs);
-  if (left.unsavedGuilds === 0 && left.unsavedFiles === 0 && left.unansweredGuilds === 0 && left.unconfirmedFiles === 0) {
+  const resave = left.resaveGuilds ?? 0;
+  if (left.unsavedGuilds === 0 && left.unsavedFiles === 0 && left.unansweredGuilds === 0 && left.unconfirmedFiles === 0 && resave === 0) {
     console.log('[Maintenance] Every change this process held is saved');
     return { saved: true };
   }
-  if (left.unsavedGuilds === 0 && left.unsavedFiles === 0) {
+  if (left.unsavedGuilds === 0 && left.unsavedFiles === 0 && resave === 0) {
     console.warn(`[Maintenance] ${heldClauses(left)}; can't confirm whether every change this process held is saved`);
     return { saved: null, unansweredGuilds: left.unansweredGuilds, unconfirmedFiles: left.unconfirmedFiles };
   }
@@ -443,6 +448,13 @@ export function heldForContent(): boolean {
 
 /** Where the bot stands while the leave step waits, in the held log's words. */
 function standing(): string {
+  const why = stepLayers.databaseStopWhy() ?? watchedBackend?.latchReason?.() ?? null;
+  if (why !== null) return `the bot process stays off Discord (${why})`;
+  const confirming = watchedBackend?.confirmingWords?.() ?? null;
+  const entry = watchedBackend?.chosenEntry?.() ?? null;
+  if (confirming !== null && entry !== null) {
+    return `the bot process keeps its changes unsaved until it can confirm that ${showEntry(entry)} is still the main (${confirming})`;
+  }
   if (outageDisconnected) return isMaintenanceGateClosed() ? 'the bot process stays off Discord (in maintenance)' : 'the bot process stays off Discord';
   if (isMaintenanceGateClosed()) return 'the bot process stays in maintenance';
   return 'the bot process keeps running';
@@ -477,18 +489,20 @@ export function startLeave(reason: string): void {
       const left = isMaintenanceBoot() ? { unsavedGuilds: 0, unsavedFiles: 0, unansweredGuilds: 0, unconfirmedFiles: 0 } : await saveHeldWrites(timing.leaveSaveBoundMs);
       if (own !== generation) return;
       // Appended lines the disk did not confirm are in their files: waiting cannot confirm them, so they never hold the leave.
-      if (left.unsavedGuilds === 0 && left.unsavedFiles === 0 && left.unansweredGuilds === 0) {
+      const resave = left.resaveGuilds ?? 0;
+      if (left.unsavedGuilds === 0 && left.unsavedFiles === 0 && left.unansweredGuilds === 0 && resave === 0) {
         restart();
         return;
       }
-      const answers = !watching || databaseAnswer === 'answers';
+      // Decision 11: a backend that holds the saves back by its own state counts as answering.
+      const answers = !watching || databaseAnswer === 'answers' || watchedBackend?.refusesByOwnState?.() === true;
       answeredPasses = answers ? answeredPasses + 1 : 0;
       refusedPasses = answers && watching && left.unsavedFiles === 0 && heldForContent() ? refusedPasses + 1 : 0;
       if (answeredPasses >= timing.heldAfterPasses) {
         const only = getWorkingSet()?.unansweredGuilds().only ?? [];
         const names = heldNames(only);
-        const held = { unsavedGuilds: left.unsavedGuilds, unsavedFiles: left.unsavedFiles, unansweredGuilds: left.unansweredGuilds };
-        if (refusedPasses >= timing.heldAfterPasses) {
+        const held: Held = { unsavedGuilds: left.unsavedGuilds, unsavedFiles: left.unsavedFiles, unansweredGuilds: left.unansweredGuilds, ...(resave > 0 ? { resaveGuilds: resave } : {}) };
+        if (refusedPasses >= timing.heldAfterPasses && resave === 0) {
           console.error(`[Maintenance] ${refusedPasses} saves in a row left changes the database refuses for their content: ${names}; ${restarts
             ? 'the bot process asks for its restart, which drops these changes'
             : 'the bot process stops, which drops these changes'}`);
@@ -498,18 +512,22 @@ export function startLeave(reason: string): void {
           return;
         }
         const forContent = refusedPasses > 0;
-        const key = `${left.unsavedGuilds}/${left.unsavedFiles}/${left.unansweredGuilds}/${names}/${only.join(',')}/${forContent}`;
+        const resaveIds = getWorkingSet()?.resaveGuilds() ?? [];
+        const key = `${left.unsavedGuilds}/${left.unsavedFiles}/${left.unansweredGuilds}/${names}/${only.join(',')}/${forContent}/${resaveIds.join(',')}`;
         if (key !== heldKey) {
           heldKey = key;
           const onlyWords = `guild(s) ${only.join(', ')}`;
-          const head = names
-            ? `left changes unsaved: ${names}${only.length > 0 ? `; ${onlyWords} hold only a save the database did not answer, which may have landed` : ''}`
-            : `left ${onlyWords} holding only a save the database did not answer, which may have landed`;
+          const resaveWords = `${resaveIds.length} guild(s) ${names || only.length > 0 ? 'wait' : 'waiting'} to be re-saved on ${resaveTarget()}: ${resaveIds.join(', ')}; this process holds their newest state`;
+          const saveHead = names
+            ? `${answeredPasses} saves in a row left changes unsaved: ${names}${only.length > 0 ? `; ${onlyWords} hold only a save the database did not answer, which may have landed` : ''}`
+            : only.length > 0 ? `${answeredPasses} saves in a row left ${onlyWords} holding only a save the database did not answer, which may have landed` : '';
+          const head = resaveIds.length === 0 ? saveHead
+            : saveHead ? `${saveHead}; ${resaveWords}` : `${answeredPasses} saves in a row left ${resaveWords}`;
           const unanswered = left.unansweredGuilds > 0;
           const drops = unanswered ? 'which drops every change not stored' : 'which drops them';
           const saved = unanswered ? 'they are saved or found stored' : 'they are saved';
           const earlier = askedEarlier ? `; a restart this process asked for earlier may still stop it, ${drops}` : '';
-          console.error(`[Maintenance] ${answeredPasses} saves in a row ${head}; ${forContent
+          console.error(`[Maintenance] ${head}; ${forContent
             ? `the database refuses these for their content; ${standing()}, and after ${timing.heldAfterPasses} saves in a row that fail this way it ${restarts ? 'restarts' : 'stops'} and drops them`
             : restarts
               ? `${standing()} and does not restart until ${saved} or the operator restarts it, ${drops}${earlier}`
@@ -533,17 +551,16 @@ export async function probeLoginAtBoot(): Promise<'accepted' | 'refused' | 'unre
   } catch {
     return 'none';
   }
-  const url = (loadCredentials().DATA_BACKEND_URL || '').trim();
-  if (kind !== 'postgres' || !url) return 'none';
-  const client = shortLivedClient({ connectionString: url, connectionTimeoutMillis: BOOT_PROBE_TIMEOUT_MS });
-  try {
-    await client.connect();
-    return 'accepted';
-  } catch (error) {
-    return isLoginRefused(error) ? 'refused' : 'unreachable';
-  } finally {
-    await client.end().catch(() => { /* never connected */ });
-  }
+  const list = addressListInUse();
+  if (kind !== 'postgres' || !list) return 'none';
+  return loginOfPass(await probePass(parseAddressList(list), { session: config => shortLivedClient(config) }));
+}
+
+/** NB5 decision 7: one pass, mapped from the pass alone. */
+export function loginOfPass(pass: Array<{ kind: 'answered' | 'refused' | 'failed'; loggedIn?: true }>): 'accepted' | 'refused' | 'unreachable' {
+  // A statement that failed after the connect still had its login accepted.
+  if (pass.some(p => p.kind === 'answered' || p.loggedIn)) return 'accepted';
+  return pass.some(p => p.kind === 'refused') ? 'refused' : 'unreachable';
 }
 
 export type BootDecision = { mode: 'normal' } | { mode: 'maintenance'; cause: MaintenanceCause; message: string };
@@ -582,6 +599,10 @@ export function markDiscordStarted(): void {
 export interface WatchedBackend {
   onLoginRefused(cb: () => void): void;
   askDatabase(): Promise<DatabaseAnswer>;
+  refusesByOwnState?(): boolean;
+  latchReason?(): string | null;
+  confirmingWords?(): string | null;
+  chosenEntry?(): string | null;
 }
 
 /**
@@ -596,6 +617,8 @@ export function watchDataBackend(
 ): { probeNow(): Promise<void> } | null {
   if (!backend) return null;
   watching = true;
+  watchedBackend = backend;
+  setStepLayers({ startLeave });
   const bound = deps.probeTimeoutMs ?? WATCH_PROBE_BOUND_MS;
   let toldAnswers = false;
 

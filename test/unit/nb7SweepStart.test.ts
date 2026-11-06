@@ -4,6 +4,8 @@ import { startGuildRequestSweep } from '../../src/bot/internalSetup/fleet/guildR
 import { ANSWER_SQL, REQUEST_CLAIM_SQL } from '../../src/bot/internalSetup/utils/dataBackends/guildRequestSql';
 import { setMaintenanceGate } from '../../src/bot/internalSetup/utils/maintenanceGate';
 import { setBackendKind } from '../helpers/backendKind';
+import { setGuildDataBackend } from '../../src/bot/internalSetup/utils/dataManager';
+import { PostgresBackend } from '../../src/bot/internalSetup/utils/dataBackends/postgresBackend';
 
 // NB7 decisions 7 and 16: the sweep the bot starts applies each claimed row through answerGuildWrite, so a closed
 // maintenance gate is answered with the maintenance refusal before the executor reads anything.
@@ -48,6 +50,7 @@ beforeEach(() => {
 });
 afterEach(() => {
   setMaintenanceGate(null);
+  setGuildDataBackend(null);
   vi.unstubAllEnvs();
   vi.useRealTimers();
   vi.restoreAllMocks();
@@ -65,12 +68,19 @@ describe('the sweep the bot starts', () => {
       if (text === ANSWER_SQL) return { rows: [], rowCount: 1 };
       return { rows: [], rowCount: 0, values };
     };
+    // NB5 G9: the pool is built from the entry the bot process chose.
+    setGuildDataBackend(Object.assign(Object.create(PostgresBackend.prototype), {
+      chosenEntry: () => 'postgres://sweep:pw@db.example:5432/smdb',
+      onDatabaseChanged: () => undefined,
+      databaseEpoch: () => 1,
+      refusalDetail: () => null,
+    }));
     setMaintenanceGate({ cause: 'hook', message: 'Back soon' });
     startGuildRequestSweep(lease);
     await vi.advanceTimersByTimeAsync(1000);
     for (let i = 0; i < 20; i++) await Promise.resolve();
     expect(db.configs).toHaveLength(1);
-    expect(db.configs[0]).toMatchObject({ connectionString: 'postgres://sweep:pw@db.example:5432/smdb', application_name: 'smdb-guild-requests', max: 2, statement_timeout: 5000 });
+    expect(db.configs[0]).toMatchObject({ host: 'db.example', port: 5432, database: 'smdb', user: 'sweep', application_name: 'smdb-guild-requests', max: 2, statement_timeout: 5000 });
     const claim = db.sent.find(s => s.text === REQUEST_CLAIM_SQL)!;
     expect(claim.values[0]).toBe('p-b');
     expect(claim.values.slice(2, 5)).toEqual([[2], [1], [9]]);

@@ -3,9 +3,12 @@
 // answers the rows of a claim whose answer never reached it, and deletes rows older than an hour. Postgres only.
 
 import { Pool } from 'pg';
+import type { ClientConfig } from 'pg';
 import { guardPoolClients } from '../utils/pgClient';
 import { randomUUID } from 'crypto';
-import { loadCredentials, resolveDataBackend } from '../../../utils/envLoader';
+import { resolveDataBackend } from '../../../utils/envLoader';
+import { pgConfig } from '../../../utils/databaseAddress';
+import { PostgresBackend } from '../utils/dataBackends/postgresBackend';
 import {
   ANSWER_READ_BACK_SQL,
   ANSWER_SQL,
@@ -17,9 +20,10 @@ import {
 } from '../utils/dataBackends/guildRequestSql';
 import { answerGuildWrite, type DataWriteReply, type GuildDataWriteRequest } from '../utils/ipcDataHandler';
 import { getDataBootStatus } from '../utils/dataBackends/boot';
-import { isStopping } from '../utils/dataManager';
+import { getGuildDataBackend, isStopping } from '../utils/dataManager';
 import { stoppedServing } from '../utils/servingGate';
 import { holderStateOf } from './claimStore';
+import { getShardClaims } from './shardBoot';
 import type { CurrentLease } from './leaseRuntime';
 import type { Pair } from './claimRules';
 
@@ -38,8 +42,29 @@ const STOP_WAIT_MS = 2000;
 const LOOKUP_BOUND_MS = 2000;
 
 export interface SweepDb {
-  /** Throws an error marked notSent when no connection was handed out, so the statement never left. */
-  query(text: string, values: unknown[], boundMs: number): Promise<{ rows: any[]; rowCount?: number | null }>;
+  /**
+   * Throws an error marked notSent when no connection was handed out, so the statement never left. at: the database
+   * epoch of the claim the statement answers (NB5 G9); a statement of an earlier epoch is refused.
+   */
+  query(text: string, values: unknown[], boundMs: number, at?: number | null): Promise<{ rows: any[]; rowCount?: number | null }>;
+}
+
+/** NB5 G9: what the sweep's statements check against the data backend; with no Postgres backend every answer is null. */
+export interface SweepGate {
+  /** The backend's database epoch. */
+  epoch(): number | null;
+  /** Why the backend refuses every statement now (latched, or held), else null. */
+  refusal(): string | null;
+  /** The latest latch's `<why>`. */
+  stopWhy(): string | null;
+}
+
+/** NB5 G9: a statement of a database this process stopped writing to; notSent when it never left. */
+export class RequestsStoppedError extends Error {
+  constructor(readonly why: string | null, readonly notSent: boolean) {
+    super(`this process stopped writing to its database${why === null ? '' : ` (${why})`}`);
+    this.name = 'RequestsStoppedError';
+  }
 }
 
 export interface SweepDeps {
@@ -55,6 +80,8 @@ export interface SweepDeps {
   serving?: () => boolean;
   newId?: () => string;
   hrtime?: () => bigint;
+  /** NB5 G9: the epoch a claim's rows belong to; with none, every claim has the same. */
+  gate?: SweepGate;
 }
 
 const sleep = (ms: number) => new Promise<void>(resolve => { const t = setTimeout(resolve, ms); (t as any).unref?.(); });
@@ -103,14 +130,15 @@ function requestOf(row: ClaimedRow, leftMs: number, hrtime: () => bigint): Guild
 
 export class GuildRequestSweep {
   private applies = 0;
-  private readonly unansweredBatches = new Map<string, number>();
+  /** Each batch with when it was kept and the epoch of its claim (NB5 G9). */
+  private readonly unansweredBatches = new Map<string, { at: number; epoch: number | null }>();
   /** Each apply with its answer write, from the claim's rows until the answer is written or given up. */
   private readonly inFlight = new Set<Promise<void>>();
   /**
    * Gatekeeper ruling 6: every request this process started, with its apply's outcome and the batch of its latest
    * claim. A claim lost in a failover behind the same URL can come back; that claim is answered with the outcome.
    */
-  private readonly started = new Map<string, { reply: Promise<DataWriteReply>; batch: string }>();
+  private readonly started = new Map<string, { reply: Promise<DataWriteReply>; batch: string; epoch: number | null }>();
   private lastCleanup = -Infinity;
   private claimFailing = false;
   private lastFailLog = -Infinity;
@@ -171,7 +199,7 @@ export class GuildRequestSweep {
 
   private prune(): void {
     const now = performance.now();
-    for (const [id, at] of this.unansweredBatches) if (now - at > UNANSWERED_KEEP_MS) this.unansweredBatches.delete(id);
+    for (const [id, kept] of this.unansweredBatches) if (now - kept.at > UNANSWERED_KEEP_MS) this.unansweredBatches.delete(id);
   }
 
   private async claim(): Promise<void> {
@@ -180,6 +208,7 @@ export class GuildRequestSweep {
     const pairs = deps.pairs();
     if (!processId || pairs.length === 0 || deps.stoppedServing() || deps.isStopping() || this.applies >= MAX_APPLIES) return;
     const batch = (deps.newId ?? randomUUID)();
+    const epoch = this.epoch();
     let rows: ClaimedRow[];
     try {
       const res = await deps.db.query(REQUEST_CLAIM_SQL, [
@@ -188,21 +217,25 @@ export class GuildRequestSweep {
       rows = res.rows as ClaimedRow[];
     } catch (error) {
       // A statement that left without an answer may commit, now or later: its batch is answered unapplied for an hour.
-      if (!(error as { notSent?: boolean })?.notSent && failureOf(error).kind === 'unknown') this.unansweredBatches.set(batch, performance.now());
+      if (!(error as { notSent?: boolean })?.notSent && failureOf(error).kind === 'unknown') this.unansweredBatches.set(batch, { at: performance.now(), epoch });
       this.noteClaimFailed(describeFailure(error));
       return;
     }
     this.noteClaimWorks();
     if (rows.length === 0) return;
     if (deps.isStopping()) {
-      for (const row of rows) if (this.started.has(row.id)) this.startApply(row, batch);
-      if (rows.some(row => !this.started.has(row.id))) this.unansweredBatches.set(batch, performance.now());
+      for (const row of rows) if (this.started.has(row.id)) this.startApply(row, batch, epoch);
+      if (rows.some(row => !this.started.has(row.id))) this.unansweredBatches.set(batch, { at: performance.now(), epoch });
       return;
     }
-    for (const row of rows) this.startApply(row, batch);
+    for (const row of rows) this.startApply(row, batch, epoch);
   }
 
-  private startApply(row: ClaimedRow, batch: string): void {
+  private epoch(): number | null {
+    return this.deps.gate?.epoch() ?? null;
+  }
+
+  private startApply(row: ClaimedRow, batch: string, epoch: number | null): void {
     const leftMs = Number(row.left_ms);
     const claimedAt = performance.now();
     const req = requestOf(row, leftMs, this.deps.hrtime ?? (() => process.hrtime.bigint()));
@@ -210,6 +243,7 @@ export class GuildRequestSweep {
     const known = this.started.get(row.id);
     if (known) {
       known.batch = batch;
+      known.epoch = epoch;
       console.warn(`[GuildRequests] The ${row.op} of server ${row.guild_id} sent from ${row.requested_by} was claimed again after this process started it; it is answered with the first apply's outcome, not applied again`);
       this.track(this.answerLatest(known, row, batch, req, until));
       return;
@@ -224,15 +258,15 @@ export class GuildRequestSweep {
         this.applies -= 1;
       }
     })();
-    const entry = { reply, batch };
+    const entry = { reply, batch, epoch };
     this.started.set(row.id, entry);
     this.track(this.answerLatest(entry, row, batch, req, until));
   }
 
   /** Only the latest claim of a request writes its answer, under that claim's batch. */
-  private async answerLatest(entry: { reply: Promise<DataWriteReply>; batch: string }, row: ClaimedRow, batch: string, req: GuildDataWriteRequest, until: number): Promise<void> {
+  private async answerLatest(entry: { reply: Promise<DataWriteReply>; batch: string; epoch: number | null }, row: ClaimedRow, batch: string, req: GuildDataWriteRequest, until: number): Promise<void> {
     const reply = await entry.reply;
-    if (entry.batch === batch) await this.writeAnswer(row, batch, req, reply, until, () => entry.batch !== batch);
+    if (entry.batch === batch) await this.writeAnswer(row, batch, req, reply, until, () => entry.batch !== batch, entry.epoch);
   }
 
   private track(run: Promise<void>): void {
@@ -240,21 +274,25 @@ export class GuildRequestSweep {
     void run.finally(() => this.inFlight.delete(run));
   }
 
-  private async writeAnswer(row: ClaimedRow, batch: string, req: GuildDataWriteRequest, reply: DataWriteReply, until: number, superseded: () => boolean = () => false): Promise<void> {
+  private async writeAnswer(row: ClaimedRow, batch: string, req: GuildDataWriteRequest, reply: DataWriteReply, until: number, superseded: () => boolean = () => false, at: number | null = null): Promise<void> {
     const text = JSON.stringify(reply);
     const outcome = outcomeOf(reply);
     const file = req.filename ? ` of ${req.module ? `${req.module}/` : ''}${req.filename}` : '';
     const from = `server ${row.guild_id} sent from ${row.requested_by}`;
     let cause = 'no attempt answered';
+    // NB5 H5: an ANSWER_SQL that got no answer may have committed.
+    let mayHaveLanded = false;
     for (;;) {
+      let answering = true;
       try {
-        const res = await this.deps.db.query(ANSWER_SQL, [row.id, batch, text], ANSWER_BOUND_MS);
+        const res = await this.deps.db.query(ANSWER_SQL, [row.id, batch, text], ANSWER_BOUND_MS, at);
+        answering = false;
         if ((res.rowCount ?? 0) > 0) {
           console.log(`[GuildRequests] ${row.op}${file} for server ${row.guild_id}, sent from ${row.requested_by}: ${outcome}`);
           return;
         }
         if (superseded()) return;
-        const back = (await this.deps.db.query(ANSWER_READ_BACK_SQL, [row.id], ANSWER_BOUND_MS)).rows[0];
+        const back = (await this.deps.db.query(ANSWER_READ_BACK_SQL, [row.id], ANSWER_BOUND_MS, at)).rows[0];
         if (back && back.reply === text) {
           console.log(`[GuildRequests] ${row.op}${file} for server ${row.guild_id}, sent from ${row.requested_by}: ${outcome}`);
           return;
@@ -263,10 +301,23 @@ export class GuildRequestSweep {
         return;
       } catch (error) {
         cause = describeFailure(error);
+        const notSent = (error as { notSent?: boolean })?.notSent === true;
+        if (answering && !notSent && failureOf(error).kind === 'unknown') mayHaveLanded = true;
+        if (error instanceof RequestsStoppedError) {
+          if (!error.notSent) {
+            console.error(`[GuildRequests] Can't confirm whether the answer to the ${row.op} of ${from} was recorded: this process stopped writing to its database while it waited${error.why === null ? '' : ` (${error.why})`}; its sender reads that answer or can't confirm. The answer was: ${outcome}`);
+            return;
+          }
+          break;
+        }
       }
       if (superseded()) return;
       if (performance.now() + ANSWER_RETRY_MS > until) break;
       await sleep(ANSWER_RETRY_MS);
+    }
+    if (mayHaveLanded) {
+      console.error(`[GuildRequests] Can't confirm whether the answer to the ${row.op} of ${from} was recorded: an attempt that got no answer may have landed, and no later attempt confirmed it (${cause}); its sender reads that answer or can't confirm. The answer was: ${outcome}`);
+      return;
     }
     console.error(`[GuildRequests] Could not record the answer to the ${row.op} of ${from} (${cause}); its sender reads can't confirm. The answer was: ${outcome}`);
   }
@@ -277,10 +328,12 @@ export class GuildRequestSweep {
   }
 
   private async answerUnanswered(): Promise<void> {
-    const ids = this.unanswered();
+    this.prune();
+    const epoch = this.epoch();
+    const ids = [...this.unansweredBatches].filter(([, kept]) => kept.epoch === epoch).map(([id]) => id);
     if (ids.length === 0) return;
     try {
-      await this.deps.db.query(UNANSWERED_BATCHES_SQL, [ids, this.startedIds()], CLAIM_BOUND_MS);
+      await this.deps.db.query(UNANSWERED_BATCHES_SQL, [ids, this.startedIds()], CLAIM_BOUND_MS, epoch);
     } catch { /* the next pass sends it again */ }
   }
 
@@ -311,9 +364,8 @@ export class GuildRequestSweep {
 }
 
 /** The sweep's pool: its own, so flushes and hydrates that hold the data pool never push a pickup past 5 s. */
-function pgSweepDb(url: string): SweepDb {
+function pgSweepDb(config: ClientConfig, gate: SweepGate): { db: SweepDb; pool: Pool } {
   const pool = new Pool({
-    connectionString: url,
     max: 2,
     min: 0,
     connectionTimeoutMillis: 5000,
@@ -321,22 +373,50 @@ function pgSweepDb(url: string): SweepDb {
     keepAlive: true,
     application_name: GUILD_REQUESTS_APPLICATION_NAME,
     statement_timeout: 5000,
+    ...config,
   } as ConstructorParameters<typeof Pool>[0]);
   pool.on('error', error => console.error('[GuildRequests] Idle connection error:', error.message));
   guardPoolClients(pool, 'the guild-requests sweep pool');
+  return { db: gatedSweepDb(pool, gate), pool };
+}
+
+/** A pool as gatedSweepDb uses it: node-pg's, or a test's fake. */
+export interface SweepPool {
+  connect(): Promise<{ query(config: unknown): Promise<any>; release(destroy?: boolean): void }>;
+}
+
+/**
+ * One statement on one client of the pool, through NB5 G9's three checks: at the entry (an earlier epoch, then the
+ * backend's refusal; nothing connects), after the connect (the epoch moved: the client is destroyed, nothing is sent),
+ * and at the answer (the epoch moved: the answer is dropped, since the statement may have applied).
+ */
+export function gatedSweepDb(pool: SweepPool, gate: SweepGate): SweepDb {
   return {
-    async query(text, values, boundMs) {
+    async query(text, values, boundMs, at) {
+      const epoch = gate.epoch();
+      if (at !== undefined && at !== epoch) throw new RequestsStoppedError(gate.stopWhy(), true);
+      const refusal = gate.refusal();
+      if (refusal !== null) throw Object.assign(new Error(refusal), { notSent: true });
       let client;
       try {
         client = await pool.connect();
       } catch (error) {
+        if (gate.epoch() !== epoch) throw new RequestsStoppedError(gate.stopWhy(), true);
         throw Object.assign(error instanceof Error ? error : new Error(String(error)), { notSent: true });
+      }
+      if (gate.epoch() !== epoch) {
+        client.release(true);
+        throw new RequestsStoppedError(gate.stopWhy(), true);
       }
       let destroy = false;
       try {
-        return await client.query({ text, values, query_timeout: boundMs } as any);
+        const res = await client.query({ text, values, query_timeout: boundMs });
+        if (gate.epoch() !== epoch) throw new RequestsStoppedError(gate.stopWhy(), false);
+        return res;
       } catch (error) {
+        if (error instanceof RequestsStoppedError) throw error;
         destroy = typeof (error as { code?: unknown })?.code !== 'string';
+        if (gate.epoch() !== epoch) throw new RequestsStoppedError(gate.stopWhy(), false);
         throw error;
       } finally {
         client.release(destroy ? true : undefined);
@@ -345,17 +425,58 @@ function pgSweepDb(url: string): SweepDb {
   };
 }
 
+function pgBackend(): PostgresBackend | null {
+  const backend = getGuildDataBackend();
+  return backend instanceof PostgresBackend ? backend : null;
+}
+
+/** NB5 G9: the gate of this process's data backend; it passes everything on a JSON bot. */
+export const backendGate: SweepGate = {
+  epoch: () => pgBackend()?.databaseEpoch() ?? null,
+  refusal: () => pgBackend()?.refusalDetail() ?? null,
+  stopWhy: () => getShardClaims()?.databaseStopWhy() ?? null,
+};
+
 let sharedDb: SweepDb | null = null;
 let lookupOverride: SweepDb | null = null;
 let sweep: GuildRequestSweep | null = null;
 
+/** NB5 G9: the pool of the chosen entry, built again when a move changes it; the old pool ends in the background. */
 function poolDb(): SweepDb {
   if (!sharedDb) {
-    const url = (loadCredentials().DATA_BACKEND_URL || '').trim();
-    if (!url) throw new Error('DATA_BACKEND_URL is not set');
-    sharedDb = pgSweepDb(url);
+    const backend = pgBackend();
+    const entry = backend?.chosenEntry() ?? null;
+    if (!backend || entry === null) throw new Error('the bot process has not chosen its database yet');
+    let built = pgSweepDb(pgConfig(entry), backendGate);
+    sharedDb = built.db;
+    backend.onDatabaseChanged(next => {
+      const old = built.pool;
+      built = pgSweepDb(pgConfig(next), backendGate);
+      sharedDb = built.db;
+      void old.end().catch(error => console.error('[GuildRequests] The pool of the database this process left did not end cleanly:', error instanceof Error ? error.message : error));
+    });
   }
   return sharedDb;
+}
+
+/** NB5 H4: every statement of the sweep reads the pool in use when it starts. */
+const currentDb: SweepDb = {
+  async query(text, values, boundMs, at) {
+    let db: SweepDb;
+    try {
+      db = poolDb();
+    } catch (error) {
+      throw Object.assign(error instanceof Error ? error : new Error(String(error)), { notSent: true });
+    }
+    return db.query(text, values, boundMs, at);
+  },
+};
+
+/** Tests drop the pool built for an earlier test's backend. */
+export function _resetGuildRequestPool(): void {
+  sharedDb = null;
+  sweep?.stop();
+  sweep = null;
 }
 
 /** Tests answer the panel refusal's lookup from a scripted database. */
@@ -370,15 +491,15 @@ const pairsOf = (lease: CurrentLease | null): Pair[] => (lease?.leases ?? [])
 /** Starts the sweep at the bot's guild report, on Postgres only. lease reads NB4's runtime. */
 export function startGuildRequestSweep(lease: () => CurrentLease | null): void {
   if (sweep || resolveDataBackend() !== 'postgres') return;
-  let db: SweepDb;
   try {
-    db = poolDb();
+    poolDb();
   } catch (error) {
     console.error(`[GuildRequests] Changes sent from other machines' panels are not read: ${error instanceof Error ? error.message : String(error)}`);
     return;
   }
   sweep = new GuildRequestSweep({
-    db,
+    db: currentDb,
+    gate: backendGate,
     processId: () => lease()?.processId ?? null,
     pairs: () => pairsOf(lease()),
     stoppedServing,

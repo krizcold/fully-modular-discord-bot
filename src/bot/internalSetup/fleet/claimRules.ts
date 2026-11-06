@@ -306,6 +306,49 @@ export function decideShardCount(stored: number | null, local: number | null, st
   return { kind: 'use', count: stored, write: false, deleteOthers: false, adopted: { local } };
 }
 
+export interface RetakeInput {
+  me: Me;
+  /** The held pairs the move's renewal did not return. */
+  pairs: Pair[];
+  /** For each of their shard ids, the guilds this process holds a set for. */
+  guildIds: Array<{ shardId: number; guildIds: string[] }>;
+  /** The main generation the move targets. */
+  generation: number;
+  /** The generation table's rows on the target (none when it has no table). */
+  generations: number[];
+  /** The target's claim rows of the pairs' shard ids, under every count. */
+  rows: ClaimRow[];
+  /** Every shard_count the target's claim rows carry. */
+  counts: number[];
+  /** The target's guild_ownership rows of those shards and of those guilds. */
+  guildClaims: Array<{ guildId: string; shardCount: number; shardId: number; claim: number }>;
+}
+
+/**
+ * NB5 decision 12 (d) as D2 amends it: a held pair is taken again only when the target shows no later holder. The
+ * generation table holds exactly the targeted generation (no row at generation 0), no claim row carries another
+ * count, the shard's row is missing or names this process, and no guild row of the shard or of a guild held in it
+ * carries a claim above the held one.
+ */
+export function planRetake(input: RetakeInput): Array<{ pair: Pair; row: ClaimRow | null }> {
+  const generationOk = input.generation === 0
+    ? input.generations.length === 0
+    : input.generations.length === 1 && input.generations[0] === input.generation;
+  if (!generationOk) return [];
+  const out: Array<{ pair: Pair; row: ClaimRow | null }> = [];
+  for (const pair of input.pairs) {
+    if (input.counts.some(c => c !== pair.shardCount)) continue;
+    const row = input.rows.find(r => r.shardCount === pair.shardCount && r.shardId === pair.shardId) ?? null;
+    if (row && row.holderProcess !== input.me.processId) continue;
+    const held = new Set(input.guildIds.find(g => g.shardId === pair.shardId)?.guildIds ?? []);
+    const later = input.guildClaims.some(g => g.claim > pair.claim
+      && ((g.shardCount === pair.shardCount && g.shardId === pair.shardId) || held.has(g.guildId)));
+    if (later) continue;
+    out.push({ pair, row });
+  }
+  return out;
+}
+
 export interface HandOver {
   shardId: number;
   receiver: string;

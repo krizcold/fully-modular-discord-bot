@@ -252,7 +252,7 @@ describe('the apply and its answer', () => {
     expect(log).toHaveBeenCalledWith('[GuildRequests] write of m/a.json for server 4194304, sent from ALPHA: saved');
   });
 
-  it('retries every 1 s and stops at left_ms + 5 s with the could-not-record line', async () => {
+  it('retries every 1 s and stops at left_ms + 5 s with the can\'t-confirm line (NB5 H5: an attempt got no answer)', async () => {
     const error = vi.spyOn(console, 'error').mockImplementation(() => undefined);
     const { s, sent } = sweep(x => (isClaim(x) ? { rows: [row({ left_ms: '3000' })] } : isAnswer(x) ? new Error('Connection terminated unexpectedly') : undefined), { apply: async () => ({ ok: true, pending: true }) });
     await s.pass();
@@ -260,7 +260,7 @@ describe('the apply and its answer', () => {
     const tries = sent.filter(isAnswer).length;
     expect(tries).toBeGreaterThanOrEqual(7);
     expect(tries).toBeLessThanOrEqual(9);
-    expect(error).toHaveBeenCalledWith('[GuildRequests] Could not record the answer to the write of server 4194304 sent from ALPHA (Connection terminated unexpectedly); its sender reads can\'t confirm. The answer was: accepted, not confirmed as saved yet');
+    expect(error).toHaveBeenCalledWith('[GuildRequests] Can\'t confirm whether the answer to the write of server 4194304 sent from ALPHA was recorded: an attempt that got no answer may have landed, and no later attempt confirmed it (Connection terminated unexpectedly); its sender reads that answer or can\'t confirm. The answer was: accepted, not confirmed as saved yet');
   });
 
   it('0 rows reads back: its own reply logs the written line and stops', async () => {

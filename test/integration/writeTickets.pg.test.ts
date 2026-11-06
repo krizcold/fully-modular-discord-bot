@@ -3,6 +3,7 @@ import type { Pool } from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { FenceToken } from '../../src/bot/internalSetup/utils/dataBackends/backend';
 import { PostgresBackend, SCHEMA_VERSION } from '../../src/bot/internalSetup/utils/dataBackends/postgresBackend';
+import { fixedDatabase } from '../helpers/fixedDatabase';
 import { setBackendKind } from '../helpers/backendKind';
 import { initWorkingSet, WorkingSetManager } from '../../src/bot/internalSetup/utils/dataBackends/workingSet';
 import { confirmWrite, saveDataTracked } from '../../src/bot/internalSetup/utils/dataManager';
@@ -26,7 +27,7 @@ beforeAll(async () => {
   const port = await hop.listen();
   const user = encodeURIComponent(container.getUsername());
   const password = encodeURIComponent(container.getPassword());
-  backend = new PostgresBackend({ url: `postgres://${user}:${password}@127.0.0.1:${port}/${container.getDatabase()}` });
+  backend = new PostgresBackend(fixedDatabase(`postgres://${user}:${password}@127.0.0.1:${port}/${container.getDatabase()}`));
   backend.start();
   const until = Date.now() + 60_000;
   while (backend.connectionState().state !== 'ready' && Date.now() < until) await new Promise(resolve => { setTimeout(resolve, 100); });
@@ -128,7 +129,7 @@ describe('the claim fence on a real Postgres', () => {
   };
 
   async function readyBackend(database = container.getDatabase()): Promise<PostgresBackend> {
-    const b = new PostgresBackend({ url: urlFor(database) });
+    const b = new PostgresBackend(fixedDatabase(urlFor(database)));
     b.start();
     const until = Date.now() + 60_000;
     while (b.connectionState().state !== 'ready' && Date.now() < until) await new Promise(resolve => { setTimeout(resolve, 100); });
@@ -228,7 +229,7 @@ describe('the claim fence on a real Postgres', () => {
       await old.query(`DROP SEQUENCE smdb_data.claim_seq`);
       const before = (await old.query(`SELECT doc, updated_at FROM smdb_data.guild_data WHERE guild_id = '7'`)).rows;
 
-      const refused = new PostgresBackend({ url: urlFor('smdb_v1') });
+      const refused = new PostgresBackend(fixedDatabase(urlFor('smdb_v1')));
       refused.start();
       try {
         const until = Date.now() + 60_000;

@@ -5,6 +5,7 @@ import { lossLine, releaseFailureLine, releaseLines, ShardClaims } from '../../s
 import { aboveReason, claimState, claimTimings, type ClaimRow, type NodeRow } from '../../src/bot/internalSetup/fleet/claimRules';
 import type { FailureClass } from '../../src/bot/internalSetup/fleet/claimStore';
 import { describeShardRow, PostgresBackend } from '../../src/bot/internalSetup/utils/dataBackends/postgresBackend';
+import { fixedDatabase } from '../helpers/fixedDatabase';
 import { WorkingSetManager } from '../../src/bot/internalSetup/utils/dataBackends/workingSet';
 import { STOPPED_SERVING_TEXT } from '../../src/bot/internalSetup/utils/servingGate';
 import { FakeStore, tokenFor } from '../helpers/fakeStore';
@@ -106,7 +107,7 @@ describe("decision 16's drop line", () => {
     async function dropAfter(commitError: Error, afterTake: 'deposed' | 'unavailable'): Promise<string[]> {
       vi.spyOn(console, 'error').mockImplementation(() => {});
       vi.spyOn(console, 'log').mockImplementation(() => {});
-      const backend = new PostgresBackend({ url: 'postgres://nobody@127.0.0.1:9/none' });
+      const backend = new PostgresBackend(fixedDatabase('postgres://nobody@127.0.0.1:9/none'));
       backends.push(backend);
       (backend as unknown as { state: string }).state = 'ready';
       let phase: 'hydrate' | 'commit-fails' | 'taken' = 'hydrate';
@@ -129,6 +130,9 @@ describe("decision 16's drop line", () => {
       ws.save(g, 'm', 'a.json', '1');
       phase = 'commit-fails';
       expect(await ws.flushGuildNow(g, 50)).not.toBe('ok');
+      // NB5 decision 13: a COMMIT that ended the session starts the hold; the chooser's confirmation ends it.
+      backend.noteEntryAnswered(backend.databaseEpoch());
+      backend.confirmHold(backend.databaseEpoch());
       phase = 'taken';
       expect(await ws.flushGuildNow(g, 50)).toBe(afterTake);
       const lines = ws.takeDropLines();

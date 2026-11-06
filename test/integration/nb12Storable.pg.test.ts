@@ -5,6 +5,7 @@ import { Client, type Pool } from 'pg';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { FenceToken } from '../../src/bot/internalSetup/utils/dataBackends/backend';
 import { PostgresBackend } from '../../src/bot/internalSetup/utils/dataBackends/postgresBackend';
+import { fixedDatabase } from '../helpers/fixedDatabase';
 import { initWorkingSet, type WorkingSetManager } from '../../src/bot/internalSetup/utils/dataBackends/workingSet';
 import { appendDataTracked, saveData, saveDataTracked } from '../../src/bot/internalSetup/utils/dataManager';
 import { flushBoundMs, textRefusal } from '../../src/bot/internalSetup/utils/storableData';
@@ -37,7 +38,7 @@ async function freshGuild(): Promise<string> {
 beforeAll(async () => {
   container = await startPostgres();
   direct = poolFor(container);
-  backend = new PostgresBackend({ url: url() });
+  backend = new PostgresBackend(fixedDatabase(url()));
   backend.start();
   const until = Date.now() + 60_000;
   while (backend.connectionState().state !== 'ready' && Date.now() < until) await new Promise(resolve => { setTimeout(resolve, 100); });

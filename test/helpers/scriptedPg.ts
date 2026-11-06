@@ -1,5 +1,6 @@
 import { vi } from 'vitest';
 import { PostgresBackend } from '../../src/bot/internalSetup/utils/dataBackends/postgresBackend';
+import { fixedDatabase } from './fixedDatabase';
 
 // The real PostgresBackend over a pool whose clients answer by script, as the server would: the fenced claim
 // updates one row, every SELECT reads no row, and each query takes what the script says. A query with a
@@ -15,7 +16,7 @@ export interface Sent {
 export type Answer = (sql: string, params: unknown[] | undefined, call: number) => unknown | Promise<unknown>;
 
 export function scriptedBackend(answer: Answer = () => undefined) {
-  const backend = new PostgresBackend({ url: 'postgres://nobody@127.0.0.1:9/none' });
+  const backend = new PostgresBackend(fixedDatabase('postgres://nobody@127.0.0.1:9/none'));
   (backend as unknown as { state: string }).state = 'ready';
   const sent: Sent[] = [];
   let out = 0;

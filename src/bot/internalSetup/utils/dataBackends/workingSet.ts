@@ -10,6 +10,7 @@ import { DataBackend, DocKey, FenceToken, GuildFlushBatch, GuildOwner } from './
 import { setLeft } from './scopeRecord';
 import { stoppedServing } from '../servingGate';
 import { keyRefusal, KeyTree, pathKeyOf, STORE_MAX_BYTES } from '../storableData';
+import { showEntry } from '../../../../utils/databaseAddress';
 
 const DEBOUNCE_MS = 500;
 const MAX_DELAY_MS = 5000;
@@ -97,9 +98,15 @@ interface HeldBatch extends BuiltBatch {
   flushId: string;
   /** The claim the batch was sent under. */
   claim: number;
+  /** NB5 decision 12: its COMMIT answered ok after this process stopped writing to this database. */
+  landedOn?: string;
 }
 
 const UNANSWERED_TEXT = "the database did not answer this save's COMMIT; whether it landed is checked before anything is sent again";
+const landedOnText = (old: string) => `this save landed on ${old} after this process stopped writing there; it is checked on the database written next before it is sent again`;
+// NB5 decision 12: SQLSTATE classes of a document the database refuses for its content.
+const CONTENT_CLASSES = ['22', '23', '54'];
+const RESAVE_PACE = 4;
 const UNANSWERED_NOTE = "a save's COMMIT got no answer; checking whether it landed";
 
 interface AppendBuffer {
@@ -142,6 +149,13 @@ class GuildWorkingSet {
   flight: GuildFlushBatch | null = null;
   // A check found the guild taken and could not tell whether the held batch landed: tickets at or below this seq.
   unknownThrough = 0;
+  // NB5 decision 12: pending re-save since the latch, with the database epoch the flag belongs to (none until step (e))
+  // and the address of the database this process stopped writing to.
+  resave: { epoch: number | null; from: string } | null = null;
+  // A graveyard restore holding the set has sent its restoreGuild call: the latch leaves the set to the restore's end.
+  restoreSent = false;
+  // The flag a latch gave this set while its restore was on the wire; a restore that reopens the set applies it.
+  latchedOnWire: { epoch: number | null; from: string } | null = null;
 
   constructor(readonly guildId: string, public fence: FenceToken) {}
 
@@ -207,9 +221,18 @@ interface HydrationInFlight {
   outcome: Promise<HydrateOutcome>;
 }
 
-/** A set still owing writes to the store: dirty, on the wire, or holding an unanswered batch. */
+/**
+ * A set still owing writes to the store: dirty, on the wire, or holding an unanswered batch. A batch that landed on the
+ * old database after the latch is counted with the re-save (decision 12), never here.
+ */
 function holds(ws: GuildWorkingSet): boolean {
-  return ws.dirtyKeys.size > 0 || ws.flushInFlight || ws.unanswered !== null;
+  return ws.dirtyKeys.size > 0 || ws.flushInFlight || (ws.unanswered !== null && ws.unanswered.landedOn === undefined);
+}
+
+/** NB5 decision 12: where a set pending re-save goes, the database in use once the latch is down, else the main still to be found. */
+export function resaveTargetOf(backend: DataBackend | null): string {
+  const entry = backend && backend.latchReason?.() === null ? (backend as { chosenEntry?(): string | null }).chosenEntry?.() ?? null : null;
+  return entry === null ? 'the main, once one is found' : showEntry(entry);
 }
 
 /** NB13 decision 6: the ticket's set holds an unanswered batch at or after it, or a flight whose COMMIT was sent. */
@@ -254,7 +277,7 @@ export class WorkingSetManager {
    * was sent), and those of them holding nothing else.
    */
   unansweredGuilds(): { all: string[]; only: string[] } {
-    const all = [...this.sets.values()].filter(ws => ws.unanswered !== null || ws.flight?.commitSent === true);
+    const all = [...this.sets.values()].filter(ws => (ws.unanswered !== null && ws.unanswered.landedOn === undefined) || ws.flight?.commitSent === true);
     return { all: all.map(ws => ws.guildId), only: all.filter(ws => ws.dirtyKeys.size === 0).map(ws => ws.guildId) };
   }
 
@@ -444,20 +467,33 @@ export class WorkingSetManager {
     const ws = this.sets.get(guildId);
     if (ws?.state !== 'ready') return false;
     ws.state = 'restoring';
+    ws.restoreSent = false;
+    ws.latchedOnWire = null;
     return true;
+  }
+
+  /** The restore holding the set is about to send its restoreGuild call. */
+  noteRestoreSent(guildId: string): void {
+    const ws = this.sets.get(guildId);
+    if (ws?.state === 'restoring') ws.restoreSent = true;
   }
 
   /**
    * The restore's end: 'reopen' serves the same set again (frozen when its shard is no longer held here) and wakes its
-   * waiters ready; 'evict' drops it, so the next access reads the store.
+   * waiters ready; 'evict' drops it, so the next access reads the store. A restore that reopens the set sent no COMMIT,
+   * so the set takes the flag a latch gave it while the restore was on the wire.
    */
   endRestore(guildId: string, how: 'reopen' | 'evict', stillHeld: () => boolean = () => true): void {
     const ws = this.sets.get(guildId);
     if (!ws || ws.state !== 'restoring') return;
+    const onWire = ws.latchedOnWire;
+    ws.restoreSent = false;
+    ws.latchedOnWire = null;
     if (how === 'evict') {
       this.evict(guildId);
       return;
     }
+    if (onWire) ws.resave = onWire;
     ws.state = stillHeld() ? 'ready' : 'frozen-retained';
     for (const wake of ws.readyWaiters.splice(0)) wake('ready');
   }
@@ -469,6 +505,55 @@ export class WorkingSetManager {
     if (ws.state !== 'fenced') this.onDeposed(ws, owner);
     for (const wake of ws.readyWaiters.splice(0)) wake('not-ready');
     this.dropWaiters(guildId);
+  }
+
+  /**
+   * NB5 decision 12, at the latch: every set whose hydrate completed in this process and whose pair it still holds
+   * becomes pending re-save; a later latch takes the epoch of a flag away again. `holdsShard` answers whether the
+   * shard's pair is still held here (NB4's loss drops a pair, a lapse keeps it).
+   */
+  markForResave(from: string, holdsShard: (shardId: number, shardCount: number) => boolean = () => true): void {
+    for (const ws of this.sets.values()) {
+      // A restore whose call was sent is on the wire: the restore's end settles its set (decision 13).
+      const onWire = ws.state === 'restoring' && ws.restoreSent;
+      const completed = ws.state === 'ready' || ws.state === 'frozen-retained' || (ws.state === 'restoring' && !ws.restoreSent);
+      const flag = (completed || onWire) && holdsShard(ws.fence.shardId, ws.fence.shardCount) ? { epoch: null, from } : null;
+      ws.resave = completed ? flag : null;
+      if (onWire) ws.latchedOnWire = flag;
+    }
+  }
+
+  /** C4: the shard's held sets save under the claim the move took again. */
+  replaceShardClaim(shardId: number, claim: number): void {
+    for (const ws of this.sets.values()) {
+      if (ws.fence.shardId === shardId && ws.state !== 'fenced') ws.fence = { ...ws.fence, claim };
+    }
+  }
+
+  /** D7: the guilds this process holds a set for in the shard, for the move's re-take. */
+  guildsOfShard(shardId: number): string[] {
+    return [...this.sets.values()].filter(ws => ws.fence.shardId === shardId).map(ws => ws.guildId);
+  }
+
+  /** Step (e): every flag of a set this process still holds belongs to the move's epoch. */
+  flagEpoch(epoch: number): void {
+    for (const ws of this.sets.values()) {
+      if (ws.resave) ws.resave.epoch = epoch;
+      if (ws.latchedOnWire) ws.latchedOnWire.epoch = epoch;
+    }
+  }
+
+  /** Step (e): the guild's retire reached the target, so its set goes. */
+  dropRetired(guildId: string): void {
+    const ws = this.sets.get(guildId);
+    if (!ws) return;
+    ws.resave = null;
+    this.evict(guildId);
+  }
+
+  /** The guilds pending re-save. */
+  resaveGuilds(): string[] {
+    return [...this.sets.values()].filter(ws => ws.resave).map(ws => ws.guildId);
   }
 
   fenceOf(guildId: string): FenceToken | null {
@@ -484,6 +569,8 @@ export class WorkingSetManager {
   evict(guildId: string): void {
     const ws = this.sets.get(guildId);
     if (!ws) return;
+    // A set pending re-save stays until it is re-saved, deposed or its retire reached the target (decision 12).
+    if (ws.resave && ws.state !== 'fenced') return;
     ws.clearTimers();
     this.forgetDirty(ws);
     this.sets.delete(guildId);
@@ -724,6 +811,12 @@ export class WorkingSetManager {
     const batch: GuildFlushBatch = { upserts: [], deletes: [], appends: [], flushId: randomUUID() };
     const sentBufs = new Map<string, AppendBuffer>();
     const flushedKeys = [...ws.dirtyKeys];
+    if (ws.resave) {
+      // Decision 12's replace mode: every document the set holds, and the guild's other rows to the graveyard.
+      const held = [...ws.docs].filter(([, doc]) => !doc.tombstone);
+      for (const [key, doc] of held) if (!doc.dirty) batch.upserts.push({ key: splitDocKey(key), doc: doc.content });
+      batch.replace = { docKeys: held.map(([key]) => splitDocKey(key)), appendKeys: [...ws.appendKeys].map(splitDocKey), reason: this.resaveReason(ws) };
+    }
     for (const key of flushedKeys) {
       const dk = splitDocKey(key);
       const doc = ws.docs.get(key);
@@ -746,6 +839,29 @@ export class WorkingSetManager {
   }
 
   /**
+   * Decision 12: a flagged flush the database refused for a document's content, sent again without the dirty keys:
+   * the clean documents as upserts, and the replace mode's deletes leaving the dirty keys alone. It lands no write.
+   */
+  private buildResend(ws: GuildWorkingSet): BuiltBatch & { batch: GuildFlushBatch } {
+    const live = [...ws.docs].filter(([, doc]) => !doc.tombstone).map(([key]) => key);
+    const upserts = live.filter(key => !ws.dirtyKeys.has(key)).map(key => ({ key: splitDocKey(key), doc: ws.docs.get(key)!.content }));
+    const docKeys = new Set([...live, ...ws.dirtyKeys]);
+    const appendKeys = new Set([...ws.appendKeys, ...ws.dirtyKeys]);
+    const batch: GuildFlushBatch = {
+      upserts,
+      deletes: [],
+      appends: [],
+      flushId: randomUUID(),
+      replace: { docKeys: [...docKeys].map(splitDocKey), appendKeys: [...appendKeys].map(splitDocKey), reason: this.resaveReason(ws) },
+    };
+    return { batch, flushedKeys: [], sentBufs: new Map(), seq: ws.landedSeq };
+  }
+
+  private resaveReason(ws: GuildWorkingSet): string {
+    return `re-saved by bot process ${ws.fence.processId ?? ws.fence.nodeId} after it stopped writing to ${ws.resave?.from ?? 'its database'}; these rows were not in its copy of the guild`;
+  }
+
+  /**
    * NB13 decision 5: a set holding an unanswered batch first asks the store whether it landed; with its fate known, or
    * with none held, it sends what is dirty.
    */
@@ -760,7 +876,7 @@ export class WorkingSetManager {
     // Left meanwhile, or forgotten by a deposition: the answer applies to nothing.
     if (this.leftHere(ws) || ws.unanswered !== held) return 'idle';
     if (fate.fate === 'unknown') {
-      ws.flushError = { text: `${UNANSWERED_TEXT}; the last check failed: ${fate.detail}` };
+      ws.flushError = { text: `${held.landedOn ? landedOnText(held.landedOn) : UNANSWERED_TEXT}; the last check failed: ${fate.detail}` };
       this.noteFlushFailure(UNANSWERED_NOTE);
       this.scheduleRetry();
       return 'failed';
@@ -789,10 +905,27 @@ export class WorkingSetManager {
     return this.send(ws);
   }
 
-  /** Builds and sends one batch of what is dirty: 'stored' once its COMMIT was answered. */
-  private async send(ws: GuildWorkingSet): Promise<FlushAnswer> {
-    if (ws.dirtyKeys.size === 0) { ws.windowOpenedAt = null; return 'idle'; }
+  /** The backend's database epoch now (decision 13); 0 for a backend with none. */
+  private epochNow(): number {
+    return this.backend.databaseEpoch?.() ?? 0;
+  }
 
+  /** A flagged set whose flag belongs to the epoch in force: its re-save may be sent (decision 12). */
+  private resaveDue(ws: GuildWorkingSet): boolean {
+    return this.flagEpochNow(ws) !== null && (ws.state === 'ready' || ws.state === 'frozen-retained' || ws.state === 'restoring');
+  }
+
+  /** The flag's epoch when it is the epoch in force, else null: a flush built now may clear only such a flag. */
+  private flagEpochNow(ws: GuildWorkingSet): number | null {
+    return ws.resave !== null && ws.resave.epoch === this.epochNow() ? ws.resave.epoch : null;
+  }
+
+  /** Builds and sends one batch of what is dirty, in replace mode while flagged: 'stored' once its COMMIT was answered. */
+  private async send(ws: GuildWorkingSet): Promise<FlushAnswer> {
+    if (ws.dirtyKeys.size === 0 && !this.resaveDue(ws)) { ws.windowOpenedAt = null; return 'idle'; }
+
+    const flag = ws.resave;
+    const builtEpoch = this.flagEpochNow(ws);
     const built = this.buildBatch(ws);
     const { batch, flushedKeys, sentBufs, seq } = built;
     const sentClaim = ws.fence.claim ?? 0;
@@ -807,9 +940,9 @@ export class WorkingSetManager {
 
     if (!outcome.ok && outcome.reason === 'unavailable' && outcome.commitUnanswered) {
       // Its keys stay in flightKeys, so the acceptance window counts them, and each buffer keeps its sent start.
-      ws.unanswered = { flushId: batch.flushId!, claim: sentClaim, flushedKeys, sentBufs, seq };
+      ws.unanswered = { flushId: batch.flushId!, claim: sentClaim, flushedKeys, sentBufs, seq, ...(outcome.landedOn ? { landedOn: outcome.landedOn } : {}) };
       ws.requeue = false;
-      ws.flushError = { text: UNANSWERED_TEXT };
+      ws.flushError = { text: outcome.landedOn ? landedOnText(outcome.landedOn) : UNANSWERED_TEXT };
       this.noteFlushFailure(UNANSWERED_NOTE);
       this.scheduleRetry();
       return 'failed';
@@ -820,6 +953,7 @@ export class WorkingSetManager {
 
     if (outcome.ok) {
       this.applyLanded(ws, built);
+      this.clearResave(ws, flag, builtEpoch);
       if (ws.requeue || ws.dirtyKeys.size > 0) {
         ws.requeue = false;
         this.markDirty(ws, [...ws.dirtyKeys][0] ?? '', Date.now());
@@ -835,11 +969,40 @@ export class WorkingSetManager {
     }
     // unavailable: everything stays dirty; merge back and retry under backoff.
     for (const key of flushedKeys) ws.dirtyKeys.add(key);
+    if (flag && ws.resave === flag && ws.dirtyKeys.size > 0 && CONTENT_CLASSES.includes(outcome.code?.slice(0, 2) ?? '') && this.resaveDue(ws) && !this.leftHere(ws)) {
+      await this.resendWithoutDirty(ws, flag);
+    }
     ws.requeue = false;
     ws.flushError = { text: outcome.detail ?? 'the store did not take the flush', code: outcome.code };
     this.noteFlushFailure('flush unavailable');
     this.scheduleRetry();
     return 'failed';
+  }
+
+  /** Decision 12: the content re-send; its landing clears the flag, and the dirty keys stay under NB2's content rule. */
+  private async resendWithoutDirty(ws: GuildWorkingSet, flag: NonNullable<GuildWorkingSet['resave']>): Promise<void> {
+    const builtEpoch = this.flagEpochNow(ws);
+    const built = this.buildResend(ws);
+    ws.flushInFlight = true;
+    ws.flight = built.batch;
+    const outcome = await this.backend.flushGuild(ws.guildId, built.batch, ws.fence);
+    ws.flushInFlight = false;
+    ws.flight = null;
+    if (!outcome.ok) return;
+    this.applyLanded(ws, built);
+    this.clearResave(ws, flag, builtEpoch);
+  }
+
+  /** Only a flush built with the flag under its epoch, sent under that epoch and landed clears it (decision 12). */
+  private clearResave(ws: GuildWorkingSet, flag: GuildWorkingSet['resave'], builtEpoch: number | null): void {
+    if (flag && builtEpoch !== null && ws.resave === flag && flag.epoch === builtEpoch && this.epochNow() === builtEpoch) ws.resave = null;
+  }
+
+  /** Decision 12: a flagged set refused 'deposed' names its re-save apart from NB4's drop line. */
+  private noteResaveDropped(ws: GuildWorkingSet): void {
+    if (!ws.resave) return;
+    const held = [...ws.docs.values()].filter(doc => !doc.tombstone).length;
+    console.error(`[Data] Guild ${ws.guildId}: ${held} document(s) were not re-saved on ${resaveTargetOf(this.backend)} (shard ${ws.fence.shardId} is held by another process)`);
   }
 
   /** A batch known stored: its writes land, the documents not written since become clean, each buffer loses its sent start. */
@@ -898,6 +1061,8 @@ export class WorkingSetManager {
     this.fencedFlushRejections += 1;
     this.lastError = `guild ${ws.guildId} fenced by ${owner?.nodeId ?? 'unknown'} (claim ${owner?.claim ?? '?'})`;
     console.error(`[Data] Deposed writer: ${this.lastError}; dropping the guild's working set without flushing${mayHaveLanded ? '; a save whose COMMIT got no answer may have landed' : ''}`);
+    this.noteResaveDropped(ws);
+    ws.resave = null;
     // Drop dirty accounting; the flush is never retried (a deposed node's
     // leftover writes are never merged later - that would be a second writer).
     this.forgetDirty(ws);
@@ -936,7 +1101,7 @@ export class WorkingSetManager {
     for (;;) {
       if (ws.state === 'fenced') return ws.unknownThrough > ws.landedSeq ? 'unavailable' : 'deposed';
       if (this.leftHere(ws)) return 'unavailable';
-      if (!ws.flushInFlight && ws.dirtyKeys.size === 0 && !ws.unanswered) return 'ok';
+      if (!ws.flushInFlight && ws.dirtyKeys.size === 0 && !ws.unanswered && !this.resaveDue(ws)) return 'ok';
       if (failed) return ws.unanswered ? 'pending' : 'held';
       const left = deadline - performance.now();
       if (left <= 0) return 'pending';
@@ -998,13 +1163,21 @@ export class WorkingSetManager {
   /** Flush every dirty guild (shutdown drain; the caller bounds it). */
   async flushAllDirty(): Promise<string[]> {
     const owing = (ws: GuildWorkingSet) => ws.dirtyKeys.size > 0 || ws.unanswered !== null;
-    await Promise.all([...this.sets.values()].filter(owing).map(ws => this.flush(ws)));
-    return [...this.sets.values()].filter(owing).map(ws => ws.guildId);
+    // Decision 12: flagged sets are flushed beside the dirty ones, RESAVE_PACE at a time.
+    const flagged = [...this.sets.values()].filter(ws => this.resaveDue(ws));
+    const others = [...this.sets.values()].filter(ws => owing(ws) && !flagged.includes(ws));
+    await Promise.all([
+      Promise.all(others.map(ws => this.flush(ws))),
+      (async () => {
+        for (let i = 0; i < flagged.length; i += RESAVE_PACE) await Promise.all(flagged.slice(i, i + RESAVE_PACE).map(ws => this.flush(ws)));
+      })(),
+    ]);
+    return [...this.sets.values()].filter(ws => ws.dirtyKeys.size > 0 || (ws.unanswered !== null && ws.unanswered.landedOn === undefined)).map(ws => ws.guildId);
   }
 
-  /** No guild holds a dirty write or a flush on the wire (the exit drain's test). */
+  /** No guild holds a dirty write, a flush on the wire or a pending re-save (the exit drain's test). */
   writesSettled(): boolean {
-    return ![...this.sets.values()].some(holds);
+    return ![...this.sets.values()].some(ws => holds(ws) || ws.resave !== null || ws.unanswered !== null);
   }
 
   flushOnTheWire(): boolean {

@@ -11,6 +11,8 @@ import type { LeaseInfo, LeaseRuntime } from './leaseRuntime';
 import type { IngestService } from '../ingest/ingestService';
 import type { ShardClaims } from './shardClaims';
 import type { FailureClass } from './claimStore';
+import { databaseView, type DatabaseView } from '../utils/dataBackends/mainDatabase';
+import { getWorkingSet } from '../utils/dataBackends/workingSet';
 
 export interface FleetClaimRow {
   shardId: number;
@@ -73,6 +75,8 @@ export interface FleetState {
   restartWaiting: string | null;
   returning: number[];
   aboveTarget: number[];
+  /** NB5 decision 19: the main database and every address; null on a JSON bot. */
+  database: DatabaseView | null;
   updatedAt: number;
 }
 
@@ -165,6 +169,15 @@ function claimTables(claims: ShardClaims, shardCount: number, ageMs: number): Pi
   return { claims: rows, nodes, aboveTarget };
 }
 
+/** Decision 19: the chooser's view, with the held counts while any set is pending re-save. */
+function databaseState(): DatabaseView | null {
+  const view = databaseView();
+  if (!view) return null;
+  const ws = getWorkingSet();
+  const resave = ws?.resaveGuilds().length ?? 0;
+  return { ...view, held: resave > 0 ? { guilds: ws?.heldGuilds().length ?? 0, resave } : null };
+}
+
 export function getFleetState(): FleetState {
   if (!sources) {
     return {
@@ -184,6 +197,7 @@ export function getFleetState(): FleetState {
       guildMap: {},
       budget: null,
       ...EMPTY_CLAIMS,
+      database: databaseState(),
       updatedAt: Date.now(),
     };
   }
@@ -238,6 +252,7 @@ export function getFleetState(): FleetState {
     guildMap,
     budget: ledger.getBudgetInfo(),
     ...claimFields,
+    database: databaseState(),
     updatedAt: Date.now(),
   };
 }

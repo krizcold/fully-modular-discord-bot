@@ -4,7 +4,7 @@ import { sendHopReply } from '../../src/webui/routes/config';
 import { createGraveyardRoutes, RESTORE_MINUTE } from '../../src/webui/routes/graveyard';
 import { RESTORE_TEXTS } from '../../src/bot/internalSetup/utils/dataManager';
 import { REQUEST_INSERT_SQL, REQUEST_POLL_SQL, SETTLE_UPDATE_SQL } from '../../src/bot/internalSetup/utils/dataBackends/guildRequestSql';
-import { endGuildRequests, NB7_TEXTS, OP_WORDS, remoteRestoreNoAnswerCause } from '../../src/webui/utils/guildRequests';
+import { endGuildRequests, NB7_TEXTS, OP_WORDS, remoteNoAnswerText, remoteRestoreNoAnswerCause } from '../../src/webui/utils/guildRequests';
 import { call, startApp } from '../helpers/configRig';
 import { BOT_DOWN, fakeBot, GUILD, isInsert, nb7Rig, resetNb7, type Rig } from '../helpers/nb7Rig';
 
@@ -58,13 +58,24 @@ describe('sendHopReply with servedBy', () => {
     ['write', 'timeout', "BRAVO did not answer in time; can't confirm whether the change was saved. Reload to check."],
     ['write', 'lost', "The answer from BRAVO could not be read from the database; can't confirm whether the change was saved. Reload to check."],
     ['delete', 'timeout', "BRAVO did not answer in time; can't confirm whether the file was deleted. Reload to check."],
-    ['guild-delete', 'lost', "The answer from BRAVO could not be read from the database; can't confirm whether this server's data was deleted. Within a minute, `smdb graveyard list` lists a new entry for this server if it was deleted; if no new entry is listed by then, it was not."],
+    ['guild-delete', 'lost', "The answer from BRAVO could not be read from the database; can't confirm whether this server's data was deleted. Within a minute, `smdb graveyard list` lists a new entry for this server with the reason webui-operator-delete if it was deleted; if no such entry is listed by then, it was not. The list reads the data of the bot behind the web panel it asks; if the main database was replaced meanwhile, check once that bot runs on the new main."],
   ] as const)('%s with noAnswer %s: 503 no-answer naming the machine', (what, cause, text) => {
     expect(answer({ ok: false, code: 'no-answer', noAnswer: cause, servedBy: 'BRAVO', sender: true }, what)).toEqual({ status: 503, body: { success: false, code: 'no-answer', error: text, servedBy: 'BRAVO' } });
   });
 
   it('a twin that differs on the holder: 409 with decision 11\'s text', () => {
     expect(answer({ ok: false, code: 'changed', status: 409, error: NB7_TEXTS.twin('BRAVO'), servedBy: 'BRAVO', sender: true })).toEqual({ status: 409, body: { success: false, error: "The module's global config on BRAVO differs from this machine's, so this server's overrides cannot be worked out here; nothing was saved. Save it from the web panel on BRAVO, or make the module's global config the same on both machines.", servedBy: 'BRAVO' } });
+  });
+});
+
+describe('the guild delete text after no answer (NB5 H7, H8)', () => {
+  const TAIL = "can't confirm whether this server's data was deleted. Within a minute, `smdb graveyard list` lists a new entry for this server with the reason webui-operator-delete if it was deleted; if no such entry is listed by then, it was not. The list reads the data of the bot behind the web panel it asks; if the main database was replaced meanwhile, check once that bot runs on the new main.";
+  it.each([
+    ['timeout', 'BRAVO did not answer in time'],
+    ['unsettled', 'The database could not show that the change sent to BRAVO was withdrawn before BRAVO took it'],
+    ['stopped', 'This web panel shut down before it read the answer from BRAVO'],
+  ])('%s: the lead, then the text', (cause, lead) => {
+    expect(remoteNoAnswerText(cause, 'BRAVO', 'guild-delete')).toBe(`${lead}; ${TAIL}`);
   });
 });
 

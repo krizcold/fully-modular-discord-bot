@@ -22,9 +22,59 @@ DATA_BACKEND=postgres
 DATA_BACKEND_URL=postgresql://smdb:password@host:5432/smdb
 ```
 
+`DATA_BACKEND_URL` takes one address or a comma-separated list of addresses of the same bot's databases (the main and
+its live copies; see "Several database addresses"). User and password are percent-encoded, so a comma inside them
+does not split the list.
+
 Switching `DATA_BACKEND` never moves data by itself. A bot with guild data in files refuses to start
 with `DATA_BACKEND=postgres`, whatever the database holds, and says so; set the value back to start it again. Booting against the
 wrong database is refused too, never served silently.
+
+## Several database addresses
+
+The bot checks every address at boot and every 30 seconds while it runs (every 5 seconds while its database does not
+answer). It uses the one database of this bot's store that accepts writes and holds the highest main generation (the
+`smdb_manager.generation` row the Bot Manager keeps; a database without it counts as generation 0). A copy, a
+read-only database and another bot's database are never used. A database that accepts writes with a lower generation
+than another is a replaced main, and the bot ignores it. When two databases accept writes at the same generation, the
+bot stops and says it can't confirm which is the main.
+
+After its database did not answer, ended the bot's sessions, refused its login or sent a certificate the bot refused,
+whether the bot saw that while saving or while checking on it, the bot saves nothing there until a check made after it
+answered again shows it is still the main. The check runs every 5 seconds, and a stop or restart in that time waits up
+to its 30 seconds for it. In that time, and after it stopped writing to a replaced database, the bot takes no change
+sent from another machine's web panel (that panel says nothing was saved once the 5 seconds to take it pass, or can't
+confirm when the bot had taken it), and it refuses a server's data delete or restore with nothing changed.
+
+When the database it uses is replaced while it runs, the bot stops serving at once, writes nothing more there, and once
+it can reach the new main it saves there every document of every guild it had loaded. Rows the new main holds for such
+a guild that the bot no longer had (documents deleted, or a guild retired, on the old main after the copy's last
+received change) go to the new main's graveyard, and the log names the batch; restore it like a retired guild within
+the graveyard's keep time. Until then the bot does not restart, and its maintenance answer counts those guilds as not
+saved. Lines appended on the old main after the copy's last received change are not restored, except those of a save
+that was being committed when the bot saw the switch. A guild retire or restore that was being committed then answers
+"can't confirm"; when such a retire did not reach the new main, the bot saves the guild's data there and logs that the
+retire must be repeated. Repeat it, or the restore, once the bot runs on the new main.
+
+Until a main is found, the bot waits with its data closed and does not connect to Discord, and the web UI's Shards
+section says why. The web panel reads only the database the bot uses. An address whose host is an IP and whose
+`sslmode` is `verify-full` has its certificate checked against that IP.
+
+## The switch notice
+
+When the Bot Manager makes another database the main, it asks the bot there to post one message to the bot's owner (the
+Discord account that owns the bot, or the team's owner): a DM titled "Main database moved" naming the machine, the date
+and the generation, which the bot pins. A bot whose database holds a main generation reads the pinned and the newest 100
+messages of that conversation at boot, before it opens any data, and every minute while it runs (every few seconds after
+a failed read, and at once when it reconnects to Discord after reads failed). A newer generation there that no database
+it reaches holds means it cannot confirm its database is still the main: it stays stopped with "can't confirm" and the
+announced machine and date. When it cannot read the conversation at boot, it waits, says "can't confirm", and DMs the
+owner once; `DATA_NOTICE_CHECK=off` makes it start on the databases alone.
+
+Only the bot's own messages count, and only in the DM. When the owner has chosen a channel for owner messages (WebUI.md),
+the bot also posts a copy of the notice there, which no machine reads. The owner must share a server with the bot and
+accept DMs from it: otherwise the notice is not posted, and a machine whose database was the main must be kept off in
+the Bot Manager until it rejoins as a live copy.
 
 ## Moving data between backends
 
@@ -178,8 +228,9 @@ is stored twice.
    cross-host database; and if you want at-rest protection, use full-disk encryption on the host.
 6. **Database HA is postgres-native.** Neither the bot nor the manager replicates the database:
    high availability of the data layer comes from the database world itself (a managed Postgres,
-   or streaming replication behind one stable URL). The bot keeps its unsaved changes while the
-   URL fails over and leaves Discord if its claims cannot be renewed in time, a promoted replica keeps the store identity
+   or streaming replication). List the main and its copies in `DATA_BACKEND_URL` (see "Several
+   database addresses"): that list is how the bot finds the main after a failover. The bot keeps
+   its unsaved changes while the main fails over and leaves Discord if its claims cannot be renewed in time, a promoted replica keeps the store identity
    and is reattached to normally, and a wrong or empty database is refused outright instead of
    served. The sidecar tier's recovery point is the nightly `pg_dump`.
 

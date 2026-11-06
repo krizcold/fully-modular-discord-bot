@@ -685,7 +685,7 @@ describe('H3: the answer\'s write on the wire', () => {
     w.model.cut(false);
     await run(w, T, { until: sent });
     cantConfirm(sent);
-    expect(loggedWith(logs.error, /^\[GuildRequests\] Could not record the answer to the write of server \d+ sent from ALPHA \(.+\); its sender reads can't confirm\. The answer was: accepted, not confirmed as saved yet$/)).toBe(true);
+    expect(loggedWith(logs.error, /^\[GuildRequests\] Can't confirm whether the answer to the write of server \d+ sent from ALPHA was recorded: an attempt that got no answer may have landed, and no later attempt confirmed it \(.+\); its sender reads that answer or can't confirm\. The answer was: accepted, not confirmed as saved yet$/)).toBe(true);
   });
 
   it('takeover: the deposed answer is written; it already says what the fence did, not-owner with the holder\'s name', async () => {
@@ -721,7 +721,7 @@ describe('H3: the answer\'s write on the wire', () => {
     expect(tries.length).toBeLessThanOrEqual(Math.ceil((leftMs + 5000) / 1000) + 1);
     for (let i = 1; i < tries.length; i++) expect(tries[i] - tries[i - 1]).toBeGreaterThanOrEqual(1000);
     expect(tries[tries.length - 1]).toBeLessThanOrEqual(leftMs + 5000);
-    expect(loggedWith(logs.error, /^\[GuildRequests\] Could not record the answer to the write of server \d+ sent from ALPHA \(SQLSTATE 28000: role is not permitted to log in\); its sender reads can't confirm\. The answer was: saved$/)).toBe(true);
+    expect(loggedWith(logs.error, /^\[GuildRequests\] Can't confirm whether the answer to the write of server \d+ sent from ALPHA was recorded: an attempt that got no answer may have landed, and no later attempt confirmed it \(SQLSTATE 28000: role is not permitted to log in\); its sender reads that answer or can't confirm\. The answer was: saved$/)).toBe(true);
     expect(w.model.rows.get(sent.id!)?.state).toBe('applying');
     expect(w.applications(sent)).toBe(1);
   });

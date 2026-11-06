@@ -17,6 +17,7 @@ vi.mock('../../src/bot/internalSetup/utils/dataBackends/workingSet', async orig 
     },
     landedFlushes: () => st.landed,
     dirtyGuildIds: () => (st.settled ? [] : ['100']),
+    resaveGuilds: () => [] as string[],
     unansweredGuilds: () => ({ all: [] as string[], only: [] as string[] }),
   };
   return { ...real, getWorkingSet: () => stub };

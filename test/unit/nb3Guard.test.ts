@@ -1,3 +1,4 @@
+import { pgConfig } from '../../src/utils/databaseAddress';
 import fs from 'fs';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
@@ -58,7 +59,7 @@ describe('the marker\'s migration field', () => {
     expect(readFileMarker()?.migration).toBe('job-guard-0004');
     setBackendKind('postgres');
     expect(evaluateRecognitionGuard()).toEqual({ state: 'boot', live: 'postgres' });
-    expect(await verifyStoreIdentity('postgres://x', true)).toEqual({ ok: true });
+    expect(await verifyStoreIdentity(pgConfig('postgres://x'), true)).toEqual({ ok: true });
     expect(JSON.parse(fs.readFileSync(MARKER, 'utf-8'))).toMatchObject({ storeId: 'store-db', migration: 'job-guard-0004' });
     writeFileMarker({ ...readFileMarker()!, flippedAt: 2 });
     expect(readFileMarker()?.migration).toBe('job-guard-0004');

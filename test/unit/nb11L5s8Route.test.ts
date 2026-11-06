@@ -9,7 +9,7 @@ import { call, resetData, startApp } from '../helpers/configRig';
 // the bot never answered, an ok reply without a count, and no reply at all.
 
 const G = '123456789012345678';
-const MINUTE = "Within a minute, if it was restored, the server's data is back and its entry is gone from `smdb graveyard list`; if not, the entry is still listed, unless it had passed the graveyard's keep time and the graveyard sweep removed it, data and all.";
+const MINUTE = "Within a minute, if it was restored, the server's data is back and its entry is gone from `smdb graveyard list`; if not, the entry is still listed, unless it had passed the graveyard's keep time and the graveyard sweep removed it, data and all. The list reads the data of the bot behind the web panel it asks; if the main database was replaced meanwhile, check once that bot runs on the new main.";
 
 beforeEach(async () => {
   setBackendKind('file');

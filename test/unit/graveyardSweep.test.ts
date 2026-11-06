@@ -11,6 +11,7 @@ vi.mock('../../src/bot/internalSetup/utils/pgClient', async importOriginal => ({
 }));
 
 import { PostgresBackend } from '../../src/bot/internalSetup/utils/dataBackends/postgresBackend';
+import { fixedDatabase } from '../helpers/fixedDatabase';
 import { closeGuildWrites, noteGuildDataServing, setGuildDataBackend, sweepGraveyard } from '../../src/bot/internalSetup/utils/dataManager';
 import { setBackendKind } from '../helpers/backendKind';
 
@@ -43,8 +44,11 @@ const backendServing = (serves: boolean) => {
 describe('the graveyard sweep', () => {
   it('deletes graveyard rows past the cutoff on its own pool and never a guild_ownership row', async () => {
     const sent: string[] = [];
-    const fake = { pool: { query: async (sql: string) => { sent.push(sql); return { rows: [], rowCount: 3 }; } } };
-    const swept = await (PostgresBackend.prototype.sweepGraveyard as (this: unknown, cutoffMs: number) => Promise<number>).call(fake, Date.now());
+    const real = new PostgresBackend(fixedDatabase('postgres://nobody@127.0.0.1:9/none'));
+    const client = { query: async (config: { text: string }) => { sent.push(config.text); return { rows: [], rowCount: 3 }; }, release: () => undefined };
+    (real as unknown as { pool: unknown }).pool = { connect: async () => client, end: async () => undefined };
+    const swept = await real.sweepGraveyard(Date.now());
+    await real.stop();
     expect(swept).toBe(3);
     expect(sent.some(sql => sql.includes('guild_data_graveyard'))).toBe(true);
     expect(sent.filter(sql => sql.includes('guild_ownership'))).toEqual([]);

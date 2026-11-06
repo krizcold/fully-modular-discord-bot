@@ -39,6 +39,8 @@ export interface BotCredentials {
   // Data backend: file (default) | postgres, and the Postgres connection string.
   DATA_BACKEND?: string;
   DATA_BACKEND_URL?: string;
+  // 'off' starts the bot on its databases alone when the switch notices cannot be read.
+  DATA_NOTICE_CHECK?: string;
   // Payment provider credentials are arbitrary env-var keys the providers
   // declare via getCredentialFields(); they're addressable through the
   // [string]: string | undefined index signature below. The per-provider
@@ -123,6 +125,7 @@ export function loadCredentials(): BotCredentials {
     SESSION_SECRET: process.env.SESSION_SECRET,
     DATA_BACKEND: process.env.DATA_BACKEND,
     DATA_BACKEND_URL: process.env.DATA_BACKEND_URL,
+    DATA_NOTICE_CHECK: process.env.DATA_NOTICE_CHECK,
   };
 
   // Payment provider env vars are dynamic per provider; copy through any

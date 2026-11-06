@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { FenceToken, RestoreOutcome } from '../../src/bot/internalSetup/utils/dataBackends/backend';
 import { initDataReadiness, type DataReadinessDriver } from '../../src/bot/internalSetup/utils/dataBackends/dataReadiness';
 import { PostgresBackend } from '../../src/bot/internalSetup/utils/dataBackends/postgresBackend';
+import { fixedDatabase } from '../helpers/fixedDatabase';
 import { initWorkingSet } from '../../src/bot/internalSetup/utils/dataBackends/workingSet';
 import { RESTORE_TEXTS, setGuildDataBackend, setOwnerInfoProvider } from '../../src/bot/internalSetup/utils/dataManager';
 import { applyOperatorDataWrite } from '../../src/bot/internalSetup/utils/ipcDataHandler';
@@ -40,7 +41,7 @@ afterEach(() => {
 
 describe('restoreGuild on Postgres with a batch whose reason is NULL', () => {
   it('commits and answers the moved rows with an empty reason', async () => {
-    const backend = new PostgresBackend({ url: 'postgres://nobody@127.0.0.1:9/none' });
+    const backend = new PostgresBackend(fixedDatabase('postgres://nobody@127.0.0.1:9/none'));
     const internals = backend as unknown as { state: string; provisioned: boolean };
     internals.state = 'ready';
     internals.provisioned = true;

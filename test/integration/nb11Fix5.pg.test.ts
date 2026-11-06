@@ -3,6 +3,7 @@ import type { Pool } from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { FenceToken } from '../../src/bot/internalSetup/utils/dataBackends/backend';
 import { PostgresBackend } from '../../src/bot/internalSetup/utils/dataBackends/postgresBackend';
+import { fixedDatabase } from '../helpers/fixedDatabase';
 import { takeShard } from '../helpers/pgClaims';
 import { poolFor, startPostgres } from '../helpers/postgres';
 
@@ -26,7 +27,7 @@ const sleep = (ms: number) => new Promise(resolve => { setTimeout(resolve, ms); 
 beforeAll(async () => {
   container = await startPostgres();
   direct = poolFor(container);
-  backend = new PostgresBackend({ url: container.getConnectionUri() });
+  backend = new PostgresBackend(fixedDatabase(container.getConnectionUri()));
   backend.start();
   const until = Date.now() + 60_000;
   while (backend.connectionState().state !== 'ready' && Date.now() < until) await sleep(100);

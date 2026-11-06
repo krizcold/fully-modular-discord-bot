@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { PostgresBackend, SCHEMA_VERSION } from '../../src/bot/internalSetup/utils/dataBackends/postgresBackend';
+import { fixedDatabase } from '../helpers/fixedDatabase';
 import { startClaimRig, type ClaimRig } from '../helpers/pgClaimRig';
 
 // NB4 decision 1: version 3 provisions the claims table, the claim clock with its one row, the machines table, the
@@ -60,7 +61,7 @@ describe('a database at {"v":2}', () => {
       await v2.query(`CREATE TABLE smdb_data.meta (key text PRIMARY KEY, value text NOT NULL, updated_at timestamptz NOT NULL DEFAULT now())`);
       await v2.query(`INSERT INTO smdb_data.meta (key, value) VALUES ('schema_version', '{"v":2}'), ('store_id', '"s"')`);
       const before = (await v2.query(`SELECT key, value, updated_at FROM smdb_data.meta ORDER BY key`)).rows;
-      const backend = new PostgresBackend({ url });
+      const backend = new PostgresBackend(fixedDatabase(url));
       backend.start();
       try {
         expect(await backend.provisionVerdict()).toEqual({ state: 'mismatch', found: '{"v":2}' });

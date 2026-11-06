@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { FenceToken } from '../../src/bot/internalSetup/utils/dataBackends/backend';
 import { PostgresBackend, SCHEMA_VERSION } from '../../src/bot/internalSetup/utils/dataBackends/postgresBackend';
+import { fixedDatabase } from '../helpers/fixedDatabase';
 
 const backends: PostgresBackend[] = [];
 afterEach(async () => {
@@ -12,7 +13,7 @@ afterEach(async () => {
 type Answer = (sql: string, params?: unknown[]) => unknown;
 
 function scripted(answer: Answer) {
-  const backend = new PostgresBackend({ url: 'postgres://nobody@127.0.0.1:9/none' });
+  const backend = new PostgresBackend(fixedDatabase('postgres://nobody@127.0.0.1:9/none'));
   backends.push(backend);
   (backend as unknown as { state: string }).state = 'ready';
   const sent: string[] = [];
@@ -40,7 +41,7 @@ const quiet = () => {
   return vi.spyOn(console, 'error').mockImplementation(() => {});
 };
 const VERSION_READ = /SELECT value FROM smdb_data\.meta WHERE key = 'schema_version'/;
-const missing = () => Object.assign(new Error('relation "smdb_data.meta" does not exist'), { code: '42P01' });
+const missing = () => Object.assign(new Error('relation "smdb_data.meta" does not exist'), { code: '42P01', severity: 'ERROR' });
 
 describe('provisioning', () => {
   it('creates the guild_ownership table', async () => {

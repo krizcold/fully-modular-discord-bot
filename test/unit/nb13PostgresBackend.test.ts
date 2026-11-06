@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { FenceToken, GuildFlushBatch } from '../../src/bot/internalSetup/utils/dataBackends/backend';
 import { PostgresBackend } from '../../src/bot/internalSetup/utils/dataBackends/postgresBackend';
+import { fixedDatabase } from '../helpers/fixedDatabase';
 
 // NB13 decisions 3 and 4 at the backend: COMMIT under a client bound, the mark in the fence, and the check of a flush
 // whose COMMIT got no answer. The scripted client keeps node-pg's query_timeout: an unanswered statement sent with one
@@ -32,7 +33,7 @@ type Answer = unknown | Error | 'never';
 interface Sent { sql: string; params?: unknown[]; timeout?: number; commitSentThen?: boolean }
 
 function scripted(answer: (sql: string, params?: unknown[]) => Answer, batch?: GuildFlushBatch) {
-  const backend = new PostgresBackend({ url: 'postgres://nobody@127.0.0.1:9/none' });
+  const backend = new PostgresBackend(fixedDatabase('postgres://nobody@127.0.0.1:9/none'));
   backends.push(backend);
   (backend as unknown as { state: string }).state = 'ready';
   const sent: Sent[] = [];
@@ -104,14 +105,15 @@ describe('2.1 a COMMIT without an answer', () => {
     ['the fence', /INSERT INTO smdb_data\.guild_ownership AS o/],
     ['an upsert', /INSERT INTO smdb_data\.guild_data/],
     ['an append insert', /INSERT INTO smdb_data\.guild_append/],
-  ])('a throw at %s carries no commitUnanswered and sends one ROLLBACK', async (_name, at) => {
+  ])('a throw at %s carries no commitUnanswered and sends no ROLLBACK on the lost client (NB5 I1)', async (_name, at) => {
     vi.spyOn(console, 'error').mockImplementation(() => {});
     const batch = batchOf();
-    const { backend, sent } = scripted(sql => at.test(sql) ? failure(undefined) : fenced(sql), batch);
+    const { backend, sent, releases } = scripted(sql => at.test(sql) ? failure(undefined) : fenced(sql), batch);
     const outcome = await backend.flushGuild('g1', batch, token);
     expect(outcome).toMatchObject({ ok: false, reason: 'unavailable' });
     expect(outcome).not.toHaveProperty('commitUnanswered');
-    expect(sent.filter(s => s.sql === 'ROLLBACK')).toHaveLength(1);
+    expect(sent.filter(s => s.sql === 'ROLLBACK')).toHaveLength(0);
+    expect(releases).toEqual([true]);
   });
 });
 
@@ -288,7 +290,7 @@ describe('2.6 and 2.7 the bound ends the check', () => {
 
 describe('2.8 the guild pool', () => {
   it('is built with keepAliveInitialDelayMillis 30000', () => {
-    const backend = new PostgresBackend({ url: 'postgres://nobody@127.0.0.1:9/none' });
+    const backend = new PostgresBackend(fixedDatabase('postgres://nobody@127.0.0.1:9/none'));
     backends.push(backend);
     expect((backend.getPool() as unknown as { options: { keepAliveInitialDelayMillis?: number } }).options.keepAliveInitialDelayMillis).toBe(30_000);
   });

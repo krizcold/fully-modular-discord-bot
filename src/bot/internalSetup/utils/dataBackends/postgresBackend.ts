@@ -8,7 +8,8 @@ import { randomUUID } from 'crypto';
 import { Client, Pool } from 'pg';
 import { guardPoolClients, shortLivedClient } from '../pgClient';
 import { FLUSH_STATEMENT_BYTES, FLUSH_WIRE_MAX, flushBoundMs, utf8Pieces } from '../storableData';
-import type { PoolClient, QueryConfig, QueryResult } from 'pg';
+import { pgConfig, showEntry } from '../../../../utils/databaseAddress';
+import type { ClientConfig, PoolClient, PoolConfig, QueryConfig, QueryResult } from 'pg';
 import type {
   DataBackend,
   DocKey,
@@ -18,6 +19,7 @@ import type {
   GuildFlushBatch,
   GuildOwner,
   HydrationOutcome,
+  LateCommit,
   RestoreOutcome,
   RestoreStop,
   RetireOutcome,
@@ -61,6 +63,7 @@ const PROVISION_DDL: string[] = [
   )`,
   `CREATE INDEX IF NOT EXISTS guild_ownership_node_idx ON smdb_data.guild_ownership (node_id)`,
   `CREATE INDEX IF NOT EXISTS guild_ownership_claim_idx ON smdb_data.guild_ownership (claim)`,
+  `CREATE INDEX IF NOT EXISTS guild_ownership_shard_idx ON smdb_data.guild_ownership (shard_count, shard_id)`,
   `CREATE SEQUENCE IF NOT EXISTS smdb_data.claim_seq`,
   `CREATE TABLE IF NOT EXISTS smdb_data.shard_claims (
     shard_count     integer     NOT NULL,
@@ -293,6 +296,9 @@ const STATEMENT_FLOOR_MS = 1000;
 const COMMIT_FLOOR_MS = 2000;
 // pg's own error for a statement that outlived its query_timeout.
 const QUERY_TIMEOUT_MESSAGE = 'Query read timeout';
+// pg-pool's error for a request queued while every client of the pool is busy.
+const POOL_FULL_MESSAGE = 'timeout exceeded when trying to connect';
+const DID_NOT_ANSWER = 'the database did not answer';
 
 class OutOfTime extends Error {}
 
@@ -331,23 +337,138 @@ function classifyFailure(error: unknown): TxFailure {
 }
 
 /**
- * One client's statements bounded by a deadline (none when null): each carries the time left as its query_timeout; a
- * forward statement is not sent below its floor; after an error nothing more is sent and the client is destroyed.
+ * NB5 D8 and G2: a retire's or a restore's COMMIT error shows that the transaction rolled back only when the database
+ * answered it, NB13's test does not read it as landed, and its class is not 53.
+ */
+export function commitRolledBack(error: unknown): boolean {
+  if (classifyFailure(error).kind !== 'answered' || commitMayHaveLanded(error)) return false;
+  return !/^53/.test(describeFailure(error).code ?? '');
+}
+
+const CERT_CODE = /^(CERT_|ERR_TLS_CERT|DEPTH_ZERO_SELF_SIGNED_CERT$|SELF_SIGNED_CERT_IN_CHAIN$|UNABLE_TO_(GET_ISSUER_CERT|VERIFY_LEAF_SIGNATURE|DECRYPT_CERT_SIGNATURE))/;
+/**
+ * NB5 decision 13: the hold's entry cause for a failure that starts it, null for one that does not. A failure is no
+ * answer as classifyFailure reads it (no SQLSTATE, a session the server ended, class 08, a client timeout); an answer,
+ * pg-pool's full-pool error and a FATAL that refused a new client at its login (atLogin) start nothing.
+ */
+function holdCause(error: unknown, atLogin = false): string | null {
+  const { code, severity, message } = (isObject(error) ? error : {}) as { code?: unknown; severity?: unknown; message?: unknown };
+  const sqlstate = typeof code === 'string' ? code : undefined;
+  if (sqlstate && CERT_CODE.test(sqlstate)) return `the database's certificate was refused (${sqlstate})`;
+  if (sqlstate === '28000') return 'the database refused the login (SQLSTATE 28000)';
+  if (message === POOL_FULL_MESSAGE || classifyFailure(error).kind === 'answered') return null;
+  if (atLogin && typeof severity === 'string' && sqlstate && !/^(08|57P0[123])/.test(sqlstate)) return null;
+  if (sqlstate === '57P01' || sqlstate === '57P02') return `the database ended this process's sessions (SQLSTATE ${sqlstate})`;
+  if (sqlstate === '57P03') return 'the database is not accepting connections yet (SQLSTATE 57P03)';
+  return DID_NOT_ANSWER;
+}
+
+/** NB5 decision 13: whether a failure is an observation that the chosen database did not answer. */
+export function isSilence(error: unknown): boolean {
+  return holdCause(error) !== null;
+}
+
+/** NB5 decision 11: what made this process stop writing to its database. */
+export type LatchCause =
+  | { kind: 'replaced'; machine: string; generation: number }
+  | { kind: 'tie'; generation: number }
+  | { kind: 'behind-notice'; machine: string; generation: number };
+
+/** NB5 decision 11's `<why>` for a latch of the database at this address. */
+export function latchWords(cause: LatchCause, address: string): string {
+  switch (cause.kind) {
+    case 'replaced': return `${address} was replaced by ${cause.machine} (generation ${cause.generation})`;
+    case 'tie': return `can't confirm that ${address} is still the main (another database accepts writes at generation ${cause.generation})`;
+    case 'behind-notice': return `can't confirm that ${address} is still the main (generation ${cause.generation} was announced for ${cause.machine})`;
+  }
+}
+
+/** The backend's own state refused a statement before it was sent: latched (its `<why>`) or held (`holdWords()`). */
+class OwnStateRefusal extends Error {
+  constructor(readonly phase: 'latched' | 'held', readonly detail: string) {
+    super(detail);
+    this.name = 'OwnStateRefusal';
+  }
+}
+
+/** The detail an operation answers for a refusal: the latch's adds that this process does not write there. */
+function operationDetail(refusal: OwnStateRefusal): string {
+  return refusal.phase === 'latched' ? `${refusal.detail}; this process does not write to it` : refusal.detail;
+}
+
+/** Client timeouts of statements whose caller's own deadline was at most their answer bound (I5 case (a)). */
+const deadlineCuts = new WeakSet<object>();
+
+const isObject = (value: unknown): value is object => !!value && typeof value === 'object';
+
+/**
+ * NB5 I1: a client checked out of the data pool. The latch cuts every lease whose COMMIT was not let through; a
+ * statement that was refused or got no answer spoils the lease, which then sends nothing more and is destroyed.
+ */
+class DataLease {
+  commitPassed = false;
+  cut = false;
+  spoiled = false;
+  spoiledBy: unknown = undefined;
+
+  constructor(readonly client: PoolClient, readonly epoch: number, readonly entry: string, readonly move: boolean) {}
+}
+
+/**
+ * NB5 decision 9's chooser as the backend sees it: the boot wait chooses the entry, and the watch probes it while the
+ * backend is held and confirms through `noteEntryAnswered`, `noteConfirmingCause` and `confirmHold`.
+ */
+export interface DatabaseChooser {
+  /** The entry chosen already, or null while the boot wait runs. */
+  chosen(): string | null;
+  /** Resolves once a pass chose an entry; null when the chooser stopped first. */
+  awaitChoice(): Promise<string | null>;
+  /** What askDatabase answers before the choice: 'refused' after a pass in which every address refused the login. */
+  lastPassLogin(): 'refused' | 'unreachable';
+  /** The backend entered its hold under this epoch. */
+  holdStarted(backend: PostgresBackend, epoch: number): void;
+  /** A drain waits on the hold: the next attempt starts without the wait before it. */
+  confirmNow(): void;
+  stop(): void;
+}
+
+/** The steps of a move that other layers own (decision 12): (a)'s check, (c) and (d), (e) and (f)'s report. */
+export interface MoveSteps {
+  /** (a): null when the target may be written, else the reason it may not. */
+  checkTarget(entry: string): Promise<string | null>;
+  /** (c) and (d): the renewal and the re-take on the claims pool (b) built; false ends this attempt. */
+  claims(entry: string): Promise<boolean>;
+  /** (e): the retires sent before the latch, settled against the target; false ends this attempt. */
+  settleRetires(epoch: number, entry: string): Promise<boolean>;
+  /** (f): the new entry is in use. */
+  moved(entry: string): void;
+  /** An attempt that passed (c) and (d) ended before (f). */
+  attemptEnded?(): void;
+}
+
+/**
+ * One client's statements bounded by a deadline (none when null): each carries the smaller of the answer bound and the
+ * time left as its query_timeout; a forward statement is not sent below its floor; after an error nothing more is sent
+ * and the client is destroyed.
  */
 class BoundedClient {
   destroy = false;
 
-  constructor(private readonly client: PoolClient, private readonly deadline: bigint | null) {}
+  constructor(
+    readonly lease: DataLease,
+    private readonly deadline: bigint | null,
+    private readonly sendOn: (lease: DataLease, text: string, values: unknown[], boundMs: number | null, callerMs?: number, onPass?: () => void) => Promise<QueryResult>,
+  ) {}
 
   left(): number {
     return this.deadline === null ? Infinity : msLeft(this.deadline);
   }
 
-  async send(text: string, values: unknown[] = [], floorMs = STATEMENT_FLOOR_MS): Promise<QueryResult> {
+  async send(text: string, values: unknown[] = [], floorMs = STATEMENT_FLOOR_MS, onPass?: () => void): Promise<QueryResult> {
     const left = this.left();
     if (left < floorMs) throw new OutOfTime();
     try {
-      return await this.client.query(this.config(text, values, left));
+      return await this.sendOn(this.lease, text, values, ANSWER_BOUND_MS, left, onPass);
     } catch (error) {
       this.destroy = true;
       throw error;
@@ -362,15 +483,11 @@ class BoundedClient {
       return null;
     }
     try {
-      return await this.client.query(this.config(text, values, left));
+      return await this.sendOn(this.lease, text, values, ANSWER_BOUND_MS, left);
     } catch {
       this.destroy = true;
       return null;
     }
-  }
-
-  private config(text: string, values: unknown[], left: number): QueryConfig {
-    return { text, values, ...(Number.isFinite(left) ? { query_timeout: Math.max(1, Math.floor(left)) } : {}) } as QueryConfig;
   }
 }
 
@@ -387,15 +504,40 @@ const RESTORE_MOVE = `WITH moved AS (
   SELECT (SELECT count(*) FROM moved) AS taken, (SELECT count(*) FROM d) + (SELECT count(*) FROM a) AS put,
          (SELECT min(reason) FROM moved) AS reason`;
 
+// Decision 12 (e) and J2: whether a retire's batch is on the target, as one row.
+const BATCH_PRESENT = `SELECT EXISTS (SELECT 1 FROM smdb_data.guild_data_graveyard WHERE guild_id = $1 AND retired_at = $2) AS present`;
+
+const NO_MOVE_STEPS: MoveSteps = {
+  checkTarget: entry => checkMoveTarget(entry, null),
+  claims: async () => true,
+  settleRetires: async () => true,
+  moved: () => undefined,
+};
+
 export class PostgresBackend implements DataBackend {
   readonly kind = 'postgres' as const;
 
   getPool(): Pool {
+    if (!this.pool) throw new Error('no database is chosen yet');
     return this.pool;
   }
 
-  private readonly pool: Pool;
-  private state: 'connecting' | 'ready' | 'outage' = 'connecting';
+  private pool: Pool | null = null;
+  private entry: string | null = null;
+  private poolEpoch = 0;
+  private epoch = 0;
+  private readonly chooser: DatabaseChooser;
+  private state: 'connecting' | 'ready' | 'outage' | 'confirming' = 'connecting';
+  private stateBeforeHold: 'connecting' | 'ready' = 'connecting';
+  private holdEntryCause = DID_NOT_ANSWER;
+  private confirmingCause = 'checking';
+  private confirmedAt: number | null = null;
+  private reportedHold: string | null = null;
+  private latchWhy: string | null = null;
+  private lastWhy: string | null = null;
+  private moving: number | null = null;
+  private moveSteps: MoveSteps = NO_MOVE_STEPS;
+  private readonly moveRefusalsLogged = new Set<string>();
   private outageSince: number | undefined;
   private outageAlertFired = false;
   private outageAlertTimer: NodeJS.Timeout | null = null;
@@ -404,17 +546,31 @@ export class PostgresBackend implements DataBackend {
   private provisioned = false;
   private started = false;
   private stopped = false;
-  private probing = false;
   private readonly listeners: AlertListener[] = [];
   private readonly loginRefusedListeners: Array<() => void> = [];
+  private readonly databaseListeners: Array<(entry: string) => void> = [];
+  private readonly holdListeners: Array<(words: string | null) => void> = [];
   private readonly pendingSleeps = new Set<{ timer: NodeJS.Timeout; resolve: () => void }>();
+  private readonly leases = new Set<DataLease>();
+  // The epoch each failure was observed under: its pool's, or a watch pass's.
+  private readonly observed = new WeakMap<object, number>();
+  // Failures of a new client's connect, whose FATAL refused only that client.
+  private readonly loginFailures = new WeakSet<object>();
   // The flush gate: at most FLUSH_WIRE_MAX flushes hold a client at once, the rest wait first in, first out.
   private flushesOnWire = 0;
   private readonly flushWaiters: Array<() => void> = [];
 
-  constructor(opts: { url: string }) {
-    this.pool = new Pool({
-      connectionString: opts.url,
+  constructor(opts: { chooser: DatabaseChooser }) {
+    this.chooser = opts.chooser;
+    const entry = this.chooser.chosen();
+    if (entry !== null) this.useEntry(entry);
+  }
+
+  /** Raises the epoch and builds the data pool for the entry under it (the choice, or step (b) of a move). */
+  private useEntry(entry: string): void {
+    this.epoch += 1;
+    const epoch = this.epoch;
+    const pool = this.makePool({
       max: POOL_MAX,
       min: 0,
       connectionTimeoutMillis: CONNECT_TIMEOUT_MS,
@@ -425,16 +581,44 @@ export class PostgresBackend implements DataBackend {
       // caller's first query on the same session (deprecated queueing, pg@9 throws).
       statement_timeout: STATEMENT_TIMEOUT_MS,
       idle_in_transaction_session_timeout: IDLE_IN_TX_TIMEOUT_MS,
+      ...pgConfig(entry),
     });
-    this.pool.on('error', error => {
+    pool.on('error', error => {
       // Unhandled idle-client errors would crash the process.
       console.error('[PostgresBackend] Idle client error:', error);
+      this.observedUnder(error, epoch);
+      this.noteFailure(error);
     });
-    guardPoolClients(this.pool, 'the guild-data pool');
+    guardPoolClients(pool, 'the guild-data pool');
+    this.pool = pool;
+    this.poolEpoch = epoch;
+    this.entry = entry;
+  }
+
+  private makePool(config: PoolConfig): Pool {
+    return new Pool(config);
+  }
+
+  private observedUnder(error: unknown, epoch: number): void {
+    if (isObject(error) && !this.observed.has(error)) this.observed.set(error, epoch);
+  }
+
+  /** The entry the data pool is built from, or null before the choice. */
+  chosenEntry(): string | null {
+    return this.entry;
+  }
+
+  /** Decision 13's database epoch: raised at the choice, at every latch and at step (b) of every move. */
+  databaseEpoch(): number {
+    return this.epoch;
+  }
+
+  private address(entry: string | null = this.entry): string {
+    return showEntry(entry ?? '');
   }
 
   // ==========================================================================
-  // LIFECYCLE + OUTAGE MACHINERY
+  // LIFECYCLE, THE LATCH AND THE HOLD
   // ==========================================================================
 
   start(): void {
@@ -445,6 +629,7 @@ export class PostgresBackend implements DataBackend {
 
   async stop(): Promise<void> {
     this.stopped = true;
+    this.chooser.stop();
     this.clearOutageAlertTimer();
     for (const entry of this.pendingSleeps) {
       clearTimeout(entry.timer);
@@ -452,7 +637,7 @@ export class PostgresBackend implements DataBackend {
     }
     this.pendingSleeps.clear();
     try {
-      await this.pool.end();
+      await this.pool?.end();
     } catch { /* already ended */ }
   }
 
@@ -469,28 +654,97 @@ export class PostgresBackend implements DataBackend {
   /** TTL sweep of graveyard rows older than the cutoff; guild_ownership rows are the claim fence and are never deleted.
    * Returns the number of rows deleted; idempotent, safe to misfire. */
   async sweepGraveyard(cutoffMs: number): Promise<number> {
-    const tombstones = await this.pool.query(
-      `DELETE FROM smdb_data.guild_data_graveyard WHERE retired_at < $1`, [cutoffMs]);
-    return tombstones.rowCount ?? 0;
+    try {
+      const tombstones = await this.leaseQuery(`DELETE FROM smdb_data.guild_data_graveyard WHERE retired_at < $1`, [cutoffMs], ANSWER_BOUND_MS);
+      return tombstones.rowCount ?? 0;
+    } catch (error) {
+      if (classifyFailure(error).kind !== 'answered') this.noteFailure(error);
+      throw error;
+    }
   }
 
-  /** True while the backend may write: provisioned at this bot's schema version and not stopped. */
+  /** True while the backend may write: provisioned at this bot's schema version, not stopped, latched or held. */
   servesData(): boolean {
-    return this.provisioned && !this.schemaMismatch && !this.stopped;
+    return this.provisioned && !this.schemaMismatch && !this.stopped && this.latchWhy === null && !this.isHeld();
   }
 
-  connectionState(): { state: 'connecting' | 'ready' | 'outage'; outageSinceMs?: number } {
-    if (this.state === 'outage') return { state: 'outage', outageSinceMs: this.outageSince };
+  /** A move's attempt is past (b) and has not ended (decision 19's 'moving'). */
+  isMoving(): boolean {
+    return this.moving !== null && this.moving === this.epoch;
+  }
+
+  connectionState(): { state: 'connecting' | 'ready' | 'outage' | 'confirming' | 'latched'; outageSinceMs?: number } {
+    if (this.latchWhy !== null) return { state: 'latched' };
+    if (this.state === 'outage' || this.state === 'confirming') return { state: this.state, outageSinceMs: this.outageSince };
     return { state: this.state };
+  }
+
+  private isHeld(): boolean {
+    return (this.state === 'outage' || this.state === 'confirming') && !this.schemaMismatch;
+  }
+
+  /** Decision 13's hold detail, from its phase; null while not held. */
+  holdWords(): string | null {
+    if (!this.isHeld()) return null;
+    const address = this.address();
+    return this.state === 'outage'
+      ? `${this.holdEntryCause}; this process checks that ${address} is still the main before writing to it`
+      : `the database answers again, but this process can't confirm yet that ${address} is still the main (${this.confirmingCause})`;
+  }
+
+  /** Decision 13's confirming cause while the hold is in 'confirming', else null. */
+  confirmingWords(): string | null {
+    return this.isHeld() && this.state === 'confirming' ? this.confirmingCause : null;
+  }
+
+  /** The latch's `<why>` while latched, else null. */
+  latchReason(): string | null {
+    return this.latchWhy;
+  }
+
+  /** G9: why this backend refuses every statement now (the latched detail or `holdWords()`), else null. */
+  refusalDetail(): string | null {
+    if (this.latchWhy !== null) return `${this.latchWhy}; this process does not write to it`;
+    return this.holdWords();
+  }
+
+  /** Decision 11: the backend itself holds the saves back (latched, or held while the database answers). */
+  refusesByOwnState(): boolean {
+    return this.latchWhy !== null || (this.isHeld() && this.state === 'confirming');
+  }
+
+  /** Decision 13: now while held, else when the last hold ended with a confirmation (null before any). */
+  heldUntil(): number | null {
+    return this.isHeld() ? Date.now() : this.confirmedAt;
+  }
+
+  /** Decision 13: a drain waits on the hold, so the chooser's next attempt starts without the wait before it. */
+  confirmNow(): void {
+    if (this.isHeld()) this.chooser.confirmNow();
   }
 
   onAlert(cb: AlertListener): void {
     this.listeners.push(cb);
   }
 
-  /** Called each time an operation fails because the database refused the login (isLoginRefused). */
+  /** Called each time an observation of the database in use shows that it refused the login (isLoginRefused). */
   onLoginRefused(cb: () => void): void {
     this.loginRefusedListeners.push(cb);
+  }
+
+  /** Decision 12 (b): called with the new entry when a move builds its pools. */
+  onDatabaseChanged(cb: (entry: string) => void): void {
+    this.databaseListeners.push(cb);
+  }
+
+  /** Decision 13: called with `holdWords()` whenever it changes, and with null when the hold ends. */
+  onHoldChanged(cb: (words: string | null) => void): void {
+    this.holdListeners.push(cb);
+  }
+
+  /** The steps of a move that the shard layer and the data manager own. */
+  setMoveSteps(steps: MoveSteps): void {
+    this.moveSteps = steps;
   }
 
   private noteLoginRefused(error: unknown): void {
@@ -506,93 +760,210 @@ export class PostgresBackend implements DataBackend {
 
   /** SELECT 1 through the guild-data pool: the database answers, refuses the login (isLoginRefused), or neither. */
   async askDatabase(): Promise<'answers' | 'refused' | 'unreachable'> {
+    if (!this.pool) return this.chooser.lastPassLogin();
     try {
-      await this.pool.query({ text: 'SELECT 1', query_timeout: ASK_DATABASE_TIMEOUT_MS } as QueryConfig);
+      await this.leaseQuery('SELECT 1', [], ASK_DATABASE_TIMEOUT_MS);
       this.noteSuccess();
       return 'answers';
     } catch (error) {
+      if (error instanceof OwnStateRefusal) return 'unreachable';
+      this.noteFailure(error);
       return isLoginRefused(error) ? 'refused' : 'unreachable';
     }
   }
 
   private async bootstrapLoop(): Promise<void> {
+    if (!this.pool) {
+      const entry = await this.chooser.awaitChoice();
+      if (entry === null || this.stopped) return;
+      if (!this.pool) this.useEntry(entry);
+    }
     let attempt = 0;
     while (!this.stopped) {
       try {
-        await this.pool.query('SELECT 1');
-        const recovery = await this.pool.query('SELECT pg_is_in_recovery() AS in_recovery');
+        await this.poolQuery('SELECT 1', [], ANSWER_BOUND_MS);
+        const recovery = await this.poolQuery('SELECT pg_is_in_recovery() AS in_recovery', [], ANSWER_BOUND_MS);
         if (recovery.rows[0]?.in_recovery === true) {
           throw new Error('the database is in recovery (read-only); the bot serves only from a database that takes writes');
         }
         await this.provision();
         if (this.schemaMismatch) return;
-        this.becomeReady();
+        if (this.isHeld()) this.stateBeforeHold = 'ready';
+        else if (this.latchWhy === null) this.state = 'ready';
         console.log('[PostgresBackend] Connected and provisioned; backend ready');
         return;
       } catch (error) {
         if (this.stopped) return;
-        this.noteLoginRefused(error);
+        if (!(error instanceof OwnStateRefusal) && this.observedNow(error)) this.noteLoginRefused(error);
         console.warn(`[PostgresBackend] Bootstrap attempt ${attempt + 1} failed (retrying):`, error);
         await this.sleep(backoffDelay(attempt++));
       }
     }
   }
 
-  private async outageProbeLoop(): Promise<void> {
-    if (this.probing) return;
-    this.probing = true;
-    try {
-      let attempt = 0;
-      while (!this.stopped && this.state === 'outage' && !this.schemaMismatch) {
-        await this.sleep(backoffDelay(attempt++));
-        if (this.stopped || this.state !== 'outage' || this.schemaMismatch) return;
-        try {
-          await this.pool.query('SELECT 1');
-          this.becomeReady();
-          console.log('[PostgresBackend] Probe succeeded; backend ready');
-          return;
-        } catch (error) {
-          this.noteLoginRefused(error);
-        }
-      }
-    } finally {
-      this.probing = false;
-    }
+  /** Whether a failure was observed under the current epoch (one with no record was observed now). */
+  private observedNow(error: unknown): boolean {
+    return (isObject(error) ? this.observed.get(error) ?? this.epoch : this.epoch) === this.epoch;
   }
 
-  private becomeReady(): void {
-    const wasOutage = this.state === 'outage';
-    this.state = 'ready';
+  /** An answer ends nothing: only the chooser's confirmation ends a hold (decision 13). */
+  private noteSuccess(): void {
+    // Kept as the one place every answered operation reports to.
+  }
+
+  /**
+   * Decision 13's one entry rule. A refusal and a deadline cut are no observation; an observation of an earlier epoch,
+   * or made while latched, changes nothing; a failure `isSilence` accepts starts the hold.
+   */
+  private noteFailure(error: unknown): void {
+    if (error instanceof OwnStateRefusal) return;
+    if (isObject(error) && deadlineCuts.has(error)) return;
+    if (this.schemaMismatch || this.stopped || this.entry === null || this.latchWhy !== null) return;
+    if (!this.observedNow(error)) return;
+    this.noteLoginRefused(error);
+    const cause = holdCause(error, isObject(error) && this.loginFailures.has(error));
+    if (cause !== null) this.enterHold(cause, error);
+  }
+
+  /** A watch pass's failed probe of the chosen entry, made under the given epoch (decision 10). */
+  noteObservation(error: unknown, epoch: number, atLogin = false): void {
+    this.observedUnder(error, epoch);
+    if (atLogin && isObject(error)) this.loginFailures.add(error);
+    this.noteFailure(error);
+  }
+
+  /** NB4's lapse puts the backend in its hold. */
+  noteLapse(): void {
+    if (this.schemaMismatch || this.stopped || this.entry === null || this.latchWhy !== null) return;
+    this.enterHold("this process's shard claims lapsed");
+  }
+
+  private enterHold(cause: string, error?: unknown): void {
+    if (this.state === 'outage') return;
+    if (this.state !== 'confirming') {
+      this.stateBeforeHold = this.state;
+      this.outageSince = Date.now();
+      if (error !== undefined) console.error(outageLine(error), error);
+      this.armOutageAlert();
+    }
+    this.state = 'outage';
+    this.holdEntryCause = cause;
+    this.reportHold();
+    this.chooser.holdStarted(this, this.epoch);
+  }
+
+  /** The watch saw the chosen entry answer under this epoch: the hold waits for its confirmation. */
+  noteEntryAnswered(epoch: number): void {
+    if (epoch !== this.epoch || this.latchWhy !== null || this.state !== 'outage' || this.schemaMismatch) return;
+    this.state = 'confirming';
+    this.confirmingCause = 'checking';
+    this.reportHold();
+  }
+
+  /** The latest attempt to confirm did not (decision 13's confirming causes). */
+  noteConfirmingCause(cause: string, epoch: number): void {
+    if (epoch !== this.epoch || this.latchWhy !== null || this.state !== 'confirming') return;
+    this.confirmingCause = cause;
+    this.reportHold();
+  }
+
+  /** The chooser confirmed the entry in use under this epoch: the hold ends. */
+  confirmHold(epoch: number): void {
+    if (epoch !== this.epoch || this.latchWhy !== null || !this.isHeld()) return;
+    this.state = this.stateBeforeHold;
     this.outageSince = undefined;
+    this.confirmedAt = Date.now();
     this.clearOutageAlertTimer();
-    if (wasOutage && this.outageAlertFired) {
+    if (this.outageAlertFired) {
       console.log('[PostgresBackend] Recovered from outage');
       this.fireAlert('recovered', 'connection to the data backend restored');
     }
     this.outageAlertFired = false;
+    this.reportHold();
   }
 
-  private noteSuccess(): void {
-    if (this.schemaMismatch || this.stopped) return;
-    if (this.state === 'outage') this.becomeReady();
+  private reportHold(): void {
+    const words = this.holdWords();
+    if (words === this.reportedHold) return;
+    this.reportedHold = words;
+    for (const listener of this.holdListeners) {
+      try { listener(words); } catch (listenerError) { console.error('[PostgresBackend] A hold listener threw:', listenerError); }
+    }
   }
 
-  private noteFailure(error: unknown): void {
-    if (this.schemaMismatch || this.stopped) return;
-    this.noteLoginRefused(error);
-    if (this.state !== 'ready') return; // connecting: bootstrap loop owns retries; outage: probe loop running
-    this.state = 'outage';
-    this.outageSince = Date.now();
-    console.error(outageLine(error), error);
-    this.armOutageAlert();
-    void this.outageProbeLoop();
+  /**
+   * Decision 11's latch, in one synchronous step: the epoch rises, no statement starts on the database again, and every
+   * operation that has not sent COMMIT is cut through its client's end().
+   */
+  latch(cause: LatchCause): void {
+    this.epoch += 1;
+    this.latchWhy = latchWords(cause, this.address());
+    this.lastWhy = this.latchWhy;
+    this.moving = null;
+    if (this.isHeld()) this.state = this.stateBeforeHold;
+    this.outageSince = undefined;
+    this.clearOutageAlertTimer();
+    this.outageAlertFired = false;
+    this.reportedHold = null;
+    for (const lease of this.leases) {
+      if (lease.commitPassed || lease.cut) continue;
+      lease.cut = true;
+      try {
+        void Promise.resolve(lease.client.end()).catch(() => undefined);
+      } catch { /* already ended */ }
+    }
+  }
+
+  /**
+   * Decision 12: moves this process to the entry while latched. (a) the target's check; (b) the epoch raised and the
+   * pools built under it; (c) and (d) the claims; (e) the retires sent before the latch; (f) ready and the latch lifted.
+   * False when this attempt ended before (f); the latch and everything held stay.
+   */
+  async useDatabase(entry: string, steps: MoveSteps = this.moveSteps): Promise<boolean> {
+    if (this.latchWhy === null || this.stopped) return false;
+    const target = this.address(entry);
+    const startedUnder = this.epoch;
+    const refusal = await steps.checkTarget(entry);
+    if (refusal !== null) {
+      const line = `[Database] Not moving to ${target}: ${refusal}; this process keeps its unsaved changes and stays stopped`;
+      if (!this.moveRefusalsLogged.has(line)) {
+        this.moveRefusalsLogged.add(line);
+        console.error(line);
+      }
+      return false;
+    }
+    if (this.epoch !== startedUnder || this.latchWhy === null || this.stopped) return false;
+    const old = this.pool;
+    this.useEntry(entry);
+    const epoch = this.epoch;
+    this.moving = epoch;
+    if (old) void old.end().catch(error => console.error('[PostgresBackend] The pool of the database this process left did not end cleanly:', error));
+    for (const listener of this.databaseListeners) {
+      try { listener(entry); } catch (listenerError) { console.error('[PostgresBackend] A database listener threw:', listenerError); }
+    }
+    if (!(await steps.claims(entry)) || this.epoch !== epoch) return this.endAttempt(epoch);
+    if (!(await steps.settleRetires(epoch, entry)) || this.epoch !== epoch) {
+      steps.attemptEnded?.();
+      return this.endAttempt(epoch);
+    }
+    this.moving = null;
+    this.latchWhy = null;
+    this.moveRefusalsLogged.clear();
+    this.state = 'ready';
+    steps.moved(entry);
+    return true;
+  }
+
+  private endAttempt(epoch: number): false {
+    if (this.moving === epoch) this.moving = null;
+    return false;
   }
 
   private armOutageAlert(): void {
     if (this.outageAlertFired || this.outageAlertTimer) return;
     this.outageAlertTimer = setTimeout(() => {
       this.outageAlertTimer = null;
-      if (this.state === 'outage' && !this.outageAlertFired) {
+      if (this.isHeld() && !this.outageAlertFired) {
         this.outageAlertFired = true;
         const sinceMs = Date.now() - (this.outageSince ?? Date.now());
         this.fireAlert('outage', `data backend unreachable for ${Math.round(sinceMs / 1000)}s`);
@@ -631,54 +1002,167 @@ export class PostgresBackend implements DataBackend {
   }
 
   // ==========================================================================
+  // THE STATEMENT HELPER (decision 13, G5, G6, I1, I5)
+  // ==========================================================================
+
+  /** The state and epoch check every statement passes right before it is sent; a move's own statements pass the latch. */
+  private refusalFor(epoch: number, move = false): OwnStateRefusal | null {
+    if (this.latchWhy !== null && !(move && this.moving === epoch && epoch === this.epoch)) return new OwnStateRefusal('latched', this.latchWhy);
+    const words = this.holdWords();
+    if (words !== null && !move) return new OwnStateRefusal('held', words);
+    if (epoch !== this.epoch) return new OwnStateRefusal('latched', this.lastWhy ?? 'this process stopped writing to that database');
+    return null;
+  }
+
+  private async checkout(move = false): Promise<DataLease> {
+    const refusal = this.refusalFor(this.poolEpoch, move);
+    if (refusal) throw refusal;
+    const pool = this.getPool();
+    const epoch = this.poolEpoch;
+    const entry = this.entry ?? '';
+    let client: PoolClient;
+    try {
+      client = await pool.connect();
+    } catch (error) {
+      this.observedUnder(error, epoch);
+      if (isObject(error)) this.loginFailures.add(error);
+      throw error;
+    }
+    const lease = new DataLease(client, epoch, entry, move);
+    this.leases.add(lease);
+    return lease;
+  }
+
+  /**
+   * Sends one statement on a lease. A spoiled lease sends nothing; a refusal spoils it; COMMIT is marked as let through
+   * before it goes out; a failure that is not an answer spoils it. boundMs null sends no client bound; callerMs is the
+   * time left to the caller's deadline.
+   */
+  private async sendOn(lease: DataLease, text: string, values: unknown[], boundMs: number | null, callerMs = Infinity, onPass?: () => void): Promise<QueryResult> {
+    if (lease.spoiled) throw lease.spoiledBy;
+    const refusal = this.refusalFor(lease.epoch, lease.move);
+    if (refusal) {
+      lease.spoiled = true;
+      lease.spoiledBy = refusal;
+      throw refusal;
+    }
+    if (text === 'COMMIT') lease.commitPassed = true;
+    onPass?.();
+    const timeout = boundMs === null ? undefined : Number.isFinite(callerMs) ? Math.max(1, Math.floor(Math.min(boundMs, callerMs))) : boundMs;
+    try {
+      if (timeout !== undefined) return await lease.client.query({ text, values, query_timeout: timeout } as QueryConfig);
+      return await (values.length > 0 ? lease.client.query(text, values) : lease.client.query(text));
+    } catch (error) {
+      this.observedUnder(error, lease.epoch);
+      if (classifyFailure(error).kind !== 'answered') {
+        if (isObject(error) && error instanceof Error && error.message === QUERY_TIMEOUT_MESSAGE && boundMs !== null && callerMs <= boundMs) deadlineCuts.add(error);
+        lease.spoiled = true;
+        if (lease.spoiledBy === undefined) lease.spoiledBy = error;
+      }
+      throw error;
+    }
+  }
+
+  private releaseLease(lease: DataLease, destroy: boolean): void {
+    this.leases.delete(lease);
+    lease.client.release(destroy || lease.spoiled || lease.cut ? true : undefined);
+  }
+
+  /** The pool form of the helper, for one autocommit statement with no lease. */
+  private async poolQuery(text: string, values: unknown[], boundMs: number): Promise<QueryResult> {
+    const refusal = this.refusalFor(this.poolEpoch);
+    if (refusal) throw refusal;
+    const epoch = this.poolEpoch;
+    try {
+      return await this.getPool().query({ text, values, query_timeout: boundMs } as QueryConfig);
+    } catch (error) {
+      this.observedUnder(error, epoch);
+      throw error;
+    }
+  }
+
+  /** One autocommit statement on a lease, so a failed connect is a failed login (decision 13). */
+  private async leaseQuery(text: string, values: unknown[], boundMs: number): Promise<QueryResult> {
+    const lease = await this.checkout();
+    try {
+      return await this.sendOn(lease, text, values, boundMs);
+    } catch (error) {
+      if (lease.cut) throw new OwnStateRefusal('latched', this.lastWhy ?? 'this process stopped writing to that database');
+      throw error;
+    } finally {
+      this.releaseLease(lease, false);
+    }
+  }
+
+  /** The refusal a failed operation answers: its own, or the latch's when the latch cut its client. */
+  private ownRefusal(lease: DataLease | undefined, error: unknown): OwnStateRefusal | null {
+    if (error instanceof OwnStateRefusal) return error;
+    if (lease?.cut) return new OwnStateRefusal('latched', this.lastWhy ?? 'this process stopped writing to that database');
+    return null;
+  }
+
+  /** I4: a close that swallowed its failure still reports what it saw. */
+  private noteClosed(lease: DataLease): void {
+    if (!lease.spoiled) {
+      this.noteSuccess();
+      return;
+    }
+    if (lease.spoiledBy instanceof OwnStateRefusal) return;
+    this.noteFailure(lease.spoiledBy);
+  }
+
+  // ==========================================================================
   // SELF-PROVISIONING
   // ==========================================================================
 
   private async provision(): Promise<void> {
     if (this.provisioned) return;
-    const client = await this.pool.connect();
+    const lease = await this.checkout();
+    let unlocked = false;
+    const send = (text: string, values: unknown[] = []) => this.sendOn(lease, text, values, ANSWER_BOUND_MS);
     try {
-      await client.query(`SELECT pg_advisory_lock(hashtext('smdb_data_bootstrap'))`);
+      await send(`SELECT pg_advisory_lock(hashtext('smdb_data_bootstrap'))`);
       try {
-        const existing = await this.readSchemaVersion(client);
+        const existing = await this.readSchemaVersion(lease);
         if (existing !== undefined && !matchesSchemaVersion(existing)) {
           this.latchSchemaMismatch(existing);
           return;
         }
-        for (const stmt of PROVISION_DDL) await client.query(stmt);
+        for (const stmt of PROVISION_DDL) await send(stmt);
         for (let i = 0; i < PARTITION_COUNT; i++) {
           const suffix = `p${String(i).padStart(2, '0')}`;
-          await client.query(
+          await send(
             `CREATE TABLE IF NOT EXISTS smdb_data.guild_data_${suffix} PARTITION OF smdb_data.guild_data FOR VALUES WITH (MODULUS ${PARTITION_COUNT}, REMAINDER ${i})`);
-          await client.query(
+          await send(
             `CREATE TABLE IF NOT EXISTS smdb_data.guild_append_${suffix} PARTITION OF smdb_data.guild_append FOR VALUES WITH (MODULUS ${PARTITION_COUNT}, REMAINDER ${i})`);
         }
-        await client.query(
+        await send(
           `INSERT INTO smdb_data.meta (key, value) VALUES ('schema_version', $1) ON CONFLICT (key) DO NOTHING`,
           [JSON.stringify({ v: SCHEMA_VERSION })]);
-        const rawVersion = await this.readSchemaVersion(client);
+        const rawVersion = await this.readSchemaVersion(lease);
         if (rawVersion === undefined || !matchesSchemaVersion(rawVersion)) {
           this.latchSchemaMismatch(rawVersion);
           return;
         }
-        await client.query(
+        await send(
           `INSERT INTO smdb_data.meta (key, value) VALUES ('store_id', $1) ON CONFLICT (key) DO NOTHING`,
           [JSON.stringify(randomUUID())]);
         this.provisioned = true;
       } finally {
         try {
-          await client.query(`SELECT pg_advisory_unlock(hashtext('smdb_data_bootstrap'))`);
-        } catch { /* session gone; the lock dies with it */ }
+          await send(`SELECT pg_advisory_unlock(hashtext('smdb_data_bootstrap'))`);
+          unlocked = true;
+        } catch { /* the client ends below, and the lock with its session */ }
       }
     } finally {
-      client.release();
+      this.releaseLease(lease, !unlocked);
     }
   }
 
   /** The stored schema_version value; undefined when the meta table or its row does not exist yet. */
-  private async readSchemaVersion(client: PoolClient): Promise<string | undefined> {
+  private async readSchemaVersion(lease: DataLease): Promise<string | undefined> {
     try {
-      const res = await client.query(`SELECT value FROM smdb_data.meta WHERE key = 'schema_version'`);
+      const res = await this.sendOn(lease, `SELECT value FROM smdb_data.meta WHERE key = 'schema_version'`, [], ANSWER_BOUND_MS);
       return res.rows[0]?.value;
     } catch (error) {
       if (isMissingRelation(error)) return undefined;
@@ -711,35 +1195,41 @@ export class PostgresBackend implements DataBackend {
 
   async hydrateGuild(guildId: string, token: FenceToken): Promise<HydrationOutcome> {
     if (this.refusedWithoutClaim('hydrate', guildId, token)) return { ok: false, reason: 'unavailable' };
-    let client: PoolClient;
+    let lease: DataLease;
     try {
-      client = await this.pool.connect();
+      lease = await this.checkout();
     } catch (error) {
+      if (error instanceof OwnStateRefusal) return { ok: false, reason: 'unavailable', detail: operationDetail(error) };
       this.noteFailure(error);
       return { ok: false, reason: 'unavailable' };
     }
     let destroy = false;
+    const send = (text: string, values: unknown[] = []) => this.sendOn(lease, text, values, ANSWER_BOUND_MS);
     try {
-      await client.query('BEGIN');
-      const claim = await client.query(FENCED_OWNERSHIP_UPSERT, this.fenceParams(guildId, token));
+      await send('BEGIN');
+      const claim = await send(FENCED_OWNERSHIP_UPSERT, this.fenceParams(guildId, token));
       if ((claim.rowCount ?? 0) !== 1) {
-        await client.query('ROLLBACK');
-        const currentOwner = await this.readOwner(client, guildId);
+        await send('ROLLBACK');
+        const currentOwner = await this.readOwner(lease, guildId);
         this.noteSuccess();
-        return { ok: false, reason: 'deposed', currentOwner };
+        return { ok: false, reason: 'deposed', currentOwner: currentOwner ?? undefined };
       }
-      const read = await this.readGuildDocs(client, guildId);
-      await client.query('COMMIT');
+      const read = await this.readGuildDocs(lease, guildId);
+      await send('COMMIT');
+      // J1: documents read from a database this process stopped writing to serve nothing; the set hydrates again.
+      if (lease.epoch !== this.epoch) return { ok: false, reason: 'unavailable' };
       this.noteSuccess();
       return { ok: true, ...read };
     } catch (error) {
       destroy = true;
-      await this.rollbackQuiet(client);
+      const refusal = this.ownRefusal(lease, error);
+      if (refusal) return { ok: false, reason: 'unavailable', detail: operationDetail(refusal) };
+      await this.rollbackQuiet(lease, error);
       this.noteFailure(error);
       console.error(`[PostgresBackend] hydrateGuild failed for ${guildId}:`, error);
       return { ok: false, reason: 'unavailable' };
     } finally {
-      client.release(destroy ? true : undefined);
+      this.releaseLease(lease, destroy);
     }
   }
 
@@ -751,9 +1241,9 @@ export class PostgresBackend implements DataBackend {
    */
   async reclaimGuild(guildId: string, token: FenceToken): Promise<'kept' | 'lost' | null> {
     if (this.refusedWithoutClaim('reclaim', guildId, token)) return null;
-    let client: PoolClient;
+    let lease: DataLease;
     try {
-      client = await this.pool.connect();
+      lease = await this.checkout();
     } catch (error) {
       this.noteFailure(error);
       return null;
@@ -761,8 +1251,8 @@ export class PostgresBackend implements DataBackend {
     let destroy = false;
     try {
       const params = this.fenceParams(guildId, token);
-      let kept = ((await client.query(OWNERSHIP_RECLAIM, params)).rowCount ?? 0) === 1;
-      if (!kept) kept = ((await client.query(OWNERSHIP_RECLAIM_INSERT, params)).rowCount ?? 0) === 1;
+      let kept = ((await this.sendOn(lease, OWNERSHIP_RECLAIM, params, ANSWER_BOUND_MS)).rowCount ?? 0) === 1;
+      if (!kept) kept = ((await this.sendOn(lease, OWNERSHIP_RECLAIM_INSERT, params, ANSWER_BOUND_MS)).rowCount ?? 0) === 1;
       this.noteSuccess();
       return kept ? 'kept' : 'lost';
     } catch (error) {
@@ -770,15 +1260,16 @@ export class PostgresBackend implements DataBackend {
       this.noteFailure(error);
       return null;
     } finally {
-      client.release(destroy ? true : undefined);
+      this.releaseLease(lease, destroy);
     }
   }
 
-  private async readGuildDocs(client: PoolClient, guildId: string): Promise<{ docs: { key: { module: string; filename: string }; doc: string }[]; appendKeys: { module: string; filename: string }[] }> {
-    const docsRes = await client.query(
-      `SELECT module, filename, doc FROM smdb_data.guild_data WHERE guild_id = $1`, [guildId]);
-    const appendRes = await client.query(
-      `SELECT DISTINCT module, filename FROM smdb_data.guild_append WHERE guild_id = $1`, [guildId]);
+  /** J2: the guild's documents and append keys, with no client bound (an answer can be large). */
+  private async readGuildDocs(lease: DataLease, guildId: string): Promise<{ docs: { key: { module: string; filename: string }; doc: string }[]; appendKeys: { module: string; filename: string }[] }> {
+    const docsRes = await this.sendOn(lease,
+      `SELECT module, filename, doc FROM smdb_data.guild_data WHERE guild_id = $1`, [guildId], null);
+    const appendRes = await this.sendOn(lease,
+      `SELECT DISTINCT module, filename FROM smdb_data.guild_append WHERE guild_id = $1`, [guildId], null);
     return {
       docs: docsRes.rows.map(row => ({ key: { module: row.module, filename: row.filename }, doc: row.doc })),
       appendKeys: appendRes.rows.map(row => ({ module: row.module, filename: row.filename })),
@@ -824,49 +1315,66 @@ export class PostgresBackend implements DataBackend {
       console.error(`[PostgresBackend] flushGuild for ${guildId} could not build its statements; nothing was sent (caller retries):`, error);
       return { ok: false, reason: 'unavailable' };
     }
-    let client: PoolClient;
+    batch.commitSent = false;
+    let lease: DataLease;
     try {
-      client = await this.pool.connect();
+      lease = await this.checkout();
     } catch (error) {
+      if (error instanceof OwnStateRefusal) return { ok: false, reason: 'unavailable', detail: operationDetail(error) };
       this.noteFailure(error);
       return { ok: false, reason: 'unavailable', ...describeFailure(error) };
     }
     let destroy = false;
-    batch.commitSent = false;
     // The query on the wire: when it was sent, its size and the server bound in force for it.
     let sent = { at: performance.now(), bytes: 0, bound: STATEMENT_TIMEOUT_MS };
-    const send = (text: string, values?: unknown[], bound = boundMs) => {
-      sent = { at: performance.now(), bytes: statementBytes(text, values ?? []), bound };
-      return values ? client.query(text, values) : client.query(text);
+    const send = (text: string, values: unknown[] = [], bound = boundMs) => {
+      sent = { at: performance.now(), bytes: statementBytes(text, values), bound };
+      return this.sendOn(lease, text, values, null);
     };
+    let copied: { moved: number; retiredAt: number } | null = null;
     try {
-      await send(`BEGIN; SET LOCAL statement_timeout = ${boundMs}`, undefined, STATEMENT_TIMEOUT_MS);
+      await send(`BEGIN; SET LOCAL statement_timeout = ${boundMs}`, [], STATEMENT_TIMEOUT_MS);
       const claim = await send(FENCED_FLUSH_UPSERT, fence);
       if ((claim.rowCount ?? 0) !== 1) {
-        await client.query('ROLLBACK');
-        const currentOwner = await this.readOwner(client, guildId);
-        const shardRow = await this.readShardRow(client, token);
+        await this.sendOn(lease, 'ROLLBACK', [], ANSWER_BOUND_MS);
+        const currentOwner = await this.readOwner(lease, guildId);
+        const shardRow = await this.readShardRow(lease, token);
         this.noteSuccess();
-        const guildPart = currentOwner ? `guild ${guildId} is held by claim ${currentOwner.claim} (${currentOwner.nodeId})` : `guild ${guildId} has no ownership row`;
+        const guildPart = currentOwner
+          ? `guild ${guildId} is held by claim ${currentOwner.claim} (${currentOwner.nodeId})`
+          : currentOwner === null ? `guild ${guildId}'s ownership row could not be read` : `guild ${guildId} has no ownership row`;
         const shardPart = shardRow === null ? `shard ${token.shardId} of ${token.shardCount}'s claim row could not be read` : describeShardRow(token.shardId, token.shardCount, shardRow);
         const detail = `deposed: ${guildPart}; ${shardPart}; local claim ${token.claim}`;
         console.error(`[PostgresBackend] Flush rejected: ${detail}`);
         this.fireAlert('deposed', detail);
-        return { ok: false, reason: 'deposed', currentOwner };
+        return { ok: false, reason: 'deposed', currentOwner: currentOwner ?? undefined };
       }
-      for (const st of statements) await send(st.text, st.values);
-      batch.commitSent = true;
+      for (const st of statements) {
+        const res = await send(st.text, st.values);
+        if (st.copy) copied = { moved: Number(res.rows[0]?.moved ?? 0), retiredAt: Number(res.rows[0]?.retired_at ?? 0) };
+      }
       sent = { at: performance.now(), bytes: statementBytes('COMMIT', []), bound: boundMs };
-      await client.query({ text: 'COMMIT', query_timeout: ANSWER_BOUND_MS } as QueryConfig);
+      await this.sendOn(lease, 'COMMIT', [], ANSWER_BOUND_MS, Infinity, () => { batch.commitSent = true; });
+      if (lease.epoch !== this.epoch) {
+        // Decision 12: a batch answered after this process stopped writing there is checked on the next database.
+        return { ok: false, reason: 'unavailable', commitUnanswered: true, landedOn: this.address(lease.entry) };
+      }
       this.noteSuccess();
+      if (copied && copied.moved > 0) {
+        console.log(`[Data] Guild ${guildId}: the re-save on ${this.address(lease.entry)} moved ${copied.moved} row(s) this process did not hold to the graveyard (batch ${copied.retiredAt})`);
+      }
       return { ok: true };
     } catch (error) {
       const failedAt = performance.now();
       destroy = true;
+      // Set by the COMMIT's onPass, which the compiler does not follow.
+      const commitSent = (batch.commitSent as boolean | undefined) === true;
+      const refusal = this.ownRefusal(lease, error);
+      if (refusal && !commitSent) return { ok: false, reason: 'unavailable', detail: operationDetail(refusal) };
       const failure = describeFailure(error);
       // A ROLLBACK after a sent COMMIT changes nothing, and after the client bound node-pg would queue it behind the COMMIT.
-      const unanswered = batch.commitSent === true && commitMayHaveLanded(error);
-      if (!unanswered) await this.rollbackQuiet(client);
+      const unanswered = commitSent && commitMayHaveLanded(error);
+      if (!unanswered) await this.rollbackQuiet(lease, error);
       this.noteFailure(error);
       if ((error as { code?: unknown } | null)?.code === '57014') {
         const kib = Math.ceil(sent.bytes / 1024);
@@ -880,7 +1388,7 @@ export class PostgresBackend implements DataBackend {
       }
       return { ok: false, reason: 'unavailable', ...failure, ...(unanswered ? { commitUnanswered: true } : {}) };
     } finally {
-      client.release(destroy ? true : undefined);
+      this.releaseLease(lease, destroy);
     }
   }
 
@@ -908,15 +1416,16 @@ export class PostgresBackend implements DataBackend {
   }
 
   private async checkOnWire(guildId: string, flushId: string, sentClaim: number, token: FenceToken, give: () => void): Promise<FlushFate> {
-    let client: PoolClient;
+    let lease: DataLease;
     try {
-      client = await this.pool.connect();
+      lease = await this.checkout();
     } catch (error) {
       give();
+      if (error instanceof OwnStateRefusal) return { fate: 'unknown', detail: operationDetail(error) };
       this.noteFailure(error);
       return { fate: 'unknown', ...describeFailure(error) };
     }
-    const ask = (text: string, values?: unknown[]) => client.query({ text, values, query_timeout: ANSWER_BOUND_MS } as QueryConfig);
+    const ask = (text: string, values: unknown[] = []) => this.sendOn(lease, text, values, ANSWER_BOUND_MS);
     let row: { claim: string | number; last_flush: string | null; node_id?: string } | undefined;
     try {
       await ask('BEGIN');
@@ -924,19 +1433,21 @@ export class PostgresBackend implements DataBackend {
       if (!row) {
         const inserted = await ask(CHECK_OWNERSHIP_INSERT, [guildId, token.nodeId, token.shardId, token.claim, token.shardCount]);
         if ((inserted.rowCount ?? 0) === 1) {
-          this.endCheck(client, ask, give);
+          this.endCheck(lease, give);
           this.noteSuccess();
           return { fate: 'not-landed' };
         }
         row = (await ask(FLUSH_MARK_SELECT, [guildId])).rows[0];
       }
     } catch (error) {
-      client.release(true);
+      this.releaseLease(lease, true);
       give();
+      const refusal = this.ownRefusal(lease, error);
+      if (refusal) return { fate: 'unknown', detail: operationDetail(refusal) };
       this.noteFailure(error);
       return { fate: 'unknown', ...describeFailure(error) };
     }
-    this.endCheck(client, ask, give);
+    this.endCheck(lease, give);
     this.noteSuccess();
     if (!row) return { fate: 'unknown', detail: "the guild's ownership row was not found after an insert conflicted on it" };
     const claim = Number(row.claim);
@@ -954,33 +1465,41 @@ export class PostgresBackend implements DataBackend {
   }
 
   /** Ends a check's read-only transaction without awaiting it: the client goes back on success, else is destroyed. */
-  private endCheck(client: PoolClient, ask: (text: string) => Promise<unknown>, give: () => void): void {
-    ask('ROLLBACK').then(() => client.release(), () => client.release(true)).finally(give);
+  private endCheck(lease: DataLease, give: () => void): void {
+    this.sendOn(lease, 'ROLLBACK', [], ANSWER_BOUND_MS).then(
+      () => this.releaseLease(lease, false),
+      error => {
+        if (!(error instanceof OwnStateRefusal) && classifyFailure(error).kind !== 'answered') this.noteFailure(error);
+        this.releaseLease(lease, true);
+      },
+    ).finally(give);
   }
 
   async retireGuild(guildId: string, reason: string, token: FenceToken, deadline: bigint | null = null): Promise<RetireOutcome> {
     if (this.refusedWithoutClaim('retire', guildId, token)) return { ok: false, reason: 'no-claim' };
     if (deadline !== null && msLeft(deadline) < STATEMENT_FLOOR_MS) return { ok: false, reason: 'out-of-time' };
-    let client: PoolClient;
+    let lease: DataLease;
     try {
-      client = await this.pool.connect();
+      lease = await this.checkout();
     } catch (error) {
+      if (error instanceof OwnStateRefusal) return this.stoppedBeforeCommit('retireGuild', guildId, error);
       this.noteFailure(error);
       return { ok: false, reason: 'unavailable', detail: describeFailure(error).detail };
     }
-    const tx = new BoundedClient(client, deadline);
+    const tx = new BoundedClient(lease, deadline, this.sendOn.bind(this));
     let began = false;
     let commitSent = false;
+    let moved = 0;
+    const retiredAt = Date.now();
     try {
       await tx.send('BEGIN');
       began = true;
       const claim = await tx.send(FENCED_OWNERSHIP_UPSERT, this.fenceParams(guildId, token));
       if ((claim.rowCount ?? 0) !== 1) {
         await tx.close('ROLLBACK');
-        this.noteSuccess();
+        this.noteClosed(lease);
         return { ok: false, reason: 'deposed' };
       }
-      const retiredAt = Date.now();
       const docsMoved = await tx.send(
         `INSERT INTO smdb_data.guild_data_graveyard (guild_id, module, filename, kind, doc, retired_at, reason)
          SELECT guild_id, module, filename, 'doc', doc, $2, $3
@@ -992,29 +1511,49 @@ export class PostgresBackend implements DataBackend {
            FROM smdb_data.guild_append WHERE guild_id = $1
           GROUP BY guild_id, module, filename`,
         [guildId, retiredAt, reason]);
+      moved = (docsMoved.rowCount ?? 0) + (streamsMoved.rowCount ?? 0);
       await tx.send(`DELETE FROM smdb_data.guild_data WHERE guild_id = $1`, [guildId]);
       await tx.send(`DELETE FROM smdb_data.guild_append WHERE guild_id = $1`, [guildId]);
       await tx.send(`UPDATE smdb_data.guild_ownership SET retired_at = now() WHERE guild_id = $1`, [guildId]);
       if (tx.left() < COMMIT_FLOOR_MS) {
         await tx.close('ROLLBACK');
+        this.noteClosed(lease);
         return { ok: false, reason: 'out-of-time' };
       }
-      commitSent = true;
-      await tx.send('COMMIT', [], COMMIT_FLOOR_MS);
+      await tx.send('COMMIT', [], COMMIT_FLOOR_MS, () => { commitSent = true; });
+      if (lease.epoch !== this.epoch) return { ok: false, reason: 'unknown', retiredAt, moved, ...this.lateCommit(lease, true) };
       this.noteSuccess();
-      const moved = (docsMoved.rowCount ?? 0) + (streamsMoved.rowCount ?? 0);
       console.log(`[PostgresBackend] Guild ${guildId} retired to graveyard (${reason}); ${moved} row(s) moved`);
-      return { ok: true, moved };
+      return { ok: true, moved, retiredAt };
     } catch (error) {
       if (began) tx.destroy = true;
       if (error instanceof OutOfTime) return { ok: false, reason: 'out-of-time' };
+      const refusal = commitSent ? null : this.ownRefusal(lease, error);
+      if (refusal) {
+        tx.destroy = true;
+        return this.stoppedBeforeCommit('retireGuild', guildId, refusal);
+      }
       const failure = this.noteTxFailure('retireGuild', guildId, error, commitSent);
+      if (commitSent) {
+        if (commitRolledBack(error)) return { ok: false, reason: 'refused', detail: describeFailure(error).detail };
+        return { ok: false, reason: 'unknown', retiredAt, moved, ...(lease.epoch !== this.epoch ? this.lateCommit(lease, false) : {}) };
+      }
       if (failure.kind === 'answered') return { ok: false, reason: 'refused', detail: failure.detail };
-      if (commitSent) return { ok: false, reason: 'unknown' };
       return failure.kind === 'timeout' ? { ok: false, reason: 'unavailable', timedOut: true } : { ok: false, reason: 'unavailable', detail: failure.detail };
     } finally {
-      client.release(tx.destroy ? true : undefined);
+      this.releaseLease(lease, tx.destroy);
     }
+  }
+
+  /** C7: a retire's or a restore's COMMIT answered after the epoch moved; committed when it answered ok. */
+  private lateCommit(lease: DataLease, committed: boolean): { afterLatch: true; late: LateCommit } {
+    return { afterLatch: true, late: { committed, old: this.address(lease.entry), why: this.lastWhy ?? 'this process stopped writing there' } };
+  }
+
+  /** G12 and H6: the backend's own state stopped a retire or a restore before its COMMIT. */
+  private stoppedBeforeCommit(op: 'retireGuild' | 'restoreGuild', guildId: string, refusal: OwnStateRefusal): { ok: false; reason: 'latched' | 'held'; detail: string } {
+    console.error(`[PostgresBackend] ${op} of guild ${guildId} stopped before COMMIT (${refusal.detail}); nothing was committed`);
+    return { ok: false, reason: refusal.phase, detail: refusal.detail };
   }
 
   /**
@@ -1032,20 +1571,21 @@ export class PostgresBackend implements DataBackend {
     }
     if (this.refusedWithoutClaim('restore', guildId, token)) return { ok: false, reason: 'no-claim' };
     if (msLeft(deadline) < STATEMENT_FLOOR_MS) return { ok: false, reason: 'out-of-time' };
-    let client: PoolClient;
+    let lease: DataLease;
     try {
-      client = await this.pool.connect();
+      lease = await this.checkout();
     } catch (error) {
+      if (error instanceof OwnStateRefusal) return this.stoppedBeforeCommit('restoreGuild', guildId, error);
       this.noteFailure(error);
       return { ok: false, reason: 'unavailable', detail: describeFailure(error).detail };
     }
-    const tx = new BoundedClient(client, deadline);
+    const tx = new BoundedClient(lease, deadline, this.sendOn.bind(this));
     let began = false;
     let commitSent = false;
     let batch = retiredAt;
     const decided = async (answer: RestoreOutcome): Promise<RestoreOutcome> => {
       await tx.close('ROLLBACK');
-      this.noteSuccess();
+      this.noteClosed(lease);
       return answer;
     };
     try {
@@ -1056,7 +1596,7 @@ export class PostgresBackend implements DataBackend {
       if (!claimed) {
         const rolledBack = await tx.close('ROLLBACK');
         const row = rolledBack ? (await tx.close(OWNER_SELECT, [guildId]))?.rows[0] : undefined;
-        this.noteSuccess();
+        this.noteClosed(lease);
         return row ? { ok: false, reason: 'deposed', currentOwner: { nodeId: row.node_id, claim: Number(row.claim) } } : { ok: false, reason: 'deposed' };
       }
       if (batch === null) {
@@ -1076,32 +1616,46 @@ export class PostgresBackend implements DataBackend {
       if (taken !== put) return await decided({ ok: false, reason: 'refused', detail: `the batch holds ${taken - put} row(s) of an unknown kind` });
       const stop = beforeCommit() ?? (tx.left() < COMMIT_FLOOR_MS ? 'out-of-time' : null);
       if (stop) return await decided({ ok: false, reason: stop });
-      commitSent = true;
-      await tx.send('COMMIT', [], COMMIT_FLOOR_MS);
+      await tx.send('COMMIT', [], COMMIT_FLOOR_MS, () => { commitSent = true; });
+      if (lease.epoch !== this.epoch) return { ok: false, reason: 'unknown', retiredAt: batch, ...this.lateCommit(lease, true) };
       this.noteSuccess();
       console.log(`[PostgresBackend] Guild ${guildId} restored from graveyard batch ${batch}; ${taken} row(s) moved back`);
       return { ok: true, moved: taken, retiredAt: batch, reason: typeof moved.reason === 'string' ? moved.reason : '' };
     } catch (error) {
       if (began) tx.destroy = true;
       if (error instanceof OutOfTime) return { ok: false, reason: 'out-of-time' };
+      const refusal = commitSent ? null : this.ownRefusal(lease, error);
+      if (refusal) {
+        tx.destroy = true;
+        return this.stoppedBeforeCommit('restoreGuild', guildId, refusal);
+      }
       const failure = this.noteTxFailure('restoreGuild', guildId, error, commitSent);
-      if (failure.kind === 'answered') return { ok: false, reason: 'refused', detail: failure.detail, code: failure.code };
       const at = batch === null ? {} : { retiredAt: batch };
-      if (commitSent) return { ok: false, reason: 'unknown', ...at };
+      if (commitSent) {
+        if (commitRolledBack(error)) return { ok: false, reason: 'refused', detail: describeFailure(error).detail, code: describeFailure(error).code };
+        return { ok: false, reason: 'unknown', ...at, ...(lease.epoch !== this.epoch ? this.lateCommit(lease, false) : {}) };
+      }
+      if (failure.kind === 'answered') return { ok: false, reason: 'refused', detail: failure.detail, code: failure.code };
       return failure.kind === 'timeout'
         ? { ok: false, reason: 'unavailable', detail: "the database did not answer within the restore's 40 s", timedOut: true }
         : { ok: false, reason: 'unavailable', detail: failure.detail };
     } finally {
-      client.release(tx.destroy ? true : undefined);
+      this.releaseLease(lease, tx.destroy);
     }
   }
 
-  /** Logs a failed bounded transaction; an error with no answer notes an outage, the call's own timeout does not. */
+  /**
+   * Logs a failed bounded transaction. A failure that is not an answer is an observation (a deadline cut is ignored
+   * there); an answer that shows the transaction rolled back counts as one.
+   */
   private noteTxFailure(op: string, guildId: string, error: unknown, commitSent: boolean): TxFailure {
     const failure = classifyFailure(error);
-    if (failure.kind === 'connection') this.noteFailure(error);
-    else if (failure.kind === 'answered') this.noteSuccess();
-    if (commitSent && failure.kind !== 'answered') {
+    if (failure.kind === 'connection' || failure.kind === 'timeout') this.noteFailure(error);
+    const refused = commitSent ? commitRolledBack(error) : failure.kind === 'answered';
+    if (refused) this.noteSuccess();
+    if (commitSent && !refused && failure.kind === 'answered') {
+      console.error(`[PostgresBackend] ${op} of guild ${guildId}: COMMIT answered ${describeFailure(error).detail}, which does not show that it rolled back; can't confirm whether it committed`);
+    } else if (commitSent && !refused) {
       console.error(`[PostgresBackend] ${op} of guild ${guildId}: COMMIT got no answer (${error instanceof Error ? error.message : String(error)}); can't confirm whether it committed`);
     } else {
       console.error(`[PostgresBackend] ${op} failed for ${guildId}:`, error);
@@ -1109,38 +1663,65 @@ export class PostgresBackend implements DataBackend {
     return failure;
   }
 
+  /**
+   * Decision 12 (e): whether the retire's batch is on the move's target, read on the pool (b) built while the latch is
+   * up. Throws when the read fails or no move runs under the current epoch.
+   */
+  async retireReached(guildId: string, retiredAt: number): Promise<boolean> {
+    const lease = await this.checkout(true);
+    try {
+      const res = await this.sendOn(lease, BATCH_PRESENT, [guildId, retiredAt], ANSWER_BOUND_MS);
+      return res.rows[0]?.present === true;
+    } finally {
+      this.releaseLease(lease, false);
+    }
+  }
+
   private fenceParams(guildId: string, token: FenceToken): unknown[] {
     return [guildId, token.nodeId, token.shardId, token.claim, token.shardCount, token.processId];
   }
 
-  /** The claim row of the token's shard for the refusal line; undefined for no row, null when it could not be read. */
-  private async readShardRow(client: PoolClient, token: FenceToken): Promise<{ claim: number; holder_name: string; released: boolean; reserved: boolean } | undefined | null> {
+  /**
+   * The claim row of the token's shard for the refusal line; undefined for no row, null when the read was answered
+   * with an error. A read that got no answer, or was refused, throws.
+   */
+  private async readShardRow(lease: DataLease, token: FenceToken): Promise<{ claim: number; holder_name: string; released: boolean; reserved: boolean } | undefined | null> {
     try {
-      const res = await client.query(
+      const res = await this.sendOn(lease,
         `SELECT claim::text AS claim, holder_name, released, reserved FROM smdb_data.shard_claims WHERE shard_count = $1 AND shard_id = $2`,
-        [token.shardCount, token.shardId]);
+        [token.shardCount, token.shardId], ANSWER_BOUND_MS);
       const row = res.rows[0];
       return row ? { claim: Number(row.claim), holder_name: row.holder_name, released: row.released === true, reserved: row.reserved === true } : undefined;
-    } catch {
+    } catch (error) {
+      if (lease.spoiled) throw error;
       return null;
     }
   }
 
-  private async readOwner(client: PoolClient, guildId: string): Promise<GuildOwner | undefined> {
+  /** The guild's owner; undefined for no row, null when the read was answered with an error; throws on no answer. */
+  private async readOwner(lease: DataLease, guildId: string): Promise<GuildOwner | undefined | null> {
     try {
-      const res = await client.query(OWNER_SELECT, [guildId]);
+      const res = await this.sendOn(lease, OWNER_SELECT, [guildId], ANSWER_BOUND_MS);
       const row = res.rows[0];
       if (!row) return undefined;
       return { nodeId: row.node_id, claim: Number(row.claim) };
-    } catch {
-      return undefined;
+    } catch (error) {
+      if (lease.spoiled) throw error;
+      return null;
     }
   }
 
-  private async rollbackQuiet(client: PoolClient): Promise<void> {
+  /**
+   * H2: the ROLLBACK after a failed hydrate or flush, sent only on a lease that is not spoiled. Its failure is noted
+   * only when the operation's own error was an answer, since the caller notes any other error itself.
+   */
+  private async rollbackQuiet(lease: DataLease, error: unknown): Promise<void> {
+    if (lease.spoiled) return;
     try {
-      await client.query('ROLLBACK');
-    } catch { /* connection already gone */ }
+      await this.sendOn(lease, 'ROLLBACK', [], ANSWER_BOUND_MS);
+    } catch (rollbackError) {
+      if (classifyFailure(error).kind === 'answered') this.noteFailure(rollbackError);
+    }
   }
 
   // ==========================================================================
@@ -1148,20 +1729,20 @@ export class PostgresBackend implements DataBackend {
   // ==========================================================================
 
   async loadDoc(guildId: string, key: DocKey): Promise<string | null> {
-    const res = await this.read(
+    const res = await this.readLong(
       `SELECT doc FROM smdb_data.guild_data WHERE guild_id = $1 AND module = $2 AND filename = $3`,
       [guildId, key.module, key.filename]);
     return res.rows[0]?.doc ?? null;
   }
 
   async listGuilds(): Promise<string[]> {
-    const res = await this.read(
+    const res = await this.readLong(
       `SELECT guild_id FROM smdb_data.guild_ownership WHERE retired_at IS NULL`, []);
     return res.rows.map(row => row.guild_id);
   }
 
   async listOwnedGuilds(shardIds: number[], shardCount: number): Promise<string[]> {
-    const res = await this.read(
+    const res = await this.readLong(
       `SELECT guild_id FROM smdb_data.guild_ownership
         WHERE retired_at IS NULL AND ((guild_id::bigint >> 22) % $1) = ANY($2)`,
       [shardCount, shardIds]);
@@ -1171,7 +1752,7 @@ export class PostgresBackend implements DataBackend {
   async listGuildFiles(guildId: string, module?: string): Promise<string[]> {
     // Non-recursive top-level .json parity with fileBackend.listGuildDataFiles;
     // no module means the guild namespace root ('').
-    const res = await this.read(
+    const res = await this.readLong(
       `SELECT filename FROM smdb_data.guild_data
         WHERE guild_id = $1 AND module = $2 AND filename NOT LIKE '%/%' AND filename LIKE '%.json'
        UNION
@@ -1192,12 +1773,30 @@ export class PostgresBackend implements DataBackend {
 
   private async read(text: string, values: unknown[]): Promise<QueryResult> {
     try {
-      const res = await this.pool.query(text, values);
+      const res = await this.leaseQuery(text, values, ANSWER_BOUND_MS);
       this.noteSuccess();
       return res;
     } catch (error) {
       this.noteFailure(error);
       throw error;
+    }
+  }
+
+  /** J2: a read whose answer can be large, on a lease the latch can cut, with no client bound. */
+  private async readLong(text: string, values: unknown[]): Promise<QueryResult> {
+    let lease: DataLease | undefined;
+    try {
+      lease = await this.checkout();
+      const res = await this.sendOn(lease, text, values, null);
+      this.noteSuccess();
+      return res;
+    } catch (error) {
+      if (lease?.cut) throw new OwnStateRefusal('latched', this.lastWhy ?? 'this process stopped writing to that database');
+      if (error instanceof OwnStateRefusal) throw error;
+      this.noteFailure(error);
+      throw error;
+    } finally {
+      if (lease) this.releaseLease(lease, false);
     }
   }
 }
@@ -1217,7 +1816,31 @@ interface Statement {
   text: string;
   values: unknown[];
   bytes: number;
+  /** The replace mode's graveyard copy, whose answer the flush keeps for its line. */
+  copy?: boolean;
 }
+
+/**
+ * NB5 decision 12 and G7: copies the guild's live rows whose keys the set does not hold into one graveyard batch of its
+ * own, numbered above the guild's newest batch, and answers the rows copied and the batch.
+ */
+const REPLACE_COPY = `WITH batch AS (
+    SELECT GREATEST($2::bigint, COALESCE((SELECT max(retired_at) FROM smdb_data.guild_data_graveyard WHERE guild_id = $1), 0) + 1) AS at),
+  docs AS (INSERT INTO smdb_data.guild_data_graveyard (guild_id, module, filename, kind, doc, retired_at, reason)
+    SELECT d.guild_id, d.module, d.filename, 'doc', d.doc, (SELECT at FROM batch), $7
+      FROM smdb_data.guild_data d
+     WHERE d.guild_id = $1 AND (d.module, d.filename) NOT IN (SELECT * FROM unnest($3::text[], $4::text[]))
+    RETURNING 1),
+  appends AS (INSERT INTO smdb_data.guild_data_graveyard (guild_id, module, filename, kind, doc, retired_at, reason)
+    SELECT a.guild_id, a.module, a.filename, 'append', string_agg(a.chunk, '' ORDER BY a.seq), (SELECT at FROM batch), $7
+      FROM smdb_data.guild_append a
+     WHERE a.guild_id = $1 AND (a.module, a.filename) NOT IN (SELECT * FROM unnest($5::text[], $6::text[]))
+     GROUP BY a.guild_id, a.module, a.filename
+    RETURNING 1)
+  SELECT (SELECT count(*) FROM docs) + (SELECT count(*) FROM appends) AS moved, (SELECT at FROM batch) AS retired_at`;
+
+const REPLACE_DELETE_DATA = `DELETE FROM smdb_data.guild_data WHERE guild_id = $1 AND (module, filename) NOT IN (SELECT * FROM unnest($2::text[], $3::text[]))`;
+const REPLACE_DELETE_APPEND = `DELETE FROM smdb_data.guild_append WHERE guild_id = $1 AND (module, filename) NOT IN (SELECT * FROM unnest($2::text[], $3::text[]))`;
 
 /**
  * The flush's statements after its fenced claim: upserts of at most MAX_ROWS_PER_STATEMENT rows and
@@ -1226,7 +1849,16 @@ interface Statement {
  */
 function flushStatements(guildId: string, batch: GuildFlushBatch): Statement[] {
   const out: Statement[] = [];
-  const add = (st: { text: string; values: unknown[] }) => out.push({ ...st, bytes: statementBytes(st.text, st.values) });
+  const add = (st: { text: string; values: unknown[]; copy?: boolean }) => out.push({ ...st, bytes: statementBytes(st.text, st.values) });
+  if (batch.replace) {
+    const docModules = batch.replace.docKeys.map(k => k.module);
+    const docFiles = batch.replace.docKeys.map(k => k.filename);
+    const appendModules = batch.replace.appendKeys.map(k => k.module);
+    const appendFiles = batch.replace.appendKeys.map(k => k.filename);
+    add({ text: REPLACE_COPY, values: [guildId, Date.now(), docModules, docFiles, appendModules, appendFiles, batch.replace.reason], copy: true });
+    add({ text: REPLACE_DELETE_DATA, values: [guildId, docModules, docFiles] });
+    add({ text: REPLACE_DELETE_APPEND, values: [guildId, appendModules, appendFiles] });
+  }
   let rows: { key: DocKey; doc: string }[] = [];
   let rowBytes = 0;
   for (const row of batch.upserts) {
@@ -1319,12 +1951,12 @@ function isMissingRelation(error: unknown): boolean {
   return code === '42P01' || code === '3F000';
 }
 
-async function metaClient(url: string): Promise<Client> {
+async function metaClient(config: ClientConfig, bounds: { connectMs: number; statementMs: number } = { connectMs: CONNECT_TIMEOUT_MS, statementMs: STATEMENT_TIMEOUT_MS }): Promise<Client> {
   const client = shortLivedClient({
-    connectionString: url,
-    connectionTimeoutMillis: CONNECT_TIMEOUT_MS,
-    statement_timeout: STATEMENT_TIMEOUT_MS,
+    connectionTimeoutMillis: bounds.connectMs,
+    statement_timeout: bounds.statementMs,
     keepAlive: true,
+    ...config,
   });
   try {
     await client.connect();
@@ -1337,8 +1969,8 @@ async function metaClient(url: string): Promise<Client> {
 
 /** Meta 'store_id'; null when reachable but absent, PostgresUnreachableError
  * when the DB cannot be asked, PostgresInRecoveryError from a standby. */
-export async function readStoreId(url: string): Promise<string | null> {
-  const client = await metaClient(url);
+export async function readStoreId(config: ClientConfig): Promise<string | null> {
+  const client = await metaClient(config);
   try {
     let res: QueryResult;
     try {
@@ -1358,3 +1990,34 @@ export async function readStoreId(url: string): Promise<string | null> {
   }
 }
 
+const MOVE_CHECK_MS = 5_000;
+
+/**
+ * Decision 12 (a): on one short-lived session with the probe's bounds, the target's store id must equal the one this
+ * machine records (when it records one) and its schema version this bot's. Null when it may be written, else why not.
+ */
+export async function checkMoveTarget(entry: string, recordedStoreId: string | null): Promise<string | null> {
+  let client: Client;
+  try {
+    client = await metaClient(pgConfig(entry), { connectMs: MOVE_CHECK_MS, statementMs: MOVE_CHECK_MS });
+  } catch (error) {
+    return `its store id and schema version could not be read (${describeFailure((error as { cause?: unknown }).cause ?? error).detail})`;
+  }
+  try {
+    const ask = (text: string) => client.query({ text, query_timeout: MOVE_CHECK_MS } as QueryConfig);
+    const version = (await ask(`SELECT value FROM smdb_data.meta WHERE key = 'schema_version'`)).rows[0]?.value;
+    if (typeof version !== 'string' || !matchesSchemaVersion(version)) {
+      return `the database holds schema version ${version ?? 'unreadable'}, and this bot reads only version ${SCHEMA_VERSION}`;
+    }
+    const raw = (await ask(`SELECT value FROM smdb_data.meta WHERE key = 'store_id'`)).rows[0]?.value;
+    const storeId: unknown = typeof raw === 'string' ? JSON.parse(raw) : null;
+    if (recordedStoreId !== null && storeId !== recordedStoreId) {
+      return `the configured database is not the one this deployment's data lives in (store ${String(storeId)} vs recorded ${recordedStoreId})`;
+    }
+    return null;
+  } catch (error) {
+    return `its store id and schema version could not be read (${describeFailure(error).detail})`;
+  } finally {
+    await client.end().catch(() => { /* best effort */ });
+  }
+}

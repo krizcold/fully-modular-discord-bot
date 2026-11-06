@@ -8,6 +8,7 @@ import { ClaimStore } from '../../src/bot/internalSetup/fleet/claimStore';
 import { claimTimings } from '../../src/bot/internalSetup/fleet/claimRules';
 import { ShardClaims } from '../../src/bot/internalSetup/fleet/shardClaims';
 import { PostgresBackend } from '../../src/bot/internalSetup/utils/dataBackends/postgresBackend';
+import { fixedDatabase } from '../helpers/fixedDatabase';
 import { initWorkingSet } from '../../src/bot/internalSetup/utils/dataBackends/workingSet';
 import { saveData } from '../../src/bot/internalSetup/utils/dataManager';
 import {
@@ -100,7 +101,7 @@ describe('NOLOGIN under either gate cause (sheet [pg] 9)', () => {
     vi.spyOn(console, 'error').mockImplementation(() => undefined);
 
     const guildId = String(4n << 22n);
-    const backend = new PostgresBackend({ url: roleUrl() });
+    const backend = new PostgresBackend(fixedDatabase(roleUrl()));
     backend.start();
     teardown = () => backend.stop();
     await until(() => backend.connectionState().state === 'ready', 30_000, 'the backend to be ready');

@@ -24,7 +24,8 @@ import { holderStateOf, type HolderCheck } from '../../bot/internalSetup/fleet/c
 import { getNodeName } from '../../bot/internalSetup/fleet/nodeName';
 import type { GuildDataWriteRequest } from '../../bot/internalSetup/utils/ipcDataHandler';
 import { guardPoolClients } from '../../bot/internalSetup/utils/pgClient';
-import { connectWithin, getWebuiDataReader, resolveWebuiDatabaseUrl } from './webuiDataReader';
+import { connectWithin, getWebuiDataReader, resolveWebuiDatabase } from './webuiDataReader';
+import { pgConfig } from '../../utils/databaseAddress';
 import { readThisNodeId } from './nodeIdRead';
 import { ROUTE_TEXT, type BotManager } from '../botManager';
 
@@ -84,7 +85,7 @@ export function remoteNoAnswerText(cause: unknown, name: string, what: 'write' |
         ? `This web panel shut down before it read the answer from ${name}`
         : `${name} did not answer in time`;
   if (what === 'guild-delete') {
-    return `${lead}; can't confirm whether this server's data was deleted. Within a minute, \`smdb graveyard list\` lists a new entry for this server if it was deleted; if no new entry is listed by then, it was not.`;
+    return `${lead}; can't confirm whether this server's data was deleted. Within a minute, \`smdb graveyard list\` lists a new entry for this server with the reason webui-operator-delete if it was deleted; if no such entry is listed by then, it was not. The list reads the data of the bot behind the web panel it asks; if the main database was replaced meanwhile, check once that bot runs on the new main.`;
   }
   const check = cause === 'stopped' ? 'Reload once the panel is back to check.' : 'Reload to check.';
   return `${lead}; can't confirm whether ${what === 'delete' ? 'the file was deleted' : 'the change was saved'}. ${check}`;
@@ -116,6 +117,8 @@ export interface GuildRequestDeps {
   holderOf(guildId: string, boundMs: number): Promise<{ rows: any[]; url?: string }>;
   readDoc(guildId: string, module: string, filename: string, boundMs?: number): Promise<string | null>;
   currentUrl(): string | null;
+  /** Why the web UI uses no database now (NB5 decision 17); null while it has one. */
+  currentRefusal(): string | null;
   requestDb(url: string): RequestDb;
   nodeId(): string | null;
   nodeName(): string;
@@ -128,7 +131,6 @@ export const SERVER_IDENTITY_SQL = `SELECT (SELECT system_identifier::text FROM 
 /** One request pool per database URL: the insert, the follow's polls and the settle; NB3's session count counts it. */
 function pgRequestDb(url: string): RequestDb {
   const pool = new Pool({
-    connectionString: url,
     max: REQUEST_POOL_MAX,
     connectionTimeoutMillis: STEP_BOUND_MS,
     idleTimeoutMillis: 1000,
@@ -136,6 +138,7 @@ function pgRequestDb(url: string): RequestDb {
     application_name: REQUESTS_APPLICATION_NAME,
     statement_timeout: 4000,
     idle_in_transaction_session_timeout: 10_000,
+    ...pgConfig(url),
   } as ConstructorParameters<typeof Pool>[0]);
   pool.on('error', () => { /* an idle client's error; the next statement answers for itself */ });
   guardPoolClients(pool, "the web UI's request pool");
@@ -168,12 +171,24 @@ function pgRequestDb(url: string): RequestDb {
 const realDeps: GuildRequestDeps = {
   holderOf: (guildId, boundMs) => getWebuiDataReader().holderOf(guildId, boundMs),
   readDoc: (guildId, module, filename, boundMs) => getWebuiDataReader().readDoc(guildId, module, filename, boundMs),
-  currentUrl: resolveWebuiDatabaseUrl,
+  currentUrl: () => {
+    const resolved = resolveWebuiDatabase();
+    return 'entry' in resolved ? resolved.entry : null;
+  },
+  currentRefusal: () => {
+    const resolved = resolveWebuiDatabase();
+    return 'refusal' in resolved ? resolved.refusal : null;
+  },
   requestDb: pgRequestDb,
   nodeId: readThisNodeId,
   nodeName: getNodeName,
 };
 let deps: GuildRequestDeps = realDeps;
+
+/** Tests build the request pool of an entry to read its config. */
+export function _pgRequestDbForTests(url: string): RequestDb {
+  return pgRequestDb(url);
+}
 
 /** Tests script the database, the reader and this machine's identity. */
 export function _setGuildRequestDeps(over: Partial<GuildRequestDeps> | null): void {
@@ -208,7 +223,7 @@ export type CheckAnswer =
 export async function runHolderCheck(guildId: string, deadline = performance.now() + CHECK_BOUND_MS): Promise<CheckAnswer> {
   try {
     const current = deps.currentUrl();
-    if (!current) throw new Error('DATA_BACKEND_URL is not set');
+    if (!current) throw new Error(deps.currentRefusal() ?? 'no database');
     const res = await deps.holderOf(guildId, Math.max(0, Math.min(CHECK_BOUND_MS, deadline - performance.now())));
     const url = res.url ?? current;
     const check = holderStateOf(res.rows);

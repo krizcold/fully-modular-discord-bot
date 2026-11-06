@@ -1,3 +1,4 @@
+import { pgConfig } from '../../src/utils/databaseAddress';
 import fs from 'fs';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
@@ -88,7 +89,7 @@ describe('writeMarkerStrict', () => {
 describe('verifyStoreIdentity adopting the store id', () => {
   it('keeps the migration the marker names', async () => {
     writeJson(MARKER, { live: 'postgres', storeId: null, flippedAt: 5, migration: 'job-s15-0004' });
-    expect(await verifyStoreIdentity('postgres://u:p@db.example:5432/smdb', true)).toEqual({ ok: true });
+    expect(await verifyStoreIdentity(pgConfig('postgres://u:p@db.example:5432/smdb'), true)).toEqual({ ok: true });
     expect(readJson(MARKER)).toEqual({ live: 'postgres', storeId: 'store-db', flippedAt: 5, migration: 'job-s15-0004' });
     expect(readFileMarker()).toEqual({ live: 'postgres', storeId: 'store-db', flippedAt: 5, migration: 'job-s15-0004' });
     expect(fs.existsSync(MARKER)).toBe(true);

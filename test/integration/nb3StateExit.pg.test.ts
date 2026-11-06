@@ -1,3 +1,4 @@
+import { pgConfig } from '../../src/utils/databaseAddress';
 import fs from 'fs';
 import path from 'path';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -146,7 +147,7 @@ describe('the next boot', () => {
     expect(there.job?.state, why(there.job)).toBe('done');
     setBackendKind('postgres');
     expect(evaluateRecognitionGuard()).toEqual({ state: 'boot', live: 'postgres' });
-    expect(await verifyStoreIdentity(rig.url, true)).toEqual({ ok: true });
+    expect(await verifyStoreIdentity(pgConfig(rig.url), true)).toEqual({ ok: true });
     setBackendKind(null);
     await run('file', 'job-se-00013');
     setBackendKind('file');

@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { FenceToken } from '../../src/bot/internalSetup/utils/dataBackends/backend';
 import { PostgresBackend } from '../../src/bot/internalSetup/utils/dataBackends/postgresBackend';
+import { fixedDatabase } from '../helpers/fixedDatabase';
 
 // NB4 decision 8: hydrate, flush and retire stamp the guild with one upsert that checks the shard's claim row for this
 // process; reclaim carries the same check. Decision 16: a flush whose COMMIT got no answer says so.
@@ -16,7 +17,7 @@ const token: FenceToken = { nodeId: 'node-a', claim: 7, processId: 'p-a', shardI
 const batch = { upserts: [{ key: { module: 'm', filename: 'a.json' }, doc: '{}' }], deletes: [], appends: [], flushId: 'f-1' };
 
 function scripted(answer: (sql: string) => unknown) {
-  const backend = new PostgresBackend({ url: 'postgres://nobody@127.0.0.1:9/none' });
+  const backend = new PostgresBackend(fixedDatabase('postgres://nobody@127.0.0.1:9/none'));
   backends.push(backend);
   (backend as unknown as { state: string }).state = 'ready';
   const sent: Array<{ sql: string; params?: unknown[] }> = [];

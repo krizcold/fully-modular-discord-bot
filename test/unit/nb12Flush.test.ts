@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { FenceToken, GuildFlushBatch } from '../../src/bot/internalSetup/utils/dataBackends/backend';
 import { ANSWER_BOUND_MS, PostgresBackend } from '../../src/bot/internalSetup/utils/dataBackends/postgresBackend';
+import { fixedDatabase } from '../helpers/fixedDatabase';
 import { WorkingSetManager } from '../../src/bot/internalSetup/utils/dataBackends/workingSet';
 import { type Answer, bytesOf, scriptedBackend } from '../helpers/scriptedPg';
 
@@ -67,12 +68,13 @@ describe('the statements of a flush', () => {
     expect(rows.join('')).toBe(chunk);
   });
 
-  it('a failure on the third statement rolls back and answers unavailable', async () => {
+  it('a failure on the third statement answers unavailable and sends nothing more on that client (NB5 I1)', async () => {
     quiet();
     const { backend, sent } = scripted((sql, _p, call) => (call === 4 ? Object.assign(new Error('boom'), { code: '08006' }) : undefined));
     const answer = await backend.flushGuild('1', { upserts: docs(300, 32 * 1024), deletes: [], appends: [] }, token);
     expect(answer).toMatchObject({ ok: false, reason: 'unavailable' });
-    expect(sent.some(s => s.sql === 'ROLLBACK')).toBe(true);
+    expect(sent).toHaveLength(4);
+    expect(sent.some(s => s.sql === 'ROLLBACK')).toBe(false);
     expect(sent.some(s => s.sql === 'COMMIT')).toBe(false);
   });
 });
@@ -125,7 +127,7 @@ describe('the 57014 log', () => {
     const error = quiet();
     let now = 1_000;
     vi.spyOn(performance, 'now').mockImplementation(() => now);
-    const backend = new PostgresBackend({ url: 'postgres://nobody@127.0.0.1:9/none' });
+    const backend = new PostgresBackend(fixedDatabase('postgres://nobody@127.0.0.1:9/none'));
     backends.push(backend);
     (backend as unknown as { state: string }).state = 'ready';
     (backend.getPool() as unknown as { connect: unknown }).connect = async () => ({
@@ -171,7 +173,7 @@ describe('the flush gate', () => {
 
   it('a failed connect, a deposed answer and a thrown statement each give the place back', async () => {
     quiet();
-    const backend = new PostgresBackend({ url: 'postgres://nobody@127.0.0.1:9/none' });
+    const backend = new PostgresBackend(fixedDatabase('postgres://nobody@127.0.0.1:9/none'));
     backends.push(backend);
     (backend as unknown as { state: string }).state = 'ready';
     let mode: 'connect' | 'deposed' | 'throw' = 'connect';
@@ -368,6 +370,8 @@ describe('the COMMIT answer bound and the save check', () => {
     const hydrated = ws.hydrate('1', token);
     await vi.advanceTimersByTimeAsync(10);
     expect(await hydrated).toBe('ready');
+    // NB5 G5: the hydrate's statements carry the 40 s bound; the rows below read the flush's statements.
+    const afterHydrate = rigged.sent.length;
     slowCommit = true;
     const line = `${'x'.repeat(1023)}\n`;
     expect(ws.append('1', 'm', 'log.jsonl', line)).toBe('accepted');
@@ -379,13 +383,16 @@ describe('the COMMIT answer bound and the save check', () => {
       return p;
     };
     const boundOf = (raw: unknown) => (typeof raw === 'string' ? undefined : (raw as { query_timeout?: number }).query_timeout);
-    const bounded = () => rigged.sent.filter(s => s.sql === 'COMMIT' && boundOf(s.raw) === ANSWER_BOUND_MS);
+    const bounded = () => rigged.sent.slice(afterHydrate).filter(s => s.sql === 'COMMIT' && boundOf(s.raw) === ANSWER_BOUND_MS);
     const start = Date.now();
     expect(await settled(ws.flushGuildNow('1', 120_000))).toBe('pending');
     expect(Date.now() - start).toBeGreaterThanOrEqual(ANSWER_BOUND_MS);
     expect(Date.now() - start).toBeLessThan(45_000);
     expect(landedFlush).toBeNull();
     expect(bounded()).toHaveLength(1);
+    // NB5 decision 13: the COMMIT's timeout started the hold, which fixedDatabase confirms on the next timer turn.
+    for (let t = 0; t < 10 && rigged.backend.connectionState().state !== 'ready'; t++) await vi.advanceTimersByTimeAsync(1000);
+    expect(rigged.backend.connectionState().state).toBe('ready');
     expect(await settled(ws.flushGuildNow('1', 120_000))).toBe('ok');
     expect(bounded()).toHaveLength(1);
     expect(landedFlush).toEqual(expect.any(String));
@@ -399,7 +406,7 @@ describe('the COMMIT answer bound and the save check', () => {
     expect(appended).toHaveLength(1);
     expect(appended[0].params?.[3]).toBe(line);
     expect(bounded()).toHaveLength(2);
-    for (const s of rigged.sent) {
+    for (const s of rigged.sent.slice(afterHydrate)) {
       if (boundOf(s.raw) !== undefined) expect([s.sql, boundOf(s.raw)]).toEqual([expect.stringMatching(/^(COMMIT|BEGIN|ROLLBACK|SELECT claim, last_flush)/), ANSWER_BOUND_MS]);
     }
     expect(rigged.sent.filter(s => s.sql.startsWith('BEGIN; SET LOCAL') || s.sql.startsWith('INSERT INTO smdb_data.guild_')).every(s => boundOf(s.raw) === undefined)).toBe(true);

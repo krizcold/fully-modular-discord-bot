@@ -386,7 +386,7 @@ function CredentialsPanel({ setupStatus, isBotRunning, onUpdate, onUpdateAndRest
                       onChange={e => handleFieldChange('DATA_BACKEND_URL', e.target.value)}
                       placeholder={secretPlaceholder(setupStatus?.credentials?.DATA_BACKEND_URL?.set, 'postgresql://user:password@host:5432/db')}
                     />
-                    <small>Leave blank to keep the saved value (it is never shown here)</small>
+                    <small>One database address, or a comma-separated list of addresses. Leave blank to keep the saved value (it is never shown here)</small>
                   </div>
                 )}
               </div>
@@ -454,6 +454,9 @@ function CredentialsPanel({ setupStatus, isBotRunning, onUpdate, onUpdateAndRest
           </button>
         </div>
       </form>
+
+      <div className="section-divider" />
+      <OwnerMessagesSection />
     </div>
   );
 }

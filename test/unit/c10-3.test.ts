@@ -107,6 +107,7 @@ function rig(file: string, name: string, initialProps: Record<string, unknown>, 
     secretPlaceholder: (isSet: boolean, example: string) => (isSet ? 'Set (leave blank to keep)' : example),
     BotCredentialsSection: stub,
     OAuthCredentialsSection: stub,
+    OwnerMessagesSection: stub,
     InstructionCard: stub,
     window: { location: { origin: 'http://localhost:3000' } },
   });

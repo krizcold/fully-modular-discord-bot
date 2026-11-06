@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { PostgresBackend } from '../../src/bot/internalSetup/utils/dataBackends/postgresBackend';
+import { fixedDatabase } from '../helpers/fixedDatabase';
 import type { FenceToken } from '../../src/bot/internalSetup/utils/dataBackends/backend';
 
 // NB4's fenced transactions on a scripted pool client: a process without a usable shard claim touches no row, a
@@ -24,7 +25,7 @@ function rig(script: Script, state: 'ready' | 'outage' | 'connecting' = 'connect
   const errors: string[] = [];
   vi.spyOn(console, 'error').mockImplementation((...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
   vi.spyOn(console, 'log').mockImplementation(() => {});
-  const backend = new PostgresBackend({ url: 'postgres://nobody@127.0.0.1:9/none' });
+  const backend = new PostgresBackend(fixedDatabase('postgres://nobody@127.0.0.1:9/none'));
   backends.push(backend);
   (backend as unknown as { state: string }).state = state;
   const queries: string[] = [];
@@ -81,13 +82,24 @@ describe('a deposed flush names the shard row', () => {
   it('a shard row read that fails says it could not be read', async () => {
     const { backend, errors, alerts } = rig(q => {
       if (isOwner(q)) return owner;
-      if (isShardRow(q)) throw new Error('connection reset');
+      if (isShardRow(q)) throw Object.assign(new Error('permission denied for table shard_claims'), { code: '42501', severity: 'ERROR' });
       return none;
     });
     expect(await backend.flushGuild('777', EMPTY, TOKEN)).toEqual({ ok: false, reason: 'deposed', currentOwner: { nodeId: 'node-b', claim: 20 } });
     const detail = "deposed: guild 777 is held by claim 20 (node-b); shard 3 of 4's claim row could not be read; local claim 7";
     expect(errors).toEqual([`[PostgresBackend] Flush rejected: ${detail}`]);
     expect(alerts).toEqual([`deposed: ${detail}`]);
+  });
+
+  it('a shard row read that lost its connection answers unavailable, with no deposed line or alert (NB5 I1)', async () => {
+    const { backend, errors, alerts } = rig(q => {
+      if (isOwner(q)) return owner;
+      if (isShardRow(q)) throw new Error('connection reset');
+      return none;
+    });
+    expect(await backend.flushGuild('777', EMPTY, TOKEN)).toEqual({ ok: false, reason: 'unavailable', detail: 'connection reset' });
+    expect(errors.some(line => line.includes('Flush rejected'))).toBe(false);
+    expect(alerts.some(alert => alert.startsWith('deposed'))).toBe(false);
   });
 
   it('reads the row of the token\'s own shard', async () => {
@@ -118,14 +130,20 @@ describe('a flush whose driver throws a bare null', () => {
 });
 
 describe('a retire whose claim lost the guild', () => {
-  it('rolls back, answers deposed, and the answer ends an outage', async () => {
-    const { backend, queries } = rig(() => none, 'outage');
-    expect(backend.connectionState().state).toBe('outage');
+  it('rolls back and answers deposed', async () => {
+    const { backend, queries } = rig(() => none, 'ready');
     expect(await backend.retireGuild('777', 'left', TOKEN)).toEqual({ ok: false, reason: 'deposed' });
     expect(queries[0]).toBe('BEGIN');
     expect(isUpsert(queries[1])).toBe(true);
     expect(queries[2]).toBe('ROLLBACK');
     expect(queries).toHaveLength(3);
     expect(backend.connectionState().state).toBe('ready');
+  });
+
+  it('during the hold it is refused with nothing sent (NB5 decision 13, G12)', async () => {
+    const { backend, queries, connect } = rig(() => none, 'outage');
+    expect(await backend.retireGuild('777', 'left', TOKEN)).toMatchObject({ ok: false, reason: 'held' });
+    expect(connect).not.toHaveBeenCalled();
+    expect(queries).toEqual([]);
   });
 });

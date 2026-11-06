@@ -42,14 +42,14 @@ const DEPOSED = "another bot process now serves this server's data; nothing was 
 const OUT_OF_TIME = 'the restore ran out of its 40 s before it could commit; nothing was restored; try again in a moment';
 const NO_ENTRY = 'no graveyard entry for this guild';
 const liveText = (r: number) => `live guild data exists; nothing was restored. To restore entry ${r}, delete this server's data, then restore with retiredAt ${r} before the bot saves anything new for the server; data it saves in between blocks the restore again. While the server's members are active, remove the bot from the server first and add it back after the restore.`;
-const unknownText = (g: string, r: number) => `can't confirm whether server ${g} was restored: the database did not confirm the commit. Within a minute, if it was restored, the server's data is back and entry ${r} is gone from \`smdb graveyard list\`; if not, the entry is still listed, unless it had passed the graveyard's keep time (GRAVEYARD_TTL_DAYS, 14 days by default) and the graveyard sweep removed it, data and all.`;
+const unknownText = (g: string, r: number) => `can't confirm whether server ${g} was restored: the database did not confirm the commit. Within a minute, if it was restored, the server's data is back and entry ${r} is gone from \`smdb graveyard list\`; if not, the entry is still listed, unless it had passed the graveyard's keep time (GRAVEYARD_TTL_DAYS, 14 days by default) and the graveyard sweep removed it, data and all. The list reads the data of the bot behind the web panel it asks; if the main database was replaced meanwhile, check once that bot runs on the new main.`;
 const DELETE_FLUSH = "the server's unsaved changes are not confirmed saved yet; nothing was removed; try again in a moment";
 const DELETE_ALREADY = "a delete of this server's data is already running; nothing was removed";
 const RESTORE_RUNNING = 'a restore of this server from the graveyard is running; nothing was removed; try again once it ends';
 const DELETE_TIMEOUT = 'the database did not finish the delete within its 40 s; nothing was removed; try again in a moment';
 const DELETE_OUT_OF_TIME = 'the delete ran out of its 40 s before it could commit; nothing was removed; try again in a moment';
 const DELETE_DEPOSED = "another bot process now serves this server's data; nothing was removed";
-const DELETE_UNKNOWN = "can't confirm whether this server's data was deleted: the database did not confirm the commit. Within a minute, `smdb graveyard list` lists a new entry for this server if it was deleted; if no new entry is listed by then, it was not.";
+const DELETE_UNKNOWN = "can't confirm whether this server's data was deleted: the database did not confirm the commit. Within a minute, `smdb graveyard list` lists a new entry for this server with the reason webui-operator-delete if it was deleted; if no such entry is listed by then, it was not. The list reads the data of the bot behind the web panel it asks; if the main database was replaced meanwhile, check once that bot runs on the new main.";
 
 type RestoreArgs = [guildId: string, retiredAt: number | null, token: FenceToken, beforeCommit: () => RestoreStop | null, deadline: bigint];
 type RetireArgs = [guildId: string, reason: string, token: FenceToken, deadline?: bigint | null];
@@ -106,9 +106,10 @@ class ScriptedStore extends FakeStore {
     for (const row of docs.keys()) this.docs.delete(row);
     for (const row of streams.keys()) this.streams.delete(row);
     const list = this.graveyard.get(guildId) ?? [];
-    list.push({ retiredAt: Date.now() + list.length, reason, docs, streams });
+    const retiredAt = Date.now() + list.length;
+    list.push({ retiredAt, reason, docs, streams });
     this.graveyard.set(guildId, list);
-    return { ok: true, moved: docs.size + streams.size };
+    return { ok: true, moved: docs.size + streams.size, retiredAt };
   }
 
   bury(guildId: string, retiredAt: number, docs: Record<string, unknown>): void {
@@ -515,7 +516,7 @@ describe('dispatch while a guild is in the map', () => {
     const deleting = deleteGuildNamespace(g, 'test', 5 * SECOND);
     await vi.waitFor(() => expect(store.retireCalls).toHaveLength(1));
     expect(gateCauseNow(g, performance.now())).toBe('loading');
-    retire.resolve({ ok: true, moved: 0 });
+    retire.resolve({ ok: true, moved: 0, retiredAt: 5 });
     await deleting;
   });
 });
@@ -855,7 +856,7 @@ describe('the delete', () => {
       `[Data] Update for guild ${g} refused: its data is being deleted`,
     ]);
     expect(evict).not.toHaveBeenCalled();
-    retire.resolve({ ok: true, moved: 1 });
+    retire.resolve({ ok: true, moved: 1, retiredAt: 5 });
     expect(await deleting).toEqual({ ok: true });
     expect(evict).toHaveBeenCalledWith(g);
     expect(store.graveyard.get(g)![0].docs.get(`${g}|m/a.json`)).toBe(JSON.stringify({ v: 1 }, null, 2));
@@ -868,14 +869,14 @@ describe('the delete', () => {
     const second = deleteGuildNamespace(fresh, 'test', 5 * SECOND);
     await vi.waitFor(() => expect(store.retireCalls).toHaveLength(2));
     expect(await ws.hydrate(fresh, { nodeId: 'node-a', claim: 7, processId: 'process-a', shardId: 0, shardCount: 1 })).toBe('ready');
-    held.resolve({ ok: true, moved: 1 });
+    held.resolve({ ok: true, moved: 1, retiredAt: 5 });
     await second;
     expect(ws.stateOf(fresh)).toBeNull();
     expect(await ws.hydrate(fresh, { nodeId: 'node-a', claim: 7, processId: 'process-a', shardId: 0, shardCount: 1 })).toBe('ready');
     expect(loadData('x.json', opts(fresh), null)).toBeNull();
 
     const third = await readyGuild(ws);
-    store.retireImpl = async () => ({ ok: false, reason: 'unknown' });
+    store.retireImpl = async () => ({ ok: false, reason: 'unknown', retiredAt: 5, moved: 1 });
     expect(await deleteGuildNamespace(third, 'test', 5 * SECOND)).toEqual({ ok: false, code: 'backend-unavailable', error: DELETE_UNKNOWN });
     expect(ws.stateOf(third)).toBeNull();
   });
@@ -973,9 +974,9 @@ describe('every accepted write is stored, held or deposed (property)', () => {
         const runDelete = async () => {
           store.retireImpl = async guildId => {
             await at('deleting');
-            if (retireAnswer === 'unknown-lost') return { ok: false, reason: 'unknown' };
+            if (retireAnswer === 'unknown-lost') return { ok: false, reason: 'unknown', retiredAt: 5, moved: 1 };
             const moved = store.retireNow(guildId, 'test');
-            return retireAnswer === 'ok' ? moved : { ok: false, reason: 'unknown' };
+            return retireAnswer === 'ok' ? moved : { ok: false, reason: 'unknown', retiredAt: 5, moved: 1 };
           };
           const deleting = deleteGuildNamespace(g, 'test', SECOND);
           inMap = true;
@@ -1380,9 +1381,9 @@ describe('the state x exit table (Postgres cells)', () => {
   }, 10_000);
 
   it.each<[string, RetireOutcome, unknown, boolean]>([
-    ['D2 retire ok', { ok: true, moved: 1 }, { ok: true }, true],
-    ['D2 COMMIT with no answer (committed)', { ok: false, reason: 'unknown' }, { ok: false, code: 'backend-unavailable', error: DELETE_UNKNOWN }, true],
-    ['D2 COMMIT with no answer (rolled back)', { ok: false, reason: 'unknown' }, { ok: false, code: 'backend-unavailable', error: DELETE_UNKNOWN }, false],
+    ['D2 retire ok', { ok: true, moved: 1, retiredAt: 5 }, { ok: true }, true],
+    ['D2 COMMIT with no answer (committed)', { ok: false, reason: 'unknown', retiredAt: 5, moved: 1 }, { ok: false, code: 'backend-unavailable', error: DELETE_UNKNOWN }, true],
+    ['D2 COMMIT with no answer (rolled back)', { ok: false, reason: 'unknown', retiredAt: 5, moved: 1 }, { ok: false, code: 'backend-unavailable', error: DELETE_UNKNOWN }, false],
     ['D2 database drops before COMMIT', { ok: false, reason: 'unavailable', detail: 'Connection terminated' }, { ok: false, code: 'backend-unavailable', error: 'the database did not answer or ended the connection (Connection terminated); nothing was removed; try again in a moment' }, false],
     ['D2 statement timeout', { ok: false, reason: 'unavailable', timedOut: true }, { ok: false, code: 'backend-unavailable', error: DELETE_TIMEOUT }, false],
     ['D2 deadline', { ok: false, reason: 'out-of-time' }, { ok: false, code: 'backend-unavailable', error: DELETE_OUT_OF_TIME }, false],
