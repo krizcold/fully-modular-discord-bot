@@ -26,7 +26,8 @@ describe('the status read', () => {
   });
 
   it('answers success for a done result', () => {
-    expect(status(journal({ result: 'done', stage: 'env' })).body).toMatchObject({ success: true, job: { state: 'done' } });
+    const marker = { live: 'postgres', migration: JOB, storeId: 's', flippedAt: 1 };
+    expect(status(journal({ result: 'done', stage: 'env', storeId: 's' }), marker).body).toMatchObject({ success: true, job: { state: 'done' } });
   });
 
   it('answers success for a matching marker: interrupted at env without the env, done when managed', () => {

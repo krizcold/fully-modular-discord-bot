@@ -15,7 +15,7 @@ import { getNodeName } from '../../fleet/nodeName';
 import { initWorkingSet, type WorkingSetManager } from './workingSet';
 import type { DataUnavailableCause } from './workingSet';
 import { initDataReadiness, getDataReadiness, DataReadinessDriver } from './dataReadiness';
-import { evaluateRecognitionGuard, verifyStoreIdentity, readFileMarker, GuardVerdict } from './recognitionGuard';
+import { evaluateRecognitionGuard, verifyStoreIdentity, readFileMarker, readMarkerStoreId, GuardVerdict } from './recognitionGuard';
 import { setGuildDataBackend, isClosedForExit, closeGuildWrites, noteGuildDataServing, guildDataOpOf, bufferRestoreEvent, retiresToSettle, settledRetire } from '../dataManager';
 import { getConfigProperty } from '../configManager';
 import { ACK_MS, sweepLateWrites } from './replyGate';
@@ -145,7 +145,7 @@ export function mainChooserDeps(): ChooserDeps {
 }
 
 function startPostgresRuntime(chooser: MainChooser = new MainChooser(mainChooserDeps())): PostgresBackend {
-  const backend = new PostgresBackend({ chooser });
+  const backend = new PostgresBackend({ chooser, markerStoreId: readMarkerStoreId });
   setMainChooser(chooser);
   reportStore({ url: null, choosing: true });
   bootStatus = { ...bootStatus, mode: 'postgres', state: 'starting', waitReason: null };
@@ -203,6 +203,12 @@ async function verifyIdentityLoop(chooser: MainChooser, backend: PostgresBackend
       run.done = true;
       refuse(`the database holds schema version ${verdict.found}, and this bot reads only version ${SCHEMA_VERSION}`, 'postgres',
         'Gates stay closed; point DATA_BACKEND_URL at a database of this bot\'s schema version in the web UI env editor');
+      return;
+    }
+    if (verdict.state === 'shape') {
+      if (run.done) return;
+      run.done = true;
+      refuse(verdict.reason, 'postgres', verdict.fix);
       return;
     }
     run.schema = verdict.state;

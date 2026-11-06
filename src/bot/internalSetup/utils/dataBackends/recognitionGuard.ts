@@ -156,6 +156,20 @@ export function readFileMarker(): BackendStateMarker | null {
   return read.state === 'ok' ? markerFrom(read.value) : null;
 }
 
+/**
+ * The store id the marker records, for a store that lacks its store_id row: null when there is no marker or it records
+ * none. Throws when the marker exists but can't be read or parsed, so no store id is written on a guess.
+ */
+export function readMarkerStoreId(): string | null {
+  const read = readJsonFile(MARKER_FILE);
+  if (read.state === 'absent') return null;
+  const unknown = 'so the store id it records is unknown; no store id was written and nothing was refused';
+  if (read.state === 'bad') throw new Error(`this machine's marker ${read.why}, ${unknown}`);
+  const marker = markerFrom(read.value);
+  if (!marker) throw new Error(`this machine's marker ${MARKER_FILE} does not name file or postgres, ${unknown}`);
+  return marker.storeId;
+}
+
 /** The migration's own marker write: throws when it fails, and reads the file back. */
 export function writeMarkerStrict(marker: BackendStateMarker): void {
   const text = JSON.stringify(marker, null, 2);

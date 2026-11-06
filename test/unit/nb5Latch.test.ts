@@ -827,26 +827,29 @@ describe('I1: the data-pool lease', () => {
     expect(releases).toEqual([undefined]);
   });
 
-  it('(6) a bootstrap whose advisory lock never answers fails at 40 s without DDL or unlock and destroys its client', async () => {
-    const { backend, statements, releases } = rig(sql => (/pg_advisory_lock/.test(sql) ? 'hang' : undefined));
+  // MB2: NB16's bootstrap takes the transaction lock (pg_try_advisory_xact_lock), which ends with its session.
+  it('(6) a bootstrap whose advisory lock never answers fails at 40 s without DDL or ROLLBACK and destroys its client', async () => {
+    const { backend, statements, releases } = rig(sql => (/pg_try_advisory_xact_lock/.test(sql) ? 'hang' : undefined));
     (backend as unknown as { provisioned: boolean }).provisioned = false;
     const run = (backend as unknown as { provision(): Promise<void> }).provision();
     const done = settle(run.catch(() => 'failed'));
-    await vi.advanceTimersByTimeAsync(ANSWER_BOUND_MS + 10);
+    await vi.advanceTimersByTimeAsync(ANSWER_BOUND_MS - 10);
+    expect(done.done).toBe(false);
+    await vi.advanceTimersByTimeAsync(20);
     expect(done.done).toBe(true);
     expect(statements().some(s => /^CREATE/.test(s))).toBe(false);
-    expect(statements().some(s => /pg_advisory_unlock/.test(s))).toBe(false);
+    expect(statements().at(-1)).toMatch(/pg_try_advisory_xact_lock/);
     expect(releases).toEqual([true]);
   });
 
   it('(7) a bootstrap where the latch rises after the lock answered sends nothing more and destroys its client', async () => {
     const r = rig(sql => {
-      if (/pg_advisory_lock/.test(sql)) { r.backend.latch(CAUSE); return { rows: [], rowCount: 1 }; }
+      if (/pg_try_advisory_xact_lock/.test(sql)) { r.backend.latch(CAUSE); return { rows: [{ locked: true }], rowCount: 1 }; }
       return undefined;
     });
     (r.backend as unknown as { provisioned: boolean }).provisioned = false;
     await (r.backend as unknown as { provision(): Promise<void> }).provision().catch(() => undefined);
-    expect(r.statements()).toEqual([expect.stringMatching(/pg_advisory_lock/)]);
+    expect(r.statements()).toEqual(['BEGIN', 'SET TRANSACTION ISOLATION LEVEL READ COMMITTED', expect.stringMatching(/pg_try_advisory_xact_lock/)]);
     expect(r.releases).toEqual([true]);
   });
 });

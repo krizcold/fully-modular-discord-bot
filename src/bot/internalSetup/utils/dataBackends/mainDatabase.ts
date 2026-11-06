@@ -734,7 +734,7 @@ export class MainChooser implements DatabaseChooser {
     }
     const mine = answers.find(a => a.entry === chosenEntry)!;
     const address = mine.address;
-    const wasOutage = backend.connectionState().state === 'outage';
+    const wasOutage = backend.holdWords() !== null && backend.connectionState().state === 'outage';
     if (mine.kind !== 'answered' && mine.error !== undefined) backend.noteObservation(mine.error, epoch, mine.atLogin === true);
     this.chosenAnswered = mine.kind === 'answered';
     if (backend.connectionState().state === 'connecting') {

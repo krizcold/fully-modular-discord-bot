@@ -10,6 +10,13 @@ import { guardPoolClients, shortLivedClient } from '../pgClient';
 import { FLUSH_STATEMENT_BYTES, FLUSH_WIRE_MAX, flushBoundMs, utf8Pieces } from '../storableData';
 import { pgConfig, showEntry } from '../../../../utils/databaseAddress';
 import type { ClientConfig, PoolClient, PoolConfig, QueryConfig, QueryResult } from 'pg';
+import {
+  checkShape, encodingRefusal, freshPrivilegeRefusal, freshRefusal, gateRefusal, metaGateCause, readFoundList,
+  refusalLogLines, relationPrivileges, shapeRefusal, sortDifferences, unversionedRefusal, privilegeDifference,
+  freshVersionRefusal, serverRelease, serverVersionRefusal, storeIdRefusal, ScratchBuildFailed, scratchRefusal,
+  ddlErrorRetries, schemaDdlRefusal,
+} from './storeShape';
+import type { FoundList, Refusal, ShapeCheck, ShapeMode } from './storeShape';
 import type {
   DataBackend,
   DocKey,
@@ -25,7 +32,7 @@ import type {
   RetireOutcome,
 } from './backend';
 
-export const SCHEMA_VERSION = 5;
+export const SCHEMA_VERSION = 6;
 const PROVISION_VERDICT_POLL_MS = 250;
 const PARTITION_COUNT = 32;
 const MAX_ROWS_PER_STATEMENT = 200;
@@ -43,15 +50,34 @@ const IDLE_IN_TX_TIMEOUT_MS = 10000;
  */
 export const ANSWER_BOUND_MS = 40_000;
 const KEEPALIVE_DELAY_MS = 30_000;
+const BOOTSTRAP_LOCK_POLL_MS = 1000;
+const BOOTSTRAP_LOCK_WAIT_MS = 300_000;
+const MIN_SERVER_VERSION_NUM = 130000;
 
-const PROVISION_DDL: string[] = [
-  `CREATE SCHEMA IF NOT EXISTS smdb_data`,
-  `CREATE TABLE IF NOT EXISTS smdb_data.meta (
+type Sender = { query(text: string, values?: unknown[]): Promise<QueryResult> };
+
+/** The seed rows of provisionDdl: rows, not shape, so neither the scratch copy nor a privilege check needs them. */
+export function provisionSeedRows(s: string): string[] {
+  return [`INSERT INTO ${s}.claim_clock (id, up_ms, ticked_at) VALUES (1, 0, now()) ON CONFLICT (id) DO NOTHING`];
+}
+
+/** provisionDdl without its seed rows: the 18 statements that make the schema. */
+export function provisionSchemaDdl(s: string): string[] {
+  const seeds = new Set(provisionSeedRows(s));
+  return provisionDdl(s).filter(stmt => !seeds.has(stmt));
+}
+
+// Any change here bumps SCHEMA_VERSION; the boot refuses a stored schema that differs.
+/** The schema's 19 statements, rendered for a schema name (smdb_data, or the scratch copy the boot compares with). */
+export function provisionDdl(s: string): string[] {
+  return [
+  `CREATE SCHEMA IF NOT EXISTS ${s}`,
+  `CREATE TABLE IF NOT EXISTS ${s}.meta (
     key        text PRIMARY KEY,
     value      text NOT NULL,
     updated_at timestamptz NOT NULL DEFAULT now()
   )`,
-  `CREATE TABLE IF NOT EXISTS smdb_data.guild_ownership (
+  `CREATE TABLE IF NOT EXISTS ${s}.guild_ownership (
     guild_id     text PRIMARY KEY,
     node_id      text NOT NULL,
     shard_id     integer NOT NULL,
@@ -61,11 +87,11 @@ const PROVISION_DDL: string[] = [
     updated_at   timestamptz NOT NULL DEFAULT now(),
     last_flush   uuid
   )`,
-  `CREATE INDEX IF NOT EXISTS guild_ownership_node_idx ON smdb_data.guild_ownership (node_id)`,
-  `CREATE INDEX IF NOT EXISTS guild_ownership_claim_idx ON smdb_data.guild_ownership (claim)`,
-  `CREATE INDEX IF NOT EXISTS guild_ownership_shard_idx ON smdb_data.guild_ownership (shard_count, shard_id)`,
-  `CREATE SEQUENCE IF NOT EXISTS smdb_data.claim_seq`,
-  `CREATE TABLE IF NOT EXISTS smdb_data.shard_claims (
+  `CREATE INDEX IF NOT EXISTS guild_ownership_node_idx ON ${s}.guild_ownership (node_id)`,
+  `CREATE INDEX IF NOT EXISTS guild_ownership_claim_idx ON ${s}.guild_ownership (claim)`,
+  `CREATE INDEX IF NOT EXISTS guild_ownership_shard_idx ON ${s}.guild_ownership (shard_count, shard_id)`,
+  `CREATE SEQUENCE IF NOT EXISTS ${s}.claim_seq`,
+  `CREATE TABLE IF NOT EXISTS ${s}.shard_claims (
     shard_count     integer     NOT NULL,
     shard_id        integer     NOT NULL,
     claim           bigint      NOT NULL,
@@ -82,14 +108,14 @@ const PROVISION_DDL: string[] = [
     extended        boolean     NOT NULL DEFAULT false,
     PRIMARY KEY (shard_count, shard_id)
   )`,
-  `CREATE TABLE IF NOT EXISTS smdb_data.claim_clock (
+  `CREATE TABLE IF NOT EXISTS ${s}.claim_clock (
     id          integer     PRIMARY KEY CHECK (id = 1),
     up_ms       bigint      NOT NULL,
     ticked_at   timestamptz NOT NULL,
     last_gap_ms bigint      NOT NULL DEFAULT 0
   )`,
-  `INSERT INTO smdb_data.claim_clock (id, up_ms, ticked_at) VALUES (1, 0, now()) ON CONFLICT (id) DO NOTHING`,
-  `CREATE TABLE IF NOT EXISTS smdb_data.shard_nodes (
+  ...provisionSeedRows(s),
+  `CREATE TABLE IF NOT EXISTS ${s}.shard_nodes (
     node_id          text PRIMARY KEY,
     node_name        text        NOT NULL,
     process_id       text        NOT NULL,
@@ -102,7 +128,7 @@ const PROVISION_DDL: string[] = [
     healthy_since    timestamptz,
     seen_at          timestamptz NOT NULL
   )`,
-  `CREATE TABLE IF NOT EXISTS smdb_data.guild_data (
+  `CREATE TABLE IF NOT EXISTS ${s}.guild_data (
     guild_id   text NOT NULL,
     module     text NOT NULL,
     filename   text NOT NULL,
@@ -112,17 +138,17 @@ const PROVISION_DDL: string[] = [
   ) PARTITION BY HASH (guild_id)`,
   // Identity columns are rejected on partitioned tables before PG17, so seq
   // takes its default from an explicit sequence instead.
-  `CREATE SEQUENCE IF NOT EXISTS smdb_data.guild_append_seq`,
-  `CREATE TABLE IF NOT EXISTS smdb_data.guild_append (
+  `CREATE SEQUENCE IF NOT EXISTS ${s}.guild_append_seq`,
+  `CREATE TABLE IF NOT EXISTS ${s}.guild_append (
     guild_id   text NOT NULL,
     module     text NOT NULL,
     filename   text NOT NULL,
-    seq        bigint NOT NULL DEFAULT nextval('smdb_data.guild_append_seq'),
+    seq        bigint NOT NULL DEFAULT nextval('${s}.guild_append_seq'),
     chunk      text NOT NULL,
     created_at timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (guild_id, module, filename, seq)
   ) PARTITION BY HASH (guild_id)`,
-  `CREATE TABLE IF NOT EXISTS smdb_data.guild_data_graveyard (
+  `CREATE TABLE IF NOT EXISTS ${s}.guild_data_graveyard (
     guild_id   text NOT NULL,
     module     text NOT NULL,
     filename   text NOT NULL,
@@ -132,8 +158,8 @@ const PROVISION_DDL: string[] = [
     reason     text NOT NULL,
     PRIMARY KEY (guild_id, retired_at, module, filename)
   )`,
-  `CREATE INDEX IF NOT EXISTS guild_graveyard_ttl_idx ON smdb_data.guild_data_graveyard (retired_at)`,
-  `CREATE TABLE IF NOT EXISTS smdb_data.guild_requests (
+  `CREATE INDEX IF NOT EXISTS guild_graveyard_ttl_idx ON ${s}.guild_data_graveyard (retired_at)`,
+  `CREATE TABLE IF NOT EXISTS ${s}.guild_requests (
     id            uuid        PRIMARY KEY,
     guild_id      text        NOT NULL,
     shard_count   integer     NOT NULL,
@@ -152,9 +178,22 @@ const PROVISION_DDL: string[] = [
     reply         text,
     done_at       timestamptz
   )`,
-  `CREATE INDEX IF NOT EXISTS guild_requests_pending_idx ON smdb_data.guild_requests (for_process, created_at) WHERE state = 'pending'`,
-  `CREATE INDEX IF NOT EXISTS guild_requests_applying_idx ON smdb_data.guild_requests (claim_batch) WHERE state = 'applying'`,
-];
+  `CREATE INDEX IF NOT EXISTS guild_requests_pending_idx ON ${s}.guild_requests (for_process, created_at) WHERE state = 'pending'`,
+  `CREATE INDEX IF NOT EXISTS guild_requests_applying_idx ON ${s}.guild_requests (claim_batch) WHERE state = 'applying'`,
+  ];
+}
+
+/** The 64 partition statements of guild_data and guild_append, p00 to p31. */
+export function partitionDdl(s: string, ifNotExists: boolean): string[] {
+  const create = ifNotExists ? 'CREATE TABLE IF NOT EXISTS' : 'CREATE TABLE';
+  const out: string[] = [];
+  for (let i = 0; i < PARTITION_COUNT; i++) {
+    const suffix = `p${String(i).padStart(2, '0')}`;
+    out.push(`${create} ${s}.guild_data_${suffix} PARTITION OF ${s}.guild_data FOR VALUES WITH (MODULUS ${PARTITION_COUNT}, REMAINDER ${i})`);
+    out.push(`${create} ${s}.guild_append_${suffix} PARTITION OF ${s}.guild_append FOR VALUES WITH (MODULUS ${PARTITION_COUNT}, REMAINDER ${i})`);
+  }
+  return out;
+}
 
 /**
  * Provisions a new store on a client inside its open transaction and answers its store id. The caller holds the
@@ -163,14 +202,8 @@ const PROVISION_DDL: string[] = [
  */
 export async function provisionStoreInTransaction(client: { query(text: string, params?: unknown[]): Promise<unknown> }): Promise<string> {
   await client.query('CREATE SCHEMA smdb_data');
-  for (const stmt of PROVISION_DDL.slice(1)) await client.query(stmt);
-  for (let i = 0; i < PARTITION_COUNT; i++) {
-    const suffix = `p${String(i).padStart(2, '0')}`;
-    await client.query(
-      `CREATE TABLE smdb_data.guild_data_${suffix} PARTITION OF smdb_data.guild_data FOR VALUES WITH (MODULUS ${PARTITION_COUNT}, REMAINDER ${i})`);
-    await client.query(
-      `CREATE TABLE smdb_data.guild_append_${suffix} PARTITION OF smdb_data.guild_append FOR VALUES WITH (MODULUS ${PARTITION_COUNT}, REMAINDER ${i})`);
-  }
+  for (const stmt of provisionDdl('smdb_data').slice(1)) await client.query(stmt);
+  for (const stmt of partitionDdl('smdb_data', false)) await client.query(stmt);
   await client.query(`INSERT INTO smdb_data.meta (key, value) VALUES ('schema_version', $1)`, [JSON.stringify({ v: SCHEMA_VERSION })]);
   const storeId = randomUUID();
   await client.query(`INSERT INTO smdb_data.meta (key, value) VALUES ('store_id', $1)`, [JSON.stringify(storeId)]);
@@ -242,8 +275,17 @@ function matchesSchemaVersion(raw: string): boolean {
   }
 }
 
-/** How provisioning ended: the schema is this bot's, the database holds another version (found), or the backend stopped. */
-export type ProvisionVerdict = { state: 'provisioned' } | { state: 'mismatch'; found: string } | { state: 'stopped' };
+/**
+ * How provisioning ended: the schema is this bot's, the database holds another version (found), the store was refused
+ * for its shape, the role's privileges or the database's encoding (the reason and fix line the boot shows), or the
+ * backend stopped.
+ */
+export type ProvisionVerdict = { state: 'provisioned' } | { state: 'mismatch'; found: string } | { state: 'shape'; reason: string; fix: string } | { state: 'stopped' };
+
+export type MismatchCause = 'version' | 'shape' | 'privileges' | 'encoding' | 'server' | 'identity' | 'scratch' | 'provision';
+
+/** What a refused check does after its ROLLBACK, on the same connection, outside any transaction. */
+type Latch = (client: Sender) => void | Promise<void>;
 
 type AlertEvent = 'outage' | 'recovered' | 'deposed';
 const ASK_DATABASE_TIMEOUT_MS = 5_000;
@@ -494,6 +536,8 @@ class BoundedClient {
 const LIVE_CHECK = `SELECT EXISTS (SELECT 1 FROM smdb_data.guild_data WHERE guild_id = $1) OR EXISTS (SELECT 1 FROM smdb_data.guild_append WHERE guild_id = $1) AS present`;
 
 // The rows put back are exactly the rows the DELETE took out: a row a concurrent sweep removed is skipped by both.
+const STORE_ID_INSERT = `INSERT INTO smdb_data.meta (key, value) VALUES ('store_id', $1) ON CONFLICT (key) DO NOTHING`;
+
 const RESTORE_MOVE = `WITH moved AS (
     DELETE FROM smdb_data.guild_data_graveyard WHERE guild_id = $1 AND retired_at = $2
     RETURNING guild_id, module, filename, kind, doc, reason),
@@ -543,6 +587,8 @@ export class PostgresBackend implements DataBackend {
   private outageAlertTimer: NodeJS.Timeout | null = null;
   private schemaMismatch = false;
   private mismatchFound = 'unreadable';
+  private mismatchCause: MismatchCause = 'version';
+  private refusal: Refusal | null = null;
   private provisioned = false;
   private started = false;
   private stopped = false;
@@ -560,8 +606,15 @@ export class PostgresBackend implements DataBackend {
   private flushesOnWire = 0;
   private readonly flushWaiters: Array<() => void> = [];
 
-  constructor(opts: { chooser: DatabaseChooser }) {
+  private readonly markerStoreId: () => string | null;
+
+  /**
+   * markerStoreId answers the store id this machine's marker records (null for none), read when a store lacks one; it
+   * throws when the marker can't be read, and the attempt then fails for bootstrapLoop to retry.
+   */
+  constructor(opts: { chooser: DatabaseChooser; markerStoreId?: () => string | null }) {
     this.chooser = opts.chooser;
+    this.markerStoreId = opts.markerStoreId ?? (() => null);
     const entry = this.chooser.chosen();
     if (entry !== null) this.useEntry(entry);
   }
@@ -641,10 +694,11 @@ export class PostgresBackend implements DataBackend {
     } catch { /* already ended */ }
   }
 
-  /** Waits until provisioning has passed, has found another schema version, or the backend stopped. */
+  /** Waits until provisioning has passed, has refused the store, or the backend stopped. */
   async provisionVerdict(): Promise<ProvisionVerdict> {
     for (;;) {
       if (this.stopped) return { state: 'stopped' };
+      if (this.schemaMismatch && this.refusal) return { state: 'shape', reason: this.refusal.reason, fix: this.refusal.fix };
       if (this.schemaMismatch) return { state: 'mismatch', found: this.mismatchFound };
       if (this.provisioned) return { state: 'provisioned' };
       await this.sleep(PROVISION_VERDICT_POLL_MS);
@@ -787,7 +841,7 @@ export class PostgresBackend implements DataBackend {
           throw new Error('the database is in recovery (read-only); the bot serves only from a database that takes writes');
         }
         await this.provision();
-        if (this.schemaMismatch) return;
+        if (this.stopped || this.schemaMismatch) return;
         if (this.isHeld()) this.stateBeforeHold = 'ready';
         else if (this.latchWhy === null) this.state = 'ready';
         console.log('[PostgresBackend] Connected and provisioned; backend ready');
@@ -1115,63 +1169,192 @@ export class PostgresBackend implements DataBackend {
   // SELF-PROVISIONING
   // ==========================================================================
 
+  /**
+   * NB16 decision 7: one transaction under the bootstrap advisory lock. The encoding, the privilege gate and the version
+   * are read first; a store that holds relations is compared with a scratch copy of the schema and gets nothing but the
+   * claim_clock row and the store id; an empty one is provisioned and compared before its COMMIT. A refusal rolls back
+   * and latches; an error rolls back and is rethrown for bootstrapLoop to retry.
+   */
   private async provision(): Promise<void> {
     if (this.provisioned) return;
     const lease = await this.checkout();
-    let unlocked = false;
-    const send = (text: string, values: unknown[] = []) => this.sendOn(lease, text, values, ANSWER_BOUND_MS);
+    const client: Sender = { query: (text, values = []) => this.sendOn(lease, text, values, ANSWER_BOUND_MS) };
+    let destroy = false;
     try {
-      await send(`SELECT pg_advisory_lock(hashtext('smdb_data_bootstrap'))`);
-      try {
-        const existing = await this.readSchemaVersion(lease);
-        if (existing !== undefined && !matchesSchemaVersion(existing)) {
-          this.latchSchemaMismatch(existing);
-          return;
-        }
-        for (const stmt of PROVISION_DDL) await send(stmt);
-        for (let i = 0; i < PARTITION_COUNT; i++) {
-          const suffix = `p${String(i).padStart(2, '0')}`;
-          await send(
-            `CREATE TABLE IF NOT EXISTS smdb_data.guild_data_${suffix} PARTITION OF smdb_data.guild_data FOR VALUES WITH (MODULUS ${PARTITION_COUNT}, REMAINDER ${i})`);
-          await send(
-            `CREATE TABLE IF NOT EXISTS smdb_data.guild_append_${suffix} PARTITION OF smdb_data.guild_append FOR VALUES WITH (MODULUS ${PARTITION_COUNT}, REMAINDER ${i})`);
-        }
-        await send(
-          `INSERT INTO smdb_data.meta (key, value) VALUES ('schema_version', $1) ON CONFLICT (key) DO NOTHING`,
-          [JSON.stringify({ v: SCHEMA_VERSION })]);
-        const rawVersion = await this.readSchemaVersion(lease);
-        if (rawVersion === undefined || !matchesSchemaVersion(rawVersion)) {
-          this.latchSchemaMismatch(rawVersion);
-          return;
-        }
-        await send(
-          `INSERT INTO smdb_data.meta (key, value) VALUES ('store_id', $1) ON CONFLICT (key) DO NOTHING`,
-          [JSON.stringify(randomUUID())]);
-        this.provisioned = true;
-      } finally {
-        try {
-          await send(`SELECT pg_advisory_unlock(hashtext('smdb_data_bootstrap'))`);
-          unlocked = true;
-        } catch { /* the client ends below, and the lock with its session */ }
+      await client.query('BEGIN');
+      // Each read after the lock wait sees what the lock holder committed, whatever default_transaction_isolation says.
+      await client.query('SET TRANSACTION ISOLATION LEVEL READ COMMITTED');
+      if (!(await this.takeBootstrapLock(client))) {
+        await client.query('ROLLBACK');
+        return;
       }
+      const outcome = await this.checkStore(client);
+      if (outcome === 'commit') {
+        await client.query('COMMIT');
+        this.provisioned = true;
+        return;
+      }
+      await client.query('ROLLBACK');
+      await outcome(client);
+    } catch (error) {
+      destroy = true;
+      if (!lease.spoiled) {
+        try {
+          await client.query('ROLLBACK');
+        } catch { /* the client is destroyed below, and the transaction with its session */ }
+      }
+      throw error;
     } finally {
-      this.releaseLease(lease, !unlocked);
+      this.releaseLease(lease, destroy);
     }
   }
 
-  /** The stored schema_version value; undefined when the meta table or its row does not exist yet. */
-  private async readSchemaVersion(lease: DataLease): Promise<string | undefined> {
-    try {
-      const res = await this.sendOn(lease, `SELECT value FROM smdb_data.meta WHERE key = 'schema_version'`, [], ANSWER_BOUND_MS);
-      return res.rows[0]?.value;
-    } catch (error) {
-      if (isMissingRelation(error)) return undefined;
-      throw error;
+  /**
+   * The bootstrap lock, held until this transaction ends (NB3's migration takes the same one). Polled, so a wait behind
+   * other processes' checks is not cut by statement_timeout; false when the backend stopped while waiting.
+   */
+  private async takeBootstrapLock(client: Sender): Promise<boolean> {
+    const started = Date.now();
+    let logged = false;
+    for (;;) {
+      const res = await client.query(`SELECT pg_try_advisory_xact_lock(hashtext('smdb_data_bootstrap')) AS locked`);
+      if (res.rows[0]?.locked === true) return true;
+      if (this.stopped) return false;
+      if (Date.now() - started >= BOOTSTRAP_LOCK_WAIT_MS) {
+        throw new Error(`the bootstrap lock stayed held for ${BOOTSTRAP_LOCK_WAIT_MS / 1000} s by another bot process's schema check or a data migration`);
+      }
+      if (!logged) {
+        logged = true;
+        console.log("[PostgresBackend] Waiting for the bootstrap lock, held by another bot process's schema check or a data migration");
+      }
+      await this.sleep(BOOTSTRAP_LOCK_POLL_MS);
+      if (this.stopped) return false;
     }
+  }
+
+  /** Steps 1 to 8 inside the open transaction: 'commit', or the latch to set after the ROLLBACK. */
+  private async checkStore(client: Sender): Promise<'commit' | Latch> {
+    const versionNum = Number((await client.query('SHOW server_version_num')).rows[0]?.server_version_num);
+    if (Number.isInteger(versionNum) && versionNum > 0 && versionNum < MIN_SERVER_VERSION_NUM) {
+      const release = serverRelease(versionNum);
+      return () => this.latchRefusal('server', serverVersionRefusal(release), release);
+    }
+    await client.query('SET LOCAL search_path = pg_catalog');
+    await client.query('SET LOCAL quote_all_identifiers = off');
+    await client.query('SET LOCAL default_table_access_method = heap');
+    const encoding = String((await client.query('SHOW server_encoding')).rows[0]?.server_encoding ?? '');
+    if (encoding !== 'UTF8') return () => this.latchRefusal('encoding', encodingRefusal(encoding), encoding);
+    const found = await readFoundList(client);
+    const gate = gateRefusal(found);
+    if (gate) return () => this.latchRefusal('privileges', gate);
+    let version: string | undefined;
+    let unreadable: string | undefined;
+    if (found.meta) {
+      unreadable = metaGateCause(found.meta) ?? undefined;
+      if (unreadable === undefined) {
+        const read = await this.readVersion(client);
+        if ('cause' in read) unreadable = read.cause;
+        else version = read.value;
+      }
+    }
+    if (version !== undefined && !matchesSchemaVersion(version)) {
+      const other = version;
+      return () => this.latchSchemaMismatch(other);
+    }
+    if (found.relations.length === 0) return this.provisionFresh(client, found);
+    if (version === undefined) {
+      const result = await this.compare(client, 'unversioned', found);
+      if (typeof result === 'function') return result;
+      return () => this.latchRefusal('shape', unversionedRefusal(found, result, unreadable));
+    }
+    const result = await this.compare(client, 'provisioned', found);
+    if (typeof result === 'function') return result;
+    const privileges = relationPrivileges(found, result.reference);
+    if (result.differences.length || privileges.length) {
+      const refusal = shapeRefusal(sortDifferences([...result.differences, ...privileges]));
+      return () => this.latchRefusal(result.differences.length ? 'shape' : 'privileges', refusal);
+    }
+    const storeId = await client.query(`SELECT 1 FROM ONLY smdb_data.meta WHERE key = 'store_id'`);
+    if (storeId.rows.length === 0) {
+      // A new id would be refused by every machine whose marker records the old one, so with one recorded nothing is written.
+      const recorded = this.markerStoreId();
+      if (recorded) return () => this.latchRefusal('identity', storeIdRefusal(recorded));
+      await client.query(STORE_ID_INSERT, [JSON.stringify(randomUUID())]);
+    }
+    for (const stmt of provisionSeedRows('smdb_data')) await client.query(stmt);
+    return 'commit';
+  }
+
+  /**
+   * Step 8: a smdb_data with no relation gets the schema, compared and its privileges read before any row is written;
+   * then the seed rows, the version row and its reread, and the store id, all before the COMMIT.
+   */
+  private async provisionFresh(client: Sender, found: FoundList): Promise<'commit' | Latch> {
+    try {
+      for (const stmt of provisionSchemaDdl('smdb_data')) await client.query(stmt);
+      for (const stmt of partitionDdl('smdb_data', true)) await client.query(stmt);
+    } catch (error) {
+      if (ddlErrorRetries(error)) throw error;
+      const e = error as { code: string; message?: unknown };
+      return this.ddlRefusal('provision', e.code, String(e.message ?? ''), found);
+    }
+    const result = await this.compare(client, 'provisioned', found);
+    if (typeof result === 'function') return result;
+    if (result.differences.length) return () => this.latchRefusal('shape', freshRefusal(result.differences));
+    const again = await readFoundList(client);
+    const lacking = relationPrivileges(again, result.reference);
+    if (again.schemaUsage === false) {
+      lacking.push(privilegeDifference(again.role, again.db, { scope: 'schema', target: 'smdb_data', privilege: 'USAGE' }));
+    }
+    if (lacking.length) return () => this.latchRefusal('privileges', freshPrivilegeRefusal(again.role, sortDifferences(lacking)));
+    for (const stmt of provisionSeedRows('smdb_data')) await client.query(stmt);
+    await client.query(
+      `INSERT INTO smdb_data.meta (key, value) VALUES ('schema_version', $1) ON CONFLICT (key) DO NOTHING`,
+      [JSON.stringify({ v: SCHEMA_VERSION })]);
+    const reread = await this.readVersion(client);
+    if (!('value' in reread) || reread.value === undefined || !matchesSchemaVersion(reread.value)) {
+      const cause = 'cause' in reread
+        ? reread.cause
+        : reread.value === undefined ? 'smdb_data.meta holds no schema_version row' : `smdb_data.meta's schema_version reads ${reread.value}`;
+      return () => this.latchRefusal('shape', freshVersionRefusal(cause));
+    }
+    await client.query(STORE_ID_INSERT, [JSON.stringify(randomUUID())]);
+    return 'commit';
+  }
+
+  /** checkShape, or the refusal's latch when the scratch could not be built for a cause that repeats at every boot. */
+  private async compare(client: Sender, mode: ShapeMode, found: FoundList): Promise<ShapeCheck | Latch> {
+    try {
+      return await checkShape(client, mode);
+    } catch (error) {
+      if (!(error instanceof ScratchBuildFailed)) throw error;
+      return this.ddlRefusal('scratch', error.code, error.serverMessage, found);
+    }
+  }
+
+  /** The latch for a server error from the bot's schema DDL. */
+  private ddlRefusal(cause: 'scratch' | 'provision', code: string, message: string, found: FoundList): Latch {
+    return async () => {
+      const refusal = cause === 'scratch'
+        ? scratchRefusal(code, message, found.role, found.db)
+        : schemaDdlRefusal(code, message, found.role, found.db);
+      this.latchRefusal(cause, refusal);
+    };
+  }
+
+  /** The schema_version row of a meta that passed the gate: its value, none, or why it can't be read. */
+  private async readVersion(client: Sender): Promise<{ value: string | undefined } | { cause: string }> {
+    const res = await client.query(`SELECT value::text FROM ONLY smdb_data.meta WHERE key = 'schema_version'`);
+    if (res.rows.length > 1) return { cause: `smdb_data.meta holds ${res.rows.length} schema_version rows` };
+    if (res.rows.length === 0) return { value: undefined };
+    const value = res.rows[0]?.value;
+    if (value === null || value === undefined) return { cause: 'smdb_data.meta holds a schema_version row with no value' };
+    return { value: String(value) };
   }
 
   private latchSchemaMismatch(found: string | undefined): void {
     this.schemaMismatch = true;
+    this.mismatchCause = 'version';
     this.mismatchFound = found ?? 'unreadable';
     this.state = 'outage';
     if (this.outageSince === undefined) this.outageSince = Date.now();
@@ -1180,6 +1363,34 @@ export class PostgresBackend implements DataBackend {
     console.error(`[PostgresBackend] ${detail}`);
     this.outageAlertFired = true;
     this.fireAlert('outage', detail);
+  }
+
+  /** The same latch for a refusal of the store's shape, the role's privileges or the encoding, with its composed texts. */
+  private latchRefusal(cause: Exclude<MismatchCause, 'version'>, refusal: Refusal, found?: string): void {
+    this.schemaMismatch = true;
+    this.mismatchCause = cause;
+    this.refusal = refusal;
+    if (found !== undefined) this.mismatchFound = found;
+    this.state = 'outage';
+    if (this.outageSince === undefined) this.outageSince = Date.now();
+    this.clearOutageAlertTimer();
+    for (const line of refusalLogLines(refusal)) console.error(line);
+    this.outageAlertFired = true;
+    this.fireAlert('outage', refusal.header);
+  }
+
+  /** The cause of the latch as a refused restore names it. */
+  private mismatchText(): string {
+    switch (this.mismatchCause) {
+      case 'shape': return "the database's smdb_data differs from this bot's schema";
+      case 'privileges': return "this bot's database role lacks privileges on smdb_data";
+      case 'encoding': return `the database's server_encoding is ${this.mismatchFound}, not UTF8`;
+      case 'server': return `the database server is PostgreSQL ${this.mismatchFound}, older than 13`;
+      case 'identity': return "the database's smdb_data.meta holds no store_id";
+      case 'scratch': return 'the bot could not build its copy of its schema to compare with';
+      case 'provision': return 'the bot could not make its schema in the database';
+      default: return `the database holds schema version ${this.mismatchFound}`;
+    }
   }
 
   /** A fenced call with no usable claim touches no row and leaves the outage state alone. */
@@ -1565,7 +1776,7 @@ export class PostgresBackend implements DataBackend {
     if (this.schemaMismatch || !this.provisioned) {
       const reason = this.schemaMismatch ? 'schema-mismatch' : 'not-provisioned';
       console.error(`[PostgresBackend] Refused restore for guild ${guildId}: ${this.schemaMismatch
-        ? `the database holds schema version ${this.mismatchFound}`
+        ? this.mismatchText()
         : 'the database is not provisioned yet'}`);
       return { ok: false, reason };
     }
