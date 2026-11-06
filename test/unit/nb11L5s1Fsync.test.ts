@@ -17,7 +17,7 @@ describe('fsyncDataDirs on this platform', () => {
       handles.push(handle);
       return handle;
     }) as any);
-    await fsyncDataDirs();
+    expect(await fsyncDataDirs()).toEqual({ failed: false });
     if (process.platform === 'win32') {
       expect(handles).toEqual([]);
       return;

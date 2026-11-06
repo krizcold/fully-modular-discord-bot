@@ -81,6 +81,16 @@ describe('the restore verb', () => {
     const { client } = fakeClient({ status: 200, ok: true, body: { success: true, retiredAt: 5000 } });
     await run(client, [G]);
     expect(stdout.join('')).toBe(`restored server ${G} from the entry deleted at ${new Date(5000).toISOString()} (retiredAt 5000, reason )\n`);
+    expect(stderr.join('')).toBe('');
+    expect(exits).toEqual([EXIT_OK]);
+  });
+
+  it('E1: a warning in the answer goes to stderr after the restored line, and the exit is success', async () => {
+    const W = "The disk did not confirm the move of this server's folder (EIO), so a power cut can undo the restore. Check the disk.";
+    const { client } = fakeClient({ status: 200, ok: true, body: { success: true, retiredAt: 5000, reason: 'r', warning: W } });
+    await run(client, [G]);
+    expect(stdout.join('')).toBe(`restored server ${G} from the entry deleted at ${new Date(5000).toISOString()} (retiredAt 5000, reason r)\n`);
+    expect(stderr.join('')).toBe(`smdb: warning: ${W}\n`);
     expect(exits).toEqual([EXIT_OK]);
   });
 });

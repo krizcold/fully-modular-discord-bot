@@ -399,7 +399,9 @@ function ConfigPanel() {
       setSaving(true);
       const res = await api.post('/config/data/delete-guild', { guildId });
       if (res.success) {
-        setSuccess(res.pending ? `Delete accepted: ${res.message}` : 'All data for this guild was deleted');
+        if (res.pending) setSuccess(`Delete accepted: ${res.message}`);
+        else if (res.warning) showToast(`All data for this guild was deleted. ${res.warning}`, 'warning', { sticky: true });
+        else setSuccess('All data for this guild was deleted');
         await refreshAfterDelete();
       } else {
         setError(res.error || 'Failed to delete guild data');

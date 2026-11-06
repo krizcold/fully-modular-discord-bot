@@ -31,7 +31,7 @@ import { backupMatch, isBackupFilename, listBackups, stampDate, writeBackup, typ
 import { childQueuedError, readServedGlobal, readServedGuild, withTargetLock, type ServedRead } from '../utils/servedRead';
 import type { BotManager } from '../botManager';
 import { hopFailure, noAnswerText } from './hopFailure';
-import { graveyardRouteRefusal } from './graveyard';
+import { graveyardRouteRefusal, moveUnconfirmedText } from './graveyard';
 import { shaOfRaw, CHANGED_SINCE_OPEN_TEXT } from '../../bot/internalSetup/utils/ipcDataHandler';
 import { planGuildChange, remoteNoAnswerText, sendGuildChange, type Plan } from '../utils/guildRequests';
 
@@ -1064,7 +1064,7 @@ export function createConfigRoutes(botManager: BotManager): Router {
         filename: '',
         op: 'delete-namespace'
       });
-      sendHopReply(res, reply ?? { ok: false, code: 'bot-down' }, {}, 'guild-delete');
+      sendHopReply(res, reply ?? { ok: false, code: 'bot-down' }, reply?.ok && typeof reply.moveUnconfirmed === 'string' ? { warning: moveUnconfirmedText(reply.moveUnconfirmed, 'delete') } : {}, 'guild-delete');
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       res.status(500).json({

@@ -13,7 +13,7 @@ import { fsyncDataDirs } from '../../src/bot/internalSetup/utils/dataBackends/fi
 import { DATA_ROOT } from '../../src/utils/dataRoot';
 
 // NB11 (sheets/NB11.md): after a move between /data and /data/_graveyard, both folders are fsynced so the rename
-// survives a power cut. A folder that cannot be opened or synced is passed over: the fsync is best-effort.
+// survives a power cut. Only an unsupported operation is passed over; any other error is answered.
 
 afterEach(() => vi.restoreAllMocks());
 afterAll(() => {
@@ -53,7 +53,7 @@ describe('fsyncDataDirs on Linux', () => {
 
   it('closes a folder whose sync fails and still syncs the next one', async () => {
     const handles = fakeOpen(dir => dir === path.resolve(DATA_ROOT));
-    await expect(fsyncDataDirs()).resolves.toBeUndefined();
+    await expect(fsyncDataDirs()).resolves.toEqual({ failed: false });
     expect(handles).toHaveLength(2);
     expect(handles[0].close).toHaveBeenCalledTimes(1);
     expect(handles[1].sync).toHaveBeenCalledTimes(1);

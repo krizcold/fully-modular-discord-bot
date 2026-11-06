@@ -71,6 +71,8 @@ export interface DataWriteReply {
   retiredAt?: number;
   reason?: string;
   moved?: number;
+  /** A JSON restore or delete whose folder move the disk did not confirm: the errno of the failed directory fsync. */
+  moveUnconfirmed?: string;
 }
 
 export interface DataReadReply {
@@ -297,7 +299,7 @@ async function graveyardOp(req: GuildDataWriteRequest, receivedAt: bigint): Prom
       // An evicted set: its read starts now, so the events it holds replay on the restored data; the answer does not wait on it.
       if (resolveDataBackend() === 'postgres' && getWorkingSet() && !getWorkingSet()!.has(guildId)) await awaitGuildDataReady(guildId);
       if (!restored.ok && deposedHolder() && !isUnconfirmedReply(restored)) return { ok: false, code: 'held-elsewhere', error: deposedText(deposedHolder()!) };
-      return restored.ok ? { ok: true, retiredAt: restored.retiredAt, reason: restored.reason, ...(restored.moved === undefined ? {} : { moved: restored.moved }) } : restored;
+      return restored.ok ? { ok: true, retiredAt: restored.retiredAt, reason: restored.reason, ...(restored.moved === undefined ? {} : { moved: restored.moved }), ...(restored.moveUnconfirmed === undefined ? {} : { moveUnconfirmed: restored.moveUnconfirmed }) } : restored;
     }
     const deleted = await deleteGuildNamespace(guildId, 'webui-operator-delete', OPERATOR_FLUSH_MS, deadline);
     if (!deleted.ok && deposedHolder() && !isUnconfirmedReply(deleted)) return { ok: false, code: 'held-elsewhere', error: deposedText(deposedHolder()!) };

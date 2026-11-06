@@ -218,6 +218,7 @@ const HANDLERS: Record<string, Handler> = {
       if (answer?.success !== true || typeof answer.retiredAt !== 'number') return;
       process.stdout.write(`restored server ${guildId} from the entry deleted at ${new Date(answer.retiredAt).toISOString()} (retiredAt ${answer.retiredAt}, reason ${String(answer.reason ?? '')})\n`);
       if (typeof answer.moved === 'number') process.stdout.write(`${answer.moved} row(s) moved\n`);
+      if (typeof (answer as { warning?: unknown }).warning === 'string') process.stderr.write(`smdb: warning: ${(answer as { warning: string }).warning}\n`);
     });
   },
 

@@ -697,7 +697,7 @@ describe('raw writes under a held guild (decision 1)', () => {
 });
 
 describe.skipIf(process.platform === 'win32')('the directories are fsynced before the answer', () => {
-  it('for a restore and for a delete each directory is synced once before the answer, and a sync that throws still answers ok', async () => {
+  it('for a restore and for a delete each directory is synced once before the answer, and a sync that throws still answers ok, naming the unconfirmed move', async () => {
     const synced = new Map<string, number>();
     let hold: ReturnType<typeof deferred<void>> | null = null;
     const open = fs.promises.open.bind(fs.promises);
@@ -717,8 +717,8 @@ describe.skipIf(process.platform === 'win32')('the directories are fsynced befor
     const g = freshGuild();
     bury(g, 1000);
     const runs: [string, () => Promise<unknown>, unknown][] = [
-      ['restore', () => restoreGuildFromGraveyard(g, 1000), { ok: true, retiredAt: 1000, reason: 'webui-operator-delete' }],
-      ['delete', () => deleteGuildNamespace(g, 'test', 5000), { ok: true }],
+      ['restore', () => restoreGuildFromGraveyard(g, 1000), { ok: true, retiredAt: 1000, reason: 'webui-operator-delete', moveUnconfirmed: 'EIO' }],
+      ['delete', () => deleteGuildNamespace(g, 'test', 5000), { ok: true, moveUnconfirmed: 'EIO' }],
     ];
     for (const [, run, expected] of runs) {
       synced.clear();
@@ -731,7 +731,7 @@ describe.skipIf(process.platform === 'win32')('the directories are fsynced befor
       expect(answered).toBe(false);
       hold = null;
       held.resolve();
-      expect(await answer).toMatchObject(expected as object);
+      expect(await answer).toEqual(expected);
       expect(synced).toEqual(once);
     }
     expect(fs.existsSync(dataPath(g))).toBe(false);

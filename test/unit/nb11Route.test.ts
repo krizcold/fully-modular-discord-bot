@@ -244,6 +244,20 @@ describe('the delete through config.ts', () => {
     }
   });
 
+  it.each([
+    [{ ok: true, moveUnconfirmed: 'EIO' }, { success: true, warning: "The disk did not confirm the move of this server's folder (EIO), so a power cut can undo the delete. Check the disk." }],
+    [{ ok: true }, { success: true }],
+  ] as const)('D2: an ok reply %j answers 200 with %j', async (reply, body) => {
+    const app = await deleteApp(reply);
+    try {
+      const res = await call(app.url, 'POST', '/api/config/data/delete-guild', { guildId: G });
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual(body);
+    } finally {
+      await app.close();
+    }
+  });
+
   it('a deposed flush answers 503 with the text that nothing was removed', async () => {
     const error = "another bot process now serves this server's data; nothing was removed";
     const app = await deleteApp({ ok: false, code: 'not-owner', error });

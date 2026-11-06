@@ -47,6 +47,7 @@ import {
   flushAll as flushAllFiles,
   failReplacedTriesAtExit,
   forgetDurableFiles,
+  forgetGuildDurableFiles,
   fileTicketState,
   queuedFileWrites,
   unconfirmedFiles,
@@ -1592,10 +1593,10 @@ export const DELETE_TEXTS = {
 };
 
 export type GraveyardReply =
-  | { ok: true; retiredAt: number; reason: string; moved?: number }
+  | { ok: true; retiredAt: number; reason: string; moved?: number; moveUnconfirmed?: string }
   | { ok: false; code: 'invalid' | 'backend-unavailable' | 'not-owner' | 'frozen' | 'io-error'; error?: string };
 
-export type DeleteReply = { ok: true } | { ok: false; code: 'invalid' | 'backend-unavailable' | 'not-owner' | 'io-error'; error: string };
+export type DeleteReply = { ok: true; moveUnconfirmed?: string } | { ok: false; code: 'invalid' | 'backend-unavailable' | 'not-owner' | 'io-error'; error: string };
 
 const errorMessage = (error: unknown): string => (error instanceof Error ? error.message : String(error));
 
@@ -1714,8 +1715,12 @@ async function retireFiles(guildId: string, reason: string, deadline: bigint): P
     if (stop) return stopAnswer(stop, 'delete');
     return { ok: false, code: 'io-error', error: DELETE_TEXTS.failed };
   }
-  await fsyncDataDirs();
-  return { ok: true };
+  const synced = await fsyncDataDirs();
+  if (synced.failed) {
+    forgetGuildDurableFiles(guildId);
+    console.error(`[DataManager] Guild ${guildId} moved to graveyard, but the disk did not confirm the sync of ${synced.dir} (${synced.code}), so a power cut can bring its folder back live`);
+  }
+  return synced.failed ? { ok: true, moveUnconfirmed: synced.code } : { ok: true };
 }
 
 /**
@@ -1826,7 +1831,7 @@ async function restoreFiles(guildId: string, retiredAt: number | undefined, dead
   replayRestoreEvents(guildId);
 
   if (failure || !outcome) return { ok: false, code: 'io-error', error: RESTORE_TEXTS.error(errorMessage(failure?.error)) };
-  if (outcome.ok) return { ok: true, retiredAt: outcome.retiredAt, reason: outcome.reason };
+  if (outcome.ok) return { ok: true, retiredAt: outcome.retiredAt, reason: outcome.reason, ...(outcome.moveUnconfirmed === undefined ? {} : { moveUnconfirmed: outcome.moveUnconfirmed }) };
   switch (outcome.why) {
     case 'no-entry': return { ok: false, code: 'invalid', error: RESTORE_TEXTS.noEntry };
     case 'live': return { ok: false, code: 'invalid', error: RESTORE_TEXTS.live(outcome.retiredAt) };

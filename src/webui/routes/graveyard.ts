@@ -19,6 +19,11 @@ const NO_ANSWER_CAUSE: Record<string, string> = {
 
 export const RESTORE_MINUTE = "Within a minute, if it was restored, the server's data is back and its entry is gone from `smdb graveyard list`; if not, the entry is still listed, unless it had passed the graveyard's keep time and the graveyard sweep removed it, data and all.";
 
+/** The warning of a restore or a delete whose folder move the disk did not confirm. */
+export function moveUnconfirmedText(code: string, what: 'restore' | 'delete'): string {
+  return `The disk did not confirm the move of this server's folder (${code}), so a power cut can undo the ${what}. Check the disk.`;
+}
+
 /** The web UI's own refusal of a restore or a server's data delete while the bot starts or stops: hopFailure's words are a save's. */
 export function graveyardRouteRefusal(code: unknown, detail: string | undefined, what: 'restore' | 'guild-delete'): string | null {
   const nothing = what === 'restore' ? 'nothing was restored' : 'nothing was removed';
@@ -127,6 +132,7 @@ export function createGraveyardRoutes(botManager: BotManager): Router {
           retiredAt: reply.retiredAt,
           reason: reply.reason,
           ...(typeof reply.moved === 'number' ? { moved: reply.moved } : {}),
+          ...(typeof reply.moveUnconfirmed === 'string' ? { warning: moveUnconfirmedText(reply.moveUnconfirmed, 'restore') } : {}),
           ...by,
         });
         return;

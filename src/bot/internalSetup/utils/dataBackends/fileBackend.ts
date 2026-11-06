@@ -195,6 +195,12 @@ export function forgetDurableFiles(): void {
   durableFiles.clear();
 }
 
+/** Forgets the durable names under /data/{guildId}: its folder moved and the move may not be on disk. */
+export function forgetGuildDurableFiles(guildId: string): void {
+  const under = underGuild(guildId);
+  for (const p of [...durableFiles.keys()]) if (under(p)) durableFiles.delete(p);
+}
+
 const failedRangeOf = (ticket: FileTicket): FailedRange | undefined =>
   (ticket.record.failed ?? []).find(range => ticket.seq >= range.from && ticket.seq <= range.through);
 
@@ -801,15 +807,36 @@ export function guildFailingWrite(guildId: string): { file: string; code: string
   return null;
 }
 
-/** Best-effort fsync of /data and /data/_graveyard on POSIX, so a rename between them survives a power cut. */
-export async function fsyncDataDirs(): Promise<void> {
-  if (IS_WINDOWS) return;
+export type DataDirsSync = { failed: false } | { failed: true; dir: string; code: string };
+
+/**
+ * fsyncs /data and /data/_graveyard on POSIX, so a rename between them survives a power cut. Only an unsupported
+ * operation is passed over, as in syncDirectoryChain; any other error, a missing folder included, is a failure. Both
+ * folders are tried; the first failure is answered.
+ */
+export async function fsyncDataDirs(): Promise<DataDirsSync> {
+  if (IS_WINDOWS) return { failed: false };
+  let first: DataDirsSync = { failed: false };
   for (const dir of [BASE_DATA_DIR, path.join(BASE_DATA_DIR, GRAVEYARD_DIR)]) {
+    let code: string | null = null;
+    let dh: fs.promises.FileHandle | null = null;
     try {
-      const dh = await fs.promises.open(dir, 'r');
-      try { await dh.sync(); } finally { await dh.close(); }
-    } catch { /* directory fsync is best-effort */ }
+      dh = await fs.promises.open(dir, 'r');
+    } catch (error) {
+      if (!SKIPPED_DIR_OPEN.has(errnoOf(error))) code = errnoOf(error);
+    }
+    if (dh) {
+      try {
+        await dh.sync();
+      } catch (error) {
+        if (!SKIPPED_DIR_SYNC.has(errnoOf(error))) code = errnoOf(error);
+      } finally {
+        try { await dh.close(); } catch (error) { console.error(`[Data] ${dir}: the directory could not be closed after its sync (${closeCodeOf(error)}); this does not change whether the sync succeeded`); }
+      }
+    }
+    if (code !== null && !first.failed) first = { failed: true, dir, code };
   }
+  return first;
 }
 
 /** Whether any of these files still has a write queued. */
@@ -1174,7 +1201,7 @@ const NOTE_FILE = '.graveyard.json';
 const SWEEP_PREFIX = '.sweep-';
 
 export type FileRestoreOutcome =
-  | { ok: true; retiredAt: number; reason: string }
+  | { ok: true; retiredAt: number; reason: string; moveUnconfirmed?: string }
   | { ok: false; why: 'no-entry' }
   | { ok: false; why: 'live'; retiredAt: number }
   | { ok: false; why: 'stopped'; stop: RestoreStop }
@@ -1285,9 +1312,14 @@ async function restoreGuildDir(guildId: string, retiredAt: number | undefined, h
     }
   }
   hooks.progress.renamed = true;
-  await fsyncDataDirs();
-  console.warn(`[DataManager] Guild ${guildId} restored from graveyard entry ${entry.name}`);
-  return { ok: true, retiredAt: entry.retiredAt, reason };
+  const synced = await fsyncDataDirs();
+  if (synced.failed) {
+    forgetGuildDurableFiles(guildId);
+    console.error(`[DataManager] Guild ${guildId} restored from graveyard entry ${entry.name}, but the disk did not confirm the sync of ${synced.dir} (${synced.code}), so a power cut can put the folder back in the graveyard`);
+  } else {
+    console.warn(`[DataManager] Guild ${guildId} restored from graveyard entry ${entry.name}`);
+  }
+  return { ok: true, retiredAt: entry.retiredAt, reason, ...(synced.failed ? { moveUnconfirmed: synced.code } : {}) };
 }
 
 /**
