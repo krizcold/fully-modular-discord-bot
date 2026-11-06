@@ -48,6 +48,7 @@ import { cancelQueued, queuedFilePaths } from '../../src/bot/internalSetup/utils
 import { dataPath } from '../../src/utils/dataRoot';
 import { failFlushes } from '../helpers/configRig';
 import { AUDIT, clearGlobal, gate, JOURNAL, jsonOf, linesOf, logged, paidSub, PREMIUM, quiet, rawOf, settleQueue, state, tick, writePremium } from './nb10PremiumRig';
+import { stubAppendHandles } from '../helpers/fileHandleStub';
 
 const role = process.env.BOT_PROCESS_ROLE;
 const later = new Date(Date.now() + 90 * 86_400_000).toISOString();
@@ -254,19 +255,16 @@ describe('NB10 test 41, further cases', () => {
   it('(vii) an append cut short by ENOSPC, then its retry: no loss is logged, and the next replay applies each event once', async () => {
     fs.writeFileSync(PREMIUM, '{ broken');
     const pm = newProcess();
-    const real = fs.promises.appendFile.bind(fs.promises);
     let cut = false;
-    vi.spyOn(fs.promises, 'appendFile').mockImplementation((async (p: any, data: any, options?: any) => {
-      if (String(p) === JOURNAL && !cut) {
-        cut = true;
-        const text = String(data);
-        const lines = text.split('\n');
-        expect(lines.filter(Boolean)).toHaveLength(2);
-        await real(p, `${lines[0]}\n${lines[1].slice(0, Math.floor(lines[1].length / 2))}`, options);
-        throw Object.assign(new Error('ENOSPC: no space left on device, write'), { code: 'ENOSPC' });
-      }
-      return real(p, data, options);
-    }) as typeof fs.promises.appendFile);
+    const stub = stubAppendHandles();
+    // The write of the journal, once, passes line 0 with its newline and half of line 1 and returns that count.
+    stub.onWrite(JOURNAL, text => {
+      if (cut) return undefined;
+      cut = true;
+      const lines = text.split('\n');
+      expect(lines.filter(Boolean)).toHaveLength(2);
+      return Buffer.byteLength(`${lines[0]}\n${lines[1].slice(0, Math.floor(lines[1].length / 2))}`);
+    });
     getPaymentRegistry().emitEvent(expired('d1', 'g1') as any);
     getPaymentRegistry().emitEvent(renewed('dm1', 'g2') as any);
     await vi.waitFor(() => expect(cut).toBe(true), { timeout: 5000, interval: 10 });
@@ -275,7 +273,7 @@ describe('NB10 test 41, further cases', () => {
     spies.error.mockClear();
     pm.logLossesAtExit();
     expect(logged(spies.error).filter(l => l.includes('lost'))).toEqual([]);
-    vi.mocked(fs.promises.appendFile).mockRestore();
+    stub.restore();
 
     writePremium(subs());
     spies.warn.mockClear();

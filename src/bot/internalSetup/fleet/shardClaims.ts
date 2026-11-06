@@ -730,15 +730,15 @@ export function releaseLines(asked: Pair[], reserved: Pair[], rows: Array<{ shar
 }
 
 /**
- * Decision 12's failure lines: a COMMIT sent with no answer (or answered by FATAL or PANIC, which ends the connection),
+ * Decision 12's failure lines: a COMMIT sent with no answer (or answered in a way that ends the session: commitMayHaveLanded),
  * a server error (a rolled-back transaction), no connection, or a connection that failed before its COMMIT was sent.
  */
 export function releaseFailureLine(asked: Pair[], failure: FailureClass, sent: boolean, connected = false): string {
   if (asked.length === 0) return `[Shards] The release did not complete (${describeFailureClass(failure)}); any shard row still naming this process frees once its claim expires`;
   const ids = `shards ${idList(asked.map(p => p.shardId))}`;
   const tail = 'any machine with room may take them once their claims expire';
-  const unanswered = failure.kind === 'timeout' || failure.kind === 'unreachable' || (failure.kind === 'error' && failure.severity !== undefined);
-  if (sent && unanswered) return `[Shards] The release of ${ids} got no answer within 2 s (${describeFailureClass(failure)}); it may still have applied, and otherwise ${tail}`;
+  if (sent && failure.kind === 'error' && failure.severity !== undefined) return `[Shards] The release of ${ids} was answered by an error that may follow a landed COMMIT (${describeFailureClass(failure)}); it may still have applied, and otherwise ${tail}`;
+  if (sent && (failure.kind === 'timeout' || failure.kind === 'unreachable')) return `[Shards] The release of ${ids} got no answer within 2 s (${describeFailureClass(failure)}); it may still have applied, and otherwise ${tail}`;
   if (failure.kind === 'error') return `[Shards] Could not release ${ids} (SQLSTATE ${failure.code} ${failure.message}); ${tail}`;
   if (failure.kind === 'refused') return `[Shards] Could not release ${ids} (the database refused the login); ${tail}`;
   if (!sent && !connected) return `[Shards] Could not reach the database to release ${ids} (${describeFailureClass(failure)}); ${tail}`;

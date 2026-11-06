@@ -83,9 +83,23 @@ describe('the release failure line by what reached the server (NB4-R3-DL-2)', ()
     expect(classifyFailure(Object.assign(new Error('lock'), { code: '55P03', severity: 'ERROR' }))).toEqual({ kind: 'error', code: '55P03', message: 'lock' });
   });
 
-  it('a COMMIT answered by FATAL may still have applied', () => {
+  it('a COMMIT answered by FATAL was answered by an error and may still have applied', () => {
     expect(releaseFailureLine(asked, classifyFailure(fatal()), true, true))
-      .toBe('[Shards] The release of shards 0, 1 got no answer within 2 s (error: SQLSTATE 57P01 terminating connection due to administrator command); it may still have applied, and otherwise any machine with room may take them once their claims expire');
+      .toBe('[Shards] The release of shards 0, 1 was answered by an error that may follow a landed COMMIT (error: SQLSTATE 57P01 terminating connection due to administrator command); it may still have applied, and otherwise any machine with room may take them once their claims expire');
+  });
+
+  it('a COMMIT sent with no answer keeps the no-answer line', () => {
+    expect(releaseFailureLine(asked, { kind: 'timeout' }, true, true))
+      .toBe('[Shards] The release of shards 0, 1 got no answer within 2 s (timeout); it may still have applied, and otherwise any machine with room may take them once their claims expire');
+  });
+
+  it('a COMMIT answered by 57P01 with a localized severity may still have applied; 23505 at ERROR did not', () => {
+    const localized = Object.assign(new Error('terminating connection due to administrator command'), { code: '57P01', severity: 'ВАЖНО' });
+    expect(releaseFailureLine(asked, classifyFailure(localized), true, true))
+      .toBe('[Shards] The release of shards 0, 1 was answered by an error that may follow a landed COMMIT (error: SQLSTATE 57P01 terminating connection due to administrator command); it may still have applied, and otherwise any machine with room may take them once their claims expire');
+    const refused = Object.assign(new Error('duplicate key value'), { code: '23505', severity: 'ERROR' });
+    expect(releaseFailureLine(asked, classifyFailure(refused), true, true))
+      .toBe('[Shards] Could not release shards 0, 1 (SQLSTATE 23505 duplicate key value); any machine with room may take them once their claims expire');
   });
 
   it('a COMMIT answered by ERROR is the server error line', () => {
@@ -109,7 +123,7 @@ describe('the release failure line by what reached the server (NB4-R3-DL-2)', ()
       throw new ClaimFailure(classifyFailure(fatal()), fatal());
     };
     await r.claims.finishStop();
-    expect(r.lines()).toContain('[Shards] The release of shards 0, 1 got no answer within 2 s (error: SQLSTATE 57P01 terminating connection due to administrator command); it may still have applied, and otherwise any machine with room may take them once their claims expire');
+    expect(r.lines()).toContain('[Shards] The release of shards 0, 1 was answered by an error that may follow a landed COMMIT (error: SQLSTATE 57P01 terminating connection due to administrator command); it may still have applied, and otherwise any machine with room may take them once their claims expire');
   });
 
   it('finishStop logs the not-applied line for a bound that fires during the release statement', async () => {

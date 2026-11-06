@@ -8,26 +8,16 @@ vi.mock('../../src/bot/internalSetup/utils/payment/paymentRegistry', async orig 
 import { dataPath } from '../../src/utils/dataRoot';
 import { appendData, flushAll } from '../../src/bot/internalSetup/utils/dataManager';
 import { configureWriterLock, releaseWriterLock, takeWriterLock, writerLockDepth, writerLockPath } from '../../src/bot/internalSetup/utils/writerLock';
+import { stubAppendHandles } from '../helpers/fileHandleStub';
 
-// NB10 test 49: an append starts on its own line, reading the file's last byte only while this process does not know it.
+// NB10 test 49, under NB13 decision 8: an append starts on its own line; the guard reads the file's last byte on every try.
 
 let n = 0;
 const fresh = () => `tail${++n}.jsonl`;
 const opts = { scope: 'global' as const, category: 'nb10tail' };
 const file = (name: string) => dataPath('global', 'nb10tail', name);
-const realOpen = fs.promises.open.bind(fs.promises);
 const L = (i: number) => JSON.stringify({ L: i, timestamp: `2026-10-29T00:00:0${i}.000Z`, action: 'nb10.tail' });
 const linesOf = (name: string) => fs.readFileSync(file(name), 'utf8').split('\n').filter(Boolean).map(l => { try { return JSON.parse(l); } catch { return null; } });
-
-/** Counts the opens for reading of one path: the last-byte check is the only one. */
-function byteReads(target: string): { count: number } {
-  const seen = { count: 0 };
-  vi.spyOn(fs.promises, 'open').mockImplementation(((p: fs.PathLike, flags?: any, ...rest: any[]) => {
-    if (String(p) === target && flags === 'r') seen.count++;
-    return (realOpen as any)(p, flags, ...rest);
-  }) as typeof fs.promises.open);
-  return seen;
-}
 
 beforeEach(() => {
   while (writerLockDepth() > 0) releaseWriterLock();
@@ -70,17 +60,13 @@ describe('an append after a line cut short', () => {
     vi.spyOn(console, 'error').mockImplementation(() => {});
     const name = fresh();
     fs.writeFileSync(file(name), '{"cut":');
-    const realAppend = fs.promises.appendFile.bind(fs.promises);
     let failed = false;
-    vi.spyOn(fs.promises, 'appendFile').mockImplementation((async (p: any, data: any, ...rest: any[]) => {
-      if (String(p) === file(name) && !failed) {
-        failed = true;
-        const text = String(data);
-        await realAppend(p, text.slice(0, Math.floor(text.length / 2)), ...rest);
-        throw Object.assign(new Error('EIO: i/o error'), { code: 'EIO' });
-      }
-      return realAppend(p, data, ...rest);
-    }) as typeof fs.promises.appendFile);
+    // The write passes half its bytes and returns that count.
+    stubAppendHandles().onWrite(file(name), text => {
+      if (failed) return undefined;
+      failed = true;
+      return Math.floor(Buffer.byteLength(text) / 2);
+    });
     appendData(name, opts, `${L(1)}\n`);
     await flushAll();
     for (let i = 0; i < 100 && !fs.readFileSync(file(name), 'utf8').endsWith(`${L(1)}\n`); i++) await new Promise(r => setTimeout(r, 50));
@@ -93,22 +79,19 @@ describe('an append after a line cut short', () => {
     expect(linesOf(name).filter(l => l !== null)).toEqual([JSON.parse(L(1)), JSON.parse(L(2))]);
   }, 20_000);
 
-  it('after its own append landed the next reads no byte; after another holder cut a line between two takes it reads one', async () => {
+  it('after another holder cut a line between two takes of the writer lock, the next append starts on its own line', async () => {
     const name = fresh();
     expect(takeWriterLock().kind).toBe('taken');
     appendData(name, opts, `${L(1)}\n`);
     await flushAll();
-    const reads = byteReads(file(name));
     appendData(name, opts, `${L(2)}\n`);
     await flushAll();
-    expect(reads.count).toBe(0);
     releaseWriterLock();
     // A second writer holds the lock, leaves the file ending in a cut line, and releases.
     fs.appendFileSync(file(name), '{"cut":');
     expect(takeWriterLock().kind).toBe('taken');
     appendData(name, opts, `${L(3)}\n`);
     await flushAll();
-    expect(reads.count).toBe(1);
     expect(linesOf(name)).toEqual([JSON.parse(L(1)), JSON.parse(L(2)), null, JSON.parse(L(3))]);
   });
 });

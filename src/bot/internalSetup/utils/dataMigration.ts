@@ -19,7 +19,7 @@ import {
   type DataBackendKind,
 } from '../../../utils/envLoader';
 import { flushAll, queuedFilePaths } from './dataBackends/fileBackend';
-import { isLoginRefused, provisionStoreInTransaction } from './dataBackends/postgresBackend';
+import { commitMayHaveLanded, isLoginRefused, provisionStoreInTransaction } from './dataBackends/postgresBackend';
 import { isGuildDataPath } from './dataManager';
 import { shortLivedClient } from './pgClient';
 import { getNodeId } from '../fleet/nodeIdentity';
@@ -198,6 +198,7 @@ function jobView(journal: MigrationJournal, state: string, stage: MigrationStage
     ...(journal.envSwitched !== undefined ? { envSwitched: journal.envSwitched } : {}),
     ...(journal.leftOut?.length ? { leftOut: journal.leftOut } : {}),
     ...(journal.shadow?.length ? { shadow: journal.shadow } : {}),
+    ...(journal.closedTails?.length ? { closedTails: journal.closedTails } : {}),
     ...(error ? { error } : {}),
   };
 }
@@ -243,6 +244,14 @@ export interface SnapItem {
   filename: string;
   kind: 'doc' | 'append';
   bytes: Buffer;
+  /** A stream whose bytes did not end in a newline: the reader added one, and every hash is taken from those bytes. */
+  closedTail?: boolean;
+}
+
+/** NB13 decision 12: a stream's open tail gets one newline, so the next line appended after the copy starts its own. */
+function closeTail(kind: 'doc' | 'append', bytes: Buffer): { bytes: Buffer; closedTail?: boolean } {
+  if (kind !== 'append' || bytes.length === 0 || bytes[bytes.length - 1] === 0x0a) return { bytes };
+  return { bytes: Buffer.concat([bytes, Buffer.from('\n')]), closedTail: true };
 }
 
 export interface SnapGrave {
@@ -382,9 +391,9 @@ function itemFrom(guildId: string, rel: string, bytes: Buffer, full: string, gra
   }
   const refusal = keyRefusal(pathKeyOf(key.module, key.filename));
   if (refusal) throw new Refusal(`The key ${rel} of ${full}: ${refusal}; nothing was written`);
+  const kind = key.filename.endsWith('.jsonl') ? 'append' : 'doc';
   return {
-    guildId, module: key.module, filename: key.filename, bytes,
-    kind: key.filename.endsWith('.jsonl') ? 'append' : 'doc',
+    guildId, module: key.module, filename: key.filename, kind, ...closeTail(kind, bytes),
     grave: grave !== undefined, ...(grave !== undefined ? { retiredAt: grave } : {}),
   };
 }
@@ -1025,9 +1034,8 @@ export function snapshotFromPgRows(dataRows: any[], appendRows: any[], graveRows
       const winner = canonical[0] ?? rows[0];
       const key = canonicalGuildKey(winner.module, winner.filename);
       paths.push(key.module ? `${key.module}/${key.filename}` : key.filename);
-      const bytes = Buffer.from(winner.text, 'utf8');
       snap.items.push({
-        guildId: scope.guildId, module: key.module, filename: key.filename, kind: winner.kind, bytes,
+        guildId: scope.guildId, module: key.module, filename: key.filename, kind: winner.kind, ...closeTail(winner.kind, Buffer.from(winner.text, 'utf8')),
         grave: scope.retiredAt !== undefined, ...(scope.retiredAt !== undefined ? { retiredAt: scope.retiredAt } : {}),
       });
       for (const other of rows) {
@@ -1145,12 +1153,14 @@ interface Tally {
   leftOut: string[];
   shadowNotes: string[];
   shadowUnits: SourceUnit[];
+  /** Each stream copied with a newline added: "<module>/<filename> of <guild or graveyard entry>". */
+  closedTails: string[];
 }
 
 async function tallySource(read: UnitReader): Promise<Tally> {
   const t: Tally = {
     copied: new Map(), all: new Map(), counts: { documents: 0, appendFiles: 0, graveyardEntries: 0, bytes: 0 },
-    graves: [], guilds: [], leftOut: [], shadowNotes: [], shadowUnits: [],
+    graves: [], guilds: [], leftOut: [], shadowNotes: [], shadowUnits: [], closedTails: [],
   };
   t.leftOut = await read(async (part, unit) => {
     for (const [k, h] of snapshotHashes(part, false)) t.copied.set(k, h);
@@ -1162,6 +1172,10 @@ async function tallySource(read: UnitReader): Promise<Tally> {
     t.counts.bytes += c.bytes;
     t.graves.push(...part.graves);
     t.guilds.push(...part.guilds);
+    for (const item of part.items) {
+      if (!item.closedTail) continue;
+      t.closedTails.push(`${item.module ? `${item.module}/` : ''}${item.filename} of ${item.grave ? `graveyard entry ${item.guildId}-${item.retiredAt}` : `guild ${item.guildId}`}`);
+    }
     if (part.shadow.length > 0) {
       t.shadowUnits.push(unit);
       for (const s of part.shadow) t.shadowNotes.push(`${s.guildId}${s.retiredAt !== undefined ? `-${s.retiredAt}` : ''}: ('${s.module}', '${s.filename}')`);
@@ -1735,8 +1749,8 @@ export class MigrationService {
     } catch (error) {
       if (error instanceof Interrupted) throw error;
       ctx.mainTx = false;
-      // A PANIC or FATAL may follow a commit record already written, and ends the session; one that still answers had a refusal.
-      if (isDatabaseError(error)) {
+      // An answer that ends the session may follow a commit record already written; any other answer is a refusal when the session still answers.
+      if (isDatabaseError(error) && !commitMayHaveLanded(error)) {
         let answered: { value: unknown } | undefined | 'failed';
         try {
           answered = await within(session.query('SELECT 1'), this.closeBound());
@@ -1864,7 +1878,10 @@ export class MigrationService {
     const counts = tally.counts;
 
     // S5: the copy, fed guild by guild.
-    stage('copying', { counts, ...(to === 'postgres' ? { destination: address } : {}), leftOut: tally.leftOut });
+    stage('copying', { counts, ...(to === 'postgres' ? { destination: address } : {}), leftOut: tally.leftOut, closedTails: tally.closedTails });
+    for (const tail of tally.closedTails) {
+      console.warn(`[Migration] The stream ${tail} did not end in a newline; it was copied with one added, so its last line stays a line of its own`);
+    }
     await this.fault('S5');
     if (to === 'postgres') {
       await main.query('BEGIN');

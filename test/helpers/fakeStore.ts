@@ -2,6 +2,7 @@ import type {
   DataBackend,
   DocKey,
   FenceToken,
+  FlushFate,
   FlushOutcome,
   GuildFlushBatch,
   HydrationOutcome,
@@ -10,7 +11,10 @@ import type {
 } from '../../src/bot/internalSetup/utils/dataBackends/backend';
 
 // BT-1's scripted DataBackend, shared by the write-ticket and write-ledger tests.
-export type FlushMode = 'commit' | 'unavailable' | 'deposed' | 'landed-unavailable';
+// NB13: 'landed-unanswered' commits and answers as if the COMMIT's answer was lost, 'lost-unanswered' stores nothing
+// and answers the same, 'commit-hang' sets commitSent and answers only when released (then as 'commit').
+export type FlushMode = 'commit' | 'unavailable' | 'deposed' | 'landed-unavailable' | 'landed-unanswered' | 'lost-unanswered' | 'commit-hang';
+export type CheckMode = 'answer' | 'unknown';
 export type HydrateMode = 'ok' | 'deposed' | 'unavailable' | 'held';
 
 export interface FlushCall {
@@ -47,6 +51,23 @@ export class FakeStore implements DataBackend {
   /** How a hydration answers (R1-J2): it reads the store, is deposed, is unavailable, or waits for releaseHydrations. */
   hydrateMode: HydrateMode = 'ok';
   hydrationsSent = 0;
+  /** Each guild's last committed flush id, as guild_ownership.last_flush holds it. */
+  readonly marks = new Map<string, string>();
+  /** Each guild's owner claim, as guild_ownership.claim holds it: raised by a commit and by takeOver. */
+  readonly ownerClaims = new Map<string, number>();
+  /** Guilds another holder took: a flush under a lower claim is deposed. */
+  private readonly taken = new Set<string>();
+  checkMode: CheckMode = 'answer';
+  checkDetail = 'the check failed';
+  checkCode: string | undefined = undefined;
+  /** How long resolveFlush holds its answer (fake timers advance it). */
+  checkDelayMs = 0;
+  checksSent = 0;
+  /** The code an 'unavailable' answer carries. */
+  failCode: string | null = null;
+  /** 'move': retireGuild moves the guild's rows into retiredRows, as the real retire moves them to the graveyard. */
+  retireMode: 'unavailable' | 'move' = 'unavailable';
+  readonly retiredRows = new Map<string, string>();
   private readonly wire: Array<() => void> = [];
   private readonly hydrations: Array<(mode: HydrateMode) => void> = [];
 
@@ -78,8 +99,17 @@ export class FakeStore implements DataBackend {
     const call: FlushCall = { token, batch: structuredClone(batch), builtAt: this.buildIndex(token) };
     this.flushesSent += 1;
     if (this.holding) await new Promise<void>(resolve => { this.wire.push(resolve); });
-    if (this.mode === 'unavailable') return { ok: false, reason: 'unavailable' };
+    const owner = this.ownerClaims.get(guildId);
+    if (this.taken.has(guildId) && owner !== undefined && (token.claim ?? 0) < owner) {
+      return { ok: false, reason: 'deposed', currentOwner: { nodeId: 'newer-owner', claim: owner } };
+    }
+    if (this.mode === 'commit-hang') {
+      batch.commitSent = true;
+      await new Promise<void>(resolve => { this.wire.push(resolve); });
+    }
+    if (this.mode === 'unavailable') return { ok: false, reason: 'unavailable', ...(this.failCode ? { code: this.failCode } : {}) };
     if (this.mode === 'deposed') return { ok: false, reason: 'deposed', currentOwner: { nodeId: 'newer-owner', claim: 9 } };
+    if (this.mode === 'lost-unanswered') return { ok: false, reason: 'unavailable', detail: 'Connection terminated unexpectedly', commitUnanswered: true };
     for (const { key, doc } of batch.upserts) this.docs.set(rowKey(guildId, key), doc);
     for (const key of batch.deletes) {
       this.docs.delete(rowKey(guildId, key));
@@ -90,7 +120,29 @@ export class FakeStore implements DataBackend {
     }
     if (this.mode === 'landed-unavailable') return { ok: false, reason: 'unavailable' };
     this.commits.push(call);
+    if (batch.flushId) this.marks.set(guildId, batch.flushId);
+    if ((token.claim ?? 0) > (this.ownerClaims.get(guildId) ?? 0)) this.ownerClaims.set(guildId, token.claim ?? 0);
+    if (this.mode === 'landed-unanswered') return { ok: false, reason: 'unavailable', detail: 'Connection terminated unexpectedly', commitUnanswered: true };
     return { ok: true };
+  }
+
+  /** NB13 decision 4 over the scripted rows: the mark, then the owner claim. */
+  async resolveFlush(guildId: string, flushId: string, _sentClaim: number, token: FenceToken): Promise<FlushFate> {
+    this.checksSent += 1;
+    if (this.checkDelayMs > 0) await new Promise<void>(resolve => { setTimeout(resolve, this.checkDelayMs); });
+    if (this.checkMode === 'unknown') return { fate: 'unknown', detail: this.checkDetail, ...(this.checkCode ? { code: this.checkCode } : {}) };
+    const claim = this.ownerClaims.get(guildId);
+    const marked = this.marks.get(guildId) === flushId;
+    if (claim !== undefined && claim > (token.claim ?? 0)) return { fate: 'deposed', landed: marked ? true : null, currentOwner: { nodeId: 'newer-owner', claim } };
+    if (marked) return { fate: 'landed' };
+    return { fate: 'not-landed' };
+  }
+
+  /** Another holder takes the guild: its claim above every token's, and with ownFlush a mark of its own. */
+  takeOver(guildId: string, ownFlush: boolean): void {
+    this.ownerClaims.set(guildId, 1_000_000_000);
+    this.taken.add(guildId);
+    if (ownFlush) this.marks.set(guildId, `new-holder-${guildId}`);
   }
 
   /** Every held hydration answers by mode from now on. */
@@ -113,8 +165,18 @@ export class FakeStore implements DataBackend {
     return this.docs.get(`${guildId}|m/${filename}`);
   }
 
-  async retireGuild(..._args: unknown[]): Promise<RetireOutcome> {
-    return { ok: false, reason: 'unavailable' };
+  async retireGuild(guildId: string, ..._rest: unknown[]): Promise<RetireOutcome> {
+    if (this.retireMode !== 'move') return { ok: false, reason: 'unavailable' };
+    let moved = 0;
+    for (const rows of [this.docs, this.streams]) {
+      for (const [row, value] of [...rows]) {
+        if (!row.startsWith(`${guildId}|`)) continue;
+        this.retiredRows.set(row, value);
+        rows.delete(row);
+        moved += 1;
+      }
+    }
+    return { ok: true, moved };
   }
 
   async restoreGuild(..._args: unknown[]): Promise<RestoreOutcome> {

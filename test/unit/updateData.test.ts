@@ -140,10 +140,8 @@ describe('update(fn) on each route and state', () => {
 
   it.each(ROUTES)('%s, an append still queued: refused io and fn never runs', async name => {
     const r = await routeOf(name);
-    const line = '{"line":1}\n';
-    if (r.ws) expect(r.ws.append(r.guildId, 'm', 'doc.json', line)).toBe('accepted');
-    else if (r.name === 'file guild') enqueueAppend(r.file, line);
-    else expect(dm.appendData('doc.json', r.options, line)).toBe(true);
+    if (r.ws) expect(r.ws.append(r.guildId, 'm', 'doc.json', '{"line":1}\n')).toBe('accepted');
+    else enqueueAppend(r.file, '{"line":1}\n');
     const { fn } = spyFn();
     expect(update(r, fn)).toEqual({ outcome: 'refused', cause: 'io' });
     expect(fn).not.toHaveBeenCalled();

@@ -74,7 +74,7 @@ describe("decision 9's refusal shard part", () => {
 });
 
 describe("decision 16's drop line", () => {
-  it('names each guild and the count, and adds the may-have-landed clause for a COMMIT with no answer, kept through a later 53300', async () => {
+  it('names each guild and the count, and adds the may-have-landed clause for a COMMIT with no answer, kept through a check that failed with 53300', async () => {
     const store = new FakeStore();
     const ws = new WorkingSetManager(store);
     const g = '999';
@@ -84,9 +84,12 @@ describe("decision 16's drop line", () => {
     let answer: any = { ok: false, reason: 'unavailable', commitUnanswered: true };
     store.flushGuild = (async (...args: Parameters<typeof real>) => { await real(...args); return answer; }) as any;
     await ws.flushGuildNow(g, 50);
-    answer = { ok: false, reason: 'unavailable', code: '53300', detail: 'too many connections' };
-    await ws.flushGuildNow(g, 50);
-    answer = { ok: false, reason: 'deposed' };
+    store.checkMode = 'unknown';
+    store.checkCode = '53300';
+    store.checkDetail = 'too many connections';
+    expect(await ws.flushGuildNow(g, 50)).toBe('pending');
+    store.checkMode = 'answer';
+    store.takeOver(g, true);
     await ws.flushGuildNow(g, 50);
     expect(ws.takeDropLines()).toEqual([`[Shards] 1 unsaved change(s) of 1 guild(s) of shard 0 were dropped: ${g}; guild(s) ${g} had a save whose answer never came, so some of these changes may have landed`]);
     expect(ws.takeDropLines()).toEqual([]);
@@ -100,7 +103,7 @@ describe("decision 16's drop line", () => {
       for (const b of backends.splice(0)) await b.stop();
     });
 
-    async function dropAfter(commitError: Error): Promise<string[]> {
+    async function dropAfter(commitError: Error, afterTake: 'deposed' | 'unavailable'): Promise<string[]> {
       vi.spyOn(console, 'error').mockImplementation(() => {});
       vi.spyOn(console, 'log').mockImplementation(() => {});
       const backend = new PostgresBackend({ url: 'postgres://nobody@127.0.0.1:9/none' });
@@ -108,10 +111,11 @@ describe("decision 16's drop line", () => {
       (backend as unknown as { state: string }).state = 'ready';
       let phase: 'hydrate' | 'commit-fails' | 'taken' = 'hydrate';
       const client = {
-        query: async (sql: string) => {
-          const q = sql.trim();
+        query: async (config: string | { text: string }) => {
+          const q = (typeof config === 'string' ? config : config.text).trim();
           if (/INSERT INTO smdb_data\.guild_ownership AS o/.test(q)) return { rows: [], rowCount: phase === 'taken' ? 0 : 1 };
           if (q === 'COMMIT' && phase === 'commit-fails') throw commitError;
+          if (phase === 'taken' && /^SELECT claim, last_flush[\s\S]*FOR SHARE$/.test(q)) return { rows: [{ claim: '20', last_flush: '00000000-0000-4000-8000-000000000000' }], rowCount: 1 };
           if (/SELECT node_id, claim FROM smdb_data\.guild_ownership/.test(q)) return { rows: [{ node_id: 'node-b', claim: '20' }], rowCount: 1 };
           if (/FROM smdb_data\.shard_claims WHERE shard_count = \$1 AND shard_id = \$2/.test(q)) return { rows: [{ claim: '20', holder_name: 'B', released: false, reserved: false }], rowCount: 1 };
           return { rows: [], rowCount: 0 };
@@ -126,19 +130,19 @@ describe("decision 16's drop line", () => {
       phase = 'commit-fails';
       expect(await ws.flushGuildNow(g, 50)).not.toBe('ok');
       phase = 'taken';
-      expect(await ws.flushGuildNow(g, 50)).toBe('deposed');
+      expect(await ws.flushGuildNow(g, 50)).toBe(afterTake);
       const lines = ws.takeDropLines();
       ws.evict(g);
       return lines;
     }
 
     it.each(['FATAL', 'PANIC'])('a COMMIT ended by a %s, then a deposed retry, carries the may-have-landed clause', async severity => {
-      const lines = await dropAfter(Object.assign(new Error('terminating connection due to administrator command'), { code: '57P01', severity }));
+      const lines = await dropAfter(Object.assign(new Error('terminating connection due to administrator command'), { code: '57P01', severity }), 'unavailable');
       expect(lines).toEqual(['[Shards] 1 unsaved change(s) of 1 guild(s) of shard 3 were dropped: 777; guild(s) 777 had a save whose answer never came, so some of these changes may have landed']);
     });
 
     it('a COMMIT answered with an ERROR, then a deposed retry, has no such clause', async () => {
-      const lines = await dropAfter(Object.assign(new Error('could not serialize access'), { code: '40001', severity: 'ERROR' }));
+      const lines = await dropAfter(Object.assign(new Error('could not serialize access'), { code: '40001', severity: 'ERROR' }), 'deposed');
       expect(lines).toEqual(['[Shards] 1 unsaved change(s) of 1 guild(s) of shard 3 were dropped: 777']);
     });
   });

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { FenceToken, GuildFlushBatch } from '../../src/bot/internalSetup/utils/dataBackends/backend';
-import { PostgresBackend } from '../../src/bot/internalSetup/utils/dataBackends/postgresBackend';
+import { ANSWER_BOUND_MS, PostgresBackend } from '../../src/bot/internalSetup/utils/dataBackends/postgresBackend';
 import { WorkingSetManager } from '../../src/bot/internalSetup/utils/dataBackends/workingSet';
 import { type Answer, bytesOf, scriptedBackend } from '../helpers/scriptedPg';
 
@@ -232,6 +232,32 @@ describe('the flush gate beside the pool', () => {
     expect(rigged.maxOut()).toBeLessThanOrEqual(9);
   });
 
+  it('twelve save checks waiting on their row lock hold at most 8 clients, a flush waits its turn, and askDatabase answers', async () => {
+    quiet();
+    const gates: Array<() => void> = [];
+    const marks = (sent: { sql: string }[]) => sent.filter(s => s.sql.startsWith('SELECT claim, last_flush, node_id'));
+    const rigged = scripted((sql, params) => (sql.startsWith('SELECT claim, last_flush, node_id')
+      ? new Promise(resolve => { gates.push(() => resolve({ rows: [{ claim: String(token.claim), last_flush: `f${String(params?.[0])}`, node_id: token.nodeId }], rowCount: 1 })); })
+      : undefined));
+    poolOfTen(rigged);
+    const checks = Array.from({ length: 12 }, (_, i) => rigged.backend.resolveFlush(String(i + 1), `f${i + 1}`, token.claim!, token));
+    await vi.waitFor(() => expect(gates).toHaveLength(8));
+    const flush = rigged.backend.flushGuild('13', { upserts: docs(1, 10), deletes: [], appends: [] }, token);
+    await new Promise(resolve => setTimeout(resolve, 5));
+    expect(rigged.out()).toBe(8);
+    expect(rigged.sent.filter(s => s.sql.startsWith('BEGIN; SET LOCAL'))).toHaveLength(0);
+    expect(await rigged.backend.askDatabase()).toBe('answers');
+    while (marks(rigged.sent).length < 12 || gates.length > 0) {
+      gates.shift()?.();
+      await new Promise(resolve => setTimeout(resolve, 1));
+      expect(rigged.out()).toBeLessThanOrEqual(8);
+    }
+    expect((await Promise.all(checks)).map(c => c.fate)).toEqual(Array(12).fill('landed'));
+    expect(await flush).toEqual({ ok: true });
+    await vi.waitFor(() => expect((rigged.backend as unknown as { flushesOnWire: number }).flushesOnWire).toBe(0));
+    expect(rigged.maxOut()).toBeLessThanOrEqual(9);
+  });
+
   it('four flushes of 1 MiB started together send four BEGINs before the first COMMIT', async () => {
     quiet();
     const { backend, sent } = scripted();
@@ -314,12 +340,28 @@ describe('a flush of many append buffers', () => {
   }, 60_000);
 });
 
-describe('no client-side bound', () => {
-  it('a COMMIT that answers after 45 s is waited for, the append is sent once, and the next flush stores the line once', async () => {
+describe('the COMMIT answer bound and the save check', () => {
+  it('a COMMIT that answers after 45 s: the 40 s bound ends the wait, the check reads the mark once the transaction ended, and the line is stored once', async () => {
     quiet();
     vi.useFakeTimers();
     let slowCommit = false;
-    const rigged = scripted(sql => (sql === 'COMMIT' && slowCommit ? new Promise(resolve => { setTimeout(() => resolve(undefined), 45_000); }) : undefined));
+    let landedFlush: unknown = null;
+    let commitEnded: Promise<void> | null = null;
+    const markSelect = (sql: string) => sql.startsWith('SELECT claim, last_flush, node_id FROM smdb_data.guild_ownership');
+    const lastFenceFlushId = () => rigged.sent.filter(s => s.sql.includes('last_flush = EXCLUDED.last_flush')).at(-1)?.params?.[6];
+    const rigged = scripted(async sql => {
+      if (sql === 'COMMIT' && slowCommit) {
+        const flushId = lastFenceFlushId();
+        commitEnded = new Promise(resolve => { setTimeout(() => { landedFlush = flushId; resolve(); }, 45_000); });
+        await commitEnded;
+        return undefined;
+      }
+      if (markSelect(sql)) {
+        if (commitEnded) await commitEnded;
+        return { rows: [{ claim: String(token.claim), last_flush: landedFlush, node_id: token.nodeId }], rowCount: 1 };
+      }
+      return undefined;
+    });
     expect((rigged.backend.getPool() as unknown as { options: Record<string, unknown> }).options.query_timeout).toBeUndefined();
     poolQueriesThroughClients(rigged);
     const ws = new WorkingSetManager(rigged.backend);
@@ -336,18 +378,31 @@ describe('no client-side bound', () => {
       expect(done).toBe(true);
       return p;
     };
-    const commits = () => rigged.sent.filter(s => s.sql === 'COMMIT').length;
+    const boundOf = (raw: unknown) => (typeof raw === 'string' ? undefined : (raw as { query_timeout?: number }).query_timeout);
+    const bounded = () => rigged.sent.filter(s => s.sql === 'COMMIT' && boundOf(s.raw) === ANSWER_BOUND_MS);
+    const start = Date.now();
+    expect(await settled(ws.flushGuildNow('1', 120_000))).toBe('pending');
+    expect(Date.now() - start).toBeGreaterThanOrEqual(ANSWER_BOUND_MS);
+    expect(Date.now() - start).toBeLessThan(45_000);
+    expect(landedFlush).toBeNull();
+    expect(bounded()).toHaveLength(1);
     expect(await settled(ws.flushGuildNow('1', 120_000))).toBe('ok');
-    expect(commits()).toBe(2);
+    expect(bounded()).toHaveLength(1);
+    expect(landedFlush).toEqual(expect.any(String));
+    const checks = rigged.sent.filter(s => markSelect(s.sql));
+    expect(checks).toHaveLength(1);
+    for (const s of checks) expect(boundOf(s.raw)).toBe(ANSWER_BOUND_MS);
     slowCommit = false;
     expect(ws.save('1', 'm', 'after.json', '1')).toBe('accepted');
     expect(await settled(ws.flushGuildNow('1', 10_000))).toBe('ok');
     const appended = rigged.sent.filter(s => s.sql.startsWith('INSERT INTO smdb_data.guild_append'));
     expect(appended).toHaveLength(1);
     expect(appended[0].params?.[3]).toBe(line);
+    expect(bounded()).toHaveLength(2);
     for (const s of rigged.sent) {
-      expect(typeof s.raw === 'string' || !('query_timeout' in (s.raw as object))).toBe(true);
+      if (boundOf(s.raw) !== undefined) expect([s.sql, boundOf(s.raw)]).toEqual([expect.stringMatching(/^(COMMIT|BEGIN|ROLLBACK|SELECT claim, last_flush)/), ANSWER_BOUND_MS]);
     }
+    expect(rigged.sent.filter(s => s.sql.startsWith('BEGIN; SET LOCAL') || s.sql.startsWith('INSERT INTO smdb_data.guild_')).every(s => boundOf(s.raw) === undefined)).toBe(true);
     ws.evict('1');
   });
 });

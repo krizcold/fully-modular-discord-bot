@@ -100,8 +100,6 @@ const INPUTS: Input[] = [
   { name: 'a 201-byte part', entry: 'save', key: `m/${'a'.repeat(201)}`, value: 1, reason: /201 bytes/ },
   { name: 'the retire note', entry: 'save', key: '.Graveyard.json', value: 1, reason: /\.Graveyard\.json/ },
   { name: 'U+0000 in a key', entry: 'save', key: 'm/a\u0000.json', value: 1, reason: /U\+0000/ },
-  { name: 'a save of .jsonl', entry: 'save', key: 'm/log.jsonl', value: 1, reason: /appends only/ },
-  { name: 'an append to .json', entry: 'append', key: 'm/log.json', value: 'x\n', reason: /must end in \.jsonl/ },
   { name: 'a key that leaves the folder', entry: 'save', key: '../x.json', value: 1, reason: /leaves the guild folder/ },
   { name: 'a 1025-byte key', entry: 'save', key: KEY_1025, value: 1, reason: /the key is 1025 bytes; a key holds at most 1024/ },
   { name: 'a part ending in "."', entry: 'save', key: 'm/a.', value: 1, reason: /ends in "\."/ },
@@ -131,6 +129,19 @@ describe.each(ROUTES)('a write the stores cannot keep, %s route', routeName => {
   it('the 1025-byte key is 1025 bytes and each of its parts at most 200', () => {
     expect(Buffer.byteLength(KEY_1025, 'utf8')).toBe(1025);
     expect(Math.max(...KEY_1025.split('/').map(p => Buffer.byteLength(p, 'utf8')))).toBe(200);
+  });
+
+  it('a save of .jsonl and an append to .json throw a TypeError (NB13 decision 12) and queue nothing', async () => {
+    const r = await routeOf(routeName);
+    expect(() => dm.saveDataTracked('m/log.jsonl', opts(r), 1)).toThrow(new TypeError('[Data] m/log.jsonl is an append-only file; write it with appendData. The value was not saved'));
+    expect(() => dm.appendDataTracked('m/log.json', opts(r), 'x\n')).toThrow(new TypeError('[Data] m/log.json does not end in .jsonl; appendData writes only .jsonl files. The line was not saved'));
+    nothingQueued(r);
+    await new Promise(resolve => setImmediate(resolve));
+    expect(fs.existsSync(guildDir(r))).toBe(false);
+    if (r.ws) {
+      expect(await r.ws.flushGuildNow(r.guildId, 1000)).toBe('ok');
+      expect([...r.store!.docs.keys(), ...r.store!.streams.keys()].filter(k => k.startsWith(`${r.guildId}|`))).toEqual([]);
+    }
   });
 
   it.each(INPUTS)('$name: refused unstorable with the reason, nothing queued, the ledger holds it', async input => {

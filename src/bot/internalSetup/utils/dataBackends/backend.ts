@@ -16,6 +16,10 @@ export interface GuildFlushBatch {
   upserts: { key: DocKey; doc: string }[];
   deletes: DocKey[];
   appends: { key: DocKey; chunk: string }[];
+  /** The batch's own id, written on the guild's ownership row in the batch's transaction (NB13 decision 1). */
+  flushId?: string;
+  /** Set by flushGuild just before it sends COMMIT. */
+  commitSent?: boolean;
 }
 
 export interface FenceToken {
@@ -37,6 +41,13 @@ export type FlushOutcome =
   | { ok: true }
   | { ok: false; reason: 'deposed'; currentOwner?: GuildOwner }
   | { ok: false; reason: 'unavailable'; detail?: string; code?: string; commitUnanswered?: boolean };
+
+/** What a check of a flush whose COMMIT got no answer found (NB13 decision 4). */
+export type FlushFate =
+  | { fate: 'landed' }
+  | { fate: 'not-landed' }
+  | { fate: 'deposed'; landed: true | null; currentOwner?: GuildOwner }
+  | { fate: 'unknown'; detail: string; code?: string };
 
 export type HydrationOutcome =
   | { ok: true; docs: { key: DocKey; doc: string }[]; appendKeys: DocKey[] }
@@ -72,6 +83,8 @@ export interface DataBackend {
   /** A kept working set asked for again: its guild re-stamped for the token only while the stamp still names this node ('kept'), else 'lost'; null when the store cannot be read. */
   reclaimGuild(guildId: string, token: FenceToken): Promise<'kept' | 'lost' | null>;
   flushGuild(guildId: string, batch: GuildFlushBatch, token: FenceToken): Promise<FlushOutcome>;
+  /** Whether the flush with this id landed, read once no transaction of the guild can still commit; changes nothing. */
+  resolveFlush(guildId: string, flushId: string, sentClaim: number, token: FenceToken): Promise<FlushFate>;
   /** deadline: a process.hrtime.bigint() reading; no statement is sent past it. */
   retireGuild(guildId: string, reason: string, token: FenceToken, deadline?: bigint | null): Promise<RetireOutcome>;
   /** retiredAt null: the guild's newest batch. beforeCommit is read after the move, just before COMMIT. */

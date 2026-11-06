@@ -38,6 +38,7 @@ import { getPremiumManager, resetPremiumManager } from '../../src/bot/internalSe
 import { getPaymentRegistry } from '../../src/bot/internalSetup/utils/payment/paymentRegistry';
 import { markPaymentLedger, runSealed } from '../../src/bot/internalSetup/utils/dataBackends/writeLedger';
 import { AUDIT, clearGlobal, gate, linesOf, logged, paidSub, quiet, settleQueue, state, writePremium } from './nb10PremiumRig';
+import { stubAppendHandles } from '../helpers/fileHandleStub';
 
 const role = process.env.BOT_PROCESS_ROLE;
 const asBot = (bot: boolean) => {
@@ -142,16 +143,14 @@ describe('the audit file read of a redelivery', () => {
     writePremium({ g2: { active: paidSub('s2', 'ps2'), paused: [] } });
     const pm = newProcess();
     const flush = gate();
-    const real = fs.promises.appendFile.bind(fs.promises);
-    vi.spyOn(fs.promises, 'appendFile').mockImplementation((async (p: any, data: any, options?: any) => {
-      if (String(p) !== AUDIT) return real(p, data, options);
-      fs.appendFileSync(p, data);
-      await flush.promise;
-    }) as typeof fs.promises.appendFile);
+    const stub = stubAppendHandles();
+    const opened = stub.holdOpen(AUDIT);
+    void flush.promise.then(() => opened.release());
     try {
       getPaymentRegistry().emitEvent(created('psA') as any);
       await pm.settled(undefined);
-      await vi.waitFor(() => expect(installLines().map(l => l.guildId)).toEqual(['g1']), { timeout: 5000, interval: 10 });
+      // The line's append is held at its open, so none of its bytes is in the file at the exit.
+      await opened.reached;
       await redeliver(pm, created('ps2', 'g2'));
       spies.error.mockClear();
       pm.logLossesAtExit();

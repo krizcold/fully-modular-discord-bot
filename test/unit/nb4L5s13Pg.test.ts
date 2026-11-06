@@ -31,8 +31,9 @@ function rig(script: Script, state: 'ready' | 'outage' | 'connecting' = 'connect
   const client = {
     query: async (q: string | { text: string; values?: unknown[] }, values?: unknown[]) => {
       const sql = typeof q === 'string' ? q : q.text;
+      const params = values ?? (typeof q === 'string' ? undefined : q.values);
       queries.push(sql.trim());
-      return script(sql.trim(), typeof q === 'string' ? values : q.values);
+      return script(sql.trim(), params);
     },
     release: () => {},
   };

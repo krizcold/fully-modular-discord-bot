@@ -45,8 +45,12 @@ import { keyRefusal, pathKeyOf, sizeRefusal, textRefusal, valueText } from './st
 
 import {
   flushAll as flushAllFiles,
-  forgetAppendTails,
+  failReplacedTriesAtExit,
+  forgetDurableFiles,
+  fileTicketState,
   queuedFileWrites,
+  unconfirmedFiles,
+  unsavedFileWrites,
   fileFlushOnTheWire,
   fileFlushesLanded,
   flushGuild as flushGuildFiles,
@@ -56,7 +60,7 @@ import {
   sweepGraveyard as sweepFileGraveyard,
   listGuilds as listGuildDirs,
 } from './dataBackends/fileBackend';
-import { getWorkingSet, DataBackendUnavailableError } from './dataBackends/workingSet';
+import { commitAnswerOwed, getWorkingSet, DataBackendUnavailableError } from './dataBackends/workingSet';
 import type { WsTicket } from './dataBackends/workingSet';
 import type { FileRestoreOutcome, FileTicket } from './dataBackends/fileBackend';
 import { deadlineIn, msLeft } from './dataBackends/postgresBackend';
@@ -67,6 +71,7 @@ import { markBarrier, noteScopeRefusal, noteScopeTicket, pendingFor, saveMark, s
 import { canonicalGuildKey, GuildKeyError, type GuildKey } from './dataKeys';
 import { isMaintenanceGateClosed } from './maintenanceGate';
 import { stoppedServing } from './servingGate';
+import type { HeldCounts } from './heldWords';
 
 export { listGlobalDataFiles, saveMark };
 export type { SaveMark };
@@ -144,8 +149,19 @@ export async function flushAll(): Promise<void> {
     flushAllFiles(),
     ws ? ws.flushAllDirty() : Promise.resolve([] as string[]),
   ]);
-  if (leftover.length > 0) {
-    console.warn(`[Data] A full flush left ${leftover.length} guild(s) with unflushed writes: ${leftover.join(', ')}`);
+  logDrainLeft('A full flush', leftover);
+}
+
+/**
+ * NB13 decision 6: the held guilds less those holding only a save the database did not answer, then those holding
+ * such a save, each in a line of its own.
+ */
+function logDrainLeft(what: 'Shutdown drain' | 'A full flush', held: string[]): void {
+  const unanswered = getWorkingSet()?.unansweredGuilds() ?? { all: [], only: [] };
+  const left = held.filter(guildId => !unanswered.only.includes(guildId));
+  if (left.length > 0) console.warn(`[Data] ${what} left ${left.length} guild(s) with unflushed writes: ${left.join(', ')}`);
+  if (unanswered.all.length > 0) {
+    console.warn(`[Data] ${what} left guild(s) ${unanswered.all.join(', ')} holding a save whose COMMIT got no answer, which may have landed`);
   }
 }
 
@@ -205,11 +221,11 @@ export function drainForExit(boundMs: number): Promise<void> {
         await drainUntilSettled(deadline - Math.floor(boundMs / 5), progress);
         closedForExit = true;
         await drainUntilSettled(deadline, progress);
-        const left = getWorkingSet()?.dirtyGuildIds() ?? [];
-        if (left.length > 0) console.warn(`[Data] Shutdown drain left ${left.length} guild(s) with unflushed writes: ${left.join(', ')}`);
+        logDrainLeft('Shutdown drain', getWorkingSet()?.dirtyGuildIds() ?? []);
         const files = queuedFileWrites();
         if (files > 0) console.warn(`[Data] Shutdown drain left ${files} file(s) with queued writes`);
       } finally {
+        failReplacedTriesAtExit();
         // A loss whose leave never ended logs what it dropped here.
         for (const line of getWorkingSet()?.takeDropLines() ?? []) console.error(line);
       }
@@ -227,9 +243,16 @@ export function isExitDraining(): boolean {
  * Maintenance's save: flushes the working set and the queued file writes until nothing is held, nothing lands for the
  * drain's give-up window, or boundMs passes. Unlike the exit drain it closes nothing. Answers what is still held.
  */
-export async function saveHeldWrites(boundMs: number): Promise<{ unsavedGuilds: number; unsavedFiles: number }> {
+export async function saveHeldWrites(boundMs: number): Promise<HeldCounts> {
   await drainUntilSettled(Date.now() + boundMs, { at: Date.now(), landed: landedFlushes() });
-  return { unsavedGuilds: getWorkingSet()?.dirtyGuildIds().length ?? 0, unsavedFiles: queuedFileWrites() };
+  const ws = getWorkingSet();
+  const unanswered = ws?.unansweredGuilds() ?? { all: [], only: [] };
+  return {
+    unsavedGuilds: (ws?.dirtyGuildIds() ?? []).filter(guildId => !unanswered.only.includes(guildId)).length,
+    unsavedFiles: unsavedFileWrites(),
+    unansweredGuilds: unanswered.all.length,
+    unconfirmedFiles: unconfirmedFiles(),
+  };
 }
 
 let guildWritesClosed = false;
@@ -450,7 +473,7 @@ export function onWriterTake(step: () => void): void {
 
 /** Clears what this process knows of the shared files' contents; run by the writer lock at each take. */
 export function forgetSharedFileKnowledge(): void {
-  forgetAppendTails();
+  forgetDurableFiles();
   for (const step of writerTakeSteps) {
     try {
       step();
@@ -538,7 +561,7 @@ export async function confirmSaved(scope: string, options: { since?: SaveMark; d
   const since = mark === undefined ? 0 : stampOf(mark);
   if (since === null) return 'unavailable';
   const deadlineMs = options.deadlineMs ?? CONFIRM_SAVED_MS;
-  const { tickets, lost, refused, pruned } = pendingFor(scope, since);
+  const { tickets, files = [], lost, refused, pruned } = pendingFor(scope, since);
   const answers: SaveOutcome[] = pruned ? ['unavailable'] : [];
   for (const mark of lost) answers.push(mark.deposed ? 'deposed' : 'unavailable');
   const docPrefix = options.category === undefined ? null : `${scope === 'global' ? 'global' : `guild:${scope}`}:${options.category}/`;
@@ -550,10 +573,19 @@ export async function confirmSaved(scope: string, options: { since?: SaveMark; d
     : getDataDirectory(scope === 'global' ? { scope: 'global', category: options.category } : { guildId: scope, category: options.category }) + path.sep;
   const judged = tickets.filter(ticket => ticket.kind === 'ws' || folder === null || ticket.path.startsWith(folder));
   const first = await Promise.all(judged.map(ticket => confirmWrite(ticket, deadlineMs).catch(() => 'unavailable' as const)));
-  // A held write is retried while slower confirms finish, so it is read again when the answer is taken.
-  const now = await Promise.all(first.map((answer, i) => answer !== 'held'
-    ? answer
-    : confirmWrite(judged[i], 0).then(again => (again === 'pending' ? 'held' as const : again), () => 'unavailable' as const)));
+  // A held write is retried while slower confirms finish, so it is read again when the answer is taken. Its 'pending'
+  // stays pending while a COMMIT that may carry it owes its answer.
+  const now = await Promise.all(first.map((answer, i) => {
+    if (answer !== 'held') return answer;
+    const ticket = judged[i];
+    return confirmWrite(ticket, 0).then(again => (again === 'pending' && !(ticket.kind === 'ws' && commitAnswerOwed(ticket)) ? 'held' as const : again), () => 'unavailable' as const);
+  }));
+  // NB13 decision 8: a file line whose sync the disk did not confirm is 'unavailable' for good, also one found so while
+  // the confirms above waited.
+  for (const group of files) {
+    if (folder !== null && !group.path.startsWith(folder)) continue;
+    if (group.failed || group.tickets.some(ticket => fileTicketState(ticket) === 'unconfirmed')) answers.push('unavailable');
+  }
   return worstSave([...answers, ...now]);
 }
 
@@ -1044,6 +1076,9 @@ export function saveDataTracked<T = any>(filename: string, options: DataOptions,
 
 function acceptSave<T>(filename: string, options: DataOptions, data: T): SaveTracked {
   refuseInsideUpdate();
+  if (filename.endsWith('.jsonl')) {
+    throw new TypeError(`[Data] ${filename} is an append-only file; write it with appendData. The value was not saved`);
+  }
   if (closedForExit) throw new DataBackendUnavailableError('node-stopping');
   refuseInMaintenance(options);
   refuseGuildWhileGated(options);
@@ -1238,6 +1273,11 @@ export function appendDataTracked(filename: string, options: DataOptions, line: 
 
 function acceptAppend(filename: string, options: DataOptions, line: string): AppendTracked {
   refuseInsideUpdate();
+  if (!filename.endsWith('.jsonl')) {
+    throw new TypeError(`[Data] ${filename} does not end in .jsonl; appendData writes only .jsonl files. The line was not saved`);
+  }
+  // Every stream line ends in a newline, so the next line starts one of its own on either backend.
+  if (typeof line === 'string' && !line.endsWith('\n')) line += '\n';
   if (closedForExit) throw new DataBackendUnavailableError('node-stopping');
   refuseInMaintenance(options);
   refuseGuildWhileGated(options);
@@ -1608,7 +1648,10 @@ async function retireRows(guildId: string, reason: string, flushMs: number, dead
       return { ok: false, code: 'not-owner', error: DELETE_TEXTS.deposed };
     }
     if (flushed !== 'ok') {
-      console.error(`[DataManager] Cannot retire guild ${guildId}: its unflushed writes are not confirmed saved (${flushed}); nothing was removed`);
+      const why = flushed === 'held'
+        ? 'its unflushed writes did not reach the store (held)'
+        : `can't confirm that its writes reached the store (${flushed})`;
+      console.error(`[DataManager] Cannot retire guild ${guildId}: ${why}; nothing was removed`);
       return { ok: false, code: 'backend-unavailable', error: DELETE_TEXTS.flush };
     }
     refuseGuildChangeInMaintenance();

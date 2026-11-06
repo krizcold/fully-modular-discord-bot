@@ -8,7 +8,7 @@ const h = vi.hoisted(() => ({ unsaved: 1 }));
 
 vi.mock('../../src/bot/internalSetup/utils/dataManager', async orig => ({
   ...(await orig<object>()),
-  saveHeldWrites: async () => ({ unsavedGuilds: h.unsaved, unsavedFiles: 0 }),
+  saveHeldWrites: async () => ({ unsavedGuilds: h.unsaved, unsavedFiles: 0, unansweredGuilds: 0, unconfirmedFiles: 0 }),
   stopProcess: () => undefined,
 }));
 
@@ -17,6 +17,7 @@ vi.mock('../../src/bot/internalSetup/utils/dataBackends/workingSet', async orig 
   getWorkingSet: () => ({
     heldGuilds: () => (h.unsaved > 0 ? [{ guildId: '111', reason: 'connection refused', code: null }] : []),
     takeDropLines: () => [],
+    unansweredGuilds: () => ({ all: [], only: [] }),
   }),
 }));
 

@@ -17,6 +17,7 @@ vi.mock('../../src/bot/internalSetup/utils/dataBackends/workingSet', async orig 
     },
     landedFlushes: () => st.landed,
     dirtyGuildIds: () => (st.settled ? [] : ['100']),
+    unansweredGuilds: () => ({ all: [] as string[], only: [] as string[] }),
   };
   return { ...real, getWorkingSet: () => stub };
 });
@@ -45,7 +46,7 @@ describe('maintenance save over a working set that does not settle', () => {
     expect(run.done()).toBe(false);
     await vi.advanceTimersByTimeAsync(500);
     expect(run.done()).toBe(true);
-    expect(run.value()).toEqual({ unsavedGuilds: 1, unsavedFiles: 0 });
+    expect(run.value()).toEqual({ unsavedGuilds: 1, unsavedFiles: 0, unansweredGuilds: 0, unconfirmedFiles: 0 });
   });
 
   it('keeps waiting while a flush is on the wire, up to its bound', async () => {
@@ -55,7 +56,7 @@ describe('maintenance save over a working set that does not settle', () => {
     expect(run.done()).toBe(false);
     await vi.advanceTimersByTimeAsync(7_000);
     expect(run.done()).toBe(true);
-    expect(run.value()).toEqual({ unsavedGuilds: 1, unsavedFiles: 0 });
+    expect(run.value()).toEqual({ unsavedGuilds: 1, unsavedFiles: 0, unansweredGuilds: 0, unconfirmedFiles: 0 });
   });
 
   it('retries a store that settles on its third pass and answers nothing held', async () => {
@@ -63,7 +64,7 @@ describe('maintenance save over a working set that does not settle', () => {
     const run = track(saveHeldWrites(10_000));
     await vi.advanceTimersByTimeAsync(1_000);
     expect(run.done()).toBe(true);
-    expect(run.value()).toEqual({ unsavedGuilds: 0, unsavedFiles: 0 });
+    expect(run.value()).toEqual({ unsavedGuilds: 0, unsavedFiles: 0, unansweredGuilds: 0, unconfirmedFiles: 0 });
     expect(st.flushCalls).toBe(3);
   });
 
@@ -72,14 +73,14 @@ describe('maintenance save over a working set that does not settle', () => {
     const run = track(saveHeldWrites(10_000));
     await vi.advanceTimersByTimeAsync(50);
     expect(run.done()).toBe(true);
-    expect(run.value()).toEqual({ unsavedGuilds: 0, unsavedFiles: 0 });
+    expect(run.value()).toEqual({ unsavedGuilds: 0, unsavedFiles: 0, unansweredGuilds: 0, unconfirmedFiles: 0 });
   });
 
   it('starts no flush when its bound has already passed', async () => {
     const pending = saveHeldWrites(0);
     expect(st.flushCalls).toBe(0);
     await vi.advanceTimersByTimeAsync(20);
-    expect(await pending).toEqual({ unsavedGuilds: 1, unsavedFiles: 0 });
+    expect(await pending).toEqual({ unsavedGuilds: 1, unsavedFiles: 0, unansweredGuilds: 0, unconfirmedFiles: 0 });
     expect(st.flushCalls).toBe(0);
   });
 });

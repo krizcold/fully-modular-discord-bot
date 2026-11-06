@@ -2,7 +2,8 @@ import { vi } from 'vitest';
 import { PostgresBackend } from '../../src/bot/internalSetup/utils/dataBackends/postgresBackend';
 
 // The real PostgresBackend over a pool whose clients answer by script, as the server would: the fenced claim
-// updates one row, every SELECT reads no row, and each query takes what the script says.
+// updates one row, every SELECT reads no row, and each query takes what the script says. A query with a
+// query_timeout rejects with pg's 'Query read timeout' when the script answers later than that.
 
 export interface Sent {
   sql: string;
@@ -27,7 +28,13 @@ export function scriptedBackend(answer: Answer = () => undefined) {
         const sql = typeof raw === 'string' ? raw : String((raw as { text?: unknown })?.text ?? '');
         sent.push({ sql, params, raw });
         if (/INSERT INTO smdb_data\.guild_ownership AS o\b/.test(sql)) return { rows: [], rowCount: 1 };
-        const res = await answer(sql, params, sent.length);
+        const values = params ?? (typeof raw === 'string' ? undefined : (raw as { values?: unknown[] })?.values);
+        const timeout = typeof raw === 'string' ? undefined : (raw as { query_timeout?: number })?.query_timeout;
+        const answered = Promise.resolve(answer(sql, values, sent.length));
+        const res = timeout === undefined ? await answered : await new Promise<unknown>((resolve, reject) => {
+          const timer = setTimeout(() => reject(new Error('Query read timeout')), timeout);
+          answered.then(v => { clearTimeout(timer); resolve(v); }, e => { clearTimeout(timer); reject(e); });
+        });
         if (res instanceof Error) throw res;
         return res ?? { rows: [], rowCount: 0 };
       },

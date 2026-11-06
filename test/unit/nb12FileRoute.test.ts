@@ -886,7 +886,16 @@ describe('property: generated histories on both routes and both file disks, with
       await dm.flushAll();
       expect(await ws.flushGuildNow(setGuild, 1000)).toBe('ok');
     };
-    const both = async (written: string, fn: (o: dm.DataOptions) => { outcome: string; cause?: string; reason?: string }) => {
+    const both = async (written: string, write: (o: dm.DataOptions) => { outcome: string; cause?: string; reason?: string }) => {
+      // NB13 decision 12: a save of a .jsonl name and an append to any other name throw a TypeError on both routes.
+      const fn = (o: dm.DataOptions): { outcome: string; cause?: string; reason?: string } => {
+        try {
+          return write(o);
+        } catch (error) {
+          if (!(error instanceof TypeError)) throw error;
+          return { outcome: 'threw', reason: error.message };
+        }
+      };
       setBackendKind('postgres');
       const onSet = fn({ guildId: setGuild });
       setBackendKind('file');
@@ -900,6 +909,7 @@ describe('property: generated histories on both routes and both file disks, with
         onFile = fn({ guildId: fileGuild });
       }
       expect(answerOf(onFile)).toBe(answerOf(onSet));
+      if (onSet.outcome === 'threw') expect(onFile.reason).toBe(onSet.reason);
       if (onSet.outcome === 'refused' && onSet.cause === 'unstorable') {
         expect(onFile.reason).toBe(onSet.reason);
         const named = namedEntry(onSet.reason ?? '');

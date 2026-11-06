@@ -90,7 +90,8 @@ describe('the round trip', () => {
       await back.idle();
       expect(back.status().body.job?.state, why(back.status().body.job)).toBe('done');
       expect(back.status().body.job.counts).toMatchObject(seeded);
-      expect(guildFiles()).toEqual(before);
+      const closed = Object.fromEntries(Object.entries(before).map(([k, hex]) => [k, k.endsWith('.jsonl') && hex !== '' && !hex.endsWith('0a') ? `${hex}0a` : hex]));
+      expect(guildFiles()).toEqual(closed);
       expect(notes()).toEqual(notesBefore);
       const names = await schemas(rig);
       const aside = names.filter(n => n.startsWith('smdb_superseded_'));

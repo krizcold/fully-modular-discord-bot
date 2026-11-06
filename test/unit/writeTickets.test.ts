@@ -39,6 +39,7 @@ import {
 import { freezeGuildWrites, servedGuilds, unfreezeGuildWrites } from '../helpers/freezeGuild';
 import { applyOperatorDataWrite } from '../../src/bot/internalSetup/utils/ipcDataHandler';
 import { FakeStore, tokenFor, type FlushCall, type FlushMode } from '../helpers/fakeStore';
+import { stubAppendHandles } from '../helpers/fileHandleStub';
 
 // BT-1, write tickets (notes/BT.md, "BT-1 design sheet" and its refinements).
 // A ticket answers 'ok' only once the store holds its write, or a later write
@@ -78,18 +79,26 @@ const HELD = {
 const LEFT_UNCONFIRMED = {
   ok: false,
   code: 'backend-unavailable',
-  error: 'this write left this node before it was confirmed saved (the guild was unloaded, its data was deleted or restored from the graveyard), so whether it was saved is unknown; reload the data to check',
+  error: 'this write left this node before it was confirmed saved (the guild was unloaded, its data was deleted or restored from the graveyard, or another bot process took the guild while the answer to a save was missing), so whether it was saved is unknown; reload the data to check',
 };
 
-/** Holds every call of the fs function on the target until open; reached resolves once the first is held. */
-function holdFs(name: 'rename' | 'appendFile', target: string): { reached: Promise<void>; open: () => void } {
+/**
+ * Holds every call of the fs function on the target until open; reached resolves once the first is held. 'a+open'
+ * holds the append's open of the target, 'write' its write call (both through the FileHandle stub).
+ */
+function holdFs(name: 'rename' | 'a+open' | 'write', target: string): { reached: Promise<void>; open: () => void } {
+  if (name !== 'rename') {
+    const stub = stubAppendHandles();
+    const hold = name === 'a+open' ? stub.holdOpen(target) : stub.holdWrite(target);
+    return { reached: hold.reached, open: hold.release };
+  }
   const real = fs.promises[name] as (...args: unknown[]) => Promise<void>;
   let open: () => void = () => undefined;
   const gate = new Promise<void>(resolve => { open = resolve; });
   let reach: () => void = () => undefined;
   const reached = new Promise<void>(resolve => { reach = resolve; });
   vi.spyOn(fs.promises, name).mockImplementation((async (...args: unknown[]) => {
-    if (String(args[name === 'rename' ? 1 : 0]) === target) {
+    if (String(args[1]) === target) {
       reach();
       await gate;
     }
@@ -736,21 +745,16 @@ describe('file-queue tickets, the state x exit table', () => {
 
   it('confirms an append that joined one already being written only once its own line lands', async () => {
     const file = freshPath('joined-on-the-wire.jsonl');
-    const appendFile = fs.promises.appendFile;
-    let open: () => void = () => undefined;
-    const gate = new Promise<void>(resolve => { open = resolve; });
-    const writing = vi.spyOn(fs.promises, 'appendFile').mockImplementation(async (...args: Parameters<typeof appendFile>) => {
-      await gate;
-      return appendFile(...args);
-    });
+    const stub = stubAppendHandles();
+    const writing = stub.holdWrite(file);
     // The lines end with a newline, as JSON-lines appends do (a line that does not is started on its own line).
     enqueueAppend(file, 'a;\n');
     const first = confirmFile(fileTicket(file), 5000);
-    for (let turns = 0; turns < 400 && writing.mock.calls.length === 0; turns++) await new Promise(resolve => { setTimeout(resolve, 5); });
-    expect(writing).toHaveBeenCalledTimes(1);
+    await writing.reached;
+    expect(stub.writeCalls.filter(p => p === file)).toHaveLength(1);
     enqueueAppend(file, 'b;\n');
     const second = fileTicket(file);
-    open();
+    writing.release();
     expect(await first).toBe('ok');
     expect(await confirmFile(second, 0)).toBe('pending');
     expect(fs.readFileSync(file, 'utf8')).toBe('a;\n');
@@ -1366,7 +1370,7 @@ describe('the operator route confirms a delete that finds an earlier delete of t
     const guildId = '9504';
     setBackendKind('file');
     const file = path.join(process.env.DATA_DIR!, guildId, 'm', 'x.jsonl');
-    const appending = holdFs('appendFile', file);
+    const appending = holdFs('a+open', file);
     const unlink = failUnlinks(file);
     expect(appendData('x.jsonl', { guildId, category: 'm' }, 'a;')).toBe(true);
     await appending.reached;
@@ -1375,7 +1379,7 @@ describe('the operator route confirms a delete that finds an earlier delete of t
     const reply = applyOperatorDataWrite(remove(guildId, 'x.jsonl'));
     appending.open();
     expect(await reply).toEqual(HELD);
-    expect(fs.readFileSync(file, 'utf8')).toBe('a;');
+    expect(fs.readFileSync(file, 'utf8')).toBe('a;\n');
     unlink.heal();
     expect(await applyOperatorDataWrite(remove(guildId, 'x.jsonl'))).toEqual({ ok: true });
     expect(fs.existsSync(file)).toBe(false);

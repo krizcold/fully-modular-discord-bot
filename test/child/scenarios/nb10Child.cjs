@@ -29,10 +29,18 @@ fs.promises.rename = async (from, to) => {
   if (failing.rename && String(to).includes(failing.rename)) throw Object.assign(new Error('EIO: injected, rename'), { code: 'EIO' });
   return realRename(from, to);
 };
-const realAppend = fs.promises.appendFile.bind(fs.promises);
-fs.promises.appendFile = async (file, data, options) => {
-  if (failing.append && String(file).endsWith(failing.append)) throw Object.assign(new Error('EIO: injected, write'), { code: 'EIO' });
-  return realAppend(file, data, options);
+// An append opens its file 'a+': on a failing path, that handle's write rejects with EIO before any byte.
+const realOpen = fs.promises.open.bind(fs.promises);
+fs.promises.open = async (file, flags, mode) => {
+  const handle = await realOpen(file, flags, mode);
+  if (flags !== 'a+' || !failing.append || !String(file).endsWith(failing.append)) return handle;
+  return new Proxy(handle, {
+    get(target, prop) {
+      if (prop === 'write') return async () => { throw Object.assign(new Error('EIO: injected, write'), { code: 'EIO' }); };
+      const value = Reflect.get(target, prop);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
 };
 
 function replacement() {

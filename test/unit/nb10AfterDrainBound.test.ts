@@ -14,6 +14,7 @@ vi.mock('../../src/bot/internalSetup/utils/dataBackends/workingSet', async orig 
     flushAllDirty: () => (ws.phase2 ? new Promise<string[]>(() => undefined) : Promise.resolve([] as string[])),
     landedFlushes: () => 0,
     dirtyGuildIds: () => [] as string[],
+    unansweredGuilds: () => ({ all: [] as string[], only: [] as string[] }),
     takeDropLines: () => [] as string[],
   };
   return { ...real, getWorkingSet: () => stub };
@@ -30,6 +31,7 @@ vi.mock('../../src/bot/internalSetup/utils/premiumNotifications', () => ({
 import { getPremiumManager, resetPremiumManager, startPremiumTickers } from '../../src/bot/internalSetup/utils/premiumManager';
 import { getPaymentRegistry } from '../../src/bot/internalSetup/utils/payment/paymentRegistry';
 import { addFinalStopStep, beginStop, installStopHandler } from '../../src/bot/internalSetup/utils/dataManager';
+import { getPending } from '../../src/bot/internalSetup/utils/dataBackends/fileBackend';
 import { AUDIT, clearGlobal, JOURNAL, jsonOf, logged, PREMIUM, quiet, rawOf, settleQueue, state, writePremium } from './nb10PremiumRig';
 
 const role = process.env.BOT_PROCESS_ROLE;
@@ -54,20 +56,19 @@ describe('the drain pass after the after-drain steps is bounded by 5 s (NB10-R11
     const spies = quiet();
     const flush = { failing: false };
     const open = fs.promises.open.bind(fs.promises);
+    const onTheWire: string[] = [];
+    // In phase 2 the append's 'a+' open of the audit file is held for ever, so the file stays absent; the bytes that
+    // try would write are its queued entry's.
     vi.spyOn(fs.promises, 'open').mockImplementation(((file: any, flags?: any, mode?: any) => {
       if (flush.failing && String(file).startsWith(`${PREMIUM}.`) && flags === 'w') {
         return Promise.reject(Object.assign(new Error('EIO: injected'), { code: 'EIO' }));
       }
-      return open(file, flags, mode);
-    }) as any);
-    const appendFile = fs.promises.appendFile.bind(fs.promises);
-    const onTheWire: string[] = [];
-    vi.spyOn(fs.promises, 'appendFile').mockImplementation(((file: any, data: any, options?: any) => {
-      if (ws.phase2 && String(file) === AUDIT) {
-        onTheWire.push(String(data));
-        return new Promise<void>(() => undefined);
+      if (ws.phase2 && String(file) === AUDIT && flags === 'a+') {
+        const entry = getPending(AUDIT);
+        if (entry && entry.op !== 'delete') onTheWire.push(entry.content);
+        return new Promise(() => undefined);
       }
-      return appendFile(file, data, options);
+      return open(file, flags, mode);
     }) as any);
     let exitedAt: number | null = null;
     let atExit: string | null = null;

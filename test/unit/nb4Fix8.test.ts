@@ -7,7 +7,7 @@ const h = vi.hoisted(() => ({ unsaved: 0 }));
 
 vi.mock('../../src/bot/internalSetup/utils/dataManager', async orig => ({
   ...(await orig<object>()),
-  saveHeldWrites: async () => ({ unsavedGuilds: h.unsaved, unsavedFiles: 0 }),
+  saveHeldWrites: async () => ({ unsavedGuilds: h.unsaved, unsavedFiles: 0, unansweredGuilds: 0, unconfirmedFiles: 0 }),
   stopProcess: () => undefined,
 }));
 

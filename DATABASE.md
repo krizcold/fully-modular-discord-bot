@@ -146,6 +146,10 @@ A restore moves one deleted server's data back in one transaction, only while th
 database, fenced by its claim like any save; on JSON it renames the entry back into `/data`. The entry leaves the
 graveyard in the same step. The file sweep renames an expired entry to `.sweep-<name>` before it removes it, and
 removes leftover `.sweep-` folders at each run.
+Each save also writes its own id on the guild's ownership row. When the answer to a save is lost (the connection
+drops after the commit was sent, or no answer comes within 40 seconds), the bot reads that row, after any unfinished
+save of the guild has ended, to learn whether the save was stored before it sends anything again, so no appended line
+is stored twice.
 
 ## Availability: read this before you rely on it
 

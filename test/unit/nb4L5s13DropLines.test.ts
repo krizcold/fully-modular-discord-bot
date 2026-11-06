@@ -42,16 +42,19 @@ const DEPOSED: FlushOutcome = { ok: false, reason: 'deposed' };
 
 describe("decision 16's drop lines", () => {
   it('list the shards in order, and each shard\'s guilds and unanswered guilds sorted and comma-separated', async () => {
-    const { ws, ctl, add } = rig();
+    const { store, ws, ctl, add } = rig();
     await add('200', 1);
     await add('100', 1);
     await add('300', 0);
     for (const g of ['200', '100', '300']) expect(ws.save(g, 'm', 'a.json', '1')).toBe('accepted');
     ctl.answer = UNANSWERED;
-    expect(await ws.flushGuildNow('200', 50)).toBe('held');
-    expect(await ws.flushGuildNow('100', 50)).toBe('held');
+    expect(await ws.flushGuildNow('200', 50)).toBe('pending');
+    expect(await ws.flushGuildNow('100', 50)).toBe('pending');
+    store.takeOver('200', true);
+    store.takeOver('100', true);
     ctl.answer = DEPOSED;
-    for (const g of ['200', '100', '300']) expect(await ws.flushGuildNow(g, 50)).toBe('deposed');
+    for (const g of ['200', '100']) expect(await ws.flushGuildNow(g, 50)).toBe('unavailable');
+    expect(await ws.flushGuildNow('300', 50)).toBe('deposed');
     expect(ws.takeDropLines()).toEqual([
       '[Shards] 1 unsaved change(s) of 1 guild(s) of shard 0 were dropped: 300',
       '[Shards] 2 unsaved change(s) of 2 guild(s) of shard 1 were dropped: 100, 200; guild(s) 100, 200 had a save whose answer never came, so some of these changes may have landed',
@@ -63,7 +66,7 @@ describe("decision 16's drop lines", () => {
     await add('400', 2);
     expect(ws.save('400', 'm', 'a.json', '1')).toBe('accepted');
     ctl.answer = UNANSWERED;
-    expect(await ws.flushGuildNow('400', 50)).toBe('held');
+    expect(await ws.flushGuildNow('400', 50)).toBe('pending');
     ctl.answer = null;
     expect(await ws.flushGuildNow('400', 50)).toBe('ok');
     expect(ws.save('400', 'm', 'a.json', '2')).toBe('accepted');

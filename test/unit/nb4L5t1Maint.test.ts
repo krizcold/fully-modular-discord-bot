@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const h = vi.hoisted(() => ({
   reads: 0,
-  save: null as null | (() => Promise<{ unsavedGuilds: number; unsavedFiles: number }>),
+  save: null as null | (() => Promise<{ unsavedGuilds: number; unsavedFiles: number; unansweredGuilds: number; unconfirmedFiles: number }>),
 }));
 vi.mock('../../src/bot/internalSetup/utils/dataManager', async orig => {
   const real = await orig<any>();
@@ -66,7 +66,7 @@ afterEach(() => {
 
 const restarts = () => sent.filter(m => m.type === 'control:restart-bot');
 const fakeTimers = () => vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date'] });
-const pending = () => new Promise<{ unsavedGuilds: number; unsavedFiles: number }>(() => undefined);
+const pending = () => new Promise<{ unsavedGuilds: number; unsavedFiles: number; unansweredGuilds: number; unconfirmedFiles: number }>(() => undefined);
 const settle = () => new Promise<void>(resolve => { setTimeout(resolve, 20); });
 
 describe('the maintenance.json poll', () => {
@@ -101,12 +101,12 @@ describe('the maintenance.json poll', () => {
 
 describe('the restart request', () => {
   it('a shard restart asked during a leave is the one request; the leave asks no second time', async () => {
-    let finish!: (left: { unsavedGuilds: number; unsavedFiles: number }) => void;
+    let finish!: (left: { unsavedGuilds: number; unsavedFiles: number; unansweredGuilds: number; unconfirmedFiles: number }) => void;
     h.save = () => new Promise(resolve => { finish = resolve; });
     startLeave('The hook says running');
     expect(restartForShards('take shard 2', () => null)).toBe(true);
     expect(restarts()).toEqual([{ type: 'control:restart-bot', data: { reason: 'take shard 2' } }]);
-    finish({ unsavedGuilds: 0, unsavedFiles: 0 });
+    finish({ unsavedGuilds: 0, unsavedFiles: 0, unansweredGuilds: 0, unconfirmedFiles: 0 });
     await settle();
     expect(restarts()).toHaveLength(1);
     expect(leaveRestartAsked()).toBe(false);
@@ -164,7 +164,7 @@ describe('the database watcher', () => {
   });
 
   it('a leave already under way takes no answer: no accepted line', async () => {
-    h.save = async () => ({ unsavedGuilds: 0, unsavedFiles: 0 });
+    h.save = async () => ({ unsavedGuilds: 0, unsavedFiles: 0, unansweredGuilds: 0, unconfirmedFiles: 0 });
     writeMaintenanceFile('maintenance', 'm');
     const b = backend(async () => 'answers');
     const watcher = watchDataBackend(b, { retryMs: NEVER })!;

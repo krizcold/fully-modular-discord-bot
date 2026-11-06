@@ -20,7 +20,7 @@ function scripted(answer: Answer) {
   const client = {
     query: async (statement: string | { text: string; values?: unknown[] }, values?: unknown[]) => {
       const sql = typeof statement === 'string' ? statement : statement.text;
-      const params = typeof statement === 'string' ? values : statement.values;
+      const params = values ?? (typeof statement === 'string' ? undefined : statement.values);
       sent.push(sql.trim());
       const res = answer(sql, params);
       if (res instanceof Error) throw res;

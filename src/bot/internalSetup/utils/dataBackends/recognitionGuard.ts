@@ -60,6 +60,8 @@ export interface MigrationJournal {
   envSwitched?: boolean;
   leftOut?: string[];
   shadow?: string[];
+  /** Streams whose last line had no newline, copied with one added (NB13 decision 12). */
+  closedTails?: string[];
 }
 
 export type DataFacts =

@@ -9,7 +9,7 @@ vi.mock('../../src/bot/internalSetup/utils/dataManager', async orig => {
   return {
     ...real,
     stopProcess: () => { h.stops += 1; },
-    saveHeldWrites: async () => ({ unsavedGuilds: 0, unsavedFiles: 0 }),
+    saveHeldWrites: async () => ({ unsavedGuilds: 0, unsavedFiles: 0, unansweredGuilds: 0, unconfirmedFiles: 0 }),
   };
 });
 

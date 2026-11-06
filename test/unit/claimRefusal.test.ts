@@ -70,7 +70,8 @@ function scriptedBackend(answer: (sql: string) => unknown): { backend: PostgresB
   (backend as unknown as { state: string }).state = 'ready';
   const sent: string[] = [];
   const client = {
-    query: async (sql: string) => {
+    query: async (q: string | { text: string }) => {
+      const sql = typeof q === 'string' ? q : q.text;
       sent.push(sql.trim());
       const res = answer(sql);
       if (res instanceof Error) throw res;

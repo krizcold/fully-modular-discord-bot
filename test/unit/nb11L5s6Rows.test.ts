@@ -165,7 +165,7 @@ describe('the delete on Postgres', () => {
     const g = await readyGuild(ws);
     vi.spyOn(ws, 'flushGuildNow').mockResolvedValue('unavailable');
     expect(await deleteGuildNamespace(g, 'test', 1000)).toEqual({ ok: false, code: 'backend-unavailable', error: "the server's unsaved changes are not confirmed saved yet; nothing was removed; try again in a moment" });
-    expect(lines(error)).toContain(`[DataManager] Cannot retire guild ${g}: its unflushed writes are not confirmed saved (unavailable); nothing was removed`);
+    expect(lines(error)).toContain(`[DataManager] Cannot retire guild ${g}: can't confirm that its writes reached the store (unavailable); nothing was removed`);
     expect(store.retireCalls).toBe(0);
   });
 

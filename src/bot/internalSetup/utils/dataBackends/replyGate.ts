@@ -18,7 +18,8 @@ import { getConfigProperty } from '../configManager';
 import { confirmWrite, isStopping } from '../dataManager';
 import { parseButtonCustomId, parseDropdownCustomId, parseModalCustomId } from '../panel/panelCustomIds';
 import { declaresOwnOutcomes } from './dataContract';
-import { droppedByDeposition } from './fileBackend';
+import { droppedByDeposition, fileTicketState } from './fileBackend';
+import { commitAnswerOwed } from './workingSet';
 import { currentLedger, currentModule, installInteractionLedgers, landed, ledgerOf, openLedger, runInLedger, type LedgerCause, type LedgerTicket, type WriteLedger } from './writeLedger';
 
 /** From the interaction's emit to the gate's own defer. Discord's 3 s also pays the gateway's delivery and the callback. */
@@ -156,7 +157,7 @@ async function judge(pending: Pending, waitMs = CONFIRM_MS): Promise<Verdict> {
     const verdict: Verdict = {
       ok: false,
       answer,
-      partial: pending.tickets.some(ticket => landed(ticket) || !(ticket.kind === 'file' && droppedByDeposition(ticket.record))),
+      partial: pending.tickets.some(ticket => landed(ticket) || !(ticket.kind === 'file' && droppedByDeposition(ticket.record) && fileTicketState(ticket) === 'open')),
       failed: pending.refused.map(r => ({ refusal: refusalKey(r) })),
     };
     // The operator's answer to a write the bot cannot store names every refused document and the accepted writes' state.
@@ -168,20 +169,28 @@ async function judge(pending: Pending, waitMs = CONFIRM_MS): Promise<Verdict> {
     };
   }
   const first = await Promise.all(pending.unlanded.map(ticket => confirmWrite(ticket, waitMs).catch(() => 'unavailable' as const)));
-  // A held write is retried while slower confirms finish, so it is read again when the verdict is taken.
-  const confirmed = await Promise.all(first.map((answer, i) => answer !== 'held'
-    ? answer
-    : confirmWrite(pending.unlanded[i], 0).then(now => (now === 'pending' ? 'held' as const : now), () => 'unavailable' as const)));
+  // A held write is retried while slower confirms finish, so it is read again when the verdict is taken. Its 'pending'
+  // stays pending while a COMMIT that may carry it owes its answer.
+  const confirmed = await Promise.all(first.map((answer, i) => {
+    if (answer !== 'held') return answer;
+    const ticket = pending.unlanded[i];
+    return confirmWrite(ticket, 0).then(now => (now === 'pending' && !(ticket.kind === 'ws' && commitAnswerOwed(ticket)) ? 'held' as const : now), () => 'unavailable' as const);
+  }));
   const answers = confirmed.map((answer, i): TruthAnswer | 'ok' => {
     const ticket = pending.unlanded[i];
-    return answer === 'unavailable' && ticket.kind === 'file' && droppedByDeposition(ticket.record) ? 'writer-lost' : answer;
+    // Only a line the deposition stopped before any of its bytes reached the file is known not saved.
+    return answer === 'unavailable' && ticket.kind === 'file' && droppedByDeposition(ticket.record) && fileTicketState(ticket) === 'open' ? 'writer-lost' : answer;
   });
   const failed = pending.unlanded.filter((_, i) => answers[i] !== 'ok');
   if (failed.length === 0) return { ok: true };
-  const partial = answers.some(answer => answer === 'ok') || pending.tickets.length > pending.unlanded.length || pending.landedBefore;
+  const bad = answers.filter((answer): answer is Exclude<typeof answer, 'ok'> => answer !== 'ok');
+  const answer = worst(bad);
+  // NB13 C6: a write of unknown fate beside a worse answer may be stored, so the change is not saved in full.
+  const partial = answers.some(a => a === 'ok') || pending.tickets.length > pending.unlanded.length || pending.landedBefore
+    || bad.some(a => a === 'unavailable' && a !== answer);
   return {
     ok: false,
-    answer: worst(answers.filter((answer): answer is Exclude<typeof answer, 'ok'> => answer !== 'ok')),
+    answer,
     partial,
     failed: failed.map(ticket => ({ key: keyOf(ticket), seq: ticket.seq })),
   };
@@ -203,18 +212,23 @@ export async function verdictOf(ledgers: WriteLedger[]): Promise<WritesVerdict> 
 
 async function failuresOf(ledgers: WriteLedger[]): Promise<Verdict> {
   const deadline = performance.now() + CONFIRM_MS;
-  const confirmed = new Map<object, number>();
+  // D8: per key, the seqs answered ok; a lower ticket recorded after a higher one was confirmed is still judged.
+  const confirmed = new Map<object, Set<number>>();
   for (;;) {
     const read = pendingIn(ledgers);
     const pending = {
       ...read,
-      unlanded: read.unlanded.filter(ticket => (confirmed.get(keyOf(ticket)) ?? -1) < ticket.seq),
+      unlanded: read.unlanded.filter(ticket => !confirmed.get(keyOf(ticket))?.has(ticket.seq)),
       landedBefore: read.landedBefore || confirmed.size > 0,
     };
     if (pending.refused.length === 0 && pending.unlanded.length === 0) return { ok: true };
     const verdict = await judge(pending, Math.max(0, deadline - performance.now()));
     if (!verdict.ok) return verdict;
-    for (const ticket of pending.unlanded) confirmed.set(keyOf(ticket), ticket.seq);
+    for (const ticket of pending.unlanded) {
+      const seqs = confirmed.get(keyOf(ticket)) ?? new Set<number>();
+      seqs.add(ticket.seq);
+      confirmed.set(keyOf(ticket), seqs);
+    }
   }
 }
 

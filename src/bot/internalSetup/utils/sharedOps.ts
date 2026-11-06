@@ -221,10 +221,11 @@ export function partialEndingIn(text: unknown): string | null {
   return at.length > 0 ? text.slice(Math.min(...at)) : null;
 }
 
+/** NB13 D4: a path is named saved only when the listed tickets hold a landed one of it and none of it not landed. */
 function landedNames(ledger: WriteLedger): string[] {
-  return [...new Set(ledger.tickets().map(entry => entry.ticket)
-    .filter(ticket => ticket.kind === 'file' && landed(ticket))
-    .map(ticket => path.basename((ticket as { path: string }).path)))];
+  const files = ledger.tickets().map(entry => entry.ticket).filter(ticket => ticket.kind === 'file') as Array<{ path: string } & Parameters<typeof landed>[0]>;
+  const open = new Set(files.filter(ticket => !landed(ticket)).map(ticket => ticket.path));
+  return [...new Set(files.filter(ticket => landed(ticket) && !open.has(ticket.path)).map(ticket => path.basename(ticket.path)))];
 }
 
 /** A partial answer drops its closing "Please ..." request and ends with partialEnding. */

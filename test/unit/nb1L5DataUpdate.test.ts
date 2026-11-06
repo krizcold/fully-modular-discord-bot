@@ -90,7 +90,7 @@ describe('what an update tells the operator and the caller', () => {
   it('a file with appends still queued is refused with an error naming the file', () => {
     const error = vi.spyOn(console, 'error').mockImplementation(() => {});
     const r = fileGuild();
-    enqueueAppend(dataPath(r.options.guildId!, r.options.category!, 'doc.json'), '{"a":1}\n');
+    enqueueAppend(r.file, '{"a":1}\n');
     expect(dm.updateData('doc.json', r.options, {}, d => d)).toEqual({ outcome: 'refused', cause: 'io' });
     expect(messages(error).some(m => m.includes('doc.json') && m.includes('appended lines are still queued'))).toBe(true);
   });
