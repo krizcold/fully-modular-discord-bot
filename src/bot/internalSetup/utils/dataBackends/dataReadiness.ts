@@ -184,6 +184,16 @@ export class DataReadinessDriver {
     return this.shardIds.includes(guildIdToShardId(guildId, this.shardCount));
   }
 
+  /** Whether the guild's shard is in this process's lease (NB7 decision 2). */
+  servesGuild(guildId: string): boolean {
+    return this.isLeasedHere(guildId);
+  }
+
+  /** Whether the process's lease was granted; NB4 decision 7 fixes it for the process's life. */
+  leaseSet(): boolean {
+    return this.lease !== null;
+  }
+
   private fenceFor(guildId: string): FenceToken {
     const lease = this.lease;
     const shardId = guildIdToShardId(guildId, this.shardCount || 1);

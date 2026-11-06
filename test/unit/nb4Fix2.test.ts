@@ -27,7 +27,7 @@ vi.mock('../../src/bot/internalSetup/utils/dataBackends/boot', async importOrigi
 
 vi.mock('../../src/bot/internalSetup/utils/dataBackends/dataReadiness', async importOriginal => {
   const real: any = await importOriginal();
-  return { ...real, getDataReadiness: () => ({ onLeaseChanged: () => undefined }) };
+  return { ...real, getDataReadiness: () => ({ onLeaseChanged: () => undefined, leaseSet: () => true, servesGuild: () => true }) };
 });
 
 vi.mock('../../src/bot/internalSetup/utils/dataBackends/fileBackend', async importOriginal => {
@@ -193,10 +193,10 @@ describe("the deferral's rest is shown from u' (NB4-R2-RUN-3)", () => {
 });
 
 describe("the panel's namespace delete and graveyard restore after the claims lapsed (NB4-R2-2)", () => {
-  it.each(['delete-namespace', 'restore-graveyard'] as const)('%s answers frozen and writes nothing once stoppedServing is true', async op => {
+  it.each(['delete-namespace', 'restore-graveyard'] as const)('%s answers not-held (NB7 decision 2) and writes nothing once stoppedServing is true', async op => {
     setStoppedServingHook(() => true);
     const reply = await applyOperatorDataWrite({ guildId: '123', module: '', filename: '', op });
-    expect(reply).toEqual({ ok: false, code: 'frozen' });
+    expect(reply).toEqual({ ok: false, code: 'not-held' });
     expect(h.restores + h.deletes).toBe(0);
   });
 

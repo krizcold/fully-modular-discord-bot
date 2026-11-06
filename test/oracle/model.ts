@@ -1,6 +1,7 @@
 import fc from 'fast-check';
 import { expect } from 'vitest';
 import type * as JudgeModule from './judge.mjs';
+import { hashOf } from './oracle.mjs';
 
 // A model of a correct store, and every check the checker must pass, written
 // against a judge module so the same checks also run against mutants of it.
@@ -195,6 +196,45 @@ const fleetNode = (nodeId: string, leases: number[], over: Partial<{
 });
 /** n acknowledged unique writes by one lane, at t = 10, 20, ... */
 const ackedRun = (lane: string, n: number) => Array.from({ length: n }, (_, i) => [send(i + 1, lane, u(lane, i + 1), i + 1, `x${i + 1}`, (i + 1) * 10), ans(i + 1, (i + 1) * 10 + 1)]).flat();
+
+// The request route's rows (NB7): each shape is a guild_requests row as a holder can leave it.
+type Shape = 'no-row' | 'pending' | 'expired' | 'applying' | 'ok' | 'held' | 'refused' | 'unapplied' | 'not-held';
+const REPLIES: Partial<Record<Shape, string>> = {
+  ok: '{"ok":true}',
+  held: '{"ok":true,"pending":true}',
+  refused: '{"ok":false,"code":"frozen","error":"Guild data is frozen"}',
+  unapplied: '{"ok":false,"code":"not-taken","unapplied":true}',
+  'not-held': '{"ok":false,"code":"not-held"}',
+};
+const STARTED: Shape[] = ['applying', 'ok', 'held', 'refused'];
+/** The rows a correct request route leaves for an op with this answer; no row is the local route's. */
+function shapesFor(o: Op): Shape[] {
+  if (o.cls === 'ACKED') return ['no-row', 'ok'];
+  if (o.cls === 'HELD') return ['no-row', 'held'];
+  if (o.cls === 'REFUSED-D') return ['no-row', 'pending', 'expired', 'unapplied', 'not-held', 'refused'];
+  return o.effectAt !== null ? ['no-row', 'applying', 'ok', 'held', 'refused'] : ['no-row', 'pending', 'expired', 'applying', 'unapplied', 'not-held', 'refused'];
+}
+/** The rows that contradict the op's answer. */
+function falseShapesFor(o: Op): Shape[] {
+  if (o.cls === 'ACKED') return ['pending', 'expired', 'applying', 'held', 'refused', 'unapplied', 'not-held'];
+  if (o.cls === 'HELD') return ['pending', 'expired', 'applying', 'ok', 'refused', 'unapplied', 'not-held'];
+  if (o.cls === 'REFUSED-D') return ['applying', 'ok', 'held'];
+  return [];
+}
+function rowOf(o: Op, shape: Shape, id: string) {
+  const state = shape === 'pending' || shape === 'expired' || shape === 'applying' ? shape : 'done';
+  return { id, op: o.op, state, key: o.key, h: o.h, taken: shape !== 'pending' && shape !== 'expired', reply: REPLIES[shape] ?? null };
+}
+/** A request listing of a world, each op's row picked from the ones a correct route leaves. */
+function requestsOf(world: World, picks: number[]) {
+  const shapes = new Map<Op, Shape>(world.ops.map((o, i) => {
+    const allowed = shapesFor(o);
+    return [o, allowed[picks[i % picks.length] % allowed.length]];
+  }));
+  const rows = world.ops.filter(o => shapes.get(o) !== 'no-row').map(o => rowOf(o, shapes.get(o) as Shape, `r${o.id}`));
+  return { shapes, listing: { name: 'requests', rows } };
+}
+const picksArb = fc.array(fc.nat(), { minLength: 50, maxLength: 50 });
 
 export interface Check { name: string; run: (J: J, numRuns: number) => void }
 
@@ -771,6 +811,86 @@ export function checks(): Check[] {
       expect(controls(outOfRange(2), outOfRange(4))).toEqual(['CONTROL']);
       expect(J.judge({ history, copies, k: 0, fleet: outOfRange(2), fleetAgain: outOfRange(4) }).notes).toEqual([]);
       expect(J.judge({ history, copies, k: 0, fleet: handoff, fleetAgain: handoff }).verdicts.map(v => v.v)).toEqual(['CONTROL']);
+    } },
+
+    // The request route's rows (NB7): each send against the rows that carry it.
+    { name: 'no verdict from the request rows a correct request route leaves', run: (J, numRuns) => fc.assert(fc.property(worldArb, picksArb, (world, picks) => {
+      silent(J.judge({ history: J.buildHistory(logsOf(world)), copies: [copyOf('db', world.final)], k: 0, noFleet: true, requests: [requestsOf(world, picks).listing] }));
+    }), { numRuns }) },
+    { name: 'TWICE: a send started by holders twice', run: (J, numRuns) => fc.assert(fc.property(worldArb, picksArb, fc.nat(), (world, picks, pick) => {
+      const { shapes, listing } = requestsOf(world, picks);
+      const started = world.ops.filter(o => STARTED.includes(shapes.get(o) as Shape));
+      fc.pre(started.length > 0);
+      const o = started[pick % started.length];
+      listing.rows.push(rowOf(o, shapes.get(o) as Shape, `again-${o.id}`));
+      only(J.judge({ history: J.buildHistory(logsOf(world)), copies: [copyOf('db', world.final)], k: 0, noFleet: true, requests: [listing] }), 'TWICE', o.key);
+    }), { numRuns }) },
+    { name: 'FALSE-ANSWER: an answer its request row contradicts', run: (J, numRuns) => fc.assert(fc.property(worldArb, picksArb, fc.nat(), fc.nat(), (world, picks, pick, which) => {
+      const { listing } = requestsOf(world, picks);
+      const cases = world.ops.filter(o => falseShapesFor(o).length > 0);
+      fc.pre(cases.length > 0);
+      const o = cases[pick % cases.length];
+      const bad = falseShapesFor(o)[which % falseShapesFor(o).length];
+      listing.rows = listing.rows.filter(r => r.id !== `r${o.id}`);
+      listing.rows.push(rowOf(o, bad, `bad-${o.id}`));
+      only(J.judge({ history: J.buildHistory(logsOf(world)), copies: [copyOf('db', world.final)], k: 0, noFleet: true, requests: [listing] }), 'FALSE-ANSWER', o.key);
+    }), { numRuns }) },
+    { name: 'request rows are read from their listing lines and judged by send', run: J => {
+      const content = (n: number) => ({ run: RUN, lane: 'a', kind: 'u', key: u('a', n), c: n, pad: `p${n}` });
+      const write = (id: number, n: number, at: number) => send(id, 'a', u('a', n), n, hashOf(content(n)), at);
+      const line = (id: string, op: string, state: string, n: number, taken: boolean, reply: string | null, c: unknown = op === 'write' ? content(n) : null) =>
+        JSON.stringify({ id, op, state, k: u('a', n), c: c === null ? null : JSON.stringify(c, null, 2), taken, reply });
+      const log = [
+        start(['a']),
+        write(1, 1, 10), ans(1, 15),
+        { t: 'send', id: 2, lane: 'a', op: 'delete', kind: 'u', key: u('a', 1), c: 0, h: null, at: 20 }, ans(2, 25),
+        write(3, 3, 30), { t: 'ans', id: 3, at: 35, status: 503, cls: 'REFUSED', definite: true },
+        write(4, 4, 40), ans(4, 45, 'HELD'),
+        { t: 'end' },
+      ];
+      const copies = [copyOf('db', new Map([[u('a', 4), hashOf(content(4))]]))];
+      const judged = (lines: string[]) => J.judge({ history: J.buildHistory([log]), copies, k: 0, noFleet: true, requests: [J.parseRequests('req', lines.join('\n'))] });
+      const verdicts = (lines: string[]) => judged(lines).verdicts.map(v => `${v.v} ${v.key}`);
+      const good = [
+        line('r1', 'write', 'done', 1, true, REPLIES.ok as string),
+        line('r2', 'delete', 'done', 1, true, REPLIES.ok as string),
+        line('r3', 'write', 'expired', 3, false, null),
+        line('r4', 'write', 'done', 4, true, REPLIES.held as string),
+      ];
+      // Stored content is pretty-printed and its keys may come in any order: the hash is the send's.
+      expect(J.parseRequests('req', good[0]).rows[0]).toEqual({ id: 'r1', op: 'write', state: 'done', key: u('a', 1), h: hashOf(content(1)), taken: true, reply: REPLIES.ok });
+      expect(J.parseRequests('req', line('r1', 'write', 'done', 1, true, null, { pad: 'p1', c: 1, key: u('a', 1), kind: 'u', lane: 'a', run: RUN })).rows[0].h).toBe(hashOf(content(1)));
+      expect(verdicts(good)).toEqual([]);
+      // A holder's not-held or unapplied answer means it started nothing.
+      expect(verdicts([...good.slice(0, 2), line('r3', 'write', 'done', 3, true, REPLIES['not-held'] as string), good[3]])).toEqual([]);
+      expect(verdicts([...good.slice(0, 2), line('r3', 'write', 'done', 3, true, REPLIES.unapplied as string), good[3]])).toEqual([]);
+      expect(verdicts([...good.slice(0, 2), line('r3', 'write', 'done', 3, true, REPLIES.refused as string), good[3]])).toEqual([]);
+      expect(verdicts([...good, line('r1b', 'write', 'done', 1, true, REPLIES['not-held'] as string)])).toEqual([]);
+      expect(verdicts([...good, line('r1b', 'write', 'expired', 1, false, null)])).toEqual([]);
+      // A refusal given as never applied, on a row a holder took and left unanswered or answered ok.
+      expect(verdicts([...good.slice(0, 2), line('r3', 'write', 'applying', 3, true, null), good[3]])).toEqual([`FALSE-ANSWER ${u('a', 3)}`]);
+      expect(verdicts([...good.slice(0, 2), line('r3', 'write', 'done', 3, true, REPLIES.ok as string), good[3]])).toEqual([`FALSE-ANSWER ${u('a', 3)}`]);
+      // A 200 needs the holder's ok, and a 202 its accepted answer.
+      expect(verdicts([line('r1', 'write', 'done', 1, true, REPLIES.held as string), ...good.slice(1)])).toEqual([`FALSE-ANSWER ${u('a', 1)}`]);
+      expect(verdicts([line('r1', 'write', 'applying', 1, true, null), ...good.slice(1)])).toEqual([`FALSE-ANSWER ${u('a', 1)}`]);
+      expect(verdicts([...good.slice(0, 3), line('r4', 'write', 'done', 4, true, REPLIES.ok as string)])).toEqual([`FALSE-ANSWER ${u('a', 4)}`]);
+      expect(verdicts([line('r1', 'write', 'done', 1, true, '{"ok":tru'), ...good.slice(1)])).toEqual([`FALSE-ANSWER ${u('a', 1)}`]);
+      // A delete is carried by its key.
+      expect(verdicts([good[0], line('r2', 'delete', 'expired', 1, false, null), ...good.slice(2)])).toEqual([`FALSE-ANSWER ${u('a', 1)}`]);
+      // Two started rows of one send, whatever each answered.
+      expect(verdicts([...good, line('r1b', 'write', 'applying', 1, true, null)])).toEqual([`TWICE ${u('a', 1)}`]);
+      expect(verdicts([...good, line('r2b', 'delete', 'done', 1, true, REPLIES.refused as string)])).toEqual([`TWICE ${u('a', 1)}`]);
+      // A started row no writer sent; one never started, or of an op the writer never sends, is not judged.
+      expect(verdicts([...good, line('r9', 'write', 'done', 9, true, REPLIES.ok as string)])).toEqual([`PHANTOM ${u('a', 9)}`]);
+      expect(verdicts([...good, line('r1c', 'write', 'done', 1, true, REPLIES.ok as string, { other: true })])).toEqual([`PHANTOM ${u('a', 1)}`]);
+      expect(verdicts([...good, line('r9', 'write', 'pending', 9, false, null)])).toEqual([]);
+      expect(verdicts([...good, line('r9', 'restore-graveyard', 'done', 9, true, REPLIES.ok as string, null)])).toEqual([]);
+      // A listing it cannot read is refused; an empty one is judged, with a note.
+      expect(() => J.parseRequests('req', `${good[0]}\nnot json`)).toThrow(/req line 2/);
+      expect(() => J.parseRequests('req', JSON.stringify({ id: 'r1', op: 'write', state: 'done', k: u('a', 1), c: null }))).toThrow(/req line 1 needs/);
+      const empty = judged([]);
+      expect(empty.verdicts).toEqual([]);
+      expect(empty.notes.join('\n')).toMatch(/req holds no request row of this run/);
     } },
   ];
 }

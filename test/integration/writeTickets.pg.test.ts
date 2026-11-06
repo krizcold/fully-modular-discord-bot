@@ -3,7 +3,7 @@ import type { StartedPostgreSqlContainer } from '@testcontainers/postgresql';
 import type { Pool } from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { FenceToken } from '../../src/bot/internalSetup/utils/dataBackends/backend';
-import { PostgresBackend } from '../../src/bot/internalSetup/utils/dataBackends/postgresBackend';
+import { PostgresBackend, SCHEMA_VERSION } from '../../src/bot/internalSetup/utils/dataBackends/postgresBackend';
 import { setBackendKind } from '../helpers/backendKind';
 import { initWorkingSet, WorkingSetManager } from '../../src/bot/internalSetup/utils/dataBackends/workingSet';
 import { confirmWrite, saveDataTracked } from '../../src/bot/internalSetup/utils/dataManager';
@@ -197,9 +197,9 @@ describe('the claim fence on a real Postgres', () => {
     'SELECT node_id, claim FROM smdb_data.guild_ownership WHERE guild_id = $1', [guildId])).rows[0];
   let guilds = 525000;
 
-  it('a fresh database is provisioned at version 3, with claim_seq and a claim column in place of term and epoch', async () => {
+  it('a fresh database is provisioned at the current schema version, with claim_seq and a claim column in place of term and epoch', async () => {
     const version = await direct.query(`SELECT value FROM smdb_data.meta WHERE key = 'schema_version'`);
-    expect(version.rows[0].value).toBe('{"v":3}');
+    expect(version.rows[0].value).toBe(JSON.stringify({ v: SCHEMA_VERSION }));
     const seq = await direct.query(`SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'smdb_data' AND c.relname = 'claim_seq' AND c.relkind = 'S'`);
     expect(seq.rowCount).toBe(1);
     const columns = await direct.query(`SELECT column_name FROM information_schema.columns WHERE table_schema = 'smdb_data' AND table_name = 'guild_ownership'`);

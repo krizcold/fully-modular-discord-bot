@@ -36,7 +36,8 @@ import { maintenanceText, runTracked } from './maintenanceGate';
 import { ROOT_CONFIG_PATH } from './configManager';
 import { isInternalGlobalRel } from './configDiscovery';
 import { DataBackendUnavailableError, getWorkingSet } from './dataBackends/workingSet';
-import { awaitGuildDataReady } from './dataBackends/boot';
+import { awaitGuildDataReady, servedElsewhere } from './dataBackends/boot';
+import { getDataReadiness } from './dataBackends/dataReadiness';
 import { canonicalGuildKey } from './dataKeys';
 import { stoppedServing } from './servingGate';
 import { truthText } from './dataBackends/replyGate';
@@ -44,7 +45,7 @@ import { checkWriterLock, deposedHolder, deposedText } from './writerLock';
 import { monoNow } from './dataBackends/postgresBackend';
 import { resolveDataBackend } from '../../../utils/envLoader';
 
-type DataOpCode = 'frozen' | 'not-owner' | 'backend-unavailable' | 'bot-down' | 'invalid' | 'io-error' | 'maintenance' | 'changed' | 'changed-since-open' | 'held-elsewhere';
+type DataOpCode = 'frozen' | 'not-owner' | 'backend-unavailable' | 'bot-down' | 'invalid' | 'io-error' | 'maintenance' | 'changed' | 'changed-since-open' | 'held-elsewhere' | 'not-held';
 
 /** A read a write was built on: the sha256 hex of the raw text read, or 'absent'. */
 export type ExpectSha = string;
@@ -64,6 +65,8 @@ export interface DataWriteReply {
   pending?: boolean;
   /** Why an accepted write is not durable yet. */
   note?: string;
+  /** changed: whether the target or its global twin changed since the read the body was built on. */
+  which?: 'target' | 'twin';
   /** A graveyard restore's entry, its reason and, on a database, the rows it moved. */
   retiredAt?: number;
   reason?: string;
@@ -187,9 +190,21 @@ function retiredAtOf(req: GuildDataWriteRequest): { retiredAt?: number } | DataW
   return { retiredAt: value };
 }
 
+/**
+ * NB7 decision 2: a Postgres process whose set lease leaves out the guild's shard, or that stopped serving, never
+ * serves the guild again in its life. Synchronous, so nothing is read, hydrated, held or written before it answers.
+ */
+function notHeldHere(guildId: string): boolean {
+  if (resolveDataBackend() !== 'postgres' || !getDataReadiness()?.leaseSet()) return false;
+  return servedElsewhere(guildId) || stoppedServing();
+}
+
+const NOT_HELD: DataWriteReply = { ok: false, code: 'not-held' };
+
 async function operatorDataWrite(req: GuildDataWriteRequest, own: { ticket?: WriteTicket; threw?: boolean }, receivedAt: bigint): Promise<DataWriteReply> {
   const invalid = validateWrite(req);
   if (invalid) return { ok: false, code: 'invalid', error: invalid };
+  if (notHeldHere(req.guildId)) return { ...NOT_HELD };
   const { guildId, module, filename, op } = req;
   const check = checkWriterLock();
   if (check.kind === 'deposed') return { ok: false, code: 'held-elsewhere', error: deposedText(check.holder) };
@@ -302,13 +317,13 @@ async function graveyardOp(req: GuildDataWriteRequest, receivedAt: bigint): Prom
 function compareRead(req: GuildDataWriteRequest): DataWriteReply | null {
   const changed = (): DataWriteReply => req.sinceOpen
     ? { ok: false, code: 'changed-since-open', error: CHANGED_SINCE_OPEN_TEXT }
-    : { ok: false, code: 'changed', error: CHANGED_TEXT };
+    : { ok: false, code: 'changed', which: 'target', error: CHANGED_TEXT };
   try {
     if (req.expectSha !== undefined && shaOfRaw(readGuildDocRaw(req.guildId, req.module, req.filename)) !== req.expectSha) return changed();
     if (req.twin) {
       const twin = applyOperatorGlobalRead({ root: req.twin.root, rel: req.twin.rel });
       if (!twin.ok) return { ok: false, code: 'invalid', error: twin.error ?? 'the global twin cannot be read' };
-      if (shaOfRaw(twin.contentJson ?? null) !== req.twin.expectSha) return { ok: false, code: 'changed', error: CHANGED_TEXT };
+      if (shaOfRaw(twin.contentJson ?? null) !== req.twin.expectSha) return { ok: false, code: 'changed', which: 'twin', error: CHANGED_TEXT };
     }
   } catch (error) {
     const code = (error as NodeJS.ErrnoException)?.code;
@@ -321,6 +336,7 @@ export async function applyOperatorDataRead(req: GuildDataReadRequest): Promise<
   if (!/^\d+$/.test(req.guildId ?? '')) return { ok: false, code: 'invalid', error: 'invalid guildId' };
   if (req.module !== '' && !validSegment(req.module, false)) return { ok: false, code: 'invalid', error: 'invalid module' };
   if (req.filename !== undefined && !validSegment(req.filename, true)) return { ok: false, code: 'invalid', error: 'invalid filename' };
+  if (notHeldHere(req.guildId)) return { ok: false, code: 'not-held' };
   if (!(await awaitGuildDataReady(req.guildId))) {
     return { ok: false, code: 'backend-unavailable', error: 'guild data is not ready' };
   }
@@ -377,6 +393,20 @@ export function applyOperatorGlobalRead(req: GlobalDataReadRequest): GlobalDataR
   return raw === null ? { ok: true, ...state } : { ok: true, contentJson: raw, ...state };
 }
 
+/**
+ * One guild change as the bot process answers it, from the web UI's IPC message or from a request row another
+ * machine's web panel sent (NB7 decision 7): the maintenance refusal first, then the tracked executor.
+ */
+export async function answerGuildWrite(data: GuildDataWriteRequest): Promise<DataWriteReply> {
+  const refusal = maintenanceIpcRefusal('data:guild-write');
+  if (refusal) return refusal as DataWriteReply;
+  try {
+    return await runTracked(() => applyOperatorDataWrite((data || {}) as GuildDataWriteRequest));
+  } catch (error) {
+    return { ok: false, code: 'io-error', error: error instanceof Error ? error.message : 'Unknown error' };
+  }
+}
+
 export function setupDataIPCHandlers(): void {
   if (!process.send) {
     console.warn('[IPCDataHandler] process.send not available - guild data IPC not registered');
@@ -388,16 +418,17 @@ export function setupDataIPCHandlers(): void {
     if (!message || typeof message !== 'object') return;
     const { type, requestId, data } = message as { type?: string; requestId?: string; data?: any };
     if ((type !== 'data:guild-write' && type !== 'data:guild-read') || !requestId) return;
+    if (type === 'data:guild-write') {
+      process.send!({ requestId, data: await answerGuildWrite((data || {}) as GuildDataWriteRequest) });
+      return;
+    }
     const refusal = maintenanceIpcRefusal(type);
     if (refusal) {
       process.send!({ requestId, data: refusal });
       return;
     }
     try {
-      const response = type === 'data:guild-write'
-        ? await runTracked(() => applyOperatorDataWrite((data || {}) as GuildDataWriteRequest))
-        : await applyOperatorDataRead((data || {}) as GuildDataReadRequest);
-      process.send!({ requestId, data: response });
+      process.send!({ requestId, data: await applyOperatorDataRead((data || {}) as GuildDataReadRequest) });
     } catch (error) {
       process.send!({ requestId, data: { ok: false, code: 'io-error', error: error instanceof Error ? error.message : 'Unknown error' } });
     }

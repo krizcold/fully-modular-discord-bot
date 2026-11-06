@@ -17,7 +17,7 @@ import { confirmSaved, saveData, saveDataOutcome } from '../../src/bot/internalS
 import { freezeGuildWrites, unfreezeGuildWrites } from '../helpers/freezeGuild';
 import { handleInvoke } from '../../src/bot/internalSetup/utils/ipcCommandHandler';
 import { runPanelAction } from '../../src/bot/internalSetup/utils/ipcPanelHandler';
-import { fakeClock, NOT_LEASED, readinessRig, stopDrivers, watch } from '../helpers/readinessRig';
+import { fakeClock, readinessRig, stopDrivers, watch } from '../helpers/readinessRig';
 
 afterEach(() => {
   setManifestReader(null);
@@ -37,7 +37,7 @@ describe('a panel action', () => {
     ['loading', 'a guild still loading'],
   ] as const)('%s for %s', async (cause, _what) => {
     fakeClock();
-    const r = readinessRig(cause === 'not-served' ? NOT_LEASED : undefined);
+    const r = readinessRig(cause === 'not-served' ? null : undefined);
     if (cause === 'loading') r.store.hydrateMode = 'held';
     const guildId = r.guild();
     const pm = manager(async () => ({ success: true }));
@@ -79,7 +79,7 @@ describe('a console invoke', () => {
     fakeClock();
     const ran = vi.fn();
     local.commands = [{ name: 'probe', callback: ran }];
-    const r = readinessRig(cause === 'not-served' ? NOT_LEASED : undefined);
+    const r = readinessRig(cause === 'not-served' ? null : undefined);
     if (cause === 'loading') r.store.hydrateMode = 'held';
     const guildId = r.guild();
     const answer = watch(invoke(guildId));

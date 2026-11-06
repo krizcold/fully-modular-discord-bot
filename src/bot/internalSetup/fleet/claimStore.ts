@@ -6,6 +6,7 @@ import type { PoolClient, QueryConfig } from 'pg';
 import { isLoginRefused } from '../utils/dataBackends/postgresBackend';
 import {
   CLOCK_GAP_CAP_MS,
+  claimState,
   decideShardCount,
   planTake,
   qualifiesAsReceiver,
@@ -17,7 +18,44 @@ import {
   type NodeRow,
   type Pair,
   type TakePlan,
+  type ClaimState,
 } from './claimRules';
+
+/** What the holder check (guildRequestSql.ts HOLDER_CHECK_SQL) found: no stored count, or the shard and its row's state. */
+export type HolderCheck =
+  | { kind: 'no-count' }
+  | {
+    kind: 'row';
+    shardCount: number;
+    shardId: number;
+    /** 'none': the shard has no claim row. */
+    state: ClaimState | 'none';
+    holderProcess: string | null;
+    holderNode: string | null;
+    holderName: string | null;
+  };
+
+/** NB4 decision 21's state of the row the holder check read, judged as the fleet page judges it (claimState). */
+export function holderStateOf(rows: any[]): HolderCheck {
+  const r = rows[0];
+  if (!r || r.n === null || r.n === undefined) return { kind: 'no-count' };
+  const base = { kind: 'row' as const, shardCount: Number(r.n), shardId: Number(r.shard) };
+  if (r.holder_process === null || r.holder_process === undefined) {
+    return { ...base, state: 'none', holderProcess: null, holderNode: null, holderName: null };
+  }
+  const row: ClaimRow = {
+    shardCount: base.shardCount, shardId: base.shardId, claim: Number(r.claim), holderProcess: r.holder_process,
+    holderNode: r.holder_node, holderName: r.holder_name, homeNode: r.holder_node, released: r.released === true,
+    reserved: r.reserved === true, takenAt: 0, renewedAt: 0, ttlMs: Number(r.ttl_ms), expiresUpMs: Number(r.expires_up_ms), extended: false,
+  };
+  const node: NodeRow | undefined = r.node_process_id === null || r.node_process_id === undefined ? undefined : {
+    nodeId: r.holder_node, nodeName: r.holder_name, processId: r.node_process_id, capacity: 0,
+    takeoverSeconds: Number(r.node_takeover_seconds), fit: false, restartable: false, returns: false,
+    seenAgoMs: Number(r.node_seen_ago_ms), healthyForMs: null,
+  };
+  const { state } = claimState(row, Number(r.renewed_ago_ms), node, Number(r.up_ms));
+  return { ...base, state, holderProcess: r.holder_process, holderNode: r.holder_node, holderName: r.holder_name };
+}
 
 export const CLAIMS_APPLICATION_NAME = 'smdb-claims';
 const CLAIM_LOCK = `SELECT pg_advisory_xact_lock(hashtext('smdb_data_claim'))`;

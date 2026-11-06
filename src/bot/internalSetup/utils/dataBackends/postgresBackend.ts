@@ -22,7 +22,7 @@ import type {
   RetireOutcome,
 } from './backend';
 
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 4;
 const PROVISION_VERDICT_POLL_MS = 250;
 const PARTITION_COUNT = 32;
 const MAX_ROWS_PER_STATEMENT = 200;
@@ -122,6 +122,27 @@ const PROVISION_DDL: string[] = [
     PRIMARY KEY (guild_id, retired_at, module, filename)
   )`,
   `CREATE INDEX IF NOT EXISTS guild_graveyard_ttl_idx ON smdb_data.guild_data_graveyard (retired_at)`,
+  `CREATE TABLE IF NOT EXISTS smdb_data.guild_requests (
+    id            uuid        PRIMARY KEY,
+    guild_id      text        NOT NULL,
+    shard_count   integer     NOT NULL,
+    shard_id      integer     NOT NULL,
+    for_process   text        NOT NULL,
+    op            text        NOT NULL CHECK (op IN ('write','delete','delete-namespace','restore-graveyard')),
+    body          text        NOT NULL,
+    requested_by  text        NOT NULL,
+    state         text        NOT NULL DEFAULT 'pending' CHECK (state IN ('pending','applying','done','expired')),
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    claim_by      timestamptz NOT NULL,
+    answer_by     timestamptz NOT NULL,
+    claim_batch   uuid,
+    applier_claim bigint,
+    taken_at      timestamptz,
+    reply         text,
+    done_at       timestamptz
+  )`,
+  `CREATE INDEX IF NOT EXISTS guild_requests_pending_idx ON smdb_data.guild_requests (for_process, created_at) WHERE state = 'pending'`,
+  `CREATE INDEX IF NOT EXISTS guild_requests_applying_idx ON smdb_data.guild_requests (claim_batch) WHERE state = 'applying'`,
 ];
 
 /**

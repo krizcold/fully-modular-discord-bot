@@ -9,6 +9,7 @@ import { listGraveyardEntries } from '../../bot/internalSetup/utils/dataManager'
 import { readFileMarker, recognitionRefusal } from '../../bot/internalSetup/utils/dataBackends/recognitionGuard';
 import { getWebuiDataReader, isDataBackendUnreachable } from '../utils/webuiDataReader';
 import { hopFailure } from './hopFailure';
+import { planGuildChange, remoteRestoreNoAnswerCause, sendGuildChange } from '../utils/guildRequests';
 
 const NO_ANSWER_CAUSE: Record<string, string> = {
   timeout: 'the bot did not answer within 50 s',
@@ -98,16 +99,26 @@ export function createGraveyardRoutes(botManager: BotManager): Router {
         res.status(503).json({ success: false, error: `Nothing was restored: ${refusal}.` });
         return;
       }
-      const reply = await botManager.writeGuildData({
+      const plan = await planGuildChange(botManager, guildId, 'restore-graveyard');
+      if (plan.kind === 'refuse' && plan.reply?.code === 'invalid') {
+        res.status(400).json({ success: false, error: plan.reply.error });
+        return;
+      }
+      const reply = await sendGuildChange(botManager, plan, {
         guildId,
         module: '',
         filename: '',
         op: 'restore-graveyard',
         contentJson: JSON.stringify({ retiredAt }),
       });
+      // NB7 decision 9: another machine's answer is prefixed with its name; the sender's own answers are not.
+      const servedBy = reply && typeof reply.servedBy === 'string' ? reply.servedBy : null;
+      const on = (text: string) => (servedBy && !reply.sender ? `On ${servedBy}: ${text}` : text);
+      const by = servedBy ? { servedBy } : {};
       // No answer from the bot: whatever the code, the restore may have landed.
       if (reply?.noAnswer) {
-        res.status(503).json({ success: false, error: `can't confirm whether server ${guildId} was restored: ${NO_ANSWER_CAUSE[reply.noAnswer as string] ?? NO_ANSWER_CAUSE.failed}. ${RESTORE_MINUTE}` });
+        const cause = servedBy ? remoteRestoreNoAnswerCause(reply.noAnswer, servedBy) : NO_ANSWER_CAUSE[reply.noAnswer as string] ?? NO_ANSWER_CAUSE.failed;
+        res.status(503).json({ success: false, error: `can't confirm whether server ${guildId} was restored: ${cause}. ${RESTORE_MINUTE}`, ...by });
         return;
       }
       if (reply?.ok) {
@@ -116,34 +127,36 @@ export function createGraveyardRoutes(botManager: BotManager): Router {
           retiredAt: reply.retiredAt,
           reason: reply.reason,
           ...(typeof reply.moved === 'number' ? { moved: reply.moved } : {}),
+          ...by,
         });
         return;
       }
       const code = reply?.code;
       const error = reply?.error || 'restore failed';
       if (code === 'invalid') {
-        res.status(409).json({ success: false, error });
+        res.status(409).json({ success: false, error: on(error), ...by });
         return;
       }
       // The restore's own words: hopFailure's speak of a change.
       if (code === 'not-owner') {
-        res.status(503).json({ success: false, error: "another bot process now serves this server's data; nothing was restored" });
+        res.status(503).json({ success: false, error: on("another bot process now serves this server's data; nothing was restored"), ...by });
         return;
       }
       if (code === 'io-error') {
-        res.status(500).json({ success: false, error });
+        res.status(500).json({ success: false, error: on(error), ...by });
         return;
       }
       const refused = graveyardRouteRefusal(code, reply?.error, 'restore');
       if (refused) {
-        res.status(503).json({ success: false, error: refused });
+        res.status(503).json({ success: false, error: on(refused), ...by });
         return;
       }
       const failure = hopFailure(code, reply?.error);
+      const named = code === 'no-holder' || code === 'not-taken' ? { code } : {};
       if (failure) {
-        res.status(failure.status).json({ success: false, error: failure.error });
+        res.status(failure.status).json({ success: false, ...named, error: on(failure.error), ...by });
       } else {
-        res.status(500).json({ success: false, error });
+        res.status(500).json({ success: false, error: on(error), ...by });
       }
     } catch (error) {
       res.status(500).json({ success: false, error: error instanceof Error ? error.message : 'Unknown error' });

@@ -3,10 +3,15 @@
 // fencing; postgres-routed guild reads in the routes go through this reader.
 
 import { Pool } from 'pg';
+import type { PoolClient, QueryConfig } from 'pg';
 import { guardPoolClients } from '../../bot/internalSetup/utils/pgClient';
 import { loadCredentials } from '../../utils/envLoader';
+import { canonicalGuildKey } from '../../bot/internalSetup/utils/dataKeys';
+import { HOLDER_CHECK_SQL } from '../../bot/internalSetup/utils/dataBackends/guildRequestSql';
 
 const READER_ERROR = 'data backend unreachable';
+const READER_MAX = 2;
+const QUERY_BOUND_MS = 5000;
 
 let reportedUrl: string | null = null;
 let generation = 0;
@@ -23,9 +28,39 @@ export function setWebuiDataStoreUrl(url: string | null): void {
   generation += 1;
 }
 
+/** The database the web UI's pools open: the store the bot child reported, else this node's DATA_BACKEND_URL; null for none. */
+export function resolveWebuiDatabaseUrl(): string | null {
+  const url = (reportedUrl ?? (loadCredentials().DATA_BACKEND_URL || '')).trim();
+  return url || null;
+}
+
+/** Waits for a pooled connection at most boundMs; one handed out later goes back to the pool. */
+export async function connectWithin(pool: Pool, boundMs: number, poolWords: string, max: number): Promise<PoolClient> {
+  const pending = pool.connect();
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      const busy = pool.totalCount >= max && pool.idleCount === 0;
+      const seconds = Math.round(boundMs / 100) / 10;
+      reject(new Error(busy
+        ? `every connection of ${poolWords} was in use for ${seconds} s`
+        : `the database did not take a connection within ${seconds} s`));
+    }, Math.max(0, boundMs));
+  });
+  try {
+    return await Promise.race([pending, timeout]);
+  } catch (error) {
+    void pending.then(client => client.release(), () => undefined);
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export class WebuiDataReader {
   private pool: Pool | null = null;
   private poolGeneration = -1;
+  private poolUrl: string | null = null;
 
   private getPool(): Pool {
     if (this.pool && this.poolGeneration !== generation) {
@@ -33,14 +68,15 @@ export class WebuiDataReader {
       this.pool = null;
     }
     if (!this.pool) {
-      const url = (reportedUrl ?? (loadCredentials().DATA_BACKEND_URL || '')).trim();
+      const url = resolveWebuiDatabaseUrl();
       if (!url) {
         throw new Error(READER_ERROR);
       }
       this.poolGeneration = generation;
+      this.poolUrl = url;
       this.pool = new Pool({
         connectionString: url,
-        max: 2,
+        max: READER_MAX,
         connectionTimeoutMillis: 5000,
         idleTimeoutMillis: 30000,
         // A data migration leaves this reader's sessions out of its count of other sessions: they only read.
@@ -51,6 +87,36 @@ export class WebuiDataReader {
       guardPoolClients(this.pool, 'the web UI reader');
     }
     return this.pool;
+  }
+
+  /**
+   * One statement under its own client bound, its hand-out bounded too: an error keeps its SQLSTATE, and a client
+   * whose query got no answer is destroyed.
+   */
+  private async boundedQuery(text: string, params: unknown[], boundMs: number): Promise<{ rows: any[]; url: string }> {
+    const pool = this.getPool();
+    const url = this.poolUrl!;
+    const started = Date.now();
+    const client = await connectWithin(pool, Math.min(QUERY_BOUND_MS, boundMs), "the web UI's reader pool", READER_MAX);
+    let destroy = false;
+    try {
+      const left = Math.max(1, Math.min(QUERY_BOUND_MS, boundMs - (Date.now() - started)));
+      const result = await client.query({ text, values: params, query_timeout: left } as QueryConfig);
+      return { rows: result.rows, url };
+    } catch (error) {
+      destroy = typeof (error as { code?: unknown })?.code !== 'string';
+      throw error;
+    } finally {
+      client.release(destroy ? true : undefined);
+    }
+  }
+
+  /**
+   * NB7 decision 4: the shard of a guild and the claim row serving it, read-only (claimStore.ts holderStateOf judges it),
+   * with the database URL the pool that read it was built on.
+   */
+  async holderOf(guildId: string, boundMs = QUERY_BOUND_MS): Promise<{ rows: any[]; url: string }> {
+    return this.boundedQuery(HOLDER_CHECK_SQL, [guildId], boundMs);
   }
 
   private async query(text: string, params: any[]): Promise<any[]> {
@@ -135,22 +201,19 @@ export class WebuiDataReader {
     }));
   }
 
-  async readDoc(guildId: string, module: string, filename: string): Promise<string | null> {
-    const docRows = await this.query(
+  /**
+   * A guild document as the bot's own read gives it (NB7 decision 10): the guild_data row under the canonical key; a
+   * key that holds only appended lines reads as absent. An error keeps its SQLSTATE.
+   */
+  async readDoc(guildId: string, module: string, filename: string, boundMs = QUERY_BOUND_MS): Promise<string | null> {
+    const key = canonicalGuildKey(module, filename);
+    const { rows } = await this.boundedQuery(
       `SELECT doc FROM smdb_data.guild_data
        WHERE guild_id = $1 AND module = $2 AND filename = $3`,
-      [guildId, module, filename]
+      [guildId, key.module, key.filename],
+      boundMs
     );
-    if (docRows.length > 0) {
-      return docRows[0].doc;
-    }
-    const appendRows = await this.query(
-      `SELECT string_agg(chunk, '' ORDER BY seq) AS doc FROM smdb_data.guild_append
-       WHERE guild_id = $1 AND module = $2 AND filename = $3`,
-      [guildId, module, filename]
-    );
-    const doc = appendRows[0]?.doc;
-    return doc == null ? null : doc;
+    return rows.length > 0 ? rows[0].doc : null;
   }
 }
 

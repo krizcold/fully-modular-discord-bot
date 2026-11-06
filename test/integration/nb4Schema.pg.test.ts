@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
-import { PostgresBackend } from '../../src/bot/internalSetup/utils/dataBackends/postgresBackend';
+import { PostgresBackend, SCHEMA_VERSION } from '../../src/bot/internalSetup/utils/dataBackends/postgresBackend';
 import { startClaimRig, type ClaimRig } from '../helpers/pgClaimRig';
 
 // NB4 decision 1: version 3 provisions the claims table, the claim clock with its one row, the machines table, the
@@ -16,8 +16,8 @@ const columns = async (table: string) => (await rig.direct.query(
   .map(r => `${r.column_name} ${r.data_type}${r.is_nullable === 'NO' ? ' not null' : ''}${r.has_default ? ' default' : ''}`);
 
 describe('a fresh database', () => {
-  it('is provisioned at {"v":3}', async () => {
-    expect((await rig.direct.query(`SELECT value FROM smdb_data.meta WHERE key = 'schema_version'`)).rows[0].value).toBe('{"v":3}');
+  it('is provisioned at the current schema version', async () => {
+    expect((await rig.direct.query(`SELECT value FROM smdb_data.meta WHERE key = 'schema_version'`)).rows[0].value).toBe(JSON.stringify({ v: SCHEMA_VERSION }));
   });
 
   it('has the three tables with the columns and types of decision 1', async () => {

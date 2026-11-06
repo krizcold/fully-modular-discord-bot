@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { FenceToken } from '../../src/bot/internalSetup/utils/dataBackends/backend';
-import { PostgresBackend } from '../../src/bot/internalSetup/utils/dataBackends/postgresBackend';
+import { PostgresBackend, SCHEMA_VERSION } from '../../src/bot/internalSetup/utils/dataBackends/postgresBackend';
 import { initWorkingSet, WorkingSetManager } from '../../src/bot/internalSetup/utils/dataBackends/workingSet';
 import { FakeStore, tokenFor } from '../helpers/fakeStore';
 import { restoreGuildFromGraveyard, setGuildDataBackend } from '../../src/bot/internalSetup/utils/dataManager';
@@ -104,7 +104,7 @@ describe('a database of another schema version', () => {
     const { backend, sent } = scriptedBackend(sql => {
       if (/CREATE TABLE IF NOT EXISTS smdb_data\.meta/.test(sql)) created = true;
       if (/SELECT value FROM smdb_data\.meta WHERE key = 'schema_version'/.test(sql)) {
-        return created ? { rows: [{ value: '{"v":3}' }], rowCount: 1 } : missing;
+        return created ? { rows: [{ value: JSON.stringify({ v: SCHEMA_VERSION }) }], rowCount: 1 } : missing;
       }
       return undefined;
     });

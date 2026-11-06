@@ -18,7 +18,7 @@
  * copy can be cut on its way, losing requests the store still saw, so one
  * with no end line is refused.
  */
-import { MARK, presentState } from './oracle.mjs';
+import { MARK, hashOf, presentState } from './oracle.mjs';
 
 /** @typedef {import('./oracle.mjs').AnswerClass} AnswerClass */
 /** @typedef {import('./oracle.mjs').DocState} DocState */
@@ -34,9 +34,12 @@ import { MARK, presentState } from './oracle.mjs';
  * @typedef {{ name: string, mode: 'judged' | 'lagging', complete: boolean, docs: Map<string, DocState>,
  *   run?: string, guild?: string, sample?: boolean }} Copy
  * @typedef {{ v: string, key?: string, copy?: string, during?: boolean, detail: string }} Verdict
+ * @typedef {{ id: string, op: string, state: string, key: string, h: string | null, taken: boolean, reply: string | null }} RequestRow
+ * @typedef {{ name: string, rows: RequestRow[] }} RequestListing
+ * @typedef {'none' | 'open' | 'ok' | 'held' | 'refused'} RequestOutcome
  */
 
-export const VERDICTS = ['LOST', 'ROLLBACK', 'FORK', 'PHANTOM', 'HELD-MISSING', 'RESURRECTED', 'WRONG-CONTENT', 'CONTROL'];
+export const VERDICTS = ['LOST', 'ROLLBACK', 'FORK', 'PHANTOM', 'HELD-MISSING', 'RESURRECTED', 'WRONG-CONTENT', 'CONTROL', 'TWICE', 'FALSE-ANSWER'];
 /** The slowest marks poll whose window edges are still judged, in ms. */
 const MARKS_EVERY_MAX = 1000;
 
@@ -640,6 +643,115 @@ export function judgeFleet(nodes, listing = null) {
 }
 
 /**
+ * The request listing (oracle.mjs sql requests under psql -At): one line per
+ * guild_requests row of the run, {"id", "op", "state", "k": the body's
+ * filename, "c": its contentJson or null, "taken": bool, "reply": text or null}.
+ * A row's content is judged by its hash, as a copy's doc is.
+ * @param {string} name
+ * @param {string} text
+ * @returns {RequestListing}
+ */
+export function parseRequests(name, text) {
+  /** @type {RequestRow[]} */
+  const rows = [];
+  text.split('\n').forEach((line, i) => {
+    if (line.trim() === '') return;
+    /** @type {any} */
+    let row;
+    try {
+      row = JSON.parse(line);
+    } catch {
+      throw new Error(`${name} line ${i + 1} is not a JSON row`);
+    }
+    if (typeof row?.id !== 'string' || typeof row.op !== 'string' || typeof row.state !== 'string' || typeof row.k !== 'string'
+      || typeof row.taken !== 'boolean' || (row.c !== null && typeof row.c !== 'string') || (row.reply !== null && typeof row.reply !== 'string')) {
+      throw new Error(`${name} line ${i + 1} needs "id", "op", "state", "k", "c", "taken" and "reply"`);
+    }
+    /** @type {string | null} */
+    let h = null;
+    if (row.c !== null) {
+      try {
+        h = hashOf(JSON.parse(row.c));
+      } catch {
+        h = `unparseable:${row.c.length}`;
+      }
+    }
+    rows.push({ id: row.id, op: row.op, state: row.state, key: row.k, h, taken: row.taken, reply: row.reply });
+  });
+  return { name, rows };
+}
+
+/**
+ * What a request row shows a holder did with it (NB7 decisions 7 and 9):
+ * 'none' when no holder started it (never taken, or answered as never
+ * applied: unapplied, or not-held, which the holder gives before doing
+ * anything); 'open' when a holder took it and its answer is not in the row,
+ * so it may have been applied; otherwise the holder's own answer.
+ * @param {RequestRow} row
+ * @returns {RequestOutcome}
+ */
+export function requestOutcome(row) {
+  if (!row.taken) return 'none';
+  if (row.state !== 'done' || row.reply === null) return 'open';
+  /** @type {any} */
+  let reply;
+  try {
+    reply = JSON.parse(row.reply);
+  } catch {
+    return 'open';
+  }
+  if (reply === null || typeof reply !== 'object') return 'open';
+  if (reply.unapplied === true || reply.code === 'not-held') return 'none';
+  if (reply.ok === true) return reply.pending === true ? 'held' : 'ok';
+  return 'refused';
+}
+
+/**
+ * Each send's answer against the request rows that carry it. A send is
+ * carried by the row of its op with its key, and for a write its content's
+ * hash: every send of a run writes content no other send writes, and a doc
+ * is deleted at most once. TWICE: more than one of a send's rows was started
+ * by a holder. FALSE-ANSWER: a 200 with no row the holder answered ok, a 202
+ * with no row it answered accepted, or a refusal given as never applied whose
+ * row a holder started and did not refuse. PHANTOM: a started row no writer
+ * sent.
+ * @param {History} history
+ * @param {RequestListing} listing
+ * @returns {Verdict[]}
+ */
+export function judgeRequests(history, listing) {
+  /** @type {Verdict[]} */
+  const verdicts = [];
+  const add = (/** @type {string} */ v, /** @type {string} */ key, /** @type {string} */ detail) => verdicts.push({ v, key, copy: listing.name, detail });
+  /** @type {Map<Op, RequestRow[]>} */
+  const bySend = new Map();
+  for (const row of listing.rows) {
+    if (row.op !== 'write' && row.op !== 'delete') continue;
+    const entry = history.keys.get(row.key);
+    const send = row.op === 'write' ? entry?.writes.find(w => w.h === row.h) : entry?.deletes[0];
+    if (!send) {
+      if (requestOutcome(row) !== 'none') add('PHANTOM', row.key, `request ${row.id} (${row.op}, ${row.state}) was taken by a holder, but no writer sent it`);
+      continue;
+    }
+    bySend.set(send, [...(bySend.get(send) ?? []), row]);
+  }
+  const rowsText = (/** @type {RequestRow[]} */ rows) => rows.map(r => `${r.id} ${r.state}${r.taken ? ' taken' : ''}${r.reply ? ` ${r.reply.slice(0, 80)}` : ''}`).join('; ');
+  for (const [send, rows] of bySend) {
+    const outcomes = rows.map(requestOutcome);
+    const started = rows.filter((_, i) => outcomes[i] !== 'none');
+    if (started.length > 1) add('TWICE', send.key, `${send.op} #${send.id} was started by holders ${started.length} times: ${rowsText(started)}`);
+    if (send.cls === 'ACKED' && !outcomes.includes('ok')) {
+      add('FALSE-ANSWER', send.key, `${send.op} #${send.id} was acknowledged, but no holder answered ok in its request: ${rowsText(rows)}`);
+    } else if (send.cls === 'HELD' && !outcomes.includes('held')) {
+      add('FALSE-ANSWER', send.key, `${send.op} #${send.id} was held, but no holder answered it accepted in its request: ${rowsText(rows)}`);
+    } else if (send.cls === 'REFUSED' && send.definite && outcomes.some(o => o === 'open' || o === 'ok' || o === 'held')) {
+      add('FALSE-ANSWER', send.key, `${send.op} #${send.id} was refused as never applied (${send.status}), but a holder started its request: ${rowsText(rows)}`);
+    }
+  }
+  return verdicts;
+}
+
+/**
  * Window coverage [A13]: at least k acknowledged operations answered inside
  * each marked window, or k in the whole run when nothing was marked; and
  * every window the scenario names must appear.
@@ -720,7 +832,7 @@ export function appCopy(text) {
  * Everything at once: the result the checker prints.
  * @param {{ history: History, copies: Copy[], agree?: string[], fleet?: { name: string, state: FleetFacts }[],
  *   fleetAgain?: { name: string, state: FleetFacts }[], noFleet?: boolean, windows?: string[], k?: number,
- *   ownership?: string, claims?: string[] }} input
+ *   ownership?: string, claims?: string[], requests?: RequestListing[] }} input
  */
 export function judge(input) {
   const { history, copies } = input;
@@ -758,6 +870,10 @@ export function judge(input) {
   verdicts.push(...reads.verdicts);
   inconclusive.push(...reads.reasons);
   verdicts.push(...judgeForks(history, copies, input.agree ?? []));
+  for (const listing of input.requests ?? []) {
+    verdicts.push(...judgeRequests(history, listing));
+    if (listing.rows.length === 0) notes.push(`${listing.name} holds no request row of this run, so no answer was compared with one`);
+  }
 
   const fleet = input.fleet ?? [];
   const again = input.fleetAgain ?? [];

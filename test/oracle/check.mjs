@@ -9,7 +9,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs, parseLog } from './oracle.mjs';
-import { appCopy, buildHistory, dbCopy, judge } from './judge.mjs';
+import { appCopy, buildHistory, dbCopy, judge, parseRequests } from './judge.mjs';
 
 const USAGE = `check.mjs --log FILE [--log FILE ...]
   [--db NAME=FILE ...]   a database listing that must hold every acknowledged effect
@@ -21,6 +21,7 @@ const USAGE = `check.mjs --log FILE [--log FILE ...]
   [--no-fleet]           only where the run has no fleet to check (a single local node)
   [--ownership FILE]     the claim sequence listing (oracle.mjs sql ownership), taken after the fleet reads: a live claim at or above the next draw is CONTROL
   [--claims FILE]        the shard claims listing (oracle.mjs sql claims), taken after --fleet; a second one, taken after --fleet-again, goes with that set: a lease whose claim shard_claims does not hold for its process is CONTROL
+  [--requests NAME=FILE ...] the run's guild_requests rows (oracle.mjs sql requests), from the database the requests went to: a send taken twice is TWICE, an answer its row contradicts is FALSE-ANSWER
   [--window NAME ...]    a window the scenario must have marked
   [--k N (5)]            acknowledged operations needed in each marked window
   [--out FILE]           the full result as JSON`;
@@ -36,7 +37,7 @@ function named(spec) {
 export function check(argv) {
   const a = parseArgs(argv, {
     log: 'many', db: 'many', lag: 'many', app: 'many', agree: 'one', fleet: 'many', 'fleet-again': 'many', 'no-fleet': 'flag', window: 'many',
-    k: 'one', out: 'one', ownership: 'one', claims: 'many',
+    k: 'one', out: 'one', ownership: 'one', claims: 'many', requests: 'many',
   });
   if (a.log.length === 0) throw new Error('at least one --log is needed');
   const history = buildHistory(a.log.map((/** @type {string} */ f) => parseLog(fs.readFileSync(f, 'utf8'))));
@@ -63,6 +64,7 @@ export function check(argv) {
     history, copies, agree: a.agree ? a.agree.split(',') : [], fleet, fleetAgain, noFleet: a['no-fleet'] === true, windows: a.window, k,
     ownership: a.ownership ? fs.readFileSync(a.ownership, 'utf8') : undefined,
     claims: a.claims.map((/** @type {string} */ f) => fs.readFileSync(f, 'utf8')),
+    requests: a.requests.map((/** @type {string} */ s) => { const { name, file } = named(s); return parseRequests(name, fs.readFileSync(file, 'utf8')); }),
   });
   if (a.out) fs.writeFileSync(a.out, `${JSON.stringify(result, null, 2)}\n`);
   return { result, run: history.run, guild: history.guild };

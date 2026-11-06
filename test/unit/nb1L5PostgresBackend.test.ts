@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { FenceToken } from '../../src/bot/internalSetup/utils/dataBackends/backend';
-import { PostgresBackend } from '../../src/bot/internalSetup/utils/dataBackends/postgresBackend';
+import { PostgresBackend, SCHEMA_VERSION } from '../../src/bot/internalSetup/utils/dataBackends/postgresBackend';
 
 const backends: PostgresBackend[] = [];
 afterEach(async () => {
@@ -48,7 +48,7 @@ describe('provisioning', () => {
     let created = false;
     const { backend, sent } = scripted(sql => {
       if (/CREATE TABLE IF NOT EXISTS smdb_data\.meta/.test(sql)) created = true;
-      if (VERSION_READ.test(sql)) return created ? { rows: [{ value: '{"v":3}' }], rowCount: 1 } : missing();
+      if (VERSION_READ.test(sql)) return created ? { rows: [{ value: JSON.stringify({ v: SCHEMA_VERSION }) }], rowCount: 1 } : missing();
       return undefined;
     });
     await internals(backend).provision();
@@ -80,7 +80,7 @@ describe('provisioning', () => {
     let inserted = false;
     const { backend } = scripted(sql => {
       if (/INSERT INTO smdb_data\.meta \(key, value\) VALUES \('schema_version'/.test(sql)) inserted = true;
-      if (VERSION_READ.test(sql)) return inserted ? { rows: [{ value: '{"v":3}' }], rowCount: 1 } : { rows: [], rowCount: 0 };
+      if (VERSION_READ.test(sql)) return inserted ? { rows: [{ value: JSON.stringify({ v: SCHEMA_VERSION }) }], rowCount: 1 } : { rows: [], rowCount: 0 };
       return undefined;
     });
     await internals(backend).provision();

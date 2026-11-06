@@ -26,7 +26,8 @@ import { getPaymentRegistry } from './utils/payment/paymentRegistry';
 import { startPremiumTickers } from './utils/premiumManager';
 import { startModuleAutoUpdater } from './utils/moduleAutoUpdater';
 import { loadCredentials } from '../../utils/envLoader';
-import { bootShards, getShardClaims } from './fleet/shardBoot';
+import { bootShards, getLeaseRuntime, getShardClaims } from './fleet/shardBoot';
+import { guildRequestsStopStep, startGuildRequestSweep } from './fleet/guildRequests';
 import { stoppedServing } from './utils/servingGate';
 import { getIngestService } from './ingest/ingestService';
 import { installReplyGate } from './utils/dataBackends/replyGate';
@@ -500,6 +501,8 @@ async function main() {
     ]);
     if (stopSteps.metricsReady && !isMaintenanceGateClosed()) getMetricsCollector().flushTotals(); // writes via saveData, so it must precede the drain
   });
+  // NB7 decision 16: the answers of the requests applied so far are written before the claims are released.
+  addReleaseStep(guildRequestsStopStep);
   addReleaseStep(async () => { await getShardClaims()?.finishStop(); });
 
   setupMaintenanceIPCAtBoot();
@@ -733,6 +736,8 @@ async function main() {
   startPremiumTickers();
   setupIPCNotificationHandler();
   reportWriterStage('guild');
+  // NB7 decision 7: on postgres, the changes other machines' web panels send to this process are read from here on.
+  startGuildRequestSweep(() => getLeaseRuntime()?.getCurrent() ?? null);
 
   // Discord App Monetization: bridge gateway entitlement events into our
   // payment-registry event stream. Only the bot process has the client;

@@ -141,10 +141,10 @@ function resetCalls() {
 }
 
 describe('the stop steps main() adds (tests run in order: during the boot, then after it)', () => {
-  it('during the boot, before the metrics start: one stop step and one release step, added with no signal listener of its own', async () => {
+  it('during the boot, before the metrics start: one stop step and two release steps (NB7\'s answer writes, then the claims), added with no signal listener of its own', async () => {
     await vi.waitFor(() => expect(h.stopSteps).toHaveLength(1));
     expect(h.ingestStarted).toBe(false);
-    expect(h.releaseSteps).toHaveLength(1);
+    expect(h.releaseSteps).toHaveLength(2);
     expect(h.signals.get('SIGTERM') ?? []).toHaveLength(0);
     expect(h.signals.get('SIGINT') ?? []).toHaveLength(0);
   });
@@ -157,6 +157,8 @@ describe('the stop steps main() adds (tests run in order: during the boot, then 
     expect(h.calls).toMatchObject({ beginStop: 1, stopSamplers: 0, flushTotals: 0, finishStop: 0 });
     expect(h.closes).toEqual(['shutting down']);
     await h.releaseSteps[0]();
+    expect(h.calls).toMatchObject({ beginStop: 1, stopSamplers: 0, flushTotals: 0, finishStop: 0 });
+    await h.releaseSteps[1]();
     expect(h.calls).toMatchObject({ beginStop: 1, stopSamplers: 0, flushTotals: 0, finishStop: 1 });
   });
 

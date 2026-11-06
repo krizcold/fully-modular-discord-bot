@@ -37,9 +37,15 @@ export interface ShardBootContext {
 let context: ShardBootContext | null = null;
 let booting: Promise<ShardBootContext> | null = null;
 let claims: ShardClaims | null = null;
+let leaseRuntime: LeaseRuntime | null = null;
 
 export function getFleetContext(): ShardBootContext | null {
   return context;
+}
+
+/** This process's lease runtime; null before the shard boot built it. */
+export function getLeaseRuntime(): LeaseRuntime | null {
+  return leaseRuntime;
 }
 
 /** This process's shard claims; null on a JSON bot and before the Postgres boot built them. */
@@ -88,6 +94,7 @@ async function runBoot(): Promise<ShardBootContext> {
   const nodeName = getNodeName();
   const ingest = getIngestService();
   const runtime = new LeaseRuntime(ingest);
+  leaseRuntime = runtime;
   setGuildViewCache(true);
 
   try {

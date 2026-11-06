@@ -3,15 +3,12 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 import { randomUUID } from 'crypto';
 import { dataPath } from '../../../utils/dataRoot';
 import { FLEET_DIR } from './constants';
 import { atomicWriteFileSync } from '../utils/atomicWrite';
 
-export function getNodeName(): string {
-  return (process.env.NODE_NAME || '').trim() || os.hostname();
-}
+export { getNodeName } from './nodeName';
 
 let cachedNodeId: string | null = null;
 

@@ -1,17 +1,25 @@
 import { spawn } from 'child_process';
 import fs from 'fs';
+import http from 'http';
+import type { AddressInfo } from 'net';
 import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { Pool } from 'pg';
 import type { StartedPostgreSqlContainer } from '@testcontainers/postgresql';
 import { GenericContainer } from 'testcontainers';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import { GuildRequestSweep } from '../../src/bot/internalSetup/fleet/guildRequests';
+import type { FenceToken, GuildFlushBatch } from '../../src/bot/internalSetup/utils/dataBackends/backend';
+import { PostgresBackend } from '../../src/bot/internalSetup/utils/dataBackends/postgresBackend';
+import type { DataWriteReply, GuildDataWriteRequest } from '../../src/bot/internalSetup/utils/ipcDataHandler';
+import { setBackendKind } from '../helpers/backendKind';
 import { endPool } from '../helpers/endPool';
+import { takeShard } from '../helpers/pgClaims';
 import { poolFor, startPostgres } from '../helpers/postgres';
 import { FAKE_SCHEMA, startFakeApp, type DeleteFault, type WriteFault } from '../oracle/fakeApp';
-import { dbCopy } from '../oracle/judge.mjs';
-import { biteStatements, dumpSql, hashOf, parseLog } from '../oracle/oracle.mjs';
+import { dbCopy, parseRequests } from '../oracle/judge.mjs';
+import { biteStatements, claimsSql, dumpSql, hashOf, ownershipSql, parseLog, requestsSql } from '../oracle/oracle.mjs';
 
 // The oracle end to end: the writer, the app-path reader, the fleet reader and
 // the checker run as child processes against fake nodes on real
@@ -86,8 +94,12 @@ async function psql(db: string, sql: string): Promise<string> {
 // multi-byte character at a chunk edge: the listing comes out in base64, and
 // only whole bytes are decoded.
 async function dump(db: string, run: string, name: string): Promise<string> {
+  return dumpQuery(db, dumpSql(GUILD, run), name);
+}
+
+async function dumpQuery(db: string, query: string, name: string): Promise<string> {
   const r = await container.exec(['sh', '-c', `psql -U "$U" -d "$D" -v ON_ERROR_STOP=1 -At -c "$Q" > /tmp/oracle-dump && base64 /tmp/oracle-dump`], {
-    env: { U: container.getUsername(), D: db, Q: dumpSql(GUILD, run) },
+    env: { U: container.getUsername(), D: db, Q: query },
   });
   if (r.exitCode !== 0) throw new Error(`psql: ${r.stderr || r.output}`);
   fs.writeFileSync(file(name), Buffer.from(r.stdout.replace(/\s+/g, ''), 'base64'));
@@ -748,4 +760,296 @@ describe('the data-loss oracle end to end', () => {
       await box.stop();
     }
   }, 120_000);
+});
+
+// NB7 test 12, the L6 scenario of the request route: two bot processes on one database (one holds the guild's shard,
+// one the other shard) and two web UIs whose machines do not run the guild, one with its bot running and one with it
+// down. The holder is killed between the claim and the answer (before its apply, and after its flush) and between
+// the apply's accept and its flush; each time a new process of its machine takes the shard. The oracle compares every
+// answer with the stored docs and with the request rows.
+describe('NB7 test 12: changes sent to the machine that runs the guild, its holder killed mid-change', () => {
+  type Requests = typeof import('../../src/webui/utils/guildRequests');
+  type KillPoint = 'claim' | 'accept' | 'flush';
+  interface Child {
+    processId: string;
+    nodeId: string;
+    token: FenceToken;
+    shardId: number;
+    applied: string[];
+    dead: () => boolean;
+    arm: (point: KillPoint) => void;
+    kill: () => void;
+  }
+
+  const L6 = 'nb7l6';
+  const RUN = 'nb7l6';
+  const guildShard = Number((BigInt(GUILD) >> 22n) % 2n);
+  const otherShard = 1 - guildShard;
+  let url = '';
+  let backend: PostgresBackend;
+  const pools: Pool[] = [];
+  const children: Child[] = [];
+  const closers: (() => Promise<void>)[] = [];
+
+  const waitFor = async (done: () => boolean, ms: number): Promise<boolean> => {
+    const began = Date.now();
+    while (!done()) {
+      if (Date.now() - began > ms) return false;
+      await sleep(100);
+    }
+    return true;
+  };
+  const poolOf = (max: number) => {
+    const p = new Pool({ connectionString: url, max });
+    p.on('error', () => undefined);
+    pools.push(p);
+    return p;
+  };
+
+  beforeAll(async () => {
+    await pool.query(`CREATE DATABASE ${L6}`);
+    url = container.getConnectionUri().replace(/\/[^/]*$/, `/${L6}`);
+    backend = new PostgresBackend({ url });
+    backend.start();
+    expect(await waitFor(() => backend.connectionState().state === 'ready', 60_000)).toBe(true);
+    await poolOf(1).query(`INSERT INTO smdb_data.meta (key, value) VALUES ('shard_count', '{"count":2}') ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`);
+  });
+
+  afterAll(async () => {
+    for (const c of children) c.kill();
+    for (const close of closers) await close();
+    await backend?.stop();
+    for (const p of pools) await endPool(p);
+  });
+
+  /**
+   * A bot process: it takes its shard's claim, keeps it renewed, and runs NB7's sweep, which applies each claimed
+   * request through the fenced flush. Armed, the next apply kills the process at that point: it answers nothing,
+   * flushes nothing more and renews nothing, and its row stays 'applying'.
+   */
+  async function startChild(processId: string, nodeId: string, shardId: number): Promise<Child> {
+    const db = poolOf(2);
+    const token = await takeShard(db, { processId, nodeId, shardId, shardCount: 2 });
+    if (shardId === guildShard) expect((await backend.hydrateGuild(GUILD, token)).ok).toBe(true);
+    const renew = () => db.query(`UPDATE smdb_data.shard_claims SET renewed_at = now() WHERE holder_process = $1 AND NOT released`, [processId]).catch(() => undefined);
+    await renew();
+    const renewal = setInterval(() => { void renew(); }, 1000);
+    let dead = false;
+    let armed: KillPoint | null = null;
+    const applied: string[] = [];
+    const hang = () => new Promise<DataWriteReply>(() => undefined);
+    const kill = () => {
+      if (dead) return;
+      dead = true;
+      clearInterval(renewal);
+      sweep.stop();
+    };
+    const dies = (point: KillPoint) => {
+      if (dead) return true;
+      if (armed !== point) return false;
+      kill();
+      return true;
+    };
+    const apply = async (req: GuildDataWriteRequest): Promise<DataWriteReply> => {
+      if (dies('claim')) return hang();
+      const key = { module: req.module, filename: req.filename };
+      const batch: GuildFlushBatch = req.op === 'delete'
+        ? { upserts: [], deletes: [key], appends: [] }
+        : { upserts: [{ key, doc: req.contentJson ?? '' }], deletes: [], appends: [] };
+      if (dies('accept')) return hang();
+      const out = await backend.flushGuild(req.guildId, batch, token);
+      if (out.ok) applied.push(`${req.op} ${req.filename} ${req.contentJson ?? ''}`);
+      if (dies('flush')) return hang();
+      if (out.ok) return { ok: true };
+      if (out.reason === 'deposed') return { ok: false, code: 'not-owner', error: 'deposed' };
+      return { ok: false, code: 'backend-unavailable', error: `the database did not take the change (${out.detail ?? 'no answer'})` };
+    };
+    const sweep = new GuildRequestSweep({
+      db: { query: (text, values, boundMs) => db.query({ text, values, query_timeout: boundMs } as any) },
+      processId: () => processId,
+      pairs: () => [{ shardCount: 2, shardId, claim: token.claim as number }],
+      stoppedServing: () => false,
+      isStopping: () => false,
+      apply,
+    });
+    sweep.start();
+    const child: Child = { processId, nodeId, token, shardId, applied, dead: () => dead, arm: point => { armed = point; }, kill };
+    children.push(child);
+    return child;
+  }
+
+  /** A web UI process of its own: a fresh copy of the request route's modules, on this database, as this machine. */
+  async function webuiModules(nodeName: string, nodeId: string) {
+    vi.resetModules();
+    const requests: Requests = await import('../../src/webui/utils/guildRequests');
+    // vi.resetModules keeps mocked modules, so envLoader's mock still reads the backendKind loaded before the reset.
+    setBackendKind('postgres');
+    (await import('../../src/webui/utils/webuiDataReader')).setWebuiDataStoreUrl(url);
+    requests._setGuildRequestDeps({ nodeName: () => nodeName, nodeId: () => nodeId });
+    const { sendHopReply } = await import('../../src/webui/routes/config');
+    return { requests, sendHopReply };
+  }
+
+  /** The operator data routes the writer uses, through the real plan, send and answer of routes/config.ts. */
+  async function startWebui(modules: Awaited<ReturnType<typeof webuiModules>>, bot: any, fleetState: () => unknown) {
+    const { requests, sendHopReply } = modules;
+    let active = 0;
+    const split = (fileId: string) => {
+      const parts = fileId.split('/');
+      return { module: parts.length >= 2 ? parts[0] : '', filename: parts[parts.length - 1] };
+    };
+    const server = http.createServer(async (req, res) => {
+      active += 1;
+      const answer = {
+        status: (code: number) => ({
+          json: (payload: unknown) => {
+            res.writeHead(code, { 'content-type': 'application/json' });
+            res.end(JSON.stringify(payload));
+          },
+        }),
+      };
+      try {
+        const at = new URL(req.url ?? '/', 'http://webui');
+        if (req.method === 'GET' && at.pathname === '/api/fleet/state') {
+          answer.status(200).json({ success: true, ...(fleetState() as object) });
+        } else if (req.method === 'GET' && at.pathname === '/api/config/data/get') {
+          const { module, filename } = split(at.searchParams.get('file') ?? '');
+          const doc = await requests.remoteReadDoc(at.searchParams.get('guildId') ?? '', module, filename, 5000);
+          if (doc === null) answer.status(404).json({ success: false, error: 'Data file not found' });
+          else answer.status(200).json({ success: true, data: JSON.parse(doc), exists: true });
+        } else if (req.method === 'POST' && (at.pathname === '/api/config/data/update' || at.pathname === '/api/config/data/delete')) {
+          const chunks: Buffer[] = [];
+          for await (const chunk of req) chunks.push(chunk as Buffer);
+          const b = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
+          const { module, filename } = split(String(b.file));
+          const op = at.pathname.endsWith('/update') ? 'write' as const : 'delete' as const;
+          const plan = await requests.planGuildChange(bot, b.guildId, op);
+          const payload: GuildDataWriteRequest = op === 'write'
+            ? { guildId: b.guildId, module, filename, op, contentJson: JSON.stringify(b.data, null, 2) }
+            : { guildId: b.guildId, module, filename, op };
+          const reply = plan.kind === 'refuse' ? plan.reply : await requests.sendGuildChange(bot, plan, payload);
+          sendHopReply(answer as any, reply, {}, op);
+        } else {
+          answer.status(404).json({ success: false, error: 'no route' });
+        }
+      } catch (error) {
+        answer.status(500).json({ success: false, error: error instanceof Error ? error.message : String(error) });
+      } finally {
+        active -= 1;
+      }
+    });
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    closers.push(async () => {
+      server.closeAllConnections();
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    });
+    return { url: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, idle: () => active === 0 };
+  }
+
+  const factsOf = (child: () => Child) => () => {
+    const c = child();
+    return {
+      initialized: true, nodeId: c.nodeId, processId: c.processId, shardCount: 2,
+      leases: [{ shardId: c.shardId, claim: c.token.claim }], shardTable: [], guildMap: { [GUILD]: guildShard },
+    };
+  };
+  const isCantConfirm = (e: any) => e.t === 'ans' && e.cls === 'REFUSED' && !e.definite && /can't confirm/.test(e.err ?? '');
+  const isNothingSaved = (e: any) => e.t === 'ans' && e.cls === 'REFUSED' && e.definite && /nothing was/.test(e.err ?? '');
+
+  it('finds no change applied twice and no answer that its rows or the stored docs contradict', async () => {
+    const alpha = await startChild('p-alpha', 'n-alpha', otherShard);
+    let bravo = await startChild('p-bravo-1', 'n-bravo', guildShard);
+    const alphaModules = await webuiModules('ALPHA', 'n-alpha');
+    const charlieModules = await webuiModules('CHARLIE', 'n-charlie');
+    const notHeld = {
+      isRunning: () => true,
+      writerRoute: () => ({ route: 'child' }),
+      writeGuildData: async () => ({ ok: false, code: 'not-held' }),
+      readGuildData: async () => ({ ok: false, code: 'not-held' }),
+    };
+    const down = { ok: false, status: 503, code: 'bot-down', error: 'the bot process is not running' };
+    const botDown = { isRunning: () => false, writerRoute: () => down, writeGuildData: async () => down, readGuildData: async () => down };
+    const alphaUi = await startWebui(alphaModules, notHeld, factsOf(() => alpha));
+    const charlieUi = await startWebui(charlieModules, botDown, () => ({ initialized: false }));
+    // The guild's machine serves only its control facts here: no lane writes through it.
+    const bravoUi = await startWebui(charlieModules, botDown, factsOf(() => bravo));
+
+    const windows: [string, KillPoint][] = [['kill-claim', 'claim'], ['kill-flush', 'flush'], ['kill-accept', 'accept']];
+    const marks = file('l6-marks.txt');
+    fs.writeFileSync(marks, '');
+    let nothingSavedWhileDead = 0;
+    let ackedAfterLastTake = 0;
+    const log = await write(RUN, [`a=${alphaUi.url}`, `c=${charlieUi.url}`],
+      ['--duration', '400', '--rate', '4', '--limiter', 'off', '--hot', '1', '--delete-ratio', '0.1', '--read-every', '4', '--max-size', '512',
+        '--timeout', '45000', '--seed', '12', '--marks', marks],
+      async text => {
+        const events = () => parseLog(text());
+        expect(await waitFor(() => ackedIn(events()).length >= 3, 60_000)).toBe(true);
+        for (const [name, point] of windows) {
+          fs.appendFileSync(marks, `begin ${name}\n`);
+          bravo.arm(point);
+          expect(await waitFor(() => bravo.dead(), 90_000)).toBe(true);
+          if (point === 'claim') {
+            // A change sent while the dead process still holds the shard is refused as never applied.
+            const before = events().filter(isNothingSaved).length;
+            expect(await waitFor(() => events().filter(isNothingSaved).length > before, 60_000)).toBe(true);
+            nothingSavedWhileDead = events().filter(isNothingSaved).length - before;
+          }
+          bravo = await startChild(`p-bravo-${children.filter(c => c.shardId === guildShard).length + 1}`, 'n-bravo', guildShard);
+        }
+        const acked = ackedIn(events()).length;
+        expect(await waitFor(() => events().filter(isCantConfirm).length >= windows.length && ackedIn(events()).length >= acked + 3, 120_000)).toBe(true);
+        ackedAfterLastTake = ackedIn(events()).length - acked;
+        for (const [name] of windows) fs.appendFileSync(marks, `end ${name}\n`);
+        expect(await waitFor(() => windows.every(([name]) => marked(events(), `end ${name}`)), 10_000)).toBe(true);
+      }, marks);
+    // A request the writer cut short at its stop is still followed by its web UI.
+    expect(await waitFor(() => alphaUi.idle() && charlieUi.idle(), 90_000)).toBe(true);
+
+    const events = parseLog(fs.readFileSync(log, 'utf8'));
+    expect(nothingSavedWhileDead).toBeGreaterThan(0);
+    expect(ackedAfterLastTake).toBeGreaterThanOrEqual(3);
+    expect(events.filter(isCantConfirm).length).toBeGreaterThanOrEqual(windows.length);
+    // The bot processes' own record: no change landed twice.
+    const applied = children.flatMap(c => c.applied);
+    expect(new Set(applied).size).toBe(applied.length);
+
+    for (const [name, ui] of [['alpha', alphaUi], ['bravo', bravoUi]] as const) {
+      expect((await runNode([ORACLE, 'fleet', '--target', ui.url, '--name', name, '--limiter', 'off', '--out', file(`l6-fleet-${name}.json`)])).code).toBe(0);
+    }
+    const printed = await runNode([ORACLE, 'sql', 'requests', '--log', log]);
+    expect(printed.stdout).toBe(`${requestsSql(GUILD, RUN)}\n`);
+    const db = await dump(L6, RUN, 'l6-db.jsonl');
+    const requests = await dumpQuery(L6, requestsSql(GUILD, RUN), 'l6-requests.jsonl');
+    const claims = await dumpQuery(L6, claimsSql(), 'l6-claims.jsonl');
+    const ownership = await dumpQuery(L6, ownershipSql(), 'l6-ownership.jsonl');
+    const rows = parseRequests('requests', fs.readFileSync(requests, 'utf8')).rows;
+    // Each kill left a row its process took and never answered.
+    expect(rows.filter(row => row.state === 'applying' && row.taken).length).toBeGreaterThanOrEqual(windows.length);
+
+    const judged = ['--log', log, '--db', `db=${db}`, '--fleet', file('l6-fleet-alpha.json'), '--fleet', file('l6-fleet-bravo.json'),
+      '--claims', claims, '--ownership', ownership, ...windows.flatMap(([name]) => ['--window', name]), '--k', '2'];
+    const r = await check([...judged, '--requests', `requests=${requests}`]);
+    expect(r.result.verdicts).toEqual([]);
+    expect(r.result.inconclusive).toEqual([]);
+    expect(r.result.notes).toEqual([]);
+    expect(r.code).toBe(0);
+
+    // Bites: a second started row of one acknowledged write is TWICE, and an acknowledged write whose row the holder
+    // answered as never applied is FALSE-ANSWER.
+    const deleted = new Set(events.filter(e => e.t === 'send' && e.op === 'delete').map(e => e.key));
+    const rowOf = (key: string) => rows.find(row => row.op === 'write' && row.key === key && row.state === 'done');
+    const ackedWrites = answeredSends(events).filter(s => s.op === 'write' && s.kind === 'u' && s.ans.cls === 'ACKED' && !deleted.has(s.key) && rowOf(s.key));
+    expect(ackedWrites.length).toBeGreaterThanOrEqual(2);
+    const [twice, untrue] = ackedWrites;
+    await psql(L6, `INSERT INTO smdb_data.guild_requests (id, guild_id, shard_count, shard_id, for_process, op, body, requested_by, state, created_at,
+      claim_by, answer_by, claim_batch, applier_claim, taken_at, reply, done_at)
+      SELECT gen_random_uuid(), guild_id, shard_count, shard_id, for_process, op, body, requested_by, state, created_at, claim_by, answer_by,
+        gen_random_uuid(), applier_claim, taken_at, reply, done_at FROM smdb_data.guild_requests WHERE id = '${rowOf(twice.key)!.id}'`);
+    await psql(L6, `UPDATE smdb_data.guild_requests SET reply = '{"ok":false,"code":"not-taken","unapplied":true}' WHERE id = '${rowOf(untrue.key)!.id}'`);
+    const bitten = await dumpQuery(L6, requestsSql(GUILD, RUN), 'l6-requests-bitten.jsonl');
+    const b = await check([...judged, '--requests', `requests=${bitten}`]);
+    expect(b.code).toBe(1);
+    expect(b.result.verdicts.map((v: any) => `${v.v} ${v.key}`).sort()).toEqual([`FALSE-ANSWER ${untrue.key}`, `TWICE ${twice.key}`].sort());
+  }, 420_000);
 });

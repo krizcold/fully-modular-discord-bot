@@ -244,7 +244,8 @@ export async function admitGuildAction(guildId: string, deadlineAt: number): Pro
     // NB4 decision 6: asked right before the admission, after every await of the hold.
     if (cause === 'admit') return stoppedServing() ? { cause: 'not-served', mark: null } : { cause, mark: saveMark() };
     const left = deadlineAt - performance.now();
-    if (FINAL_CAUSES.has(cause) || left <= 0) return { cause, mark: null };
+    // NB7 decision 19: a set lease never gains a shard while the process runs, so an unleased guild never becomes served.
+    if (FINAL_CAUSES.has(cause) || (cause === 'not-served' && getDataReadiness()?.leaseSet()) || left <= 0) return { cause, mark: null };
     await new Promise<void>(resolve => setTimeout(resolve, Math.min(HOLD_POLL_MS, left)));
   }
 }
@@ -343,6 +344,17 @@ export async function gateEventDispatch(eventName: string, args: any[], replay: 
   const readiness = getDataReadiness();
   if (!readiness || resolveDataBackend() === 'file') return !bufferRestoreEvent(guildId, replay);
   return readiness.admitEvent(guildId, replay);
+}
+
+/**
+ * Whether this Postgres process's set lease leaves out the guild's shard, so another machine runs it (NB7 decisions 2
+ * and 19). Synchronous; false on a JSON bot, before the lease is set, and once this process stopped serving (NB4's own
+ * answer covers that).
+ */
+export function servedElsewhere(guildId: string): boolean {
+  if (resolveDataBackend() !== 'postgres' || stoppedServing()) return false;
+  const readiness = getDataReadiness();
+  return !!readiness && readiness.leaseSet() && !readiness.servesGuild(guildId);
 }
 
 /**

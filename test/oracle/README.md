@@ -5,7 +5,7 @@ every answer. Copies of the run's docs are taken afterwards, and the checker jud
 
 | File | Runs where | What it does |
 |---|---|---|
-| oracle.mjs | the dev box, or a node image on a host | `write`, `read` (a copy through one node's app read path), `fleet` (the control facts), `sql` (the database listing query; `sql ownership` lists the claim sequence and the highest guild_ownership and shard_claims claims for check.mjs `--ownership`; `sql claims` lists the shard_claims rows for check.mjs `--claims`), `bite`, `cleanup` |
+| oracle.mjs | the dev box, or a node image on a host | `write`, `read` (a copy through one node's app read path), `fleet` (the control facts), `sql` (the database listing query; `sql ownership` lists the claim sequence and the highest guild_ownership and shard_claims claims for check.mjs `--ownership`; `sql claims` lists the shard_claims rows for check.mjs `--claims`; `sql requests` lists the run's guild_requests rows for check.mjs `--requests`), `bite`, `cleanup` |
 | check.mjs | the dev box | judges logs and copies; exit 0 PASS, 1 FAIL, 2 INCONCLUSIVE, 64 usage |
 | judge.mjs | (library) | the verdict rules |
 | model.ts, fakeApp.ts | tests only | the model of a correct store with every check, and a stand-in node on real Postgres with injectable faults |
@@ -71,11 +71,13 @@ answering 500 "An error occurred" from its error handler.
 | LOST | An acknowledged doc is absent, or a hot doc holds a value that an acknowledged later write by another lane should have replaced. |
 | ROLLBACK | A hot doc holds a counter lower than one its own lane had acknowledged. |
 | FORK | Two copies each hold docs the other lacks, or copies named in `--agree` differ. |
-| PHANTOM | A doc is present though its write was refused before applying, or a run doc that no writer sent is present. |
+| PHANTOM | A doc is present though its write was refused before applying, or a run doc that no writer sent is present, or a holder took a request row of the run that no writer sent (`--requests`). |
 | HELD-MISSING | A held (202) effect never arrived. |
 | RESURRECTED | A doc is back after its delete was acknowledged. |
 | WRONG-CONTENT | A doc holds bytes that no one wrote to it. |
 | CONTROL | A shard is leased to two live processes at once, a shard in a process's shard table is not leased by that process or is leased by another one, nodes disagree on the shard count, a guild maps to two shards or out of range, one claim is reported on two shards or by two processes, a lease's claim is not the one the shard_claims row of its shard holds for that process (`--claims`), or a live claim is at or above the claim the next take would draw (`--ownership`). Facts are keyed by process id (a JSON bot's by node id). With two sets of control facts, only a CONTROL that both sets show counts. |
+| TWICE | Holders started more than one request row carrying one send (`--requests`): the change was taken twice. |
+| FALSE-ANSWER | A send's answer contradicts its request rows (`--requests`): a 200 with no row the holder answered ok, a 202 with no row it answered accepted, or a refusal given as never applied whose row a holder took and left unanswered or answered as applied. |
 
 `(during)` marks a verdict from a read made during the run, judged against what was acknowledged before that read was
 sent.
@@ -85,6 +87,11 @@ How the checker judges:
   compared, so ordering across their lanes goes unjudged [A16]; per-lane checks still apply.
 - **Late landings.** A write that got no answer may land at any time, so it never counts as superseded. A doc that ends
   on such a write after committed ones makes the run inconclusive, because a late landing and a rollback look the same.
+- **Request rows (NB7).** A change sent to the machine that runs the guild is a row of smdb_data.guild_requests that
+  the holder takes, applies and answers. A send is matched to its rows by op, key and, for a write, its content's hash.
+  A row shows what the holder did: nothing (never taken, or answered `unapplied` or `not-held`, both given before
+  anything is applied), the holder's answer, or taken with no answer, which may have been applied. A send with no row
+  went by the local route and is judged by the copies alone. A listing with no row of the run is judged, with a note.
 
 A streamed log with no end line is refused (exit 64): it may have lost requests the store still saw. Judge the writer's
 own file log instead (step 2).
@@ -128,6 +135,11 @@ fleet.
     listing does not hold for its process in both reads, and one shard leased to two live processes. No rule judges
     when a take may happen: a release between two reads makes a legal take look early, so the take's timing is
     tested where the take is visible (NB4's property and Postgres tests).
+  - **The request row rules** raise nothing on any listing a correct request route leaves (each answer with each row
+    it allows, or none), name TWICE on a send given a second started row and FALSE-ANSWER on a send whose row
+    contradicts its answer, and hand-built cases read listing lines (pretty-printed content, reordered keys, a bad
+    line, a missing field) and cover not-held and unapplied answers, deletes, an unparseable reply and rows no writer
+    sent.
 - **test/unit/oracleJudge.test.ts** runs those checks against judge.mjs.
 - **test/unit/oracleMutants.test.ts** runs them against 76 mutants of judge.mjs, each breaking one rule. A hand-built
   check must kill each one, so the result does not depend on what the generator draws.
@@ -158,7 +170,15 @@ fleet.
   - leases are compared with `sql claims` listings taken after each set of control facts: a legal takeover, a clean
     stop and the next process's take, or a hand-over and the receiving node's take, between two reads pass, and a
     lease whose claim the table does not hold in both reads, or a shard two processes lease, is named;
-  - the test's own database copy fails when psql fails.
+  - the test's own database copy fails when psql fails;
+  - NB7 test 12: two web UIs (one whose bot runs another shard and answers `not-held`, one whose bot is down) send
+    through the real request route to the bot process that holds the guild's shard, which runs the real sweep over
+    the real fenced flush. That process is killed after a claim before its apply, after its flush before its answer,
+    and after its apply's accept before its flush, and each time a new process of its machine takes the shard. The
+    run passes with the docs, the `sql requests` listing, the control facts, the claims and the claim sequence, with
+    can't confirm answers for the killed changes and a "nothing was saved" answer for a change sent to the dead
+    process; the bitten listing (a second started row of one acknowledged write, and an acknowledged write's row
+    answered `unapplied`) fails with exactly TWICE and FALSE-ANSWER on those docs.
 
 ## On the live fleet (the main session's runs)
 
@@ -248,6 +268,12 @@ Guardrails: the secret filter on every read; `ssh <host> ...` with no flag befor
        shard_claims claims. The checker works out the claim the next take would draw (as the bot draws it) and calls
        CONTROL when a live process already holds that claim or a higher one on a lease: the sequence went back, as after a restore that did not raise
        it. An empty or unreadable listing is not judged, and the checker writes a note saying so.
+     - **The request rows, from the serving primary, once the web UIs have answered every request** (NB7: a guild
+       another machine runs). A row is deleted an hour after its insert, so take it within the hour:
+
+           node test/oracle/oracle.mjs sql requests --log <run>.jsonl | ssh contabo-dbot docker exec -i <postgres container> psql -U smdb -d smdb -At > requests.jsonl
+
+       A row holds the change's content, so send the output to a file as bytes, as for the database copy.
 4. **Judge:**
 
        node test/oracle/check.mjs --log <run>.jsonl --db primary=<p>.jsonl --lag standby=<s>.jsonl --app <node>-app.jsonl --fleet <node>-fleet-1.json --fleet-again <node>-fleet-2.json --claims claims-1.jsonl --claims claims-2.jsonl --ownership ownership.jsonl --window kill-bot
@@ -255,6 +281,7 @@ Guardrails: the secret filter on every read; `ssh <host> ...` with no flag befor
    - Use `--db` for a copy that must hold everything acknowledged (the serving primary, and a sync standby).
    - Use `--lag` for an async standby.
    - Use `--agree` for copies that must match after the chain settles.
+   - Use `--requests NAME=FILE` for the request rows: each send is compared with the rows that carry it.
 5. **The bite test, once, before trusting a baseline (VERIFY.md 5.5):** after a short clean run, `oracle.mjs bite --log
    <run>.jsonl` prints two SQL statements for the judged copy's database. Run them, dump the copy again, and check. The
    result must be FAIL, with exactly LOST and ROLLBACK on the named docs. Then run the 30-minute baseline.

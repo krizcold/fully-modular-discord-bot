@@ -2,7 +2,8 @@
 
 import { extractModuleNameFromPanel, getPanelManager } from './panelManager';
 import { getConfigProperty } from './configManager';
-import { admitGuildAction, ENTRY_WAIT_MS, gateCauseText } from './dataBackends/boot';
+import { admitGuildAction, ENTRY_WAIT_MS, gateCauseText, servedElsewhere } from './dataBackends/boot';
+import { notServedHereText } from '../fleet/guildRequests';
 import { runSealed } from './dataBackends/writeLedger';
 import { operatorRefusalText, truthText, verdictOf } from './dataBackends/replyGate';
 import { broadcastWebUIPanelUpdate } from './panel/panelWebUIAdapter';
@@ -166,6 +167,7 @@ function panelModule(panelManager: any, panelId: unknown): string | null {
 export async function runPanelAction(type: string, data: any, panelManager: any): Promise<any> {
   if (PANEL_ACTIONS.has(type) && data?.guildId) {
     const held = await admitGuildAction(String(data.guildId), performance.now() + ENTRY_WAIT_MS);
+    if (held.cause === 'not-served' && servedElsewhere(String(data.guildId))) return { success: false, error: await notServedHereText(String(data.guildId), 'panel') };
     if (held.cause !== 'admit') return { success: false, error: gateCauseText(held.cause) };
   }
   return runSealed('panel', null, panelModule(panelManager, data?.panelId), async ledger => {

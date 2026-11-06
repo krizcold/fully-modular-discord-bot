@@ -33,6 +33,7 @@ import type { BotManager } from '../botManager';
 import { hopFailure, noAnswerText } from './hopFailure';
 import { graveyardRouteRefusal } from './graveyard';
 import { shaOfRaw, CHANGED_SINCE_OPEN_TEXT } from '../../bot/internalSetup/utils/ipcDataHandler';
+import { planGuildChange, remoteNoAnswerText, sendGuildChange, type Plan } from '../utils/guildRequests';
 
 const CONFIG_NOT_FOUND = 'Config file not found. It may not exist in any scanned directories.';
 
@@ -264,8 +265,8 @@ export function createConfigRoutes(botManager: BotManager): Router {
   }
 
   /** The target's newest accepted body, from the process that serves it. */
-  const readTarget = (t: ConfigTarget): Promise<ServedRead> => (t.guildId
-    ? readServedGuild(botManager, { guildId: t.guildId, module: t.guild!.module, filename: t.guild!.filename, path: t.path })
+  const readTarget = (t: ConfigTarget, plan?: Plan): Promise<ServedRead> => (t.guildId
+    ? readServedGuild(botManager, { guildId: t.guildId, module: t.guild!.module, filename: t.guild!.filename, path: t.path }, { plan })
     : readServedGlobal(botManager, { ...t.global, path: t.path }));
 
   /** A durable backup of the body the target holds now; none when it holds none. Throws when it cannot be written. */
@@ -291,12 +292,21 @@ export function createConfigRoutes(botManager: BotManager): Router {
     return rawCheckRefusal(t.path, text);
   };
 
-  const fail = (res: Response, failure: { status: number; error: string }) => {
-    res.status(failure.status).json({ success: false, error: failure.error });
+  const fail = (res: Response, failure: { status: number; error: string; code?: string }) => {
+    res.status(failure.status).json({ success: false, error: failure.error, ...(failure.code ? { code: failure.code } : {}) });
   };
 
-  /** Only the bot child writes a postgres-routed guild: with it down, nothing is read or backed up for a write. */
-  const hopWriteWithoutBot = (t: ConfigTarget): boolean => !!t.guildId && postgresServed() && !botManager.isRunning();
+  /** A postgres-routed guild's change is planned (NB7 decision 3) inside its target lock, before its read. */
+  const plannedTarget = (t: ConfigTarget): boolean => !!t.guildId && postgresServed();
+
+  /** The plan of a postgres-routed guild's write, or undefined for any other target; a refusal is answered here. */
+  const planWrite = async (t: ConfigTarget, res: Response): Promise<{ plan?: Plan } | null> => {
+    if (!plannedTarget(t)) return {};
+    const plan = await planGuildChange(botManager, t.guildId!, 'write');
+    if (plan.kind !== 'refuse') return { plan };
+    sendHopReply(res, plan.reply);
+    return null;
+  };
 
   /** A write the route cannot make now (the web panel exiting, the bot stopping, starting or waiting): refused before its read. */
   const refuseBeforeRead = (t: ConfigTarget, res: Response): boolean => {
@@ -306,10 +316,15 @@ export function createConfigRoutes(botManager: BotManager): Router {
     return true;
   };
 
-  /** The target's write, built on the body read (expectSha): the bot process applies it, or the local chain with no bot. */
-  const writeTarget = (t: ConfigTarget, contentJson: string, expectSha: string, twin?: { root?: 'config'; rel?: string; expectSha: string }, sinceOpen = false): Promise<any> => (t.guildId
-    ? botManager.writeGuildData({ guildId: t.guildId, module: t.guild!.module, filename: t.guild!.filename, op: 'write', contentJson, expectSha, ...(twin ? { twin } : {}), ...(sinceOpen ? { sinceOpen } : {}) })
-    : botManager.runSharedOp('global.write', { ...t.global, contentJson, expectSha, ...(sinceOpen ? { sinceOpen } : {}) }));
+  /**
+   * The target's write, built on the body read (expectSha): the bot process applies it, or the local chain with no bot;
+   * a planned guild write goes by its plan, to this machine's bot process or as a request to the machine that runs it.
+   */
+  const writeTarget = (t: ConfigTarget, contentJson: string, expectSha: string, twin?: { root?: 'config'; rel?: string; expectSha: string }, sinceOpen = false, plan?: Plan): Promise<any> => {
+    if (!t.guildId) return botManager.runSharedOp('global.write', { ...t.global, contentJson, expectSha, ...(sinceOpen ? { sinceOpen } : {}) });
+    const payload = { guildId: t.guildId, module: t.guild!.module, filename: t.guild!.filename, op: 'write' as const, contentJson, expectSha, ...(twin ? { twin } : {}), ...(sinceOpen ? { sinceOpen } : {}) };
+    return plan ? sendGuildChange(botManager, plan, payload) : botManager.writeGuildData(payload);
+  };
 
   /** The bot refuses to serve guild data while DATA_BACKEND names the store the data does not live in: say why instead of listing or writing the wrong one. */
   const refuseGuildOffStore = (guildId: string | null | undefined, res: Response, write: boolean): boolean => {
@@ -525,16 +540,14 @@ export function createConfigRoutes(botManager: BotManager): Router {
       }
 
       if (refuseGuildOffStore(t.guildId, res, true)) return;
-      if (hopWriteWithoutBot(t)) {
-        sendHopReply(res, { ok: false, code: 'bot-down' });
-        return;
-      }
-      if (refuseBeforeRead(t, res)) return;
-      // One operator write of a file at a time, from its read to its write.
+      if (!plannedTarget(t) && refuseBeforeRead(t, res)) return;
+      // One operator write of a file at a time, from its plan and read to its write.
       await withTargetLock(t.path, async () => {
+        const planned = await planWrite(t, res);
+        if (!planned) return;
         // The backup holds the newest accepted body, from the process that
         // serves the target; a backup that cannot be written stops the save.
-        const current = await readTarget(t);
+        const current = await readTarget(t, planned.plan);
         if (!current.ok) {
           fail(res, current);
           return;
@@ -588,7 +601,7 @@ export function createConfigRoutes(botManager: BotManager): Router {
         // The bot process applies the write while it runs; with none, the web UI's local chain does. Either compares
         // the stored body with the one read here, in the write's own turn.
         const twin = twinSha !== null && t.globalTwin ? { root: t.globalTwin.root, rel: t.globalTwin.rel, expectSha: twinSha } : undefined;
-        const reply = await writeTarget(t, JSON.stringify(toStore, null, 2), shaOfRaw(current.content), twin);
+        const reply = await writeTarget(t, JSON.stringify(toStore, null, 2), shaOfRaw(current.content), twin, false, planned.plan);
         if (reply?.ok && !reply.pending) console.log(`[Config] ${fileId} updated successfully ${guildId ? `for guild ${guildId}` : '(global)'}`);
         sendHopReply(res, reply, { backupCreated, storedKeys: Object.keys(toStore).length });
       });
@@ -733,16 +746,14 @@ export function createConfigRoutes(botManager: BotManager): Router {
       }
 
       if (refuseGuildOffStore(t.guildId, res, true)) return;
-      if (hopWriteWithoutBot(t)) {
-        sendHopReply(res, { ok: false, code: 'bot-down' });
-        return;
-      }
-      if (refuseBeforeRead(t, res)) return;
+      if (!plannedTarget(t) && refuseBeforeRead(t, res)) return;
 
-      // One operator write of a file at a time, from its read to its write.
+      // One operator write of a file at a time, from its plan and read to its write.
       await withTargetLock(t.path, async () => {
+        const planned = await planWrite(t, res);
+        if (!planned) return;
         // The undo copy is this target's own, of the newest body it accepted.
-        const current = await readTarget(t);
+        const current = await readTarget(t, planned.plan);
         if (!current.ok) {
           fail(res, current);
           return;
@@ -765,7 +776,7 @@ export function createConfigRoutes(botManager: BotManager): Router {
           return;
         }
 
-        const reply = await writeTarget(t, body, shaOfRaw(current.content));
+        const reply = await writeTarget(t, body, shaOfRaw(current.content), undefined, false, planned.plan);
         if (reply?.ok && !reply.pending) console.log(`[Config] Restored ${t.key}${guildId ? ` for guild ${guildId}` : ''} from backup: ${filename}`);
         sendHopReply(res, reply, { backupCreated });
       });
@@ -943,16 +954,14 @@ export function createConfigRoutes(botManager: BotManager): Router {
       }
 
       if (refuseGuildOffStore(t.guildId, res, true)) return;
-      if (hopWriteWithoutBot(t)) {
-        sendHopReply(res, { ok: false, code: 'bot-down' });
-        return;
-      }
-      if (refuseBeforeRead(t, res)) return;
-      // One operator write of a file at a time, from its read to its write.
+      if (!plannedTarget(t) && refuseBeforeRead(t, res)) return;
+      // One operator write of a file at a time, from its plan and read to its write.
       await withTargetLock(t.path, async () => {
+        const planned = await planWrite(t, res);
+        if (!planned) return;
         // The backup holds the newest accepted body, from the process that
         // serves the target; a backup that cannot be written stops the save.
-        const current = await readTarget(t);
+        const current = await readTarget(t, planned.plan);
         if (!current.ok) {
           fail(res, current);
           return;
@@ -978,7 +987,7 @@ export function createConfigRoutes(botManager: BotManager): Router {
           return;
         }
 
-        const reply = await writeTarget(t, JSON.stringify(newData, null, 2), loadedSha, undefined, true);
+        const reply = await writeTarget(t, JSON.stringify(newData, null, 2), loadedSha, undefined, true, planned.plan);
         if (reply?.ok && !reply.pending) console.log(`[Data] ${t.key} saved successfully${guildId ? ` for guild ${guildId}` : ' (global)'}`);
         sendHopReply(res, reply, { backupCreated });
       });
@@ -1016,7 +1025,8 @@ export function createConfigRoutes(botManager: BotManager): Router {
         return;
       }
       if (refuseGuildOffStore(guildId, res, true)) return;
-      const reply = await botManager.writeGuildData({
+      const plan = await planGuildChange(botManager, guildId, 'delete');
+      const reply = await sendGuildChange(botManager, plan, {
         guildId,
         module: resolved.target.guild!.module,
         filename: resolved.target.guild!.filename,
@@ -1047,7 +1057,8 @@ export function createConfigRoutes(botManager: BotManager): Router {
       if (refuseGuildWrite(guildId, res)) return;
       if (refuseGuildOffStore(guildId, res, true)) return;
 
-      const reply = await botManager.writeGuildData({
+      const plan = await planGuildChange(botManager, guildId, 'delete-namespace');
+      const reply = await sendGuildChange(botManager, plan, {
         guildId,
         module: '',
         filename: '',
@@ -1081,17 +1092,25 @@ function noAnswerReplyText(cause: unknown, what: 'write' | 'delete' | 'guild-del
  * extra (a backup's outcome) rides on a success answer.
  */
 export function sendHopReply(res: Response, reply: any, extra: Record<string, unknown> = {}, what: 'write' | 'delete' | 'guild-delete' = 'write'): void {
+  // NB7 decision 9: an answer another machine's bot gave is prefixed with its name; the sender's own answers are not.
+  const servedBy = reply && typeof reply.servedBy === 'string' ? reply.servedBy : null;
+  const on = (text: string) => (servedBy && !reply.sender ? `On ${servedBy}: ${text}` : text);
+  const by = servedBy ? { servedBy } : {};
   // A change the bot never answered: nobody knows whether it was saved.
   if (reply && reply.noAnswer) {
-    res.status(503).json({ success: false, code: 'no-answer', error: noAnswerReplyText(reply.noAnswer, what) });
+    res.status(503).json({ success: false, code: 'no-answer', error: servedBy ? remoteNoAnswerText(reply.noAnswer, servedBy, what) : noAnswerReplyText(reply.noAnswer, what), ...by });
     return;
   }
   if (reply && reply.ok) {
     if (reply.pending) {
-      res.status(202).json({ success: true, pending: true, message: reply.note ?? PENDING_TEXT, ...extra });
+      res.status(202).json({ success: true, pending: true, message: on(reply.note ?? PENDING_TEXT), ...extra, ...by });
     } else {
-      res.status(200).json({ success: true, ...extra });
+      res.status(200).json({ success: true, ...extra, ...by });
     }
+    return;
+  }
+  if (reply?.code === 'no-holder' || reply?.code === 'not-taken') {
+    res.status(503).json({ success: false, code: reply.code, error: hopFailure(reply.code, reply.error)!.error, ...by });
     return;
   }
   // A shared op the bot accepted and has not confirmed on disk yet; built while the bot stops, its text says it may be lost.
@@ -1102,20 +1121,20 @@ export function sendHopReply(res: Response, reply: any, extra: Record<string, un
   const detail = reply && typeof reply.error === 'string' ? reply.error : undefined;
   const refused = what === 'guild-delete' ? graveyardRouteRefusal(reply?.code, detail, 'guild-delete') : null;
   if (refused) {
-    res.status(503).json({ success: false, error: refused });
+    res.status(503).json({ success: false, error: on(refused), ...by });
     return;
   }
   const failure = hopFailure(reply?.code, detail);
   if (failure) {
-    res.status(failure.status).json({ success: false, error: failure.error });
+    res.status(failure.status).json({ success: false, error: on(failure.error), ...by });
     return;
   }
   switch (reply?.code) {
     case 'invalid':
-      res.status(400).json({ success: false, error: detail || 'Invalid request' });
+      res.status(400).json({ success: false, error: on(detail || 'Invalid request'), ...by });
       return;
     default:
-      res.status(500).json({ success: false, error: detail || 'Guild data operation failed' });
+      res.status(500).json({ success: false, error: on(detail || 'Guild data operation failed'), ...by });
       return;
   }
 }

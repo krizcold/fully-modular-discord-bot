@@ -119,6 +119,12 @@ as room nor give it shards; when it would restart (after it could not renew, los
 saves what it can, releases its shards and stops, so the other machines take them after the takeover delay; started
 again by hand, it takes back those still free. A JSON bot runs every shard in one process and takes no claims.
 
+`smdb_data.guild_requests` holds the changes one machine's web panel sends to the machine that runs a server's shard
+(see "Editing a server another machine runs" in the web UI docs, WebUI.md). A row names the bot process the panel
+found holding the shard and is taken only by that process, only within 5 seconds of its sending; rows are deleted
+after an hour.
+This table came with a new schema version, so a database made by an earlier version of the bot is refused at boot.
+
 ## Local development (Windows first-class)
 
 Any reachable Postgres works:

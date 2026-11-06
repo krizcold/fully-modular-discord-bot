@@ -35,6 +35,10 @@ export function hopFailure(code: unknown, detail?: string): HopFailure | null {
       return { status: 503, error: detail || 'Your change is not confirmed as saved yet. Please check again in a moment.' };
     case 'no-answer':
       return { status: 503, error: detail || noAnswerText('failed', 'write') };
+    case 'no-holder':
+      return { status: 503, error: detail || "No machine runs this server's shard right now; nothing was saved. Try again in a moment." };
+    case 'not-taken':
+      return { status: 503, error: detail || 'The machine that runs this server did not apply the change; nothing was saved. Try again in a moment.' };
     default:
       return null;
   }

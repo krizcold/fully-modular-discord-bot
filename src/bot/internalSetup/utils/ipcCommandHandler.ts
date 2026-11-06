@@ -9,7 +9,8 @@ import handleCommands from '../events/interactionCreate/handleCommands';
 import getLocalCommands from './getLocalCommands';
 import { getPanelManager } from './panelManager';
 import { buildConsoleInteraction } from './consoleInteraction';
-import { admitGuildAction, ENTRY_WAIT_MS, gateConsoleText } from './dataBackends/boot';
+import { admitGuildAction, ENTRY_WAIT_MS, gateConsoleText, servedElsewhere } from './dataBackends/boot';
+import { notServedHereText } from '../fleet/guildRequests';
 import { isCommandRunnable } from './commandGate';
 import { runSealed } from './dataBackends/writeLedger';
 import { operatorRefusalText, truthText, verdictOf } from './dataBackends/replyGate';
@@ -53,6 +54,7 @@ export async function handleInvoke(data: InvokePayload): Promise<Record<string, 
 
   const guildId = data.guildId ? String(data.guildId) : null;
   const guild = guildId ? client.guilds.cache.get(guildId) || null : null;
+  if (guildId && servedElsewhere(guildId)) return { success: false, error: await notServedHereText(guildId, 'console') };
   if (guildId && !data.force) {
     if (!guild) {
       return { success: false, error: `this bot does not serve guild ${guildId} (not in cache); pass force to attempt anyway` };

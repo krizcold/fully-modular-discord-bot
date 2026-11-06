@@ -119,6 +119,10 @@ export function botFor(child: FakeChild): BotManager {
       return applyOperatorDataWrite(req);
     },
     writeRefusal: () => null,
+    // NB10's route as NB7's plan reads it: the child while it runs; with none, bot-down for a Postgres guild.
+    writerRoute: (_kind: string, opts: { postgresGuild?: boolean } = {}) => (child.running
+      ? { route: 'child' }
+      : opts.postgresGuild ? { ok: false, status: 503, code: 'bot-down', error: 'the bot process is not running' } : { route: 'local' }),
     runSharedOp: async (op: string, args: any) => {
       child.sharedOps.push({ op, args });
       const scripted = child.shared?.({ op, args });

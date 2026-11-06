@@ -226,9 +226,9 @@ describe('the hold', () => {
     expect(r.store.hydrationsSent).toBe(1);
   });
 
-  it('not-served waits, and a grant inside the bound is taken', async () => {
+  it('before the lease is set, not-served waits, and the grant inside the bound is taken', async () => {
     fakeClock();
-    const r = readinessRig(NOT_LEASED);
+    const r = readinessRig(null);
     const guildId = r.guild();
     const hold = watch(admitGuildAction(guildId, now() + 2000));
     await vi.advanceTimersByTimeAsync(500);

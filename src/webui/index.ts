@@ -3,6 +3,7 @@
 import { createServer as createHTTPServer, request as httpRequest } from 'http';
 import { request as httpsRequest } from 'https';
 import { BotManager } from './botManager';
+import { endGuildRequests } from './utils/guildRequests';
 import { createServer } from './server';
 import { WebSocketManager } from './websocketManager';
 import { getInstallQueue } from './utils/installQueue';
@@ -140,6 +141,7 @@ export async function startWebUI(botManager: BotManager): Promise<void> {
     // automatic start.
     await botManager.shutdown(false);
     await botManager.endLocalChain();
+    await endGuildRequests();
 
     stopSessionStore();
 

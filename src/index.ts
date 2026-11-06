@@ -25,6 +25,7 @@ initLogCapture();
 
 import 'dotenv/config';
 import { BotManager, inLocalOp, populateTakeCause } from './webui/botManager';
+import { endGuildRequests } from './webui/utils/guildRequests';
 import { startWebUI, flushBeforeExit } from './webui';
 import { ensureConfigPopulated } from './bot/internalSetup/utils/configManager';
 import { getSafetyManager } from './utils/updateSafety';
@@ -144,6 +145,7 @@ async function main() {
     botManager.beginExit();
     await botManager.shutdown(false);
     await botManager.endLocalChain();
+    await endGuildRequests();
     await flushBeforeExit();
     process.exit(0);
   });
@@ -153,6 +155,7 @@ async function main() {
     botManager.beginExit();
     await botManager.shutdown(false);
     await botManager.endLocalChain();
+    await endGuildRequests();
     await flushBeforeExit();
     process.exit(0);
   });

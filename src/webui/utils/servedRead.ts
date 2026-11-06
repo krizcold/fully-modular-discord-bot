@@ -8,7 +8,8 @@ import * as path from 'path';
 import { readRawStrict } from '../../bot/internalSetup/utils/dataManager';
 import { filesPending } from '../../bot/internalSetup/utils/dataBackends/fileBackend';
 import { resolveDataBackend } from '../../utils/envLoader';
-import { getWebuiDataReader } from './webuiDataReader';
+import { failureOf } from '../../bot/internalSetup/utils/dataBackends/guildRequestSql';
+import { NB7_TEXTS, remoteReadDoc, runHolderCheck, switchOnNotHeld, type CheckAnswer, type Plan } from './guildRequests';
 import { hopFailure } from '../routes/hopFailure';
 import type { BotManager } from '../botManager';
 
@@ -18,7 +19,7 @@ import type { BotManager } from '../botManager';
  */
 export type ServedRead =
   | { ok: true; content: string | null; notice?: string; childQueued?: boolean; childFailing?: boolean; unstorable?: string }
-  | { ok: false; status: number; error: string };
+  | { ok: false; status: number; error: string; code?: string };
 
 export const BOT_DOWN_DISK_NOTICE = "The bot is not running: this was read from this node's disk, and a change the bot had not saved yet is not in it.";
 export const BOT_DOWN_DATABASE_NOTICE = 'The bot is not running: this was read from the database, and a change the bot had not saved yet is not in it.';
@@ -110,26 +111,70 @@ export async function readServedGlobal(botManager: BotManager, target: GlobalRea
  * guild's files are also written by this process (its
  * saves and restores queue here), so its own queue counts as for a global file.
  */
-export async function readServedGuild(botManager: BotManager, target: GuildReadTarget): Promise<ServedRead> {
+export async function readServedGuild(botManager: BotManager, target: GuildReadTarget, opts: { plan?: Plan } = {}): Promise<ServedRead> {
   const fileRouted = resolveDataBackend() !== 'postgres';
+  const plan = opts.plan;
+  const leftOf = () => (plan ? plan.deadline - performance.now() : READ_BOUND_MS);
+  if (!fileRouted && plan?.kind === 'request') return databaseRead(target, NB7_TEXTS.heldNotice(plan.holder!.name), leftOf());
   const queuedBefore = fileRouted && filesPending([target.path]);
   const reply = await botManager.readGuildData({ guildId: target.guildId, module: target.module, filename: target.filename });
   if (reply?.ok) {
     if (fileRouted) return combine(target, queuedBefore, reply);
     return typeof reply.unstorable === 'string' ? { ok: true, content: bodyOf(reply), unstorable: reply.unstorable } : { ok: true, content: bodyOf(reply) };
   }
-  if (reply?.code !== 'bot-down') return refused(reply, 'Guild data operation failed');
-  if (!fileRouted) {
-    try {
-      const reader = getWebuiDataReader();
-      const exists = await reader.exists(target.guildId, target.module, target.filename);
-      const doc = exists ? await reader.readDoc(target.guildId, target.module, target.filename) : null;
-      return { ok: true, content: doc, notice: BOT_DOWN_DATABASE_NOTICE };
-    } catch {
-      return { ok: false, status: 503, error: 'Data backend unreachable; retry shortly' };
-    }
+  if (fileRouted) {
+    if (reply?.code !== 'bot-down') return refused(reply, 'Guild data operation failed');
+    return readHere(target.path, BOT_DOWN_DISK_NOTICE);
   }
-  return readHere(target.path, BOT_DOWN_DISK_NOTICE);
+  // NB7 decision 10: the child does not serve the guild; a write route's plan follows the holder check from here on.
+  if (reply?.code === 'not-held') {
+    if (plan) {
+      await switchOnNotHeld(plan, target.guildId);
+      if (plan.kind !== 'request') return planRefusal(plan.reply);
+      return databaseRead(target, NB7_TEXTS.heldNotice(plan.holder!.name), leftOf());
+    }
+    const check = await runHolderCheck(target.guildId);
+    if (check.kind === 'failed') return { ok: false, status: 503, error: NB7_TEXTS.readLookupFailed(describeLookupFailure(check.error)) };
+    return databaseRead(target, noticeOf(check));
+  }
+  if (reply?.code !== 'bot-down' && reply?.code !== 'starting') return refused(reply, 'Guild data operation failed');
+  // NB7 decision 3: on the local route every reply but not-held is the answer.
+  if (plan?.kind === 'local') return planRefusal(reply);
+  const check = await runHolderCheck(target.guildId, plan?.deadline);
+  if (check.kind === 'failed' || (check.kind === 'held' && check.thisNode)) {
+    if (reply.code === 'bot-down') return databaseRead(target, BOT_DOWN_DATABASE_NOTICE, leftOf());
+    return refused(reply, 'Guild data operation failed');
+  }
+  return databaseRead(target, noticeOf(check), leftOf());
+}
+
+const READ_BOUND_MS = 5000;
+const DATABASE_UNREACHABLE = 'Data backend unreachable; retry shortly';
+
+/** The database read of a guild document with its notice (NB7 decision 10); boundMs cuts it to a write's deadline. */
+async function databaseRead(target: GuildReadTarget, notice: string, boundMs = READ_BOUND_MS): Promise<ServedRead> {
+  try {
+    return { ok: true, content: await remoteReadDoc(target.guildId, target.module, target.filename, boundMs), notice };
+  } catch {
+    return { ok: false, status: 503, error: DATABASE_UNREACHABLE };
+  }
+}
+
+const noticeOf = (check: CheckAnswer): string => (check.kind === 'held' ? NB7_TEXTS.heldNotice(check.holder.name) : NB7_TEXTS.noHolderNotice);
+
+function describeLookupFailure(error: unknown): string {
+  const failure = failureOf(error);
+  return failure.kind === 'refused' ? `SQLSTATE ${failure.code}: ${failure.message}` : failure.cause;
+}
+
+const PLAN_CODES = new Set(['no-holder', 'not-taken', 'maintenance']);
+
+/** A plan's refusal as a read's failure: its status, the text sendHopReply gives it and the code it carries. */
+function planRefusal(reply: any): ServedRead {
+  const detail = typeof reply?.error === 'string' ? reply.error : undefined;
+  const hop = hopFailure(reply?.code, detail);
+  if (hop) return PLAN_CODES.has(reply.code) ? { ok: false, status: hop.status, error: hop.error, code: reply.code } : { ok: false, status: hop.status, error: hop.error };
+  return { ok: false, status: reply?.code === 'invalid' ? 400 : 500, error: detail || 'Guild data operation failed' };
 }
 
 const held = new Map<string, Promise<void>>();

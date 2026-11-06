@@ -136,6 +136,8 @@ const DEFINITE_REFUSALS = [
   'delete not accepted',
   'guild data is not ready',
   'Data file not found',
+  // NB7 invariant 2: a request-route answer holding it is a change no process applied.
+  'nothing was',
 ];
 
 /**
@@ -803,6 +805,22 @@ export function claimsSql() {
   return `SELECT jsonb_build_object('rows', COALESCE(jsonb_agg(jsonb_build_object('count', shard_count, 'shard', shard_id, 'claim', claim, 'process', holder_process, 'released', released) ORDER BY shard_count, shard_id), '[]'::jsonb)) FROM smdb_data.shard_claims`;
 }
 
+/**
+ * The request listing of one run, one line per smdb_data.guild_requests row
+ * of a write or a delete of the run's docs under `psql -At`: its id, op and
+ * state, the body's filename ("k") and contentJson ("c", null for a delete),
+ * whether a holder took it ("taken") and the holder's reply. The input
+ * check.mjs takes as --requests.
+ * @param {string} guild
+ * @param {string} run
+ */
+export function requestsSql(guild, run) {
+  if (!/^\d{5,20}$/.test(guild) || !RUN_ID.test(run)) throw new Error('requestsSql needs a guild id and a run id');
+  const prefix = `${run}-`;
+  const field = (/** @type {string} */ name) => `(body::jsonb ->> '${name}')`;
+  return `SELECT json_build_object('id', id, 'op', op, 'state', state, 'k', ${field('filename')}, 'c', ${field('contentJson')}, 'taken', taken_at IS NOT NULL, 'reply', reply) FROM smdb_data.guild_requests WHERE guild_id = '${guild}' AND op IN ('write', 'delete') AND ${field('module')} = '${MODULE}' AND left(${field('filename')}, ${prefix.length}) = '${prefix}' ORDER BY created_at, id`;
+}
+
 /** @param {string[]} argv */
 async function sql(argv) {
   if (argv.length === 1 && argv[0] === 'ownership') {
@@ -811,6 +829,12 @@ async function sql(argv) {
   }
   if (argv.length === 1 && argv[0] === 'claims') {
     process.stdout.write(`${claimsSql()}\n`);
+    return;
+  }
+  if (argv[0] === 'requests') {
+    const r = parseArgs(argv.slice(1), { log: 'many' });
+    const { run, guild } = keysFromLogs(r.log);
+    process.stdout.write(`${requestsSql(guild, run)}\n`);
     return;
   }
   const a = parseArgs(argv, { log: 'many' });
@@ -881,6 +905,7 @@ oracle.mjs fleet --target URL --name NODE --out FILE [--limiter SPEC] [--timeout
 oracle.mjs sql --log FILE      the psql query that lists the run's docs
 oracle.mjs sql ownership       the psql query that lists the claim sequence and the highest stored claims
 oracle.mjs sql claims          the psql query that lists shard_claims
+oracle.mjs sql requests --log FILE  the psql query that lists the run's rows of guild_requests
 oracle.mjs bite --log FILE     the bite test's two tamperings, as SQL
 oracle.mjs cleanup --log FILE [--log FILE ...] --target URL [--limiter SPEC]`;
 

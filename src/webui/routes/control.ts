@@ -1,5 +1,6 @@
 import { Router, Request, Response } from 'express';
 import { BotManager } from '../botManager';
+import { endGuildRequests } from '../utils/guildRequests';
 import { getWebuiLogs, clearWebuiLogs } from '../utils/logCapture';
 import { drainForExit } from '../../bot/internalSetup/utils/dataManager';
 
@@ -104,6 +105,7 @@ export function createControlRoutes(botManager: BotManager): Router {
             console.error('[Control] Error during bot shutdown:', err);
           }
           await botManager.endLocalChain();
+          await endGuildRequests();
           await flushBeforeExit();
           console.log('[Control] Exiting process - Docker will restart container');
           process.exit(0);
@@ -152,6 +154,7 @@ export function createControlRoutes(botManager: BotManager): Router {
           console.error('[Control] Error during bot shutdown:', err);
         }
         await botManager.endLocalChain();
+        await endGuildRequests();
         await flushBeforeExit();
         console.log('[Control] Exiting process for full restart');
         process.exit(0);
