@@ -30,7 +30,8 @@ beforeAll(async () => {
       client.heldCommitWrapped = true;
       const query = client.query.bind(client);
       client.query = async (...args: any[]) => {
-        if (holdNext && typeof args[0] === 'string' && args[0].trim().toUpperCase() === 'COMMIT') {
+        const text = typeof args[0] === 'string' ? args[0] : args[0]?.text;
+        if (holdNext && typeof text === 'string' && text.trim().toUpperCase() === 'COMMIT') {
           holdNext = false;
           const go = new Promise<void>(resolve => { letCommit = resolve; });
           atCommit?.();
