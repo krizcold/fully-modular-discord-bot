@@ -30,6 +30,7 @@ export interface BotCredentials {
   FLEET_SHARD_CAPACITY?: string;
   FLEET_TAKEOVER_SECONDS?: string;
   FLEET_SHARD_RETURN?: string;
+  FLEET_RESHARD_OVERLAP?: string;
   // OAuth Configuration (Optional - for Guild Web-UI)
   ENABLE_GUILD_WEBUI?: string;
   DISCORD_CLIENT_ID?: string;
@@ -117,6 +118,7 @@ export function loadCredentials(): BotCredentials {
     FLEET_SHARD_CAPACITY: process.env.FLEET_SHARD_CAPACITY,
     FLEET_TAKEOVER_SECONDS: process.env.FLEET_TAKEOVER_SECONDS,
     FLEET_SHARD_RETURN: process.env.FLEET_SHARD_RETURN,
+    FLEET_RESHARD_OVERLAP: process.env.FLEET_RESHARD_OVERLAP,
     // OAuth fields
     ENABLE_GUILD_WEBUI: process.env.ENABLE_GUILD_WEBUI,
     DISCORD_CLIENT_ID: process.env.DISCORD_CLIENT_ID,
@@ -299,6 +301,15 @@ export function shardReturnEnabled(): boolean {
   if (raw === '' || raw === 'true') return true;
   if (raw === 'false') return false;
   rejectSetting('FLEET_SHARD_RETURN', raw, 'expected true or false; using true');
+  return true;
+}
+
+/** Whether this machine allows a reshard beside the running shards (NB9 decision 20, C12). */
+export function reshardOverlap(): boolean {
+  const raw = (process.env.FLEET_RESHARD_OVERLAP ?? '').trim();
+  if (raw === '' || raw === 'true') return true;
+  if (raw === 'false') return false;
+  rejectSetting('FLEET_RESHARD_OVERLAP', raw, 'expected true or false; using true');
   return true;
 }
 

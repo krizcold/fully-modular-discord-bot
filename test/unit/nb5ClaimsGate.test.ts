@@ -221,7 +221,7 @@ describe('C5 (b): retarget', () => {
   it('builds its pool from the entry\'s parts (pgConfig), never the raw list', () => {
     const store = new ClaimStore('postgres://bot:pw@db3.example:5433/botdb', T);
     const options = (store as any).pool.options;
-    expect(options).toMatchObject({ host: 'db3.example', port: 5433, database: 'botdb', user: 'bot', application_name: 'smdb-claims', max: 2 });
+    expect(options).toMatchObject({ host: 'db3.example', port: 5433, database: 'botdb', user: 'bot', application_name: 'smdb-claims', max: 3 });
     expect(options.connectionString).toBeUndefined();
     void store.end();
   });
@@ -240,6 +240,7 @@ describe('D7: the re-take', () => {
     const f = fakePool((text, values) => {
       order.push(text);
       if (/^SELECT up_ms::text/.test(text.trim())) return { rows: [{ up_ms: '1000', u_prime: '1200', now_ms: 5000 }] };
+      if (text.includes('LEFT JOIN smdb_data.reshard')) return { rows: [{ attempt: null, state: null, from_count: null, to_count: null, target: null, target_by: null, target_at: null, meta_count: 4 }] };
       if (text.includes('to_regclass')) return { rows: [{ present: true }] };
       if (text.includes('FROM smdb_manager.generation')) return { rows: [{ generation: '2' }] };
       if (text.includes('FROM smdb_data.shard_claims WHERE shard_id = ANY')) return { rows: [claimRow(3, '91', 'p-a'), claimRow(1, '50', 'p-z')] };
@@ -262,13 +263,16 @@ describe('D7: the re-take', () => {
       if (/^SELECT up_ms::text/.test(text.trim())) return 'clock';
       if (text.includes('to_regclass') || text.includes('smdb_manager.generation')) return 'generation';
       if (text.includes('WHERE shard_id = ANY')) return 'claim rows';
+      if (text.includes('LEFT JOIN smdb_data.reshard')) return 'step 1';
+      if (text.includes('DELETE FROM smdb_data.shard_claims c')) return 'step 2';
+      if (text.includes('SELECT c.shard_count, c.shard_id, c.holder_name')) return 'step 3';
       if (text.includes('DISTINCT shard_count')) return 'counts';
       if (text.includes('GREATEST(') || text.includes('nextval')) return 'draw';
       if (text.includes('guild_ownership')) return 'guild claims';
       if (text === TAKE_INSERT_SQL || text === TAKE_UPDATE_SQL) return 'write';
       return text;
     });
-    expect(kinds).toEqual(['BEGIN', 'lock', 'clock', 'generation', 'generation', 'claim rows', 'counts', 'guild claims', 'draw', 'draw', 'write', 'write', 'COMMIT']);
+    expect(kinds).toEqual(['BEGIN', 'lock', 'clock', 'generation', 'generation', 'claim rows', 'step 1', 'step 2', 'step 3', 'guild claims', 'draw', 'draw', 'write', 'write', 'COMMIT']);
     expect(commitSentAt).toBe(order.length - 1);
     const insert = f.clients[0].sent.indexOf(TAKE_INSERT_SQL);
     const update = f.clients[0].sent.indexOf(TAKE_UPDATE_SQL);
@@ -284,6 +288,7 @@ describe('D7: the re-take', () => {
     let updateValues: unknown[] = [];
     const f = fakePool((text, values) => {
       if (/^SELECT up_ms::text/.test(text.trim())) return { rows: [{ up_ms: '1000', u_prime: '1200', now_ms: 5000 }] };
+      if (text.includes('LEFT JOIN smdb_data.reshard')) return { rows: [{ attempt: null, state: null, from_count: null, to_count: null, target: null, target_by: null, target_at: null, meta_count: 4 }] };
       if (text.includes('to_regclass')) return { rows: [{ present: false }] };
       if (text.includes('WHERE shard_id = ANY')) return { rows: [{ shard_count: 4, shard_id: 3, claim: '91', holder_process: 'p-a', holder_node: 'n-a', holder_name: 'A', home_node: 'n-a', released: false, reserved: false, taken_at: 1, renewed_at: 2, ttl_ms: '30000', expires_up_ms: '50000', extended: false, renewed_ago_ms: 1 }] };
       if (text.includes('DISTINCT shard_count')) return { rows: [{ shard_count: 4 }] };

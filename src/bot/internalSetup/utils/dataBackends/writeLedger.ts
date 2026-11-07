@@ -335,13 +335,19 @@ export function isPaymentLedger(ledger: WriteLedger | undefined): boolean {
   return paymentOpOf(ledger) !== undefined;
 }
 
+/** NB9 43: the interaction hook, read at each interaction, so it can be set after the wrap. */
+export interface InteractionHookHolder {
+  onOpen?: (interaction: object, ledger: WriteLedger) => void;
+}
+
 /**
  * Wraps the gateway Client's emit once: interactionCreate opens a ledger keyed
  * to the interaction and runs every listener inside it (the dispatcher, module
- * listeners, collectors). Every other event passes through unchanged. onOpen
- * sees each interaction and its ledger before any listener (BT-3's reply gate).
+ * listeners, collectors). Every other event passes through unchanged. The
+ * holder's onOpen sees each interaction and its ledger before any listener
+ * (BT-3's reply gate).
  */
-export function installInteractionLedgers(client: Client, onOpen?: (interaction: object, ledger: WriteLedger) => void): void {
+export function installInteractionLedgers(client: Client, holder: InteractionHookHolder = {}): void {
   const emit = client.emit;
   client.emit = function emitWithLedger(this: Client, event: string | symbol, ...args: unknown[]): boolean {
     const interaction = args[0];
@@ -349,7 +355,7 @@ export function installInteractionLedgers(client: Client, onOpen?: (interaction:
       return (emit as (event: string | symbol, ...args: unknown[]) => boolean).call(this, event, ...args);
     }
     const ledger = openLedger('interaction', interaction);
-    onOpen?.(interaction, ledger);
+    holder.onOpen?.(interaction, ledger);
     return runInLedger(ledger, null, () => (emit as (event: string | symbol, ...args: unknown[]) => boolean).call(this, event, ...args));
   } as Client['emit'];
 }

@@ -7,6 +7,7 @@ import { Router, Request, Response, NextFunction } from 'express';
 import { addressesTiming, type BotManager } from '../botManager';
 import { resolveDataBackend } from '../../utils/envLoader';
 import { checkAddressList } from '../../utils/databaseAddress';
+import { checkMemoryReading, refusedLine } from '../../utils/memoryReading';
 import { atomicWriteFileSync } from '../../bot/internalSetup/utils/atomicWrite';
 import { decideMain } from '../../bot/internalSetup/utils/dataBackends/mainDatabase';
 import {
@@ -432,6 +433,22 @@ export function createManagedRoutes(botManager: BotManager, migration: Migration
     }
     const answer = await botManager.applyAddressList(value);
     res.status(answer.status).json(answer.body);
+  });
+
+  // NB9 19, 37 and 51: the manager's memory reading, kept by the web UI process and pushed to the bot process.
+  router.post('/memory', (req: Request, res: Response) => {
+    const refused = checkMemoryReading(req.body);
+    if (refused) {
+      console.warn(refusedLine(refused));
+      res.status(400).json({ success: false, error: refused });
+      return;
+    }
+    const body = req.body as { room: boolean | null; useMb: number | null; freeMb: number | null; at: string; error?: string };
+    botManager.noteMemoryReading({
+      room: body.room, useMb: body.useMb, freeMb: body.freeMb, at: body.at,
+      ...(typeof body.error === 'string' ? { error: body.error } : {}),
+    });
+    res.json({ success: true });
   });
 
   return router;

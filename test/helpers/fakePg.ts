@@ -14,6 +14,8 @@ export interface FakeStore {
   noMeta?: boolean;
   /** The owner_channel row's value (NB5 decision 23); absent for no row. */
   ownerChannel?: string;
+  /** Row 1 of the reshard table, written by provisioning's seed. */
+  reshardSeeded?: boolean;
 }
 
 const sha = (s: string) => createHash('sha256').update(Buffer.from(s, 'utf8')).digest('hex');
@@ -112,7 +114,7 @@ export class FakeClient {
     this.db.clients.delete(this.pid);
   }
 
-  async query(text: string, params: any[] = []): Promise<{ rows: Row[]; command?: string }> {
+  async query(text: string, params: any[] = []): Promise<{ rows: Row[]; command?: string; rowCount?: number }> {
     const sql = text.replace(/\s+/g, ' ').trim();
     this.db.log.push({ app: this.app, sql });
     if (this.ended) throw new Error('Client was closed and is not queryable');
@@ -164,7 +166,7 @@ export class FakeClient {
     return this.statSnapshot;
   }
 
-  private async answer(sql: string, params: any[]): Promise<{ rows: Row[]; command?: string }> {
+  private async answer(sql: string, params: any[]): Promise<{ rows: Row[]; command?: string; rowCount?: number }> {
     if (/^BEGIN/.test(sql)) { this.view = clone(this.db.schemas); return { rows: [] }; }
     const sp = /^SAVEPOINT (\w+)/.exec(sql);
     if (sp) {
@@ -243,6 +245,12 @@ export class FakeClient {
     }
     if (/^CREATE /.test(sql)) return { rows: [] };
     if (/^INSERT INTO smdb_data\.claim_clock/.test(sql)) return { rows: [] };
+    if (/^INSERT INTO smdb_data\.reshard \(id\) VALUES \(1\) ON CONFLICT \(id\) DO NOTHING$/.test(sql)) {
+      const s = this.store();
+      const rowCount = s.reshardSeeded ? 0 : 1;
+      s.reshardSeeded = true;
+      return { rows: [], command: 'INSERT', rowCount };
+    }
     // No shard claims are modelled: the rename aside (NB4 decision 25) finds none.
     if (/to_regclass\('smdb_data\.shard_claims'\)/.test(sql)) return { rows: [{ present: false }] };
     if (/INSERT INTO smdb_data\.meta .*'owner_channel'/.test(sql)) {

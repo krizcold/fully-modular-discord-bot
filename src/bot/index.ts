@@ -48,20 +48,44 @@ import 'dotenv/config';
 import { beginStop, installStopHandler } from './internalSetup/utils/dataManager';
 import { configureWriterLock, onDeposed, releaseWriterLockAtExit, reportWriterStage, takeWriterLockForBoot } from './internalSetup/utils/writerLock';
 import { setupAddressesIpc } from '../utils/databaseAddress';
+import { setupMemoryIpc } from '../utils/memoryReading';
 
-// Every writer of the data files runs after the writer lock is taken: clientInitializer loads only then.
-async function boot(): Promise<void> {
-  configureWriterLock('bot');
-  setupAddressesIpc();
-  await takeWriterLockForBoot();
-  installStopHandler();
-  process.on('exit', () => releaseWriterLockAtExit());
+function watchDeposition(): void {
   onDeposed(holder => {
     reportWriterStage('deposed', { holder: { role: holder.role ?? null, pid: holder.pid } });
     // After every deposition listener of this synchronous run.
     void Promise.resolve().then(() => beginStop(true));
   });
-  await import('./internalSetup/clientInitializer');
+}
+
+// NB9 27 and 42: a standby takes no lock before it serves; it takes the lock at serve, then runs the normal boot's steps.
+async function standbyBoot(): Promise<void> {
+  setupAddressesIpc();
+  setupMemoryIpc();
+  installStopHandler();
+  process.on('exit', () => releaseWriterLockAtExit());
+  const { standbyMain } = await import('./internalSetup/fleet/standbyBoot');
+  await standbyMain({
+    takeLock: async () => {
+      configureWriterLock('bot');
+      await takeWriterLockForBoot();
+      watchDeposition();
+    },
+  });
+}
+
+// Every writer of the data files runs after the writer lock is taken: clientInitializer loads only then.
+async function boot(): Promise<void> {
+  if (process.env.SMDB_RESHARD_STANDBY) return standbyBoot();
+  configureWriterLock('bot');
+  setupAddressesIpc();
+  setupMemoryIpc();
+  await takeWriterLockForBoot();
+  installStopHandler();
+  process.on('exit', () => releaseWriterLockAtExit());
+  watchDeposition();
+  const { main } = await import('./internalSetup/clientInitializer');
+  main().catch(console.error);
 }
 
 boot().catch(error => {

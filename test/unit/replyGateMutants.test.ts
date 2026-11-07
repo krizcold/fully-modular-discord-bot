@@ -534,7 +534,7 @@ describe('the shutdown handler in the bot', () => {
     for (const step of ['getShardClaims()?.beginStop();', 'stopSamplers();', "getIngestService().close('shutting down')", 'getMetricsCollector().flushTotals();']) {
       expect(steps).toContain(step);
     }
-    expect(source).toContain('addReleaseStep(async () => { await getShardClaims()?.finishStop(); });');
+    expect(source).toContain("addReleaseStep(() => claimsStop('serving'));");
     const facade = readSourceText(__dirname, '../../src/bot/internalSetup/utils/dataManager.ts');
     const stop = /export function installStopHandler\(\): void \{([\s\S]*?)\n\}/.exec(facade)?.[1] ?? '';
     for (const step of ['await runSteps(stopSteps);', 'await runSteps(finalStopSteps.splice(0));', 'await drainForExit(getWorkingSet() ? 30000 : 5000);', 'await runSteps(releaseSteps);', 'process.exit(stopExitCode);']) {

@@ -4,6 +4,7 @@
 // block or crash the bot child.
 
 import { getFleetState } from '../fleet/state';
+import { getJsonReshard, getReshard } from '../fleet/shardBoot';
 
 /** Unsolicited push, carried by the metrics 5s sample tick (no own timer). */
 export function pushFleetStatus(): void {
@@ -11,6 +12,16 @@ export function pushFleetStatus(): void {
   try {
     process.send({ type: 'fleet:status', data: getFleetState() });
   } catch { /* fleet push must never take the bot down */ }
+}
+
+/** NB9 7, 15, 33 and 49: the web UI's answers about a standby go to this process's reshard driver. */
+function handleReshardMessage(message: { type: string; requestId?: unknown }): void {
+  void getReshard()?.onMessage(message).catch(error => console.error('[Shards] Could not handle the standby state the web UI sent:', error));
+  const answer = getJsonReshard()?.onMessage(message) ?? null;
+  if (message.type !== 'reshard:retire' || typeof message.requestId !== 'string' || !message.requestId) return;
+  try {
+    process.send!({ requestId: message.requestId, data: answer ?? { accepted: false } });
+  } catch { /* the parent is gone */ }
 }
 
 export function setupFleetIPCHandlers(): void {
@@ -24,6 +35,10 @@ export function setupFleetIPCHandlers(): void {
   process.on('message', (message: any) => {
     if (!message || typeof message !== 'object') return;
     const { type, requestId } = message;
+    if (type === 'reshard:standby-state' || type === 'reshard:retire') {
+      handleReshardMessage(message);
+      return;
+    }
     if (typeof type !== 'string' || !type.startsWith('fleet:') || !requestId) return;
 
     try {

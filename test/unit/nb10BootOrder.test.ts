@@ -132,7 +132,7 @@ describe('the report order of a bot process (NB10 tests 8 and 23)', () => {
   it('a normal boot reports nothing while decideBoot runs, shared after the shared-op handler, guild after the data handlers and tickers', async () => {
     const decision = gate<any>();
     ctl.decide = () => decision.promise;
-    await import('../../src/bot/internalSetup/clientInitializer');
+    void (await import('../../src/bot/internalSetup/clientInitializer')).main().catch(console.error);
     await vi.waitFor(() => expect(ctl.order).toContain('decideBoot started'), { timeout: 5000, interval: 5 });
     await new Promise(resolve => setTimeout(resolve, 50));
     expect(reports()).toEqual([]);
@@ -157,7 +157,7 @@ describe('the report order of a bot process (NB10 tests 8 and 23)', () => {
       if (tries > 3) return new Promise<number>(() => undefined);
       throw new Error('Discord unreachable');
     };
-    await import('../../src/bot/internalSetup/clientInitializer');
+    void (await import('../../src/bot/internalSetup/clientInitializer')).main().catch(console.error);
     await vi.waitFor(() => expect(ctl.order).toContain('decideBoot started'), { timeout: 5000, interval: 5 });
     expect(reports()).toEqual([]);
     decision.open({ mode: 'maintenance', cause: 'hook', message: 'Back soon.' });

@@ -6,7 +6,10 @@
 // changes bounce its gateway sessions, never the object.
 
 import { Client, ClientOptions, Status } from 'discord.js';
-import { installInteractionLedgers, type WriteLedger } from '../utils/dataBackends/writeLedger';
+import { installInteractionLedgers, type InteractionHookHolder, type WriteLedger } from '../utils/dataBackends/writeLedger';
+
+/** @discordjs/ws's `buildIdentifyThrottler` option, given the gateway manager (NB9 16). */
+export type IdentifyThrottlerBuilder = (manager: any) => Promise<unknown>;
 
 export class IngestService {
   private client: Client | null = null;
@@ -18,11 +21,20 @@ export class IngestService {
   private shardPlan: { shards: number[]; shardCount: number } | null = null;
   private closed = false;
   private hasBeenReady = false;
+  /** NB9 43: the one interaction hook of the Client's one ledger wrapper. */
+  private readonly hook: InteractionHookHolder = {};
+  private identifyThrottler: IdentifyThrottlerBuilder | null = null;
+
+  /** NB9 16: the identify throttler the Client built next gets. */
+  setIdentifyThrottler(build: IdentifyThrottlerBuilder | null): void {
+    this.identifyThrottler = build;
+  }
 
   /** onInteraction: given each interaction and its ledger before any listener (the bot passes BT-3's reply gate). */
   buildClient(options: ClientOptions, onInteraction?: (interaction: object, ledger: WriteLedger) => void): Client {
     if (this.client) throw new Error('[Ingest] buildClient() called twice');
     const opts: ClientOptions = { ...options };
+    if (this.identifyThrottler) opts.ws = { ...opts.ws, buildIdentifyThrottler: this.identifyThrottler } as ClientOptions['ws'];
     const plan = this.shardPlan;
     // discord.js refuses shards: [], so an empty plan writes nothing and the process never logs in.
     if (plan && plan.shards.length > 0) {
@@ -35,10 +47,18 @@ export class IngestService {
       (this.client.options as any).shards = plan.shards;
       (this.client.options as any).shardCount = plan.shardCount;
     }
-    installInteractionLedgers(this.client, onInteraction);
+    this.hook.onOpen = onInteraction;
+    installInteractionLedgers(this.client, this.hook);
     this.restoreRestToken();
     this.client.once('clientReady', () => { this.hasBeenReady = true; });
     return this.client;
+  }
+
+  /** NB9 43: the Client this service built (a standby's) gets its interaction hook now; nothing is wrapped again. */
+  adoptClient(client: Client, onInteraction: (interaction: object, ledger: WriteLedger) => void): Client {
+    if (!this.client || client !== this.client) throw new Error('[Ingest] adoptClient() with a Client this service did not build');
+    this.hook.onOpen = onInteraction;
+    return client;
   }
 
   // REST (command registration, notices, access-log posts) works without a

@@ -1,4 +1,4 @@
-import { Client, GatewayIntentBits, Partials, Collection, Interaction, ButtonInteraction, StringSelectMenuInteraction, MessageFlags } from 'discord.js';
+import { Client, GatewayIntentBits, IntentsBitField, Partials, Collection, Interaction, ButtonInteraction, StringSelectMenuInteraction, MessageFlags } from 'discord.js';
 import * as fs from 'fs';
 import * as path from 'path';
 import getAllFiles from './utils/getAllFiles';
@@ -40,6 +40,8 @@ import { decideBoot, installMaintenanceGate, markDiscordStarted, runMaintenanceB
 import { isMaintenanceGateClosed } from './utils/maintenanceGate';
 import { PostgresBackend } from './utils/dataBackends/postgresBackend';
 import { noteShardReconnect, stopMainWatch } from './utils/dataBackends/mainDatabase';
+import { claimsStop, endStandbyMaintenanceAnswers, l20Line, type RunBotOptions } from './fleet/standbyBoot';
+import { setLoginIntents } from './fleet/state';
 
 // Load credentials from /data/.env (Web-UI managed) or environment variables
 const credentials = loadCredentials();
@@ -475,13 +477,23 @@ function runInitializers(client: Client) {
 }
 
 
+/** The normal boot. */
+export async function main(): Promise<void> {
+  return runBot({});
+}
+
 /**
- * Main function that initializes the client.
+ * The bot process's boot. A promoted standby (NB9 28) passes what it took and the Client it logged in; every other step
+ * runs as in a normal boot.
  */
-async function main() {
+export async function runBot(opts: RunBotOptions): Promise<void> {
+  const { taken, client: adopted, releaseInjected } = opts;
   // The saved maintenance state (and a refused database login) is read before the data backend opens.
   const boot = await decideBoot();
   if (boot.mode === 'maintenance') {
+    if (releaseInjected) await releaseInjected();
+    // NB9 D3: in the turn the maintenance boot's listener starts.
+    endStandbyMaintenanceAnswers();
     await runMaintenanceBoot(boot);
     return;
   }
@@ -506,8 +518,10 @@ async function main() {
   // NB5 C1 and G10: the watch stops after the exit drain, before any release step writes to the database.
   addReleaseStep(() => stopMainWatch());
   addReleaseStep(guildRequestsStopStep);
-  addReleaseStep(async () => { await getShardClaims()?.finishStop(); });
+  addReleaseStep(() => claimsStop('serving'));
 
+  // NB9 D3: no await since decideBoot, so the standby's answers end in the turn this listener starts.
+  endStandbyMaintenanceAnswers();
   setupMaintenanceIPCAtBoot();
 
   // Data backend boot runs FIRST so the readiness driver exists when the
@@ -524,7 +538,7 @@ async function main() {
   reportWriterStage('shared');
 
   // Every shard runs in this process.
-  const fleet = await bootShards();
+  const fleet = taken ? await bootShards({ taken }) : await bootShards();
 
   // PHASE 0: Ensure config.json is fully populated with schema
   console.log('[Bot] Synchronizing config.json with schema...');
@@ -566,7 +580,9 @@ async function main() {
   const intents = requiredIntents.length > 0 ? requiredIntents : defaultIntents;
   const finalIntents = intents.map(intent => typeof intent === 'string' ? GatewayIntentBits[intent as keyof typeof GatewayIntentBits] : intent).filter(i => typeof i === 'number');
   const intentsList = finalIntents.map((i) => { const n = Object.entries(GatewayIntentBits).find(([_,v])=>v===i)?.[0]; return n||i; });
-  console.log('Logging in with intents:', intentsList);
+  if (!adopted) console.log('Logging in with intents:', intentsList);
+  const loggedInBits = adopted ? Number(new IntentsBitField(adopted.options.intents).bitfield) : Number(new IntentsBitField(finalIntents as number[]).bitfield);
+  setLoginIntents(loggedInBits);
 
   // PHASE 4: Create the real client with all required intents.
   // Partials are REQUIRED for reaction events on uncached messages (e.g. a
@@ -576,10 +592,12 @@ async function main() {
   // Construction goes through IngestService: {shards, shardCount} come from
   // this process's lease (the whole shard set). Every
   // interaction gets its write ledger and its reply gate (BT-3).
-  const client = getIngestService().buildClient({
-    intents: finalIntents,
-    partials: [Partials.Message, Partials.Reaction, Partials.User],
-  }, installReplyGate);
+  const client = adopted
+    ? getIngestService().adoptClient(adopted, installReplyGate)
+    : getIngestService().buildClient({
+      intents: finalIntents,
+      partials: [Partials.Message, Partials.Reaction, Partials.User],
+    }, installReplyGate);
   installMaintenanceGate(client);
   client.on('shardReady', () => noteShardReconnect());
   client.on('shardResume', () => noteShardReconnect());
@@ -785,7 +803,14 @@ async function main() {
 
   // No identify without a held claim; a Postgres process holding none logs in nothing.
   markDiscordStarted();
+  // NB9 D1: a promoted standby whose sessions stayed runs the ready work once, as after a login.
+  if (fleet.keptSessions === true && !stoppedServing()) {
+    const wanted = Number(new IntentsBitField(finalIntents as number[]).bitfield);
+    const missing = Object.entries(GatewayIntentBits)
+      .filter(([, bit]) => typeof bit === 'number' && (wanted & bit) !== 0 && (loggedInBits & bit) === 0)
+      .map(([name]) => name);
+    if (missing.length > 0) console.warn(l20Line(missing));
+    client.emit('clientReady', client as Client<true>);
+  }
   fleet.startIngest(process.env.DISCORD_TOKEN);
 }
-
-main().catch(console.error);

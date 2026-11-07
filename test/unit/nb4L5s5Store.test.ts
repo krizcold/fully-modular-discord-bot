@@ -88,8 +88,10 @@ function fakeDb(opts: DbOptions) {
     if (/^\s*(BEGIN|COMMIT|ROLLBACK|SET LOCAL)/.test(text) || text.trim() === '') return { rows: [] };
     if (/pg_advisory_xact_lock/.test(text)) return { rows: [{}] };
     if (/FROM smdb_data\.claim_clock WHERE id = 1\s*$/.test(text)) return { rows: [{ up_ms: String(upMs), u_prime: String(uPrimeMs), now_ms: 0 }] };
+    if (/LEFT JOIN smdb_data\.reshard/.test(text)) return { rows: [{ attempt: null, state: null, from_count: null, to_count: null, target: null, target_by: null, target_at: null, meta_count: opts.count ?? null }] };
     if (/FROM smdb_data\.meta/.test(text)) return { rows: opts.count == null ? [] : [{ value: JSON.stringify({ count: opts.count }) }] };
     if (/AS renewed_ago_ms FROM smdb_data\.shard_claims\s*$/.test(text)) return { rows: rows.map(asRaw) };
+    if (/AS renewed_ago_ms FROM smdb_data\.shard_claims WHERE shard_count = \$1$/.test(text)) return { rows: rows.map(asRaw).filter(r => r.shard_count === values[0]) };
     if (/FROM smdb_data\.shard_nodes\s*$/.test(text)) return { rows: nodes };
     if (/AS floor/.test(text)) return opts.floor instanceof Error ? opts.floor : { rows: [{ floor: opts.floor ?? '0' }] };
     if (/nextval/.test(text)) {

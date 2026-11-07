@@ -63,6 +63,11 @@ export class IdentifyLedger {
     return this.recommendation;
   }
 
+  /** NB9 17: max_concurrency from the last /gateway/bot read; 1 before any, or when Discord sent none. */
+  getMaxConcurrency(): number {
+    return this.lastFetch?.maxConcurrency ?? 1;
+  }
+
   private scheduleRefresh(): void {
     if (this.refreshQueued) return;
     this.refreshQueued = true;

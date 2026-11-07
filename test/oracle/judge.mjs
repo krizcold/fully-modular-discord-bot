@@ -448,8 +448,10 @@ export function controlFacts(nodes, listing = null) {
   };
   for (const n of nodes.filter(x => x.state.initialized)) {
     const id = holderOf(n);
+    // Keyed by count: a stuck process of the old count can still answer after a reshard is done (NB9 C4).
+    const count = n.state.shardCount;
     for (const l of n.state.leases) {
-      put(f.holders, String(l.shardId), id);
+      put(f.holders, `${count} ${l.shardId}`, id);
       if (typeof l.claim !== 'number') continue;
       put(f.claims, String(l.claim), `shard ${l.shardId} by ${id}`);
       if (listing && !holdsLease(listing.get(`${n.state.shardCount} ${l.shardId}`), l.claim, n.state.processId)) {
@@ -457,13 +459,12 @@ export function controlFacts(nodes, listing = null) {
       }
     }
     for (const row of n.state.shardTable) {
-      put(f.owners, String(row.shardId), id);
-      if (!n.state.leases.some(l => l.shardId === row.shardId)) put(f.unleased, String(row.shardId), id);
+      put(f.owners, `${count} ${row.shardId}`, id);
+      if (!n.state.leases.some(l => l.shardId === row.shardId)) put(f.unleased, `${count} ${row.shardId}`, id);
     }
-    const count = n.state.shardCount;
     if (typeof count === 'number' && count > 0) put(f.counts, 'all', String(count));
     for (const [guild, shard] of Object.entries(n.state.guildMap)) {
-      put(f.guildShards, guild, String(shard));
+      put(f.guildShards, `${guild} ${count}`, String(shard));
       if (typeof count === 'number' && count > 0 && (typeof shard !== 'number' || shard < 0 || shard >= count)) {
         // Keyed without the count, so a count that changed between two sets does not hide it.
         put(f.outOfRange, `${guild} ${shard}`, 'out');
@@ -510,33 +511,38 @@ export function commonFacts(a, b) {
  * No shard leased to two processes, every shard table row leased by the
  * process reporting it, one shard count, every guild mapped to one shard in
  * range, each claim on one shard of one process, and every lease's claim the
- * one shard_claims holds for it.
+ * one shard_claims holds for it. Shards and guilds are judged within one count;
+ * a second count is allowed only as a reshard listing row's {from, to}.
  * @param {ControlFacts} f
+ * @param {{ rows: { from: number, to: number }[] } | null} [reshard]
  * @returns {Verdict[]}
  */
-export function controlVerdicts(f) {
+export function controlVerdicts(f, reshard = null) {
   /** @type {Verdict[]} */
   const verdicts = [];
   const add = (/** @type {string} */ detail) => verdicts.push({ v: 'CONTROL', detail });
   const sorted = (/** @type {Set<string>} */ s) => [...s].sort();
-  for (const [shard, set] of f.holders) {
-    if (set.size > 1) add(`shard ${shard} is leased to ${set.size} processes at once: ${sorted(set).join(', ')}`);
+  const shardOf = (/** @type {string} */ key) => key.split(' ')[1];
+  for (const [key, set] of f.holders) {
+    if (set.size > 1) add(`shard ${shardOf(key)} is leased to ${set.size} processes at once: ${sorted(set).join(', ')}`);
   }
-  for (const [shard, owners] of f.owners) {
-    const set = f.holders.get(shard) ?? new Set();
+  for (const [key, owners] of f.owners) {
+    const set = f.holders.get(key) ?? new Set();
     for (const owner of sorted(owners)) {
       for (const holder of sorted(set)) {
-        if (holder !== owner) add(`shard ${shard} is leased by ${holder}, but it is in the shard table of ${owner}`);
+        if (holder !== owner) add(`shard ${shardOf(key)} is leased by ${holder}, but it is in the shard table of ${owner}`);
       }
     }
   }
-  for (const [shard, owners] of f.unleased) {
-    for (const owner of sorted(owners)) add(`shard ${shard} is in the shard table of ${owner}, which does not lease it`);
+  for (const [key, owners] of f.unleased) {
+    for (const owner of sorted(owners)) add(`shard ${shardOf(key)} is in the shard table of ${owner}, which does not lease it`);
   }
   const counts = f.counts.get('all');
-  if (counts && counts.size > 1) add(`nodes disagree on the shard count: ${sorted(counts).join(', ')}`);
-  for (const [guild, set] of f.guildShards) {
-    if (set.size > 1) add(`guild ${guild} is mapped to ${set.size} shards across nodes: ${sorted(set).join(', ')}`);
+  const ofAttempt = counts !== undefined && counts.size === 2
+    && (reshard?.rows ?? []).some(r => counts.has(String(r.from)) && counts.has(String(r.to)));
+  if (counts && counts.size > 1 && !ofAttempt) add(`nodes disagree on the shard count: ${sorted(counts).join(', ')}`);
+  for (const [key, set] of f.guildShards) {
+    if (set.size > 1) add(`guild ${key.split(' ')[0]} is mapped to ${set.size} shards across nodes: ${sorted(set).join(', ')}`);
   }
   for (const guildShard of f.outOfRange.keys()) {
     const [guild, shard] = guildShard.split(' ');
@@ -550,6 +556,107 @@ export function controlVerdicts(f) {
     for (const holder of sorted(set)) add(`${holder} holds a lease on shard ${shard} under claim ${claim}, which shard_claims does not hold for it`);
   }
   return verdicts;
+}
+
+/**
+ * @typedef {{ attempt: string, state: string, from: number, to: number, fromRows: number }} ReshardRow
+ * @typedef {{ rows: ReshardRow[], meta: number | null }} ReshardListing
+ */
+
+const OPEN_STATES = new Set(['standby', 'flipped', 'stopping']);
+
+/**
+ * The shard a guild routes to under a count, as Discord routes it: (id >> 22) % count.
+ * @param {string} guild
+ * @param {number} count
+ */
+export function shardOfGuild(guild, count) {
+  try {
+    return Number((BigInt(guild) >> 22n) % BigInt(count));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * NB9 decision 22 on one set of facts and the reshard listing taken after it: no guild in the granted shards of two
+ * live processes, whatever count each runs, and no grant of an attempt's new count before the attempt is done (from
+ * the listing, and from each process's own view of the attempt).
+ * @param {{ name: string, state: FleetFacts }[]} nodes
+ * @param {ReshardListing | null} [listing]
+ * @returns {Verdict[]}
+ */
+export function reshardFleetVerdicts(nodes, listing = null) {
+  /** @type {Verdict[]} */
+  const verdicts = [];
+  const add = (/** @type {string} */ detail) => verdicts.push({ v: 'CONTROL', detail });
+  const live = nodes.filter(n => n.state.initialized);
+  const guilds = [...new Set(live.flatMap(n => Object.keys(n.state.guildMap)))].sort();
+  for (const guild of guilds) {
+    const holders = new Set(live.filter(n => {
+      const count = n.state.shardCount;
+      return typeof count === 'number' && count > 0 && n.state.leases.some(l => l.shardId === shardOfGuild(guild, count));
+    }).map(holderOf));
+    if (holders.size > 1) add(`guild ${guild} is in the granted shards of ${holders.size} processes at once: ${[...holders].sort().join(', ')}`);
+  }
+  /** @type {{ attempt: string, state: string, from: number, to: number }[]} */
+  const open = [];
+  // From the listing only: a stuck process's own view can still read 'flipped' after the attempt is done (NB9 C4).
+  for (const r of listing?.rows ?? []) if (OPEN_STATES.has(r.state)) open.push(r);
+  for (const n of live) {
+    const count = n.state.shardCount;
+    const attempt = open.find(r => r.to === count && r.from !== count);
+    if (attempt && n.state.leases.length > 0) add(`${holderOf(n)} holds a grant of the ${count}-shard set while the reshard to ${count} shards is ${attempt.state}`);
+  }
+  return verdicts;
+}
+
+/**
+ * NB9 decision 22 on one reshard listing: at most one attempt open, no shard_claims row of the old count once an
+ * attempt is done, and meta 'shard_count' at the new count once it is flipped or done.
+ * @param {ReshardListing} listing
+ * @returns {Verdict[]}
+ */
+export function reshardListingVerdicts(listing) {
+  /** @type {Verdict[]} */
+  const verdicts = [];
+  const add = (/** @type {string} */ detail) => verdicts.push({ v: 'CONTROL', detail });
+  const open = listing.rows.filter(r => OPEN_STATES.has(r.state));
+  if (open.length > 1) add(`the reshard listing holds ${open.length} open attempts: ${open.map(r => r.attempt).sort().join(', ')}`);
+  for (const r of listing.rows) {
+    if (r.state === 'done' && r.fromRows > 0) add(`the reshard from ${r.from} to ${r.to} shards is done, but shard_claims still holds ${r.fromRows} row(s) of the ${r.from}-shard set`);
+    if ((r.state === 'flipped' || r.state === 'done') && listing.meta !== r.to) add(`the reshard to ${r.to} shards is ${r.state}, but meta 'shard_count' holds ${listing.meta ?? 'no count'}`);
+  }
+  return verdicts;
+}
+
+/**
+ * The reshard listing (oracle.mjs sql reshard under psql -At): one line,
+ * {"rows": [{"attempt": text, "state": text, "from": n, "to": n, "fromRows": n}, ...], "meta": n or null}.
+ * @param {string} text
+ * @returns {ReshardListing}
+ */
+export function parseReshard(text) {
+  const lines = text.split('\n').filter(line => line.trim() !== '');
+  if (lines.length !== 1) throw new Error(`it has ${lines.length} lines, not one`);
+  /** @type {any} */
+  let doc;
+  try {
+    doc = JSON.parse(lines[0]);
+  } catch {
+    throw new Error(`its line is not JSON: ${lines[0].slice(0, 80)}`);
+  }
+  const meta = doc?.meta === null ? null : doc?.meta;
+  if (!Array.isArray(doc?.rows) || (meta !== null && !Number.isSafeInteger(meta))) {
+    throw new Error(`its line is not {"rows": [...], "meta": n or null}: ${lines[0].slice(0, 80)}`);
+  }
+  for (const r of doc.rows) {
+    if (typeof r?.attempt !== 'string' || typeof r.state !== 'string' || !Number.isSafeInteger(r.from) || !Number.isSafeInteger(r.to)
+      || !Number.isSafeInteger(r.fromRows)) {
+      throw new Error(`a row is not {"attempt": text, "state": text, "from": n, "to": n, "fromRows": n}: ${JSON.stringify(r).slice(0, 80)}`);
+    }
+  }
+  return { rows: doc.rows.map((/** @type {any} */ r) => ({ attempt: r.attempt, state: r.state, from: r.from, to: r.to, fromRows: r.fromRows })), meta };
 }
 
 /** @typedef {{ last: number, called: boolean, highest: number | null, claims: number | null }} OwnershipListing */
@@ -637,9 +744,10 @@ export function parseClaims(text) {
  * The control check on one set of facts.
  * @param {{ name: string, state: FleetFacts }[]} nodes
  * @param {ClaimsListing | null} [listing]
+ * @param {ReshardListing | null} [reshard]
  */
-export function judgeFleet(nodes, listing = null) {
-  return controlVerdicts(controlFacts(nodes, listing));
+export function judgeFleet(nodes, listing = null, reshard = null) {
+  return controlVerdicts(controlFacts(nodes, listing), reshard);
 }
 
 /**
@@ -832,7 +940,7 @@ export function appCopy(text) {
  * Everything at once: the result the checker prints.
  * @param {{ history: History, copies: Copy[], agree?: string[], fleet?: { name: string, state: FleetFacts }[],
  *   fleetAgain?: { name: string, state: FleetFacts }[], noFleet?: boolean, windows?: string[], k?: number,
- *   ownership?: string, claims?: string[], requests?: RequestListing[] }} input
+ *   ownership?: string, claims?: string[], requests?: RequestListing[], reshard?: string[] }} input
  */
 export function judge(input) {
   const { history, copies } = input;
@@ -895,7 +1003,21 @@ export function judge(input) {
   const secondListing = listings.length > 1 ? listings[1] : firstListing;
   const leasesWithClaims = [...fleet, ...again].some(n => n.state.initialized && n.state.leases.some(l => typeof l.claim === 'number'));
   if (leasesWithClaims && claimTexts.length === 0) notes.push('leases were not compared with shard_claims: no claims listing was given (--claims)');
-  if (fleet.length > 0 && again.length === 0) verdicts.push(...judgeFleet(fleet, firstListing));
+  const reshardTexts = input.reshard ?? [];
+  const reshardOpen = [...fleet, ...again].some(n => n.state.initialized && OPEN_STATES.has(n.state.reshard?.state ?? ""));
+  if (reshardOpen && reshardTexts.length === 0) notes.push('grants were not compared with the reshard attempt: no reshard listing was given (--reshard)');
+  const reshardListings = reshardTexts.map((text, i) => {
+    try {
+      return parseReshard(text);
+    } catch (error) {
+      notes.push(`reshard listing ${i + 1} was not judged: ${error instanceof Error ? error.message : String(error)}`);
+      return null;
+    }
+  });
+  // With two sets, the first listing goes with --fleet and the second with --fleet-again, and only what both show counts.
+  const firstReshard = reshardListings[0] ?? null;
+  const secondReshard = reshardListings.length > 1 ? reshardListings[1] : firstReshard;
+  if (fleet.length > 0 && again.length === 0) verdicts.push(...judgeFleet(fleet, firstListing, firstReshard));
   if (fleet.length > 0 && again.length > 0) {
     // Only what both sets show counts, so both must cover the same nodes.
     const ids = (/** @type {typeof fleet} */ set) => new Set(set.map(n => n.state.nodeId ?? n.name));
@@ -905,11 +1027,33 @@ export function judge(input) {
     for (const id of inSecond) if (!inFirst.has(id)) inconclusive.push(`node ${id} is in the second set of control facts only`);
     const first = controlFacts(fleet, firstListing);
     const second = controlFacts(again, secondListing);
-    const both = controlVerdicts(commonFacts(first, second));
+    const eitherReshard = { rows: [...(firstReshard?.rows ?? []), ...(secondReshard?.rows ?? [])] };
+    const both = controlVerdicts(commonFacts(first, second), eitherReshard);
     verdicts.push(...both);
     const counted = new Set(both.map(v => v.detail));
-    for (const detail of new Set([...controlVerdicts(first), ...controlVerdicts(second)].map(v => v.detail))) {
+    for (const detail of new Set([...controlVerdicts(first, firstReshard), ...controlVerdicts(second, secondReshard)].map(v => v.detail))) {
       if (!counted.has(detail)) notes.push(`CONTROL seen in one set of control facts only: ${detail}`);
+    }
+  }
+  const listingDetails = new Set();
+  for (const listing of reshardListings) {
+    if (!listing) continue;
+    for (const v of reshardListingVerdicts(listing)) {
+      if (listingDetails.has(v.detail)) continue;
+      listingDetails.add(v.detail);
+      verdicts.push(v);
+    }
+  }
+  if (again.length === 0 && fleet.length > 0) verdicts.push(...reshardFleetVerdicts(fleet, firstReshard));
+  if (fleet.length > 0 && again.length > 0) {
+    const inSecond = new Set(reshardFleetVerdicts(again, secondReshard).map(v => v.detail));
+    for (const v of reshardFleetVerdicts(fleet, firstReshard)) {
+      if (inSecond.has(v.detail)) verdicts.push(v);
+      else notes.push(`CONTROL seen in one set of control facts only: ${v.detail}`);
+    }
+    const inFirst = new Set(reshardFleetVerdicts(fleet, firstReshard).map(v => v.detail));
+    for (const v of reshardFleetVerdicts(again, secondReshard)) {
+      if (!inFirst.has(v.detail)) notes.push(`CONTROL seen in one set of control facts only: ${v.detail}`);
     }
   }
   if (input.ownership !== undefined) {

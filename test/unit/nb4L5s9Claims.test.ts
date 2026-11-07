@@ -25,7 +25,6 @@ function done(pairs: Pair[], over: Partial<Done> = {}): Done {
     shardCount: pairs[0]?.shardCount ?? 2,
     taken: pairs.map(pair => ({ pair, above: null })),
     plan: { takes: [], wait: null, heldElsewhere: 0, elsewhere: [], waitingForOwner: 0, leftToOthers: 0 },
-    adopted: null,
     predecessorRenewedAt: new Map(),
     ...over,
   };
@@ -123,7 +122,8 @@ function lateAck(r: Rig, pairs: Pair[], lateBy = T.deadlineMs) {
 async function reserveOne(r: Rig) {
   const R: Pair = { shardCount: 4, shardId: 1, claim: 9 };
   r.state.restartAnswer = false;
-  await bootWith(r, []);
+  r.takes.push(done([], { shardCount: 4 }));
+  await r.claims.bootTake(async () => 4);
   r.claims.noteGranted();
   r.store.readPage.mockImplementation(async () => page({ shardCount: 4 }));
   r.takes.push(done([R]));
@@ -412,13 +412,25 @@ describe('the boot take answer', () => {
 describe('a failed page read', () => {
   it('after a stop began, a failed page read sends no restart request', async () => {
     const r = rig();
-    await reserveOne(r);
+    const R: Pair = { shardCount: 4, shardId: 1, claim: 9 };
+    r.state.restartAnswer = false;
+    r.takes.push(done([], { shardCount: 4 }));
+    await r.claims.bootTake(async () => 4);
+    const bootReads = r.store.readPage.mock.calls.length;
+    expect(bootReads).toBe(1);
+    r.claims.noteGranted();
+    r.store.readPage.mockImplementation(async () => page({ shardCount: 4 }));
+    r.takes.push(done([R]));
+    r.reservedKeys.add(pairKey(R));
+    await r.claims.renewOnce();
+    await flush();
+    expect(r.claims.snapshot().reserved).toEqual([R]);
     expect(r.calls.restarts).toEqual(['take shard 1']);
     r.state.stopping = true;
     r.store.readPage.mockImplementationOnce(async () => { throw new Error('connect ECONNREFUSED'); });
     await r.claims.renewOnce();
     await flush();
-    expect(r.store.readPage).toHaveBeenCalledTimes(2);
+    expect(r.store.readPage.mock.calls.length - bootReads).toBe(2);
     expect(r.calls.restarts).toEqual(['take shard 1']);
   });
 

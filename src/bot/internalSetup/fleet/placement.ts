@@ -9,11 +9,30 @@ export interface SessionStartLimit {
   total: number;
   remaining: number;
   resetAfterMs: number;
+  /** NB9 17: identifies Discord allows at once (the bucket count); 1 when it sent none. */
+  maxConcurrency?: number;
 }
 
 export interface GatewayInfo {
   recommendedShards: number;
   sessionStartLimit: SessionStartLimit | null;
+}
+
+/** /gateway/bot's answer as this bot reads it. */
+export function parseGatewayInfo(parsed: any): GatewayInfo {
+  const ssl = parsed?.session_start_limit;
+  const mc = Number(ssl?.max_concurrency);
+  return {
+    recommendedShards: Number(parsed.shards) || 1,
+    sessionStartLimit: ssl && Number.isFinite(Number(ssl.total))
+      ? {
+          total: Number(ssl.total),
+          remaining: Number(ssl.remaining) || 0,
+          resetAfterMs: Number(ssl.reset_after) || 0,
+          maxConcurrency: Number.isInteger(mc) && mc > 0 ? mc : 1,
+        }
+      : null,
+  };
 }
 
 /** GET /gateway/bot for the recommended shard count and identify budget; error is null exactly when info is set. */
@@ -30,18 +49,7 @@ export function fetchGatewayInfoResult(token: string | undefined): Promise<{ inf
         res.on('end', () => {
           try {
             if (res.statusCode !== 200) return resolve(null, `HTTP ${res.statusCode}`);
-            const parsed = JSON.parse(body);
-            const ssl = parsed?.session_start_limit;
-            resolve({
-              recommendedShards: Number(parsed.shards) || 1,
-              sessionStartLimit: ssl && Number.isFinite(Number(ssl.total))
-                ? {
-                    total: Number(ssl.total),
-                    remaining: Number(ssl.remaining) || 0,
-                    resetAfterMs: Number(ssl.reset_after) || 0,
-                  }
-                : null,
-            });
+            resolve(parseGatewayInfo(JSON.parse(body)));
           } catch {
             resolve(null, 'the reply was not valid JSON');
           }

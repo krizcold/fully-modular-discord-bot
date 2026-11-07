@@ -165,8 +165,8 @@ FLEET_SHARD_CAPACITY is each machine's target (default 1; 0 for none): a machine
 takes more only when no other machine has room (it logs a warning per shard), and gives such a shard to a machine
 with room once that machine has been healthy for 5 minutes. So a bot on one machine serves every shard, and with the
 defaults the shards spread one per machine. FLEET_TAKEOVER_SECONDS is the takeover delay (15 to 3600, default 30), and
-FLEET_SHARD_RETURN (default true; false stops returns and moves). Machines read the shard count from the database: a
-changed FLEET_SHARD_COUNT takes effect when every machine has stopped and one starts again.
+FLEET_SHARD_RETURN (default true; false stops returns and moves). Machines read the shard count from the database:
+changing FLEET_SHARD_COUNT on one machine reshards the bot (see Resharding).
 
 A machine's set of shards is fixed while it runs: taking a shard, giving one away and losing one restart it, so its
 own shards are offline for its restart, and it restarts for a take or a give-away only while its saves succeed. A
@@ -183,6 +183,63 @@ again by hand, it takes back those still free. A JSON bot runs every shard in on
 found holding the shard and is taken only by that process, only within 5 seconds of its sending; rows are deleted
 after an hour.
 This table came with a new schema version, so a database made by an earlier version of the bot is refused at boot.
+
+## Resharding
+
+The bot changes its shard count (reshards) in two cases. Changing FLEET_SHARD_COUNT on any one machine reshards the
+whole bot to that count; the other machines need no edit, and machines whose value did not change follow the database.
+With no FLEET_SHARD_COUNT set, the bot follows Discord's recommended count upward, and only beside the running shards
+(below). Discord's recommendation never lowers the count; only a lower FLEET_SHARD_COUNT does. A machine new to the bot
+that starts with a FLEET_SHARD_COUNT other than the bot's count reshards nothing: its log names the count the bot runs
+and where that count was set. The attempt, its state and the last count set are in `smdb_data.reshard`; the Usage tab's Capacity card shows
+them.
+
+A reshard runs in one of two ways:
+
+- Beside the running shards. Each machine starts a second bot process that connects its share of the new shards while
+  the old shards go on serving. Once every new shard is connected, the bot switches: the old shards save everything
+  they hold and release their claims, and the new shards read no server before that. Each machine's second bot
+  process then becomes its bot process. This needs about twice the memory for some minutes, so it runs only when
+  FLEET_RESHARD_OVERLAP is true on every running machine and each machine's manager reports room in memory (the
+  manager's reading reaches the bot through the web UI's `memory` hook). A reshard whose new shards are not all
+  connected in time is called off, and the bot keeps its shard count.
+- By stopping and starting. Every machine stops its shards, saving what they hold, and starts again under the new
+  count. Members see the bot offline until the machines have started again, as at a restart, with no maintenance
+  message. The bot reshards this way for a FLEET_SHARD_COUNT change when it cannot reshard beside the running shards;
+  for Discord's recommendation it does not, and the Usage tab says why and how to reshard by hand.
+
+What members notice beside the running shards: a few events are missed or handled twice at the switch. A slash command
+is answered once, since Discord accepts one answer per command.
+
+A change of FLEET_SHARD_COUNT while a reshard runs calls it off and starts one toward the new value; once the bot has
+switched to the new shards, the new value waits until that reshard is done. A machine that runs the bot without the
+web UI stops when the bot reshards by stopping and starting, and stays stopped until it is started by hand.
+
+On a bot with a database, a reshard beside the running shards can be called off when a machine drops out before the
+bot switches to its new shards: its bot process crashes or is killed (by the out-of-memory killer, for example), the
+machine loses power, it cannot reach the database for longer than its takeover delay, or a Stop or Restart takes more
+than 40 seconds. The call-off comes once another machine sees that machine's shards expire, or once the web UI on that
+machine saw its bot process end while the second bot process ran. Otherwise, and always on a bot with one machine, the
+reshard goes on after the restart, and a drop-out in the last seconds before the switch can let the switch go ahead.
+When a killed bot process is not started again, the call-off comes once another machine sees its shards expire, or
+once someone starts it. A machine that drops out after the switch calls nothing off: the reshard finishes once that
+machine's old shards expire. When the database switches to its copy and the copy lost the moment the bot switched to
+its new shards, the reshard is called off unless the bot can switch again on the copy before the old shards' claims
+expire. Each such call-off counts as one of the two tries beside the running shards. A bot process that stops because
+another process took its data files (exit code 75) releases its shards as it stops and does not count, unless that
+release fails.
+
+After a call-off the next try comes after 15 minutes. After two counted tries toward one count, a bot with
+FLEET_SHARD_COUNT set reshards by stopping and starting every machine; without it, the bot does not reshard toward that
+count until Discord's recommendation moves to another count, someone sets FLEET_SHARD_COUNT, or a reshard finishes, and
+the log and the Usage tab give the reason with the hint to set FLEET_SHARD_COUNT.
+
+Discord allows a bot a number of gateway logins per day, and a reshard waits until enough remain for its new shards and
+one more full start. Every machine and bot process spaces its shards' logins through the database
+(`smdb_data.identify_slots`): one login per Discord rate limit bucket every 5.5 seconds across the whole bot.
+
+A JSON bot reshards only beside its shards and only on Discord's recommendation: a second bot process connects the new
+shards and the bot switches once all are connected. Its FLEET_SHARD_COUNT takes effect at its next restart.
 
 ## Local development (Windows first-class)
 

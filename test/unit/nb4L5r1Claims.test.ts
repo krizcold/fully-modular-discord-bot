@@ -21,7 +21,6 @@ function done(pairs: Pair[]): TakeAnswer {
     shardCount: 2,
     taken: pairs.map(pair => ({ pair, above: null })),
     plan: { wait: null, elsewhere: [], takes: [] } as never,
-    adopted: null,
     predecessorRenewedAt: new Map(),
   };
 }

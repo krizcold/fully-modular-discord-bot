@@ -81,10 +81,13 @@ describe('ruling 1: the scratch and the privilege checks need no seed row', () =
   it('provisionDdl is the schema statements with the seed rows in place, unchanged in order', () => {
     const all = provisionDdl('smdb_data');
     const seeds = provisionSeedRows('smdb_data');
-    expect(seeds).toEqual(['INSERT INTO smdb_data.claim_clock (id, up_ms, ticked_at) VALUES (1, 0, now()) ON CONFLICT (id) DO NOTHING']);
+    expect(seeds).toEqual([
+      'INSERT INTO smdb_data.claim_clock (id, up_ms, ticked_at) VALUES (1, 0, now()) ON CONFLICT (id) DO NOTHING',
+      'INSERT INTO smdb_data.reshard (id) VALUES (1) ON CONFLICT (id) DO NOTHING',
+    ]);
     expect(provisionSchemaDdl('smdb_data')).toEqual(all.filter(s => !seeds.includes(s)));
-    expect(provisionSchemaDdl('smdb_data')).toHaveLength(18);
-    expect(all).toHaveLength(19);
+    expect(provisionSchemaDdl('smdb_data')).toHaveLength(20);
+    expect(all).toHaveLength(22);
     expect(provisionSchemaDdl('smdb_data').some(s => /^\s*INSERT/i.test(s))).toBe(false);
   });
 
@@ -93,7 +96,7 @@ describe('ruling 1: the scratch and the privilege checks need no seed row', () =
     await checkShape({ query: async (text: string) => { sent.push(text); return { rows: [] }; } }, 'provisioned');
     expect(sent.filter(s => /^\s*INSERT/i.test(s))).toEqual([]);
     const ddl = sent.filter(s => /^CREATE /.test(s));
-    expect(ddl).toHaveLength(18 + 64);
+    expect(ddl).toHaveLength(20 + 64);
     expect(sent.filter(s => /smdb_shape_\w+\.claim_clock \(/.test(s))).toHaveLength(1);
   });
 
@@ -112,7 +115,7 @@ describe('ruling 1: the scratch and the privilege checks need no seed row', () =
     expect(lastList).toBeGreaterThan(0);
     expect(firstInsert).toBeGreaterThan(lastList);
     expect(sent.filter(s => /^INSERT/.test(s)).map(s => s.split(' (')[0])).toEqual([
-      'INSERT INTO smdb_data.claim_clock', 'INSERT INTO smdb_data.meta', 'INSERT INTO smdb_data.meta',
+      'INSERT INTO smdb_data.claim_clock', 'INSERT INTO smdb_data.reshard', 'INSERT INTO smdb_data.meta', 'INSERT INTO smdb_data.meta',
     ]);
     expect(sent.filter(s => /^(COMMIT|ROLLBACK)$/.test(s))).toEqual(['COMMIT']);
   });
@@ -154,19 +157,19 @@ describe('ruling 2: a store of the right shape with no store_id row', () => {
     expect(storeIdRefusal("o'x").fix).toContain(`VALUES ('store_id', '"o''x"')`);
   });
 
-  it('with no store id in the marker: a new id is written, then the claim_clock row, and the store commits', async () => {
+  it('with no store id in the marker: a new id is written, then the seed rows, and the store commits', async () => {
     quiet();
     const { backend, sent } = scripted(storeScript([]), () => null);
     await internals(backend).provision();
     expect(internals(backend).provisioned).toBe(true);
     expect(sent.filter(s => /^INSERT/.test(s)).map(s => s.split(' (')[0])).toEqual([
-      'INSERT INTO smdb_data.meta', 'INSERT INTO smdb_data.claim_clock',
+      'INSERT INTO smdb_data.meta', 'INSERT INTO smdb_data.claim_clock', 'INSERT INTO smdb_data.reshard',
     ]);
     expect(sent.find(s => /^INSERT INTO smdb_data\.meta/.test(s))).toContain("'store_id'");
     expect(sent.filter(s => /^(COMMIT|ROLLBACK)$/.test(s))).toEqual(['COMMIT']);
   });
 
-  it('a store that holds its store_id writes only the claim_clock row and never asks the marker', async () => {
+  it('a store that holds its store_id writes only the seed rows and never asks the marker', async () => {
     quiet();
     const marker = vi.fn(() => 'abc-123');
     const { backend, sent } = scripted(storeScript([{ '?column?': 1 }]), marker);

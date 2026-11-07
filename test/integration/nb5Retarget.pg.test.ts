@@ -221,6 +221,9 @@ describe("decision 12 (d) as D2 amends it: the move's re-take on a real target (
   const shardRow = (count: number, claim: number, holder: string) => rig.direct.query(
     `INSERT INTO smdb_data.shard_claims (shard_count, shard_id, claim, holder_process, holder_node, holder_name, home_node, ttl_ms, expires_up_ms)
      VALUES ($1, 0, $2, $3, $4, $4, $4, 30000, 30000)`, [count, claim, holder, holder.replace(/^p-/, 'node-')]);
+  const meta = (count: number) => rig.direct.query(
+    `INSERT INTO smdb_data.meta (key, value) VALUES ('shard_count', $1)
+     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`, [JSON.stringify({ count })]);
   const guildRow = (guildId: string, shardId: number, claim: number, node: string) => rig.direct.query(
     `INSERT INTO smdb_data.guild_ownership (guild_id, node_id, shard_id, claim, shard_count) VALUES ($1, $2, $3, $4, 1)`, [guildId, node, shardId, claim]);
   const flush = (claim: number) => rig.backend.flushGuild(G, {
@@ -239,6 +242,7 @@ describe("decision 12 (d) as D2 amends it: the move's re-take on a real target (
   });
 
   it("(a) the shard row names Y at 57 above P's 40 and G's row is stamped by Y at 57: no take, nothing changes, G's writes are refused deposed", async () => {
+    await meta(1);
     await shardRow(1, 57, 'p-y');
     await guildRow(G, 0, 57, 'node-y');
     expect(await rig.store().retake(request())).toEqual({ taken: [] });
@@ -249,13 +253,15 @@ describe("decision 12 (d) as D2 amends it: the move's re-take on a real target (
   }, 120_000);
 
   it('(b) the shard count changed before the promotion (rows under count 2, none under 1): no take', async () => {
+    await meta(2);
     await shardRow(2, 30, 'p-y');
     await guildRow(G, 0, 40, 'node-a');
-    expect(await rig.store().retake(request())).toEqual({ taken: [] });
+    expect(await rig.store().retake(request())).toMatchObject({ taken: [], refused: { kind: 'count', read: { metaCount: 2 } } });
     expect(await rows()).toEqual([{ shard_count: 2, claim: '30', holder_process: 'p-y' }]);
   }, 120_000);
 
   it("(c) the shard row names another process below P's claim: no take, and G's writes are refused deposed", async () => {
+    await meta(1);
     await shardRow(1, 12, 'p-y');
     await guildRow(G, 0, 40, 'node-a');
     expect(await rig.store().retake(request())).toEqual({ taken: [] });
@@ -264,6 +270,7 @@ describe("decision 12 (d) as D2 amends it: the move's re-take on a real target (
   }, 120_000);
 
   it('a missing shard row with no guild row above the held claim: taken again under a claim above every claim on the target, and G saves', async () => {
+    await meta(1);
     await guildRow(G, 0, 40, 'node-a');
     await guildRow('880000000000000503', 3, 90, 'node-z');
     const answer = await rig.store().retake(request());
@@ -274,6 +281,7 @@ describe("decision 12 (d) as D2 amends it: the move's re-take on a real target (
   }, 120_000);
 
   it("D2: an earlier attempt's re-take committed and its answer discarded: the next attempt takes it again, G saves, nothing reads deposed", async () => {
+    await meta(1);
     await guildRow(G, 0, 40, 'node-a');
     const store = rig.store();
     const first = await store.retake(request());

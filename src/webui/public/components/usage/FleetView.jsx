@@ -28,6 +28,87 @@ function fleetFormatDuration(ms) {
   return `${h}h ${m % 60}m`;
 }
 
+// NB9 12's dates are the UTC day, as the log lines give them.
+function fleetDay(ms) {
+  return new Date(ms).toISOString().slice(0, 10);
+}
+
+function fleetSetOn(target) {
+  return `set on ${target.by}${target.at != null ? ` on ${fleetDay(target.at)}` : ''}`;
+}
+
+// A database bot follows Discord's recommendation upward while no FLEET_SHARD_COUNT is set; a JSON bot while its own
+// setting is unset.
+function fleetFollowsDiscord(cap) {
+  if (cap.dataBackend === 'postgres') return !(cap.target && cap.target.count != null);
+  return cap.shardSource !== 'override';
+}
+
+// NB9 12's P2 to P5: the open attempt, a wanted count that waits or cannot run, and the last reshard.
+function fleetReshardLines(cap) {
+  const lines = [];
+  const r = cap.reshard;
+  if (r) {
+    const head = `Resharding from ${r.from} to ${r.to} shards`;
+    const names = r.waitingFor || [];
+    if (r.state === 'flipped') {
+      lines.push(`${head}: switched; the old shards save what they hold${names.length > 0 ? ` (still held by ${names.join(', ')})` : ''}, then the new ones serve`);
+    } else if (r.method === 'stop-start' || r.state === 'stopping') {
+      lines.push(`${head} by stopping and starting every machine${r.reason ? ` (${r.reason})` : ''}${names.length > 0 ? `: waiting for ${names.join(', ')} to stop` : ''}`);
+    } else {
+      const times = [];
+      if (r.startedAgoMs != null) times.push(`started ${Math.max(0, Math.round(r.startedAgoMs / 60000))} min ago`);
+      if (r.untilMs != null) times.push(`called off if not done in ${Math.max(0, Math.ceil(r.untilMs / 60000))} min`);
+      lines.push(`${head} beside the running ones: ${r.connected} of ${r.to} new shards connected${times.length > 0 ? `; ${times.join(', ')}` : ''}`);
+    }
+  }
+  const w = cap.reshardWait;
+  if (w && w.cannot) {
+    const tail = cap.dataBackend === 'postgres'
+      ? `Set FLEET_SHARD_COUNT to ${w.wanted} on one machine to reshard by stopping and starting every machine`
+      : `Set FLEET_SHARD_COUNT to ${w.wanted} and restart the bot to reshard by restarting it`;
+    lines.push(`Discord recommends ${w.wanted} shards (the bot runs ${cap.shardCount}), and a reshard beside the running shards cannot run: ${w.reason}. ${tail}`);
+  } else if (w) {
+    const source = w.source === 'setting' && cap.target ? fleetSetOn(cap.target) : "from Discord's recommendation";
+    lines.push(`${w.wanted} shards wanted (${source}); resharding waits: ${w.reason}`);
+  }
+  const last = cap.lastReshard;
+  if (last && last.state === 'done') {
+    const how = last.method === 'overlap' ? ', beside the running shards' : last.method === 'stop-start' ? ', by stopping and starting' : '';
+    lines.push(`Last reshard: ${last.from} to ${last.to} shards${last.endedAt != null ? ` on ${fleetDay(last.endedAt)}` : ''}${how}`);
+  } else if (last && last.state === 'cancelled') {
+    lines.push(`The last reshard to ${last.to} shards was called off${last.endedAt != null ? ` on ${fleetDay(last.endedAt)}` : ''}${last.reason ? `: ${last.reason}` : ''}`);
+  }
+  return lines;
+}
+
+// The Capacity card's summary of a fleet state.
+function fleetCapacitySummary(fleet) {
+  const shardTable = fleet.shardTable || [];
+  const guildMap = fleet.guildMap || {};
+  let totalGuilds = 0;
+  let busiest = 0;
+  for (const s of shardTable) {
+    const c = s.guildCount || 0;
+    totalGuilds += c;
+    if (c > busiest) busiest = c;
+  }
+  if (totalGuilds === 0) totalGuilds = Object.keys(guildMap).length;
+  return {
+    totalGuilds,
+    shardCount: fleet.shardCount != null ? fleet.shardCount : shardTable.length,
+    shardSource: fleet.shardSource,
+    recommendedShards: fleet.recommendedShards != null ? fleet.recommendedShards : null,
+    recommendedAt: fleet.recommendedAt != null ? fleet.recommendedAt : null,
+    busiest,
+    dataBackend: fleet.dataBackend,
+    reshard: fleet.reshard || null,
+    reshardWait: fleet.reshardWait || null,
+    lastReshard: fleet.lastReshard || null,
+    target: fleet.target || null,
+  };
+}
+
 // Total guilds, shard count + source, and busiest-shard utilization against
 // the guild-per-shard limits.
 function FleetCapacityCard({ cap }) {
@@ -40,7 +121,11 @@ function FleetCapacityCard({ cap }) {
 
   const readAt = cap.recommendedAt != null ? `, read ${new Date(cap.recommendedAt).toLocaleString()}` : '';
   let shardsLabel;
-  if (cap.shardSource === 'override') shardsLabel = `${cap.shardCount} (FLEET_SHARD_COUNT override)`;
+  if (cap.dataBackend === 'postgres') {
+    shardsLabel = cap.target && cap.target.count != null
+      ? `${cap.shardCount} (FLEET_SHARD_COUNT ${cap.target.count}, ${fleetSetOn(cap.target)})`
+      : `${cap.shardCount} (follows Discord's recommendation upward)`;
+  } else if (cap.shardSource === 'override') shardsLabel = `${cap.shardCount} (FLEET_SHARD_COUNT override)`;
   else if (cap.shardSource === 'discord') shardsLabel = `${cap.shardCount} (Discord's recommendation at boot)`;
   else if (cap.shardSource === 'fallback') shardsLabel = `${cap.shardCount} (fallback: Discord's recommendation could not be read at boot)`;
   else shardsLabel = String(cap.shardCount);
@@ -55,6 +140,9 @@ function FleetCapacityCard({ cap }) {
           ? ` (Discord recommends ${cap.recommendedShards}${readAt})`
           : ''}
       </div>
+      {fleetReshardLines(cap).map((line) => (
+        <div key={line} className="usage-stat-sub" style={{ marginBottom: '8px' }}>{line}</div>
+      ))}
 
       <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.78rem', color: '#bbb', marginBottom: '4px' }}>
         <span>{`${cap.busiest} guilds/shard (busiest shard)`}</span>
@@ -65,7 +153,9 @@ function FleetCapacityCard({ cap }) {
       </div>
       {cap.busiest > FLEET_APPROACHING ? (
         <div className="usage-stat-sub" style={{ marginTop: '8px', color: '#fee75c' }}>
-          Approaching per-shard capacity: plan to add shards.
+          {fleetFollowsDiscord(cap) && !(cap.reshardWait && cap.reshardWait.cannot)
+            ? 'Approaching per-shard capacity: Discord will recommend more shards, and the bot reshards to them'
+            : 'Approaching per-shard capacity: plan to add shards.'}
         </div>
       ) : null}
     </div>
@@ -333,25 +423,8 @@ function FleetView({ api, wsClient, guildNames }) {
   }));
   guildEntries.sort((a, b) => a.shardId - b.shardId || (a.name > b.name ? 1 : a.name < b.name ? -1 : 0));
 
-  const shardCount = fleet.shardCount != null ? fleet.shardCount : shardTable.length;
-
-  let totalGuilds = 0;
-  let busiest = 0;
-  for (const s of shardTable) {
-    const c = s.guildCount || 0;
-    totalGuilds += c;
-    if (c > busiest) busiest = c;
-  }
-  if (totalGuilds === 0) totalGuilds = Object.keys(guildMap).length;
-
-  const capacitySummary = {
-    totalGuilds,
-    shardCount,
-    shardSource: fleet.shardSource,
-    recommendedShards: fleet.recommendedShards != null ? fleet.recommendedShards : null,
-    recommendedAt: fleet.recommendedAt != null ? fleet.recommendedAt : null,
-    busiest,
-  };
+  const capacitySummary = fleetCapacitySummary(fleet);
+  const shardCount = capacitySummary.shardCount;
 
   return (
     <div className="usage-board">

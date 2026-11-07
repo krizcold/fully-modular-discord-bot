@@ -135,11 +135,11 @@ function colRow(rel: string, name: string, type: string, notNull: boolean, extra
 
 const CURRENT = [{ value: JSON.stringify({ v: pg.SCHEMA_VERSION }) }];
 
-/** The frozen schema statements without its seed row, as the fresh path and the scratch send them. */
-const frozenSchema = () => [...FROZEN_V7_DDL, ...frozenPartitions(true)].filter(s => !s.startsWith('INSERT')).map(s => s.trim());
+/** The frozen schema statements without its seed rows, as the fresh path and the scratch send them. */
+const frozenSchema = () => [...FROZEN_V8_DDL, ...frozenPartitions(true)].filter(s => !s.startsWith('INSERT')).map(s => s.trim());
 
 const SEQ_PARAMS = { seq_increment: '1', seq_min: '1', seq_max: '9223372036854775807', seq_cache: '1', seq_cycle: false };
-const PLAIN_TABLES = ['meta', 'guild_ownership', 'shard_claims', 'claim_clock', 'shard_nodes', 'guild_data_graveyard', 'guild_requests'];
+const PLAIN_TABLES = ['meta', 'guild_ownership', 'shard_claims', 'claim_clock', 'shard_nodes', 'reshard', 'identify_slots', 'guild_data_graveyard', 'guild_requests'];
 const PARTITIONED = ['guild_data', 'guild_append'];
 const SEQUENCES = ['claim_seq', 'guild_append_seq'];
 const partitionNames = (t: string) => Array.from({ length: 32 }, (_, i) => [`${t}_p${String(i).padStart(2, '0')}`, i] as const);
@@ -169,7 +169,7 @@ function madeCatalog(_schema: string, which: Which): Row[] {
 }
 
 describe('a provisioned store of the right shape', () => {
-  it('sends BEGIN, READ COMMITTED, the lock, the server version, the SET LOCALs, the encoding, the found list, the version, the scratch, the store id read, the claim_clock row and COMMIT', async () => {
+  it('sends BEGIN, READ COMMITTED, the lock, the server version, the SET LOCALs, the encoding, the found list, the version, the scratch, the store id read, the seed rows and COMMIT', async () => {
     quiet();
     const { backend, sent } = scripted({ version: CURRENT });
     await internals(backend).provision();
@@ -199,6 +199,7 @@ describe('a provisioned store of the right shape', () => {
       'RELEASE SAVEPOINT shape',
       "SELECT 1 FROM ONLY smdb_data.meta WHERE key = 'store_id'",
       'INSERT INTO smdb_data.claim_clock',
+      'INSERT INTO smdb_data.reshard',
       'COMMIT',
     ]);
     expect(sent.filter(s => /^CREATE\b/.test(s) && /smdb_data/.test(s))).toEqual([]);
@@ -440,13 +441,13 @@ describe('a fresh database', () => {
     expect(sent[at + 2 + own.length]).toBe('SAVEPOINT shape');
     expect(SCRATCH.test(sent[at + 3 + own.length])).toBe(true);
     const tail = sent.slice(sent.indexOf('RELEASE SAVEPOINT shape'));
-    expect(tail.length).toBe(7);
+    expect(tail.length).toBe(8);
     expect(FOUND.test(tail[1])).toBe(true);
-    expect(tail[2]).toBe(FROZEN_V7_DDL.find(s => s.startsWith('INSERT'))!.trim());
-    expect(tail[3]).toMatch(/^INSERT INTO smdb_data\.meta \(key, value\) VALUES \('schema_version', \$1\) ON CONFLICT \(key\) DO NOTHING$/);
-    expect(VERSION.test(tail[4])).toBe(true);
-    expect(tail[5]).toMatch(/^INSERT INTO smdb_data\.meta \(key, value\) VALUES \('store_id'/);
-    expect(tail[6]).toBe('COMMIT');
+    expect(tail.slice(2, 4)).toEqual(FROZEN_V8_DDL.filter(s => s.startsWith('INSERT')).map(s => s.trim()));
+    expect(tail[4]).toMatch(/^INSERT INTO smdb_data\.meta \(key, value\) VALUES \('schema_version', \$1\) ON CONFLICT \(key\) DO NOTHING$/);
+    expect(VERSION.test(tail[5])).toBe(true);
+    expect(tail[6]).toMatch(/^INSERT INTO smdb_data\.meta \(key, value\) VALUES \('store_id'/);
+    expect(tail[7]).toBe('COMMIT');
   });
 
   it('R2-T2: the second found list lists the made tables with DELETE false: ROLLBACK, no row written, the fresh privilege texts', async () => {
@@ -458,15 +459,15 @@ describe('a fresh database', () => {
       catalog: madeCatalog,
     });
     await internals(backend).provision();
-    const lines = ['claim_clock', 'guild_append', 'guild_data', 'guild_data_graveyard', 'guild_ownership', 'guild_requests', 'meta', 'shard_claims', 'shard_nodes']
+    const lines = ['claim_clock', 'guild_append', 'guild_data', 'guild_data_graveyard', 'guild_ownership', 'guild_requests', 'identify_slots', 'meta', 'reshard', 'shard_claims', 'shard_nodes']
       .map(t => `this bot's database role smdb_bot lacks DELETE on smdb_data.${t}`);
     expect(await backend.provisionVerdict()).toEqual({
       state: 'shape',
-      reason: `this bot's database role smdb_bot lacked privileges on the schema it made in the database, so it was rolled back (default privileges or an event trigger take them from new tables): ${lines.slice(0, 5).join('; ')}; and 4 more (the bot's log lists them)`,
+      reason: `this bot's database role smdb_bot lacked privileges on the schema it made in the database, so it was rolled back (default privileges or an event trigger take them from new tables): ${lines.slice(0, 5).join('; ')}; and 6 more (the bot's log lists them)`,
       fix: "Gates stay closed and nothing in the database was changed; as smdb_bot or a superuser, run ALTER DEFAULT PRIVILEGES FOR ROLE smdb_bot GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO smdb_bot; ALTER DEFAULT PRIVILEGES FOR ROLE smdb_bot GRANT USAGE, UPDATE ON SEQUENCES TO smdb_bot (SELECT * FROM pg_default_acl lists what is set), remove any event trigger that revokes privileges on new tables, and restart the bot",
     });
     expect(errors.mock.calls.map(c => String(c[0])).filter(l => l.startsWith('[PostgresBackend] schema'))).toEqual([
-      "[PostgresBackend] schema-mismatch: this bot's database role smdb_bot lacked 9 privilege(s) on the schema it made in the database, so it was rolled back before it was committed (default privileges set with ALTER DEFAULT PRIVILEGES, or an event trigger, take them from new tables); refusing to serve",
+      "[PostgresBackend] schema-mismatch: this bot's database role smdb_bot lacked 11 privilege(s) on the schema it made in the database, so it was rolled back before it was committed (default privileges set with ALTER DEFAULT PRIVILEGES, or an event trigger, take them from new tables); refusing to serve",
       ...lines.map(l => `[PostgresBackend] schema difference: ${l}`),
     ]);
     expect(sent.slice(-3)).toEqual(['RELEASE SAVEPOINT shape', sent[sent.length - 2], 'ROLLBACK']);
@@ -583,8 +584,8 @@ describe('a throw at any statement of the check', () => {
   });
 });
 
-// The schema of SCHEMA_VERSION 6, frozen. A change here means the DDL changed.
-const FROZEN_V7_DDL = [
+// The schema of SCHEMA_VERSION 8, frozen. A change here means the DDL changed.
+const FROZEN_V8_DDL = [
   `CREATE SCHEMA IF NOT EXISTS smdb_data`,
   `CREATE TABLE IF NOT EXISTS smdb_data.meta (
     key        text PRIMARY KEY,
@@ -620,6 +621,7 @@ const FROZEN_V7_DDL = [
     ttl_ms          bigint      NOT NULL,
     expires_up_ms   bigint      NOT NULL,
     extended        boolean     NOT NULL DEFAULT false,
+    ready           boolean     NOT NULL DEFAULT false,
     PRIMARY KEY (shard_count, shard_id)
   )`,
   `CREATE TABLE IF NOT EXISTS smdb_data.claim_clock (
@@ -640,7 +642,39 @@ const FROZEN_V7_DDL = [
     returns          boolean     NOT NULL,
     started_at       timestamptz NOT NULL,
     healthy_since    timestamptz,
-    seen_at          timestamptz NOT NULL
+    seen_at          timestamptz NOT NULL,
+    count_setting    integer,
+    reshard_overlap  boolean     NOT NULL DEFAULT true,
+    memory_room      boolean,
+    memory_free_mb   integer,
+    memory_use_mb    integer,
+    memory_error     text,
+    memory_at        timestamptz
+  )`,
+  `CREATE TABLE IF NOT EXISTS smdb_data.reshard (
+    id          integer     PRIMARY KEY CHECK (id = 1),
+    target      integer,
+    target_by   text,
+    target_at   timestamptz,
+    attempt     uuid,
+    from_count  integer,
+    to_count    integer,
+    method      text        CHECK (method IN ('overlap', 'stop-start')),
+    state       text        CHECK (state IN ('standby', 'flipped', 'stopping', 'done', 'cancelled')),
+    started_by  text,
+    started_at  timestamptz,
+    until_at    timestamptz,
+    flipped_at  timestamptz,
+    ended_at    timestamptz,
+    reason      text,
+    retry_after timestamptz,
+    failures    integer     NOT NULL DEFAULT 0
+  )`,
+  `INSERT INTO smdb_data.reshard (id) VALUES (1) ON CONFLICT (id) DO NOTHING`,
+  `CREATE TABLE IF NOT EXISTS smdb_data.identify_slots (
+    bucket     integer     PRIMARY KEY,
+    last_at    timestamptz NOT NULL,
+    process_id text        NOT NULL
   )`,
   `CREATE TABLE IF NOT EXISTS smdb_data.guild_data (
     guild_id   text NOT NULL,
@@ -708,16 +742,16 @@ function frozenPartitions(ifNotExists: boolean): string[] {
 
 const BUMP = 'the DDL changed: bump SCHEMA_VERSION (the boot refuses a stored schema that differs) and update this copy';
 
-describe('the schema of SCHEMA_VERSION 7 (guard)', () => {
-  it("provision()'s 83 statements are today's, text for text", () => {
-    expect(pg.SCHEMA_VERSION, BUMP).toBe(7);
-    expect([...pg.provisionDdl('smdb_data'), ...pg.partitionDdl('smdb_data', true)], BUMP).toEqual([...FROZEN_V7_DDL, ...frozenPartitions(true)]);
+describe('the schema of SCHEMA_VERSION 8 (guard)', () => {
+  it("provision()'s 86 statements are today's, text for text", () => {
+    expect(pg.SCHEMA_VERSION, BUMP).toBe(8);
+    expect([...pg.provisionDdl('smdb_data'), ...pg.partitionDdl('smdb_data', true)], BUMP).toEqual([...FROZEN_V8_DDL, ...frozenPartitions(true)]);
   });
 
   it("provisionStoreInTransaction's statements are today's, text for text", async () => {
     const sent: string[] = [];
     await pg.provisionStoreInTransaction({ query: async (text: string) => { sent.push(text); return { rows: [] }; } });
-    expect(sent.slice(0, -2), BUMP).toEqual(['CREATE SCHEMA smdb_data', ...FROZEN_V7_DDL.slice(1), ...frozenPartitions(false)]);
+    expect(sent.slice(0, -2), BUMP).toEqual(['CREATE SCHEMA smdb_data', ...FROZEN_V8_DDL.slice(1), ...frozenPartitions(false)]);
   });
 
   it('the DDL rendered for another schema names no smdb_data', () => {

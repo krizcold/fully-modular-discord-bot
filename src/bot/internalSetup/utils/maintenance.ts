@@ -362,7 +362,7 @@ export function canRestart(): boolean {
   return !!process.send || send !== processSender;
 }
 
-function requestRestart(reason: string, forShards = false): void {
+export function requestRestart(reason: string, forShards = false): void {
   if (restartRequested) return;
   restartRequested = true;
   if (!canRestart()) {
@@ -378,6 +378,23 @@ function requestRestart(reason: string, forShards = false): void {
   restartResend = every(timing.restartResendMs, () => {
     console.warn(`[Maintenance] The bot process still runs ${Math.round(timing.restartResendMs / 1000)} s after asking for its restart; asking again`);
     send({ type: 'control:restart-bot', data: { reason } });
+  });
+}
+
+/**
+ * NB9 9 and 25: the hand-over's end. The web UI process stops this bot process and runs the one for the new shards;
+ * the ask is re-sent every 60 s until the stop comes. `attempt` is the reshard row's attempt as read, null after a
+ * direct change.
+ */
+export function retireForReshard(attempt: string | null, reason: string): void {
+  if (restartRequested) return;
+  restartRequested = true;
+  shardRestart = false;
+  console.log(`[Maintenance] ${reason}; asking the web UI process to stop this bot process and run the one for the new shards`);
+  send({ type: 'control:reshard-retire', data: { attempt } });
+  restartResend = every(timing.restartResendMs, () => {
+    console.warn(`[Maintenance] The bot process still runs ${Math.round(timing.restartResendMs / 1000)} s after asking to hand over; asking again`);
+    send({ type: 'control:reshard-retire', data: { attempt } });
   });
 }
 
@@ -467,19 +484,24 @@ function standing(): string {
  * their content (SQLSTATE class 22, 23 or 54), it logs them and asks for the restart, which drops them. Any other
  * failure, and files that cannot be written, keep it waiting.
  */
-export function startLeave(reason: string): void {
+export function startLeave(reason: string, handOver?: { attempt: string | null }): void {
   if (leaving) return;
   leaving = true;
   stopTimer(filePoll);
   filePoll = null;
   const own = generation;
-  const restarts = canRestart();
+  // NB9 C8: the end is chosen once; a hand-over with no IPC channel ends in NB4's stop.
+  const end: 'hand-over' | 'restart' | 'stop' = !canRestart() ? 'stop' : handOver ? 'hand-over' : 'restart';
+  const restarts = end === 'restart';
   withdrawRestart();
   const askedEarlier = restartAskedEarlier;
-  console.log(`[Maintenance] ${reason}; saving what this process holds before it ${restarts ? 'restarts' : 'stops (no web UI process runs to restart it)'}`);
+  console.log(`[Maintenance] ${reason}; saving what this process holds before it ${end === 'hand-over'
+    ? 'stops and the bot process for the new shards takes over'
+    : restarts ? 'restarts' : 'stops (no web UI process runs to restart it)'}`);
   const restart = (): void => {
     for (const line of getWorkingSet()?.takeDropLines() ?? []) console.error(line);
-    requestRestart(reason);
+    if (end === 'hand-over') retireForReshard(handOver!.attempt, reason);
+    else requestRestart(reason);
   };
   void (async () => {
     let answeredPasses = 0;
@@ -503,9 +525,11 @@ export function startLeave(reason: string): void {
         const names = heldNames(only);
         const held: Held = { unsavedGuilds: left.unsavedGuilds, unsavedFiles: left.unsavedFiles, unansweredGuilds: left.unansweredGuilds, ...(resave > 0 ? { resaveGuilds: resave } : {}) };
         if (refusedPasses >= timing.heldAfterPasses && resave === 0) {
-          console.error(`[Maintenance] ${refusedPasses} saves in a row left changes the database refuses for their content: ${names}; ${restarts
-            ? 'the bot process asks for its restart, which drops these changes'
-            : 'the bot process stops, which drops these changes'}`);
+          console.error(`[Maintenance] ${refusedPasses} saves in a row left changes the database refuses for their content: ${names}; ${end === 'hand-over'
+            ? 'the bot process stops for the hand-over, which drops these changes'
+            : restarts
+              ? 'the bot process asks for its restart, which drops these changes'
+              : 'the bot process stops, which drops these changes'}`);
           heldReport = held;
           reportMode('held', held);
           restart();
@@ -528,10 +552,12 @@ export function startLeave(reason: string): void {
           const saved = unanswered ? 'they are saved or found stored' : 'they are saved';
           const earlier = askedEarlier ? `; a restart this process asked for earlier may still stop it, ${drops}` : '';
           console.error(`[Maintenance] ${head}; ${forContent
-            ? `the database refuses these for their content; ${standing()}, and after ${timing.heldAfterPasses} saves in a row that fail this way it ${restarts ? 'restarts' : 'stops'} and drops them`
-            : restarts
-              ? `${standing()} and does not restart until ${saved} or the operator restarts it, ${drops}${earlier}`
-              : `${standing()} and does not stop until ${saved} or the operator stops it, ${drops}`}`);
+            ? `the database refuses these for their content; ${standing()}, and after ${timing.heldAfterPasses} saves in a row that fail this way it ${end === 'hand-over' ? 'stops for the hand-over' : restarts ? 'restarts' : 'stops'} and drops them`
+            : end === 'hand-over'
+              ? `${standing()} and does not stop for the hand-over until ${saved} or the operator stops it, ${drops}${earlier}`
+              : restarts
+                ? `${standing()} and does not restart until ${saved} or the operator restarts it, ${drops}${earlier}`
+                : `${standing()} and does not stop until ${saved} or the operator stops it, ${drops}`}`);
           heldReport = held;
           reportMode('held', held);
         }

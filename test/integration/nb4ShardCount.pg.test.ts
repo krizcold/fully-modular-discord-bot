@@ -38,27 +38,26 @@ describe('the stored shard count', () => {
     await rig.direct.query(`UPDATE smdb_data.shard_claims SET released = true WHERE shard_id = 1`);
     const other = await take(b, B, 4);
     expect(other.kind === 'done' && other.shardCount).toBe(2);
-    expect(other.kind === 'done' && other.adopted).toEqual({ local: 4, stored: 2 });
     expect(await stored()).toBe('{"count":2}');
     expect(await counts()).toEqual([2]);
   });
 
-  it('with every row expired the count changes and the old rows go', async () => {
+  it('with every row expired a boot of another local count takes under the stored count (NB9 C1)', async () => {
     await aTakesUnder2();
     const exp = Math.max(...(await rig.direct.query(`SELECT expires_up_ms::bigint AS e FROM smdb_data.shard_claims`)).rows.map(r => Number(r.e)));
     await rig.direct.query(`UPDATE smdb_data.claim_clock SET up_ms = $1, ticked_at = now()`, [exp]);
     const changed = await take(b, B, 4);
-    expect(changed.kind === 'done' && changed.shardCount).toBe(4);
-    expect(await stored()).toBe('{"count":4}');
-    expect(await counts()).toEqual([4]);
+    expect(changed.kind === 'done' && changed.shardCount).toBe(2);
+    expect(await stored()).toBe('{"count":2}');
+    expect(await counts()).toEqual([2]);
   });
 
-  it('with every row released, kept for two different nodes and unexpired, the count changes', async () => {
+  it('with every row released, kept for two different nodes and unexpired, the count stays (NB9 C1)', async () => {
     await aTakesUnder2();
     await rig.direct.query(`UPDATE smdb_data.shard_claims SET released = true, holder_node = CASE WHEN shard_id = 0 THEN 'n-a' ELSE 'n-z' END`);
     const changed = await take(b, B, 4);
-    expect(changed.kind === 'done' && changed.shardCount).toBe(4);
-    expect(await counts()).toEqual([4]);
+    expect(changed.kind === 'done' && changed.shardCount).toBe(2);
+    expect(await counts()).toEqual([2]);
   });
 
   it('with one row held unreleased and unexpired it does not', async () => {

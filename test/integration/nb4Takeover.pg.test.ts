@@ -201,13 +201,12 @@ describe('the shard count in the database', () => {
     expect(first.kind === 'done' && first.shardCount).toBe(2);
     expect((await rig.direct.query(`SELECT value FROM smdb_data.meta WHERE key = 'shard_count'`)).rows[0].value).toBe('{"count":2}');
     const other = await take(b, B, { boot: true, localCount: 4, capacity: 1 });
-    expect(other.kind === 'done' && other.adopted).toEqual({ local: 4, stored: 2 });
     expect(other.kind === 'done' && other.shardCount).toBe(2);
     await rig.direct.query(`UPDATE smdb_data.shard_claims SET released = true WHERE holder_node = 'n-a'`);
     await rig.direct.query(`UPDATE smdb_data.shard_claims SET released = true, holder_node = 'n-z' WHERE holder_node = 'n-b'`);
     const changed = await take(b, B, { boot: true, localCount: 4, capacity: 1 });
-    expect(changed.kind === 'done' && changed.shardCount).toBe(4);
-    expect((await rig.direct.query(`SELECT count(*)::int AS n FROM smdb_data.shard_claims WHERE shard_count <> 4`)).rows[0].n).toBe(0);
+    expect(changed.kind === 'done' && changed.shardCount).toBe(2);
+    expect((await rig.direct.query(`SELECT value FROM smdb_data.meta WHERE key = 'shard_count'`)).rows[0].value).toBe('{"count":2}');
     log.mockRestore();
   });
 

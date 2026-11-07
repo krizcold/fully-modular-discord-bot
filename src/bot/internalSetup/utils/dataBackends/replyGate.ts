@@ -762,7 +762,7 @@ export function sweepLateWrites(interaction: object): Promise<void> {
 
 /** The gateway Client's interactions: each gets its ledger (BT-2) and its reply gate. */
 export function installGatedInteractions(client: Client): void {
-  installInteractionLedgers(client, installReplyGate);
+  installInteractionLedgers(client, { onOpen: installReplyGate });
 }
 
 const MESSAGE_SENDS = ['reply', 'editReply', 'followUp'] as const;

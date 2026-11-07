@@ -139,10 +139,19 @@ function takeDb(opts: { stored?: number | null; rows?: RowSpec[]; nodes?: any[] 
   return (text, _client, values) => {
     if (/pg_advisory_xact_lock/.test(text)) return { rows: [{}] };
     if (/FROM smdb_data\.claim_clock/.test(text)) return { rows: [{ up_ms: '1000', u_prime: '1000', now_ms: 0 }] };
-    if (/^SELECT value FROM smdb_data\.meta/.test(text)) {
-      return { rows: opts.stored == null ? [] : [{ value: JSON.stringify({ count: opts.stored }) }] };
+    if (/LEFT JOIN smdb_data\.reshard/.test(text)) {
+      return { rows: [{ attempt: null, state: null, from_count: null, to_count: null, target: null, target_by: null, target_at: null, meta_count: opts.stored ?? null }] };
     }
-    if (/AS renewed_ago_ms\s+FROM smdb_data\.shard_claims$/.test(text)) return { rows: (opts.rows ?? []).map(rawRow) };
+    const dead = (r: RowSpec) => r.released === true || (r.expiresUpMs ?? 999_999) <= 1000;
+    if (/^DELETE FROM smdb_data\.shard_claims c/.test(text)) {
+      return { rows: (opts.rows ?? []).filter(r => r.count !== values[0] && dead(r)).map(r => ({ shard_count: r.count, shard_id: r.id, released: r.released ?? false })) };
+    }
+    if (/^SELECT c\.shard_count, c\.shard_id, c\.holder_name/.test(text)) {
+      return { rows: (opts.rows ?? []).filter(r => r.count !== values[0] && !dead(r)).map(r => ({ shard_count: r.count, shard_id: r.id, holder_name: rawRow(r).holder_name })) };
+    }
+    if (/AS renewed_ago_ms\s+FROM smdb_data\.shard_claims WHERE shard_count = \$1$/.test(text)) {
+      return { rows: (opts.rows ?? []).filter(r => r.count === values[0]).map(rawRow) };
+    }
     if (/AS healthy_for_ms\s+FROM smdb_data\.shard_nodes$/.test(text)) return { rows: opts.nodes ?? [] };
     if (/AS floor/.test(text)) return { rows: [{ floor: '0' }] };
     if (/nextval/.test(text)) {
@@ -302,7 +311,7 @@ describe('the renewal', () => {
     const store = storeWith(pool);
     await store.renew(renewReq([{ shardCount: 4, shardId: 1, claim: 11 }, { shardCount: 4, shardId: 3, claim: 13 }]));
     const sent = clients[0].sent.find(s => RENEWAL.test(s.text))!;
-    expect(sent.values).toEqual([[4, 4], [1, 3], [11, 13], 'p-a', 'n-a', 'A', 4, 30, true, true, true, 0, T.ttlMs]);
+    expect(sent.values).toEqual([[4, 4], [1, 3], [11, 13], 'p-a', 'n-a', 'A', 4, 30, true, true, true, 0, T.ttlMs, null, true, null, null, null, null, null, false]);
   });
 
   it.each([
@@ -346,9 +355,13 @@ describe('the take', () => {
     expect(client.released).toEqual([undefined]);
   });
 
-  it('a first take writes the shard count and clears rows of every other count', async () => {
-    const { answer, sent } = await runTake(takeDb({ stored: null, rows: [{ count: 2, id: 0 }] }), takeReq({ localCount: 3 }));
+  it('a first take writes the shard count after step (1) and deletes the released row of another count in step (2)', async () => {
+    const { answer, sent } = await runTake(takeDb({ stored: null, rows: [{ count: 2, id: 0, released: true }] }), takeReq({ localCount: 3 }));
+    expect(answer.kind).toBe('done');
     expect(answer.shardCount).toBe(3);
+    const stepOne = sent.findIndex(s => /LEFT JOIN smdb_data\.reshard/.test(s.text));
+    expect(stepOne).toBeGreaterThan(-1);
+    expect(sent.findIndex(s => /^INSERT INTO smdb_data\.meta/.test(s.text))).toBeGreaterThan(stepOne);
     const writes = metaWrites(sent);
     expect(writes).toHaveLength(1);
     expect(writes[0].values).toHaveLength(1);
@@ -356,44 +369,51 @@ describe('the take', () => {
     expect(writes[0].text).toMatch(/VALUES \('shard_count', \$1\)/);
     const dels = deletes(sent);
     expect(dels).toHaveLength(1);
-    expect(dels[0].text).toMatch(/WHERE shard_count <> \$1/);
-    expect(dels[0].values).toEqual([3]);
+    expect(dels[0].text).toMatch(/WHERE c\.shard_count <> \$1::int AND \(c\.released OR c\.expires_up_ms <= \$2::bigint\)/);
+    expect(dels[0].values[0]).toBe(3);
     expect(dels[0].inTx).toBe(true);
+    expect(sent.at(-1)!.text).toBe('COMMIT');
   });
 
   it('a take under the stored count it agrees with writes no count and deletes nothing; other nodes with room keep the rest', async () => {
-    const db = takeDb({ stored: 2, nodes: [rawNode('n-b', 5)] });
+    const inner = takeDb({ stored: 2, nodes: [rawNode('n-b', 5)] });
+    const deleted: unknown[] = [];
+    const db: Script = async (text, client, values) => {
+      const reply = await inner(text, client, values);
+      if (/^DELETE FROM smdb_data\.shard_claims/.test(text)) deleted.push(...((reply as any)?.rows ?? []));
+      return reply;
+    };
     const { answer, sent } = await runTake(db, takeReq({ localCount: 2, capacity: 1 }));
     expect(answer.shardCount).toBe(2);
     expect(metaWrites(sent)).toEqual([]);
-    expect(deletes(sent)).toEqual([]);
+    expect(deleted).toEqual([]);
     expect(takenIds(answer)).toEqual([[0, null]]);
     expect(answer.plan.leftToOthers).toBe(1);
   });
 
-  it('a stored count with a live row is kept against another local count (adopted)', async () => {
+  it('a running take of own count 1 under meta 2 is refused count and writes nothing (NB9 C1)', async () => {
     const db = takeDb({ stored: 2, rows: [{ count: 2, id: 0 }] });
-    const { answer, sent } = await runTake(db, takeReq({ localCount: 1 }));
-    expect(answer.shardCount).toBe(2);
-    expect(answer.adopted).toEqual({ local: 1, stored: 2 });
+    const { answer, sent } = await runTake(db, takeReq({ localCount: 1, boot: false }));
+    expect(answer.kind).toBe('count');
     expect(metaWrites(sent)).toEqual([]);
-    expect(takenIds(answer)).toEqual([[1, null]]);
+    expect(sent.some(s => /^INSERT INTO smdb_data\.shard_claims|^UPDATE smdb_data\.shard_claims/.test(s.text))).toBe(false);
+    expect(sent.at(-1)!.text).toBe('ROLLBACK');
   });
 
-  it('a stored count whose only live row is of another count gives way to the local count', async () => {
+  it('a stored count whose only live row is of another count does not change: the take is refused count (NB9 C1)', async () => {
     const db = takeDb({ stored: 2, rows: [{ count: 1, id: 0 }] });
     const { answer, sent } = await runTake(db, takeReq({ localCount: 1 }));
-    expect(answer.shardCount).toBe(1);
-    expect(answer.adopted).toBeNull();
-    expect(JSON.parse(metaWrites(sent)[0].values[0] as string)).toEqual({ count: 1 });
-    expect(deletes(sent)[0].values).toEqual([1]);
+    expect(answer.kind).toBe('count');
+    expect(metaWrites(sent)).toEqual([]);
+    expect(deletes(sent)).toEqual([]);
   });
 
-  it('a live row of another count does not hold back a shard of the active count', async () => {
+  it('a live row of another count holds the take back: held with that row, nothing taken (NB9 56)', async () => {
     const db = takeDb({ stored: 1, rows: [{ count: 2, id: 0 }] });
-    const { answer } = await runTake(db, takeReq({ localCount: 1 }));
-    expect(answer.shardCount).toBe(1);
-    expect(takenIds(answer)).toEqual([[0, null]]);
+    const { answer, sent } = await runTake(db, takeReq({ localCount: 1 }));
+    expect(answer).toMatchObject({ kind: 'held', rows: [{ shardCount: 2, shardId: 0, holderName: 'B' }] });
+    expect(sent.some(s => /^INSERT INTO smdb_data\.shard_claims|^UPDATE smdb_data\.shard_claims/.test(s.text))).toBe(false);
+    expect(sent.at(-1)!.text).toBe('ROLLBACK');
   });
 
   it('a live row of the active count held by another node is not taken', async () => {

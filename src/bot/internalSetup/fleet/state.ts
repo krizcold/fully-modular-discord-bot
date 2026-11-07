@@ -10,7 +10,7 @@ import type { BudgetInfo, IdentifyLedger } from './identifyLedger';
 import type { LeaseInfo, LeaseRuntime } from './leaseRuntime';
 import type { IngestService } from '../ingest/ingestService';
 import type { ShardClaims } from './shardClaims';
-import type { FailureClass } from './claimStore';
+import type { FailureClass, PageRead } from './claimStore';
 import { databaseView, type DatabaseView } from '../utils/dataBackends/mainDatabase';
 import { getWorkingSet } from '../utils/dataBackends/workingSet';
 
@@ -77,6 +77,14 @@ export interface FleetState {
   aboveTarget: number[];
   /** NB5 decision 19: the main database and every address; null on a JSON bot. */
   database: DatabaseView | null;
+  /** NB9 21: the open attempt as the last page read showed it; null with none. */
+  reshard: FleetReshard | null;
+  /** NB9 21: a wanted count the bot does not reshard to yet, and why; null when none waits. */
+  reshardWait: { wanted: number; source: 'setting' | 'discord'; reason: string; cannot?: true } | null;
+  /** NB9 21: the last attempt that ended. */
+  lastReshard: { from: number; to: number; method: 'overlap' | 'stop-start' | null; state: 'done' | 'cancelled'; endedAt: number | null; reason: string | null } | null;
+  /** NB9 21: the count an operator set, by machine and time; count null when the setting was removed. */
+  target: { count: number | null; by: string; at: number | null } | null;
   updatedAt: number;
 }
 
@@ -95,9 +103,78 @@ export interface FleetStateSources {
 
 let sources: FleetStateSources | null = null;
 
+/** NB9 21: the reshard driver's wait (Postgres), or a JSON bot's own reshard fields from its memory. */
+export type ReshardSource = () => Partial<Pick<FleetState, 'reshard' | 'reshardWait' | 'lastReshard' | 'target'>>;
+let reshardSource: ReshardSource | null = null;
+
+let loginIntentBits = 0;
+
+/** NB9 7: the intents bitfield this process logged in with, sent with the standby ask. */
+export function setLoginIntents(bits: number): void {
+  loginIntentBits = bits;
+}
+
+export function loginIntents(): number {
+  return loginIntentBits;
+}
+
+export function setReshardSource(source: ReshardSource | null): void {
+  reshardSource = source;
+}
+
 /** Wired once by the shard boot. */
 export function _setFleetStateSources(s: FleetStateSources): void {
   sources = s;
+}
+
+/** NB9 21's open attempt. */
+export interface FleetReshard {
+  attempt: string;
+  from: number;
+  to: number;
+  method: 'overlap' | 'stop-start' | null;
+  state: 'standby' | 'flipped' | 'stopping';
+  startedAgoMs: number | null;
+  untilMs: number | null;
+  reason: string | null;
+  /** Ready live rows of the new count. */
+  connected: number;
+  /** The machines that still hold live rows of the old count. */
+  waitingFor: string[];
+}
+
+const EMPTY_RESHARD = { reshard: null, reshardWait: null, lastReshard: null, target: null };
+
+/** NB9 21: the reshard row from the last page read, its times moved on by ageMs. */
+function reshardFields(page: PageRead | null, ageMs: number): Pick<FleetState, 'reshard' | 'reshardWait' | 'lastReshard' | 'target'> {
+  const read = page?.reshard;
+  if (!page || !read) return EMPTY_RESHARD;
+  const more = page.attempt;
+  const target = read.targetBy ? { count: read.target ?? null, by: read.targetBy, at: read.targetAt ?? null } : null;
+  const counts = read.attempt !== null && read.fromCount !== null && read.toCount !== null;
+  const open = counts && (read.state === 'standby' || read.state === 'flipped' || read.state === 'stopping');
+  const reshard: FleetReshard | null = open ? {
+    attempt: read.attempt!,
+    from: read.fromCount!,
+    to: read.toCount!,
+    method: more?.method ?? null,
+    state: read.state as FleetReshard['state'],
+    startedAgoMs: more?.startedAgoMs == null ? null : more.startedAgoMs + ageMs,
+    untilMs: more?.untilMs == null ? null : Math.max(more.untilMs - ageMs, 0),
+    reason: more?.reason ?? null,
+    connected: more?.connected ?? 0,
+    waitingFor: more?.waitingFor ?? [],
+  } : null;
+  const ended = counts && (read.state === 'done' || read.state === 'cancelled');
+  const lastReshard = ended ? {
+    from: read.fromCount!,
+    to: read.toCount!,
+    method: more?.method ?? null,
+    state: read.state as 'done' | 'cancelled',
+    endedAt: more?.endedAgoMs == null ? null : Date.now() - more.endedAgoMs - ageMs,
+    reason: more?.reason ?? null,
+  } : null;
+  return { reshard, reshardWait: null, lastReshard, target };
 }
 
 const EMPTY_CLAIMS = {
@@ -112,6 +189,7 @@ const EMPTY_CLAIMS = {
   restartWaiting: null,
   returning: [] as number[],
   aboveTarget: [] as number[],
+  ...EMPTY_RESHARD,
 };
 
 /**
@@ -233,7 +311,13 @@ export function getFleetState(): FleetState {
       pendingRestart: snap.pendingRestart,
       restartWaiting: snap.restartWaiting,
       returning: snap.returning,
+      ...reshardFields(snap.page, readAgoMs ?? 0),
     };
+  }
+  if (reshardSource) {
+    const own = reshardSource();
+    // On Postgres the page read holds the attempt; the driver adds only its wait. A JSON bot fills all four.
+    claimFields = claims ? { ...claimFields, reshardWait: own.reshardWait ?? null } : { ...claimFields, ...own };
   }
   return {
     initialized: true,

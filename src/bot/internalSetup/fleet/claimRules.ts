@@ -290,22 +290,6 @@ export function planTake(input: TakeInput): TakePlan {
   return { takes, wait: null, heldElsewhere, elsewhere, waitingForOwner, leftToOthers: rest.length - extra };
 }
 
-export type CountDecision =
-  | { kind: 'need-count' }
-  | { kind: 'use'; count: number; write: boolean; deleteOthers: boolean; adopted: { local: number } | null };
-
-/** Decision 13: the count every process takes under, and when a take may change it. */
-export function decideShardCount(stored: number | null, local: number | null, storedRows: ClaimRow[], upMs: number): CountDecision {
-  if (stored === null) {
-    if (local === null) return { kind: 'need-count' };
-    return { kind: 'use', count: local, write: true, deleteOthers: true, adopted: null };
-  }
-  if (local === null || local === stored) return { kind: 'use', count: stored, write: false, deleteOthers: false, adopted: null };
-  const live = storedRows.some(r => !r.released && !isExpired(r, upMs));
-  if (!live) return { kind: 'use', count: local, write: true, deleteOthers: true, adopted: null };
-  return { kind: 'use', count: stored, write: false, deleteOthers: false, adopted: { local } };
-}
-
 export interface RetakeInput {
   me: Me;
   /** The held pairs the move's renewal did not return. */

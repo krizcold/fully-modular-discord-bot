@@ -2,7 +2,7 @@ import type { StartedPostgreSqlContainer } from '@testcontainers/postgresql';
 import type { Pool } from 'pg';
 import { expect } from 'vitest';
 
-import { PostgresBackend } from '../../src/bot/internalSetup/utils/dataBackends/postgresBackend';
+import { PostgresBackend, provisionSeedRows } from '../../src/bot/internalSetup/utils/dataBackends/postgresBackend';
 import { fixedDatabase } from './fixedDatabase';
 import { ClaimStore, type Heartbeat } from '../../src/bot/internalSetup/fleet/claimStore';
 import { claimTimings, type Me } from '../../src/bot/internalSetup/fleet/claimRules';
@@ -66,6 +66,9 @@ export async function startClaimRig(): Promise<ClaimRig> {
       await direct.query(`DELETE FROM smdb_data.shard_nodes`);
       await direct.query(`DELETE FROM smdb_data.meta WHERE key = 'shard_count'`);
       await direct.query(`UPDATE smdb_data.claim_clock SET up_ms = 0, ticked_at = now(), last_gap_ms = 0`);
+      await direct.query(`DELETE FROM smdb_data.reshard`);
+      await direct.query(provisionSeedRows('smdb_data').find(s => s.startsWith('INSERT INTO smdb_data.reshard '))!);
+      await direct.query(`DELETE FROM smdb_data.identify_slots`);
     },
     async stop() {
       for (const s of stores) await s.end();

@@ -1,7 +1,7 @@
 import fc from 'fast-check';
 import { expect } from 'vitest';
 import type * as JudgeModule from './judge.mjs';
-import { hashOf } from './oracle.mjs';
+import { hashOf, reduceFleetState } from './oracle.mjs';
 
 // A model of a correct store, and every check the checker must pass, written
 // against a judge module so the same checks also run against mutants of it.
@@ -184,7 +184,7 @@ const sixDocs = () => new Map([1, 2, 3, 4, 5, 6].map(n => [u('a', n), `x${n}`]))
 /** A process's fleet facts; `claims` maps a leased shard to its claim (a Postgres bot), none for a JSON bot. */
 const fleetNode = (nodeId: string, leases: number[], over: Partial<{
   name: string; initialized: boolean; table: [number, string][]; guildMap: Record<string, number>; shardCount: number;
-  processId: string; claims: Record<number, number>;
+  processId: string; claims: Record<number, number>; reshard: { attempt: string; state: string; from: number; to: number };
 }> = {}) => ({
   name: over.name ?? nodeId,
   state: {
@@ -192,6 +192,7 @@ const fleetNode = (nodeId: string, leases: number[], over: Partial<{
     leases: leases.map(shardId => ({ shardId, claim: over.claims?.[shardId] ?? null })),
     shardTable: (over.table ?? []).map(([shardId, owner]) => ({ shardId, nodeId: owner, status: 'Ready' })),
     guildMap: over.guildMap ?? {},
+    reshard: over.reshard ?? null,
   },
 });
 /** n acknowledged unique writes by one lane, at t = 10, 20, ... */
@@ -811,6 +812,76 @@ export function checks(): Check[] {
       expect(controls(outOfRange(2), outOfRange(4))).toEqual(['CONTROL']);
       expect(J.judge({ history, copies, k: 0, fleet: outOfRange(2), fleetAgain: outOfRange(4) }).notes).toEqual([]);
       expect(J.judge({ history, copies, k: 0, fleet: handoff, fleetAgain: handoff }).verdicts.map(v => v.v)).toEqual(['CONTROL']);
+    } },
+
+    // NB9 decision 22: the reshard rules, each with its bite.
+    { name: 'NB9 22: a guild in the granted shards of two live processes is CONTROL, across shard counts', run: J => {
+      // Guild g routes to shard 1 under 4 shards and to shard 5 under 8 (Discord's (id >> 22) % count).
+      const g = String(5n << 22n);
+      const old = fleetNode('m', [1], { processId: 'p1', shardCount: 4, guildMap: { [g]: 1 } });
+      const both = J.reshardFleetVerdicts([old, fleetNode('w', [5], { processId: 'q1', shardCount: 8, guildMap: { [g]: 5 } })]);
+      expect(both.map(v => v.detail)).toEqual([`guild ${g} is in the granted shards of 2 processes at once: m (process p1), w (process q1)`]);
+      expect(J.reshardFleetVerdicts([old, fleetNode('w', [4], { processId: 'q1', shardCount: 8 })])).toEqual([]);
+      expect(J.reshardFleetVerdicts([old, fleetNode('w', [5], { processId: 'q1', shardCount: 8, initialized: false })])).toEqual([]);
+      const history = J.buildHistory([[start(['a']), ...sixAcked(), { t: 'end' }]]);
+      const copies = [copyOf('db', sixDocs())];
+      const two = [old, fleetNode('w', [5], { processId: 'q1', shardCount: 8 })];
+      const apart = [old, fleetNode('w', [4], { processId: 'q1', shardCount: 8 })];
+      const details = (fleet: any[], fleetAgain?: any[]) =>
+        J.judge({ history, copies, k: 0, fleet, ...(fleetAgain ? { fleetAgain } : {}) }).verdicts.map(v => v.detail).filter(d => /granted shards/.test(d));
+      expect(details(two)).toHaveLength(1);
+      expect(details(two, apart)).toEqual([]);
+      expect(details(apart, two)).toEqual([]);
+      expect(details(two, two)).toHaveLength(1);
+      expect(J.judge({ history, copies, k: 0, fleet: two, fleetAgain: apart }).notes.join('\n')).toMatch(/granted shards of 2 processes/);
+    } },
+    { name: 'NB9 22: a grant of the new count before the attempt is done is CONTROL', run: J => {
+      const row = (state: string) => ({ attempt: 'a-1', state, from: 4, to: 8, fromRows: state === 'done' ? 0 : 4 });
+      const listing = (state: string) => ({ rows: [row(state)], meta: state === 'standby' ? 4 : 8 });
+      const standby = fleetNode('w', [0], { processId: 'q1', shardCount: 8 });
+      for (const state of ['standby', 'flipped', 'stopping']) {
+        expect(J.reshardFleetVerdicts([standby], listing(state)).map(v => v.detail))
+          .toEqual([`w (process q1) holds a grant of the 8-shard set while the reshard to 8 shards is ${state}`]);
+      }
+      expect(J.reshardFleetVerdicts([standby], listing('done'))).toEqual([]);
+      expect(J.reshardFleetVerdicts([fleetNode('w', [], { processId: 'q1', shardCount: 8 })], listing('flipped'))).toEqual([]);
+      expect(J.reshardFleetVerdicts([fleetNode('m', [0], { processId: 'p1', shardCount: 4 })], listing('flipped'))).toEqual([]);
+      // oracle.mjs fleet keeps the process's own view of the attempt, but the open attempt comes from the listing only
+      // (code review round 1, lane C finding 4: a stuck process's view can read 'flipped' after 'done').
+      expect(reduceFleetState({ initialized: true, reshard: { ...row('flipped'), method: 'overlap', connected: 3, waitingFor: ['B'] } }).reshard)
+        .toEqual({ attempt: 'a-1', state: 'flipped', from: 4, to: 8 });
+      expect(reduceFleetState({ initialized: true, reshard: null }).reshard).toBeNull();
+      expect(J.reshardFleetVerdicts([fleetNode('w', [0], { processId: 'q1', shardCount: 8, reshard: row('flipped') })])).toEqual([]);
+      expect(J.reshardFleetVerdicts([fleetNode('w', [0], { processId: 'q1', shardCount: 8, reshard: row('done') })])).toEqual([]);
+      const history = J.buildHistory([[start(['a']), ...sixAcked(), { t: 'end' }]]);
+      const r = J.judge({ history, copies: [copyOf('db', sixDocs())], k: 0, fleet: [standby], reshard: [JSON.stringify(listing('flipped'))] });
+      expect(r.verdicts.map(v => v.detail)).toContain('w (process q1) holds a grant of the 8-shard set while the reshard to 8 shards is flipped');
+      const unlisted = J.judge({ history, copies: [copyOf('db', sixDocs())], k: 0, fleet: [fleetNode('w', [0], { processId: 'q1', shardCount: 8, reshard: row('flipped') })] });
+      expect(unlisted.notes).toContain('grants were not compared with the reshard attempt: no reshard listing was given (--reshard)');
+    } },
+    { name: 'NB9 22: two open attempts, an old row after done, or meta behind a flipped attempt is CONTROL', run: J => {
+      const row = (attempt: string, state: string, fromRows = 0) => ({ attempt, state, from: 4, to: 8, fromRows });
+      const v = (listing: object) => J.reshardListingVerdicts(listing as any).map(x => x.detail);
+      expect(v({ rows: [row('a-1', 'standby'), row('a-2', 'flipped')], meta: 8 })).toContain('the reshard listing holds 2 open attempts: a-1, a-2');
+      expect(v({ rows: [row('a-1', 'cancelled'), row('a-2', 'standby')], meta: 4 })).toEqual([]);
+      expect(v({ rows: [row('a-1', 'done', 2)], meta: 8 })).toEqual(['the reshard from 4 to 8 shards is done, but shard_claims still holds 2 row(s) of the 4-shard set']);
+      expect(v({ rows: [row('a-1', 'flipped', 2)], meta: 8 })).toEqual([]);
+      expect(v({ rows: [row('a-1', 'flipped')], meta: 4 })).toEqual(["the reshard to 8 shards is flipped, but meta 'shard_count' holds 4"]);
+      expect(v({ rows: [row('a-1', 'done')], meta: null })).toEqual(["the reshard to 8 shards is done, but meta 'shard_count' holds no count"]);
+      expect(v({ rows: [row('a-1', 'standby')], meta: 4 })).toEqual([]);
+      expect(v({ rows: [row('a-1', 'done')], meta: 8 })).toEqual([]);
+      // The listing line oracle.mjs sql reshard prints, judged by judge().
+      const history = J.buildHistory([[start(['a']), ...sixAcked(), { t: 'end' }]]);
+      const copies = [copyOf('db', sixDocs())];
+      const text = `${JSON.stringify({ rows: [row('a-1', 'done', 1)], meta: 8 })}\n`;
+      expect(J.parseReshard(text)).toEqual({ rows: [row('a-1', 'done', 1)], meta: 8 });
+      const judged = J.judge({ history, copies, k: 0, fleet: [fleetNode('m', [0])], reshard: [text] });
+      expect(judged.verdicts.map(x => x.detail)).toEqual(['the reshard from 4 to 8 shards is done, but shard_claims still holds 1 row(s) of the 4-shard set']);
+      for (const bad of ['', 'not json', '{"rows":[{"attempt":1}],"meta":8}', `${text}${text}`]) {
+        const r = J.judge({ history, copies, k: 0, fleet: [fleetNode('m', [0])], reshard: [bad] });
+        expect(r.verdicts).toEqual([]);
+        expect(r.notes.join('\n')).toMatch(/reshard listing 1 was not judged/);
+      }
     } },
 
     // The request route's rows (NB7): each send against the rows that carry it.

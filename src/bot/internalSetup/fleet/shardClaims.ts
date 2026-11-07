@@ -18,12 +18,22 @@ import {
   describeClass,
   type ClaimStoreApi,
   type FailureClass,
+  type HeartbeatMemory,
   type PageRead,
+  type RedrawAnswer,
   type RenewAnswer,
   type RetakeAnswer,
+  type HeldRow,
+  type StandbyTakeAnswer,
   type TakeAnswer,
 } from './claimStore';
 import { commitRolledBack } from '../utils/dataBackends/postgresBackend';
+import {
+  attemptOpen, callOffVerdict, closeVerdict, flipVerdict, takeOutcome, waitingBootVerdict, wantedCount, type GateRead, type WritesMeta,
+} from './reshardRules';
+import { callOffReshard, closeReshard, flipReshard, readFacts } from './reshardStore';
+import { getShardCountOverride } from './placement';
+import { reshardOverlap } from '../../../utils/envLoader';
 
 export type Clocks = () => { perf: number; wall: number };
 const realClocks: Clocks = () => ({ perf: performance.now(), wall: Date.now() });
@@ -70,6 +80,48 @@ export interface ShardClaimsDeps {
   /** NB5 D7: the guilds this process holds a set for in the shard. */
   guildsOfShard?: (shardId: number) => string[];
   log?: Pick<Console, 'log' | 'warn' | 'error'>;
+  /** NB9 4: this machine's FLEET_SHARD_COUNT, null when unset; read from the env when absent. */
+  countSetting?: () => number | null;
+  /** NB9 20: FLEET_RESHARD_OVERLAP; read from the env when absent. */
+  reshardOverlap?: () => boolean;
+  /** NB9 19 and 37: the memory reading the web UI pushed, aged to now; null with none. */
+  memoryReading?: () => HeartbeatMemory | null;
+  /** NB9 7, 27 and 45: this process is a standby for the attempt; its lanes run in standby mode. */
+  standby?: StandbyMode;
+  /** NB9 D2: the serve lanes of a promoted standby; its own take was sent, so the stop releases. */
+  fromStandby?: boolean;
+  /** NB9 E5: the standby's pairs (taken's), named by the release until the redraw's answer is recorded. */
+  standbyPairs?: Pair[];
+  /** NB9 6 to 12 and 25: each page read of a granted process outside a stop goes to the reshard driver. */
+  onPage?: (page: PageRead) => Promise<void> | void;
+}
+
+/** NB9 7, 27, 30 and 45: a standby's lanes, before it serves. */
+export interface StandbyMode {
+  attempt: string;
+  /** W. */
+  count: number;
+  /** The attempt was called off or replaced (L12), or a lapse or a loss ended the standby (L22); called once. */
+  onEnd: (end: StandbyEnd) => void;
+  /** The poll read 'done' for this attempt with meta W; called once. */
+  onDone?: () => void;
+  /** The shards held and how many of them are ready, at each change. */
+  onProgress?: (held: number, ready: number) => void;
+}
+
+/**
+ * reason null: the attempt was replaced by another, whose start overwrote the reason; replacedBy is then that
+ * attempt's to_count when the row holds one (E7's L12 replaced form).
+ */
+export type StandbyEnd = { kind: 'called-off'; reason: string | null; replacedBy?: number } | { kind: 'failed'; cause: string };
+
+const POLL_MS = 1000;
+
+/** NB9 29 and 41: what the redraw serves, from the standby's take: W, its process id and its pairs with their claims. */
+export interface RedrawTaken {
+  count: number;
+  processId: string;
+  pairs: Pair[];
 }
 
 /** NB5 decision 12: the database a move writes next, for (c)'s and (d)'s lines and (d)'s generation rule. */
@@ -91,7 +143,7 @@ export interface ClaimsSnapshot {
   /** The fitness key that holds the restart request back; null when the request was sent or none is pending. */
   restartWaiting: string | null;
   returning: number[];
-  stopped: 'lapse' | 'loss' | 'database' | null;
+  stopped: 'lapse' | 'loss' | 'database' | 'reshard' | null;
   renewMs: number;
 }
 
@@ -103,7 +155,7 @@ export class ShardClaims {
   /** The database time of the last completed renewal that returned each pair. */
   private readonly lastReturnedAt = new Map<string, number>();
   private latestFailure: FailureClass | null = null;
-  private stopped: 'lapse' | 'loss' | 'database' | null = null;
+  private stopped: 'lapse' | 'loss' | 'database' | 'reshard' | null = null;
   private granted = false;
   private closing = false;
   private renewing: Promise<void> | null = null;
@@ -119,6 +171,8 @@ export class ShardClaims {
   private moveLostReserved: Pair[] = [];
   private lastNotMoving: string | null = null;
   private everSentTake = false;
+  /** NB9 69: L32's take form once per wait of the running take. */
+  private readonly reserveHeldLogged = new Set<string>();
   /** Pairs found lost during the exit drain: the release asks for them and names them as no longer held. */
   private lostAtStop: Pair[] = [];
   private pageReadError: FailureClass | null = null;
@@ -126,6 +180,8 @@ export class ShardClaims {
   private renewTimer: NodeJS.Timeout | null = null;
   private deadlineTimer: NodeJS.Timeout | null = null;
   private wroteHeartbeat = false;
+  /** NB9 52: true until this process's first heartbeat statement completed. */
+  private targetEdge = true;
   private lastCopyLog = -Infinity;
   private firstRenewalAt: number | null = null;
   private page: PageRead | null = null;
@@ -136,12 +192,42 @@ export class ShardClaims {
   private shardCount: number | null = null;
   private retired = false;
   private finishing: Promise<void> | null = null;
+  /** NB9 7: each held pair's readiness, sent with the standby's renewals. */
+  private readonly ready = new Map<number, boolean>();
+  private pollTimer: NodeJS.Timeout | null = null;
+  private standbyEnded = false;
+  private doneReported = false;
+  private allReadyLogged = false;
+  /** NB9 E5: taken's pairs until the redraw's answer is recorded. */
+  private standbyPairs: Pair[] = [];
+  /** NB9 9 and H5: the hand-over's counts, set when this process hands its shards to the new set. */
+  private handOver: { from: number; to: number } | null = null;
   private readonly clocks: Clocks;
   private readonly log: Pick<Console, 'log' | 'warn' | 'error'>;
 
   constructor(private readonly deps: ShardClaimsDeps) {
     this.clocks = deps.clocks ?? realClocks;
     this.log = deps.log ?? console;
+    this.everSentTake = deps.fromStandby === true;
+    if (deps.fromStandby === true) this.standbyPairs = [...(deps.standbyPairs ?? [])];
+  }
+
+  /** The count this process took or serves under; null before its take. */
+  ownCount(): number | null {
+    return this.shardCount;
+  }
+
+  /** NB9 9 and 12: NB4's stop-serving step for a hand-over or a stop-start leave; false when it already stopped serving. */
+  stopServingForReshard(): boolean {
+    if (this.stopped) return false;
+    this.stopped = 'reshard';
+    this.runStopStep();
+    return true;
+  }
+
+  /** NB9 9: this process hands over to W; its release logs H5 and runs the close. */
+  noteHandOver(from: number, to: number): void {
+    this.handOver = { from, to };
   }
 
   get processId(): string {
@@ -187,9 +273,13 @@ export class ShardClaims {
 
   /** Starts the renewal lane: a tick and heartbeat every R, with the pairs held or reserved. */
   start(): void {
-    if (this.renewTimer) return;
+    if (this.renewTimer || this.lanesStopped) return;
     this.renewTimer = setInterval(() => { void this.renewOnce(); }, this.deps.timings.renewMs);
     this.renewTimer.unref?.();
+    if (this.deps.standby && !this.pollTimer) {
+      this.pollTimer = setInterval(() => { void this.poll(); }, POLL_MS);
+      this.pollTimer.unref?.();
+    }
   }
 
   // ---------------------------------------------------------------- deadline
@@ -249,11 +339,17 @@ export class ShardClaims {
     this.deadlineTimer.unref?.();
   }
 
-  private lapse(): void {
+  private lapse(from?: { perf: number; wall: number }): void {
     if (this.stopped) return;
     this.stopped = 'lapse';
-    const since = this.earliestReturn();
+    const since = from ?? this.earliestReturn();
     const seconds = since ? Math.round(elapsedMs(since, this.clocks()) / 1000) : 0;
+    if (this.deps.standby) {
+      // A standby holds no grant and no data: nothing to stop serving; it stops (30).
+      if (this.deadlineTimer) { clearTimeout(this.deadlineTimer); this.deadlineTimer = null; }
+      this.endStandby({ kind: 'failed', cause: `no claim renewal for ${seconds} s` });
+      return;
+    }
     this.runStopStep();
     if (this.deps.isStopping()) {
       this.log.warn(`[Shards] No claim renewal for ${seconds} s during the exit drain; every guild set is frozen`);
@@ -274,6 +370,12 @@ export class ShardClaims {
     const lostKeys = new Set(lost.map(pairKey));
     this.held = this.held.filter(p => !lostKeys.has(pairKey(p)));
     this.reserved = this.reserved.filter(p => !lostKeys.has(pairKey(p)));
+    if (this.deps.standby) {
+      if (!this.stopped) this.stopped = 'loss';
+      if (this.deadlineTimer) { clearTimeout(this.deadlineTimer); this.deadlineTimer = null; }
+      this.endStandby({ kind: 'failed', cause: lossCause(lost[0].shardId) });
+      return;
+    }
     if (!this.stopped) {
       this.stopped = 'loss';
       this.runStopStep();
@@ -335,7 +437,15 @@ export class ShardClaims {
       restartable: this.deps.restartable,
       returns: this.deps.returns,
       startedAt: this.deps.startedAt,
+      countSetting: this.countSetting(),
+      reshardOverlap: this.deps.reshardOverlap ? this.deps.reshardOverlap() : reshardOverlap(),
+      memory: this.deps.memoryReading?.() ?? null,
+      targetEdge: this.targetEdge,
     };
+  }
+
+  private countSetting(): number | null {
+    return this.deps.countSetting ? this.deps.countSetting() : getShardCountOverride();
   }
 
   private async renewCycle(): Promise<void> {
@@ -343,16 +453,33 @@ export class ShardClaims {
     const pairs: Pair[] = [...this.held, ...this.reserved.map(({ at: _at, ...p }) => p)];
     let answer: RenewAnswer;
     try {
-      answer = await this.deps.store.renew({ me: this.deps.me, pairs, ttlMs: this.deps.timings.ttlMs, heartbeat: this.heartbeat() });
+      answer = this.deps.standby
+        ? await this.renewStandby(pairs)
+        : await this.deps.store.renew({ me: this.deps.me, pairs, ttlMs: this.deps.timings.ttlMs, heartbeat: this.heartbeat() });
     } catch (error) {
       if (!(error instanceof ClaimPausedError)) this.latestFailure = classifyFailure(error);
       return;
     }
     this.latestFailure = null;
+    if (this.deps.standby) {
+      this.firstRenewalAt ??= answer.at;
+      this.applyRenewal(answer, sent, new Set(pairs.map(pairKey)));
+      return;
+    }
+    this.targetEdge = false;
+    if (answer.targetWritten) this.log.log(l16Line(answer.targetWritten.from, answer.targetWritten.to));
     this.noteHeartbeat(answer);
     this.firstRenewalAt ??= answer.at;
     this.applyRenewal(answer, sent, new Set(pairs.map(pairKey)));
     if (this.granted) void this.work();
+  }
+
+  /** C14: the standby's renewal carries each pair's readiness and no heartbeat. */
+  private renewStandby(pairs: Pair[]): Promise<RenewAnswer> {
+    if (!this.deps.store.renewStandby) throw new Error('this claims store has no standby renewal');
+    return this.deps.store.renewStandby({
+      me: this.deps.me, pairs: pairs.map(p => ({ ...p, ready: this.ready.get(p.shardId) === true })), ttlMs: this.deps.timings.ttlMs,
+    });
   }
 
   private noteHeartbeat(answer: RenewAnswer): void {
@@ -422,6 +549,30 @@ export class ShardClaims {
     const copied = new Set<number>();
     const record = this.deps.lastRecord?.() ?? null;
     let count = await localCount();
+    let writesMeta: WritesMeta | undefined;
+    let takeCount: number | null = count;
+    const setting = this.countSetting();
+    // NB9 74: the boot's page read before its first try; whether a live row of meta's count is known comes only from it.
+    let pageLive: { metaCount: number; live: boolean } | null = null;
+    if (!this.deps.isStopping() && this.databaseStop === null) {
+      try {
+        const page = await this.deps.store.readPage(null);
+        if (page.reshard) {
+          if (page.reshard.metaCount !== null) {
+            pageLive = { metaCount: page.reshard.metaCount, live: page.rows.some(r => !r.released && r.expiresUpMs > page.upMs) };
+          }
+          ({ takeCount, writesMeta } = this.bootBranch(page.reshard, count, setting, pageLive));
+        }
+      } catch {
+        // No page read: the gate's step (1) decides the first try, and its refusal the branch of the next.
+      }
+    }
+    const logged = new Set<string>();
+    const once = (key: string, line: string) => {
+      if (logged.has(key)) return;
+      logged.add(key);
+      this.log.warn(line);
+    };
     for (;;) {
       if (this.deps.isStopping() || giveUp() || this.databaseStop !== null) return null;
       let began: { perf: number; wall: number } | null = null;
@@ -430,7 +581,8 @@ export class ShardClaims {
         this.everSentTake = true;
         answer = await this.deps.store.take({
           me: this.deps.me, capacity: this.deps.capacity, ttlMs: this.deps.timings.ttlMs, boot: true, known: [],
-          localCount: count, reserve: false, copied,
+          localCount: takeCount, reserve: false, copied, ...(writesMeta ? { writesMeta } : {}),
+          ...(setting !== null ? { countSetting: setting } : {}),
         }, () => { began = this.clocks(); });
       } catch (error) {
         if (this.databaseStop !== null || this.lanesStopped || this.deps.isStopping()) return null;
@@ -445,8 +597,36 @@ export class ShardClaims {
       if (answer.kind === 'need-count') {
         await sleep(this.deps.timings.renewMs);
         count = await localCount();
+        takeCount = count;
+        writesMeta = undefined;
         continue;
       }
+      if (answer.kind === 'count') {
+        // NB9 74 and 77: no line; the next try after R takes the branch this read gives.
+        const live = pageLive !== null && pageLive.metaCount === answer.read.metaCount ? pageLive : null;
+        ({ takeCount, writesMeta } = this.bootBranch(answer.read, count, setting, live));
+        await sleep(this.deps.timings.renewMs);
+        continue;
+      }
+      if (answer.kind === 'held') {
+        const n = writesMeta ? takeCount : answer.read.metaCount;
+        if (writesMeta?.kind === 'change') {
+          once(`L14:${answer.read.attempt}`, l14Line(n ?? 0, answer.read.fromCount ?? 0, answer.rows));
+        } else {
+          const storedHeld = writesMeta?.kind === 'direct' && answer.rows.some(row => row.shardCount === answer.read.metaCount);
+          const action = takeOutcome(writesMeta ? 'count-writing' : 'boot', 'held', answer.read, n ?? undefined, storedHeld);
+          if (action.line === 'L13') once(`L13:${answer.read.attempt}`, l13Line(n ?? 0, answer.read.fromCount ?? 0, answer.rows));
+          else if (action.line === 'L32') for (const line of heldLines(n ?? 0, answer.rows, this.deps.timings.renewMs)) once(`L32:${line}`, line);
+          if (storedHeld) {
+            takeCount = count;
+            writesMeta = undefined;
+          }
+        }
+        await sleep(this.deps.timings.renewMs);
+        continue;
+      }
+      if (answer.closed) this.log.log(closeLine(answer.closed.fromCount, answer.closed.expired));
+      if (answer.spread) this.log.log(l15Line(answer.spread.fromCount, answer.shardCount, answer.taken.map(t => t.pair.shardId), answer.spread.kept));
       if (answer.plan.wait) {
         const now = this.clocks().wall;
         for (const [shardId, renewedAt] of answer.predecessorRenewedAt) {
@@ -467,9 +647,6 @@ export class ShardClaims {
         await sleep(this.deps.timings.renewMs);
         continue;
       }
-      if (answer.adopted) {
-        this.log.warn(`[Shards] This machine resolves ${answer.adopted.local} shards; the database runs ${answer.adopted.stored}, and the count changes only when no machine holds a shard under ${answer.adopted.stored}: stop the bot on the other machines, then restart this one`);
-      }
       for (const t of answer.taken) {
         if (t.above === 'no-room') this.log.warn(`[Shards] Taking shard ${t.pair.shardId} above this machine's target (FLEET_SHARD_CAPACITY ${this.deps.capacity}): no other machine has room for it`);
         else if (t.above === 'own') this.log.warn(`[Shards] Taking shard ${t.pair.shardId} above this machine's target (FLEET_SHARD_CAPACITY ${this.deps.capacity}): it was this machine's shard`);
@@ -481,6 +658,16 @@ export class ShardClaims {
           if (kept.includes(other.shardId) && !taken.has(other.shardId)) {
             this.log.warn(`[Shards] Shard ${other.shardId} kept for this machine was taken by ${other.holderName} while it restarted`);
           }
+        }
+      }
+      if (!writesMeta && answer.read && setting !== null) {
+        // NB9 4, 13 and 74: this machine's setting differs from the wanted count, with no change of its own.
+        const read = answer.read;
+        const target = read.target ?? null;
+        if (setting !== (target ?? read.metaCount ?? answer.shardCount)) {
+          const source = target !== null && read.targetBy && read.targetAt !== null && read.targetAt !== undefined
+            ? { machine: read.targetBy, date: targetDate(read.targetAt) } : null;
+          this.log.warn(l17Line(setting, answer.shardCount, source));
         }
       }
       this.shardCount = answer.shardCount;
@@ -500,6 +687,87 @@ export class ShardClaims {
     }
   }
 
+  /**
+   * NB9 74: the take of the boot's try for a read; W is the target, else meta or Discord's recommendation, larger. The
+   * local count is the recommendation only while FLEET_SHARD_COUNT is unset (31: a setting that wrote no target is not W).
+   */
+  private bootBranch(read: GateRead, local: number | null, setting: number | null, live: { metaCount: number; live: boolean } | null): { takeCount: number | null; writesMeta?: WritesMeta } {
+    const wanted = wantedCount(read.target ?? null, read.metaCount, setting === null ? local : null);
+    const liveOfMeta = live !== null && live.metaCount === read.metaCount ? live.live : null;
+    const branch = waitingBootVerdict(read, wanted, liveOfMeta);
+    if (branch === 'count-change' && read.attempt !== null && read.toCount !== null) {
+      return { takeCount: read.toCount, writesMeta: { kind: 'change', attempt: read.attempt } };
+    }
+    if (branch === 'direct-change' && read.metaCount !== null && wanted !== null) {
+      return { takeCount: wanted, writesMeta: { kind: 'direct', from: read.metaCount } };
+    }
+    return { takeCount: local };
+  }
+
+  /**
+   * NB9 29, 59, 67 and D5: the serve's redraw of taken's pairs under W. A failed statement is retried every R until D
+   * from its first BEGIN, then the lapse runs and no loss step. A refusal runs NB4's loss for every pair of taken, after
+   * L32's redraw form when a live row held it. A pair the redraw did not return is in `lost`, for the loss right after
+   * the grant (lossAfterGrant). Null when a stop began, the database stopped or D passed.
+   */
+  async redraw(taken: RedrawTaken): Promise<{ shardCount: number; pairs: Pair[]; lost: Pair[] } | null> {
+    if (taken.processId !== this.processId) throw new Error(`the redraw names process ${taken.processId}, not this process's ${this.processId}`);
+    const shardCount = taken.count;
+    if (taken.pairs.length === 0) return { shardCount, pairs: [], lost: [] };
+    const store = this.deps.store;
+    if (!store.redraw) throw new Error('this claims store has no redraw');
+    const start = this.clocks();
+    let first: { perf: number; wall: number } | null = null;
+    for (;;) {
+      if (this.deps.isStopping() || this.databaseStop !== null) return null;
+      let began: { perf: number; wall: number } | null = null;
+      let answer: RedrawAnswer;
+      try {
+        this.everSentTake = true;
+        answer = await store.redraw(
+          { me: this.deps.me, shardCount, shardIds: taken.pairs.map(p => p.shardId), ttlMs: this.deps.timings.ttlMs },
+          () => { began = this.clocks(); first ??= began; },
+        );
+      } catch (error) {
+        if (this.databaseStop !== null || this.lanesStopped || this.deps.isStopping()) return null;
+        this.latestFailure = classifyFailure(error);
+        const since = first ?? start;
+        if (elapsedMs(since, this.clocks()) >= this.deps.timings.deadlineMs) {
+          this.lapse(since);
+          return null;
+        }
+        await sleep(this.deps.timings.renewMs);
+        continue;
+      }
+      this.standbyPairs = [];
+      if (answer.kind !== 'done') {
+        if (answer.kind === 'held') for (const line of redrawHeldLines(answer.rows)) this.log.error(line);
+        this.loss([...taken.pairs]);
+        return { shardCount, pairs: [], lost: [] };
+      }
+      if (answer.closed) this.log.log(closeLine(answer.closed.fromCount, answer.closed.expired));
+      this.shardCount = shardCount;
+      const at = began ?? this.clocks();
+      this.held = answer.pairs;
+      for (const p of answer.pairs) this.lastReturned.set(pairKey(p), at);
+      const returned = new Set(answer.pairs.map(p => p.shardId));
+      const lost = taken.pairs.filter(p => !returned.has(p.shardId));
+      if (this.deps.isStopping() || this.databaseStop !== null) return null;
+      if (this.held.length > 0 && elapsedMs(at, this.clocks()) >= this.deps.timings.deadlineMs) {
+        const held = this.held;
+        this.held = [];
+        await this.renewWith(held);
+        if (this.databaseStop !== null) return null;
+      }
+      return { shardCount, pairs: [...this.held], lost };
+    }
+  }
+
+  /** NB9 29: the pairs the redraw did not return are NB4's loss, run right after the grant. */
+  lossAfterGrant(lost: Pair[]): void {
+    if (lost.length > 0) this.loss(lost);
+  }
+
   /** On the renewal lane: waits for the renewal on the wire, then renews exactly these pairs, and interval ticks wait for it. */
   private renewWith(pairs: Pair[]): Promise<void> {
     const run = (async () => {
@@ -517,6 +785,7 @@ export class ShardClaims {
     try {
       const answer = await this.deps.store.renew({ me: this.deps.me, pairs, ttlMs: this.deps.timings.ttlMs, heartbeat: this.heartbeat() });
       this.latestFailure = null;
+      this.targetEdge = false;
       const mine = new Set(answer.rows.filter(r => r.mine && !r.released).map(pairKey));
       this.held = pairs.filter(p => mine.has(pairKey(p)));
       for (const p of this.held) {
@@ -531,6 +800,155 @@ export class ShardClaims {
       }
       this.latestFailure = classifyFailure(error);
       this.held = [];
+    }
+  }
+
+  // ---------------------------------------------------------------- standby mode (NB9 7, 27, 45)
+
+  /**
+   * NB9 7, 27 and 61: the standby's one take of rows of W after its first renewal, retried every R after a failed
+   * statement and while this machine's earlier standby still holds rows of W (NB4's deferral). L5 once it took.
+   * Null when a stop began, or when the reshard row no longer holds the attempt in 'standby' (the end is reported).
+   */
+  async standbyTake(): Promise<{ count: number; pairs: Pair[] } | null> {
+    const standby = this.deps.standby;
+    if (!standby) throw new Error('standbyTake() outside standby mode');
+    const store = this.deps.store;
+    if (!store.standbyTake) throw new Error('this claims store has no standby take');
+    let lastFailureLog = -Infinity;
+    for (;;) {
+      if (this.deps.isStopping() || this.lanesStopped || this.standbyEnded) return null;
+      let began: { perf: number; wall: number } | null = null;
+      let answer: StandbyTakeAnswer;
+      try {
+        this.everSentTake = true;
+        answer = await store.standbyTake(
+          { me: this.deps.me, capacity: this.deps.capacity, ttlMs: this.deps.timings.ttlMs, attempt: standby.attempt, shardCount: standby.count },
+          () => { began = this.clocks(); },
+        );
+      } catch (error) {
+        if (this.lanesStopped || this.deps.isStopping()) return null;
+        const now = this.clocks().wall;
+        if (now - lastFailureLog >= FAILURE_LOG_MS) {
+          lastFailureLog = now;
+          this.log.warn(`[Shards] Cannot take shards yet: the take failed (${describeFailureClass(classifyFailure(error))}); retrying every ${seconds(this.deps.timings.renewMs)} s`);
+        }
+        await sleep(this.deps.timings.renewMs);
+        continue;
+      }
+      if (answer.kind === 'not-standby') {
+        const replaced = answer.attempt !== standby.attempt;
+        this.endStandby(replaced && answer.attempt !== null && typeof answer.toCount === 'number'
+          ? { kind: 'called-off', reason: null, replacedBy: answer.toCount }
+          : { kind: 'called-off', reason: replaced ? null : answer.reason });
+        return null;
+      }
+      if (answer.plan.wait) {
+        await sleep(this.deps.timings.renewMs);
+        continue;
+      }
+      this.shardCount = standby.count;
+      const at = began ?? this.clocks();
+      this.held = answer.taken;
+      for (const p of this.held) {
+        this.lastReturned.set(pairKey(p), at);
+        this.ready.set(p.shardId, false);
+      }
+      const ids = this.held.map(p => p.shardId);
+      this.log.log(ids.length > 0
+        ? l5Line(standby.count, ids)
+        : l5NoneLine(standby.count, this.deps.capacity, answer.plan.heldElsewhere, standby.count - answer.plan.heldElsewhere));
+      this.progress();
+      if (this.held.length > 0 && elapsedMs(at, this.clocks()) >= this.deps.timings.deadlineMs) await this.renewOnce();
+      else this.armDeadline();
+      return { count: standby.count, pairs: [...this.held] };
+    }
+  }
+
+  /** NB9 7: a shard is ready from 'shardReady' or 'shardResume' until 'shardDisconnect' or 'shardReconnecting'. */
+  setReady(shardId: number, ready: boolean): void {
+    if (!this.held.some(p => p.shardId === shardId) || this.ready.get(shardId) === ready) return;
+    this.ready.set(shardId, ready);
+    this.progress();
+  }
+
+  private progress(): void {
+    const held = this.held.length;
+    const ready = this.held.filter(p => this.ready.get(p.shardId) === true).length;
+    try { this.deps.standby?.onProgress?.(held, ready); } catch (error) { this.log.error('[Shards] Could not report which new shards are connected:', error); }
+    if (held > 0 && ready === held && !this.allReadyLogged) {
+      this.allReadyLogged = true;
+      this.log.log(l6Line(held));
+    }
+  }
+
+  /**
+   * NB9 29 and C5: the pre-serve lanes stop (the renewal, the 1 s poll and the deadline); a renewal on the wire gets up
+   * to 2 s. The rows stay unreleased: the serve's redraw takes them on, or the stop's release frees them.
+   */
+  async stopLanes(): Promise<void> {
+    this.lanesStopped = true;
+    if (this.pollTimer) { clearInterval(this.pollTimer); this.pollTimer = null; }
+    if (this.renewTimer) { clearInterval(this.renewTimer); this.renewTimer = null; }
+    if (this.deadlineTimer) { clearTimeout(this.deadlineTimer); this.deadlineTimer = null; }
+    this.deps.store.abandonWork();
+    if (this.renewing) {
+      const settled = await Promise.race([this.renewing.then(() => true), sleep(2000).then(() => false)]);
+      if (!settled) this.deps.store.abandonRenewal();
+    }
+  }
+
+  private endStandby(end: StandbyEnd): void {
+    if (this.standbyEnded) return;
+    this.standbyEnded = true;
+    if (this.pollTimer) { clearInterval(this.pollTimer); this.pollTimer = null; }
+    try { this.deps.standby?.onEnd(end); } catch (error) { this.log.error('[Shards] Could not report the end of this standby:', error); }
+  }
+
+  /** NB9 45: every 1 s, the reshard row read; the flip, the close and a due call-off run when the read shows them due. */
+  private async poll(): Promise<void> {
+    const standby = this.deps.standby;
+    if (!standby || this.standbyEnded || this.lanesStopped || this.workRun || !this.deps.store.withWorkClient) return;
+    await this.onWorkLane(() => this.pollCycle(standby));
+  }
+
+  private async pollCycle(standby: StandbyMode): Promise<void> {
+    const work = this.deps.store.withWorkClient!.bind(this.deps.store);
+    const facts = await work('the reshard poll', client => readFacts(client));
+    if (this.standbyEnded || this.lanesStopped) return;
+    const { row } = facts;
+    if (row.attempt !== standby.attempt) {
+      this.endStandby(row.attempt !== null && row.toCount !== null
+        ? { kind: 'called-off', reason: null, replacedBy: row.toCount }
+        : { kind: 'called-off', reason: null });
+      return;
+    }
+    if (row.state === 'cancelled') {
+      this.endStandby({ kind: 'called-off', reason: row.reason ?? null });
+      return;
+    }
+    if (row.state === 'standby') {
+      if (flipVerdict(facts, standby.attempt)) {
+        const flip = await work('the flip', client => flipReshard(client, standby.attempt));
+        if (flip.kind === 'flipped') this.log.log(l7Line(flip.toCount, flip.fromCount));
+        return;
+      }
+      if (callOffVerdict(facts) === null) return;
+      const off = await work('the call-off', client => callOffReshard(client, standby.attempt));
+      if (off.kind !== 'called-off') return;
+      this.log.warn(l11Line(off.toCount, off.reason, off.fromCount, off.retryNow ? null : off.retryAfterMs));
+      this.endStandby({ kind: 'called-off', reason: off.reason });
+      return;
+    }
+    if (row.state === 'flipped') {
+      if (!closeVerdict(facts, standby.attempt).close) return;
+      const closed = await work('the close', client => closeReshard(client, standby.attempt));
+      if (closed.kind === 'closed') this.log.log(closeLine(closed.fromCount, closed.expired));
+      return;
+    }
+    if (row.state === 'done' && facts.metaCount === standby.count && !this.doneReported) {
+      this.doneReported = true;
+      try { standby.onDone?.(); } catch (error) { this.log.error('[Shards] Could not report the end of the reshard:', error); }
     }
   }
 
@@ -577,6 +995,7 @@ export class ShardClaims {
         { move: true },
       );
       this.latestFailure = null;
+      this.targetEdge = false;
       const mine = new Map(answer.rows.filter(r => r.mine).map(r => [pairKey(r), r]));
       const returned: Pair[] = [];
       const missing: Pair[] = [];
@@ -611,15 +1030,18 @@ export class ShardClaims {
     }
     const missing = renewal.missing;
     let taken: RetakeAnswer['taken'] = [];
+    let refused: RetakeAnswer['refused'];
     if (missing.length > 0) {
       const ids = missing.map(p => p.shardId);
       const guildIds = [...new Set(ids)].map(shardId => ({ shardId, guildIds: this.deps.guildsOfShard?.(shardId) ?? [] }));
       let commitSent = false;
       try {
-        taken = (await this.deps.store.retake({
+        const answer = await this.deps.store.retake({
           me: this.deps.me, shardCount: missing[0].shardCount, pairs: missing, guildIds, generation: target.generation,
           ttlMs: this.deps.timings.ttlMs,
-        }, () => { commitSent = true; })).taken;
+        }, () => { commitSent = true; });
+        taken = answer.taken;
+        refused = answer.refused;
       } catch (error) {
         const cause = error instanceof ClaimFailure ? error.cause : error;
         const one = new Set(ids).size === 1;
@@ -634,6 +1056,11 @@ export class ShardClaims {
         }
         return false;
       }
+    }
+    if (refused?.kind === 'held') {
+      const ids = [...new Set(missing.map(p => p.shardId))];
+      this.notMoving(retakeHeldLine(ids, missing[0].shardCount, target.address, refused.rows));
+      return false;
     }
     for (const t of taken) this.replaceClaim(t.before, t.pair.claim);
     this.lanesPaused = false;
@@ -713,9 +1140,15 @@ export class ShardClaims {
     this.page = page;
     this.pageReadAt = this.clocks().perf;
     this.pageReadError = null;
+    if (this.granted && !this.closing && !this.deps.isStopping() && this.deps.onPage) {
+      try { await this.deps.onPage(page); } catch { /* the reshard check failed; the next tick tries again */ }
+    }
     if (!this.mayRestart()) return;
     const unfit = this.deps.fitness();
-    if (unfit === null && !this.restartSent) {
+    // NB9 14: while an attempt is open, no reservation, return or move of a row of either count.
+    const open = page.reshard ? attemptOpen(page.reshard) : false;
+    if (open) this.returnList = [];
+    if (unfit === null && !this.restartSent && !open) {
       try {
         await this.maybeReserve(page);
       } catch { /* the reservation failed; the next tick tries again */ }
@@ -731,20 +1164,30 @@ export class ShardClaims {
   }
 
   private async maybeReserve(page: PageRead): Promise<void> {
-    const count = page.shardCount ?? this.shardCount;
-    if (count === null) return;
+    const count = this.shardCount;
+    if (count === null || (page.shardCount !== null && page.shardCount !== count)) return;
     const plan = planTake({
       me: this.deps.me, capacity: this.deps.capacity, boot: false, known: this.known(), shardCount: count,
       rows: page.rows, nodes: page.nodes, upMs: page.upMs, uPrimeMs: page.uPrimeMs,
     });
-    if (plan.takes.length === 0 && count === this.shardCount) return;
+    if (plan.takes.length === 0) return;
     this.everSentTake = true;
     let began = this.clocks();
     const answer = await this.deps.store.take({
       me: this.deps.me, capacity: this.deps.capacity, ttlMs: this.deps.timings.ttlMs, boot: false, known: this.known(),
       localCount: this.shardCount, reserve: true,
     }, () => { began = this.clocks(); });
+    if (answer.kind === 'held') {
+      for (const line of heldLines(count, answer.rows, this.deps.timings.renewMs)) {
+        if (this.reserveHeldLogged.has(line)) continue;
+        this.reserveHeldLogged.add(line);
+        this.log.warn(line);
+      }
+      return;
+    }
     if (answer.kind !== 'done') return;
+    this.reserveHeldLogged.clear();
+    if (answer.closed) this.log.log(closeLine(answer.closed.fromCount, answer.closed.expired));
     for (const t of answer.taken) this.reserved.push({ ...t.pair, at: began });
   }
 
@@ -842,7 +1285,9 @@ export class ShardClaims {
       if (!settled) this.deps.store.abandonRenewal();
     }
     if (!this.everSentTake) return;
-    const asked = [...this.known(), ...this.lostAtStop];
+    const own = this.known();
+    const known = [...own, ...this.standbyPairs.filter(p => !own.some(k => k.shardId === p.shardId))];
+    const asked = [...known, ...this.lostAtStop];
     const reserved = this.reserved.map(({ at: _at, ...p }) => p);
     const heldShards = new Set(this.held.map(p => p.shardId));
     const handOvers = this.returnList.filter(h => heldShards.has(h.shardId));
@@ -861,11 +1306,12 @@ export class ShardClaims {
         () => { sent = true; },
         () => { connected = true; },
       );
-      for (const line of releaseLines(asked, reserved, rows, this.deps.timings.ttlMs)) this.log.log(line);
+      for (const line of releaseLines(asked, reserved, rows, this.deps.timings.ttlMs, this.handOver ?? undefined)) this.log.log(line);
+      if (this.handOver) await this.closeAfterHandOver();
       if (this.shardCount !== null && this.deps.noteKeptAtStop) {
         try {
-          const returned = new Set(rows.map(r => `${r.shardId}:${r.claim}`));
-          const dropped = [...new Set([...asked.filter(p => !returned.has(`${p.shardId}:${p.claim}`)).map(p => p.shardId), ...rows.filter(r => r.handedTo !== null).map(r => r.shardId)])];
+          const returned = new Set(rows.map(r => r.shardId));
+          const dropped = [...new Set([...asked.filter(p => !returned.has(p.shardId)).map(p => p.shardId), ...rows.filter(r => r.handedTo !== null).map(r => r.shardId)])];
           this.deps.noteKeptAtStop(this.shardCount, rows.filter(r => r.handedTo === null).map(r => r.shardId), dropped);
         } catch (error) {
           this.log.error('[Shards] Could not record the shards the release kept for this machine:', error instanceof Error ? error.message : error);
@@ -873,10 +1319,25 @@ export class ShardClaims {
       }
     } catch (error) {
       if (error instanceof ClaimPausedError) this.log.error(releaseFailureLine(asked, classifyFailure(error), sent, connected, this.databaseStop));
-      else this.log.error(releaseFailureLine(this.known(), classifyFailure(error), sent, connected));
+      else this.log.error(releaseFailureLine(known, classifyFailure(error), sent, connected));
     }
     this.held = [];
     this.reserved = [];
+    this.standbyPairs = [];
+  }
+
+  /** NB9 9 and 10: after a hand-over's release, the close on the work lane; its own transaction checks every fact again. */
+  private async closeAfterHandOver(): Promise<void> {
+    const store = this.deps.store;
+    if (!store.withWorkClient) return;
+    try {
+      const closed = await Promise.race([
+        store.withWorkClient('the close', client => closeReshard(client, null)),
+        sleep(2000).then(() => null),
+      ]);
+      if (closed === null) { store.abandonWork(); return; }
+      if (closed.kind === 'closed') this.log.log(closeLine(closed.fromCount, closed.expired));
+    } catch { /* another release, a standby's poll or a waiting boot runs the close */ }
   }
 }
 
@@ -904,21 +1365,166 @@ export function describeFailureClass(failure: FailureClass): string {
 
 const idList = (ids: number[]): string => [...ids].sort((a, b) => a - b).join(', ');
 
-/** Decision 12's completed lines, built from what the release statement returned. */
-export function releaseLines(asked: Pair[], reserved: Pair[], rows: Array<{ shardId: number; claim: number; wasReserved: boolean; handedTo: string | null }>, ttlMs: number): string[] {
+function heldNames(rows: HeldRow[]): string {
+  return [...new Set(rows.map(r => r.holderName))].sort().join(', ');
+}
+
+function heldByCount(rows: HeldRow[]): Map<number, HeldRow[]> {
+  const by = new Map<number, HeldRow[]>();
+  for (const row of rows) by.set(row.shardCount, [...(by.get(row.shardCount) ?? []), row]);
+  return new Map([...by].sort((a, b) => a[0] - b[0]));
+}
+
+/** NB9 L32, the boot or running take's form, one line per count still held. */
+export function heldLines(n: number, rows: HeldRow[], renewMs: number): string[] {
+  return [...heldByCount(rows)].map(([c, held]) =>
+    `[Shards] Not taking shards of the ${n}-shard set yet: shard(s) ${idList(held.map(r => r.shardId))} of the ${c}-shard set are still held by ${heldNames(held)}; trying again every ${seconds(renewMs)} s`);
+}
+
+/** NB9 L32, the redraw's form. */
+export function redrawHeldLines(rows: HeldRow[]): string[] {
+  return [...heldByCount(rows)].map(([c, held]) =>
+    `[Shards] Not serving the new shards: shard(s) ${idList(held.map(r => r.shardId))} of the ${c}-shard set are still held by ${heldNames(held)} on this database; this process restarts, and its next start waits until they are released or expire`);
+}
+
+/** NB9 L32, the re-take's form, the counts still held joined in one line. */
+export function retakeHeldLine(ids: number[], n: number, address: string, rows: HeldRow[]): string {
+  const held = [...heldByCount(rows)].map(([c, h]) => `shard(s) ${idList(h.map(r => r.shardId))} of the ${c}-shard set`).join(' and ');
+  return `[Database] Not taking shard(s) ${idList(ids)} of the ${n}-shard set again on ${address} yet: ${held} are still held there by ${heldNames(rows)}; this process keeps its unsaved changes and tries again at the next check`;
+}
+
+/** NB9 L13. */
+export function l13Line(w: number, from: number, rows: HeldRow[]): string {
+  return `[Shards] The bot is switching to ${w} shards: this process takes shards once the ${from} old ones are released (still held by ${heldNames(rows)})`;
+}
+
+/** NB9 L14. */
+export function l14Line(w: number, from: number, rows: HeldRow[]): string {
+  return `[Shards] Resharding to ${w} shards: this process takes shards once every machine has stopped its ${from} old ones (still held by ${heldNames(rows)})`;
+}
+
+/** NB9 L9 as round 2 words it, with its tail when an old row expired instead of being released. */
+export function closeLine(from: number, expired: number[]): string {
+  if (expired.length === 0) return `[Shards] The ${from} old shards are released; each machine's new shards serve once its old bot process has stopped`;
+  return `[Shards] The ${from} old shards are released or expired; each machine's new shards serve once its old bot process has stopped; shard(s) ${idList(expired)} expired instead (their process stopped renewing before it released them)`;
+}
+
+/** NB9 L15: the count change wrote meta and spread the rows of W (12, 36). */
+export function l15Line(from: number, w: number, mine: number[], kept: Array<{ nodeName: string; shardIds: number[]; seconds: number }>): string {
+  const tail = kept.map(k => `; shard(s) ${idList(k.shardIds)} are kept for ${k.nodeName} for ${k.seconds} s`).join('');
+  return `[Shards] No machine holds a shard under ${from} any more: the bot now runs ${w} shards; this machine takes shard(s) ${idList(mine)}${tail}`;
+}
+
+/** NB9 L16: this process's heartbeat wrote the target from a changed FLEET_SHARD_COUNT. */
+export function l16Line(from: number | null, to: number | null): string {
+  if (to === null) return `[Shards] FLEET_SHARD_COUNT on this machine was removed (it was ${from ?? 'unset'}): the bot follows Discord's recommended count upward`;
+  return `[Shards] FLEET_SHARD_COUNT on this machine changed from ${from ?? 'unset'} to ${to}: the bot reshards to ${to} shards`;
+}
+
+/** L17's <date>: the day of the target's time, UTC. */
+export function targetDate(atMs: number): string {
+  return new Date(atMs).toISOString().slice(0, 10);
+}
+
+/** NB9 L17. */
+export function l17Line(setting: number, n: number, source: { machine: string; date: string } | null): string {
+  const from = source ? `set on ${source.machine} on ${source.date}` : "from Discord's recommendation";
+  return `[Shards] FLEET_SHARD_COUNT on this machine is ${setting}, but the bot runs ${n} shards (${from}); only a change of the setting reshards the bot, so change it on this machine to reshard to another count`;
+}
+
+/** NB9 L5. */
+export function l5Line(w: number, ids: number[]): string {
+  return `[Shards] Standby for the reshard to ${w} shards: took shard(s) ${idList(ids)}; connecting them to Discord`;
+}
+
+/** NB9 L5's second form (B11): the counts from the take. */
+export function l5NoneLine(w: number, capacity: number, held: number, left: number): string {
+  return `[Shards] Standby for the reshard to ${w} shards: took none (FLEET_SHARD_CAPACITY ${capacity}): ${held} taken by other machines' standbys, ${left} left to machines with room; this process runs this machine's bot once its old bot process stops`;
+}
+
+/** NB9 L6. */
+export function l6Line(k: number): string {
+  return `[Shards] Standby: all ${k} new shard(s) of this process are connected; waiting for the other machines`;
+}
+
+/** NB9 L7. */
+export function l7Line(w: number, n: number): string {
+  return `[Shards] All ${w} new shards are connected: switched the bot to ${w} shards; the ${n} old shards save what they hold and stop, then the new ones serve`;
+}
+
+/** A database time in L11's next-try tail: its UTC day and minute. */
+export function retryTime(atMs: number): string {
+  return `${new Date(atMs).toISOString().slice(0, 16).replace('T', ' ')} UTC`;
+}
+
+/** NB9 L11; retryAtMs null when the next try may start at once. */
+export function l11Line(w: number, reason: string, n: number, retryAtMs: number | null): string {
+  const tail = retryAtMs === null ? '' : `; the next try is after ${retryTime(retryAtMs)}`;
+  return `[Shards] Called off the reshard to ${w} shards: ${reason}; the bot keeps ${n} shards${tail}`;
+}
+
+/** NB9 L12 (E7). */
+export function l12Line(w: number, reason: string): string {
+  return `[Shards] The reshard to ${w} shards was called off (${reason}); this standby process stops`;
+}
+
+/** NB9 L12's replaced form (E7): the row names another attempt, toward W2. */
+export function l12ReplacedLine(w: number, w2: number): string {
+  return `[Shards] The reshard to ${w} shards has ended and a reshard to ${w2} shards has started in its place; this standby process stops`;
+}
+
+/** NB9 L12's form when the row names no attempt (E8). */
+export function l12GoneLine(w: number): string {
+  return `[Shards] The reshard to ${w} shards has ended: the database no longer records it; this standby process stops`;
+}
+
+/** NB9 L22's promoted form (D4, E3): the cause capitalised. */
+export function l22PromotedLine(cause: string): string {
+  return `[Shards] ${cause.charAt(0).toUpperCase()}${cause.slice(1)} before this process served the new shards; asking the web UI process to restart it`;
+}
+
+/** NB9 L33 (D4). */
+export const L33_LINE = '[Shards] The database was not verified 300 s after this process was promoted to run the new shards; releasing them now';
+/** NB9 D4: the restart ask's reason after L33. */
+export const L33_RESTART_REASON = 'The database was not verified 300 s after this process was promoted to run the new shards';
+
+/** NB9 L22's standby form (E6). */
+export function l22Line(cause: string): string {
+  return `[Shards] Standby: ${cause}; this standby process stops`;
+}
+
+/** NB9 L22's loss cause. */
+export function lossCause(shardId: number): string {
+  return `shard ${shardId}'s claim is no longer this process's`;
+}
+
+/**
+ * Decision 12's completed lines, built from what the release statement returned; at a hand-over (NB9 9) H5 in place
+ * of the kept line. Each shard is named once (E5): one the release returned is never also "no longer held".
+ */
+export function releaseLines(asked: Pair[], reserved: Pair[], rows: Array<{ shardId: number; claim: number; wasReserved: boolean; handedTo: string | null }>, ttlMs: number, handOver?: { from: number; to: number }): string[] {
   const lines: string[] = [];
   const ttl = Math.round(ttlMs / 1000);
   const kept = rows.filter(r => !r.wasReserved && r.handedTo === null).map(r => r.shardId);
   const keptReserved = rows.filter(r => r.wasReserved).map(r => r.shardId);
-  if (kept.length > 0) lines.push(`[Shards] Released shards ${idList(kept)}: kept for this machine's next start for ${ttl} s, then free to any machine with room`);
+  if (kept.length > 0 && handOver) lines.push(h5Line(kept, handOver.from, handOver.to));
+  else if (kept.length > 0) lines.push(`[Shards] Released shards ${idList(kept)}: kept for this machine's next start for ${ttl} s, then free to any machine with room`);
   if (keptReserved.length > 0) lines.push(`[Shards] Reserved shards ${idList(keptReserved)} stay kept for this machine's next start for ${ttl} s, then free to any machine with room`);
   for (const r of rows) if (r.handedTo !== null && !r.wasReserved) lines.push(`[Shards] Handed shard ${r.shardId} to ${r.handedTo}`);
-  const returned = new Set(rows.map(r => `${r.shardId}:${r.claim}`));
+  const returned = new Set(rows.map(r => r.shardId));
   void reserved;
+  const named = new Set<number>();
   for (const pair of asked) {
-    if (!returned.has(`${pair.shardId}:${pair.claim}`)) lines.push(`[Shards] Shard ${pair.shardId} was no longer held by this process at the release`);
+    if (returned.has(pair.shardId) || named.has(pair.shardId)) continue;
+    named.add(pair.shardId);
+    lines.push(`[Shards] Shard ${pair.shardId} was no longer held by this process at the release`);
   }
   return lines;
+}
+
+/** NB9 H5: the release at a hand-over. */
+export function h5Line(ids: number[], from: number, to: number): string {
+  return `[Shards] Released the old shard(s) ${idList(ids)} of the ${from}-shard set: the ${to} new shards take their servers once every old shard is released`;
 }
 
 /**

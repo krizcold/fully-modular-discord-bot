@@ -70,8 +70,9 @@ function takeScript(nextval: string, floor = '0', hang?: RegExp) {
     if (hang?.test(text)) return 'hang';
     if (/pg_advisory_xact_lock/.test(text)) return { rows: [{}] };
     if (/FROM smdb_data\.claim_clock/.test(text)) return { rows: [{ up_ms: '0', u_prime: '0', now_ms: 0 }] };
+    if (/LEFT JOIN smdb_data\.reshard/.test(text)) return { rows: [{ attempt: null, state: null, from_count: null, to_count: null, target: null, target_by: null, target_at: null, meta_count: null }] };
     if (/FROM smdb_data\.meta/.test(text)) return { rows: [] };
-    if (/FROM smdb_data\.shard_claims$/.test(text.trim()) || /AS renewed_ago_ms FROM smdb_data\.shard_claims/.test(text)) return { rows: [] };
+    if (/FROM smdb_data\.shard_claims( WHERE shard_count = \$1)?$/.test(text.trim()) || /AS renewed_ago_ms FROM smdb_data\.shard_claims/.test(text)) return { rows: [] };
     if (/FROM smdb_data\.shard_nodes/.test(text)) return { rows: [] };
     if (/AS floor/.test(text)) return { rows: [{ floor }] };
     if (/nextval/.test(text)) return { rows: [{ n: nextval }] };

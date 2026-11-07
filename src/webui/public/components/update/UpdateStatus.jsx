@@ -334,7 +334,7 @@ function UpdateStatus({ api, status, onRefresh }) {
             {status.safety.crashHistory.slice(-5).map((crash, i) => (
               <div key={i} className="crash-item">
                 <span>{formatTimestamp(crash.timestamp)}</span>
-                <span>Exit Code: {crash.exitCode}</span>
+                {crash.exitCode !== null && crash.exitCode !== undefined && <span>Exit Code: {crash.exitCode}</span>}
                 {crash.signal && <span>Signal: {crash.signal}</span>}
               </div>
             ))}

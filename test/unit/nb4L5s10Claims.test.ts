@@ -94,7 +94,7 @@ async function rig(o: RigOpts) {
   const plan = { takes: [], wait: null, heldElsewhere: 0, elsewhere: [], waitingForOwner: 0, leftToOthers: 0 };
   const done = (ids: number[]): TakeAnswer => ({
     kind: 'done', shardCount: count, taken: ids.map(id => ({ pair: { shardCount: count, shardId: id, claim: 1 }, above: null })),
-    plan, adopted: null, predecessorRenewedAt: new Map(),
+    plan, predecessorRenewedAt: new Map(),
   });
   const store: ClaimStoreApi = {
     async renew(req) {
@@ -192,13 +192,12 @@ describe('the reservation of a running process (decision 10)', () => {
     expect(r.claims.snapshot().reserved.map(p => p.shardId)).toEqual([2, 3]);
   });
 
-  it('a stored count that differs from the boot count sends a take even when no shard is free', async () => {
+  it('a stored count that differs from the boot count sends no take (NB9 C1)', async () => {
     const r = await rig({ boot: [0, 1] });
     const others = [0, 1, 2, 3, 4, 5].map(id => row(6, id, { holderProcess: 'p-b', holderNode: 'node-b', holderName: 'B', homeNode: 'node-b' }));
     r.setPage(page(others, [nodeB()], 6));
     await r.cycle();
-    expect(r.reserveTakes()).toHaveLength(1);
-    expect(r.reserveTakes()[0]).toMatchObject({ reserve: true, boot: false, localCount: 4 });
+    expect(r.reserveTakes()).toHaveLength(0);
   });
 
   it('a reservation ages from the take\'s BEGIN, and is given up after the TTL with the seconds it waited', async () => {

@@ -185,12 +185,12 @@ describe('NB16-DL-2: a store that is not fresh gets no new store id while the ma
     expect(sent.filter(s => /^(COMMIT|ROLLBACK)$/.test(s))).toEqual(['ROLLBACK']);
   });
 
-  it('a store with its store_id row gets the claim_clock row and no store id insert', async () => {
+  it('a store with its store_id row gets the seed rows and no store id insert', async () => {
     quiet();
     const { backend, sent } = scripted({ version: [{ value: CURRENT }] });
     await internals(backend).provision();
     expect(await backend.provisionVerdict()).toEqual({ state: 'provisioned' });
-    expect(writes(sent).map(s => s.split('(')[0].trim())).toEqual(['INSERT INTO smdb_data.claim_clock']);
+    expect(writes(sent).map(s => s.split('(')[0].trim())).toEqual(['INSERT INTO smdb_data.claim_clock', 'INSERT INTO smdb_data.reshard']);
     expect(sent[sent.length - 1]).toBe('COMMIT');
   });
 });

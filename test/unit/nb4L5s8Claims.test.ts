@@ -26,7 +26,6 @@ function done(pairs: Pair[]): TakeAnswer {
     shardCount: 2,
     taken: pairs.map(pair => ({ pair, above: null })),
     plan: { wait: null, elsewhere: [], takes: [] } as never,
-    adopted: null,
     predecessorRenewedAt: new Map(),
   };
 }
@@ -291,6 +290,7 @@ describe('the stop-serving step and the reports after it', () => {
 
 describe('reservations and the restart request', () => {
   async function reserving(r: ReturnType<typeof rig>, pairs: Pair[]) {
+    await holding(r, []);
     r.store.takes.push(done(pairs));
     r.claims.noteGranted();
     await r.claims.renewOnce();

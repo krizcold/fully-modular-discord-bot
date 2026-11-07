@@ -3,7 +3,6 @@ import { describe, expect, it } from 'vitest';
 import {
   aboveReason,
   claimState,
-  decideShardCount,
   planReturns,
   planTake,
   type ClaimRow,
@@ -73,31 +72,6 @@ describe('nb4L5s2 planTake order and no-room count', () => {
     const plan = planTake({ me: ME, capacity: 0, boot: false, known: [], shardCount: 3, rows, nodes, upMs: UP, uPrimeMs: UP });
     expect(takeIds(plan.takes)).toEqual([[0, 'no-room'], [1, 'no-room']]);
     expect(plan.leftToOthers).toBe(1);
-  });
-});
-
-describe('nb4L5s2 decideShardCount', () => {
-  const live = row(0, { expiresUpMs: UP + 10_000 });
-  const releasedLive = row(1, { released: true, expiresUpMs: UP + 10_000 });
-
-  it('writes the local count and deletes other counts when none is stored', () => {
-    expect(decideShardCount(null, 4, [], UP)).toEqual({ kind: 'use', count: 4, write: true, deleteOthers: true, adopted: null });
-  });
-
-  it('uses the stored count unchanged when the local one matches, even with live rows', () => {
-    expect(decideShardCount(4, 4, [live], UP)).toEqual({ kind: 'use', count: 4, write: false, deleteOthers: false, adopted: null });
-  });
-
-  it('uses the stored count unchanged when no local count is set', () => {
-    expect(decideShardCount(4, null, [], UP)).toEqual({ kind: 'use', count: 4, write: false, deleteOthers: false, adopted: null });
-  });
-
-  it('keeps the stored count while one row is live, even beside a released row', () => {
-    expect(decideShardCount(4, 6, [live, releasedLive], UP)).toEqual({ kind: 'use', count: 4, write: false, deleteOthers: false, adopted: { local: 6 } });
-  });
-
-  it('switches to the local count when the only unexpired row is released', () => {
-    expect(decideShardCount(4, 6, [releasedLive], UP)).toEqual({ kind: 'use', count: 6, write: true, deleteOthers: true, adopted: null });
   });
 });
 

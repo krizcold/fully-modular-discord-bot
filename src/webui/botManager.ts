@@ -18,6 +18,8 @@ import type { NotifyOutcome } from '../bot/internalSetup/utils/subscriptionNotif
 import { readMaintenanceFile } from '../utils/maintenanceFile';
 import { heldClauses } from '../bot/internalSetup/utils/heldWords';
 import type { RunningMigration } from '../bot/internalSetup/utils/dataMigration';
+import { standbyAskVerdict, untilSeconds } from '../bot/internalSetup/fleet/reshardRules';
+import { IDENTIFY_SPACING_MS } from '../bot/internalSetup/fleet/constants';
 
 const MIGRATION_RUNNING = 'A data migration is running';
 
@@ -46,6 +48,56 @@ const ANSWER_BY_NS = 45_000_000_000n;
 /** The op in progress gets this long to land or cancel when the web UI exits. */
 const LOCAL_CHAIN_EXIT_MS = 10_000;
 const ROUTE_POLL_MS = 250;
+/** NB9 50: a memory reading older than this does not show room for a second bot process. */
+const READING_FRESH_MS = 15 * 60_000;
+/** NB9 15: the JSON bot process answers 'reshard:retire' within this. */
+const RETIRE_ANSWER_MS = 5_000;
+
+export const b1Line = (w: number): string => `[BotManager] Starting a second bot process for the reshard to ${w} shards`;
+export const b2Line = (reason: string): string => `[BotManager] Not starting a second bot process for the reshard: ${reason}`;
+export const b3Line = (w: number): string => `[BotManager] The bot process hands over to the second bot process for the reshard to ${w} shards`;
+export const B4_LINE = '[BotManager] The second bot process now runs the bot';
+export const b5Line = (code: number | null, signal: string | null, reason: string | null): string =>
+  `[BotManager] The second bot process for the reshard exited (code ${code}, signal ${signal}) before the hand-over${reason ? `: ${reason}` : ''}`;
+export const b6Line = (cause: string): string => `[BotManager] Stopping the second bot process for the reshard: ${cause}`;
+export const B7_LINE = '[BotManager] The bot process finished its hand-over, but the second bot process is not running; starting a new bot process';
+export const b8Line = (cause: string): string => `[BotManager] Not acting on the bot process's hand-over yet: ${cause}; it asks again within 60 s`;
+export const b9Line = (seconds: number): string =>
+  `[BotManager] The bot process did not exit ${seconds} s after it was killed during its hand-over; starting a new bot process, which waits until the old one has exited`;
+export const b15Line = (signal: string | null): string => `[BotManager] BOT CRASHED - Killed by signal ${signal} with no stop asked`;
+
+/** The manager's memory reading (NB9 19, 51), kept with the monotonic time it arrived. */
+export interface MemoryReading {
+  room: boolean | null;
+  useMb: number | null;
+  freeMb: number | null;
+  at: string;
+  error?: string;
+}
+
+/** NB9 18, 30, 34, 49: the second bot process of a reshard while it is not the bot process. */
+interface StandbyChild {
+  child: ChildProcess;
+  attempt: string;
+  to: number;
+  json: boolean;
+  forkedAt: number;
+  deadline: NodeJS.Timeout | null;
+  held: number;
+  ready: number;
+  /** Its stop handshake was answered false: it stops on its own. */
+  abandoning: boolean;
+  /** B6 stopped it. */
+  stopAsked: boolean;
+  /** The reason and kind its handshake gave. */
+  stopReason: string | null;
+  stopKind: string | null;
+  /** The JSON bot process accepted the retire: the deadline no longer applies. */
+  accepted: boolean;
+}
+
+const monoMs = (): number => performance.now();
+const childGone = (child: ChildProcess): boolean => child.exitCode !== null || child.signalCode !== null;
 
 /** The stage a child must have reported before a message type can be sent to it (its handler is registered by then). */
 export function ipcStageOf(type: string): 'shared' | 'guild' {
@@ -233,6 +285,25 @@ export interface LogsResponse {
  * Manages the Discord bot as a child process
  * Handles lifecycle (start, restart, shutdown) and log collection
  */
+/** The bot's entry: dist in production, the TypeScript source under ts-node in development. */
+function botEntry(): { entry: string; isProd: boolean } {
+  const isProd = process.env.NODE_ENV !== 'development';
+  const entry = isProd
+    ? path.join(__dirname, '..', 'bot', 'index.js') // dist/bot/index.js
+    : path.join(__dirname, '..', 'bot', 'index.ts'); // src/bot/index.ts
+  return { entry, isProd };
+}
+
+/** A bot process forked as start() forks it, with the env given on top. */
+function forkBot(credentials: BotCredentials, extra: Record<string, string>): ChildProcess {
+  const { entry, isProd } = botEntry();
+  return fork(entry, [], {
+    env: { ...process.env, ...credentials, BOT_PROCESS_ROLE: 'bot', ...(hookListInUse() !== null ? { DATA_BACKEND_URL: hookListInUse()! } : {}), ...extra },
+    silent: true, // Capture stdout/stderr
+    execArgv: isProd ? [] : ['-r', 'ts-node/register'] // Use ts-node in development
+  });
+}
+
 export class BotManager {
   private botProcess: ChildProcess | null = null;
   private logs: string[] = []; // Circular buffer (10k lines)
@@ -303,6 +374,16 @@ export class BotManager {
   private chainCurrent: { entry: LocalEntry; done: Promise<void> } | null = null;
   private chainHolds = false;
   private chainDeposed: LockHolder | null = null;
+  // NB9: the reshard's second bot process, the child handing over to it, and the attempt of the last fork.
+  private standby: StandbyChild | null = null;
+  private retiring: { child: ChildProcess; attempt: string | null; stops: number } | null = null;
+  private forkedFor: string | null = null;
+  // NB9 65: the last exit nobody asked for while a standby lived.
+  private overlapEnded: { attempt: string; code: number | null; signal: string | null } | null = null;
+  private memoryReading: (MemoryReading & { arrivedMs: number }) | null = null;
+  private retireHeldLogged = new Set<string>();
+  // NB9 16: the last identify grant per bucket, across every child.
+  private identifyGrants = new Map<number, number>();
 
   /** Wire the web-UI listener stop/start hooks (owned by startWebUI). */
   setWebUiControl(control: { stop: () => void; start: () => void }): void {
@@ -433,7 +514,6 @@ export class BotManager {
     this.operationInProgress = true;
     // An operator's start begins a fresh count of automatic ones.
     if (!this.startingAfterCrash) this.crashRestarts = 0;
-    this.stopRequested = false;
 
     // Load and validate credentials
     const credentials = loadCredentials();
@@ -449,207 +529,23 @@ export class BotManager {
       };
     }
 
-    // Determine bot entry point
-    const isProd = process.env.NODE_ENV !== 'development';
-    const botEntryPoint = isProd
-      ? path.join(__dirname, '..', 'bot', 'index.js') // dist/bot/index.js
-      : path.join(__dirname, '..', 'bot', 'index.ts'); // src/bot/index.ts
+    if (!this.startingAfterCrash && this.crashRestartTimer) {
+      clearTimeout(this.crashRestartTimer);
+      this.crashRestartTimer = null;
+      console.log('[BotManager] The automatic start after the crash was called off: the bot is being started now');
+    }
 
-    console.log(`[BotManager] Starting bot from: ${botEntryPoint}`);
+    console.log(`[BotManager] Starting bot from: ${botEntry().entry}`);
 
     try {
       // Fork bot process with credentials. BOT_PROCESS_ROLE marks the child
       // so code that must run in exactly one process (e.g. payment-provider
       // tick loops) can tell which side it's on.
-      this.botProcess = fork(botEntryPoint, [], {
-        env: { ...process.env, ...credentials, BOT_PROCESS_ROLE: 'bot', ...(hookListInUse() !== null ? { DATA_BACKEND_URL: hookListInUse()! } : {}) },
-        silent: true, // Capture stdout/stderr
-        execArgv: isProd ? [] : ['-r', 'ts-node/register'] // Use ts-node in development
-      });
-
-      const child = this.botProcess;
-      this.childMode = 'running';
-      this.childHeld = null;
-      this.childMaintenanceBoot = false;
-      this.childModeReported = false;
-      this.childStoreReported = false;
-      this.childLoggedIn = false;
-      this.childEnterAnswer = null;
-      this.childStage = 'none';
-      this.childWaitHolder = null;
-      this.childWaitCause = null;
-      this.childWaitReadCause = null;
-      this.childDeposedHolder = null;
-      this.stopKind = null;
+      const child = forkBot(credentials, {});
       if (typeof child.pid === 'number') this.unexitedChildren.set(child.pid, child);
-      this.lastChild = child;
-      this.lastChildExited = false;
-      // Ops queued in the local chain that have not started are routed again: the child waits for the one in progress.
-      this.rerouteQueued();
-      // A new child serves no store until it reports one.
-      noteWebuiChild('started');
-      this.botStartTime = Date.now();
-      this.crashed = false;
-
-      // Capture stdout
-      if (this.botProcess.stdout) {
-        this.botProcess.stdout.on('data', (data: Buffer) => {
-          const logLine = data.toString();
-          this.addLog(logLine);
-          if (this.botProcess === child && logLine.includes('Logged in as')) {
-            this.childLoggedIn = true;
-            this.childModeReported = true;
-          }
-          process.stdout.write(`[Bot] ${logLine}`); // Also write to parent stdout for Docker logs
-        });
-      }
-
-      // Capture stderr
-      if (this.botProcess.stderr) {
-        this.botProcess.stderr.on('data', (data: Buffer) => {
-          const logLine = `[ERROR] ${data.toString()}`;
-          this.addLog(logLine);
-          process.stderr.write(`[Bot] ${logLine}`); // Also write to parent stderr for Docker logs
-        });
-      }
-
-      // Handle process exit
-      this.botProcess.on('exit', (code, signal) => {
-        if (this.lastChild === child) this.lastChildExited = true;
-        if (typeof child.pid === 'number' && this.unexitedChildren.get(child.pid) === child) this.unexitedChildren.delete(child.pid);
-        this.failStageWaiters(child);
-        // A child still draining when its shutdown moved the handle on exits
-        // later; that exit is not its successor's.
-        if (this.botProcess !== child) {
-          console.log(`[BotManager] A previous bot child exited with code: ${code}, signal: ${signal}`);
-          return;
-        }
-        console.log(`[BotManager] Bot exited with code: ${code}, signal: ${signal}`);
-
-        if (code === EXIT_DEPOSED) {
-          // Another process took the data files' lock: not a crash; a new child waits for the lock.
-          this.crashed = false;
-          let holder = this.childDeposedHolder;
-          if (!holder) {
-            const read = readWriterHolder();
-            holder = read.kind === 'held' ? { role: read.holder.role ?? null, pid: read.holder.pid } : null;
-          }
-          console.warn(holder
-            ? `[BotManager] The bot process stopped: ${holderWords({ role: holder.role ?? undefined })} (pid ${holder.pid}) took the data files' lock`
-            : "[BotManager] The bot process stopped: another process took the data files' lock");
-          if (this.stopRequested) {
-            console.log('[BotManager] The exit followed a requested stop; not starting the bot again');
-          } else {
-            this.crashRestartTimer = setTimeout(() => {
-              this.crashRestartTimer = null;
-              this.runCrashRestart();
-            }, CRASH_RESTART_DELAY_MS).unref();
-          }
-        } else if (code !== 0 && code !== null) {
-          // Bot crashed!
-          this.crashed = true;
-          this.crashLogs = [...this.logs];
-          this.addLog(`\n[BotManager] BOT CRASHED - Exit code: ${code}\n`);
-
-          // Record crash to safety manager
-          this.safetyManager.recordCrash(code, signal, this.crashLogs);
-
-          this.emitEvent('bot:crash', { code, signal, logs: this.crashLogs });
-          // A child that stays down is a dead bot behind a container
-          // that still reads running.
-          if (this.botStartTime > 0 && Date.now() - this.botStartTime >= CRASH_STABLE_UPTIME_MS) this.crashRestarts = 0;
-          if (this.stopRequested) {
-            console.log('[BotManager] The exit followed a requested stop; not starting the bot again');
-          } else if (this.isInSafeMode()) {
-            console.error('[BotManager] Safe mode: the bot stays down after this crash');
-          } else if (this.crashRestarts >= CRASH_RESTARTS_MAX) {
-            console.error(`[BotManager] The bot stays down: ${this.crashRestarts} automatic starts in a row ended in a crash before ${CRASH_STABLE_UPTIME_MS / 60_000} minutes of uptime; start it by hand`);
-          } else {
-            this.crashRestarts += 1;
-            console.warn(`[BotManager] Starting the bot again in ${CRASH_RESTART_DELAY_MS / 1000}s (automatic start ${this.crashRestarts} of ${CRASH_RESTARTS_MAX})`);
-            this.crashRestartTimer = setTimeout(() => {
-              this.crashRestartTimer = null;
-              this.runCrashRestart();
-            }, CRASH_RESTART_DELAY_MS).unref();
-          }
-        } else {
-          // Clean exit
-          this.crashed = false;
-          this.crashLogs = [];
-        }
-
-        this.botProcess = null;
-        noteWebuiChild('gone');
-        this.botStartTime = 0;
-        this.failPendingIpc('bot process exited before replying');
-        this.emitEvent('bot:status', this.getStatus());
-      });
-
-      // Handle process errors
-      this.botProcess.on('error', (error) => {
-        console.error('[BotManager] Bot process error:', error);
-        this.addLog(`[BotManager] Process error: ${error.message}`);
-      });
-
-      // Handle IPC messages from bot (for real-time panel updates)
-      this.botProcess.on('message', (message: any) => {
-        // A draining previous child still reports; only the current one may
-        // move the manager's state.
-        if (this.botProcess !== child) return;
-        if (message.type === 'data:writer') {
-          this.noteWriterStage(child, message.data);
-        } else if (message.type === 'panel:live_update') {
-          this.emitPanelUpdate(message.data);
-        } else if (message.type === 'metrics:snapshot') {
-          if (this.wsManager) {
-            this.wsManager.broadcast('bot:metrics:snapshot', message.data);
-          }
-        } else if (message.type === 'fleet:status') {
-          if (this.wsManager) {
-            this.wsManager.broadcast('bot:fleet:status', message.data);
-          }
-        } else if (message.type === 'data:store') {
-          // The parent's reader follows the store the child serves, never only
-          // the node's own /data/.env.
-          const data = message.data ?? {};
-          setWebuiDataStoreUrl({
-            url: typeof data.url === 'string' ? data.url : null,
-            ...(data.choosing === true ? { choosing: true as const } : {}),
-            ...(data.held === true ? { held: true as const } : {}),
-            ...(typeof data.reason === 'string' ? { reason: data.reason } : {}),
-          });
-          this.childModeReported = true;
-          this.childStoreReported = true;
-        } else if (message.type === 'data:addresses-ack') {
-          this.noteAddressesAck(message.data);
-        } else if (message.type === 'maintenance:mode') {
-          if (typeof message.data?.mode === 'string') {
-            if (message.data.boot === true) {
-              this.childMaintenanceBoot = true;
-              noteWebuiChild('maintenance-boot');
-            }
-            this.childModeReported = true;
-            this.childMode = message.data.mode;
-            this.childHeld = childHeldOf(this.childMode, message.data.held);
-            this.emitEvent('bot:status', this.getStatus());
-          }
-        } else if (message.type === 'control:restart-bot') {
-          console.warn(`[BotManager] The bot process asked for a restart: ${typeof message.data?.reason === 'string' ? message.data.reason : 'no reason given'}`);
-          void this.requestRestart().then(result => {
-            if (!result.success) console.error(`[BotManager] The restart the bot process asked for did not happen: ${result.error ?? result.reason ?? 'unknown'}`);
-          });
-        } else if (message.type === 'control:shutdown-bot') {
-          // Access-log channel "Shut down bot" button: stop the Discord bot child.
-          console.warn('[BotManager] control:shutdown-bot received from access-log action');
-          void this.shutdown(false);
-        } else if (message.type === 'control:stop-webui') {
-          console.warn('[BotManager] control:stop-webui received; stopping the web-UI listener (bot stays connected)');
-          this.webuiControl?.stop();
-        } else if (message.type === 'control:start-webui') {
-          console.warn('[BotManager] control:start-webui received; restarting the web-UI listener');
-          this.webuiControl?.start();
-        }
-      });
+      this.attachChild(child);
+      this.adoptAsCurrent(child);
+      this.pushMemory(child);
 
       // Wait a bit to see if bot starts successfully
       await this.waitForBotReady(5000);
@@ -697,6 +593,512 @@ export class BotManager {
     }
   }
 
+  /** NB9 39 and C6: every field that describes the current child, set when a child becomes current. */
+  private adoptAsCurrent(child: ChildProcess): void {
+    this.botProcess = child;
+    this.childMode = 'running';
+    this.childHeld = null;
+    this.childMaintenanceBoot = false;
+    this.childModeReported = false;
+    this.childStoreReported = false;
+    this.childLoggedIn = false;
+    this.childEnterAnswer = null;
+    this.childStage = 'none';
+    this.childWaitHolder = null;
+    this.childWaitCause = null;
+    this.childWaitReadCause = null;
+    this.childDeposedHolder = null;
+    this.stopKind = null;
+    this.lastChild = child;
+    this.lastChildExited = false;
+    this.retireHeldLogged.clear();
+    // Ops queued in the local chain that have not started are routed again: the child waits for the one in progress.
+    this.rerouteQueued();
+    // A new child serves no store until it reports one.
+    noteWebuiChild('started');
+    this.botStartTime = Date.now();
+    this.crashed = false;
+    this.stopRequested = false;
+  }
+
+  /** NB9 26 and 40: one wiring per child; each event is decided by what the child is when it arrives. */
+  private attachChild(child: ChildProcess): void {
+    child.stdout?.on('data', (data: Buffer) => {
+      const text = data.toString();
+      const logLine = this.standby?.child === child ? `[Standby] ${text}` : text;
+      this.addLog(logLine);
+      if (this.botProcess === child && text.includes('Logged in as')) {
+        this.childLoggedIn = true;
+        this.childModeReported = true;
+      }
+      process.stdout.write(`[Bot] ${logLine}`); // Also write to parent stdout for Docker logs
+    });
+
+    child.stderr?.on('data', (data: Buffer) => {
+      const logLine = `${this.standby?.child === child ? '[Standby] ' : ''}[ERROR] ${data.toString()}`;
+      this.addLog(logLine);
+      process.stderr.write(`[Bot] ${logLine}`); // Also write to parent stderr for Docker logs
+    });
+
+    child.on('exit', (code, signal) => {
+      if (this.lastChild === child) this.lastChildExited = true;
+      if (typeof child.pid === 'number' && this.unexitedChildren.get(child.pid) === child) this.unexitedChildren.delete(child.pid);
+      this.failStageWaiters(child);
+      if (this.retiring?.child === child) {
+        if (this.botProcess === child) {
+          console.log(`[BotManager] Bot exited with code: ${code}, signal: ${signal}`);
+          this.currentChildGone('bot process exited before replying');
+        }
+        this.promote(false);
+        return;
+      }
+      if (this.botProcess === child) {
+        this.botProcessExit(code, signal);
+        return;
+      }
+      if (this.standby?.child === child) {
+        this.standbyExit(code, signal);
+        return;
+      }
+      // A child still draining when its shutdown moved the handle on exits
+      // later; that exit is not its successor's.
+      console.log(`[BotManager] A previous bot child exited with code: ${code}, signal: ${signal}`);
+    });
+
+    child.on('error', (error) => {
+      console.error('[BotManager] Bot process error:', error);
+      this.addLog(`[BotManager] Process error: ${error.message}`);
+    });
+
+    child.on('message', (message: any) => {
+      if (!message || typeof message !== 'object') return;
+      // A draining previous child still reports; only the current one and the standby may move the manager's state.
+      if (this.botProcess === child) this.botProcessMessage(child, message);
+      else if (this.standby?.child === child) this.standbyMessage(child, message);
+    });
+  }
+
+  /** Today's tail of a current child's exit or give-up. */
+  private currentChildGone(pending: string): void {
+    this.botProcess = null;
+    noteWebuiChild('gone');
+    this.botStartTime = 0;
+    this.failPendingIpc(pending);
+  }
+
+  /** NB9 40 branch (2): the current child's exit, with 65's mark and 62's crash test after NB10's code 75. */
+  private botProcessExit(code: number | null, signal: NodeJS.Signals | null): void {
+    console.log(`[BotManager] Bot exited with code: ${code}, signal: ${signal}`);
+    this.markOverlapEnd(code, signal);
+
+    if (code === EXIT_DEPOSED) {
+      // Another process took the data files' lock: not a crash; a new child waits for the lock.
+      this.crashed = false;
+      let holder = this.childDeposedHolder;
+      if (!holder) {
+        const read = readWriterHolder();
+        holder = read.kind === 'held' ? { role: read.holder.role ?? null, pid: read.holder.pid } : null;
+      }
+      console.warn(holder
+        ? `[BotManager] The bot process stopped: ${holderWords({ role: holder.role ?? undefined })} (pid ${holder.pid}) took the data files' lock`
+        : "[BotManager] The bot process stopped: another process took the data files' lock");
+      if (this.stopRequested) {
+        console.log('[BotManager] The exit followed a requested stop; not starting the bot again');
+      } else {
+        this.crashRestartTimer = setTimeout(() => {
+          this.crashRestartTimer = null;
+          this.runCrashRestart();
+        }, CRASH_RESTART_DELAY_MS).unref();
+      }
+    } else if (code !== 0 && !(code === null && this.stopRequested)) {
+      // Bot crashed! A kill by a signal with no stop asked since the child's adoption is one too (NB9 62).
+      this.crashed = true;
+      this.crashLogs = [...this.logs];
+      this.addLog(code === null ? `\n${b15Line(signal)}\n` : `\n[BotManager] BOT CRASHED - Exit code: ${code}\n`);
+
+      // Record crash to safety manager
+      this.safetyManager.recordCrash(code, signal, this.crashLogs);
+
+      this.emitEvent('bot:crash', { code, signal, logs: this.crashLogs });
+      // A child that stays down is a dead bot behind a container
+      // that still reads running.
+      if (this.botStartTime > 0 && Date.now() - this.botStartTime >= CRASH_STABLE_UPTIME_MS) this.crashRestarts = 0;
+      if (this.stopRequested) {
+        console.log('[BotManager] The exit followed a requested stop; not starting the bot again');
+      } else if (this.isInSafeMode()) {
+        console.error('[BotManager] Safe mode: the bot stays down after this crash');
+      } else if (this.crashRestarts >= CRASH_RESTARTS_MAX) {
+        console.error(`[BotManager] The bot stays down: ${this.crashRestarts} automatic starts in a row ended in a crash before ${CRASH_STABLE_UPTIME_MS / 60_000} minutes of uptime; start it by hand`);
+      } else {
+        this.crashRestarts += 1;
+        console.warn(`[BotManager] Starting the bot again in ${CRASH_RESTART_DELAY_MS / 1000}s (automatic start ${this.crashRestarts} of ${CRASH_RESTARTS_MAX})`);
+        this.crashRestartTimer = setTimeout(() => {
+          this.crashRestartTimer = null;
+          this.runCrashRestart();
+        }, CRASH_RESTART_DELAY_MS).unref();
+      }
+    } else {
+      // Clean exit
+      this.crashed = false;
+      this.crashLogs = [];
+    }
+
+    this.currentChildGone('bot process exited before replying');
+    this.emitEvent('bot:status', this.getStatus());
+  }
+
+  /**
+   * NB9 18 and 65: the current child exited with no retire, so its standby stops; an exit nobody asked for (no stop
+   * since its adoption, code not 75) while that standby lives marks its attempt.
+   */
+  private markOverlapEnd(code: number | null, signal: NodeJS.Signals | null): void {
+    const standby = this.standby;
+    if (!standby || childGone(standby.child)) return;
+    if (!this.stopRequested && code !== EXIT_DEPOSED) this.overlapEnded = { attempt: standby.attempt, code, signal };
+    this.stopStandby('the bot process exited');
+  }
+
+  /** The current child's messages. */
+  private botProcessMessage(child: ChildProcess, message: any): void {
+    if (message.type === 'control:reshard-standby') {
+      this.standbyAsk(child, message.data);
+    } else if (message.type === 'control:reshard-retire') {
+      this.retireAsk(child, message.data);
+    } else if (message.type === 'identify:slot') {
+      this.identifySlot(child, message.data);
+    } else if (message.type === 'reshard:standby-stopping') {
+      // NB9 30: the asker is the bot process now, so it was promoted.
+      this.sendTo(child, { type: 'reshard:standby-stop-answer', data: { promoted: true } });
+    } else if (message.type === 'data:writer') {
+      this.noteWriterStage(child, message.data);
+    } else if (message.type === 'panel:live_update') {
+      this.emitPanelUpdate(message.data);
+    } else if (message.type === 'metrics:snapshot') {
+      if (this.wsManager) {
+        this.wsManager.broadcast('bot:metrics:snapshot', message.data);
+      }
+    } else if (message.type === 'fleet:status') {
+      if (this.wsManager) {
+        this.wsManager.broadcast('bot:fleet:status', message.data);
+      }
+    } else if (message.type === 'data:store') {
+      // The parent's reader follows the store the child serves, never only
+      // the node's own /data/.env.
+      const data = message.data ?? {};
+      setWebuiDataStoreUrl({
+        url: typeof data.url === 'string' ? data.url : null,
+        ...(data.choosing === true ? { choosing: true as const } : {}),
+        ...(data.held === true ? { held: true as const } : {}),
+        ...(typeof data.reason === 'string' ? { reason: data.reason } : {}),
+      });
+      this.childModeReported = true;
+      this.childStoreReported = true;
+    } else if (message.type === 'data:addresses-ack') {
+      this.noteAddressesAck(message.data);
+    } else if (message.type === 'maintenance:mode') {
+      if (typeof message.data?.mode === 'string') {
+        if (message.data.boot === true) {
+          this.childMaintenanceBoot = true;
+          noteWebuiChild('maintenance-boot');
+        }
+        this.childModeReported = true;
+        this.childMode = message.data.mode;
+        this.childHeld = childHeldOf(this.childMode, message.data.held);
+        this.emitEvent('bot:status', this.getStatus());
+      }
+    } else if (message.type === 'control:restart-bot') {
+      console.warn(`[BotManager] The bot process asked for a restart: ${typeof message.data?.reason === 'string' ? message.data.reason : 'no reason given'}`);
+      void this.requestRestart().then(result => {
+        if (!result.success) console.error(`[BotManager] The restart the bot process asked for did not happen: ${result.error ?? result.reason ?? 'unknown'}`);
+      });
+    } else if (message.type === 'control:shutdown-bot') {
+      // Access-log channel "Shut down bot" button: stop the Discord bot child.
+      console.warn('[BotManager] control:shutdown-bot received from access-log action');
+      void this.shutdown(false);
+    } else if (message.type === 'control:stop-webui') {
+      console.warn('[BotManager] control:stop-webui received; stopping the web-UI listener (bot stays connected)');
+      this.webuiControl?.stop();
+    } else if (message.type === 'control:start-webui') {
+      console.warn('[BotManager] control:start-webui received; restarting the web-UI listener');
+      this.webuiControl?.start();
+    }
+  }
+
+  private sendTo(child: ChildProcess | null, message: object): void {
+    if (!child || childGone(child)) return;
+    try {
+      child.send(message);
+    } catch { /* the child is gone; its exit settles the rest */ }
+  }
+
+  /** NB9 19: the manager's memory reading, kept with the monotonic time it arrived. */
+  noteMemoryReading(reading: MemoryReading): void {
+    this.memoryReading = { ...reading, arrivedMs: monoMs() };
+    this.pushMemory(this.botProcess);
+    if (this.standby) this.pushMemory(this.standby.child);
+  }
+
+  /** NB9 19: the larger of the time since the reading arrived and the time since its `at`, at least 0. */
+  private memoryAgeMs(reading: MemoryReading & { arrivedMs: number }): number {
+    const sinceAt = Date.now() - Date.parse(reading.at);
+    return Math.max(monoMs() - reading.arrivedMs, Number.isFinite(sinceAt) ? sinceAt : 0, 0);
+  }
+
+  /** NB9 19 and 60: 'memory:reading' at each arrival and after each fork or promotion. */
+  private pushMemory(child: ChildProcess | null): void {
+    const reading = this.memoryReading;
+    if (!reading) return;
+    this.sendTo(child, {
+      type: 'memory:reading',
+      data: {
+        room: reading.room, useMb: reading.useMb, freeMb: reading.freeMb,
+        ...(reading.error !== undefined ? { error: reading.error } : {}),
+        ageMs: this.memoryAgeMs(reading),
+      },
+    });
+  }
+
+  /** B2's 'memory' reason for the reading held now, or null when it shows room (NB9 18, 33, 50). */
+  private memoryReason(): string | null {
+    const reading = this.memoryReading;
+    if (!reading) return 'the manager has sent no memory reading';
+    const ageMs = this.memoryAgeMs(reading);
+    if (ageMs > READING_FRESH_MS) return `the memory reading is ${Math.floor(ageMs / 60_000)} min old`;
+    if (reading.room === null) return `can't confirm there is room: the manager could not take the memory reading (${reading.error ?? 'no error given'})`;
+    if (reading.room === false) return `the memory reading shows no room (${reading.freeMb ?? '?'} MB free, ${reading.useMb ?? '?'} MB used)`;
+    return null;
+  }
+
+  /** NB9 50 as 65 orders it: the answer to 'control:reshard-standby' from the current child. */
+  private standbyAsk(child: ChildProcess, data: any): void {
+    const attempt = typeof data?.attempt === 'string' && data.attempt ? data.attempt : null;
+    const to = Number(data?.to);
+    if (attempt === null || !Number.isSafeInteger(to) || to < 1) return;
+    const living = this.standby !== null && this.standby.attempt === attempt && !childGone(this.standby.child);
+    const restarting = child.killed || this.stoppingRestart !== null || this.queuedRestart !== null;
+    const answer = standbyAskVerdict({
+      attempt,
+      exiting: this.exiting,
+      overlapEnded: this.overlapEnded,
+      standbyOfAttempt: living,
+      busy: restarting || this.operationInProgress,
+      busyReason: restarting ? 'the bot is being stopped or restarted' : 'another operation is in progress',
+      forkedFor: this.forkedFor,
+      memoryReason: this.memoryReason(),
+    });
+    if (answer.state === 'refused') {
+      console.warn(b2Line(answer.reason));
+      this.sendTo(child, { type: 'reshard:standby-state', data: { attempt, state: 'refused', kind: answer.kind, reason: answer.reason } });
+      return;
+    }
+    if (answer.state === 'started') {
+      try {
+        this.forkStandby(attempt, to, data);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Unknown error';
+        console.error('[BotManager] Error starting bot:', message);
+        if (data?.json === true) {
+          this.sendTo(child, {
+            type: 'reshard:standby-state',
+            data: { attempt, state: 'ended', reason: `the second bot process could not be started (${message})` },
+          });
+        }
+        return;
+      }
+    }
+    this.sendTo(child, { type: 'reshard:standby-state', data: { attempt, state: answer.state } });
+  }
+
+  /** NB9 7, 18 and 27: the standby forked as start() forks, with the reshard's env and its output marked. */
+  private forkStandby(attempt: string, to: number, data: any): void {
+    if (this.standby && !childGone(this.standby.child)) this.stopStandby('the second bot process is not the one for this reshard');
+    const json = data?.json === true;
+    const maxConcurrency = Number.isSafeInteger(Number(data?.maxConcurrency)) && Number(data.maxConcurrency) > 0 ? Number(data.maxConcurrency) : 1;
+    const entry = typeof data?.entry === 'string' ? data.entry : '';
+    const from = Number.isSafeInteger(data?.from) && data.from > 0 ? data.from : null;
+    const child = forkBot(loadCredentials(), {
+      SMDB_RESHARD_STANDBY: attempt,
+      SMDB_RESHARD_COUNT: String(to),
+      SMDB_RESHARD_INTENTS: String(Number(data?.intents) || 0),
+      SMDB_RESHARD_MC: String(maxConcurrency),
+      ...(!json && entry ? { SMDB_RESHARD_DB: entry } : {}),
+      ...(from !== null ? { SMDB_RESHARD_FROM: String(from) } : {}),
+    });
+    if (typeof child.pid === 'number') this.unexitedChildren.set(child.pid, child);
+    const standby: StandbyChild = {
+      child, attempt, to, json, forkedAt: monoMs(), deadline: null, held: 0, ready: 0,
+      abandoning: false, stopAsked: false, stopReason: null, stopKind: null, accepted: false,
+    };
+    this.standby = standby;
+    this.forkedFor = attempt;
+    this.attachChild(child);
+    console.log(b1Line(to));
+    this.pushMemory(child);
+    if (json) {
+      // NB9 15: a JSON standby not ready by U from its fork is stopped; the retire's acceptance ends the bound.
+      const seconds = untilSeconds('overlap', to, maxConcurrency);
+      standby.deadline = setTimeout(() => {
+        standby.deadline = null;
+        if (this.standby !== standby || standby.accepted || standby.stopAsked) return;
+        const cause = `not every new shard was connected within ${Math.round(seconds / 60)} min`;
+        this.stopStandby(cause);
+        this.sendTo(this.botProcess, { type: 'reshard:standby-state', data: { attempt, state: 'ended', reason: cause } });
+      }, seconds * 1000);
+      standby.deadline.unref?.();
+    }
+  }
+
+  /** B6: the standby is stopped through its stop handler (SIGTERM), and killed if it outlives the stop wait. */
+  private stopStandby(cause: string): void {
+    const standby = this.standby;
+    if (!standby || standby.stopAsked || childGone(standby.child)) return;
+    standby.stopAsked = true;
+    if (standby.deadline) { clearTimeout(standby.deadline); standby.deadline = null; }
+    console.warn(b6Line(cause));
+    const { child } = standby;
+    try {
+      child.kill('SIGTERM');
+    } catch { /* already gone */ }
+    const kill = setTimeout(() => {
+      if (!childGone(child)) {
+        try { child.kill('SIGKILL'); } catch { /* already gone */ }
+      }
+    }, CHILD_STOP_WAIT_MS);
+    kill.unref?.();
+    child.once('exit', () => clearTimeout(kill));
+  }
+
+  /** The standby's own messages (NB9 26, 30, 15, 16). */
+  private standbyMessage(child: ChildProcess, message: any): void {
+    const standby = this.standby!;
+    const data = message.data;
+    if (message.type === 'reshard:standby-progress') {
+      standby.held = Number(data?.held) || 0;
+      standby.ready = Number(data?.ready) || 0;
+    } else if (message.type === 'reshard:standby-ready') {
+      if (standby.json) void this.askJsonRetire(standby);
+    } else if (message.type === 'reshard:standby-stopping') {
+      standby.abandoning = true;
+      standby.stopReason = typeof data?.reason === 'string' && data.reason ? data.reason : null;
+      standby.stopKind = typeof data?.kind === 'string' ? data.kind : null;
+      this.sendTo(child, { type: 'reshard:standby-stop-answer', data: { promoted: false } });
+    } else if (message.type === 'identify:slot') {
+      this.identifySlot(child, data);
+    }
+  }
+
+  /** NB9 15: a ready JSON standby; the bot process is asked to retire and answers within 5 s. */
+  private async askJsonRetire(standby: StandbyChild): Promise<void> {
+    if (standby.stopAsked) return;
+    if (standby.deadline) { clearTimeout(standby.deadline); standby.deadline = null; }
+    let accepted = false;
+    let answered = false;
+    try {
+      const reply = await this.sendIPCMessage('reshard:retire', { attempt: standby.attempt }, RETIRE_ANSWER_MS);
+      answered = true;
+      accepted = reply?.accepted === true;
+    } catch { /* no answer within 5 s, or the bot process is gone */ }
+    if (this.standby !== standby) return;
+    if (accepted) {
+      standby.accepted = true;
+      return;
+    }
+    if (!answered && !standby.stopAsked) {
+      this.sendTo(this.botProcess, {
+        type: 'reshard:standby-state',
+        data: { attempt: standby.attempt, state: 'ended', reason: 'the bot process did not answer the retire within 5 s' },
+      });
+    }
+    this.stopStandby('the reshard was called off');
+  }
+
+  /** NB9 40 branch (3) and 49: the standby exited before any promotion. */
+  private standbyExit(code: number | null, signal: NodeJS.Signals | null): void {
+    const standby = this.standby!;
+    this.standby = null;
+    if (standby.deadline) { clearTimeout(standby.deadline); standby.deadline = null; }
+    if (standby.stopAsked) return;
+    console.warn(b5Line(code, signal, standby.stopReason));
+    if (standby.stopKind === 'called-off') return;
+    this.sendTo(this.botProcess, {
+      type: 'reshard:standby-state',
+      data: { attempt: standby.attempt, state: 'ended', reason: standby.stopReason ?? `exit code ${code}, signal ${signal}` },
+    });
+  }
+
+  /** NB9 26 and 53: the current child's own retire after its leave. */
+  private retireAsk(child: ChildProcess, data: any): void {
+    if (child.killed || this.retiring || this.exiting) return;
+    const cause = this.operationInProgress
+      ? 'another operation is in progress'
+      : this.stoppingRestart || this.queuedRestart ? 'a restart is under way' : null;
+    if (cause) {
+      if (!this.retireHeldLogged.has(cause)) {
+        this.retireHeldLogged.add(cause);
+        console.warn(b8Line(cause));
+      }
+      return;
+    }
+    const attempt = typeof data?.attempt === 'string' && data.attempt ? data.attempt : null;
+    this.retiring = { child, attempt, stops: this.stopsRequested + 1 };
+    const standby = this.standby;
+    if (standby && standby.attempt === attempt && !childGone(standby.child)) console.log(b3Line(standby.to));
+    void this.shutdown(false, 'restart');
+  }
+
+  /**
+   * NB9 26 and 40: at the retiring child's exit, the standby of its attempt becomes the bot process when every check
+   * holds; after a give-up nothing is promoted and a new child starts.
+   */
+  private promote(givenUp: boolean): void {
+    const retiring = this.retiring!;
+    this.retiring = null;
+    const standby = this.standby;
+    if (this.exiting) {
+      this.stopStandby('the web UI is shutting down');
+      return;
+    }
+    if (this.stopsRequested !== retiring.stops) {
+      this.stopStandby('a stop or restart was asked during the hand-over');
+      return;
+    }
+    const usable = standby !== null && standby.attempt === retiring.attempt && !childGone(standby.child) && !standby.abandoning;
+    if (givenUp || !usable) {
+      if (givenUp) {
+        this.stopStandby(`the old bot process did not exit ${CHILD_KILL_WAIT_MS / 1000} s after it was killed`);
+        console.warn(b9Line(CHILD_KILL_WAIT_MS / 1000));
+      } else {
+        if (standby && standby.attempt !== retiring.attempt) this.stopStandby('the second bot process is not the one for this reshard');
+        console.warn(B7_LINE);
+      }
+      void this.start();
+      return;
+    }
+    this.standby = null;
+    if (standby.deadline) { clearTimeout(standby.deadline); standby.deadline = null; }
+    this.adoptAsCurrent(standby.child);
+    console.log(B4_LINE);
+    // NB9 C7: the address list in use reaches the process before it boots; its ack changes nothing.
+    const list = hookListInUse();
+    if (list !== null) this.sendTo(standby.child, { type: 'data:addresses', data: { id: `addresses-${++this.addressesSeq}`, url: list } });
+    this.pushMemory(standby.child);
+    this.sendTo(standby.child, { type: 'reshard:promoted', data: { attempt: standby.attempt } });
+    this.emitEvent('bot:status', this.getStatus());
+  }
+
+  /** NB9 16: the last grant per bucket on this process's monotonic clock, across every child; 0 is a grant. */
+  private identifySlot(child: ChildProcess, data: any): void {
+    const nonce = data?.nonce;
+    const bucket = Number(data?.bucket);
+    if (typeof nonce !== 'string' || !Number.isSafeInteger(bucket) || bucket < 0) return;
+    const now = monoMs();
+    const last = this.identifyGrants.get(bucket);
+    let waitMs = 0;
+    if (last !== undefined && now - last < IDENTIFY_SPACING_MS) waitMs = Math.ceil(last + IDENTIFY_SPACING_MS - now);
+    else this.identifyGrants.set(bucket, now);
+    this.sendTo(child, { type: 'identify:slot', data: { nonce, waitMs } });
+  }
+
   /** What this child waits for before it opens the data files, while it reported `waiting`. */
   private waitingReport(child: ChildProcess): { holder: { role: string | null; pid: number } | null; cause: string | null; readCause: string | null } | null {
     if (this.botProcess !== child || this.childStage !== 'waiting') return null;
@@ -706,6 +1108,7 @@ export class BotManager {
   /** The process is about to exit: nothing starts the child again. */
   beginExit(): void {
     this.exiting = true;
+    this.stopStandby('the web UI is shutting down');
   }
 
   /** The automatic start after a crash; under the migration lock it is recorded and run once at the release. */
@@ -1004,6 +1407,8 @@ export class BotManager {
 
     this.cancelCrashRestart();
     this.stopsRequested += 1;
+    // NB9 18: the standby stops with its bot process; during a retire promote() decides.
+    if (!this.retiring || this.retiring.child !== this.botProcess) this.stopStandby(kind === 'restart' ? 'the bot is restarting' : 'the bot process stopped');
     if (!this.botProcess) {
       console.log('[BotManager] Bot is not running');
       return;
@@ -1029,13 +1434,18 @@ export class BotManager {
 
       // The child drains its accepted writes before it exits; nothing may
       // start beside it until it has.
-      if (!await this.within(exited, emergency ? CHILD_KILL_WAIT_MS : CHILD_STOP_WAIT_MS) && !emergency) {
+      let gone = await this.within(exited, emergency ? CHILD_KILL_WAIT_MS : CHILD_STOP_WAIT_MS);
+      if (!gone && !emergency) {
         console.log('[BotManager] Bot did not exit gracefully, forcing shutdown');
         child.kill('SIGKILL');
-        await this.within(exited, CHILD_KILL_WAIT_MS);
+        gone = await this.within(exited, CHILD_KILL_WAIT_MS);
       }
 
-      if (this.botProcess === child) {
+      if (!gone && this.retiring?.child === child) {
+        // NB9 40: the retiring child outlived its kill; no promotion, a new child that waits for the old one.
+        if (this.botProcess === child) this.currentChildGone('bot process was stopped before replying');
+        this.promote(true);
+      } else if (this.botProcess === child) {
         this.botProcess = null;
         noteWebuiChild('gone');
         this.botStartTime = 0;

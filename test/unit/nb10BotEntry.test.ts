@@ -10,7 +10,7 @@ vi.mock('dotenv/config', () => ({}));
 vi.mock('tsconfig-paths', () => ({ register: () => undefined }));
 vi.mock('../../src/bot/internalSetup/clientInitializer', () => {
   order.push('clientInitializer loaded');
-  return {};
+  return { main: async () => undefined };
 });
 vi.mock('../../src/bot/internalSetup/utils/writerLock', async orig => ({
   ...(await orig<any>()),

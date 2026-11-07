@@ -130,7 +130,9 @@ vi.mock('../../src/bot/internalSetup/utils/dataBackends/mainDatabase', () => ({
   noteShardReconnect: () => undefined,
 }));
 
-import '../../src/bot/internalSetup/clientInitializer';
+import { main } from '../../src/bot/internalSetup/clientInitializer';
+
+void main().catch(console.error);
 
 const NOT_STARTED = '[Shards] Module initializers, panel recovery and the module auto-updater do not start: this process stopped serving its shards';
 const STOPPED_AFTER = '[Shards] Panel recovery and the module auto-updater stopped: this process stopped serving its shards';

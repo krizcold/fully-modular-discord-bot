@@ -274,15 +274,16 @@ describe('the boot take lines (decision 13, decision 10)', () => {
     });
   }
 
-  it('the count line names the local and the stored count and its condition', async () => {
+  it('a boot of another local count takes under the stored count and logs no count line (NB9 C1)', async () => {
     const store = new MemClaimStore(() => 0);
     store.count = 2;
     store.rows.set('2:0', { shardCount: 2, shardId: 0, claim: 5, holderProcess: 'p-x', holderNode: 'node-x', holderName: 'X', homeNode: 'node-x', released: false, reserved: false, takenAt: 0, renewedAt: 0, ttlMs: 30_000, expiresUpMs: 100_000, extended: false });
     const log: string[] = [];
     const c = claims(store, 4, log);
     await c.firstRenewal();
-    await c.bootTake(async () => 4);
-    expect(log).toContain('[Shards] This machine resolves 4 shards; the database runs 2, and the count changes only when no machine holds a shard under 2: stop the bot on the other machines, then restart this one');
+    const taken = await c.bootTake(async () => 4);
+    expect(taken?.shardCount).toBe(2);
+    expect(log.filter(line => line.startsWith('[Shards] This machine resolves'))).toEqual([]);
   });
 
   it('the above-target warnings: no other machine has room only for the rows above the room, and a kept row of this machine', async () => {

@@ -27,7 +27,7 @@ describe('a fresh database', () => {
       'holder_node text not null', 'holder_name text not null', 'home_node text not null', 'released boolean not null default',
       'reserved boolean not null default', 'taken_at timestamp with time zone not null default',
       'renewed_at timestamp with time zone not null default', 'ttl_ms bigint not null', 'expires_up_ms bigint not null',
-      'extended boolean not null default',
+      'extended boolean not null default', 'ready boolean not null default',
     ]);
     expect(await columns('claim_clock')).toEqual([
       'id integer not null', 'up_ms bigint not null', 'ticked_at timestamp with time zone not null', 'last_gap_ms bigint not null default',
@@ -36,6 +36,8 @@ describe('a fresh database', () => {
       'node_id text not null', 'node_name text not null', 'process_id text not null', 'capacity integer not null',
       'takeover_seconds integer not null', 'fit boolean not null', 'restartable boolean not null', 'returns boolean not null',
       'started_at timestamp with time zone not null', 'healthy_since timestamp with time zone', 'seen_at timestamp with time zone not null',
+      'count_setting integer', 'reshard_overlap boolean not null default', 'memory_room boolean', 'memory_free_mb integer',
+      'memory_use_mb integer', 'memory_error text', 'memory_at timestamp with time zone',
     ]);
   });
 

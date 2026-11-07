@@ -65,6 +65,18 @@ export class LeaseRuntime {
     this.maybeStart();
   }
 
+  /**
+   * NB9 7 and 27: a standby logs its shards in before it serves, with no data grant (the data layer is not told). The
+   * serve's applyGrant with the same shard set and count then keeps these sessions (29).
+   */
+  startStandby(grant: LeaseGrant, token: string | undefined): void {
+    this.current = { processId: grant.processId, shardCount: grant.shardCount, leases: grant.leases };
+    this.token = token;
+    this.ingest.setShardPlan(grant.leases.map(l => l.shardId).sort((a, b) => a - b), grant.shardCount);
+    if (grant.leases.length === 0 || this.ingest.isStarted() || isStopping()) return;
+    void this.ingest.start(token);
+  }
+
   async applyGrant(grant: LeaseGrant): Promise<void> {
     const shardIds = grant.leases.map(l => l.shardId).sort((a, b) => a - b);
     const sameShape =

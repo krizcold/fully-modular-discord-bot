@@ -6,7 +6,7 @@ import { afterAll, describe, expect, it, vi } from 'vitest';
 const ctl = vi.hoisted(() => ({ take: null as null | (() => Promise<void>), released: 0 }));
 vi.mock('dotenv/config', () => ({}));
 vi.mock('tsconfig-paths', () => ({ register: () => undefined }));
-vi.mock('../../src/bot/internalSetup/clientInitializer', () => ({}));
+vi.mock('../../src/bot/internalSetup/clientInitializer', () => ({ main: async () => undefined }));
 vi.mock('../../src/bot/internalSetup/utils/writerLock', async orig => ({
   ...(await orig<any>()),
   configureWriterLock: () => undefined,

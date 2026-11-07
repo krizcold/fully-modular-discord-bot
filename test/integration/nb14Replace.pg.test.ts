@@ -437,20 +437,20 @@ describe('the sweep and the keep time', () => {
   });
 });
 
-describe('version 7', () => {
-  it('a database of version 6 is refused (C19)', async () => {
-    expect(SCHEMA_VERSION).toBe(7);
-    await direct.query('CREATE DATABASE nb14v6');
+describe('version 8', () => {
+  it('a database of version 7 is refused (C19)', async () => {
+    expect(SCHEMA_VERSION).toBe(8);
+    await direct.query('CREATE DATABASE nb14v7');
     const user = encodeURIComponent(container.getUsername());
     const password = encodeURIComponent(container.getPassword());
-    const url = `postgres://${user}:${password}@${container.getHost()}:${container.getPort()}/nb14v6`;
+    const url = `postgres://${user}:${password}@${container.getHost()}:${container.getPort()}/nb14v7`;
     const first = new PostgresBackend(fixedDatabase(url));
     first.start();
     await waitReady(first);
     await first.stop();
-    const v6 = new Pool({ connectionString: url, max: 1 });
-    await v6.query(`UPDATE smdb_data.meta SET value = '{"v":6}' WHERE key = 'schema_version'`);
-    await v6.end();
+    const v7 = new Pool({ connectionString: url, max: 1 });
+    await v7.query(`UPDATE smdb_data.meta SET value = '{"v":7}' WHERE key = 'schema_version'`);
+    await v7.end();
     const lines: string[] = [];
     const capture = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
     vi.spyOn(console, 'error').mockImplementation(capture);
@@ -461,7 +461,7 @@ describe('version 7', () => {
     try {
       const until = Date.now() + 30_000;
       while (!lines.some(l => l.includes('schema-mismatch')) && Date.now() < until) await sleep(100);
-      expect(lines).toContain('[PostgresBackend] schema-mismatch: smdb_data.meta schema_version is {"v":6}, expected {"v":7}; refusing to serve');
+      expect(lines).toContain('[PostgresBackend] schema-mismatch: smdb_data.meta schema_version is {"v":7}, expected {"v":8}; refusing to serve');
       expect(second.servesData()).toBe(false);
     } finally {
       await second.stop();

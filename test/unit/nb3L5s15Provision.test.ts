@@ -21,8 +21,9 @@ describe('provisionStoreInTransaction', () => {
     const { sent } = await provision();
     expect(sent[0]).toEqual({ text: 'CREATE SCHEMA smdb_data' });
     expect(sent.filter(s => /CREATE SCHEMA/.test(s.text)).map(s => s.text)).toEqual(['CREATE SCHEMA smdb_data']);
-    // NB7 added smdb_data.guild_requests and its two indexes; NB5 the shard index of guild_ownership.
-    expect(sent).toHaveLength(85);
+    // NB7 added smdb_data.guild_requests and its two indexes; NB5 the shard index of guild_ownership; NB9 the reshard
+    // table, its row and identify_slots.
+    expect(sent).toHaveLength(88);
     const claims = sent.map(s => s.text).filter(t => /shard_claims|claim_clock|shard_nodes|guild_ownership_claim_idx/.test(t));
     expect(claims.map(t => t.split('(')[0].trim())).toEqual([
       'CREATE INDEX IF NOT EXISTS guild_ownership_claim_idx ON smdb_data.guild_ownership',
@@ -48,7 +49,7 @@ describe('provisionStoreInTransaction', () => {
 
   it('stores the schema version and the store id it answers', async () => {
     const { id, sent } = await provision();
-    expect(SCHEMA_VERSION).toBe(7);
+    expect(SCHEMA_VERSION).toBe(8);
     expect(sent.slice(-2)).toEqual([
       { text: `INSERT INTO smdb_data.meta (key, value) VALUES ('schema_version', $1)`, params: [JSON.stringify({ v: SCHEMA_VERSION })] },
       { text: `INSERT INTO smdb_data.meta (key, value) VALUES ('store_id', $1)`, params: [JSON.stringify(id)] },

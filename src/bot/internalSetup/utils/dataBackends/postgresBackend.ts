@@ -33,7 +33,7 @@ import type {
   RetireOutcome,
 } from './backend';
 
-export const SCHEMA_VERSION = 7;
+export const SCHEMA_VERSION = 8;
 const PROVISION_VERDICT_POLL_MS = 250;
 const PARTITION_COUNT = 32;
 const MAX_ROWS_PER_STATEMENT = 200;
@@ -59,18 +59,22 @@ type Sender = { query(text: string, values?: unknown[]): Promise<QueryResult> };
 
 /** The seed rows of provisionDdl: rows, not shape, so neither the scratch copy nor a privilege check needs them. */
 export function provisionSeedRows(s: string): string[] {
-  return [`INSERT INTO ${s}.claim_clock (id, up_ms, ticked_at) VALUES (1, 0, now()) ON CONFLICT (id) DO NOTHING`];
+  return [
+    `INSERT INTO ${s}.claim_clock (id, up_ms, ticked_at) VALUES (1, 0, now()) ON CONFLICT (id) DO NOTHING`,
+    `INSERT INTO ${s}.reshard (id) VALUES (1) ON CONFLICT (id) DO NOTHING`,
+  ];
 }
 
-/** provisionDdl without its seed rows: the 18 statements that make the schema. */
+/** provisionDdl without its seed rows: the 20 statements that make the schema. */
 export function provisionSchemaDdl(s: string): string[] {
   const seeds = new Set(provisionSeedRows(s));
   return provisionDdl(s).filter(stmt => !seeds.has(stmt));
 }
 
 // Any change here bumps SCHEMA_VERSION; the boot refuses a stored schema that differs.
-/** The schema's 19 statements, rendered for a schema name (smdb_data, or the scratch copy the boot compares with). */
+/** The schema's 22 statements, rendered for a schema name (smdb_data, or the scratch copy the boot compares with). */
 export function provisionDdl(s: string): string[] {
+  const [clockSeed, reshardSeed] = provisionSeedRows(s);
   return [
   `CREATE SCHEMA IF NOT EXISTS ${s}`,
   `CREATE TABLE IF NOT EXISTS ${s}.meta (
@@ -107,6 +111,7 @@ export function provisionDdl(s: string): string[] {
     ttl_ms          bigint      NOT NULL,
     expires_up_ms   bigint      NOT NULL,
     extended        boolean     NOT NULL DEFAULT false,
+    ready           boolean     NOT NULL DEFAULT false,
     PRIMARY KEY (shard_count, shard_id)
   )`,
   `CREATE TABLE IF NOT EXISTS ${s}.claim_clock (
@@ -115,7 +120,7 @@ export function provisionDdl(s: string): string[] {
     ticked_at   timestamptz NOT NULL,
     last_gap_ms bigint      NOT NULL DEFAULT 0
   )`,
-  ...provisionSeedRows(s),
+  clockSeed,
   `CREATE TABLE IF NOT EXISTS ${s}.shard_nodes (
     node_id          text PRIMARY KEY,
     node_name        text        NOT NULL,
@@ -127,7 +132,39 @@ export function provisionDdl(s: string): string[] {
     returns          boolean     NOT NULL,
     started_at       timestamptz NOT NULL,
     healthy_since    timestamptz,
-    seen_at          timestamptz NOT NULL
+    seen_at          timestamptz NOT NULL,
+    count_setting    integer,
+    reshard_overlap  boolean     NOT NULL DEFAULT true,
+    memory_room      boolean,
+    memory_free_mb   integer,
+    memory_use_mb    integer,
+    memory_error     text,
+    memory_at        timestamptz
+  )`,
+  `CREATE TABLE IF NOT EXISTS ${s}.reshard (
+    id          integer     PRIMARY KEY CHECK (id = 1),
+    target      integer,
+    target_by   text,
+    target_at   timestamptz,
+    attempt     uuid,
+    from_count  integer,
+    to_count    integer,
+    method      text        CHECK (method IN ('overlap', 'stop-start')),
+    state       text        CHECK (state IN ('standby', 'flipped', 'stopping', 'done', 'cancelled')),
+    started_by  text,
+    started_at  timestamptz,
+    until_at    timestamptz,
+    flipped_at  timestamptz,
+    ended_at    timestamptz,
+    reason      text,
+    retry_after timestamptz,
+    failures    integer     NOT NULL DEFAULT 0
+  )`,
+  reshardSeed,
+  `CREATE TABLE IF NOT EXISTS ${s}.identify_slots (
+    bucket     integer     PRIMARY KEY,
+    last_at    timestamptz NOT NULL,
+    process_id text        NOT NULL
   )`,
   `CREATE TABLE IF NOT EXISTS ${s}.guild_data (
     guild_id   text NOT NULL,

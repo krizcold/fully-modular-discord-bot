@@ -170,6 +170,7 @@ describe('NB4 decision 10: a take re-takes a row it may take through the guarded
       }
       if (/pg_advisory_xact_lock/.test(text)) return { rows: [{}] };
       if (/^\s*SELECT up_ms::text/.test(text)) return { rows: [clockRow] };
+      if (/LEFT JOIN smdb_data\.reshard/.test(text)) return { rows: [{ attempt: null, state: null, from_count: null, to_count: null, target: null, target_by: null, target_at: null, meta_count: 1 }] };
       if (/FROM smdb_data\.meta/.test(text)) return { rows: [{ value: '{"count":1}' }] };
       if (/AS floor/.test(text)) return { rows: [{ floor: '3' }] };
       if (/nextval/.test(text)) return { rows: [{ n: '9' }] };

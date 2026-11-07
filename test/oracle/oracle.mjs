@@ -723,7 +723,8 @@ const URL_SECRET = /\b[a-z][a-z0-9+.-]*:\/\/[^\s"'@/]*@/gi;
 /**
  * @typedef {{ initialized: boolean, nodeId: string | null, processId: string | null, shardCount: number | null,
  *   leases: { shardId: number, claim: number | null }[], shardTable: { shardId: number, nodeId: string | null, status: string | null }[],
- *   guildMap: Record<string, number> }} FleetFacts
+ *   guildMap: Record<string, number>,
+ *   reshard: { attempt: string, state: string, from: number, to: number } | null }} FleetFacts
  */
 
 /**
@@ -746,6 +747,9 @@ export function reduceFleetState(state) {
       ? s.shardTable.map((/** @type {any} */ r) => ({ shardId: r.shardId, nodeId: r.nodeId ?? null, status: r.status ?? null }))
       : [],
     guildMap: s.guildMap && typeof s.guildMap === 'object' ? s.guildMap : {},
+    reshard: s.reshard && typeof s.reshard === 'object' && typeof s.reshard.attempt === 'string'
+      ? { attempt: s.reshard.attempt, state: String(s.reshard.state), from: Number(s.reshard.from), to: Number(s.reshard.to) }
+      : null,
   };
 }
 
@@ -806,6 +810,15 @@ export function claimsSql() {
 }
 
 /**
+ * The reshard listing, one line under `psql -At`, read in one snapshot: the
+ * reshard row's attempt with the count of shard_claims rows of its from_count,
+ * and meta 'shard_count'. The input check.mjs takes as --reshard (NB9 22).
+ */
+export function reshardSql() {
+  return `SELECT jsonb_build_object('rows', COALESCE((SELECT jsonb_agg(jsonb_build_object('attempt', r.attempt::text, 'state', r.state, 'from', r.from_count, 'to', r.to_count, 'fromRows', (SELECT count(*) FROM smdb_data.shard_claims c WHERE c.shard_count = r.from_count)) ORDER BY r.id) FROM smdb_data.reshard r WHERE r.attempt IS NOT NULL), '[]'::jsonb), 'meta', (SELECT (m.value::jsonb ->> 'count')::int FROM smdb_data.meta m WHERE m.key = 'shard_count'))`;
+}
+
+/**
  * The request listing of one run, one line per smdb_data.guild_requests row
  * of a write or a delete of the run's docs under `psql -At`: its id, op and
  * state, the body's filename ("k") and contentJson ("c", null for a delete),
@@ -829,6 +842,10 @@ async function sql(argv) {
   }
   if (argv.length === 1 && argv[0] === 'claims') {
     process.stdout.write(`${claimsSql()}\n`);
+    return;
+  }
+  if (argv.length === 1 && argv[0] === 'reshard') {
+    process.stdout.write(`${reshardSql()}\n`);
     return;
   }
   if (argv[0] === 'requests') {
@@ -905,6 +922,7 @@ oracle.mjs fleet --target URL --name NODE --out FILE [--limiter SPEC] [--timeout
 oracle.mjs sql --log FILE      the psql query that lists the run's docs
 oracle.mjs sql ownership       the psql query that lists the claim sequence and the highest stored claims
 oracle.mjs sql claims          the psql query that lists shard_claims
+oracle.mjs sql reshard         the psql query that lists the reshard attempt, its old rows and meta 'shard_count'
 oracle.mjs sql requests --log FILE  the psql query that lists the run's rows of guild_requests
 oracle.mjs bite --log FILE     the bite test's two tamperings, as SQL
 oracle.mjs cleanup --log FILE [--log FILE ...] --target URL [--limiter SPEC]`;

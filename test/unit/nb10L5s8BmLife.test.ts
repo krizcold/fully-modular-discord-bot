@@ -13,7 +13,7 @@ vi.mock('child_process', async orig => {
 });
 vi.mock('../../src/utils/updateSafety', () => ({ getSafetyManager: () => safety }));
 
-import { BotManager, populateTakeCause, deposedRouteText } from '../../src/webui/botManager';
+import { BotManager, b15Line, populateTakeCause, deposedRouteText } from '../../src/webui/botManager';
 import { writerLockPath } from '../../src/bot/internalSetup/utils/writerLock';
 import { forks, forkLogin } from '../helpers/forkMock';
 import { answering, exitChild, freshWriterLock, report, resetForks, sentTo, tick } from '../helpers/nb10Rig';
@@ -135,13 +135,20 @@ describe('the exits of the bot process', () => {
     expect((m as any).crashRestartTimer).toBeNull();
   });
 
-  it('an exit by signal with no code is no crash', async () => {
+  it('an exit by signal with no code and no stop asked is a crash (NB9 62): B15, the crash recorded, the restart after 5 s', async () => {
     const { m, child } = await startWith([{ stage: 'guild' }]);
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const before = forks.children.length;
     child.signalCode = 'SIGKILL';
     child.emit('exit', null, 'SIGKILL');
-    expect(m.getStatus().crashed).toBe(false);
-    expect(m.getLogs(true).crashed).toBe(false);
-    expect(safety.recordCrash).not.toHaveBeenCalled();
+    expect(m.getStatus().crashed).toBe(true);
+    expect(m.getLogs(true).current.some(line => line.includes(b15Line('SIGKILL')))).toBe(true);
+    expect(safety.recordCrash).toHaveBeenCalledWith(null, 'SIGKILL', expect.any(Array));
+    await vi.advanceTimersByTimeAsync(4_900);
+    expect(forks.children).toHaveLength(before);
+    await vi.advanceTimersByTimeAsync(200);
+    expect(forks.children).toHaveLength(before + 1);
+    vi.useRealTimers();
   });
 
   it('a stop with no arguments sends SIGTERM, not SIGKILL', async () => {

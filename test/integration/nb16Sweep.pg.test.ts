@@ -55,6 +55,21 @@ const SKIP: Record<string, string> = {
   'guild_data.guild_id retype': '42P16',
   'guild_append.guild_id drop': '42P16',
   'guild_append.guild_id retype': '42P16',
+  'reshard.attempt notnull': '23502',
+  'reshard.ended_at notnull': '23502',
+  'reshard.flipped_at notnull': '23502',
+  'reshard.from_count notnull': '23502',
+  'reshard.method notnull': '23502',
+  'reshard.reason notnull': '23502',
+  'reshard.retry_after notnull': '23502',
+  'reshard.started_at notnull': '23502',
+  'reshard.started_by notnull': '23502',
+  'reshard.state notnull': '23502',
+  'reshard.target notnull': '23502',
+  'reshard.target_at notnull': '23502',
+  'reshard.target_by notnull': '23502',
+  'reshard.to_count notnull': '23502',
+  'reshard.until_at notnull': '23502',
 };
 
 // Decision 9 orders by relation name, then decision 2's aspects, then column or constraint name.
@@ -153,6 +168,26 @@ const EXTRAS: Record<string, Extras> = {
     sentences: [{
       rel: 'guild_data_graveyard', aspect: ASPECT.constraint, sub: 'guild_data_graveyard_kind_check',
       text: "smdb_data.guild_data_graveyard constraint guild_data_graveyard_kind_check is CHECK (((kind)::text = ANY (ARRAY['doc'::text, 'append'::text]))), where this bot's schema has CHECK ((kind = ANY (ARRAY['doc'::text, 'append'::text])))",
+    }],
+  },
+  'identify_slots.bucket drop': { pk: true },
+  'reshard.id drop': { pk: true, constraints: ['reshard_id_check'] },
+  'reshard.attempt retype': TO_TEXT,
+  'reshard.method drop': { constraints: ['reshard_method_check'] },
+  'reshard.state drop': { constraints: ['reshard_state_check'] },
+  'shard_claims.ready retype': TO_TEXT,
+  'shard_nodes.reshard_overlap retype': TO_TEXT,
+  'shard_nodes.memory_room retype': TO_TEXT,
+  'reshard.method retype': {
+    sentences: [{
+      rel: 'reshard', aspect: ASPECT.constraint, sub: 'reshard_method_check',
+      text: "smdb_data.reshard constraint reshard_method_check is CHECK (((method)::text = ANY (ARRAY['overlap'::text, 'stop-start'::text]))), where this bot's schema has CHECK ((method = ANY (ARRAY['overlap'::text, 'stop-start'::text])))",
+    }],
+  },
+  'reshard.state retype': {
+    sentences: [{
+      rel: 'reshard', aspect: ASPECT.constraint, sub: 'reshard_state_check',
+      text: "smdb_data.reshard constraint reshard_state_check is CHECK (((state)::text = ANY (ARRAY['standby'::text, 'flipped'::text, 'stopping'::text, 'done'::text, 'cancelled'::text]))), where this bot's schema has CHECK ((state = ANY (ARRAY['standby'::text, 'flipped'::text, 'stopping'::text, 'done'::text, 'cancelled'::text])))",
     }],
   },
 };

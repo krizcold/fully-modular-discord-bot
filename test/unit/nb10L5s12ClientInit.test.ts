@@ -85,7 +85,7 @@ function stopStep(): Promise<() => Promise<void>> {
     };
     vi.spyOn(console, 'log').mockImplementation(() => undefined);
     try {
-      await import('../../src/bot/internalSetup/clientInitializer');
+      void (await import('../../src/bot/internalSetup/clientInitializer')).main().catch(console.error);
       await vi.waitFor(() => expect(ctl.reported).toContain('guild'), { timeout: 5000, interval: 5 });
       await vi.waitFor(() => expect(ctl.steps.length).toBeGreaterThan(0), { timeout: 5000, interval: 5 });
     } finally {
